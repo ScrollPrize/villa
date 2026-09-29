@@ -1,113 +1,120 @@
-# Continuous trajectory memory (v4)
+# Main-encoder feature memory (v4)
 
-`--memory-version 4 --no-correction` selects `TrajectoryMemoryFollower`.
-One transformer decoder predicts all future points jointly. A query for each
-forward distance samples initial image features on the forward axis, exchanges
-information with the other queries through self-attention, and cross-attends to
-image/history tokens, persistent identity slots, immutable seed tokens, and the
-latest observed patch. The forward-axis query locations do not constrain the
-output to that line: a linear head predicts two continuous lateral coordinates
-per query, bounded by the crop. The first point also respects the existing
-maximum connection distance. Forward planes remain fixed.
+`--memory-version 4 --no-correction` selects the new v4 architecture. It replaces
+the earlier, untrained v4 patch-memory design; it does not change v2/v3 models.
 
-There is no lattice, dynamic-programming route search, correction head, or second
-decoder pass. Prefix confidence inspects the predicted curve; it is not multiplied
-by lattice probability mass. Diagnostics expose a single proposal. The shared
-confidence and identity heads still inspect local features; those evaluations
-do not update coordinates.
+## Prediction and retained evidence
 
-The v3 `IdentityMemory` writer is retained, including its pre-write admission
-gate, immutable seed, FP32 writes, and separate latest-observation tokens. Seed
-pose is expressed in the actual query crop frame, including its roll. Each
-decoder layer reads this identity memory directly, so coordinate loss reaches
-the persistent writer and seed encoder without passing through discrete route
-selection. This does not establish that a trained model will use memory well;
-matched-input identity tests and held-out tracing are still needed.
+A single transformer decoder jointly predicts continuous lateral coordinates at
+16 fixed forward distances. Unmasked self-attention lets every future point
+influence every other point. There is no route lattice, dynamic-programming
+search, refinement head, or second decoder pass.
 
-## Supervision and replay
+Each current main crop is encoded once. The encoder's contextual spatial features
+are pooled to a `2 x 4 x 4` grid, projected to 32 memory tokens, and used by the
+existing admission-probe/gated-slot update. This grid covers the full main crop;
+it is not another raw-image crop or another image encoder. It is a compressed
+representation, not a lossless copy of the encoder feature map.
 
-The existing dense coordinate, prefix-confidence, candidate, visible-reference
-identity and memory-probe losses are reused. Coordinate loss directly supervises
-the sole proposal. Recoverable drift and on-policy replay use the same annotation
-and holdout rules as the existing trainer. Confirmed departures teach rejection
-and memory probes, but do not receive trajectory geometry loss. Unobservable or
-censored labels remain masked. V4 has no route-localization loss.
+Every decoder layer can read:
 
-Matched decisions retain the v3 policy: identical local crops and histories, with
-different causal earlier observations and seeds outside the crop. This provides
-examples where local image/history information alone cannot identify the target.
-`--trajectory-sequence-weight 0.5` adds geometry/confidence supervision at an
-earlier causal decision on eligible observed tracks. It reconstructs that prefix
-with current weights; it does not use later observations or train through future
-commits. Set the weight to zero to disable this extra decision. The original
-`--route-sequence-weight` continues to apply only to v3.
+- The current image and visible history.
+- Persistent learned identity slots (16 in the launcher).
+- An immutable seed representation (32 tokens).
+- A bounded cache of spatial grids from observed crops (64 crops by default,
+  including the current crop).
 
-## Launch and checkpoints
+Cached tokens retain world positions and crop orientations. Reads express their
+positions, orientations and ages relative to the current crop. Tokens are not
+masked merely because their locations have left the crop. The oldest explicit
+cache entry is evicted when the cache fills; the seed remains and learned slots
+can retain older information. Probes and retained state remain FP32 while the
+main encoder/decoder use the trainer's existing BF16 autocast on CUDA.
 
-From `fiber_follow`, using the existing project environment:
+The cache contains image evidence actually observed at each decision, never
+annotation coordinates or uncommitted predictions. At inference, a normal trace
+initializes its seed from its first main crop. A cold start at a remote supplied
+seed encodes that seed crop once, then the current crop. A cold start does not
+reconstruct all historical main crops; its cache fills as tracing proceeds.
+
+## Streamed training
+
+V4 uses consecutive observed states instead of rebuilding small historical
+patches separately for independently sampled decisions. Saved rollout paths,
+drifted synthetic histories, wrong continuations and matched identity examples
+supply the observations. Annotation geometry is used for targets only.
+
+Each sampled stream visits its actual seed, up to the newest `memory_steps`
+historical observations, and the sampled endpoint. Every selected crop becomes
+its own supervised decision. Unknown bridge labels are masked, and confirmed
+departures still teach rejection without trajectory geometry loss. Crop and
+label holdout checks cover the whole stream before image reads. Matched endpoint
+crops retain identical local inputs and their different earlier identity evidence.
+
+`--feature-sequence-length 2` keeps gradients through two consecutive decisions.
+Their losses are accumulated before backward. The resulting bounded state is
+detached and carried across subsequent chunks and optimizer updates. Detaching
+preserves memory values; it only ends gradient propagation into older graphs.
+Features carried across optimizer updates were computed with slightly older
+weights. They are not a permanent dataset-wide feature cache.
+
+`--microbatch` counts main crops across traces and time. With microbatch 4 and
+sequence length 2, each full chunk has two traces and two decisions. Matched
+sampling requires an even number of concurrent traces. The trainer accumulates
+chunks until it reaches the effective `--batch` crop budget; a partial ending
+chunk can make this exceed the requested budget by less than one microbatch.
+Losses are normalized by the actual number of states, and throughput logs use
+actual counts. Stream ids include worker and group identity; ended streams are
+removed, and worker interleaving does not mix their memory.
+
+There is no independently reconstructed `trajectory_sequence` auxiliary pass.
+The old `--trajectory-sequence-weight` must be zero. `memory_patch_size` and
+`memory_grad_steps` remain legacy configuration fields for checkpoint tools;
+v4 uses `feature_memory_grid` and `feature_sequence_length` instead.
+
+Sampling fractions apply to stream endpoints. Since streams have different
+lengths, the resulting per-state source mix can differ; logs report the actual
+mix. More supervised crop decisions are not necessarily more independent
+examples. The shorter gradient horizon and different sampling distribution need
+held-out tracing validation, especially for long-lived fiber identity.
+
+## Launch and initialization
 
 ```bash
-bash scripts/launch_trajectory_memory.sh --direction-inputs
+bash scripts/launch_trajectory_memory.sh --direction-inputs --batch 8 --microbatch 4 --workers 8
 ```
 
-The launcher uses the existing drift/replay recipe, 16 future points, 8 committed
-points, 16 memory slots, up to 64 historical observations, and gradients through
-the newest 32 plus the current observation. It refuses an existing run name.
-It starts fresh weights unless `--init-tracer` is supplied. It launches background
-training; do not invoke it just to inspect arguments. To see trainer options:
+This launches a new background run. The launcher does not overwrite existing run
+names. The main encoder, single continuous decoder, confidence and identity heads
+can initialize from a v2/v3 checkpoint:
 
 ```bash
-bash scripts/launch_regression.sh --help
-```
-
-A separate run can initialize from a v2 or v3 checkpoint:
-
-```bash
-RUN_NAME=axial_trajectory_memory_v4_run1 bash scripts/launch_trajectory_memory.sh \
-  --init-tracer output/axial_spatial_memory_v3_run2/ckpt_007000.pt \
+RUN_NAME=axial_feature_memory_v4_run1 bash scripts/launch_trajectory_memory.sh \
+  --init-tracer output/axial_spatial_memory_v3_run2/ckpt_010000.pt \
   --direction-inputs --batch 8 --microbatch 4 --workers 8
 ```
 
-Compatible encoder, decoder, coordinate, confidence and memory weights are
-retained; lattice and correction heads are omitted. V3's coordinate head was
-unused during v3 training, so its weights are inherited rather than trained by
-that run. Direct identity attention changes decoder behavior even with shared
-weights. This migration starts a new optimizer, schedule and run; it is not a
-behavior-preserving resume. Memory dimensions must match when reusing weights.
+Migration retains compatible encoder, decoder, confidence and identity weights
+and initializes the new feature memory. When importing v3, the continuous
+coordinate output layer also starts fresh: v3 never trained it with its lattice
+objective. Importing v2 retains its trained continuous coordinate layer.
+This starts a new optimizer and schedule, not a behavior-preserving resume.
 
-V4 checkpoints use `axial_fiber_memory_v4` and load through the existing trainer,
-collector and tracer. True `--resume` is supported within a v4 run with matching
-options. V2/v3 checkpoint loading and model behavior remain supported; a running
-v3 trainer is not restarted or migrated by adding this implementation.
+V4 checkpoints identify `feature_memory_revision: 1`. Checkpoints of the previous
+patch-memory v4 are rejected explicitly. V2/v3 checkpoint loading remains
+supported. Model, EMA, optimizer and RNG resume normally within the new v4.
+As with the existing iterable loader, resuming starts new data streams: ephemeral
+worker cursors and carried training states are not restored. Every new stream
+starts with an explicit reset and rebuilds memory from its seed; this is not
+bit-exact continuation of the pre-interruption sample sequence.
+
+Training-batch diagnostics receive the actual carried input state rather than
+silently plotting a cold prediction. Those state features were produced by the
+training model; independent monitor tracing still uses the EMA model throughout.
 
 ## Validation
 
-```bash
-AGENTS_AGENT_MODE=1 PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 \
-  PYTHONPATH=../../.. python -m pytest \
-  tests/test_trajectory_memory.py tests/test_spatial_memory_v3.py \
-  tests/test_learned_memory.py tests/test_memory_sequences.py \
-  tests/test_identity_decisions.py tests/test_regression.py -q
-```
-
-Tests check direct geometry gradients into seed and earlier observations, memory
-sensitivity with fixed local inputs, bidirectional influence between future
-points (including point 2 and point 8), continuous coordinates and connection
-bounds, censoring/departure masks, matched identity sampling, causal replay,
-streaming/reconstruction parity, burn-in, tracing state ownership, checkpoint and
-optimizer restoration, migration, direction expansion, and full-graph capture.
-Implementation checks do not establish tracing quality or CUDA performance.
-
-Validation on 2026-09-29: the six-file suite above passed 108 tests, skipped five
-CUDA tests, and deselected one test under the repository's default marker filter.
-The subsequently added point-2/point-8 interaction test also passed. Full-graph
-capture used `torch.compile(backend='eager', fullgraph=True)`, not CUDA Inductor.
-Loading `ckpt_007000.pt` from the v3 run and migrating in memory retained every
-shared tensor exactly (4,931,226 v3 parameters; 4,530,711 v4 parameters). No trained
-v4 quality comparison or throughput measurement has been performed.
-
-The existing training environment lacked pytest. Validation used an already
-cached pytest distribution, without installing packages:
+Use the existing environment; no dependencies were installed:
 
 ```bash
 AGENTS_AGENT_MODE=1 PYTHONDONTWRITEBYTECODE=1 CUDA_VISIBLE_DEVICES='' \
@@ -118,9 +125,80 @@ PYTHONPATH=/home/sean/Documents/villa4/vesuvius/src:/home/sean/.cache/uv/archive
   tests/test_trajectory_memory.py tests/test_spatial_memory_v3.py \
   tests/test_learned_memory.py tests/test_memory_sequences.py \
   tests/test_identity_decisions.py tests/test_regression.py \
-  -q -o cache_dir=/tmp/fiber-trajectory-pytest
+  -q -o cache_dir=/tmp/fiber-feature-pytest
 ```
 
-The same environment was used for the final targeted check with pytest arguments
-`tests/test_trajectory_memory.py::test_future_points_influence_each_other_in_both_directions
--q -o cache_dir=/tmp/fiber-trajectory-pytest`.
+The CPU suite passed 111 tests, skipped six CUDA tests and deselected one test.
+It covers gradients into earlier main-crop features, bidirectional point-query
+influence, remote-memory sensitivity, seed immutability, bounded cache eviction,
+stream ownership and detachment across optimizer updates, cold/warm tracing,
+matched endpoints, checkpoint migration/resume and graph capture. GPU numerical
+and production-throughput validation are recorded separately below.
+
+The same suite with CUDA enabled passed 116 tests initially; the new compiled
+gradient test needed `.item()` in its assertion to compare a CUDA scalar with
+pytest. After that test-only fix, its rerun passed (117 passing tests combined,
+one deselected). Run the command above without `CUDA_VISIBLE_DEVICES=''` and with
+`TORCHINDUCTOR_COMPILE_THREADS=4` for GPU validation. The two-decision BF16 compiled
+test checks eager/compiled loss agreement, gradient cosine similarity above .99
+and gradient norms within 5% for the encoder, decoder and memory writer.
+
+A real-data preflight also passed for 16 eight-channel crop decisions, checking
+that streamed inputs contain no separately reconstructed historical image crops.
+Its report is `output/feature_memory_v4_validation/preflight/report.json`.
+
+## Production training cost versus v3
+
+Measured on the RTX 5090 with PyTorch 2.12.1+cu130, using the stopped
+`axial_spatial_memory_v3_run2` recipe and checkpoint 10000. Both bounded runs used
+the real s1 CT, presence/direction inputs (eight channels), 120x101x101 crops,
+fixed recovery and saved on-policy banks, batch 8, microbatch 4, eight loader
+workers, compilation and BF16 with FP32 memory. V3 retained its refinement and
+earlier-decision auxiliary loss; v4 used two-decision feature-memory chunks.
+
+Each run completed 80 optimizer updates; the first 30 (including compilation)
+were excluded. Timings include loader waits, forward/backward, losses, gradient
+clipping, AdamW and EMA. Metrics were computed every update for both models.
+Background collection, periodic diagnostic tracing and checkpoint I/O are
+excluded. These are steady training costs, not total production wall time.
+
+| Measurement | V3 | New v4 |
+| --- | ---: | ---: |
+| Measured updates | 50 | 50 |
+| Primary crop decisions | 400 | 436 |
+| Total supervised crops, including auxiliary | 520 | 436 |
+| Mean ms per supervised crop | 56.4 | 58.7 |
+| Mean ms per primary decision, including auxiliary work | 73.3 | 58.7 |
+| p50 / p95 ms per primary decision | 71.8 / 90.0 | 57.3 / 64.0 |
+| Peak allocated GPU memory, GiB | 16.68 | 12.17 |
+
+V4 costs about 4% more per supervised crop and uses about 27% less peak allocated
+memory in this measurement. The larger improvement per primary decision reflects
+v3's additional supervised crops; it should not be described as a 20% speedup per
+supervised crop. V4 can slightly exceed batch 8 when finishing a variable-length
+chunk, so the table divides by actual crop counts. Streams change the observed
+source mixture and correlation between examples; this benchmark does not measure
+convergence or held-out tracing quality.
+
+The v4 profiler's largest self-CUDA categories were convolution backward (24%),
+attention backward (10%), convolution forward (10%), copies (7%) and attention
+forward (6%). Profiling was performed on an excluded warmup update.
+
+Local reproducibility artifacts are in `output/feature_memory_v4_validation/`:
+`production_v{3,4}_results.json` contains every update and summary;
+`production_v{3,4}_argv.json` contains the complete trainer arguments;
+`production_v4_profile.txt` and `.json` contain the profile. The bounded harness
+loads the original run recipe and uses separate output directories:
+
+```bash
+AGENTS_AGENT_MODE=1 PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 \
+OPENBLAS_NUM_THREADS=4 TORCHINDUCTOR_COMPILE_THREADS=4 \
+PYTHONPATH=/home/sean/Documents/villa4/vesuvius/src \
+/home/sean/Documents/villa4/vesuvius/.venv/bin/python \
+  output/feature_memory_v4_validation/real_training_benchmark.py \
+  --version 3 --steps 80 --warmup 30 --tag production
+```
+
+Use `--version 4 --profile` for v4 and a fresh `--tag` when repeating either run.
+The original v3 trainer was stopped; its latest durable checkpoint is 10000.
+No new long-running training job was launched.

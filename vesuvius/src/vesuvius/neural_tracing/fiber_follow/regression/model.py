@@ -1,8 +1,10 @@
 """Crop-only fiber following: residual 3-D stem, 8x2x2 tokens, full axial attention.
 
 All physical coordinates are trace-grid voxels; CT samples are half a trace voxel.
-The default is crop-only. Optional learned memory uses a small observation
-encoder and a bounded recurrent state, with a separate immutable seed anchor.
+Bare DirectConfig() retains the legacy crop-only constructor default. Training
+launchers explicitly enable memory, and v4 requires it. V2/v3 memory uses a
+small observation encoder; v4 retains main-encoder features. Both memory designs
+carry bounded state and an immutable seed.
 """
 from dataclasses import asdict, dataclass, field
 import math
@@ -58,7 +60,10 @@ class DirectConfig:
     route_loss_weight: float = 1.
     route_sequence_weight: float = .5  # v3: additional earlier decision from an observed track
     route_refinement_radius: float | None = None  # v3: per-axis displacement from selected cell; None keeps half-cell bound
-    trajectory_sequence_weight: float = .5  # v4: additional causal decision on an observed track
+    trajectory_sequence_weight: float = 0.  # obsolete v4 prefix-reconstruction objective
+    feature_memory_grid: tuple = (2, 4, 4)  # v4 spatial tokens per encoded crop
+    feature_sequence_length: int = 2  # v4 decisions per gradient chunk
+    feature_memory_revision: int = 1
 
     def __post_init__(self):
         if not isinstance(self.direction_inputs, bool):
@@ -106,12 +111,19 @@ class DirectConfig:
                 raise ValueError('Continuous trajectory memory requires positive memory_slots')
             if self.correction or self.route_refinement_radius is not None:
                 raise ValueError('Memory v4 uses one decoder pass; use --no-correction and no route refinement radius')
-            if not math.isfinite(self.trajectory_sequence_weight) or self.trajectory_sequence_weight < 0:
-                raise ValueError('Trajectory sequence weight must be finite and nonnegative')
+            if self.trajectory_sequence_weight != 0:
+                raise ValueError('V4 supervises every streamed decision; trajectory_sequence_weight must be zero')
+            self.feature_memory_grid = tuple(self.feature_memory_grid)
+            if len(self.feature_memory_grid) != 3 or any(not isinstance(n, int) or n < 1 for n in self.feature_memory_grid):
+                raise ValueError('Feature memory grid requires three positive integers')
+            if not isinstance(self.feature_sequence_length, int) or self.feature_sequence_length < 2:
+                raise ValueError('Feature sequence length must be at least two')
+            if self.feature_memory_revision != 1:
+                raise ValueError('Unsupported feature memory revision')
 
     @property
     def sequence_weight(self):
-        return {3: self.route_sequence_weight, 4: self.trajectory_sequence_weight}.get(self.memory_version, 0.)
+        return {3: self.route_sequence_weight}.get(self.memory_version, 0.)
 
     @property
     def sequence_key(self):

@@ -7,7 +7,8 @@ import numpy as np
 import pytest
 import torch
 
-from test_learned_memory import memory_config, memory_batch
+from test_learned_memory import memory_config
+from test_identity import batch as base_batch
 from test_neighbor_bank import make_bank, add_shard, publish
 from test_neighbor_following import clean_sample
 from vesuvius.neural_tracing.fiber_follow.regression.model import (
@@ -29,6 +30,26 @@ from vesuvius.neural_tracing.fiber_follow.shared.runloop import resume_training,
 
 def cfg(**kwargs):
     return memory_config(memory_version=4, correction=False, **kwargs)
+
+
+def memory_batch(c, b=2, step=0):
+    data = base_batch(c, b)
+    data['x'].update(query_position=torch.tensor([0., 0., float(step)*30]).expand(b, -1).clone(),
+        query_frame=torch.eye(3).expand(b, -1, -1).clone(), feature_seed_here=torch.full((b,), step == 0),
+        memory_mask=torch.ones(b, 1, dtype=torch.bool), memory_seed_valid=torch.ones(b, dtype=torch.bool))
+    return data
+
+
+def state_from(model, output):
+    return {k: output['memory_'+k] for k in model.initial_memory(0, 'cpu')}
+
+
+def training_chunk(c, start=0, end=False):
+    steps = [memory_batch(c, 2, step=t) for t in range(start, start+2)]
+    for t, b in enumerate(steps, start):
+        b.update(stream_id=torch.tensor([10, 20]), stream_reset=torch.full((2,), t == 0),
+                 stream_end=torch.full((2,), end and t == start+1))
+    return dict(feature_sequence=steps)
 
 
 def test_single_pass_continuous_curve_and_connection_bound():
@@ -56,25 +77,26 @@ def test_single_pass_continuous_curve_and_connection_bound():
     assert out['points'][..., :2].abs().max() <= model.cfg.lateral_limit
 
 
-def test_geometry_alone_trains_seed_writer_and_earlier_observations():
+def test_geometry_alone_trains_seed_writer_and_earlier_main_encoder_features():
     torch.manual_seed(19)
     model = build_model(cfg())
-    b = memory_batch(model.cfg)
-    # No visible seed/history can supply an alternative identity gradient path.
-    b['hmask'].zero_()
-    b['x']['seed_mask'].zero_()
-    b['x']['memory_patches'].requires_grad_()
-    b['x']['memory_seed_patch'].requires_grad_()
-    b['dense_ab'].fill_(.8)  # recovery offset, not a straight-head target
-    out = model(b['x'], b['hist'], b['hmask'])
+    old = memory_batch(model.cfg, step=0)
+    b = memory_batch(model.cfg, step=1)
+    for row in (old, b):
+        row['hmask'].zero_()
+        row['x']['seed_mask'].zero_()
+        row['x']['fine'].requires_grad_()
+    b['dense_ab'].fill_(.8)
+    first = model(old['x'], old['hist'], old['hmask'])
+    out = model(b['x'], b['hist'], b['hmask'], memory=state_from(model, first))
     terms = loss_terms(out, b, model.cfg)
     assert 'route_per_state' not in terms
     terms['geometry_per_state'].mean().backward()
-    assert b['x']['memory_patches'].grad[:, 0].abs().sum() > 0
-    assert b['x']['memory_seed_patch'].grad.abs().sum() > 0
+    assert old['x']['fine'].grad.abs().sum() > 0
+    assert b['x']['fine'].grad.abs().sum() > 0
     for param in (model.coordinates.weight, model.decoder.layers[0].self_attn.in_proj_weight,
-                  model.recurrent_memory.gate.weight, model.recurrent_memory.proposal.weight,
-                  model.recurrent_memory.probe_head[-1].weight):
+                  model.encoder.stem[0].weight, model.recurrent_memory.gate.weight,
+                  model.recurrent_memory.proposal.weight, model.recurrent_memory.feature_projection[-1].weight):
         assert param.grad is not None and param.grad.abs().sum() > 0
     assert all(p.grad is None or torch.isfinite(p.grad).all() for p in model.parameters())
 
@@ -102,7 +124,7 @@ def test_same_crop_reads_persistent_slots_and_seed_in_crop_frame():
     frame = torch.tensor([[[0., -1., 0.], [1., 0., 0.], [0., 0., 1.]]])
     b['x']['query_frame'] = frame
     ctx = model.context(b['x'], b['hist'], b['hmask'])
-    state = model.recurrent_memory.observe(b['x'])
+    state = model.recurrent_memory.observe_features(ctx['deep'], b['x'])
     # Hold the local crop and latest observation fixed; vary only old memory.
     state = {k: v.detach() for k, v in state.items()}
     ctx['recurrent'] = state
@@ -122,7 +144,7 @@ def test_same_crop_reads_persistent_slots_and_seed_in_crop_frame():
     ctx['recurrent'] = state
     model.predict(ctx, b['hist'])
     torch.testing.assert_close(seen[0], frame)
-    torch.testing.assert_close(state['frame'], torch.eye(3)[None])
+    torch.testing.assert_close(state['frame'], frame)
 
 
 def test_censored_and_departed_states_do_not_train_coordinates():
@@ -140,31 +162,42 @@ def test_censored_and_departed_states_do_not_train_coordinates():
 @pytest.mark.parametrize('version', [2, 3])
 def test_migration_reuses_shared_weights_and_expands_directions(version):
     old = build_model(memory_config(memory_version=version))
+    with torch.no_grad():
+        old.coordinates.weight.fill_(17.)
+        old.coordinates.bias.fill_(19.)
     c = replace(old.cfg, memory_version=4, correction=False, route_refinement_radius=None)
+    # Capture the exact fresh initialization without advancing the migration RNG.
+    with torch.random.fork_rng(devices=[]):
+        fresh = build_model(c)
     model = initialize_trajectory_model(old, c)
     assert model.architecture == TRAJECTORY_MEMORY_ARCHITECTURE
     for key, value in model.state_dict().items():
-        torch.testing.assert_close(value, old.state_dict()[key], rtol=0, atol=0)
+        if version == 3 and key.startswith('coordinates.'):
+            torch.testing.assert_close(value, fresh.state_dict()[key], rtol=0, atol=0)
+            assert not torch.equal(value, old.state_dict()[key])
+        elif not key.startswith('recurrent_memory.'):
+            torch.testing.assert_close(value, old.state_dict()[key], rtol=0, atol=0)
+    assert old.coordinates.weight.eq(17.).all() and old.coordinates.bias.eq(19.).all()
     assert old.cfg.memory_version == version and old.cfg.correction
     expanded = add_direction_inputs(model)
     assert expanded.cfg.direction_inputs and expanded.cfg.memory_version == 4
     assert expanded.encoder.stem[0].weight[:, 2:].eq(0).all()
-    assert expanded.recurrent_memory.patch_encoder[0].weight[:, 2:].eq(0).all()
+    assert not hasattr(expanded.recurrent_memory, 'patch_encoder')
 
 
 def test_training_sequence_checkpoint_and_optimizer_resume(tmp_path):
     torch.manual_seed(32)
     model = build_model(cfg())
     b = memory_batch(model.cfg)
-    b['trajectory_sequence'] = memory_batch(model.cfg, 1)
+    chunk = training_chunk(model.cfg)
     ema = copy.deepcopy(model)
     opt = torch.optim.AdamW(model.parameters(), lr=.001)
     before = model.coordinates.weight.detach().clone()
-    metrics = optimizer_update(model, ema, opt, [b], 1, .001, device='cpu', compute_metrics=False)
+    metrics = optimizer_update(model, ema, opt, [chunk], 1, .001, device='cpu', compute_metrics=False)
     assert np.isfinite(metrics['loss'])
     assert not torch.equal(before, model.coordinates.weight)
-    assert metrics['memory']['sequence_states'] == 1 and metrics['memory']['sequence_loss'] > 0
-    assert 'route_loss' not in metrics['memory']
+    assert metrics['observed_states'] == 4
+    assert 'route_loss' not in metrics.get('memory', {})
     path = tmp_path/'v4.pt'
     spec = FiberVolumeSpec('/tmp/presence', ct_zarr='/tmp/ct', inputs='ct+presence')
     sample = SampleConfig(crop=model.cfg.fine, n_history=model.cfg.n_history, n_future=model.cfg.n_future)
@@ -189,54 +222,74 @@ def test_training_sequence_checkpoint_and_optimizer_resume(tmp_path):
         checkpoint_config(dict(ck, architecture='axial_fiber_memory_v3'))
 
 
-def test_builder_keeps_paired_local_inputs_identical_and_includes_causal_replay(tmp_path, monkeypatch):
+def test_builder_streams_causal_main_crops_and_keeps_paired_endpoints_identical(tmp_path, monkeypatch):
+    from vesuvius.neural_tracing.fiber_follow.regression.feature_sequences import sequence_batches, FeatureStreamStates
     bank, parent = make_bank(tmp_path)
     publish(tmp_path, [add_shard(tmp_path, 0, x=4., z_range=(20., 180.))])
-    c = cfg(fine=CropSpec(depth=40, width=25, behind=16, spacing=1.), memory_steps=16)
+    c = cfg(fine=CropSpec(depth=40, width=25, behind=16, spacing=1.), memory_steps=4)
     builder = IdentityObservationBuilder(c, [parent], negative_bank=bank, augment=True)
     rng = np.random.default_rng(11)
     rows = decision_pair(bank, clean_sample(c), c, rng)
     assert rows is not None
     for row in rows:
         builder.prepare(row, row.get('supervision_fiber', parent), rng)
-        assert builder.footprint_allowed(row, None)
+    reads = []
     def images(items, vol, crop, pool=None, **kwargs):
+        reads.extend((np.asarray(i['pos']).copy(), crop) for i in items)
         return torch.ones(len(items), 2, crop.depth, crop.width, crop.width)*.25
     monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.regression.data.image_crop', images)
-    b = builder(rows, None)
-    assert 'trajectory_sequence' in b and 'route_mask' not in b
-    assert 'trajectory_sequence' not in b['trajectory_sequence']
-    assert {'route_ab', 'plane_ab', 'offtrack', 'memory_target_identity'}.isdisjoint(b['x'])
-    assert b['x']['query_frame'].shape == (2, 3, 3)
-    assert not b['x']['seed_mask'].any()
-    torch.testing.assert_close(b['x']['fine'][0], b['x']['fine'][1], rtol=0, atol=0)
+    chunks = list(sequence_batches(builder, rows, None))
+    assert len(chunks) >= 2
+    steps = [b for chunk in chunks for b in chunk['feature_sequence']]
+    assert len(reads) == sum(len(b['hist']) for b in steps)
+    assert all(crop == c.fine for _, crop in reads)
+    endpoints = []
+    for b in steps:
+        assert 'memory_patches' not in b['x'] and 'feature_seed_x' not in b['x']
+        assert b['memory_target_identity'].shape == (len(b['hist']), 1)
+        endpoints.extend(b['x']['fine'][b['stream_end']].unbind())
+    torch.testing.assert_close(endpoints[0], endpoints[1], rtol=0, atol=0)
     model = build_model(c)
-    metrics = optimizer_update(model, copy.deepcopy(model), torch.optim.AdamW(model.parameters()),
-                               [b], 1, .001, device='cpu', compute_metrics=False)
-    assert np.isfinite(metrics['loss']) and metrics['memory']['sequence_states'] > 0
+    ema, opt, states = copy.deepcopy(model), torch.optim.AdamW(model.parameters()), FeatureStreamStates()
+    for j, chunk in enumerate(chunks):
+        metrics = optimizer_update(model, ema, opt, [chunk], j+1, .001, device='cpu',
+                                   compute_metrics=False, stream_states=states)
+        assert np.isfinite(metrics['loss'])
+        assert all(not v.requires_grad for state in states.states.values() for v in state.values())
+    assert not states.states
 
 
-def test_streaming_memory_matches_reconstruction_and_respects_burn_in():
-    torch.manual_seed(12)
-    model = build_model(cfg(memory_steps=6, memory_grad_steps=2)).eval()
-    b = memory_batch(model.cfg, 1)
-    x = b['x']
-    sequence_keys = ('memory_patches', 'memory_mask', 'memory_positions', 'memory_frames')
-    with torch.no_grad():
-        expected = model(x, b['hist'], b['hmask'])
-        state = model.initial_memory(1, 'cpu')
-        for index in range(x['memory_mask'].shape[1]):
-            current = {k: v[:, index:index+1] if k in sequence_keys else v for k, v in x.items()}
-            current['memory_seed_valid'] = x['memory_seed_valid'] & (index == 0)
-            actual = model(current, b['hist'], b['hmask'], memory=state)
-            state = {k: actual['memory_'+k] for k in state}
-    for key in ('points', 'confidence', 'memory_slots', 'memory_anchor', 'memory_recent'):
-        torch.testing.assert_close(actual[key], expected[key])
-    x['memory_patches'].requires_grad_()
-    out = model(x, b['hist'], b['hmask'])
-    loss_terms(out, b, model.cfg)['geometry_per_state'].sum().backward()
-    assert x['memory_patches'].grad[:, :-3].eq(0).all()
-    assert x['memory_patches'].grad[:, -3:].abs().sum() > 0
+def test_streaming_keeps_remote_seed_and_cache_until_explicit_eviction():
+    model = build_model(cfg(memory_steps=2)).eval()
+    state = None
+    original_anchor = None
+    for t in range(5):
+        b = memory_batch(model.cfg, 1, t)
+        with torch.no_grad():
+            out = model(b['x'], b['hist'], b['hmask'], memory=state)
+        state = state_from(model, out)
+        if original_anchor is None:
+            original_anchor = state['anchor'].clone()
+        torch.testing.assert_close(state['anchor'], original_anchor, rtol=0, atol=0)
+    assert state['cache_valid'].all()
+    # The previous crop is 30 voxels away, well beyond the current crop width.
+    assert (state['cache_xyz'][:, 0, :, 2]-state['position'][:, None, 2]).abs().min() > 10
+    _, padding = model.recurrent_memory.read_tokens(state)
+    assert not padding.any()
+    assert state['cache'].shape[1] == 2
+    assert state['cache_age'].tolist() == [[1., 0.]]
+    ctx = model.context(b['x'], b['hist'], b['hmask'])
+    ctx['recurrent'] = state
+    baseline = model.predict(ctx, b['hist'])['points']
+    changed = dict(state, cache=state['cache'].clone())
+    changed['cache'][:, 0] += torch.randn_like(changed['cache'][:, 0])*2
+    ctx['recurrent'] = changed
+    assert (model.predict(ctx, b['hist'])['points']-baseline).abs().max() > 1e-5
+    # Detaching preserves the exact information and predictions.
+    current = memory_batch(model.cfg, 1, 6)
+    a = model(current['x'], current['hist'], current['hmask'], memory=state)
+    z = model(current['x'], current['hist'], current['hmask'], memory={k:v.detach() for k,v in state.items()})
+    torch.testing.assert_close(a['points'], z['points'], rtol=0, atol=0)
 
 
 def test_tracer_retains_memory_across_commits(monkeypatch):
@@ -245,11 +298,11 @@ def test_tracer_retains_memory_across_commits(monkeypatch):
         return torch.ones(len(items), 2, crop.depth, crop.width, crop.width)*.25
     monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.regression.data.image_crop', images)
     seen = []
-    observe = model.recurrent_memory.observe
-    def capture(x, state=None):
-        seen.append((x['memory_seed_valid'].clone(), state['slots'].clone(), x['query_frame'].clone()))
-        return observe(x, state)
-    monkeypatch.setattr(model.recurrent_memory, 'observe', capture)
+    observe = model.recurrent_memory.observe_features
+    def capture(deep, x, state=None):
+        seen.append((x['feature_seed_here'].clone(), state['slots'].clone(), x['query_frame'].clone()))
+        return observe(deep, x, state)
+    monkeypatch.setattr(model.recurrent_memory, 'observe_features', capture)
     tracer = DirectTracer(model, SimpleNamespace(shape=(1000, 1000, 1000)), model.cfg.fine, model.cfg.n_history,
                           TraceParams(n_commit=1, max_len=8, confidence=0.), device='cpu')
     try:
@@ -285,3 +338,78 @@ def test_parser_exposes_single_pass_v4():
                                      '--trajectory-sequence-weight', '0', '--fiber-zarrs', '/tmp/presence',
                                      '--fibers', '/tmp/fibers', '--ct', '/tmp/ct', '--manifest', '/tmp/seeds.json'])
     assert args.memory_version == 4 and not args.correction and args.trajectory_sequence_weight == 0
+
+
+def test_cold_remote_seed_is_encoded_once_and_warm_trace_reads_only_current_crop(monkeypatch):
+    model = build_model(cfg()).eval()
+    reads = []
+    def images(items, vol, crop, pool=None, **kwargs):
+        reads.extend(np.asarray(i['pos']).copy() for i in items)
+        return torch.ones(len(items), 2, crop.depth, crop.width, crop.width)*.25
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.regression.data.image_crop', images)
+    tracer = DirectTracer(model, SimpleNamespace(shape=(1000, 1000, 1000)), model.cfg.fine,
+                          model.cfg.n_history, TraceParams(n_commit=1), device='cpu')
+    b = memory_batch(model.cfg, 1)
+    pos = np.array([[100., 100., 400.]])
+    paths = [dict(seed_pos=np.array([100., 100., 300.]), seed_tangent=np.array([0., 0., 1.]),
+                  seed_valid=True, seed_age=100., memory_warm=False)]
+    try:
+        x = tracer.build_inputs(pos, np.eye(3)[None], b['hist'].numpy(), b['hmask'].numpy(), paths)
+        assert 'feature_seed_x' in x and len(reads) == 2
+        with torch.no_grad():
+            first = model(x, b['hist'], b['hmask'])
+        state = state_from(model, first)
+        assert state['anchor_valid'].all()
+        torch.testing.assert_close(state['anchor_position'], torch.tensor([[100., 100., 300.]]))
+        paths[0]['memory_warm'] = True
+        x = tracer.build_inputs(pos+np.array([0., 0., 8.]), np.eye(3)[None], b['hist'].numpy(), b['hmask'].numpy(), paths)
+        assert 'feature_seed_x' not in x and len(reads) == 3
+        with torch.no_grad():
+            second = model(x, b['hist'], b['hmask'], memory=state)
+        torch.testing.assert_close(second['memory_anchor'], first['memory_anchor'], rtol=0, atol=0)
+    finally:
+        tracer.close()
+
+
+def test_stream_ownership_reset_detach_and_eviction_across_optimizer_updates():
+    from vesuvius.neural_tracing.fiber_follow.regression.feature_sequences import FeatureStreamStates
+    model = build_model(cfg())
+    ema, opt, states = copy.deepcopy(model), torch.optim.AdamW(model.parameters()), FeatureStreamStates()
+    with pytest.raises(ValueError, match='Missing carried'):
+        states.incoming(model, training_chunk(model.cfg, start=2)['feature_sequence'][0], 'cpu')
+    first = training_chunk(model.cfg)
+    optimizer_update(model, ema, opt, [first], 1, .001, compute_metrics=False, stream_states=states)
+    assert set(states.states) == {10, 20}
+    assert all(not v.requires_grad for row in states.states.values() for v in row.values())
+    later = training_chunk(model.cfg, start=2, end=True)
+    # Keep associations when a loader batch reorders its active traces.
+    later['feature_sequence'][0]['stream_id'] = torch.tensor([20, 10])
+    incoming = states.incoming(model, later['feature_sequence'][0], 'cpu')
+    torch.testing.assert_close(incoming['anchor'][0], states.states[20]['anchor'][0])
+    diagnostic = {}
+    result = optimizer_update(model, ema, opt, [later], 2, .001, compute_metrics=False,
+                              stream_states=states, diagnostic=diagnostic)
+    assert np.isfinite(result['loss']) and result['observed_states'] == 4
+    assert not states.states
+    assert diagnostic['memory']['anchor_valid'].all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA unavailable')
+def test_compiled_feature_sequence_bf16_gradients_match_eager():
+    from vesuvius.neural_tracing.fiber_follow.regression.train import compile_training_model, conv_memory_format
+    torch.manual_seed(77)
+    eager = build_model(cfg()).to('cuda', memory_format=conv_memory_format('cuda'))
+    compiled_base = copy.deepcopy(eager)
+    chunk = training_chunk(eager.cfg)
+    results = []
+    for model in (eager, compile_training_model(compiled_base)):
+        results.append(optimizer_update(model, copy.deepcopy(eager), torch.optim.AdamW(model.parameters()),
+            [chunk], 1, 0., device='cuda', compute_metrics=False, memory_grad_clip=0., rest_grad_clip=0.))
+    assert results[0]['loss'] == pytest.approx(results[1]['loss'], rel=.02, abs=.002)
+    for prefix in ('encoder.', 'decoder.', 'recurrent_memory.'):
+        gradients = [torch.cat([p.grad.flatten() for name,p in m.named_parameters()
+                               if name.startswith(prefix) and p.grad is not None]).float()
+                     for m in (eager, compiled_base)]
+        assert all(torch.isfinite(g).all() for g in gradients)
+        assert torch.nn.functional.cosine_similarity(*gradients, dim=0) > .99
+        assert (gradients[1].norm()/gradients[0].norm()).item() == pytest.approx(1., rel=.05)

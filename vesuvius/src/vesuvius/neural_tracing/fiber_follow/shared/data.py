@@ -526,6 +526,10 @@ class FollowDataset(torch.utils.data.IterableDataset):
                     break
             if len(items) != self.chunk:
                 raise ValueError('Could not fill a training batch outside the held-out band')
+            if getattr(self.batch_builder, 'streaming', False):
+                yield from self.batch_builder.sequence_batches(items, vol, band=self.exclude,
+                    worker=0 if info is None else info.id, requested_fraction=2*requested/self.chunk)
+                continue
             batch = (self.batch_builder(items, vol) if self.batch_builder is not None
                      else collate_with_volume(items, vol, cfg.crop, grid))
             if fraction:

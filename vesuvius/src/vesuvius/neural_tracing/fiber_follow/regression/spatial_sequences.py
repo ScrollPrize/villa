@@ -23,15 +23,24 @@ def earlier_decision(item, builder):
     if not len(known):
         return None
     j = int(rng.choice(known))
+    if arclength(np.asarray(track['pos'][:j+1], float))[-1] < 2:
+        return None
+    return decision_at(item, builder, j, rng=rng)
+
+
+def decision_at(item, builder, j, *, rng=None, observed_indices=None):
+    """Label one causal replay prefix; shared by v3 sampling and v4 streams."""
+    cfg = builder.cfg
+    track = item['memory_track']
+    rng = np.random.default_rng(item['identity_seed']) if rng is None else rng
     path = np.asarray(track['pos'][:j+1],float)
     if not np.isfinite(path).all():
         return None
     arc = arclength(path)
-    if arc[-1] < 2:
-        return None
     pos,frame = path[-1],np.asarray(track['frame'][j],float)
     behind = arc[-1]-np.arange(1,cfg.n_history+1)
-    history = interp_at(path,arc,np.clip(behind,0,arc[-1]))
+    history = (interp_at(path,arc,np.clip(behind,0,arc[-1])) if len(path) > 1 and arc[-1] > 0
+               else np.repeat(pos[None], cfg.n_history, 0))
     fi,current_t,reverse = item['fiber_ref']
     fiber = item.get('supervision_fiber')
     if fiber is None:
@@ -52,10 +61,11 @@ def earlier_decision(item, builder):
                           future_step=cfg.future_step,recent_history_points=cfg.n_history)
     row = label_state(fiber,pos,frame,history,behind >= 0,sample,t=t,reverse=reverse,
                       offtrack=bool(track['offtrack'][j]))
+    observed = slice(None, j) if observed_indices is None else observed_indices
     row.update(fiber_ref=(fi,fiber.length-t if reverse else t,reverse),
                source=item.get('source',1),source_step=item.get('source_step',-1),
                stratum=item.get('stratum',-1),location_source=item.get('location_source',0),
-               memory_track={key:np.asarray(value[:j]).copy() for key,value in track.items()},
+               memory_track={key:np.asarray(value[observed]).copy() for key,value in track.items()},
                _route_sequence_member=True)
     for key in ('supervision_fiber','bank_parent_arc_range',*SEED_FIELDS):
         if key in item:

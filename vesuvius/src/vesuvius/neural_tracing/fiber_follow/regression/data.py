@@ -56,12 +56,27 @@ class ObservationBuilder:
                  seed_mask=stack('visible_seed_mask'),seed_age=stack('visible_seed_age'),
                  seed_tangent=stack('visible_seed_tangent'))
         if self.cfg.memory_slots:
-            from .memory_data import memory_images
-            x.update(memory_images(items, vol, self.cfg, crop_images, pool))
-            if self.cfg.memory_version == 3:
-                x['route_frame'] = stack('frame')
-            elif self.cfg.memory_version == 4:
+            if self.cfg.memory_version == 4:
                 x['query_frame'] = stack('frame')
+                x['query_position'] = stack('pos')
+                here = [bool(i.get('seed_valid', False)) and
+                        np.linalg.norm(np.asarray(i['seed_pos'])-i['pos']) < 1e-4 for i in items]
+                x['feature_seed_here'] = torch.tensor(here)
+                x['memory_mask'] = torch.ones(len(items), 1, dtype=torch.bool)
+                x['memory_seed_valid'] = torch.tensor([bool(i.get('seed_valid', False)) for i in items])
+                remote = [bool(i.get('seed_valid', False)) and not i.get('memory_warm', False) and not h
+                          for i, h in zip(items, here)]
+                if any(remote):
+                    from .feature_sequences import seed_observation
+                    seeds = [seed_observation(i, self.cfg) if r else dict(i, memory_warm=True)
+                             for i, r in zip(items, remote)]
+                    x['feature_seed_x'] = self.images(seeds, vol, pool)
+                    x['feature_seed_x']['feature_active'] = torch.tensor(remote)
+            else:
+                from .memory_data import memory_images
+                x.update(memory_images(items, vol, self.cfg, crop_images, pool))
+                if self.cfg.memory_version == 3:
+                    x['route_frame'] = stack('frame')
         return x
 
     def __call__(self,items,vol):
@@ -490,7 +505,8 @@ class IdentityObservationBuilder(ObservationBuilder):
                 batch[key] = torch.from_numpy(np.stack([i[key] for i in items]))
         if self.cfg.memory_slots and self.cfg.memory_version >= 2:
             from .memory_data import memory_targets
-            batch.update(memory_targets(items, self.cfg))
+            targets = ([dict(i, memory_warm=True) for i in items] if self.cfg.memory_version == 4 else items)
+            batch.update(memory_targets(targets, self.cfg))
         if self.sampling.decision_fraction:
             shape = (2,self.cfg.n_future)
             for key,trailing in (('candidate_points',(3,)),('candidate_mask',()),('candidate_labels',())):
@@ -509,7 +525,7 @@ class IdentityObservationBuilder(ObservationBuilder):
                 augment_image_pair(batch['x']['fine'][j], item['photometric'], rng, **augmentation)
                 if item['drop_presence']:
                     batch['presence_dropped'][j] = 1
-                if self.cfg.memory_slots:
+                if self.cfg.memory_slots and self.cfg.memory_version != 4:
                     # Same augmentation parameters along the observation sequence.
                     x = batch['x']
                     for k in torch.nonzero(x['memory_mask'][j]).flatten().tolist():
@@ -519,13 +535,21 @@ class IdentityObservationBuilder(ObservationBuilder):
                     if item['drop_presence']:
                         x['memory_patches'][j,:,1] = 0
                         x['memory_seed_patch'][j,1] = 0
-        if (self.cfg.memory_version in (3, 4) and self.cfg.sequence_weight > 0
+        if (self.cfg.memory_version == 3 and self.cfg.sequence_weight > 0
                 and not any(i.get('_route_sequence_member',False) for i in items)):
             from .spatial_sequences import earlier_decision
             earlier = [row for item in items if (row := earlier_decision(item,self)) is not None]
             if earlier:
                 batch[self.cfg.sequence_key] = self(earlier,vol)
         return batch
+
+    @property
+    def streaming(self):
+        return self.cfg.memory_version == 4
+
+    def sequence_batches(self, items, vol, **kwargs):
+        from .feature_sequences import sequence_batches
+        return sequence_batches(self, items, vol, **kwargs)
 
 
 def observation_builder(cfg,**kwargs):
@@ -546,4 +570,6 @@ class DirectTracer(ModelTracer):
             for item,path in zip(items,paths):
                 item.update({k:path[k] for k in SEED_FIELDS if k in path})
                 item['memory_warm'] = path.get('memory_warm', False)
-        return {k:v.to(self.device) for k,v in self.observations.images(items,self.vol,self.pool).items()}
+        def move(value):
+            return {k: move(v) for k, v in value.items()} if isinstance(value, dict) else value.to(self.device)
+        return move(self.observations.images(items,self.vol,self.pool))

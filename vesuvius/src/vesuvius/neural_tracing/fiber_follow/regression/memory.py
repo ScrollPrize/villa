@@ -179,8 +179,9 @@ class LearnedMemory(nn.Module):
         attention, h = self.write_attention, self.cfg.hidden
         query = F.linear(self.write_norm(slots), attention.in_proj_weight[:h], attention.in_proj_bias[:h])
         query = query.unflatten(-1, (self.cfg.heads, -1)).transpose(1, 2)
-        visible = torch.cat((torch.ones_like(anchor_valid)[:, None].expand(-1, 8),
-                             anchor_valid[:, None].expand(-1, 8)), 1)
+        count = key.shape[-2]//2
+        visible = torch.cat((torch.ones_like(anchor_valid)[:, None].expand(-1, count),
+                             anchor_valid[:, None].expand(-1, count)), 1)
         evidence = F.scaled_dot_product_attention(query, key, value, attn_mask=visible[:, None, None])
         evidence = attention.out_proj(evidence.transpose(1, 2).flatten(2))
         pair = torch.cat((slots, evidence), -1)
@@ -195,7 +196,7 @@ class LearnedMemory(nn.Module):
         query = observations.mean(2, keepdim=True)
         tokens = torch.cat((slots+self.role[0], anchor_tokens), 2).flatten(0, 1)
         retained = torch.cat((torch.zeros(b, slots.shape[2], device=slots.device, dtype=torch.bool),
-                              ~anchor_valid[:, None].expand(-1, 8)), 1)
+                              ~anchor_valid[:, None].expand(-1, anchor_tokens.shape[-2])), 1)
         read = self.probe_attention(self.probe_norm(query).flatten(0, 1), tokens, tokens,
                                     key_padding_mask=retained.repeat_interleave(t, 0), need_weights=False)[0]
         return self.probe_head(torch.cat((query, read.unflatten(0, (b, t))), -1))[:, :, 0]

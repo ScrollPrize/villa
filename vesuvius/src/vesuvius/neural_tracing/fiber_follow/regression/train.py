@@ -97,6 +97,8 @@ REST_GRAD_CLIP = 20.
 
 def checkpoint_config(ck):
     model_cfg = dict(ck['model_cfg'])
+    if model_cfg.get('memory_version') == 4 and 'feature_memory_revision' not in model_cfg:
+        raise ValueError('This checkpoint is the superseded patch-memory v4; start feature-memory v4 from v2/v3 weights')
     if ck['architecture'] == MEMORY_ARCHITECTURE_V1:
         model_cfg.setdefault('memory_version', 1)  # saved before versions were recorded
     cfg = DirectConfig(**model_cfg)
@@ -139,7 +141,7 @@ def add_direction_inputs(model):
     expanded = build_model(cfg).to(device, memory_format=conv_memory_format(device))
     state = model.state_dict()
     keys = ['encoder.stem.0.weight']
-    if cfg.memory_slots:
+    if cfg.memory_slots and cfg.memory_version != 4:
         keys.append('recurrent_memory.patch_encoder.0.weight')
     target = expanded.state_dict()
     for key in keys:
@@ -179,10 +181,13 @@ decoder attention to identity memory changes behavior even with shared weights.
         raise ValueError('Legacy v1 memory checkpoints cannot initialize new runs')
     device = next(model.parameters()).device
     upgraded = build_model(cfg).to(device, memory_format=conv_memory_format(device))
+    # V3 never used its inherited continuous head; preserve the fresh v4
+    # initialization instead. V2's trained continuous head remains transferable.
+    fresh = ('recurrent_memory.',) + (('coordinates.',) if model.cfg.memory_version == 3 else ())
     state = {k: v for k, v in model.state_dict().items()
-             if not k.startswith(('route_', 'correction_head.'))}
+             if not k.startswith(('route_', 'correction_head.') + fresh)}
     incompatible = upgraded.load_state_dict(state, strict=False)
-    allowed = () if model.cfg.memory_slots else ('recurrent_memory.',)
+    allowed = fresh
     if incompatible.unexpected_keys or any(not k.startswith(allowed) for k in incompatible.missing_keys):
         raise ValueError(f'Unexpected trajectory initialization mismatch: {incompatible}')
     upgraded.train(model.training)
@@ -196,7 +201,7 @@ def move_batch(batch, device):
 
 
 @torch.no_grad()
-def training_diagnostics(model, cpu_batch, tracer, fibers, seeds, out, step, log, *, device):
+def training_diagnostics(model, cpu_batch, tracer, fibers, seeds, out, step, log, *, device, memory=None):
     """Plot EMA proposals and the same monitor rollouts used for logged metrics."""
     from vesuvius.neural_tracing.fiber_follow.shared.diag import plot_batch, plot_curves, plot_refinement, plot_rollouts
     from vesuvius.neural_tracing.fiber_follow.shared.evaluate import evaluate
@@ -213,7 +218,8 @@ def training_diagnostics(model, cpu_batch, tracer, fibers, seeds, out, step, log
     model.eval()
     try:
         with torch.autocast('cuda', dtype=torch.bfloat16, enabled=torch.device(device).type == 'cuda'):
-            prediction = model(batch['x'], batch['hist'], batch['hmask'])
+            prediction = model(batch['x'], batch['hist'], batch['hmask'],
+                               memory=None if memory is None else take(memory))
         points = prediction['points']
         target = torch.cat((batch['plane_ab'], points[..., 2:]), -1)
         for scale, crop in (('fine', model.cfg.fine),):
@@ -297,7 +303,8 @@ def clip_training_gradients(model, memory_max_norm=MEMORY_GRAD_CLIP, rest_max_no
 def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolerance=1.5,
                      confidence_weight=.5, ema_decay=.999, n_commit=None, compute_metrics=True,
                      identity_weight=.5, identity_temperature=.1, candidate_weight=1., memory_probe_weight=.5,
-                     memory_grad_clip=MEMORY_GRAD_CLIP, rest_grad_clip=REST_GRAD_CLIP):
+                     memory_grad_clip=MEMORY_GRAD_CLIP, rest_grad_clip=REST_GRAD_CLIP, stream_states=None,
+                     diagnostic=None):
     """Equal weight per observed state, independent of microbatch boundaries.
 
     Within a state each loss averages over its known points; fully unknown
@@ -305,7 +312,9 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
     Loss sums stay on the device until every microbatch is queued, so the host
     synchronizes once per update rather than once per microbatch.
     """
-    total = sum(len(b['hist']) for b in batches)
+    from .feature_sequences import sequence_steps, FeatureStreamStates
+    stream_states = FeatureStreamStates() if stream_states is None else stream_states
+    total = sum(len(b['hist']) for chunk in batches for b in sequence_steps(chunk))
     if total < 1:
         raise ValueError('An update needs at least one state')
     for group in opt.param_groups:
@@ -323,102 +332,117 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
     decisions, rankings = [], []
     memory = {}
     model.train()
-    for cpu in batches:
-        if 'pair_sampling_version' in cpu:
-            pair_version = int(cpu['pair_sampling_version'][0])
-        batch = move_batch(cpu, device)
-        if model.cfg.memory_slots:
-            sums['memory_observations_mean'] = sums.get('memory_observations_mean', 0.)+float(cpu['x']['memory_mask'].sum())/total
-            if 'memory_target_identity_mask' in cpu:
-                labeled = cpu['memory_target_identity_mask']
-                memory['labeled_writes'] = memory.get('labeled_writes', 0.)+float(labeled.sum())
-                memory['labeled_states'] = memory.get('labeled_states', 0.)+float(labeled.any(-1).sum())
-                memory['departed_states'] = memory.get('departed_states', 0.)+float(
-                    (labeled & (cpu['memory_target_identity'] < .5)).any(-1).sum())
-            sums['memory_anchor_fraction'] = sums.get('memory_anchor_fraction', 0.)+float(cpu['x']['memory_seed_valid'].sum())/total
-        queries = dict(queries=batch['identity_points']) if 'identity_points' in batch else {}
-        if 'candidate_points' in batch:
-            queries['candidates'] = batch['candidate_points']
-        with torch.autocast('cuda', dtype=torch.bfloat16, enabled=torch.device(device).type == 'cuda'):
-            output = model(batch['x'], batch['hist'], batch['hmask'], **queries)
-            terms = loss_terms(output, batch, model.cfg, tolerance, n_commit=n_commit,
-                               identity_temperature=identity_temperature)
-            geometry = terms['geometry_per_state'].sum()/total
-            confidence = terms['confidence_per_state'].sum()/total
-            loss = geometry + confidence_weight*confidence
-            if 'route_per_state' in terms:
-                route_loss = terms['route_per_state'].sum()/total
-                loss = loss+model.cfg.route_loss_weight*route_loss
-                accumulate(memory, 'route_loss', route_loss)
-                for key in ('route_count','route_error_sum'):
-                    accumulate(memory,key,terms[key])
-            if 'identity_per_state' in terms:
-                identity_loss = terms['identity_per_state'].sum()/total
-                loss = loss + identity_weight*identity_loss
-                accumulate(identity, 'identity_loss', identity_loss)
-            if 'candidate_per_state' in terms:
-                candidate_loss = terms['candidate_per_state'].sum()/total
-                loss = loss+candidate_weight*candidate_loss
-                accumulate(identity, 'candidate_loss', candidate_loss)
-            if 'memory_probe' in output and 'memory_target_identity' in batch:
-                probe = memory_probe_terms(output, batch)
-                identity_probe = probe['memory_identity_per_state'].sum()/total
-                offset_probe = probe['memory_offset_per_state'].sum()/total
-                loss = loss+memory_probe_weight*(identity_probe+offset_probe)
-                for key, value in (('probe_identity_loss', identity_probe), ('probe_offset_loss', offset_probe),
-                                   *((k.removeprefix('memory_'), v) for k, v in probe.items() if not k.endswith('_per_state'))):
-                    accumulate(memory, key, value)
-        loss.backward()
-        if model.cfg.memory_version in (3, 4) and model.cfg.sequence_key in batch:
-            earlier = batch[model.cfg.sequence_key]
-            with torch.autocast('cuda',dtype=torch.bfloat16,enabled=torch.device(device).type == 'cuda'):
-                sequence_output = model(earlier['x'],earlier['hist'],earlier['hmask'])
-                sequence_terms = loss_terms(sequence_output,earlier,model.cfg,tolerance,n_commit=n_commit)
-                sequence_loss = model.cfg.sequence_weight*(
-                    model.cfg.route_loss_weight*sequence_terms.get('route_per_state', 0.)+
-                    sequence_terms['geometry_per_state']+confidence_weight*sequence_terms['confidence_per_state']).sum()/total
-            sequence_loss.backward()
-            accumulate(memory,'sequence_loss',sequence_loss)
-            memory['sequence_states'] = memory.get('sequence_states',0)+len(earlier['hist'])
-            loss = loss.detach()+sequence_loss.detach()
-        if compute_metrics:
-            decisions.extend(decision_rows(output, batch, model.cfg, n_commit, tolerance))
-            if 'candidate_confidence_logits' in output:
-                for name, row in candidate_decisions(output, batch, model.cfg, n_commit).items():
-                    group = candidate_groups.setdefault(name, {})
-                    for key, value in row.items():
-                        group[key] = group.get(key, 0)+value
-            if 'query_embedding' in output:
-                rankings.append(identity_ranking(output, batch, model.cfg))
-                for name,row in identity_training_groups(output,batch,terms,model.cfg,identity_temperature).items():
-                    group = identity_groups.setdefault(name,{})
-                    for key,value in row.items():
-                        group[key] = group.get(key,0)+value
-        for key in IDENTITY_SUMS:
-            if key in terms:
-                accumulate(identity, key, terms[key])
-        for key in ('presence_dropped', 'blurred', 'foreign_components', 'seed_present', 'identity_observable'):
-            if key in cpu:
-                identity[key] = identity.get(key, 0.)+float((cpu[key] > 0).sum())
-        if 'decision_requested' in cpu:
-            requested_decisions += float(cpu['decision_requested'].sum())
-        if 'negative_bank_shards' in cpu:
-            low,high = int(cpu['negative_bank_shards'].min()),int(cpu['negative_bank_shards'].max())
-            identity['negative_bank_shards_min'] = min(identity.get('negative_bank_shards_min',low),low)
-            identity['negative_bank_shards_max'] = max(identity.get('negative_bank_shards_max',high),high)
-        if 'location_source' in cpu:
-            for index, name in enumerate(LOCATION_SOURCES):
-                key = f'location_{name}'
-                identity[key] = identity.get(key, 0.)+float((cpu['location_source'] == index).sum())
-        for key, value in (('loss', loss), ('geometry', geometry), ('confidence_loss', confidence)):
-            accumulate(sums, key, value)
-        for key in ('error_sum', 'geometry_count', 'correct_count', 'confidence_count'):
-            accumulate(sums, key, terms[key])
-        if 'source' in cpu:
-            for source in range(len(sources)):
-                sources[source] += int((cpu['source'] == source).sum())
-            if 'bank_tail_length' in cpu:
-                bank_tails.extend(cpu['bank_tail_length'][cpu['source'] == 3].tolist())
+    for chunk in batches:
+        sequence = sequence_steps(chunk)
+        chunk_losses = []
+        for cpu in sequence:
+            if 'pair_sampling_version' in cpu:
+                pair_version = int(cpu['pair_sampling_version'][0])
+            batch = move_batch(cpu, device)
+            if model.cfg.memory_slots:
+                sums['memory_observations_mean'] = sums.get('memory_observations_mean', 0.)+float(cpu['x']['memory_mask'].sum())/total
+                if 'memory_target_identity_mask' in cpu:
+                    labeled = cpu['memory_target_identity_mask']
+                    memory['labeled_writes'] = memory.get('labeled_writes', 0.)+float(labeled.sum())
+                    memory['labeled_states'] = memory.get('labeled_states', 0.)+float(labeled.any(-1).sum())
+                    memory['departed_states'] = memory.get('departed_states', 0.)+float(
+                        (labeled & (cpu['memory_target_identity'] < .5)).any(-1).sum())
+                sums['memory_anchor_fraction'] = sums.get('memory_anchor_fraction', 0.)+float(cpu['x']['memory_seed_valid'].sum())/total
+            carried = stream_states.incoming(model, cpu, device) if 'stream_id' in cpu else None
+            if diagnostic is not None:
+                diagnostic.update(cpu_batch=cpu, memory=None if carried is None else
+                                  {k: v.detach() for k, v in carried.items()})
+            queries = dict(queries=batch['identity_points']) if 'identity_points' in batch else {}
+            if 'candidate_points' in batch:
+                queries['candidates'] = batch['candidate_points']
+            with torch.autocast('cuda', dtype=torch.bfloat16, enabled=torch.device(device).type == 'cuda'):
+                output = model(batch['x'], batch['hist'], batch['hmask'], memory=carried, **queries)
+                if carried is not None:
+                    stream_states.update(cpu, output, carried)
+                terms = loss_terms(output, batch, model.cfg, tolerance, n_commit=n_commit,
+                                   identity_temperature=identity_temperature)
+                geometry = terms['geometry_per_state'].sum()/total
+                confidence = terms['confidence_per_state'].sum()/total
+                loss = geometry + confidence_weight*confidence
+                if 'route_per_state' in terms:
+                    route_loss = terms['route_per_state'].sum()/total
+                    loss = loss+model.cfg.route_loss_weight*route_loss
+                    accumulate(memory, 'route_loss', route_loss)
+                    for key in ('route_count','route_error_sum'):
+                        accumulate(memory,key,terms[key])
+                if 'identity_per_state' in terms:
+                    identity_loss = terms['identity_per_state'].sum()/total
+                    loss = loss + identity_weight*identity_loss
+                    accumulate(identity, 'identity_loss', identity_loss)
+                if 'candidate_per_state' in terms:
+                    candidate_loss = terms['candidate_per_state'].sum()/total
+                    loss = loss+candidate_weight*candidate_loss
+                    accumulate(identity, 'candidate_loss', candidate_loss)
+                if 'memory_probe' in output and 'memory_target_identity' in batch:
+                    probe = memory_probe_terms(output, batch)
+                    identity_probe = probe['memory_identity_per_state'].sum()/total
+                    offset_probe = probe['memory_offset_per_state'].sum()/total
+                    loss = loss+memory_probe_weight*(identity_probe+offset_probe)
+                    for key, value in (('probe_identity_loss', identity_probe), ('probe_offset_loss', offset_probe),
+                                       *((k.removeprefix('memory_'), v) for k, v in probe.items() if not k.endswith('_per_state'))):
+                        accumulate(memory, key, value)
+            if 'feature_sequence' in chunk:
+                chunk_losses.append(loss)
+            else:
+                loss.backward()
+            if model.cfg.memory_version == 3 and model.cfg.sequence_key in batch:
+                earlier = batch[model.cfg.sequence_key]
+                with torch.autocast('cuda',dtype=torch.bfloat16,enabled=torch.device(device).type == 'cuda'):
+                    sequence_output = model(earlier['x'],earlier['hist'],earlier['hmask'])
+                    sequence_terms = loss_terms(sequence_output,earlier,model.cfg,tolerance,n_commit=n_commit)
+                    sequence_loss = model.cfg.sequence_weight*(
+                        model.cfg.route_loss_weight*sequence_terms.get('route_per_state', 0.)+
+                        sequence_terms['geometry_per_state']+confidence_weight*sequence_terms['confidence_per_state']).sum()/total
+                sequence_loss.backward()
+                accumulate(memory,'sequence_loss',sequence_loss)
+                memory['sequence_states'] = memory.get('sequence_states',0)+len(earlier['hist'])
+                loss = loss.detach()+sequence_loss.detach()
+            if compute_metrics:
+                decisions.extend(decision_rows(output, batch, model.cfg, n_commit, tolerance))
+                if 'candidate_confidence_logits' in output:
+                    for name, row in candidate_decisions(output, batch, model.cfg, n_commit).items():
+                        group = candidate_groups.setdefault(name, {})
+                        for key, value in row.items():
+                            group[key] = group.get(key, 0)+value
+                if 'query_embedding' in output:
+                    rankings.append(identity_ranking(output, batch, model.cfg))
+                    for name,row in identity_training_groups(output,batch,terms,model.cfg,identity_temperature).items():
+                        group = identity_groups.setdefault(name,{})
+                        for key,value in row.items():
+                            group[key] = group.get(key,0)+value
+            for key in IDENTITY_SUMS:
+                if key in terms:
+                    accumulate(identity, key, terms[key])
+            for key in ('presence_dropped', 'blurred', 'foreign_components', 'seed_present', 'identity_observable'):
+                if key in cpu:
+                    identity[key] = identity.get(key, 0.)+float((cpu[key] > 0).sum())
+            if 'decision_requested' in cpu:
+                requested_decisions += float(cpu['decision_requested'].sum())
+            if 'negative_bank_shards' in cpu:
+                low,high = int(cpu['negative_bank_shards'].min()),int(cpu['negative_bank_shards'].max())
+                identity['negative_bank_shards_min'] = min(identity.get('negative_bank_shards_min',low),low)
+                identity['negative_bank_shards_max'] = max(identity.get('negative_bank_shards_max',high),high)
+            if 'location_source' in cpu:
+                for index, name in enumerate(LOCATION_SOURCES):
+                    key = f'location_{name}'
+                    identity[key] = identity.get(key, 0.)+float((cpu['location_source'] == index).sum())
+            for key, value in (('loss', loss), ('geometry', geometry), ('confidence_loss', confidence)):
+                accumulate(sums, key, value)
+            for key in ('error_sum', 'geometry_count', 'correct_count', 'confidence_count'):
+                accumulate(sums, key, terms[key])
+            if 'source' in cpu:
+                for source in range(len(sources)):
+                    sources[source] += int((cpu['source'] == source).sum())
+                if 'bank_tail_length' in cpu:
+                    bank_tails.extend(cpu['bank_tail_length'][cpu['source'] == 3].tolist())
+        if chunk_losses:
+            torch.stack(chunk_losses).sum().backward()
+            stream_states.detach()
     resolve_device_sums(sums, identity, memory)
     # The summed loss is finite only if every microbatch loss was; checked before any update.
     if not math.isfinite(sums['loss']):
@@ -426,6 +450,7 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
     sums.update(clip_training_gradients(model, memory_grad_clip, rest_grad_clip))
     opt.step()
     update_ema(ema, model, step, ema_decay)
+    sums['observed_states'] = total
     sums.update(error_mean=sums['error_sum']/max(1., sums['geometry_count']),
                 prefix_correct_fraction=sums['correct_count']/max(1., sums['confidence_count']),
                 fresh_fraction=float(sources[0]/total), fixed_fraction=float(sources[1]/total),
@@ -502,7 +527,11 @@ def build_parser():
     ap.add_argument('--memory-version', type=int, choices=(2,3,4), default=2,
                     help='2: recurrent follower; 3: spatial lattice route; 4: continuous trajectory with direct identity attention (requires --no-correction)')
     ap.add_argument('--trajectory-sequence-weight', type=float, default=DirectConfig.trajectory_sequence_weight,
-                    help='V4 additional geometry/confidence supervision at an earlier causal replay decision')
+                    help='Obsolete v4 prefix loss; must be zero for feature-memory streams')
+    ap.add_argument('--feature-sequence-length', type=int, default=DirectConfig.feature_sequence_length,
+                    help='V4 decisions per gradient chunk; microbatch counts crops across time and traces')
+    ap.add_argument('--feature-memory-grid', type=int, nargs=3, default=DirectConfig.feature_memory_grid,
+                    help='V4 pooled main-encoder spatial grid, depth height width')
     ap.add_argument('--route-grid-step', type=float, default=DirectConfig.route_grid_step)
     ap.add_argument('--route-transition-radius', type=int, default=DirectConfig.route_transition_radius)
     ap.add_argument('--route-transition-cost', type=float, default=DirectConfig.route_transition_cost)
@@ -517,7 +546,7 @@ def build_parser():
     ap.add_argument('--memory-stride', type=int, default=4,
                     help='Spacing of reconstructed historical observations in trace voxels')
     ap.add_argument('--memory-patch-size', type=int, default=17,
-                    help='Odd CT/presence patch size for the memory writer')
+                    help='V2/v3 odd raw memory-patch size; v4 reuses main-encoder features')
     ap.add_argument('--memory-grad-steps', type=int, default=32,
                     help='Newest observations that backpropagate; older ones are a no-grad burn-in')
     ap.add_argument('--memory-probe-weight', type=float, default=.5,
@@ -637,6 +666,7 @@ def main(argv=None):
                        memory_stride=args.memory_stride,memory_patch_size=args.memory_patch_size,
                        memory_grad_steps=args.memory_grad_steps,memory_version=args.memory_version,
                        trajectory_sequence_weight=args.trajectory_sequence_weight,
+                       feature_sequence_length=args.feature_sequence_length, feature_memory_grid=args.feature_memory_grid,
                        **{k:getattr(args,k) for k in ROUTE_OPTIONS})
     initialized = None
     resume = None
@@ -645,9 +675,12 @@ def main(argv=None):
         if args.memory_version == 4 and initialized.cfg.memory_version != 4:
             cfg = replace(initialized.cfg, memory_version=4, correction=False, route_refinement_radius=None,
                           trajectory_sequence_weight=args.trajectory_sequence_weight,
+                          feature_sequence_length=args.feature_sequence_length, feature_memory_grid=args.feature_memory_grid,
                           **{k: getattr(args,k) for k in MEMORY_OPTIONS})
+            reset_coordinates = initialized.cfg.memory_version == 3
             initialized = initialize_trajectory_model(initialized, cfg)
-            progress('Initialized continuous trajectory memory v4 from shared EMA weights; lattice and refinement heads omitted')
+            progress('Initialized feature-memory v4 from shared EMA encoder/decoder weights; new memory initialized'
+                     + ('; continuous coordinate head starts fresh' if reset_coordinates else ''))
         elif args.memory_version == 3 and initialized.cfg.memory_version != 3:
             cfg = replace(initialized.cfg,memory_version=3,
                           **{k:getattr(args,k) for k in (*MEMORY_OPTIONS,*ROUTE_OPTIONS)})
@@ -666,7 +699,8 @@ def main(argv=None):
             if initialized.cfg.memory_slots and initialized.cfg.memory_version == 1:
                 raise ValueError('Legacy v1 memory checkpoints cannot initialize new runs')
             cfg = initialized.cfg
-        for key in (*MEMORY_OPTIONS,'memory_version',*ROUTE_OPTIONS,'trajectory_sequence_weight'):
+        for key in (*MEMORY_OPTIONS,'memory_version',*ROUTE_OPTIONS,'trajectory_sequence_weight',
+                    'feature_sequence_length','feature_memory_grid'):
             setattr(args, key, getattr(cfg, key))
         if args.direction_inputs and not cfg.direction_inputs:
             initialized = add_direction_inputs(initialized)
@@ -684,6 +718,13 @@ def main(argv=None):
         initialized.cfg = cfg
     if args.decision_fraction and args.microbatch % 2:
         raise ValueError('Matched decisions require an even microbatch')
+    stream_batch = args.microbatch
+    if cfg.memory_version == 4:
+        if args.microbatch % cfg.feature_sequence_length:
+            raise ValueError('V4 microbatch must divide into feature_sequence_length decisions')
+        stream_batch = args.microbatch//cfg.feature_sequence_length
+        if args.decision_fraction and stream_batch % 2:
+            raise ValueError('V4 matched decisions need an even number of traces: microbatch / feature_sequence_length')
     if not np.isfinite(args.candidate_weight) or args.candidate_weight <= 0:
         raise ValueError('Candidate weight must be finite and positive')
     if not np.isfinite(args.memory_probe_weight) or args.memory_probe_weight < 0 or args.dagger_after <= 0:
@@ -759,6 +800,8 @@ def main(argv=None):
                    'negative_bank_refresh_seconds','negative_bank_cache_mb','activation_checkpointing',
                    'memory_grad_clip','rest_grad_clip','presence_dropout','blur_probability','blur_sigma',
                    'decision_fraction','bank_following_probability','fresh_fraction','route_refinement_radius'}
+        if cfg.memory_version != 4:
+            ignored.update(('trajectory_sequence_weight', 'feature_sequence_length', 'feature_memory_grid'))
         defaults = build_parser()
         for key,value in vars(args).items():
             # Options added after a run started had their default behavior.
@@ -807,9 +850,11 @@ def main(argv=None):
     contacts = load_contacts(args.contacts,train_f,band) if args.contacts else ()
     hard_spans = load_hard_spans(args.hard_spans,train_f) if args.hard_spans else ()
     progress(f'Sampling: {len(contacts)} contacts, {len(hard_spans)} hard spans; memory slots={cfg.memory_slots}')
+    if cfg.memory_version == 4:
+        progress(f'Feature-memory streams: {stream_batch} traces x {cfg.feature_sequence_length} decisions per full chunk; state persists across chunks')
     builder = IdentityObservationBuilder(cfg,train_f,identity_sampling,contacts=contacts,
         hard_spans=hard_spans,augment=True,negative_bank=negative_bank,**role_banks)
-    dataset = FollowDataset(train_f, spec, sample, band, chunk=args.microbatch, seed=args.seed+done,
+    dataset = FollowDataset(train_f, spec, sample, band, chunk=stream_batch, seed=args.seed+done,
         cache_bytes=int(args.worker_cache_gb*(1 << 30)), fixed=fixed, onpolicy=caches,
         replay_index=str(collector.index), batch_builder=builder, additional_crops=(), fresh_fraction=args.fresh_fraction)
     loader_args = dict(batch_size=None, num_workers=args.workers,
@@ -834,7 +879,8 @@ def main(argv=None):
     log.record(dict(step=done,event='identity_sampling',architecture=model.architecture,
         source_sampling=dict(fresh=args.fresh_fraction,fixed=(1-args.fresh_fraction)/2,recent=(1-args.fresh_fraction)/2),
         pair_sampling_version=identity_sampling.pair_sampling_version,
-        history_policy='learned_observation_memory' if cfg.memory_slots else 'visible_crop_only',sampling=asdict(identity_sampling),
+        history_policy=('main_encoder_feature_memory' if cfg.memory_version == 4 else
+                        'learned_observation_memory' if cfg.memory_slots else 'visible_crop_only'),sampling=asdict(identity_sampling),
         negative_bank_path=str(negative_bank.root),negative_bank_provenance=negative_bank.provenance(),
         bank_role_provenance=role_provenance()))
     tracer = None
@@ -849,6 +895,10 @@ def main(argv=None):
                 TraceParams(n_commit=args.n_commit, max_len=args.diag_max_len), device=args.device)
         progress(f'Starting data loader; waiting for {args.batch//args.microbatch} microbatches for update {done+1}')
         iterator = iter(loader)
+        from .feature_sequences import FeatureStreamStates, sequence_steps
+        stream_states = FeatureStreamStates()
+        observed_states = interval_states = 0
+        prior_samples = int(resume.get('samples_seen', done*args.batch)) if resume else 0
         for step in range(done+1, args.steps+1):
             event = collector.poll()
             if event:
@@ -858,21 +908,28 @@ def main(argv=None):
             if early and step != done+1:
                 progress(f'Update {step}: waiting for data')
             batches = []
-            for index in range(args.batch//args.microbatch):
-                batches.append(next(iterator))
+            batch_states = 0
+            while batch_states < args.batch:
+                chunk = next(iterator)
+                batches.append(chunk)
+                batch_states += sum(len(b['hist']) for b in sequence_steps(chunk))
                 if step == done+1:
-                    progress(f'Update {step}: received microbatch {index+1}/{args.batch//args.microbatch}')
+                    progress(f'Update {step}: received {batch_states}/{args.batch} crop states')
             data_seconds = time.monotonic()-batch_started
             update_started = time.monotonic()
             if early:
                 progress(f'Update {step}: data ready in {data_seconds:.1f}s; running forward/backward and optimizer')
             lr = lr_at(step, args.lr, args.warmup, args.steps)
+            diagnostic = {} if tracer is not None and args.diag_every and step % args.diag_every == 0 else None
             metrics = optimizer_update(trainable, ema, opt, batches, step, lr, device=args.device,
                 tolerance=args.tolerance, confidence_weight=args.confidence_weight, ema_decay=args.ema_decay,
                 n_commit=args.n_commit, compute_metrics=step % args.log_every == 0 or step == args.steps,
                 identity_weight=args.identity_weight, identity_temperature=args.identity_temperature,
                 candidate_weight=args.candidate_weight, memory_probe_weight=args.memory_probe_weight,
-                memory_grad_clip=args.memory_grad_clip, rest_grad_clip=args.rest_grad_clip)
+                memory_grad_clip=args.memory_grad_clip, rest_grad_clip=args.rest_grad_clip,
+                stream_states=stream_states, diagnostic=diagnostic)
+            observed_states += metrics['observed_states']
+            interval_states += metrics['observed_states']
             update_seconds = time.monotonic()-update_started
             interval_data_seconds += data_seconds
             interval_update_seconds += update_seconds
@@ -882,16 +939,18 @@ def main(argv=None):
                     progress(f'Startup progress complete; regular metrics every {args.log_every} updates')
             if step % args.log_every == 0 or step == args.steps:
                 now = time.monotonic()
-                log.record(dict(step=step, lr=lr, **metrics, samples_seen=step*args.batch,
+                log.record(dict(step=step, lr=lr, **metrics, samples_seen=prior_samples+observed_states,
                     train_seconds=now-started,
-                    samples_per_second=(step-done)*args.batch/(now-started),
-                    interval_samples_per_second=(step-interval_step)*args.batch/(now-interval_started),
+                    samples_per_second=observed_states/(now-started),
+                    interval_samples_per_second=interval_states/(now-interval_started),
                     interval_data_seconds=interval_data_seconds, interval_update_seconds=interval_update_seconds))
                 interval_started, interval_step = now, step
                 interval_data_seconds = interval_update_seconds = 0.
+                interval_states = 0
 
             def save(path, resumable=False):
                 extra = dict(step=step, tolerance=args.tolerance, n_commit=args.n_commit,
+                    samples_seen=prior_samples+observed_states,
                     identity_sampling=asdict(identity_sampling),
                     negative_bank_provenance=negative_bank.provenance() if negative_bank else None,
                     bank_role_provenance=role_provenance(),
@@ -909,13 +968,18 @@ def main(argv=None):
                     extra.update(optimizer=opt.state_dict(), rng=training_rng_state())
                 save_checkpoint(path, model, ema, spec, sample, extra)
 
+            # Preserve the completed optimizer update before optional collectors
+            # or diagnostics can fail. These checkpoints include optimizer/RNG.
+            if step % args.ckpt_every == 0 or step == args.steps:
+                save(out/f'ckpt_{step:06d}.pt', resumable=True)
+                save(out/'last.pt', resumable=True)
             if step < args.steps and collector.launch(step, save):
                 log.record(dict(step=step, dagger_launched=True))
             periodic = {}
             if tracer is not None and args.diag_every and step % args.diag_every == 0:
                 began = time.monotonic()
-                training_diagnostics(ema, batches[-1], tracer, val_f, manifest['monitor'], out, step, log,
-                                     device=args.device)
+                training_diagnostics(ema, diagnostic['cpu_batch'], tracer, val_f, manifest['monitor'], out, step, log,
+                                     device=args.device, memory=diagnostic['memory'])
                 periodic['diagnostics_seconds'] = time.monotonic()-began
             if tracer is not None and args.long_diag_every and step % args.long_diag_every == 0:
                 from vesuvius.neural_tracing.fiber_follow.shared.evaluate import evaluate
@@ -952,9 +1016,6 @@ def main(argv=None):
             if periodic:
                 # Wall time spent outside optimizer updates, so throughput can be read from the log.
                 log.record(dict(step=step, **periodic))
-            if step % args.ckpt_every == 0 or step == args.steps:
-                save(out/f'ckpt_{step:06d}.pt', resumable=True)
-                save(out/'last.pt', resumable=True)
     finally:
         event = collector.close()
         if event:

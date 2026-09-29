@@ -49,8 +49,11 @@ def evaluate_recovery_states(model, vol, states, fibers, sample, *, device='cpu'
     count = len(states) if limit == 0 else min(limit, len(states))
     if limit < 0 or recovery_length <= 0 or not 1 <= n_commit <= model.cfg.n_future:
         raise ValueError('Invalid recovery evaluation bounds')
-    def move(value):
-        return {k: move(v) for k,v in value.items()} if isinstance(value, dict) else value.to(device)
+    def move(value, *, float_inputs=False):
+        if isinstance(value, dict):
+            return {k: move(v, float_inputs=float_inputs) for k,v in value.items()}
+        dtype = torch.float32 if float_inputs and value.is_floating_point() else value.dtype
+        return value.to(device=device, dtype=dtype)
     grid = torch.from_numpy(crop_local_grid(sample.crop)).float()
     rows, predictions = [], []
     for j in range(count):
@@ -67,8 +70,9 @@ def evaluate_recovery_states(model, vol, states, fibers, sample, *, device='cpu'
             generator=trace_generator(sampling_seed,states.pos[j],states.frame[j,:,2])
             sampling['initial_noise']=trace_noise(model.cfg,[generator],device)
         # The original crop builder can return float16, while direct images
-        # arrive as a dictionary. Both enter the model in float32 before AMP.
-        images = {k: v.float() for k, v in b['x'].items()} if isinstance(b['x'], dict) else b['x'].float()
+        # arrive as a dictionary, including v4's nested remote-seed crop.
+        # Floating inputs enter in float32 before AMP; preserve boolean masks.
+        images = move(b['x'], float_inputs=True)
         with torch.no_grad(),torch.autocast('cuda',dtype=torch.bfloat16,enabled=device.startswith('cuda')):
             output=model(images,b['hist'],b['hmask'],**sampling)
         if on_prediction is not None:

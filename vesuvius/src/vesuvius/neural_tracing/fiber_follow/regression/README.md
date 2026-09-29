@@ -1,7 +1,7 @@
 # Axial fiber follower
 
 For the single-pass continuous decoder with direct attention to persistent
-identity memory, see [trajectory memory v4](TRAJECTORY_MEMORY.md). It is selected
+main-encoder feature memory and streamed training, see [trajectory memory v4](TRAJECTORY_MEMORY.md). It is selected
 explicitly and does not change the v2 default or existing v3 runs.
 
 The training launcher uses `axial_fiber_memory_v2`, the model from

@@ -28,6 +28,7 @@ def main(argv=None):
     ap.add_argument('--microbatch',type=int,default=4)
     ap.add_argument('--batches',type=int,default=4)
     ap.add_argument('--forward',action='store_true')
+    ap.add_argument('--direction-inputs',action='store_true')
     ap.add_argument('--memory-version',type=int,choices=(2,3,4),default=2)
     ap.add_argument('--memory-slots',type=int,default=0)
     ap.add_argument('--memory-steps',type=int,default=32)
@@ -39,7 +40,7 @@ def main(argv=None):
     ap.add_argument('--onpolicy',nargs='*',default=[],help='Replay caches, e.g. collected with observed tracks')
     args=ap.parse_args(argv)
     torch.set_num_threads(4);torch.manual_seed(0)
-    cfg=DirectConfig(memory_version=args.memory_version,memory_slots=args.memory_slots,memory_steps=args.memory_steps,
+    cfg=DirectConfig(direction_inputs=args.direction_inputs,memory_version=args.memory_version,memory_slots=args.memory_slots,memory_steps=args.memory_steps,
                      memory_stride=args.memory_stride,memory_patch_size=args.memory_patch_size,
                      memory_grad_steps=args.memory_grad_steps,correction=args.memory_version != 4)
     spec=FiberVolumeSpec(args.fiber_zarrs,ct_zarr=args.ct,ct_level=0,ct_grid_scale=4.,inputs='ct+presence')
@@ -52,13 +53,44 @@ def main(argv=None):
         memory_switch_probability=args.memory_switch_probability,memory_switch_tail=tuple(args.memory_switch_tail))
     builder=IdentityObservationBuilder(cfg,fibers,sampling,negative_bank=bank,augment=True)
     sample=SampleConfig(crop=cfg.fine,n_history=cfg.n_history,n_future=cfg.n_future,recent_history_points=cfg.n_history)
-    ds=FollowDataset(fibers,spec,sample,band,chunk=args.microbatch,seed=37,batch_builder=builder,
+    chunk = args.microbatch
+    if cfg.memory_version == 4:
+        if args.microbatch % (2*cfg.feature_sequence_length):
+            raise ValueError('V4 preflight microbatch must contain an even number of full sequence streams')
+        chunk //= cfg.feature_sequence_length
+    ds=FollowDataset(fibers,spec,sample,band,chunk=chunk,seed=37,batch_builder=builder,
                      onpolicy=[OnPolicyStates.load(p) for p in args.onpolicy])
     it=iter(ds);args.out.mkdir(parents=True,exist_ok=True)
     model=build_model(cfg).to(args.device,memory_format=conv_memory_format(args.device)) if args.forward else None
+    if cfg.memory_version == 4:
+        import copy
+        from .feature_sequences import FeatureStreamStates
+        from .train import optimizer_update
+        states = FeatureStreamStates()
+        ema = copy.deepcopy(model) if model is not None else None
+        opt = torch.optim.AdamW(model.parameters(), lr=0.) if model is not None else None
     rows=[]
     for index in range(args.batches):
         started=time.perf_counter();cpu=next(it)
+        if cfg.memory_version == 4:
+            steps = cpu['feature_sequence']
+            for batch in steps:
+                assert 'memory_patches' not in batch['x'] and 'feature_seed_x' not in batch['x']
+                assert torch.isfinite(batch['x']['fine']).all()
+                assert all(torch.isfinite(batch[k]).all() for k in ('memory_target_identity','memory_target_offset'))
+            if index == 0:
+                torch.save(cpu, args.out/'batch.pt')
+            row = dict(batch=index, read_seconds=time.perf_counter()-started,
+                       states=sum(len(b['hist']) for b in steps), decisions=len(steps))
+            if model is not None:
+                metrics = optimizer_update(model, ema, opt, [cpu], index+1, 0., device=args.device,
+                                           compute_metrics=False, stream_states=states)
+                assert all(p.grad is None or torch.isfinite(p.grad).all() for p in model.parameters())
+                assert model.encoder.compress.weight.grad.abs().sum() > 0
+                row.update(loss=metrics['loss'], retained_streams=len(states.states))
+            rows.append(row)
+            print(json.dumps(row), flush=True)
+            continue
         assert {'fine','seed','seed_mask','seed_age','seed_tangent'} <= set(cpu['x'])
         if cfg.memory_slots:
             assert cpu['x']['memory_mask'][:,-1].all()

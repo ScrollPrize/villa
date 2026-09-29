@@ -57,7 +57,7 @@ def memory_layout(item, cfg):
             if not np.isfinite(heading).all() or np.linalg.norm(heading) < 1e-6:
                 heading = frame[:, 2]
             observations.append(dict(pos=hist[i], frame=frame_from_heading(normalize(heading))))
-    observations.append(dict(pos=pos, frame=frame_from_heading(frame[:, 2])))
+    observations.append(dict(pos=pos, frame=frame if cfg.memory_version == 4 else frame_from_heading(frame[:, 2])))
     seed = None
     if not warm and item.get('seed_valid', False):
         point = np.asarray(item['seed_pos'])
@@ -68,6 +68,13 @@ def memory_layout(item, cfg):
 
 
 def memory_allowed(item, cfg, band):
+    if cfg.memory_version == 4:
+        if not training_state_allowed(item, cfg.fine, band):
+            return False
+        if item.get('seed_valid', False) and not item.get('memory_warm', False):
+            from .feature_sequences import seed_observation
+            return training_state_allowed(seed_observation(item, cfg), cfg.fine, band)
+        return True
     observations, seed = memory_layout(item, cfg)
     return all(training_state_allowed(o, memory_crop(cfg), band)
                for o in observations+([] if seed is None else [seed]))
