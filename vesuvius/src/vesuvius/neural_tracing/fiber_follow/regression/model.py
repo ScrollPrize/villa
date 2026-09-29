@@ -7,6 +7,7 @@ small observation encoder; v4 retains main-encoder features. Both memory designs
 carry bounded state and an immutable seed.
 """
 from dataclasses import asdict, dataclass, field
+from contextlib import nullcontext
 import math
 
 import torch
@@ -64,8 +65,16 @@ class DirectConfig:
     feature_memory_grid: tuple = (2, 4, 4)  # v4 spatial tokens per encoded crop
     feature_sequence_length: int = 2  # v4 decisions per gradient chunk
     feature_memory_revision: int = 1
+    recurrent_refinement_steps: int = 0  # v4 shared-decoder passes after the initial proposal
+    recurrent_refinement_limit: float = 1.  # maximum lateral update norm per pass
 
     def __post_init__(self):
+        if not isinstance(self.recurrent_refinement_steps, int) or self.recurrent_refinement_steps < 0:
+            raise ValueError('Recurrent refinement steps must be a nonnegative integer')
+        if not math.isfinite(self.recurrent_refinement_limit) or self.recurrent_refinement_limit <= 0:
+            raise ValueError('Recurrent refinement limit must be finite and positive')
+        if self.recurrent_refinement_steps and self.memory_version != 4:
+            raise ValueError('Recurrent refinement requires feature-memory v4')
         if not isinstance(self.direction_inputs, bool):
             raise ValueError('direction_inputs must be a boolean')
         if isinstance(self.fine, dict):
@@ -239,14 +248,38 @@ class DepthwiseConv3d(nn.Conv3d):
 
 class PathDecoderLayer(nn.TransformerDecoderLayer):
     """Prefer cuDNN for short queries over long, padding-masked image memory."""
+    def attention_backend(self, tensor):
+        return (sdpa_kernel([SDPBackend.CUDNN_ATTENTION, SDPBackend.FLASH_ATTENTION,
+                             SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH], set_priority=True)
+                if tensor.is_cuda else nullcontext())
+
     def _mha_block(self, x, mem, attn_mask, key_padding_mask, is_causal=False):
-        if x.is_cuda:
-            # Flash does not support this padding mask in the installed PyTorch.
-            # Retain the other backends for unsupported devices/dtypes/shapes.
-            with sdpa_kernel([SDPBackend.CUDNN_ATTENTION, SDPBackend.FLASH_ATTENTION,
-                              SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH], set_priority=True):
-                return super()._mha_block(x, mem, attn_mask, key_padding_mask, is_causal)
-        return super()._mha_block(x, mem, attn_mask, key_padding_mask, is_causal)
+        with self.attention_backend(x):
+            return super()._mha_block(x, mem, attn_mask, key_padding_mask, is_causal)
+
+    def project_memory(self, memory):
+        """Differentiable per-decision K/V; never retained across model forwards."""
+        attn = self.multihead_attn
+        h, heads = attn.embed_dim, attn.num_heads
+        kv = F.linear(memory, attn.in_proj_weight[h:], attn.in_proj_bias[h:])
+        return tuple(v.reshape(len(memory), -1, heads, h//heads).transpose(1, 2).contiguous()
+                     for v in kv.chunk(2, dim=-1))
+
+    def forward_cached(self, x, kv, padding):
+        """The ordinary pre-norm decoder computation with already projected K/V."""
+        if not self.norm_first or self.multihead_attn.dropout:
+            raise ValueError('Cached trajectory decoder requires pre-norm and zero attention dropout')
+        x = x+self._sa_block(self.norm1(x), None, None)
+        attn = self.multihead_attn
+        h, heads = attn.embed_dim, attn.num_heads
+        q = F.linear(self.norm2(x), attn.in_proj_weight[:h], attn.in_proj_bias[:h])
+        q = q.reshape(len(x), -1, heads, h//heads).transpose(1, 2).contiguous()
+        mask = torch.zeros(padding.shape, device=x.device, dtype=q.dtype).masked_fill(padding, -torch.inf)
+        with self.attention_backend(q):
+            value = F.scaled_dot_product_attention(q, *kv, attn_mask=mask[:, None, None, :])
+        value = value.transpose(1, 2).contiguous().reshape(len(x), -1, h)
+        x = x+self.dropout2(attn.out_proj(value))
+        return x+self._ff_block(self.norm3(x))
 
 
 class AxialBlock(nn.Module):
@@ -381,7 +414,9 @@ class DirectFollower(nn.Module):
         mask = torch.cat((hmask.bool(),seed_mask),1) & crop_support(references,cfg.fine)
         references = torch.where(mask[...,None],references.float(),0.)
         dense,deep,image_tokens = self.encoder(x['fine'],references,mask)
-        local,_ = sample_features(dense,references,cfg.fine)
+        sampling_dense = dense.float() if cfg.recurrent_refinement_steps else dense
+        local,_ = sample_features(sampling_dense,references,cfg.fine)
+        local = local.to(dense.dtype)
         embedded = F.normalize(self.embedding(local),dim=-1)
         embedded = torch.where(mask[...,None],embedded,0.)
         ages = torch.arange(1,cfg.n_history+2,device=hist.device).float()[None].expand(len(hist),-1).clone()
@@ -395,8 +430,11 @@ class DirectFollower(nn.Module):
         ref_tokens = self.reference_token(torch.cat((local,metadata),-1))
         memory = torch.cat((image_tokens,ref_tokens.to(image_tokens.dtype)),1)
         padding = torch.cat((torch.zeros(image_tokens.shape[:2],device=hist.device,dtype=torch.bool),~mask),1)
-        return dict(fine=dense,deep=deep,memory=memory,padding=padding,
-                    reference_embedding=embedded,reference_mask=mask)
+        ctx = dict(fine=dense,deep=deep,memory=memory,padding=padding,
+                   reference_embedding=embedded,reference_mask=mask)
+        if cfg.recurrent_refinement_steps:
+            ctx.update(fine_fp32=sampling_dense, deep_fp32=deep.float())
+        return ctx
 
     def patches(self, fine, points):
         b,k,_ = points.shape
@@ -404,13 +442,16 @@ class DirectFollower(nn.Module):
         return values.reshape(b,k,-1)
 
     def query_features(self, ctx, initial):
-        return torch.cat((self.patches(ctx['fine'],initial),initial[...,2:]/(self.cfg.n_future*self.cfg.future_step)),-1)
+        patches = self.patches(ctx.get('fine_fp32', ctx['fine']),initial).to(ctx['fine'].dtype)
+        return torch.cat((patches,initial[...,2:]/(self.cfg.n_future*self.cfg.future_step)),-1)
 
     def evidence(self, ctx, points, stage):
         b,k,_ = points.shape
-        local,support = sample_features(ctx['fine'],(points[:,:,None]+self.path_stencil).reshape(b,k*27,3),self.cfg.fine)
+        local,support = sample_features(ctx.get('fine_fp32', ctx['fine']),(points[:,:,None]+self.path_stencil).reshape(b,k*27,3),self.cfg.fine)
+        local = local.to(ctx['fine'].dtype)
         local = torch.cat((local,support[...,None]),-1).reshape(b,k,-1)
-        deep,valid = sample_features(ctx['deep'],points,self.cfg.fine,TOKEN_STRIDE,TOKEN_OFFSET)
+        deep,valid = sample_features(ctx.get('deep_fp32', ctx['deep']),points,self.cfg.fine,TOKEN_STRIDE,TOKEN_OFFSET)
+        deep = deep.to(ctx['deep'].dtype)
         return torch.cat((local,deep,valid[...,None]),-1)
 
     def forward(self, x, hist, hmask, queries=None, candidates=None, memory=None):

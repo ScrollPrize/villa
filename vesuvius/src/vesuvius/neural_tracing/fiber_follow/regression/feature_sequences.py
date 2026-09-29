@@ -11,6 +11,8 @@ from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength, fram
 from vesuvius.neural_tracing.fiber_follow.shared.data import training_state_allowed
 
 
+FEATURE_SAMPLING_REVISION = 3  # causal headings, generator-certified history, equal crop weights
+
 def seed_observation(item, cfg):
     return dict(pos=np.asarray(item['seed_pos']).copy(),
         frame=frame_from_heading(normalize(np.asarray(item['seed_tangent']))),
@@ -23,7 +25,7 @@ def stream_rows(item, builder, band=None):
     """Use observed paths (including drift), not annotation trajectories as inputs.
 
     Retain the actual seed and the newest memory_steps historical decisions.
-    Every selected position is encoded once and is itself a training example.
+    Every selected position is encoded once; known membership supplies supervision.
     Unknown bridge states retain their observations but have masked supervision.
     Reject an entire stream if any crop/label crosses the held-out band.
     """
@@ -38,11 +40,29 @@ def stream_rows(item, builder, band=None):
         if len(path) > 1 and arc[-1] > 0:
             pos = interp_at(path, arc, sample_s)
             behind = interp_at(path, arc, np.maximum(0, sample_s-.5))
-            frames = np.stack([frame_from_heading(normalize(p-q) if np.linalg.norm(p-q) > 1e-6
-                                else np.asarray(item['frame'])[:, 2]) for p, q in zip(pos, behind)])
+            keep = np.linalg.norm(pos-behind, axis=1)>1e-6
+            seed_here = bool(item.get('seed_valid', False) and np.linalg.norm(pos[0]-item['seed_pos'])<1e-4)
+            if seed_here:
+                keep[0] = True
+            frames = np.asarray([frame_from_heading(item['seed_tangent'] if k==0 and seed_here else normalize(p-q))
+                for k,(p,q) in enumerate(zip(pos,behind)) if keep[k]]).reshape(-1,3,3)
+            pos = pos[keep]
         else:
             pos, frames = np.empty((0, 3)), np.empty((0, 3, 3))
-        track = dict(pos=pos, frame=frames, offtrack=np.zeros(len(pos)), offset=np.full((len(pos), 3), np.nan))
+        membership = np.zeros(len(pos))
+        if not item.get('_generated_original_history', False):
+            membership[:] = np.nan
+            if '_constructed_path' in item and len(pos):
+                from .neighbor_mining import exact_nearest
+                distance, _, segment, u = exact_nearest(pos, item['_constructed_path'])
+                arcs = item['_constructed_arc']
+                at = arcs[segment]+u*np.diff(arcs)[segment]
+                # Reconstructed chords can cut across bends: certify only points
+                # still close to the generated path and outside its unknown bridge.
+                close = distance<=.25
+                membership[close & (at<=item['_leave_arc']+1e-6)] = 0.
+                membership[close & (at>=item['_reach_arc']-1e-6)] = 1.
+        track = dict(pos=pos, frame=frames, offtrack=membership, offset=np.full((len(pos),3),np.nan))
     # Label/history construction still sees the whole causal observed prefix;
     # the feature stream only reads the retained keyframes and its immutable seed.
     track = {key: np.asarray(value).copy() for key, value in track.items()}
@@ -51,7 +71,9 @@ def stream_rows(item, builder, band=None):
         seed = seed_observation(item, cfg)
         # Prepending supplies causal history; do not duplicate an existing seed.
         if not len(track['pos']) or np.linalg.norm(track['pos'][0]-seed['pos']) > 1e-4:
-            additions = dict(pos=seed['pos'], frame=seed['frame'], offtrack=0., offset=np.zeros(3))
+            certified = item.get('_seed_original_certified', False)
+            additions = dict(pos=seed['pos'], frame=seed['frame'], offtrack=0. if certified else np.nan,
+                             offset=np.zeros(3) if certified else np.full(3,np.nan))
             track = {key: np.concatenate((np.asarray(additions[key])[None], value)) for key, value in track.items()}
             indices = [j+1 for j in indices]
         if not indices or indices[0] != 0:

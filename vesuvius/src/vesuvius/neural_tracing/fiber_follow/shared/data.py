@@ -293,7 +293,8 @@ def make_sample(fiber: TracedFiber, t: float, reverse: bool, cfg: SampleConfig, 
     drift = fr[:,:2] @ displacement
     hist += ramp[:,None]*drift
     pos += drift
-    return dict(pos=pos, frame=frame, hist_local=(hist-pos) @ frame, hmask=hmask,
+    return dict(_generated_original_history=True, _seed_original_certified=True,
+                pos=pos, frame=frame, hist_local=(hist-pos) @ frame, hmask=hmask,
                 **continuation_targets(fiber, t, reverse, pos, frame, cfg))
 
 

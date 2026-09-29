@@ -99,7 +99,7 @@ def loss_terms(output, batch, cfg, tolerance=1.5, *, n_commit=None, identity_tem
     error = F.smooth_l1_loss(predicted, target, beta=1., reduction='none').mean(-1)
     geometry = window_mean(error, mask, near)
     initial_geometry = geometry
-    if cfg.correction:
+    if cfg.correction or cfg.recurrent_refinement_steps:
         initial = F.interpolate(output['initial_points'][..., :2].transpose(1, 2),
                                 size=mask.shape[1], mode='linear', align_corners=True).transpose(1, 2)
         initial_error = F.smooth_l1_loss(initial, target, beta=1., reduction='none').mean(-1)

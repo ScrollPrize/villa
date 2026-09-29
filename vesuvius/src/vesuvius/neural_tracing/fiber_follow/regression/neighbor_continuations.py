@@ -90,6 +90,10 @@ def wrong_continuation(bank, cfg, rng, *, tail_length_range=(4., 128.), prefer_l
                 bank_transition_length=bridge_length,bank_tail_length=tail_length,
                 bank_prefix_end_t=float(own_t[0]), seed_pos=path[0].copy(),
                 seed_tangent=normalize(path[1]-path[0]),seed_age=float(distance[-1]),seed_valid=True)
+    # Certification metadata only: never enters the model.
+    item.update(_seed_original_certified=True, _constructed_path=path,
+                _constructed_arc=distance, _leave_arc=distance[len(prefix_t)],
+                _reach_arc=distance[len(prefix_t)+int(np.searchsorted(samples,finish))])
     if track_stride:
         item['memory_track'] = continuation_track(path,distance,len(prefix_t),samples,start,finish,track_stride)
     return item
@@ -106,8 +110,9 @@ def continuation_track(path, distance, prefix_count, samples, start, finish, str
     arcs = arcs[arcs >= 0][::-1]
     points = interp_at(path,distance,arcs)
     behind = interp_at(path,distance,np.clip(arcs-1.,0,None))
-    ahead = interp_at(path,distance,np.minimum(arcs+1.,distance[-1]))
-    frames = np.stack([frame_from_heading(normalize(a-b)) for a,b in zip(ahead,behind)])
+    initial = normalize(path[1]-path[0])
+    frames = np.stack([frame_from_heading(normalize(p-b) if np.linalg.norm(p-b)>1e-6 else initial)
+                       for p,b in zip(points,behind)])
     # Path arclength where the bridge leaves the original and reaches the neighbor.
     leave = distance[prefix_count]
     reach = distance[prefix_count+int(np.searchsorted(samples,finish))]

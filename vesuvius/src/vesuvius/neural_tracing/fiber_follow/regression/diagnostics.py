@@ -19,7 +19,10 @@ def decision_rows(output, batch, cfg, n_commit=None, tolerance=1.5, thresholds=D
     window = commit_window(cfg, n_commit)
     points = output['points']
     labels, known, _ = prefix_labels(points, batch, tolerance, cfg.max_recovery_distance)
+    identity_observable = batch.get('identity_observable', torch.ones(len(points), dtype=torch.bool)).bool()
+    known = known*identity_observable[:, None]
     annotated = batch['dense_mask'].bool() & ~batch['offtrack'][:, None].bool()
+    annotated &= identity_observable[:, None]
     observable = geometry_mask(batch, cfg)
     near = dense_commit_mask(observable.shape[1], cfg, window, points.device)
     mask = observable & near
@@ -34,10 +37,10 @@ def decision_rows(output, batch, cfg, n_commit=None, tolerance=1.5, thresholds=D
     rows = []
     for i in range(len(points)):
         drift = None
-        if 'gt_history' in batch and batch['gt_history_mask'][i, 0] > 0:
+        if identity_observable[i] and 'gt_history' in batch and batch['gt_history_mask'][i, 0] > 0:
             value = float(batch['gt_history'][i, 0].norm())
             drift = value if math.isfinite(value) else None
-        row = dict(drift=drift, departed=bool(batch['offtrack'][i]), states=1,
+        row = dict(drift=drift, departed=bool(identity_observable[i] and batch['offtrack'][i]), states=1,
                    history_points=int(batch['hmask'][i].sum()),
                    first_confidence_sum=float(output['confidence'][i, 0]),
                    first_known=int(known[i, 0]), first_correct=int(known[i, 0]*labels[i, 0]),

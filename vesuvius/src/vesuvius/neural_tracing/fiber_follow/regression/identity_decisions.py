@@ -106,6 +106,7 @@ def decision_pair(bank, sample, model, rng, *, attempts=32):
             fiber, t, rev = (parent, own_t, reverse) if target == 0 else (neighbor, head, False)
             row = label_state(fiber, pos.copy(), frame.copy(), history.copy(), mask.copy(), sample,
                               t=t, reverse=rev, offtrack=offtrack)
+            row['_seed_original_certified'] = True
             row.update(fiber_ref=(fi, ta if target == 0 else head, rev), source=5, source_step=-1,
                        stratum=4 if offtrack else -1, location_source=6,
                        seed_pos=refs[target], seed_tangent=tangents[target], seed_valid=True,

@@ -36,6 +36,7 @@ from vesuvius.neural_tracing.fiber_follow.regression.diagnostics import (
     candidate_decisions, summarize_candidates,
 )
 from vesuvius.neural_tracing.fiber_follow.regression.recovery import monitor_fixture, evaluate_monitor
+from vesuvius.neural_tracing.fiber_follow.regression.feature_sequences import FEATURE_SAMPLING_REVISION
 from vesuvius.neural_tracing.fiber_follow.shared.training_log import format_training_log
 
 
@@ -230,7 +231,7 @@ def training_diagnostics(model, cpu_batch, tracer, fibers, seeds, out, step, log
                        history_channel=None)
         curves = prediction['refinement_points']
         labels = (['initial proposal']+[f'correction {i}' for i in range(1, curves.shape[1]-1)]+
-                  ['corrected proposal']) if model.cfg.correction else ['proposal']
+                  ['corrected proposal']) if curves.shape[1] > 1 else ['proposal']
         plot_refinement(curves, batch['hist'], batch['hmask'],
                         images/f'correction_{step:06d}.png',
                         labels=labels,
@@ -622,6 +623,10 @@ def build_parser():
                     help='Replay states recorded after a confirmed departure, in trace voxels')
     ap.add_argument('--replay-keep', type=int, default=4)
     ap.add_argument('--resume', help='Resume last.pt inside this run with the same training options')
+    ap.add_argument('--recurrent-refinement-steps', type=int, default=0,
+                    help='V4 shared-decoder refinement passes; upgrade existing runs with upgrade_refinement')
+    ap.add_argument('--recurrent-refinement-limit', type=float, default=1.,
+                    help='V4 maximum lateral displacement norm per refinement pass, in trace voxels')
     ap.add_argument('--init-tracer', help='Initialize a new run from saved EMA follower weights')
     return ap
 
@@ -667,6 +672,8 @@ def main(argv=None):
                        memory_grad_steps=args.memory_grad_steps,memory_version=args.memory_version,
                        trajectory_sequence_weight=args.trajectory_sequence_weight,
                        feature_sequence_length=args.feature_sequence_length, feature_memory_grid=args.feature_memory_grid,
+                       recurrent_refinement_steps=args.recurrent_refinement_steps,
+                       recurrent_refinement_limit=args.recurrent_refinement_limit,
                        **{k:getattr(args,k) for k in ROUTE_OPTIONS})
     initialized = None
     resume = None
@@ -699,8 +706,10 @@ def main(argv=None):
             if initialized.cfg.memory_slots and initialized.cfg.memory_version == 1:
                 raise ValueError('Legacy v1 memory checkpoints cannot initialize new runs')
             cfg = initialized.cfg
+        if args.recurrent_refinement_steps and args.recurrent_refinement_steps != cfg.recurrent_refinement_steps:
+            raise ValueError('Adding recurrent refinement to a checkpoint requires upgrade_refinement')
         for key in (*MEMORY_OPTIONS,'memory_version',*ROUTE_OPTIONS,'trajectory_sequence_weight',
-                    'feature_sequence_length','feature_memory_grid'):
+                    'feature_sequence_length','feature_memory_grid','recurrent_refinement_steps','recurrent_refinement_limit'):
             setattr(args, key, getattr(cfg, key))
         if args.direction_inputs and not cfg.direction_inputs:
             initialized = add_direction_inputs(initialized)
@@ -879,6 +888,7 @@ def main(argv=None):
     log.record(dict(step=done,event='identity_sampling',architecture=model.architecture,
         source_sampling=dict(fresh=args.fresh_fraction,fixed=(1-args.fresh_fraction)/2,recent=(1-args.fresh_fraction)/2),
         pair_sampling_version=identity_sampling.pair_sampling_version,
+        feature_sampling_revision=FEATURE_SAMPLING_REVISION if cfg.memory_version == 4 else None,
         history_policy=('main_encoder_feature_memory' if cfg.memory_version == 4 else
                         'learned_observation_memory' if cfg.memory_slots else 'visible_crop_only'),sampling=asdict(identity_sampling),
         negative_bank_path=str(negative_bank.root),negative_bank_provenance=negative_bank.provenance(),
@@ -950,6 +960,7 @@ def main(argv=None):
 
             def save(path, resumable=False):
                 extra = dict(step=step, tolerance=args.tolerance, n_commit=args.n_commit,
+                    feature_sampling_revision=FEATURE_SAMPLING_REVISION if cfg.memory_version == 4 else None,
                     samples_seen=prior_samples+observed_states,
                     identity_sampling=asdict(identity_sampling),
                     negative_bank_provenance=negative_bank.provenance() if negative_bank else None,
@@ -964,6 +975,8 @@ def main(argv=None):
                 elif resume and 'init_tracer_sha256' in resume:
                     extra['init_tracer_sha256'] = resume['init_tracer_sha256']
                     extra['init_tracer_path'] = resume.get('init_tracer_path')
+                if resume and 'refinement_upgrade' in resume:
+                    extra['refinement_upgrade'] = resume['refinement_upgrade']
                 if resumable:
                     extra.update(optimizer=opt.state_dict(), rng=training_rng_state())
                 save_checkpoint(path, model, ema, spec, sample, extra)

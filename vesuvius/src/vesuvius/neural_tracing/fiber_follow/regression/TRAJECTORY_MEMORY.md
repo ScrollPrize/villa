@@ -7,8 +7,8 @@ the earlier, untrained v4 patch-memory design; it does not change v2/v3 models.
 
 A single transformer decoder jointly predicts continuous lateral coordinates at
 16 fixed forward distances. Unmasked self-attention lets every future point
-influence every other point. There is no route lattice, dynamic-programming
-search, refinement head, or second decoder pass.
+influence every other point. There is no route lattice or dynamic-programming
+search. By default there is no refinement head or second decoder pass.
 
 Each current main crop is encoded once. The encoder's contextual spatial features
 are pooled to a `2 x 4 x 4` grid, projected to 32 memory tokens, and used by the
@@ -37,6 +37,57 @@ initializes its seed from its first main crop. A cold start at a remote supplied
 seed encodes that seed crop once, then the current crop. A cold start does not
 reconstruct all historical main crops; its cache fills as tracing proceeds.
 
+## Optional recurrent refinement
+
+`--recurrent-refinement-steps 1` adds one pass through the same four-layer
+trajectory decoder. The initial curve samples the existing 3x3x3 fine-feature
+stencil and deep features; a learned fusion maps that evidence, support and
+current coordinates into the retained trajectory tokens. A learned stage
+embedding distinguishes each refinement pass. Every pass reads the same current
+image/history, identity slots, seed and cached crop tokens, with full point
+self-attention. The encoder and memory writer still run once per observed crop.
+
+Cross-attention keys/values are projected once per decoder layer per decision
+and shared across passes, with gradients attached. FP32 feature-map conversions
+are also shared by query sampling, refinement, confidence and identity queries.
+Neither cache survives the model forward or crosses optimizer updates.
+
+The stage embedding and displacement readout start at zero. Initial coordinates
+therefore remain unchanged by the refinement update; confidence is not guaranteed
+unchanged because it uses the final decoder tokens. Updates have lateral norm at
+most `--recurrent-refinement-limit` (default one trace voxel), preserve forward
+planes, and enforce the existing crop and first-point recovery bounds. All
+coordinate updates remain differentiable. Geometry uses 75% final-curve loss and
+25% mean earlier-curve loss with the existing censoring/departure masks. The
+confidence head detaches the final curve for its direct evidence sampling and
+labels, as before; the updated decoder tokens remain differentiable, including
+their dependence on earlier proposals through refinement.
+
+Old checkpoints default to zero passes and load strictly. To continue an existing
+run with refinement, use `regression.upgrade_refinement`, supplying a resumable
+checkpoint and an audit of live process arguments against the latest
+`resume_configuration` log event. It creates a separate run directory and launch
+script, preserves existing model/EMA tensors, maps AdamW moments by parameter
+name, and retains RNG, completed step, schedule, sample count, monitor fixture and
+published replay. New parameters start without optimizer moments. This is an
+architecture upgrade, not an exact continuation: worker streams restart, and the
+new loss/decoder path changes future updates. It never stops or launches a trainer.
+
+```bash
+PYTHONPATH=/home/sean/Documents/villa4/vesuvius/src \
+/home/sean/Documents/villa4/vesuvius/.venv/bin/python -m \
+  vesuvius.neural_tracing.fiber_follow.regression.upgrade_refinement \
+  --checkpoint output/OLD_RUN/last.pt \
+  --runtime-audit output/recurrent_refinement_validation/live_config_audit.json \
+  --name NEW_RUN --steps 1 --limit 1
+bash output/NEW_RUN/launch.sh
+```
+
+The audit JSON contains `runtime_options`, `model_cfg` and
+`cli_event_differences` (which must be empty), plus process identity/provenance.
+The migration checks it against the checkpoint and latest resume log. The
+generated `upgrade.json` records all option changes and the source SHA256.
+
 ## Streamed training
 
 V4 uses consecutive observed states instead of rebuilding small historical
@@ -45,8 +96,12 @@ drifted synthetic histories, wrong continuations and matched identity examples
 supply the observations. Annotation geometry is used for targets only.
 
 Each sampled stream visits its actual seed, up to the newest `memory_steps`
-historical observations, and the sampled endpoint. Every selected crop becomes
-its own supervised decision. Unknown bridge labels are masked, and confirmed
+historical observations, and the sampled endpoint. Generated original-fiber
+histories retain their intended-original supervision; explicit tracks retain
+their recorded membership. Legacy replay history without membership labels is
+context only. Inserted seeds require generator certification for supervision.
+Historical headings use an incoming chord or the supplied seed direction; an
+unoriented oldest observation is omitted. Unknown bridge labels are masked, and confirmed
 departures still teach rejection without trajectory geometry loss. Crop and
 label holdout checks cover the whole stream before image reads. Matched endpoint
 crops retain identical local inputs and their different earlier identity evidence.
@@ -64,7 +119,8 @@ sampling requires an even number of concurrent traces. The trainer accumulates
 chunks until it reaches the effective `--batch` crop budget; a partial ending
 chunk can make this exceed the requested budget by less than one microbatch.
 Losses are normalized by the actual number of states, and throughput logs use
-actual counts. Stream ids include worker and group identity; ended streams are
+actual counts. These correctness fixes use sampling revision 3 and retain equal
+per-crop weights, optimizer updates, and the existing schedule. Stream ids include worker and group identity; ended streams are
 removed, and worker interleaving does not mix their memory.
 
 There is no independently reconstructed `trajectory_sequence` auxiliary pass.
@@ -111,6 +167,26 @@ bit-exact continuation of the pre-interruption sample sequence.
 Training-batch diagnostics receive the actual carried input state rather than
 silently plotting a cold prediction. Those state features were produced by the
 training model; independent monitor tracing still uses the EMA model throughout.
+
+Scheduled resumable checkpoints are saved before collection and diagnostics.
+Recovery evaluation handles the nested remote-seed input recursively, converting
+floating tensors to FP32 while preserving boolean masks.
+
+The first `axial_feature_memory_v4_run1` stopped at step 1000 before these fixes.
+Its surviving `dagger/source_001000.pt` contains model and EMA weights but no
+optimizer/RNG state, so it cannot provide an exact training resume. To initialize
+a new run from its trained v4 EMA weights (including memory and coordinates):
+
+```bash
+RUN_NAME=axial_feature_memory_v4_run2 bash scripts/launch_trajectory_memory.sh \
+  --init-tracer output/axial_feature_memory_v4_run1/dagger/source_001000.pt \
+  --direction-inputs --batch 8 --microbatch 4 --workers 8
+```
+
+This restarts the optimizer and schedule. Recovery validation after the fix
+completed all 32 original monitor states on CUDA, with 162 model forwards and
+52 nested remote-seed inputs. The report is
+`output/feature_memory_v4_validation/recovery_step_001000_fixed.json`.
 
 ## Validation
 
@@ -202,3 +278,52 @@ PYTHONPATH=/home/sean/Documents/villa4/vesuvius/src \
 Use `--version 4 --profile` for v4 and a fresh `--tag` when repeating either run.
 The original v3 trainer was stopped; its latest durable checkpoint is 10000.
 No new long-running training job was launched.
+
+## Recurrent refinement validation (2026-09-29)
+
+The refinement upgrade of `axial_feature_memory_v4_run2/ckpt_008000.pt` preserves
+all existing model/EMA tensors, 282 populated optimizer states and 69,418 observed
+samples. Runtime settings were checked against the live process and its latest
+resume event, including feature sampling revision 3; the original launch JSON
+was not treated as the current configuration. The new run is
+`axial_feature_memory_v4_refined_run1`, with one refinement pass, a one-voxel
+update bound, and unchanged batch 8 / microbatch 4 / two-decision chunks.
+`upgrade.json` and `migration_validation.json` in that directory record lineage
+and the configuration/state checks. The original run stopped after saving step
+8,000, and `launch.sh` resumes the upgraded checkpoint with the existing schedule.
+
+The CPU regression suite passed 94 tests (four CUDA skips, one deselected); the
+subsequently added directory-migration integration test also passed. Seven GPU
+tests passed, including compiled/eager BF16 two-decision gradient comparison with
+candidate scoring. Tests cover cached/recomputed attention gradients, neutral
+initial displacement, one observation write, bounds, departure/censoring masks,
+earlier-observation gradients, optimizer/EMA/RNG migration and full-graph capture.
+
+Measured on the RTX 5090 / PyTorch 2.12.1+cu130, with fixed synthetic eight-channel
+120x101x101 crops and candidate curves, production model dimensions, batch 8,
+microbatch 4, compiled BF16 training and FP32 memory. Five warmup updates were
+excluded, followed by 20 measured updates per variant (160 crops). Includes
+forward/backward, AdamW, clipping and EMA; excludes image I/O, real sampling,
+metrics, collectors and diagnostics. These results measure cost, not tracing
+accuracy or full production wall time.
+
+| Configuration | Mean ms/crop | p50 / p95 ms/crop | Peak allocated GiB |
+| --- | ---: | ---: | ---: |
+| Original v4 | 46.98 | 46.38 / 48.72 | 11.47 |
+| One shared-decoder refinement pass | 50.89 | 50.78 / 52.59 | 11.79 |
+
+This workload adds 8.3% training time and 0.33 GiB peak allocation. Shared
+projections and FP32 maps reduce the overhead relative to recomputing each pass.
+Raw samples and the harness are in `output/recurrent_refinement_validation/`.
+Run this command with `--passes 0` for the baseline and `--passes 1` for refinement,
+using a distinct `--out` path for each:
+
+```bash
+AGENTS_AGENT_MODE=1 PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 \
+OPENBLAS_NUM_THREADS=1 TORCHINDUCTOR_COMPILE_THREADS=4 \
+PYTHONPATH=/home/sean/Documents/villa4/vesuvius/src \
+/home/sean/Documents/villa4/vesuvius/.venv/bin/python -u \
+  output/recurrent_refinement_validation/benchmark.py \
+  --checkpoint output/axial_feature_memory_v4_run2/ckpt_008000.pt \
+  --passes 1 --out output/recurrent_refinement_validation/refined.json
+```

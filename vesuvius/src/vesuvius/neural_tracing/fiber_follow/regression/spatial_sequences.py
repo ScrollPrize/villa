@@ -60,7 +60,7 @@ def decision_at(item, builder, j, *, rng=None, observed_indices=None):
     sample = SampleConfig(crop=cfg.fine,n_history=cfg.n_history,n_future=cfg.n_future,
                           future_step=cfg.future_step,recent_history_points=cfg.n_history)
     row = label_state(fiber,pos,frame,history,behind >= 0,sample,t=t,reverse=reverse,
-                      offtrack=bool(track['offtrack'][j]))
+                      offtrack=bool(track['offtrack'][j]) if np.isfinite(track['offtrack'][j]) else False)
     observed = slice(None, j) if observed_indices is None else observed_indices
     row.update(fiber_ref=(fi,fiber.length-t if reverse else t,reverse),
                source=item.get('source',1),source_step=item.get('source_step',-1),
