@@ -261,11 +261,7 @@ void publishDirectory(const std::filesystem::path& tempDir,
 
 std::filesystem::path cachedCatalogManifestPath()
 {
-    QString base = QStandardPaths::writableLocation(QStandardPaths::CacheLocation);
-    if (base.isEmpty()) {
-        base = QDir::home().filePath(QStringLiteral(".VC3D"));
-    }
-    return std::filesystem::path(base.toStdString()) / "open-data-catalog" / "metadata.json";
+    return cachedOpenDataManifestPath();
 }
 
 std::vector<std::string> normalGridsEntryTags(const OpenDataNormalGridsInfo& info)

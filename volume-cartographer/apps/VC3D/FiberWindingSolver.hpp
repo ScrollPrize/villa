@@ -427,7 +427,19 @@ struct SolveResult {
 
 // The winding-direction vote, from radii one whole turn apart along each
 // fiber (crumpling cancels over a full turn), covariance as the fallback
-// when nothing wraps. 0 override = infer.
+// when nothing wraps.
+struct ChiralityVote {
+    // The vote's answer: the sign of the net turn votes, of the covariance
+    // votes when no fiber wraps, +1 on a tie.
+    int sense = 1;
+    // Wrapping fibers for +1 minus wrapping fibers for -1; 0 when no fiber
+    // wraps (covariance evidence carries no weight beyond the sign).
+    int netTurnVotes = 0;
+    bool haveTurnEvidence = false;
+    int covarianceVotes = 0;
+};
+[[nodiscard]] ChiralityVote tallyChirality(const std::vector<FiberTrace>& fibers);
+// The vote's sense, or the override when it is not 0.
 [[nodiscard]] int inferChirality(const std::vector<FiberTrace>& fibers,
                                  int chiralityOverride);
 

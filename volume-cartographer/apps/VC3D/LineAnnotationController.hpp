@@ -3,6 +3,7 @@
 #include <set>
 
 #include "FiberRuntimeIds.hpp"
+#include "vc/fiber_tracer/FiberDisplay.hpp"
 
 #include <QObject>
 #include <QPointF>
@@ -214,6 +215,11 @@ public:
         // count scaled back to the annotation (level 0) resolution; 0 when the
         // volume is unknown.
         int annotationZSlices = 0;
+        // The current volume's open-data coordinate space
+        // ("<sample>/<volume>@L<level>", from its vc-open-data tags), which
+        // names the catalog entry that orients it; empty for a volume without
+        // the tags.
+        std::string coordinateSpace;
         QString umbilicusMessage;           // resolver error / ambiguity text; empty on success
         // Ready-to-display description of the frame the scale maps from, for
         // workspace status bars: the stamped volume and its level offset when
@@ -392,6 +398,11 @@ public:
     // for attach and detach it overlaps umbilicusGeneration(), which holders
     // still compare as the reviewer-prescribed mechanism for in-app changes.
     [[nodiscard]] QString umbilicusFingerprint() const;
+    // The current volume's open-data coordinate space
+    // ("<sample>/<volume>@L<level>", from its vc-open-data tags), naming the
+    // catalog entry that orients it; empty for a volume without the tags.
+    // A tag read, no parse, so it is cheap enough for dependency checks.
+    [[nodiscard]] std::string fiberMapCoordinateSpace() const;
     [[nodiscard]] std::vector<FiberLinkOverlayInfo> fiberLinkOverlayInfos() const;
     // Bumped whenever the loaded fiber set changes (load, save, delete, and the
     // edits that refresh the fiber summaries). Holders of derived data compare
@@ -503,6 +514,7 @@ public:
     [[nodiscard]] bool prepareForPackageSwitch();
 
 signals:
+    void volumeOverlayToggleRequested();
     void lineAnnotationWorkspaceRequested(LineAnnotationDialog* dialog, const QString& title);
     void fibersChanged(std::vector<LineAnnotationController::FiberSummary> fibers);
     void fiberAlignmentMetricsReset(bool pending);
@@ -556,6 +568,8 @@ private:
         std::vector<FiberSummary::AlignmentMetrics> spans;
     };
     struct StoredFiber {
+        double width = 0.0;
+        double widthGapFraction = vc::fiber_tracer::kDefaultFiberWidthGapFraction;
         uint64_t id = 0;
         std::string username;
         std::string startedAt;
@@ -711,7 +725,9 @@ private:
     void handleGeneratedControlPoint(const std::string& surfaceName,
                                      cv::Vec3f volumePoint,
                                      double linePosition,
-                                     std::optional<cv::Vec3f> lineAnchor = std::nullopt);
+                                     std::optional<cv::Vec3f> lineAnchor = std::nullopt,
+                                     std::optional<cv::Vec3d> displayNormal = std::nullopt,
+                                     std::optional<cv::Vec3d> direction = std::nullopt);
     void handleGeneratedControlPointDelete(const std::string& surfaceName,
                                            double linePosition,
                                            cv::Vec3f volumePoint);
@@ -984,6 +1000,8 @@ private:
     // NaN entries mark invalid samples.
     [[nodiscard]] std::vector<cv::Vec3f> orientedLineNormalsForSession(
         const LineAnnotationSession& session);
+    [[nodiscard]] vc::fiber_tracer::FiberDisplayField displayFieldForSession(
+        const LineAnnotationSession& session, const std::vector<cv::Vec3f>& orientedNormals) const;
     bool materializeGeneratedViews(LineAnnotationSession& session);
     bool materializeGeneratedViews(LineAnnotationSession& session,
                                    const std::string& surfacePrefix);
@@ -1217,9 +1235,11 @@ private:
     [[nodiscard]] bool isAlignmentPendingForFiber(uint64_t fiberId) const;
     [[nodiscard]] bool isAlignmentPendingForFiber(uint64_t fiberId,
                                                   uint64_t requestToken) const;
-    [[nodiscard]] std::optional<std::pair<std::filesystem::path, double>>
-        resolveAlignmentMetricsManifestPath();
+    [[nodiscard]] std::shared_ptr<vc::lasagna::LasagnaDataset>
+        resolveAlignmentMetricsDataset();
     void requestFiberAlignmentMetricsForFibers(std::vector<uint64_t> fiberIds);
+    void saveFiberDisplayAnnotations(LineAnnotationSession& session);
+    void setSessionFiberWidth(LineAnnotationSession& session, double width);
     void publishFiberAlignmentMetrics(uint64_t fiberId,
                                       CachedFiberAlignmentMetrics metrics);
     void publishPendingFiberAlignmentMetrics(const StoredFiber& fiber);

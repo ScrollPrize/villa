@@ -58,6 +58,32 @@ private slots:
         QCOMPARE(queue.finishApply(), Pending::None);
     }
 
+    // The pending slot remembers whether anyone asked for it: automatic
+    // requests (staleness gates) stay automatic only until an explicit one
+    // joins, and the flag is consumed with the slot.
+    void pendingRemembersWhetherItWasAskedFor()
+    {
+        FiberMapRebuildQueue queue;
+        QVERIFY(!queue.pendingAutomatic());
+        (void)queue.request(false, true);  // the running build's origin is not the slot's
+        QVERIFY(!queue.pendingAutomatic());
+        QCOMPARE(queue.request(false, true), Request::Coalesced);
+        QVERIFY(queue.pendingAutomatic());
+        QCOMPARE(queue.request(false, true), Request::Coalesced);
+        QVERIFY(queue.pendingAutomatic());
+        QCOMPARE(queue.request(false, false), Request::Coalesced);
+        QVERIFY(!queue.pendingAutomatic());
+        QCOMPARE(queue.request(true, true), Request::Coalesced);
+        QVERIFY(!queue.pendingAutomatic());  // explicit intent survives a later automatic one
+        queue.beginApply();
+        QCOMPARE(queue.finishApply(), Pending::Full);
+        QVERIFY(!queue.pendingAutomatic());
+        // A fresh slot starts over.
+        (void)queue.request(false, false);
+        QCOMPARE(queue.request(false, true), Request::Coalesced);
+        QVERIFY(queue.pendingAutomatic());
+    }
+
     void requestsDuringApplyCoalesceToo()
     {
         FiberMapRebuildQueue queue;

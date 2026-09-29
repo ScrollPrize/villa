@@ -589,11 +589,7 @@ private:
 
 std::filesystem::path openDataCatalogManifestCachePath()
 {
-    QString base = QStandardPaths::writableLocation(QStandardPaths::CacheLocation);
-    if (base.isEmpty()) {
-        base = QDir::home().filePath(QStringLiteral(".VC3D"));
-    }
-    return std::filesystem::path(base.toStdString()) / "open-data-catalog" / "metadata.json";
+    return vc3d::opendata::cachedOpenDataManifestPath();
 }
 
 QString formatAtlasCoveredSize(const vc::atlas::AtlasCoveredSize& size)
@@ -2489,6 +2485,12 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
 
     _workspaceTabs = new QTabWidget(this);
     _workspaceTabs->setObjectName(QStringLiteral("workspaceTabs"));
+    _projectNameLabel = new QLabel(_workspaceTabs);
+    _projectNameLabel->setObjectName(QStringLiteral("currentProjectName"));
+    _projectNameLabel->setTextFormat(Qt::PlainText);
+    _projectNameLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    _projectNameLabel->setContentsMargins(8, 0, 8, 0);
+    _workspaceTabs->setCornerWidget(_projectNameLabel, Qt::TopRightCorner);
     _workspaceTabs->setTabsClosable(true);
     _workspaceTabs->addTab(_segmentWorkspaceWindow, tr("main"));
     _workspaceTabs->addTab(_lasagnaWorkspaceWindow, tr("Lasagna"));
@@ -2534,6 +2536,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     connect(_workspaceTabs, &QTabWidget::currentChanged, this, [this]() {
         scheduleWindowStateSave();
         updateActiveWorkspaceViewerControls();
+        QTimer::singleShot(0, this, &CWindow::updateProjectNameLabel);
     });
     connect(_workspaceTabs, &QTabWidget::tabCloseRequested, this, [this](int index) {
         if (!_workspaceTabs) {
@@ -2562,6 +2565,8 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     vc::render::processChunkCacheService()->configureDecodedByteCapacity(
         _cacheSizeBytes);
     _state = new CState(this, _benchOptions.debugDownloadQueue);
+    connect(_state, &CState::vpkgChanged, this, &CWindow::updateProjectNameLabel);
+    updateProjectNameLabel();
     connect(_state, &CState::poiChanged, this, &CWindow::onFocusPOIChanged);
     connect(_state, &CState::surfaceWillBeDeleted, this, &CWindow::onSurfaceWillBeDeleted);
     connect(_state, &CState::vpkgChanged, this,
@@ -2676,6 +2681,8 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             _lineAnnotationController.get());
     _lineAnnotationController->setVolumeSelectorFactory(
         [this](QWidget* parent) { return createAnnotationVolumeSelector(parent); });
+    connect(_lineAnnotationController.get(), &LineAnnotationController::volumeOverlayToggleRequested,
+            this, &CWindow::toggleVolumeOverlayVisibility);
     connect(_lineAnnotationController.get(),
             &LineAnnotationController::atlasCreated,
             this,
@@ -4117,6 +4124,26 @@ void CWindow::updateActiveWorkspaceViewerControls()
     }
     // Composite and volume-overlay controls remain bound to both managers.
     // Only navigation and other workspace-local controls follow the active tab.
+}
+
+void CWindow::updateProjectNameLabel()
+{
+    if (!_projectNameLabel || !_workspaceTabs) return;
+    const auto project = _state ? _state->vpkg() : nullptr;
+    if (!project) {
+        _projectNameLabel->clear();
+        _projectNameLabel->setToolTip({});
+        _projectNameLabel->setFixedWidth(0);
+        return;
+    }
+    const QString name = QString::fromStdString(project->name());
+    _projectNameLabel->setToolTip(QString::fromStdString(project->path().string()));
+    const int available = std::max(0, _workspaceTabs->width() -
+        _workspaceTabs->tabBar()->sizeHint().width() - 8);
+    const auto metrics = _projectNameLabel->fontMetrics();
+    _projectNameLabel->setFixedWidth(std::min(available, metrics.horizontalAdvance(name) + 16));
+    _projectNameLabel->setText(metrics.elidedText(
+        name, Qt::ElideMiddle, std::max(0, _projectNameLabel->width() - 16)));
 }
 
 void CWindow::resetSegmentationViews(bool persistLayout)
@@ -8614,6 +8641,7 @@ void CWindow::keyReleaseEvent(QKeyEvent* event)
 void CWindow::resizeEvent(QResizeEvent* event)
 {
     QMainWindow::resizeEvent(event);
+    QTimer::singleShot(0, this, &CWindow::updateProjectNameLabel);
     scheduleWindowStateSave();
 }
 

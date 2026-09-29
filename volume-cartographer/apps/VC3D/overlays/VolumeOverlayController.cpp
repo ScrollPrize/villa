@@ -136,14 +136,27 @@ std::string coordinateSpaceTag(const VolumePkg& pkg, const std::string& volumeId
     return {};
 }
 
+constexpr bool coordinateSpaceTagsCompatible(std::string_view base,
+                                            std::string_view overlay)
+{
+    // Missing tags retain the untagged overlay convention: shared base coordinates.
+    return base.empty() || overlay.empty() || base == overlay;
+}
+
+static_assert(coordinateSpaceTagsCompatible("", ""));
+static_assert(coordinateSpaceTagsCompatible("scan@L0", ""));
+static_assert(coordinateSpaceTagsCompatible("", "scan@L0"));
+static_assert(coordinateSpaceTagsCompatible("scan@L0", "scan@L0"));
+static_assert(!coordinateSpaceTagsCompatible("scan@L0", "scan@L1"));
+static_assert(!coordinateSpaceTagsCompatible("scan-a@L0", "scan-b@L0"));
+
 bool overlayCoordinatesCompatible(const VolumePkg& pkg,
                                   const std::string& baseId,
                                   const std::string& overlayId)
 {
     const auto base = coordinateSpaceTag(pkg, baseId);
     const auto overlay = coordinateSpaceTag(pkg, overlayId);
-    return (base.empty() && overlay.empty()) ||
-           (!base.empty() && base == overlay);
+    return coordinateSpaceTagsCompatible(base, overlay);
 }
 } // namespace
 
