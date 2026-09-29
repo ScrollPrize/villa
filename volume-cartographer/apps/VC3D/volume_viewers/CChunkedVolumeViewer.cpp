@@ -4858,23 +4858,26 @@ CChunkedVolumeViewer::surfaceProjectionContext() const
 }
 
 std::optional<SurfaceProjection>
-CChunkedVolumeViewer::projectVolumePoint(const cv::Vec3f& volPoint) const
+CChunkedVolumeViewer::projectVolumePoint(const cv::Vec3f& volPoint,
+                                         float depthTolerance) const
 {
     auto surf = _surfWeak.lock();
     if (!surf)
         return std::nullopt;
+    float depthLo = 0.0f;
+    float depthHi = 0.0f;
+    quadProjectDepthBand(depthLo, depthHi);
     if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
         const cv::Vec3f proj = plane->project(volPoint, 1.0, 1.0);
-        return SurfaceProjection{proj[0], proj[1], 0.0f, false};
+        return SurfaceProjection{
+            proj[0], proj[1], 0.0f, false,
+            depthBandDistance(plane->scalarp(volPoint), depthLo, depthHi)};
     }
     if (auto* quad = dynamic_cast<QuadSurface*>(surf.get())) {
         cv::Vec3f ptr = quad->pointer();
         auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
-        float depthLo = 0.0f;
-        float depthHi = 0.0f;
-        quadProjectDepthBand(depthLo, depthHi);
         const float tolerance =
-            kQuadProjectTolerance + std::max(std::abs(depthLo), std::abs(depthHi));
+            depthTolerance + std::max(std::abs(depthLo), std::abs(depthHi));
         // pointTo() with a patch index signals "no surface point within tolerance" by
         // returning a positive value (~the tolerance) WITHOUT updating ptr, so a bare
         // `< 0.0f` check would silently keep ptr at {0,0,0} and map the point to the
@@ -4885,16 +4888,17 @@ CChunkedVolumeViewer::projectVolumePoint(const cv::Vec3f& volPoint) const
         // Gate on the signed offset along the surface normal so only the
         // depth band the view actually displays accepts the point.
         float w = _zOff;
+        float distance = dist;
         const cv::Vec3f surfCoord = quad->coord(ptr);
         const cv::Vec3f surfNormal = quad->normal(ptr);
         if (validSurfacePoint(surfCoord) && finiteVec3(surfNormal)) {
             w = (volPoint - surfCoord).dot(surfNormal);
-            if (w < depthLo - kQuadProjectTolerance ||
-                w > depthHi + kQuadProjectTolerance)
+            if (w < depthLo - depthTolerance || w > depthHi + depthTolerance)
                 return std::nullopt;
+            distance = depthBandDistance(volPoint, surfCoord, surfNormal, depthLo, depthHi);
         }
         const cv::Vec3f loc = quad->loc(ptr);
-        return SurfaceProjection{loc[0], loc[1], w, true};
+        return SurfaceProjection{loc[0], loc[1], w, true, distance};
     }
     return std::nullopt;
 }
@@ -4918,7 +4922,7 @@ QPointF CChunkedVolumeViewer::surfaceProjectionToScene(
 
 QPointF CChunkedVolumeViewer::volumeToScene(const cv::Vec3f& volPoint)
 {
-    if (const auto projection = projectVolumePoint(volPoint))
+    if (const auto projection = projectVolumePoint(volPoint, kQuadProjectTolerance))
         return surfaceProjectionToScene(*projection);
     // Only on failure is it worth re-establishing why: a surface that is
     // absent, or neither a plane nor a quad, maps to a default-constructed
