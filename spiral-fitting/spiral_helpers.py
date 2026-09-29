@@ -144,6 +144,14 @@ def load_fiber_point_collection(path, collection_id, coordinate_scale=0.25, min_
     with open(path, 'r') as f:
         data = json.load(f)
 
+    return _fiber_data_point_collection(
+        data, path, collection_id, coordinate_scale, min_point_spacing,
+        base_shape_zyx=base_shape_zyx)
+
+
+def _fiber_data_point_collection(data, path, collection_id, coordinate_scale=0.25,
+                                min_point_spacing=20.0, *, base_shape_zyx=None):
+
     source_shape = data.get('coordinate_base_shape_zyx')
     if source_shape is not None:
         for name, shape in (('coordinate_base_shape_zyx', source_shape),
@@ -344,11 +352,12 @@ def fiber_collection_hv_tag(pcl, *, min_z_fraction, min_auto_certainty):
         min_auto_certainty=min_auto_certainty)
 
 
-def load_fiber_point_collections(path, next_id, min_point_spacing=20.0, *, base_shape_zyx=None):
-    if not path:
+def load_fiber_point_collections(path, next_id, min_point_spacing=20.0, *, base_shape_zyx=None,
+                                z_range=None, automated_fiber_volume=None):
+    if not path and not automated_fiber_volume:
         return {}, next_id
-    fiber_paths = sorted(glob.glob(os.path.join(path, '*.json')))
-    if not fiber_paths:
+    fiber_paths = sorted(glob.glob(os.path.join(path, '*.json'))) if path else []
+    if not fiber_paths and not automated_fiber_volume:
         print(f'no fiber point collections found in {path}')
         return {}, next_id
 
@@ -371,6 +380,22 @@ def load_fiber_point_collections(path, next_id, min_point_spacing=20.0, *, base_
         point_collections[next_id] = pcl
         total_points += len(pcl['points'])
         next_id += 1
+
+    if automated_fiber_volume:
+        from afv_input import iter_afv_fibers
+        for logical_id, data, origin in iter_afv_fibers(automated_fiber_volume, z_range=z_range):
+            # Same geometry and H/V interpretation as native fibers.
+            source = os.path.join(str(automated_fiber_volume), logical_id + '.json')
+            pcl = _fiber_data_point_collection(
+                data, source, next_id, min_point_spacing=min_point_spacing,
+                base_shape_zyx=base_shape_zyx)
+            if pcl is None:
+                raise ValueError(f'Invalid fiber {logical_id} in {automated_fiber_volume}')
+            pcl['source_file'] = source
+            pcl['metadata'].update(origin)
+            point_collections[next_id] = pcl
+            total_points += len(pcl['points'])
+            next_id += 1
 
     print(
         f'Loaded {len(point_collections)} fiber point collections '

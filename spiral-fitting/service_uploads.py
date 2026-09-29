@@ -42,7 +42,8 @@ UPLOADED_CHECKPOINTS_KEPT = 3
 UPLOADED_CHECKPOINTS_DIRNAME = "uploaded-checkpoints"
 MAX_CHECKPOINT_UPLOAD_BYTES = int(os.environ.get(
     "SPIRAL_CHECKPOINT_UPLOAD_MAX_BYTES", 64 * 1024 * 1024 * 1024))
-UPLOAD_KINDS = ("patch", "fiber", "pcl", "checkpoint")
+UPLOAD_KINDS = ("patch", "fiber", "pcl", "checkpoint", "afv")
+SERVICE_FILE_KINDS = ("checkpoint", "afv")
 STAGING_DIRNAME = ".spiral-upload-staging"
 
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -192,6 +193,16 @@ def _validate_upload_content(kind, role, directory):
     if kind == "patch":
         _validate_patch_content(directory)
         return
+    if kind == "afv":
+        from afv_input import validate_afv_container
+        files = [p for p in directory.rglob("*") if p.is_file()]
+        if len(files) != 1 or files[0].suffix.lower() != ".afv":
+            raise ApiError(400, "An AFV upload must contain exactly one .afv file")
+        try:
+            validate_afv_container(files[0])
+        except Exception as exc:
+            raise ApiError(400, f"Invalid AFV: {exc}") from exc
+        return
     if kind == "checkpoint":
         files = [p for p in directory.rglob("*") if p.is_file()]
         if len(files) != 1:
@@ -281,13 +292,13 @@ class UploadManager:
         root = self.environment.output_root()
         return None if root is None else root / STAGING_DIRNAME
 
-    def checkpoint_root(self):
+    def checkpoint_root(self, kind="checkpoint"):
         root = self.environment.output_root()
-        return None if root is None else root / UPLOADED_CHECKPOINTS_DIRNAME
+        return None if root is None else root / ("uploaded-fiber-volumes" if kind == "afv" else UPLOADED_CHECKPOINTS_DIRNAME)
 
     @staticmethod
-    def checkpoint_digest_path(root, digest):
-        return root / f"{digest}.ckpt"
+    def checkpoint_digest_path(root, digest, kind="checkpoint"):
+        return root / (digest + (".afv" if kind == "afv" else ".ckpt"))
 
     @staticmethod
     def _file_sha256(path):
@@ -300,15 +311,15 @@ class UploadManager:
                 digest.update(block)
         return digest.hexdigest()
 
-    def find_uploaded_checkpoint(self, root, digest, size):
+    def find_uploaded_checkpoint(self, root, digest, size, kind="checkpoint"):
         """Find retained checkpoint content, including pre-v7 named uploads."""
-        canonical = self.checkpoint_digest_path(root, digest)
+        canonical = self.checkpoint_digest_path(root, digest, kind)
         try:
             if canonical.is_file() and canonical.stat().st_size == size:
                 return canonical
         except OSError:
             pass
-        if not root.is_dir():
+        if kind == "afv" or not root.is_dir():
             return None
         for candidate in root.iterdir():
             if candidate == canonical:
@@ -323,10 +334,10 @@ class UploadManager:
         return None
 
     @staticmethod
-    def checkpoint_record(input_id, path, size, upload_id=None):
+    def checkpoint_record(input_id, path, size, upload_id=None, kind="checkpoint"):
         record = {
             "id": input_id,
-            "kind": "checkpoint",
+            "kind": kind,
             "role": None,
             "path": str(path),
             "bytes": size,
@@ -376,7 +387,7 @@ class UploadManager:
                     # when the caller supplied one. No staging bytes exist.
                     record = dict(result["input"], upload_id=upload_id)
                     upload = Upload(
-                        upload_id, self.environment.session_id(), "checkpoint", None,
+                        upload_id, self.environment.session_id(), request["kind"], None,
                         request["id"], _validate_upload_manifest(request),
                         self.staging_root() / upload_id)
                     upload.record = record
@@ -396,7 +407,7 @@ class UploadManager:
         kind = str(request.get("kind") or "").strip()
         if kind not in UPLOAD_KINDS:
             raise ApiError(HTTPStatus.BAD_REQUEST,
-                           "Input kind must be one of patch, fiber, pcl, checkpoint")
+                           "Input kind must be one of patch, fiber, pcl, checkpoint, afv")
         role = request.get("role")
         if kind == "pcl":
             if role not in PCL_ROLE_FILES:
@@ -409,7 +420,7 @@ class UploadManager:
         if any(key in request for key in ("operation", "target_collection_id",
                                           "base_source_revision", "base_revision")):
             raise ApiError(400, "Uploads contain bytes only; stage revisions with /session/input-changes")
-        if kind != "checkpoint" and not request.get("upload_id"):
+        if kind not in SERVICE_FILE_KINDS and not request.get("upload_id"):
             raise ApiError(400, "Input uploads require a stable upload_id")
         input_id = str(request.get("id") or "").strip()
         if not _SAFE_ID.match(input_id):
@@ -417,7 +428,7 @@ class UploadManager:
                            "The input id must be a single safe path component")
         manifest = _validate_upload_manifest(request)
         declared = sum(entry["size"] for entry in manifest.values())
-        if kind == "checkpoint":
+        if kind in SERVICE_FILE_KINDS:
             with self._lock:
                 # Resume checkpoints are needed before a session exists, so
                 # they are service-scoped: allowed whenever an output
@@ -434,9 +445,9 @@ class UploadManager:
                     raise ApiError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
                                    "The checkpoint exceeds the upload size limit")
             entry = next(iter(manifest.values()))
-            checkpoint_root = output_root / UPLOADED_CHECKPOINTS_DIRNAME
+            checkpoint_root = output_root / ("uploaded-fiber-volumes" if kind == "afv" else UPLOADED_CHECKPOINTS_DIRNAME)
             existing = self.find_uploaded_checkpoint(
-                checkpoint_root, entry["sha256"], entry["size"])
+                checkpoint_root, entry["sha256"], entry["size"], kind)
             if existing is not None:
                 try:
                     os.utime(existing, None)
@@ -446,10 +457,10 @@ class UploadManager:
                     "accepted": True,
                     "deduplicated": True,
                     "input": self.checkpoint_record(
-                        input_id, existing, entry["size"]),
+                        input_id, existing, entry["size"], kind=kind),
                 }
         with self._lock:
-            if kind == "checkpoint":
+            if kind in SERVICE_FILE_KINDS:
                 current_output_root = self.environment.output_root()
                 if current_output_root is None or current_output_root != output_root:
                     raise ApiError(HTTPStatus.CONFLICT,
@@ -457,14 +468,14 @@ class UploadManager:
                 # Close the race with another request that finalized this
                 # digest while the legacy-file scan ran without the state lock.
                 canonical = self.checkpoint_digest_path(
-                    checkpoint_root, entry["sha256"])
+                    checkpoint_root, entry["sha256"], kind)
                 if canonical.is_file() and canonical.stat().st_size == entry["size"]:
                     os.utime(canonical, None)
                     return {
                         "accepted": True,
                         "deduplicated": True,
                         "input": self.checkpoint_record(
-                            input_id, canonical, entry["size"]),
+                            input_id, canonical, entry["size"], kind=kind),
                     }
             upload_id = request.get("upload_id") or secrets.token_hex(16)
             staging = self.staging_root() / upload_id
@@ -479,7 +490,7 @@ class UploadManager:
             upload = self.uploads.get(upload_id)
             # Checkpoint uploads are service-scoped; editable inputs are
             # bound to the workspace they were started for.
-            if upload is None or (upload.kind != "checkpoint"
+            if upload is None or (upload.kind not in SERVICE_FILE_KINDS
                                   and upload.session_id != self.environment.session_id()):
                 raise ApiError(HTTPStatus.NOT_FOUND, "Unknown upload")
             if upload.cancelled and not include_cancelled:
@@ -638,7 +649,7 @@ class UploadManager:
                                [{"field": name, "message": "File was not uploaded"}
                                 for name in missing])
             _validate_upload_content(upload.kind, upload.role, upload.staging_dir)
-            if upload.kind != "checkpoint":
+            if upload.kind not in SERVICE_FILE_KINDS:
                 path = (upload.staging_dir if upload.kind == "patch" else
                         next(p for p in upload.staging_dir.rglob("*") if p.is_file()))
                 upload.record = {
@@ -646,7 +657,7 @@ class UploadManager:
                     "path": str(path), "upload_id": upload.upload_id,
                     "bytes": upload.declared_bytes(), "state": "uploaded"}
                 return FinalizedUpload(upload.kind, dict(upload.record))
-            if upload.kind == "checkpoint":
+            if upload.kind in SERVICE_FILE_KINDS:
                 record = self._publish_checkpoint(upload)
                 upload.record = record
                 return FinalizedUpload(upload.kind, dict(record))
@@ -656,7 +667,7 @@ class UploadManager:
         The published path lies under the output directory, which the
         dataset-mode load validation already accepts for resume checkpoints.
         """
-        root = self.checkpoint_root()
+        root = self.checkpoint_root(upload.kind)
         if root is None:
             raise ApiError(HTTPStatus.CONFLICT,
                            "The service no longer has an output directory for "
@@ -664,7 +675,7 @@ class UploadManager:
         root.mkdir(parents=True, exist_ok=True)
         source = next(p for p in upload.staging_dir.rglob("*") if p.is_file())
         entry = next(iter(upload.manifest.values()))
-        destination = self.checkpoint_digest_path(root, entry["sha256"])
+        destination = self.checkpoint_digest_path(root, entry["sha256"], upload.kind)
         with self._lock:
             # A concurrent upload of the same content may have finalized after
             # begin() checked the content-addressed destination.
@@ -674,10 +685,11 @@ class UploadManager:
             else:
                 os.replace(source, destination)
         shutil.rmtree(upload.staging_dir, ignore_errors=True)
-        self.prune_checkpoints(destination)
+        if upload.kind == "checkpoint":
+            self.prune_checkpoints(destination)
         return self.checkpoint_record(
             upload.input_id, destination, upload.declared_bytes(),
-            upload.upload_id)
+            upload.upload_id, kind=upload.kind)
 
     def prune_checkpoints(self, just_published):
         root = self.checkpoint_root()
