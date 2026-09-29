@@ -33,11 +33,22 @@ public:
     ~FiberCollectionController() override;
     QDockWidget* dock() const { return dock_; }
     void setLineAnnotationActive(bool active);
+    void setSpiralFitAvailable(bool available);
     void openCollection(const QString& path, bool persist = true, const std::string& expectedUuid = {});
     // Selects the trace under a plain left click that no native tool, collection
     // point or fiber annotation used. Returns true if a trace was selected.
     bool handleVolumeClick(Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
+    // Scale from native L0 coordinates to this viewer's volume, for viewers
+    // outside the main workspace such as Spiral previews. Other viewers use
+    // the scale of the current CT volume.
+    void setViewerNativeToViewerFactor(VolumeViewerBase* viewer, double factor);
     void detachViewer(VolumeViewerBase* viewer) override;
+    QString openVolumePath() const { return enabled_ ? path_ : QString{}; }
+
+signals:
+    void openVolumeChanged(const QString& path);
+    void addToSpiralRequested(const QString& fiberJsonPath);
+
 protected:
     bool isOverlayEnabledFor(VolumeViewerBase* viewer) const override;
     bool needsOverlayRebuild(VolumeViewerBase* viewer) const override;
@@ -67,6 +78,9 @@ private:
     QLineEdit* idInput_{};
     QPushButton* next_{};
     QPushButton* openAnnotation_{};
+    QPushButton* addToSpiral_{};
+    bool spiralFitAvailable_{false};
+    bool pendingForSpiral_{false};
     QPushButton* detach_{};
     QString path_, attachment_;
     std::string uuid_, coordinateSpace_;
@@ -76,6 +90,8 @@ private:
     bool lineAnnotationActive_{false};
     int64_t pendingAnnotation_{};
     double nativeToViewer_{1.0};
+    std::unordered_map<VolumeViewerBase*, double> viewerFactors_;
+    double nativeToViewer(VolumeViewerBase* viewer) const;
     double nativeVoxelMm_{1.0};
     int64_t selected_{0}, lastRow_{0};
     double lastLength_{std::numeric_limits<double>::infinity()};
@@ -92,6 +108,7 @@ private:
     void clear();
     void invalidate();
     void showInLineAnnotation(int64_t id);
+    void prepareSelectedFiber(int64_t id, bool forSpiral);
     void startPendingAnnotation();
     void finishAnnotationRequest();
     void watchAnnotationRender(class LineAnnotationDialog* dialog, int64_t id, uint64_t token);

@@ -18,6 +18,7 @@
 #include <QDialog>
 #include <QDir>
 #include <QFileDialog>
+#include <QFileInfo>
 #include <QFormLayout>
 #include <QGridLayout>
 #include <QHBoxLayout>
@@ -298,6 +299,12 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     pathsForm->addRow(tr("PCLs"), pclContainer);
 
     addPathRow(pathsForm, "fibers", tr("Fibers"), true);
+    auto* fibersPath = addPathRow(pathsForm, "automated_fiber_volume", tr("Automated Fiber Volume"), false);
+    fibersPath->setObjectName(QStringLiteral("spiralAutomatedFiberVolumePath"));
+    fibersPath->setClearButtonEnabled(true);
+    fibersPath->setPlaceholderText(tr("Optional .afv — added to the existing fibers"));
+    fibersPath->setToolTip(tr("Add a local .afv volume alongside the existing dataset fibers. "
+                              "Selecting an AFV enables fiber input at Initialize/Rebuild; local files are uploaded first."));
 
     // Vertical fibers lie on the back face of the papyrus sheet; the fitter can
     // expect them a few voxels radially outside the winding it fits to the
@@ -987,6 +994,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                 // status poll decides which verbs the resident session can
                 // take, and Rebuild is one of them.
                 if (!_connected) {
+                    _fiberUploadActive = false;
                     _load->setEnabled(false);
                     _run->setEnabled(false);
                     _stop->setEnabled(false);
@@ -1110,6 +1118,20 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
             _editingAccessError = error;
         _warnings->setText(error);
     });
+    connect(_service, &SpiralServiceManager::fiberVolumeResolved, this,
+            [this](const QString& local, const QString& host) {
+                _uploadedAfvLocal = local; _uploadedAfvHost = host;
+            });
+    connect(_service, &SpiralServiceManager::fiberVolumeUploadActive, this, [this](bool active) {
+        _fiberUploadActive = active;
+        if (active) { _load->setEnabled(false); _run->setEnabled(false);
+            _state->setText(tr("Preparing Automated Fiber Volume transfer…")); }
+    });
+    connect(_service, &SpiralServiceManager::fiberVolumeUploadProgress, this,
+            [this](qint64 sent, qint64 total) {
+                if (total > 0) _state->setText(tr("Uploading Automated Fiber Volume… %1 / %2 MB")
+                    .arg(sent / 1000000).arg(total / 1000000));
+            });
     connect(_service, &SpiralServiceManager::checkpointUploadProgress, this,
             [this](qint64 sent, qint64 total) {
                 if (total > 0)
@@ -1675,11 +1697,11 @@ void SpiralPanel::setRemoteMode(bool remote)
     // resolution. The tracks selection stays editable because the client
     // chooses among service-advertised values; checkpoints have their own
     // section and are never a path the client types here.
-    const QStringList clientSelectable{QStringLiteral("tracks_dbm")};
+    const QStringList clientSelectable{QStringLiteral("tracks_dbm"), QStringLiteral("automated_fiber_volume")};
     for (auto it = _paths.begin(); it != _paths.end(); ++it) {
         it.value()->setReadOnly(!clientSelectable.contains(it.key()));
         if (_pathBrowseButtons.contains(it.key()))
-            _pathBrowseButtons[it.key()]->setVisible(false);
+            _pathBrowseButtons[it.key()]->setVisible(it.key() == QStringLiteral("automated_fiber_volume"));
     }
     // PCL collections are advertised by dataset resolution; extra collections
     // join a session through ephemeral uploads, not the load request.
@@ -1691,6 +1713,34 @@ void SpiralPanel::setRemoteMode(bool remote)
     _save->setVisible(true);
     for (QLineEdit* edit : {_paths["dataset_root"], _paths["umbilicus"]})
         edit->setToolTip(tr("Service-host path, owned by the service"));
+}
+
+void SpiralPanel::keepCurrentFiberSourceForSingleFiber()
+{
+    auto* edit = _paths.value(QStringLiteral("automated_fiber_volume"));
+    if (!edit || _afvPathManual || _autoFilledAfvPath.isEmpty()
+        || edit->text() != _autoFilledAfvPath || _loadedSessionRequest.isEmpty()) return;
+    // Adding one fiber is an explicit alternative to the suggested whole AFV.
+    edit->setText(_loadedSessionRequest.value("paths").toObject().value("automated_fiber_volume").toString());
+    _afvPathManual = true;
+    _autoFilledAfvPath.clear();
+    refreshReloadRequired();
+}
+
+void SpiralPanel::setOpenFiberVolume(const QString& path)
+{
+    _openFiberVolume = path;
+    if (_afvPathManual) return;
+    auto* edit = _paths.value(QStringLiteral("automated_fiber_volume"));
+    if (!edit) return;
+    if (!path.isEmpty()) {
+        edit->setText(path);
+        _autoFilledAfvPath = path;
+    } else if (!_autoFilledAfvPath.isEmpty() && edit->text() == _autoFilledAfvPath) {
+        edit->clear();
+        _autoFilledAfvPath.clear();
+    }
+    refreshReloadRequired();
 }
 
 QLineEdit* SpiralPanel::addPathRow(QFormLayout* form, const QString& key, const QString& label, bool directory)
@@ -1705,16 +1755,24 @@ QLineEdit* SpiralPanel::addPathRow(QFormLayout* form, const QString& key, const 
     _pathBrowseButtons[key] = browse;
     connect(edit, &QLineEdit::textEdited, this, [this, key](const QString&) {
         if (!_applyingResolution) {
+            if (key == QStringLiteral("automated_fiber_volume")) _afvPathManual = true;
             if (key != QStringLiteral("dataset_root")) _hasManualEdits = true;
             refreshReloadRequired();
         }
     });
     connect(browse, &QToolButton::clicked, this, [this, edit, directory, key]() {
-        const QString chosen = directory
-            ? QFileDialog::getExistingDirectory(this, tr("Select directory"), edit->text())
-            : QFileDialog::getOpenFileName(this, tr("Select file"), edit->text());
+        QString chosen;
+        if (key == QStringLiteral("automated_fiber_volume")) {
+            chosen = QFileDialog::getOpenFileName(this, tr("Open Automated Fiber Volume"),
+                edit->text(), tr("Automated Fiber Volumes (*.afv)"));
+        } else {
+            chosen = directory
+                ? QFileDialog::getExistingDirectory(this, tr("Select directory"), edit->text())
+                : QFileDialog::getOpenFileName(this, tr("Select file"), edit->text());
+        }
         if (!chosen.isEmpty()) {
             edit->setText(chosen);
+            if (key == QStringLiteral("automated_fiber_volume")) _afvPathManual = true;
             if (key != QStringLiteral("dataset_root")) _hasManualEdits = true;
             refreshReloadRequired();
         }
@@ -1827,7 +1885,9 @@ void SpiralPanel::applyResolution(const QJsonObject& resolution, bool force)
     if (!root.isEmpty()) _paths[QStringLiteral("dataset_root")]->setText(root);
     const QJsonObject resolved = resolution.value("resolved").toObject();
     for (auto it = resolved.begin(); it != resolved.end(); ++it)
-        if (_paths.contains(it.key())) _paths[it.key()]->setText(it.value().toString());
+        if (_paths.contains(it.key()) && !(it.key() == QStringLiteral("automated_fiber_volume")
+            && (_afvPathManual || !_openFiberVolume.isEmpty())))
+            _paths[it.key()]->setText(it.value().toString());
     _pclList->clear();
     for (const QJsonValue& value : resolution.value("pcl_inputs").toArray()) {
         const QJsonObject item = value.toObject();
@@ -1888,6 +1948,8 @@ QJsonObject SpiralPanel::sessionRequest() const
     // built from unless the checkpoint section replaces it.
     paths["checkpoint"] = _sessionCheckpoint;
     QJsonObject config = sessionAdvancedConfig();
+    if (QFileInfo(paths.value("automated_fiber_volume").toString()).suffix().compare(QStringLiteral("afv"), Qt::CaseInsensitive) == 0)
+        config[QStringLiteral("input_use_fibers")] = true;
     // Dedicated controls override the profile for their keys. A checkpoint
     // session keeps the checkpoint's own durable configuration (see
     // sessionAdvancedConfig), so they are not injected there.
@@ -2087,6 +2149,8 @@ void SpiralPanel::synchronizeSession(const QJsonObject& request,
     _applyingResolution = true;
     for (auto it = _paths.begin(); it != _paths.end(); ++it)
         it.value()->setText(paths.value(it.key()).toString());
+    if (!_uploadedAfvHost.isEmpty() && paths.value("automated_fiber_volume").toString() == _uploadedAfvHost)
+        _paths["automated_fiber_volume"]->setText(_uploadedAfvLocal);
     const QString checkpoint =
         paths.value(QStringLiteral("checkpoint")).toString();
     setSessionCheckpoint(checkpoint);
@@ -2133,6 +2197,7 @@ void SpiralPanel::synchronizeSession(const QJsonObject& request,
     // session defaults; both describe the same resident fit.
     _loadedSessionRequest = sessionRequest();
     _reloadRequired = false;
+    setOpenFiberVolume(_openFiberVolume);
     for (auto it = _visibilityChecks.begin(); it != _visibilityChecks.end(); ++it)
         it.value()->setChecked(it.key() == QStringLiteral("output"));
 }
@@ -2362,10 +2427,10 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
     _sessionRunnable = runnable;
     // Initialize is available without a session. Rebuild otherwise needs an
     // idle or failed session.
-    _load->setEnabled(_connected && _service->ownsInputWorkspace()
+    _load->setEnabled(!_fiberUploadActive && _connected && _service->ownsInputWorkspace()
                       && (runnable || state == QStringLiteral("Error")
                           || state == QStringLiteral("Uninitialized")));
-    _run->setEnabled(_connected && _service->ownsInputWorkspace() && runnable && !_reloadRequired);
+    _run->setEnabled(!_fiberUploadActive && _connected && _service->ownsInputWorkspace() && runnable && !_reloadRequired);
     _stop->setEnabled(_service->ownsInputWorkspace() && state == "Running");
     _save->setEnabled(_connected && _service->ownsInputWorkspace() && runnable);
     _downloadCheckpoint->setEnabled(
@@ -2528,7 +2593,7 @@ void SpiralPanel::refreshReloadRequired()
     const bool wasReloadRequired = _reloadRequired;
     _reloadRequired = normalizedReloadRequest(current)
         != normalizedReloadRequest(_loadedSessionRequest);
-    _run->setEnabled(_connected && _service->ownsInputWorkspace() && _sessionRunnable && !_reloadRequired);
+    _run->setEnabled(!_fiberUploadActive && _connected && _service->ownsInputWorkspace() && _sessionRunnable && !_reloadRequired);
     if (_reloadRequired)
         _state->setText(tr("Reload required — fit inputs or session configuration changed"));
     else if (wasReloadRequired)
@@ -2543,6 +2608,7 @@ void SpiralPanel::persist() const
     if (_currentProfileId == kLocalhostProfileId)
         profileFromFields().save(settings);
     const QString prefix = formSettingsPrefix();
+    settings.setValue(prefix + "afv_path_manual", _afvPathManual);
     for (auto it = _paths.begin(); it != _paths.end(); ++it)
         settings.setValue(prefix + QStringLiteral("paths/") + it.key(), it.value()->text());
     QJsonArray pcls;
@@ -2587,6 +2653,7 @@ void SpiralPanel::restore()
     const QString pathsPrefix = legacy ? QStringLiteral("spiral/paths/")
                                        : prefix + QStringLiteral("paths/");
     const QString valuePrefix = legacy ? QStringLiteral("spiral/") : prefix;
+    _afvPathManual = settings.value(valuePrefix + "afv_path_manual", false).toBool();
 
     _applyingResolution = true;
     for (auto it = _paths.begin(); it != _paths.end(); ++it)

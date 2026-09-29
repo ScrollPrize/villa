@@ -258,6 +258,15 @@ FiberCollectionController::FiberCollectionController(CState* state, ViewerManage
     openAnnotation_->setObjectName("fiberCollectionOpenAnnotation");
     openAnnotation_->setEnabled(false);
     fibersLayout->addWidget(openAnnotation_);
+    addToSpiral_ = new QPushButton(tr("Add to Spiral Fit"), body);
+    addToSpiral_->setObjectName("fiberCollectionAddToSpiral");
+    addToSpiral_->setEnabled(false);
+    addToSpiral_->setToolTip(tr("Initialize a Spiral session to add the selected fiber."));
+    fibersLayout->addWidget(addToSpiral_);
+    connect(addToSpiral_, &QPushButton::clicked, this, [this]() {
+        if (spiralFitAvailable_ && selected_)
+            prepareSelectedFiber(selected_, true);
+    });
     annotationStatus_ = new QLabel(body);
     annotationStatus_->setObjectName("fiberCollectionAnnotationStatus");
     annotationStatus_->setWordWrap(true);
@@ -348,6 +357,14 @@ FiberCollectionController::~FiberCollectionController()
         if (s->cancelled)
             s->cancelled->store(true);
 }
+void FiberCollectionController::setSpiralFitAvailable(bool available)
+{
+    spiralFitAvailable_ = available;
+    addToSpiral_->setEnabled(available && enabled_ && selected_ && openAnnotation_->isEnabled());
+    addToSpiral_->setToolTip(available
+        ? tr("Send only the selected fiber to the current Spiral fit.")
+        : tr("Initialize a Spiral session to add the selected fiber."));
+}
 void FiberCollectionController::setLineAnnotationActive(bool active)
 {
     lineAnnotationActive_ = active;
@@ -374,12 +391,14 @@ void FiberCollectionController::clear()
     enabled_ = false;
     detach_->setEnabled(false);
     openAnnotation_->setEnabled(false);
+    addToSpiral_->setEnabled(false);
     selected_ = 0;
     pendingAnnotation_ = 0;
     path_.clear();
     attachment_.clear();
     uuid_.clear();
     coordinateSpace_.clear();
+    emit openVolumeChanged({});
     for (auto& [v, s] : views_) {
         if (s->cancelled)
             s->cancelled->store(true);
@@ -501,6 +520,7 @@ void FiberCollectionController::openCollection(const QString& path, bool persist
             uuid_ = result.value.at("uuid").get<std::string>();
             totalFibers_ = result.value.at("fiber_count").get<int64_t>();
             enabled_ = true;
+            emit openVolumeChanged(path_);
             detach_->setEnabled(true);
             status_->setToolTip(path_ + "\n" + QString::fromStdString(uuid_));
             status_->setText(tr("%1 fibers · native geometry · read only").arg(result.value.at("fiber_count").get<int64_t>()));
@@ -640,6 +660,7 @@ void FiberCollectionController::selectFiber(int64_t id, bool focusView, bool ope
     const auto rev = revision_;
     along_->setEnabled(false);
     openAnnotation_->setEnabled(false);
+    addToSpiral_->setEnabled(false);
     selection_->setText(tr("Loading fiber #%1…").arg(id));
     const auto path = path_.toStdString();
     background<vc::fibers::Summary>(
@@ -664,6 +685,7 @@ void FiberCollectionController::selectFiber(int64_t id, bool focusView, bool ope
             along_->setValue(centerIndex);
             along_->setEnabled(true);
             openAnnotation_->setEnabled(annotations_ != nullptr);
+            setSpiralFitAvailable(spiralFitAvailable_);
             openAnnotation_->setToolTip(tr("Open fiber #%1 in Line Annotation.").arg(s.id));
             invalidate();
             if (focusView)
@@ -715,9 +737,10 @@ std::optional<FiberCollectionController::Slice> FiberCollectionController::slice
     if (rect.isEmpty())
         return std::nullopt;
     Slice s;
-    s.origin = point(viewer->sceneToVolume(rect.topLeft()), 1 / nativeToViewer_);
-    const auto x = point(viewer->sceneToVolume(rect.topRight()), 1 / nativeToViewer_);
-    const auto y = point(viewer->sceneToVolume(rect.bottomLeft()), 1 / nativeToViewer_);
+    const double toNative = 1 / nativeToViewer(viewer);
+    s.origin = point(viewer->sceneToVolume(rect.topLeft()), toNative);
+    const auto x = point(viewer->sceneToVolume(rect.topRight()), toNative);
+    const auto y = point(viewer->sceneToVolume(rect.bottomLeft()), toNative);
     try {
         s.u = normalized(sub(x, s.origin));
         s.v = normalized(sub(y, s.origin));
@@ -866,6 +889,7 @@ void FiberCollectionController::collectPrimitives(VolumeViewerBase* viewer, Over
     Runs horizontal, vertical, other, selected;
     std::array<Runs, 32> rainbowPaths;
     const bool useRainbow = rainbow_->isChecked();
+    const double toViewer = nativeToViewer(viewer);
     std::unordered_set<int64_t> visibleIds;
     for (const auto& b : v.blocks) {
         // Hash the logical fiber ID, not its storage block or catalog row, so
@@ -896,7 +920,7 @@ void FiberCollectionController::collectPrimitives(VolumeViewerBase* viewer, Over
                 p[j] = b.points[i - 1][j] + lo * d;
                 q[j] = b.points[i - 1][j] + hi * d;
             }
-            const auto pa = viewer->volumeToScene(cvpoint(p, nativeToViewer_)), pb = viewer->volumeToScene(cvpoint(q, nativeToViewer_));
+            const auto pa = viewer->volumeToScene(cvpoint(p, toViewer)), pb = viewer->volumeToScene(cvpoint(q, toViewer));
             // Stroke contiguous segments together. Independent round caps on
             // every tiny segment make Qt's compound-path rasterizer expensive
             // in dense views. Keep every vertex and every actual slice break.
@@ -1028,9 +1052,14 @@ bool FiberCollectionController::handleVolumeClick(Qt::MouseButton button, Qt::Ke
 }
 void FiberCollectionController::showInLineAnnotation(int64_t id)
 {
-    if (!annotations_ || !enabled_)
+    prepareSelectedFiber(id, false);
+}
+void FiberCollectionController::prepareSelectedFiber(int64_t id, bool forSpiral)
+{
+    if (!annotations_ || !enabled_ || (forSpiral && !spiralFitAvailable_))
         return;
     pendingAnnotation_ = id;
+    pendingForSpiral_ = forSpiral;
     ++annotationRevision_;
     for (const auto& connection : annotationRenderConnections_)
         disconnect(connection);
@@ -1045,6 +1074,7 @@ void FiberCollectionController::startPendingAnnotation()
     if (annotationBusy_ || !pendingAnnotation_ || !enabled_)
         return;
     const auto id = std::exchange(pendingAnnotation_, 0);
+    const bool forSpiral = pendingForSpiral_;
     const auto token = annotationRevision_;
     const auto digest = QCryptographicHash::hash(QByteArray::fromStdString(uuid_), QCryptographicHash::Sha256).toHex().left(32);
     const auto filename = QString("collection_%1_%2.json").arg(QString::fromLatin1(digest)).arg(id);
@@ -1093,7 +1123,7 @@ void FiberCollectionController::startPendingAnnotation()
         if (!entry.contains("control_points"))
             entry["control_points"] = Json::array({entry["line_points"].front(), entry["line_points"].back()});
         return entry;
-    }, [this, rev, token, filename, id, existing](const Outcome<Json>& result) {
+    }, [this, rev, token, filename, id, existing, forSpiral](const Outcome<Json>& result) {
         // Keep the guard through native open too: saving an old annotation can
         // run a nested event loop. New clicks replace pending work, never recurse.
         const auto finish = qScopeGuard([this]() { finishAnnotationRequest(); });
@@ -1112,6 +1142,20 @@ void FiberCollectionController::startPendingAnnotation()
                 annotationStatus_->setText(error.isEmpty() ? tr("Could not open fiber #%1.").arg(id) : error);
                 return;
             }
+        }
+        if (forSpiral) {
+            if (!spiralFitAvailable_) {
+                annotationStatus_->setText(tr("Spiral session unavailable. Fiber #%1 was not sent.").arg(id));
+                return;
+            }
+            const auto filePath = annotations_->fiberFilePath(nativeId);
+            if (filePath.empty()) {
+                annotationStatus_->setText(tr("Fiber #%1 has no saved file.").arg(id));
+                return;
+            }
+            annotationStatus_->setText(tr("Sending fiber #%1 to Spiral. See Spiral for upload status.").arg(id));
+            emit addToSpiralRequested(QString::fromStdString(filePath.string()));
+            return;
         }
         annotationStatus_->setText(tr("Building flattened views for fiber #%1…").arg(id));
         QString error;
@@ -1168,8 +1212,25 @@ void FiberCollectionController::watchAnnotationRender(LineAnnotationDialog* dial
         }
     }));
 }
+void FiberCollectionController::setViewerNativeToViewerFactor(VolumeViewerBase* viewer, double factor)
+{
+    if (!viewer || !(factor > 0.0) || !std::isfinite(factor))
+        return;
+    if (const auto found = viewerFactors_.find(viewer); found != viewerFactors_.end() && found->second == factor)
+        return;
+    viewerFactors_[viewer] = factor;
+    if (const auto found = views_.find(viewer); found != views_.end())
+        found->second->dirty = true;
+    refreshViewer(viewer);
+}
+double FiberCollectionController::nativeToViewer(VolumeViewerBase* viewer) const
+{
+    const auto found = viewerFactors_.find(viewer);
+    return found == viewerFactors_.end() ? nativeToViewer_ : found->second;
+}
 void FiberCollectionController::detachViewer(VolumeViewerBase* viewer)
 {
+    viewerFactors_.erase(viewer);
     if (auto it = views_.find(viewer); it != views_.end()) {
         if (it->second->cancelled)
             it->second->cancelled->store(true);

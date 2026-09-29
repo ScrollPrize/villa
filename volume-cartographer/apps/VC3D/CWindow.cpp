@@ -2648,6 +2648,13 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                             viewer, _spiralWorkspace->fiberBaseToPreviewFactor()
                                         .value_or(1.0));
                     }
+                    if (_fiberCollection && viewer) {
+                        _fiberCollection->attachViewer(
+                            viewer, _spiralWorkspace->viewerManager());
+                        _fiberCollection->setViewerNativeToViewerFactor(
+                            viewer, _spiralWorkspace->fiberBaseToPreviewFactor()
+                                        .value_or(1.0));
+                    }
                 });
         for (auto* viewer : _spiralWorkspace->viewerManager()->baseViewers()) {
             if (auto* chunked = viewer
@@ -2660,16 +2667,19 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
         connect(_spiralWorkspace, &SpiralWorkspace::spiralSessionActiveChanged, this, [this](bool active) {
             if (_surfacePanel) _surfacePanel->setSpiralFitAvailable(active);
             if (_fiberWidget) _fiberWidget->setSpiralFitAvailable(active);
+            if (_fiberCollection) _fiberCollection->setSpiralFitAvailable(active);
         });
         connect(_spiralWorkspace,
                 &SpiralWorkspace::fiberBaseToPreviewFactorChanged,
                 this, [this](double factor, bool valid) {
-                    if (!_fiberOverlay || !_spiralWorkspace ||
-                        !_spiralWorkspace->viewerManager()) return;
+                    if (!_spiralWorkspace || !_spiralWorkspace->viewerManager()) return;
                     const double applied = valid ? factor : 1.0;
                     _spiralWorkspace->viewerManager()->forEachBaseViewer(
                         [this, applied](VolumeViewerBase* viewer) {
-                            _fiberOverlay->setViewerBaseToViewerFactor(viewer, applied);
+                            if (_fiberOverlay)
+                                _fiberOverlay->setViewerBaseToViewerFactor(viewer, applied);
+                            if (_fiberCollection)
+                                _fiberCollection->setViewerNativeToViewerFactor(viewer, applied);
                         });
                 });
     }
@@ -2814,6 +2824,22 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     _fiberOverlay = std::make_unique<FiberOverlayController>(this);
     _fiberOverlay->bindToViewerManager(_viewerManager.get());
     _fiberCollection = std::make_unique<FiberCollectionController>(_state, _viewerManager.get(), this, _lineAnnotationController.get());
+    if (_spiralWorkspace) {
+        connect(_fiberCollection.get(), &FiberCollectionController::openVolumeChanged,
+                _spiralWorkspace, &SpiralWorkspace::setOpenFiberVolume);
+        _spiralWorkspace->setOpenFiberVolume(_fiberCollection->openVolumePath());
+        connect(_fiberCollection.get(), &FiberCollectionController::addToSpiralRequested,
+                _spiralWorkspace, &SpiralWorkspace::addFiberToCurrentFit);
+        _fiberCollection->setSpiralFitAvailable(_spiralWorkspace->hasActiveSpiralSession());
+        if (auto* spiralViewers = _spiralWorkspace->viewerManager()) {
+            spiralViewers->setVolumeClickInterceptor(
+                [this](const cv::Vec3f&, const cv::Vec3f&, Surface*, Qt::MouseButton button,
+                       Qt::KeyboardModifiers modifiers) {
+                    return _fiberCollection && !(_segmentationModule && _segmentationModule->editingEnabled()) &&
+                           _fiberCollection->handleVolumeClick(button, modifiers);
+                });
+        }
+    }
     updateActiveWorkspaceViewerControls();
     if (_spiralWorkspace && _spiralWorkspace->viewerManager()) {
         _spiralWorkspace->viewerManager()->forEachBaseViewer(
@@ -2821,6 +2847,11 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                 _fiberOverlay->attachViewer(
                     viewer, _spiralWorkspace->viewerManager());
                 _fiberOverlay->setViewerBaseToViewerFactor(
+                    viewer, _spiralWorkspace->fiberBaseToPreviewFactor()
+                                .value_or(1.0));
+                _fiberCollection->attachViewer(
+                    viewer, _spiralWorkspace->viewerManager());
+                _fiberCollection->setViewerNativeToViewerFactor(
                     viewer, _spiralWorkspace->fiberBaseToPreviewFactor()
                                 .value_or(1.0));
             });

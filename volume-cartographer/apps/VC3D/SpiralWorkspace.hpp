@@ -62,6 +62,7 @@ public:
 
     // Cross-panel entry points for "Add to current spiral fit".
     bool hasActiveSpiralSession() const;
+    void setOpenFiberVolume(const QString& path);
     void addPatchToCurrentFit(const QString& tifxyzDirectory,
                               const std::shared_ptr<QuadSurface>& surface = {});
     void addFiberToCurrentFit(const QString& fiberJsonPath);
