@@ -21,11 +21,6 @@
 // this set is now empty; the mechanism stays for any future embargo.
 const EMBARGOED = new Set([]);
 
-function uniqSortedNums(arr) {
-  return [...new Set(arr.filter((v) => v !== null && v !== undefined))].sort(
-    (a, b) => a - b
-  );
-}
 function uniqStrings(arr) {
   return [...new Set(arr.filter((v) => v !== null && v !== undefined && v !== ""))].sort();
 }
@@ -53,9 +48,9 @@ function webknossosDatasets(progress) {
   const p = progress || {};
   const listed = (Array.isArray(p.wk) ? p.wk : []).filter((d) => d && d.url);
   if (listed.length) {
-    return listed.map((d) => ({ name: d.name ?? null, px: d.px ?? null, url: d.url }));
+    return listed.map((d) => ({ name: d.name ?? null, url: d.url }));
   }
-  return p.wkUrl ? [{ name: null, px: null, url: p.wkUrl }] : [];
+  return p.wkUrl ? [{ name: null, url: p.wkUrl }] : [];
 }
 
 // Pull {px, energy, loc, name} out of a single scan record. The public
@@ -134,8 +129,6 @@ function deriveFacts(sample) {
     n_volumes: Object.keys(volumes).length,
     n_segments: Object.keys(segments).length,
     min_px: pxVals.length ? Math.min(...pxVals) : null,
-    energies: uniqSortedNums(scanList.map((s) => s.energy)),
-    locations: uniqStrings(scanList.map((s) => s.loc)),
     scans: scanList,
     licenses,
     ctVolumes,
@@ -652,8 +645,6 @@ function buildIndex(samples, opts) {
       n_volumes: facts ? facts.n_volumes : 0,
       n_segments: facts ? facts.n_segments : 0,
       min_px: facts ? facts.min_px : null,
-      energies: facts ? facts.energies : [],
-      locations: facts ? facts.locations : [],
       scans: facts ? facts.scans : [],
       hasS3: !!facts,
       licenses: facts ? facts.licenses : [],

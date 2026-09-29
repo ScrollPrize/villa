@@ -127,24 +127,11 @@ export default function DataCatalog({ scroll }) {
     key: d.url || i,
     href: d.url,
     title: d.name || "webknossos viewer",
-    detail: d.px != null ? `${d.px} µm` : "",
   }));
   const licenses = scroll.licenses || [];
   // Optional per-license scope annotations curated in atlasOverlay.json
   // (license name -> which of this scroll's data it covers).
   const licenseScope = scroll.licenseScope || null;
-
-  // Volume-level predictions are listed in their own Predictions table; here we
-  // only summarize the count in the metadata list.
-  const preds = scroll.predictions || [];
-  const nSurface = preds.filter((p) => p.purpose === "surface-prediction").length;
-  const nInk3d = preds.filter((p) => p.purpose === "ink-detection-3d").length;
-  const predsTxt = [
-    nSurface ? `${nSurface} surface` : null,
-    nInk3d ? `${nInk3d} 3D-ink` : null,
-  ]
-    .filter(Boolean)
-    .join(" · ");
 
   // Quick-link buttons (ref lines 108-112).
   const links = [];
@@ -209,9 +196,6 @@ export default function DataCatalog({ scroll }) {
 
   // Metadata rows (ref lines 115-123).
   const configs = scanConfigurations(scroll.scans);
-  const segments = scroll.n_segments;
-  const segmentsTxt =
-    segments != null ? Number(segments).toLocaleString() : "—";
 
   return (
     <div className="panel full catalog">
@@ -234,20 +218,8 @@ export default function DataCatalog({ scroll }) {
               ))
             : "—"}
         </dd>
-        <dt>Scans / volumes</dt>
-        <dd>
-          {scroll.n_scans} / {scroll.n_volumes}
-        </dd>
-        <dt>Segments</dt>
-        <dd>{segmentsTxt}</dd>
         <dt>Formats</dt>
         <dd>CT volumes (TIFF stacks · OME-Zarr) · surface segments</dd>
-        {predsTxt ? (
-          <React.Fragment>
-            <dt>Predictions</dt>
-            <dd>{predsTxt}</dd>
-          </React.Fragment>
-        ) : null}
         <dt>License</dt>
         <dd>
           {licenses.length ? (
