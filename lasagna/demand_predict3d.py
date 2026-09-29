@@ -766,9 +766,6 @@ class DemandWorkerPool:
         accumulator_workers = len(devices) if accumulator_workers is None else int(accumulator_workers)
         if accumulator_workers < 1 or flush_workers < 1:
             raise ValueError("positive accumulation/publication worker budgets required")
-        hot_total = accumulator_workers * 8 if accumulator_hot_slots is None else int(accumulator_hot_slots)
-        if hot_total < accumulator_workers or int(accumulator_spill_segment_slots) < 1:
-            raise ValueError("hot slots must cover every accumulator worker and spill segments must be positive")
         for key, store in stores.items():
             store.arena_key = str(key)
         tile_shape = (self.geometry.tile,) * 3
@@ -787,6 +784,9 @@ class DemandWorkerPool:
                            for p in first.products for channel in range(p.raw_channel_count)]
         record_layouts, record_bytes = tiled._packed_layouts(record_entries)
         self.record_spec = tiled._AccumulatorRecordSpec(record_bytes, record_layouts)
+        hot_total = accumulator_workers * 8 if accumulator_hot_slots is None else int(accumulator_hot_slots)
+        if hot_total < accumulator_workers or int(accumulator_spill_segment_slots) < 1:
+            raise ValueError("hot slots must cover every accumulator worker and spill segments must be positive")
         hot_counts = tuple(hot_total // accumulator_workers + (i < hot_total % accumulator_workers)
                            for i in range(accumulator_workers))
         self.inputs, self.results, self.weight_templates = [], [], []

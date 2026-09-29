@@ -617,13 +617,22 @@ def create_managed_demand_pool(stores, readers, device_list, settings, pool_grou
     adaptive = settings.get("demand_gpu_manager")
     factory = demand.DemandWorkerPool if pool_groups is None else (
         lambda *args, **kwargs: ModelWorkerPools(*args, groups=pool_groups, **kwargs))
+    # Chunk-major arena evaluations need enough owner-local hot records to
+    # avoid spilling every tile contribution. Older configs predate these
+    # knobs, so retain the proven full-evaluation defaults unless either
+    # override is explicit.
+    accumulator_workers = settings.get("accumulator_workers")
+    accumulator_hot_slots = settings.get("accumulator_hot_slots")
+    if accumulator_workers is None and accumulator_hot_slots is None:
+        accumulator_workers = 128
+        accumulator_hot_slots = 163840
     pool = factory(stores, readers, device_list,
         slots_per_gpu=int(settings.get("slots_per_gpu", 2)),
         input_workers=int(settings.get("input_workers", 8)),
         input_slots=settings.get("input_slots"), result_slots=settings.get("result_slots"),
         max_batch_size=settings.get("max_batch_size", 1),
-        accumulator_workers=settings.get("accumulator_workers"),
-        accumulator_hot_slots=settings.get("accumulator_hot_slots"),
+        accumulator_workers=accumulator_workers,
+        accumulator_hot_slots=accumulator_hot_slots,
         accumulator_spill_segment_slots=int(settings.get("accumulator_spill_segment_slots", 256)),
         flush_workers=int(settings.get("flush_workers", 4)),
         deferred_gpu=adaptive is not None)
