@@ -169,7 +169,7 @@ def states(f,n=10):
         offtrack=np.arange(n)%5==4,hard=np.ones(n,bool),exploratory=np.zeros(n,bool))
 
 
-def test_replay_rejects_old_versions_and_mixes_fixed_and_recent_sources(tmp_path):
+def test_replay_rejects_old_versions_and_mixes_fresh_and_recent_sources(tmp_path):
     f=fiber();arrays=states(f);old=tmp_path/'old.npz'
     np.savez(old,__metadata__=json.dumps(dict(version=4,fibers=D.fiber_manifest([f]),provenance={})),
              candidates=np.zeros((10,7,64,3)),**arrays)
@@ -180,14 +180,24 @@ def test_replay_rejects_old_versions_and_mixes_fixed_and_recent_sources(tmp_path
     path=tmp_path/'bank.npz';bank.save(path);bank=D.OnPolicyStates.load(path)
     bank.validate_fibers([f]);assert bank.hist.shape==(10,8,3)
     pools=D.replay_pools([bank]);assert all(pools)
-    ds=D.FollowDataset([f],spec,cfg,None,fixed=[bank],onpolicy=[bank])
+    ds=D.FollowDataset([f],spec,cfg,None,onpolicy=[bank])
     rng=np.random.default_rng(3);counts=np.zeros(3,int);departed=np.zeros(3,int)
     for _ in range(20000):
         draw=ds.draw_replay(rng);source=0 if draw is None else draw[0];counts[source]+=1
         if draw is not None: departed[source]+=draw[1]==4
-    np.testing.assert_allclose(counts/counts.sum(),[.5,.25,.25],atol=.015)
-    np.testing.assert_allclose(departed[1:]/counts[1:],[.1,.1],atol=.02)
-    ds._set_replay([]);assert all(ds.fixed_pools) and not any(ds.recent_pools)
+    np.testing.assert_allclose(counts/counts.sum(),[.7,0.,.3],atol=.015)
+    np.testing.assert_allclose(departed[2]/counts[2],.1,atol=.02)
+    assert counts[1] == 0
+    replacement=D.OnPolicyStates(manifest=bank.manifest,provenance={},drift=drift,**arrays)
+    replacement_path=tmp_path/'replacement.npz';replacement.save(replacement_path)
+    index=tmp_path/'replay.json';index.write_text(json.dumps([str(replacement_path)]))
+    ds.replay_index=str(index);ds.refresh_replay()
+    assert len(ds.onpolicy) == 1 and ds.onpolicy[0]._dir != bank._dir
+    assert all(entry[0] is ds.onpolicy[0] for pool in ds.recent_pools
+               for entries in pool.values() for entry in entries)
+    index.write_text('[]');ds.refresh_replay()
+    assert not any(ds.recent_pools)
+    assert all(ds.draw_replay(rng) is None for _ in range(100))
 
 
 def test_accumulation_steps_once_and_ema_matches_effective_batch(monkeypatch):
@@ -272,7 +282,7 @@ def test_preflight_must_match_encoding_cache_mode(tmp_path,cached_benchmark):
     if cached_benchmark: benchmark['cache_training_encoding']=True
     path=tmp_path/'benchmark.json';path.write_text(json.dumps(benchmark))
     args=['--device','cpu','--fiber-zarrs','unused','--ct','unused','--fibers','unused',
-          '--name','unused','--fixed-bank','unused','--manifest','unused','--benchmark',str(path)]
+          '--name','unused','--manifest','unused','--benchmark',str(path)]
     if cached_benchmark: args.append('--no-cache-training-encoding')
     with pytest.raises(ValueError,match='matching full-crop benchmark'):
         main(args)

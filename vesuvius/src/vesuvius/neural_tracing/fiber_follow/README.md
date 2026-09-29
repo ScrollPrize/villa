@@ -62,8 +62,8 @@ and no localization loss. GT history is diagnostic data only.
 
 ## Data and first run
 
-The mixture is 50% fresh augmentation, 25% permanent recovery bank and 25%
-recent replay. Each replay source reserves 10% of draws for confirmed departures;
+The default mixture is 70% fresh augmentation and 30% current replay, controlled
+by `--fresh-fraction` in either trainer. Replay reserves 10% of draws for confirmed departures;
 other draws balance the drift bands <1, 1–1.5, 1.5–2, 2–3.5 and fibers within each
 band. Missing strata fall back to fresh states. Logs contain realized source
 fractions and stratum counts. A smooth accumulated displacement over a uniformly
@@ -71,11 +71,9 @@ sampled 16–64 history voxels augments existing drift, heading, wobble, missing
 and truncated histories.
 
 Replay v5 stores observed states and original-fiber correspondence, independently
-of prediction shapes. The one-time importer that built the fixed bank discarded
-predictions, relabeled drift, checked the larger crop/holdout footprint, preserved
-source provenance, deduplicated states, and sampled up to 20,000 unique eligible states. The fixed bank never
-rotates out with the latest four completed caches. Every training replay draw is
-relabeled and checked again before recropping. The original 48-voxel holdout
+of prediction shapes. Training uses the latest completed on-policy caches
+(default: four), rotating older caches out as new ones arrive. Every training
+replay draw is relabeled and checked again before recropping. The original 48-voxel holdout
 position guard and complete crop/history/target exclusion remain in force.
 
 From this directory, using an existing environment with the project dependencies:
@@ -85,10 +83,10 @@ export PYTHONPATH=../../..
 bash scripts/launch_single_path.sh single_path_v11_run1
 ```
 
-The frozen seed manifest (`output/single_path_v11_preparation/seeds.json`) and
-permanent recovery bank (`fixed_recovery.npz`) already exist in this workspace.
-They were derived once from v10 runs; the one-off preparation scripts are in git
-history. Stop a run from either trainer with `bash scripts/stop.sh NAME`.
+The frozen seed manifest (`output/single_path_v11_preparation/seeds.json`)
+already exists in this workspace. A new run samples fresh states until current
+replay is available, unless initial caches are supplied with `--onpolicy`.
+Stop a run from either trainer with `bash scripts/stop.sh NAME`.
 The launcher benchmarks
 before starting training. If microbatch 2 exhausts GPU memory, rerun with
 `MICROBATCH=1`; effective batch remains eight and the crop remains full sized.

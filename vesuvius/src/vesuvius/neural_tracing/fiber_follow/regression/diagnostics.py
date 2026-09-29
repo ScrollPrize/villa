@@ -184,7 +184,7 @@ def identity_training_groups(output, batch, terms, cfg, temperature):
             identity_sum=float(scored['identity_per_state'][member].sum()),
             recent_states=int((eligible & (scored['identity_anchor_source']==1)).sum()),
             seed_states=int((eligible & (scored['identity_anchor_source']==2)).sum()))
-    for i,name in enumerate(('fresh','fixed','recent','wrong_continuation','bank_following','decision_pair')):
+    for i,name in ((0,'fresh'), (2,'recent'), (3,'wrong_continuation'), (4,'bank_following'), (5,'decision_pair')):
         record('source/'+name,batch['source']==i,batch,terms)
     if 'location_source' in batch:
         record('source/bank_covered',batch['location_source']==5,batch,terms)

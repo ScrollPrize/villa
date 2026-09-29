@@ -19,7 +19,7 @@ command=("$PYTHON" -u -m vesuvius.neural_tracing.fiber_follow.regression.train \
     --fibers /mnt/raid_nvme/spiral_dataset_working/fibers \
     --ct /mnt/raid_nvme/volpkgs/s1_2um_ds2.volpkg/volumes/s1_ds2.zarr \
     --manifest "$FF/output/single_path_v11_preparation/seeds.json" \
-    --fixed-bank "$FF/output/single_path_v11_preparation/fixed_recovery.npz" "$@")
+    "$@")
 "$PYTHON" - "$FF/output/logs" "$name" "${command[@]}" <<'PY'
 from pathlib import Path
 import shlex

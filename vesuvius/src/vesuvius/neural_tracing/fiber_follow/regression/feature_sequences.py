@@ -113,10 +113,43 @@ def stream_rows(item, builder, band=None):
     return rows
 
 
+class SwitchCropBudget:
+    """Admit whole streams using actual crop costs, without extra active state.
+
+    Ordinary streams earn room for switches; excess switch proposals are dropped
+    before image I/O. At completed-group boundaries switches cannot exceed the
+    target share. Selection can undershoot if suitable switch proposals are rare.
+    """
+    def __init__(self, fraction):
+        if not 0 <= fraction < 1:
+            raise ValueError('Switch crop fraction must be in [0, 1)')
+        self.fraction = fraction
+        self.ordinary = self.switch = 0
+        self.rejected_streams = 0
+
+    def admit(self, streams):
+        self.ordinary += sum(len(rows) for rows in streams if rows[-1].get('source') != 3)
+        accepted = []
+        for rows in streams:
+            if rows[-1].get('source') == 3:
+                proposed = self.switch+len(rows)
+                if proposed > self.fraction*(self.ordinary+proposed)+1e-9:
+                    self.rejected_streams += 1
+                    continue
+                self.switch = proposed
+            accepted.append(rows)
+        return accepted
+
+
 def sequence_batches(builder, items, vol, *, band=None, worker=0, requested_fraction=0.):
     """Yield bounded chunks; ids survive worker interleaving and optimizer updates."""
     streams = [stream_rows(item, builder, band) for item in items]
     streams = [rows for rows in streams if rows]
+    fraction = builder.cfg.feature_switch_crop_fraction
+    if fraction >= 0:
+        if not hasattr(builder, '_switch_crop_budget'):
+            builder._switch_crop_budget = SwitchCropBudget(fraction)
+        streams = builder._switch_crop_budget.admit(streams)
     if not streams:
         return
     group = getattr(builder, '_feature_group', 0)

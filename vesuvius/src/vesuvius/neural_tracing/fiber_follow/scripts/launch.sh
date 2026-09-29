@@ -1,6 +1,6 @@
 #!/bin/bash
 # Internal helper for launch_single_path.sh, which supplies the required
-# --ct/--manifest/--fixed-bank/--benchmark options. Starts flow training in the
+# --ct/--manifest/--benchmark options. Starts flow training in the
 # background (own process group).
 # Outputs: output/NAME/ (ckpts, images, log.jsonl), stdout in output/logs/NAME.log
 FF="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"

@@ -56,7 +56,7 @@ def test_training_startup_with_legacy_volume_metadata(tmp_path, monkeypatch, leg
         flow_draws=64, crop=[176, 96, 96], sampler_mode='zero', compile_model=False,
         cache_training_encoding=True)))
     args = ['--device', 'cpu', '--fiber-zarrs', spec.fiber_zarr_dir, '--ct', spec.ct_zarr,
-            '--fibers', 'unused', '--fixed-bank', 'unused', '--manifest', str(manifest_path),
+            '--fibers', 'unused', '--manifest', str(manifest_path),
             '--benchmark', str(benchmark), '--out-root', str(tmp_path/'output'), '--name', 'run',
             '--sampler-mode', 'zero', '--workers', '0']
     if mode != 'fresh':

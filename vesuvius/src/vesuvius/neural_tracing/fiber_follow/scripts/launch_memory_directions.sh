@@ -12,7 +12,7 @@ fi
 command=(bash "$FF/scripts/launch_memory.sh"
     --init-tracer "$INIT_TRACER" --direction-inputs
     --n-commit 8 --presence-dropout 0
-    --fresh-fraction 0.6 --bank-following-probability 0.2 --decision-fraction 0.1)
+    --fresh-fraction 0.7 --bank-following-probability 0.2 --decision-fraction 0.1)
 if [[ ${1:-} == --dry-run ]]; then
     shift
     printf 'RUN_NAME=%q ' "$RUN_NAME"

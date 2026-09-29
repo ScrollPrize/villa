@@ -54,6 +54,7 @@ class DirectConfig:
     # The newest memory_grad_steps observations (and the head) backpropagate;
     # older ones are a no-grad burn-in. At least memory_steps: no burn-in.
     memory_grad_steps: int = 32
+    memory_departed_weight: float = 1.  # auxiliary probe BCE weight for actual departed labels
     memory_version: int = 2  # 1: legacy checkpoints without the probe
     route_grid_step: float = 2.  # v3: maximum lateral lattice spacing, trace voxels
     route_transition_radius: int = 1  # v3: connected lattice neighbors per plane
@@ -67,11 +68,18 @@ class DirectConfig:
     feature_detail_tokens: int = 16  # revision 2: fine neighborhoods along observed history
     feature_stream_steps: int = 128  # revision 2: historical observations before endpoint
     feature_replay_weight: float = .5  # revision 2: stratified endpoint replay objective
+    feature_switch_crop_fraction: float = -1.  # -1 disables whole-stream crop-budget admission
     feature_memory_revision: int = 1
     recurrent_refinement_steps: int = 0  # v4 shared-decoder passes after the initial proposal
     recurrent_refinement_limit: float = 1.  # maximum lateral update norm per pass
 
     def __post_init__(self):
+        if not math.isfinite(self.memory_departed_weight) or self.memory_departed_weight <= 0:
+            raise ValueError('Departed probe weight must be finite and positive')
+        if self.feature_switch_crop_fraction != -1 and not 0 <= self.feature_switch_crop_fraction < 1:
+            raise ValueError('Switch crop fraction must be -1 (legacy) or in [0, 1)')
+        if self.feature_switch_crop_fraction >= 0 and self.memory_version != 4:
+            raise ValueError('Switch crop budget requires feature-memory v4')
         if not isinstance(self.recurrent_refinement_steps, int) or self.recurrent_refinement_steps < 0:
             raise ValueError('Recurrent refinement steps must be a nonnegative integer')
         if not math.isfinite(self.recurrent_refinement_limit) or self.recurrent_refinement_limit <= 0:

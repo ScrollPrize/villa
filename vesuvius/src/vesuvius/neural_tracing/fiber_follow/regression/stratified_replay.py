@@ -88,7 +88,7 @@ class StratifiedReplay:
                 if 'candidate_per_state' in terms:
                     loss = loss+candidate_weight*terms['candidate_per_state'].sum()
                 if 'memory_target_identity' in batch:
-                    probe = memory_probe_terms(output, batch)
+                    probe = memory_probe_terms(output, batch, departed_weight=raw.cfg.memory_departed_weight)
                     loss = loss+memory_probe_weight*(probe['memory_identity_per_state'].sum()+probe['memory_offset_per_state'].sum())
                 loss = loss*(weight/total)
             loss.backward()

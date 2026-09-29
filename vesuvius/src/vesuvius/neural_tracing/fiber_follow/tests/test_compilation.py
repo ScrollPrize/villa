@@ -51,7 +51,7 @@ def test_preflight_requires_matching_compilation(tmp_path,monkeypatch,compiled_b
     if compiled_benchmark: benchmark['compile_model']=True
     path=tmp_path/'benchmark.json';path.write_text(json.dumps(benchmark))
     args=['--fiber-zarrs','unused','--ct','unused','--fibers','unused','--name','unused',
-          '--fixed-bank','unused','--manifest','unused','--benchmark',str(path)]
+          '--manifest','unused','--benchmark',str(path)]
     if compiled_benchmark: args.append('--no-compile')
     with pytest.raises(ValueError,match='matching full-crop benchmark'):
         main(args)

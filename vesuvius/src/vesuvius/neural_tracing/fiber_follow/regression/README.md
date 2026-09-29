@@ -84,15 +84,18 @@ while `config.json` retains the original launch settings. Neither `--resume` nor
 is used by the fresh-run recipe.
 
 `--decision-fraction` reserves matched identity-pair slots first. For remaining
-draws, `--fresh-fraction` (default 0.5) selects fresh sampling, with the remainder
-split equally between fixed and recent replay. Bank following, covered locations,
+draws, `--fresh-fraction` (default 0.7) selects fresh sampling, with the remainder
+allocated to current replay. Bank following, covered locations,
 and memory switches are conditional on fresh sampling. Empty/rejected replay
 draws can fall back to fresh sampling, so observed ratios can differ.
 `--decision-fraction`, `--fresh-fraction`, and `--bank-following-probability` may
 be changed on resume; sampler events and subsequent checkpoints record them.
-For example, `--decision-fraction 0.1 --fresh-fraction 0.6
---bank-following-probability 0.2` requests 10% pairs, 18% fixed replay, 18% recent
-replay, and 54% fresh opportunities, including 10.8% bank following, before
+For an older launch command, remove `--fixed-bank PATH` and use
+`--fresh-fraction 0.7` for the new 70/30 base mix. Existing checkpoints remain
+loadable; saved historical configuration and bank files are not rewritten.
+For example, `--decision-fraction 0.1 --fresh-fraction 0.7
+--bank-following-probability 0.2` requests 10% pairs, 27% current replay, and
+63% fresh opportunities, including 12.6% bank following, before
 rejection/fallback. Other fresh subtypes divide the remaining fresh slots.
 Source allocation checks can run without pytest:
 `PYTHONPATH=../../.. python -m unittest discover -s tests -p test_sampling_ratios.py -v`.

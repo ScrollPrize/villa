@@ -229,7 +229,7 @@ def test_preflight_rejects_different_scorer_configuration(tmp_path,field,value):
     bench[field]=value; path=tmp_path/'bench.json'; path.write_text(json.dumps(bench))
     with pytest.raises(ValueError,match='matching full-crop benchmark'):
         main(['--device','cpu','--fiber-zarrs','unused','--fibers','unused','--ct','unused',
-              '--name','unused','--fixed-bank','unused','--manifest','unused','--benchmark',str(path),
+              '--name','unused','--manifest','unused','--benchmark',str(path),
               '--sampler-mode','zero','--scorer','passage','--gaussian-candidates','4'])
 
 

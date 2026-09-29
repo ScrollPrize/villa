@@ -16,7 +16,7 @@ def _number(value, spec='.3f'):
 class DirectTrainingInterval:
     """Pool every update's counts; weight per-crop means by actual crop count."""
     means = ('loss', 'geometry', 'confidence_loss', 'replay_loss', 'fresh_fraction',
-             'fixed_fraction', 'recent_fraction', 'bank_wrong_continuation_fraction',
+             'recent_fraction', 'bank_wrong_continuation_fraction',
              'bank_following_fraction', 'decision_pair_fraction')
     counts = ('error_sum', 'geometry_count', 'point_correct_count', 'point_wrong_count',
               'point_unknown_count', 'replay_endpoints', 'replay_observations', 'replay_encoder_crops')
@@ -74,13 +74,18 @@ def _interval_training_lines(row):
                  f" | departed recall {_rate(m['memory_departed_correct'], m['memory_departed_count'])}"
                  f" | replay {int(m['replay_endpoints'])} endpoints / {int(m['replay_encoder_crops'])} encoder crops"
                  f" (loss {m['replay_loss']:.4f})")
+    lines.append(f"  probe labels: departed {_rate(m['memory_departed_count'], m['memory_identity_count'])}"
+                 +f" | false departure {_rate(m['memory_identity_count']-m['memory_departed_count']-(m['memory_identity_correct']-m['memory_departed_correct']), m['memory_identity_count']-m['memory_departed_count'])}"
+                 +f" | departed loss weight {row.get('memory_departed_weight', 1.):g}x")
     lines.append(f"  identity: rank {_rate(m['identity_identity_rank_correct'], m['identity_identity_count'])}"
                  f" | InfoNCE {m['identity_identity_loss']:.4f} | candidate BCE {m['identity_candidate_loss']:.4f}"
                  f" ({int(m['identity_candidate_states'])} eligible crops)")
     lines.append('  data: '+' / '.join(f'{name} {m[key]:.0%}' for name, key in
-                 (('fresh','fresh_fraction'), ('fixed','fixed_fraction'), ('recent','recent_fraction'),
-                  ('departures','bank_wrong_continuation_fraction'), ('following','bank_following_fraction'),
+                 (('fresh','fresh_fraction'), ('recent','recent_fraction'),
+                  ('switch streams','bank_wrong_continuation_fraction'), ('following','bank_following_fraction'),
                   ('pairs','decision_pair_fraction'))))
+    if row.get('feature_switch_crop_fraction', -1.) >= 0:
+        lines[-1] += f" | switch crop budget {row['feature_switch_crop_fraction']:.0%} (cumulative)"
     lines.append('  gradients: '+' | '.join(
         f"{name} max {m[name+'_grad_norm_max']:.2g}, clipped {m[name+'_clipped_updates']}/{updates} updates"
         for name in ('memory', 'rest')))
@@ -123,7 +128,7 @@ def _decision_lines(decisions):
 def _direct_training_lines(row):
     lines = [f"  geometry {row['geometry']:.4f} | confidence {row['confidence_loss']:.4f}"
              f" | mean error {row['error_mean']:.3f} voxels | prefix correct {row['prefix_correct_fraction']:.1%}",
-             f"  data: fresh {row['fresh_fraction']:.0%} | fixed {row['fixed_fraction']:.0%}"
+             f"  data: fresh {row['fresh_fraction']:.0%}"
              f" | recent {row['recent_fraction']:.0%}"]
     if 'interval_samples_per_second' in row:
         lines.insert(0, f"  recent speed {row['interval_samples_per_second']:.2f} samples/s"
@@ -198,7 +203,9 @@ def format_training_log(row):
         return (f"{step} | resumed {row['checkpoint']}\n"
                 f"  commit {options.get('n_commit', '?')} | history spacing {cfg.get('memory_stride', '?')} vox"
                 f" | memory revision {cfg.get('feature_memory_revision', '?')}"
-                f" | batch {options.get('batch', '?')} / microbatch {options.get('microbatch', '?')}")
+                f" | batch {options.get('batch', '?')} / microbatch {options.get('microbatch', '?')}"
+                f"\n  departed probe loss {cfg.get('memory_departed_weight', 1.):g}x"
+                f" | switch crop budget {cfg.get('feature_switch_crop_fraction', -1.):g}")
     if row.get('event') == 'identity_sampling':
         bank = row.get('negative_bank_provenance') or {}
         return (f"{step} | identity sampling v{row.get('pair_sampling_version', '?')}"
@@ -240,7 +247,7 @@ def format_training_log(row):
              f" | {row['samples_per_second']:.2f} samples/s",
              f"  flow {row['flow']:.4f} | confidence {row['confidence_loss']:.4f}"
              f" (weight {row['confidence_coefficient']:.2f})",
-             f"  data: fresh {row['fresh_fraction']:.0%} | fixed {row['fixed_fraction']:.0%}"
+             f"  data: fresh {row['fresh_fraction']:.0%}"
              f" | recent {row['recent_fraction']:.0%} | replay seen {row['replay_samples_seen']:,}"]
 
     def rate(numerator, denominator):

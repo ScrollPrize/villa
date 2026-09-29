@@ -58,6 +58,8 @@ def test_logging_preserves_rng_rollout_cost_loss_and_optimizer_update(monkeypatc
     model = FollowNet(cfg)
     initial = copy.deepcopy(model.state_dict())
     b = batch(cfg)
+    b['source'][:] = torch.tensor([0, 2])
+    b['stratum'][:] = torch.tensor([-1, 4])
     outputs = []
     retained = []
     generate = FollowNet.generate_training_curve
@@ -82,6 +84,11 @@ def test_logging_preserves_rng_rollout_cost_loss_and_optimizer_update(monkeypatc
     off,on = outputs
     assert retained == [False, True]
     assert off[0] == on[0] and off[5] == on[5] == 2*cfg.flow_steps+2
+    for _, metrics, *_ in outputs:
+        assert metrics['fresh_fraction'] == metrics['recent_fraction'] == .5
+        assert metrics['replay_samples'] == 1
+        assert metrics['replay_stratum_counts'] == [0, 0, 0, 0, 1]
+        assert 'fixed_fraction' not in metrics
     assert 'refinement' not in off[1]
     assert len(on[1]['refinement']['by_drift']['all']['error_mean']) == cfg.flow_steps+1
     for index in (2, 3):
@@ -95,7 +102,7 @@ def test_terminal_blocks_preserve_json_and_format_events(tmp_path, capsys):
     metrics = refinement_metrics(torch.zeros(2, 3, 4, 3), batch(cfg), cfg)
     row = dict(step=1250, loss=1.23456, lr=.001, samples_per_second=8.765,
                flow=1.1, confidence_loss=.269, confidence_coefficient=.5,
-               fresh_fraction=.5, fixed_fraction=.25, recent_fraction=.25,
+               fresh_fraction=.5, recent_fraction=.5,
                replay_samples_seen=5000, commit_correct_count=3, commit_known_count=4, commit_window=8,
                refinement=metrics)
     for threshold in DIAGNOSTIC_THRESHOLDS:
@@ -115,6 +122,7 @@ def test_terminal_blocks_preserve_json_and_format_events(tmp_path, capsys):
     assert 'Step 1,250 | loss 1.2346 | lr 1.00e-03 | 8.77 samples/s' in printed
     assert 'initial' in printed and 'step 2' in printed and 'refinement' in printed
     assert '1/4 (25.0%)' in printed and 'n/a (0 known)' in printed
+    assert 'fixed' not in printed
     assert 'dagger_launched: true' in printed and 'precision 95.0%' in printed
     assert '"refinement"' not in printed
     assert format_training_log(dict(dagger_discarded=True)) == 'Training | dagger_discarded: true'

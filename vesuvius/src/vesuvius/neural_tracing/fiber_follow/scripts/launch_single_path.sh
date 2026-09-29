@@ -67,6 +67,6 @@ benchmark="$FF/output/preflight/${name}_b${MICROBATCH}_${sampler_mode}_${scorer}
     --candidate-selection "$candidate_selection" \
     "${perf_args[@]}" --out "$benchmark"
 PYTHON="$PYTHON" bash "$FF/scripts/launch.sh" "$name" --ct "$CT_ZARR" --microbatch "$MICROBATCH" \
-    --fixed-bank "$PREPARATION/fixed_recovery.npz" --manifest "$PREPARATION/seeds.json" \
+    --manifest "$PREPARATION/seeds.json" \
     --benchmark "$benchmark" --sampler-mode "$sampler_mode" --scorer "$scorer" \
     --gaussian-candidates "$gaussian_candidates" --candidate-selection "$candidate_selection" "${train_args[@]}"

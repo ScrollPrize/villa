@@ -154,7 +154,7 @@ def optimizer_update(model, ema, opt, batches, update, lr, *, device, tolerance=
     total_loss=0.
     metrics={}
     sources=np.zeros(3,dtype=np.int64)
-    strata=np.zeros((2,5),dtype=np.int64)
+    strata=np.zeros(5,dtype=np.int64)
     total=sum(len(b['hist']) for b in batches)
     last=None
     # Label all detached generated curves first, so censoring and departures do
@@ -212,16 +212,15 @@ def optimizer_update(model, ema, opt, batches, update, lr, *, device, tolerance=
         if 'source' in cpu:
             for source in range(3):
                 sources[source]+=int((cpu['source']==source).sum())
-            for source in (1,2):
-                for band in range(5):
-                    strata[source-1,band]+=int(((cpu['source']==source)&(cpu['stratum']==band)).sum())
+            for band in range(5):
+                strata[band]+=int(((cpu['source']==2)&(cpu['stratum']==band)).sum())
         last={k:v.detach() for k,v in batch.items()}
         del out,loss,batch,encoding_args
     torch.nn.utils.clip_grad_norm_(model.parameters(),1.,error_if_nonfinite=True)
     opt.step()
     update_ema(ema,model,update,decay)
-    metrics.update(fresh_fraction=sources[0]/total,fixed_fraction=sources[1]/total,recent_fraction=sources[2]/total,
-                   replay_stratum_counts=strata.tolist(),replay_samples=int(sources[1:].sum()))
+    metrics.update(fresh_fraction=sources[0]/total,recent_fraction=sources[2]/total,
+                   replay_stratum_counts=strata.tolist(),replay_samples=int(sources[2]))
     return total_loss,metrics,last
 
 
@@ -258,7 +257,8 @@ def build_parser():
     ap.add_argument('--tolerance',type=float,default=1.5)
     ap.add_argument('--n-commit',type=int,default=DEFAULT_N_COMMIT,
                     help='Rollout commit limit; also the confidence near-window and refinement metric width')
-    ap.add_argument('--fixed-bank',required=True)
+    ap.add_argument('--fresh-fraction',type=float,default=.7,
+                    help='Fresh share of draws; remainder uses current replay; may change on resume')
     ap.add_argument('--onpolicy',nargs='*',default=[])
     ap.add_argument('--dagger-every',type=int,default=1000)
     ap.add_argument('--dagger-device')
@@ -287,6 +287,8 @@ def build_parser():
 def main(argv=None):
     raise_open_file_limit()
     args=build_parser().parse_args(argv)
+    if not np.isfinite(args.fresh_fraction) or not 0 <= args.fresh_fraction <= 1:
+        raise ValueError('fresh-fraction must be finite and in [0, 1]')
     if args.resume and args.init_from:
         raise ValueError('--resume and --init-from are mutually exclusive')
     if args.batch != 8 or args.batch % args.microbatch:
@@ -337,7 +339,6 @@ def main(argv=None):
     manifest=read_manifest(args.manifest)
     if manifest['fibers']!=fiber_manifest(val_f) or FiberVolumeSpec(**manifest['volume'])!=spec:
         raise ValueError('Frozen manifest does not match run geometry/volume')
-    fixed=OnPolicyStates.load(args.fixed_bank)
     if initial is not None:
         if FiberVolumeSpec(**initial['vol_spec'])!=spec or CropSpec(**initial['crop'])!=crop or initial['n_history']!=128:
             raise ValueError('Initialization volume/crop/history differs from this run')
@@ -365,7 +366,8 @@ def main(argv=None):
                               seeds_per_fiber=args.dagger_seeds_per_fiber)
     # A resumed run reseeds its loader workers so it does not replay the run's first states.
     ds=FollowDataset(train_f,spec,sample_cfg,band,chunk=args.microbatch,seed=args.seed+(resume['step'] if resume else 0),
-                     cache_bytes=int(args.worker_cache_gb*(1<<30)),fixed=[fixed],onpolicy=caches,replay_index=str(collector.index))
+                     cache_bytes=int(args.worker_cache_gb*(1<<30)),onpolicy=caches,replay_index=str(collector.index),
+                     fresh_fraction=args.fresh_fraction)
     kwargs=dict(num_workers=args.workers,batch_size=None)
     if args.workers: kwargs.update(prefetch_factor=2,persistent_workers=True)
     loader=torch.utils.data.DataLoader(ds,**kwargs); it=iter(loader)

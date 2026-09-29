@@ -63,7 +63,7 @@ def decision_at(item, builder, j, *, rng=None, observed_indices=None):
                       offtrack=bool(track['offtrack'][j]) if np.isfinite(track['offtrack'][j]) else False)
     observed = slice(None, j) if observed_indices is None else observed_indices
     row.update(fiber_ref=(fi,fiber.length-t if reverse else t,reverse),
-               source=item.get('source',1),source_step=item.get('source_step',-1),
+               source=item.get('source',2),source_step=item.get('source_step',-1),
                stratum=item.get('stratum',-1),location_source=item.get('location_source',0),
                memory_track={key:np.asarray(value[observed]).copy() for key,value in track.items()},
                _route_sequence_member=True)

@@ -92,7 +92,8 @@ ARCHITECTURES = (ARCHITECTURE, MEMORY_ARCHITECTURE, MEMORY_ARCHITECTURE_V1,
                  SPATIAL_MEMORY_ARCHITECTURE, TRAJECTORY_MEMORY_ARCHITECTURE)
 ROUTE_OPTIONS = ('route_grid_step','route_transition_radius','route_transition_cost','route_loss_weight','route_sequence_weight')
 MEMORY_OPTIONS = ('memory_slots','memory_steps','memory_stride','memory_patch_size','memory_grad_steps')
-FEATURE_OPTIONS = ('feature_memory_revision', 'feature_detail_tokens', 'feature_stream_steps', 'feature_replay_weight')
+FEATURE_OPTIONS = ('feature_memory_revision', 'feature_detail_tokens', 'feature_stream_steps', 'feature_replay_weight',
+                   'feature_switch_crop_fraction')
 MEMORY_GRAD_CLIP = 5.
 REST_GRAD_CLIP = 20.
 
@@ -383,7 +384,7 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
                     loss = loss+candidate_weight*candidate_loss
                     accumulate(identity, 'candidate_loss', candidate_loss)
                 if 'memory_probe' in output and 'memory_target_identity' in batch:
-                    probe = memory_probe_terms(output, batch)
+                    probe = memory_probe_terms(output, batch, departed_weight=model.cfg.memory_departed_weight)
                     identity_probe = probe['memory_identity_per_state'].sum()/total
                     offset_probe = probe['memory_offset_per_state'].sum()/total
                     loss = loss+memory_probe_weight*(identity_probe+offset_probe)
@@ -465,7 +466,7 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
     sums['observed_states'] = total
     sums.update(error_mean=sums['error_sum']/max(1., sums['geometry_count']),
                 prefix_correct_fraction=sums['correct_count']/max(1., sums['confidence_count']),
-                fresh_fraction=float(sources[0]/total), fixed_fraction=float(sources[1]/total),
+                fresh_fraction=float(sources[0]/total),
                 recent_fraction=float(sources[2]/total),bank_wrong_continuation_fraction=float(sources[3]/total),
                 bank_following_fraction=float(sources[4]/total),
                 decision_pair_fraction=float(sources[5]/total), decision_requested_fraction=requested_decisions/total)
@@ -510,7 +511,6 @@ def build_parser():
     ap.add_argument('--fibers', required=True)
     ap.add_argument('--ct', required=True)
     ap.add_argument('--manifest', required=True)
-    ap.add_argument('--fixed-bank', help='Optional existing v5 original-fiber recovery bank')
     ap.add_argument('--onpolicy', nargs='*', default=[])
     ap.add_argument('--out-root', default=str(Path(__file__).parents[1]/'output'))
     ap.add_argument('--device', default='cuda')
@@ -566,6 +566,8 @@ def build_parser():
                     help='Newest observations that backpropagate; older ones are a no-grad burn-in')
     ap.add_argument('--memory-probe-weight', type=float, default=.5,
                     help='Per-write departure/offset probe coefficient (memory models)')
+    ap.add_argument('--memory-departed-weight', type=float, default=1.,
+                    help='BCE multiplier for labeled departed observations only; may change on resume')
     ap.add_argument('--memory-switch-probability', type=float, default=0.,
                     help='Fresh draws replaced by original-then-neighbor memory sequences')
     ap.add_argument('--memory-switch-tail', type=float, nargs=2, default=(16.,96.), metavar=('MIN', 'MAX'),
@@ -583,8 +585,8 @@ def build_parser():
     ap.add_argument('--decision-fraction', type=float, default=.25,
                     help='Fraction reserved for matched pairs with visible reference seeds')
     ap.add_argument('--candidate-weight', type=float, default=1., help='Weight of candidate prefix BCE through the existing confidence head')
-    ap.add_argument('--fresh-fraction', type=float, default=.5,
-                    help='Fresh share of non-pair draws; remainder split equally between fixed/recent replay; may change on resume')
+    ap.add_argument('--fresh-fraction', type=float, default=.7,
+                    help='Fresh share of non-pair draws; remainder uses current replay; may change on resume')
     ap.add_argument('--embedding', type=int, default=32)
     ap.add_argument('--negative-bank', help='Shared live bank for InfoNCE negatives, wrong continuations and following supervision')
     ap.add_argument('--near-negative-bank', help='Additional bank of validated nearby negative relationships')
@@ -684,6 +686,7 @@ def main(argv=None):
                        memory_slots=args.memory_slots,memory_steps=args.memory_steps,
                        memory_stride=args.memory_stride,memory_patch_size=args.memory_patch_size,
                        memory_grad_steps=args.memory_grad_steps,memory_version=args.memory_version,
+                       memory_departed_weight=args.memory_departed_weight,
                        trajectory_sequence_weight=args.trajectory_sequence_weight,
                        feature_sequence_length=args.feature_sequence_length, feature_memory_grid=args.feature_memory_grid,
                        recurrent_refinement_steps=args.recurrent_refinement_steps,
@@ -733,7 +736,9 @@ def main(argv=None):
     if args.resume:
         resume = read_checkpoint(args.resume,ARCHITECTURES,args.device)
         # Sampling spacing changes no parameter shapes; use the requested value.
-        cfg = replace(checkpoint_config(resume), memory_stride=args.memory_stride)
+        cfg = replace(checkpoint_config(resume), memory_stride=args.memory_stride,
+                      memory_departed_weight=args.memory_departed_weight,
+                      feature_switch_crop_fraction=args.feature_switch_crop_fraction)
         if args.direction_inputs != cfg.direction_inputs:
             raise ValueError('Resume direction inputs differ; use --init-tracer for a new direction-enabled run')
     cfg = resolve_refinement_config(cfg, args.route_refinement_radius)
@@ -824,7 +829,7 @@ def main(argv=None):
                    'negative_bank_refresh_seconds','negative_bank_cache_mb','activation_checkpointing',
                    'memory_grad_clip','rest_grad_clip','presence_dropout','blur_probability','blur_sigma',
                    'decision_fraction','bank_following_probability','fresh_fraction','route_refinement_radius',
-                   'n_commit','memory_stride'}  # Sampling/commit policy; bounds are checked above.
+                   'n_commit','memory_stride','memory_departed_weight','feature_switch_crop_fraction'}
         if cfg.memory_version != 4:
             ignored.update(('trajectory_sequence_weight', 'feature_sequence_length', 'feature_memory_grid'))
         defaults = build_parser()
@@ -866,7 +871,6 @@ def main(argv=None):
     replay_paths = json.loads(replay_index.read_text()) if resume and replay_index.exists() else args.onpolicy
     progress('Loading replay banks and preparing data loader')
     caches = [OnPolicyStates.load(p) for p in replay_paths]
-    fixed = [OnPolicyStates.load(args.fixed_bank)] if args.fixed_bank else []
     collector = OnlineCollector(out/'dagger', args.fibers, args.val_z, args.dagger_device or args.device,
         every=args.dagger_every, max_seeds=args.dagger_seeds, seed=args.seed, replay_keep=args.replay_keep,
         initial=[c._dir for c in caches], trace_len=args.dagger_trace_len, n_commit=args.n_commit,
@@ -880,7 +884,7 @@ def main(argv=None):
     builder = IdentityObservationBuilder(cfg,train_f,identity_sampling,contacts=contacts,
         hard_spans=hard_spans,augment=True,negative_bank=negative_bank,**role_banks)
     dataset = FollowDataset(train_f, spec, sample, band, chunk=stream_batch, seed=args.seed+done,
-        cache_bytes=int(args.worker_cache_gb*(1 << 30)), fixed=fixed, onpolicy=caches,
+        cache_bytes=int(args.worker_cache_gb*(1 << 30)), onpolicy=caches,
         replay_index=str(collector.index), batch_builder=builder, additional_crops=(), fresh_fraction=args.fresh_fraction)
     loader_args = dict(batch_size=None, num_workers=args.workers,
                        pin_memory=torch.device(args.device).type == 'cuda')
@@ -902,7 +906,7 @@ def main(argv=None):
         log.record(dict(step=done, event='resume_configuration', checkpoint=str(args.resume),
                         training_options=vars(args), model_cfg=cfg.to_dict()))
     log.record(dict(step=done,event='identity_sampling',architecture=model.architecture,
-        source_sampling=dict(fresh=args.fresh_fraction,fixed=(1-args.fresh_fraction)/2,recent=(1-args.fresh_fraction)/2),
+        source_sampling=dict(fresh=args.fresh_fraction,recent=1-args.fresh_fraction),
         pair_sampling_version=identity_sampling.pair_sampling_version,
         feature_sampling_revision=FEATURE_SAMPLING_REVISION if cfg.memory_version == 4 else None,
         history_policy=('main_encoder_feature_memory' if cfg.memory_version == 4 else
@@ -973,6 +977,8 @@ def main(argv=None):
                     interval_samples_per_second=interval_states/(now-interval_started),
                     interval_data_seconds=interval_data_seconds, interval_update_seconds=interval_update_seconds,
                     interval=interval_metrics.summary(), n_future=cfg.n_future, tolerance=args.tolerance,
+                    memory_departed_weight=cfg.memory_departed_weight,
+                    feature_switch_crop_fraction=cfg.feature_switch_crop_fraction,
                     interval_updates=step-interval_step,
                     cuda_peak_allocated_gib=torch.cuda.max_memory_allocated(args.device)/2**30
                         if torch.device(args.device).type == 'cuda' else None))

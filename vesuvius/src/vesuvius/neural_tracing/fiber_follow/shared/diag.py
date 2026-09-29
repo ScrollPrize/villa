@@ -114,7 +114,7 @@ def plot_batch(x, pred, fut, fmask, crop, path, observed, hmask, history_gt, his
             title = 'OFF TRACK: reject continuation'
         if source is not None:
             # Codes follow data.REPLAY_SOURCES; unknown codes still get a label.
-            names = {0: 'fresh', 1: 'fixed recovery', 2: 'recent replay'}
+            names = {0: 'fresh', 2: 'recent replay'}
             title = names.get(int(source[i]), f'source {int(source[i])}') + '\n' + title
         if confidence is not None:
             title += f'\nnext-step confidence {confidence[i, 0]:.2f}'

@@ -192,7 +192,7 @@ def loss_terms(output, batch, cfg, tolerance=1.5, *, n_commit=None, identity_tem
     return terms
 
 
-def memory_probe_terms(output, batch):
+def memory_probe_terms(output, batch, *, departed_weight=1.):
     """Per-write departure and original-fiber offset probe on the recurrent memory.
 
     Targets are annotation-derived and never enter the writer. Each state
@@ -202,6 +202,8 @@ def memory_probe_terms(output, batch):
     identity_mask = batch['memory_target_identity_mask'].bool()
     target = batch['memory_target_identity'].float()
     bce = F.binary_cross_entropy_with_logits(probe[..., 0], target, reduction='none')
+    # Label 0 means departed. pos_weight would upweight the opposite class.
+    bce = bce*torch.where(target < .5, departed_weight, 1.)
     identity = torch.where(identity_mask, bce, 0.).sum(-1)/identity_mask.sum(-1).clamp_min(1)
     offset_mask = batch['memory_target_offset_mask'].bool()
     offset_target = batch['memory_target_offset'].float()

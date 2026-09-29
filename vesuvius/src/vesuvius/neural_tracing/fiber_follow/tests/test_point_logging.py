@@ -72,6 +72,7 @@ def test_interval_pools_counts_weights_crop_means_and_preserves_json(tmp_path,ca
     interval.add(interval_row(1,16,0,2.))
     interval.add(interval_row(3,0,48,4.))
     summary = interval.summary()
+    assert 'fixed_fraction' not in summary
     assert summary['loss'] == 3.5
     assert summary['crops'] == 4 and summary['updates'] == 2
     assert summary['replay_endpoints'] == 2 and summary['replay_encoder_crops'] == 8
@@ -84,6 +85,7 @@ def test_interval_pools_counts_weights_crop_means_and_preserves_json(tmp_path,ca
     log.close()
     printed = capsys.readouterr().out
     assert '16 right / 48 wrong | 25.0% correct | 0 unknown' in printed
+    assert 'fixed' not in printed
     assert 'last 2 updates / 4 crops' in printed
     assert '500 ms/update' in printed and '50 ms/update' in printed
     assert '16-point correctness' not in printed and len(printed.splitlines()) <= 10
@@ -97,9 +99,12 @@ def test_every_optimizer_update_reports_point_counts_without_detailed_metrics():
     torch.manual_seed(12)
     model = DirectFollower(config())
     data = batch(model.cfg)
+    data['source'] = torch.tensor([0, 2])
     ema = copy.deepcopy(model)
     opt = torch.optim.SGD(model.parameters(), lr=.001)
     metrics = optimizer_update(model,ema,opt,[data],1,.001,compute_metrics=False)
+    assert 'fixed_fraction' not in metrics
+    assert metrics['fresh_fraction'] == metrics['recent_fraction'] == .5
     assert 'decisions' not in metrics
     assert sum(metrics[k] for k in ('point_correct_count','point_wrong_count','point_unknown_count')) == 8
 

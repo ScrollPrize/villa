@@ -424,3 +424,25 @@ contains the pooled metrics. `curves.png` refreshes atomically at every log entr
 and includes individual point accuracy. On resume, it omits rolled-back log
 records beyond the restored checkpoint. Full rollout/crop diagnostics retain
 their separate diagnostic schedule.
+
+### Switch sampling and probe balance
+
+`--feature-switch-crop-fraction 0.15` limits synthetic switch streams (source 3)
+using their actual expanded crop counts. Each worker always accepts ordinary
+streams and admits a whole switch stream only when enough ordinary crops have
+been admitted to support its cost. Rejected proposals perform no image I/O.
+Accepted streams keep their full history, chronological order, two-step chunks,
+and existing memory ownership; no interleaving or additional active streams are
+introduced. The cumulative admitted share is at most 15% at complete group
+boundaries. Short logging windows can still show bursts; the share can undershoot
+while a worker earns room for a long stream or valid proposals are scarce. The
+other sources retain their selection behavior. `-1` preserves legacy sampling,
+and `0` excludes source 3.
+
+`--memory-departed-weight 4` multiplies only the auxiliary identity-probe BCE on
+known departed observations (target 0), including stratified endpoint replay.
+It does not weight the entire switch stream, change offset/geometry losses, or
+alter the metric counts. Target-1 observations retain their original weight.
+Both options may change on resume and are recorded in the resumed configuration
+and subsequent checkpoints. Terminal logs distinguish switch-stream crop share,
+actual departed probe-label share, departure recall, and false departures.

@@ -334,7 +334,8 @@ def continuation_targets(fiber, t, reverse, pos, frame, cfg, offtrack=False):
 
 
 # Source is independent of the within-source drift/departure stratum.
-REPLAY_SOURCES = dict(fixed=1, recent=2)
+# Keep replay source IDs stable across saved diagnostics.
+REPLAY_SOURCES = dict(recent=2)
 DRIFT_BANDS = ((0.,1.), (1.,1.5), (1.5,2.), (2.,3.5))
 
 
@@ -352,17 +353,17 @@ def replay_pools(caches):
 
 
 class FollowDataset(torch.utils.data.IterableDataset):
-    """Configurable fresh share; remaining draws split equally across replay banks.
+    """Configurable fresh share; remaining draws use rotating recent replay.
 
-    Defaults to 50% fresh, 25% permanent fixed bank, 25% rotating recent replay.
-    Each replay allocation reserves 10% for confirmed departure; remaining
+    Defaults to 70% fresh and 30% recent replay.
+    Replay reserves 10% for confirmed departure; remaining
     draws are uniform over drift bands and then fibers. Empty strata use fresh
     augmentation. Every draw is relabeled and holdout checked before crop I/O.
     """
     def __init__(self, fibers, vol_spec, cfg, exclude_band, chunk=2, seed=0,
-                 cache_bytes=1 << 30, onpolicy=None, fixed=None,
+                 cache_bytes=1 << 30, onpolicy=None,
                  window=256., pool_size=12, window_samples=192, replay_index=None, refresh_chunks=8,
-                 batch_builder=None, additional_crops=(), fresh_fraction=.5):
+                 batch_builder=None, additional_crops=(), fresh_fraction=.7):
         if not np.isfinite(fresh_fraction) or not 0 <= fresh_fraction <= 1:
             raise ValueError('Fresh fraction must be finite and in [0, 1]')
         self.fresh_fraction = float(fresh_fraction)
@@ -373,9 +374,6 @@ class FollowDataset(torch.utils.data.IterableDataset):
         self.batch_builder = batch_builder
         self.additional_crops = tuple(additional_crops)
         self._replay_paths = None
-        self.fixed = list(fixed or [])
-        self._validate(self.fixed)
-        self.fixed_pools = replay_pools(self.fixed)
         self._set_replay(list(onpolicy or []))
         lengths = np.array([f.length for f in fibers])
         if not len(lengths):
@@ -398,12 +396,12 @@ class FollowDataset(torch.utils.data.IterableDataset):
             self.batch_builder.set_replay(caches)
 
     def draw_replay(self,rng):
-        replay_fraction = (1-self.fresh_fraction)/2
-        source = int(rng.choice(3,p=(self.fresh_fraction,replay_fraction,replay_fraction)))
+        source = int(rng.choice((0, REPLAY_SOURCES['recent']),
+                                p=(self.fresh_fraction, 1-self.fresh_fraction)))
         band = 4 if rng.random()<.1 else int(rng.integers(4))
         if source == 0:
             return None
-        pool = (self.fixed_pools if source == 1 else self.recent_pools)[band]
+        pool = self.recent_pools[band]
         if not pool:
             return None
         fi = rng.choice(sorted(pool))
