@@ -497,6 +497,8 @@ void UnifiedBrowserDialog::navigateLocal(const QString& absDir)
     }
 
     QDir::Filters filters = QDir::AllEntries | QDir::NoDotAndDotDot;
+    // Let Qt honor native hidden-file semantics, including Windows attributes;
+    // a dot-prefixed filename alone is not hidden on Windows.
     if (_showHidden->isChecked()) filters |= QDir::Hidden;
     auto entries = d.entryInfoList(filters, QDir::Name | QDir::DirsFirst);
 
