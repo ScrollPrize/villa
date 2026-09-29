@@ -61,6 +61,41 @@ optimizer, and EMA tracks while initializing refinement geometry from the
 original annotations. It keeps normal0.1/tangent10/direction0.1, LR0.01,
 global batch128, and embeddings disabled.
 
+### Anisotropic Gaussian presence targets
+
+The current full-resolution follow-up changes that config to initialize model
+weights from the refinement run's best EMA-0.999 snapshot while restoring its
+saved fiber geometry and continuing online refinement. This is a weights-only
+`training.initialize_from`, not an optimizer/step resume; the new optimizer,
+EMA tracks, and update counter start fresh.
+
+It opts into a soft line-distribution target:
+
+```json
+"presence_radius_voxels": 2,
+"presence_target_mode": "anisotropic_gaussian",
+"presence_gaussian_width_ratio": 4,
+"presence_gaussian_truncate_sigma": 3
+```
+
+`presence_radius_voxels` is the surface-normal thickness sigma in this mode.
+The in-sheet axis perpendicular to the fiber uses four times that sigma. For a
+voxel's closest point on a finite line segment, the target is
+`exp(-0.5*((d_normal/sigma_normal)^2 + (d_width/sigma_width)^2))`; finite end
+caps use the width sigma, overlapping segments combine by maximum, and values
+outside three sigma are exactly zero. Output-stride targets retain input-voxel
+units. Sparse direction supervision remains centerline-only.
+
+Normals come from the same native validity/encoding-aware Lasagna sampler as
+refinement. The loader transforms them through each affine and smooth
+augmentation as covectors (`J^-T n`), then forms the local in-sheet axis from
+the transformed segment tangent. Invalid normals or singular transforms use
+the existing deterministic same-scroll sample replacement rather than a fake
+axis. Soft BCE is averaged over nonzero tube support per patch; pure-zero
+background is averaged separately, preserving the established equal
+positive/background patch weighting. The target-only macro-batch prepass uses
+the identical support/background group counts.
+
 Optional direction guidance (default weight0, current trial0.1) penalizes
 `1-(unit_segment_tangent dot predicted_base_axis)^2` at the same segment quadrature.
 Six encoded channels are interpolated before shared analytic decoding. The full

@@ -698,10 +698,20 @@ class MacroBatchTargetSource:
             if self.conditioned:
                 return targets.presence_target.new_tensor((indices.shape[0] * 12,
                     torch.unique(indices[:, 0]).numel() * 2, len(batch.volume) * 2)).cpu()
+            if targets.presence_target_mode == "anisotropic_gaussian":
+                positive_groups = (targets.presence_target > 0.0).flatten(1).any(dim=1).sum().float()
+                negative_groups = (targets.presence_target == 0.0).flatten(1).any(dim=1).sum().float()
+            else:
+                positive_groups = targets.presence_target.new_tensor(
+                    torch.unique(indices[:, 0]).numel()
+                )
+                negative_groups = (
+                    (targets.presence_target <= 0.5).flatten(1).any(dim=1).sum().float()
+                )
             counts = torch.stack((
                 targets.presence_target.new_tensor(indices.shape[0] * 6),
-                targets.presence_target.new_tensor(torch.unique(indices[:, 0]).numel()),
-                (targets.presence_target <= 0.5).flatten(1).any(dim=1).sum().float()))
+                positive_groups,
+                negative_groups))
             if self.config.embedding.enabled:
                 from .embedding import embedding_pair_counts
                 counts = torch.cat((counts, counts.new_tensor(embedding_pair_counts(batch))))
