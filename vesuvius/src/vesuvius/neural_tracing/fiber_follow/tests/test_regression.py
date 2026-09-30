@@ -487,8 +487,7 @@ def test_diagnostic_logging_preserves_training_update_and_rng():
         torch.testing.assert_close(p, q, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize('image_layout', ['tensor', 'dict', 'remote_seed'])
-def test_shared_recovery_evaluator_preserves_float_inputs_and_observed_states(image_layout):
+def test_slab_recovery_evaluator_preserves_float_inputs_and_observed_states():
     from vesuvius.neural_tracing.fiber_follow.shared.data import TracedFiber
     from vesuvius.neural_tracing.fiber_follow.shared.recovery import make_recovery_states, evaluate_recovery_states
     cfg = config()
@@ -498,11 +497,7 @@ def test_shared_recovery_evaluator_preserves_float_inputs_and_observed_states(im
                           n_future=cfg.n_future)
     states = make_recovery_states([fiber], [dict(fiber=0, t=150., sign=1)], sample, dict(split='monitor'))
     inputs = batch(cfg, 1)
-    inputs['x'] = ({k: v.half() for k, v in inputs['x'].items()} if image_layout != 'tensor'
-                   else torch.zeros(1, 3, 4, 4, 4, dtype=torch.float16))
-    if image_layout == 'remote_seed':
-        inputs['x']['feature_seed_x'] = dict(fine=inputs['x']['fine'].clone(),
-            feature_active=torch.tensor([True]), query_position=torch.zeros(1, 3, dtype=torch.float64))
+    inputs['x'] = {k: v.half() if v.is_floating_point() else v for k, v in inputs['x'].items()}
     class Model(torch.nn.Module):
         def __init__(self):
             super().__init__()
@@ -515,8 +510,8 @@ def test_shared_recovery_evaluator_preserves_float_inputs_and_observed_states(im
                 else:
                     assert value.dtype == (torch.float32 if value.is_floating_point() else torch.bool)
             check(x)
-            if image_layout == 'remote_seed':
-                assert x['feature_seed_x']['feature_active'].item()
+            assert x['history_valid'].dtype == torch.bool
+            assert x['history_slabs'].dtype == torch.float32
             p = torch.zeros(1, cfg.n_future, 3)
             p[..., 2] = torch.arange(1, cfg.n_future+1)
             return dict(points=p, confidence=torch.ones(1, cfg.n_future))
@@ -537,6 +532,7 @@ def test_shared_recovery_evaluator_preserves_float_inputs_and_observed_states(im
     assert predictions.shape == (1, 4, 3) and len(rows) == len(audited) == len(closed) == 1
     for key in ('hist', 'hmask', 'frame'):
         np.testing.assert_array_equal(traced[0][key], getattr(states, key)[0])
+    np.testing.assert_array_equal(traced[0]['observed_path'], states.observed_prefix(0))
 
 
 def test_tight_blocks_match_rotation_invariant_blocks_at_array_edges():

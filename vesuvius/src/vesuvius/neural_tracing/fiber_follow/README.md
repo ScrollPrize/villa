@@ -14,9 +14,9 @@ Layout:
   `shared.infer`.
 - `output/` stays at this level for both trainers.
 
-The active follower is `single_path_flow_v11`: a jointly denoised future curve,
-with optional mixed proposals and passage scoring, trained from scratch.
-Old follower checkpoints are rejected by training/inference.
+The current slab follower and its training workflow are documented in
+[regression/README.md](regression/README.md). The remaining model description
+below documents the older `single_path_flow_v11` implementation.
 
 ## Model and tracing
 
@@ -291,17 +291,14 @@ sustained wrong continuations; no improvement is assumed from confidence shifts.
 ## Verification and current status
 
 ```bash
-OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONPATH=../../.. \
-  PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests -q \
-  -o cache_dir=/tmp/single-path-pytest
+OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 ../../../../.venv/bin/python -m pytest tests -q \
+  -o cache_dir=/tmp/fiber-slab-pytest
 ```
 
-Tests cover attention across futures and full history, masked and unsupported
-observations, GT isolation, endpoint censoring, departed states, confidence gradient
-routes, recovery limits, coordinate transforms, seeded Gaussian inference, legacy
-zero-start inference, independence from batch grouping and diagnostic RNG, midpoint
-integration, replay import/rotation, checkpoint round trips,
-accumulation, collection and synthetic parallel-fiber identity recovery.
+The retained tests cover the historical slab model and its training loop,
+including data preparation, causal replay, inference, diagnostics and CUDA
+gradients. Tests for other model families and unrelated utilities have been
+removed. See [slab validation](regression/SLAB_VALIDATION.md) for current results.
 
 The original zero-start full-crop RTX 5090 benchmark passed: microbatch 2, effective batch 8,
 9.20 GiB peak allocated / 10.02 GiB reserved, 8.85 samples/second (cached-batch
