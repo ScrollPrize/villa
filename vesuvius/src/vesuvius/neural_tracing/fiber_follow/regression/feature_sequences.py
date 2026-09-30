@@ -11,7 +11,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength, fram
 from vesuvius.neural_tracing.fiber_follow.shared.data import training_state_allowed
 
 
-FEATURE_SAMPLING_REVISION = 4  # equal stream budgets, protected endpoints, dense candidate labels
+FEATURE_SAMPLING_REVISION = 5  # bank following has its own endpoint budget
 
 def seed_observation(item, cfg):
     return dict(pos=np.asarray(item['seed_pos']).copy(),

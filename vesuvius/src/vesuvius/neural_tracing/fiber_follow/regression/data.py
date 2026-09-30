@@ -94,7 +94,7 @@ class IdentitySampling:
     lateral_memory: int = 1024
     bank_wrong_continuation_probability: float = .75
     bank_wrong_continuation_tail: tuple = (4., 16.)
-    bank_following_probability: float = 0.  # fraction of fresh draws; trainer opts in
+    bank_following_probability: float = 0.  # independent fraction of endpoint proposals
     bank_coverage_probability: float = 0.  # reserved fresh slots on covered parent spans
     prefer_long_continuations: bool = False
     decision_fraction: float = 0.  # fraction of endpoint proposals reserved for matched pairs
@@ -129,14 +129,16 @@ class IdentitySampling:
             raise ValueError('Bank following probability must be in [0,1]')
         if not 0 <= self.decision_fraction <= 1:
             raise ValueError('Decision fraction must be in [0,1]')
+        if self.decision_fraction+self.bank_following_probability > 1:
+            raise ValueError('Decision and bank-following endpoint fractions must sum to at most one')
         if not 0 <= self.decision_choice_fraction <= 1:
             raise ValueError('Decision choice fraction must be in [0,1]')
         if not np.isfinite(self.candidate_tolerance) or self.candidate_tolerance <= 0:
             raise ValueError('Candidate tolerance must be finite and positive')
-        if not 0 <= self.bank_coverage_probability <= 1-self.bank_following_probability:
-            raise ValueError('Following and covered fresh probabilities must sum to at most one')
-        if not 0 <= self.memory_switch_probability <= 1-self.bank_following_probability-self.bank_coverage_probability:
-            raise ValueError('Following, covered and memory-switch fresh probabilities must sum to at most one')
+        if not 0 <= self.bank_coverage_probability <= 1:
+            raise ValueError('Covered fresh probability must be in [0,1]')
+        if not 0 <= self.memory_switch_probability <= 1-self.bank_coverage_probability:
+            raise ValueError('Covered and memory-switch fresh probabilities must sum to at most one')
         from vesuvius.neural_tracing.fiber_follow.regression.neighbor_continuations import validate_tail_range
         object.__setattr__(self, 'bank_wrong_continuation_tail', validate_tail_range(self.bank_wrong_continuation_tail))
         object.__setattr__(self, 'memory_switch_tail', validate_tail_range(self.memory_switch_tail))
@@ -266,16 +268,19 @@ class IdentityObservationBuilder(ObservationBuilder):
         return decision_pair(self.near_negative_bank or self.negative_bank, sample_cfg, self.cfg, rng,
                              choice=rng.random() < self.sampling.decision_choice_fraction)
 
+    def bank_following(self, sample_cfg, rng):
+        """Draw a generated target from the dedicated endpoint budget."""
+        from vesuvius.neural_tracing.fiber_follow.regression.neighbor_following import following_sample
+        bank = self.following_bank or self.negative_bank
+        return None if bank is None else following_sample(bank, sample_cfg, rng)
+
     def replace_fresh(self, sample_cfg, rng):
-        """Reserve fresh slots for following and covered annotation locations."""
+        """Oversample covered annotations or switch histories with annotated targets."""
         s = self.sampling
-        reserved = s.bank_following_probability+s.bank_coverage_probability
+        reserved = s.bank_coverage_probability
         if self.negative_bank is None or reserved+s.memory_switch_probability == 0:
             return None
-        from vesuvius.neural_tracing.fiber_follow.regression.neighbor_following import following_sample
         u = rng.random()
-        if u < s.bank_following_probability:
-            return following_sample(self.following_bank or self.negative_bank,sample_cfg,rng)
         if u >= reserved:
             if u < reserved+s.memory_switch_probability:
                 return self.memory_switch(sample_cfg,rng)

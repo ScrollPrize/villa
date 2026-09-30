@@ -23,7 +23,7 @@ exec bash "$FF/scripts/launch_regression.sh" "$RUN_NAME" \
     --channels 32 --hidden 128 --axial-layers 4 --decoder-layers 4 \
     --no-activation-checkpointing --recurrent-refinement-steps 1 \
     --no-history-prob 0.15 --short-history-prob 0.4 \
-    --decision-fraction 0.3 --decision-choice-fraction 0.75 --candidate-weight 1.0 \
+    --decision-fraction 0.3 --decision-choice-fraction 0.75 --candidate-weight 1.0 --fresh-fraction 0.7 \
     --presence-dropout 0 --direction-inputs \
     --blur-probability 0.25 --blur-sigma 0.5 1.25 \
     --contacts "$FF/output/direct_ct_spatial_run1/contacts.json" \

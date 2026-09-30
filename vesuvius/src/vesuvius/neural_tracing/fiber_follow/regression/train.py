@@ -450,7 +450,7 @@ def build_parser():
                     help='Requested fraction of matched pairs teaching recoverable geometry choices')
     ap.add_argument('--candidate-weight', type=float, default=1., help='Weight of candidate first-failure survival likelihood')
     ap.add_argument('--fresh-fraction', type=float, default=.7,
-                    help='Fresh share of non-pair draws; remainder uses current replay; may change on resume')
+                    help='Annotation-fresh share after decision and bank-following budgets; remainder uses replay')
     ap.add_argument('--negative-bank', help='Shared live bank for foreign-fiber masks, wrong continuations and following supervision')
     ap.add_argument('--near-negative-bank', help='Additional bank of validated nearby negative relationships')
     ap.add_argument('--following-bank', help='Following path source (default: negative-bank)')
@@ -464,7 +464,7 @@ def build_parser():
     ap.add_argument('--bank-wrong-continuation-tail', type=float, nargs=2, default=(4.,16.), metavar=('MIN', 'MAX'),
                     help='Wrong-fiber tail range in trace voxels (default: 4 16)')
     ap.add_argument('--bank-following-probability', type=float, default=.1,
-                    help='Fraction of fresh draws following validated bank paths (default: .1)')
+                    help='Independent fraction of endpoint proposals following validated bank paths (default: .1)')
     ap.add_argument('--presence-dropout', type=float, default=.25,
                     help='Probability of zeroing the presence crop; may be changed on resume')
     ap.add_argument('--blur-probability', type=float, default=.25,
@@ -740,7 +740,9 @@ def main(argv=None):
                     groups=[dict(parameters=len(g['params'])) for g in opt.param_groups],
                     trainable_parameters=sum(p.numel() for p in model.parameters() if p.requires_grad)))
     log.record(dict(step=done,event='identity_sampling',architecture=model.architecture,
-        source_sampling=dict(fresh=args.fresh_fraction,recent=1-args.fresh_fraction),
+        source_sampling=dict(decision=args.decision_fraction,bank_following=args.bank_following_probability,
+            fresh=(1-args.decision_fraction-args.bank_following_probability)*args.fresh_fraction,
+            recent=(1-args.decision_fraction-args.bank_following_probability)*(1-args.fresh_fraction)),
         feature_sampling_revision=FEATURE_SAMPLING_REVISION,
         history_policy='main_encoder_feature_memory',sampling=asdict(identity_sampling),
         negative_bank_path=str(negative_bank.root),negative_bank_provenance=negative_bank.provenance(),

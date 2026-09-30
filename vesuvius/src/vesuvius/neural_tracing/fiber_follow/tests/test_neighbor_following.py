@@ -1,6 +1,4 @@
 """Positive bank supervision, symmetric distant queries and shared-bank roles."""
-from dataclasses import replace
-
 import numpy as np
 import pytest
 
@@ -43,17 +41,17 @@ def test_bank_following_uses_its_own_fiber_and_censors_cut_ends(tmp_path,seed):
     assert not end['endpoint_known'] and not end['fmask'][1:].any()
 
 
-def test_bank_following_probability_with_empty_and_populated_bank(tmp_path):
+def test_bank_following_is_separate_from_fresh_with_empty_and_populated_bank(tmp_path):
     bank,parent = make_bank(tmp_path)
     cfg = DirectConfig()
     builder = IdentityObservationBuilder(cfg,[parent],negative_bank=bank,
         sampling=IdentitySampling(bank_following_probability=1.))
     sample = clean_sample(cfg)
-    assert builder.replace_fresh(sample,np.random.default_rng(1)) is None
+    assert builder.bank_following(sample,np.random.default_rng(1)) is None
     publish(tmp_path,[add_shard(tmp_path,0,z_range=(20.,180.))])
-    builder.sampling = replace(builder.sampling,bank_following_probability=.1)
-    draws=[builder.replace_fresh(sample,np.random.default_rng(seed)) for seed in range(200)]
-    assert 8 <= sum(x is not None for x in draws) <= 35
+    for seed in range(10):
+        assert builder.replace_fresh(sample,np.random.default_rng(seed)) is None
+        assert builder.bank_following(sample,np.random.default_rng(seed))['source'] == 4
 
 def test_covered_primary_sampling_keeps_history_and_prepares_only_once(tmp_path):
     bank,parent = make_bank(tmp_path)
@@ -87,7 +85,7 @@ def test_separate_roles_supply_both_bands_without_changing_following_source(tmp_
     world = local @ state['frame'].T+state['pos']
     assert (np.abs(world[:,0]-6) < .5).any()
     assert (np.abs(world[:,0]-24) < .5).any()
-    state = builder.replace_fresh(clean_sample(cfg),np.random.default_rng(3))
+    state = builder.bank_following(clean_sample(cfg),np.random.default_rng(3))
     np.testing.assert_allclose(state['supervision_fiber'].points[:,0],6.)
 
 

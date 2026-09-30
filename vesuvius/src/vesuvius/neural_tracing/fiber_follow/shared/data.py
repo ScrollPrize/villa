@@ -355,7 +355,7 @@ def replay_pools(caches):
 class FollowDataset(torch.utils.data.IterableDataset):
     """Configurable fresh share; remaining draws use rotating recent replay.
 
-    Defaults to 70% fresh and 30% recent replay.
+    Defaults to 70% fresh and 30% recent replay after dedicated builder budgets.
     Replay reserves 10% for confirmed departure; remaining
     draws are uniform over drift bands and then fibers. Empty strata use fresh
     augmentation. Every draw is relabeled and holdout checked before crop I/O.
@@ -409,6 +409,24 @@ class FollowDataset(torch.utils.data.IterableDataset):
         sizes = np.array([len(idx) for _,idx in entries])
         op,idx = entries[rng.choice(len(entries),p=sizes/sizes.sum())]
         return source,band,op,int(rng.choice(idx))
+
+    def endpoint_requests(self, rng):
+        """Reserve paired decisions and bank following before annotation/replay.
+
+        Failed proposals return to annotation/replay, not another bank budget.
+        Pair allocation stays even; expected endpoint shares are unconditional.
+        """
+        sampling = getattr(self.batch_builder, 'sampling', None)
+        decisions = getattr(sampling, 'decision_fraction', 0.)
+        following = getattr(sampling, 'bank_following_probability', 0.)
+        if not (0 <= decisions <= 1 and 0 <= following <= 1 and decisions+following <= 1):
+            raise ValueError('Decision and bank-following endpoint fractions must sum to at most one')
+        if decisions and self.chunk % 2:
+            raise ValueError('Matched identity decisions require an even microbatch')
+        pairs = int(rng.binomial(self.chunk//2, decisions)) if decisions else 0
+        remaining = self.chunk-2*pairs
+        bank = int(rng.binomial(remaining, min(1., following/(1-decisions)))) if following and remaining else 0
+        return pairs, bank
 
     def refresh_replay(self):
         if self.replay_index is None or not os.path.exists(self.replay_index):
@@ -470,17 +488,19 @@ class FollowDataset(torch.utils.data.IterableDataset):
             chunks += 1
             items = []
             fraction = getattr(getattr(self.batch_builder, 'sampling', None), 'decision_fraction', 0.)
-            requested = 0
-            if fraction:
-                if self.chunk % 2:
-                    raise ValueError('Matched identity decisions require an even microbatch')
-                requested = int(rng.binomial(self.chunk//2, fraction))
-                for _ in range(requested):
-                    pair = self.batch_builder.decision_pair(cfg, rng)
-                    if pair is not None:
-                        pair = [self.prepare(item, rng) for item in pair]
-                        if all(self.state_allowed(item) for item in pair):
-                            items.extend(pair)
+            requested, following = self.endpoint_requests(rng)
+            for _ in range(requested):
+                pair = self.batch_builder.decision_pair(cfg, rng)
+                if pair is not None:
+                    pair = [self.prepare(item, rng) for item in pair]
+                    if all(self.state_allowed(item) for item in pair):
+                        items.extend(pair)
+            for _ in range(following):
+                item = self.batch_builder.bank_following(cfg, rng)
+                if item is not None:
+                    item = self.prepare(item, rng)
+                    if self.state_allowed(item):
+                        items.append(item)
             for attempt in range(max(10000, self.chunk*1000)):
                 if len(items) == self.chunk:
                     break

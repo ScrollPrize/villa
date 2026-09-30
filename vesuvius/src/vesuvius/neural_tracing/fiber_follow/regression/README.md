@@ -79,6 +79,19 @@ admitted crops. Logs report actual endpoint counts, choice counts, and supervisi
 weights separately from crop-source percentages, so fallback and stream expansion
 are visible.
 
+Bank following has its own endpoint-proposal budget: the launcher's
+`--bank-following-probability .2` reserves 20% independently of the 30% matched
+decisions. The remaining 50% uses `--fresh-fraction .7`: 35% annotation-fresh
+and 15% recent replay overall, before fallback and rejection. Fresh targets come
+from actual annotations; covered-parent resampling and synthetic switch histories
+still use annotated targets. Generated bank paths enter through the dedicated
+following budget or matched decisions. Missing or unsafe bank proposals fall back
+to the annotation/replay mix; empty replay strata fall back to annotations.
+These are requested endpoint shares, not guaranteed crop percentages.
+Sampling revision 5 changes `--bank-following-probability` from a fraction of fresh
+draws to an independent endpoint fraction, including when resuming old runs.
+Its sum with `--decision-fraction` must not exceed one.
+
 Each matched endpoint scores four shuffled paths: the two bank/annotation
 continuations and two smooth transitions between them, with varied transition
 onsets. Paired observations share candidate geometry and order. Candidate labels

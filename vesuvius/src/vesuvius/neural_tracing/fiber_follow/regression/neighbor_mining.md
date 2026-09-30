@@ -332,12 +332,16 @@ source 3, reported as `bank_wrong_continuation_fraction` separately from recent
 replay. Candidate generation reads cached geometry only and performs no native
 tracing or additional prediction-volume reads.
 
-`--bank-following-probability .1` also draws from this same bank for 10% of fresh
-attempts, treating those paths as ordinary annotations with equal loss weights.
-Their cut endpoints are unknown. Geometry, recent history and identity positives
+`--bank-following-probability .1` reserves an independent 10% of endpoint
+proposals for following this bank's paths, with the normal stream loss budget.
+It shares the top-level budget with `--decision-fraction`; their sum cannot exceed
+one. Remaining proposals use the annotation-fresh/recent-replay mix. Missing or
+unsafe bank draws fall back to that mix. Fresh targets remain actual annotations.
+Their cut endpoints are unknown. Geometry and recent history
 use the mined path; the original annotated parent supplies certified negatives.
 All normal holdout checks apply. Source 4 is logged as `bank_following_fraction`.
-Changing the bank-following sampling policy requires a new run.
+Sampling revision 5 applies this endpoint-budget meaning on resumed runs too;
+older revisions interpreted this option as a fraction of fresh attempts.
 
 The tail range is saved in config/checkpoints; changing it requires a
 new run. The original short bank
