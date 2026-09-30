@@ -1,4 +1,4 @@
-"""Convolution-free 4x4x4 patch encoding and learned fine-feature reconstruction."""
+"""4x4x4 patch encoding, with optional legacy fine-feature reconstruction."""
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -36,7 +36,7 @@ class PatchShuffleEncoder(AxialEncoder):
         self.blocks = nn.ModuleList(AxialBlock(cfg.hidden, cfg.heads, local_convolution=False)
                                     for _ in range(cfg.layers))
         self.norm = nn.LayerNorm(cfg.hidden)
-        self.reconstruction = nn.Linear(cfg.hidden, 64*cfg.channels)
+        self.reconstruction = None if cfg.token_only else nn.Linear(cfg.hidden, 64*cfg.channels)
         self.register_buffer('token_xyz', token_coordinates(cfg).reshape(-1,3), persistent=False)
 
     def encode(self, image, references, mask):
@@ -49,11 +49,13 @@ class PatchShuffleEncoder(AxialEncoder):
             else:
                 tokens = block(tokens)
         deep = self.norm(tokens).permute(0,4,1,2,3)
-        # The memory writer needs unconditioned local appearance as well as deep
-        # context. Reconstruct once here, including on observation-only crops.
+        # Token-only mode returns this same coarse lattice for both consumers.
+        # Legacy models reconstruct unconditioned fine appearance for memory.
         return self.decode(None, deep), deep
 
     def decode(self, fine, deep):
+        if self.cfg.token_only:
+            return deep
         # Supervised predictions reconstruct again after historical-memory
         # conditioning, sharing the same projection as observation extraction.
         return unpatchify(self.reconstruction(deep.permute(0,2,3,4,1)), self.shape)

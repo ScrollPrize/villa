@@ -28,7 +28,7 @@ class DetailedFeatureMemory(nn.Module):
                              .flatten(2).transpose(1, 2)[0], persistent=False)
         self.coarse_count = self.count
         self.count += cfg.feature_detail_tokens
-        width = 9*(cfg.channels+1)+cfg.hidden+1
+        width = cfg.hidden+1 if cfg.token_only else 9*(cfg.channels+1)+cfg.hidden+1
         self.detail_projection = nn.Sequential(nn.LayerNorm(width), nn.Linear(width, cfg.hidden))
         self.detail_role = nn.Parameter(torch.randn(cfg.hidden)*.02)
         self.prior_attention = nn.MultiheadAttention(cfg.hidden, cfg.heads, dropout=0., batch_first=True)
@@ -81,11 +81,15 @@ class DetailedFeatureMemory(nn.Module):
             coarse = self.feature_projection(coarse)
             points, valid = self.detail_points(hist.float(), hmask)
             b, n = points.shape[:2]
-            patches = points[:, :, None]+self.detail_stencil
-            values, support = sample_features(fine, patches.reshape(b, n*9, 3), self.cfg.fine)
-            local = torch.cat((values, support[..., None]), -1).reshape(b, n, -1)
             context, supported = sample_features(deep, points, self.cfg.fine, self.cfg.token_stride, self.cfg.token_offset)
-            detail = self.detail_projection(torch.cat((local, context, supported[..., None]), -1))+self.detail_role
+            if self.cfg.token_only:
+                detail_input = torch.cat((context, supported[..., None]), -1)
+            else:
+                patches = points[:, :, None]+self.detail_stencil
+                values, support = sample_features(fine, patches.reshape(b, n*9, 3), self.cfg.fine)
+                local = torch.cat((values, support[..., None]), -1).reshape(b, n, -1)
+                detail_input = torch.cat((local, context, supported[..., None]), -1)
+            detail = self.detail_projection(detail_input)+self.detail_role
             detail = torch.where(valid[..., None], detail, 0.)
             xyz = torch.cat((self.local_xyz[None].expand(b, -1, -1), points), 1)
             mask = torch.cat((torch.ones(b, self.coarse_count, device=deep.device, dtype=torch.bool), valid), 1)

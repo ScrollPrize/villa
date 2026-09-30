@@ -2,7 +2,8 @@
 
 Regression uses a continuous follower with main-encoder observation memory,
 shared-decoder refinement, and causal segment survival confidence. The image
-encoder can use convolutions or 4x4x4 patches with learned pixel-shuffle reconstruction.
+encoder can use convolutions or 4x4x4 patches. The patch launcher uses only the
+coarse patch tokens throughout, with no fine-feature reconstruction or output planes.
 See [architecture and supervision](TRAJECTORY_MEMORY.md).
 
 ## Training
@@ -22,7 +23,7 @@ To try the convolution-free encoder in a fresh run:
 
 ```bash
 bash scripts/launch_patch4_memory.sh
-tail -F output/logs/axial_patch4_memory_v9_run1.log
+tail -F output/logs/axial_patch4_tokens_memory_v9_run1.log
 ```
 
 The patch launcher defaults to `--batch 1 --microbatch 16 --feature-sequence-length 2`:
@@ -40,28 +41,38 @@ Decisions still run one at a time; `--batch` controls gradient accumulation.
 Both encoders always compile their training operations. `RUN_NAME`, `BANK_PATH`,
 and trailing arguments work as in `launch_memory.sh`.
 
-`patch4` embeds ordered 4x4x4 patches, applies the configured axial transformer
-blocks, and projects each token into 64 distinct fine-feature vectors before 3D
-pixel shuffle. It reconstructs the original crop resolution for the existing
-path decoder, survival scorer and memory writer. With the default crop, its
-token grid is 30x26x26, at 128 channels with four axial blocks. It has no spatial
-convolutions, including inside the axial blocks. `--activation-checkpointing`
-works with either encoder.
+The patch launcher selects `--encoder patch4 --token-only`. It embeds ordered
+4x4x4 patches and applies four axial transformer blocks at width 128. The default
+crop produces a 30x26x26 grid (20,280 tokens). Generator and survival attention
+read this grid plus references and historical memory: 23,545 positions before
+masking. Path queries, refinement, segment evidence and memory detail tokens all
+sample the same coarse lattice at its physical patch centers. Predictions remain
+continuous coordinates. No reconstructed fine volume, fine-feature stencils or
+output-plane tokens are used. There are no spatial convolutions.
 
-Patch runs save the architecture `axial_patch4_fiber_memory_v9` and their encoder
-choice in checkpoints. Loading for tracing/collection and resuming training
-select the saved encoder automatically; an explicit conflicting `--encoder`
-is rejected. Existing convolutional v9 checkpoints without an encoder field
-still load as `conv`. Changing encoders requires a fresh run; v1-v8 checkpoints
-remain unsupported. The patch encoder's speed has been benchmarked, but tracing
-quality still needs evaluation.
+Token-only runs save architecture `axial_patch4_tokens_fiber_memory_v9`. This is a
+fresh-training architecture; it cannot resume the older fine-feature patch model.
+Existing `axial_patch4_fiber_memory_v9` and convolutional v9 checkpoints still load
+with their original feature layouts. Loading infers the layout from the checkpoint;
+explicit conflicting `--encoder` or `--token-only` options are rejected on resume.
+Use `--no-token-only` to explicitly train the original reconstruction-based patch
+model. v1-v8 checkpoints remain unsupported. Tracing quality needs evaluation.
+
+Attention K/V projections and their compacted valid CUDA rows are reused across
+refinement attempts and supplied candidate paths within each decision. They remain
+differentiable and are never cached across optimizer updates.
+
+`--activation-checkpointing` controls checkpointing inside axial blocks. Separately,
+selected historical encoders are checkpointed by default. The optional
+`--no-history-encoder-checkpointing` retains their activations instead of recomputing
+them during backward, trading additional VRAM for less computation. The launcher
+keeps historical checkpointing enabled; compare memory before disabling it.
 
 Every historical crop is encoded into spatially located appearance tokens. Most
 crops use an observation-only, no-grad encoder path: they skip the trajectory
 generator, confidence scorer, and refinement. The convolutional encoder reuses
-stem features; the patch encoder uses its linear/shuffle reconstruction to supply
-local appearance to memory. Full supervised predictions reconstruct fine features
-after reading historical memory. The
+stem features; token-only patches supply coarse features directly. Legacy dense
+models reconstruct fine features after reading historical memory. The
 endpoint and at most `--feature-history-decisions 2` uniformly sampled earlier
 positions receive full supervised predictions. Sampling happens once per stream
 in the loader, independently of the model's confidence and label observability.
@@ -305,3 +316,22 @@ replay autograd contracts, packed stream gradients, and skipped AdamW updates.
 Output-plane checks cover full lateral coverage, physical coordinates, fractional
 depth interpolation, access through every generator layer and gradient isolation.
 They do not establish trained tracing accuracy or confidence calibration.
+
+## Bounded compute and VRAM comparison
+
+This uses full-size synthetic images, complete observation streams, optimizer
+updates and the normal compiled BF16/FP32 policy. It excludes data loading and
+tracing quality. Use fresh result paths and run the variants sequentially:
+
+```bash
+python -m vesuvius.neural_tracing.fiber_follow.regression.benchmark_sparse_training \
+  --encoder patch4 --token-only --length 8 --streams 2 --warmup 2 --repeats 3 \
+  --out /tmp/token_checkpoint_on.json
+python -m vesuvius.neural_tracing.fiber_follow.regression.benchmark_sparse_training \
+  --encoder patch4 --token-only --no-history-encoder-checkpointing \
+  --length 8 --streams 2 --warmup 2 --repeats 3 --out /tmp/token_checkpoint_off.json
+```
+
+Peak allocated memory measures live PyTorch tensors; peak reserved memory also
+includes allocator-held space. Memory cost depends on historical crops retained
+for each decision and is not a universal constant for all stream lengths.

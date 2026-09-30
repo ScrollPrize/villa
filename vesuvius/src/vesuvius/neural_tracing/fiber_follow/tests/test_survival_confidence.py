@@ -44,7 +44,7 @@ def test_confidence_head_computes_fp32_inside_bf16_autocast(device):
              scorer.failure.register_forward_pre_hook(capture('failure'))]
     try:
         with torch.autocast(device, dtype=torch.bfloat16):
-            logits = scorer(spatial, points, scorer.project_memory(memory), padding)
+            logits = scorer(spatial, points, scorer.project_memory(memory, padding), padding)
     finally:
         for hook in hooks:
             hook.remove()
@@ -125,7 +125,7 @@ def test_first_segment_reads_all_observations_but_no_future_segment_features():
     memory = torch.randn(1, 9, model.cfg.hidden, requires_grad=True)
     padding = torch.zeros(1, 9, dtype=torch.bool)
     padding[:, -1] = True
-    logits = scorer(spatial, points, scorer.project_memory(memory), padding)
+    logits = scorer(spatial, points, scorer.project_memory(memory, padding), padding)
     logits[:, 0].sum().backward()
     assert spatial.grad[:, 0].abs().sum() > 0
     assert spatial.grad[:, 1:].count_nonzero() == 0

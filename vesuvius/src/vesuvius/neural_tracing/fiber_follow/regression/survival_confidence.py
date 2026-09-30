@@ -14,7 +14,7 @@ class SegmentSurvivalScorer(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         h = cfg.hidden
-        evidence_width = 27*(cfg.channels+1)+h+1
+        evidence_width = cfg.path_evidence_width
         # Ordered image samples, start/end/displacement/length.
         width = self.samples_per_segment*evidence_width+10
         self.query = nn.Sequential(nn.LayerNorm(width), nn.Linear(width, h), nn.SiLU())
@@ -22,8 +22,8 @@ class SegmentSurvivalScorer(nn.Module):
             activation='gelu', batch_first=True, norm_first=True) for _ in range(2))
         self.norm = nn.LayerNorm(h)
         self.failure = nn.Linear(h, 1)
-        self.plane_projection = nn.Linear(cfg.channels, h)
-        self.plane_position = nn.Linear(3, h)
+        self.plane_projection = None if cfg.token_only else nn.Linear(cfg.channels, h)
+        self.plane_position = None if cfg.token_only else nn.Linear(3, h)
 
     def plane_tokens(self, samples, xyz):
         tokens = self.plane_projection(samples)
@@ -36,8 +36,8 @@ class SegmentSurvivalScorer(nn.Module):
                                 dtype=points.dtype)/self.samples_per_segment
         return start[:, :, None]+fraction[None, None, :, None]*(points-start)[:, :, None]
 
-    def project_memory(self, memory):
-        return [layer.project_memory(memory) for layer in self.layers]
+    def project_memory(self, memory, padding):
+        return [layer.compact_memory(layer.project_memory(memory), padding) for layer in self.layers]
 
     def forward(self, spatial, points, projected, padding):
         start = torch.cat((torch.zeros_like(points[:, :1]), points[:, :-1]), 1)

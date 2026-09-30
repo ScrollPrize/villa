@@ -68,6 +68,10 @@ def main():
     ap.add_argument('--repeats', type=int, default=10)
     ap.add_argument('--seed', type=int, default=194)
     ap.add_argument('--history-decisions', type=int, default=2)
+    ap.add_argument('--encoder', choices=('conv', 'patch4'), default='conv')
+    ap.add_argument('--token-only', action='store_true')
+    ap.add_argument('--history-encoder-checkpointing', action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument('--refinement-steps', type=int, default=2)
     args = ap.parse_args()
     if min(args.length, args.streams, args.warmup, args.repeats) < 1 or args.history_decisions < 0:
         ap.error('Positive dimensions/repetitions and nonnegative history decisions required')
@@ -75,7 +79,10 @@ def main():
         ap.error('Use a fresh result path')
     torch.set_num_threads(4)
     torch.manual_seed(args.seed)
-    cfg = DirectConfig(direction_inputs=True, feature_history_decisions=args.history_decisions)
+    cfg = DirectConfig(direction_inputs=True, feature_history_decisions=args.history_decisions,
+                       encoder=args.encoder, token_only=args.token_only,
+                       history_encoder_checkpointing=args.history_encoder_checkpointing,
+                       recurrent_refinement_steps=args.refinement_steps)
     chunks = synthetic_streams(cfg, args.length, args.streams, args.seed)
     if args.save_fixture:
         if args.save_fixture.exists():
@@ -99,9 +106,12 @@ def main():
         row = dict(iteration=i+1, ms=1000*(time.perf_counter()-started),
             graphs=counters['stats']['unique_graphs']-before,
             peak_allocated_gib=torch.cuda.max_memory_allocated()/2**30,
+            peak_reserved_gib=torch.cuda.max_memory_reserved()/2**30,
             **{k: metrics[k] for k in ('loss', 'grad_norm', 'observed_states', 'supervised_states',
                                       'endpoint_states', 'history_encoder_crops', 'memory_replay_observations')})
         samples.append(row)
+        if not np.isfinite(row['loss']) or not np.isfinite(row['grad_norm']):
+            raise RuntimeError('Nonfinite benchmark loss or gradients')
         print(json.dumps(row), flush=True)
     steady = [r for r in samples[args.warmup:] if not r['graphs']]
     if not steady:
@@ -117,7 +127,8 @@ def main():
         observations_per_second=sum(r['observed_states'] for r in steady)/seconds,
         decisions_per_second=sum(r['supervised_states'] for r in steady)/seconds,
         endpoints_per_second=sum(r['endpoint_states'] for r in steady)/seconds,
-        peak_allocated_gib=max(r['peak_allocated_gib'] for r in steady), samples=samples)
+        peak_allocated_gib=max(r['peak_allocated_gib'] for r in steady),
+        peak_reserved_gib=max(r['peak_reserved_gib'] for r in steady), samples=samples)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(result, indent=2)+'\n')
     print(json.dumps({k:v for k,v in result.items() if k not in ('samples', 'config')}, indent=2))

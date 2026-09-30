@@ -1,6 +1,19 @@
 # Observation memory and causal survival confidence
 
-## Information flow
+## Token-only patch model
+
+`scripts/launch_patch4_memory.sh` selects `axial_patch4_tokens_fiber_memory_v9`.
+Its only spatial feature lattice is the 4x4x4 patch grid: 20,280 width-128 tokens
+for the default crop. It has no fine reconstruction, output-plane feature tokens
+or fine stencils. References, initial path queries, refinement feedback, segment
+samples and memory details sample this coarse lattice using its physical stride
+and offset. The generator and scorer attend to the deep grid and history only.
+Both reuse compacted CUDA K/V across attempts. Historical encoder checkpointing
+remains on by default and can be disabled independently of axial-block
+checkpointing. Losses, memory chronology and continuous path coordinates retain
+the contract below. Older v9 model configurations keep their original dense paths.
+
+## Dense-model information flow
 
 1. The main encoder extracts stem appearance features and an axial deep lattice
    from CT, presence, optional direction fields, and visible observed history.

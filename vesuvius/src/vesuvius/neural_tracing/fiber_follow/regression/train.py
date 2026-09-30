@@ -22,7 +22,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.runloop import (
 )
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume, FiberVolumeSpec
 from vesuvius.neural_tracing.fiber_follow.regression.model import (
-    ARCHITECTURE, PATCH_ARCHITECTURE, DirectConfig, build_model,
+    ARCHITECTURE, PATCH_ARCHITECTURE, TOKEN_ARCHITECTURE, DirectConfig, build_model,
 )
 from vesuvius.neural_tracing.fiber_follow.regression.data import (
     IdentityObservationBuilder, IdentitySampling, DirectTracer, LOCATION_SOURCES,
@@ -233,6 +233,13 @@ def training_prediction(model, x, hist, hmask, candidates=None, memory=None, con
         curves = candidates.detach()
         if count < CANDIDATE_COUNT:
             curves = torch.cat((curves, curves[:, :1].expand(-1, CANDIDATE_COUNT-count, -1, -1)), 1)
+        # Compacted CUDA K/V have a different key count as history grows. Keep
+        # the separate candidate graph reusable across these decision contexts.
+        if isinstance(context['confidence_projected'][0][0], tuple):
+            for layer in context['confidence_projected']:
+                for row in layer:
+                    for value in row:
+                        torch._dynamo.mark_dynamic(value, 2)
         scored = model.score_candidates(context, fixed_rows(curves, size))
         output.update({name: value[:, :count] for name, value in scored.items()})
     output = {name: value[:actual] for name, value in output.items()}
@@ -283,11 +290,11 @@ def initialize_training_optimizer(model, ema, args, resume=None):
     return opt, done, origin
 
 
-ARCHITECTURES = (ARCHITECTURE, PATCH_ARCHITECTURE)
+ARCHITECTURES = (ARCHITECTURE, PATCH_ARCHITECTURE, TOKEN_ARCHITECTURE)
 FEATURE_OPTIONS = ('feature_detail_tokens', 'feature_stream_steps', 'feature_history_decisions',
                    'feature_switch_crop_fraction', 'feature_history_loss_fraction')
 MEMORY_GRAD_CLIP = 5.
-REST_GRAD_CLIP = 20.
+REST_GRAD_CLIP = 100.
 
 
 def checkpoint_config(ck):
@@ -303,6 +310,15 @@ def resolve_encoder(requested, checkpoint=None):
     saved = checkpoint_config(checkpoint).encoder
     if requested is not None and requested != saved:
         raise ValueError('Encoder must match the resumed checkpoint; start a new run to change it')
+    return saved
+
+
+def resolve_token_only(requested, checkpoint=None):
+    if checkpoint is None:
+        return bool(requested)
+    saved = checkpoint_config(checkpoint).token_only
+    if requested is not None and requested != saved:
+        raise ValueError('Token-only mode must match the resumed checkpoint; start a new run to change it')
     return saved
 
 
@@ -678,7 +694,11 @@ def build_parser():
     ap.add_argument('--n-commit', type=int, default=16)
     ap.add_argument('--channels', type=int, default=DirectConfig.channels, help='Base image encoder width')
     ap.add_argument('--encoder', choices=('conv', 'patch4'), default=None,
-                    help='Image encoder: conv (default) or convolution-free 4x4x4 patches with pixel shuffle; inferred on resume')
+                    help='Image encoder: conv (default) or convolution-free 4x4x4 patches; inferred on resume')
+    ap.add_argument('--token-only', action=argparse.BooleanOptionalAction, default=None,
+                    help='Use only patch4 tokens throughout; no reconstructed fine features or output planes')
+    ap.add_argument('--history-encoder-checkpointing', action=argparse.BooleanOptionalAction, default=True,
+                    help='Recompute selected historical encoders during backward to save VRAM')
     ap.add_argument('--direction-inputs', action=argparse.BooleanOptionalAction, default=True,
                     help='Add six sign-invariant direction channels to main, memory and seed crops; no image augmentations on these channels')
     ap.add_argument('--decoder-layers', type=int, default=4)
@@ -820,7 +840,10 @@ def main(argv=None):
     torch.set_num_threads(args.threads)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    cfg = DirectConfig(encoder=resolve_encoder(args.encoder),
+    resume = read_checkpoint(args.resume,ARCHITECTURES,args.device) if args.resume else None
+    cfg = DirectConfig(encoder=resolve_encoder(args.encoder, resume),
+                       token_only=resolve_token_only(args.token_only, resume),
+                       history_encoder_checkpointing=args.history_encoder_checkpointing,
                        direction_inputs=args.direction_inputs,channels=args.channels,hidden=args.hidden,layers=args.axial_layers,
                        decoder_layers=args.decoder_layers,
                        activation_checkpointing=args.activation_checkpointing,
@@ -829,17 +852,16 @@ def main(argv=None):
                        feature_sequence_length=args.feature_sequence_length, feature_memory_grid=args.feature_memory_grid,
                        recurrent_refinement_steps=args.recurrent_refinement_steps,
                        **{k:getattr(args,k) for k in FEATURE_OPTIONS})
-    resume = None
-    if args.resume:
-        resume = read_checkpoint(args.resume,ARCHITECTURES,args.device)
-        resolve_encoder(args.encoder, resume)
+    if resume:
         # Sampling spacing changes no parameter shapes; use the requested value.
         cfg = replace(checkpoint_config(resume), memory_stride=args.memory_stride,
+                      history_encoder_checkpointing=args.history_encoder_checkpointing,
                       feature_switch_crop_fraction=args.feature_switch_crop_fraction,
                       feature_history_loss_fraction=args.feature_history_loss_fraction)
         if args.direction_inputs != cfg.direction_inputs:
             raise ValueError('Direction inputs must match the resumed checkpoint; start a new run to change them')
     args.encoder = cfg.encoder
+    args.token_only = cfg.token_only
     if args.decision_fraction and args.microbatch % 2:
         raise ValueError('Matched decisions require an even microbatch')
     if args.microbatch % cfg.feature_sequence_length:
@@ -917,13 +939,14 @@ def main(argv=None):
     if resume:
         ignored = {'resume','reset_optimizer','out_root','device','batch','microbatch','workers','threads','worker_cache_gb',
                    'log_every','ckpt_every','diag_every','dagger_device',
-                   'negative_bank_refresh_seconds','negative_bank_cache_mb','activation_checkpointing',
+                   'negative_bank_refresh_seconds','negative_bank_cache_mb','activation_checkpointing','history_encoder_checkpointing',
                    'memory_grad_clip','rest_grad_clip','presence_dropout','blur_probability','blur_sigma',
                    'decision_fraction','decision_choice_fraction','bank_following_probability','fresh_fraction',
                    'bank_hard_fraction','replay_failure_fraction','bank_switch_tolerance','bank_own_tolerance',
                    'n_commit','memory_stride','feature_switch_crop_fraction','feature_history_loss_fraction'}
+        legacy_defaults = dict(encoder='conv', token_only=False, history_encoder_checkpointing=True)
         for key,value in vars(args).items():
-            recorded = (resume['training_options'].get(key, 'conv') if key == 'encoder'
+            recorded = (resume['training_options'].get(key, legacy_defaults[key]) if key in legacy_defaults
                         else resume['training_options'][key])
             if key not in ignored and json.dumps(recorded,sort_keys=True) != json.dumps(value,sort_keys=True):
                 raise ValueError(f'Resume option differs: {key}')

@@ -14,6 +14,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.policy import DEFAULT_CONFIDENC
 
 ARCHITECTURE = 'axial_fiber_memory_v9'
 PATCH_ARCHITECTURE = 'axial_patch4_fiber_memory_v9'
+TOKEN_ARCHITECTURE = 'axial_patch4_tokens_fiber_memory_v9'
 TOKEN_STRIDE = (8, 2, 2)
 TOKEN_OFFSET = (3, 0, 0)
 
@@ -45,10 +46,16 @@ class DirectConfig:
     feature_history_loss_fraction: float = .25
     recurrent_refinement_steps: int = 2
     encoder: str = 'conv'
+    token_only: bool = False
+    history_encoder_checkpointing: bool = True
 
     def __post_init__(self):
         if self.encoder not in ('conv', 'patch4'):
             raise ValueError('Encoder must be conv or patch4')
+        if not isinstance(self.token_only, bool) or (self.token_only and self.encoder != 'patch4'):
+            raise ValueError('Token-only features require the patch4 encoder')
+        if not isinstance(self.history_encoder_checkpointing, bool):
+            raise ValueError('history_encoder_checkpointing must be a boolean')
         if isinstance(self.fine, dict):
             self.fine = CropSpec(**self.fine)
         c = self.fine
@@ -98,7 +105,13 @@ class DirectConfig:
 
     @property
     def architecture(self):
+        if self.token_only:
+            return TOKEN_ARCHITECTURE
         return PATCH_ARCHITECTURE if self.encoder == 'patch4' else ARCHITECTURE
+
+    @property
+    def path_evidence_width(self):
+        return self.hidden+1 if self.token_only else 27*(self.channels+1)+self.hidden+1
 
     @property
     def token_stride(self):
@@ -242,24 +255,40 @@ class PathDecoderLayer(nn.TransformerDecoderLayer):
         return tuple(v.reshape(len(memory), -1, heads, h//heads).transpose(1, 2).contiguous()
                      for v in kv.chunk(2, dim=-1))
 
-    def attend_memory(self, q, kv, padding):
-        """Remove excluded keys so CUDA AMP can use unmasked Flash attention.
+    def compact_memory(self, kv, padding):
+        """Gather valid CUDA keys once per decision, before any path attempts."""
+        if not kv[0].is_cuda or kv[0].dtype not in (torch.float16, torch.bfloat16):
+            return kv
+        rows = []
+        for row in range(kv[0].shape[0]):
+            keep = (~padding[row]).nonzero().flatten()
+            torch._check(keep.numel() > 0)
+            rows.append(tuple(v[row:row+1].index_select(2, keep) for v in kv))
+        return tuple(rows)
 
-        This mask is key padding only: removing keys preserves softmax and
+    @staticmethod
+    def select_memory(projected, keep):
+        """Select active inference rows from dense or variable-length cached K/V."""
+        if isinstance(projected[0][0], tuple):
+            rows = keep.tolist()
+            return [tuple(kv[i] for i in rows) for kv in projected]
+        return [tuple(v[keep] for v in kv) for kv in projected]
+
+    def attend_memory(self, q, kv, padding):
+        """Reuse compacted CUDA K/V with unmasked Flash attention.
+
+        The mask is key padding only: removing keys preserves softmax and
         leaves query order (including causal candidate self-attention) intact.
         Image/plane tokens guarantee at least one valid key in every row.
         Other backends remain available on devices without Flash support.
         """
-        if q.is_cuda and q.dtype in (torch.float16, torch.bfloat16):
-            k, v = kv
+        if isinstance(kv[0], tuple):
             values = []
-            for row in range(q.shape[0]):
-                keep = (~padding[row]).nonzero().flatten()
-                torch._check(keep.numel() > 0)
+            for row, (k, v) in enumerate(kv):
                 with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.CUDNN_ATTENTION,
                                   SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH], set_priority=True):
                     values.append(F.scaled_dot_product_attention(q[row:row+1].contiguous(),
-                        k[row:row+1].index_select(2, keep), v[row:row+1].index_select(2, keep)))
+                        k, v))
             return torch.cat(values, 0)
         mask = torch.zeros(padding.shape, device=q.device, dtype=q.dtype).masked_fill(padding, -torch.inf)
         with self.attention_backend(q):
@@ -420,14 +449,14 @@ class DirectFollower(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.architecture = cfg.architecture
-        c,h = cfg.channels,cfg.hidden
+        c,h = (cfg.hidden if cfg.token_only else cfg.channels),cfg.hidden
         if cfg.encoder == 'patch4':
             from .patch_encoder import PatchShuffleEncoder
             self.encoder = PatchShuffleEncoder(cfg)
         else:
             self.encoder = AxialEncoder(cfg)
         self.reference_token = nn.Sequential(nn.Linear(c+8,h),nn.SiLU(),nn.Linear(h,h))
-        self.query = nn.Sequential(nn.Linear(9*c+1,h),nn.SiLU(),nn.Linear(h,h))
+        self.query = nn.Sequential(nn.Linear((c if cfg.token_only else 9*c)+1,h),nn.SiLU(),nn.Linear(h,h))
         layer = PathDecoderLayer(h,cfg.heads,2*h,dropout=0.,activation='gelu',batch_first=True,norm_first=True)
         self.decoder = nn.TransformerDecoder(layer,cfg.decoder_layers,norm=nn.LayerNorm(h))
         self.coordinates = nn.Linear(h,2)
@@ -445,12 +474,12 @@ class DirectFollower(nn.Module):
         self.encoder_memory_projection = nn.Linear(cfg.hidden, cfg.hidden)
         if cfg.recurrent_refinement_steps:
             # Spatial evidence, previous coordinates, detached failure/survival.
-            width = 27*(cfg.channels+1)+cfg.hidden+1+3+2
+            width = cfg.path_evidence_width+3+2
             self.refinement_fusion = nn.Sequential(nn.Linear(width, cfg.hidden), nn.SiLU(),
                                                   nn.Linear(cfg.hidden, cfg.hidden))
             self.refinement_stage = nn.Embedding(cfg.recurrent_refinement_steps, cfg.hidden)
             nn.init.zeros_(self.refinement_stage.weight)
-        self.output_plane_features = OutputPlaneFeatures(cfg)
+        self.output_plane_features = None if cfg.token_only else OutputPlaneFeatures(cfg)
 
     def references(self, x, hist, hmask):
         cfg = self.cfg
@@ -465,7 +494,7 @@ class DirectFollower(nn.Module):
         cfg = self.cfg
         image_tokens = deep.flatten(2).transpose(1,2)
         sampling_dense = dense.float() if cfg.recurrent_refinement_steps else dense
-        local,_ = sample_features(sampling_dense,references,cfg.fine)
+        local,_ = self.sample_local(sampling_dense, references)
         local = local.to(dense.dtype)
         ages = torch.arange(1,cfg.n_history+2,device=hist.device).float()[None].expand(len(hist),-1).clone()
         ages[:,-1] = x.get('seed_age',hist.new_zeros(len(hist))).reshape(-1)
@@ -480,10 +509,18 @@ class DirectFollower(nn.Module):
         padding = torch.cat((torch.zeros(image_tokens.shape[:2],device=hist.device,dtype=torch.bool),~mask),1)
         ctx = dict(fine=dense,deep=deep,memory=memory,padding=padding,reference_mask=mask)
         if cfg.recurrent_refinement_steps:
-            ctx.update(fine_fp32=sampling_dense, deep_fp32=deep.float())
+            ctx.update(fine_fp32=sampling_dense, deep_fp32=sampling_dense if cfg.token_only else deep.float())
         return ctx
 
+    def sample_local(self, features, points):
+        cfg = self.cfg
+        return sample_features(features, points, cfg.fine,
+                               cfg.token_stride if cfg.token_only else 1,
+                               cfg.token_offset if cfg.token_only else (0,0,0))
+
     def patches(self, fine, points):
+        if self.cfg.token_only:
+            return self.sample_local(fine, points)[0]
         b,k,_ = points.shape
         values,_ = sample_features(fine,(points[:,:,None]+self.stencil).reshape(b,k*9,3),self.cfg.fine)
         return values.reshape(b,k,-1)
@@ -493,6 +530,9 @@ class DirectFollower(nn.Module):
         return torch.cat((patches,initial[...,2:]/(self.cfg.n_future*self.cfg.future_step)),-1)
 
     def evidence(self, ctx, points, stage):
+        if self.cfg.token_only:
+            values, support = self.sample_local(ctx.get('deep_fp32', ctx['deep']), points)
+            return torch.cat((values.to(ctx['deep'].dtype), support[...,None]), -1)
         b,k,_ = points.shape
         local,support = sample_features(ctx.get('fine_fp32', ctx['fine']),(points[:,:,None]+self.path_stencil).reshape(b,k*27,3),self.cfg.fine)
         local = local.to(ctx['fine'].dtype)
@@ -543,6 +583,8 @@ class DirectFollower(nn.Module):
         # Keep recomputation inside the compiled operation. Wrapping a compiled
         # callable here would re-enter Dynamo from autograd's worker threads.
         from torch.utils.checkpoint import checkpoint
+        if not self.cfg.history_encoder_checkpointing:
+            return self.observation_features(x, hist, hmask)
         return checkpoint(self.observation_features, x, hist, hmask,
                           use_reentrant=False, preserve_rng_state=False)
 
@@ -593,7 +635,8 @@ class DirectFollower(nn.Module):
         query = self.query(self.query_features(ctx, reference))
         if cfg.recurrent_refinement_steps:
             # These tensors are shared only within this decision and remain attached.
-            projected = [layer.project_memory(memory) for layer in self.decoder.layers]
+            projected = [layer.compact_memory(layer.project_memory(memory), padding)
+                         for layer in self.decoder.layers]
             decoded = self.decode_cached(query, projected, padding)
         else:
             projected = None
@@ -618,6 +661,10 @@ class DirectFollower(nn.Module):
         identity, identity_padding = self.recurrent_memory.read_tokens(query_state)
         memory = torch.cat((ctx['memory'], identity.to(ctx['memory'].dtype)), 1)
         padding = torch.cat((ctx['padding'], identity_padding), 1)
+        if self.cfg.token_only:
+            ctx.update(confidence_projected=self.confidence_scorer.project_memory(memory, padding),
+                       confidence_padding=padding)
+            return memory, padding
         # Sample the complete planes once; generator and scorer learn independent
         # channel/position projections of exactly the same spatial evidence.
         samples = self.output_plane_features.sample(ctx['fine'])
@@ -628,7 +675,7 @@ class DirectFollower(nn.Module):
         # Every segment reads every plane. K/V stay differentiable and are reused
         # across generated and supplied curves within this decision.
         confidence_memory = torch.cat((memory, confidence_fine), 1)
-        ctx.update(confidence_projected=self.confidence_scorer.project_memory(confidence_memory),
+        ctx.update(confidence_projected=self.confidence_scorer.project_memory(confidence_memory, padding),
                    confidence_padding=padding)
         memory = torch.cat((memory, fine), 1)
         return memory, padding
@@ -656,11 +703,11 @@ class DirectFollower(nn.Module):
             if len(keep) != len(points):
                 indices = indices[keep]
                 points, decoded, hazards, confidence = (v[keep] for v in (points, decoded, hazards, confidence))
-                projected = [tuple(v[keep] for v in kv) for kv in projected]
+                projected = PathDecoderLayer.select_memory(projected, keep)
                 padding = padding[keep]
                 active_ctx = {key: active_ctx[key][keep] for key in
                               ('fine', 'deep', 'fine_fp32', 'deep_fp32', 'confidence_padding')} | dict(
-                    confidence_projected=[tuple(v[keep] for v in kv) for kv in active_ctx['confidence_projected']])
+                    confidence_projected=PathDecoderLayer.select_memory(active_ctx['confidence_projected'], keep))
             decoded, points = self.refine_prediction(active_ctx, points, decoded, hazards, confidence,
                 projected, padding, self.refinement_stage.weight[stage])
             refinements.append(refinements[-1].index_copy(0, indices, points))
