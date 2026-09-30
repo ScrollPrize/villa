@@ -11,7 +11,7 @@ import numpy as np
 import torch
 
 from vesuvius.neural_tracing.fiber_follow.shared.data import (
-    DATA_POLICY, FollowDataset, OnPolicyStates, SampleConfig, ZBand, fiber_manifest, load_fibers, split_fibers,
+    DATA_POLICY, FollowDataset, OnPolicyStates, SampleConfig, ZBand, fiber_manifest, load_fibers, split_fibers, REPLAY_FAILURES,
 )
 from vesuvius.neural_tracing.fiber_follow.shared.experiment import read_manifest
 from vesuvius.neural_tracing.fiber_follow.shared.online import OnlineCollector
@@ -318,6 +318,10 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
             sums['endpoint_states'] = sums.get('endpoint_states', 0)+int(endpoint.sum())
             sums['matched_endpoint_states'] = sums.get('matched_endpoint_states', 0)+int(matched.sum())
             sums['choice_endpoint_states'] = sums.get('choice_endpoint_states', 0)+int(choice.sum())
+            if 'failure_kind' in cpu:
+                for kind, name in enumerate(REPLAY_FAILURES[1:], 1):
+                    key = 'replay_'+name+'_endpoints'
+                    sums[key] = sums.get(key, 0)+int(((cpu['failure_kind'] == kind) & endpoint).sum())
             if 'decision_requested' in cpu:
                 requested_decisions += float(cpu['decision_requested'].sum())
             if 'negative_bank_shards' in cpu:
@@ -465,6 +469,14 @@ def build_parser():
                     help='Wrong-fiber tail range in trace voxels (default: 4 16)')
     ap.add_argument('--bank-following-probability', type=float, default=.1,
                     help='Independent fraction of endpoint proposals following validated bank paths (default: .1)')
+    ap.add_argument('--bank-hard-fraction', type=float, default=.5,
+                    help='Fraction of bank draws ranked by nearby similar, curved, or converging geometry')
+    ap.add_argument('--replay-failure-fraction', type=float, default=.5,
+                    help='Replay share balanced across available failure kinds; remainder uses drift bands')
+    ap.add_argument('--bank-switch-tolerance', type=float, default=.75,
+                    help='Foreign centerline contact radius for DAgger labels, in trace voxels')
+    ap.add_argument('--bank-own-tolerance', type=float, default=1.5,
+                    help='Annotation tube excluded from confirmed foreign contact')
     ap.add_argument('--presence-dropout', type=float, default=.25,
                     help='Probability of zeroing the presence crop; may be changed on resume')
     ap.add_argument('--blur-probability', type=float, default=.25,
@@ -503,8 +515,7 @@ def build_parser():
     ap.add_argument('--recurrent-refinement-steps', type=int, default=DirectConfig.recurrent_refinement_steps,
                     help='Number of shared-decoder refinement passes')
     ap.add_argument('--recurrent-refinement-limit', type=float, default=None,
-                    help='V4 maximum lateral displacement norm per refinement pass, in trace voxels; '
-                         'omitted keeps the checkpoint value (1 for new models); may change on resume')
+                    help=f'Maximum lateral displacement norm per refinement pass, in trace voxels (default: {DirectConfig.recurrent_refinement_limit:g})')
     return ap
 
 
@@ -594,6 +605,8 @@ def main(argv=None):
         raise ValueError('Candidate weight must be finite and positive')
     if args.dagger_after <= 0:
         raise ValueError('--dagger-after must be positive')
+    from vesuvius.neural_tracing.fiber_follow.regression.bank_geometry import BankSwitchDetector
+    BankSwitchDetector([], args.bank_switch_tolerance, args.bank_own_tolerance)
     identity_sampling = IdentitySampling(
         presence_dropout=args.presence_dropout,contact_fraction=args.contact_fraction,
         blur_probability=args.blur_probability,blur_sigma=args.blur_sigma,
@@ -601,6 +614,7 @@ def main(argv=None):
         bank_wrong_continuation_probability=args.bank_wrong_continuation_probability,
         bank_wrong_continuation_tail=args.bank_wrong_continuation_tail,
         bank_following_probability=args.bank_following_probability,
+        bank_hard_fraction=args.bank_hard_fraction,replay_failure_fraction=args.replay_failure_fraction,
         decision_fraction=args.decision_fraction,decision_choice_fraction=args.decision_choice_fraction,
         candidate_tolerance=args.tolerance,bank_coverage_probability=args.bank_coverage_probability,
         prefer_long_continuations=args.prefer_long_continuations,
@@ -660,6 +674,7 @@ def main(argv=None):
                    'negative_bank_refresh_seconds','negative_bank_cache_mb','activation_checkpointing',
                    'memory_grad_clip','rest_grad_clip','presence_dropout','blur_probability','blur_sigma',
                    'decision_fraction','decision_choice_fraction','bank_following_probability','fresh_fraction',
+                   'bank_hard_fraction','replay_failure_fraction','bank_switch_tolerance','bank_own_tolerance',
                    'n_commit','memory_stride','feature_switch_crop_fraction','feature_history_loss_fraction',
                    'recurrent_refinement_limit'}
         defaults = build_parser()
@@ -706,7 +721,9 @@ def main(argv=None):
         every=args.dagger_every, max_seeds=args.dagger_seeds, seed=args.seed, replay_keep=args.replay_keep,
         initial=[c._dir for c in caches], trace_len=args.dagger_trace_len, n_commit=args.n_commit,
         collector_module='vesuvius.neural_tracing.fiber_follow.regression.collect',
-        extra_args=('--after', args.dagger_after))
+        extra_args=('--after', args.dagger_after, '--bank-switch-tolerance', args.bank_switch_tolerance,
+                    '--bank-own-tolerance', args.bank_own_tolerance,
+                    *[v for path in (args.negative_bank, args.near_negative_bank) if path for v in ('--failure-bank', path)]))
     contacts = load_contacts(args.contacts,train_f,band) if args.contacts else ()
     hard_spans = load_hard_spans(args.hard_spans,train_f) if args.hard_spans else ()
     progress(f'Sampling: {len(contacts)} contacts, {len(hard_spans)} hard spans; memory slots={cfg.memory_slots}')

@@ -22,7 +22,9 @@ class DirectTrainingInterval:
               'point_unknown_count', 'replay_endpoints', 'replay_observations', 'replay_encoder_crops',
               'confidence_labeled_states', 'confidence_departed_states',
               'supervision_weight', 'endpoint_weight', 'matched_endpoint_weight', 'choice_endpoint_weight',
-              'endpoint_states', 'matched_endpoint_states', 'choice_endpoint_states')
+              'endpoint_states', 'matched_endpoint_states', 'choice_endpoint_states',
+              'replay_bank_switch_endpoints', 'replay_premature_stop_endpoints',
+              'replay_endpoint_overshoot_endpoints', 'replay_pre_switch_endpoints')
     nested_counts = {'identity': ('candidate_states', 'candidate_intervals', 'candidate_late_failures',
                                  'candidate_first_failures', 'candidate_supervision_weight'),
                      'memory': ('identity_count', 'identity_correct', 'departed_count',
@@ -102,6 +104,10 @@ def _interval_training_lines(row):
                   ('pairs','decision_pair_fraction'))))
     if row.get('feature_switch_crop_fraction', -1.) >= 0:
         lines[-1] += f" | switch crop budget {row['feature_switch_crop_fraction']:.0%} (cumulative)"
+    failures = ('bank_switch', 'pre_switch', 'premature_stop', 'endpoint_overshoot')
+    if any(m.get('replay_'+name+'_endpoints', 0) for name in failures):
+        lines.append('  replay failure endpoints: '+' / '.join(
+            f'{name.replace("_", " ")} {int(m.get("replay_"+name+"_endpoints", 0))}' for name in failures))
     lines.append('  gradients: '+' | '.join(
         f"{name} max {m[name+'_grad_norm_max']:.2g}, clipped {m[name+'_clipped_updates']}/{updates} updates"
         for name in ('memory', 'rest')))

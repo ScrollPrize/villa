@@ -13,8 +13,8 @@ def bank_fiber(parent, points):
                        endpoint_stop=(False,False),source_hash=identity)
 
 
-def following_sample(bank, cfg, rng):
-    draw = bank.draw_path(rng)
+def following_sample(bank, cfg, rng, *, hard_fraction=0.):
+    draw = bank.draw_path(rng, hard_fraction=hard_fraction)
     if draw is None:
         return None
     fi, points, arc_range = draw

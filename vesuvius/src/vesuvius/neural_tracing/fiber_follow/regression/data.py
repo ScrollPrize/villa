@@ -95,6 +95,8 @@ class IdentitySampling:
     bank_wrong_continuation_probability: float = .75
     bank_wrong_continuation_tail: tuple = (4., 16.)
     bank_following_probability: float = 0.  # independent fraction of endpoint proposals
+    bank_hard_fraction: float = .5  # mix geometry-ranked proposals with uniform bank draws
+    replay_failure_fraction: float = .5  # remainder preserves recoverable drift bands
     bank_coverage_probability: float = 0.  # reserved fresh slots on covered parent spans
     prefer_long_continuations: bool = False
     decision_fraction: float = 0.  # fraction of endpoint proposals reserved for matched pairs
@@ -127,6 +129,8 @@ class IdentitySampling:
             raise ValueError('Bank wrong-continuation probability must be in [0,1]')
         if not 0 <= self.bank_following_probability <= 1:
             raise ValueError('Bank following probability must be in [0,1]')
+        if not all(np.isfinite(v) and 0 <= v <= 1 for v in (self.bank_hard_fraction, self.replay_failure_fraction)):
+            raise ValueError('Hard-bank and replay-failure fractions must be in [0,1]')
         if not 0 <= self.decision_fraction <= 1:
             raise ValueError('Decision fraction must be in [0,1]')
         if self.decision_fraction+self.bank_following_probability > 1:
@@ -266,13 +270,15 @@ class IdentityObservationBuilder(ObservationBuilder):
         if self.negative_bank is None:
             raise ValueError('Matched decisions require a bank')
         return decision_pair(self.near_negative_bank or self.negative_bank, sample_cfg, self.cfg, rng,
-                             choice=rng.random() < self.sampling.decision_choice_fraction)
+                             choice=rng.random() < self.sampling.decision_choice_fraction,
+                             hard_fraction=self.sampling.bank_hard_fraction)
 
     def bank_following(self, sample_cfg, rng):
         """Draw a generated target from the dedicated endpoint budget."""
         from vesuvius.neural_tracing.fiber_follow.regression.neighbor_following import following_sample
         bank = self.following_bank or self.negative_bank
-        return None if bank is None else following_sample(bank, sample_cfg, rng)
+        return None if bank is None else following_sample(bank, sample_cfg, rng,
+                                                        hard_fraction=self.sampling.bank_hard_fraction)
 
     def replace_fresh(self, sample_cfg, rng):
         """Oversample covered annotations or switch histories with annotated targets."""
@@ -290,7 +296,7 @@ class IdentityObservationBuilder(ObservationBuilder):
             if self.near_negative_bank is not None and self.near_negative_bank is not self.negative_bank else [])
         for _ in range(3):
             bank = banks[int(rng.integers(len(banks)))]
-            draw = bank.draw_path(rng,unique=False)
+            draw = bank.draw_path(rng,unique=False,hard_fraction=s.bank_hard_fraction)
             if draw is None:
                 continue
             fi,_,(a,b) = draw

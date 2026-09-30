@@ -11,7 +11,7 @@ from torch.utils.checkpoint import checkpoint
 
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
 
-ARCHITECTURE = 'axial_fiber_memory_v6'
+ARCHITECTURE = 'axial_fiber_memory_v7'
 TOKEN_STRIDE = (8, 2, 2)
 TOKEN_OFFSET = (3, 0, 0)
 
@@ -41,8 +41,8 @@ class DirectConfig:
     feature_replay_weight: float = .5
     feature_switch_crop_fraction: float = -1.
     feature_history_loss_fraction: float = .25
-    recurrent_refinement_steps: int = 1
-    recurrent_refinement_limit: float = 1.
+    recurrent_refinement_steps: int = 2
+    recurrent_refinement_limit: float = 4.
 
     def __post_init__(self):
         if isinstance(self.fine, dict):
@@ -337,9 +337,12 @@ class OutputPlaneFeatures(nn.Module):
             values = (values.float()+(upper.float()-values.float())*self.fraction).to(fine.dtype)
         return values.flatten(2).transpose(1, 2)
 
-    def forward(self, fine):
-        tokens = self.projection(self.sample(fine))
+    def project(self, samples):
+        tokens = self.projection(samples)
         return tokens+self.position(self.xyz/16.).to(tokens.dtype)
+
+    def forward(self, fine):
+        return self.project(self.sample(fine))
 
 
 class DirectFollower(nn.Module):
@@ -519,16 +522,19 @@ class DirectFollower(nn.Module):
         identity, identity_padding = self.recurrent_memory.read_tokens(query_state)
         memory = torch.cat((ctx['memory'], identity.to(ctx['memory'].dtype)), 1)
         padding = torch.cat((ctx['padding'], identity_padding), 1)
-        # The scorer reads the full observed scene through its own projections.
-        # Reuse these differentiable K/V across generated and supplied curves.
-        ctx.update(confidence_projected=self.confidence_scorer.project_memory(memory),
-                   confidence_padding=padding)
-        # Generator-only extra reads: retain the full deep lattice, references
-        # and historical memory. Every query can attend to every fine plane.
-        # The scorer keeps its segment samples and original observation bank.
-        fine = self.output_plane_features(ctx['fine']).to(memory.dtype)
-        memory = torch.cat((memory, fine), 1)
+        # Sample the complete planes once; generator and scorer learn independent
+        # channel/position projections of exactly the same spatial evidence.
+        samples = self.output_plane_features.sample(ctx['fine'])
+        fine = self.output_plane_features.project(samples).to(memory.dtype)
+        confidence_fine = self.confidence_scorer.plane_tokens(
+            samples, self.output_plane_features.xyz).to(memory.dtype)
         padding = torch.cat((padding, padding.new_zeros(fine.shape[:2])), 1)
+        # Every segment reads every plane. K/V stay differentiable and are reused
+        # across generated and supplied curves within this decision.
+        confidence_memory = torch.cat((memory, confidence_fine), 1)
+        ctx.update(confidence_projected=self.confidence_scorer.project_memory(confidence_memory),
+                   confidence_padding=padding)
+        memory = torch.cat((memory, fine), 1)
         return memory, padding
 
     def finish_prediction(self, ctx, decoded, points, projected, padding, candidates=None):

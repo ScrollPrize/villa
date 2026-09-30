@@ -22,6 +22,12 @@ class SegmentSurvivalScorer(nn.Module):
             activation='gelu', batch_first=True, norm_first=True) for _ in range(2))
         self.norm = nn.LayerNorm(h)
         self.failure = nn.Linear(h, 1)
+        self.plane_projection = nn.Linear(cfg.channels, h)
+        self.plane_position = nn.Linear(3, h)
+
+    def plane_tokens(self, samples, xyz):
+        tokens = self.plane_projection(samples)
+        return tokens+self.plane_position(xyz/16.).to(tokens.dtype)
 
     def segment_samples(self, points):
         """Every location depends only on this endpoint and its predecessor."""
@@ -39,7 +45,7 @@ class SegmentSurvivalScorer(nn.Module):
         geometry = torch.cat((start, points, delta, delta.norm(dim=-1, keepdim=True)), -1)/16.
         query = self.query(torch.cat((spatial.flatten(2), geometry), -1))
         # Only the proposed path is causal. Cross-attention reads all observed
-        # image/reference/memory tokens; no generator hidden state enters here.
+        # deep/fine-plane/reference/memory tokens; no generator hidden state enters here.
         k = points.shape[1]
         causal = torch.ones(k, k, device=points.device, dtype=torch.bool).triu(1)
         for layer, kv in zip(self.layers, projected):

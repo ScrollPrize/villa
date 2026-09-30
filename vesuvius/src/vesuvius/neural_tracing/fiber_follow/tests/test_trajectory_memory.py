@@ -174,7 +174,7 @@ def test_training_sequence_checkpoint_and_optimizer_resume(tmp_path):
     assert not torch.equal(before, model.coordinates.weight)
     assert metrics['observed_states'] == 4
     assert 'route_loss' not in metrics.get('memory', {})
-    path = tmp_path/'v4.pt'
+    path = tmp_path/'current.pt'
     spec = FiberVolumeSpec('/tmp/presence', ct_zarr='/tmp/ct', inputs='ct+presence')
     sample = SampleConfig(crop=model.cfg.fine, n_history=model.cfg.n_history, n_future=model.cfg.n_future)
     save_checkpoint(path, model, ema, spec, sample,
@@ -194,6 +194,11 @@ def test_training_sequence_checkpoint_and_optimizer_resume(tmp_path):
     for key, state in opt.state_dict()['state'].items():
         for name, value in state.items():
             torch.testing.assert_close(restored_opt.state_dict()['state'][key][name], value, rtol=0, atol=0)
+    # Matching tensor shapes do not make an older architecture acceptable.
+    for version in range(1, 7):
+        torch.save(dict(ck, architecture=f'axial_fiber_memory_v{version}'), path)
+        with pytest.raises(ValueError, match='Checkpoint'):
+            load_checkpoint(path, 'cpu')
 
 
 def test_builder_streams_causal_main_crops_and_keeps_paired_endpoints_identical(tmp_path, monkeypatch):

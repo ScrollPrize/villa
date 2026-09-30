@@ -86,11 +86,10 @@ def test_all_generator_layers_read_fine_planes_and_keep_deep_and_history(monkeyp
     output = model(batch['x'], batch['hist'], batch['hmask'])
     ctx, memory, padding = (captured[k] for k in ('ctx', 'memory', 'padding'))
     spatial_count = math.prod(c.token_shape)
-    observation_count = ctx['confidence_padding'].shape[1]
     fine_count = c.n_future*c.fine.width**2
-    assert memory.shape[1] == observation_count+fine_count
+    assert memory.shape[1] == ctx['confidence_padding'].shape[1]
     torch.testing.assert_close(memory[:, :spatial_count], ctx['deep'].flatten(2).transpose(1, 2))
-    torch.testing.assert_close(padding[:, :observation_count], ctx['confidence_padding'])
+    torch.testing.assert_close(padding, ctx['confidence_padding'])
     assert not padding[:, -fine_count:].any()
     assert [index for index, _ in reads] == list(range(c.decoder_layers))
     assert all(value is memory for _, value in reads)
@@ -115,11 +114,76 @@ def test_generator_plane_projections_do_not_enter_candidate_scoring():
     first['candidate_hazard_logits'].sum().backward()
     assert all(p.grad is None for p in model.output_plane_features.parameters())
     assert model.encoder.dense_decoder[-1].weight.grad.abs().sum() > 0
+    for module in (model.confidence_scorer.plane_projection, model.confidence_scorer.plane_position):
+        for param in module.parameters():
+            assert param.grad is not None and torch.isfinite(param.grad).all() and param.grad.abs().sum() > 0
     with torch.no_grad():
         model.output_plane_features.projection.weight.normal_(std=2.)
     second = model(*args, candidates=curves)
     assert (first['points']-second['points']).abs().max() > 1e-5
     torch.testing.assert_close(first['candidate_hazard_logits'], second['candidate_hazard_logits'], rtol=0, atol=0)
+    torch.testing.assert_close(first['memory_cache'], second['memory_cache'], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize('scored', ['hazard_logits', 'candidate_hazard_logits'])
+def test_all_scorer_layers_read_every_fine_pixel_and_reuse_projections(monkeypatch, scored):
+    torch.manual_seed(84)
+    model = build_model(cfg(recurrent_refinement_steps=1)).eval()
+    batch = memory_batch(model.cfg, 1)
+    samples, reads = [], []
+    original_sample = model.output_plane_features.sample
+
+    def sample(fine):
+        value = original_sample(fine)
+        samples.append(value)
+        return value
+
+    monkeypatch.setattr(model.output_plane_features, 'sample', sample)
+    for index, layer in enumerate(model.confidence_scorer.layers):
+        original = layer.project_memory
+
+        def read(memory, _original=original, _index=index):
+            reads.append((_index, memory))
+            return _original(memory)
+
+        monkeypatch.setattr(layer, 'project_memory', read)
+    curves = torch.zeros(1, 2, model.cfg.n_future, 3, requires_grad=True)
+    with torch.no_grad():
+        curves[..., 2] = model.planes
+        curves[:, 1, :, 0] = 2.
+    output = model(batch['x'], batch['hist'], batch['hmask'], candidates=curves)
+    # One shared plane gather, and one K/V projection per scorer layer for all paths.
+    assert len(samples) == 1
+    assert [index for index, _ in reads] == list(range(len(model.confidence_scorer.layers)))
+    memory = reads[0][1]
+    assert all(value is memory for _, value in reads)
+    fine_count = model.cfg.n_future*model.cfg.fine.width**2
+    expected = model.confidence_scorer.plane_tokens(samples[0], model.output_plane_features.xyz)
+    torch.testing.assert_close(memory[:, -fine_count:], expected)
+    # The first segment reaches every pixel, including distant/later planes,
+    # through both projected tokens and the shared, unprojected fine samples.
+    score = output[scored][..., 0].sum()
+    memory_gradient, sample_gradient = torch.autograd.grad(score, (memory, samples[0]), retain_graph=True)
+    assert (memory_gradient[:, -fine_count:].abs().sum(-1) > 0).all()
+    assert (sample_gradient.abs().sum(-1) > 0).all()
+    score.backward()
+    assert curves.grad is None
+    for name, param in model.named_parameters():
+        if name.startswith(('coordinates.', 'decoder.', 'query.', 'refinement_', 'output_plane_features.')):
+            assert param.grad is None, name
+
+
+def test_scorer_plane_projections_change_scores_without_changing_paths():
+    torch.manual_seed(85)
+    model = build_model(cfg(recurrent_refinement_steps=1)).eval()
+    batch = memory_batch(model.cfg, 1)
+    args = batch['x'], batch['hist'], batch['hmask']
+    with torch.no_grad():
+        first = model(*args)
+        model.confidence_scorer.plane_projection.weight.normal_(std=2.)
+        second = model(*args)
+    assert (first['hazard_logits']-second['hazard_logits']).abs().max() > 1e-5
+    torch.testing.assert_close(first['points'], second['points'], rtol=0, atol=0)
     torch.testing.assert_close(first['memory_cache'], second['memory_cache'], rtol=0, atol=0)
 
 

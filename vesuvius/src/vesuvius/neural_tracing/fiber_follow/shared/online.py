@@ -7,7 +7,7 @@ import sys
 
 import numpy as np
 
-from vesuvius.neural_tracing.fiber_follow.shared.data import OnPolicyStates
+from vesuvius.neural_tracing.fiber_follow.shared.data import OnPolicyStates, REPLAY_FAILURES
 from vesuvius.neural_tracing.fiber_follow.shared.trace import DEFAULT_CONFIDENCE, DEFAULT_N_COMMIT
 
 
@@ -61,6 +61,8 @@ class OnlineCollector:
                     dagger_caches=len(self.paths), dagger_cache=str(self.output),
                     dagger_fibers=int(len(np.unique(states.fiber_idx))),
                     dagger_hard=int(np.count_nonzero(states.hard)),
+                    dagger_failures={name:int(np.count_nonzero(states.failure_kind == i))
+                                     for i, name in enumerate(REPLAY_FAILURES)},
                     dagger_exploratory=int(np.count_nonzero(states.exploratory)))
 
     def launch(self, step, save):

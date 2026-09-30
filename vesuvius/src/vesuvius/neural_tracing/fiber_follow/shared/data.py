@@ -337,15 +337,23 @@ def continuation_targets(fiber, t, reverse, pos, frame, cfg, offtrack=False):
 # Keep replay source IDs stable across saved diagnostics.
 REPLAY_SOURCES = dict(recent=2)
 DRIFT_BANDS = ((0.,1.), (1.,1.5), (1.5,2.), (2.,3.5))
+REPLAY_FAILURES = ('ordinary', 'bank_switch', 'premature_stop', 'endpoint_overshoot', 'pre_switch')
 
 
-def replay_pools(caches):
-    """Five strata, each grouped by fiber, across every cache of one source."""
-    pools = [dict() for _ in range(5)]
+def replay_pools(caches, *, failures=False):
+    """Drift/departure strata, optionally split by recorded failure, then fiber."""
+    pools = [dict() for _ in range(9 if failures else 5)]
     for op in caches:
         off = np.asarray(op.offtrack,bool)
-        for band,(lo,hi) in enumerate((*DRIFT_BANDS,(0.,0.))):
-            member = off if band == 4 else (~off & (op.drift>=lo) & (op.drift<hi))
+        kinds = np.asarray(op.failure_kind) if failures else np.zeros(len(op), np.int8)
+        for band in range(len(pools)):
+            if band >= 5:
+                member = kinds == band-4
+            elif band == 4:
+                member = off & (kinds == 0)
+            else:
+                lo, hi = DRIFT_BANDS[band]
+                member = ~off & (kinds == 0) & (op.drift>=lo) & (op.drift<hi)
             for fi in np.unique(op.fiber_idx[member]):
                 idx = np.flatnonzero(member & (op.fiber_idx==fi))
                 pools[band].setdefault(int(fi),[]).append((op,idx))
@@ -356,8 +364,9 @@ class FollowDataset(torch.utils.data.IterableDataset):
     """Configurable fresh share; remaining draws use rotating recent replay.
 
     Defaults to 70% fresh and 30% recent replay after dedicated builder budgets.
-    Replay reserves 10% for confirmed departure; remaining
-    draws are uniform over drift bands and then fibers. Empty strata use fresh
+    Legacy replay reserves 10% for departure. Builders may instead reserve a
+    failure budget, uniform over available kinds, then fibers. Remaining draws
+    use drift bands and then fibers. Empty legacy strata use fresh
     augmentation. Every draw is relabeled and holdout checked before crop I/O.
     """
     def __init__(self, fibers, vol_spec, cfg, exclude_band, chunk=2, seed=0,
@@ -391,14 +400,23 @@ class FollowDataset(torch.utils.data.IterableDataset):
     def _set_replay(self,caches):
         self._validate(caches)
         self.onpolicy = caches
-        self.recent_pools = replay_pools(caches)
+        self.replay_failure_fraction = getattr(getattr(self.batch_builder, 'sampling', None),
+                                              'replay_failure_fraction', None)
+        self.recent_pools = replay_pools(caches, failures=self.replay_failure_fraction is not None)
         if hasattr(self.batch_builder, 'set_replay'):
             self.batch_builder.set_replay(caches)
 
     def draw_replay(self,rng):
         source = int(rng.choice((0, REPLAY_SOURCES['recent']),
                                 p=(self.fresh_fraction, 1-self.fresh_fraction)))
-        band = 4 if rng.random()<.1 else int(rng.integers(4))
+        if self.replay_failure_fraction is None:
+            band = 4 if rng.random()<.1 else int(rng.integers(4))
+        else:
+            failures = [i for i in range(4, len(self.recent_pools)) if self.recent_pools[i]]
+            drift = [i for i in range(4) if self.recent_pools[i]]
+            options = failures if rng.random() < self.replay_failure_fraction else drift
+            options = options or drift or failures
+            band = int(rng.choice(options)) if options else 0
         if source == 0:
             return None
         pool = self.recent_pools[band]
@@ -465,6 +483,7 @@ class FollowDataset(torch.utils.data.IterableDataset):
         item = label_state(self.fibers[fi],op.pos[j],op.frame[j],op.hist[j],op.hmask[j],self.cfg,
                            t=t,reverse=reverse,offtrack=bool(op.offtrack[j]))
         item.update(source=source,stratum=band,source_step=op.provenance.get('step',-1) or -1,
+                    failure_kind=int(op.failure_kind[j]) if hasattr(op, 'failure_kind') else 0,
                     fiber_ref=(fi,self.fibers[fi].length-t if reverse else t,reverse))
         item.update({k: getattr(op, k)[j] for k in SEED_FIELDS if hasattr(op, k)})
         track = op.track(j) if hasattr(op, 'track') else None
@@ -697,6 +716,7 @@ def collate_targets(items):
         out['source'] = st('source')
         out['source_step'] = st('source_step')
         out['stratum'] = st('stratum')
+        out['failure_kind'] = torch.tensor([it.get('failure_kind', 0) for it in items], dtype=torch.long)
     return out
 
 
@@ -725,11 +745,20 @@ class OnPolicyStates:
               "hard", "exploratory")
     # Fields later collectors add; caches without them load with the default.
     # drift: current-position error in trace-grid voxels (NaN when departed or unknown).
+    # failure_kind indexes REPLAY_FAILURES. switch_* identifies the first certified
+    # foreign contact, including on retained pre-switch rows. None of it is input.
     # Arc positions compared against float64 trace geometry keep full precision.
-    FLOAT64_FIELDS = ("t",)
+    FLOAT64_FIELDS = ("t", "travelled", "switch_distance", "switch_pos")
     OPTIONAL = {"drift": lambda n: np.full(n, np.nan, np.float32),
                 "source_cache": lambda n: np.full(n, -1, np.int32),
-                "source_row": lambda n: np.full(n, -1, np.int64), **SEED_DEFAULTS}
+                "source_row": lambda n: np.full(n, -1, np.int64),
+                "failure_kind": lambda n: np.zeros(n, np.int8),
+                "travelled": lambda n: np.full(n, np.nan, np.float64),
+                "switch_distance": lambda n: np.full(n, np.nan, np.float64),
+                "switch_pos": lambda n: np.full((n,3), np.nan, np.float64),
+                "switch_decision": lambda n: np.full(n, -1, np.int64),
+                "switch_bank_path": lambda n: np.full(n, '', dtype='U1'),
+                "switch_bank_run": lambda n: np.full(n, '', dtype='U64'), **SEED_DEFAULTS}
     # Optional observed tracks: every earlier head of a state's trace, one per
     # decision. Row i's heads are track_*[seq_start[i]:seq_end[i]]; -1 means
     # none. Offsets/departure are relabeled annotation targets, never inputs.

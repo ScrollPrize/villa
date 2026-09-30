@@ -10,16 +10,19 @@ From `fiber_follow`, using the existing project environment:
 
 ```bash
 bash scripts/launch_memory.sh
-tail -F output/logs/axial_survival_memory_v6_run1.log
+tail -F output/logs/axial_survival_memory_v7_run1.log
 ```
 
 `launch_trajectory_memory.sh` delegates to the same launcher. The launcher uses
 CT/presence plus six unsigned local-frame direction channels, batch 8,
 microbatch 4, eight workers, 16-point maximum commit, history spacing 8,
 16 memory slots, 64 cached observations, two-decision gradient chunks,
-and one shared-decoder refinement pass. It starts random weights and refuses
+and two shared-decoder refinement passes, each allowing up to four voxels of
+lateral correction per point. It starts random weights and refuses
 an existing destination. Set `RUN_NAME` for another fresh run; trailing trainer
 arguments override launcher settings. No training is launched by editing code.
+The architecture is `axial_fiber_memory_v7`; older checkpoints are rejected,
+with no migration or compatibility mode.
 
 The loss combines geometry, generated-path survival likelihood, and candidate-path
 survival likelihood. Survival likelihood sums the supervised intervals per path;
@@ -43,7 +46,10 @@ prediction and refinement. Each plane retains the full 101x101 resolution:
 163,216 fine tokens join 39,015 deep tokens plus references and observation
 memory. Fine tokens have learned channel projections and physical XYZ position
 embeddings. Output planes between input slices interpolate only along depth.
-The scorer reads segment-local dense samples plus deep/reference/memory tokens.
+Every scorer layer also reads all full-resolution output planes, alongside
+segment-local dense samples and deep/reference/memory tokens. Plane sampling is
+shared with the generator; the scorer has independent channel and XYZ projections
+and reuses its own attention K/V across generated and candidate paths.
 Observed history and the seed condition the crop; annotations only define losses.
 Cold starts with a remote seed encode that seed crop once. Warm tracing encodes
 only each new head crop and carries observation memory forward.
@@ -92,6 +98,43 @@ Sampling revision 5 changes `--bank-following-probability` from a fraction of fr
 draws to an independent endpoint fraction, including when resuming old runs.
 Its sum with `--decision-fraction` must not exceed one.
 
+`--bank-hard-fraction .5` keeps half of bank proposals uniform. For the other
+half, the loader chooses one of three geometry criteria uniformly and selects
+the strongest of eight proposals: nearby paths with similar tangents and bending,
+curved paths, or converging/diverging neighbors. Comparisons use four-voxel
+arclength spacing; distances and curve similarity are independent of vertex
+density and trace direction. Following draws still honor unique-path eligibility;
+matched decisions and covered-parent draws use all valid relationships. This
+changes exposure to the existing trusted bank; it does not change its annotations
+or mine previously absent weak-signal examples.
+
+New DAgger collections use the negative and near-negative banks to detect foreign
+contact along the actual committed polyline, including between decision heads.
+The first intersection with a `.75`-voxel bank-path tube outside the intended
+annotation's `1.5`-voxel tube certifies a switch. Both radii are configurable
+(`--bank-switch-tolerance`, `--bank-own-tolerance`). Overlapping tubes remain
+ambiguous; absent bank coverage cannot establish fiber identity. Contact positions
+are continuous segment/capsule intersections, not rounded voxel or head locations.
+Once departed, the existing stopping-only supervision remains absorbing.
+
+Replay stores `failure_kind`, `travelled`, `switch_pos`, `switch_distance`,
+`switch_decision` (the within-trace decision that committed the contacting segment),
+`switch_bank_path` (shard/path index), and `switch_bank_run`. The pre-switch window
+retains geometry targets and shares the event metadata; confirmed switched states
+have geometry masked. These labels never enter model inputs. Bank provenance is
+saved with the collection. `--replay-failure-fraction .5` reserves half of replay
+for available generic departures, bank switches, premature stops, endpoint
+overshoots, and pre-switch states, equally by category and then by fiber. The other
+half balances recoverable drift bands. If one side is empty, the other receives
+its budget; fully empty replay falls back to annotation-fresh draws. Logs report
+collected categories and realized training endpoint counts.
+
+Old replay caches remain loadable with their original labels and default unknown
+switch metadata. Recollect them to obtain continuous contact locations; older
+caches did not store every committed segment. Sampling revision 6 enables these
+budgets on resume and changes seeded draw order. It does not establish a tracing
+accuracy improvement without a training/rollout comparison.
+
 Each matched endpoint scores four shuffled paths: the two bank/annotation
 continuations and two smooth transitions between them, with varied transition
 onsets. Paired observations share candidate geometry and order. Candidate labels
@@ -118,6 +161,7 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=../../.. \
   tests/test_trajectory_memory.py tests/test_recurrent_refinement.py \
   tests/test_feature_correctness.py tests/test_direction_inputs.py \
   tests/test_decision_training.py tests/test_sampling_balance.py \
+  tests/test_bank_failures.py tests/test_sampling_ratios.py \
   tests/test_output_plane_features.py \
   -q -o cache_dir=/tmp/fiber-survival-pytest
 ```

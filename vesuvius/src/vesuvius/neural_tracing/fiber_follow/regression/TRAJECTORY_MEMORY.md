@@ -18,9 +18,10 @@
    XYZ position embeddings. Every query can attend to all planes in every layer;
    there is no per-query plane mask. The production crop supplies 163,216 fine
    tokens alongside 39,015 deep tokens. Four decoder layers jointly predict the
-   future lateral coordinates. By default, one more
-   pass through the same decoder samples the proposal and applies a bounded
-   one-voxel lateral correction. Generator self-attention remains bidirectional.
+   future lateral coordinates. Two further passes through the same decoder each
+   resample the current proposal and apply up to four voxels of lateral correction
+   per point. Crop bounds and the first-connection limit apply after each pass.
+   Generator self-attention remains bidirectional.
 5. A separate scorer samples four ordered locations along each incoming proposed
    segment, including the endpoint, using the existing 3x3x3 fine-feature stencil
    and deep features. At production forward spacing this is one sample per quarter
@@ -28,10 +29,13 @@
    determines resolution; arbitrary resampling of candidates is not supported.
 6. Segment tokens include sampled evidence and start/end/displacement/length.
    Two scoring decoder layers use causal segment self-attention and unrestricted
-   cross-attention to the deep image/reference/memory token set. Dense output-plane
-   tokens are generator inputs; the scorer obtains its fine evidence through
-   segment samples. Its own K/V projections are reused across
-   scored candidates within one decision. No generator hidden states enter scoring.
+   cross-attention to the deep image/reference/memory tokens and every lateral
+   pixel on all output planes. The generator and scorer share plane sampling;
+   the scorer learns independent channel and physical XYZ projections. It retains
+   segment-local fine samples as well. Its own K/V projections are reused across
+   generated and supplied paths within one decision. No generator hidden states
+   enter scoring. Architecture `axial_fiber_memory_v7` requires newly trained
+   weights; older checkpoints have no migration or compatibility path.
 7. One linear readout predicts the conditional first-failure logit per segment.
    Prefix confidence is the product of conditional survival probabilities,
    accumulated in FP32 log space. Supplied candidates and generated paths use the
@@ -72,8 +76,8 @@ previous point. Known departures and physical endpoints are failures; unknown
 ends and unobservable identity are censored. Foreign-fiber masks remain negatives.
 
 Confidence detaches scored coordinates. Its loss trains its own scorer, the
-shared encoder and memory, but not the generator decoder, coordinate head or
-refinement head. Geometry supervises initial/final proposals with weights
+shared encoder and memory, but not the generator plane projections, decoder,
+coordinate head or refinement head. Geometry supervises initial/final proposals with weights
 25%/75%. Seed, history and observation-memory tokens are available through
 cross-attention.
 

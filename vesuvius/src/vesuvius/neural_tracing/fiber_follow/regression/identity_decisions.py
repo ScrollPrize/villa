@@ -38,7 +38,7 @@ def path_candidates(curves, supported, rng):
             np.array([0, 0, 1, 1], np.int64)[order])
 
 
-def decision_pair(bank, sample, model, rng, *, attempts=32, choice=None):
+def decision_pair(bank, sample, model, rng, *, attempts=32, choice=None, hard_fraction=0.):
     """Return two states sharing crops, candidate order and observed history.
 
     Choice pairs share a short uncertain path between nearby fibers; either
@@ -57,7 +57,7 @@ def decision_pair(bank, sample, model, rng, *, attempts=32, choice=None):
                          17*model.fine.spacing/2+2.))
     horizon = sample.future_s[-1]
     for _ in range(attempts):
-        draw = bank.draw_path(rng, unique=False, min_length=tail+horizon+12)
+        draw = bank.draw_path(rng, unique=False, min_length=tail+horizon+12, hard_fraction=hard_fraction)
         if draw is None:
             continue
         fi, line, arc_range = draw

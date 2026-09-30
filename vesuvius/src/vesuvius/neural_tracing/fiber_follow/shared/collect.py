@@ -24,7 +24,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.reference import SEED_FIELDS, S
 class DecisionCollector:
     """Original-fiber, progress-bounded labeler, including pre-failure windows."""
     def __init__(self, fiber, fiber_idx, t0, sign, cfg, band=None, off_dist=3.5,
-                 before=48., after=24., stride=16., max_states=192, additional_crops=()):
+                 before=48., after=24., stride=16., max_states=192, additional_crops=(), bank_detector=None):
         self.fiber, self.fi, self.t, self.sign = fiber, fiber_idx, t0, sign
         self.cfg, self.band, self.off_dist = cfg, band, off_dist
         self.before, self.after, self.stride, self.max_states = before, after, stride, max_states
@@ -35,6 +35,45 @@ class DecisionCollector:
         self.departed = None
         self.last_travelled = 0.
         self.boundary_crossed = False
+        self.bank_detector, self.bank_switch = bank_detector, None
+
+    def observe_bank_segment(self, segment, travelled):
+        """Attach first-contact evidence to the decisions preceding the switch."""
+        if self.bank_detector is None or self.bank_switch is not None:
+            return
+        event = self.bank_detector.first_contact(self.fi, self.t, segment)
+        if event is None:
+            return
+        start = travelled-float(arclength(segment)[-1])
+        commit_rows = [j for j, distance in enumerate(self.distances) if distance <= start+1e-6]
+        self.bank_switch = dict(switch_distance=start+event['distance'],
+            switch_pos=event['pos'], switch_decision=commit_rows[-1] if commit_rows else 0,
+            switch_bank_path=event['bank_path'], switch_bank_run=event['bank_run'])
+        self.departed = (self.bank_switch['switch_distance'] if self.departed is None else
+                         min(self.departed, self.bank_switch['switch_distance']))
+        for row, distance in zip(reversed(self.rows), reversed(self.distances)):
+            if self.bank_switch['switch_distance']-distance > self.before:
+                break
+            row.update(self.bank_switch, hard=True)
+            if not row['offtrack']:
+                row['failure_kind'] = 4  # geometry remains supervised before contact
+
+    def observe_final_path(self, path):
+        """A length-limited trace may commit a last segment with no next decision.
+
+        Keep its causal pre-switch rows; never fabricate an unobserved endpoint.
+        The caller excludes oracle-aborted traces, and holdout remains censored.
+        """
+        if self.bank_detector is None or self.bank_switch is not None or not self.rows:
+            return
+        arc = arclength(path)
+        if arc[-1] <= self.last_travelled+1e-6:
+            return
+        tail = np.concatenate((np.asarray(self.rows[-1]['pos'])[None],
+                               np.asarray(path)[arc > self.last_travelled+1e-6]))
+        if self.band is not None and np.any((tail[:,2] >= self.band.lo-48) & (tail[:,2] < self.band.hi+48)):
+            return
+        self.observe_bank_segment(tail, float(arc[-1]))
 
     def __call__(self, state):
         f, sign = self.fiber, self.sign
@@ -76,6 +115,7 @@ class DecisionCollector:
                 self.departed = self.last_travelled+float(arclength(segment[:first+1])[-1])
             else:
                 self.t = float(f.s[nearest[-1]])
+        self.observe_bank_segment(segment, travelled)
         offtrack = self.departed is not None
         if offtrack and travelled-self.departed > self.after:
             return False
@@ -90,13 +130,21 @@ class DecisionCollector:
         if not all(training_state_allowed(item, crop, self.band)
                    for crop in (self.cfg.crop, *self.additional_crops)):
             return False  # do not trace through held-out space and resume afterwards
-        row = {k: state[k] for k in ('pos', 'frame', 'hist', 'hmask', 'exploratory')}
+        row = {k: default(1)[0] for k, default in OnPolicyStates.OPTIONAL.items()}
+        row.update({k: state[k] for k in ('pos', 'frame', 'hist', 'hmask', 'exploratory')})
         row.update({k: state[k] if k in state else SEED_DEFAULTS[k](1)[0] for k in SEED_FIELDS})
         # Current-position error against the matched GT point, in trace-grid
         # voxels; departed states have no correspondence. Lets replay stratify
         # on recoverable drift without relabeling every state at load time.
         drift = float('nan') if offtrack else float(np.linalg.norm(item['gt_history'][0]))
         row.update(source_cache=-1, source_row=len(self.rows), fiber_idx=self.fi, t=self.t, reverse=sign < 0, offtrack=offtrack, hard=hard, drift=drift)
+        row['travelled'] = travelled
+        if self.bank_switch is not None:
+            row.update(self.bank_switch, failure_kind=1)
+        elif self.boundary_crossed:
+            row['failure_kind'] = 3
+        elif not offtrack and state['would_stop'] and item['plane_mask'][0] and not state.get('recovery_blocked', False):
+            row['failure_kind'] = 2
         # Offset from the head to its matched original-fiber point (world).
         offset = (np.asarray(state['frame']) @ item['gt_history'][0] if not offtrack and item['gt_history_mask'][0] > 0
                   else np.full(3, np.nan))
@@ -136,7 +184,7 @@ def track_arrays(track):
             for key, shape in (('pos', (3,)), ('frame', (3, 3)), ('offtrack', ()), ('offset', (3,)))}
 
 
-def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer):
+def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer, bank_loader=None):
     ap = argparse.ArgumentParser()
     ap.add_argument('--checkpoint', required=True)
     ap.add_argument('--fibers', required=True)
@@ -157,6 +205,9 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer):
     ap.add_argument('--threads', type=int, default=2)
     ap.add_argument('--out', required=True)
     ap.add_argument('--seed', type=int, default=1)
+    ap.add_argument('--failure-bank', action='append', default=[], help='Trusted bank for switch labeling; repeat for multiple banks')
+    ap.add_argument('--bank-switch-tolerance', type=float, default=.75)
+    ap.add_argument('--bank-own-tolerance', type=float, default=1.5)
     args = ap.parse_args(argv)
     torch.set_num_threads(args.threads)
     model, crop, n_hist, spec, ck = checkpoint_loader(args.checkpoint, args.device)
@@ -170,6 +221,7 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer):
     fibers = load_fibers(args.fibers, grid_scale=spec.grid_scale)
     band = ZBand(args.val_z[0]/spec.grid_scale, args.val_z[1]/spec.grid_scale)
     train_f, _ = split_fibers(fibers, band)
+    bank_detector = bank_loader(args, ck, train_f, band, spec) if bank_loader is not None else None
     # Limit volume reads as well as rollouts when collecting a bounded batch.
     rng = np.random.default_rng(args.seed)
     seeds = []
@@ -193,9 +245,13 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer):
             chunk = seeds[offset:offset+args.batch]
             collectors = [DecisionCollector(train_f[s['fiber']], s['fiber'], s['t'], s['sign'], cfg, band,
                                            args.off_dist, args.before, args.after, args.stride,
-                                           additional_crops=getattr(tracer, 'additional_crops', ())) for s in chunk]
-            tracer.trace(np.stack([s['pos'] for s in chunk]), np.stack([s['heading'] for s in chunk]),
-                         on_decision=lambda i, state: collectors[i](state))
+                                           additional_crops=getattr(tracer, 'additional_crops', ()),
+                                           bank_detector=bank_detector) for s in chunk]
+            paths, reasons = tracer.trace(np.stack([s['pos'] for s in chunk]), np.stack([s['heading'] for s in chunk]),
+                                          on_decision=lambda i, state: collectors[i](state))
+            for collector, path, reason in zip(collectors, paths, reasons):
+                if reason != 'oracle':
+                    collector.observe_final_path(path)
             append_traces(collectors, rows, track)
             print(json.dumps(dict(traces=offset+len(chunk), total=len(seeds), states=len(rows))), flush=True)
     finally:
@@ -206,7 +262,9 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer):
                         provenance=dict(checkpoint=os.path.abspath(args.checkpoint), step=ck.get('step'),
                                         model_cfg=model.cfg.to_dict(), crop=asdict(crop),
                                         sampler_mode=getattr(model.cfg, 'sampler_mode', 'zero'),
-                                        volume=spec.to_dict(), collection=vars(args)),
+                                        volume=spec.to_dict(), collection=vars(args),
+                                        failure_banks=([b.provenance() for b in bank_detector.banks]
+                                                       if bank_detector is not None else [])),
                         **{key: np.asarray([row[key] for row in rows])
                            for key in OnPolicyStates.FIELDS + tuple(OnPolicyStates.OPTIONAL) + tuple(OnPolicyStates.ROW_TRACK)},
                         **track_arrays(track))

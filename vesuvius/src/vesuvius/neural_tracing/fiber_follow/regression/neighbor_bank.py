@@ -53,17 +53,21 @@ class NeighborBank:
         self._manifest_sha = None
         self._signature, self._next_refresh = None, 0.
         self._cache, self._trees = OrderedDict(), OrderedDict()
+        self._difficulty = OrderedDict()
+        self._arc_bounds = {}
+        self._spatial_bounds = {}
         self._cached_bytes = 0
         self._pid = os.getpid()
         self.refresh(force=True)
 
     def __getstate__(self):
-        return dict(self.__dict__, _cache=OrderedDict(), _trees=OrderedDict(), _cached_bytes=0,
+        return dict(self.__dict__, _cache=OrderedDict(), _trees=OrderedDict(), _difficulty=OrderedDict(), _cached_bytes=0,
                     _next_refresh=0., _pid=None)
 
     def _worker(self):
         if self._pid != os.getpid():
             self._cache, self._trees = OrderedDict(), OrderedDict()
+            self._difficulty = OrderedDict()
             self._cached_bytes, self._next_refresh = 0, 0.
             self._pid = os.getpid()
 
@@ -137,15 +141,40 @@ class NeighborBank:
         if Path(self.run['ct']).parent.resolve() != Path(spec.ct_zarr).resolve():
             raise ValueError('Negative-bank CT source differs from training')
 
+    def _archive(self, entry):
+        raw = (self.root/entry['path']/'bank.npz').read_bytes()
+        if hashlib.sha256(raw).hexdigest() != entry['bank_sha256']:
+            raise ValueError(f'Negative-bank shard checksum mismatch: {entry["path"]}')
+        return np.load(io.BytesIO(raw), allow_pickle=False)
+
+    def _shard_arc_bounds(self, entry):
+        """Mining anchors need not match a path's nearest annotated winding.
+
+        Cache tiny verified arc envelopes independently of the geometry LRU.
+        Legacy manifests have only anchor ranges, which cannot safely cull paths.
+        """
+        key = entry['path']
+        if key not in self._arc_bounds:
+            with self._archive(entry) as data:
+                ranges = data['arc_ranges']
+                if (ranges.shape != (entry['candidates'], 2) or not np.isfinite(ranges).all()
+                        or np.any(ranges[:,0] >= ranges[:,1])):
+                    raise ValueError(f'Invalid negative-bank arc ranges: {key}')
+                self._arc_bounds[key] = ((float(ranges[:,0].min()), float(ranges[:,1].max()))
+                                         if len(ranges) else (float('inf'), -float('inf')))
+                points = data['points']
+                if points.ndim != 2 or points.shape[1] != 3 or not np.isfinite(points).all():
+                    raise ValueError(f'Invalid negative-bank points: {key}')
+                self._spatial_bounds[key] = ((points.min(0), points.max(0)) if len(points)
+                                             else (np.full(3, np.inf), np.full(3, -np.inf)))
+        return self._arc_bounds[key]
+
     def _shard(self, entry):
         key = entry['path']
         if key in self._cache:
             self._cache.move_to_end(key)
             return self._cache[key]
-        raw = (self.root/key/'bank.npz').read_bytes()
-        if hashlib.sha256(raw).hexdigest() != entry['bank_sha256']:
-            raise ValueError(f'Negative-bank shard checksum mismatch: {key}')
-        with np.load(io.BytesIO(raw), allow_pickle=False) as archive:
+        with self._archive(entry) as archive:
             data = {k:archive[k] for k in ('points','offsets','arc_ranges','train_eligible','anchors')}
             data['draw_eligible'] = archive['draw_eligible'] if 'draw_eligible' in archive else data['train_eligible'].copy()
         p, offsets, ranges, eligible = (data[k] for k in ('points','offsets','arc_ranges','train_eligible'))
@@ -172,6 +201,10 @@ class NeighborBank:
             # Same quarter-voxel arclength interpolation as the target annotation.
             lines[i] = interp_at(line,arc,np.arange(0.,arc[-1]+1e-9,.25))
         data['lines'] = lines
+        self._arc_bounds[key] = ((float(ranges[:,0].min()), float(ranges[:,1].max()))
+                                 if len(ranges) else (float('inf'), -float('inf')))
+        self._spatial_bounds[key] = ((p.min(0), p.max(0)) if len(p)
+                                     else (np.full(3, np.inf), np.full(3, -np.inf)))
         data['bytes'] = sum(v.nbytes for v in data.values() if isinstance(v,np.ndarray))+sum(p.nbytes for p in lines.values())
         while self._cache and self._cached_bytes+data['bytes'] > self.cache_bytes:
             _, old = self._cache.popitem(last=False)
@@ -183,26 +216,78 @@ class NeighborBank:
 
     def paths(self, fiber_index, original_arc, *, half_window=64.):
         """Only validated training paths near this target's original arclength."""
+        return [r['samples'] for r in self.path_records(fiber_index, original_arc, half_window=half_window)]
+
+    def path_records(self, fiber_index, original_arc, *, half_window=64.):
+        """Stable shard/path identifiers accompany exact relationship geometry."""
         self.refresh()
         lo, hi = original_arc-half_window, original_arc+half_window
-        padding = self.run['mining']['block_size']
         lines = []
         for shard in self._by_fiber.get(self.fiber_ids[fiber_index],()):
-            if shard['anchor_range'][0] > hi+padding or shard['anchor_range'][1] < lo-padding:
+            lower, upper = self._shard_arc_bounds(shard)
+            if lower > hi or upper < lo:
                 continue
             data = self._shard(shard)
             for i,line in data['lines'].items():
                 a,b = data['arc_ranges'][i]
                 if a <= hi and b >= lo:
-                    lines.append(line)
+                    # Keep the original polyline: regular resampling can cut
+                    # corners, which matters for continuous contact locations.
+                    lines.append(self._path_record(shard, data, i))
         return lines
 
-    def draw_path(self, rng, *, unique=True, min_length=0.):
+    @staticmethod
+    def _path_record(shard, data, i):
+        a, b = data['offsets'][i:i+2]
+        return dict(points=data['points'][a:b], samples=data['lines'][i], shard=shard['path'], index=int(i))
+
+    def spatial_records(self, fiber_index, world, *, radius=0.):
+        """Trusted relationships intersecting a world-space bounding box.
+
+        A nearby winding may have a distant annotation arc. Spatial queries
+        therefore cannot be restricted to the intended head's progress window.
+        """
+        self.refresh()
+        low, high = np.min(world, axis=0)-radius, np.max(world, axis=0)+radius
+        records = []
+        for shard in self._by_fiber.get(self.fiber_ids[fiber_index], ()):
+            self._shard_arc_bounds(shard)
+            a, b = self._spatial_bounds[shard['path']]
+            if np.any(a > high) or np.any(b < low):
+                continue
+            data = self._shard(shard)
+            for i in data['lines']:
+                record = self._path_record(shard, data, i)
+                p = record['points']
+                if np.all(p.min(0) <= high) and np.all(p.max(0) >= low):
+                    records.append(record)
+        return records
+
+    def draw_path(self, rng, *, unique=True, min_length=0., hard_fraction=0.):
         """Following draws use unique geometry; other roles may use all relationships.
 
         Version-2 length metadata selects fitting paths before loading geometry.
         Old shards use bounded rejection sampling without a full-bank scan.
         """
+        if not np.isfinite(hard_fraction) or not 0 <= hard_fraction <= 1:
+            raise ValueError('Hard bank fraction must be in [0,1]')
+        if hard_fraction and rng.random() < hard_fraction:
+            from .bank_geometry import difficulty_scores, DIFFICULTY_KINDS
+            kind = int(rng.integers(len(DIFFICULTY_KINDS)))
+            proposals = [self.draw_path(rng, unique=unique, min_length=min_length) for _ in range(8)]
+            proposals = [p for p in proposals if p is not None]
+            if not proposals:
+                return None
+            scores = []
+            for fi, line, _ in proposals:
+                key = (fi, hashlib.sha256(line.tobytes()).digest())
+                if key not in self._difficulty:
+                    self._difficulty[key] = difficulty_scores(line, self.fibers[fi])
+                    if len(self._difficulty) > 128:
+                        self._difficulty.popitem(last=False)
+                scores.append(self._difficulty[key][kind])
+            best = np.flatnonzero(np.asarray(scores) >= max(scores)-1e-12)
+            return proposals[int(rng.choice(best))]
         if not self.training:
             return None
         self.refresh()
@@ -281,9 +366,11 @@ class NeighborBank:
             a,b = item['bank_parent_arc_range']
             lines = [interp_at(fiber.points,fiber.s,np.arange(max(0.,a),min(fiber.length,b)+1e-9,.25))]
         else:
-            lines = self.paths(fi,fiber.length-t if reverse else t)
-            for bank in additional_banks:
-                lines.extend(bank.paths(fi,fiber.length-t if reverse else t))
+            lateral, forward = crop.lateral_coords[[0,-1]], crop.forward_coords[[0,-1]]
+            corners = np.array([[a,b,z] for a in lateral for b in lateral for z in forward])
+            world = corners @ np.asarray(item['frame']).T+item['pos']
+            lines = [r['samples'] for bank in (self, *additional_banks)
+                     for r in bank.spatial_records(fi, world)]
         mask_crop = crop if mask_crop is None else mask_crop
         shape = (mask_crop.depth,mask_crop.width,mask_crop.width)
         mask = np.zeros(shape,bool)
