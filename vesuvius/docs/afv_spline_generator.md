@@ -50,7 +50,8 @@ only once it is complete.
 1. **Blocks.** The zone is cut into cubes of `--block-size` voxels, X
    varying fastest; the last cubes along an axis are shorter. Each block is
    read with a margin of 32 voxels, clipped to the volume, so that the
-   polylines of neighbouring blocks overlap.
+   polylines of neighbouring blocks overlap; fibers can therefore reach up
+   to 32 voxels beyond the zone.
 2. **Prediction.** The block is z-scored with its own mean and standard
    deviation (at least 10 grey levels) and predicted in windows of the model
    patch overlapping by half, blended with Gaussian weights. Test-time
@@ -102,6 +103,7 @@ curvature, and the fibers around the gap),
 without CT. Its distances are converted to micrometres with the voxel size
 given by `--voxel-size` and `--native-scale`, 8.64 µm when it is not given.
 
-On one RTX 3090, the 512³ zone above takes 148 s with mirroring and 52 s
-without, reading included, with a peak of 3.5 GB of RAM without mirroring.
-A GPU is strongly recommended: predicting on the CPU is very slow.
+On one RTX 3090, the 512³ zone above gives 5,220 fibers in 8 min 38 s with
+mirroring, reading over HTTPS included, about half of it extending the
+fibers, with a peak of 4.4 GB of RAM. A GPU is strongly recommended:
+predicting on the CPU is very slow.
