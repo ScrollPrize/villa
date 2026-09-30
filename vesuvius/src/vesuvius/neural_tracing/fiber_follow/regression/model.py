@@ -23,7 +23,6 @@ MEMORY_ARCHITECTURE = 'axial_fiber_memory_v2'
 MEMORY_ARCHITECTURE_V1 = 'axial_fiber_memory_v1'  # no probe; loadable, not trained further
 SPATIAL_MEMORY_ARCHITECTURE = 'axial_fiber_memory_v3'
 TRAJECTORY_MEMORY_ARCHITECTURE = 'axial_fiber_memory_v4'
-CANDIDATE_MEMORY_ARCHITECTURE = 'axial_fiber_memory_v5'
 TOKEN_STRIDE = (8, 2, 2)  # z, y, x in input samples
 TOKEN_OFFSET = (3, 0, 0)  # centre of four stride-two stem positions
 IDENTITY_EVIDENCE_WIDTH = 8  # point/mean/min/coverage for seed and history separately
@@ -74,17 +73,9 @@ class DirectConfig:
     recurrent_refinement_steps: int = 0  # v4 shared-decoder passes after the initial proposal
     recurrent_refinement_limit: float = 1.  # maximum lateral update norm per pass
 
-    proposal_step: float = .5  # v5 spatial sampling; coordinates include learned offsets
-    proposal_candidates: int = 32
-    proposal_suppression: float = .5
-    proposal_direction_cost: float = .1
-    proposal_turn_cost: float = .05
-    proposal_loss_weight: float = 1.
-    proposal_offset_weight: float = 1.
-
     @property
     def feature_memory(self):
-        return self.memory_version in (4, 5)
+        return self.memory_version == 4
 
     @property
     def memory_probe(self):
@@ -92,6 +83,8 @@ class DirectConfig:
         return bool(self.memory_slots and not (self.feature_memory and self.feature_memory_revision == 2))
 
     def __post_init__(self):
+        if self.memory_version not in (1, 2, 3, 4):
+            raise ValueError('Unknown memory version')
         if not math.isfinite(self.memory_departed_weight) or self.memory_departed_weight <= 0:
             raise ValueError('Departed probe weight must be finite and positive')
         if self.feature_switch_crop_fraction != -1 and not 0 <= self.feature_switch_crop_fraction < 1:
@@ -131,8 +124,6 @@ class DirectConfig:
         if self.memory_slots:
             if any(not isinstance(v, int) or v < 1 for v in (self.memory_steps, self.memory_stride, self.memory_grad_steps)):
                 raise ValueError('Memory sequence dimensions must be positive integers')
-            if self.memory_version not in (1, 2, 3, 4, 5):
-                raise ValueError('Unknown memory version')
             if not isinstance(self.memory_patch_size, int) or self.memory_patch_size < 5 or self.memory_patch_size % 2 != 1:
                 raise ValueError('Memory patch size must be odd and at least five')
         if self.memory_version == 3:
@@ -165,20 +156,6 @@ class DirectConfig:
             if not math.isfinite(self.feature_replay_weight) or self.feature_replay_weight < 0:
                 raise ValueError('Nonnegative finite replay weight required')
 
-        if self.memory_version == 5:
-            if self.feature_memory_revision != 2:
-                raise ValueError('V5 requires feature memory revision 2')
-            if not math.isfinite(self.proposal_step) or self.proposal_step <= 0:
-                raise ValueError('Proposal spacing must be finite and positive')
-            if not isinstance(self.proposal_candidates, int) or self.proposal_candidates < 1:
-                raise ValueError('Positive candidate count required')
-            if self.proposal_candidates > (2*math.ceil(self.lateral_limit/self.proposal_step)+1)**2:
-                raise ValueError('Candidate count exceeds proposal locations')
-            if any(not math.isfinite(v) or v < 0 for v in (self.proposal_suppression,
-                    self.proposal_direction_cost, self.proposal_turn_cost, self.proposal_loss_weight,
-                    self.proposal_offset_weight)):
-                raise ValueError('Proposal costs and weights must be finite and nonnegative')
-
     @property
     def sequence_weight(self):
         return {3: self.route_sequence_weight}.get(self.memory_version, 0.)
@@ -209,9 +186,6 @@ class DirectConfig:
 
 def build_model(cfg):
     """Explicit architecture dispatch; legacy constructors and weights stay intact."""
-    if cfg.memory_slots and cfg.memory_version == 5:
-        from .candidate_model import CandidateMemoryFollower
-        return CandidateMemoryFollower(cfg)
     if cfg.memory_slots and cfg.memory_version == 4:
         from .trajectory_model import TrajectoryMemoryFollower
         return TrajectoryMemoryFollower(cfg)
@@ -430,7 +404,7 @@ class DirectFollower(nn.Module):
 
     def __init__(self, cfg):
         super().__init__()
-        if cfg.memory_version in (3, 4, 5):
+        if cfg.memory_version in (3, 4):
             raise ValueError('Use build_model(cfg) for memory v3/v4')
         self.cfg = cfg
         c,h = cfg.channels,cfg.hidden

@@ -22,7 +22,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.runloop import (
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume, FiberVolumeSpec
 from vesuvius.neural_tracing.fiber_follow.regression.model import (
     ARCHITECTURE, MEMORY_ARCHITECTURE, MEMORY_ARCHITECTURE_V1, SPATIAL_MEMORY_ARCHITECTURE,
-    TRAJECTORY_MEMORY_ARCHITECTURE, CANDIDATE_MEMORY_ARCHITECTURE, DirectConfig, DirectFollower, build_model,
+    TRAJECTORY_MEMORY_ARCHITECTURE, DirectConfig, DirectFollower, build_model,
 )
 from vesuvius.neural_tracing.fiber_follow.regression.data import (
     IdentityObservationBuilder, IdentitySampling, DirectTracer, LOCATION_SOURCES,
@@ -75,9 +75,8 @@ def compile_training_model(model):
     eager bf16 rounding restores eager-matching gradients (aot_eager was already
     correct, which isolates the fault to inductor code generation).
 
-    Each input variant (batch size, candidates, replay) is a static graph, and
-    unfreezing inherited weights after the V5 proposal warmup recompiles all of
-    them. The default limit of 8 then drops later variants to eager execution.
+    Each input variant (batch size, candidates, replay) is a static graph.
+    Allow enough variants to avoid dropping later ones to eager execution.
     """
     import torch._dynamo.config
     import torch._inductor.config
@@ -100,16 +99,6 @@ def initialize_training_optimizer(model, ema, args, resume=None):
     if reset and resume is None:
         raise ValueError('--reset-optimizer requires --resume')
     parameters = model.parameters()
-    transfer = not reset and model.cfg.memory_version == 5 and (
-        args.init_tracer or (resume and any('freeze_until' in g for g in resume['optimizer']['param_groups'])))
-    if transfer:
-        if args.proposal_warmup_steps < 0 or not 0 < args.proposal_inherited_lr_scale <= 1:
-            raise ValueError('V5 transfer requires nonnegative warmup and inherited LR scale in (0,1]')
-        new, inherited = [], []
-        for name, param in model.named_parameters():
-            (new if name.startswith('proposal_') else inherited).append(param)
-        parameters = [dict(params=new), dict(params=inherited, lr_scale=args.proposal_inherited_lr_scale,
-                                             freeze_until=args.proposal_warmup_steps)]
     if reset:
         model.requires_grad_(True)
     opt = torch.optim.AdamW(parameters, lr=args.lr, weight_decay=1e-4)
@@ -120,26 +109,27 @@ def initialize_training_optimizer(model, ema, args, resume=None):
 
 
 ARCHITECTURES = (ARCHITECTURE, MEMORY_ARCHITECTURE, MEMORY_ARCHITECTURE_V1,
-                 SPATIAL_MEMORY_ARCHITECTURE, TRAJECTORY_MEMORY_ARCHITECTURE, CANDIDATE_MEMORY_ARCHITECTURE)
+                 SPATIAL_MEMORY_ARCHITECTURE, TRAJECTORY_MEMORY_ARCHITECTURE)
 ROUTE_OPTIONS = ('route_grid_step','route_transition_radius','route_transition_cost','route_loss_weight','route_sequence_weight')
 MEMORY_OPTIONS = ('memory_slots','memory_steps','memory_stride','memory_patch_size','memory_grad_steps')
 FEATURE_OPTIONS = ('feature_memory_revision', 'feature_detail_tokens', 'feature_stream_steps', 'feature_replay_weight',
                    'feature_switch_crop_fraction')
-PROPOSAL_OPTIONS = ('proposal_step', 'proposal_candidates', 'proposal_suppression', 'proposal_direction_cost',
-                    'proposal_turn_cost', 'proposal_loss_weight', 'proposal_offset_weight')
 MEMORY_GRAD_CLIP = 5.
 REST_GRAD_CLIP = 20.
 
 
 def checkpoint_config(ck):
-    model_cfg = dict(ck['model_cfg'])
+    if ck['architecture'] not in ARCHITECTURES:
+        raise ValueError('Unsupported checkpoint architecture')
+    # Older shared configs serialized unused proposal options for every model.
+    model_cfg = {k: v for k, v in ck['model_cfg'].items() if not k.startswith('proposal_')}
     if model_cfg.get('memory_version') == 4 and 'feature_memory_revision' not in model_cfg:
         raise ValueError('This checkpoint is the superseded patch-memory v4; start feature-memory v4 from v2/v3 weights')
     if ck['architecture'] == MEMORY_ARCHITECTURE_V1:
         model_cfg.setdefault('memory_version', 1)  # saved before versions were recorded
     cfg = DirectConfig(**model_cfg)
     expected = ({1: MEMORY_ARCHITECTURE_V1, 2: MEMORY_ARCHITECTURE, 3: SPATIAL_MEMORY_ARCHITECTURE,
-                 4: TRAJECTORY_MEMORY_ARCHITECTURE, 5: CANDIDATE_MEMORY_ARCHITECTURE}[cfg.memory_version]
+                 4: TRAJECTORY_MEMORY_ARCHITECTURE}[cfg.memory_version]
                 if cfg.memory_slots else ARCHITECTURE)
     if ck['architecture'] != expected:
         raise ValueError('Checkpoint architecture and memory configuration disagree')
@@ -354,10 +344,7 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
     if total < 1:
         raise ValueError('An update needs at least one state')
     for group in opt.param_groups:
-        group['lr'] = lr*group.get('lr_scale', 1.)
-        if 'freeze_until' in group:
-            for param in group['params']:
-                param.requires_grad_(step > group['freeze_until'])
+        group['lr'] = lr
     opt.zero_grad(set_to_none=True)
     sums = dict(loss=0., geometry=0., confidence_loss=0., error_sum=0., geometry_count=0.,
                 correct_count=0., confidence_count=0.)
@@ -411,13 +398,6 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
                     accumulate(memory, 'route_loss', route_loss)
                     for key in ('route_count','route_error_sum'):
                         accumulate(memory,key,terms[key])
-                if 'proposal_per_state' in terms:
-                    proposal_loss = terms['proposal_per_state'].sum()/total
-                    loss = loss+proposal_loss
-                    accumulate(memory, 'proposal_loss', proposal_loss)
-                    for key, value in terms.items():
-                        if key.startswith('proposal_') and not key.endswith('_per_state'):
-                            accumulate(memory, key, value)
                 if 'identity_per_state' in terms:
                     identity_loss = terms['identity_per_state'].sum()/total
                     loss = loss + identity_weight*identity_loss
@@ -580,17 +560,15 @@ def build_parser():
     ap.add_argument('--decoder-layers', type=int, default=4)
     ap.add_argument('--axial-layers', type=int, default=4)
     ap.add_argument('--hidden', type=int, default=128)
-    ap.add_argument('--memory-version', type=int, choices=(2,3,4,5), default=2,
-                    help='2: recurrent follower; 3: spatial lattice route; 4: continuous regression; 5: continuous candidate routes (4/5 require --no-correction)')
+    ap.add_argument('--memory-version', type=int, choices=(2,3,4), default=2,
+                    help='2: recurrent follower; 3: spatial lattice route; 4: continuous regression (requires --no-correction)')
     ap.add_argument('--trajectory-sequence-weight', type=float, default=DirectConfig.trajectory_sequence_weight,
                     help='Obsolete v4 prefix loss; must be zero for feature-memory streams')
     ap.add_argument('--feature-sequence-length', type=int, default=DirectConfig.feature_sequence_length,
                     help='V4 decisions per gradient chunk; microbatch counts crops across time and traces')
-    for name in (*FEATURE_OPTIONS, *PROPOSAL_OPTIONS):
+    for name in FEATURE_OPTIONS:
         default = getattr(DirectConfig, name)
         ap.add_argument('--'+name.replace('_', '-'), type=type(default), default=default)
-    ap.add_argument('--proposal-warmup-steps', type=int, default=500, help='V5 transfer: freeze inherited weights for these initial updates')
-    ap.add_argument('--proposal-inherited-lr-scale', type=float, default=.1, help='V5 transfer learning rate multiplier for inherited weights')
     ap.add_argument('--feature-memory-grid', type=int, nargs=3, default=DirectConfig.feature_memory_grid,
                     help='V4 pooled main-encoder spatial grid, depth height width')
     ap.add_argument('--route-grid-step', type=float, default=DirectConfig.route_grid_step)
@@ -706,11 +684,8 @@ def main(argv=None):
     progress(f'Starting training: device={args.device}, workers={args.workers}')
     if args.resume and args.init_tracer:
         raise ValueError('--init-tracer starts a new run and cannot be combined with --resume')
-    if args.reset_optimizer:
-        if not args.resume:
-            raise ValueError('--reset-optimizer requires --resume')
-        args.proposal_warmup_steps = 0
-        args.proposal_inherited_lr_scale = 1.
+    if args.reset_optimizer and not args.resume:
+        raise ValueError('--reset-optimizer requires --resume')
     if any(not math.isfinite(v) or v < 0 for v in (args.memory_grad_clip, args.rest_grad_clip)):
         raise ValueError('Gradient clipping limits must be finite and nonnegative (0 disables clipping)')
     if not math.isfinite(args.fresh_fraction) or not 0 <= args.fresh_fraction <= 1:
@@ -748,23 +723,13 @@ def main(argv=None):
                        feature_sequence_length=args.feature_sequence_length, feature_memory_grid=args.feature_memory_grid,
                        recurrent_refinement_steps=args.recurrent_refinement_steps,
                        **refinement_limit,
-                       **{k:getattr(args,k) for k in (*ROUTE_OPTIONS, *FEATURE_OPTIONS, *PROPOSAL_OPTIONS)})
+                       **{k:getattr(args,k) for k in (*ROUTE_OPTIONS, *FEATURE_OPTIONS)})
     args.recurrent_refinement_limit = cfg.recurrent_refinement_limit
     initialized = None
     resume = None
     if args.init_tracer:
         initialized,_,_,_,_ = load_checkpoint(args.init_tracer,args.device)
-        if args.memory_version == 5 and initialized.cfg.memory_version == 4:
-            from .candidate_model import initialize_candidate_model
-            cfg = replace(initialized.cfg, memory_version=5,
-                          recurrent_refinement_steps=args.recurrent_refinement_steps,
-                          **refinement_limit,
-                          **{k: getattr(args, k) for k in PROPOSAL_OPTIONS})
-            initialized = initialize_candidate_model(initialized, cfg).to(memory_format=conv_memory_format(args.device))
-            progress('Initialized v5 from v4 EMA; continuous proposal and identity heads start fresh')
-        elif args.memory_version == 5 and initialized.cfg.memory_version != 5:
-            raise ValueError('V5 initialization requires v4 revision 2 or an existing v5 checkpoint')
-        elif args.memory_version == 4 and not initialized.cfg.feature_memory:
+        if args.memory_version == 4 and not initialized.cfg.feature_memory:
             cfg = replace(initialized.cfg, memory_version=4, correction=False, route_refinement_radius=None,
                           trajectory_sequence_weight=args.trajectory_sequence_weight,
                           feature_sequence_length=args.feature_sequence_length, feature_memory_grid=args.feature_memory_grid,
@@ -794,7 +759,7 @@ def main(argv=None):
         if args.recurrent_refinement_steps and args.recurrent_refinement_steps != cfg.recurrent_refinement_steps:
             raise ValueError('Adding recurrent refinement to a checkpoint requires upgrade_refinement')
         for key in (*MEMORY_OPTIONS,'memory_version',*ROUTE_OPTIONS,'trajectory_sequence_weight',
-                    'feature_sequence_length','feature_memory_grid','recurrent_refinement_steps','recurrent_refinement_limit',*FEATURE_OPTIONS,*PROPOSAL_OPTIONS):
+                    'feature_sequence_length','feature_memory_grid','recurrent_refinement_steps','recurrent_refinement_limit',*FEATURE_OPTIONS):
             setattr(args, key, getattr(cfg, key))
         if args.direction_inputs and not cfg.direction_inputs:
             initialized = add_direction_inputs(initialized)
@@ -900,8 +865,6 @@ def main(argv=None):
                    'decision_fraction','bank_following_probability','fresh_fraction','route_refinement_radius',
                    'n_commit','memory_stride','memory_departed_weight','feature_switch_crop_fraction',
                    'recurrent_refinement_limit'}
-        if args.reset_optimizer:
-            ignored.update(('proposal_warmup_steps', 'proposal_inherited_lr_scale'))
         if not cfg.feature_memory:
             ignored.update(('trajectory_sequence_weight', 'feature_sequence_length', 'feature_memory_grid'))
         defaults = build_parser()
@@ -980,8 +943,7 @@ def main(argv=None):
                         training_options=vars(args), model_cfg=cfg.to_dict()))
     log.record(dict(step=done, event='optimizer_configuration', reset=args.reset_optimizer,
                     lr_restart_step=lr_restart_step, optimizer_state_entries=len(opt.state),
-                    groups=[dict(parameters=len(g['params']), lr_scale=g.get('lr_scale', 1.),
-                                 freeze_until=g.get('freeze_until', 0)) for g in opt.param_groups],
+                    groups=[dict(parameters=len(g['params'])) for g in opt.param_groups],
                     trainable_parameters=sum(p.numel() for p in model.parameters() if p.requires_grad)))
     log.record(dict(step=done,event='identity_sampling',architecture=model.architecture,
         source_sampling=dict(fresh=args.fresh_fraction,recent=1-args.fresh_fraction),

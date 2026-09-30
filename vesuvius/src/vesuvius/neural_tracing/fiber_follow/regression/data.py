@@ -409,12 +409,12 @@ class IdentityObservationBuilder(ObservationBuilder):
                 distance = cKDTree(fiber.points).query(np.stack([o['pos'] for o in observations]))[0]
                 item['identity_observable'] |= bool((distance <= s.on_fiber_tolerance).any())
         item['identity_curve'] = curve
-        if cfg.memory_slots and cfg.memory_version in (3, 5):
+        if cfg.memory_slots and cfg.memory_version == 3:
             from .spatial_supervision import prepare_route_targets
             prepare_route_targets(item, fiber, cfg)
         visible = visible_points(curve,cfg.fine)
         item['identity_label_z'] = (curve[visible] @ frame.T+pos)[:,2] if visible.any() else pos[2:3]
-        if cfg.memory_version in (3, 4, 5) and 'pair_observation_seed' in item:
+        if cfg.memory_version in (3, 4) and 'pair_observation_seed' in item:
             # Matched local inputs stay identical after augmentation as well;
             # the earlier observations must supply the distinguishing evidence.
             rng = np.random.default_rng(item['pair_observation_seed'])
@@ -431,7 +431,7 @@ class IdentityObservationBuilder(ObservationBuilder):
     def footprint_allowed(self,item,band):
         # CT is restricted to the main crop, whose footprint FollowDataset checks.
         # Also reject matched labels if their distinguishing seed is not visible.
-        if item.get('source') == 5 and self.cfg.memory_version not in (3, 4, 5) and not item['visible_seed_mask'].any():
+        if item.get('source') == 5 and self.cfg.memory_version not in (3, 4) and not item['visible_seed_mask'].any():
             return False
         if self.cfg.memory_slots:
             from .memory_data import memory_allowed
@@ -501,7 +501,7 @@ class IdentityObservationBuilder(ObservationBuilder):
         batch.update(self.identity_targets(items))
         batch['identity_observable'] = torch.tensor([i.get('identity_observable',True) for i in items])
         batch['bank_tail_length'] = torch.tensor([i.get('bank_tail_length',0.) for i in items],dtype=torch.float32)
-        if self.cfg.memory_slots and self.cfg.memory_version in (3, 5):
+        if self.cfg.memory_slots and self.cfg.memory_version == 3:
             for key in ('route_ab','route_mask'):
                 batch[key] = torch.from_numpy(np.stack([i[key] for i in items]))
         if self.cfg.memory_probe and self.cfg.memory_version >= 2:

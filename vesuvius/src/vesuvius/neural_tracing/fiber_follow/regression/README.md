@@ -1,9 +1,5 @@
 # Axial fiber follower
 
-For the optional continuous-candidate architecture with revision-2 feature
-memory, fine spatial proposals and two refinement passes, see
-[candidate memory v5](CANDIDATE_MEMORY.md). Existing architecture defaults remain.
-
 For continuous path prediction with observation-only memory, memory-conditioned
 fine features, curve-specific confidence and one shared-decoder refinement pass,
 see [trajectory memory v4](TRAJECTORY_MEMORY.md). Its launcher starts a fresh

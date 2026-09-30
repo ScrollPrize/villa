@@ -204,7 +204,7 @@ def format_training_log(row):
     step = f"Step {row['step']:,}" if 'step' in row else 'Training'
     if row.get('event') == 'resume_configuration':
         options, cfg = row.get('training_options', {}), row.get('model_cfg', {})
-        observation_memory = cfg.get('memory_version') in (4, 5) and cfg.get('feature_memory_revision') == 2
+        observation_memory = cfg.get('memory_version') == 4 and cfg.get('feature_memory_revision') == 2
         memory = ('observation memory (no probes)' if observation_memory else
                   f"departed probe loss {cfg.get('memory_departed_weight', 1.):g}x")
         return (f"{step} | resumed {row['checkpoint']}\n"

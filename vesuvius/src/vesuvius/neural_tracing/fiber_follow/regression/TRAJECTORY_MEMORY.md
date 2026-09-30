@@ -99,7 +99,7 @@ OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 OPENBLAS_NUM_THREADS=1 \
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=../../.. \
 ../../../../.venv/bin/python -m pytest \
   tests/test_detailed_memory.py tests/test_trajectory_memory.py \
-  tests/test_recurrent_refinement.py tests/test_candidate_memory.py \
+  tests/test_recurrent_refinement.py \
   tests/test_point_logging.py tests/test_sampling_balance.py \
   -q -o cache_dir=/tmp/fiber-observation-pytest
 ```

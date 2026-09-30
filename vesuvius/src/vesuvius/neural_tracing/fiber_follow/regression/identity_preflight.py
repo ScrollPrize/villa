@@ -29,7 +29,7 @@ def main(argv=None):
     ap.add_argument('--batches',type=int,default=4)
     ap.add_argument('--forward',action='store_true')
     ap.add_argument('--direction-inputs',action='store_true')
-    ap.add_argument('--memory-version',type=int,choices=(2,3,4,5),default=2)
+    ap.add_argument('--memory-version',type=int,choices=(2,3,4),default=2)
     ap.add_argument('--memory-slots',type=int,default=0)
     ap.add_argument('--memory-steps',type=int,default=32)
     ap.add_argument('--memory-stride',type=int,default=4)
@@ -42,9 +42,7 @@ def main(argv=None):
     torch.set_num_threads(4);torch.manual_seed(0)
     cfg=DirectConfig(direction_inputs=args.direction_inputs,memory_version=args.memory_version,memory_slots=args.memory_slots,memory_steps=args.memory_steps,
                      memory_stride=args.memory_stride,memory_patch_size=args.memory_patch_size,
-                     memory_grad_steps=args.memory_grad_steps,correction=args.memory_version not in (4,5),
-                     feature_memory_revision=2 if args.memory_version == 5 else 1,
-                     recurrent_refinement_steps=2 if args.memory_version == 5 else 0)
+                     memory_grad_steps=args.memory_grad_steps,correction=args.memory_version != 4)
     spec=FiberVolumeSpec(args.fiber_zarrs,ct_zarr=args.ct,ct_level=0,ct_grid_scale=4.,inputs='ct+presence')
     band=ZBand(45000/spec.grid_scale,48500/spec.grid_scale)
     fibers,_=split_fibers(load_fibers(args.fibers,grid_scale=spec.grid_scale),band)

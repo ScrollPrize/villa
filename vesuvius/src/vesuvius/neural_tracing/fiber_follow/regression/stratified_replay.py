@@ -100,8 +100,6 @@ class StratifiedReplay:
                 output = model(batch['x'], batch['hist'], batch['hmask'], memory=state, **kwargs)
                 terms = loss_terms(output, batch, raw.cfg, tolerance, n_commit=n_commit)
                 loss = terms['geometry_per_state'].sum()+confidence_weight*terms['confidence_per_state'].sum()
-                if 'proposal_per_state' in terms:
-                    loss = loss+terms['proposal_per_state'].sum()
                 if 'candidate_per_state' in terms:
                     loss = loss+candidate_weight*terms['candidate_per_state'].sum()
                 if 'memory_probe' in output and 'memory_target_identity' in batch:

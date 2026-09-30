@@ -188,9 +188,6 @@ def loss_terms(output, batch, cfg, tolerance=1.5, *, n_commit=None, identity_tem
         valid = mask.any(-1)
         terms['candidate_per_state'] = per_candidate.sum(-1)/valid.sum(-1).clamp_min(1)
         terms['candidate_states'] = valid.any(-1).sum()
-    if 'proposal_logits' in output:
-        from .candidate_supervision import proposal_loss_terms
-        terms.update(proposal_loss_terms(output, batch, cfg))
     if 'route_logits' in output:
         from .spatial_supervision import route_loss_terms
         terms.update(route_loss_terms(output,batch,cfg))

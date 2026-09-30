@@ -624,3 +624,85 @@ def test_tight_blocks_match_rotation_invariant_blocks_at_array_edges():
     expected = reference(items)
     assert torch.equal(image, expected)
     assert 0 < float((expected != 0).float().mean()) < 1
+
+
+def test_fresh_optimizer_resume_preserves_weights_and_future_resume_schedule():
+    from vesuvius.neural_tracing.fiber_follow.regression.train import initialize_training_optimizer
+    from vesuvius.neural_tracing.fiber_follow.shared.runloop import lr_at
+    args = SimpleNamespace(reset_optimizer=False, lr=.0003)
+    model = DirectFollower(config())
+    ema = copy.deepcopy(model)
+    opt, _, _ = initialize_training_optimizer(model, ema, args)
+    for p in model.parameters():
+        p.grad = torch.ones_like(p)
+    opt.step()
+    ck = dict(model=copy.deepcopy(model.state_dict()), ema=copy.deepcopy(ema.state_dict()),
+              optimizer=opt.state_dict(), rng=training_rng_state(), step=3000)
+    assert len(ck['optimizer']['param_groups']) == 1 and ck['optimizer']['state']
+    expected_rng = torch.rand(3)
+    reset_model = DirectFollower(config()).requires_grad_(False)
+    reset_ema = copy.deepcopy(reset_model)
+    args.reset_optimizer = True
+    fresh, done, origin = initialize_training_optimizer(reset_model, reset_ema, args, ck)
+    assert done == origin == 3000
+    assert len(fresh.param_groups) == 1 and not fresh.state
+    assert all(p.requires_grad for p in reset_model.parameters())
+    torch.testing.assert_close(torch.rand(3), expected_rng, rtol=0, atol=0)
+    for actual, saved in ((reset_model, ck['model']), (reset_ema, ck['ema'])):
+        for key, value in actual.state_dict().items():
+            torch.testing.assert_close(value, saved[key], rtol=0, atol=0)
+    fresh.param_groups[0]['lr'] = lr_at(done+1-origin, args.lr, 500, 100000-origin)
+    assert fresh.param_groups[0]['lr'] == pytest.approx(.0003/500)
+    for p in reset_model.parameters():
+        p.grad = torch.ones_like(p)
+    fresh.step()
+    after = dict(model=reset_model.state_dict(), ema=reset_ema.state_dict(),
+                 optimizer=fresh.state_dict(), rng=training_rng_state(), step=3001,
+                 lr_restart_step=origin)
+    args.reset_optimizer = False
+    restored = DirectFollower(config())
+    restored_opt, done, origin = initialize_training_optimizer(restored, copy.deepcopy(restored), args, after)
+    assert done == 3001 and origin == 3000 and len(restored_opt.param_groups) == 1
+    assert len(restored_opt.state) == len(fresh.state)
+    assert lr_at(done+1-origin, args.lr, 500, 100000-origin) == pytest.approx(.0003*2/500)
+
+
+@pytest.mark.parametrize('version', [1, 2, 3, 4])
+def test_checkpoint_load_ignores_retired_shared_proposal_options(tmp_path, version):
+    from vesuvius.neural_tracing.fiber_follow.regression.model import build_model
+    cfg = replace(config(), memory_version=version, memory_slots=4, correction=False,
+                  feature_memory_revision=2)
+    model = build_model(cfg)
+    spec = FiberVolumeSpec('unused', ct_zarr='unused', ct_level=0, ct_grid_scale=4., inputs='ct+presence')
+    path = tmp_path/'last.pt'
+    save_checkpoint(path, model, model, spec, SampleConfig(crop=cfg.fine, n_history=cfg.n_history), {})
+    ck = torch.load(path, weights_only=False)
+    # The old shared dataclass wrote these fields even for models that never used them.
+    ck['model_cfg'].update(proposal_step=.5, proposal_candidates=32, proposal_suppression=.5,
+                           proposal_direction_cost=.1, proposal_turn_cost=.05,
+                           proposal_loss_weight=1., proposal_offset_weight=1.)
+    torch.save(ck, path)
+    restored, *_ = load_checkpoint(path, 'cpu')
+    assert restored.cfg == cfg
+    for key, value in model.state_dict().items():
+        torch.testing.assert_close(restored.state_dict()[key], value, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize('slots', [0, 4])
+def test_removed_memory_version_rejected_without_fallback(slots):
+    from vesuvius.neural_tracing.fiber_follow.regression.train import checkpoint_config
+    with pytest.raises(ValueError, match='Unknown memory version'):
+        replace(config(), memory_version=5, memory_slots=slots)
+    with pytest.raises(ValueError, match='Unsupported checkpoint architecture'):
+        checkpoint_config(dict(architecture='axial_fiber_memory_v5', model_cfg={}))
+
+
+@pytest.mark.parametrize('option', [['--memory-version', '5'], ['--proposal-step', '.5'],
+                                  ['--proposal-warmup-steps', '500']])
+def test_removed_model_cli_options_rejected(option):
+    from vesuvius.neural_tracing.fiber_follow.regression.train import build_parser
+    required = ['--name', 'test', '--fiber-zarrs', '/tmp/presence', '--fibers', '/tmp/fibers',
+                '--ct', '/tmp/ct', '--manifest', '/tmp/seeds.json']
+    with pytest.raises(SystemExit) as error:
+        build_parser().parse_args(required+option)
+    assert error.value.code == 2
