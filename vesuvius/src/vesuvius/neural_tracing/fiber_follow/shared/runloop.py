@@ -119,18 +119,23 @@ def restore_training_rng(state):
         torch.cuda.set_rng_state_all([s.cpu() for s in state['cuda']])
 
 
-def resume_training(ck, model, ema, opt):
+def resume_training(ck, model, ema, opt, *, reset_optimizer=False):
     """Restore weights, EMA, optimizer and RNG from a resumable checkpoint.
 
     Only ``ckpt_*.pt``/``last.pt`` written by training carry optimizer state;
     collector snapshots do not. Loader workers restart their own streams, so
     the sampled data sequence after a resume differs from an uninterrupted run.
+    With reset_optimizer, retain the supplied fresh optimizer instead of the
+    saved moments/groups. Model weights, EMA, RNG and update count still resume.
     Returns the completed update count and replay samples seen so far.
     """
     if 'optimizer' not in ck:
         raise ValueError('Checkpoint holds no optimizer state; resume from ckpt_*.pt or last.pt of a run')
+    if reset_optimizer and opt.state:
+        raise ValueError('Optimizer reset requires a fresh optimizer with empty state')
     model.load_state_dict(ck['model'])
     ema.load_state_dict(ck['ema'])
-    opt.load_state_dict(ck['optimizer'])
+    if not reset_optimizer:
+        opt.load_state_dict(ck['optimizer'])
     restore_training_rng(ck['rng'])
     return int(ck['step']), int(ck.get('replay_seen', 0))

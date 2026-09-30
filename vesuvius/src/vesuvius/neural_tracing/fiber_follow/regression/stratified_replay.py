@@ -30,6 +30,21 @@ class StratifiedReplay:
     def __init__(self):
         self.streams = {}
         self.pending = []
+        self._compiled = None
+
+    def transition(self, raw, compiled):
+        """The writer transition; compiled when the training forward is.
+
+        A replay runs up to feature_stream_steps small transitions in sequence,
+        so eager execution is dominated by kernel launches. Batch size and
+        state shapes are fixed, so a handful of static graphs cover every call.
+        """
+        base = getattr(raw, 'replay_transition', raw.recurrent_memory.observe_tokens)
+        if not compiled:
+            return base
+        if self._compiled is None or self._compiled[0] is not raw:
+            self._compiled = (raw, torch.compile(base, dynamic=False))
+        return self._compiled[1]
 
     def record(self, cpu, output):
         if 'replay_select' not in cpu:
@@ -60,6 +75,7 @@ class StratifiedReplay:
         raw = getattr(model, '_orig_mod', model)
         weight = raw.cfg.feature_replay_weight
         metrics = dict(replay_endpoints=0, replay_observations=0, replay_encoder_crops=0, replay_loss=0.)
+        transition = self.transition(raw, compiled=raw is not model)
         while self.pending:
             rows = self.pending.pop(0)
             if len(rows) < 2 or not weight:
@@ -77,7 +93,6 @@ class StratifiedReplay:
                     else:
                         features = row['features']
                     pose = move_batch(row['pose'], device)
-                    transition = getattr(raw, 'replay_transition', raw.recurrent_memory.observe_tokens)
                     state, _ = transition(*features, pose, state)
                     state = {k: v for k, v in state.items() if k != 'probe'}
                 batch = move_batch(rows[-1]['batch'], device)
@@ -85,6 +100,8 @@ class StratifiedReplay:
                 output = model(batch['x'], batch['hist'], batch['hmask'], memory=state, **kwargs)
                 terms = loss_terms(output, batch, raw.cfg, tolerance, n_commit=n_commit)
                 loss = terms['geometry_per_state'].sum()+confidence_weight*terms['confidence_per_state'].sum()
+                if 'proposal_per_state' in terms:
+                    loss = loss+terms['proposal_per_state'].sum()
                 if 'candidate_per_state' in terms:
                     loss = loss+candidate_weight*terms['candidate_per_state'].sum()
                 if 'memory_target_identity' in batch:
@@ -92,7 +109,8 @@ class StratifiedReplay:
                     loss = loss+memory_probe_weight*(probe['memory_identity_per_state'].sum()+probe['memory_offset_per_state'].sum())
                 loss = loss*(weight/total)
             loss.backward()
-            metrics['replay_loss'] += float(loss.detach())
+            # Stays on the device; the training update resolves all sums with one transfer.
+            metrics['replay_loss'] = metrics['replay_loss']+loss.detach().double()
             metrics['replay_endpoints'] += 1
             metrics['replay_observations'] += len(rows)
             metrics['replay_encoder_crops'] += 1

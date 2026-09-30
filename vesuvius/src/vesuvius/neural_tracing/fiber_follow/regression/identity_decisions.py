@@ -24,7 +24,7 @@ def decision_pair(bank, sample, model, rng, *, attempts=32):
     if not tails:
         return None
     tail = float(rng.choice(tails))
-    spatial = model.memory_slots and model.memory_version in (3, 4)
+    spatial = model.memory_slots and model.memory_version in (3, 4, 5)
     reference_gap = (max(8.,model.fine.behind*model.fine.spacing+
                          model.memory_patch_size*model.fine.spacing/2+2.) if spatial else 8.)
     horizon = sample.future_s[-1]

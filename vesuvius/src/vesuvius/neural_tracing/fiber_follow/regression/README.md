@@ -1,5 +1,9 @@
 # Axial fiber follower
 
+For the optional continuous-candidate architecture with revision-2 feature
+memory, fine spatial proposals and two refinement passes, see
+[candidate memory v5](CANDIDATE_MEMORY.md). Existing architecture defaults remain.
+
 For the single-pass continuous decoder with direct attention to persistent
 main-encoder feature memory and streamed training, see [trajectory memory v4](TRAJECTORY_MEMORY.md). It is selected
 explicitly and does not change the v2 default or existing v3 runs.

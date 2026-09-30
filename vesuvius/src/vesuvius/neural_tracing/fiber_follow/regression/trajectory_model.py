@@ -20,7 +20,7 @@ class TrajectoryMemoryFollower(DirectFollower):
     def __init__(self, cfg):
         if cfg.memory_version != 4 or cfg.correction:
             raise ValueError('TrajectoryMemoryFollower requires memory v4 without correction')
-        super().__init__(replace(cfg, memory_version=2, recurrent_refinement_steps=0))
+        super().__init__(replace(cfg, memory_version=2, recurrent_refinement_steps=0, feature_switch_crop_fraction=-1.))
         self.cfg, self.architecture = cfg, TRAJECTORY_MEMORY_ARCHITECTURE
         self.recurrent_memory = FeatureMemory(cfg, self.encoder.token_xyz)
         if cfg.feature_memory_revision == 2:
@@ -106,14 +106,8 @@ class TrajectoryMemoryFollower(DirectFollower):
         return self.confidence_memory_head(torch.cat((query, retrieved, query*retrieved), -1))[..., 0].float()
 
     def predict(self, ctx, hist, candidates=None):
-        cfg, state = self.cfg, ctx['recurrent']
-        # Express retained spatial evidence in the actual crop frame, including roll.
-        query_state = dict(state, frame=ctx.get('query_frame', state['frame']))
-        identity, identity_padding = self.recurrent_memory.read_tokens(query_state)
-        if cfg.feature_memory_revision == 2:
-            ctx.update(identity_tokens=identity, identity_padding=identity_padding)
-        memory = torch.cat((ctx['memory'], identity.to(ctx['memory'].dtype)), 1)
-        padding = torch.cat((ctx['padding'], identity_padding), 1)
+        cfg = self.cfg
+        memory, padding = self.decoder_memory(ctx)
 
         # These locations initialize feature queries, not output constraints.
         # Forward distance distinguishes the queries; self-attention couples
@@ -133,6 +127,24 @@ class TrajectoryMemoryFollower(DirectFollower):
         first = first*(first_limit/first.norm(dim=-1, keepdim=True).clamp_min(1e-8)).clamp(max=1.)
         lateral = torch.cat((first, lateral[:, 1:]), 1)
         points = torch.cat((lateral, reference[..., 2:]), -1)
+        return self.finish_prediction(ctx, decoded, points, projected if cfg.recurrent_refinement_steps else None,
+                                      padding, candidates)
+
+    def decoder_memory(self, ctx):
+        cfg, state = self.cfg, ctx['recurrent']
+        # Express retained spatial evidence in the actual crop frame, including roll.
+        query_state = dict(state, frame=ctx.get('query_frame', state['frame']))
+        identity, identity_padding = self.recurrent_memory.read_tokens(query_state)
+        if cfg.feature_memory_revision == 2:
+            ctx.update(identity_tokens=identity, identity_padding=identity_padding)
+        memory = torch.cat((ctx['memory'], identity.to(ctx['memory'].dtype)), 1)
+        padding = torch.cat((ctx['padding'], identity_padding), 1)
+
+        return memory, padding
+
+    def finish_prediction(self, ctx, decoded, points, projected, padding, candidates=None):
+        cfg = self.cfg
+        first_limit = math.sqrt(max(0., cfg.max_recovery_distance**2-cfg.future_step**2))
         initial = points
         refinements = [points]
         for stage in range(cfg.recurrent_refinement_steps):
@@ -145,7 +157,7 @@ class TrajectoryMemoryFollower(DirectFollower):
             first = lateral[:, :1]
             first = first*(first_limit/first.norm(dim=-1, keepdim=True).clamp_min(1e-8)).clamp(max=1.)
             lateral = torch.cat((first, lateral[:, 1:]), 1)
-            points = torch.cat((lateral, reference[..., 2:]), -1)
+            points = torch.cat((lateral, initial[..., 2:]), -1)
             refinements.append(points)
         logits = self.confidence_logits(ctx, decoded, points)
         out = dict(points=points, initial_points=initial, refinement_points=torch.stack(refinements, 1),

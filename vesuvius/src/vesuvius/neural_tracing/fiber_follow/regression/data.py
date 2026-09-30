@@ -56,7 +56,7 @@ class ObservationBuilder:
                  seed_mask=stack('visible_seed_mask'),seed_age=stack('visible_seed_age'),
                  seed_tangent=stack('visible_seed_tangent'))
         if self.cfg.memory_slots:
-            if self.cfg.memory_version == 4:
+            if self.cfg.feature_memory:
                 x['query_frame'] = stack('frame')
                 x['query_position'] = stack('pos')
                 here = [bool(i.get('seed_valid', False)) and
@@ -323,7 +323,7 @@ class IdentityObservationBuilder(ObservationBuilder):
         for _ in range(3):
             item = wrong_continuation(self.continuation_bank or self.negative_bank,sample_cfg,rng,
                                       tail_length_range=self.sampling.memory_switch_tail,prefer_long=True,
-                                      prefix_length=(self.cfg.feature_stream_steps if self.cfg.memory_version == 4 and self.cfg.feature_memory_revision == 2
+                                      prefix_length=(self.cfg.feature_stream_steps if self.cfg.feature_memory and self.cfg.feature_memory_revision == 2
                                                      else self.cfg.memory_steps)*self.cfg.memory_stride,
                                       track_stride=self.cfg.memory_stride)
             if item is not None:
@@ -409,12 +409,12 @@ class IdentityObservationBuilder(ObservationBuilder):
                 distance = cKDTree(fiber.points).query(np.stack([o['pos'] for o in observations]))[0]
                 item['identity_observable'] |= bool((distance <= s.on_fiber_tolerance).any())
         item['identity_curve'] = curve
-        if cfg.memory_slots and cfg.memory_version == 3:
+        if cfg.memory_slots and cfg.memory_version in (3, 5):
             from .spatial_supervision import prepare_route_targets
             prepare_route_targets(item, fiber, cfg)
         visible = visible_points(curve,cfg.fine)
         item['identity_label_z'] = (curve[visible] @ frame.T+pos)[:,2] if visible.any() else pos[2:3]
-        if cfg.memory_version in (3, 4) and 'pair_observation_seed' in item:
+        if cfg.memory_version in (3, 4, 5) and 'pair_observation_seed' in item:
             # Matched local inputs stay identical after augmentation as well;
             # the earlier observations must supply the distinguishing evidence.
             rng = np.random.default_rng(item['pair_observation_seed'])
@@ -431,7 +431,7 @@ class IdentityObservationBuilder(ObservationBuilder):
     def footprint_allowed(self,item,band):
         # CT is restricted to the main crop, whose footprint FollowDataset checks.
         # Also reject matched labels if their distinguishing seed is not visible.
-        if item.get('source') == 5 and self.cfg.memory_version not in (3, 4) and not item['visible_seed_mask'].any():
+        if item.get('source') == 5 and self.cfg.memory_version not in (3, 4, 5) and not item['visible_seed_mask'].any():
             return False
         if self.cfg.memory_slots:
             from .memory_data import memory_allowed
@@ -501,12 +501,12 @@ class IdentityObservationBuilder(ObservationBuilder):
         batch.update(self.identity_targets(items))
         batch['identity_observable'] = torch.tensor([i.get('identity_observable',True) for i in items])
         batch['bank_tail_length'] = torch.tensor([i.get('bank_tail_length',0.) for i in items],dtype=torch.float32)
-        if self.cfg.memory_slots and self.cfg.memory_version == 3:
+        if self.cfg.memory_slots and self.cfg.memory_version in (3, 5):
             for key in ('route_ab','route_mask'):
                 batch[key] = torch.from_numpy(np.stack([i[key] for i in items]))
         if self.cfg.memory_slots and self.cfg.memory_version >= 2:
             from .memory_data import memory_targets
-            targets = ([dict(i, memory_warm=True) for i in items] if self.cfg.memory_version == 4 else items)
+            targets = ([dict(i, memory_warm=True) for i in items] if self.cfg.feature_memory else items)
             batch.update(memory_targets(targets, self.cfg))
         if self.sampling.decision_fraction:
             shape = (2,self.cfg.n_future)
@@ -526,7 +526,7 @@ class IdentityObservationBuilder(ObservationBuilder):
                 augment_image_pair(batch['x']['fine'][j], item['photometric'], rng, **augmentation)
                 if item['drop_presence']:
                     batch['presence_dropped'][j] = 1
-                if self.cfg.memory_slots and self.cfg.memory_version != 4:
+                if self.cfg.memory_slots and not self.cfg.feature_memory:
                     # Same augmentation parameters along the observation sequence.
                     x = batch['x']
                     for k in torch.nonzero(x['memory_mask'][j]).flatten().tolist():
@@ -546,7 +546,7 @@ class IdentityObservationBuilder(ObservationBuilder):
 
     @property
     def streaming(self):
-        return self.cfg.memory_version == 4
+        return self.cfg.feature_memory
 
     def sequence_batches(self, items, vol, **kwargs):
         from .feature_sequences import sequence_batches

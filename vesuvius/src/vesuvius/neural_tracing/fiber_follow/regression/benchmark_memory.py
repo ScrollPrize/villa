@@ -36,7 +36,7 @@ def synthetic_batch(cfg, batch, observations):
              memory_seed_position=torch.zeros(batch,3),memory_seed_frame=torch.eye(3).expand(batch,-1,-1).clone())
     if cfg.memory_version == 3:
         x['route_frame'] = torch.eye(3).expand(batch,-1,-1).clone()
-    if cfg.memory_version == 4:
+    if cfg.feature_memory:
         x = {k: v for k, v in x.items() if not k.startswith('memory_')}
         t = 1
         x.update(query_position=torch.zeros(batch, 3), query_frame=torch.eye(3).expand(batch, -1, -1).clone(),
