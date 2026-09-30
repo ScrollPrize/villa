@@ -1,0 +1,41 @@
+#pragma once
+
+#include "FiberCollectionGenerator.hpp"
+
+#include <QDialog>
+#include <array>
+
+class QCheckBox;
+class QDoubleSpinBox;
+class QLabel;
+class QLineEdit;
+class QSpinBox;
+
+// Options of a new Automated Fiber Volume: output file, zone of the current
+// volume, model and Python. The caller adds the volume and its coordinate
+// identity to the request. Choices are remembered.
+class FiberCollectionGeneratorDialog : public QDialog
+{
+    Q_OBJECT
+public:
+    // XYZ voxels of the current volume; voxelSizeUm is its voxel size, 0 if unknown.
+    FiberCollectionGeneratorDialog(const std::array<int, 3>& shape, const std::array<int, 3>& center, double voxelSizeUm, QWidget* parent = nullptr);
+    vc3d::fibergen::Request request() const;
+    // Empty to detect Python automatically.
+    QString pythonExecutable() const;
+    void accept() override;
+
+private:
+    std::array<int, 3> shape_;
+    QLineEdit* output_{};
+    std::array<QSpinBox*, 3> center_{};
+    std::array<QSpinBox*, 3> size_{};
+    QLabel* zone_{};
+    QLineEdit* model_{};
+    QCheckBox* mirror_{};
+    QDoubleSpinBox* threshold_{};
+    QLineEdit* python_{};
+    std::array<int, 3> zoneOrigin() const;
+    std::array<int, 3> zoneSize() const;
+    void updateZone();
+};

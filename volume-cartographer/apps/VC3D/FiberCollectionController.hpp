@@ -4,6 +4,7 @@
 #include "vc/core/types/FiberCollection.hpp"
 #include <QPointF>
 #include <QPointer>
+#include <QStringList>
 #include <atomic>
 #include <memory>
 #include <limits>
@@ -20,6 +21,8 @@ class QCheckBox;
 class QSlider;
 class QLineEdit;
 class QPushButton;
+class QProcess;
+class QProgressBar;
 class QMainWindow;
 class LineAnnotationController;
 
@@ -68,6 +71,14 @@ private:
     QPushButton* next_{};
     QPushButton* openAnnotation_{};
     QPushButton* detach_{};
+    // A background run of the Python generator, creating a new volume.
+    QPushButton* create_{};
+    QProgressBar* generatorProgress_{};
+    QPushButton* generatorCancel_{};
+    QLabel* generatorStatus_{};
+    QPointer<QProcess> generator_;
+    QString generatorOutput_, generatorError_, generatorSpace_;
+    QStringList generatorLog_;
     QString path_, attachment_;
     std::string uuid_, coordinateSpace_;
     double sourceResolution_{};
@@ -106,4 +117,8 @@ private:
     void request(VolumeViewerBase* viewer, const Slice& slice);
     std::optional<Slice> slice(VolumeViewerBase* viewer) const;
     QString attachmentPath() const;
+    void createCollection();
+    void readGeneratorOutput();
+    void finishGenerator(int exitCode, bool crashed);
+    void showGeneratorStatus(const QString& text);
 };

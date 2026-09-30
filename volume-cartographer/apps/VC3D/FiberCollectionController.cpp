@@ -1,7 +1,10 @@
 #include "FiberCollectionController.hpp"
 #include "CState.hpp"
+#include "FiberCollectionGenerator.hpp"
+#include "FiberCollectionGeneratorDialog.hpp"
 #include "ViewerManager.hpp"
 #include "OpenDataCoordinateIdentity.hpp"
+#include "PythonExecutable.hpp"
 #include "VCSettings.hpp"
 #include "LineAnnotationController.hpp"
 #include "LineAnnotationDialog.hpp"
@@ -13,6 +16,7 @@
 #include "vc/core/util/PlaneSurface.hpp"
 
 #include <QCheckBox>
+#include <QCoreApplication>
 #include <QCryptographicHash>
 #include <QDockWidget>
 #include <QDoubleSpinBox>
@@ -30,6 +34,8 @@
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPolygonF>
+#include <QProcess>
+#include <QProgressBar>
 #include <QPushButton>
 #include <QSaveFile>
 #include <QScopeGuard>
@@ -43,6 +49,7 @@
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <cmath>
+#include <iostream>
 #include <limits>
 #include <unordered_set>
 #include <utility>
@@ -175,6 +182,26 @@ FiberCollectionController::FiberCollectionController(CState* state, ViewerManage
     collectionActions->addWidget(open, 1);
     collectionActions->addWidget(detach_);
     collectionLayout->addLayout(collectionActions);
+    create_ = new QPushButton(tr("Create volume…"), body);
+    create_->setObjectName("fiberCollectionCreate");
+    create_->setToolTip(tr("Predict fibers in a zone of the current CT volume and open them as a new Automated Fiber Volume."));
+    collectionLayout->addWidget(create_);
+    generatorProgress_ = new QProgressBar(body);
+    generatorProgress_->setRange(0, 1000);
+    generatorProgress_->setTextVisible(false);
+    generatorCancel_ = new QPushButton(tr("Cancel"), body);
+    auto* generatorRow = new QHBoxLayout;
+    generatorRow->addWidget(generatorProgress_, 1);
+    generatorRow->addWidget(generatorCancel_);
+    collectionLayout->addLayout(generatorRow);
+    generatorProgress_->hide();
+    generatorCancel_->hide();
+    generatorStatus_ = new QLabel(body);
+    generatorStatus_->setObjectName("fiberCollectionGeneratorStatus");
+    generatorStatus_->setWordWrap(true);
+    generatorStatus_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    generatorStatus_->hide();
+    collectionLayout->addWidget(generatorStatus_);
     visible_ = new QCheckBox(tr("Show volume · read only"), body);
     visible_->setChecked(true);
     collectionLayout->addWidget(visible_);
@@ -284,6 +311,24 @@ FiberCollectionController::FiberCollectionController(CState* state, ViewerManage
         if (!path.isEmpty())
             openCollection(path);
     });
+    connect(create_, &QPushButton::clicked, this, &FiberCollectionController::createCollection);
+    connect(generatorCancel_, &QPushButton::clicked, this, [this]() {
+        if (!generator_)
+            return;
+        generatorError_ = tr("Cancelled.");
+        generatorCancel_->setEnabled(false);
+#ifdef Q_OS_WIN
+        generator_->kill();
+#else
+        // SIGTERM lets the generator remove its temporary file.
+        QProcess* process = generator_;
+        process->terminate();
+        QTimer::singleShot(10000, process, [process]() {
+            if (process->state() != QProcess::NotRunning)
+                process->kill();
+        });
+#endif
+    });
     connect(visible_, &QCheckBox::toggled, this, [this]() { invalidate(); });
     connect(minLength_, &QDoubleSpinBox::valueChanged, this, [this](double length) {
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
@@ -344,6 +389,16 @@ FiberCollectionController::FiberCollectionController(CState* state, ViewerManage
 }
 FiberCollectionController::~FiberCollectionController()
 {
+    if (generator_) {
+        generator_->disconnect(this);
+#ifndef Q_OS_WIN
+        generator_->terminate();
+        generator_->waitForFinished(3000);
+#endif
+        if (generator_->state() != QProcess::NotRunning)
+            generator_->kill();
+        generator_->waitForFinished(1000);
+    }
     for (auto& [v, s] : views_)
         if (s->cancelled)
             s->cancelled->store(true);
@@ -516,6 +571,143 @@ void FiberCollectionController::openCollection(const QString& path, bool persist
             listPage(true);
             invalidate();
         });
+}
+void FiberCollectionController::showGeneratorStatus(const QString& text)
+{
+    generatorStatus_->setText(text);
+    generatorStatus_->setVisible(!text.isEmpty());
+}
+void FiberCollectionController::createCollection()
+{
+    if (generator_)
+        return;
+    dock_->show();
+    const auto volume = state_->currentVolume();
+    if (!volume || !state_->vpkg()) {
+        showGeneratorStatus(tr("Open the CT volume first."));
+        return;
+    }
+    const auto identity = vc3d::opendata::coordinateIdentityForVolume(*state_->vpkg(), state_->currentVolumeId());
+    if (!identity) {
+        showGeneratorStatus(tr("This volume has no verified coordinate identity. Attach a volume with coordinate metadata first."));
+        return;
+    }
+    // Remote volumes may be rebased on a coarser array of their OME-Zarr group.
+    const auto location = volume->isRemote() ? QString::fromStdString(volume->remoteUrl()) : vc3d::pathToQString(volume->path());
+    if (location.isEmpty()) {
+        showGeneratorStatus(tr("The current volume has no location the generator can read."));
+        return;
+    }
+    const auto shape = volume->shapeXyz();
+    std::array<int, 3> center{shape[0] / 2, shape[1] / 2, shape[2] / 2};
+    if (const auto* focus = state_->poi("focus"))
+        for (int i = 0; i < 3; ++i)
+            center[i] = int(std::lround(focus->p[i]));
+    FiberCollectionGeneratorDialog dialog(
+        {shape[0], shape[1], shape[2]}, center, identity->sourceOriginalResolution * double(identity->sourceCoordinateScaleFactor), dock_);
+    if (dialog.exec() != QDialog::Accepted)
+        return;
+    auto request = dialog.request();
+    request.volume = location;
+    request.level = volume->isRemote() ? volume->baseScaleLevel() : 0;
+    request.coordinateSpace = QString::fromStdString(identity->coordinateSpace);
+    request.nativeScale = identity->sourceCoordinateScaleFactor;
+    request.voxelSizeUm = identity->sourceOriginalResolution;
+    request.sourcePath = QString::fromStdString(identity->sourcePath);
+    const auto python = dialog.pythonExecutable().isEmpty() ? vc3d::findPythonExecutable() : dialog.pythonExecutable();
+    const auto arguments = vc3d::fibergen::arguments(request);
+
+    generatorOutput_.clear();
+    generatorError_.clear();
+    generatorLog_.clear();
+    generatorSpace_ = request.coordinateSpace;
+    auto* process = new QProcess(this);
+    generator_ = process;
+    process->setProcessEnvironment(vc3d::fibergen::environment(
+        QProcessEnvironment::systemEnvironment(), vc3d::fibergen::vesuviusSourceDirectory(QCoreApplication::applicationDirPath())));
+    connect(process, &QProcess::readyReadStandardOutput, this, &FiberCollectionController::readGeneratorOutput);
+    connect(process, &QProcess::readyReadStandardError, this, [this, process]() {
+        const auto text = QString::fromUtf8(process->readAllStandardError());
+        std::cerr << "[afv-generator] " << text.toStdString();
+        generatorLog_ += text.split('\n', Qt::SkipEmptyParts);
+        while (generatorLog_.size() > 20)
+            generatorLog_.removeFirst();
+    });
+    connect(process, &QProcess::finished, this, [this](int exitCode, QProcess::ExitStatus status) {
+        finishGenerator(exitCode, status == QProcess::CrashExit);
+    });
+    connect(process, &QProcess::errorOccurred, this, [this, python](QProcess::ProcessError error) {
+        if (error == QProcess::FailedToStart) {
+            generatorError_ = tr("Could not start %1. Choose the Python of your vesuvius environment.").arg(python);
+            finishGenerator(-1, true);
+        }
+    });
+    std::cout << "Starting Automated Fiber Volume generator: " << python.toStdString();
+    for (const auto& argument : arguments)
+        std::cout << " " << argument.toStdString();
+    std::cout << std::endl;
+    create_->setEnabled(false);
+    generatorCancel_->setEnabled(true);
+    generatorProgress_->setValue(0);
+    generatorProgress_->show();
+    generatorCancel_->show();
+    showGeneratorStatus(tr("Starting Python…"));
+    process->start(python, arguments);
+}
+void FiberCollectionController::readGeneratorOutput()
+{
+    while (generator_ && generator_->canReadLine()) {
+        const auto line = generator_->readLine();
+        const auto event = vc3d::fibergen::parseEvent(line);
+        if (!event) {
+            std::cout << "[afv-generator] " << line.toStdString();
+            continue;
+        }
+        using Kind = vc3d::fibergen::Event::Kind;
+        switch (event->kind) {
+        case Kind::Progress:
+            generatorProgress_->setValue(int(std::lround(event->fraction * 1000)));
+            showGeneratorStatus(event->message);
+            break;
+        case Kind::Warning:
+            generatorLog_ << event->message;
+            break;
+        case Kind::Done:
+            generatorOutput_ = event->output;
+            break;
+        case Kind::Error:
+            generatorError_ = event->message;
+            break;
+        }
+    }
+}
+void FiberCollectionController::finishGenerator(int exitCode, bool crashed)
+{
+    if (!generator_)
+        return;
+    readGeneratorOutput();
+    generator_->disconnect(this);
+    generator_->deleteLater();
+    generator_ = nullptr;
+    create_->setEnabled(true);
+    generatorProgress_->hide();
+    generatorCancel_->hide();
+    if (crashed || exitCode != 0 || generatorOutput_.isEmpty()) {
+        auto message = generatorError_;
+        if (message.isEmpty())
+            message = generatorLog_.isEmpty() ? tr("The generator stopped (exit code %1).").arg(exitCode) : generatorLog_.last();
+        showGeneratorStatus(tr("No volume created: %1").arg(message));
+        return;
+    }
+    const auto identity = state_->currentVolume() && state_->vpkg()
+        ? vc3d::opendata::coordinateIdentityForVolume(*state_->vpkg(), state_->currentVolumeId())
+        : std::nullopt;
+    if (!identity || QString::fromStdString(identity->coordinateSpace) != generatorSpace_) {
+        showGeneratorStatus(tr("Created %1. Open it with the %2 volume.").arg(generatorOutput_, generatorSpace_));
+        return;
+    }
+    showGeneratorStatus({});
+    openCollection(generatorOutput_);
 }
 void FiberCollectionController::invalidate()
 {

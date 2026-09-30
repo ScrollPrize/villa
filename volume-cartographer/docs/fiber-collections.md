@@ -3,10 +3,11 @@
 An **Automated Fiber Volume** is a single read-only SQLite file holding a large
 fiber collection, such as the output of automated fiber tracing: exact geometry,
 per-fiber annotations and a spatial index over blocks of geometry. It is written
-outside VC3D, in the format described below. VC3D displays it next to the
-editable annotations without importing it. Opening a volume reads its metadata
-and one catalog page; each view then loads only the fibers crossing its visible
-slice.
+outside VC3D, in the format described below, for example by
+`vesuvius.afv_spline_generator`, which VC3D can run (see [Create](#create)).
+VC3D displays it next to the editable annotations without importing it. Opening
+a volume reads its metadata and one catalog page; each view then loads only the
+fibers crossing its visible slice.
 
 ![A 61,486-fiber Automated Fiber Volume of PHerc. 0175A drawn on the XY and YZ CT slices with rainbow colors, next to its dock](images/fiber-collection-viewer.jpg)
 
@@ -18,6 +19,26 @@ VC3D --volpkg scroll.volpkg.json --fiber-collection fibers.afv
 
 or use **File → Open Automated Fiber Volume…**. The dock is under
 **View → Fibers**.
+
+## Create
+
+**Create volume…** in the dock predicts fibers in a zone of the current CT
+volume with a fiber model and opens the result as **Open** does. Choose
+where to save the new `.afv` (an existing file is never replaced) and the zone,
+centered on the focus point by default and at most 1,024 voxels per side, in
+voxels of the current volume. **Model**, **Test-time mirroring** (better
+predictions, about 8× slower) and **Fiber threshold** are remembered.
+
+VC3D runs `python -m vesuvius.afv_spline_generator` in the background and shows
+its progress under the button; **Cancel** stops it. Python is the one given in
+the dialog, or else found as for Neural Trace (`PYTHON_EXECUTABLE`, the active
+conda environment, `~/miniconda3`, `~/anaconda3`, then the `PATH`); it needs
+`vesuvius[models]` and, for reasonable speed, a GPU. When VC3D runs from a
+build inside a villa checkout, that checkout's `vesuvius/src` is put first on
+`PYTHONPATH`. The volume must be readable by Python: a local Zarr or a public
+`http(s)://` one, and it needs a coordinate identity (see
+[Coordinates](#coordinates)). The method and the command line are described in
+[`vesuvius/docs/afv_spline_generator.md`](../../vesuvius/docs/afv_spline_generator.md).
 
 ## Viewer
 
@@ -145,8 +166,10 @@ on Debian/Ubuntu, `sqlite` on Homebrew, `sqlite3[rtree]` with vcpkg. With
 `-DVC_TESTING=ON`:
 
 ```sh
-cmake --build build --target VC3D test_fiber_collection
-ctest --test-dir build -R test_fiber_collection --output-on-failure
+cmake --build build --target VC3D test_fiber_collection test_fiber_collection_generator
+ctest --test-dir build -R fiber_collection --output-on-failure
 ```
 
-The test writes its own `.afv` files in the format above.
+`test_fiber_collection` writes its own `.afv` files in the format above;
+`test_fiber_collection_generator` checks the generator's command line, progress
+events and zone without running Python.

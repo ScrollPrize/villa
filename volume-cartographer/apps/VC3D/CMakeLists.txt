@@ -17,6 +17,10 @@ set(srcs
     CWindow.cpp
     FiberCollectionController.cpp
     FiberCollectionController.hpp
+    FiberCollectionGenerator.cpp
+    FiberCollectionGenerator.hpp
+    FiberCollectionGeneratorDialog.cpp
+    FiberCollectionGeneratorDialog.hpp
     CWindowContextMenu.cpp
     StatusDockPanelHost.cpp
     StatusDockPanelHost.hpp
