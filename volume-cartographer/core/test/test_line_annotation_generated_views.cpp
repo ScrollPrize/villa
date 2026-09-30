@@ -2940,7 +2940,7 @@ TEST_CASE("line annotation successful multi fiber save deletes recovery backups"
     std::filesystem::remove_all(dir);
 }
 
-TEST_CASE("line annotation failed multi fiber save keeps recovery backups")
+TEST_CASE("line annotation failed multi fiber save restores overwritten targets")
 {
     const auto dir = makeTempSaveDir("multi_failure");
     const auto first = dir / "fiber_a.json";
@@ -2959,12 +2959,130 @@ TEST_CASE("line annotation failed multi fiber save keeps recovery backups")
 
     CHECK_FALSE(result.ok);
     CHECK(result.error.find("Injected failure") != std::string::npos);
-    REQUIRE(result.recoveryFiles.size() == 2);
-    for (const auto& recovery : result.recoveryFiles) {
-        CHECK(std::filesystem::exists(recovery));
-        CHECK(recovery.filename().string().find(".recovery.") != std::string::npos);
+    // The overwritten first target is restored from its recovery copy, the
+    // second was never replaced, and no artifact of the undo survives.
+    CHECK(result.recoveryFiles.empty());
+    CHECK(readText(first) == "{\"old\":\"a\"}\n");
+    CHECK(readText(second) == "{\"old\":\"b\"}\n");
+    CHECK(recoveryFilesIn(dir).empty());
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("line annotation failed save restores an overwritten peer after a later payload fails")
+{
+    const auto dir = makeTempSaveDir("peer_restore");
+    const auto merged = dir / "fiber_merged.json";
+    const auto peerA = dir / "fiber_peer_a.json";
+    const auto peerB = dir / "fiber_peer_b.json";
+    const auto original = dir / "fiber_original.json";
+    writeText(peerA, "{\"peer\":\"a\"}\n");
+    writeText(peerB, "{\"peer\":\"b\"}\n");
+    writeText(original, "{\"original\":true}\n");
+
+    // Payload order: new fiber, peer A (overwritten), peer B; fail right after
+    // peer A landed, with the original already retired.
+    setenv("VC3D_FIBER_SAVE_FAIL_STAGE", "replace:1", 1);
+    const auto result = vc3d::line_annotation::runFiberSaveJob(
+        17,
+        {{1, 1, merged, nlohmann::json{{"merged", true}}},
+         {2, 5, peerA, nlohmann::json{{"peer", "a-redirected"}}},
+         {3, 5, peerB, nlohmann::json{{"peer", "b-redirected"}}}},
+        {original});
+    unsetenv("VC3D_FIBER_SAVE_FAIL_STAGE");
+
+    CHECK_FALSE(result.ok);
+    CHECK(result.recoveryFiles.empty());
+    CHECK_FALSE(std::filesystem::exists(merged));
+    CHECK(readText(peerA) == "{\"peer\":\"a\"}\n");
+    CHECK(readText(peerB) == "{\"peer\":\"b\"}\n");
+    CHECK(readText(original) == "{\"original\":true}\n");
+    CHECK(recoveryFilesIn(dir).empty());
+    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+        CHECK(entry.path().filename().string().find(".tmp.") == std::string::npos);
     }
-    CHECK(recoveryFilesIn(dir).size() == 2);
+    const auto retiredDir = dir / ".retired";
+    if (std::filesystem::exists(retiredDir)) {
+        CHECK(std::filesystem::is_empty(retiredDir));
+    }
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("line annotation write-stage failure leaves no temp file and no change")
+{
+    const auto dir = makeTempSaveDir("write_failure");
+    const auto first = dir / "fiber_a.json";
+    const auto second = dir / "fiber_b.json";
+    writeText(first, "{\"old\":\"a\"}\n");
+
+    setenv("VC3D_FIBER_SAVE_FAIL_STAGE", "write:1", 1);
+    const auto result = vc3d::line_annotation::runFiberSaveJob(
+        18,
+        {{1, 1, first, nlohmann::json{{"new", "a"}}},
+         {2, 1, second, nlohmann::json{{"new", "b"}}}});
+    unsetenv("VC3D_FIBER_SAVE_FAIL_STAGE");
+
+    CHECK_FALSE(result.ok);
+    CHECK(result.recoveryFiles.empty());
+    CHECK(readText(first) == "{\"old\":\"a\"}\n");
+    CHECK_FALSE(std::filesystem::exists(second));
+    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+        CHECK(entry.path().filename().string().find(".tmp.") == std::string::npos);
+    }
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("line annotation retire-stage failure restores the earlier retirement")
+{
+    const auto dir = makeTempSaveDir("retire_stage");
+    const auto first = dir / "fiber_a.json";
+    const auto second = dir / "fiber_b.json";
+    const auto target = dir / "fiber_new.json";
+    writeText(first, "{\"a\":true}\n");
+    writeText(second, "{\"b\":true}\n");
+
+    setenv("VC3D_FIBER_SAVE_FAIL_STAGE", "retire:1", 1);
+    const auto result = vc3d::line_annotation::runFiberSaveJob(
+        19, {{1, 1, target, nlohmann::json{{"new", true}}}}, {first, second});
+    unsetenv("VC3D_FIBER_SAVE_FAIL_STAGE");
+
+    CHECK_FALSE(result.ok);
+    CHECK(result.recoveryFiles.empty());
+    CHECK(readText(first) == "{\"a\":true}\n");
+    CHECK(readText(second) == "{\"b\":true}\n");
+    CHECK_FALSE(std::filesystem::exists(target));
+    const auto retiredDir = dir / ".retired";
+    if (std::filesystem::exists(retiredDir)) {
+        CHECK(std::filesystem::is_empty(retiredDir));
+    }
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("line annotation failed restore is reported as recovery required")
+{
+    const auto dir = makeTempSaveDir("restore_failure");
+    const auto first = dir / "fiber_a.json";
+    const auto second = dir / "fiber_b.json";
+    writeText(first, "{\"old\":\"a\"}\n");
+    writeText(second, "{\"old\":\"b\"}\n");
+
+    // Both replaced, then the restore of the first is made to fail.
+    setenv("VC3D_FIBER_SAVE_FAIL_STAGE", "restore:0", 1);
+    const auto result = vc3d::line_annotation::runFiberSaveJob(
+        20,
+        {{1, 1, first, nlohmann::json{{"new", "a"}}},
+         {2, 1, second, nlohmann::json{{"new", "b"}}}});
+    unsetenv("VC3D_FIBER_SAVE_FAIL_STAGE");
+
+    CHECK_FALSE(result.ok);
+    CHECK(result.error.find("could not restore") != std::string::npos);
+    // The second target was restored; the first keeps the new content and
+    // its recovery copy is reported so the caller can ask for recovery.
+    CHECK(readText(second) == "{\"old\":\"b\"}\n");
+    CHECK(readText(first).find("\"new\": \"a\"") != std::string::npos);
+    REQUIRE(result.recoveryFiles.size() == 1);
+    CHECK(std::filesystem::exists(result.recoveryFiles.front()));
+    CHECK(readText(result.recoveryFiles.front()) == "{\"old\":\"a\"}\n");
+    CHECK(recoveryFilesIn(dir).size() == 1);
     std::filesystem::remove_all(dir);
 }
 
@@ -3060,8 +3178,8 @@ TEST_CASE("line annotation failed multi fiber save removes orphan new targets")
     unsetenv("VC3D_FIBER_SAVE_FAIL_AFTER_FIRST_REPLACE");
 
     CHECK_FALSE(result.ok);
-    // Neither brand-new target survives the aborted batch; a pre-existing
-    // target would instead keep the new content plus its recovery copy.
+    // Neither brand-new target survives the aborted batch (a pre-existing
+    // target is restored from its recovery copy instead).
     CHECK_FALSE(std::filesystem::exists(first));
     CHECK_FALSE(std::filesystem::exists(second));
     CHECK(recoveryFilesIn(dir).empty());

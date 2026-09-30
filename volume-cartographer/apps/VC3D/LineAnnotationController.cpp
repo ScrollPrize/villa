@@ -10,6 +10,7 @@
 #include "OpenDataLasagna.hpp"
 #include "FiberSliceGeometry.hpp"
 #include "LineAnnotationAdjacentLinks.hpp"
+#include "LineAnnotationFiberLinks.hpp"
 #include "LineAnnotationFiberNaming.hpp"
 #include "LineAnnotationFiberSaveJob.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
@@ -356,6 +357,20 @@ struct LineAnnotationController::IntersectionInspectionSession {
 
 namespace {
 
+// Link predicates shared with the save/validation helpers and the
+// structural-edit planners (LineAnnotationFiberLinks.hpp).
+using vc3d::line_annotation::branchDirectionsCompatible;
+using vc3d::line_annotation::branchReferencesFiber;
+using vc3d::line_annotation::endpointTangentFromLinePoints;
+using vc3d::line_annotation::fiberErrorName;
+using vc3d::line_annotation::finiteDirection;
+using vc3d::line_annotation::finitePoint;
+using vc3d::line_annotation::matchingStoredControlPointIndex;
+using vc3d::line_annotation::normalizedOrZero;
+using vc3d::line_annotation::pointsApproximatelyEqual;
+using vc3d::line_annotation::storedControlPointIndexByPosition;
+using vc3d::line_annotation::tangentAtLinePosition;
+
 // Arclength radius within which a placement click replaces the existing
 // control(s) instead of adding one. Tied to the strip's along-line sampling
 // so no control span can be created shorter than one strip column (#1484:
@@ -411,7 +426,6 @@ void copyCoordinateIdentityToJson(
         identity->sourceOriginalResolution;
 }
 
-constexpr double kEpsilon = 1.0e-12;
 constexpr double kLineSegmentLength = 32.0;
 // Quiet window between a control-point edit and the solve it dispatches;
 // rapid placement coalesces into one solve over the union of dirty spans.
@@ -629,12 +643,11 @@ void writeJsonAtomic(const fs::path& finalPath, const nlohmann::json& root)
     }
 
     const fs::path tempPath = finalPath.string() + ".tmp";
-    {
-        std::ofstream out(tempPath);
-        if (!out) {
-            throw std::runtime_error("Failed to open " + tempPath.string());
-        }
-        out << root.dump(2) << '\n';
+    try {
+        vc3d::line_annotation::writeTextFileChecked(tempPath, root.dump(2) + '\n');
+    } catch (...) {
+        fs::remove(tempPath, ec);
+        throw;
     }
     fs::rename(tempPath, finalPath, ec);
     if (ec) {
@@ -656,7 +669,6 @@ void atlasDebug(const std::string& message)
     }
 }
 
-bool finitePoint(const cv::Vec3d& v);
 cv::Vec3f toVec3f(const cv::Vec3d& v);
 
 const char* sideStripProgressPhaseName(vc::atlas::FiberSideStripProgressPhase phase)
@@ -783,29 +795,6 @@ double elapsedMs(Clock::time_point start, Clock::time_point end)
     return std::chrono::duration<double, std::milli>(end - start).count();
 }
 
-bool finiteDirection(const cv::Vec3d& v)
-{
-    return std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2]) &&
-           std::sqrt(v.dot(v)) > kEpsilon;
-}
-
-cv::Vec3d normalizedOrZero(const cv::Vec3d& v)
-{
-    if (!std::isfinite(v[0]) || !std::isfinite(v[1]) || !std::isfinite(v[2])) {
-        return {0.0, 0.0, 0.0};
-    }
-    const double n = std::sqrt(v.dot(v));
-    if (n <= kEpsilon) {
-        return {0.0, 0.0, 0.0};
-    }
-    return v * (1.0 / n);
-}
-
-bool finitePoint(const cv::Vec3d& v)
-{
-    return std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2]);
-}
-
 bool finitePoint(const cv::Vec3f& v)
 {
     return std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2]);
@@ -851,48 +840,6 @@ cv::Vec3d toVec3d(const cv::Vec3f& v)
 bool approximatelyEqual(double a, double b)
 {
     return std::abs(a - b) <= 1.0e-9;
-}
-
-bool pointsApproximatelyEqual(const cv::Vec3d& a,
-                              const cv::Vec3d& b,
-                              double tolerance = 1.0e-6)
-{
-    if (!finitePoint(a) || !finitePoint(b)) {
-        return false;
-    }
-    const cv::Vec3d delta = a - b;
-    return delta.dot(delta) <= tolerance * tolerance;
-}
-
-std::optional<int> storedControlPointIndexByPosition(
-    const std::vector<vc3d::line_annotation::StoredControlPoint>& controlPoints,
-    const cv::Vec3d& point)
-{
-    if (!finitePoint(point)) {
-        return std::nullopt;
-    }
-    for (size_t i = 0; i < controlPoints.size(); ++i) {
-        if (pointsApproximatelyEqual(controlPoints[i], point)) {
-            return static_cast<int>(i);
-        }
-    }
-    return std::nullopt;
-}
-
-std::optional<int> matchingStoredControlPointIndex(
-    const std::vector<vc3d::line_annotation::StoredControlPoint>& controlPoints,
-    int fallbackIndex,
-    const cv::Vec3d& point)
-{
-    if (auto index = storedControlPointIndexByPosition(controlPoints, point)) {
-        return index;
-    }
-    if (fallbackIndex < 0 ||
-        static_cast<size_t>(fallbackIndex) >= controlPoints.size() ||
-        !pointsApproximatelyEqual(controlPoints[static_cast<size_t>(fallbackIndex)], point)) {
-        return std::nullopt;
-    }
-    return fallbackIndex;
 }
 
 std::optional<int> sessionControlPointIndexByPosition(
@@ -964,24 +911,6 @@ std::optional<int> matchingSessionControlPointIndex(
     return fallbackIndex;
 }
 
-std::string fiberErrorName(const std::string& fileName)
-{
-    const std::string baseName = fs::path(fileName).filename().string();
-    return baseName.empty() ? std::string{"<unknown>"} : baseName;
-}
-
-bool branchDirectionsCompatible(const cv::Vec3d& a,
-                                const cv::Vec3d& b,
-                                double tolerance = 1.0e-5)
-{
-    const cv::Vec3d na = normalizedOrZero(a);
-    const cv::Vec3d nb = normalizedOrZero(b);
-    if (!finiteDirection(na) || !finiteDirection(nb)) {
-        return false;
-    }
-    return std::abs(std::abs(na.dot(nb)) - 1.0) <= tolerance;
-}
-
 void addUniqueFiberId(std::vector<uint64_t>& ids, uint64_t fiberId)
 {
     if (fiberId == 0 ||
@@ -989,19 +918,6 @@ void addUniqueFiberId(std::vector<uint64_t>& ids, uint64_t fiberId)
         return;
     }
     ids.push_back(fiberId);
-}
-
-// Runtime ids are unique across every registered source and stable across
-// reloads (FiberRuntimeIds). Once both sides have one, do not let an equal
-// filename in another source create a false match. Filename matching remains
-// the legacy/on-load fallback. The rule is sameFiberIdentity, shared with the
-// deletion helpers and the branch synchronizers.
-bool branchReferencesFiber(const LineAnnotationController::FiberBranchRef& branch,
-                           uint64_t fiberId,
-                           const std::string& fileName)
-{
-    return vc3d::line_annotation::sameFiberIdentity(branch.branchFiberId, branch.branchFileName,
-                                                    fiberId, fileName);
 }
 
 bool controlPointHasBranchLink(
@@ -1309,39 +1225,6 @@ cv::Vec3d interpolatedPointAtLinePosition(const std::vector<cv::Vec3d>& points,
     const double t = linePosition - static_cast<double>(lower);
     return points[static_cast<size_t>(lower)] * (1.0 - t) +
            points[static_cast<size_t>(upper)] * t;
-}
-
-cv::Vec3d tangentAtLinePosition(const std::vector<cv::Vec3d>& points,
-                                double linePosition)
-{
-    if (points.size() < 2 || !std::isfinite(linePosition)) {
-        return {1.0, 0.0, 0.0};
-    }
-    linePosition = std::clamp(linePosition, 0.0, static_cast<double>(points.size() - 1));
-    int lower = static_cast<int>(std::floor(linePosition));
-    int upper = std::min<int>(lower + 1, static_cast<int>(points.size()) - 1);
-    if (lower == upper && lower > 0) {
-        --lower;
-    }
-    cv::Vec3d tangent = points[static_cast<size_t>(upper)] - points[static_cast<size_t>(lower)];
-    tangent = normalizedOrZero(tangent);
-    return finiteDirection(tangent) ? tangent : cv::Vec3d{1.0, 0.0, 0.0};
-}
-
-cv::Vec3d endpointTangentFromLinePoints(const std::vector<cv::Vec3d>& linePoints,
-                                        const cv::Vec3d& controlPoint,
-                                        const cv::Vec3d& fallback = {0.0, 0.0, 0.0})
-{
-    if (linePoints.size() >= 2 && finitePoint(controlPoint)) {
-        const size_t index =
-            vc3d::fiber_slice::nearestLinePointIndex(linePoints, controlPoint);
-        const cv::Vec3d tangent =
-            tangentAtLinePosition(linePoints, static_cast<double>(index));
-        if (finiteDirection(tangent)) {
-            return normalizedOrZero(tangent);
-        }
-    }
-    return finiteDirection(fallback) ? normalizedOrZero(fallback) : cv::Vec3d{0.0, 0.0, 0.0};
 }
 
 std::vector<cv::Vec3d> linePointPositions(const vc::lasagna::LineModel& line)
@@ -17885,212 +17768,13 @@ LineAnnotationController::makeFiberSaveSnapshot(const StoredFiber& fiber) const
 void LineAnnotationController::canonicalizeFiberSaveSnapshots(
     std::vector<FiberSaveSnapshot>& snapshots) const
 {
-    auto findSnapshotForBranch =
-        [&snapshots](const FiberBranchRef& branch) -> FiberSaveSnapshot* {
-        for (auto& snapshot : snapshots) {
-            if (branchReferencesFiber(branch,
-                                      snapshot.fiber.id,
-                                      snapshot.fiber.fileName)) {
-                return &snapshot;
-            }
-        }
-        return nullptr;
-    };
-
-    for (auto& snapshot : snapshots) {
-        for (auto& branch : snapshot.fiber.branches) {
-            if (auto localIndex = matchingStoredControlPointIndex(
-                    snapshot.fiber.controlPoints,
-                    branch.controlPointIndex,
-                    branch.controlPointPosition)) {
-                branch.controlPointIndex = *localIndex;
-                branch.controlPointPosition =
-                    snapshot.fiber.controlPoints[static_cast<size_t>(*localIndex)];
-            }
-            branch.controlPointDirection =
-                endpointTangentFromLinePoints(snapshot.fiber.linePoints,
-                                              branch.controlPointPosition,
-                                              branch.controlPointDirection);
-            if (finiteDirection(branch.branchControlPointDirection)) {
-                branch.branchControlPointDirection =
-                    normalizedOrZero(branch.branchControlPointDirection);
-            }
-
-            auto* target = findSnapshotForBranch(branch);
-            if (!target) {
-                continue;
-            }
-            branch.branchFiberId = target->fiber.id;
-            branch.branchFileName = target->fiber.fileName;
-            if (auto targetIndex = matchingStoredControlPointIndex(
-                    target->fiber.controlPoints,
-                    branch.branchControlPointIndex,
-                    branch.branchControlPointPosition)) {
-                branch.branchControlPointIndex = *targetIndex;
-                branch.branchControlPointPosition =
-                    target->fiber.controlPoints[static_cast<size_t>(*targetIndex)];
-            }
-            branch.branchControlPointDirection =
-                endpointTangentFromLinePoints(target->fiber.linePoints,
-                                              branch.branchControlPointPosition,
-                                              branch.branchControlPointDirection);
-        }
-    }
-
-    for (auto& snapshot : snapshots) {
-        for (auto& branch : snapshot.fiber.branches) {
-            if (branch.controlPointIndex < 0 ||
-                branch.branchControlPointIndex < 0 ||
-                static_cast<size_t>(branch.controlPointIndex) >=
-                    snapshot.fiber.controlPoints.size()) {
-                continue;
-            }
-            auto* target = findSnapshotForBranch(branch);
-            if (!target ||
-                static_cast<size_t>(branch.branchControlPointIndex) >=
-                    target->fiber.controlPoints.size()) {
-                continue;
-            }
-            auto reciprocal = std::find_if(
-                target->fiber.branches.begin(),
-                target->fiber.branches.end(),
-                [&snapshot, &branch](const FiberBranchRef& candidate) {
-                    return candidate.adjacent == branch.adjacent &&
-                           branchReferencesFiber(candidate,
-                                                 snapshot.fiber.id,
-                                                 snapshot.fiber.fileName) &&
-                           (candidate.controlPointIndex ==
-                                branch.branchControlPointIndex ||
-                            pointsApproximatelyEqual(candidate.controlPointPosition,
-                                                     branch.branchControlPointPosition)) &&
-                           (candidate.branchControlPointIndex ==
-                                branch.controlPointIndex ||
-                            pointsApproximatelyEqual(candidate.branchControlPointPosition,
-                                                     branch.controlPointPosition));
-                });
-            if (reciprocal == target->fiber.branches.end()) {
-                continue;
-            }
-
-            branch.branchFiberId = target->fiber.id;
-            branch.branchFileName = target->fiber.fileName;
-            branch.controlPointPosition =
-                snapshot.fiber.controlPoints[static_cast<size_t>(branch.controlPointIndex)];
-            branch.branchControlPointPosition =
-                target->fiber.controlPoints[static_cast<size_t>(branch.branchControlPointIndex)];
-
-            reciprocal->controlPointIndex = branch.branchControlPointIndex;
-            reciprocal->branchFiberId = snapshot.fiber.id;
-            reciprocal->branchControlPointIndex = branch.controlPointIndex;
-            reciprocal->branchFileName = snapshot.fiber.fileName;
-            reciprocal->controlPointPosition = branch.branchControlPointPosition;
-            reciprocal->branchControlPointPosition = branch.controlPointPosition;
-            reciprocal->controlPointDirection = branch.branchControlPointDirection;
-            reciprocal->branchControlPointDirection = branch.controlPointDirection;
-            reciprocal->pending = branch.pending;
-        }
-    }
+    vc3d::line_annotation::canonicalizeFiberSaveSnapshots(snapshots);
 }
 
 void LineAnnotationController::validateFiberSaveSnapshots(
     const std::vector<FiberSaveSnapshot>& snapshots) const
 {
-    // Geometry guard for every snapshot, linked or not: the v3 loader (and
-    // split/merge planning) requires control points to be an exact ordered
-    // subset of line_points. A violation here means a session was serialized
-    // before its geometry was finalized by a solve; writing it would produce
-    // a fiber that fails to load. Refuse the save instead.
-    for (const auto& snapshot : snapshots) {
-        if (snapshot.fiber.controlPoints.empty()) {
-            continue;
-        }
-        if (snapshot.fiber.linePoints.empty()) {
-            // Control points with no line at all cannot satisfy the subset
-            // contract either; the loader would reject the file.
-            throw std::runtime_error(
-                fiberErrorName(snapshot.fiber.fileName) +
-                ": control points present but line_points is empty; the "
-                "fiber was not finalized before saving");
-        }
-        if (!vc3d::line_annotation::orderedControlPointLineIndices(
-                vc3d::line_annotation::storedControlPointPositions(
-                    snapshot.fiber.controlPoints),
-                snapshot.fiber.linePoints)) {
-            throw std::runtime_error(
-                fiberErrorName(snapshot.fiber.fileName) +
-                ": control points are not an ordered exact subset of "
-                "line_points; the fiber was not finalized before saving");
-        }
-    }
-
-    if (snapshots.size() < 2) {
-        return;
-    }
-
-    auto findSnapshotForBranch =
-        [&snapshots](const FiberBranchRef& branch) -> const FiberSaveSnapshot* {
-        for (const auto& snapshot : snapshots) {
-            if (branchReferencesFiber(branch,
-                                      snapshot.fiber.id,
-                                      snapshot.fiber.fileName)) {
-                return &snapshot;
-            }
-        }
-        return nullptr;
-    };
-    auto fail = [](const FiberSaveSnapshot& snapshot, const std::string& reason) {
-        throw std::runtime_error(fiberErrorName(snapshot.fiber.fileName) + ": " + reason);
-    };
-
-    for (const auto& snapshot : snapshots) {
-        for (const auto& branch : snapshot.fiber.branches) {
-            const auto localIndex = matchingStoredControlPointIndex(
-                snapshot.fiber.controlPoints,
-                branch.controlPointIndex,
-                branch.controlPointPosition);
-            if (!localIndex) {
-                fail(snapshot, "local CP position mismatch");
-            }
-            if (branch.branchFileName.empty()) {
-                fail(snapshot, "missing branch_file");
-            }
-
-            const FiberSaveSnapshot* target = findSnapshotForBranch(branch);
-            if (!target) {
-                continue;
-            }
-            const auto targetIndex = matchingStoredControlPointIndex(
-                target->fiber.controlPoints,
-                branch.branchControlPointIndex,
-                branch.branchControlPointPosition);
-            if (!targetIndex) {
-                fail(snapshot, "linked CP position mismatch");
-            }
-
-            const auto reciprocal = std::find_if(
-                target->fiber.branches.begin(),
-                target->fiber.branches.end(),
-                [&snapshot, &branch](const FiberBranchRef& candidate) {
-                    return candidate.adjacent == branch.adjacent &&
-                           branchReferencesFiber(candidate,
-                                                 snapshot.fiber.id,
-                                                 snapshot.fiber.fileName) &&
-                           candidate.controlPointIndex == branch.branchControlPointIndex &&
-                           candidate.branchControlPointIndex == branch.controlPointIndex &&
-                           pointsApproximatelyEqual(candidate.controlPointPosition,
-                                                    branch.branchControlPointPosition) &&
-                           pointsApproximatelyEqual(candidate.branchControlPointPosition,
-                                                    branch.controlPointPosition) &&
-                           branchDirectionsCompatible(candidate.controlPointDirection,
-                                                      branch.branchControlPointDirection) &&
-                           branchDirectionsCompatible(candidate.branchControlPointDirection,
-                                                      branch.controlPointDirection);
-                });
-            if (reciprocal == target->fiber.branches.end()) {
-                fail(snapshot, "missing reciprocal branch");
-            }
-        }
-    }
+    vc3d::line_annotation::validateFiberSaveSnapshots(snapshots);
 }
 
 void LineAnnotationController::scheduleFiberSave(const StoredFiber& fiber)
@@ -19028,3 +18712,4 @@ QString LineAnnotationController::takeLastSuppressedError()
     _lastSuppressedError.clear();
     return message;
 }
+
