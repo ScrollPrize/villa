@@ -4,6 +4,7 @@
 
 #include <QDialog>
 #include <array>
+#include <vector>
 
 class QCheckBox;
 class QDoubleSpinBox;
@@ -12,8 +13,8 @@ class QLineEdit;
 class QSpinBox;
 
 // Options of a new Automated Fiber Volume: output file, zone of the current
-// volume, model and Python. The caller adds the volume and its coordinate
-// identity to the request. Choices are remembered.
+// volume and its blocks, model and Python. The caller adds the volume and its
+// coordinate identity to the request. Choices are remembered.
 class FiberCollectionGeneratorDialog : public QDialog
 {
     Q_OBJECT
@@ -23,13 +24,19 @@ public:
     vc3d::fibergen::Request request() const;
     // Empty to detect Python automatically.
     QString pythonExecutable() const;
+    // The blocks of the chosen zone, in processing order.
+    std::vector<vc3d::fibergen::Block> blocks() const;
     void accept() override;
+
+signals:
+    void zoneChanged();
 
 private:
     std::array<int, 3> shape_;
     QLineEdit* output_{};
     std::array<QSpinBox*, 3> center_{};
     std::array<QSpinBox*, 3> size_{};
+    QSpinBox* blockSize_{};
     QLabel* zone_{};
     QLineEdit* model_{};
     QCheckBox* mirror_{};

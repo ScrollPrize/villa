@@ -7,15 +7,18 @@
 #include <array>
 #include <cstdint>
 #include <optional>
+#include <vector>
 
 // Runs of `python -m vesuvius.afv_spline_generator`, which predicts fibers in a
-// zone of CT and writes them as an Automated Fiber Volume.
+// zone of CT block by block, stitches them into long fibers and writes them as
+// an Automated Fiber Volume.
 namespace vc3d::fibergen
 {
 
 inline constexpr auto kModule = "vesuvius.afv_spline_generator";
 inline constexpr auto kDefaultModel = "Qualzz20/afv_fiber_9um";
 inline constexpr double kDefaultThresholdPercent = 60.0;
+inline constexpr int kDefaultBlockSize = 512;
 
 struct Request {
     // Local OME-Zarr directory or http(s) URL, and the array read as the volume.
@@ -33,17 +36,39 @@ struct Request {
     QString model = kDefaultModel;
     bool mirror = true;
     double thresholdPercent = kDefaultThresholdPercent;
+    int blockSize = kDefaultBlockSize;
+    // Receives a .afv of the fibers stitched so far after each block; empty for none.
+    QString previewDirectory;
 };
+
+// A block of the zone, in XYZ voxels of the volume.
+struct Block {
+    std::array<int, 3> origin{};
+    std::array<int, 3> size{};
+    bool operator==(const Block&) const = default;
+};
+
+// The zone cut into cubes of `blockSize`, the last ones shorter, x varying
+// fastest: the blocks the generator processes, in its order.
+std::vector<Block> zoneBlocks(const std::array<int, 3>& origin, const std::array<int, 3>& size, int blockSize);
 
 // Arguments after the Python executable, with progress as JSON lines.
 QStringList arguments(const Request& request);
 
 struct Event {
-    enum class Kind { Progress, Warning, Done, Error };
+    enum class Kind { Progress, Plan, Block, Preview, Warning, Done, Error };
     Kind kind{};
     QString message;
     // Completed part of the run, from 0 to 1.
     double fraction = 0.0;
+    // Plan: every block of the run.
+    std::vector<Block> blocks;
+    // Block: the block and its new state (reading, predicting, splines,
+    // stitching, stitched, extending or done).
+    int index = -1;
+    QString state;
+    // Preview: a .afv of the fibers stitched so far.
+    QString path;
     // Done only.
     QString output;
     qint64 fibers = 0;

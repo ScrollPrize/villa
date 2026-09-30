@@ -1,8 +1,9 @@
 """Generate an Automated Fiber Volume (.afv) from a zone of a CT volume.
 
-A fiber model predicts vertical and horizontal fiber probabilities over the
-zone, smooth polylines are fitted to them (see ``splines``) and written in
-native L0 coordinates, ready to open in VC3D.
+The zone is processed in blocks. In each block a fiber model predicts vertical
+and horizontal fiber probabilities and smooth polylines are fitted to them
+(see ``splines``). The blocks' polylines are then stitched into long fibers
+(see ``extend``) and written in native L0 coordinates, ready to open in VC3D.
 """
 
 from __future__ import annotations
@@ -13,8 +14,10 @@ import json
 import os
 import signal
 import sys
+import tempfile
 import time
 import traceback
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
@@ -27,17 +30,24 @@ DEFAULT_MODEL = "Qualzz20/afv_fiber_9um"
 DEFAULT_THRESHOLD = 60.0
 # Voxel sizes of the scans DEFAULT_MODEL was trained on, in micrometres.
 DEFAULT_MODEL_VOXEL_SIZES = (8.64, 9.362)
+DEFAULT_BLOCK_SIZE = 512
+# Each block is predicted with this much context on every side, so the
+# splines of neighbouring blocks overlap and can be joined.
+BLOCK_MARGIN = 32
+GAP_MODEL = Path(__file__).parent / "extend" / "gap_model.pt"
 
 
 class Reporter:
     """Progress as text on stderr, or as JSON lines on stdout for VC3D.
 
     JSON events have an ``event`` of ``progress`` (with ``stage``, ``message``
-    and the completed ``fraction`` of the run), ``warning``, ``done`` or
-    ``error``.
+    and the completed ``fraction`` of the run), ``plan`` (the ``blocks``, each
+    an ``origin`` and ``size`` in volume voxels), ``block`` (the ``index`` of
+    a block and its new ``state``), ``preview`` (the ``path`` of a .afv with
+    the fibers stitched so far), ``warning``, ``done`` or ``error``.
     """
 
-    STAGES = {"read": (0.0, 0.04), "model": (0.04, 0.08), "predict": (0.08, 0.85), "splines": (0.85, 0.97), "write": (0.97, 1.0)}
+    STAGES = {"read": (0.0, 0.01), "model": (0.01, 0.04), "blocks": (0.04, 0.85), "stitch": (0.85, 0.97), "write": (0.97, 1.0)}
 
     def __init__(self, json_lines: bool):
         self.json_lines = json_lines
@@ -51,7 +61,7 @@ class Reporter:
             print(f"[{fields['fraction']:6.1%}] {fields['message']}", file=sys.stderr, flush=True)
         elif event == "done":
             print(f"Wrote {fields['fibers']} fibers to {fields['output']}", flush=True)
-        else:
+        elif event in ("warning", "error"):
             print(f"{event}: {fields['message']}", file=sys.stderr, flush=True)
 
     def __call__(self, stage: str, message: str, done: int = 0, total: int = 0) -> None:
@@ -88,6 +98,50 @@ def zone_slices(shape_zyx: Sequence[int], origin_xyz: Sequence[int], size_xyz: S
             raise ValueError(f"The zone [{start}, {start + size}) exceeds the volume along {axis} (size {extent})")
         zone.append(slice(start, start + size))
     return tuple(zone)
+
+
+def zone_blocks(origin_xyz: Sequence[int], size_xyz: Sequence[int], block: int) -> list[tuple[list[int], list[int]]]:
+    """The zone cut into blocks of ``block`` voxels, the last ones shorter, x varying fastest."""
+    if block < 1:
+        raise ValueError("--block-size must be at least 1")
+    axes = [[(o + start, min(block, s - start)) for start in range(0, s, block)] for o, s in zip(origin_xyz, size_xyz)]
+    return [([x, y, z], [sx, sy, sz]) for z, sz in axes[2] for y, sy in axes[1] for x, sx in axes[0]]
+
+
+class RegionReader:
+    """Reads small regions of a volume through a cache of its storage chunks."""
+
+    def __init__(self, volume, budget: int = 64 * 1024**2):
+        self.volume = volume
+        self.chunks = np.asarray(volume.chunks, dtype=int)
+        self.shape = np.asarray(volume.shape, dtype=int)
+        self.cache: OrderedDict[tuple[int, ...], np.ndarray] = OrderedDict()
+        self.budget = budget
+        self.bytes = 0
+
+    def _chunk(self, key: tuple[int, ...]) -> np.ndarray:
+        if key in self.cache:
+            self.cache.move_to_end(key)
+            return self.cache[key]
+        start = np.asarray(key) * self.chunks
+        block = np.asarray(self.volume[tuple(slice(int(a), int(b)) for a, b in zip(start, np.minimum(start + self.chunks, self.shape)))])
+        self.cache[key] = block
+        self.bytes += block.nbytes
+        while self.bytes > self.budget and len(self.cache) > 1:
+            self.bytes -= self.cache.popitem(last=False)[1].nbytes
+        return block
+
+    def __call__(self, low_xyz: Sequence[int], high_xyz: Sequence[int]) -> np.ndarray:
+        low, high = np.asarray(low_xyz, dtype=int)[::-1], np.asarray(high_xyz, dtype=int)[::-1]
+        out = np.empty(tuple(high - low), dtype=self.volume.dtype)
+        for key in np.ndindex(tuple((high - 1) // self.chunks - low // self.chunks + 1)):
+            key = tuple(int(k) for k in np.asarray(key) + low // self.chunks)
+            start = np.asarray(key) * self.chunks
+            a, b = np.maximum(low, start), np.minimum(high, start + self.chunks)
+            out[tuple(slice(int(x), int(y)) for x, y in zip(a - low, b - low))] = self._chunk(key)[
+                tuple(slice(int(x), int(y)) for x, y in zip(a - start, b - start))
+            ]
+        return out
 
 
 def select_device(name: str):
@@ -171,6 +225,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_THRESHOLD,
         help=f"Minimum fiber probability in percent (default: {DEFAULT_THRESHOLD:g})",
     )
+    parser.add_argument(
+        "--block-size",
+        type=int,
+        default=DEFAULT_BLOCK_SIZE,
+        help=f"The zone is processed in cubes of this many voxels per side (default: {DEFAULT_BLOCK_SIZE})",
+    )
+    parser.add_argument("--preview-dir", type=Path, help="Folder receiving a .afv of the fibers stitched so far after each block")
     parser.add_argument("--device", default="auto", help="auto (default), cuda, cuda:N, mps or cpu")
     parser.add_argument("--progress", choices=("text", "json"), default="text", help="Progress as text on stderr, or JSON lines on stdout")
     return parser
@@ -204,9 +265,12 @@ def generate(args: argparse.Namespace, report: Reporter) -> dict[str, Any]:
 
     report("read", "Opening the volume")
     volume = open_volume(args.volume, args.level)
-    zone = zone_slices(volume.shape, args.origin, args.size)
-    report("read", "Reading {} × {} × {} voxels".format(*args.size))
-    ct = np.asarray(volume[zone])
+    zone_slices(volume.shape, args.origin, args.size)
+    blocks = zone_blocks(args.origin, args.size, args.block_size)
+    shape_xyz = np.asarray(volume.shape[::-1], dtype=int)
+    report.emit("plan", blocks=[{"origin": origin, "size": size} for origin, size in blocks], block_size=args.block_size)
+    if args.preview_dir is not None and not args.preview_dir.is_dir():
+        raise FileNotFoundError(f"The folder {args.preview_dir} does not exist")
 
     device = select_device(args.device)
     report("model", f"Loading {args.model} on {device}")
@@ -215,46 +279,13 @@ def generate(args: argparse.Namespace, report: Reporter) -> dict[str, Any]:
     folder, provenance = resolve_model(args.model)
     network, patch = load_network(folder, device)
     mirror = not args.no_mirror
-    probabilities = predict_fibers(
-        network,
-        ct,
-        patch,
-        device=device,
-        mirror=mirror,
-        progress=lambda done, total: report("predict", f"Predicting fibers · window {done} of {total}", done, total),
-    )
-    del ct, network
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
 
-    names = {"V": ("vertical", 0), "H": ("horizontal", 1)}
+    from .extend.ct_support import CTSupport
+    from .extend.gap_model import Predictor, geometry_features
+    from .extend.stitch import Stitcher
 
-    def spline_progress(family: str, done: int, total: int) -> None:
-        name, index = names[family]
-        report("splines", f"Fitting {name} fibers · {done} of {total} pieces", index * total + done, 2 * total)
-
-    traces = extract_splines(probabilities, threshold, spline_progress)
-    del probabilities
-
-    origin = np.asarray(args.origin, dtype=np.float64)
-    voxel_mm = args.voxel_size / 1000 if args.voxel_size else None
-
-    def fibers() -> Iterator[Fiber]:
-        for index, (family, line) in enumerate(traces, 1):
-            points = (line[:, ::-1] + origin) * args.native_scale
-            length = float(np.linalg.norm(np.diff(points, axis=0), axis=1).sum())
-            annotation = {
-                "type": "vc3d_fiber",
-                "version": 1,
-                "sequence": index,
-                "hv_classification": {"manual_tag": family},
-                "control_points": [points[0].tolist(), points[-1].tolist()],
-                "length_voxels": length,
-            }
-            if voxel_mm:
-                annotation["length_mm"] = length * voxel_mm
-            yield Fiber(name=f"fiber_{index}", family=family, points=points, annotation=annotation)
-
+    gap_model = Predictor(GAP_MODEL)
+    voxel_microns = args.voxel_size * args.native_scale if args.voxel_size else float(gap_model.metadata["voxelMicrons"])
     frame = {
         "vc_open_data_coordinate_space": args.coordinate_space,
         "vc_open_data_source_coordinate_level": 0,
@@ -265,7 +296,7 @@ def generate(args: argparse.Namespace, report: Reporter) -> dict[str, Any]:
         root["vc_open_data_source_path"] = args.source_path
     if args.voxel_size:
         root["vc_open_data_source_original_resolution"] = args.voxel_size
-        root["voxel_size_mm"] = voxel_mm
+        root["voxel_size_mm"] = args.voxel_size / 1000
     if args.native_scale == 1:
         # Only known exactly when the volume is the native volume.
         root["coordinate_base_shape_zyx"] = list(volume.shape)
@@ -279,10 +310,124 @@ def generate(args: argparse.Namespace, report: Reporter) -> dict[str, Any]:
         "origin_xyz": list(args.origin),
         "size_xyz": list(args.size),
         "native_scale": args.native_scale,
+        "block_size": args.block_size,
+        "block_margin": BLOCK_MARGIN,
+        "gap_model": gap_model.metadata.get("modelName", GAP_MODEL.name),
     }
+
+    def write(path: Path, traces: list[dict[str, Any]]) -> dict[str, Any]:
+        return write_afv(path, afv_fibers(traces, args.native_scale, args.voxel_size), frame=frame, root=root, metadata={"generator": generator})
+
+    names = {"V": "vertical", "H": "horizontal"}
+    count = len(blocks)
+    with tempfile.TemporaryDirectory(prefix="afv-stitch-") as scratch:
+        stitcher = Stitcher(scratch)
+        try:
+            for index, (origin, size) in enumerate(blocks):
+                label = f"Block {index + 1} of {count}"
+
+                def step(fraction: float, message: str) -> None:
+                    report("blocks", f"{label} · {message}", int(1000 * (index + fraction)), 1000 * count)
+
+                low = np.maximum(np.asarray(origin) - BLOCK_MARGIN, 0)
+                high = np.minimum(np.asarray(origin) + np.asarray(size) + BLOCK_MARGIN, shape_xyz)
+                report.emit("block", index=index, state="reading")
+                step(0.0, "reading the CT")
+                ct = np.asarray(volume[tuple(slice(int(a), int(b)) for a, b in zip(low[::-1], high[::-1]))])
+                report.emit("block", index=index, state="predicting")
+                probabilities = predict_fibers(
+                    network,
+                    ct,
+                    patch,
+                    device=device,
+                    mirror=mirror,
+                    progress=lambda done, total: step(0.05 + 0.8 * done / total, f"predicting fibers · window {done} of {total}"),
+                )
+                del ct
+                report.emit("block", index=index, state="splines")
+
+                def spline_progress(family: str, done: int, total: int) -> None:
+                    part = (0 if family == "V" else 1) + (done / total if total else 1)
+                    step(0.85 + 0.05 * part, f"fitting {names[family]} fibers · {done} of {total} pieces")
+
+                traces = extract_splines(probabilities, threshold, spline_progress)
+                del probabilities
+                report.emit("block", index=index, state="stitching")
+                step(0.95, f"joining {len(traces)} fibers to the neighbouring blocks")
+                stitcher.add_block(f"block-{index}", low.tolist(), (high - low).tolist(), traces,
+                                   (np.asarray(origin), np.asarray(origin) + np.asarray(size)))
+                report.emit("block", index=index, state="stitched")
+                if args.preview_dir is not None:
+                    preview = args.preview_dir.expanduser().absolute() / f"preview-{index + 1:04d}.afv"
+                    chains = list(stitcher.chains())
+                    write(preview, chains)
+                    report.emit("preview", path=str(preview), fibers=len(chains))
+            del network
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+            ct_support = CTSupport(RegionReader(volume), shape_xyz)
+
+            def score(proposals: list[dict[str, Any]], row: dict[str, Any]) -> np.ndarray:
+                features = np.stack(
+                    [geometry_features(p["a"], p["b"], p["context"], family=row["family"], voxel_microns=voxel_microns) for p in proposals]
+                )
+                return gap_model.score(features)
+
+            def measure(a: np.ndarray, b: np.ndarray) -> dict[str, Any]:
+                evidence = ct_support.features(a, b)
+                return dict(state="available" if evidence["valid"] else "unavailable", status=evidence["status"])
+
+            owner = {}
+            for cid in stitcher.chain_ids():
+                curve = stitcher.catalog.get_curve(cid, include_provenance=False)
+                middle = np.asarray(curve["points"][len(curve["points"]) // 2])
+                owner[cid] = next(
+                    (i for i, (o, sz) in enumerate(blocks) if np.all(middle >= o) and np.all(middle < np.asarray(o) + sz)),
+                    int(np.argmin([np.linalg.norm(middle - (np.asarray(o) + np.asarray(sz) / 2)) for o, sz in blocks])),
+                )
+            remaining = np.bincount(list(owner.values()), minlength=count)
+            for index in range(count):
+                report.emit("block", index=index, state="extending" if remaining[index] else "done")
+            order = stitcher.chain_ids()
+
+            def expand_progress(done: int, total: int) -> None:
+                if done:
+                    block = owner[order[done - 1]]
+                    remaining[block] -= 1
+                    if remaining[block] == 0:
+                        report.emit("block", index=int(block), state="done")
+                report("stitch", f"Extending fibers across gaps · {done} of {total}", done, total)
+
+            traces = stitcher.expand(score, measure, expand_progress)
+        finally:
+            stitcher.close()
+
     report("write", f"Writing {len(traces)} fibers")
-    written = write_afv(output, fibers(), frame=frame, root=root, metadata={"generator": generator})
+    written = write(output, traces)
     return {"output": str(output), "fibers": written["fiber_count"], "points": written["point_count"], "uuid": written["uuid"]}
+
+
+def afv_fibers(traces: list[dict[str, Any]], native_scale: int, voxel_size: float | None) -> Iterator[Fiber]:
+    families = {0: "V", 1: "H"}
+    for index, trace in enumerate(traces, 1):
+        points = np.asarray(trace["points"], dtype=np.float64) * native_scale
+        length = float(np.linalg.norm(np.diff(points, axis=0), axis=1).sum())
+        family = families[trace["family"]]
+        annotation = {
+            "type": "vc3d_fiber",
+            "version": 1,
+            "sequence": index,
+            "hv_classification": {"manual_tag": family},
+            "control_points": [points[0].tolist(), points[-1].tolist()],
+            "length_voxels": length,
+        }
+        if voxel_size:
+            annotation["length_mm"] = length * voxel_size / 1000
+        if trace.get("gaps"):
+            # Point index ranges bridging a gap between two observed pieces.
+            annotation["inferred_gap_point_ranges"] = trace["gaps"]
+        yield Fiber(name=f"fiber_{index}", family=family, points=points, annotation=annotation)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

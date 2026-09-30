@@ -238,6 +238,7 @@ vesuvius = [
     "tifxyz_label_transfer/*.cpp",
     "tifxyz_label_transfer/*.md",
     "tifxyz_label_transfer/docs/*.md",
+    "afv_spline_generator/extend/*.pt",
 ]
 
 [tool.setuptools.cmdclass]

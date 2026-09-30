@@ -22,15 +22,35 @@ or use **File → Open Automated Fiber Volume…**. The dock is under
 
 ## Create
 
-**Create volume…** in the dock predicts fibers in a zone of the current CT
-volume with a fiber model and opens the result as **Open** does. Choose
-where to save the new `.afv` (an existing file is never replaced) and the zone,
-centered on the focus point by default and at most 1,024 voxels per side, in
-voxels of the current volume. **Model**, **Test-time mirroring** (better
-predictions, about 8× slower) and **Fiber threshold** are remembered.
+**Generate automated fibers…** in the dock predicts fibers in a zone of the
+current CT volume with a fiber model, stitches them into long fibers and opens
+the result as **Open** does. Choose where to save the new `.afv` (an existing
+file is never replaced) and the zone, in voxels of the current volume: a
+512-voxel cube centered on the focus point by default, of any size up to the
+volume. The zone is processed in cubes of **Block size** voxels (512 by
+default); while the dialog is open, the blocks are drawn on the CT views and
+the dialog shows how many there are. **Block size**, **Model**, **Test-time
+mirroring** (better predictions, about 8× slower) and **Fiber threshold** are
+remembered.
 
 VC3D runs `python -m vesuvius.afv_spline_generator` in the background and shows
-its progress under the button; **Cancel** stops it. Python is the one given in
+its progress under the button; **Cancel** stops it. Each block is drawn on the
+CT views in the color of its stage, labelled **Block N · stage** when it is
+large enough:
+
+| Stage | Color |
+| --- | --- |
+| waiting | grey |
+| reading CT | light blue |
+| predicting | blue |
+| fitting splines | purple |
+| stitching | orange |
+| stitched | yellow |
+| extending | pink |
+| done | green |
+
+After each block, the fibers stitched so far are shown as a preview; the
+final volume replaces it when the extension is done. Python is the one given in
 the dialog, or else found as for Neural Trace (`PYTHON_EXECUTABLE`, the active
 conda environment, `~/miniconda3`, `~/anaconda3`, then the `PATH`); it needs
 `vesuvius[models]` and, for reasonable speed, a GPU. When VC3D runs from a

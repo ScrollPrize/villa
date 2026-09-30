@@ -20,7 +20,6 @@
 
 namespace
 {
-constexpr int kMaxZoneSize = 1024;
 constexpr int kDefaultZoneSize = 512;
 // Voxel sizes of the scans the default model was trained on: 8.64 and 9.362 µm.
 constexpr double kDefaultModelMinVoxelUm = 8.0;
@@ -30,6 +29,7 @@ constexpr auto kMirrorKey = "fiberCollections/generator/mirror";
 constexpr auto kThresholdKey = "fiberCollections/generator/thresholdPercent";
 constexpr auto kPythonKey = "fiberCollections/generator/python";
 constexpr auto kSizeKey = "fiberCollections/generator/zoneSize";
+constexpr auto kBlockSizeKey = "fiberCollections/generator/blockSize";
 constexpr auto kDirectoryKey = "fiberCollections/generator/directory";
 }  // namespace
 
@@ -41,8 +41,8 @@ FiberCollectionGeneratorDialog::FiberCollectionGeneratorDialog(
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     auto* layout = new QVBoxLayout(this);
     auto* intro = new QLabel(
-        tr("Predict fibers in a zone of the current volume, fit smooth polylines to them and open the result. "
-           "Runs Python with the vesuvius package in the background."),
+        tr("Predict fibers in a zone of the current volume block by block, stitch them into long fibers and open the result. "
+           "The blocks are drawn on the CT views. Runs Python with the vesuvius package in the background."),
         this);
     intro->setWordWrap(true);
     layout->addWidget(intro);
@@ -79,7 +79,7 @@ FiberCollectionGeneratorDialog::FiberCollectionGeneratorDialog(
         center_[i]->setPrefix(QStringLiteral("%1 ").arg(QLatin1Char("XYZ"[i])));
         centerRow->addWidget(center_[i]);
         size_[i] = new QSpinBox(this);
-        size_[i]->setRange(1, std::clamp(shape_[i], 1, kMaxZoneSize));
+        size_[i]->setRange(1, std::max(shape_[i], 1));
         size_[i]->setSingleStep(64);
         size_[i]->setValue(std::min(savedSize, shape_[i]));
         size_[i]->setPrefix(QStringLiteral("%1 ").arg(QLatin1Char("XYZ"[i])));
@@ -89,6 +89,13 @@ FiberCollectionGeneratorDialog::FiberCollectionGeneratorDialog(
     }
     form->addRow(tr("Zone center (voxels)"), centerRow);
     form->addRow(tr("Zone size (voxels)"), sizeRow);
+    blockSize_ = new QSpinBox(this);
+    blockSize_->setRange(128, 2048);
+    blockSize_->setSingleStep(64);
+    blockSize_->setValue(settings.value(kBlockSizeKey, vc3d::fibergen::kDefaultBlockSize).toInt());
+    blockSize_->setToolTip(tr("The zone is processed in cubes of this size; the fibers of neighbouring cubes are stitched together."));
+    connect(blockSize_, &QSpinBox::valueChanged, this, &FiberCollectionGeneratorDialog::updateZone);
+    form->addRow(tr("Block size (voxels)"), blockSize_);
     zone_ = new QLabel(this);
     zone_->setWordWrap(true);
     form->addRow(QString(), zone_);
@@ -149,14 +156,21 @@ std::array<int, 3> FiberCollectionGeneratorDialog::zoneOrigin() const
     return vc3d::fibergen::zoneOrigin({center_[0]->value(), center_[1]->value(), center_[2]->value()}, zoneSize(), shape_);
 }
 
+std::vector<vc3d::fibergen::Block> FiberCollectionGeneratorDialog::blocks() const
+{
+    return vc3d::fibergen::zoneBlocks(zoneOrigin(), zoneSize(), blockSize_->value());
+}
+
 void FiberCollectionGeneratorDialog::updateZone()
 {
     const auto from = zoneOrigin();
     const auto extent = zoneSize();
-    zone_->setText(tr("X %1–%2, Y %3–%4, Z %5–%6 of the current volume")
+    const auto count = blocks().size();
+    zone_->setText(tr("X %1–%2, Y %3–%4, Z %5–%6 of the current volume · %n block(s) to process", nullptr, int(count))
                        .arg(from[0]).arg(from[0] + extent[0] - 1)
                        .arg(from[1]).arg(from[1] + extent[1] - 1)
                        .arg(from[2]).arg(from[2] + extent[2] - 1));
+    emit zoneChanged();
 }
 
 vc3d::fibergen::Request FiberCollectionGeneratorDialog::request() const
@@ -168,6 +182,7 @@ vc3d::fibergen::Request FiberCollectionGeneratorDialog::request() const
     request.model = model_->text().trimmed().isEmpty() ? QString(vc3d::fibergen::kDefaultModel) : model_->text().trimmed();
     request.mirror = mirror_->isChecked();
     request.thresholdPercent = threshold_->value();
+    request.blockSize = blockSize_->value();
     return request;
 }
 
@@ -202,6 +217,7 @@ void FiberCollectionGeneratorDialog::accept()
     settings.setValue(kModelKey, request().model);
     settings.setValue(kMirrorKey, mirror_->isChecked());
     settings.setValue(kThresholdKey, threshold_->value());
+    settings.setValue(kBlockSizeKey, blockSize_->value());
     settings.setValue(kPythonKey, pythonExecutable());
     QDialog::accept();
 }

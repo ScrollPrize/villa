@@ -74,6 +74,38 @@ def test_generates_a_volume_in_native_coordinates(monkeypatch, capsys, volume, t
     assert json.loads(annotation)["length_mm"] == pytest.approx(length * 0.0045)
 
 
+def test_blocks_are_stitched_and_previewed(monkeypatch, capsys, volume, tmp_path):
+    output = tmp_path / "fibers.afv"
+    previews = tmp_path / "previews"
+    previews.mkdir()
+    code, events = run(monkeypatch, capsys, volume, output, "--block-size", "48", "--preview-dir", str(previews))
+    assert code == 0
+    plan = next(e for e in events if e["event"] == "plan")
+    assert plan["blocks"] == [{"origin": [4, 10, 8], "size": [48, 40, 30]}, {"origin": [52, 10, 8], "size": [40, 40, 30]}]
+    for index in (0, 1):
+        states = [e["state"] for e in events if e["event"] == "block" and e["index"] == index]
+        assert states[:5] == ["reading", "predicting", "splines", "stitching", "stitched"] and states[-1] == "done"
+    shown = [e for e in events if e["event"] == "preview"]
+    assert [e["path"] for e in shown] == [str(previews / "preview-0001.afv"), str(previews / "preview-0002.afv")]
+    assert all(e["fibers"] == 1 for e in shown)
+    # Both blocks see the fiber; it is written once.
+    assert events[-1]["fibers"] == 1
+
+
+def test_zone_is_cut_into_blocks():
+    assert cli.zone_blocks([4, 10, 8], [88, 40, 30], 48) == [([4, 10, 8], [48, 40, 30]), ([52, 10, 8], [40, 40, 30])]
+    assert len(cli.zone_blocks([0, 0, 0], [1024, 1024, 512], 512)) == 4
+    assert cli.zone_blocks([0, 0, 0], [1024, 1024, 512], 512)[1] == ([512, 0, 0], [512, 512, 512])
+
+
+def test_region_reader_matches_the_volume(volume):
+    array = cli.open_volume(str(volume), 0)
+    read = cli.RegionReader(array, budget=3 * 16**3)
+    for low, high in (([0, 0, 0], [96, 64, 48]), ([5, 17, 31], [70, 40, 33]), ([90, 60, 40], [96, 64, 48])):
+        assert np.array_equal(read(low, high), array[low[2]:high[2], low[1]:high[1], low[0]:high[0]])
+    assert len(read.cache) <= 3
+
+
 def test_reports_errors_as_json_and_writes_nothing(monkeypatch, capsys, volume, tmp_path):
     output = tmp_path / "fibers.afv"
     code, events = run(monkeypatch, capsys, volume, output, "--level", "1")
