@@ -85,6 +85,10 @@ std::array<int, 3> zoneOrigin(const std::array<int, 3>& center, const std::array
 // must be installed in the Python environment.
 QString vesuviusSourceDirectory(const QString& applicationDirectory);
 
+// The Python of the environment next to `vesuviusSource` (vesuvius/.venv, as
+// `uv sync` creates it), or empty.
+QString checkoutPython(const QString& vesuviusSource);
+
 // `environment` with `vesuviusSource`, if any, first on PYTHONPATH.
 QProcessEnvironment environment(QProcessEnvironment environment, const QString& vesuviusSource);
 

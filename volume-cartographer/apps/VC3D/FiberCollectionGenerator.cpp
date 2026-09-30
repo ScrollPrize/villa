@@ -140,6 +140,19 @@ QString vesuviusSourceDirectory(const QString& applicationDirectory)
     return {};
 }
 
+QString checkoutPython(const QString& vesuviusSource)
+{
+    if (vesuviusSource.isEmpty())
+        return {};
+    const QDir venv(QDir(vesuviusSource).filePath("../.venv"));
+    for (const auto* relative : {"bin/python", "Scripts/python.exe"}) {
+        const auto path = venv.filePath(relative);
+        if (QFileInfo(path).isExecutable())
+            return QDir::cleanPath(path);
+    }
+    return {};
+}
+
 QProcessEnvironment environment(QProcessEnvironment environment, const QString& vesuviusSource)
 {
     if (vesuviusSource.isEmpty())

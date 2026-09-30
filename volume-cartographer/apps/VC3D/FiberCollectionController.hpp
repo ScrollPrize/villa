@@ -81,7 +81,7 @@ private:
     QPushButton* generatorCancel_{};
     QLabel* generatorStatus_{};
     QPointer<QProcess> generator_;
-    QString generatorOutput_, generatorError_, generatorSpace_;
+    QString generatorOutput_, generatorError_, generatorSpace_, generatorPython_;
     QStringList generatorLog_;
     // Receives the generator's previews; removed with them when the run ends.
     std::unique_ptr<QTemporaryDir> generatorPreview_;

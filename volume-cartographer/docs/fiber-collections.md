@@ -50,12 +50,16 @@ large enough:
 | done | green |
 
 After each block, the fibers stitched so far are shown as a preview; the
-final volume replaces it when the extension is done. Python is the one given in
-the dialog, or else found as for Neural Trace (`PYTHON_EXECUTABLE`, the active
-conda environment, `~/miniconda3`, `~/anaconda3`, then the `PATH`); it needs
-`vesuvius[models]` and, for reasonable speed, a GPU. When VC3D runs from a
-build inside a villa checkout, that checkout's `vesuvius/src` is put first on
-`PYTHONPATH`. The volume must be readable by Python: a local Zarr or a public
+final volume replaces it when the extension is done.
+
+When VC3D runs from a build inside a villa checkout, that checkout's
+`vesuvius/src` is put first on `PYTHONPATH`. Python is the one given in the
+dialog; else, from a checkout, `vesuvius/.venv` as created by `uv sync`; else
+it is found as for Neural Trace (`PYTHON_EXECUTABLE`, the active conda
+environment, `~/miniconda3`, `~/anaconda3`, then the `PATH`). An application
+started from the Finder or a desktop menu doesn't see the conda environment of
+a shell. Python needs the dependencies of `vesuvius[models]` and, for
+reasonable speed, a GPU. The volume must be readable by Python: a local Zarr or a public
 `http(s)://` one, and it needs a coordinate identity (see
 [Coordinates](#coordinates)). The method and the command line are described in
 [`vesuvius/docs/afv_spline_generator.md`](../../vesuvius/docs/afv_spline_generator.md).

@@ -38,6 +38,7 @@
 #include <QProcess>
 #include <QProgressBar>
 #include <QPushButton>
+#include <QRegularExpression>
 #include <QSaveFile>
 #include <QScopeGuard>
 #include <QSettings>
@@ -690,17 +691,22 @@ void FiberCollectionController::createCollection()
     generatorPreview_ = std::make_unique<QTemporaryDir>();
     if (generatorPreview_->isValid())
         request.previewDirectory = generatorPreview_->path();
-    const auto python = dialog.pythonExecutable().isEmpty() ? vc3d::findPythonExecutable() : dialog.pythonExecutable();
+    const auto vesuviusSource = vc3d::fibergen::vesuviusSourceDirectory(QCoreApplication::applicationDirPath());
+    auto python = dialog.pythonExecutable();
+    if (python.isEmpty())
+        python = vc3d::fibergen::checkoutPython(vesuviusSource);
+    if (python.isEmpty())
+        python = vc3d::findPythonExecutable();
     const auto arguments = vc3d::fibergen::arguments(request);
 
     generatorOutput_.clear();
     generatorError_.clear();
     generatorLog_.clear();
     generatorSpace_ = request.coordinateSpace;
+    generatorPython_ = python;
     auto* process = new QProcess(this);
     generator_ = process;
-    process->setProcessEnvironment(vc3d::fibergen::environment(
-        QProcessEnvironment::systemEnvironment(), vc3d::fibergen::vesuviusSourceDirectory(QCoreApplication::applicationDirPath())));
+    process->setProcessEnvironment(vc3d::fibergen::environment(QProcessEnvironment::systemEnvironment(), vesuviusSource));
     connect(process, &QProcess::readyReadStandardOutput, this, &FiberCollectionController::readGeneratorOutput);
     connect(process, &QProcess::readyReadStandardError, this, [this, process]() {
         const auto text = QString::fromUtf8(process->readAllStandardError());
@@ -790,6 +796,10 @@ void FiberCollectionController::finishGenerator(int exitCode, bool crashed)
         auto message = generatorError_;
         if (message.isEmpty())
             message = generatorLog_.isEmpty() ? tr("The generator stopped (exit code %1).").arg(exitCode) : generatorLog_.last();
+        const auto missing = QRegularExpression("No module named '([^']+)'").match(message);
+        if (missing.hasMatch())
+            message = tr("%1 has no module %2. In Generate automated fibers…, choose the Python of an environment where vesuvius[models] is installed.")
+                          .arg(generatorPython_, missing.captured(1));
         showGeneratorStatus(tr("No volume created: %1").arg(message));
         return;
     }

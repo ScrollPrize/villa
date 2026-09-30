@@ -141,6 +141,19 @@ private slots:
         QCOMPARE(vesuviusSourceDirectory(app), QDir::cleanPath(source));
         QVERIFY(vesuviusSourceDirectory(root.path()).isEmpty());
 
+        QVERIFY(checkoutPython(source).isEmpty());
+#ifdef Q_OS_WIN
+        QFile python(root.filePath("villa/vesuvius/.venv/Scripts/python.exe"));
+#else
+        QFile python(root.filePath("villa/vesuvius/.venv/bin/python"));
+#endif
+        QVERIFY(QDir().mkpath(QFileInfo(python).absolutePath()));
+        QVERIFY(python.open(QIODevice::WriteOnly));
+        python.close();
+        QVERIFY(python.setPermissions(python.permissions() | QFileDevice::ExeOwner));
+        QCOMPARE(checkoutPython(source), QDir::cleanPath(python.fileName()));
+        QVERIFY(checkoutPython(QString()).isEmpty());
+
         QProcessEnvironment inherited;
         inherited.insert("PYTHONPATH", "/other");
         QCOMPARE(environment(inherited, source).value("PYTHONPATH"), source + QDir::listSeparator() + "/other");
