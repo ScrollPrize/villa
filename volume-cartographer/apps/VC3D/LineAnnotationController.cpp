@@ -13946,32 +13946,11 @@ void LineAnnotationController::loadFibersForCurrentPackage()
                   });
     };
 
-    auto loadStrictFibers = [&]() {
-        std::vector<StoredFiber> strictFibers;
-        std::vector<std::string> strictErrors;
-        for (const auto& [source, path] : fiberFiles) {
-            try {
-                if (auto fiber = loadFiberFile(path)) {
-                    fiber->sourceRoot = source;
-                    strictFibers.push_back(std::move(*fiber));
-                }
-            } catch (const std::exception& ex) {
-                strictErrors.push_back(
-                    fiberErrorName(path.filename().string()) + ": " + ex.what());
-            }
-        }
-        sortLoadedFibers(strictFibers);
-        dedupeLoadedFiberSources(strictFibers, sources);
-        healOneSidedAdjacentLinks(strictFibers);
-        (void)validateLoadedFiberLinks(strictFibers, strictErrors);
-        return std::pair<std::vector<StoredFiber>, std::vector<std::string>>{
-            std::move(strictFibers),
-            std::move(strictErrors)};
-    };
-
     std::vector<StoredFiber> loadedFibers;
     std::vector<std::string> fatalLoadErrors;
     std::vector<std::string> branchLoadErrors;
+    std::size_t neutralizedLinkEntries = 0;
+    bool deferHealWrites = false;
     std::unordered_set<std::string> fibersWithRemovedBranchEntries;
     for (const auto& [source, path] : fiberFiles) {
         try {
@@ -14089,19 +14068,21 @@ void LineAnnotationController::loadFibersForCurrentPackage()
             }
         }
 
-        auto strict = loadStrictFibers();
-        loadedFibers = std::move(strict.first);
-        fatalLoadErrors = std::move(strict.second);
+        // "Keep files unchanged" (and the dialog-less path, and a repair
+        // that could not save): drop the offending entries in memory only.
+        // Every fiber stays loaded; the files are not written, not even the
+        // heals below (they are re-derived on the next load).
+        neutralizedLinkEntries =
+            neutralizeLoadedFiberBranchLinks(loadedFibers, branchLinkIssues);
+        deferHealWrites = true;
     }
 
     std::vector<std::string> loadErrors = std::move(fatalLoadErrors);
-    if (branchErrors.empty()) {
-        (void)validateLoadedFiberLinks(loadedFibers, loadErrors);
-    }
+    (void)validateLoadedFiberLinks(loadedFibers, loadErrors);
 
     for (auto& fiber : loadedFibers) {
         addKnownFiberTags(fiber.tags);
-        if (fiber.needsSave && fiber.sourceRoot == primarySource) {
+        if (!deferHealWrites && fiber.needsSave && fiber.sourceRoot == primarySource) {
             if (adjacentHealSaveIsStale(fiber)) {
                 fiber.needsSave = false;
                 continue;
@@ -14122,6 +14103,53 @@ void LineAnnotationController::loadFibersForCurrentPackage()
         return;
     }
     _fibers = std::move(loadedFibers);
+    if (neutralizedLinkEntries > 0) {
+        // The entries just dropped from the stored records may still be held
+        // by an open session of the same fiber or of its former partner;
+        // such a session would write the one-way link back with its next
+        // save. Drop every session entry whose partner record no longer has
+        // a reciprocal (matched by position: a session-side target index can
+        // be a session index of the partner's own pane).
+        for (auto& pane : _panes) {
+            if (!pane.session) {
+                continue;
+            }
+            auto& session = *pane.session;
+            const auto before = session.branches.size();
+            session.branches.erase(
+                std::remove_if(
+                    session.branches.begin(), session.branches.end(),
+                    [this, &session](const FiberBranchRef& branch) {
+                        const auto target = std::find_if(
+                            _fibers.begin(), _fibers.end(),
+                            [&branch](const StoredFiber& fiber) {
+                                return branchReferencesFiber(branch, fiber.id, fiber.fileName);
+                            });
+                        if (target == _fibers.end()) {
+                            return false;
+                        }
+                        return std::none_of(
+                            target->branches.begin(), target->branches.end(),
+                            [&session, &branch](const FiberBranchRef& candidate) {
+                                return candidate.adjacent == branch.adjacent &&
+                                    branchReferencesFiber(candidate, session.fiberId,
+                                                          session.fiberFileName) &&
+                                    pointsApproximatelyEqual(candidate.controlPointPosition,
+                                                             branch.branchControlPointPosition) &&
+                                    pointsApproximatelyEqual(candidate.branchControlPointPosition,
+                                                             branch.controlPointPosition);
+                            });
+                    }),
+                session.branches.end());
+            if (session.branches.size() != before) {
+                Logger()->warn("Line Annotation: dropped {} link entr{} from the open session "
+                               "of {} whose partner no longer links back",
+                               before - session.branches.size(),
+                               before - session.branches.size() == 1 ? "y" : "ies",
+                               session.fiberFileName);
+            }
+        }
+    }
     // The stored fibers' branch refs were remapped onto the survivors' ids
     // above (validateLoadedFiberLinks); an open session's refs were written
     // before this load and can still hold the id of a copy the dedupe just
@@ -18293,99 +18321,15 @@ std::vector<LineAnnotationController::BranchLinkValidationIssue>
 LineAnnotationController::collectLoadedFiberBranchIssues(
     const std::vector<StoredFiber>& fibers) const
 {
-    const auto sourceFileKey = [](const StoredFiber& fiber,
-                                  const std::string& fileName) {
-        return (fiber.sourceRoot / fileName).lexically_normal().string();
-    };
-    std::vector<BranchLinkValidationIssue> issues;
-    std::unordered_map<std::string, size_t> indexByFileName;
-    indexByFileName.reserve(fibers.size());
-    for (size_t i = 0; i < fibers.size(); ++i) {
-        if (!fibers[i].fileName.empty()) {
-            indexByFileName[sourceFileKey(fibers[i], fibers[i].fileName)] = i;
-        }
-    }
-
-    for (size_t fiberIndex = 0; fiberIndex < fibers.size(); ++fiberIndex) {
-        const StoredFiber& fiber = fibers[fiberIndex];
-        for (size_t branchIndex = 0; branchIndex < fiber.branches.size(); ++branchIndex) {
-            const FiberBranchRef& branch = fiber.branches[branchIndex];
-            auto addIssue = [&](const std::string& reason) {
-                issues.push_back({fiberIndex, branchIndex, reason});
-            };
-
-            if (branch.controlPointIndex < 0 ||
-                static_cast<size_t>(branch.controlPointIndex) >= fiber.controlPoints.size()) {
-                addIssue("local CP index out of range");
-                continue;
-            }
-            if (!pointsApproximatelyEqual(
-                    fiber.controlPoints[static_cast<size_t>(branch.controlPointIndex)],
-                    branch.controlPointPosition)) {
-                addIssue("local CP position mismatch");
-                continue;
-            }
-            if (!finiteDirection(branch.controlPointDirection) ||
-                !finiteDirection(branch.branchControlPointDirection)) {
-                addIssue("invalid branch directions");
-                continue;
-            }
-            if (fiber.linePoints.size() >= 2) {
-                const cv::Vec3d expectedLocal =
-                    endpointTangentFromLinePoints(fiber.linePoints,
-                                                  branch.controlPointPosition);
-                if (!branchDirectionsCompatible(branch.controlPointDirection,
-                                                expectedLocal)) {
-                    addIssue("branch endpoint direction mismatch");
-                    continue;
-                }
-            }
-            if (branch.branchFileName.empty()) {
-                addIssue("missing branch_file");
-                continue;
-            }
-            const auto targetIndex = indexByFileName.find(
-                loadedFiberLinkKey(fiber, branch.branchFileName));
-            if (targetIndex == indexByFileName.end()) {
-                addIssue("missing linked fiber");
-                continue;
-            }
-            const StoredFiber& target = fibers[targetIndex->second];
-            if (branch.branchControlPointIndex < 0 ||
-                static_cast<size_t>(branch.branchControlPointIndex) >=
-                    target.controlPoints.size()) {
-                addIssue("linked CP index out of range");
-                continue;
-            }
-            if (!pointsApproximatelyEqual(
-                    target.controlPoints[static_cast<size_t>(branch.branchControlPointIndex)],
-                    branch.branchControlPointPosition)) {
-                addIssue("linked CP position mismatch");
-                continue;
-            }
-            if (target.linePoints.size() >= 2) {
-                const cv::Vec3d expectedLinked =
-                    endpointTangentFromLinePoints(target.linePoints,
-                                                  branch.branchControlPointPosition);
-                if (!branchDirectionsCompatible(branch.branchControlPointDirection,
-                                                expectedLinked)) {
-                    addIssue("branch endpoint direction mismatch");
-                    continue;
-                }
-            }
-
-            const auto reciprocal = std::find_if(
-                target.branches.begin(),
-                target.branches.end(),
-                [&fiber, &branch](const FiberBranchRef& candidate) {
-                    return isReciprocalBranchRef(fiber, branch, candidate);
-                });
-            if (reciprocal == target.branches.end()) {
-                addIssue("missing reciprocal branch");
-            }
-        }
-    }
-    return issues;
+    return vc3d::line_annotation::collectFiberBranchIssues(
+        fibers,
+        [](const StoredFiber& fiber, const std::string& fileName) {
+            return (fiber.sourceRoot / fileName).lexically_normal().string();
+        },
+        [this](const StoredFiber& fiber, const std::string& branchFileName) {
+            return loadedFiberLinkKey(fiber, branchFileName);
+        },
+        isReciprocalBranchRef);
 }
 
 void LineAnnotationController::healOneSidedAdjacentLinks(std::vector<StoredFiber>& fibers) const
@@ -18415,6 +18359,28 @@ bool LineAnnotationController::adjacentHealSaveIsStale(const StoredFiber& fiber)
     return stale;
 }
 
+std::size_t LineAnnotationController::neutralizeLoadedFiberBranchLinks(
+    std::vector<StoredFiber>& fibers,
+    const std::vector<BranchLinkValidationIssue>& issues) const
+{
+    const auto neutralized = vc3d::line_annotation::neutralizeFiberBranchIssues(
+        fibers, issues,
+        [this](const std::vector<StoredFiber>& current) {
+            return collectLoadedFiberBranchIssues(current);
+        });
+    for (const std::size_t index : neutralized.changedFibers) {
+        fibers[index].linkEntriesDroppedAtLoad = true;
+    }
+    if (neutralized.removedEntries > 0) {
+        Logger()->warn("Line Annotation: ignored {} broken link entr{} on {} fiber(s); "
+                       "the files are unchanged and every fiber stays loaded",
+                       neutralized.removedEntries,
+                       neutralized.removedEntries == 1 ? "y" : "ies",
+                       neutralized.changedFibers.size());
+    }
+    return neutralized.removedEntries;
+}
+
 bool LineAnnotationController::repairLoadedFiberBranchLinks(
     std::vector<StoredFiber>& fibers,
     const std::unordered_set<std::string>& fibersWithRemovedBranchEntries,
@@ -18423,48 +18389,15 @@ bool LineAnnotationController::repairLoadedFiberBranchLinks(
 {
     std::unordered_set<std::string> changedFiles = fibersWithRemovedBranchEntries;
 
-    auto removeIssues = [&](const std::vector<BranchLinkValidationIssue>& issues) {
-        std::unordered_map<size_t, std::vector<size_t>> branchIndicesByFiber;
-        for (const auto& issue : issues) {
-            if (issue.fiberIndex >= fibers.size()) {
-                continue;
-            }
-            if (issue.branchIndex >= fibers[issue.fiberIndex].branches.size()) {
-                continue;
-            }
-            branchIndicesByFiber[issue.fiberIndex].push_back(issue.branchIndex);
-        }
-
-        bool changed = false;
-        for (auto& [fiberIndex, branchIndices] : branchIndicesByFiber) {
-            auto& fiber = fibers[fiberIndex];
-            std::sort(branchIndices.begin(), branchIndices.end());
-            branchIndices.erase(std::unique(branchIndices.begin(), branchIndices.end()),
-                                branchIndices.end());
-            for (auto it = branchIndices.rbegin(); it != branchIndices.rend(); ++it) {
-                if (*it >= fiber.branches.size()) {
-                    continue;
-                }
-                fiber.branches.erase(fiber.branches.begin() +
-                                     static_cast<std::ptrdiff_t>(*it));
-                fiber.needsSave = true;
-                changedFiles.insert(
-                    (fiber.sourceRoot / fiber.fileName).lexically_normal().string());
-                changed = true;
-            }
-        }
-        return changed;
-    };
-
-    (void)removeIssues(initialIssues);
-    for (;;) {
-        const auto issues = collectLoadedFiberBranchIssues(fibers);
-        if (issues.empty()) {
-            break;
-        }
-        if (!removeIssues(issues)) {
-            break;
-        }
+    const auto neutralized = vc3d::line_annotation::neutralizeFiberBranchIssues(
+        fibers, initialIssues,
+        [this](const std::vector<StoredFiber>& current) {
+            return collectLoadedFiberBranchIssues(current);
+        });
+    for (const std::size_t index : neutralized.changedFibers) {
+        auto& fiber = fibers[index];
+        fiber.needsSave = true;
+        changedFiles.insert((fiber.sourceRoot / fiber.fileName).lexically_normal().string());
     }
 
     for (auto& fiber : fibers) {
@@ -18555,39 +18488,12 @@ std::string LineAnnotationController::loadedFiberLinkKey(
 bool LineAnnotationController::validateLoadedFiberLinks(std::vector<StoredFiber>& fibers,
                                                         std::vector<std::string>& errors) const
 {
-    bool removedInvalidFibers = false;
-    for (;;) {
-        const auto issues = collectLoadedFiberBranchIssues(fibers);
-        if (issues.empty()) {
-            break;
-        }
-
-        std::unordered_set<std::string> invalidFiles;
-        for (const auto& issue : issues) {
-            if (issue.fiberIndex >= fibers.size()) {
-                continue;
-            }
-            const auto& fiber = fibers[issue.fiberIndex];
-            invalidFiles.insert(
-                (fiber.sourceRoot / fiber.fileName).lexically_normal().string());
-            errors.push_back(fiberErrorName(fiber.fileName) + ": " + issue.reason);
-        }
-        if (invalidFiles.empty()) {
-            break;
-        }
-        removedInvalidFibers = true;
-        fibers.erase(std::remove_if(fibers.begin(),
-                                    fibers.end(),
-                                    [&invalidFiles](const StoredFiber& fiber) {
-                                        const std::string sourceFile =
-                                            (fiber.sourceRoot / fiber.fileName)
-                                                .lexically_normal().string();
-                                        return invalidFiles.find(sourceFile) !=
-                                               invalidFiles.end();
-                                    }),
-                     fibers.end());
-    }
-
+    // Link problems are neutralized entry-wise before this point
+    // (neutralizeLoadedFiberBranchLinks / repairLoadedFiberBranchLinks);
+    // what remains here is the runtime-id assignment and the link-id remap.
+    // Never remove a fiber for a link problem: that only manufactures
+    // "missing linked fiber" on its peers and cascades through the network.
+    (void)errors;
     const auto sourceFileKey = [](const StoredFiber& fiber,
                                   const std::string& fileName) {
         return (fiber.sourceRoot / fileName).lexically_normal().string();
@@ -18609,7 +18515,7 @@ bool LineAnnotationController::validateLoadedFiberLinks(std::vector<StoredFiber>
             }
         }
     }
-    return !removedInvalidFibers;
+    return true;
 }
 
 std::string LineAnnotationController::uniqueImportedFiberFileName(

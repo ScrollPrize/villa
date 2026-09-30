@@ -229,6 +229,15 @@ vc_add_test(NAME test_spiral_config_profile_editor
 
 qt6_wrap_cpp(line_annotation_vccollection_moc ${PROJECT_SOURCE_DIR}/core/include/vc/ui/VCCollection.hpp)
 qt6_wrap_cpp(line_annotation_cstate_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.hpp)
+vc_add_test(NAME test_line_annotation_link_validation
+    SOURCES test_line_annotation_link_validation.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberSliceGeometry.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberSliceGeometry.hpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSegments.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSegments.hpp
+    LIBS doctest::doctest Qt6::Core vc_core vc_lasagna vc_fiber_tracer
+    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
 vc_add_test(NAME test_line_annotation_generated_views
     SOURCES test_line_annotation_generated_views.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSaveJob.cpp

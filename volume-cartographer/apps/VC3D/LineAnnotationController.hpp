@@ -35,6 +35,7 @@
 #include "LineAnnotationFiberClassification.hpp"
 #include "LineAnnotationFiberDeletion.hpp"
 #include "LineAnnotationFiberSegments.hpp"
+#include "LineAnnotationFiberLinkValidation.hpp"
 #include "LineAnnotationStoredFiber.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
 #include "vc/atlas/FiberIntersections.hpp"
@@ -568,11 +569,7 @@ private:
         std::vector<std::shared_ptr<FiberSaveBatchTracker>> batches;
     };
 
-    struct BranchLinkValidationIssue {
-        size_t fiberIndex = 0;
-        size_t branchIndex = 0;
-        std::string reason;
-    };
+    using BranchLinkValidationIssue = vc3d::line_annotation::BranchLinkValidationIssue;
 
     struct FiberSaveTaskResult {
         bool ok = false;
@@ -1147,6 +1144,13 @@ private:
                                              std::vector<std::string>* branchErrors = nullptr) const;
     [[nodiscard]] std::vector<BranchLinkValidationIssue> collectLoadedFiberBranchIssues(
         const std::vector<StoredFiber>& fibers) const;
+    // Drops the offending entries (and, through the fixed point, their
+    // reciprocals) in memory without touching the files; marks the fibers
+    // whose record now differs from disk. Returns the number of entries
+    // dropped.
+    std::size_t neutralizeLoadedFiberBranchLinks(
+        std::vector<StoredFiber>& fibers,
+        const std::vector<BranchLinkValidationIssue>& issues) const;
     [[nodiscard]] bool repairLoadedFiberBranchLinks(
         std::vector<StoredFiber>& fibers,
         const std::unordered_set<std::string>& fibersWithRemovedBranchEntries,
