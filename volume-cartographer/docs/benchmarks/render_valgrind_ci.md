@@ -57,10 +57,15 @@ Set `jobs` to a smaller positive number to limit local CPU or memory use. This
 only controls how many independent Ninja commands run at once. It does not
 change the fixed four-worker renderer fixture or five-core replay model.
 
-The regular estimate contains no Python process. Ninja invokes Valgrind
-directly, then `bench_thread_sync_replay evaluate-render` parses the raw
+Ninja invokes a Python retry driver, which launches Valgrind and then
+`bench_thread_sync_replay evaluate-render`. The C++ evaluator parses the raw
 Callgrind profiles and scheduler log, attributes costs to their originating
 threads, replays the synchronization graph, and writes the result in C++.
+
+Collection or replay-evaluation failures trigger a fresh capture, up to three
+total attempts per case. Failed captures are retained in `failed-attempt-N/`.
+The first valid evaluation is used; the reference comparison runs outside this
+retry loop, so a performance regression is not retried or discarded.
 
 Artifacts are under
 `build/ci-render-benchmark/render-valgrind-ci/<fixture>/<scenario>/`:
@@ -74,7 +79,8 @@ Start failure diagnosis with the raw profiles, scheduler log, and
 `evaluation.json`.
 Historical compiler, model, checksum, cache, fixture, repetition, and profiler
 changes do not fail the reference gate. Current-run parse errors or
-incomplete futex dependencies still fail because they prevent a valid score. A
+incomplete futex dependencies still fail after all three capture attempts
+because they prevent a valid score. A
 score above the allowed slowdown is a performance regression requiring
 investigation or an intentional reference update.
 
