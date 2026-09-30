@@ -26,11 +26,8 @@ class DirectTrainingInterval:
               'replay_bank_switch_endpoints', 'replay_premature_stop_endpoints',
               'replay_endpoint_overshoot_endpoints', 'replay_pre_switch_endpoints')
     nested_counts = {'identity': ('candidate_states', 'candidate_intervals', 'candidate_late_failures',
-                                 'candidate_first_failures', 'candidate_supervision_weight'),
-                     'memory': ('identity_count', 'identity_correct', 'departed_count',
-                                'departed_correct', 'offset_count', 'offset_error_sum')}
-    nested_means = {'identity': ('candidate_loss',),
-                    'memory': ('probe_identity_loss', 'probe_offset_loss')}
+                                 'candidate_first_failures', 'candidate_supervision_weight')}
+    nested_means = {'identity': ('candidate_loss',)}
 
     def __init__(self):
         self.values = dict(updates=0, crops=0, decisions=0)
@@ -80,12 +77,6 @@ def _interval_training_lines(row):
              f" | {m['refinement_attempts_mean']:.2f} attempts/decision"]
     if row.get('cuda_peak_allocated_gib') is not None:
         lines[-1] += f" | peak allocated VRAM {row['cuda_peak_allocated_gib']:.2f} GiB (session)"
-    if m['memory_identity_count']:
-        lines.append(f"  memory probe: correct {_rate(m['memory_identity_correct'], m['memory_identity_count'])}"
-                 f" | departed recall {_rate(m['memory_departed_correct'], m['memory_departed_count'])}"
-                 f" | departed loss weight {row.get('memory_departed_weight', 1.):g}x")
-        lines.append(f"  probe labels: departed {_rate(m['memory_departed_count'], m['memory_identity_count'])}"
-                     f" | false departure {_rate(m['memory_identity_count']-m['memory_departed_count']-(m['memory_identity_correct']-m['memory_departed_correct']), m['memory_identity_count']-m['memory_departed_count'])}")
     slabs = max(1., m.get('history_valid_slabs', 0.))
     lines.append(f"  historical slabs: {m.get('history_valid_slabs', 0.)/max(1, m['decisions']):.2f}/decision"
                  f" | age {m.get('history_age_sum', 0.)/slabs:.1f} voxels"
@@ -109,17 +100,16 @@ def _interval_training_lines(row):
                  f" ({int(m['identity_candidate_states'])} eligible crops)")
     lines.append('  data: '+' / '.join(f'{name} {m[key]:.0%}' for name, key in
                  (('fresh','fresh_fraction'), ('recent','recent_fraction'),
-                  ('switch streams','bank_wrong_continuation_fraction'), ('following','bank_following_fraction'),
+                  ('wrong turns','bank_wrong_continuation_fraction'), ('following','bank_following_fraction'),
                   ('pairs','decision_pair_fraction'))))
-    if row.get('feature_switch_crop_fraction', -1.) >= 0:
-        lines[-1] += f" | switch crop budget {row['feature_switch_crop_fraction']:.0%} (cumulative)"
+
     failures = ('bank_switch', 'pre_switch', 'premature_stop', 'endpoint_overshoot')
     if any(m.get('replay_'+name+'_endpoints', 0) for name in failures):
         lines.append('  replay failure endpoints: '+' / '.join(
             f'{name.replace("_", " ")} {int(m.get("replay_"+name+"_endpoints", 0))}' for name in failures))
     lines.append('  gradients: '+' | '.join(
         f"{name} max {m[name+'_grad_norm_max']:.2g}, clipped {m[name+'_clipped_updates']}/{updates} updates"
-        for name in ('memory', 'rest')))
+        for name in ('history', 'rest')))
     return lines
 
 
@@ -177,14 +167,6 @@ def _direct_training_lines(row):
                      f" | rest {row['rest_grad_norm']:.3g} (scale {row['rest_grad_clip_scale']:.3g})")
     if 'identity' in row:
         lines.extend(_identity_lines(row['identity']))
-    if 'memory' in row:
-        m = row['memory']
-        lines.append(f"  memory probe: identity {m.get('probe_identity_loss', 0.):.4f}"
-                     f" (acc {m.get('probe_identity_accuracy', 0.):.1%}, departed recall "
-                     +_rate(m.get('departed_correct', 0), m.get('departed_count', 0))+")"
-                     f" | offset {m.get('probe_offset_loss', 0.):.4f} ({m.get('probe_offset_error_mean', 0.):.2f} vox)"
-                     f" | labeled writes/state {m.get('labeled_writes_per_state', 0.):.1f}"
-                     f" | departed states {m.get('departed_state_fraction', 0.):.0%}")
     if 'decisions' in row:
         lines.extend(_decision_lines(row['decisions']))
     return lines
@@ -214,12 +196,10 @@ def format_training_log(row):
     step = f"Step {row['step']:,}" if 'step' in row else 'Training'
     if row.get('event') == 'resume_configuration':
         options, cfg = row.get('training_options', {}), row.get('model_cfg', {})
-        memory = 'observation memory | causal survival confidence'
         return (f"{step} | resumed {row['checkpoint']}\n"
-                f"  commit {options.get('n_commit', '?')} | history spacing {cfg.get('memory_stride', '?')} vox"
+                f"  commit {options.get('n_commit', '?')} | historical slabs: 8 slots, minimum spacing 32 vox"
                 f" | batch {options.get('batch', '?')} / microbatch {options.get('microbatch', '?')}"
-                f"\n  {memory}"
-                f" | switch crop budget {cfg.get('feature_switch_crop_fraction', -1.):g}")
+                f"\n  live CT/path slabs | causal survival confidence")
     if row.get('event') == 'identity_sampling':
         bank = row.get('negative_bank_provenance') or {}
         return (f"{step} | identity sampling v{row.get('pair_sampling_version', '?')}"

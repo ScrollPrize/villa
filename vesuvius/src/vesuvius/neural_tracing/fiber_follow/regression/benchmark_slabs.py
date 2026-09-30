@@ -13,11 +13,13 @@ from .model import DirectConfig, build_model
 from .train import conv_memory_format, optimizer_update, prepare_training
 
 
-def synthetic_decisions(cfg, count=6, seed=194):
+def synthetic_decisions(cfg, count=6, seed=194, ages=None):
     rng = torch.Generator().manual_seed(seed)
     rows = []
-    for j in range(count):
-        age = (j+1)*184./count
+    ages = ages if ages is not None else ([0.,40.,152.,160.,184.,184.] if count == 6 else np.linspace(0.,184.,count))
+    if len(ages) != count or any(age < 0 for age in ages):
+        raise ValueError("Need one nonnegative historical age per decision")
+    for j, age in enumerate(ages):
         arcs = selected_arcs(age)
         valid = torch.arange(8)[None] < len(arcs)
         hist = torch.zeros(1, cfg.n_history, 3)
@@ -58,6 +60,7 @@ def main():
     ap.add_argument('--repeats', type=int, default=3)
     ap.add_argument('--decisions', type=int, default=6)
     ap.add_argument('--seed', type=int, default=194)
+    ap.add_argument('--ages', type=float, nargs='+', help='Observed lengths; default matches six baseline decision ages')
     ap.add_argument('--encoder', choices=('conv', 'patch4'), default='patch4')
     ap.add_argument('--token-only', action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument('--device', default='cuda')
@@ -67,7 +70,7 @@ def main():
     torch.set_num_threads(4)
     torch.manual_seed(args.seed)
     cfg = DirectConfig(direction_inputs=True, encoder=args.encoder, token_only=args.token_only)
-    batches = synthetic_decisions(cfg, args.decisions, args.seed)
+    batches = synthetic_decisions(cfg, args.decisions, args.seed, args.ages)
     model = build_model(cfg).to(args.device, memory_format=conv_memory_format(args.device))
     ema = copy.deepcopy(model).requires_grad_(False).eval()
     opt = torch.optim.AdamW(model.parameters(), lr=.0003, weight_decay=1e-4)
@@ -100,6 +103,7 @@ def main():
         parameters=sum(p.numel() for p in model.parameters()),
         history_parameters=sum(p.numel() for p in model.history_encoder.parameters()),
         input='Synthetic full-size current crops and live CT/path slabs; no volume I/O',
+        ages=[float(b['x']['history_ages'][0,0]) for b in batches],
         warmup=args.warmup, measured=len(measured), mean_ms=float(np.mean(times)),
         p50_ms=float(np.median(times)), p95_ms=float(np.percentile(times, 95)),
         decisions_per_second=1000*sum(r['supervised_states'] for r in measured)/sum(times),

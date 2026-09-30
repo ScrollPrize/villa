@@ -197,3 +197,75 @@ def test_compiled_decisions_match_inference_with_all_history_gradients(token_onl
     for p,q in zip(m.parameters(),compiled.parameters()):
         if p.grad is not None:
             torch.testing.assert_close(p.grad,q.grad,atol=2e-6,rtol=2e-4)
+
+
+def test_complete_synthetic_prefix_precedes_local_history_truncation():
+    from test_identity import line_fiber
+    fiber=line_fiber(1500.)
+    sample=SampleConfig(n_history=128,full_observed_history=True,no_history_prob=0.,short_history_prob=0.)
+    lengths=[]
+    for seed in range(20):
+        item=make_sample(fiber,1000.,False,sample,np.random.default_rng(seed))
+        path=item['observed_path'];lengths.append(len(path))
+        assert item['hist_local'].shape==(128,3)
+        np.testing.assert_allclose(path[0],item['seed_pos'])
+        np.testing.assert_allclose(path[-1],item['pos'])
+        n=int(item['hmask'].sum())
+        np.testing.assert_allclose(item['hist_local'][:n] @ item['frame'].T+item['pos'],path[-2:-n-2:-1])
+    assert max(lengths)>128 and len(set(lengths))>10
+    no=make_sample(fiber,1000.,False,SampleConfig(full_observed_history=True,no_history_prob=1.),np.random.default_rng(3))
+    assert len(no['observed_path'])==1 and not no['hmask'].any()
+
+
+def test_actual_trace_commits_and_resumed_slabs_use_same_prefix(monkeypatch):
+    from vesuvius.neural_tracing.fiber_follow.shared.trace import TraceParams
+    fake_ct(monkeypatch)
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.regression.data.image_crop',
+        lambda items,vol,crop,pool=None,**kw:torch.zeros(len(items),2,crop.depth,crop.width,crop.width))
+    c=cfg()
+    class Model(torch.nn.Module):
+        cfg=c
+        def forward(self,x,hist,hmask):
+            p=hist.new_tensor([[[.2,0,1.],[-.3,0,2.],[.1,0,3.],[0,0,4.]]]).expand(len(hist),-1,-1)
+            return dict(points=p,confidence=p.new_ones(len(hist),4))
+    def tracer():
+        t=DirectTracer.__new__(DirectTracer)
+        t.model,t.device,t.n_history=Model(),'cpu',c.n_history
+        t.vol,t.pool,t.observations=SimpleNamespace(shape=(1000,1000,1000)),None,ObservationBuilder(c)
+        t.p=TraceParams(n_commit=4,max_len=12.,loop_radius=.01)
+        return t
+    original=tracer();seen=[];images=[]
+    build=original.build_inputs
+    def record(*args,**kwargs):
+        x=build(*args,**kwargs);images.append(x);return x
+    monkeypatch.setattr(original,'build_inputs',record)
+    original._trace(np.array([[100.,100.,100.]]),np.array([[0.,0.,1.]]),None,None,
+                    lambda i,state:seen.append(state))
+    assert len(seen)>1 and len(seen[1]['observed_path'])>4
+    resumed=tracer();again=[]
+    build=resumed.build_inputs
+    monkeypatch.setattr(resumed,'build_inputs',lambda *args,**kw:again.append(build(*args,**kw)) or again[-1])
+    resumed._trace(seen[1]['pos'][None],seen[1]['frame'][:,2][None],None,None,None,initial_states=[seen[1]])
+    for key in ('history_slabs','history_pose','history_valid'):
+        torch.testing.assert_close(images[1][key],again[0][key],atol=0,rtol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA unavailable')
+def test_cuda_bf16_masks_and_compiled_repeated_updates():
+    from vesuvius.neural_tracing.fiber_follow.regression.train import move_batch
+    torch.manual_seed(16)
+    model=build_model(cfg(encoder='patch4',token_only=True,recurrent_refinement_steps=1)).cuda()
+    ema=copy.deepcopy(model)
+    prepare_training(model,2)
+    opt=torch.optim.SGD(model.parameters(),lr=.001)
+    for count in (2,0,8,1):
+        batch=slab_batch(model.cfg,2)
+        batch['x']['history_valid'][:]=False
+        batch['x']['history_valid'][:,:count]=True
+        batch['x']['history_slabs'][~batch['x']['history_valid']]=float('nan')
+        metrics=optimizer_update(model,ema,opt,[batch],1,.001,device='cuda',compute_metrics=False)
+        assert np.isfinite(metrics['loss']) and np.isfinite(metrics['history_grad_norm'])
+        if count:
+            assert metrics['history_grad_norm']>0
+        else:
+            assert metrics['history_grad_norm']==0

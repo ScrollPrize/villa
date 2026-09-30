@@ -29,12 +29,14 @@ def main(argv=None):
     ap.add_argument('--batches',type=int,default=4)
     ap.add_argument('--forward',action='store_true')
     ap.add_argument('--direction-inputs',action='store_true')
+    ap.add_argument('--encoder',choices=('conv','patch4'),default='conv')
+    ap.add_argument('--token-only',action='store_true')
     ap.add_argument('--memory-switch-probability',type=float,default=0.)
     ap.add_argument('--memory-switch-tail',type=float,nargs=2,default=(16.,96.))
     ap.add_argument('--onpolicy',nargs='*',default=[],help='Replay caches, e.g. collected with observed tracks')
     args=ap.parse_args(argv)
     torch.set_num_threads(4);torch.manual_seed(0)
-    cfg=DirectConfig(direction_inputs=args.direction_inputs)
+    cfg=DirectConfig(direction_inputs=args.direction_inputs,encoder=args.encoder,token_only=args.token_only)
     spec=FiberVolumeSpec(args.fiber_zarrs,ct_zarr=args.ct,ct_level=0,ct_grid_scale=4.,inputs='ct+presence')
     band=ZBand(45000/spec.grid_scale,48500/spec.grid_scale)
     fibers,_=split_fibers(load_fibers(args.fibers,grid_scale=spec.grid_scale),band)
@@ -50,7 +52,9 @@ def main(argv=None):
         raise ValueError('Preflight microbatch must contain complete pairs')
     ds=FollowDataset(fibers,spec,sample,band,chunk=chunk,seed=37,batch_builder=builder,
                      onpolicy=[OnPolicyStates.load(p) for p in args.onpolicy])
-    it=iter(ds);args.out.mkdir(parents=True,exist_ok=True)
+    if args.out.exists():
+        raise FileExistsError('Use a fresh preflight output directory')
+    it=iter(ds);args.out.mkdir(parents=True)
     model=build_model(cfg).to(args.device,memory_format=conv_memory_format(args.device)) if args.forward else None
     import copy
     from .train import optimizer_update
@@ -70,7 +74,8 @@ def main(argv=None):
                                        compute_metrics=False)
             assert all(p.grad is None or torch.isfinite(p.grad).all() for p in model.parameters())
             if metrics['optimizer_applied']:
-                assert model.encoder.compress.weight.grad.abs().sum() > 0
+                assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.encoder.parameters())
+                assert metrics['history_grad_norm'] > 0
             row.update(loss=metrics['loss'], history_grad_norm=metrics['history_grad_norm'],
                        history_valid_slabs_mean=metrics['history_valid_slabs_mean'])
         rows.append(row)

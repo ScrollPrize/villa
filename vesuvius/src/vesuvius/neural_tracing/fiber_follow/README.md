@@ -5,7 +5,7 @@ Layout:
 - `flow_matching/`: the flow-matching follower (model, losses, `train`, and
   `collect`/`infer` entry points). Launch with `bash scripts/launch_single_path.sh NAME`.
 - `regression/`: an independent directly supervised alternative
-  ([README](regression/README.md)). It uses fine level-0 CT, memory retained from the main encoder,
+  ([README](regression/README.md)). It uses fine level-0 CT, live historical CT/path slabs,
   continuous path prediction with shared-decoder refinement, and causal survival confidence.
   Launch with `bash scripts/launch_memory.sh` (`RUN_NAME` selects the destination).
 - `shared/`: volume access, sampling, data, tracing, evaluation, diagnostics and

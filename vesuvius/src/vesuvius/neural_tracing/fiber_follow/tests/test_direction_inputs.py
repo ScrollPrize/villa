@@ -228,16 +228,16 @@ class DirectionInputTests(unittest.TestCase):
         torch.testing.assert_close(pair[2:],before,rtol=0,atol=0)
         self.assertEqual(pair[1].count_nonzero().item(),0)
         original=dict(x=dict(fine=patch_image[None].clone(),seed_mask=torch.ones(1,1),
-            memory_patches=patch_image[None,None].repeat(1,3,1,1,1,1),memory_mask=torch.tensor([[True,False,True]]),
-            memory_seed_patch=patch_image[None].clone(),memory_seed_valid=torch.tensor([True])))
+            history_slabs=patch_image[:2][None,None].repeat(1,8,1,1,1,1),
+            history_valid=torch.tensor([[True,False,True,False,False,False,False,False]])))
         training=copy.deepcopy(original);builder=IdentityObservationBuilder(cfg,augment=True)
         state=dict(photometric=(1.3,.1,.07),identity_seed=3,blur_sigma=1.,drop_presence=True)
         with patch.object(ObservationBuilder,'observations',return_value=training), \
              patch.object(builder,'bank_targets',return_value=dict(presence_dropped=torch.zeros(1))):
             got=builder([state],None)['x']
-        for key in ('fine','memory_seed_patch'):
-            torch.testing.assert_close(got[key][:,2:],original['x'][key][:,2:],rtol=0,atol=0)
-        torch.testing.assert_close(got['memory_patches'][:,:,2:],original['x']['memory_patches'][:,:,2:],rtol=0,atol=0)
+        torch.testing.assert_close(got['fine'][:,2:],original['x']['fine'][:,2:],rtol=0,atol=0)
+        torch.testing.assert_close(got['history_slabs'][:,:,1],original['x']['history_slabs'][:,:,1],rtol=0,atol=0)
+        torch.testing.assert_close(got['history_slabs'][:,1],original['x']['history_slabs'][:,1],rtol=0,atol=0)
 
 
 

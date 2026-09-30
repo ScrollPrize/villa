@@ -37,7 +37,7 @@ def paired_history_report(model, batch, threshold=.5):
                         confidence_threshold=threshold)
             known = batch['candidate_mask'].bool().all(-1)
             correct = (batch['candidate_labels'] > .5).all(-1) & known
-            wrong = (batch['candidate_labels'] <= .5).any(-1) & known
+            wrong = ((batch['candidate_labels'] <= .5) & batch['candidate_mask'].bool()).any(-1)
             accepted = out['candidate_confidence'][..., -1] >= threshold
             distances = (out['points'][:, None]-batch['candidate_points']).square().sum(-1).mean(-1)
             choice = distances.argmin(-1)

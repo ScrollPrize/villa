@@ -4,7 +4,6 @@ import time
 import numpy as np
 import torch
 from torch import nn
-import torch.nn.functional as F
 
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import (
     CropSpec, arclength, interp_at, frame_from_heading, normalize, crop_local_grid,
@@ -49,7 +48,7 @@ def fitted_heading(path, arc, at, seed_heading):
 def slab_layout(item):
     path = observed_path(item)
     arc = arclength(path)
-    heading = item.get('seed_tangent', np.asarray(item['frame'])[:, 2])
+    heading = item['seed_tangent'] if item.get('seed_valid', False) else np.asarray(item['frame'])[:, 2]
     if not np.isfinite(heading).all() or np.linalg.norm(heading) < 1e-8:
         raise ValueError('A finite nonzero seed heading is required')
     slabs = []

@@ -153,7 +153,7 @@ def test_monitor_observations_need_no_negative_bank_or_identity_labels(monkeypat
     images = fake_images(builder,items)
     monkeypatch.setattr(IdentityObservationBuilder,'images',lambda *a,**kw:images)
     result = builder(items,None)
-    assert set(result['x']) == {'fine','seed','seed_mask','seed_age','seed_tangent'} and 'dense_mask' in result
+    assert set(result['x']) == set(images) and 'dense_mask' in result
     assert 'identity_points' not in result and 'negative_mask' not in result
 
 

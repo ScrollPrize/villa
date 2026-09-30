@@ -86,7 +86,7 @@ class IdentitySampling:
     decision_fraction: float = 0.  # fraction of endpoint proposals reserved for matched pairs
     decision_choice_fraction: float = .75  # requested choice share; remaining pairs teach departure
     candidate_tolerance: float = 1.5
-    # Fresh draws replaced by long original-then-neighbor memory sequences.
+    # Fresh draws replaced by long original-then-neighbor observed paths.
     memory_switch_probability: float = 0.
     memory_switch_tail: tuple = (16., 96.)
 
@@ -195,7 +195,7 @@ def augment_image_pair(image, params, rng, *, blur_sigma=0., drop_presence=False
 
 
 class IdentityObservationBuilder(ObservationBuilder):
-    """Bank-derived following, foreign masks, and memory-dependent path decisions."""
+    """Bank-derived following, foreign masks, and history-dependent path decisions."""
     def __init__(self,cfg: DirectConfig,fibers=None,sampling=IdentitySampling(),*,
                  augment=False,negative_bank=None,
                  near_negative_bank=None,following_bank=None,continuation_bank=None):
@@ -256,7 +256,7 @@ class IdentityObservationBuilder(ObservationBuilder):
         return None
 
     def memory_switch(self, sample_cfg, rng):
-        """Original fiber, bridge, then a long neighbor tail, observed along the way."""
+        """Original fiber, bridge, then a long neighbor tail in one observed prefix."""
         from vesuvius.neural_tracing.fiber_follow.regression.neighbor_continuations import wrong_continuation
         for _ in range(3):
             item = wrong_continuation(self.continuation_bank or self.negative_bank,sample_cfg,rng,

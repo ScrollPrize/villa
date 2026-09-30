@@ -64,8 +64,8 @@ def interval_row(crops, right, wrong, loss):
     return dict(observed_states=crops, supervised_states=crops, point_correct_count=right, point_wrong_count=wrong,
                 point_unknown_count=0, geometry=loss, loss=loss, confidence_loss=.2,
                 geometry_count=right+wrong, error_sum=right+wrong,
-                memory_replay_observations=1, history_encoder_crops=4,
-                memory_grad_norm=3., memory_grad_clip_scale=.5)
+                history_load_seconds=1, history_valid_slabs=4,
+                history_grad_norm=3., history_grad_clip_scale=.5)
 
 
 def test_interval_pools_counts_weights_crop_means_and_preserves_json(tmp_path,capsys):
@@ -77,8 +77,8 @@ def test_interval_pools_counts_weights_crop_means_and_preserves_json(tmp_path,ca
     assert summary['loss'] == 3.5
     assert summary['refinement_attempts_mean'] == 2.5 and summary['refinement_attempts_sum'] == 10
     assert summary['crops'] == 4 and summary['updates'] == 2
-    assert summary['memory_replay_observations'] == 2 and summary['history_encoder_crops'] == 8
-    assert summary['memory_clipped_updates'] == 2
+    assert summary['history_load_seconds'] == 2 and summary['history_valid_slabs'] == 8
+    assert summary['history_clipped_updates'] == 2
     row = dict(step=10050,geometry=4.,loss=4.,lr=.001,interval=summary,n_future=16,tolerance=1.5,
                interval_update_seconds=1.,interval_data_seconds=.1,interval_samples_per_second=4.)
     path = tmp_path/'log.jsonl'

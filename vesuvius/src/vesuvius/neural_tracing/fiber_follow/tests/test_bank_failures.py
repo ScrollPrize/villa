@@ -86,7 +86,8 @@ def test_close_neighbor_switch_is_labeled_before_distance_departure_and_saved(tm
     before, after = collector.rows
     assert before['failure_kind'] == 4 and not before['offtrack']
     assert after['failure_kind'] == 1 and after['offtrack']
-    assert collector.track[0]['offtrack'] == 0 and collector.track[1]['offtrack'] == 1
+    np.testing.assert_array_equal(collector.track, np.stack((a,b)))
+    assert [r['prefix_end'] for r in collector.rows] == [1,2]
     assert after['switch_decision'] == 0
     np.testing.assert_allclose(after['switch_pos'], [2.25, 0., start+sign*6])
     assert after['switch_distance'] == pytest.approx(np.linalg.norm(b-a)*.75)
@@ -104,7 +105,8 @@ def test_close_neighbor_switch_is_labeled_before_distance_departure_and_saved(tm
     np.testing.assert_array_equal(loaded.failure_kind, [4, 1])
     np.testing.assert_array_equal(loaded.switch_pos, states.switch_pos)
     np.testing.assert_array_equal(loaded.switch_bank_path, states.switch_bank_path)
-    assert loaded.track(1)['offtrack'].tolist() == [0.]
+    np.testing.assert_array_equal(loaded.observed_prefix(1), np.stack((a,b)))
+    np.testing.assert_array_equal(loaded.observed_prefix(0), a[None])
 
 
 def test_premature_stopping_and_real_endpoint_overshoot_are_distinct(tmp_path):
@@ -126,7 +128,7 @@ def test_terminal_commit_keeps_event_without_inventing_decision(tmp_path):
                                   bank_detector=BankSwitchDetector([bank]))
     assert collector(decision([0,0,50], 0.))
     collector.observe_final_path(np.array([[0.,0.,50.], [3.,0.,58.]]))
-    assert len(collector.rows) == 1 and len(collector.track) == 1
+    assert len(collector.rows) == 1 and len(collector.track) == 2
     assert collector.rows[0]['failure_kind'] == 4 and not collector.rows[0]['offtrack']
     np.testing.assert_allclose(collector.rows[0]['switch_pos'], [2.25,0,56])
 
