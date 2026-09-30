@@ -70,3 +70,11 @@
 - Final CPU validation after review fixes: 67 passed, 4 CUDA-only skipped, one
   host-Gloo test deselected; shared-slot/config 12 passed; non-distributed
   single-backward 16 passed and 1 skipped; `git diff --check` passed.
+- First half-sigma/orientation launch restored update 18,000 on managed physical
+  GPUs 0-6, but its initial 121-batch test deadlocked on the final 2-batch wave:
+  ranks 0-1 ran an extra DDP forward while ranks 2-6 entered the next refinement
+  collective. NCCL reported sequence 599 `ALLGATHER` timeout after ten minutes.
+- Managed evaluation now pads ranks without a real final-wave batch with a
+  deterministic duplicate forward, disables their stateful observer, and drops
+  the padded result. This preserves identical DDP sequencing without changing
+  test rows or refinement proposals. Focused partition/gather tests: 6 passed.

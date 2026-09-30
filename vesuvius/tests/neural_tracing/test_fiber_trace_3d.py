@@ -454,6 +454,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.train import (
     _oblique_line_presence_for_display,
     _distributed_config_from_env,
     _distributed_gather_dense_test_rows,
+    _distributed_evaluation_wave_indices,
     _distributed_should_use_sync_batchnorm,
     _distributed_test_batch_indices,
     _distributed_training_batch_index,
@@ -1924,6 +1925,26 @@ def test_3d_distributed_test_batches_are_disjoint_and_complete(
             )
             for index in range(expected_count)
         ) == sample_count
+
+
+def test_distributed_evaluation_partial_wave_pads_ddp_without_duplicating_results() -> None:
+    remaining = list(range(121))
+    assignments = [
+        _distributed_evaluation_wave_indices(
+            remaining,
+            start=119,
+            wave_size=7,
+            rank=rank,
+            world_size=7,
+            pad_empty_ranks=True,
+        )
+        for rank in range(7)
+    ]
+
+    assert assignments[:2] == [([119], False), ([120], False)]
+    assert all(len(indices) == 1 and padded for indices, padded in assignments[2:])
+    assert {indices[0] for indices, _ in assignments[2:]} <= {119, 120}
+    assert [indices[0] for indices, padded in assignments if not padded] == [119, 120]
 
 
 def test_3d_gathered_test_rows_restore_serial_global_batch_mean(monkeypatch) -> None:

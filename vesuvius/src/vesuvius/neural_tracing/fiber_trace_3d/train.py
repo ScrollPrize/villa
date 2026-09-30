@@ -2284,6 +2284,30 @@ def _distributed_test_batch_indices(
     return tuple(range(int(config.rank), batch_count, int(config.world_size)))
 
 
+def _distributed_evaluation_wave_indices(
+    remaining: Sequence[int],
+    *,
+    start: int,
+    wave_size: int,
+    rank: int,
+    world_size: int,
+    pad_empty_ranks: bool,
+) -> tuple[list[int], bool]:
+    """Assign one evaluation wave while preserving DDP forward parity.
+
+    Managed evaluation yields between world-sized waves.  Its final wave can
+    contain fewer batches than ranks, but every DDP rank must still execute the
+    same number of forwards before the following collective.  Empty ranks load
+    a deterministic duplicate solely to preserve that sequencing; callers
+    discard its row and disable stateful prediction observers.
+    """
+    wave = list(remaining[int(start):int(start) + int(wave_size)])
+    indices = wave[int(rank)::int(world_size)]
+    if indices or not pad_empty_ranks or not wave:
+        return indices, False
+    return [wave[int(rank) % len(wave)]], True
+
+
 def _test_batch_take(*, sample_count: int, batch_size: int, global_batch_index: int) -> int:
     remaining = int(sample_count) - int(global_batch_index) * int(batch_size)
     if remaining <= 0:
@@ -3639,15 +3663,29 @@ def training_units(
             wave_size = distributed.world_size if pending_test is not None else max(1, total)
             all_rows = []
             for start in range(0, len(remaining), wave_size):
-                indices = remaining[start:start + wave_size][distributed.rank::distributed.world_size]
+                indices, padded = _distributed_evaluation_wave_indices(
+                    remaining,
+                    start=start,
+                    wave_size=wave_size,
+                    rank=distributed.rank,
+                    world_size=distributed.world_size,
+                    pad_empty_ranks=pending_test is not None,
+                )
                 iterator = queued_evaluation(indices, step, source=source,
                     evaluation_loader=evaluation_loader, count=count, offset=offset)
                 try:
-                    local = _evaluate_dense_loss_rows(raw_model, evaluation_loader, **options,
+                    local_options = (
+                        {**options, "prediction_observer": None}
+                        if padded
+                        else options
+                    )
+                    local = _evaluate_dense_loss_rows(raw_model, evaluation_loader, **local_options,
                         ema=ema, global_batch_indices=indices, batch_iterator=iterator,
                         microbatch_size=(min(loader.config.batch_size,
                             evaluation_microbatch_size or loader.config.batch_size)
                             if pending_test is not None else evaluation_microbatch_size))
+                    if padded:
+                        local = []
                 finally:
                     iterator.close()
                 refinement_stats = empty_refinement_statistics()
