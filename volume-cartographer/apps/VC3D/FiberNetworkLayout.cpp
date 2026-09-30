@@ -2230,6 +2230,7 @@ ContentDigest digestGlobalInputs(const std::vector<InputFiber>& fibers,
     hashDouble(digest, solver.untrustedConfidenceFactor);
     hashDouble(digest, solver.declarationViolationTurns);
     hashDouble(digest, solver.endpointClearanceTurns);
+    hashDouble(digest, solver.apexProminenceVx);
     hashU64(digest, static_cast<uint64_t>(
                         static_cast<int64_t>(solver.chiralityOverride)));
     return digest;

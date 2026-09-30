@@ -16,6 +16,8 @@
 
 #include <QtTest/QtTest>
 
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <set>
 #include <string>
@@ -1231,6 +1233,750 @@ private slots:
             QVERIFY(crossing.status != CrossingStatus::InGroup);
         }
         QVERIFY(countDroppedCrossings(result) >= 1);
+    }
+
+    // A traced V polyline steps back in height by fractions of a voxel. Such
+    // a back-step is no fold apex: the limbs it cuts count as one traversal,
+    // so a verdict group is not broken into a singleton and an even rest (the
+    // kb-159 / lt-165 rings of PHerc0139, where a 0.9 vx back-step between
+    // the first and second of five crossings left two red rings). A back-step
+    // deeper than the prominence is a fold and still cuts.
+    void subVoxelBackStepDoesNotCutATraversal()
+    {
+        for (const double backStep : {0.0, 0.9, 50.0}) {
+            World world;
+            // A straight H climbing in z as it turns.
+            FiberTrace h;
+            h.hvTag = 'H';
+            for (int i = 0; i <= 400; ++i) {
+                const double w = 0.2 + 0.2 * i / 400.0;
+                h.theta.push_back(kTwoPi * w);
+                h.z.push_back(29000.0 + 2000.0 * i / 400.0);
+                h.radius.push_back(sheetR(w, h.z.back()) - kSheetStep);
+            }
+            world.fibers.push_back(std::move(h));
+            world.trueM.push_back(0);
+            // A V fiber weaving across the H fiber's angle three times, on
+            // the H fiber's own sheet for the first half and a thickness
+            // further in for the second: inside, outside, outside - one
+            // inside, an odd count, verdict Inside (same winding).
+            FiberTrace v;
+            v.hvTag = 'V';
+            for (int i = 0; i <= 400; ++i) {
+                const double z = 29000.0 + 2000.0 * i / 400.0;
+                const double wH = 0.2 + 0.2 * i / 400.0;
+                const double w = wH + 0.03 * std::sin(kTwoPi * 1.5 * i / 400.0 + 0.5);
+                v.theta.push_back(kTwoPi * w);
+                v.z.push_back(z);
+                v.radius.push_back(sheetR(w, z) - (i > 200 ? 2.0 * kSheetStep : 0.0));
+            }
+            // The back-step: one sample between the first crossing (i ~ 112)
+            // and the second (i ~ 245) dips below its predecessor.
+            v.z[150] = v.z[149] - backStep;
+            world.fibers.push_back(std::move(v));
+            world.trueM.push_back(0);
+            const SolveResult result =
+                solveWindings(world.fibers, world.links, SolverParams{});
+            QCOMPARE(result.crossings.size(), std::size_t{3});
+            const std::size_t branches =
+                canonicalizeTrace(world.fibers[1], result.chirality).branches.size();
+            QCOMPARE(branches, backStep > 0.0 ? std::size_t{3} : std::size_t{1});
+            if (backStep < 4.0) {
+                // One run, one group, verdict taken; all three crossings
+                // stand behind it.
+                const CrossingGroup& group = singleGroup(result);
+                QCOMPARE(group.multiplicity, 3);
+                QCOMPARE(group.insideCount, 1);
+                QVERIFY(group.mixedSigns);
+                QVERIFY(group.orientationSum % 2 != 0);
+                QVERIFY(group.traversalCovered);
+                QVERIFY(!group.onCurtain);
+                QVERIFY(group.hasVerdict);
+                QCOMPARE(group.verdict, CrossingKind::Inside);
+                QCOMPARE(group.vBranch, std::size_t{0});
+                for (const Crossing& crossing : result.crossings) {
+                    QCOMPARE(crossing.status, CrossingStatus::InGroup);
+                    QCOMPARE(crossing.groupIndex, 0LL);
+                }
+                QCOMPARE(countDroppedCrossings(result), 0);
+                checkRelativeTurns(result, world, {0, 1});
+            } else {
+                // A real fold: the limbs are counted apart, the first
+                // crossing stands alone, the other two are too few for a
+                // verdict, and the signs' conflict surfaces as before.
+                for (const CrossingGroup& group : result.groups) {
+                    QVERIFY(!group.hasVerdict);
+                }
+                for (const Crossing& crossing : result.crossings) {
+                    QVERIFY(crossing.status != CrossingStatus::InGroup);
+                }
+                QVERIFY(countDroppedCrossings(result) >= 1);
+            }
+        }
+    }
+
+    // Jitter at the apices of a genuine fold: three 2000 vx limbs with a
+    // one-voxel back-and-forth at both extrema, the middle limb a wrap
+    // inward. Reading the extrema with hysteresis keeps the three limbs
+    // apart (a two-neighbour rule would chain the whole polyline into one
+    // run through the short branches and issue a verdict across limbs the
+    // solver has never counted together): an H fiber crossing all three
+    // gets three singletons, no verdict, and the conflict surfaces as
+    // before.
+    void jitterAtAFoldApexKeepsTheLimbsApart()
+    {
+        World world;
+        FiberTrace h;
+        h.hvTag = 'H';
+        for (double theta = kHairpinTheta0 - 0.2; theta <= kHairpinTheta0 + 0.2 + 1e-9;
+             theta += 0.002) {
+            h.theta.push_back(theta);
+            h.z.push_back(30000.0);
+            h.radius.push_back(20000.0);
+        }
+        world.fibers.push_back(std::move(h));
+        world.trueM.push_back(0);
+        FiberTrace v;
+        v.hvTag = 'V';
+        const auto sample = [&v](double z, double radius) {
+            v.theta.push_back(kHairpinTheta0);
+            v.z.push_back(z);
+            v.radius.push_back(radius);
+        };
+        for (double z = 29000.0; z <= 31000.0 + 1e-9; z += 25.0) {
+            sample(z, 22000.0);
+        }
+        sample(30999.0, 22000.0);
+        sample(31000.0, 22000.0);
+        for (double z = 30975.0; z >= 29000.0 - 1e-9; z -= 25.0) {
+            sample(z, 21000.0);
+        }
+        sample(29001.0, 21000.0);
+        sample(29000.0, 21000.0);
+        for (double z = 29025.0; z <= 31000.0 + 1e-9; z += 25.0) {
+            sample(z, 19000.0);
+        }
+        world.fibers.push_back(std::move(v));
+        world.trueM.push_back(0);
+        const SolveResult result =
+            solveWindings(world.fibers, world.links, SolverParams{});
+        QCOMPARE(canonicalizeTrace(world.fibers[1], result.chirality).branches.size(),
+                 std::size_t{7});
+        QCOMPARE(result.crossings.size(), std::size_t{3});
+        for (const CrossingGroup& group : result.groups) {
+            QVERIFY(!group.hasVerdict);
+        }
+        for (const Crossing& crossing : result.crossings) {
+            QVERIFY(crossing.status != CrossingStatus::InGroup);
+        }
+        QVERIFY(countDroppedCrossings(result) >= 1);
+    }
+
+    // The same with a sloping H fiber and an angle step in the V fiber: the
+    // three crossings of the one zigzag traversal land at different heights
+    // (below, inside and above the back-step's height band), so only their
+    // kinds' pattern - Outside, Inside, Inside - and the middle event's limb
+    // tell them apart from three genuine crossings. The event on the
+    // back-step limb withholds the verdict. All four sample orders.
+    void slopingTraversalThroughABackStepTakesNoVerdict()
+    {
+        for (int variant = 0; variant < 4; ++variant) {
+            World world;
+            FiberTrace h;
+            h.hvTag = 'H';
+            std::vector<std::array<double, 3>> hSamples = {{-0.1, 29800.0, 20300.0},
+                                                          {0.1, 30200.0, 20300.0}};
+            std::vector<std::array<double, 3>> vSamples = {{-0.001, 29000.0, 20000.0},
+                                                          {-0.001, 30000.5, 20200.0},
+                                                          {0.001, 29999.5, 20600.0},
+                                                          {0.001, 31000.0, 22000.0}};
+            if (variant & 1) {
+                std::reverse(hSamples.begin(), hSamples.end());
+            }
+            if (variant & 2) {
+                std::reverse(vSamples.begin(), vSamples.end());
+            }
+            for (const auto& [theta, z, radius] : hSamples) {
+                h.theta.push_back(theta);
+                h.z.push_back(z);
+                h.radius.push_back(radius);
+            }
+            world.fibers.push_back(std::move(h));
+            world.trueM.push_back(0);
+            FiberTrace v;
+            v.hvTag = 'V';
+            for (const auto& [theta, z, radius] : vSamples) {
+                v.theta.push_back(theta);
+                v.z.push_back(z);
+                v.radius.push_back(radius);
+            }
+            world.fibers.push_back(std::move(v));
+            world.trueM.push_back(0);
+            SolverParams params;
+            params.chiralityOverride = 1;
+            const SolveResult result = solveWindings(world.fibers, world.links, params);
+            QCOMPARE(canonicalizeTrace(world.fibers[1], result.chirality).branches.size(),
+                     std::size_t{3});
+            QCOMPARE(result.crossings.size(), std::size_t{3});
+            const CrossingGroup& group = singleGroup(result);
+            QCOMPARE(group.multiplicity, 3);
+            QCOMPARE(group.insideCount, 2);
+            QVERIFY(group.mixedSigns);
+            QVERIFY(group.orientationSum % 2 != 0);
+            QVERIFY(group.onCurtain);
+            QVERIFY(!group.hasVerdict);
+            for (const Crossing& crossing : result.crossings) {
+                QVERIFY(crossing.status != CrossingStatus::InGroup);
+            }
+        }
+    }
+
+    // The encounter with a back-step limb may be read as a touch rather
+    // than a crossing: here both back-step limbs are met within rounding of
+    // their upper vertices (the intersections lie 2^-38 and 2^-37 inside),
+    // detection snaps the hits to the vertices and the ray test reads
+    // touches, which no group counts. The veto must still see them, or the
+    // three counted full-limb events (Outside, Outside, Inside... read
+    // Inside, Inside, Outside in one order) would take a verdict whose
+    // inside parity is not the exact five-crossing count's. (With band
+    // membership read from the H segment's height interval the touch is
+    // covered twice over: its companions lie within 2^-38 of the band
+    // edges, so any segment holding them meets the band as well.) All four
+    // sample orders.
+    void touchOnABackStepLimbVetoesTheVerdict()
+    {
+        const double e = std::ldexp(1.0, -38);
+        const double f = std::ldexp(1.0, -37);
+        for (int variant = 0; variant < 4; ++variant) {
+            World world;
+            std::vector<std::array<double, 3>> hSamples = {{-0.5, 20000.0, 20300.0},
+                                                          {0.5, 40000.0, 20300.0}};
+            std::vector<std::array<double, 3>> vSamples = {
+                {-0.2, 20000.0, 20000.0},    {-0.05, 29000.0 - e, 20000.0},
+                {0.0, 30000.0 + e, 20000.0}, {0.001, 29999.0, 22000.0},
+                {0.2, 34000.0 - f, 22000.0}, {0.25, 35000.0 + f, 22000.0},
+                {0.251, 34999.0, 22000.0},   {0.251, 40000.0, 22000.0}};
+            if (variant & 1) {
+                std::reverse(hSamples.begin(), hSamples.end());
+            }
+            if (variant & 2) {
+                std::reverse(vSamples.begin(), vSamples.end());
+            }
+            FiberTrace h;
+            h.hvTag = 'H';
+            for (const auto& [theta, z, radius] : hSamples) {
+                h.theta.push_back(theta);
+                h.z.push_back(z);
+                h.radius.push_back(radius);
+            }
+            world.fibers.push_back(std::move(h));
+            world.trueM.push_back(0);
+            FiberTrace v;
+            v.hvTag = 'V';
+            for (const auto& [theta, z, radius] : vSamples) {
+                v.theta.push_back(theta);
+                v.z.push_back(z);
+                v.radius.push_back(radius);
+            }
+            world.fibers.push_back(std::move(v));
+            world.trueM.push_back(0);
+            SolverParams params;
+            params.chiralityOverride = 1;
+            const SolveResult result = solveWindings(world.fibers, world.links, params);
+            QCOMPARE(canonicalizeTrace(world.fibers[1], result.chirality).branches.size(),
+                     std::size_t{5});
+            int touches = 0;
+            for (const Crossing& event : result.events) {
+                touches += event.touch ? 1 : 0;
+            }
+            QVERIFY(touches >= 1);
+            QCOMPARE(result.groups.size(), std::size_t{1});
+            QVERIFY(result.groups.front().onCurtain);
+            QVERIFY(!result.groups.front().hasVerdict);
+            for (const Crossing& crossing : result.crossings) {
+                QVERIFY(crossing.status != CrossingStatus::InGroup);
+            }
+        }
+    }
+
+    // A traversal through a back-step can miss the back-step limb itself
+    // and meet the limb after twice instead, where that limb wobbles in
+    // angle inside the back-step's height band: here the H fiber slips
+    // under the one-voxel back-step, crosses the lower limb at 29999.7
+    // (Outside, the radius steps across the back-step) and the upper limb
+    // at 29999.5 and 30001.3 (Inside, Inside). Two of the three lie in the
+    // band [29999, 30000]; the run takes no verdict (an Outside verdict
+    // would stand on a count that is not one smoothed traversal's). Both
+    // sample orders of the V fiber.
+    void angleWobbleInsideTheBackStepBandTakesNoVerdict()
+    {
+        for (const bool reversed : {false, true}) {
+            World world;
+            FiberTrace h;
+            h.hvTag = 'H';
+            for (const auto& [theta, z, radius] :
+                 {std::array{-0.2, 37999.7, 20300.0}, std::array{0.2, 21999.7, 20300.0}}) {
+                h.theta.push_back(theta);
+                h.z.push_back(z);
+                h.radius.push_back(radius);
+            }
+            world.fibers.push_back(std::move(h));
+            world.trueM.push_back(0);
+            std::vector<std::array<double, 3>> vSamples = {{0.0, 20000.0, 20000.0},
+                                                          {0.0, 30000.0, 20000.0},
+                                                          {0.00002, 29999.0, 22000.0},
+                                                          {-0.00004, 30001.0, 22000.0},
+                                                          {0.00002, 40000.0, 22000.0}};
+            if (reversed) {
+                std::reverse(vSamples.begin(), vSamples.end());
+            }
+            FiberTrace v;
+            v.hvTag = 'V';
+            for (const auto& [theta, z, radius] : vSamples) {
+                v.theta.push_back(theta);
+                v.z.push_back(z);
+                v.radius.push_back(radius);
+            }
+            world.fibers.push_back(std::move(v));
+            world.trueM.push_back(0);
+            SolverParams params;
+            params.chiralityOverride = 1;
+            const SolveResult result = solveWindings(world.fibers, world.links, params);
+            QCOMPARE(canonicalizeTrace(world.fibers[1], result.chirality).branches.size(),
+                     std::size_t{3});
+            // Three events; the two Inside ones, 1.8 vx apart at one radial
+            // gap, share a display representative.
+            QCOMPARE(result.events.size(), std::size_t{3});
+            const CrossingGroup& group = singleGroup(result);
+            QCOMPARE(group.multiplicity, 3);
+            QCOMPARE(group.insideCount, 2);
+            QVERIFY(group.onCurtain);
+            QVERIFY(!group.hasVerdict);
+            for (const Crossing& crossing : result.crossings) {
+                QVERIFY(crossing.status != CrossingStatus::InGroup);
+            }
+        }
+    }
+
+    // Nested jitter: a 3 vx back-step whose two ends each carry a half-voxel
+    // wobble. The heights the run visits more than once span the whole
+    // back-step [29997, 30000], not only the two half-voxel overlaps of
+    // consecutive limbs; the H fiber slips through the middle, missing every
+    // short limb, and meets the long limbs at 29998.5 (Outside), 29997.6
+    // and 30000.1 (Inside, Inside). The bands are the sub-prominence limbs'
+    // own ranges, so the middle is covered and the run takes no verdict.
+    // The H fiber is sampled every 0.1 vx of height around the encounters,
+    // so each event's segment enclosure is tight and meets only the
+    // 3 vx limb's range, not the two half-voxel overlaps: the fixture
+    // depends on the bands being the limbs' ranges. All four sample orders.
+    void nestedJitterIsCoveredWhole()
+    {
+        for (int variant = 0; variant < 4; ++variant) {
+            World world;
+            // Heights descending from 37998.5 to 21998.5 along theta = -0.2
+            // .. 0.2 (z = 37998.5 - 40000 (theta + 0.2)).
+            std::vector<double> heights = {37998.5, 34000.0, 31000.0};
+            for (double z = 30002.05; z >= 29995.95 - 1e-9; z -= 0.1) {
+                heights.push_back(z);
+            }
+            heights.insert(heights.end(), {29000.0, 26000.0, 21998.5});
+            std::vector<std::array<double, 3>> hSamples;
+            for (const double z : heights) {
+                hSamples.push_back({(37998.5 - z) / 40000.0 - 0.2, z, 20300.0});
+            }
+            std::vector<std::array<double, 3>> vSamples = {
+                {0.0, 20000.0, 20000.0},      {0.0, 30000.0, 20000.0},
+                {0.0, 29999.5, 20000.0},      {0.0, 30000.0, 20000.0},
+                {0.00005, 29997.0, 22000.0},  {0.00005, 29997.5, 22000.0},
+                {0.00005, 29997.0, 22000.0},  {-0.00004, 29999.0, 22000.0},
+                {0.00005, 40000.0, 22000.0}};
+            if (variant & 1) {
+                std::reverse(hSamples.begin(), hSamples.end());
+            }
+            if (variant & 2) {
+                std::reverse(vSamples.begin(), vSamples.end());
+            }
+            FiberTrace h;
+            h.hvTag = 'H';
+            for (const auto& [theta, z, radius] : hSamples) {
+                h.theta.push_back(theta);
+                h.z.push_back(z);
+                h.radius.push_back(radius);
+            }
+            world.fibers.push_back(std::move(h));
+            world.trueM.push_back(0);
+            FiberTrace v;
+            v.hvTag = 'V';
+            for (const auto& [theta, z, radius] : vSamples) {
+                v.theta.push_back(theta);
+                v.z.push_back(z);
+                v.radius.push_back(radius);
+            }
+            world.fibers.push_back(std::move(v));
+            world.trueM.push_back(0);
+            SolverParams params;
+            params.chiralityOverride = 1;
+            const SolveResult result = solveWindings(world.fibers, world.links, params);
+            QCOMPARE(canonicalizeTrace(world.fibers[1], result.chirality).branches.size(),
+                     std::size_t{7});
+            QCOMPARE(result.events.size(), std::size_t{3});
+            const CrossingGroup& group = singleGroup(result);
+            QCOMPARE(group.multiplicity, 3);
+            QCOMPARE(group.insideCount, 2);
+            QVERIFY(group.onCurtain);
+            QVERIFY(!group.hasVerdict);
+            for (const Crossing& crossing : result.crossings) {
+                QVERIFY(crossing.status != CrossingStatus::InGroup);
+            }
+        }
+    }
+
+    // An event exactly at a band edge: the middle crossing of this
+    // traversal lies at height 30000, the top of the band [29999, 30000],
+    // halfway along an H segment whose interpolation reconstructs it a few
+    // ulps above (30000.000000000007) in one sample order and exactly in
+    // the other. Band membership is read from the H segment's height
+    // interval, which encloses the crossing whatever the rounding, so the
+    // veto holds in both orders.
+    void bandEdgeIsReadWithinRounding()
+    {
+        for (const bool reversed : {false, true}) {
+            World world;
+            std::vector<std::array<double, 3>> hSamples = {
+                {-58618.0 / 65536.0, 88616.0, 20300.0}, {13520.0 / 65536.0, 16478.0, 20300.0}};
+            if (reversed) {
+                std::reverse(hSamples.begin(), hSamples.end());
+            }
+            FiberTrace h;
+            h.hvTag = 'H';
+            for (const auto& [theta, z, radius] : hSamples) {
+                h.theta.push_back(theta);
+                h.z.push_back(z);
+                h.radius.push_back(radius);
+            }
+            world.fibers.push_back(std::move(h));
+            world.trueM.push_back(0);
+            FiberTrace v;
+            v.hvTag = 'V';
+            for (const auto& [theta, z, radius] :
+                 {std::array{0.0, 20000.0, 20000.0}, std::array{0.0, 30000.0, 20000.0},
+                  std::array{1.0 / 65536.0, 29999.0, 22000.0},
+                  std::array{-5.0 / 65536.0, 30001.0, 22000.0},
+                  std::array{1.0 / 65536.0, 40000.0, 22000.0}}) {
+                v.theta.push_back(theta);
+                v.z.push_back(z);
+                v.radius.push_back(radius);
+            }
+            world.fibers.push_back(std::move(v));
+            world.trueM.push_back(0);
+            SolverParams params;
+            params.chiralityOverride = 1;
+            const SolveResult result = solveWindings(world.fibers, world.links, params);
+            QCOMPARE(result.events.size(), std::size_t{3});
+            const CrossingGroup& group = singleGroup(result);
+            QCOMPARE(group.multiplicity, 3);
+            QCOMPARE(group.insideCount, 2);
+            QVERIFY(group.onCurtain);
+            QVERIFY(!group.hasVerdict);
+        }
+    }
+
+    // The same at a nearly parallel crossing: the intersection parameter is
+    // a determinant quotient whose cancellation puts the reconstructed
+    // height a microvoxel above the band's top edge (exactly 30000 in the
+    // reals), far beyond any epsilon envelope. The H segment's height
+    // interval encloses it regardless. Both sample orders of the H fiber.
+    void nearlyParallelBandEdgeIsEnclosed()
+    {
+        const double a = 10771629145.0 / 281474976710656.0;
+        const double b = 10771629982.0 / 281474976710656.0;
+        for (const bool reversed : {false, true}) {
+            World world;
+            std::vector<std::array<double, 3>> hSamples = {{-4529.0 * a, 25471.0, 20300.0},
+                                                          {1832.0 * a, 31832.0, 20300.0}};
+            if (reversed) {
+                std::reverse(hSamples.begin(), hSamples.end());
+            }
+            FiberTrace h;
+            h.hvTag = 'H';
+            for (const auto& [theta, z, radius] : hSamples) {
+                h.theta.push_back(theta);
+                h.z.push_back(z);
+                h.radius.push_back(radius);
+            }
+            world.fibers.push_back(std::move(h));
+            world.trueM.push_back(0);
+            FiberTrace v;
+            v.hvTag = 'V';
+            for (const auto& [theta, z, radius] :
+                 {std::array{0.0, 20000.0, 20000.0}, std::array{-0.01, 30000.0, 20000.0},
+                  std::array{-b, 29999.0, 22000.0}, std::array{1000.0 * b, 31000.0, 22000.0},
+                  std::array{-1.0, 40000.0, 22000.0}}) {
+                v.theta.push_back(theta);
+                v.z.push_back(z);
+                v.radius.push_back(radius);
+            }
+            world.fibers.push_back(std::move(v));
+            world.trueM.push_back(0);
+            SolverParams params;
+            params.chiralityOverride = 1;
+            const SolveResult result = solveWindings(world.fibers, world.links, params);
+            QCOMPARE(result.events.size(), std::size_t{3});
+            const CrossingGroup& group = singleGroup(result);
+            QCOMPARE(group.multiplicity, 3);
+            QVERIFY(group.onCurtain);
+            QVERIFY(!group.hasVerdict);
+        }
+    }
+
+    // Jitter at an apex that revisits the apex height: the run's extreme is
+    // reached twice, and the stretch between the visits is a run of its
+    // own, so it attaches to neither limb and the runs read the same in
+    // either sample order of the V fiber. The theta = 0 limb, crossed three
+    // times (Inside, Outside, Outside), keeps its Inside verdict in both
+    // orders (attaching the jitter to it in one order would veto it there).
+    void tiedApexHeightsAreReadOrderIndependently()
+    {
+        for (const bool reversed : {false, true}) {
+            World world;
+            FiberTrace h;
+            h.hvTag = 'H';
+            for (const auto& [theta, z, radius] :
+                 {std::array{0.4, 29009.5, 19000.0}, std::array{0.1, 29009.5, 19000.0},
+                  std::array{0.1, 29005.0, 19000.0}, std::array{-0.1, 29005.0, 19000.0},
+                  std::array{-0.1, 29005.0, 21000.0}, std::array{0.1, 29005.0, 21000.0},
+                  std::array{-0.1, 29005.0, 21000.0}}) {
+                h.theta.push_back(theta);
+                h.z.push_back(z);
+                h.radius.push_back(radius);
+            }
+            world.fibers.push_back(std::move(h));
+            world.trueM.push_back(0);
+            std::vector<std::array<double, 3>> vSamples = {
+                {0.0, 29000.0, 20000.0}, {0.0, 29010.0, 20000.0}, {0.1, 29009.0, 20000.0},
+                {0.2, 29010.0, 20000.0}, {0.2, 29000.0, 20000.0}};
+            if (reversed) {
+                std::reverse(vSamples.begin(), vSamples.end());
+            }
+            FiberTrace v;
+            v.hvTag = 'V';
+            for (const auto& [theta, z, radius] : vSamples) {
+                v.theta.push_back(theta);
+                v.z.push_back(z);
+                v.radius.push_back(radius);
+            }
+            world.fibers.push_back(std::move(v));
+            world.trueM.push_back(0);
+            SolverParams params;
+            params.chiralityOverride = 1;
+            const SolveResult result = solveWindings(world.fibers, world.links, params);
+            QCOMPARE(canonicalizeTrace(world.fibers[1], result.chirality).branches.size(),
+                     std::size_t{4});
+            int verdicts = 0;
+            for (const CrossingGroup& group : result.groups) {
+                if (group.hasVerdict) {
+                    ++verdicts;
+                    QCOMPARE(group.verdict, CrossingKind::Inside);
+                    QCOMPARE(group.multiplicity, 3);
+                }
+            }
+            QCOMPARE(verdicts, 1);
+        }
+    }
+
+    // A V fiber of one monotone branch shorter than the prominence in height
+    // (a nearly level trace near a fold) is a run of one limb: nothing
+    // overlaps, so it is no back-step and its group's verdict stands as it
+    // did per branch. All four sample orders.
+    void aShortSingleBranchIsNotABackStep()
+    {
+        for (int variant = 0; variant < 4; ++variant) {
+            World world;
+            std::vector<std::array<double, 3>> hSamples = {{-0.2, 29001.0, 19000.0},
+                                                          {0.2, 29001.0, 19000.0},
+                                                          {0.2, 29001.5, 21000.0},
+                                                          {-0.2, 29002.0, 21000.0},
+                                                          {0.2, 29002.0, 21000.0}};
+            std::vector<std::array<double, 3>> vSamples = {{-0.05, 29000.0, 20000.0},
+                                                          {0.05, 29003.0, 20000.0}};
+            if (variant & 1) {
+                std::reverse(hSamples.begin(), hSamples.end());
+            }
+            if (variant & 2) {
+                std::reverse(vSamples.begin(), vSamples.end());
+            }
+            FiberTrace h;
+            h.hvTag = 'H';
+            for (const auto& [theta, z, radius] : hSamples) {
+                h.theta.push_back(theta);
+                h.z.push_back(z);
+                h.radius.push_back(radius);
+            }
+            world.fibers.push_back(std::move(h));
+            world.trueM.push_back(0);
+            FiberTrace v;
+            v.hvTag = 'V';
+            for (const auto& [theta, z, radius] : vSamples) {
+                v.theta.push_back(theta);
+                v.z.push_back(z);
+                v.radius.push_back(radius);
+            }
+            world.fibers.push_back(std::move(v));
+            world.trueM.push_back(0);
+            SolverParams params;
+            params.chiralityOverride = 1;
+            const SolveResult result = solveWindings(world.fibers, world.links, params);
+            QCOMPARE(canonicalizeTrace(world.fibers[1], result.chirality).branches.size(),
+                     std::size_t{1});
+            const CrossingGroup& group = singleGroup(result);
+            QCOMPARE(group.multiplicity, 3);
+            QVERIFY(!group.onCurtain);
+            QVERIFY(group.hasVerdict);
+            QCOMPARE(group.verdict, CrossingKind::Inside);
+        }
+    }
+
+    // A back-step at which the V fiber's angle also steps: the run's two
+    // limbs lie at different angles below and above it. An H fiber that
+    // ends just short of the lower limb's angle, within the clearance, has
+    // an incomplete count; read against the limb that spans its height it
+    // gets no coverage. (Joining the limbs' samples into one polyline
+    // ordered by height would interpolate a locus between the two angles and
+    // certify the clearance falsely.)
+    void endpointClearanceIsReadPerLimb()
+    {
+        World world;
+        FiberTrace h;
+        h.hvTag = 'H';
+        for (const auto& [theta, radius] : {std::pair{0.6, 19000.0}, std::pair{-0.2, 19000.0},
+                                            std::pair{0.1, 21000.0}, std::pair{-0.02, 21000.0}}) {
+            h.theta.push_back(theta);
+            h.z.push_back(29050.0);
+            h.radius.push_back(radius);
+        }
+        world.fibers.push_back(std::move(h));
+        world.trueM.push_back(0);
+        FiberTrace v;
+        v.hvTag = 'V';
+        for (const auto& [theta, z] : {std::pair{0.0, 29000.0}, std::pair{0.0, 29100.0},
+                                       std::pair{0.4, 29099.0}, std::pair{0.4, 29200.0}}) {
+            v.theta.push_back(theta);
+            v.z.push_back(z);
+            v.radius.push_back(20000.0);
+        }
+        world.fibers.push_back(std::move(v));
+        world.trueM.push_back(0);
+        const SolveResult result =
+            solveWindings(world.fibers, world.links, SolverParams{});
+        QCOMPARE(canonicalizeTrace(world.fibers[1], result.chirality).branches.size(),
+                 std::size_t{3});
+        QCOMPARE(result.crossings.size(), std::size_t{3});
+        const CrossingGroup& group = singleGroup(result);
+        QCOMPARE(group.multiplicity, 3);
+        QVERIFY(group.mixedSigns);
+        QVERIFY(group.orientationSum % 2 != 0);
+        QVERIFY(!group.traversalCovered);
+        QVERIFY(!group.hasVerdict);
+        for (const Crossing& crossing : result.crossings) {
+            QVERIFY(crossing.status != CrossingStatus::InGroup);
+        }
+    }
+
+    // Before the polyline has moved a prominence from its start, the
+    // direction is open and the running lowest and highest extrema decide:
+    // a 3 vx rise followed by a 6 vx fall is a genuine reversal although
+    // neither extremum is a prominence from the start. The three limbs are
+    // then not one run (an H crossing all three at a radius between theirs
+    // would otherwise take an Outside verdict). Both sample orders.
+    void startupReversalIsReadFromTheRunningExtrema()
+    {
+        for (const bool reversed : {false, true}) {
+            World world;
+            FiberTrace h;
+            h.hvTag = 'H';
+            for (double theta = -0.2; theta <= 0.2 + 1e-9; theta += 0.002) {
+                h.theta.push_back(theta);
+                h.z.push_back(30001.0);
+                h.radius.push_back(20300.0);
+            }
+            world.fibers.push_back(std::move(h));
+            world.trueM.push_back(0);
+            FiberTrace v;
+            v.hvTag = 'V';
+            std::vector<std::pair<double, double>> samples = {
+                {30000.0, 20000.0}, {30003.0, 20000.0}, {29997.0, 21200.0}, {30100.0, 22000.0}};
+            if (reversed) {
+                std::reverse(samples.begin(), samples.end());
+            }
+            for (const auto& [z, radius] : samples) {
+                v.theta.push_back(0.0);
+                v.z.push_back(z);
+                v.radius.push_back(radius);
+            }
+            world.fibers.push_back(std::move(v));
+            world.trueM.push_back(0);
+            const SolveResult result =
+                solveWindings(world.fibers, world.links, SolverParams{});
+            QCOMPARE(canonicalizeTrace(world.fibers[1], result.chirality).branches.size(),
+                     std::size_t{3});
+            QCOMPARE(result.crossings.size(), std::size_t{3});
+            for (const CrossingGroup& group : result.groups) {
+                QVERIFY(group.multiplicity < 3);
+                QVERIFY(!group.hasVerdict);
+            }
+            for (const Crossing& crossing : result.crossings) {
+                QVERIFY(crossing.status != CrossingStatus::InGroup);
+            }
+        }
+    }
+
+    // A traversal through a back-step meets the run's curtain three times.
+    // Where the V fiber's radius is continuous across the back-step the two
+    // extra crossings are of one kind and the inside count's parity holds;
+    // here the radius steps across the one-voxel back-step and the H
+    // fiber's radius falls between the limbs', so the three events are
+    // Outside, Inside, Inside. The middle one lies on the back-step limb,
+    // which marks the count as not one traversal's: no verdict (an Outside
+    // verdict would separate the H fiber from the middle limb it sits
+    // inside of).
+    void backStepBandWithBothKindsTakesNoVerdict()
+    {
+        World world;
+        FiberTrace h;
+        h.hvTag = 'H';
+        for (double theta = -0.2; theta <= 0.2 + 1e-9; theta += 0.002) {
+            h.theta.push_back(theta);
+            h.z.push_back(30000.0);
+            h.radius.push_back(20300.0);
+        }
+        world.fibers.push_back(std::move(h));
+        world.trueM.push_back(0);
+        FiberTrace v;
+        v.hvTag = 'V';
+        for (const auto& [z, radius] : {std::pair{29900.0, 20000.0}, std::pair{30000.5, 20200.0},
+                                        std::pair{29999.5, 20600.0}, std::pair{30100.0, 22000.0}}) {
+            v.theta.push_back(0.0);
+            v.z.push_back(z);
+            v.radius.push_back(radius);
+        }
+        world.fibers.push_back(std::move(v));
+        world.trueM.push_back(0);
+        const SolveResult result =
+            solveWindings(world.fibers, world.links, SolverParams{});
+        QCOMPARE(canonicalizeTrace(world.fibers[1], result.chirality).branches.size(),
+                 std::size_t{3});
+        QCOMPARE(result.crossings.size(), std::size_t{3});
+        const CrossingGroup& group = singleGroup(result);
+        QCOMPARE(group.multiplicity, 3);
+        QCOMPARE(group.insideCount, 2);
+        QVERIFY(group.mixedSigns);
+        QVERIFY(group.orientationSum % 2 != 0);
+        QVERIFY(group.traversalCovered);
+        QVERIFY(group.onCurtain);
+        QVERIFY(!group.hasVerdict);
+        for (const Crossing& crossing : result.crossings) {
+            QVERIFY(crossing.status != CrossingStatus::InGroup);
+        }
     }
 
     // A V fiber folding back in height sweeps a curtain that covers the same

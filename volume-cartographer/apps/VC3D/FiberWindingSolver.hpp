@@ -163,6 +163,13 @@ struct SolverParams {
     // mid-traversal, and its crossing count is then incomplete. Intent: a
     // few hundred voxels of arc at the scroll's radii.
     double endpointClearanceTurns = 0.01;
+    // A height reversal of a V polyline is a fold apex - cutting the fiber
+    // into the limbs the traversal groups count separately - only when the
+    // reversed run climbs back at least this far. Smaller back-steps are
+    // sampling jitter (traced polylines step back by fractions of a voxel),
+    // and the limbs they cut count as one traversal (see the note on runs at
+    // CrossingGroup). Intent: ~0.001 cm, one tracer step.
+    double apexProminenceVx = 4.0;
     // 0 = infer from the data; +1 / -1 force the winding direction.
     int chiralityOverride = 0;
 };
@@ -295,6 +302,25 @@ struct Crossing {
 // fiber therefore contributes one group per limb, and its limbs' disagreement
 // surfaces as it always did.
 //
+// The cut is made at every height reversal of the polyline, and a traced
+// polyline reverses height by a fraction of a voxel all the time. Such a
+// back-step is no fold: the count is taken per RUN of branches, the runs
+// bounded by the extrema at which the polyline reverses by at least
+// SolverParams::apexProminenceVx (read with hysteresis along the polyline,
+// so jitter at a genuine apex neither hides the apex nor joins its limbs).
+// A back-step alters the polyline only within its height band, so outside
+// the bands the run's curve is one smoothed limb's and every crossing there
+// is a crossing of both; inside a band one traversal meets the curtain more
+// than once, and the extra crossings cancel in the inside count only when
+// they are of one kind, which the geometry does not guarantee. A run with
+// any event, counted or a touch, inside one of its bands (or on a
+// sub-prominence limb) takes no verdict (onCurtain); a group whose events
+// all lie outside the bands counts as on one limb. A run of a single branch
+// has no back-step, however short. The cut itself stays for detection, so only the grouping (and
+// the apex, curtain and seam gates that go with it) is per run. The run's
+// completeness test reads its limbs one by one: an H end must clear every
+// limb spanning its height, on one side.
+//
 // The verdict is only issued where it can change anything and where the
 // count is trustworthy: the signs must be mixed (a uniform group already
 // says what its members say, and keeps their individual constraints), the
@@ -309,6 +335,7 @@ struct CrossingGroup {
     std::size_t hFiber = 0;
     std::size_t vFiber = 0;
     long long n = 0;
+    // First limb of the run of V branches counted together.
     std::size_t vBranch = 0;
     // Indices into the EVENT list this group belongs to (PairCrossings::events
     // in the shard, SolveResult::events in the solve), touches excluded.
@@ -322,8 +349,9 @@ struct CrossingGroup {
     bool mixedSigns = false;
     // Eligibility diagnostics (see above). onCurtain: an event on the edge
     // of the radial curtain - exactly at the V fiber's radius, or a crossing
-    // at a fold apex shared with another limb - where the count is not of
-    // one traversal of this limb.
+    // at a fold apex shared with another limb - or any event, counted or a
+    // touch, inside a back-step's height band of the run - where the count
+    // is not of one traversal of this run.
     bool coverageGap = false;
     bool unresolved = false;
     bool onCurtain = false;

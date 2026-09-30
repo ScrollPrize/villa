@@ -1766,6 +1766,7 @@ void FiberMapWorkspace::startRebuild(bool fullRebuild, bool automatic)
             job->params.solver.zMergeVx = 0.2 * vxPerCm;             // crossing dedup span
             job->params.solver.neighborhoodZVx = 0.5 * vxPerCm;      // ordinal window
             job->params.solver.neighborhoodArcVx = 0.5 * vxPerCm;
+            job->params.solver.apexProminenceVx = 0.001 * vxPerCm; // fold apex vs jitter
         }
 
         // The cache travels WITH the job: the worker is its only toucher
