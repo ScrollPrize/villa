@@ -359,6 +359,13 @@ same modules build with serial kernels when it does not.
 or with conda/pip, install `torch` for your CUDA version and then
 `pip install -e .` from `spiral-fitting/`.
 
+On Linux x86-64, `uv sync` installs `brook-cu12`, CuPy and cuCIM for the GPU
+backend of `extract_surface_tracks.py` instead of Kimimaro, its CPU backend;
+on a machine without an NVIDIA GPU of compute capability 8.0 or newer, add
+Kimimaro with `uv sync --extra cpu` (with pip: `pip install -e '.[cpu]'`), and
+pass `--extra cpu` on later syncs too, since a plain `uv sync` removes it again.
+Other platforms get Kimimaro by default.
+
 ### Resident sparse field pools
 
 Normals and gradient magnitude samples are served by fully
@@ -787,6 +794,116 @@ journalctl --user -u spiral-service -f     # logs (includes the API key print)
 ```
 
 Direct command-line use remains fully supported; the unit is a convenience.
+
+## Extracting surface tracks
+
+`extract_surface_tracks.py` turns a surface-prediction volume into the tracks
+DBM that the next sections pack, index and rasterize. The predictions are
+binarized (`> 0`) and cut into thin slabs: horizontal ribbons 4 voxels deep
+every 16 voxels of z, then vertical zx and zy slabs 4 voxels thick every 64
+voxels across the occupied yx range. In every slab the connected components
+are labelled, max-pooled by 4, filtered by size and skeletonized, and each
+skeleton chain between branch or end points with at least 10 vertices becomes
+a track.
+
+```sh
+python extract_surface_tracks.py \
+    --predictions /path/to/<surface-predictions>.zarr/0 \
+    --out /path/to/<dataset>/tracks/<name>.dbm \
+    --z-min 10900 --z-max 11300
+```
+
+Every option defaults to the configuration at the top of the script, which
+also holds the slab geometry, the size thresholds and `path_mode`. Its two
+paths are placeholders: the script stops with an error until they are set or
+passed as `--predictions` and `--out`. `--predictions` takes a local path or a
+URL such as `s3://...`, opened with `open_zarr` from `../vesuvius/src`; the GPU
+backend reads a local zarr v2 array in the layout of the surface predictions
+(uint8, blosc, `/` chunk keys) straight from its chunk files instead. The z
+range is half-open (`[z-min, z-max)`).
+
+Two backends write the same keys in the same format:
+
+- `gpu`: Brook (`brook-cu12`) and cuCIM on NVIDIA GPUs, one worker process
+  per GPU. It needs Linux x86-64, GPUs of compute capability 8.0 or newer
+  (Ampere or later) and an NVIDIA driver R545 or newer (R570 or newer where the
+  driver JIT-compiles Brook's PTX). The CUDA 12 libraries come as pip wheels
+  (`brook-cu12` bundles its runtime; CuPy and cuCIM use NVIDIA's CUDA wheels
+  installed with them), so no system CUDA toolkit is needed. `--gpus 0,1`
+  selects GPUs by their `nvidia-smi` index; the default is every visible GPU.
+  Without `--gpus`, a set `CUDA_VISIBLE_DEVICES` is read the same way
+  (`nvidia-smi` indices, PCI bus order); UUID and MIG entries are not accepted,
+  so pass `--gpus` instead. With `--gpus`, `--backend auto` does not fall back
+  to Kimimaro when the GPU backend cannot run.
+- `cpu`: Kimimaro, one slab at a time. `uv sync` installs it on every platform
+  except Linux x86-64, where it is the optional `cpu` extra
+  (`uv sync --extra cpu`) for machines without a compatible GPU.
+
+`--backend auto` (the default) picks the GPU backend when its check passes
+(platform, packages, and the NVIDIA driver version and the compute capability
+of the selected GPUs, as reported by `nvidia-smi`) and `path_mode` is
+`'interjoint'`, and Kimimaro otherwise. The
+script prints the backend it uses and why. `--backend gpu` and `--backend cpu`
+stop with the reason when that backend cannot run. The GPU backend implements
+only the `'interjoint'` path mode.
+
+Brook implements Kimimaro's skeletonization on the GPU. Its skeletons are close
+to Kimimaro's but not always identical, so the two backends' DBMs agree closely
+rather than byte for byte (see the measurements below). Kimimaro collects the
+skeletons of its 8 worker processes as they finish, so the order of the tracks
+within a key can also differ between two CPU runs.
+
+Every key (`h:{z}`, `vy:{y}`, `vx:{x}`) holds a pickled list of `(N, 3)` int32
+ZYX arrays in full-resolution voxels, and an empty slab holds an empty list.
+Keys already in the DBM are skipped, so an interrupted run resumes where it
+stopped, with either backend; delete the DBM to recompute it. When
+`write_native_packed_store` is set (the default), the script then writes the
+packed store described in the next section. That step imports `tracks.py`,
+which needs PyTorch; `--no-packed-store` skips it, and `convert_track_store.py`
+can write the store later.
+
+The GPU backend decodes the z range once into a bit-packed block in POSIX
+shared memory (`/dev/shm`) of about (z-max − z-min) × Y × X / 8 bytes, where Y
+and X are the full extent of the volume, plus at most a quarter of that again
+(at the default slab spacing) for the byte columns of the vx slabs. For 400
+slices of a 7888 × 8096 volume the block takes 3.2 GB. The script stops with an
+error when `/dev/shm` has too little free space.
+
+Measured on Scroll 1 surface predictions with the default slab geometry and
+thresholds. Times run from the start of the extraction to the closed DBM,
+reading and decoding included, interpreter start-up and the packed store not:
+
+| Input (Y × X) | z range | Hardware | Backend | Runs | Time |
+| :--- | :--- | :--- | :--- | ---: | ---: |
+| public predictions, 7888 × 8096 | 10900–11300 | Intel Core i9-14900KF | Kimimaro, 8 workers | 1 | 336.9 s |
+| same | 10900–11300 | NVIDIA RTX 4090, driver 615 | GPU | 3 | 4.1, 4.2, 4.2 s |
+| predictions, 8174 × 8174 | 10900–11300 | 4 × NVIDIA H100 80GB, driver 570 | GPU | 3 | 4.4, 4.5, 4.6 s |
+| same | 10752–14848 | 4 × NVIDIA H100 80GB | GPU | 3 | 15.7, 15.9, 19.6 s |
+| same | 10752–14848 | 1 × NVIDIA H100 80GB | GPU | 1 | 40.0 s |
+
+The 19.6 s run was the first in a new environment (numba compiles and caches
+its kernels once). On z 10752–14848 (446 keys) the GPU backend wrote 1,006,831
+tracks with 41,530,237 points, and a Kimimaro run on the same range wrote
+1,006,740 tracks with 41,543,412 points (+0.01 % tracks, −0.03 % points). The
+GPU DBMs were byte-identical across runs and between 1 and 4 GPUs, and the tests
+compare them with the per-slab loop run with `brook.skeletonize`. These are
+single inputs; speed and agreement depend on the data and the GPUs.
+
+Run the tests from the repository root:
+
+```sh
+PYTHONPATH=spiral-fitting spiral-fitting/.venv/bin/python -m pytest -q \
+  spiral-fitting/tests/test_extract_surface_tracks.py
+```
+
+They compare `fast_tracks.py` with the networkx walk of the CPU backend on
+fixed and random graphs, check the backend selection and the command line
+without a GPU or Kimimaro, and run the CPU backend on a small synthetic volume
+when Kimimaro is installed. With Brook, CuPy, cuCIM and a GPU of compute
+capability 8.0 or newer, they also run the GPU backend on one GPU on two small
+synthetic zarr stores, one read by the direct chunk reader and one through the
+fallback reader, and compare the DBMs with the per-slab loop run with
+`brook.skeletonize`.
 
 ## Packing large track databases
 

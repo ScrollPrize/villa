@@ -596,11 +596,6 @@ if(VC_RUN_RENDER_BENCHMARKS)
         set(_render_valgrind_ci_gate_outputs)
 
         foreach(_fixture serial parallel)
-            if(_fixture STREQUAL "serial")
-                set(_render_workers 1)
-            else()
-                set(_render_workers 4)
-            endif()
             foreach(_scenario full_res fallback_3 mixed_correlated mixed_shuffled)
                 set(_case_dir
                     "${_render_valgrind_ci_root}/${_fixture}/${_scenario}")
@@ -612,77 +607,33 @@ if(VC_RUN_RENDER_BENCHMARKS)
                 set(_callgrind_metadata
                     "${_callgrind_dir}/metadata.json")
                 set(_callgrind_scheduler)
-                set(_callgrind_scheduler_args)
                 set(_callgrind_byproducts
                     "${_callgrind_metadata}")
                 if(_fixture STREQUAL "parallel")
                     set(_callgrind_scheduler
                         "${_callgrind_dir}/scheduler.log")
-                    list(APPEND _callgrind_scheduler_args
-                        --trace-sched=yes
-                        --trace-syscalls=yes
-                        --time-stamp=yes
-                        "--log-file=${_callgrind_scheduler}")
                     list(APPEND _callgrind_byproducts
                         "${_callgrind_scheduler}")
                 endif()
+                set(_evaluation "${_case_dir}/evaluation.json")
                 add_custom_command(
-                    OUTPUT "${_callgrind_stamp}"
+                    OUTPUT "${_evaluation}" "${_callgrind_stamp}"
                     BYPRODUCTS ${_callgrind_byproducts}
-                    COMMAND ${CMAKE_COMMAND} -E remove_directory
-                        "${_callgrind_dir}"
-                    COMMAND ${CMAKE_COMMAND} -E make_directory
-                        "${_callgrind_dir}"
-                    COMMAND ${CMAKE_COMMAND} -E env
-                        "VC_RENDER_SAMPLER_THREADS=${_render_workers}"
-                        ${VC_VALGRIND_EXECUTABLE}
-                        --tool=callgrind
-                        --instr-atstart=no
-                        --fair-sched=yes
-                        --scheduling-quantum=10000
-                        --separate-threads=yes
-                        --dump-every-bb=10000
-                        --combine-dumps=no
-                        --collect-systime=no
-                        --cache-sim=yes
-                        --branch-sim=yes
-                        --I1=32768,8,64
-                        --D1=32768,8,64
-                        --LL=8388608,16,64
-                        ${_callgrind_scheduler_args}
-                        "--callgrind-out-file=${_callgrind_prefix}"
-                        $<TARGET_FILE:bench_render_synthetic>
+                    COMMAND ${Python3_EXECUTABLE}
+                        "${PROJECT_SOURCE_DIR}/scripts/run_render_valgrind_ci.py"
+                        collect-evaluate
+                        --valgrind "${VC_VALGRIND_EXECUTABLE}"
+                        --benchmark $<TARGET_FILE:bench_render_synthetic>
+                        --replay $<TARGET_FILE:bench_thread_sync_replay>
                         --fixture ${_fixture}
                         --scenario ${_scenario}
-                        --native-trials 1
-                        --metadata "${_callgrind_metadata}"
-                        --repetitions 1
-                        --callgrind
-                    COMMAND ${CMAKE_COMMAND} -E touch "${_callgrind_stamp}"
+                        --model "${_render_valgrind_ci_model}"
+                        --case-dir "${_case_dir}"
                     DEPENDS
                         bench_render_synthetic
-                    VERBATIM)
-
-                set(_evaluation "${_case_dir}/evaluation.json")
-                set(_evaluation_command
-                    $<TARGET_FILE:bench_thread_sync_replay>
-                    evaluate-render
-                    --fixture ${_fixture}
-                    --scenario ${_scenario}
-                    --callgrind-prefix "${_callgrind_prefix}"
-                    --callgrind-metadata "${_callgrind_metadata}"
-                    --model "${_render_valgrind_ci_model}"
-                    --output "${_evaluation}")
-                if(_fixture STREQUAL "parallel")
-                    list(APPEND _evaluation_command
-                        --callgrind-scheduler "${_callgrind_scheduler}")
-                endif()
-                add_custom_command(
-                    OUTPUT "${_evaluation}"
-                    COMMAND ${_evaluation_command}
-                    DEPENDS
-                        "${_callgrind_stamp}"
                         bench_thread_sync_replay
+                        "${PROJECT_SOURCE_DIR}/scripts/run_render_valgrind_ci.py"
+                        "${PROJECT_SOURCE_DIR}/scripts/render_valgrind_common.py"
                         "${_render_valgrind_ci_model}"
                     VERBATIM)
                 list(APPEND _render_valgrind_ci_measure_outputs "${_evaluation}")
@@ -915,6 +866,7 @@ vc_add_test(NAME test_plane_surface_branches)
 vc_add_test(NAME test_affine_transform_surface)
 
 vc_add_test(NAME test_quadsurface_more)
+vc_add_test(NAME test_quadsurface_smooth)
 
 vc_add_test(NAME test_surface_cache_dependencies)
 

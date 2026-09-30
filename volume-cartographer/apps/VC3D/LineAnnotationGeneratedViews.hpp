@@ -1,6 +1,8 @@
 #pragma once
 
 #include "vc/lasagna/LineViewBuilder.hpp"
+#include "vc/fiber_tracer/FiberDisplay.hpp"
+#include "vc/core/util/QuadSurface.hpp"
 
 #include <opencv2/core/types.hpp>
 
@@ -29,6 +31,31 @@ class QuadSurface;
 class QWidget;
 
 namespace vc3d::line_annotation {
+
+struct GeneratedStripFrame {
+    cv::Vec3d along, across, normal;
+};
+inline std::optional<GeneratedStripFrame> generatedStripFrame(QuadSurface* surface,
+                                                            const cv::Vec2d& uv)
+{
+    if (!surface || !surface->rawPointsPtr() || surface->rawPointsPtr()->empty())
+        return std::nullopt;
+    const cv::Vec3f ptr{float(uv[0]*surface->scale()[0]),
+                       float(uv[1]*surface->scale()[1]),0};
+    const auto across=vc::fiber_tracer::displayUnit(cv::Vec3d(
+        surface->coord(ptr,{0,1,0})-surface->coord(ptr,{0,-1,0})));
+    const double col=surface->surfaceToGrid(uv)[0];
+    const double row=surface->rawPointsPtr()->rows/2;
+    const auto left=surface->gridToSurface({std::max(0.0,col-0.5),row});
+    const auto right=surface->gridToSurface({
+        std::min(double(surface->rawPointsPtr()->cols-1),col+0.5),row});
+    const auto along=vc::fiber_tracer::displayUnit(cv::Vec3d(
+        surface->sampleAtSurface(right).volume-surface->sampleAtSurface(left).volume));
+    const auto normal=across && along ?
+        vc::fiber_tracer::displayUnit(along->cross(*across)) : std::nullopt;
+    if (!normal) return std::nullopt;
+    return GeneratedStripFrame{across->cross(*normal),*across,*normal};
+}
 
 enum class GeneratedControlPointContextResult {
     None,
@@ -90,6 +117,7 @@ struct GeneratedOverlay {
         char interpolationModeMarker = 'L';
         std::vector<uint64_t> branchIds;
         std::vector<BranchLink> branchLinks;
+        std::optional<cv::Vec3d> direction;
     };
 
     struct PredSnapMarker {
@@ -232,6 +260,11 @@ inline void scaleGeneratedMarkerForVolume(GeneratedOverlay::PredSnapMarker& mark
 }
 
 struct GeneratedViews {
+    double fiberWidth = 0.0; // Display-volume voxels, not persisted units.
+    double fiberWidthGapFraction = vc::fiber_tracer::kDefaultFiberWidthGapFraction;
+    double fiberBaseToVolumeScale = 1.0;
+    bool hasManualDisplayNormals = false;
+    std::vector<double> controlAngleOffsetsDegrees;
     std::string lineSurfaceName;
     QString lineSurfaceTitle;
     std::shared_ptr<QuadSurface> lineSurface;
@@ -249,6 +282,9 @@ struct GeneratedViews {
     // scroll center (NaN where the sample is invalid). Empty when
     // unavailable.
     std::vector<cv::Vec3f> lineNormals;
+    // Optional directed display correction; lineNormals still owns the
+    // fiber-wide viewer orientation convention.
+    std::vector<cv::Vec3f> displayLineNormals;
     // Unwrapped winding angle (radians) of each line point about the scroll
     // center, or empty when no center reference exists. See
     // unwrappedGeneratedWindingAngles.
@@ -518,12 +554,7 @@ inline cv::Vec3f interpolatedGeneratedLinePoint(const std::vector<cv::Vec3f>& li
                 std::numeric_limits<float>::quiet_NaN(),
                 std::numeric_limits<float>::quiet_NaN()};
     }
-    linePosition = std::clamp(linePosition, 0.0, static_cast<double>(linePoints.size() - 1));
-    const int lower = static_cast<int>(std::floor(linePosition));
-    const int upper = std::min<int>(lower + 1, static_cast<int>(linePoints.size()) - 1);
-    const float t = static_cast<float>(linePosition - static_cast<double>(lower));
-    return linePoints[static_cast<size_t>(lower)] * (1.0f - t) +
-           linePoints[static_cast<size_t>(upper)] * t;
+    return cv::Vec3f(vc::fiber_tracer::displayVectorAt(linePoints, linePosition));
 }
 
 // The side cut shows the stretch of the fiber within this winding distance of
@@ -1790,6 +1821,25 @@ inline bool generatedLineOrderNeighbourIsKollesisTermination(
     return false;
 }
 
+// Strip span selection depends only on longitudinal position, never click height.
+// At a CP use its outgoing span; the final CP uses its incoming span.
+inline std::optional<size_t> generatedControlSpanOwnerRank(
+    const std::vector<const GeneratedOverlay::ControlPointMarker*>& sortedControls,
+    double linePosition)
+{
+    if (sortedControls.size() < 2 || !std::isfinite(linePosition) ||
+        linePosition < sortedControls.front()->linePosition ||
+        linePosition > sortedControls.back()->linePosition) {
+        return std::nullopt;
+    }
+    for (size_t rank = 1; rank < sortedControls.size(); ++rank) {
+        if (linePosition < sortedControls[rank]->linePosition) {
+            return rank - 1;
+        }
+    }
+    return sortedControls.size() - 2;
+}
+
 struct GeneratedControlPointContextMenuOptions {
     QWidget* parent = nullptr;
     std::string surfaceName;
@@ -1814,6 +1864,7 @@ struct GeneratedControlPointContextMenuOptions {
     // Fiber file stem for menu labels, resolved when the menu opens.
     std::function<QString(uint64_t)> fiberDisplayNameForId;
     std::function<void(double, cv::Vec3f)> deleteControlPoint;
+    std::function<void(size_t)> clearControlCorrections;
     // (clicked volume point, link direction): start a new fiber seeded at the
     // click whose seed control point is linked to the designated candidate.
     std::function<void(cv::Vec3f, cv::Vec3f)> newLineAnnotationLinkedToCandidate;

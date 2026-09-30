@@ -1,5 +1,42 @@
 # VC3D Line Annotation Fibers
 
+## CP direction annotations
+
+Shift-drag near an existing CP in either strip to edit its forward direction.
+The live cyan handle points from the CP to the cursor; release commits, Escape
+cancels. The local strip frame includes normal corrections. Editing preserves
+the component perpendicular to that strip and changes only the in-plane heading.
+A click without movement does not change the annotation.
+Away from a CP, a completed drag inserts a CP at the drag-start volume point.
+It inherits the interpolated normal correction through ordinary CP placement;
+the direction is applied before the edit is published or optimization scheduled.
+Escape cancels creation as well as direction editing.
+Annotated CPs have a cyan 80-pixel direction marker in both strips (hover edge
+ticks are 12 pixels). Markers and dragging share the corrected local strip frame.
+The bottom of the Ctrl-right-click menu offers "Clear CP normals and dirs"
+for the selected CP. The annotation window menu offers "Clear all normals and dirs"
+for the entire current fiber. Both clear manual and inherited normal corrections
+and direction axes, but leaves fiber width/gap unchanged. Removing direction
+constraints queues reoptimization of the affected adjacent spans using the current auto/manual mode.
+
+The optional CP field `direction: [x,y,z]` is a finite nonzero signed forward
+direction in base coordinates. Placement chooses its sign from increasing
+strip-column/fiber order, not the user's drag sign. Reversal negates it;
+save/load and remote merge preserve its sign. Opposite signed edits conflict.
+
+Annotations apply independently of span length and interpolation choice:
+native tracing fixes its first step to the annotation for forward tracing and
+its negation for backward tracing (by fiber order, not endpoint displacement).
+Ordinary initial-direction hints still select/sign-align the prediction. After
+the fixed first step, ordinary candidate search resumes. For annotated endpoints
+only, fusion restores the endpoint edge direction and smoothly fades the
+positional adjustment into the interior;
+Lasagna uses per-side endpoint direction constraints; cubic spline runs use
+annotated endpoint and interior tangents. At the CP, the annotation also defines
+the cross-section plane normal. Existing auto/manual optimization scheduling is
+retained; edits dirty adjacent spans and connected spline runs follow the normal
+optimization path. Saved display-normal corrections remain separate.
+
 VC3D writes line annotations as `vc3d_fiber` JSON, currently **version 4**.
 Version 3 stores `control_points` as objects with a required `position`. Every
 non-final control point owns a required `segment_to_next` descriptor for its
@@ -31,6 +68,96 @@ click that replaces the point, a split, a reverse and a merge (union of both
 points' tags), and go with a deleted point. Loaders reject any other
 control-point field, so a tagged fiber does not load on builds older than this
 field.
+
+## Fiber width and display normals
+
+Adding a CP inside a manually corrected region inherits the effective
+interpolated display normal before insertion, rather than adding a zero-offset
+knot. Existing CP replacements keep their stored normal; explicit edge-drag
+normals take precedence. Uncorrected regions remain unset and follow Lasagna.
+
+In the upper-left cross view, Shift-left-drag selects the closest of the
+center and two nominal width edges (not the tolerance boundaries), in screen
+space. Moving the center translates it without editing its normal or width.
+Moving an edge places it at the mouse, using the direction from the original
+opposite edge to determine orientation. Width stays fixed: the center sits half
+the width behind the mouse along that direction, and the opposite edge moves
+with it. Only the CP position and baked display normal change. With no width,
+only the center is draggable. While Shift remains held, mouse release retains
+the preview and another drag continues from it without reslicing or optimizing.
+Releasing Shift commits one combined edit using the ordinary CP replacement
+radius, save and reoptimization path (if the mouse is still down, commit waits
+for its release). The original line anchor is retained across all strokes. Escape,
+focus loss or a geometry replacement cancels it. A target exactly at the original
+opposite edge cannot define an angle, so that stroke is discarded while earlier
+strokes are retained. This replaces prediction
+snap Shift-click in this cross view only. Fiber storage and tracing-normal
+semantics are unchanged.
+
+The drag preview also shows both inner/outer tolerance ticks, using the stored
+width gap and following the preview's position and rotation. These ticks are
+12 screen pixels long and respect the width-guide visibility toggle.
+During the Shift-drag sequence, the original normal/width guides and ordinary
+hover-width markers are hidden; only the current drag preview is shown. They
+return on commit or cancellation, respecting their menu visibility settings.
+
+The annotation toolbar has **Fiber width** (base voxels; 0 means unset) and
+**CP angle offset** (degrees). The angle control selects the nearest CP within
+the same arclength radius as CP replacement, and is disabled outside that radius.
+Setting an angle to zero removes its manual normal.
+
+Version-3 JSON stores optional top-level `width`, always-written top-level
+`width_gap_fraction` (default 0.2), and optional per-control-point
+`display_normal: [x,y,z]` and `display_normal_source`. The source is `manual`
+for explicit angle/edge-drag edits, `interpolated` for inheritance on CP
+creation, and `unknown` for older normals without provenance. Training should
+select only `manual`. Normal and provenance travel together through saving,
+replacement, reversal, split/merge, optimization and remote three-way sync.
+Clearing a normal omits both fields. The normal is the baked world-space unit normal,
+not an angle. The gap is a dimensionless fraction between 0 and 1; missing
+values load as 0.2 and are explicitly written on the next save. Existing values
+are retained; there is currently no gap editor in the toolbar. Coordinates
+scale the width but never this fraction. The stored normal is projected into
+the current cross plane after movement,
+reoptimization, or Lasagna reload; the spinbox shows its angle relative to the
+current Lasagna normal. An unprojectable stored direction is cleared, saved,
+and reported with the number of affected CPs.
+
+Display offsets use bounded C1 smoothstep interpolation in arclength between
+CPs (shortest angular path). Unset CPs constrain the offset to zero. The viewer
+and annotation code share the cut-plane tangent calculation. Corrections affect
+the cross-section and both strips, never tracing, alignment metrics, or
+optimization inputs.
+
+Width draws inner and outer guide pairs at `(1-gap)*width` and
+`(1+gap)*width`: by default 80% and 120% of the full width
+(offsets +/-0.40 and +/-0.60 times width from the center). The top strip shows
+continuous boundaries; the cross view shows short ticks. Hovering either view
+shows cyan edge ticks in both panes around the same world-space hover position,
+projected into each view, to preview placement. Cursor ticks
+remain 12 screen pixels long; their spacing follows the physical width and
+view scale. They hide on leaving the view, invalid data, unset width or hiding
+width guides, independently of linked-cursor mirroring.
+Any manual normal enables a horizontal cross-view guide. Both guide types can
+be hidden in the annotation menu. Graphics items are reused; width paths change
+only when the width changes (short tick lengths also adapt on zoom), with
+transforms updated for navigation. Mouse movement only repositions the existing
+cursor overlay, without requesting a volume render.
+
+**Ctrl+Space** in the fiber annotation window toggles the existing volume
+overlay through the main window's shared toggle action. **Space** continues to
+toggle cross-view mouse-follow. The annotation menu also exposes the overlay
+toggle. This is independent of width/normal guide visibility.
+
+Edits use the ordinary queued fiber save/sync path without retracing or changing
+review tags. CP metadata follows CP movement, reversal and split; each split
+inherits width and gap. Joining fibers uses the clicked fiber's nonzero width
+and its gap, otherwise the other fiber's width and gap. Three-way sync merges
+width, gap and per-CP normal changes
+independently of span refits; divergent edits and edits to removed CPs conflict.
+
+The former cross-section polygon/line editor and `cross_sections` storage are
+removed. Old records are not migrated and are omitted when rewriting a fiber.
 
 Tagged points draw as a hollow ring in the control-point yellow, a step larger
 than a filled point, in the cut and strip views and the overview bar; a tagged
@@ -91,14 +218,16 @@ unchanged), in place of the traced or interpolated style, and marks every
 break point with the dotted amber rim. The flag is display-only in the map:
 it does not change heat-map seeding, winding evidence or publishing.
 
-## Span menu (strips)
+## Combined span and control-point menu (strips)
 
-In the strip views a Ctrl+right-click on the centre line, away from every
-control point marker (12 scene units from a marker, within 12 of the line),
-opens the **span menu** for the span containing the click's line position;
-within a marker's reach the point menu opens as before, and far from both the
-nearest-point fallback stands. The span menu shows the span's state (mode
-marker, goal, gap or damaged) and holds everything that acts on a span:
+In either strip view, Ctrl+right-click anywhere across its height opens one
+menu with actions for the containing span and the nearest control point.
+Span selection uses only the click's longitudinal line position, not its
+distance from the centre line or a CP marker. At an exact CP position the
+outgoing span is selected; the final CP uses its incoming span. Extrapolated
+tails outside the control-point range have CP actions only.
+The menu identifies both targets and shows the span's state (mode marker,
+goal, gap or damaged). The span section contains:
 
 - **Interpolation goal** (Global / Cubic spline / Lasagna / Fiber trace):
   lives here and nowhere else now.
@@ -219,6 +348,30 @@ giving a 192-base-voxel first-to-last-row extent close to the previous typical
 width without depending on optimized-line spacing. The along-line target and
 the cross-row spacing are independent constants
 (`kLineViewAlongSamplingDistanceBaseVoxels`, `kLineViewCrossRowSpacingBaseVoxels`).
+
+Ribbons are ordinary QuadSurfaces constructed at the existing support spacing.
+Construction resamples the stored polyline and transports/sign-aligns/roll-smooths
+its frames. Corrected normals replace the display input normals before this
+same pipeline; no separate rotation is applied to finished frames.
+Rendering, depth normals, picking, intersections
+and export all use the same support grid. No cubic strip upsampling or custom
+render-time interpolation is used. CP editing and cross views share the regular
+central-chord line tangent (one-sided at endpoints), interpolated between samples.
+Centers remain linear and volume LOD is unchanged.
+
+Saved display normals are axes: both signs describe the same cross-section.
+Offsets choose the smallest rotation around the fiber (at most 90 degrees),
+and target axes interpolate in a common parallel-transported reference frame,
+not as corrections added to a rotating Lasagna baseline. Unset CPs target the
+Lasagna normal; spans with no corrected endpoints retain their sampled normals.
+The ordinary construction pipeline owns all subsequent alignment and smoothing.
+
+CP movement uses a cubic displacement field over the original chord arclength.
+It preserves the requested CP positions and only replaces the existing adjacent
+spans. Stationary controls and the outer edit boundaries have zero displacement
+derivative, avoiding the former triangular correction's sudden slope change.
+The corrected curve is still stored as a resampled polyline. This change does
+not smooth or otherwise alter native bidirectional trace fusion.
 
 Clicking to place a control point uses optimized-polyline arclength in base
 voxels. Every existing control within an inclusive 8-voxel radius (the strip's
@@ -354,8 +507,13 @@ locally tangent planes along both complete traces and intersects the opposite
 trace. It selects the smallest meeting error and accepts it when the error is
 at most `max(10 base voxels, 10% of the combined partial traced length)`. This
 can succeed even when neither direction reached its endpoint planes. The
-accepted partial traces are warped by arc-length fraction to their shared
-midpoint, concatenated, and resampled, with the original CP endpoints restored
+accepted partial traces are warped by arc-length fraction to a shared meeting
+point. With prefix lengths `Lf`, `Lr` and meeting positions `Pf`, `Pr`, this is
+`Pf + Lf/(Lf+Lr) * (Pr-Pf)`: each side absorbs correction proportional to its
+traced length. A zero-length side stays at its CP and the other side takes the
+full endpoint correction, without an artificial connector. This is shared by
+all native segment-tracing callers. The partial traces are concatenated and
+resampled, with the original CP endpoints restored
 exactly. Rejected spans display the generic `fiber gap` failure label because
 the threshold is no longer ratio-only.
 

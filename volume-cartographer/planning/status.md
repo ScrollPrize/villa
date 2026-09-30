@@ -1,8 +1,9 @@
 # Status
 
-- [x] Inspect main, caller contracts and relevant cache requirements.
-- [x] Independent plan review (fixture construction clarifications incorporated).
-- [x] Regression tests fail before the fix (also reproduced with Paris4 data).
-- [x] Implement the decode fix and API documentation.
-- [x] Run focused tests and independent code review.
-- [x] Record results and prepare PR preview for approval (not published).
+- [x] Inspect existing paths and write plan.
+- [x] Independent review.
+- [x] Filters and fresh creation.
+- [x] Dialog and opening.
+- [x] Documentation and regression tests.
+- [x] Final rebuild/test after review fixes.
+- [ ] Live GUI validation (manual).

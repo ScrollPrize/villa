@@ -18,6 +18,7 @@
 #include <array>
 
 namespace vc3d::line_annotation {
+
 namespace {
 
 bool finiteScenePoint(const QPointF& point)
@@ -668,6 +669,30 @@ std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
                     generatedStripControlPointToScene(viewer, quad, control,
                                                       overlay.stripPositionMap);
                 if (finiteScenePoint(controlScene)) {
+                    if (control.direction) {
+                        const double col=overlay.stripPositionMap.valid()
+                            ? overlay.stripPositionMap.originalPositionToStripGridColumn(control.linePosition)
+                            : control.linePosition;
+                        const auto uv=quad->gridToSurface({col,double(quad->rawPointsPtr()->rows/2)});
+                        if (const auto frame=generatedStripFrame(quad,uv)) {
+                            const QPointF origin=viewer->surfaceCoordsToScene(uv[0],uv[1]);
+                            const QPointF projected=viewer->surfaceCoordsToScene(
+                                uv[0]+control.direction->dot(frame->along),
+                                uv[1]+control.direction->dot(frame->across))-origin;
+                            const auto transform=viewer->graphicsView()->viewportTransform();
+                            const QPointF pixels=transform.map(origin+projected)-transform.map(origin);
+                            const double length=std::hypot(pixels.x(),pixels.y());
+                            if (length>1e-6) {
+                                const QPointF half=projected*(40.0/length);
+                                auto style=lineStyle;
+                                style.penColor=QColor(0,245,255);
+                                style.penWidth=1.5;
+                                style.z=170;
+                                primitives.push_back(ViewerOverlayControllerBase::LineStripPrimitive{
+                                    {controlScene-half,controlScene+half},false,style});
+                            }
+                        }
+                    }
                     const qreal radius =
                         (control.hasBranches ? 6.25 : (control.isSeed ? 5.5 : 5.0)) +
                         (drawsTagRing(control) ? 1.0 : 0.0);
@@ -961,38 +986,15 @@ namespace {
 
 // The span menu: `ownerRank` indexes sortedControls (by line position); the
 // span runs from that control to the next.
-GeneratedControlPointContextResult showGeneratedSpanContextMenu(
+std::function<bool(QAction*)> appendGeneratedSpanContextActions(
+    QMenu& menu,
     const GeneratedControlPointContextMenuOptions& options,
-    QuadSurface* quad,
     const std::vector<const GeneratedOverlay::ControlPointMarker*>& sortedControls,
     size_t ownerRank)
 {
     const auto& owner = *sortedControls[ownerRank];
     const auto& next = *sortedControls[ownerRank + 1];
 
-    // Preview: the span itself, highlighted on the centre line.
-    {
-        const QPointF a = generatedStripControlPointToScene(
-            options.viewer, quad, owner, options.stripPositionMap);
-        const QPointF b = generatedStripControlPointToScene(
-            options.viewer, quad, next, options.stripPositionMap);
-        if (finiteScenePoint(a) && finiteScenePoint(b)) {
-            ViewerOverlayControllerBase::OverlayStyle previewStyle;
-            previewStyle.penColor = QColor(255, 120, 40, 245);
-            previewStyle.penWidth = 4.0;
-            previewStyle.z = 180.0;
-            std::vector<ViewerOverlayControllerBase::OverlayPrimitive> primitives;
-            primitives.push_back(ViewerOverlayControllerBase::LineStripPrimitive{
-                {a, b}, false, previewStyle});
-            ViewerOverlayControllerBase::applyPrimitives(
-                options.viewer,
-                "line_annotation_control_context_" + options.surfaceName,
-                std::move(primitives));
-        }
-    }
-
-    QMenu menu(options.parent);
-    // The span's state as text, so the metadata can be read, not only seen.
     QString state = QWidget::tr("%1, goal %2")
                         .arg(QChar(owner.interpolationModeMarker))
                         .arg(QString::fromStdString(owner.interpolationGoal));
@@ -1010,6 +1012,7 @@ GeneratedControlPointContextResult showGeneratedSpanContextMenu(
     std::vector<std::pair<QAction*, std::string>> goalActions;
     {
         QMenu* goalMenu = menu.addMenu(QWidget::tr("Interpolation goal"));
+        goalMenu->setEnabled(static_cast<bool>(options.setSegmentInterpolationGoal));
         const std::array<std::pair<const char*, const char*>, 4> goals{{
             {"Global", "global"},
             {"Cubic spline", "cspline"},
@@ -1067,34 +1070,34 @@ GeneratedControlPointContextResult showGeneratedSpanContextMenu(
         splitAndLinkAction->setEnabled(enabled);
     }
 
-    QAction* selected = menu.exec(options.globalPos);
-    clearGeneratedControlPointContextPreview(options.viewer, options.surfaceName);
-    if (!selected) {
-        return GeneratedControlPointContextResult::Handled;
-    }
-    for (const auto& [action, goal] : goalActions) {
-        if (selected == action) {
-            options.setSegmentInterpolationGoal(owner.controlIndex, next.controlIndex, goal);
-            return GeneratedControlPointContextResult::Handled;
+    return [=, &options](QAction* selected) {
+        if (!selected) {
+            return false;
         }
-    }
-    if (gapAction && selected == gapAction && gapAction->isEnabled()) {
-        options.setSpanGap(owner.controlIndex, next.controlIndex, !owner.hasGapToNext);
-        return GeneratedControlPointContextResult::Handled;
-    }
-    if (damagedAction && selected == damagedAction && damagedAction->isEnabled()) {
-        options.setSpanDamaged(owner.controlIndex, next.controlIndex, !owner.hasDamagedToNext);
-        return GeneratedControlPointContextResult::Handled;
-    }
-    if (splitAction && selected == splitAction && splitAction->isEnabled()) {
-        options.splitSpan(owner.controlIndex, next.controlIndex, false);
-        return GeneratedControlPointContextResult::Handled;
-    }
-    if (splitAndLinkAction && selected == splitAndLinkAction && splitAndLinkAction->isEnabled()) {
-        options.splitSpan(owner.controlIndex, next.controlIndex, true);
-        return GeneratedControlPointContextResult::Handled;
-    }
-    return GeneratedControlPointContextResult::Handled;
+        for (const auto& [action, goal] : goalActions) {
+            if (selected == action) {
+                options.setSegmentInterpolationGoal(owner.controlIndex, next.controlIndex, goal);
+                return true;
+            }
+        }
+        if (gapAction && selected == gapAction && gapAction->isEnabled()) {
+            options.setSpanGap(owner.controlIndex, next.controlIndex, !owner.hasGapToNext);
+            return true;
+        }
+        if (damagedAction && selected == damagedAction && damagedAction->isEnabled()) {
+            options.setSpanDamaged(owner.controlIndex, next.controlIndex, !owner.hasDamagedToNext);
+            return true;
+        }
+        if (splitAction && selected == splitAction && splitAction->isEnabled()) {
+            options.splitSpan(owner.controlIndex, next.controlIndex, false);
+            return true;
+        }
+        if (splitAndLinkAction && selected == splitAndLinkAction && splitAndLinkAction->isEnabled()) {
+            options.splitSpan(owner.controlIndex, next.controlIndex, true);
+            return true;
+        }
+        return false;
+    };
 }
 
 } // namespace
@@ -1177,37 +1180,18 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
 
     clearGeneratedControlPointContextPreview(options.viewer, options.surfaceName);
 
-    // On a strip, a click on the centre line away from every control point
-    // is a SPAN click: the span containing the click's line position gets its
-    // own menu (goal, gap, damaged, split). Within a control marker's reach
-    // the point menu wins, so a point sitting on the line stays reachable;
-    // far from both, the nearest-point fallback below stands.
-    if (options.stripViewer && options.setSegmentInterpolationGoal) {
-        constexpr double kControlHitThreshold = 12.0;
-        constexpr double kLineHitThreshold = 12.0;
-        auto* quad = dynamic_cast<QuadSurface*>(options.viewer->currentSurface());
-        const QPointF lineScene = generatedStripLinePositionToScene(
-            options.viewer, quad, options.linePosition, &options.stripPositionMap);
-        if (bestDistanceSq > kControlHitThreshold * kControlHitThreshold &&
-            finiteScenePoint(lineScene) &&
-            std::abs(lineScene.y() - options.scenePoint.y()) <= kLineHitThreshold) {
-            std::vector<const GeneratedOverlay::ControlPointMarker*> sortedControls;
-            for (const auto& control : options.controlPoints) {
-                if (control.controlIndex != std::numeric_limits<size_t>::max() &&
-                    validGeneratedLinePosition(control.linePosition, options.linePointCount)) {
-                    sortedControls.push_back(&control);
-                }
-            }
-            std::sort(sortedControls.begin(), sortedControls.end(),
-                      [](const auto* a, const auto* b) { return a->linePosition < b->linePosition; });
-            for (size_t rank = 1; rank < sortedControls.size(); ++rank) {
-                if (options.linePosition > sortedControls[rank - 1]->linePosition &&
-                    options.linePosition < sortedControls[rank]->linePosition) {
-                    return showGeneratedSpanContextMenu(options, quad, sortedControls, rank - 1);
-                }
+    std::vector<const GeneratedOverlay::ControlPointMarker*> sortedControls;
+    if (options.stripViewer) {
+        for (const auto& control : options.controlPoints) {
+            if (control.controlIndex != std::numeric_limits<size_t>::max() &&
+                validGeneratedLinePosition(control.linePosition, options.linePointCount)) {
+                sortedControls.push_back(&control);
             }
         }
+        std::sort(sortedControls.begin(), sortedControls.end(),
+                  [](const auto* a, const auto* b) { return a->linePosition < b->linePosition; });
     }
+    const auto spanRank = generatedControlSpanOwnerRank(sortedControls, options.linePosition);
 
     if (finiteScenePoint(options.scenePoint) && finiteScenePoint(targetScene)) {
         ViewerOverlayControllerBase::OverlayStyle previewStyle;
@@ -1226,6 +1210,17 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
             selectedControl.hasBranches ? 7.0 : (selectedControl.isSeed ? 6.5 : 6.0),
             true,
             previewStyle});
+        if (spanRank) {
+            auto* quad = dynamic_cast<QuadSurface*>(options.viewer->currentSurface());
+            const QPointF a = generatedStripControlPointToScene(
+                options.viewer, quad, *sortedControls[*spanRank], options.stripPositionMap);
+            const QPointF b = generatedStripControlPointToScene(
+                options.viewer, quad, *sortedControls[*spanRank + 1], options.stripPositionMap);
+            if (finiteScenePoint(a) && finiteScenePoint(b)) {
+                primitives.push_back(ViewerOverlayControllerBase::LineStripPrimitive{
+                    {a, b}, false, previewStyle});
+            }
+        }
         ViewerOverlayControllerBase::applyPrimitives(
             options.viewer,
             "line_annotation_control_context_" + options.surfaceName,
@@ -1238,6 +1233,14 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
             : selectedControl.controlIndex;
 
     QMenu menu(options.parent);
+    std::function<bool(QAction*)> handleSpanAction;
+    if (spanRank) {
+        handleSpanAction = appendGeneratedSpanContextActions(
+            menu, options, sortedControls, *spanRank);
+        menu.addSeparator();
+    }
+    menu.addAction(QWidget::tr("CP %1").arg(QString::number(selectedControlIndex)))
+        ->setEnabled(false);
     QAction* deleteAction = menu.addAction(QWidget::tr("Delete control point"));
     deleteAction->setEnabled(options.controlPoints.size() > 1);
     QAction* kollesisTerminationAction = nullptr;
@@ -1403,9 +1406,23 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
             QWidget::tr("Go to nearby annotation (%1)")
                 .arg(fiberName(nearbyIntersection->fiberId)));
     }
+    QAction* clearCorrectionsAction = nullptr;
+    if (options.clearControlCorrections) {
+        menu.addSeparator();
+        clearCorrectionsAction = menu.addAction(QWidget::tr("Clear CP normals and dirs"));
+        clearCorrectionsAction->setEnabled(
+            selectedControlIndex != std::numeric_limits<size_t>::max());
+    }
     QAction* selected = menu.exec(options.globalPos);
     clearGeneratedControlPointContextPreview(options.viewer, options.surfaceName);
 
+    if (handleSpanAction && handleSpanAction(selected)) {
+        return GeneratedControlPointContextResult::Handled;
+    }
+    if (clearCorrectionsAction && selected == clearCorrectionsAction) {
+        options.clearControlCorrections(selectedControlIndex);
+        return GeneratedControlPointContextResult::Handled;
+    }
     if (selected == deleteAction && deleteAction->isEnabled()) {
         if (options.deleteControlPoint) {
             options.deleteControlPoint(selectedControl.linePosition, selectedControl.point);

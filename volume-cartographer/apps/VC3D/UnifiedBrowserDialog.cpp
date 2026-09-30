@@ -1,4 +1,6 @@
 #include "UnifiedBrowserDialog.hpp"
+#include <QCheckBox>
+#include <QKeyEvent>
 
 #include "vc/core/util/HttpFetch.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
@@ -337,6 +339,7 @@ UnifiedBrowserDialog::UnifiedBrowserDialog(QWidget* parent)
     connect(_upButton, &QPushButton::clicked,
             this, &UnifiedBrowserDialog::onUpClicked);
     _pathBar = new QLineEdit();
+    _pathBar->installEventFilter(this);
     _pathBar->setPlaceholderText(tr("Path or URL — paste anything"));
     connect(_pathBar, &QLineEdit::textEdited, this, [this]() {
         _pathBarEdited = true;
@@ -358,6 +361,11 @@ UnifiedBrowserDialog::UnifiedBrowserDialog(QWidget* parent)
     connect(_list, &QListWidget::itemSelectionChanged,
             this, &UnifiedBrowserDialog::onItemSelectionChanged);
     layout->addWidget(_list);
+    _showHidden = new QCheckBox(tr("Show hidden files"), this);
+    layout->addWidget(_showHidden);
+    connect(_showHidden, &QCheckBox::toggled, this, [this]() {
+        if (_mode == Mode::Local) navigateLocal(_currentLocalDir);
+    });
 
     // Status
     _status = new QLabel();
@@ -392,14 +400,20 @@ void UnifiedBrowserDialog::setHint(const QString& text)
     }
 }
 
-void UnifiedBrowserDialog::setStartUri(const QString& uri)
+void UnifiedBrowserDialog::setStartUri(const QString& uri, bool isFile)
 {
     if (uri.isEmpty()) return;
     const QString trimmed = uri.trimmed();
     const Mode m = detectModeFromUri(trimmed);
     if (m == Mode::Remote) {
         _remoteRadio->setChecked(true);
-        navigateRemote(withTrailingSlash(trimmed));
+        if (isFile && _acceptsFiles) {
+            navigateRemote(trimmed.left(trimmed.lastIndexOf('/') + 1));
+            _pathBar->setText(trimmed);
+            _pathBarEdited = true;
+        } else {
+            navigateRemote(withTrailingSlash(trimmed));
+        }
     } else {
         _localRadio->setChecked(true);
         QString p = fileUriToPath(trimmed);
@@ -437,6 +451,18 @@ void UnifiedBrowserDialog::onPathBarReturn()
     handleTypedPath(text, false);
 }
 
+bool UnifiedBrowserDialog::eventFilter(QObject* watched, QEvent* event)
+{
+    if (watched == _pathBar && event->type() == QEvent::KeyPress) {
+        const auto* key = static_cast<QKeyEvent*>(event);
+        if (key->key() == Qt::Key_Return || key->key() == Qt::Key_Enter) {
+            onPathBarReturn();
+            return true; // Do not also activate the dialog's default Open button.
+        }
+    }
+    return QDialog::eventFilter(watched, event);
+}
+
 void UnifiedBrowserDialog::onUpClicked()
 {
     if (_mode == Mode::Local) {
@@ -471,6 +497,9 @@ void UnifiedBrowserDialog::navigateLocal(const QString& absDir)
     }
 
     QDir::Filters filters = QDir::AllEntries | QDir::NoDotAndDotDot;
+    // Let Qt honor native hidden-file semantics, including Windows attributes;
+    // a dot-prefixed filename alone is not hidden on Windows.
+    if (_showHidden->isChecked()) filters |= QDir::Hidden;
     auto entries = d.entryInfoList(filters, QDir::Name | QDir::DirsFirst);
 
     QRegularExpression filterRe;

@@ -392,6 +392,7 @@ class FetchFailureTests(unittest.TestCase):
         self.assertRegex(p["surface"]["effective_geometry_sha1"], r"^[0-9a-f]{40}$")
         self.assertEqual(p["surface"]["grid_width"], SURF_N)
         self.assertEqual(p["surface"]["grid_height"], SURF_N)
+        self.assertEqual(p["render"]["surface_interpolation"], "linear")
         self.assertEqual(p["render"]["pixels_per_level_voxel"], 1.0)
         self.assertEqual(p["render"]["num_slices"], 3)
         self.assertFalse(p["render"]["composite"])
@@ -404,6 +405,18 @@ class FetchFailureTests(unittest.TestCase):
             [0.0, 0.0, 1.0, 0.0],
             [0.0, 0.0, 0.0, 1.0],
         ])
+
+    def test_zarr_provenance_records_effective_surface_interpolation(self):
+        url = self.serving(0, NEVER_FAIL)
+        for spelling in ("smooth", "bicubic"):
+            with self.subTest(surface_interpolation=spelling):
+                out = self.root / ("provenance_" + spelling + ".zarr")
+                r = self.render(url, "--zarr-output", out,
+                                extra=("--pyramid", "false", "--surface-interpolation", spelling))
+                self.assertEqual(r.returncode, 0, r.stderr[-400:])
+                attrs = json.loads((out / ".zattrs").read_text())
+                self.assertEqual(attrs["render_provenance"]["render"]["surface_interpolation"],
+                                 "smooth")
 
     def test_transient_failures_still_recover(self):
         url = self.serving(2)

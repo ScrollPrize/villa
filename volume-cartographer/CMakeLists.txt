@@ -414,7 +414,9 @@ endif()
 # LTO stays off on Windows: GCC LTO across DLLs interacts badly with PE
 # auto-import/export-all, and link times on the CI runners balloon.
 if(NOT _san AND NOT WIN32 AND NOT CMAKE_BUILD_TYPE STREQUAL "Debug" AND NOT CMAKE_BUILD_TYPE STREQUAL "QuickBuild")
-    add_compile_options(${_lto})
+    # Host LTO on NVCC-generated objects can leave fatbinData unresolved.
+    # Keep C/C++ and link-time LTO, but exclude CUDA compilation.
+    add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:${_lto}>")
     add_link_options(${_lto})
 endif()
 
