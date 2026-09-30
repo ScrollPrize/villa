@@ -30,10 +30,7 @@ def batch(cfg, b=2):
     q = 4*(cfg.n_future-1)+1
     from slab_fixtures import slab_inputs
     return dict(x=slab_inputs(b) | {name: torch.rand(b, 2, crop.depth, crop.width, crop.width)
-                   for name, crop in (('fine', cfg.fine),)} | dict(
-                    query_frame=torch.eye(3).expand(b,-1,-1).clone(),query_position=torch.zeros(b,3),
-                    feature_seed_here=torch.ones(b,dtype=torch.bool),memory_mask=torch.ones(b,1,dtype=torch.bool),
-                    memory_seed_valid=torch.ones(b,dtype=torch.bool)),
+                   for name, crop in (('fine', cfg.fine),)},
                 hist=hist, hmask=torch.ones(b, cfg.n_history), dense_ab=torch.ones(b, q, 2),
                 dense_mask=torch.ones(b, q), offtrack=torch.zeros(b), endpoint_known=torch.zeros(b),
                 end_local=torch.zeros(b, 3), source=torch.zeros(b))
@@ -354,8 +351,6 @@ def test_commit_window_loss_and_auxiliary_proposal_supervision():
         errors = F.smooth_l1_loss(dense, b['dense_ab'], reduction='none').mean(-1)
         return .5*errors[:, :5].mean()+.5*errors[:, :11].mean()
     torch.testing.assert_close(result['geometry_per_state'][0], .75*expected(points)+.25*expected(initial))
-    from vesuvius.neural_tracing.fiber_follow.flow_matching.supervision import prefix_labels
-    labels, known, _ = prefix_labels(points, b)
     expected_conf = (F.softplus(logits[0, :2]).sum()+F.softplus(-logits[0, 2])+F.softplus(-logits[0, 0]))/2
     torch.testing.assert_close(result['confidence_per_state'][0], expected_conf)
     result['geometry_per_state'].sum().backward()

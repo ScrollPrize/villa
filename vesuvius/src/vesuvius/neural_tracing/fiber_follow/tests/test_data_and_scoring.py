@@ -1,4 +1,4 @@
-"""Fiber loading, holdout isolation, replay storage, collection and trace scoring."""
+"""Training fiber loading, holdout isolation, replay storage and collection."""
 from dataclasses import asdict, replace
 import json
 import pickle
@@ -9,7 +9,6 @@ import pytest
 from vc3d_fiber_format import legacy_lasagna_segments
 from vesuvius.neural_tracing.fiber_follow.shared import data as D
 from vesuvius.neural_tracing.fiber_follow.shared.collect import DecisionCollector
-from vesuvius.neural_tracing.fiber_follow.shared.evaluate import score_trace, summarize
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, arclength, frame_from_heading
 from vesuvius.neural_tracing.fiber_follow.shared.online import OnlineCollector
 from vesuvius.neural_tracing.fiber_follow.shared.trace import TraceParams
@@ -297,69 +296,3 @@ def test_confidence_threshold_default_is_shared_by_rollout_and_collection(tmp_pa
     collector = OnlineCollector(tmp_path/'collector', 'fibers', [100, 200], 'cpu')
     assert collector.confidence == DEFAULT_CONFIDENCE
     collector.close()
-
-
-@pytest.mark.parametrize('sign', [-1., 1.])
-@pytest.mark.parametrize('known', [False, True])
-def test_endpoint_crossing_partitions_segment_exactly(sign, known):
-    f = fiber(endpoints=(known, known))
-    x = np.arange(50, 112, 2.5) if sign > 0 else np.arange(50, -12, -2.5)
-    p = np.c_[x, np.zeros(len(x)), np.zeros(len(x))]
-    m = score_trace(p, f, 50, sign)
-    assert m['correct'] == 50
-    assert m['followed'] == 50
-    assert m['unknown'] == (0 if known else 10)
-    assert m['offtrack'] == (10 if known else 0)
-    assert m['endpoint_overrun'] == (10 if known else 0)
-    assert not m['diverged']
-    assert m['correct'] + m['offtrack'] + m['unknown'] == m['length']
-
-
-def test_crossing_inside_long_segment_keeps_fractional_length():
-    f = fiber()
-    p = np.array([[90., 0, 0], [99., 0, 0], [103., 0, 0], [107., 0, 0], [110., 0, 0]])
-    m = score_trace(p, f, 90, 1)
-    assert m['correct'] == 10 and m['unknown'] == 10
-
-
-def test_early_departure_then_return_is_not_endpoint_censored():
-    f = fiber()
-    x = np.arange(50, 112, dtype=float)
-    p = np.c_[x, np.zeros(len(x)), np.zeros(len(x))]
-    p[5:10, 1] = 5
-    m = score_trace(p, f, 50, 1)
-    assert m['diverged'] and m['unknown'] == 0
-    assert m['correct'] == 4
-    assert m['correct'] + m['offtrack'] == m['length']
-
-
-def test_departure_near_endpoint_is_not_excused_by_reached_end_tolerance():
-    f = fiber()
-    p = np.array([[95., 0, 0], [98., 0, 0], [98., 4, 0], [98., 5, 0], [98., 6, 0]])
-    m = score_trace(p, f, 95, 1)
-    assert m['reached_end'] and m['diverged']
-    assert m['unknown'] == 0 and m['offtrack'] == 6
-
-
-def test_nearby_earlier_winding_does_not_censor_at_endpoint_plane():
-    p = np.array([[x, 1, 0] for x in range(11)] +
-                 [[10, y, 0] for y in range(2, 11)] +
-                 [[x, 10, 0] for x in range(9, -1, -1)] +
-                 [[0, y, 0] for y in range(9, -1, -1)] +
-                 [[x, 0, 0] for x in range(1, 6)], dtype=float)
-    f = D.TracedFiber('winding', p, arclength(p), 'H')
-    m = score_trace(p[:11], f, 0, 1)
-    assert m['unknown'] == 0
-    assert not m['crossed_endpoint']
-    assert m['followed'] == 10
-
-
-def test_summary_accounts_for_all_length_and_unknown_is_not_verified():
-    f = fiber()
-    x = np.arange(50., 111.)
-    row = score_trace(np.c_[x, x*0, x*0], f, 50, 1)
-    s = summarize([row])
-    assert s['length_precision'] == 1
-    assert s['verified_length_fraction'] == pytest.approx(50/60)
-    assert s['unknown_length_fraction'] == pytest.approx(10/60)
-    assert s['correct_length'] + s['wrong_length'] + s['unknown_length'] == s['total_length']

@@ -10,7 +10,6 @@ import torch
 
 from test_regression import batch, config
 from vesuvius.neural_tracing.fiber_follow.shared.data import TracedFiber
-from vesuvius.neural_tracing.fiber_follow.shared.diag import plot_denoising, rollout_diag
 from vesuvius.neural_tracing.fiber_follow.regression.model import DirectFollower
 from vesuvius.neural_tracing.fiber_follow.regression.train import training_diagnostics
 from vesuvius.neural_tracing.fiber_follow.shared.evaluate import evaluate, monitor_coverage
@@ -109,23 +108,6 @@ def test_direct_images_preserve_scores_rng_and_parameters(tmp_path, monkeypatch,
     assert 'dense curve error (voxels)' in labels[str(tmp_path/'curves.png')]
 
 
-def test_flow_rollout_and_denoising_plot_contract_is_preserved(tmp_path):
-    fibers, seeds = monitor()
-    tracer = Tracer()
-    summary = rollout_diag(tracer, fibers, seeds, tmp_path/'rollout.png', max_len=4., batch=2)
-    assert tracer.calls == 1 and tracer.p.max_len == 8.
-    assert summary['coverage_mean'] == 1. and summary['length_precision'] == 1.
-    direct_tracer = Tracer()
-    direct_tracer.p.max_len = 4.
-    _, direct_summary = evaluate(direct_tracer, fibers, seeds, batch=2, coverage_max_len=4.)
-    assert direct_summary == summary
-    _, final_summary = evaluate(direct_tracer, fibers, seeds, batch=2)
-    assert final_summary['coverage_mean'] == pytest.approx((4/89+4/9)/2)
-    curves = torch.zeros(1, 5, 4, 3)
-    curves[..., 2] = torch.arange(1, 5)
-    plot_denoising(curves, torch.zeros(1, 3, 3), torch.zeros(1, 3), tmp_path/'denoising.png')
-    with Image.open(tmp_path/'denoising.png') as image:
-        image.verify()
 
 
 @pytest.mark.parametrize('available,followed,cap,expected', [

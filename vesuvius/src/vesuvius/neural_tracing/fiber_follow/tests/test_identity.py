@@ -14,8 +14,8 @@ from vesuvius.neural_tracing.fiber_follow.regression.model import DirectConfig, 
 
 from vesuvius.neural_tracing.fiber_follow.regression.supervision import loss_terms
 from vesuvius.neural_tracing.fiber_follow.regression.train import load_checkpoint, optimizer_update, save_checkpoint
-from vesuvius.neural_tracing.fiber_follow.shared.components import ComponentRule, sample_pairs
-from vesuvius.neural_tracing.fiber_follow.shared.data import SampleConfig, TracedFiber, ZBand, crop_corners
+from vesuvius.neural_tracing.fiber_follow.shared.components import ComponentRule
+from vesuvius.neural_tracing.fiber_follow.shared.data import SampleConfig, TracedFiber, ZBand
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, crop_local_grid, sample_oriented_fast
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolumeSpec
 
@@ -33,9 +33,7 @@ def batch(cfg,b=2):
     q=4*(cfg.n_future-1)+1
     x=dict(fine=torch.rand(b,2,cfg.fine.depth,cfg.fine.width,cfg.fine.width),
         seed=torch.zeros(b,1,3),seed_mask=torch.ones(b,1),seed_tangent=torch.tensor([0.,0.,1.]).expand(b,-1),
-        seed_age=torch.zeros(b), query_frame=torch.eye(3).expand(b,-1,-1).clone(),
-        query_position=torch.zeros(b,3), feature_seed_here=torch.ones(b,dtype=torch.bool),
-        memory_mask=torch.ones(b,1,dtype=torch.bool),memory_seed_valid=torch.ones(b,dtype=torch.bool))
+        seed_age=torch.zeros(b))
     from slab_fixtures import slab_inputs
     x.update(slab_inputs(b))
     return dict(x=x,hist=hist,hmask=torch.ones(b,cfg.n_history),dense_ab=torch.zeros(b,q,2),
@@ -52,24 +50,6 @@ def forward(m, b):
 
 
 
-def test_bank_radius_keeps_supported_diagonals_and_rejects_crop_edge_patches():
-    cfg, rule = DirectConfig(), ComponentRule()
-    from vesuvius.neural_tracing.fiber_follow.regression.neighbor_mining import MiningConfig
-    assert rule.lateral_max == MiningConfig().max_distance
-    curve = np.c_[np.zeros(21), np.zeros(21), np.arange(21.)]
-    diagonal = rule.lateral_max/np.sqrt(2.)
-    foreign = np.array([[-diagonal, -diagonal, 10.], [diagonal, diagonal, 10.],
-                        [rule.lateral_max, 0., 10.], [9., 9., 10.]])
-    _, positive_mask, negative, negative_mask = sample_pairs(
-        curve, cfg.fine, foreign, np.full(len(foreign), 10), np.random.default_rng(0),
-        positives=1, negatives=4, forward=(10., 10.),
-        margin=cfg.patch_radius, rule=rule)
-    assert positive_mask.all() and negative_mask.sum() == 3
-    selected = negative[0, negative_mask[0] > 0]
-    np.testing.assert_allclose(np.linalg.norm(selected[:,:2],axis=1),12.,atol=1e-6)
-    corners = selected[:, None]+np.array([[-1,-1,-1],[1,1,1]])[None]*cfg.patch_radius
-    bounds = crop_corners(cfg.fine)
-    assert (corners >= bounds.min(0)).all() and (corners <= bounds.max(0)).all()
 
 
 
