@@ -20,8 +20,11 @@ class DirectTrainingInterval:
              'bank_following_fraction', 'decision_pair_fraction')
     counts = ('error_sum', 'geometry_count', 'point_correct_count', 'point_wrong_count',
               'point_unknown_count', 'replay_endpoints', 'replay_observations', 'replay_encoder_crops',
-              'confidence_labeled_states', 'confidence_departed_states')
-    nested_counts = {'identity': ('candidate_states',),
+              'confidence_labeled_states', 'confidence_departed_states',
+              'supervision_weight', 'endpoint_weight', 'matched_endpoint_weight', 'choice_endpoint_weight',
+              'endpoint_states', 'matched_endpoint_states', 'choice_endpoint_states')
+    nested_counts = {'identity': ('candidate_states', 'candidate_intervals', 'candidate_late_failures',
+                                 'candidate_first_failures', 'candidate_supervision_weight'),
                      'memory': ('identity_count', 'identity_correct', 'departed_count',
                                 'departed_correct', 'offset_count', 'offset_error_sum')}
     nested_means = {'identity': ('candidate_loss',),
@@ -81,6 +84,16 @@ def _interval_training_lines(row):
                  f" (loss {m['replay_loss']:.4f})")
     lines.append(f"  scored crops: candidates {_rate(m['identity_candidate_states'], m['crops'])}"
                  f" | departed {_rate(m.get('confidence_departed_states', 0), m.get('confidence_labeled_states', 0))}")
+    if m.get('endpoint_states'):
+        lines.append(f"  supervised endpoints: matched {_rate(m['matched_endpoint_states'], m['endpoint_states'])}"
+                     f" | geometry choices {_rate(m['choice_endpoint_states'], m['endpoint_states'])}")
+        weight = max(m['supervision_weight'], 1e-12)
+        lines.append(f"  task loss budget: endpoints {m['endpoint_weight']/weight:.1%}"
+                     f" | matched {m['matched_endpoint_weight']/weight:.1%}"
+                     f" | geometry choices {m['choice_endpoint_weight']/weight:.1%}")
+        lines.append(f"  candidate hazard targets: {int(m['identity_candidate_intervals'])} intervals"
+                     f" | {int(m['identity_candidate_first_failures'])} first-segment failures"
+                     f" | {int(m['identity_candidate_late_failures'])} later failures")
     lines.append(f"  candidate survival loss {m['identity_candidate_loss']:.4f}"
                  f" ({int(m['identity_candidate_states'])} eligible crops)")
     lines.append('  data: '+' / '.join(f'{name} {m[key]:.0%}' for name, key in

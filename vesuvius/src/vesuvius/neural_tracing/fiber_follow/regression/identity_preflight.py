@@ -45,7 +45,7 @@ def main(argv=None):
     bank=NeighborBank(args.bank,fibers,band,grid_scale=spec.grid_scale)
     bank.validate_volume(spec)
     sampling=IdentitySampling(rule=ComponentRule(lateral_max=32.),decision_fraction=.5,
-        negative_near_fraction=.5,negative_near_distance=12.,bank_coverage_probability=.2,bank_following_probability=.1,
+        bank_coverage_probability=.2,bank_following_probability=.1,
         memory_switch_probability=args.memory_switch_probability,memory_switch_tail=tuple(args.memory_switch_tail))
     builder=IdentityObservationBuilder(cfg,fibers,sampling,negative_bank=bank,augment=True)
     sample=SampleConfig(crop=cfg.fine,n_history=cfg.n_history,n_future=cfg.n_future,recent_history_points=cfg.n_history)

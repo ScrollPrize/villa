@@ -11,7 +11,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength, fram
 from vesuvius.neural_tracing.fiber_follow.shared.data import training_state_allowed
 
 
-FEATURE_SAMPLING_REVISION = 3  # causal headings, generator-certified history, equal crop weights
+FEATURE_SAMPLING_REVISION = 4  # equal stream budgets, protected endpoints, dense candidate labels
 
 def seed_observation(item, cfg):
     return dict(pos=np.asarray(item['seed_pos']).copy(),
@@ -144,7 +144,10 @@ class SwitchCropBudget:
 def sequence_batches(builder, items, vol, *, band=None, worker=0, requested_fraction=0.):
     """Yield bounded chunks; ids survive worker interleaving and optimizer updates."""
     streams = [stream_rows(item, builder, band) for item in items]
-    streams = [rows for rows in streams if rows]
+    failed_pairs = {item['pair_observation_seed'] for item, rows in zip(items, streams)
+                    if not rows and 'pair_observation_seed' in item}
+    streams = [rows for item, rows in zip(items, streams)
+               if rows and (not failed_pairs or item.get('pair_observation_seed') not in failed_pairs)]
     fraction = builder.cfg.feature_switch_crop_fraction
     if fraction >= 0:
         if not hasattr(builder, '_switch_crop_budget'):
@@ -152,6 +155,7 @@ def sequence_batches(builder, items, vol, *, band=None, worker=0, requested_frac
         streams = builder._switch_crop_budget.admit(streams)
     if not streams:
         return
+    weights = [stream_loss_weights(len(rows), builder.cfg.feature_history_loss_fraction) for rows in streams]
     group = getattr(builder, '_feature_group', 0)
     builder._feature_group = group+1
     ids = [(worker << 48)+(group << 16)+j for j in range(len(streams))]
@@ -171,11 +175,24 @@ def sequence_batches(builder, items, vol, *, band=None, worker=0, requested_frac
             batch['stream_id'] = torch.tensor([ids[j] for j in active], dtype=torch.long)
             batch['stream_reset'] = torch.full((len(active),), t == 0, dtype=torch.bool)
             batch['stream_end'] = torch.tensor([t == len(streams[j])-1 for j in active])
+            batch['loss_weight'] = torch.tensor([weights[j][t] for j in active], dtype=torch.float32)
             batch['decision_requested'] = torch.full((len(active),), requested_fraction)
             if selected is not None:
                 batch['replay_select'] = torch.tensor([t in selected[j] for j in active])
             sequence.append(batch)
         yield dict(feature_sequence=sequence)
+
+
+def stream_loss_weights(length, history_fraction):
+    """One unit of task loss per stream, irrespective of observation count.
+
+    The endpoint receives the reserved share; earlier observations share the
+    history budget. Unknown labels still contribute zero. Do not renormalize
+    these weights within gradient chunks: that would restore length bias.
+    """
+    if length == 1:
+        return np.ones(1)
+    return np.r_[np.full(length-1, history_fraction/(length-1)), 1-history_fraction]
 
 
 def sequence_steps(batch):

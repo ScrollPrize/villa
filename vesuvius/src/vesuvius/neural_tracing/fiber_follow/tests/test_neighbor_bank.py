@@ -110,7 +110,7 @@ def test_evaluation_paths_are_available_only_in_explicit_evaluation_mode(tmp_pat
 def test_identity_supervision_and_training_cli_require_a_bank():
     builder = IdentityObservationBuilder(DirectConfig())
     with pytest.raises(ValueError,match='requires a negative bank'):
-        builder.identity_targets([])
+        builder.bank_targets([])
     from vesuvius.neural_tracing.fiber_follow.regression.train import main
     with pytest.raises(ValueError,match='requires --negative-bank'):
         main(['--name','unused','--fiber-zarrs','unused','--fibers','unused','--ct','unused',
@@ -170,7 +170,7 @@ def test_prediction_and_ct_sources_must_match_training(tmp_path):
 
 @pytest.mark.parametrize('reverse',[False,True])
 @pytest.mark.parametrize('angle',[0.,.37])
-def test_training_targets_stay_exactly_on_both_centerlines(tmp_path,reverse,angle):
+def test_foreign_masks_refresh_without_contrastive_queries(tmp_path,reverse,angle):
     bank,fiber = make_bank(tmp_path)
     cfg = DirectConfig()
     builder = IdentityObservationBuilder(cfg,[fiber],negative_bank=bank)
@@ -178,25 +178,15 @@ def test_training_targets_stay_exactly_on_both_centerlines(tmp_path,reverse,angl
     rotation = np.array([[np.cos(angle),-np.sin(angle),0.],[np.sin(angle),np.cos(angle),0.],[0.,0.,1.]])
     state['frame'] = state['frame'] @ rotation
     state['identity_curve'] = state['identity_curve'] @ rotation
-    # No negatives before a validated path arrives.
-    empty = builder.identity_targets([state])
-    assert not empty['negative_mask'].any() and not empty['foreign'].any()
+    empty = builder.bank_targets([state])
+    assert not empty['foreign'].any() and not builder.lateral
     publish(tmp_path,[add_shard(tmp_path,0,x=6.13)])
-    result = builder.identity_targets([state])
-    assert result['negative_mask'].any() and result['foreign'].any()
-    k,m = builder.sampling.positives,builder.sampling.negatives
-    positive = result['identity_points'][0,:k].numpy()
-    negative = result['identity_points'][0,k:].reshape(k,m,3).numpy()
-    valid = result['negative_mask'][0].numpy().astype(bool)
-    world = positive @ state['frame'].T+state['pos']
-    np.testing.assert_allclose(world[:,:2],0.,atol=1e-6)
-    for p,points,keep in zip(positive,negative,valid):
-        world = points[keep] @ state['frame'].T+state['pos']
-        # Off-grid centerline must remain off-grid: neither dilation nor phase
-        # matching may displace queries from the stored native polyline.
-        np.testing.assert_allclose(world[:,0],6.13,atol=1e-6)
-        np.testing.assert_allclose(world[:,1],0.,atol=1e-6)
-        assert bank.clear_of_target(0,world).all()
+    result = builder.bank_targets([state])
+    assert result['foreign'].any() and builder.lateral[-1] == state['fiber_ref']
+    assert not {'identity_points', 'positive_mask', 'negative_mask', 'negative_distance',
+                'negative_path_ids', 'reference_on_fiber'} & result.keys()
+    expected = bank.candidates(state,cfg.fine,builder.sampling.rule)['foreign']
+    np.testing.assert_array_equal(result['foreign'][0], expected)
     assert result['negative_bank_shards'].item() == 1
 
 

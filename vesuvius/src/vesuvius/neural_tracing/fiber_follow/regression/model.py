@@ -11,7 +11,7 @@ from torch.utils.checkpoint import checkpoint
 
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
 
-ARCHITECTURE = 'axial_fiber_memory_v5'
+ARCHITECTURE = 'axial_fiber_memory_v6'
 TOKEN_STRIDE = (8, 2, 2)
 TOKEN_OFFSET = (3, 0, 0)
 
@@ -40,6 +40,7 @@ class DirectConfig:
     feature_stream_steps: int = 128
     feature_replay_weight: float = .5
     feature_switch_crop_fraction: float = -1.
+    feature_history_loss_fraction: float = .25
     recurrent_refinement_steps: int = 1
     recurrent_refinement_limit: float = 1.
 
@@ -72,6 +73,8 @@ class DirectConfig:
             raise ValueError('Nonnegative finite replay weight required')
         if self.feature_switch_crop_fraction != -1 and not 0 <= self.feature_switch_crop_fraction < 1:
             raise ValueError('Switch crop fraction must be -1 (disabled) or in [0, 1)')
+        if not math.isfinite(self.feature_history_loss_fraction) or not 0 <= self.feature_history_loss_fraction < 1:
+            raise ValueError('History loss fraction must be finite and in [0, 1)')
         if not isinstance(self.recurrent_refinement_steps, int) or self.recurrent_refinement_steps < 0:
             raise ValueError('Recurrent refinement steps must be a nonnegative integer')
         if not math.isfinite(self.recurrent_refinement_limit) or self.recurrent_refinement_limit <= 0:
@@ -307,6 +310,38 @@ class AxialEncoder(nn.Module):
         return self.decode(fine, deep), deep, deep.flatten(2).transpose(1,2)
 
 
+class OutputPlaneFeatures(nn.Module):
+    """Every lateral pixel on each output plane, with physical XYZ positions."""
+    def __init__(self, cfg):
+        super().__init__()
+        crop = cfg.fine
+        planes = torch.arange(1, cfg.n_future+1).float()*cfg.future_step
+        lateral = (torch.arange(crop.width).float()-(crop.width-1)/2)*crop.spacing
+        f, v, u = torch.meshgrid(planes, lateral, lateral, indexing='ij')
+        self.register_buffer('xyz', torch.stack((u, v, f), -1).reshape(-1, 3), persistent=False)
+        depth = crop.behind+planes/crop.spacing
+        lower = depth.floor().long().clamp(0, crop.depth-1)
+        self.register_buffer('lower', lower, persistent=False)
+        self.register_buffer('upper', (lower+1).clamp(max=crop.depth-1), persistent=False)
+        self.register_buffer('fraction', (depth-depth.floor())[None, None, :, None, None], persistent=False)
+        self.on_grid = bool((depth == depth.floor()).all())
+        self.projection = nn.Linear(cfg.channels, cfg.hidden)
+        self.position = nn.Linear(3, cfg.hidden)
+
+    def sample(self, fine):
+        # Gather whole slices without pooling or resampling the lateral axes.
+        # Interpolate only depth for configurations whose planes fall between slices.
+        values = fine.index_select(2, self.lower)
+        if not self.on_grid:
+            upper = fine.index_select(2, self.upper)
+            values = (values.float()+(upper.float()-values.float())*self.fraction).to(fine.dtype)
+        return values.flatten(2).transpose(1, 2)
+
+    def forward(self, fine):
+        tokens = self.projection(self.sample(fine))
+        return tokens+self.position(self.xyz/16.).to(tokens.dtype)
+
+
 class DirectFollower(nn.Module):
     architecture = ARCHITECTURE
 
@@ -341,6 +376,7 @@ class DirectFollower(nn.Module):
             nn.init.zeros_(self.refinement_stage.weight)
             nn.init.zeros_(self.refinement_delta.weight)
             nn.init.zeros_(self.refinement_delta.bias)
+        self.output_plane_features = OutputPlaneFeatures(cfg)
 
     def references(self, x, hist, hmask):
         cfg = self.cfg
@@ -477,7 +513,7 @@ class DirectFollower(nn.Module):
                                       padding, candidates)
 
     def decoder_memory(self, ctx):
-        cfg, state = self.cfg, ctx['recurrent']
+        state = ctx['recurrent']
         # Express retained spatial evidence in the actual crop frame, including roll.
         query_state = dict(state, frame=ctx.get('query_frame', state['frame']))
         identity, identity_padding = self.recurrent_memory.read_tokens(query_state)
@@ -487,6 +523,12 @@ class DirectFollower(nn.Module):
         # Reuse these differentiable K/V across generated and supplied curves.
         ctx.update(confidence_projected=self.confidence_scorer.project_memory(memory),
                    confidence_padding=padding)
+        # Generator-only extra reads: retain the full deep lattice, references
+        # and historical memory. Every query can attend to every fine plane.
+        # The scorer keeps its segment samples and original observation bank.
+        fine = self.output_plane_features(ctx['fine']).to(memory.dtype)
+        memory = torch.cat((memory, fine), 1)
+        padding = torch.cat((padding, padding.new_zeros(fine.shape[:2])), 1)
         return memory, padding
 
     def finish_prediction(self, ctx, decoded, points, projected, padding, candidates=None):

@@ -27,8 +27,7 @@ from vesuvius.neural_tracing.fiber_follow.regression.data import (
     IdentityObservationBuilder, IdentitySampling, DirectTracer, LOCATION_SOURCES,
     load_contacts, load_hard_spans,
 )
-from vesuvius.neural_tracing.fiber_follow.shared.components import PAIR_SAMPLING_VERSION, ComponentRule
-from vesuvius.neural_tracing.fiber_follow.regression.supervision import commit_window, loss_terms
+from vesuvius.neural_tracing.fiber_follow.regression.supervision import commit_window, loss_terms, weighted_state_sum
 from vesuvius.neural_tracing.fiber_follow.regression.diagnostics import (
     decision_rows, summarize_decisions,
     candidate_decisions, summarize_candidates,
@@ -108,7 +107,7 @@ def initialize_training_optimizer(model, ema, args, resume=None):
 
 ARCHITECTURES = (ARCHITECTURE,)
 FEATURE_OPTIONS = ('feature_detail_tokens', 'feature_stream_steps', 'feature_replay_weight',
-                   'feature_switch_crop_fraction')
+                   'feature_switch_crop_fraction', 'feature_history_loss_fraction')
 MEMORY_GRAD_CLIP = 5.
 REST_GRAD_CLIP = 20.
 
@@ -200,7 +199,8 @@ def resolve_device_sums(*tables):
 
 
 IDENTITY_SUMS = ('identity_correct_count',
-                 'identity_flipped_count', 'candidate_states')
+                 'identity_flipped_count', 'candidate_states', 'candidate_intervals',
+                 'candidate_late_failures', 'candidate_first_failures', 'candidate_supervision_weight')
 
 
 def clip_training_gradients(model, memory_max_norm=MEMORY_GRAD_CLIP, rest_max_norm=REST_GRAD_CLIP):
@@ -237,7 +237,7 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
                      candidate_weight=1.,
                      memory_grad_clip=MEMORY_GRAD_CLIP, rest_grad_clip=REST_GRAD_CLIP, stream_states=None,
                      diagnostic=None):
-    """Equal weight per observed state, independent of microbatch boundaries.
+    """Fixed stream loss budgets, independent of microbatch boundaries.
 
     Geometry averages known points; survival sums known intervals. Fully
     unknown states contribute zero. Geometry and confidence are evaluated in one pass.
@@ -259,7 +259,6 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
     identity = {}
     candidate_groups = {}
     requested_decisions = 0.
-    pair_version = PAIR_SAMPLING_VERSION
     decisions = []
     memory = {}
     model.train()
@@ -267,8 +266,6 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
         sequence = sequence_steps(chunk)
         chunk_losses = []
         for cpu in sequence:
-            if 'pair_sampling_version' in cpu:
-                pair_version = int(cpu['pair_sampling_version'][0])
             batch = move_batch(cpu, device)
             if model.cfg.memory_slots:
                 sums['memory_observations_mean'] = sums.get('memory_observations_mean', 0.)+float(cpu['x']['memory_mask'].sum())/total
@@ -278,7 +275,7 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
                 diagnostic.update(cpu_batch=cpu, memory=None if carried is None else
                                   {k: v.detach() for k, v in carried.items()})
             scoring = {}
-            if 'candidate_points' in batch:
+            if 'candidate_points' in batch and cpu['candidate_mask'].any():
                 scoring['candidates'] = batch['candidate_points']
             with torch.autocast('cuda', dtype=torch.bfloat16, enabled=torch.device(device).type == 'cuda'):
                 output = model(batch['x'], batch['hist'], batch['hmask'], memory=carried, **scoring)
@@ -287,11 +284,11 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
                     if model.cfg.feature_replay_weight:
                         stream_states.replay.record(cpu, output)
                 terms = loss_terms(output, batch, model.cfg, tolerance, n_commit=n_commit)
-                geometry = terms['geometry_per_state'].sum()/total
-                confidence = terms['confidence_per_state'].sum()/total
+                geometry = weighted_state_sum(terms['geometry_per_state'], batch)/total
+                confidence = weighted_state_sum(terms['confidence_per_state'], batch)/total
                 loss = geometry + confidence_weight*confidence
                 if 'candidate_per_state' in terms:
-                    candidate_loss = terms['candidate_per_state'].sum()/total
+                    candidate_loss = weighted_state_sum(terms['candidate_per_state'], batch)/total
                     loss = loss+candidate_weight*candidate_loss
                     accumulate(identity, 'candidate_loss', candidate_loss)
             if 'feature_sequence' in chunk:
@@ -311,6 +308,16 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
             for key in ('presence_dropped', 'blurred', 'foreign_components', 'seed_present', 'identity_observable'):
                 if key in cpu:
                     identity[key] = identity.get(key, 0.)+float((cpu[key] > 0).sum())
+            weights = cpu.get('loss_weight', torch.ones(len(cpu['hist'])))
+            endpoint = cpu.get('stream_end', torch.ones(len(weights), dtype=torch.bool))
+            matched = endpoint & (cpu.get('decision_kind', torch.zeros(len(weights))) > 0)
+            choice = endpoint & (cpu.get('decision_kind', torch.zeros(len(weights))) == 1)
+            for name, select in (('supervision', torch.ones_like(endpoint)), ('endpoint', endpoint),
+                                 ('matched_endpoint', matched), ('choice_endpoint', choice)):
+                sums[name+'_weight'] = sums.get(name+'_weight', 0.)+float(weights[select].sum())
+            sums['endpoint_states'] = sums.get('endpoint_states', 0)+int(endpoint.sum())
+            sums['matched_endpoint_states'] = sums.get('matched_endpoint_states', 0)+int(matched.sum())
+            sums['choice_endpoint_states'] = sums.get('choice_endpoint_states', 0)+int(choice.sum())
             if 'decision_requested' in cpu:
                 requested_decisions += float(cpu['decision_requested'].sum())
             if 'negative_bank_shards' in cpu:
@@ -369,10 +376,10 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
         sums['memory'] = memory
     if identity:
         # Versioned separately from the distance metrics above.
-        identity.update(identity_version=1, pair_sampling_version=pair_version,
+        identity.update(identity_version=1,
                         identity_prefix_correct_fraction=identity.get('identity_correct_count', 0.)/max(1., sums['confidence_count']))
         if 'candidate_loss' in identity:
-            identity['candidate_loss_eligible'] = identity['candidate_loss']*total/max(1., identity.get('candidate_states', 0.))
+            identity['candidate_loss_eligible'] = identity['candidate_loss']*total/max(1e-12, identity.get('candidate_supervision_weight', 0.))
         for key in ('presence_dropped', 'blurred', 'foreign_components', 'seed_present', 'identity_observable', *(f'location_{n}' for n in LOCATION_SOURCES)):
             if key in identity:
                 identity[key+'_fraction'] = identity.pop(key)/total
@@ -438,7 +445,9 @@ def build_parser():
     ap.add_argument('--short-history-prob', type=float, default=.4,
                     help='Given history is present, probability of a balanced 1-8/9-32 point startup history')
     ap.add_argument('--decision-fraction', type=float, default=.25,
-                    help='Fraction reserved for matched pairs with visible reference seeds')
+                    help='Fraction of endpoint proposals reserved for matched pairs with remote observed seeds')
+    ap.add_argument('--decision-choice-fraction', type=float, default=.75,
+                    help='Requested fraction of matched pairs teaching recoverable geometry choices')
     ap.add_argument('--candidate-weight', type=float, default=1., help='Weight of candidate first-failure survival likelihood')
     ap.add_argument('--fresh-fraction', type=float, default=.7,
                     help='Fresh share of non-pair draws; remainder uses current replay; may change on resume')
@@ -446,12 +455,8 @@ def build_parser():
     ap.add_argument('--near-negative-bank', help='Additional bank of validated nearby negative relationships')
     ap.add_argument('--following-bank', help='Following path source (default: negative-bank)')
     ap.add_argument('--continuation-bank', help='Wrong-continuation path source (default: negative-bank)')
-    ap.add_argument('--negative-near-fraction', type=float, default=.5, help='Negative slots reserved for nearby paths (new runs: .5)')
-    ap.add_argument('--negative-near-distance', type=float, default=12., help='Near/outer split in trace voxels (default: 12)')
     ap.add_argument('--bank-coverage-probability', type=float, default=.2, help='Fresh slots reserved for covered parents with usable history (new runs: .2)')
     ap.add_argument('--prefer-long-continuations', action=argparse.BooleanOptionalAction, default=False)
-    ap.add_argument('--negative-lateral-max', type=float, default=32.,
-                    help='Maximum neighbor distance; every sampled point must also lie inside the CT crop')
     ap.add_argument('--negative-bank-refresh-seconds', type=float, default=30., help='Each loader worker checks for completed new negative shards at this interval')
     ap.add_argument('--negative-bank-cache-mb', type=float, default=64., help='Maximum cached negative geometry per loader worker')
     ap.add_argument('--bank-wrong-continuation-probability', type=float, default=.75,
@@ -573,7 +578,8 @@ def main(argv=None):
         resume = read_checkpoint(args.resume,ARCHITECTURES,args.device)
         # Sampling spacing changes no parameter shapes; use the requested value.
         cfg = replace(checkpoint_config(resume), memory_stride=args.memory_stride,
-                      feature_switch_crop_fraction=args.feature_switch_crop_fraction, **refinement_limit)
+                      feature_switch_crop_fraction=args.feature_switch_crop_fraction,
+                      feature_history_loss_fraction=args.feature_history_loss_fraction, **refinement_limit)
         args.recurrent_refinement_limit = cfg.recurrent_refinement_limit
         if args.direction_inputs != cfg.direction_inputs:
             raise ValueError('Direction inputs must match the resumed checkpoint; start a new run to change them')
@@ -589,15 +595,14 @@ def main(argv=None):
     if args.dagger_after <= 0:
         raise ValueError('--dagger-after must be positive')
     identity_sampling = IdentitySampling(
-        rule=ComponentRule(lateral_max=args.negative_lateral_max),
         presence_dropout=args.presence_dropout,contact_fraction=args.contact_fraction,
         blur_probability=args.blur_probability,blur_sigma=args.blur_sigma,
         hard_span_fraction=args.hard_span_fraction,lateral_fraction=args.lateral_fraction,
         bank_wrong_continuation_probability=args.bank_wrong_continuation_probability,
         bank_wrong_continuation_tail=args.bank_wrong_continuation_tail,
         bank_following_probability=args.bank_following_probability,
-        decision_fraction=args.decision_fraction,negative_near_fraction=args.negative_near_fraction,
-        negative_near_distance=args.negative_near_distance,bank_coverage_probability=args.bank_coverage_probability,
+        decision_fraction=args.decision_fraction,decision_choice_fraction=args.decision_choice_fraction,
+        candidate_tolerance=args.tolerance,bank_coverage_probability=args.bank_coverage_probability,
         prefer_long_continuations=args.prefer_long_continuations,
         memory_switch_probability=args.memory_switch_probability,memory_switch_tail=args.memory_switch_tail)
     if not args.negative_bank:
@@ -654,8 +659,8 @@ def main(argv=None):
                    'log_every','ckpt_every','diag_every','dagger_device','compile',
                    'negative_bank_refresh_seconds','negative_bank_cache_mb','activation_checkpointing',
                    'memory_grad_clip','rest_grad_clip','presence_dropout','blur_probability','blur_sigma',
-                   'decision_fraction','bank_following_probability','fresh_fraction',
-                   'n_commit','memory_stride','feature_switch_crop_fraction',
+                   'decision_fraction','decision_choice_fraction','bank_following_probability','fresh_fraction',
+                   'n_commit','memory_stride','feature_switch_crop_fraction','feature_history_loss_fraction',
                    'recurrent_refinement_limit'}
         defaults = build_parser()
         for key,value in vars(args).items():
@@ -736,7 +741,6 @@ def main(argv=None):
                     trainable_parameters=sum(p.numel() for p in model.parameters() if p.requires_grad)))
     log.record(dict(step=done,event='identity_sampling',architecture=model.architecture,
         source_sampling=dict(fresh=args.fresh_fraction,recent=1-args.fresh_fraction),
-        pair_sampling_version=identity_sampling.pair_sampling_version,
         feature_sampling_revision=FEATURE_SAMPLING_REVISION,
         history_policy='main_encoder_feature_memory',sampling=asdict(identity_sampling),
         negative_bank_path=str(negative_bank.root),negative_bank_provenance=negative_bank.provenance(),

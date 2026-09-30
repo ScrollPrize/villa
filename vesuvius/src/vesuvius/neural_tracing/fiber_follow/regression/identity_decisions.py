@@ -1,4 +1,4 @@
-"""Matched decisions distinguished by observed seeds inside the current crop."""
+"""Matched choices and departures distinguished by earlier observed fibers."""
 import numpy as np
 
 from vesuvius.neural_tracing.fiber_follow.shared.data import continuation_targets, label_state
@@ -9,7 +9,36 @@ from vesuvius.neural_tracing.fiber_follow.regression.neighbor_following import b
 from vesuvius.neural_tracing.fiber_follow.regression.neighbor_mining import exact_nearest
 
 
-def decision_pair(bank, sample, model, rng, *, attempts=32):
+CANDIDATE_COUNT = 4
+
+
+def path_candidates(curves, supported, rng):
+    """Two continuations and two smooth switches with identical paired inputs.
+
+    Switch onset varies over the forecast. Labels are deliberately not assigned
+    here: dense geometry, foreign masks and censoring determine the first failure.
+    """
+    count = curves.shape[1]
+    mixed, masks = [], []
+    for origin in (0, 1):
+        if count < 4:
+            mixed.append(curves[origin].copy())
+            masks.append(np.zeros(count, bool))
+            continue
+        start = int(rng.integers(1, count-2))  # this many endpoints remain correct
+        width = min(int(rng.integers(2, 5)), count-start)
+        phase = np.clip((np.arange(count)-start+1)/width, 0., 1.)
+        blend = phase**3*(10+phase*(-15+6*phase))
+        mixed.append(curves[origin]*(1-blend[:, None])+curves[1-origin]*blend[:, None])
+        # Both source curves must be supported once mixing begins.
+        masks.append(supported[origin] & ((blend == 0) | supported[1-origin]))
+    order = rng.permutation(CANDIDATE_COUNT)
+    return (np.concatenate((curves, mixed)).astype(np.float32)[order],
+            np.minimum.accumulate(np.concatenate((supported, masks)), axis=-1)[order],
+            np.array([0, 0, 1, 1], np.int64)[order])
+
+
+def decision_pair(bank, sample, model, rng, *, attempts=32, choice=None):
     """Return two states sharing crops, candidate order and observed history.
 
     Choice pairs share a short uncertain path between nearby fibers; either
@@ -19,7 +48,7 @@ def decision_pair(bank, sample, model, rng, *, attempts=32):
     observations of the simulated paths, not replacements of contaminated
     recent observations. Only certified bank relationships are used.
     """
-    choice = bool(rng.integers(2))
+    choice = bool(rng.integers(2)) if choice is None else choice
     tails = [v for v in (4.,8.,12.) if v+8 < model.fine.behind*model.fine.spacing]
     if not tails:
         return None
@@ -85,9 +114,7 @@ def decision_pair(bank, sample, model, rng, *, attempts=32):
         # Recheck the exact interpolated B history against the original target.
         if not choice and not bank.clear_of_target(fi, np.concatenate((history[mask > 0], bpos[None]))).all():
             continue
-        order = rng.permutation(2)
-        curves = curves[order]
-        supported = supported[order].astype(np.float32)
+        curves, supported, candidate_kind = path_candidates(curves, supported, rng)
         reference_b = head-tail-reference_gap
         reference_a = float(np.interp(reference_b, s, matched))
         refs = [interp_at(parent.points, parent.s, np.array([reference_a]))[0],
@@ -111,7 +138,7 @@ def decision_pair(bank, sample, model, rng, *, attempts=32):
                        seed_pos=refs[target], seed_tangent=tangents[target], seed_valid=True,
                        seed_age=float(arclength(np.concatenate((refs[target][None], history[mask > 0][::-1], pos[None])))[-1]),
                        candidate_points=curves.copy(), candidate_mask=supported.copy(),
-                       candidate_labels=np.repeat(((order == target) & (not offtrack))[:, None], sample.n_future, axis=1).astype(np.float32),
+                       candidate_kind=candidate_kind.copy(),
                        decision_kind=1 if choice else (2 if offtrack else 3),
                        decision_tail=tail, bank_tail_length=tail if offtrack else 0.)
             if target == 1:

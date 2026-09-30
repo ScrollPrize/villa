@@ -79,12 +79,14 @@ def test_separate_roles_supply_both_bands_without_changing_following_source(tmp_
     cfg = DirectConfig()
     builder = IdentityObservationBuilder(cfg,[parent],negative_bank=bank,near_negative_bank=near,
         following_bank=near,sampling=IdentitySampling(rule=ComponentRule(lateral_max=32.),
-            negative_near_fraction=.5,bank_following_probability=1.))
+            bank_following_probability=1.))
     state = item(cfg)
-    labels = builder.identity_targets([state])
-    assert labels['negative_mask'].all()
-    assert (labels['negative_distance'][...,:4] <= 12).all()
-    assert (labels['negative_distance'][...,4:] > 12).all()
+    labels = builder.bank_targets([state])
+    from vesuvius.neural_tracing.fiber_follow.shared.geometry import crop_local_grid
+    local = crop_local_grid(cfg.fine)[labels['foreign'][0].numpy().astype(bool)]
+    world = local @ state['frame'].T+state['pos']
+    assert (np.abs(world[:,0]-6) < .5).any()
+    assert (np.abs(world[:,0]-24) < .5).any()
     state = builder.replace_fresh(clean_sample(cfg),np.random.default_rng(3))
     np.testing.assert_allclose(state['supervision_fiber'].points[:,0],6.)
 
@@ -99,11 +101,13 @@ def test_positive_bank_path_uses_annotated_parent_as_negative(tmp_path):
         sampling=IdentitySampling(rule=ComponentRule(lateral_max=32.)))
     state=following_sample(bank,clean_sample(cfg),np.random.default_rng(20))
     state=builder.prepare(state,state['supervision_fiber'],np.random.default_rng(21))
-    labels=builder.identity_targets([state])
-    assert labels['positive_mask'].all() and labels['negative_mask'].all()
-    world=labels['identity_points'][0].numpy() @ state['frame'].T+state['pos']
-    np.testing.assert_allclose(world[:4,0],24.,atol=1e-6)
-    np.testing.assert_allclose(world[4:,0],0.,atol=1e-6)
+    labels=builder.bank_targets([state])
+    from vesuvius.neural_tracing.fiber_follow.shared.geometry import crop_local_grid
+    assert labels['foreign'].any()
+    local = crop_local_grid(cfg.fine)[labels['foreign'][0].numpy().astype(bool)]
+    world = local @ state['frame'].T+state['pos']
+    assert (np.abs(world[:,0]) < .5).all()
+    assert bank.clear_of_state(state,world).all()
 
 
 

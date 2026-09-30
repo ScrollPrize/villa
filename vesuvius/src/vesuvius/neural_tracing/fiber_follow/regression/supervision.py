@@ -46,6 +46,30 @@ def foreign_failures(points, batch, cfg, count):
 
 
 @torch.no_grad()
+def candidate_targets(batch, cfg, tolerance):
+    """Label supplied paths with the deployed dense first-failure contract.
+
+    Called by the loader after foreign masks are built, before augmentation.
+    Candidate support only censors; it never manufactures a positive prefix.
+    """
+    labels, known = [], []
+    for points in batch['candidate_points'].unbind(1):
+        foreign = foreign_failures(points, batch, cfg, batch['dense_mask'].shape[-1])
+        target, mask, _ = prefix_labels(points, batch, tolerance, cfg.max_recovery_distance,
+                                        extra_failure=foreign)
+        labels.append(target)
+        known.append(mask)
+    mask = torch.stack(known, 1)*batch['candidate_mask']
+    mask *= batch['identity_observable'][:, None, None]
+    return torch.stack(labels, 1), mask
+
+
+def weighted_state_sum(values, batch):
+    """Keep the stream's fixed loss budget across chunks and endpoint replay."""
+    return (values*batch.get('loss_weight', torch.ones_like(values))).sum()
+
+
+@torch.no_grad()
 def point_correctness(points, batch, cfg, tolerance, foreign=None):
     """Independent predicted-point counts, not cumulative prefix labels.
 
@@ -146,4 +170,9 @@ def loss_terms(output, batch, cfg, tolerance=1.5, *, n_commit=None):
         valid = mask.any(-1)
         terms['candidate_per_state'] = per_candidate.sum(-1)/valid.sum(-1).clamp_min(1)
         terms['candidate_states'] = valid.any(-1).sum()
+        terms['candidate_intervals'] = mask.sum()
+        failures = mask & (labels < .5)
+        terms['candidate_late_failures'] = failures[..., 1:].sum()
+        terms['candidate_first_failures'] = failures[..., 0].sum()
+        terms['candidate_supervision_weight'] = weighted_state_sum(valid.any(-1).float(), batch)
     return terms

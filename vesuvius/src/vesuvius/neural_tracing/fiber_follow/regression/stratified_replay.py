@@ -71,7 +71,7 @@ class StratifiedReplay:
     def backward(self, model, total, *, device, tolerance, n_commit, confidence_weight,
                  candidate_weight):
         from .train import move_batch
-        from .supervision import loss_terms
+        from .supervision import loss_terms, weighted_state_sum
         raw = getattr(model, '_orig_mod', model)
         weight = raw.cfg.feature_replay_weight
         metrics = dict(replay_endpoints=0, replay_observations=0, replay_encoder_crops=0, replay_loss=0.)
@@ -95,12 +95,13 @@ class StratifiedReplay:
                     pose = move_batch(row['pose'], device)
                     state, _ = transition(*features, pose, state)
                 batch = move_batch(rows[-1]['batch'], device)
-                kwargs = dict(candidates=batch['candidate_points']) if 'candidate_points' in batch else {}
+                score = 'candidate_points' in batch and rows[-1]['batch']['candidate_mask'].any()
+                kwargs = dict(candidates=batch['candidate_points']) if score else {}
                 output = model(batch['x'], batch['hist'], batch['hmask'], memory=state, **kwargs)
                 terms = loss_terms(output, batch, raw.cfg, tolerance, n_commit=n_commit)
-                loss = terms['geometry_per_state'].sum()+confidence_weight*terms['confidence_per_state'].sum()
+                loss = weighted_state_sum(terms['geometry_per_state'], batch)+confidence_weight*weighted_state_sum(terms['confidence_per_state'], batch)
                 if 'candidate_per_state' in terms:
-                    loss = loss+candidate_weight*terms['candidate_per_state'].sum()
+                    loss = loss+candidate_weight*weighted_state_sum(terms['candidate_per_state'], batch)
                 loss = loss*(weight/total)
             loss.backward()
             # Stays on the device; the training update resolves all sums with one transfer.

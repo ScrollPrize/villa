@@ -10,9 +10,7 @@ import numpy as np
 import torch
 from scipy.ndimage import gaussian_filter
 
-from vesuvius.neural_tracing.fiber_follow.shared.components import (
-    PAIR_SAMPLING_VERSION, ComponentRule, sample_pairs,
-)
+from vesuvius.neural_tracing.fiber_follow.shared.components import ComponentRule
 from vesuvius.neural_tracing.fiber_follow.shared.data import collate_targets, fiber_manifest
 from vesuvius.neural_tracing.fiber_follow.shared.crop_sampling import scalar_crops
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import interp_at
@@ -83,9 +81,6 @@ class ObservationBuilder:
 class IdentitySampling:
     """Training-only identity targets, augmentation and ambiguous-state oversampling."""
     rule: ComponentRule = ComponentRule()
-    pair_sampling_version: int = PAIR_SAMPLING_VERSION
-    positives: int = 4
-    negatives: int = 8
     on_fiber_tolerance: float = 1.5  # visible reference counts toward the anchor within this of GT
     presence_dropout: float = .25
     contrast: float = 1.4  # log-uniform contrast factor in [1/c, c]
@@ -100,11 +95,11 @@ class IdentitySampling:
     bank_wrong_continuation_probability: float = .75
     bank_wrong_continuation_tail: tuple = (4., 16.)
     bank_following_probability: float = 0.  # fraction of fresh draws; trainer opts in
-    negative_near_fraction: float | None = None  # None samples without near/outer stratification
-    negative_near_distance: float = 12.
     bank_coverage_probability: float = 0.  # reserved fresh slots on covered parent spans
     prefer_long_continuations: bool = False
-    decision_fraction: float = 0.  # fraction of all states reserved for matched pairs
+    decision_fraction: float = 0.  # fraction of endpoint proposals reserved for matched pairs
+    decision_choice_fraction: float = .75  # requested choice share; remaining pairs teach departure
+    candidate_tolerance: float = 1.5
     # Fresh draws replaced by long original-then-neighbor memory sequences.
     memory_switch_probability: float = 0.
     memory_switch_tail: tuple = (16., 96.)
@@ -118,7 +113,7 @@ class IdentitySampling:
                      self.hard_span_fraction, self.lateral_fraction)
         if not all(0 <= f <= 1 for f in fractions) or sum(fractions[1:]) > 1:
             raise ValueError('Identity sampling probabilities must lie in [0, 1]; oversampling at most 1')
-        if min(self.positives, self.negatives, self.lateral_memory) < 1 or self.contrast < 1:
+        if self.lateral_memory < 1 or self.contrast < 1:
             raise ValueError('Invalid identity sample counts or augmentation')
         if not np.isfinite(self.blur_probability) or not 0 <= self.blur_probability <= 1:
             raise ValueError('Blur probability must be in [0, 1]')
@@ -134,14 +129,14 @@ class IdentitySampling:
             raise ValueError('Bank following probability must be in [0,1]')
         if not 0 <= self.decision_fraction <= 1:
             raise ValueError('Decision fraction must be in [0,1]')
+        if not 0 <= self.decision_choice_fraction <= 1:
+            raise ValueError('Decision choice fraction must be in [0,1]')
+        if not np.isfinite(self.candidate_tolerance) or self.candidate_tolerance <= 0:
+            raise ValueError('Candidate tolerance must be finite and positive')
         if not 0 <= self.bank_coverage_probability <= 1-self.bank_following_probability:
             raise ValueError('Following and covered fresh probabilities must sum to at most one')
         if not 0 <= self.memory_switch_probability <= 1-self.bank_following_probability-self.bank_coverage_probability:
             raise ValueError('Following, covered and memory-switch fresh probabilities must sum to at most one')
-        if self.negative_near_fraction is not None and not 0 <= self.negative_near_fraction <= 1:
-            raise ValueError('Near-negative fraction must be in [0,1]')
-        if not np.isfinite(self.negative_near_distance) or self.negative_near_distance <= self.rule.own_radius:
-            raise ValueError('Near-negative distance must exceed own-fiber radius')
         from vesuvius.neural_tracing.fiber_follow.regression.neighbor_continuations import validate_tail_range
         object.__setattr__(self, 'bank_wrong_continuation_tail', validate_tail_range(self.bank_wrong_continuation_tail))
         object.__setattr__(self, 'memory_switch_tail', validate_tail_range(self.memory_switch_tail))
@@ -253,7 +248,7 @@ def contact_location(fibers, episode, side, reverse, rng, approach=24.):
 
 
 class IdentityObservationBuilder(ObservationBuilder):
-    """Crop-only visual identity supervision from the shared neighboring-path bank."""
+    """Bank-derived following, foreign masks, and memory-dependent path decisions."""
     def __init__(self,cfg: DirectConfig,fibers=None,sampling=IdentitySampling(),*,
                  contacts=(),hard_spans=(),augment=False,negative_bank=None,
                  near_negative_bank=None,following_bank=None,continuation_bank=None):
@@ -268,7 +263,8 @@ class IdentityObservationBuilder(ObservationBuilder):
         from vesuvius.neural_tracing.fiber_follow.regression.identity_decisions import decision_pair
         if self.negative_bank is None:
             raise ValueError('Matched decisions require a bank')
-        return decision_pair(self.near_negative_bank or self.negative_bank, sample_cfg, self.cfg, rng)
+        return decision_pair(self.near_negative_bank or self.negative_bank, sample_cfg, self.cfg, rng,
+                             choice=rng.random() < self.sampling.decision_choice_fraction)
 
     def replace_fresh(self, sample_cfg, rng):
         """Reserve fresh slots for following and covered annotation locations."""
@@ -429,55 +425,34 @@ class IdentityObservationBuilder(ObservationBuilder):
         z = np.asarray(item.get('identity_label_z',np.asarray(item['pos'])[2:3]))
         return not (z.min()-2 < band.hi and z.max()+2 >= band.lo)
 
-    def identity_targets(self, items):
+    def bank_targets(self, items):
+        """Foreign-path masks and coverage feedback; no contrastive point queries."""
         if self.negative_bank is None:
-            raise ValueError('Identity supervision requires a negative bank')
-        cfg, s = self.cfg, self.sampling
-        B, K, M, P = len(items), s.positives, s.negatives, cfg.n_history+1
+            raise ValueError('Bank supervision requires a negative bank')
+        cfg, bank = self.cfg, self.negative_bank
         shape = (cfg.fine.depth, cfg.fine.width, cfg.fine.width)
-        out = dict(positive_mask=np.zeros((B, K), np.float32), negative_mask=np.zeros((B, K, M), np.float32),
-                   identity_points=np.zeros((B, K*(1+M), 3), np.float32), reference_on_fiber=np.zeros((B, P), np.float32),
-                   foreign=np.zeros((B, *shape), np.uint8), presence_dropped=np.zeros(B, np.float32),
-                   location_source=np.zeros(B, np.float32), foreign_components=np.zeros(B, np.float32))
-        out.update(negative_path_ids=np.full((B,K,M),-1,np.int64),negative_distance=np.zeros((B,K,M),np.float32),
-                   pair_sampling_version=np.full(B,s.pair_sampling_version,np.int64),
-                   negative_near_distance=np.full(B,s.negative_near_distance,np.float32))
-        if self.negative_bank is not None:
-            out['negative_bank_shards'] = np.zeros(B, np.int64)
-        crop = cfg.fine
+        out = dict(foreign=np.zeros((len(items), *shape), np.uint8),
+                   presence_dropped=np.zeros(len(items), np.float32),
+                   location_source=np.zeros(len(items), np.float32),
+                   foreign_components=np.zeros(len(items), np.float32),
+                   negative_bank_shards=np.zeros(len(items), np.int64))
         for j, item in enumerate(items):
+            out['location_source'][j] = item.get('location_source', 0)
             if 'identity_curve' not in item:
                 continue
-            rng = np.random.default_rng(item['identity_seed'])
-            bank = self.negative_bank
-            found = bank.candidates(item,crop,s.rule,mask_crop=cfg.fine,
-                additional_banks=([self.near_negative_bank] if self.near_negative_bank is not None and self.near_negative_bank is not bank else ()))
-            pos, pos_mask, neg, neg_mask, metadata = sample_pairs(
-                item['identity_curve'], crop, found['local'], found['nearest'], rng,
-                positives=K, negatives=M, margin=cfg.patch_radius,
-                rule=s.rule,
-                appearance_crop=cfg.fine,
-                along_margin=cfg.fine.spacing,
-                path_ids=found['path_ids'],near_fraction=s.negative_near_fraction,
-                near_distance=s.negative_near_distance,return_metadata=True)
-            if bank is not None:
-                # Recheck float32 query coordinates against the whole target,
-                # including geometry outside this crop.
-                valid = neg_mask > 0
-                if valid.any():
-                    world = neg[valid] @ np.asarray(item['frame']).T+item['pos']
-                    neg_mask[valid] *= bank.clear_of_state(item,world)
-                out['negative_bank_shards'][j] = bank.shard_count+(self.near_negative_bank.shard_count
-                    if self.near_negative_bank is not None and self.near_negative_bank is not bank else 0)
-            for key,value in metadata.items():
-                out[key][j] = value
-            out['positive_mask'][j], out['negative_mask'][j] = pos_mask, neg_mask
-            out['identity_points'][j] = np.concatenate((pos, neg.reshape(-1, 3)))
-            out['reference_on_fiber'][j] = item['reference_on_fiber']
+            found = bank.candidates(item, cfg.fine, self.sampling.rule, mask_crop=cfg.fine,
+                additional_banks=([self.near_negative_bank] if self.near_negative_bank is not None
+                                  and self.near_negative_bank is not bank else ()))
             out['foreign'][j] = found['foreign']
             out['foreign_components'][j] = found['counts']['foreign_components']
-            out['location_source'][j] = item.get('location_source', 0)
-            if self.fibers is not None and item.get('source') == 0 and (neg_mask.sum(-1)*pos_mask).any():
+            out['negative_bank_shards'][j] = bank.shard_count+(self.near_negative_bank.shard_count
+                if self.near_negative_bank is not None and self.near_negative_bank is not bank else 0)
+            # Remember covered locations directly, independent of randomly selected
+            # contrastive queries. Missing coverage remains unknown.
+            ahead = found['local']
+            if (self.fibers is not None and item.get('source') == 0 and len(ahead)
+                    and ((ahead[:, 2] >= cfg.future_step)
+                         & (ahead[:, 2] <= cfg.n_future*cfg.future_step)).any()):
                 self.lateral.append(item['fiber_ref'])
         return {k: torch.from_numpy(v) for k, v in out.items()}
 
@@ -485,13 +460,19 @@ class IdentityObservationBuilder(ObservationBuilder):
         batch = super().__call__(items,vol)
         if self.fibers is None and not self.augment and not any('identity_curve' in i for i in items):
             return batch
-        batch.update(self.identity_targets(items))
+        batch.update(self.bank_targets(items))
         batch['identity_observable'] = torch.tensor([i.get('identity_observable',True) for i in items])
         batch['bank_tail_length'] = torch.tensor([i.get('bank_tail_length',0.) for i in items],dtype=torch.float32)
         if self.sampling.decision_fraction:
-            shape = (2,self.cfg.n_future)
-            for key,trailing in (('candidate_points',(3,)),('candidate_mask',()),('candidate_labels',())):
+            from .identity_decisions import CANDIDATE_COUNT
+            from .supervision import candidate_targets
+            shape = (CANDIDATE_COUNT,self.cfg.n_future)
+            for key,trailing in (('candidate_points',(3,)),('candidate_mask',())):
                 batch[key] = torch.from_numpy(np.stack([i.get(key,np.zeros((*shape,*trailing),np.float32)) for i in items]))
+            batch['candidate_kind'] = torch.from_numpy(np.stack([i.get('candidate_kind',
+                np.full(CANDIDATE_COUNT, -1, np.int64)) for i in items]))
+            batch['candidate_labels'], batch['candidate_mask'] = candidate_targets(
+                batch, self.cfg, self.sampling.candidate_tolerance)
             for key in ('decision_kind','decision_tail'):
                 batch[key] = torch.tensor([i.get(key,0) for i in items],dtype=torch.float32)
         batch['seed_present'] = batch['x']['seed_mask'].flatten()

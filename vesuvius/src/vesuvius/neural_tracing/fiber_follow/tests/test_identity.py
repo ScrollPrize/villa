@@ -31,19 +31,14 @@ def batch(cfg,b=2):
     hist=torch.zeros(b,cfg.n_history,3)
     hist[...,2]=-torch.arange(1,cfg.n_history+1)
     q=4*(cfg.n_future-1)+1
-    K,M=2,3
     x=dict(fine=torch.rand(b,2,cfg.fine.depth,cfg.fine.width,cfg.fine.width),
         seed=torch.zeros(b,1,3),seed_mask=torch.ones(b,1),seed_tangent=torch.tensor([0.,0.,1.]).expand(b,-1),
         seed_age=torch.zeros(b), query_frame=torch.eye(3).expand(b,-1,-1).clone(),
         query_position=torch.zeros(b,3), feature_seed_here=torch.ones(b,dtype=torch.bool),
         memory_mask=torch.ones(b,1,dtype=torch.bool),memory_seed_valid=torch.ones(b,dtype=torch.bool))
-    points=torch.zeros(b,K*(1+M),3)
-    points[:,:K,2]=torch.tensor([2.,3.])
-    points[:,K:,0],points[:,K:,2]=3.,2.
     return dict(x=x,hist=hist,hmask=torch.ones(b,cfg.n_history),dense_ab=torch.zeros(b,q,2),
         dense_mask=torch.ones(b,q),offtrack=torch.zeros(b),endpoint_known=torch.zeros(b),
-        end_local=torch.zeros(b,3),source=torch.zeros(b),identity_points=points,
-        positive_mask=torch.ones(b,K),negative_mask=torch.ones(b,K,M),reference_on_fiber=torch.ones(b,cfg.n_history+1),
+        end_local=torch.zeros(b,3),source=torch.zeros(b),
         foreign=torch.zeros(b,cfg.fine.depth,cfg.fine.width,cfg.fine.width,dtype=torch.uint8))
 
 
@@ -78,7 +73,7 @@ def test_bank_radius_keeps_supported_diagonals_and_rejects_crop_edge_patches():
 
 
 def test_saved_presence_threshold_loads_without_reapplying():
-    saved = dict(rule=dict(threshold=.7, own_radius=1.5, lateral_max=32., along_window=2.), pair_sampling_version=4)
+    saved = dict(rule=dict(threshold=.7, own_radius=1.5, lateral_max=32., along_window=2.))
     sampling = IdentitySampling(**saved)
     assert sampling.rule == ComponentRule(lateral_max=32.)
     assert not hasattr(sampling.rule, 'threshold')
@@ -136,11 +131,11 @@ def test_presence_dropout_after_targets(monkeypatch):
     images = fake_images(builder, items)
     monkeypatch.setattr(IdentityObservationBuilder, 'images', lambda self, items, vol, pool=None: images)
     seen = []
-    original = IdentityObservationBuilder.identity_targets
+    original = IdentityObservationBuilder.bank_targets
     def targets(self, items):
         seen.append(float(images['fine'][:, 1].abs().sum()))
         return original(self, items)
-    monkeypatch.setattr(IdentityObservationBuilder, 'identity_targets', targets)
+    monkeypatch.setattr(IdentityObservationBuilder, 'bank_targets', targets)
     out = builder(items, None)
     assert seen[0] > 0 and out['x']['fine'][:, 1].abs().sum() == 0
     assert out['presence_dropped'].tolist() == [1.]

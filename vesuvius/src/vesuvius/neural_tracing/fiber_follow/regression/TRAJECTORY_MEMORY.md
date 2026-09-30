@@ -11,9 +11,14 @@
 3. Queries retrieve incoming historical observations. The coarse retrieval is
    projected/interpolated onto the deep lattice; the fine-feature decoder combines
    this conditioned lattice with stem features once per crop.
-4. The generator reads current spatial features, visible references, immutable
-   seed observations, cached observations and persistent slots. Four decoder
-   layers jointly predict the future lateral coordinates. By default, one more
+4. The generator reads the complete deep lattice and full-resolution dense
+   features on every output plane, plus visible references, immutable seed
+   observations, cached observations and persistent slots. Plane features retain
+   every lateral pixel, are projected to the decoder width and receive physical
+   XYZ position embeddings. Every query can attend to all planes in every layer;
+   there is no per-query plane mask. The production crop supplies 163,216 fine
+   tokens alongside 39,015 deep tokens. Four decoder layers jointly predict the
+   future lateral coordinates. By default, one more
    pass through the same decoder samples the proposal and applies a bounded
    one-voxel lateral correction. Generator self-attention remains bidirectional.
 5. A separate scorer samples four ordered locations along each incoming proposed
@@ -23,7 +28,9 @@
    determines resolution; arbitrary resampling of candidates is not supported.
 6. Segment tokens include sampled evidence and start/end/displacement/length.
    Two scoring decoder layers use causal segment self-attention and unrestricted
-   cross-attention to the entire current image/reference/memory token set. Their own K/V projections are reused across
+   cross-attention to the deep image/reference/memory token set. Dense output-plane
+   tokens are generator inputs; the scorer obtains its fine evidence through
+   segment samples. Its own K/V projections are reused across
    scored candidates within one decision. No generator hidden states enter scoring.
 7. One linear readout predicts the conditional first-failure logit per segment.
    Prefix confidence is the product of conditional survival probabilities,
@@ -47,7 +54,12 @@ receive no supervision. A failure observed after an annotation gap does not loca
 the first-failure interval; training conservatively censors at the gap.
 
 Both generated and supplied candidate paths use this likelihood. Intervals sum
-within a path; paths average per state and states average per effective batch.
+within a path; paths average per state. States receive fixed per-stream weights
+before division by the effective crop-batch size: .75 for the selected endpoint,
+.25 shared by earlier observations (one for a single-observation stream).
+The history share is configurable. Chunk-local renormalization is deliberately
+avoided because it would reintroduce history-length bias. Endpoint replay uses
+the same state weight in addition to its replay coefficient.
 Commit-window weighting applies to geometry only. This changes confidence-loss
 scale from the former prefix BCE. Raw `confidence_count` remains a count of known
 prefix labels for correctness metrics, not a count of hazard training targets.
@@ -64,6 +76,14 @@ shared encoder and memory, but not the generator decoder, coordinate head or
 refinement head. Geometry supervises initial/final proposals with weights
 25%/75%. Seed, history and observation-memory tokens are available through
 cross-attention.
+
+Matched choices reserve supervision for both recoverable alternatives, requiring
+different geometry under identical local observations but different histories.
+Departure pairs instead contrast stopping on a foreign tail with following that
+same tail under its own history. Four supplied candidates include both original
+continuations and two smooth switches at varied forecast positions; dense labels
+locate their first failure. Candidate geometry/order is shared between paired
+observations. Synthetic transitions never serve as geometry targets.
 
 Inference commits the longest prefix clearing its confidence threshold. Confidence
 is monotone by construction; it does not need post-hoc minimum repair. The shared
