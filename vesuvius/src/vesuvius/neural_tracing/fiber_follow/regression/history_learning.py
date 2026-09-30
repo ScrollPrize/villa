@@ -13,23 +13,25 @@ from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
 
 
 def controlled_pair(cfg):
-    b, k = 2, cfg.n_future
+    b, k = 4, cfg.n_future
     image = torch.rand(1,cfg.input_channels,cfg.fine.depth,cfg.fine.width,cfg.fine.width).expand(b,-1,-1,-1,-1).clone()
     slabs = torch.zeros(b,8,2,8,65,65)
     # CT strand context differs; the observed strand marker and all metadata
     # stay fixed. Current crops, local histories and candidate order are identical.
     slabs[0,0,0,:,:,18:24] = 1.
     slabs[1,0,0,:,:,40:46] = 1.
-    slabs[:,0,1,:,:,31:34] = 1.
-    valid = torch.zeros(b,8,dtype=torch.bool);valid[:,0]=True
+    slabs[2,1,0,:,:,18:24] = 1.
+    slabs[3,1,0,:,:,40:46] = 1.
+    slabs[:,:2,1,:,:,31:34] = 1.
+    valid = torch.zeros(b,8,dtype=torch.bool);valid[:,:2]=True
     pose = torch.zeros(b,8,14);pose[:,0,2]=-2.;pose[:,0,12]=.7;pose[:,0,13]=1.
     x = dict(fine=image,history_slabs=slabs,history_valid=valid,history_pose=pose,
              history_ages=torch.full((b,8),256.),history_overlap=torch.zeros(b,8),history_load_seconds=torch.zeros(b))
     curves = torch.zeros(b,2,k,3)
     curves[:,:,:,2] = torch.arange(1,k+1)*cfg.future_step
     curves[:,0,:,0] = -2.;curves[:,1,:,0] = 2.
-    labels = torch.zeros(b,2,k);labels[0,0]=1.;labels[1,1]=1.
-    dense = torch.zeros(b,4*(k-1)+1,2);dense[0,:,0]=-2.;dense[1,:,0]=2.
+    labels = torch.zeros(b,2,k);labels[::2,0]=1.;labels[1::2,1]=1.
+    dense = torch.zeros(b,4*(k-1)+1,2);dense[::2,:,0]=-2.;dense[1::2,:,0]=2.
     return dict(x=x,hist=torch.zeros(b,cfg.n_history,3),hmask=torch.zeros(b,cfg.n_history),
                 dense_ab=dense,dense_mask=torch.ones(dense.shape[:2]),offtrack=torch.zeros(b),
                 endpoint_known=torch.zeros(b),end_local=torch.zeros(b,3),source=torch.zeros(b),
@@ -61,9 +63,14 @@ def main():
             losses.append(dict(step=step,loss=float(loss.detach())))
             print(json.dumps(losses[-1]),flush=True)
     report=paired_history_report(model,batch)
+    with torch.no_grad():
+        prediction=model(batch['x'],batch['hist'],batch['hmask'])
+    target=batch['candidate_points'][torch.arange(4,device=args.device),torch.arange(4,device=args.device)%2]
+    geometry_error=float((prediction['points']-target).norm(dim=-1).mean())
+    generated_accepted=int((prediction['confidence'][:,-1]>=.5).sum())
     full=report['full']
-    passed=full['geometry_choice_accuracy']==1. and full['correct_acceptance']==1. and full['wrong_rejection']==1.
-    result=dict(passed=passed,steps=args.steps,seed=491,device=args.device,losses=losses,ablations=report)
+    passed=full['geometry_choice_accuracy']==1. and full['correct_acceptance']==1. and full['wrong_rejection']==1. and geometry_error<.25 and generated_accepted==4
+    result=dict(passed=passed,geometry_error=geometry_error,generated_accepted=generated_accepted,steps=args.steps,seed=491,device=args.device,losses=losses,ablations=report)
     args.out.parent.mkdir(parents=True,exist_ok=True)
     args.out.write_text(json.dumps(result,indent=2)+'\n')
     torch.save(cpu,args.out.with_suffix('.fixture.pt'))
