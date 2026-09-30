@@ -238,6 +238,17 @@ vc_add_test(NAME test_line_annotation_link_validation
     LIBS doctest::doctest Qt6::Core vc_core vc_lasagna vc_fiber_tracer
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
+vc_add_test(NAME test_line_annotation_structural_edits
+    SOURCES test_line_annotation_structural_edits.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberSliceGeometry.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberSliceGeometry.hpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSegments.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSegments.hpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationStructuralEdits.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationStructuralEdits.hpp
+    LIBS doctest::doctest Qt6::Core vc_core vc_lasagna vc_fiber_tracer
+    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
 vc_add_test(NAME test_line_annotation_generated_views
     SOURCES test_line_annotation_generated_views.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSaveJob.cpp

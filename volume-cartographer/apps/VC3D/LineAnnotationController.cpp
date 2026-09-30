@@ -11,6 +11,7 @@
 #include "FiberSliceGeometry.hpp"
 #include "LineAnnotationAdjacentLinks.hpp"
 #include "LineAnnotationFiberLinks.hpp"
+#include "LineAnnotationStructuralEdits.hpp"
 #include "LineAnnotationFiberNaming.hpp"
 #include "LineAnnotationFiberSaveJob.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
@@ -370,6 +371,8 @@ using vc3d::line_annotation::normalizedOrZero;
 using vc3d::line_annotation::pointsApproximatelyEqual;
 using vc3d::line_annotation::storedControlPointIndexByPosition;
 using vc3d::line_annotation::tangentAtLinePosition;
+using vc3d::line_annotation::fiberGeometryKey;
+using vc3d::line_annotation::kNeedsReoptimizationTag;
 
 // Arclength radius within which a placement click replaces the existing
 // control(s) instead of adding one. Tied to the strip's along-line sampling
@@ -442,7 +445,6 @@ constexpr double kControlPointLabelLinePositionTolerance = 1.0e-3;
 // Applied by the sync tool's three-way merge (scripts/fiber_merge.py,
 // REOPTIMIZE_TAG) when it had to synthesize line_points it cannot fit to
 // the volume; keep the literal in sync with that module.
-constexpr const char* kNeedsReoptimizationTag = "needs_reoptimization";
 using Clock = std::chrono::steady_clock;
 
 struct InitialLineDiscretization {
@@ -18423,28 +18425,6 @@ bool LineAnnotationController::repairLoadedFiberBranchLinks(
 }
 
 namespace {
-
-// Exact geometry fingerprint used to recognise the same fiber stored under
-// two names. Raw double bits keep the comparison exact and format-independent.
-std::string fiberGeometryKey(const std::vector<vc3d::line_annotation::StoredControlPoint>& controls,
-                             const std::vector<cv::Vec3d>& linePoints)
-{
-    if (controls.empty() && linePoints.empty()) return {};
-    std::string key;
-    key.reserve(sizeof(uint64_t) + (controls.size() + linePoints.size()) * 3 * sizeof(uint64_t));
-    auto appendPoint = [&key](const cv::Vec3d& point) {
-        for (int axis = 0; axis < 3; ++axis) {
-            uint64_t bits = 0;
-            std::memcpy(&bits, &point[axis], sizeof(bits));
-            key.append(reinterpret_cast<const char*>(&bits), sizeof(bits));
-        }
-    };
-    const uint64_t controlCount = controls.size();
-    key.append(reinterpret_cast<const char*>(&controlCount), sizeof(controlCount));
-    for (const auto& control : controls) appendPoint(control);
-    for (const auto& point : linePoints) appendPoint(point);
-    return key;
-}
 
 }  // namespace
 
