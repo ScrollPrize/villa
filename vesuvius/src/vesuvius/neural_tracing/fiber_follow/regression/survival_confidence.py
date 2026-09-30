@@ -50,7 +50,10 @@ class SegmentSurvivalScorer(nn.Module):
         causal = torch.ones(k, k, device=points.device, dtype=torch.bool).triu(1)
         for layer, kv in zip(self.layers, projected):
             query = layer.forward_cached(query, kv, padding, causal_mask=causal)
-        return self.failure(self.norm(query)).squeeze(-1).float()
+        # Preserve precision before thresholding/ranking proposals. Casting the
+        # logits after a BF16 projection cannot recover its rounding loss.
+        with torch.autocast(query.device.type, enabled=False):
+            return self.failure(self.norm(query.float())).squeeze(-1)
 
 
 def survival_predictions(hazard_logits):

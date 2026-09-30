@@ -82,8 +82,7 @@ def main():
         print('MEASURED '+json.dumps(row), flush=True)
         last_return = time.perf_counter()
         if len(rows) == args.updates:
-            raw = getattr(model, '_orig_mod', model)
-            saved = dict(staged, model=raw.state_dict(), ema=ema.state_dict(), optimizer=opt.state_dict(),
+            saved = dict(staged, model=model.state_dict(), ema=ema.state_dict(), optimizer=opt.state_dict(),
                          rng=training_rng_state(), step=step, samples_seen=ck.get('samples_seen', 0)+observed)
             torch.save(saved, destination/f'ckpt_{step:06d}.pt')
             raise BenchmarkComplete()

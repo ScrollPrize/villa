@@ -18,7 +18,7 @@ from vesuvius.neural_tracing.fiber_follow.regression.data import IdentityObserva
 from vesuvius.neural_tracing.fiber_follow.regression.identity_decisions import decision_pair
 from vesuvius.neural_tracing.fiber_follow.regression.supervision import loss_terms
 from vesuvius.neural_tracing.fiber_follow.regression.train import (
-    optimizer_update, save_checkpoint,
+    optimizer_update, save_checkpoint, prepare_training,
     load_checkpoint, checkpoint_config, build_parser,
 )
 from vesuvius.neural_tracing.fiber_follow.shared.data import SampleConfig
@@ -169,6 +169,7 @@ def test_training_sequence_checkpoint_and_optimizer_resume(tmp_path):
     ema = copy.deepcopy(model)
     opt = torch.optim.AdamW(model.parameters(), lr=.001)
     before = model.coordinates.weight.detach().clone()
+    prepare_training(model, backend='eager')
     metrics = optimizer_update(model, ema, opt, [chunk], 1, .001, device='cpu', compute_metrics=False)
     assert np.isfinite(metrics['loss'])
     assert not torch.equal(before, model.coordinates.weight)
@@ -230,6 +231,7 @@ def test_builder_streams_causal_main_crops_and_keeps_paired_endpoints_identical(
     torch.testing.assert_close(endpoints[0], endpoints[1], rtol=0, atol=0)
     model = build_model(c)
     ema, opt, states = copy.deepcopy(model), torch.optim.AdamW(model.parameters()), FeatureStreamStates()
+    prepare_training(model, backend='eager')
     for j, chunk in enumerate(chunks):
         metrics = optimizer_update(model, ema, opt, [chunk], j+1, .001, device='cpu',
                                    compute_metrics=False, stream_states=states)
@@ -342,6 +344,7 @@ def test_stream_ownership_reset_detach_and_eviction_across_optimizer_updates():
     from vesuvius.neural_tracing.fiber_follow.regression.feature_sequences import FeatureStreamStates
     model = build_model(cfg())
     ema, opt, states = copy.deepcopy(model), torch.optim.AdamW(model.parameters()), FeatureStreamStates()
+    prepare_training(model, backend='eager')
     with pytest.raises(ValueError, match='Missing carried'):
         states.incoming(model, training_chunk(model.cfg, start=2)['feature_sequence'][0], 'cpu')
     first = training_chunk(model.cfg)
@@ -363,13 +366,14 @@ def test_stream_ownership_reset_detach_and_eviction_across_optimizer_updates():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA unavailable')
 def test_compiled_feature_sequence_bf16_gradients_match_eager():
-    from vesuvius.neural_tracing.fiber_follow.regression.train import compile_training_model, conv_memory_format
+    from vesuvius.neural_tracing.fiber_follow.regression.train import prepare_training, conv_memory_format
     torch.manual_seed(77)
     eager = build_model(cfg()).to('cuda', memory_format=conv_memory_format('cuda'))
     compiled_base = copy.deepcopy(eager)
     chunk = training_chunk(eager.cfg)
     results = []
-    for model in (eager, compile_training_model(compiled_base)):
+    # Capture the same training graph without Inductor as the numerical oracle.
+    for model in (prepare_training(eager, backend='eager'), prepare_training(compiled_base)):
         results.append(optimizer_update(model, copy.deepcopy(eager), torch.optim.AdamW(model.parameters()),
             [chunk], 1, 0., device='cuda', compute_metrics=False, memory_grad_clip=0., rest_grad_clip=0.))
     assert results[0]['loss'] == pytest.approx(results[1]['loss'], rel=.02, abs=.002)

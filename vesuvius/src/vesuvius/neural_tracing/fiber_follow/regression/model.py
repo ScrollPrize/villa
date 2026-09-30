@@ -226,6 +226,29 @@ class PathDecoderLayer(nn.TransformerDecoderLayer):
         return tuple(v.reshape(len(memory), -1, heads, h//heads).transpose(1, 2).contiguous()
                      for v in kv.chunk(2, dim=-1))
 
+    def attend_memory(self, q, kv, padding):
+        """Remove excluded keys so CUDA AMP can use unmasked Flash attention.
+
+        This mask is key padding only: removing keys preserves softmax and
+        leaves query order (including causal candidate self-attention) intact.
+        Image/plane tokens guarantee at least one valid key in every row.
+        Other backends remain available on devices without Flash support.
+        """
+        if q.is_cuda and q.dtype in (torch.float16, torch.bfloat16):
+            k, v = kv
+            values = []
+            for row in range(q.shape[0]):
+                keep = (~padding[row]).nonzero().flatten()
+                torch._check(keep.numel() > 0)
+                with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.CUDNN_ATTENTION,
+                                  SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH], set_priority=True):
+                    values.append(F.scaled_dot_product_attention(q[row:row+1].contiguous(),
+                        k[row:row+1].index_select(2, keep), v[row:row+1].index_select(2, keep)))
+            return torch.cat(values, 0)
+        mask = torch.zeros(padding.shape, device=q.device, dtype=q.dtype).masked_fill(padding, -torch.inf)
+        with self.attention_backend(q):
+            return F.scaled_dot_product_attention(q, *kv, attn_mask=mask[:, None, None, :])
+
     def forward_cached(self, x, kv, padding, *, causal_mask=None):
         """The ordinary pre-norm decoder computation with already projected K/V."""
         if not self.norm_first or self.multihead_attn.dropout:
@@ -235,9 +258,7 @@ class PathDecoderLayer(nn.TransformerDecoderLayer):
         h, heads = attn.embed_dim, attn.num_heads
         q = F.linear(self.norm2(x), attn.in_proj_weight[:h], attn.in_proj_bias[:h])
         q = q.reshape(len(x), -1, heads, h//heads).transpose(1, 2).contiguous()
-        mask = torch.zeros(padding.shape, device=x.device, dtype=q.dtype).masked_fill(padding, -torch.inf)
-        with self.attention_backend(q):
-            value = F.scaled_dot_product_attention(q, *kv, attn_mask=mask[:, None, None, :])
+        value = self.attend_memory(q, kv, padding)
         value = value.transpose(1, 2).contiguous().reshape(len(x), -1, h)
         x = x+self.dropout2(attn.out_proj(value))
         return x+self._ff_block(self.norm3(x))

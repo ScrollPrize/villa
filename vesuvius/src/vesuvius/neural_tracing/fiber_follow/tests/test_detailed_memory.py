@@ -7,7 +7,7 @@ import torch
 from test_trajectory_memory import cfg, memory_batch, state_from, training_chunk
 from vesuvius.neural_tracing.fiber_follow.regression.model import build_model
 from vesuvius.neural_tracing.fiber_follow.regression.stratified_replay import stratified_indices
-from vesuvius.neural_tracing.fiber_follow.regression.train import optimizer_update
+from vesuvius.neural_tracing.fiber_follow.regression.train import optimizer_update, prepare_training
 from vesuvius.neural_tracing.fiber_follow.regression.feature_sequences import FeatureStreamStates
 
 
@@ -105,6 +105,7 @@ def test_replay_across_updates_keeps_selected_crops_only_and_evicts_finished_str
     torch.manual_seed(54)
     model = build_model(config())
     ema, opt, states = copy.deepcopy(model), torch.optim.AdamW(model.parameters()), FeatureStreamStates()
+    prepare_training(model, backend='eager')
     for start in (0, 2, 4):
         chunk = training_chunk(model.cfg, start=start, end=start == 4)
         for i, b in enumerate(chunk['feature_sequence']):
@@ -121,7 +122,9 @@ def test_replay_across_updates_keeps_selected_crops_only_and_evicts_finished_str
 def test_memory_with_adaptive_refinement_compiled_backward():
     model = build_model(config())
     b = memory_batch(model.cfg, 1)
-    out = torch.compile(model, backend='eager')(b['x'], b['hist'], b['hmask'])
+    from vesuvius.neural_tracing.fiber_follow.regression.train import prepare_training, training_prediction
+    prepare_training(model, backend='eager')
+    out = training_prediction(model, b['x'], b['hist'], b['hmask'])
     out['points'].square().mean().backward()
     assert model.encoder_memory_projection.weight.grad.abs().sum() > 0
     assert all(p.grad is None or torch.isfinite(p.grad).all() for p in model.parameters())
@@ -169,7 +172,7 @@ def test_fixed_candidate_scores_do_not_change_when_generator_changes():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA unavailable')
 def test_revision2_compiled_bf16_gradients_match_eager():
-    from vesuvius.neural_tracing.fiber_follow.regression.train import compile_training_model, move_batch
+    from vesuvius.neural_tracing.fiber_follow.regression.train import prepare_training, move_batch, training_prediction
     torch.manual_seed(57)
     eager = build_model(config()).cuda()
     compiled = copy.deepcopy(eager)
@@ -182,11 +185,12 @@ def test_revision2_compiled_bf16_gradients_match_eager():
     b['candidate_labels'][:, 0] = 1.
     losses = []
     predictions = []
-    for model in (eager, compile_training_model(compiled)):
+    for model in (eager, prepare_training(compiled)):
         with torch.autocast('cuda', dtype=torch.bfloat16):
-            out = model(b['x'], b['hist'], b['hmask'], candidates=candidates)
+            forward = (lambda *a, **kw: training_prediction(model, *a, **kw)) if model is compiled else model
+            out = forward(b['x'], b['hist'], b['hmask'], candidates=candidates)
             state = state_from(eager, out)
-            out = model(b['x'], b['hist'], b['hmask'], candidates=candidates, memory=state)
+            out = forward(b['x'], b['hist'], b['hmask'], candidates=candidates, memory=state)
             # Train every actual proposal, as the trainer does. Differentiating
             # only an argmax-selected proposal makes this numerical-gradient
             # test discontinuous at nearly tied BF16 confidence scores.

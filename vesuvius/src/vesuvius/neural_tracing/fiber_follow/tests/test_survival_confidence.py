@@ -21,6 +21,49 @@ def scoring_context(model, batch, memory=None):
     return ctx
 
 
+@pytest.mark.parametrize('device', ['cpu', pytest.param('cuda', marks=pytest.mark.skipif(
+    not torch.cuda.is_available(), reason='CUDA unavailable'))])
+def test_confidence_head_computes_fp32_inside_bf16_autocast(device):
+    torch.manual_seed(65)
+    cfg = config()
+    scorer = build_model(cfg).to(device).confidence_scorer
+    width = 27*(cfg.channels+1)+cfg.hidden+1
+    spatial = torch.randn(2, 4, 4, width, device=device, requires_grad=True)
+    points = torch.zeros(2, 4, 3, device=device)
+    points[..., 2] = torch.arange(1, 5, device=device)
+    memory = torch.randn(2, 9, cfg.hidden, device=device, requires_grad=True)
+    padding = torch.zeros(2, 9, device=device, dtype=torch.bool)
+    inputs = {}
+    def capture(name):
+        def hook(module, args):
+            assert not torch.is_autocast_enabled(device)
+            assert args[0].dtype == torch.float32
+            inputs[name] = args[0].detach()
+        return hook
+    hooks = [scorer.norm.register_forward_pre_hook(capture('norm')),
+             scorer.failure.register_forward_pre_hook(capture('failure'))]
+    try:
+        with torch.autocast(device, dtype=torch.bfloat16):
+            logits = scorer(spatial, points, scorer.project_memory(memory), padding)
+    finally:
+        for hook in hooks:
+            hook.remove()
+    expected = torch.nn.functional.linear(
+        torch.nn.functional.layer_norm(inputs['norm'], scorer.norm.normalized_shape,
+                                       scorer.norm.weight, scorer.norm.bias, scorer.norm.eps),
+        scorer.failure.weight, scorer.failure.bias).squeeze(-1)
+    assert logits.dtype == torch.float32
+    torch.testing.assert_close(logits, expected, rtol=0, atol=0)
+    assert not torch.equal(logits, logits.bfloat16().float())
+    values = (scorer.norm.weight, scorer.failure.weight)
+    # CPU oneDNN BF16 attention backward is not supported on every host.
+    # CUDA additionally checks gradients through the surrounding BF16 scorer.
+    if device == 'cuda':
+        values += (spatial, memory)
+    for grad in torch.autograd.grad(logits.square().mean(), values):
+        assert torch.isfinite(grad).all() and grad.abs().sum() > 0
+
+
 @pytest.mark.parametrize('training', [False, True])
 def test_replacing_truncating_or_extending_suffix_preserves_prefix(training):
     torch.manual_seed(61)

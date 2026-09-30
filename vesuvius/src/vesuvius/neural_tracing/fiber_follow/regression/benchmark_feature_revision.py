@@ -15,7 +15,7 @@ import torch
 
 from .model import build_model
 from .benchmark_memory import synthetic_batch
-from .train import checkpoint_config, compile_training_model, conv_memory_format, optimizer_update, move_batch
+from .train import checkpoint_config, prepare_training, conv_memory_format, optimizer_update, move_batch
 from .feature_sequences import FeatureStreamStates
 from .stratified_replay import stratified_indices, take_row
 
@@ -44,7 +44,6 @@ def main():
     ap.add_argument('--warmup', type=int, default=5)
     ap.add_argument('--repeats', type=int, default=20)
     ap.add_argument('--replay-length', type=int, default=0)
-    ap.add_argument('--eager', action='store_true')
     args = ap.parse_args()
     if min(args.warmup, args.repeats) < 1 or args.replay_length < 0 or args.replay_length == 1:
         ap.error('Positive repetitions and zero or at least two replay observations required')
@@ -56,7 +55,7 @@ def main():
     model.load_state_dict(ck['model'])
     ema = copy.deepcopy(model).requires_grad_(False).eval()
     opt = torch.optim.AdamW(model.parameters(), lr=.0003)
-    wrapped = model if args.eager else compile_training_model(model)
+    prepare_training(model)
     chunks = []
     for j in range(2):
         sequence = []
@@ -74,7 +73,7 @@ def main():
     def step(i):
         if replay:
             states.replay.pending.append(replay)
-        return optimizer_update(wrapped, ema, opt, chunks, i, .0003, device='cuda', n_commit=8,
+        return optimizer_update(model, ema, opt, chunks, i, .0003, device='cuda', n_commit=8,
                                 compute_metrics=False, stream_states=states)
 
     print('Starting warmup', flush=True)
@@ -93,7 +92,7 @@ def main():
         torch.cuda.synchronize()
         timings.append((time.perf_counter()-started)*1000)
     result = dict(checkpoint=args.checkpoint, config=cfg.to_dict(), hardware=torch.cuda.get_device_name(),
-        torch=torch.__version__, compiled=not args.eager, precision='BF16 encoder/decoder; FP32 memory',
+        torch=torch.__version__, compiled=True, precision='BF16 encoder/decoder; FP32 memory',
         effective_batch=8, microbatch=4, sequence_length=2, concurrent_traces=2,
         input='Fixed synthetic full-size CT/presence/directions, two candidate curves per crop; geometry and survival losses; includes AdamW, clipping, EMA; excludes volume IO',
         replay_length=args.replay_length, replay_endpoints_per_update=int(bool(replay)),

@@ -10,7 +10,7 @@ import torch
 from vesuvius.neural_tracing.fiber_follow.regression.model import DirectConfig, DirectFollower, feature_grid
 from vesuvius.neural_tracing.fiber_follow.regression.supervision import geometry_mask, loss_terms
 from vesuvius.neural_tracing.fiber_follow.regression.train import (
-    optimizer_update, save_checkpoint, load_checkpoint, validate_volume_source, clip_training_gradients,
+    optimizer_update, save_checkpoint, load_checkpoint, validate_volume_source, clip_training_gradients, prepare_training,
 )
 from vesuvius.neural_tracing.fiber_follow.regression.data import image_crop
 from vesuvius.neural_tracing.fiber_follow.shared.data import FollowDataset, SampleConfig, ZBand, training_state_allowed
@@ -125,6 +125,8 @@ def test_microbatch_partition_keeps_objective_and_update():
         return {k: take(v, sl) for k, v in value.items()} if isinstance(value, dict) else value[sl]
     averages = [copy.deepcopy(m) for m in (a, bmodel)]
     optimizers = [torch.optim.SGD(m.parameters(), lr=.001) for m in (a, bmodel)]
+    prepare_training(a, batch_size=3, backend='eager')
+    prepare_training(bmodel, batch_size=2, backend='eager')
     results = [optimizer_update(a, averages[0], optimizers[0], [data], 1, .001),
                optimizer_update(bmodel, averages[1], optimizers[1],
                                 [take(data, slice(0, 1)), take(data, slice(1, 3))], 1, .001)]
@@ -207,6 +209,7 @@ def test_nonfinite_microbatch_loss_raises_before_any_update():
     poisoned['x']['fine'] = torch.full_like(poisoned['x']['fine'], float('nan'))
     before = copy.deepcopy(model.state_dict())
     ema = copy.deepcopy(model)
+    prepare_training(model, backend='eager')
     with pytest.raises(FloatingPointError, match='Nonfinite loss at step 7'):
         optimizer_update(model, ema, torch.optim.SGD(model.parameters(), lr=.1),
                          [take(data, slice(0, 1)), poisoned], 7, .1)
@@ -216,17 +219,21 @@ def test_nonfinite_microbatch_loss_raises_before_any_update():
 
 def test_training_compilation_emulates_eager_bf16_rounding(monkeypatch):
     import torch._inductor.config
-    from vesuvius.neural_tracing.fiber_follow.regression.train import compile_training_model
+    from vesuvius.neural_tracing.fiber_follow.regression.train import prepare_training
     monkeypatch.setattr(torch._inductor.config, 'emulate_precision_casts', False)
     compiled = []
     monkeypatch.setattr(torch, 'compile', lambda module, **kwargs: compiled.append((module, kwargs)) or module)
     model = DirectFollower(config())
-    wrapped = compile_training_model(model)
-    assert wrapped._orig_mod is model
+    parameters, keys = list(model.parameters()), list(model.state_dict())
+    assert prepare_training(model) is model
+    assert not hasattr(model, '_orig_mod')
     assert [fn.__name__ for fn, _ in compiled] == [
         'training_forward', 'score_candidates', 'replay_observation_features', 'observe_tokens']
     assert all(options == dict(dynamic=False, fullgraph=True) for _, options in compiled)
-    assert list(wrapped.parameters()) == list(model.parameters())
+    assert list(model.parameters()) == parameters
+    assert list(model.state_dict()) == keys
+    assert prepare_training(model) is model
+    assert len(compiled) == 4  # Setup is idempotent.
     assert torch._inductor.config.emulate_precision_casts
 
 
@@ -237,6 +244,7 @@ def test_checkpoint_roundtrip_and_resume_optimizer_rng(tmp_path):
     ema = copy.deepcopy(m)
     opt = torch.optim.AdamW(m.parameters(), lr=.001)
     data = batch(cfg)
+    prepare_training(m, backend='eager')
     optimizer_update(m, ema, opt, [data], 1, .001)
     spec = FiberVolumeSpec('unused', ct_zarr='unused', ct_level=0, ct_grid_scale=4., inputs='ct+presence')
     sample = SampleConfig(crop=cfg.fine, n_history=cfg.n_history)
@@ -250,6 +258,7 @@ def test_checkpoint_roundtrip_and_resume_optimizer_rng(tmp_path):
     restored_ema = copy.deepcopy(restored)
     restored_opt = torch.optim.AdamW(restored.parameters(), lr=.001)
     assert resume_training(ck, restored, restored_ema, restored_opt)[0] == 1
+    prepare_training(restored, backend='eager')
     torch.testing.assert_close(torch.rand(3), expected_rng, rtol=0, atol=0)
     optimizer_update(m, ema, opt, [data], 2, .001)
     optimizer_update(restored, restored_ema, restored_opt, [data], 2, .001)
@@ -471,7 +480,9 @@ def test_diagnostic_logging_preserves_training_update_and_rng():
     for model, enabled in ((a, False), (bmodel, True)):
         torch.set_rng_state(rng)
         opt = torch.optim.SGD(model.parameters(), lr=.001)
-        results.append(optimizer_update(model, copy.deepcopy(model), opt, [data], 1, .001,
+        ema = copy.deepcopy(model)
+        prepare_training(model, backend='eager')
+        results.append(optimizer_update(model, ema, opt, [data], 1, .001,
                                         n_commit=2, compute_metrics=enabled))
         torch.testing.assert_close(torch.get_rng_state(), rng)
     assert 'decisions' not in results[0] and results[1]['decisions']['n_commit'] == 2

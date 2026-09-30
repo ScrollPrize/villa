@@ -11,7 +11,7 @@ from test_trajectory_memory import cfg, memory_batch, state_from, training_chunk
 from vesuvius.neural_tracing.fiber_follow.regression.model import build_model, PathDecoderLayer
 from vesuvius.neural_tracing.fiber_follow.regression.supervision import loss_terms
 from vesuvius.neural_tracing.fiber_follow.regression.train import (
-    checkpoint_config, optimizer_update, build_parser, compile_training_model,
+    checkpoint_config, optimizer_update, build_parser, prepare_training, training_prediction,
 )
 from vesuvius.neural_tracing.fiber_follow.shared.runloop import resume_training, training_rng_state
 
@@ -105,8 +105,8 @@ def test_bounds_and_masked_geometry():
 def test_adaptive_refinement_compiles_and_backpropagates():
     model = build_model(cfg(recurrent_refinement_steps=1))
     b = memory_batch(model.cfg)
-    wrapped = torch.compile(model, backend='eager')
-    out = wrapped(b['x'], b['hist'], b['hmask'])
+    prepare_training(model, backend='eager')
+    out = training_prediction(model, b['x'], b['hist'], b['hmask'])
     loss_terms(out, b, model.cfg)['geometry_per_state'].mean().backward()
     assert torch.isfinite(model.coordinates.weight.grad).all()
 
@@ -122,7 +122,7 @@ def test_compiled_refinement_bf16_two_decision_gradients():
     compiled = copy.deepcopy(eager)
     chunk = [move_batch(b, 'cuda') for b in training_chunk(c)['feature_sequence']]
     losses = []
-    for model in (eager, compile_training_model(compiled)):
+    for model in (eager, prepare_training(compiled)):
         state = None
         loss = 0
         with torch.autocast('cuda', dtype=torch.bfloat16):
@@ -133,8 +133,8 @@ def test_compiled_refinement_bf16_two_decision_gradients():
                 b['candidate_mask'] = torch.ones_like(candidates[..., 0], dtype=torch.bool)
                 b['candidate_labels'] = torch.zeros_like(candidates[..., 0])
                 b['candidate_labels'][:, 0] = 1.
-                out = model(b['x'], b['hist'], b['hmask'], memory=state,
-                            candidates=candidates)
+                forward = (lambda *a, **kw: training_prediction(model, *a, **kw)) if model is compiled else model
+                out = forward(b['x'], b['hist'], b['hmask'], memory=state, candidates=candidates)
                 state = state_from(eager, out)
                 terms = loss_terms(out, b, c)
                 loss = (loss+terms['geometry_per_state'].mean()+terms['confidence_per_state'].mean()

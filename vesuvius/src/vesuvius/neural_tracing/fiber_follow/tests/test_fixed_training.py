@@ -6,10 +6,19 @@ import torch
 
 from test_trajectory_memory import cfg, memory_batch, state_from, training_chunk
 from vesuvius.neural_tracing.fiber_follow.regression.model import build_model
-from vesuvius.neural_tracing.fiber_follow.regression.train import compile_training_model, optimizer_update
+from vesuvius.neural_tracing.fiber_follow.regression.train import (
+    prepare_training, optimizer_update, training_prediction, training_observation_features,
+    training_memory_transition, begin_training_update, finish_training_update,
+)
 from vesuvius.neural_tracing.fiber_follow.regression.supervision import loss_terms
 from vesuvius.neural_tracing.fiber_follow.regression.feature_sequences import FeatureStreamStates
-from vesuvius.neural_tracing.fiber_follow.regression.compiled_training import pack_feature_chunks
+from vesuvius.neural_tracing.fiber_follow.regression.train import pack_feature_chunks
+
+
+def predict(model, *args, **kwargs):
+    # The adaptive inference implementation is an independent numerical oracle.
+    return (training_prediction(model, *args, **kwargs) if hasattr(model, 'training_batch_size')
+            else model(*args, **kwargs))
 
 
 def compare_gradients(left, right):
@@ -20,7 +29,21 @@ def compare_gradients(left, right):
             torch.testing.assert_close(p.grad, q.grad, rtol=3e-4, atol=2e-6, msg=name)
 
 
-def test_one_crop_graph_across_rows_memory_candidates_and_acceptance():
+def test_remote_seed_uses_training_operations_with_matching_gradients():
+    torch.manual_seed(114)
+    reference = build_model(cfg(recurrent_refinement_steps=0))
+    model = prepare_training(copy.deepcopy(reference), backend='eager')
+    batch = memory_batch(model.cfg, 1, step=1)
+    batch['x']['feature_seed_x'] = memory_batch(model.cfg, 1)['x']
+    outputs = [predict(m, batch['x'], batch['hist'], batch['hmask']) for m in (reference, model)]
+    for name in ('points', 'hazard_logits', 'memory_slots', 'memory_anchor'):
+        torch.testing.assert_close(outputs[0][name], outputs[1][name], rtol=3e-4, atol=2e-6)
+    for out in outputs:
+        (out['points'].square().mean()+out['hazard_logits'].square().mean()).backward()
+    compare_gradients(reference, model)
+
+
+def test_bounded_crop_graphs_across_rows_memory_candidates_and_acceptance():
     torch.manual_seed(111)
     eager = build_model(cfg(recurrent_refinement_steps=2))
     raw = copy.deepcopy(eager)
@@ -28,7 +51,7 @@ def test_one_crop_graph_across_rows_memory_candidates_and_acceptance():
     def backend(graph, inputs):
         graphs.append(graph)
         return graph.forward
-    compiled = compile_training_model(raw, backend=backend)
+    compiled = prepare_training(raw, backend=backend)
     for count, detached, scored, threshold in (
             (2, False, False, 1.), (1, True, True, 0.),
             (1, False, False, .5), (2, True, True, .5),
@@ -42,12 +65,12 @@ def test_one_crop_graph_across_rows_memory_candidates_and_acceptance():
         for model in (eager, compiled):
             model.zero_grad(set_to_none=True)
             if model is compiled:
-                model.begin_update()
-            old = model(batch['x'], batch['hist'], batch['hmask'], confidence_threshold=threshold)
+                begin_training_update(model)
+            old = predict(model, batch['x'], batch['hist'], batch['hmask'], confidence_threshold=threshold)
             state = state_from(eager, old)
             if detached:
                 state = {key: value.detach() for key, value in state.items()}
-            out = model(batch['x'], batch['hist'], batch['hmask'], memory=state,
+            out = predict(model, batch['x'], batch['hist'], batch['hmask'], memory=state,
                         candidates=candidates if scored else None, confidence_threshold=threshold)
             terms = loss_terms(out, batch, eager.cfg)
             loss = terms['geometry_per_state'].sum()+.5*terms['confidence_per_state'].sum()
@@ -55,7 +78,7 @@ def test_one_crop_graph_across_rows_memory_candidates_and_acceptance():
                 loss = loss+out['candidate_hazard_logits'].square().mean()
             loss.backward()
             if model is compiled:
-                model.finish_update()
+                finish_training_update(model)
             outputs.append(out)
         for name in ('points', 'confidence', 'hazard_logits'):
             torch.testing.assert_close(outputs[0][name], outputs[1][name], rtol=1e-5, atol=1e-6)
@@ -63,7 +86,7 @@ def test_one_crop_graph_across_rows_memory_candidates_and_acceptance():
         assert torch.equal(outputs[0]['refinement_mask'], outputs[1]['refinement_mask'][:, :used])
         assert not outputs[1]['refinement_mask'][:, used:].any()
         compare_gradients(eager, raw)
-    assert len(graphs) == 2  # One crop graph; one optional candidate-scoring graph.
+    assert len(graphs) == 4  # Crop and candidate graphs, each for batches 1 and 2.
 
 
 def test_replay_has_one_encoder_and_one_transition_graph():
@@ -73,15 +96,15 @@ def test_replay_has_one_encoder_and_one_transition_graph():
     def backend(graph, inputs):
         graphs.append(graph)
         return graph.forward
-    model = compile_training_model(raw, backend=backend)
+    model = prepare_training(raw, backend=backend)
     batch = memory_batch(raw.cfg, 1)
     pose = {key: batch['x'][key] for key in ('query_position', 'query_frame', 'feature_seed_here')}
     state = None
     for i in range(4):
-        features = model.replay_observation_features(batch['x'], batch['hist'], batch['hmask'])
+        features = training_observation_features(model, batch['x'], batch['hist'], batch['hmask'])
         if i % 2:
             features = tuple(value.detach() for value in features)
-        state, _ = model.replay_transition(*features, pose, state)
+        state, _ = training_memory_transition(model, *features, pose, state)
     state['slots'].square().sum().backward()
     assert len(graphs) == 2
     assert raw.encoder.stem[0].weight.grad.abs().sum() > 0
@@ -94,13 +117,13 @@ def test_cuda_replay_checkpoint_gradients_and_graph_reuse():
     torch.manual_seed(116)
     eager = build_model(cfg(recurrent_refinement_steps=2)).cuda()
     raw = copy.deepcopy(eager)
-    compiled = compile_training_model(raw)
+    compiled = prepare_training(raw)
     batch = move_batch(memory_batch(raw.cfg, 1), 'cuda')
     pose = {key: batch['x'][key] for key in ('query_position', 'query_frame', 'feature_seed_here')}
     before = counters['stats']['unique_graphs']
     losses = []
     for model in (eager, compiled):
-        transition = (model.replay_transition if model is compiled else
+        transition = ((lambda *args: training_memory_transition(model, *args)) if model is compiled else
                       model.recurrent_memory.observe_tokens)
         # Backward recomputes the encoder, then a second replay must reuse it.
         for repeat in range(2):
@@ -108,7 +131,7 @@ def test_cuda_replay_checkpoint_gradients_and_graph_reuse():
             state = None
             with torch.autocast('cuda', dtype=torch.bfloat16):
                 for i in range(3):
-                    features = model.replay_observation_features(batch['x'], batch['hist'], batch['hmask'])
+                    features = training_observation_features(model, batch['x'], batch['hist'], batch['hmask'])
                     if i == 1:
                         features = tuple(value.detach() for value in features)
                     state, retrieved = transition(*features, pose, state)
@@ -128,7 +151,7 @@ def test_partial_acceptance_keeps_policy_and_geometry_gradients():
     torch.manual_seed(115)
     eager = build_model(cfg(recurrent_refinement_steps=2))
     raw = copy.deepcopy(eager)
-    compiled = compile_training_model(raw, backend='eager')
+    compiled = prepare_training(raw, backend='eager')
     batch = memory_batch(eager.cfg, 2)
     with torch.no_grad():
         confidence = eager(batch['x'], batch['hist'], batch['hmask'])['refinement_confidence'][:, 0, -1]
@@ -136,7 +159,7 @@ def test_partial_acceptance_keeps_policy_and_geometry_gradients():
     threshold = float(confidence.mean())
     predictions = []
     for model in (eager, compiled):
-        out = model(batch['x'], batch['hist'], batch['hmask'], confidence_threshold=threshold)
+        out = predict(model, batch['x'], batch['hist'], batch['hmask'], confidence_threshold=threshold)
         terms = loss_terms(out, batch, eager.cfg)
         (terms['geometry_per_state'].sum()+terms['confidence_per_state'].sum()).backward()
         predictions.append(out)
@@ -173,10 +196,13 @@ def test_masked_retries_preserve_adamw_skipped_parameter_updates():
     torch.manual_seed(113)
     eager = build_model(cfg(recurrent_refinement_steps=2, feature_replay_weight=0.))
     raw = copy.deepcopy(eager)
-    compiled = compile_training_model(raw, backend='eager')
+    compiled = prepare_training(raw, backend='eager')
+    prepare_training(eager, backend='eager')
     models = (eager, compiled)
     optimizers = [torch.optim.AdamW(model.parameters(), lr=.001, weight_decay=.1) for model in models]
-    emas = [copy.deepcopy(eager), copy.deepcopy(raw)]
+    emas = [build_model(eager.cfg), build_model(eager.cfg)]
+    for ema in emas:
+        ema.load_state_dict(raw.state_dict())
     # Populate identical momentum, then accept every initial proposal. A zero
     # grad would incorrectly decay parameters and advance optimizer moments.
     for model, opt in zip(models, optimizers):
@@ -203,7 +229,7 @@ def test_packed_stream_gradients_and_detach_match_unpacked_training():
     torch.manual_seed(114)
     eager = build_model(cfg(recurrent_refinement_steps=2, feature_replay_weight=0.))
     raw = copy.deepcopy(eager)
-    compiled = compile_training_model(raw, backend='eager')
+    compiled = prepare_training(raw, backend='eager')
     chunks = [training_chunk(eager.cfg)]
     # Separate independent rows into the partial chunks emitted by workers.
     partial = []
@@ -212,6 +238,7 @@ def test_packed_stream_gradients_and_detach_match_unpacked_training():
                 for key, value in batch.items()}
     for j in range(2):
         partial.append(dict(feature_sequence=[row(batch, j) for batch in chunks[0]['feature_sequence']]))
+    prepare_training(eager, batch_size=1, backend='eager')
     states = [FeatureStreamStates(), FeatureStreamStates()]
     metrics = []
     for model, carried in zip((eager, compiled), states):

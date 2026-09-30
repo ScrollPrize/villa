@@ -54,14 +54,11 @@ class StratifiedReplay:
 
     def backward(self, model, total, *, device, tolerance, n_commit, confidence_weight,
                  candidate_weight):
-        from .train import move_batch
+        from .train import (move_batch, training_prediction, training_observation_features,
+                            training_memory_transition)
         from .supervision import commit_window, loss_terms, weighted_state_sum
-        raw = getattr(model, '_orig_mod', model)
-        weight = raw.cfg.feature_replay_weight
+        weight = model.cfg.feature_replay_weight
         metrics = dict(replay_endpoints=0, replay_observations=0, replay_encoder_crops=0, replay_loss=0.)
-        transition = (model.replay_transition if hasattr(model, 'replay_transition') else
-                      raw.recurrent_memory.observe_tokens)
-        encode = model.replay_observation_features
         while self.pending:
             rows = self.pending.pop(0)
             if len(rows) < 2 or not weight:
@@ -73,18 +70,18 @@ class StratifiedReplay:
                         batch = move_batch(row['batch'], device)
                         # Checkpoint only selected image encodings. Do not detach
                         # the recurrent state between selected observations.
-                        features = encode(batch['x'], batch['hist'], batch['hmask'])
+                        features = training_observation_features(model, batch['x'], batch['hist'], batch['hmask'])
                         metrics['replay_encoder_crops'] += 1
                     else:
                         features = row['features']
                     pose = move_batch(row['pose'], device)
-                    state, _ = transition(*features, pose, state)
+                    state, _ = training_memory_transition(model, *features, pose, state)
                 batch = move_batch(rows[-1]['batch'], device)
                 score = 'candidate_points' in batch and rows[-1]['batch']['candidate_mask'].any()
                 kwargs = dict(candidates=batch['candidate_points']) if score else {}
-                output = model(batch['x'], batch['hist'], batch['hmask'], memory=state,
-                               n_commit=commit_window(raw.cfg, n_commit), **kwargs)
-                terms = loss_terms(output, batch, raw.cfg, tolerance, n_commit=n_commit)
+                output = training_prediction(model, batch['x'], batch['hist'], batch['hmask'], memory=state,
+                               n_commit=commit_window(model.cfg, n_commit), **kwargs)
+                terms = loss_terms(output, batch, model.cfg, tolerance, n_commit=n_commit)
                 loss = weighted_state_sum(terms['geometry_per_state'], batch)+confidence_weight*weighted_state_sum(terms['confidence_per_state'], batch)
                 if 'candidate_per_state' in terms:
                     loss = loss+candidate_weight*weighted_state_sum(terms['candidate_per_state'], batch)
