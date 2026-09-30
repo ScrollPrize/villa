@@ -352,6 +352,20 @@ class FetchFailureTests(unittest.TestCase):
                            "every pixel of the reference render is the same value, so the surface "
                            "is probably outside the volume and nothing was sampled")
 
+    def test_zarr_metadata_lists_only_requested_pyramid_levels(self):
+        url = self.serving(0, NEVER_FAIL)
+        for pyramid in (False, True):
+            for pre in (False, True):
+                with self.subTest(pyramid=pyramid, pre=pre):
+                    out = self.root / ("levels_%s_%s.zarr" % (pyramid, pre))
+                    options = ("--pyramid", str(pyramid).lower()) + (("--pre",) if pre else ())
+                    r = self.render(url, "--zarr-output", out, extra=options)
+                    self.assertEqual(r.returncode, 0, r.stderr[-400:])
+                    attrs = json.loads((out / ".zattrs").read_text())
+                    paths = [d["path"] for d in attrs["multiscales"][0]["datasets"]]
+                    self.assertEqual(paths, [str(i) for i in range(6 if pyramid else 1)])
+                    self.assertTrue(all((out / p / ".zarray").is_file() for p in paths))
+
     def test_zarr_output_records_render_provenance(self):
         url = self.serving(0, NEVER_FAIL)
         out = self.root / "provenance.zarr"

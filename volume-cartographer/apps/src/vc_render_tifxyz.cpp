@@ -2056,7 +2056,7 @@ int main(int argc, char *argv[])
                 writeZarrAttrs(outFilePath, attrsVolumePath, group_idx, baseZ, slice_step, accum_step,
                                accum_type_str, accumOffsets.size(), attrXY, baseZ, CH, CW,
                                render_level_voxel_size, zarr_voxel_unit, tgt_scale,
-                               &extraAttributes);
+                               &extraAttributes, wantPyramid);
                 return true;
             } else if (numParts > 1) {
                 if (!std::filesystem::exists(std::filesystem::path(zarrOutputArg) / "0" / ".zarray")) {
@@ -2278,7 +2278,7 @@ int main(int argc, char *argv[])
                 writeZarrAttrs(outFilePath, attrsVolumePath, group_idx, baseZ, slice_step, accum_step,
                                accum_type_str, accumOffsets.size(), attrXY, baseZ, CH, CW,
                                render_level_voxel_size, zarr_voxel_unit, tgt_scale,
-                               &extraAttributes);
+                               &extraAttributes, wantPyramid);
             }
         }
         return true;

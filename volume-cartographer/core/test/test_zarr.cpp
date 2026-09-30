@@ -274,6 +274,18 @@ TEST_CASE("buildMultiscales writes relative pyramid scaling when the size is unk
     CHECK(ms["datasets"][size_t(0)]["coordinateTransformations"][size_t(1)]["type"] == "translation");
 }
 
+TEST_CASE("buildMultiscales omits disabled pyramid levels without changing level zero")
+{
+    for (const double size : {0.0, 8.0}) {
+        const auto full = buildMultiscales(size, "micrometer", 3.0, 2.0);
+        const auto base = buildMultiscales(size, "micrometer", 3.0, 2.0, false);
+        REQUIRE(full["datasets"].size() == 6);
+        REQUIRE(base["datasets"].size() == 1);
+        CHECK(base["datasets"][size_t(0)].dump() == full["datasets"][size_t(0)].dump());
+        CHECK(base["axes"].dump() == full["axes"].dump());
+    }
+}
+
 TEST_CASE("buildMultiscales keeps the physical scale and unit when the size is known")
 {
     // The known-size path must be untouched by the unknown-size fix: same
