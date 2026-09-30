@@ -21,10 +21,10 @@ class DirectTrainingInterval:
     counts = ('error_sum', 'geometry_count', 'point_correct_count', 'point_wrong_count',
               'point_unknown_count', 'replay_endpoints', 'replay_observations', 'replay_encoder_crops',
               'confidence_labeled_states', 'confidence_departed_states')
-    nested_counts = {'identity': ('identity_count', 'identity_rank_correct', 'candidate_states'),
+    nested_counts = {'identity': ('candidate_states',),
                      'memory': ('identity_count', 'identity_correct', 'departed_count',
                                 'departed_correct', 'offset_count', 'offset_error_sum')}
-    nested_means = {'identity': ('identity_loss', 'candidate_loss'),
+    nested_means = {'identity': ('candidate_loss',),
                     'memory': ('probe_identity_loss', 'probe_offset_loss')}
 
     def __init__(self):
@@ -81,8 +81,7 @@ def _interval_training_lines(row):
                  f" (loss {m['replay_loss']:.4f})")
     lines.append(f"  scored crops: candidates {_rate(m['identity_candidate_states'], m['crops'])}"
                  f" | departed {_rate(m.get('confidence_departed_states', 0), m.get('confidence_labeled_states', 0))}")
-    lines.append(f"  identity: rank {_rate(m['identity_identity_rank_correct'], m['identity_identity_count'])}"
-                 f" | InfoNCE {m['identity_identity_loss']:.4f} | candidate BCE {m['identity_candidate_loss']:.4f}"
+    lines.append(f"  candidate survival loss {m['identity_candidate_loss']:.4f}"
                  f" ({int(m['identity_candidate_states'])} eligible crops)")
     lines.append('  data: '+' / '.join(f'{name} {m[key]:.0%}' for name, key in
                  (('fresh','fresh_fraction'), ('recent','recent_fraction'),
@@ -164,11 +163,7 @@ def _direct_training_lines(row):
 
 
 def _identity_lines(stats):
-    lines = [f"  identity: InfoNCE {stats.get('identity_loss', 0.):.4f} | rank "
-             +_rate(stats.get('identity_rank_correct', 0), stats.get('identity_count', 0))
-             +f" | scored states {int(stats.get('identity_states', 0))}"
-             +f" ({stats.get('eligible_fraction', 0.):.1%} eligible)"
-             +f" | identity-aware prefix correct {stats.get('identity_prefix_correct_fraction', 0.):.1%}"
+    lines = [f"  identity-aware prefix correct {stats.get('identity_prefix_correct_fraction', 0.):.1%}"
              +f" | labels flipped {int(stats.get('identity_flipped_count', 0))}",
              f"  identity data: presence dropped {stats.get('presence_dropped_fraction', 0.):.0%}"
              f" | neighbor coverage {stats.get('foreign_components_fraction', 0.):.0%}"
@@ -176,27 +171,14 @@ def _identity_lines(stats):
                       if key.startswith('location_') and key.endswith('_fraction'))]
     if 'blurred_fraction' in stats:
         lines[-1] += f" | blurred {stats['blurred_fraction']:.0%}"
-    if 'ranking' in stats:
-        lines.append('  history-vs-neighbor ranking: '+' | '.join(
-            f"{name} {_rate(v['correct'], v['pairs'])}" for name, v in stats['ranking'].items() if v['pairs']))
-    if 'identity_loss_eligible' in stats:
-        lines.append(f"  InfoNCE per eligible state {stats['identity_loss_eligible']:.4f}"
-                     +f" | observed seed present {stats.get('seed_present_fraction', 0.):.0%}")
     if 'candidate_loss' in stats:
-        lines.append(f"  candidate BCE {stats['candidate_loss']:.4f}"
+        lines.append(f"  candidate survival loss {stats['candidate_loss']:.4f}"
                      +f" | per eligible state {stats['candidate_loss_eligible']:.4f}")
     for name, group in stats.get('candidate_decisions', {}).items():
         if group['states']:
             lines.append(f"  identity decisions {name}: correct accepted "
                          +_rate(group['accepted_positive'], group['positive'])
                          +" | wrong rejected "+_rate(group['rejected_negative'], group['negative']))
-    for name,group in stats.get('training_groups',{}).items():
-        if group['states']:
-            lines.append(f"  identity {name}: {_rate(group['eligible_states'],group['states'])} eligible"
-                         f" | paths/positive {group['distinct_paths_per_positive']:.2f}"
-                         f" | recent/seed {group['recent_states']}/{group['seed_states']}"
-                         f" | geometry {group['geometry_mean']:.4f} | confidence {group['confidence_mean']:.4f}"
-                         f" | InfoNCE {group['identity_mean']:.4f}")
     return lines
 
 

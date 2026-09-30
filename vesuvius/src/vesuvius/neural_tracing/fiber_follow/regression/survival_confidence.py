@@ -3,11 +3,11 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from .model import PathDecoderLayer, IDENTITY_EVIDENCE_WIDTH
+from .model import PathDecoderLayer
 
 
 class SegmentSurvivalScorer(nn.Module):
-    # V4 proposals occupy fixed forward planes. Four samples per incoming
+    # Proposals occupy fixed forward planes. Four samples per incoming
     # segment match the default labels' quarter-forward-voxel resolution.
     samples_per_segment = 4
 
@@ -15,8 +15,8 @@ class SegmentSurvivalScorer(nn.Module):
         super().__init__()
         h = cfg.hidden
         evidence_width = 27*(cfg.channels+1)+h+1
-        # Ordered image samples, start/end/displacement/length, reference evidence.
-        width = self.samples_per_segment*evidence_width+10+IDENTITY_EVIDENCE_WIDTH
+        # Ordered image samples, start/end/displacement/length.
+        width = self.samples_per_segment*evidence_width+10
         self.query = nn.Sequential(nn.LayerNorm(width), nn.Linear(width, h), nn.SiLU())
         self.layers = nn.ModuleList(PathDecoderLayer(h, cfg.heads, 2*h, dropout=0.,
             activation='gelu', batch_first=True, norm_first=True) for _ in range(2))
@@ -33,11 +33,11 @@ class SegmentSurvivalScorer(nn.Module):
     def project_memory(self, memory):
         return [layer.project_memory(memory) for layer in self.layers]
 
-    def forward(self, spatial, points, comparison, projected, padding):
+    def forward(self, spatial, points, projected, padding):
         start = torch.cat((torch.zeros_like(points[:, :1]), points[:, :-1]), 1)
         delta = points-start
         geometry = torch.cat((start, points, delta, delta.norm(dim=-1, keepdim=True)), -1)/16.
-        query = self.query(torch.cat((spatial.flatten(2), geometry, comparison), -1))
+        query = self.query(torch.cat((spatial.flatten(2), geometry), -1))
         # Only the proposed path is causal. Cross-attention reads all observed
         # image/reference/memory tokens; no generator hidden state enters here.
         k = points.shape[1]

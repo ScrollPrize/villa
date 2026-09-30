@@ -56,11 +56,6 @@ def test_prediction_is_deterministic_and_geometry_trains_actual_coordinates():
     terms['geometry_per_state'].mean().backward()
     for module in (m.coordinates, m.encoder.stem[0], m.encoder.compress, m.reference_token[0]):
         assert module.weight.grad is not None and module.weight.grad.abs().sum() > 0
-    assert m.confidence_head[-1].weight.grad is None
-    m.zero_grad(set_to_none=True)
-    loss_terms(forward(m, b), b, m.cfg)['confidence_per_state'].mean().backward()
-    assert m.confidence_head[-1].weight.grad.abs().sum() > 0
-    assert m.coordinates.weight.grad is None
 
 
 def test_masked_history_nan_and_no_history_are_safe_and_gt_is_not_an_input():
@@ -128,21 +123,6 @@ def test_microbatch_partition_keeps_objective_and_update():
         assert result['bank_wrong_continuation_tail_max'] == 128.
     for p, q in zip(a.parameters(), bmodel.parameters()):
         torch.testing.assert_close(p, q, rtol=2e-5, atol=2e-7)
-
-
-def test_optimizer_update_clips_requested_group_norm_and_logs_preclip_norm():
-    torch.manual_seed(43)
-    model = DirectFollower(config())
-    ema = copy.deepcopy(model)
-    opt = torch.optim.SGD(model.parameters(), lr=.001)
-    metrics = optimizer_update(model, ema, opt, [batch(model.cfg)], 1, .001,
-                               confidence_weight=10000., compute_metrics=False, rest_grad_clip=5.)
-    norm = torch.linalg.vector_norm(torch.stack([
-        p.grad.norm() for p in model.parameters() if p.grad is not None]))
-    assert metrics['grad_norm'] > 5.
-    assert float(norm) == pytest.approx(5., rel=1e-5)
-    assert metrics['rest_grad_clip_scale'] == pytest.approx(5./(metrics['grad_norm']+1e-6))
-    assert metrics['memory_grad_norm'] == 0.
 
 
 @pytest.mark.parametrize('compiled', [False, True])

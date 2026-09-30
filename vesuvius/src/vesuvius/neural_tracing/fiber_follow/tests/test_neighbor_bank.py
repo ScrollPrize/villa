@@ -13,7 +13,6 @@ import torch
 
 from vesuvius.neural_tracing.fiber_follow.regression.data import IdentityObservationBuilder, IdentitySampling
 from vesuvius.neural_tracing.fiber_follow.regression.model import DirectConfig, sample_features
-from vesuvius.neural_tracing.fiber_follow.regression.supervision import identity_terms
 from vesuvius.neural_tracing.fiber_follow.regression.neighbor_bank import NeighborBank
 from vesuvius.neural_tracing.fiber_follow.regression.neighbor_bulk import digest, pack_paths, write_json
 from vesuvius.neural_tracing.fiber_follow.regression.neighbor_mining import MiningConfig

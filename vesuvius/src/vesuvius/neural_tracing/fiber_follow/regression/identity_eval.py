@@ -7,9 +7,6 @@
       --checkpoint output/direct_refined_run1/last.pt --subset EVAL/ambiguous.json --out EVAL/baseline
   python -m vesuvius.neural_tracing.fiber_follow.regression.identity_eval rollouts \\
       --checkpoint RUN/last.pt --subset EVAL/ambiguous.json --out EVAL/identity --baseline-rows EVAL/baseline/rows_c0.500.json
-  # identity checkpoints only: held-out ranking and appearance-token ablation
-  python -m vesuvius.neural_tracing.fiber_follow.regression.identity_eval embedding \\
-      --checkpoint RUN/last.pt --subset EVAL/ambiguous.json --out EVAL/identity
 
 Rollout scoring is the shared monitor scoring (``score_trace`` with a capped
 denominator). Identity metrics are versioned separately (``identity_version``).
@@ -24,16 +21,15 @@ import numpy as np
 from scipy.spatial import cKDTree
 import torch
 
-from vesuvius.neural_tracing.fiber_follow.shared.data import SampleConfig, ZBand, fiber_manifest, load_fibers, make_sample, split_fibers
+from vesuvius.neural_tracing.fiber_follow.shared.data import ZBand, fiber_manifest, load_fibers, split_fibers
 from vesuvius.neural_tracing.fiber_follow.shared.evaluate import evaluate, trace_events
 from vesuvius.neural_tracing.fiber_follow.shared.experiment import jsonable, paired_bootstrap, read_manifest, rollout_summary
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import interp_at
 from vesuvius.neural_tracing.fiber_follow.shared.trace import TraceParams
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume
-from vesuvius.neural_tracing.fiber_follow.regression.data import DirectTracer, IdentityObservationBuilder, traversal
-from vesuvius.neural_tracing.fiber_follow.regression.diagnostics import identity_ranking, summarize_ranking
+from vesuvius.neural_tracing.fiber_follow.regression.data import DirectTracer, traversal
 from vesuvius.neural_tracing.fiber_follow.regression.model import DirectConfig
-from vesuvius.neural_tracing.fiber_follow.regression.train import load_checkpoint, move_batch, validate_volume_source
+from vesuvius.neural_tracing.fiber_follow.regression.train import load_checkpoint, validate_volume_source
 
 IDENTITY_VERSION = 1
 FIBERS = '/mnt/raid_nvme/spiral_dataset_working/fibers'
@@ -229,79 +225,14 @@ def logged_rollouts(tracer, val, seeds, max_len):
     return rows, paths, logged
 
 
-@torch.no_grad()
-def run_embedding(args):
-    """Held-out ranking by history distance, and appearance-token ablation on ambiguous states."""
-    manifest = read_manifest(args.manifest)
-    subset = read_subset(args.subset, manifest)
-    model, crop, nh, spec, ck = load_checkpoint(args.checkpoint, args.device)
-    _, val = load_split(args.fibers, manifest, spec.grid_scale)
-    cfg = model.cfg
-    from vesuvius.neural_tracing.fiber_follow.regression.neighbor_bank import NeighborBank
-    bank = NeighborBank(args.negative_bank,val,ZBand(45000/spec.grid_scale,48500/spec.grid_scale),
-                        grid_scale=spec.grid_scale,training=False)
-    bank.validate_volume(spec)
-    from vesuvius.neural_tracing.fiber_follow.regression.data import IdentitySampling
-    sampling = IdentitySampling(**(ck.get('identity_sampling') or {}))
-    builder = IdentityObservationBuilder(cfg, val,sampling,negative_bank=bank)
-    sample = SampleConfig(crop=cfg.fine, n_history=cfg.n_history, n_future=cfg.n_future, recent_history_points=cfg.n_history,
-                          no_history_prob=0., short_history_prob=0.)
-    rng = np.random.default_rng(20260926)
-    vol = FiberVolume(spec)
-    items = []
-    for row in subset[args.split]:
-        f = val[row['fiber']]
-        reverse = row['sign'] < 0
-        for offset in (-8., 0., 8.):
-            arc = row['t']+row['sign']*(row['arc']+offset)
-            if not 0 <= arc <= f.length:
-                continue
-            t = f.length-arc if reverse else arc
-            item = make_sample(f, t, reverse, sample, rng)
-            item.update(fiber_ref=(row['fiber'], t, reverse), source=0, source_step=-1, stratum=-1)
-            items.append(builder.prepare(item, f, rng))
-    rankings, shifts = [], dict(masked=[], shuffled=[])
-    for offset in range(0, len(items), 4):
-        batch = move_batch(builder(items[offset:offset+4], vol), args.device)
-        with torch.autocast('cuda', dtype=torch.bfloat16, enabled=args.device.startswith('cuda')):
-            out = model(batch['x'], batch['hist'], batch['hmask'], queries=batch['identity_points'])
-            rankings.append(identity_ranking(out, batch, cfg))
-            for name in shifts:
-                x = dict(batch['x'])
-                hist,hmask = batch['hist'],batch['hmask']
-                if name == 'masked':
-                    x['seed_mask'] = torch.zeros_like(x['seed_mask'])
-                    hmask = torch.zeros_like(hmask)
-                else:
-                    for key in ('seed','seed_mask','seed_age','seed_tangent'):
-                        x[key] = x[key].roll(1,0)
-                    hist,hmask = hist.roll(1,0),hmask.roll(1,0)
-                other = model(x,hist,hmask)
-                shifts[name].append(dict(
-                    points=(other['points'][:, :4, :2]-out['points'][:, :4, :2]).float().norm(dim=-1).mean(1).cpu(),
-                    confidence=(other['confidence'][:, 3]-out['confidence'][:, 3]).float().abs().cpu()))
-    report = dict(identity_version=IDENTITY_VERSION, checkpoint=str(Path(args.checkpoint).resolve()), step=ck.get('step'),
-                  split=args.split, states=len(items), reference_policy="visible_crop_only",
-                  negative_lateral_max=sampling.rule.lateral_max, heldout_ranking=summarize_ranking(rankings))
-    for name, values in shifts.items():
-        points = torch.cat([v['points'] for v in values]).numpy()
-        confidence = torch.cat([v['confidence'] for v in values]).numpy()
-        report[f'ablation_{name}'] = dict(mean_point_shift=float(points.mean()), p90_point_shift=float(np.quantile(points, .9)),
-                                          mean_confidence4_change=float(confidence.mean()))
-    args.out.mkdir(parents=True, exist_ok=True)
-    (args.out/'embedding.json').write_text(json.dumps(report, indent=2))
-    print(json.dumps(report, indent=2))
-
-
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('mode', choices=('subset', 'rollouts', 'embedding'))
+    ap.add_argument('mode', choices=('subset', 'rollouts'))
     ap.add_argument('--out', type=Path, required=True)
     ap.add_argument('--manifest', default=MANIFEST)
     ap.add_argument('--fibers', default=FIBERS)
     ap.add_argument('--subset', type=Path)
     ap.add_argument('--checkpoint')
-    ap.add_argument('--negative-bank', help='Required for embedding diagnostics; reads evaluation-only paths')
     ap.add_argument('--split', default='calibration', choices=('calibration', 'final'))
     ap.add_argument('--max-len', type=float, default=400.)
     ap.add_argument('--radius', type=float, default=6., help='Subset: proximity to another annotated fiber')
@@ -313,10 +244,8 @@ def main(argv=None):
     if args.mode == 'subset':
         return make_subset(args)
     if args.subset is None or args.checkpoint is None:
-        ap.error('rollouts and embedding need --subset and --checkpoint')
-    if args.mode == 'embedding' and not args.negative_bank:
-        ap.error('embedding requires --negative-bank')
-    return run_rollouts(args) if args.mode == 'rollouts' else run_embedding(args)
+        ap.error('rollouts need --subset and --checkpoint')
+    return run_rollouts(args)
 
 
 if __name__ == '__main__':

@@ -4,18 +4,13 @@ Regression has one model: the continuous follower with main-encoder observation
 memory, shared-decoder refinement, and causal segment survival confidence.
 See [architecture and supervision](TRAJECTORY_MEMORY.md).
 
-There is no separate historical image encoder, route classifier, admission
-classifier, departure/offset probe, or selectable legacy regression architecture.
-Old regression weights and optimizers are incompatible. Start a fresh run.
-New checkpoints support normal resume.
-
 ## Training
 
 From `fiber_follow`, using the existing project environment:
 
 ```bash
 bash scripts/launch_memory.sh
-tail -F output/logs/axial_survival_memory_v4_run1.log
+tail -F output/logs/axial_survival_memory_v5_run1.log
 ```
 
 `launch_trajectory_memory.sh` delegates to the same launcher. The launcher uses
@@ -26,9 +21,8 @@ and one shared-decoder refinement pass. It starts random weights and refuses
 an existing destination. Set `RUN_NAME` for another fresh run; trailing trainer
 arguments override launcher settings. No training is launched by editing code.
 
-The loss combines geometry, generated-path survival likelihood, candidate-path
-survival likelihood, and visible-reference contrastive supervision. Survival
-likelihood sums the supervised intervals per path; unlike the former prefix BCE,
+The loss combines geometry, generated-path survival likelihood, and candidate-path
+survival likelihood. Survival likelihood sums the supervised intervals per path;
 it does not average prefixes or reweight the commit window. The existing geometry
 loss still weights the commit window and supervises initial/final curves 25%/75%.
 The numerical scale of confidence losses has therefore changed; their weights

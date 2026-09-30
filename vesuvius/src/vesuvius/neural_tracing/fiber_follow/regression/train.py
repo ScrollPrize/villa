@@ -30,8 +30,7 @@ from vesuvius.neural_tracing.fiber_follow.regression.data import (
 from vesuvius.neural_tracing.fiber_follow.shared.components import PAIR_SAMPLING_VERSION, ComponentRule
 from vesuvius.neural_tracing.fiber_follow.regression.supervision import commit_window, loss_terms
 from vesuvius.neural_tracing.fiber_follow.regression.diagnostics import (
-    decision_rows, summarize_decisions, identity_ranking, summarize_ranking,
-    identity_training_groups, summarize_identity_groups,
+    decision_rows, summarize_decisions,
     candidate_decisions, summarize_candidates,
 )
 from vesuvius.neural_tracing.fiber_follow.regression.recovery import monitor_fixture, evaluate_monitor
@@ -200,7 +199,7 @@ def resolve_device_sums(*tables):
             table[key] = value
 
 
-IDENTITY_SUMS = ('identity_count', 'identity_states', 'identity_rank_correct', 'identity_correct_count',
+IDENTITY_SUMS = ('identity_correct_count',
                  'identity_flipped_count', 'candidate_states')
 
 
@@ -235,13 +234,13 @@ def clip_training_gradients(model, memory_max_norm=MEMORY_GRAD_CLIP, rest_max_no
 
 def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolerance=1.5,
                      confidence_weight=.5, ema_decay=.999, n_commit=None, compute_metrics=True,
-                     identity_weight=.5, identity_temperature=.1, candidate_weight=1.,
+                     candidate_weight=1.,
                      memory_grad_clip=MEMORY_GRAD_CLIP, rest_grad_clip=REST_GRAD_CLIP, stream_states=None,
                      diagnostic=None):
     """Equal weight per observed state, independent of microbatch boundaries.
 
-    Within a state each loss averages over its known points; fully unknown
-    states contribute zero. Geometry and confidence are evaluated in one pass.
+    Geometry averages known points; survival sums known intervals. Fully
+    unknown states contribute zero. Geometry and confidence are evaluated in one pass.
     Loss sums stay on the device until every microbatch is queued, so the host
     synchronizes once per update rather than once per microbatch.
     """
@@ -258,11 +257,10 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
     sources = np.zeros(6, dtype=np.int64)
     bank_tails = []
     identity = {}
-    identity_groups = {}
     candidate_groups = {}
     requested_decisions = 0.
     pair_version = PAIR_SAMPLING_VERSION
-    decisions, rankings = [], []
+    decisions = []
     memory = {}
     model.train()
     for chunk in batches:
@@ -279,24 +277,19 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
             if diagnostic is not None:
                 diagnostic.update(cpu_batch=cpu, memory=None if carried is None else
                                   {k: v.detach() for k, v in carried.items()})
-            queries = dict(queries=batch['identity_points']) if 'identity_points' in batch else {}
+            scoring = {}
             if 'candidate_points' in batch:
-                queries['candidates'] = batch['candidate_points']
+                scoring['candidates'] = batch['candidate_points']
             with torch.autocast('cuda', dtype=torch.bfloat16, enabled=torch.device(device).type == 'cuda'):
-                output = model(batch['x'], batch['hist'], batch['hmask'], memory=carried, **queries)
+                output = model(batch['x'], batch['hist'], batch['hmask'], memory=carried, **scoring)
                 if carried is not None:
                     stream_states.update(cpu, output, carried)
                     if model.cfg.feature_replay_weight:
                         stream_states.replay.record(cpu, output)
-                terms = loss_terms(output, batch, model.cfg, tolerance, n_commit=n_commit,
-                                   identity_temperature=identity_temperature)
+                terms = loss_terms(output, batch, model.cfg, tolerance, n_commit=n_commit)
                 geometry = terms['geometry_per_state'].sum()/total
                 confidence = terms['confidence_per_state'].sum()/total
                 loss = geometry + confidence_weight*confidence
-                if 'identity_per_state' in terms:
-                    identity_loss = terms['identity_per_state'].sum()/total
-                    loss = loss + identity_weight*identity_loss
-                    accumulate(identity, 'identity_loss', identity_loss)
                 if 'candidate_per_state' in terms:
                     candidate_loss = terms['candidate_per_state'].sum()/total
                     loss = loss+candidate_weight*candidate_loss
@@ -312,12 +305,6 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
                         group = candidate_groups.setdefault(name, {})
                         for key, value in row.items():
                             group[key] = group.get(key, 0)+value
-                if 'query_embedding' in output:
-                    rankings.append(identity_ranking(output, batch, model.cfg))
-                    for name,row in identity_training_groups(output,batch,terms,model.cfg,identity_temperature).items():
-                        group = identity_groups.setdefault(name,{})
-                        for key,value in row.items():
-                            group[key] = group.get(key,0)+value
             for key in IDENTITY_SUMS:
                 if key in terms:
                     accumulate(identity, key, terms[key])
@@ -383,10 +370,7 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
     if identity:
         # Versioned separately from the distance metrics above.
         identity.update(identity_version=1, pair_sampling_version=pair_version,
-                        eligible_fraction=identity.get('identity_states',0.)/total,
-                        identity_rank_accuracy=identity.get('identity_rank_correct', 0.)/max(1., identity.get('identity_count', 0.)),
                         identity_prefix_correct_fraction=identity.get('identity_correct_count', 0.)/max(1., sums['confidence_count']))
-        identity['identity_loss_eligible'] = identity.get('identity_loss', 0.)*total/max(1., identity.get('identity_states', 0.))
         if 'candidate_loss' in identity:
             identity['candidate_loss_eligible'] = identity['candidate_loss']*total/max(1., identity.get('candidate_states', 0.))
         for key in ('presence_dropped', 'blurred', 'foreign_components', 'seed_present', 'identity_observable', *(f'location_{n}' for n in LOCATION_SOURCES)):
@@ -395,9 +379,6 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
         sums['identity'] = identity
     if compute_metrics:
         sums['decisions'] = summarize_decisions(decisions, commit_window(model.cfg, n_commit))
-        if rankings:
-            sums['identity']['ranking'] = summarize_ranking(rankings)
-            sums['identity']['training_groups'] = summarize_identity_groups(identity_groups)
         if candidate_groups:
             sums['identity']['candidate_decisions'] = summarize_candidates(candidate_groups)
     return sums
@@ -456,15 +437,12 @@ def build_parser():
     ap.add_argument('--no-history-prob', type=float, default=.15, help='Fresh-state probability of absent observed history')
     ap.add_argument('--short-history-prob', type=float, default=.4,
                     help='Given history is present, probability of a balanced 1-8/9-32 point startup history')
-    ap.add_argument('--identity-weight', type=float, default=.5, help='InfoNCE coefficient')
-    ap.add_argument('--identity-temperature', type=float, default=.1)
     ap.add_argument('--decision-fraction', type=float, default=.25,
                     help='Fraction reserved for matched pairs with visible reference seeds')
     ap.add_argument('--candidate-weight', type=float, default=1., help='Weight of candidate first-failure survival likelihood')
     ap.add_argument('--fresh-fraction', type=float, default=.7,
                     help='Fresh share of non-pair draws; remainder uses current replay; may change on resume')
-    ap.add_argument('--embedding', type=int, default=32)
-    ap.add_argument('--negative-bank', help='Shared live bank for InfoNCE negatives, wrong continuations and following supervision')
+    ap.add_argument('--negative-bank', help='Shared live bank for foreign-fiber masks, wrong continuations and following supervision')
     ap.add_argument('--near-negative-bank', help='Additional bank of validated nearby negative relationships')
     ap.add_argument('--following-bank', help='Following path source (default: negative-bank)')
     ap.add_argument('--continuation-bank', help='Wrong-continuation path source (default: negative-bank)')
@@ -581,7 +559,7 @@ def main(argv=None):
     refinement_limit = ({} if args.recurrent_refinement_limit is None else
                         dict(recurrent_refinement_limit=args.recurrent_refinement_limit))
     cfg = DirectConfig(direction_inputs=args.direction_inputs,channels=args.channels,hidden=args.hidden,layers=args.axial_layers,
-                       decoder_layers=args.decoder_layers,embedding=args.embedding,
+                       decoder_layers=args.decoder_layers,
                        activation_checkpointing=args.activation_checkpointing,
                        memory_slots=args.memory_slots,memory_steps=args.memory_steps,
                        memory_stride=args.memory_stride,
@@ -624,8 +602,6 @@ def main(argv=None):
         memory_switch_probability=args.memory_switch_probability,memory_switch_tail=args.memory_switch_tail)
     if not args.negative_bank:
         raise ValueError('Training requires --negative-bank')
-    if min(args.identity_weight,args.identity_temperature) <= 0:
-        raise ValueError('Identity weight and temperature must be positive')
     if not 1 <= args.n_commit <= cfg.n_future:
         raise ValueError('Commit window must fit forecast')
     # Finest-level CT in a single enlarged crop.
@@ -807,7 +783,6 @@ def main(argv=None):
             metrics = optimizer_update(trainable, ema, opt, batches, step, lr, device=args.device,
                 tolerance=args.tolerance, confidence_weight=args.confidence_weight, ema_decay=args.ema_decay,
                 n_commit=args.n_commit, compute_metrics=step % args.log_every == 0 or step == args.steps,
-                identity_weight=args.identity_weight, identity_temperature=args.identity_temperature,
                 candidate_weight=args.candidate_weight,
                 memory_grad_clip=args.memory_grad_clip, rest_grad_clip=args.rest_grad_clip,
                 stream_states=stream_states, diagnostic=diagnostic)

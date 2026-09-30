@@ -78,25 +78,13 @@ def test_outside_history_and_seed_cannot_influence_predictions():
 
 
 
-def test_query_order_and_outside_support():
-    m=DirectFollower(config()).eval();b=batch(m.cfg,1)
-    b['identity_points'][0,-1]=torch.tensor([100.,0.,0.])
-    first=forward(m,b)
-    order=torch.randperm(b['identity_points'].shape[1])
-    b['identity_points']=b['identity_points'][:,order]
-    second=forward(m,b)
-    torch.testing.assert_close(first['query_embedding'][:,order],second['query_embedding'])
-    torch.testing.assert_close(first['query_support'][:,order],second['query_support'])
-    assert not first['query_support'][0,-1]
-
-
 def test_checkpointing_preserves_outputs_and_gradients():
     torch.manual_seed(9)
     a=DirectFollower(config());b=DirectFollower(replace(a.cfg,activation_checkpointing=True))
     b.load_state_dict(a.state_dict());data=batch(a.cfg,1)
     for m in (a,b):
         out=forward(m,data)
-        loss=out['points'].square().mean()+out['query_embedding'][...,0].mean()
+        loss=out['points'].square().mean()+out['hazard_logits'].square().mean()
         loss.backward()
     for pa,pb in zip(a.parameters(),b.parameters()):
         if pa.grad is not None:torch.testing.assert_close(pa.grad,pb.grad,atol=2e-6,rtol=2e-5)
@@ -106,9 +94,9 @@ def test_unobservable_identity_has_no_supervision_gradient():
     m=DirectFollower(config());data=batch(m.cfg,1)
     data['identity_observable']=torch.zeros(1,dtype=torch.bool)
     out=forward(m,data);terms=loss_terms(out,data,m.cfg)
-    for name in ('geometry_per_state','confidence_per_state','identity_per_state'):
+    for name in ('geometry_per_state','confidence_per_state'):
         assert terms[name].eq(0).all()
-    sum(terms[k].sum() for k in ('geometry_per_state','confidence_per_state','identity_per_state')).backward()
+    sum(terms[k].sum() for k in ('geometry_per_state','confidence_per_state')).backward()
     assert all(p.grad is None or p.grad.eq(0).all() for p in m.parameters())
 
 

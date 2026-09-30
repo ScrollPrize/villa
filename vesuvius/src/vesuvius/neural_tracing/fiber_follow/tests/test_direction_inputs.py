@@ -59,7 +59,7 @@ def volume(root, nx=None, ny=None):
 
 def config(**kwargs):
     options=dict(fine=CropSpec(depth=16,width=9,behind=7,spacing=.5),channels=4,hidden=16,
-                 heads=2,layers=1,decoder_layers=1,n_future=4,n_history=8,embedding=8,
+                 heads=2,layers=1,decoder_layers=1,n_future=4,n_history=8,
                  memory_slots=2,memory_steps=2,memory_stride=1,feature_detail_tokens=4)
     options.update(kwargs)
     return DirectConfig(**options)

@@ -22,7 +22,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolumeSpec
 
 def config(**kwargs):
     options=dict(fine=CropSpec(depth=24,width=17,behind=8),channels=4,hidden=16,
-        heads=2,layers=1,decoder_layers=1,n_future=4,n_history=32,embedding=8,activation_checkpointing=False,memory_slots=4,memory_steps=4,feature_detail_tokens=4,recurrent_refinement_steps=0)
+        heads=2,layers=1,decoder_layers=1,n_future=4,n_history=32,activation_checkpointing=False,memory_slots=4,memory_steps=4,feature_detail_tokens=4,recurrent_refinement_steps=0)
     options.update(kwargs)
     return DirectConfig(**options)
 
@@ -48,7 +48,7 @@ def batch(cfg,b=2):
 
 
 def forward(m, b):
-    return m(b['x'], b['hist'], b['hmask'], queries=b['identity_points'])
+    return m(b['x'], b['hist'], b['hmask'])
 
 
 
@@ -169,8 +169,7 @@ def test_gradients_reach_the_shared_encoder_from_every_objective():
     b = batch(m.cfg)
     out = forward(m, b)
     terms = loss_terms(out, b, m.cfg)
-    assert terms['identity_count'] == 4
-    for key in ('identity_per_state', 'geometry_per_state', 'confidence_per_state'):
+    for key in ('geometry_per_state', 'confidence_per_state'):
         m.zero_grad(set_to_none=True)
         terms = loss_terms(forward(m, b), b, m.cfg)
         terms[key].sum().backward()
@@ -209,6 +208,6 @@ def test_cuda_bf16_identity_gradients():
     b = move_batch(batch(m.cfg), 'cuda')
     with torch.autocast('cuda', dtype=torch.bfloat16):
         terms = loss_terms(forward(m, b), b, m.cfg)
-        loss = sum(terms[k].mean() for k in ('geometry_per_state', 'confidence_per_state', 'identity_per_state'))
+        loss = sum(terms[k].mean() for k in ('geometry_per_state', 'confidence_per_state'))
     loss.backward()
     assert torch.isfinite(loss) and m.encoder.stem[0].weight.grad.abs().sum() > 0

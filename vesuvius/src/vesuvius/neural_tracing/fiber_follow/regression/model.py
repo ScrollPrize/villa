@@ -11,10 +11,9 @@ from torch.utils.checkpoint import checkpoint
 
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
 
-ARCHITECTURE = 'axial_fiber_memory_v4'
+ARCHITECTURE = 'axial_fiber_memory_v5'
 TOKEN_STRIDE = (8, 2, 2)
 TOKEN_OFFSET = (3, 0, 0)
-IDENTITY_EVIDENCE_WIDTH = 8
 
 
 @dataclass
@@ -26,7 +25,6 @@ class DirectConfig:
     heads: int = 4
     layers: int = 4
     decoder_layers: int = 4
-    embedding: int = 32
     activation_checkpointing: bool = False
     n_future: int = 16
     future_step: float = 1.
@@ -52,7 +50,7 @@ class DirectConfig:
         if min(c.depth, c.width) < 8 or not 0 <= c.behind < c.depth or not math.isfinite(c.spacing) or c.spacing <= 0:
             raise ValueError('Invalid fine crop')
         if min(self.channels, self.hidden, self.heads, self.layers, self.decoder_layers,
-               self.embedding, self.n_future, self.n_history) < 1 or self.hidden % self.heads:
+               self.n_future, self.n_history) < 1 or self.hidden % self.heads:
             raise ValueError('Positive dimensions required; hidden must divide by heads')
         if not 0 < self.future_step <= self.max_recovery_distance or not math.isfinite(self.max_recovery_distance):
             raise ValueError('Invalid forward spacing or connection limit')
@@ -317,7 +315,6 @@ class DirectFollower(nn.Module):
         self.cfg = cfg
         c,h = cfg.channels,cfg.hidden
         self.encoder = AxialEncoder(cfg)
-        self.embedding = nn.Linear(c,cfg.embedding)
         self.reference_token = nn.Sequential(nn.Linear(c+8,h),nn.SiLU(),nn.Linear(h,h))
         self.query = nn.Sequential(nn.Linear(9*c+1,h),nn.SiLU(),nn.Linear(h,h))
         layer = PathDecoderLayer(h,cfg.heads,2*h,dropout=0.,activation='gelu',batch_first=True,norm_first=True)
@@ -360,8 +357,6 @@ class DirectFollower(nn.Module):
         sampling_dense = dense.float() if cfg.recurrent_refinement_steps else dense
         local,_ = sample_features(sampling_dense,references,cfg.fine)
         local = local.to(dense.dtype)
-        embedded = F.normalize(self.embedding(local),dim=-1)
-        embedded = torch.where(mask[...,None],embedded,0.)
         ages = torch.arange(1,cfg.n_history+2,device=hist.device).float()[None].expand(len(hist),-1).clone()
         ages[:,-1] = x.get('seed_age',hist.new_zeros(len(hist))).reshape(-1)
         anchor = torch.zeros_like(ages)
@@ -373,8 +368,7 @@ class DirectFollower(nn.Module):
         ref_tokens = self.reference_token(torch.cat((local,metadata),-1))
         memory = torch.cat((image_tokens,ref_tokens.to(image_tokens.dtype)),1)
         padding = torch.cat((torch.zeros(image_tokens.shape[:2],device=hist.device,dtype=torch.bool),~mask),1)
-        ctx = dict(fine=dense,deep=deep,memory=memory,padding=padding,
-                   reference_embedding=embedded,reference_mask=mask)
+        ctx = dict(fine=dense,deep=deep,memory=memory,padding=padding,reference_mask=mask)
         if cfg.recurrent_refinement_steps:
             ctx.update(fine_fp32=sampling_dense, deep_fp32=deep.float())
         return ctx
@@ -400,36 +394,13 @@ class DirectFollower(nn.Module):
     def initial_memory(self, batch, device):
         return self.recurrent_memory.initial_state(batch, device)
 
-    def identity_evidence(self, ctx, values, support):
-        """Observed-reference cosine evidence for each prefix, without GT filtering.
-
-        Keep the seed separate from potentially contaminated recent history.
-        Missing references/unsupported samples have zero evidence and explicit
-        coverage, so missing information is distinguishable from a poor match.
-        """
-        candidate = F.normalize(self.embedding(values).float(),dim=-1)
-        refs,mask = ctx['reference_embedding'].float(),ctx['reference_mask'].bool()
-        history = F.normalize((refs[:,:-1]*mask[:,:-1,None]).sum(1),dim=-1)
-        seed = F.normalize(refs[:,-1],dim=-1)
-        anchors = torch.stack((seed,history),1)
-        available = torch.stack((mask[:,-1],mask[:,:-1].any(1)),1)
-        valid = support[:,:,None] & available[:,None]
-        similarity = (candidate[:,:,None]*anchors[:,None]).sum(-1).clamp(-1.,1.)
-        similarity = torch.where(valid,similarity,0.)
-        observed = valid.float().cumsum(1)
-        mean = similarity.cumsum(1)/observed.clamp_min(1.)
-        minimum = similarity.masked_fill(~valid,torch.inf).cummin(1).values
-        minimum = torch.where(observed > 0,minimum,0.)
-        count = torch.arange(1,values.shape[1]+1,device=values.device)[None,:,None]
-        return torch.cat((similarity,mean,minimum,observed/count),-1)
-
     def context(self, x, hist, hmask):
         references, mask = self.references(x, hist, hmask)
         stem, deep = self.encoder.encode(x['fine'], references, mask)
         return dict(stem=stem, deep=deep, references=references, reference_mask=mask,
                     query_frame=x['query_frame'])
 
-    def forward(self, x, hist, hmask, queries=None, candidates=None, memory=None):
+    def forward(self, x, hist, hmask, candidates=None, memory=None):
         # A cold, externally supplied history may have a remote seed. Encode
         # that seed crop once; streamed training starts at the seed itself.
         if 'feature_seed_x' in x:
@@ -443,13 +414,6 @@ class DirectFollower(nn.Module):
         if observation is not None:
             out.update(observation_tokens=observation[0], observation_xyz=observation[1], observation_valid=observation[2])
         out.update({'memory_'+k: v for k, v in ctx['recurrent'].items()})
-        out.update(reference_embedding=ctx['reference_embedding'], reference_mask=ctx['reference_mask'])
-        if queries is not None:
-            from .model import sample_features
-            import torch.nn.functional as F
-            values, support = sample_features(ctx.get('fine_fp32', ctx['fine']), queries, self.cfg.fine)
-            values = values.to(ctx['fine'].dtype)
-            out.update(query_embedding=F.normalize(self.embedding(values), dim=-1), query_support=support)
         return out
 
     def observation_features(self, x, hist, hmask):
@@ -484,12 +448,7 @@ class DirectFollower(nn.Module):
         samples = self.confidence_scorer.segment_samples(points)
         spatial = self.evidence(ctx, samples.flatten(1, 2), 'confidence')
         spatial = spatial.reshape(*samples.shape[:3], -1)
-        c = self.cfg.channels
-        centre = (len(self.path_stencil)//2)*(c+1)
-        endpoint = spatial[:, :, -1]
-        comparison = self.identity_evidence(ctx, endpoint[..., centre:centre+c],
-                                             endpoint[..., centre+c].bool())
-        return self.confidence_scorer(spatial, points, comparison,
+        return self.confidence_scorer(spatial, points,
                                      ctx['confidence_projected'], ctx['confidence_padding'])
 
     def predict(self, ctx, hist, candidates=None):

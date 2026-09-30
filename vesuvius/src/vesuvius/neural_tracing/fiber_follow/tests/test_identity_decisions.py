@@ -11,7 +11,7 @@ from test_neighbor_following import clean_sample
 from vesuvius.neural_tracing.fiber_follow.regression.identity_decisions import decision_pair
 from vesuvius.neural_tracing.fiber_follow.regression.data import IdentityObservationBuilder, reference_layout
 from vesuvius.neural_tracing.fiber_follow.regression.model import DirectConfig, DirectFollower
-from vesuvius.neural_tracing.fiber_follow.regression.supervision import loss_terms, identity_terms
+from vesuvius.neural_tracing.fiber_follow.regression.supervision import loss_terms
 from vesuvius.neural_tracing.fiber_follow.regression.train import optimizer_update
 from vesuvius.neural_tracing.fiber_follow.shared.data import FollowDataset, OnPolicyStates, fiber_manifest
 from vesuvius.neural_tracing.fiber_follow.shared.reference import SEED_FIELDS, observed_seed
@@ -52,7 +52,7 @@ def test_candidate_update_independent_of_microbatch_boundaries():
         torch.testing.assert_close(pa, pb, rtol=2e-5, atol=1e-7)
 
 
-def test_observed_seed_at_start_and_single_seed_infonce():
+def test_observed_seed_at_start_reaches_reference_tokens():
     cfg = config()
     state = dict(pos=np.array([20., 30., 40.]), frame=np.eye(3),
                  hist_local=np.zeros((cfg.n_history, 3)), hmask=np.zeros(cfg.n_history))
@@ -63,11 +63,11 @@ def test_observed_seed_at_start_and_single_seed_infonce():
     model = DirectFollower(cfg)
     data = batch(cfg, 1)
     data['hmask'].zero_()
-    data['reference_on_fiber'].zero_()
-    data['reference_on_fiber'][:,-1]=1.
-    data['identity_seed_fallback'] = torch.ones(1, dtype=torch.bool)
-    out = model(data['x'], data['hist'], data['hmask'], queries=data['identity_points'])
-    assert identity_terms(out, data, cfg)['identity_states'] == 1
+    out = model(data['x'], data['hist'], data['hmask'])
+    _, mask = model.references(data['x'], data['hist'], data['hmask'])
+    assert mask.sum() == 1 and mask[0, -1]
+    out['hazard_logits'].sum().backward()
+    assert model.reference_token[0].weight.grad.abs().sum() > 0
 
 
 def test_replay_preserves_seed_but_distant_seed_is_not_observable(tmp_path):

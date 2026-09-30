@@ -95,7 +95,7 @@ def main():
     result = dict(checkpoint=args.checkpoint, config=cfg.to_dict(), hardware=torch.cuda.get_device_name(),
         torch=torch.__version__, compiled=not args.eager, precision='BF16 encoder/decoder; FP32 memory',
         effective_batch=8, microbatch=4, sequence_length=2, concurrent_traces=2,
-        input='Fixed synthetic full-size CT/presence/directions, two candidate curves per crop; all losses except contrastive identity; includes AdamW, clipping, EMA; excludes volume IO',
+        input='Fixed synthetic full-size CT/presence/directions, two candidate curves per crop; geometry and survival losses; includes AdamW, clipping, EMA; excludes volume IO',
         replay_length=args.replay_length, replay_endpoints_per_update=int(bool(replay)),
         replay_encoder_crops=metrics.get('replay_encoder_crops', 0),
         warmup=args.warmup, warmup_seconds=warmup_seconds, repeats=args.repeats,

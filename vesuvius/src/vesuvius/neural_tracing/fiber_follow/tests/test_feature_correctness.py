@@ -60,9 +60,9 @@ def test_unlabeled_replay_history_masks_losses_but_updates_memory(tmp_path,monke
     monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.regression.data.image_crop',
         lambda items,vol,crop,pool=None,**kw:torch.ones(len(items),2,crop.depth,crop.width,crop.width)*.25)
     batch=b([rows[0]],None);model=build_model(c)
-    output=model(batch['x'],batch['hist'],batch['hmask'],queries=batch['identity_points'])
+    output=model(batch['x'],batch['hist'],batch['hmask'])
     terms=loss_terms(output,batch,c)
-    assert all(terms[k].eq(0).all() for k in ('geometry_per_state','confidence_per_state','identity_per_state'))
+    assert all(terms[k].eq(0).all() for k in ('geometry_per_state','confidence_per_state'))
     assert output['memory_cache_valid'].any()
     diagnostic=decision_rows(output,batch,c)[0]
     assert not diagnostic['departed']

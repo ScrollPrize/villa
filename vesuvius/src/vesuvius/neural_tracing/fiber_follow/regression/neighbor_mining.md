@@ -313,16 +313,13 @@ when separation exceeds 12, their length is at least twice the maximum
 separation. Outer-bank paths therefore need more room before the tail, and
 not every 80–160 path can provide a full 128-voxel tail.
 They are already-departed states:
-positive geometry masks are zero, confidence teaches rejection, and the identity
-anchor includes only history patches still on the original annotation.
+positive geometry masks are zero and confidence teaches rejection.
 Seed-segment anchors are drawn strictly from the original prefix before the
 synthetic bridge. A long tail can fill all 128 recent observations with the
 wrong fiber. New runs require original-fiber evidence: when fewer than two
 recent patches remain, seed anchors are forced from the original prefix. If
 these cannot fit, the synthetic state falls back to the original replay draw.
-InfoNCE uses at least two valid seed anchors as a fallback, keeping the same
-single per-state loss and effective-batch denominator. Legacy resumes retain
-their saved policy. Length-aware draws skip shards with no fitting training
+Length-aware draws skip shards with no fitting training
 paths, and still check the actual bridge and tail after selecting geometry.
 The bridge itself is never treated as a positive future. Existing crop, history,
 patch and label holdout checks still apply before volume reads.
@@ -340,12 +337,10 @@ attempts, treating those paths as ordinary annotations with equal loss weights.
 Their cut endpoints are unknown. Geometry, recent history and identity positives
 use the mined path; the original annotated parent supplies certified negatives.
 All normal holdout checks apply. Source 4 is logged as `bank_following_fraction`.
-Older checkpoints retain zero bank-following draws and dense-map queries;
-switching modes requires a new run, optionally with `--init-tracer`.
+Changing the bank-following sampling policy requires a new run.
 
-The tail range is saved in config/checkpoints. Resuming an older checkpoint
-without this setting retains its original 4–12 range; changing it requires a
-new run (optionally initialized with `--init-tracer`). The original short bank
+The tail range is saved in config/checkpoints; changing it requires a
+new run. The original short bank
 can still be used with `--bank-wrong-continuation-tail 4 12`. Structured training
 logs report the realized `bank_wrong_continuation_tail_mean`, `_min`, and `_max`
 for bank states in each logged batch; batches without bank states report null.
@@ -384,15 +379,11 @@ nice -n 19 python -m pytest -q -p no:cacheprovider \
 The centerline audit used eight real locations with fine CT level 0, coarse CT
 level 1 and presence level 3. All produced four positives and 32 negatives;
 maximum displacement from either sampled centerline was below 1e-6 trace voxels
-(float32 conversion). A CPU optimizer update completed with nonzero InfoNCE.
+(float32 conversion).
 See `output/neighbor_centerline_training_probe.json`. A second probe exercised
 forward and reverse smooth departures, retaining 28 on-target history patches,
 zero geometry targets and four known confidence rejections; its CPU optimizer
 update passed (`output/neighbor_wrong_continuation_probe.json`).
 
-Tests also check identical-CT chance loss, query-order invariance, absence of
-presence/geometry/label inputs to appearance embeddings, and shared history
-scoring. These verify processing symmetry and geometric labels, not a guarantee
-against every learned shortcut or every possible tracing error. The older
-`neighbor_negative_training_probe.json` timings describe the retired tube
+The older `neighbor_negative_training_probe.json` timings describe the retired tube
 sampler and are not performance measurements of the centerline implementation.

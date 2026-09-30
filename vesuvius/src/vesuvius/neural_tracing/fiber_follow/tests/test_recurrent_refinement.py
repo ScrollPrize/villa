@@ -138,7 +138,7 @@ def test_compiled_refinement_bf16_two_decision_gradients():
                 b['candidate_labels'] = torch.zeros_like(candidates[..., 0])
                 b['candidate_labels'][:, 0] = 1.
                 out = model(b['x'], b['hist'], b['hmask'], memory=state,
-                            queries=b['identity_points'], candidates=candidates)
+                            candidates=candidates)
                 state = state_from(eager, out)
                 terms = loss_terms(out, b, c)
                 loss = (loss+terms['geometry_per_state'].mean()+terms['confidence_per_state'].mean()

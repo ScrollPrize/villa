@@ -1,9 +1,5 @@
 # Observation memory and causal survival confidence
 
-This is the sole regression architecture. Old crop-only, patch-memory, spatial
-route, and noncausal prefix-scoring implementations have been removed. Start fresh
-weights; there is no legacy model selector or checkpoint migration.
-
 ## Information flow
 
 1. The main encoder extracts stem appearance features and an axial deep lattice
@@ -25,10 +21,9 @@ weights; there is no legacy model selector or checkpoint migration.
    and deep features. At production forward spacing this is one sample per quarter
    forward voxel, matching dense supervision. The fixed forward-plane representation
    determines resolution; arbitrary resampling of candidates is not supported.
-6. Segment tokens include sampled evidence, start/end/displacement/length and
-   causal visible-reference comparisons. Two scoring decoder layers use causal
-   segment self-attention and unrestricted cross-attention to the entire current
-   image/reference/memory token set. Their own K/V projections are reused across
+6. Segment tokens include sampled evidence and start/end/displacement/length.
+   Two scoring decoder layers use causal segment self-attention and unrestricted
+   cross-attention to the entire current image/reference/memory token set. Their own K/V projections are reused across
    scored candidates within one decision. No generator hidden states enter scoring.
 7. One linear readout predicts the conditional first-failure logit per segment.
    Prefix confidence is the product of conditional survival probabilities,
@@ -66,9 +61,9 @@ ends and unobservable identity are censored. Foreign-fiber masks remain negative
 
 Confidence detaches scored coordinates. Its loss trains its own scorer, the
 shared encoder and memory, but not the generator decoder, coordinate head or
-refinement head. The visible-reference contrastive loss also reaches memory
-through conditioned fine features. Geometry supervises initial/final proposals
-with weights 25%/75%. No auxiliary admission or memory-probe objectives exist.
+refinement head. Geometry supervises initial/final proposals with weights
+25%/75%. Seed, history and observation-memory tokens are available through
+cross-attention.
 
 Inference commits the longest prefix clearing its confidence threshold. Confidence
 is monotone by construction; it does not need post-hoc minimum repair. The shared
