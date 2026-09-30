@@ -109,10 +109,15 @@ def zone_blocks(origin_xyz: Sequence[int], size_xyz: Sequence[int], block: int) 
 
 
 class RegionReader:
-    """Reads small regions of a volume through a cache of its storage chunks."""
+    """Reads small regions of a volume through a cache of its storage chunks.
 
-    def __init__(self, volume, budget: int = 64 * 1024**2):
+    Chunks leaving the memory cache are kept in ``spill`` when it is given, so
+    that each chunk of a remote volume is downloaded once.
+    """
+
+    def __init__(self, volume, budget: int = 64 * 1024**2, spill: Path | None = None):
         self.volume = volume
+        self.spill = spill
         self.chunks = np.asarray(volume.chunks, dtype=int)
         self.shape = np.asarray(volume.shape, dtype=int)
         self.cache: OrderedDict[tuple[int, ...], np.ndarray] = OrderedDict()
@@ -123,8 +128,14 @@ class RegionReader:
         if key in self.cache:
             self.cache.move_to_end(key)
             return self.cache[key]
-        start = np.asarray(key) * self.chunks
-        block = np.asarray(self.volume[tuple(slice(int(a), int(b)) for a, b in zip(start, np.minimum(start + self.chunks, self.shape)))])
+        stored = self.spill / ("_".join(map(str, key)) + ".npy") if self.spill else None
+        if stored and stored.exists():
+            block = np.load(stored)
+        else:
+            start = np.asarray(key) * self.chunks
+            block = np.asarray(self.volume[tuple(slice(int(a), int(b)) for a, b in zip(start, np.minimum(start + self.chunks, self.shape)))])
+            if stored:
+                np.save(stored, block)
         self.cache[key] = block
         self.bytes += block.nbytes
         while self.bytes > self.budget and len(self.cache) > 1:
@@ -366,7 +377,8 @@ def generate(args: argparse.Namespace, report: Reporter) -> dict[str, Any]:
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 
-            ct_support = CTSupport(RegionReader(volume), shape_xyz)
+            (Path(scratch) / "ct").mkdir()
+            ct_support = CTSupport(RegionReader(volume, spill=Path(scratch) / "ct"), shape_xyz)
 
             def score(proposals: list[dict[str, Any]], row: dict[str, Any]) -> np.ndarray:
                 features = np.stack(

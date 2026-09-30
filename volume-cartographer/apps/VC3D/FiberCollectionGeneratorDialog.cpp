@@ -166,10 +166,12 @@ void FiberCollectionGeneratorDialog::updateZone()
     const auto from = zoneOrigin();
     const auto extent = zoneSize();
     const auto count = blocks().size();
-    zone_->setText(tr("X %1–%2, Y %3–%4, Z %5–%6 of the current volume · %n block(s) to process", nullptr, int(count))
+    const auto work = count == 1 ? tr("1 block to process") : tr("%1 blocks to process").arg(int(count));
+    zone_->setText(tr("X %1–%2, Y %3–%4, Z %5–%6 of the current volume · %7")
                        .arg(from[0]).arg(from[0] + extent[0] - 1)
                        .arg(from[1]).arg(from[1] + extent[1] - 1)
-                       .arg(from[2]).arg(from[2] + extent[2] - 1));
+                       .arg(from[2]).arg(from[2] + extent[2] - 1)
+                       .arg(work));
     emit zoneChanged();
 }
 

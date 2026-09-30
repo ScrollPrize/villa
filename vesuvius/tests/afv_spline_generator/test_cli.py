@@ -98,12 +98,15 @@ def test_zone_is_cut_into_blocks():
     assert cli.zone_blocks([0, 0, 0], [1024, 1024, 512], 512)[1] == ([512, 0, 0], [512, 512, 512])
 
 
-def test_region_reader_matches_the_volume(volume):
+@pytest.mark.parametrize("spilled", [False, True])
+def test_region_reader_matches_the_volume(volume, tmp_path, spilled):
     array = cli.open_volume(str(volume), 0)
-    read = cli.RegionReader(array, budget=3 * 16**3)
-    for low, high in (([0, 0, 0], [96, 64, 48]), ([5, 17, 31], [70, 40, 33]), ([90, 60, 40], [96, 64, 48])):
-        assert np.array_equal(read(low, high), array[low[2]:high[2], low[1]:high[1], low[0]:high[0]])
+    read = cli.RegionReader(array, budget=3 * 16**3, spill=tmp_path if spilled else None)
+    for _ in range(2):
+        for low, high in (([0, 0, 0], [96, 64, 48]), ([5, 17, 31], [70, 40, 33]), ([90, 60, 40], [96, 64, 48])):
+            assert np.array_equal(read(low, high), array[low[2]:high[2], low[1]:high[1], low[0]:high[0]])
     assert len(read.cache) <= 3
+    assert len(list(tmp_path.glob("*.npy"))) == (len(list(np.ndindex(*np.ceil(np.asarray(array.shape) / array.chunks).astype(int)))) if spilled else 0)
 
 
 def test_reports_errors_as_json_and_writes_nothing(monkeypatch, capsys, volume, tmp_path):
