@@ -164,9 +164,10 @@ def test_censored_and_departed_states_do_not_train_coordinates():
 
 
 
-def test_training_sequence_checkpoint_and_optimizer_resume(tmp_path):
+@pytest.mark.parametrize('encoder', ['conv', 'patch4'])
+def test_training_sequence_checkpoint_and_optimizer_resume(tmp_path, encoder):
     torch.manual_seed(32)
-    model = build_model(cfg())
+    model = build_model(cfg(encoder=encoder))
     b = memory_batch(model.cfg)
     chunk = training_chunk(model.cfg)
     ema = copy.deepcopy(model)
@@ -183,8 +184,12 @@ def test_training_sequence_checkpoint_and_optimizer_resume(tmp_path):
     sample = SampleConfig(crop=model.cfg.fine, n_history=model.cfg.n_history, n_future=model.cfg.n_future)
     save_checkpoint(path, model, ema, spec, sample,
                     dict(optimizer=opt.state_dict(), rng=training_rng_state(), step=1))
+    if encoder == 'conv':
+        legacy = torch.load(path, weights_only=False)
+        del legacy['model_cfg']['encoder']
+        torch.save(legacy, path)
     restored, *_, ck = load_checkpoint(path, 'cpu')
-    assert restored.architecture == ARCHITECTURE
+    assert restored.architecture == model.cfg.architecture
     with torch.no_grad():
         expected = ema.eval()(b['x'], b['hist'], b['hmask'])
         actual = restored(b['x'], b['hist'], b['hmask'])

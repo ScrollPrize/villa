@@ -78,9 +78,10 @@ def test_outside_history_and_seed_cannot_influence_predictions():
 
 
 
-def test_checkpointing_preserves_outputs_and_gradients():
+@pytest.mark.parametrize('encoder', ['conv', 'patch4'])
+def test_checkpointing_preserves_outputs_and_gradients(encoder):
     torch.manual_seed(9)
-    a=DirectFollower(config());b=DirectFollower(replace(a.cfg,activation_checkpointing=True))
+    a=DirectFollower(config(encoder=encoder));b=DirectFollower(replace(a.cfg,activation_checkpointing=True))
     b.load_state_dict(a.state_dict());data=batch(a.cfg,1)
     for m in (a,b):
         out=forward(m,data)

@@ -13,6 +13,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
 from vesuvius.neural_tracing.fiber_follow.shared.policy import DEFAULT_CONFIDENCE, commit_prefix
 
 ARCHITECTURE = 'axial_fiber_memory_v9'
+PATCH_ARCHITECTURE = 'axial_patch4_fiber_memory_v9'
 TOKEN_STRIDE = (8, 2, 2)
 TOKEN_OFFSET = (3, 0, 0)
 
@@ -43,8 +44,11 @@ class DirectConfig:
     feature_switch_crop_fraction: float = -1.
     feature_history_loss_fraction: float = .25
     recurrent_refinement_steps: int = 2
+    encoder: str = 'conv'
 
     def __post_init__(self):
+        if self.encoder not in ('conv', 'patch4'):
+            raise ValueError('Encoder must be conv or patch4')
         if isinstance(self.fine, dict):
             self.fine = CropSpec(**self.fine)
         c = self.fine
@@ -93,8 +97,20 @@ class DirectConfig:
         return (self.fine.width-1)*self.fine.spacing/2-self.patch_radius
 
     @property
+    def architecture(self):
+        return PATCH_ARCHITECTURE if self.encoder == 'patch4' else ARCHITECTURE
+
+    @property
+    def token_stride(self):
+        return (4, 4, 4) if self.encoder == 'patch4' else TOKEN_STRIDE
+
+    @property
+    def token_offset(self):
+        return (1.5, 1.5, 1.5) if self.encoder == 'patch4' else TOKEN_OFFSET
+
+    @property
     def token_shape(self):
-        return tuple(math.ceil(n/s) for n,s in zip((self.fine.depth,self.fine.width,self.fine.width),TOKEN_STRIDE))
+        return tuple(math.ceil(n/s) for n,s in zip((self.fine.depth,self.fine.width,self.fine.width),self.token_stride))
 
     def to_dict(self):
         return asdict(self)
@@ -265,19 +281,28 @@ class PathDecoderLayer(nn.TransformerDecoderLayer):
 
 
 class AxialBlock(nn.Module):
-    def __init__(self, width, heads):
+    def __init__(self, width, heads, *, local_convolution=True):
         super().__init__()
         self.axes = nn.ModuleList(AxisAttention(width,heads,a) for a in (3,2,1))
         self.norm = nn.LayerNorm(width)
         self.mlp = nn.Sequential(nn.Linear(width,4*width),nn.GELU(),nn.Linear(4*width,width))
         self.local = nn.Sequential(DepthwiseConv3d(width,width,3,padding=1,groups=width),
-                                   nn.SiLU(),nn.Conv3d(width,width,1))
+                                   nn.SiLU(),nn.Conv3d(width,width,1)) if local_convolution else None
 
     def forward(self, x):
         for axis in self.axes:
             x = axis(x)
         x = x+self.mlp(self.norm(x))
-        return x+self.local(x.permute(0,4,1,2,3)).permute(0,2,3,4,1)
+        return x+self.local(x.permute(0,4,1,2,3)).permute(0,2,3,4,1) if self.local is not None else x
+
+
+def token_coordinates(cfg):
+    """Token centers in crop-local XYZ, including patch padding at crop edges."""
+    d,y,x = torch.meshgrid(*(torch.arange(n).float() for n in cfg.token_shape),indexing='ij')
+    xyz = torch.stack((x,y,d),-1)
+    xyz = (xyz*xyz.new_tensor(tuple(reversed(cfg.token_stride)))
+           +xyz.new_tensor(tuple(reversed(cfg.token_offset))))*cfg.fine.spacing
+    return xyz-xyz.new_tensor(((cfg.fine.width-1)*cfg.fine.spacing/2,)*2+(cfg.fine.behind*cfg.fine.spacing,))
 
 
 class AxialEncoder(nn.Module):
@@ -297,22 +322,20 @@ class AxialEncoder(nn.Module):
         self.dense_projection = nn.Conv3d(h,c,1)
         self.dense_decoder = nn.Sequential(nn.Conv3d(2*c,c,3,padding=1,bias=False),
             nn.GroupNorm(math.gcd(8,c),c),nn.SiLU(),nn.Conv3d(c,c,3,padding=1,bias=False))
-        d,y,x = torch.meshgrid(*(torch.arange(n).float() for n in cfg.token_shape),indexing='ij')
-        xyz = torch.stack((2*x,2*y,8*d+3),-1)*cfg.fine.spacing
-        xyz -= xyz.new_tensor(((cfg.fine.width-1)*cfg.fine.spacing/2,)*2+(cfg.fine.behind*cfg.fine.spacing,))
+        xyz = token_coordinates(cfg)
         self.register_buffer('token_xyz',xyz.reshape(-1,3),persistent=False)
         d,y,x = torch.meshgrid(torch.arange(cfg.fine.depth).float(),
             torch.arange(cfg.fine.width).float(),torch.arange(cfg.fine.width).float(),indexing='ij')
         points = torch.stack((x,y,d),-1)*cfg.fine.spacing
         points -= points.new_tensor(((cfg.fine.width-1)*cfg.fine.spacing/2,)*2+(cfg.fine.behind*cfg.fine.spacing,))
-        self.register_buffer('decode_grid',feature_grid(points,cfg.fine,cfg.token_shape,TOKEN_STRIDE,TOKEN_OFFSET)[None],persistent=False)
+        self.register_buffer('decode_grid',feature_grid(points,cfg.fine,cfg.token_shape,cfg.token_stride,cfg.token_offset)[None],persistent=False)
 
     def conditioning(self, references, mask):
         cfg = self.cfg
         points = torch.where(mask[...,None],references,0.).float()
         origin = device_vector(points, (-(cfg.fine.width-1)*cfg.fine.spacing/2,)*2+(-cfg.fine.behind*cfg.fine.spacing,))
-        offset = device_vector(points, (0,0,3))*cfg.fine.spacing
-        index = torch.round((points-origin-offset)/(device_vector(points, (2,2,8))*cfg.fine.spacing)).long()
+        offset = device_vector(points, tuple(reversed(cfg.token_offset)))*cfg.fine.spacing
+        index = torch.round((points-origin-offset)/(device_vector(points, tuple(reversed(cfg.token_stride)))*cfg.fine.spacing)).long()
         d,y,x = cfg.token_shape
         index = torch.stack((index[...,0].clamp(0,x-1),index[...,1].clamp(0,y-1),index[...,2].clamp(0,d-1)),-1)
         flat = index[...,0]+x*(index[...,1]+y*index[...,2])
@@ -396,8 +419,13 @@ class DirectFollower(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
+        self.architecture = cfg.architecture
         c,h = cfg.channels,cfg.hidden
-        self.encoder = AxialEncoder(cfg)
+        if cfg.encoder == 'patch4':
+            from .patch_encoder import PatchShuffleEncoder
+            self.encoder = PatchShuffleEncoder(cfg)
+        else:
+            self.encoder = AxialEncoder(cfg)
         self.reference_token = nn.Sequential(nn.Linear(c+8,h),nn.SiLU(),nn.Linear(h,h))
         self.query = nn.Sequential(nn.Linear(9*c+1,h),nn.SiLU(),nn.Linear(h,h))
         layer = PathDecoderLayer(h,cfg.heads,2*h,dropout=0.,activation='gelu',batch_first=True,norm_first=True)
@@ -469,7 +497,7 @@ class DirectFollower(nn.Module):
         local,support = sample_features(ctx.get('fine_fp32', ctx['fine']),(points[:,:,None]+self.path_stencil).reshape(b,k*27,3),self.cfg.fine)
         local = local.to(ctx['fine'].dtype)
         local = torch.cat((local,support[...,None]),-1).reshape(b,k,-1)
-        deep,valid = sample_features(ctx.get('deep_fp32', ctx['deep']),points,self.cfg.fine,TOKEN_STRIDE,TOKEN_OFFSET)
+        deep,valid = sample_features(ctx.get('deep_fp32', ctx['deep']),points,self.cfg.fine,self.cfg.token_stride,self.cfg.token_offset)
         deep = deep.to(ctx['deep'].dtype)
         return torch.cat((local,deep,valid[...,None]),-1)
 

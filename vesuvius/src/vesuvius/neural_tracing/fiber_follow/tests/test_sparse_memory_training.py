@@ -177,11 +177,12 @@ def test_history_rejects_missing_reset_and_future_encoder_selection():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA unavailable')
-def test_cuda_sparse_collection_replay_gradients_and_graph_reuse():
+@pytest.mark.parametrize('encoder', ['conv', 'patch4'])
+def test_cuda_sparse_collection_replay_gradients_and_graph_reuse(encoder):
     from torch._dynamo.utils import counters
     from vesuvius.neural_tracing.fiber_follow.regression.train import conv_memory_format
     torch.manual_seed(734)
-    reference = build_model(cfg(memory_steps=2, recurrent_refinement_steps=1)).to('cuda', memory_format=conv_memory_format('cuda'))
+    reference = build_model(cfg(encoder=encoder, memory_steps=2, recurrent_refinement_steps=1)).to('cuda', memory_format=conv_memory_format('cuda'))
     compiled = copy.deepcopy(reference)
     chunks = stream(reference.cfg, length=7, batch=2)
     results = []

@@ -22,7 +22,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.runloop import (
 )
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume, FiberVolumeSpec
 from vesuvius.neural_tracing.fiber_follow.regression.model import (
-    ARCHITECTURE, DirectConfig, build_model,
+    ARCHITECTURE, PATCH_ARCHITECTURE, DirectConfig, build_model,
 )
 from vesuvius.neural_tracing.fiber_follow.regression.data import (
     IdentityObservationBuilder, IdentitySampling, DirectTracer, LOCATION_SOURCES,
@@ -283,7 +283,7 @@ def initialize_training_optimizer(model, ema, args, resume=None):
     return opt, done, origin
 
 
-ARCHITECTURES = (ARCHITECTURE,)
+ARCHITECTURES = (ARCHITECTURE, PATCH_ARCHITECTURE)
 FEATURE_OPTIONS = ('feature_detail_tokens', 'feature_stream_steps', 'feature_history_decisions',
                    'feature_switch_crop_fraction', 'feature_history_loss_fraction')
 MEMORY_GRAD_CLIP = 5.
@@ -291,7 +291,19 @@ REST_GRAD_CLIP = 20.
 
 
 def checkpoint_config(ck):
-    return DirectConfig(**ck['model_cfg'])
+    cfg = DirectConfig(**ck['model_cfg'])
+    if ck['architecture'] != cfg.architecture:
+        raise ValueError('Checkpoint architecture does not match its encoder configuration')
+    return cfg
+
+
+def resolve_encoder(requested, checkpoint=None):
+    if checkpoint is None:
+        return requested or DirectConfig.encoder
+    saved = checkpoint_config(checkpoint).encoder
+    if requested is not None and requested != saved:
+        raise ValueError('Encoder must match the resumed checkpoint; start a new run to change it')
+    return saved
 
 
 def load_checkpoint(path,device='cuda'):
@@ -665,6 +677,8 @@ def build_parser():
     ap.add_argument('--tolerance', type=float, default=1.5)
     ap.add_argument('--n-commit', type=int, default=16)
     ap.add_argument('--channels', type=int, default=DirectConfig.channels, help='Base image encoder width')
+    ap.add_argument('--encoder', choices=('conv', 'patch4'), default=None,
+                    help='Image encoder: conv (default) or convolution-free 4x4x4 patches with pixel shuffle; inferred on resume')
     ap.add_argument('--direction-inputs', action=argparse.BooleanOptionalAction, default=True,
                     help='Add six sign-invariant direction channels to main, memory and seed crops; no image augmentations on these channels')
     ap.add_argument('--decoder-layers', type=int, default=4)
@@ -806,7 +820,8 @@ def main(argv=None):
     torch.set_num_threads(args.threads)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    cfg = DirectConfig(direction_inputs=args.direction_inputs,channels=args.channels,hidden=args.hidden,layers=args.axial_layers,
+    cfg = DirectConfig(encoder=resolve_encoder(args.encoder),
+                       direction_inputs=args.direction_inputs,channels=args.channels,hidden=args.hidden,layers=args.axial_layers,
                        decoder_layers=args.decoder_layers,
                        activation_checkpointing=args.activation_checkpointing,
                        memory_slots=args.memory_slots,memory_steps=args.memory_steps,
@@ -817,12 +832,14 @@ def main(argv=None):
     resume = None
     if args.resume:
         resume = read_checkpoint(args.resume,ARCHITECTURES,args.device)
+        resolve_encoder(args.encoder, resume)
         # Sampling spacing changes no parameter shapes; use the requested value.
         cfg = replace(checkpoint_config(resume), memory_stride=args.memory_stride,
                       feature_switch_crop_fraction=args.feature_switch_crop_fraction,
                       feature_history_loss_fraction=args.feature_history_loss_fraction)
         if args.direction_inputs != cfg.direction_inputs:
             raise ValueError('Direction inputs must match the resumed checkpoint; start a new run to change them')
+    args.encoder = cfg.encoder
     if args.decision_fraction and args.microbatch % 2:
         raise ValueError('Matched decisions require an even microbatch')
     if args.microbatch % cfg.feature_sequence_length:
@@ -906,7 +923,8 @@ def main(argv=None):
                    'bank_hard_fraction','replay_failure_fraction','bank_switch_tolerance','bank_own_tolerance',
                    'n_commit','memory_stride','feature_switch_crop_fraction','feature_history_loss_fraction'}
         for key,value in vars(args).items():
-            recorded = resume['training_options'][key]
+            recorded = (resume['training_options'].get(key, 'conv') if key == 'encoder'
+                        else resume['training_options'][key])
             if key not in ignored and json.dumps(recorded,sort_keys=True) != json.dumps(value,sort_keys=True):
                 raise ValueError(f'Resume option differs: {key}')
         if resume['seed_manifest_sha256'] != manifest['sha256'] or resume['fiber_manifest'] != fiber_manifest(fibers):

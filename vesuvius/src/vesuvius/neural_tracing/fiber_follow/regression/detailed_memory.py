@@ -4,7 +4,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from .model import sample_features, crop_support, TOKEN_STRIDE, TOKEN_OFFSET
+from .model import sample_features, crop_support
 
 
 class DetailedFeatureMemory(nn.Module):
@@ -84,7 +84,7 @@ class DetailedFeatureMemory(nn.Module):
             patches = points[:, :, None]+self.detail_stencil
             values, support = sample_features(fine, patches.reshape(b, n*9, 3), self.cfg.fine)
             local = torch.cat((values, support[..., None]), -1).reshape(b, n, -1)
-            context, supported = sample_features(deep, points, self.cfg.fine, TOKEN_STRIDE, TOKEN_OFFSET)
+            context, supported = sample_features(deep, points, self.cfg.fine, self.cfg.token_stride, self.cfg.token_offset)
             detail = self.detail_projection(torch.cat((local, context, supported[..., None]), -1))+self.detail_role
             detail = torch.where(valid[..., None], detail, 0.)
             xyz = torch.cat((self.local_xyz[None].expand(b, -1, -1), points), 1)

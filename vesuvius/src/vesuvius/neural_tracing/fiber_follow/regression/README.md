@@ -1,7 +1,8 @@
 # Observation-memory fiber regression
 
-Regression has one model: the continuous follower with main-encoder observation
-memory, shared-decoder refinement, and causal segment survival confidence.
+Regression uses a continuous follower with main-encoder observation memory,
+shared-decoder refinement, and causal segment survival confidence. The image
+encoder can use convolutions or 4x4x4 patches with learned pixel-shuffle reconstruction.
 See [architecture and supervision](TRAJECTORY_MEMORY.md).
 
 ## Training
@@ -13,14 +14,54 @@ bash scripts/launch_memory.sh
 tail -F output/logs/axial_survival_memory_v9_run1.log
 ```
 
-The architecture/training contract is `axial_fiber_memory_v9`. Start a fresh run;
-older checkpoints are rejected, with no migration or compatibility mode. The
+The default `--encoder conv` architecture is `axial_fiber_memory_v9`. The
 launcher refuses an existing destination. Set `RUN_NAME` for another fresh run;
 trailing arguments override `regression.train.build_parser` defaults.
 
+To try the convolution-free encoder in a fresh run:
+
+```bash
+bash scripts/launch_patch4_memory.sh
+tail -F output/logs/axial_patch4_memory_v9_run1.log
+```
+
+The patch launcher defaults to `--batch 1 --microbatch 16 --feature-sequence-length 2`:
+a minimum of one supervised decision per update, with eight traces by two
+observations per loader chunk. Whole chunks remain intact, so an update can have
+more than one supervised decision. Edit `BATCH_SIZE`, `MICROBATCH_SIZE`, and
+`WORKERS` (default 8 data-loader workers) near the top of the script, or override
+them in the environment:
+
+```bash
+BATCH_SIZE=8 MICROBATCH_SIZE=16 WORKERS=8 bash scripts/launch_patch4_memory.sh
+```
+
+Decisions still run one at a time; `--batch` controls gradient accumulation.
+Both encoders always compile their training operations. `RUN_NAME`, `BANK_PATH`,
+and trailing arguments work as in `launch_memory.sh`.
+
+`patch4` embeds ordered 4x4x4 patches, applies the configured axial transformer
+blocks, and projects each token into 64 distinct fine-feature vectors before 3D
+pixel shuffle. It reconstructs the original crop resolution for the existing
+path decoder, survival scorer and memory writer. With the default crop, its
+token grid is 30x26x26, at 128 channels with four axial blocks. It has no spatial
+convolutions, including inside the axial blocks. `--activation-checkpointing`
+works with either encoder.
+
+Patch runs save the architecture `axial_patch4_fiber_memory_v9` and their encoder
+choice in checkpoints. Loading for tracing/collection and resuming training
+select the saved encoder automatically; an explicit conflicting `--encoder`
+is rejected. Existing convolutional v9 checkpoints without an encoder field
+still load as `conv`. Changing encoders requires a fresh run; v1-v8 checkpoints
+remain unsupported. The patch encoder's speed has been benchmarked, but tracing
+quality still needs evaluation.
+
 Every historical crop is encoded into spatially located appearance tokens. Most
-crops use an observation-only, no-grad encoder path: they do not run the dense
-feature decoder, trajectory generator, confidence scorer, or refinement. The
+crops use an observation-only, no-grad encoder path: they skip the trajectory
+generator, confidence scorer, and refinement. The convolutional encoder reuses
+stem features; the patch encoder uses its linear/shuffle reconstruction to supply
+local appearance to memory. Full supervised predictions reconstruct fine features
+after reading historical memory. The
 endpoint and at most `--feature-history-decisions 2` uniformly sampled earlier
 positions receive full supervised predictions. Sampling happens once per stream
 in the loader, independently of the model's confidence and label observability.
