@@ -12,6 +12,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include <nlohmann/json.hpp>
 #include <opencv2/core/types.hpp>
 
 #include "LineAnnotationAdjacentLinks.hpp"
@@ -408,4 +409,26 @@ TEST_CASE("geometry key: identical geometry under another name is recognised")
     copy.linePoints.back()[0] += 1.0e-9;
     CHECK(vc3d::line_annotation::fiberGeometryKey(a.controlPoints, a.linePoints) !=
           vc3d::line_annotation::fiberGeometryKey(copy.controlPoints, copy.linePoints));
+}
+
+TEST_CASE("referenced file names: every branch_file counts, valid or not")
+{
+    const nlohmann::json root = nlohmann::json::parse(R"({
+        "branches": [
+            {"control_point_index": 2, "branch_file": "sub/dir/a.json"},
+            {"control_point_index": "nine", "branch_file": "b.json"},
+            {"control_point_index": 999},
+            "not an object",
+            {"branch_file": 7}
+        ],
+        "adjacent_branches": {"not": "an array"},
+        "control_points": []
+    })");
+    const auto names = vc3d::line_annotation::referencedFiberFileNames(root);
+    CHECK(names == std::vector<std::string>{"a.json", "b.json"});
+    CHECK(vc3d::line_annotation::referencedFiberFileNames(nlohmann::json::array()).empty());
+    const nlohmann::json adjacentOnly = nlohmann::json::parse(
+        R"({"adjacent_branches": [{"branch_file": "c.json"}]})");
+    CHECK(vc3d::line_annotation::referencedFiberFileNames(adjacentOnly) ==
+          std::vector<std::string>{"c.json"});
 }

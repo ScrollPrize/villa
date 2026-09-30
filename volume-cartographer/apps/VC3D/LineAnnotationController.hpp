@@ -1135,14 +1135,35 @@ private:
     [[nodiscard]] static nlohmann::json fiberSaveSnapshotToJson(
         const FiberSaveSnapshot& snapshot,
         double scale = 1.0);
-    [[nodiscard]] std::optional<StoredFiber> loadFiberJson(const nlohmann::json& root,
-                                                           const std::filesystem::path& path,
-                                                           std::vector<std::string>* branchErrors = nullptr) const;
+    // A link entry a load dropped from a stored record (neutralized, removed
+    // by a repair, or stripped by the lenient parser). Fields a stripped
+    // entry did not parse stay unset; a descriptor without a target matches
+    // nothing.
+    struct DroppedLinkEntry {
+        std::filesystem::path ownerSourceRoot;
+        std::string ownerFileName;
+        std::string targetFileName;
+        bool adjacent = false;
+        std::optional<int> localIndex;
+        std::optional<cv::Vec3d> controlPointPosition;
+        std::optional<cv::Vec3d> branchControlPointPosition;
+        // The whole array of this kind was unreadable (not an array): every
+        // entry of the kind is unaccounted for.
+        bool wholeKind = false;
+    };
+    // `stripped` (optional, lenient mode only) receives one descriptor per
+    // link entry the parser discarded, with whatever fields it could read.
+    [[nodiscard]] std::optional<StoredFiber> loadFiberJson(
+        const nlohmann::json& root,
+        const std::filesystem::path& path,
+        std::vector<std::string>* branchErrors = nullptr,
+        std::vector<DroppedLinkEntry>* stripped = nullptr) const;
     [[nodiscard]] // Reads and parses one fiber file, stamping StoredFiber::loadedWriteTime
     // from before the read; branchErrors, when given, collects per-branch
     // load problems the way loadFiberJson reports them.
     std::optional<StoredFiber> loadFiberFile(const std::filesystem::path& path,
-                                             std::vector<std::string>* branchErrors = nullptr) const;
+                                             std::vector<std::string>* branchErrors = nullptr,
+                                             std::vector<DroppedLinkEntry>* stripped = nullptr) const;
     [[nodiscard]] std::vector<BranchLinkValidationIssue> collectLoadedFiberBranchIssues(
         const std::vector<StoredFiber>& fibers) const;
     // Drops the offending entries (and, through the fixed point, their
@@ -1152,11 +1173,14 @@ private:
     std::size_t neutralizeLoadedFiberBranchLinks(
         std::vector<StoredFiber>& fibers,
         const std::vector<BranchLinkValidationIssue>& issues) const;
+    // `writtenFiles` receives the source-qualified keys of the records
+    // saveFiberNow completed (a stale-skipped or failed write is not in it).
     [[nodiscard]] bool repairLoadedFiberBranchLinks(
         std::vector<StoredFiber>& fibers,
         const std::unordered_set<std::string>& fibersWithRemovedBranchEntries,
         const std::vector<BranchLinkValidationIssue>& initialIssues,
-        std::vector<std::string>& errors) const;
+        std::vector<std::string>& errors,
+        std::unordered_set<std::string>* writtenFiles = nullptr) const;
     [[nodiscard]] std::string uniqueImportedFiberFileName(const StoredFiber& fiber,
                                                           std::unordered_set<std::string>& reserved,
                                                           uint64_t& nextSequence) const;
@@ -1432,6 +1456,12 @@ private:
     // A structural edit's disk undo left artifacts behind: memory and disk
     // are known to differ until the next load. Latched until then.
     bool _structuralEditRecoveryRequired = false;
+    // Loads restarted because a save was scheduled while the broken-link
+    // prompt was open (its snapshot predates the reconciliation). Past the
+    // bound the next load answers the prompt itself with "Keep files
+    // unchanged" (no modal, so nothing can schedule a save during it).
+    int _fiberLoadRestartsForSaves = 0;
+    bool _fiberLoadAutoKeepUnchanged = false;
 
     // Everything a merge/split needs from the menu callback, captured by
     // identity and position (never by index or iterator) because phase B
@@ -1481,24 +1511,29 @@ private:
     // Entries the current load dropped from stored records (neutralize or
     // repair): the same entries are removed from open sessions, including
     // their armed rollback copies, so no session writes a one-way link back.
-    struct DroppedLinkEntry {
-        std::filesystem::path ownerSourceRoot;
-        std::string ownerFileName;
-        std::string targetFileName;
-        cv::Vec3d controlPointPosition{0.0, 0.0, 0.0};
-        cv::Vec3d branchControlPointPosition{0.0, 0.0, 0.0};
-        bool adjacent = false;
-    };
     static std::vector<DroppedLinkEntry> droppedLinkEntries(
         const std::vector<StoredFiber>& before, const std::vector<StoredFiber>& after);
-    void dropLinkEntriesFromOpenSessions(const std::vector<DroppedLinkEntry>& dropped);
+    // Removes from every open session (its live branches and its armed
+    // rollback copies) the entries in `dropped` that the session's own
+    // record in `records` no longer holds, matched on every field the
+    // descriptor knows.
+    void dropLinkEntriesFromOpenSessions(const std::vector<DroppedLinkEntry>& dropped,
+                                         const std::vector<StoredFiber>& records);
     bool structuralEditPreflight(uint64_t packageGeneration, uint64_t loadSequence,
                                  std::string* error);
     [[nodiscard]] bool structuralEditParticipantAllowed(const std::filesystem::path& sourceRoot,
                                                         const std::string& fileName,
                                                         std::string* error) const;
+    // Files that may still reference an original although no record in the
+    // write set does: flagged records outside the write set (their file
+    // holds entries the record dropped at load) and files hidden by the
+    // source dedupe (their links are in no record at all). Read raw, so the
+    // lenient parser cannot hide an entry a second time; references resolve
+    // the way the loader resolves them (owner source root + basename,
+    // through the alias table).
     [[nodiscard]] std::optional<std::string> structuralEditStaleLinkOnDisk(
-        const std::vector<StoredFiber>& originals) const;
+        const std::vector<StoredFiber>& originals,
+        const std::unordered_set<std::string>& writeSetKeys) const;
     // Deduplicates the deferred re-optimization prompt across reentrant
     // fiber (re)loads.
     bool _reoptimizationPromptPending = false;

@@ -21,6 +21,8 @@
 #include <utility>
 #include <vector>
 
+#include <nlohmann/json_fwd.hpp>
+
 #include "LineAnnotationFiberLinkValidation.hpp"
 #include "LineAnnotationFiberLinks.hpp"
 #include "LineAnnotationFiberSegments.hpp"
@@ -168,6 +170,15 @@ StructuralGraphCheck checkStructuralEditGraph(const std::vector<StoredFiber>& gr
     }
     return check;
 }
+
+// The `branch_file` values a fiber document names in its "branches" and
+// "adjacent_branches" arrays, reduced to basenames, read WITHOUT the fiber
+// parser's validation: an entry the lenient loader would strip (out-of-range
+// index, missing field, non-object element) still names its target here.
+// Elements without a string branch_file, and arrays that are not arrays, are
+// skipped. Used by the structural-edit preflight to see what a file still
+// references on disk regardless of what the loaded record kept.
+[[nodiscard]] std::vector<std::string> referencedFiberFileNames(const nlohmann::json& root);
 
 // Exact geometry fingerprint the loader's source dedupe uses to recognise
 // the same fiber stored under two names (raw double bits, format-independent).

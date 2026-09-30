@@ -2,6 +2,9 @@
 
 #include <algorithm>
 #include <cstring>
+#include <filesystem>
+
+#include <nlohmann/json.hpp>
 
 namespace vc3d::line_annotation {
 
@@ -353,6 +356,35 @@ std::optional<std::size_t> redirectBranchRefs(std::vector<FiberBranchRef>& refs,
         ref.branchControlPointIndex = target.controlPointIndex;
     }
     return resolved.size();
+}
+
+std::vector<std::string> referencedFiberFileNames(const nlohmann::json& root)
+{
+    std::vector<std::string> names;
+    if (!root.is_object()) {
+        return names;
+    }
+    for (const char* kind : {"branches", "adjacent_branches"}) {
+        const auto it = root.find(kind);
+        if (it == root.end() || !it->is_array()) {
+            continue;
+        }
+        for (const auto& entry : *it) {
+            if (!entry.is_object()) {
+                continue;
+            }
+            const auto file = entry.find("branch_file");
+            if (file == entry.end() || !file->is_string()) {
+                continue;
+            }
+            const std::string name =
+                std::filesystem::path(file->get<std::string>()).filename().string();
+            if (!name.empty()) {
+                names.push_back(name);
+            }
+        }
+    }
+    return names;
 }
 
 std::string fiberGeometryKey(const std::vector<StoredControlPoint>& controls,
