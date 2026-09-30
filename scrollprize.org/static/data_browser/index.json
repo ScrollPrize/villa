@@ -5475,8 +5475,7 @@
         "textFound": "Ink detected",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 8.9,
-        "wkUrl": null
+        "score": 8.9
       },
       "stages": {
         "scanned": true,
@@ -7555,8 +7554,7 @@
         "textFound": "Ink detected",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 7.6,
-        "wkUrl": null
+        "score": 7.6
       },
       "stages": {
         "scanned": true,
@@ -7940,8 +7938,7 @@
         "textFound": "Segmenting",
         "textRank": 1,
         "unrolledPct": 0,
-        "score": 1016.6,
-        "wkUrl": null
+        "score": 1016.6
       },
       "stages": {
         "scanned": true,
@@ -8088,8 +8085,7 @@
         "textFound": "Segmenting",
         "textRank": 1,
         "unrolledPct": 0,
-        "score": 8.9,
-        "wkUrl": null
+        "score": 8.9
       },
       "stages": {
         "scanned": true,
@@ -8203,8 +8199,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 7.6,
-        "wkUrl": null
+        "score": 7.6
       },
       "stages": {
         "scanned": true,
@@ -8329,8 +8324,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 7.6,
-        "wkUrl": null
+        "score": 7.6
       },
       "stages": {
         "scanned": true,
@@ -8446,8 +8440,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 7.6,
-        "wkUrl": null
+        "score": 7.6
       },
       "stages": {
         "scanned": true,
@@ -8574,8 +8567,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 7.6,
-        "wkUrl": null
+        "score": 7.6
       },
       "stages": {
         "scanned": true,
@@ -8669,8 +8661,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 7.6,
-        "wkUrl": null
+        "score": 7.6
       },
       "stages": {
         "scanned": true,
@@ -8874,8 +8865,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 1.4,
-        "wkUrl": null
+        "score": 1.4
       },
       "stages": {
         "scanned": true,
@@ -8969,8 +8959,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 1.4,
-        "wkUrl": null
+        "score": 1.4
       },
       "stages": {
         "scanned": true,
@@ -9064,8 +9053,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 1.4,
-        "wkUrl": null
+        "score": 1.4
       },
       "stages": {
         "scanned": true,
@@ -9170,8 +9158,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 1.4,
-        "wkUrl": null
+        "score": 1.4
       },
       "stages": {
         "scanned": true,
@@ -9370,8 +9357,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 1.4,
-        "wkUrl": null
+        "score": 1.4
       },
       "stages": {
         "scanned": true,
@@ -9465,8 +9451,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 1.4,
-        "wkUrl": null
+        "score": 1.4
       },
       "stages": {
         "scanned": true,
@@ -9560,8 +9545,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 1.4,
-        "wkUrl": null
+        "score": 1.4
       },
       "stages": {
         "scanned": true,
@@ -9655,8 +9639,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 1.4,
-        "wkUrl": null
+        "score": 1.4
       },
       "stages": {
         "scanned": true,
@@ -9750,8 +9733,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 1.4,
-        "wkUrl": null
+        "score": 1.4
       },
       "stages": {
         "scanned": true,
@@ -9856,8 +9838,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 1.4,
-        "wkUrl": null
+        "score": 1.4
       },
       "stages": {
         "scanned": true,
@@ -9962,8 +9943,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 1.4,
-        "wkUrl": null
+        "score": 1.4
       },
       "stages": {
         "scanned": true,
@@ -10068,8 +10048,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 0.6,
-        "wkUrl": null
+        "score": 0.6
       },
       "stages": {
         "scanned": true,
@@ -10174,8 +10153,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 0.6,
-        "wkUrl": null
+        "score": 0.6
       },
       "stages": {
         "scanned": true,
@@ -10280,8 +10258,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 0.6,
-        "wkUrl": null
+        "score": 0.6
       },
       "stages": {
         "scanned": true,
@@ -10386,8 +10363,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 0.6,
-        "wkUrl": null
+        "score": 0.6
       },
       "stages": {
         "scanned": true,
@@ -10492,8 +10468,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 0.6,
-        "wkUrl": null
+        "score": 0.6
       },
       "stages": {
         "scanned": true,
@@ -10598,8 +10573,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 0.6,
-        "wkUrl": null
+        "score": 0.6
       },
       "stages": {
         "scanned": true,
@@ -10704,8 +10678,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 0.6,
-        "wkUrl": null
+        "score": 0.6
       },
       "stages": {
         "scanned": true,
@@ -10810,8 +10783,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 0.6,
-        "wkUrl": null
+        "score": 0.6
       },
       "stages": {
         "scanned": true,
@@ -10905,8 +10877,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 0.6,
-        "wkUrl": null
+        "score": 0.6
       },
       "stages": {
         "scanned": true,
@@ -10989,8 +10960,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 0,
-        "wkUrl": null
+        "score": 0
       },
       "stages": {
         "scanned": true,
@@ -11047,8 +11017,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 0,
-        "wkUrl": null
+        "score": 0
       },
       "stages": {
         "scanned": true,
@@ -11105,8 +11074,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 0,
-        "wkUrl": null
+        "score": 0
       },
       "stages": {
         "scanned": true,
@@ -11163,8 +11131,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 0,
-        "wkUrl": null
+        "score": 0
       },
       "stages": {
         "scanned": true,
@@ -11221,8 +11188,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 0,
-        "wkUrl": null
+        "score": 0
       },
       "stages": {
         "scanned": true,
@@ -11279,8 +11245,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 0,
-        "wkUrl": null
+        "score": 0
       },
       "stages": {
         "scanned": true,

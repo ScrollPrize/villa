@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import { neuroglancerUrl } from "./dataAccess";
-import { scanConfigurations, webknossosDatasets } from "./buildIndex";
+import { webknossosDatasets } from "./buildIndex";
 
 // DataCatalog — the "Data & access" panel for a scroll detail page.
 // Ported from the reference renderer (ref/scroll.html ~104-127): a set of
@@ -82,16 +82,6 @@ function VolumeDropdown({ label, items }) {
       ) : null}
     </span>
   );
-}
-
-function configText(c) {
-  const parts = [
-    c.px != null ? `${c.px} µm` : null,
-    c.energy != null ? `${c.energy} keV` : null,
-    c.loc || null,
-    c.n > 1 ? `${c.n} scans` : null,
-  ].filter(Boolean);
-  return parts.length ? parts.join(" · ") : "unspecified";
 }
 
 export default function DataCatalog({ scroll }) {
@@ -194,8 +184,6 @@ export default function DataCatalog({ scroll }) {
     );
   }
 
-  // Metadata rows (ref lines 115-123).
-  const configs = scanConfigurations(scroll.scans);
 
   return (
     <div className="panel full catalog">
@@ -210,14 +198,6 @@ export default function DataCatalog({ scroll }) {
         )}
       </div>
       <dl className="meta">
-        <dt>Scan configurations</dt>
-        <dd>
-          {configs.length
-            ? configs.map((c) => (
-                <div key={`${c.px}|${c.energy}|${c.loc}`}>{configText(c)}</div>
-              ))
-            : "—"}
-        </dd>
         <dt>Formats</dt>
         <dd>CT volumes (TIFF stacks · OME-Zarr) · surface segments</dd>
         <dt>License</dt>
