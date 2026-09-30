@@ -610,16 +610,18 @@ bool PointCollections::loadFromJSON(const std::string& filename)
         return false;
     }
 
-    clearAll();
-
+    // Parse the whole document before touching the store, so a malformed
+    // file (for example an invalid collection uuid) leaves it unchanged.
+    Json fileMetadata;
+    std::unordered_map<uint64_t, Collection> collections;
     try {
         if (!j.contains("vc_pointcollections_json_version") || j.at("vc_pointcollections_json_version").get_string() != VC_POINTCOLLECTIONS_JSON_VERSION) {
             throw std::runtime_error("JSON file has incorrect version or is missing version info.");
         }
 
-        _fileMetadata = j;
-        _fileMetadata.erase("vc_pointcollections_json_version");
-        _fileMetadata.erase("collections");
+        fileMetadata = j;
+        fileMetadata.erase("vc_pointcollections_json_version");
+        fileMetadata.erase("collections");
 
         Json collections_obj = j.at("collections");  // copy — ref into at() cache gets evicted by nested at() calls
         if (!collections_obj.is_object()) {
@@ -631,15 +633,21 @@ bool PointCollections::loadFromJSON(const std::string& filename)
             Collection col;
             from_json(*it, col);
             col.id = id;
-            _collections[col.id] = col;
-            for (auto& point_pair : _collections.at(col.id).points) {
+            for (auto& point_pair : col.points) {
                 point_pair.second.collectionId = col.id;
             }
+            collections[col.id] = std::move(col);
         }
 
     } catch (const std::exception& e) {
         std::cerr << "Failed to extract data from JSON: " << e.what() << std::endl;
         return false;
+    }
+
+    clearAll();
+    _fileMetadata = std::move(fileMetadata);
+    for (auto& [id, col] : collections) {
+        _collections[id] = std::move(col);
     }
 
     // Recalculate next IDs
@@ -794,9 +802,9 @@ bool PointCollections::loadFromSegmentPath(const std::filesystem::path& segmentP
             return false;
         }
 
-        std::vector<uint64_t> addedCollectionIds;
-        int loadedCount = 0;
-
+        // Parse every collection before installing any, so a malformed file
+        // does not leave a partial load behind.
+        std::vector<Collection> parsed;
         for (auto it = collections_obj.begin(); it != collections_obj.end(); ++it) {
             Collection col;
             from_json(*it, col);
@@ -804,9 +812,14 @@ bool PointCollections::loadFromSegmentPath(const std::filesystem::path& segmentP
             if (!col.anchor2d.has_value()) {
                 continue;
             }
+            col.id = std::stoull(it.key());
+            parsed.push_back(std::move(col));
+        }
 
-            uint64_t id = std::stoull(it.key());
-            col.id = id;
+        std::vector<uint64_t> addedCollectionIds;
+        int loadedCount = 0;
+
+        for (auto& col : parsed) {
             _collections[col.id] = col;
             for (auto& point_pair : _collections.at(col.id).points) {
                 point_pair.second.collectionId = col.id;

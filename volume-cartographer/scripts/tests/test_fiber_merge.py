@@ -1779,3 +1779,60 @@ def test_v3_tagging_and_refitting_the_same_final_span_is_a_manual_conflict():
 
     assert not result['ok']
     assert any('changed differently on both sides' in c for c in result['conflicts'])
+
+
+FIBER_UUID_A = '0f8fad5b-d9cb-469f-a165-70867728950e'
+FIBER_UUID_B = '7c9e6679-7425-40de-944b-e07fc1f90ae7'
+
+
+def test_is_fiber_doc_rejects_present_but_invalid_uuid():
+    doc = make_fiber(BASE_CPS)
+    assert fiber_merge.is_fiber_doc(doc)  # legacy: no uuid
+    doc['uuid'] = FIBER_UUID_A
+    assert fiber_merge.is_fiber_doc(doc)
+    doc['uuid'] = FIBER_UUID_A.upper()  # isxdigit accepts either case
+    assert fiber_merge.is_fiber_doc(doc)
+    for bad in ('dj_x_000001', '', None, 7, FIBER_UUID_A + '0',
+                FIBER_UUID_A.replace('-', '')):
+        doc['uuid'] = bad
+        assert not fiber_merge.is_fiber_doc(doc), bad
+
+
+def test_differing_uuids_are_a_conflict_not_a_generation_pick():
+    base = make_fiber(BASE_CPS)
+    local = make_fiber(BASE_CPS, tags=['x'], generation=3)
+    remote = make_fiber(BASE_CPS, tags=['y'], generation=2)
+    local['uuid'] = FIBER_UUID_A
+    remote['uuid'] = FIBER_UUID_B
+    result = merge_fibers(base, local, remote)
+    assert not result['ok']
+    assert any("'uuid' differs" in c for c in result['conflicts'])
+    # Even when only one side "changed", an identity swap is a conflict.
+    base['uuid'] = FIBER_UUID_A
+    local = copy.deepcopy(base)
+    remote = copy.deepcopy(base)
+    remote['uuid'] = FIBER_UUID_B
+    assert not merge_fibers(base, local, remote)['ok']
+
+
+def test_uuid_survives_merge_from_either_side():
+    base = make_fiber(BASE_CPS)
+    # Newer (remote) side is legacy; local carries the uuid.
+    local = make_fiber(BASE_CPS, tags=['x'], generation=2)
+    remote = make_fiber(BASE_CPS, tags=['y'], generation=5)
+    local['uuid'] = FIBER_UUID_A
+    result = merge_fibers(base, local, remote)
+    assert result['ok'], result['conflicts']
+    assert result['merged']['uuid'] == FIBER_UUID_A
+    # Short circuit: local unchanged, remote (without uuid) taken.
+    base['uuid'] = FIBER_UUID_A
+    local = copy.deepcopy(base)
+    remote = make_fiber(BASE_CPS, tags=['y'], generation=2)
+    result = merge_fibers(base, local, remote)
+    assert result['ok'] and result['merged']['uuid'] == FIBER_UUID_A
+    # Same uuid on both sides is the ordinary case.
+    remote['uuid'] = FIBER_UUID_A
+    local = make_fiber(BASE_CPS, tags=['x'], generation=3)
+    local['uuid'] = FIBER_UUID_A
+    result = merge_fibers(base, local, remote)
+    assert result['ok'] and result['merged']['uuid'] == FIBER_UUID_A

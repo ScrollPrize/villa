@@ -17,6 +17,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import uuid
 
 import numpy as np
 from scipy.ndimage import label
@@ -211,6 +212,9 @@ def write_merged_metadata(original_path, merged_path, native_report, validation)
     before = json.loads((original_path / 'meta.json').read_text())
     rendered = json.loads((merged_path / 'meta.json').read_text())
     result = dict(before)
+    # The extended strip coexists with the original: a new object, so it gets
+    # a fresh identity rather than inheriting the source strip's uuid.
+    result['uuid'] = str(uuid.uuid4())
     result['bbox'] = rendered['bbox']
     result['constraint_graph'] = rendered['constraint_graph']
     result['area_vx2'] = validation['area_vx2']

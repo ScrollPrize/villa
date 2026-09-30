@@ -134,7 +134,7 @@ echo ""
 # Same meta.json fixup VC3D does after vc_obj2tifxyz (overwriteMetaScale_).
 set_meta_scale() {
     python3 - "$1" <<'EOF'
-import json, os, sys
+import json, os, sys, uuid
 d = sys.argv[1]
 p = os.path.join(d, "meta.json")
 root = {}
@@ -148,7 +148,7 @@ if os.path.exists(p):
         pass
 root["scale"] = [0.05, 0.05]
 root.setdefault("type", "seg")
-root.setdefault("uuid", os.path.basename(os.path.normpath(d)))
+root.setdefault("uuid", str(uuid.uuid4()))  # new surface: random, never the dir name
 root.setdefault("format", "tifxyz")
 with open(p, "w") as f:
     json.dump(root, f, indent=4)

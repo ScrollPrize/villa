@@ -141,20 +141,6 @@ cv::Vec3f json_bbox_high(const Json& meta)
     };
 }
 
-std::string now_id()
-{
-    using namespace std::chrono;
-    const auto now = system_clock::now();
-    const auto ms = duration_cast<milliseconds>(now.time_since_epoch()) % 1000;
-    const auto timer = system_clock::to_time_t(now);
-    std::tm bt = *std::localtime(&timer);
-
-    std::ostringstream oss;
-    oss << std::put_time(&bt, "%Y%m%d%H%M%S");
-    oss << std::setfill('0') << std::setw(3) << ms.count();
-    return oss.str();
-}
-
 std::vector<SurfacePatchIndex::SurfacePtr> discover_patch_surfaces(
     const Config& cfg,
     float zMin,
@@ -1595,9 +1581,6 @@ int main(int argc, char** argv)
                       << ", interpolated misses: " << snapInterpolatedCount << '\n';
         }
 
-        const std::string uuid = cfg.output.filename().empty()
-            ? std::string("projected_tifxyz_") + now_id()
-            : cfg.output.filename().string();
         auto out = std::make_unique<QuadSurface>(finalPoints, src->scale());
         // Start from the source segment's own metadata (scroll_source,
         // target_volume, seed, and anything carried from earlier pipeline
@@ -1653,7 +1636,7 @@ int main(int argc, char** argv)
 
         try {
             std::cout << "Saving tifxyz: " << cfg.output << '\n';
-            out->save(cfg.output.string(), uuid, true);
+            out->saveAsNew(cfg.output, true);
         } catch (const std::exception& ex) {
             std::cerr << "ERROR: failed to save output tifxyz: " << ex.what() << '\n';
             return EXIT_FAILURE;

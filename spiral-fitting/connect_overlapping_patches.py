@@ -28,6 +28,7 @@ import colorsys
 import json
 import os
 import threading
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Optional
@@ -664,6 +665,7 @@ def main(patches_path, tolerance, min_overlap_points, min_diff_points, query_str
                     for pid, p in enumerate(points_xyz)
                 }
                 collections[str(collection_id)] = {
+                    'uuid': str(uuid.uuid4()),
                     'name': f"between_patches__{r['a']}__{r['b']}",
                     'points': points,
                     'metadata': {'winding_is_absolute': False},

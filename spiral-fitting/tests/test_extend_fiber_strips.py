@@ -49,3 +49,24 @@ def test_shared_index_matches_separate_source_and_strip_indexes(monkeypatch):
         assert shared == {'samples': len(xyz), 'source_hits': int(source_hits.sum()),
                           'strip_hits': int(strip_hits.sum()),
                           'joint_hits': int((source_hits & strip_hits).sum())}
+
+
+def test_merged_strip_metadata_gets_fresh_uuid(tmp_path):
+    import json
+    import uuid
+    original = tmp_path / 'original'
+    merged = tmp_path / 'merged'
+    original.mkdir()
+    merged.mkdir()
+    source_uuid = str(uuid.uuid4())
+    (original / 'meta.json').write_text(json.dumps(
+        {'type': 'seg', 'format': 'tifxyz', 'uuid': source_uuid, 'extra': 1}))
+    (merged / 'meta.json').write_text(json.dumps({'bbox': [[0, 0, 0], [1, 1, 1]],
+                                                  'constraint_graph': {}}))
+    extension.write_merged_metadata(
+        original, merged, {'accepted': [{'patch': 'p'}]},
+        {'area_vx2': 4.0, 'original_retained_fraction': 1.0, 'original_distance_p95': 0.0})
+    result = json.loads((merged / 'meta.json').read_text())
+    assert result['uuid'] != source_uuid
+    assert uuid.UUID(result['uuid']).version == 4
+    assert result['extra'] == 1 and result['source'] == 'anchored_strip_merge'

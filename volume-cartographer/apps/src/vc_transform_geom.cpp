@@ -259,8 +259,7 @@ static int run_tifxyz(const std::filesystem::path& inDir,
     surf->meta["area_vx2"] = area_vx2;
 
     try {
-        std::filesystem::path out = outDir;
-        surf->save(out);
+        surf->saveEdited(inDir, outDir);
     } catch (const std::exception& e) {
         std::cerr << "failed to save tifxyz: " << e.what() << std::endl; return 4;
     }

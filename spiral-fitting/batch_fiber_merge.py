@@ -17,6 +17,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import time
+import uuid
 
 import numpy as np
 from preview_fiber_merge import load_surface, surface_metrics
@@ -33,6 +34,13 @@ def fingerprint(path):
         return hashlib.file_digest(stream, 'sha256').hexdigest()
 
 
+def _is_canonical_uuid(value):
+    try:
+        return isinstance(value, str) and str(uuid.UUID(value)) == value
+    except ValueError:
+        return False
+
+
 def finalize_segment_ids_locked(root):
     """Caller holds .batch.lock; repair IDs only after all export attempts finish."""
     status = json.loads((root / 'status.json').read_text())
@@ -42,14 +50,21 @@ def finalize_segment_ids_locked(root):
     actual = set((root / 'strips').glob('*/meta.json'))
     if actual != expected:
         raise ValueError('Published metadata files do not match the completed export manifest')
+    # Each exported strip is a new object and needs its own random uuid. Keep
+    # one the fitter already minted (so the pass is idempotent); replace a
+    # missing, non-canonical or batch-duplicated one (e.g. every strip sharing
+    # the fitter's intermediate "refined" name) with a fresh uuid4.
     plan = []
+    seen = set()
     for path in sorted(actual):
         metadata = json.loads(path.read_text())
         if metadata.get('type') != 'seg' or metadata.get('format') != 'tifxyz':
             raise ValueError(f'Unexpected segment metadata: {path}')
-        plan.append((path, path.parent.stem, metadata))
-    if len({identifier for _, identifier, _ in plan}) != len(plan):
-        raise ValueError('Strip folder names would produce duplicate segment IDs')
+        identifier = metadata.get('uuid')
+        if not _is_canonical_uuid(identifier) or identifier in seen:
+            identifier = str(uuid.uuid4())
+        seen.add(identifier)
+        plan.append((path, identifier, metadata))
     backup_root = root / 'metadata_before_unique_ids'
     changes = []
     for path, identifier, metadata in plan:

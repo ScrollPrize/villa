@@ -120,7 +120,7 @@ void exportSurface(const FitResult& result,const std::filesystem::path& path) {
     // save() mutates a QuadSurface's backing path: export a private copy so
     // viewers and concurrent snapshots never observe those mutations.
     auto copy=std::make_shared<QuadSurface>(*result.surface->rawPointsPtr(),result.surface->scale());
-    copy->setStrictQuadRenderValidity(true);copy->save(path,path.filename().string(),true);
+    copy->setStrictQuadRenderValidity(true);copy->saveAsNew(path,true);
     copy->writeValidMask();
     auto metaPath=path/"meta.json";std::ifstream input(metaPath);auto meta=Json::parse(input);input.close();
     meta["constraint_graph"]={{"origin",vec(result.origin)},{"coordinate_frame","patch"},

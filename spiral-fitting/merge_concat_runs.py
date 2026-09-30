@@ -25,6 +25,7 @@ import argparse
 import glob
 import json
 import os
+import uuid
 
 import cv2
 import numpy as np
@@ -102,9 +103,10 @@ def step_from_meta(meta_path):
     return None
 
 
-def save_tifxyz(pts, out_winding_dir, uuid, step_size, voxel_um, source):
+def save_tifxyz(pts, out_winding_dir, step_size, voxel_um, source):
     """Write x/y/z.tif + meta.json, mirroring spiral-fitting/tifxyz.py:save_tifxyz.
-    `pts` is (H,W,3) in x,y,z order with -1 for invalid."""
+    `pts` is (H,W,3) in x,y,z order with -1 for invalid. The merged surface is a new
+    object, so meta.json gets a fresh random uuid (not the winding folder name)."""
     os.makedirs(out_winding_dir, exist_ok=True)
     tifffile.imwrite(os.path.join(out_winding_dir, "x.tif"), pts[..., 0].astype(np.float32))
     tifffile.imwrite(os.path.join(out_winding_dir, "y.tif"), pts[..., 1].astype(np.float32))
@@ -125,7 +127,7 @@ def save_tifxyz(pts, out_winding_dir, uuid, step_size, voxel_um, source):
         "area_cm2": area_vx2 * voxel_um ** 2 / 1.0e8 if voxel_um else None,
         "format": "tifxyz",
         "type": "seg",
-        "uuid": uuid,
+        "uuid": str(uuid.uuid4()),
         "source": source,
     }
     with open(os.path.join(out_winding_dir, "meta.json"), "w") as f:
@@ -208,7 +210,7 @@ def main():
         merged[~np.isfinite(merged).all(axis=-1)] = -1.0
         merged = merged.astype(np.float32)
 
-        area = save_tifxyz(merged, os.path.join(args.out, w), w, step_size, voxel_um,
+        area = save_tifxyz(merged, os.path.join(args.out, w), step_size, voxel_um,
                            f"merge_concat_runs {args.method} of {len(wdirs)} runs")
         n_pts = int((merged[..., 0] != -1).sum())
         print(f"{w}: runs={len(wdirs)} grid={ref_shape[0]}x{ref_shape[1]} "

@@ -6,6 +6,7 @@
 #include "VCSettings.hpp"
 #include "OpenDataNormalGrids.hpp"
 #include "OpenDataSegmentCache.hpp"
+#include "vc/core/util/Uuid.hpp"
 
 #include <functional>
 #include <algorithm>
@@ -1006,11 +1007,8 @@ private:
             root.insert(QStringLiteral("type"), QStringLiteral("seg"));
         }
         if (!root.contains(QStringLiteral("uuid"))) {
-            QString uuid = QFileInfo(dir).fileName();
-            if (uuid.isEmpty()) {
-                uuid = QDir(dir).dirName();
-            }
-            root.insert(QStringLiteral("uuid"), uuid);
+            root.insert(QStringLiteral("uuid"),
+                        QString::fromStdString(vc::util::newUuid()));
         }
         if (!root.contains(QStringLiteral("format"))) {
             root.insert(QStringLiteral("format"), QStringLiteral("tifxyz"));
@@ -1577,7 +1575,7 @@ static ABFFlattenResult runAbfFlattenTask(const ABFFlattenTaskConfig& cfg, const
         emitProgress(QObject::tr("Saving flattened surface..."));
         std::filesystem::path outPath(cfg.outputPath.toStdString());
         std::filesystem::create_directories(outPath);
-        flatSurf->save(outPath, true);
+        flatSurf->saveAsNew(outPath, true);
 
         result.success = true;
     } catch (const std::exception& e) {
@@ -3722,7 +3720,7 @@ bool SegmentationCommandHandler::cropSurfaceToValidRegion(const std::string& seg
         for (const auto& ch : croppedChannels) {
             tempSurface->setChannel(ch.name, ch.data);
         }
-        tempSurface->save(surface->path.string(), surface->id, true);
+        tempSurface->save(surface->path, true);
     } catch (const std::exception& ex) {
         return fail(tr("Failed to crop %1: %2")
                         .arg(QString::fromStdString(segmentId))
@@ -3786,7 +3784,7 @@ void SegmentationCommandHandler::onFlipSurface(const std::string& segmentId, boo
     }
 
     try {
-        surface->save(surface->path.string(), surface->id, true);
+        surface->save(surface->path, true);
         emit surfaceSavedTo(QString::fromStdString(surface->path.string()));
     } catch (const std::exception& ex) {
         QMessageBox::critical(_parentWidget,
@@ -3821,7 +3819,7 @@ void SegmentationCommandHandler::onRotateSurface(const std::string& segmentId)
     surface->rotate(90.0f);
 
     try {
-        surface->save(surface->path.string(), surface->id, true);
+        surface->save(surface->path, true);
         emit surfaceSavedTo(QString::fromStdString(surface->path.string()));
     } catch (const std::exception& ex) {
         QMessageBox::critical(_parentWidget,
@@ -5285,10 +5283,9 @@ void SegmentationCommandHandler::onExportWidthChunks(const std::string& segmentI
         }
         const QString outAbs = outRoot.filePath(outDirName);
         const std::string outPath = outAbs.toStdString();
-        const std::string uuid    = outDirName.toStdString();  // uuid ~ folder name
 
         try {
-            chunkSurf.save(outPath, uuid, forceOverwrite);
+            chunkSurf.saveAsNew(outPath, forceOverwrite);
             ++exported;
             results << outAbs;
         } catch (const std::exception& e) {
@@ -5755,9 +5752,6 @@ bool SegmentationCommandHandler::renameSurfaceHeadless(const QString& segmentIdQ
     // Check if this is the currently selected segment.
     bool wasSelected = (_state->activeSurfaceId() == oldId);
 
-    // Store the old UUID for rollback if needed.
-    std::string oldUuid = seg->id();
-
     // === Clean up the segment before renaming ===
 
     // Clear from surface collection (including "segmentation" if it matches).
@@ -5784,20 +5778,8 @@ bool SegmentationCommandHandler::renameSurfaceHeadless(const QString& segmentIdQ
         }
     }
 
-    // Update meta.json UUID.
-    try {
-        seg->setId(newId);
-        seg->saveMetadata();
-    } catch (const std::exception& e) {
-        // Reload the old segment.
-        _state->vpkg()->refreshSegmentations();
-        if (_surfacePanel) {
-            _surfacePanel->reloadSurfacesFromDisk();
-        }
-        return fail(tr("Failed to update metadata: %1").arg(e.what()));
-    }
-
-    // Perform the folder rename.
+    // Perform the folder rename. meta.json "uuid" is the object identity and
+    // stays unchanged; only the directory name (the VC3D segment id) changes.
     try {
         std::filesystem::rename(currentPath, newPath);
 
@@ -5825,14 +5807,6 @@ bool SegmentationCommandHandler::renameSurfaceHeadless(const QString& segmentIdQ
         return true;
 
     } catch (const std::exception& e) {
-        // Attempt to rollback metadata change.
-        try {
-            seg->setId(oldUuid);
-            seg->saveMetadata();
-        } catch (...) {
-            // Rollback failed - metadata is now inconsistent.
-        }
-
         // Refresh to get back to a consistent state.
         _state->vpkg()->refreshSegmentations();
         if (_surfacePanel) {
@@ -5925,7 +5899,8 @@ void SegmentationCommandHandler::onCopySurfaceRequested(const QString& segmentId
 
     try {
         auto copiedSeg = Segmentation::New(newPath);
-        copiedSeg->setId(newId);
+        // A copy is a new object.
+        copiedSeg->setUuid(vc::util::newUuid());
         copiedSeg->setName(newId);
         copiedSeg->saveMetadata();
     } catch (const std::exception& e) {

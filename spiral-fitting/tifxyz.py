@@ -6,6 +6,7 @@ import torch
 import numpy as np
 from PIL import Image
 from typing import Optional, Union, Literal
+from uuid import uuid4
 from einops import rearrange
 import torch.nn.functional as F
 from dataclasses import dataclass, field
@@ -449,6 +450,11 @@ def load_tifxyz(path, *, z_range=None, skip_empty=False):
 
 
 def save_tifxyz(zyxs, path, uuid, step_size, voxel_size_um, source):
+    """Write a NEW tifxyz surface to ``path/uuid``.
+
+    ``uuid`` names the directory only; meta.json gets a fresh random
+    identity, never one derived from the name.
+    """
     path = f'{path}/{uuid}'
     os.makedirs(path, exist_ok=True)
     Image.fromarray(np.asarray(zyxs[..., 2], dtype=np.float32)).save(f'{path}/x.tif')
@@ -471,7 +477,7 @@ def save_tifxyz(zyxs, path, uuid, step_size, voxel_size_um, source):
             'area_cm2': area_vx2 * voxel_size_um ** 2 / 1.e8,
             'format': 'tifxyz',
             'type': 'seg',
-            'uuid': uuid,
+            'uuid': str(uuid4()),
             'source': source,
         }, f, indent=4)
     return True
@@ -600,7 +606,9 @@ def save_combined_tifxyz(
             "voxel_size_um": float(voxel_size_um),
             "format": "tifxyz",
             "type": "seg",
-            "uuid": uuid,
+            # ``uuid`` is the directory name (manifest surface_id); the
+            # surface's identity is a fresh random UUID.
+            "uuid": str(uuid4()),
             "source": source,
             "winding_column_ranges": components,
             "component_winding_ids": ids,

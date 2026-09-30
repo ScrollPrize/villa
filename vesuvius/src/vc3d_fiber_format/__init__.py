@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,27 @@ _POSITIVE_CONFIG_KEYS = {
     "max_step_factor", "endpoint_accept_threshold_base_voxels",
 }
 _NON_NEGATIVE_CONFIG_KEYS = _CONFIG_KEYS_V3 - _POSITIVE_CONFIG_KEYS
+
+# Canonical 8-4-4-4-12 hex UUID text; mirrors vc::util::isUuid in
+# volume-cartographer/core/include/vc/core/util/Uuid.hpp.
+_UUID_RE = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+
+
+def is_canonical_uuid(value: Any) -> bool:
+    """True for a string in canonical 8-4-4-4-12 hex UUID form."""
+    return isinstance(value, str) and _UUID_RE.fullmatch(value) is not None
+
+
+def validate_fiber_uuid(obj: Any, *, label: str = "vc3d_fiber") -> None:
+    """Reject a present-but-invalid top-level fiber ``uuid``.
+
+    The field is optional (legacy fibers lack it), but when present it must
+    be canonical UUID text, as VC3D's parseVc3dFiberJson requires.
+    """
+    if isinstance(obj, dict) and "uuid" in obj and not is_canonical_uuid(obj["uuid"]):
+        raise ValueError(f"{label} has an invalid uuid")
 
 
 @dataclass(frozen=True)
@@ -221,6 +243,7 @@ def parse_vc3d_fiber_format(
         raise ValueError(f"only vc3d_fiber versions 1 and 3 are supported, got {version!r}")
     if version == 3 and "type" not in obj:
         raise ValueError("version-3 vc3d_fiber is missing type")
+    validate_fiber_uuid(obj, label=label)
 
     if version == 3 and "optimization_mode" not in obj:
         raise ValueError("version-3 vc3d_fiber is missing optimization_mode")

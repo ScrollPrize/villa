@@ -3723,7 +3723,8 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
         const double area_est_vx2 = vc::surface::computeSurfaceAreaVox2(*surf);
         surf->meta = utils::Json::parse(meta_params.dump());
         if (resume_surf && !resume_surf->id.empty()) {
-            surf->meta["seed_surface_id"] = resume_surf->id;
+            surf->meta["seed_surface_id"] = resume_surf->objectUuid().empty()
+                ? resume_surf->id : resume_surf->objectUuid();
         }
         vc::surface::storeAreaMeta(surf->meta, area_est_vx2,
                                    static_cast<double>(voxelsize));
@@ -3842,7 +3843,8 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
         }
         surf->meta["elapsed_time_s"] = f_timer.seconds();
         if (resume_surf && !resume_surf->id.empty()) {
-            surf->meta["seed_surface_id"] = resume_surf->id;
+            surf->meta["seed_surface_id"] = resume_surf->objectUuid().empty()
+                ? resume_surf->id : resume_surf->objectUuid();
             // Store grid offset for correction point remapping
             // new_coord = old_coord + offset
             const int offset_row = resume_pad_y - used_area_safe.y;

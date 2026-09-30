@@ -618,8 +618,7 @@ static std::unique_ptr<QuadSurface> load_or_create_center_cutout(QuadSurface& ta
     seed_surface->meta["sweep_cutout_px"] = cutout_px;
     seed_surface->meta["sweep_cutout_x"] = x0;
     seed_surface->meta["sweep_cutout_y"] = y0;
-    const std::string uuid = cutout_dir.filename().string();
-    seed_surface->save(cutout_dir, uuid, true);
+    seed_surface->saveAsNew(cutout_dir, true);
     std::cout << "Created sweep seed cutout " << cutout_dir
               << " roi=" << roi
               << " edge_cm=" << cutout_cm << std::endl;
@@ -1354,7 +1353,7 @@ int main(int argc, char *argv[])
                     surf->meta["sweep_seed_only"] = seed_only_sweep;
                     add_metric_meta(*surf, sweep_metrics);
                     add_target_context(surf->meta, vol_path);
-                    surf->save(seg_dir, uuid);
+                    surf->saveAsNew(seg_dir);
 
                     run_report["metrics"] = metrics_json(sweep_metrics);
                     if (sweep_metrics.objective_score < best_score) {
@@ -1486,7 +1485,7 @@ int main(int argc, char *argv[])
 
             std::string uuid = "auto_trace_" + get_surface_time_str() + "_" + seed.label;
             std::filesystem::path seg_dir = tgt_dir / uuid;
-            surf->save(seg_dir, uuid);
+            surf->saveAsNew(seg_dir);
             std::cout << "  output=" << seg_dir << std::endl;
 
             delete surf;
@@ -1518,7 +1517,7 @@ int main(int argc, char *argv[])
     add_target_context(surf->meta, vol_path);
     std::string uuid = "auto_trace_" + get_surface_time_str();;
     std::filesystem::path seg_dir = tgt_dir / uuid;
-    surf->save(seg_dir, uuid);
+    surf->saveAsNew(seg_dir);
 
     delete surf;
     delete_loaded_source_surfaces(surfaces, src);

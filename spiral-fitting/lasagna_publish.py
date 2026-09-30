@@ -43,6 +43,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 from urllib.parse import quote
 
 import numpy as np
@@ -980,7 +981,9 @@ class LasagnaPublisher:
                 flattened_metadata.pop("components", None)
                 flattened_metadata.pop("winding_column_ranges", None)
                 flattened_metadata.pop("model_source", None)
-                flattened_metadata["uuid"] = surface_id
+                # A new published surface: fresh identity, never derived
+                # from surface_id (the directory name VC3D keys it by).
+                flattened_metadata["uuid"] = str(uuid.uuid4())
                 flattened_metadata["name"] = surface_id
                 flattened_metadata["grid_shape"] = [
                     int(flattened_xyz.shape[0]), int(flattened_xyz.shape[1])]

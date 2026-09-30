@@ -1,4 +1,5 @@
 #include "LasagnaServiceManager.hpp"
+#include "vc/core/util/Uuid.hpp"
 
 #include <QCoreApplication>
 #include <QCryptographicHash>
@@ -352,7 +353,11 @@ void updateTifxyzMetadataIdentity(const QString& tifxyzDir, const QString& name)
         return;
     }
     QJsonObject root = doc.object();
-    root[QStringLiteral("uuid")] = name;
+    // The result keeps an object UUID assigned by its producer; a legacy
+    // name-derived value is replaced, never derived from the final name.
+    if (!vc::util::isUuid(root.value(QStringLiteral("uuid")).toString().toStdString())) {
+        root[QStringLiteral("uuid")] = QString::fromStdString(vc::util::newUuid());
+    }
     root[QStringLiteral("name")] = name;
     if (!metaFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
         return;

@@ -1,4 +1,5 @@
 import json
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -41,7 +42,8 @@ def test_batch_exports_only_continuous_surface_and_resumes(tmp_path, monkeypatch
     assert status['counts'] == {'exported': 1, 'no_assignments': 1}
     assert list((args.output / 'strips').iterdir()) == [args.output / 'strips/a.tifxyz']
     assert len(list(args.output.rglob('x.tif'))) == 1
-    assert json.loads((args.output / 'strips/a.tifxyz/meta.json').read_text())['uuid'] == 'a'
+    published_uuid = json.loads((args.output / 'strips/a.tifxyz/meta.json').read_text())['uuid']
+    assert uuid.UUID(published_uuid).version == 4 and published_uuid not in ('a', 'refined')
     assert batch.run_batch(args) == 0
     assert len(commands) == 1
     # Resumption must refuse silently changed assignments.
@@ -92,7 +94,7 @@ def test_fiber_only_batch_includes_unassigned_horizontal_fiber(tmp_path, monkeyp
     row = json.loads((args.output / 'status.json').read_text())['fibers'][0]
     assert row['status'] == 'exported' and row['patch_count'] == 0 and row['export_kind'] == 'fiber_only'
     meta = json.loads((args.output / row['surface'] / 'meta.json').read_text())
-    assert meta['uuid'] == 'horizontal' and meta['constraint_graph']['fiber_only']
+    assert uuid.UUID(meta['uuid']).version == 4 and meta['constraint_graph']['fiber_only']
 
 
 def test_id_repair_waits_for_completion_and_preserves_geometry_and_other_metadata(tmp_path):
@@ -115,9 +117,33 @@ def test_id_repair_waits_for_completion_and_preserves_geometry_and_other_metadat
     batch.write_json(tmp_path / 'status.json', status)
     first = batch.finalize_segment_ids_locked(tmp_path)
     assert first['unique_ids'] == 2
+    assigned = set()
     for name in ('a', 'b'):
         folder = tmp_path / 'strips' / f'{name}.tifxyz'
-        assert json.loads((folder / 'meta.json').read_text()) == dict(original, uuid=name)
+        repaired = json.loads((folder / 'meta.json').read_text())
+        assert uuid.UUID(repaired['uuid']).version == 4
+        assert repaired == dict(original, uuid=repaired['uuid'])
+        assigned.add(repaired['uuid'])
         assert (folder / 'x.tif').read_bytes() == b'unchanged geometry'
         assert json.loads((tmp_path / 'metadata_before_unique_ids' / folder.name / 'meta.json').read_text()) == original
+    assert len(assigned) == 2
     assert batch.finalize_segment_ids_locked(tmp_path) == first
+
+
+def test_id_repair_keeps_unique_fitter_uuids_and_replaces_duplicates(tmp_path):
+    kept = str(uuid.uuid4())
+    rows = []
+    for name in ('a', 'b', 'c'):
+        folder = tmp_path / 'strips' / f'{name}.tifxyz'
+        folder.mkdir(parents=True)
+        # a and b share one uuid (a copied surface); c is legacy name-derived.
+        meta_uuid = 'c' if name == 'c' else kept
+        (folder / 'meta.json').write_text(json.dumps({'type': 'seg', 'format': 'tifxyz', 'uuid': meta_uuid}))
+        rows.append({'status': 'exported', 'surface': f'strips/{name}.tifxyz'})
+    batch.write_json(tmp_path / 'status.json', {'complete': True, 'fibers': rows})
+    batch.finalize_segment_ids_locked(tmp_path)
+    ids = {name: json.loads((tmp_path / 'strips' / f'{name}.tifxyz' / 'meta.json').read_text())['uuid']
+           for name in ('a', 'b', 'c')}
+    assert ids['a'] == kept
+    assert len(set(ids.values())) == 3
+    assert all(uuid.UUID(value).version == 4 for value in ids.values())

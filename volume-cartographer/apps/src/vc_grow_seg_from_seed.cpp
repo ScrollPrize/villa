@@ -637,16 +637,16 @@ int main(int argc, char *argv[])
     if (mode == "expansion")
         meta_params["seed_overlap"] = count_overlap;
 
-    std::string uuid;
+    std::string seg_name;
     std::filesystem::path seg_dir;
     if (!segment_name.empty()) {
         // Use target-dir directly with custom segment name
-        uuid = segment_name;
+        seg_name = segment_name;
         seg_dir = tgt_dir;
     } else {
         // Default: create timestamped subfolder
-        uuid = name_prefix + time_str();
-        seg_dir = tgt_dir / uuid;
+        seg_name = name_prefix + time_str();
+        seg_dir = tgt_dir / seg_name;
     }
 
     //
@@ -1447,7 +1447,7 @@ int main(int argc, char *argv[])
         add_target_context(neighbor_meta, vol_path);
 
         out_surf->meta = neighbor_meta;
-        out_surf->save(out_dir, uuid_local, true);
+        out_surf->saveAsNew(out_dir, true);
 
         // Done
         return EXIT_SUCCESS;
@@ -1488,7 +1488,7 @@ int main(int argc, char *argv[])
     }
 
     std::cout << "saving " << seg_dir.string() << std::endl;
-    surf->save(seg_dir, uuid, true);
+    surf->saveAsNew(seg_dir, true);
     surf->path = seg_dir;
 
     if (mode == "expansion" && !skip_overlap_check) {

@@ -206,12 +206,14 @@ running attempts and their logs. A filesystem lock prevents two runners from
 using the same batch directory. Worker processes each use one fit/OpenMP/BLAS
 thread. Concurrency does not change within-fiber fitting order.
 
-After **all** export attempts finish, the batch assigns each published
-`meta.json.uuid` to its strip folder's stem (the original fiber basename).
-VC3D uses this field as its segment ID; the fitter's intermediate `refined`
-directory name must not be shared by every published segment. The final pass
-backs up the original metadata under `metadata_before_unique_ids/`, changes
-only `uuid`, and verifies uniqueness in `metadata_ids_status.json`.
+After **all** export attempts finish, the batch gives each published
+`meta.json.uuid` a unique persistent object UUID: a canonical fitter UUID is
+kept when no other strip in the batch uses it; a missing, name-derived (such
+as the fitter's intermediate `refined`) or duplicate value is replaced with a
+fresh random UUID. VC3D keys segments by directory name, so the UUID is object
+identity only. The final pass backs up the original metadata under
+`metadata_before_unique_ids/`, changes only `uuid`, and verifies uniqueness in
+`metadata_ids_status.json`.
 The pass is idempotent and also runs after resuming a batch.
 
 For a batch already running under an older runner, queue the same final pass

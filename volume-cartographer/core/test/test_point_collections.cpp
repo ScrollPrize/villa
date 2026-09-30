@@ -528,3 +528,51 @@ TEST_CASE("ids stay unique across a load + further adds")
     CHECK(matches == 1);
     CHECK(loaded.getPoints("a").size() == 3);
 }
+
+TEST_CASE("an invalid collection uuid leaves the store unchanged")
+{
+    const fs::path tmp = fs::temp_directory_path() /
+        ("pc_bad_uuid_" + std::to_string(::getpid()) + ".json");
+    {
+        std::ofstream o(tmp);
+        o << R"({
+            "vc_pointcollections_json_version": "1",
+            "collections": {
+                "1": {"name": "good", "points": {}, "metadata": {}, "color": [1, 1, 1]},
+                "2": {"uuid": "not-a-uuid", "name": "bad", "points": {},
+                      "metadata": {}, "color": [1, 1, 1]}
+            }
+        })";
+    }
+
+    PointCollections c;
+    c.addPoint("kept", {1, 2, 3});
+    const std::string keptUuid =
+        c.getAllCollections().at(c.getCollectionId("kept").value()).uuid;
+    CHECK_FALSE(c.loadFromJSON(tmp.string()));
+    REQUIRE(c.getAllCollections().size() == 1);
+    CHECK(c.getAllCollections().begin()->second.uuid == keptUuid);
+    CHECK(c.getPoints("kept").size() == 1);
+    fs::remove(tmp);
+
+    // A segment corrections file fails the same way: nothing is half-loaded.
+    const fs::path segDir = fs::temp_directory_path() /
+        ("pc_bad_uuid_seg_" + std::to_string(::getpid()));
+    fs::create_directories(segDir);
+    {
+        std::ofstream o(segDir / "corrections.json");
+        o << R"({
+            "vc_pointcollections_json_version": "1",
+            "collections": {
+                "1": {"name": "good", "points": {}, "metadata": {}, "color": [1, 1, 1],
+                      "anchor2d": [1, 2]},
+                "2": {"uuid": "not-a-uuid", "name": "bad", "points": {},
+                      "metadata": {}, "color": [1, 1, 1], "anchor2d": [3, 4]}
+            }
+        })";
+    }
+    CHECK_FALSE(c.loadFromSegmentPath(segDir));
+    CHECK(c.getAllCollections().size() == 1);
+    CHECK(c.getCollectionId("good") == std::nullopt);
+    fs::remove_all(segDir);
+}

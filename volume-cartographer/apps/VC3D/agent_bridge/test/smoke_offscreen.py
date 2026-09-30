@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import socket
 import sys
@@ -1523,6 +1524,34 @@ def check_c4(client: BridgeClient, results: Results, volpkg: str,
                        f"unexpected {type(e).__name__}: {e}")
 
 
+UUID_TEXT = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+def check_legacy_fiber_uuid(client: BridgeClient, results: Results,
+                            fiber_volpkg: str, fiber_file: Path) -> None:
+    """A fiber file without a uuid gets one persisted on load, and keeps it
+    across a save and a reopen (the identity must not change per load)."""
+    def stored_uuid() -> str | None:
+        return json.loads(fiber_file.read_text()).get("uuid")
+
+    try:
+        first = stored_uuid()
+        client.call("fiber.save", {}, timeout=RPC_TIMEOUT)
+        after_save = stored_uuid()
+        client.call("volume.open", {"path": fiber_volpkg}, timeout=RPC_TIMEOUT)
+        after_reopen = stored_uuid()
+        results.record(
+            "legacy_fiber_uuid_persisted",
+            isinstance(first, str) and UUID_TEXT.fullmatch(first) is not None
+            and first == after_save == after_reopen,
+            f"on_load={first} after_save={after_save} after_reopen={after_reopen}",
+        )
+    except Exception as e:  # noqa: BLE001
+        results.record("legacy_fiber_uuid_persisted", False,
+                       f"unexpected {type(e).__name__}: {e}")
+
+
 def check_c2_oversized(sock_path: str, results: Results) -> None:
     """Send a single unterminated line > 1 MiB; the server must drop that socket
     while a separate fresh connection keeps working."""
@@ -1741,6 +1770,20 @@ def main() -> int:
             "line_points": [],
             "branches": [{}],
         }))
+        # A well-formed fiber written before fibers carried a uuid.
+        legacy_fiber = fiber_dir / "fiber_legacy.json"
+        legacy_fiber.write_text(json.dumps({
+            "type": "vc3d_fiber",
+            "version": 1,
+            "username": "smoke",
+            "started_at": "2026-01-01T00:00:00Z",
+            "sequence": 2,
+            "generation": 1,
+            "control_points": [[10.0, 10.0, 10.0], [10.0, 10.0, 20.0]],
+            "line_points": [[10.0, 10.0, 10.0], [10.0, 10.0, 15.0],
+                            [10.0, 10.0, 20.0]],
+            "branches": [],
+        }))
         name = unique_name("main")
         config_home = tmp_path / "config-main"
         proc = launch(binary, name, str(volpkg), str(config_home))
@@ -1763,6 +1806,8 @@ def main() -> int:
             check_segments_attach(client, results, tmp_path, volpkg)
             check_open_data_editable_copy(client, results, tmp_path, volpkg)
             check_c4(client, results, str(volpkg), str(broken_volpkg))
+            check_legacy_fiber_uuid(client, results, str(broken_volpkg),
+                                    legacy_fiber)
             check_project_create(client, results, tmp_path)
             check_c2_oversized(sock_path, results)
             check_c2_suffix_bypass(sock_path, results)

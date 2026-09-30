@@ -25,6 +25,7 @@
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Rect3D.hpp"
 #include "vc/core/util/Tiff.hpp"
+#include "vc/core/util/Uuid.hpp"
 #include "utils/Json.hpp"
 
 #include <opencv2/core.hpp>
@@ -119,7 +120,7 @@ static void saveGrid(const Grid& g, const fs::path& outdir, const fs::path& srcd
     Json meta;
     const fs::path sm = srcdir / "meta.json";
     if (fs::exists(sm)) meta = Json::parse_file(sm.string());
-    meta["uuid"] = outdir.filename().string();
+    meta["uuid"] = vc::util::newUuid();  // a straightened copy is a new object
     meta["format"] = "tifxyz";
     meta["type"] = "seg";
     if (!meta.contains("scale")) {           // preserve the input's scale array

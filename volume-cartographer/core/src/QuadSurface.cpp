@@ -1758,14 +1758,38 @@ float QuadSurface::pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int m
     return min_dist;
 }
 
+std::string QuadSurface::objectUuid() const
+{
+    if (!meta.is_object() || !meta.contains("uuid") || !meta["uuid"].is_string())
+        return {};
+    return meta["uuid"].get_string();
+}
+
+std::string QuadSurface::objectUuidOrNew() const
+{
+    std::string uuid = objectUuid();
+    return uuid.empty() ? vc::util::newUuid() : uuid;
+}
+
 void QuadSurface::save(const std::filesystem::path &path_, bool force_overwrite)
 {
-    const std::string uuid = meta.is_object() && meta.contains("uuid") &&
-                                     meta["uuid"].is_string() &&
-                                     !meta["uuid"].get_string().empty()
-        ? meta["uuid"].get_string()
-        : vc::util::newUuid();
-    save(path_, uuid, force_overwrite);
+    saveWithUuid(path_, objectUuidOrNew(), force_overwrite);
+}
+
+void QuadSurface::saveAsNew(const std::filesystem::path &path_, bool force_overwrite)
+{
+    saveWithUuid(path_, vc::util::newUuid(), force_overwrite);
+}
+
+void QuadSurface::saveEdited(const std::filesystem::path &source,
+                             const std::filesystem::path &dest,
+                             bool force_overwrite)
+{
+    std::error_code ec;
+    if (std::filesystem::exists(dest, ec) && std::filesystem::equivalent(source, dest, ec))
+        save(dest, force_overwrite);
+    else
+        saveAsNew(dest, force_overwrite);
 }
 
 std::recursive_mutex& QuadSurface::dirWriteMutex(const std::filesystem::path& dir)
@@ -1781,11 +1805,7 @@ void QuadSurface::saveOverwrite()
     std::lock_guard<std::recursive_mutex> dirLock(dirWriteMutex(path));
 
     std::filesystem::path final_path = path;
-    const std::string uuid = meta.is_object() && meta.contains("uuid") &&
-                                     meta["uuid"].is_string() &&
-                                     !meta["uuid"].get_string().empty()
-        ? meta["uuid"].get_string()
-        : vc::util::newUuid();
+    const std::string uuid = objectUuidOrNew();
 
     // Snapshot the on-disk state before overwriting. saveSnapshot() writes
     // a rotating backup at <backupRoot>/backups/<segname>/{0..N-1}/ so a
@@ -1799,7 +1819,7 @@ void QuadSurface::saveOverwrite()
                        final_path.string(), e.what());
     }
 
-    save(final_path.string(), uuid, true);
+    saveWithUuid(final_path, uuid, true);
     path = final_path;
     id = final_path.filename().string();
 }
@@ -2064,7 +2084,7 @@ void QuadSurface::saveSnapshot(int maxBackups, bool force)
 }
 
 
-void QuadSurface::save(const std::filesystem::path &path_, const std::string &uuid, bool force_overwrite)
+void QuadSurface::saveWithUuid(const std::filesystem::path &path_, const std::string &uuid, bool force_overwrite)
 {
     std::filesystem::path target_path = path_;
     std::filesystem::path final_path = path_;
@@ -2232,10 +2252,7 @@ void QuadSurface::save_meta()
         throw std::runtime_error("can't save_meta() with non-object metadata!");
     }
 
-    const std::string uuid = meta.contains("uuid") && meta["uuid"].is_string() &&
-                                     !meta["uuid"].get_string().empty()
-        ? meta["uuid"].get_string()
-        : vc::util::newUuid();
+    const std::string uuid = objectUuidOrNew();
 
     {
         // NB: deliberately no bbox recompute here, unlike save(). save_meta()

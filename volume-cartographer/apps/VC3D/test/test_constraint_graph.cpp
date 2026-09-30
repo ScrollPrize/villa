@@ -702,7 +702,7 @@ private slots:
             }
             // The initial chart is much longer than the fiber, so many useful
             // correspondences start over 80 vx apart in the flattened view.
-            QuadSurface(grid,{.01f,.05f}).save(root/"patches"/name,name);
+            QuadSurface(grid,{.01f,.05f}).save(root/"patches"/name);
         }
         Settings settings;settings.fiberFolder=root/"fibers";settings.patchFolder=root/"patches";
         settings.fiberScale=1;settings.radius=1.5;
@@ -1115,7 +1115,7 @@ private slots:
         QTemporaryDir dir;auto path=std::filesystem::path(dir.path().toStdString())/"patch";
         cv::Mat_<cv::Vec3f> grid(5,5);
         for(int y=0;y<5;++y)for(int x=0;x<5;++x)grid(y,x)={100+x*20.0f,100+y*20.0f,100};
-        QuadSurface(grid,{.05f,.05f}).save(path,"patch");
+        QuadSurface(grid,{.05f,.05f}).save(path);
         Catalog catalog;catalog.patches.push_back({"patch",path,{100,100,100},{180,180,100}});
         Graph graph;graph.seed="first";Normals normals;
         auto add=[&](std::string id,double y,double z,double chartOffset){
@@ -1757,7 +1757,7 @@ private slots:
         for(const char* name:{"a.json","b.json"})std::ofstream(root/"fibers"/name)<<fiber;
         cv::Mat_<cv::Vec3f> grid(3,8);
         for(int y=0;y<grid.rows;++y)for(int x=0;x<grid.cols;++x)grid(y,x)={100+x*20.0f,100+y*20.0f,104};
-        QuadSurface patch(grid,{.05f,.05f});patch.save(root/"patches"/"one","one");
+        QuadSurface patch(grid,{.05f,.05f});patch.save(root/"patches"/"one");
         Settings settings;settings.fiberFolder=root/"fibers";settings.patchFolder=root/"patches";settings.fiberScale=1;
         const auto catalog=loadCatalog(settings);Normals normals;const auto graph=seedGraph(catalog,0,settings,normals);
         const auto before=graphToJson(graph).dump();
@@ -1839,7 +1839,7 @@ private slots:
             std::ofstream(root/"fibers"/name)<<j;};
         writeFiber("a.json","b.json");writeFiber("b.json","a.json");writeFiber("c.json","d.json");writeFiber("d.json","c.json");
         cv::Mat_<cv::Vec3f> grid(3,3);for(int y=0;y<3;++y)for(int x=0;x<3;++x)grid(y,x)={100+x*20.0f,100+y*20.0f,104};
-        QuadSurface patch(grid,{.05f,.05f});patch.save(root/"patches"/"one","one");
+        QuadSurface patch(grid,{.05f,.05f});patch.save(root/"patches"/"one");
         Settings s;s.fiberFolder=root/"fibers";s.patchFolder=root/"patches";s.fiberScale=1;
         auto catalog=loadCatalog(s);QCOMPARE(catalog.components.size(),size_t(2));QCOMPARE(catalog.components[0].size(),size_t(2));QCOMPARE(catalog.links.size(),size_t(2));
         Normals normals;auto g=seedGraph(catalog,0,s,normals);auto candidates=discover(catalog,g,"fiber:a.json");QCOMPARE(candidates.size(),size_t(1));QVERIFY(std::abs(candidates[0].distance-4)<1e-4);
@@ -1863,7 +1863,7 @@ private slots:
         auto grown=propose(catalog,proposal,reverse[0],true,normals);
         auto fitted=fit(grown);QVERIFY2(fitted.valid,fitted.message.c_str());QCOMPARE(fitted.graph.nodes.size(),size_t(5));
         // A second real patch must share overlap constraints with the first.
-        patch.save(root/"patches"/"two","two");catalog=loadCatalog(s);
+        patch.save(root/"patches"/"two");catalog=loadCatalog(s);
         interrupted=false;
         QVERIFY_EXCEPTION_THROWN(discover(catalog,g,"fiber:a.json",&interrupted,{},[&](auto){interrupted=true;}),std::runtime_error);
         auto more=discover(catalog,fitted.graph,"fiber:a.json");QCOMPARE(more.size(),size_t(1));

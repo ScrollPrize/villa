@@ -13134,7 +13134,7 @@ std::vector<fs::path> LineAnnotationController::saveGeneratedQuadMeshes(LineAnno
 
         const fs::path outputPath = nextMeshExportPath(pathsDir, stem);
         const std::string outputName = outputPath.filename().string();
-        clone->save(outputPath.string(), outputName, false);
+        clone->saveAsNew(outputPath, false);
 
         if (_surfacePanel) {
             _surfacePanel->addSingleSegmentation(outputName);
@@ -17637,7 +17637,14 @@ std::optional<LineAnnotationController::StoredFiber> LineAnnotationController::l
     const int fiberVersion = parsedFiber.version;
 
     StoredFiber fiber;
-    if (!parsedFiber.uuid.empty()) fiber.uuid = parsedFiber.uuid;
+    if (!parsedFiber.uuid.empty()) {
+        fiber.uuid = parsedFiber.uuid;
+    } else {
+        // A legacy file gets its persistent UUID now, like other missing
+        // metadata: the load-time repair save writes it back, so the identity
+        // does not change on every load.
+        fiber.needsSave = true;
+    }
     fiber.optimizationMode =
         vc3d::line_annotation::fiberOptimizationModeFromString(
             parsedFiber.optimizationMode);

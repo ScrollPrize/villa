@@ -702,7 +702,7 @@ void SurfaceAffineTransformController::onSaveTransformedRequested()
 
         const std::filesystem::path stagingPath =
             std::filesystem::path(stagingRoot.path().toStdString()) / newId;
-        transformedSurface->save(stagingPath.string(), newId, false);
+        transformedSurface->saveAsNew(stagingPath, false);
 
         std::filesystem::copy(sourcePath,
                               targetPath,
