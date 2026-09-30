@@ -111,5 +111,6 @@
 - That relaunch exposed one final transport constraint: the optimized central
   test queue is deliberately one-pass, so padding ranks cannot request old
   indices 0-4 again. Padding now performs shape-correct zero-input DDP forwards
-  without loading or reporting any sample; every real test batch remains on
-  the central queue.
+  without loading or reporting any sample and synchronizes outstanding CUDA
+  work before the following NCCL object collective; every real test batch
+  remains on the central queue.

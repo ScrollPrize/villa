@@ -2548,6 +2548,11 @@ def _run_metric_free_evaluation_forwards(
     for name in (() if ema is None else ema.tracks):
         with ema.apply(raw_model, name):
             run()
+    if device.type == "cuda":
+        # Real evaluation synchronizes while converting loss statistics to
+        # host scalars. Padding has no statistics, so make that boundary
+        # explicit before the next NCCL object collective.
+        torch.cuda.synchronize(device)
     model.train()
 
 
@@ -3796,6 +3801,7 @@ def training_units(
             wave_size = distributed.world_size if pending_test is not None else max(1, total)
             all_rows = []
             for start in range(0, len(remaining), wave_size):
+                partial_wave = len(remaining[start:start + wave_size]) < distributed.world_size
                 indices, padded = _distributed_evaluation_wave_indices(
                     remaining,
                     start=start,
@@ -3822,6 +3828,8 @@ def training_units(
                         math.ceil(evaluation_loader.config.batch_size / evaluation_microbatch)
                         if pending_test is not None else 0)
                     if padded:
+                        if partial_wave:
+                            print(f"distributed test final wave rank={distributed.rank} phase=padding_begin", flush=True)
                         _run_metric_free_evaluation_forwards(
                             raw_model, evaluation_loader.config, device=distributed.device,
                             physical_batch_size=evaluation_microbatch,
@@ -3829,12 +3837,16 @@ def training_units(
                             mixed_precision=mixed_precision, ema=ema,
                         )
                         local = []
+                        if partial_wave:
+                            print(f"distributed test final wave rank={distributed.rank} phase=padding_end", flush=True)
                     else:
                         local = _evaluate_dense_loss_rows(raw_model, evaluation_loader, **local_options,
                             ema=ema, global_batch_indices=indices, batch_iterator=iterator,
                             microbatch_size=(evaluation_microbatch
                                 if pending_test is not None else evaluation_microbatch_size),
                             minimum_forward_count=minimum_forward_count)
+                        if partial_wave:
+                            print(f"distributed test final wave rank={distributed.rank} phase=evaluation_end", flush=True)
                 finally:
                     if iterator is not None:
                         iterator.close()
@@ -3842,8 +3854,12 @@ def training_units(
                 if source == "test" and refinement.config.enabled and refinement.config.update_enabled:
                     # Raw and all EMA tracks have now consumed identical batch
                     # targets. Commit before a possible managed yield/restart.
+                    if partial_wave:
+                        print(f"distributed test final wave rank={distributed.rank} phase=refinement_begin", flush=True)
                     refinement_stats = refinement.flush(distributed, phase="test", step=step,
                         batch=f"{remaining[start]}:{remaining[min(start+wave_size,len(remaining))-1]}")
+                    if partial_wave:
+                        print(f"distributed test final wave rank={distributed.rank} phase=refinement_end", flush=True)
                 rows = _distributed_gather_dense_test_rows(local, distributed)
                 if pending_test is None:
                     test_refinement_totals[:] = [a+b for a,b in zip(test_refinement_totals,refinement_stats)]
