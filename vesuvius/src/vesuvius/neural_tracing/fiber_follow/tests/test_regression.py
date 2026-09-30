@@ -236,9 +236,10 @@ def test_training_compilation_emulates_eager_bf16_rounding(monkeypatch):
     assert not torch._inductor.config.emulate_precision_casts
 
 
-def test_checkpoint_roundtrip_and_resume_optimizer_rng(tmp_path):
+@pytest.mark.parametrize('encoder,token_only', [('conv',False), ('patch4',False), ('patch4',True)])
+def test_checkpoint_roundtrip_and_resume_optimizer_rng(tmp_path, encoder, token_only):
     torch.manual_seed(7)
-    cfg = config()
+    cfg = replace(config(), encoder=encoder, token_only=token_only)
     m = DirectFollower(cfg)
     ema = copy.deepcopy(m)
     opt = torch.optim.AdamW(m.parameters(), lr=.001)

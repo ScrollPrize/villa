@@ -1,6 +1,6 @@
 # Historical slabs and causal survival confidence
 
-The v10 model uses live history independently at each decision. No persistent
+The v10/v11 models use live history independently at each decision. No persistent
 feature state, recurrent writer, remote full-size seed crop or historical main
 encoder exists. See [run commands and diagnostics](README.md).
 
@@ -51,7 +51,10 @@ including output bias. Encode once per decision, keeping gradients attached;
 reuse these features for generated candidates, retries and supplied candidates.
 No historical coordinates or path markings separately enter either head.
 
-The main encoder and its local history inputs are unchanged. Dense models still
+The patch4 encoder now embeds overlapping 6x6x6 neighborhoods with a stride-4
+convolution (v11). Padding 1 plus high-edge padding to multiples of four retains
+the previous token centers and grid. The convolutional main encoder and local
+history inputs are unchanged. Dense models still
 use full output-plane features; the patch token-only model still samples its
 coarse patch lattice. Refinement predicts absolute replacement paths through the
 same coordinate readout. Acceptance, commit limits and connection bounds retain

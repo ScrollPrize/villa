@@ -13,8 +13,8 @@ from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
 from vesuvius.neural_tracing.fiber_follow.shared.policy import DEFAULT_CONFIDENCE, commit_prefix
 
 ARCHITECTURE = 'axial_fiber_slabs_v10'
-PATCH_ARCHITECTURE = 'axial_patch4_fiber_slabs_v10'
-TOKEN_ARCHITECTURE = 'axial_patch4_tokens_fiber_slabs_v10'
+PATCH_ARCHITECTURE = 'axial_patch4_overlap_fiber_slabs_v11'
+TOKEN_ARCHITECTURE = 'axial_patch4_overlap_tokens_fiber_slabs_v11'
 TOKEN_STRIDE = (8, 2, 2)
 TOKEN_OFFSET = (3, 0, 0)
 

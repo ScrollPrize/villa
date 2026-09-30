@@ -2,7 +2,7 @@
 # Compiled patch/shuffle follower.
 set -euo pipefail
 FF="$(cd "$(dirname "$0")/.." && pwd)"
-export RUN_NAME=${RUN_NAME:-axial_patch4_tokens_slabs_v10_run1}
+export RUN_NAME=${RUN_NAME:-axial_patch4_overlap_tokens_slabs_v11_run1}
 # Edit these defaults here, or override them through environment variables.
 BATCH_SIZE=${BATCH_SIZE:-16}
 MICROBATCH_SIZE=${MICROBATCH_SIZE:-16}

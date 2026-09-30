@@ -216,3 +216,101 @@ use full-size patch4 token-only crops with direction channels, two refinements,
 and four candidates at the last two decisions. The six-decision ages are
 0/40/152/160/184/184; the sixteen-decision ages span 0..184 uniformly.
 These benchmarks exclude volume I/O, logging diagnostics and held-out tracing.
+
+## Prospective convolutional patch stem (not enabled)
+
+A follow-up probe compared the existing patchify/linear projection with the
+repository's `PatchEmbed_deeper`, configured for two downsampling stages
+(`depth_per_level=(1,1)`), eight input channels and output width 128. Its posted
+three-stage default downsamples 8x, not 4x; its default width 864 is not the
+current follower width. All inputs were contiguous FP32 (B,8,120,101,101);
+residual variants pad the upper edges to multiples of four so the stride-2
+average-pooling skip and convolution branches agree on odd input widths.
+Convolution weights use channels-last, and all variants use BF16 autocast.
+These are isolated **eager forward/backward** measurements, five warmups and
+twenty measured iterations on the same RTX 5090. Memory is incremental peak
+allocation above the input and parameter allocations, with gradients cleared
+before each iteration; it is not total model memory. Compilation could change
+these timings, and they must not be read as measured end-to-end training cost.
+
+| Batch | Stem | Mean / p50 / p95 | Incremental peak |
+| --- | --- | ---: | ---: |
+| 1 | current_patch4 | 0.49 / 0.52 / 0.61 ms | 0.078 GiB |
+| 1 | residual_base32 | 20.87 / 20.44 / 22.53 ms | 0.748 GiB |
+| 1 | residual_base16 | 12.96 / 12.80 / 13.93 ms | 0.396 GiB |
+| 1 | early_stride2_base16 | 1.41 / 1.41 / 1.49 ms | 0.089 GiB |
+| 16 | current_patch4 | 5.46 / 5.27 / 6.15 ms | 1.238 GiB |
+| 16 | residual_base32 | 197.86 / 196.48 / 205.73 ms | 11.842 GiB |
+| 16 | residual_base16 | 106.30 / 106.22 / 110.00 ms | 6.269 GiB |
+| 16 | early_stride2_base16 | 11.71 / 11.49 / 12.79 ms | 1.422 GiB |
+
+The lighter alternative is an 8→16 Conv3d/InstanceNorm/ReLU at stride 2,
+a 16→32 basic residual block at stride 2, and a 32→128 1x1x1 projection.
+It retains learned overlapping local convolutions while avoiding a wide
+full-resolution residual block. This is a cost probe, not an accuracy result.
+Adopting either convolutional stem would also require reviewing token-center
+coordinates: the existing patch grid uses an offset of 1.5 input samples.
+No stem was integrated into the follower during this audit.
+
+Exact probe and raw results: `/tmp/fiber_perf_audit/stem.py` and `stem.json`.
+Command: `/home/sean/Documents/villa4/vesuvius/.venv/bin/python /tmp/fiber_perf_audit/stem.py`.
+
+## Overlapping patch embedding (v11)
+
+The patch4 main encoder now uses Conv3d(kernel=6, stride=4, padding=1), with
+high-edge zero padding to complete the stride-four grid. Its 6-cube receptive
+fields overlap by two voxels on each axis. The token count, physical center
+offset (1.5 input samples), axial blocks, local history conditioning, and optional
+dense reconstruction grid are retained. Both patch models have new v11
+architecture identifiers and require fresh training; the conv model stays v10
+and replay remains v6.
+
+A zero-halo equivalence test maps arbitrary old linear weights into the central
+4-cube and verifies output and input-gradient parity in FP64, including partial
+edge cells. A corner impulse outside the old first patch now affects all eight
+neighboring tokens and has nonzero input and halo-weight gradients. Checkpoint
+round-trip and resumed-optimizer/RNG tests cover both overlapping patch models.
+No real-data training-quality improvement is claimed by these checks.
+
+Full training benchmark: RTX 5090, PyTorch 2.12.1+cu130, BF16 autocast, compiled
+forward/backward/loss, four CPU threads, seed 194, synthetic direction-enabled
+120x101x101 crops, 16 decisions in one microbatch, two refinement steps, and four
+supplied candidates for the final two decisions. Three warmup updates precede
+ten measured updates. Baseline is `a9c97dd4c`; both runs exclude volume I/O.
+
+| Measurement | Nonoverlapping linear patch4 | Overlapping convolution |
+| --- | ---: | ---: |
+| Mean update | 199.74 ms | 202.52 ms |
+| p50 / p95 | 198.03 / 205.62 ms | 201.21 / 209.29 ms |
+| Peak allocated VRAM | 14.1316 GiB | 14.1323 GiB |
+| Parameters | 3,001,319 | 3,156,967 |
+
+Mean update time increased 1.4% in this bounded sample; peak memory was effectively
+unchanged. No new graphs were compiled during measured updates. Fresh random
+initialization changes with the projection dimensions, so training losses from
+these short throughput runs do not constitute a paired accuracy comparison.
+
+A separate eager embedding profile confirmed cuDNN BF16 convolution and weight-
+gradient kernels. Its main costs were data copies/layout conversion and the
+convolution kernels; the old projection profile was dominated by copies. Those
+single profiled passes are diagnostic, not substitutes for the compiled training
+measurements above. Raw reports, profiler output and the frozen baseline are in
+`/tmp/fiber_overlap/`.
+
+Commands from `fiber_follow` (use fresh output filenames when repeating):
+
+```bash
+PY=/home/sean/Documents/villa4/vesuvius/.venv/bin/python
+OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 "$PY" -m pytest tests -q \
+  -o addopts='' -o cache_dir=/tmp/fiber_overlap/pytest_cuda
+"$PY" -m vesuvius.neural_tracing.fiber_follow.regression.benchmark_slabs \
+  --warmup 3 --repeats 10 --decisions 16 --microbatch 16 \
+  --out /tmp/fiber_overlap/after.json
+"$PY" /tmp/fiber_overlap/profile_embedding.py
+```
+
+The same benchmark command before the code change wrote `before.json`.
+The frozen baseline source is in `/tmp/fiber_overlap/baseline/`.
+The final CUDA-enabled suite passed **290 tests and 10 subtests** in 61.04
+seconds, including compiled BF16 updates and the added overlap and checkpoint
+checks. `git diff --check` and launcher shell syntax validation also passed.

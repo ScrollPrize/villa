@@ -17,13 +17,19 @@ bash scripts/launch_memory.sh
 
 Set `RUN_NAME`, `BATCH_SIZE`, `MICROBATCH_SIZE`, `WORKERS`, and `BANK_PATH` as needed.
 The patch launcher defaults to 16 decisions per update and microbatch, eight
-loader workers, and a fresh `axial_patch4_tokens_slabs_v10_run1` destination.
+loader workers, and a fresh `axial_patch4_overlap_tokens_slabs_v11_run1` destination.
 The convolutional launcher defaults to `axial_survival_slabs_v10_run1`.
 Existing output directories are never overwritten.
 
 Architecture identifiers are `axial_fiber_slabs_v10`,
-`axial_patch4_fiber_slabs_v10`, and `axial_patch4_tokens_fiber_slabs_v10`.
-Fresh training and replay v6 are required. Recurrent checkpoints and old replay
+`axial_patch4_overlap_fiber_slabs_v11`, and `axial_patch4_overlap_tokens_fiber_slabs_v11`.
+Patch4 now uses a learned 6x6x6 convolution with stride 4 and padding 1, after
+padding the high image edges to multiples of four. Adjacent neighborhoods overlap
+by two voxels. The 30x26x26 token grid and centers at offset 1.5 input samples
+are preserved; dense reconstruction still uses 4x4x4 output cells.
+Overlapping patch models require fresh training; v10 nonoverlapping patch
+checkpoints are rejected rather than silently reshaped. The conv model remains
+v10, and replay v6 remains compatible. Recurrent checkpoints and older replay
 are rejected; there is no weight migration or memory compatibility interface.
 The existing regression `train`, `collect`, and `infer` module entry points remain.
 
@@ -173,7 +179,7 @@ The fixture must contain complete adjacent matched pairs, candidates and labels;
 it can be reused unchanged across checkpoints. Existing held-out rollout and
 monitor recovery evaluations remain part of training. `identity_preflight` checks
 real-data independent batches, and `benchmark_feature_training` measures a bounded
-fork of a v10 run using its actual data. The synthetic benchmark excludes I/O;
+fork of a compatible run using its actual data. The synthetic benchmark excludes I/O;
 compare equal hardware, precision and supervised decision counts.
 
 See [recorded validation](SLAB_VALIDATION.md) for measured results and limits.

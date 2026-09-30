@@ -194,7 +194,7 @@ REST_GRAD_CLIP = 100.
 
 def checkpoint_config(ck):
     if ck['architecture'] not in ARCHITECTURES:
-        raise ValueError('Historical slabs require fresh v10 training and replay v6')
+        raise ValueError('Unsupported checkpoint architecture; overlapping patch embeddings require fresh v11 training')
     cfg = DirectConfig(**ck['model_cfg'])
     if ck['architecture'] != cfg.architecture:
         raise ValueError('Checkpoint architecture does not match its encoder configuration')
@@ -535,7 +535,7 @@ def build_parser():
     ap.add_argument('--n-commit', type=int, default=16)
     ap.add_argument('--channels', type=int, default=DirectConfig.channels, help='Base image encoder width')
     ap.add_argument('--encoder', choices=('conv', 'patch4'), default=None,
-                    help='Image encoder: conv (default) or convolution-free 4x4x4 patches; inferred on resume')
+                    help='Image encoder: conv (default) or overlapping 6x6x6 patches at stride 4; inferred on resume')
     ap.add_argument('--token-only', action=argparse.BooleanOptionalAction, default=None,
                     help='Use only patch4 tokens throughout; no reconstructed fine features or output planes')
     ap.add_argument('--direction-inputs', action=argparse.BooleanOptionalAction, default=True,
