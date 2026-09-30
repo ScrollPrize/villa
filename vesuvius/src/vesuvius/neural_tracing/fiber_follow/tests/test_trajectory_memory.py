@@ -7,18 +7,18 @@ import numpy as np
 import pytest
 import torch
 
-from test_learned_memory import memory_config
+from test_identity import config as memory_config
 from test_identity import batch as base_batch
 from test_neighbor_bank import make_bank, add_shard, publish
 from test_neighbor_following import clean_sample
 from vesuvius.neural_tracing.fiber_follow.regression.model import (
-    build_model, DirectConfig, TRAJECTORY_MEMORY_ARCHITECTURE,
+    build_model, DirectConfig, ARCHITECTURE,
 )
 from vesuvius.neural_tracing.fiber_follow.regression.data import IdentityObservationBuilder, DirectTracer
 from vesuvius.neural_tracing.fiber_follow.regression.identity_decisions import decision_pair
 from vesuvius.neural_tracing.fiber_follow.regression.supervision import loss_terms
 from vesuvius.neural_tracing.fiber_follow.regression.train import (
-    initialize_trajectory_model, add_direction_inputs, optimizer_update, save_checkpoint,
+    optimizer_update, save_checkpoint,
     load_checkpoint, checkpoint_config, build_parser,
 )
 from vesuvius.neural_tracing.fiber_follow.shared.data import SampleConfig
@@ -29,7 +29,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.runloop import resume_training,
 
 
 def cfg(**kwargs):
-    return memory_config(memory_version=4, correction=False, **kwargs)
+    return memory_config(**kwargs)
 
 
 def memory_batch(c, b=2, step=0):
@@ -124,7 +124,7 @@ def test_same_crop_reads_persistent_slots_and_seed_in_crop_frame():
     frame = torch.tensor([[[0., -1., 0.], [1., 0., 0.], [0., 0., 1.]]])
     b['x']['query_frame'] = frame
     ctx = model.context(b['x'], b['hist'], b['hmask'])
-    state = model.recurrent_memory.observe_features(ctx['deep'], b['x'])
+    state, _ = model.observe_context(ctx, b['x'], b['hist'], b['hmask'], None)
     # Hold the local crop and latest observation fixed; vary only old memory.
     state = {k: v.detach() for k, v in state.items()}
     ctx['recurrent'] = state
@@ -159,30 +159,6 @@ def test_censored_and_departed_states_do_not_train_coordinates():
     assert model.coordinates.weight.grad.eq(0).all()
 
 
-@pytest.mark.parametrize('version', [2, 3])
-def test_migration_reuses_shared_weights_and_expands_directions(version):
-    old = build_model(memory_config(memory_version=version))
-    with torch.no_grad():
-        old.coordinates.weight.fill_(17.)
-        old.coordinates.bias.fill_(19.)
-    c = replace(old.cfg, memory_version=4, correction=False, route_refinement_radius=None)
-    # Capture the exact fresh initialization without advancing the migration RNG.
-    with torch.random.fork_rng(devices=[]):
-        fresh = build_model(c)
-    model = initialize_trajectory_model(old, c)
-    assert model.architecture == TRAJECTORY_MEMORY_ARCHITECTURE
-    for key, value in model.state_dict().items():
-        if version == 3 and key.startswith('coordinates.'):
-            torch.testing.assert_close(value, fresh.state_dict()[key], rtol=0, atol=0)
-            assert not torch.equal(value, old.state_dict()[key])
-        elif not key.startswith('recurrent_memory.'):
-            torch.testing.assert_close(value, old.state_dict()[key], rtol=0, atol=0)
-    assert old.coordinates.weight.eq(17.).all() and old.coordinates.bias.eq(19.).all()
-    assert old.cfg.memory_version == version and old.cfg.correction
-    expanded = add_direction_inputs(model)
-    assert expanded.cfg.direction_inputs and expanded.cfg.memory_version == 4
-    assert expanded.encoder.stem[0].weight[:, 2:].eq(0).all()
-    assert not hasattr(expanded.recurrent_memory, 'patch_encoder')
 
 
 def test_training_sequence_checkpoint_and_optimizer_resume(tmp_path):
@@ -204,7 +180,7 @@ def test_training_sequence_checkpoint_and_optimizer_resume(tmp_path):
     save_checkpoint(path, model, ema, spec, sample,
                     dict(optimizer=opt.state_dict(), rng=training_rng_state(), step=1))
     restored, *_, ck = load_checkpoint(path, 'cpu')
-    assert restored.architecture == TRAJECTORY_MEMORY_ARCHITECTURE
+    assert restored.architecture == ARCHITECTURE
     with torch.no_grad():
         expected = ema.eval()(b['x'], b['hist'], b['hmask'])
         actual = restored(b['x'], b['hist'], b['hmask'])
@@ -218,8 +194,6 @@ def test_training_sequence_checkpoint_and_optimizer_resume(tmp_path):
     for key, state in opt.state_dict()['state'].items():
         for name, value in state.items():
             torch.testing.assert_close(restored_opt.state_dict()['state'][key][name], value, rtol=0, atol=0)
-    with pytest.raises(ValueError, match='architecture'):
-        checkpoint_config(dict(ck, architecture='axial_fiber_memory_v3'))
 
 
 def test_builder_streams_causal_main_crops_and_keeps_paired_endpoints_identical(tmp_path, monkeypatch):
@@ -246,10 +220,7 @@ def test_builder_streams_causal_main_crops_and_keeps_paired_endpoints_identical(
     endpoints = []
     for b in steps:
         assert 'memory_patches' not in b['x'] and 'feature_seed_x' not in b['x']
-        if c.memory_probe:
-            assert b['memory_target_identity'].shape == (len(b['hist']), 1)
-        else:
-            assert not any(k.startswith('memory_target_') for k in b)
+        assert not any(k.startswith('memory_target_') for k in b)
         endpoints.extend(b['x']['fine'][b['stream_end']].unbind())
     torch.testing.assert_close(endpoints[0], endpoints[1], rtol=0, atol=0)
     model = build_model(c)
@@ -282,6 +253,7 @@ def test_streaming_keeps_remote_seed_and_cache_until_explicit_eviction():
     assert state['cache'].shape[1] == 2
     assert state['cache_age'].tolist() == [[1., 0.]]
     ctx = model.context(b['x'], b['hist'], b['hmask'])
+    model.observe_context(ctx, b['x'], b['hist'], b['hmask'], state)
     ctx['recurrent'] = state
     baseline = model.predict(ctx, b['hist'])['points']
     changed = dict(state, cache=state['cache'].clone())
@@ -301,11 +273,11 @@ def test_tracer_retains_memory_across_commits(monkeypatch):
         return torch.ones(len(items), 2, crop.depth, crop.width, crop.width)*.25
     monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.regression.data.image_crop', images)
     seen = []
-    observe = model.recurrent_memory.observe_features
-    def capture(deep, x, state=None):
+    observe = model.recurrent_memory.observe_tokens
+    def capture(tokens, xyz, valid, x, state=None):
         seen.append((x['feature_seed_here'].clone(), state['slots'].clone(), x['query_frame'].clone()))
-        return observe(deep, x, state)
-    monkeypatch.setattr(model.recurrent_memory, 'observe_features', capture)
+        return observe(tokens, xyz, valid, x, state)
+    monkeypatch.setattr(model.recurrent_memory, 'observe_tokens', capture)
     tracer = DirectTracer(model, SimpleNamespace(shape=(1000, 1000, 1000)), model.cfg.fine, model.cfg.n_history,
                           TraceParams(n_commit=1, max_len=8, confidence=0.), device='cpu')
     try:
@@ -326,21 +298,8 @@ def test_fullgraph_capture_and_backward():
     assert model.recurrent_memory.gate.weight.grad.abs().sum() > 0
 
 
-@pytest.mark.parametrize('kwargs', [dict(memory_slots=0), dict(correction=True),
-                                    dict(route_refinement_radius=1.), dict(trajectory_sequence_weight=-1.),
-                                    dict(trajectory_sequence_weight=float('nan'))])
-def test_v4_rejects_incompatible_configuration(kwargs):
-    options = dict(memory_version=4, memory_slots=4, correction=False)
-    options.update(kwargs)
-    with pytest.raises(ValueError):
-        DirectConfig(**options)
 
 
-def test_parser_exposes_single_pass_v4():
-    args = build_parser().parse_args(['--name', 'test', '--memory-version', '4', '--no-correction',
-                                     '--trajectory-sequence-weight', '0', '--fiber-zarrs', '/tmp/presence',
-                                     '--fibers', '/tmp/fibers', '--ct', '/tmp/ct', '--manifest', '/tmp/seeds.json'])
-    assert args.memory_version == 4 and not args.correction and args.trajectory_sequence_weight == 0
 
 
 def test_cold_remote_seed_is_encoded_once_and_warm_trace_reads_only_current_crop(monkeypatch):

@@ -1,115 +1,91 @@
-# Observation memory for the continuous follower (v4)
+# Observation memory and causal survival confidence
 
-The trajectory launcher selects feature-memory revision 2 with one recurrent
-refinement pass. Memory retains observations from outside the current crop;
-path prediction and confidence decide how to use them.
-
-This implementation replaces the former admission-gated revision 2. Start a
-fresh training run. Old revision-2 model and optimizer checkpoints are not
-compatible, and no migration is provided. Revision 1 and the other architecture
-modes remain separate experiments.
+This is the sole regression architecture. Old crop-only, patch-memory, spatial
+route, and noncausal prefix-scoring implementations have been removed. Start fresh
+weights; there is no legacy model selector or checkpoint migration.
 
 ## Information flow
 
-1. The main encoder extracts independent local appearance features and an axial
-   deep lattice from the current CT, presence, direction fields and observed
-   history. Persistent memory does not enter this encoding.
-2. Memory stores 32 pooled deep tokens and up to 16 detail tokens. Detail tokens
-   contain 3x3 stem-feature neighborhoods plus deep features at the head and
-   visible observed history. These are independent observations, not the final
-   memory-conditioned fine features.
-3. Spatial queries retrieve from incoming memory. The coarse retrieval is
-   projected and interpolated onto the deep lattice. The fine-feature decoder
-   then combines that conditioned lattice with local stem features, once per crop.
-   Both fine features and visible-reference features therefore see history.
-4. The path decoder reads the current conditioned spatial features, visible
-   references and persistent memory directly. Four shared decoder layers predict
-   16 continuous lateral coordinates. One further pass samples the proposed
-   curve's features and applies bounded one-voxel lateral refinement.
-5. Confidence samples the actual curve being scored and queries memory at those
-   locations. Retrieved features enter the curve evidence transformer before
-   prefix aggregation. There is one prefix-confidence readout, without a separate
-   additive memory-logit head. The scorer never receives the generator's decoder
-   tokens; supplied candidates and generated paths use the same scorer.
+1. The main encoder extracts stem appearance features and an axial deep lattice
+   from CT, presence, optional direction fields, and visible observed history.
+   Persistent memory does not enter this encoding.
+2. Memory stores 32 pooled deep tokens and up to 16 detail tokens containing
+   3x3 stem neighborhoods and deep features at the head and observed history.
+   There is no other image encoder. Stored observations precede memory conditioning.
+3. Queries retrieve incoming historical observations. The coarse retrieval is
+   projected/interpolated onto the deep lattice; the fine-feature decoder combines
+   this conditioned lattice with stem features once per crop.
+4. The generator reads current spatial features, visible references, immutable
+   seed observations, cached observations and persistent slots. Four decoder
+   layers jointly predict the future lateral coordinates. By default, one more
+   pass through the same decoder samples the proposal and applies a bounded
+   one-voxel lateral correction. Generator self-attention remains bidirectional.
+5. A separate scorer samples four ordered locations along each incoming proposed
+   segment, including the endpoint, using the existing 3x3x3 fine-feature stencil
+   and deep features. At production forward spacing this is one sample per quarter
+   forward voxel, matching dense supervision. The fixed forward-plane representation
+   determines resolution; arbitrary resampling of candidates is not supported.
+6. Segment tokens include sampled evidence, start/end/displacement/length and
+   causal visible-reference comparisons. Two scoring decoder layers use causal
+   segment self-attention and unrestricted cross-attention to the entire current
+   image/reference/memory token set. Their own K/V projections are reused across
+   scored candidates within one decision. No generator hidden states enter scoring.
+7. One linear readout predicts the conditional first-failure logit per segment.
+   Prefix confidence is the product of conditional survival probabilities,
+   accumulated in FP32 log space. Supplied candidates and generated paths use the
+   same scorer. Existing diagnostic `confidence_logits` remain prefix logits;
+   explicit `hazard_logits` are used for training.
 
-All coordinates use trace-grid voxels. The production crop is 120x101x101 at
-spacing 0.5; output points occupy fixed forward planes 1 through 16. Point
-self-attention, crop bounds and the first-point recovery limit are unchanged.
+Holding observations and a prefix fixed, replacing its suffix leaves earlier
+scores unchanged. Truncating/extending it also preserves those scores, up to
+floating-point kernel rounding. Image lookahead remains unrestricted: the causal
+mask applies only to proposed segments, never to the observed scene.
+
+## Supervision and decisions
+
+For conditional failure probabilities `h[i]`, prefix survival is
+`S[k] = product(1 - h[i], i <= k)`. If the first known failure is in interval `j`,
+the negative log likelihood is `-sum(log(1-h[i]), i<j) - log(h[j])`.
+A fully correct or right-censored path contributes survival terms only through its
+last known correct prefix. Hazards after a first failure or an unknown prefix
+receive no supervision. A failure observed after an annotation gap does not locate
+the first-failure interval; training conservatively censors at the gap.
+
+Both generated and supplied candidate paths use this likelihood. Intervals sum
+within a path; paths average per state and states average per effective batch.
+Commit-window weighting applies to geometry only. This changes confidence-loss
+scale from the former prefix BCE. Raw `confidence_count` remains a count of known
+prefix labels for correctness metrics, not a count of hazard training targets.
+
+Dense labels retain their existing recovery contract: the first event judges the
+first point and admissibility of the origin-to-first-point connection. A displaced
+origin may recover within the configured limit; that bridge is not required to
+match the original centerline. Later events judge all dense crossings since the
+previous point. Known departures and physical endpoints are failures; unknown
+ends and unobservable identity are censored. Foreign-fiber masks remain negatives.
+
+Confidence detaches scored coordinates. Its loss trains its own scorer, the
+shared encoder and memory, but not the generator decoder, coordinate head or
+refinement head. The visible-reference contrastive loss also reaches memory
+through conditioned fine features. Geometry supervises initial/final proposals
+with weights 25%/75%. No auxiliary admission or memory-probe objectives exist.
+
+Inference commits the longest prefix clearing its confidence threshold. Confidence
+is monotone by construction; it does not need post-hoc minimum repair. The shared
+trace policy's existing cumulative minimum is harmless for these monotone values.
 
 ## Retention and gradients
 
-Memory contains an immutable seed observation, the latest 64 observation grids,
-and 16 persistent learned slots. Spatial tokens retain position, orientation, age
-and validity, and remain readable outside the current crop. Every observation is
-cached, including observations made after a wrong turn.
+Memory carries an immutable seed observation, the newest 64 observation grids,
+and 16 persistent slots. Spatial tokens retain position, orientation, age and
+validity and stay readable outside the current crop. Every observation is cached,
+including wrong turns. Slots compress independent observations using a learned
+update gate; retrieved historical interpretations are never written back.
 
-Slots compress observations using their existing learned update gate. There is
-no fiber-membership admission classifier, admission metadata, identity-based
-write multiplier, offset probe, or auxiliary memory-probe loss. The writer
-receives independent observations and the previous slots; retrieved historical
-interpretations are not written back as new observations.
+Training carries memory through two-decision gradient chunks. Endpoint replay
+recomputes writer transitions chronologically and re-encodes up to three selected
+historical crops, stratified by age. Other historical features are detached and
+potentially stale. This is not full-history encoder backpropagation. The immutable
+seed survives cache eviction, and persistent slots can retain older evidence.
 
-Path and confidence objectives train memory retrieval and compression. The
-visible-reference contrastive objective remains an encoder objective. Confidence
-detaches scored coordinates and has no gradient path into the coordinate head,
-trajectory decoder or refinement head. It still trains the shared encoder and
-memory. Geometry supervises both the initial and refined curves (25% / 75%).
-
-Training carries memory across two-decision gradient chunks. Revision-2 endpoint
-replay retains its age-stratified historical re-encoding and differentiable
-writer transitions. The replay objective has geometry, confidence and candidate
-terms, without memory-probe terms. Other historical features remain detached,
-potentially stale representations; this is not full-history encoder BPTT.
-The seed persists after cache eviction, and slots can retain still older evidence.
-
-## Fresh training
-
-From `fiber_follow`, using the existing environment:
-
-```bash
-bash scripts/launch_trajectory_memory.sh
-tail -F output/logs/axial_observation_memory_v4_run1.log
-```
-
-The launcher starts a fresh run with direction inputs, batch 8, microbatch 4,
-eight workers, 16-point maximum commit, history spacing 8, revision 2 and one
-refinement pass. It refuses an existing destination. Override `RUN_NAME` to
-start another experiment; trailing trainer options override launcher settings.
-
-Matched decision endpoints increase from 10% to 30% of sampling opportunities,
-and synthetic memory switches increase from 15% to 30% of eligible fresh draws.
-These are endpoint probabilities, not guaranteed per-crop fractions: causal
-streams expand into different numbers of observations. Logs report actual
-candidate-supervised crops and known departed confidence states across every
-ordinary training crop. Endpoint replay is reported separately. These settings
-need validation on actual branch-choice and departure outcomes.
-
-No old checkpoint should be passed with `--resume` or `--init-tracer`.
-New checkpoints from this implementation can resume normally. There is no
-admission/offset loss to tune; the launcher sets `--memory-probe-weight 0`.
-The shared trainer retains probe options for the other memory architectures.
-
-## Validation
-
-Run the CPU architectural and training checks without installing dependencies:
-
-```bash
-AGENTS_AGENT_MODE=1 PYTHONDONTWRITEBYTECODE=1 CUDA_VISIBLE_DEVICES='' \
-OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 OPENBLAS_NUM_THREADS=1 \
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=../../.. \
-../../../../.venv/bin/python -m pytest \
-  tests/test_detailed_memory.py tests/test_trajectory_memory.py \
-  tests/test_recurrent_refinement.py \
-  tests/test_point_logging.py tests/test_sampling_balance.py \
-  -q -o cache_dir=/tmp/fiber-observation-pytest
-```
-
-Tests check independent stored observations, memory-conditioned fine features,
-candidate-specific reads, generator-independent scores and gradients,
-long-range compression gradients, immutable seeds, cache masking, cold/warm
-tracing, chronological replay, training updates and full-graph capture.
-The CUDA test additionally compares eager and compiled BF16 gradients when
-a working GPU environment is available.
-
-These implementation tests do not establish tracing accuracy, convergence,
-production GPU memory use or throughput for the revised architecture.
+See [training and validation commands](README.md).

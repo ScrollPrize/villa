@@ -39,7 +39,7 @@ class StratifiedReplay:
         so eager execution is dominated by kernel launches. Batch size and
         state shapes are fixed, so a handful of static graphs cover every call.
         """
-        base = getattr(raw, 'replay_transition', raw.recurrent_memory.observe_tokens)
+        base = raw.recurrent_memory.observe_tokens
         if not compiled:
             return base
         if self._compiled is None or self._compiled[0] is not raw:
@@ -69,9 +69,9 @@ class StratifiedReplay:
                 self.pending.append(self.streams.pop(key))
 
     def backward(self, model, total, *, device, tolerance, n_commit, confidence_weight,
-                 candidate_weight, memory_probe_weight):
+                 candidate_weight):
         from .train import move_batch
-        from .supervision import loss_terms, memory_probe_terms
+        from .supervision import loss_terms
         raw = getattr(model, '_orig_mod', model)
         weight = raw.cfg.feature_replay_weight
         metrics = dict(replay_endpoints=0, replay_observations=0, replay_encoder_crops=0, replay_loss=0.)
@@ -94,7 +94,6 @@ class StratifiedReplay:
                         features = row['features']
                     pose = move_batch(row['pose'], device)
                     state, _ = transition(*features, pose, state)
-                    state = {k: v for k, v in state.items() if k != 'probe'}
                 batch = move_batch(rows[-1]['batch'], device)
                 kwargs = dict(candidates=batch['candidate_points']) if 'candidate_points' in batch else {}
                 output = model(batch['x'], batch['hist'], batch['hmask'], memory=state, **kwargs)
@@ -102,9 +101,6 @@ class StratifiedReplay:
                 loss = terms['geometry_per_state'].sum()+confidence_weight*terms['confidence_per_state'].sum()
                 if 'candidate_per_state' in terms:
                     loss = loss+candidate_weight*terms['candidate_per_state'].sum()
-                if 'memory_probe' in output and 'memory_target_identity' in batch:
-                    probe = memory_probe_terms(output, batch, departed_weight=raw.cfg.memory_departed_weight)
-                    loss = loss+memory_probe_weight*(probe['memory_identity_per_state'].sum()+probe['memory_offset_per_state'].sum())
                 loss = loss*(weight/total)
             loss.backward()
             # Stays on the device; the training update resolves all sums with one transfer.

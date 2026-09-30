@@ -41,7 +41,7 @@ def test_direct_images_preserve_scores_rng_and_parameters(tmp_path, monkeypatch,
     from matplotlib.axes import Axes
     from matplotlib.figure import Figure
     cfg = config()
-    cfg.correction = correction
+    cfg.recurrent_refinement_steps = int(correction)
     model = DirectFollower(cfg)
     data = batch(cfg)
     data.update(plane_ab=torch.ones(2, cfg.n_future, 2), plane_mask=torch.ones(2, cfg.n_future),

@@ -18,37 +18,6 @@ from vesuvius.neural_tracing.fiber_follow.shared.reference import SEED_FIELDS, o
 from vesuvius.neural_tracing.fiber_follow.shared.trace import ModelTracer, TraceParams
 
 
-def test_matched_decisions_change_ownership_and_geometry_with_only_reference(tmp_path):
-    bank, parent = make_bank(tmp_path)
-    publish(tmp_path, [add_shard(tmp_path, 0, x=4., z_range=(20., 180.))])
-    cfg = DirectConfig()
-    builder = IdentityObservationBuilder(cfg, [parent], negative_bank=bank)
-    rng = np.random.default_rng(7)
-    kinds, tails = set(), set()
-    for _ in range(40):
-        rows = decision_pair(bank, clean_sample(cfg), cfg, rng)
-        assert rows is not None
-        a, b = sorted(rows, key=lambda row: 'supervision_fiber' in row)
-        for key in ('pos', 'frame', 'hist_local', 'hmask', 'candidate_points', 'candidate_mask'):
-            np.testing.assert_array_equal(a[key], b[key])
-        assert np.linalg.norm(a['seed_pos']-b['seed_pos']) == 4.
-        assert b['candidate_labels'].sum() == cfg.n_future
-        assert not (a['candidate_labels']*b['candidate_labels']).any()
-        assert a['candidate_mask'].all() and b['candidate_mask'].all()
-        if a['offtrack']:
-            assert not a['candidate_labels'].any()
-            kinds.add('departed')
-            tails.add(a['decision_tail'])
-        else:
-            assert a['candidate_labels'].sum() == cfg.n_future
-            assert np.linalg.norm(a['plane_ab']-b['plane_ab'], axis=-1).min() > 3.9
-            kinds.add('choice')
-        for row in rows:
-            prepared = builder.prepare(row, row.get('supervision_fiber', parent), rng)
-            assert prepared['reference_mask'][-1:].sum() == 1
-            assert prepared['identity_reference_valid']
-            assert builder.footprint_allowed(prepared, bank.band)
-    assert kinds == {'choice', 'departed'} and max(tails) <= 12.
 
 
 def candidate_batch(cfg):
@@ -63,25 +32,6 @@ def candidate_batch(cfg):
     return data
 
 
-def test_candidates_share_deployed_head_and_train_identity_attention():
-    torch.manual_seed(17)
-    model = DirectFollower(config()).eval()
-    data = candidate_batch(model.cfg)
-    def forward(candidates):
-        return model(data['x'], data['hist'], data['hmask'], candidates=candidates)
-    out = forward(data['candidate_points'])
-    reordered = forward(data['candidate_points'].flip(1))
-    torch.testing.assert_close(out['candidate_confidence_logits'].flip(1), reordered['candidate_confidence_logits'])
-    predicted = forward(out['points'].detach()[:, None])
-    torch.testing.assert_close(predicted['candidate_confidence_logits'][:, 0], predicted['confidence_logits'])
-    terms = loss_terms(out, data, model.cfg)
-    terms['candidate_per_state'].sum().backward()
-    for module in (model.reference_token, model.encoder,
-                   model.decoder, model.confidence_head):
-        assert sum(float(p.grad.abs().sum()) for p in module.parameters() if p.grad is not None) > 0
-    assert model.coordinates.weight.grad is None  # candidate coordinates are labels
-    data['candidate_mask'].zero_()
-    assert loss_terms(out, data, model.cfg)['candidate_per_state'].eq(0).all()
 
 
 def test_candidate_update_independent_of_microbatch_boundaries():

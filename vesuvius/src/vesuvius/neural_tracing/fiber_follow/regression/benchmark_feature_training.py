@@ -14,7 +14,7 @@ import numpy as np
 import torch
 
 from . import train
-from .upgrade_refinement import options_argv
+from .train import options_argv
 from vesuvius.neural_tracing.fiber_follow.shared.runloop import training_rng_state
 
 

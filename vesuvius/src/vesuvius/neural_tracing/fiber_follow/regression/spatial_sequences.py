@@ -1,9 +1,4 @@
-"""Additional supervised decisions from causal prefixes of observed replay tracks.
-
-Each prefix is independently re-encoded with current weights, using the same
-writer transition as streaming inference. Its later observations never enter
-its inputs. This trades repeated encoding for bounded activation memory.
-"""
+"""Label causal prefixes of observed replay tracks for streaming decisions."""
 import numpy as np
 
 from .neighbor_mining import exact_nearest
@@ -12,24 +7,8 @@ from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength, inte
 from vesuvius.neural_tracing.fiber_follow.shared.reference import SEED_FIELDS
 
 
-def earlier_decision(item, builder):
-    cfg = builder.cfg
-    track = item.get('memory_track')
-    if track is None or len(track['pos']) < 4:
-        return None
-    rng = np.random.default_rng(item['identity_seed'])
-    known = np.flatnonzero(np.isfinite(track['offtrack']))
-    known = known[(known >= 2) & (known < len(track['pos'])-1)]
-    if not len(known):
-        return None
-    j = int(rng.choice(known))
-    if arclength(np.asarray(track['pos'][:j+1], float))[-1] < 2:
-        return None
-    return decision_at(item, builder, j, rng=rng)
-
-
 def decision_at(item, builder, j, *, rng=None, observed_indices=None):
-    """Label one causal replay prefix; shared by v3 sampling and v4 streams."""
+    """Label one causal replay prefix without exposing later observations."""
     cfg = builder.cfg
     track = item['memory_track']
     rng = np.random.default_rng(item['identity_seed']) if rng is None else rng
@@ -65,8 +44,7 @@ def decision_at(item, builder, j, *, rng=None, observed_indices=None):
     row.update(fiber_ref=(fi,fiber.length-t if reverse else t,reverse),
                source=item.get('source',2),source_step=item.get('source_step',-1),
                stratum=item.get('stratum',-1),location_source=item.get('location_source',0),
-               memory_track={key:np.asarray(value[observed]).copy() for key,value in track.items()},
-               _route_sequence_member=True)
+               memory_track={key:np.asarray(value[observed]).copy() for key,value in track.items()})
     for key in ('supervision_fiber','bank_parent_arc_range',*SEED_FIELDS):
         if key in item:
             row[key] = item[key]

@@ -18,22 +18,6 @@ from vesuvius.neural_tracing.fiber_follow.shared.data import SampleConfig
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolumeSpec
 
 
-def test_production_grid_and_single_encoder():
-    cfg=DirectConfig()
-    assert (cfg.fine.depth,cfg.fine.width,cfg.fine.behind)==(120,101,48)
-    assert cfg.token_shape==(15,51,51) and np.prod(cfg.token_shape)==39015
-    m=DirectFollower(cfg)
-    assert cfg.channels==32 and cfg.hidden==128 and cfg.layers==4
-    assert m.encoder.stem[0].out_channels==32
-    assert m.encoder.down[0].out_channels==64 and m.encoder.down[2].out_channels==128
-    assert isinstance(m.encoder.down[-1],ResidualConv)
-    assert m.encoder.down[-1].net[2].in_channels==128
-    assert m.encoder.dense_projection.out_channels==32
-    assert sum(p.numel() for p in m.parameters())==4464453
-    assert m.encoder.compress.kernel_size==(4,1,1)
-    assert m.encoder.compress.stride==(4,1,1)
-    assert not hasattr(m,'appearance') and not hasattr(m,'coarse_encoder')
-    assert [a.axis for a in m.encoder.blocks[0].axes]==[3,2,1]
 
 
 def test_one_axial_cycle_connects_distant_positions_in_both_directions():
@@ -92,19 +76,6 @@ def test_outside_history_and_seed_cannot_influence_predictions():
         torch.testing.assert_close(before[key],after[key],rtol=0,atol=0)
 
 
-def test_visible_reference_changes_context_without_oracle_inputs():
-    torch.manual_seed(1)
-    m=DirectFollower(config()).eval()
-    b=batch(m.cfg,1)
-    a=m.context(b['x'],b['hist'],b['hmask'])
-    b['x']['seed'][:,:,0]=4.
-    other=m.context(b['x'],b['hist'],b['hmask'])
-    assert not torch.equal(a['fine'],other['fine'])
-    # Changing annotation-only tensors cannot alter the model's input or output.
-    before=forward(m,b)
-    b['reference_on_fiber'].zero_();b['foreign'].fill_(1);b['dense_ab'].fill_(float('nan'))
-    after=forward(m,b)
-    for key in before:torch.testing.assert_close(before[key],after[key],rtol=0,atol=0)
 
 
 def test_query_order_and_outside_support():
@@ -141,43 +112,10 @@ def test_unobservable_identity_has_no_supervision_gradient():
     assert all(p.grad is None or p.grad.eq(0).all() for p in m.parameters())
 
 
-def test_reference_visibility_masks_seed_geometry_and_labels():
-    cfg=config();fiber=line_fiber()
-    item=dict(pos=np.array([106.,100.,400.]),frame=np.eye(3),
-        hist_local=np.c_[np.zeros(cfg.n_history),np.zeros(cfg.n_history),-np.arange(1,cfg.n_history+1)],
-        hmask=np.ones(cfg.n_history),seed_pos=np.array([100.,100.,395.]),seed_tangent=np.array([0.,0.,1.]),
-        seed_age=5.,seed_valid=True,fiber_ref=(0,200.,False),source=2,offtrack=True)
-    builder=IdentityObservationBuilder(cfg,[fiber])
-    a=builder.prepare(copy.deepcopy(item),fiber,np.random.default_rng(1))
-    assert a['visible_seed_mask'].all() and a['identity_observable']
-    item['seed_pos'][2]=200.
-    b=builder.prepare(item,fiber,np.random.default_rng(1))
-    assert not b['visible_seed_mask'].any() and not b['identity_observable']
-    assert not b['visible_seed'].any() and not b['visible_seed_tangent'].any() and b['visible_seed_age']==0
 
 
-def test_observation_builder_reads_only_one_ct_and_presence_crop(monkeypatch):
-    cfg=config();calls=[]
-    def sample(items,vol,crop,pool=None,*,presence=False):
-        calls.append((crop,presence))
-        return torch.zeros(len(items),1,crop.depth,crop.width,crop.width)
-    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.regression.data.scalar_crops',sample)
-    item=dict(pos=np.zeros(3),frame=np.eye(3),hist_local=np.zeros((cfg.n_history,3)),hmask=np.zeros(cfg.n_history))
-    x=ObservationBuilder(cfg).images([item],None)
-    assert calls==[(cfg.fine,False),(cfg.fine,True)]
-    assert set(x)=={'fine','seed','seed_mask','seed_age','seed_tangent'}
 
 
-@pytest.mark.parametrize('old_architecture',['direct_identity_v1','axial_fiber_v1','axial_fiber_v2'])
-def test_new_checkpoint_roundtrip_and_reject_old_architecture(tmp_path,old_architecture):
-    cfg=config();m=DirectFollower(cfg).eval();data=batch(cfg,1)
-    sample=SampleConfig(crop=cfg.fine,n_history=cfg.n_history,n_future=cfg.n_future)
-    path=tmp_path/'model.pt'
-    save_checkpoint(path,m,m,FiberVolumeSpec('/unused'),sample)
-    loaded,*_=load_checkpoint(path,'cpu')
-    for key,value in forward(m,data).items():torch.testing.assert_close(value,forward(loaded,data)[key])
-    ck=torch.load(path,weights_only=False);ck['architecture']=old_architecture;torch.save(ck,path)
-    with pytest.raises(ValueError):load_checkpoint(path,'cpu')
 
 
 def test_history_cues_use_nearest_physical_token_centres():

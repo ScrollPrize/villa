@@ -6,7 +6,6 @@ import pytest
 import torch
 from test_trajectory_memory import cfg
 from vesuvius.neural_tracing.fiber_follow.regression.feature_sequences import SwitchCropBudget, sequence_batches
-from vesuvius.neural_tracing.fiber_follow.regression.supervision import memory_probe_terms
 
 
 def stream(source, length, identity=0):
@@ -35,7 +34,7 @@ def test_burst_is_budgeted_as_one_complete_stream_not_truncated_or_interleaved(m
     monkeypatch.setattr(module,'stream_rows',lambda item,builder,band:item)
     class Builder:
         def __init__(self):
-            self.cfg=cfg(feature_switch_crop_fraction=.15,feature_memory_revision=2)
+            self.cfg=cfg(feature_switch_crop_fraction=.15)
             self.encoded=[]
         def __call__(self,rows,vol):
             self.encoded.extend((r['source'],r['observation']) for r in rows)
@@ -65,28 +64,7 @@ def test_burst_is_budgeted_as_one_complete_stream_not_truncated_or_interleaved(m
     assert all(sid>>48==2 for sid in seen)
 
 
-def test_departed_weight_changes_only_negative_bce_gradient_and_not_metrics():
-    b=dict(memory_target_identity=torch.tensor([[1.,0.,0.]]),
-           memory_target_identity_mask=torch.tensor([[True,True,False]]),
-           memory_target_offset=torch.ones(1,3,3),
-           memory_target_offset_mask=torch.tensor([[True,False,False]]))
-    results=[]
-    for weight in (1.,4.):
-        p=torch.zeros(1,3,4,requires_grad=True)
-        terms=memory_probe_terms(dict(memory_probe=p),b,departed_weight=weight)
-        (terms['memory_identity_per_state'].sum()+terms['memory_offset_per_state'].sum()).backward()
-        results.append((terms,p.grad))
-    normal,weighted=results
-    assert weighted[1][0,1,0]==4*normal[1][0,1,0]
-    assert weighted[1][0,0,0]==normal[1][0,0,0]
-    assert weighted[1][0,2,0]==0
-    torch.testing.assert_close(weighted[1][...,1:],normal[1][...,1:])
-    for key in ('memory_identity_count','memory_identity_correct','memory_departed_count','memory_departed_correct'):
-        assert normal[0][key]==weighted[0][key]
-
-
-@pytest.mark.parametrize('field,value',[('memory_departed_weight',0.),('memory_departed_weight',float('nan')),
- ('feature_switch_crop_fraction',1.),('feature_switch_crop_fraction',-.1),('feature_switch_crop_fraction',float('nan'))])
+@pytest.mark.parametrize('field,value',[('feature_switch_crop_fraction',1.),('feature_switch_crop_fraction',-.1),('feature_switch_crop_fraction',float('nan'))])
 def test_invalid_balance_config(field,value):
     with pytest.raises(ValueError):
         cfg(**{field:value})

@@ -19,37 +19,6 @@ def configuration():
     return model,sample
 
 
-@pytest.mark.parametrize('seed',range(6))
-def test_smooth_bridge_retains_own_history_and_rejects_wrong_tail(tmp_path,seed):
-    bank,fiber = make_bank(tmp_path,with_path=True)
-    cfg,sample = configuration()
-    rng = np.random.default_rng(seed)
-    state = wrong_continuation(bank,sample,rng,tail_length_range=(4.,12.))
-    assert state is not None and state['offtrack'] == 1 and state['source'] == 3
-    np.testing.assert_allclose(state['pos'][:2],[6.,0.],atol=1e-8)
-    assert bank.clear_of_target(0,state['pos']).all()
-    assert not state['fmask'].any() and not state['dense_mask'].any()
-    history = state['hist_local'] @ state['frame'].T+state['pos']
-    valid = history[state['hmask']>0]
-    assert (abs(valid[:,0])<1e-8).sum() >= 8
-    assert ((valid[:,0]>0) & (valid[:,0]<6)).any()
-    np.testing.assert_allclose(valid[0,:2],[6.,0.],atol=1e-8)
-    steps = np.diff(np.concatenate((state['pos'][None],valid)),axis=0)
-    assert np.linalg.norm(steps,axis=1).max() <= 1.000001
-    assert np.linalg.norm(steps,axis=1).min() > .98
-    directions = steps/np.linalg.norm(steps,axis=1)[:,None]
-    assert (directions[1:]*directions[:-1]).sum(1).min() > .97
-    builder = IdentityObservationBuilder(cfg,[fiber],negative_bank=bank)
-    builder.prepare(state,fiber,rng)
-    on=state['reference_on_fiber']
-    assert on[:cfg.n_history].sum() >= 1
-    assert state['identity_observable'] == bool(on[:-1].sum() >= 2 or on[-1])
-    assert not on[state['reference_mask']==0].any()
-    assert state['reference_on_fiber'][0] == 0
-    points = torch.zeros(1,4,3)
-    points[0,:,2] = torch.arange(1,5)
-    target,known,_ = prefix_labels(points,collate_targets([state]))
-    assert not target.any() and known.all()
 
 
 def test_only_recent_departure_slots_are_replaced_and_missing_bank_abstains(tmp_path):
@@ -98,25 +67,6 @@ def test_unsafe_synthetic_departure_falls_back_to_original_replay(tmp_path):
     np.testing.assert_array_equal(state['pos'],replay.pos[0])
 
 
-@pytest.mark.parametrize('seed',range(6))
-def test_long_departure_without_visible_reference_is_not_supervised(tmp_path,seed):
-    bank,fiber = make_bank(tmp_path)
-    publish(tmp_path,[add_shard(tmp_path,0,z_range=(20.,180.))])
-    cfg = DirectConfig(n_future=4)
-    sample = SampleConfig(crop=cfg.fine,n_history=cfg.n_history,n_future=4)
-    builder = IdentityObservationBuilder(cfg,[fiber],negative_bank=bank,
-        sampling=IdentitySampling(bank_wrong_continuation_probability=1.,
-                                  bank_wrong_continuation_tail=(128.,128.)))
-    state = builder.replace_replay(2,4,sample,np.random.default_rng(seed))
-    assert state is not None and state['bank_tail_length'] == 128.
-    history = state['hist_local'] @ state['frame'].T+state['pos']
-    np.testing.assert_allclose(history[:,0],6.,atol=1e-5)
-    assert state['hmask'].all() and not state['dense_mask'].any()
-    builder.prepare(state,fiber,np.random.default_rng(seed))
-    assert not state['reference_on_fiber'][:cfg.n_history].any()
-    assert not state['reference_on_fiber'].any()
-    assert not state['identity_observable']
-    assert not state['visible_seed_mask'].any()
 
 
 def test_variable_tails_reach_128_and_short_paths_are_not_silently_substituted(tmp_path):

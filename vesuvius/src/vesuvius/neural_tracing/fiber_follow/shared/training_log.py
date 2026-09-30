@@ -204,12 +204,9 @@ def format_training_log(row):
     step = f"Step {row['step']:,}" if 'step' in row else 'Training'
     if row.get('event') == 'resume_configuration':
         options, cfg = row.get('training_options', {}), row.get('model_cfg', {})
-        observation_memory = cfg.get('memory_version') == 4 and cfg.get('feature_memory_revision') == 2
-        memory = ('observation memory (no probes)' if observation_memory else
-                  f"departed probe loss {cfg.get('memory_departed_weight', 1.):g}x")
+        memory = 'observation memory | causal survival confidence'
         return (f"{step} | resumed {row['checkpoint']}\n"
                 f"  commit {options.get('n_commit', '?')} | history spacing {cfg.get('memory_stride', '?')} vox"
-                f" | memory revision {cfg.get('feature_memory_revision', '?')}"
                 f" | batch {options.get('batch', '?')} / microbatch {options.get('microbatch', '?')}"
                 f"\n  {memory}"
                 f" | switch crop budget {cfg.get('feature_switch_crop_fraction', -1.):g}")

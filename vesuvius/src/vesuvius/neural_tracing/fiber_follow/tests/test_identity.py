@@ -22,7 +22,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolumeSpec
 
 def config(**kwargs):
     options=dict(fine=CropSpec(depth=24,width=17,behind=8),channels=4,hidden=16,
-        heads=2,layers=1,decoder_layers=1,n_future=4,n_history=32,embedding=8,activation_checkpointing=False)
+        heads=2,layers=1,decoder_layers=1,n_future=4,n_history=32,embedding=8,activation_checkpointing=False,memory_slots=4,memory_steps=4,feature_detail_tokens=4,recurrent_refinement_steps=0)
     options.update(kwargs)
     return DirectConfig(**options)
 
@@ -34,7 +34,9 @@ def batch(cfg,b=2):
     K,M=2,3
     x=dict(fine=torch.rand(b,2,cfg.fine.depth,cfg.fine.width,cfg.fine.width),
         seed=torch.zeros(b,1,3),seed_mask=torch.ones(b,1),seed_tangent=torch.tensor([0.,0.,1.]).expand(b,-1),
-        seed_age=torch.zeros(b))
+        seed_age=torch.zeros(b), query_frame=torch.eye(3).expand(b,-1,-1).clone(),
+        query_position=torch.zeros(b,3), feature_seed_here=torch.ones(b,dtype=torch.bool),
+        memory_mask=torch.ones(b,1,dtype=torch.bool),memory_seed_valid=torch.ones(b,dtype=torch.bool))
     points=torch.zeros(b,K*(1+M),3)
     points[:,:K,2]=torch.tensor([2.,3.])
     points[:,K:,0],points[:,K:,2]=3.,2.

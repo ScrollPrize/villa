@@ -21,7 +21,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolumeSpec
 
 def config():
     return DirectConfig(fine=CropSpec(depth=16, width=12, behind=7),
-                        channels=4, hidden=16, heads=2, layers=1, decoder_layers=1, activation_checkpointing=False, n_future=4, n_history=32)
+                        channels=4, hidden=16, heads=2, layers=1, decoder_layers=1, activation_checkpointing=False, n_future=4, n_history=32, memory_slots=4, memory_steps=4, feature_detail_tokens=4, recurrent_refinement_steps=0)
 
 
 def batch(cfg, b=2):
@@ -29,7 +29,10 @@ def batch(cfg, b=2):
     hist[..., 2] = -torch.arange(1, cfg.n_history+1)
     q = 4*(cfg.n_future-1)+1
     return dict(x={name: torch.rand(b, 2, crop.depth, crop.width, crop.width)
-                   for name, crop in (('fine', cfg.fine),)},
+                   for name, crop in (('fine', cfg.fine),)} | dict(
+                    query_frame=torch.eye(3).expand(b,-1,-1).clone(),query_position=torch.zeros(b,3),
+                    feature_seed_here=torch.ones(b,dtype=torch.bool),memory_mask=torch.ones(b,1,dtype=torch.bool),
+                    memory_seed_valid=torch.ones(b,dtype=torch.bool)),
                 hist=hist, hmask=torch.ones(b, cfg.n_history), dense_ab=torch.ones(b, q, 2),
                 dense_mask=torch.ones(b, q), offtrack=torch.zeros(b), endpoint_known=torch.zeros(b),
                 end_local=torch.zeros(b, 3), source=torch.zeros(b))
@@ -326,52 +329,18 @@ def test_cuda_bf16_geometry_gradients():
     assert torch.isfinite(loss) and m.coordinates.weight.grad.abs().sum() > 0
 
 
-def test_local_correction_is_bounded_and_confidence_cannot_train_its_coordinates():
-    torch.manual_seed(123)
-    cfg = replace(config(), correction_limit=.4)
-    m = DirectFollower(cfg)
-    b = batch(cfg)
-    seen = []
-    original = m.evidence
-    def patches(ctx, points, stage):
-        seen.append(points.detach().clone())
-        return original(ctx, points, stage)
-    m.evidence = patches
-    encodings = []
-    handles = [encoder.register_forward_hook(lambda *args: encodings.append(1))
-               for encoder in (m.encoder,)]
-    out = forward(m, b)
-    for handle in handles:
-        handle.remove()
-    assert len(encodings) == 1  # One encoding despite repeated correction.
-    assert len(seen) == cfg.correction_steps+1
-    assert out['refinement_points'].shape == (2, 3, 4, 3)
-    for i, coordinates in enumerate(seen):
-        torch.testing.assert_close(coordinates, out['refinement_points'][:, i])
-    delta = out['refinement_points'][:, 1:]-out['refinement_points'][:, :-1]
-    assert delta[..., :2].norm(dim=-1).max() <= cfg.correction_limit+1e-6
-    assert delta[..., 2].count_nonzero() == 0
-    assert out['points'][..., :2].abs().max() <= cfg.lateral_limit
-    loss_terms(out, b, cfg, n_commit=2)['geometry_per_state'].mean().backward()
-    assert m.correction_head[-1].weight.grad.abs().sum() > 0
-    assert m.coordinates.weight.grad.abs().sum() > 0
-    assert m.encoder.stem[0].weight.grad.abs().sum() > 0
-    m.zero_grad(set_to_none=True)
-    loss_terms(forward(m, b), b, cfg, n_commit=2)['confidence_per_state'].mean().backward()
-    assert m.correction_head[-1].weight.grad is None
-    assert m.coordinates.weight.grad is None
 
 
 def test_commit_window_loss_and_auxiliary_proposal_supervision():
     import torch.nn.functional as F
-    cfg = config()
+    cfg = replace(config(), recurrent_refinement_steps=1)
     b = batch(cfg, 1)
     b['dense_ab'].zero_()
     b['dense_mask'][:, -2:] = 0
     points = torch.tensor([[[1., 0., 1.], [1., 0., 2.], [3., 0., 3.], [3., 0., 4.]]], requires_grad=True)
     initial = (points.detach()*torch.tensor([2., 1., 1.])).requires_grad_()
     logits = torch.tensor([[1., 2., 3., 4.]], requires_grad=True)
-    out = dict(points=points, initial_points=initial, confidence_logits=logits)
+    out = dict(points=points, initial_points=initial, confidence_logits=logits, hazard_logits=logits)
     result = loss_terms(out, b, cfg, n_commit=2)
     def expected(curve):
         dense = F.interpolate(curve[..., :2].transpose(1, 2), size=13, mode='linear', align_corners=True).transpose(1, 2)
@@ -380,8 +349,7 @@ def test_commit_window_loss_and_auxiliary_proposal_supervision():
     torch.testing.assert_close(result['geometry_per_state'][0], .75*expected(points)+.25*expected(initial))
     from vesuvius.neural_tracing.fiber_follow.flow_matching.supervision import prefix_labels
     labels, known, _ = prefix_labels(points, b)
-    bce = F.binary_cross_entropy_with_logits(logits, labels, reduction='none')
-    expected_conf = .5*(bce[:, :2]*known[:, :2]).sum()/known[:, :2].sum()+.5*(bce*known).sum()/known.sum()
+    expected_conf = F.softplus(logits[0, :2]).sum()+F.softplus(-logits[0, 2])
     torch.testing.assert_close(result['confidence_per_state'][0], expected_conf)
     result['geometry_per_state'].sum().backward()
     assert points.grad.abs().sum() > 0 and initial.grad.abs().sum() > 0
@@ -390,7 +358,7 @@ def test_commit_window_loss_and_auxiliary_proposal_supervision():
 
 
 def test_every_refinement_receives_auxiliary_geometry_supervision():
-    cfg = config()
+    cfg = replace(config(), recurrent_refinement_steps=1)
     b = batch(cfg, 1)
     b['dense_ab'].zero_()
     curves = []
@@ -398,7 +366,7 @@ def test_every_refinement_receives_auxiliary_geometry_supervision():
         curve = torch.tensor([[[error, 0., float(z)] for z in range(1, 5)]], requires_grad=True)
         curves.append(curve)
     out = dict(points=curves[-1], initial_points=curves[0], refinement_points=torch.stack(curves, 1),
-               confidence_logits=torch.zeros(1, 4))
+               confidence_logits=torch.zeros(1, 4), hazard_logits=torch.zeros(1, 4))
     terms = loss_terms(out, b, cfg)
     # Smooth L1 averaged over x,y; first two stages share the 25% auxiliary term.
     expected = .75*.25+.25*((3-.5)/2+(2-.5)/2)/2
@@ -429,23 +397,6 @@ def test_startup_sampling_and_history_diagnostics():
     assert all(0 <= v['first_confidence_mean'] <= 1 for v in stats['by_history'].values())
 
 
-@pytest.mark.parametrize('correction', [False, True])
-def test_compact_config_checkpoint_inference(tmp_path, correction):
-    cfg = replace(config(), correction=correction, correction_steps=1)
-    m = DirectFollower(cfg).eval()
-    b = batch(cfg)
-    assert hasattr(m, 'correction_head') == correction
-    out = forward(m, b)
-    if not correction:
-        torch.testing.assert_close(out['initial_points'], out['points'], rtol=0, atol=0)
-    spec = FiberVolumeSpec('unused', ct_zarr='unused', ct_level=0, ct_grid_scale=4., inputs='ct+presence')
-    path = tmp_path/'compact.pt'
-    save_checkpoint(path, m, m, spec, SampleConfig(crop=cfg.fine, n_history=cfg.n_history))
-    loaded = load_checkpoint(path, 'cpu')[0]
-    assert loaded.cfg.correction == correction
-    assert loaded.cfg.correction_steps == 1
-    for key, value in forward(loaded, b).items():
-        torch.testing.assert_close(value, out[key], rtol=0, atol=0)
 
 
 def test_decision_metrics_score_actual_commits_censor_unknowns_and_pool_counts():
@@ -667,34 +618,8 @@ def test_fresh_optimizer_resume_preserves_weights_and_future_resume_schedule():
     assert lr_at(done+1-origin, args.lr, 500, 100000-origin) == pytest.approx(.0003*2/500)
 
 
-@pytest.mark.parametrize('version', [1, 2, 3, 4])
-def test_checkpoint_load_ignores_retired_shared_proposal_options(tmp_path, version):
-    from vesuvius.neural_tracing.fiber_follow.regression.model import build_model
-    cfg = replace(config(), memory_version=version, memory_slots=4, correction=False,
-                  feature_memory_revision=2)
-    model = build_model(cfg)
-    spec = FiberVolumeSpec('unused', ct_zarr='unused', ct_level=0, ct_grid_scale=4., inputs='ct+presence')
-    path = tmp_path/'last.pt'
-    save_checkpoint(path, model, model, spec, SampleConfig(crop=cfg.fine, n_history=cfg.n_history), {})
-    ck = torch.load(path, weights_only=False)
-    # The old shared dataclass wrote these fields even for models that never used them.
-    ck['model_cfg'].update(proposal_step=.5, proposal_candidates=32, proposal_suppression=.5,
-                           proposal_direction_cost=.1, proposal_turn_cost=.05,
-                           proposal_loss_weight=1., proposal_offset_weight=1.)
-    torch.save(ck, path)
-    restored, *_ = load_checkpoint(path, 'cpu')
-    assert restored.cfg == cfg
-    for key, value in model.state_dict().items():
-        torch.testing.assert_close(restored.state_dict()[key], value, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize('slots', [0, 4])
-def test_removed_memory_version_rejected_without_fallback(slots):
-    from vesuvius.neural_tracing.fiber_follow.regression.train import checkpoint_config
-    with pytest.raises(ValueError, match='Unknown memory version'):
-        replace(config(), memory_version=5, memory_slots=slots)
-    with pytest.raises(ValueError, match='Unsupported checkpoint architecture'):
-        checkpoint_config(dict(architecture='axial_fiber_memory_v5', model_cfg={}))
 
 
 @pytest.mark.parametrize('option', [['--memory-version', '5'], ['--proposal-step', '.5'],

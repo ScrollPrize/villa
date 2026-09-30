@@ -10,7 +10,7 @@ from vesuvius.neural_tracing.fiber_follow.regression.neighbor_continuations impo
 from vesuvius.neural_tracing.fiber_follow.shared.data import make_sample
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import frame_from_heading,CropSpec
 from vesuvius.neural_tracing.fiber_follow.regression.model import build_model
-from vesuvius.neural_tracing.fiber_follow.regression.supervision import loss_terms,memory_probe_terms
+from vesuvius.neural_tracing.fiber_follow.regression.supervision import loss_terms
 from vesuvius.neural_tracing.fiber_follow.regression.diagnostics import decision_rows
 
 def setup(tmp):
@@ -61,9 +61,8 @@ def test_unlabeled_replay_history_masks_losses_but_updates_memory(tmp_path,monke
         lambda items,vol,crop,pool=None,**kw:torch.ones(len(items),2,crop.depth,crop.width,crop.width)*.25)
     batch=b([rows[0]],None);model=build_model(c)
     output=model(batch['x'],batch['hist'],batch['hmask'],queries=batch['identity_points'])
-    terms=loss_terms(output,batch,c);probe=memory_probe_terms(output,batch)
+    terms=loss_terms(output,batch,c)
     assert all(terms[k].eq(0).all() for k in ('geometry_per_state','confidence_per_state','identity_per_state'))
-    assert all(probe[k].eq(0).all() for k in ('memory_identity_per_state','memory_offset_per_state'))
     assert output['memory_cache_valid'].any()
     diagnostic=decision_rows(output,batch,c)[0]
     assert not diagnostic['departed']

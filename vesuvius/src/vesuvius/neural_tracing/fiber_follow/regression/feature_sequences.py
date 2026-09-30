@@ -66,7 +66,7 @@ def stream_rows(item, builder, band=None):
     # Label/history construction still sees the whole causal observed prefix;
     # the feature stream only reads the retained keyframes and its immutable seed.
     track = {key: np.asarray(value).copy() for key, value in track.items()}
-    horizon = cfg.feature_stream_steps if cfg.feature_memory_revision == 2 else cfg.memory_steps
+    horizon = cfg.feature_stream_steps
     indices = list(range(max(0, len(track['pos'])-horizon), len(track['pos'])))
     if item.get('seed_valid', False):
         seed = seed_observation(item, cfg)
@@ -157,7 +157,7 @@ def sequence_batches(builder, items, vol, *, band=None, worker=0, requested_frac
     ids = [(worker << 48)+(group << 16)+j for j in range(len(streams))]
     length = builder.cfg.feature_sequence_length
     selected = None
-    if builder.cfg.feature_memory_revision == 2 and builder.cfg.feature_replay_weight:
+    if builder.cfg.feature_replay_weight:
         from .stratified_replay import stratified_indices
         selected = [stratified_indices(len(rows), np.random.default_rng(int(rows[-1].get('identity_seed', 0))))
                     for rows in streams]

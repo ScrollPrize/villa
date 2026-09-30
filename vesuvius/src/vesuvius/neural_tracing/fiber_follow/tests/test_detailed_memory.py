@@ -12,7 +12,7 @@ from vesuvius.neural_tracing.fiber_follow.regression.feature_sequences import Fe
 
 
 def config(**kwargs):
-    return cfg(feature_memory_revision=2, feature_detail_tokens=4, recurrent_refinement_steps=1, **kwargs)
+    return cfg(feature_detail_tokens=4, recurrent_refinement_steps=1, **kwargs)
 
 
 def test_history_conditions_fine_features_and_path_without_rewriting_observations():
@@ -31,7 +31,6 @@ def test_history_conditions_fine_features_and_path_without_rewriting_observation
     hook.remove()
     assert len(fine) == 2  # One dense decode per observed crop.
     assert (fine[0]-fine[1]).abs().max() > 1e-7
-    assert not model.cfg.memory_probe
     assert not any('probe' in k or 'admission' in k for k in model.state_dict())
     assert not any('probe' in k or 'admission' in k for k in a)
     # Slot compression uses incoming slots and the observation, not retrieved beliefs.
@@ -66,13 +65,13 @@ def test_candidate_queries_are_candidate_specific_and_read_memory():
     curves[..., 2] = model.planes
     curves[:, 1, :, 0] = 2
     queries = []
-    hook = model.confidence_memory_attention.register_forward_pre_hook(lambda m, args: queries.append(args[0]))
+    hook = model.confidence_scorer.query.register_forward_hook(lambda m, args, result: queries.append(result))
     out = model(b['x'], b['hist'], b['hmask'], candidates=curves)
     hook.remove()
     assert len(queries) == 3
     assert not torch.equal(queries[1], queries[2])
     out['candidate_confidence_logits'].sum().backward()
-    assert model.confidence_memory_attention.in_proj_weight.grad.abs().sum() > 0
+    assert model.confidence_scorer.layers[0].multihead_attn.in_proj_weight.grad.abs().sum() > 0
 
 
 def test_stratification_reproducible_and_covers_evicted_evidence():
@@ -146,7 +145,7 @@ def test_confidence_has_no_gradient_to_path_generator_but_trains_encoder_and_mem
             assert p.grad is None, name
     for p in (model.encoder.stem[0].weight, model.encoder.dense_decoder[-1].weight,
               model.encoder_memory_projection.weight, model.recurrent_memory.gate.weight,
-              model.confidence_memory_attention.in_proj_weight):
+              model.confidence_scorer.layers[0].multihead_attn.in_proj_weight):
         assert p.grad is not None and p.grad.abs().sum() > 0
     assert first['x']['fine'].grad.abs().sum() > 0
 
@@ -188,7 +187,7 @@ def test_revision2_compiled_bf16_gradients_match_eager():
         losses.append(loss.detach())
         loss.backward()
     torch.testing.assert_close(*losses, atol=.01, rtol=.02)
-    for prefix in ('encoder.', 'decoder.', 'recurrent_memory.', 'encoder_memory_', 'confidence_memory_'):
+    for prefix in ('encoder.', 'decoder.', 'recurrent_memory.', 'encoder_memory_', 'confidence_scorer.'):
         grads = [torch.cat([p.grad.flatten() for name, p in model.named_parameters()
                            if name.startswith(prefix) and p.grad is not None]) for model in (eager, compiled)]
         assert all(torch.isfinite(g).all() for g in grads)

@@ -1,0 +1,159 @@
+"""Prefix invariance, unrestricted observation reads and censored likelihoods."""
+import math
+
+import pytest
+import torch
+
+from test_detailed_memory import config
+from test_trajectory_memory import memory_batch, state_from
+from vesuvius.neural_tracing.fiber_follow.regression.model import build_model
+from vesuvius.neural_tracing.fiber_follow.regression.supervision import loss_terms
+from vesuvius.neural_tracing.fiber_follow.regression.survival_confidence import (
+    survival_loss, survival_predictions,
+)
+
+
+def scoring_context(model, batch, memory=None):
+    ctx = model.context(batch['x'], batch['hist'], batch['hmask'])
+    ctx['recurrent'], _ = model.observe_context(ctx, batch['x'], batch['hist'], batch['hmask'], memory)
+    model.decoder_memory(ctx)
+    return ctx
+
+
+@pytest.mark.parametrize('training', [False, True])
+def test_replacing_truncating_or_extending_suffix_preserves_prefix(training):
+    torch.manual_seed(61)
+    model = build_model(config()).train(training)
+    first = memory_batch(model.cfg, 1)
+    with torch.no_grad():
+        state = state_from(model, model(first['x'], first['hist'], first['hmask']))
+        batch = memory_batch(model.cfg, 1, step=1)
+        ctx = scoring_context(model, batch, state)
+        curve = torch.zeros(1, 4, 3)
+        curve[..., 2] = torch.arange(1, 5)
+        curve[0, :, 0] = torch.tensor([.2, -.4, .7, 1.])
+        baseline = model.hazard_logits(ctx, curve)
+        changed = curve.clone()
+        changed[:, 2:, :2] = torch.tensor([[2., -2.], [-3., 3.]])
+        alternative = model.hazard_logits(ctx, changed)
+        torch.testing.assert_close(baseline[:, :2], alternative[:, :2], rtol=0, atol=0)
+        assert not torch.equal(baseline[:, 2:], alternative[:, 2:])
+        # Different sequence lengths may select different floating-point kernels.
+        short = model.hazard_logits(ctx, curve[:, :2])
+        torch.testing.assert_close(baseline[:, :2], short, rtol=1e-5, atol=2e-6)
+        extension = torch.cat((curve, torch.tensor([[[2., 1., 5.], [3., -1., 6.]]])), 1)
+        extended = model.hazard_logits(ctx, extension)
+        torch.testing.assert_close(baseline, extended[:, :4], rtol=1e-5, atol=2e-6)
+        for other in (alternative[:, :2], short, extended[:, :2]):
+            torch.testing.assert_close(survival_predictions(baseline[:, :2])[1],
+                                       survival_predictions(other)[1], rtol=1e-5, atol=2e-6)
+
+
+def test_segment_reads_cover_interior_and_do_not_receive_generator_state(monkeypatch):
+    model = build_model(config()).eval()
+    batch = memory_batch(model.cfg, 1)
+    ctx = scoring_context(model, batch)
+    curve = torch.tensor([[[1., 0., 1.], [3., 2., 2.], [2., 0., 3.], [0., 0., 4.]]], requires_grad=True)
+    sampled = []
+    original = model.evidence
+    def capture(ctx, points, stage):
+        sampled.append(points.detach().clone())
+        return original(ctx, points, stage)
+    monkeypatch.setattr(model, 'evidence', capture)
+    logits = model.confidence_logits(ctx, torch.full((1, 4, model.cfg.hidden), float('nan')), curve)
+    torch.testing.assert_close(sampled[0][0, 4:8], torch.tensor([
+        [1.5, .5, 1.25], [2., 1., 1.5], [2.5, 1.5, 1.75], [3., 2., 2.]]))
+    logits.sum().backward()
+    assert curve.grad is None
+    assert all(p.grad is None for p in model.decoder.parameters())
+    assert model.coordinates.weight.grad is None
+    assert model.encoder.stem[0].weight.grad.abs().sum() > 0
+
+
+def test_first_segment_reads_all_observations_but_no_future_segment_features():
+    torch.manual_seed(62)
+    model = build_model(config())
+    scorer = model.confidence_scorer
+    width = 27*(model.cfg.channels+1)+model.cfg.hidden+1
+    spatial = torch.randn(1, 4, 4, width, requires_grad=True)
+    points = torch.zeros(1, 4, 3)
+    points[..., 2] = torch.arange(1, 5)
+    memory = torch.randn(1, 9, model.cfg.hidden, requires_grad=True)
+    padding = torch.zeros(1, 9, dtype=torch.bool)
+    padding[:, -1] = True
+    logits = scorer(spatial, points, torch.zeros(1, 4, 8), scorer.project_memory(memory), padding)
+    logits[:, 0].sum().backward()
+    assert spatial.grad[:, 0].abs().sum() > 0
+    assert spatial.grad[:, 1:].count_nonzero() == 0
+    assert (memory.grad[:, :-1].abs().sum(-1) > 0).all()
+    assert memory.grad[:, -1].count_nonzero() == 0
+
+
+def test_survival_probabilities_are_conditional_products_and_numerically_stable():
+    hazards = torch.tensor([[.1, .2, .3, .4]])
+    logits, confidence = survival_predictions(torch.logit(hazards))
+    torch.testing.assert_close(confidence, torch.tensor([[.9, .72, .504, .3024]]))
+    torch.testing.assert_close(logits.sigmoid(), confidence)
+    assert (confidence[:, 1:] <= confidence[:, :-1]).all()
+    extreme = torch.tensor([[-1000., -100., 0., 100., 1000.]], requires_grad=True)
+    logits, confidence = survival_predictions(extreme)
+    assert torch.isfinite(logits).all() and torch.isfinite(confidence).all()
+    logits.sum().backward()
+    assert torch.isfinite(extreme.grad).all()
+
+
+def test_first_failure_censoring_and_missing_gaps_have_exact_likelihood_and_gradients():
+    hazards = torch.logit(torch.tensor([[.1, .2, .3, .4]])).repeat(5, 1).requires_grad_()
+    labels = torch.tensor([[1., 1., 0., 0.], [1., 1., 1., 1.], [0., 0., 0., 0.],
+                           [1., 1., 0., 0.], [0., 0., 0., 0.]])
+    known = torch.tensor([[1, 1, 1, 1], [1, 1, 0, 0], [1, 1, 1, 1],
+                          [1, 0, 1, 1], [0, 0, 0, 0]], dtype=torch.bool)
+    loss, valid = survival_loss(hazards, labels, known)
+    expected = torch.tensor([-math.log(.9*.8*.3), -math.log(.9*.8), -math.log(.1), -math.log(.9), 0.])
+    torch.testing.assert_close(loss, expected)
+    assert valid.tolist() == [[True, True, True, False], [True, True, False, False],
+                              [True, False, False, False], [True, False, False, False], [False]*4]
+    loss.sum().backward()
+    assert hazards.grad[~valid].count_nonzero() == 0
+    assert (hazards.grad[valid] != 0).all()
+
+
+def test_generated_and_candidate_losses_share_survival_semantics_and_mask_identity():
+    cfg = config()
+    batch = memory_batch(cfg, 2)
+    points = torch.zeros(2, cfg.n_future, 3)
+    points[..., 2] = torch.arange(1, cfg.n_future+1)
+    hazards = torch.zeros(2, cfg.n_future, requires_grad=True)
+    candidates = torch.zeros(2, 2, cfg.n_future, requires_grad=True)
+    batch['offtrack'][0] = 1
+    batch['identity_observable'] = torch.tensor([True, False])
+    batch['candidate_labels'] = torch.zeros(2, 2, cfg.n_future)
+    batch['candidate_mask'] = torch.ones(2, 2, cfg.n_future, dtype=torch.bool)
+    logits, confidence = survival_predictions(hazards)
+    out = dict(points=points, initial_points=points, hazard_logits=hazards,
+               confidence_logits=logits, confidence=confidence, candidate_hazard_logits=candidates,
+               candidate_confidence_logits=survival_predictions(candidates)[0])
+    terms = loss_terms(out, batch, cfg, n_commit=1)
+    torch.testing.assert_close(terms['confidence_per_state'], torch.tensor([math.log(2), 0.]))
+    torch.testing.assert_close(terms['candidate_per_state'], torch.tensor([math.log(2), 0.]))
+    (terms['confidence_per_state'].sum()+terms['candidate_per_state'].sum()).backward()
+    assert hazards.grad[0, 0] < 0 and hazards.grad[:, 1:].count_nonzero() == 0
+    assert candidates.grad[0, :, 0].lt(0).all() and candidates.grad[:, :, 1:].count_nonzero() == 0
+    assert hazards.grad[1].count_nonzero() == candidates.grad[1].count_nonzero() == 0
+
+
+@torch.no_grad()
+def test_same_curve_gets_same_score_as_generated_or_supplied_candidate():
+    model = build_model(config()).eval()
+    batch = memory_batch(model.cfg, 1)
+    args = batch['x'], batch['hist'], batch['hmask']
+    generated = model(*args)
+    curve = generated['points']
+    alternative = curve.clone()
+    alternative[..., 0] += 2.
+    supplied = model(*args, candidates=torch.stack((alternative, curve), 1))
+    torch.testing.assert_close(supplied['candidate_hazard_logits'][:, 1], generated['hazard_logits'])
+    torch.testing.assert_close(supplied['candidate_confidence'][:, 1], generated['confidence'])
+    reordered = model(*args, candidates=torch.stack((curve, alternative), 1))
+    torch.testing.assert_close(reordered['candidate_hazard_logits'],
+                               supplied['candidate_hazard_logits'].flip(1))

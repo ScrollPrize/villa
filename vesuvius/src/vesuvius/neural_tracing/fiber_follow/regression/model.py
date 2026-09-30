@@ -1,11 +1,4 @@
-"""Crop-only fiber following: residual 3-D stem, 8x2x2 tokens, full axial attention.
-
-All physical coordinates are trace-grid voxels; CT samples are half a trace voxel.
-Bare DirectConfig() retains the legacy crop-only constructor default. Training
-launchers explicitly enable memory, and v4 requires it. V2/v3 memory uses a
-small observation encoder; v4 retains main-encoder features. Both memory designs
-carry bounded state and an immutable seed.
-"""
+"""Observation-memory fiber regression with continuous paths and causal survival scoring."""
 from dataclasses import asdict, dataclass, field
 from contextlib import nullcontext
 import math
@@ -18,19 +11,15 @@ from torch.utils.checkpoint import checkpoint
 
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
 
-ARCHITECTURE = 'axial_fiber_v3'
-MEMORY_ARCHITECTURE = 'axial_fiber_memory_v2'
-MEMORY_ARCHITECTURE_V1 = 'axial_fiber_memory_v1'  # no probe; loadable, not trained further
-SPATIAL_MEMORY_ARCHITECTURE = 'axial_fiber_memory_v3'
-TRAJECTORY_MEMORY_ARCHITECTURE = 'axial_fiber_memory_v4'
-TOKEN_STRIDE = (8, 2, 2)  # z, y, x in input samples
-TOKEN_OFFSET = (3, 0, 0)  # centre of four stride-two stem positions
-IDENTITY_EVIDENCE_WIDTH = 8  # point/mean/min/coverage for seed and history separately
+ARCHITECTURE = 'axial_fiber_memory_v4'
+TOKEN_STRIDE = (8, 2, 2)
+TOKEN_OFFSET = (3, 0, 0)
+IDENTITY_EVIDENCE_WIDTH = 8
 
 
 @dataclass
 class DirectConfig:
-    direction_inputs: bool = False  # six local-frame second moments after CT/presence
+    direction_inputs: bool = False
     fine: CropSpec = field(default_factory=lambda: CropSpec(depth=120, width=101, behind=48, spacing=.5))
     channels: int = 32
     hidden: int = 128
@@ -44,61 +33,19 @@ class DirectConfig:
     n_history: int = 128
     max_recovery_distance: float = 6.
     patch_radius: float = 1.
-    correction: bool = True
-    correction_limit: float = 1.
-    correction_steps: int = 2
-    memory_slots: int = 0  # zero preserves the crop-only architecture and weights
-    memory_steps: int = 32  # preceding observed patches, plus the current head
-    memory_stride: int = 4  # reconstructed-history observation spacing in trace voxels
-    memory_patch_size: int = 17  # 8-voxel-wide patch at the production .5 spacing
-    # The newest memory_grad_steps observations (and the head) backpropagate;
-    # older ones are a no-grad burn-in. At least memory_steps: no burn-in.
-    memory_grad_steps: int = 32
-    memory_departed_weight: float = 1.  # auxiliary probe BCE weight for actual departed labels
-    memory_version: int = 2  # 1: legacy checkpoints without the probe
-    route_grid_step: float = 2.  # v3: maximum lateral lattice spacing, trace voxels
-    route_transition_radius: int = 1  # v3: connected lattice neighbors per plane
-    route_transition_cost: float = .25
-    route_loss_weight: float = 1.
-    route_sequence_weight: float = .5  # v3: additional earlier decision from an observed track
-    route_refinement_radius: float | None = None  # v3: per-axis displacement from selected cell; None keeps half-cell bound
-    trajectory_sequence_weight: float = 0.  # obsolete v4 prefix-reconstruction objective
-    feature_memory_grid: tuple = (2, 4, 4)  # v4 spatial tokens per encoded crop
-    feature_sequence_length: int = 2  # v4 decisions per gradient chunk
-    feature_detail_tokens: int = 16  # revision 2: fine neighborhoods along observed history
-    feature_stream_steps: int = 128  # revision 2: historical observations before endpoint
-    feature_replay_weight: float = .5  # revision 2: stratified endpoint replay objective
-    feature_switch_crop_fraction: float = -1.  # -1 disables whole-stream crop-budget admission
-    feature_memory_revision: int = 1
-    recurrent_refinement_steps: int = 0  # v4 shared-decoder passes after the initial proposal
-    recurrent_refinement_limit: float = 1.  # maximum lateral update norm per pass
-
-    @property
-    def feature_memory(self):
-        return self.memory_version == 4
-
-    @property
-    def memory_probe(self):
-        """Observation memory has no auxiliary identity or localization probe."""
-        return bool(self.memory_slots and not (self.feature_memory and self.feature_memory_revision == 2))
+    memory_slots: int = 16
+    memory_steps: int = 64
+    memory_stride: int = 8
+    feature_memory_grid: tuple = (2, 4, 4)
+    feature_sequence_length: int = 2
+    feature_detail_tokens: int = 16
+    feature_stream_steps: int = 128
+    feature_replay_weight: float = .5
+    feature_switch_crop_fraction: float = -1.
+    recurrent_refinement_steps: int = 1
+    recurrent_refinement_limit: float = 1.
 
     def __post_init__(self):
-        if self.memory_version not in (1, 2, 3, 4):
-            raise ValueError('Unknown memory version')
-        if not math.isfinite(self.memory_departed_weight) or self.memory_departed_weight <= 0:
-            raise ValueError('Departed probe weight must be finite and positive')
-        if self.feature_switch_crop_fraction != -1 and not 0 <= self.feature_switch_crop_fraction < 1:
-            raise ValueError('Switch crop fraction must be -1 (legacy) or in [0, 1)')
-        if self.feature_switch_crop_fraction >= 0 and not self.feature_memory:
-            raise ValueError('Switch crop budget requires feature-memory v4')
-        if not isinstance(self.recurrent_refinement_steps, int) or self.recurrent_refinement_steps < 0:
-            raise ValueError('Recurrent refinement steps must be a nonnegative integer')
-        if not math.isfinite(self.recurrent_refinement_limit) or self.recurrent_refinement_limit <= 0:
-            raise ValueError('Recurrent refinement limit must be finite and positive')
-        if self.recurrent_refinement_steps and not self.feature_memory:
-            raise ValueError('Recurrent refinement requires feature-memory v4')
-        if not isinstance(self.direction_inputs, bool):
-            raise ValueError('direction_inputs must be a boolean')
         if isinstance(self.fine, dict):
             self.fine = CropSpec(**self.fine)
         c = self.fine
@@ -111,58 +58,28 @@ class DirectConfig:
             raise ValueError('Invalid forward spacing or connection limit')
         if not 0 < self.patch_radius < (c.width-1)*c.spacing/2:
             raise ValueError('Local observation patch must fit fine crop')
-        if not math.isfinite(self.correction_limit) or self.correction_limit <= 0:
-            raise ValueError('Invalid correction limit')
-        if self.route_refinement_radius is not None and (not math.isfinite(self.route_refinement_radius) or self.route_refinement_radius <= 0):
-            raise ValueError('Route refinement radius must be finite and positive')
-        if not isinstance(self.correction_steps, int) or self.correction_steps < 1:
-            raise ValueError('Invalid correction steps')
         if self.n_future*self.future_step > (c.depth-c.behind-1)*c.spacing:
             raise ValueError('Future horizon exceeds fine image')
-        if not isinstance(self.memory_slots, int) or self.memory_slots < 0:
-            raise ValueError('Memory slots must be a nonnegative integer')
-        if self.memory_slots:
-            if any(not isinstance(v, int) or v < 1 for v in (self.memory_steps, self.memory_stride, self.memory_grad_steps)):
-                raise ValueError('Memory sequence dimensions must be positive integers')
-            if not isinstance(self.memory_patch_size, int) or self.memory_patch_size < 5 or self.memory_patch_size % 2 != 1:
-                raise ValueError('Memory patch size must be odd and at least five')
-        if self.memory_version == 3:
-            if not self.memory_slots:
-                raise ValueError('Spatial memory requires positive memory_slots')
-            if not math.isfinite(self.route_grid_step) or self.route_grid_step <= 0:
-                raise ValueError('Route grid spacing must be finite and positive')
-            if not isinstance(self.route_transition_radius, int) or self.route_transition_radius < 1:
-                raise ValueError('Route transition radius must be a positive integer')
-            if any(not math.isfinite(v) or v < 0 for v in (self.route_transition_cost, self.route_loss_weight, self.route_sequence_weight)):
-                raise ValueError('Route cost and loss weight must be finite and nonnegative')
-        if self.feature_memory:
-            if not self.memory_slots:
-                raise ValueError('Continuous trajectory memory requires positive memory_slots')
-            if self.correction or self.route_refinement_radius is not None:
-                raise ValueError('Memory v4 uses one decoder pass; use --no-correction and no route refinement radius')
-            if self.trajectory_sequence_weight != 0:
-                raise ValueError('V4 supervises every streamed decision; trajectory_sequence_weight must be zero')
-            self.feature_memory_grid = tuple(self.feature_memory_grid)
-            if len(self.feature_memory_grid) != 3 or any(not isinstance(n, int) or n < 1 for n in self.feature_memory_grid):
-                raise ValueError('Feature memory grid requires three positive integers')
-            if not isinstance(self.feature_sequence_length, int) or self.feature_sequence_length < 2:
-                raise ValueError('Feature sequence length must be at least two')
-            if self.feature_memory_revision not in (1, 2):
-                raise ValueError('Unsupported feature memory revision')
-            if not isinstance(self.feature_detail_tokens, int) or self.feature_detail_tokens < 1:
-                raise ValueError('Positive detail token count required')
-            if self.feature_memory_revision == 2 and (not isinstance(self.feature_stream_steps, int) or self.feature_stream_steps < self.memory_steps):
-                raise ValueError('Feature stream must cover at least the cache horizon')
-            if not math.isfinite(self.feature_replay_weight) or self.feature_replay_weight < 0:
-                raise ValueError('Nonnegative finite replay weight required')
-
-    @property
-    def sequence_weight(self):
-        return {3: self.route_sequence_weight}.get(self.memory_version, 0.)
-
-    @property
-    def sequence_key(self):
-        return 'trajectory_sequence' if self.feature_memory else 'route_sequence'
+        if any(not isinstance(v, int) or v < 1 for v in
+               (self.memory_slots, self.memory_steps, self.memory_stride, self.feature_detail_tokens)):
+            raise ValueError('Memory dimensions must be positive integers')
+        self.feature_memory_grid = tuple(self.feature_memory_grid)
+        if len(self.feature_memory_grid) != 3 or any(not isinstance(n, int) or n < 1 for n in self.feature_memory_grid):
+            raise ValueError('Feature memory grid requires three positive integers')
+        if not isinstance(self.feature_sequence_length, int) or self.feature_sequence_length < 2:
+            raise ValueError('Feature sequence length must be at least two')
+        if not isinstance(self.feature_stream_steps, int) or self.feature_stream_steps < self.memory_steps:
+            raise ValueError('Feature stream must cover at least the cache horizon')
+        if not math.isfinite(self.feature_replay_weight) or self.feature_replay_weight < 0:
+            raise ValueError('Nonnegative finite replay weight required')
+        if self.feature_switch_crop_fraction != -1 and not 0 <= self.feature_switch_crop_fraction < 1:
+            raise ValueError('Switch crop fraction must be -1 (disabled) or in [0, 1)')
+        if not isinstance(self.recurrent_refinement_steps, int) or self.recurrent_refinement_steps < 0:
+            raise ValueError('Recurrent refinement steps must be a nonnegative integer')
+        if not math.isfinite(self.recurrent_refinement_limit) or self.recurrent_refinement_limit <= 0:
+            raise ValueError('Recurrent refinement limit must be finite and positive')
+        if not isinstance(self.direction_inputs, bool):
+            raise ValueError('direction_inputs must be a boolean')
 
     @property
     def input_channels(self):
@@ -185,13 +102,6 @@ class DirectConfig:
 
 
 def build_model(cfg):
-    """Explicit architecture dispatch; legacy constructors and weights stay intact."""
-    if cfg.memory_slots and cfg.memory_version == 4:
-        from .trajectory_model import TrajectoryMemoryFollower
-        return TrajectoryMemoryFollower(cfg)
-    if cfg.memory_slots and cfg.memory_version == 3:
-        from .spatial_model import SpatialMemoryFollower
-        return SpatialMemoryFollower(cfg)
     return DirectFollower(cfg)
 
 
@@ -291,11 +201,11 @@ class PathDecoderLayer(nn.TransformerDecoderLayer):
         return tuple(v.reshape(len(memory), -1, heads, h//heads).transpose(1, 2).contiguous()
                      for v in kv.chunk(2, dim=-1))
 
-    def forward_cached(self, x, kv, padding):
+    def forward_cached(self, x, kv, padding, *, causal_mask=None):
         """The ordinary pre-norm decoder computation with already projected K/V."""
         if not self.norm_first or self.multihead_attn.dropout:
             raise ValueError('Cached trajectory decoder requires pre-norm and zero attention dropout')
-        x = x+self._sa_block(self.norm1(x), None, None)
+        x = x+self._sa_block(self.norm1(x), causal_mask, None, is_causal=causal_mask is not None)
         attn = self.multihead_attn
         h, heads = attn.embed_dim, attn.num_heads
         q = F.linear(self.norm2(x), attn.in_proj_weight[:h], attn.in_proj_bias[:h])
@@ -404,8 +314,6 @@ class DirectFollower(nn.Module):
 
     def __init__(self, cfg):
         super().__init__()
-        if cfg.memory_version in (3, 4):
-            raise ValueError('Use build_model(cfg) for memory v3/v4')
         self.cfg = cfg
         c,h = cfg.channels,cfg.hidden
         self.encoder = AxialEncoder(cfg)
@@ -417,28 +325,25 @@ class DirectFollower(nn.Module):
         self.coordinates = nn.Linear(h,2)
         nn.init.normal_(self.coordinates.weight,std=.005)
         nn.init.zeros_(self.coordinates.bias)
-        evidence_width = 27*(c+1)+h+1
-        def path_layers():
-            return [nn.Linear(h+evidence_width+3,h),nn.SiLU(),nn.TransformerEncoderLayer(
-                h,cfg.heads,2*h,dropout=0.,activation='gelu',batch_first=True,norm_first=True)]
-        if cfg.correction:
-            self.correction_head = nn.Sequential(*path_layers(),nn.Linear(h,2))
-            nn.init.normal_(self.correction_head[-1].weight,std=.001)
-            nn.init.zeros_(self.correction_head[-1].bias)
-        self.path_evidence = nn.Sequential(*path_layers())
-        self.confidence_head = nn.Sequential(nn.Linear(2*h+IDENTITY_EVIDENCE_WIDTH,h),nn.SiLU(),nn.Linear(h,1))
-        # Start neutral; candidate/prefix BCE learns how to use the comparison.
-        # Zero new columns also permit a lossless one-time checkpoint expansion.
-        with torch.no_grad():
-            self.confidence_head[0].weight[:,2*h:].zero_()
         self.register_buffer('stencil',torch.tensor([[a,b,0.] for a in (-1.,0.,1.) for b in (-1.,0.,1.)])*cfg.patch_radius,persistent=False)
         self.register_buffer('path_stencil',torch.tensor([[a*cfg.patch_radius,b*cfg.patch_radius,z]
             for z in (-1.,0.,1.) for a in (-1.,0.,1.) for b in (-1.,0.,1.)]),persistent=False)
         self.register_buffer('planes',torch.arange(1,cfg.n_future+1).float()*cfg.future_step,persistent=False)
-        if cfg.memory_slots:
-            from .memory import LearnedMemory
-            self.recurrent_memory = LearnedMemory(cfg)
-            self.architecture = MEMORY_ARCHITECTURE if cfg.memory_version == 2 else MEMORY_ARCHITECTURE_V1
+        from .detailed_memory import DetailedFeatureMemory
+        from .survival_confidence import SegmentSurvivalScorer
+        self.recurrent_memory = DetailedFeatureMemory(cfg, self.encoder.token_xyz)
+        self.confidence_scorer = SegmentSurvivalScorer(cfg)
+        self.encoder_memory_gate = nn.Parameter(torch.tensor(-4.))
+        self.encoder_memory_projection = nn.Linear(cfg.hidden, cfg.hidden)
+        if cfg.recurrent_refinement_steps:
+            width = 27*(cfg.channels+1)+cfg.hidden+1+3
+            self.refinement_fusion = nn.Sequential(nn.Linear(width, cfg.hidden), nn.SiLU(),
+                                                  nn.Linear(cfg.hidden, cfg.hidden))
+            self.refinement_stage = nn.Embedding(cfg.recurrent_refinement_steps, cfg.hidden)
+            self.refinement_delta = nn.Linear(cfg.hidden, 2)
+            nn.init.zeros_(self.refinement_stage.weight)
+            nn.init.zeros_(self.refinement_delta.weight)
+            nn.init.zeros_(self.refinement_delta.bias)
 
     def references(self, x, hist, hmask):
         cfg = self.cfg
@@ -448,11 +353,6 @@ class DirectFollower(nn.Module):
         mask = torch.cat((hmask.bool(),seed_mask),1) & crop_support(references,cfg.fine)
         references = torch.where(mask[...,None],references.float(),0.)
         return references, mask
-
-    def context(self, x, hist, hmask):
-        references, mask = self.references(x, hist, hmask)
-        dense,deep,_ = self.encoder(x['fine'],references,mask)
-        return self.context_from_features(x, hist, references, mask, dense, deep)
 
     def context_from_features(self, x, hist, references, mask, dense, deep):
         cfg = self.cfg
@@ -497,24 +397,7 @@ class DirectFollower(nn.Module):
         deep = deep.to(ctx['deep'].dtype)
         return torch.cat((local,deep,valid[...,None]),-1)
 
-    def forward(self, x, hist, hmask, queries=None, candidates=None, memory=None):
-        ctx = self.context(x,hist,hmask)
-        if self.cfg.memory_slots:
-            ctx['recurrent'] = self.recurrent_memory.observe(x, memory)
-        elif memory is not None:
-            raise ValueError('Persistent memory requires a memory-enabled checkpoint')
-        out = self.predict(ctx,hist,candidates)
-        if self.cfg.memory_slots:
-            out.update({'memory_'+k: v for k,v in ctx['recurrent'].items()})
-        out.update(reference_embedding=ctx['reference_embedding'],reference_mask=ctx['reference_mask'])
-        if queries is not None:
-            values,support = sample_features(ctx['fine'],queries,self.cfg.fine)
-            out.update(query_embedding=F.normalize(self.embedding(values),dim=-1),query_support=support)
-        return out
-
     def initial_memory(self, batch, device):
-        if not self.cfg.memory_slots:
-            raise ValueError('This checkpoint has no persistent memory')
         return self.recurrent_memory.initial_state(batch, device)
 
     def identity_evidence(self, ctx, values, support):
@@ -540,55 +423,143 @@ class DirectFollower(nn.Module):
         count = torch.arange(1,values.shape[1]+1,device=values.device)[None,:,None]
         return torch.cat((similarity,mean,minimum,observed/count),-1)
 
-    def confidence_logits(self, ctx, decoded, points):
-        """The same prefix classifier scores predictions and supervised candidates."""
-        points = points.detach()
-        spatial = self.evidence(ctx,points,'confidence')
-        evidence = self.path_evidence(torch.cat((decoded,spatial,points/16),-1))
-        return self.prefix_confidence(ctx, evidence, spatial)
+    def context(self, x, hist, hmask):
+        references, mask = self.references(x, hist, hmask)
+        stem, deep = self.encoder.encode(x['fine'], references, mask)
+        return dict(stem=stem, deep=deep, references=references, reference_mask=mask,
+                    query_frame=x['query_frame'])
 
-    def prefix_confidence(self, ctx, evidence, spatial):
-        """Aggregate curve-specific evidence into prefix correctness logits."""
-        count = torch.arange(1, evidence.shape[1]+1, device=evidence.device)[None, :, None]
-        prefix_mean = evidence.cumsum(1)/count
-        prefix_max = evidence.cummax(1).values
-        # The 3x3x3 evidence stencil already samples the exact candidate centre.
-        # Reuse it: another grid_sample would retain a full FP32 crop for backward.
+    def forward(self, x, hist, hmask, queries=None, candidates=None, memory=None):
+        # A cold, externally supplied history may have a remote seed. Encode
+        # that seed crop once; streamed training starts at the seed itself.
+        if 'feature_seed_x' in x:
+            seed_x = x['feature_seed_x']
+            empty = torch.zeros_like(hmask)
+            seed_ctx = self.context(seed_x, torch.zeros_like(hist), empty)
+            memory, _ = self.observe_context(seed_ctx, seed_x, torch.zeros_like(hist), empty, memory)
+        ctx = self.context(x, hist, hmask)
+        ctx['recurrent'], observation = self.observe_context(ctx, x, hist, hmask, memory)
+        out = self.predict(ctx, hist, candidates)
+        if observation is not None:
+            out.update(observation_tokens=observation[0], observation_xyz=observation[1], observation_valid=observation[2])
+        out.update({'memory_'+k: v for k, v in ctx['recurrent'].items()})
+        out.update(reference_embedding=ctx['reference_embedding'], reference_mask=ctx['reference_mask'])
+        if queries is not None:
+            from .model import sample_features
+            import torch.nn.functional as F
+            values, support = sample_features(ctx.get('fine_fp32', ctx['fine']), queries, self.cfg.fine)
+            values = values.to(ctx['fine'].dtype)
+            out.update(query_embedding=F.normalize(self.embedding(values), dim=-1), query_support=support)
+        return out
+
+    def observation_features(self, x, hist, hmask):
+        """Re-encode a selected replay crop without decoding or reading memory."""
+        ctx = self.context(x, hist, hmask)
+        return self.recurrent_memory.extract(ctx['deep'], ctx['stem'], hist, hmask)
+
+    def observe_context(self, ctx, x, hist, hmask, memory):
+        # Store local appearance and unconditioned deep context. Final dense
+        # features are decoded once, AFTER reading historical observations.
+        observation = self.recurrent_memory.extract(ctx['deep'], ctx['stem'], hist, hmask)
+        state, retrieved = self.recurrent_memory.observe_tokens(*observation, x, memory)
+        # A coarse spatial read broadcasts historical context to the deep lattice.
+        # This avoids 39k queries over the entire historical cache. Stored
+        # observation features above remain independent of this conditioning.
+        n = self.recurrent_memory.coarse_count
+        condition = self.encoder_memory_projection(retrieved[:, :n].to(ctx['deep'].dtype))
+        condition = condition.transpose(1, 2).reshape(len(hist), self.cfg.hidden, *self.cfg.feature_memory_grid)
+        condition = F.interpolate(condition, size=ctx['deep'].shape[-3:], mode='trilinear', align_corners=False)
+        deep = ctx['deep']+self.encoder_memory_gate.sigmoid()*condition
+        dense = self.encoder.decode(ctx['stem'], deep)
+        ctx.update(self.context_from_features(x, hist, ctx['references'], ctx['reference_mask'], dense, deep))
+        return state, observation
+
+    def confidence_logits(self, ctx, decoded, points):
+        from .survival_confidence import survival_predictions
+        return survival_predictions(self.hazard_logits(ctx, points))[0]
+
+    def hazard_logits(self, ctx, points):
+        # No generator state or proposed suffix enters a segment's evidence.
+        points = points.detach()
+        samples = self.confidence_scorer.segment_samples(points)
+        spatial = self.evidence(ctx, samples.flatten(1, 2), 'confidence')
+        spatial = spatial.reshape(*samples.shape[:3], -1)
         c = self.cfg.channels
         centre = (len(self.path_stencil)//2)*(c+1)
-        comparison = self.identity_evidence(ctx,spatial[...,centre:centre+c],spatial[...,centre+c].bool())
-        logits = self.confidence_head(torch.cat((prefix_mean,prefix_max,comparison),-1)).squeeze(-1).float()
-        return logits
+        endpoint = spatial[:, :, -1]
+        comparison = self.identity_evidence(ctx, endpoint[..., centre:centre+c],
+                                             endpoint[..., centre+c].bool())
+        return self.confidence_scorer(spatial, points, comparison,
+                                     ctx['confidence_projected'], ctx['confidence_padding'])
 
     def predict(self, ctx, hist, candidates=None):
         cfg = self.cfg
-        initial = hist.new_zeros(len(hist), cfg.n_future, 3)
-        initial[..., 2] = self.planes
-        query = self.query(self.query_features(ctx, initial))
-        decoded = self.decoder(query, ctx['memory'], memory_key_padding_mask=ctx['padding'])
-        if self.cfg.memory_slots:
-            decoded = self.recurrent_memory.read(decoded, ctx['recurrent'])
+        memory, padding = self.decoder_memory(ctx)
+
+        # These locations initialize feature queries, not output constraints.
+        # Forward distance distinguishes the queries; self-attention couples
+        # them and cross-attention can retrieve evidence anywhere in the crop.
+        reference = hist.new_zeros(len(hist), cfg.n_future, 3)
+        reference[..., 2] = self.planes
+        query = self.query(self.query_features(ctx, reference))
+        if cfg.recurrent_refinement_steps:
+            # These tensors are shared only within this decision and remain attached.
+            projected = [layer.project_memory(memory) for layer in self.decoder.layers]
+            decoded = self.decode_cached(query, projected, padding)
+        else:
+            decoded = self.decoder(query, memory, memory_key_padding_mask=padding)
         lateral = cfg.lateral_limit*torch.tanh(self.coordinates(decoded).float())
-        points = torch.cat((lateral, initial[..., 2:]), -1)
-        initial_points = points
+        first_limit = math.sqrt(max(0., cfg.max_recovery_distance**2-cfg.future_step**2))
+        first = lateral[:, :1]
+        first = first*(first_limit/first.norm(dim=-1, keepdim=True).clamp_min(1e-8)).clamp(max=1.)
+        lateral = torch.cat((first, lateral[:, 1:]), 1)
+        points = torch.cat((lateral, reference[..., 2:]), -1)
+        return self.finish_prediction(ctx, decoded, points, projected if cfg.recurrent_refinement_steps else None,
+                                      padding, candidates)
+
+    def decoder_memory(self, ctx):
+        cfg, state = self.cfg, ctx['recurrent']
+        # Express retained spatial evidence in the actual crop frame, including roll.
+        query_state = dict(state, frame=ctx.get('query_frame', state['frame']))
+        identity, identity_padding = self.recurrent_memory.read_tokens(query_state)
+        memory = torch.cat((ctx['memory'], identity.to(ctx['memory'].dtype)), 1)
+        padding = torch.cat((ctx['padding'], identity_padding), 1)
+        # The scorer reads the full observed scene through its own projections.
+        # Reuse these differentiable K/V across generated and supplied curves.
+        ctx.update(confidence_projected=self.confidence_scorer.project_memory(memory),
+                   confidence_padding=padding)
+        return memory, padding
+
+    def finish_prediction(self, ctx, decoded, points, projected, padding, candidates=None):
+        from .survival_confidence import survival_predictions
+        cfg = self.cfg
+        first_limit = math.sqrt(max(0., cfg.max_recovery_distance**2-cfg.future_step**2))
+        initial = points
         refinements = [points]
-        if cfg.correction:
-            # Train the shared refiner through each update; refresh evidence
-            # at the new coordinates while encoding the crop only once.
-            for _ in range(cfg.correction_steps):
-                evidence = self.evidence(ctx, points, 'correction')
-                correction = self.correction_head(torch.cat((decoded, evidence, points/16), -1))
-                correction = correction.float().tanh()*(cfg.correction_limit/math.sqrt(2))
-                lateral = (lateral+correction).clamp(-cfg.lateral_limit, cfg.lateral_limit)
-                points = torch.cat((lateral, initial[..., 2:]), -1)
-                refinements.append(points)
-        # Confidence inspects the actual prediction. Its labels and coordinate
-        # sampling are detached; coordinate regression retains its own gradient.
-        logits = self.confidence_logits(ctx, decoded, points)
-        out = dict(points=points, initial_points=initial_points,
-                    refinement_points=torch.stack(refinements, 1),
-                    confidence_logits=logits, confidence=logits.sigmoid().cummin(-1).values)
+        for stage in range(cfg.recurrent_refinement_steps):
+            evidence = self.evidence(ctx, points, 'refinement')
+            refreshed = self.refinement_fusion(torch.cat((evidence, points/16.), -1))
+            query = decoded+refreshed+self.refinement_stage.weight[stage].to(decoded.dtype)
+            decoded = self.decode_cached(query, projected, padding)
+            delta = self.refinement_delta(decoded).float().tanh()*(cfg.recurrent_refinement_limit/math.sqrt(2))
+            lateral = (points[..., :2]+delta).clamp(-cfg.lateral_limit, cfg.lateral_limit)
+            first = lateral[:, :1]
+            first = first*(first_limit/first.norm(dim=-1, keepdim=True).clamp_min(1e-8)).clamp(max=1.)
+            lateral = torch.cat((first, lateral[:, 1:]), 1)
+            points = torch.cat((lateral, initial[..., 2:]), -1)
+            refinements.append(points)
+        hazards = self.hazard_logits(ctx, points)
+        logits, confidence = survival_predictions(hazards)
+        out = dict(points=points, initial_points=initial, refinement_points=torch.stack(refinements, 1),
+                   hazard_logits=hazards, confidence_logits=logits, confidence=confidence)
         if candidates is not None:
-            out['candidate_confidence_logits'] = torch.stack([
-                self.confidence_logits(ctx, decoded, curve) for curve in candidates.unbind(1)], 1)
+            hazards = torch.stack([self.hazard_logits(ctx, curve) for curve in candidates.unbind(1)], 1)
+            logits, confidence = survival_predictions(hazards)
+            out.update(candidate_hazard_logits=hazards, candidate_confidence_logits=logits,
+                       candidate_confidence=confidence)
         return out
+
+    def decode_cached(self, query, projected, padding):
+        for layer, kv in zip(self.decoder.layers, projected):
+            query = layer.forward_cached(query, kv, padding)
+        return self.decoder.norm(query)

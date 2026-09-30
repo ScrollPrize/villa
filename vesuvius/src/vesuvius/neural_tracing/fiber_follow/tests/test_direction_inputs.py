@@ -26,7 +26,7 @@ from vesuvius.neural_tracing.fiber_follow.regression.data import (
 )
 from vesuvius.neural_tracing.fiber_follow.regression.memory_data import memory_layout
 from vesuvius.neural_tracing.fiber_follow.regression.train import (
-    add_direction_inputs, save_checkpoint, load_checkpoint, checkpoint_config, build_parser,
+    save_checkpoint, load_checkpoint, checkpoint_config, build_parser,
 )
 from vesuvius.neural_tracing.fiber_follow.shared.data import SampleConfig
 from vesuvius.neural_tracing.fiber_follow.shared.trace import TraceParams
@@ -60,7 +60,7 @@ def volume(root, nx=None, ny=None):
 def config(**kwargs):
     options=dict(fine=CropSpec(depth=16,width=9,behind=7,spacing=.5),channels=4,hidden=16,
                  heads=2,layers=1,decoder_layers=1,n_future=4,n_history=8,embedding=8,
-                 memory_slots=2,memory_steps=2,memory_stride=1,memory_patch_size=5,memory_grad_steps=2)
+                 memory_slots=2,memory_steps=2,memory_stride=1,feature_detail_tokens=4)
     options.update(kwargs)
     return DirectConfig(**options)
 
@@ -202,10 +202,9 @@ class DirectionInputTests(unittest.TestCase):
             observations,seed=memory_layout(state,cfg)
             expected=local_direction_moments(world,state['frame'])
             np.testing.assert_allclose(x['fine'][0,2:,:,4,4].numpy(),np.repeat(expected[:,None],cfg.fine.depth,1),atol=2e-7)
-            for k,obs in enumerate(observations):
-                np.testing.assert_allclose(x['memory_patches'][0,k,2:,2,2,2],local_direction_moments(world,obs['frame']),atol=2e-7)
-            np.testing.assert_allclose(x['memory_seed_patch'][0,2:,2,2,2],local_direction_moments(world,seed['frame']),atol=2e-7)
-            self.assertFalse(np.allclose(x['fine'][0,2:,7,4,4],x['memory_seed_patch'][0,2:,2,2,2]))
+            seed_x=x['feature_seed_x']
+            np.testing.assert_allclose(seed_x['fine'][0,2:,7,4,4],local_direction_moments(world,seed['frame']),atol=2e-7)
+            self.assertFalse(np.allclose(x['fine'][0,2:,7,4,4],seed_x['fine'][0,2:,7,4,4]))
             # Actual DirectTracer uses the same sampling path; exercise reconstructed
             # causal history rather than the optional explicit memory_track.
             plain={k:v for k,v in state.items() if k!='memory_track'}
@@ -219,9 +218,8 @@ class DirectionInputTests(unittest.TestCase):
             finally:tracer.close()
             warm=dict(plain,memory_warm=True)
             online=builder.images([warm],vol)
-            self.assertEqual(online['memory_patches'].shape,(1,1,8,5,5,5))
-            torch.testing.assert_close(online['memory_patches'][0,0],expected_x['memory_patches'][0,-1])
-            self.assertEqual(online['memory_seed_patch'].count_nonzero().item(),0)
+            torch.testing.assert_close(online['fine'],expected_x['fine'])
+            self.assertNotIn('feature_seed_x',online)
 
     def test_all_image_augmentations_leave_directions_bitwise_unchanged(self):
         cfg=config(direction_inputs=True)
@@ -237,44 +235,12 @@ class DirectionInputTests(unittest.TestCase):
         training=copy.deepcopy(original);builder=IdentityObservationBuilder(cfg,augment=True)
         state=dict(photometric=(1.3,.1,.07),identity_seed=3,blur_sigma=1.,drop_presence=True)
         with patch.object(ObservationBuilder,'__call__',return_value=training), \
-             patch.object(builder,'identity_targets',return_value=dict(presence_dropped=torch.zeros(1))), \
-             patch('vesuvius.neural_tracing.fiber_follow.regression.memory_data.memory_targets',return_value={}):
+             patch.object(builder,'identity_targets',return_value=dict(presence_dropped=torch.zeros(1))):
             got=builder([state],None)['x']
         for key in ('fine','memory_seed_patch'):
             torch.testing.assert_close(got[key][:,2:],original['x'][key][:,2:],rtol=0,atol=0)
         torch.testing.assert_close(got['memory_patches'][:,:,2:],original['x']['memory_patches'][:,:,2:],rtol=0,atol=0)
 
-    def test_checkpoint_expansion_preserves_outputs_and_trains_new_weights(self):
-        torch.manual_seed(12);cfg=config();model=DirectFollower(cfg).eval()
-        # Open the read path to check the existing learned memory is preserved too.
-        torch.nn.init.xavier_uniform_(model.recurrent_memory.read_attention.out_proj.weight)
-        upgraded=add_direction_inputs(model)
-        self.assertEqual(upgraded.cfg.input_channels,8)
-        self.assertEqual(model.cfg.input_channels,2)
-        with tempfile.TemporaryDirectory() as tmp:
-            vol=volume(Path(tmp));state=item(cfg)
-            base=ObservationBuilder(cfg).images([state],vol)
-            extended=ObservationBuilder(upgraded.cfg).images([state],vol)
-            hist=torch.tensor(state['hist_local'][None],dtype=torch.float32);mask=torch.tensor(state['hmask'][None])
-            with torch.no_grad():
-                expected=model(base,hist,mask);actual=upgraded(extended,hist,mask)
-            for key in expected:torch.testing.assert_close(actual[key],expected[key],atol=3e-6,rtol=3e-5)
-            output=upgraded(extended,hist,mask)
-            (output['points'].square().mean()+output['confidence'].mean()).backward()
-            for name in ('encoder.stem.0.weight','recurrent_memory.patch_encoder.0.weight'):
-                weight=dict(upgraded.named_parameters())[name]
-                self.assertGreater(weight.grad[:,2:].abs().sum().item(),0)
-                self.assertTrue(torch.isfinite(weight.grad).all())
-                self.assertEqual(weight[:,2:].count_nonzero().item(),0)
-            ck=Path(tmp)/'model.pt'
-            save_checkpoint(ck,upgraded,upgraded,vol.spec,SampleConfig(crop=cfg.fine,n_history=cfg.n_history))
-            loaded,_,_,_,saved=load_checkpoint(ck,'cpu')
-            self.assertTrue(loaded.cfg.direction_inputs)
-            self.assertEqual(loaded.recurrent_memory.patch_encoder[0].in_channels,8)
-            for key,value in loaded.state_dict().items():torch.testing.assert_close(value,upgraded.state_dict()[key],rtol=0,atol=0)
-            saved['model_cfg'].pop('direction_inputs');saved['model_cfg']['memory_slots']=2
-            self.assertFalse(checkpoint_config(saved).direction_inputs)
-        self.assertFalse(build_parser().get_default('direction_inputs'))
 
 
 if __name__=='__main__':unittest.main()

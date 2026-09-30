@@ -13,7 +13,6 @@ from vesuvius.neural_tracing.fiber_follow.regression.supervision import loss_ter
 from vesuvius.neural_tracing.fiber_follow.regression.train import (
     checkpoint_config, optimizer_update, build_parser, compile_training_model,
 )
-from vesuvius.neural_tracing.fiber_follow.regression.upgrade_refinement import upgrade_checkpoint, options_argv
 from vesuvius.neural_tracing.fiber_follow.shared.runloop import resume_training, training_rng_state
 
 
@@ -46,8 +45,8 @@ def test_refinement_starts_neutral_encodes_writes_and_projects_once(monkeypatch)
     model.load_state_dict(old.state_dict(), strict=False)
     b = memory_batch(model.cfg)
     calls = dict(encoder=0, writer=0, projection=0, decoder=0)
-    for obj, method, key in ((model.encoder, 'forward', 'encoder'),
-                             (model.recurrent_memory, 'observe_features', 'writer'),
+    for obj, method, key in ((model.encoder, 'encode', 'encoder'),
+                             (model.recurrent_memory, 'observe_tokens', 'writer'),
                              (model.decoder.layers[0], 'project_memory', 'projection'),
                              (model.decoder.layers[0], 'forward_cached', 'decoder')):
         original = getattr(obj, method)
@@ -104,40 +103,6 @@ def test_bounds_and_masked_geometry():
     assert model.refinement_delta.weight.grad.eq(0).all()
 
 
-def test_upgrade_preserves_model_ema_optimizer_rng_and_next_update():
-    torch.manual_seed(44)
-    model = build_model(cfg())
-    ema = copy.deepcopy(model)
-    opt = torch.optim.AdamW(model.parameters(), lr=.001)
-    optimizer_update(model, ema, opt, [training_chunk(model.cfg)], 17, .001, device='cpu', compute_metrics=False)
-    ck = dict(model_cfg=model.cfg.to_dict(), architecture=model.architecture,
-              model=model.state_dict(), ema=ema.state_dict(), optimizer=opt.state_dict(),
-              rng=training_rng_state(), step=17, samples_seen=123, replay_seen=11)
-    upgraded = upgrade_checkpoint(ck)
-    new = build_model(checkpoint_config(upgraded))
-    new_ema = copy.deepcopy(new)
-    new_opt = torch.optim.AdamW(new.parameters(), lr=.001)
-    assert resume_training(upgraded, new, new_ema, new_opt) == (17, 11)
-    assert upgraded['samples_seen'] == 123
-    torch.testing.assert_close(torch.get_rng_state(), ck['rng']['torch'], rtol=0, atol=0)
-    for before, after in ((model, new), (ema, new_ema)):
-        for name, value in before.state_dict().items():
-            torch.testing.assert_close(value, after.state_dict()[name], rtol=0, atol=0)
-    old_params = dict(model.named_parameters())
-    for name, p in new.named_parameters():
-        if name.startswith('refinement_'):
-            assert not new_opt.state.get(p)
-        else:
-            for key, value in opt.state[old_params[name]].items():
-                torch.testing.assert_close(new_opt.state[p][key], value, rtol=0, atol=0)
-    metrics = optimizer_update(new, new_ema, new_opt, [training_chunk(new.cfg)], 18, .001,
-                               device='cpu', compute_metrics=False)
-    assert torch.isfinite(torch.tensor(metrics['loss']))
-    assert new.refinement_delta.weight.abs().sum() > 0
-    options = vars(build_parser().parse_args(['--name', 'test', '--fiber-zarrs', '/a', '--fibers', '/b',
-        '--ct', '/c', '--manifest', '/d', '--memory-version', '4', '--no-correction',
-        '--recurrent-refinement-steps', '1']))
-    assert json.dumps(vars(build_parser().parse_args(options_argv(options))), sort_keys=True) == json.dumps(options, sort_keys=True)
 
 
 def test_refinement_fullgraph_capture():
@@ -149,49 +114,6 @@ def test_refinement_fullgraph_capture():
     assert torch.isfinite(model.refinement_delta.weight.grad).all()
 
 
-def test_run_migration_uses_runtime_options_and_preserves_fixture_replay(tmp_path, monkeypatch):
-    from vesuvius.neural_tracing.fiber_follow.regression.upgrade_refinement import main
-    model = build_model(cfg())
-    source = tmp_path/'old'
-    source.mkdir()
-    path = source/'ckpt_000017.pt'
-    options = vars(build_parser().parse_args(['--name', 'old', '--fiber-zarrs', '/a', '--fibers', '/b',
-        '--ct', '/c', '--manifest', '/d', '--out-root', str(tmp_path), '--batch', '8',
-        '--microbatch', '4', '--memory-version', '4', '--no-correction', '--resume', str(path)]))
-    options.pop('recurrent_refinement_steps')
-    options.pop('recurrent_refinement_limit')
-    options = json.loads(json.dumps(options))
-    fixture = source/'monitor_recovery.npz'
-    fixture.write_bytes(b'unchanged monitor fixture')
-    ck = dict(model_cfg=model.cfg.to_dict(), architecture=model.architecture,
-              model=model.state_dict(), ema=model.state_dict(), step=17,
-              optimizer=torch.optim.AdamW(model.parameters()).state_dict(), rng=training_rng_state(),
-              monitor_recovery_sha256=hashlib.sha256(fixture.read_bytes()).hexdigest(),
-              training_options=options, feature_sampling_revision=3)
-    torch.save(ck, path)
-    # Deliberately stale launch config: the runtime event is authoritative.
-    (source/'config.json').write_text(json.dumps(dict(options, batch=16)))
-    (source/'log.jsonl').write_text(json.dumps(dict(event='resume_configuration', training_options=options))+'\n')
-    replay = tmp_path/'replay'
-    replay.mkdir()
-    (source/'dagger').mkdir()
-    (source/'dagger'/'replay.json').write_text(json.dumps([str(replay)]))
-    audit = tmp_path/'audit.json'
-    audit.write_text(json.dumps(dict(runtime_options=options, model_cfg=ck['model_cfg'], cli_event_differences={})))
-    monkeypatch.setattr('sys.argv', ['upgrade_refinement', '--checkpoint', str(path),
-        '--runtime-audit', str(audit), '--name', 'new'])
-    main()
-    destination = tmp_path/'new'
-    configuration = json.loads((destination/'config.json').read_text())
-    assert configuration['batch'] == 8 and configuration['recurrent_refinement_steps'] == 1
-    assert (destination/'monitor_recovery.npz').read_bytes() == fixture.read_bytes()
-    assert json.loads((destination/'dagger'/'replay.json').read_text()) == [str(replay)]
-    upgraded = torch.load(destination/'last.pt', weights_only=False)
-    assert upgraded['step'] == 17 and upgraded['feature_sampling_revision'] == 3
-    argv = json.loads((destination/'resume_argv.json').read_text())
-    assert vars(build_parser().parse_args(argv)) == upgraded['training_options']
-    with pytest.raises(FileExistsError):
-        main()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA unavailable')

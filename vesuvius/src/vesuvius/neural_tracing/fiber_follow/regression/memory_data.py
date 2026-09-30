@@ -6,22 +6,11 @@ labels are auxiliary targets only; the writer sees positions, frames and CT.
 Without a track, observations are reconstructed from the saved history.
 """
 import numpy as np
-import torch
 
-from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, frame_from_heading, normalize
+from vesuvius.neural_tracing.fiber_follow.shared.geometry import frame_from_heading, normalize
 from vesuvius.neural_tracing.fiber_follow.shared.data import training_state_allowed
 
 TRACK_KEYS = ('pos', 'frame', 'offtrack', 'offset')  # offset: world vector to the original fiber
-
-
-def memory_crop(cfg):
-    n = cfg.memory_patch_size
-    return CropSpec(depth=n, width=n, behind=n//2, spacing=cfg.fine.spacing)
-
-
-def memory_count(items, cfg):
-    """Fixed training shape; online calls contain just a single new observation."""
-    return 1 if all(i.get('memory_warm', False) for i in items) else cfg.memory_steps+1
 
 
 def memory_layout(item, cfg):
@@ -57,7 +46,7 @@ def memory_layout(item, cfg):
             if not np.isfinite(heading).all() or np.linalg.norm(heading) < 1e-6:
                 heading = frame[:, 2]
             observations.append(dict(pos=hist[i], frame=frame_from_heading(normalize(heading))))
-    observations.append(dict(pos=pos, frame=frame if cfg.feature_memory else frame_from_heading(frame[:, 2])))
+    observations.append(dict(pos=pos, frame=frame))
     seed = None
     if not warm and item.get('seed_valid', False):
         point = np.asarray(item['seed_pos'])
@@ -68,94 +57,9 @@ def memory_layout(item, cfg):
 
 
 def memory_allowed(item, cfg, band):
-    if cfg.feature_memory:
-        if not training_state_allowed(item, cfg.fine, band):
-            return False
-        if item.get('seed_valid', False) and not item.get('memory_warm', False):
-            from .feature_sequences import seed_observation
-            return training_state_allowed(seed_observation(item, cfg), cfg.fine, band)
-        return True
-    observations, seed = memory_layout(item, cfg)
-    return all(training_state_allowed(o, memory_crop(cfg), band)
-               for o in observations+([] if seed is None else [seed]))
-
-
-def memory_images(items, vol, cfg, image_crop, pool=None):
-    layouts = [memory_layout(i, cfg) for i in items]
-    count = memory_count(items, cfg)
-    b, n = len(items), cfg.memory_patch_size
-    patches = torch.zeros(b, count, cfg.input_channels, n, n, n)
-    mask = torch.zeros(b, count, dtype=torch.bool)
-    positions = torch.zeros(b, count, 3)
-    frames = torch.eye(3).expand(b, count, -1, -1).clone()
-    seed_patch = torch.zeros(b, cfg.input_channels, n, n, n)
-    seed_valid = torch.zeros(b, dtype=torch.bool)
-    seed_position = torch.zeros(b, 3)
-    seed_frame = torch.eye(3).expand(b, -1, -1).clone()
-    reads, destinations = [], []
-    for j, (observations, seed) in enumerate(layouts):
-        for k, obs in enumerate(observations, count-len(observations)):
-            reads.append(obs); destinations.append((j, k))
-            mask[j, k] = True
-            positions[j, k] = torch.as_tensor(obs['pos'], dtype=torch.float32)
-            frames[j, k] = torch.as_tensor(obs['frame'], dtype=torch.float32)
-        if seed is not None:
-            reads.append(seed); destinations.append((j, -1)); seed_valid[j] = True
-            seed_position[j] = torch.as_tensor(seed['pos'], dtype=torch.float32)
-            seed_frame[j] = torch.as_tensor(seed['frame'], dtype=torch.float32)
-    # Bound temporary source blocks for a production microbatch of sequences.
-    for start in range(0, len(reads), 32):
-        images = image_crop(reads[start:start+32], vol, memory_crop(cfg), pool)
-        for image, (j, k) in zip(images, destinations[start:start+32]):
-            if k < 0:
-                seed_patch[j] = image
-            else:
-                patches[j, k] = image
-    return dict(memory_patches=patches, memory_mask=mask, memory_positions=positions,
-                memory_frames=frames, memory_seed_patch=seed_patch, memory_seed_valid=seed_valid,
-                memory_seed_position=seed_position, memory_seed_frame=seed_frame)
-
-
-def memory_targets(items, cfg):
-    """Per-observation probe targets, aligned with ``memory_images``; never model inputs.
-
-    Identity is 1 until the trace's confirmed departure from its original fiber.
-    Offsets point from the observation to that fiber, in the observation's
-    frame, known only while on it and within the recovery distance. Tracks
-    label every write; otherwise only the head is labeled. Burn-in writes and
-    states whose memory cannot distinguish the original fiber are unlabeled.
-    """
-    count = memory_count(items, cfg)
-    b = len(items)
-    identity = np.zeros((b, count), np.float32)
-    identity_mask = np.zeros((b, count), bool)
-    offset = np.zeros((b, count, 3), np.float32)
-    offset_mask = np.zeros((b, count), bool)
-    burn = max(0, count-cfg.memory_grad_steps-1)
-    for j, item in enumerate(items):
-        if not item.get('identity_observable', True):
-            continue
-        observations, _ = memory_layout(item, cfg)
-        track = item.get('memory_track')
-        for k, obs in enumerate(observations, count-len(observations)):
-            if k < burn:
-                continue
-            if 'track' in obs:
-                off, vector = float(track['offtrack'][obs['track']]), np.asarray(track['offset'][obs['track']], np.float64)
-            elif k == count-1 and 'offtrack' in item:
-                off = float(item['offtrack'])
-                vector = np.full(3, np.nan)
-                if not off and 'gt_history' in item and item['gt_history_mask'][0] > 0:
-                    vector = np.asarray(item['frame']) @ np.asarray(item['gt_history'][0], np.float64)
-            else:
-                continue
-            if not np.isfinite(off):
-                continue
-            identity[j, k], identity_mask[j, k] = 1.-off, True
-            local = vector @ obs['frame']
-            if not off and np.isfinite(local).all() and np.linalg.norm(local) <= cfg.max_recovery_distance:
-                offset[j, k], offset_mask[j, k] = local, True
-    return dict(memory_target_identity=torch.from_numpy(identity),
-                memory_target_identity_mask=torch.from_numpy(identity_mask),
-                memory_target_offset=torch.from_numpy(offset),
-                memory_target_offset_mask=torch.from_numpy(offset_mask))
+    if not training_state_allowed(item, cfg.fine, band):
+        return False
+    if item.get('seed_valid', False) and not item.get('memory_warm', False):
+        from .feature_sequences import seed_observation
+        return training_state_allowed(seed_observation(item, cfg), cfg.fine, band)
+    return True

@@ -4,6 +4,7 @@ import torch.nn.functional as F
 
 from vesuvius.neural_tracing.fiber_follow.shared.labels import prefix_labels
 from vesuvius.neural_tracing.fiber_follow.regression.model import feature_grid
+from .survival_confidence import survival_loss
 
 
 def geometry_mask(batch, cfg):
@@ -131,7 +132,7 @@ def loss_terms(output, batch, cfg, tolerance=1.5, *, n_commit=None, identity_tem
     error = F.smooth_l1_loss(predicted, target, beta=1., reduction='none').mean(-1)
     geometry = window_mean(error, mask, near)
     initial_geometry = geometry
-    if cfg.correction or cfg.recurrent_refinement_steps:
+    if cfg.recurrent_refinement_steps:
         initial = F.interpolate(output['initial_points'][..., :2].transpose(1, 2),
                                 size=mask.shape[1], mode='linear', align_corners=True).transpose(1, 2)
         initial_error = F.smooth_l1_loss(initial, target, beta=1., reduction='none').mean(-1)
@@ -163,12 +164,11 @@ def loss_terms(output, batch, cfg, tolerance=1.5, *, n_commit=None, identity_tem
         observed = batch['identity_observable'][:,None]
         known = known*observed
         supervised_known = supervised_known*observed
-    bce = F.binary_cross_entropy_with_logits(output['confidence_logits'], supervised, reduction='none')
+    confidence, confidence_valid = survival_loss(output['hazard_logits'], supervised, supervised_known)
     terms = dict(geometry_per_state=geometry,
-                 confidence_per_state=window_mean(bce, supervised_known.bool(),
-                                                  torch.arange(cfg.n_future, device=mask.device) < window),
-                 confidence_labeled_states=supervised_known.bool().any(-1).sum(),
-                 confidence_departed_states=(supervised_known.bool().any(-1) & batch['offtrack'].bool()).sum(),
+                 confidence_per_state=confidence,
+                 confidence_labeled_states=confidence_valid.any(-1).sum(),
+                 confidence_departed_states=(confidence_valid.any(-1) & batch['offtrack'].bool()).sum(),
                  geometry_count=mask.sum(), confidence_count=supervised_known.sum(),
                  error_sum=torch.where(mask, (predicted-target).norm(dim=-1), 0.).sum(),
                  correct_count=(labels*known).sum())
@@ -183,39 +183,8 @@ def loss_terms(output, batch, cfg, tolerance=1.5, *, n_commit=None, identity_tem
         if 'identity_observable' in batch:
             mask = mask & batch['identity_observable'][:,None,None]
         labels = batch['candidate_labels'].float()
-        bce = F.binary_cross_entropy_with_logits(output['candidate_confidence_logits'], labels, reduction='none')
-        per_candidate = window_mean(bce, mask, torch.arange(cfg.n_future, device=mask.device) < window)
+        per_candidate, mask = survival_loss(output['candidate_hazard_logits'], labels, mask)
         valid = mask.any(-1)
         terms['candidate_per_state'] = per_candidate.sum(-1)/valid.sum(-1).clamp_min(1)
         terms['candidate_states'] = valid.any(-1).sum()
-    if 'route_logits' in output:
-        from .spatial_supervision import route_loss_terms
-        terms.update(route_loss_terms(output,batch,cfg))
     return terms
-
-
-def memory_probe_terms(output, batch, *, departed_weight=1.):
-    """Per-write departure and original-fiber offset probe on the recurrent memory.
-
-    Targets are annotation-derived and never enter the writer. Each state
-    averages over its labeled writes, so a long track weighs as much as a head.
-    """
-    probe = output['memory_probe'].float()
-    identity_mask = batch['memory_target_identity_mask'].bool()
-    target = batch['memory_target_identity'].float()
-    bce = F.binary_cross_entropy_with_logits(probe[..., 0], target, reduction='none')
-    # Label 0 means departed. pos_weight would upweight the opposite class.
-    bce = bce*torch.where(target < .5, departed_weight, 1.)
-    identity = torch.where(identity_mask, bce, 0.).sum(-1)/identity_mask.sum(-1).clamp_min(1)
-    offset_mask = batch['memory_target_offset_mask'].bool()
-    offset_target = batch['memory_target_offset'].float()
-    error = F.smooth_l1_loss(probe[..., 1:], offset_target, beta=1., reduction='none').sum(-1)
-    offset = torch.where(offset_mask, error, 0.).sum(-1)/offset_mask.sum(-1).clamp_min(1)
-    correct = ((probe[..., 0] > 0) == (target > .5)) & identity_mask
-    departed = identity_mask & (target < .5)
-    distance = (probe[..., 1:]-offset_target).norm(dim=-1)
-    return dict(memory_identity_per_state=identity, memory_offset_per_state=offset,
-                memory_identity_count=identity_mask.sum(), memory_identity_correct=correct.sum(),
-                memory_departed_count=departed.sum(), memory_departed_correct=(correct & departed).sum(),
-                memory_offset_count=offset_mask.sum(),
-                memory_offset_error_sum=torch.where(offset_mask, distance, 0.).sum())

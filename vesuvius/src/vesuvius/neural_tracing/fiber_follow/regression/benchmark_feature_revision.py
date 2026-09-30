@@ -52,8 +52,6 @@ def main():
     torch.manual_seed(194)
     ck = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
     cfg = checkpoint_config(ck)
-    if args.replay_length and cfg.feature_memory_revision != 2:
-        ap.error('Replay requires revision 2')
     model = build_model(cfg).to('cuda', memory_format=conv_memory_format('cuda'))
     model.load_state_dict(ck['model'])
     ema = copy.deepcopy(model).requires_grad_(False).eval()

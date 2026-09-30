@@ -1,16 +1,31 @@
 """Spatial observations and task-trained compression, without identity judgments."""
+import math
 import torch
 from torch import nn
 import torch.nn.functional as F
 
-from .feature_memory import FeatureMemory
 from .model import sample_features, crop_support, TOKEN_STRIDE, TOKEN_OFFSET
 
 
-class DetailedFeatureMemory(FeatureMemory):
+class DetailedFeatureMemory(nn.Module):
     def __init__(self, cfg, token_xyz):
-        super().__init__(cfg, token_xyz)
-        del self.probe_norm, self.probe_attention, self.probe_head
+        super().__init__()
+        self.cfg = cfg
+        h = cfg.hidden
+        self.initial_slots = nn.Parameter(torch.randn(cfg.memory_slots, h)*.02)
+        self.motion = nn.Sequential(nn.Linear(12, h), nn.SiLU(), nn.Linear(h, h))
+        self.write_norm = nn.LayerNorm(h)
+        self.write_attention = nn.MultiheadAttention(h, cfg.heads, dropout=0., batch_first=True)
+        self.proposal = nn.Linear(2*h, h)
+        self.gate = nn.Linear(2*h, h)
+        nn.init.constant_(self.gate.bias, -2.)
+        self.role = nn.Parameter(torch.randn(2, h)*.02)
+        self.count = math.prod(cfg.feature_memory_grid)
+        self.feature_projection = nn.Sequential(nn.LayerNorm(cfg.hidden), nn.Linear(cfg.hidden, cfg.hidden))
+        self.spatial = nn.Linear(4, cfg.hidden)
+        xyz = token_xyz.reshape(*cfg.token_shape, 3).permute(3, 0, 1, 2)[None]
+        self.register_buffer('local_xyz', F.adaptive_avg_pool3d(xyz, cfg.feature_memory_grid)
+                             .flatten(2).transpose(1, 2)[0], persistent=False)
         self.coarse_count = self.count
         self.count += cfg.feature_detail_tokens
         width = 9*(cfg.channels+1)+cfg.hidden+1
@@ -23,10 +38,23 @@ class DetailedFeatureMemory(FeatureMemory):
         self.register_buffer('detail_stencil', stencil*cfg.patch_radius, persistent=False)
 
     def initial_state(self, batch, device):
-        state = super().initial_state(batch, device)
-        state.update(anchor_mask=torch.zeros(batch, self.count, device=device, dtype=torch.bool),
-                     cache_mask=torch.zeros(batch, self.cfg.memory_steps, self.count, device=device, dtype=torch.bool))
-        return state
+        n, k, h = self.count, self.cfg.memory_steps, self.cfg.hidden
+        return dict(slots=self.initial_slots.to(device).unsqueeze(0).expand(batch, -1, -1),
+            anchor=torch.zeros(batch, n, h, device=device),
+            anchor_xyz=torch.zeros(batch, n, 3, device=device),
+            anchor_mask=torch.zeros(batch, n, device=device, dtype=torch.bool),
+            anchor_valid=torch.zeros(batch, device=device, dtype=torch.bool),
+            anchor_position=torch.zeros(batch, 3, device=device),
+            anchor_frame=torch.eye(3, device=device).expand(batch, -1, -1),
+            position=torch.zeros(batch, 3, device=device),
+            frame=torch.eye(3, device=device).expand(batch, -1, -1),
+            seen=torch.zeros(batch, device=device, dtype=torch.bool),
+            cache=torch.zeros(batch, k, n, h, device=device),
+            cache_xyz=torch.zeros(batch, k, n, 3, device=device),
+            cache_frames=torch.eye(3, device=device).expand(batch, k, -1, -1).clone(),
+            cache_valid=torch.zeros(batch, k, device=device, dtype=torch.bool),
+            cache_mask=torch.zeros(batch, k, n, device=device, dtype=torch.bool),
+            cache_age=torch.zeros(batch, k, device=device))
 
     def detail_points(self, hist, hmask):
         """Head plus evenly spaced visible *observed* history, with fixed padding."""
@@ -64,11 +92,46 @@ class DetailedFeatureMemory(FeatureMemory):
             return torch.cat((coarse, detail), 1), xyz, mask
 
     def read_tokens(self, state):
-        tokens, padding = super().read_tokens(state)
-        s, n = self.cfg.memory_slots, self.count
-        padding = torch.cat((padding[:, :s], ~state['anchor_mask'] | ~state['anchor_valid'][:, None],
-                             (~state['cache_mask'] | ~state['cache_valid'][:, :, None]).flatten(1, 2)), 1)
+        """No crop-support mask: remote evidence remains readable until eviction."""
+        frame, position = state['frame'], state['position']
+        def spatial(xyz, ages):
+            local = torch.einsum('bni,bij->bnj', xyz-position[:, None], frame)/16.
+            local = local.sign()*torch.log1p(local.abs())
+            return self.spatial(torch.cat((local, torch.log1p(ages)[..., None]), -1))
+        anchor = state['anchor']+self.role[1]+spatial(state['anchor_xyz'],
+                    state['cache_age'].new_zeros(state['anchor'].shape[:2]))
+        anchor = anchor+self.relative_anchor(state['anchor_position'], state['anchor_frame'],
+                    position, frame, state['anchor_valid'])[:, None]
+        k, n = state['cache'].shape[1:3]
+        cache = state['cache'].flatten(1, 2)+self.role[0]+spatial(state['cache_xyz'].flatten(1, 2),
+                    state['cache_age'][:, :, None].expand(-1, -1, n).flatten(1, 2))
+        rotation = frame[:, None].transpose(-1, -2) @ state['cache_frames']
+        pose = torch.cat((rotation.new_zeros(len(frame), k, 3), rotation.flatten(-2)), -1)
+        cache = cache+(self.motion(pose)[:, :, None].expand(-1, -1, n, -1)).flatten(1, 2)
+        tokens = torch.cat((state['slots']+self.role[0], anchor, cache), 1)
+        padding = torch.cat((torch.zeros(state['slots'].shape[:2], device=frame.device, dtype=torch.bool),
+            ~state['anchor_mask'] | ~state['anchor_valid'][:, None],
+            (~state['cache_mask'] | ~state['cache_valid'][:, :, None]).flatten(1, 2)), 1)
         return tokens, padding
+
+    def relative_anchor(self, anchor_position, anchor_frame, position, frame, valid):
+        delta = torch.einsum('...i,...ij->...j', anchor_position-position, frame)/16.
+        delta = delta.sign()*torch.log1p(delta.abs())
+        rotation = (frame.transpose(-1, -2) @ anchor_frame).flatten(-2)
+        pose = torch.where(valid[..., None], torch.cat((delta, rotation), -1), 0.)
+        return self.motion(pose)
+
+    def write_inputs(self, encoded, pos, fr, previous, previous_frame, moved,
+                     anchor, anchor_position, anchor_frame, anchor_valid):
+        """Observation and seed tokens of each write (b×t×8×h), independent of the slots."""
+        displacement = torch.einsum('bti,btij->btj', pos-previous, fr)/16.
+        rotation = (fr.transpose(-1, -2) @ previous_frame).flatten(2)
+        motion = torch.where(moved[..., None], torch.cat((displacement, rotation), -1), 0.)
+        observations = encoded+self.motion(motion)[:, :, None]
+        seed_pose = self.relative_anchor(anchor_position[:, None], anchor_frame[:, None], pos, fr,
+                                         anchor_valid[:, None].expand(-1, pos.shape[1]))
+        anchor_tokens = anchor[:, None]+self.role[1]+seed_pose[:, :, None]
+        return observations, anchor_tokens
 
     def observe_tokens(self, tokens, local_xyz, valid, x, state=None):
         """Replayable small transition; all intervening writes stay differentiable."""

@@ -17,13 +17,13 @@ from vesuvius.neural_tracing.fiber_follow.shared.runloop import RunLog
 
 
 def test_individual_points_recover_after_wrong_point_and_ignore_confidence():
-    cfg = replace(config(), fine=replace(config().fine, depth=40), n_future=16, correction=False)
+    cfg = replace(config(), fine=replace(config().fine, depth=40), n_future=16, recurrent_refinement_steps=0)
     data = batch(cfg, 1)
     data['dense_ab'].zero_()
     points = torch.zeros(1, 16, 3)
     points[..., 2] = torch.arange(1, 17)
     points[0, 2, 0] = 2.
-    output = dict(points=points, confidence_logits=torch.full((1,16), -10.))
+    output = dict(points=points, confidence_logits=torch.full((1,16), -10.), hazard_logits=torch.zeros(1,16))
     terms = loss_terms(output, data, cfg, n_commit=16)
     assert terms['point_correct_count'] == 15
     assert terms['point_wrong_count'] == 1
