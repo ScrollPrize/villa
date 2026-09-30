@@ -37,6 +37,7 @@
 #include "LineAnnotationFiberSegments.hpp"
 #include "LineAnnotationFiberLinkValidation.hpp"
 #include "LineAnnotationStoredFiber.hpp"
+#include "LineAnnotationStructuralEdits.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
 #include "vc/atlas/FiberIntersections.hpp"
 #include "vc/core/util/Umbilicus.hpp"
@@ -1422,6 +1423,82 @@ private:
     // deleteFibers is running (it yields to the event loop while draining
     // saves); a second delete meanwhile is refused.
     bool _deletingFibers = false;
+    // A merge or split from its menu callback to the end of its commit; the
+    // second one refuses, and deletes/renames/imports refuse meanwhile.
+    bool _structuralEditInProgress = false;
+    // _fiberSaveFailureCount as of the last load: structural edits refuse to
+    // run when a save has failed since (memory may be ahead of disk).
+    uint64_t _fiberSaveFailureCountAtLoad = 0;
+    // A structural edit's disk undo left artifacts behind: memory and disk
+    // are known to differ until the next load. Latched until then.
+    bool _structuralEditRecoveryRequired = false;
+
+    // Everything a merge/split needs from the menu callback, captured by
+    // identity and position (never by index or iterator) because phase B
+    // runs after the callback returned and after a save drain.
+    struct StructuralEditCapture {
+        uint64_t packageGeneration = 0;
+        uint64_t loadSequence = 0;
+        std::weak_ptr<LineAnnotationSession> session;
+        std::string surfaceName;
+        uint64_t sessionFiberId = 0;
+        std::string sessionFileName;
+        cv::Vec3d firstPoint{0.0, 0.0, 0.0};
+        int firstHint = -1;
+        cv::Vec3d secondPoint{0.0, 0.0, 0.0};
+        int secondHint = -1;
+        uint64_t farId = 0;
+        std::string farFileName;
+        std::filesystem::path farSourceRoot;
+        cv::Vec3d farPoint{0.0, 0.0, 0.0};
+        int farHint = -1;
+        vc3d::line_annotation::FiberOptimizationMode mode =
+            vc3d::line_annotation::FiberOptimizationMode::Lasagna;
+        bool linkHalves = false;
+        bool suppressErrors = false;
+    };
+    struct StructuralEditRequest {
+        const char* verb = "";
+        std::vector<StoredFiber> newFibers;
+        std::vector<StoredFiber> originals;
+        std::vector<vc3d::line_annotation::BranchRedirectSource> sources;
+        std::vector<std::weak_ptr<LineAnnotationSession>> consumedSessions;
+    };
+    struct StructuralEditOutcome {
+        bool ok = false;
+        bool recoveryRequired = false;
+        // ok, but a notification after the commit threw: views may be stale.
+        std::string warning;
+        std::string error;
+        std::vector<std::string> writtenFileNames;
+    };
+    void commitFiberMerge(StructuralEditCapture capture);
+    void commitFiberSplit(StructuralEditCapture capture);
+    // `committed` is set the moment the disk transaction succeeded, before
+    // any step that allocates, so a caller catching an exception knows
+    // whether "nothing was changed" is still true.
+    StructuralEditOutcome commitStructuralEdit(StructuralEditRequest request, bool* committed);
+    // Entries the current load dropped from stored records (neutralize or
+    // repair): the same entries are removed from open sessions, including
+    // their armed rollback copies, so no session writes a one-way link back.
+    struct DroppedLinkEntry {
+        std::filesystem::path ownerSourceRoot;
+        std::string ownerFileName;
+        std::string targetFileName;
+        cv::Vec3d controlPointPosition{0.0, 0.0, 0.0};
+        cv::Vec3d branchControlPointPosition{0.0, 0.0, 0.0};
+        bool adjacent = false;
+    };
+    static std::vector<DroppedLinkEntry> droppedLinkEntries(
+        const std::vector<StoredFiber>& before, const std::vector<StoredFiber>& after);
+    void dropLinkEntriesFromOpenSessions(const std::vector<DroppedLinkEntry>& dropped);
+    bool structuralEditPreflight(uint64_t packageGeneration, uint64_t loadSequence,
+                                 std::string* error);
+    [[nodiscard]] bool structuralEditParticipantAllowed(const std::filesystem::path& sourceRoot,
+                                                        const std::string& fileName,
+                                                        std::string* error) const;
+    [[nodiscard]] std::optional<std::string> structuralEditStaleLinkOnDisk(
+        const std::vector<StoredFiber>& originals) const;
     // Deduplicates the deferred re-optimization prompt across reentrant
     // fiber (re)loads.
     bool _reoptimizationPromptPending = false;
