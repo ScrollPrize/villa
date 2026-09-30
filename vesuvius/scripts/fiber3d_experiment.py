@@ -260,8 +260,10 @@ def comparison_followup():
 def production_start(config_path=None, resume=None):
     """Start the ordinary adaptive trainer, with no outer exclusive reservation."""
     from villa_gpu_manager.processes import process_identity, process_state
+    production = None
     if config_path is None:
-        config_path = json.loads(CONTROL.read_text())['production']['config']
+        production = json.loads(CONTROL.read_text())['production']
+        config_path = production['config']
     config_path = (ROOT / config_path).resolve()
     config = json.loads(config_path.read_text())
     root = Path(config['training']['run_path']) / '.launches'
@@ -282,8 +284,11 @@ def production_start(config_path=None, resume=None):
     (folder / 'command.json').write_text(json.dumps(command))
     (folder / 'source.txt').write_text(subprocess.check_output(['git','rev-parse','HEAD'], cwd=ROOT,text=True)
         + subprocess.check_output(['git','diff'], cwd=ROOT,text=True))
+    environment = dict(os.environ, PYTHONUNBUFFERED='1')
+    if production is not None and production.get('cuda_visible_devices') is not None:
+        environment['CUDA_VISIBLE_DEVICES'] = str(production['cuda_visible_devices'])
     with (folder / 'train.log').open('w') as log:
-        process = subprocess.Popen(command, cwd=ROOT, env=dict(os.environ, PYTHONUNBUFFERED='1'),
+        process = subprocess.Popen(command, cwd=ROOT, env=environment,
             stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
     identity = process_identity(process.pid)
     (folder / 'controller.json').write_text(json.dumps(identity))

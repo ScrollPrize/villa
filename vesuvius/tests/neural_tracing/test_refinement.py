@@ -374,6 +374,34 @@ def test_independent_piece_uniform_cap_and_free_endpoints():
     np.testing.assert_array_equal(limits,np.full(9,.125))
 
 
+def test_gaussian_surface_normal_uses_inverse_transpose_affine():
+    from types import SimpleNamespace
+    from vesuvius.neural_tracing.fiber_trace_3d.loader import (
+        FiberTrace3DLoader,
+        _Augment3DParams,
+    )
+    loader = FiberTrace3DLoader.__new__(FiberTrace3DLoader)
+    loader.config = SimpleNamespace(patch_shape_zyx=(64, 64, 64))
+    angle = np.deg2rad(37.0)
+    rotation = np.asarray([
+        [1.0, 0.0, 0.0],
+        [0.0, np.cos(angle), -np.sin(angle)],
+        [0.0, np.sin(angle), np.cos(angle)],
+    ])
+    matrix = rotation @ np.diag([-2.0, 0.5, 1.5])
+    params = _Augment3DParams(
+        0, np.full(3, 32.0), np.full(3, 32.0), matrix, np.linalg.inv(matrix),
+        0.0, 1.0, 1.0, 0.0, 0.0, None, 0.0, 0.0, None,
+    )
+    normal = np.asarray([[1.0, 2.0, 3.0]])
+    actual = loader._transform_surface_normals_to_output(
+        np.asarray([[32.0, 32.0, 32.0]]), normal, params
+    )[0]
+    expected = np.linalg.solve(matrix.T, normal[0])
+    expected /= np.linalg.norm(expected)
+    np.testing.assert_allclose(actual, expected, atol=2.0e-6)
+
+
 def test_independent_piece_omits_stitching_segments(monkeypatch, tmp_path):
     from vesuvius.neural_tracing.fiber_trace_3d.arc_sampling import FiberLocation
     loader = make_refining_loader(monkeypatch, tmp_path)
@@ -386,7 +414,7 @@ def test_independent_piece_omits_stitching_segments(monkeypatch, tmp_path):
     all_segments = loader._line_segment_spec(record,loc,params,patch_shape=(32,)*3,radius=1.)
     separate = loader._line_segment_spec(replace(record,label_breaks=(1,3)),loc,params,
                                          patch_shape=(32,)*3,radius=1.)
-    for all_values, actual in zip(all_segments,separate):
+    for all_values, actual in zip(all_segments[:4],separate[:4]):
         np.testing.assert_array_equal(actual,all_values[[0,2]])
 
 

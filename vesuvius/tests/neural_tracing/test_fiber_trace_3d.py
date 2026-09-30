@@ -1277,12 +1277,22 @@ def test_shared_tensor_slots_round_trip_and_reject_stale_generation() -> None:
         patch_shape_zyx=(8, 8, 8),
     )
     raw = loader.load_raw_sample(5)
+    normal = torch.arange(
+        raw.sample.target_segment_starts_zyx.numel(), dtype=torch.float32
+    ).reshape_as(raw.sample.target_segment_starts_zyx)
+    raw = replace(raw, sample=replace(
+        raw.sample,
+        target_segment_normals_zyx=normal,
+        presence_target_mode="anisotropic_gaussian",
+    ))
     payload = slots.encode(5, raw, final=False)
     restored = slots.decode(5, payload, final=False)
     assert torch.equal(restored.sample.volume, raw.sample.volume)
     assert restored.sample.valid_mask is None
     assert restored.sample.volume.data_ptr() == slots.volumes[0].data_ptr()
     assert torch.equal(restored.sample.target_tangent_zyx, raw.sample.target_tangent_zyx)
+    assert torch.equal(restored.sample.target_segment_normals_zyx, normal)
+    assert restored.sample.presence_target_mode == "anisotropic_gaussian"
 
     replacement = loader.load_raw_sample(7)
     slots.encode(7, replacement, final=False)

@@ -160,7 +160,6 @@
     }
   ],
   "training": {
-    "initialize_from": "/ephemeral/hendrik/fiber3d_train2/runs/5scroll_json_eligible_refinement_128_sd1_16x8_ema_20260915_212757/snapshots/best_ema_0p999.pt",
     "checkpoint_interval": 100,
     "device": "auto",
     "direction_weight": 10,
@@ -227,6 +226,6 @@
     "enabled": true,
     "shape_normal_weight": 0.1,
     "shape_tangent_weight": 10.0,
-    "direction_weight": 0.1
+    "direction_weight": 1.0
   }
 }

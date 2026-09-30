@@ -99,9 +99,12 @@ def prepare_settings(config_path, raw, *, socket=None):
             raise ValueError("automatic startup calibration requires configured test_datasets and a positive test_interval")
         from villa_gpu_manager.bootstrap import visible_gpu_uuids
         visible = set(visible_gpu_uuids())
-        if not inventory["gpus"] or visible != set(inventory["gpus"]):
-            raise ValueError("automatic startup calibration requires visibility of all managed GPUs")
-        budget = min(inventory["gpus"].values())
+        managed = set(inventory["gpus"])
+        if not visible or not visible <= managed:
+            raise ValueError(
+                "automatic startup calibration requires a nonempty managed GPU subset"
+            )
+        budget = min(inventory["gpus"][gpu] for gpu in visible)
         reserve = 4 * 1024**3
         if budget <= reserve:
             raise ValueError("managed GPU capacity is too small for startup driver reserve")

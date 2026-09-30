@@ -107,6 +107,9 @@
   "prefetch_sampler_workers": 8,
   "prefetch_workers": 64,
   "presence_radius_voxels": 2,
+  "presence_target_mode": "anisotropic_gaussian",
+  "presence_gaussian_width_ratio": 4,
+  "presence_gaussian_truncate_sigma": 3,
   "round_source_to_chunk_boundaries": true,
   "seed": 0,
   "test_datasets": [
@@ -160,7 +163,7 @@
     }
   ],
   "training": {
-    "resume": "/ephemeral/hendrik/fiber3d_train2/runs/5scroll_json_eligible_fullres_128_sd1_16x8_ema_20260916_192344/snapshots/current.pt",
+    "initialize_from": "/ephemeral/hendrik/fiber3d_train2/runs/5scroll_json_eligible_fullres_refinement_128_sd1_16x8_ema_20260916_213753/snapshots/best_ema_0p999.pt",
     "checkpoint_interval": 100,
     "device": "auto",
     "direction_weight": 10,
@@ -172,7 +175,7 @@
     "max_steps": 2000000,
     "mixed_precision": "bf16",
     "presence_weight": 1,
-    "run_name": "5scroll_json_eligible_fullres_refinement_128_sd1_16x8_ema",
+    "run_name": "5scroll_json_eligible_fullres_refinement_gaussian_128_sd1_16x8_ema",
     "run_path": "/ephemeral/hendrik/fiber3d_train2/runs",
     "sample_vis_interval": 500,
     "scalar_log_interval": 100,

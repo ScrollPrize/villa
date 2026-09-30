@@ -696,12 +696,39 @@ class MacroBatchTargetSource:
             targets = materialize_targets(geometry, self.config, output_stride=self.output_stride)
             indices = targets.direction_indices_bzyx
             if self.conditioned:
-                return targets.presence_target.new_tensor((indices.shape[0] * 12,
-                    torch.unique(indices[:, 0]).numel() * 2, len(batch.volume) * 2)).cpu()
+                direction_count = (
+                    targets.presence_target[
+                        indices[:, 0], 0, indices[:, 1], indices[:, 2], indices[:, 3]
+                    ].sum() * 12
+                    if targets.presence_target_mode == "anisotropic_gaussian"
+                    else targets.presence_target.new_tensor(indices.shape[0] * 12)
+                )
+                return torch.stack((
+                    direction_count,
+                    direction_count.new_tensor(torch.unique(indices[:, 0]).numel() * 2),
+                    direction_count.new_tensor(len(batch.volume) * 2),
+                )).cpu()
+            if targets.presence_target_mode == "anisotropic_gaussian":
+                positive_groups = (targets.presence_target > 0.0).flatten(1).any(dim=1).sum().float()
+                negative_groups = (targets.presence_target == 0.0).flatten(1).any(dim=1).sum().float()
+            else:
+                positive_groups = targets.presence_target.new_tensor(
+                    torch.unique(indices[:, 0]).numel()
+                )
+                negative_groups = (
+                    (targets.presence_target <= 0.5).flatten(1).any(dim=1).sum().float()
+                )
+            direction_count = (
+                targets.presence_target[
+                    indices[:, 0], 0, indices[:, 1], indices[:, 2], indices[:, 3]
+                ].sum() * 6
+                if targets.presence_target_mode == "anisotropic_gaussian"
+                else targets.presence_target.new_tensor(indices.shape[0] * 6)
+            )
             counts = torch.stack((
-                targets.presence_target.new_tensor(indices.shape[0] * 6),
-                targets.presence_target.new_tensor(torch.unique(indices[:, 0]).numel()),
-                (targets.presence_target <= 0.5).flatten(1).any(dim=1).sum().float()))
+                direction_count,
+                positive_groups,
+                negative_groups))
             if self.config.embedding.enabled:
                 from .embedding import embedding_pair_counts
                 counts = torch.cat((counts, counts.new_tensor(embedding_pair_counts(batch))))

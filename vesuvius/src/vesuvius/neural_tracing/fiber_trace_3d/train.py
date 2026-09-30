@@ -1445,12 +1445,23 @@ def compute_losses(
         direction_error = (pred_selected - batch.direction_target_sparse) ** 2
         direction_error = direction_error * batch.direction_weight_sparse
         direction_sum = direction_error.sum()
-        direction_count = direction_error.new_tensor(direction_error.numel())
+        if batch.presence_target_mode == "anisotropic_gaussian":
+            direction_falloff = batch.presence_target[
+                indices[:, 0], 0, indices[:, 1], indices[:, 2], indices[:, 3]
+            ].to(dtype=direction_error.dtype)
+            direction_count = direction_falloff.sum() * int(direction_error.shape[-1])
+        else:
+            direction_falloff = None
+            direction_count = direction_error.new_tensor(direction_error.numel())
         selected_axis = pred_axis[row_index, selected_branch]
         agreement = torch.abs(torch.sum(selected_axis * target_axis, dim=-1)).clamp(0.0, 1.0)
         angle_values = torch.rad2deg(torch.acos(agreement))
-        angle_sum = angle_values.sum()
-        angle_count = angle_values.new_tensor(angle_values.numel())
+        if direction_falloff is None:
+            angle_sum = angle_values.sum()
+            angle_count = angle_values.new_tensor(angle_values.numel())
+        else:
+            angle_sum = (angle_values * direction_falloff).sum()
+            angle_count = direction_falloff.sum()
         selected_presence = pred_presence_sparse[row_index, selected_branch]
         positive_presence_bce = _safe_probability_bce(
             selected_presence.clamp(1.0e-6, 1.0 - 1.0e-6),
@@ -1506,7 +1517,27 @@ def compute_losses(
         branch_count_stat = zero.detach()
 
     presence_target = batch.presence_target.unsqueeze(1).expand_as(pred_presences)
-    negative_mask = presence_target <= 0.5
+    if batch.presence_target_mode == "anisotropic_gaussian":
+        positive_mask = presence_target > 0.0
+        if presence_loss_mask is not None:
+            positive_mask = positive_mask & presence_loss_mask.unsqueeze(1)
+        soft_presence_bce = _safe_probability_bce(
+            pred_presences.clamp(1.0e-6, 1.0 - 1.0e-6),
+            presence_target,
+            reduction="none",
+        )
+        positive_mask_f = positive_mask.to(dtype=soft_presence_bce.dtype)
+        positive_group_sum = (soft_presence_bce * positive_mask_f).sum(
+            dim=(2, 3, 4, 5)
+        ).reshape(-1)
+        positive_group_count = positive_mask_f.sum(dim=(2, 3, 4, 5)).reshape(-1)
+        positive_presence_sum, positive_presence_group_count = _nonempty_group_statistics(
+            positive_group_sum,
+            positive_group_count,
+        )
+        negative_mask = presence_target == 0.0
+    else:
+        negative_mask = presence_target <= 0.5
     if presence_loss_mask is not None:
         negative_mask = negative_mask & presence_loss_mask.unsqueeze(1)
     negative_presence_bce = _safe_probability_bce(
@@ -1640,7 +1671,18 @@ def compute_conditioned_losses(
             device=direction_error.device,
         )[:, None, :]
         direction_sum = direction_error.sum()
-        direction_count = direction_error.new_tensor(direction_error.numel())
+        if batch.presence_target_mode == "anisotropic_gaussian":
+            direction_falloff = batch.presence_target[
+                indices[:, 0], 0, indices[:, 1], indices[:, 2], indices[:, 3]
+            ].to(dtype=direction_error.dtype)
+            direction_count = (
+                direction_falloff.sum()
+                * int(direction_error.shape[1])
+                * int(direction_error.shape[2])
+            )
+        else:
+            direction_falloff = None
+            direction_count = direction_error.new_tensor(direction_error.numel())
         pred_axis = decode_lasagna_direction_3x2_analytic(pred_dirs.reshape(-1, 6)).reshape(
             int(indices.shape[0]),
             positive_query_count,
@@ -1651,8 +1693,12 @@ def compute_conditioned_losses(
             1.0,
         )
         angle_values = torch.rad2deg(torch.acos(agreement))
-        angle_sum = angle_values.sum()
-        angle_count = angle_values.new_tensor(angle_values.numel())
+        if direction_falloff is None:
+            angle_sum = angle_values.sum()
+            angle_count = angle_values.new_tensor(angle_values.numel())
+        else:
+            angle_sum = (angle_values * direction_falloff[:, None]).sum()
+            angle_count = direction_falloff.sum() * int(angle_values.shape[1])
         positive_presence_bce = _safe_probability_bce(
             pred_presence.clamp(1.0e-6, 1.0 - 1.0e-6),
             torch.ones_like(pred_presence),
@@ -2606,6 +2652,7 @@ def _slice_batch(batch: FiberTrace3DBatch, start: int, stop: int) -> FiberTrace3
         if sparse_tangent is not None:
             sparse_tangent = sparse_tangent[sparse_mask]
     return FiberTrace3DBatch(
+        presence_target_mode=batch.presence_target_mode,
         embedding_geometry=None if batch.embedding_geometry is None else batch.embedding_geometry[start:stop],
         refinement_geometry=None if batch.refinement_geometry is None else batch.refinement_geometry[start:stop],
         volume=batch.volume[start:stop],
@@ -2625,6 +2672,9 @@ def _slice_batch(batch: FiberTrace3DBatch, start: int, stop: int) -> FiberTrace3
         target_segment_bbox_lo_zyx=batch.target_segment_bbox_lo_zyx[segment_start:segment_stop],
         target_segment_bbox_hi_zyx=batch.target_segment_bbox_hi_zyx[segment_start:segment_stop],
         target_tangent_zyx=batch.target_tangent_zyx[start:stop],
+        target_segment_normals_zyx=None
+        if batch.target_segment_normals_zyx is None
+        else batch.target_segment_normals_zyx[segment_start:segment_stop],
         direction_target=None
         if batch.direction_target is None
         else batch.direction_target[start:stop],

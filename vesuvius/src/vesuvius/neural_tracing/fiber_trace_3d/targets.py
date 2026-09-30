@@ -199,6 +199,110 @@ def _materialize_dense_line_indices(
     )
 
 
+def _materialize_anisotropic_gaussian_presence(
+    *,
+    batch: FiberTrace3DBatch,
+    config: FiberTrace3DConfig,
+    patch_shape: tuple[int, int, int],
+    coordinate_scale: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Rasterize a soft tube in the local fiber/sheet frame.
+
+    The local surface normal is the thickness axis. The in-sheet axis
+    perpendicular to the segment is the width axis. Finite segment caps use
+    the width sigma so adjacent segments join without a hard endpoint seam.
+    """
+
+    if batch.target_segment_normals_zyx is None:
+        raise ValueError("anisotropic Gaussian presence targets require segment normals")
+    device = batch.volume.device
+    starts = batch.target_segment_starts_zyx.to(device=device, dtype=torch.float32)
+    ends = batch.target_segment_ends_zyx.to(device=device, dtype=torch.float32)
+    normals = batch.target_segment_normals_zyx.to(device=device, dtype=torch.float32)
+    if starts.shape != ends.shape or starts.shape != normals.shape:
+        raise ValueError("Gaussian segment starts/ends/normals must have matching shapes")
+    counts_cpu = batch.target_segment_counts.to(device="cpu", dtype=torch.long)
+    sample_ids_cpu = torch.repeat_interleave(
+        torch.arange(int(batch.volume.shape[0]), dtype=torch.long), counts_cpu
+    )
+    dense_cpu = batch.target_modes.to(device="cpu")[sample_ids_cpu] == _TARGET_MODE_DENSE_LINE
+    selected_cpu = torch.nonzero(dense_cpu, as_tuple=False).flatten()
+    selected = selected_cpu.to(device=device)
+    starts, ends, normals = (value[selected] for value in (starts, ends, normals))
+    sample_ids_cpu = sample_ids_cpu[selected_cpu]
+    bbox_lo_cpu = batch.target_segment_bbox_lo_zyx.to(device="cpu", dtype=torch.long)[selected_cpu]
+    bbox_hi_cpu = batch.target_segment_bbox_hi_zyx.to(device="cpu", dtype=torch.long)[selected_cpu]
+    if int(dense_cpu.shape[0]) != int(batch.target_segment_starts_zyx.shape[0]):
+        raise ValueError("Gaussian segment metadata count mismatch")
+    target = torch.zeros(
+        (int(batch.volume.shape[0]), *patch_shape), dtype=torch.float32, device=device
+    )
+    tangent_target = torch.zeros(
+        (int(batch.volume.shape[0]), *patch_shape, 3), dtype=torch.float32, device=device
+    )
+    if int(starts.shape[0]) == 0:
+        empty_indices = torch.zeros((0, 4), dtype=torch.long, device=device)
+        empty_tangents = torch.zeros((0, 3), dtype=torch.float32, device=device)
+        empty_weights = torch.zeros((0,), dtype=torch.float32, device=device)
+        return target, empty_indices, empty_tangents, empty_weights
+
+    scale = float(coordinate_scale)
+    starts = starts / scale
+    ends = ends / scale
+    bbox_lo_cpu = torch.div(bbox_lo_cpu, int(coordinate_scale), rounding_mode="floor")
+    bbox_hi_cpu = torch.div(
+        bbox_hi_cpu + int(coordinate_scale) - 1,
+        int(coordinate_scale),
+        rounding_mode="floor",
+    )
+    sigma_thickness = float(config.presence_radius_voxels) / scale
+    sigma_width = sigma_thickness * float(config.presence_gaussian_width_ratio)
+    cutoff2 = float(config.presence_gaussian_truncate_sigma) ** 2
+    grid = _zyx_grid(patch_shape, device=device, dtype=torch.float32)
+    for segment in range(int(starts.shape[0])):
+        lo = tuple(max(0, int(bbox_lo_cpu[segment, axis])) for axis in range(3))
+        hi = tuple(min(patch_shape[axis], int(bbox_hi_cpu[segment, axis])) for axis in range(3))
+        if any(hi[axis] <= lo[axis] for axis in range(3)):
+            continue
+        p0, p1 = starts[segment], ends[segment]
+        vector = p1 - p0
+        length = torch.linalg.vector_norm(vector).clamp_min(1.0e-6)
+        tangent = vector / length
+        normal = normals[segment] - torch.dot(normals[segment], tangent) * tangent
+        normal = normal / torch.linalg.vector_norm(normal).clamp_min(1.0e-6)
+        width = torch.linalg.cross(tangent, normal, dim=0)
+        width = width / torch.linalg.vector_norm(width).clamp_min(1.0e-6)
+        slices = tuple(slice(lo[axis], hi[axis]) for axis in range(3))
+        coordinates = grid[slices]
+        from_start = coordinates - p0
+        along = torch.minimum(
+            torch.sum(from_start * tangent, dim=-1).clamp_min(0.0),
+            length,
+        )
+        delta = coordinates - (p0 + along.unsqueeze(-1) * tangent)
+        standardized2 = (
+            (torch.sum(delta * normal, dim=-1) / sigma_thickness) ** 2
+            + (torch.sum(delta * width, dim=-1) / sigma_width) ** 2
+            + (torch.sum(delta * tangent, dim=-1) / sigma_width) ** 2
+        )
+        probability = torch.where(
+            standardized2 <= cutoff2,
+            torch.exp(-0.5 * standardized2),
+            torch.zeros_like(standardized2),
+        )
+        sample = int(sample_ids_cpu[segment])
+        current = target[sample][slices]
+        replace = probability > current
+        target[sample][slices] = torch.where(replace, probability, current)
+        tangent_view = tangent_target[sample][slices]
+        tangent_target[sample][slices] = torch.where(
+            replace.unsqueeze(-1), tangent.view(1, 1, 1, 3), tangent_view
+        )
+    support = target > 0.0
+    indices_bzyx = torch.nonzero(support, as_tuple=False).to(dtype=torch.long)
+    return target, indices_bzyx, tangent_target[support], target[support]
+
+
 def _materialize_coarse_cp_only_sample(
     *,
     batch: FiberTrace3DBatch,
@@ -303,7 +407,7 @@ def materialize_targets(
         coordinate_scale=output_stride,
         input_shape=input_shape,
     )
-    if int(line_indices.shape[0]) > 0:
+    if int(line_indices.shape[0]) > 0 and config.presence_target_mode != "anisotropic_gaussian":
         direction_indices.append(line_indices)
         direction_tangents.append(line_tangents)
     if profile:
@@ -349,7 +453,21 @@ def materialize_targets(
         timings["target_cp_index_ms"] = (time.perf_counter() - cp_start) * 1000.0
         timings["target_cp_points"] = float(cp_direction_points)
     scatter_start = time.perf_counter()
-    presence_target = positive.to(dtype=torch.float32).view(
+    if config.presence_target_mode == "anisotropic_gaussian":
+        presence, gaussian_indices, gaussian_tangents, gaussian_falloff = _materialize_anisotropic_gaussian_presence(
+            batch=geometry_batch,
+            config=config,
+            patch_shape=patch_shape,
+            coordinate_scale=output_stride,
+        )
+        if direction_indices:
+            raise ValueError("Gaussian direction support currently requires dense-line-only batches")
+        direction_indices.append(gaussian_indices)
+        direction_tangents.append(gaussian_tangents)
+    else:
+        presence = positive.to(dtype=torch.float32)
+        gaussian_falloff = None
+    presence_target = presence.view(
         int(batch.volume.shape[0]),
         1,
         *patch_shape,
@@ -370,6 +488,10 @@ def materialize_targets(
         tangent_xyz = tangents_zyx[:, [2, 1, 0]]
         direction_target_sparse = encode_lasagna_direction_3x2(tangent_xyz)
         direction_weight_sparse = projection_magnitude_weights_3x2(tangent_xyz)
+        if gaussian_falloff is not None:
+            if int(gaussian_falloff.shape[0]) != int(direction_weight_sparse.shape[0]):
+                raise ValueError("Gaussian direction falloff count mismatch")
+            direction_weight_sparse = direction_weight_sparse * gaussian_falloff[:, None]
     else:
         indices_bzyx = torch.zeros((0, 4), dtype=torch.long, device=device)
         tangents_zyx = torch.zeros((0, 3), dtype=torch.float32, device=device)

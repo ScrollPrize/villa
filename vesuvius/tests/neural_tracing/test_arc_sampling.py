@@ -1,6 +1,7 @@
 from collections import Counter
 from dataclasses import replace
 import json
+import math
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,7 +17,9 @@ from vesuvius.neural_tracing.fiber_trace_3d.loader import (
     _TARGET_MODE_CP_ONLY, _TARGET_MODE_DENSE_LINE,
 )
 from vesuvius.neural_tracing.fiber_trace_3d.targets import materialize_targets
+from vesuvius.neural_tracing.fiber_trace_3d.sample_pipeline import MacroBatchTargetSource
 from vesuvius.neural_tracing.fiber_trace_3d.train import (
+    compute_losses,
     _make_test_loader_raw_config, _resolve_dense_test_selection,
 )
 
@@ -204,6 +207,123 @@ def test_dense_json_supervises_only_selected_line_and_matches_nml(stride):
     assert torch.equal(batch.direction_indices_bzyx, reference.direction_indices_bzyx)
     assert batch.presence_target.sum() >= 16 // stride
     assert batch.presence_target.sum() < (16 // stride) ** 2
+
+
+def _gaussian_line_batch(*, stride=1):
+    loader = make_loader()
+    raw = loader.load_batch(0, sample_mode="flat")
+    shift = torch.round(raw.cp_local_zyx[0]) - raw.cp_local_zyx[0]
+    normals = torch.zeros_like(raw.target_segment_starts_zyx)
+    normals[:, 0] = 1.0  # Surface-normal thickness is output Z.
+    shape = torch.tensor(loader.config.patch_shape_zyx)
+    raw = replace(
+        raw,
+        cp_local_zyx=raw.cp_local_zyx + shift,
+        target_segment_starts_zyx=raw.target_segment_starts_zyx + shift,
+        target_segment_ends_zyx=raw.target_segment_ends_zyx + shift,
+        target_segment_normals_zyx=normals,
+        target_segment_bbox_lo_zyx=torch.zeros_like(raw.target_segment_bbox_lo_zyx),
+        target_segment_bbox_hi_zyx=shape.view(1, 3).expand_as(raw.target_segment_bbox_hi_zyx),
+        presence_target_mode="anisotropic_gaussian",
+    )
+    config = replace(
+        loader.config,
+        presence_target_mode="anisotropic_gaussian",
+        presence_radius_voxels=1.0,
+        presence_gaussian_width_ratio=4.0,
+        presence_gaussian_truncate_sigma=3.0,
+    )
+    return raw, config, materialize_targets(raw, config, output_stride=stride)
+
+
+def test_anisotropic_gaussian_presence_has_four_to_one_local_sigma():
+    stride = 1
+    raw, config, batch = _gaussian_line_batch(stride=stride)
+    target = batch.presence_target[0, 0]
+    center = torch.round(raw.cp_local_zyx[0] / stride).long()
+    assert target[tuple(center)] == pytest.approx(1.0)
+    thickness_step = max(1, round(config.presence_radius_voxels / stride))
+    width_step = max(1, round(4 * config.presence_radius_voxels / stride))
+    z = center.clone(); z[0] += thickness_step
+    y = center.clone(); y[1] += width_step
+    assert target[tuple(z)] == pytest.approx(target[tuple(y)], abs=2.0e-5)
+    assert 0.4 < float(target[tuple(z)]) < 0.8
+    support_indices = torch.nonzero(target > 0.0, as_tuple=False)
+    assert torch.equal(batch.direction_indices_bzyx[:, 1:], support_indices)
+    assert int(batch.direction_indices_bzyx.shape[0]) > int(
+        materialize_targets(
+            raw, replace(config, presence_target_mode="binary"), output_stride=stride
+        ).direction_indices_bzyx.shape[0]
+    )
+    center_row = torch.nonzero(
+        (batch.direction_indices_bzyx[:, 1:] == center).all(dim=1), as_tuple=False
+    ).item()
+    z_row = torch.nonzero(
+        (batch.direction_indices_bzyx[:, 1:] == z).all(dim=1), as_tuple=False
+    ).item()
+    center_weight = batch.direction_weight_sparse[center_row].sum()
+    z_weight = batch.direction_weight_sparse[z_row].sum()
+    assert z_weight / center_weight == pytest.approx(float(target[tuple(z)]), abs=2.0e-5)
+
+
+def test_anisotropic_gaussian_uses_input_voxel_units_at_stride_four():
+    raw, config, batch = _gaussian_line_batch(stride=4)
+    target = batch.presence_target[0, 0]
+    center = torch.round(raw.cp_local_zyx[0] / 4).long()
+    width = center.clone(); width[1] += 1
+    thickness = center.clone(); thickness[0] += 1
+    assert target[tuple(center)] == pytest.approx(1.0)
+    assert target[tuple(width)] == pytest.approx(math.exp(-0.5), abs=2.0e-5)
+    assert target[tuple(thickness)] == 0.0
+
+
+def test_anisotropic_gaussian_tail_is_soft_positive_and_cutoff_is_zero():
+    _raw, _config, batch = _gaussian_line_batch()
+    center = torch.round(batch.cp_local_zyx[0]).long()
+    tail = center.clone(); tail[0] += 2
+    outside = center.clone(); outside[0] += 4
+    assert 0.0 < float(batch.presence_target[(0, 0, *tail)]) < 0.5
+    assert batch.presence_target[(0, 0, *outside)] == 0.0
+    output = torch.full((1, 7, *batch.presence_target.shape[-3:]), 0.5, requires_grad=True)
+    output.data[(0, 6, *tail)] = 0.01
+    loss = compute_losses(output, batch, direction_weight=0, presence_weight=1)["total"]
+    loss.backward()
+    assert output.grad[(0, 6, *tail)] < 0  # Soft tail pulls upward, not toward hard zero.
+
+
+def test_anisotropic_gaussian_normal_sign_is_irrelevant():
+    raw, config, positive = _gaussian_line_batch()
+    negative = materialize_targets(
+        replace(raw, target_segment_normals_zyx=-raw.target_segment_normals_zyx),
+        config,
+    )
+    torch.testing.assert_close(positive.presence_target, negative.presence_target, rtol=0, atol=0)
+
+
+def test_anisotropic_gaussian_target_prepass_counts_match_loss_groups():
+    raw, config, batch = _gaussian_line_batch()
+    source = MacroBatchTargetSource(
+        None,
+        config=config,
+        device=torch.device("cpu"),
+        output_stride=1,
+        batch_sizes=[1],
+    )
+    counts = source._counts(raw)
+    output = torch.full((1, 7, *batch.presence_target.shape[-3:]), 0.5)
+    statistics = compute_losses(
+        output,
+        batch,
+        direction_weight=1,
+        presence_weight=1,
+        _return_statistics=True,
+    )
+    actual = torch.stack((
+        statistics.direction_count,
+        statistics.positive_presence_count,
+        statistics.negative_presence_count,
+    )).cpu()
+    torch.testing.assert_close(counts, actual, rtol=0, atol=0)
 
 
 def test_whole_selected_line_reentering_patch_remains_positive():
