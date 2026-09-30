@@ -114,3 +114,13 @@
   without loading or reporting any sample and synchronizes outstanding CUDA
   work before the following NCCL object collective; every real test batch
   remains on the central queue.
+- Per-rank boundary logging showed all padding forwards completed, but only the
+  real rank reached refinement `gather_object`; empty ranks stalled in generic
+  proposal preparation. Added an explicit empty-participant flush which asserts
+  no retained observations and enters the matching gather/barrier directly.
+  The six-GPU production validation then completed final batch 120:120 (two
+  committed patches), reported update-18000 test loss 0.898774 and EMA-0.999
+  loss 0.881731, completed real startup calibration through update 18,012 and
+  microbatch 8, saved calibration fingerprint `b0271f...b1724`, and registered
+  its adaptive continuation. Temporary boundary logging was removed after
+  validation. Active run directory ends in `20260930_155132`.

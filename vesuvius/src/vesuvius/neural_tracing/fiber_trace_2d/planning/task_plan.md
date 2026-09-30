@@ -69,12 +69,11 @@
     Preserve the former aggregate positive/negative scale with coefficients
     1/0.5/0.5, carry the additional target-only count through the one-backward
     accumulator, and expose each component as a metric.
-13. Keep distributed test forward/collective parity in partial final waves by
-    assigning distinct deterministic batches to otherwise idle ranks and
-    running metric-free local parity forwards when the final real batch has
-    fewer physical microbatches. Since very small test sets can still require
-    duplicate samples, make broker test leases reference-counted and release
-    the shared queue ticket only after the final reader completes.
+13. Keep distributed test forward/collective parity in partial final waves with
+    shape-correct metric-free local forwards, explicit CUDA synchronization,
+    and a direct empty-participant refinement gather/barrier. Never replay a
+    consumed central-queue ticket. Retain reference-counted broker leases as a
+    transport invariant for legitimate concurrent readers.
 
 ## Spec update
 
