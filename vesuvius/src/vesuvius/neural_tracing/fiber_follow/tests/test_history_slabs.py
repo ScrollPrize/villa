@@ -269,3 +269,43 @@ def test_cuda_bf16_masks_and_compiled_repeated_updates():
             assert metrics['history_grad_norm']>0
         else:
             assert metrics['history_grad_norm']==0
+
+
+@pytest.mark.parametrize('device', ['cpu', 'cuda'])
+def test_cached_history_attention_matches_mha_and_reuses_attached_projections(device):
+    if device == 'cuda' and not torch.cuda.is_available():
+        pytest.skip('CUDA unavailable')
+    from vesuvius.neural_tracing.fiber_follow.regression.history_slabs import HistoryAttention
+    torch.manual_seed(91)
+    dtype = torch.float32 if device == 'cuda' else torch.float64
+    original = HistoryAttention(32, 4).to(device=device, dtype=dtype)
+    cached = copy.deepcopy(original)
+    query = torch.randn(3, 4, 32, device=device, dtype=dtype)
+    tokens = torch.randn(3, 162, 32, device=device, dtype=dtype)
+    padding = torch.zeros(3, 162, device=device, dtype=torch.bool)
+    padding[1, 80:] = True
+    padding[2] = True
+    tokens[2] = 0.
+    outputs, gradients = [], []
+    for model, use_cache in ((original, False), (cached, True)):
+        q, t = query.clone().requires_grad_(), tokens.clone().requires_grad_()
+        with torch.autocast(device, dtype=torch.bfloat16, enabled=device == 'cuda'):
+            if use_cache:
+                projected = model.project_memory(t, padding)
+            for _ in range(3):
+                if use_cache:
+                    q = model.forward_cached(q, *projected)
+                else:
+                    empty = padding.all(-1)
+                    value = model.attention(model.norm(q), t, t,
+                        key_padding_mask=padding & ~empty[:, None], need_weights=False)[0]
+                    q = q+torch.where(empty[:, None, None], 0., value)
+        q.square().mean().backward()
+        outputs.append(q.detach())
+        gradients.append((t.grad, *(p.grad for p in model.parameters())))
+        assert t.grad[padding].eq(0).all()
+        torch.testing.assert_close(q[2], query[2], rtol=0, atol=0)
+    rtol, atol = (.03, .002) if device == 'cuda' else (1e-9, 1e-10)
+    torch.testing.assert_close(*outputs, rtol=rtol, atol=atol)
+    for a, b in zip(*gradients):
+        torch.testing.assert_close(a, b, rtol=rtol, atol=atol)

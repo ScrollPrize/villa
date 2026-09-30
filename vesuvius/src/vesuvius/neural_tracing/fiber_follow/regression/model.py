@@ -207,6 +207,14 @@ class DepthwiseConv3d(nn.Conv3d):
         return self._conv_forward(x.contiguous(), weight, self.bias)
 
 
+def project_attention_memory(attn, memory):
+    """Differentiable K/V with the parameter layout of MultiheadAttention."""
+    width, heads = attn.embed_dim, attn.num_heads
+    kv = F.linear(memory, attn.in_proj_weight[width:], attn.in_proj_bias[width:])
+    return tuple(value.reshape(len(memory), -1, heads, width//heads).transpose(1, 2).contiguous()
+                 for value in kv.chunk(2, dim=-1))
+
+
 class PathDecoderLayer(nn.TransformerDecoderLayer):
     """Prefer cuDNN for short queries over long, padding-masked image memory."""
     def attention_backend(self, tensor):
@@ -220,47 +228,19 @@ class PathDecoderLayer(nn.TransformerDecoderLayer):
 
     def project_memory(self, memory):
         """Differentiable per-decision K/V; never retained across model forwards."""
-        attn = self.multihead_attn
-        h, heads = attn.embed_dim, attn.num_heads
-        kv = F.linear(memory, attn.in_proj_weight[h:], attn.in_proj_bias[h:])
-        return tuple(v.reshape(len(memory), -1, heads, h//heads).transpose(1, 2).contiguous()
-                     for v in kv.chunk(2, dim=-1))
-
-    def compact_memory(self, kv, padding):
-        """Gather valid CUDA keys once per decision, before any path attempts."""
-        if not kv[0].is_cuda or kv[0].dtype not in (torch.float16, torch.bfloat16):
-            return kv
-        rows = []
-        for row in range(kv[0].shape[0]):
-            keep = (~padding[row]).nonzero().flatten()
-            torch._check(keep.numel() > 0)
-            rows.append(tuple(v[row:row+1].index_select(2, keep) for v in kv))
-        return tuple(rows)
+        return project_attention_memory(self.multihead_attn, memory)
 
     @staticmethod
     def select_memory(projected, keep):
-        """Select active inference rows from dense or variable-length cached K/V."""
-        if isinstance(projected[0][0], tuple):
-            rows = keep.tolist()
-            return [tuple(kv[i] for i in rows) for kv in projected]
+        """Select active inference rows from per-decision K/V."""
         return [tuple(v[keep] for v in kv) for kv in projected]
 
     def attend_memory(self, q, kv, padding):
-        """Reuse compacted CUDA K/V with unmasked Flash attention.
+        """Batched SDPA with a broadcast key mask and fixed-size K/V.
 
-        The mask is key padding only: removing keys preserves softmax and
-        leaves query order (including causal candidate self-attention) intact.
-        Image/plane tokens guarantee at least one valid key in every row.
-        Other backends remain available on devices without Flash support.
+        cuDNN handles the short-query/long-memory case without per-row gathers
+        or data-dependent key counts. Keep the mask compact, never BxHxQxK.
         """
-        if isinstance(kv[0], tuple):
-            values = []
-            for row, (k, v) in enumerate(kv):
-                with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.CUDNN_ATTENTION,
-                                  SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH], set_priority=True):
-                    values.append(F.scaled_dot_product_attention(q[row:row+1].contiguous(),
-                        k, v))
-            return torch.cat(values, 0)
         mask = torch.zeros(padding.shape, device=q.device, dtype=q.dtype).masked_fill(padding, -torch.inf)
         with self.attention_backend(q):
             return F.scaled_dot_product_attention(q, *kv, attn_mask=mask[:, None, None, :])
@@ -278,7 +258,7 @@ class PathDecoderLayer(nn.TransformerDecoderLayer):
         value = value.transpose(1, 2).contiguous().reshape(len(x), -1, h)
         x = x+self.dropout2(attn.out_proj(value))
         if history is not None:
-            x = history_attention(x, *history)
+            x = history_attention.forward_cached(x, *history)
         return x+self._ff_block(self.norm3(x))
 
 
@@ -352,7 +332,7 @@ class AxialEncoder(nn.Module):
         return rendered.reshape(len(points),d,y,x,3)
 
     def encode(self, image, references, mask):
-        """Independent observation features, before any persistent-memory read."""
+        """Encode the current observation and its local path conditioning."""
         fine = self.stem(image)
         down = self.down(fine)
         down = F.pad(down,(0,0,0,0,0,(-down.shape[2])%4))
@@ -518,13 +498,15 @@ class DirectFollower(nn.Module):
 
     def context(self, x, hist, hmask):
         references, mask = self.references(x, hist, hmask)
-        stem, deep = self.encoder.encode(x['fine'], references, mask)
-        dense = self.encoder.decode(stem, deep)
+        dense, deep, _ = self.encoder(x['fine'], references, mask)
         ctx = self.context_from_features(x, hist, references, mask, dense, deep)
         if 'history_tokens' in x:
             ctx['history_tokens'], ctx['history_padding'] = x['history_tokens'], x['history_padding']
         else:
             ctx['history_tokens'], ctx['history_padding'] = self.encode_history(x)
+        history = (ctx['history_tokens'], ctx['history_padding'])
+        ctx['history_projected'] = self.history_attention.project_memory(*history)
+        ctx['confidence_history_projected'] = self.confidence_scorer.history_attention.project_memory(*history)
         return ctx
 
     def forward(self, x, hist, hmask, candidates=None,
@@ -548,7 +530,7 @@ class DirectFollower(nn.Module):
         spatial = spatial.reshape(*samples.shape[:3], -1)
         return self.confidence_scorer(spatial, points,
                                      ctx['confidence_projected'], ctx['confidence_padding'],
-                                     (ctx['history_tokens'], ctx['history_padding']))
+                                     ctx['confidence_history_projected'])
 
     def predict(self, ctx, hist, candidates=None, confidence_threshold=DEFAULT_CONFIDENCE):
         decoded, points, projected, padding = self.prepare_prediction(ctx, hist)
@@ -566,7 +548,7 @@ class DirectFollower(nn.Module):
         reference[..., 2] = self.planes
         query = self.query(self.query_features(ctx, reference))
         # Attached features and image projections are reused for this decision.
-        projected = [layer.compact_memory(layer.project_memory(memory), padding)
+        projected = [layer.project_memory(memory)
                      for layer in self.decoder.layers]
         decoded = self.decode_cached(query, projected, padding, ctx)
         points = self.decode_coordinates(decoded)
@@ -631,7 +613,9 @@ class DirectFollower(nn.Module):
                 active_ctx = {key: active_ctx[key][keep] for key in
                               ('fine', 'deep', 'fine_fp32', 'deep_fp32', 'confidence_padding',
                                'history_tokens', 'history_padding')} | dict(
-                    confidence_projected=PathDecoderLayer.select_memory(active_ctx['confidence_projected'], keep))
+                    confidence_projected=PathDecoderLayer.select_memory(active_ctx['confidence_projected'], keep),
+                    history_projected=tuple(v[keep] for v in active_ctx['history_projected']),
+                    confidence_history_projected=tuple(v[keep] for v in active_ctx['confidence_history_projected']))
             decoded, points = self.refine_prediction(active_ctx, points, decoded, hazards, confidence,
                 projected, padding, self.refinement_stage.weight[stage])
             refinements.append(refinements[-1].index_copy(0, indices, points))
@@ -701,7 +685,7 @@ class DirectFollower(nn.Module):
             valid.append(active)
         out = self.proposal_output(initial, refinements, scores, valid)
         score_context = {key: ctx[key] for key in
-                         ('fine', 'deep', 'confidence_projected', 'confidence_padding', 'history_tokens', 'history_padding')}
+                         ('fine', 'deep', 'confidence_projected', 'confidence_padding', 'confidence_history_projected')}
         if self.cfg.recurrent_refinement_steps:
             score_context.update(fine_fp32=ctx['fine_fp32'], deep_fp32=ctx['deep_fp32'])
         return out, score_context
@@ -709,5 +693,5 @@ class DirectFollower(nn.Module):
     def decode_cached(self, query, projected, padding, ctx):
         for layer, kv in zip(self.decoder.layers, projected):
             query = layer.forward_cached(query, kv, padding,
-                history=(ctx['history_tokens'], ctx['history_padding']), history_attention=self.history_attention)
+                history=ctx['history_projected'], history_attention=self.history_attention)
         return self.decoder.norm(query)

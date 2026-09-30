@@ -53,28 +53,47 @@ def synthetic_decisions(cfg, count=6, seed=194, ages=None):
     return rows
 
 
+def decision_microbatches(rows, size):
+    """Group synthetic decisions; absent candidates receive zero supervision."""
+    if size < 1:
+        raise ValueError('Positive microbatch size required')
+
+    def combine(group):
+        output = {}
+        for key in sorted(set().union(*(row.keys() for row in group))):
+            example = next(row[key] for row in group if key in row)
+            output[key] = (combine([row[key] for row in group]) if isinstance(example, dict)
+                           else torch.cat([row[key] if key in row else torch.zeros_like(example)
+                                           for row in group]))
+        return output
+
+    return [combine(rows[i:i+size]) for i in range(0, len(rows), size)]
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--out', type=Path, required=True)
     ap.add_argument('--warmup', type=int, default=2)
     ap.add_argument('--repeats', type=int, default=3)
     ap.add_argument('--decisions', type=int, default=6)
+    ap.add_argument('--microbatch', type=int, default=1)
     ap.add_argument('--seed', type=int, default=194)
     ap.add_argument('--ages', type=float, nargs='+', help='Observed lengths; default matches six baseline decision ages')
     ap.add_argument('--encoder', choices=('conv', 'patch4'), default='patch4')
     ap.add_argument('--token-only', action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument('--device', default='cuda')
     args = ap.parse_args()
-    if args.out.exists() or min(args.decisions, args.repeats, args.warmup) < 1:
+    if args.out.exists() or min(args.decisions, args.microbatch, args.repeats, args.warmup) < 1:
         ap.error('Need a fresh output path and positive dimensions')
     torch.set_num_threads(4)
     torch.manual_seed(args.seed)
     cfg = DirectConfig(direction_inputs=True, encoder=args.encoder, token_only=args.token_only)
-    batches = synthetic_decisions(cfg, args.decisions, args.seed, args.ages)
+    decisions = synthetic_decisions(cfg, args.decisions, args.seed, args.ages)
+    batches = decision_microbatches(decisions, args.microbatch)
     model = build_model(cfg).to(args.device, memory_format=conv_memory_format(args.device))
     ema = copy.deepcopy(model).requires_grad_(False).eval()
     opt = torch.optim.AdamW(model.parameters(), lr=.0003, weight_decay=1e-4)
-    prepare_training(model, 1)
+    prepare_training(model, args.microbatch)
     from torch._dynamo.utils import counters
     rows = []
     cuda = torch.device(args.device).type == 'cuda'
@@ -103,7 +122,7 @@ def main():
         parameters=sum(p.numel() for p in model.parameters()),
         history_parameters=sum(p.numel() for p in model.history_encoder.parameters()),
         input='Synthetic full-size current crops and live CT/path slabs; no volume I/O',
-        ages=[float(b['x']['history_ages'][0,0]) for b in batches],
+        ages=[float(b['x']['history_ages'][0,0]) for b in decisions], microbatch=args.microbatch,
         warmup=args.warmup, measured=len(measured), mean_ms=float(np.mean(times)),
         p50_ms=float(np.median(times)), p95_ms=float(np.percentile(times, 95)),
         decisions_per_second=1000*sum(r['supervised_states'] for r in measured)/sum(times),

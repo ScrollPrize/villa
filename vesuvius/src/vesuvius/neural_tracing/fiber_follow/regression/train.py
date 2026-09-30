@@ -27,7 +27,7 @@ from vesuvius.neural_tracing.fiber_follow.regression.model import (
 from vesuvius.neural_tracing.fiber_follow.regression.data import (
     IdentityObservationBuilder, IdentitySampling, DirectTracer, LOCATION_SOURCES,
 )
-from vesuvius.neural_tracing.fiber_follow.regression.supervision import commit_window, loss_terms, weighted_state_sum
+from vesuvius.neural_tracing.fiber_follow.regression.supervision import commit_window, loss_terms
 from vesuvius.neural_tracing.fiber_follow.regression.diagnostics import (
     decision_rows, summarize_decisions,
     candidate_decisions, summarize_candidates,
@@ -76,18 +76,17 @@ def prepare_training(model, batch_size=2, *, backend=None):
         return model
     if batch_size < 1:
         raise ValueError('Positive training batch size required')
-    import torch._inductor.config
-    import torch._dynamo.config
-    # Required by the existing BF16 gradient regression on Torch 2.12.
-    torch._inductor.config.emulate_precision_casts = True
-    torch._dynamo.config.capture_dynamic_output_shape_ops = True
     options = dict(dynamic=False, fullgraph=True)
+    # Keep eager BF16 rounding without changing global compiler configuration.
+    if backend is None or backend == 'inductor':
+        options['options'] = dict(emulate_precision_casts=True)
     if backend is not None:
         options['backend'] = backend
     model.training_batch_size = batch_size
     model._training_refined = None
     model.training_forward = torch.compile(model.training_forward, **options)
     model.score_candidates = torch.compile(model.score_candidates, **options)
+    model.training_loss = torch.compile(loss_terms, **options)
     return model
 
 
@@ -97,6 +96,13 @@ def fixed_rows(value, size):
         raise ValueError(f'Expected 1..{size} rows, got {len(value)}')
     if len(value) < size:
         value = torch.cat((value, value[:1].expand(size-len(value), *value.shape[1:])))
+    stride = 1
+    canonical = []
+    for extent in reversed(value.shape):
+        canonical.append(stride)
+        stride *= max(1, extent)
+    if value.stride() == tuple(reversed(canonical)):
+        return value
     # Singleton dimensions can otherwise retain the stride of an indexed view.
     return torch.empty_like(value, memory_format=torch.contiguous_format).copy_(value)
 
@@ -126,8 +132,7 @@ def finish_training_update(model):
 
 def training_prediction(model, x, hist, hmask, candidates=None, confidence_threshold=.5, n_commit=None):
     actual = len(hist)
-    # Replay endpoints are single crops. Computing a duplicate second row
-    # also duplicates the encoder, proposals and candidate-scoring work.
+    # A single decision needs no duplicate encoder, proposal or scoring work.
     # Keep only two batch specializations: one row or the configured batch.
     size = 1 if actual == 1 else model.training_batch_size
     # Compact live slabs before the fixed-shape compiled decision graph.
@@ -150,13 +155,6 @@ def training_prediction(model, x, hist, hmask, candidates=None, confidence_thres
         curves = candidates.detach()
         if count < CANDIDATE_COUNT:
             curves = torch.cat((curves, curves[:, :1].expand(-1, CANDIDATE_COUNT-count, -1, -1)), 1)
-        # Compacted CUDA K/V have a different key count as history grows. Keep
-        # the separate candidate graph reusable across these decision contexts.
-        if isinstance(context['confidence_projected'][0][0], tuple):
-            for layer in context['confidence_projected']:
-                for row in layer:
-                    for value in row:
-                        torch._dynamo.mark_dynamic(value, 2)
         scored = model.score_candidates(context, fixed_rows(curves, size))
         output.update({name: value[:, :count] for name, value in scored.items()})
     output = {name: value[:actual] for name, value in output.items()}
@@ -408,7 +406,7 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
         with torch.autocast('cuda', dtype=torch.bfloat16, enabled=torch.device(device).type == 'cuda'):
             output = training_prediction(model, batch['x'], batch['hist'], batch['hmask'],
                            n_commit=commit_window(model.cfg, n_commit), **scoring)
-            terms = loss_terms(output, batch, model.cfg, tolerance, n_commit=n_commit)
+            terms = model.training_loss(output, batch, model.cfg, tolerance, n_commit=n_commit)
             geometry = terms['geometry_per_state'].sum()/denominator
             confidence = terms['confidence_per_state'].sum()/denominator
             loss = geometry + confidence_weight*confidence

@@ -41,7 +41,7 @@ def test_token_sampling_uses_patch_centers_and_crop_support():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA unavailable')
-def test_compacted_attention_matches_masked_values_gradients_and_reuses_storage():
+def test_cached_attention_matches_unprojected_values_gradients_and_reuses_storage():
     torch.manual_seed(273)
     layer = PathDecoderLayer(32,4,64,dropout=0.,batch_first=True,norm_first=True).cuda()
     reference = copy.deepcopy(layer)
@@ -52,17 +52,17 @@ def test_compacted_attention_matches_masked_values_gradients_and_reuses_storage(
     padding[0,19:] = True
     padding[1,7:13] = True
     with torch.autocast('cuda',dtype=torch.bfloat16):
-        dense = reference.project_memory(other)
-        compact = layer.compact_memory(layer.project_memory(memory),padding)
-        assert [row[0].shape[2] for row in compact] == [19,37]
-        pointers = [[v.data_ptr() for v in row] for row in compact]
+        projected = layer.project_memory(memory)
+        assert all(value.shape == (2,4,43,8) for value in projected)
+        pointers = [v.data_ptr() for v in projected]
         a = b = query
         for _ in range(3):
-            a = reference.forward_cached(a,dense,padding)
-            b = layer.forward_cached(b,compact,padding)
-        assert pointers == [[v.data_ptr() for v in row] for row in compact]
-        selected = PathDecoderLayer.select_memory([compact],torch.tensor([1],device='cuda'))
-        assert selected[0][0][0] is compact[1][0]
+            a = reference(a,other,memory_key_padding_mask=padding)
+            b = layer.forward_cached(b,projected,padding)
+        assert pointers == [v.data_ptr() for v in projected]
+        selected = PathDecoderLayer.select_memory([projected],torch.tensor([1],device='cuda'))
+        for value, original in zip(selected[0], projected):
+            torch.testing.assert_close(value, original[1:2], rtol=0, atol=0)
     torch.testing.assert_close(a,b,rtol=.03,atol=.02)
     a.square().mean().backward(); b.square().mean().backward()
     torch.testing.assert_close(memory.grad,other.grad,rtol=.06,atol=3e-4)

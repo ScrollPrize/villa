@@ -83,3 +83,15 @@ def test_encoder_selection_and_legacy_checkpoint_defaults():
         resolve_encoder('patch4',old)
     with pytest.raises(ValueError,match='architecture'):
         checkpoint_config(dict(patch,model_cfg=legacy))
+
+
+def test_context_reconstructs_dense_patch_features_only_once():
+    model = build_model(config(encoder='patch4'))
+    b = memory_batch(model.cfg)
+    calls = []
+    hook = model.encoder.reconstruction.register_forward_hook(lambda *args: calls.append(1))
+    try:
+        model.context(b['x'], b['hist'], b['hmask'])
+    finally:
+        hook.remove()
+    assert len(calls) == 1

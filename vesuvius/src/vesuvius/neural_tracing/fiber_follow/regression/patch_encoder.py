@@ -50,14 +50,11 @@ class PatchShuffleEncoder(AxialEncoder):
                 tokens = block(tokens)
         deep = self.norm(tokens).permute(0,4,1,2,3)
         # Token-only mode returns this same coarse lattice for both consumers.
-        # Legacy models reconstruct unconditioned fine appearance for memory.
         return self.decode(None, deep), deep
 
     def decode(self, fine, deep):
         if self.cfg.token_only:
             return deep
-        # Supervised predictions reconstruct again after historical-memory
-        # conditioning, sharing the same projection as observation extraction.
         return unpatchify(self.reconstruction(deep.permute(0,2,3,4,1)), self.shape)
 
     def forward(self, image, references, mask):

@@ -4,6 +4,7 @@ import time
 import numpy as np
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import (
     CropSpec, arclength, interp_at, frame_from_heading, normalize, crop_local_grid,
@@ -148,11 +149,25 @@ class HistoryAttention(nn.Module):
         self.norm = nn.LayerNorm(width)
         self.attention = nn.MultiheadAttention(width, heads, dropout=0., batch_first=True)
 
-    def forward(self, query, tokens, padding):
+    def project_memory(self, tokens, padding):
+        """Attached K/V shared by all layers and attempts within one decision."""
+        from .model import project_attention_memory
+        k, v = project_attention_memory(self.attention, tokens)
         # Supply one finite key for empty rows and zero their contribution,
         # including the output bias. No NaN softmax or suppressive learned gate.
         empty = padding.all(-1)
-        safe = padding & ~empty[:, None]
-        value = self.attention(self.norm(query), tokens, tokens,
-                               key_padding_mask=safe, need_weights=False)[0]
+        allowed = (~padding | empty[:, None])[:, None, None, :]
+        return k, v, allowed, empty
+
+    def forward_cached(self, query, k, v, allowed, empty):
+        attn = self.attention
+        width, heads = attn.embed_dim, attn.num_heads
+        q = F.linear(self.norm(query), attn.in_proj_weight[:width], attn.in_proj_bias[:width])
+        q = q.reshape(len(query), -1, heads, width//heads).transpose(1, 2)
+        value = F.scaled_dot_product_attention(q, k, v, attn_mask=allowed)
+        value = value.transpose(1, 2).reshape(len(query), -1, width)
+        value = attn.out_proj(value)
         return query+torch.where(empty[:, None, None], 0., value)
+
+    def forward(self, query, tokens, padding):
+        return self.forward_cached(query, *self.project_memory(tokens, padding))

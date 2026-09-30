@@ -97,7 +97,7 @@ def test_path_decoder_restores_attention_backend_preferences(device):
 
 @pytest.mark.parametrize('compiled', [False, True])
 @pytest.mark.parametrize('device', ['cpu', 'cuda'])
-def test_cached_attention_removes_only_masked_keys_and_preserves_gradients(device, compiled):
+def test_batched_attention_masks_keys_and_preserves_gradients(device, compiled):
     if device == 'cuda' and not torch.cuda.is_available():
         pytest.skip('CUDA unavailable')
     from torch.nn.attention import _cur_sdpa_kernel_backends
@@ -108,7 +108,7 @@ def test_cached_attention_removes_only_masked_keys_and_preserves_gradients(devic
     inputs = [torch.randn(*shape, device=device, dtype=dtype, requires_grad=True)
               for shape in ((2, 4, 16, 32), (2, 4, 1024, 32), (2, 4, 1024, 32))]
     probe = torch.randn(2, 4, 16, 32, device=device)
-    with torch._dynamo.config.patch(capture_dynamic_output_shape_ops=True):
+    with torch._dynamo.config.patch(capture_dynamic_output_shape_ops=False):
         attend = torch.compile(layer.attend_memory, fullgraph=True, dynamic=False) if compiled else layer.attend_memory
         graphs = None
         for stride in (3, 5):

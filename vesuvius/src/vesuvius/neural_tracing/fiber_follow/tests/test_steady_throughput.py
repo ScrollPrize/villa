@@ -30,3 +30,17 @@ def test_warmup_and_missing_first_gap_are_not_timed():
     assert measured[0]['step'] == 6
     with pytest.raises(RuntimeError, match='compilation-free'):
         steady_summary(data, len(data))
+
+
+def test_synthetic_microbatch_preserves_decisions_and_candidate_supervision():
+    import torch
+    from slab_fixtures import cfg
+    from vesuvius.neural_tracing.fiber_follow.regression.benchmark_slabs import (
+        synthetic_decisions, decision_microbatches,
+    )
+    rows = synthetic_decisions(cfg(), 3)
+    grouped = decision_microbatches(rows, 3)[0]
+    assert len(grouped['hist']) == 3
+    torch.testing.assert_close(grouped['x']['fine'], torch.cat([r['x']['fine'] for r in rows]))
+    assert not grouped['candidate_mask'][0].any()
+    torch.testing.assert_close(grouped['candidate_mask'][1:], torch.cat([r['candidate_mask'] for r in rows[1:]]))

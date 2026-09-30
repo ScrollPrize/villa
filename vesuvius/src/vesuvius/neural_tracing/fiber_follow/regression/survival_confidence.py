@@ -39,9 +39,11 @@ class SegmentSurvivalScorer(nn.Module):
         return start[:, :, None]+fraction[None, None, :, None]*(points-start)[:, :, None]
 
     def project_memory(self, memory, padding):
-        return [layer.compact_memory(layer.project_memory(memory), padding) for layer in self.layers]
+        return [layer.project_memory(memory) for layer in self.layers]
 
     def forward(self, spatial, points, projected, padding, history):
+        if len(history) == 2:
+            history = self.history_attention.project_memory(*history)
         start = torch.cat((torch.zeros_like(points[:, :1]), points[:, :-1]), 1)
         delta = points-start
         geometry = torch.cat((start, points, delta, delta.norm(dim=-1, keepdim=True)), -1)/16.

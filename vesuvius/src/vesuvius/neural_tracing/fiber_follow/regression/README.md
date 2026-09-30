@@ -59,12 +59,18 @@ separate residual history attention shared across their respective decoder
 layers. History features stay attached and are reused across all attempts and
 supplied candidates within a decision. Fully masked history contributes zero.
 
-Training compiles supervised prediction and supplied-candidate scoring. Valid
+Training compiles supervised prediction, supplied-candidate scoring, and losses. Valid
 slabs are gathered and encoded before those fixed-shape compiler boundaries.
-The current-image attention K/V projections are reused within the decision.
+Current-image attention uses batched, padding-masked SDPA with cuDNN preferred
+on CUDA. It needs no per-row key compaction or dynamic key dimensions.
+Current-image and historical attention K/V projections remain attached and are
+reused within the decision, including supplied-candidate scoring.
 CUDA uses BF16 autocast with FP32 survival and coordinate policy; the slab encoder
 and other parameters have independent gradient clipping (5 and 100).
 `--activation-checkpointing` still controls the main axial blocks.
+FP32 feature sampling preserves physical coordinate interpolation; the final
+survival projection and log-space accumulation preserve stopping precision.
+Inductor's BF16 rounding setting is local to these compiled functions.
 
 Logs include valid slabs per decision, historical age, actual slab-grid overlap
 with the current crop, loader slab seconds, encoder seconds (CUDA events on GPU),
@@ -141,6 +147,10 @@ OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 ../../../../.venv/bin/python -m pytest tests
 
 ../../../../.venv/bin/python -m vesuvius.neural_tracing.fiber_follow.regression.benchmark_slabs \
   --warmup 2 --repeats 10 --decisions 6 --out /tmp/slab-benchmark.json
+
+# Match the launcher's microbatch, including batched attention and candidate padding:
+../../../../.venv/bin/python -m vesuvius.neural_tracing.fiber_follow.regression.benchmark_slabs \
+  --warmup 3 --repeats 10 --decisions 16 --microbatch 16 --out /tmp/slab-benchmark-b16.json
 ```
 
 Use fresh output paths. The controlled learning check has two fixed identity

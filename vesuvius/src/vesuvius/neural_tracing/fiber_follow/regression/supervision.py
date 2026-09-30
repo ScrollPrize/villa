@@ -64,11 +64,6 @@ def candidate_targets(batch, cfg, tolerance):
     return torch.stack(labels, 1), mask
 
 
-def weighted_state_sum(values, batch):
-    """Keep the stream's fixed loss budget across chunks and endpoint replay."""
-    return (values*batch.get('loss_weight', torch.ones_like(values))).sum()
-
-
 @torch.no_grad()
 def point_correctness(points, batch, cfg, tolerance, foreign=None):
     """Independent predicted-point counts, not cumulative prefix labels.
@@ -179,5 +174,5 @@ def loss_terms(output, batch, cfg, tolerance=1.5, *, n_commit=None):
         failures = mask & (labels < .5)
         terms['candidate_late_failures'] = failures[..., 1:].sum()
         terms['candidate_first_failures'] = failures[..., 0].sum()
-        terms['candidate_supervision_weight'] = weighted_state_sum(valid.any(-1).float(), batch)
+        terms['candidate_supervision_weight'] = valid.any(-1).float().sum()
     return terms

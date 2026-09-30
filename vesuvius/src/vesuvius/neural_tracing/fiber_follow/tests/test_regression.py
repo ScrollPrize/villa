@@ -226,13 +226,14 @@ def test_training_compilation_emulates_eager_bf16_rounding(monkeypatch):
     assert prepare_training(model) is model
     assert not hasattr(model, '_orig_mod')
     assert [fn.__name__ for fn, _ in compiled] == [
-        'training_forward', 'score_candidates']
-    assert all(options == dict(dynamic=False, fullgraph=True) for _, options in compiled)
+        'training_forward', 'score_candidates', 'loss_terms']
+    assert all(options == dict(dynamic=False, fullgraph=True, options=dict(emulate_precision_casts=True))
+               for _, options in compiled)
     assert list(model.parameters()) == parameters
     assert list(model.state_dict()) == keys
     assert prepare_training(model) is model
-    assert len(compiled) == 2  # Setup is idempotent.
-    assert torch._inductor.config.emulate_precision_casts
+    assert len(compiled) == 3  # Setup is idempotent.
+    assert not torch._inductor.config.emulate_precision_casts
 
 
 def test_checkpoint_roundtrip_and_resume_optimizer_rng(tmp_path):

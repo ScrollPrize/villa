@@ -94,3 +94,49 @@ def test_masked_retries_preserve_adamw_skipped_parameter_updates():
     assert all(p.grad is None for p in raw.refinement_fusion.parameters())
 
 
+
+
+def test_fixed_rows_avoids_full_crop_copy_but_normalizes_singleton_strides():
+    from vesuvius.neural_tracing.fiber_follow.regression.train import fixed_rows
+    value = torch.randn(2, 2, 8, 9, 9, requires_grad=True)
+    assert fixed_rows(value, 2) is value
+    indexed = torch.randn(3, 2, 1, 3).transpose(1, 2)
+    assert indexed.is_contiguous()  # Singleton strides still differ from canonical.
+    result = fixed_rows(indexed, 3)
+    assert result.stride() == (6, 6, 3, 1)
+    torch.testing.assert_close(result, indexed)
+    padded = fixed_rows(value[:1], 2)
+    padded.sum().backward()
+    torch.testing.assert_close(value.grad[0], torch.full_like(value[0], 2.))
+    assert value.grad[1].eq(0).all()
+
+
+@pytest.mark.parametrize('device', ['cpu', 'cuda'])
+def test_compiled_loss_preserves_terms_and_prediction_gradients(device):
+    if device == 'cuda' and not torch.cuda.is_available():
+        pytest.skip('CUDA unavailable')
+    from vesuvius.neural_tracing.fiber_follow.regression.train import move_batch
+    torch.manual_seed(341)
+    model = build_model(cfg(encoder='patch4', token_only=True, recurrent_refinement_steps=1)).to(device)
+    batch = move_batch(memory_batch(model.cfg), device)
+    with torch.no_grad():
+        prediction = model(batch['x'], batch['hist'], batch['hmask'])
+    prediction = {k: v.detach().requires_grad_(v.is_floating_point()) for k, v in prediction.items()}
+    compiled = torch.compile(loss_terms, fullgraph=True, dynamic=False,
+                             options=dict(emulate_precision_casts=True))
+    inputs = [v for v in prediction.values() if v.requires_grad]
+    terms, gradients = [], []
+    for loss in (loss_terms, compiled):
+        with torch.autocast(device, dtype=torch.bfloat16, enabled=device == 'cuda'):
+            result = loss(prediction, batch, model.cfg)
+            value = (result['geometry_per_state']+.5*result['confidence_per_state']).sum()
+        terms.append(result)
+        gradients.append(torch.autograd.grad(value, inputs, allow_unused=True))
+    for key in terms[0]:
+        torch.testing.assert_close(terms[0][key], terms[1][key], rtol=3e-5, atol=2e-6)
+    for a, b in zip(*gradients):
+        if a is None:
+            # AOTAutograd can materialize zeros for metric-only outputs.
+            assert b is None or b.eq(0).all()
+        else:
+            torch.testing.assert_close(a, b, rtol=3e-5, atol=2e-6)
