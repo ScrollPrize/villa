@@ -1007,6 +1007,28 @@ class RefinementObserver:
         self.pending.append((batch.stream_indices.detach(), batch.refinement_geometry,
                              presence_outputs(output.detach()).amax(dim=1).squeeze(1).float(),directions))
 
+    def flush_empty(self, distributed, *, phase=None):
+        """Participate in a distributed flush without preparing proposals."""
+        if self.pending:
+            raise RuntimeError("metric-free refinement participant retained observations")
+        import torch.distributed as dist
+        if distributed.enabled:
+            if phase is not None:
+                print(f"refinement_{phase} collective rank={distributed.rank} "
+                      "phase=gather_begin proposals=0", flush=True)
+            dist.gather_object([], None, dst=0)
+            if phase is not None:
+                print(f"refinement_{phase} collective rank={distributed.rank} "
+                      "phase=gather_end", flush=True)
+            if phase is not None:
+                print(f"refinement_{phase} collective rank={distributed.rank} "
+                      "phase=barrier_begin", flush=True)
+            dist.barrier()
+            if phase is not None:
+                print(f"refinement_{phase} collective rank={distributed.rank} "
+                      "phase=barrier_end", flush=True)
+        return empty_refinement_statistics()
+
     def flush(self, distributed, *, phase=None, step=None, writer=None, batch=None):
         if not self.config.enabled or not self.config.update_enabled:
             return
@@ -1036,8 +1058,14 @@ class RefinementObserver:
                               before_orientation, after_orientation, loss))
         self.pending.clear()
         if distributed.enabled:
+            if phase is not None:
+                print(f"refinement_{phase} collective rank={distributed.rank} "
+                      f"phase=gather_begin proposals={len(proposals)}", flush=True)
             gathered = [None] * distributed.world_size if distributed.is_main else None
             dist.gather_object(proposals, gathered, dst=0)
+            if phase is not None:
+                print(f"refinement_{phase} collective rank={distributed.rank} "
+                      "phase=gather_end", flush=True)
         else:
             gathered = [proposals]
         statistics = empty_refinement_statistics()
@@ -1066,6 +1094,12 @@ class RefinementObserver:
         # Do not let another rank start preparing a new test phase before all
         # proposals have been committed. Queue lookahead stays immutable.
         if distributed.enabled:
+            if phase is not None:
+                print(f"refinement_{phase} collective rank={distributed.rank} "
+                      "phase=barrier_begin", flush=True)
             dist.barrier()
+            if phase is not None:
+                print(f"refinement_{phase} collective rank={distributed.rank} "
+                      "phase=barrier_end", flush=True)
         self.seconds += time.perf_counter() - started
         return statistics

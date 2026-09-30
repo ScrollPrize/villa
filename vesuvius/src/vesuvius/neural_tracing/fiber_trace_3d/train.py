@@ -3856,8 +3856,11 @@ def training_units(
                     # targets. Commit before a possible managed yield/restart.
                     if partial_wave:
                         print(f"distributed test final wave rank={distributed.rank} phase=refinement_begin", flush=True)
-                    refinement_stats = refinement.flush(distributed, phase="test", step=step,
-                        batch=f"{remaining[start]}:{remaining[min(start+wave_size,len(remaining))-1]}")
+                    refinement_stats = (
+                        refinement.flush_empty(distributed, phase="test")
+                        if padded else refinement.flush(distributed, phase="test", step=step,
+                            batch=f"{remaining[start]}:{remaining[min(start+wave_size,len(remaining))-1]}")
+                    )
                     if partial_wave:
                         print(f"distributed test final wave rank={distributed.rank} phase=refinement_end", flush=True)
                 rows = _distributed_gather_dense_test_rows(local, distributed)

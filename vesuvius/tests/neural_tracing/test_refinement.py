@@ -261,6 +261,14 @@ def test_raw_and_both_emas_use_same_refined_test_line(monkeypatch,tmp_path):
         torch.testing.assert_close(targets,seen[0],rtol=0,atol=0)
 
 
+def test_empty_refinement_flush_rejects_retained_observations():
+    observer = RefinementObserver(RefinementConfig(enabled=True, update_enabled=True))
+    assert observer.flush_empty(SimpleNamespace(enabled=False), phase="test") == [0.0] * 6
+    observer.pending.append(object())
+    with pytest.raises(RuntimeError, match="retained observations"):
+        observer.flush_empty(SimpleNamespace(enabled=False), phase="test")
+
+
 def test_quadrature_matches_linear_field():
     p = line()[:, :3]
     presence = np.broadcast_to(np.arange(64, dtype=float)[None, :, None] / 63, (64,)*3).copy()
