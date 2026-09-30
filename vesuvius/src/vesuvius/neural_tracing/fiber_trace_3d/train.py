@@ -2346,6 +2346,7 @@ def _distributed_evaluation_wave_indices(
     wave_size: int,
     rank: int,
     world_size: int,
+    total_batch_count: int,
     pad_empty_ranks: bool,
 ) -> tuple[list[int], bool]:
     """Assign one evaluation wave while preserving DDP forward parity.
@@ -2360,6 +2361,19 @@ def _distributed_evaluation_wave_indices(
     indices = wave[int(rank)::int(world_size)]
     if indices or not pad_empty_ranks or not wave:
         return indices, False
+    # Prefer a distinct, already-defined test batch for every padding rank.
+    # Reusing one live shared-memory ticket across processes is not a safe
+    # transport primitive, even though all readers are logically read-only.
+    occupied = set(wave)
+    wanted = int(rank) - len(wave)
+    for candidate in range(int(total_batch_count)):
+        if candidate in occupied:
+            continue
+        if wanted == 0:
+            return [candidate], True
+        wanted -= 1
+    # Very small test sets can have fewer batches than ranks. The broker's
+    # reference-counted lease remains the bounded fallback for that case.
     return [wave[int(rank) % len(wave)]], True
 
 
@@ -3724,6 +3738,7 @@ def training_units(
                     wave_size=wave_size,
                     rank=distributed.rank,
                     world_size=distributed.world_size,
+                    total_batch_count=total,
                     pad_empty_ranks=pending_test is not None,
                 )
                 iterator = queued_evaluation(indices, step, source=source,

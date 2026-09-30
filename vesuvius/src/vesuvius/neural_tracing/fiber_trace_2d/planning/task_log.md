@@ -94,3 +94,10 @@
   count and numerator are now carried through the single-backward accumulator,
   not merely reported as metrics. Focused prepass, gradient, loss, and broker
   tests pass (4 selected, 308 deselected).
+- A six-GPU relaunch proved that reference counting alone was insufficient:
+  rank 0 reached refinement `gather_object` after final batch 120 while ranks
+  1-5 remained behind the shared-ticket transport, producing NCCL sequence 632
+  timeout. Padding now assigns distinct deterministic existing test batches to
+  idle ranks whenever the test set has enough batches (121 here); duplicate
+  shared leases remain only as the bounded fallback for test sets smaller than
+  the world size. Focused wave/broker tests pass (2 selected, 290 deselected).

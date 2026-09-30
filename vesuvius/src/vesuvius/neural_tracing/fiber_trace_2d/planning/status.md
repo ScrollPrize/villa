@@ -4,7 +4,9 @@ GPUs 0-6 and failed in the initial test because a partial final evaluation wave
 violated DDP forward parity. The scheduler now pads only execution (not
 metrics/refinement) on empty ranks. The first corrected six-GPU launch exposed
 shared ownership of its padded broker sample; test leases are now
-reference-counted. Gaussian ridge, distribution-negative, and background
+reference-counted, and normal-size tests use distinct padding samples across
+ranks rather than sharing a live transport ticket. Gaussian ridge,
+distribution-negative, and background
 losses are independently normalized and included in the single-backward path.
 Relaunch verification is pending.
 - [x] Preserve pre-task dirty source changes in focused commits.

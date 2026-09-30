@@ -1936,6 +1936,7 @@ def test_distributed_evaluation_partial_wave_pads_ddp_without_duplicating_result
             wave_size=7,
             rank=rank,
             world_size=7,
+            total_batch_count=121,
             pad_empty_ranks=True,
         )
         for rank in range(7)
@@ -1943,7 +1944,8 @@ def test_distributed_evaluation_partial_wave_pads_ddp_without_duplicating_result
 
     assert assignments[:2] == [([119], False), ([120], False)]
     assert all(len(indices) == 1 and padded for indices, padded in assignments[2:])
-    assert {indices[0] for indices, _ in assignments[2:]} <= {119, 120}
+    assert [indices[0] for indices, _ in assignments[2:]] == [0, 1, 2, 3, 4]
+    assert len({indices[0] for indices, _ in assignments}) == 7
     assert [indices[0] for indices, padded in assignments if not padded] == [119, 120]
 
 
