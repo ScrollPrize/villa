@@ -1,6 +1,7 @@
 #include "FiberMapWorkspace.hpp"
 
 #include "FiberMapRuler.hpp"
+#include "FiberMapRulerMath.hpp"
 #include "LineAnnotationController.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
 
@@ -1140,6 +1141,12 @@ FiberMapWorkspace::~FiberMapWorkspace()
     _rebuildPool.waitForDone();
 }
 
+double FiberMapWorkspace::sceneXOf(double layoutXVx) const
+{
+    return vc3d::fiber_map::sheetDistanceMonotoneVx(vc3d::fiber_map::sheetModelOf(_layout),
+                                                    layoutXVx);
+}
+
 double FiberMapWorkspace::sceneVxPerCm() const
 {
     return kUmPerCm / _voxelSizeUm.value_or(kAssumedVoxelSizeUm);
@@ -1587,8 +1594,12 @@ void runRebuildJob(const std::shared_ptr<FiberMapWorkspace::RebuildJobResult>& j
             // Its own guard: the layout above is good whatever happens here.
             const auto gapBegin = std::chrono::steady_clock::now();
             try {
+                // Built on the layout's winding-linear grid, then re-gridded
+                // in sheet distance, which is the scene's x (see sceneXOf).
                 job->gapField = std::make_shared<const vc3d::fiber_map::gaps::GapField>(
-                    vc3d::fiber_map::gaps::buildGapField(job->layout, job->gapParams));
+                    vc3d::fiber_map::gaps::resampledToSheetDistance(
+                        vc3d::fiber_map::gaps::buildGapField(job->layout, job->gapParams),
+                        vc3d::fiber_map::sheetModelOf(job->layout)));
                 job->gapTiles = colourGapTiles(
                     *job->gapField, gapColourTable(paletteForDark(job->gapDarkTheme)));
             } catch (const std::exception& ex) {
@@ -2240,11 +2251,14 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
         return;
     }
 
-    // Scene coordinates are (x, -y) in voxels: negating z once here keeps the
-    // scroll axis reading upward without ever mirroring text.
+    // Scene coordinates are (sheet distance, -y) in voxels: x goes through
+    // sceneXOf(), and negating z once here keeps the scroll axis reading
+    // upward without ever mirroring text.
     const double topY = -_layout.yMaxVx;
     const double bottomY = -_layout.yMinVx;
-    const double sceneWidth = std::max(_layout.x1Vx - _layout.x0Vx, 1e-6);
+    const double leftX = sceneXOf(_layout.x0Vx);
+    const double rightX = sceneXOf(_layout.x1Vx);
+    const double sceneWidth = std::max(rightX - leftX, 1e-6);
     // The one conversion of this rebuild. Every scene-space size below that was
     // chosen as a physical length goes through it, and nothing else does.
     const double vxPerCm = sceneVxPerCm();
@@ -2299,18 +2313,21 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
         FiberMapRulerModel rulerModel;
         rulerModel.hasLayout = true;
         rulerModel.windings = _layout.windings;
+        for (vc3d::fiber_map::WindingMark& mark : rulerModel.windings) {
+            mark.xVx = sceneXOf(mark.xVx);
+        }
         rulerModel.sheet = vc3d::fiber_map::sheetModelOf(_layout);
         rulerModel.voxelSizeUm = _voxelSizeUm;
         rulerModel.extentTopSceneY = extentTopY;
         rulerModel.extentBottomSceneY = extentBottomY;
-        rulerModel.extentLeftSceneX = _layout.x0Vx;
-        rulerModel.extentRightSceneX = _layout.x1Vx;
+        rulerModel.extentLeftSceneX = leftX;
+        rulerModel.extentRightSceneX = rightX;
         _view->setRulerModel(rulerModel);
     }
 
     // One ground for the whole map, spanning the scroll's own z extent.
     auto* ground = _scene->addRect(
-        QRectF(QPointF(_layout.x0Vx, extentTopY), QPointF(_layout.x1Vx, extentBottomY)),
+        QRectF(QPointF(leftX, extentTopY), QPointF(rightX, extentBottomY)),
         QPen(Qt::NoPen), QBrush(tint(theme.surface, theme.ink, 0.045)));
     ground->setZValue(kPanelZ);
 
@@ -2321,7 +2338,8 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
     // top ruler's, which labels whatever is in view; the scene carries only
     // the gridlines.
     for (const vc3d::fiber_map::WindingMark& mark : _layout.windings) {
-        auto* line = _scene->addLine(mark.xVx, extentTopY, mark.xVx, extentBottomY);
+        const double x = sceneXOf(mark.xVx);
+        auto* line = _scene->addLine(x, extentTopY, x, extentBottomY);
         QPen pen(theme.winding);
         pen.setWidthF(0.8);
         pen.setCosmetic(true);
@@ -2336,11 +2354,11 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
         entry.networkId = placed.meta.networkId;
         for (vc3d::fiber_map::Run& run : entry.fiber.runs) {
             for (QPointF& point : run.points) {
-                point.setY(-point.y());
+                point = QPointF(sceneXOf(point.x()), -point.y());
             }
         }
         for (QPointF& point : entry.fiber.controlPoints) {
-            point.setY(-point.y());
+            point = QPointF(sceneXOf(point.x()), -point.y());
         }
 
         // The path items only carry geometry: clicks resolve through
@@ -2404,8 +2422,7 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
             } else {
                 const QPointF left = endpoint(true, true);
                 const QPointF right = endpoint(false, true);
-                const bool atRight =
-                    (_layout.x1Vx - right.x()) < (left.x() - _layout.x0Vx);
+                const bool atRight = (rightX - right.x()) < (left.x() - leftX);
                 anchor = atRight ? right : left;
                 offsetX = atRight ? 10.0 : -10.0;
                 anchorRight = !atRight;
@@ -2428,8 +2445,8 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
     }
 
     for (const vc3d::fiber_map::PlacedLink& link : _layout.links) {
-        const QPointF a(link.a.x(), -link.a.y());
-        const QPointF b(link.b.x(), -link.b.y());
+        const QPointF a(sceneXOf(link.a.x()), -link.a.y());
+        const QPointF b(sceneXOf(link.b.x()), -link.b.y());
         const QPointF middle = 0.5 * (a + b);
         if (!link.suspect) {
             // A winding-suspect link keeps its own red treatment below;
@@ -2544,7 +2561,7 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
                                    suspectRingRadius, kMinSuspectRingPx,
                                    kMaxSuspectRingPx, suspectRingBounds);
         _scene->addItem(ring);
-        ring->setPos(QPointF(mark.posVx.x(), -mark.posVx.y()));
+        ring->setPos(QPointF(sceneXOf(mark.posVx.x()), -mark.posVx.y()));
         ring->setZValue(kSuspectRingZ);
     }
 
@@ -2552,8 +2569,7 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
     // shows. The axes float just outside the extent, so the fit keeps a
     // slice of room above the ceiling and below the floor for their bands.
     const double height = std::max(sceneBottomY - sceneTopY, 1e-6);
-    _contentRect =
-        QRectF(_layout.x0Vx, sceneTopY - 0.06 * height, sceneWidth, 1.12 * height);
+    _contentRect = QRectF(leftX, sceneTopY - 0.06 * height, sceneWidth, 1.12 * height);
 
     // Panning stops at the scene rect, so the rect runs wider than the content:
     // zoomed in, the map's edges can be dragged away from the viewport edge
@@ -2561,9 +2577,17 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
     const double xMargin = std::max(0.25 * sceneWidth, kMinSceneMarginCm * vxPerCm);
     _scene->setSceneRect(_contentRect.adjusted(-xMargin, 0.0, xMargin, 0.0));
 
+    // Chips hide once a winding is narrower than kMinChipPixelsPerWinding on
+    // screen. Windings are not equally wide in the scene, so the threshold is
+    // set by the narrowest one on the map; one winding at the reference
+    // radius stands in when the layout has fewer than two marks.
     if (_layout.rRefVx > 0.0) {
-        _chipHideScale =
-            kMinChipPixelsPerWinding / (2.0 * M_PI * _layout.rRefVx);
+        const double narrowestWindingVx = vc3d::fiber_map::ruler::narrowestNeighbourGap(
+            _layout.windings.begin(), _layout.windings.end(),
+            [this](const vc3d::fiber_map::WindingMark& mark) { return sceneXOf(mark.xVx); },
+            -std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(),
+            2.0 * M_PI * _layout.rRefVx);
+        _chipHideScale = kMinChipPixelsPerWinding / narrowestWindingVx;
     }
     updateLabelChipVisibility();
 }
@@ -2692,7 +2716,7 @@ void FiberMapWorkspace::rebuildTree()
     };
     std::vector<ErrorEntry> errors;
     for (const vc3d::fiber_map::CrossingMark& mark : _layout.suspectCrossings) {
-        const QPointF ring(mark.posVx.x(), -mark.posVx.y());
+        const QPointF ring(sceneXOf(mark.posVx.x()), -mark.posVx.y());
         errors.push_back(ErrorEntry{QRectF(ring, ring), mark.hFiberId, mark.vFiberId,
                                     tr("crossing")});
     }
@@ -2701,8 +2725,8 @@ void FiberMapWorkspace::rebuildTree()
             continue;
         }
         // The rings sit on the two linked control points.
-        const QPointF ringA(link.a.x(), -link.a.y());
-        const QPointF ringB(link.b.x(), -link.b.y());
+        const QPointF ringA(sceneXOf(link.a.x()), -link.a.y());
+        const QPointF ringB(sceneXOf(link.b.x()), -link.b.y());
         errors.push_back(ErrorEntry{
             QRectF(ringA, ringB).normalized(), link.fiberA, link.fiberB,
             link.adjacentDisagrees

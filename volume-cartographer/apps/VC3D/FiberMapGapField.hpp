@@ -124,6 +124,27 @@ struct GapField {
 // radius) yields an empty field.
 [[nodiscard]] GapField buildGapField(const GlobalResult& layout, const GapFieldParams& params);
 
+// The field re-gridded for a scene whose x is sheet distance rather than the
+// layout's winding-linear x (sheetDistanceMonotoneVx): the cell stays square
+// and the same size, x0Vx becomes the sheet distance at the grid's left edge,
+// and the columns cover the grid's sheet-distance span, so there are about
+// (mean modelled radius / rRef) times as many. buildGapField already counts
+// those columns against params.maxCells, so a field it built re-grids within
+// the same budget. Each output cell takes the smallest value of the source
+// columns whose centres fall inside it (the inner windings compress the map,
+// and a fiber's zero line is one source column wide: the smallest SAMPLED
+// source value is kept, so the field's sampled minima survive, and a cell
+// reads the lowest of the source samples it covers rather than the distance
+// at its centre, which can be far lower where the fold's other-winding
+// candidates slope steeply; the source's own raster error is carried over),
+// and the source column its own centre falls in where none does (the outer
+// windings stretch the map; the source's own resolution, cell * r(W) / rRef
+// in sheet distance, is all there is). Right for a heat map that shows where
+// fibers are missing; not a measurement of distance at a point. Flags and
+// counts carry over; an empty field stays empty; a model whose mapping is
+// the identity (no pitch and radius0 == rRef, or degenerate) yields a copy.
+[[nodiscard]] GapField resampledToSheetDistance(const GapField& field, const SheetModel& model);
+
 // Whether two captures of the heat-map settings would build the same field:
 // both off, or both on with equal parameters. This is the workspace's one
 // test for "the published field is the one the toolbar asks for", used both

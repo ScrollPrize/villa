@@ -1372,6 +1372,53 @@ private slots:
         // A distance no positive radius can reach has no position.
         QVERIFY(std::isnan(vc3d::fiber_map::sheetXForDistanceVx(model, -1e12)));
 
+        // The scaling the scene is drawn with agrees with the sheet distance
+        // wherever the modelled radius is positive, continues at the map's
+        // own scale below that floor, and inverts everywhere.
+        const double xFloor = -(model.radius0Vx / model.pitchVx) * circumference;
+        for (double x : {-0.5 * circumference, 0.0, 0.3 * circumference,
+                         2.7 * circumference}) {
+            QVERIFY(std::abs(vc3d::fiber_map::sheetDistanceMonotoneVx(model, x) -
+                             vc3d::fiber_map::sheetDistanceVx(model, x)) < 1e-6);
+        }
+        const double distanceFloor = vc3d::fiber_map::sheetDistanceVx(model, xFloor);
+        for (double below : {1.0, 3.0 * circumference}) {
+            const double x = xFloor - below;
+            const double distance = vc3d::fiber_map::sheetDistanceMonotoneVx(model, x);
+            QVERIFY2(std::abs(distance - (distanceFloor - below)) < 1e-6,
+                     qPrintable(QString::number(distance)));
+            QVERIFY2(std::abs(vc3d::fiber_map::sheetXForDistanceMonotoneVx(model, distance) -
+                              x) < 1e-6,
+                     qPrintable(QString::number(distance)));
+        }
+        QCOMPARE(vc3d::fiber_map::sheetDomainFloorXVx(model), xFloor);
+        // At the floor and one ulp either side the round trip lands on the
+        // floor to rounding (the quadratic is flat there, so no better).
+        for (double distance : {std::nextafter(distanceFloor, -1e300), distanceFloor,
+                                std::nextafter(distanceFloor, 1e300)}) {
+            const double back = vc3d::fiber_map::sheetXForDistanceMonotoneVx(model, distance);
+            QVERIFY2(std::abs(back - xFloor) < 1e-6 * std::abs(xFloor),
+                     qPrintable(QStringLiteral("%1 -> %2").arg(distance, 0, 'g', 17).arg(back)));
+        }
+        // Hand-built degenerate models map as the identity, floorless.
+        for (const vc3d::fiber_map::SheetModel degenerate :
+             {vc3d::fiber_map::SheetModel{0.0, 4000.0, 300.0},
+              vc3d::fiber_map::SheetModel{4000.0, 0.0, 300.0},
+              vc3d::fiber_map::SheetModel{4000.0, -1.0, 300.0}}) {
+            QVERIFY(std::isinf(vc3d::fiber_map::sheetDomainFloorXVx(degenerate)));
+            QCOMPARE(vc3d::fiber_map::sheetDistanceMonotoneVx(degenerate, 123.5), 123.5);
+            QCOMPARE(vc3d::fiber_map::sheetXForDistanceMonotoneVx(degenerate, 123.5), 123.5);
+        }
+        double previous = -std::numeric_limits<double>::infinity();
+        for (int step = -40; step <= 60; ++step) {
+            const double x = xFloor + 0.1 * static_cast<double>(step) * circumference;
+            const double distance = vc3d::fiber_map::sheetDistanceMonotoneVx(model, x);
+            QVERIFY(distance > previous);
+            QVERIFY(std::abs(vc3d::fiber_map::sheetXForDistanceMonotoneVx(model, distance) -
+                             x) < 1e-6 * std::max(1.0, std::abs(x)));
+            previous = distance;
+        }
+
         // A vanishingly small positive pitch must not lose the answer to
         // cancellation: the inverse tends smoothly to the linear case.
         {
@@ -1425,6 +1472,10 @@ private slots:
         const double x = 0.37 * kTwoPi * result.rRefVx;
         QVERIFY(std::abs(vc3d::fiber_map::sheetDistanceVx(model, x) - x) < 1e-9);
         QVERIFY(std::abs(vc3d::fiber_map::sheetXForDistanceVx(model, x) - x) < 1e-9);
+        // So the scene is drawn at the map's own scale, floorless.
+        QVERIFY(std::isinf(vc3d::fiber_map::sheetDomainFloorXVx(model)));
+        QVERIFY(std::abs(vc3d::fiber_map::sheetDistanceMonotoneVx(model, x) - x) < 1e-9);
+        QVERIFY(std::abs(vc3d::fiber_map::sheetXForDistanceMonotoneVx(model, x) - x) < 1e-9);
     }
 
     // Equal labels tie-break by fileName, never by the runtime id: swapping

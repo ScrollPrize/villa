@@ -2109,6 +2109,46 @@ double sheetXForDistanceVx(const SheetModel& model, double distanceVx)
     return w * kTwoPi * model.rRefVx;
 }
 
+double sheetDomainFloorXVx(const SheetModel& model)
+{
+    if (!(model.rRefVx > 0.0) || !(model.radius0Vx > 0.0) || !(model.pitchVx > 0.0)) {
+        return -std::numeric_limits<double>::infinity();
+    }
+    return -(model.radius0Vx / model.pitchVx) * kTwoPi * model.rRefVx;
+}
+
+double sheetDistanceMonotoneVx(const SheetModel& model, double xVx)
+{
+    if (!(model.rRefVx > 0.0) || !(model.radius0Vx > 0.0)) {
+        return xVx;
+    }
+    const double xFloor = sheetDomainFloorXVx(model);
+    if (xVx < xFloor) {
+        return sheetDistanceVx(model, xFloor) + (xVx - xFloor);
+    }
+    return sheetDistanceVx(model, xVx);
+}
+
+double sheetXForDistanceMonotoneVx(const SheetModel& model, double distanceVx)
+{
+    if (!(model.rRefVx > 0.0) || !(model.radius0Vx > 0.0)) {
+        return distanceVx;
+    }
+    const double xFloor = sheetDomainFloorXVx(model);
+    if (std::isfinite(xFloor)) {
+        const double distanceFloor = sheetDistanceVx(model, xFloor);
+        // The floor and everything below it are the linear continuation;
+        // the quadratic's own root there is ill-conditioned (zero
+        // discriminant up to rounding) and would land a hair off.
+        if (distanceVx <= distanceFloor) {
+            return xFloor + (distanceVx - distanceFloor);
+        }
+        const double x = sheetXForDistanceVx(model, distanceVx);
+        return std::isfinite(x) ? x : xFloor;
+    }
+    return sheetXForDistanceVx(model, distanceVx);
+}
+
 SheetModel sheetModelOf(const GlobalResult& result)
 {
     return SheetModel{result.rRefVx, result.sheetRadius0Vx, result.sheetPitchVx};
