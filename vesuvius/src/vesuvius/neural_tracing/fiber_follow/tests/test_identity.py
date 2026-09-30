@@ -22,7 +22,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolumeSpec
 
 def config(**kwargs):
     options=dict(fine=CropSpec(depth=24,width=17,behind=8),channels=4,hidden=16,
-        heads=2,layers=1,decoder_layers=1,n_future=4,n_history=32,activation_checkpointing=False,memory_slots=4,memory_steps=4,feature_detail_tokens=4,recurrent_refinement_steps=0)
+        heads=2,layers=1,decoder_layers=1,n_future=4,n_history=32,activation_checkpointing=False,recurrent_refinement_steps=0)
     options.update(kwargs)
     return DirectConfig(**options)
 
@@ -36,6 +36,8 @@ def batch(cfg,b=2):
         seed_age=torch.zeros(b), query_frame=torch.eye(3).expand(b,-1,-1).clone(),
         query_position=torch.zeros(b,3), feature_seed_here=torch.ones(b,dtype=torch.bool),
         memory_mask=torch.ones(b,1,dtype=torch.bool),memory_seed_valid=torch.ones(b,dtype=torch.bool))
+    from slab_fixtures import slab_inputs
+    x.update(slab_inputs(b))
     return dict(x=x,hist=hist,hmask=torch.ones(b,cfg.n_history),dense_ab=torch.zeros(b,q,2),
         dense_mask=torch.ones(b,q),offtrack=torch.zeros(b),endpoint_known=torch.zeros(b),
         end_local=torch.zeros(b,3),source=torch.zeros(b),
@@ -102,7 +104,8 @@ def fake_images(builder,items):
     cfg=builder.cfg
     for item in items: reference_layout(item,cfg)
     stack=lambda key: torch.from_numpy(np.stack([i[key] for i in items]).astype(np.float32))
-    return dict(fine=torch.from_numpy(np.random.default_rng(3).random((len(items),2,cfg.fine.depth,cfg.fine.width,cfg.fine.width),np.float32)),
+    from slab_fixtures import slab_inputs
+    return slab_inputs(len(items)) | dict(fine=torch.from_numpy(np.random.default_rng(3).random((len(items),2,cfg.fine.depth,cfg.fine.width,cfg.fine.width),np.float32)),
         seed=stack('visible_seed'),seed_mask=stack('visible_seed_mask'),seed_tangent=stack('visible_seed_tangent'),seed_age=stack('visible_seed_age'))
 
 

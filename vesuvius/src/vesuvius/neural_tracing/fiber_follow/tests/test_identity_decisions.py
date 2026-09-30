@@ -83,7 +83,9 @@ def test_replay_preserves_seed_but_distant_seed_is_not_observable(tmp_path):
     ds.batch_builder = IdentityObservationBuilder(cfg, [parent], negative_bank=bank)
     for valid in (False, True):
         seed = dict(seed_pos=[[0., 0., 20.]], seed_tangent=[[0., 0., 1.]], seed_age=[80.], seed_valid=[True]) if valid else {}
-        states = OnPolicyStates(manifest=fiber_manifest([parent]), **arrays, **seed)
+        prefix = np.array([[0.,0.,20.],[0.,0.,100.]]) if valid else np.array([[0.,0.,100.]])
+        states = OnPolicyStates(manifest=fiber_manifest([parent]), **arrays, **seed,
+                                seq_start=[0], seq_end=[len(prefix)], track_pos=prefix)
         path = tmp_path/f'{valid}.npz'
         states.save(path)
         loaded = OnPolicyStates.load(path)
@@ -116,9 +118,9 @@ def test_trace_keeps_seed_from_first_decision_through_recovery():
     for row in rows:
         np.testing.assert_array_equal(row['seed_pos'], [10., 20., 30.])
         assert row['seed_valid']
-    recovered = dict(rows[1], seed_pos=np.array([1., 2., 3.]), seed_age=90.)
+    recovered = dict(rows[1])
     rows.clear()
     tracer._trace(recovered['pos'][None], np.array([[0., 0., 1.]]), None, None,
                   lambda i, state: rows.append(state), initial_states=[recovered])
     np.testing.assert_array_equal(rows[-1]['seed_pos'], recovered['seed_pos'])
-    assert rows[-1]['seed_age'] == 94.
+    assert rows[-1]['seed_age'] == 6.

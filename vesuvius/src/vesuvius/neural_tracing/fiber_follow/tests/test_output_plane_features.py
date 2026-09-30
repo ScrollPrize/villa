@@ -4,7 +4,7 @@ import math
 import pytest
 import torch
 
-from test_trajectory_memory import cfg, memory_batch
+from slab_fixtures import cfg, slab_batch as memory_batch
 from vesuvius.neural_tracing.fiber_follow.regression.model import (
     DirectConfig, OutputPlaneFeatures, build_model,
 )
@@ -67,22 +67,11 @@ def test_all_generator_layers_read_fine_planes_and_keep_deep_and_history(monkeyp
     monkeypatch.setattr(model, 'decoder_memory', capture_memory)
     reads = []
     for index, layer in enumerate(model.decoder.layers):
-        if refinements:
-            original = layer.project_memory
-
-            def read(memory, _original=original, _index=index):
-                reads.append((_index, memory))
-                return _original(memory)
-
-            monkeypatch.setattr(layer, 'project_memory', read)
-        else:
-            original = layer._mha_block
-
-            def read(query, memory, *args, _original=original, _index=index, **kwargs):
-                reads.append((_index, memory))
-                return _original(query, memory, *args, **kwargs)
-
-            monkeypatch.setattr(layer, '_mha_block', read)
+        original = layer.project_memory
+        def read(memory, _original=original, _index=index):
+            reads.append((_index, memory))
+            return _original(memory)
+        monkeypatch.setattr(layer, 'project_memory', read)
     output = model(batch['x'], batch['hist'], batch['hmask'])
     ctx, memory, padding = (captured[k] for k in ('ctx', 'memory', 'padding'))
     spatial_count = math.prod(c.token_shape)
@@ -122,7 +111,6 @@ def test_generator_plane_projections_do_not_enter_candidate_scoring():
     second = model(*args, candidates=curves)
     assert (first['points']-second['points']).abs().max() > 1e-5
     torch.testing.assert_close(first['candidate_hazard_logits'], second['candidate_hazard_logits'], rtol=0, atol=0)
-    torch.testing.assert_close(first['memory_cache'], second['memory_cache'], rtol=0, atol=0)
 
 
 @pytest.mark.parametrize('scored', ['hazard_logits', 'candidate_hazard_logits'])
@@ -185,7 +173,6 @@ def test_scorer_plane_projections_inform_feedback_without_changing_initial_path(
     assert (first['hazard_logits']-second['hazard_logits']).abs().max() > 1e-5
     torch.testing.assert_close(first['initial_points'], second['initial_points'], rtol=0, atol=0)
     assert (first['refinement_points'][:, 1:]-second['refinement_points'][:, 1:]).abs().max() > 1e-7
-    torch.testing.assert_close(first['memory_cache'], second['memory_cache'], rtol=0, atol=0)
 
 
 def test_fractional_plane_sampling_compiles_with_gradients():

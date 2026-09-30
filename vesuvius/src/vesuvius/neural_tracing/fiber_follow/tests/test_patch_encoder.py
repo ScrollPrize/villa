@@ -4,7 +4,7 @@ import torch
 from torch import nn
 
 from test_identity import config
-from test_trajectory_memory import memory_batch, state_from
+from slab_fixtures import slab_batch as memory_batch
 from test_training_defaults import REQUIRED
 from vesuvius.neural_tracing.fiber_follow.regression.model import (
     ARCHITECTURE, PATCH_ARCHITECTURE, DirectConfig, build_model, sample_features,
@@ -47,7 +47,7 @@ def test_patch_centers_align_sampling_and_history_without_changing_conv_model():
     fine,deep = model.encoder.encode(torch.rand(1,2,cfg.fine.depth,cfg.fine.width,cfg.fine.width),references,mask)
     assert fine.shape == (1,cfg.channels,cfg.fine.depth,cfg.fine.width,cfg.fine.width)
     assert deep.shape == (1,cfg.hidden,*cfg.token_shape)
-    assert not any(isinstance(module,nn.Conv3d) for module in model.modules())
+    assert not any(isinstance(module,nn.Conv3d) for module in model.encoder.modules())
 
 
 def test_patch_history_and_reconstruction_receive_geometry_gradients():
@@ -59,9 +59,10 @@ def test_patch_history_and_reconstruction_receive_geometry_gradients():
         row['x']['seed_mask'].zero_()
         row['x']['fine'].requires_grad_()
     first = model(old['x'],old['hist'],old['hmask'])
-    result = model(current['x'],current['hist'],current['hmask'],memory=state_from(model,first))
+    current['x']['history_slabs'].requires_grad_()
+    result = model(current['x'],current['hist'],current['hmask'])
     loss_terms(result,current,model.cfg)['geometry_per_state'].mean().backward()
-    for gradient in (old['x']['fine'].grad,current['x']['fine'].grad,
+    for gradient in (current['x']['history_slabs'].grad,current['x']['fine'].grad,
                      model.encoder.patch_projection.weight.grad,model.encoder.reconstruction.weight.grad):
         assert torch.isfinite(gradient).all() and gradient.abs().sum() > 0
 

@@ -11,7 +11,6 @@ from test_regression import proposal_output
 from test_neighbor_bank import make_bank, add_shard, publish
 from test_neighbor_following import clean_sample
 from vesuvius.neural_tracing.fiber_follow.regression.data import IdentityObservationBuilder, IdentitySampling
-from vesuvius.neural_tracing.fiber_follow.regression.feature_sequences import sequence_batches, decision_plan
 from vesuvius.neural_tracing.fiber_follow.regression.identity_decisions import decision_pair, path_candidates
 from vesuvius.neural_tracing.fiber_follow.regression.model import DirectFollower
 from vesuvius.neural_tracing.fiber_follow.regression.supervision import candidate_targets, loss_terms, geometry_mask
@@ -21,34 +20,8 @@ from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
 from vesuvius.neural_tracing.fiber_follow.shared.training_log import DirectTrainingInterval
 
 
-def test_stream_length_does_not_change_endpoint_or_total_budget(monkeypatch):
-    import vesuvius.neural_tracing.fiber_follow.regression.feature_sequences as module
-    monkeypatch.setattr(module, 'stream_rows', lambda item, builder, band: item)
-    class Builder:
-        cfg = config(feature_history_loss_fraction=.25)
-        def __call__(self, items, vol, *, decision_mask=None):
-            return dict(hist=torch.zeros(len(items), 1, 3))
-    streams = [[dict(source=source, identity_seed=j) for _ in range(length)]
-               for j, (source, length) in enumerate([(5, 6), (5, 9), (0, 18), (3, 130)])]
-    totals, endpoints, observed = defaultdict(float), {}, defaultdict(int)
-    for chunk in sequence_batches(Builder(), streams, None):
-        for b in chunk['feature_sequence']:
-            for sid, weight, end in zip(b['stream_id'].tolist(), b['loss_weight'].tolist(), b['stream_end'].tolist()):
-                totals[sid] += weight
-                observed[sid] += 1
-                if end: endpoints[sid] = weight
-    assert list(observed.values()) == [6, 9, 18, 130]
-    np.testing.assert_allclose(list(totals.values()), 1.)
-    np.testing.assert_allclose(list(endpoints.values()), .75)
-    assert sum(endpoints.values())/sum(totals.values()) == pytest.approx(.75)
-    assert (endpoints[0]+endpoints[1])/sum(totals.values()) == pytest.approx(.375)
-    assert decision_plan(1, Builder.cfg, np.random.default_rng(1))[0].tolist() == [1.]
 
 
-@pytest.mark.parametrize('value', [-.1, 1., float('nan')])
-def test_invalid_history_budget(value):
-    with pytest.raises(ValueError, match='History loss'):
-        config(feature_history_loss_fraction=value)
 
 
 def matched_batch(tmp_path, monkeypatch, choice):
@@ -158,24 +131,22 @@ def test_weighted_optimizer_update_is_microbatch_invariant_and_logs_budget():
     interval = DirectTrainingInterval()
     interval.add(metrics[0])
     summary = interval.summary()
-    assert summary['endpoint_states'] == summary['choice_endpoint_states'] == 1
-    assert summary['matched_endpoint_weight'] == .75
-    assert summary['supervision_weight'] == pytest.approx(.75+.25/129)
+    assert summary['endpoint_states'] == 2 and summary['choice_endpoint_states'] == 1
+    assert summary['matched_endpoint_weight'] == 1.
+    assert summary['supervision_weight'] == 2.
 
 
 def test_pair_is_discarded_together_if_one_history_crosses_holdout(monkeypatch):
-    import vesuvius.neural_tracing.fiber_follow.regression.feature_sequences as module
-    monkeypatch.setattr(module, 'stream_rows', lambda item, builder, band: item['rows'])
-    class Builder:
-        cfg = config()
-        def __call__(self, items, vol, *, decision_mask=None):
-            return dict(hist=torch.zeros(len(items), 1, 3), source=torch.tensor([r['source'] for r in items]))
-    items = [dict(pair_observation_seed=123, rows=[]),
-             dict(pair_observation_seed=123, rows=[dict(source=5, identity_seed=1)]),
-             dict(rows=[dict(source=0, identity_seed=2)])]
-    batches = list(sequence_batches(Builder(), items, None))
-    assert len(batches) == 1
-    assert batches[0]['feature_sequence'][0]['source'].tolist() == [0]
+    from test_history_slabs import observation
+    from vesuvius.neural_tracing.fiber_follow.regression.history_slabs import slabs_allowed
+    from vesuvius.neural_tracing.fiber_follow.shared.data import FollowDataset, ZBand
+    ds = FollowDataset.__new__(FollowDataset)
+    ds.prepare = lambda item, rng: item
+    ds.state_allowed = lambda item: slabs_allowed(item, ZBand(100,120))
+    unsafe = observation(np.array([[0.,0,100],[0,0,400]]))
+    safe = observation(np.array([[0.,0,300],[0,0,400]]))
+    assert not ds.prepare_pair([unsafe,safe],np.random.default_rng(0))
+    assert len(ds.prepare_pair([safe,safe],np.random.default_rng(0))) == 2
 
 
 def test_unlabeled_candidate_padding_does_not_run_scorer(monkeypatch):

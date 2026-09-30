@@ -206,7 +206,7 @@ def test_replay_preserves_endpoint_arc_precision(tmp_path):
     loaded.validate_fibers([f])
     assert loaded.t.dtype == np.float64
     assert loaded.t[0] == f.length
-    assert loaded.pos.dtype == np.float32
+    assert loaded.pos.dtype == np.float64
     pickle.loads(pickle.dumps(loaded)).validate_fibers([f])
 
 

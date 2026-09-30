@@ -50,21 +50,8 @@ class ObservationBuilder:
         x = dict(fine=crop_images(items,vol,self.cfg.fine,pool),seed=stack('visible_seed'),
                  seed_mask=stack('visible_seed_mask'),seed_age=stack('visible_seed_age'),
                  seed_tangent=stack('visible_seed_tangent'))
-        x['query_frame'] = stack('frame')
-        x['query_position'] = stack('pos')
-        here = [bool(i.get('seed_valid', False)) and
-                np.linalg.norm(np.asarray(i['seed_pos'])-i['pos']) < 1e-4 for i in items]
-        x['feature_seed_here'] = torch.tensor(here)
-        x['memory_mask'] = torch.ones(len(items), 1, dtype=torch.bool)
-        x['memory_seed_valid'] = torch.tensor([bool(i.get('seed_valid', False)) for i in items])
-        remote = [bool(i.get('seed_valid', False)) and not i.get('memory_warm', False) and not h
-                  for i, h in zip(items, here)]
-        if any(remote):
-            from .feature_sequences import seed_observation
-            seeds = [seed_observation(i, self.cfg) if r else dict(i, memory_warm=True)
-                     for i, r in zip(items, remote)]
-            x['feature_seed_x'] = self.images(seeds, vol, pool)
-            x['feature_seed_x']['feature_active'] = torch.tensor(remote)
+        from .history_slabs import load_slabs
+        x.update(load_slabs(items, vol, self.cfg, pool))
         return x
 
     def observations(self, items, vol):
@@ -271,13 +258,10 @@ class IdentityObservationBuilder(ObservationBuilder):
     def memory_switch(self, sample_cfg, rng):
         """Original fiber, bridge, then a long neighbor tail, observed along the way."""
         from vesuvius.neural_tracing.fiber_follow.regression.neighbor_continuations import wrong_continuation
-        if not self.cfg.memory_slots:
-            raise ValueError('Memory-switch sequences require a memory model')
         for _ in range(3):
             item = wrong_continuation(self.continuation_bank or self.negative_bank,sample_cfg,rng,
                                       tail_length_range=self.sampling.memory_switch_tail,prefer_long=True,
-                                      prefix_length=(self.cfg.feature_stream_steps)*self.cfg.memory_stride,
-                                      track_stride=self.cfg.memory_stride)
+                                      prefix_length=float(rng.uniform(128., 1024.)))
             if item is not None:
                 item['location_source'] = LOCATION_SOURCES.index('memory_switch')
                 return item
@@ -331,18 +315,13 @@ class IdentityObservationBuilder(ObservationBuilder):
         # Confirmed old departures with no visible original-fiber evidence cannot
         # be distinguished from ordinary following of the neighboring fiber.
         item['identity_observable'] = bool(not item.get('offtrack',False) or item['identity_reference_valid'])
-        if cfg.memory_slots and item.get('offtrack', False):
-            from .memory_data import memory_layout
-            observations, seed = memory_layout(item, cfg)
-            observations = observations[:-1]  # head alone is not original-fiber history
-            # Annotation membership controls supervision only. The memory
-            # writer receives every observed patch, including contaminated ones.
-            if seed is not None:
-                observations = observations+[seed]
-            if observations:
-                from scipy.spatial import cKDTree
-                distance = cKDTree(fiber.points).query(np.stack([o['pos'] for o in observations]))[0]
-                item['identity_observable'] |= bool((distance <= s.on_fiber_tolerance).any())
+        if item.get('offtrack', False):
+            from .history_slabs import slab_layout
+            observations = slab_layout(item)
+            # Membership affects labels only; every observed slab is still input.
+            from scipy.spatial import cKDTree
+            distance = cKDTree(fiber.points).query(np.stack([o['pos'] for o in observations]))[0]
+            item['identity_observable'] |= bool((distance <= s.on_fiber_tolerance).any())
         item['identity_curve'] = curve
         visible = visible_points(curve,cfg.fine)
         item['identity_label_z'] = (curve[visible] @ frame.T+pos)[:,2] if visible.any() else pos[2:3]
@@ -361,12 +340,9 @@ class IdentityObservationBuilder(ObservationBuilder):
         return item
 
     def footprint_allowed(self,item,band):
-        # CT is restricted to the main crop, whose footprint FollowDataset checks.
-        # Also reject matched labels if their distinguishing seed is not visible.
-        if self.cfg.memory_slots:
-            from .memory_data import memory_allowed
-            if not memory_allowed(item, self.cfg, band):
-                return False
+        from .history_slabs import slabs_allowed
+        if not slabs_allowed(item, band):
+            return False
         if band is None:
             return True
         z = np.asarray(item.get('identity_label_z',np.asarray(item['pos'])[2:3]))
@@ -466,17 +442,15 @@ class IdentityObservationBuilder(ObservationBuilder):
                 augmentation = dict(blur_sigma=item.get('blur_sigma', 0.), drop_presence=item['drop_presence'])
                 batch['blurred'][j] = augmentation['blur_sigma'] > 0
                 augment_image_pair(batch['x']['fine'][j], item['photometric'], rng, **augmentation)
+                for slot in batch['x']['history_valid'][j].nonzero().flatten().tolist():
+                    ct = batch['x']['history_slabs'][j, slot, 0].numpy()
+                    if augmentation['blur_sigma'] > 0:
+                        gaussian_filter(ct, sigma=augmentation['blur_sigma'], mode='reflect', output=ct)
+                    ct[:] = photometric(ct, item['photometric'], rng)
                 if item['drop_presence']:
                     batch['presence_dropped'][j] = 1
         return batch
 
-    @property
-    def streaming(self):
-        return True
-
-    def sequence_batches(self, items, vol, **kwargs):
-        from .feature_sequences import sequence_batches
-        return sequence_batches(self, items, vol, **kwargs)
 
 
 def observation_builder(cfg,**kwargs):
@@ -496,7 +470,7 @@ class DirectTracer(ModelTracer):
         if paths is not None:
             for item,path in zip(items,paths):
                 item.update({k:path[k] for k in SEED_FIELDS if k in path})
-                item['memory_warm'] = path.get('memory_warm', False)
+                item['observed_path'] = path['observed_path']
         def move(value):
             return {k: move(v) for k, v in value.items()} if isinstance(value, dict) else value.to(self.device)
         return move(self.observations.images(items,self.vol,self.pool))

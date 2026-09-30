@@ -19,7 +19,7 @@ class DirectTrainingInterval:
              'recent_fraction', 'bank_wrong_continuation_fraction',
              'bank_following_fraction', 'decision_pair_fraction', 'refinement_attempts_mean')
     counts = ('error_sum', 'geometry_count', 'point_correct_count', 'point_wrong_count',
-              'point_unknown_count', 'supervised_states', 'observation_only_states', 'memory_replay_observations', 'history_encoder_crops',
+              'point_unknown_count', 'supervised_states', 'observation_only_states', 'history_valid_slabs', 'history_age_sum', 'history_overlap_sum', 'history_load_seconds', 'history_encode_seconds',
               'confidence_labeled_states', 'confidence_departed_states', 'refinement_attempts_sum',
               'supervision_weight', 'endpoint_weight', 'matched_endpoint_weight', 'choice_endpoint_weight',
               'endpoint_states', 'matched_endpoint_states', 'choice_endpoint_states',
@@ -49,7 +49,7 @@ class DirectTrainingInterval:
                 name = section+'_'+key
                 weight = decisions if key in self.nested_means[section] else 1
                 self.values[name] = self.values.get(name, 0.)+source.get(key, 0.)*weight
-        for group in ('memory', 'rest'):
+        for group in ('history', 'rest'):
             key = group+'_grad_norm'
             self.values[key+'_max'] = max(self.values.get(key+'_max', 0.), row.get(key, 0.))
             key = group+'_clipped_updates'
@@ -86,8 +86,12 @@ def _interval_training_lines(row):
                  f" | departed loss weight {row.get('memory_departed_weight', 1.):g}x")
         lines.append(f"  probe labels: departed {_rate(m['memory_departed_count'], m['memory_identity_count'])}"
                      f" | false departure {_rate(m['memory_identity_count']-m['memory_departed_count']-(m['memory_identity_correct']-m['memory_departed_correct']), m['memory_identity_count']-m['memory_departed_count'])}")
-    lines.append(f"  memory: {int(m['memory_replay_observations'])} replayed observations / "
-                 f"{int(m['history_encoder_crops'])} historical encoder crops with gradients")
+    slabs = max(1., m.get('history_valid_slabs', 0.))
+    lines.append(f"  historical slabs: {m.get('history_valid_slabs', 0.)/max(1, m['decisions']):.2f}/decision"
+                 f" | age {m.get('history_age_sum', 0.)/slabs:.1f} voxels"
+                 f" | current-crop overlap {m.get('history_overlap_sum', 0.)/slabs:.1%}"
+                 f" | load {m.get('history_load_seconds', 0.):.3f}s"
+                 f" | encode {m.get('history_encode_seconds', 0.):.3f}s")
     lines.append(f"  supervision: {int(m['decisions'])} decisions / {int(m['crops'])} observations")
     lines.append(f"  scored crops: candidates {_rate(m['identity_candidate_states'], m['decisions'])}"
                  f" | departed {_rate(m.get('confidence_departed_states', 0), m.get('confidence_labeled_states', 0))}")
@@ -167,9 +171,9 @@ def _direct_training_lines(row):
         lines[-1] += f" | bank following {row['bank_following_fraction']:.0%}"
     if 'decision_pair_fraction' in row:
         lines[-1] += f" | identity pairs {row['decision_pair_fraction']:.0%} (requested {row.get('decision_requested_fraction', 0.):.0%})"
-    if 'memory_grad_norm' in row:
-        lines.append(f"  gradients before clipping: memory {row['memory_grad_norm']:.3g}"
-                     f" (scale {row['memory_grad_clip_scale']:.3g})"
+    if 'history_grad_norm' in row:
+        lines.append(f"  gradients before clipping: history {row['history_grad_norm']:.3g}"
+                     f" (scale {row['history_grad_clip_scale']:.3g})"
                      f" | rest {row['rest_grad_norm']:.3g} (scale {row['rest_grad_clip_scale']:.3g})")
     if 'identity' in row:
         lines.extend(_identity_lines(row['identity']))

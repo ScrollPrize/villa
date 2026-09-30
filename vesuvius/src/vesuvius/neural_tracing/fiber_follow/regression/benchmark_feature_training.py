@@ -45,7 +45,6 @@ def main():
     cp = destination/source.name
     options.update(name=destination.name, out_root=str(destination.parent), resume=str(cp),
                    workers=args.workers, log_every=10)
-    options.update({key: ck['model_cfg'][key] for key in train.FEATURE_OPTIONS})
     destination.mkdir(parents=True)
     staged = dict(ck, training_options=options)
     torch.save(staged, cp)
@@ -79,7 +78,7 @@ def main():
                    compiled_graphs=counters['stats']['unique_graphs']-graphs_before,
                    peak_allocated_gib=torch.cuda.max_memory_allocated()/2**30,
                    peak_reserved_gib=torch.cuda.max_memory_reserved()/2**30,
-                   **{k: v for k, v in metrics.items() if k in ('loss', 'grad_norm', 'observed_states', 'endpoint_states', 'supervised_states', 'history_encoder_crops', 'memory_replay_observations') or k.startswith('replay_')})
+                   **{k: v for k, v in metrics.items() if k in ('loss', 'grad_norm', 'observed_states', 'endpoint_states', 'supervised_states', 'history_valid_slabs', 'history_encode_seconds') or k.startswith('replay_')})
         rows.append(row)
         with (destination/'timings.jsonl').open('a') as f:
             f.write(json.dumps(row)+'\n')
@@ -110,8 +109,8 @@ def main():
         peak_allocated_gib=max(r['peak_allocated_gib'] for r in measured_rows),
         peak_reserved_gib=max(r['peak_reserved_gib'] for r in measured_rows),
         supervised_states=sum(r['supervised_states'] for r in measured_rows),
-        memory_replay_observations=sum(r['memory_replay_observations'] for r in measured_rows),
-        history_encoder_crops=sum(r['history_encoder_crops'] for r in measured_rows),
+        history_valid_slabs=sum(r['history_valid_slabs'] for r in measured_rows),
+        history_encode_seconds=sum(r['history_encode_seconds'] for r in measured_rows),
         samples=rows)
     (destination/'benchmark.json').write_text(json.dumps(result, indent=2))
     print(json.dumps({k: v for k, v in result.items() if k not in ('samples', 'options', 'config')}), flush=True)

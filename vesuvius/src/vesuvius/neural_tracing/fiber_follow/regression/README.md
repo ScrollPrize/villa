@@ -325,13 +325,29 @@ tracing quality. Use fresh result paths and run the variants sequentially:
 
 ```bash
 python -m vesuvius.neural_tracing.fiber_follow.regression.benchmark_sparse_training \
-  --encoder patch4 --token-only --length 8 --streams 2 --warmup 2 --repeats 3 \
+  --encoder patch4 --token-only --length 24 --streams 2 --warmup 2 --repeats 3 \
   --out /tmp/token_checkpoint_on.json
 python -m vesuvius.neural_tracing.fiber_follow.regression.benchmark_sparse_training \
   --encoder patch4 --token-only --no-history-encoder-checkpointing \
-  --length 8 --streams 2 --warmup 2 --repeats 3 --out /tmp/token_checkpoint_off.json
+  --length 24 --streams 2 --warmup 2 --repeats 3 --out /tmp/token_checkpoint_off.json
 ```
 
 Peak allocated memory measures live PyTorch tensors; peak reserved memory also
 includes allocator-held space. Memory cost depends on historical crops retained
 for each decision and is not a universal constant for all stream lengths.
+
+A bounded RTX 5090 comparison (Torch 2.12.1, seed 194, two streams of 24
+observations, two warmups and three measured updates, two refinement steps)
+measured the following for the token-only model. Each update had 48 observations,
+six supervised decisions, 14 historical encoder crops with gradients and 90
+writer replay operations, exercising all three historical age bands.
+
+| Historical encoder checkpointing | Peak allocated | Peak reserved | Mean update | p50 / p95 |
+| --- | --- | --- | --- | --- |
+| Enabled (default) | 1.310 GiB | 1.457 GiB | 913 ms | 910 / 921 ms |
+| Disabled | 2.967 GiB | 3.195 GiB | 892 ms | 892 / 897 ms |
+
+Disabling it used **1.658 GiB more live tensor memory** in this workload. The
+measured time reduction was only 2.2%, from a short sample. This excludes I/O and
+is not a tracing-quality comparison. The default remains enabled. Full local
+results and exact commands are in `output/token_only_validation/comparison.json`.

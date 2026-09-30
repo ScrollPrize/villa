@@ -24,7 +24,7 @@ from vesuvius.neural_tracing.fiber_follow.regression.model import DirectConfig, 
 from vesuvius.neural_tracing.fiber_follow.regression.data import (
     image_crop, ObservationBuilder, IdentityObservationBuilder, augment_image_pair, DirectTracer,
 )
-from vesuvius.neural_tracing.fiber_follow.regression.memory_data import memory_layout
+from vesuvius.neural_tracing.fiber_follow.regression.history_slabs import slab_layout
 from vesuvius.neural_tracing.fiber_follow.regression.train import (
     save_checkpoint, load_checkpoint, checkpoint_config, build_parser,
 )
@@ -59,8 +59,7 @@ def volume(root, nx=None, ny=None):
 
 def config(**kwargs):
     options=dict(fine=CropSpec(depth=16,width=9,behind=7,spacing=.5),channels=4,hidden=16,
-                 heads=2,layers=1,decoder_layers=1,n_future=4,n_history=8,
-                 memory_slots=2,memory_steps=2,memory_stride=1,feature_detail_tokens=4)
+                 heads=2,layers=1,decoder_layers=1,n_future=4,n_history=8)
     options.update(kwargs)
     return DirectConfig(**options)
 
@@ -73,8 +72,7 @@ def item(cfg):
     return dict(pos=np.array([20.,20.,20.]),frame=frame,hist_local=np.zeros((cfg.n_history,3)),
         hmask=np.zeros(cfg.n_history),seed_valid=True,seed_pos=np.array([19.,20.,19.]),
         seed_tangent=np.array([.8,0,.6]),seed_age=2.,
-        memory_track=dict(pos=np.array([[19.,20.,19.],[20.,20.,19.5]]),
-            frame=np.stack([frame_from_heading(np.array([1.,0.,0.])),frame_from_heading(np.array([0.,1.,0.]))])))
+        observed_path=np.array([[19.,20.,19.],[20.,20.,19.5],[20.,20.,20.]]))
 
 
 class DirectionInputTests(unittest.TestCase):
@@ -199,12 +197,10 @@ class DirectionInputTests(unittest.TestCase):
             vol=volume(Path(tmp));state=item(cfg);builder=ObservationBuilder(cfg)
             x=builder.images([state],vol)
             world=decode_direction_bytes(np.array([204],np.uint8),np.array([77],np.uint8))[0]
-            observations,seed=memory_layout(state,cfg)
+            observations,seed=slab_layout(state),None
             expected=local_direction_moments(world,state['frame'])
             np.testing.assert_allclose(x['fine'][0,2:,:,4,4].numpy(),np.repeat(expected[:,None],cfg.fine.depth,1),atol=2e-7)
-            seed_x=x['feature_seed_x']
-            np.testing.assert_allclose(seed_x['fine'][0,2:,7,4,4],local_direction_moments(world,seed['frame']),atol=2e-7)
-            self.assertFalse(np.allclose(x['fine'][0,2:,7,4,4],seed_x['fine'][0,2:,7,4,4]))
+            self.assertEqual(x['history_slabs'].shape[2],2)  # CT/path only, no direction channels
             # Actual DirectTracer uses the same sampling path; exercise reconstructed
             # causal history rather than the optional explicit memory_track.
             plain={k:v for k,v in state.items() if k!='memory_track'}
@@ -214,7 +210,9 @@ class DirectionInputTests(unittest.TestCase):
             try:
                 actual=tracer.build_inputs(np.array([plain['pos']]),np.array([plain['frame']]),
                     np.array([plain['hist_local']]),np.array([plain['hmask']]),[plain])
-                for k in expected_x:torch.testing.assert_close(actual[k],expected_x[k],rtol=0,atol=0)
+                for k in expected_x:
+                    if k != 'history_load_seconds':
+                        torch.testing.assert_close(actual[k],expected_x[k],rtol=0,atol=0)
             finally:tracer.close()
             warm=dict(plain,memory_warm=True)
             online=builder.images([warm],vol)

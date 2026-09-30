@@ -21,14 +21,15 @@ from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolumeSpec
 
 def config():
     return DirectConfig(fine=CropSpec(depth=16, width=12, behind=7),
-                        channels=4, hidden=16, heads=2, layers=1, decoder_layers=1, activation_checkpointing=False, n_future=4, n_history=32, memory_slots=4, memory_steps=4, feature_detail_tokens=4, recurrent_refinement_steps=0)
+                        channels=4, hidden=16, heads=2, layers=1, decoder_layers=1, activation_checkpointing=False, n_future=4, n_history=32, recurrent_refinement_steps=0)
 
 
 def batch(cfg, b=2):
     hist = torch.zeros(b, cfg.n_history, 3)
     hist[..., 2] = -torch.arange(1, cfg.n_history+1)
     q = 4*(cfg.n_future-1)+1
-    return dict(x={name: torch.rand(b, 2, crop.depth, crop.width, crop.width)
+    from slab_fixtures import slab_inputs
+    return dict(x=slab_inputs(b) | {name: torch.rand(b, 2, crop.depth, crop.width, crop.width)
                    for name, crop in (('fine', cfg.fine),)} | dict(
                     query_frame=torch.eye(3).expand(b,-1,-1).clone(),query_position=torch.zeros(b,3),
                     feature_seed_here=torch.ones(b,dtype=torch.bool),memory_mask=torch.ones(b,1,dtype=torch.bool),
@@ -143,9 +144,9 @@ def test_microbatch_partition_keeps_objective_and_update():
 @pytest.mark.parametrize('compiled', [False, True])
 def test_memory_spike_cannot_scale_other_gradients(compiled):
     model = torch.nn.Module()
-    model.recurrent_memory = torch.nn.Linear(2, 1, bias=False)
+    model.history_encoder = torch.nn.Linear(2, 1, bias=False)
     model.encoder = torch.nn.Linear(2, 1, bias=False)
-    memory, rest = model.recurrent_memory.weight, model.encoder.weight
+    memory, rest = model.history_encoder.weight, model.encoder.weight
     memory.grad = torch.tensor([[3e6, 4e6]])
     rest.grad = torch.tensor([[3., 4.]])
     if compiled:
@@ -153,37 +154,37 @@ def test_memory_spike_cannot_scale_other_gradients(compiled):
     metrics = clip_training_gradients(model, 5., 20.)
     torch.testing.assert_close(memory.grad, torch.tensor([[3., 4.]]))
     torch.testing.assert_close(rest.grad, torch.tensor([[3., 4.]]), rtol=0, atol=0)
-    assert metrics['memory_grad_norm'] == pytest.approx(5e6)
+    assert metrics['history_grad_norm'] == pytest.approx(5e6)
     assert metrics['rest_grad_norm'] == 5.
-    assert metrics['memory_grad_clip_scale'] == pytest.approx(1e-6)
+    assert metrics['history_grad_clip_scale'] == pytest.approx(1e-6)
     assert metrics['rest_grad_clip_scale'] == 1.
 
 
 def test_clipping_can_be_disabled_independently():
     model = torch.nn.Module()
-    model.recurrent_memory = torch.nn.Linear(2, 1, bias=False)
+    model.history_encoder = torch.nn.Linear(2, 1, bias=False)
     model.encoder = torch.nn.Linear(2, 1, bias=False)
     for memory_cap, rest_cap in [(0., 20.), (5., 0.)]:
-        model.recurrent_memory.weight.grad = torch.tensor([[30., 40.]])
+        model.history_encoder.weight.grad = torch.tensor([[30., 40.]])
         model.encoder.weight.grad = torch.tensor([[30., 40.]])
         result = clip_training_gradients(model, memory_cap, rest_cap)
-        assert model.recurrent_memory.weight.grad.norm().item() == pytest.approx(memory_cap or 50.)
+        assert model.history_encoder.weight.grad.norm().item() == pytest.approx(memory_cap or 50.)
         assert model.encoder.weight.grad.norm().item() == pytest.approx(rest_cap or 50.)
-        assert result['memory_grad_norm'] == result['rest_grad_norm'] == 50.
+        assert result['history_grad_norm'] == result['rest_grad_norm'] == 50.
 
 
-@pytest.mark.parametrize('bad_group', ['recurrent_memory', 'encoder'])
+@pytest.mark.parametrize('bad_group', ['history_encoder', 'encoder'])
 @pytest.mark.parametrize('cap', [0., 5.])
 def test_nonfinite_gradients_raise_before_clipping_either_group(bad_group, cap):
     model = torch.nn.Module()
-    model.recurrent_memory = torch.nn.Linear(2, 1, bias=False)
+    model.history_encoder = torch.nn.Linear(2, 1, bias=False)
     model.encoder = torch.nn.Linear(2, 1, bias=False)
     for p in model.parameters():
         p.grad = torch.full_like(p, 100.)
     getattr(model, bad_group).weight.grad.fill_(float('inf'))
     with pytest.raises(RuntimeError, match='non-finite'):
         clip_training_gradients(model, cap, cap)
-    for name in ('recurrent_memory', 'encoder'):
+    for name in ('history_encoder', 'encoder'):
         if name != bad_group:
             assert (getattr(model, name).weight.grad == 100.).all()
 
@@ -228,12 +229,12 @@ def test_training_compilation_emulates_eager_bf16_rounding(monkeypatch):
     assert prepare_training(model) is model
     assert not hasattr(model, '_orig_mod')
     assert [fn.__name__ for fn, _ in compiled] == [
-        'training_forward', 'score_candidates', 'collect_observation_features', 'replay_observation_features', 'observe_tokens']
+        'training_forward', 'score_candidates']
     assert all(options == dict(dynamic=False, fullgraph=True) for _, options in compiled)
     assert list(model.parameters()) == parameters
     assert list(model.state_dict()) == keys
     assert prepare_training(model) is model
-    assert len(compiled) == 5  # Setup is idempotent.
+    assert len(compiled) == 2  # Setup is idempotent.
     assert torch._inductor.config.emulate_precision_casts
 
 

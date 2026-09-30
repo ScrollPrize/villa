@@ -20,6 +20,8 @@ class SegmentSurvivalScorer(nn.Module):
         self.query = nn.Sequential(nn.LayerNorm(width), nn.Linear(width, h), nn.SiLU())
         self.layers = nn.ModuleList(PathDecoderLayer(h, cfg.heads, 2*h, dropout=0.,
             activation='gelu', batch_first=True, norm_first=True) for _ in range(2))
+        from .history_slabs import HistoryAttention
+        self.history_attention = HistoryAttention(h, cfg.heads)
         self.norm = nn.LayerNorm(h)
         self.failure = nn.Linear(h, 1)
         self.plane_projection = None if cfg.token_only else nn.Linear(cfg.channels, h)
@@ -39,7 +41,7 @@ class SegmentSurvivalScorer(nn.Module):
     def project_memory(self, memory, padding):
         return [layer.compact_memory(layer.project_memory(memory), padding) for layer in self.layers]
 
-    def forward(self, spatial, points, projected, padding):
+    def forward(self, spatial, points, projected, padding, history):
         start = torch.cat((torch.zeros_like(points[:, :1]), points[:, :-1]), 1)
         delta = points-start
         geometry = torch.cat((start, points, delta, delta.norm(dim=-1, keepdim=True)), -1)/16.
@@ -49,7 +51,8 @@ class SegmentSurvivalScorer(nn.Module):
         k = points.shape[1]
         causal = torch.ones(k, k, device=points.device, dtype=torch.bool).triu(1)
         for layer, kv in zip(self.layers, projected):
-            query = layer.forward_cached(query, kv, padding, causal_mask=causal)
+            query = layer.forward_cached(query, kv, padding, causal_mask=causal,
+                                         history=history, history_attention=self.history_attention)
         # Preserve precision before thresholding/ranking proposals. Casting the
         # logits after a BF16 projection cannot recover its rounding loss.
         with torch.autocast(query.device.type, enabled=False):

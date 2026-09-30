@@ -20,14 +20,14 @@ def test_production_defaults_and_explicit_overrides():
     parser = build_parser()
     args = vars(parser.parse_args(REQUIRED))
     expected = dict(steps=100000, batch=8, microbatch=4, workers=8, n_commit=16,
-                    direction_inputs=True, feature_switch_crop_fraction=.15,
+                    direction_inputs=True,
                     memory_switch_probability=.3, decision_fraction=.3,
                     bank_wrong_continuation_probability=0., bank_following_probability=.2,
                     presence_dropout=0., diag_every=5000, dagger_after=96.,
-                    recurrent_refinement_steps=2, warmup=500, feature_history_decisions=2)
+                    recurrent_refinement_steps=2, warmup=500)
     assert {key: args[key] for key in expected} == expected
     assert 'compile' not in args
-    for option in ('--compile', '--no-compile', '--feature-replay-weight'):
+    for option in ('--compile', '--no-compile', '--feature-replay-weight', '--memory-slots', '--memory-steps', '--memory-stride', '--feature-sequence-length', '--history-encoder-checkpointing'):
         with pytest.raises(SystemExit):
             parser.parse_args(REQUIRED+[option])
     root = Path(__file__).resolve().parents[1]

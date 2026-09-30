@@ -62,6 +62,7 @@ def test_unsafe_synthetic_departure_falls_back_to_original_replay(tmp_path):
         pos=np.array([[7.,0.,100.]]),frame=np.eye(3)[None],
         hist=np.c_[np.full(64,7.),np.zeros(64),100.-np.arange(1,65)][None],
         hmask=np.ones((1,64)),provenance={'step':1000})
+    replay.observed_prefix = lambda j: np.concatenate((replay.hist[j][np.asarray(replay.hmask[j])>0][::-1], replay.pos[j:j+1]))
     state = ds.replay_item((2,4,replay,0),np.random.default_rng(8))
     assert state['source'] == 2 and state['source_step'] == 1000
     np.testing.assert_array_equal(state['pos'],replay.pos[0])

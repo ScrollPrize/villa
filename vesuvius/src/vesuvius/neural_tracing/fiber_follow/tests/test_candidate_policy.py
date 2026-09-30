@@ -115,6 +115,7 @@ def test_recovery_rows_use_the_candidate_selected_at_each_threshold():
         t=np.array([150.]),reverse=np.array([False]),offtrack=np.array([False]),drift=np.array([0.]))
     class States:
         def __len__(self): return 1
+        def observed_prefix(self, j): return np.concatenate((states.hist[j][::-1], states.pos[j:j+1]))
         def __getattr__(self,name): return getattr(states,name)
     points,confidence=proposals();points[:,0,:,0]=3.
     class Model:

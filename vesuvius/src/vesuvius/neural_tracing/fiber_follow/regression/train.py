@@ -33,7 +33,7 @@ from vesuvius.neural_tracing.fiber_follow.regression.diagnostics import (
     candidate_decisions, summarize_candidates,
 )
 from vesuvius.neural_tracing.fiber_follow.regression.recovery import monitor_fixture, evaluate_monitor
-from vesuvius.neural_tracing.fiber_follow.regression.feature_sequences import FEATURE_SAMPLING_REVISION
+from vesuvius.neural_tracing.fiber_follow.regression.history_slabs import SAMPLING_REVISION
 from vesuvius.neural_tracing.fiber_follow.regression.identity_decisions import CANDIDATE_COUNT
 from vesuvius.neural_tracing.fiber_follow.shared.training_log import format_training_log, DirectTrainingInterval
 
@@ -88,9 +88,6 @@ def prepare_training(model, batch_size=2, *, backend=None):
     model._training_refined = None
     model.training_forward = torch.compile(model.training_forward, **options)
     model.score_candidates = torch.compile(model.score_candidates, **options)
-    model.collect_observation_features = torch.compile(model.collect_observation_features, **options)
-    model.replay_observation_features = torch.compile(model.replay_observation_features, **options)
-    model.recurrent_memory.observe_tokens = torch.compile(model.recurrent_memory.observe_tokens, **options)
     return model
 
 
@@ -104,101 +101,19 @@ def fixed_rows(value, size):
     return torch.empty_like(value, memory_format=torch.contiguous_format).copy_(value)
 
 
-def differentiable_state(state, size):
-    """Uniform autograd metadata without reconnecting a detached history.
-
-    Constant/detached fields become leaves whose input gradients are discarded.
-    Already attached fields retain their graph, including learned reset slots
-    and every preceding writer transition reconstructed for this decision.
-    """
-    result = {}
-    for name in sorted(state):
-        value = state[name]
-        value = fixed_rows(value, size)
-        if value.is_floating_point() and not value.requires_grad:
-            value.requires_grad_(True)
-        result[name] = value
-    return result
-
-
-def pack_feature_chunks(chunks, size):
-    """Pack independent partial chunks within their existing optimizer update.
-
-    Keep chunks of a repeated stream in their original chronological order.
-    Full worker chunks are reused without copying their large crops.
-    Real rows alone reach the losses, metrics and persistent observation history.
-    """
-    if any('feature_sequence' not in chunk or 'stream_id' not in chunk['feature_sequence'][0]
-           for chunk in chunks):
-        return chunks
-    seen, complete, pending = set(), [], []
-    def row(batch, j):
-        return {key: row(value, j) if isinstance(value, dict) else value[j:j+1]
-                for key, value in batch.items()}
-    for chunk in chunks:
-        sequence = chunk['feature_sequence']
-        names = sequence[0]['stream_id'].tolist()
-        if seen.intersection(names):
-            return chunks
-        seen.update(names)
-        if len(names) == size:
-            complete.append(chunk)
-            continue
-        if len(names) > size:
-            raise ValueError('Worker chunk exceeds compiled stream batch')
-        for name in names:
-            rows = []
-            for batch in sequence:
-                ids = batch['stream_id'].tolist()
-                if name in ids:
-                    rows.append(row(batch, ids.index(name)))
-            pending.append(rows)
-    def schema(batch):
-        return tuple((key, schema(value) if isinstance(value, dict) else (value.dtype, value.shape[1:]))
-                     for key, value in sorted(batch.items()))
-    if pending and any(schema(rows[0]) != schema(pending[0][0]) for rows in pending):
-        return chunks
-    def combine(rows):
-        result = {}
-        for key in rows[0]:
-            values = [r[key] for r in rows]
-            if isinstance(values[0], dict):
-                result[key] = combine(values)
-            elif len(values) == 1:
-                result[key] = values[0]
-            elif values[0].is_pinned() and not any(v.requires_grad for v in values):
-                target = torch.empty((sum(len(v) for v in values), *values[0].shape[1:]),
-                                     dtype=values[0].dtype, pin_memory=True)
-                result[key] = torch.cat(values, out=target)
-            else:
-                result[key] = torch.cat(values)
-        return result
-    pending.sort(key=len, reverse=True)
-    for start in range(0, len(pending), size):
-        streams = pending[start:start+size]
-        # Observation-only rows omit target tensors. Do not merge incompatible
-        # schemas, including a mismatch later in a chunk whose first rows agree.
-        for t in range(max(map(len, streams))):
-            rows = [rows[t] for rows in streams if t < len(rows)]
-            if any(schema(row) != schema(rows[0]) for row in rows[1:]):
-                return chunks
-        complete.append(dict(feature_sequence=[combine([rows[t] for rows in streams if t < len(rows)])
-                                               for t in range(max(map(len, streams)))]))
-    return complete
-
-
 def training_inputs(x, hist, hmask, size):
     b = len(hist)
     defaults = dict(seed=hist.new_zeros(b, 1, 3), seed_mask=hist.new_zeros(b, 1),
                     seed_tangent=hist.new_zeros(b, 3), seed_age=hist.new_zeros(b))
     names = ('fine', 'seed', 'seed_mask', 'seed_tangent', 'seed_age',
-             'query_frame', 'query_position', 'feature_seed_here')
+             'history_tokens', 'history_padding')
     image = {name: fixed_rows(x[name] if name in x else defaults[name], size) for name in names}
     return image, fixed_rows(hist, size), fixed_rows(hmask, size)
 
 
 def begin_training_update(model):
     model._training_refined = torch.zeros((), device=next(model.parameters()).device, dtype=torch.bool)
+    model._history_timings = []
 
 
 def finish_training_update(model):
@@ -209,23 +124,25 @@ def finish_training_update(model):
                 parameter.grad = None
 
 
-def training_prediction(model, x, hist, hmask, candidates=None, memory=None, confidence_threshold=.5, n_commit=None):
+def training_prediction(model, x, hist, hmask, candidates=None, confidence_threshold=.5, n_commit=None):
     actual = len(hist)
     # Replay endpoints are single crops. Computing a duplicate second row
     # also duplicates the encoder, proposals and candidate-scoring work.
     # Keep only two batch specializations: one row or the configured batch.
     size = 1 if actual == 1 else model.training_batch_size
-    if 'feature_seed_x' in x:
-        seed_x = x['feature_seed_x']
-        empty = torch.zeros_like(hmask)
-        features = training_observation_features(model, seed_x, torch.zeros_like(hist), empty)
-        memory, _ = training_memory_transition(model, *features, seed_x, memory)
-    if memory is None:
-        memory = model.initial_memory(actual, hist.device)
-    image, history, mask = training_inputs(x, hist, hmask, size)
-    state = differentiable_state(memory, size)
+    # Compact live slabs before the fixed-shape compiled decision graph.
+    # Convolutions see valid slots only; gradients remain attached across heads.
+    timing = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)) if hist.is_cuda else time.perf_counter()
+    if hist.is_cuda:
+        timing[0].record()
+    tokens, padding = model.encode_history(x)
+    if hist.is_cuda:
+        timing[1].record()
+    if hasattr(model, '_history_timings'):
+        model._history_timings.append(timing if hist.is_cuda else time.perf_counter()-timing)
+    image, history, mask = training_inputs(dict(x, history_tokens=tokens, history_padding=padding), hist, hmask, size)
     threshold = hist.new_full((), confidence_threshold)
-    output, context = model.training_forward(image, history, mask, state, threshold)
+    output, context = model.training_forward(image, history, mask, threshold)
     if candidates is not None:
         count = candidates.shape[1]
         if not 0 < count <= CANDIDATE_COUNT:
@@ -247,24 +164,6 @@ def training_prediction(model, x, hist, hmask, candidates=None, memory=None, con
         begin_training_update(model)
     model._training_refined = model._training_refined | output['refinement_mask'][:, 1:].any()
     return model.select_prediction(output, confidence_threshold, n_commit)
-
-
-def training_observation_features(model, x, hist, hmask):
-    """Canonical inputs for a selected historical or externally supplied seed crop."""
-    return model.replay_observation_features(*training_inputs(x, hist, hmask, len(hist)))
-
-
-def training_memory_transition(model, tokens, local_xyz, valid, pose, state=None):
-    size = len(tokens)
-    if state is None:
-        state = model.initial_memory(size, tokens.device)
-    tokens = fixed_rows(tokens, size)
-    if not tokens.requires_grad:
-        tokens.requires_grad_(True)
-    pose = {name: fixed_rows(pose[name], size) for name in
-            ('query_position', 'query_frame', 'feature_seed_here')}
-    return model.recurrent_memory.observe_tokens(tokens, fixed_rows(local_xyz, size), fixed_rows(valid, size),
-                            pose, differentiable_state(state, size))
 
 
 def match_optimizer_layout(opt):
@@ -291,13 +190,13 @@ def initialize_training_optimizer(model, ema, args, resume=None):
 
 
 ARCHITECTURES = (ARCHITECTURE, PATCH_ARCHITECTURE, TOKEN_ARCHITECTURE)
-FEATURE_OPTIONS = ('feature_detail_tokens', 'feature_stream_steps', 'feature_history_decisions',
-                   'feature_switch_crop_fraction', 'feature_history_loss_fraction')
-MEMORY_GRAD_CLIP = 5.
+HISTORY_GRAD_CLIP = 5.
 REST_GRAD_CLIP = 100.
 
 
 def checkpoint_config(ck):
+    if ck['architecture'] not in ARCHITECTURES:
+        raise ValueError('Historical slabs require fresh v10 training and replay v6')
     cfg = DirectConfig(**ck['model_cfg'])
     if ck['architecture'] != cfg.architecture:
         raise ValueError('Checkpoint architecture does not match its encoder configuration')
@@ -353,12 +252,11 @@ class DecisionBatchPrefetch:
         self.closed = False
 
     def collect(self):
-        from .feature_sequences import sequence_steps, decision_count
         chunks, count = [], 0
         while count < self.decisions:
             chunk = next(self.iterator)
             chunks.append(chunk)
-            count += sum(decision_count(row) for row in sequence_steps(chunk))
+            count += len(chunk['hist'])
         return chunks
 
     def __next__(self):
@@ -376,7 +274,7 @@ class DecisionBatchPrefetch:
 
 
 @torch.no_grad()
-def training_diagnostics(model, cpu_batch, tracer, fibers, seeds, out, step, log, *, device, memory=None):
+def training_diagnostics(model, cpu_batch, tracer, fibers, seeds, out, step, log, *, device):
     """Plot EMA proposals and the same monitor rollouts used for logged metrics."""
     from vesuvius.neural_tracing.fiber_follow.shared.diag import plot_batch, plot_curves, plot_refinement, plot_rollouts
     from vesuvius.neural_tracing.fiber_follow.shared.evaluate import evaluate
@@ -394,7 +292,7 @@ def training_diagnostics(model, cpu_batch, tracer, fibers, seeds, out, step, log
     try:
         with torch.autocast('cuda', dtype=torch.bfloat16, enabled=torch.device(device).type == 'cuda'):
             prediction = model(batch['x'], batch['hist'], batch['hmask'],
-                               memory=None if memory is None else take(memory), n_commit=tracer.p.n_commit)
+                               n_commit=tracer.p.n_commit)
         points = prediction['points']
         target = torch.cat((batch['plane_ab'], points[..., 2:]), -1)
         for scale, crop in (('fine', model.cfg.fine),):
@@ -446,20 +344,15 @@ IDENTITY_SUMS = ('identity_correct_count',
                  'candidate_late_failures', 'candidate_first_failures', 'candidate_supervision_weight')
 
 
-def clip_training_gradients(model, memory_max_norm=MEMORY_GRAD_CLIP, rest_max_norm=REST_GRAD_CLIP):
-    """Clip memory separately so its recurrent spikes cannot scale image gradients.
-
-    Zero disables clipping for a group, but never disables finite-gradient checks.
-    Identify the recurrent-memory parameter group by object identity.
-    Check both groups before modifying either group's gradients.
-    """
-    limits = dict(memory=memory_max_norm, rest=rest_max_norm)
+def clip_training_gradients(model, history_max_norm=HISTORY_GRAD_CLIP, rest_max_norm=REST_GRAD_CLIP):
+    """Clip the slab encoder separately; check both groups before modifying gradients."""
+    limits = dict(history=history_max_norm, rest=rest_max_norm)
     if any(not math.isfinite(v) or v < 0 for v in limits.values()):
         raise ValueError('Gradient clipping limits must be finite and nonnegative (0 disables clipping)')
     parameters = list(model.parameters())
-    memory = getattr(model, 'recurrent_memory', None)
+    memory = getattr(model, 'history_encoder', None)
     memory_ids = {id(p) for p in memory.parameters()} if memory is not None else set()
-    groups = dict(memory=[p for p in parameters if id(p) in memory_ids],
+    groups = dict(history=[p for p in parameters if id(p) in memory_ids],
                   rest=[p for p in parameters if id(p) not in memory_ids])
     norms = {name: torch.nn.utils.get_total_norm(
         [p.grad for p in params if p.grad is not None], error_if_nonfinite=True)
@@ -475,63 +368,16 @@ def clip_training_gradients(model, memory_max_norm=MEMORY_GRAD_CLIP, rest_max_no
     return metrics
 
 
-def training_decisions(model, batches, history, device):
-    """Collect every observation; yield only supervised, causally replayed decisions.
-
-    The caller records the decision's observation after its single task backward.
-    No writer graph crosses decisions or optimizer updates. Only detached visual
-    evidence and the bounded selected CPU crops persist between loader chunks.
-    """
-    from .feature_sequences import sequence_steps
-    from .stratified_replay import take_rows
-    for chunk in batches:
-        for cpu in sequence_steps(chunk):
-            if 'stream_id' not in cpu:
-                yield cpu, None, {}
-                continue
-            history.start(cpu)
-            selected = cpu['decision_mask'].bool()
-            if (cpu['stream_end'] & ~selected).any():
-                raise ValueError('Every endpoint must be a supervised decision')
-            indices = (~selected).nonzero().flatten()
-            if len(indices):
-                observation = take_rows(cpu, indices)
-                batch = move_batch({k: observation[k] for k in ('x', 'hist', 'hmask')}, device)
-                with torch.no_grad(), torch.autocast('cuda', dtype=torch.bfloat16,
-                                                     enabled=torch.device(device).type == 'cuda'):
-                    features = model.collect_observation_features(
-                        *training_inputs(batch['x'], batch['hist'], batch['hmask'], len(indices)))
-                history.record(observation, features)
-                del features, batch
-            for j in selected.nonzero().flatten().tolist():
-                decision = take_rows(cpu, slice(j, j+1))
-                with torch.autocast('cuda', dtype=torch.bfloat16, enabled=torch.device(device).type == 'cuda'):
-                    state, counts = history.reconstruct(model, decision, device)
-                yield decision, state, counts
-
-
 def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolerance=1.5,
                      confidence_weight=.5, ema_decay=.999, n_commit=None, compute_metrics=True,
                      candidate_weight=1.,
-                     memory_grad_clip=MEMORY_GRAD_CLIP, rest_grad_clip=REST_GRAD_CLIP, stream_states=None,
+                     history_grad_clip=HISTORY_GRAD_CLIP, rest_grad_clip=REST_GRAD_CLIP,
                      diagnostic=None):
-    """Fixed stream loss budgets, independent of microbatch boundaries.
-
-    Every selected decision has one loss using reconstructed memory. Loss weights
-    sum to one per stream and the update divides by its supervised decision count,
-    never its observation count or its realized sum of weights. Observation-only
-    calls collect history without advancing AdamW/EMA; the main loop gathers at
-    least the requested decision batch before calling this function.
-    """
-    from .feature_sequences import sequence_steps, decision_count
-    from .stratified_replay import ObservationHistory
-    stream_states = ObservationHistory() if stream_states is None else stream_states
+    """One equally weighted task loss per independent supervised decision."""
     prepare_training(model, getattr(model, 'training_batch_size', 2))
-    batches = pack_feature_chunks(batches, model.training_batch_size)
-    observed = sum(len(b['hist']) for chunk in batches for b in sequence_steps(chunk))
-    total = sum(decision_count(b) for chunk in batches for b in sequence_steps(chunk))
-    if observed < 1:
-        raise ValueError('An update needs at least one observation')
+    total = observed = sum(len(batch['hist']) for batch in batches)
+    if total < 1:
+        raise ValueError('An update needs at least one supervised decision')
     denominator = max(1, total)
     for group in opt.param_groups:
         group['lr'] = lr
@@ -545,33 +391,32 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
     candidate_groups = {}
     requested_decisions = 0.
     decisions = []
-    memory = {}
     model.train()
-    sums.update(memory_replay_observations=0, history_encoder_crops=0)
-    for cpu, carried, replay_counts in training_decisions(model, batches, stream_states, device):
+    for cpu in batches:
         batch = move_batch(cpu, device)
-        for key, value in replay_counts.items():
-            sums[key] += value
+        valid = cpu['x']['history_valid']
+        for name, value in dict(history_valid_slabs=valid.sum(),
+                history_age_sum=cpu['x']['history_ages'][valid].sum(),
+                history_overlap_sum=cpu['x']['history_overlap'][valid].sum(),
+                history_load_seconds=cpu['x']['history_load_seconds'].sum()).items():
+            sums[name] = sums.get(name, 0.)+float(value)
         if diagnostic is not None:
-            diagnostic.update(cpu_batch=cpu, memory=None if carried is None else
-                              {k: v.detach() for k, v in carried.items()})
+            diagnostic.update(cpu_batch=cpu)
         scoring = {}
         if 'candidate_points' in batch and cpu['candidate_mask'].any():
             scoring['candidates'] = batch['candidate_points']
         with torch.autocast('cuda', dtype=torch.bfloat16, enabled=torch.device(device).type == 'cuda'):
-            output = training_prediction(model, batch['x'], batch['hist'], batch['hmask'], memory=carried,
+            output = training_prediction(model, batch['x'], batch['hist'], batch['hmask'],
                            n_commit=commit_window(model.cfg, n_commit), **scoring)
             terms = loss_terms(output, batch, model.cfg, tolerance, n_commit=n_commit)
-            geometry = weighted_state_sum(terms['geometry_per_state'], batch)/denominator
-            confidence = weighted_state_sum(terms['confidence_per_state'], batch)/denominator
+            geometry = terms['geometry_per_state'].sum()/denominator
+            confidence = terms['confidence_per_state'].sum()/denominator
             loss = geometry + confidence_weight*confidence
             if 'candidate_per_state' in terms:
-                candidate_loss = weighted_state_sum(terms['candidate_per_state'], batch)/denominator
+                candidate_loss = terms['candidate_per_state'].sum()/denominator
                 loss = loss+candidate_weight*candidate_loss
                 accumulate(identity, 'candidate_loss', candidate_loss)
         loss.backward()
-        if 'stream_id' in cpu:
-            stream_states.record(cpu, tuple(output['observation_'+name] for name in ('tokens', 'xyz', 'valid')))
         if compute_metrics:
             decisions.extend(decision_rows(output, batch, model.cfg, n_commit, tolerance))
             if 'candidate_confidence_logits' in output:
@@ -585,8 +430,8 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
         for key in ('presence_dropped', 'blurred', 'foreign_components', 'seed_present', 'identity_observable'):
             if key in cpu:
                 identity[key] = identity.get(key, 0.)+float((cpu[key] > 0).sum())
-        weights = cpu.get('loss_weight', torch.ones(len(cpu['hist'])))
-        endpoint = cpu.get('stream_end', torch.ones(len(weights), dtype=torch.bool))
+        weights = torch.ones(len(cpu['hist']))
+        endpoint = torch.ones(len(weights), dtype=torch.bool)
         matched = endpoint & (cpu.get('decision_kind', torch.zeros(len(weights))) > 0)
         choice = endpoint & (cpu.get('decision_kind', torch.zeros(len(weights))) == 1)
         for name, select in (('supervision', torch.ones_like(endpoint)), ('endpoint', endpoint),
@@ -620,17 +465,23 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
                 sources[source] += int((cpu['source'] == source).sum())
             if 'bank_tail_length' in cpu:
                 bank_tails.extend(cpu['bank_tail_length'][cpu['source'] == 3].tolist())
-    resolve_device_sums(sums, identity, memory)
+    resolve_device_sums(sums, identity)
+    sums['history_encode_seconds'] = sum(t[0].elapsed_time(t[1])/1000 if isinstance(t, tuple) else t
+                                         for t in model._history_timings)
     # The summed loss is finite only if every microbatch loss was; checked before any update.
     if not math.isfinite(sums['loss']):
         raise FloatingPointError(f'Nonfinite loss at step {step}')
     if total:
         finish_training_update(model)
-        sums.update(clip_training_gradients(model, memory_grad_clip, rest_grad_clip))
+        sums.update(clip_training_gradients(model, history_grad_clip, rest_grad_clip))
         opt.step()
         update_ema(ema, model, step, ema_decay)
     sums.update(observed_states=observed, supervised_states=total,
                 observation_only_states=observed-total, optimizer_applied=bool(total))
+    slab_count = max(1., sums['history_valid_slabs'])
+    sums.update(history_age_mean=sums['history_age_sum']/slab_count,
+                history_overlap_mean=sums['history_overlap_sum']/slab_count,
+                history_valid_slabs_mean=sums['history_valid_slabs']/denominator)
     sums['refinement_attempts_mean'] = sums.get('refinement_attempts_sum', 0.)/denominator
     sums.update(error_mean=sums['error_sum']/max(1., sums['geometry_count']),
                 prefix_correct_fraction=sums['correct_count']/max(1., sums['confidence_count']),
@@ -641,14 +492,6 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
     sums.update(bank_wrong_continuation_tail_mean=float(np.mean(bank_tails)) if bank_tails else None,
                 bank_wrong_continuation_tail_min=min(bank_tails) if bank_tails else None,
                 bank_wrong_continuation_tail_max=max(bank_tails) if bank_tails else None)
-    if memory:
-        memory.update(probe_identity_accuracy=memory.get('identity_correct', 0.)/max(1., memory.get('identity_count', 0.)),
-                      probe_departed_recall=memory.get('departed_correct', 0.)/max(1., memory.get('departed_count', 0.)),
-                      probe_offset_error_mean=memory.get('offset_error_sum', 0.)/max(1., memory.get('offset_count', 0.)),
-                      labeled_writes_per_state=memory.get('labeled_writes', 0.)/denominator,
-                      labeled_state_fraction=memory.get('labeled_states', 0.)/denominator,
-                      departed_state_fraction=memory.get('departed_states', 0.)/denominator)
-        sums['memory'] = memory
     if identity:
         # Versioned separately from the distance metrics above.
         identity.update(identity_version=1,
@@ -685,8 +528,8 @@ def build_parser():
     ap.add_argument('--lr', type=float, default=3e-4)
     ap.add_argument('--warmup', type=int, default=500)
     ap.add_argument('--ema-decay', type=float, default=.999)
-    ap.add_argument('--memory-grad-clip', type=float, default=MEMORY_GRAD_CLIP,
-                    help='Gradient-norm limit for recurrent memory only; 0 disables clipping')
+    ap.add_argument('--history-grad-clip', type=float, default=HISTORY_GRAD_CLIP,
+                    help='Gradient-norm limit for historical slab encoder; 0 disables clipping')
     ap.add_argument('--rest-grad-clip', type=float, default=REST_GRAD_CLIP,
                     help='Independent gradient-norm limit for all other parameters; 0 disables clipping')
     ap.add_argument('--confidence-weight', type=float, default=.5)
@@ -697,26 +540,11 @@ def build_parser():
                     help='Image encoder: conv (default) or convolution-free 4x4x4 patches; inferred on resume')
     ap.add_argument('--token-only', action=argparse.BooleanOptionalAction, default=None,
                     help='Use only patch4 tokens throughout; no reconstructed fine features or output planes')
-    ap.add_argument('--history-encoder-checkpointing', action=argparse.BooleanOptionalAction, default=True,
-                    help='Recompute selected historical encoders during backward to save VRAM')
     ap.add_argument('--direction-inputs', action=argparse.BooleanOptionalAction, default=True,
-                    help='Add six sign-invariant direction channels to main, memory and seed crops; no image augmentations on these channels')
+                    help='Add six sign-invariant direction channels to main crops; no image augmentations on these channels')
     ap.add_argument('--decoder-layers', type=int, default=4)
     ap.add_argument('--axial-layers', type=int, default=4)
     ap.add_argument('--hidden', type=int, default=128)
-    ap.add_argument('--feature-sequence-length', type=int, default=DirectConfig.feature_sequence_length,
-                    help='Observation steps per loader chunk; no gradient truncation at chunk boundaries')
-    for name in FEATURE_OPTIONS:
-        default = .15 if name == 'feature_switch_crop_fraction' else getattr(DirectConfig, name)
-        ap.add_argument('--'+name.replace('_', '-'), type=type(default), default=default)
-    ap.add_argument('--feature-memory-grid', type=int, nargs=3, default=DirectConfig.feature_memory_grid,
-                    help='Pooled main-encoder spatial grid, depth height width')
-    ap.add_argument('--memory-slots', type=int, default=16,
-                    help='Positive number of persistent observation-memory slots')
-    ap.add_argument('--memory-steps', type=int, default=64,
-                    help='Number of cached main-encoder observations')
-    ap.add_argument('--memory-stride', type=int, default=DirectConfig.memory_stride,
-                    help='Spacing of historical observations in trace voxels; may change on resume')
     ap.add_argument('--memory-switch-probability', type=float, default=.3,
                     help='Fresh draws replaced by original-then-neighbor memory sequences')
     ap.add_argument('--memory-switch-tail', type=float, nargs=2, default=(16.,96.), metavar=('MIN', 'MAX'),
@@ -818,7 +646,7 @@ def main(argv=None):
     progress(f'Starting training: device={args.device}, workers={args.workers}')
     if args.reset_optimizer and not args.resume:
         raise ValueError('--reset-optimizer requires --resume')
-    if any(not math.isfinite(v) or v < 0 for v in (args.memory_grad_clip, args.rest_grad_clip)):
+    if any(not math.isfinite(v) or v < 0 for v in (args.history_grad_clip, args.rest_grad_clip)):
         raise ValueError('Gradient clipping limits must be finite and nonnegative (0 disables clipping)')
     if not math.isfinite(args.fresh_fraction) or not 0 <= args.fresh_fraction <= 1:
         raise ValueError('Fresh fraction must be finite and in [0, 1]')
@@ -843,32 +671,18 @@ def main(argv=None):
     resume = read_checkpoint(args.resume,ARCHITECTURES,args.device) if args.resume else None
     cfg = DirectConfig(encoder=resolve_encoder(args.encoder, resume),
                        token_only=resolve_token_only(args.token_only, resume),
-                       history_encoder_checkpointing=args.history_encoder_checkpointing,
                        direction_inputs=args.direction_inputs,channels=args.channels,hidden=args.hidden,layers=args.axial_layers,
                        decoder_layers=args.decoder_layers,
                        activation_checkpointing=args.activation_checkpointing,
-                       memory_slots=args.memory_slots,memory_steps=args.memory_steps,
-                       memory_stride=args.memory_stride,
-                       feature_sequence_length=args.feature_sequence_length, feature_memory_grid=args.feature_memory_grid,
-                       recurrent_refinement_steps=args.recurrent_refinement_steps,
-                       **{k:getattr(args,k) for k in FEATURE_OPTIONS})
+                       recurrent_refinement_steps=args.recurrent_refinement_steps)
     if resume:
-        # Sampling spacing changes no parameter shapes; use the requested value.
-        cfg = replace(checkpoint_config(resume), memory_stride=args.memory_stride,
-                      history_encoder_checkpointing=args.history_encoder_checkpointing,
-                      feature_switch_crop_fraction=args.feature_switch_crop_fraction,
-                      feature_history_loss_fraction=args.feature_history_loss_fraction)
+        cfg = checkpoint_config(resume)
         if args.direction_inputs != cfg.direction_inputs:
             raise ValueError('Direction inputs must match the resumed checkpoint; start a new run to change them')
     args.encoder = cfg.encoder
     args.token_only = cfg.token_only
     if args.decision_fraction and args.microbatch % 2:
         raise ValueError('Matched decisions require an even microbatch')
-    if args.microbatch % cfg.feature_sequence_length:
-        raise ValueError('Microbatch must divide into feature_sequence_length observations')
-    stream_batch = args.microbatch//cfg.feature_sequence_length
-    if args.decision_fraction and stream_batch % 2:
-        raise ValueError('Matched decisions need an even number of traces: microbatch / feature_sequence_length')
     if not np.isfinite(args.candidate_weight) or args.candidate_weight <= 0:
         raise ValueError('Candidate weight must be finite and positive')
     if args.dagger_after <= 0:
@@ -897,7 +711,7 @@ def main(argv=None):
     if cfg.direction_inputs:
         # Validate sibling paths and grids before starting loaders or collectors.
         FiberVolume(spec, cache_bytes=1 << 20).direction_fields()
-    sample = SampleConfig(crop=cfg.fine, n_history=cfg.n_history, n_future=cfg.n_future,
+    sample = SampleConfig(crop=cfg.fine, n_history=cfg.n_history, n_future=cfg.n_future, full_observed_history=True,
                           future_step=cfg.future_step, recent_history_points=cfg.n_history,
                           no_history_prob=args.no_history_prob, short_history_prob=args.short_history_prob)
     progress('Loading manifest and fiber annotations')
@@ -939,15 +753,13 @@ def main(argv=None):
     if resume:
         ignored = {'resume','reset_optimizer','out_root','device','batch','microbatch','workers','threads','worker_cache_gb',
                    'log_every','ckpt_every','diag_every','dagger_device',
-                   'negative_bank_refresh_seconds','negative_bank_cache_mb','activation_checkpointing','history_encoder_checkpointing',
-                   'memory_grad_clip','rest_grad_clip','presence_dropout','blur_probability','blur_sigma',
+                   'negative_bank_refresh_seconds','negative_bank_cache_mb','activation_checkpointing',
+                   'history_grad_clip','rest_grad_clip','presence_dropout','blur_probability','blur_sigma',
                    'decision_fraction','decision_choice_fraction','bank_following_probability','fresh_fraction',
                    'bank_hard_fraction','replay_failure_fraction','bank_switch_tolerance','bank_own_tolerance',
-                   'n_commit','memory_stride','feature_switch_crop_fraction','feature_history_loss_fraction'}
-        legacy_defaults = dict(encoder='conv', token_only=False, history_encoder_checkpointing=True)
+                   'n_commit'}
         for key,value in vars(args).items():
-            recorded = (resume['training_options'].get(key, legacy_defaults[key]) if key in legacy_defaults
-                        else resume['training_options'][key])
+            recorded = resume['training_options'][key]
             if key not in ignored and json.dumps(recorded,sort_keys=True) != json.dumps(value,sort_keys=True):
                 raise ValueError(f'Resume option differs: {key}')
         if resume['seed_manifest_sha256'] != manifest['sha256'] or resume['fiber_manifest'] != fiber_manifest(fibers):
@@ -965,14 +777,14 @@ def main(argv=None):
         if resume and resume.get('monitor_recovery_sha256') != recovery_hash:
             raise ValueError('Monitor recovery fixture changed since checkpoint')
     progress('Initializing models and optimizer')
-    progress(f'Independent gradient clipping: memory={args.memory_grad_clip:g}, rest={args.rest_grad_clip:g} (0 disables clipping)')
+    progress(f'Independent gradient clipping: history={args.history_grad_clip:g}, rest={args.rest_grad_clip:g} (0 disables clipping)')
     model = build_model(cfg).to(args.device, memory_format=conv_memory_format(args.device))
     ema = copy.deepcopy(model).requires_grad_(False).eval()
     opt, done, lr_restart_step = initialize_training_optimizer(model, ema, args, resume)
     if args.reset_optimizer:
         progress(f'Fresh AdamW: one parameter group, all parameters trainable; LR restarts at update {done+1} '
                  f'with {args.warmup} warmup updates to {args.lr:g}')
-    prepare_training(model, stream_batch)
+    prepare_training(model, args.microbatch)
     progress('Compiling training operations; first forward/backward passes may take several minutes')
     if done >= args.steps:
         raise ValueError('Run has already reached its requested update count')
@@ -987,11 +799,10 @@ def main(argv=None):
         extra_args=('--after', args.dagger_after, '--bank-switch-tolerance', args.bank_switch_tolerance,
                     '--bank-own-tolerance', args.bank_own_tolerance,
                     *[v for path in (args.negative_bank, args.near_negative_bank) if path for v in ('--failure-bank', path)]))
-    progress(f'Memory slots={cfg.memory_slots}')
-    progress(f'Visual-history streams: {stream_batch} traces x {cfg.feature_sequence_length} observations per chunk; at most {cfg.feature_history_decisions} auxiliary decisions plus one endpoint')
+    progress(f'Live historical slabs: eight slots; {args.microbatch} independent decisions per microbatch')
     builder = IdentityObservationBuilder(cfg,train_f,identity_sampling,
         augment=True,negative_bank=negative_bank,**role_banks)
-    dataset = FollowDataset(train_f, spec, sample, band, chunk=stream_batch, seed=args.seed+done,
+    dataset = FollowDataset(train_f, spec, sample, band, chunk=args.microbatch, seed=args.seed+done,
         cache_bytes=int(args.worker_cache_gb*(1 << 30)), onpolicy=caches,
         replay_index=str(collector.index), batch_builder=builder, additional_crops=(), fresh_fraction=args.fresh_fraction)
     loader_args = dict(batch_size=None, num_workers=args.workers,
@@ -1021,8 +832,8 @@ def main(argv=None):
         source_sampling=dict(decision=args.decision_fraction,bank_following=args.bank_following_probability,
             fresh=(1-args.decision_fraction-args.bank_following_probability)*args.fresh_fraction,
             recent=(1-args.decision_fraction-args.bank_following_probability)*(1-args.fresh_fraction)),
-        feature_sampling_revision=FEATURE_SAMPLING_REVISION,
-        history_policy='main_encoder_feature_memory',sampling=asdict(identity_sampling),
+        history_sampling_revision=SAMPLING_REVISION,
+        history_policy='live_observed_slabs',sampling=asdict(identity_sampling),
         negative_bank_path=str(negative_bank.root),negative_bank_provenance=negative_bank.provenance(),
         bank_role_provenance=role_provenance()))
     tracer = None
@@ -1040,8 +851,6 @@ def main(argv=None):
         progress(f'Starting data loader; collecting {args.batch} supervised decisions for update {done+1}')
         iterator = iter(loader)
         updates = DecisionBatchPrefetch(iterator, args.batch)
-        from .stratified_replay import ObservationHistory
-        stream_states = ObservationHistory()
         observed_states = interval_states = 0
         prior_samples = int(resume['samples_seen']) if resume else 0
         for step in range(done+1, args.steps+1):
@@ -1063,8 +872,8 @@ def main(argv=None):
                 tolerance=args.tolerance, confidence_weight=args.confidence_weight, ema_decay=args.ema_decay,
                 n_commit=args.n_commit, compute_metrics=step % args.log_every == 0 or step == args.steps,
                 candidate_weight=args.candidate_weight,
-                memory_grad_clip=args.memory_grad_clip, rest_grad_clip=args.rest_grad_clip,
-                stream_states=stream_states, diagnostic=diagnostic)
+                history_grad_clip=args.history_grad_clip, rest_grad_clip=args.rest_grad_clip,
+                diagnostic=diagnostic)
             observed_states += metrics['observed_states']
             interval_states += metrics['observed_states']
             update_seconds = time.monotonic()-update_started
@@ -1083,7 +892,6 @@ def main(argv=None):
                     interval_samples_per_second=interval_states/(now-interval_started),
                     interval_data_seconds=interval_data_seconds, interval_update_seconds=interval_update_seconds,
                     interval=interval_metrics.summary(), n_future=cfg.n_future, tolerance=args.tolerance,
-                    feature_switch_crop_fraction=cfg.feature_switch_crop_fraction,
                     interval_updates=step-interval_step,
                     cuda_peak_allocated_gib=torch.cuda.max_memory_allocated(args.device)/2**30
                         if torch.device(args.device).type == 'cuda' else None))
@@ -1096,7 +904,7 @@ def main(argv=None):
 
             def save(path, resumable=False):
                 extra = dict(step=step, lr_restart_step=lr_restart_step, tolerance=args.tolerance, n_commit=args.n_commit,
-                    feature_sampling_revision=FEATURE_SAMPLING_REVISION,
+                    history_sampling_revision=SAMPLING_REVISION,
                     samples_seen=prior_samples+observed_states,
                     identity_sampling=asdict(identity_sampling),
                     negative_bank_provenance=negative_bank.provenance() if negative_bank else None,
@@ -1119,7 +927,7 @@ def main(argv=None):
             if tracer is not None and args.diag_every and step % args.diag_every == 0:
                 began = time.monotonic()
                 training_diagnostics(ema, diagnostic['cpu_batch'], tracer, val_f, manifest['monitor'], out, step, log,
-                                     device=args.device, memory=diagnostic['memory'])
+                                     device=args.device)
                 periodic['diagnostics_seconds'] = time.monotonic()-began
             if tracer is not None and args.long_diag_every and step % args.long_diag_every == 0:
                 from vesuvius.neural_tracing.fiber_follow.shared.evaluate import evaluate

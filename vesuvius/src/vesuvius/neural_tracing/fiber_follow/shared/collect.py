@@ -30,7 +30,7 @@ class DecisionCollector:
         self.before, self.after, self.stride, self.max_states = before, after, stride, max_states
         self.additional_crops = tuple(additional_crops)
         self.rows, self.distances = [], []
-        # Every recorded decision's observed head, in order (before thinning).
+        # Actual committed vertices, once per trace (before decision thinning).
         self.track = []
         self.departed = None
         self.last_travelled = 0.
@@ -64,6 +64,8 @@ class DecisionCollector:
         Keep its causal pre-switch rows; never fabricate an unobserved endpoint.
         The caller excludes oracle-aborted traces, and holdout remains censored.
         """
+        if len(path) >= len(self.track) and np.array_equal(np.asarray(self.track), np.asarray(path)[:len(self.track)]):
+            self.track.extend(np.asarray(path)[len(self.track):].copy())
         if self.bank_detector is None or self.bank_switch is not None or not self.rows:
             return
         arc = arclength(path)
@@ -145,10 +147,14 @@ class DecisionCollector:
             row['failure_kind'] = 3
         elif not offtrack and state['would_stop'] and item['plane_mask'][0] and not state.get('recovery_blocked', False):
             row['failure_kind'] = 2
-        # Offset from the head to its matched original-fiber point (world).
-        offset = (np.asarray(state['frame']) @ item['gt_history'][0] if not offtrack and item['gt_history_mask'][0] > 0
-                  else np.full(3, np.nan))
-        self.track.append(dict(pos=state['pos'], frame=state['frame'], offtrack=float(offtrack), offset=offset))
+        # last_segment is the actual committed polyline, including intermediate
+        # vertices. It is also sufficient for callers without a full prefix.
+        prefix = np.asarray(state.get('observed_path',
+            list(self.track)+list(segment[1:] if self.track else segment)), dtype=np.float64)
+        if self.track and not np.array_equal(np.asarray(self.track), prefix[:len(self.track)]):
+            raise ValueError('Collected observed prefixes must extend the committed trace')
+        self.track.extend(prefix[len(self.track):].copy())
+        row['prefix_end'] = len(self.track)
         self.rows.append(row)
         self.distances.append(travelled)
         self.last_travelled = travelled
@@ -174,14 +180,13 @@ def append_traces(collectors, rows, track):
     """Kept rows reference their own trace's earlier heads in the shared track."""
     for collector in collectors:
         for row in collector.finish():
-            row.update(seq_start=len(track), seq_end=len(track)+row['source_row'])
+            row.update(seq_start=len(track), seq_end=len(track)+row['prefix_end'])
             rows.append(row)
         track.extend(collector.track)
 
 
 def track_arrays(track):
-    return {'track_'+key: np.asarray([step[key] for step in track], np.float32).reshape(len(track), *shape)
-            for key, shape in (('pos', (3,)), ('frame', (3, 3)), ('offtrack', ()), ('offset', (3,)))}
+    return {'track_pos': np.asarray(track, np.float64).reshape(-1, 3)}
 
 
 def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer, bank_loader=None):
@@ -274,8 +279,8 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer, bank_loader=
     st.save(temp)
     # Pre-create mmap before publishing so multiple loader workers never race.
     OnPolicyStates.load(temp)
-    temp_mmap = Path(str(temp)[:-4]+'_mmap_v5')
-    final_mmap = Path(str(path)[:-4]+'_mmap_v5')
+    temp_mmap = Path(str(temp)[:-4]+'_mmap_v6')
+    final_mmap = Path(str(path)[:-4]+'_mmap_v6')
     os.replace(temp_mmap, final_mmap)
     os.replace(temp, path)
     print(json.dumps(dict(states=len(st), hard=int(st.hard.sum()), offtrack=int(st.offtrack.sum()), out=str(path))))

@@ -15,7 +15,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.reference import SEED_FIELDS, o
 def make_recovery_states(fibers, seeds, cfg, provenance, seed=20260925):
     """Freeze four drift bands per seed using a private RNG, preserving identity."""
     rng = np.random.default_rng(seed)
-    rows = []
+    rows, track = [], []
     for entry in seeds:
         fi = entry['fiber']
         fiber = fibers[fi]
@@ -32,11 +32,14 @@ def make_recovery_states(fibers, seeds, cfg, provenance, seed=20260925):
             rows.append(dict(fiber_idx=fi, t=entry['t'], reverse=reverse, pos=item['pos'], frame=item['frame'],
                 hist=item['hist_local']@item['frame'].T+item['pos'], hmask=item['hmask'],
                 offtrack=False, hard=True, exploratory=False, drift=drift,
-                **observed_seed(item['pos'], item['frame'], item['hist_local'], item['hmask'])))
+                **{k: item[k] for k in SEED_FIELDS},
+                seq_start=len(track), seq_end=len(track)+len(item['observed_path'])))
+            track.extend(item['observed_path'])
     if not rows:
         raise ValueError('Recovery fixtures need at least one seed')
     return OnPolicyStates(manifest=fiber_manifest(fibers), provenance=provenance,
-        **{k: np.asarray([r[k] for r in rows]) for k in OnPolicyStates.FIELDS+('drift',)+SEED_FIELDS})
+        **{k: np.asarray([r[k] for r in rows]) for k in OnPolicyStates.FIELDS+('drift',)+SEED_FIELDS+tuple(OnPolicyStates.ROW_TRACK)},
+        track_pos=np.asarray(track, dtype=np.float64))
 
 
 @torch.no_grad()
@@ -63,6 +66,7 @@ def evaluate_recovery_states(model, vol, states, fibers, sample, *, device='cpu'
         item=label_state(f,states.pos[j],states.frame[j],states.hist[j],states.hmask[j],sample,
                          t=float(states.t[j]),reverse=bool(states.reverse[j]),offtrack=bool(states.offtrack[j]))
         item.update({k: getattr(states, k)[j] for k in SEED_FIELDS if hasattr(states, k)})
+        item['observed_path'] = states.observed_prefix(j)
         cpu = batch_builder([item], vol) if batch_builder else collate_with_volume([item],vol,sample.crop,grid)
         b = move(cpu)
         sampling={}
@@ -72,7 +76,7 @@ def evaluate_recovery_states(model, vol, states, fibers, sample, *, device='cpu'
             generator=trace_generator(sampling_seed,states.pos[j],states.frame[j,:,2])
             sampling['initial_noise']=trace_noise(model.cfg,[generator],device)
         # The original crop builder can return float16, while direct images
-        # arrive as a dictionary, including v4's nested remote-seed crop.
+        # arrive as a dictionary with independent historical slabs.
         # Floating inputs enter in float32 before AMP; preserve boolean masks.
         images = move(b['x'], float_inputs=True)
         if hasattr(model, 'select_prediction'):
@@ -106,6 +110,7 @@ def evaluate_recovery_states(model, vol, states, fibers, sample, *, device='cpu'
                 TraceParams(max_len=recovery_length,confidence=threshold,seed=sampling_seed,
                             n_commit=n_commit),device=device)
             state={k:getattr(states,k)[j] for k in ('hist','hmask','frame')}
+            state['observed_path'] = states.observed_prefix(j)
             state.update({k: getattr(states, k)[j] for k in SEED_FIELDS if hasattr(states, k)})
             try:
                 paths,reasons=tracer.trace(states.pos[j:j+1],states.frame[j:j+1,:,2],initial_states=[state])

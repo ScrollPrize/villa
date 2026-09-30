@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from test_regression import proposal_output
-from test_trajectory_memory import cfg, memory_batch
+from slab_fixtures import cfg, slab_batch as memory_batch
 from vesuvius.neural_tracing.fiber_follow.regression.model import build_model, select_refinement
 from vesuvius.neural_tracing.fiber_follow.regression.supervision import loss_terms
 from vesuvius.neural_tracing.fiber_follow.regression.diagnostics import decision_rows
@@ -173,6 +173,8 @@ def test_all_attempts_get_their_own_first_failure_supervision():
 
 
 def test_tracer_passes_operating_threshold_into_adaptive_model(monkeypatch):
+    from test_history_slabs import fake_ct
+    fake_ct(monkeypatch)
     model = build_model(cfg(recurrent_refinement_steps=2)).eval()
     monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.regression.data.image_crop',
         lambda items, vol, crop, pool=None, **kw: torch.ones(len(items), 2, crop.depth, crop.width, crop.width)*.25)

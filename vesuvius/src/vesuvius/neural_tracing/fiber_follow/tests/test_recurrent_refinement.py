@@ -7,7 +7,7 @@ from dataclasses import replace
 import pytest
 import torch
 
-from test_trajectory_memory import cfg, memory_batch, state_from, training_chunk
+from slab_fixtures import cfg, slab_batch as memory_batch
 from vesuvius.neural_tracing.fiber_follow.regression.model import build_model, PathDecoderLayer
 from vesuvius.neural_tracing.fiber_follow.regression.supervision import loss_terms
 from vesuvius.neural_tracing.fiber_follow.regression.train import (
@@ -44,7 +44,7 @@ def test_passes_share_coordinate_head_and_encode_write_project_once(monkeypatch)
     b = memory_batch(model.cfg)
     calls = dict(encoder=0, writer=0, projection=0, scorer_projection=0, decoder=0, coordinates=0, scoring=0)
     for obj, method, key in ((model.encoder, 'encode', 'encoder'),
-                             (model.recurrent_memory, 'observe_tokens', 'writer'),
+                             (model.history_encoder, 'forward', 'writer'),
                              (model.decoder.layers[0], 'project_memory', 'projection'),
                              (model.confidence_scorer.layers[0], 'project_memory', 'scorer_projection'),
                              (model.decoder.layers[0], 'forward_cached', 'decoder'),
@@ -62,23 +62,6 @@ def test_passes_share_coordinate_head_and_encode_write_project_once(monkeypatch)
     assert out['refinement_hazard_logits'].shape == (len(b['hist']), 3, model.cfg.n_future)
 
 
-def test_refinement_geometry_reaches_proposal_stage_fusion_and_old_observations():
-    torch.manual_seed(43)
-    model = build_model(cfg(recurrent_refinement_steps=1))
-    earlier = memory_batch(model.cfg, step=0)
-    b = memory_batch(model.cfg, step=1)
-    earlier['x']['fine'].requires_grad_()
-    old = model(earlier['x'], earlier['hist'], earlier['hmask'])
-    out = model(b['x'], b['hist'], b['hmask'], memory=state_from(model, old))
-    gradient, = torch.autograd.grad(out['points'].square().mean(), out['initial_points'], retain_graph=True)
-    assert gradient.abs().sum() > 0
-    loss_terms(out, b, model.cfg)['geometry_per_state'].mean().backward()
-    assert all(p.grad is None for p in model.confidence_scorer.parameters())
-    assert earlier['x']['fine'].grad.abs().sum() > 0
-    for name, p in model.named_parameters():
-        if name.startswith(('refinement_', 'coordinates.')):
-            assert p.grad is not None and p.grad.abs().sum() > 0, name
-    assert all(p.grad is None or torch.isfinite(p.grad).all() for p in model.parameters())
 
 
 def test_bounds_and_masked_geometry():
@@ -113,38 +96,3 @@ def test_adaptive_refinement_compiles_and_backpropagates():
 
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA unavailable')
-def test_compiled_refinement_bf16_two_decision_gradients():
-    from vesuvius.neural_tracing.fiber_follow.regression.train import move_batch
-    torch.manual_seed(45)
-    c = cfg(recurrent_refinement_steps=1)
-    eager = build_model(c).cuda()
-    compiled = copy.deepcopy(eager)
-    chunk = [move_batch(b, 'cuda') for b in training_chunk(c)['feature_sequence']]
-    losses = []
-    for model in (eager, prepare_training(compiled)):
-        state = None
-        loss = 0
-        with torch.autocast('cuda', dtype=torch.bfloat16):
-            for b in chunk:
-                candidates = b['hist'].new_zeros(2, 2, c.n_future, 3)
-                candidates[..., 2] = eager.planes
-                candidates[:, 1, :, 0] = 2.
-                b['candidate_mask'] = torch.ones_like(candidates[..., 0], dtype=torch.bool)
-                b['candidate_labels'] = torch.zeros_like(candidates[..., 0])
-                b['candidate_labels'][:, 0] = 1.
-                forward = (lambda *a, **kw: training_prediction(model, *a, **kw)) if model is compiled else model
-                out = forward(b['x'], b['hist'], b['hmask'], memory=state, candidates=candidates)
-                state = state_from(eager, out)
-                terms = loss_terms(out, b, c)
-                loss = (loss+terms['geometry_per_state'].mean()+terms['confidence_per_state'].mean()
-                        +out['candidate_confidence_logits'].square().mean())
-        losses.append(loss.detach())
-        loss.backward()
-    torch.testing.assert_close(*losses, atol=.005, rtol=.02)
-    for prefix in ('encoder.', 'decoder.', 'refinement_', 'recurrent_memory.'):
-        grads = [torch.cat([p.grad.flatten() for name, p in model.named_parameters()
-                           if name.startswith(prefix) and p.grad is not None]) for model in (eager, compiled)]
-        assert all(torch.isfinite(g).all() for g in grads)
-        assert torch.nn.functional.cosine_similarity(*grads, dim=0).item() > .99
-        assert (grads[1].norm()/grads[0].norm()).item() == pytest.approx(1., rel=.05)

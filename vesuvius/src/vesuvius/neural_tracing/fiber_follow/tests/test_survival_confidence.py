@@ -4,8 +4,8 @@ import math
 import pytest
 import torch
 
-from test_detailed_memory import config
-from test_trajectory_memory import memory_batch, state_from
+from test_identity import config
+from slab_fixtures import slab_batch as memory_batch
 from test_regression import proposal_output
 from vesuvius.neural_tracing.fiber_follow.regression.model import build_model
 from vesuvius.neural_tracing.fiber_follow.regression.supervision import loss_terms
@@ -14,9 +14,8 @@ from vesuvius.neural_tracing.fiber_follow.regression.survival_confidence import 
 )
 
 
-def scoring_context(model, batch, memory=None):
+def scoring_context(model, batch):
     ctx = model.context(batch['x'], batch['hist'], batch['hmask'])
-    ctx['recurrent'], _ = model.observe_context(ctx, batch['x'], batch['hist'], batch['hmask'], memory)
     model.decoder_memory(ctx)
     return ctx
 
@@ -44,7 +43,7 @@ def test_confidence_head_computes_fp32_inside_bf16_autocast(device):
              scorer.failure.register_forward_pre_hook(capture('failure'))]
     try:
         with torch.autocast(device, dtype=torch.bfloat16):
-            logits = scorer(spatial, points, scorer.project_memory(memory, padding), padding)
+            logits = scorer(spatial, points, scorer.project_memory(memory, padding), padding, (memory, padding))
     finally:
         for hook in hooks:
             hook.remove()
@@ -70,9 +69,8 @@ def test_replacing_truncating_or_extending_suffix_preserves_prefix(training):
     model = build_model(config()).train(training)
     first = memory_batch(model.cfg, 1)
     with torch.no_grad():
-        state = state_from(model, model(first['x'], first['hist'], first['hmask']))
         batch = memory_batch(model.cfg, 1, step=1)
-        ctx = scoring_context(model, batch, state)
+        ctx = scoring_context(model, batch)
         curve = torch.zeros(1, 4, 3)
         curve[..., 2] = torch.arange(1, 5)
         curve[0, :, 0] = torch.tensor([.2, -.4, .7, 1.])
@@ -125,7 +123,7 @@ def test_first_segment_reads_all_observations_but_no_future_segment_features():
     memory = torch.randn(1, 9, model.cfg.hidden, requires_grad=True)
     padding = torch.zeros(1, 9, dtype=torch.bool)
     padding[:, -1] = True
-    logits = scorer(spatial, points, scorer.project_memory(memory, padding), padding)
+    logits = scorer(spatial, points, scorer.project_memory(memory, padding), padding, (memory, padding))
     logits[:, 0].sum().backward()
     assert spatial.grad[:, 0].abs().sum() > 0
     assert spatial.grad[:, 1:].count_nonzero() == 0

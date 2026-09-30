@@ -30,7 +30,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.geometry import (
 )
 from vesuvius.neural_tracing.fiber_follow.shared.fast_sample import sample_crop
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume
-from vesuvius.neural_tracing.fiber_follow.shared.reference import SEED_FIELDS, SEED_DEFAULTS
+from vesuvius.neural_tracing.fiber_follow.shared.reference import SEED_FIELDS, SEED_DEFAULTS, observed_seed
 
 
 DATA_VERSION = 2
@@ -168,6 +168,7 @@ class SampleConfig:
     history_jitter: float = 0.0  # independent point noise; disable for smooth history
     history_drift: float = 2.0  # accumulated lateral displacement, smooth over 16--64 voxels
     history_wobble: float = 1.0  # max amplitude (voxels) of slow lateral wobble on the own-trace history
+    full_observed_history: bool = False  # direct slab model preserves the complete synthetic prefix
     dense_substeps: int = 4
 
     @property
@@ -259,7 +260,11 @@ def make_sample(fiber: TracedFiber, t: float, reverse: bool, cfg: SampleConfig, 
     frame = random_rotation_about(frame_from_heading(heading), rng.uniform(0, 2 * np.pi))
 
     # history: GT points behind with the drift ramping in
-    k = np.arange(1, cfg.n_history + 1) * cfg.history_step
+    count = cfg.n_history
+    if cfg.full_observed_history:
+        available = max(1, int(t/cfg.history_step))
+        count = max(count, int(rng.integers(1, available+1)))
+    k = np.arange(1, count + 1) * cfg.history_step
     th = t - k
     hmask = (th >= 0).astype(np.float32)
     if rng.random() < cfg.no_history_prob:
@@ -293,8 +298,11 @@ def make_sample(fiber: TracedFiber, t: float, reverse: bool, cfg: SampleConfig, 
     drift = fr[:,:2] @ displacement
     hist += ramp[:,None]*drift
     pos += drift
+    observed = np.concatenate((hist[hmask > 0][::-1], pos[None]))
+    seed = observed_seed(pos, frame, (hist-pos) @ frame, hmask)
     return dict(_generated_original_history=True, _seed_original_certified=True,
-                pos=pos, frame=frame, hist_local=(hist-pos) @ frame, hmask=hmask,
+                observed_path=observed, **seed,
+                pos=pos, frame=frame, hist_local=((hist-pos) @ frame)[:cfg.n_history], hmask=hmask[:cfg.n_history],
                 **continuation_targets(fiber, t, reverse, pos, frame, cfg))
 
 
@@ -486,11 +494,13 @@ class FollowDataset(torch.utils.data.IterableDataset):
                     failure_kind=int(op.failure_kind[j]) if hasattr(op, 'failure_kind') else 0,
                     fiber_ref=(fi,self.fibers[fi].length-t if reverse else t,reverse))
         item.update({k: getattr(op, k)[j] for k in SEED_FIELDS if hasattr(op, k)})
-        track = op.track(j) if hasattr(op, 'track') else None
-        if track is not None:
-            item['memory_track'] = track
+        item['observed_path'] = op.observed_prefix(j)
         item = self.prepare(item,rng)
         return item if self.state_allowed(item) else None
+
+    def prepare_pair(self, pair, rng):
+        prepared = [self.prepare(item, rng) for item in pair]
+        return prepared if all(self.state_allowed(item) for item in prepared) else []
 
     def __iter__(self):
         info = torch.utils.data.get_worker_info()
@@ -511,9 +521,7 @@ class FollowDataset(torch.utils.data.IterableDataset):
             for _ in range(requested):
                 pair = self.batch_builder.decision_pair(cfg, rng)
                 if pair is not None:
-                    pair = [self.prepare(item, rng) for item in pair]
-                    if all(self.state_allowed(item) for item in pair):
-                        items.extend(pair)
+                    items.extend(self.prepare_pair(pair, rng))
             for _ in range(following):
                 item = self.batch_builder.bank_following(cfg, rng)
                 if item is not None:
@@ -564,10 +572,6 @@ class FollowDataset(torch.utils.data.IterableDataset):
                     break
             if len(items) != self.chunk:
                 raise ValueError('Could not fill a training batch outside the held-out band')
-            if getattr(self.batch_builder, 'streaming', False):
-                yield from self.batch_builder.sequence_batches(items, vol, band=self.exclude,
-                    worker=0 if info is None else info.id, requested_fraction=2*requested/self.chunk)
-                continue
             batch = (self.batch_builder(items, vol) if self.batch_builder is not None
                      else collate_with_volume(items, vol, cfg.crop, grid))
             if fraction:
@@ -733,7 +737,7 @@ def label_state(fiber, pos, frame, hist_world, hmask, cfg, *, t, reverse, offtra
                 **continuation_targets(fiber, traversal_t, reverse, pos, frame, cfg, offtrack))
 
 
-STATE_VERSION = 5
+STATE_VERSION = 6
 
 class OnPolicyStates:
     """States (pos, heading, own-trace history) visited by a tracer on GT fibers.
@@ -748,7 +752,7 @@ class OnPolicyStates:
     # failure_kind indexes REPLAY_FAILURES. switch_* identifies the first certified
     # foreign contact, including on retained pre-switch rows. None of it is input.
     # Arc positions compared against float64 trace geometry keep full precision.
-    FLOAT64_FIELDS = ("t", "travelled", "switch_distance", "switch_pos")
+    FLOAT64_FIELDS = ("t", "travelled", "switch_distance", "switch_pos", "pos", "frame", "hist", "seed_pos", "seed_tangent", "track_pos")
     OPTIONAL = {"drift": lambda n: np.full(n, np.nan, np.float32),
                 "source_cache": lambda n: np.full(n, -1, np.int32),
                 "source_row": lambda n: np.full(n, -1, np.int64),
@@ -759,15 +763,10 @@ class OnPolicyStates:
                 "switch_decision": lambda n: np.full(n, -1, np.int64),
                 "switch_bank_path": lambda n: np.full(n, '', dtype='U1'),
                 "switch_bank_run": lambda n: np.full(n, '', dtype='U64'), **SEED_DEFAULTS}
-    # Optional observed tracks: every earlier head of a state's trace, one per
-    # decision. Row i's heads are track_*[seq_start[i]:seq_end[i]]; -1 means
-    # none. Offsets/departure are relabeled annotation targets, never inputs.
+    # Each trace is stored once. The exclusive end includes the decision head.
     ROW_TRACK = {"seq_start": lambda n: np.full(n, -1, np.int64),
                  "seq_end": lambda n: np.full(n, -1, np.int64)}
-    TRACK = {"track_pos": lambda n: np.zeros((n, 3), np.float32),
-             "track_frame": lambda n: np.zeros((n, 3, 3), np.float32),
-             "track_offtrack": lambda n: np.zeros(n, np.float32),
-             "track_offset": lambda n: np.zeros((n, 3), np.float32)}
+    TRACK = {"track_pos": lambda n: np.zeros((n, 3), np.float64)}
 
     def __init__(self, *, manifest, provenance=None, **arrays):
         for key in self.FIELDS:
@@ -792,13 +791,17 @@ class OnPolicyStates:
     def __len__(self):
         return len(self.pos)
 
-    def track(self, j):
-        """Earlier observed heads of row ``j``'s trace (oldest first), or None."""
-        if self.seq_end[j] < 0:
-            return None
-        sl = slice(int(self.seq_start[j]), int(self.seq_end[j]))
-        return dict(pos=self.track_pos[sl], frame=self.track_frame[sl],
-                    offtrack=self.track_offtrack[sl], offset=self.track_offset[sl])
+    def observed_prefix(self, j):
+        """Actual committed polyline through this decision; no future vertices."""
+        start, end = int(self.seq_start[j]), int(self.seq_end[j])
+        if not 0 <= start < end <= len(self.track_pos):
+            raise ValueError('Replay needs complete observed prefixes; recollect with replay v6')
+        path = self.track_pos[start:end]
+        if not np.allclose(path[-1], self.pos[j], atol=1e-5, rtol=0):
+            raise ValueError('Replay prefix does not end at decision head')
+        if self.seed_valid[j] and not np.allclose(path[0], self.seed_pos[j], atol=1e-5, rtol=0):
+            raise ValueError('Replay prefix does not start at its original seed')
+        return path
 
     def save(self, path):
         np.savez(path, __metadata__=json.dumps(dict(version=STATE_VERSION, fibers=self.manifest, provenance=self.provenance)),
@@ -820,7 +823,7 @@ class OnPolicyStates:
         """``path``: .npz from collect.py (converted once to a sibling ``_mmap/``
         dir of .npy files) or such a directory."""
         path = os.fspath(path)
-        d = path[:-4] + "_mmap_v5" if path.endswith(".npz") else path
+        d = path[:-4] + "_mmap_v6" if path.endswith(".npz") else path
         metadata_path = os.path.join(d, "metadata.json")
         if path.endswith(".npz"):
             with np.load(path, allow_pickle=False) as z:

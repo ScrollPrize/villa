@@ -14,7 +14,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.data import build_inputs, read_
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, crop_local_grid, frame_from_heading, normalize
 from vesuvius.neural_tracing.fiber_follow.shared.policy import DEFAULT_CONFIDENCE, DEFAULT_N_COMMIT, commit_prefix
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume
-from vesuvius.neural_tracing.fiber_follow.shared.reference import SEED_FIELDS
+from vesuvius.neural_tracing.fiber_follow.shared.reference import SEED_FIELDS, observed_path
 
 if TYPE_CHECKING:
     from vesuvius.neural_tracing.fiber_follow.flow_matching.model import FollowNet
@@ -126,8 +126,12 @@ class ModelTracer:
         if initial_states is not None:
             if len(initial_states) != n:
                 raise ValueError('One initial observed state is required per seed')
-            paths = [list(np.asarray(s['hist'])[np.asarray(s['hmask'])>0][::-1])+[np.asarray(p,dtype=np.float64)]
+            paths = [list(observed_path(dict(s, pos=p,
+                      hist_local=(np.asarray(s['hist'])-p) @ s['frame'])))
                      for s,p in zip(initial_states,seeds_xyz)]
+            if any(not len(path) or not np.allclose(path[-1], p, atol=1e-5, rtol=0)
+                   for path, p in zip(paths, seeds_xyz)):
+                raise ValueError('Initial observed prefix must end at resumed head')
         hist_start = [len(p)-1 for p in paths]
         frames = [frame_from_heading(h) for h in headings]
         stochastic = (getattr(self.model.cfg, 'sampler_mode', 'zero') == 'gaussian'
@@ -139,6 +143,9 @@ class ModelTracer:
             frames = [np.asarray(s['frame']).copy() for s in initial_states]
         references = [dict(seed_pos=np.asarray(p).copy(), seed_tangent=normalize(np.asarray(h)),
                            seed_age=0., seed_valid=True) for p, h in zip(seeds_xyz, headings)]
+        if histories is not None:
+            for reference, path in zip(references, paths):
+                reference.update(seed_pos=np.asarray(path[0]).copy(), seed_age=float(arclength(np.asarray(path))[-1]))
         if initial_states is not None:
             for reference, state in zip(references, initial_states):
                 reference.update({k: state[k] for k in SEED_FIELDS if k in state})
@@ -148,9 +155,6 @@ class ModelTracer:
         exploration = np.full(n, -1, int)
         stop_streak = np.zeros(n, int)
         last_segment = [np.asarray([p[-1]]) for p in paths]
-        # Per-call/per-trace state, never shared between separate trace() calls.
-        memory = (self.model.initial_memory(n, self.device)
-                  if getattr(self.model.cfg, 'memory_slots', 0) else None)
         pp = self.p
         while active.any():
             idx = np.flatnonzero(active)
@@ -173,16 +177,12 @@ class ModelTracer:
             tensor = lambda a: torch.from_numpy(np.ascontiguousarray(a)).to(self.device)
             context = {}
             if self.path_context:
-                context['paths'] = [dict(seed_segment=np.asarray(paths[i][hist_start[i]:hist_start[i]+64]),
+                context['paths'] = [dict(observed_path=np.asarray(paths[i]),
+                                         seed_segment=np.asarray(paths[i][hist_start[i]:hist_start[i]+64]),
                                          travelled=float(length[i]),
                                          **{**references[i], 'seed_age': references[i]['seed_age']+float(length[i])}) for i in idx]
-                if memory is not None:
-                    for j, i in enumerate(idx):
-                        context['paths'][j]['memory_warm'] = bool(memory['seen'][i])
             x = self.build_inputs(pos, fr, hist, hm, **context)
             sampling = {}
-            if memory is not None:
-                sampling['memory'] = {k: v[idx] for k,v in memory.items()}
             if stochastic:
                 sampling['initial_noise'] = trace_noise(self.model.cfg, [generators[i] for i in idx], self.device)
             if (hasattr(self.model, 'select_prediction')
@@ -190,13 +190,6 @@ class ModelTracer:
                 sampling.update(confidence_threshold=pp.confidence,n_commit=pp.n_commit)
             with torch.autocast('cuda', dtype=torch.bfloat16, enabled=self.device.startswith('cuda')):
                 out = self.model(x, tensor(hist).float(), tensor(hm), **sampling)
-            if memory is not None:
-                # Writes describe the current observed head, never the uncommitted
-                # proposal. Retiring/reordering active traces preserves ownership.
-                for key, value in memory.items():
-                    updated = value.clone()
-                    updated[idx] = out['memory_'+key].detach().to(value.dtype)
-                    memory[key] = updated
             commits, allowed = commit_prefix(out['points'], out['confidence'], pp.confidence, pp.n_commit,
                                              self.model.cfg.max_recovery_distance)
             commits, allowed = [v.cpu().numpy() for v in (commits, allowed)]
@@ -212,9 +205,9 @@ class ModelTracer:
                 state = dict(pos=pos[j].copy(), frame=fr[j].copy(), hist=hist_world[j].copy(), hmask=hm[j].copy(),
                              points=points[j].copy(), confidence=conf.copy(), n_commit=commit, would_stop=would_stop, exploratory=exploratory,
                              recovery_allowed=bool(allowed[j]), recovery_blocked=bool(recovery_blocked),
-                             travelled=float(length[i]), last_segment=last_segment[i].copy())
-                if self.path_context:
-                    state.update({k: context['paths'][j][k] for k in SEED_FIELDS})
+                             travelled=float(length[i]), last_segment=last_segment[i].copy(),
+                             observed_path=np.asarray(paths[i]).copy())
+                state.update({**references[i], 'seed_age': references[i]['seed_age']+float(length[i])})
                 if on_decision is not None and on_decision(int(i), state) is False:
                     active[i], reasons[i] = False, 'oracle'
                     continue

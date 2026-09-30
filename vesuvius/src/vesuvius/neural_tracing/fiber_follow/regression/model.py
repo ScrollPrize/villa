@@ -1,4 +1,4 @@
-"""Observation-memory fiber regression with continuous paths and causal survival scoring."""
+"""Historical-slab fiber regression with continuous paths and causal survival scoring."""
 from dataclasses import asdict, dataclass, field
 from contextlib import nullcontext
 import math
@@ -12,9 +12,9 @@ from torch.utils.checkpoint import checkpoint
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
 from vesuvius.neural_tracing.fiber_follow.shared.policy import DEFAULT_CONFIDENCE, commit_prefix
 
-ARCHITECTURE = 'axial_fiber_memory_v9'
-PATCH_ARCHITECTURE = 'axial_patch4_fiber_memory_v9'
-TOKEN_ARCHITECTURE = 'axial_patch4_tokens_fiber_memory_v9'
+ARCHITECTURE = 'axial_fiber_slabs_v10'
+PATCH_ARCHITECTURE = 'axial_patch4_fiber_slabs_v10'
+TOKEN_ARCHITECTURE = 'axial_patch4_tokens_fiber_slabs_v10'
 TOKEN_STRIDE = (8, 2, 2)
 TOKEN_OFFSET = (3, 0, 0)
 
@@ -34,28 +34,15 @@ class DirectConfig:
     n_history: int = 128
     max_recovery_distance: float = 6.
     patch_radius: float = 1.
-    memory_slots: int = 16
-    memory_steps: int = 64
-    memory_stride: int = 8
-    feature_memory_grid: tuple = (2, 4, 4)
-    feature_sequence_length: int = 2
-    feature_detail_tokens: int = 16
-    feature_stream_steps: int = 128
-    feature_history_decisions: int = 2
-    feature_switch_crop_fraction: float = -1.
-    feature_history_loss_fraction: float = .25
     recurrent_refinement_steps: int = 2
     encoder: str = 'conv'
     token_only: bool = False
-    history_encoder_checkpointing: bool = True
 
     def __post_init__(self):
         if self.encoder not in ('conv', 'patch4'):
             raise ValueError('Encoder must be conv or patch4')
         if not isinstance(self.token_only, bool) or (self.token_only and self.encoder != 'patch4'):
             raise ValueError('Token-only features require the patch4 encoder')
-        if not isinstance(self.history_encoder_checkpointing, bool):
-            raise ValueError('history_encoder_checkpointing must be a boolean')
         if isinstance(self.fine, dict):
             self.fine = CropSpec(**self.fine)
         c = self.fine
@@ -70,22 +57,6 @@ class DirectConfig:
             raise ValueError('Local observation patch must fit fine crop')
         if self.n_future*self.future_step > (c.depth-c.behind-1)*c.spacing:
             raise ValueError('Future horizon exceeds fine image')
-        if any(not isinstance(v, int) or v < 1 for v in
-               (self.memory_slots, self.memory_steps, self.memory_stride, self.feature_detail_tokens)):
-            raise ValueError('Memory dimensions must be positive integers')
-        self.feature_memory_grid = tuple(self.feature_memory_grid)
-        if len(self.feature_memory_grid) != 3 or any(not isinstance(n, int) or n < 1 for n in self.feature_memory_grid):
-            raise ValueError('Feature memory grid requires three positive integers')
-        if not isinstance(self.feature_sequence_length, int) or self.feature_sequence_length < 2:
-            raise ValueError('Feature sequence length must be at least two')
-        if not isinstance(self.feature_stream_steps, int) or self.feature_stream_steps < self.memory_steps:
-            raise ValueError('Feature stream must cover at least the cache horizon')
-        if not isinstance(self.feature_history_decisions, int) or self.feature_history_decisions < 0:
-            raise ValueError('Historical decision count must be a nonnegative integer')
-        if self.feature_switch_crop_fraction != -1 and not 0 <= self.feature_switch_crop_fraction < 1:
-            raise ValueError('Switch crop fraction must be -1 (disabled) or in [0, 1)')
-        if not math.isfinite(self.feature_history_loss_fraction) or not 0 <= self.feature_history_loss_fraction < 1:
-            raise ValueError('History loss fraction must be finite and in [0, 1)')
         if not isinstance(self.recurrent_refinement_steps, int) or self.recurrent_refinement_steps < 0:
             raise ValueError('Recurrent refinement steps must be a nonnegative integer')
         if not isinstance(self.direction_inputs, bool):
@@ -294,7 +265,7 @@ class PathDecoderLayer(nn.TransformerDecoderLayer):
         with self.attention_backend(q):
             return F.scaled_dot_product_attention(q, *kv, attn_mask=mask[:, None, None, :])
 
-    def forward_cached(self, x, kv, padding, *, causal_mask=None):
+    def forward_cached(self, x, kv, padding, *, causal_mask=None, history=None, history_attention=None):
         """The ordinary pre-norm decoder computation with already projected K/V."""
         if not self.norm_first or self.multihead_attn.dropout:
             raise ValueError('Cached trajectory decoder requires pre-norm and zero attention dropout')
@@ -306,6 +277,8 @@ class PathDecoderLayer(nn.TransformerDecoderLayer):
         value = self.attend_memory(q, kv, padding)
         value = value.transpose(1, 2).contiguous().reshape(len(x), -1, h)
         x = x+self.dropout2(attn.out_proj(value))
+        if history is not None:
+            x = history_attention(x, *history)
         return x+self._ff_block(self.norm3(x))
 
 
@@ -466,12 +439,11 @@ class DirectFollower(nn.Module):
         self.register_buffer('path_stencil',torch.tensor([[a*cfg.patch_radius,b*cfg.patch_radius,z]
             for z in (-1.,0.,1.) for a in (-1.,0.,1.) for b in (-1.,0.,1.)]),persistent=False)
         self.register_buffer('planes',torch.arange(1,cfg.n_future+1).float()*cfg.future_step,persistent=False)
-        from .detailed_memory import DetailedFeatureMemory
+        from .history_slabs import HistoryEncoder, HistoryAttention
         from .survival_confidence import SegmentSurvivalScorer
-        self.recurrent_memory = DetailedFeatureMemory(cfg, self.encoder.token_xyz)
+        self.history_encoder = HistoryEncoder(cfg)
+        self.history_attention = HistoryAttention(h, cfg.heads)
         self.confidence_scorer = SegmentSurvivalScorer(cfg)
-        self.encoder_memory_gate = nn.Parameter(torch.tensor(-4.))
-        self.encoder_memory_projection = nn.Linear(cfg.hidden, cfg.hidden)
         if cfg.recurrent_refinement_steps:
             # Spatial evidence, previous coordinates, detached failure/survival.
             width = cfg.path_evidence_width+3+2
@@ -541,69 +513,28 @@ class DirectFollower(nn.Module):
         deep = deep.to(ctx['deep'].dtype)
         return torch.cat((local,deep,valid[...,None]),-1)
 
-    def initial_memory(self, batch, device):
-        return self.recurrent_memory.initial_state(batch, device)
+    def encode_history(self, x):
+        return self.history_encoder(x['history_slabs'], x['history_valid'], x['history_pose'])
 
     def context(self, x, hist, hmask):
         references, mask = self.references(x, hist, hmask)
         stem, deep = self.encoder.encode(x['fine'], references, mask)
-        return dict(stem=stem, deep=deep, references=references, reference_mask=mask,
-                    query_frame=x['query_frame'])
+        dense = self.encoder.decode(stem, deep)
+        ctx = self.context_from_features(x, hist, references, mask, dense, deep)
+        if 'history_tokens' in x:
+            ctx['history_tokens'], ctx['history_padding'] = x['history_tokens'], x['history_padding']
+        else:
+            ctx['history_tokens'], ctx['history_padding'] = self.encode_history(x)
+        return ctx
 
-    def forward(self, x, hist, hmask, candidates=None, memory=None,
+    def forward(self, x, hist, hmask, candidates=None,
                 confidence_threshold=DEFAULT_CONFIDENCE, n_commit=None):
-        # A cold, externally supplied history may have a remote seed. Encode
-        # that seed crop once; streamed training starts at the seed itself.
-        if 'feature_seed_x' in x:
-            seed_x = x['feature_seed_x']
-            empty = torch.zeros_like(hmask)
-            seed_ctx = self.context(seed_x, torch.zeros_like(hist), empty)
-            memory, _ = self.observe_context(seed_ctx, seed_x, torch.zeros_like(hist), empty, memory)
         ctx = self.context(x, hist, hmask)
-        ctx['recurrent'], observation = self.observe_context(ctx, x, hist, hmask, memory)
         out = self.predict(ctx, hist, candidates, confidence_threshold)
-        if observation is not None:
-            out.update(observation_tokens=observation[0], observation_xyz=observation[1], observation_valid=observation[2])
-        out.update({'memory_'+k: v for k, v in ctx['recurrent'].items()})
         return self.select_prediction(out, confidence_threshold, n_commit)
 
     def select_prediction(self, output, confidence_threshold=DEFAULT_CONFIDENCE, n_commit=None):
         return select_refinement(output, self.cfg, confidence_threshold, n_commit)
-
-    def observation_features(self, x, hist, hmask):
-        """Re-encode a selected replay crop without decoding or reading memory."""
-        ctx = self.context(x, hist, hmask)
-        return self.recurrent_memory.extract(ctx['deep'], ctx['stem'], hist, hmask)
-
-    def collect_observation_features(self, x, hist, hmask):
-        """Separate no-grad compiler boundary for visual history collection."""
-        return self.observation_features(x, hist, hmask)
-
-    def replay_observation_features(self, x, hist, hmask):
-        # Keep recomputation inside the compiled operation. Wrapping a compiled
-        # callable here would re-enter Dynamo from autograd's worker threads.
-        from torch.utils.checkpoint import checkpoint
-        if not self.cfg.history_encoder_checkpointing:
-            return self.observation_features(x, hist, hmask)
-        return checkpoint(self.observation_features, x, hist, hmask,
-                          use_reentrant=False, preserve_rng_state=False)
-
-    def observe_context(self, ctx, x, hist, hmask, memory):
-        # Store local appearance and unconditioned deep context. Final dense
-        # features are decoded once, AFTER reading historical observations.
-        observation = self.recurrent_memory.extract(ctx['deep'], ctx['stem'], hist, hmask)
-        state, retrieved = self.recurrent_memory.observe_tokens(*observation, x, memory)
-        # A coarse spatial read broadcasts historical context to the deep lattice.
-        # This avoids 39k queries over the entire historical cache. Stored
-        # observation features above remain independent of this conditioning.
-        n = self.recurrent_memory.coarse_count
-        condition = self.encoder_memory_projection(retrieved[:, :n].to(ctx['deep'].dtype))
-        condition = condition.transpose(1, 2).reshape(len(hist), self.cfg.hidden, *self.cfg.feature_memory_grid)
-        condition = F.interpolate(condition, size=ctx['deep'].shape[-3:], mode='trilinear', align_corners=False)
-        deep = ctx['deep']+self.encoder_memory_gate.sigmoid()*condition
-        dense = self.encoder.decode(ctx['stem'], deep)
-        ctx.update(self.context_from_features(x, hist, ctx['references'], ctx['reference_mask'], dense, deep))
-        return state, observation
 
     def confidence_logits(self, ctx, decoded, points):
         from .survival_confidence import survival_predictions
@@ -616,7 +547,8 @@ class DirectFollower(nn.Module):
         spatial = self.evidence(ctx, samples.flatten(1, 2), 'confidence')
         spatial = spatial.reshape(*samples.shape[:3], -1)
         return self.confidence_scorer(spatial, points,
-                                     ctx['confidence_projected'], ctx['confidence_padding'])
+                                     ctx['confidence_projected'], ctx['confidence_padding'],
+                                     (ctx['history_tokens'], ctx['history_padding']))
 
     def predict(self, ctx, hist, candidates=None, confidence_threshold=DEFAULT_CONFIDENCE):
         decoded, points, projected, padding = self.prepare_prediction(ctx, hist)
@@ -633,14 +565,10 @@ class DirectFollower(nn.Module):
         reference = hist.new_zeros(len(hist), cfg.n_future, 3)
         reference[..., 2] = self.planes
         query = self.query(self.query_features(ctx, reference))
-        if cfg.recurrent_refinement_steps:
-            # These tensors are shared only within this decision and remain attached.
-            projected = [layer.compact_memory(layer.project_memory(memory), padding)
-                         for layer in self.decoder.layers]
-            decoded = self.decode_cached(query, projected, padding)
-        else:
-            projected = None
-            decoded = self.decoder(query, memory, memory_key_padding_mask=padding)
+        # Attached features and image projections are reused for this decision.
+        projected = [layer.compact_memory(layer.project_memory(memory), padding)
+                     for layer in self.decoder.layers]
+        decoded = self.decode_cached(query, projected, padding, ctx)
         points = self.decode_coordinates(decoded)
         return decoded, points, projected, padding
 
@@ -655,12 +583,7 @@ class DirectFollower(nn.Module):
         return torch.cat((lateral, self.planes[None, :, None].expand(len(decoded), -1, -1)), -1)
 
     def decoder_memory(self, ctx):
-        state = ctx['recurrent']
-        # Express retained spatial evidence in the actual crop frame, including roll.
-        query_state = dict(state, frame=ctx.get('query_frame', state['frame']))
-        identity, identity_padding = self.recurrent_memory.read_tokens(query_state)
-        memory = torch.cat((ctx['memory'], identity.to(ctx['memory'].dtype)), 1)
-        padding = torch.cat((ctx['padding'], identity_padding), 1)
+        memory, padding = ctx['memory'], ctx['padding']
         if self.cfg.token_only:
             ctx.update(confidence_projected=self.confidence_scorer.project_memory(memory, padding),
                        confidence_padding=padding)
@@ -706,7 +629,8 @@ class DirectFollower(nn.Module):
                 projected = PathDecoderLayer.select_memory(projected, keep)
                 padding = padding[keep]
                 active_ctx = {key: active_ctx[key][keep] for key in
-                              ('fine', 'deep', 'fine_fp32', 'deep_fp32', 'confidence_padding')} | dict(
+                              ('fine', 'deep', 'fine_fp32', 'deep_fp32', 'confidence_padding',
+                               'history_tokens', 'history_padding')} | dict(
                     confidence_projected=PathDecoderLayer.select_memory(active_ctx['confidence_projected'], keep))
             decoded, points = self.refine_prediction(active_ctx, points, decoded, hazards, confidence,
                 projected, padding, self.refinement_stage.weight[stage])
@@ -741,10 +665,10 @@ class DirectFollower(nn.Module):
         feedback = torch.stack((hazards.sigmoid(), confidence), -1).detach()
         refreshed = self.refinement_fusion(torch.cat((evidence, points/16., feedback), -1))
         query = decoded+refreshed+stage_embedding.to(decoded.dtype)
-        decoded = self.decode_cached(query, projected, padding)
+        decoded = self.decode_cached(query, projected, padding, ctx)
         return decoded, self.decode_coordinates(decoded)
 
-    def training_forward(self, x, hist, hmask, memory, threshold):
+    def training_forward(self, x, hist, hmask, threshold):
         """Fixed proposal slots; accepted rows retain their last actual attempt.
 
         The eager inference path still compacts accepted rows. Here acceptance
@@ -753,7 +677,6 @@ class DirectFollower(nn.Module):
         """
         from .survival_confidence import survival_predictions
         ctx = self.context(x, hist, hmask)
-        ctx['recurrent'], observation = self.observe_context(ctx, x, hist, hmask, memory)
         decoded, points, projected, padding = self.prepare_prediction(ctx, hist)
         initial = points
         hazards = self.hazard_logits(ctx, points)
@@ -777,15 +700,14 @@ class DirectFollower(nn.Module):
             scores.append((hazards, logits, confidence))
             valid.append(active)
         out = self.proposal_output(initial, refinements, scores, valid)
-        out.update(observation_tokens=observation[0], observation_xyz=observation[1], observation_valid=observation[2])
-        out.update({'memory_'+key: value for key, value in ctx['recurrent'].items()})
         score_context = {key: ctx[key] for key in
-                         ('fine', 'deep', 'confidence_projected', 'confidence_padding')}
+                         ('fine', 'deep', 'confidence_projected', 'confidence_padding', 'history_tokens', 'history_padding')}
         if self.cfg.recurrent_refinement_steps:
             score_context.update(fine_fp32=ctx['fine_fp32'], deep_fp32=ctx['deep_fp32'])
         return out, score_context
 
-    def decode_cached(self, query, projected, padding):
+    def decode_cached(self, query, projected, padding, ctx):
         for layer, kv in zip(self.decoder.layers, projected):
-            query = layer.forward_cached(query, kv, padding)
+            query = layer.forward_cached(query, kv, padding,
+                history=(ctx['history_tokens'], ctx['history_padding']), history_attention=self.history_attention)
         return self.decoder.norm(query)

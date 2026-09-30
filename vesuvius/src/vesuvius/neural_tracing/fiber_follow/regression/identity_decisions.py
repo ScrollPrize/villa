@@ -117,7 +117,7 @@ def decision_pair(bank, sample, model, rng, *, attempts=32, choice=None, hard_fr
         if not choice and not bank.clear_of_target(fi, np.concatenate((history[mask > 0], bpos[None]))).all():
             continue
         curves, supported, candidate_kind = path_candidates(curves, supported, rng)
-        reference_b = head-tail-reference_gap
+        reference_b = float(rng.uniform(0., head-tail-reference_gap))
         reference_a = float(np.interp(reference_b, s, matched))
         refs = [interp_at(parent.points, parent.s, np.array([reference_a]))[0],
                 interp_at(line, s, np.array([reference_b]))[0]]
@@ -147,7 +147,7 @@ def decision_pair(bank, sample, model, rng, *, attempts=32, choice=None, hard_fr
                 row.update(supervision_fiber=neighbor, bank_parent_arc_range=arc_range)
             row['pair_observation_seed'] = pair_observation_seed
             # Observed synthetic paths differ before the shared local tail.
-            # Labels are kept in memory_track, never in image/model inputs.
+            # Only the actual synthetic observed polyline enters slab inputs.
             prefix_s = np.arange(reference_b,head-tail,.5)
             prefix_b = interp_at(line,s,prefix_s)
             prefix_a = interp_at(parent.points,parent.s,np.interp(prefix_s,s,matched))
@@ -158,22 +158,7 @@ def decision_pair(bank, sample, model, rng, *, attempts=32, choice=None, hard_fr
             prefix = prefix*(1-blend[:,None])+common*blend[:,None]
             observed = np.concatenate((prefix,history[mask > 0][::-1],pos[None]))
             observed_arc = arclength(observed)
-            arcs = np.arange(0,observed_arc[-1],model.memory_stride)
-            track_pos = interp_at(observed,observed_arc,arcs)
-            behind = interp_at(observed,observed_arc,np.maximum(0,arcs-.5))
-            heading0 = tangents[target]
-            track_frame = np.stack([frame_from_heading(normalize(p-q) if np.linalg.norm(p-q)>1e-6 else heading0)
-                                    for p,q in zip(track_pos,behind)])
-            # Only certain prefix and shared-tail membership is supervised;
-            # the interpolated bridge remains unknown.
-            pure_index = min(len(prefix_s)-1,int(np.searchsorted(prefix_s,head-tail-8.)))
-            pure = observed_arc[max(0,pure_index)]
-            on_tail = arcs >= observed_arc[-1]-tail+1e-5
-            off = np.where(arcs < pure,0.,np.nan)
-            if not choice:
-                off[on_tail] = float(target == 0)
-            row['memory_track'] = dict(pos=track_pos,frame=track_frame,offtrack=off,
-                offset=np.where((off == 0)[:,None],np.zeros((len(off),3)),np.nan))
+            row['observed_path'] = observed
             row['seed_age'] = float(observed_arc[-1])
             rows.append(row)
         if rng.integers(2):
