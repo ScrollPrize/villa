@@ -504,7 +504,7 @@ class IdentityObservationBuilder(ObservationBuilder):
         if self.cfg.memory_slots and self.cfg.memory_version in (3, 5):
             for key in ('route_ab','route_mask'):
                 batch[key] = torch.from_numpy(np.stack([i[key] for i in items]))
-        if self.cfg.memory_slots and self.cfg.memory_version >= 2:
+        if self.cfg.memory_probe and self.cfg.memory_version >= 2:
             from .memory_data import memory_targets
             targets = ([dict(i, memory_warm=True) for i in items] if self.cfg.feature_memory else items)
             batch.update(memory_targets(targets, self.cfg))

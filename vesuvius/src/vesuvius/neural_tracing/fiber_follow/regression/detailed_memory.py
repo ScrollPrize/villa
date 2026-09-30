@@ -1,8 +1,4 @@
-"""Revision 2: spatial detail and admission informed by incoming memory.
-
-Cache entries are observations, not identity endorsements. Their admission
-probability is retained as metadata, including for observations judged departed.
-"""
+"""Spatial observations and task-trained compression, without identity judgments."""
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -14,15 +10,14 @@ from .model import sample_features, crop_support, TOKEN_STRIDE, TOKEN_OFFSET
 class DetailedFeatureMemory(FeatureMemory):
     def __init__(self, cfg, token_xyz):
         super().__init__(cfg, token_xyz)
+        del self.probe_norm, self.probe_attention, self.probe_head
         self.coarse_count = self.count
         self.count += cfg.feature_detail_tokens
         width = 9*(cfg.channels+1)+cfg.hidden+1
         self.detail_projection = nn.Sequential(nn.LayerNorm(width), nn.Linear(width, cfg.hidden))
         self.detail_role = nn.Parameter(torch.randn(cfg.hidden)*.02)
-        self.admission_embedding = nn.Linear(1, cfg.hidden, bias=False)
         self.prior_attention = nn.MultiheadAttention(cfg.hidden, cfg.heads, dropout=0., batch_first=True)
         self.prior_norm = nn.LayerNorm(cfg.hidden)
-        self.prior_gate = nn.Parameter(torch.tensor(-2.))
         self.write_position = nn.Linear(3, cfg.hidden, bias=False)
         stencil = torch.tensor([[a, b, 0.] for a in (-1., 0., 1.) for b in (-1., 0., 1.)])
         self.register_buffer('detail_stencil', stencil*cfg.patch_radius, persistent=False)
@@ -30,8 +25,7 @@ class DetailedFeatureMemory(FeatureMemory):
     def initial_state(self, batch, device):
         state = super().initial_state(batch, device)
         state.update(anchor_mask=torch.zeros(batch, self.count, device=device, dtype=torch.bool),
-                     cache_mask=torch.zeros(batch, self.cfg.memory_steps, self.count, device=device, dtype=torch.bool),
-                     cache_admission=torch.zeros(batch, self.cfg.memory_steps, device=device))
+                     cache_mask=torch.zeros(batch, self.cfg.memory_steps, self.count, device=device, dtype=torch.bool))
         return state
 
     def detail_points(self, hist, hmask):
@@ -74,9 +68,7 @@ class DetailedFeatureMemory(FeatureMemory):
         s, n = self.cfg.memory_slots, self.count
         padding = torch.cat((padding[:, :s], ~state['anchor_mask'] | ~state['anchor_valid'][:, None],
                              (~state['cache_mask'] | ~state['cache_valid'][:, :, None]).flatten(1, 2)), 1)
-        trust = self.admission_embedding(state['cache_admission'][..., None])
-        cache = tokens[:, s+n:]+trust[:, :, None].expand(-1, -1, n, -1).flatten(1, 2)
-        return torch.cat((tokens[:, :s+n], cache), 1), padding
+        return tokens, padding
 
     def observe_tokens(self, tokens, local_xyz, valid, x, state=None):
         """Replayable small transition; all intervening writes stay differentiable."""
@@ -99,24 +91,17 @@ class DetailedFeatureMemory(FeatureMemory):
             anchor_valid = seed | state['anchor_valid']
             anchor_position = torch.where(seed[:, None], position, state['anchor_position'])
             anchor_frame = torch.where(seed[:, None, None], frame, state['anchor_frame'])
-            observed, anchors = self.write_inputs(query[:, None]+self.prior_gate.sigmoid()*retrieved[:, None],
+            # Compress observations, not a retrieved interpretation of them.
+            # The memory read above is used only by the current spatial encoder.
+            observed, anchors = self.write_inputs(query[:, None],
                 position[:, None], frame[:, None], state['position'][:, None], state['frame'][:, None],
                 state['seen'][:, None], anchor, anchor_position, anchor_frame, anchor_valid)
-            # Padding must not contribute to the pooled probe query.
-            pooled = (observed[:, 0]*valid[..., None]).sum(1)/valid.sum(1, keepdim=True).clamp_min(1)
-            probe_tokens = torch.cat((state['slots']+self.role[0], anchors[:, 0]), 1)
-            probe_padding = torch.cat((torch.zeros_like(state['slots'][..., 0], dtype=torch.bool),
-                                       ~anchor_mask | ~anchor_valid[:, None]), 1)
-            read = self.probe_attention(self.probe_norm(pooled[:, None]), probe_tokens, probe_tokens,
-                                        key_padding_mask=probe_padding, need_weights=False)[0]
-            probe = self.probe_head(torch.cat((pooled[:, None], read), -1))
             context = torch.cat((observed[:, 0], anchors[:, 0]), 1)
             write_padding = torch.cat((~valid, ~anchor_mask | ~anchor_valid[:, None]), 1)
             evidence = self.write_attention(self.write_norm(state['slots']), context, context,
                                             key_padding_mask=write_padding, need_weights=False)[0]
             pair = torch.cat((state['slots'], evidence), -1)
-            admission = probe[:, 0, 0].sigmoid()
-            slots = state['slots']+admission[:, None, None]*self.gate(pair).sigmoid()*(self.proposal(pair).tanh()-state['slots'])
+            slots = state['slots']+self.gate(pair).sigmoid()*(self.proposal(pair).tanh()-state['slots'])
             out = dict(slots=slots, anchor=anchor, anchor_xyz=anchor_xyz, anchor_mask=anchor_mask,
                 anchor_valid=anchor_valid, anchor_position=anchor_position, anchor_frame=anchor_frame,
                 position=position, frame=frame, seen=torch.ones_like(anchor_valid),
@@ -125,9 +110,7 @@ class DetailedFeatureMemory(FeatureMemory):
                 cache_frames=torch.cat((state['cache_frames'][:, 1:], frame[:, None]), 1),
                 cache_mask=torch.cat((state['cache_mask'][:, 1:], valid[:, None]), 1),
                 cache_valid=torch.cat((state['cache_valid'][:, 1:], torch.ones_like(anchor_valid)[:, None]), 1),
-                cache_admission=torch.cat((state['cache_admission'][:, 1:], admission[:, None]), 1),
-                cache_age=torch.cat((state['cache_age'][:, 1:]+1, state['cache_age'].new_zeros(len(tokens), 1)), 1),
-                probe=probe)
+                cache_age=torch.cat((state['cache_age'][:, 1:]+1, state['cache_age'].new_zeros(len(tokens), 1)), 1))
             if 'feature_active' in x:
                 active = x['feature_active'].bool()
                 for key, previous in state.items():

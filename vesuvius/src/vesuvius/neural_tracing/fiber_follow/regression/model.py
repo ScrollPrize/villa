@@ -86,6 +86,11 @@ class DirectConfig:
     def feature_memory(self):
         return self.memory_version in (4, 5)
 
+    @property
+    def memory_probe(self):
+        """Observation memory has no auxiliary identity or localization probe."""
+        return bool(self.memory_slots and not (self.feature_memory and self.feature_memory_revision == 2))
+
     def __post_init__(self):
         if not math.isfinite(self.memory_departed_weight) or self.memory_departed_weight <= 0:
             raise ValueError('Departed probe weight must be finite and positive')
@@ -391,7 +396,8 @@ class AxialEncoder(nn.Module):
         rendered = torch.cat((count.clamp_max(1),rendered[...,1:2]/count.clamp_min(1),rendered[...,2:].clamp_max(1)),-1)
         return rendered.reshape(len(points),d,y,x,3)
 
-    def forward(self, image, references, mask):
+    def encode(self, image, references, mask):
+        """Independent observation features, before any persistent-memory read."""
         fine = self.stem(image)
         down = self.down(fine)
         down = F.pad(down,(0,0,0,0,0,(-down.shape[2])%4))
@@ -405,11 +411,18 @@ class AxialEncoder(nn.Module):
                 tokens = block(tokens)
         tokens = self.norm(tokens)
         deep = tokens.permute(0,4,1,2,3)
+        return fine, deep
+
+    def decode(self, fine, deep):
+        """Build localization features from local appearance and spatial context."""
         low = self.dense_projection(deep)
-        up = F.grid_sample(low.float(),self.decode_grid.expand(len(image),-1,-1,-1,-1),
+        up = F.grid_sample(low.float(),self.decode_grid.expand(len(fine),-1,-1,-1,-1),
                            padding_mode='border',align_corners=True).to(fine.dtype)
-        dense = fine+self.dense_decoder(torch.cat((fine,up),1))
-        return dense, deep, tokens.flatten(1,3)
+        return fine+self.dense_decoder(torch.cat((fine,up),1))
+
+    def forward(self, image, references, mask):
+        fine, deep = self.encode(image, references, mask)
+        return self.decode(fine, deep), deep, deep.flatten(2).transpose(1,2)
 
 
 class DirectFollower(nn.Module):
@@ -453,14 +466,23 @@ class DirectFollower(nn.Module):
             self.recurrent_memory = LearnedMemory(cfg)
             self.architecture = MEMORY_ARCHITECTURE if cfg.memory_version == 2 else MEMORY_ARCHITECTURE_V1
 
-    def context(self, x, hist, hmask):
+    def references(self, x, hist, hmask):
         cfg = self.cfg
         seed = x.get('seed',hist.new_zeros(len(hist),1,3))
         seed_mask = x.get('seed_mask',hmask.new_zeros(len(hist),1)).bool()
         references = torch.cat((hist,seed),1)
         mask = torch.cat((hmask.bool(),seed_mask),1) & crop_support(references,cfg.fine)
         references = torch.where(mask[...,None],references.float(),0.)
-        dense,deep,image_tokens = self.encoder(x['fine'],references,mask)
+        return references, mask
+
+    def context(self, x, hist, hmask):
+        references, mask = self.references(x, hist, hmask)
+        dense,deep,_ = self.encoder(x['fine'],references,mask)
+        return self.context_from_features(x, hist, references, mask, dense, deep)
+
+    def context_from_features(self, x, hist, references, mask, dense, deep):
+        cfg = self.cfg
+        image_tokens = deep.flatten(2).transpose(1,2)
         sampling_dense = dense.float() if cfg.recurrent_refinement_steps else dense
         local,_ = sample_features(sampling_dense,references,cfg.fine)
         local = local.to(dense.dtype)
@@ -549,7 +571,11 @@ class DirectFollower(nn.Module):
         points = points.detach()
         spatial = self.evidence(ctx,points,'confidence')
         evidence = self.path_evidence(torch.cat((decoded,spatial,points/16),-1))
-        count = torch.arange(1, points.shape[1]+1, device=points.device)[None, :, None]
+        return self.prefix_confidence(ctx, evidence, spatial)
+
+    def prefix_confidence(self, ctx, evidence, spatial):
+        """Aggregate curve-specific evidence into prefix correctness logits."""
+        count = torch.arange(1, evidence.shape[1]+1, device=evidence.device)[None, :, None]
         prefix_mean = evidence.cumsum(1)/count
         prefix_max = evidence.cummax(1).values
         # The 3x3x3 evidence stencil already samples the exact candidate centre.
@@ -558,8 +584,6 @@ class DirectFollower(nn.Module):
         centre = (len(self.path_stencil)//2)*(c+1)
         comparison = self.identity_evidence(ctx,spatial[...,centre:centre+c],spatial[...,centre+c].bool())
         logits = self.confidence_head(torch.cat((prefix_mean,prefix_max,comparison),-1)).squeeze(-1).float()
-        if 'identity_tokens' in ctx:
-            logits = logits+self.memory_confidence(ctx, spatial, points)
         return logits
 
     def predict(self, ctx, hist, candidates=None):

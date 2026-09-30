@@ -1,4 +1,4 @@
-"""Continuous trajectory prediction with direct access to identity memory.
+"""Continuous trajectory prediction with direct access to observed feature memory.
 
 One transformer decoder jointly predicts all future lateral coordinates. Every
 layer reads image/history tokens, persistent slots, the immutable seed, and the
@@ -31,9 +31,6 @@ class TrajectoryMemoryFollower(DirectFollower):
             width = 27*(cfg.channels+1)+cfg.hidden+1+3
             self.confidence_memory_query = nn.Sequential(nn.Linear(width, cfg.hidden), nn.LayerNorm(cfg.hidden))
             self.confidence_memory_attention = nn.MultiheadAttention(cfg.hidden, cfg.heads, dropout=0., batch_first=True)
-            self.confidence_memory_head = nn.Sequential(nn.Linear(3*cfg.hidden, cfg.hidden), nn.SiLU(), nn.Linear(cfg.hidden, 1))
-            nn.init.zeros_(self.confidence_memory_head[-1].weight)
-            nn.init.zeros_(self.confidence_memory_head[-1].bias)
         if cfg.recurrent_refinement_steps:
             width = 27*(cfg.channels+1)+cfg.hidden+1+3
             self.refinement_fusion = nn.Sequential(nn.Linear(width, cfg.hidden), nn.SiLU(),
@@ -45,7 +42,12 @@ class TrajectoryMemoryFollower(DirectFollower):
             nn.init.zeros_(self.refinement_delta.bias)
 
     def context(self, x, hist, hmask):
-        ctx = super().context(x, hist, hmask)
+        if self.cfg.feature_memory_revision == 2:
+            references, mask = self.references(x, hist, hmask)
+            stem, deep = self.encoder.encode(x['fine'], references, mask)
+            ctx = dict(stem=stem, deep=deep, references=references, reference_mask=mask)
+        else:
+            ctx = super().context(x, hist, hmask)
         if 'query_frame' in x:
             ctx['query_frame'] = x['query_frame']
         return ctx
@@ -76,14 +78,16 @@ class TrajectoryMemoryFollower(DirectFollower):
     def observation_features(self, x, hist, hmask):
         """Re-encode a selected replay crop without decoding or reading memory."""
         ctx = self.context(x, hist, hmask)
-        return self.recurrent_memory.extract(ctx['deep'], ctx.get('fine_fp32', ctx['fine']), hist, hmask)
+        return self.recurrent_memory.extract(ctx['deep'], ctx['stem'], hist, hmask)
 
     def observe_context(self, ctx, x, hist, hmask, memory):
         if self.cfg.feature_memory_revision == 1:
             return self.recurrent_memory.observe_features(ctx['deep'], x, memory), None
-        observation = self.recurrent_memory.extract(ctx['deep'], ctx.get('fine_fp32', ctx['fine']), hist, hmask)
+        # Store local appearance and unconditioned deep context. Final dense
+        # features are decoded once, AFTER reading historical observations.
+        observation = self.recurrent_memory.extract(ctx['deep'], ctx['stem'], hist, hmask)
         state, retrieved = self.recurrent_memory.observe_tokens(*observation, x, memory)
-        # A coarse spatial read broadcasts identity context to the deep lattice.
+        # A coarse spatial read broadcasts historical context to the deep lattice.
         # This avoids 39k queries over the entire historical cache. Stored
         # observation features above remain independent of this conditioning.
         n = self.recurrent_memory.coarse_count
@@ -91,19 +95,23 @@ class TrajectoryMemoryFollower(DirectFollower):
         condition = condition.transpose(1, 2).reshape(len(hist), self.cfg.hidden, *self.cfg.feature_memory_grid)
         condition = F.interpolate(condition, size=ctx['deep'].shape[-3:], mode='trilinear', align_corners=False)
         deep = ctx['deep']+self.encoder_memory_gate.sigmoid()*condition
-        image_count = deep.shape[2]*deep.shape[3]*deep.shape[4]
-        ctx['deep'] = deep
-        if 'deep_fp32' in ctx:
-            ctx['deep_fp32'] = deep.float()
-        ctx['memory'] = torch.cat((deep.flatten(2).transpose(1, 2), ctx['memory'][:, image_count:]), 1)
+        dense = self.encoder.decode(ctx['stem'], deep)
+        ctx.update(self.context_from_features(x, hist, ctx['references'], ctx['reference_mask'], dense, deep))
         return state, observation
 
-    def memory_confidence(self, ctx, spatial, points):
+    def confidence_logits(self, ctx, decoded, points):
+        if self.cfg.feature_memory_revision != 2:
+            return super().confidence_logits(ctx, decoded, points)
+        # Only the scored curve defines these queries. Generator tokens and
+        # refinement coordinates cannot supply a shortcut or receive scorer gradients.
+        points = points.detach()
+        spatial = self.evidence(ctx, points, 'confidence')
         query = self.confidence_memory_query(torch.cat((spatial, points/16.), -1))
         tokens = ctx['identity_tokens'].to(query.dtype)
         retrieved = self.confidence_memory_attention(query, tokens, tokens,
             key_padding_mask=ctx['identity_padding'], need_weights=False)[0]
-        return self.confidence_memory_head(torch.cat((query, retrieved, query*retrieved), -1))[..., 0].float()
+        evidence = self.path_evidence(torch.cat((query+retrieved, spatial, points/16.), -1))
+        return self.prefix_confidence(ctx, evidence, spatial)
 
     def predict(self, ctx, hist, candidates=None):
         cfg = self.cfg

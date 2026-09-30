@@ -380,7 +380,7 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
             batch = move_batch(cpu, device)
             if model.cfg.memory_slots:
                 sums['memory_observations_mean'] = sums.get('memory_observations_mean', 0.)+float(cpu['x']['memory_mask'].sum())/total
-                if 'memory_target_identity_mask' in cpu:
+                if model.cfg.memory_probe and 'memory_target_identity_mask' in cpu:
                     labeled = cpu['memory_target_identity_mask']
                     memory['labeled_writes'] = memory.get('labeled_writes', 0.)+float(labeled.sum())
                     memory['labeled_states'] = memory.get('labeled_states', 0.)+float(labeled.any(-1).sum())
@@ -482,7 +482,8 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
             for key, value in (('loss', loss), ('geometry', geometry), ('confidence_loss', confidence)):
                 accumulate(sums, key, value)
             for key in ('error_sum', 'geometry_count', 'correct_count', 'confidence_count',
-                        'point_correct_count', 'point_wrong_count', 'point_unknown_count'):
+                        'point_correct_count', 'point_wrong_count', 'point_unknown_count',
+                        'confidence_labeled_states', 'confidence_departed_states'):
                 accumulate(sums, key, terms[key])
             if 'source' in cpu:
                 for source in range(len(sources)):

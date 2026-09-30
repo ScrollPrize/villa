@@ -19,7 +19,8 @@ class DirectTrainingInterval:
              'recent_fraction', 'bank_wrong_continuation_fraction',
              'bank_following_fraction', 'decision_pair_fraction')
     counts = ('error_sum', 'geometry_count', 'point_correct_count', 'point_wrong_count',
-              'point_unknown_count', 'replay_endpoints', 'replay_observations', 'replay_encoder_crops')
+              'point_unknown_count', 'replay_endpoints', 'replay_observations', 'replay_encoder_crops',
+              'confidence_labeled_states', 'confidence_departed_states')
     nested_counts = {'identity': ('identity_count', 'identity_rank_correct', 'candidate_states'),
                      'memory': ('identity_count', 'identity_correct', 'departed_count',
                                 'departed_correct', 'offset_count', 'offset_error_sum')}
@@ -70,13 +71,16 @@ def _interval_training_lines(row):
              f" | {row['interval_samples_per_second']:.1f} crops/s"]
     if row.get('cuda_peak_allocated_gib') is not None:
         lines[-1] += f" | peak allocated VRAM {row['cuda_peak_allocated_gib']:.2f} GiB (session)"
-    lines.append(f"  memory probe: correct {_rate(m['memory_identity_correct'], m['memory_identity_count'])}"
+    if m['memory_identity_count']:
+        lines.append(f"  memory probe: correct {_rate(m['memory_identity_correct'], m['memory_identity_count'])}"
                  f" | departed recall {_rate(m['memory_departed_correct'], m['memory_departed_count'])}"
-                 f" | replay {int(m['replay_endpoints'])} endpoints / {int(m['replay_encoder_crops'])} encoder crops"
+                 f" | departed loss weight {row.get('memory_departed_weight', 1.):g}x")
+        lines.append(f"  probe labels: departed {_rate(m['memory_departed_count'], m['memory_identity_count'])}"
+                     f" | false departure {_rate(m['memory_identity_count']-m['memory_departed_count']-(m['memory_identity_correct']-m['memory_departed_correct']), m['memory_identity_count']-m['memory_departed_count'])}")
+    lines.append(f"  replay: {int(m['replay_endpoints'])} endpoints / {int(m['replay_encoder_crops'])} encoder crops"
                  f" (loss {m['replay_loss']:.4f})")
-    lines.append(f"  probe labels: departed {_rate(m['memory_departed_count'], m['memory_identity_count'])}"
-                 +f" | false departure {_rate(m['memory_identity_count']-m['memory_departed_count']-(m['memory_identity_correct']-m['memory_departed_correct']), m['memory_identity_count']-m['memory_departed_count'])}"
-                 +f" | departed loss weight {row.get('memory_departed_weight', 1.):g}x")
+    lines.append(f"  scored crops: candidates {_rate(m['identity_candidate_states'], m['crops'])}"
+                 f" | departed {_rate(m.get('confidence_departed_states', 0), m.get('confidence_labeled_states', 0))}")
     lines.append(f"  identity: rank {_rate(m['identity_identity_rank_correct'], m['identity_identity_count'])}"
                  f" | InfoNCE {m['identity_identity_loss']:.4f} | candidate BCE {m['identity_candidate_loss']:.4f}"
                  f" ({int(m['identity_candidate_states'])} eligible crops)")
@@ -200,11 +204,14 @@ def format_training_log(row):
     step = f"Step {row['step']:,}" if 'step' in row else 'Training'
     if row.get('event') == 'resume_configuration':
         options, cfg = row.get('training_options', {}), row.get('model_cfg', {})
+        observation_memory = cfg.get('memory_version') in (4, 5) and cfg.get('feature_memory_revision') == 2
+        memory = ('observation memory (no probes)' if observation_memory else
+                  f"departed probe loss {cfg.get('memory_departed_weight', 1.):g}x")
         return (f"{step} | resumed {row['checkpoint']}\n"
                 f"  commit {options.get('n_commit', '?')} | history spacing {cfg.get('memory_stride', '?')} vox"
                 f" | memory revision {cfg.get('feature_memory_revision', '?')}"
                 f" | batch {options.get('batch', '?')} / microbatch {options.get('microbatch', '?')}"
-                f"\n  departed probe loss {cfg.get('memory_departed_weight', 1.):g}x"
+                f"\n  {memory}"
                 f" | switch crop budget {cfg.get('feature_switch_crop_fraction', -1.):g}")
     if row.get('event') == 'identity_sampling':
         bank = row.get('negative_bank_provenance') or {}

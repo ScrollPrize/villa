@@ -246,7 +246,10 @@ def test_builder_streams_causal_main_crops_and_keeps_paired_endpoints_identical(
     endpoints = []
     for b in steps:
         assert 'memory_patches' not in b['x'] and 'feature_seed_x' not in b['x']
-        assert b['memory_target_identity'].shape == (len(b['hist']), 1)
+        if c.memory_probe:
+            assert b['memory_target_identity'].shape == (len(b['hist']), 1)
+        else:
+            assert not any(k.startswith('memory_target_') for k in b)
         endpoints.extend(b['x']['fine'][b['stream_end']].unbind())
     torch.testing.assert_close(endpoints[0], endpoints[1], rtol=0, atol=0)
     model = build_model(c)

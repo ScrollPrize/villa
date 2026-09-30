@@ -167,6 +167,8 @@ def loss_terms(output, batch, cfg, tolerance=1.5, *, n_commit=None, identity_tem
     terms = dict(geometry_per_state=geometry,
                  confidence_per_state=window_mean(bce, supervised_known.bool(),
                                                   torch.arange(cfg.n_future, device=mask.device) < window),
+                 confidence_labeled_states=supervised_known.bool().any(-1).sum(),
+                 confidence_departed_states=(supervised_known.bool().any(-1) & batch['offtrack'].bool()).sum(),
                  geometry_count=mask.sum(), confidence_count=supervised_known.sum(),
                  error_sum=torch.where(mask, (predicted-target).norm(dim=-1), 0.).sum(),
                  correct_count=(labels*known).sum())

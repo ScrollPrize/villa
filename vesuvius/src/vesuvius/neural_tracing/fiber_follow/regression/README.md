@@ -4,9 +4,11 @@ For the optional continuous-candidate architecture with revision-2 feature
 memory, fine spatial proposals and two refinement passes, see
 [candidate memory v5](CANDIDATE_MEMORY.md). Existing architecture defaults remain.
 
-For the single-pass continuous decoder with direct attention to persistent
-main-encoder feature memory and streamed training, see [trajectory memory v4](TRAJECTORY_MEMORY.md). It is selected
-explicitly and does not change the v2 default or existing v3 runs.
+For continuous path prediction with observation-only memory, memory-conditioned
+fine features, curve-specific confidence and one shared-decoder refinement pass,
+see [trajectory memory v4](TRAJECTORY_MEMORY.md). Its launcher starts a fresh
+revision-2 run; checkpoints from the former admission-gated revision 2 cannot
+resume this architecture.
 
 The training launcher uses `axial_fiber_memory_v2`, the model from
 `output/axial_memory_seq_run1`. The model, memory writer, observation construction

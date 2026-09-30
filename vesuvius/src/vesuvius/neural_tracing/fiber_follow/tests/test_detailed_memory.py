@@ -1,5 +1,4 @@
 import copy
-from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -16,7 +15,7 @@ def config(**kwargs):
     return cfg(feature_memory_revision=2, feature_detail_tokens=4, recurrent_refinement_steps=1, **kwargs)
 
 
-def test_cache_influences_admission_and_writer_but_not_cached_observation():
+def test_history_conditions_fine_features_and_path_without_rewriting_observations():
     torch.manual_seed(51)
     model = build_model(config()).eval()
     b = memory_batch(model.cfg, 1)
@@ -25,10 +24,18 @@ def test_cache_influences_admission_and_writer_but_not_cached_observation():
     altered = {k: v.clone() for k, v in state.items()}
     altered['cache'] += torch.randn_like(altered['cache'])*3
     b['x']['feature_seed_here'].zero_()
+    fine = []
+    hook = model.encoder.dense_decoder.register_forward_hook(lambda m, args, result: fine.append(result))
     a = model(b['x'], b['hist'], b['hmask'], memory=state)
     z = model(b['x'], b['hist'], b['hmask'], memory=altered)
-    assert (a['memory_probe']-z['memory_probe']).abs().max() > 1e-7
-    assert (a['memory_slots']-z['memory_slots']).abs().max() > 1e-7
+    hook.remove()
+    assert len(fine) == 2  # One dense decode per observed crop.
+    assert (fine[0]-fine[1]).abs().max() > 1e-7
+    assert not model.cfg.memory_probe
+    assert not any('probe' in k or 'admission' in k for k in model.state_dict())
+    assert not any('probe' in k or 'admission' in k for k in a)
+    # Slot compression uses incoming slots and the observation, not retrieved beliefs.
+    torch.testing.assert_close(a['memory_slots'], z['memory_slots'], rtol=0, atol=0)
     torch.testing.assert_close(a['observation_tokens'], z['observation_tokens'], rtol=0, atol=0)
     torch.testing.assert_close(a['memory_cache'][:, -1], z['memory_cache'][:, -1], rtol=0, atol=0)
     assert (a['points']-z['points']).abs().max() > 1e-7
@@ -49,12 +56,11 @@ def test_detail_padding_and_remote_pose():
     b['x']['query_position'] += 100
     a = model(b['x'], b['hist'], b['hmask'], memory=state)
     torch.testing.assert_close(a['memory_anchor'], old_anchor)
-    assert a['memory_cache_admission'].shape == (1, model.cfg.memory_steps)
+    assert a['memory_cache'].shape[1] == model.cfg.memory_steps
 
 
 def test_candidate_queries_are_candidate_specific_and_read_memory():
     model = build_model(config()).eval()
-    torch.nn.init.normal_(model.confidence_memory_head[-1].weight, std=.1)
     b = memory_batch(model.cfg, 1)
     curves = torch.zeros(1, 2, model.cfg.n_future, 3)
     curves[..., 2] = model.planes
@@ -92,7 +98,6 @@ def test_evicted_crop_receives_gradient_through_all_writer_updates():
         if t > 0:
             features = tuple(v.detach() for v in features)
         state, _ = model.recurrent_memory.observe_tokens(*features, b['x'], state)
-        state.pop('probe')
     state['slots'].square().sum().backward()
     assert first['x']['fine'].grad.abs().sum() > 0
 
@@ -123,31 +128,44 @@ def test_revision2_fullgraph_backward():
     assert all(p.grad is None or torch.isfinite(p.grad).all() for p in model.parameters())
 
 
-def test_upgrade_preserves_existing_tensors_moments_and_rng():
-    from vesuvius.neural_tracing.fiber_follow.regression.upgrade_feature_memory import upgrade_checkpoint
-    from vesuvius.neural_tracing.fiber_follow.shared.runloop import training_rng_state
-    model = build_model(cfg(recurrent_refinement_steps=1))
-    opt = torch.optim.AdamW(model.parameters())
-    optimizer_update(model, copy.deepcopy(model), opt, [training_chunk(model.cfg)], 1, .001, compute_metrics=False)
-    ck = dict(architecture=model.architecture, model_cfg=model.cfg.to_dict(), model=model.state_dict(),
-              ema=model.state_dict(), optimizer=opt.state_dict(), rng=training_rng_state(), step=1)
-    upgraded = upgrade_checkpoint(ck)
-    new = build_model(replace(model.cfg, **{k: upgraded['model_cfg'][k] for k in
-                      ('feature_memory_revision', 'feature_detail_tokens', 'feature_stream_steps', 'feature_replay_weight')}))
-    new.load_state_dict(upgraded['model'], strict=True)
-    new_opt = torch.optim.AdamW(new.parameters())
-    new_opt.load_state_dict(upgraded['optimizer'])
-    old_params = dict(model.named_parameters())
-    for name, value in ck['model'].items():
-        torch.testing.assert_close(upgraded['model'][name], value, rtol=0, atol=0)
-        torch.testing.assert_close(upgraded['ema'][name], value, rtol=0, atol=0)
-    for name, p in new.named_parameters():
-        if name in old_params:
-            for key, value in opt.state[old_params[name]].items():
-                torch.testing.assert_close(new_opt.state[p][key], value, rtol=0, atol=0)
-        else:
-            assert not new_opt.state.get(p)
-    assert upgraded['rng'] is ck['rng'] and upgraded['step'] == ck['step']
+@pytest.mark.parametrize('scored', ['confidence_logits', 'candidate_confidence_logits'])
+def test_confidence_has_no_gradient_to_path_generator_but_trains_encoder_and_memory(scored):
+    torch.manual_seed(56)
+    model = build_model(config()).eval()
+    first = memory_batch(model.cfg, 1)
+    first['x']['fine'].requires_grad_()
+    state = state_from(model, model(first['x'], first['hist'], first['hmask']))
+    b = memory_batch(model.cfg, 1, step=1)
+    curves = b['hist'].new_zeros(1, 2, model.cfg.n_future, 3)
+    curves[..., 2] = model.planes
+    curves[:, 1, :, 0] = 2
+    out = model(b['x'], b['hist'], b['hmask'], candidates=curves, memory=state)
+    out[scored].sum().backward()
+    for name, p in model.named_parameters():
+        if name.startswith(('coordinates.', 'decoder.', 'query.', 'refinement_')):
+            assert p.grad is None, name
+    for p in (model.encoder.stem[0].weight, model.encoder.dense_decoder[-1].weight,
+              model.encoder_memory_projection.weight, model.recurrent_memory.gate.weight,
+              model.confidence_memory_attention.in_proj_weight):
+        assert p.grad is not None and p.grad.abs().sum() > 0
+    assert first['x']['fine'].grad.abs().sum() > 0
+
+
+def test_fixed_candidate_scores_do_not_change_when_generator_changes():
+    torch.manual_seed(58)
+    model = build_model(config()).eval()
+    b = memory_batch(model.cfg, 1)
+    curves = b['hist'].new_zeros(1, 2, model.cfg.n_future, 3)
+    curves[..., 2] = model.planes
+    curves[:, 1, :, 0] = 2
+    with torch.no_grad():
+        a = model(b['x'], b['hist'], b['hmask'], candidates=curves)
+        model.coordinates.bias.add_(.5)
+        model.refinement_delta.weight.normal_()
+        model.decoder.layers[0].linear1.weight.normal_()
+        z = model(b['x'], b['hist'], b['hmask'], candidates=curves)
+    assert (a['points']-z['points']).abs().max() > .1
+    torch.testing.assert_close(a['candidate_confidence_logits'], z['candidate_confidence_logits'], rtol=0, atol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA unavailable')
@@ -155,7 +173,6 @@ def test_revision2_compiled_bf16_gradients_match_eager():
     from vesuvius.neural_tracing.fiber_follow.regression.train import compile_training_model, move_batch
     torch.manual_seed(57)
     eager = build_model(config()).cuda()
-    torch.nn.init.normal_(eager.confidence_memory_head[-1].weight, std=.03)
     compiled = copy.deepcopy(eager)
     b = move_batch(memory_batch(eager.cfg, 2), 'cuda')
     candidates = b['hist'].new_zeros(2, 2, eager.cfg.n_future, 3)
@@ -167,7 +184,7 @@ def test_revision2_compiled_bf16_gradients_match_eager():
             out = model(b['x'], b['hist'], b['hmask'], candidates=candidates)
             state = state_from(eager, out)
             out = model(b['x'], b['hist'], b['hmask'], candidates=candidates, memory=state)
-            loss = out['points'].square().mean()+out['candidate_confidence_logits'].square().mean()+out['memory_probe'].square().mean()
+            loss = out['points'].square().mean()+out['candidate_confidence_logits'].square().mean()
         losses.append(loss.detach())
         loss.backward()
     torch.testing.assert_close(*losses, atol=.01, rtol=.02)
