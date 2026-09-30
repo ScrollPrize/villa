@@ -13,8 +13,9 @@ class QLineEdit;
 class QSpinBox;
 
 // Options of a new Automated Fiber Volume: output file, zone of the current
-// volume and its blocks, model and Python. The caller adds the volume and its
-// coordinate identity to the request. Choices are remembered.
+// volume and its blocks, model, extension and cleanup, and Python. The caller
+// adds the volume and its coordinate identity to the request. Choices are
+// remembered.
 class FiberCollectionGeneratorDialog : public QDialog
 {
     Q_OBJECT
@@ -41,6 +42,11 @@ private:
     QLineEdit* model_{};
     QCheckBox* mirror_{};
     QDoubleSpinBox* threshold_{};
+    QCheckBox* extend_{};
+    QDoubleSpinBox* maxJoinAngle_{};
+    QCheckBox* removeShort_{};
+    QDoubleSpinBox* minLength_{};
+    QDoubleSpinBox* blackDistance_{};
     QLineEdit* python_{};
     std::array<int, 3> zoneOrigin() const;
     std::array<int, 3> zoneSize() const;

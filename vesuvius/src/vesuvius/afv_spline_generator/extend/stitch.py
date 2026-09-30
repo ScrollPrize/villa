@@ -1,7 +1,7 @@
 """Stitch the splines of a zone processed block by block into long fibers.
 
 Every block's splines enter one catalogue, which suppresses duplicates and
-joins splines that overlap across neighbouring blocks. Each chain is then
+joins splines that overlap across neighbouring blocks. Each chain can then be
 grown from both ends by the reciprocal Expander: a gap join needs the learned
 geometry score, a clear margin over the alternatives, the same choice from
 the other side, no obstruction and CT at the join.
@@ -91,6 +91,10 @@ class Stitcher:
             curve = self.catalog.get_curve(cid, include_provenance=False)
             points = np.asarray(curve['points'], float)
             yield dict(family=int(curve['family']), points=points, gaps=_gap_ranges(curve, points))
+
+    def stitched(self):
+        """Every fiber without extension: the catalogue chains and the short splines kept aside."""
+        return list(self.chains()) + [dict(s, gaps=[]) for s in self.short]
 
     def expand(self, score, measure, progress: Callable[[int, int], None] | None = None):
         """Grow every chain, longest first; a chain joined into another is not grown again."""

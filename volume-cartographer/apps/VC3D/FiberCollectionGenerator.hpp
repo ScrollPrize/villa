@@ -19,6 +19,9 @@ inline constexpr auto kModule = "vesuvius.afv_spline_generator";
 inline constexpr auto kDefaultModel = "Qualzz20/afv_fiber_9um";
 inline constexpr double kDefaultThresholdPercent = 60.0;
 inline constexpr int kDefaultBlockSize = 512;
+inline constexpr double kDefaultMaxJoinAngle = 45.0;
+inline constexpr double kDefaultMinLength = 32.0;
+inline constexpr double kDefaultBlackDistance = 16.0;
 
 struct Request {
     // Local OME-Zarr directory or http(s) URL, and the array read as the volume.
@@ -37,6 +40,14 @@ struct Request {
     bool mirror = false;
     double thresholdPercent = kDefaultThresholdPercent;
     int blockSize = kDefaultBlockSize;
+    // Join fibers across gaps with the gap model (slow).
+    bool extend = false;
+    // Inferred joins turning more than this many degrees are cut.
+    double maxJoinAngle = kDefaultMaxJoinAngle;
+    // Fibers shorter than this, or passing this close to the black outside the
+    // papyrus, are removed; 0 keeps them. Voxels of the volume.
+    double minLength = kDefaultMinLength;
+    double blackDistance = kDefaultBlackDistance;
     // Receives a .afv of the fibers stitched so far after each block; empty for none.
     QString previewDirectory;
 };

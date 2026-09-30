@@ -30,6 +30,11 @@ constexpr auto kThresholdKey = "fiberCollections/generator/thresholdPercent";
 constexpr auto kPythonKey = "fiberCollections/generator/python";
 constexpr auto kSizeKey = "fiberCollections/generator/zoneSize";
 constexpr auto kBlockSizeKey = "fiberCollections/generator/blockSize";
+constexpr auto kExtendKey = "fiberCollections/generator/extend";
+constexpr auto kMaxJoinAngleKey = "fiberCollections/generator/maxJoinAngle";
+constexpr auto kRemoveShortKey = "fiberCollections/generator/removeShort";
+constexpr auto kMinLengthKey = "fiberCollections/generator/minLength";
+constexpr auto kBlackDistanceKey = "fiberCollections/generator/blackDistance";
 constexpr auto kDirectoryKey = "fiberCollections/generator/directory";
 }  // namespace
 
@@ -115,6 +120,38 @@ FiberCollectionGeneratorDialog::FiberCollectionGeneratorDialog(
     threshold_->setToolTip(tr("Minimum fiber probability kept before fitting polylines."));
     form->addRow(tr("Fiber threshold"), threshold_);
 
+    extend_ = new QCheckBox(tr("Join fibers across gaps with the gap model: longer fibers, several times slower"), this);
+    extend_->setChecked(settings.value(kExtendKey, false).toBool());
+    form->addRow(QString(), extend_);
+    maxJoinAngle_ = new QDoubleSpinBox(this);
+    maxJoinAngle_->setRange(0, 180);
+    maxJoinAngle_->setDecimals(0);
+    maxJoinAngle_->setSuffix(QStringLiteral("°"));
+    maxJoinAngle_->setValue(settings.value(kMaxJoinAngleKey, vc3d::fibergen::kDefaultMaxJoinAngle).toDouble());
+    maxJoinAngle_->setToolTip(tr("Inferred joins turning more than this, measured over 8 voxels on each side, are cut. 180° keeps every join."));
+    form->addRow(tr("Max join angle"), maxJoinAngle_);
+    removeShort_ = new QCheckBox(tr("Remove fibers shorter than"), this);
+    removeShort_->setChecked(settings.value(kRemoveShortKey, true).toBool());
+    minLength_ = new QDoubleSpinBox(this);
+    minLength_->setRange(1, 100000);
+    minLength_->setDecimals(0);
+    minLength_->setSuffix(tr(" voxels"));
+    minLength_->setValue(settings.value(kMinLengthKey, vc3d::fibergen::kDefaultMinLength).toDouble());
+    minLength_->setEnabled(removeShort_->isChecked());
+    connect(removeShort_, &QCheckBox::toggled, minLength_, &QWidget::setEnabled);
+    auto* shortRow = new QHBoxLayout;
+    shortRow->addWidget(removeShort_);
+    shortRow->addWidget(minLength_, 1);
+    form->addRow(QString(), shortRow);
+    blackDistance_ = new QDoubleSpinBox(this);
+    blackDistance_->setRange(0, 1024);
+    blackDistance_->setDecimals(0);
+    blackDistance_->setSuffix(tr(" voxels"));
+    blackDistance_->setSpecialValueText(tr("Keep them"));
+    blackDistance_->setValue(settings.value(kBlackDistanceKey, vc3d::fibergen::kDefaultBlackDistance).toDouble());
+    blackDistance_->setToolTip(tr("Fibers passing this close to the black outside the papyrus (CT value 0) are removed."));
+    form->addRow(tr("Remove fibers near the outside black"), blackDistance_);
+
     python_ = new QLineEdit(settings.value(kPythonKey).toString(), this);
     python_->setPlaceholderText(tr("Detect automatically"));
     python_->setToolTip(tr("Python with the vesuvius package and its model dependencies."));
@@ -185,6 +222,10 @@ vc3d::fibergen::Request FiberCollectionGeneratorDialog::request() const
     request.mirror = mirror_->isChecked();
     request.thresholdPercent = threshold_->value();
     request.blockSize = blockSize_->value();
+    request.extend = extend_->isChecked();
+    request.maxJoinAngle = maxJoinAngle_->value();
+    request.minLength = removeShort_->isChecked() ? minLength_->value() : 0.0;
+    request.blackDistance = blackDistance_->value();
     return request;
 }
 
@@ -220,6 +261,11 @@ void FiberCollectionGeneratorDialog::accept()
     settings.setValue(kMirrorKey, mirror_->isChecked());
     settings.setValue(kThresholdKey, threshold_->value());
     settings.setValue(kBlockSizeKey, blockSize_->value());
+    settings.setValue(kExtendKey, extend_->isChecked());
+    settings.setValue(kMaxJoinAngleKey, maxJoinAngle_->value());
+    settings.setValue(kRemoveShortKey, removeShort_->isChecked());
+    settings.setValue(kMinLengthKey, minLength_->value());
+    settings.setValue(kBlackDistanceKey, blackDistance_->value());
     settings.setValue(kPythonKey, pythonExecutable());
     QDialog::accept();
 }

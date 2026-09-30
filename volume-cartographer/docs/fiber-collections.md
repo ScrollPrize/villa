@@ -29,9 +29,21 @@ file is never replaced) and the zone, in voxels of the current volume: a
 512-voxel cube centered on the focus point by default, of any size up to the
 volume. The zone is processed in cubes of **Block size** voxels (512 by
 default); while the dialog is open, the blocks are drawn on the CT views and
-the dialog shows how many there are. **Block size**, **Model**, **Test-time
-mirroring** (off by default: better predictions, about 8× slower) and **Fiber
-threshold** are remembered.
+the dialog shows how many there are. The other options, all remembered:
+
+* **Model**, **Test-time mirroring** (off by default: better predictions,
+  about 8× slower) and **Fiber threshold**.
+* **Join fibers across gaps** (off by default): extends the fibers across
+  gaps inside the zone with a gap model; longer fibers, several times slower.
+* **Max join angle** (45° by default): inferred joins turning more than this
+  are cut.
+* **Remove fibers shorter than** (on, 32 voxels by default).
+* **Remove fibers near the outside black** (16 voxels by default, or **Keep
+  them**): removes fibers passing this close to the black (CT value 0)
+  outside the papyrus.
+
+The points of every fiber are thinned to the fewest that stay within 0.05
+voxel of the original polyline.
 
 VC3D runs `python -m vesuvius.afv_spline_generator` in the background and shows
 its progress under the button; **Cancel** stops it. Each block is drawn on the
@@ -46,11 +58,11 @@ large enough:
 | fitting splines | purple |
 | stitching | orange |
 | stitched | yellow |
-| extending | pink |
+| extending (with **Join fibers across gaps**) | pink |
 | done | green |
 
 After each block, the fibers stitched so far are shown as a preview; the
-final volume replaces it when the extension is done.
+final volume replaces it at the end.
 
 When VC3D runs from a build inside a villa checkout, that checkout's
 `vesuvius/src` is put first on `PYTHONPATH`. Python is the one given in the

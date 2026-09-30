@@ -2,8 +2,9 @@
 
 The zone is processed in blocks. In each block a fiber model predicts vertical
 and horizontal fiber probabilities and smooth polylines are fitted to them
-(see ``splines``). The blocks' polylines are then stitched into long fibers
-(see ``extend``) and written in native L0 coordinates, ready to open in VC3D.
+(see ``splines``). The blocks' polylines are then stitched into long fibers,
+optionally extended across gaps (see ``extend``), cleaned (see ``cleanup``)
+and written in native L0 coordinates, ready to open in VC3D.
 """
 
 from __future__ import annotations
@@ -24,10 +25,14 @@ from typing import Any, Iterator, Sequence
 import numpy as np
 
 from .afv import Fiber, write_afv
+from .cleanup import TOLERANCE, ExteriorBlack, clean
 
 
 DEFAULT_MODEL = "Qualzz20/afv_fiber_9um"
 DEFAULT_THRESHOLD = 60.0
+DEFAULT_MAX_JOIN_ANGLE = 45.0
+DEFAULT_MIN_LENGTH = 32.0
+DEFAULT_BLACK_DISTANCE = 16.0
 # Voxel sizes of the scans DEFAULT_MODEL was trained on, in micrometres.
 DEFAULT_MODEL_VOXEL_SIZES = (8.64, 9.362)
 DEFAULT_BLOCK_SIZE = 512
@@ -243,6 +248,30 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_BLOCK_SIZE,
         help=f"The zone is processed in cubes of this many voxels per side (default: {DEFAULT_BLOCK_SIZE})",
     )
+    parser.add_argument(
+        "--extend",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Join fibers across gaps inside the zone with the gap model: longer fibers, several times slower (default: off)",
+    )
+    parser.add_argument(
+        "--max-join-angle",
+        type=float,
+        default=DEFAULT_MAX_JOIN_ANGLE,
+        help=f"Cut inferred joins turning more than this many degrees, measured over 8 voxels on each side; 180 keeps them all (default: {DEFAULT_MAX_JOIN_ANGLE:g})",
+    )
+    parser.add_argument(
+        "--min-length",
+        type=float,
+        default=DEFAULT_MIN_LENGTH,
+        help=f"Remove fibers shorter than this many voxels; 0 keeps them all (default: {DEFAULT_MIN_LENGTH:g})",
+    )
+    parser.add_argument(
+        "--black-distance",
+        type=float,
+        default=DEFAULT_BLACK_DISTANCE,
+        help=f"Remove fibers passing within this many voxels of the black outside the papyrus (CT value 0); 0 keeps them all (default: {DEFAULT_BLACK_DISTANCE:g})",
+    )
     parser.add_argument("--preview-dir", type=Path, help="Folder receiving a .afv of the fibers stitched so far after each block")
     parser.add_argument("--device", default="auto", help="auto (default), cuda, cuda:N, mps or cpu")
     parser.add_argument("--progress", choices=("text", "json"), default="text", help="Progress as text on stderr, or JSON lines on stdout")
@@ -267,6 +296,10 @@ def generate(args: argparse.Namespace, report: Reporter) -> dict[str, Any]:
     threshold = threshold_to_u8(args.threshold)
     if args.voxel_size is not None and not args.voxel_size > 0:
         raise ValueError("--voxel-size must be positive")
+    if not 0 <= args.max_join_angle <= 180:
+        raise ValueError("--max-join-angle must be between 0 and 180")
+    if args.min_length < 0 or args.black_distance < 0:
+        raise ValueError("--min-length and --black-distance cannot be negative")
     if args.model == DEFAULT_MODEL and args.voxel_size:
         effective = args.voxel_size * args.native_scale
         if not 8.0 <= effective <= 10.0:
@@ -292,12 +325,8 @@ def generate(args: argparse.Namespace, report: Reporter) -> dict[str, Any]:
     network, patch = load_network(folder, device)
     mirror = args.mirror
 
-    from .extend.ct_support import CTSupport
-    from .extend.gap_model import Predictor, geometry_features
     from .extend.stitch import Stitcher
 
-    gap_model = Predictor(GAP_MODEL)
-    voxel_microns = args.voxel_size * args.native_scale if args.voxel_size else float(gap_model.metadata["voxelMicrons"])
     frame = {
         "vc_open_data_coordinate_space": args.coordinate_space,
         "vc_open_data_source_coordinate_level": 0,
@@ -324,14 +353,29 @@ def generate(args: argparse.Namespace, report: Reporter) -> dict[str, Any]:
         "native_scale": args.native_scale,
         "block_size": args.block_size,
         "block_margin": BLOCK_MARGIN,
-        "gap_model": gap_model.metadata.get("modelName", GAP_MODEL.name),
+        "extend": args.extend,
+        "max_join_angle_degrees": args.max_join_angle,
+        "min_length_voxels": args.min_length,
+        "black_distance_voxels": args.black_distance,
+        "point_tolerance_voxels": TOLERANCE,
     }
+    if args.extend:
+        from .extend.ct_support import CTSupport
+        from .extend.gap_model import Predictor, geometry_features
+
+        gap_model = Predictor(GAP_MODEL)
+        voxel_microns = args.voxel_size * args.native_scale if args.voxel_size else float(gap_model.metadata["voxelMicrons"])
+        generator["gap_model"] = gap_model.metadata.get("modelName", GAP_MODEL.name)
 
     def write(path: Path, traces: list[dict[str, Any]]) -> dict[str, Any]:
         return write_afv(path, afv_fibers(traces, args.native_scale, args.voxel_size), frame=frame, root=root, metadata={"generator": generator})
 
     names = {"V": "vertical", "H": "horizontal"}
     count = len(blocks)
+    black = None
+    if args.black_distance > 0:
+        black = ExteriorBlack(np.maximum(np.asarray(args.origin) - BLOCK_MARGIN, 0),
+                              np.minimum(np.asarray(args.origin) + np.asarray(args.size) + BLOCK_MARGIN, shape_xyz))
     with tempfile.TemporaryDirectory(prefix="afv-stitch-") as scratch:
         stitcher = Stitcher(scratch)
         try:
@@ -346,6 +390,8 @@ def generate(args: argparse.Namespace, report: Reporter) -> dict[str, Any]:
                 report.emit("block", index=index, state="reading")
                 step(0.0, "reading the CT")
                 ct = np.asarray(volume[tuple(slice(int(a), int(b)) for a, b in zip(low[::-1], high[::-1]))])
+                if black is not None:
+                    black.add(ct, low)
                 report.emit("block", index=index, state="predicting")
                 probabilities = predict_fibers(
                     network,
@@ -371,51 +417,58 @@ def generate(args: argparse.Namespace, report: Reporter) -> dict[str, Any]:
                 report.emit("block", index=index, state="stitched")
                 if args.preview_dir is not None:
                     preview = args.preview_dir.expanduser().absolute() / f"preview-{index + 1:04d}.afv"
-                    chains = list(stitcher.chains())
-                    write(preview, chains)
-                    report.emit("preview", path=str(preview), fibers=len(chains))
+                    shown = clean(stitcher.stitched(), args.max_join_angle, args.min_length)
+                    write(preview, shown)
+                    report.emit("preview", path=str(preview), fibers=len(shown))
             del network
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 
-            (Path(scratch) / "ct").mkdir()
-            ct_support = CTSupport(RegionReader(volume, spill=Path(scratch) / "ct"), shape_xyz)
+            if args.extend:
+                (Path(scratch) / "ct").mkdir()
+                ct_support = CTSupport(RegionReader(volume, spill=Path(scratch) / "ct"), shape_xyz)
 
-            def score(proposals: list[dict[str, Any]], row: dict[str, Any]) -> np.ndarray:
-                features = np.stack(
-                    [geometry_features(p["a"], p["b"], p["context"], family=row["family"], voxel_microns=voxel_microns) for p in proposals]
-                )
-                return gap_model.score(features)
+                def score(proposals: list[dict[str, Any]], row: dict[str, Any]) -> np.ndarray:
+                    features = np.stack(
+                        [geometry_features(p["a"], p["b"], p["context"], family=row["family"], voxel_microns=voxel_microns) for p in proposals]
+                    )
+                    return gap_model.score(features)
 
-            def measure(a: np.ndarray, b: np.ndarray) -> dict[str, Any]:
-                evidence = ct_support.features(a, b)
-                return dict(state="available" if evidence["valid"] else "unavailable", status=evidence["status"])
+                def measure(a: np.ndarray, b: np.ndarray) -> dict[str, Any]:
+                    evidence = ct_support.features(a, b)
+                    return dict(state="available" if evidence["valid"] else "unavailable", status=evidence["status"])
 
-            owner = {}
-            for cid in stitcher.chain_ids():
-                curve = stitcher.catalog.get_curve(cid, include_provenance=False)
-                middle = np.asarray(curve["points"][len(curve["points"]) // 2])
-                owner[cid] = next(
-                    (i for i, (o, sz) in enumerate(blocks) if np.all(middle >= o) and np.all(middle < np.asarray(o) + sz)),
-                    int(np.argmin([np.linalg.norm(middle - (np.asarray(o) + np.asarray(sz) / 2)) for o, sz in blocks])),
-                )
-            remaining = np.bincount(list(owner.values()), minlength=count)
-            for index in range(count):
-                report.emit("block", index=index, state="extending" if remaining[index] else "done")
-            order = stitcher.chain_ids()
+                owner = {}
+                for cid in stitcher.chain_ids():
+                    curve = stitcher.catalog.get_curve(cid, include_provenance=False)
+                    middle = np.asarray(curve["points"][len(curve["points"]) // 2])
+                    owner[cid] = next(
+                        (i for i, (o, sz) in enumerate(blocks) if np.all(middle >= o) and np.all(middle < np.asarray(o) + sz)),
+                        int(np.argmin([np.linalg.norm(middle - (np.asarray(o) + np.asarray(sz) / 2)) for o, sz in blocks])),
+                    )
+                remaining = np.bincount(list(owner.values()), minlength=count)
+                for index in range(count):
+                    report.emit("block", index=index, state="extending" if remaining[index] else "done")
+                order = stitcher.chain_ids()
 
-            def expand_progress(done: int, total: int) -> None:
-                if done:
-                    block = owner[order[done - 1]]
-                    remaining[block] -= 1
-                    if remaining[block] == 0:
-                        report.emit("block", index=int(block), state="done")
-                report("stitch", f"Extending fibers across gaps · {done} of {total}", done, total)
+                def expand_progress(done: int, total: int) -> None:
+                    if done:
+                        block = owner[order[done - 1]]
+                        remaining[block] -= 1
+                        if remaining[block] == 0:
+                            report.emit("block", index=int(block), state="done")
+                    report("stitch", f"Extending fibers across gaps · {done} of {total}", done, total)
 
-            traces = stitcher.expand(score, measure, expand_progress)
+                traces = stitcher.expand(score, measure, expand_progress)
+            else:
+                for index in range(count):
+                    report.emit("block", index=index, state="done")
+                traces = stitcher.stitched()
         finally:
             stitcher.close()
 
+    report("stitch", f"Cleaning {len(traces)} fibers", 1, 1)
+    traces = clean(traces, args.max_join_angle, args.min_length, black, args.black_distance)
     report("write", f"Writing {len(traces)} fibers")
     written = write(output, traces)
     return {"output": str(output), "fibers": written["fiber_count"], "points": written["point_count"], "uuid": written["uuid"]}

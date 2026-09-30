@@ -29,6 +29,10 @@ QStringList arguments(const Request& request)
     if (request.mirror)
         args << "--mirror";
     args << "--block-size" << QString::number(request.blockSize);
+    if (request.extend)
+        args << "--extend";
+    args << "--max-join-angle" << decimal(request.maxJoinAngle) << "--min-length" << decimal(request.minLength)
+         << "--black-distance" << decimal(request.blackDistance);
     if (!request.previewDirectory.isEmpty())
         args << "--preview-dir" << request.previewDirectory;
     args << "--progress" << "json";

@@ -30,13 +30,18 @@ private slots:
         request.thresholdPercent = 55;
         request.mirror = true;
         request.blockSize = 256;
+        request.extend = true;
+        request.maxJoinAngle = 30;
+        request.minLength = 0;
+        request.blackDistance = 8;
         request.previewDirectory = "/tmp/previews";
         const QStringList expected{
             "-m", "vesuvius.afv_spline_generator", "--volume", "https://example.org/scroll.zarr", "--level", "1",
             "--origin", "10", "20", "30", "--size", "512", "256", "128", "--output", "/data/fibers.afv",
             "--coordinate-space", "PHerc0813/20250821151723", "--native-scale", "2", "--voxel-size", "9.362",
             "--source-path", "s3://bucket/scroll.zarr/", "--model", "Qualzz20/afv_fiber_9um", "--threshold", "55",
-            "--mirror", "--block-size", "256", "--preview-dir", "/tmp/previews", "--progress", "json"};
+            "--mirror", "--block-size", "256", "--extend", "--max-join-angle", "30", "--min-length", "0",
+            "--black-distance", "8", "--preview-dir", "/tmp/previews", "--progress", "json"};
         QCOMPARE(arguments(request), expected);
     }
 
@@ -50,9 +55,12 @@ private slots:
         QVERIFY(!args.contains("--voxel-size"));
         QVERIFY(!args.contains("--source-path"));
         QVERIFY(!args.contains("--mirror"));
+        QVERIFY(!args.contains("--extend"));
         QVERIFY(!args.contains("--preview-dir"));
         QCOMPARE(args.mid(args.indexOf("--threshold"), 2), (QStringList{"--threshold", "60"}));
         QCOMPARE(args.mid(args.indexOf("--block-size"), 2), (QStringList{"--block-size", "512"}));
+        QCOMPARE(args.mid(args.indexOf("--max-join-angle"), 6),
+                 (QStringList{"--max-join-angle", "45", "--min-length", "32", "--black-distance", "16"}));
     }
 
     void parsesProgressEvents()

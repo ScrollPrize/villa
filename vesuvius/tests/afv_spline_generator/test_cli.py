@@ -65,6 +65,8 @@ def test_generates_a_volume_in_native_coordinates(monkeypatch, capsys, volume, t
     # The native shape is not known exactly from a downsampled volume.
     assert "coordinate_base_shape_zyx" not in metadata["root"]
     assert metadata["generator"]["origin_xyz"] == [4, 10, 8] and metadata["generator"]["mirror"] is False
+    assert metadata["generator"]["extend"] is False and "gap_model" not in metadata["generator"]
+    assert metadata["generator"]["max_join_angle_degrees"] == 45 and metadata["generator"]["min_length_voxels"] == 32
     family, length, annotation = db.execute("SELECT family, length, annotation FROM fibers").fetchone()
     points = np.concatenate([np.frombuffer(blob, "<f8").reshape(-1, 3) for (blob,) in db.execute("SELECT points FROM blocks ORDER BY first_segment")])
     assert family == "V"
@@ -92,6 +94,14 @@ def test_blocks_are_stitched_and_previewed(monkeypatch, capsys, volume, tmp_path
     assert events[-1]["fibers"] == 1
 
 
+def test_fibers_are_extended_only_when_asked(monkeypatch, capsys, volume, tmp_path):
+    code, events = run(monkeypatch, capsys, volume, tmp_path / "fibers.afv", "--block-size", "48", "--extend")
+    assert code == 0 and events[-1]["fibers"] == 1
+    assert "extending" in {e["state"] for e in events if e["event"] == "block"}
+    metadata = {key: json.loads(value) for key, value in sqlite3.connect(tmp_path / "fibers.afv").execute("SELECT key, value FROM metadata")}
+    assert metadata["generator"]["extend"] is True and metadata["generator"]["gap_model"]
+
+
 def test_zone_is_cut_into_blocks():
     assert cli.zone_blocks([4, 10, 8], [88, 40, 30], 48) == [([4, 10, 8], [48, 40, 30]), ([52, 10, 8], [40, 40, 30])]
     assert len(cli.zone_blocks([0, 0, 0], [1024, 1024, 512], 512)) == 4
@@ -116,10 +126,17 @@ def test_reports_errors_as_json_and_writes_nothing(monkeypatch, capsys, volume, 
     assert not output.exists()
 
 
+REQUIRED = ["--volume", "v.zarr", "--origin", "0", "0", "0", "--size", "1", "1", "1", "--output", "f.afv", "--coordinate-space", "S/1"]
+
+
 @pytest.mark.parametrize("flag, mirror", [((), False), (("--mirror",), True), (("--no-mirror",), False)])
 def test_mirroring_is_off_unless_asked(flag, mirror):
-    required = ["--volume", "v.zarr", "--origin", "0", "0", "0", "--size", "1", "1", "1", "--output", "f.afv", "--coordinate-space", "S/1"]
-    assert cli.build_parser().parse_args([*required, *flag]).mirror is mirror
+    assert cli.build_parser().parse_args([*REQUIRED, *flag]).mirror is mirror
+
+
+def test_cleanup_defaults():
+    args = cli.build_parser().parse_args(REQUIRED)
+    assert (args.extend, args.max_join_angle, args.min_length, args.black_distance) == (False, 45, 32, 16)
 
 
 def test_zone_must_be_inside_the_volume():
