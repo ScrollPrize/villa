@@ -1,6 +1,8 @@
 """Matched choices and departures distinguished by earlier observed fibers."""
 import numpy as np
 
+from vesuvius.neural_tracing.fiber_follow.regression.data import LOCATION_SOURCES
+
 from vesuvius.neural_tracing.fiber_follow.shared.data import continuation_targets, label_state
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import (
     arclength, interp_at, tangent_at, frame_from_heading, random_rotation_about, normalize,
@@ -134,7 +136,7 @@ def decision_pair(bank, sample, model, rng, *, attempts=32, choice=None, hard_fr
                               t=t, reverse=rev, offtrack=offtrack)
             row['_seed_original_certified'] = True
             row.update(fiber_ref=(fi, ta if target == 0 else head, rev), source=5, source_step=-1,
-                       stratum=4 if offtrack else -1, location_source=6,
+                       stratum=4 if offtrack else -1, location_source=LOCATION_SOURCES.index('decision_pair'),
                        seed_pos=refs[target], seed_tangent=tangents[target], seed_valid=True,
                        seed_age=float(arclength(np.concatenate((refs[target][None], history[mask > 0][::-1], pos[None])))[-1]),
                        candidate_points=curves.copy(), candidate_mask=supported.copy(),

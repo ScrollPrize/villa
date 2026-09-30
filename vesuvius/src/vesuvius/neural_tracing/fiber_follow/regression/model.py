@@ -486,6 +486,13 @@ class DirectFollower(nn.Module):
         ctx = self.context(x, hist, hmask)
         return self.recurrent_memory.extract(ctx['deep'], ctx['stem'], hist, hmask)
 
+    def replay_observation_features(self, x, hist, hmask):
+        # Keep recomputation inside the compiled operation. Wrapping a compiled
+        # callable here would re-enter Dynamo from autograd's worker threads.
+        from torch.utils.checkpoint import checkpoint
+        return checkpoint(self.observation_features, x, hist, hmask,
+                          use_reentrant=False, preserve_rng_state=False)
+
     def observe_context(self, ctx, x, hist, hmask, memory):
         # Store local appearance and unconditioned deep context. Final dense
         # features are decoded once, AFTER reading historical observations.
@@ -517,6 +524,11 @@ class DirectFollower(nn.Module):
                                      ctx['confidence_projected'], ctx['confidence_padding'])
 
     def predict(self, ctx, hist, candidates=None, confidence_threshold=DEFAULT_CONFIDENCE):
+        decoded, points, projected, padding = self.prepare_prediction(ctx, hist)
+        return self.finish_prediction(ctx, decoded, points, projected, padding, candidates, confidence_threshold)
+
+    def prepare_prediction(self, ctx, hist):
+        """Initial proposal and attention projections shared by every attempt."""
         cfg = self.cfg
         memory, padding = self.decoder_memory(ctx)
 
@@ -531,10 +543,10 @@ class DirectFollower(nn.Module):
             projected = [layer.project_memory(memory) for layer in self.decoder.layers]
             decoded = self.decode_cached(query, projected, padding)
         else:
+            projected = None
             decoded = self.decoder(query, memory, memory_key_padding_mask=padding)
         points = self.decode_coordinates(decoded)
-        return self.finish_prediction(ctx, decoded, points, projected if cfg.recurrent_refinement_steps else None,
-                                      padding, candidates, confidence_threshold)
+        return decoded, points, projected, padding
 
     def decode_coordinates(self, decoded):
         """The same absolute-coordinate readout and bounds for every proposal."""
@@ -596,29 +608,82 @@ class DirectFollower(nn.Module):
                 active_ctx = {key: active_ctx[key][keep] for key in
                               ('fine', 'deep', 'fine_fp32', 'deep_fp32', 'confidence_padding')} | dict(
                     confidence_projected=[tuple(v[keep] for v in kv) for kv in active_ctx['confidence_projected']])
-            evidence = self.evidence(active_ctx, points, 'refinement')
-            # Geometry cannot teach the scorer to manufacture convenient feedback.
-            feedback = torch.stack((hazards.sigmoid(), confidence), -1).detach()
-            refreshed = self.refinement_fusion(torch.cat((evidence, points/16., feedback), -1))
-            query = decoded+refreshed+self.refinement_stage.weight[stage].to(decoded.dtype)
-            decoded = self.decode_cached(query, projected, padding)
-            points = self.decode_coordinates(decoded)
+            decoded, points = self.refine_prediction(active_ctx, points, decoded, hazards, confidence,
+                projected, padding, self.refinement_stage.weight[stage])
             refinements.append(refinements[-1].index_copy(0, indices, points))
             hazards = self.hazard_logits(active_ctx, points)
             logits, confidence = survival_predictions(hazards)
             scores.append(tuple(previous.index_copy(0, indices, value)
                                 for previous, value in zip(scores[-1], (hazards, logits, confidence))))
             valid.append(torch.zeros_like(valid[0]).index_fill(0, indices, True))
+        out = self.proposal_output(initial, refinements, scores, valid)
+        if candidates is not None:
+            out.update(self.score_candidates(ctx, candidates))
+        return out
+
+    def proposal_output(self, initial, refinements, scores, valid):
         out = dict(initial_points=initial, refinement_points=torch.stack(refinements, 1),
                    refinement_mask=torch.stack(valid, 1))
         out.update({'refinement_'+name: torch.stack([score[i] for score in scores], 1)
                     for i, name in enumerate(('hazard_logits', 'confidence_logits', 'confidence'))})
-        if candidates is not None:
-            hazards = torch.stack([self.hazard_logits(ctx, curve) for curve in candidates.unbind(1)], 1)
-            logits, confidence = survival_predictions(hazards)
-            out.update(candidate_hazard_logits=hazards, candidate_confidence_logits=logits,
-                       candidate_confidence=confidence)
         return out
+
+    def score_candidates(self, ctx, candidates):
+        from .survival_confidence import survival_predictions
+        hazards = torch.stack([self.hazard_logits(ctx, curve) for curve in candidates.unbind(1)], 1)
+        logits, confidence = survival_predictions(hazards)
+        return dict(candidate_hazard_logits=hazards, candidate_confidence_logits=logits,
+                    candidate_confidence=confidence)
+
+    def refine_prediction(self, ctx, points, decoded, hazards, confidence, projected, padding, stage_embedding):
+        evidence = self.evidence(ctx, points, 'refinement')
+        # Geometry cannot teach the scorer to manufacture convenient feedback.
+        feedback = torch.stack((hazards.sigmoid(), confidence), -1).detach()
+        refreshed = self.refinement_fusion(torch.cat((evidence, points/16., feedback), -1))
+        query = decoded+refreshed+stage_embedding.to(decoded.dtype)
+        decoded = self.decode_cached(query, projected, padding)
+        return decoded, self.decode_coordinates(decoded)
+
+    def training_forward(self, x, hist, hmask, memory, threshold):
+        """Fixed proposal slots; accepted rows retain their last actual attempt.
+
+        The eager inference path still compacts accepted rows. Here acceptance
+        is tensor data, so it cannot change the compiled graph or output shapes.
+        Losses use refinement_mask to exclude the unused proposals.
+        """
+        from .survival_confidence import survival_predictions
+        ctx = self.context(x, hist, hmask)
+        ctx['recurrent'], observation = self.observe_context(ctx, x, hist, hmask, memory)
+        decoded, points, projected, padding = self.prepare_prediction(ctx, hist)
+        initial = points
+        hazards = self.hazard_logits(ctx, points)
+        logits, confidence = survival_predictions(hazards)
+        refinements, scores = [points], [(hazards, logits, confidence)]
+        active = torch.ones(len(hist), device=hist.device, dtype=torch.bool)
+        valid = [active]
+        for stage in range(self.cfg.recurrent_refinement_steps):
+            counts, _ = commit_prefix(points, confidence.detach(), threshold,
+                                      self.cfg.n_future, self.cfg.max_recovery_distance)
+            active = active & (counts < self.cfg.n_future)
+            next_decoded, next_points = self.refine_prediction(ctx, points, decoded, hazards, confidence,
+                projected, padding, self.refinement_stage.weight[stage])
+            decoded = torch.where(active[:, None, None], next_decoded, decoded)
+            points = torch.where(active[:, None, None], next_points, points)
+            next_hazards = self.hazard_logits(ctx, points)
+            next_logits, next_confidence = survival_predictions(next_hazards)
+            hazards, logits, confidence = (torch.where(active[:, None], new, old) for new, old in
+                zip((next_hazards, next_logits, next_confidence), (hazards, logits, confidence)))
+            refinements.append(points)
+            scores.append((hazards, logits, confidence))
+            valid.append(active)
+        out = self.proposal_output(initial, refinements, scores, valid)
+        out.update(observation_tokens=observation[0], observation_xyz=observation[1], observation_valid=observation[2])
+        out.update({'memory_'+key: value for key, value in ctx['recurrent'].items()})
+        score_context = {key: ctx[key] for key in
+                         ('fine', 'deep', 'confidence_projected', 'confidence_padding')}
+        if self.cfg.recurrent_refinement_steps:
+            score_context.update(fine_fp32=ctx['fine_fp32'], deep_fp32=ctx['deep_fp32'])
+        return out, score_context
 
     def decode_cached(self, query, projected, padding):
         for layer, kv in zip(self.decoder.layers, projected):

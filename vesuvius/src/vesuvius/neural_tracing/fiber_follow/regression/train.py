@@ -25,7 +25,6 @@ from vesuvius.neural_tracing.fiber_follow.regression.model import (
 )
 from vesuvius.neural_tracing.fiber_follow.regression.data import (
     IdentityObservationBuilder, IdentitySampling, DirectTracer, LOCATION_SOURCES,
-    load_contacts, load_hard_spans,
 )
 from vesuvius.neural_tracing.fiber_follow.regression.supervision import commit_window, loss_terms, weighted_state_sum
 from vesuvius.neural_tracing.fiber_follow.regression.diagnostics import (
@@ -63,8 +62,8 @@ def conv_memory_format(device):
     return torch.channels_last_3d if torch.device(device).type == 'cuda' else torch.contiguous_format
 
 
-def compile_training_model(model):
-    """Compile the training forward; the module keeps its own parameters.
+def compile_training_model(model, batch_size=2, *, backend=None):
+    """Compile fixed tensor operations; the module keeps its own parameters.
 
     Inductor (torch 2.12) otherwise returns corrupted encoder gradients for this
     graph whenever candidate curves are scored: 30-10,000x the eager magnitude and
@@ -72,15 +71,13 @@ def compile_training_model(model):
     eager bf16 rounding restores eager-matching gradients (aot_eager was already
     correct, which isolates the fault to inductor code generation).
 
-    Adaptive retries introduce graph boundaries at row selection. Each active
-    batch size/candidate/replay variant can compile separately; allow enough
-    variants to avoid dropping later ones to eager execution.
+    Row counts, candidate presence and retry outcomes no longer specialize the
+    main graph. Each explicit operation has a fixed shape and autograd contract.
     """
-    import torch._dynamo.config
     import torch._inductor.config
+    from .compiled_training import CompiledTrainingModel
     torch._inductor.config.emulate_precision_casts = True
-    torch._dynamo.config.recompile_limit = max(torch._dynamo.config.recompile_limit, 32)
-    return torch.compile(model)
+    return CompiledTrainingModel(model, batch_size, backend=backend)
 
 
 def match_optimizer_layout(opt):
@@ -246,12 +243,16 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
     """
     from .feature_sequences import sequence_steps, FeatureStreamStates
     stream_states = FeatureStreamStates() if stream_states is None else stream_states
+    if hasattr(model, 'pack_batches'):
+        batches = model.pack_batches(batches)
     total = sum(len(b['hist']) for chunk in batches for b in sequence_steps(chunk))
     if total < 1:
         raise ValueError('An update needs at least one state')
     for group in opt.param_groups:
         group['lr'] = lr
     opt.zero_grad(set_to_none=True)
+    if hasattr(model, 'begin_update'):
+        model.begin_update()
     sums = dict(loss=0., geometry=0., confidence_loss=0., error_sum=0., geometry_count=0.,
                 correct_count=0., confidence_count=0.)
     sources = np.zeros(6, dtype=np.int64)
@@ -358,6 +359,8 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
     # The summed loss is finite only if every microbatch loss was; checked before any update.
     if not math.isfinite(sums['loss']):
         raise FloatingPointError(f'Nonfinite loss at step {step}')
+    if hasattr(model, 'finish_update'):
+        model.finish_update()
     sums.update(clip_training_gradients(model, memory_grad_clip, rest_grad_clip))
     opt.step()
     update_ema(ema, model, step, ema_decay)
@@ -407,10 +410,10 @@ def build_parser():
     ap.add_argument('--onpolicy', nargs='*', default=[])
     ap.add_argument('--out-root', default=str(Path(__file__).parents[1]/'output'))
     ap.add_argument('--device', default='cuda')
-    ap.add_argument('--steps', type=int, default=50000)
-    ap.add_argument('--batch', type=int, default=24)
-    ap.add_argument('--microbatch', type=int, default=24)
-    ap.add_argument('--workers', type=int, default=6)
+    ap.add_argument('--steps', type=int, default=100000)
+    ap.add_argument('--batch', type=int, default=8)
+    ap.add_argument('--microbatch', type=int, default=4)
+    ap.add_argument('--workers', type=int, default=8)
     ap.add_argument('--worker-cache-gb', type=float, default=.5)
     ap.add_argument('--threads', type=int, default=4)
     ap.add_argument('--lr', type=float, default=3e-4)
@@ -422,9 +425,9 @@ def build_parser():
                     help='Independent gradient-norm limit for all other parameters; 0 disables clipping')
     ap.add_argument('--confidence-weight', type=float, default=.5)
     ap.add_argument('--tolerance', type=float, default=1.5)
-    ap.add_argument('--n-commit', type=int, default=4)
+    ap.add_argument('--n-commit', type=int, default=16)
     ap.add_argument('--channels', type=int, default=DirectConfig.channels, help='Base image encoder width')
-    ap.add_argument('--direction-inputs', action=argparse.BooleanOptionalAction, default=False,
+    ap.add_argument('--direction-inputs', action=argparse.BooleanOptionalAction, default=True,
                     help='Add six sign-invariant direction channels to main, memory and seed crops; no image augmentations on these channels')
     ap.add_argument('--decoder-layers', type=int, default=4)
     ap.add_argument('--axial-layers', type=int, default=4)
@@ -432,7 +435,7 @@ def build_parser():
     ap.add_argument('--feature-sequence-length', type=int, default=DirectConfig.feature_sequence_length,
                     help='V4 decisions per gradient chunk; microbatch counts crops across time and traces')
     for name in FEATURE_OPTIONS:
-        default = getattr(DirectConfig, name)
+        default = .15 if name == 'feature_switch_crop_fraction' else getattr(DirectConfig, name)
         ap.add_argument('--'+name.replace('_', '-'), type=type(default), default=default)
     ap.add_argument('--feature-memory-grid', type=int, nargs=3, default=DirectConfig.feature_memory_grid,
                     help='V4 pooled main-encoder spatial grid, depth height width')
@@ -442,7 +445,7 @@ def build_parser():
                     help='Number of cached main-encoder observations')
     ap.add_argument('--memory-stride', type=int, default=DirectConfig.memory_stride,
                     help='Spacing of historical observations in trace voxels; may change on resume')
-    ap.add_argument('--memory-switch-probability', type=float, default=0.,
+    ap.add_argument('--memory-switch-probability', type=float, default=.3,
                     help='Fresh draws replaced by original-then-neighbor memory sequences')
     ap.add_argument('--memory-switch-tail', type=float, nargs=2, default=(16.,96.), metavar=('MIN', 'MAX'),
                     help='Neighbor tail length of memory-switch sequences in trace voxels')
@@ -450,14 +453,14 @@ def build_parser():
     ap.add_argument('--no-history-prob', type=float, default=.15, help='Fresh-state probability of absent observed history')
     ap.add_argument('--short-history-prob', type=float, default=.4,
                     help='Given history is present, probability of a balanced 1-8/9-32 point startup history')
-    ap.add_argument('--decision-fraction', type=float, default=.25,
+    ap.add_argument('--decision-fraction', type=float, default=.3,
                     help='Fraction of endpoint proposals reserved for matched pairs with remote observed seeds')
     ap.add_argument('--decision-choice-fraction', type=float, default=.75,
                     help='Requested fraction of matched pairs teaching recoverable geometry choices')
     ap.add_argument('--candidate-weight', type=float, default=1., help='Weight of candidate first-failure survival likelihood')
     ap.add_argument('--fresh-fraction', type=float, default=.7,
                     help='Annotation-fresh share after decision and bank-following budgets; remainder uses replay')
-    ap.add_argument('--negative-bank', help='Shared live bank for foreign-fiber masks, wrong continuations and following supervision')
+    ap.add_argument('--negative-bank', default=str(Path(__file__).parents[1]/'output'/'neighbor_samples_r0_32_l80_160_v2'), help='Shared live bank for foreign-fiber masks, wrong continuations and following supervision')
     ap.add_argument('--near-negative-bank', help='Additional bank of validated nearby negative relationships')
     ap.add_argument('--following-bank', help='Following path source (default: negative-bank)')
     ap.add_argument('--continuation-bank', help='Wrong-continuation path source (default: negative-bank)')
@@ -465,12 +468,12 @@ def build_parser():
     ap.add_argument('--prefer-long-continuations', action=argparse.BooleanOptionalAction, default=False)
     ap.add_argument('--negative-bank-refresh-seconds', type=float, default=30., help='Each loader worker checks for completed new negative shards at this interval')
     ap.add_argument('--negative-bank-cache-mb', type=float, default=64., help='Maximum cached negative geometry per loader worker')
-    ap.add_argument('--bank-wrong-continuation-probability', type=float, default=.75,
+    ap.add_argument('--bank-wrong-continuation-probability', type=float, default=0.,
                     help='Fraction of recent DAgger departure draws to replace with safe bank continuations when available')
     ap.add_argument('--bank-wrong-continuation-tail', type=float, nargs=2, default=(4.,16.), metavar=('MIN', 'MAX'),
                     help='Wrong-fiber tail range in trace voxels (default: 4 16)')
-    ap.add_argument('--bank-following-probability', type=float, default=.1,
-                    help='Independent fraction of endpoint proposals following validated bank paths (default: .1)')
+    ap.add_argument('--bank-following-probability', type=float, default=.2,
+                    help='Independent fraction of endpoint proposals following validated bank paths (default: .2)')
     ap.add_argument('--bank-hard-fraction', type=float, default=.5,
                     help='Fraction of bank draws ranked by nearby similar, curved, or converging geometry')
     ap.add_argument('--replay-failure-fraction', type=float, default=.5,
@@ -479,16 +482,12 @@ def build_parser():
                     help='Foreign centerline contact radius for DAgger labels, in trace voxels')
     ap.add_argument('--bank-own-tolerance', type=float, default=1.5,
                     help='Annotation tube excluded from confirmed foreign contact')
-    ap.add_argument('--presence-dropout', type=float, default=.25,
+    ap.add_argument('--presence-dropout', type=float, default=0.,
                     help='Probability of zeroing the presence crop; may be changed on resume')
     ap.add_argument('--blur-probability', type=float, default=.25,
                     help='Probability of shared CT/presence Gaussian blur; may be changed on resume')
     ap.add_argument('--blur-sigma', type=float, nargs=2, default=(.5, 1.25), metavar=('MIN', 'MAX'),
                     help='Gaussian blur sigma range in sampled crop voxels; may be changed on resume')
-    ap.add_argument('--contacts', help='Mined contact episodes of the training fibers (oversampled)')
-    ap.add_argument('--hard-spans', help='Hard controlled spans by fiber name (oversampled)')
-    ap.add_argument('--contact-fraction', type=float, default=.2, help='Fresh draws near contact episodes')
-    ap.add_argument('--hard-span-fraction', type=float, default=.1)
     ap.add_argument('--lateral-fraction', type=float, default=.1,
                     help='Fresh draws near earlier states with bank negatives')
     ap.add_argument('--compile', action=argparse.BooleanOptionalAction, default=True,
@@ -497,7 +496,7 @@ def build_parser():
     ap.add_argument('--val-z', type=float, nargs=2, default=(45000., 48500.))
     ap.add_argument('--log-every', type=int, default=50)
     ap.add_argument('--ckpt-every', type=int, default=1000)
-    ap.add_argument('--diag-every', type=int, default=1000)
+    ap.add_argument('--diag-every', type=int, default=5000)
     ap.add_argument('--diag-max-len', type=float, default=400.)
     ap.add_argument('--long-diag-every', type=int, default=0, help='Additional long monitor rollouts; 0 disables')
     ap.add_argument('--long-diag-max-len', type=float, default=1200.)
@@ -508,7 +507,7 @@ def build_parser():
     ap.add_argument('--dagger-seeds', type=int, default=64)
     ap.add_argument('--dagger-device')
     ap.add_argument('--dagger-trace-len', type=float, default=6000.)
-    ap.add_argument('--dagger-after', type=float, default=24.,
+    ap.add_argument('--dagger-after', type=float, default=96.,
                     help='Replay states recorded after a confirmed departure, in trace voxels')
     ap.add_argument('--replay-keep', type=int, default=4)
     ap.add_argument('--resume', help='Resume last.pt inside this run with the same training options')
@@ -602,9 +601,9 @@ def main(argv=None):
     from vesuvius.neural_tracing.fiber_follow.regression.bank_geometry import BankSwitchDetector
     BankSwitchDetector([], args.bank_switch_tolerance, args.bank_own_tolerance)
     identity_sampling = IdentitySampling(
-        presence_dropout=args.presence_dropout,contact_fraction=args.contact_fraction,
+        presence_dropout=args.presence_dropout,
         blur_probability=args.blur_probability,blur_sigma=args.blur_sigma,
-        hard_span_fraction=args.hard_span_fraction,lateral_fraction=args.lateral_fraction,
+        lateral_fraction=args.lateral_fraction,
         bank_wrong_continuation_probability=args.bank_wrong_continuation_probability,
         bank_wrong_continuation_tail=args.bank_wrong_continuation_tail,
         bank_following_probability=args.bank_following_probability,
@@ -701,7 +700,7 @@ def main(argv=None):
                  f'with {args.warmup} warmup updates to {args.lr:g}')
     # The compiled wrapper shares the module's parameters, so EMA updates, gradient
     # clipping and checkpoints keep using ``model``; only the training forward is compiled.
-    trainable = compile_training_model(model) if args.compile and torch.device(args.device).type == 'cuda' else model
+    trainable = compile_training_model(model, stream_batch) if args.compile and torch.device(args.device).type == 'cuda' else model
     if args.compile and torch.device(args.device).type == 'cuda':
         progress('Compilation enabled; first forward/backward passes will compile lazily and may take several minutes')
     if done >= args.steps:
@@ -717,12 +716,10 @@ def main(argv=None):
         extra_args=('--after', args.dagger_after, '--bank-switch-tolerance', args.bank_switch_tolerance,
                     '--bank-own-tolerance', args.bank_own_tolerance,
                     *[v for path in (args.negative_bank, args.near_negative_bank) if path for v in ('--failure-bank', path)]))
-    contacts = load_contacts(args.contacts,train_f,band) if args.contacts else ()
-    hard_spans = load_hard_spans(args.hard_spans,train_f) if args.hard_spans else ()
-    progress(f'Sampling: {len(contacts)} contacts, {len(hard_spans)} hard spans; memory slots={cfg.memory_slots}')
+    progress(f'Memory slots={cfg.memory_slots}')
     progress(f'Feature-memory streams: {stream_batch} traces x {cfg.feature_sequence_length} decisions per full chunk; state persists across chunks')
-    builder = IdentityObservationBuilder(cfg,train_f,identity_sampling,contacts=contacts,
-        hard_spans=hard_spans,augment=True,negative_bank=negative_bank,**role_banks)
+    builder = IdentityObservationBuilder(cfg,train_f,identity_sampling,
+        augment=True,negative_bank=negative_bank,**role_banks)
     dataset = FollowDataset(train_f, spec, sample, band, chunk=stream_batch, seed=args.seed+done,
         cache_bytes=int(args.worker_cache_gb*(1 << 30)), onpolicy=caches,
         replay_index=str(collector.index), batch_builder=builder, additional_crops=(), fresh_fraction=args.fresh_fraction)

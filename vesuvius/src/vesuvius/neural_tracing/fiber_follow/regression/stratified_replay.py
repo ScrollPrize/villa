@@ -8,7 +8,6 @@ not an unbiased estimator of full-history encoder backpropagation.
 """
 import numpy as np
 import torch
-from torch.utils.checkpoint import checkpoint
 
 
 def stratified_indices(length, rng):
@@ -30,21 +29,6 @@ class StratifiedReplay:
     def __init__(self):
         self.streams = {}
         self.pending = []
-        self._compiled = None
-
-    def transition(self, raw, compiled):
-        """The writer transition; compiled when the training forward is.
-
-        A replay runs up to feature_stream_steps small transitions in sequence,
-        so eager execution is dominated by kernel launches. Batch size and
-        state shapes are fixed, so a handful of static graphs cover every call.
-        """
-        base = raw.recurrent_memory.observe_tokens
-        if not compiled:
-            return base
-        if self._compiled is None or self._compiled[0] is not raw:
-            self._compiled = (raw, torch.compile(base, dynamic=False))
-        return self._compiled[1]
 
     def record(self, cpu, output):
         if 'replay_select' not in cpu:
@@ -75,7 +59,9 @@ class StratifiedReplay:
         raw = getattr(model, '_orig_mod', model)
         weight = raw.cfg.feature_replay_weight
         metrics = dict(replay_endpoints=0, replay_observations=0, replay_encoder_crops=0, replay_loss=0.)
-        transition = self.transition(raw, compiled=raw is not model)
+        transition = (model.replay_transition if hasattr(model, 'replay_transition') else
+                      raw.recurrent_memory.observe_tokens)
+        encode = model.replay_observation_features
         while self.pending:
             rows = self.pending.pop(0)
             if len(rows) < 2 or not weight:
@@ -87,8 +73,7 @@ class StratifiedReplay:
                         batch = move_batch(row['batch'], device)
                         # Checkpoint only selected image encodings. Do not detach
                         # the recurrent state between selected observations.
-                        features = checkpoint(raw.observation_features, batch['x'], batch['hist'], batch['hmask'],
-                                              use_reentrant=False, preserve_rng_state=False)
+                        features = encode(batch['x'], batch['hist'], batch['hmask'])
                         metrics['replay_encoder_crops'] += 1
                     else:
                         features = row['features']

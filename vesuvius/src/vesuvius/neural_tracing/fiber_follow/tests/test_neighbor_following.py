@@ -61,7 +61,7 @@ def test_covered_primary_sampling_keeps_history_and_prepares_only_once(tmp_path)
         sampling=IdentitySampling(bank_coverage_probability=1.))
     rng = np.random.default_rng(17)
     state = builder.replace_fresh(clean_sample(cfg),rng)
-    assert state['source'] == 0 and state['location_source'] == 5
+    assert state['source'] == 0 and state['location_source'] == 3
     assert state['reference_on_fiber'][:cfg.n_history].sum() >= 2
     assert 'supervision_fiber' not in state
     seed = state['identity_seed']

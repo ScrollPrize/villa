@@ -177,16 +177,29 @@ def test_revision2_compiled_bf16_gradients_match_eager():
     candidates = b['hist'].new_zeros(2, 2, eager.cfg.n_future, 3)
     candidates[..., 2] = eager.planes
     candidates[:, 1, :, 0] = 2
+    b['candidate_mask'] = torch.ones_like(candidates[..., 0], dtype=torch.bool)
+    b['candidate_labels'] = torch.zeros_like(candidates[..., 0])
+    b['candidate_labels'][:, 0] = 1.
     losses = []
+    predictions = []
     for model in (eager, compile_training_model(compiled)):
         with torch.autocast('cuda', dtype=torch.bfloat16):
             out = model(b['x'], b['hist'], b['hmask'], candidates=candidates)
             state = state_from(eager, out)
             out = model(b['x'], b['hist'], b['hmask'], candidates=candidates, memory=state)
-            loss = out['points'].square().mean()+out['candidate_confidence_logits'].square().mean()
+            # Train every actual proposal, as the trainer does. Differentiating
+            # only an argmax-selected proposal makes this numerical-gradient
+            # test discontinuous at nearly tied BF16 confidence scores.
+            from vesuvius.neural_tracing.fiber_follow.regression.supervision import loss_terms
+            loss = (loss_terms(out, b, eager.cfg)['geometry_per_state'].mean()
+                    +out['candidate_confidence_logits'].square().mean())
         losses.append(loss.detach())
+        predictions.append({key: out[key].detach() for key in
+                            ('refinement_points', 'refinement_confidence', 'refinement_mask')})
         loss.backward()
     torch.testing.assert_close(*losses, atol=.01, rtol=.02)
+    for key in predictions[0]:
+        torch.testing.assert_close(predictions[0][key], predictions[1][key], atol=.01, rtol=.02)
     for prefix in ('encoder.', 'decoder.', 'recurrent_memory.', 'encoder_memory_', 'confidence_scorer.'):
         grads = [torch.cat([p.grad.flatten() for name, p in model.named_parameters()
                            if name.startswith(prefix) and p.grad is not None]) for model in (eager, compiled)]

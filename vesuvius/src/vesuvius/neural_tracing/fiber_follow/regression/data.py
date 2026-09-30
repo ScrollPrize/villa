@@ -1,17 +1,14 @@
 """Shared training/rollout observation builder for the direct follower."""
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from functools import partial
-import hashlib
-import json
-from pathlib import Path
 
 import numpy as np
 import torch
 from scipy.ndimage import gaussian_filter
 
 from vesuvius.neural_tracing.fiber_follow.shared.components import ComponentRule
-from vesuvius.neural_tracing.fiber_follow.shared.data import collate_targets, fiber_manifest
+from vesuvius.neural_tracing.fiber_follow.shared.data import collate_targets
 from vesuvius.neural_tracing.fiber_follow.shared.crop_sampling import scalar_crops
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import interp_at
 from vesuvius.neural_tracing.fiber_follow.shared.trace import ModelTracer
@@ -88,8 +85,6 @@ class IdentitySampling:
     noise: float = .03  # maximum Gaussian noise standard deviation
     blur_probability: float = .25
     blur_sigma: tuple = (.5, 1.25)  # Gaussian sigma in sampled crop voxels
-    contact_fraction: float = .2  # of fresh draws, near mined contact episodes
-    hard_span_fraction: float = .1
     lateral_fraction: float = .1  # near earlier fresh states that had bank negatives
     lateral_memory: int = 1024
     bank_wrong_continuation_probability: float = .75
@@ -111,10 +106,8 @@ class IdentitySampling:
             # Checkpoints before pair sampling v5 stored a presence threshold.
             rule = {k: v for k, v in self.rule.items() if k != 'threshold'}
             object.__setattr__(self, 'rule', ComponentRule(**rule))
-        fractions = (self.presence_dropout, self.contact_fraction,
-                     self.hard_span_fraction, self.lateral_fraction)
-        if not all(0 <= f <= 1 for f in fractions) or sum(fractions[1:]) > 1:
-            raise ValueError('Identity sampling probabilities must lie in [0, 1]; oversampling at most 1')
+        if not all(0 <= f <= 1 for f in (self.presence_dropout, self.lateral_fraction)):
+            raise ValueError('Identity sampling probabilities must lie in [0, 1]')
         if self.lateral_memory < 1 or self.contrast < 1:
             raise ValueError('Invalid identity sample counts or augmentation')
         if not np.isfinite(self.blur_probability) or not 0 <= self.blur_probability <= 1:
@@ -149,38 +142,7 @@ class IdentitySampling:
 
 
 # Oversampled fresh locations, recorded per state.
-LOCATION_SOURCES = ('uniform', 'contact', 'hard_span', 'lateral', 'bank_following', 'bank_covered', 'decision_pair',
-                    'memory_switch')
-
-
-def contact_index_sha256(fibers, band, spacing=4., radius=6.):
-    identity = dict(version=1, fibers=fiber_manifest(fibers), spacing=spacing, radius=radius,
-                    band=asdict(band) if band is not None else None)
-    return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
-
-
-def load_contacts(path, fibers, band):
-    """Mined contact episodes; indices refer to ``fibers``, checked by geometry hash."""
-    data = json.loads(Path(path).read_text())
-    if data['sha256'] != contact_index_sha256(fibers, band):
-        raise ValueError(f'{path} was mined from different fibers or holdout')
-    return data['episodes']
-
-
-def load_hard_spans(path, fibers):
-    """(fiber index, start arc, end arc) of listed controlled spans, checked by geometry."""
-    data = json.loads(Path(path).read_text())
-    manifest = {entry['name']: entry for entry in data['fiber_manifest']}
-    current = {entry['name']: entry for entry in fiber_manifest(fibers)}
-    index = {f.name: i for i, f in enumerate(fibers)}
-    spans = []
-    for name, ids in sorted(data['hard_spans'].items()):
-        if name not in index:
-            continue
-        if manifest.get(name) != current[name]:
-            raise ValueError(f'{path}: {name} geometry changed')
-        spans.extend((index[name], fibers[index[name]].spans[i].start, fibers[index[name]].spans[i].end) for i in ids)
-    return spans
+LOCATION_SOURCES = ('uniform', 'lateral', 'bank_following', 'bank_covered', 'decision_pair', 'memory_switch')
 
 
 def traversal(fiber, reverse):
@@ -243,24 +205,13 @@ def augment_image_pair(image, params, rng, *, blur_sigma=0., drop_presence=False
         values[1] = 0
 
 
-def contact_location(fibers, episode, side, reverse, rng, approach=24.):
-    """A fresh state leading into or passing through one side of a contact episode."""
-    fi, lo, hi = ((episode['a'], episode['a0'], episode['a1']) if side == 0
-                  else (episode['b'], episode['b0'], episode['b1']))
-    original = rng.uniform(lo, hi+approach) if reverse else rng.uniform(lo-approach, hi)
-    length = fibers[fi].length
-    original = float(np.clip(original, 0, length))
-    return dict(fiber=int(fi), t=length-original if reverse else original, reverse=reverse, source=1)
-
-
 class IdentityObservationBuilder(ObservationBuilder):
     """Bank-derived following, foreign masks, and memory-dependent path decisions."""
     def __init__(self,cfg: DirectConfig,fibers=None,sampling=IdentitySampling(),*,
-                 contacts=(),hard_spans=(),augment=False,negative_bank=None,
+                 augment=False,negative_bank=None,
                  near_negative_bank=None,following_bank=None,continuation_bank=None):
         super().__init__(cfg)
         self.fibers,self.sampling,self.augment = fibers,sampling,augment
-        self.contacts,self.hard_spans = list(contacts),list(hard_spans)
         self.negative_bank,self.near_negative_bank = negative_bank,near_negative_bank
         self.following_bank,self.continuation_bank = following_bank,continuation_bank
         self.lateral = deque(maxlen=sampling.lateral_memory)
@@ -308,7 +259,7 @@ class IdentityObservationBuilder(ObservationBuilder):
                 continue
             t = float(rng.uniform(lo,hi))
             item = make_sample(bank.fibers[fi],t,reverse,sample_cfg,rng)
-            item.update(fiber_ref=(fi,t,reverse),source=0,source_step=-1,stratum=-1,location_source=5)
+            item.update(fiber_ref=(fi,t,reverse),source=0,source_step=-1,stratum=-1,location_source=LOCATION_SOURCES.index('bank_covered'))
             self.prepare(item,bank.fibers[fi],rng)
             if item['reference_on_fiber'][:-1].sum() >= 2:
                 item['_identity_prepared'] = True
@@ -344,29 +295,12 @@ class IdentityObservationBuilder(ObservationBuilder):
                 return item
         return None
     def fresh_location(self, rng):
-        s = self.sampling
-        u = rng.random()
-        location = None
-        if u < s.contact_fraction:
-            if self.contacts:
-                e = self.contacts[int(rng.integers(len(self.contacts)))]
-                return contact_location(self.fibers, e, int(rng.integers(2)), bool(rng.integers(2)), rng)
-        elif u < s.contact_fraction+s.hard_span_fraction:
-            if self.hard_spans:
-                fi, lo, hi = self.hard_spans[int(rng.integers(len(self.hard_spans)))]
-                location = (fi, rng.uniform(lo-16, hi+16), bool(rng.integers(2)), 2)
-        elif u < s.contact_fraction+s.hard_span_fraction+s.lateral_fraction:
-            if self.lateral:
-                fi, t, reverse = self.lateral[int(rng.integers(len(self.lateral)))]
-                length = self.fibers[fi].length
-                t = float(np.clip(t+rng.uniform(-16, 16), 0, length))
-                return dict(fiber=fi, t=t, reverse=reverse, source=3)
-        if location is None:
-            return None
-        fi, original, reverse, source = location
-        length = self.fibers[fi].length
-        original = float(np.clip(original, 0, length))
-        return dict(fiber=int(fi), t=length-original if reverse else original, reverse=reverse, source=source)
+        if rng.random() < self.sampling.lateral_fraction and self.lateral:
+            fi, t, reverse = self.lateral[int(rng.integers(len(self.lateral)))]
+            length = self.fibers[fi].length
+            t = float(np.clip(t+rng.uniform(-16, 16), 0, length))
+            return dict(fiber=fi, t=t, reverse=reverse, source=LOCATION_SOURCES.index('lateral'))
+        return None
 
     def prepare(self,item,fiber,rng):
         """Build observable references and labels; annotations never become inputs."""

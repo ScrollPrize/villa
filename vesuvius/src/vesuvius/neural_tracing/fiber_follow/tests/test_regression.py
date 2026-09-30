@@ -219,10 +219,14 @@ def test_training_compilation_emulates_eager_bf16_rounding(monkeypatch):
     from vesuvius.neural_tracing.fiber_follow.regression.train import compile_training_model
     monkeypatch.setattr(torch._inductor.config, 'emulate_precision_casts', False)
     compiled = []
-    monkeypatch.setattr(torch, 'compile', lambda module, **kwargs: compiled.append((module, kwargs)) or 'compiled')
+    monkeypatch.setattr(torch, 'compile', lambda module, **kwargs: compiled.append((module, kwargs)) or module)
     model = DirectFollower(config())
-    assert compile_training_model(model) == 'compiled'
-    assert compiled == [(model, {})]
+    wrapped = compile_training_model(model)
+    assert wrapped._orig_mod is model
+    assert [fn.__name__ for fn, _ in compiled] == [
+        'training_forward', 'score_candidates', 'replay_observation_features', 'observe_tokens']
+    assert all(options == dict(dynamic=False, fullgraph=True) for _, options in compiled)
+    assert list(wrapped.parameters()) == list(model.parameters())
     assert torch._inductor.config.emulate_precision_casts
 
 

@@ -2,6 +2,8 @@
 import hashlib
 import numpy as np
 
+from vesuvius.neural_tracing.fiber_follow.regression.data import LOCATION_SOURCES
+
 from vesuvius.neural_tracing.fiber_follow.shared.data import TracedFiber, make_sample
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength
 
@@ -27,6 +29,6 @@ def following_sample(bank, cfg, rng, *, hard_fraction=0.):
     reverse = bool(rng.integers(2))
     t = float(rng.uniform(8.,end))
     item = make_sample(fiber,t,reverse,cfg,rng)
-    item.update(fiber_ref=(fi,t,reverse),source=4,source_step=-1,stratum=-1,location_source=4,
+    item.update(fiber_ref=(fi,t,reverse),source=4,source_step=-1,stratum=-1,location_source=LOCATION_SOURCES.index('bank_following'),
                 supervision_fiber=fiber,bank_parent_arc_range=arc_range)
     return item

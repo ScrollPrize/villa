@@ -13,17 +13,21 @@ bash scripts/launch_memory.sh
 tail -F output/logs/axial_survival_memory_v8_run1.log
 ```
 
-`launch_trajectory_memory.sh` delegates to the same launcher. The launcher uses
+`launch_trajectory_memory.sh` delegates to the same launcher. Training defaults
+live in `regression.train.build_parser`; the launcher supplies the run name,
+data paths, and optional `BANK_PATH` override. The trainer defaults use
 CT/presence plus six unsigned local-frame direction channels, batch 8,
 microbatch 4, eight workers, 16-point maximum commit, history spacing 8,
 16 memory slots, 64 cached observations, two-decision gradient chunks,
 and at most two additional shared-decoder attempts. Every attempt uses the same
 absolute-coordinate head, with crop and first-connection bounds. A full-horizon
-acceptance ends retries immediately; only unaccepted batch rows run another
-decoder/scorer pass. The old correction-limit option is removed.
+acceptance ends the row's valid attempts immediately. Inference skips subsequent
+decoder/scorer work for accepted rows; compiled training retains fixed proposal
+slots and masks their computation out of the objective. The old correction-limit
+option is removed.
 The launcher starts random weights and refuses
 an existing destination. Set `RUN_NAME` for another fresh run; trailing trainer
-arguments override launcher settings. No training is launched by editing code.
+arguments override trainer defaults. No training is launched by editing code.
 The architecture is `axial_fiber_memory_v8`; older checkpoints are rejected,
 with no migration or compatibility mode.
 
@@ -35,7 +39,7 @@ attempt 75% and shares 25% across earlier attempts, or gives the sole attempt 10
 Skipped attempts contribute no loss. The previous proposal's conditional failure
 probabilities and prefix confidence feed the next decoder pass with detached
 gradients. There is no feedback warm-up schedule: low confidence uses the available
-retry budget; high full-path confidence exits early. Training logs report
+retry budget; high full-path confidence masks further attempts. Training logs report
 `refinement_attempts_mean` including the initial proposal.
 
 Selection retains the longest acceptable prefix across attempted proposals,
@@ -45,9 +49,36 @@ threshold sweeps rerun adaptive prediction separately for each threshold.
 
 Memory writing runs in FP32; CUDA forward/backward otherwise uses BF16 autocast.
 Gradient clipping remains separate for memory (5) and the rest of the model (20).
-Compiled training retains Inductor `emulate_precision_casts`. Adaptive batch
-compaction creates graph boundaries and active-batch-size variants. CPU compile
-checks do not establish production CUDA throughput or numerical parity.
+Compiled training retains Inductor `emulate_precision_casts`. It compiles four
+fixed-shape operations with `fullgraph=True`: crop prediction, optional candidate
+scoring, selected replay encoding, and replay memory transitions. The crop batch
+is `microbatch / feature_sequence_length` (two rows by default). Independent
+partial stream chunks are packed within their original optimizer update;
+remaining padding is excluded from losses, metrics and persistent memory.
+Packing retains each stream's gradient-chunk boundary and its loss budget.
+
+All proposal slots remain present during compiled training. Acceptance masks
+freeze completed rows and retain the original per-attempt loss weights. Candidate
+scoring uses a separate fixed four-path operation only when needed. Input layouts,
+memory key order and autograd metadata are normalized before compilation;
+detached history remains detached from earlier chunks. Unused refinement
+parameters keep `grad=None`, so masking does not introduce AdamW updates.
+Model parameters, checkpoint format, precision and adaptive inference are unchanged.
+Replay encoder checkpointing is captured inside its compiled operation, so backward
+recomputation does not re-enter the compiler with different thread metadata.
+Packing can change floating-point accumulation order. Compiled BF16 rounding can
+also change an acceptance or selection decision near a threshold/tie; this is not
+a promise of bitwise-identical training trajectories.
+CPU graph checks alone do not establish CUDA numerical parity or throughput.
+
+On the RTX 5090 with PyTorch 2.12.1, a real-data fork of `axial_survival_memory_v8_run2`
+at step 12000 produced four graphs over 80 updates, with no recompilation or graph
+breaks. On 34 matched steady updates (20 warmup; compilation/profiling excluded),
+mean/p50/p95 update time changed from 1433/1347/2120 to 1296/1271/2011 ms; crop and
+replay counts matched. Peak allocated memory increased from 16.61 to 18.57 GiB.
+This is a short benchmark, not evidence of identical learned trajectories.
+Local commands, raw measurements and profiles are recorded in
+`output/step_time_review_20260930/REVIEW.txt`.
 
 ## Inputs and sampling
 
@@ -172,7 +203,7 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=../../.. \
 ../../../../.venv/bin/python -m pytest \
   tests/test_survival_confidence.py tests/test_detailed_memory.py \
   tests/test_trajectory_memory.py tests/test_recurrent_refinement.py \
-  tests/test_feedback_refinement.py \
+  tests/test_feedback_refinement.py tests/test_fixed_training.py \
   tests/test_feature_correctness.py tests/test_direction_inputs.py \
   tests/test_decision_training.py tests/test_sampling_balance.py \
   tests/test_bank_failures.py tests/test_sampling_ratios.py \
@@ -185,6 +216,8 @@ first-failure/censoring losses, generator gradient isolation, memory retention,
 chronological replay, optimizer updates, checkpoint round trips and tracing.
 Feedback checks cover early exit, shrinking active batches, absolute path
 replacement, score/geometry gradient isolation, per-attempt losses and selection.
+Fixed-training checks cover graph reuse across row counts and acceptance outcomes,
+replay autograd contracts, packed stream gradients, and skipped AdamW updates.
 Output-plane checks cover full lateral coverage, physical coordinates, fractional
 depth interpolation, access through every generator layer and gradient isolation.
 They do not establish trained tracing accuracy or confidence calibration.
