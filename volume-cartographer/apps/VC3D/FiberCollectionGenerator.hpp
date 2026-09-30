@@ -20,7 +20,7 @@ inline constexpr auto kDefaultModel = "Qualzz20/afv_fiber_9um";
 inline constexpr double kDefaultThresholdPercent = 60.0;
 inline constexpr int kDefaultBlockSize = 512;
 inline constexpr double kDefaultMaxJoinAngle = 45.0;
-inline constexpr double kDefaultMinLength = 32.0;
+inline constexpr double kDefaultMinLength = 100.0;
 inline constexpr double kDefaultBlackDistance = 16.0;
 
 struct Request {

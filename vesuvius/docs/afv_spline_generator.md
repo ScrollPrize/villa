@@ -44,7 +44,7 @@ only once it is complete.
 | `--block-size` | `512` | side of the cubes the zone is processed in, in voxels |
 | `--extend` | off | join fibers across gaps inside the zone with the gap model: longer fibers, several times slower |
 | `--max-join-angle` | `45` | inferred joins turning more than this many degrees are cut; `180` keeps them all |
-| `--min-length` | `32` | fibers shorter than this many voxels are removed; `0` keeps them all |
+| `--min-length` | `100` | fibers shorter than this many voxels are removed; `0` keeps them all |
 | `--black-distance` | `16` | fibers passing within this many voxels of the black outside the papyrus are removed; `0` keeps them all |
 | `--preview-dir` | | folder where a preview `.afv` of the fibers stitched so far is written after each block |
 | `--source-path` | | native source volume recorded in the file |
@@ -122,10 +122,8 @@ curvature, and the fibers around the gap),
 without CT. Its distances are converted to micrometres with the voxel size
 given by `--voxel-size` and `--native-scale`, 8.64 µm when it is not given.
 
-On one RTX 3090, the 512³ zone above gives 3,284 fibers in 1 min 28 s with
-a preview, as VC3D runs it, reading over HTTPS included: 36 s of prediction,
-30 s of polylines and 3 s of cleanup, with a peak of 4.4 GB of RAM. With
-`--extend` and `--max-join-angle 180`, it takes 6 min 18 s, 5 min of which
-is extension, and gives 2,707 longer fibers holding 731 joins; 26 of these
-joins turn more than 45° and are cut by default. A GPU is strongly
-recommended: predicting on the CPU is very slow.
+On one RTX 3090, the 512³ zone above gives 1,055 fibers in 1 min 21 s with
+a preview, as VC3D runs it, reading over HTTPS included: 32 s of prediction,
+30 s of polylines and 2 s of cleanup, with a peak of 4.3 GB of RAM. With
+`--extend`, it takes 6 min 18 s, 5 min of which is extension. A GPU is
+strongly recommended: predicting on the CPU is very slow.

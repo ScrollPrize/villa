@@ -44,6 +44,7 @@ def run(monkeypatch, capsys, volume, output, *extra):
         "--voxel-size", "4.5",
         "--device", "cpu",
         "--progress", "json",
+        "--min-length", "32",
         *extra,
     ])
     return code, [json.loads(line) for line in capsys.readouterr().out.splitlines()]
@@ -136,7 +137,7 @@ def test_mirroring_is_off_unless_asked(flag, mirror):
 
 def test_cleanup_defaults():
     args = cli.build_parser().parse_args(REQUIRED)
-    assert (args.extend, args.max_join_angle, args.min_length, args.black_distance) == (False, 45, 32, 16)
+    assert (args.extend, args.max_join_angle, args.min_length, args.black_distance) == (False, 45, 100, 16)
 
 
 def test_zone_must_be_inside_the_volume():

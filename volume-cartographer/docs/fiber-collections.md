@@ -37,7 +37,7 @@ the dialog shows how many there are. The other options, all remembered:
   gaps inside the zone with a gap model; longer fibers, several times slower.
 * **Max join angle** (45° by default): inferred joins turning more than this
   are cut.
-* **Remove fibers shorter than** (on, 32 voxels by default).
+* **Remove fibers shorter than** (on, 100 voxels by default).
 * **Remove fibers near the outside black** (16 voxels by default, or **Keep
   them**): removes fibers passing this close to the black (CT value 0)
   outside the papyrus.

@@ -31,7 +31,7 @@ from .cleanup import TOLERANCE, ExteriorBlack, clean
 DEFAULT_MODEL = "Qualzz20/afv_fiber_9um"
 DEFAULT_THRESHOLD = 60.0
 DEFAULT_MAX_JOIN_ANGLE = 45.0
-DEFAULT_MIN_LENGTH = 32.0
+DEFAULT_MIN_LENGTH = 100.0
 DEFAULT_BLACK_DISTANCE = 16.0
 # Voxel sizes of the scans DEFAULT_MODEL was trained on, in micrometres.
 DEFAULT_MODEL_VOXEL_SIZES = (8.64, 9.362)

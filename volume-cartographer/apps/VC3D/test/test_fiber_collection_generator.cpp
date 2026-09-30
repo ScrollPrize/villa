@@ -60,7 +60,7 @@ private slots:
         QCOMPARE(args.mid(args.indexOf("--threshold"), 2), (QStringList{"--threshold", "60"}));
         QCOMPARE(args.mid(args.indexOf("--block-size"), 2), (QStringList{"--block-size", "512"}));
         QCOMPARE(args.mid(args.indexOf("--max-join-angle"), 6),
-                 (QStringList{"--max-join-angle", "45", "--min-length", "32", "--black-distance", "16"}));
+                 (QStringList{"--max-join-angle", "45", "--min-length", "100", "--black-distance", "16"}));
     }
 
     void parsesProgressEvents()
