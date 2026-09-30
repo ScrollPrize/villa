@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 import torch
 
-from test_regression import batch, config
+from test_regression import batch, config, proposal_output
 from vesuvius.neural_tracing.fiber_follow.regression.supervision import point_correctness, loss_terms
 from vesuvius.neural_tracing.fiber_follow.regression.model import DirectFollower
 from vesuvius.neural_tracing.fiber_follow.regression.train import optimizer_update
@@ -23,7 +23,8 @@ def test_individual_points_recover_after_wrong_point_and_ignore_confidence():
     points = torch.zeros(1, 16, 3)
     points[..., 2] = torch.arange(1, 17)
     points[0, 2, 0] = 2.
-    output = dict(points=points, confidence_logits=torch.full((1,16), -10.), hazard_logits=torch.zeros(1,16))
+    output = proposal_output(points[:, None], torch.zeros(1, 1, 16))
+    output['confidence_logits'] = torch.full((1, 16), -10.)
     terms = loss_terms(output, data, cfg, n_commit=16)
     assert terms['point_correct_count'] == 15
     assert terms['point_wrong_count'] == 1
@@ -69,11 +70,12 @@ def interval_row(crops, right, wrong, loss):
 
 def test_interval_pools_counts_weights_crop_means_and_preserves_json(tmp_path,capsys):
     interval = DirectTrainingInterval()
-    interval.add(interval_row(1,16,0,2.))
-    interval.add(interval_row(3,0,48,4.))
+    interval.add(dict(interval_row(1,16,0,2.), refinement_attempts_mean=1., refinement_attempts_sum=1))
+    interval.add(dict(interval_row(3,0,48,4.), refinement_attempts_mean=3., refinement_attempts_sum=9))
     summary = interval.summary()
     assert 'fixed_fraction' not in summary
     assert summary['loss'] == 3.5
+    assert summary['refinement_attempts_mean'] == 2.5 and summary['refinement_attempts_sum'] == 10
     assert summary['crops'] == 4 and summary['updates'] == 2
     assert summary['replay_endpoints'] == 2 and summary['replay_encoder_crops'] == 8
     assert summary['memory_clipped_updates'] == 2
@@ -88,6 +90,7 @@ def test_interval_pools_counts_weights_crop_means_and_preserves_json(tmp_path,ca
     assert 'fixed' not in printed
     assert 'last 2 updates / 4 crops' in printed
     assert '500 ms/update' in printed and '50 ms/update' in printed
+    assert '2.50 attempts/crop' in printed
     assert '16-point correctness' not in printed and len(printed.splitlines()) <= 10
     assert json.loads(path.read_text()) == row
     assert DirectTrainingInterval().summary()['crops'] == 0
@@ -106,6 +109,8 @@ def test_every_optimizer_update_reports_point_counts_without_detailed_metrics():
     assert 'fixed_fraction' not in metrics
     assert metrics['fresh_fraction'] == metrics['recent_fraction'] == .5
     assert 'decisions' not in metrics
+    assert metrics['refinement_attempts_mean'] == 1.
+    assert metrics['refinement_attempts_sum'] == 2
     assert sum(metrics[k] for k in ('point_correct_count','point_wrong_count','point_unknown_count')) == 8
 
 

@@ -71,7 +71,7 @@ class StratifiedReplay:
     def backward(self, model, total, *, device, tolerance, n_commit, confidence_weight,
                  candidate_weight):
         from .train import move_batch
-        from .supervision import loss_terms, weighted_state_sum
+        from .supervision import commit_window, loss_terms, weighted_state_sum
         raw = getattr(model, '_orig_mod', model)
         weight = raw.cfg.feature_replay_weight
         metrics = dict(replay_endpoints=0, replay_observations=0, replay_encoder_crops=0, replay_loss=0.)
@@ -97,7 +97,8 @@ class StratifiedReplay:
                 batch = move_batch(rows[-1]['batch'], device)
                 score = 'candidate_points' in batch and rows[-1]['batch']['candidate_mask'].any()
                 kwargs = dict(candidates=batch['candidate_points']) if score else {}
-                output = model(batch['x'], batch['hist'], batch['hmask'], memory=state, **kwargs)
+                output = model(batch['x'], batch['hist'], batch['hmask'], memory=state,
+                               n_commit=commit_window(raw.cfg, n_commit), **kwargs)
                 terms = loss_terms(output, batch, raw.cfg, tolerance, n_commit=n_commit)
                 loss = weighted_state_sum(terms['geometry_per_state'], batch)+confidence_weight*weighted_state_sum(terms['confidence_per_state'], batch)
                 if 'candidate_per_state' in terms:

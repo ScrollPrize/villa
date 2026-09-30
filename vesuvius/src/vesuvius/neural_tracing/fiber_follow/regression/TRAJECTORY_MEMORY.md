@@ -18,10 +18,12 @@
    XYZ position embeddings. Every query can attend to all planes in every layer;
    there is no per-query plane mask. The production crop supplies 163,216 fine
    tokens alongside 39,015 deep tokens. Four decoder layers jointly predict the
-   future lateral coordinates. Two further passes through the same decoder each
-   resample the current proposal and apply up to four voxels of lateral correction
-   per point. Crop bounds and the first-connection limit apply after each pass.
-   Generator self-attention remains bidirectional.
+   future lateral coordinates. Up to two further passes through the same decoder
+   receive the previous coordinates, resampled evidence, decoder state and detached
+   conditional failure probabilities/prefix confidence. The same coordinate head
+   predicts a complete absolute replacement path on every attempt; there is no
+   offset head or correction-distance setting. Crop bounds and the first-connection
+   limit apply after each pass. Generator self-attention remains bidirectional.
 5. A separate scorer samples four ordered locations along each incoming proposed
    segment, including the endpoint, using the existing 3x3x3 fine-feature stencil
    and deep features. At production forward spacing this is one sample per quarter
@@ -34,13 +36,20 @@
    the scorer learns independent channel and physical XYZ projections. It retains
    segment-local fine samples as well. Its own K/V projections are reused across
    generated and supplied paths within one decision. No generator hidden states
-   enter scoring. Architecture `axial_fiber_memory_v7` requires newly trained
+   enter scoring. Architecture `axial_fiber_memory_v8` requires newly trained
    weights; older checkpoints have no migration or compatibility path.
 7. One linear readout predicts the conditional first-failure logit per segment.
    Prefix confidence is the product of conditional survival probabilities,
    accumulated in FP32 log space. Supplied candidates and generated paths use the
    same scorer. Existing diagnostic `confidence_logits` remain prefix logits;
    explicit `hazard_logits` are used for training.
+8. Every proposal is scored before deciding whether to retry. Acceptance across
+   the entire horizon ends that row's attempts immediately, even when the commit
+   limit is shorter. Only unaccepted rows enter further decoder/scorer calls;
+   encoder features and projected K/V are reused. The step setting is a maximum
+   number of additional attempts, so two means between one and three proposals.
+   This policy applies in training and inference. `refinement_mask` identifies
+   actual attempts in a batch; padded entries receive no loss or selection weight.
 
 Holding observations and a prefix fixed, replacing its suffix leaves earlier
 scores unchanged. Truncating/extending it also preserves those scores, up to
@@ -58,7 +67,8 @@ receive no supervision. A failure observed after an annotation gap does not loca
 the first-failure interval; training conservatively censors at the gap.
 
 Both generated and supplied candidate paths use this likelihood. Intervals sum
-within a path; paths average per state. States receive fixed per-stream weights
+within a path; generated paths average over actual attempts, while supplied
+candidates average separately per state. States receive fixed per-stream weights
 before division by the effective crop-batch size: .75 for the selected endpoint,
 .25 shared by earlier observations (one for a single-observation stream).
 The history share is configurable. Chunk-local renormalization is deliberately
@@ -77,9 +87,11 @@ ends and unobservable identity are censored. Foreign-fiber masks remain negative
 
 Confidence detaches scored coordinates. Its loss trains its own scorer, the
 shared encoder and memory, but not the generator plane projections, decoder,
-coordinate head or refinement head. Geometry supervises initial/final proposals with weights
-25%/75%. Seed, history and observation-memory tokens are available through
-cross-attention.
+shared coordinate head or feedback fusion. Geometry cannot update the scorer
+through detached feedback or discrete selection. The last attempted proposal gets
+75% of the geometry weight and earlier attempts share 25%; a sole proposal gets
+100%. All attempts are trained, including ones rejected by selection. Seed,
+history and observation-memory tokens are available through cross-attention.
 
 Matched choices reserve supervision for both recoverable alternatives, requiring
 different geometry under identical local observations but different histories.
@@ -89,7 +101,13 @@ continuations and two smooth switches at varied forecast positions; dense labels
 locate their first failure. Candidate geometry/order is shared between paired
 observations. Synthetic transitions never serve as geometry targets.
 
-Inference commits the longest prefix clearing its confidence threshold. Confidence
+Inference selects the proposal with the longest acceptable prefix within the
+commit limit, then greatest confidence at its last accepted point, then earliest
+attempt. If none qualifies, the best valid first-point confidence is selected and
+the commit gate still stops. A full-path acceptance ends further retries. Low
+initial confidence therefore consumes the retry budget rather than ending retries;
+there is no feedback warm-up schedule. Mean attempts used is logged for monitoring.
+Confidence
 is monotone by construction; it does not need post-hoc minimum repair. The shared
 trace policy's existing cumulative minimum is harmless for these monotone values.
 

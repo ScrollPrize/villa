@@ -1,4 +1,4 @@
-"""Shared-decoder refinement, differentiable caches and checkpoint migration."""
+"""Shared absolute-coordinate prediction, differentiable caches and feedback."""
 import copy
 import hashlib
 import json
@@ -38,36 +38,33 @@ def test_cached_decoder_matches_recomputed_forward_and_gradients():
         torch.testing.assert_close(p.grad, q.grad, atol=1e-6, rtol=1e-4)
 
 
-def test_refinement_starts_neutral_encodes_writes_and_projects_once(monkeypatch):
+def test_passes_share_coordinate_head_and_encode_write_project_once(monkeypatch):
     torch.manual_seed(42)
-    old = build_model(cfg()).eval()
-    model = build_model(replace(old.cfg, recurrent_refinement_steps=2)).eval()
-    model.load_state_dict(old.state_dict(), strict=False)
+    model = build_model(cfg(recurrent_refinement_steps=2)).eval()
     b = memory_batch(model.cfg)
-    calls = dict(encoder=0, writer=0, projection=0, decoder=0)
+    calls = dict(encoder=0, writer=0, projection=0, scorer_projection=0, decoder=0, coordinates=0, scoring=0)
     for obj, method, key in ((model.encoder, 'encode', 'encoder'),
                              (model.recurrent_memory, 'observe_tokens', 'writer'),
                              (model.decoder.layers[0], 'project_memory', 'projection'),
-                             (model.decoder.layers[0], 'forward_cached', 'decoder')):
+                             (model.confidence_scorer.layers[0], 'project_memory', 'scorer_projection'),
+                             (model.decoder.layers[0], 'forward_cached', 'decoder'),
+                             (model.coordinates, 'forward', 'coordinates'),
+                             (model, 'hazard_logits', 'scoring')):
         original = getattr(obj, method)
         def count(*args, _original=original, _key=key, **kwargs):
             calls[_key] += 1
             return _original(*args, **kwargs)
         monkeypatch.setattr(obj, method, count)
-    expected = old(b['x'], b['hist'], b['hmask'])
     out = model(b['x'], b['hist'], b['hmask'])
-    assert calls == dict(encoder=1, writer=1, projection=1, decoder=3)
-    torch.testing.assert_close(out['points'], expected['points'], atol=2e-6, rtol=1e-5)
-    torch.testing.assert_close(out['points'], out['initial_points'], atol=1e-6, rtol=1e-5)
+    assert calls == dict(encoder=1, writer=1, projection=1, scorer_projection=1, decoder=3, coordinates=3, scoring=3)
+    assert not hasattr(model, 'refinement_delta')
     assert out['refinement_points'].shape[1] == 3
-    for key in state_from(model, out):
-        torch.testing.assert_close(out['memory_'+key], expected['memory_'+key], rtol=0, atol=0)
+    assert out['refinement_hazard_logits'].shape == (len(b['hist']), 3, model.cfg.n_future)
 
 
 def test_refinement_geometry_reaches_proposal_stage_fusion_and_old_observations():
     torch.manual_seed(43)
     model = build_model(cfg(recurrent_refinement_steps=1))
-    torch.nn.init.normal_(model.refinement_delta.weight, std=.03)
     earlier = memory_batch(model.cfg, step=0)
     b = memory_batch(model.cfg, step=1)
     earlier['x']['fine'].requires_grad_()
@@ -76,6 +73,7 @@ def test_refinement_geometry_reaches_proposal_stage_fusion_and_old_observations(
     gradient, = torch.autograd.grad(out['points'].square().mean(), out['initial_points'], retain_graph=True)
     assert gradient.abs().sum() > 0
     loss_terms(out, b, model.cfg)['geometry_per_state'].mean().backward()
+    assert all(p.grad is None for p in model.confidence_scorer.parameters())
     assert earlier['x']['fine'].grad.abs().sum() > 0
     for name, p in model.named_parameters():
         if name.startswith(('refinement_', 'coordinates.')):
@@ -87,31 +85,30 @@ def test_bounds_and_masked_geometry():
     c = cfg(recurrent_refinement_steps=2, max_recovery_distance=2.)
     model = build_model(c)
     with torch.no_grad():
-        model.refinement_delta.bias.fill_(100.)
+        model.coordinates.bias.fill_(100.)
     b = memory_batch(c)
     b['offtrack'][0] = 1
     b['dense_mask'][1].zero_()
     out = model(b['x'], b['hist'], b['hmask'])
     curves = out['refinement_points']
-    assert curves[..., :2].diff(dim=1).norm(dim=-1).max() <= c.recurrent_refinement_limit+1e-5
     assert curves[:, :, 0].norm(dim=-1).max() <= c.max_recovery_distance+1e-5
     assert curves[..., :2].abs().max() <= c.lateral_limit
     torch.testing.assert_close(curves[..., 2], model.planes.expand_as(curves[..., 2]))
     loss = loss_terms(out, b, c)['geometry_per_state']
     assert loss.eq(0).all()
     loss.sum().backward()
-    assert model.refinement_delta.weight.grad.eq(0).all()
+    assert model.coordinates.weight.grad.eq(0).all()
 
 
 
 
-def test_refinement_fullgraph_capture():
+def test_adaptive_refinement_compiles_and_backpropagates():
     model = build_model(cfg(recurrent_refinement_steps=1))
     b = memory_batch(model.cfg)
-    wrapped = torch.compile(model, backend='eager', fullgraph=True)
+    wrapped = torch.compile(model, backend='eager')
     out = wrapped(b['x'], b['hist'], b['hmask'])
     loss_terms(out, b, model.cfg)['geometry_per_state'].mean().backward()
-    assert torch.isfinite(model.refinement_delta.weight.grad).all()
+    assert torch.isfinite(model.coordinates.weight.grad).all()
 
 
 
@@ -122,7 +119,6 @@ def test_compiled_refinement_bf16_two_decision_gradients():
     torch.manual_seed(45)
     c = cfg(recurrent_refinement_steps=1)
     eager = build_model(c).cuda()
-    torch.nn.init.normal_(eager.refinement_delta.weight, std=.03)
     compiled = copy.deepcopy(eager)
     chunk = [move_batch(b, 'cuda') for b in training_chunk(c)['feature_sequence']]
     losses = []

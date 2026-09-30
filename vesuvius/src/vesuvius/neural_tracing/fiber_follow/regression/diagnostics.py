@@ -6,6 +6,7 @@ import torch.nn.functional as F
 
 from vesuvius.neural_tracing.fiber_follow.shared.policy import DIAGNOSTIC_THRESHOLDS, commit_prefix, recovery_allowed
 from vesuvius.neural_tracing.fiber_follow.shared.labels import prefix_labels
+from vesuvius.neural_tracing.fiber_follow.regression.model import select_refinement
 from vesuvius.neural_tracing.fiber_follow.regression.supervision import (
     commit_window, dense_commit_mask, geometry_mask,
 )
@@ -14,9 +15,10 @@ from vesuvius.neural_tracing.fiber_follow.regression.supervision import (
 @torch.no_grad()
 def decision_rows(output, batch, cfg, n_commit=None, tolerance=1.5, thresholds=DIAGNOSTIC_THRESHOLDS):
     """Small CPU records; no forward pass or random draws. Unknowns stay unknown."""
-    output = {k: v.detach().float().cpu() for k, v in output.items()}
+    output = {k: (v.detach().float() if v.is_floating_point() else v.detach()).cpu() for k, v in output.items()}
     batch = {k: v.detach().cpu() for k, v in batch.items() if isinstance(v, torch.Tensor)}
     window = commit_window(cfg, n_commit)
+    output = select_refinement(output, cfg, n_commit=window)
     points = output['points']
     labels, known, _ = prefix_labels(points, batch, tolerance, cfg.max_recovery_distance)
     identity_observable = batch.get('identity_observable', torch.ones(len(points), dtype=torch.bool)).bool()
@@ -32,8 +34,12 @@ def decision_rows(output, batch, cfg, n_commit=None, tolerance=1.5, thresholds=D
                               mode='linear', align_corners=True).transpose(1, 2)
         errors[name] = (dense-batch['dense_ab']).norm(dim=-1)
     allowed = recovery_allowed(points, cfg.max_recovery_distance)
-    policies = {str(t): commit_prefix(points, output['confidence'], t, window, cfg.max_recovery_distance)[0]
-                for t in thresholds}
+    policies = {}
+    for threshold in thresholds:
+        chosen = select_refinement(output, cfg, threshold, window)
+        counts, _ = commit_prefix(chosen['points'], chosen['confidence'], threshold, window, cfg.max_recovery_distance)
+        gate_labels, gate_known, _ = prefix_labels(chosen['points'], batch, tolerance, cfg.max_recovery_distance)
+        policies[str(threshold)] = counts, gate_labels, gate_known*identity_observable[:, None]
     rows = []
     for i in range(len(points)):
         drift = None
@@ -58,13 +64,13 @@ def decision_rows(output, batch, cfg, n_commit=None, tolerance=1.5, thresholds=D
         delta = (errors['final'][i][mask[i]].mean()-errors['initial'][i][mask[i]].mean()) if comparable else 0.
         row['correction_improved'] = int(comparable and delta < -1e-6)
         row['correction_worsened'] = int(comparable and delta > 1e-6)
-        for threshold, counts in policies.items():
+        for threshold, (counts, gate_labels, gate_known) in policies.items():
             count = int(counts[i])
-            assessed = count > 0 and bool(known[i, count-1])
+            assessed = count > 0 and bool(gate_known[i, count-1])
             row['gate_'+threshold] = dict(
-                false_stops=int(count == 0 and bool(known[i, 0]*labels[i, 0])),
+                false_stops=int(count == 0 and bool(gate_known[i, 0]*gate_labels[i, 0])),
                 accepted_known=int(assessed),
-                accepted_wrong=int(assessed and not labels[i, count-1]),
+                accepted_wrong=int(assessed and not gate_labels[i, count-1]),
                 accepted_unknown=int(count > 0 and not assessed),
                 departed_continues=int(row['departed'] and count > 0))
         rows.append(row)

@@ -10,31 +10,44 @@ From `fiber_follow`, using the existing project environment:
 
 ```bash
 bash scripts/launch_memory.sh
-tail -F output/logs/axial_survival_memory_v7_run1.log
+tail -F output/logs/axial_survival_memory_v8_run1.log
 ```
 
 `launch_trajectory_memory.sh` delegates to the same launcher. The launcher uses
 CT/presence plus six unsigned local-frame direction channels, batch 8,
 microbatch 4, eight workers, 16-point maximum commit, history spacing 8,
 16 memory slots, 64 cached observations, two-decision gradient chunks,
-and two shared-decoder refinement passes, each allowing up to four voxels of
-lateral correction per point. It starts random weights and refuses
+and at most two additional shared-decoder attempts. Every attempt uses the same
+absolute-coordinate head, with crop and first-connection bounds. A full-horizon
+acceptance ends retries immediately; only unaccepted batch rows run another
+decoder/scorer pass. The old correction-limit option is removed.
+The launcher starts random weights and refuses
 an existing destination. Set `RUN_NAME` for another fresh run; trailing trainer
 arguments override launcher settings. No training is launched by editing code.
-The architecture is `axial_fiber_memory_v7`; older checkpoints are rejected,
+The architecture is `axial_fiber_memory_v8`; older checkpoints are rejected,
 with no migration or compatibility mode.
 
 The loss combines geometry, generated-path survival likelihood, and candidate-path
 survival likelihood. Survival likelihood sums the supervised intervals per path;
-it does not average prefixes or reweight the commit window. The existing geometry
-loss still weights the commit window and supervises initial/final curves 25%/75%.
-The numerical scale of confidence losses has therefore changed; their weights
-and confidence thresholds require calibration on freshly trained weights.
+it does not average prefixes or reweight the commit window. Generated survival
+loss averages the attempts actually made for each state. Geometry gives the last
+attempt 75% and shares 25% across earlier attempts, or gives the sole attempt 100%.
+Skipped attempts contribute no loss. The previous proposal's conditional failure
+probabilities and prefix confidence feed the next decoder pass with detached
+gradients. There is no feedback warm-up schedule: low confidence uses the available
+retry budget; high full-path confidence exits early. Training logs report
+`refinement_attempts_mean` including the initial proposal.
+
+Selection retains the longest acceptable prefix across attempted proposals,
+breaking ties by confidence at that prefix and then earlier attempt. All-rejected
+proposals still stop. Tracing uses its actual threshold and commit limit; recovery
+threshold sweeps rerun adaptive prediction separately for each threshold.
 
 Memory writing runs in FP32; CUDA forward/backward otherwise uses BF16 autocast.
 Gradient clipping remains separate for memory (5) and the rest of the model (20).
-Compiled training retains Inductor `emulate_precision_casts`. CPU full-graph
-capture checks do not establish production CUDA throughput or numerical parity.
+Compiled training retains Inductor `emulate_precision_casts`. Adaptive batch
+compaction creates graph boundaries and active-batch-size variants. CPU compile
+checks do not establish production CUDA throughput or numerical parity.
 
 ## Inputs and sampling
 
@@ -159,6 +172,7 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=../../.. \
 ../../../../.venv/bin/python -m pytest \
   tests/test_survival_confidence.py tests/test_detailed_memory.py \
   tests/test_trajectory_memory.py tests/test_recurrent_refinement.py \
+  tests/test_feedback_refinement.py \
   tests/test_feature_correctness.py tests/test_direction_inputs.py \
   tests/test_decision_training.py tests/test_sampling_balance.py \
   tests/test_bank_failures.py tests/test_sampling_ratios.py \
@@ -169,6 +183,8 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=../../.. \
 Checks cover suffix independence, segment evidence, full observation access,
 first-failure/censoring losses, generator gradient isolation, memory retention,
 chronological replay, optimizer updates, checkpoint round trips and tracing.
+Feedback checks cover early exit, shrinking active batches, absolute path
+replacement, score/geometry gradient isolation, per-attempt losses and selection.
 Output-plane checks cover full lateral coverage, physical coordinates, fractional
 depth interpolation, access through every generator layer and gradient isolation.
 They do not establish trained tracing accuracy or confidence calibration.

@@ -173,7 +173,7 @@ def test_all_scorer_layers_read_every_fine_pixel_and_reuse_projections(monkeypat
             assert param.grad is None, name
 
 
-def test_scorer_plane_projections_change_scores_without_changing_paths():
+def test_scorer_plane_projections_inform_feedback_without_changing_initial_path():
     torch.manual_seed(85)
     model = build_model(cfg(recurrent_refinement_steps=1)).eval()
     batch = memory_batch(model.cfg, 1)
@@ -183,7 +183,8 @@ def test_scorer_plane_projections_change_scores_without_changing_paths():
         model.confidence_scorer.plane_projection.weight.normal_(std=2.)
         second = model(*args)
     assert (first['hazard_logits']-second['hazard_logits']).abs().max() > 1e-5
-    torch.testing.assert_close(first['points'], second['points'], rtol=0, atol=0)
+    torch.testing.assert_close(first['initial_points'], second['initial_points'], rtol=0, atol=0)
+    assert (first['refinement_points'][:, 1:]-second['refinement_points'][:, 1:]).abs().max() > 1e-7
     torch.testing.assert_close(first['memory_cache'], second['memory_cache'], rtol=0, atol=0)
 
 

@@ -6,6 +6,7 @@ import torch
 
 from test_detailed_memory import config
 from test_trajectory_memory import memory_batch, state_from
+from test_regression import proposal_output
 from vesuvius.neural_tracing.fiber_follow.regression.model import build_model
 from vesuvius.neural_tracing.fiber_follow.regression.supervision import loss_terms
 from vesuvius.neural_tracing.fiber_follow.regression.survival_confidence import (
@@ -130,9 +131,8 @@ def test_generated_and_candidate_losses_share_survival_semantics_and_mask_identi
     batch['candidate_labels'] = torch.zeros(2, 2, cfg.n_future)
     batch['candidate_mask'] = torch.ones(2, 2, cfg.n_future, dtype=torch.bool)
     logits, confidence = survival_predictions(hazards)
-    out = dict(points=points, initial_points=points, hazard_logits=hazards,
-               confidence_logits=logits, confidence=confidence, candidate_hazard_logits=candidates,
-               candidate_confidence_logits=survival_predictions(candidates)[0])
+    out = proposal_output(points[:, None], hazards[:, None])
+    out.update(candidate_hazard_logits=candidates, candidate_confidence_logits=survival_predictions(candidates)[0])
     terms = loss_terms(out, batch, cfg, n_commit=1)
     torch.testing.assert_close(terms['confidence_per_state'], torch.tensor([math.log(2), 0.]))
     torch.testing.assert_close(terms['candidate_per_state'], torch.tensor([math.log(2), 0.]))

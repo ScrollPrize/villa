@@ -185,7 +185,8 @@ class ModelTracer:
                 sampling['memory'] = {k: v[idx] for k,v in memory.items()}
             if stochastic:
                 sampling['initial_noise'] = trace_noise(self.model.cfg, [generators[i] for i in idx], self.device)
-            if getattr(self.model.cfg, 'candidate_selection', 'prefix') == 'stop_fallback':
+            if (hasattr(self.model, 'select_prediction')
+                    or getattr(self.model.cfg, 'candidate_selection', 'prefix') == 'stop_fallback'):
                 sampling.update(confidence_threshold=pp.confidence,n_commit=pp.n_commit)
             with torch.autocast('cuda', dtype=torch.bfloat16, enabled=self.device.startswith('cuda')):
                 out = self.model(x, tensor(hist).float(), tensor(hm), **sampling)

@@ -68,8 +68,8 @@ def test_candidate_queries_are_candidate_specific_and_read_memory():
     hook = model.confidence_scorer.query.register_forward_hook(lambda m, args, result: queries.append(result))
     out = model(b['x'], b['hist'], b['hmask'], candidates=curves)
     hook.remove()
-    assert len(queries) == 3
-    assert not torch.equal(queries[1], queries[2])
+    assert len(queries) == model.cfg.recurrent_refinement_steps+3
+    assert not torch.equal(queries[-2], queries[-1])
     out['candidate_confidence_logits'].sum().backward()
     assert model.confidence_scorer.layers[0].multihead_attn.in_proj_weight.grad.abs().sum() > 0
 
@@ -118,10 +118,10 @@ def test_replay_across_updates_keeps_selected_crops_only_and_evicts_finished_str
     assert not states.states and not states.replay.streams and not states.replay.pending
 
 
-def test_revision2_fullgraph_backward():
+def test_memory_with_adaptive_refinement_compiled_backward():
     model = build_model(config())
     b = memory_batch(model.cfg, 1)
-    out = torch.compile(model, backend='eager', fullgraph=True)(b['x'], b['hist'], b['hmask'])
+    out = torch.compile(model, backend='eager')(b['x'], b['hist'], b['hmask'])
     out['points'].square().mean().backward()
     assert model.encoder_memory_projection.weight.grad.abs().sum() > 0
     assert all(p.grad is None or torch.isfinite(p.grad).all() for p in model.parameters())
@@ -160,7 +160,7 @@ def test_fixed_candidate_scores_do_not_change_when_generator_changes():
     with torch.no_grad():
         a = model(b['x'], b['hist'], b['hmask'], candidates=curves)
         model.coordinates.bias.add_(.5)
-        model.refinement_delta.weight.normal_()
+        model.refinement_fusion[-1].weight.normal_()
         model.decoder.layers[0].linear1.weight.normal_()
         z = model(b['x'], b['hist'], b['hmask'], candidates=curves)
     assert (a['points']-z['points']).abs().max() > .1

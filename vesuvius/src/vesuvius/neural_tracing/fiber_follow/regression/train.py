@@ -72,8 +72,9 @@ def compile_training_model(model):
     eager bf16 rounding restores eager-matching gradients (aot_eager was already
     correct, which isolates the fault to inductor code generation).
 
-    Each input variant (batch size, candidates, replay) is a static graph.
-    Allow enough variants to avoid dropping later ones to eager execution.
+    Adaptive retries introduce graph boundaries at row selection. Each active
+    batch size/candidate/replay variant can compile separately; allow enough
+    variants to avoid dropping later ones to eager execution.
     """
     import torch._dynamo.config
     import torch._inductor.config
@@ -150,7 +151,7 @@ def training_diagnostics(model, cpu_batch, tracer, fibers, seeds, out, step, log
     try:
         with torch.autocast('cuda', dtype=torch.bfloat16, enabled=torch.device(device).type == 'cuda'):
             prediction = model(batch['x'], batch['hist'], batch['hmask'],
-                               memory=None if memory is None else take(memory))
+                               memory=None if memory is None else take(memory), n_commit=tracer.p.n_commit)
         points = prediction['points']
         target = torch.cat((batch['plane_ab'], points[..., 2:]), -1)
         for scale, crop in (('fine', model.cfg.fine),):
@@ -160,8 +161,7 @@ def training_diagnostics(model, cpu_batch, tracer, fibers, seeds, out, step, log
                        source=batch['source'], offtrack=batch['offtrack'], confidence=prediction['confidence'],
                        history_channel=None)
         curves = prediction['refinement_points']
-        labels = (['initial proposal']+[f'correction {i}' for i in range(1, curves.shape[1]-1)]+
-                  ['corrected proposal']) if curves.shape[1] > 1 else ['proposal']
+        labels = ['initial proposal']+[f'feedback proposal {i}' for i in range(1, curves.shape[1])]
         plot_refinement(curves, batch['hist'], batch['hmask'],
                         images/f'correction_{step:06d}.png',
                         labels=labels,
@@ -278,7 +278,8 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
             if 'candidate_points' in batch and cpu['candidate_mask'].any():
                 scoring['candidates'] = batch['candidate_points']
             with torch.autocast('cuda', dtype=torch.bfloat16, enabled=torch.device(device).type == 'cuda'):
-                output = model(batch['x'], batch['hist'], batch['hmask'], memory=carried, **scoring)
+                output = model(batch['x'], batch['hist'], batch['hmask'], memory=carried,
+                               n_commit=commit_window(model.cfg, n_commit), **scoring)
                 if carried is not None:
                     stream_states.update(cpu, output, carried)
                     if model.cfg.feature_replay_weight:
@@ -336,7 +337,7 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
                 accumulate(sums, key, value)
             for key in ('error_sum', 'geometry_count', 'correct_count', 'confidence_count',
                         'point_correct_count', 'point_wrong_count', 'point_unknown_count',
-                        'confidence_labeled_states', 'confidence_departed_states'):
+                        'confidence_labeled_states', 'confidence_departed_states', 'refinement_attempts_sum'):
                 accumulate(sums, key, terms[key])
             if 'source' in cpu:
                 for source in range(len(sources)):
@@ -361,6 +362,7 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
     opt.step()
     update_ema(ema, model, step, ema_decay)
     sums['observed_states'] = total
+    sums['refinement_attempts_mean'] = sums['refinement_attempts_sum']/total
     sums.update(error_mean=sums['error_sum']/max(1., sums['geometry_count']),
                 prefix_correct_fraction=sums['correct_count']/max(1., sums['confidence_count']),
                 fresh_fraction=float(sources[0]/total),
@@ -513,9 +515,7 @@ def build_parser():
     ap.add_argument('--reset-optimizer', action='store_true',
                     help='With --resume: fresh AdamW, one LR for all parameters, no transfer freeze, and restart LR warmup/decay')
     ap.add_argument('--recurrent-refinement-steps', type=int, default=DirectConfig.recurrent_refinement_steps,
-                    help='Number of shared-decoder refinement passes')
-    ap.add_argument('--recurrent-refinement-limit', type=float, default=None,
-                    help=f'Maximum lateral displacement norm per refinement pass, in trace voxels (default: {DirectConfig.recurrent_refinement_limit:g})')
+                    help='Maximum additional absolute-coordinate attempts; stop early when the full path is accepted')
     return ap
 
 
@@ -571,9 +571,6 @@ def main(argv=None):
     torch.set_num_threads(args.threads)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    # Omitted: new models use the config default; checkpoints keep their own value.
-    refinement_limit = ({} if args.recurrent_refinement_limit is None else
-                        dict(recurrent_refinement_limit=args.recurrent_refinement_limit))
     cfg = DirectConfig(direction_inputs=args.direction_inputs,channels=args.channels,hidden=args.hidden,layers=args.axial_layers,
                        decoder_layers=args.decoder_layers,
                        activation_checkpointing=args.activation_checkpointing,
@@ -581,17 +578,14 @@ def main(argv=None):
                        memory_stride=args.memory_stride,
                        feature_sequence_length=args.feature_sequence_length, feature_memory_grid=args.feature_memory_grid,
                        recurrent_refinement_steps=args.recurrent_refinement_steps,
-                       **refinement_limit,
                        **{k:getattr(args,k) for k in FEATURE_OPTIONS})
-    args.recurrent_refinement_limit = cfg.recurrent_refinement_limit
     resume = None
     if args.resume:
         resume = read_checkpoint(args.resume,ARCHITECTURES,args.device)
         # Sampling spacing changes no parameter shapes; use the requested value.
         cfg = replace(checkpoint_config(resume), memory_stride=args.memory_stride,
                       feature_switch_crop_fraction=args.feature_switch_crop_fraction,
-                      feature_history_loss_fraction=args.feature_history_loss_fraction, **refinement_limit)
-        args.recurrent_refinement_limit = cfg.recurrent_refinement_limit
+                      feature_history_loss_fraction=args.feature_history_loss_fraction)
         if args.direction_inputs != cfg.direction_inputs:
             raise ValueError('Direction inputs must match the resumed checkpoint; start a new run to change them')
     if args.decision_fraction and args.microbatch % 2:
@@ -675,8 +669,7 @@ def main(argv=None):
                    'memory_grad_clip','rest_grad_clip','presence_dropout','blur_probability','blur_sigma',
                    'decision_fraction','decision_choice_fraction','bank_following_probability','fresh_fraction',
                    'bank_hard_fraction','replay_failure_fraction','bank_switch_tolerance','bank_own_tolerance',
-                   'n_commit','memory_stride','feature_switch_crop_fraction','feature_history_loss_fraction',
-                   'recurrent_refinement_limit'}
+                   'n_commit','memory_stride','feature_switch_crop_fraction','feature_history_loss_fraction'}
         defaults = build_parser()
         for key,value in vars(args).items():
             # Options added after a run started had their default behavior.

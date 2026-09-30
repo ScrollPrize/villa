@@ -49,6 +49,8 @@ def evaluate_recovery_states(model, vol, states, fibers, sample, *, device='cpu'
     count = len(states) if limit == 0 else min(limit, len(states))
     if limit < 0 or recovery_length <= 0 or not 1 <= n_commit <= model.cfg.n_future:
         raise ValueError('Invalid recovery evaluation bounds')
+    if not thresholds:
+        raise ValueError('Recovery evaluation needs at least one confidence threshold')
     def move(value, *, float_inputs=False):
         if isinstance(value, dict):
             return {k: move(v, float_inputs=float_inputs) for k,v in value.items()}
@@ -73,15 +75,27 @@ def evaluate_recovery_states(model, vol, states, fibers, sample, *, device='cpu'
         # arrive as a dictionary, including v4's nested remote-seed crop.
         # Floating inputs enter in float32 before AMP; preserve boolean masks.
         images = move(b['x'], float_inputs=True)
+        if hasattr(model, 'select_prediction'):
+            sampling.update(confidence_threshold=thresholds[0], n_commit=n_commit)
         with torch.no_grad(),torch.autocast('cuda',dtype=torch.bfloat16,enabled=device.startswith('cuda')):
             output=model(images,b['hist'],b['hmask'],**sampling)
         if on_prediction is not None:
             on_prediction(output, b)
         labels,masks,error=prefix_labels(output['points'],b,tolerance,model.cfg.max_recovery_distance)
         prediction=output['points'][0].float().cpu().numpy();predictions.append(prediction)
-        for threshold in thresholds:
+        for threshold_index, threshold in enumerate(thresholds):
             confidence=output['confidence']
-            if getattr(model.cfg,'candidate_selection','prefix')=='stop_fallback' and 'candidate_points' in output:
+            if hasattr(model, 'select_prediction'):
+                # A different threshold changes when retries stop, not only which
+                # prefix is committed. Re-run that policy on the same observations.
+                if threshold_index:
+                    sampling['confidence_threshold'] = threshold
+                    with torch.autocast('cuda', dtype=torch.bfloat16, enabled=device.startswith('cuda')):
+                        output = model(images, b['hist'], b['hmask'], **sampling)
+                chosen = output
+                confidence = chosen['confidence']
+                labels, masks, error = prefix_labels(chosen['points'], b, tolerance, model.cfg.max_recovery_distance)
+            elif getattr(model.cfg,'candidate_selection','prefix')=='stop_fallback' and 'candidate_points' in output:
                 selected=select_candidate(output['candidate_points'],output['candidate_confidence'],n_commit,
                                           model.cfg.max_recovery_distance,stop_threshold=threshold)
                 index=torch.arange(len(selected),device=selected.device)

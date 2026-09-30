@@ -114,27 +114,31 @@ def loss_terms(output, batch, cfg, tolerance=1.5, *, n_commit=None):
     predicted = F.interpolate(output['points'][..., :2].transpose(1, 2),
                               size=mask.shape[1], mode='linear', align_corners=True).transpose(1, 2)
     target = torch.where(mask[..., None], batch['dense_ab'], 0.)
-    error = F.smooth_l1_loss(predicted, target, beta=1., reduction='none').mean(-1)
-    geometry = window_mean(error, mask, near)
-    initial_geometry = geometry
-    if cfg.recurrent_refinement_steps:
-        initial = F.interpolate(output['initial_points'][..., :2].transpose(1, 2),
-                                size=mask.shape[1], mode='linear', align_corners=True).transpose(1, 2)
-        initial_error = F.smooth_l1_loss(initial, target, beta=1., reduction='none').mean(-1)
-        initial_geometry = window_mean(initial_error, mask, near)
-        # Supervise every earlier proposal without increasing the total loss
-        # weight as refinement steps are added. The final curve gets 75%.
-        auxiliary = initial_geometry
-        if 'refinement_points' in output:
-            earlier = output['refinement_points'][:, :-1]
-            losses = []
-            for curve in earlier.unbind(1):
-                dense = F.interpolate(curve[..., :2].transpose(1, 2),
-                    size=mask.shape[1], mode='linear', align_corners=True).transpose(1, 2)
-                errors = F.smooth_l1_loss(dense, target, beta=1., reduction='none').mean(-1)
-                losses.append(window_mean(errors, mask, near))
-            auxiliary = torch.stack(losses).mean(0)
-        geometry = .75*geometry+.25*auxiliary
+    # Train every generated proposal, even when selection retains an earlier one.
+    # The last attempted pass gets 75%; earlier passes share 25%. Survival averages attempts
+    # so adding feedback iterations does not multiply the confidence loss weight.
+    geometry_losses, confidence_losses = [], []
+    for curve, hazards in zip(output['refinement_points'].unbind(1),
+                              output['refinement_hazard_logits'].unbind(1)):
+        dense = F.interpolate(curve[..., :2].transpose(1, 2), size=mask.shape[1],
+                              mode='linear', align_corners=True).transpose(1, 2)
+        error = F.smooth_l1_loss(dense, target, beta=1., reduction='none').mean(-1)
+        geometry_losses.append(window_mean(error, mask, near))
+        foreign = foreign_failures(curve, batch, cfg, mask.shape[1]) if 'foreign' in batch else None
+        labels, known, _ = prefix_labels(curve, batch, tolerance, cfg.max_recovery_distance,
+                                        extra_failure=foreign)
+        if 'identity_observable' in batch:
+            known = known*batch['identity_observable'][:, None]
+        confidence_losses.append(survival_loss(hazards, labels, known)[0])
+    attempts = output['refinement_mask'].bool()
+    count = attempts.sum(1)
+    last = count-1
+    geometry_losses = torch.stack(geometry_losses, 1)
+    final = geometry_losses.gather(1, last[:, None]).squeeze(1)
+    earlier = attempts & (torch.arange(attempts.shape[1], device=mask.device)[None] < last[:, None])
+    auxiliary = torch.where(earlier, geometry_losses, 0.).sum(1)/(count-1).clamp_min(1)
+    geometry = torch.where(count > 1, .75*final+.25*auxiliary, final)
+    confidence = torch.where(attempts, torch.stack(confidence_losses, 1), 0.).sum(1)/count
     labels, known, _ = prefix_labels(output['points'], batch, tolerance, cfg.max_recovery_distance)
     # Identity-aware labels: a point on a validated neighboring fiber is
     # wrong even within the distance tolerance. Distance metrics keep their names.
@@ -149,9 +153,10 @@ def loss_terms(output, batch, cfg, tolerance=1.5, *, n_commit=None):
         observed = batch['identity_observable'][:,None]
         known = known*observed
         supervised_known = supervised_known*observed
-    confidence, confidence_valid = survival_loss(output['hazard_logits'], supervised, supervised_known)
+    _, confidence_valid = survival_loss(output['hazard_logits'], supervised, supervised_known)
     terms = dict(geometry_per_state=geometry,
                  confidence_per_state=confidence,
+                 refinement_attempts_sum=count.sum(),
                  confidence_labeled_states=confidence_valid.any(-1).sum(),
                  confidence_departed_states=(confidence_valid.any(-1) & batch['offtrack'].bool()).sum(),
                  geometry_count=mask.sum(), confidence_count=supervised_known.sum(),

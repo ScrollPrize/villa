@@ -42,6 +42,19 @@ def forward(m, b):
     return m(b['x'], b['hist'], b['hmask'])
 
 
+def proposal_output(curves, hazards, selected=-1):
+    """Build the current all-proposal output contract for loss/policy fixtures."""
+    from vesuvius.neural_tracing.fiber_follow.regression.survival_confidence import survival_predictions
+    logits, confidence = survival_predictions(hazards)
+    return dict(points=curves[:, selected], initial_points=curves[:, 0],
+                hazard_logits=hazards[:, selected], confidence_logits=logits[:, selected],
+                confidence=confidence[:, selected], refinement_points=curves,
+                refinement_hazard_logits=hazards, refinement_confidence_logits=logits,
+                refinement_confidence=confidence,
+                refinement_mask=torch.ones(curves.shape[:2], device=curves.device, dtype=torch.bool),
+                selected_refinement=torch.full((len(curves),), selected % curves.shape[1], device=curves.device))
+
+
 def test_prediction_is_deterministic_and_geometry_trains_actual_coordinates():
     torch.manual_seed(20)
     m = DirectFollower(config())
@@ -320,7 +333,7 @@ def test_commit_window_loss_and_auxiliary_proposal_supervision():
     points = torch.tensor([[[1., 0., 1.], [1., 0., 2.], [3., 0., 3.], [3., 0., 4.]]], requires_grad=True)
     initial = (points.detach()*torch.tensor([2., 1., 1.])).requires_grad_()
     logits = torch.tensor([[1., 2., 3., 4.]], requires_grad=True)
-    out = dict(points=points, initial_points=initial, confidence_logits=logits, hazard_logits=logits)
+    out = proposal_output(torch.stack((initial, points), 1), logits[:, None].expand(-1, 2, -1))
     result = loss_terms(out, b, cfg, n_commit=2)
     def expected(curve):
         dense = F.interpolate(curve[..., :2].transpose(1, 2), size=13, mode='linear', align_corners=True).transpose(1, 2)
@@ -329,7 +342,7 @@ def test_commit_window_loss_and_auxiliary_proposal_supervision():
     torch.testing.assert_close(result['geometry_per_state'][0], .75*expected(points)+.25*expected(initial))
     from vesuvius.neural_tracing.fiber_follow.flow_matching.supervision import prefix_labels
     labels, known, _ = prefix_labels(points, b)
-    expected_conf = F.softplus(logits[0, :2]).sum()+F.softplus(-logits[0, 2])
+    expected_conf = (F.softplus(logits[0, :2]).sum()+F.softplus(-logits[0, 2])+F.softplus(-logits[0, 0]))/2
     torch.testing.assert_close(result['confidence_per_state'][0], expected_conf)
     result['geometry_per_state'].sum().backward()
     assert points.grad.abs().sum() > 0 and initial.grad.abs().sum() > 0
@@ -338,15 +351,15 @@ def test_commit_window_loss_and_auxiliary_proposal_supervision():
 
 
 def test_every_refinement_receives_auxiliary_geometry_supervision():
-    cfg = replace(config(), recurrent_refinement_steps=1)
+    cfg = replace(config(), recurrent_refinement_steps=2)
     b = batch(cfg, 1)
     b['dense_ab'].zero_()
     curves = []
     for error in (3., 2., 1.):
         curve = torch.tensor([[[error, 0., float(z)] for z in range(1, 5)]], requires_grad=True)
         curves.append(curve)
-    out = dict(points=curves[-1], initial_points=curves[0], refinement_points=torch.stack(curves, 1),
-               confidence_logits=torch.zeros(1, 4), hazard_logits=torch.zeros(1, 4))
+    # Selecting an earlier path must not deprive the final proposal of its loss.
+    out = proposal_output(torch.stack(curves, 1), torch.zeros(1, 3, 4), selected=0)
     terms = loss_terms(out, b, cfg)
     # Smooth L1 averaged over x,y; first two stages share the 25% auxiliary term.
     expected = .75*.25+.25*((3-.5)/2+(2-.5)/2)/2
@@ -398,7 +411,9 @@ def test_decision_metrics_score_actual_commits_censor_unknowns_and_pool_counts()
     conf = torch.ones(5, 4)*.9
     conf[0] = .1           # false stop on a correct path
     conf[1, 2:] = .1
-    out = dict(points=points, initial_points=points+torch.tensor([.2, 0., 0.]), confidence=conf)
+    out = proposal_output(points[:, None], torch.zeros(5, 1, 4))
+    out.update(initial_points=points+torch.tensor([.2, 0., 0.]), confidence=conf,
+               refinement_confidence=conf[:, None])
     rows = decision_rows(out, b, cfg, n_commit=4)
     stats = summarize_decisions(rows, 4)
     all_stats = stats['by_drift']['all']

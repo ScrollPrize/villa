@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from test_identity import config, batch
+from test_regression import proposal_output
 from test_neighbor_bank import make_bank, add_shard, publish
 from test_neighbor_following import clean_sample
 from vesuvius.neural_tracing.fiber_follow.regression.data import IdentityObservationBuilder, IdentitySampling
@@ -87,7 +88,7 @@ def test_same_local_observation_has_opposite_geometry_choices_and_late_failures(
     points.requires_grad_()
     hazards = torch.zeros(2, cfg.n_future, requires_grad=True)
     logits, confidence = survival_predictions(hazards)
-    out = dict(points=points, hazard_logits=hazards, confidence_logits=logits, confidence=confidence)
+    out = proposal_output(points[:, None], hazards[:, None])
     terms = loss_terms(out, b, cfg)
     terms['geometry_per_state'].sum().backward()
     assert (points.grad[0, :, :2]*points.grad[1, :, :2]).sum() < 0

@@ -128,12 +128,12 @@ def test_same_crop_reads_persistent_slots_and_seed_in_crop_frame():
     # Hold the local crop and latest observation fixed; vary only old memory.
     state = {k: v.detach() for k, v in state.items()}
     ctx['recurrent'] = state
-    baseline = model.predict(ctx, b['hist'])['points']
+    baseline = model.select_prediction(model.predict(ctx, b['hist']))['points']
     for key in ('slots', 'anchor'):
         changed = dict(state)
         changed[key] = state[key]+torch.randn_like(state[key])*2
         ctx['recurrent'] = changed
-        actual = model.predict(ctx, b['hist'])['points']
+        actual = model.select_prediction(model.predict(ctx, b['hist']))['points']
         assert (actual-baseline).abs().max() > 1e-5, key
     seen = []
     original = model.recurrent_memory.read_tokens
@@ -195,7 +195,7 @@ def test_training_sequence_checkpoint_and_optimizer_resume(tmp_path):
         for name, value in state.items():
             torch.testing.assert_close(restored_opt.state_dict()['state'][key][name], value, rtol=0, atol=0)
     # Matching tensor shapes do not make an older architecture acceptable.
-    for version in range(1, 7):
+    for version in range(1, 8):
         torch.save(dict(ck, architecture=f'axial_fiber_memory_v{version}'), path)
         with pytest.raises(ValueError, match='Checkpoint'):
             load_checkpoint(path, 'cpu')
@@ -260,11 +260,11 @@ def test_streaming_keeps_remote_seed_and_cache_until_explicit_eviction():
     ctx = model.context(b['x'], b['hist'], b['hmask'])
     model.observe_context(ctx, b['x'], b['hist'], b['hmask'], state)
     ctx['recurrent'] = state
-    baseline = model.predict(ctx, b['hist'])['points']
+    baseline = model.select_prediction(model.predict(ctx, b['hist']))['points']
     changed = dict(state, cache=state['cache'].clone())
     changed['cache'][:, 0] += torch.randn_like(changed['cache'][:, 0])*2
     ctx['recurrent'] = changed
-    assert (model.predict(ctx, b['hist'])['points']-baseline).abs().max() > 1e-5
+    assert (model.select_prediction(model.predict(ctx, b['hist']))['points']-baseline).abs().max() > 1e-5
     # Detaching preserves the exact information and predictions.
     current = memory_batch(model.cfg, 1, 6)
     a = model(current['x'], current['hist'], current['hmask'], memory=state)

@@ -17,10 +17,10 @@ class DirectTrainingInterval:
     """Pool every update's counts; weight per-crop means by actual crop count."""
     means = ('loss', 'geometry', 'confidence_loss', 'replay_loss', 'fresh_fraction',
              'recent_fraction', 'bank_wrong_continuation_fraction',
-             'bank_following_fraction', 'decision_pair_fraction')
+             'bank_following_fraction', 'decision_pair_fraction', 'refinement_attempts_mean')
     counts = ('error_sum', 'geometry_count', 'point_correct_count', 'point_wrong_count',
               'point_unknown_count', 'replay_endpoints', 'replay_observations', 'replay_encoder_crops',
-              'confidence_labeled_states', 'confidence_departed_states',
+              'confidence_labeled_states', 'confidence_departed_states', 'refinement_attempts_sum',
               'supervision_weight', 'endpoint_weight', 'matched_endpoint_weight', 'choice_endpoint_weight',
               'endpoint_states', 'matched_endpoint_states', 'choice_endpoint_states',
               'replay_bank_switch_endpoints', 'replay_premature_stop_endpoints',
@@ -73,7 +73,8 @@ def _interval_training_lines(row):
              f" | mean error {_number(m['error_mean'])} vox",
              f"  speed: {1000*row['interval_update_seconds']/updates:.0f} ms/update"
              f" | data wait {1000*row['interval_data_seconds']/updates:.0f} ms/update"
-             f" | {row['interval_samples_per_second']:.1f} crops/s"]
+             f" | {row['interval_samples_per_second']:.1f} crops/s"
+             f" | {m['refinement_attempts_mean']:.2f} attempts/crop"]
     if row.get('cuda_peak_allocated_gib') is not None:
         lines[-1] += f" | peak allocated VRAM {row['cuda_peak_allocated_gib']:.2f} GiB (session)"
     if m['memory_identity_count']:

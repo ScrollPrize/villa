@@ -10,8 +10,9 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.checkpoint import checkpoint
 
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
+from vesuvius.neural_tracing.fiber_follow.shared.policy import DEFAULT_CONFIDENCE, commit_prefix
 
-ARCHITECTURE = 'axial_fiber_memory_v7'
+ARCHITECTURE = 'axial_fiber_memory_v8'
 TOKEN_STRIDE = (8, 2, 2)
 TOKEN_OFFSET = (3, 0, 0)
 
@@ -42,7 +43,6 @@ class DirectConfig:
     feature_switch_crop_fraction: float = -1.
     feature_history_loss_fraction: float = .25
     recurrent_refinement_steps: int = 2
-    recurrent_refinement_limit: float = 4.
 
     def __post_init__(self):
         if isinstance(self.fine, dict):
@@ -77,8 +77,6 @@ class DirectConfig:
             raise ValueError('History loss fraction must be finite and in [0, 1)')
         if not isinstance(self.recurrent_refinement_steps, int) or self.recurrent_refinement_steps < 0:
             raise ValueError('Recurrent refinement steps must be a nonnegative integer')
-        if not math.isfinite(self.recurrent_refinement_limit) or self.recurrent_refinement_limit <= 0:
-            raise ValueError('Recurrent refinement limit must be finite and positive')
         if not isinstance(self.direction_inputs, bool):
             raise ValueError('direction_inputs must be a boolean')
 
@@ -104,6 +102,32 @@ class DirectConfig:
 
 def build_model(cfg):
     return DirectFollower(cfg)
+
+
+def select_refinement(output, cfg, confidence_threshold=DEFAULT_CONFIDENCE, n_commit=None):
+    """Longest acceptable prefix, then confidence at its end, then earlier pass.
+
+    If every proposal stops, select the best first-point confidence among valid
+    connections; the unchanged commit gate still stops. Selection never splices
+    paths or transfers one proposal's confidence to another proposal.
+    """
+    if not 0 <= confidence_threshold <= 1:
+        raise ValueError('Confidence threshold must lie in [0, 1]')
+    window = cfg.n_future if n_commit is None else n_commit
+    curves, confidence = output['refinement_points'], output['refinement_confidence'].detach()
+    counts, allowed = commit_prefix(curves, confidence, confidence_threshold, window, cfg.max_recovery_distance)
+    accepted = (confidence[..., -1] >= confidence_threshold) & allowed & output['refinement_mask']
+    prior_accept = torch.cat((torch.zeros_like(accepted[:, :1]), accepted[:, :-1]), 1).long().cumsum(1) > 0
+    valid = output['refinement_mask'] & ~prior_accept
+    longest = counts.masked_fill(~valid, -1).max(-1, keepdim=True).values
+    score = confidence.gather(-1, (counts-1).clamp_min(0)[..., None]).squeeze(-1)
+    score = score.nan_to_num(nan=-torch.inf).masked_fill((counts != longest) | ~allowed | ~valid, -torch.inf)
+    selected = score.argmax(-1)
+    index = torch.arange(len(curves), device=curves.device)
+    result = dict(output, selected_refinement=selected)
+    for name in ('points', 'hazard_logits', 'confidence_logits', 'confidence'):
+        result[name] = output['refinement_'+name][index, selected]
+    return result
 
 
 def device_vector(like, values):
@@ -371,14 +395,12 @@ class DirectFollower(nn.Module):
         self.encoder_memory_gate = nn.Parameter(torch.tensor(-4.))
         self.encoder_memory_projection = nn.Linear(cfg.hidden, cfg.hidden)
         if cfg.recurrent_refinement_steps:
-            width = 27*(cfg.channels+1)+cfg.hidden+1+3
+            # Spatial evidence, previous coordinates, detached failure/survival.
+            width = 27*(cfg.channels+1)+cfg.hidden+1+3+2
             self.refinement_fusion = nn.Sequential(nn.Linear(width, cfg.hidden), nn.SiLU(),
                                                   nn.Linear(cfg.hidden, cfg.hidden))
             self.refinement_stage = nn.Embedding(cfg.recurrent_refinement_steps, cfg.hidden)
-            self.refinement_delta = nn.Linear(cfg.hidden, 2)
             nn.init.zeros_(self.refinement_stage.weight)
-            nn.init.zeros_(self.refinement_delta.weight)
-            nn.init.zeros_(self.refinement_delta.bias)
         self.output_plane_features = OutputPlaneFeatures(cfg)
 
     def references(self, x, hist, hmask):
@@ -439,7 +461,8 @@ class DirectFollower(nn.Module):
         return dict(stem=stem, deep=deep, references=references, reference_mask=mask,
                     query_frame=x['query_frame'])
 
-    def forward(self, x, hist, hmask, candidates=None, memory=None):
+    def forward(self, x, hist, hmask, candidates=None, memory=None,
+                confidence_threshold=DEFAULT_CONFIDENCE, n_commit=None):
         # A cold, externally supplied history may have a remote seed. Encode
         # that seed crop once; streamed training starts at the seed itself.
         if 'feature_seed_x' in x:
@@ -449,11 +472,14 @@ class DirectFollower(nn.Module):
             memory, _ = self.observe_context(seed_ctx, seed_x, torch.zeros_like(hist), empty, memory)
         ctx = self.context(x, hist, hmask)
         ctx['recurrent'], observation = self.observe_context(ctx, x, hist, hmask, memory)
-        out = self.predict(ctx, hist, candidates)
+        out = self.predict(ctx, hist, candidates, confidence_threshold)
         if observation is not None:
             out.update(observation_tokens=observation[0], observation_xyz=observation[1], observation_valid=observation[2])
         out.update({'memory_'+k: v for k, v in ctx['recurrent'].items()})
-        return out
+        return self.select_prediction(out, confidence_threshold, n_commit)
+
+    def select_prediction(self, output, confidence_threshold=DEFAULT_CONFIDENCE, n_commit=None):
+        return select_refinement(output, self.cfg, confidence_threshold, n_commit)
 
     def observation_features(self, x, hist, hmask):
         """Re-encode a selected replay crop without decoding or reading memory."""
@@ -490,7 +516,7 @@ class DirectFollower(nn.Module):
         return self.confidence_scorer(spatial, points,
                                      ctx['confidence_projected'], ctx['confidence_padding'])
 
-    def predict(self, ctx, hist, candidates=None):
+    def predict(self, ctx, hist, candidates=None, confidence_threshold=DEFAULT_CONFIDENCE):
         cfg = self.cfg
         memory, padding = self.decoder_memory(ctx)
 
@@ -506,14 +532,19 @@ class DirectFollower(nn.Module):
             decoded = self.decode_cached(query, projected, padding)
         else:
             decoded = self.decoder(query, memory, memory_key_padding_mask=padding)
+        points = self.decode_coordinates(decoded)
+        return self.finish_prediction(ctx, decoded, points, projected if cfg.recurrent_refinement_steps else None,
+                                      padding, candidates, confidence_threshold)
+
+    def decode_coordinates(self, decoded):
+        """The same absolute-coordinate readout and bounds for every proposal."""
+        cfg = self.cfg
         lateral = cfg.lateral_limit*torch.tanh(self.coordinates(decoded).float())
         first_limit = math.sqrt(max(0., cfg.max_recovery_distance**2-cfg.future_step**2))
         first = lateral[:, :1]
         first = first*(first_limit/first.norm(dim=-1, keepdim=True).clamp_min(1e-8)).clamp(max=1.)
         lateral = torch.cat((first, lateral[:, 1:]), 1)
-        points = torch.cat((lateral, reference[..., 2:]), -1)
-        return self.finish_prediction(ctx, decoded, points, projected if cfg.recurrent_refinement_steps else None,
-                                      padding, candidates)
+        return torch.cat((lateral, self.planes[None, :, None].expand(len(decoded), -1, -1)), -1)
 
     def decoder_memory(self, ctx):
         state = ctx['recurrent']
@@ -537,28 +568,51 @@ class DirectFollower(nn.Module):
         memory = torch.cat((memory, fine), 1)
         return memory, padding
 
-    def finish_prediction(self, ctx, decoded, points, projected, padding, candidates=None):
+    def finish_prediction(self, ctx, decoded, points, projected, padding, candidates=None,
+                          confidence_threshold=DEFAULT_CONFIDENCE):
         from .survival_confidence import survival_predictions
         cfg = self.cfg
-        first_limit = math.sqrt(max(0., cfg.max_recovery_distance**2-cfg.future_step**2))
         initial = points
         refinements = [points]
-        for stage in range(cfg.recurrent_refinement_steps):
-            evidence = self.evidence(ctx, points, 'refinement')
-            refreshed = self.refinement_fusion(torch.cat((evidence, points/16.), -1))
-            query = decoded+refreshed+self.refinement_stage.weight[stage].to(decoded.dtype)
-            decoded = self.decode_cached(query, projected, padding)
-            delta = self.refinement_delta(decoded).float().tanh()*(cfg.recurrent_refinement_limit/math.sqrt(2))
-            lateral = (points[..., :2]+delta).clamp(-cfg.lateral_limit, cfg.lateral_limit)
-            first = lateral[:, :1]
-            first = first*(first_limit/first.norm(dim=-1, keepdim=True).clamp_min(1e-8)).clamp(max=1.)
-            lateral = torch.cat((first, lateral[:, 1:]), 1)
-            points = torch.cat((lateral, initial[..., 2:]), -1)
-            refinements.append(points)
         hazards = self.hazard_logits(ctx, points)
         logits, confidence = survival_predictions(hazards)
-        out = dict(points=points, initial_points=initial, refinement_points=torch.stack(refinements, 1),
-                   hazard_logits=hazards, confidence_logits=logits, confidence=confidence)
+        scores = [(hazards, logits, confidence)]
+        valid = [torch.ones(len(points), device=points.device, dtype=torch.bool)]
+        indices = torch.arange(len(points), device=points.device)
+        active_ctx = ctx
+        for stage in range(cfg.recurrent_refinement_steps):
+            # A full-horizon acceptance ends this row's retries. Dynamic batch
+            # compaction skips both generator and scorer work for accepted rows.
+            counts, _ = commit_prefix(points, confidence.detach(), confidence_threshold,
+                                      cfg.n_future, cfg.max_recovery_distance)
+            keep = torch.nonzero(counts < cfg.n_future).flatten()
+            if not len(keep):
+                break
+            if len(keep) != len(points):
+                indices = indices[keep]
+                points, decoded, hazards, confidence = (v[keep] for v in (points, decoded, hazards, confidence))
+                projected = [tuple(v[keep] for v in kv) for kv in projected]
+                padding = padding[keep]
+                active_ctx = {key: active_ctx[key][keep] for key in
+                              ('fine', 'deep', 'fine_fp32', 'deep_fp32', 'confidence_padding')} | dict(
+                    confidence_projected=[tuple(v[keep] for v in kv) for kv in active_ctx['confidence_projected']])
+            evidence = self.evidence(active_ctx, points, 'refinement')
+            # Geometry cannot teach the scorer to manufacture convenient feedback.
+            feedback = torch.stack((hazards.sigmoid(), confidence), -1).detach()
+            refreshed = self.refinement_fusion(torch.cat((evidence, points/16., feedback), -1))
+            query = decoded+refreshed+self.refinement_stage.weight[stage].to(decoded.dtype)
+            decoded = self.decode_cached(query, projected, padding)
+            points = self.decode_coordinates(decoded)
+            refinements.append(refinements[-1].index_copy(0, indices, points))
+            hazards = self.hazard_logits(active_ctx, points)
+            logits, confidence = survival_predictions(hazards)
+            scores.append(tuple(previous.index_copy(0, indices, value)
+                                for previous, value in zip(scores[-1], (hazards, logits, confidence))))
+            valid.append(torch.zeros_like(valid[0]).index_fill(0, indices, True))
+        out = dict(initial_points=initial, refinement_points=torch.stack(refinements, 1),
+                   refinement_mask=torch.stack(valid, 1))
+        out.update({'refinement_'+name: torch.stack([score[i] for score in scores], 1)
+                    for i, name in enumerate(('hazard_logits', 'confidence_logits', 'confidence'))})
         if candidates is not None:
             hazards = torch.stack([self.hazard_logits(ctx, curve) for curve in candidates.unbind(1)], 1)
             logits, confidence = survival_predictions(hazards)
