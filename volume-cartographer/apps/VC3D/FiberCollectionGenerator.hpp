@@ -34,7 +34,7 @@ struct Request {
     double voxelSizeUm = 0.0;
     QString sourcePath;
     QString model = kDefaultModel;
-    bool mirror = true;
+    bool mirror = false;
     double thresholdPercent = kDefaultThresholdPercent;
     int blockSize = kDefaultBlockSize;
     // Receives a .afv of the fibers stitched so far after each block; empty for none.

@@ -226,9 +226,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--source-path", help="Native source volume recorded with the fibers")
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"nnU-Net fiber model: folder or Hugging Face repository (default: {DEFAULT_MODEL})")
     parser.add_argument(
-        "--no-mirror",
-        action="store_true",
-        help="Disable test-time mirroring: about 8x faster, with visibly worse predictions",
+        "--mirror",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Test-time mirroring: better predictions, about 8x slower (default: off)",
     )
     parser.add_argument(
         "--threshold",
@@ -289,7 +290,7 @@ def generate(args: argparse.Namespace, report: Reporter) -> dict[str, Any]:
         report.emit("warning", message="No GPU found: predicting on the CPU is very slow.")
     folder, provenance = resolve_model(args.model)
     network, patch = load_network(folder, device)
-    mirror = not args.no_mirror
+    mirror = args.mirror
 
     from .extend.ct_support import CTSupport
     from .extend.gap_model import Predictor, geometry_features

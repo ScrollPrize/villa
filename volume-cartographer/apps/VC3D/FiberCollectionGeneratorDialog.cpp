@@ -105,7 +105,7 @@ FiberCollectionGeneratorDialog::FiberCollectionGeneratorDialog(
     model_->setToolTip(tr("Hugging Face repository or local folder of an nnU-Net fiber model."));
     form->addRow(tr("Model"), model_);
     mirror_ = new QCheckBox(tr("Test-time mirroring: better predictions, about 8× slower"), this);
-    mirror_->setChecked(settings.value(kMirrorKey, true).toBool());
+    mirror_->setChecked(settings.value(kMirrorKey, false).toBool());
     form->addRow(QString(), mirror_);
     threshold_ = new QDoubleSpinBox(this);
     threshold_->setRange(1, 100);

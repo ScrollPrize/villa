@@ -37,7 +37,7 @@ only once it is complete.
 | Option | Default | |
 | --- | --- | --- |
 | `--model` | `Qualzz20/afv_fiber_9um` | nnU-Net fiber model: local export folder or Hugging Face repository, downloaded once into the Hugging Face cache |
-| `--no-mirror` | mirroring on | disables test-time mirroring: about 8× faster, visibly worse predictions |
+| `--mirror` | off | test-time mirroring: better predictions, about 8× slower prediction |
 | `--threshold` | `60` | minimum fiber probability, in percent |
 | `--device` | `auto` | `cuda`, `cuda:N`, `mps` or `cpu`; `auto` prefers CUDA, then MPS |
 | `--block-size` | `512` | side of the cubes the zone is processed in, in voxels |
@@ -54,9 +54,9 @@ only once it is complete.
    to 32 voxels beyond the zone.
 2. **Prediction.** The block is z-scored with its own mean and standard
    deviation (at least 10 grey levels) and predicted in windows of the model
-   patch overlapping by half, blended with Gaussian weights. Test-time
-   mirroring averages the network outputs for the 8 axis flips of each
-   window. The network is loaded once for all blocks.
+   patch overlapping by half, blended with Gaussian weights. With `--mirror`,
+   the network outputs for the 8 axis flips of each window are averaged. The
+   network is loaded once for all blocks.
    The model gives, per voxel, the probabilities of a vertical fiber, a
    horizontal fiber and an intersection.
 3. **Polylines.** For each family, the probability plus half of the
@@ -103,7 +103,7 @@ curvature, and the fibers around the gap),
 without CT. Its distances are converted to micrometres with the voxel size
 given by `--voxel-size` and `--native-scale`, 8.64 µm when it is not given.
 
-On one RTX 3090, the 512³ zone above gives 5,220 fibers in 8 min 38 s with
-mirroring, reading over HTTPS included, about half of it extending the
-fibers, with a peak of 4.4 GB of RAM. A GPU is strongly recommended:
-predicting on the CPU is very slow.
+On one RTX 3090, the 512³ zone above gives 5,383 fibers in 5 min 39 s,
+reading over HTTPS included: 33 s of prediction and 4 min 20 s of extension,
+with a peak of 4.5 GB of RAM. With `--mirror`, it takes 8 min 38 s. A GPU is
+strongly recommended: predicting on the CPU is very slow.

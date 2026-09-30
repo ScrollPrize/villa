@@ -64,7 +64,7 @@ def test_generates_a_volume_in_native_coordinates(monkeypatch, capsys, volume, t
     assert metadata["root"]["vc_open_data_source_original_resolution"] == 4.5
     # The native shape is not known exactly from a downsampled volume.
     assert "coordinate_base_shape_zyx" not in metadata["root"]
-    assert metadata["generator"]["origin_xyz"] == [4, 10, 8] and metadata["generator"]["mirror"] is True
+    assert metadata["generator"]["origin_xyz"] == [4, 10, 8] and metadata["generator"]["mirror"] is False
     family, length, annotation = db.execute("SELECT family, length, annotation FROM fibers").fetchone()
     points = np.concatenate([np.frombuffer(blob, "<f8").reshape(-1, 3) for (blob,) in db.execute("SELECT points FROM blocks ORDER BY first_segment")])
     assert family == "V"
@@ -114,6 +114,12 @@ def test_reports_errors_as_json_and_writes_nothing(monkeypatch, capsys, volume, 
     code, events = run(monkeypatch, capsys, volume, output, "--level", "1")
     assert code == 1 and events[-1] == {"event": "error", "message": "The volume has no array 1"}
     assert not output.exists()
+
+
+@pytest.mark.parametrize("flag, mirror", [((), False), (("--mirror",), True), (("--no-mirror",), False)])
+def test_mirroring_is_off_unless_asked(flag, mirror):
+    required = ["--volume", "v.zarr", "--origin", "0", "0", "0", "--size", "1", "1", "1", "--output", "f.afv", "--coordinate-space", "S/1"]
+    assert cli.build_parser().parse_args([*required, *flag]).mirror is mirror
 
 
 def test_zone_must_be_inside_the_volume():

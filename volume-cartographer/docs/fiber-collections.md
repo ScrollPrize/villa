@@ -30,8 +30,8 @@ file is never replaced) and the zone, in voxels of the current volume: a
 volume. The zone is processed in cubes of **Block size** voxels (512 by
 default); while the dialog is open, the blocks are drawn on the CT views and
 the dialog shows how many there are. **Block size**, **Model**, **Test-time
-mirroring** (better predictions, about 8× slower) and **Fiber threshold** are
-remembered.
+mirroring** (off by default: better predictions, about 8× slower) and **Fiber
+threshold** are remembered.
 
 VC3D runs `python -m vesuvius.afv_spline_generator` in the background and shows
 its progress under the button; **Cancel** stops it. Each block is drawn on the

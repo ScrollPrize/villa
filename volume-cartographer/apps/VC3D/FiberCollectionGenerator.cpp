@@ -26,8 +26,8 @@ QStringList arguments(const Request& request)
     if (!request.sourcePath.isEmpty())
         args << "--source-path" << request.sourcePath;
     args << "--model" << request.model << "--threshold" << decimal(request.thresholdPercent);
-    if (!request.mirror)
-        args << "--no-mirror";
+    if (request.mirror)
+        args << "--mirror";
     args << "--block-size" << QString::number(request.blockSize);
     if (!request.previewDirectory.isEmpty())
         args << "--preview-dir" << request.previewDirectory;

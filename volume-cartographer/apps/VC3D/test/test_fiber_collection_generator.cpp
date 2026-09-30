@@ -28,7 +28,7 @@ private slots:
         request.voxelSizeUm = 9.362;
         request.sourcePath = "s3://bucket/scroll.zarr/";
         request.thresholdPercent = 55;
-        request.mirror = false;
+        request.mirror = true;
         request.blockSize = 256;
         request.previewDirectory = "/tmp/previews";
         const QStringList expected{
@@ -36,7 +36,7 @@ private slots:
             "--origin", "10", "20", "30", "--size", "512", "256", "128", "--output", "/data/fibers.afv",
             "--coordinate-space", "PHerc0813/20250821151723", "--native-scale", "2", "--voxel-size", "9.362",
             "--source-path", "s3://bucket/scroll.zarr/", "--model", "Qualzz20/afv_fiber_9um", "--threshold", "55",
-            "--no-mirror", "--block-size", "256", "--preview-dir", "/tmp/previews", "--progress", "json"};
+            "--mirror", "--block-size", "256", "--preview-dir", "/tmp/previews", "--progress", "json"};
         QCOMPARE(arguments(request), expected);
     }
 
@@ -49,7 +49,7 @@ private slots:
         const auto args = arguments(request);
         QVERIFY(!args.contains("--voxel-size"));
         QVERIFY(!args.contains("--source-path"));
-        QVERIFY(!args.contains("--no-mirror"));
+        QVERIFY(!args.contains("--mirror"));
         QVERIFY(!args.contains("--preview-dir"));
         QCOMPARE(args.mid(args.indexOf("--threshold"), 2), (QStringList{"--threshold", "60"}));
         QCOMPARE(args.mid(args.indexOf("--block-size"), 2), (QStringList{"--block-size", "512"}));
