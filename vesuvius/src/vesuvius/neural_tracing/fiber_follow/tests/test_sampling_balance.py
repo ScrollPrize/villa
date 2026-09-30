@@ -36,7 +36,7 @@ def test_burst_is_budgeted_as_one_complete_stream_not_truncated_or_interleaved(m
         def __init__(self):
             self.cfg=cfg(feature_switch_crop_fraction=.15)
             self.encoded=[]
-        def __call__(self,rows,vol):
+        def __call__(self,rows,vol, *, decision_mask=None):
             self.encoded.extend((r['source'],r['observation']) for r in rows)
             return dict(hist=torch.zeros(len(rows),1,3),source=torch.tensor([r['source'] for r in rows]),
                         observation=torch.tensor([r['observation'] for r in rows]))

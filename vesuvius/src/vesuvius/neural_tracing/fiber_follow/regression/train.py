@@ -1,6 +1,7 @@
 """Train a direct curve follower from scratch, with original-fiber online replay."""
 import argparse
 import copy
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, replace
 import json
 import math
@@ -175,6 +176,12 @@ def pack_feature_chunks(chunks, size):
     pending.sort(key=len, reverse=True)
     for start in range(0, len(pending), size):
         streams = pending[start:start+size]
+        # Observation-only rows omit target tensors. Do not merge incompatible
+        # schemas, including a mismatch later in a chunk whose first rows agree.
+        for t in range(max(map(len, streams))):
+            rows = [rows[t] for rows in streams if t < len(rows)]
+            if any(schema(row) != schema(rows[0]) for row in rows[1:]):
+                return chunks
         complete.append(dict(feature_sequence=[combine([rows[t] for rows in streams if t < len(rows)])
                                                for t in range(max(map(len, streams)))]))
     return complete
@@ -300,6 +307,44 @@ def move_batch(batch, device):
     # Pinned loader batches copy asynchronously; the compute stream orders later use.
     return {k: move_batch(v, device) if isinstance(v, dict) else v.to(device, non_blocking=True)
             for k, v in batch.items()}
+
+
+class DecisionBatchPrefetch:
+    """Assemble one CPU update ahead while the current update uses the GPU.
+
+    Only this thread consumes the loader iterator. Chunks remain ordered and
+    the same first whole chunk reaching the decision budget ends each update.
+    The complete denominator is therefore known before any task backward.
+    """
+    def __init__(self, iterator, decisions):
+        if decisions < 1:
+            raise ValueError('Positive decision budget required')
+        self.iterator, self.decisions = iterator, decisions
+        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='decision-batch')
+        self.pending = self.executor.submit(self.collect)
+        self.closed = False
+
+    def collect(self):
+        from .feature_sequences import sequence_steps, decision_count
+        chunks, count = [], 0
+        while count < self.decisions:
+            chunk = next(self.iterator)
+            chunks.append(chunk)
+            count += sum(decision_count(row) for row in sequence_steps(chunk))
+        return chunks
+
+    def __next__(self):
+        if self.closed:
+            raise StopIteration
+        chunks = self.pending.result()
+        self.pending = self.executor.submit(self.collect)
+        return chunks
+
+    def close(self):
+        if not self.closed:
+            self.closed = True
+            self.pending.cancel()
+            self.executor.shutdown(wait=True, cancel_futures=True)
 
 
 @torch.no_grad()
@@ -945,6 +990,7 @@ def main(argv=None):
     interval_started, interval_step = started, done
     interval_data_seconds = interval_update_seconds = 0.
     interval_metrics = DirectTrainingInterval()
+    updates = None
     try:
         if args.diag_every or args.long_diag_every:
             from vesuvius.neural_tracing.fiber_follow.shared.trace import TraceParams
@@ -952,7 +998,7 @@ def main(argv=None):
                 TraceParams(n_commit=args.n_commit, max_len=args.diag_max_len), device=args.device)
         progress(f'Starting data loader; collecting {args.batch} supervised decisions for update {done+1}')
         iterator = iter(loader)
-        from .feature_sequences import sequence_steps, decision_count
+        updates = DecisionBatchPrefetch(iterator, args.batch)
         from .stratified_replay import ObservationHistory
         stream_states = ObservationHistory()
         observed_states = interval_states = 0
@@ -965,14 +1011,7 @@ def main(argv=None):
             batch_started = time.monotonic()
             if early and step != done+1:
                 progress(f'Update {step}: waiting for data')
-            batches = []
-            batch_states = 0
-            while batch_states < args.batch:
-                chunk = next(iterator)
-                batches.append(chunk)
-                batch_states += sum(decision_count(b) for b in sequence_steps(chunk))
-                if step == done+1:
-                    progress(f'Update {step}: received {batch_states}/{args.batch} supervised decisions')
+            batches = next(updates)
             data_seconds = time.monotonic()-batch_started
             update_started = time.monotonic()
             if early:
@@ -1077,6 +1116,8 @@ def main(argv=None):
                 # Wall time spent outside optimizer updates, so throughput can be read from the log.
                 log.record(dict(step=step, **periodic))
     finally:
+        if updates is not None:
+            updates.close()
         event = collector.close()
         if event:
             log.record(event)

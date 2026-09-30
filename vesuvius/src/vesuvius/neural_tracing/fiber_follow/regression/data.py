@@ -67,11 +67,13 @@ class ObservationBuilder:
             x['feature_seed_x']['feature_active'] = torch.tensor(remote)
         return x
 
-    def __call__(self,items,vol):
+    def observations(self, items, vol):
         return dict(x=self.images(items,vol),
                     hist=torch.as_tensor(np.stack([i['hist_local'] for i in items]),dtype=torch.float32),
-                    hmask=torch.as_tensor(np.stack([i['hmask'] for i in items]),dtype=torch.float32),
-                    **collate_targets(items))
+                    hmask=torch.as_tensor(np.stack([i['hmask'] for i in items]),dtype=torch.float32))
+
+    def __call__(self,items,vol):
+        return dict(self.observations(items, vol), **collate_targets(items))
 
 
 @dataclass(frozen=True)
@@ -370,45 +372,69 @@ class IdentityObservationBuilder(ObservationBuilder):
         z = np.asarray(item.get('identity_label_z',np.asarray(item['pos'])[2:3]))
         return not (z.min()-2 < band.hi and z.max()+2 >= band.lo)
 
-    def bank_targets(self, items):
+    def bank_targets(self, items, decision_mask=None):
         """Foreign-path masks and coverage feedback; no contrastive point queries."""
         if self.negative_bank is None:
             raise ValueError('Bank supervision requires a negative bank')
         cfg, bank = self.cfg, self.negative_bank
+        selected = np.ones(len(items), bool) if decision_mask is None else np.asarray(decision_mask, dtype=bool)
         shape = (cfg.fine.depth, cfg.fine.width, cfg.fine.width)
-        out = dict(foreign=np.zeros((len(items), *shape), np.uint8),
-                   presence_dropped=np.zeros(len(items), np.float32),
+        out = dict(presence_dropped=np.zeros(len(items), np.float32),
                    location_source=np.zeros(len(items), np.float32),
                    foreign_components=np.zeros(len(items), np.float32),
                    negative_bank_shards=np.zeros(len(items), np.int64))
+        if selected.any() or not len(items):
+            out['foreign'] = np.zeros((len(items), *shape), np.uint8)
         for j, item in enumerate(items):
             out['location_source'][j] = item.get('location_source', 0)
             if 'identity_curve' not in item:
                 continue
+            feedback = self.fibers is not None and item.get('source') == 0
+            if not selected[j] and not feedback:
+                continue
             found = bank.candidates(item, cfg.fine, self.sampling.rule, mask_crop=cfg.fine,
                 additional_banks=([self.near_negative_bank] if self.near_negative_bank is not None
-                                  and self.near_negative_bank is not bank else ()))
-            out['foreign'][j] = found['foreign']
+                                  and self.near_negative_bank is not bank else ()), rasterize=bool(selected[j]))
+            if selected[j]:
+                out['foreign'][j] = found['foreign']
             out['foreign_components'][j] = found['counts']['foreign_components']
             out['negative_bank_shards'][j] = bank.shard_count+(self.near_negative_bank.shard_count
                 if self.near_negative_bank is not None and self.near_negative_bank is not bank else 0)
             # Remember covered locations directly, independent of randomly selected
             # contrastive queries. Missing coverage remains unknown.
             ahead = found['local']
-            if (self.fibers is not None and item.get('source') == 0 and len(ahead)
+            if (feedback and len(ahead)
                     and ((ahead[:, 2] >= cfg.future_step)
                          & (ahead[:, 2] <= cfg.n_future*cfg.future_step)).any()):
                 self.lateral.append(item['fiber_ref'])
         return {k: torch.from_numpy(v) for k, v in out.items()}
 
-    def __call__(self,items,vol):
-        batch = super().__call__(items,vol)
+    def __call__(self,items,vol, *, decision_mask=None):
+        """Images for every observation; expensive targets only for decisions.
+
+        Mixed batches retain row-aligned tensors with unused rows zero-filled.
+        Observation-only batches omit annotation and dense-mask tensors entirely.
+        Preparation/holdout checks and per-item augmentation RNG are unchanged.
+        """
+        selected = (torch.ones(len(items), dtype=torch.bool) if decision_mask is None
+                    else torch.as_tensor(decision_mask, dtype=torch.bool))
+        if selected.shape != (len(items),):
+            raise ValueError('Decision mask must have one entry per observation')
+        indices = selected.nonzero().flatten()
+        def scatter(values):
+            if len(indices) == len(items):
+                return values
+            return {k: v.new_zeros((len(items), *v.shape[1:])).index_copy_(0, indices, v)
+                    for k, v in values.items()}
+        batch = self.observations(items, vol)
+        if len(indices):
+            batch.update(scatter(collate_targets([items[j] for j in indices.tolist()])))
         if self.fibers is None and not self.augment and not any('identity_curve' in i for i in items):
             return batch
-        batch.update(self.bank_targets(items))
+        batch.update(self.bank_targets(items, selected))
         batch['identity_observable'] = torch.tensor([i.get('identity_observable',True) for i in items])
         batch['bank_tail_length'] = torch.tensor([i.get('bank_tail_length',0.) for i in items],dtype=torch.float32)
-        if self.sampling.decision_fraction:
+        if self.sampling.decision_fraction and len(indices):
             from .identity_decisions import CANDIDATE_COUNT
             from .supervision import candidate_targets
             shape = (CANDIDATE_COUNT,self.cfg.n_future)
@@ -416,8 +442,18 @@ class IdentityObservationBuilder(ObservationBuilder):
                 batch[key] = torch.from_numpy(np.stack([i.get(key,np.zeros((*shape,*trailing),np.float32)) for i in items]))
             batch['candidate_kind'] = torch.from_numpy(np.stack([i.get('candidate_kind',
                 np.full(CANDIDATE_COUNT, -1, np.int64)) for i in items]))
-            batch['candidate_labels'], batch['candidate_mask'] = candidate_targets(
-                batch, self.cfg, self.sampling.candidate_tolerance)
+            # Most rows have no supplied candidate paths, even at decisions.
+            # Avoid sampling their full foreign volume for four all-masked paths.
+            eligible = (selected & batch['candidate_mask'].bool().flatten(1).any(1)
+                        & batch['identity_observable']).nonzero().flatten()
+            labels = torch.zeros_like(batch['candidate_mask'], dtype=torch.float32)
+            known = torch.zeros_like(labels)
+            if len(eligible):
+                target_batch = batch if len(eligible) == len(items) else {
+                    k: v[eligible] for k, v in batch.items() if torch.is_tensor(v)}
+                target, mask = candidate_targets(target_batch, self.cfg, self.sampling.candidate_tolerance)
+                labels[eligible], known[eligible] = target, mask
+            batch['candidate_labels'], batch['candidate_mask'] = labels, known
             for key in ('decision_kind','decision_tail'):
                 batch[key] = torch.tensor([i.get(key,0) for i in items],dtype=torch.float32)
         batch['seed_present'] = batch['x']['seed_mask'].flatten()

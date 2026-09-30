@@ -167,12 +167,13 @@ def sequence_batches(builder, items, vol, *, band=None, worker=0, requested_frac
             active = [j for j, rows in enumerate(streams) if t < len(rows)]
             if not active:
                 break
-            batch = builder([streams[j][t] for j in active], vol)
+            weights = torch.tensor([plans[j][0][t] for j in active], dtype=torch.float32)
+            batch = builder([streams[j][t] for j in active], vol, decision_mask=weights > 0)
             batch['stream_id'] = torch.tensor([ids[j] for j in active], dtype=torch.long)
             batch['stream_reset'] = torch.full((len(active),), t == 0, dtype=torch.bool)
             batch['stream_end'] = torch.tensor([t == len(streams[j])-1 for j in active])
             batch['stream_index'] = torch.full((len(active),), t, dtype=torch.long)
-            batch['loss_weight'] = torch.tensor([plans[j][0][t] for j in active], dtype=torch.float32)
+            batch['loss_weight'] = weights
             batch['decision_mask'] = batch['loss_weight'] > 0
             batch['encoder_indices'] = torch.tensor(np.stack([plans[j][1][t] for j in active]), dtype=torch.long)
             batch['retain_until'] = torch.tensor([plans[j][2][t] for j in active], dtype=torch.long)

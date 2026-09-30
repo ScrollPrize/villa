@@ -234,7 +234,7 @@ class DirectionInputTests(unittest.TestCase):
             memory_seed_patch=patch_image[None].clone(),memory_seed_valid=torch.tensor([True])))
         training=copy.deepcopy(original);builder=IdentityObservationBuilder(cfg,augment=True)
         state=dict(photometric=(1.3,.1,.07),identity_seed=3,blur_sigma=1.,drop_presence=True)
-        with patch.object(ObservationBuilder,'__call__',return_value=training), \
+        with patch.object(ObservationBuilder,'observations',return_value=training), \
              patch.object(builder,'bank_targets',return_value=dict(presence_dropped=torch.zeros(1))):
             got=builder([state],None)['x']
         for key in ('fine','memory_seed_patch'):

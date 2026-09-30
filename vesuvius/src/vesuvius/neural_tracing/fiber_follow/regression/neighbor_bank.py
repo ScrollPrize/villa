@@ -347,7 +347,7 @@ class NeighborBank:
         tree,gap = self.state_target_tree(item)
         return tree.query(np.asarray(world).reshape(-1,3))[0]-gap > self.exclusion
 
-    def candidates(self, item, crop, rule, *, mask_crop=None, additional_banks=()):
+    def candidates(self, item, crop, rule, *, mask_crop=None, additional_banks=(), rasterize=True):
         """Exact centerline queries, with whole-annotation clearance.
 
         Presence support was established when the bank was mined; it is not
@@ -356,6 +356,8 @@ class NeighborBank:
         Confidence labels rasterize only cells containing these line samples;
         their entire cell must clear the target exclusion tube. Query locations
         are never rasterized, expanded, jittered or snapped to the crop grid.
+        Observation-only rows use the same geometry for sampling feedback but
+        do not need a dense confidence-label mask.
         """
         fi,t,reverse = item['fiber_ref']
         fiber = self.fibers[fi]
@@ -373,7 +375,7 @@ class NeighborBank:
                      for r in bank.spatial_records(fi, world)]
         mask_crop = crop if mask_crop is None else mask_crop
         shape = (mask_crop.depth,mask_crop.width,mask_crop.width)
-        mask = np.zeros(shape,bool)
+        mask = np.zeros(shape,bool) if rasterize else None
         empty = dict(foreign=mask, local=np.empty((0,3)), nearest=np.empty(0,np.int64), path_ids=np.empty(0,np.int64),
                      counts=dict(foreign_components=0))
         if not lines or len(item['identity_curve']) < 3:
@@ -391,11 +393,12 @@ class NeighborBank:
         nearest = cKDTree(item['identity_curve']).query(local)[1]
         keep &= (nearest > 0) & (nearest < len(item['identity_curve'])-1)
         local,nearest,path_ids = local[keep],nearest[keep],path_ids[keep]
-        voxels = np.unique(np.rint(crop_indices(mask_crop,local)).astype(int),axis=0)
-        voxels = voxels[np.all((voxels >= 0) & (voxels < np.asarray(shape)),axis=1)]
-        points = crop_local_grid(mask_crop)[tuple(voxels.T)]
-        half_cell = np.sqrt(3)*mask_crop.spacing/2
-        keep = tree.query(points @ frame.T+pos)[0]-gap-half_cell > max(self.exclusion,rule.own_radius)
-        mask[tuple(voxels[keep].T)] = True
+        if rasterize:
+            voxels = np.unique(np.rint(crop_indices(mask_crop,local)).astype(int),axis=0)
+            voxels = voxels[np.all((voxels >= 0) & (voxels < np.asarray(shape)),axis=1)]
+            points = crop_local_grid(mask_crop)[tuple(voxels.T)]
+            half_cell = np.sqrt(3)*mask_crop.spacing/2
+            keep = tree.query(points @ frame.T+pos)[0]-gap-half_cell > max(self.exclusion,rule.own_radius)
+            mask[tuple(voxels[keep].T)] = True
         return dict(foreign=mask, local=local, nearest=nearest, path_ids=path_ids,
                     counts=dict(foreign_components=int(bool(len(local)))))

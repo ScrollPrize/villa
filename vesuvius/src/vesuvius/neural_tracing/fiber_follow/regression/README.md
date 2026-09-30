@@ -60,6 +60,18 @@ gradients: each supervised decision reconstructs its prefix independently.
 Independent partial chunks can be packed within an update. Observation encoding
 is batched; gradient-bearing decisions currently reconstruct one stream at a time.
 
+Workers receive the decision mask before building each image batch. Every row
+keeps its original augmentation and stream/holdout checks, but annotation tensors,
+foreign-mask rasterization and candidate labels are built only for supervised
+rows. Observation-only batches omit those targets; mixed batches zero-fill unused
+target rows. Fresh observation rows still query bank geometry to preserve the
+coverage feedback used by subsequent lateral sampling.
+
+The trainer assembles one complete CPU decision batch ahead while the current
+update runs on the GPU. This overlaps loader waiting without changing chunk order,
+update boundaries, loss normalization, or optimizer/EMA cadence. It can retain one
+additional update's crops in host memory, on top of the DataLoader's worker queue.
+
 Memory writing and the scorer's final normalization/confidence projection run in
 FP32; other CUDA model computation uses BF16 autocast. Sampling coordinates,
 survival accumulation, and proposal comparisons remain FP32. Gradient clipping

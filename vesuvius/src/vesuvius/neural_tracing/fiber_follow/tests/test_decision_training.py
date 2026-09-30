@@ -26,7 +26,7 @@ def test_stream_length_does_not_change_endpoint_or_total_budget(monkeypatch):
     monkeypatch.setattr(module, 'stream_rows', lambda item, builder, band: item)
     class Builder:
         cfg = config(feature_history_loss_fraction=.25)
-        def __call__(self, items, vol):
+        def __call__(self, items, vol, *, decision_mask=None):
             return dict(hist=torch.zeros(len(items), 1, 3))
     streams = [[dict(source=source, identity_seed=j) for _ in range(length)]
                for j, (source, length) in enumerate([(5, 6), (5, 9), (0, 18), (3, 130)])]
@@ -168,7 +168,7 @@ def test_pair_is_discarded_together_if_one_history_crosses_holdout(monkeypatch):
     monkeypatch.setattr(module, 'stream_rows', lambda item, builder, band: item['rows'])
     class Builder:
         cfg = config()
-        def __call__(self, items, vol):
+        def __call__(self, items, vol, *, decision_mask=None):
             return dict(hist=torch.zeros(len(items), 1, 3), source=torch.tensor([r['source'] for r in items]))
     items = [dict(pair_observation_seed=123, rows=[]),
              dict(pair_observation_seed=123, rows=[dict(source=5, identity_seed=1)]),
