@@ -9,11 +9,12 @@ an Automated Fiber Volume
 VC3D runs it from **Generate automated fibers…** in its **Automated Fiber
 Volume** dock; it can also be run on its own.
 
-Install the model dependencies and run, here on a 512³ zone of PHerc0813:
+From `villa/vesuvius`, install the model extra and run, here on a 512³ zone
+of PHerc0813:
 
 ```bash
-pip install "vesuvius[models]"
-vesuvius.afv_spline_generator \
+uv sync --extra models
+uv run --extra models vesuvius.afv_spline_generator \
   --volume https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc0813/volumes/20250821151723-9.362um-1.2m-113keV-masked.zarr \
   --origin 3720 4776 6592 --size 512 512 512 \
   --coordinate-space PHerc0813/20250821151723 --voxel-size 9.362 \

@@ -66,7 +66,8 @@ final volume replaces it at the end.
 
 When VC3D runs from a build inside a villa checkout, that checkout's
 `vesuvius/src` is put first on `PYTHONPATH`. Python is the one given in the
-dialog; else, from a checkout, `vesuvius/.venv` as created by `uv sync`; else
+dialog; else, from a checkout, `vesuvius/.venv` as created by
+`uv sync --extra models`; else
 it is found as for Neural Trace (`PYTHON_EXECUTABLE`, the active conda
 environment, `~/miniconda3`, `~/anaconda3`, then the `PATH`). An application
 started from the Finder or a desktop menu doesn't see the conda environment of
