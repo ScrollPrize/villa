@@ -52,6 +52,184 @@
   EMA-0.999 weights and saved refined geometry while continuing online
   refinement in a fresh managed training run.
 
+## 2026-09-28 — Ordinary-only N2 solve/readout
+
+- Same548 N2 source fibers solved without reference nodes or cross factors;
+  original IDs verified exactly and no largest-component filtering. Special
+  post-split reference attachments are unchanged and used only for readout.
+- Full-coverage gauge0 correctness/shift scores:3/10=15.38%/19.23%,
+  10/3=7.69%/15.38%,10/10=15.38%/34.62%. All28 gauge readouts retained;
+  gauge0 covers98.78% of reference observations. Ties and partial-gauge
+  limitations explicit; no fabricated all-gauge score or tuning promotion.
+- Native123/Python27 tests pass; all three runs complete. Full ladders and
+  provenance in volume-cartographer/docs/fiber_benchmark_runs/2026-09-28-n2-unconditioned.*.
+
+## 2026-09-28 — Complete-graph fixed-reference neighborhood diagnostic
+
+- BP-only now retains all winding components by default; legacy largest-only
+  filtering requires an explicit flag. No implicit loss of remote source pieces.
+- Added whole-source N-winding reference neighborhood selection, canonical fixed
+  references, shared combined-graph assembly and per-source/piece/continuation
+  diagnostics. Ordinary H/V/winding/defect states remain joint and free.
+- N2 retains548/2778 sources (19.73%). D10/C10 disables7.04% of pieces with1.29%
+  active continuation jumps, versus8.66%/1.40% for the same fibers scored from
+  the all-fiber solve. Cheaper step cost trades defects for substantially more
+  jumps. All220 reference pieces fixed; all-graph keeps665 unanchored gauges.
+- Four trials completed;123 native and26 Python tests pass. Full results,
+  provenance, commands and limitations in
+  volume-cartographer/docs/fiber_benchmark_runs/2026-09-28-reference-neighborhood.md.
+
+## 2026-09-27 — Preserve certified constraints across piece splitting
+
+- Fixed post-split support filtering/clipping and source-pair parallel evidence
+  reweighting. Certify first; splits change owner IDs only, never validity.
+- Fixed the same dependency in reference cross-constraint extraction: certify
+  on source fibers, then use the shared event-owner remapper for existing pieces.
+- Full six-setting Paris4 2048 rerun: all53,480 certified events retained with
+  parallel on; off intentionally omits17,952. No support rejection or missing
+  reference owners. Native118 and Python34 regression tests pass.
+- Corrected fixed-H/V parallel-on initial accuracy19.23%, versus rerun legacy
+  grouped38.46%; shift scores46.15% versus73.08%. Fine joint-H/V variants remain
+  at11.54% initial accuracy. No default changes; bugfix is not a quality win.
+- Full percentages, ladders, audits, provenance and reusable commands in
+  volume-cartographer/docs/fiber_benchmark_runs/2026-09-27-certified-splits.*.
+  Earlier local-events/local-costs/local-step-costs results are now explicitly
+  marked historical broken-graph experiments, not intended-algorithm results.
+
+## 2026-09-27 — Distance-weighted continuation
+
+- Added opt-in untruncated lambda*absolute physical winding displacement,
+  including H/V phase; retains ordinary evidence and soft pair coupling.
+- D10/parallel-off joint-H/V six-trial experiment complete. Hard and flat-C10
+  controls reproduce previous scores/ladders. Linear lambda {0.1,1,10,100}
+  gives initial accuracy {7.69,11.54,11.54,7.69}% and shift scores
+  {3.85,3.85,7.69,11.54}%, versus flat-C10 7.69%/15.38%.
+  No overall correctness gain, defaults unchanged. Tables/plot/JSON:
+  volume-cartographer/docs/fiber_benchmark_runs/2026-09-27-local-step-costs.*.
+- Approved build/run commands only. 116 native BP tests and 32 Python tests
+  passed; independent plan/implementation reviews passed.
+
+## 2026-09-27 — Independent continuation cuts: completed cost matrix
+
+- Benchmark policy clarified by user: message-limit termination is accepted as
+  a completed solve. Earlier increased budgets did not improve results; do not
+  propose budget increases or use the limit as an excuse for poor scores.
+
+- Completed 24 joint H/V and 8 fixed-H/V trials. Independent piece disabling
+  and flat continuation cuts implemented; no default promotion. Cheap cuts
+  fragment the solution; no overall correctness winner. Full percentage
+  tables/plots: docs/fiber_benchmark_runs/2026-09-27-local-costs.*.
+- Shift diagnostic on saved independent ladders requires 20–25 offset changes
+  across 26 references: poor accuracy is not merely one persistent offset.
+- Native 115 tests and Python 30 tests passed for that implementation.
+
+## 2026-09-27 — Local events and clean constraint-midpoint segmentation
+
+- Added opt-in per-side local direction/distance/sign certification, repeated
+  parallel correspondence, weighted evidence, clean non-overlapping midpoint
+  splits and parallel-on/off ablation. Shared geometry and winding samplers
+  reused; legacy defaults unchanged.
+- Frozen 2048 beam8/reverse-consistency benchmark: legacy removal score
+  −110.6766%, independent accuracy 38.46%; local+parallel −90.5016%/15.38%;
+  local orthogonal-only −74.7873%/11.54%. Not promoted: local conditioned
+  accuracy falls to 57.69%/34.62% versus 100% legacy, and 90.92% of locally
+  accepted events lose support after excessive splitting. Both local variants
+  have identical 68,851 pre-BP pieces, median length 22.80 base voxels.
+- Full methods, caveats, results JSON and SVG:
+  `volume-cartographer/docs/fiber_benchmark_runs/2026-09-27-local-events.md`.
+
+## 2026-09-27 — Controlled retention/constraint alternatives
+
+- Completed31recorded crop trials: centered quality, length/degree costs,
+  localized cut placement with matched controls, and latent ordinary-measurement
+  disablement. Cost10 improves removal score−110.6766%→−78.3149%, with38.46%
+  independent accuracy unchanged; cost100 gives−82.5469%/42.31% but only25/26
+  conditioned-reference readouts correct. Other mechanisms did not give a
+  worthwhile gain. Reference evidence/continuity cannot disable; retained off
+  measurements remain benchmark penalties. Defaults unchanged.107native and
+  24Python tests pass. Full tables, plot and JSON:
+  `volume-cartographer/docs/fiber_benchmark_runs/2026-09-27-density-alternatives.md`.
+
+## 2026-09-24 — Density penalty direct search
+
+- Completed51settings plus baseline, separate mean/median/worst coarse grids and
+  two refinements. Best removal scores -109.6787%/-109.1046%/-108.6632% versus
+  -110.6766% baseline. All selected winners retain38.46%independent accuracy.
+  Worst-density gains2.0134pp with scale0.88913971/floor0.63245553. Defaults
+  unchanged; in-sample, fixed500-message-budget results. Full report/data:
+  `2026-09-24-density-sweep.md` and adjacent resultsJSON in native benchmark docs.
+
+## 2026-09-24 — Density-modulated disablement experiment
+
+- Added optional per-piece winding defect multipliers, shared across all winding
+  unary paths; defaults unchanged. Tested arc-weighted mean/median and maximum
+  native tracer loss density on the reverse-consistency 2048 crop. All retain
+  38.46% independent winding accuracy and worsen removal score from -110.68%
+  to -113.71%/-113.35%/-116.87%. No promotion. 104 native and 32 Python tests
+  pass. Full results and limitations: `2026-09-24-defect-density.md` in native
+  benchmark reports.
+
+## 2026-09-23 — Reproducible Paris4 crop benchmark
+
+- Reverse-consistency unpruned independent BP improves correct reference windings7/26(26.92%)→10/26(38.46%);9/26zero-hard-sign errors. Initial500cap,all6790initial states reproduce preceding run. Full ladder:2026-09-23-reverse-consistency-independent.md.
+
+- User-approved promotion:reverse consistency is now default for CLI dense-beam crop generation feeding BP. Explicit --no-reverse-consistency preserves control runs;historical configs updated. Replay/fiberlet/shared-API defaults unchanged.22CLItests plus default/disabled real-data smoke pass.
+
+- Optional dense-beam reverse consistency added:20/40base ellipse,40base backoff, preserved gaps/provenance and retained forward costs. With40/80suppression/45° gate,2048crop BP removal score improves−169.64%→−110.68%,removed constraints36.50%→24.33%;2778pieces,2.26%checked length skipped.86native/20CLItests pass. Disabled by default. Full report/commands:2026-09-23-reverse-consistency.md.
+
+-40/80,45° unpruned independent reference assignment gives7/26 correct(26.92%) versus original8/26(30.77%),despite improved removal metric;11/26 sign-feasible. Frozen initial states match preceding run. Full ladder:2026-09-23-coverage40x80-angle45-independent.md.
+
+-2048 BP removal benchmark with40/80,45° traces improves score−210.44%→−169.64%;problematic fraction67.79%→62.91%,conditioned reference diagnostic21/26→26/26.339.22s,same capped BP/pruning protocol. See2026-09-23-coverage40x80-angle45-bp.md.
+
+-40/80 seed suppression with45° gate reduces2382→1484 traces and removes the audited winding0.5 duplicates.40/80 reference-matching success remains23/26. Config experiment only,default unchanged; full tables in `volume-cartographer/docs/fiber_benchmark_runs/2026-09-23-coverage40x80-angle45.md`.
+
+- Explicit tangential seed-coverage radius added;40/80 experiment reduces2048 source traces3697→2382 but preserves winding0.5 triplicate.22/26 strong matches unchanged; some partial coverage worsens.83 crop tests pass; defaults unchanged. Full results: `volume-cartographer/docs/fiber_benchmark_runs/2026-09-23-coverage40x80.md`.
+
+- Independent reference assignment now ranks each reference against frozen initial BP using configured weights/hard signs, without reference-assisted solves or pruning. Exposes five alternatives, sign errors, finite loss, ties and unbounded tails.103 native tests and3 CLI checks pass. Completed1024/2048 runs; full results in `volume-cartographer/docs/fiber_benchmark_runs/2026-09-23-independent-reference-assignment.md`. Historical conditioned scores are not initial-BP accuracy.
+
+- Joint-grid BP zero-weight correction: remove fully inactive winding factors
+  before graph preparation; preserve separate original-index diagnostics.
+  Fix support-expansion normalization so neutral messages stay neutral.
+ 100native winding tests plus7runner tests passed; omitted-input equality
+  covers disconnected bridges, defects and short iteration caps. User approved
+  correcting outputs rather than preserving the old finite-iteration artifact.
+  See docs/fiber_benchmark_runs/2026-09-23-inactive-winding-factors.md.
+  Corrected small run: 53.04 s (was 68.69 s), 88.46% exact references.
+  Larger 2048³ run: 24m52s, 80.77% exact; extra context did not improve
+  accuracy. Full assignment table and capped-solver caveats saved separately.
+
+- New beam8 BP ablation: hard perpendicular order +parallel-one weight0.1,
+  other measurement classes disabled. Constraint-119.57% versus-178.90%;
+  exact88.46% unchanged with same three errors. Logged message-limit and
+  defect-neutralization caveats; production defaults unchanged.
+
+- Imported third-party Qual275-fiber collection and added frozen-polyline replay
+  using the shared evaluator. All three crop plots updated: replay0.0464%,
+  constraint-55.31%, exact references84.62%. Documented acquisition-gap-heavy
+  replay semantics, sparse BP graph and preserved native L0 geometry/provenance.
+
+- Added shared-scheduler, canonical-anchor dense VC3D beam candidate generation
+  for BP. Classic/new constraint scores -240.90%/-178.90%, both88.46% exact
+  references; 1145.24s/45.73s. Historical Fiberlet quality filtering is not
+  transferable to beam costs; report and plots label this difference. Added
+  explicit bounded winding state memory guard override (default unchanged).
+
+- Corrected direct comparison to actual VC3D beam defaults, without fullres
+  tuning: Classic50.000%, new33.333% (1/2 failures). Restored the historical
+  failures+1 headline in native summaries, migrated current crop artifacts and
+  added measurements to the existing progress plots. Greedy remains an explicit
+  historical control, not the default VC3D result.
+
+- Added the approved evaluation runner's `crop-benchmark` mode and reproducible
+  direct/fiberlet/BP configs for the handoff's 24 in-crop fibers (48 directions).
+- Integrated crop-scoped canonical on-demand anchor/fiberlet caches into
+  `vc_fiber_trace_chunk`; shared helpers with production preprocessing and
+  preserved the evaluated-anchor view for compact path storage.
+- Recorded new/Classic controls, historical metrics and generation-version
+  caveats in `volume-cartographer/docs/fiber_benchmark_runs/2026-09-23-crop-new-predictions.md`.
+  BP reference-assisted and unassisted results are explicitly separated.
+- Validated 18 native replay tests, 43 storage tests and 3 recording-runner tests.
+
 ## 2026-09-19 — Skeleton backend: sub-ports, kept variants, per-sub-port routing
 
 - Measured what the thresholded fibre presence constrains. Its section is a
@@ -3155,5 +3333,49 @@ identity remains unconfirmed. Global-assignment experiments not yet implemented.
   supports --export-manifests-only to refresh metadata without inference.
 # 2026-09-23
 
+## 2026-09-24 — Tracer cost and initial classification audit
+
+- Added optional dense forward-step cost capture with exact historical trace
+  verification, plus analysis joining existing reference-removal labels to
+  piece-local total/mean/max costs. All3retraces match; no BP rerun.
+- Current reverse2048removed pieces have median density0.401vs0.247retained,
+  max-step median0.760vs0.580. Matched Classic/new1024initial winding defect
+  fractions14.05%vs7.89%. Reports and per-piece data in
+  `volume-cartographer/docs/fiber_benchmark_runs/2026-09-24-tracer-cost-removal.md`.
+
+- Tested reverse-consistency winding BP at500/1000/5000updates with fixed
+  normal/orientation preprocessing: unchanged38.46%reference accuracy and full
+  ladder; all unconverged. Added optional winding-only iteration limit with
+  unchanged defaults and29passing CLI tests. Results and reproduction in
+  `volume-cartographer/docs/fiber_benchmark_runs/2026-09-23-reverse-consistency-message-limits.md`.
+
 - Added manager-owned, SHA-256-bound snapshot imports and required stable
   external model identifiers for new inference runs.
+## 2026-09-27 — Finite winding-step audit and parameter search
+
+- Checkpoint before tuning: `dd8c1331e`. New candidates use finite physical
+  winding-step costs, not hard continuation equality or flat break penalties.
+- Corrected downstream diagnostics: positive finite steps are charged, not
+  reported as removed connections. Zero-cost edges retain absent-factor behavior.
+- Added default-off local normalized-MAP decode repair and default-preserving
+  continuation defect-mass ablations. Decoder keeps calibration/gauges/supports
+  fixed and can restore defects, but objective improvement is not accuracy.
+- Reproducible screening skips only reference-assisted solves, validated against
+  full initial ladders. All trials/provenance retained in
+  `volume-cartographer/docs/fiber_benchmark_runs/2026-09-27-winding-step-search.*`.
+- Native122 and Python26 tests pass.48completed trials; best finite initial
+  accuracy26.92% versus legacy38.46%, no candidate promoted. Remaining runs
+  blocked intermittently by md0 filesystem transaction waits. Latest status
+  table: `2026-09-27-winding-step-search-status.md`; task remains incomplete.
+## 2026-09-30 — Integrate training, extraction and crop experiments
+
+- Merge villa's fiber-exps4 (29ff06409) and villa2's fiber-exps
+  (29b2eb56f) into eval-fiber-extraction, then branch as fiber-exp5.
+- Keep extraction task documents and combine durable changelog histories.
+  Retain both independent native replay test additions; production code merges
+  automatically. Update the DDP statistics test mock for short/long embeddings.
+- Workspace RelWithDebInfo build and native replay/tracing/reference tests
+  pass (23/86/22), plus four coordinate-contract CLI tests. No extraction or
+  evaluation rerun; source worktrees and untracked artifacts left untouched.
+- Focused Python suites: 430 passed, 38 skipped, two expected failures;
+  short/long embedding mock corrected after initial regression detection.

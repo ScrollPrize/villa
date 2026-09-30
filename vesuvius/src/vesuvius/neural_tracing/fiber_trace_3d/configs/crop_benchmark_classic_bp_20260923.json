@@ -1,0 +1,76 @@
+{
+  "output_root": "/ephemeral/hendrik/fiber_crop_bench/20260923_v1",
+  "reference_dir": "/home/hendrik/test_datasets/2026-09-01_fiber_stack2",
+  "input_files": [
+    "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd1-7ff0ce6c/artifacts/PHercParis4-20260411134726-las-sd1-7ff0ce6c.lasagna.json",
+    "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json",
+    "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd1-d74cca79/artifacts/PHercParis4-20260411134726-las-sd1-d74cca79.lasagna.json"
+  ],
+  "commands": [
+    {
+      "name": "crop-trace-classic",
+      "binary": "vc_fiber_trace_chunk",
+      "args": [
+        "trace",
+        "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-fiberlets-e7aa1a99/artifacts/fiberlets.zarr",
+        "--normal-manifest",
+        "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json",
+        "--bbox",
+        "10240",
+        "22016",
+        "6144",
+        "11264",
+        "23040",
+        "7168",
+        "--lookahead",
+        "384",
+        "--ambiguity-margin",
+        "0.40",
+        "--ambiguity-radius",
+        "20",
+        "--threads",
+        "128",
+        "--output",
+        "/ephemeral/hendrik/fiber_crop_bench/20260923_v1/crop-trace-classic.zarr",
+        "--obj",
+        "/ephemeral/hendrik/fiber_crop_bench/20260923_v1/crop-trace-classic.obj"
+      ]
+    },
+    {
+      "name": "bp-classic-q021",
+      "binary": "vc_fiber_trace_chunk",
+      "args": [
+        "direction-ablation",
+        "/ephemeral/hendrik/fiber_crop_bench/20260923_v1/crop-trace-classic.zarr",
+        "--normal-manifest",
+        "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json",
+        "--output",
+        "/ephemeral/hendrik/fiber_crop_bench/20260923_v1/bp-classic-q021",
+        "--direction-dominance",
+        "0.9",
+        "--piece-length",
+        "512",
+        "--bp-only",
+        "--bp-inference",
+        "sum-product-mixed",
+        "--quality-threshold",
+        "0.21",
+        "--winding-fixed-orientation",
+        "--reference-prune-offenders",
+        "--reference-prune-policy",
+        "oracle-inliers",
+        "--reference-oracle-magnitude-weight",
+        "1",
+        "--reference-oracle-accept-message-limit",
+        "--reference-oracle-rounds",
+        "1",
+        "--reference-fiber-dir",
+        "/home/hendrik/test_datasets/2026-09-01_fiber_stack2",
+        "--reference-fiber-tag",
+        "hendrik_crop1",
+        "--threads",
+        "128"
+      ]
+    }
+  ]
+}

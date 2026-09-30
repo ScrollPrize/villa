@@ -1060,20 +1060,10 @@ nlohmann::json fiberletSourceIdentity(
                 fail(std::string("--source-context is missing object '") +
                      field + "'");
         }
-    } else {
-        // Manual native runs remain location-independent even without manager
-        // catalog identities. The content hashes are stable identifiers.
-        sources = {
-            {"source_volume", {{"identity", "manifest_hashes_only"}}},
-            {"fiber_prediction", nlohmann::json::object()},
-            {"normal_prediction", nlohmann::json::object()},
-        };
     }
-    sources["fiber_prediction"]["manifest_content_hash"] =
-        fileHash(fiberDataset.manifest().manifestPath);
-    sources["normal_prediction"]["manifest_content_hash"] =
-        fileHash(normalDataset.manifest().manifestPath);
-    return sources;
+    return vc::fiber_tracer::makeFiberletSourceIdentity(
+        fiberDataset.manifest().manifestPath,
+        normalDataset.manifest().manifestPath, std::move(sources));
 }
 
 vc::fiber_tracer::FiberletDatasetMetadata replayDatasetMetadata(
@@ -4507,23 +4497,14 @@ int runWholeVolumePreprocessing(
     cacheOptions.service.fetchConcurrency.workerCapacity = workerCount;
     cacheOptions.service.fetchConcurrency.maxConcurrentReads = workerCount;
 
-    FiberletOnDemandConfig onDemand;
-    onDemand.anchorRoot = anchorRoot;
-    onDemand.fiberletRoot = options.outputDirectory;
-    onDemand.anchorMetadata = anchorMetadata;
-    onDemand.fiberletMetadata = finalMetadata;
-    onDemand.grid = grid;
-    onDemand.anchorConfig = options.anchors;
-    onDemand.pathConfig = options.paths;
     // Whole-volume parallelism is across chunks so one global worker budget can
     // move dynamically between ready fiberlets and their anchor dependencies.
-    configureCanonicalFiberletGeneration(onDemand);
-    onDemand.predictionSampler = [&field](const auto& indices, int threads, auto& samples) {
-        field.sampleStoredGridBatch(indices, threads, samples);
-    };
-    onDemand.normalSampler = normalSampler;
-    onDemand.anchorCacheOptions = cacheOptions;
-    onDemand.fiberletCacheOptions = cacheOptions;
+    auto onDemand = makeCanonicalFiberletOnDemandConfig(
+        anchorRoot, options.outputDirectory, anchorMetadata, finalMetadata,
+        grid, options.anchors, options.paths,
+        [&field](const auto& indices, int threads, auto& samples) {
+            field.sampleStoredGridBatch(indices, threads, samples);
+        }, normalSampler, cacheOptions);
     if (options.printStats) {
         onDemand.progress = [](const FiberletOnDemandProgress& progress) {
             if (progress.status == "completed") {

@@ -5,6 +5,7 @@
 #include "vc/fiber_tracer/FiberAnchorCoverage.hpp"
 #include "vc/fiber_tracer/FiberAnchors.hpp"
 #include "vc/fiber_tracer/FiberletPipeline.hpp"
+#include "vc/fiber_tracer/FiberJson.hpp"
 #include "vc/lasagna/LineOptimizer.hpp"
 
 #include <cmath>
@@ -58,6 +59,93 @@ TEST_CASE("reference replay interval tolerates accumulated roundoff but not miss
     };
     check(FiberReplayTraceResult{});
     check(FiberletGraphReplayResult{});
+}
+
+TEST_CASE("precomputed replay emits fixed offset geometry and terminal samples")
+{
+    using namespace vc::fiber_tracer;
+    const ConstantNormalSampler normals({0,0,1});
+    const std::vector<cv::Vec3d> reference{{0,0,0},{82,0,0}};
+    std::vector<PolylineArcGeometry> candidates{makePolylineArcGeometry({{0,2,0},{82,2,0}})};
+    const auto replay = tracePrecomputedFiberReplay(candidates, reference, normals);
+    CHECK(replay.failures.empty());
+    REQUIRE(replay.segments.size() == 1);
+    const auto& points = replay.segments.front().tracePointsBase;
+    REQUIRE(points.size() >= 3);
+    CHECK(points[1] == cv::Vec3d(0,2,0)); // Actual offset acquisition, not snapped GT.
+    CHECK(points[2] == cv::Vec3d(8,2,0));
+    CHECK(points.back() == cv::Vec3d(82,2,0)); // Non-step-multiple endpoint.
+    auto reverse = reference;
+    std::reverse(reverse.begin(), reverse.end());
+    const auto backwards = tracePrecomputedFiberReplay(candidates, reverse, normals);
+    CHECK(backwards.failures.empty());
+    CHECK(backwards.segments.front().tracePointsBase.back() == cv::Vec3d(0,2,0));
+
+    candidates.clear();
+    const auto missing = tracePrecomputedFiberReplay(candidates, reference, normals);
+    REQUIRE_FALSE(missing.failures.empty());
+    CHECK(missing.failures.front().reason == "no_aligned_candidate");
+    CHECK(missing.completedReferenceArcBase == doctest::Approx(82));
+    candidates.push_back(makePolylineArcGeometry({{0,-10,0},{0,10,0}}));
+    const auto wrong = tracePrecomputedFiberReplay(candidates, reference, normals);
+    CHECK(wrong.failures.front().reason == "no_aligned_candidate");
+    candidates[0] = makePolylineArcGeometry({{0,0,0},{10,0,0}});
+    const auto shortLine = tracePrecomputedFiberReplay(candidates, reference, normals);
+    REQUIRE_FALSE(shortLine.failures.empty());
+    CHECK(shortLine.failures.front().reason == "candidate_end");
+    CHECK(shortLine.segments.front().tracePointsBase.back() == cv::Vec3d(10,0,0));
+    CHECK(shortLine.completedReferenceArcBase == doctest::Approx(82));
+    candidates[0] = makePolylineArcGeometry({{0,0,21},{82,0,21}});
+    const auto outside = tracePrecomputedFiberReplay(candidates, reference, normals);
+    CHECK(outside.failures.front().reason == "no_aligned_candidate");
+}
+
+TEST_CASE("native collection parser validates scale without applying historical transforms")
+{
+    using namespace vc::fiber_tracer;
+    const nlohmann::json entry = {
+        {"type", "vc3d_fiber"}, {"version", 1}, {"hv_classification", "H"},
+        {"line_points", {{100,200,300},{110,200,300}}},
+        {"control_points", {{100,200,300},{110,200,300}}}};
+    nlohmann::json root = {{"type", "vc3d_fiber_collection"}, {"version", 1}, {"scale", 1},
+        {"point_collections", nlohmann::json::array({entry})}};
+    const auto parsed = parseNativeVc3dFiberCollection(root, "fixture");
+    REQUIRE(parsed.size() == 1);
+    CHECK(parsed[0].linePoints.front() == cv::Vec3d(100,200,300));
+    root["scale"] = 4;
+    CHECK_THROWS_AS(parseNativeVc3dFiberCollection(root, "fixture"), std::invalid_argument);
+    root["scale"] = 1;
+    root["vc_open_data_source_coordinate_level"] = 2;
+    CHECK_THROWS_AS(parseNativeVc3dFiberCollection(root, "fixture"), std::invalid_argument);
+}
+
+TEST_CASE("precomputed acquisition freezes the initially closest candidate without future GT reranking")
+{
+    using namespace vc::fiber_tracer;
+    const ConstantNormalSampler normals({0,0,1});
+    const std::vector<cv::Vec3d> reference{{0,0,0},{100,0,0}};
+    const std::vector<PolylineArcGeometry> candidates{
+        makePolylineArcGeometry({{0,1,0},{16,1,0},{32,1,40},{100,1,40}}),
+        makePolylineArcGeometry({{0,2,0},{100,2,0}})};
+    const auto replay = tracePrecomputedFiberReplay(candidates, reference, normals);
+    REQUIRE_FALSE(replay.failures.empty());
+    CHECK(replay.failures.front().reason == "distance_above_threshold");
+    REQUIRE_FALSE(replay.segments.empty());
+    const auto& first = replay.segments.front();
+    REQUIRE(first.tracePointsBase.size() > 2);
+    CHECK(first.tracePointsBase[1] == cv::Vec3d(0,1,0));
+    CHECK(first.tracePointsBase.back()[1] == doctest::Approx(1));
+    CHECK(first.tracePointsBase.back()[2] > 20);
+    // A future-aware selector would take candidate 1 immediately and report
+    // zero failures. A mid-segment switch would conceal candidate 0's failure.
+
+    const std::vector<PolylineArcGeometry> ties{
+        makePolylineArcGeometry({{0,1,0},{100,1,0}}),
+        makePolylineArcGeometry({{0,-1,0},{100,-1,0}})};
+    const auto tied = tracePrecomputedFiberReplay(ties, reference, normals);
+    REQUIRE_FALSE(tied.segments.empty());
+    CHECK(tied.segments.front().tracePointsBase[1] == cv::Vec3d(0,1,0));
+    CHECK(tied.failures.empty());
 }
 
 TEST_CASE("anchor coverage uses ellipse flat caps and arclength gaps")
@@ -124,6 +212,43 @@ TEST_CASE("weighted fit cache identities separate while legacy identity ignores 
     CHECK(weighted!=legacy);
     a.weightedFitIterations=4;
     CHECK(identity()!=weighted);
+}
+
+TEST_CASE("canonical generated cache preserves scientific settings across runtime roots")
+{
+    using namespace vc::fiber_tracer;
+    FiberAnchorConfig anchors;
+    FiberletPathConfig paths;
+    anchors.parallelThreads = 32;
+    paths.parallelThreads = 32;
+    paths.longitudinalStepPredictionVoxels = 1.0F;
+    FiberPredictionGridInfo grid{{32,32,32},8};
+    const auto sources = nlohmann::json{{"model", "test"}};
+    const auto anchorMetadata = makeFiberletDatasetMetadata(
+        FiberletDatasetKind::Anchors, grid, anchors, paths, 128, sources);
+    const auto pathMetadata = makeFiberletDatasetMetadata(
+        FiberletDatasetKind::Fiberlets, grid, anchors, paths, 128, sources);
+    FiberletChunkCacheOptions cache;
+    cache.service.fetchConcurrency.workerCapacity = 8;
+    auto sampler = [](const auto&, int, auto&) {};
+    const auto normals = std::make_shared<ConstantNormalSampler>(cv::Vec3d{0,0,1});
+    const auto first = makeCanonicalFiberletOnDemandConfig(
+        "/first/anchors", "/first/paths", anchorMetadata, pathMetadata,
+        grid, anchors, paths, sampler, normals, cache);
+    const auto second = makeCanonicalFiberletOnDemandConfig(
+        "/second/anchors", "/second/paths", anchorMetadata, pathMetadata,
+        grid, anchors, paths, sampler, normals, cache);
+    CHECK(first.fiberletMetadata.datasetFingerprint == second.fiberletMetadata.datasetFingerprint);
+    CHECK(first.pathConfig.longitudinalStepPredictionVoxels == 1.0F);
+    CHECK(first.anchorConfig.parallelThreads == 1);
+    CHECK(first.pathConfig.parallelThreads == 1);
+    CHECK(first.fiberletCacheOptions.service.fetchConcurrency.workerCapacity == 8);
+    CHECK(first.anchorCellPredicate({999,999,999}));
+    CHECK(first.pointPredicate({999,999,999}));
+    auto changedPaths = paths;
+    changedPaths.longitudinalStepPredictionVoxels = 2.0F;
+    CHECK(makeFiberletDatasetMetadata(FiberletDatasetKind::Fiberlets, grid,
+        anchors, changedPaths, 128, sources).datasetFingerprint != pathMetadata.datasetFingerprint);
 }
 
 TEST_CASE("anchor direction error ignores sign")
@@ -252,9 +377,9 @@ TEST_CASE("reference replay summary includes successes and explicit voxel scale"
     CHECK(summary.meanFailedSpanLengthMillimeters == doctest::Approx(0.125));
     CHECK(summary.lengthWeightedSuccessPercent == doctest::Approx(87.5));
     CHECK(summary.failuresPerDirectedMillimeter == doctest::Approx(1.0));
-    CHECK(summary.meanSegmentLengthBaseVoxels == doctest::Approx(200.0 / 3.0));
-    CHECK(summary.meanSegmentLengthMillimeters == doctest::Approx(1.0 / 3.0));
-    CHECK(summary.meanSegmentLengthPercent == doctest::Approx(100.0 / 3.0));
+    CHECK(summary.meanSegmentLengthBaseVoxels == doctest::Approx(100.0));
+    CHECK(summary.meanSegmentLengthMillimeters == doctest::Approx(0.5));
+    CHECK(summary.meanSegmentLengthPercent == doctest::Approx(50.0));
     REQUIRE(summary.failureReasons.size() == 1);
     CHECK(summary.failureReasons.front().first == "route_state_limit");
 }
@@ -292,7 +417,7 @@ TEST_CASE("reference replay mean segment length handles zero and multiple failur
     CHECK_THROWS_AS(vc::fiber_tracer::summarizeFiberReferenceReplay(1, incompleteOutcomes, 2.4), std::invalid_argument);
 }
 
-TEST_CASE("reference replay complete partitions include each directed terminal segment")
+TEST_CASE("reference replay corpus score uses failures plus one regardless of direction count")
 {
     vc::fiber_tracer::FiberReferenceReplayOutcome outcome;
     outcome.referenceLengthBaseVoxels = 10000.0;
@@ -318,19 +443,19 @@ TEST_CASE("reference replay complete partitions include each directed terminal s
     const auto pooled = vc::fiber_tracer::summarizeFiberReferenceReplay(2, unequalDirections, 1.0);
     CHECK(pooled.directedCases == 2);
     CHECK(pooled.totalFailures == 1);
-    CHECK(pooled.meanSegmentLengthMillimeters == doctest::Approx(10.0));
-    CHECK(pooled.meanSegmentLengthPercent == doctest::Approx(100.0 / 3.0));
+    CHECK(pooled.meanSegmentLengthMillimeters == doctest::Approx(15.0));
+    CHECK(pooled.meanSegmentLengthPercent == doctest::Approx(50.0));
 
     outcome.failureFree = true;
     outcome.failures.clear();
     const std::array noFailures{outcome, longer};
     const auto successful = vc::fiber_tracer::summarizeFiberReferenceReplay(2, noFailures, 1.0);
-    CHECK(successful.meanSegmentLengthMillimeters == doctest::Approx(15.0));
-    CHECK(successful.meanSegmentLengthPercent == doctest::Approx(50.0));
+    CHECK(successful.meanSegmentLengthMillimeters == doctest::Approx(30.0));
+    CHECK(successful.meanSegmentLengthPercent == doctest::Approx(100.0));
     const nlohmann::json config{{"error_threshold_base_voxels", 2.0}};
     const auto json = vc::fiber_tracer::fiberReferenceReplayBenchmarkJson(
         successful, noFailures, "fiberlet", config, {}, {0, 0, 0}, {1, 1, 1});
-    CHECK(json.at("summary").at("reliability_segments") == 2);
+    CHECK(json.at("summary").at("reliability_segments") == 1);
 }
 
 TEST_CASE("reference replay empty summary has no reliability partitions")
@@ -376,8 +501,8 @@ TEST_CASE("reference replay JSON version five preserves failure diagnostics")
         summary, outcomes, "fiberlet", commonConfig,
         {{"beam_width", 16}}, {0, 0, 0}, {10, 10, 10});
 
-    CHECK(json.at("version") == 5);
-    CHECK(json.at("metric_definition") == "complete-reference-partition-v1");
+    CHECK(json.at("version") == 6);
+    CHECK(json.at("metric_definition") == "corpus-failures-plus-one-v1");
     CHECK(json.at("tracer") == "fiberlet");
     CHECK(json.at("backend_config").at("beam_width") == 16);
     CHECK(json.at("summary").at("reliability_segments") == 2);

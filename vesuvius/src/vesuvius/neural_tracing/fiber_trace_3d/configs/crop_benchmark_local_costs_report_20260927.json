@@ -1,0 +1,7 @@
+{
+  "output_root": "/ephemeral/hendrik/fiber_crop_bench/20260927_local_costs_v1",
+  "local_cost_sweep": {
+    "report_only": true,
+    "supplemental_roots": ["/ephemeral/hendrik/fiber_crop_bench/20260927_local_costs_fixed_v1"]
+  }
+}

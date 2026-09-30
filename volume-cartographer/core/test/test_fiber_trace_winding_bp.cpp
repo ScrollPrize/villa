@@ -5,6 +5,7 @@
 #include "vc/fiber_tracer/FiberTraceWindingBeliefPropagation.hpp"
 #include "vc/fiber_tracer/FiberTraceWindingLeastSquares.hpp"
 #include "vc/fiber_tracer/FiberTraceWindingOrderedCuts.hpp"
+#include "vc/fiber_tracer/LasagnaNormalAlignment.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -13,6 +14,191 @@
 #include <numeric>
 #include <string>
 #include <vector>
+
+TEST_CASE("Local events split cleanly between orthogonal crossings before parallel ablation")
+{
+    using namespace vc::fiber_tracer;
+    std::vector<FiberletCropTraceLine> source(4);
+    source[0].pointsBaseXYZ={{0,0,0},{1024,0,0}};
+    source[1].pointsBaseXYZ={{256,-256,10},{256,256,10}};
+    source[2].pointsBaseXYZ={{768,-256,10},{768,256,10}};
+    source[3].pointsBaseXYZ={{0,0,20},{1024,0,20}};
+    FiberTraceConstraintConfig cfg;
+    cfg.localEvents=true; cfg.parallelThreads=2;
+    auto sampler=[](const cv::Vec3d& a,const cv::Vec3d& b,double){return std::abs(a[2]-b[2])/20.;};
+    const auto full=extractFiberTraceConstraints(source,cfg,sampler);
+    CHECK(full.localMidpointCuts==2);
+    REQUIRE(full.pieces.size()==6);
+    CHECK(full.pieces[0].endArcBaseVoxels==doctest::Approx(512.));
+    CHECK(full.pieces[1].beginArcBaseVoxels==doctest::Approx(512.));
+    CHECK(full.hardConstraints==2);
+    for(std::size_t t=0;t<source.size();++t) {
+        double end=0.;
+        for(const auto& p:full.pieces)if(p.traceIndex==t) {
+            CHECK(p.beginArcBaseVoxels==doctest::Approx(end)); end=p.endArcBaseVoxels;
+        }
+        CHECK(end==doctest::Approx(t==1||t==2?512.:1024.));
+    }
+    std::size_t repeated=0;
+    for(const auto& c:full.constraints) if(!c.hardContinuity) {
+        CHECK(c.arcABaseVoxels>=full.pieces[c.pieceA].beginArcBaseVoxels);
+        CHECK(c.arcABaseVoxels<=full.pieces[c.pieceA].endArcBaseVoxels);
+        CHECK(c.arcBBaseVoxels>=full.pieces[c.pieceB].beginArcBaseVoxels);
+        CHECK(c.arcBBaseVoxels<=full.pieces[c.pieceB].endArcBaseVoxels);
+        if(c.parallelScore>.5)++repeated;
+    }
+    CHECK(full.localCertifiedEvents==full.localRetainedCertifiedEvents);
+    CHECK(full.localRejectedSupport==0);
+    CHECK(repeated>2);
+    cfg.localIncludeParallel=false;
+    const auto orth=extractFiberTraceConstraints(source,cfg,sampler);
+    REQUIRE(orth.pieces.size()==full.pieces.size());
+    for(std::size_t i=0;i<full.pieces.size();++i) {
+        CHECK(orth.pieces[i].beginArcBaseVoxels==full.pieces[i].beginArcBaseVoxels);
+        CHECK(orth.pieces[i].endArcBaseVoxels==full.pieces[i].endArcBaseVoxels);
+    }
+    CHECK(orth.localParallelOmitted==repeated);
+    CHECK(orth.localCertifiedEvents==orth.localRetainedCertifiedEvents+orth.localParallelOmitted);
+    for(const auto& c:orth.constraints)CHECK((c.hardContinuity||c.perpendicularScore>.5));
+    cfg.preserveInputLinesAsPieces=true;
+    const auto cross=extractFiberTraceConstraints(source,cfg,sampler);
+    CHECK(cross.pieces.size()==source.size());
+}
+
+TEST_CASE("Certified event support and parallel evidence survive dense crossing splits")
+{
+    using namespace vc::fiber_tracer;
+    std::vector<FiberletCropTraceLine> source(2);
+    source[0].pointsBaseXYZ={{0,0,0},{1024,0,0}};
+    source[1].pointsBaseXYZ={{0,0,20},{1024,0,20}};
+    FiberTraceConstraintConfig cfg; cfg.localEvents=true; cfg.parallelThreads=2;
+    auto sampler=[](const cv::Vec3d& a,const cv::Vec3d& b,double){return std::abs(a[2]-b[2])/20.;};
+    const auto unsplit=extractFiberTraceConstraints(source,cfg,sampler);
+    for(double x:{256.,272.,288.}) {
+        FiberletCropTraceLine cross;
+        cross.pointsBaseXYZ={{x,-256,10},{x,256,10}};
+        source.push_back(cross);
+    }
+    const auto split=extractFiberTraceConstraints(source,cfg,sampler);
+    CHECK(split.localRejectedSupport==0);
+    CHECK(split.localCertifiedEvents==split.localRetainedCertifiedEvents);
+    std::vector<FiberTraceConstraint> samePair;
+    std::size_t denseCrossings=0;
+    bool extendsBothSides=false;
+    for(const auto& c:split.constraints) {
+        if(c.hardContinuity)continue;
+        const auto& a=split.pieces[c.pieceA]; const auto& b=split.pieces[c.pieceB];
+        if(a.traceIndex==0 && b.traceIndex==1)samePair.push_back(c);
+        if(c.perpendicularScore>.5 && a.traceIndex==0 && b.traceIndex>=2) {
+            ++denseCrossings;
+            if(std::abs(c.arcABaseVoxels-272.)<1e-6) {
+                CHECK(c.supportABegin==doctest::Approx(240.));
+                CHECK(c.supportAEnd==doctest::Approx(304.));
+                extendsBothSides=c.supportABegin<a.beginArcBaseVoxels && c.supportAEnd>a.endArcBaseVoxels;
+            }
+        }
+    }
+    CHECK(denseCrossings==3);
+    CHECK(extendsBothSides);
+    REQUIRE(samePair.size()==unsplit.constraints.size());
+    for(std::size_t i=0;i<samePair.size();++i) {
+        const auto& a=samePair[i]; const auto& b=unsplit.constraints[i];
+        CHECK(a.arcABaseVoxels==b.arcABaseVoxels); CHECK(a.arcBBaseVoxels==b.arcBBaseVoxels);
+        CHECK(a.supportABegin==b.supportABegin); CHECK(a.supportAEnd==b.supportAEnd);
+        CHECK(a.supportBBegin==b.supportBBegin); CHECK(a.supportBEnd==b.supportBEnd);
+        CHECK(a.evidenceWeight==b.evidenceWeight);
+        CHECK(a.windingDistance==b.windingDistance);
+        CHECK(a.signedWindingDelta==b.signedWindingDelta);
+        CHECK(a.parallelWindingDistance==b.parallelWindingDistance);
+        CHECK(a.signedParallelWindingDelta==b.signedParallelWindingDelta);
+        CHECK(a.parallelScore==b.parallelScore); CHECK(a.perpendicularScore==b.perpendicularScore);
+    }
+}
+
+TEST_CASE("Reference event ownership remaps full-source evidence without recertifying short pieces")
+{
+    using namespace vc::fiber_tracer;
+    std::vector<FiberletCropTraceLine> source(2);
+    source[0].pointsBaseXYZ={{0,0,0},{1024,0,0}};
+    source[1].pointsBaseXYZ={{0,0,20},{1024,0,20}};
+    FiberTraceConstraintConfig cfg; cfg.localEvents=true; cfg.preserveInputLinesAsPieces=true;
+    const auto certified=extractFiberTraceConstraints(source,cfg,
+        [](const cv::Vec3d&,const cv::Vec3d&,double){return 1.;});
+    std::vector<FiberTraceConstraintPiece> targets;
+    for(const auto& sourcePiece:certified.pieces) {
+        for(int i=0;i<128;++i) {
+            auto piece=sourcePiece;
+            piece.beginArcBaseVoxels=i*8.; piece.endArcBaseVoxels=(i+1)*8.;
+            targets.push_back(piece);
+        }
+    }
+    std::size_t missing=0;
+    const auto mapped=remapCertifiedFiberTraceEvents(certified.constraints,certified.pieces,targets,missing);
+    REQUIRE(mapped.size()==certified.constraints.size()); CHECK(missing==0);
+    double massBefore=0.,massAfter=0.;
+    for(std::size_t i=0;i<mapped.size();++i) {
+        const auto& a=certified.constraints[i]; const auto& b=mapped[i];
+        CHECK(a.arcABaseVoxels==b.arcABaseVoxels); CHECK(a.arcBBaseVoxels==b.arcBBaseVoxels);
+        CHECK(a.supportABegin==b.supportABegin); CHECK(a.supportAEnd==b.supportAEnd);
+        CHECK(a.supportBBegin==b.supportBBegin); CHECK(a.supportBEnd==b.supportBEnd);
+        CHECK(a.windingDistance==b.windingDistance); CHECK(a.parallelWindingDistance==b.parallelWindingDistance);
+        CHECK(a.evidenceWeight==b.evidenceWeight);
+        CHECK(targets[b.pieceA].beginArcBaseVoxels<=b.arcABaseVoxels);
+        CHECK(targets[b.pieceA].endArcBaseVoxels>=b.arcABaseVoxels);
+        massBefore+=a.evidenceWeight; massAfter+=b.evidenceWeight;
+    }
+    CHECK(massBefore==massAfter);
+    std::erase_if(targets,[](const auto& p) {
+        return p.traceIndex==0 && p.beginArcBaseVoxels>=504. && p.endArcBaseVoxels<=528.;
+    });
+    const auto withGap=remapCertifiedFiberTraceEvents(certified.constraints,certified.pieces,targets,missing);
+    CHECK(missing>0);
+    CHECK(withGap.size()+missing==certified.constraints.size());
+    for(const auto& c:withGap)CHECK((c.arcABaseVoxels<=504. || c.arcABaseVoxels>=528.));
+}
+
+TEST_CASE("Local parallel measurements reject side disagreement and normalize repeated evidence")
+{
+    using namespace vc::fiber_tracer;
+    std::vector<FiberletCropTraceLine> source(2);
+    source[0].pointsBaseXYZ={{0,0,0},{1024,0,0}};
+    source[1].pointsBaseXYZ={{0,0,20},{1024,0,20}};
+    FiberTraceConstraintConfig cfg; cfg.localEvents=true; cfg.parallelThreads=2;
+    auto constant=[](const cv::Vec3d&,const cv::Vec3d&,double){return 1.;};
+    const auto coarse=extractFiberTraceConstraints(source,cfg,constant);
+    cfg.localSpacingBaseVoxels=32.;
+    const auto fine=extractFiberTraceConstraints(source,cfg,constant);
+    auto mass=[](const auto& r){double s=0.;for(const auto& c:r.constraints)if(!c.hardContinuity)s+=c.evidenceWeight;return s;};
+    CHECK(fine.constraints.size()>coarse.constraints.size());
+    CHECK(mass(fine)==doctest::Approx(mass(coarse)));
+    cfg.localSpacingBaseVoxels=64.;
+    const auto disagree=extractFiberTraceConstraints(source,cfg,[](const cv::Vec3d& a,const cv::Vec3d&,double){return a[0]<512.?0.:1.;});
+    for(const auto& c:disagree.constraints)if(!c.hardContinuity)
+        CHECK((c.arcABaseVoxels<=448. || c.arcABaseVoxels>=576.));
+    CHECK(disagree.localRejectedConsistency>0);
+    CHECK(disagree.localTransitionCuts==2);
+    CHECK(disagree.pieces.size()==4);
+    // An H-to-V turn may not be classified by averaging away its two sides.
+    source[1].pointsBaseXYZ={{0,0,20},{512,0,20},{512,512,20}};
+    const auto turn=extractFiberTraceConstraints(source,cfg,constant);
+    for(const auto& c:turn.constraints)if(!c.hardContinuity)
+        CHECK(std::abs(c.arcBBaseVoxels-512.)>cfg.localTangentSpanBaseVoxels);
+}
+
+TEST_CASE("Local reference cross events retain certified one-sided endpoint support")
+{
+    using namespace vc::fiber_tracer;
+    std::vector<FiberletCropTraceLine> source(2);
+    source[0].pointsBaseXYZ={{0,0,0},{256,0,0}};
+    source[1].pointsBaseXYZ={{0,0,20},{256,0,20}};
+    FiberTraceConstraintConfig cfg; cfg.localEvents=true;
+    cfg.preserveInputLinesAsPieces=true; cfg.parallelThreads=2;
+    const auto r=extractFiberTraceConstraints(source,cfg,
+        [](const cv::Vec3d&,const cv::Vec3d&,double){return 1.;});
+    CHECK(r.pieces.size()==2);
+    CHECK(std::any_of(r.constraints.begin(),r.constraints.end(),[](const auto& c){return c.arcABaseVoxels==0.;}));
+    CHECK(std::any_of(r.constraints.begin(),r.constraints.end(),[](const auto& c){return c.arcABaseVoxels==256.;}));
+}
 
 namespace
 {
@@ -635,6 +821,196 @@ TEST_CASE("Finite winding sign costs replace hard rejection and preserve zero-co
     CHECK(tiedHard.factorDiagnostics[0].hardPerpendicularSign);
 }
 
+TEST_CASE("Fixed grid omits neutral winding factors while preserving full diagnostics and beliefs")
+{
+    const auto source = lines(3);
+    auto active = pieces(3);
+    addMeasured(active, 0, 1, 1.0, 0.0);
+    addMeasured(active, 1, 2, 1.0, 0.0);
+    auto disabled = active;
+    addMeasured(disabled, 0, 2, 1.0, 2.0); // Entire inactive edge.
+    addMeasured(disabled, 0, 1, 1.0, 2.0); // Inactive measurement on live edge.
+    FiberTraceJointGridWindingConfig settings;
+    static_cast<FiberTraceWindingBeliefPropagationConfig&>(settings) = config();
+    useZeroClassWeights(settings);
+    settings.parallelSameWeight = 1.0;
+    settings.enforceParallelWindingSign = false;
+    settings.enforcePerpendicularWindingSign = false;
+    settings.fixedPhaseMagnitude = 0.5;
+    settings.fixedMeasurementScale = 1.0;
+    settings.minimumActiveWinding = -2;
+    settings.maximumActiveWinding = 2;
+    settings.mixedUnaryCost = 1.0; // Exercise nonzero Defect probability.
+    settings.stableIterations = 2;
+    const std::vector fixed(source.size(), FiberTraceFixedOrientation::Horizontal);
+    const auto omitted = solveFiberTraceJointGridWindingBeliefPropagation(
+        active, topology(source, active), settings, {}, fixed);
+    FiberTraceJointGridProgress lastProgress;
+    const auto compact = solveFiberTraceJointGridWindingBeliefPropagation(
+        disabled, topology(source, disabled), settings,
+        [&](const auto& event) { lastProgress = event; }, fixed);
+    CHECK(compact.inputFactors == 3);
+    CHECK(compact.retainedFactors == 2);
+    CHECK(compact.inputMeasurements == 4);
+    CHECK(compact.retainedMeasurements == 2);
+    CHECK(lastProgress.retainedFactors == 2);
+    CHECK(lastProgress.inputMeasurements == 4);
+    REQUIRE(compact.factorDiagnostics.size() == 4);
+    CHECK(compact.factorDiagnostics[2].constraintIndex == 2);
+    CHECK(compact.factorDiagnostics[2].effectiveParallelWindingWeight == 0.0);
+    CHECK(compact.mapWinding == omitted.mapWinding);
+    CHECK(compact.mapOrientationByPiece == omitted.mapOrientationByPiece);
+    CHECK(compact.windingValid == omitted.windingValid);
+    CHECK(compact.gaugePieces == omitted.gaugePieces);
+    CHECK(compact.componentByPiece == omitted.componentByPiece);
+    CHECK(compact.integerGaugeByPiece == omitted.integerGaugeByPiece);
+    CHECK(compact.continuousWinding == omitted.continuousWinding);
+    CHECK(compact.decodedEnergy == omitted.decodedEnergy);
+    CHECK(compact.mixedProbability == omitted.mixedProbability);
+    CHECK(compact.mapProbability == omitted.mapProbability);
+    CHECK(compact.posteriorMeanLatentCoordinate == omitted.posteriorMeanLatentCoordinate);
+    CHECK(compact.messageResidual == omitted.messageResidual);
+    CHECK(compact.totalCandidateStates == omitted.totalCandidateStates);
+
+    // Zero magnitude is not enough: local-span and sign penalties still act.
+    settings.localSpanCost = 0.1;
+    auto kept = solveFiberTraceJointGridWindingBeliefPropagation(
+        disabled, topology(source, disabled), settings, {}, fixed);
+    CHECK(kept.retainedMeasurements == 4);
+    settings.localSpanCost = 0.0;
+    settings.enforceParallelWindingSign = true;
+    settings.finiteSignInfringementCost = 1.0;
+    kept = solveFiberTraceJointGridWindingBeliefPropagation(
+        disabled, topology(source, disabled), settings, {}, fixed);
+    CHECK(kept.retainedMeasurements == 4);
+    settings.finiteSignInfringementCost.reset();
+    kept = solveFiberTraceJointGridWindingBeliefPropagation(
+        disabled, topology(source, disabled), settings, {}, fixed);
+    CHECK(kept.retainedMeasurements == 4);
+    CHECK(kept.factorDiagnostics[2].hardParallelSign);
+    settings.enforceParallelWindingSign = false;
+    const auto joint = solveFiberTraceJointGridWindingBeliefPropagation(
+        disabled, topology(source, disabled), settings);
+    CHECK(joint.retainedMeasurements == 4); // Orientation factors still active.
+    settings.fixedMeasurementScale = 0.1; // Raw distance 2 quantizes to zero.
+    const auto rescaled = solveFiberTraceJointGridWindingBeliefPropagation(
+        disabled, topology(source, disabled), settings, {}, fixed);
+    CHECK(rescaled.retainedMeasurements == 4);
+    settings.fixedMeasurementScale.reset();
+    settings.fixedPhaseMagnitude.reset();
+    settings.maximumMessageIterations = 2;
+    const auto adaptive = solveFiberTraceJointGridWindingBeliefPropagation(
+        disabled, topology(source, disabled), settings, {}, fixed);
+    CHECK(adaptive.retainedMeasurements == 4); // Other scales can reactivate terms.
+}
+
+TEST_CASE("Zero winding bridge is exactly equivalent to absent constraints before topology and initialization")
+{
+    const auto source = lines(4);
+    auto report = pieces(4);
+    addMeasured(report, 0, 1, 1.0, 0.0);
+    addMeasured(report, 2, 3, 1.0, 0.0);
+    addMeasured(report, 1, 2, 1.0, 2.0); // Neutral bridge joining phase components.
+    FiberTraceJointGridWindingConfig settings;
+    static_cast<FiberTraceWindingBeliefPropagationConfig&>(settings) = config();
+    useZeroClassWeights(settings);
+    settings.parallelSameWeight = 1.0;
+    settings.enforceParallelWindingSign = false;
+    settings.enforcePerpendicularWindingSign = false;
+    settings.fixedPhaseMagnitude = 0.5;
+    settings.fixedMeasurementScale = 1.0;
+    settings.minimumActiveWinding = -2;
+    settings.maximumActiveWinding = 2;
+    const std::vector fixed(source.size(), FiberTraceFixedOrientation::Horizontal);
+    auto absent = report;
+    absent.constraints.pop_back();
+    settings.messageDamping = 0.5;
+    settings.mixedUnaryCost = 0.25;
+    for (const bool measurementOff : {false, true}) {
+    settings.measurementDisableCost = measurementOff ? std::optional<double>{2.} : std::nullopt;
+    for (const std::size_t cap : {1, 2, 7, 100}) {
+        settings.maximumMessageIterations = cap;
+        const auto solved = solveFiberTraceJointGridWindingBeliefPropagation(
+            report, topology(source, report), settings, {}, fixed);
+        const auto omitted = solveFiberTraceJointGridWindingBeliefPropagation(
+            absent, topology(source, absent), settings, {}, fixed);
+        CHECK(solved.retainedFactors == 2);
+        CHECK(solved.factorDiagnostics.size() == 3);
+        CHECK(solved.connectedComponents == 2);
+        CHECK(solved.componentByPiece == omitted.componentByPiece);
+        CHECK(solved.integerGaugeByPiece == omitted.integerGaugeByPiece);
+        CHECK(solved.gaugePieces == omitted.gaugePieces);
+        CHECK(solved.continuousWinding == omitted.continuousWinding);
+        CHECK(solved.mapWinding == omitted.mapWinding);
+        CHECK(solved.mapOrientationByPiece == omitted.mapOrientationByPiece);
+        CHECK(solved.windingValid == omitted.windingValid);
+        CHECK(solved.mixedProbability == omitted.mixedProbability);
+        CHECK(solved.classAProbability == omitted.classAProbability);
+        CHECK(solved.componentPositivePhaseSignProbability == omitted.componentPositivePhaseSignProbability);
+        CHECK(solved.decodedEnergy == omitted.decodedEnergy);
+        CHECK(solved.messageResidual == omitted.messageResidual);
+        CHECK(solved.messageIterations == omitted.messageIterations);
+        CHECK(solved.totalCandidateStates == omitted.totalCandidateStates);
+    }
+    }
+    settings.measurementDisableCost.reset();
+
+    // Entirely zero weighting is also neutral across adaptive scale classes.
+    useZeroClassWeights(settings);
+    settings.fixedPhaseMagnitude.reset();
+    settings.fixedMeasurementScale.reset();
+    settings.maximumMessageIterations = 2;
+    auto empty = pieces(4);
+    const auto zero = solveFiberTraceJointGridWindingBeliefPropagation(
+        report, topology(source, report), settings, {}, fixed);
+    const auto none = solveFiberTraceJointGridWindingBeliefPropagation(
+        empty, topology(source, empty), settings, {}, fixed);
+    CHECK(zero.retainedFactors == 0);
+    CHECK(zero.componentByPiece == none.componentByPiece);
+    CHECK(zero.mixedProbability == none.mixedProbability);
+    CHECK(zero.decodedEnergy == none.decodedEnergy);
+    CHECK(zero.totalCandidateStates == none.totalCandidateStates);
+
+    // Exact-zero raw targets remain in the zero class at every scale, even
+    // when other (unreachable) distance classes have nonzero loss weights.
+    auto rawZero = pieces(4);
+    addMeasured(rawZero, 0, 1, 1.0, 0.0);
+    addMeasured(rawZero, 2, 3, 0.0, 0.0);
+    settings.parallelFarWeight = 1.0;
+    settings.parallelOneWeight = 1.0;
+    settings.perpendicularFarWeight = 1.0;
+    const auto rawZeroSolved = solveFiberTraceJointGridWindingBeliefPropagation(
+        rawZero, topology(source, rawZero), settings, {}, fixed);
+    CHECK(rawZeroSolved.retainedFactors == 0);
+    CHECK(rawZeroSolved.mixedProbability == none.mixedProbability);
+    CHECK(rawZeroSolved.totalCandidateStates == none.totalCandidateStates);
+    for (auto& constraint : rawZero.constraints) {
+        constraint.parallelScore = 0.0;
+        constraint.perpendicularScore = 0.0;
+    }
+    // Canonical orientation constraints require complementary scores summing
+    // to one. A full-zero joint-orientation factor is not representable there.
+    CHECK_THROWS_AS(topology(source, rawZero), std::invalid_argument);
+}
+
+TEST_CASE("Support expansion is invariant to log message gauge and preserves neutral messages")
+{
+    for (const std::size_t orientations : {1, 2}) {
+        const std::vector<double> uniform(1 + 3 * orientations, -7.0);
+        const auto extended = expandFiberTraceWindingLogMessage(uniform, -1, 1, -2, 3, orientations);
+        REQUIRE(extended.size() == 1 + 6 * orientations);
+        for (const auto value : extended) CHECK(value == extended.front());
+        std::vector<double> zero(uniform.size(), 0.0);
+        CHECK(extended == expandFiberTraceWindingLogMessage(zero, -1, 1, -2, 3, orientations));
+        auto shifted = uniform;
+        shifted[0] = -9.0;
+        auto shiftedAgain = shifted;
+        for (auto& value : shiftedAgain) value += 32.0;
+        CHECK(expandFiberTraceWindingLogMessage(shifted, -1, 1, -2, 3, orientations) ==
+              expandFiberTraceWindingLogMessage(shiftedAgain, -1, 1, -2, 3, orientations));
+    }
+}
+
 TEST_CASE("Signed winding value and extra sign hardness are independently weighted")
 {
     const auto source = lines(2);
@@ -1143,6 +1519,14 @@ TEST_CASE("Constraint agreement separates infringed and Defect-neutralized facto
     CHECK(benchmark.problematicConstraints == 5);
     CHECK(benchmark.retainedFulfilledConstraints == 1);
 
+    auto disabledWinding = winding;
+    disabledWinding.factorDiagnostics.front().measurementMapOff = true;
+    const auto disabledBenchmark = summarizeFiberTracePruningConstraintBenchmark(
+        6, retainedConstraints, report, disabledWinding, 0);
+    CHECK(disabledBenchmark.retainedDisabledConstraints == 1);
+    CHECK(disabledBenchmark.retainedFulfilledConstraints == 0);
+    CHECK(disabledBenchmark.problematicConstraints == 6);
+
     const std::array<std::size_t, 3> sparseRetainedConstraints{0, 2, 3};
     const auto sparseBenchmark = summarizeFiberTracePruningConstraintBenchmark(
         6, sparseRetainedConstraints, report, winding, 0);
@@ -1206,6 +1590,31 @@ TEST_CASE("Largest winding component uses effective factors and deterministic ti
     const auto withoutMixed = selectLargestFiberTraceWindingComponent(report, prepared, config(), fixed);
     CHECK(withoutMixed.components == 4);
     CHECK(withoutMixed.retainedPieceIndices == std::vector<std::size_t>{3, 4});
+}
+
+TEST_CASE("Reference neighborhood retains whole sources across disconnected pieces")
+{
+    auto report = pieces(7);
+    // Reference 0; pieces 1 and 2 share a source but no connecting factor.
+    report.pieces[2].traceIndex = 1;
+    report.pieces[2].pieceIndex = 1;
+    addMeasured(report, 0, 1, 0.0, -4.0);
+    addMeasured(report, 1, 3, 0.0, 0.5); // no ordinary graph flood
+    addMeasured(report, 0, 4, 1.0, 0.5); // parallel does not seed
+    addMeasured(report, 0, 5, 0.0, 0.5);
+    report.constraints.back().signedWindingDelta.reset(); // unknown is not zero
+    addMeasured(report, 0, 6, 0.0, 4.01); // outside inclusive scaled radius
+    const auto subset = selectFiberTraceReferenceNeighborhood(report, 1, 2.0, 0.5);
+    CHECK(subset.retainedPieceIndices == std::vector<std::size_t>{0, 1, 2});
+    REQUIRE(subset.report.constraints.size() == 1);
+    CHECK(subset.report.constraints[0].signedWindingDelta == -4.0);
+    CHECK(subset.report.pieces[1].traceIndex == subset.report.pieces[2].traceIndex);
+    CHECK(selectFiberTraceReferenceNeighborhood(report, 1, 1.99, 0.5)
+        .retainedPieceIndices == std::vector<std::size_t>{0});
+    CHECK(selectFiberTraceReferenceNeighborhood(report, 1, std::nullopt, 0.5)
+        .retainedPieceIndices.size() == 7);
+    CHECK_THROWS(selectFiberTraceReferenceNeighborhood(report, 1, -1.0, 0.5));
+    CHECK_THROWS(selectFiberTraceReferenceNeighborhood(report, 1, 2.0, 0.0));
 }
 
 TEST_CASE("Largest winding component honors cutoff and signed evidence")
@@ -4706,7 +5115,7 @@ TEST_CASE("Ceres winding recovers fractional state from a fixed source")
     REQUIRE(solved.solutionUsable);
     CHECK(solved.factorDiagnostics.size() == 1);
     CHECK(solved.incidentEffectiveConstraints ==
-          std::vector<std::size_t>{1, 1});
+          std::vector<double>{1, 1});
     CHECK(solved.states[1].horizontalness < 0.05);
     CHECK(solved.states[1].activity > 0.95);
     CHECK(solved.states[1].winding == doctest::Approx(0.5).epsilon(1.0e-4));
@@ -4990,6 +5399,13 @@ TEST_CASE("Conditioned inliers cover sign conflicts without deleting continuatio
     CHECK(extracted.mapWinding == std::vector<int>{0, 1});
     CHECK(extracted.factorDiagnostics.empty());
 
+    auto edgeDisabled = conditioned;
+    edgeDisabled.factorDiagnostics[2].measurementMapOff = true;
+    const auto offSelection = selectFiberTraceConditionedInliers(
+        constraints, baseline, edgeDisabled, referencePieces, inliers);
+    CHECK(offSelection.conflictCoverRemovedPieces == 0);
+    CHECK(offSelection.retainedOrdinaryPieceIndices == std::vector<std::size_t>{0, 1, 2});
+
     inliers.inlierSignConflictWeight = 0.0;
     CHECK_THROWS_AS(
         selectFiberTraceConditionedInliers(
@@ -5193,6 +5609,557 @@ TEST_CASE("Reference winding range retention validates its half-winding cohort")
         summarizeFiberTraceReferenceRangeBenchmark(
             report, calibration, 3, 0.0, 0.5),
         std::invalid_argument);
+}
+
+TEST_CASE("Independent reference ranking preserves weights and frozen observations")
+{
+    FiberTraceReferenceWindingObservation row;
+    row.exactWindingFactor = true;
+    row.bpEndpointActive = true;
+    row.bpEndpointOrientation = FiberTraceFixedOrientation::Horizontal;
+    row.admittedParallelCoefficient = 0.1;
+    row.signedParallelTarget = 1.0;
+    row.parallelMagnitudePresent = true;
+    row.parallelDistance = 1.0;
+    row.inferredReferenceWindings[0] = 1.0;
+    row.inferredReferenceWindingCount = 1;
+    auto strong = row;
+    strong.admittedParallelCoefficient = 4.0;
+    strong.signedParallelTarget = 3.0;
+    strong.inferredReferenceWindings[0] = 3.0;
+    std::vector observations{row, strong};
+    const FiberTraceReferenceWindingBenchmark calibration;
+    const auto ranked = rankFiberTraceIndependentReferenceWindings(observations, calibration, 1);
+    REQUIRE(ranked.size() == 1);
+    REQUIRE(ranked[0].candidates.size() == 5);
+    CHECK(ranked[0].candidates[0].rawWinding == 3.0);
+    CHECK(ranked[0].candidates[0].finiteLoss == doctest::Approx(0.2));
+    CHECK(ranked[0].bestTies == 1);
+    CHECK(ranked[0].candidates[0].satisfiedObservations == 1);
+    CHECK(ranked[0].candidates[0].violatedObservations == 1);
+    CHECK(observations[0].admittedParallelCoefficient == 0.1);
+    CHECK(observations[1].signedParallelTarget == 3.0);
+    CHECK_FALSE(ranked[0].lowerUnboundedBest);
+    CHECK_FALSE(ranked[0].upperUnboundedBest);
+    auto shifted = calibration;
+    shifted.globalSign = -1;
+    shifted.gauges.push_back({0, 2.0, 0, 0});
+    const auto aligned = rankFiberTraceIndependentReferenceWindings(observations, shifted, 1);
+    CHECK(aligned[0].candidates[0].rawWinding == 3.0);
+    CHECK(aligned[0].candidates[0].winding == -1.0);
+    CHECK(aligned[0].candidates[0].finiteLoss == ranked[0].candidates[0].finiteLoss);
+    const auto preserved = calibrateFiberTraceReferenceWindings(observations, 0.5, true);
+    REQUIRE(preserved.references[0].rawEstimatedWinding);
+    CHECK(*preserved.references[0].rawEstimatedWinding == 3.0);
+}
+
+TEST_CASE("Independent reference hard signs expose contradictions and unbounded ties")
+{
+    FiberTraceReferenceWindingObservation row;
+    row.exactWindingFactor = true;
+    row.bpEndpointActive = true;
+    row.bpEndpointOrientation = FiberTraceFixedOrientation::Horizontal;
+    row.rawCoefficient = row.admittedCoefficient = 0.0;
+    row.hardParallelSign = true;
+    row.signedParallelTarget = 1.0;
+    const FiberTraceReferenceWindingBenchmark calibration;
+    auto ranked = rankFiberTraceIndependentReferenceWindings(std::vector{row}, calibration, 1);
+    CHECK(ranked[0].candidates[0].hardViolations == 0);
+    CHECK(ranked[0].candidates[0].rawWinding == 0.5);
+    CHECK(ranked[0].bestTies == 4);
+    CHECK(ranked[0].upperUnboundedBest);
+    CHECK(ranked[0].upperUnboundedFeasible);
+    CHECK_FALSE(ranked[0].lowerUnboundedFeasible);
+    auto opposite = row;
+    opposite.signedParallelTarget = -1.0;
+    ranked = rankFiberTraceIndependentReferenceWindings(std::vector{row, opposite}, calibration, 1);
+    CHECK(ranked[0].candidates[0].hardViolations == 1);
+    CHECK(ranked[0].candidates[0].finiteLoss == 0.0);
+    CHECK(ranked[0].bestTies == 8);
+    CHECK(ranked[0].lowerUnboundedBest);
+    CHECK(ranked[0].upperUnboundedBest);
+    CHECK_FALSE(ranked[0].lowerUnboundedFeasible);
+    CHECK_FALSE(ranked[0].upperUnboundedFeasible);
+}
+
+TEST_CASE("Independent reference ranking ignores inactive and zero evidence and separates gauges")
+{
+    FiberTraceReferenceWindingObservation row;
+    row.exactWindingFactor = true;
+    row.bpEndpointActive = true;
+    row.bpEndpointOrientation = FiberTraceFixedOrientation::Horizontal;
+    row.parallelMagnitudePresent = true;
+    row.parallelDistance = 100.0;
+    row.rawCoefficient = row.admittedCoefficient = 0.0;
+    auto inactive = row;
+    inactive.bpEndpointActive = false;
+    inactive.admittedParallelCoefficient = 100.0;
+    const FiberTraceReferenceWindingBenchmark calibration;
+    auto ranked = rankFiberTraceIndependentReferenceWindings(std::vector{row, inactive}, calibration, 2);
+    REQUIRE(ranked.size() == 2);
+    CHECK(ranked[0].candidates.empty());
+    CHECK(ranked[0].ignoredZeroWeight == 1);
+    CHECK(ranked[0].excludedInactive == 1);
+    CHECK(ranked[1].observations == 0);
+    CHECK(ranked[1].candidates.empty());
+    row.admittedParallelCoefficient = 1.0;
+    row.parallelDistance = 1.0;
+    auto other = row;
+    other.integerGauge = 1;
+    other.bpLatentCoordinate = 20.0;
+    ranked = rankFiberTraceIndependentReferenceWindings(std::vector{row, other}, calibration, 1);
+    REQUIRE(ranked.size() == 2);
+    CHECK(ranked[0].bestTies == 2);
+    CHECK(ranked[0].candidates[0].rawWinding == -1.0);
+    CHECK(ranked[0].candidates[1].rawWinding == 1.0);
+    CHECK(ranked[1].candidates[0].rawWinding == 19.0);
+}
+
+TEST_CASE("Winding defect multipliers preserve defaults and scale unary costs")
+{
+    const auto source = lines(2);
+    auto report = pieces(source.size());
+    addMeasured(report, 0, 1, 0.25, 0.30);
+    FiberTraceJointGridWindingConfig joint;
+    static_cast<FiberTraceWindingBeliefPropagationConfig&>(joint) = config();
+    joint.mixedUnaryCost = 0.7;
+    joint.fixedPhaseMagnitude = 0.5;
+    joint.fixedMeasurementScale = 1.0;
+    const std::vector<FiberTraceFixedOrientation> fixed(2, FiberTraceFixedOrientation::Horizontal);
+    for (bool fixedMode : {false, true}) {
+        const auto orientations = fixedMode ? fixed : std::vector<FiberTraceFixedOrientation>{};
+        const auto run = [&](const auto& r, const auto& c) {
+            return solveFiberTraceJointGridWindingBeliefPropagation(r, topology(source, r), c, {}, orientations);
+        };
+        const auto original = run(report, joint);
+        auto explicitOne = report;
+        for (auto& p : explicitOne.pieces) p.windingDefectCostMultiplier = 1.0;
+        const auto same = run(explicitOne, joint);
+        CHECK(same.mixedProbability == original.mixedProbability);
+        for (double factor : {0.5, 2.0}) {
+        auto scaled = report;
+        for (auto& p : scaled.pieces) p.windingDefectCostMultiplier = factor;
+        auto half = joint;
+        half.mixedUnaryCost *= factor;
+        const auto a = run(scaled, joint);
+        const auto b = run(report, half);
+        CHECK(a.mixedProbability == b.mixedProbability);
+        CHECK(a.decodedEnergy == doctest::Approx(b.decodedEnergy));
+        CHECK(a.windingValid == b.windingValid);
+        CHECK(a.mapWindingHypothesis == b.mapWindingHypothesis);
+        for (std::size_t i = 0; i < a.windingValid.size(); ++i)
+            if (a.windingValid[i])
+                CHECK(a.mapLatentCoordinate[i] == b.mapLatentCoordinate[i]);
+        }
+    }
+    report.pieces[0].windingDefectCostMultiplier = 0.2;
+    report.pieces[1].windingDefectCostMultiplier = 0.8;
+    const std::vector<std::size_t> retained{1};
+    const auto subset = subsetFiberTraceConstraintReport(report, retained);
+    CHECK(subset.report.pieces[0].windingDefectCostMultiplier == 0.8);
+    for (double invalid : {0.0, -1.0, std::numeric_limits<double>::infinity()}) {
+        report.pieces[0].windingDefectCostMultiplier = invalid;
+        CHECK_THROWS(solveFiberTraceJointGridWindingBeliefPropagation(report, topology(source, report), joint));
+    }
+}
+
+TEST_CASE("Length-based defect measure matches degree when calibrated equal")
+{
+    const auto source = lines(2);
+    auto report = pieces(2);
+    addMeasured(report, 0, 1, 0.25, 0.3);
+    FiberTraceJointGridWindingConfig joint;
+    static_cast<FiberTraceWindingBeliefPropagationConfig&>(joint) = config();
+    joint.fixedPhaseMagnitude = .5;
+    joint.fixedMeasurementScale = 1.;
+    joint.mixedUnaryCost = .7;
+    const std::vector fixed(2, FiberTraceFixedOrientation::Horizontal);
+    const auto control = solveFiberTraceJointGridWindingBeliefPropagation(report, topology(source, report), joint, {}, fixed);
+    for (auto& piece : report.pieces) {
+        piece.windingDefectLengthMeasure = 1.;
+        piece.windingDefectLengthBlend = 1.;
+    }
+    const auto same = solveFiberTraceJointGridWindingBeliefPropagation(report, topology(source, report), joint, {}, fixed);
+    CHECK(same.mixedProbability == control.mixedProbability);
+    CHECK(same.decodedEnergy == control.decodedEnergy);
+    report.pieces[0].windingDefectLengthBlend = 2.;
+    CHECK_THROWS(solveFiberTraceJointGridWindingBeliefPropagation(report, topology(source, report), joint, {}, fixed));
+}
+
+TEST_CASE("Measurement off alternative permits hard sign violation but never continuity")
+{
+    const auto source = lines(2);
+    auto report = pieces(2);
+    addMeasured(report, 0, 1, 0., .5);
+    FiberTraceJointGridWindingConfig joint;
+    static_cast<FiberTraceWindingBeliefPropagationConfig&>(joint) = config();
+    joint.fixedPhaseMagnitude = .5;
+    joint.fixedMeasurementScale = 1.;
+    const std::vector<FiberTraceFixedWindingState> fixed{
+        {true, FiberTraceFixedOrientation::Horizontal, 1, 1},
+        {true, FiberTraceFixedOrientation::Vertical, 0, 1}};
+    CHECK_THROWS(solveFiberTraceJointGridWindingBeliefPropagation(report, topology(source, report), joint, {}, {}, fixed));
+    joint.measurementDisableCost = 2.;
+    const auto result = solveFiberTraceJointGridWindingBeliefPropagation(report, topology(source, report), joint, {}, {}, fixed);
+    CHECK(result.windingValid == std::vector<unsigned char>{1, 1});
+    CHECK(result.measurementDisableMapOff == 1);
+    CHECK(result.measurementDisableConditionalPosteriorSum == doctest::Approx(1.));
+    CHECK(std::isfinite(result.decodedEnergy));
+    CHECK(result.decodedEnergy == doctest::Approx(2. + joint.temperature * std::log1p(std::exp(-2./joint.temperature))));
+    report.constraints[0].allowMeasurementDisable = false;
+    CHECK_THROWS(solveFiberTraceJointGridWindingBeliefPropagation(report, topology(source, report), joint, {}, {}, fixed));
+    report.constraints[0].allowMeasurementDisable = true;
+    report.constraints[0].hardContinuity = true;
+    CHECK_THROWS(solveFiberTraceJointGridWindingBeliefPropagation(report, topology(source, report), joint, {}, {}, fixed));
+}
+
+TEST_CASE("Continuation cuts retain active pieces and ordinary evidence on the same pair")
+{
+    const auto source = lines(2);
+    auto report = pieces(2);
+    addMeasured(report, 0, 1, 0., .5);
+    auto graph = topology(source, report);
+    // Exercise aggregation directly; the geometric extractor normally keeps
+    // ordinary and continuation measurements on different pairs.
+    graph.hardConstraintIndices.push_back(1);
+    FiberTraceConstraint continuation;
+    continuation.pieceA = 0; continuation.pieceB = 1;
+    continuation.hardContinuity = true; continuation.parallelScore = 1.;
+    continuation.signedWindingDelta = 0.;
+    report.constraints.push_back(continuation);
+    FiberTraceJointGridWindingConfig joint;
+    static_cast<FiberTraceWindingBeliefPropagationConfig&>(joint) = config();
+    joint.fixedPhaseMagnitude = .5; joint.fixedMeasurementScale = 1.;
+    const std::vector<FiberTraceFixedWindingState> fixed{
+        {true, FiberTraceFixedOrientation::Horizontal, 0, 1},
+        {true, FiberTraceFixedOrientation::Vertical, 0, 1}};
+    CHECK_THROWS(solveFiberTraceJointGridWindingBeliefPropagation(report, graph, joint, {}, {}, fixed));
+    joint.continuityCutCost = 2.;
+    const auto result = solveFiberTraceJointGridWindingBeliefPropagation(report, graph, joint, {}, {}, fixed);
+    CHECK(result.windingValid == std::vector<unsigned char>{1, 1});
+    CHECK(result.continuityMapCuts == 1);
+    CHECK(result.continuityCutEnergy == doctest::Approx(2.));
+    CHECK(result.decodedEnergy == doctest::Approx(2.));
+    CHECK(result.factorDiagnostics.back().continuityMapCut || result.factorDiagnostics.front().continuityMapCut);
+    // Cutting continuation must NOT disable the ordinary hard sign.
+    auto bad = fixed; bad[0].winding = 1;
+    CHECK_THROWS(solveFiberTraceJointGridWindingBeliefPropagation(report, graph, joint, {}, {}, bad));
+    joint.continuityCutCost = -1.;
+    CHECK_THROWS(solveFiberTraceJointGridWindingBeliefPropagation(report, graph, joint, {}, {}, fixed));
+}
+
+TEST_CASE("Decode repair uses normalized BP energy and preserves fixed states")
+{
+    const auto source=lines(3);
+    auto report=pieces(3);
+    auto graph=topology(source,report);
+    for(std::size_t i=0;i<2;++i) {
+        FiberTraceConstraint c;
+        c.pieceA=i; c.pieceB=i+1; c.parallelScore=1.; c.hardContinuity=true; c.signedWindingDelta=0.;
+        report.constraints.push_back(c); graph.hardConstraintIndices.push_back(i);
+    }
+    FiberTraceJointGridWindingConfig joint;
+    static_cast<FiberTraceWindingBeliefPropagationConfig&>(joint)=config();
+    joint.fixedPhaseMagnitude=.5; joint.fixedMeasurementScale=1.;
+    joint.continuityCutCost=2.; joint.continuityCostByDistance=true;
+    joint.temperature=.25; joint.orientationTemperature=2.; joint.mixedUnaryCost=5.;
+    joint.decodeRepairSweeps=5;
+    const std::vector<FiberTraceFixedWindingState> fixed{
+        {true,FiberTraceFixedOrientation::Horizontal,0,1},
+        {true,FiberTraceFixedOrientation::Horizontal,1,1},
+        {true,FiberTraceFixedOrientation::Horizontal,1,1}};
+    const auto result=solveFiberTraceJointGridWindingBeliefPropagation(report,graph,joint,{}, {}, fixed);
+    CHECK(result.decodeRepairChanges==0);
+    CHECK(result.decodeRepairObjectiveBefore==doctest::Approx(2./.25));
+    CHECK(result.decodeRepairObjectiveAfter==result.decodeRepairObjectiveBefore);
+    CHECK(result.mapWinding[0]==0); CHECK(result.mapWinding[1]==1); CHECK(result.windingValid[2]==1);
+}
+
+TEST_CASE("Decode repair chooses according to unequal BP temperatures rather than raw costs")
+{
+    const auto source=lines(2);
+    auto report=pieces(2);
+    addMeasured(report,0,1,1.,1.);
+    auto graph=topology(source,report);
+    FiberTraceConstraint c;
+    c.pieceA=0; c.pieceB=1; c.parallelScore=1.; c.hardContinuity=true; c.signedWindingDelta=0.;
+    report.constraints.push_back(c); graph.hardConstraintIndices.push_back(1);
+    FiberTraceJointGridWindingConfig joint;
+    static_cast<FiberTraceWindingBeliefPropagationConfig&>(joint)=config();
+    joint.fixedPhaseMagnitude=.5; joint.fixedMeasurementScale=1.;
+    joint.continuityCutCost=1.; joint.continuityCostByDistance=true;
+    joint.enforceParallelWindingSign=true; joint.mixedUnaryCost=1.5;
+    joint.hardSignMinimumNormalAlignment.reset();
+    joint.orientationTemperature=1.; joint.decodeRepairSweeps=5;
+    const std::vector<FiberTraceFixedOrientation> orientations(2,FiberTraceFixedOrientation::Horizontal);
+    const std::vector<FiberTraceFixedWindingState> fixed{
+        {true,FiberTraceFixedOrientation::Horizontal,0,1}, {}};
+    joint.temperature=.1;
+    const auto cold=solveFiberTraceJointGridWindingBeliefPropagation(report,graph,joint,{},orientations,fixed);
+    CHECK(cold.windingValid[1]==0);
+    joint.temperature=2.;
+    const auto warm=solveFiberTraceJointGridWindingBeliefPropagation(report,graph,joint,{},orientations,fixed);
+    CHECK(warm.windingValid[1]==1);
+    CHECK(warm.mapWinding[1]==1);
+}
+
+TEST_CASE("Decode repair restores projected pieces through valid winding changes")
+{
+    const auto source=lines(3);
+    auto report=pieces(3);
+    for(std::size_t i=0;i<2;++i) addMeasured(report,i,i+1,1.,1.);
+    // Shortcut magnitude disagrees with the three strictly ordered steps.
+    // The hard signs remain jointly feasible; the independent decode need not.
+    addMeasured(report,0,2,1.,1.);
+    for(int i=0;i<4;++i) addMeasured(report,0,1,1.,1.);
+    const auto graph=topology(source,report);
+    FiberTraceJointGridWindingConfig joint;
+    static_cast<FiberTraceWindingBeliefPropagationConfig&>(joint)=config();
+    joint.fixedPhaseMagnitude=.5; joint.fixedMeasurementScale=1.;
+    joint.enforceParallelWindingSign=true; joint.maximumMessageIterations=1;
+    joint.hardSignMinimumNormalAlignment.reset();
+    joint.mixedUnaryCost=100.;
+    const std::vector<FiberTraceFixedOrientation> orientations(3,FiberTraceFixedOrientation::Horizontal);
+    const std::vector<FiberTraceJointGridInitialState> initial;
+    const auto baseline=solveFiberTraceJointGridWindingBeliefPropagation(report,graph,joint,{},orientations,{},initial);
+    joint.decodeRepairSweeps=5;
+    const auto result=solveFiberTraceJointGridWindingBeliefPropagation(report,graph,joint,{},orientations,{},initial);
+    const auto repeat=solveFiberTraceJointGridWindingBeliefPropagation(report,graph,joint,{},orientations,{},initial);
+    CHECK(result.decodeRepairObjectiveAfter<=result.decodeRepairObjectiveBefore);
+    CHECK(result.decodeRepairRestored>0);
+    CHECK(result.mapWinding==repeat.mapWinding);
+    CHECK(result.windingValid==repeat.windingValid);
+    CHECK(result.classAProbability==baseline.classAProbability);
+    CHECK(result.mixedProbability==baseline.mixedProbability);
+    for(const auto& edge:report.constraints)
+        if(result.windingValid[edge.pieceA] && result.windingValid[edge.pieceB])
+            CHECK(result.mapWinding[edge.pieceB]>result.mapWinding[edge.pieceA]);
+}
+
+TEST_CASE("Synthetic continuation can be excluded from defect mass without losing pair factors")
+{
+    const auto source = lines(2);
+    auto report = pieces(2);
+    addMeasured(report, 0, 1, 0., .5);
+    auto graph = topology(source, report);
+    auto cfg = config();
+    cfg.continuityCutCost = 1.;
+    cfg.continuityCostByDistance = true;
+    cfg.includeContinuityInDefectMass = false;
+    const auto before = prepareFiberTraceWindingModel(report, graph, cfg);
+    FiberTraceConstraint c;
+    c.pieceA=0; c.pieceB=1; c.parallelScore=1.; c.hardContinuity=true; c.signedWindingDelta=0.;
+    report.constraints.push_back(c);
+    graph.hardConstraintIndices.push_back(1);
+    const auto after = prepareFiberTraceWindingModel(report, graph, cfg);
+    CHECK(after.incidentMeasurements == before.incidentMeasurements);
+    CHECK(after.incidentWindingMeasurements == before.incidentWindingMeasurements);
+    CHECK(after.edges.front().measurements.size() == before.edges.front().measurements.size()+1);
+    cfg.includeContinuityInDefectMass = true;
+    const auto legacy = prepareFiberTraceWindingModel(report, graph, cfg);
+    CHECK(legacy.incidentMeasurements.front() > after.incidentMeasurements.front());
+
+    // Continuation-only nodes explicitly have no data-derived defect mass.
+    report.constraints.erase(report.constraints.begin());
+    graph.hardConstraintIndices = {0};
+    graph.softConstraintIndices.clear();
+    cfg.includeContinuityInDefectMass = false;
+    const auto emptyMass = prepareFiberTraceWindingModel(report, graph, cfg);
+    CHECK(emptyMass.incidentMeasurements == std::vector<double>{0.,0.});
+    REQUIRE(emptyMass.edges.size() == 1);
+    // The prepass validates canonical adjacent pieces of one source trace.
+    report.pieces[0].endArcBaseVoxels=3.;
+    report.pieces[1].traceIndex=0; report.pieces[1].pieceIndex=1;
+    report.pieces[1].beginArcBaseVoxels=3.;
+    report.constraints[0].windingDistance=0.;
+    report.constraints[0].parallelWindingDistance=0.;
+    report.constraints[0].closestDistanceBaseVoxels=0.;
+    report.constraints[0].arcABaseVoxels=3.; report.constraints[0].arcBBaseVoxels=3.;
+    report.inputTraces=1;
+    const auto singleSource=lines(1);
+    FiberTraceBeliefPropagationConfig orientation;
+    orientation.mixedUnaryCost=2.;
+    orientation.cropMinimumBaseXYZ={-5.,-5.,-5.};
+    orientation.cropMaximumBaseXYZ={5.,5.,5.};
+    const auto withMass = solveFiberTraceMixedSumProduct(singleSource, report, orientation);
+    orientation.includeContinuityInDefectMass=false;
+    const auto withoutMass = solveFiberTraceMixedSumProduct(singleSource, report, orientation);
+    CHECK(withoutMass.mixedProbability[1] > withMass.mixedProbability[1]);
+    CHECK(withoutMass.factors == withMass.factors);
+}
+
+TEST_CASE("Distance continuation charges winding displacement without a cap")
+{
+    const auto source = lines(2);
+    auto report = pieces(2);
+    auto graph = topology(source, report);
+    FiberTraceConstraint c;
+    c.pieceA = 0; c.pieceB = 1; c.parallelScore = 1.; c.hardContinuity = true;
+    c.signedWindingDelta = 0.;
+    report.constraints.push_back(c);
+    graph.hardConstraintIndices.push_back(0);
+    FiberTraceJointGridWindingConfig joint;
+    static_cast<FiberTraceWindingBeliefPropagationConfig&>(joint) = config();
+    joint.fixedPhaseMagnitude = .5; joint.fixedMeasurementScale = 1.;
+    joint.continuityCostByDistance = true;
+    CHECK_THROWS(solveFiberTraceJointGridWindingBeliefPropagation(report, graph, joint));
+    joint.continuityCutCost = 2.;
+    for (const int sign : {-1, 1}) {
+        for (const int winding : {-3, 0, 1, 3}) {
+            for (const auto orientation : {FiberTraceFixedOrientation::Horizontal, FiberTraceFixedOrientation::Vertical}) {
+                const std::vector<FiberTraceFixedWindingState> fixed{
+                    {true, FiberTraceFixedOrientation::Horizontal, 0, sign},
+                    {true, orientation, winding, sign}};
+                const auto result = solveFiberTraceJointGridWindingBeliefPropagation(report, graph, joint, {}, {}, fixed);
+                const double delta = winding + (orientation == FiberTraceFixedOrientation::Vertical ? sign * .5 : 0.);
+                CHECK(result.decodedEnergy == doctest::Approx(2. * std::abs(delta)));
+                CHECK(result.continuityStepEnergy == doctest::Approx(2. * std::abs(delta)));
+                CHECK(result.continuityCutEnergy == 0.);
+                CHECK(result.continuityMapCuts == 0);
+                CHECK(result.continuityStepEligible == 1);
+                CHECK(result.continuityNonzeroSteps == (delta != 0.));
+                CHECK_FALSE(result.factorDiagnostics.front().continuityMapCut);
+            }
+        }
+    }
+    joint.mixedUnaryCost = 0.;
+    const std::vector<FiberTraceFixedOrientation> defect{
+        FiberTraceFixedOrientation::Horizontal, FiberTraceFixedOrientation::Mixed};
+    const auto result = solveFiberTraceJointGridWindingBeliefPropagation(report, graph, joint, {}, defect);
+    CHECK(result.decodedEnergy == 0.);
+    CHECK(result.continuityCutEnergy == 0.);
+}
+
+TEST_CASE("Free continuation cuts are exactly absent from the solver graph")
+{
+    const auto source = lines(2);
+    auto report = pieces(2);
+    addMeasured(report, 0, 1, 0., .5);
+    auto graph = topology(source, report);
+    FiberTraceJointGridWindingConfig joint;
+    static_cast<FiberTraceWindingBeliefPropagationConfig&>(joint) = config();
+    joint.fixedPhaseMagnitude = .5; joint.fixedMeasurementScale = 1.;
+    joint.mixedUnaryCost = .1;
+    const auto baseline = solveFiberTraceJointGridWindingBeliefPropagation(report, graph, joint);
+    FiberTraceConstraint continuation;
+    continuation.pieceA = 0; continuation.pieceB = 1;
+    continuation.hardContinuity = true; continuation.parallelScore = 1.;
+    continuation.signedWindingDelta = 0.;
+    report.constraints.push_back(continuation);
+    graph.hardConstraintIndices.push_back(1);
+    joint.continuityCutCost = 0.;
+    const auto result = solveFiberTraceJointGridWindingBeliefPropagation(report, graph, joint);
+    CHECK(result.mixedProbability == baseline.mixedProbability);
+    CHECK(result.classAProbability == baseline.classAProbability);
+    CHECK(result.mapWinding == baseline.mapWinding);
+    CHECK(result.decodedEnergy == baseline.decodedEnergy);
+    CHECK(result.retainedFactors == baseline.retainedFactors);
+    joint.continuityCostByDistance = true;
+    const auto zeroStep = solveFiberTraceJointGridWindingBeliefPropagation(report, graph, joint);
+    CHECK(zeroStep.mixedProbability == baseline.mixedProbability);
+    CHECK(zeroStep.mapWinding == baseline.mapWinding);
+    CHECK(zeroStep.retainedFactors == baseline.retainedFactors);
+    for (const auto& diagnostic : zeroStep.factorDiagnostics)
+        if (diagnostic.constraintIndex == 1)
+            CHECK(diagnostic.continuityMapCut);
+}
+
+TEST_CASE("Free cuts do not connect independent gauges and defects do not pay cut cost")
+{
+    const auto source = lines(2);
+    auto report = pieces(2);
+    auto graph = topology(source, report);
+    FiberTraceJointGridWindingConfig joint;
+    static_cast<FiberTraceWindingBeliefPropagationConfig&>(joint) = config();
+    joint.fixedPhaseMagnitude = .5; joint.fixedMeasurementScale = 1.;
+    const auto baseline = solveFiberTraceJointGridWindingBeliefPropagation(report, graph, joint);
+    FiberTraceConstraint c;
+    c.pieceA = 0; c.pieceB = 1; c.parallelScore = 1.; c.hardContinuity = true;
+    c.arcABaseVoxels = 3.; c.arcBBaseVoxels = 3.; c.signedWindingDelta = 0.;
+    report.constraints.push_back(c);
+    graph.hardConstraintIndices.push_back(0);
+    joint.continuityCutCost = 0.;
+    const auto free = solveFiberTraceJointGridWindingBeliefPropagation(report, graph, joint);
+    CHECK(free.connectedComponents == baseline.connectedComponents);
+    CHECK(free.gaugePieces == baseline.gaugePieces);
+    CHECK(free.mixedProbability == baseline.mixedProbability);
+    CHECK(free.decodedEnergy == baseline.decodedEnergy);
+    joint.continuityCutCost = 7.;
+    joint.mixedUnaryCost = 0.;
+    const std::vector<FiberTraceFixedOrientation> fixed{
+        FiberTraceFixedOrientation::Horizontal, FiberTraceFixedOrientation::Mixed};
+    const auto defect = solveFiberTraceJointGridWindingBeliefPropagation(report, graph, joint, {}, fixed);
+    CHECK(defect.continuityMapCuts == 0);
+    CHECK(defect.continuityCutEnergy == 0.);
+    CHECK(defect.decodedEnergy == 0.);
+}
+
+TEST_CASE("Local parallel certification rejects opposite signed side measurements")
+{
+    auto source=lines(2);
+    source[0].pointsBaseXYZ={{0,0,0},{1024,0,0}};
+    source[1].pointsBaseXYZ={{0,0,20},{1024,0,20}};
+    LasagnaNormalAlignmentField field;
+    field.lattice=makeLasagnaNormalLattice({-32,-32,-32},{1056,32,64},16.);
+    field.positionsBaseXYZ=field.lattice.positionsBaseXYZ;
+    field.nodeByLatticeSample.resize(field.positionsBaseXYZ.size());
+    std::iota(field.nodeByLatticeSample.begin(),field.nodeByLatticeSample.end(),0);
+    field.alignment.componentByNode.assign(field.positionsBaseXYZ.size(),0);
+    for(const auto& p:field.positionsBaseXYZ)
+        field.alignment.alignedNormals.push_back({0,0,p[0]<512?1.f:-1.f});
+    FiberTraceConstraintConfig cfg; cfg.localEvents=true; cfg.parallelThreads=2;
+    const auto r=extractFiberTraceConstraints(source,cfg,
+        [](const cv::Vec3d&,const cv::Vec3d&,double){return 1.;},{},{},&field);
+    CHECK(r.localRejectedConsistency>0);
+    CHECK(r.localTransitionCuts==2);
+    CHECK(r.signedWindingConstraints==r.constraints.size());
+    std::size_t ordinary=0;
+    for(const auto& c:r.constraints)if(!c.hardContinuity) {
+        ++ordinary; REQUIRE(c.signedWindingDelta.has_value());
+        CHECK((c.arcABaseVoxels<448. || c.arcABaseVoxels>=576.));
+        CHECK((*c.signedWindingDelta>0.)==(c.arcABaseVoxels<512.));
+    }
+    CHECK(ordinary>0);
+}
+
+TEST_CASE("Fractional evidence keeps finite winding energy and incidence sampling-invariant")
+{
+    const auto source=lines(2);
+    auto single=pieces(2);
+    addMeasured(single,0,1,1.,1.);
+    auto cfg=config();
+    cfg.enforceParallelWindingSign=true;
+    cfg.finiteSignInfringementCost=3.;
+    auto repeated=single;
+    repeated.constraints[0].evidenceWeight=.25;
+    repeated.constraints.resize(4,repeated.constraints[0]);
+    const auto a=prepareFiberTraceWindingModel(single,topology(source,single),cfg);
+    const auto b=prepareFiberTraceWindingModel(repeated,topology(source,repeated),cfg);
+    CHECK(a.incidentMeasurements==b.incidentMeasurements);
+    CHECK(a.incidentWindingMeasurements==b.incidentWindingMeasurements);
+    double weightA=0.,weightB=0.,signA=0.,signB=0.;
+    for(const auto& e:a.edges)for(const auto& m:e.measurements){weightA+=m.parallelConfidence;signA+=m.parallelSignPenalty;}
+    for(const auto& e:b.edges)for(const auto& m:e.measurements){weightB+=m.parallelConfidence;signB+=m.parallelSignPenalty;}
+    CHECK(weightA==doctest::Approx(weightB)); CHECK(signA==doctest::Approx(signB));
+}
+
+TEST_CASE("Explicit piece cuts preserve geometry with exact arc boundaries")
+{
+    auto source = lines(1);
+    source[0].pointsBaseXYZ = {{0.,0.,0.}, {1024.,0.,0.}};
+    FiberTraceConstraintConfig cfg;
+    cfg.extraPieceCutsBaseVoxels = {{400., 464.}};
+    const auto report = extractFiberTraceConstraints(source, cfg,
+        [](const cv::Vec3d&, const cv::Vec3d&, double) { return 0.; });
+    REQUIRE(!report.pieces.empty());
+    CHECK(report.pieces.front().beginArcBaseVoxels == 0.);
+    CHECK(report.pieces.back().endArcBaseVoxels == 1024.);
+    for (const auto& p : report.pieces)
+        for (double cut : cfg.extraPieceCutsBaseVoxels[0])
+            CHECK_FALSE(p.beginArcBaseVoxels < cut && p.endArcBaseVoxels > cut);
+    cfg.extraPieceCutsBaseVoxels = {{464.,400.}};
+    CHECK_THROWS(extractFiberTraceConstraints(source, cfg,
+        [](const cv::Vec3d&, const cv::Vec3d&, double) { return 0.; }));
 }
 
 }  // namespace

@@ -1,0 +1,2785 @@
+{
+  "baselines": [
+    {
+      "constraint_score_percent": -110.6766032555403,
+      "continuity": 4012,
+      "defect_percent": 15.596465390279823,
+      "exact_references": 26,
+      "independent_missing": 0,
+      "independent_percent": 38.46153846153846,
+      "ladder": [
+        {
+          "hard_sign_errors": "26",
+          "reference": "0",
+          "winding": "-0"
+        },
+        {
+          "hard_sign_errors": "15",
+          "reference": "0.5",
+          "winding": "0.5"
+        },
+        {
+          "hard_sign_errors": "1",
+          "reference": "1",
+          "winding": "1"
+        },
+        {
+          "hard_sign_errors": "13",
+          "reference": "1.5",
+          "winding": "1.5"
+        },
+        {
+          "hard_sign_errors": "13",
+          "reference": "2",
+          "winding": "2"
+        },
+        {
+          "hard_sign_errors": "24",
+          "reference": "2.5",
+          "winding": "1.5"
+        },
+        {
+          "hard_sign_errors": "0",
+          "reference": "3",
+          "winding": "2"
+        },
+        {
+          "hard_sign_errors": "0",
+          "reference": "3.5",
+          "winding": "2.5"
+        },
+        {
+          "hard_sign_errors": "0",
+          "reference": "4",
+          "winding": "4"
+        },
+        {
+          "hard_sign_errors": "0",
+          "reference": "4.5",
+          "winding": "4.5"
+        },
+        {
+          "hard_sign_errors": "15",
+          "reference": "5",
+          "winding": "5"
+        },
+        {
+          "hard_sign_errors": "21",
+          "reference": "5.5",
+          "winding": "5.5"
+        },
+        {
+          "hard_sign_errors": "27",
+          "reference": "6",
+          "winding": "6"
+        },
+        {
+          "hard_sign_errors": "3",
+          "reference": "6.5",
+          "winding": "5.5"
+        },
+        {
+          "hard_sign_errors": "0",
+          "reference": "7",
+          "winding": "6"
+        },
+        {
+          "hard_sign_errors": "35",
+          "reference": "7.5",
+          "winding": "6.5"
+        },
+        {
+          "hard_sign_errors": "8",
+          "reference": "8",
+          "winding": "6"
+        },
+        {
+          "hard_sign_errors": "0",
+          "reference": "8.5",
+          "winding": "6.5"
+        },
+        {
+          "hard_sign_errors": "28",
+          "reference": "9",
+          "winding": "7"
+        },
+        {
+          "hard_sign_errors": "0",
+          "reference": "9.5",
+          "winding": "6.5"
+        },
+        {
+          "hard_sign_errors": "6",
+          "reference": "10",
+          "winding": "7"
+        },
+        {
+          "hard_sign_errors": "7",
+          "reference": "10.5",
+          "winding": "7.5"
+        },
+        {
+          "hard_sign_errors": "0",
+          "reference": "11",
+          "winding": "8"
+        },
+        {
+          "hard_sign_errors": "0",
+          "reference": "11.5",
+          "winding": "9.5"
+        },
+        {
+          "hard_sign_errors": "23",
+          "reference": "12",
+          "winding": "10"
+        },
+        {
+          "hard_sign_errors": "6",
+          "reference": "12.5",
+          "winding": "9.5"
+        }
+      ],
+      "missing_references": 0,
+      "name": "legacy",
+      "ordinary": 157124,
+      "orthogonal": 95529,
+      "parallel": 61595,
+      "parallel_evidence_mass": 61595.0,
+      "pieces": 6790,
+      "problematic_unique_constraints": 84651,
+      "provenance": {
+        "binary_sha256": "23b4549288d9bd405dcc437289106fadeb69225b1ecbfb4eccf3e2d6fbb1388c",
+        "build_type": "RelWithDebInfo",
+        "command": [
+          "/home/hendrik/villa2/volume-cartographer/build/fiber-evaluation/bin/vc_fiber_trace_chunk",
+          "direction-ablation",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr",
+          "--normal-manifest",
+          "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json",
+          "--output",
+          "/ephemeral/hendrik/fiber_crop_bench/20260927_local_events_v1/legacy",
+          "--direction-dominance",
+          "0.9",
+          "--piece-length",
+          "512",
+          "--bp-only",
+          "--bp-inference",
+          "sum-product-mixed",
+          "--winding-fixed-orientation",
+          "--reference-prune-offenders",
+          "--reference-prune-policy",
+          "oracle-inliers",
+          "--reference-oracle-magnitude-weight",
+          "1",
+          "--reference-oracle-accept-message-limit",
+          "--reference-oracle-rounds",
+          "1",
+          "--reference-fiber-dir",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2",
+          "--reference-fiber-tag",
+          "hendrik_crop1",
+          "--threads",
+          "64",
+          "--winding-weights",
+          "0,0,0,0.1,0",
+          "--winding-sign-weights",
+          "1,0",
+          "--winding-hard-signs",
+          "perpendicular",
+          "--winding-sign-cost",
+          "hard",
+          "--winding-hard-sign-angle",
+          "off",
+          "--winding-max-candidate-states",
+          "32000000",
+          "--reference-initial-readout"
+        ],
+        "inputs": {
+          "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd1-7ff0ce6c/artifacts/PHercParis4-20260411134726-las-sd1-7ff0ce6c.lasagna.json": "293cf8cb76bf07e621d3eab401904114e374225d3932f960b7a0d3d550594755",
+          "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json": "e18d1074759ef6db32538963ab13b9071dc8af334af7d991bbf77442e58453ff"
+        },
+        "references": {
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T064452831_000002.json": "d17ad691e02a8a476300ac0ff56cc5a6244d34f89f683ed273ff39c5dc138726",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T064812002_000003.json": "2f4af3d2ba2b4ea6ca4111bcb87ab8d585d68dc7391bea0cb7f8e945fcaecc45",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T065143381_000004.json": "5e5626d31c03d4fd8f510f8eb637e5df740a4a84999e0ebd4994bd0fc05fd26a",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T065643794_000005.json": "904711cb839c5e1d4a80c35009348d1dcb945975658904f976b68dd3009c15bd",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T072253909_000006.json": "066bce1b199be6ae740378409c0c7ee4e2ae15ca7f9095190fb6d8e5d0a28028",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T072717899_000007.json": "fe0ae2ad23db46f9ebea752e2e229427ccb932bbdec2bda12f2b54ff3f3628ff",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T073017594_000008.json": "19c0ae145078fd5553bb6c80353996ef8d02b167bc18d7b46eb13bc13dd0fd0a",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T074703971_000009.json": "70ba5ab35fc08d046eb20eb9a5ba12adeac0e56a984800d8363ab185b49bcb21",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T102631471_000010.json": "0f0d290ecc32d42b53829518bd68fac99ced7d202ac939866e3dd9c7c06bc336",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T105412524_000011.json": "3e91ed087f823690e8fb238e831270b7b432d5e1dc4e2520e934786e121f51b8",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T105602115_000012.json": "9df341a1a61d2be410648e0da2f1d53e59a5b989462af61ed3826b51506fd6fe",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160540656_000013.json": "106141ae627655102ca2cc4aba6039555d750932f05b996aa2e3056bbb04dae4",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160642323_000014.json": "8995247d04c62f7f421f20d3973fe907d159cf15a8bcfc52d45e8a47f686a3b4",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160716356_000015.json": "3f870c22039b77becd8945fb7d38378a360f7bd7d2bcc816272dfd596973622c",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160812289_000016.json": "9c6a41b3454a04a37adc2a3dd4aa9ea9806525f481420358f8c12bdcccd1fdeb",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T161032692_000017.json": "67918572c79cc166da81172a3e24ed01d78e8b471bc2c8d583a25a51c2a10df1",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T161219869_000018.json": "14ebb8e782fdadb8734af5f67948a9bdbe58f5089e1b46f66d37e0aeb1587b9d",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162005620_000019.json": "6461910faa5c12b9a1ffd1dceac24c5ed9626fab66914278e0097e68c56f8656",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162100631_000020.json": "0912f1593746e92dbf6ab7a50b183faab0765074fac86a7c3309e2ef66c64608",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162112825_000021.json": "6a0ffd62111ad098b4054a6fe71c9ac43dd96681ffef29a9d7927834311680cf",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162212264_000022.json": "2b222c9aecc1e03d0d61f7877b9b6ab0b329a442bf55d82ea24f4d28620f174b",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162324568_000023.json": "6a10d1044fc1ec1c487a3ba2e7a3f73cf05538ccda970d226c4fa02333d83283",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162413303_000024.json": "2fe404f9fd7eff16f4f6f0033e8d0ca598581bc0153107b8c8c6ac19b24b6465",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162425442_000025.json": "9c77b0839564818a7548380419ca8912e3753513afccfb515633eed8fe2a1af1",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162507413_000026.json": "17da40bd53a5de5f4b87a6a4e3014336cf2c0d8e6b9123236e427f46dda591e4",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162541128_000027.json": "99e51aad66cae4480d0013b6744523133c819da07fe68da11177544b372adb15"
+        },
+        "repetitions": 1,
+        "returncode": 0,
+        "revision": "ccbc6b21b28f4a635d8e92ff2deec07cbb21dafd",
+        "shared_libraries": {
+          "/home/hendrik/villa2/volume-cartographer/build/fiber-evaluation/core/libvc_fiber_tracer.so": "1d4a877bdf7d30bfd6a7be593a573c2b73da0c2aa2f37999a8bd3a735f6a7373"
+        },
+        "started_utc": "2026-09-27T14:42:01Z",
+        "wall_seconds": 263.4160727580311
+      },
+      "reference_score_percent": 100.0,
+      "retained_fulfilled_unique_constraints": 76485,
+      "wall_seconds": 263.4160727580311,
+      "wrong_references": 0
+    },
+    {
+      "constraint_score_percent": -90.50157920662977,
+      "continuity": 61049,
+      "defect_percent": 3.816684454497666,
+      "exact_references": 15,
+      "extraction": {
+        "consistency_rejected": 521744,
+        "constraints": 70927,
+        "continuity": 66073,
+        "midpoint_cuts": 58700,
+        "parallel_omitted": 0,
+        "pieces": 68851,
+        "refined": 36377,
+        "support_rejected": 48626,
+        "transition_cuts": 7838
+      },
+      "independent_missing": 0,
+      "independent_percent": 15.384615384615385,
+      "ladder": [
+        {
+          "hard_sign_errors": "57",
+          "reference": "0",
+          "winding": "3"
+        },
+        {
+          "hard_sign_errors": "46",
+          "reference": "0.5",
+          "winding": "4.5"
+        },
+        {
+          "hard_sign_errors": "35",
+          "reference": "1",
+          "winding": "3"
+        },
+        {
+          "hard_sign_errors": "55",
+          "reference": "1.5",
+          "winding": "1.5"
+        },
+        {
+          "hard_sign_errors": "57",
+          "reference": "2",
+          "winding": "2"
+        },
+        {
+          "hard_sign_errors": "67",
+          "reference": "2.5",
+          "winding": "2.5"
+        },
+        {
+          "hard_sign_errors": "93",
+          "reference": "3",
+          "winding": "4"
+        },
+        {
+          "hard_sign_errors": "66",
+          "reference": "3.5",
+          "winding": "3.5"
+        },
+        {
+          "hard_sign_errors": "115",
+          "reference": "4",
+          "winding": "2"
+        },
+        {
+          "hard_sign_errors": "77",
+          "reference": "4.5",
+          "winding": "-1"
+        },
+        {
+          "hard_sign_errors": "90",
+          "reference": "5",
+          "winding": "4"
+        },
+        {
+          "hard_sign_errors": "74",
+          "reference": "5.5",
+          "winding": "-1"
+        },
+        {
+          "hard_sign_errors": "100",
+          "reference": "6",
+          "winding": "0"
+        },
+        {
+          "hard_sign_errors": "86",
+          "reference": "6.5",
+          "winding": "1.5"
+        },
+        {
+          "hard_sign_errors": "93",
+          "reference": "7",
+          "winding": "4"
+        },
+        {
+          "hard_sign_errors": "66",
+          "reference": "7.5",
+          "winding": "1.5"
+        },
+        {
+          "hard_sign_errors": "120",
+          "reference": "8",
+          "winding": "2"
+        },
+        {
+          "hard_sign_errors": "95",
+          "reference": "8.5",
+          "winding": "1.5"
+        },
+        {
+          "hard_sign_errors": "70",
+          "reference": "9",
+          "winding": "-1"
+        },
+        {
+          "hard_sign_errors": "108",
+          "reference": "9.5",
+          "winding": "0.5"
+        },
+        {
+          "hard_sign_errors": "42",
+          "reference": "10",
+          "winding": "0.5"
+        },
+        {
+          "hard_sign_errors": "84",
+          "reference": "10.5",
+          "winding": "3.5"
+        },
+        {
+          "hard_sign_errors": "43",
+          "reference": "11",
+          "winding": "4"
+        },
+        {
+          "hard_sign_errors": "86",
+          "reference": "11.5",
+          "winding": "2.5"
+        },
+        {
+          "hard_sign_errors": "26",
+          "reference": "12",
+          "winding": "2"
+        },
+        {
+          "hard_sign_errors": "59",
+          "reference": "12.5",
+          "winding": "2.5"
+        }
+      ],
+      "missing_references": 0,
+      "name": "local-parallel",
+      "ordinary": 4627,
+      "orthogonal": 4229,
+      "parallel": 398,
+      "parallel_evidence_mass": 129.68633336363058,
+      "piece_length_base_p5_p50_p95": [
+        1.0269060941525368,
+        22.804298857849062,
+        96.83913563732577
+      ],
+      "pieces": 62777,
+      "problematic_unique_constraints": 31233,
+      "provenance": {
+        "binary_sha256": "23b4549288d9bd405dcc437289106fadeb69225b1ecbfb4eccf3e2d6fbb1388c",
+        "build_type": "RelWithDebInfo",
+        "command": [
+          "/home/hendrik/villa2/volume-cartographer/build/fiber-evaluation/bin/vc_fiber_trace_chunk",
+          "direction-ablation",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr",
+          "--normal-manifest",
+          "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json",
+          "--output",
+          "/ephemeral/hendrik/fiber_crop_bench/20260927_local_events_v1/local-parallel",
+          "--direction-dominance",
+          "0.9",
+          "--piece-length",
+          "512",
+          "--bp-only",
+          "--bp-inference",
+          "sum-product-mixed",
+          "--winding-fixed-orientation",
+          "--reference-prune-offenders",
+          "--reference-prune-policy",
+          "oracle-inliers",
+          "--reference-oracle-magnitude-weight",
+          "1",
+          "--reference-oracle-accept-message-limit",
+          "--reference-oracle-rounds",
+          "1",
+          "--reference-fiber-dir",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2",
+          "--reference-fiber-tag",
+          "hendrik_crop1",
+          "--threads",
+          "64",
+          "--winding-weights",
+          "0,0,0,0.1,0",
+          "--winding-sign-weights",
+          "1,0",
+          "--winding-hard-signs",
+          "perpendicular",
+          "--winding-sign-cost",
+          "hard",
+          "--winding-hard-sign-angle",
+          "off",
+          "--winding-max-candidate-states",
+          "32000000",
+          "--reference-initial-readout",
+          "--local-constraint-events"
+        ],
+        "inputs": {
+          "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd1-7ff0ce6c/artifacts/PHercParis4-20260411134726-las-sd1-7ff0ce6c.lasagna.json": "293cf8cb76bf07e621d3eab401904114e374225d3932f960b7a0d3d550594755",
+          "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json": "e18d1074759ef6db32538963ab13b9071dc8af334af7d991bbf77442e58453ff"
+        },
+        "references": {
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T064452831_000002.json": "d17ad691e02a8a476300ac0ff56cc5a6244d34f89f683ed273ff39c5dc138726",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T064812002_000003.json": "2f4af3d2ba2b4ea6ca4111bcb87ab8d585d68dc7391bea0cb7f8e945fcaecc45",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T065143381_000004.json": "5e5626d31c03d4fd8f510f8eb637e5df740a4a84999e0ebd4994bd0fc05fd26a",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T065643794_000005.json": "904711cb839c5e1d4a80c35009348d1dcb945975658904f976b68dd3009c15bd",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T072253909_000006.json": "066bce1b199be6ae740378409c0c7ee4e2ae15ca7f9095190fb6d8e5d0a28028",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T072717899_000007.json": "fe0ae2ad23db46f9ebea752e2e229427ccb932bbdec2bda12f2b54ff3f3628ff",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T073017594_000008.json": "19c0ae145078fd5553bb6c80353996ef8d02b167bc18d7b46eb13bc13dd0fd0a",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T074703971_000009.json": "70ba5ab35fc08d046eb20eb9a5ba12adeac0e56a984800d8363ab185b49bcb21",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T102631471_000010.json": "0f0d290ecc32d42b53829518bd68fac99ced7d202ac939866e3dd9c7c06bc336",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T105412524_000011.json": "3e91ed087f823690e8fb238e831270b7b432d5e1dc4e2520e934786e121f51b8",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T105602115_000012.json": "9df341a1a61d2be410648e0da2f1d53e59a5b989462af61ed3826b51506fd6fe",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160540656_000013.json": "106141ae627655102ca2cc4aba6039555d750932f05b996aa2e3056bbb04dae4",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160642323_000014.json": "8995247d04c62f7f421f20d3973fe907d159cf15a8bcfc52d45e8a47f686a3b4",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160716356_000015.json": "3f870c22039b77becd8945fb7d38378a360f7bd7d2bcc816272dfd596973622c",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160812289_000016.json": "9c6a41b3454a04a37adc2a3dd4aa9ea9806525f481420358f8c12bdcccd1fdeb",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T161032692_000017.json": "67918572c79cc166da81172a3e24ed01d78e8b471bc2c8d583a25a51c2a10df1",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T161219869_000018.json": "14ebb8e782fdadb8734af5f67948a9bdbe58f5089e1b46f66d37e0aeb1587b9d",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162005620_000019.json": "6461910faa5c12b9a1ffd1dceac24c5ed9626fab66914278e0097e68c56f8656",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162100631_000020.json": "0912f1593746e92dbf6ab7a50b183faab0765074fac86a7c3309e2ef66c64608",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162112825_000021.json": "6a0ffd62111ad098b4054a6fe71c9ac43dd96681ffef29a9d7927834311680cf",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162212264_000022.json": "2b222c9aecc1e03d0d61f7877b9b6ab0b329a442bf55d82ea24f4d28620f174b",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162324568_000023.json": "6a10d1044fc1ec1c487a3ba2e7a3f73cf05538ccda970d226c4fa02333d83283",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162413303_000024.json": "2fe404f9fd7eff16f4f6f0033e8d0ca598581bc0153107b8c8c6ac19b24b6465",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162425442_000025.json": "9c77b0839564818a7548380419ca8912e3753513afccfb515633eed8fe2a1af1",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162507413_000026.json": "17da40bd53a5de5f4b87a6a4e3014336cf2c0d8e6b9123236e427f46dda591e4",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162541128_000027.json": "99e51aad66cae4480d0013b6744523133c819da07fe68da11177544b372adb15"
+        },
+        "repetitions": 1,
+        "returncode": 0,
+        "revision": "ccbc6b21b28f4a635d8e92ff2deec07cbb21dafd",
+        "shared_libraries": {
+          "/home/hendrik/villa2/volume-cartographer/build/fiber-evaluation/core/libvc_fiber_tracer.so": "1d4a877bdf7d30bfd6a7be593a573c2b73da0c2aa2f37999a8bd3a735f6a7373"
+        },
+        "started_utc": "2026-09-27T14:42:14Z",
+        "wall_seconds": 453.6539609389147
+      },
+      "reference_score_percent": 57.69230769230769,
+      "retained_fulfilled_unique_constraints": 34511,
+      "wall_seconds": 453.6539609389147,
+      "wrong_references": 11
+    },
+    {
+      "constraint_score_percent": -74.78732254515202,
+      "continuity": 60832,
+      "defect_percent": 3.7548554164868366,
+      "exact_references": 9,
+      "extraction": {
+        "consistency_rejected": 521744,
+        "constraints": 70418,
+        "continuity": 66073,
+        "midpoint_cuts": 58700,
+        "parallel_omitted": 542,
+        "pieces": 68851,
+        "refined": 36377,
+        "support_rejected": 48593,
+        "transition_cuts": 7838
+      },
+      "independent_missing": 0,
+      "independent_percent": 11.538461538461538,
+      "ladder": [
+        {
+          "hard_sign_errors": "58",
+          "reference": "0",
+          "winding": "5"
+        },
+        {
+          "hard_sign_errors": "43",
+          "reference": "0.5",
+          "winding": "2"
+        },
+        {
+          "hard_sign_errors": "33",
+          "reference": "1",
+          "winding": "4"
+        },
+        {
+          "hard_sign_errors": "46",
+          "reference": "1.5",
+          "winding": "5.5"
+        },
+        {
+          "hard_sign_errors": "74",
+          "reference": "2",
+          "winding": "1.5"
+        },
+        {
+          "hard_sign_errors": "72",
+          "reference": "2.5",
+          "winding": "2"
+        },
+        {
+          "hard_sign_errors": "91",
+          "reference": "3",
+          "winding": "1.5"
+        },
+        {
+          "hard_sign_errors": "66",
+          "reference": "3.5",
+          "winding": "1.5"
+        },
+        {
+          "hard_sign_errors": "109",
+          "reference": "4",
+          "winding": "5"
+        },
+        {
+          "hard_sign_errors": "77",
+          "reference": "4.5",
+          "winding": "6.5"
+        },
+        {
+          "hard_sign_errors": "69",
+          "reference": "5",
+          "winding": "5"
+        },
+        {
+          "hard_sign_errors": "73",
+          "reference": "5.5",
+          "winding": "5.5"
+        },
+        {
+          "hard_sign_errors": "99",
+          "reference": "6",
+          "winding": "6"
+        },
+        {
+          "hard_sign_errors": "68",
+          "reference": "6.5",
+          "winding": "5.5"
+        },
+        {
+          "hard_sign_errors": "91",
+          "reference": "7",
+          "winding": "1.5"
+        },
+        {
+          "hard_sign_errors": "67",
+          "reference": "7.5",
+          "winding": "5.5"
+        },
+        {
+          "hard_sign_errors": "120",
+          "reference": "8",
+          "winding": "1.5"
+        },
+        {
+          "hard_sign_errors": "95",
+          "reference": "8.5",
+          "winding": "5.5"
+        },
+        {
+          "hard_sign_errors": "71",
+          "reference": "9",
+          "winding": "6.5"
+        },
+        {
+          "hard_sign_errors": "108",
+          "reference": "9.5",
+          "winding": "5.5"
+        },
+        {
+          "hard_sign_errors": "42",
+          "reference": "10",
+          "winding": "6.5"
+        },
+        {
+          "hard_sign_errors": "84",
+          "reference": "10.5",
+          "winding": "1.5"
+        },
+        {
+          "hard_sign_errors": "44",
+          "reference": "11",
+          "winding": "1.5"
+        },
+        {
+          "hard_sign_errors": "87",
+          "reference": "11.5",
+          "winding": "1.5"
+        },
+        {
+          "hard_sign_errors": "25",
+          "reference": "12",
+          "winding": "5"
+        },
+        {
+          "hard_sign_errors": "78",
+          "reference": "12.5",
+          "winding": "4.5"
+        }
+      ],
+      "missing_references": 0,
+      "name": "local-orthogonal",
+      "ordinary": 4237,
+      "orthogonal": 4237,
+      "parallel": 0,
+      "parallel_evidence_mass": 0,
+      "piece_length_base_p5_p50_p95": [
+        1.0269060941525368,
+        22.804298857849062,
+        96.83913563732577
+      ],
+      "pieces": 62559,
+      "problematic_unique_constraints": 27868,
+      "provenance": {
+        "binary_sha256": "23b4549288d9bd405dcc437289106fadeb69225b1ecbfb4eccf3e2d6fbb1388c",
+        "build_type": "RelWithDebInfo",
+        "command": [
+          "/home/hendrik/villa2/volume-cartographer/build/fiber-evaluation/bin/vc_fiber_trace_chunk",
+          "direction-ablation",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr",
+          "--normal-manifest",
+          "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json",
+          "--output",
+          "/ephemeral/hendrik/fiber_crop_bench/20260927_local_events_v1/local-orthogonal",
+          "--direction-dominance",
+          "0.9",
+          "--piece-length",
+          "512",
+          "--bp-only",
+          "--bp-inference",
+          "sum-product-mixed",
+          "--winding-fixed-orientation",
+          "--reference-prune-offenders",
+          "--reference-prune-policy",
+          "oracle-inliers",
+          "--reference-oracle-magnitude-weight",
+          "1",
+          "--reference-oracle-accept-message-limit",
+          "--reference-oracle-rounds",
+          "1",
+          "--reference-fiber-dir",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2",
+          "--reference-fiber-tag",
+          "hendrik_crop1",
+          "--threads",
+          "64",
+          "--winding-weights",
+          "0,0,0,0.1,0",
+          "--winding-sign-weights",
+          "1,0",
+          "--winding-hard-signs",
+          "perpendicular",
+          "--winding-sign-cost",
+          "hard",
+          "--winding-hard-sign-angle",
+          "off",
+          "--winding-max-candidate-states",
+          "32000000",
+          "--reference-initial-readout",
+          "--local-constraint-events",
+          "--local-no-parallel"
+        ],
+        "inputs": {
+          "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd1-7ff0ce6c/artifacts/PHercParis4-20260411134726-las-sd1-7ff0ce6c.lasagna.json": "293cf8cb76bf07e621d3eab401904114e374225d3932f960b7a0d3d550594755",
+          "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json": "e18d1074759ef6db32538963ab13b9071dc8af334af7d991bbf77442e58453ff"
+        },
+        "references": {
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T064452831_000002.json": "d17ad691e02a8a476300ac0ff56cc5a6244d34f89f683ed273ff39c5dc138726",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T064812002_000003.json": "2f4af3d2ba2b4ea6ca4111bcb87ab8d585d68dc7391bea0cb7f8e945fcaecc45",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T065143381_000004.json": "5e5626d31c03d4fd8f510f8eb637e5df740a4a84999e0ebd4994bd0fc05fd26a",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T065643794_000005.json": "904711cb839c5e1d4a80c35009348d1dcb945975658904f976b68dd3009c15bd",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T072253909_000006.json": "066bce1b199be6ae740378409c0c7ee4e2ae15ca7f9095190fb6d8e5d0a28028",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T072717899_000007.json": "fe0ae2ad23db46f9ebea752e2e229427ccb932bbdec2bda12f2b54ff3f3628ff",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T073017594_000008.json": "19c0ae145078fd5553bb6c80353996ef8d02b167bc18d7b46eb13bc13dd0fd0a",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T074703971_000009.json": "70ba5ab35fc08d046eb20eb9a5ba12adeac0e56a984800d8363ab185b49bcb21",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T102631471_000010.json": "0f0d290ecc32d42b53829518bd68fac99ced7d202ac939866e3dd9c7c06bc336",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T105412524_000011.json": "3e91ed087f823690e8fb238e831270b7b432d5e1dc4e2520e934786e121f51b8",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T105602115_000012.json": "9df341a1a61d2be410648e0da2f1d53e59a5b989462af61ed3826b51506fd6fe",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160540656_000013.json": "106141ae627655102ca2cc4aba6039555d750932f05b996aa2e3056bbb04dae4",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160642323_000014.json": "8995247d04c62f7f421f20d3973fe907d159cf15a8bcfc52d45e8a47f686a3b4",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160716356_000015.json": "3f870c22039b77becd8945fb7d38378a360f7bd7d2bcc816272dfd596973622c",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160812289_000016.json": "9c6a41b3454a04a37adc2a3dd4aa9ea9806525f481420358f8c12bdcccd1fdeb",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T161032692_000017.json": "67918572c79cc166da81172a3e24ed01d78e8b471bc2c8d583a25a51c2a10df1",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T161219869_000018.json": "14ebb8e782fdadb8734af5f67948a9bdbe58f5089e1b46f66d37e0aeb1587b9d",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162005620_000019.json": "6461910faa5c12b9a1ffd1dceac24c5ed9626fab66914278e0097e68c56f8656",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162100631_000020.json": "0912f1593746e92dbf6ab7a50b183faab0765074fac86a7c3309e2ef66c64608",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162112825_000021.json": "6a0ffd62111ad098b4054a6fe71c9ac43dd96681ffef29a9d7927834311680cf",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162212264_000022.json": "2b222c9aecc1e03d0d61f7877b9b6ab0b329a442bf55d82ea24f4d28620f174b",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162324568_000023.json": "6a10d1044fc1ec1c487a3ba2e7a3f73cf05538ccda970d226c4fa02333d83283",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162413303_000024.json": "2fe404f9fd7eff16f4f6f0033e8d0ca598581bc0153107b8c8c6ac19b24b6465",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162425442_000025.json": "9c77b0839564818a7548380419ca8912e3753513afccfb515633eed8fe2a1af1",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162507413_000026.json": "17da40bd53a5de5f4b87a6a4e3014336cf2c0d8e6b9123236e427f46dda591e4",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162541128_000027.json": "99e51aad66cae4480d0013b6744523133c819da07fe68da11177544b372adb15"
+        },
+        "repetitions": 1,
+        "returncode": 0,
+        "revision": "ccbc6b21b28f4a635d8e92ff2deec07cbb21dafd",
+        "shared_libraries": {
+          "/home/hendrik/villa2/volume-cartographer/build/fiber-evaluation/core/libvc_fiber_tracer.so": "1d4a877bdf7d30bfd6a7be593a573c2b73da0c2aa2f37999a8bd3a735f6a7373"
+        },
+        "started_utc": "2026-09-27T14:42:15Z",
+        "wall_seconds": 318.16448288806714
+      },
+      "reference_score_percent": 34.61538461538461,
+      "retained_fulfilled_unique_constraints": 37263,
+      "wall_seconds": 318.16448288806714,
+      "wrong_references": 17
+    }
+  ],
+  "complete": true,
+  "historical_control_checks": {},
+  "results": [
+    {
+      "artifact_root": "/ephemeral/hendrik/fiber_crop_bench/20260927_local_step_costs_v1",
+      "constraint_score_percent": -986.1346633416459,
+      "cut": 0.1,
+      "cut_reports": [
+        {
+          "cut_percent": 19.331519244639697,
+          "cuts": 11793,
+          "eligible": 61004,
+          "energy": 989.95
+        }
+      ],
+      "defect": 10,
+      "defect_percent": 0.0,
+      "distance_cost": true,
+      "event_audit": {
+        "maximum_event_groups": 1,
+        "maximum_orthogonal_factors": 5,
+        "multiple_event_pieces": 0,
+        "multiple_orthogonal_factor_pieces": 521,
+        "pieces_with_orthogonal_events": 8042
+      },
+      "exact_references": 9,
+      "geometry_sha256": "0c61e47e8384b784a20dd54922b4255b4a00d5a669a26dd473626ee152549572",
+      "independent_missing": 0,
+      "independent_percent": 7.6923076923076925,
+      "initial_readout_status": [
+        "converged"
+      ],
+      "ladder": [
+        {
+          "hard_sign_errors": "60",
+          "reference": "0",
+          "winding": "8"
+        },
+        {
+          "hard_sign_errors": "44",
+          "reference": "0.5",
+          "winding": "10.5"
+        },
+        {
+          "hard_sign_errors": "49",
+          "reference": "1",
+          "winding": "10.5"
+        },
+        {
+          "hard_sign_errors": "73",
+          "reference": "1.5",
+          "winding": "8"
+        },
+        {
+          "hard_sign_errors": "73",
+          "reference": "2",
+          "winding": "9.5"
+        },
+        {
+          "hard_sign_errors": "74",
+          "reference": "2.5",
+          "winding": "10.5"
+        },
+        {
+          "hard_sign_errors": "93",
+          "reference": "3",
+          "winding": "9.5"
+        },
+        {
+          "hard_sign_errors": "67",
+          "reference": "3.5",
+          "winding": "10.5"
+        },
+        {
+          "hard_sign_errors": "122",
+          "reference": "4",
+          "winding": "4.5"
+        },
+        {
+          "hard_sign_errors": "82",
+          "reference": "4.5",
+          "winding": "5.5"
+        },
+        {
+          "hard_sign_errors": "90",
+          "reference": "5",
+          "winding": "9.5"
+        },
+        {
+          "hard_sign_errors": "74",
+          "reference": "5.5",
+          "winding": "8"
+        },
+        {
+          "hard_sign_errors": "104",
+          "reference": "6",
+          "winding": "5.5"
+        },
+        {
+          "hard_sign_errors": "94",
+          "reference": "6.5",
+          "winding": "8"
+        },
+        {
+          "hard_sign_errors": "98",
+          "reference": "7",
+          "winding": "10.5"
+        },
+        {
+          "hard_sign_errors": "78",
+          "reference": "7.5",
+          "winding": "5.5"
+        },
+        {
+          "hard_sign_errors": "121",
+          "reference": "8",
+          "winding": "8"
+        },
+        {
+          "hard_sign_errors": "118",
+          "reference": "8.5",
+          "winding": "8"
+        },
+        {
+          "hard_sign_errors": "76",
+          "reference": "9",
+          "winding": "5.5"
+        },
+        {
+          "hard_sign_errors": "102",
+          "reference": "9.5",
+          "winding": "8"
+        },
+        {
+          "hard_sign_errors": "33",
+          "reference": "10",
+          "winding": "8"
+        },
+        {
+          "hard_sign_errors": "85",
+          "reference": "10.5",
+          "winding": "10.5"
+        },
+        {
+          "hard_sign_errors": "44",
+          "reference": "11",
+          "winding": "10.5"
+        },
+        {
+          "hard_sign_errors": "90",
+          "reference": "11.5",
+          "winding": "10.5"
+        },
+        {
+          "hard_sign_errors": "41",
+          "reference": "12",
+          "winding": "9.5"
+        },
+        {
+          "hard_sign_errors": "80",
+          "reference": "12.5",
+          "winding": "9.5"
+        }
+      ],
+      "ladder_shift_percent": 3.8461538461538436,
+      "ladder_shifts": 25,
+      "missing_references": 0,
+      "name": "orthogonal-d10-c0p1-distance",
+      "parallel": false,
+      "problematic_unique_constraints": 59316,
+      "provenance": {
+        "binary_sha256": "7e12b3ad9571a425057dc96a8ea1a36c5c4b070d5b9f9e07b45e255f621fdc71",
+        "build_type": "RelWithDebInfo",
+        "command": [
+          "/home/hendrik/villa2/volume-cartographer/build/fiber-evaluation/bin/vc_fiber_trace_chunk",
+          "direction-ablation",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr",
+          "--normal-manifest",
+          "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json",
+          "--output",
+          "/ephemeral/hendrik/fiber_crop_bench/20260927_local_step_costs_v1/orthogonal-d10-c0p1-distance",
+          "--direction-dominance",
+          "0.9",
+          "--piece-length",
+          "512",
+          "--bp-only",
+          "--bp-inference",
+          "sum-product-mixed",
+          "--reference-prune-offenders",
+          "--reference-prune-policy",
+          "oracle-inliers",
+          "--reference-oracle-magnitude-weight",
+          "1",
+          "--reference-oracle-accept-message-limit",
+          "--reference-oracle-rounds",
+          "1",
+          "--reference-fiber-dir",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2",
+          "--reference-fiber-tag",
+          "hendrik_crop1",
+          "--threads",
+          "48",
+          "--winding-weights",
+          "0,0,0,0.1,0",
+          "--winding-sign-weights",
+          "1,0",
+          "--winding-hard-signs",
+          "perpendicular",
+          "--winding-sign-cost",
+          "hard",
+          "--winding-hard-sign-angle",
+          "off",
+          "--winding-max-candidate-states",
+          "32000000",
+          "--reference-initial-readout",
+          "--local-constraint-events",
+          "--winding-defect-cost",
+          "10",
+          "--winding-continuity-step-cost",
+          "0.1",
+          "--local-no-parallel"
+        ],
+        "inputs": {
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/.zattrs": "7db3db753ab26d4e3c2a9e9e738dba64b6400dc0d6032d8425838d40bcb903a3",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/.zgroup": "e1e1914ae531ecb50e1ead685ef01895a5452faf5f25f35cd78f1f5de1367470",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/.zarray": "14308c8b8fb9b5048f0ffe462fe88a20c45bc845bafac9674e9f0970fe423b24",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.0.0": "3351c8be12da158c6e5aabf49c53bfbcbddc0e495b4f2264f567cfe1dedca5cc",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.0.1": "4a5b6688b4fbd84582471f5b32477e09ed41031a74917a36d005d9a2c987a19e",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.0.2": "56ba6b4cbb3de6cf29f6de6fc68ee4028a767d9aae296af8b33169008f307511",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.0.3": "d2d335641b054738106aa88394f2c0cabbae4d33f8294d177e39aa25e8254479",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.1.0": "7d2cc3cf7abe93932987c943e04e5584a1ba5dd17212eb0f61731baedce41a29",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.1.1": "d7937c817cef43e03aa8578ce8187a98969f959eefdb28622ead9478fcd6a112",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.1.2": "de7bb792fbed7943bf7655d9f71a5b8bdf89e57d1c67a7d9c61c8d6bcdbdc9bc",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.1.3": "6e2dafc73605f9dd3d62a20f2f833e254e8c417c01177229aca83c3381ebfcc8",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.2.0": "a30d87ce1ef47e941f645740df77b7de5912dea4f8d33f77659595e4068dec49",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.2.1": "a773eadcf7a1a8d090827dc74e331bb1a2a2aa2cf99d15818ac6c6364875283c",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.2.2": "8fafe8c3af01d23a5295c97e3b43bf26bc4a826bbf385ec971b8decd897aaaa9",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.2.3": "4408395331ac587431681add747c65317751ae942e0e889fb24887db19170fe5",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.3.0": "be9313a6f7d21513b726f41eb6971faddcad04a124bcc6d3d315f0e8fdea6a76",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.3.1": "9ac41c5e017c02976f52b289b9a7b8a96cdb55671e56126381e4cedb90b811a5",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.3.2": "96db9307e67d773c6881472d12982377ea24e00b9716482c80edc40b9ae02c15",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.3.3": "404e5cc28e6bd4b503ace3eb1941db7170579d64919b5c5e7f2e26eabceb7963",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.0.0": "c6d643465586c23429b8cd29710981320bb515f5ead0a51b562568227c95fbd9",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.0.1": "c7beedfb34e7b9257573db90845c1a6456d6120050cdb5d011c4dd136414f706",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.0.2": "85167dc49b58ed7880b00d2103589a2ce9ba2b217c9122d246aa15d488b360fb",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.0.3": "53a172af248a1e44dd3470677ea873e8f37b38b71daa29bbf133d72be782adf7",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.1.0": "ba2a4d7f6b6ab6a9721dd7a2730d4723fbb488bb44e5fbb0549e5a592ed96fd6",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.1.1": "a7688a34f9b3bd2e75884e57b74aee89889120dbc0040c17b8b028e73dd6355d",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.1.2": "818b335924b5dcdf3ef2dc3e17abc3c66efed3bcc2f6ae62551b7b0986769c7e",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.1.3": "ad202b8fccbf11fbdc92fb564634ad35bce35b27aad6809941873232aefbcaec",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.2.0": "4653c47f31be25cde47aacc5e68968d39dab45c4e9c869403b76b07fca1d4b39",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.2.1": "4a4e6b33d4839b27abb3ff64d03d725a551d0a3121f1c72df107e6702c3a8d7c",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.2.2": "95fe1ba3e5de86f90c4005ad5412d13c29f12dde26b9a1abe91084dd6b579c0d",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.2.3": "d244539642ea7fa57ebe440f9c9ea3f2ed43a3590a8cc7a3bfd8869013ae99cd",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.3.0": "24daca7a1583db451fd5c1e9a36dd3d54343df7d39ec5f2b837bc51484ee26f2",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.3.1": "19a01be4b17877819b9ea2732bb0f770defd95a1875206ad68fcd0fc5994d669",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.3.2": "96d060e4a47e7195145056d22fbf91531cbb307fb48a5d22d942220e77f3eb45",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.3.3": "f38e057e090029a9f2c658c05a94feda1cdd4a6c6b4275f218feec9d4b7a1cec",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.0.0": "627905528560f13aa15c3f8f8765b1da6facde4b06ce9a47216d80522d51540f",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.0.1": "aee5fdaf874e74e68a80516320cc2dd85cfcad3587849efe08fdd409610a22a3",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.0.2": "59c0cfe7f1f5df2b0bc3b75d2553d5cf8a09d0f0eaa37946dd96b9b6d379d50b",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.0.3": "9e0b6c58ff25c59c8942647f175dd059d912b3e26e52209a6a51bd75e6307755",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.1.0": "aad9d68b691b95a34ad702a130a938977eaafdcabd83ae5a639096f2f5eb8b72",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.1.1": "c26c4257988d1bb9dbebd4b4e074a5dd5bcabb3559626dd87c3f4f11288cf690",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.1.2": "8542b4d6a785e1ef82cd23b5a27e911cd153ee6e1655794c29870b06498db38c",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.1.3": "258bed12764e9f872015b7a8dcf857c638250dd6c47f5aa2a0ab742954d0319a",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.2.0": "2a474d67dcadfbcbeccb3f2d89eb076d5ceee12c912a3f96ed6722f86dbd1c9a",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.2.1": "c0357afe671bd0c12037b2e83ddb79f91da8160d2273f3f1aa97d217e0622e05",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.2.2": "ad7c74c5a589267a0f16368bca2212c9a44f65d4a93c1ae05fce0a6b3a50263c",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.2.3": "22c480c95d2aa36456482e7d210f4a45cf34ecc3aeb5672a152b9ee3d4ca7676",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.3.0": "e973b3afd4ff4d112edc56dfef849d781a2e4dbeea59696e924bea2744a76236",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.3.1": "68bd68b12d253f828dba605548f562a8ac60bdbefc813124958d2c372e1c26c4",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.3.2": "45b4431bc7081eb95bcd2ed76de286a4ba058e44113bfbd1d4b820d4d4126ae1",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.3.3": "d15e576f17ada9252dbf41434aed44265470ee49082b319fce0ffe377681da14",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.0.0": "fb5b405b2e75df7b2c5c2eec283919cf42fe924f902a8015f604cc23964c1621",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.0.1": "05b90ef588d079ebf4fa3760ea536e7006aec23645b655474afd2915ff78ed15",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.0.2": "cda4c9ad31a6d8d587d2f3878e69717c30e501444034e5f2bfd5e0da7d9a597d",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.0.3": "1bad7fc3be627a8a0dc33250c715cc80013c13ff654fb3a957765791ebb206b2",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.1.0": "d8f683e6f79164ea2320b48247530ac723191e97a1b1022eb61f6fb5789c5123",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.1.1": "60d959f9a0e52e5139cb88db307bb849bbecd01bda67e536cf547610c28e7809",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.1.2": "e66fe5be1799d3eef68546ae2f63bdc26f3e102dd79c75fe517945c4a596e183",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.1.3": "82e5bc5f5c9167b39b19efd60b0cc75e6282957d94ab49b13ace0aedb32bae34",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.2.0": "4e6ba52d921d6dae685ca2bc5aab84677a4004d306317710b4c6cead0e496535",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.2.1": "7be900b1fbc2ece8e150b49e88b5a100645897681d265af31383faa1f0c2a1b2",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.2.2": "21b4a70eb2d8fc2c9265619c3976ffdc094b4ccced704c103d20365d429400b2",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.2.3": "dd59ff60640f2d115f35c5cf8805b97542a7522e7a73742a76093a5f703f5e9b",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.3.0": "200c2eb93571df1ca59c7ba55b6ebb30127d4c8c2c5372b2a66f1e3291f3a437",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.3.1": "0ad09d98295d663df53dfcfab228a7e4d1b5dc06ec8b996aea69281b90168660",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.3.2": "0d777266d226aeb4167309b893cd9dc1ce07704e8abbe55ed3fe1ce66bb7c2b1",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.3.3": "9cc6861d640738b66bc79c319f66400b4a74cf2f5026da442c6d866327189fb9",
+          "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd1-7ff0ce6c/artifacts/PHercParis4-20260411134726-las-sd1-7ff0ce6c.lasagna.json": "293cf8cb76bf07e621d3eab401904114e374225d3932f960b7a0d3d550594755",
+          "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json": "e18d1074759ef6db32538963ab13b9071dc8af334af7d991bbf77442e58453ff"
+        },
+        "references": {
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T064452831_000002.json": "d17ad691e02a8a476300ac0ff56cc5a6244d34f89f683ed273ff39c5dc138726",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T064812002_000003.json": "2f4af3d2ba2b4ea6ca4111bcb87ab8d585d68dc7391bea0cb7f8e945fcaecc45",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T065143381_000004.json": "5e5626d31c03d4fd8f510f8eb637e5df740a4a84999e0ebd4994bd0fc05fd26a",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T065643794_000005.json": "904711cb839c5e1d4a80c35009348d1dcb945975658904f976b68dd3009c15bd",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T072253909_000006.json": "066bce1b199be6ae740378409c0c7ee4e2ae15ca7f9095190fb6d8e5d0a28028",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T072717899_000007.json": "fe0ae2ad23db46f9ebea752e2e229427ccb932bbdec2bda12f2b54ff3f3628ff",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T073017594_000008.json": "19c0ae145078fd5553bb6c80353996ef8d02b167bc18d7b46eb13bc13dd0fd0a",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T074703971_000009.json": "70ba5ab35fc08d046eb20eb9a5ba12adeac0e56a984800d8363ab185b49bcb21",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T102631471_000010.json": "0f0d290ecc32d42b53829518bd68fac99ced7d202ac939866e3dd9c7c06bc336",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T105412524_000011.json": "3e91ed087f823690e8fb238e831270b7b432d5e1dc4e2520e934786e121f51b8",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T105602115_000012.json": "9df341a1a61d2be410648e0da2f1d53e59a5b989462af61ed3826b51506fd6fe",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160540656_000013.json": "106141ae627655102ca2cc4aba6039555d750932f05b996aa2e3056bbb04dae4",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160642323_000014.json": "8995247d04c62f7f421f20d3973fe907d159cf15a8bcfc52d45e8a47f686a3b4",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160716356_000015.json": "3f870c22039b77becd8945fb7d38378a360f7bd7d2bcc816272dfd596973622c",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160812289_000016.json": "9c6a41b3454a04a37adc2a3dd4aa9ea9806525f481420358f8c12bdcccd1fdeb",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T161032692_000017.json": "67918572c79cc166da81172a3e24ed01d78e8b471bc2c8d583a25a51c2a10df1",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T161219869_000018.json": "14ebb8e782fdadb8734af5f67948a9bdbe58f5089e1b46f66d37e0aeb1587b9d",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162005620_000019.json": "6461910faa5c12b9a1ffd1dceac24c5ed9626fab66914278e0097e68c56f8656",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162100631_000020.json": "0912f1593746e92dbf6ab7a50b183faab0765074fac86a7c3309e2ef66c64608",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162112825_000021.json": "6a0ffd62111ad098b4054a6fe71c9ac43dd96681ffef29a9d7927834311680cf",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162212264_000022.json": "2b222c9aecc1e03d0d61f7877b9b6ab0b329a442bf55d82ea24f4d28620f174b",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162324568_000023.json": "6a10d1044fc1ec1c487a3ba2e7a3f73cf05538ccda970d226c4fa02333d83283",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162413303_000024.json": "2fe404f9fd7eff16f4f6f0033e8d0ca598581bc0153107b8c8c6ac19b24b6465",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162425442_000025.json": "9c77b0839564818a7548380419ca8912e3753513afccfb515633eed8fe2a1af1",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162507413_000026.json": "17da40bd53a5de5f4b87a6a4e3014336cf2c0d8e6b9123236e427f46dda591e4",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162541128_000027.json": "99e51aad66cae4480d0013b6744523133c819da07fe68da11177544b372adb15"
+        },
+        "repetitions": 1,
+        "returncode": 0,
+        "revision": "ccbc6b21b28f4a635d8e92ff2deec07cbb21dafd",
+        "shared_libraries": {
+          "/home/hendrik/villa2/volume-cartographer/build/fiber-evaluation/core/libvc_fiber_tracer.so": "81cd28e15817fd464d1c1742d82eff2a3e2b76ad5bca4f356ab69dd411239b88"
+        },
+        "started_utc": "2026-09-27T17:19:50Z",
+        "wall_seconds": 128.1458165140357
+      },
+      "reference_score_percent": 34.61538461538461,
+      "retained_fulfilled_unique_constraints": 6015,
+      "reused": false,
+      "status": "complete",
+      "wall_seconds": 128.1458165140357,
+      "winding_statuses": [
+        "converged"
+      ],
+      "wrong_references": 17
+    },
+    {
+      "artifact_root": "/ephemeral/hendrik/fiber_crop_bench/20260927_local_step_costs_v1",
+      "constraint_score_percent": -268.31097079715863,
+      "cut": 1,
+      "cut_reports": [
+        {
+          "cut_percent": 6.740356861716085,
+          "cuts": 4110,
+          "eligible": 60976,
+          "energy": 2608.0
+        }
+      ],
+      "defect": 10,
+      "defect_percent": 0.02549475764046018,
+      "distance_cost": true,
+      "event_audit": {
+        "maximum_event_groups": 1,
+        "maximum_orthogonal_factors": 5,
+        "multiple_event_pieces": 0,
+        "multiple_orthogonal_factor_pieces": 521,
+        "pieces_with_orthogonal_events": 8042
+      },
+      "exact_references": 11,
+      "geometry_sha256": "0c61e47e8384b784a20dd54922b4255b4a00d5a669a26dd473626ee152549572",
+      "independent_missing": 0,
+      "independent_percent": 11.538461538461538,
+      "initial_readout_status": [
+        "message_limit"
+      ],
+      "ladder": [
+        {
+          "hard_sign_errors": "64",
+          "reference": "0",
+          "winding": "8.5"
+        },
+        {
+          "hard_sign_errors": "44",
+          "reference": "0.5",
+          "winding": "2.5"
+        },
+        {
+          "hard_sign_errors": "49",
+          "reference": "1",
+          "winding": "2.5"
+        },
+        {
+          "hard_sign_errors": "68",
+          "reference": "1.5",
+          "winding": "5"
+        },
+        {
+          "hard_sign_errors": "75",
+          "reference": "2",
+          "winding": "2.5"
+        },
+        {
+          "hard_sign_errors": "74",
+          "reference": "2.5",
+          "winding": "2.5"
+        },
+        {
+          "hard_sign_errors": "90",
+          "reference": "3",
+          "winding": "5"
+        },
+        {
+          "hard_sign_errors": "67",
+          "reference": "3.5",
+          "winding": "2.5"
+        },
+        {
+          "hard_sign_errors": "122",
+          "reference": "4",
+          "winding": "7.5"
+        },
+        {
+          "hard_sign_errors": "81",
+          "reference": "4.5",
+          "winding": "7.5"
+        },
+        {
+          "hard_sign_errors": "78",
+          "reference": "5",
+          "winding": "5"
+        },
+        {
+          "hard_sign_errors": "68",
+          "reference": "5.5",
+          "winding": "6.5"
+        },
+        {
+          "hard_sign_errors": "104",
+          "reference": "6",
+          "winding": "7.5"
+        },
+        {
+          "hard_sign_errors": "71",
+          "reference": "6.5",
+          "winding": "6.5"
+        },
+        {
+          "hard_sign_errors": "98",
+          "reference": "7",
+          "winding": "2"
+        },
+        {
+          "hard_sign_errors": "67",
+          "reference": "7.5",
+          "winding": "6.5"
+        },
+        {
+          "hard_sign_errors": "119",
+          "reference": "8",
+          "winding": "6.5"
+        },
+        {
+          "hard_sign_errors": "102",
+          "reference": "8.5",
+          "winding": "6.5"
+        },
+        {
+          "hard_sign_errors": "76",
+          "reference": "9",
+          "winding": "7.5"
+        },
+        {
+          "hard_sign_errors": "111",
+          "reference": "9.5",
+          "winding": "6.5"
+        },
+        {
+          "hard_sign_errors": "42",
+          "reference": "10",
+          "winding": "7.5"
+        },
+        {
+          "hard_sign_errors": "85",
+          "reference": "10.5",
+          "winding": "2.5"
+        },
+        {
+          "hard_sign_errors": "42",
+          "reference": "11",
+          "winding": "4"
+        },
+        {
+          "hard_sign_errors": "90",
+          "reference": "11.5",
+          "winding": "2.5"
+        },
+        {
+          "hard_sign_errors": "39",
+          "reference": "12",
+          "winding": "5"
+        },
+        {
+          "hard_sign_errors": "81",
+          "reference": "12.5",
+          "winding": "5"
+        }
+      ],
+      "ladder_shift_percent": 3.8461538461538436,
+      "ladder_shifts": 25,
+      "missing_references": 0,
+      "name": "orthogonal-d10-c1-distance",
+      "parallel": false,
+      "problematic_unique_constraints": 47593,
+      "provenance": {
+        "binary_sha256": "7e12b3ad9571a425057dc96a8ea1a36c5c4b070d5b9f9e07b45e255f621fdc71",
+        "build_type": "RelWithDebInfo",
+        "command": [
+          "/home/hendrik/villa2/volume-cartographer/build/fiber-evaluation/bin/vc_fiber_trace_chunk",
+          "direction-ablation",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr",
+          "--normal-manifest",
+          "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json",
+          "--output",
+          "/ephemeral/hendrik/fiber_crop_bench/20260927_local_step_costs_v1/orthogonal-d10-c1-distance",
+          "--direction-dominance",
+          "0.9",
+          "--piece-length",
+          "512",
+          "--bp-only",
+          "--bp-inference",
+          "sum-product-mixed",
+          "--reference-prune-offenders",
+          "--reference-prune-policy",
+          "oracle-inliers",
+          "--reference-oracle-magnitude-weight",
+          "1",
+          "--reference-oracle-accept-message-limit",
+          "--reference-oracle-rounds",
+          "1",
+          "--reference-fiber-dir",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2",
+          "--reference-fiber-tag",
+          "hendrik_crop1",
+          "--threads",
+          "48",
+          "--winding-weights",
+          "0,0,0,0.1,0",
+          "--winding-sign-weights",
+          "1,0",
+          "--winding-hard-signs",
+          "perpendicular",
+          "--winding-sign-cost",
+          "hard",
+          "--winding-hard-sign-angle",
+          "off",
+          "--winding-max-candidate-states",
+          "32000000",
+          "--reference-initial-readout",
+          "--local-constraint-events",
+          "--winding-defect-cost",
+          "10",
+          "--winding-continuity-step-cost",
+          "1",
+          "--local-no-parallel"
+        ],
+        "inputs": {
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/.zattrs": "7db3db753ab26d4e3c2a9e9e738dba64b6400dc0d6032d8425838d40bcb903a3",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/.zgroup": "e1e1914ae531ecb50e1ead685ef01895a5452faf5f25f35cd78f1f5de1367470",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/.zarray": "14308c8b8fb9b5048f0ffe462fe88a20c45bc845bafac9674e9f0970fe423b24",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.0.0": "3351c8be12da158c6e5aabf49c53bfbcbddc0e495b4f2264f567cfe1dedca5cc",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.0.1": "4a5b6688b4fbd84582471f5b32477e09ed41031a74917a36d005d9a2c987a19e",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.0.2": "56ba6b4cbb3de6cf29f6de6fc68ee4028a767d9aae296af8b33169008f307511",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.0.3": "d2d335641b054738106aa88394f2c0cabbae4d33f8294d177e39aa25e8254479",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.1.0": "7d2cc3cf7abe93932987c943e04e5584a1ba5dd17212eb0f61731baedce41a29",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.1.1": "d7937c817cef43e03aa8578ce8187a98969f959eefdb28622ead9478fcd6a112",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.1.2": "de7bb792fbed7943bf7655d9f71a5b8bdf89e57d1c67a7d9c61c8d6bcdbdc9bc",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.1.3": "6e2dafc73605f9dd3d62a20f2f833e254e8c417c01177229aca83c3381ebfcc8",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.2.0": "a30d87ce1ef47e941f645740df77b7de5912dea4f8d33f77659595e4068dec49",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.2.1": "a773eadcf7a1a8d090827dc74e331bb1a2a2aa2cf99d15818ac6c6364875283c",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.2.2": "8fafe8c3af01d23a5295c97e3b43bf26bc4a826bbf385ec971b8decd897aaaa9",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.2.3": "4408395331ac587431681add747c65317751ae942e0e889fb24887db19170fe5",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.3.0": "be9313a6f7d21513b726f41eb6971faddcad04a124bcc6d3d315f0e8fdea6a76",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.3.1": "9ac41c5e017c02976f52b289b9a7b8a96cdb55671e56126381e4cedb90b811a5",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.3.2": "96db9307e67d773c6881472d12982377ea24e00b9716482c80edc40b9ae02c15",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.3.3": "404e5cc28e6bd4b503ace3eb1941db7170579d64919b5c5e7f2e26eabceb7963",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.0.0": "c6d643465586c23429b8cd29710981320bb515f5ead0a51b562568227c95fbd9",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.0.1": "c7beedfb34e7b9257573db90845c1a6456d6120050cdb5d011c4dd136414f706",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.0.2": "85167dc49b58ed7880b00d2103589a2ce9ba2b217c9122d246aa15d488b360fb",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.0.3": "53a172af248a1e44dd3470677ea873e8f37b38b71daa29bbf133d72be782adf7",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.1.0": "ba2a4d7f6b6ab6a9721dd7a2730d4723fbb488bb44e5fbb0549e5a592ed96fd6",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.1.1": "a7688a34f9b3bd2e75884e57b74aee89889120dbc0040c17b8b028e73dd6355d",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.1.2": "818b335924b5dcdf3ef2dc3e17abc3c66efed3bcc2f6ae62551b7b0986769c7e",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.1.3": "ad202b8fccbf11fbdc92fb564634ad35bce35b27aad6809941873232aefbcaec",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.2.0": "4653c47f31be25cde47aacc5e68968d39dab45c4e9c869403b76b07fca1d4b39",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.2.1": "4a4e6b33d4839b27abb3ff64d03d725a551d0a3121f1c72df107e6702c3a8d7c",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.2.2": "95fe1ba3e5de86f90c4005ad5412d13c29f12dde26b9a1abe91084dd6b579c0d",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.2.3": "d244539642ea7fa57ebe440f9c9ea3f2ed43a3590a8cc7a3bfd8869013ae99cd",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.3.0": "24daca7a1583db451fd5c1e9a36dd3d54343df7d39ec5f2b837bc51484ee26f2",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.3.1": "19a01be4b17877819b9ea2732bb0f770defd95a1875206ad68fcd0fc5994d669",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.3.2": "96d060e4a47e7195145056d22fbf91531cbb307fb48a5d22d942220e77f3eb45",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.3.3": "f38e057e090029a9f2c658c05a94feda1cdd4a6c6b4275f218feec9d4b7a1cec",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.0.0": "627905528560f13aa15c3f8f8765b1da6facde4b06ce9a47216d80522d51540f",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.0.1": "aee5fdaf874e74e68a80516320cc2dd85cfcad3587849efe08fdd409610a22a3",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.0.2": "59c0cfe7f1f5df2b0bc3b75d2553d5cf8a09d0f0eaa37946dd96b9b6d379d50b",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.0.3": "9e0b6c58ff25c59c8942647f175dd059d912b3e26e52209a6a51bd75e6307755",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.1.0": "aad9d68b691b95a34ad702a130a938977eaafdcabd83ae5a639096f2f5eb8b72",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.1.1": "c26c4257988d1bb9dbebd4b4e074a5dd5bcabb3559626dd87c3f4f11288cf690",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.1.2": "8542b4d6a785e1ef82cd23b5a27e911cd153ee6e1655794c29870b06498db38c",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.1.3": "258bed12764e9f872015b7a8dcf857c638250dd6c47f5aa2a0ab742954d0319a",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.2.0": "2a474d67dcadfbcbeccb3f2d89eb076d5ceee12c912a3f96ed6722f86dbd1c9a",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.2.1": "c0357afe671bd0c12037b2e83ddb79f91da8160d2273f3f1aa97d217e0622e05",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.2.2": "ad7c74c5a589267a0f16368bca2212c9a44f65d4a93c1ae05fce0a6b3a50263c",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.2.3": "22c480c95d2aa36456482e7d210f4a45cf34ecc3aeb5672a152b9ee3d4ca7676",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.3.0": "e973b3afd4ff4d112edc56dfef849d781a2e4dbeea59696e924bea2744a76236",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.3.1": "68bd68b12d253f828dba605548f562a8ac60bdbefc813124958d2c372e1c26c4",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.3.2": "45b4431bc7081eb95bcd2ed76de286a4ba058e44113bfbd1d4b820d4d4126ae1",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.3.3": "d15e576f17ada9252dbf41434aed44265470ee49082b319fce0ffe377681da14",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.0.0": "fb5b405b2e75df7b2c5c2eec283919cf42fe924f902a8015f604cc23964c1621",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.0.1": "05b90ef588d079ebf4fa3760ea536e7006aec23645b655474afd2915ff78ed15",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.0.2": "cda4c9ad31a6d8d587d2f3878e69717c30e501444034e5f2bfd5e0da7d9a597d",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.0.3": "1bad7fc3be627a8a0dc33250c715cc80013c13ff654fb3a957765791ebb206b2",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.1.0": "d8f683e6f79164ea2320b48247530ac723191e97a1b1022eb61f6fb5789c5123",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.1.1": "60d959f9a0e52e5139cb88db307bb849bbecd01bda67e536cf547610c28e7809",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.1.2": "e66fe5be1799d3eef68546ae2f63bdc26f3e102dd79c75fe517945c4a596e183",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.1.3": "82e5bc5f5c9167b39b19efd60b0cc75e6282957d94ab49b13ace0aedb32bae34",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.2.0": "4e6ba52d921d6dae685ca2bc5aab84677a4004d306317710b4c6cead0e496535",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.2.1": "7be900b1fbc2ece8e150b49e88b5a100645897681d265af31383faa1f0c2a1b2",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.2.2": "21b4a70eb2d8fc2c9265619c3976ffdc094b4ccced704c103d20365d429400b2",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.2.3": "dd59ff60640f2d115f35c5cf8805b97542a7522e7a73742a76093a5f703f5e9b",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.3.0": "200c2eb93571df1ca59c7ba55b6ebb30127d4c8c2c5372b2a66f1e3291f3a437",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.3.1": "0ad09d98295d663df53dfcfab228a7e4d1b5dc06ec8b996aea69281b90168660",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.3.2": "0d777266d226aeb4167309b893cd9dc1ce07704e8abbe55ed3fe1ce66bb7c2b1",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.3.3": "9cc6861d640738b66bc79c319f66400b4a74cf2f5026da442c6d866327189fb9",
+          "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd1-7ff0ce6c/artifacts/PHercParis4-20260411134726-las-sd1-7ff0ce6c.lasagna.json": "293cf8cb76bf07e621d3eab401904114e374225d3932f960b7a0d3d550594755",
+          "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json": "e18d1074759ef6db32538963ab13b9071dc8af334af7d991bbf77442e58453ff"
+        },
+        "references": {
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T064452831_000002.json": "d17ad691e02a8a476300ac0ff56cc5a6244d34f89f683ed273ff39c5dc138726",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T064812002_000003.json": "2f4af3d2ba2b4ea6ca4111bcb87ab8d585d68dc7391bea0cb7f8e945fcaecc45",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T065143381_000004.json": "5e5626d31c03d4fd8f510f8eb637e5df740a4a84999e0ebd4994bd0fc05fd26a",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T065643794_000005.json": "904711cb839c5e1d4a80c35009348d1dcb945975658904f976b68dd3009c15bd",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T072253909_000006.json": "066bce1b199be6ae740378409c0c7ee4e2ae15ca7f9095190fb6d8e5d0a28028",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T072717899_000007.json": "fe0ae2ad23db46f9ebea752e2e229427ccb932bbdec2bda12f2b54ff3f3628ff",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T073017594_000008.json": "19c0ae145078fd5553bb6c80353996ef8d02b167bc18d7b46eb13bc13dd0fd0a",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T074703971_000009.json": "70ba5ab35fc08d046eb20eb9a5ba12adeac0e56a984800d8363ab185b49bcb21",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T102631471_000010.json": "0f0d290ecc32d42b53829518bd68fac99ced7d202ac939866e3dd9c7c06bc336",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T105412524_000011.json": "3e91ed087f823690e8fb238e831270b7b432d5e1dc4e2520e934786e121f51b8",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T105602115_000012.json": "9df341a1a61d2be410648e0da2f1d53e59a5b989462af61ed3826b51506fd6fe",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160540656_000013.json": "106141ae627655102ca2cc4aba6039555d750932f05b996aa2e3056bbb04dae4",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160642323_000014.json": "8995247d04c62f7f421f20d3973fe907d159cf15a8bcfc52d45e8a47f686a3b4",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160716356_000015.json": "3f870c22039b77becd8945fb7d38378a360f7bd7d2bcc816272dfd596973622c",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160812289_000016.json": "9c6a41b3454a04a37adc2a3dd4aa9ea9806525f481420358f8c12bdcccd1fdeb",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T161032692_000017.json": "67918572c79cc166da81172a3e24ed01d78e8b471bc2c8d583a25a51c2a10df1",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T161219869_000018.json": "14ebb8e782fdadb8734af5f67948a9bdbe58f5089e1b46f66d37e0aeb1587b9d",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162005620_000019.json": "6461910faa5c12b9a1ffd1dceac24c5ed9626fab66914278e0097e68c56f8656",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162100631_000020.json": "0912f1593746e92dbf6ab7a50b183faab0765074fac86a7c3309e2ef66c64608",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162112825_000021.json": "6a0ffd62111ad098b4054a6fe71c9ac43dd96681ffef29a9d7927834311680cf",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162212264_000022.json": "2b222c9aecc1e03d0d61f7877b9b6ab0b329a442bf55d82ea24f4d28620f174b",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162324568_000023.json": "6a10d1044fc1ec1c487a3ba2e7a3f73cf05538ccda970d226c4fa02333d83283",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162413303_000024.json": "2fe404f9fd7eff16f4f6f0033e8d0ca598581bc0153107b8c8c6ac19b24b6465",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162425442_000025.json": "9c77b0839564818a7548380419ca8912e3753513afccfb515633eed8fe2a1af1",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162507413_000026.json": "17da40bd53a5de5f4b87a6a4e3014336cf2c0d8e6b9123236e427f46dda591e4",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162541128_000027.json": "99e51aad66cae4480d0013b6744523133c819da07fe68da11177544b372adb15"
+        },
+        "repetitions": 1,
+        "returncode": 0,
+        "revision": "ccbc6b21b28f4a635d8e92ff2deec07cbb21dafd",
+        "shared_libraries": {
+          "/home/hendrik/villa2/volume-cartographer/build/fiber-evaluation/core/libvc_fiber_tracer.so": "81cd28e15817fd464d1c1742d82eff2a3e2b76ad5bca4f356ab69dd411239b88"
+        },
+        "started_utc": "2026-09-27T17:19:50Z",
+        "wall_seconds": 472.458346941974
+      },
+      "reference_score_percent": 42.30769230769231,
+      "retained_fulfilled_unique_constraints": 17738,
+      "reused": false,
+      "status": "complete",
+      "wall_seconds": 472.458346941974,
+      "winding_statuses": [
+        "message_limit"
+      ],
+      "wrong_references": 15
+    },
+    {
+      "artifact_root": "/ephemeral/hendrik/fiber_crop_bench/20260927_local_step_costs_v1",
+      "constraint_score_percent": -20.66379772085034,
+      "cut": 10,
+      "cut_reports": [
+        {
+          "cut_percent": 1.139629372708354,
+          "cuts": 690,
+          "eligible": 60546,
+          "energy": 6900.0
+        }
+      ],
+      "defect": 10,
+      "defect_percent": 0.40154243283724783,
+      "event_audit": {
+        "maximum_event_groups": 1,
+        "maximum_orthogonal_factors": 5,
+        "multiple_event_pieces": 0,
+        "multiple_orthogonal_factor_pieces": 521,
+        "pieces_with_orthogonal_events": 8042
+      },
+      "exact_references": 11,
+      "geometry_sha256": "0c61e47e8384b784a20dd54922b4255b4a00d5a669a26dd473626ee152549572",
+      "independent_missing": 0,
+      "independent_percent": 7.6923076923076925,
+      "initial_readout_status": [
+        "message_limit"
+      ],
+      "ladder": [
+        {
+          "hard_sign_errors": "64",
+          "reference": "0",
+          "winding": "7"
+        },
+        {
+          "hard_sign_errors": "42",
+          "reference": "0.5",
+          "winding": "2"
+        },
+        {
+          "hard_sign_errors": "41",
+          "reference": "1",
+          "winding": "5"
+        },
+        {
+          "hard_sign_errors": "44",
+          "reference": "1.5",
+          "winding": "5.5"
+        },
+        {
+          "hard_sign_errors": "74",
+          "reference": "2",
+          "winding": "2"
+        },
+        {
+          "hard_sign_errors": "74",
+          "reference": "2.5",
+          "winding": "2"
+        },
+        {
+          "hard_sign_errors": "93",
+          "reference": "3",
+          "winding": "2"
+        },
+        {
+          "hard_sign_errors": "67",
+          "reference": "3.5",
+          "winding": "2"
+        },
+        {
+          "hard_sign_errors": "110",
+          "reference": "4",
+          "winding": "5"
+        },
+        {
+          "hard_sign_errors": "80",
+          "reference": "4.5",
+          "winding": "6.5"
+        },
+        {
+          "hard_sign_errors": "80",
+          "reference": "5",
+          "winding": "5"
+        },
+        {
+          "hard_sign_errors": "75",
+          "reference": "5.5",
+          "winding": "6.5"
+        },
+        {
+          "hard_sign_errors": "104",
+          "reference": "6",
+          "winding": "7"
+        },
+        {
+          "hard_sign_errors": "73",
+          "reference": "6.5",
+          "winding": "5.5"
+        },
+        {
+          "hard_sign_errors": "98",
+          "reference": "7",
+          "winding": "2"
+        },
+        {
+          "hard_sign_errors": "74",
+          "reference": "7.5",
+          "winding": "5.5"
+        },
+        {
+          "hard_sign_errors": "123",
+          "reference": "8",
+          "winding": "7"
+        },
+        {
+          "hard_sign_errors": "118",
+          "reference": "8.5",
+          "winding": "4.5"
+        },
+        {
+          "hard_sign_errors": "76",
+          "reference": "9",
+          "winding": "7"
+        },
+        {
+          "hard_sign_errors": "112",
+          "reference": "9.5",
+          "winding": "7"
+        },
+        {
+          "hard_sign_errors": "42",
+          "reference": "10",
+          "winding": "7"
+        },
+        {
+          "hard_sign_errors": "85",
+          "reference": "10.5",
+          "winding": "2"
+        },
+        {
+          "hard_sign_errors": "44",
+          "reference": "11",
+          "winding": "2"
+        },
+        {
+          "hard_sign_errors": "87",
+          "reference": "11.5",
+          "winding": "5.5"
+        },
+        {
+          "hard_sign_errors": "36",
+          "reference": "12",
+          "winding": "6"
+        },
+        {
+          "hard_sign_errors": "86",
+          "reference": "12.5",
+          "winding": "5.5"
+        }
+      ],
+      "ladder_shift_percent": 15.384615384615385,
+      "ladder_shifts": 22,
+      "missing_references": 0,
+      "name": "orthogonal-d10-c10",
+      "parallel": false,
+      "problematic_unique_constraints": 11188,
+      "provenance": {
+        "binary_sha256": "7e12b3ad9571a425057dc96a8ea1a36c5c4b070d5b9f9e07b45e255f621fdc71",
+        "build_type": "RelWithDebInfo",
+        "command": [
+          "/home/hendrik/villa2/volume-cartographer/build/fiber-evaluation/bin/vc_fiber_trace_chunk",
+          "direction-ablation",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr",
+          "--normal-manifest",
+          "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json",
+          "--output",
+          "/ephemeral/hendrik/fiber_crop_bench/20260927_local_step_costs_v1/orthogonal-d10-c10",
+          "--direction-dominance",
+          "0.9",
+          "--piece-length",
+          "512",
+          "--bp-only",
+          "--bp-inference",
+          "sum-product-mixed",
+          "--reference-prune-offenders",
+          "--reference-prune-policy",
+          "oracle-inliers",
+          "--reference-oracle-magnitude-weight",
+          "1",
+          "--reference-oracle-accept-message-limit",
+          "--reference-oracle-rounds",
+          "1",
+          "--reference-fiber-dir",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2",
+          "--reference-fiber-tag",
+          "hendrik_crop1",
+          "--threads",
+          "48",
+          "--winding-weights",
+          "0,0,0,0.1,0",
+          "--winding-sign-weights",
+          "1,0",
+          "--winding-hard-signs",
+          "perpendicular",
+          "--winding-sign-cost",
+          "hard",
+          "--winding-hard-sign-angle",
+          "off",
+          "--winding-max-candidate-states",
+          "32000000",
+          "--reference-initial-readout",
+          "--local-constraint-events",
+          "--winding-defect-cost",
+          "10",
+          "--winding-continuity-cut-cost",
+          "10",
+          "--local-no-parallel"
+        ],
+        "inputs": {
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/.zattrs": "7db3db753ab26d4e3c2a9e9e738dba64b6400dc0d6032d8425838d40bcb903a3",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/.zgroup": "e1e1914ae531ecb50e1ead685ef01895a5452faf5f25f35cd78f1f5de1367470",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/.zarray": "14308c8b8fb9b5048f0ffe462fe88a20c45bc845bafac9674e9f0970fe423b24",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.0.0": "3351c8be12da158c6e5aabf49c53bfbcbddc0e495b4f2264f567cfe1dedca5cc",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.0.1": "4a5b6688b4fbd84582471f5b32477e09ed41031a74917a36d005d9a2c987a19e",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.0.2": "56ba6b4cbb3de6cf29f6de6fc68ee4028a767d9aae296af8b33169008f307511",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.0.3": "d2d335641b054738106aa88394f2c0cabbae4d33f8294d177e39aa25e8254479",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.1.0": "7d2cc3cf7abe93932987c943e04e5584a1ba5dd17212eb0f61731baedce41a29",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.1.1": "d7937c817cef43e03aa8578ce8187a98969f959eefdb28622ead9478fcd6a112",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.1.2": "de7bb792fbed7943bf7655d9f71a5b8bdf89e57d1c67a7d9c61c8d6bcdbdc9bc",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.1.3": "6e2dafc73605f9dd3d62a20f2f833e254e8c417c01177229aca83c3381ebfcc8",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.2.0": "a30d87ce1ef47e941f645740df77b7de5912dea4f8d33f77659595e4068dec49",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.2.1": "a773eadcf7a1a8d090827dc74e331bb1a2a2aa2cf99d15818ac6c6364875283c",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.2.2": "8fafe8c3af01d23a5295c97e3b43bf26bc4a826bbf385ec971b8decd897aaaa9",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.2.3": "4408395331ac587431681add747c65317751ae942e0e889fb24887db19170fe5",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.3.0": "be9313a6f7d21513b726f41eb6971faddcad04a124bcc6d3d315f0e8fdea6a76",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.3.1": "9ac41c5e017c02976f52b289b9a7b8a96cdb55671e56126381e4cedb90b811a5",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.3.2": "96db9307e67d773c6881472d12982377ea24e00b9716482c80edc40b9ae02c15",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.3.3": "404e5cc28e6bd4b503ace3eb1941db7170579d64919b5c5e7f2e26eabceb7963",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.0.0": "c6d643465586c23429b8cd29710981320bb515f5ead0a51b562568227c95fbd9",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.0.1": "c7beedfb34e7b9257573db90845c1a6456d6120050cdb5d011c4dd136414f706",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.0.2": "85167dc49b58ed7880b00d2103589a2ce9ba2b217c9122d246aa15d488b360fb",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.0.3": "53a172af248a1e44dd3470677ea873e8f37b38b71daa29bbf133d72be782adf7",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.1.0": "ba2a4d7f6b6ab6a9721dd7a2730d4723fbb488bb44e5fbb0549e5a592ed96fd6",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.1.1": "a7688a34f9b3bd2e75884e57b74aee89889120dbc0040c17b8b028e73dd6355d",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.1.2": "818b335924b5dcdf3ef2dc3e17abc3c66efed3bcc2f6ae62551b7b0986769c7e",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.1.3": "ad202b8fccbf11fbdc92fb564634ad35bce35b27aad6809941873232aefbcaec",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.2.0": "4653c47f31be25cde47aacc5e68968d39dab45c4e9c869403b76b07fca1d4b39",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.2.1": "4a4e6b33d4839b27abb3ff64d03d725a551d0a3121f1c72df107e6702c3a8d7c",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.2.2": "95fe1ba3e5de86f90c4005ad5412d13c29f12dde26b9a1abe91084dd6b579c0d",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.2.3": "d244539642ea7fa57ebe440f9c9ea3f2ed43a3590a8cc7a3bfd8869013ae99cd",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.3.0": "24daca7a1583db451fd5c1e9a36dd3d54343df7d39ec5f2b837bc51484ee26f2",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.3.1": "19a01be4b17877819b9ea2732bb0f770defd95a1875206ad68fcd0fc5994d669",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.3.2": "96d060e4a47e7195145056d22fbf91531cbb307fb48a5d22d942220e77f3eb45",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.3.3": "f38e057e090029a9f2c658c05a94feda1cdd4a6c6b4275f218feec9d4b7a1cec",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.0.0": "627905528560f13aa15c3f8f8765b1da6facde4b06ce9a47216d80522d51540f",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.0.1": "aee5fdaf874e74e68a80516320cc2dd85cfcad3587849efe08fdd409610a22a3",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.0.2": "59c0cfe7f1f5df2b0bc3b75d2553d5cf8a09d0f0eaa37946dd96b9b6d379d50b",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.0.3": "9e0b6c58ff25c59c8942647f175dd059d912b3e26e52209a6a51bd75e6307755",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.1.0": "aad9d68b691b95a34ad702a130a938977eaafdcabd83ae5a639096f2f5eb8b72",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.1.1": "c26c4257988d1bb9dbebd4b4e074a5dd5bcabb3559626dd87c3f4f11288cf690",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.1.2": "8542b4d6a785e1ef82cd23b5a27e911cd153ee6e1655794c29870b06498db38c",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.1.3": "258bed12764e9f872015b7a8dcf857c638250dd6c47f5aa2a0ab742954d0319a",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.2.0": "2a474d67dcadfbcbeccb3f2d89eb076d5ceee12c912a3f96ed6722f86dbd1c9a",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.2.1": "c0357afe671bd0c12037b2e83ddb79f91da8160d2273f3f1aa97d217e0622e05",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.2.2": "ad7c74c5a589267a0f16368bca2212c9a44f65d4a93c1ae05fce0a6b3a50263c",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.2.3": "22c480c95d2aa36456482e7d210f4a45cf34ecc3aeb5672a152b9ee3d4ca7676",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.3.0": "e973b3afd4ff4d112edc56dfef849d781a2e4dbeea59696e924bea2744a76236",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.3.1": "68bd68b12d253f828dba605548f562a8ac60bdbefc813124958d2c372e1c26c4",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.3.2": "45b4431bc7081eb95bcd2ed76de286a4ba058e44113bfbd1d4b820d4d4126ae1",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.3.3": "d15e576f17ada9252dbf41434aed44265470ee49082b319fce0ffe377681da14",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.0.0": "fb5b405b2e75df7b2c5c2eec283919cf42fe924f902a8015f604cc23964c1621",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.0.1": "05b90ef588d079ebf4fa3760ea536e7006aec23645b655474afd2915ff78ed15",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.0.2": "cda4c9ad31a6d8d587d2f3878e69717c30e501444034e5f2bfd5e0da7d9a597d",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.0.3": "1bad7fc3be627a8a0dc33250c715cc80013c13ff654fb3a957765791ebb206b2",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.1.0": "d8f683e6f79164ea2320b48247530ac723191e97a1b1022eb61f6fb5789c5123",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.1.1": "60d959f9a0e52e5139cb88db307bb849bbecd01bda67e536cf547610c28e7809",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.1.2": "e66fe5be1799d3eef68546ae2f63bdc26f3e102dd79c75fe517945c4a596e183",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.1.3": "82e5bc5f5c9167b39b19efd60b0cc75e6282957d94ab49b13ace0aedb32bae34",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.2.0": "4e6ba52d921d6dae685ca2bc5aab84677a4004d306317710b4c6cead0e496535",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.2.1": "7be900b1fbc2ece8e150b49e88b5a100645897681d265af31383faa1f0c2a1b2",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.2.2": "21b4a70eb2d8fc2c9265619c3976ffdc094b4ccced704c103d20365d429400b2",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.2.3": "dd59ff60640f2d115f35c5cf8805b97542a7522e7a73742a76093a5f703f5e9b",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.3.0": "200c2eb93571df1ca59c7ba55b6ebb30127d4c8c2c5372b2a66f1e3291f3a437",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.3.1": "0ad09d98295d663df53dfcfab228a7e4d1b5dc06ec8b996aea69281b90168660",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.3.2": "0d777266d226aeb4167309b893cd9dc1ce07704e8abbe55ed3fe1ce66bb7c2b1",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.3.3": "9cc6861d640738b66bc79c319f66400b4a74cf2f5026da442c6d866327189fb9",
+          "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd1-7ff0ce6c/artifacts/PHercParis4-20260411134726-las-sd1-7ff0ce6c.lasagna.json": "293cf8cb76bf07e621d3eab401904114e374225d3932f960b7a0d3d550594755",
+          "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json": "e18d1074759ef6db32538963ab13b9071dc8af334af7d991bbf77442e58453ff"
+        },
+        "references": {
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T064452831_000002.json": "d17ad691e02a8a476300ac0ff56cc5a6244d34f89f683ed273ff39c5dc138726",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T064812002_000003.json": "2f4af3d2ba2b4ea6ca4111bcb87ab8d585d68dc7391bea0cb7f8e945fcaecc45",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T065143381_000004.json": "5e5626d31c03d4fd8f510f8eb637e5df740a4a84999e0ebd4994bd0fc05fd26a",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T065643794_000005.json": "904711cb839c5e1d4a80c35009348d1dcb945975658904f976b68dd3009c15bd",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T072253909_000006.json": "066bce1b199be6ae740378409c0c7ee4e2ae15ca7f9095190fb6d8e5d0a28028",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T072717899_000007.json": "fe0ae2ad23db46f9ebea752e2e229427ccb932bbdec2bda12f2b54ff3f3628ff",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T073017594_000008.json": "19c0ae145078fd5553bb6c80353996ef8d02b167bc18d7b46eb13bc13dd0fd0a",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T074703971_000009.json": "70ba5ab35fc08d046eb20eb9a5ba12adeac0e56a984800d8363ab185b49bcb21",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T102631471_000010.json": "0f0d290ecc32d42b53829518bd68fac99ced7d202ac939866e3dd9c7c06bc336",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T105412524_000011.json": "3e91ed087f823690e8fb238e831270b7b432d5e1dc4e2520e934786e121f51b8",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T105602115_000012.json": "9df341a1a61d2be410648e0da2f1d53e59a5b989462af61ed3826b51506fd6fe",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160540656_000013.json": "106141ae627655102ca2cc4aba6039555d750932f05b996aa2e3056bbb04dae4",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160642323_000014.json": "8995247d04c62f7f421f20d3973fe907d159cf15a8bcfc52d45e8a47f686a3b4",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160716356_000015.json": "3f870c22039b77becd8945fb7d38378a360f7bd7d2bcc816272dfd596973622c",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160812289_000016.json": "9c6a41b3454a04a37adc2a3dd4aa9ea9806525f481420358f8c12bdcccd1fdeb",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T161032692_000017.json": "67918572c79cc166da81172a3e24ed01d78e8b471bc2c8d583a25a51c2a10df1",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T161219869_000018.json": "14ebb8e782fdadb8734af5f67948a9bdbe58f5089e1b46f66d37e0aeb1587b9d",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162005620_000019.json": "6461910faa5c12b9a1ffd1dceac24c5ed9626fab66914278e0097e68c56f8656",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162100631_000020.json": "0912f1593746e92dbf6ab7a50b183faab0765074fac86a7c3309e2ef66c64608",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162112825_000021.json": "6a0ffd62111ad098b4054a6fe71c9ac43dd96681ffef29a9d7927834311680cf",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162212264_000022.json": "2b222c9aecc1e03d0d61f7877b9b6ab0b329a442bf55d82ea24f4d28620f174b",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162324568_000023.json": "6a10d1044fc1ec1c487a3ba2e7a3f73cf05538ccda970d226c4fa02333d83283",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162413303_000024.json": "2fe404f9fd7eff16f4f6f0033e8d0ca598581bc0153107b8c8c6ac19b24b6465",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162425442_000025.json": "9c77b0839564818a7548380419ca8912e3753513afccfb515633eed8fe2a1af1",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162507413_000026.json": "17da40bd53a5de5f4b87a6a4e3014336cf2c0d8e6b9123236e427f46dda591e4",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162541128_000027.json": "99e51aad66cae4480d0013b6744523133c819da07fe68da11177544b372adb15"
+        },
+        "repetitions": 1,
+        "returncode": 0,
+        "revision": "ccbc6b21b28f4a635d8e92ff2deec07cbb21dafd",
+        "shared_libraries": {
+          "/home/hendrik/villa2/volume-cartographer/build/fiber-evaluation/core/libvc_fiber_tracer.so": "81cd28e15817fd464d1c1742d82eff2a3e2b76ad5bca4f356ab69dd411239b88"
+        },
+        "started_utc": "2026-09-27T17:19:50Z",
+        "wall_seconds": 395.5393533440074
+      },
+      "reference_score_percent": 42.30769230769231,
+      "retained_fulfilled_unique_constraints": 54143,
+      "reused": false,
+      "status": "complete",
+      "wall_seconds": 395.5393533440074,
+      "winding_statuses": [
+        "message_limit"
+      ],
+      "wrong_references": 15
+    },
+    {
+      "artifact_root": "/ephemeral/hendrik/fiber_crop_bench/20260927_local_step_costs_v1",
+      "constraint_score_percent": -22.029624371929692,
+      "cut": 10,
+      "cut_reports": [
+        {
+          "cut_percent": 1.079706795218913,
+          "cuts": 654,
+          "eligible": 60572,
+          "energy": 7835.0
+        }
+      ],
+      "defect": 10,
+      "defect_percent": 0.3744542528442589,
+      "distance_cost": true,
+      "event_audit": {
+        "maximum_event_groups": 1,
+        "maximum_orthogonal_factors": 5,
+        "multiple_event_pieces": 0,
+        "multiple_orthogonal_factor_pieces": 521,
+        "pieces_with_orthogonal_events": 8042
+      },
+      "exact_references": 9,
+      "geometry_sha256": "0c61e47e8384b784a20dd54922b4255b4a00d5a669a26dd473626ee152549572",
+      "independent_missing": 0,
+      "independent_percent": 11.538461538461538,
+      "initial_readout_status": [
+        "message_limit"
+      ],
+      "ladder": [
+        {
+          "hard_sign_errors": "64",
+          "reference": "0",
+          "winding": "10"
+        },
+        {
+          "hard_sign_errors": "43",
+          "reference": "0.5",
+          "winding": "14"
+        },
+        {
+          "hard_sign_errors": "33",
+          "reference": "1",
+          "winding": "13.5"
+        },
+        {
+          "hard_sign_errors": "49",
+          "reference": "1.5",
+          "winding": "12"
+        },
+        {
+          "hard_sign_errors": "75",
+          "reference": "2",
+          "winding": "14.5"
+        },
+        {
+          "hard_sign_errors": "65",
+          "reference": "2.5",
+          "winding": "13"
+        },
+        {
+          "hard_sign_errors": "93",
+          "reference": "3",
+          "winding": "14.5"
+        },
+        {
+          "hard_sign_errors": "67",
+          "reference": "3.5",
+          "winding": "14.5"
+        },
+        {
+          "hard_sign_errors": "99",
+          "reference": "4",
+          "winding": "12.5"
+        },
+        {
+          "hard_sign_errors": "80",
+          "reference": "4.5",
+          "winding": "9.5"
+        },
+        {
+          "hard_sign_errors": "81",
+          "reference": "5",
+          "winding": "12.5"
+        },
+        {
+          "hard_sign_errors": "75",
+          "reference": "5.5",
+          "winding": "9.5"
+        },
+        {
+          "hard_sign_errors": "102",
+          "reference": "6",
+          "winding": "9.5"
+        },
+        {
+          "hard_sign_errors": "73",
+          "reference": "6.5",
+          "winding": "12"
+        },
+        {
+          "hard_sign_errors": "98",
+          "reference": "7",
+          "winding": "14.5"
+        },
+        {
+          "hard_sign_errors": "78",
+          "reference": "7.5",
+          "winding": "9.5"
+        },
+        {
+          "hard_sign_errors": "122",
+          "reference": "8",
+          "winding": "9.5"
+        },
+        {
+          "hard_sign_errors": "124",
+          "reference": "8.5",
+          "winding": "12"
+        },
+        {
+          "hard_sign_errors": "76",
+          "reference": "9",
+          "winding": "9.5"
+        },
+        {
+          "hard_sign_errors": "112",
+          "reference": "9.5",
+          "winding": "9.5"
+        },
+        {
+          "hard_sign_errors": "42",
+          "reference": "10",
+          "winding": "9.5"
+        },
+        {
+          "hard_sign_errors": "84",
+          "reference": "10.5",
+          "winding": "13.5"
+        },
+        {
+          "hard_sign_errors": "44",
+          "reference": "11",
+          "winding": "14.5"
+        },
+        {
+          "hard_sign_errors": "79",
+          "reference": "11.5",
+          "winding": "12.5"
+        },
+        {
+          "hard_sign_errors": "34",
+          "reference": "12",
+          "winding": "12"
+        },
+        {
+          "hard_sign_errors": "66",
+          "reference": "12.5",
+          "winding": "12.5"
+        }
+      ],
+      "ladder_shift_percent": 7.692307692307687,
+      "ladder_shifts": 24,
+      "missing_references": 0,
+      "name": "orthogonal-d10-c10-distance",
+      "parallel": false,
+      "problematic_unique_constraints": 11794,
+      "provenance": {
+        "binary_sha256": "7e12b3ad9571a425057dc96a8ea1a36c5c4b070d5b9f9e07b45e255f621fdc71",
+        "build_type": "RelWithDebInfo",
+        "command": [
+          "/home/hendrik/villa2/volume-cartographer/build/fiber-evaluation/bin/vc_fiber_trace_chunk",
+          "direction-ablation",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr",
+          "--normal-manifest",
+          "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json",
+          "--output",
+          "/ephemeral/hendrik/fiber_crop_bench/20260927_local_step_costs_v1/orthogonal-d10-c10-distance",
+          "--direction-dominance",
+          "0.9",
+          "--piece-length",
+          "512",
+          "--bp-only",
+          "--bp-inference",
+          "sum-product-mixed",
+          "--reference-prune-offenders",
+          "--reference-prune-policy",
+          "oracle-inliers",
+          "--reference-oracle-magnitude-weight",
+          "1",
+          "--reference-oracle-accept-message-limit",
+          "--reference-oracle-rounds",
+          "1",
+          "--reference-fiber-dir",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2",
+          "--reference-fiber-tag",
+          "hendrik_crop1",
+          "--threads",
+          "48",
+          "--winding-weights",
+          "0,0,0,0.1,0",
+          "--winding-sign-weights",
+          "1,0",
+          "--winding-hard-signs",
+          "perpendicular",
+          "--winding-sign-cost",
+          "hard",
+          "--winding-hard-sign-angle",
+          "off",
+          "--winding-max-candidate-states",
+          "32000000",
+          "--reference-initial-readout",
+          "--local-constraint-events",
+          "--winding-defect-cost",
+          "10",
+          "--winding-continuity-step-cost",
+          "10",
+          "--local-no-parallel"
+        ],
+        "inputs": {
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/.zattrs": "7db3db753ab26d4e3c2a9e9e738dba64b6400dc0d6032d8425838d40bcb903a3",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/.zgroup": "e1e1914ae531ecb50e1ead685ef01895a5452faf5f25f35cd78f1f5de1367470",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/.zarray": "14308c8b8fb9b5048f0ffe462fe88a20c45bc845bafac9674e9f0970fe423b24",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.0.0": "3351c8be12da158c6e5aabf49c53bfbcbddc0e495b4f2264f567cfe1dedca5cc",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.0.1": "4a5b6688b4fbd84582471f5b32477e09ed41031a74917a36d005d9a2c987a19e",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.0.2": "56ba6b4cbb3de6cf29f6de6fc68ee4028a767d9aae296af8b33169008f307511",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.0.3": "d2d335641b054738106aa88394f2c0cabbae4d33f8294d177e39aa25e8254479",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.1.0": "7d2cc3cf7abe93932987c943e04e5584a1ba5dd17212eb0f61731baedce41a29",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.1.1": "d7937c817cef43e03aa8578ce8187a98969f959eefdb28622ead9478fcd6a112",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.1.2": "de7bb792fbed7943bf7655d9f71a5b8bdf89e57d1c67a7d9c61c8d6bcdbdc9bc",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.1.3": "6e2dafc73605f9dd3d62a20f2f833e254e8c417c01177229aca83c3381ebfcc8",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.2.0": "a30d87ce1ef47e941f645740df77b7de5912dea4f8d33f77659595e4068dec49",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.2.1": "a773eadcf7a1a8d090827dc74e331bb1a2a2aa2cf99d15818ac6c6364875283c",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.2.2": "8fafe8c3af01d23a5295c97e3b43bf26bc4a826bbf385ec971b8decd897aaaa9",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.2.3": "4408395331ac587431681add747c65317751ae942e0e889fb24887db19170fe5",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.3.0": "be9313a6f7d21513b726f41eb6971faddcad04a124bcc6d3d315f0e8fdea6a76",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.3.1": "9ac41c5e017c02976f52b289b9a7b8a96cdb55671e56126381e4cedb90b811a5",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.3.2": "96db9307e67d773c6881472d12982377ea24e00b9716482c80edc40b9ae02c15",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.3.3": "404e5cc28e6bd4b503ace3eb1941db7170579d64919b5c5e7f2e26eabceb7963",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.0.0": "c6d643465586c23429b8cd29710981320bb515f5ead0a51b562568227c95fbd9",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.0.1": "c7beedfb34e7b9257573db90845c1a6456d6120050cdb5d011c4dd136414f706",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.0.2": "85167dc49b58ed7880b00d2103589a2ce9ba2b217c9122d246aa15d488b360fb",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.0.3": "53a172af248a1e44dd3470677ea873e8f37b38b71daa29bbf133d72be782adf7",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.1.0": "ba2a4d7f6b6ab6a9721dd7a2730d4723fbb488bb44e5fbb0549e5a592ed96fd6",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.1.1": "a7688a34f9b3bd2e75884e57b74aee89889120dbc0040c17b8b028e73dd6355d",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.1.2": "818b335924b5dcdf3ef2dc3e17abc3c66efed3bcc2f6ae62551b7b0986769c7e",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.1.3": "ad202b8fccbf11fbdc92fb564634ad35bce35b27aad6809941873232aefbcaec",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.2.0": "4653c47f31be25cde47aacc5e68968d39dab45c4e9c869403b76b07fca1d4b39",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.2.1": "4a4e6b33d4839b27abb3ff64d03d725a551d0a3121f1c72df107e6702c3a8d7c",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.2.2": "95fe1ba3e5de86f90c4005ad5412d13c29f12dde26b9a1abe91084dd6b579c0d",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.2.3": "d244539642ea7fa57ebe440f9c9ea3f2ed43a3590a8cc7a3bfd8869013ae99cd",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.3.0": "24daca7a1583db451fd5c1e9a36dd3d54343df7d39ec5f2b837bc51484ee26f2",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.3.1": "19a01be4b17877819b9ea2732bb0f770defd95a1875206ad68fcd0fc5994d669",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.3.2": "96d060e4a47e7195145056d22fbf91531cbb307fb48a5d22d942220e77f3eb45",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.3.3": "f38e057e090029a9f2c658c05a94feda1cdd4a6c6b4275f218feec9d4b7a1cec",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.0.0": "627905528560f13aa15c3f8f8765b1da6facde4b06ce9a47216d80522d51540f",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.0.1": "aee5fdaf874e74e68a80516320cc2dd85cfcad3587849efe08fdd409610a22a3",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.0.2": "59c0cfe7f1f5df2b0bc3b75d2553d5cf8a09d0f0eaa37946dd96b9b6d379d50b",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.0.3": "9e0b6c58ff25c59c8942647f175dd059d912b3e26e52209a6a51bd75e6307755",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.1.0": "aad9d68b691b95a34ad702a130a938977eaafdcabd83ae5a639096f2f5eb8b72",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.1.1": "c26c4257988d1bb9dbebd4b4e074a5dd5bcabb3559626dd87c3f4f11288cf690",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.1.2": "8542b4d6a785e1ef82cd23b5a27e911cd153ee6e1655794c29870b06498db38c",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.1.3": "258bed12764e9f872015b7a8dcf857c638250dd6c47f5aa2a0ab742954d0319a",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.2.0": "2a474d67dcadfbcbeccb3f2d89eb076d5ceee12c912a3f96ed6722f86dbd1c9a",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.2.1": "c0357afe671bd0c12037b2e83ddb79f91da8160d2273f3f1aa97d217e0622e05",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.2.2": "ad7c74c5a589267a0f16368bca2212c9a44f65d4a93c1ae05fce0a6b3a50263c",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.2.3": "22c480c95d2aa36456482e7d210f4a45cf34ecc3aeb5672a152b9ee3d4ca7676",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.3.0": "e973b3afd4ff4d112edc56dfef849d781a2e4dbeea59696e924bea2744a76236",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.3.1": "68bd68b12d253f828dba605548f562a8ac60bdbefc813124958d2c372e1c26c4",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.3.2": "45b4431bc7081eb95bcd2ed76de286a4ba058e44113bfbd1d4b820d4d4126ae1",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.3.3": "d15e576f17ada9252dbf41434aed44265470ee49082b319fce0ffe377681da14",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.0.0": "fb5b405b2e75df7b2c5c2eec283919cf42fe924f902a8015f604cc23964c1621",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.0.1": "05b90ef588d079ebf4fa3760ea536e7006aec23645b655474afd2915ff78ed15",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.0.2": "cda4c9ad31a6d8d587d2f3878e69717c30e501444034e5f2bfd5e0da7d9a597d",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.0.3": "1bad7fc3be627a8a0dc33250c715cc80013c13ff654fb3a957765791ebb206b2",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.1.0": "d8f683e6f79164ea2320b48247530ac723191e97a1b1022eb61f6fb5789c5123",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.1.1": "60d959f9a0e52e5139cb88db307bb849bbecd01bda67e536cf547610c28e7809",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.1.2": "e66fe5be1799d3eef68546ae2f63bdc26f3e102dd79c75fe517945c4a596e183",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.1.3": "82e5bc5f5c9167b39b19efd60b0cc75e6282957d94ab49b13ace0aedb32bae34",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.2.0": "4e6ba52d921d6dae685ca2bc5aab84677a4004d306317710b4c6cead0e496535",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.2.1": "7be900b1fbc2ece8e150b49e88b5a100645897681d265af31383faa1f0c2a1b2",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.2.2": "21b4a70eb2d8fc2c9265619c3976ffdc094b4ccced704c103d20365d429400b2",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.2.3": "dd59ff60640f2d115f35c5cf8805b97542a7522e7a73742a76093a5f703f5e9b",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.3.0": "200c2eb93571df1ca59c7ba55b6ebb30127d4c8c2c5372b2a66f1e3291f3a437",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.3.1": "0ad09d98295d663df53dfcfab228a7e4d1b5dc06ec8b996aea69281b90168660",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.3.2": "0d777266d226aeb4167309b893cd9dc1ce07704e8abbe55ed3fe1ce66bb7c2b1",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.3.3": "9cc6861d640738b66bc79c319f66400b4a74cf2f5026da442c6d866327189fb9",
+          "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd1-7ff0ce6c/artifacts/PHercParis4-20260411134726-las-sd1-7ff0ce6c.lasagna.json": "293cf8cb76bf07e621d3eab401904114e374225d3932f960b7a0d3d550594755",
+          "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json": "e18d1074759ef6db32538963ab13b9071dc8af334af7d991bbf77442e58453ff"
+        },
+        "references": {
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T064452831_000002.json": "d17ad691e02a8a476300ac0ff56cc5a6244d34f89f683ed273ff39c5dc138726",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T064812002_000003.json": "2f4af3d2ba2b4ea6ca4111bcb87ab8d585d68dc7391bea0cb7f8e945fcaecc45",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T065143381_000004.json": "5e5626d31c03d4fd8f510f8eb637e5df740a4a84999e0ebd4994bd0fc05fd26a",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T065643794_000005.json": "904711cb839c5e1d4a80c35009348d1dcb945975658904f976b68dd3009c15bd",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T072253909_000006.json": "066bce1b199be6ae740378409c0c7ee4e2ae15ca7f9095190fb6d8e5d0a28028",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T072717899_000007.json": "fe0ae2ad23db46f9ebea752e2e229427ccb932bbdec2bda12f2b54ff3f3628ff",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T073017594_000008.json": "19c0ae145078fd5553bb6c80353996ef8d02b167bc18d7b46eb13bc13dd0fd0a",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T074703971_000009.json": "70ba5ab35fc08d046eb20eb9a5ba12adeac0e56a984800d8363ab185b49bcb21",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T102631471_000010.json": "0f0d290ecc32d42b53829518bd68fac99ced7d202ac939866e3dd9c7c06bc336",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T105412524_000011.json": "3e91ed087f823690e8fb238e831270b7b432d5e1dc4e2520e934786e121f51b8",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T105602115_000012.json": "9df341a1a61d2be410648e0da2f1d53e59a5b989462af61ed3826b51506fd6fe",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160540656_000013.json": "106141ae627655102ca2cc4aba6039555d750932f05b996aa2e3056bbb04dae4",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160642323_000014.json": "8995247d04c62f7f421f20d3973fe907d159cf15a8bcfc52d45e8a47f686a3b4",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160716356_000015.json": "3f870c22039b77becd8945fb7d38378a360f7bd7d2bcc816272dfd596973622c",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160812289_000016.json": "9c6a41b3454a04a37adc2a3dd4aa9ea9806525f481420358f8c12bdcccd1fdeb",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T161032692_000017.json": "67918572c79cc166da81172a3e24ed01d78e8b471bc2c8d583a25a51c2a10df1",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T161219869_000018.json": "14ebb8e782fdadb8734af5f67948a9bdbe58f5089e1b46f66d37e0aeb1587b9d",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162005620_000019.json": "6461910faa5c12b9a1ffd1dceac24c5ed9626fab66914278e0097e68c56f8656",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162100631_000020.json": "0912f1593746e92dbf6ab7a50b183faab0765074fac86a7c3309e2ef66c64608",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162112825_000021.json": "6a0ffd62111ad098b4054a6fe71c9ac43dd96681ffef29a9d7927834311680cf",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162212264_000022.json": "2b222c9aecc1e03d0d61f7877b9b6ab0b329a442bf55d82ea24f4d28620f174b",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162324568_000023.json": "6a10d1044fc1ec1c487a3ba2e7a3f73cf05538ccda970d226c4fa02333d83283",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162413303_000024.json": "2fe404f9fd7eff16f4f6f0033e8d0ca598581bc0153107b8c8c6ac19b24b6465",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162425442_000025.json": "9c77b0839564818a7548380419ca8912e3753513afccfb515633eed8fe2a1af1",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162507413_000026.json": "17da40bd53a5de5f4b87a6a4e3014336cf2c0d8e6b9123236e427f46dda591e4",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162541128_000027.json": "99e51aad66cae4480d0013b6744523133c819da07fe68da11177544b372adb15"
+        },
+        "repetitions": 1,
+        "returncode": 0,
+        "revision": "ccbc6b21b28f4a635d8e92ff2deec07cbb21dafd",
+        "shared_libraries": {
+          "/home/hendrik/villa2/volume-cartographer/build/fiber-evaluation/core/libvc_fiber_tracer.so": "81cd28e15817fd464d1c1742d82eff2a3e2b76ad5bca4f356ab69dd411239b88"
+        },
+        "started_utc": "2026-09-27T17:22:00Z",
+        "wall_seconds": 914.6686661209678
+      },
+      "reference_score_percent": 34.61538461538461,
+      "retained_fulfilled_unique_constraints": 53537,
+      "reused": false,
+      "status": "complete",
+      "wall_seconds": 914.6686661209678,
+      "winding_statuses": [
+        "message_limit"
+      ],
+      "wrong_references": 17
+    },
+    {
+      "artifact_root": "/ephemeral/hendrik/fiber_crop_bench/20260927_local_step_costs_v1",
+      "constraint_score_percent": -20.67271283178485,
+      "cut": 100,
+      "cut_reports": [
+        {
+          "cut_percent": 1.2058143376280146,
+          "cuts": 730,
+          "eligible": 60540,
+          "energy": 85100.0
+        }
+      ],
+      "defect": 10,
+      "defect_percent": 0.40950954459989164,
+      "distance_cost": true,
+      "event_audit": {
+        "maximum_event_groups": 1,
+        "maximum_orthogonal_factors": 5,
+        "multiple_event_pieces": 0,
+        "multiple_orthogonal_factor_pieces": 521,
+        "pieces_with_orthogonal_events": 8042
+      },
+      "exact_references": 11,
+      "geometry_sha256": "0c61e47e8384b784a20dd54922b4255b4a00d5a669a26dd473626ee152549572",
+      "independent_missing": 0,
+      "independent_percent": 7.6923076923076925,
+      "initial_readout_status": [
+        "message_limit"
+      ],
+      "ladder": [
+        {
+          "hard_sign_errors": "64",
+          "reference": "0",
+          "winding": "7"
+        },
+        {
+          "hard_sign_errors": "42",
+          "reference": "0.5",
+          "winding": "2"
+        },
+        {
+          "hard_sign_errors": "40",
+          "reference": "1",
+          "winding": "5"
+        },
+        {
+          "hard_sign_errors": "48",
+          "reference": "1.5",
+          "winding": "5.5"
+        },
+        {
+          "hard_sign_errors": "74",
+          "reference": "2",
+          "winding": "2"
+        },
+        {
+          "hard_sign_errors": "74",
+          "reference": "2.5",
+          "winding": "2"
+        },
+        {
+          "hard_sign_errors": "93",
+          "reference": "3",
+          "winding": "2"
+        },
+        {
+          "hard_sign_errors": "67",
+          "reference": "3.5",
+          "winding": "2"
+        },
+        {
+          "hard_sign_errors": "110",
+          "reference": "4",
+          "winding": "5"
+        },
+        {
+          "hard_sign_errors": "82",
+          "reference": "4.5",
+          "winding": "6.5"
+        },
+        {
+          "hard_sign_errors": "80",
+          "reference": "5",
+          "winding": "5"
+        },
+        {
+          "hard_sign_errors": "75",
+          "reference": "5.5",
+          "winding": "6.5"
+        },
+        {
+          "hard_sign_errors": "104",
+          "reference": "6",
+          "winding": "7"
+        },
+        {
+          "hard_sign_errors": "73",
+          "reference": "6.5",
+          "winding": "5.5"
+        },
+        {
+          "hard_sign_errors": "98",
+          "reference": "7",
+          "winding": "2"
+        },
+        {
+          "hard_sign_errors": "74",
+          "reference": "7.5",
+          "winding": "5.5"
+        },
+        {
+          "hard_sign_errors": "123",
+          "reference": "8",
+          "winding": "7"
+        },
+        {
+          "hard_sign_errors": "116",
+          "reference": "8.5",
+          "winding": "4.5"
+        },
+        {
+          "hard_sign_errors": "76",
+          "reference": "9",
+          "winding": "7"
+        },
+        {
+          "hard_sign_errors": "111",
+          "reference": "9.5",
+          "winding": "7"
+        },
+        {
+          "hard_sign_errors": "42",
+          "reference": "10",
+          "winding": "7"
+        },
+        {
+          "hard_sign_errors": "85",
+          "reference": "10.5",
+          "winding": "2"
+        },
+        {
+          "hard_sign_errors": "44",
+          "reference": "11",
+          "winding": "2"
+        },
+        {
+          "hard_sign_errors": "90",
+          "reference": "11.5",
+          "winding": "2"
+        },
+        {
+          "hard_sign_errors": "36",
+          "reference": "12",
+          "winding": "6"
+        },
+        {
+          "hard_sign_errors": "87",
+          "reference": "12.5",
+          "winding": "2"
+        }
+      ],
+      "ladder_shift_percent": 11.538461538461542,
+      "ladder_shifts": 23,
+      "missing_references": 0,
+      "name": "orthogonal-d10-c100-distance",
+      "parallel": false,
+      "problematic_unique_constraints": 11192,
+      "provenance": {
+        "binary_sha256": "7e12b3ad9571a425057dc96a8ea1a36c5c4b070d5b9f9e07b45e255f621fdc71",
+        "build_type": "RelWithDebInfo",
+        "command": [
+          "/home/hendrik/villa2/volume-cartographer/build/fiber-evaluation/bin/vc_fiber_trace_chunk",
+          "direction-ablation",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr",
+          "--normal-manifest",
+          "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json",
+          "--output",
+          "/ephemeral/hendrik/fiber_crop_bench/20260927_local_step_costs_v1/orthogonal-d10-c100-distance",
+          "--direction-dominance",
+          "0.9",
+          "--piece-length",
+          "512",
+          "--bp-only",
+          "--bp-inference",
+          "sum-product-mixed",
+          "--reference-prune-offenders",
+          "--reference-prune-policy",
+          "oracle-inliers",
+          "--reference-oracle-magnitude-weight",
+          "1",
+          "--reference-oracle-accept-message-limit",
+          "--reference-oracle-rounds",
+          "1",
+          "--reference-fiber-dir",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2",
+          "--reference-fiber-tag",
+          "hendrik_crop1",
+          "--threads",
+          "48",
+          "--winding-weights",
+          "0,0,0,0.1,0",
+          "--winding-sign-weights",
+          "1,0",
+          "--winding-hard-signs",
+          "perpendicular",
+          "--winding-sign-cost",
+          "hard",
+          "--winding-hard-sign-angle",
+          "off",
+          "--winding-max-candidate-states",
+          "32000000",
+          "--reference-initial-readout",
+          "--local-constraint-events",
+          "--winding-defect-cost",
+          "10",
+          "--winding-continuity-step-cost",
+          "100",
+          "--local-no-parallel"
+        ],
+        "inputs": {
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/.zattrs": "7db3db753ab26d4e3c2a9e9e738dba64b6400dc0d6032d8425838d40bcb903a3",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/.zgroup": "e1e1914ae531ecb50e1ead685ef01895a5452faf5f25f35cd78f1f5de1367470",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/.zarray": "14308c8b8fb9b5048f0ffe462fe88a20c45bc845bafac9674e9f0970fe423b24",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.0.0": "3351c8be12da158c6e5aabf49c53bfbcbddc0e495b4f2264f567cfe1dedca5cc",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.0.1": "4a5b6688b4fbd84582471f5b32477e09ed41031a74917a36d005d9a2c987a19e",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.0.2": "56ba6b4cbb3de6cf29f6de6fc68ee4028a767d9aae296af8b33169008f307511",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.0.3": "d2d335641b054738106aa88394f2c0cabbae4d33f8294d177e39aa25e8254479",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.1.0": "7d2cc3cf7abe93932987c943e04e5584a1ba5dd17212eb0f61731baedce41a29",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.1.1": "d7937c817cef43e03aa8578ce8187a98969f959eefdb28622ead9478fcd6a112",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.1.2": "de7bb792fbed7943bf7655d9f71a5b8bdf89e57d1c67a7d9c61c8d6bcdbdc9bc",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.1.3": "6e2dafc73605f9dd3d62a20f2f833e254e8c417c01177229aca83c3381ebfcc8",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.2.0": "a30d87ce1ef47e941f645740df77b7de5912dea4f8d33f77659595e4068dec49",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.2.1": "a773eadcf7a1a8d090827dc74e331bb1a2a2aa2cf99d15818ac6c6364875283c",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.2.2": "8fafe8c3af01d23a5295c97e3b43bf26bc4a826bbf385ec971b8decd897aaaa9",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.2.3": "4408395331ac587431681add747c65317751ae942e0e889fb24887db19170fe5",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.3.0": "be9313a6f7d21513b726f41eb6971faddcad04a124bcc6d3d315f0e8fdea6a76",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.3.1": "9ac41c5e017c02976f52b289b9a7b8a96cdb55671e56126381e4cedb90b811a5",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.3.2": "96db9307e67d773c6881472d12982377ea24e00b9716482c80edc40b9ae02c15",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.3.3": "404e5cc28e6bd4b503ace3eb1941db7170579d64919b5c5e7f2e26eabceb7963",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.0.0": "c6d643465586c23429b8cd29710981320bb515f5ead0a51b562568227c95fbd9",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.0.1": "c7beedfb34e7b9257573db90845c1a6456d6120050cdb5d011c4dd136414f706",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.0.2": "85167dc49b58ed7880b00d2103589a2ce9ba2b217c9122d246aa15d488b360fb",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.0.3": "53a172af248a1e44dd3470677ea873e8f37b38b71daa29bbf133d72be782adf7",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.1.0": "ba2a4d7f6b6ab6a9721dd7a2730d4723fbb488bb44e5fbb0549e5a592ed96fd6",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.1.1": "a7688a34f9b3bd2e75884e57b74aee89889120dbc0040c17b8b028e73dd6355d",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.1.2": "818b335924b5dcdf3ef2dc3e17abc3c66efed3bcc2f6ae62551b7b0986769c7e",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.1.3": "ad202b8fccbf11fbdc92fb564634ad35bce35b27aad6809941873232aefbcaec",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.2.0": "4653c47f31be25cde47aacc5e68968d39dab45c4e9c869403b76b07fca1d4b39",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.2.1": "4a4e6b33d4839b27abb3ff64d03d725a551d0a3121f1c72df107e6702c3a8d7c",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.2.2": "95fe1ba3e5de86f90c4005ad5412d13c29f12dde26b9a1abe91084dd6b579c0d",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.2.3": "d244539642ea7fa57ebe440f9c9ea3f2ed43a3590a8cc7a3bfd8869013ae99cd",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.3.0": "24daca7a1583db451fd5c1e9a36dd3d54343df7d39ec5f2b837bc51484ee26f2",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.3.1": "19a01be4b17877819b9ea2732bb0f770defd95a1875206ad68fcd0fc5994d669",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.3.2": "96d060e4a47e7195145056d22fbf91531cbb307fb48a5d22d942220e77f3eb45",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.3.3": "f38e057e090029a9f2c658c05a94feda1cdd4a6c6b4275f218feec9d4b7a1cec",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.0.0": "627905528560f13aa15c3f8f8765b1da6facde4b06ce9a47216d80522d51540f",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.0.1": "aee5fdaf874e74e68a80516320cc2dd85cfcad3587849efe08fdd409610a22a3",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.0.2": "59c0cfe7f1f5df2b0bc3b75d2553d5cf8a09d0f0eaa37946dd96b9b6d379d50b",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.0.3": "9e0b6c58ff25c59c8942647f175dd059d912b3e26e52209a6a51bd75e6307755",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.1.0": "aad9d68b691b95a34ad702a130a938977eaafdcabd83ae5a639096f2f5eb8b72",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.1.1": "c26c4257988d1bb9dbebd4b4e074a5dd5bcabb3559626dd87c3f4f11288cf690",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.1.2": "8542b4d6a785e1ef82cd23b5a27e911cd153ee6e1655794c29870b06498db38c",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.1.3": "258bed12764e9f872015b7a8dcf857c638250dd6c47f5aa2a0ab742954d0319a",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.2.0": "2a474d67dcadfbcbeccb3f2d89eb076d5ceee12c912a3f96ed6722f86dbd1c9a",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.2.1": "c0357afe671bd0c12037b2e83ddb79f91da8160d2273f3f1aa97d217e0622e05",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.2.2": "ad7c74c5a589267a0f16368bca2212c9a44f65d4a93c1ae05fce0a6b3a50263c",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.2.3": "22c480c95d2aa36456482e7d210f4a45cf34ecc3aeb5672a152b9ee3d4ca7676",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.3.0": "e973b3afd4ff4d112edc56dfef849d781a2e4dbeea59696e924bea2744a76236",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.3.1": "68bd68b12d253f828dba605548f562a8ac60bdbefc813124958d2c372e1c26c4",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.3.2": "45b4431bc7081eb95bcd2ed76de286a4ba058e44113bfbd1d4b820d4d4126ae1",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.3.3": "d15e576f17ada9252dbf41434aed44265470ee49082b319fce0ffe377681da14",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.0.0": "fb5b405b2e75df7b2c5c2eec283919cf42fe924f902a8015f604cc23964c1621",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.0.1": "05b90ef588d079ebf4fa3760ea536e7006aec23645b655474afd2915ff78ed15",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.0.2": "cda4c9ad31a6d8d587d2f3878e69717c30e501444034e5f2bfd5e0da7d9a597d",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.0.3": "1bad7fc3be627a8a0dc33250c715cc80013c13ff654fb3a957765791ebb206b2",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.1.0": "d8f683e6f79164ea2320b48247530ac723191e97a1b1022eb61f6fb5789c5123",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.1.1": "60d959f9a0e52e5139cb88db307bb849bbecd01bda67e536cf547610c28e7809",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.1.2": "e66fe5be1799d3eef68546ae2f63bdc26f3e102dd79c75fe517945c4a596e183",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.1.3": "82e5bc5f5c9167b39b19efd60b0cc75e6282957d94ab49b13ace0aedb32bae34",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.2.0": "4e6ba52d921d6dae685ca2bc5aab84677a4004d306317710b4c6cead0e496535",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.2.1": "7be900b1fbc2ece8e150b49e88b5a100645897681d265af31383faa1f0c2a1b2",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.2.2": "21b4a70eb2d8fc2c9265619c3976ffdc094b4ccced704c103d20365d429400b2",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.2.3": "dd59ff60640f2d115f35c5cf8805b97542a7522e7a73742a76093a5f703f5e9b",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.3.0": "200c2eb93571df1ca59c7ba55b6ebb30127d4c8c2c5372b2a66f1e3291f3a437",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.3.1": "0ad09d98295d663df53dfcfab228a7e4d1b5dc06ec8b996aea69281b90168660",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.3.2": "0d777266d226aeb4167309b893cd9dc1ce07704e8abbe55ed3fe1ce66bb7c2b1",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.3.3": "9cc6861d640738b66bc79c319f66400b4a74cf2f5026da442c6d866327189fb9",
+          "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd1-7ff0ce6c/artifacts/PHercParis4-20260411134726-las-sd1-7ff0ce6c.lasagna.json": "293cf8cb76bf07e621d3eab401904114e374225d3932f960b7a0d3d550594755",
+          "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json": "e18d1074759ef6db32538963ab13b9071dc8af334af7d991bbf77442e58453ff"
+        },
+        "references": {
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T064452831_000002.json": "d17ad691e02a8a476300ac0ff56cc5a6244d34f89f683ed273ff39c5dc138726",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T064812002_000003.json": "2f4af3d2ba2b4ea6ca4111bcb87ab8d585d68dc7391bea0cb7f8e945fcaecc45",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T065143381_000004.json": "5e5626d31c03d4fd8f510f8eb637e5df740a4a84999e0ebd4994bd0fc05fd26a",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T065643794_000005.json": "904711cb839c5e1d4a80c35009348d1dcb945975658904f976b68dd3009c15bd",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T072253909_000006.json": "066bce1b199be6ae740378409c0c7ee4e2ae15ca7f9095190fb6d8e5d0a28028",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T072717899_000007.json": "fe0ae2ad23db46f9ebea752e2e229427ccb932bbdec2bda12f2b54ff3f3628ff",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T073017594_000008.json": "19c0ae145078fd5553bb6c80353996ef8d02b167bc18d7b46eb13bc13dd0fd0a",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T074703971_000009.json": "70ba5ab35fc08d046eb20eb9a5ba12adeac0e56a984800d8363ab185b49bcb21",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T102631471_000010.json": "0f0d290ecc32d42b53829518bd68fac99ced7d202ac939866e3dd9c7c06bc336",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T105412524_000011.json": "3e91ed087f823690e8fb238e831270b7b432d5e1dc4e2520e934786e121f51b8",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T105602115_000012.json": "9df341a1a61d2be410648e0da2f1d53e59a5b989462af61ed3826b51506fd6fe",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160540656_000013.json": "106141ae627655102ca2cc4aba6039555d750932f05b996aa2e3056bbb04dae4",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160642323_000014.json": "8995247d04c62f7f421f20d3973fe907d159cf15a8bcfc52d45e8a47f686a3b4",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160716356_000015.json": "3f870c22039b77becd8945fb7d38378a360f7bd7d2bcc816272dfd596973622c",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160812289_000016.json": "9c6a41b3454a04a37adc2a3dd4aa9ea9806525f481420358f8c12bdcccd1fdeb",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T161032692_000017.json": "67918572c79cc166da81172a3e24ed01d78e8b471bc2c8d583a25a51c2a10df1",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T161219869_000018.json": "14ebb8e782fdadb8734af5f67948a9bdbe58f5089e1b46f66d37e0aeb1587b9d",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162005620_000019.json": "6461910faa5c12b9a1ffd1dceac24c5ed9626fab66914278e0097e68c56f8656",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162100631_000020.json": "0912f1593746e92dbf6ab7a50b183faab0765074fac86a7c3309e2ef66c64608",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162112825_000021.json": "6a0ffd62111ad098b4054a6fe71c9ac43dd96681ffef29a9d7927834311680cf",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162212264_000022.json": "2b222c9aecc1e03d0d61f7877b9b6ab0b329a442bf55d82ea24f4d28620f174b",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162324568_000023.json": "6a10d1044fc1ec1c487a3ba2e7a3f73cf05538ccda970d226c4fa02333d83283",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162413303_000024.json": "2fe404f9fd7eff16f4f6f0033e8d0ca598581bc0153107b8c8c6ac19b24b6465",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162425442_000025.json": "9c77b0839564818a7548380419ca8912e3753513afccfb515633eed8fe2a1af1",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162507413_000026.json": "17da40bd53a5de5f4b87a6a4e3014336cf2c0d8e6b9123236e427f46dda591e4",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162541128_000027.json": "99e51aad66cae4480d0013b6744523133c819da07fe68da11177544b372adb15"
+        },
+        "repetitions": 1,
+        "returncode": 0,
+        "revision": "ccbc6b21b28f4a635d8e92ff2deec07cbb21dafd",
+        "shared_libraries": {
+          "/home/hendrik/villa2/volume-cartographer/build/fiber-evaluation/core/libvc_fiber_tracer.so": "81cd28e15817fd464d1c1742d82eff2a3e2b76ad5bca4f356ab69dd411239b88"
+        },
+        "started_utc": "2026-09-27T17:25:19Z",
+        "wall_seconds": 303.71688139403705
+      },
+      "reference_score_percent": 42.30769230769231,
+      "retained_fulfilled_unique_constraints": 54139,
+      "reused": false,
+      "status": "complete",
+      "wall_seconds": 303.71688139403705,
+      "winding_statuses": [
+        "message_limit"
+      ],
+      "wrong_references": 15
+    },
+    {
+      "artifact_root": "/ephemeral/hendrik/fiber_crop_bench/20260927_local_step_costs_v1",
+      "constraint_score_percent": -21.82937062937063,
+      "cut": "hard",
+      "cut_reports": [
+        {
+          "cut_percent": 0.0,
+          "cuts": 0,
+          "eligible": 0,
+          "energy": 0.0
+        }
+      ],
+      "defect": 10,
+      "defect_percent": 1.5472131043054271,
+      "event_audit": {
+        "maximum_event_groups": 1,
+        "maximum_orthogonal_factors": 5,
+        "multiple_event_pieces": 0,
+        "multiple_orthogonal_factor_pieces": 521,
+        "pieces_with_orthogonal_events": 8042
+      },
+      "exact_references": 11,
+      "geometry_sha256": "0c61e47e8384b784a20dd54922b4255b4a00d5a669a26dd473626ee152549572",
+      "independent_missing": 0,
+      "independent_percent": 7.6923076923076925,
+      "initial_readout_status": [
+        "message_limit"
+      ],
+      "ladder": [
+        {
+          "hard_sign_errors": "64",
+          "reference": "0",
+          "winding": "7"
+        },
+        {
+          "hard_sign_errors": "42",
+          "reference": "0.5",
+          "winding": "2"
+        },
+        {
+          "hard_sign_errors": "39",
+          "reference": "1",
+          "winding": "5"
+        },
+        {
+          "hard_sign_errors": "48",
+          "reference": "1.5",
+          "winding": "5.5"
+        },
+        {
+          "hard_sign_errors": "73",
+          "reference": "2",
+          "winding": "2"
+        },
+        {
+          "hard_sign_errors": "73",
+          "reference": "2.5",
+          "winding": "2"
+        },
+        {
+          "hard_sign_errors": "93",
+          "reference": "3",
+          "winding": "2"
+        },
+        {
+          "hard_sign_errors": "67",
+          "reference": "3.5",
+          "winding": "2"
+        },
+        {
+          "hard_sign_errors": "107",
+          "reference": "4",
+          "winding": "5"
+        },
+        {
+          "hard_sign_errors": "82",
+          "reference": "4.5",
+          "winding": "6.5"
+        },
+        {
+          "hard_sign_errors": "78",
+          "reference": "5",
+          "winding": "5"
+        },
+        {
+          "hard_sign_errors": "74",
+          "reference": "5.5",
+          "winding": "6.5"
+        },
+        {
+          "hard_sign_errors": "103",
+          "reference": "6",
+          "winding": "7"
+        },
+        {
+          "hard_sign_errors": "71",
+          "reference": "6.5",
+          "winding": "5.5"
+        },
+        {
+          "hard_sign_errors": "97",
+          "reference": "7",
+          "winding": "2"
+        },
+        {
+          "hard_sign_errors": "73",
+          "reference": "7.5",
+          "winding": "5.5"
+        },
+        {
+          "hard_sign_errors": "117",
+          "reference": "8",
+          "winding": "7"
+        },
+        {
+          "hard_sign_errors": "115",
+          "reference": "8.5",
+          "winding": "4.5"
+        },
+        {
+          "hard_sign_errors": "75",
+          "reference": "9",
+          "winding": "7"
+        },
+        {
+          "hard_sign_errors": "107",
+          "reference": "9.5",
+          "winding": "7"
+        },
+        {
+          "hard_sign_errors": "39",
+          "reference": "10",
+          "winding": "7"
+        },
+        {
+          "hard_sign_errors": "85",
+          "reference": "10.5",
+          "winding": "2"
+        },
+        {
+          "hard_sign_errors": "43",
+          "reference": "11",
+          "winding": "2"
+        },
+        {
+          "hard_sign_errors": "89",
+          "reference": "11.5",
+          "winding": "2"
+        },
+        {
+          "hard_sign_errors": "36",
+          "reference": "12",
+          "winding": "6"
+        },
+        {
+          "hard_sign_errors": "82",
+          "reference": "12.5",
+          "winding": "5.5"
+        }
+      ],
+      "ladder_shift_percent": 11.538461538461542,
+      "ladder_shifts": 23,
+      "missing_references": 0,
+      "name": "orthogonal-d10-chard",
+      "parallel": false,
+      "problematic_unique_constraints": 11706,
+      "provenance": {
+        "binary_sha256": "7e12b3ad9571a425057dc96a8ea1a36c5c4b070d5b9f9e07b45e255f621fdc71",
+        "build_type": "RelWithDebInfo",
+        "command": [
+          "/home/hendrik/villa2/volume-cartographer/build/fiber-evaluation/bin/vc_fiber_trace_chunk",
+          "direction-ablation",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr",
+          "--normal-manifest",
+          "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json",
+          "--output",
+          "/ephemeral/hendrik/fiber_crop_bench/20260927_local_step_costs_v1/orthogonal-d10-chard",
+          "--direction-dominance",
+          "0.9",
+          "--piece-length",
+          "512",
+          "--bp-only",
+          "--bp-inference",
+          "sum-product-mixed",
+          "--reference-prune-offenders",
+          "--reference-prune-policy",
+          "oracle-inliers",
+          "--reference-oracle-magnitude-weight",
+          "1",
+          "--reference-oracle-accept-message-limit",
+          "--reference-oracle-rounds",
+          "1",
+          "--reference-fiber-dir",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2",
+          "--reference-fiber-tag",
+          "hendrik_crop1",
+          "--threads",
+          "48",
+          "--winding-weights",
+          "0,0,0,0.1,0",
+          "--winding-sign-weights",
+          "1,0",
+          "--winding-hard-signs",
+          "perpendicular",
+          "--winding-sign-cost",
+          "hard",
+          "--winding-hard-sign-angle",
+          "off",
+          "--winding-max-candidate-states",
+          "32000000",
+          "--reference-initial-readout",
+          "--local-constraint-events",
+          "--winding-defect-cost",
+          "10",
+          "--local-no-parallel"
+        ],
+        "inputs": {
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/.zattrs": "7db3db753ab26d4e3c2a9e9e738dba64b6400dc0d6032d8425838d40bcb903a3",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/.zgroup": "e1e1914ae531ecb50e1ead685ef01895a5452faf5f25f35cd78f1f5de1367470",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/.zarray": "14308c8b8fb9b5048f0ffe462fe88a20c45bc845bafac9674e9f0970fe423b24",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.0.0": "3351c8be12da158c6e5aabf49c53bfbcbddc0e495b4f2264f567cfe1dedca5cc",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.0.1": "4a5b6688b4fbd84582471f5b32477e09ed41031a74917a36d005d9a2c987a19e",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.0.2": "56ba6b4cbb3de6cf29f6de6fc68ee4028a767d9aae296af8b33169008f307511",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.0.3": "d2d335641b054738106aa88394f2c0cabbae4d33f8294d177e39aa25e8254479",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.1.0": "7d2cc3cf7abe93932987c943e04e5584a1ba5dd17212eb0f61731baedce41a29",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.1.1": "d7937c817cef43e03aa8578ce8187a98969f959eefdb28622ead9478fcd6a112",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.1.2": "de7bb792fbed7943bf7655d9f71a5b8bdf89e57d1c67a7d9c61c8d6bcdbdc9bc",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.1.3": "6e2dafc73605f9dd3d62a20f2f833e254e8c417c01177229aca83c3381ebfcc8",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.2.0": "a30d87ce1ef47e941f645740df77b7de5912dea4f8d33f77659595e4068dec49",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.2.1": "a773eadcf7a1a8d090827dc74e331bb1a2a2aa2cf99d15818ac6c6364875283c",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.2.2": "8fafe8c3af01d23a5295c97e3b43bf26bc4a826bbf385ec971b8decd897aaaa9",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.2.3": "4408395331ac587431681add747c65317751ae942e0e889fb24887db19170fe5",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.3.0": "be9313a6f7d21513b726f41eb6971faddcad04a124bcc6d3d315f0e8fdea6a76",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.3.1": "9ac41c5e017c02976f52b289b9a7b8a96cdb55671e56126381e4cedb90b811a5",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.3.2": "96db9307e67d773c6881472d12982377ea24e00b9716482c80edc40b9ae02c15",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/0.3.3": "404e5cc28e6bd4b503ace3eb1941db7170579d64919b5c5e7f2e26eabceb7963",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.0.0": "c6d643465586c23429b8cd29710981320bb515f5ead0a51b562568227c95fbd9",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.0.1": "c7beedfb34e7b9257573db90845c1a6456d6120050cdb5d011c4dd136414f706",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.0.2": "85167dc49b58ed7880b00d2103589a2ce9ba2b217c9122d246aa15d488b360fb",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.0.3": "53a172af248a1e44dd3470677ea873e8f37b38b71daa29bbf133d72be782adf7",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.1.0": "ba2a4d7f6b6ab6a9721dd7a2730d4723fbb488bb44e5fbb0549e5a592ed96fd6",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.1.1": "a7688a34f9b3bd2e75884e57b74aee89889120dbc0040c17b8b028e73dd6355d",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.1.2": "818b335924b5dcdf3ef2dc3e17abc3c66efed3bcc2f6ae62551b7b0986769c7e",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.1.3": "ad202b8fccbf11fbdc92fb564634ad35bce35b27aad6809941873232aefbcaec",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.2.0": "4653c47f31be25cde47aacc5e68968d39dab45c4e9c869403b76b07fca1d4b39",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.2.1": "4a4e6b33d4839b27abb3ff64d03d725a551d0a3121f1c72df107e6702c3a8d7c",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.2.2": "95fe1ba3e5de86f90c4005ad5412d13c29f12dde26b9a1abe91084dd6b579c0d",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.2.3": "d244539642ea7fa57ebe440f9c9ea3f2ed43a3590a8cc7a3bfd8869013ae99cd",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.3.0": "24daca7a1583db451fd5c1e9a36dd3d54343df7d39ec5f2b837bc51484ee26f2",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.3.1": "19a01be4b17877819b9ea2732bb0f770defd95a1875206ad68fcd0fc5994d669",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.3.2": "96d060e4a47e7195145056d22fbf91531cbb307fb48a5d22d942220e77f3eb45",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/1.3.3": "f38e057e090029a9f2c658c05a94feda1cdd4a6c6b4275f218feec9d4b7a1cec",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.0.0": "627905528560f13aa15c3f8f8765b1da6facde4b06ce9a47216d80522d51540f",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.0.1": "aee5fdaf874e74e68a80516320cc2dd85cfcad3587849efe08fdd409610a22a3",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.0.2": "59c0cfe7f1f5df2b0bc3b75d2553d5cf8a09d0f0eaa37946dd96b9b6d379d50b",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.0.3": "9e0b6c58ff25c59c8942647f175dd059d912b3e26e52209a6a51bd75e6307755",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.1.0": "aad9d68b691b95a34ad702a130a938977eaafdcabd83ae5a639096f2f5eb8b72",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.1.1": "c26c4257988d1bb9dbebd4b4e074a5dd5bcabb3559626dd87c3f4f11288cf690",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.1.2": "8542b4d6a785e1ef82cd23b5a27e911cd153ee6e1655794c29870b06498db38c",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.1.3": "258bed12764e9f872015b7a8dcf857c638250dd6c47f5aa2a0ab742954d0319a",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.2.0": "2a474d67dcadfbcbeccb3f2d89eb076d5ceee12c912a3f96ed6722f86dbd1c9a",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.2.1": "c0357afe671bd0c12037b2e83ddb79f91da8160d2273f3f1aa97d217e0622e05",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.2.2": "ad7c74c5a589267a0f16368bca2212c9a44f65d4a93c1ae05fce0a6b3a50263c",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.2.3": "22c480c95d2aa36456482e7d210f4a45cf34ecc3aeb5672a152b9ee3d4ca7676",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.3.0": "e973b3afd4ff4d112edc56dfef849d781a2e4dbeea59696e924bea2744a76236",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.3.1": "68bd68b12d253f828dba605548f562a8ac60bdbefc813124958d2c372e1c26c4",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.3.2": "45b4431bc7081eb95bcd2ed76de286a4ba058e44113bfbd1d4b820d4d4126ae1",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/2.3.3": "d15e576f17ada9252dbf41434aed44265470ee49082b319fce0ffe377681da14",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.0.0": "fb5b405b2e75df7b2c5c2eec283919cf42fe924f902a8015f604cc23964c1621",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.0.1": "05b90ef588d079ebf4fa3760ea536e7006aec23645b655474afd2915ff78ed15",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.0.2": "cda4c9ad31a6d8d587d2f3878e69717c30e501444034e5f2bfd5e0da7d9a597d",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.0.3": "1bad7fc3be627a8a0dc33250c715cc80013c13ff654fb3a957765791ebb206b2",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.1.0": "d8f683e6f79164ea2320b48247530ac723191e97a1b1022eb61f6fb5789c5123",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.1.1": "60d959f9a0e52e5139cb88db307bb849bbecd01bda67e536cf547610c28e7809",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.1.2": "e66fe5be1799d3eef68546ae2f63bdc26f3e102dd79c75fe517945c4a596e183",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.1.3": "82e5bc5f5c9167b39b19efd60b0cc75e6282957d94ab49b13ace0aedb32bae34",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.2.0": "4e6ba52d921d6dae685ca2bc5aab84677a4004d306317710b4c6cead0e496535",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.2.1": "7be900b1fbc2ece8e150b49e88b5a100645897681d265af31383faa1f0c2a1b2",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.2.2": "21b4a70eb2d8fc2c9265619c3976ffdc094b4ccced704c103d20365d429400b2",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.2.3": "dd59ff60640f2d115f35c5cf8805b97542a7522e7a73742a76093a5f703f5e9b",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.3.0": "200c2eb93571df1ca59c7ba55b6ebb30127d4c8c2c5372b2a66f1e3291f3a437",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.3.1": "0ad09d98295d663df53dfcfab228a7e4d1b5dc06ec8b996aea69281b90168660",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.3.2": "0d777266d226aeb4167309b893cd9dc1ce07704e8abbe55ed3fe1ce66bb7c2b1",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr/traces/3.3.3": "9cc6861d640738b66bc79c319f66400b4a74cf2f5026da442c6d866327189fb9",
+          "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd1-7ff0ce6c/artifacts/PHercParis4-20260411134726-las-sd1-7ff0ce6c.lasagna.json": "293cf8cb76bf07e621d3eab401904114e374225d3932f960b7a0d3d550594755",
+          "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json": "e18d1074759ef6db32538963ab13b9071dc8af334af7d991bbf77442e58453ff"
+        },
+        "references": {
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T064452831_000002.json": "d17ad691e02a8a476300ac0ff56cc5a6244d34f89f683ed273ff39c5dc138726",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T064812002_000003.json": "2f4af3d2ba2b4ea6ca4111bcb87ab8d585d68dc7391bea0cb7f8e945fcaecc45",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T065143381_000004.json": "5e5626d31c03d4fd8f510f8eb637e5df740a4a84999e0ebd4994bd0fc05fd26a",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T065643794_000005.json": "904711cb839c5e1d4a80c35009348d1dcb945975658904f976b68dd3009c15bd",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T072253909_000006.json": "066bce1b199be6ae740378409c0c7ee4e2ae15ca7f9095190fb6d8e5d0a28028",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T072717899_000007.json": "fe0ae2ad23db46f9ebea752e2e229427ccb932bbdec2bda12f2b54ff3f3628ff",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T073017594_000008.json": "19c0ae145078fd5553bb6c80353996ef8d02b167bc18d7b46eb13bc13dd0fd0a",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T074703971_000009.json": "70ba5ab35fc08d046eb20eb9a5ba12adeac0e56a984800d8363ab185b49bcb21",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T102631471_000010.json": "0f0d290ecc32d42b53829518bd68fac99ced7d202ac939866e3dd9c7c06bc336",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T105412524_000011.json": "3e91ed087f823690e8fb238e831270b7b432d5e1dc4e2520e934786e121f51b8",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T105602115_000012.json": "9df341a1a61d2be410648e0da2f1d53e59a5b989462af61ed3826b51506fd6fe",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160540656_000013.json": "106141ae627655102ca2cc4aba6039555d750932f05b996aa2e3056bbb04dae4",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160642323_000014.json": "8995247d04c62f7f421f20d3973fe907d159cf15a8bcfc52d45e8a47f686a3b4",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160716356_000015.json": "3f870c22039b77becd8945fb7d38378a360f7bd7d2bcc816272dfd596973622c",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160812289_000016.json": "9c6a41b3454a04a37adc2a3dd4aa9ea9806525f481420358f8c12bdcccd1fdeb",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T161032692_000017.json": "67918572c79cc166da81172a3e24ed01d78e8b471bc2c8d583a25a51c2a10df1",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T161219869_000018.json": "14ebb8e782fdadb8734af5f67948a9bdbe58f5089e1b46f66d37e0aeb1587b9d",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162005620_000019.json": "6461910faa5c12b9a1ffd1dceac24c5ed9626fab66914278e0097e68c56f8656",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162100631_000020.json": "0912f1593746e92dbf6ab7a50b183faab0765074fac86a7c3309e2ef66c64608",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162112825_000021.json": "6a0ffd62111ad098b4054a6fe71c9ac43dd96681ffef29a9d7927834311680cf",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162212264_000022.json": "2b222c9aecc1e03d0d61f7877b9b6ab0b329a442bf55d82ea24f4d28620f174b",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162324568_000023.json": "6a10d1044fc1ec1c487a3ba2e7a3f73cf05538ccda970d226c4fa02333d83283",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162413303_000024.json": "2fe404f9fd7eff16f4f6f0033e8d0ca598581bc0153107b8c8c6ac19b24b6465",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162425442_000025.json": "9c77b0839564818a7548380419ca8912e3753513afccfb515633eed8fe2a1af1",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162507413_000026.json": "17da40bd53a5de5f4b87a6a4e3014336cf2c0d8e6b9123236e427f46dda591e4",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162541128_000027.json": "99e51aad66cae4480d0013b6744523133c819da07fe68da11177544b372adb15"
+        },
+        "repetitions": 1,
+        "returncode": 0,
+        "revision": "ccbc6b21b28f4a635d8e92ff2deec07cbb21dafd",
+        "shared_libraries": {
+          "/home/hendrik/villa2/volume-cartographer/build/fiber-evaluation/core/libvc_fiber_tracer.so": "81cd28e15817fd464d1c1742d82eff2a3e2b76ad5bca4f356ab69dd411239b88"
+        },
+        "started_utc": "2026-09-27T17:19:50Z",
+        "wall_seconds": 327.73291510506533
+      },
+      "reference_score_percent": 42.30769230769231,
+      "retained_fulfilled_unique_constraints": 53625,
+      "reused": false,
+      "status": "complete",
+      "wall_seconds": 327.73291510506533,
+      "winding_statuses": [
+        "message_limit"
+      ],
+      "wrong_references": 15
+    }
+  ],
+  "summary_hashes": {
+    "/ephemeral/hendrik/fiber_crop_bench/20260927_local_step_costs_v1/summary.json": "1780bd518facd87dd551636dcf3f4e18aea77aa6128dd23ecf6e3c4e2253a1d5"
+  },
+  "summary_sha256": "1780bd518facd87dd551636dcf3f4e18aea77aa6128dd23ecf6e3c4e2253a1d5"
+}

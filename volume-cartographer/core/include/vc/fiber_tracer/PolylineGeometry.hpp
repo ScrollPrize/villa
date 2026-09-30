@@ -109,6 +109,9 @@ clipPolylineToHalfOpenBox(
     double beginArc,
     double endArc);
 
+[[nodiscard]] PolylineArcProjection projectPointToPolylineSegment(
+    const PolylineArcSegment& segment, const cv::Vec3d& point);
+
 [[nodiscard]] double distanceToPolylineArc(
     const PolylineArcGeometry& geometry,
     const cv::Vec3d& point,

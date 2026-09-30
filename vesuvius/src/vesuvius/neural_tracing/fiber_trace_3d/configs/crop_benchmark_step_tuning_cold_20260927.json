@@ -1,0 +1,58 @@
+{
+  "output_root": "/ephemeral/hendrik/fiber_crop_bench/20260927_step_tuning_cold_v1",
+  "local_cost_sweep": {
+    "template": "/home/hendrik/villa2/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/crop_benchmark_local_events_local-parallel_20260927.json",
+    "workers": 3,
+    "threads": 48,
+    "points": [
+      {
+        "parallel": true,
+        "defect": 100,
+        "cut": 10,
+        "fixed_orientation": true,
+        "distance_cost": true,
+        "screen_only": true,
+        "variant": "cool0p1-baseD10",
+        "options": {
+          "--winding-temperature": 0.025
+        }
+      },
+      {
+        "parallel": true,
+        "defect": 1000,
+        "cut": 10,
+        "fixed_orientation": true,
+        "distance_cost": true,
+        "screen_only": true,
+        "variant": "cool0p01-baseD10",
+        "options": {
+          "--winding-temperature": 0.0025
+        }
+      },
+      {
+        "parallel": true,
+        "defect": 1000,
+        "cut": 1,
+        "fixed_orientation": true,
+        "distance_cost": true,
+        "screen_only": true,
+        "variant": "cool0p1-baseD100",
+        "options": {
+          "--winding-temperature": 0.025
+        }
+      },
+      {
+        "parallel": true,
+        "defect": 10000,
+        "cut": 1,
+        "fixed_orientation": true,
+        "distance_cost": true,
+        "screen_only": true,
+        "variant": "cool0p01-baseD100",
+        "options": {
+          "--winding-temperature": 0.0025
+        }
+      }
+    ]
+  }
+}

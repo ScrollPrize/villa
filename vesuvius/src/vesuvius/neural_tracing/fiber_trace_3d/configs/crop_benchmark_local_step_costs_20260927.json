@@ -1,0 +1,16 @@
+{
+  "output_root": "/ephemeral/hendrik/fiber_crop_bench/20260927_local_step_costs_v1",
+  "local_cost_sweep": {
+    "template": "/home/hendrik/villa2/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/crop_benchmark_local_events_local-parallel_20260927.json",
+    "workers": 4,
+    "threads": 48,
+    "points": [
+      {"parallel": false, "defect": 10, "cut": "hard"},
+      {"parallel": false, "defect": 10, "cut": 10},
+      {"parallel": false, "defect": 10, "cut": 0.1, "distance_cost": true},
+      {"parallel": false, "defect": 10, "cut": 1, "distance_cost": true},
+      {"parallel": false, "defect": 10, "cut": 10, "distance_cost": true},
+      {"parallel": false, "defect": 10, "cut": 100, "distance_cost": true}
+    ]
+  }
+}

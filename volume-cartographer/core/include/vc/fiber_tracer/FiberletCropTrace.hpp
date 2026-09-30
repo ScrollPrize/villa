@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vc/fiber_tracer/FiberGraph.hpp"
+#include "vc/fiber_tracer/FiberTrace.hpp"
 
 #include <array>
 #include <cstddef>
@@ -24,6 +25,11 @@ struct FiberletCropTraceConfig {
     std::size_t maximumGeneratedStatesPerStep = 1'000'000;
     std::size_t maximumFiberletsPerSide = 100'000;
     double coverageNormalRadiusBaseVoxels = 20.0;
+    std::optional<double> coverageTangentialRadiusBaseVoxels;
+    bool reverseConsistency = false;
+    double reverseNormalRadiusBaseVoxels = 20.0;
+    double reverseTangentialRadiusBaseVoxels = 40.0;
+    double reverseBackoffBaseVoxels = 40.0;
     double coverageDirectionDegrees = 25.0;
     bool stopAtCoveredAnchors = false;
     std::optional<double> ambiguityRelativeCostMargin;
@@ -32,6 +38,7 @@ struct FiberletCropTraceConfig {
     std::size_t parallelThreads = 0;
     std::size_t maximumAttempts = 0;
     std::size_t maximumFibers = 0;
+    bool captureStepCosts = false; // Dense tracing diagnostics only; not serialized.
 };
 
 struct FiberletCropTraceSearchBox {
@@ -39,16 +46,21 @@ struct FiberletCropTraceSearchBox {
     cv::Vec3d maximumBaseXYZ{0.0, 0.0, 0.0};
 };
 
+[[nodiscard]] double fiberletCropCoverageTangentialRadius(const FiberletCropTraceConfig& config);
+
 [[nodiscard]] FiberletCropTraceSearchBox fiberletCropTraceSearchBox(
     const FiberletCropTraceConfig& config);
 
 struct FiberletCropTraceLine {
     FiberletStorageKey seed;
     cv::Vec3d seedBaseXYZ{0.0, 0.0, 0.0};
+    std::optional<cv::Vec3d> originalSeedBaseXYZ;
     float seedPresence = 0.0F;
   double totalMetricCost = 0.0;
   double pathLengthPredictionVoxels = 0.0;
     std::vector<cv::Vec3d> pointsBaseXYZ;
+    std::vector<double> segmentMetricCosts;
+    std::vector<double> segmentOriginalStepCosts;
     std::string negativeTermination;
     std::string positiveTermination;
     std::size_t negativeFiberlets = 0;
@@ -72,6 +84,9 @@ struct FiberletCropTraceResult {
     std::optional<double> minimumAmbiguityRelativeCostGap;
     double maximumAmbiguityThresholdRatio = 0.0;
     std::size_t qualityRejectedAnchors = 0;
+    std::size_t reverseAttempts = 0;
+    std::size_t reverseFailures = 0;
+    double reverseSkippedLengthBaseVoxels = 0.0;
     double candidateBatchSeconds = 0.0;
     double candidateBatchCpuSeconds = 0.0;
     double candidateTaskSeconds = 0.0;
@@ -183,6 +198,22 @@ struct FiberValueBandObjPaths {
 };
 
 using FiberletCropTraceProgress = std::function<void(const FiberletCropTraceResult& result, std::size_t remainingAnchors)>;
+
+// Cost is unavailable (serialized zero sentinel), not a quality score. Preserve
+// source order and separate contiguous runs; never connect a crop-external gap.
+[[nodiscard]] std::vector<FiberletCropTraceLine> importFiberCropLines(
+    std::span<const std::vector<cv::Vec3d>> sourceLines,
+    const FiberletCropTraceConfig& config);
+
+// Canonical anchors, deterministic crop scheduling and coverage, dense production beam.
+[[nodiscard]] FiberletCropTraceResult traceDenseBeamCrop(
+    const FiberPredictionSource& predictions,
+    std::vector<FiberletStoredAnchor> anchors,
+    double predictionToBaseScale,
+    const vc::lasagna::NormalSampler& normalSampler,
+    const FiberTraceConfig& denseConfig,
+    const FiberletCropTraceConfig& config,
+    const FiberletCropTraceProgress& progress = {});
 
 [[nodiscard]] FiberletCropTraceResult traceFiberletCrop(
     const FiberletReplayGraphSource& graph,

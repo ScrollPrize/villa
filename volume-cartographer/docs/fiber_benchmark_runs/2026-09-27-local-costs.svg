@@ -1,0 +1,249 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="980">
+<rect width="100%" height="100%" fill="white"/>
+<g font-family="sans-serif" font-size="12"><text x="10" y="20">Local BP costs — removal score (blue; nearer zero better), independent accuracy (green), conditioned accuracy (orange)</text>
+<text x="10" y="48">legacy</text>
+<rect x="310" y="38" width="14.98338019242715" height="10" fill="#4575b4"/>
+<text x="615" y="48">-110.6766%</text>
+<rect x="730" y="38" width="76.92307692307692" height="10" fill="#16855b"/>
+<text x="940" y="48">38.4615%</text>
+<rect x="1020" y="38" width="200.0" height="10" fill="#dc8431"/>
+<text x="1240" y="48">100.0000%</text>
+<text x="10" y="74">local-parallel</text>
+<rect x="310" y="64" width="12.252088782821524" height="10" fill="#4575b4"/>
+<text x="615" y="74">-90.5016%</text>
+<rect x="730" y="64" width="30.76923076923077" height="10" fill="#16855b"/>
+<text x="940" y="74">15.3846%</text>
+<rect x="1020" y="64" width="115.38461538461539" height="10" fill="#dc8431"/>
+<text x="1240" y="74">57.6923%</text>
+<text x="10" y="100">local-orthogonal</text>
+<rect x="310" y="90" width="10.124695322284364" height="10" fill="#4575b4"/>
+<text x="615" y="100">-74.7873%</text>
+<rect x="730" y="90" width="23.076923076923077" height="10" fill="#16855b"/>
+<text x="940" y="100">11.5385%</text>
+<rect x="1020" y="90" width="69.23076923076923" height="10" fill="#dc8431"/>
+<text x="1240" y="100">34.6154%</text>
+<text x="10" y="126">orthogonal-d1-c0p1</text>
+<rect x="310" y="116" width="156.22209229577527" height="10" fill="#4575b4"/>
+<text x="615" y="126">-1153.9539%</text>
+<rect x="730" y="116" width="7.6923076923076925" height="10" fill="#16855b"/>
+<text x="940" y="126">3.8462%</text>
+<rect x="1020" y="116" width="38.46153846153846" height="10" fill="#dc8431"/>
+<text x="1240" y="126">19.2308%</text>
+<text x="10" y="152">orthogonal-d1-c1</text>
+<rect x="310" y="142" width="297.01327868186553" height="10" fill="#4575b4"/>
+<text x="615" y="152">-2193.9256%</text>
+<rect x="730" y="142" width="0.0" height="10" fill="#16855b"/>
+<text x="940" y="152">0.0000%</text>
+<rect x="1020" y="142" width="38.46153846153846" height="10" fill="#dc8431"/>
+<text x="1240" y="152">19.2308%</text>
+<text x="10" y="178">orthogonal-d1-c10</text>
+<rect x="310" y="168" width="217.2683825694469" height="10" fill="#4575b4"/>
+<text x="615" y="178">-1604.8800%</text>
+<rect x="730" y="168" width="23.076923076923077" height="10" fill="#16855b"/>
+<text x="940" y="178">11.5385%</text>
+<rect x="1020" y="168" width="69.23076923076923" height="10" fill="#dc8431"/>
+<text x="1240" y="178">34.6154%</text>
+<text x="10" y="204">orthogonal-d1-chard</text>
+<rect x="310" y="194" width="235.0426783197537" height="10" fill="#4575b4"/>
+<text x="615" y="204">-1736.1720%</text>
+<rect x="730" y="194" width="0.0" height="10" fill="#16855b"/>
+<text x="940" y="204">0.0000%</text>
+<rect x="1020" y="194" width="69.23076923076923" height="10" fill="#dc8431"/>
+<text x="1240" y="204">34.6154%</text>
+<text x="10" y="230">orthogonal-d10-c0p1</text>
+<rect x="310" y="220" width="131.47759199959512" height="10" fill="#4575b4"/>
+<text x="615" y="230">-971.1756%</text>
+<rect x="730" y="220" width="7.6923076923076925" height="10" fill="#16855b"/>
+<text x="940" y="230">3.8462%</text>
+<rect x="1020" y="220" width="46.15384615384615" height="10" fill="#dc8431"/>
+<text x="1240" y="230">23.0769%</text>
+<text x="10" y="256">orthogonal-d10-c1</text>
+<rect x="310" y="246" width="6.614909115222405" height="10" fill="#4575b4"/>
+<text x="615" y="256">-48.8618%</text>
+<rect x="730" y="246" width="7.6923076923076925" height="10" fill="#16855b"/>
+<text x="940" y="256">3.8462%</text>
+<rect x="1020" y="246" width="61.53846153846154" height="10" fill="#dc8431"/>
+<text x="1240" y="256">30.7692%</text>
+<text x="10" y="282">orthogonal-d10-c10</text>
+<rect x="310" y="272" width="2.7974615082471055" height="10" fill="#4575b4"/>
+<text x="615" y="282">-20.6638%</text>
+<rect x="730" y="272" width="15.384615384615385" height="10" fill="#16855b"/>
+<text x="940" y="282">7.6923%</text>
+<rect x="1020" y="272" width="84.61538461538461" height="10" fill="#dc8431"/>
+<text x="1240" y="282">42.3077%</text>
+<text x="10" y="308">orthogonal-d10-chard</text>
+<rect x="310" y="298" width="2.955256575286068" height="10" fill="#4575b4"/>
+<text x="615" y="308">-21.8294%</text>
+<rect x="730" y="298" width="15.384615384615385" height="10" fill="#16855b"/>
+<text x="940" y="308">7.6923%</text>
+<rect x="1020" y="298" width="84.61538461538461" height="10" fill="#dc8431"/>
+<text x="1240" y="308">42.3077%</text>
+<text x="10" y="334">orthogonal-d100-c0p1</text>
+<rect x="310" y="324" width="135.35932204855732" height="10" fill="#4575b4"/>
+<text x="615" y="334">-999.8485%</text>
+<rect x="730" y="324" width="0.0" height="10" fill="#16855b"/>
+<text x="940" y="334">0.0000%</text>
+<rect x="1020" y="324" width="76.92307692307692" height="10" fill="#dc8431"/>
+<text x="1240" y="334">38.4615%</text>
+<text x="10" y="360">orthogonal-d100-c1</text>
+<rect x="310" y="350" width="5.195601149849041" height="10" fill="#4575b4"/>
+<text x="615" y="360">-38.3780%</text>
+<rect x="730" y="350" width="7.6923076923076925" height="10" fill="#16855b"/>
+<text x="940" y="360">3.8462%</text>
+<rect x="1020" y="350" width="53.84615384615385" height="10" fill="#dc8431"/>
+<text x="1240" y="360">26.9231%</text>
+<text x="10" y="386">orthogonal-d100-c10</text>
+<rect x="310" y="376" width="3.3763404419205356" height="10" fill="#4575b4"/>
+<text x="615" y="386">-24.9398%</text>
+<rect x="730" y="376" width="23.076923076923077" height="10" fill="#16855b"/>
+<text x="940" y="386">11.5385%</text>
+<rect x="1020" y="376" width="84.61538461538461" height="10" fill="#dc8431"/>
+<text x="1240" y="386">42.3077%</text>
+<text x="10" y="412">orthogonal-d100-chard</text>
+<rect x="310" y="402" width="3.223439339347044" height="10" fill="#4575b4"/>
+<text x="615" y="412">-23.8103%</text>
+<rect x="730" y="402" width="23.076923076923077" height="10" fill="#16855b"/>
+<text x="940" y="412">11.5385%</text>
+<rect x="1020" y="402" width="53.84615384615385" height="10" fill="#dc8431"/>
+<text x="1240" y="412">26.9231%</text>
+<text x="10" y="438">parallel-d1-c0p1</text>
+<rect x="310" y="428" width="146.17726641506252" height="10" fill="#4575b4"/>
+<text x="615" y="438">-1079.7566%</text>
+<rect x="730" y="428" width="15.384615384615385" height="10" fill="#16855b"/>
+<text x="940" y="438">7.6923%</text>
+<rect x="1020" y="428" width="92.3076923076923" height="10" fill="#dc8431"/>
+<text x="1240" y="438">46.1538%</text>
+<text x="10" y="464">parallel-d1-c1</text>
+<rect x="310" y="454" width="300.0" height="10" fill="#4575b4"/>
+<text x="615" y="464">-2215.9874%</text>
+<rect x="730" y="454" width="23.076923076923077" height="10" fill="#16855b"/>
+<text x="940" y="464">11.5385%</text>
+<rect x="1020" y="454" width="53.84615384615385" height="10" fill="#dc8431"/>
+<text x="1240" y="464">26.9231%</text>
+<text x="10" y="490">parallel-d1-c10</text>
+<rect x="310" y="480" width="220.36217406851492" height="10" fill="#4575b4"/>
+<text x="615" y="490">-1627.7326%</text>
+<rect x="730" y="480" width="23.076923076923077" height="10" fill="#16855b"/>
+<text x="940" y="490">11.5385%</text>
+<rect x="1020" y="480" width="69.23076923076923" height="10" fill="#dc8431"/>
+<text x="1240" y="490">34.6154%</text>
+<text x="10" y="516">parallel-d1-chard</text>
+<rect x="310" y="506" width="254.10721778456556" height="10" fill="#4575b4"/>
+<text x="615" y="516">-1876.9946%</text>
+<rect x="730" y="506" width="30.76923076923077" height="10" fill="#16855b"/>
+<text x="940" y="516">15.3846%</text>
+<rect x="1020" y="506" width="30.76923076923077" height="10" fill="#dc8431"/>
+<text x="1240" y="516">15.3846%</text>
+<text x="10" y="542">parallel-d10-c0p1</text>
+<rect x="310" y="532" width="143.09341921807325" height="10" fill="#4575b4"/>
+<text x="615" y="542">-1056.9774%</text>
+<rect x="730" y="532" width="30.76923076923077" height="10" fill="#16855b"/>
+<text x="940" y="542">15.3846%</text>
+<rect x="1020" y="532" width="38.46153846153846" height="10" fill="#dc8431"/>
+<text x="1240" y="542">19.2308%</text>
+<text x="10" y="568">parallel-d10-c1</text>
+<rect x="310" y="558" width="5.669238179181127" height="10" fill="#4575b4"/>
+<text x="615" y="568">-41.8765%</text>
+<rect x="730" y="558" width="23.076923076923077" height="10" fill="#16855b"/>
+<text x="940" y="568">11.5385%</text>
+<rect x="1020" y="558" width="69.23076923076923" height="10" fill="#dc8431"/>
+<text x="1240" y="568">34.6154%</text>
+<text x="10" y="594">parallel-d10-c10</text>
+<rect x="310" y="584" width="3.0845176249452138" height="10" fill="#4575b4"/>
+<text x="615" y="594">-22.7842%</text>
+<rect x="730" y="584" width="30.76923076923077" height="10" fill="#16855b"/>
+<text x="940" y="594">15.3846%</text>
+<rect x="1020" y="584" width="61.53846153846154" height="10" fill="#dc8431"/>
+<text x="1240" y="594">30.7692%</text>
+<text x="10" y="620">parallel-d10-chard</text>
+<rect x="310" y="610" width="2.7641358247629477" height="10" fill="#4575b4"/>
+<text x="615" y="620">-20.4176%</text>
+<rect x="730" y="610" width="30.76923076923077" height="10" fill="#16855b"/>
+<text x="940" y="620">15.3846%</text>
+<rect x="1020" y="610" width="30.76923076923077" height="10" fill="#dc8431"/>
+<text x="1240" y="620">15.3846%</text>
+<text x="10" y="646">parallel-d100-c0p1</text>
+<rect x="310" y="636" width="149.86232802988036" height="10" fill="#4575b4"/>
+<text x="615" y="646">-1106.9767%</text>
+<rect x="730" y="636" width="23.076923076923077" height="10" fill="#16855b"/>
+<text x="940" y="646">11.5385%</text>
+<rect x="1020" y="636" width="61.53846153846154" height="10" fill="#dc8431"/>
+<text x="1240" y="646">30.7692%</text>
+<text x="10" y="672">parallel-d100-c1</text>
+<rect x="310" y="662" width="6.605795103698564" height="10" fill="#4575b4"/>
+<text x="615" y="672">-48.7945%</text>
+<rect x="730" y="662" width="7.6923076923076925" height="10" fill="#16855b"/>
+<text x="940" y="672">3.8462%</text>
+<rect x="1020" y="662" width="92.3076923076923" height="10" fill="#dc8431"/>
+<text x="1240" y="672">46.1538%</text>
+<text x="10" y="698">parallel-d100-c10</text>
+<rect x="310" y="688" width="3.2613294382491693" height="10" fill="#4575b4"/>
+<text x="615" y="698">-24.0902%</text>
+<rect x="730" y="688" width="15.384615384615385" height="10" fill="#16855b"/>
+<text x="940" y="698">7.6923%</text>
+<rect x="1020" y="688" width="100.0" height="10" fill="#dc8431"/>
+<text x="1240" y="698">50.0000%</text>
+<text x="10" y="724">parallel-d100-chard</text>
+<rect x="310" y="714" width="3.5071370378208737" height="10" fill="#4575b4"/>
+<text x="615" y="724">-25.9059%</text>
+<rect x="730" y="714" width="15.384615384615385" height="10" fill="#16855b"/>
+<text x="940" y="724">7.6923%</text>
+<rect x="1020" y="714" width="92.3076923076923" height="10" fill="#dc8431"/>
+<text x="1240" y="724">46.1538%</text>
+<text x="10" y="750">orthogonal-d100-c0p1-fixed</text>
+<rect x="310" y="740" width="71.19605442596017" height="10" fill="#4575b4"/>
+<text x="615" y="750">-525.8985%</text>
+<rect x="730" y="740" width="23.076923076923077" height="10" fill="#16855b"/>
+<text x="940" y="750">11.5385%</text>
+<rect x="1020" y="740" width="61.53846153846154" height="10" fill="#dc8431"/>
+<text x="1240" y="750">30.7692%</text>
+<text x="10" y="776">orthogonal-d100-c1-fixed</text>
+<rect x="310" y="766" width="9.381084940897155" height="10" fill="#4575b4"/>
+<text x="615" y="776">-69.2946%</text>
+<rect x="730" y="766" width="23.076923076923077" height="10" fill="#16855b"/>
+<text x="940" y="776">11.5385%</text>
+<rect x="1020" y="766" width="61.53846153846154" height="10" fill="#dc8431"/>
+<text x="1240" y="776">30.7692%</text>
+<text x="10" y="802">orthogonal-d100-c10-fixed</text>
+<rect x="310" y="792" width="7.419955304100708" height="10" fill="#4575b4"/>
+<text x="615" y="802">-54.8084%</text>
+<rect x="730" y="792" width="30.76923076923077" height="10" fill="#16855b"/>
+<text x="940" y="802">15.3846%</text>
+<rect x="1020" y="792" width="38.46153846153846" height="10" fill="#dc8431"/>
+<text x="1240" y="802">19.2308%</text>
+<text x="10" y="828">orthogonal-d100-chard-fixed</text>
+<rect x="310" y="818" width="10.124695322284364" height="10" fill="#4575b4"/>
+<text x="615" y="828">-74.7873%</text>
+<rect x="730" y="818" width="23.076923076923077" height="10" fill="#16855b"/>
+<text x="940" y="828">11.5385%</text>
+<rect x="1020" y="818" width="69.23076923076923" height="10" fill="#dc8431"/>
+<text x="1240" y="828">34.6154%</text>
+<text x="10" y="854">parallel-d100-c0p1-fixed</text>
+<rect x="310" y="844" width="71.7967415712043" height="10" fill="#4575b4"/>
+<text x="615" y="854">-530.3356%</text>
+<rect x="730" y="844" width="23.076923076923077" height="10" fill="#16855b"/>
+<text x="940" y="854">11.5385%</text>
+<rect x="1020" y="844" width="69.23076923076923" height="10" fill="#dc8431"/>
+<text x="1240" y="854">34.6154%</text>
+<text x="10" y="880">parallel-d100-c1-fixed</text>
+<rect x="310" y="870" width="8.21384173829324" height="10" fill="#4575b4"/>
+<text x="615" y="880">-60.6726%</text>
+<rect x="730" y="870" width="30.76923076923077" height="10" fill="#16855b"/>
+<text x="940" y="880">15.3846%</text>
+<rect x="1020" y="870" width="53.84615384615385" height="10" fill="#dc8431"/>
+<text x="1240" y="880">26.9231%</text>
+<text x="10" y="906">parallel-d100-c10-fixed</text>
+<rect x="310" y="896" width="8.77216802686855" height="10" fill="#4575b4"/>
+<text x="615" y="906">-64.7967%</text>
+<rect x="730" y="896" width="30.76923076923077" height="10" fill="#16855b"/>
+<text x="940" y="906">15.3846%</text>
+<rect x="1020" y="896" width="100.0" height="10" fill="#dc8431"/>
+<text x="1240" y="906">50.0000%</text>
+<text x="10" y="932">parallel-d100-chard-fixed</text>
+<rect x="310" y="922" width="12.252088782821524" height="10" fill="#4575b4"/>
+<text x="615" y="932">-90.5016%</text>
+<rect x="730" y="922" width="30.76923076923077" height="10" fill="#16855b"/>
+<text x="940" y="932">15.3846%</text>
+<rect x="1020" y="922" width="115.38461538461539" height="10" fill="#dc8431"/>
+<text x="1240" y="932">57.6923%</text>
+</g></svg>

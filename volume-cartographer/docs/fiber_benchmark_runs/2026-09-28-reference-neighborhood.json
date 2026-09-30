@@ -1,0 +1,1329 @@
+{
+  "version": 1,
+  "scope": "complete-graph fixed-reference neighborhood",
+  "matched_all_solve_n2_cohort": {
+    "traces": 548,
+    "pieces": 29597,
+    "disabled_pieces": 2563,
+    "disabled_length": 98706.12012568842,
+    "length": 803538.0053640235,
+    "disabled_runs": 2245,
+    "winding_jump_runs": 335,
+    "affected_traces": 501,
+    "active_edges": 24454,
+    "nonzero_jumps": 343,
+    "disabled_pieces_percent": 8.659661452174207,
+    "disabled_length_percent": 12.283939212181009,
+    "nonzero_winding_jumps_percent": 1.4026335159892043
+  },
+  "runs": [
+    {
+      "name": "n2-d10-c10",
+      "result_path": "/ephemeral/hendrik/fiber_crop_bench/20260928_reference_neighborhood_v1/n2-d10-c10_reference_neighborhood.json",
+      "version": 1,
+      "cutoff_windings": 2,
+      "measurement_scale": 0.822,
+      "canonical_reference_sign": -1,
+      "reference_sign_audit": [
+        {
+          "chosen_sign": -1,
+          "negative_agreement_mass": 113,
+          "normal_component": 0,
+          "positive_agreement_mass": 0
+        }
+      ],
+      "cross_normal_components_without_reference_sign_evidence": [],
+      "summary": {
+        "absolute_jump_sum": 302.5,
+        "active_active_edges": 25352,
+        "affected_traces": 471,
+        "affected_traces_percent": 85.94890510948905,
+        "combined_factors_all": 104743,
+        "combined_factors_retained": 45157,
+        "continuation_edges": 29049,
+        "decoded_energy": 81500,
+        "defect_incident_edges": 3697,
+        "disabled_length_base_voxels": 82953.17907235755,
+        "disabled_length_percent": 10.323491672901971,
+        "disabled_pieces": 2083,
+        "disabled_pieces_percent": 7.037875460350711,
+        "disabled_runs": 1795,
+        "integer_gauge_components": 1,
+        "maximum_jump": 2.5,
+        "message_iterations": 500,
+        "nonzero_winding_jumps": 326,
+        "nonzero_winding_jumps_percent": 1.2858946039760177,
+        "ordinary_length_base_voxels": 803538.0053640235,
+        "ordinary_pieces_all": 68851,
+        "ordinary_pieces_retained": 29597,
+        "ordinary_pieces_retained_percent": 42.98702996325398,
+        "ordinary_traces_all": 2778,
+        "ordinary_traces_retained": 548,
+        "ordinary_traces_retained_percent": 19.7264218862491,
+        "ordinary_unanchored_components": 0,
+        "reference_only_components": 0,
+        "reference_pieces_fixed": 220,
+        "solve_seconds": 38.715828333,
+        "solver_status": "message_limit",
+        "winding_jump_runs": 320
+      },
+      "factor_agreement": {
+        "ordinary": {
+          "continuity": {
+            "defect_neutralized": 3697,
+            "evaluated": 25352,
+            "infringed": 326,
+            "prepared": 29049
+          },
+          "parallel_hv": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "parallel_sign": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "parallel_winding_0": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "parallel_winding_1": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "parallel_winding_2+": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "perp_hv": {
+            "defect_neutralized": 2216,
+            "evaluated": 10837,
+            "infringed": 861,
+            "prepared": 13053
+          },
+          "perp_sign": {
+            "defect_neutralized": 2216,
+            "evaluated": 10837,
+            "infringed": 0,
+            "prepared": 13053
+          },
+          "perp_winding_0.5": {
+            "defect_neutralized": 942,
+            "evaluated": 4899,
+            "infringed": 473,
+            "prepared": 5841
+          },
+          "perp_winding_1.5+": {
+            "defect_neutralized": 1274,
+            "evaluated": 5938,
+            "infringed": 5354,
+            "prepared": 7212
+          }
+        },
+        "reference_cross": {
+          "continuity": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "parallel_hv": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "parallel_sign": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "parallel_winding_0": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "parallel_winding_1": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "parallel_winding_2+": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "perp_hv": {
+            "defect_neutralized": 1480,
+            "evaluated": 1381,
+            "infringed": 414,
+            "prepared": 2861
+          },
+          "perp_sign": {
+            "defect_neutralized": 1480,
+            "evaluated": 1381,
+            "infringed": 0,
+            "prepared": 2861
+          },
+          "perp_winding_0.5": {
+            "defect_neutralized": 635,
+            "evaluated": 651,
+            "infringed": 512,
+            "prepared": 1286
+          },
+          "perp_winding_1.5+": {
+            "defect_neutralized": 845,
+            "evaluated": 730,
+            "infringed": 688,
+            "prepared": 1575
+          }
+        },
+        "reference_only": {
+          "continuity": {
+            "defect_neutralized": 0,
+            "evaluated": 194,
+            "infringed": 0,
+            "prepared": 194
+          },
+          "parallel_hv": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "parallel_sign": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "parallel_winding_0": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "parallel_winding_1": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "parallel_winding_2+": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "perp_hv": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "perp_sign": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "perp_winding_0.5": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "perp_winding_1.5+": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          }
+        }
+      },
+      "run": {
+        "binary_sha256": "7414d6ca84ab47b5630c51c8eed95b910e50ee6572de4f31496540175d7b6b56",
+        "build_type": "RelWithDebInfo",
+        "command": [
+          "/home/hendrik/villa2/volume-cartographer/build/fiber-evaluation/bin/vc_fiber_trace_chunk",
+          "direction-ablation",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr",
+          "--normal-manifest",
+          "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json",
+          "--output",
+          "/ephemeral/hendrik/fiber_crop_bench/20260928_reference_neighborhood_v1/n2-d10-c10",
+          "--direction-dominance",
+          "0.9",
+          "--piece-length",
+          "512",
+          "--bp-only",
+          "--bp-inference",
+          "sum-product-mixed",
+          "--reference-fiber-dir",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2",
+          "--reference-fiber-tag",
+          "hendrik_crop1",
+          "--threads",
+          "64",
+          "--winding-weights",
+          "0,0,0,0.1,0",
+          "--winding-sign-weights",
+          "1,0",
+          "--winding-hard-signs",
+          "perpendicular",
+          "--winding-sign-cost",
+          "hard",
+          "--winding-hard-sign-angle",
+          "off",
+          "--winding-max-candidate-states",
+          "32000000",
+          "--local-constraint-events",
+          "--reference-neighborhood-windings",
+          "2",
+          "--winding-continuity-step-cost",
+          "10",
+          "--winding-defect-cost",
+          "10",
+          "--winding-message-iterations",
+          "500",
+          "--local-no-parallel"
+        ],
+        "inputs": {
+          "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd1-7ff0ce6c/artifacts/PHercParis4-20260411134726-las-sd1-7ff0ce6c.lasagna.json": "293cf8cb76bf07e621d3eab401904114e374225d3932f960b7a0d3d550594755",
+          "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json": "e18d1074759ef6db32538963ab13b9071dc8af334af7d991bbf77442e58453ff"
+        },
+        "references": {
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T064452831_000002.json": "d17ad691e02a8a476300ac0ff56cc5a6244d34f89f683ed273ff39c5dc138726",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T064812002_000003.json": "2f4af3d2ba2b4ea6ca4111bcb87ab8d585d68dc7391bea0cb7f8e945fcaecc45",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T065143381_000004.json": "5e5626d31c03d4fd8f510f8eb637e5df740a4a84999e0ebd4994bd0fc05fd26a",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T065643794_000005.json": "904711cb839c5e1d4a80c35009348d1dcb945975658904f976b68dd3009c15bd",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T072253909_000006.json": "066bce1b199be6ae740378409c0c7ee4e2ae15ca7f9095190fb6d8e5d0a28028",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T072717899_000007.json": "fe0ae2ad23db46f9ebea752e2e229427ccb932bbdec2bda12f2b54ff3f3628ff",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T073017594_000008.json": "19c0ae145078fd5553bb6c80353996ef8d02b167bc18d7b46eb13bc13dd0fd0a",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T074703971_000009.json": "70ba5ab35fc08d046eb20eb9a5ba12adeac0e56a984800d8363ab185b49bcb21",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T102631471_000010.json": "0f0d290ecc32d42b53829518bd68fac99ced7d202ac939866e3dd9c7c06bc336",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T105412524_000011.json": "3e91ed087f823690e8fb238e831270b7b432d5e1dc4e2520e934786e121f51b8",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T105602115_000012.json": "9df341a1a61d2be410648e0da2f1d53e59a5b989462af61ed3826b51506fd6fe",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160540656_000013.json": "106141ae627655102ca2cc4aba6039555d750932f05b996aa2e3056bbb04dae4",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160642323_000014.json": "8995247d04c62f7f421f20d3973fe907d159cf15a8bcfc52d45e8a47f686a3b4",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160716356_000015.json": "3f870c22039b77becd8945fb7d38378a360f7bd7d2bcc816272dfd596973622c",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160812289_000016.json": "9c6a41b3454a04a37adc2a3dd4aa9ea9806525f481420358f8c12bdcccd1fdeb",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T161032692_000017.json": "67918572c79cc166da81172a3e24ed01d78e8b471bc2c8d583a25a51c2a10df1",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T161219869_000018.json": "14ebb8e782fdadb8734af5f67948a9bdbe58f5089e1b46f66d37e0aeb1587b9d",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162005620_000019.json": "6461910faa5c12b9a1ffd1dceac24c5ed9626fab66914278e0097e68c56f8656",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162100631_000020.json": "0912f1593746e92dbf6ab7a50b183faab0765074fac86a7c3309e2ef66c64608",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162112825_000021.json": "6a0ffd62111ad098b4054a6fe71c9ac43dd96681ffef29a9d7927834311680cf",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162212264_000022.json": "2b222c9aecc1e03d0d61f7877b9b6ab0b329a442bf55d82ea24f4d28620f174b",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162324568_000023.json": "6a10d1044fc1ec1c487a3ba2e7a3f73cf05538ccda970d226c4fa02333d83283",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162413303_000024.json": "2fe404f9fd7eff16f4f6f0033e8d0ca598581bc0153107b8c8c6ac19b24b6465",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162425442_000025.json": "9c77b0839564818a7548380419ca8912e3753513afccfb515633eed8fe2a1af1",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162507413_000026.json": "17da40bd53a5de5f4b87a6a4e3014336cf2c0d8e6b9123236e427f46dda591e4",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162541128_000027.json": "99e51aad66cae4480d0013b6744523133c819da07fe68da11177544b372adb15"
+        },
+        "repetitions": 1,
+        "returncode": 0,
+        "revision": "a185b07687130ca086e7b3af1d940127ffe08486",
+        "shared_libraries": {
+          "/home/hendrik/villa2/volume-cartographer/build/fiber-evaluation/core/libvc_fiber_tracer.so": "97a6dbc722a55c58cae6032a60f58e856bbb5f86c1b171b22faa90977ca5f739"
+        },
+        "started_utc": "2026-09-28T13:11:37Z",
+        "wall_seconds": 97.80649595400018
+      }
+    },
+    {
+      "name": "nall-d10-c10",
+      "result_path": "/ephemeral/hendrik/fiber_crop_bench/20260928_reference_neighborhood_v1/nall-d10-c10_reference_neighborhood.json",
+      "version": 1,
+      "cutoff_windings": null,
+      "measurement_scale": 0.822,
+      "canonical_reference_sign": -1,
+      "reference_sign_audit": [
+        {
+          "chosen_sign": -1,
+          "negative_agreement_mass": 113,
+          "normal_component": 0,
+          "positive_agreement_mass": 0
+        }
+      ],
+      "cross_normal_components_without_reference_sign_evidence": [],
+      "summary": {
+        "absolute_jump_sum": 814.5,
+        "active_active_edges": 57703,
+        "affected_traces": 1409,
+        "affected_traces_percent": 50.71994240460763,
+        "combined_factors_all": 104743,
+        "combined_factors_retained": 104743,
+        "continuation_edges": 66073,
+        "decoded_energy": 163621,
+        "defect_incident_edges": 8370,
+        "disabled_length_base_voxels": 193720.6869362778,
+        "disabled_length_percent": 8.703340544962167,
+        "disabled_pieces": 4603,
+        "disabled_pieces_percent": 6.685451191703824,
+        "disabled_runs": 4195,
+        "integer_gauge_components": 666,
+        "maximum_jump": 2.5,
+        "message_iterations": 500,
+        "nonzero_winding_jumps": 820,
+        "nonzero_winding_jumps_percent": 1.4210699617004314,
+        "ordinary_length_base_voxels": 2225819.912888631,
+        "ordinary_pieces_all": 68851,
+        "ordinary_pieces_retained": 68851,
+        "ordinary_pieces_retained_percent": 100,
+        "ordinary_traces_all": 2778,
+        "ordinary_traces_retained": 2778,
+        "ordinary_traces_retained_percent": 100,
+        "ordinary_unanchored_components": 665,
+        "reference_only_components": 0,
+        "reference_pieces_fixed": 220,
+        "solve_seconds": 77.099087927,
+        "solver_status": "message_limit",
+        "winding_jump_runs": 806
+      },
+      "factor_agreement": {
+        "ordinary": {
+          "continuity": {
+            "defect_neutralized": 8370,
+            "evaluated": 57703,
+            "infringed": 820,
+            "prepared": 66073
+          },
+          "parallel_hv": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "parallel_sign": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "parallel_winding_0": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "parallel_winding_1": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "parallel_winding_2+": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "perp_hv": {
+            "defect_neutralized": 4977,
+            "evaluated": 30551,
+            "infringed": 1606,
+            "prepared": 35528
+          },
+          "perp_sign": {
+            "defect_neutralized": 4977,
+            "evaluated": 30551,
+            "infringed": 0,
+            "prepared": 35528
+          },
+          "perp_winding_0.5": {
+            "defect_neutralized": 2094,
+            "evaluated": 12786,
+            "infringed": 1580,
+            "prepared": 14880
+          },
+          "perp_winding_1.5+": {
+            "defect_neutralized": 2883,
+            "evaluated": 17765,
+            "infringed": 16409,
+            "prepared": 20648
+          }
+        },
+        "reference_cross": {
+          "continuity": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "parallel_hv": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "parallel_sign": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "parallel_winding_0": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "parallel_winding_1": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "parallel_winding_2+": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "perp_hv": {
+            "defect_neutralized": 1552,
+            "evaluated": 1396,
+            "infringed": 210,
+            "prepared": 2948
+          },
+          "perp_sign": {
+            "defect_neutralized": 1552,
+            "evaluated": 1396,
+            "infringed": 0,
+            "prepared": 2948
+          },
+          "perp_winding_0.5": {
+            "defect_neutralized": 648,
+            "evaluated": 638,
+            "infringed": 505,
+            "prepared": 1286
+          },
+          "perp_winding_1.5+": {
+            "defect_neutralized": 904,
+            "evaluated": 758,
+            "infringed": 706,
+            "prepared": 1662
+          }
+        },
+        "reference_only": {
+          "continuity": {
+            "defect_neutralized": 0,
+            "evaluated": 194,
+            "infringed": 0,
+            "prepared": 194
+          },
+          "parallel_hv": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "parallel_sign": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "parallel_winding_0": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "parallel_winding_1": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "parallel_winding_2+": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "perp_hv": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "perp_sign": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "perp_winding_0.5": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "perp_winding_1.5+": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          }
+        }
+      },
+      "run": {
+        "binary_sha256": "7414d6ca84ab47b5630c51c8eed95b910e50ee6572de4f31496540175d7b6b56",
+        "build_type": "RelWithDebInfo",
+        "command": [
+          "/home/hendrik/villa2/volume-cartographer/build/fiber-evaluation/bin/vc_fiber_trace_chunk",
+          "direction-ablation",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr",
+          "--normal-manifest",
+          "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json",
+          "--output",
+          "/ephemeral/hendrik/fiber_crop_bench/20260928_reference_neighborhood_v1/nall-d10-c10",
+          "--direction-dominance",
+          "0.9",
+          "--piece-length",
+          "512",
+          "--bp-only",
+          "--bp-inference",
+          "sum-product-mixed",
+          "--reference-fiber-dir",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2",
+          "--reference-fiber-tag",
+          "hendrik_crop1",
+          "--threads",
+          "64",
+          "--winding-weights",
+          "0,0,0,0.1,0",
+          "--winding-sign-weights",
+          "1,0",
+          "--winding-hard-signs",
+          "perpendicular",
+          "--winding-sign-cost",
+          "hard",
+          "--winding-hard-sign-angle",
+          "off",
+          "--winding-max-candidate-states",
+          "32000000",
+          "--local-constraint-events",
+          "--reference-neighborhood-windings",
+          "all",
+          "--winding-continuity-step-cost",
+          "10",
+          "--winding-defect-cost",
+          "10",
+          "--winding-message-iterations",
+          "500",
+          "--local-no-parallel"
+        ],
+        "inputs": {
+          "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd1-7ff0ce6c/artifacts/PHercParis4-20260411134726-las-sd1-7ff0ce6c.lasagna.json": "293cf8cb76bf07e621d3eab401904114e374225d3932f960b7a0d3d550594755",
+          "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json": "e18d1074759ef6db32538963ab13b9071dc8af334af7d991bbf77442e58453ff"
+        },
+        "references": {
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T064452831_000002.json": "d17ad691e02a8a476300ac0ff56cc5a6244d34f89f683ed273ff39c5dc138726",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T064812002_000003.json": "2f4af3d2ba2b4ea6ca4111bcb87ab8d585d68dc7391bea0cb7f8e945fcaecc45",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T065143381_000004.json": "5e5626d31c03d4fd8f510f8eb637e5df740a4a84999e0ebd4994bd0fc05fd26a",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T065643794_000005.json": "904711cb839c5e1d4a80c35009348d1dcb945975658904f976b68dd3009c15bd",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T072253909_000006.json": "066bce1b199be6ae740378409c0c7ee4e2ae15ca7f9095190fb6d8e5d0a28028",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T072717899_000007.json": "fe0ae2ad23db46f9ebea752e2e229427ccb932bbdec2bda12f2b54ff3f3628ff",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T073017594_000008.json": "19c0ae145078fd5553bb6c80353996ef8d02b167bc18d7b46eb13bc13dd0fd0a",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T074703971_000009.json": "70ba5ab35fc08d046eb20eb9a5ba12adeac0e56a984800d8363ab185b49bcb21",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T102631471_000010.json": "0f0d290ecc32d42b53829518bd68fac99ced7d202ac939866e3dd9c7c06bc336",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T105412524_000011.json": "3e91ed087f823690e8fb238e831270b7b432d5e1dc4e2520e934786e121f51b8",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T105602115_000012.json": "9df341a1a61d2be410648e0da2f1d53e59a5b989462af61ed3826b51506fd6fe",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160540656_000013.json": "106141ae627655102ca2cc4aba6039555d750932f05b996aa2e3056bbb04dae4",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160642323_000014.json": "8995247d04c62f7f421f20d3973fe907d159cf15a8bcfc52d45e8a47f686a3b4",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160716356_000015.json": "3f870c22039b77becd8945fb7d38378a360f7bd7d2bcc816272dfd596973622c",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160812289_000016.json": "9c6a41b3454a04a37adc2a3dd4aa9ea9806525f481420358f8c12bdcccd1fdeb",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T161032692_000017.json": "67918572c79cc166da81172a3e24ed01d78e8b471bc2c8d583a25a51c2a10df1",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T161219869_000018.json": "14ebb8e782fdadb8734af5f67948a9bdbe58f5089e1b46f66d37e0aeb1587b9d",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162005620_000019.json": "6461910faa5c12b9a1ffd1dceac24c5ed9626fab66914278e0097e68c56f8656",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162100631_000020.json": "0912f1593746e92dbf6ab7a50b183faab0765074fac86a7c3309e2ef66c64608",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162112825_000021.json": "6a0ffd62111ad098b4054a6fe71c9ac43dd96681ffef29a9d7927834311680cf",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162212264_000022.json": "2b222c9aecc1e03d0d61f7877b9b6ab0b329a442bf55d82ea24f4d28620f174b",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162324568_000023.json": "6a10d1044fc1ec1c487a3ba2e7a3f73cf05538ccda970d226c4fa02333d83283",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162413303_000024.json": "2fe404f9fd7eff16f4f6f0033e8d0ca598581bc0153107b8c8c6ac19b24b6465",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162425442_000025.json": "9c77b0839564818a7548380419ca8912e3753513afccfb515633eed8fe2a1af1",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162507413_000026.json": "17da40bd53a5de5f4b87a6a4e3014336cf2c0d8e6b9123236e427f46dda591e4",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162541128_000027.json": "99e51aad66cae4480d0013b6744523133c819da07fe68da11177544b372adb15"
+        },
+        "repetitions": 1,
+        "returncode": 0,
+        "revision": "a185b07687130ca086e7b3af1d940127ffe08486",
+        "shared_libraries": {
+          "/home/hendrik/villa2/volume-cartographer/build/fiber-evaluation/core/libvc_fiber_tracer.so": "97a6dbc722a55c58cae6032a60f58e856bbb5f86c1b171b22faa90977ca5f739"
+        },
+        "started_utc": "2026-09-28T13:11:38Z",
+        "wall_seconds": 136.79890862000002
+      }
+    },
+    {
+      "name": "n2-d3-c10",
+      "result_path": "/ephemeral/hendrik/fiber_crop_bench/20260928_reference_neighborhood_v1/n2-d3-c10_reference_neighborhood.json",
+      "version": 1,
+      "cutoff_windings": 2,
+      "measurement_scale": 0.822,
+      "canonical_reference_sign": -1,
+      "reference_sign_audit": [
+        {
+          "chosen_sign": -1,
+          "negative_agreement_mass": 113,
+          "normal_component": 0,
+          "positive_agreement_mass": 0
+        }
+      ],
+      "cross_normal_components_without_reference_sign_evidence": [],
+      "summary": {
+        "absolute_jump_sum": 463,
+        "active_active_edges": 25343,
+        "affected_traces": 494,
+        "affected_traces_percent": 90.14598540145985,
+        "combined_factors_all": 104743,
+        "combined_factors_retained": 45157,
+        "continuation_edges": 29049,
+        "decoded_energy": 28262,
+        "defect_incident_edges": 3706,
+        "disabled_length_base_voxels": 83074.1698789215,
+        "disabled_length_percent": 10.33854893288921,
+        "disabled_pieces": 2090,
+        "disabled_pieces_percent": 7.061526506064804,
+        "disabled_runs": 1796,
+        "integer_gauge_components": 1,
+        "maximum_jump": 2.5,
+        "message_iterations": 500,
+        "nonzero_winding_jumps": 427,
+        "nonzero_winding_jumps_percent": 1.6848833997553565,
+        "ordinary_length_base_voxels": 803538.0053640235,
+        "ordinary_pieces_all": 68851,
+        "ordinary_pieces_retained": 29597,
+        "ordinary_pieces_retained_percent": 42.98702996325398,
+        "ordinary_traces_all": 2778,
+        "ordinary_traces_retained": 548,
+        "ordinary_traces_retained_percent": 19.7264218862491,
+        "ordinary_unanchored_components": 0,
+        "reference_only_components": 0,
+        "reference_pieces_fixed": 220,
+        "solve_seconds": 36.181276995,
+        "solver_status": "message_limit",
+        "winding_jump_runs": 421
+      },
+      "factor_agreement": {
+        "ordinary": {
+          "continuity": {
+            "defect_neutralized": 3706,
+            "evaluated": 25343,
+            "infringed": 427,
+            "prepared": 29049
+          },
+          "parallel_hv": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "parallel_sign": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "parallel_winding_0": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "parallel_winding_1": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "parallel_winding_2+": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "perp_hv": {
+            "defect_neutralized": 2264,
+            "evaluated": 10789,
+            "infringed": 263,
+            "prepared": 13053
+          },
+          "perp_sign": {
+            "defect_neutralized": 2264,
+            "evaluated": 10789,
+            "infringed": 0,
+            "prepared": 13053
+          },
+          "perp_winding_0.5": {
+            "defect_neutralized": 968,
+            "evaluated": 4873,
+            "infringed": 664,
+            "prepared": 5841
+          },
+          "perp_winding_1.5+": {
+            "defect_neutralized": 1296,
+            "evaluated": 5916,
+            "infringed": 5285,
+            "prepared": 7212
+          }
+        },
+        "reference_cross": {
+          "continuity": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "parallel_hv": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "parallel_sign": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "parallel_winding_0": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "parallel_winding_1": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "parallel_winding_2+": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "perp_hv": {
+            "defect_neutralized": 1473,
+            "evaluated": 1388,
+            "infringed": 47,
+            "prepared": 2861
+          },
+          "perp_sign": {
+            "defect_neutralized": 1473,
+            "evaluated": 1388,
+            "infringed": 0,
+            "prepared": 2861
+          },
+          "perp_winding_0.5": {
+            "defect_neutralized": 631,
+            "evaluated": 655,
+            "infringed": 516,
+            "prepared": 1286
+          },
+          "perp_winding_1.5+": {
+            "defect_neutralized": 842,
+            "evaluated": 733,
+            "infringed": 682,
+            "prepared": 1575
+          }
+        },
+        "reference_only": {
+          "continuity": {
+            "defect_neutralized": 0,
+            "evaluated": 194,
+            "infringed": 0,
+            "prepared": 194
+          },
+          "parallel_hv": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "parallel_sign": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "parallel_winding_0": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "parallel_winding_1": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "parallel_winding_2+": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "perp_hv": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "perp_sign": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "perp_winding_0.5": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "perp_winding_1.5+": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          }
+        }
+      },
+      "run": {
+        "binary_sha256": "7414d6ca84ab47b5630c51c8eed95b910e50ee6572de4f31496540175d7b6b56",
+        "build_type": "RelWithDebInfo",
+        "command": [
+          "/home/hendrik/villa2/volume-cartographer/build/fiber-evaluation/bin/vc_fiber_trace_chunk",
+          "direction-ablation",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr",
+          "--normal-manifest",
+          "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json",
+          "--output",
+          "/ephemeral/hendrik/fiber_crop_bench/20260928_reference_neighborhood_v1/n2-d3-c10",
+          "--direction-dominance",
+          "0.9",
+          "--piece-length",
+          "512",
+          "--bp-only",
+          "--bp-inference",
+          "sum-product-mixed",
+          "--reference-fiber-dir",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2",
+          "--reference-fiber-tag",
+          "hendrik_crop1",
+          "--threads",
+          "64",
+          "--winding-weights",
+          "0,0,0,0.1,0",
+          "--winding-sign-weights",
+          "1,0",
+          "--winding-hard-signs",
+          "perpendicular",
+          "--winding-sign-cost",
+          "hard",
+          "--winding-hard-sign-angle",
+          "off",
+          "--winding-max-candidate-states",
+          "32000000",
+          "--local-constraint-events",
+          "--reference-neighborhood-windings",
+          "2",
+          "--winding-continuity-step-cost",
+          "10",
+          "--winding-defect-cost",
+          "3",
+          "--winding-message-iterations",
+          "500",
+          "--local-no-parallel"
+        ],
+        "inputs": {
+          "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd1-7ff0ce6c/artifacts/PHercParis4-20260411134726-las-sd1-7ff0ce6c.lasagna.json": "293cf8cb76bf07e621d3eab401904114e374225d3932f960b7a0d3d550594755",
+          "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json": "e18d1074759ef6db32538963ab13b9071dc8af334af7d991bbf77442e58453ff"
+        },
+        "references": {
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T064452831_000002.json": "d17ad691e02a8a476300ac0ff56cc5a6244d34f89f683ed273ff39c5dc138726",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T064812002_000003.json": "2f4af3d2ba2b4ea6ca4111bcb87ab8d585d68dc7391bea0cb7f8e945fcaecc45",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T065143381_000004.json": "5e5626d31c03d4fd8f510f8eb637e5df740a4a84999e0ebd4994bd0fc05fd26a",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T065643794_000005.json": "904711cb839c5e1d4a80c35009348d1dcb945975658904f976b68dd3009c15bd",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T072253909_000006.json": "066bce1b199be6ae740378409c0c7ee4e2ae15ca7f9095190fb6d8e5d0a28028",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T072717899_000007.json": "fe0ae2ad23db46f9ebea752e2e229427ccb932bbdec2bda12f2b54ff3f3628ff",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T073017594_000008.json": "19c0ae145078fd5553bb6c80353996ef8d02b167bc18d7b46eb13bc13dd0fd0a",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T074703971_000009.json": "70ba5ab35fc08d046eb20eb9a5ba12adeac0e56a984800d8363ab185b49bcb21",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T102631471_000010.json": "0f0d290ecc32d42b53829518bd68fac99ced7d202ac939866e3dd9c7c06bc336",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T105412524_000011.json": "3e91ed087f823690e8fb238e831270b7b432d5e1dc4e2520e934786e121f51b8",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T105602115_000012.json": "9df341a1a61d2be410648e0da2f1d53e59a5b989462af61ed3826b51506fd6fe",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160540656_000013.json": "106141ae627655102ca2cc4aba6039555d750932f05b996aa2e3056bbb04dae4",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160642323_000014.json": "8995247d04c62f7f421f20d3973fe907d159cf15a8bcfc52d45e8a47f686a3b4",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160716356_000015.json": "3f870c22039b77becd8945fb7d38378a360f7bd7d2bcc816272dfd596973622c",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160812289_000016.json": "9c6a41b3454a04a37adc2a3dd4aa9ea9806525f481420358f8c12bdcccd1fdeb",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T161032692_000017.json": "67918572c79cc166da81172a3e24ed01d78e8b471bc2c8d583a25a51c2a10df1",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T161219869_000018.json": "14ebb8e782fdadb8734af5f67948a9bdbe58f5089e1b46f66d37e0aeb1587b9d",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162005620_000019.json": "6461910faa5c12b9a1ffd1dceac24c5ed9626fab66914278e0097e68c56f8656",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162100631_000020.json": "0912f1593746e92dbf6ab7a50b183faab0765074fac86a7c3309e2ef66c64608",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162112825_000021.json": "6a0ffd62111ad098b4054a6fe71c9ac43dd96681ffef29a9d7927834311680cf",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162212264_000022.json": "2b222c9aecc1e03d0d61f7877b9b6ab0b329a442bf55d82ea24f4d28620f174b",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162324568_000023.json": "6a10d1044fc1ec1c487a3ba2e7a3f73cf05538ccda970d226c4fa02333d83283",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162413303_000024.json": "2fe404f9fd7eff16f4f6f0033e8d0ca598581bc0153107b8c8c6ac19b24b6465",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162425442_000025.json": "9c77b0839564818a7548380419ca8912e3753513afccfb515633eed8fe2a1af1",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162507413_000026.json": "17da40bd53a5de5f4b87a6a4e3014336cf2c0d8e6b9123236e427f46dda591e4",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162541128_000027.json": "99e51aad66cae4480d0013b6744523133c819da07fe68da11177544b372adb15"
+        },
+        "repetitions": 1,
+        "returncode": 0,
+        "revision": "a185b07687130ca086e7b3af1d940127ffe08486",
+        "shared_libraries": {
+          "/home/hendrik/villa2/volume-cartographer/build/fiber-evaluation/core/libvc_fiber_tracer.so": "97a6dbc722a55c58cae6032a60f58e856bbb5f86c1b171b22faa90977ca5f739"
+        },
+        "started_utc": "2026-09-28T13:11:39Z",
+        "wall_seconds": 94.78919489600003
+      }
+    },
+    {
+      "name": "n2-d10-c3",
+      "result_path": "/ephemeral/hendrik/fiber_crop_bench/20260928_reference_neighborhood_v1/n2-d10-c3_reference_neighborhood.json",
+      "version": 1,
+      "cutoff_windings": 2,
+      "measurement_scale": 0.822,
+      "canonical_reference_sign": -1,
+      "reference_sign_audit": [
+        {
+          "chosen_sign": -1,
+          "negative_agreement_mass": 113,
+          "normal_component": 0,
+          "positive_agreement_mass": 0
+        }
+      ],
+      "cross_normal_components_without_reference_sign_evidence": [],
+      "summary": {
+        "absolute_jump_sum": 1299.5,
+        "active_active_edges": 26918,
+        "affected_traces": 485,
+        "affected_traces_percent": 88.5036496350365,
+        "combined_factors_all": 104743,
+        "combined_factors_retained": 45157,
+        "continuation_edges": 29049,
+        "decoded_energy": 58968.5,
+        "defect_incident_edges": 2131,
+        "disabled_length_base_voxels": 55281.351419304796,
+        "disabled_length_percent": 6.879743216907446,
+        "disabled_pieces": 1271,
+        "disabled_pieces_percent": 4.294354157515964,
+        "disabled_runs": 1015,
+        "integer_gauge_components": 1,
+        "maximum_jump": 2.5,
+        "message_iterations": 500,
+        "nonzero_winding_jumps": 1912,
+        "nonzero_winding_jumps_percent": 7.103053718701241,
+        "ordinary_length_base_voxels": 803538.0053640235,
+        "ordinary_pieces_all": 68851,
+        "ordinary_pieces_retained": 29597,
+        "ordinary_pieces_retained_percent": 42.98702996325398,
+        "ordinary_traces_all": 2778,
+        "ordinary_traces_retained": 548,
+        "ordinary_traces_retained_percent": 19.7264218862491,
+        "ordinary_unanchored_components": 0,
+        "reference_only_components": 0,
+        "reference_pieces_fixed": 220,
+        "solve_seconds": 34.795276509,
+        "solver_status": "message_limit",
+        "winding_jump_runs": 1783
+      },
+      "factor_agreement": {
+        "ordinary": {
+          "continuity": {
+            "defect_neutralized": 2131,
+            "evaluated": 26918,
+            "infringed": 1912,
+            "prepared": 29049
+          },
+          "parallel_hv": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "parallel_sign": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "parallel_winding_0": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "parallel_winding_1": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "parallel_winding_2+": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "perp_hv": {
+            "defect_neutralized": 1561,
+            "evaluated": 11492,
+            "infringed": 444,
+            "prepared": 13053
+          },
+          "perp_sign": {
+            "defect_neutralized": 1561,
+            "evaluated": 11492,
+            "infringed": 0,
+            "prepared": 13053
+          },
+          "perp_winding_0.5": {
+            "defect_neutralized": 686,
+            "evaluated": 5155,
+            "infringed": 252,
+            "prepared": 5841
+          },
+          "perp_winding_1.5+": {
+            "defect_neutralized": 875,
+            "evaluated": 6337,
+            "infringed": 6000,
+            "prepared": 7212
+          }
+        },
+        "reference_cross": {
+          "continuity": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "parallel_hv": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "parallel_sign": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "parallel_winding_0": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "parallel_winding_1": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "parallel_winding_2+": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "perp_hv": {
+            "defect_neutralized": 1459,
+            "evaluated": 1402,
+            "infringed": 246,
+            "prepared": 2861
+          },
+          "perp_sign": {
+            "defect_neutralized": 1459,
+            "evaluated": 1402,
+            "infringed": 0,
+            "prepared": 2861
+          },
+          "perp_winding_0.5": {
+            "defect_neutralized": 621,
+            "evaluated": 665,
+            "infringed": 526,
+            "prepared": 1286
+          },
+          "perp_winding_1.5+": {
+            "defect_neutralized": 838,
+            "evaluated": 737,
+            "infringed": 680,
+            "prepared": 1575
+          }
+        },
+        "reference_only": {
+          "continuity": {
+            "defect_neutralized": 0,
+            "evaluated": 194,
+            "infringed": 0,
+            "prepared": 194
+          },
+          "parallel_hv": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "parallel_sign": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "parallel_winding_0": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "parallel_winding_1": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "parallel_winding_2+": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "perp_hv": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "perp_sign": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "perp_winding_0.5": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          },
+          "perp_winding_1.5+": {
+            "defect_neutralized": 0,
+            "evaluated": 0,
+            "infringed": 0,
+            "prepared": 0
+          }
+        }
+      },
+      "run": {
+        "binary_sha256": "7414d6ca84ab47b5630c51c8eed95b910e50ee6572de4f31496540175d7b6b56",
+        "build_type": "RelWithDebInfo",
+        "command": [
+          "/home/hendrik/villa2/volume-cartographer/build/fiber-evaluation/bin/vc_fiber_trace_chunk",
+          "direction-ablation",
+          "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.zarr",
+          "--normal-manifest",
+          "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json",
+          "--output",
+          "/ephemeral/hendrik/fiber_crop_bench/20260928_reference_neighborhood_v1/n2-d10-c3",
+          "--direction-dominance",
+          "0.9",
+          "--piece-length",
+          "512",
+          "--bp-only",
+          "--bp-inference",
+          "sum-product-mixed",
+          "--reference-fiber-dir",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2",
+          "--reference-fiber-tag",
+          "hendrik_crop1",
+          "--threads",
+          "64",
+          "--winding-weights",
+          "0,0,0,0.1,0",
+          "--winding-sign-weights",
+          "1,0",
+          "--winding-hard-signs",
+          "perpendicular",
+          "--winding-sign-cost",
+          "hard",
+          "--winding-hard-sign-angle",
+          "off",
+          "--winding-max-candidate-states",
+          "32000000",
+          "--local-constraint-events",
+          "--reference-neighborhood-windings",
+          "2",
+          "--winding-continuity-step-cost",
+          "3",
+          "--winding-defect-cost",
+          "10",
+          "--winding-message-iterations",
+          "500",
+          "--local-no-parallel"
+        ],
+        "inputs": {
+          "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd1-7ff0ce6c/artifacts/PHercParis4-20260411134726-las-sd1-7ff0ce6c.lasagna.json": "293cf8cb76bf07e621d3eab401904114e374225d3932f960b7a0d3d550594755",
+          "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json": "e18d1074759ef6db32538963ab13b9071dc8af334af7d991bbf77442e58453ff"
+        },
+        "references": {
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T064452831_000002.json": "d17ad691e02a8a476300ac0ff56cc5a6244d34f89f683ed273ff39c5dc138726",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T064812002_000003.json": "2f4af3d2ba2b4ea6ca4111bcb87ab8d585d68dc7391bea0cb7f8e945fcaecc45",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T065143381_000004.json": "5e5626d31c03d4fd8f510f8eb637e5df740a4a84999e0ebd4994bd0fc05fd26a",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T065643794_000005.json": "904711cb839c5e1d4a80c35009348d1dcb945975658904f976b68dd3009c15bd",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T072253909_000006.json": "066bce1b199be6ae740378409c0c7ee4e2ae15ca7f9095190fb6d8e5d0a28028",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T072717899_000007.json": "fe0ae2ad23db46f9ebea752e2e229427ccb932bbdec2bda12f2b54ff3f3628ff",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T073017594_000008.json": "19c0ae145078fd5553bb6c80353996ef8d02b167bc18d7b46eb13bc13dd0fd0a",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260828T074703971_000009.json": "70ba5ab35fc08d046eb20eb9a5ba12adeac0e56a984800d8363ab185b49bcb21",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T102631471_000010.json": "0f0d290ecc32d42b53829518bd68fac99ced7d202ac939866e3dd9c7c06bc336",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T105412524_000011.json": "3e91ed087f823690e8fb238e831270b7b432d5e1dc4e2520e934786e121f51b8",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T105602115_000012.json": "9df341a1a61d2be410648e0da2f1d53e59a5b989462af61ed3826b51506fd6fe",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160540656_000013.json": "106141ae627655102ca2cc4aba6039555d750932f05b996aa2e3056bbb04dae4",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160642323_000014.json": "8995247d04c62f7f421f20d3973fe907d159cf15a8bcfc52d45e8a47f686a3b4",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160716356_000015.json": "3f870c22039b77becd8945fb7d38378a360f7bd7d2bcc816272dfd596973622c",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T160812289_000016.json": "9c6a41b3454a04a37adc2a3dd4aa9ea9806525f481420358f8c12bdcccd1fdeb",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T161032692_000017.json": "67918572c79cc166da81172a3e24ed01d78e8b471bc2c8d583a25a51c2a10df1",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T161219869_000018.json": "14ebb8e782fdadb8734af5f67948a9bdbe58f5089e1b46f66d37e0aeb1587b9d",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162005620_000019.json": "6461910faa5c12b9a1ffd1dceac24c5ed9626fab66914278e0097e68c56f8656",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162100631_000020.json": "0912f1593746e92dbf6ab7a50b183faab0765074fac86a7c3309e2ef66c64608",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162112825_000021.json": "6a0ffd62111ad098b4054a6fe71c9ac43dd96681ffef29a9d7927834311680cf",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162212264_000022.json": "2b222c9aecc1e03d0d61f7877b9b6ab0b329a442bf55d82ea24f4d28620f174b",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162324568_000023.json": "6a10d1044fc1ec1c487a3ba2e7a3f73cf05538ccda970d226c4fa02333d83283",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162413303_000024.json": "2fe404f9fd7eff16f4f6f0033e8d0ca598581bc0153107b8c8c6ac19b24b6465",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162425442_000025.json": "9c77b0839564818a7548380419ca8912e3753513afccfb515633eed8fe2a1af1",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162507413_000026.json": "17da40bd53a5de5f4b87a6a4e3014336cf2c0d8e6b9123236e427f46dda591e4",
+          "/home/hendrik/test_datasets/2026-09-01_fiber_stack2/waldkauz_20260901T162541128_000027.json": "99e51aad66cae4480d0013b6744523133c819da07fe68da11177544b372adb15"
+        },
+        "repetitions": 1,
+        "returncode": 0,
+        "revision": "a185b07687130ca086e7b3af1d940127ffe08486",
+        "shared_libraries": {
+          "/home/hendrik/villa2/volume-cartographer/build/fiber-evaluation/core/libvc_fiber_tracer.so": "97a6dbc722a55c58cae6032a60f58e856bbb5f86c1b171b22faa90977ca5f739"
+        },
+        "started_utc": "2026-09-28T13:11:41Z",
+        "wall_seconds": 93.12974723499974
+      }
+    }
+  ]
+}

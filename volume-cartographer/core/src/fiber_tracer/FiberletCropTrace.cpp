@@ -23,6 +23,7 @@
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <tuple>
 #include <thread>
 
@@ -676,6 +677,8 @@ struct SideTrace {
     };
 
     std::vector<cv::Vec3d> points;
+    std::vector<double> cumulativeCosts;
+    std::vector<double> originalStepCosts;
     std::vector<Boundary> boundaries;
     std::string termination = "graph_exhausted";
     std::size_t fiberlets = 0;
@@ -774,7 +777,150 @@ struct TraceCandidate {
     double centralMetricCost = 0.0;
     LookaheadStatistics lookahead;
     bool hasUsableEdge = false;
+    std::vector<FiberletCropTraceLine> verifiedLines;
+    std::size_t reverseAttempts = 0;
+    std::size_t reverseFailures = 0;
+    double reverseSkippedLengthBaseVoxels = 0.0;
 };
+
+// Retain the original geometry, not the independently reconstructed reverse
+// route. Costs are integrated from the original forward steps at cut positions.
+void verifyDenseCandidate(
+    TraceCandidate& candidate,
+    const FiberPredictionSource& predictions,
+    const vc::lasagna::NormalSampler& normals,
+    const FiberTraceConfig& denseConfig,
+    double predictionToBaseScale,
+    const FiberletCropTraceConfig& config)
+{
+    struct Interval { double begin; double end; };
+    std::vector<FiberletCropTraceLine> negativePieces, positivePieces;
+    for (int sign : {-1, 1}) {
+        const auto& side = sign < 0 ? candidate.negative : candidate.positive;
+        if (side.points.size() < 2)
+            continue;
+        const auto geometry = makePolylineArcGeometry(side.points);
+        if (!(geometry.length() > kEpsilon))
+            continue;
+        std::vector<Interval> intervals;
+        double startArc = geometry.length();
+        while (startArc > kEpsilon) {
+            ++candidate.reverseAttempts;
+            const auto start = samplePolylineArc(geometry, startArc);
+            double verifiedArc = startArc;
+            cv::Vec3d previous = start.point;
+            const double scale = denseConfig.traceToBaseScale;
+            try {
+                (void)traceFiberExtrapolation(predictions, start.point / scale,
+                    -start.tangent, std::max(3.0 * startArc / scale,
+                        2.0 * denseConfig.stepVoxels), denseConfig, &normals, {},
+                    [&](const cv::Vec3d& tracePoint, double, int) {
+                        const cv::Vec3d point = tracePoint * scale;
+                        const double advance = length(point - previous);
+                        if (!(advance > kEpsilon))
+                            return true;
+                        previous = point;
+                        // Restrict each match to a small monotone arc window, so
+                        // a nearby fold cannot jump the validator along the line.
+                        const auto projection = projectPointToPolylineArc(geometry,
+                            point, std::max(0.0, verifiedArc - 2.0 * advance), verifiedArc);
+                        const auto measurement = measureFiberReplayThreshold(point,
+                            projection.point, normals, scale,
+                            config.reverseNormalRadiusBaseVoxels,
+                            config.reverseTangentialRadiusBaseVoxels /
+                                config.reverseNormalRadiusBaseVoxels);
+                        if (fiberReplayThresholdExceeded(measurement,
+                                config.reverseNormalRadiusBaseVoxels) ||
+                            !(projection.arc < verifiedArc - kEpsilon))
+                            return false;
+                        verifiedArc = projection.arc;
+                        return verifiedArc > kEpsilon;
+                    });
+            } catch (const std::invalid_argument& error) {
+                // Same missing-start policy as reference replay. A reverse
+                // seed in a prediction hole is an immediate failed check;
+                // never hide configuration or other sampling failures.
+                if (std::string_view(error.what()) !=
+                    "fiber trace start point has no valid prediction direction")
+                    throw;
+            }
+            if (startArc - verifiedArc > kEpsilon)
+                intervals.push_back({verifiedArc, startArc});
+            if (verifiedArc <= kEpsilon)
+                break;
+            ++candidate.reverseFailures;
+            const double next = std::max(0.0,
+                verifiedArc - config.reverseBackoffBaseVoxels);
+            candidate.reverseSkippedLengthBaseVoxels += verifiedArc - next;
+            startArc = next;
+        }
+        const auto costAt = [&](double arc) {
+            const auto sample = samplePolylineArc(geometry, arc);
+            const auto i = sample.segmentIndex;
+            const double span = geometry.vertexArcs[i + 1] - geometry.vertexArcs[i];
+            const double fraction = span > 0 ?
+                (arc - geometry.vertexArcs[i]) / span : 0.0;
+            return side.cumulativeCosts[i] + fraction *
+                (side.cumulativeCosts[i + 1] - side.cumulativeCosts[i]);
+        };
+        auto& pieces = sign < 0 ? negativePieces : positivePieces;
+        // Seed-to-end order gives stable output and permits only the two
+        // seed-adjacent intervals to be joined across the original seed.
+        for (auto it = intervals.rbegin(); it != intervals.rend(); ++it) {
+            auto line = candidate.line;
+            line.pointsBaseXYZ = slicePolylineArc(geometry, it->begin, it->end);
+            line.pathLengthPredictionVoxels = (it->end - it->begin) / predictionToBaseScale;
+            line.totalMetricCost = costAt(it->end) - costAt(it->begin);
+            if (config.captureStepCosts) {
+                const auto local = makePolylineArcGeometry(line.pointsBaseXYZ);
+                for (std::size_t j = 1; j < local.vertexArcs.size(); ++j) {
+                    const double a = it->begin + local.vertexArcs[j - 1];
+                    const double b = it->begin + local.vertexArcs[j];
+                    line.segmentMetricCosts.push_back(costAt(b) - costAt(a));
+                    const auto source = samplePolylineArc(geometry, (a + b) * 0.5).segmentIndex;
+                    line.segmentOriginalStepCosts.push_back(side.originalStepCosts.at(source));
+                }
+            }
+            line.seedBaseXYZ = line.pointsBaseXYZ.front();
+            if (it->begin > kEpsilon)
+                line.originalSeedBaseXYZ = candidate.line.seedBaseXYZ;
+            line.negativeTermination = it->begin <= kEpsilon ? "seed" : "reverse_consistency_gap";
+            line.positiveTermination = it->end == geometry.length() ? side.termination : "reverse_consistency_backoff";
+            const auto steps = line.pointsBaseXYZ.size() - 1;
+            if (sign < 0) {
+                std::reverse(line.pointsBaseXYZ.begin(), line.pointsBaseXYZ.end());
+                std::reverse(line.segmentMetricCosts.begin(), line.segmentMetricCosts.end());
+                std::reverse(line.segmentOriginalStepCosts.begin(), line.segmentOriginalStepCosts.end());
+                std::swap(line.negativeTermination, line.positiveTermination);
+                line.negativeFiberlets = steps;
+            } else {
+                line.positiveFiberlets = steps;
+            }
+            pieces.push_back(std::move(line));
+        }
+    }
+    if (!negativePieces.empty() && !positivePieces.empty() &&
+        !negativePieces.front().originalSeedBaseXYZ &&
+        !positivePieces.front().originalSeedBaseXYZ) {
+        auto& joined = negativePieces.front();
+        auto& positive = positivePieces.front();
+        joined.pointsBaseXYZ.insert(joined.pointsBaseXYZ.end(),
+            std::next(positive.pointsBaseXYZ.begin()), positive.pointsBaseXYZ.end());
+        joined.totalMetricCost += positive.totalMetricCost;
+        joined.segmentMetricCosts.insert(joined.segmentMetricCosts.end(),
+            positive.segmentMetricCosts.begin(), positive.segmentMetricCosts.end());
+        joined.segmentOriginalStepCosts.insert(joined.segmentOriginalStepCosts.end(),
+            positive.segmentOriginalStepCosts.begin(), positive.segmentOriginalStepCosts.end());
+        joined.pathLengthPredictionVoxels += positive.pathLengthPredictionVoxels;
+        joined.positiveTermination = positive.positiveTermination;
+        joined.positiveFiberlets = positive.positiveFiberlets;
+        positivePieces.erase(positivePieces.begin());
+    }
+    candidate.verifiedLines = std::move(negativePieces);
+    candidate.verifiedLines.insert(candidate.verifiedLines.end(),
+        std::make_move_iterator(positivePieces.begin()),
+        std::make_move_iterator(positivePieces.end()));
+}
 
 void truncateAtCoveredAnchor(
     SideTrace& side,
@@ -818,6 +964,15 @@ FiberletCropTraceLine finalizeCandidate(TraceCandidate& candidate)
     line.pointsBaseXYZ.insert(
         line.pointsBaseXYZ.end(), std::next(positive.points.begin()),
         positive.points.end());
+    if (!negative.originalStepCosts.empty() || !positive.originalStepCosts.empty()) {
+        for (std::size_t i = negative.cumulativeCosts.size(); i > 1; --i)
+            line.segmentMetricCosts.push_back(negative.cumulativeCosts[i - 1] - negative.cumulativeCosts[i - 2]);
+        for (std::size_t i = 1; i < positive.cumulativeCosts.size(); ++i)
+            line.segmentMetricCosts.push_back(positive.cumulativeCosts[i] - positive.cumulativeCosts[i - 1]);
+        line.segmentOriginalStepCosts.assign(negative.originalStepCosts.rbegin(), negative.originalStepCosts.rend());
+        line.segmentOriginalStepCosts.insert(line.segmentOriginalStepCosts.end(),
+            positive.originalStepCosts.begin(), positive.originalStepCosts.end());
+    }
     return std::move(line);
 }
 
@@ -953,12 +1108,13 @@ std::size_t suppressCoveredAnchors(
     const std::map<Bucket, std::vector<std::size_t>>& index,
     const vc::lasagna::NormalSampler& normalSampler,
     double normalWorkingToBaseScale,
-    const FiberletReplayGraphSource& graph,
+    double predictionToBaseScale,
     const FiberletCropTraceConfig& config)
 {
     if (line.size() < 2)
         return 0;
-    const double broadRadius = fiberReplayTangentialThresholdBaseVoxels(config.coverageNormalRadiusBaseVoxels);
+    const double tangentialRadius = fiberletCropCoverageTangentialRadius(config);
+    const double broadRadius = std::max(tangentialRadius, config.coverageNormalRadiusBaseVoxels);
     const double minimumDirectionDot = std::cos(config.coverageDirectionDegrees * kPi / 180.0);
     struct Projection {
         double distanceSquared = std::numeric_limits<double>::infinity();
@@ -987,7 +1143,7 @@ std::size_t suppressCoveredAnchors(
                     for (const auto anchorIndex : found->second) {
                         if (covered[anchorIndex])
                             continue;
-                        const cv::Vec3d point(anchors[anchorIndex].positionPredictionXYZ * graph.predictionToBaseScale());
+                        const cv::Vec3d point(anchors[anchorIndex].positionPredictionXYZ * predictionToBaseScale);
                         const double t = std::clamp((point - start).dot(delta) / segmentLengthSquared, 0.0, 1.0);
                         const cv::Vec3d projection = start + delta * t;
                         const double distanceSquared = (point - projection).dot(point - projection);
@@ -1005,9 +1161,10 @@ std::size_t suppressCoveredAnchors(
     for (const auto& [anchorIndex, projection] : projections) {
         if (covered[anchorIndex])
             continue;
-        const cv::Vec3d point(anchors[anchorIndex].positionPredictionXYZ * graph.predictionToBaseScale());
+        const cv::Vec3d point(anchors[anchorIndex].positionPredictionXYZ * predictionToBaseScale);
         const auto measurement =
-            measureFiberReplayThreshold(point, projection.point, normalSampler, normalWorkingToBaseScale, config.coverageNormalRadiusBaseVoxels);
+            measureFiberReplayThreshold(point, projection.point, normalSampler, normalWorkingToBaseScale, config.coverageNormalRadiusBaseVoxels,
+                tangentialRadius / config.coverageNormalRadiusBaseVoxels);
         if (fiberReplayThresholdExceeded(measurement, config.coverageNormalRadiusBaseVoxels)) {
             continue;
         }
@@ -1057,15 +1214,26 @@ FiberletCropTraceSearchBox fiberletCropTraceSearchBox(
     return result;
 }
 
-FiberletCropTraceResult traceFiberletCrop(
-    const FiberletReplayGraphSource& graph,
+double fiberletCropCoverageTangentialRadius(const FiberletCropTraceConfig& config)
+{
+    const double radius = config.coverageTangentialRadiusBaseVoxels.value_or(
+        fiberReplayTangentialThresholdBaseVoxels(config.coverageNormalRadiusBaseVoxels));
+    if (!(radius > 0.0) || !std::isfinite(radius))
+        throw std::invalid_argument("Crop tangential coverage radius must be finite and positive");
+    return radius;
+}
+
+static FiberletCropTraceResult traceCropCandidates(
+    double predictionToBaseScale,
+    bool concurrentQueries,
+    const std::function<TraceCandidate(const FiberletStoredAnchor&)>& traceCandidateAt,
     std::vector<FiberletStoredAnchor> anchors,
     const vc::lasagna::NormalSampler& normalSampler,
     double normalWorkingToBaseScale,
     const FiberletCropTraceConfig& config,
     const FiberletCropTraceProgress& progress)
 {
-    const auto searchBox = fiberletCropTraceSearchBox(config);
+    (void)fiberletCropTraceSearchBox(config);
     if (config.beamWidth == 0 || config.maximumGeneratedStatesPerStep == 0 ||
         config.maximumFiberletsPerSide == 0 || !(config.coverageNormalRadiusBaseVoxels > 0.0) ||
         !(config.coverageDirectionDegrees >= 0.0) || !(config.coverageDirectionDegrees <= 90.0) || !(normalWorkingToBaseScale > 0.0) ||
@@ -1091,12 +1259,12 @@ FiberletCropTraceResult traceFiberletCrop(
     std::vector<bool> covered(anchors.size(), false);
     std::size_t activeAnchors = anchors.size();
     std::map<FiberletStorageKey, std::size_t> anchorIndices;
-    const double bucketSide = fiberReplayTangentialThresholdBaseVoxels(config.coverageNormalRadiusBaseVoxels);
+    const double bucketSide = std::max(fiberletCropCoverageTangentialRadius(config), config.coverageNormalRadiusBaseVoxels);
     std::map<Bucket, std::vector<std::size_t>> spatialIndex;
     for (std::size_t index = 0; index < anchors.size(); ++index) {
         if (!anchorIndices.emplace(anchors[index].key, index).second)
             throw std::invalid_argument("Fiberlet crop anchors contain a duplicate key");
-        const cv::Vec3d point(anchors[index].positionPredictionXYZ * graph.predictionToBaseScale());
+        const cv::Vec3d point(anchors[index].positionPredictionXYZ * predictionToBaseScale);
         spatialIndex[bucketFor(point, bucketSide)].push_back(index);
     }
 
@@ -1106,7 +1274,7 @@ FiberletCropTraceResult traceFiberletCrop(
     const bool ambiguitySamplingIsConcurrent =
         !config.ambiguityRelativeCostMargin.has_value() ||
         normalSampler.supportsConcurrentSampling();
-    const std::size_t workerCount = graph.supportsConcurrentQueries() &&
+    const std::size_t workerCount = concurrentQueries &&
             ambiguitySamplingIsConcurrent
         ? std::min(requestedThreads, std::max<std::size_t>(1, anchors.size()))
         : 1;
@@ -1157,9 +1325,7 @@ FiberletCropTraceResult traceFiberletCrop(
             completion.anchorIndex = anchorIndex;
             const auto started = std::chrono::steady_clock::now();
             try {
-                completion.candidate = traceCandidate(
-                    graph, anchors[anchorIndex], normalSampler,
-                    normalWorkingToBaseScale, config, searchBox);
+                completion.candidate = traceCandidateAt(anchors[anchorIndex]);
             } catch (...) {
                 completion.failure = std::current_exception();
             }
@@ -1264,37 +1430,50 @@ FiberletCropTraceResult traceFiberletCrop(
                     truncateAtCoveredAnchor(
                         candidate.positive, anchorIndices, covered);
                 }
-                const bool bidirectional = candidate.negative.fiberlets > 0 &&
-                    candidate.positive.fiberlets > 0;
-                auto line = finalizeCandidate(candidate);
-                if (line.pointsBaseXYZ.size() < 2) {
-                    ++result.noEdgeAnchors;
-                } else if (config.maximumAcceptedCostDensity &&
-                           line.totalMetricCost /
-                                   line.pathLengthPredictionVoxels >
-                               *config.maximumAcceptedCostDensity) {
-                    ++result.qualityRejectedAnchors;
+                std::vector<FiberletCropTraceLine> lines;
+                if (config.reverseConsistency) {
+                    lines = std::move(candidate.verifiedLines);
+                    result.reverseAttempts += candidate.reverseAttempts;
+                    result.reverseFailures += candidate.reverseFailures;
+                    result.reverseSkippedLengthBaseVoxels += candidate.reverseSkippedLengthBaseVoxels;
                 } else {
-                    result.coveredAnchorStops +=
-                        candidate.negative.termination == "covered_anchor";
-                    result.coveredAnchorStops +=
-                        candidate.positive.termination == "covered_anchor";
-                    result.acceptedAmbiguityStops +=
-                        candidate.negative.termination == "ambiguous_route";
-                    result.acceptedAmbiguityStops +=
-                        candidate.positive.termination == "ambiguous_route";
-                    if (bidirectional)
-                        ++result.bidirectionalLines;
-                    else
-                        ++result.oneSidedLines;
-                    covered[index] = true;
-                    const std::size_t suppressed = suppressCoveredAnchors(
-                        line.pointsBaseXYZ, anchors, active, covered,
-                        spatialIndex, normalSampler, normalWorkingToBaseScale,
-                        graph, config);
-                    result.coveredAnchors += suppressed;
-                    activeAnchors -= suppressed;
-                    result.lines.push_back(std::move(line));
+                    lines.push_back(finalizeCandidate(candidate));
+                }
+                if (lines.empty())
+                    ++result.noEdgeAnchors;
+                for (auto& line : lines) {
+                    if (config.maximumFibers && result.lines.size() >= config.maximumFibers)
+                        break;
+                    if (line.pointsBaseXYZ.size() < 2) {
+                        ++result.noEdgeAnchors;
+                    } else if (config.maximumAcceptedCostDensity &&
+                               line.totalMetricCost /
+                                       line.pathLengthPredictionVoxels >
+                                   *config.maximumAcceptedCostDensity) {
+                        ++result.qualityRejectedAnchors;
+                    } else {
+                        result.coveredAnchorStops +=
+                            candidate.negative.termination == "covered_anchor";
+                        result.coveredAnchorStops +=
+                            candidate.positive.termination == "covered_anchor";
+                        result.acceptedAmbiguityStops +=
+                            candidate.negative.termination == "ambiguous_route";
+                        result.acceptedAmbiguityStops +=
+                            candidate.positive.termination == "ambiguous_route";
+                        if (line.negativeFiberlets > 0 && line.positiveFiberlets > 0)
+                            ++result.bidirectionalLines;
+                        else
+                            ++result.oneSidedLines;
+                        if (!line.originalSeedBaseXYZ)
+                            covered[index] = true;
+                        const std::size_t suppressed = suppressCoveredAnchors(
+                            line.pointsBaseXYZ, anchors, active, covered,
+                            spatialIndex, normalSampler, normalWorkingToBaseScale,
+                            predictionToBaseScale, config);
+                        result.coveredAnchors += suppressed;
+                        activeAnchors -= suppressed;
+                        result.lines.push_back(std::move(line));
+                    }
                 }
             }
             if (progress)
@@ -1332,6 +1511,146 @@ FiberletCropTraceResult traceFiberletCrop(
     if (orderedFailure)
         std::rethrow_exception(orderedFailure);
     return result;
+}
+
+std::vector<FiberletCropTraceLine> importFiberCropLines(
+    std::span<const std::vector<cv::Vec3d>> sourceLines,
+    const FiberletCropTraceConfig& config)
+{
+    (void)fiberletCropTraceSearchBox(config);
+    if (config.reverseConsistency)
+        throw std::invalid_argument("Reverse consistency requires dense beam tracing");
+    if (config.maximumAcceptedCostDensity)
+        throw std::invalid_argument("Imported fibers have no metric quality cost");
+    std::vector<FiberletCropTraceLine> result;
+    for (std::size_t source = 0; source < sourceLines.size(); ++source) {
+        const auto runs = clipPolylineToHalfOpenBox(sourceLines[source], config.minimumBaseXYZ, config.maximumBaseXYZ);
+        for (std::size_t run = 0; run < runs.size(); ++run) {
+            const auto geometry = makePolylineArcGeometry(runs[run]);
+            if (!(geometry.length() > kEpsilon)) continue;
+            FiberletCropTraceLine line;
+            line.seed = {{0, static_cast<std::int64_t>(source), static_cast<std::int64_t>(run)}, 0};
+            // Segment midpoint is strictly inside even when a run starts on an
+            // excluded maximum face. Insert it so artifact seed lies on route.
+            line.seedBaseXYZ = (runs[run][0] + runs[run][1]) * 0.5;
+            line.pointsBaseXYZ = runs[run];
+            line.pointsBaseXYZ.insert(line.pointsBaseXYZ.begin() + 1, line.seedBaseXYZ);
+            line.pathLengthPredictionVoxels = geometry.length(); // Native L0 scale 1.
+            line.negativeTermination = "imported_run_start";
+            line.positiveTermination = "imported_run_end";
+            result.push_back(std::move(line));
+        }
+    }
+    return result;
+}
+
+FiberletCropTraceResult traceFiberletCrop(
+    const FiberletReplayGraphSource& graph,
+    std::vector<FiberletStoredAnchor> anchors,
+    const vc::lasagna::NormalSampler& normalSampler,
+    double normalWorkingToBaseScale,
+    const FiberletCropTraceConfig& config,
+    const FiberletCropTraceProgress& progress)
+{
+    if (config.reverseConsistency)
+        throw std::invalid_argument("Reverse consistency requires dense beam tracing");
+    const auto searchBox = fiberletCropTraceSearchBox(config);
+    return traceCropCandidates(graph.predictionToBaseScale(), graph.supportsConcurrentQueries(),
+        [&](const auto& seed) {
+            return traceCandidate(graph, seed, normalSampler, normalWorkingToBaseScale, config, searchBox);
+        }, std::move(anchors), normalSampler, normalWorkingToBaseScale, config, progress);
+}
+
+FiberletCropTraceResult traceDenseBeamCrop(
+    const FiberPredictionSource& predictions,
+    std::vector<FiberletStoredAnchor> anchors,
+    double predictionToBaseScale,
+    const vc::lasagna::NormalSampler& normalSampler,
+    const FiberTraceConfig& denseConfig,
+    const FiberletCropTraceConfig& config,
+    const FiberletCropTraceProgress& progress)
+{
+    if (config.reverseConsistency &&
+        (!(config.reverseNormalRadiusBaseVoxels > 0) || !std::isfinite(config.reverseNormalRadiusBaseVoxels) ||
+         !(config.reverseTangentialRadiusBaseVoxels > 0) || !std::isfinite(config.reverseTangentialRadiusBaseVoxels) ||
+         !(config.reverseBackoffBaseVoxels > 0) || !std::isfinite(config.reverseBackoffBaseVoxels)))
+        throw std::invalid_argument("Reverse consistency radii and backoff must be finite and positive");
+    if (config.stopAtCoveredAnchors || config.ambiguityRelativeCostMargin)
+        throw std::invalid_argument("Dense beam crop does not support graph-only stopping options");
+    if (config.maximumAcceptedCostDensity)
+        throw std::invalid_argument("Dense beam loss is not calibrated to Fiberlet quality thresholds");
+    if (!(predictionToBaseScale > 0.0) || !std::isfinite(predictionToBaseScale))
+        throw std::invalid_argument("Dense crop prediction scale must be positive and finite");
+    const double traceScale = denseConfig.traceToBaseScale;
+    if (!(traceScale > 0.0) || !std::isfinite(traceScale))
+        throw std::invalid_argument("Dense crop trace scale must be positive and finite");
+    auto traceConfig = denseConfig;
+    traceConfig.parallelThreads = 1;
+    const double distance = length(config.maximumBaseXYZ - config.minimumBaseXYZ) * 3.0 / traceScale;
+    return traceCropCandidates(predictionToBaseScale,
+        predictions.supportsConcurrentSampling() && normalSampler.supportsConcurrentSampling(),
+        [&](const FiberletStoredAnchor& seed) {
+            TraceCandidate candidate;
+            candidate.line.seed = seed.key;
+            candidate.line.seedBaseXYZ = cv::Vec3d(seed.positionPredictionXYZ) * predictionToBaseScale;
+            candidate.line.seedPresence = seed.predictionPresence;
+            const auto axis = normalized(seed.fittedAxisXYZ);
+            if (length(axis) <= kEpsilon)
+                return candidate;
+            // Canonical stored-grid anchors may fall in a hole in the trace
+            // binding; treat these as unusable seeds, not a whole-crop failure.
+            const cv::Vec3d traceStart(cv::Vec3f(candidate.line.seedBaseXYZ / traceScale));
+            const auto initialSample = predictions.sample(traceStart, axis);
+            if (std::none_of(initialSample.options.begin(), initialSample.options.end(),
+                    [](const auto& option) { return option.valid; }))
+                return candidate;
+            for (int sign : {-1, 1}) {
+                auto& side = sign < 0 ? candidate.negative : candidate.positive;
+                side.points.push_back(candidate.line.seedBaseXYZ);
+                if (config.reverseConsistency || config.captureStepCosts)
+                    side.cumulativeCosts.push_back(0.0);
+                double previousLoss = 0.0;
+                bool exited = false;
+                const auto traced = traceFiberExtrapolation(predictions,
+                    candidate.line.seedBaseXYZ / traceScale, axis * sign, distance,
+                    traceConfig, &normalSampler, {},
+                    [&](const cv::Vec3d& tracePoint, double cumulativeLoss, int) {
+                        const cv::Vec3d point = tracePoint * traceScale;
+                        const auto previous = side.points.back();
+                        if (length(point - previous) <= kEpsilon)
+                            return true;
+                        double fraction = 1.0;
+                        cv::Vec3d retained = point;
+                        if (!pointInHalfOpenBox(point, config.minimumBaseXYZ, config.maximumBaseXYZ)) {
+                            const auto clipped = clipLineSegmentToHalfOpenBox(previous, point,
+                                config.minimumBaseXYZ, config.maximumBaseXYZ);
+                            if (!clipped) {
+                                exited = true;
+                                return false;
+                            }
+                            retained = clipped->finish;
+                            fraction = length(retained - previous) / length(point - previous);
+                            exited = true;
+                        }
+                        side.totalMetricCost += (cumulativeLoss - previousLoss) * fraction;
+                        if (config.captureStepCosts)
+                            side.originalStepCosts.push_back(cumulativeLoss - previousLoss);
+                        previousLoss = cumulativeLoss;
+                        side.pathLengthPredictionVoxels += length(retained - previous) / predictionToBaseScale;
+                        side.points.push_back(retained);
+                        if (config.reverseConsistency || config.captureStepCosts)
+                            side.cumulativeCosts.push_back(side.totalMetricCost);
+                        ++side.fiberlets;
+                        return !exited;
+                    });
+                side.termination = exited ? "crop_exit" : traced.reason;
+            }
+            candidate.hasUsableEdge = candidate.negative.fiberlets + candidate.positive.fiberlets > 0;
+            if (config.reverseConsistency && candidate.hasUsableEdge)
+                verifyDenseCandidate(candidate, predictions, normalSampler,
+                    traceConfig, predictionToBaseScale, config);
+            return candidate;
+        }, std::move(anchors), normalSampler, traceScale, config, progress);
 }
 
 FiberDirectionClassification classifyFiberletCropDirections(

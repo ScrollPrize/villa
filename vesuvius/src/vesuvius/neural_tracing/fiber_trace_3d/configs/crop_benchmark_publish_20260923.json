@@ -1,0 +1,15 @@
+{
+  "output_root": "/ephemeral/hendrik/fiber_crop_bench/20260923_v1",
+  "reference_dir": "/home/hendrik/test_datasets/2026-09-01_fiber_stack2",
+  "restore_historical_metrics": true,
+  "commands": [],
+  "publish_replay_plots": [
+    {"id": "greedy_classic_20260923", "label": "Greedy / Classic rerun", "result": "direct-d74cca79.json"},
+    {"id": "greedy_new_20260923", "label": "Greedy / new u22000", "result": "direct-7ff0ce6c.json"},
+    {"id": "fiberlet_classic_v2_20260923", "label": "Fiberlet / Classic cache v2", "result": "fiberlet-classic.json"},
+    {"id": "fiberlet_classic_v3_20260923", "label": "Fiberlet / Classic v3", "result": "fiberlet-classic-regenerated.json"},
+    {"id": "fiberlet_new_v3_20260923", "label": "Fiberlet / new u22000", "result": "fiberlet-7ff0ce6c.json"},
+    {"id": "beam_classic_20260923", "label": "VC3D beam / Classic", "result": "beam-d74cca79.json"},
+    {"id": "beam_new_20260923", "label": "VC3D beam / new u22000", "result": "beam-7ff0ce6c.json"}
+  ]
+}

@@ -150,6 +150,19 @@ enum class FiberTraceWindingNormalConfidence : unsigned char {
     FiberTraceWindingNormalConfidence mode) noexcept;
 
 struct FiberTraceWindingBeliefPropagationConfig {
+    // Experimental joint-grid winding-measurement on/off prior; continuity is never disabled.
+    std::optional<double> measurementDisableCost;
+    // Joint-grid only: minimize a binary continuation keep/cut choice.
+    // Keep requires identical active H/V and integer winding; cut costs C.
+    // A Defect endpoint already disconnects it, without an extra charge.
+    std::optional<double> continuityCutCost;
+    // With a cost configured, penalize physical winding distance instead of
+    // a constant cut: C*abs(delta integer winding + calibrated H/V offset).
+    bool continuityCostByDistance = false;
+    // Experimental prior: synthetic boundaries need not add evidence mass.
+    bool includeContinuityInDefectMass = true;
+    // Opt-in deterministic coordinate descent of the decoded BP objective.
+    std::size_t decodeRepairSweeps = 0;
     double temperature = 0.25;
     double messageDamping = 0.5;
     double messageResidualTolerance = 1.0e-8;
@@ -261,6 +274,10 @@ struct FiberTraceJointGridProgress {
     double minimumGain = 1.0;
     double maximumGain = 1.0;
     double elapsedSeconds = 0.0;
+    std::size_t inputFactors = 0;
+    std::size_t retainedFactors = 0;
+    std::size_t inputMeasurements = 0;
+    std::size_t retainedMeasurements = 0;
 };
 
 using FiberTraceJointGridProgressCallback =
@@ -296,6 +313,9 @@ using FiberTraceInterleavedWindingProgressCallback =
     std::function<void(const FiberTraceInterleavedWindingProgress&)>;
 
 struct FiberTraceWindingFactorDiagnostic {
+    bool measurementMapOff = false;
+    bool continuityMapCut = false;
+    double measurementConditionalOffProbability = 0.0;
     std::size_t constraintIndex = 0;
     std::size_t pieceA = 0;
     std::size_t pieceB = 0;
@@ -361,7 +381,9 @@ struct FiberTracePreparedWindingMeasurement {
     std::optional<double> rawPerpendicularSignedDelta;
     std::optional<double> selectedNormalAlignment;
     double selectedConfidence = 1.0;
+    double evidenceWeight = 1.0;
     bool continuity = false;
+    bool allowMeasurementDisable = true;
     bool quantizeTargets = true;
     bool parallelDominant = false;
     bool perpendicularDominant = false;
@@ -379,12 +401,17 @@ struct FiberTracePreparedWindingEdge {
 };
 
 struct FiberTracePreparedWindingModel {
+    std::size_t inputFactors = 0;
+    std::size_t inputMeasurements = 0;
     std::vector<std::size_t> pieceToNode;
     std::vector<std::vector<std::size_t>> piecesByNode;
     std::vector<FiberTracePreparedWindingEdge> edges;
     std::vector<std::vector<std::size_t>> adjacency;
-    std::vector<std::size_t> incidentMeasurements;
-    std::vector<std::size_t> incidentWindingMeasurements;
+    std::vector<double> incidentMeasurements;
+    std::vector<double> incidentWindingMeasurements;
+    std::vector<double> defectCostMultipliers;
+    std::vector<double> defectLengthMeasures;
+    std::vector<double> defectLengthBlends;
     std::vector<std::size_t> componentByNode;
     std::vector<std::size_t> integerGaugeByNode;
     std::vector<std::size_t> gaugeNodeByComponent;
@@ -394,6 +421,12 @@ struct FiberTracePreparedWindingModel {
     FiberTraceWindingBeliefPropagationConfig config;
     double preparedMeasurementScale = 1.0;
 };
+
+// Expand integer support without letting a normalized constant message favor
+// newly inserted states. Existing relative log evidence is preserved.
+[[nodiscard]] std::vector<double> expandFiberTraceWindingLogMessage(
+    std::span<const double> message, int oldLower, int oldUpper,
+    int newLower, int newUpper, std::size_t orientationCount);
 
 [[nodiscard]] FiberTracePreparedWindingModel prepareFiberTraceWindingModel(
     const FiberTraceConstraintReport& constraints,
@@ -533,6 +566,11 @@ struct FiberTraceWindingBeliefPropagationReport {
 };
 
 struct FiberTraceInterleavedWindingReport : FiberTraceWindingBeliefPropagationReport {
+    // Joint-grid hot-graph counts; full factorDiagnostics remain available.
+    std::size_t inputFactors = 0;
+    std::size_t retainedFactors = 0;
+    std::size_t inputMeasurements = 0;
+    std::size_t retainedMeasurements = 0;
     std::vector<double> classAProbability;
     std::vector<double> mixedProbability;
     std::vector<double> classBProbability;
@@ -574,6 +612,22 @@ struct FiberTraceInterleavedWindingReport : FiberTraceWindingBeliefPropagationRe
     std::size_t calibrationGridShifts = 0;
     std::size_t calibrationIterations = 0;
     std::size_t hardSignProjectedDefects = 0;
+    std::size_t measurementDisableEligible = 0;
+    std::size_t continuityCutEligible = 0;
+    std::size_t continuityMapCuts = 0;
+    double continuityCutEnergy = 0.0;
+    std::size_t continuityStepEligible = 0;
+    std::size_t continuityNonzeroSteps = 0;
+    double continuityStepEnergy = 0.0;
+    std::size_t decodeRepairIterations = 0;
+    std::size_t decodeRepairChanges = 0;
+    std::size_t decodeRepairRestored = 0;
+    std::size_t decodeRepairDisabled = 0;
+    double decodeRepairObjectiveBefore = 0.0;
+    double decodeRepairObjectiveAfter = 0.0;
+    double decodeRepairSeconds = 0.0;
+    std::size_t measurementDisableMapOff = 0;
+    double measurementDisableConditionalPosteriorSum = 0.0;
     std::size_t initialDefectGaugeComponents = 0;
     std::size_t selectedInitialization = 0;
     std::size_t rankDeficientUpdates = 0;
@@ -875,6 +929,7 @@ summarizeFiberTraceReferenceRangeBenchmark(
     double maximumReferenceWinding);
 
 struct FiberTracePruningConstraintBenchmark {
+    std::size_t retainedDisabledConstraints = 0;
     std::size_t initialConstraints = 0;
     std::size_t removedIncidentConstraints = 0;
     std::size_t retainedFulfilledConstraints = 0;
@@ -1105,7 +1160,49 @@ struct FiberTraceReferenceSourceConstraintGroups {
     const FiberTraceWindingBeliefPropagationConfig& config = {});
 
 [[nodiscard]] FiberTraceReferenceWindingBenchmark calibrateFiberTraceReferenceWindings(
-    std::span<const FiberTraceReferenceWindingObservation> observations, double tolerance = 0.5);
+    std::span<const FiberTraceReferenceWindingObservation> observations, double tolerance = 0.5,
+    bool preserveConfiguredWeights = false);
+
+struct FiberTraceIndependentReferenceCandidate {
+    double winding = 0.0;
+    double rawWinding = 0.0;
+    std::size_t hardViolations = 0;
+    double finiteLoss = 0.0;
+    // A satisfied observation has no hard violation and zero finite loss.
+    std::size_t satisfiedObservations = 0;
+    std::size_t violatedObservations = 0;
+};
+
+struct FiberTraceIndependentReferenceAssignment {
+    std::size_t referenceSource = 0;
+    // Missing sources use size_t(-1); distinct gauges are never pooled.
+    std::size_t integerGauge = static_cast<std::size_t>(-1);
+    bool calibrated = false;
+    std::size_t observations = 0;
+    std::size_t admittedObservations = 0;
+    std::size_t excludedInactive = 0;
+    std::size_t ignoredZeroWeight = 0;
+    double minimumCandidateWinding = 0.0;
+    double maximumCandidateWinding = 0.0;
+    std::size_t evaluatedCandidates = 0;
+    std::size_t bestTies = 0;
+    bool lowerUnboundedBest = false;
+    bool upperUnboundedBest = false;
+    bool lowerUnboundedFeasible = false;
+    bool upperUnboundedFeasible = false;
+    std::vector<FiberTraceIndependentReferenceCandidate> candidates;
+};
+
+// Frozen observations only: exhaustive raw half-grid spanning all energy
+// breakpoints plus two windings on each side. Throws rather than truncating a
+// range exceeding one million candidates. Calibration only changes coordinates.
+// bestTies counts finite-grid ties; unbounded flags describe omitted tails.
+[[nodiscard]] std::vector<FiberTraceIndependentReferenceAssignment>
+rankFiberTraceIndependentReferenceWindings(
+    std::span<const FiberTraceReferenceWindingObservation> observations,
+    const FiberTraceReferenceWindingBenchmark& calibration,
+    std::size_t referenceSources,
+    std::size_t maximumCandidates = 5);
 
 [[nodiscard]] std::vector<FiberTraceReferenceClampedFactorConflict>
 diagnoseFiberTraceReferenceClampedConflicts(

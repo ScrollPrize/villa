@@ -1,5 +1,15 @@
 # Fiber-tracing benchmark runbook
 
+## Crop winding: independent reference assignment
+
+Use `--reference-independent` with the native joint-grid mixed BP evaluator to rank each reference from the frozen, reference-free initial solve. It rejects reference conditioning/pruning and non-joint-grid solvers. This is distinct from the historical conditioned-oracle/pruned-solve scores.
+
+```sh
+/home/hendrik/.venv_las/bin/python /home/hendrik/villa2/vesuvius/scripts/run_classic_fiber_evaluation.py crop-benchmark --config /home/hendrik/villa2/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/crop_benchmark_independent_reference_2048_20260923.json
+```
+
+Replace `2048` with `1024` for the smaller control. Saved source traces are reused; initial BP and reference cross-constraints are recomputed. No neural inference or source tracing. Outputs include CSV-formatted `independent_reference_summary` and `independent_reference_candidates` blocks in the native log. Candidate ordering minimizes hard-sign errors first, then configured weighted finite loss. Positive minimum errors means no hard-feasible candidate; alternative candidates are diagnostic violations, not a relaxation of the BP solve. Ties and unbounded tails are reported explicitly. Candidate grid is half-windings without a GT-parity filter. GT is used only for global sign/per-gauge offset alignment and evaluation, never to update/prune initial BP. Retain raw windings when comparing gauges.
+
 This is the central index for the current fiber-tracing benchmarks and their
 approved runner commands. Dated reports remain the authority for measured
 numbers; this file identifies which evidence is current and how each workload is
@@ -10,6 +20,13 @@ recreate a virtual environment, and do not prepend `AGENTS_AGENT_MODE=1` for a
 manual run.
 
 ## Which benchmark to use
+
+The Paris4 1024³ crop benchmark compares direct greedy replay, fiberlet replay,
+and BP winding optimization on the same crop/new prediction. Its reproducible
+configs and results are in
+[`2026-09-23-crop-new-predictions.md`](../../../../../../volume-cartographer/docs/fiber_benchmark_runs/2026-09-23-crop-new-predictions.md).
+Use the approved evaluation runner's `crop-benchmark --config ...` mode. BP
+reference-conditioned diagnostics are not held-out tracing scores.
 
 | Family | Status | Purpose | Current evidence |
 |---|---|---|---|

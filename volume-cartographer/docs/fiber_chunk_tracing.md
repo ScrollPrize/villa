@@ -1,5 +1,83 @@
 # Fiberlet crop tracing
 
+## Distance-weighted continuation (experimental)
+
+Use `--winding-continuity-step-cost L` instead of the flat cut option to keep
+a soft continuation potential `L * abs(q_b-q_a)`, with q equal to integer
+winding plus calibrated H/V phase offset. There is no cap or independent
+free-cut switch. Half-winding differences cost L/2 at phase 0.5. Defect
+endpoints retain their usual piece cost and do not pay an extra continuation
+cost. Both cost flags are mutually exclusive; defaults remain unchanged.
+
+The existing `continuity_map_cut` diagnostic means unequal active endpoints
+in this mode, **not removal of their BP coupling**. The conditioned inlier
+benchmark still excludes violated equalities; judge initial winding/ladder
+accuracy separately. Reported continuation energy uses the actual displacement.
+
+Run the matched D10/parallel-off six-setting experiment with the approved
+runner and config `crop_benchmark_local_step_costs_20260927.json`; regenerate
+its report without solving using `crop_benchmark_local_step_costs_report_20260927.json`.
+
+## Independent piece and continuation disabling (experimental)
+
+Direction-ablation joint-grid mixed BP accepts `--winding-continuity-cut-cost C`
+(finite, nonnegative). For each continuation link, keeping it requires equal
+active orientation and integer winding; cutting it costs C and leaves both
+pieces and their ordinary constraints intact. A Defect endpoint already
+disconnects the link, with no extra cut cost. This minimizes the binary switch
+(Potts energy); it does not marginalize a latent keep/cut variable. C=0 removes
+continuity from graph coupling, incidence and gauges. The default remains hard
+continuity. Do not combine this option with nonzero `--piece-break-cost` (the
+older, different active/Defect boundary penalty).
+
+`--winding-defect-cost D` independently sets the existing piece Defect unary
+per incident evidence mass. Use joint orientation inference (omit
+`--winding-fixed-orientation`) to allow H/V changes across a cut. The reference
+pruning diagnostic now also supports joint orientations. Diagnostics include
+`continuity_map_cut` in factor CSVs and cut counts/energy in logs. Cut links are
+excluded from conditioned inlier connectivity and count as disabled constraints
+in the removal benchmark; they do not count as fulfilled evidence.
+
+The approved evaluation runner's `crop-benchmark` command accepts
+`crop_benchmark_local_costs_20260927.json` for the resumable 24-point matrix,
+and `crop_benchmark_local_costs_report_20260927.json` to regenerate its report
+without rerunning native evaluation. Both configs live under
+`vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/`.
+
+For experimental loss-aware winding disablement, direction-ablation joint-grid
+mixed BP accepts `--winding-defect-multipliers input.json`. Version1JSON contains
+`trace_artifact` and a nonempty ordered `pieces` array with `piece`,
+`original_trace`, `begin_arc_base`, `end_arc_base`, and `multiplier` in `(0,1]`.
+Artifact path and every piece identity must match exactly. Factors attach to
+piece descriptors and survive subsetting/reference conditioning; reference
+pieces default to1. Only winding defect penalties change, not orientation BP
+or pairwise constraints. The multiplier is exported in consistency CSVs.
+`--reference-initial-readout` adds the existing independent reference readout
+of the original frozen BP solution alongside removal diagnostics, without
+feeding those assignments back to the solver.
+
+The first controlled experiment uses mean, length-weighted median, or maximum
+native forward loss per prediction voxel, with `max(0.1,0.5/(0.5+d))`.
+`scripts/prepare_defect_density_inputs.py` prepares these inputs from the
+audited step-cost CSV and original consistency CSV without reading reference
+removal labels. The default without this option remains multiplier1.
+
+Dense tracing can optionally audit historical cost data with
+`--trace-cost-reference /path/to/saved.zarr`. It captures original forward-step
+losses without changing tracing, requires exact geometry/order/aggregate-cost
+agreement against that saved artifact, and writes `<output-stem>_step_costs.csv`.
+The CSV includes original (unclipped) step costs and retained segment costs;
+segment arrays are transient, not added to the artifact storage format. See
+[the cost/removal benchmark](fiber_benchmark_runs/2026-09-24-tracer-cost-removal.md)
+for reproducing piece-local means and maxima using saved BP removal labels.
+
+For controlled winding-BP iteration sweeps, use
+`--bp-message-iterations 500` to hold normal-lattice alignment and orientation
+fixed while varying `--winding-message-iterations`. Without the optional override,
+winding retains the existing behavior of sharing the BP limit. The
+override is positive and supported only for direction-ablation joint-grid
+mixed BP runs; unsupported solvers are rejected rather than ignoring it.
+
 The complete frozen PHercParis4 1024-crop evaluation workflow, including
 prediction and Fiberlet generation, is documented in
 [`fiber_pruning_benchmark.md`](fiber_pruning_benchmark.md).
@@ -1066,6 +1144,22 @@ state per integer winding plus one Defect state; Defect is not duplicated over
 the winding support. The chosen backend still controls phase/scale calibration,
 component sign, integer-support expansion, and winding factor evaluation.
 
+In joint-grid fixed-orientation mode, a measurement with no active winding
+magnitude, sign, continuity or local-span term is excluded before building the
+winding graph. It cannot join components, choose gauges, affect initialization,
+add Defect incidence, or allocate BP messages. Its original-index diagnostic row
+is still available. Zero magnitude weight removes that term only: an independently
+enabled sign/order loss is retained. With adaptive calibration, removal requires
+neutrality across all reachable scale classes, not just the current scale.
+The orientation prepass has independent direction-class scores and is unchanged.
+Plain/alternating legacy winding backends are outside this joint-grid correction.
+
+When winding support or the calibration grid expands, old log messages are
+shifted to a common max-zero gauge before new neutral entries are inserted.
+Thus a uniform message remains uniform instead of temporarily preferring new
+states through damping. This corrects the previous finite-iteration behavior;
+see [validation and timings](fiber_benchmark_runs/2026-09-23-inactive-winding-factors.md).
+
 A late Defect pays `--winding-defect-cost` times its retained incident winding
 measurement count at `--bp-temperature` and is
 selected only from winding evidence; fixed mode does not repeat the H/V
@@ -2005,6 +2099,32 @@ provide an adequate unsupervised stopping rule.
 
 ## Reference endpoint replay
 
+For a new dense prediction without a preprocessed Fiberlet dataset, `trace`
+and Fiberlet `reference-replay-benchmark` accept input `-`,
+`--fiber-manifest prediction.lasagna.json`, and
+`--fiberlet-cache-root /path/to/generated-cache`. They use the canonical
+whole-volume anchor/path algorithms through the shared on-demand preprocessor.
+The graph requests only the crop's lookahead-expanded region and its required
+incident-edge/anchor dependencies. The generated `anchors.zarr` and
+`fiberlets.zarr` reside under a fingerprint directory based on both prediction
+manifests, algorithm parameters and storage layout; crop bounds are excluded,
+so subsequent crops and replay/trace commands reuse completed chunks.
+`--fiberlet-storage-chunk-side` defaults to 512 base voxels. These are separate
+anchor and path caches; reopen them through the same options, rather than
+passing the path cache as a standalone combined Fiberlet dataset. Transient
+`--stage` filtering continues to require a preprocessed combined dataset.
+
+```bash
+vc_fiber_trace_chunk reference-replay-benchmark - \
+  --fiber-manifest prediction.lasagna.json \
+  --fiberlet-cache-root generated-fiberlets \
+  --normal-manifest normals.lasagna.json \
+  --bbox 10240 22016 6144 11264 23040 7168 \
+  --reference-fiber-dir reference-fibers \
+  --reference-fiber-tag hendrik_crop1 \
+  --base-voxel-size-um 2.4 --output reference-replay.json
+```
+
 Use `reference-replay-benchmark` to run Fiberlet, direct greedy, or Lasagna
 normal-transport tracing from both ends of every tagged reference run inside a
 crop. Fiberlet remains the default. The two direct controls are selected with
@@ -2020,6 +2140,104 @@ vc_fiber_trace_chunk reference-replay-benchmark fiberlets.zarr \
   --base-voxel-size-um 2.4 \
   --output reference-replay.json
 ```
+
+Use `--replay-tracer beam` for the same native dense beam implementation and
+`FiberTraceConfig` defaults used by VC3D: beam width 8, lookahead 2, step 4 trace
+voxels, cone 25 degrees, lazy lookahead enabled. It shares the dense replay
+implementation and scale resolution with the greedy control. No full-resolution
+model-specific tuning is applied. CLI `--beam`/`--lookahead` are Fiberlet options;
+do not use them to configure this dense mode.
+
+### Imported fixed fibers (BP input and static replay)
+
+Native L0 collections can be imported without retracing predictions:
+
+```bash
+vc_fiber_trace_chunk trace candidates.vc3d.json --trace-tracer imported \
+  --normal-manifest normals.lasagna.json \
+  --bbox 10240 22016 6144 11264 23040 7168 --output imported-traces.zarr
+
+vc_fiber_trace_chunk reference-replay-benchmark - --replay-tracer precomputed \
+  --candidate-fibers candidates.vc3d.json --normal-manifest normals.lasagna.json \
+  --bbox 10240 22016 6144 11264 23040 7168 \
+  --reference-fiber-dir reference-fibers --reference-fiber-tag hendrik_crop1 \
+  --base-voxel-size-um 2.4 --output precomputed-replay.json
+```
+
+The collection must be `vc3d_fiber_collection` version 1 with `scale: 1` and
+native-L0 coordinate metadata. Its `point_collections` entries use the shared
+VC3D fiber parser. Coordinates are never multiplied by a historical conversion
+factor: an input already converted from L2 to L0 remains unchanged. The CLI
+checks collection/entry coordinate spaces against `source.sample_id` and
+`source.volume_id` in the normal manifest's adjacent inference provenance.
+A readable local provenance file is currently required for this check.
+H/V classifications and family labels are not used in import, replay, or BP.
+
+Import clips every contiguous run independently to the half-open crop. Reentry
+runs stay separate; crop-external gaps never become edges. A collinear interior
+midpoint supplies the artifact seed without altering route geometry. Provenance
+records a fingerprint of collection content, original filename, source index,
+and crop run ID.
+The artifact has **no metric quality score**: its zero cost is an unavailable
+sentinel, not a perfect score. Import and downstream CLI quality filtering are
+rejected for these artifacts. BP receives all imported runs.
+
+Precomputed replay is a static-geometry evaluation, **not beam tracing**. At
+each shared evaluator restart it considers only the current reference start
+point and tangent. It selects the nearest Euclidean segment projection that is
+inside the existing anisotropic acceptance ellipse and whose unoriented tangent
+is within 25 degrees of the seed tangent. Equal-distance ties use collection
+order then segment order. Polyline and orientation are then frozen until the
+evaluator stops the segment or the candidate ends. It emits the actual projected
+seed, uniformly spaced 8-base-voxel arc samples, and the exact terminal endpoint
+when reached. It never snaps/translates candidates to GT, selects using future
+reference points, or switches candidates during a segment. Acquisition scans
+segments linearly using the same segment-projection helper as the geometry
+library. Missing candidates and short tails produce failures through the shared
+replay driver; its reset rules and metric aggregation are unchanged.
+
+Regression tests are in `test_fiber_reference_replay_benchmark` (offset seed,
+reverse traversal, missing/wrong-direction/short candidates, terminal samples,
+scale rejection) and `test_fiberlet_crop_trace` (independent reentry runs and
+quality rejection).
+
+### Dense beam candidate crops (BP input)
+
+`trace - --trace-tracer beam --fiber-manifest PREDICTIONS
+--fiberlet-cache-root CACHE --normal-manifest NORMALS --bbox X0 Y0 Z0 X1 Y1 Z1
+--output crop-traces.zarr` traces full candidates from canonical prediction
+anchors, without reference seeding or replay resets. The cache supplies anchors
+only: no Fiberlet paths are generated. It uses the production dense beam tracer
+and the same deterministic crop scheduling and coverage suppression as Fiberlet
+crop tracing. Dense defaults are beam width 8, lookahead 2, step 4 trace voxels,
+and cone 25 degrees; configure these with `--beam-width`, `--beam-lookahead-steps`,
+`--step-voxels`, and `--cone-angle-degrees`, not graph `--beam`/`--lookahead`.
+
+Each side stops at its first crop exit and is clipped to that face. A finite
+fallback length budget of **three times the crop diagonal per side** bounds
+paths that remain inside the crop; this is an arclength budget in base voxels,
+converted to trace units for extrapolation. Native step discretization applies.
+Only committed production-beam points and their cumulative loss contribute to
+the retained route; the exit segment's loss is prorated by its retained length.
+Artifact points and seeds are in base units, while path length is in prediction
+voxels. Normal sampling uses the trace-to-base conversion, independently of the
+prediction-to-base conversion.
+
+The output remains a `FiberletCropTraceArtifact` for existing BP consumers.
+Its legacy graph trace configuration fields are retained for format
+compatibility and **are not the effective dense beam configuration**. The
+preprocessing provenance's `dense_config` is authoritative for dense tracing.
+Production beam loss per prediction voxel is not calibrated to the Fiberlet
+quality score: omit the historical Fiberlet `--quality-threshold 0.21` for
+dense candidates. Graph ambiguity stopping (`--ambiguity-margin`)
+and covered-anchor endpoint stopping do not apply to dense tracing and are
+rejected. Downstream BP should consume these candidates without a graph-quality
+cutoff.
+
+For large BP candidate graphs, `direction-ablation
+--winding-max-candidate-states N` raises the winding solver's memory safety
+guard (default 4,000,000). It does not truncate the state alphabet or change the
+objective. Use an explicit bounded value and record it with benchmark settings.
 
 Direct greedy replay consumes the dense Fiber prediction manifest and forces
 the historical greedy policy of beam width one and lookahead one:
@@ -2081,3 +2299,235 @@ reference endpoint and reset by their respective evaluation step. JSON records
 the tracer, common evaluator settings, backend settings, and only the consumed
 input artifacts. Sampling cadence can affect observed failures and must be
 considered when comparing backends.
+
+## Dense-beam reverse consistency
+
+For `trace --trace-tracer beam`, add:
+
+```text
+--coverage 40 --coverage-tangential 80 --coverage-angle 45
+--reverse-consistency --reverse-normal 20 --reverse-tangential 40 --reverse-backoff 40
+```
+
+Reverse checking is enabled by default for CLI `trace --trace-tracer beam`,
+the dense crop generation path feeding BP. Use `--no-reverse-consistency` for
+a control run. It remains opt-in in the shared C++ crop configuration and does
+not change reference replay, imported fibers or fiberlet tracing.
+This is not a reference/GT check. Each
+original seed-to-end half is independently traced backwards with the same
+production beam settings, starting with the reversed endpoint tangent.
+Each committed reverse point is locally projected onto the original half in a
+monotonically decreasing arc window (at most twice that step's travel).
+The existing Lasagna-normal ellipse metric uses20 normal/40 in-sheet base-voxel
+radii. Failure includes leaving this ellipse, no backward progress, or early
+tracer termination before reaching the seed.
+
+Only verified intervals of the **original forward geometry** are retained.
+At a failure, the checker cuts at the last verified arc, skips40 base voxels
+towards the seed, and retries. Backoff is configurable and repeated failures can
+create larger gaps. The two seed-adjacent intervals join only if both reach the
+seed; all other pieces remain separate. Only retained geometry suppresses other
+seeds. These pieces may therefore be supplemented by another seed's valid trace.
+The reverse check is sampled at the normal beam step cadence, not a continuous
+geometric proof.
+
+Piece costs integrate the original step losses, interpolating at cuts.
+A piece not containing its original seed gets a local storage point and retains
+its original seed position/key in artifact provenance. Metadata records thresholds,
+backoff, per-piece terminations and reverse attempts/failures/skipped length.
+Counters describe active committed candidates, excluding discarded speculative
+work. Existing readers predating this extension may reject the new optional
+metadata; existing artifacts remain readable by the updated reader.
+
+## Experimental BP retention alternatives
+
+### Local events and non-overlapping pieces
+
+`--local-constraint-events` is an opt-in alternative to fixed 512/128
+piece/overlap subdivision. It uses the same source traces, spatial index,
+polyline projection, batched normal-distance sampler and BP solvers.
+
+Candidate identities are source trace/arc pairs, discovered before subdivision.
+Incoming/outgoing 16-base-voxel secants are checked separately (all available
+side combinations must agree: parallel within 30 degrees, orthogonal within
+30 degrees of perpendicular). Original uncut traces require both sides;
+reference cross-extraction on already-cut pieces accepts independently certified
+existing sides and preserves the input piece IDs.
+
+Parallel correspondences repeat every 64 base voxels, walk 32 and 64 voxels on
+each side, and must be locally reciprocal within 8 voxels. Correspondence search
+is bounded in arc; it cannot jump to an arbitrary distant part of a folded trace.
+Orthogonal encounters use shorter 8/16-voxel independent probes on each trace.
+Every connector must agree with the base connector's distance category and be
+within 0.25 winding units; nonzero signed distances must agree in sign and normal
+component. Extra samples certify the base measurement, not average it away.
+Near-identical encounters are deduplicated within 8 voxels on both source arcs
+(parallel repeats retain their distinct A arcs).
+
+Consecutive accepted orthogonal event locations induce midpoint cuts. Parallel
+relation/category/sign changes also induce midpoint cuts across a bounded
+ambiguous band. Two rounds of finer sampling target changes between valid/invalid
+or differently classified nearby candidates. This is a bounded local search,
+not a guarantee to find every event between samples.
+
+Pieces cover the complete original trace, share only their boundary point, and
+have **zero overlapping arc length**. Continuation factors retain the existing
+break/defect semantics. Every certified event survives subdivision unchanged:
+only its owning piece IDs are remapped using its base-point arcs. Its support
+may cross either or both piece boundaries; subdivision never revalidates,
+clips or drops that measurement. The earlier post-split support filter was a
+bug and its benchmark results do not evaluate the intended formulation.
+
+Repeated parallel finite costs and defect incidence are weighted by represented
+arc length, divided by a fixed 128-base-voxel unit, before subdivision on the
+original source-trace pair. Voronoi intervals partition
+neighboring samples; this avoids simply multiplying evidence when sampling more
+densely. Hard sign constraints remain hard. Orthogonal events retain unit weight.
+Factor CSVs include the base arcs, immutable certified support and evidence weight.
+Extraction reports certified and retained-certified counts; these must agree
+apart from explicitly omitted parallel factors. Regression tests verify that
+adding crossing-induced splits preserves existing events and weights.
+
+Reference-to-BP cross events follow the same source-first rule: certify on full
+reference/source fibers and use the shared arc-to-piece remapper. The evaluator
+retains its canonical per-piece interface, but does not re-certify tiny pieces.
+An event whose owning interval was removed during component selection is
+explicitly counted as `missing_owner`; a gap is never mapped to the next piece.
+
+`--local-no-parallel` removes ordinary parallel factors **after** the shared
+event extraction and subdivision; continuation factors remain. Thus the paired
+experiment uses identical piece geometry. `--local-event-spacing N` and
+`--local-parallel-span N` configure sampling/support. Existing piece multipliers
+or explicit cut hints cannot be combined with local subdivision.
+
+Run the corrected experiment through the approved evaluation runner with
+`crop_benchmark_certified_splits_20260927.json`
+under the fiber_trace_3d configs directory. No inference or retracing is needed.
+
+These opt-in diagnostics do not change production defaults. See the
+[controlled trial protocol](fiber_benchmark_runs/2026-09-27-density-alternatives.md).
+
+- `--winding-defect-multipliers JSON`: positive finite per-piece factors (including
+  factors above one). Optional `length_measure` and `length_blend` interpolate the
+  incident-count defect measure with a fixed calibrated length measure. The
+  JSON's trace and original-piece identities must match; calibration is supplied
+  once and is not recomputed during conditioning/pruning.
+- `--piece-cut-hints JSON`: direction-ablation extra boundaries, in base-voxel arc
+  coordinates, keyed by original trace ID. Version 1 contains `trace_artifact`
+  and `cuts: {"trace-id": [arc, ...]}`. Arcs must be finite, ascending and interior.
+  Partitions use shared native subdivision and continuity handling. Cannot be
+  combined with old per-piece multipliers because piece identities change.
+- `--winding-measurement-disable-cost C`: joint-grid mixed BP only; positive
+  finite cost for an ordinary measurement's latent off alternative. Sum-product
+  marginalizes the switch; it does not merely scale a hard/infinite penalty.
+  Hard continuity and conditioned reference evidence remain non-disableable.
+  MAP-off measurements do not drive endpoint pruning, but count as problematic
+  in the removal benchmark. Diagnostics distinguish initial, conditioned and
+  fresh solves; off probabilities are conditional on decoded endpoint states.
+
+### Finite winding-step continuation experiments
+
+`--winding-continuity-step-cost L` uses `L*abs(q_b-q_a)` across each
+added piece boundary, where q includes the calibrated H/V phase. A half winding
+costs L/2 at phase0.5. Positive-cost nonzero steps remain active factors, not
+disabled/cut edges; `continuity_step` reports their count and energy separately.
+L=0 removes the factor entirely, including downstream connectivity.
+The old `--winding-continuity-cut-cost` is a distinct flat keep/cut model.
+
+`--continuity-defect-mass all|ordinary|winding-ordinary|prepass-ordinary`
+controls whether synthetic continuation contributes to the piece's defect unary
+incidence in both stages or only one. Default `all` preserves earlier behavior.
+This is a modeling ablation: it does not remove or weaken pair factors. With
+exclusion, continuation-only pieces have zero data-derived defect mass; no hidden
+minimum is added. Fixed H/V still uses its prepass and may irreversibly mark
+ambiguous pieces Mixed. Joint H/V is a separate comparison.
+
+The `crop_benchmark_step_tuning_*_20260927.json` configs use the existing approved
+`run_classic_fiber_evaluation.py crop-benchmark --config CONFIG` entrypoint.
+Screening keeps initial-reference readout but omits reference-assisted solves;
+missing conditioned/removal scores are null. Matched full-run ladders validate
+the shortcut. Final candidates must receive the full benchmark. All trials use
+the same certified graph, frozen traces and500-message budget. See
+[winding-step search](fiber_benchmark_runs/2026-09-27-winding-step-search.md).
+### Winding component selection
+
+BP-only evaluation now retains **all winding components** by default, including
+components not connected to the central seed. Reference connections are built
+against that complete eligible graph. The previous largest-component filtering
+is available only through explicit `--winding-largest-component-only` for
+historical reproduction. Logs record `fiber BP component selection policy=all`
+or `policy=largest-only`, with before/after trace, piece and constraint counts.
+This changes the evaluated cohort; historical scores are not automatically
+comparable to runs retaining all components. Disconnected components can have
+independent winding gauges; keeping them does not establish their relative
+absolute winding offsets.
+
+### Restricted fixed-reference diagnostic
+
+`--reference-neighborhood-windings 2` selects ordinary source fibers with an
+orthogonal reference cross-constraint whose unquantized absolute signed normal
+distance times the fixed measurement scale is at most 2. Selection retains
+every piece of those source fibers and every induced factor, including their
+reference constraints beyond the selection radius. It is not recursive graph
+expansion. `all` instead supplies a matched all-fiber control.
+
+Requires BP-only joint-grid sum-product-mixed, fixed phase 0.5 and measurement
+scale, positive `--winding-continuity-step-cost`, and reference fibers. References
+are fixed active on their known half-winding ladder; ordinary H/V, winding and
+defect states remain free. A canonical even-H/odd-V reference gauge uses signed
+reference-reference evidence, audited separately per normal component; ambiguous
+or incompatible sign choices fail. This diagnostic does not run the ordinary
+prepass or reference-pruning/oracle solver. Existing combined-graph assembly is
+shared with the legacy conditioned benchmark.
+
+Outputs `<prefix>_reference_neighborhood.json`, `_pieces.csv`, and
+`_continuations.csv`, retaining original artifact trace IDs and original
+ordinary piece IDs. They report retention, disabled pieces and union-length,
+disabled runs, active-active physical winding jumps, and reference-unanchored
+integer gauges. These are solver diagnostics, not ground-truth error labels
+for ordinary fibers. Defect endpoints do not count as winding jumps.
+
+Reproducible configurations (cached 2048 Paris4 beam8 traces, EMA999 best u22000,
+prediction `7ff0ce6c`, no parallel events, 500-message limit) are in
+`vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/crop_benchmark_reference_neighborhood_*_20260928.json`.
+Use the existing approved `run_classic_fiber_evaluation.py crop-benchmark --config`
+runner; no inference or retracing is performed.
+
+For an ordinary-only solve of the identical selected cohort, additionally pass
+`--reference-neighborhood-unconditioned --reference-independent`. The combined
+reference graph is used only to select source IDs. The actual solver report is
+subset from the original ordinary graph: no reference nodes, cross factors,
+fixed reference states or reference-conditioned initialization enter BP. Cached
+cross constraints are remapped separately for the existing post-solve readout.
+Reference events remain special post-split attachments; this mode does not
+change piece boundaries. `<prefix>_neighborhood_cohort.json` records original
+source/piece IDs and graph counts for comparison with conditioned runs.
+
+Removing reference anchors can leave several independent integer gauges.
+The `neighborhood_readout_report` option in the approved crop runner audits cohort
+identity and uses the established accuracy/shift parsers. It preserves every
+gauge's readout, including ties/unbounded optima. It does not manufacture one
+aggregate ladder from disagreeing gauges. Per-gauge correctness uses the full
+reference denominator; incomplete ladders have no shift score. Full-coverage
+components are reported explicitly, not selected by accuracy. Gauge offsets and
+global sign are calibrated only after solving, using the existing reference
+readout convention; this is not reference-free evaluation calibration.
+
+### Optional winding decode repair
+
+`--winding-decode-repair N` performs at most N deterministic coordinate-descent
+sweeps after the joint-grid decoder's hard-sign projection (default 0, unchanged).
+Each move strictly lowers the normalized negative log BP objective, including
+the distinct winding and orientation temperatures. All incident pair factors
+are evaluated; reference labels are never consulted. Calibration, component
+phase, candidate supports, exact fixed states and the entire selected gauge
+state are frozen. Active labels can change winding; eligible defects can be
+restored. Fixed prepass Mixed states cannot be restored.
+
+The `decode_repair` diagnostic records normalized objective before/after,
+sweeps, changes, restorations, disablements and time. Counts are transitions,
+not unique pieces (one piece can move repeatedly). Posterior marginals remain
+the original BP marginals; decoded labels and their marginal probability are
+updated. This is a local MAP experiment, not an exact global solver: a group
+of pieces may require a coordinated move that single-piece descent cannot make.
+Lower objective is not a guarantee of better reference accuracy.

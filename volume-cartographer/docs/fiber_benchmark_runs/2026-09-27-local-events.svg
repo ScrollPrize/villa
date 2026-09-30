@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="420" viewBox="0 0 1080 420">
+<rect width="1080" height="420" fill="white"/>
+<g font-family="sans-serif" fill="#17202a"><text x="28" y="30" font-size="19">Paris4 2048 crop: clean local-event segmentation</text>
+<text x="28" y="54" font-size="12">Same saved beam8/reverse-consistency traces; 500-message budgets; defaults unchanged.</text>
+<text x="28" y="92" font-size="14">Removal score (0% best)</text>
+<text x="28" y="126" font-size="12">Legacy fixed pieces</text><rect x="28" y="134" width="230.58" height="23" fill="#667788"/><text x="265.5762567823756" y="151" font-size="12">-110.68%</text>
+<text x="28" y="202" font-size="12">Local + parallel</text><rect x="28" y="210" width="188.54" height="23" fill="#387cb8"/><text x="223.5449566804787" y="227" font-size="12">-90.50%</text>
+<text x="28" y="278" font-size="12">Local orthogonal only</text><rect x="28" y="286" width="155.81" height="23" fill="#dc913e"/><text x="190.8069219690667" y="303" font-size="12">-74.79%</text>
+<text x="380" y="92" font-size="14">Initial independent accuracy</text>
+<text x="380" y="126" font-size="12">Legacy fixed pieces</text><rect x="380" y="134" width="96.15" height="23" fill="#667788"/><text x="483.15384615384613" y="151" font-size="12">38.46%</text>
+<text x="380" y="202" font-size="12">Local + parallel</text><rect x="380" y="210" width="38.46" height="23" fill="#387cb8"/><text x="425.46153846153845" y="227" font-size="12">15.38%</text>
+<text x="380" y="278" font-size="12">Local orthogonal only</text><rect x="380" y="286" width="28.85" height="23" fill="#dc913e"/><text x="415.84615384615387" y="303" font-size="12">11.54%</text>
+<text x="732" y="92" font-size="14">Conditioned reference accuracy</text>
+<text x="732" y="126" font-size="12">Legacy fixed pieces</text><rect x="732" y="134" width="250.00" height="23" fill="#667788"/><text x="989" y="151" font-size="12">100.00%</text>
+<text x="732" y="202" font-size="12">Local + parallel</text><rect x="732" y="210" width="144.23" height="23" fill="#387cb8"/><text x="883.2307692307693" y="227" font-size="12">57.69%</text>
+<text x="732" y="278" font-size="12">Local orthogonal only</text><rect x="732" y="286" width="86.54" height="23" fill="#dc913e"/><text x="825.5384615384615" y="303" font-size="12">34.62%</text>
+<text x="28" y="366" font-size="13">Not an improvement: local conditioned solves hit the message limit and fail reference recovery.</text>
+<text x="28" y="390" font-size="12">Removal score is confounded by many more continuation links. Median local piece: 22.80 base voxels.</text></g></svg>

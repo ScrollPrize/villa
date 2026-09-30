@@ -1849,7 +1849,7 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
         totalFailures += summary.totalFailures;
     }
     vc::core::util::atomicWriteString(output / "summary.json", Json{
-        {"version", 2}, {"metric_definition", "complete-reference-partition-v1"},
+        {"version", 3}, {"metric_definition", "corpus-failures-plus-one-v1"},
         {"completed", true}, {"cases", cases.size()}, {"workers", workers},
         {"evaluated_cases", evaluatedCases},
         {"route_state_limit_cases", allInfrastructureFailures.size()},
@@ -1865,9 +1865,9 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
         {"failures", totalFailures},
         {"reference_selection_policy", references.at("policy")},
         {"failures_per_directed_mm", directedLengthMm > 0 ? Json(totalFailures / directedLengthMm) : Json(nullptr)},
-        {"reliability_segments", totalFailures + evaluatedCases},
-        {"mean_segment_length_mm", evaluatedCases == 0 ? Json(nullptr) : Json(directedLengthMm / (totalFailures + evaluatedCases))},
-        {"mean_segment_length_percent", evaluatedCases == 0 ? Json(nullptr) : Json(100.0 / (totalFailures + evaluatedCases))},
+        {"reliability_segments", evaluatedCases == 0 ? 0 : totalFailures + 1},
+        {"mean_segment_length_mm", evaluatedCases == 0 ? Json(nullptr) : Json(directedLengthMm / (totalFailures + 1))},
+        {"mean_segment_length_percent", evaluatedCases == 0 ? Json(nullptr) : Json(100.0 / (totalFailures + 1))},
         {"wall_seconds", std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count()},
         {"config", persistedConfig}, {"effective_trace", cli::traceConfigJson(trace)}, {"sources", summaries}}.dump(2) + "\n");
     return 0;

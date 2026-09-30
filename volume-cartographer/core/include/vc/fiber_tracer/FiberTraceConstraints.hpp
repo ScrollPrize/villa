@@ -44,6 +44,17 @@ struct FiberTraceConstraintConfig {
     double maximumWindingDistance = 1.5;
     bool enforceMaximumWindingDistance = true;
     bool preserveInputLinesAsPieces = false;
+    bool localEvents = false;
+    bool localIncludeParallel = true;
+    double localSpacingBaseVoxels = 64.0;
+    double localTangentSpanBaseVoxels = 16.0;
+    double localParallelSpanBaseVoxels = 64.0;
+    double localReciprocalToleranceBaseVoxels = 8.0;
+    double localAngularToleranceDegrees = 30.0;
+    double localDistanceTolerance = 0.25;
+    std::size_t localRefinementRounds = 2;
+    // Optional arc boundaries per input trace; geometry/continuity is preserved.
+    std::vector<std::vector<double>> extraPieceCutsBaseVoxels;
     std::size_t parallelThreads = 0;
 };
 
@@ -54,6 +65,9 @@ struct FiberTraceConstraintPiece {
     double endArcBaseVoxels = 0.0;
     std::vector<double> sampleArcsBaseVoxels;
     std::vector<cv::Vec3d> samplePointsBaseXYZ;
+    double windingDefectCostMultiplier = 1.0;
+    double windingDefectLengthMeasure = 0.0;
+    double windingDefectLengthBlend = 0.0;
 };
 
 struct FiberTraceConstraint {
@@ -68,6 +82,14 @@ struct FiberTraceConstraint {
     double perpendicularScore = 0.0;
     double windingDistance = 0.0;
     bool hardContinuity = false;
+    // Reference evidence may not opt out during conditioned benchmark solves.
+    bool allowMeasurementDisable = true;
+    double evidenceWeight = 1.0;
+    bool localEvent = false;
+    int localOrientation = 1;
+    // Immutable source-trace support used for certification; never clipped by cuts.
+    double supportABegin = 0.0, supportAEnd = 0.0;
+    double supportBBegin = 0.0, supportBEnd = 0.0;
     std::optional<double> signedWindingDelta;
     std::optional<double> perpendicularNormalAlignment;
     std::optional<std::size_t> windingNormalComponent;
@@ -83,6 +105,15 @@ struct FiberTraceConstraint {
 };
 
 struct FiberTraceConstraintReport {
+    std::size_t localRejectedConsistency = 0;
+    std::size_t localRejectedSupport = 0;
+    // Extraction-stage counts, before optional external/component owner filtering.
+    std::size_t localCertifiedEvents = 0;
+    std::size_t localRetainedCertifiedEvents = 0;
+    std::size_t localRefinedCandidates = 0;
+    std::size_t localMidpointCuts = 0;
+    std::size_t localTransitionCuts = 0;
+    std::size_t localParallelOmitted = 0;
     std::vector<FiberTraceConstraintPiece> pieces;
     std::vector<FiberTraceConstraint> constraints;
     std::size_t inputTraces = 0;
@@ -148,6 +179,13 @@ struct FiberTraceConstraintSubsetResult {
     std::vector<std::size_t> retainedConstraintIndices;
 };
 
+// References occupy a prefix of pieces and have distinct source trace IDs.
+// A null cutoff retains all pieces; otherwise orthogonal reference measurements
+// seed whole ordinary source traces (no transitive graph expansion).
+[[nodiscard]] FiberTraceConstraintSubsetResult selectFiberTraceReferenceNeighborhood(
+    const FiberTraceConstraintReport& report, std::size_t referencePieces,
+    std::optional<double> maximumWindings, double measurementScale);
+
 using FiberTraceWindingDistance = std::function<double(
     const cv::Vec3d& aBaseXYZ,
     const cv::Vec3d& bBaseXYZ,
@@ -185,6 +223,17 @@ struct FiberTraceConstraintObjReport {
 
 [[nodiscard]] double dominantFiberTraceConstraintWindingDistance(
     const FiberTraceConstraint& constraint) noexcept;
+
+// Reassign certified source-arc events to existing pieces without changing any
+// measurement/support/weight. Missing owners (removed intervals) are counted;
+// an event in a gap is never assigned to the next piece. Continuations are not
+// accepted here: create them after remapping. Shared by extraction and reference
+// cross-readout so split geometry is never used to re-certify measurements.
+[[nodiscard]] std::vector<FiberTraceConstraint> remapCertifiedFiberTraceEvents(
+    std::span<const FiberTraceConstraint> events,
+    std::span<const FiberTraceConstraintPiece> sourcePieces,
+    std::span<const FiberTraceConstraintPiece> targetPieces,
+    std::size_t& missingOwners);
 
 struct FiberTraceOrderedCrossSourceConstraint {
     std::size_t constraintIndex = 0;

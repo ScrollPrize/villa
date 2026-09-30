@@ -63,14 +63,16 @@ struct PairCandidate {
     std::size_t globalSampleA = 0;
     std::size_t globalSampleB = 0;
     double distance = std::numeric_limits<double>::infinity();
+    double arcA = -1.0, arcB = -1.0;
 };
 
-enum class RejectReason { None, Tangent, Winding, WindingCutoff };
+enum class RejectReason { None, Tangent, Winding, WindingCutoff, Consistency };
 
 struct ScoredCandidate {
     std::optional<FiberTraceConstraint> constraint;
     std::vector<std::pair<cv::Vec3d, cv::Vec3d>> parallelConnectors;
     RejectReason rejection = RejectReason::None;
+    PairCandidate candidate;
 };
 
 struct SignedWindingSample {
@@ -195,6 +197,15 @@ void validateConfig(const FiberTraceConstraintConfig& config)
         config.maximumWindingDistance > 0.0;
     if (!valid)
         throw std::invalid_argument("Fiber trace constraint configuration is invalid");
+    if (config.localEvents &&
+        (!(config.localSpacingBaseVoxels > 0.) || !std::isfinite(config.localSpacingBaseVoxels) ||
+         !(config.localTangentSpanBaseVoxels > 0.) || !std::isfinite(config.localTangentSpanBaseVoxels) ||
+         !(config.localParallelSpanBaseVoxels >= 2.*config.localTangentSpanBaseVoxels) || !std::isfinite(config.localParallelSpanBaseVoxels) ||
+         !(config.localReciprocalToleranceBaseVoxels > 0.) || !std::isfinite(config.localReciprocalToleranceBaseVoxels) ||
+         !(config.localAngularToleranceDegrees > 0. && config.localAngularToleranceDegrees < 45.) ||
+         !(config.localDistanceTolerance > 0.) || !std::isfinite(config.localDistanceTolerance) ||
+         config.localRefinementRounds > 4 || !config.extraPieceCutsBaseVoxels.empty()))
+        throw std::invalid_argument("Invalid local constraint event configuration");
 }
 
 std::optional<cv::Vec3d> centeredTangent(
@@ -470,12 +481,145 @@ std::optional<RefinedCorrespondence> refinedCorrespondence(
     return best;
 }
 
+ScoredCandidate scoreLocalCandidate(
+    PairCandidate candidate,
+    const std::vector<FiberTraceConstraintPiece>& pieces,
+    const std::vector<std::optional<PolylineArcGeometry>>& geometries,
+    const FiberTraceConstraintConfig& config)
+{
+    const auto& pa = pieces[candidate.pieces.a];
+    const auto& pb = pieces[candidate.pieces.b];
+    const auto& ga = *geometries[pa.traceIndex];
+    const auto& gb = *geometries[pb.traceIndex];
+    double a = candidate.arcA >= 0. ? candidate.arcA : pa.sampleArcsBaseVoxels[candidate.sampleA];
+    double b = candidate.arcB >= 0. ? candidate.arcB : pb.sampleArcsBaseVoxels[candidate.sampleB];
+    const double h = config.localTangentSpanBaseVoxels;
+    const double reach = config.localParallelSpanBaseVoxels;
+    const double cosine = std::cos(config.localAngularToleranceDegrees * std::acos(-1.) / 180.);
+    const double sine = std::sin(config.localAngularToleranceDegrees * std::acos(-1.) / 180.);
+    auto failure = [&]() {
+        ScoredCandidate result;
+        result.rejection = RejectReason::Consistency;
+        result.candidate = candidate;
+        result.candidate.arcA = a;
+        result.candidate.arcB = b;
+        return result;
+    };
+    const auto tangent = [&](const auto& g, double arc, int side) -> std::optional<cv::Vec3d> {
+        if (arc < 0. || arc > g.length() || (side<0 ? arc-h<0. : arc+h>g.length())) return std::nullopt;
+        const auto p = samplePolylineArc(g, arc).point;
+        auto t = normalizedOrZero(side < 0 ? p-samplePolylineArc(g, arc-h).point : samplePolylineArc(g, arc+h).point-p);
+        if (length(t) <= kEpsilon) return std::nullopt;
+        return t;
+    };
+    const auto relation = [&](double aa, double bb) {
+        bool parallel = true, orthogonal = true;
+        int valid=0;
+        for (int sa : {-1,1}) for (int sb : {-1,1}) {
+            const auto ta = tangent(ga, aa, sa), tb = tangent(gb, bb, sb);
+            if (!ta || !tb) {
+                if(config.preserveInputLinesAsPieces) continue;
+                return 0;
+            }
+            ++valid;
+            const double dot = std::abs(ta->dot(*tb));
+            parallel = parallel && dot >= cosine;
+            orthogonal = orthogonal && dot <= sine;
+        }
+        return valid==0 ? 0 : parallel ? 1 : orthogonal ? 2 : 0;
+    };
+    int kind = relation(a,b);
+    if (kind == 0) return failure();
+    const double seedA = a, seedB = b;
+    // Alternating bounded projection refines orthogonal encounters. Parallel
+    // events keep their A arc: sliding both points would erase repeated samples.
+    for (int i=0; i<4; ++i) {
+        b = projectPointToPolylineArc(gb, samplePolylineArc(ga,a).point,
+            std::max(0.,seedB-reach), std::min(gb.length(),seedB+reach)).arc;
+        if (kind == 2)
+            a = projectPointToPolylineArc(ga, samplePolylineArc(gb,b).point,
+                std::max(0.,seedA-reach), std::min(ga.length(),seedA+reach)).arc;
+    }
+    if (relation(a,b) != kind) return failure();
+    const auto pointA=samplePolylineArc(ga,a).point, pointB=samplePolylineArc(gb,b).point;
+    if (length(pointB-pointA) > config.maximumDistanceBaseVoxels) return failure();
+    const auto reciprocal = projectPointToPolylineArc(ga, pointB,
+        std::max(0.,a-reach), std::min(ga.length(),a+reach));
+    if (std::abs(reciprocal.arc-a) > config.localReciprocalToleranceBaseVoxels) return failure();
+    const auto ta=tangent(ga,a,1).has_value()?tangent(ga,a,1):tangent(ga,a,-1);
+    const auto tb=tangent(gb,b,1).has_value()?tangent(gb,b,1):tangent(gb,b,-1);
+    const int orientation = ta->dot(*tb) < 0. ? -1 : 1;
+    FiberTraceConstraint c;
+    c.pieceA=candidate.pieces.a; c.pieceB=candidate.pieces.b;
+    c.arcABaseVoxels=a; c.arcBBaseVoxels=b;
+    c.pointABaseXYZ=pointA; c.pointBBaseXYZ=pointB;
+    c.closestDistanceBaseVoxels=length(pointB-pointA);
+    c.parallelScore=kind==1 ? 1. : 0.; c.perpendicularScore=1.-c.parallelScore;
+    c.localEvent=true; c.localOrientation=orientation;
+    c.supportABegin=std::max(0.,a-h); c.supportAEnd=std::min(ga.length(),a+h);
+    c.supportBBegin=std::max(0.,b-h); c.supportBEnd=std::min(gb.length(),b+h);
+    ScoredCandidate result;
+    result.parallelConnectors.emplace_back(pointA,pointB);
+    // Both halves independently certify the same base-point relationship.
+    // Orthogonal connectors use shorter probes, parallel connectors longer walks.
+    const double span = kind==1 ? reach : h;
+    int certifiedA=0, certifiedB=0;
+    for (int side : {-1,1}) {
+        const bool fitsA=a+side*span-h>=0. && a+side*span+h<=ga.length();
+        const bool fitsB=b+orientation*side*span-h>=0. && b+orientation*side*span+h<=gb.length();
+        if(!fitsA || !fitsB) {
+            if(!config.preserveInputLinesAsPieces) return failure();
+            if(kind==1 || (!fitsA && !fitsB))continue;
+        }
+        double previousB=b;
+        for (double distance : {span*.5, span}) {
+            const double aa=a+side*distance;
+            const double nominalB=b+orientation*side*distance;
+            double bb=nominalB;
+            if (kind==1) {
+                bb=projectPointToPolylineArc(gb,samplePolylineArc(ga,aa).point,
+                    std::max(0.,nominalB-h),std::min(gb.length(),nominalB+h)).arc;
+                if (orientation*side*(bb-previousB)<=0. || relation(aa,bb)!=1) return failure();
+                const auto back=projectPointToPolylineArc(ga,samplePolylineArc(gb,bb).point,
+                    std::max(0.,aa-h),std::min(ga.length(),aa+h));
+                if (std::abs(back.arc-aa)>config.localReciprocalToleranceBaseVoxels) return failure();
+                previousB=bb;
+            } else {
+                // Probe each trace independently around a localized crossing;
+                // moving both does not define parallel correspondence here.
+                bb=b;
+                if ((fitsA && relation(aa,b)!=2) || (fitsB && relation(a,nominalB)!=2)) return failure();
+            }
+            if(fitsA) {
+                const auto qa=samplePolylineArc(ga,aa).point, qb=samplePolylineArc(gb,bb).point;
+                if (length(qb-qa)>config.maximumDistanceBaseVoxels) return failure();
+                result.parallelConnectors.emplace_back(qa,qb);
+                c.supportABegin=std::min(c.supportABegin,aa-h); c.supportAEnd=std::max(c.supportAEnd,aa+h);
+                c.supportBBegin=std::min(c.supportBBegin,std::max(0.,bb-h)); c.supportBEnd=std::max(c.supportBEnd,std::min(gb.length(),bb+h));
+            }
+            if(kind==2 && fitsB) {
+                if(length(samplePolylineArc(gb,nominalB).point-pointA)>config.maximumDistanceBaseVoxels) return failure();
+                result.parallelConnectors.emplace_back(pointA,samplePolylineArc(gb,nominalB).point);
+                c.supportBBegin=std::min(c.supportBBegin,nominalB-h); c.supportBEnd=std::max(c.supportBEnd,nominalB+h);
+            }
+        }
+        certifiedA+=fitsA; certifiedB+=fitsB;
+    }
+    if(!certifiedA || !certifiedB)return failure();
+    c.parallelCorrespondenceSamples=result.parallelConnectors.size();
+    result.constraint=c;
+    result.candidate=candidate; result.candidate.arcA=a; result.candidate.arcB=b;
+    return result;
+}
+
 ScoredCandidate scoreCandidate(
     const PairCandidate& candidate,
     const std::vector<FiberTraceConstraintPiece>& pieces,
     const std::vector<std::optional<PolylineArcGeometry>>& geometries,
     const FiberTraceConstraintConfig& config)
 {
+    if (config.localEvents)
+        return scoreLocalCandidate(candidate,pieces,geometries,config);
     const auto& pieceA = pieces[candidate.pieces.a];
     const auto& pieceB = pieces[candidate.pieces.b];
     const auto& geometryA = *geometries[pieceA.traceIndex];
@@ -731,50 +875,41 @@ ScoredCandidate scoreCandidate(
     };
 }
 
-}  // namespace
-
-FiberTraceConstraintReport extractFiberTraceConstraints(
-    const std::vector<FiberletCropTraceLine>& lines,
-    const FiberTraceConstraintConfig& config,
-    const FiberTraceWindingDistance& windingDistance,
-    const FiberTraceWindingDistanceBatch& windingDistanceBatch,
-    const FiberTraceConstraintTracePairFilter& tracePairFilter,
-    const LasagnaNormalAlignmentField* alignedNormals)
+void deduplicateLocalEvents(std::vector<ScoredCandidate>& scored)
 {
-    validateConfig(config);
-    FiberTraceConstraintReport report;
-    report.inputTraces = lines.size();
-    std::vector<std::optional<PolylineArcGeometry>> geometries(lines.size());
-    std::vector<std::vector<std::size_t>> piecesByTrace(lines.size());
-
-    const auto prepareStarted = std::chrono::steady_clock::now();
-    for (std::size_t traceIndex = 0; traceIndex < lines.size(); ++traceIndex) {
-        try {
-            geometries[traceIndex] = makePolylineArcGeometry(
-                lines[traceIndex].pointsBaseXYZ);
-        } catch (const std::invalid_argument&) {
-            ++report.skippedDegenerateTraces;
-            continue;
+    // Projection can discover the same encounter from several nearby seeds.
+    // Quantization is ONLY an index: test actual arc distances in adjacent bins.
+    using Key = std::tuple<std::size_t,std::size_t,long long,long long>;
+    std::map<Key,std::vector<std::size_t>> cells;
+    constexpr double tolerance=8.;
+    std::vector<ScoredCandidate> unique;
+    for (auto& s : scored) {
+        if (!s.constraint) { unique.push_back(std::move(s)); continue; }
+        const auto& c=*s.constraint;
+        const auto a=static_cast<long long>(std::floor(c.arcABaseVoxels/tolerance));
+        const auto b=static_cast<long long>(std::floor(c.arcBBaseVoxels/tolerance));
+        bool duplicate=false;
+        for (int da=-1;da<=1;++da) for(int db=-1;db<=1;++db) {
+            auto it=cells.find({c.pieceA,c.pieceB,a+da,b+db});
+            if(it==cells.end()) continue;
+            for(auto i:it->second) {
+                const auto& other=*unique[i].constraint;
+                if(c.parallelScore==other.parallelScore &&
+                   std::abs(c.arcABaseVoxels-other.arcABaseVoxels)<=(c.parallelScore>.5?1e-4:tolerance) &&
+                   std::abs(c.arcBBaseVoxels-other.arcBBaseVoxels)<=tolerance) duplicate=true;
+            }
         }
-        const auto intervals = config.preserveInputLinesAsPieces ? std::vector<std::pair<double, double>>{{0.0, geometries[traceIndex]->length()}}
-                                                                 : pieceIntervals(
-            geometries[traceIndex]->length(), config);
-        piecesByTrace[traceIndex].reserve(intervals.size());
-        for (std::size_t pieceIndex = 0; pieceIndex < intervals.size(); ++pieceIndex) {
-            const auto [begin, end] = intervals[pieceIndex];
-            piecesByTrace[traceIndex].push_back(report.pieces.size());
-            report.pieces.push_back(makePiece(
-                traceIndex,
-                pieceIndex,
-                *geometries[traceIndex],
-                begin,
-                end,
-                config.resampleSpacingBaseVoxels));
-            report.resampledPoints +=
-                report.pieces.back().samplePointsBaseXYZ.size();
-        }
+        if(duplicate) continue;
+        cells[{c.pieceA,c.pieceB,a,b}].push_back(unique.size());
+        unique.push_back(std::move(s));
     }
+    scored=std::move(unique);
+}
 
+void appendContinuity(FiberTraceConstraintReport& report,
+    const std::vector<std::vector<std::size_t>>& piecesByTrace,
+    const std::vector<std::optional<PolylineArcGeometry>>& geometries)
+{
     for (const auto& tracePieces : piecesByTrace) {
         for (std::size_t index = 1; index < tracePieces.size(); ++index) {
             const std::size_t pieceA = tracePieces[index - 1];
@@ -800,127 +935,14 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
             ++report.hardConstraints;
         }
     }
-    report.prepareSeconds = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - prepareStarted).count();
+}
 
-    const auto searchStarted = std::chrono::steady_clock::now();
-    std::vector<SampleRecord> samples;
-    samples.reserve(report.resampledPoints);
-    std::vector<RTreeValue> values;
-    values.reserve(report.resampledPoints);
-    for (std::size_t pieceIndex = 0; pieceIndex < report.pieces.size(); ++pieceIndex) {
-        const auto& piece = report.pieces[pieceIndex];
-        for (std::size_t sampleIndex = 0;
-             sampleIndex < piece.samplePointsBaseXYZ.size();
-             ++sampleIndex) {
-            const std::size_t globalIndex = samples.size();
-            samples.push_back({pieceIndex, sampleIndex});
-            values.emplace_back(
-                point3(piece.samplePointsBaseXYZ[sampleIndex]), globalIndex);
-        }
-    }
-    const PointTree tree(values.begin(), values.end());
-    std::map<PiecePair, PairCandidate> bestByPair;
-    std::vector<RTreeValue> hits;
-    const double maximumDistanceSquared =
-        config.maximumDistanceBaseVoxels * config.maximumDistanceBaseVoxels;
-    for (std::size_t globalA = 0; globalA < samples.size(); ++globalA) {
-        const auto& sampleA = samples[globalA];
-        const auto& pieceA = report.pieces[sampleA.piece];
-        const cv::Vec3d pointA = pieceA.samplePointsBaseXYZ[sampleA.sample];
-        hits.clear();
-        tree.query(
-            bgi::intersects(queryBox(
-                pointA, config.maximumDistanceBaseVoxels)),
-            std::back_inserter(hits));
-        for (const auto& hit : hits) {
-            const std::size_t globalB = hit.second;
-            if (globalB <= globalA)
-                continue;
-            const auto& sampleB = samples[globalB];
-            if (sampleA.piece == sampleB.piece)
-                continue;
-            const auto& pieceB = report.pieces[sampleB.piece];
-            if (pieceA.traceIndex == pieceB.traceIndex)
-                continue;
-            if (tracePairFilter && !tracePairFilter(pieceA.traceIndex, pieceB.traceIndex)) {
-                continue;
-            }
-            const cv::Vec3d pointB = pieceB.samplePointsBaseXYZ[sampleB.sample];
-            const cv::Vec3d delta = pointA - pointB;
-            const double distanceSquared = delta.dot(delta);
-            if (!std::isfinite(distanceSquared) ||
-                distanceSquared > maximumDistanceSquared + kEpsilon) {
-                continue;
-            }
-            ++report.spatialHits;
-            PairCandidate candidate;
-            if (sampleA.piece < sampleB.piece) {
-                candidate.pieces = {sampleA.piece, sampleB.piece};
-                candidate.sampleA = sampleA.sample;
-                candidate.sampleB = sampleB.sample;
-                candidate.globalSampleA = globalA;
-                candidate.globalSampleB = globalB;
-            } else {
-                candidate.pieces = {sampleB.piece, sampleA.piece};
-                candidate.sampleA = sampleB.sample;
-                candidate.sampleB = sampleA.sample;
-                candidate.globalSampleA = globalB;
-                candidate.globalSampleB = globalA;
-            }
-            candidate.distance = std::sqrt(std::max(0.0, distanceSquared));
-            const auto found = bestByPair.find(candidate.pieces);
-            if (found == bestByPair.end())
-                bestByPair.emplace(candidate.pieces, candidate);
-            else if (betterCandidate(candidate, found->second))
-                found->second = candidate;
-        }
-    }
-    std::vector<PairCandidate> candidates;
-    candidates.reserve(bestByPair.size());
-    for (const auto& [key, candidate] : bestByPair) {
-        (void)key;
-        candidates.push_back(candidate);
-    }
-    report.measuredCandidates = candidates.size();
-    report.searchSeconds = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - searchStarted).count();
-
-    if (!candidates.empty() && !windingDistance && !windingDistanceBatch)
-        throw std::invalid_argument("Fiber trace constraint winding sampler is missing");
-    const auto scoreStarted = std::chrono::steady_clock::now();
-    const std::size_t requestedThreads = config.parallelThreads == 0
-        ? std::max<std::size_t>(1, std::thread::hardware_concurrency())
-        : config.parallelThreads;
-    const int workers = static_cast<int>(std::min<std::size_t>(
-        requestedThreads,
-        std::max<std::size_t>(1, candidates.size())));
-    std::vector<ScoredCandidate> scored(candidates.size());
-    std::vector<std::exception_ptr> failures(candidates.size());
-#ifdef _OPENMP
-#pragma omp parallel for schedule(guided, 16) num_threads(workers)
-#endif
-    for (std::ptrdiff_t index = 0;
-         index < static_cast<std::ptrdiff_t>(candidates.size());
-         ++index) {
-        try {
-            scored[static_cast<std::size_t>(index)] = scoreCandidate(
-                candidates[static_cast<std::size_t>(index)],
-                report.pieces,
-                geometries,
-                config);
-        } catch (...) {
-            failures[static_cast<std::size_t>(index)] = std::current_exception();
-        }
-    }
-    for (const auto& failure : failures) {
-        if (failure)
-            std::rethrow_exception(failure);
-    }
-    report.orientationScoreSeconds = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - scoreStarted).count();
-
-    const auto windingStarted = std::chrono::steady_clock::now();
+void measureCandidates(
+    std::vector<ScoredCandidate>& scored, const FiberTraceConstraintConfig& config,
+    const FiberTraceWindingDistance& windingDistance,
+    const FiberTraceWindingDistanceBatch& windingDistanceBatch,
+    const LasagnaNormalAlignmentField* alignedNormals, int workers)
+{
     std::vector<std::size_t> acceptedIndices;
     std::vector<std::size_t> connectorOffsets;
     std::vector<std::pair<cv::Vec3d, cv::Vec3d>> connectors;
@@ -1034,12 +1056,455 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
             }
         }
 
+        if (config.localEvents) {
+            const auto& c = *result.constraint;
+            const double step = c.parallelScore > c.perpendicularScore ? 1.0 : 0.5;
+            bool consistent = true;
+            for (std::size_t sample = begin; sample < end; ++sample) {
+                if (!std::isfinite(windings[sample]) ||
+                    std::abs(windings[sample] - closestWinding) > config.localDistanceTolerance ||
+                    std::llround(windings[sample] / step) != std::llround(closestWinding / step)) {
+                    consistent = false;
+                    break;
+                }
+                if (alignedNormals != nullptr && closestWinding > config.localDistanceTolerance) {
+                    const auto value = signedWindingSample(connectors[sample], windings[sample], *alignedNormals);
+                    if (!value || !c.signedWindingDelta ||
+                        value->component != c.windingNormalComponent ||
+                        std::signbit(value->value) != std::signbit(*c.signedWindingDelta))
+                        consistent = false;
+                }
+            }
+            if (!consistent) {
+                result.constraint.reset();
+                result.rejection = RejectReason::Consistency;
+                continue;
+            }
+            // Off-base samples certify the measurement; they do not move or average it.
+            result.constraint->parallelWindingDistance = closestWinding;
+            result.constraint->signedParallelWindingDelta = c.signedWindingDelta;
+            result.constraint->parallelNormalAlignment = c.perpendicularNormalAlignment;
+        }
         if (config.enforceMaximumWindingDistance &&
             (!(closestWinding < config.maximumWindingDistance) ||
              !(result.constraint->parallelWindingDistance <
                config.maximumWindingDistance))) {
             result.constraint.reset();
             result.rejection = RejectReason::WindingCutoff;
+        }
+    }
+}
+
+// Evidence belongs to certified source-trace encounters, not their later
+// segmentation. Partition repeated parallel evidence before remapping IDs.
+void normalizeLocalParallelEvidence(FiberTraceConstraintReport& report,
+    const std::vector<std::optional<PolylineArcGeometry>>& geometries,
+    const FiberTraceConstraintConfig& config)
+{
+    std::map<PiecePair,std::vector<std::size_t>> repeats;
+    for(std::size_t i=0;i<report.constraints.size();++i)
+        if(report.constraints[i].parallelScore>.5)
+            repeats[{report.constraints[i].pieceA,report.constraints[i].pieceB}].push_back(i);
+    for(auto& [pair,ids]:repeats) {
+        std::stable_sort(ids.begin(),ids.end(),[&](auto a,auto b) {
+            return report.constraints[a].arcABaseVoxels<report.constraints[b].arcABaseVoxels;
+        });
+        for(std::size_t first=0;first<ids.size();) {
+            std::size_t endGroup=first+1;
+            const double arc=report.constraints[ids[first]].arcABaseVoxels;
+            while(endGroup<ids.size() && report.constraints[ids[endGroup]].arcABaseVoxels==arc)
+                ++endGroup;
+            for(std::size_t k=first;k<endGroup;++k) {
+                auto& c=report.constraints[ids[k]];
+                double begin=c.supportABegin,end=c.supportAEnd;
+                if(!config.preserveInputLinesAsPieces) {
+                    const double margin=config.localParallelSpanBaseVoxels+config.localTangentSpanBaseVoxels;
+                    begin=std::max(begin,margin);
+                    end=std::min(end,geometries[report.pieces[c.pieceA].traceIndex]->length()-margin);
+                }
+                if(first>0)begin=std::max(begin,.5*(report.constraints[ids[first-1]].arcABaseVoxels+arc));
+                if(endGroup<ids.size())end=std::min(end,.5*(report.constraints[ids[endGroup]].arcABaseVoxels+arc));
+                if(!(end>begin))
+                    throw std::logic_error("Certified parallel event has no represented source support");
+                c.evidenceWeight=(end-begin)/(128.*static_cast<double>(endGroup-first));
+            }
+            first=endGroup;
+        }
+    }
+}
+
+// All event identities still refer to whole source traces here. Derive cuts
+// before optional parallel-factor removal so the ablation has identical pieces.
+void splitLocalEvents(FiberTraceConstraintReport& report,
+    const std::vector<std::optional<PolylineArcGeometry>>& geometries,
+    const FiberTraceConstraintConfig& config)
+{
+    normalizeLocalParallelEvidence(report,geometries,config);
+    report.localCertifiedEvents=report.constraints.size();
+    const auto originalPieces=report.pieces;
+    std::vector<std::vector<double>> orthogonal(geometries.size()), cuts(geometries.size());
+    std::map<PiecePair,std::vector<std::size_t>> pairs;
+    for(std::size_t i=0;i<report.constraints.size();++i) {
+        const auto& c=report.constraints[i];
+        pairs[{c.pieceA,c.pieceB}].push_back(i);
+        if(c.perpendicularScore>c.parallelScore) {
+            orthogonal[originalPieces[c.pieceA].traceIndex].push_back(c.arcABaseVoxels);
+            orthogonal[originalPieces[c.pieceB].traceIndex].push_back(c.arcBBaseVoxels);
+        }
+    }
+    const auto sortUnique=[](auto& v) {
+        std::sort(v.begin(),v.end());
+        v.erase(std::unique(v.begin(),v.end(),[](double a,double b){return std::abs(a-b)<1e-4;}),v.end());
+    };
+    for(std::size_t t=0;t<orthogonal.size();++t) {
+        auto& arcs=orthogonal[t]; sortUnique(arcs);
+        for(std::size_t i=1;i<arcs.size();++i) {
+            cuts[t].push_back(.5*(arcs[i-1]+arcs[i]));
+            ++report.localMidpointCuts;
+        }
+    }
+    for(auto& [pair,indices]:pairs) {
+        std::sort(indices.begin(),indices.end(),[&](auto i,auto j) {
+            const auto& a=report.constraints[i]; const auto& b=report.constraints[j];
+            return std::tie(a.arcABaseVoxels,a.arcBBaseVoxels)<std::tie(b.arcABaseVoxels,b.arcBBaseVoxels);
+        });
+        for(std::size_t k=1;k<indices.size();++k) {
+            const auto& a=report.constraints[indices[k-1]];
+            const auto& b=report.constraints[indices[k]];
+            // Two-sided certification leaves an ambiguous band around a real
+            // transition. Bridge that bounded band, not only adjacent samples.
+            const double bracket=2*(config.localSpacingBaseVoxels+
+                config.localParallelSpanBaseVoxels+config.localTangentSpanBaseVoxels);
+            if(std::abs(a.arcABaseVoxels-b.arcABaseVoxels)>bracket ||
+               std::abs(a.arcBBaseVoxels-b.arcBBaseVoxels)>bracket) continue;
+            const auto category=[](const auto& c) {
+                return std::tuple{c.parallelScore>c.perpendicularScore,
+                    std::llround(c.windingDistance/(c.parallelScore>.5?1.:.5)),
+                    c.signedWindingDelta ? (*c.signedWindingDelta<0.?-1:1):0};
+            };
+            if(category(a)!=category(b) && (a.parallelScore>.5 || b.parallelScore>.5)) {
+                cuts[originalPieces[pair.a].traceIndex].push_back(.5*(a.arcABaseVoxels+b.arcABaseVoxels));
+                cuts[originalPieces[pair.b].traceIndex].push_back(.5*(a.arcBBaseVoxels+b.arcBBaseVoxels));
+                report.localTransitionCuts+=2;
+            }
+        }
+    }
+    std::vector<std::vector<std::size_t>> piecesByTrace(geometries.size());
+    if(!config.preserveInputLinesAsPieces) {
+        report.pieces.clear(); report.resampledPoints=0;
+        for(std::size_t t=0;t<geometries.size();++t) {
+            if(!geometries[t]) continue;
+            auto& c=cuts[t]; sortUnique(c);
+            c.erase(std::remove_if(c.begin(),c.end(),[&](double x){return x<=1e-4 || x>=geometries[t]->length()-1e-4;}),c.end());
+            c.push_back(geometries[t]->length());
+            double begin=0.;
+            for(double end:c) {
+                piecesByTrace[t].push_back(report.pieces.size());
+                report.pieces.push_back(makePiece(t,piecesByTrace[t].size()-1,*geometries[t],begin,end,config.resampleSpacingBaseVoxels));
+                report.resampledPoints+=report.pieces.back().samplePointsBaseXYZ.size();
+                begin=end;
+            }
+        }
+    } else {
+        for(std::size_t i=0;i<report.pieces.size();++i)
+            piecesByTrace[report.pieces[i].traceIndex].push_back(i);
+        report.localMidpointCuts=report.localTransitionCuts=0;
+    }
+    std::size_t missingOwners=0;
+    report.constraints=remapCertifiedFiberTraceEvents(report.constraints,originalPieces,report.pieces,missingOwners);
+    if(missingOwners)
+        throw std::logic_error("Full subdivision lost certified event owners");
+    std::erase_if(report.constraints,[&](const auto& c) {
+        if(config.localIncludeParallel || c.parallelScore<=.5)return false;
+        ++report.localParallelOmitted; return true;
+    });
+    report.localRetainedCertifiedEvents=report.constraints.size();
+    appendContinuity(report,piecesByTrace,geometries);
+}
+
+}  // namespace
+
+std::vector<FiberTraceConstraint> remapCertifiedFiberTraceEvents(
+    std::span<const FiberTraceConstraint> events,
+    std::span<const FiberTraceConstraintPiece> sourcePieces,
+    std::span<const FiberTraceConstraintPiece> targetPieces,
+    std::size_t& missingOwners)
+{
+    std::map<std::size_t,std::vector<std::size_t>> byTrace;
+    for(std::size_t i=0;i<targetPieces.size();++i)byTrace[targetPieces[i].traceIndex].push_back(i);
+    for(auto& [trace,ids]:byTrace) {
+        std::stable_sort(ids.begin(),ids.end(),[&](auto a,auto b) {
+            return targetPieces[a].beginArcBaseVoxels<targetPieces[b].beginArcBaseVoxels;
+        });
+        for(std::size_t i=1;i<ids.size();++i)
+            if(targetPieces[ids[i]].endArcBaseVoxels<targetPieces[ids[i-1]].endArcBaseVoxels)
+                throw std::invalid_argument("Nested target intervals are not ordered fiber pieces");
+    }
+    const auto owner=[&](std::size_t source,double arc)->std::optional<std::size_t> {
+        if(source>=sourcePieces.size())throw std::out_of_range("Certified event source piece");
+        const auto found=byTrace.find(sourcePieces[source].traceIndex);
+        if(found==byTrace.end())return std::nullopt;
+        const auto& ids=found->second;
+        auto it=std::upper_bound(ids.begin(),ids.end(),arc,[&](double x,std::size_t id) {
+            return x<targetPieces[id].beginArcBaseVoxels;
+        });
+        if(it==ids.begin())return std::nullopt;
+        const auto id=*std::prev(it);
+        if(arc>targetPieces[id].endArcBaseVoxels)return std::nullopt;
+        return id;
+    };
+    missingOwners=0;
+    std::vector<FiberTraceConstraint> result;
+    result.reserve(events.size());
+    for(auto c:events) {
+        if(c.hardContinuity)throw std::invalid_argument("Cannot remap a continuation as a certified event");
+        const auto a=owner(c.pieceA,c.arcABaseVoxels),b=owner(c.pieceB,c.arcBBaseVoxels);
+        if(!a||!b){++missingOwners;continue;}
+        c.pieceA=*a; c.pieceB=*b;
+        result.push_back(std::move(c));
+    }
+    return result;
+}
+
+FiberTraceConstraintReport extractFiberTraceConstraints(
+    const std::vector<FiberletCropTraceLine>& lines,
+    const FiberTraceConstraintConfig& config,
+    const FiberTraceWindingDistance& windingDistance,
+    const FiberTraceWindingDistanceBatch& windingDistanceBatch,
+    const FiberTraceConstraintTracePairFilter& tracePairFilter,
+    const LasagnaNormalAlignmentField* alignedNormals)
+{
+    validateConfig(config);
+    FiberTraceConstraintReport report;
+    report.inputTraces = lines.size();
+    std::vector<std::optional<PolylineArcGeometry>> geometries(lines.size());
+    std::vector<std::vector<std::size_t>> piecesByTrace(lines.size());
+
+    if (!config.extraPieceCutsBaseVoxels.empty() &&
+        (config.extraPieceCutsBaseVoxels.size() != lines.size() || config.preserveInputLinesAsPieces))
+        throw std::invalid_argument("Piece cut hints require one entry per trace and ordinary splitting");
+    const auto prepareStarted = std::chrono::steady_clock::now();
+    for (std::size_t traceIndex = 0; traceIndex < lines.size(); ++traceIndex) {
+        try {
+            geometries[traceIndex] = makePolylineArcGeometry(
+                lines[traceIndex].pointsBaseXYZ);
+        } catch (const std::invalid_argument&) {
+            ++report.skippedDegenerateTraces;
+            continue;
+        }
+        auto intervals = (config.preserveInputLinesAsPieces || config.localEvents) ? std::vector<std::pair<double, double>>{{0.0, geometries[traceIndex]->length()}}
+                                                                 : pieceIntervals(
+            geometries[traceIndex]->length(), config);
+        if (!config.extraPieceCutsBaseVoxels.empty()) {
+            intervals.clear();
+            double begin = 0.0;
+            auto cuts = config.extraPieceCutsBaseVoxels[traceIndex];
+            for (double cut : cuts) {
+                if (!std::isfinite(cut) || cut <= begin || cut >= geometries[traceIndex]->length())
+                    throw std::invalid_argument("Piece cuts must be ordered interior arcs");
+                begin = cut;
+            }
+            cuts.push_back(geometries[traceIndex]->length());
+            begin = 0.0;
+            for (double end : cuts) {
+                for (const auto& interval : pieceIntervals(end - begin, config))
+                    intervals.emplace_back(begin + interval.first, begin + interval.second);
+                begin = end;
+            }
+        }
+        piecesByTrace[traceIndex].reserve(intervals.size());
+        for (std::size_t pieceIndex = 0; pieceIndex < intervals.size(); ++pieceIndex) {
+            const auto [begin, end] = intervals[pieceIndex];
+            piecesByTrace[traceIndex].push_back(report.pieces.size());
+            report.pieces.push_back(makePiece(
+                traceIndex,
+                pieceIndex,
+                *geometries[traceIndex],
+                begin,
+                end,
+                config.localEvents ? config.localSpacingBaseVoxels : config.resampleSpacingBaseVoxels));
+            report.resampledPoints +=
+                report.pieces.back().samplePointsBaseXYZ.size();
+        }
+    }
+
+    appendContinuity(report, piecesByTrace, geometries);
+    report.prepareSeconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - prepareStarted).count();
+
+    const auto searchStarted = std::chrono::steady_clock::now();
+    std::vector<SampleRecord> samples;
+    samples.reserve(report.resampledPoints);
+    std::vector<RTreeValue> values;
+    values.reserve(report.resampledPoints);
+    for (std::size_t pieceIndex = 0; pieceIndex < report.pieces.size(); ++pieceIndex) {
+        const auto& piece = report.pieces[pieceIndex];
+        for (std::size_t sampleIndex = 0;
+             sampleIndex < piece.samplePointsBaseXYZ.size();
+             ++sampleIndex) {
+            const std::size_t globalIndex = samples.size();
+            samples.push_back({pieceIndex, sampleIndex});
+            values.emplace_back(
+                point3(piece.samplePointsBaseXYZ[sampleIndex]), globalIndex);
+        }
+    }
+    const PointTree tree(values.begin(), values.end());
+    std::map<PiecePair, PairCandidate> bestByPair;
+    // Arc-pair cells preserve separate encounters of the same two source traces.
+    using LocalKey = std::tuple<std::size_t,std::size_t,std::size_t,std::size_t>;
+    std::map<LocalKey, PairCandidate> localCandidates;
+    std::vector<RTreeValue> hits;
+    const double maximumDistanceSquared =
+        config.maximumDistanceBaseVoxels * config.maximumDistanceBaseVoxels;
+    for (std::size_t globalA = 0; globalA < samples.size(); ++globalA) {
+        const auto& sampleA = samples[globalA];
+        const auto& pieceA = report.pieces[sampleA.piece];
+        const cv::Vec3d pointA = pieceA.samplePointsBaseXYZ[sampleA.sample];
+        hits.clear();
+        tree.query(
+            bgi::intersects(queryBox(
+                pointA, config.maximumDistanceBaseVoxels)),
+            std::back_inserter(hits));
+        for (const auto& hit : hits) {
+            const std::size_t globalB = hit.second;
+            if (globalB <= globalA)
+                continue;
+            const auto& sampleB = samples[globalB];
+            if (sampleA.piece == sampleB.piece)
+                continue;
+            const auto& pieceB = report.pieces[sampleB.piece];
+            if (pieceA.traceIndex == pieceB.traceIndex)
+                continue;
+            if (tracePairFilter && !tracePairFilter(pieceA.traceIndex, pieceB.traceIndex)) {
+                continue;
+            }
+            const cv::Vec3d pointB = pieceB.samplePointsBaseXYZ[sampleB.sample];
+            const cv::Vec3d delta = pointA - pointB;
+            const double distanceSquared = delta.dot(delta);
+            if (!std::isfinite(distanceSquared) ||
+                distanceSquared > maximumDistanceSquared + kEpsilon) {
+                continue;
+            }
+            ++report.spatialHits;
+            PairCandidate candidate;
+            if (sampleA.piece < sampleB.piece) {
+                candidate.pieces = {sampleA.piece, sampleB.piece};
+                candidate.sampleA = sampleA.sample;
+                candidate.sampleB = sampleB.sample;
+                candidate.globalSampleA = globalA;
+                candidate.globalSampleB = globalB;
+            } else {
+                candidate.pieces = {sampleB.piece, sampleA.piece};
+                candidate.sampleA = sampleB.sample;
+                candidate.sampleB = sampleA.sample;
+                candidate.globalSampleA = globalB;
+                candidate.globalSampleB = globalA;
+            }
+            candidate.distance = std::sqrt(std::max(0.0, distanceSquared));
+            if (config.localEvents) {
+                const LocalKey key{candidate.pieces.a,candidate.pieces.b,candidate.sampleA,candidate.sampleB};
+                localCandidates.emplace(key,candidate);
+                continue;
+            }
+            const auto found = bestByPair.find(candidate.pieces);
+            if (found == bestByPair.end())
+                bestByPair.emplace(candidate.pieces, candidate);
+            else if (betterCandidate(candidate, found->second))
+                found->second = candidate;
+        }
+    }
+    std::vector<PairCandidate> candidates;
+    for (const auto& [key,candidate] : localCandidates) candidates.push_back(candidate);
+    candidates.reserve(bestByPair.size());
+    for (const auto& [key, candidate] : bestByPair) {
+        (void)key;
+        candidates.push_back(candidate);
+    }
+    report.measuredCandidates = candidates.size();
+    report.searchSeconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - searchStarted).count();
+
+    if (!candidates.empty() && !windingDistance && !windingDistanceBatch)
+        throw std::invalid_argument("Fiber trace constraint winding sampler is missing");
+    const auto scoreStarted = std::chrono::steady_clock::now();
+    const std::size_t requestedThreads = config.parallelThreads == 0
+        ? std::max<std::size_t>(1, std::thread::hardware_concurrency())
+        : config.parallelThreads;
+    const int workers = static_cast<int>(std::min<std::size_t>(
+        requestedThreads,
+        std::max<std::size_t>(1, candidates.size())));
+    std::vector<ScoredCandidate> scored(candidates.size());
+    std::vector<std::exception_ptr> failures(candidates.size());
+#ifdef _OPENMP
+#pragma omp parallel for schedule(guided, 16) num_threads(workers)
+#endif
+    for (std::ptrdiff_t index = 0;
+         index < static_cast<std::ptrdiff_t>(candidates.size());
+         ++index) {
+        try {
+            scored[static_cast<std::size_t>(index)] = scoreCandidate(
+                candidates[static_cast<std::size_t>(index)],
+                report.pieces,
+                geometries,
+                config);
+        } catch (...) {
+            failures[static_cast<std::size_t>(index)] = std::current_exception();
+        }
+    }
+    for (const auto& failure : failures) {
+        if (failure)
+            std::rethrow_exception(failure);
+    }
+    report.orientationScoreSeconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - scoreStarted).count();
+
+    const auto windingStarted = std::chrono::steady_clock::now();
+    if(config.localEvents) deduplicateLocalEvents(scored);
+    measureCandidates(scored, config, windingDistance, windingDistanceBatch, alignedNormals, workers);
+    if(config.localEvents) {
+        for(std::size_t round=0;round<config.localRefinementRounds;++round) {
+            std::map<PiecePair,std::vector<std::size_t>> groups;
+            for(std::size_t i=0;i<scored.size();++i) groups[scored[i].candidate.pieces].push_back(i);
+            std::vector<PairCandidate> extra;
+            for(auto& [pair,ids]:groups) {
+                std::sort(ids.begin(),ids.end(),[&](auto i,auto j) {
+                    return std::tie(scored[i].candidate.arcA,scored[i].candidate.arcB) <
+                        std::tie(scored[j].candidate.arcA,scored[j].candidate.arcB);
+                });
+                const auto state=[](const ScoredCandidate& s) {
+                    if(!s.constraint) return std::tuple{0,0LL,0};
+                    const auto& c=*s.constraint;
+                    return std::tuple{c.parallelScore>.5?1:2,
+                        std::llround(c.windingDistance/(c.parallelScore>.5?1.:.5)),
+                        c.signedWindingDelta?(*c.signedWindingDelta<0.?-1:1):0};
+                };
+                for(std::size_t k=1;k<ids.size();++k) {
+                    const auto& a=scored[ids[k-1]]; const auto& b=scored[ids[k]];
+                    double gap=std::abs(a.candidate.arcA-b.candidate.arcA);
+                    if(state(a)==state(b) || gap<config.localSpacingBaseVoxels/std::pow(2.,round+1) ||
+                       gap>2*config.localSpacingBaseVoxels ||
+                       std::abs(a.candidate.arcB-b.candidate.arcB)>2*config.localSpacingBaseVoxels) continue;
+                    auto c=a.candidate;
+                    c.arcA=.5*(a.candidate.arcA+b.candidate.arcA);
+                    c.arcB=.5*(a.candidate.arcB+b.candidate.arcB);
+                    extra.push_back(c);
+                }
+            }
+            if(extra.empty()) break;
+            std::vector<ScoredCandidate> refined(extra.size());
+            std::vector<std::exception_ptr> errors(extra.size());
+#ifdef _OPENMP
+#pragma omp parallel for schedule(guided, 16) num_threads(workers)
+#endif
+            for(std::ptrdiff_t i=0;i<static_cast<std::ptrdiff_t>(extra.size());++i) {
+                try { refined[i]=scoreLocalCandidate(extra[i],report.pieces,geometries,config); }
+                catch(...) { errors[i]=std::current_exception(); }
+            }
+            for(const auto& e:errors)if(e)std::rethrow_exception(e);
+            measureCandidates(refined,config,windingDistance,windingDistanceBatch,alignedNormals,workers);
+            report.localRefinedCandidates+=refined.size();
+            scored.insert(scored.end(),std::make_move_iterator(refined.begin()),std::make_move_iterator(refined.end()));
+            deduplicateLocalEvents(scored);
         }
     }
     report.windingScoreSeconds = std::chrono::duration<double>(
@@ -1062,11 +1527,28 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
             ++report.rejectedWinding;
         else if (result.rejection == RejectReason::WindingCutoff)
             ++report.rejectedWindingCutoff;
+        else if (result.rejection == RejectReason::Consistency)
+            ++report.localRejectedConsistency;
+    }
+    if(config.localEvents) {
+        splitLocalEvents(report,geometries,config);
+        report.signedWindingConstraints=report.skippedSignedWindingConstraints=0;
+        if(alignedNormals != nullptr) {
+            for(const auto& c:report.constraints) {
+                if(c.hardContinuity)continue; // Counted by the shared finalization below.
+                if(c.signedWindingDelta && c.signedParallelWindingDelta)
+                    ++report.signedWindingConstraints;
+                else ++report.skippedSignedWindingConstraints;
+            }
+        }
     }
     std::sort(report.constraints.begin(), report.constraints.end(),
-        [](const auto& left, const auto& right) {
-            return std::tie(left.pieceA, left.pieceB, left.hardContinuity) <
-                std::tie(right.pieceA, right.pieceB, right.hardContinuity);
+        [&](const auto& left, const auto& right) {
+            if(!config.localEvents)
+                return std::tie(left.pieceA,left.pieceB,left.hardContinuity) <
+                    std::tie(right.pieceA,right.pieceB,right.hardContinuity);
+            return std::tie(left.pieceA, left.pieceB, left.hardContinuity,left.arcABaseVoxels,left.arcBBaseVoxels) <
+                std::tie(right.pieceA, right.pieceB, right.hardContinuity,right.arcABaseVoxels,right.arcBBaseVoxels);
         });
     report.scoreSeconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - scoreStarted).count();
@@ -1228,6 +1710,43 @@ std::vector<FiberletCropTraceLine> makeFiberTraceConstraintPieceLines(
         result.push_back(std::move(line));
     }
     return result;
+}
+
+FiberTraceConstraintSubsetResult selectFiberTraceReferenceNeighborhood(
+    const FiberTraceConstraintReport& report, std::size_t referencePieces,
+    std::optional<double> maximumWindings, double measurementScale)
+{
+    if (referencePieces > report.pieces.size() || !std::isfinite(measurementScale) ||
+        measurementScale <= 0.0 || (maximumWindings &&
+        (!std::isfinite(*maximumWindings) || *maximumWindings < 0.0)))
+        throw std::invalid_argument("Invalid reference neighborhood cutoff or scale");
+    std::vector<unsigned char> referenceTrace(report.inputTraces, 0);
+    std::vector<unsigned char> keepTrace(report.inputTraces, maximumWindings ? 0 : 1);
+    for (std::size_t p = 0; p < report.pieces.size(); ++p) {
+        const auto trace = report.pieces[p].traceIndex;
+        if (trace >= report.inputTraces)
+            throw std::invalid_argument("Reference neighborhood has an invalid source trace");
+        if (p < referencePieces) referenceTrace[trace] = keepTrace[trace] = 1;
+    }
+    for (std::size_t p = referencePieces; p < report.pieces.size(); ++p)
+        if (referenceTrace[report.pieces[p].traceIndex])
+            throw std::invalid_argument("Reference and ordinary pieces share a source trace");
+    for (const auto& c : report.constraints) {
+        if (c.pieceA >= report.pieces.size() || c.pieceB >= report.pieces.size())
+            throw std::invalid_argument("Reference neighborhood has an invalid constraint");
+        if (!maximumWindings || c.hardContinuity ||
+            (c.pieceA < referencePieces) == (c.pieceB < referencePieces) ||
+            !(c.perpendicularScore > 0.0) || c.perpendicularScore < c.parallelScore ||
+            !c.signedWindingDelta || !std::isfinite(*c.signedWindingDelta) ||
+            std::abs(*c.signedWindingDelta) * measurementScale > *maximumWindings)
+            continue;
+        const auto ordinary = c.pieceA < referencePieces ? c.pieceB : c.pieceA;
+        keepTrace[report.pieces[ordinary].traceIndex] = 1;
+    }
+    std::vector<std::size_t> retained;
+    for (std::size_t p = 0; p < report.pieces.size(); ++p)
+        if (keepTrace[report.pieces[p].traceIndex]) retained.push_back(p);
+    return subsetFiberTraceConstraintReport(report, retained);
 }
 
 FiberTraceConstraintSubsetResult subsetFiberTraceConstraintReport(const FiberTraceConstraintReport& constraints, std::span<const std::size_t> retainedPieceIndices)

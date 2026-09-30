@@ -2,6 +2,7 @@
 #include "vc/core/util/AtomicFile.hpp"
 #include "vc/core/io/PolylineObj.hpp"
 #include "vc/fiber_tracer/FiberletChunkGraph.hpp"
+#include "vc/fiber_tracer/FiberletPipeline.hpp"
 #include "vc/fiber_tracer/FiberletCropTrace.hpp"
 #include "vc/fiber_tracer/FiberletCropTraceArtifact.hpp"
 #include "vc/fiber_tracer/FiberletCropVisualization.hpp"
@@ -73,14 +74,51 @@ enum class BpBalanceSelection {
 enum class ReferenceReplayTracer {
     Fiberlet,
     Greedy,
+    Beam,
     Lasagna,
+    Precomputed,
 };
 
+bool isDenseReplay(ReferenceReplayTracer tracer)
+{
+    return tracer == ReferenceReplayTracer::Greedy || tracer == ReferenceReplayTracer::Beam;
+}
+
 constexpr double kDefaultWindingPhase = 0.5;
+
+void validateCollectionNormalSpace(const nlohmann::json& collection,
+    const vc::lasagna::LasagnaDatasetManifest& manifest)
+{
+    const auto provenancePath = manifest.baseDirectory /
+        manifest.raw.at("provenance").get<std::string>();
+    std::ifstream input(provenancePath);
+    if (!input) throw std::invalid_argument("collection import/replay requires readable normal inference provenance");
+    nlohmann::json provenance;
+    input >> provenance;
+    const auto& source = provenance.at("source");
+    const auto space = source.at("sample_id").get<std::string>() + "/" +
+        source.at("volume_id").get<std::string>();
+    if (collection.value("vc_open_data_coordinate_space", std::string{}) != space)
+        throw std::invalid_argument("collection and normal manifest coordinate spaces differ");
+    for (const auto& entry : collection.at("point_collections"))
+        if (entry.value("vc_open_data_coordinate_space", space) != space)
+            throw std::invalid_argument("collection entry and normal coordinate spaces differ");
+}
+
+void validateArtifactQuality(const vc::fiber_tracer::FiberletCropTraceArtifact& artifact,
+    bool filtering)
+{
+    if (filtering && artifact.metadata.processing.contains("preprocessing") &&
+        artifact.metadata.processing.at("preprocessing").value("quality_cost", std::string{}) == "unavailable")
+        throw std::invalid_argument("Imported fibers have no quality score; remove quality filtering");
+}
 constexpr double kDefaultWindingMeasurementScale = 0.822;
 
 struct Options {
     Mode mode = Mode::Trace;
+    bool denseBeamCrop = false;
+    bool importedCrop = false;
+    std::filesystem::path candidateFibers;
     std::filesystem::path input;
     std::string normalManifest;
     std::filesystem::path remoteCacheDirectory;
@@ -110,12 +148,18 @@ struct Options {
     ReferenceReplayTracer referenceReplayTracer =
         ReferenceReplayTracer::Fiberlet;
     std::string fiberManifest;
+    std::filesystem::path fiberletCacheRoot;
+    std::filesystem::path traceCostReference;
+    int fiberletStorageChunkSide = 512;
     int inferenceScaledownPower = 2;
     double lasagnaReplayStepBaseVoxels = 16.0;
     vc::fiber_tracer::FiberTraceConfig directReplayTrace;
     std::filesystem::path referenceFiberDirectory;
     std::string referenceFiberTag;
     bool referenceConditioningDiagnostic = false;
+    // Negative sentinel denotes the matched all-fiber control.
+    std::optional<double> referenceNeighborhoodWindings;
+    bool referenceNeighborhoodUnconditioned = false;
     bool referencePruneOffenders = false;
     vc::fiber_tracer::FiberTraceConditionedOffenderConfig
         referencePruneConfig;
@@ -127,6 +171,10 @@ struct Options {
     bool hasReferenceOracleOption = false;
     bool referenceOracleAcceptMessageLimit = false;
     bool referenceConstraintDetails = false;
+    bool referenceIndependent = false;
+    bool referenceInitialReadout = false;
+    std::filesystem::path defectMultipliers;
+    std::filesystem::path pieceCutHints;
     std::size_t ablationStep = 5;
     std::optional<std::size_t> ablationLimit;
     std::size_t postIterations = 0;
@@ -139,6 +187,8 @@ struct Options {
     vc::fiber_tracer::FiberTraceWindingSolver windingSolver =
         vc::fiber_tracer::FiberTraceWindingSolver::JointGrid;
     bool windingFixedOrientation = false;
+    bool windingLargestComponentOnly = false;
+    std::optional<std::size_t> windingMessageIterations;
     double windingDefectCost = 100.0;
     double pieceBreakCost = 0.0;
     double windingContinuousCost = 0.0;
@@ -146,6 +196,7 @@ struct Options {
     bool windingSignFirst = false;
     std::size_t windingSignFirstSteps = 1;
     std::optional<std::size_t> windingLevelGrowthMaximum;
+    std::size_t windingMaximumCandidateStates = 4'000'000;
     bool hardSplitContinuity = true;
     std::optional<double> hardSignMinimumNormalAlignment =
         0.8660254037844386;
@@ -159,6 +210,10 @@ struct Options {
         windingNormalConfidence =
         vc::fiber_tracer::FiberTraceWindingNormalConfidence::Linear;
     std::optional<double> windingSignCost = 44.0;
+    std::optional<double> windingMeasurementDisableCost;
+    std::optional<double> windingContinuityCutCost;
+    bool windingContinuityCostByDistance = false;
+    bool windingIncludeContinuityInDefectMass = true;
     std::array<double, 5> windingWeights =
         vc::fiber_tracer::kDefaultFiberTraceWindingClassWeights;
     std::array<double, 2> windingSignWeights =
@@ -172,6 +227,9 @@ struct Options {
     bool orderedPruneOffenders = false;
     bool hasBounds = false;
     bool hasTraceOnlyOption = false;
+    bool hasReverseOption = false;
+    bool hasReverseParameters = false;
+    std::optional<bool> reverseChoice;
     bool hasConstraintOnlyOption = false;
     bool hasSolverOnlyOption = false;
     bool hasSharedRuntimeOption = false;
@@ -315,6 +373,7 @@ void usage(const char* executable)
                  " --base-voxel-size-um N --output result.json [options]\n\n"
               << "Trace quality options:\n"
               << "  --quality-threshold D     accept/retain traces with cost density <= D\n\n"
+              << "  --trace-cost-reference ZARR verify dense retrace against saved artifact and export step costs\n"
               << "Stored trace input options:\n"
               << "  --quality-fraction F      retain the best F fraction by cost density\n"
               << "  --reference-fiber-dir DIR tagged VC3D reference fiber JSON directory\n"
@@ -344,10 +403,15 @@ void usage(const char* executable)
               << "  --reference-oracle-accept-message-limit\n"
               << "                              score capped conditioned states (diagnostic only)\n\n"
               << "  --reference-constraint-details\n"
+              << "  --reference-independent   Rank each reference against frozen initial BP; no reference pruning\n"
               << "                              print every reference piece-pair constraint\n\n"
               << "Reference replay benchmark options:\n"
-              << "  --replay-tracer NAME       fiberlet, greedy, or lasagna [fiberlet]\n"
-              << "  --fiber-manifest PATH      Fiber prediction manifest (greedy only)\n"
+              << "  --trace-tracer NAME        fiberlet, beam, or imported [fiberlet]\n"
+              << "  --candidate-fibers PATH    native L0 scale-1 collection for precomputed replay\n"
+              << "  --replay-tracer NAME       fiberlet, beam, greedy, lasagna, or precomputed [fiberlet]\n"
+              << "  --fiber-manifest PATH      Fiber prediction for dense replay or generated Fiberlets\n"
+              << "  --fiberlet-cache-root PATH  reusable on-demand Fiberlet cache (trace/replay)\n"
+              << "  --fiberlet-storage-chunk-side N  generated cache side in base voxels [512]\n"
               << "  --inference-scaledown-power N  direct tracer scale exponent [2]\n"
               << "  --lasagna-step N           normal-transport step in base voxels [16]\n"
               << "  --base-voxel-size-um N     physical base-voxel size; required\n"
@@ -368,6 +432,12 @@ void usage(const char* executable)
               << "  --lookahead N              lookahead in base voxels [384]\n"
               << "  --coverage N               normal coverage radius in base voxels [20]\n"
               << "  --coverage-angle N         parallel-axis coverage angle [25]\n"
+              << "  --coverage-tangential N    in-sheet coverage radius [4 x --coverage]\n"
+              << "  --reverse-consistency     split dense beam fibers failing reverse checks [on]\n"
+              << "  --no-reverse-consistency  disable reverse checks for a dense-beam control\n"
+              << "  --reverse-normal N        reverse normal radius, base voxels [20]\n"
+              << "  --reverse-tangential N    reverse in-sheet radius, base voxels [40]\n"
+              << "  --reverse-backoff N       skip original arc on failure, base voxels [40]\n"
               << "  --stop-at-covered          stop output after reaching a covered anchor\n"
               << "  --ambiguity-margin F       stop before a distinct route within relative cost gap F\n"
               << "  --ambiguity-radius N       distinct-route normal radius in base voxels [20]\n"
@@ -388,13 +458,25 @@ void usage(const char* executable)
               << "  --bp-soft-strength F      quadratic balance strength [1]\n"
               << "  --bp-temperature F        min-marginal decoding temperature [1.25]\n"
               << "  --bp-message-iterations N message update limit [500]\n"
+              << "  --winding-message-iterations N joint-grid winding limit [same as BP]\n"
+              << "  --winding-defect-multipliers JSON validated original-piece disablement factors\n"
+              << "  --piece-cut-hints JSON extra trace arc boundaries (direction-ablation only)\n"
+              << "  --winding-measurement-disable-cost C optional ordinary measurement off cost (joint-grid mixed BP)\n"
+              << "  --winding-continuity-cut-cost C independent continuation cut cost; active pieces retained (joint-grid mixed BP)\n"
+              << "  --winding-continuity-step-cost C continuation energy C*absolute winding distance (includes H/V phase); replaces cut cost\n"
+              << "  --reference-initial-readout independent initial readout alongside removal diagnostics\n"
               << "  --bp-balance-iterations N field update limit [64]\n"
               << "  --bp-damping F            message damping in (0,1] [0.5]\n"
               << "  --bp-residual F           message residual tolerance [1e-8]\n"
               << "  --bp-balance-tolerance F  target/field tolerance [1e-3]\n"
               << "  --winding-solver MODE     joint-grid, alternating, ceres, or ordered-cuts [joint-grid]\n"
+              << "  --reference-neighborhood-windings N|all  fixed-reference whole-fiber diagnostic\n"
+              << "  --reference-neighborhood-unconditioned  solve selected ordinary fibers only; independent reference readout\n"
               << "  --winding-fixed-orientation  solve H/V/Mixed first, then only winding\n"
+              << "  --winding-largest-component-only  legacy BP-only filtering (default: keep all components)\n"
               << "  --winding-defect-cost F   winding-stage Defect cost per constraint [100]\n"
+              << "  --continuity-defect-mass all|ordinary|winding-ordinary|prepass-ordinary [all]\n"
+              << "  --winding-decode-repair N deterministic local label optimization sweeps [0]\n"
               << "  --split-continuity MODE   hard or finite [hard]\n"
               << "  --piece-break-cost F      finite-mode same-trace boundary cost [0]\n"
               << "  --winding-continuous-cost F\n"
@@ -410,6 +492,7 @@ void usage(const char* executable)
               << "  --winding-sign-first-steps N\n"
               << "                              magnitude continuation stages after sign-only [1]\n"
               << "  --winding-level-growth N  grow sign-only integer support to N levels\n"
+              << "  --winding-max-candidate-states N  BP memory safety limit (default 4000000)\n"
               << "  --parallel-winding-cutoff F\n"
               << "                              exclusive parallel integer-distance cutoff [off]\n"
               << "  --winding-hard-signs MODE  none, perpendicular, parallel, or both [both]\n"
@@ -448,6 +531,10 @@ void usage(const char* executable)
               << "  --sample-step N            common trace resampling step [32]\n"
               << "  --piece-length N           target overlapping piece length [512]\n"
               << "  --piece-overlap N          neighboring piece overlap [128]\n"
+              << "  --local-constraint-events clean event-midpoint splits and per-side local consistency\n"
+              << "  --local-no-parallel       omit parallel factors after common event segmentation\n"
+              << "  --local-event-spacing N   repeated local event spacing [64]\n"
+              << "  --local-parallel-span N   per-side correspondence support [64]\n"
               << "  --max-distance N           closest-pair threshold [128]\n"
               << "  --tangent-window N         centered tangent secant length [32]\n"
               << "  --parallel-correspondence MODE\n"
@@ -664,16 +751,26 @@ Options parse(int argc, char** argv)
             const std::string tracer = value(index, argc, argv, "--replay-tracer");
             if (tracer == "fiberlet")
                 options.referenceReplayTracer = ReferenceReplayTracer::Fiberlet;
+            else if (tracer == "beam")
+                options.referenceReplayTracer = ReferenceReplayTracer::Beam;
             else if (tracer == "greedy")
                 options.referenceReplayTracer = ReferenceReplayTracer::Greedy;
             else if (tracer == "lasagna")
                 options.referenceReplayTracer = ReferenceReplayTracer::Lasagna;
+            else if (tracer == "precomputed")
+                options.referenceReplayTracer = ReferenceReplayTracer::Precomputed;
             else
-                fail("--replay-tracer must be fiberlet, greedy, or lasagna");
+                fail("--replay-tracer must be fiberlet, beam, greedy, or lasagna");
             options.hasDirectReplayOption = true;
+        } else if (argument == "--candidate-fibers") {
+            options.candidateFibers = value(index, argc, argv, "--candidate-fibers");
         } else if (argument == "--fiber-manifest") {
             options.fiberManifest = value(index, argc, argv, "--fiber-manifest");
-            options.hasDirectReplayOption = true;
+        } else if (argument == "--fiberlet-cache-root") {
+            options.fiberletCacheRoot = value(index, argc, argv, "--fiberlet-cache-root");
+        } else if (argument == "--fiberlet-storage-chunk-side") {
+            options.fiberletStorageChunkSide = static_cast<int>(count(
+                index, argc, argv, "--fiberlet-storage-chunk-side"));
         } else if (argument == "--inference-scaledown-power") {
             options.inferenceScaledownPower = static_cast<int>(count(
                 index, argc, argv, "--inference-scaledown-power"));
@@ -682,6 +779,23 @@ Options parse(int argc, char** argv)
             options.lasagnaReplayStepBaseVoxels = number(
                 index, argc, argv, "--lasagna-step");
             options.hasDirectReplayOption = true;
+        } else if (argument == "--reference-neighborhood-unconditioned") {
+            options.referenceNeighborhoodUnconditioned = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--reference-neighborhood-windings") {
+            const auto cutoff = value(index, argc, argv, "--reference-neighborhood-windings");
+            if (cutoff == "all") {
+                options.referenceNeighborhoodWindings = -1.0;
+            } else {
+                std::size_t used = 0;
+                const double number = std::stod(cutoff, &used);
+                if (used != cutoff.size() || !std::isfinite(number) || number < 0.0)
+                    fail("--reference-neighborhood-windings requires nonnegative N or all");
+                options.referenceNeighborhoodWindings = number;
+            }
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
         } else if (argument == "--reference-conditioning-diagnostic") {
             options.referenceConditioningDiagnostic = true;
             options.hasAblationOnlyOption = true;
@@ -767,6 +881,10 @@ Options parse(int argc, char** argv)
             options.hasReferenceOracleOption = true;
             options.hasAblationOnlyOption = true;
             options.hasConstraintOnlyOption = true;
+        } else if (argument == "--reference-independent") {
+            options.referenceIndependent = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
         } else if (argument == "--reference-constraint-details") {
             options.referenceConstraintDetails = true;
             options.hasAblationOnlyOption = true;
@@ -833,6 +951,13 @@ Options parse(int argc, char** argv)
         } else if (argument == "--profile-memory") {
             options.profileMemory = true;
             options.hasTraceOnlyOption = true;
+        } else if (argument == "--trace-tracer") {
+            const auto tracer = value(index, argc, argv, "--trace-tracer");
+            if (tracer != "fiberlet" && tracer != "beam" && tracer != "imported")
+                fail("--trace-tracer must be fiberlet, beam, or imported");
+            options.denseBeamCrop = tracer == "beam";
+            options.importedCrop = tracer == "imported";
+            options.hasTraceOnlyOption = true;
         } else if (argument == "--beam") {
             options.trace.beamWidth = count(index, argc, argv, "--beam");
             options.hasTraceOnlyOption = true;
@@ -842,8 +967,32 @@ Options parse(int argc, char** argv)
         } else if (argument == "--coverage") {
             options.trace.coverageNormalRadiusBaseVoxels = number(index, argc, argv, "--coverage");
             options.hasTraceOnlyOption = true;
+        } else if (argument == "--coverage-tangential") {
+            options.trace.coverageTangentialRadiusBaseVoxels = number(index, argc, argv, "--coverage-tangential");
+            options.hasTraceOnlyOption = true;
         } else if (argument == "--coverage-angle") {
             options.trace.coverageDirectionDegrees = number(index, argc, argv, "--coverage-angle");
+            options.hasTraceOnlyOption = true;
+        } else if (argument == "--reverse-consistency" || argument == "--no-reverse-consistency") {
+            const bool enabled = argument == "--reverse-consistency";
+            if (options.reverseChoice && *options.reverseChoice != enabled)
+                fail("conflicting reverse consistency enable/disable flags");
+            options.reverseChoice = enabled;
+            options.hasReverseOption = true;
+            options.hasTraceOnlyOption = true;
+        } else if (argument == "--reverse-normal" || argument == "--reverse-tangential" ||
+                   argument == "--reverse-backoff") {
+            options.hasReverseOption = true;
+            options.hasReverseParameters = true;
+            const double setting = number(index, argc, argv, argument.c_str());
+            if (!(setting > 0.0) || !std::isfinite(setting))
+                fail("reverse consistency parameters must be finite and positive");
+            if (argument == "--reverse-normal")
+                options.trace.reverseNormalRadiusBaseVoxels = setting;
+            else if (argument == "--reverse-tangential")
+                options.trace.reverseTangentialRadiusBaseVoxels = setting;
+            else
+                options.trace.reverseBackoffBaseVoxels = setting;
             options.hasTraceOnlyOption = true;
         } else if (argument == "--stop-at-covered") {
             options.trace.stopAtCoveredAnchors = true;
@@ -985,6 +1134,25 @@ Options parse(int argc, char** argv)
             options.hasBpTuningOption = true;
             options.hasAblationOnlyOption = true;
             options.hasConstraintOnlyOption = true;
+        } else if (argument == "--winding-defect-multipliers") {
+            options.defectMultipliers = value(index, argc, argv, "--winding-defect-multipliers");
+        } else if (argument == "--reference-initial-readout") {
+            options.referenceInitialReadout = true;
+        } else if (argument == "--trace-cost-reference") {
+            options.traceCostReference = value(index, argc, argv, "--trace-cost-reference");
+            options.trace.captureStepCosts = true;
+        } else if (argument == "--piece-cut-hints") {
+            options.pieceCutHints = value(index, argc, argv, "--piece-cut-hints");
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--winding-message-iterations") {
+            const auto iterations = count(index, argc, argv, "--winding-message-iterations");
+            if (iterations == 0)
+                fail("--winding-message-iterations must be positive");
+            options.windingMessageIterations = iterations;
+            options.hasBpTuningOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
         } else if (argument == "--bp-balance-iterations") {
             options.bp.maximumBalanceIterations =
                 count(index, argc, argv, "--bp-balance-iterations");
@@ -1041,6 +1209,10 @@ Options parse(int argc, char** argv)
             options.hasWindingSolverOption = true;
             options.hasAblationOnlyOption = true;
             options.hasConstraintOnlyOption = true;
+        } else if (argument == "--winding-largest-component-only") {
+            options.windingLargestComponentOnly = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
         } else if (argument == "--winding-fixed-orientation") {
             options.windingFixedOrientation = true;
             options.hasWindingOrientationOption = true;
@@ -1083,6 +1255,19 @@ Options parse(int argc, char** argv)
             options.hasWindingDefectCostOption = true;
             options.hasAblationOnlyOption = true;
             options.hasConstraintOnlyOption = true;
+        } else if (argument == "--winding-decode-repair") {
+            options.jointGrid.decodeRepairSweeps = count(index, argc, argv, "--winding-decode-repair");
+            options.hasJointGridOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--continuity-defect-mass") {
+            const auto mode = value(index, argc, argv, "--continuity-defect-mass");
+            if (mode != "all" && mode != "ordinary" && mode != "winding-ordinary" && mode != "prepass-ordinary")
+                fail("Invalid continuity-defect-mass mode");
+            options.bp.includeContinuityInDefectMass = mode != "ordinary" && mode != "prepass-ordinary";
+            options.windingIncludeContinuityInDefectMass = mode != "ordinary" && mode != "winding-ordinary";
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
         } else if (argument == "--piece-break-cost") {
             options.pieceBreakCost = number(
                 index, argc, argv, "--piece-break-cost");
@@ -1091,6 +1276,21 @@ Options parse(int argc, char** argv)
                 fail("--piece-break-cost must be finite and nonnegative");
             }
             options.hasPieceBreakCostOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--winding-continuity-cut-cost" || argument == "--winding-continuity-step-cost") {
+            if (options.windingContinuityCutCost)
+                fail("Specify only one continuation cost option");
+            options.windingContinuityCostByDistance = argument == "--winding-continuity-step-cost";
+            options.windingContinuityCutCost = number(index, argc, argv, argument.c_str());
+            if (!std::isfinite(*options.windingContinuityCutCost) || *options.windingContinuityCutCost < 0.0)
+                fail("Continuity cut cost must be finite and nonnegative");
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--winding-measurement-disable-cost") {
+            options.windingMeasurementDisableCost = number(index, argc, argv, "--winding-measurement-disable-cost");
+            if (!std::isfinite(*options.windingMeasurementDisableCost) || *options.windingMeasurementDisableCost <= 0.0)
+                fail("Measurement disable cost must be positive and finite");
             options.hasAblationOnlyOption = true;
             options.hasConstraintOnlyOption = true;
         } else if (argument == "--winding-continuous-cost") {
@@ -1164,6 +1364,13 @@ Options parse(int argc, char** argv)
             }
             options.windingSignFirst = true;
             options.hasJointGridOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--winding-max-candidate-states") {
+            options.windingMaximumCandidateStates = count(
+                index, argc, argv, "--winding-max-candidate-states");
+            if (options.windingMaximumCandidateStates == 0)
+                fail("--winding-max-candidate-states must be positive");
             options.hasAblationOnlyOption = true;
             options.hasConstraintOnlyOption = true;
         } else if (argument == "--winding-level-growth") {
@@ -1409,6 +1616,14 @@ Options parse(int argc, char** argv)
             options.hasConstraintOnlyOption = true;
         } else if (argument == "--piece-overlap") {
             options.constraints.pieceOverlapBaseVoxels = number(index, argc, argv, "--piece-overlap");
+        } else if (argument == "--local-constraint-events") {
+            options.constraints.localEvents = true;
+        } else if (argument == "--local-no-parallel") {
+            options.constraints.localIncludeParallel = false;
+        } else if (argument == "--local-event-spacing") {
+            options.constraints.localSpacingBaseVoxels = number(index, argc, argv, "--local-event-spacing");
+        } else if (argument == "--local-parallel-span") {
+            options.constraints.localParallelSpanBaseVoxels = number(index, argc, argv, "--local-parallel-span");
             options.hasConstraintOnlyOption = true;
         } else if (argument == "--max-distance") {
             options.constraints.maximumDistanceBaseVoxels = number(index, argc, argv, "--max-distance");
@@ -1536,6 +1751,44 @@ Options parse(int argc, char** argv)
             fail("unknown option: " + argument);
         }
     }
+    options.trace.reverseConsistency = options.mode == Mode::Trace &&
+        options.denseBeamCrop && options.reverseChoice.value_or(true);
+    if (options.trace.captureStepCosts && (options.mode != Mode::Trace || !options.denseBeamCrop))
+        fail("--trace-cost-reference requires dense beam trace mode");
+    if (!options.constraints.localIncludeParallel && !options.constraints.localEvents)
+        throw std::invalid_argument("--local-no-parallel requires --local-constraint-events");
+    if (options.constraints.localEvents) {
+        options.constraints.pieceOverlapBaseVoxels = 0.;
+        if(!options.defectMultipliers.empty() || !options.pieceCutHints.empty())
+            throw std::invalid_argument("Local event segmentation cannot use legacy piece IDs or cut hints");
+    }
+    if ((!options.defectMultipliers.empty() || options.referenceInitialReadout) &&
+        (options.mode != Mode::DirectionAblation || !options.bpOnly ||
+         options.windingSolver != vc::fiber_tracer::FiberTraceWindingSolver::JointGrid ||
+         options.bpInference != vc::fiber_tracer::FiberTraceBeliefInference::SumProductMixed))
+        fail("defect multipliers/initial readout require direction-ablation joint-grid mixed BP");
+    if (options.referenceInitialReadout && !options.hasReferenceFiberDirectoryOption)
+        fail("--reference-initial-readout requires reference fibers");
+    if (!options.pieceCutHints.empty() && (options.mode != Mode::DirectionAblation || !options.defectMultipliers.empty()))
+        fail("Piece cut hints require direction-ablation without original-piece multipliers");
+    if (options.windingMeasurementDisableCost && (options.mode != Mode::DirectionAblation || !options.bpOnly ||
+        options.windingSolver != vc::fiber_tracer::FiberTraceWindingSolver::JointGrid ||
+        options.bpInference != vc::fiber_tracer::FiberTraceBeliefInference::SumProductMixed))
+        fail("Measurement disable cost requires direction-ablation joint-grid mixed BP");
+    if (options.windingContinuityCutCost && (options.mode != Mode::DirectionAblation || !options.bpOnly ||
+        options.windingSolver != vc::fiber_tracer::FiberTraceWindingSolver::JointGrid ||
+        options.bpInference != vc::fiber_tracer::FiberTraceBeliefInference::SumProductMixed || options.pieceBreakCost != 0.0))
+        fail("Continuity cut cost requires direction-ablation joint-grid mixed BP and zero piece-break-cost");
+    if (options.windingMessageIterations &&
+        (options.mode != Mode::DirectionAblation ||
+         (!options.bpOnly && options.bpBalance == BpBalanceSelection::None) ||
+         options.windingSolver != vc::fiber_tracer::FiberTraceWindingSolver::JointGrid ||
+         options.bpInference != vc::fiber_tracer::FiberTraceBeliefInference::SumProductMixed))
+        fail("--winding-message-iterations requires direction-ablation joint-grid mixed BP");
+    if (options.hasReverseOption &&
+        (options.mode != Mode::Trace || !options.denseBeamCrop ||
+         (options.hasReverseParameters && !options.trace.reverseConsistency)))
+        fail("reverse options require trace --trace-tracer beam and enabled checks when tuning");
     if (options.qualityFraction && options.qualityThreshold) {
         fail("--quality-fraction and --quality-threshold are mutually exclusive");
     }
@@ -1557,7 +1810,25 @@ Options parse(int argc, char** argv)
     if (vc::lasagna::isRemoteLasagnaLocation(options.normalManifest) && options.remoteCacheDirectory.empty()) {
         fail("a remote normal manifest requires --remote-cache-dir");
     }
+    if (!options.fiberletCacheRoot.empty()) {
+        if (options.mode != Mode::Trace && options.mode != Mode::ReferenceReplayBenchmark)
+            fail("--fiberlet-cache-root requires trace or reference-replay-benchmark");
+        if (options.input != "-" || options.fiberManifest.empty())
+            fail("on-demand Fiberlets require input '-' and --fiber-manifest");
+        if (options.referenceReplayTracer != ReferenceReplayTracer::Fiberlet)
+            fail("on-demand Fiberlets require the fiberlet replay tracer");
+        if (!options.filterStages.empty())
+            fail("--stage requires an already generated combined Fiberlet dataset");
+        if (options.fiberletStorageChunkSide <= 0)
+            fail("--fiberlet-storage-chunk-side must be positive");
+    } else if (!options.fiberManifest.empty() &&
+               !(options.mode == Mode::ReferenceReplayBenchmark &&
+                 isDenseReplay(options.referenceReplayTracer))) {
+        fail("--fiber-manifest requires dense replay or --fiberlet-cache-root");
+    }
     if (options.mode == Mode::ReferenceReplayBenchmark) {
+        if ((options.referenceReplayTracer == ReferenceReplayTracer::Precomputed) != !options.candidateFibers.empty())
+            fail("precomputed replay requires --candidate-fibers; other backends do not accept it");
         if (options.output.empty())
             fail("--output is required");
         if (!options.hasBounds)
@@ -1574,18 +1845,20 @@ Options parse(int argc, char** argv)
             fail("--failure-threshold must be nonnegative");
         if (!(options.replayMatchRefineSteps >= 0.0))
             fail("--match-refine-steps must be nonnegative");
-        if (options.referenceReplayTracer == ReferenceReplayTracer::Greedy &&
+        if (isDenseReplay(options.referenceReplayTracer) &&
             options.fiberManifest.empty()) {
-            fail("greedy reference replay requires --fiber-manifest");
+            fail("dense reference replay requires --fiber-manifest");
         }
-        if (options.referenceReplayTracer != ReferenceReplayTracer::Greedy &&
-            !options.fiberManifest.empty()) {
-            fail("--fiber-manifest is valid only with --replay-tracer greedy");
+        if (!isDenseReplay(options.referenceReplayTracer) &&
+            !options.fiberManifest.empty() && options.fiberletCacheRoot.empty()) {
+            fail("--fiber-manifest requires dense replay or --fiberlet-cache-root");
         }
         if (!(options.lasagnaReplayStepBaseVoxels > 0.0))
             fail("--lasagna-step must be positive");
-        options.directReplayTrace.beamWidth = 1;
-        options.directReplayTrace.beamLookaheadSteps = 1;
+        if (options.referenceReplayTracer == ReferenceReplayTracer::Greedy) {
+            options.directReplayTrace.beamWidth = 1;
+            options.directReplayTrace.beamLookaheadSteps = 1;
+        }
         options.directReplayTrace.parallelThreads = options.threads;
         vc::fiber_tracer::cli::validateTraceOptions(
             options.directReplayTrace);
@@ -1597,7 +1870,24 @@ Options parse(int argc, char** argv)
         options.trace.parallelThreads = static_cast<std::size_t>(options.threads);
         return options;
     }
-    if (options.hasDirectReplayOption)
+    if (!options.candidateFibers.empty()) fail("--candidate-fibers requires precomputed replay");
+    if (options.trace.reverseConsistency && !options.denseBeamCrop)
+        fail("--reverse-consistency requires --trace-tracer beam");
+    if (options.importedCrop && (options.mode != Mode::Trace || options.input == "-" ||
+        !options.fiberletCacheRoot.empty() || !options.fiberManifest.empty() ||
+        options.qualityThreshold || options.qualityFraction || !options.filterStages.empty() ||
+        options.trace.ambiguityRelativeCostMargin || options.trace.stopAtCoveredAnchors))
+        fail("imported crop requires a native collection input and no graph generation/quality/stopping options");
+    if (options.denseBeamCrop) {
+        if (options.mode != Mode::Trace || options.fiberletCacheRoot.empty())
+            fail("--trace-tracer beam requires trace - --fiber-manifest and --fiberlet-cache-root (anchors only)");
+        if (options.trace.ambiguityRelativeCostMargin || options.trace.stopAtCoveredAnchors ||
+            options.trace.maximumAcceptedCostDensity || options.qualityThreshold || options.qualityFraction ||
+            !options.filterStages.empty())
+            fail("dense beam crop does not support graph ambiguity/stopping or Fiberlet quality filters");
+        vc::fiber_tracer::cli::validateTraceOptions(options.directReplayTrace);
+    }
+    if (options.hasDirectReplayOption && !options.denseBeamCrop)
         fail("direct replay options require reference-replay-benchmark");
     if (options.mode == Mode::Constraints ||
         options.mode == Mode::Consensus ||
@@ -1621,6 +1911,25 @@ Options parse(int argc, char** argv)
         if (options.hasReferenceFiberTagOption &&
             options.referenceFiberTag.empty()) {
             fail("--reference-fiber-tag must not be empty");
+        }
+        if (options.referenceNeighborhoodUnconditioned &&
+            (!options.referenceNeighborhoodWindings || !options.referenceIndependent))
+            fail("--reference-neighborhood-unconditioned requires a neighborhood cutoff and --reference-independent");
+        if (options.referenceNeighborhoodUnconditioned &&
+            (options.hasWindingWeightSearchOption || options.hasWindingWeightSearchLocalOption))
+            fail("Unconditioned neighborhood evaluation does not allow reference-driven weight search");
+        if (options.referenceNeighborhoodWindings &&
+            (!options.hasReferenceFiberDirectoryOption || !options.bpOnly ||
+             options.bpInference != vc::fiber_tracer::FiberTraceBeliefInference::SumProductMixed ||
+             options.windingSolver != vc::fiber_tracer::FiberTraceWindingSolver::JointGrid ||
+             options.windingFixedOrientation || options.windingLargestComponentOnly ||
+             options.referenceConditioningDiagnostic || options.referencePruneOffenders ||
+             !options.windingContinuityCostByDistance || !options.windingContinuityCutCost ||
+             *options.windingContinuityCutCost <= 0.0)) {
+            fail("Reference neighborhood requires references, BP-only joint-grid sum-product-mixed, finite distance continuation, no prefilter/fixed orientation/pruning");
+        }
+        if (options.windingLargestComponentOnly && !options.bpOnly) {
+            fail("--winding-largest-component-only requires --bp-only");
         }
         if (options.referenceConditioningDiagnostic &&
             !options.hasReferenceFiberDirectoryOption) {
@@ -1687,6 +1996,13 @@ Options parse(int argc, char** argv)
         if (options.referenceConstraintDetails &&
             !options.hasReferenceFiberDirectoryOption) {
             fail("--reference-constraint-details requires reference fibers");
+        }
+        if (options.referenceIndependent &&
+            (!options.hasReferenceFiberDirectoryOption || options.referencePruneOffenders ||
+             options.referenceConditioningDiagnostic ||
+             options.windingSolver != vc::fiber_tracer::FiberTraceWindingSolver::JointGrid ||
+             !options.bpOnly || options.bpInference != vc::fiber_tracer::FiberTraceBeliefInference::SumProductMixed)) {
+            fail("--reference-independent requires reference fibers and joint-grid mixed BP without reference pruning or conditioning");
         }
         if (options.mode == Mode::Consensus && options.hasSolverOnlyOption)
             fail("consensus does not accept HiGHS labeling options");
@@ -1846,9 +2162,6 @@ Options parse(int argc, char** argv)
         if (options.referencePruneOffenders && options.windingSolver != vc::fiber_tracer::FiberTraceWindingSolver::JointGrid) {
             fail("--reference-prune-offenders requires --winding-solver joint-grid");
         }
-        if (options.referencePruneOffenders && !options.windingFixedOrientation) {
-            fail("--reference-prune-offenders requires --winding-fixed-orientation");
-        }
         const bool hasExplicitFixedPhase =
             options.jointGrid.fixedPhaseMagnitude.has_value();
         const bool hasExplicitFixedScale =
@@ -1949,6 +2262,24 @@ double quantile(std::vector<double> values, double fraction)
     return values[lower] * (1.0 - blend) + values[upper] * blend;
 }
 
+void printLocalConstraintSummary(
+    const vc::fiber_tracer::FiberTraceConstraintReport& report,
+    const vc::fiber_tracer::FiberTraceConstraintConfig& config)
+{
+    if(!config.localEvents)return;
+    std::cout << "local constraint events: pieces=" << report.pieces.size()
+              << " constraints=" << report.constraints.size()
+              << " continuity=" << report.hardConstraints
+              << " consistency_rejected=" << report.localRejectedConsistency
+              << " support_rejected=" << report.localRejectedSupport
+              << " certified=" << report.localCertifiedEvents
+              << " retained_certified=" << report.localRetainedCertifiedEvents
+              << " refined=" << report.localRefinedCandidates
+              << " midpoint_cuts=" << report.localMidpointCuts
+              << " transition_cuts=" << report.localTransitionCuts
+              << " parallel_omitted=" << report.localParallelOmitted << std::endl;
+}
+
 void printConstraintReport(
     const vc::fiber_tracer::FiberTraceConstraintReport& report,
     const std::vector<vc::fiber_tracer::FiberTraceConstraint>& extractedConstraints,
@@ -2008,6 +2339,7 @@ void printConstraintReport(
                   << quantile(perpendicular, fraction) << "  "
                   << quantile(winding, fraction) << '\n';
     }
+    printLocalConstraintSummary(report, config);
     std::cout << "fiber trace constraint timing\n"
               << "prepare_seconds  search_seconds  orientation_seconds  winding_seconds  score_seconds  total_wall_seconds  "
                  "total_cpu_seconds\n"
@@ -2015,6 +2347,23 @@ void printConstraintReport(
               << report.orientationScoreSeconds << "  "
               << report.windingScoreSeconds << "  "
               << report.scoreSeconds << "  " << wallSeconds << "  " << cpuSeconds << '\n';
+}
+
+void writeLocalConstraintPieces(
+    const vc::fiber_tracer::FiberTraceConstraintReport& report,
+    const std::vector<std::size_t>& originalTraceIndices,
+    const std::filesystem::path& prefix)
+{
+    const auto path=prefix.parent_path()/(prefix.stem().string()+"_local_event_pieces.csv");
+    std::ofstream out(path);
+    if(!out)throw std::runtime_error("Cannot write local event pieces: "+path.string());
+    out << "piece,original_trace,source_piece,begin_arc_base,end_arc_base\n" << std::setprecision(17);
+    for(std::size_t i=0;i<report.pieces.size();++i) {
+        const auto& p=report.pieces[i];
+        out << i << ',' << originalTraceIndices.at(p.traceIndex) << ',' << p.pieceIndex << ','
+            << p.beginArcBaseVoxels << ',' << p.endArcBaseVoxels << '\n';
+    }
+    if(!out)throw std::runtime_error("Failed to write local event pieces: "+path.string());
 }
 
 void printConstraintPruningReport(
@@ -2659,7 +3008,8 @@ void writeAndPrintBpReport(
            "perpendicular_sign_promoted_by_alignment,"
            "correspondence_samples,advance_residual_fraction,"
            "connector_tangent_abs_dot,connector_length_change_fraction,"
-           "connector_direction_change,limit_hit_fraction\n"
+           "connector_direction_change,limit_hit_fraction,measurement_map_off,measurement_conditional_off_probability,"
+           "evidence_weight,local_event,arc_a,arc_b,support_a_begin,support_a_end,support_b_begin,support_b_end,continuity_map_cut\n"
         << std::setprecision(17);
     const auto writeOptionalDouble = [](std::ostream& stream,
                                         const std::optional<double>& value) {
@@ -2736,7 +3086,14 @@ void writeAndPrintBpReport(
                      << sourceConstraint.parallelMeanConnectorTangentAbsDot << ','
                      << sourceConstraint.parallelMeanConnectorLengthChangeFraction << ','
                      << sourceConstraint.parallelMeanConnectorDirectionChange << ','
-                     << sourceConstraint.parallelLimitHitFraction << '\n';
+                     << sourceConstraint.parallelLimitHitFraction << ','
+                     << factor.measurementMapOff << ','
+                     << factor.measurementConditionalOffProbability << ','
+                     << sourceConstraint.evidenceWeight << ',' << sourceConstraint.localEvent << ','
+                     << sourceConstraint.arcABaseVoxels << ',' << sourceConstraint.arcBBaseVoxels << ','
+                     << sourceConstraint.supportABegin << ',' << sourceConstraint.supportAEnd << ','
+                     << sourceConstraint.supportBBegin << ',' << sourceConstraint.supportBEnd << ','
+                     << factor.continuityMapCut << '\n';
     }
     if (!factorOutput)
         throw std::runtime_error(
@@ -2789,7 +3146,7 @@ void writeAndPrintBpReport(
     std::ofstream csvOutput(csv);
     if (!csvOutput)
         throw std::runtime_error("failed to open BP consistency CSV: " + csv.string());
-    csvOutput << "piece,original_trace,source_piece,begin_arc_base,end_arc_base,reference,";
+    csvOutput << "piece,original_trace,source_piece,begin_arc_base,end_arc_base,reference,winding_defect_multiplier,";
     if (sumProduct) {
         csvOutput << "bp_inference,bp_temperature,";
     }
@@ -2811,6 +3168,19 @@ void writeAndPrintBpReport(
            "weighted_hard_mismatch_rate,soft_mismatch_proxy,"
            "neighbor_support_balance,neighbor_certainty";
     if (interleaved) {
+        std::cout << "continuity_cut eligible=" << interleaved->continuityCutEligible
+                  << " map_cut=" << interleaved->continuityMapCuts
+                  << " energy=" << interleaved->continuityCutEnergy << '\n';
+        std::cout << "continuity_step eligible=" << interleaved->continuityStepEligible
+                  << " nonzero=" << interleaved->continuityNonzeroSteps
+                  << " energy=" << interleaved->continuityStepEnergy << '\n';
+        std::cout << "decode_repair sweeps=" << interleaved->decodeRepairIterations
+                  << " changes=" << interleaved->decodeRepairChanges
+                  << " restored=" << interleaved->decodeRepairRestored
+                  << " disabled=" << interleaved->decodeRepairDisabled
+                  << " before=" << interleaved->decodeRepairObjectiveBefore
+                  << " after=" << interleaved->decodeRepairObjectiveAfter
+                  << " seconds=" << interleaved->decodeRepairSeconds << '\n';
         csvOutput << ",winding_latent_mean,winding_phase,winding_scale,"
                      "winding_defect_cost_per_constraint,"
                      "winding_piece_break_cost,"
@@ -2836,7 +3206,8 @@ void writeAndPrintBpReport(
                   << descriptor.pieceIndex << ','
                   << descriptor.beginArcBaseVoxels << ','
                   << descriptor.endArcBaseVoxels << ','
-                  << directionName(directions[piece]) << ',';
+                  << directionName(directions[piece]) << ','
+                  << descriptor.windingDefectCostMultiplier << ',';
         if (sumProduct) {
             csvOutput << inferenceName << ',' << report.inferenceTemperature
                       << ',';
@@ -2970,6 +3341,10 @@ void writeAndPrintBpReport(
               << "winding_factor_csv=" << factorCsv
               << " winding_obj_layers=" << windingPaths.size() << '\n';
     if (interleaved) {
+        if (interleaved->measurementDisableEligible > 0)
+            std::cout << "measurement_disable eligible=" << interleaved->measurementDisableEligible
+                      << " map_off=" << interleaved->measurementDisableMapOff
+                      << " conditional_posterior_sum=" << interleaved->measurementDisableConditionalPosteriorSum << '\n';
         std::cout << (ceresWinding
                 ? "fiber winding Ceres configuration\n"
                 : "fiber winding calibration\n");
@@ -3592,6 +3967,10 @@ makeJointGridWindingProgressPrinter()
             break;
         }
         line << " states=" << p.candidateStates
+             << " factors=" << p.retainedFactors << '/' << p.inputFactors
+             << " measurements=" << p.retainedMeasurements << '/' << p.inputMeasurements
+             << " pruned_factors=" << p.inputFactors - p.retainedFactors
+             << " pruned_measurements=" << p.inputMeasurements - p.retainedMeasurements
              << " grid=" << p.gainCells << 'x' << p.phaseCells
              << " shifts=" << p.gridShifts
              << std::scientific << std::setprecision(3)
@@ -4509,6 +4888,8 @@ WindingWeightTuple windingWeights(const Options& options)
 ReferenceBpCrossConstraints extractReferenceBpCrossConstraints(
     const ReferenceFiberDiagnostics& reference,
     const std::vector<vc::fiber_tracer::FiberletCropTraceLine>& bpPieceLines,
+    const std::vector<vc::fiber_tracer::FiberletCropTraceLine>& bpSourceLines,
+    const vc::fiber_tracer::FiberTraceConstraintReport& bpConstraints,
     const Options& options,
     const vc::lasagna::LasagnaNormalSampler& normals,
     const vc::fiber_tracer::LasagnaNormalAlignmentField& alignedNormals)
@@ -4517,9 +4898,12 @@ ReferenceBpCrossConstraints extractReferenceBpCrossConstraints(
         throw std::invalid_argument("Reference diagnostic pieces do not match their source IDs");
     }
     std::vector<vc::fiber_tracer::FiberletCropTraceLine> combined;
-    combined.reserve(reference.pieceLines.size() + bpPieceLines.size());
-    combined.insert(combined.end(), reference.pieceLines.begin(), reference.pieceLines.end());
-    combined.insert(combined.end(), bpPieceLines.begin(), bpPieceLines.end());
+    const bool sourceCertification=options.constraints.localEvents;
+    const auto& refLines=sourceCertification?reference.lines:reference.pieceLines;
+    const auto& traceLines=sourceCertification?bpSourceLines:bpPieceLines;
+    combined.reserve(refLines.size() + traceLines.size());
+    combined.insert(combined.end(), refLines.begin(), refLines.end());
+    combined.insert(combined.end(), traceLines.begin(), traceLines.end());
 
     auto config = options.constraints;
     config.preserveInputLinesAsPieces = true;
@@ -4537,12 +4921,47 @@ ReferenceBpCrossConstraints extractReferenceBpCrossConstraints(
             return normals.normalAlignedWindingDistancesBatch(
                 connectors, step, threads);
         },
-        [referencePieces](std::size_t a, std::size_t b) {
-            return (a < referencePieces) != (b < referencePieces);
+        [referenceSources=refLines.size()](std::size_t a, std::size_t b) {
+            return (a < referenceSources) != (b < referenceSources);
         },
         &alignedNormals);
     if (report.pieces.size() != combined.size()) {
         throw std::logic_error("Reference/BP cross extraction did not preserve input pieces");
+    }
+    if(sourceCertification) {
+        if(!reference.constraintReport || reference.constraintReport->pieces.size()!=referencePieces ||
+           bpConstraints.pieces.size()!=bpPieceLines.size())
+            throw std::logic_error("Reference source ownership does not match evaluation pieces");
+        auto targets=reference.constraintReport->pieces;
+        for(auto piece:bpConstraints.pieces) {
+            piece.traceIndex+=reference.lines.size();
+            targets.push_back(std::move(piece));
+        }
+        const auto certified=report.constraints.size();
+        std::size_t missingOwners=0;
+        report.constraints=vc::fiber_tracer::remapCertifiedFiberTraceEvents(
+            report.constraints,report.pieces,targets,missingOwners);
+        // Keep the canonical one-trace-per-piece interface used by reference
+        // readout/subsetting; events retain their original source-arc provenance.
+        report.resampledPoints=0;
+        for(std::size_t i=0;i<targets.size();++i) {
+            auto& p=targets[i];
+            const double begin=p.beginArcBaseVoxels;
+            p.traceIndex=i; p.pieceIndex=0;
+            p.endArcBaseVoxels-=begin; p.beginArcBaseVoxels=0.;
+            for(auto& arc:p.sampleArcsBaseVoxels)arc-=begin;
+            report.resampledPoints+=p.samplePointsBaseXYZ.size();
+        }
+        report.pieces=std::move(targets);
+        report.inputTraces=report.pieces.size();
+        report.signedWindingConstraints=report.skippedSignedWindingConstraints=0;
+        for(const auto& c:report.constraints) {
+            if(c.signedWindingDelta && c.signedParallelWindingDelta)++report.signedWindingConstraints;
+            else ++report.skippedSignedWindingConstraints;
+        }
+        std::cout << "reference cross source events: certified=" << certified
+                  << " retained=" << report.constraints.size()
+                  << " missing_owner=" << missingOwners << std::endl;
     }
     return {std::move(report), referencePieces};
 }
@@ -4886,40 +5305,17 @@ std::string formatReferenceCeresLeastSquaresBenchmark(
     return output.str();
 }
 
-FixedReferenceConditionedProblem makeFixedReferenceConditionedProblem(
+FixedReferenceConditionedProblem assembleFixedReferenceConditionedProblem(
     const ReferenceFiberDiagnostics& reference,
     const ReferenceBpCrossConstraints& cross,
     const std::vector<vc::fiber_tracer::FiberletCropTraceLine>& bpSourceLines,
     const vc::fiber_tracer::FiberTraceConstraintReport& bpConstraints,
-    const vc::fiber_tracer::FiberTraceInterleavedWindingReport& baseline,
-    const vc::fiber_tracer::FiberTraceReferenceWindingBenchmark& calibration,
-    const vc::fiber_tracer::FiberTraceLabelingConfig& labeling,
-    double phase)
+    const vc::fiber_tracer::FiberTraceLabelingConfig& labeling)
 {
-    constexpr double epsilon = 1.0e-8;
-    if (cross.referencePieces != reference.pieceLines.size() ||
-        cross.report.pieces.size() !=
-            cross.referencePieces + bpConstraints.pieces.size() ||
-        !reference.constraintReport ||
-        baseline.mapLatentCoordinate.size() != bpConstraints.pieces.size() ||
-        baseline.integerGaugeByPiece.size() != bpConstraints.pieces.size() ||
-        baseline.componentByPiece.size() != bpConstraints.pieces.size()) {
-        throw std::invalid_argument(
-            "Fixed-reference conditioned inputs do not match BP pieces");
-    }
-    if (!std::isfinite(phase) || phase < 0.0 || phase > 0.5 ||
-        (calibration.globalSign != -1 && calibration.globalSign != 1)) {
-        throw std::invalid_argument(
-            "Fixed-reference conditioned calibration is invalid");
-    }
-    std::map<std::size_t, double> offsetByGauge;
-    for (const auto& gauge : calibration.gauges) {
-        if (!offsetByGauge.emplace(gauge.integerGauge, gauge.offset).second) {
-            throw std::invalid_argument(
-                "Fixed-reference gauge calibration is ambiguous");
-        }
-    }
-
+    if (!reference.constraintReport ||
+        cross.referencePieces != reference.constraintReport->pieces.size() ||
+        cross.report.pieces.size() != cross.referencePieces + bpConstraints.pieces.size())
+        throw std::invalid_argument("Fixed-reference combined inputs do not match");
     FixedReferenceConditionedProblem result;
     result.referencePieces = cross.referencePieces;
     result.lines.reserve(reference.lines.size() + bpSourceLines.size());
@@ -4955,12 +5351,53 @@ FixedReferenceConditionedProblem makeFixedReferenceConditionedProblem(
             result.constraints.constraints.push_back(source);
     }
     result.ordinaryConstraintOffset = result.constraints.constraints.size();
+    for (auto& constraint : result.constraints.constraints)
+        constraint.allowMeasurementDisable = false;
     for (const auto& source : bpConstraints.constraints) {
         auto remapped = source;
         remapped.pieceA += result.referencePieces;
         remapped.pieceB += result.referencePieces;
         result.constraints.constraints.push_back(std::move(remapped));
     }
+    return result;
+}
+
+FixedReferenceConditionedProblem makeFixedReferenceConditionedProblem(
+    const ReferenceFiberDiagnostics& reference,
+    const ReferenceBpCrossConstraints& cross,
+    const std::vector<vc::fiber_tracer::FiberletCropTraceLine>& bpSourceLines,
+    const vc::fiber_tracer::FiberTraceConstraintReport& bpConstraints,
+    const vc::fiber_tracer::FiberTraceInterleavedWindingReport& baseline,
+    const vc::fiber_tracer::FiberTraceReferenceWindingBenchmark& calibration,
+    const vc::fiber_tracer::FiberTraceLabelingConfig& labeling,
+    double phase)
+{
+    constexpr double epsilon = 1.0e-8;
+    if (cross.referencePieces != reference.pieceLines.size() ||
+        cross.report.pieces.size() !=
+            cross.referencePieces + bpConstraints.pieces.size() ||
+        !reference.constraintReport ||
+        baseline.mapLatentCoordinate.size() != bpConstraints.pieces.size() ||
+        baseline.integerGaugeByPiece.size() != bpConstraints.pieces.size() ||
+        baseline.componentByPiece.size() != bpConstraints.pieces.size()) {
+        throw std::invalid_argument(
+            "Fixed-reference conditioned inputs do not match BP pieces");
+    }
+    if (!std::isfinite(phase) || phase < 0.0 || phase > 0.5 ||
+        (calibration.globalSign != -1 && calibration.globalSign != 1)) {
+        throw std::invalid_argument(
+            "Fixed-reference conditioned calibration is invalid");
+    }
+    std::map<std::size_t, double> offsetByGauge;
+    for (const auto& gauge : calibration.gauges) {
+        if (!offsetByGauge.emplace(gauge.integerGauge, gauge.offset).second) {
+            throw std::invalid_argument(
+                "Fixed-reference gauge calibration is ambiguous");
+        }
+    }
+
+    auto result = assembleFixedReferenceConditionedProblem(
+        reference, cross, bpSourceLines, bpConstraints, labeling);
     struct RawGauge {
         double coordinate = 0.0;
         int phaseSign = 1;
@@ -5502,6 +5939,268 @@ void validateFixedReferenceConditionedResult(const FixedReferenceConditionedProb
             throw std::logic_error("Conditioned solve altered a fixed reference state");
         }
     }
+}
+
+void runReferenceNeighborhoodDiagnostic(
+    const Options& options,
+    const ReferenceFiberDiagnostics& reference,
+    const ReferenceBpCrossConstraints& cross,
+    const std::vector<vc::fiber_tracer::FiberletCropTraceLine>& sourceLines,
+    const vc::fiber_tracer::FiberTraceConstraintReport& sourceConstraints,
+    const std::vector<std::size_t>& originalTraceIndices,
+    const vc::fiber_tracer::FiberTraceWindingBeliefPropagationConfig& windingConfig,
+    const cv::Vec3d& cropMinimum, const cv::Vec3d& cropMaximum)
+{
+    using namespace vc::fiber_tracer;
+    using Json = nlohmann::json;
+    if (!options.jointGrid.fixedPhaseMagnitude ||
+        *options.jointGrid.fixedPhaseMagnitude != 0.5 ||
+        !options.jointGrid.fixedMeasurementScale || !reference.constraintReport)
+        throw std::invalid_argument("Reference neighborhood needs fixed phase 0.5 and scale");
+
+    // The reference gauge is independent of any ordinary solution. Audit normal
+    // components separately: disconnected alignment components need not agree.
+    std::map<std::size_t, std::array<double, 2>> agreement;
+    for (const auto& c : reference.constraintReport->constraints) {
+        if (c.hardContinuity || c.perpendicularScore < c.parallelScore ||
+            !(c.perpendicularScore > 0.0) || !c.signedWindingDelta ||
+            !std::isfinite(*c.signedWindingDelta) || *c.signedWindingDelta == 0.0)
+            continue;
+        const double delta = 0.5 * (static_cast<double>(reference.sourceIdsByPiece.at(c.pieceB)) -
+            static_cast<double>(reference.sourceIdsByPiece.at(c.pieceA)));
+        if (delta == 0.0) continue;
+        const double weight = c.evidenceWeight * c.perpendicularScore;
+        if (!std::isfinite(weight) || weight <= 0.0) continue;
+        auto& mass = agreement[c.windingNormalComponent.value_or(std::numeric_limits<std::size_t>::max())];
+        mass[delta * *c.signedWindingDelta > 0.0 ? 0 : 1] += weight;
+    }
+    int sign = 0;
+    Json signAudit = Json::array();
+    for (const auto& [component, mass] : agreement) {
+        if (mass[0] == mass[1])
+            throw std::runtime_error("Reference normal-component sign is ambiguous");
+        const int preferred = mass[0] > mass[1] ? 1 : -1;
+        signAudit.push_back({{"normal_component", component},
+            {"positive_agreement_mass", mass[0]}, {"negative_agreement_mass", mass[1]},
+            {"chosen_sign", preferred}});
+        if (sign != 0 && sign != preferred)
+            throw std::runtime_error("Reference normal components require incompatible winding gauges");
+        sign = preferred;
+    }
+    if (sign == 0) throw std::runtime_error("No signed reference-reference evidence for canonical gauge");
+    Json uncalibratedCrossComponents = Json::array();
+    std::set<std::size_t> seenCrossComponents;
+    for (const auto& c : cross.report.constraints) {
+        const auto component = c.windingNormalComponent.value_or(std::numeric_limits<std::size_t>::max());
+        if (!agreement.contains(component) && seenCrossComponents.insert(component).second)
+            uncalibratedCrossComponents.push_back(component);
+    }
+    auto full = assembleFixedReferenceConditionedProblem(
+        reference, cross, sourceLines, sourceConstraints, options.labeling);
+    const std::optional<double> cutoff = *options.referenceNeighborhoodWindings < 0.0
+        ? std::nullopt : options.referenceNeighborhoodWindings;
+    const auto selected = selectFiberTraceReferenceNeighborhood(
+        full.constraints, full.referencePieces, cutoff, *options.jointGrid.fixedMeasurementScale);
+    FixedReferenceConditionedProblem problem;
+    problem.referencePieces = full.referencePieces;
+    problem.constraints = selected.report;
+    for (const auto source : selected.retainedTraceIndices)
+        problem.lines.push_back(full.lines.at(source));
+    problem.fixedStates.resize(problem.constraints.pieces.size());
+    for (std::size_t p = 0; p < problem.referencePieces; ++p) {
+        if (selected.retainedPieceIndices.at(p) != p)
+            throw std::logic_error("Reference neighborhood lost a reference piece");
+        const auto id = reference.sourceIdsByPiece.at(p);
+        problem.fixedStates[p] = {true, id % 2 == 0
+            ? FiberTraceFixedOrientation::Horizontal : FiberTraceFixedOrientation::Vertical,
+            sign * static_cast<int>(id / 2), sign};
+    }
+    const auto topology = prepareFiberTraceBeliefTopology(
+        problem.lines, problem.constraints, cropMinimum, cropMaximum);
+    auto config = options.jointGrid;
+    static_cast<FiberTraceWindingBeliefPropagationConfig&>(config) = windingConfig;
+    config.mixedUnaryCost = options.windingDefectCost;
+    config.pieceBreakCost = options.pieceBreakCost;
+    config.orientationTemperature = options.bp.horizontalnessTemperature;
+    std::cout << "reference neighborhood solve status=started cutoff="
+              << (cutoff ? std::to_string(*cutoff) : "all")
+              << " pieces=" << problem.constraints.pieces.size()
+              << " full_pieces=" << full.constraints.pieces.size() << std::endl;
+    const auto started = std::chrono::steady_clock::now();
+    const auto result = solveFiberTraceJointGridWindingBeliefPropagation(
+        problem.constraints, topology, config, {}, {}, problem.fixedStates);
+    const double solveSeconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - started).count();
+    validateFixedReferenceConditionedResult(problem, result);
+    for (std::size_t p = 0; p < problem.referencePieces; ++p) {
+        const double expected = sign * 0.5 * reference.sourceIdsByPiece.at(p);
+        if (std::abs(result.mapLatentCoordinate.at(p) - expected) > 1.e-8 ||
+            result.componentPhaseSign.at(result.componentByPiece.at(p)) != sign)
+            throw std::logic_error("Reference neighborhood changed fixed physical coordinates");
+    }
+    const auto oldOrdinaryTrace = [&](std::size_t p) {
+        const auto oldPiece = selected.retainedPieceIndices.at(p);
+        return full.constraints.pieces.at(oldPiece).traceIndex - reference.lines.size();
+    };
+    std::map<std::size_t, std::vector<std::size_t>> byTrace;
+    std::map<std::size_t, std::array<std::size_t, 2>> gauges;
+    Json pieceRows = Json::array(), continuationRows = Json::array(), traceRows = Json::array();
+    std::size_t disabled = 0, ordinaryPieces = 0;
+    std::ostringstream pieceCsv, edgeCsv;
+    pieceCsv << "source_trace,piece,begin_arc,end_arc,active,orientation,winding,q\n";
+    edgeCsv << "source_trace,piece_a,piece_b,active_a,active_b,absolute_winding_jump\n";
+    for (std::size_t p = 0; p < problem.constraints.pieces.size(); ++p) {
+        const bool ref = p < problem.referencePieces;
+        ++gauges[result.integerGaugeByPiece.at(p)][ref ? 0 : 1];
+        if (ref) continue;
+        ++ordinaryPieces;
+        const auto source = oldOrdinaryTrace(p);
+        byTrace[source].push_back(p);
+        const auto& piece = problem.constraints.pieces[p];
+        const bool active = result.windingValid.at(p) != 0;
+        disabled += !active;
+        const auto oldPiece = selected.retainedPieceIndices[p] - full.referencePieces;
+        const auto originalSource = originalTraceIndices.at(source);
+        pieceRows.push_back({{"source_trace", originalSource}, {"original_piece", oldPiece},
+            {"begin_arc", piece.beginArcBaseVoxels}, {"end_arc", piece.endArcBaseVoxels},
+            {"active", active}, {"orientation", static_cast<int>(result.mapOrientationByPiece[p])},
+            {"winding", active ? Json(result.mapWinding[p]) : Json(nullptr)},
+            {"q", active ? Json(result.mapLatentCoordinate[p]) : Json(nullptr)}});
+        pieceCsv << originalSource << ',' << oldPiece << ',' << piece.beginArcBaseVoxels << ','
+            << piece.endArcBaseVoxels << ',' << active << ','
+            << static_cast<int>(result.mapOrientationByPiece[p]) << ',';
+        if (active) pieceCsv << result.mapWinding[p] << ',' << result.mapLatentCoordinate[p];
+        else pieceCsv << ',';
+        pieceCsv << '\n';
+    }
+    std::size_t continuation = 0, activeEdges = 0, jumps = 0, defectEdges = 0;
+    double jumpSum = 0.0, jumpMax = 0.0;
+    std::map<std::size_t, std::size_t> jumpsByTrace;
+    std::map<std::size_t, std::vector<std::pair<std::size_t, std::size_t>>> jumpEdgesByTrace;
+    for (const auto& c : problem.constraints.constraints) {
+        if (!c.hardContinuity || c.pieceA < problem.referencePieces || c.pieceB < problem.referencePieces)
+            continue;
+        ++continuation;
+        const bool a = result.windingValid[c.pieceA], b = result.windingValid[c.pieceB];
+        const double jump = a && b ? std::abs(result.mapLatentCoordinate[c.pieceB] - result.mapLatentCoordinate[c.pieceA]) : 0.0;
+        if (a && b) ++activeEdges; else ++defectEdges;
+        if (jump > 1.e-8) {
+            ++jumps; ++jumpsByTrace[oldOrdinaryTrace(c.pieceA)];
+            jumpEdgesByTrace[oldOrdinaryTrace(c.pieceA)].emplace_back(c.pieceA, c.pieceB);
+        }
+        jumpSum += jump;
+        jumpMax = std::max(jumpMax, jump);
+        const auto source = originalTraceIndices.at(oldOrdinaryTrace(c.pieceA));
+        const auto pa = selected.retainedPieceIndices[c.pieceA] - full.referencePieces;
+        const auto pb = selected.retainedPieceIndices[c.pieceB] - full.referencePieces;
+        continuationRows.push_back({{"source_trace", source}, {"piece_a", pa}, {"piece_b", pb},
+            {"active_a", a}, {"active_b", b}, {"absolute_winding_jump", a && b ? Json(jump) : Json(nullptr)}});
+        edgeCsv << source << ',' << pa << ',' << pb << ',' << a << ',' << b << ',';
+        if (a && b) edgeCsv << jump;
+        edgeCsv << '\n';
+    }
+    std::size_t disabledRuns = 0, affectedTraces = 0, jumpRuns = 0;
+    double totalLength = 0.0, disabledLength = 0.0;
+    for (auto& [source, indices] : byTrace) {
+        std::sort(indices.begin(), indices.end(), [&](auto a, auto b) {
+            const auto aa = problem.constraints.pieces[a].beginArcBaseVoxels;
+            const auto bb = problem.constraints.pieces[b].beginArcBaseVoxels;
+            return aa < bb || (aa == bb && a < b);
+        });
+        std::size_t defects = 0, runs = 0;
+        double unionEnd = -std::numeric_limits<double>::infinity();
+        double disabledEnd = unionEnd, previousEnd = unionEnd, length = 0.0, defectLength = 0.0;
+        bool previousDisabled = false;
+        for (auto p : indices) {
+            const auto& piece = problem.constraints.pieces[p];
+            const double begin = piece.beginArcBaseVoxels, end = piece.endArcBaseVoxels;
+            length += std::max(0.0, end - std::max(begin, unionEnd));
+            unionEnd = std::max(unionEnd, end);
+            const bool inactive = !result.windingValid[p];
+            if (inactive) {
+                ++defects;
+                if (!previousDisabled || begin > previousEnd + 1.e-8) ++runs;
+                defectLength += std::max(0.0, end - std::max(begin, disabledEnd));
+                disabledEnd = std::max(disabledEnd, end);
+            }
+            previousDisabled = inactive;
+            previousEnd = end;
+        }
+        totalLength += length; disabledLength += defectLength; disabledRuns += runs;
+        const auto traceJumps = jumpsByTrace[source];
+        // Connected jump-edge chains along the original source, not proximity
+        // in the global piece vector (which can interleave unrelated fibers).
+        std::map<std::size_t, std::size_t> jumpParent;
+        const auto root = [&](std::size_t p) {
+            while (jumpParent.at(p) != p) p = jumpParent.at(p);
+            return p;
+        };
+        for (const auto& [a, b] : jumpEdgesByTrace[source]) {
+            jumpParent.try_emplace(a, a); jumpParent.try_emplace(b, b);
+            jumpParent[root(b)] = root(a);
+        }
+        std::size_t traceJumpRuns = 0;
+        for (const auto& [p, parent] : jumpParent) traceJumpRuns += p == parent;
+        jumpRuns += traceJumpRuns;
+        affectedTraces += defects > 0 || traceJumps > 0;
+        traceRows.push_back({{"source_trace", originalTraceIndices.at(source)}, {"pieces", indices.size()},
+            {"disabled_pieces", defects}, {"disabled_runs", runs}, {"winding_jumps", traceJumps},
+            {"winding_jump_runs", traceJumpRuns},
+            {"length_base_voxels", length}, {"disabled_length_base_voxels", defectLength}});
+    }
+    std::size_t unanchored = 0, referenceOnly = 0;
+    for (const auto& [id, counts] : gauges) {
+        unanchored += counts[0] == 0; referenceOnly += counts[1] == 0;
+    }
+    const auto pct = [](double value, double count) { return count > 0 ? 100.0 * value / count : 0.0; };
+    Json summary = {{"ordinary_traces_all", sourceLines.size()}, {"ordinary_traces_retained", byTrace.size()},
+        {"ordinary_traces_retained_percent", pct(byTrace.size(), sourceLines.size())},
+        {"ordinary_pieces_all", sourceConstraints.pieces.size()}, {"ordinary_pieces_retained", ordinaryPieces},
+        {"ordinary_pieces_retained_percent", pct(ordinaryPieces, sourceConstraints.pieces.size())},
+        {"combined_factors_all", full.constraints.constraints.size()},
+        {"combined_factors_retained", problem.constraints.constraints.size()},
+        {"disabled_pieces", disabled}, {"disabled_pieces_percent", pct(disabled, ordinaryPieces)},
+        {"ordinary_length_base_voxels", totalLength}, {"disabled_length_base_voxels", disabledLength},
+        {"disabled_length_percent", pct(disabledLength, totalLength)}, {"disabled_runs", disabledRuns},
+        {"affected_traces", affectedTraces}, {"affected_traces_percent", pct(affectedTraces, byTrace.size())},
+        {"continuation_edges", continuation}, {"active_active_edges", activeEdges}, {"defect_incident_edges", defectEdges},
+        {"nonzero_winding_jumps", jumps}, {"nonzero_winding_jumps_percent", pct(jumps, activeEdges)},
+        {"absolute_jump_sum", jumpSum}, {"maximum_jump", jumpMax}, {"integer_gauge_components", gauges.size()},
+        {"winding_jump_runs", jumpRuns},
+        {"ordinary_unanchored_components", unanchored}, {"reference_only_components", referenceOnly},
+        {"reference_pieces_fixed", problem.referencePieces}, {"solver_status", result.status},
+        {"message_iterations", result.messageIterations}, {"decoded_energy", result.decodedEnergy},
+        {"solve_seconds", solveSeconds}};
+    Json factorAgreement = Json::object();
+    for (int group = 0; group < 3; ++group) {
+        auto groupResult = result;
+        std::erase_if(groupResult.factorDiagnostics, [&](const auto& factor) {
+            const bool a = factor.pieceA < problem.referencePieces;
+            const bool b = factor.pieceB < problem.referencePieces;
+            return (a && b ? 0 : a || b ? 1 : 2) != group;
+        });
+        const auto agreementSummary = summarizeFiberTraceConstraintAgreement(problem.constraints, groupResult);
+        Json classes = Json::object();
+        for (std::size_t i = 0; i < agreementSummary.classes.size(); ++i) {
+            const auto& count = agreementSummary.classes[i];
+            classes[fiberTraceConstraintAgreementClassName(static_cast<FiberTraceConstraintAgreementClass>(i))] = {
+                {"prepared", count.prepared}, {"evaluated", count.evaluated},
+                {"defect_neutralized", count.defectNeutralized}, {"infringed", count.infringed}};
+        }
+        factorAgreement[group == 0 ? "reference_only" : group == 1 ? "reference_cross" : "ordinary"] = classes;
+    }
+    const Json document = {{"version", 1}, {"cutoff_windings", cutoff ? Json(*cutoff) : Json(nullptr)},
+        {"measurement_scale", result.measurementScale}, {"canonical_reference_sign", sign},
+        {"reference_sign_audit", signAudit}, {"summary", summary}, {"traces", traceRows},
+        {"cross_normal_components_without_reference_sign_evidence", uncalibratedCrossComponents},
+        {"factor_agreement", factorAgreement},
+        {"pieces", pieceRows}, {"continuations", continuationRows},
+        {"interpretation", "Ordinary jumps/disablements are solver diagnostics, not known geometric ground-truth errors."}};
+    const auto prefix = options.output.string() + "_reference_neighborhood";
+    vc::core::util::atomicWriteString(prefix + ".json", document.dump(2) + "\n");
+    vc::core::util::atomicWriteString(prefix + "_pieces.csv", pieceCsv.str());
+    vc::core::util::atomicWriteString(prefix + "_continuations.csv", edgeCsv.str());
+    std::cout << "reference neighborhood complete " << summary.dump() << std::endl;
 }
 
 std::string formatFixedReferenceConditionedComparison(
@@ -6357,10 +7056,52 @@ std::string formatReferenceBpWindingBenchmark(
     const vc::fiber_tracer::FiberTraceConstraintReport& bpConstraints,
     std::span<const std::size_t> bpOriginalTraceIndices,
     bool includeConstraintDetails,
-    std::optional<int> windingOutputOffsetOverride = std::nullopt)
+    std::optional<int> windingOutputOffsetOverride = std::nullopt,
+    bool independent = false)
 {
     const auto observations = makeReferenceBpWindingObservations(
         reference, cross, winding, config);
+
+    if (independent) {
+        const auto calibration = vc::fiber_tracer::calibrateFiberTraceReferenceWindings(
+            observations, 0.5, true);
+        const auto assignments = vc::fiber_tracer::rankFiberTraceIndependentReferenceWindings(
+            observations, calibration, reference.sourceNames.size(), 5);
+        std::ostringstream result;
+        result.imbue(std::locale::classic());
+        result << "independent reference assignment frozen_initial_bp=1 conditioned_solve=0 pruning=0"
+               << " configured_weights=1 half_grid=0.5 orientation_parity_filter=off"
+               << " global_sign=" << calibration.globalSign
+               << " bp_status=" << winding.status << '\n';
+        result << "gauge,offset\n";
+        for (const auto& gauge : calibration.gauges)
+            result << gauge.integerGauge << ',' << gauge.offset << '\n';
+        result << "independent_reference_summary\n"
+               << "reference,gauge,calibrated,observations,admitted,inactive,zero_weight,min_candidate,max_candidate,evaluated,best_ties,lower_unbounded_best,upper_unbounded_best,lower_unbounded_feasible,upper_unbounded_feasible\n";
+        for (const auto& row : assignments) {
+            result << row.referenceSource * 0.5 << ',' << row.integerGauge << ','
+                   << row.calibrated << ',' << row.observations << ',' << row.admittedObservations << ','
+                   << row.excludedInactive << ',' << row.ignoredZeroWeight << ','
+                   << row.minimumCandidateWinding << ',' << row.maximumCandidateWinding << ','
+                   << row.evaluatedCandidates << ',' << row.bestTies << ','
+                   << row.lowerUnboundedBest << ',' << row.upperUnboundedBest << ','
+                   << row.lowerUnboundedFeasible << ',' << row.upperUnboundedFeasible << '\n';
+        }
+        result << "independent_reference_candidates\n"
+               << "reference,gauge,rank,winding,raw_winding,hard_sign_errors,finite_loss,satisfied_observations,violated_observations\n";
+        result << std::setprecision(12);
+        for (const auto& row : assignments) {
+            for (std::size_t rank = 0; rank < row.candidates.size(); ++rank) {
+                const auto& candidate = row.candidates[rank];
+                result << row.referenceSource * 0.5 << ',' << row.integerGauge << ',' << rank + 1 << ','
+                       << candidate.winding << ',' << candidate.rawWinding << ','
+                       << candidate.hardViolations << ',' << candidate.finiteLoss << ','
+                       << candidate.satisfiedObservations << ',' << candidate.violatedObservations << '\n';
+            }
+        }
+        result << "independent_reference_end\n";
+        return result.str();
+    }
 
     const auto benchmark = vc::fiber_tracer::calibrateFiberTraceReferenceWindings(observations);
     const int windingOutputOffset = windingOutputOffsetOverride.value_or(
@@ -7485,6 +8226,7 @@ int main(int argc, char** argv)
             const auto cpuStarted = std::clock();
             auto artifact =
                 vc::fiber_tracer::readFiberletCropTraceArtifact(options.input);
+            validateArtifactQuality(artifact, options.qualityFraction.has_value() || options.qualityThreshold.has_value());
             const auto retainedOriginalTraceIndices = applyQualityFilter(
                 artifact.lines, options.qualityFraction,
                 options.qualityThreshold);
@@ -7545,6 +8287,8 @@ int main(int argc, char** argv)
                         makeNormalAlignmentProgressPrinter()));
                 std::cout
                     << "fiber winding normal alignment"
+                    << " maximum_message_iterations="
+                    << alignmentConfig.beliefPropagation.maximumMessageIterations
                     << " spacing_base=" << nx.spacing
                     << " candidates=" << alignedNormalField->candidateSamples
                     << " valid=" << alignedNormalField->rawNormals.size()
@@ -7690,10 +8434,23 @@ int main(int argc, char** argv)
                         trustedMask.push_back(trusted ? 1 : 0);
                     }
 
+                    auto checkpointConfig = options.constraints;
+                    if (!options.pieceCutHints.empty()) {
+                        std::ifstream input(options.pieceCutHints);
+                        nlohmann::json hints;
+                        input >> hints;
+                        if (hints.at("version").get<int>() != 1 ||
+                            std::filesystem::weakly_canonical(hints.at("trace_artifact").get<std::string>()) != std::filesystem::weakly_canonical(options.input))
+                            throw std::runtime_error("Piece cut artifact mismatch");
+                        const auto& cuts = hints.at("cuts");
+                        checkpointConfig.extraPieceCutsBaseVoxels.resize(diagnosticLines.size());
+                        for (std::size_t i = 0; i < diagnosticLines.size(); ++i)
+                            checkpointConfig.extraPieceCutsBaseVoxels[i] = cuts.at(std::to_string(diagnosticOriginalTraceIndices[i])).get<std::vector<double>>();
+                    }
                     auto checkpointReport =
                         vc::fiber_tracer::extractFiberTraceConstraints(
                             diagnosticLines,
-                            options.constraints,
+                            checkpointConfig,
                             [&normals](const cv::Vec3d& a,
                                        const cv::Vec3d& b,
                                        double step) {
@@ -7712,6 +8469,42 @@ int main(int argc, char** argv)
                             alignedNormalField
                                 ? &*alignedNormalField
                                 : nullptr);
+                    printLocalConstraintSummary(checkpointReport, checkpointConfig);
+                    if(checkpointConfig.localEvents)
+                        writeLocalConstraintPieces(checkpointReport,diagnosticOriginalTraceIndices,options.output);
+                    if (!options.defectMultipliers.empty()) {
+                        std::ifstream input(options.defectMultipliers);
+                        nlohmann::json document;
+                        input >> document;
+                        if (document.at("version").get<int>() != 1 ||
+                            std::filesystem::weakly_canonical(document.at("trace_artifact").get<std::string>()) !=
+                            std::filesystem::weakly_canonical(options.input))
+                            throw std::runtime_error("Defect multiplier artifact identity mismatch");
+                        const auto& rows = document.at("pieces");
+                        if (!rows.is_array() || rows.empty())
+                            throw std::runtime_error("Defect multiplier pieces must be a nonempty array");
+                        if (rows.size() != checkpointReport.pieces.size())
+                            throw std::runtime_error("Defect multiplier piece count mismatch");
+                        double minimum = 1.0, maximum = 0.0, sum = 0.0;
+                        for (std::size_t i = 0; i < checkpointReport.pieces.size(); ++i) {
+                            auto& piece = checkpointReport.pieces[i];
+                            const auto& row = rows.at(i);
+                            if (row.at("piece").get<std::size_t>() != i ||
+                                row.at("original_trace").get<std::size_t>() != diagnosticOriginalTraceIndices.at(piece.traceIndex) ||
+                                row.at("begin_arc_base").get<double>() != piece.beginArcBaseVoxels ||
+                                row.at("end_arc_base").get<double>() != piece.endArcBaseVoxels)
+                                throw std::runtime_error("Defect multiplier piece identity mismatch at " + std::to_string(i));
+                            const double m = row.at("multiplier").get<double>();
+                            if (!std::isfinite(m) || m <= 0.0)
+                                throw std::runtime_error("Defect multiplier must be finite and positive");
+                            piece.windingDefectCostMultiplier = m;
+                            piece.windingDefectLengthMeasure = row.value("length_measure", 0.0);
+                            piece.windingDefectLengthBlend = row.value("length_blend", 0.0);
+                            minimum = std::min(minimum, m); maximum = std::max(maximum, m); sum += m;
+                        }
+                        std::cout << "defect multipliers count=" << rows.size()
+                            << " min=" << minimum << " mean=" << sum / rows.size() << " max=" << maximum << '\n';
+                    }
                     const auto extractedConstraints =
                         checkpointReport.constraints;
                     std::optional<
@@ -7766,10 +8559,18 @@ int main(int argc, char** argv)
                                 ? options.windingTemperature
                                 : options.bp.horizontalnessTemperature;
                             windingConfig.messageDamping = options.bp.messageDamping;
+                            windingConfig.measurementDisableCost = options.windingMeasurementDisableCost;
+                            windingConfig.continuityCutCost = options.windingContinuityCutCost;
+                            windingConfig.continuityCostByDistance = options.windingContinuityCostByDistance;
+                            windingConfig.includeContinuityInDefectMass = options.windingIncludeContinuityInDefectMass;
+                            windingConfig.decodeRepairSweeps = options.jointGrid.decodeRepairSweeps;
+                            windingConfig.maximumTotalCandidateStates =
+                                options.windingMaximumCandidateStates;
                             windingConfig.messageResidualTolerance =
                                 options.bp.messageResidualTolerance;
                             windingConfig.maximumMessageIterations =
-                                options.bp.maximumMessageIterations;
+                                options.windingMessageIterations.value_or(
+                                    options.bp.maximumMessageIterations);
                             windingConfig.parallelWorkers =
                                 static_cast<std::size_t>(options.threads);
                             windingConfig.parallelWindingDistanceCutoff =
@@ -7798,6 +8599,64 @@ int main(int argc, char** argv)
                             auto bpSourceLines = diagnosticLines;
                             auto bpSourceOriginalTraceIndices = diagnosticOriginalTraceIndices;
                             auto bpSourceDirections = diagnosticDirections;
+                            std::optional<ReferenceBpCrossConstraints> selectedNeighborhoodCross;
+                            if (options.referenceNeighborhoodWindings) {
+                                if (!referenceDiagnostics || !alignedNormalField)
+                                    throw std::logic_error("Reference neighborhood needs references and aligned normals");
+                                const auto pieceLines = vc::fiber_tracer::makeFiberTraceConstraintPieceLines(
+                                    diagnosticLines, selectedBpConstraints);
+                                const auto cross = extractReferenceBpCrossConstraints(
+                                    *referenceDiagnostics, pieceLines, diagnosticLines,
+                                    selectedBpConstraints, options, normals, *alignedNormalField);
+                                if (!options.referenceNeighborhoodUnconditioned) {
+                                    runReferenceNeighborhoodDiagnostic(options, *referenceDiagnostics,
+                                        cross, diagnosticLines, selectedBpConstraints,
+                                        diagnosticOriginalTraceIndices, windingConfig,
+                                        artifact.minimumBaseXYZ, artifact.maximumBaseXYZ);
+                                    return;
+                                }
+                                if (!options.jointGrid.fixedMeasurementScale)
+                                    throw std::invalid_argument("Neighborhood selection requires a fixed measurement scale");
+                                const auto combined = assembleFixedReferenceConditionedProblem(
+                                    *referenceDiagnostics, cross, diagnosticLines,
+                                    selectedBpConstraints, options.labeling);
+                                const std::optional<double> cutoff = *options.referenceNeighborhoodWindings < 0.0
+                                    ? std::nullopt : options.referenceNeighborhoodWindings;
+                                const auto neighborhood = vc::fiber_tracer::selectFiberTraceReferenceNeighborhood(
+                                    combined.constraints, combined.referencePieces, cutoff,
+                                    *options.jointGrid.fixedMeasurementScale);
+                                std::vector<std::size_t> ordinaryPieces;
+                                for (auto p : neighborhood.retainedPieceIndices)
+                                    if (p >= combined.referencePieces)
+                                        ordinaryPieces.push_back(p - combined.referencePieces);
+                                // Subset the ORIGINAL ordinary report, not the combined
+                                // report: reference nodes and cross factors never enter BP.
+                                const auto subset = vc::fiber_tracer::subsetFiberTraceConstraintReport(
+                                    selectedBpConstraints, ordinaryPieces);
+                                bpConstraints = subset.report;
+                                bpSourceLines.clear();
+                                bpSourceOriginalTraceIndices.clear();
+                                bpSourceDirections.clear();
+                                for (const auto old : subset.retainedTraceIndices) {
+                                    bpSourceLines.push_back(diagnosticLines.at(old));
+                                    bpSourceOriginalTraceIndices.push_back(diagnosticOriginalTraceIndices.at(old));
+                                    bpSourceDirections.push_back(diagnosticDirections.at(old));
+                                }
+                                selectedNeighborhoodCross = subsetReferenceBpCrossConstraints(cross, ordinaryPieces);
+                                const nlohmann::json cohort = {
+                                    {"reference_nodes_in_solve", 0}, {"reference_cross_factors_in_solve", 0},
+                                    {"ordinary_source_trace_ids", bpSourceOriginalTraceIndices},
+                                    {"ordinary_original_piece_ids", ordinaryPieces},
+                                    {"ordinary_pieces", bpConstraints.pieces.size()},
+                                    {"ordinary_factors", bpConstraints.constraints.size()},
+                                    {"cross_factors_for_readout_only", selectedNeighborhoodCross->report.constraints.size()}};
+                                vc::core::util::atomicWriteString(options.output.string() + "_neighborhood_cohort.json", cohort.dump(2) + "\n");
+                                std::cout << "ordinary-only reference neighborhood selected_sources="
+                                    << bpSourceLines.size() << " pieces=" << bpConstraints.pieces.size()
+                                    << " factors=" << bpConstraints.constraints.size()
+                                    << " reference_nodes_in_solve=0 reference_cross_factors_in_solve=0"
+                                    << " conditioned_initialization=0\n" << std::flush;
+                            }
                             std::vector<unsigned char> bpSourcePieceOne;
                             bpSourcePieceOne.reserve(bpConstraints.pieces.size());
                             for (const auto& piece : bpConstraints.pieces) {
@@ -7887,7 +8746,7 @@ int main(int argc, char** argv)
                             std::size_t componentRounds = 0;
                             while (true) {
                                 if (bpConstraints.pieces.empty()) {
-                                    throw std::runtime_error("BP main winding component is empty");
+                                    throw std::runtime_error("BP winding graph is empty");
                                 }
                                 fixedOrientations.clear();
                                 if (options.windingFixedOrientation) {
@@ -7895,6 +8754,11 @@ int main(int argc, char** argv)
                                     fixedOrientations = vc::fiber_tracer::
                                         fixedFiberTraceOrientations(report);
                                 }
+                                // Reference connections are constructed below. Dropping
+                                // components here can discard fibers those references
+                                // would connect, or only part of a linked source fiber.
+                                if (!options.windingLargestComponentOnly)
+                                    break;
                                 const auto component = vc::fiber_tracer::
                                     selectLargestFiberTraceWindingComponent(
                                         bpConstraints,
@@ -7955,7 +8819,9 @@ int main(int argc, char** argv)
                             if (!options.windingFixedOrientation && !jointGrid)
                                 solveOrientation();
                             std::cout
-                                << "fiber BP main winding component"
+                                << "fiber BP component selection"
+                                << " policy=" << (options.windingLargestComponentOnly
+                                    ? "largest-only" : "all")
                                 << " rounds=" << componentRounds
                                 << " traces=" << inputTraces << "->"
                                 << bpConstraints.inputTraces
@@ -7976,13 +8842,13 @@ int main(int argc, char** argv)
                                 bpOriginalTraceIndices.push_back(bpSourceOriginalTraceIndices.at(piece.traceIndex));
                                 bpDirections.push_back(bpSourceDirections.at(piece.traceIndex));
                             }
-                            std::optional<ReferenceBpCrossConstraints> referenceBpConstraints;
-                            if (referenceDiagnostics && options.bpInference == vc::fiber_tracer::FiberTraceBeliefInference::SumProductMixed) {
+                            auto referenceBpConstraints = std::move(selectedNeighborhoodCross);
+                            if (!referenceBpConstraints && referenceDiagnostics && options.bpInference == vc::fiber_tracer::FiberTraceBeliefInference::SumProductMixed) {
                                 if (!alignedNormalField) {
                                     throw std::logic_error("Reference/BP benchmark requires aligned normals");
                                 }
                                 referenceBpConstraints =
-                                    extractReferenceBpCrossConstraints(*referenceDiagnostics, bpPieceLines, options, normals, *alignedNormalField);
+                                    extractReferenceBpCrossConstraints(*referenceDiagnostics, bpPieceLines, bpSourceLines, bpConstraints, options, normals, *alignedNormalField);
                             }
                             const auto solveInterleaved = [&] (
                                 const WindingWeightTuple& weights,
@@ -9146,13 +10012,14 @@ int main(int argc, char** argv)
                                                 state.problem.constraints,
                                                 artifact.minimumBaseXYZ,
                                                 artifact.maximumBaseXYZ);
-                                            std::vector<vc::fiber_tracer::FiberTraceFixedOrientation> orientations(
-                                                state.problem.constraints.pieces.size());
-                                            for (std::size_t piece = 0; piece < state.problem.referencePieces; ++piece)
-                                                orientations[piece] = state.problem.fixedStates[piece].orientation;
-                                            for (std::size_t piece = 0; piece < retained.size(); ++piece) {
-                                                orientations[state.problem.referencePieces + piece] =
-                                                    fixedOrientations.at(retained[piece]);
+                                            std::vector<vc::fiber_tracer::FiberTraceFixedOrientation> orientations;
+                                            if (!fixedOrientations.empty()) {
+                                                orientations.resize(state.problem.constraints.pieces.size());
+                                                for (std::size_t piece = 0; piece < state.problem.referencePieces; ++piece)
+                                                    orientations[piece] = state.problem.fixedStates[piece].orientation;
+                                                for (std::size_t piece = 0; piece < retained.size(); ++piece)
+                                                    orientations[state.problem.referencePieces + piece] =
+                                                        fixedOrientations.at(retained[piece]);
                                             }
                                             state.conditioned = vc::fiber_tracer::
                                                 solveFiberTraceJointGridWindingBeliefPropagation(
@@ -9490,9 +10357,9 @@ int main(int argc, char** argv)
                                     }
                                     std::vector<vc::fiber_tracer::FiberTraceFixedOrientation> prunedOrientations;
                                     prunedOrientations.reserve(subset.retainedPieceIndices.size());
-                                    for (const std::size_t oldPiece : subset.retainedPieceIndices) {
-                                        prunedOrientations.push_back(fixedOrientations.at(oldPiece));
-                                    }
+                                    if (!fixedOrientations.empty())
+                                        for (const std::size_t oldPiece : subset.retainedPieceIndices)
+                                            prunedOrientations.push_back(fixedOrientations.at(oldPiece));
                                     vc::fiber_tracer::FiberTraceInterleavedWindingReport finalPruned;
                                     vc::fiber_tracer::FiberTraceInterleavedWindingReport alignedFinalPruned;
                                     std::vector<vc::fiber_tracer::FiberletCropTraceLine> finalPieceLines;
@@ -9691,6 +10558,16 @@ int main(int argc, char** argv)
                                                    << " pair_candidates=" << options.referencePruneConfig.oracleMaximumPairCandidates;
                                         break;
                                     }
+                                    if (options.windingMeasurementDisableCost) {
+                                        const auto counts = [&](const char* name, const auto& report) {
+                                            diagnostic << '\n' << name << "_measurement_disable eligible="
+                                                << report.measurementDisableEligible << " map_off="
+                                                << report.measurementDisableMapOff << " conditional_posterior_sum="
+                                                << report.measurementDisableConditionalPosteriorSum << '\n';
+                                        };
+                                        counts("conditioned", conditioned);
+                                        counts("fresh", alignedFinalPruned);
+                                    }
                                     diagnostic << '\n'
                                                << std::left << std::setw(28) << "metric" << std::right << std::setw(12) << "value" << '\n'
                                                << std::left << std::setw(28) << "ordinary input pieces" << std::right << std::setw(12)
@@ -9826,6 +10703,8 @@ int main(int argc, char** argv)
                                                           constraintBenchmark->problematicConstraints,
                                                           constraintBenchmark->retainedFulfilledConstraints)
                                                    << '\n';
+                                        diagnostic << "explicitly_disabled_retained_constraints="
+                                                   << constraintBenchmark->retainedDisabledConstraints << '\n';
                                         diagnostic << "direct_output_base="
                                                    << std::quoted(directArtifactReport->outputBase.string())
                                                    << "\n\nreference conditioned-inlier result benchmark\n"
@@ -10038,7 +10917,9 @@ int main(int argc, char** argv)
                                             windingConfig,
                                             bpConstraints,
                                             bpOriginalTraceIndices,
-                                            options.referenceConstraintDetails);
+                                            options.referenceConstraintDetails,
+                                            std::nullopt,
+                                            options.referenceIndependent || options.referenceInitialReadout);
                                 }
                                 if (options.referencePruneOffenders) {
                                     referenceBenchmark =
@@ -10270,12 +11151,17 @@ int main(int argc, char** argv)
                                     windingConfig;
                             windingConfig.temperature =
                                 options.bp.horizontalnessTemperature;
+                            windingConfig.includeContinuityInDefectMass =
+                                options.windingIncludeContinuityInDefectMass;
                             windingConfig.messageDamping =
                                 options.bp.messageDamping;
+                            windingConfig.maximumTotalCandidateStates =
+                                options.windingMaximumCandidateStates;
                             windingConfig.messageResidualTolerance =
                                 options.bp.messageResidualTolerance;
                             windingConfig.maximumMessageIterations =
-                                options.bp.maximumMessageIterations;
+                                options.windingMessageIterations.value_or(
+                                    options.bp.maximumMessageIterations);
                             windingConfig.parallelWorkers =
                                 static_cast<std::size_t>(options.threads);
                             windingConfig.parallelWindingDistanceCutoff =
@@ -10594,6 +11480,7 @@ int main(int argc, char** argv)
         if (options.mode == Mode::Visualize) {
             auto artifact =
                 vc::fiber_tracer::readFiberletCropTraceArtifact(options.input);
+            validateArtifactQuality(artifact, options.qualityFraction.has_value() || options.qualityThreshold.has_value());
             applyQualityFilter(
                 artifact.lines, options.qualityFraction,
                 options.qualityThreshold);
@@ -10602,6 +11489,44 @@ int main(int argc, char** argv)
             printDirectionReport(report.directions, options.output);
             std::cout << "fiberlet crop visualization completed"
                       << " traces=" << artifact.lines.size() << " input=" << options.input << " output=" << options.output << '\n';
+            return 0;
+        }
+
+        if (options.importedCrop) {
+            using namespace vc::fiber_tracer;
+            const auto collection = readNativeVc3dFiberCollectionJson(options.input);
+            const auto fibers = parseNativeVc3dFiberCollection(collection, options.input.string());
+            vc::lasagna::LasagnaDatasetOpenOptions normalOptions;
+            normalOptions.remoteCacheRoot = options.remoteCacheDirectory;
+            const auto normals = vc::lasagna::LasagnaDataset::openLocation(options.normalManifest, normalOptions);
+            validateCollectionNormalSpace(collection, normals.manifest());
+            std::vector<std::vector<cv::Vec3d>> sourceLines;
+            for (const auto& fiber : fibers) sourceLines.push_back(fiber.linePoints);
+            const auto lines = importFiberCropLines(sourceLines, options.trace);
+            FiberletDatasetMetadata source;
+            source.kind = FiberletDatasetKind::Combined;
+            source.spatialChunkSideBaseVoxels = 64;
+            source.chunkGridShapeZYX = {1, 1, 1};
+            source.coordinateUnitsPerChunkZYX = {8, 8, 8};
+            source.maximumEndpointReachCoordinateUnitsZYX = {0, 0, 0};
+            source.predictionToBaseScale = 1;
+            source.sources = {{"collection", std::filesystem::absolute(options.input).string()},
+                {"collection_metadata", collection}};
+            source.processing = {{"backend", "imported"}};
+            finalizeFiberletDatasetIdentity(source);
+            nlohmann::json runs = nlohmann::json::array();
+            for (const auto& line : lines) {
+                const auto sourceIndex = static_cast<std::size_t>(line.seed.coordinateZYX[1]);
+                runs.push_back({{"source_index", sourceIndex}, {"crop_run_id", line.seed.coordinateZYX[2]},
+                    {"filename", collection.at("point_collections").at(sourceIndex).value("filename", std::string{})}});
+            }
+            const nlohmann::json provenance = {{"tracer", "imported"}, {"quality_cost", "unavailable"},
+                {"serialized_cost_zero_is_sentinel", true}, {"family_labels_used", false},
+                {"coordinate_scale", 1}, {"source_fibers", fibers.size()}, {"runs", runs}};
+            writeFiberletCropTraceArtifact(options.output, source, normals.manifest().raw, options.trace, lines, provenance);
+            (void)visualize(lines, options.obj, options.directionDominance);
+            std::cout << "imported crop source_fibers=" << fibers.size() << " crop_runs=" << lines.size()
+                      << " output=" << options.output << '\n';
             return 0;
         }
 
@@ -10631,7 +11556,7 @@ int main(int argc, char** argv)
             std::optional<vc::lasagna::LasagnaDataset> fiberDataset;
             std::optional<vc::fiber_tracer::FiberPredictionField> predictions;
             std::optional<vc::fiber_tracer::FiberPredictionTraceScales> scales;
-            if (options.referenceReplayTracer == ReferenceReplayTracer::Greedy) {
+            if (isDenseReplay(options.referenceReplayTracer)) {
                 vc::lasagna::LasagnaDatasetOpenOptions fiberOptions;
                 fiberOptions.remoteCacheRoot = options.remoteCacheDirectory;
                 auto opened = vc::lasagna::LasagnaDataset::openLocation(
@@ -10652,6 +11577,15 @@ int main(int argc, char** argv)
             const vc::lasagna::LasagnaNormalSampler normals(
                 normalDataset);
 
+            std::vector<vc::fiber_tracer::PolylineArcGeometry> precomputed;
+            if (options.referenceReplayTracer == ReferenceReplayTracer::Precomputed) {
+                const auto collection = vc::fiber_tracer::readNativeVc3dFiberCollectionJson(options.candidateFibers);
+                const auto fibers = vc::fiber_tracer::parseNativeVc3dFiberCollection(collection, options.candidateFibers.string());
+                validateCollectionNormalSpace(collection, normalDataset.manifest());
+                for (const auto& fiber : fibers)
+                    precomputed.push_back(vc::fiber_tracer::makePolylineArcGeometry(fiber.linePoints));
+            }
+
             std::vector<vc::fiber_tracer::FiberReferenceReplayOutcome>
                 outcomes(cases.size());
             std::atomic<std::size_t> next{0};
@@ -10671,8 +11605,7 @@ int main(int argc, char** argv)
                             return;
                         try {
                             vc::fiber_tracer::FiberReplayTraceResult replay;
-                            if (options.referenceReplayTracer ==
-                                ReferenceReplayTracer::Greedy) {
+                            if (isDenseReplay(options.referenceReplayTracer)) {
                                 vc::fiber_tracer::FiberReplayTraceRequest request;
                                 request.fiber.linePointsXyzBase =
                                     cases[index].pointsBaseXYZ;
@@ -10694,6 +11627,10 @@ int main(int argc, char** argv)
                                 replay = vc::fiber_tracer::traceFiberReplay(
                                     *predictions, request, normals,
                                     scales->traceToBaseScale);
+                            } else if (options.referenceReplayTracer == ReferenceReplayTracer::Precomputed) {
+                                replay = vc::fiber_tracer::tracePrecomputedFiberReplay(precomputed,
+                                    cases[index].pointsBaseXYZ, normals, 1.0,
+                                    options.replayFailureThresholdBaseVoxels, options.replayMatchRefineSteps);
                             } else {
                                 vc::fiber_tracer::LasagnaReplayTraceRequest request;
                                 request.referencePointsBase =
@@ -10731,12 +11668,14 @@ int main(int argc, char** argv)
 
             const auto summary = vc::fiber_tracer::summarizeFiberReferenceReplay(
                 selection.fibers.size(), outcomes, *options.baseVoxelSizeUm);
-            const bool greedy = options.referenceReplayTracer ==
-                ReferenceReplayTracer::Greedy;
-            const double evaluationStepBase = greedy
+            const bool dense = isDenseReplay(options.referenceReplayTracer);
+            const bool fixed = options.referenceReplayTracer == ReferenceReplayTracer::Precomputed;
+            const double evaluationStepBase = fixed ? 8.0 : dense
                 ? options.directReplayTrace.stepVoxels * scales->traceToBaseScale
                 : options.lasagnaReplayStepBaseVoxels;
-            const std::string tracer = greedy ? "greedy" : "lasagna";
+            const std::string tracer = dense
+                ? (options.referenceReplayTracer == ReferenceReplayTracer::Beam ? "beam" : "greedy")
+                : fixed ? "precomputed" : "lasagna";
             const nlohmann::json commonConfig = {
                 {"error_threshold_base_voxels",
                  options.replayFailureThresholdBaseVoxels},
@@ -10745,12 +11684,12 @@ int main(int argc, char** argv)
                 {"minimum_reset_advance_base_voxels", evaluationStepBase},
                 {"stop_at_first_failure", false},
                 {"post_failure_policy", "native_step_reset"},
-                {"initialization", greedy
+                {"initialization", fixed ? "nearest_locally_aligned_candidate_projection" : dense
                     ? "exact_reference_endpoint_and_prediction"
                     : "exact_reference_endpoint_and_reference_tangent"},
             };
             nlohmann::json backendConfig;
-            if (greedy) {
+            if (dense) {
                 backendConfig = vc::fiber_tracer::cli::traceConfigJson(
                     options.directReplayTrace);
                 backendConfig["inference_scaledown_power"] =
@@ -10758,6 +11697,14 @@ int main(int argc, char** argv)
                 backendConfig["prediction_to_base"] =
                     scales->predictionToBaseScale;
                 backendConfig["trace_to_base"] = scales->traceToBaseScale;
+            } else if (fixed) {
+                backendConfig = {{"kind", "frozen_precomputed_polyline"}, {"step_base_voxels", 8.0},
+                    {"acquisition_angle_degrees", 25.0}, {"acquisition_distance", "existing_acceptance_ellipse"},
+                    {"selection", "nearest_euclidean_then_source_then_segment"},
+                    {"selection_inputs", "current_start_point_and_tangent_only"},
+                    {"emit_actual_projection", true}, {"emit_terminal_endpoint", true},
+                    {"candidate_switching", false}, {"warping", false}, {"coordinate_scale", 1},
+                    {"candidate_count", precomputed.size()}, {"max_step_factor", 3.0}};
             } else {
                 backendConfig = {
                     {"kind", "reference_tangent_normal_transport_control"},
@@ -10777,8 +11724,10 @@ int main(int argc, char** argv)
                 {"reference_fiber_tag", options.referenceFiberTag},
                 {"reference_files", std::move(sources)},
             };
-            if (greedy)
+            if (dense)
                 output["inputs"]["fiber_manifest"] = options.fiberManifest;
+            if (fixed)
+                output["inputs"]["candidate_fibers"] = options.candidateFibers.string();
             output["runtime"] = {
                 {"workers", workers},
                 {"wall_seconds", std::chrono::duration<double>(
@@ -10796,11 +11745,6 @@ int main(int argc, char** argv)
             return 0;
         }
 
-        auto dataset = vc::fiber_tracer::FiberletChunkDataset::openExisting(options.input);
-        if (dataset->metadata().kind != vc::fiber_tracer::FiberletDatasetKind::Combined) {
-            fail("input must be a combined Fiberlet dataset");
-        }
-
         vc::fiber_tracer::FiberletChunkCacheOptions cacheOptions;
         cacheOptions.service.decodedByteCapacity = options.cacheBytes;
         auto graphBudget = std::make_shared<vc::render::DecodedChunkCacheBudget>(
@@ -10808,11 +11752,90 @@ int main(int argc, char** argv)
         cacheOptions.service.decodedByteBudget = graphBudget;
         cacheOptions.service.fetchConcurrency.workerCapacity = static_cast<std::size_t>(options.threads);
         cacheOptions.service.fetchConcurrency.maxConcurrentReads = static_cast<std::size_t>(options.threads);
+        std::unique_ptr<vc::core::util::ExclusiveDirectoryLock> generationLock;
+        std::shared_ptr<vc::fiber_tracer::FiberletOnDemandPreprocessor> generation;
+        struct GenerationShutdown {
+            std::shared_ptr<vc::fiber_tracer::FiberletOnDemandPreprocessor>& value;
+            ~GenerationShutdown() {
+                if (value) {
+                    try { value->shutdown(); }
+                    catch (const std::exception& error) {
+                        std::cerr << "Fiberlet generation shutdown: " << error.what() << '\n';
+                    }
+                }
+            }
+        } generationShutdown{generation};
+        std::shared_ptr<vc::fiber_tracer::FiberletChunkDataset> dataset;
+        if (options.fiberletCacheRoot.empty()) {
+            dataset = vc::fiber_tracer::FiberletChunkDataset::openExisting(options.input);
+        } else {
+            using namespace vc::fiber_tracer;
+            vc::lasagna::LasagnaDatasetOpenOptions predictionOptions;
+            predictionOptions.remoteCacheRoot = options.remoteCacheDirectory;
+            const auto predictions = vc::lasagna::LasagnaDataset::openLocation(
+                options.fiberManifest, predictionOptions);
+            auto field = std::make_shared<FiberPredictionField>(
+                predictions, FiberPredictionFieldBindingMode::CanonicalStoredGrid);
+            const auto grid = field->storedGridInfo();
+            auto normalOptions = predictionOptions;
+            normalOptions.workingToBaseScale = grid.predictionToBaseScale;
+            const auto normals = vc::lasagna::LasagnaDataset::openLocation(
+                options.normalManifest, normalOptions);
+            const auto sources = makeFiberletSourceIdentity(
+                predictions.manifest().manifestPath, normals.manifest().manifestPath);
+            const FiberAnchorConfig anchors;
+            const FiberletPathConfig paths;
+            const FiberletGeometryCacheProfile profile{
+                .geometry = {.positionQuantumBaseVoxels = 0.0, .compactDirections = true},
+                .compatibilityCostTagBits = 16,
+                .storageChunkSideBaseVoxels = options.fiberletStorageChunkSide};
+            const auto anchorMetadata = makeFiberletDatasetMetadata(
+                FiberletDatasetKind::Anchors, grid, anchors, paths,
+                options.fiberletStorageChunkSide, sources);
+            const auto fiberletMetadata = makeFiberletDatasetMetadata(
+                FiberletDatasetKind::Fiberlets, grid, anchors, paths,
+                options.fiberletStorageChunkSide, sources, {}, 0.0, profile,
+                FiberletStorageProfile::CompactDirectionsFixedCost);
+            std::ostringstream fingerprint;
+            for (const auto byte : fiberletMetadata.datasetFingerprint)
+                fingerprint << std::hex << std::setfill('0') << std::setw(2)
+                            << static_cast<unsigned>(byte);
+            const auto root = options.fiberletCacheRoot / fingerprint.str();
+            generationLock = std::make_unique<vc::core::util::ExclusiveDirectoryLock>(root);
+            auto config = makeCanonicalFiberletOnDemandConfig(
+                root / "anchors.zarr", root / "fiberlets.zarr",
+                anchorMetadata, fiberletMetadata, grid, anchors, paths,
+                [field](const auto& indices, int threads, auto& samples) {
+                    field->sampleStoredGridBatch(indices, threads, samples);
+                }, std::make_shared<vc::lasagna::LasagnaNormalSampler>(normals), cacheOptions);
+            config.progress = [](const FiberletOnDemandProgress& event) {
+                if (event.status == "completed")
+                    std::osyncstream(std::cout) << "fiberlet-preprocess stage=" << event.stage
+                        << " key=" << event.key.iz << '/' << event.key.iy << '/' << event.key.ix
+                        << " seconds=" << event.elapsedSeconds << " outputs=" << event.outputCount
+                        << '\n' << std::flush;
+            };
+            generation = FiberletOnDemandPreprocessor::create(std::move(config));
+            dataset = generation->fiberletDataset();
+            std::cout << "fiberlet generation cache=" << dataset->root()
+                      << " identity=" << fingerprint.str() << '\n' << std::flush;
+        }
+        if (!generation && dataset->metadata().kind != vc::fiber_tracer::FiberletDatasetKind::Combined)
+            fail("input must be a combined Fiberlet dataset");
         std::shared_ptr<TransientCropFilter> transientFilter;
         std::unique_ptr<vc::fiber_tracer::FiberletStoredReplayGraphSource> graph;
         nlohmann::json filterProvenance;
         if (options.filterStages.empty()) {
-            graph = std::make_unique<
+            if (generation) {
+                graph = std::make_unique<vc::fiber_tracer::FiberletStoredReplayGraphSource>(
+                    generation->anchorDataset(), generation->anchorCache(),
+                    generation->fiberletDataset(), generation->fiberletCache(),
+                    vc::fiber_tracer::fiberletPathConfigFromDatasetMetadata(
+                        dataset->metadata(), options.threads), 45.0F,
+                    [generation](const auto& key, auto payload) {
+                        return generation->evaluationAnchorChunk(key, std::move(payload));
+                    });
+            } else graph = std::make_unique<
                 vc::fiber_tracer::FiberletStoredReplayGraphSource>(
                 dataset, cacheOptions);
         } else {
@@ -10986,6 +12009,93 @@ int main(int argc, char** argv)
         vc::fiber_tracer::validateFiberletNormalDatasetCompatibility(dataset->metadata(), normalDataset);
         const vc::lasagna::LasagnaNormalSampler normals(normalDataset);
 
+        if (options.denseBeamCrop) {
+            using namespace vc::fiber_tracer;
+            vc::lasagna::LasagnaDatasetOpenOptions fiberOptions;
+            fiberOptions.remoteCacheRoot = options.remoteCacheDirectory;
+            const auto opened = vc::lasagna::LasagnaDataset::openLocation(options.fiberManifest, fiberOptions);
+            const auto scales = resolveFiberPredictionTraceScales(opened.manifest(), options.inferenceScaledownPower);
+            auto manifest = opened.manifest();
+            manifest.workingToBaseScale = scales.traceToBaseScale;
+            const vc::lasagna::LasagnaDataset traceDataset(std::move(manifest));
+            const FiberPredictionField predictions(traceDataset);
+            auto denseNormalOptions = normalOptions;
+            denseNormalOptions.workingToBaseScale = scales.traceToBaseScale;
+            const auto denseNormalDataset = vc::lasagna::LasagnaDataset::openLocation(options.normalManifest, denseNormalOptions);
+            const vc::lasagna::LasagnaNormalSampler denseNormals(denseNormalDataset);
+            auto denseConfig = options.directReplayTrace;
+            denseConfig.traceToBaseScale = scales.traceToBaseScale;
+            auto anchors = graph->anchorsInBaseBox(options.trace.minimumBaseXYZ, options.trace.maximumBaseXYZ);
+            std::cout << "dense beam crop anchors=" << anchors.size() << " fiberlet_paths=0\n" << std::flush;
+            const auto result = traceDenseBeamCrop(predictions, std::move(anchors),
+                dataset->metadata().predictionToBaseScale, denseNormals, denseConfig, options.trace,
+                [](const auto& current, std::size_t remaining) {
+                    std::osyncstream(std::cout) << "dense beam crop attempted=" << current.attemptedAnchors
+                        << " accepted=" << current.lines.size() << " remaining=" << remaining << '\n' << std::flush;
+                });
+            const nlohmann::json provenance = {
+                {"tracer", "dense_beam"}, {"seeding", "canonical_prediction_anchors_no_gt"},
+                {"dense_config", vc::fiber_tracer::cli::traceConfigJson(denseConfig)},
+                {"beam_width", denseConfig.beamWidth}, {"lookahead_steps", denseConfig.beamLookaheadSteps},
+                {"step_trace_voxels", denseConfig.stepVoxels}, {"cone_degrees", denseConfig.coneAngleDegrees},
+                {"trace_to_base_scale", denseConfig.traceToBaseScale},
+                {"quality_cost", "production_beam_loss_per_prediction_voxel_not_fiberlet_calibrated"},
+                {"graph_ambiguity", "not_applicable"}, {"fiberlet_paths_generated", 0}};
+            double retainedLengthBase = 0.0;
+            for (const auto& line : result.lines)
+                retainedLengthBase += line.pathLengthPredictionVoxels * dataset->metadata().predictionToBaseScale;
+            const nlohmann::json summary = {
+                {"reverse_attempts", result.reverseAttempts},
+                {"reverse_failures", result.reverseFailures},
+                {"reverse_skipped_length_base", result.reverseSkippedLengthBaseVoxels},
+                {"retained_length_base", retainedLengthBase},
+                {"attempted_anchors", result.attemptedAnchors},
+                {"computed_candidates", result.computedCandidates},
+                {"discarded_candidates", result.discardedCandidates},
+                {"candidate_batch_seconds", result.candidateBatchSeconds},
+                {"candidate_task_seconds", result.candidateTaskSeconds}};
+            writeFiberletCropTraceArtifact(options.output, dataset->metadata(), normalDataset.manifest().raw,
+                options.trace, result.lines, provenance, summary);
+            if (options.trace.captureStepCosts) {
+                const auto previous = readFiberletCropTraceArtifact(options.traceCostReference);
+                if (previous.lines.size() != result.lines.size())
+                    throw std::runtime_error("Cost audit trace count differs from saved artifact");
+                for (std::size_t i = 0; i < result.lines.size(); ++i) {
+                    const auto& a = result.lines[i];
+                    const auto& b = previous.lines[i];
+                    if (a.pointsBaseXYZ != b.pointsBaseXYZ || a.totalMetricCost != b.totalMetricCost ||
+                        a.pathLengthPredictionVoxels != b.pathLengthPredictionVoxels)
+                        throw std::runtime_error("Cost audit geometry/order/aggregate mismatch at trace " + std::to_string(i));
+                    if (a.segmentMetricCosts.size() + 1 != a.pointsBaseXYZ.size() ||
+                        a.segmentOriginalStepCosts.size() != a.segmentMetricCosts.size())
+                        throw std::runtime_error("Cost audit segment count mismatch");
+                }
+                const auto csv = options.output.parent_path() / (options.output.stem().string() + "_step_costs.csv");
+                std::ofstream out(csv);
+                out << std::setprecision(17)
+                    << "trace,segment,begin_arc_base,end_arc_base,cost,original_step_cost,total_trace_cost,prediction_scale\n";
+                for (std::size_t i = 0; i < result.lines.size(); ++i) {
+                    const auto& line = result.lines[i];
+                    double arc = 0.0;
+                    for (std::size_t j = 0; j < line.segmentMetricCosts.size(); ++j) {
+                        const double end = arc + cv::norm(line.pointsBaseXYZ[j + 1] - line.pointsBaseXYZ[j]);
+                        out << i << ',' << j << ',' << arc << ',' << end << ','
+                            << line.segmentMetricCosts[j] << ',' << line.segmentOriginalStepCosts[j] << ','
+                            << line.totalMetricCost << ',' << dataset->metadata().predictionToBaseScale << '\n';
+                        arc = end;
+                    }
+                }
+                out.close();
+                if (!out) throw std::runtime_error("Cost audit CSV write failed");
+                std::cout << "cost audit exact_geometry_and_totals=1 traces=" << result.lines.size()
+                    << " csv=" << csv << '\n';
+            }
+            const auto visualization = visualize(result.lines, options.obj, options.directionDominance);
+            std::cout << "dense beam crop completed traces=" << result.lines.size() << " output=" << options.output << '\n';
+            std::cout << "dense beam crop summary " << summary.dump() << '\n';
+            return 0;
+        }
+
         vc::fiber_tracer::FiberletGraphMaterializationDiagnostics
             graphDiagnostics;
         const auto normalChunkCache =
@@ -11131,12 +12241,18 @@ int main(int argc, char** argv)
                 summary, outcomes, "fiberlet", commonConfig, backendConfig,
                 options.trace.minimumBaseXYZ, options.trace.maximumBaseXYZ);
             output["inputs"] = {
-                {"fiberlet_dataset", options.input.string()},
+                {"fiberlet_dataset", dataset->root().string()},
                 {"normal_manifest", options.normalManifest},
                 {"reference_fiber_directory", options.referenceFiberDirectory.string()},
                 {"reference_fiber_tag", options.referenceFiberTag},
                 {"reference_files", std::move(sources)},
             };
+            if (generation) {
+                output["inputs"]["fiber_manifest"] = options.fiberManifest;
+                output["inputs"]["anchor_dataset"] = generation->anchorDataset()->root().string();
+                output["inputs"]["fiberlet_processing"] = dataset->metadata().processing;
+                output["inputs"]["fiberlet_sources"] = dataset->metadata().sources;
+            }
             output["runtime"] = {
                 {"workers", workers},
                 {"wall_seconds", std::chrono::duration<double>(std::chrono::steady_clock::now() - benchmarkStarted).count()},

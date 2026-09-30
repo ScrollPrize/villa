@@ -1,0 +1,168 @@
+{
+  "output_root": "/ephemeral/hendrik/fiber_crop_bench/20260927_step_tuning_refine_v1",
+  "local_cost_sweep": {
+    "template": "/home/hendrik/villa2/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/crop_benchmark_local_events_local-parallel_20260927.json",
+    "workers": 4,
+    "threads": 48,
+    "points": [
+      {
+        "parallel": true,
+        "defect": 100,
+        "cut": 1,
+        "fixed_orientation": true,
+        "distance_cost": true,
+        "screen_only": true,
+        "variant": "mixed10",
+        "options": {
+          "--bp-mixed-cost": 10
+        }
+      },
+      {
+        "parallel": true,
+        "defect": 100,
+        "cut": 1,
+        "fixed_orientation": true,
+        "distance_cost": true,
+        "screen_only": true,
+        "variant": "finite-prepass",
+        "options": {
+          "--split-continuity": "finite"
+        }
+      },
+      {
+        "parallel": true,
+        "defect": 100,
+        "cut": 1,
+        "fixed_orientation": true,
+        "distance_cost": true,
+        "screen_only": true,
+        "variant": "p0",
+        "options": {
+          "--winding-weights": "0,0,0.1,0.1,0"
+        }
+      },
+      {
+        "parallel": true,
+        "defect": 100,
+        "cut": 1,
+        "fixed_orientation": true,
+        "distance_cost": true,
+        "screen_only": true,
+        "variant": "p1x10",
+        "options": {
+          "--winding-weights": "0,0,0,1,0"
+        }
+      },
+      {
+        "parallel": true,
+        "defect": 100,
+        "cut": 1,
+        "fixed_orientation": true,
+        "distance_cost": true,
+        "screen_only": true,
+        "variant": "temp005",
+        "options": {
+          "--winding-temperature": 0.05
+        }
+      },
+      {
+        "parallel": true,
+        "defect": 100,
+        "cut": 1,
+        "fixed_orientation": true,
+        "distance_cost": true,
+        "screen_only": true,
+        "variant": "mass-ordinary",
+        "options": {
+          "--continuity-defect-mass": "ordinary"
+        }
+      },
+      {
+        "parallel": true,
+        "defect": 100,
+        "cut": 1,
+        "fixed_orientation": true,
+        "distance_cost": true,
+        "screen_only": true,
+        "variant": "mass-winding-ordinary",
+        "options": {
+          "--continuity-defect-mass": "winding-ordinary"
+        }
+      },
+      {
+        "parallel": true,
+        "defect": 100,
+        "cut": 1,
+        "fixed_orientation": true,
+        "distance_cost": true,
+        "screen_only": true,
+        "variant": "mass-prepass-ordinary",
+        "options": {
+          "--continuity-defect-mass": "prepass-ordinary"
+        }
+      },
+      {
+        "parallel": true,
+        "defect": 1,
+        "cut": 0.1,
+        "fixed_orientation": true,
+        "distance_cost": true,
+        "screen_only": true
+      },
+      {
+        "parallel": true,
+        "defect": 1,
+        "cut": 1,
+        "fixed_orientation": true,
+        "distance_cost": true,
+        "screen_only": true
+      },
+      {
+        "parallel": true,
+        "defect": 1,
+        "cut": 10,
+        "fixed_orientation": true,
+        "distance_cost": true,
+        "screen_only": true
+      },
+      {
+        "parallel": true,
+        "defect": 10,
+        "cut": 0.1,
+        "fixed_orientation": true,
+        "distance_cost": true,
+        "screen_only": true
+      },
+      {
+        "parallel": true,
+        "defect": 10,
+        "cut": 1,
+        "fixed_orientation": true,
+        "distance_cost": true,
+        "screen_only": true
+      },
+      {
+        "parallel": true,
+        "defect": 10,
+        "cut": 10,
+        "fixed_orientation": true,
+        "distance_cost": true,
+        "screen_only": true
+      },
+      {
+        "parallel": true,
+        "defect": 10,
+        "cut": 1,
+        "distance_cost": true,
+        "screen_only": true
+      },
+      {
+        "parallel": true,
+        "defect": 100,
+        "cut": 1,
+        "distance_cost": true,
+        "screen_only": true
+      }
+    ]
+  }
+}

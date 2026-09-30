@@ -4271,7 +4271,8 @@ FiberTraceOneWayResult traceFiberExtrapolation(
     double distanceVoxels,
     const FiberTraceConfig& config,
     const vc::lasagna::NormalSampler* normalSampler,
-    const FiberTraceProgressCallback& progress)
+    const FiberTraceProgressCallback& progress,
+    const std::function<bool(const cv::Vec3d&, double, int)>& committedStep)
 {
     if (!finitePoint(startPoint) || !finitePoint(outwardDirection)) {
         throw std::invalid_argument("fiber extrapolation request contains a non-finite point or direction");
@@ -4294,7 +4295,8 @@ FiberTraceOneWayResult traceFiberExtrapolation(
     // to "reach", so the span-bounded endpoint threshold of traceFiberSegment
     // deliberately does not apply.
     request.config = config;
-    return traceOneWayCore(predictions, request, normalSampler, progress, "extrapolation", distanceVoxels);
+    return traceOneWayCore(predictions, request, normalSampler, progress, "extrapolation", distanceVoxels,
+        std::nullopt, committedStep);
 }
 
 double effectiveEndpointAcceptThresholdBaseVoxels(const FiberTraceConfig& config,

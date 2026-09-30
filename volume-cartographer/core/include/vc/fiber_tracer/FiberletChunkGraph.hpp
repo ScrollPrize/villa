@@ -233,7 +233,8 @@ public:
         std::shared_ptr<FiberletChunkDataset> fiberletDataset,
         std::shared_ptr<vc::render::ChunkCache> fiberletCache,
         FiberletPathConfig pathConfig,
-        float maximumJoinAngleDegrees = 45.0F);
+        float maximumJoinAngleDegrees = 45.0F,
+        FiberletAnchorView anchorView = {});
 
     [[nodiscard]] bool supportsConcurrentQueries() const noexcept override { return false; }
     [[nodiscard]] float predictionToBaseScale() const noexcept override;

@@ -581,6 +581,8 @@ def test_global_loss_statistics_match_single_batch_value_and_ddp_gradient(monkey
                 "positive_embedding",
                 "negative_embedding",
                 "contrastive_embedding",
+                "short_embedding",
+                "long_embedding",
             )
             for item in (
                 {
@@ -594,6 +596,8 @@ def test_global_loss_statistics_match_single_batch_value_and_ddp_gradient(monkey
                     "positive_embedding": (torch.tensor(0.0), torch.tensor(0.0)),
                     "negative_embedding": (torch.tensor(0.0), torch.tensor(0.0)),
                     "contrastive_embedding": (torch.tensor(0.0), torch.tensor(0.0)),
+                    "short_embedding": (torch.tensor(0.0), torch.tensor(0.0)),
+                    "long_embedding": (torch.tensor(0.0), torch.tensor(0.0)),
                 }[name]
             )
         ]

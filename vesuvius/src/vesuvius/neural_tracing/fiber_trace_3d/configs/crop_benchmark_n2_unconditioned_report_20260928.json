@@ -1,0 +1,22 @@
+{
+  "neighborhood_readout_report": {
+    "output": "/ephemeral/hendrik/fiber_crop_bench/20260928_n2_unconditioned_v1/summary.json",
+    "runs": [
+      {
+        "name": "n2-d3-c10",
+        "prefix": "/ephemeral/hendrik/fiber_crop_bench/20260928_n2_unconditioned_v1/n2-d3-c10",
+        "conditioned": "/ephemeral/hendrik/fiber_crop_bench/20260928_reference_neighborhood_v1/n2-d3-c10_reference_neighborhood.json"
+      },
+      {
+        "name": "n2-d10-c3",
+        "prefix": "/ephemeral/hendrik/fiber_crop_bench/20260928_n2_unconditioned_v1/n2-d10-c3",
+        "conditioned": "/ephemeral/hendrik/fiber_crop_bench/20260928_reference_neighborhood_v1/n2-d10-c3_reference_neighborhood.json"
+      },
+      {
+        "name": "n2-d10-c10",
+        "prefix": "/ephemeral/hendrik/fiber_crop_bench/20260928_n2_unconditioned_v1/n2-d10-c10",
+        "conditioned": "/ephemeral/hendrik/fiber_crop_bench/20260928_reference_neighborhood_v1/n2-d10-c10_reference_neighborhood.json"
+      }
+    ]
+  }
+}

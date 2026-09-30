@@ -1,0 +1,7 @@
+{
+  "output_root": "/ephemeral/hendrik/fiber_crop_bench/20260927_local_step_costs_v1",
+  "local_cost_sweep": {
+    "report_only": true,
+    "report_destination": "volume-cartographer/docs/fiber_benchmark_runs/2026-09-27-local-step-costs"
+  }
+}

@@ -2378,6 +2378,54 @@ TEST_CASE("Fiberlet chunk route analysis finds exact simple entry-to-exit optima
     std::filesystem::remove_all(root);
 }
 
+TEST_CASE("Stored crop graph accepts canonical intermediate anchors with evaluation view")
+{
+    std::mt19937_64 random(std::random_device{}());
+    const auto root = std::filesystem::temp_directory_path() /
+        ("vc_fiberlet_crop_view_" + std::to_string(random()));
+    FiberletDatasetMetadata anchorMetadata;
+    anchorMetadata.kind = FiberletDatasetKind::Anchors;
+    anchorMetadata.profile = FiberletStorageProfile::Float32Cache;
+    anchorMetadata.chunkGridShapeZYX = {1,1,1};
+    anchorMetadata.coordinateUnitsPerChunkZYX = {4,4,4};
+    anchorMetadata.maximumEndpointReachCoordinateUnitsZYX = {4,4,4};
+    anchorMetadata.spatialChunkSideBaseVoxels = 16;
+    anchorMetadata.predictionToBaseScale = 1;
+    finalizeFiberletDatasetIdentity(anchorMetadata);
+    auto pathMetadata = anchorMetadata;
+    pathMetadata.kind = FiberletDatasetKind::Fiberlets;
+    pathMetadata.profile = FiberletStorageProfile::CompactDirectionsFixedCost;
+    pathMetadata.costBits = 16;
+    finalizeFiberletDatasetIdentity(pathMetadata);
+    auto anchors = FiberletChunkDataset::createOrOpen(root / "anchors", anchorMetadata);
+    auto paths = FiberletChunkDataset::createOrOpen(root / "paths", pathMetadata);
+    const vc::render::ChunkKey owner{0,0,0,0};
+    const FiberletStoredAnchor anchor{key(1,1,1), {4,4,4}, {1,0,0}};
+    anchors->publishChunk(FiberletStorageChunkKind::Anchors, owner,
+        serializeFiberletAnchors(anchors->codecConfig(FiberletStorageChunkKind::Anchors, owner),
+            std::array{anchor}));
+    auto anchorCache = createStoredFiberletAnchorChunkCache(anchors);
+    auto pathCache = createStoredFiberletPathChunkCache(paths);
+    CHECK_THROWS_AS(FiberletStoredReplayGraphSource(
+        anchors, anchorCache, paths, pathCache, FiberletPathConfig{}), std::invalid_argument);
+    size_t views = 0;
+    FiberletStoredReplayGraphSource graph(anchors, anchorCache, paths, pathCache,
+        FiberletPathConfig{}, 45.0F,
+        [&](const auto&, auto payload) {
+            ++views;
+            auto evaluated = std::make_shared<std::vector<FiberletStoredAnchor>>(payload->anchors);
+            for (auto& value : *evaluated) value.fittedAxisXYZ = {0,1,0};
+            return evaluated;
+        });
+    const auto selected = graph.anchorsInBaseBox({0,0,0}, {16,16,16});
+    REQUIRE(selected.size() == 1);
+    CHECK(selected.front().fittedAxisXYZ == cv::Vec3f(0,1,0));
+    CHECK(views > 0);
+    pathCache->cancelPendingAndWait();
+    anchorCache->cancelPendingAndWait();
+    std::filesystem::remove_all(root);
+}
+
 TEST_CASE("Fiberlet sparse overlays fall through and enforce monotone records")
 {
     std::mt19937_64 random(std::random_device{}());

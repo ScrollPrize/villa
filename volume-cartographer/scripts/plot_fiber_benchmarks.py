@@ -215,6 +215,9 @@ def load_plot_data(path: Path) -> tuple[dict[str, Any], dict[str, list[PlotPoint
         "pre_pruning_reference": REFERENCE_EXACT_METRIC,
     }
     parsed: dict[str, list[PlotPoint]] = {}
+    # Keep reproduction evidence in the data while avoiding duplicate
+    # algorithm milestones. Publishers preserve this document-level policy.
+    excluded = document.get("plot_excluded_measurements", {})
     for name, metric in expected.items():
         benchmark = raw_benchmarks.get(name, {})
         if benchmark.get("metric") != metric:
@@ -225,6 +228,7 @@ def load_plot_data(path: Path) -> tuple[dict[str, Any], dict[str, list[PlotPoint
         points = [
             _score_point(project_root, metric, point, label_suffix)
             for point in benchmark.get("points", [])
+            if point.get("measurement_id") not in excluded
         ]
         if not points:
             raise ValueError(f"{name}: no plot points")
@@ -369,7 +373,7 @@ def render_plot(
             linewidth=linewidth,
             zorder=3,
             label=(
-                point.plot_label
+                f"{point.plot_label}: {point.score_percent:.2f}%"
                 if point.measured
                 else f"{point.plot_label} (assumed floor)"
             ),

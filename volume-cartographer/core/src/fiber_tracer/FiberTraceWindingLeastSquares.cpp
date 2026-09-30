@@ -102,9 +102,9 @@ PairCoefficients pairCoefficients(
         return result;
 
     result.parallelOrientation = checkedSqrt(
-        measurement.parallel, "Ceres parallel orientation coefficient");
+        measurement.evidenceWeight * measurement.parallel, "Ceres parallel orientation coefficient");
     result.perpendicularOrientation = checkedSqrt(
-        measurement.perpendicular,
+        measurement.evidenceWeight * measurement.perpendicular,
         "Ceres perpendicular orientation coefficient");
     const double parallelWeight = measurement.parallelMagnitudePresent
         ? measurement.parallelMultiplier * measurement.parallelConfidence
@@ -165,7 +165,7 @@ PairCoefficients pairCoefficients(
 FiberTraceWindingLeastSquaresCostSummary evaluateCosts(
     const FiberTracePreparedWindingModel& model,
     std::span<const FiberTraceWindingLeastSquaresState> states,
-    std::span<const std::size_t> incident,
+    std::span<const double> incident,
     const FiberTraceWindingLeastSquaresConfig& config)
 {
     FiberTraceWindingLeastSquaresCostSummary result;

@@ -1,0 +1,114 @@
+{
+  "output_root": "/ephemeral/hendrik/fiber_crop_bench/20260927_step_tuning_repair_v1",
+  "local_cost_sweep": {
+    "template": "/home/hendrik/villa2/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/crop_benchmark_local_events_local-parallel_20260927.json",
+    "workers": 4,
+    "threads": 48,
+    "points": [
+      {
+        "parallel": true,
+        "defect": 100,
+        "cut": 1,
+        "fixed_orientation": true,
+        "distance_cost": true,
+        "screen_only": true
+      },
+      {
+        "parallel": true,
+        "defect": 10,
+        "cut": 1,
+        "fixed_orientation": true,
+        "distance_cost": true,
+        "screen_only": true,
+        "variant": "repair5",
+        "options": {
+          "--winding-decode-repair": 5
+        }
+      },
+      {
+        "parallel": true,
+        "defect": 10,
+        "cut": 10,
+        "fixed_orientation": true,
+        "distance_cost": true,
+        "screen_only": true,
+        "variant": "repair5",
+        "options": {
+          "--winding-decode-repair": 5
+        }
+      },
+      {
+        "parallel": true,
+        "defect": 100,
+        "cut": 1,
+        "fixed_orientation": true,
+        "distance_cost": true,
+        "screen_only": true,
+        "variant": "repair5",
+        "options": {
+          "--winding-decode-repair": 5
+        }
+      },
+      {
+        "parallel": true,
+        "defect": 100,
+        "cut": 10,
+        "fixed_orientation": true,
+        "distance_cost": true,
+        "screen_only": true,
+        "variant": "repair5",
+        "options": {
+          "--winding-decode-repair": 5
+        }
+      },
+      {
+        "parallel": true,
+        "defect": 10,
+        "cut": 1,
+        "fixed_orientation": false,
+        "distance_cost": true,
+        "screen_only": true,
+        "variant": "repair5",
+        "options": {
+          "--winding-decode-repair": 5
+        }
+      },
+      {
+        "parallel": true,
+        "defect": 10,
+        "cut": 10,
+        "fixed_orientation": false,
+        "distance_cost": true,
+        "screen_only": true,
+        "variant": "repair5",
+        "options": {
+          "--winding-decode-repair": 5
+        }
+      },
+      {
+        "parallel": true,
+        "defect": 100,
+        "cut": 1,
+        "fixed_orientation": false,
+        "distance_cost": true,
+        "screen_only": true,
+        "variant": "repair5",
+        "options": {
+          "--winding-decode-repair": 5
+        }
+      },
+      {
+        "parallel": true,
+        "defect": 100,
+        "cut": 10,
+        "fixed_orientation": false,
+        "distance_cost": true,
+        "screen_only": true,
+        "variant": "repair5",
+        "options": {
+          "--winding-decode-repair": 5
+        }
+      }
+    ]
+  }
+}

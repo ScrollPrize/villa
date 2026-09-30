@@ -3,6 +3,22 @@
 #include <limits>
 #include <stdexcept>
 namespace vc::fiber_tracer {
+nlohmann::json makeFiberletSourceIdentity(
+    const std::filesystem::path& fiberManifest,
+    const std::filesystem::path& normalManifest,
+    nlohmann::json sources)
+{
+    if (sources.empty())
+        sources = {{"source_volume", {{"identity", "manifest_hashes_only"}}},
+                   {"fiber_prediction", nlohmann::json::object()},
+                   {"normal_prediction", nlohmann::json::object()}};
+    for (const auto* key : {"source_volume", "fiber_prediction", "normal_prediction"})
+        if (!sources.contains(key) || !sources.at(key).is_object())
+            throw std::invalid_argument(std::string("fiberlet source identity requires object: ") + key);
+    sources["fiber_prediction"]["manifest_content_hash"] = fiberletContentHash(fiberManifest);
+    sources["normal_prediction"]["manifest_content_hash"] = fiberletContentHash(normalManifest);
+    return sources;
+}
 FiberletDatasetMetadata makeFiberletDatasetMetadata(
     FiberletDatasetKind kind, const FiberPredictionGridInfo& grid,
     const FiberAnchorConfig& anchors, const FiberletPathConfig& paths,
@@ -150,5 +166,32 @@ void configureCanonicalFiberletGeneration(FiberletOnDemandConfig& config) {
     config.anchorCellPredicate = [](const std::array<std::size_t, 3>&) { return true; };
     config.anchorRetainPredicate = [](const FiberAnchor&) { return FiberAnchorRetainEvaluation{true, {}, {}}; };
     config.pointPredicate = [](const cv::Vec3d&) { return true; };
+}
+FiberletOnDemandConfig makeCanonicalFiberletOnDemandConfig(
+    const std::filesystem::path& anchorRoot,
+    const std::filesystem::path& fiberletRoot,
+    const FiberletDatasetMetadata& anchorMetadata,
+    const FiberletDatasetMetadata& fiberletMetadata,
+    const FiberPredictionGridInfo& grid,
+    const FiberAnchorConfig& anchors,
+    const FiberletPathConfig& paths,
+    FiberStoredPredictionBatchSampler predictionSampler,
+    std::shared_ptr<const vc::lasagna::NormalSampler> normalSampler,
+    const FiberletChunkCacheOptions& cacheOptions)
+{
+    FiberletOnDemandConfig config;
+    config.anchorRoot = anchorRoot;
+    config.fiberletRoot = fiberletRoot;
+    config.anchorMetadata = anchorMetadata;
+    config.fiberletMetadata = fiberletMetadata;
+    config.grid = grid;
+    config.anchorConfig = anchors;
+    config.pathConfig = paths;
+    configureCanonicalFiberletGeneration(config);
+    config.predictionSampler = std::move(predictionSampler);
+    config.normalSampler = std::move(normalSampler);
+    config.anchorCacheOptions = cacheOptions;
+    config.fiberletCacheOptions = cacheOptions;
+    return config;
 }
 }
