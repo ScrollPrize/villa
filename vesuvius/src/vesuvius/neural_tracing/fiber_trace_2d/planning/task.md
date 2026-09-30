@@ -13,7 +13,7 @@ physical GPUs 0-5; GPUs 6 and 7 are reserved for other work.
 Continue the stopped Gaussian run from its latest optimizer checkpoint with
 half the previous distribution sigma (normal sigma 1 voxel, in-sheet sigma 4
 voxels), retaining the 4:1 anisotropy and all refined-fiber state. Run this
-continuation on physical GPUs 0-6.
+continuation on physical GPUs 0-5; GPUs 6-7 remain reserved.
 
 Also allow online refinement to rotate the anisotropic distribution around the
 local fiber tangent. Keep rotation updates small and weakly tether the refined

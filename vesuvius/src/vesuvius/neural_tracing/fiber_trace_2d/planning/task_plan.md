@@ -37,7 +37,8 @@
 8. Stop the initial run cleanly, then resume its latest full checkpoint with
    thickness sigma halved from 2 to 1 voxel (and therefore width sigma from 8
    to 4 voxels). Give the continuation a distinct run name, request physical
-   GPUs 0-6, and verify restored update/optimizer/refinement state and progress.
+   GPUs 0-5, leaving physical GPUs 6-7 reserved, and verify restored
+   update/optimizer/refinement state and progress.
 9. Represent distribution orientation as a sign-invariant rotation around the
    local fiber tangent, relative to the native Lasagna normal sampled at the
    immutable baseline material position. Persist `(cos(2 theta), sin(2 theta))`

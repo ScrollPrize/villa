@@ -303,7 +303,7 @@
   },
   "production": {
     "config": "/home/hendrik/villa/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/train_5scroll_json_eligible_fullres_refinement_ema_16x8.json",
-    "cuda_visible_devices": "0,1,2,3,4,5,6"
+    "cuda_visible_devices": "0,1,2,3,4,5"
   },
   "trace_series": {
     "launch": "/ephemeral/hendrik/fiber3d_train2/runs/.launches/finetune_5scroll_s1a_128_sd1_16x8_ema_lr0001-20260912_223739",

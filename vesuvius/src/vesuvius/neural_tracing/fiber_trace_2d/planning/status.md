@@ -1,8 +1,9 @@
 # Status: anisotropic Gaussian fiber-presence supervision
-The first managed half-sigma launch restored update 18,000 and GPUs 0-6 but
-failed in the initial test because a partial final evaluation wave violated DDP
-forward parity. The scheduler now pads only execution (not metrics/refinement)
-on empty ranks; focused regression tests pass. Relaunch verification is pending.
+The first managed half-sigma launch restored update 18,000 but incorrectly used
+GPUs 0-6 and failed in the initial test because a partial final evaluation wave
+violated DDP forward parity. The scheduler now pads only execution (not
+metrics/refinement) on empty ranks; focused regression tests pass. Relaunch
+verification is pending.
 - [x] Preserve pre-task dirty source changes in focused commits.
 - [x] Inspect current target, loss, native-normal, refinement, and checkpoint paths.
 - [x] Write task and implementation plan.
@@ -18,4 +19,4 @@ on empty ranks; focused regression tests pass. Relaunch verification is pending.
 - [x] Stop the sigma-2 run cleanly at the user's request.
 - [x] Implement persistent bounded Gaussian-orientation refinement.
 - [x] Validate orientation refinement and legacy archive compatibility.
-- [ ] Resume from its latest full checkpoint with half sigma on GPUs 0-6.
+- [ ] Resume from its latest full checkpoint with half sigma on GPUs 0-5.

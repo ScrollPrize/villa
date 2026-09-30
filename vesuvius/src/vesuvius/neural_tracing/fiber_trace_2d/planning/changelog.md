@@ -3121,4 +3121,5 @@ identity remains unconfirmed. Global-assignment experiments not yet implemented.
   a capped angular update, and a weak tether to the immutable Lasagna normal;
   legacy geometry-only refinement archives migrate to zero rotation.
 - Prepared the stopped full-resolution Gaussian run to resume from its update
-  18,000 full checkpoint with half-width sigmas and managed GPUs 0-6.
+  18,000 full checkpoint with half-width sigmas and managed GPUs 0-5, leaving
+  GPUs 6-7 reserved.
