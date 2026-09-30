@@ -1,4 +1,5 @@
 #include "LasagnaServiceManager.hpp"
+#include "PythonExecutable.hpp"
 
 #include <QCoreApplication>
 #include <QCryptographicHash>
@@ -457,42 +458,6 @@ ResultsPlacementResult placeResultsArchive(const QByteArray& data,
     return result;
 }
 
-QString findPythonExecutable()
-{
-    QStringList candidates;
-
-    QString envPython = qEnvironmentVariable("PYTHON_EXECUTABLE");
-    if (!envPython.isEmpty()) {
-        candidates.append(envPython);
-    }
-
-    QString condaPrefix = qEnvironmentVariable("CONDA_PREFIX");
-    if (!condaPrefix.isEmpty()) {
-        candidates.append(QDir(condaPrefix).filePath("bin/python"));
-        candidates.append(QDir(condaPrefix).filePath("bin/python3"));
-    }
-
-    QString home = QDir::homePath();
-    candidates.append(QDir(home).filePath("miniconda3/bin/python"));
-    candidates.append(QDir(home).filePath("miniconda3/bin/python3"));
-    candidates.append(QDir(home).filePath("anaconda3/bin/python"));
-    candidates.append(QDir(home).filePath("anaconda3/bin/python3"));
-
-    candidates.append("python3");
-    candidates.append("python");
-    candidates.append("/usr/bin/python3");
-    candidates.append("/usr/local/bin/python3");
-
-    for (const QString& candidate : candidates) {
-        QProcess test;
-        test.start(candidate, {"--version"});
-        if (test.waitForFinished(1000) && test.exitCode() == 0) {
-            return candidate;
-        }
-    }
-    return "python3";
-}
-
 QString findLasagnaServiceScript()
 {
     QString appDir = QCoreApplication::applicationDirPath();
@@ -754,7 +719,7 @@ bool LasagnaServiceManager::startService(const QString& pythonPath,
     }
     _process->setProcessEnvironment(env);
 
-    QString python = pythonPath.isEmpty() ? findPythonExecutable() : pythonPath;
+    QString python = pythonPath.isEmpty() ? vc3d::findPythonExecutable() : pythonPath;
 
     // Port 0 = auto-select
     QStringList args = {

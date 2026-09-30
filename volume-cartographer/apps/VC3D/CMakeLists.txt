@@ -221,6 +221,8 @@ set(srcs
     segmentation/SegmentationUndoHistory.hpp
     NeuralTraceServiceManager.cpp
     NeuralTraceServiceManager.hpp
+    PythonExecutable.cpp
+    PythonExecutable.hpp
     LasagnaServiceManager.cpp
     LasagnaServiceManager.hpp
     SpiralArtifactCache.cpp
