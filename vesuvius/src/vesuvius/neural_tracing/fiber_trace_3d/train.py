@@ -3761,8 +3761,13 @@ def training_units(
                     total_batch_count=total,
                     pad_empty_ranks=pending_test is not None,
                 )
-                iterator = queued_evaluation(indices, step, source=source,
-                    evaluation_loader=evaluation_loader, count=count, offset=offset)
+                # Padding may replay an earlier logical index, but the central
+                # queue is intentionally one-pass and cannot reissue a consumed
+                # ticket. Load these metric-free parity batches directly in the
+                # worker; all real evaluation batches stay on the fast queue.
+                iterator = (None if padded else queued_evaluation(
+                    indices, step, source=source, evaluation_loader=evaluation_loader,
+                    count=count, offset=offset))
                 try:
                     local_options = (
                         {**options, "prediction_observer": None}
@@ -3783,7 +3788,8 @@ def training_units(
                     if padded:
                         local = []
                 finally:
-                    iterator.close()
+                    if iterator is not None:
+                        iterator.close()
                 refinement_stats = empty_refinement_statistics()
                 if source == "test" and refinement.config.enabled and refinement.config.update_enabled:
                     # Raw and all EMA tracks have now consumed identical batch

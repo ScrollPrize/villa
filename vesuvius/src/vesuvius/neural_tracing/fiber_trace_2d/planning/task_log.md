@@ -108,3 +108,7 @@
   partial logical batch. Its loss and refinement observer effects are discarded.
   Focused parity tests pass (2 selected, 289 deselected); the broader affected
   CPU suite passes (60 passed, 14 CUDA-only skips).
+- That relaunch exposed one final transport constraint: the optimized central
+  test queue is deliberately one-pass, so padding ranks cannot request old
+  indices 0-4 again. Metric-free padding now loads those exceptional batches
+  directly per worker; every real test batch remains on the central queue.
