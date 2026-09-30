@@ -84,8 +84,7 @@ only once it is complete.
    next candidate by at least 0.15, the other end picks it back, it neither
    crosses another fiber of the same family nor runs back into the fiber, and
    the CT around it is inside the volume and not empty.
-   Chains absorbed into a longer fiber are not grown again. The catalogue and
-   the extension are the fiber extension engine of Papyruss, ported unchanged.
+   Chains absorbed into a longer fiber are not grown again.
 6. **Cleanup.** At every inferred join, the directions entering and leaving
    it are measured over 8 voxels on each side; a join turning more than
    `--max-join-angle` is removed and its fiber split in two. Fibers shorter
@@ -96,10 +95,9 @@ only once it is complete.
    cubes with a zero voxel next to them. A fiber is removed when one of its
    points is inside such a cube or within the distance of its centre, so the
    distance holds to about 3.5 voxels. Enclosed holes and isolated zero
-   voxels inside the papyrus are ignored. Finally the points of each fiber
-   are thinned to the fewest that keep every original point within 0.05
-   voxel and every stretch at least 99.9 % of its length; the ends of every
-   join are kept.
+   voxels inside the papyrus are ignored. Finally the number of points of
+   each fiber is reduced, keeping every original point within 0.05 voxel
+   and at least 99.9 % of the length; the ends of every join are kept.
 7. **Output.** Fibers are written longest first as `V` (vertical) and `H`
    (horizontal) fibers; the point ranges bridged by joins are recorded in
    each fiber's `inferred_gap_point_ranges` annotation. The `generator`

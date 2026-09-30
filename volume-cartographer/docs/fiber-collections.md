@@ -42,8 +42,8 @@ the dialog shows how many there are. The other options, all remembered:
   them**): removes fibers passing this close to the black (CT value 0)
   outside the papyrus.
 
-The points of every fiber are thinned to the fewest that stay within 0.05
-voxel of the original polyline.
+The number of points of every fiber is then reduced, keeping every original
+point within 0.05 voxel.
 
 VC3D runs `python -m vesuvius.afv_spline_generator` in the background and shows
 its progress under the button; **Cancel** stops it. Each block is drawn on the
