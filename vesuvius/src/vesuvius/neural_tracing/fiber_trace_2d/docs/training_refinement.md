@@ -15,6 +15,11 @@ Disabled by default. Add a top-level object to a training JSON:
   "shape_normal_weight": 0.1,
   "shape_tangent_weight": 10.0,
   "direction_weight": 0.1,
+  "orientation_enabled": true,
+  "orientation_learning_rate": 0.05,
+  "orientation_gt_weight": 0.01,
+  "orientation_max_step_degrees": 1.0,
+  "orientation_probe_radius_sigma": 2.0,
   "learning_rate": 0.01,
   "max_step_fraction": 0.125,
   "border_fraction": 0.125
@@ -101,6 +106,34 @@ pointwise optimum is the configured Gaussian probability. The target-only
 macro-batch prepass uses the identical support/background group counts and
 Gaussian direction-weight sum.
 
+The half-sigma continuation resumes the preceding run's full raw checkpoint,
+including optimizer, EMA, update counter, refined curves, and material state.
+It changes thickness sigma from 2 to 1 input voxel and therefore in-sheet sigma
+from 8 to 4 voxels. It runs on the managed physical-GPU subset 0-6.
+
+When `orientation_enabled` is true, refinement may also rotate the Gaussian
+cross-section about its local fiber tangent. The state is an unoriented axis,
+so each material node stores `(cos(2 theta), sin(2 theta))`; interpolation and
+resampling therefore remain continuous modulo pi. Theta is relative to the
+native Lasagna normal sampled at the immutable baseline material location.
+Target construction applies the persisted rotation in base space before the
+existing exact covector augmentation transform.
+
+Each refinement iteration estimates an angular derivative with central
+finite differences. Four symmetric probes use the same physical radius on the
+candidate normal and width axes; the score is mean width-axis presence minus
+mean normal-axis presence. Unlike an equal-Mahalanobis ellipse contour, this is
+uniquely maximized modulo pi by the correct axes when width exceeds thickness.
+Output-voxel sigma offsets are
+pulled back through the local full augmentation Jacobian, then evaluated with
+the exact nonlinear base-to-patch transform. A segment contributes only when
+both angular candidates have complete in-patch probe sets. The explicit update
+is capped by `orientation_max_step_degrees` per iteration and uses the same
+training border taper/endpoint pinning as position; independent test pieces use
+the uniform cap. `orientation_gt_weight * sin(theta)^2` weakly tethers the axis
+to the original native normal. Geometry and orientation use one optimistic
+compare-and-swap, so a stale proposal changes neither.
+
 Optional direction guidance (default weight0, current trial0.1) penalizes
 `1-(unit_segment_tangent dot predicted_base_axis)^2` at the same segment quadrature.
 Six encoded channels are interpolated before shared analytic decoding. The full
@@ -144,10 +177,15 @@ geometry version is observed; bit-identical scheduling is not promised.
 ## Snapshots and lifecycle
 
 Alongside model snapshots, `fibers_step_########.zip` contains every registered
-train/test component's original `baseline.npy`, refined `current.npy`, source
+train/test component's original `baseline.npy`, refined `current.npy`, refined
+`orientation.npy`, source
 `metadata.json`, and inspectable `fiber.json`. Arrays are base-volume ZYX plus
 original arclength in the fourth column; JSON coordinates are XYZ. Original
 control-point/segment provenance is retained for JSON fibers.
+`orientation.npy` holds the doubled-angle vectors on the `current.npy` material
+lattice. Geometry-only archives from before orientation refinement load as an
+explicit zero rotation `(1,0)` and are upgraded in the live temporary store;
+`fiber.json` remains a geometry-only inspection export.
 Checkpoints reference the archive filename and SHA256. Keep the matching archive
 beside a checkpoint when moving it. Resume checks its integrity and dataset
 identity; changed source membership fails explicitly. Original annotations are
@@ -175,7 +213,9 @@ Run the approved `vesuvius/scripts/run_fiber3d_cooperative_tests` launcher with
 `refinement` and `cuda-refinement` suites in its JSON control. CUDA checks acquire
 an exclusive manager allocation. Tests cover solver/reference agreement,
 projection/taper, normal-sign invariance, queue payloads, stale writes, archives,
-worker-count changes and detached GPU feedback with backward.
+worker-count changes and detached GPU feedback with backward. Orientation tests
+cover modulo-pi interpolation, periodic tether/cap, invalid probes, anisotropic
+alignment, atomic stale writes, legacy/new archives, and target rotation.
 
 Measured 2026-09-15: one CPU thread, synthetic 24-node curves, affine + smooth
 warps, four iterations, ten repeats: 16-patch solve min/median/max
@@ -207,6 +247,12 @@ four iterations/ten repeats, guided solve plus post-solve loss reporting
 37.41/37.48/37.69ms; different work is included, so this is not a like-for-like
 speed comparison. Tests include dense anisotropic reference, axis-sign invariance,
 direction finite-difference gradient and nonlinear warp pullback.
+
+Orientation version measured 2026-09-30 on the same 16-patch, 24-node,
+four-iteration affine+smooth synthetic workload (ten repeats, one CPU thread):
+111.62/111.75/115.99 ms min/median/max, or 143.2 patches/s. The geometry-only
+batched solve in the same invocation measured 38.94/39.04/39.15 ms. This is
+solver-only host timing, not an end-to-end training-throughput claim.
 
 Managed production continuation was launched from
 update11800. The first fixed-test-crop continuation incorrectly resumed refinement

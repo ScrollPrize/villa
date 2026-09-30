@@ -3113,3 +3113,12 @@ identity remains unconfirmed. Global-assignment experiments not yet implemented.
 
 - Added manager-owned, SHA-256-bound snapshot imports and required stable
   external model identifiers for new inference runs.
+
+# 2026-09-30 — Online Gaussian orientation refinement
+
+- Added opt-in, persistent modulo-pi rotation of anisotropic Gaussian fiber
+  targets during online refinement. Rotation uses equal-radius presence probes,
+  a capped angular update, and a weak tether to the immutable Lasagna normal;
+  legacy geometry-only refinement archives migrate to zero rotation.
+- Prepared the stopped full-resolution Gaussian run to resume from its update
+  18,000 full checkpoint with half-width sigmas and managed GPUs 0-6.

@@ -10,5 +10,9 @@
 - [x] Add production config and documentation.
 - [x] Extend direction supervision across Gaussian support with weighted normalization.
 - [x] Restrict managed production launch to GPUs 0-5.
-- [ ] Launch managed training from best EMA-0.999 and verify progress.
-- [ ] Commit the completed implementation.
+- [x] Launch managed training from best EMA-0.999 and verify progress.
+- [x] Commit the completed implementation.
+- [x] Stop the sigma-2 run cleanly at the user's request.
+- [x] Implement persistent bounded Gaussian-orientation refinement.
+- [x] Validate orientation refinement and legacy archive compatibility.
+- [ ] Resume from its latest full checkpoint with half sigma on GPUs 0-6.

@@ -34,6 +34,35 @@
    through the approved cooperative experiment runner on physical GPUs 0-5 and
    verify manager allocation plus initial training/test progress. Permit
    automatic startup calibration on an explicit nonempty managed GPU subset.
+8. Stop the initial run cleanly, then resume its latest full checkpoint with
+   thickness sigma halved from 2 to 1 voxel (and therefore width sigma from 8
+   to 4 voxels). Give the continuation a distinct run name, request physical
+   GPUs 0-6, and verify restored update/optimizer/refinement state and progress.
+9. Represent distribution orientation as a sign-invariant rotation around the
+   local fiber tangent, relative to the native Lasagna normal sampled at the
+   immutable baseline material position. Persist `(cos(2 theta), sin(2 theta))`
+   on the same material-arc lattice as each refined curve so interpolation is
+   continuous modulo pi. Include independent test patches and archives; restore
+   old geometry-only archives with the explicit `(1,0)` zero-rotation state.
+10. During refinement, use fixed symmetric probes at the same physical radius
+    along the candidate width and normal axes, scoring width-axis presence
+    minus normal-axis presence through the exact nonlinear base-to-patch
+    transform.
+    Estimate the angular derivative by central finite differences, reject
+    incomplete/out-of-patch probe sets, and apply an explicit capped angular
+    step plus a weak periodic `sin²(theta)` tether to zero rotation. Convert
+    configured output-voxel sigmas through each probe's local augmentation
+    Jacobian before evaluating exact transformed query positions.
+    Commit curve and orientation together under the existing optimistic lock;
+    stale proposals update neither. Reinterpolate doubled-angle vectors on the
+    returned material coordinates whenever curve geometry is resampled.
+11. Apply the interpolated refined rotation to native segment normals before
+    the existing augmentation covector transform and Gaussian rasterization.
+    Keep binary targets and refinement without Gaussian orientation unchanged.
+    Add archive compatibility, cap/tether, transform, target-orientation, and
+    stale-commit regression tests before launching the half-sigma continuation.
+    Preserve material identities through clipping so every emitted segment uses
+    the matching persisted orientation and immutable baseline normal.
 
 ## Spec update
 

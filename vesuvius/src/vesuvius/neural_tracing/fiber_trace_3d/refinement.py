@@ -43,6 +43,11 @@ class RefinementConfig:
     learning_rate: float = 0.01
     max_step_fraction: float = 0.125
     border_fraction: float = 0.125
+    orientation_enabled: bool = False
+    orientation_learning_rate: float = 0.05
+    orientation_gt_weight: float = 0.01
+    orientation_max_step_degrees: float = 1.0
+    orientation_probe_radius_sigma: float = 2.0
 
     @classmethod
     def parse(cls, raw):
@@ -53,8 +58,9 @@ class RefinementConfig:
         if unknown:
             raise ValueError(f"unknown refinement settings: {sorted(unknown)}")
         result = cls(**values)
-        if type(result.enabled) is not bool or type(result.update_enabled) is not bool:
-            raise ValueError("refinement enabled/update_enabled must be boolean")
+        if (type(result.enabled) is not bool or type(result.update_enabled) is not bool or
+                type(result.orientation_enabled) is not bool):
+            raise ValueError("refinement enabled/update_enabled/orientation_enabled must be boolean")
         if result.state_checkpoint is not None and (not isinstance(result.state_checkpoint, str) or not result.state_checkpoint):
             raise ValueError("refinement.state_checkpoint must be a nonempty path string")
         if result.state_sha256 is not None and (not isinstance(result.state_sha256, str) or len(result.state_sha256) != 64 or
@@ -68,11 +74,13 @@ class RefinementConfig:
             if type(getattr(result, name)) is not int or not 1 <= getattr(result, name) <= 64:
                 raise ValueError(f"refinement.{name} must be an integer in [1,64]")
         for name in ("spacing_base", "normal_radius_base", "tangent_radius_base", "learning_rate",
-                     "max_step_fraction", "border_fraction"):
+                     "max_step_fraction", "border_fraction", "orientation_learning_rate",
+                     "orientation_max_step_degrees", "orientation_probe_radius_sigma"):
             value = getattr(result, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value) or value <= 0:
                 raise ValueError(f"refinement.{name} must be positive finite")
-        for name in ("gt_weight", "shape_weight", "direction_weight", "shape_normal_weight", "shape_tangent_weight"):
+        for name in ("gt_weight", "shape_weight", "direction_weight", "shape_normal_weight", "shape_tangent_weight",
+                     "orientation_gt_weight"):
             value = getattr(result, name)
             if value is None and name.startswith("shape_") and name != "shape_weight":
                 continue
@@ -80,6 +88,10 @@ class RefinementConfig:
                 raise ValueError(f"refinement.{name} must be nonnegative finite")
         if result.border_fraction > 0.5 or result.max_step_fraction > 1:
             raise ValueError("refinement border_fraction<=0.5 and max_step_fraction<=1 required")
+        if result.orientation_max_step_degrees > 45:
+            raise ValueError("refinement.orientation_max_step_degrees must be <=45")
+        if result.orientation_enabled and not result.enabled:
+            raise ValueError("orientation refinement requires refinement.enabled=true")
         if result.enabled and raw.get("model_3d", raw.get("model", {})).get("conditioned_decoder_enabled", False):
             raise ValueError("refinement requires an unconditioned presence output")
         return result
@@ -101,6 +113,32 @@ def resample(points, material, count=None):
         raise ValueError("refinement produced a degenerate/nonfinite curve")
     at = np.linspace(0., arc[-1], len(points) if count is None else count)
     return interpolate(np.c_[points, material][keep], arc[keep], at)
+
+
+def zero_orientation(count):
+    result = np.zeros((int(count), 2), dtype=np.float64)
+    result[:, 0] = 1.0
+    return result
+
+
+def normalize_orientation(value):
+    value = np.asarray(value, dtype=np.float64)
+    lengths = np.linalg.norm(value, axis=-1, keepdims=True)
+    if value.ndim != 2 or value.shape[1] != 2 or not np.isfinite(value).all() or np.any(lengths <= 1e-10):
+        raise ValueError("invalid doubled-angle orientation state")
+    return value / lengths
+
+
+def orientation_angles(value):
+    value = normalize_orientation(value)
+    return 0.5 * np.arctan2(value[:, 1], value[:, 0])
+
+
+def interpolate_orientation(value, knots, locations):
+    value = normalize_orientation(value)
+    doubled = np.unwrap(np.arctan2(value[:, 1], value[:, 0]))
+    phase = np.interp(locations, knots, doubled)
+    return np.stack((np.cos(phase), np.sin(phase)), axis=1)
 
 
 def ellipse_metric(normals, cfg):
@@ -197,6 +235,19 @@ def normal_projectors(normals):
     n = np.asarray(normals,dtype=np.float64)
     n = n/np.maximum(np.linalg.norm(n,axis=-1,keepdims=True),1e-12)
     return n[:,:,None]*n[:,None,:]
+
+
+def rotate_normals_about_tangent(normals, tangents, angles):
+    """Rotate unoriented sheet normals around the local fiber tangent."""
+    tangent = np.asarray(tangents, dtype=np.float64)
+    tangent /= np.maximum(np.linalg.norm(tangent, axis=-1, keepdims=True), 1e-12)
+    normal = np.asarray(normals, dtype=np.float64)
+    normal = normal - tangent * np.sum(normal * tangent, axis=-1, keepdims=True)
+    normal /= np.maximum(np.linalg.norm(normal, axis=-1, keepdims=True), 1e-12)
+    width = np.cross(tangent, normal)
+    angle = np.asarray(angles, dtype=np.float64)[..., None]
+    rotated = np.cos(angle) * normal + np.sin(angle) * width
+    return rotated / np.maximum(np.linalg.norm(rotated, axis=-1, keepdims=True), 1e-12)
 
 
 def semi_implicit_step(points, baseline, metric, force, cfg, links=None, material_lengths=None, normal_metric=None):
@@ -332,6 +383,7 @@ class GeometryStore:
             path.mkdir()
             np.save(path / "baseline.npy", np.c_[points, arc])
             np.save(path / "current.npy", curve)
+            np.save(path / "orientation.npy", zero_orientation(len(curve)))
             (path / "metadata.json").write_text(json.dumps(metadata))
 
     def validate_split(self, keys, split):
@@ -341,7 +393,7 @@ class GeometryStore:
             if expected != set(keys):
                 raise ValueError(f"refinement resume {split} dataset membership changed")
 
-    def test_patch(self, parent, sample_index, params, shape, spacing, start, current, baseline):
+    def test_patch(self, parent, sample_index, params, shape, spacing, start, current, baseline, orientation=None):
         """Lazy independent local state; parent identity was validated by register.
 
         New deterministic crops may be first encountered after a checkpoint.
@@ -365,18 +417,41 @@ class GeometryStore:
                 path.mkdir()
                 np.save(path / "baseline.npy", baseline)
                 np.save(path / "current.npy", current)
+                np.save(path / "orientation.npy", zero_orientation(len(current))
+                        if orientation is None else normalize_orientation(orientation))
                 (path / "metadata.json").write_text(json.dumps(metadata))
-        return key, self.read(key)
+        current, orientation = self.read_state(key)
+        return key, current, orientation
 
     def read(self, key):
+        return self.read_state(key)[0]
+
+    def read_state(self, key):
         path = self.root / key
+        orientation_path = path / "orientation.npy"
+        if not orientation_path.exists() and not self.read_only:
+            # One-time migration needs exclusion; ordinary hot-path reads stay
+            # concurrent under a shared lock.
+            with file_lock(path / "lock"):
+                if not orientation_path.exists():
+                    current = np.load(path / "current.npy", mmap_mode="r")
+                    np.save(orientation_path, zero_orientation(len(current)))
         with file_lock(path / "lock", shared=True):
-            return np.load(path / "current.npy", mmap_mode="r").copy()
+            current = np.load(path / "current.npy", mmap_mode="r").copy()
+            if orientation_path.exists():
+                orientation = np.load(orientation_path, mmap_mode="r").copy()
+            else:
+                # Geometry snapshots written before orientation refinement are
+                # explicitly the zero-rotation state.
+                orientation = zero_orientation(len(current))
+            if orientation.shape != (len(current), 2):
+                raise ValueError("invalid refinement orientation state shape")
+            return current, normalize_orientation(orientation)
 
     def baseline(self, key):
         return np.load(self.root / key / "baseline.npy", mmap_mode="r")
 
-    def commit(self, key, start, before, after):
+    def commit(self, key, start, before, after, before_orientation=None, after_orientation=None):
         if self.read_only:
             raise RuntimeError("frozen refinement geometry is read-only")
         path = self.root / key
@@ -387,7 +462,26 @@ class GeometryStore:
                 return False
             if after.shape != before.shape or not np.isfinite(after).all() or np.any(np.diff(after[:, 3]) <= 0):
                 raise ValueError("invalid refinement proposal")
+            orientation_target = None
+            orientation_view = None
+            if (before_orientation is None) != (after_orientation is None):
+                raise ValueError("orientation refinement commit requires before and after state")
+            if before_orientation is not None:
+                orientation_path = path / "orientation.npy"
+                if not orientation_path.exists():
+                    np.save(orientation_path, zero_orientation(len(target)))
+                orientation_target = np.load(orientation_path, mmap_mode="r+")
+                orientation_view = orientation_target[start:start + len(before_orientation)]
+                if not np.array_equal(orientation_view, before_orientation):
+                    return False
+                if (after_orientation.shape != before_orientation.shape or
+                        after_orientation.shape != (len(after), 2) or
+                        not np.isfinite(after_orientation).all()):
+                    raise ValueError("invalid refinement orientation proposal")
+                after_orientation = normalize_orientation(after_orientation)
             view[:] = after
+            if orientation_view is not None:
+                orientation_view[:] = after_orientation
             return True
 
     def save(self, target):
@@ -401,8 +495,14 @@ class GeometryStore:
             for path in sorted(self.root.iterdir()):
                 if not path.is_dir():
                     continue
+                # Upgrade geometry-only archives before taking the shared
+                # snapshot lock; never write while holding a shared lock.
+                self.read_state(path.name)
                 with file_lock(path / "lock", shared=True):
-                    for name in ("baseline.npy", "current.npy", "metadata.json"):
+                    orientation_path = path / "orientation.npy"
+                    if not orientation_path.exists():
+                        raise RuntimeError("refinement orientation migration did not persist")
+                    for name in ("baseline.npy", "current.npy", "orientation.npy", "metadata.json"):
                         archive.write(path / name, f"{path.name}/{name}")
                     curve = np.load(path / "current.npy")
                     metadata = json.loads((path / "metadata.json").read_text())
@@ -441,7 +541,7 @@ class GeometryStore:
                 pieces = Path(name).parts
                 if len(pieces) != 2 or len(pieces[0]) != 64 or any(c not in "0123456789abcdef" for c in pieces[0]):
                     raise ValueError("invalid refinement archive entry")
-                if pieces[1] not in {"baseline.npy", "current.npy", "metadata.json", "fiber.json"}:
+                if pieces[1] not in {"baseline.npy", "current.npy", "orientation.npy", "metadata.json", "fiber.json"}:
                     raise ValueError("invalid refinement archive file")
                 archive.extract(name, self.root)
         (self.root / "restored.json").write_text("{}")
@@ -524,6 +624,9 @@ class RefinementObservation:
     config: RefinementConfig
     output_stride: int = 1
     independent_piece: bool = False
+    orientation: np.ndarray | None = None
+    orientation_sigma_thickness_output: float = 0.0
+    orientation_width_ratio: float = 1.0
 
 
 class BatchedPatchTransform:
@@ -611,7 +714,142 @@ def direction_feedback(points, edges, material_lengths, transform, ids, maps, st
     return force,losses
 
 
-def refine_observations(observations, maps, directions=None):
+def orientation_feedback(observations, curves, orientations, maps, transform):
+    """One capped periodic orientation update from detached presence probes.
+
+    Four symmetric equal-radius points measure mean presence along the candidate
+    width axis minus mean presence along the candidate normal. Candidate axes
+    are formed in base space, converted to the exact target axes with the local
+    augmentation Jacobian, and converted back to base offsets before the
+    nonlinear transform is evaluated.
+    """
+    from scipy.ndimage import map_coordinates
+    if not observations:
+        return []
+    cfg = observations[0].config
+    if not cfg.orientation_enabled:
+        return [normalize_orientation(value) for value in orientations]
+    offsets = np.r_[0, np.cumsum([len(curve) for curve in curves])]
+    points = np.concatenate([curve[:, :3] for curve in curves])
+    ids = np.repeat(np.arange(len(curves)), [len(curve) for curve in curves])
+    links = ids[1:] == ids[:-1]
+    edges = np.flatnonzero(links)
+    q = 0.5 * (points[edges] + points[edges + 1])
+    qids = ids[edges]
+    tangents = points[edges + 1] - points[edges]
+    tangent_lengths = np.linalg.norm(tangents, axis=1)
+    tangents /= np.maximum(tangent_lengths[:, None], 1e-12)
+
+    base_normals = []
+    edge_angles = []
+    thickness = []
+    width_ratio = []
+    for observation, curve, state in zip(observations, curves, orientations, strict=True):
+        normals = np.asarray(observation.normals, dtype=np.float64)
+        if normals.shape != (len(observation.current), 3):
+            raise ValueError("orientation refinement normal/curve shape mismatch")
+        # Align only for interpolation; a global sign reversal produces the
+        # same unoriented result. Re-sample on the curve's updated material
+        # coordinates after every geometry solve.
+        normals = normals.copy()
+        for index in range(1, len(normals)):
+            if np.dot(normals[index - 1], normals[index]) < 0:
+                normals[index] *= -1
+        normals = interpolate(normals, observation.current[:, 3], curve[:, 3])
+        normals /= np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), 1e-12)
+        right = normals[1:].copy()
+        right[np.sum(normals[:-1] * right, axis=1) < 0] *= -1
+        normal = normals[:-1] + right
+        normal /= np.maximum(np.linalg.norm(normal, axis=1, keepdims=True), 1e-12)
+        base_normals.append(normal)
+        doubled_mid = interpolate_orientation(
+            state, curve[:, 3], 0.5 * (curve[:-1, 3] + curve[1:, 3]))
+        edge_angles.append(orientation_angles(doubled_mid))
+        thickness.extend([float(observation.orientation_sigma_thickness_output)] * (len(curve) - 1))
+        width_ratio.extend([float(observation.orientation_width_ratio)] * (len(curve) - 1))
+    base_normals = np.concatenate(base_normals)
+    theta = np.concatenate(edge_angles)
+    thickness = np.asarray(thickness)
+    width_ratio = np.asarray(width_ratio)
+    if np.any(thickness <= 0) or np.any(width_ratio <= 1):
+        raise ValueError("orientation refinement requires positive sigma and width ratio >1")
+
+    perturb = np.concatenate((np.eye(3), -np.eye(3))) * 0.5
+    mapped = transform((q[None] + perturb[:, None]).reshape(-1, 3), np.tile(qids, 6)).reshape(6, -1, 3)
+    jacobian = (mapped[:3] - mapped[3:]).transpose(1, 2, 0)
+    if not np.isfinite(jacobian).all() or np.any(np.linalg.cond(jacobian) > 1e8):
+        raise ValueError("orientation refinement encountered a singular/nonfinite patch Jacobian")
+    # Equal physical radii make the objective orientation-identifiable: for a
+    # width>thickness Gaussian, width-presence minus normal-presence is uniquely
+    # maximal (modulo pi) when the candidate axes match the target axes.
+    pattern = np.asarray([[1., 0.], [-1., 0.], [0., 1.], [0., -1.]])
+    # A five-degree symmetric stencil is deliberately wider than sub-voxel
+    # trilinear lattice noise while remaining local relative to the pi-periodic
+    # orientation field.
+    epsilon = np.deg2rad(5.0)
+    stack = np.stack(maps)
+
+    def score(candidate):
+        normal_base = rotate_normals_about_tangent(base_normals, tangents, candidate)
+        tangent_out = np.einsum("nij,nj->ni", jacobian, tangents)
+        tangent_out /= np.maximum(np.linalg.norm(tangent_out, axis=1, keepdims=True), 1e-12)
+        normal_out = np.linalg.solve(jacobian.transpose(0, 2, 1), normal_base[..., None])[..., 0]
+        normal_out -= tangent_out * np.sum(normal_out * tangent_out, axis=1, keepdims=True)
+        normal_out /= np.maximum(np.linalg.norm(normal_out, axis=1, keepdims=True), 1e-12)
+        width_out = np.cross(tangent_out, normal_out)
+        radius = thickness * cfg.orientation_probe_radius_sigma
+        output_delta = radius[:, None, None] * (
+            pattern[None, :, 0, None] * normal_out[:, None]
+            + pattern[None, :, 1, None] * width_out[:, None]
+        )
+        base_delta = np.linalg.solve(
+            np.repeat(jacobian[:, None], len(pattern), axis=1).reshape(-1, 3, 3),
+            output_delta.reshape(-1, 3, 1),
+        ).reshape(len(q), len(pattern), 3)
+        query = (q[:, None] + base_delta).reshape(-1, 3)
+        query_ids = np.repeat(qids, len(pattern))
+        exact = transform(query, query_ids) / observations[0].output_stride
+        valid = np.all((exact >= 0) & (exact <= np.asarray(stack.shape[1:]) - 1), axis=1)
+        values = map_coordinates(
+            stack,
+            np.concatenate((query_ids[None], exact.T)),
+            order=1,
+            mode="nearest",
+            prefilter=False,
+        ).reshape(len(q), len(pattern))
+        valid = valid.reshape(len(q), len(pattern)).all(axis=1)
+        normal_score = values[:, :2].mean(axis=1)
+        width_score = values[:, 2:].mean(axis=1)
+        return width_score - normal_score, valid
+
+    plus, valid_plus = score(theta + epsilon)
+    minus, valid_minus = score(theta - epsilon)
+    derivative = (plus - minus) / (2 * epsilon)
+    derivative[~(valid_plus & valid_minus)] = 0.
+    edge_mass = np.maximum(tangent_lengths, 1e-12)
+    node_gradient = np.zeros(len(points))
+    node_mass = np.zeros(len(points))
+    np.add.at(node_gradient, edges, derivative * edge_mass / 2)
+    np.add.at(node_gradient, edges + 1, derivative * edge_mass / 2)
+    np.add.at(node_mass, edges, edge_mass / 2)
+    np.add.at(node_mass, edges + 1, edge_mass / 2)
+    node_gradient /= np.maximum(node_mass, 1e-12)
+    current = np.concatenate([orientation_angles(value) for value in orientations])
+    node_gradient -= cfg.orientation_gt_weight * np.sin(2 * current)
+    delta = cfg.orientation_learning_rate * node_gradient
+
+    independent = np.array([o.independent_piece for o in observations], dtype=bool)[ids]
+    endpoints = np.r_[offsets[:-1], offsets[1:] - 1]
+    taper_fraction = step_limits(transform(points, ids), observations[0].shape, cfg, independent, endpoints)
+    taper_fraction /= cfg.max_step_fraction
+    cap = np.deg2rad(cfg.orientation_max_step_degrees) * taper_fraction
+    delta = np.clip(delta, -cap, cap)
+    updated = current + delta
+    doubled = np.stack((np.cos(2 * updated), np.sin(2 * updated)), axis=1)
+    return [doubled[a:b] for a, b in zip(offsets[:-1], offsets[1:])]
+
+
+def refine_observations(observations, maps, directions=None, *, return_orientation=False):
     """Solve independent ragged curves as one narrow-band system.
 
     Zero off-diagonal links separate patches. Grouping changes dispatch only;
@@ -634,6 +872,8 @@ def refine_observations(observations, maps, directions=None):
     previous[offsets[:-1]] = offsets[:-1]
     following[offsets[1:]-1] = offsets[1:]-1
     curves = [o.current.copy() for o in observations]
+    orientations = [zero_orientation(len(o.current)) if o.orientation is None
+                    else normalize_orientation(o.orientation) for o in observations]
     metrics = [ellipse_metric(o.normals, cfg).reshape(-1, 9) for o in observations]
     projectors = [normal_projectors(o.normals).reshape(-1,9) for o in observations]
     maps = np.stack(maps)
@@ -678,8 +918,13 @@ def refine_observations(observations, maps, directions=None):
         limits = step_limits(transform(points, ids), observations[0].shape, cfg, independent, endpoint)
         delta = clamp_update(delta, points, metric, limits, tangent=points[following]-points[previous])
         updated = points+delta
+        old_curves = curves
         curves = [resample(updated[a:b], curve[a:b,3]) for a,b in zip(offsets[:-1], offsets[1:])]
-    return curves
+        orientations = [interpolate_orientation(state, old[:,3], new[:,3])
+                        for state,old,new in zip(orientations,old_curves,curves,strict=True)]
+        if cfg.orientation_enabled:
+            orientations = orientation_feedback(observations, curves, orientations, maps, transform)
+    return (curves, orientations) if return_orientation else curves
 
 
 def refinement_losses(observations, curves, maps, directions=None):
@@ -780,10 +1025,15 @@ class RefinementObserver:
                 images.append(values)
                 directions.append(encoded)
         direction_maps = np.stack(directions) if directions and self.config.direction_weight else None
-        afters = refine_observations([o for _,o in todo], images, direction_maps)
+        afters, after_orientations = refine_observations(
+            [o for _,o in todo], images, direction_maps, return_orientation=True)
         losses = refinement_losses([o for _,o in todo], afters, images, direction_maps)
-        for (index, observation), after, loss in zip(todo, afters, losses):
-            proposals.append((index, observation.key, observation.start, observation.current, after, loss))
+        for (index, observation), after, after_orientation, loss in zip(
+                todo, afters, after_orientations, losses, strict=True):
+            before_orientation = (zero_orientation(len(observation.current))
+                                  if observation.orientation is None else observation.orientation)
+            proposals.append((index, observation.key, observation.start, observation.current, after,
+                              before_orientation, after_orientation, loss))
         self.pending.clear()
         if distributed.enabled:
             gathered = [None] * distributed.world_size if distributed.is_main else None
@@ -794,8 +1044,9 @@ class RefinementObserver:
         if distributed.is_main:
             store = active_store()
             applied_losses = []
-            for _, key, start, before, after, loss in sorted((p for rows in gathered for p in rows), key=lambda p: p[0]):
-                if store.commit(key, start, before, after):
+            for _, key, start, before, after, before_orientation, after_orientation, loss in sorted(
+                    (p for rows in gathered for p in rows), key=lambda p: p[0]):
+                if store.commit(key, start, before, after, before_orientation, after_orientation):
                     self.accepted += 1
                     applied_losses.append(loss)
                 else:

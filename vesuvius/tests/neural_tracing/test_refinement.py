@@ -15,7 +15,8 @@ from vesuvius.neural_tracing.fiber_trace_3d.refinement import (
     presence_force, refine_curve, refinement_session,
     refine_observations, BatchedPatchTransform, step_limits, bending_terms, refinement_losses,
     normal_projectors, shape_metric, direction_feedback, REFINEMENT_LOSS_NAMES,
-    active_store,
+    active_store, zero_orientation, orientation_angles, interpolate_orientation,
+    orientation_feedback,
 )
 
 
@@ -40,6 +41,15 @@ def test_config_rejects_invalid():
                     {**frozen, "enabled": False}):
         with pytest.raises(ValueError):
             RefinementConfig.parse({"refinement": invalid})
+    with pytest.raises(ValueError, match="orientation refinement"):
+        RefinementConfig.parse({"refinement": {"orientation_enabled": True}})
+
+
+def test_doubled_angle_interpolation_is_periodic_modulo_pi():
+    angles = np.deg2rad([89.0, -89.0])
+    state = np.stack((np.cos(2 * angles), np.sin(2 * angles)), axis=1)
+    midpoint = orientation_angles(interpolate_orientation(state, [0., 1.], [.5]))[0]
+    assert abs(abs(np.rad2deg(midpoint)) - 90.0) < 1.0e-10
 
 
 def test_frozen_geometry_store_is_read_only(tmp_path):
@@ -402,6 +412,39 @@ def test_gaussian_surface_normal_uses_inverse_transpose_affine():
     np.testing.assert_allclose(actual, expected, atol=2.0e-6)
 
 
+def test_loader_applies_persisted_orientation_to_gaussian_targets(monkeypatch, tmp_path):
+    from vesuvius.neural_tracing.fiber_trace_3d.loader import FiberTrace3DLoader
+    source = make_refining_loader(monkeypatch, tmp_path)
+    cfg = replace(
+        source.config,
+        datasets=tuple({**item, "dense_supervision": True} for item in source.config.datasets),
+        presence_target_mode="anisotropic_gaussian",
+        presence_radius_voxels=1.0,
+        presence_gaussian_width_ratio=4.0,
+        refinement=replace(source.config.refinement, orientation_enabled=True),
+    )
+    object.__setattr__(cfg, "_array_records", source.config._array_records)
+    loader = FiberTrace3DLoader(cfg)
+    original = loader.load_sample(0)
+    key = loader._refinement_keys[0]
+    curve, orientation = loader._refinement_store.read_state(key)
+    angle = .25
+    rotated = np.tile([np.cos(2 * angle), np.sin(2 * angle)], (len(curve), 1))
+    assert loader._refinement_store.commit(key, 0, curve, curve, orientation, rotated)
+    changed = loader.load_sample(0)
+    np.testing.assert_array_equal(changed.target_segment_starts_zyx, original.target_segment_starts_zyx)
+    tangents = changed.target_segment_ends_zyx.numpy() - changed.target_segment_starts_zyx.numpy()
+    tangents /= np.linalg.norm(tangents, axis=1, keepdims=True)
+    before = original.target_segment_normals_zyx.numpy()
+    before -= tangents * np.sum(before * tangents, axis=1, keepdims=True)
+    before /= np.linalg.norm(before, axis=1, keepdims=True)
+    expected = np.cos(angle) * before + np.sin(angle) * np.cross(tangents, before)
+    actual = changed.target_segment_normals_zyx.numpy()
+    actual -= tangents * np.sum(actual * tangents, axis=1, keepdims=True)
+    actual /= np.linalg.norm(actual, axis=1, keepdims=True)
+    np.testing.assert_allclose(np.abs(np.sum(actual * expected, axis=1)), 1., atol=2e-5)
+
+
 def test_independent_piece_omits_stitching_segments(monkeypatch, tmp_path):
     from vesuvius.neural_tracing.fiber_trace_3d.arc_sampling import FiberLocation
     loader = make_refining_loader(monkeypatch, tmp_path)
@@ -474,6 +517,83 @@ def test_store_snapshot_restore_and_stale(tmp_path):
     with zipfile.ZipFile(tmp_path / "fibers.zip") as z:
         exported = parse_vc3d_fiber(json.loads(z.read(key + "/fiber.json")))
     np.testing.assert_allclose(exported.line_points_zyx, after[:, :3])
+
+
+def test_store_orientation_atomicity_and_legacy_archive(tmp_path):
+    cfg = RefinementConfig()
+    key = "b" * 64
+    store = GeometryStore(tmp_path / "live")
+    store.register(key, line()[:, :3], {"split": "train"}, cfg)
+    current, orientation = store.read_state(key)
+    changed = orientation.copy()
+    angle = np.deg2rad(3.0)
+    changed[:, 0], changed[:, 1] = np.cos(2 * angle), np.sin(2 * angle)
+    assert store.commit(key, 0, current, current, orientation, changed)
+    assert not store.commit(key, 0, current, current, orientation, changed)
+    np.testing.assert_allclose(orientation_angles(store.read_state(key)[1]), angle)
+    # Simulate a geometry-only archive written before orientation refinement.
+    (store.root / key / "orientation.npy").unlink()
+    _, migrated = store.read_state(key)
+    np.testing.assert_array_equal(migrated, zero_orientation(len(current)))
+    saved = store.save(tmp_path / "state.zip")
+    restored = GeometryStore(tmp_path / "restored")
+    restored.restore(tmp_path / saved["file"], saved["sha256"])
+    np.testing.assert_array_equal(restored.read_state(key)[1], migrated)
+
+
+def test_orientation_feedback_periodic_tether_cap_and_invalid_probes():
+    from vesuvius.neural_tracing.fiber_trace_3d.loader import _Augment3DParams
+    points = np.c_[np.linspace(8, 56, 9), np.full(9, 32.), np.full(9, 32.)]
+    curve = np.c_[points, arclength(points)]
+    angle = np.full(len(curve), .25)
+    state = np.stack((np.cos(2 * angle), np.sin(2 * angle)), axis=1)
+    cfg = RefinementConfig(enabled=True, orientation_enabled=True, iterations=1,
+                           orientation_learning_rate=1., orientation_gt_weight=100.,
+                           orientation_max_step_degrees=1.)
+    params = _Augment3DParams(0,np.zeros(3),np.zeros(3),np.eye(3),np.eye(3),0,1,1,0,0,None,0,0,None)
+    observation = RefinementObservation(
+        "a", 0, curve, curve.copy(), np.tile([0.,1.,0.], (len(curve),1)),
+        params, 1., (64,)*3, cfg, independent_piece=True, orientation=state,
+        orientation_sigma_thickness_output=1., orientation_width_ratio=4.)
+    transform = BatchedPatchTransform([observation])
+    updated = orientation_feedback([observation], [curve], [state], [np.ones((64,)*3)], transform)[0]
+    actual = orientation_angles(updated)
+    np.testing.assert_allclose(angle-actual, np.deg2rad(1.), atol=1e-12)
+    # With zero tether and every symmetric probe outside, nearest-edge samples
+    # must not create a false angular update.
+    outside_curve = curve.copy(); outside_curve[:,1] = .1
+    no_tether = replace(cfg, orientation_gt_weight=0.)
+    outside = replace(observation, current=outside_curve, baseline=outside_curve.copy(), config=no_tether)
+    unchanged = orientation_feedback([outside], [outside_curve], [state],
+                                     [np.random.default_rng(1).random((64,)*3)],
+                                     BatchedPatchTransform([outside]))[0]
+    np.testing.assert_allclose(orientation_angles(unchanged), angle, atol=1e-12)
+
+
+@pytest.mark.parametrize("initial_angle", [0., .01, -.01, .1, -.3, .3, 1.2])
+def test_orientation_feedback_aligns_with_anisotropic_presence(initial_angle):
+    from vesuvius.neural_tracing.fiber_trace_3d.loader import _Augment3DParams
+    points = np.c_[np.linspace(8, 56, 9), np.full(9, 32.), np.full(9, 32.)]
+    curve = np.c_[points, arclength(points)]
+    angle = np.full(len(curve), initial_angle)
+    state = np.stack((np.cos(2 * angle), np.sin(2 * angle)), axis=1)
+    cfg = RefinementConfig(enabled=True, orientation_enabled=True, iterations=1,
+                           orientation_learning_rate=.05, orientation_gt_weight=0.,
+                           orientation_max_step_degrees=10., orientation_probe_radius_sigma=2.)
+    params = _Augment3DParams(0,np.zeros(3),np.zeros(3),np.eye(3),np.eye(3),0,1,1,0,0,None,0,0,None)
+    observation = RefinementObservation(
+        "a", 0, curve, curve.copy(), np.tile([0.,1.,0.], (len(curve),1)),
+        params, 1., (64,)*3, cfg, independent_piece=True, orientation=state,
+        orientation_sigma_thickness_output=1., orientation_width_ratio=4.)
+    grid = np.indices((64,)*3)
+    presence = np.exp(-.5*((grid[1]-32.)**2 + ((grid[2]-32.)/4.)**2))
+    updated = orientation_feedback([observation], [curve], [state], [presence],
+                                   BatchedPatchTransform([observation]))[0]
+    result = np.max(np.abs(orientation_angles(updated)))
+    if initial_angle == 0:
+        assert result < 1e-12
+    else:
+        assert result < abs(initial_angle)
 
 
 def test_session_restores_and_cleans_environment(tmp_path, monkeypatch):
@@ -669,6 +789,20 @@ def test_augmented_mapping_quadrature_and_cost():
         durations.append(time.perf_counter()-start)
     print(f"guided refinement CPU one-core solve+losses: 16 patches,24 nodes,4 iterations,10 repeats; "
           f"ms/batch min/median/max={np.array([min(durations),np.median(durations),max(durations)])*1000}")
+    orientation_cfg = replace(cfg, direction_weight=0., orientation_enabled=True)
+    oriented = [replace(o, config=orientation_cfg, orientation=zero_orientation(len(o.current)),
+                        orientation_sigma_thickness_output=1., orientation_width_ratio=4.)
+                for o in observations]
+    durations = []
+    for _ in range(10):
+        start = time.perf_counter()
+        curves, states = refine_observations(oriented, [presence]*16, return_orientation=True)
+        assert all(np.isfinite(curve).all() for curve in curves)
+        assert all(np.isfinite(state).all() for state in states)
+        durations.append(time.perf_counter()-start)
+    print(f"orientation refinement CPU one-core solve: 16 patches,24 nodes,4 iterations,10 repeats; "
+          f"ms/batch min/median/max={np.array([min(durations),np.median(durations),max(durations)])*1000}; "
+          f"patches/s={16/np.median(durations):.1f}")
 
 
 @pytest.mark.skipif(os.environ.get("FIBER_COOPERATIVE_CUDA_TEST") != "1", reason="manager-gated CUDA only")

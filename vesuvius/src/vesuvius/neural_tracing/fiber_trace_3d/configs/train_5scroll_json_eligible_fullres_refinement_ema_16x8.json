@@ -106,7 +106,7 @@
   ],
   "prefetch_sampler_workers": 8,
   "prefetch_workers": 64,
-  "presence_radius_voxels": 2,
+  "presence_radius_voxels": 1,
   "presence_target_mode": "anisotropic_gaussian",
   "presence_gaussian_width_ratio": 4,
   "presence_gaussian_truncate_sigma": 3,
@@ -163,7 +163,7 @@
     }
   ],
   "training": {
-    "initialize_from": "/ephemeral/hendrik/fiber3d_train2/runs/5scroll_json_eligible_fullres_refinement_128_sd1_16x8_ema_20260916_213753/snapshots/best_ema_0p999.pt",
+    "resume": "/ephemeral/hendrik/fiber3d_train2/runs/5scroll_json_eligible_fullres_refinement_gaussian_128_sd1_16x8_ema_20260929_092844/snapshots/current.pt",
     "checkpoint_interval": 100,
     "device": "auto",
     "direction_weight": 10,
@@ -175,7 +175,7 @@
     "max_steps": 2000000,
     "mixed_precision": "bf16",
     "presence_weight": 1,
-    "run_name": "5scroll_json_eligible_fullres_refinement_gaussian_128_sd1_16x8_ema",
+    "run_name": "5scroll_json_eligible_fullres_refinement_gaussian_halfsigma_128_sd1_16x8_ema",
     "run_path": "/ephemeral/hendrik/fiber3d_train2/runs",
     "sample_vis_interval": 500,
     "scalar_log_interval": 100,
@@ -230,6 +230,11 @@
     "enabled": true,
     "shape_normal_weight": 0.1,
     "shape_tangent_weight": 10.0,
-    "direction_weight": 0.1
+    "direction_weight": 0.1,
+    "orientation_enabled": true,
+    "orientation_learning_rate": 0.05,
+    "orientation_gt_weight": 0.01,
+    "orientation_max_step_degrees": 1.0,
+    "orientation_probe_radius_sigma": 2.0
   }
 }
