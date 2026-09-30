@@ -208,7 +208,9 @@ void SpiralServiceManager::stageInput(const QString& kind, const QString& path, 
         }
         if (!deleted && !QFileInfo::exists(localPath) && error.isEmpty()) error = tr("Input file is missing: %1").arg(localPath);
         QJsonObject manifest{{QStringLiteral("kind"), kind}, {QStringLiteral("path"), localPath},
-            {QStringLiteral("role"), role}, {QStringLiteral("name"), alias}, {QStringLiteral("alias"), alias}};
+            {QStringLiteral("name"), alias}, {QStringLiteral("alias"), alias}};
+        // Only PCLs are role-typed; the service rejects a role on any other kind.
+        if (kind == QStringLiteral("pcl")) manifest[QStringLiteral("role")] = role;
         auto draft = _inputDrafts.value(id);
         if (!draft) {
             _inputOrder.push_back(id);
@@ -226,7 +228,7 @@ void SpiralServiceManager::stageInput(const QString& kind, const QString& path, 
 
 void SpiralServiceManager::stagePatch(const QString& directory, const QString& inputId, bool deleted)
 {
-    stageInput(QStringLiteral("patch"), directory, inputId, QStringLiteral("verified"), {}, deleted);
+    stageInput(QStringLiteral("patch"), directory, inputId, {}, {}, deleted);
 }
 
 void SpiralServiceManager::stageJsonInput(const QString& kind, const QString& path,
@@ -507,9 +509,10 @@ void SpiralServiceManager::applyInputDrafts(bool commit, const QStringList& sele
             const auto& manifest = snapshot.content.manifest;
             const auto kind = manifest.value(QStringLiteral("kind")).toString();
             QJsonObject change{{QStringLiteral("id"), snapshot.id},
-                {QStringLiteral("kind"), kind}, {QStringLiteral("role"), manifest.value(QStringLiteral("role"))},
+                {QStringLiteral("kind"), kind},
                 {QStringLiteral("name"), manifest.value(QStringLiteral("name"))},
                 {QStringLiteral("expected_revision"), qint64(snapshot.expectedAccepted)}};
+            if (kind == QStringLiteral("pcl")) change[QStringLiteral("role")] = manifest.value(QStringLiteral("role"));
             if (snapshot.content.deleted) {
                 change[QStringLiteral("deleted")] = true;
             } else if (manifest.contains(QStringLiteral("restore_revision"))) {

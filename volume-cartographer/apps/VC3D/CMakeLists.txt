@@ -65,6 +65,8 @@ set(srcs
     OpenDataSampleProject.hpp
     OpenDataVolumePrefill.cpp
     OpenDataVolumePrefill.hpp
+    OpenDataVolumeOrientation.cpp
+    OpenDataVolumeOrientation.hpp
     OpenDataNormalGrids.cpp
     OpenDataNormalGrids.hpp
     OpenDataSegmentCache.cpp
@@ -283,6 +285,8 @@ set(srcs
     elements/COutlinedTextItem.cpp
     volume_viewers/CChunkedVolumeViewer.cpp
     volume_viewers/CChunkedVolumeViewer.hpp
+    volume_viewers/IntersectionLayerItem.cpp
+    volume_viewers/IntersectionLayerItem.hpp
     volume_viewers/CameraGizmoWidget.cpp
     volume_viewers/CameraGizmoWidget.hpp
     volume_viewers/VolumetricCompositor.cpp

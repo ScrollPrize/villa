@@ -209,8 +209,9 @@ namespace perf {
     constexpr int RAM_CACHE_SIZE_GB_DEFAULT = 10;
 
     // Startup-only persistent representation for remote-volume chunks.
-    constexpr auto REMOTE_CACHE_DELTA3D = "perf/remote_cache_delta3d";
-    constexpr bool REMOTE_CACHE_DELTA3D_DEFAULT = false;
+    constexpr auto REMOTE_CACHE_DELTA3D = vc::settings::kRemoteCacheDelta3d;
+    constexpr bool REMOTE_CACHE_DELTA3D_DEFAULT =
+        vc::settings::kRemoteCacheDelta3dDefault;
 
     // Shared budget for every managed remote Zarr chunk beneath the resolved
     // vc3d cache root. Zero maximum means unlimited.

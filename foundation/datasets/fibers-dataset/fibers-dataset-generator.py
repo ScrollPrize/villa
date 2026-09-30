@@ -87,7 +87,18 @@ if __name__ == "__main__":
     parser.add_argument("--nml_path", required=True, help="Path to the .nml file.")
     # parser.add_argument("--size", type=int, required=True, help="Chunk size.")
     parser.add_argument("--output_folder", required=True, help="Output folder path.")
+    parser.add_argument("--token_path", default="token.txt",
+                        help="Path to a file containing the WebKnossos token.")
     args = parser.parse_args()
+
+    # Read the token before any expensive work: the volume download needs it, and
+    # failing after the voxelization has already run wastes minutes and leaves a
+    # half-finished output folder behind.
+    try:
+        with open(args.token_path, "r") as file:
+            TOKEN = file.read().strip()
+    except OSError as e:
+        parser.error(f"Failed to read token from {args.token_path}: {e}")
 
     # Create folder structure if it does not exist
     labels_folder = os.path.join(args.output_folder, "labelsTr")
@@ -137,12 +148,6 @@ if __name__ == "__main__":
     print("Loading volume (using webknossos)...")
 
     WK_URL = "http://dl.ash2txt.org:8080"
-
-    # Open and read the token file
-    with open("token.txt", "r") as file:
-        TOKEN = file.read().strip()
-
-    print(f"Loaded TOKEN: {TOKEN}")
 
     ORGANIZATION_ID = "Scroll_Prize"
 

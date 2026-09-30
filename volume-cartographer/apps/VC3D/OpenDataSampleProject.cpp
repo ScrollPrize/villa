@@ -1,4 +1,5 @@
 #include "OpenDataSampleProject.hpp"
+#include "ProjectFiberPaths.hpp"
 
 #include "OpenDataNormalGrids.hpp"
 #include "OpenDataLasagna.hpp"
@@ -360,11 +361,14 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
     const std::filesystem::path& remoteCacheRoot,
     OpenDataSampleProjectResult* resultOut,
     const OpenDataSampleProgressCallback& progressCallback,
-    const OpenDataResourceSelection* selection)
+    const OpenDataResourceSelection* selection,
+    const OpenDataNewProject* newProject)
 {
     auto result = OpenDataSampleProjectResult{};
     std::shared_ptr<VolumePkg> pkg;
-    const auto cachedProjectPath = remoteCacheRoot.empty()
+    if (newProject && (newProject->path.empty() || newProject->name.empty()))
+        throw std::invalid_argument("New project requires a name and destination.");
+    const auto cachedProjectPath = (remoteCacheRoot.empty() || newProject)
         ? std::filesystem::path{}
         : sampleProjectCachePath(remoteCacheRoot, sample);
 
@@ -389,9 +393,10 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
     if (!pkg) {
         vc::project::LoadOptions opts;
         opts.deferResolution = true;
-        pkg = VolumePkg::newEmpty(opts);
+        pkg = newProject ? VolumePkg::newDetached(opts) : VolumePkg::newEmpty(opts);
     }
-    pkg->setName(sample.id.empty() ? "Open Data Sample" : sample.id);
+    pkg->setName(newProject ? newProject->name :
+                 (sample.id.empty() ? "Open Data Sample" : sample.id));
     auto attachResult = attachOpenDataSampleVolumes(*pkg, sample, selection);
     result.supportedVolumes = attachResult.supportedVolumes;
     result.attachedVolumeEntries = attachResult.attachedVolumeEntries;
@@ -420,10 +425,30 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
     // Reconcile against the current manifest on every open. This is metadata-
     // only for lazy segments and also removes stale layout entries from older
     // cached projects.
-    attachOpenDataSampleSegments(*pkg, sample, remoteCacheRoot, result,
-                                 progressCallback);
+    if (selection && selection->segmentIds) {
+        auto segmentSample = sample;
+        std::erase_if(segmentSample.segments, [&](const auto& segment) {
+            const auto& ids = *selection->segmentIds;
+            return std::find(ids.begin(), ids.end(), segment.id) == ids.end();
+        });
+        attachOpenDataSampleSegments(*pkg, segmentSample, remoteCacheRoot, result,
+                                    progressCallback, true);
+    } else {
+        attachOpenDataSampleSegments(*pkg, sample, remoteCacheRoot, result,
+                                    progressCallback);
+    }
     // Catalog loads remain unresolved until volume tags, normal-grid paths,
     // and every segment representation/cache entry have been reconciled.
+    if (newProject) {
+        // Detached preparation must not overwrite the active project's autosave.
+        // Reload the saved JSON to activate ordinary persistence and exercise
+        // exactly the same entry resolution as reopening it later.
+        std::filesystem::create_directories(vc3d::projectFiberDirectory(newProject->path));
+        pkg->save(newProject->path);
+        vc::project::LoadOptions opts;
+        opts.deferResolution = true;
+        pkg = VolumePkg::load(newProject->path, opts);
+    }
     if (pkg->entryResolutionDeferred()) {
         if (progressCallback) {
             OpenDataSampleDownloadProgress progress;
@@ -563,6 +588,11 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
                             volumeIndex, artifactIndex, *reprKind, volume.id)) {
                         continue;
                     }
+                } else if (selection->rawVolumeIds &&
+                           std::find(selection->rawVolumeIds->begin(),
+                                     selection->rawVolumeIds->end(), volume.id) ==
+                               selection->rawVolumeIds->end()) {
+                    continue;
                 }
             }
 
@@ -654,8 +684,9 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
         const auto predictionLabel = volumeArtifactLabel(volume, prediction);
         const int level = candidate.sourceCoordinateLevel;
         if (candidate.sourceUrl.empty() ||
-            std::find(attachedLocations.begin(), attachedLocations.end(),
-                      candidate.sourceUrl) == attachedLocations.end()) {
+            (!(selection && selection->rawVolumeIds) &&
+             std::find(attachedLocations.begin(), attachedLocations.end(),
+                       candidate.sourceUrl) == attachedLocations.end())) {
             ++result.failedVolumes;
             result.messages.push_back(
                 "Skipped virtual source for " + predictionLabel +
@@ -706,11 +737,17 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
 
     std::vector<std::string> attachedVirtualLocators;
     for (const auto& candidate : virtualSources) {
+        // An explicit source selection must not grow additional scan entries.
+        // Prediction coordinate metadata remains available without attaching a
+        // rebased source; native L0 Lasagna resolution is supported directly.
+        if (selection && selection->rawVolumeIds)
+            continue;
         const auto& volume = *candidate.volume;
         const int level = candidate.sourceCoordinateLevel;
         if (candidate.sourceUrl.empty() ||
-            std::find(attachedLocations.begin(), attachedLocations.end(),
-                      candidate.sourceUrl) == attachedLocations.end()) {
+            (!(selection && selection->rawVolumeIds) &&
+             std::find(attachedLocations.begin(), attachedLocations.end(),
+                       candidate.sourceUrl) == attachedLocations.end())) {
             ++result.failedVolumes;
             result.messages.push_back(
                 "Skipped virtual source for " +
@@ -795,13 +832,14 @@ void attachOpenDataSampleSegments(
     const OpenDataSample& sample,
     const std::filesystem::path& remoteCacheRoot,
     OpenDataSampleProjectResult& result,
-    const OpenDataSampleProgressCallback& progressCallback)
+    const OpenDataSampleProgressCallback& progressCallback,
+    bool individualEntries)
 {
     const auto cacheResult = reconcileOpenDataSampleSegments(
         pkg,
         sample,
         remoteCacheRoot,
-        progressCallback);
+        progressCallback, false, individualEntries);
     result.supportedTifxyzSegments += cacheResult.supportedTifxyzSegments;
     result.cachedTifxyzSegments += cacheResult.cachedTifxyzSegments;
     result.attachedSegmentEntries += cacheResult.attachedSegmentEntries;

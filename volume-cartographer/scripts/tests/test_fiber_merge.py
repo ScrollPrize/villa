@@ -37,7 +37,7 @@ def line_for(cps, samples_per_span=4):
 
 
 def make_fiber(cps, branches=None, tags=None, generation=1,
-               filename='dj_x_000001.json'):
+               filename='dj_x_000001.json', adjacent_branches=None):
     return {
         'type': 'vc3d_fiber',
         'version': 1,
@@ -47,6 +47,7 @@ def make_fiber(cps, branches=None, tags=None, generation=1,
         'control_points': [list(p) for p in cps],
         'line_points': line_for(cps),
         'branches': copy.deepcopy(branches or []),
+        'adjacent_branches': copy.deepcopy(adjacent_branches or []),
         'tags': list(tags or []),
     }
 
@@ -226,74 +227,75 @@ def loader_issues(docs_by_name):
                 issues.append(f"{name}: control point {k} not on line (fatal)")
                 break
             li += 1
-        for entry in doc.get('branches', []):
-            # Parse-time stripping: the loader deletes (and rewrites the
-            # file without) entries it cannot parse — surfaced as issues so
-            # merge output never relies on that destruction.
-            if (not isinstance(entry, dict) or
-                    'link_direction' in entry or
-                    any(key not in entry for key in _REQUIRED_BRANCH_KEYS) or
-                    not _l_basename(entry['branch_file'])):
-                issues.append(f"{name}: branch entry stripped at parse time "
-                              "(file rewritten)")
-                continue
-            if (not _l_finite_direction(entry['control_point_direction']) or
-                    not _l_finite_direction(
-                        entry['branch_control_point_direction'])):
-                issues.append(f"{name}: non-finite branch direction")
-                continue
-            i = entry['control_point_index']
-            if not (isinstance(i, int) and 0 <= i < len(cps)):
-                issues.append(f"{name}: local CP index out of range")
-                continue
-            if not _l_pos_eq(cps[i], entry['control_point_position']):
-                issues.append(f"{name}: local CP position mismatch")
-                continue
-            if len(line) >= 2:
-                tangent = _l_tangent(line, entry['control_point_position'])
-                if not _l_dirs_compatible(entry['control_point_direction'],
-                                          tangent):
-                    issues.append(f"{name}: branch endpoint direction mismatch")
+        for kind in ('branches', 'adjacent_branches'):
+            for entry in doc.get(kind, []):
+                # Parse-time stripping: the loader deletes (and rewrites the
+                # file without) entries it cannot parse — surfaced as issues so
+                # merge output never relies on that destruction.
+                if (not isinstance(entry, dict) or
+                        'link_direction' in entry or
+                        any(key not in entry for key in _REQUIRED_BRANCH_KEYS) or
+                        not _l_basename(entry['branch_file'])):
+                    issues.append(f"{name}: branch entry stripped at parse time "
+                                  "(file rewritten)")
                     continue
-            target = docs_by_name.get(_l_basename(entry['branch_file']))
-            if target is None:
-                issues.append(f"{name}: missing linked fiber "
-                              f"{entry['branch_file']}")
-                continue
-            tcps = [_l_cp_position(cp) for cp in target['control_points']]
-            tline = target['line_points']
-            j = entry['branch_control_point_index']
-            if not (isinstance(j, int) and 0 <= j < len(tcps)):
-                issues.append(f"{name}: linked CP index out of range")
-                continue
-            if not _l_pos_eq(tcps[j], entry['branch_control_point_position']):
-                issues.append(f"{name}: linked CP position mismatch")
-                continue
-            if len(tline) >= 2:
-                tangent = _l_tangent(tline,
-                                     entry['branch_control_point_position'])
-                if not _l_dirs_compatible(
-                        entry['branch_control_point_direction'], tangent):
-                    issues.append(f"{name}: linked endpoint direction mismatch")
+                if (not _l_finite_direction(entry['control_point_direction']) or
+                        not _l_finite_direction(
+                            entry['branch_control_point_direction'])):
+                    issues.append(f"{name}: non-finite branch direction")
                     continue
-            # C2: index-exact reciprocity, plus positions and directions
-            # compared STORED against STORED.
-            reciprocal = any(
-                _l_basename(c.get('branch_file')) == name and
-                c.get('control_point_index') == j and
-                c.get('branch_control_point_index') == i and
-                _l_pos_eq(c.get('control_point_position'),
-                          entry['branch_control_point_position']) and
-                _l_pos_eq(c.get('branch_control_point_position'),
-                          entry['control_point_position']) and
-                _l_dirs_compatible(c.get('control_point_direction'),
-                                   entry['branch_control_point_direction']) and
-                _l_dirs_compatible(c.get('branch_control_point_direction'),
-                                   entry['control_point_direction'])
-                for c in target.get('branches', []) if isinstance(c, dict))
-            if not reciprocal:
-                issues.append(f"{name}: missing reciprocal branch in "
-                              f"{entry['branch_file']}")
+                i = entry['control_point_index']
+                if not (isinstance(i, int) and 0 <= i < len(cps)):
+                    issues.append(f"{name}: local CP index out of range")
+                    continue
+                if not _l_pos_eq(cps[i], entry['control_point_position']):
+                    issues.append(f"{name}: local CP position mismatch")
+                    continue
+                if len(line) >= 2:
+                    tangent = _l_tangent(line, entry['control_point_position'])
+                    if not _l_dirs_compatible(entry['control_point_direction'],
+                                              tangent):
+                        issues.append(f"{name}: branch endpoint direction mismatch")
+                        continue
+                target = docs_by_name.get(_l_basename(entry['branch_file']))
+                if target is None:
+                    issues.append(f"{name}: missing linked fiber "
+                                  f"{entry['branch_file']}")
+                    continue
+                tcps = [_l_cp_position(cp) for cp in target['control_points']]
+                tline = target['line_points']
+                j = entry['branch_control_point_index']
+                if not (isinstance(j, int) and 0 <= j < len(tcps)):
+                    issues.append(f"{name}: linked CP index out of range")
+                    continue
+                if not _l_pos_eq(tcps[j], entry['branch_control_point_position']):
+                    issues.append(f"{name}: linked CP position mismatch")
+                    continue
+                if len(tline) >= 2:
+                    tangent = _l_tangent(tline,
+                                         entry['branch_control_point_position'])
+                    if not _l_dirs_compatible(
+                            entry['branch_control_point_direction'], tangent):
+                        issues.append(f"{name}: linked endpoint direction mismatch")
+                        continue
+                # C2: index-exact reciprocity, plus positions and directions
+                # compared STORED against STORED.
+                reciprocal = any(
+                    _l_basename(c.get('branch_file')) == name and
+                    c.get('control_point_index') == j and
+                    c.get('branch_control_point_index') == i and
+                    _l_pos_eq(c.get('control_point_position'),
+                              entry['branch_control_point_position']) and
+                    _l_pos_eq(c.get('branch_control_point_position'),
+                              entry['control_point_position']) and
+                    _l_dirs_compatible(c.get('control_point_direction'),
+                                       entry['branch_control_point_direction']) and
+                    _l_dirs_compatible(c.get('branch_control_point_direction'),
+                                       entry['control_point_direction'])
+                    for c in target.get(kind, []) if isinstance(c, dict))
+                if not reciprocal:
+                    issues.append(f"{name}: missing reciprocal branch in "
+                                  f"{entry['branch_file']}")
     return issues
 
 
@@ -587,7 +589,7 @@ def test_short_circuit_local_unchanged():
     remote = make_fiber(BASE_CPS, tags=['new'], generation=4)
     result = merge_fibers(base, copy.deepcopy(base), remote)
     assert result['ok']
-    assert result['merged'] == remote
+    assert result['merged'] == dict(remote, width_gap_fraction=0.2)
     # A wholesale-adopted side is already consistent with its peers
     assert result['peer_files'] == []
 
@@ -596,7 +598,7 @@ def test_noop_stability():
     base = make_fiber(BASE_CPS)
     result = merge_fibers(base, copy.deepcopy(base), copy.deepcopy(base))
     assert result['ok']
-    assert result['merged'] == base
+    assert result['merged'] == dict(base, width_gap_fraction=0.2)
 
 
 def test_tolerance_bounds():
@@ -808,6 +810,251 @@ def test_refresh_syncs_pending_on_existing_reciprocal():
     assert out['ok'] and out['b_changed']
     assert not out['b_doc']['branches'][0].get('pending', False)
     assert loader_issues({'a.json': out['a_doc'], 'b.json': out['b_doc']}) == []
+
+
+def test_refresh_ordinary_link_does_not_create_missing_adjacent_array():
+    a, b = make_pair('a.json', 'b.json', BASE_CPS,
+                     [cp(i, dz=50.0) for i in range(4)], 2, 1)
+    del b['adjacent_branches']
+    a['branches'][0].pop('pending', None)
+
+    out = refresh_pair_links(a, b, 'a.json', 'b.json')
+
+    assert out['ok']
+    assert 'adjacent_branches' not in out['b_doc']
+
+
+def adjacent_pair():
+    b_cps = [cp(i, dz=50.0) for i in range(4)]
+    a, b = make_pair('a.json', 'b.json', BASE_CPS, b_cps, 2, 1)
+    for doc in (a, b):
+        doc['adjacent_branches'] = doc.pop('branches')
+        doc['branches'] = []
+    return a, b
+
+
+@pytest.mark.parametrize('array_present', [False, True])
+def test_refresh_restores_adjacent_reciprocal_in_its_own_array(array_present):
+    a, b = adjacent_pair()
+    b['adjacent_branches'] = []
+    if not array_present:
+        del b['adjacent_branches']
+    out = refresh_pair_links(a, b, 'a.json', 'b.json')
+    assert out['ok'] and out['b_changed']
+    assert out['b_doc']['branches'] == []
+    assert len(out['b_doc']['adjacent_branches']) == 1
+    assert 'adjacent' not in out['b_doc']['adjacent_branches'][0]
+    assert loader_issues({'a.json': out['a_doc'], 'b.json': out['b_doc']}) == []
+    again = refresh_pair_links(out['a_doc'], out['b_doc'], 'a.json', 'b.json')
+    assert again['ok'] and not again['a_changed'] and not again['b_changed']
+
+
+@pytest.mark.parametrize('kind', ['branches', 'adjacent_branches'])
+def test_refresh_relink_moves_reciprocal_between_arrays(kind):
+    a, b = adjacent_pair()
+    old_kind = 'adjacent_branches' if kind == 'branches' else 'branches'
+    if old_kind == 'branches':
+        for doc in (a, b):
+            doc['branches'], doc['adjacent_branches'] = doc['adjacent_branches'], []
+    base = copy.deepcopy(a)
+    a[kind], a[old_kind] = a[old_kind], []
+    a[kind][0]['pending'] = True
+    out = refresh_pair_links(a, b, 'a.json', 'b.json', base_doc=base)
+    assert out['ok'] and out['b_changed']
+    assert out['b_doc'][old_kind] == []
+    assert len(out['b_doc'][kind]) == 1
+    assert out['b_doc'][kind][0]['pending'] is True
+    assert out['b_doc']['generation'] == b['generation'] + 1
+    assert loader_issues({'a.json': out['a_doc'], 'b.json': out['b_doc']}) == []
+
+
+def test_refresh_never_pairs_different_kinds_without_a_base():
+    a, b = adjacent_pair()
+    b['branches'], b['adjacent_branches'] = b['adjacent_branches'], []
+    assert loader_issues({'a.json': a, 'b.json': b})
+    out = refresh_pair_links(a, b, 'a.json', 'b.json')
+    assert not out['ok']
+    assert out['a_doc'] == a and out['b_doc'] == b
+    assert not out['a_changed'] and not out['b_changed']
+
+
+def test_refresh_missing_array_cannot_erase_peer_adjacent_links():
+    a, b = adjacent_pair()
+    del a['adjacent_branches']
+    out = refresh_pair_links(a, b, 'a.json', 'b.json')
+    assert not out['ok']
+    assert any('older VC3D' in message for message in out['conflicts'])
+    assert out['b_doc'] == b and not out['b_changed']
+
+
+def test_refresh_with_base_detects_both_arrays_stripped():
+    a, b = adjacent_pair()
+    base = copy.deepcopy(a)
+    del a['adjacent_branches']
+    del b['adjacent_branches']
+    out = refresh_pair_links(a, b, 'a.json', 'b.json', base_doc=base)
+    assert not out['ok']
+    assert out['a_doc'] == a and out['b_doc'] == b
+
+
+@pytest.mark.parametrize('kind', ['branches', 'adjacent_branches'])
+def test_refresh_deletion_only_removes_same_kind_reciprocal(kind):
+    a, b = adjacent_pair()
+    other = 'branches' if kind == 'adjacent_branches' else 'adjacent_branches'
+    for doc in (a, b):
+        doc['branches'] = copy.deepcopy(doc['adjacent_branches'])
+    base = copy.deepcopy(a)
+    a[kind] = []
+    out = refresh_pair_links(a, b, 'a.json', 'b.json', base_doc=base)
+    assert out['ok']
+    assert out['b_doc'][kind] == []
+    assert len(out['b_doc'][other]) == 1
+    assert loader_issues({'a.json': out['a_doc'], 'b.json': out['b_doc']}) == []
+
+
+@pytest.mark.parametrize('kind', ['branches', 'adjacent_branches'])
+@pytest.mark.parametrize('remote_action', ['untouched', 'deleted', 'approved'])
+def test_relink_moves_entry_and_keeps_fresh_review_state(kind, remote_action):
+    old_kind = 'adjacent_branches' if kind == 'branches' else 'branches'
+    entry = link('kb_a.json', BASE_CPS[2], OTHER, 2, pending=True)
+    base = make_fiber(BASE_CPS, **{old_kind: [entry]})
+    local = make_fiber(BASE_CPS, generation=2, **{kind: [entry]})
+    remote = copy.deepcopy(base)
+    remote['tags'] = ['x']
+    if remote_action == 'deleted':
+        remote[old_kind] = []
+    elif remote_action == 'approved':
+        remote[old_kind][0]['pending'] = False
+    result = merge_fibers(base, local, remote)
+    assert result['ok']
+    assert result['merged'][old_kind] == []
+    assert result['merged'][kind] == [entry]
+    assert result['stats']['links_approved'] == 0
+
+
+@pytest.mark.parametrize('sides', ['local', 'remote', 'both'])
+@pytest.mark.parametrize('other_action', ['untouched', 'metadata', 'deleted'])
+def test_stripped_array_is_a_conflict_before_all_shortcuts(sides, other_action):
+    entry = link('kb_a.json', BASE_CPS[2], OTHER, 2)
+    base = make_fiber(BASE_CPS, adjacent_branches=[entry])
+    local, remote = copy.deepcopy(base), copy.deepcopy(base)
+    for name, doc in (('local', local), ('remote', remote)):
+        if sides in (name, 'both'):
+            del doc['adjacent_branches']
+            doc['generation'] = 2
+        elif other_action == 'metadata':
+            doc['tags'] = ['x']
+        elif other_action == 'deleted':
+            doc['adjacent_branches'] = []
+    result = merge_fibers(base, local, remote)
+    assert not result['ok']
+    assert any('older VC3D' in message for message in result['conflicts'])
+
+
+def test_strip_detection_does_not_depend_on_remaining_links_or_geometry():
+    entry = link('kb_a.json', BASE_CPS[2], OTHER, 2)
+    base = make_fiber(BASE_CPS, branches=[entry], adjacent_branches=[entry])
+    stripped = make_fiber([cp(i, dz=50) for i in range(4)])
+    del stripped['adjacent_branches']
+    assert fiber_merge.legacy_regression(stripped, base)
+    stripped['adjacent_branches'] = []
+    assert fiber_merge.legacy_regression(stripped, base) is None
+
+
+@pytest.mark.parametrize('has_array', [False, True])
+def test_legacy_regression_requires_base_adjacent_entries(has_array):
+    base = make_fiber(BASE_CPS)
+    if not has_array:
+        del base['adjacent_branches']
+    legacy = make_fiber(BASE_CPS)
+    del legacy['adjacent_branches']
+    assert fiber_merge.legacy_regression(legacy, base) is None
+    result = merge_fibers(base, legacy, legacy)
+    assert result['ok'] and 'adjacent_branches' not in result['merged']
+
+
+def test_full_merge_preserves_an_absent_adjacent_array():
+    """All three inputs lack adjacent_branches and both sides edited tags,
+    so no whole-document shortcut applies and the full merge runs. It must
+    not manufacture an empty array: that reads as "deliberately no adjacent
+    links" and would hide a peer's missing reciprocal from the sync check
+    and from the loader's repair."""
+    base = make_fiber(BASE_CPS)
+    del base['adjacent_branches']
+    local = copy.deepcopy(base)
+    local['tags'] = ['x']
+    local['generation'] = 2
+    remote = copy.deepcopy(base)
+    remote['tags'] = ['y']
+    remote['generation'] = 2
+    result = merge_fibers(base, local, remote)
+    assert result['ok'], result['conflicts']
+    assert 'adjacent_branches' not in result['merged']
+    assert 'branches' in result['merged']
+    assert loader_issues({'dj_x_000001.json': result['merged']}) == []
+    # Same when only the BASE knew the kind: it contributes no entries, so
+    # an empty array on it says nothing about what the two saved files know.
+    known_base = make_fiber(BASE_CPS)
+    assert known_base['adjacent_branches'] == []
+    result = merge_fibers(known_base, local, remote)
+    assert result['ok'], result['conflicts']
+    assert 'adjacent_branches' not in result['merged']
+    # An input that knows the kind still yields an explicit empty array.
+    knowing = copy.deepcopy(local)
+    knowing['adjacent_branches'] = []
+    result = merge_fibers(base, knowing, remote)
+    assert result['ok'], result['conflicts']
+    assert result['merged']['adjacent_branches'] == []
+
+
+def test_merge_kind_mismatch_without_a_base_is_a_conflict():
+    entry = link('kb_a.json', BASE_CPS[2], OTHER, 2)
+    result = merge_fibers(make_fiber(BASE_CPS),
+                          make_fiber(BASE_CPS, adjacent_branches=[entry]),
+                          make_fiber(BASE_CPS, branches=[entry]))
+    assert not result['ok']
+    assert any('adjacent' in message for message in result['conflicts'])
+
+
+def test_merge_combines_both_arrays_and_reports_adjacent_peers():
+    ordinary = link('ordinary.json', BASE_CPS[2], OTHER, 2)
+    adjacent = link('adjacent.json', BASE_CPS[4], OTHER, 4)
+    result = merge_fibers(make_fiber(BASE_CPS),
+                          make_fiber(BASE_CPS, branches=[ordinary]),
+                          make_fiber(BASE_CPS, adjacent_branches=[adjacent]))
+    assert result['ok']
+    assert result['merged']['branches'] == [ordinary]
+    assert result['merged']['adjacent_branches'] == [adjacent]
+    assert result['peer_files'] == ['adjacent.json', 'ordinary.json']
+
+
+@pytest.mark.parametrize('kind', ['branches', 'adjacent_branches'])
+def test_each_kind_reanchors_links_after_geometry_merge(kind):
+    a, b = adjacent_pair()
+    if kind == 'branches':
+        for doc in (a, b):
+            doc['branches'], doc['adjacent_branches'] = doc['adjacent_branches'], []
+    local, remote = copy.deepcopy(a), copy.deepcopy(a)
+    local['control_points'].insert(1, cp(0.5))
+    local['line_points'] = line_for(local['control_points'])
+    local[kind][0]['control_point_index'] += 1
+    remote[kind][0]['pending'] = False
+    merged = merge_fibers(a, local, remote)
+    assert merged['ok']
+    assert merged['merged'][kind][0]['control_point_index'] == 3
+    assert not merged['merged'][kind][0]['pending']
+    refreshed = refresh_pair_links(merged['merged'], b, 'a.json', 'b.json', base_doc=a)
+    assert refreshed['ok']
+    assert loader_issues({'a.json': refreshed['a_doc'], 'b.json': refreshed['b_doc']}) == []
+
+
+@pytest.mark.parametrize('kind', ['branches', 'adjacent_branches'])
+def test_each_kind_preserves_opaque_entries(kind):
+    base = make_fiber(BASE_CPS, **{kind: [{'unrecognized': 'entry'}]})
+    local, remote = copy.deepcopy(base), copy.deepcopy(base)
+    local['tags'], remote['tags'] = ['local'], ['remote']
+    result = merge_fibers(base, local, remote)
+    assert result['ok'] and result['merged'][kind] == base[kind]
 
 
 def test_branch_file_compared_as_basename():
@@ -1032,7 +1279,7 @@ def test_short_circuit_merges_still_report_peers():
     remote = make_fiber(BASE_CPS, branches=[entry], tags=['new'], generation=4)
     result = merge_fibers(base, copy.deepcopy(base), remote)
     assert result['ok']
-    assert result['merged'] == remote
+    assert result['merged'] == dict(remote, width_gap_fraction=0.2)
     assert result['peer_files'] == ['kb_a.json']
 
 
@@ -1412,7 +1659,7 @@ def test_v3_short_circuit_merge_then_refresh(changed_side):
     result = merge_fibers(base_a, local, remote)
     assert result['ok'], result['conflicts']
     assert result['peer_files'] == ['b.json']
-    assert result['merged'] == changed
+    assert result['merged'] == dict(changed, width_gap_fraction=0.2)
 
     out = refresh_pair_links(result['merged'], b, 'a.json', 'b.json',
                              base_doc=base_a)
@@ -1519,6 +1766,104 @@ def test_v3_interior_control_point_tag_survives_a_separated_remote_span_change()
     assert loader_issues({'dj_x_000001.json': merged}) == []
 
 
+def test_display_metadata_merges_independently_of_geometry():
+    base = make_v3_fiber(BASE_CPS)
+    local, remote = copy.deepcopy(base), copy.deepcopy(base)
+    local['width'] = 24
+    local['control_points'][0]['display_normal'] = [0, 1, 0]
+    remote['control_points'][1]['display_normal'] = [0, 0, 1]
+    set_v3_span(remote, 5, goal='lasagna', bend=-2.0)
+    result = merge_fibers(base, local, remote)
+    assert result['ok'], result['conflicts']
+    assert result['merged']['width'] == 24
+    assert result['merged']['control_points'][0]['display_normal'] == [0, 1, 0]
+    assert result['merged']['control_points'][1]['display_normal'] == [0, 0, 1]
+    assert result['merged']['control_points'][5]['segment_to_next']['interp_goal'] == 'lasagna'
+
+
+def test_display_metadata_conflicts_and_reset():
+    base = make_v3_fiber(BASE_CPS)
+    base['control_points'][0]['display_normal'] = [0, 1, 0]
+    local, remote = copy.deepcopy(base), copy.deepcopy(base)
+    del local['control_points'][0]['display_normal']
+    remote['width'] = 12
+    result = merge_fibers(base, local, remote)
+    assert result['ok'], result['conflicts']
+    assert 'display_normal' not in result['merged']['control_points'][0]
+    remote['control_points'][0]['display_normal'] = [0, 0, 1]
+    assert not merge_fibers(base, local, remote)['ok']
+
+
+def test_display_normal_provenance_merges_with_normal():
+    base = make_v3_fiber(BASE_CPS)
+    base['control_points'][0]['display_normal'] = [0, 1, 0]
+    base['control_points'][0]['display_normal_source'] = 'interpolated'
+    local, remote = copy.deepcopy(base), copy.deepcopy(base)
+    local['control_points'][0]['display_normal_source'] = 'manual'
+    remote['width'] = 24
+    result = merge_fibers(base, local, remote)
+    assert result['ok'], result['conflicts']
+    assert result['merged']['control_points'][0]['display_normal_source'] == 'manual'
+    # Provenance must not detach from a concurrently changed vector.
+    remote['control_points'][0]['display_normal'] = [0, 0, 1]
+    assert not merge_fibers(base, local, remote)['ok']
+
+
+def test_display_normal_provenance_legacy_and_validation():
+    base = make_v3_fiber(BASE_CPS)
+    base['control_points'][0]['display_normal'] = [0, 1, 0]
+    result = merge_fibers(base, base, base)
+    assert result['ok']
+    assert result['merged']['control_points'][0]['display_normal_source'] == 'unknown'
+    base['control_points'][0]['display_normal_source'] = 'invalid'
+    assert not merge_fibers(base, base, base)['ok']
+
+
+def test_width_gap_defaults_and_three_way_merge():
+    base = make_v3_fiber(BASE_CPS)
+    assert merge_fibers(base, base, base)['merged']['width_gap_fraction'] == 0.2
+    local, remote = copy.deepcopy(base), copy.deepcopy(base)
+    local['width_gap_fraction'] = 0.3
+    remote['width'] = 15
+    result = merge_fibers(base, local, remote)
+    assert result['ok'], result['conflicts']
+    assert result['merged']['width_gap_fraction'] == 0.3
+    assert result['merged']['width'] == 15
+    assert merge_fibers(base, base, local)['merged']['width_gap_fraction'] == 0.3
+    remote['width_gap_fraction'] = 0.4
+    assert not merge_fibers(base, local, remote)['ok']
+    for bad in [-0.1, 1.1, '20%', None, True]:
+        local['width_gap_fraction'] = bad
+        assert not fiber_merge.is_fiber_doc(local)
+    local, remote = copy.deepcopy(base), copy.deepcopy(base)
+    local['width'], remote['width'] = 10, 20
+    assert not merge_fibers(base, local, remote)['ok']
+
+
+@pytest.mark.parametrize('version', [3, 4])
+def test_cp_directions_merge_validate_and_preserve_sign(version):
+    base = make_v3_fiber(BASE_CPS)
+    base['version'] = version
+    if version == 4:
+        base['control_points'][0]['segment_to_next']['tags'] = ['damaged']
+    local, remote = copy.deepcopy(base), copy.deepcopy(base)
+    local['control_points'][0]['direction'] = [1, 0, 0]
+    remote['control_points'][0]['direction'] = [1, 0, 0]
+    remote['width'] = 20
+    result = merge_fibers(base, local, remote)
+    assert result['ok'], result['conflicts']
+    assert result['merged']['control_points'][0]['direction'] == [1, 0, 0]
+    assert result['merged']['width'] == 20
+    assert result['merged']['version'] == version
+    if version == 4:
+        assert result['merged']['control_points'][0]['segment_to_next']['tags'] == ['damaged']
+    remote['control_points'][0]['direction'] = [-1, 0, 0]
+    assert not merge_fibers(base, local, remote)['ok']
+    for invalid in ([0, 0, 0], [1, 2], [float('nan'), 0, 1]):
+        local['control_points'][0]['direction'] = invalid
+        assert not fiber_merge.is_fiber_doc(local)
+
+
 def test_v3_tagging_and_refitting_the_same_final_span_is_a_manual_conflict():
     base = make_v3_fiber(BASE_CPS)
     local = copy.deepcopy(base)
@@ -1532,3 +1877,147 @@ def test_v3_tagging_and_refitting_the_same_final_span_is_a_manual_conflict():
 
     assert not result['ok']
     assert any('changed differently on both sides' in c for c in result['conflicts'])
+
+
+def test_is_fiber_doc_accepts_the_break_tag():
+    """The break tag is one more string in the per-CP tags array: every loader
+    already accepts it, on any control point, so untouched fibers and older
+    builds see no new field."""
+    doc = make_v3_fiber(BASE_CPS)
+    doc['control_points'][1]['tags'] = ['break']
+    doc['control_points'][2]['tags'] = ['break']
+    assert fiber_merge.is_fiber_doc(doc)
+    assert loader_issues({'dj_x_000001.json': doc}) == []
+
+
+def make_v4_gap(doc, first):
+    """What VC3D writes for a gap between controls first and first+1: both
+    break tags, the span's 'gap' tag and the cubic-spline goal, under format
+    version 4."""
+    doc['version'] = 4
+    doc['control_points'][first]['tags'] = ['break']
+    doc['control_points'][first + 1]['tags'] = ['break']
+    set_v3_span(doc, first, goal='cspline', bend=0.0)
+    doc['control_points'][first]['segment_to_next']['tags'] = ['gap']
+
+
+def test_is_fiber_doc_version_4_span_tags():
+    """Version 4 = version 3 plus optional span tags; a version-3 span may not
+    carry them, and the tags must be a list of strings."""
+    doc = make_v3_fiber(BASE_CPS)
+    make_v4_gap(doc, 1)
+    assert fiber_merge.is_fiber_doc(doc)
+    assert fiber_merge._has_trace_span(doc)
+    v3 = copy.deepcopy(doc)
+    v3['version'] = 3
+    assert not fiber_merge.is_fiber_doc(v3)
+    bad = copy.deepcopy(doc)
+    bad['control_points'][1]['segment_to_next']['tags'] = 'gap'
+    assert not fiber_merge.is_fiber_doc(bad)
+    bad = copy.deepcopy(doc)
+    bad['control_points'][1]['segment_to_next']['tags'] = [1]
+    assert not fiber_merge.is_fiber_doc(bad)
+    bad = copy.deepcopy(doc)
+    bad['control_points'][1]['segment_to_next']['gap'] = True     # unknown field
+    assert not fiber_merge.is_fiber_doc(bad)
+
+
+def test_v4_gap_span_survives_a_separated_remote_span_change():
+    """A gap is two consecutive break tags, the span's own 'gap' tag and the
+    cubic-spline goal; all live in the same span run, so a change elsewhere
+    merges and the gap arrives intact. A v3 base with v4 sides (the normal
+    state right after an upgrade) is not a version conflict; the merge is
+    written as version 4."""
+    base = make_v3_fiber(BASE_CPS)
+    local = copy.deepcopy(base)
+    remote = copy.deepcopy(base)
+    local['generation'] = 2
+    remote['generation'] = 3
+    make_v4_gap(local, 1)
+    remote['version'] = 4
+    set_v3_span(remote, 5, goal='lasagna', bend=-2.0)
+
+    result = merge_fibers(base, local, remote)
+
+    assert result['ok'], result['conflicts']
+    merged = result['merged']
+    assert merged['version'] == 4
+    assert merged['control_points'][1]['tags'] == ['break']
+    assert merged['control_points'][2]['tags'] == ['break']
+    assert merged['control_points'][1]['segment_to_next']['interp_goal'] == 'cspline'
+    assert merged['control_points'][1]['segment_to_next']['tags'] == ['gap']
+    assert merged['control_points'][5]['segment_to_next']['interp_goal'] == 'lasagna'
+    assert 'tags' not in merged['control_points'][5]['segment_to_next']
+    assert loader_issues({'dj_x_000001.json': merged}) == []
+
+
+def test_v3_remote_still_merges_with_a_v4_local():
+    """One side still on the old build: its version-3 file merges against
+    the v4 side; the result is version 4."""
+    base = make_v3_fiber(BASE_CPS)
+    local = copy.deepcopy(base)
+    remote = copy.deepcopy(base)
+    local['generation'] = 2
+    remote['generation'] = 3
+    local['version'] = 4
+    set_v3_span(local, 1, goal='cspline', bend=1.5)
+    set_v3_span(remote, 5, goal='lasagna', bend=-2.0)
+
+    result = merge_fibers(base, local, remote)
+
+    assert result['ok'], result['conflicts']
+    assert result['merged']['version'] == 4
+    assert loader_issues({'dj_x_000001.json': result['merged']}) == []
+
+
+def test_v3_side_from_an_old_build_does_not_pull_a_v4_file_back():
+    """A one-sided shortcut result is written at the lineage's highest
+    version: base v4, remote v4 unchanged, local re-saved by an old build as
+    v3 (span tags dropped) still merges to version 4."""
+    base = make_v3_fiber(BASE_CPS)
+    base['version'] = 4
+    remote = copy.deepcopy(base)
+    local = copy.deepcopy(base)
+    local['version'] = 3
+    local['generation'] = 2
+    set_v3_span(local, 1, goal='cspline', bend=1.5)
+
+    result = merge_fibers(base, local, remote)
+
+    assert result['ok'], result['conflicts']
+    assert result['merged']['version'] == 4
+    assert result['merged']['control_points'][1]['segment_to_next']['interp_goal'] == 'cspline'
+    assert loader_issues({'dj_x_000001.json': result['merged']}) == []
+
+
+def test_v3_save_over_a_v4_base_with_span_tags_is_a_regression_conflict():
+    """An older build re-saving a fiber whose last-synced copy carried span
+    tags cannot have kept them: that is a conflict for manual resolution
+    (before the merge shortcuts and in vc_sync's upload guard), not a silent
+    loss. A v4 base WITHOUT span tags re-saved as v3 is fine."""
+    base = make_v3_fiber(BASE_CPS)
+    make_v4_gap(base, 1)
+    stale = copy.deepcopy(base)
+    stale['version'] = 3
+    for cp in stale['control_points'][:-1]:
+        cp['segment_to_next'].pop('tags', None)
+    stale['generation'] = 2
+    set_v3_span(stale, 5, goal='lasagna', bend=-2.0)
+    assert fiber_merge.legacy_regression(stale, base)
+    # Shortcut path: remote unchanged, local is the stale v3 save.
+    result = merge_fibers(base, stale, copy.deepcopy(base))
+    assert not result['ok']
+    assert any('span tags' in c for c in result['conflicts'])
+    # Content-merge path: remote changed too.
+    remote = copy.deepcopy(base)
+    remote['generation'] = 3
+    set_v3_span(remote, 3, goal='cspline', bend=1.0)
+    result = merge_fibers(base, stale, remote)
+    assert not result['ok']
+    assert any('span tags' in c for c in result['conflicts'])
+    # No span tags in the base: a v3 re-save is no regression.
+    plain = make_v3_fiber(BASE_CPS)
+    plain['version'] = 4
+    downgraded = copy.deepcopy(plain)
+    downgraded['version'] = 3
+    assert fiber_merge.legacy_regression(downgraded, plain) is None

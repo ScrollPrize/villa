@@ -69,9 +69,11 @@ public:
     // SurfaceProjection / SurfaceProjectionContext live in
     // volume_viewers/SurfaceProjection.hpp; see it for what the split is for.
 
-    // nullopt when the point does not project onto the displayed surface.
+    // nullopt when the point does not project onto the displayed surface or,
+    // for quad surfaces, lies more than `depthTolerance` outside the
+    // displayed depth band.
     virtual std::optional<SurfaceProjection> projectVolumePoint(
-        const cv::Vec3f& vol_point) const = 0;
+        const cv::Vec3f& vol_point, float depthTolerance) const = 0;
     virtual QPointF surfaceProjectionToScene(const SurfaceProjection& projection) const = 0;
     virtual SurfaceProjectionContext surfaceProjectionContext() const = 0;
 
@@ -168,8 +170,8 @@ public:
     // When the SurfaceCache band covers a frame, stop publishing that frame's
     // raw-path viewport chunk demand so the (background-priority) tile fills
     // are not starved by interactive fetches for a sampling path the frame
-    // never executes. Off by default; enabled by workspaces where the
-    // flattened view is the primary pane (the Spiral workspace).
+    // never executes. Off by default; enabled by the main and Spiral
+    // workspaces.
     virtual void setPreferSurfaceTileFills(bool) {}
 
     // --- Interaction state ---

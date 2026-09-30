@@ -3,6 +3,7 @@
 #include <set>
 
 #include "FiberRuntimeIds.hpp"
+#include "vc/fiber_tracer/FiberDisplay.hpp"
 
 #include <QObject>
 #include <QPointF>
@@ -152,6 +153,13 @@ public:
         // Mirrors FiberBranchRef::pending: the link still awaits reviewer
         // approval, and the map colours it like the annotation views do.
         bool pending = false;
+        // Mirrors FiberBranchRef::adjacent: the endpoints are one winding
+        // apart (V inside H), which the map's winding solve honours.
+        bool adjacent = false;
+        // The containing JSON array states the kind explicitly, so
+        // two refs of one pair with different kinds are a real disagreement.
+        // Missing adjacent arrays are healed before load-time validation.
+        bool adjacentExplicit = true;
     };
 
     struct FiberMapFiber {
@@ -170,6 +178,15 @@ public:
         // Per control point: carries the kollesis_termination tag. Same size
         // as controlPoints.
         std::vector<bool> kollesisTerminations;
+        // Per control point: carries the break tag (dotted rim in the map).
+        // Same size as controlPoints.
+        std::vector<bool> breaks;
+        // Per control-point span: the span descriptor carries the gap span
+        // tag (dotted amber run in the map). Size max(0, controlPoints - 1).
+        std::vector<bool> gapSegments;
+        // Per control-point span: the damaged span tag (alternating amber
+        // and red dashes in the map). Same size.
+        std::vector<bool> damagedSegments;
         // Branch links resolving to a loaded fiber, pending included.
         std::vector<FiberMapLink> links;
     };
@@ -198,6 +215,11 @@ public:
         // count scaled back to the annotation (level 0) resolution; 0 when the
         // volume is unknown.
         int annotationZSlices = 0;
+        // The current volume's open-data coordinate space
+        // ("<sample>/<volume>@L<level>", from its vc-open-data tags), which
+        // names the catalog entry that orients it; empty for a volume without
+        // the tags.
+        std::string coordinateSpace;
         QString umbilicusMessage;           // resolver error / ambiguity text; empty on success
         // Ready-to-display description of the frame the scale maps from, for
         // workspace status bars: the stamped volume and its level offset when
@@ -230,6 +252,11 @@ public:
     // saved-fiber control-point ordering. Any live mutation of control points or
     // branches must go through the private session paths that call
     // syncLinkedBranchMetadataAfterFiberModification().
+    // Adjacent links have the same entry schema as ordinary branches, in a
+    // separate top-level array. Always written, even empty: absence means a
+    // legacy writer, while an empty array is a deliberate absence of links.
+    static constexpr const char* kAdjacentBranchesJsonKey = "adjacent_branches";
+
     struct FiberBranchRef {
         int controlPointIndex = -1;
         uint64_t branchFiberId = 0;
@@ -241,6 +268,17 @@ public:
         cv::Vec3d branchControlPointPosition{0.0, 0.0, 0.0};
         // Link awaits reviewer approval; kept in sync on both reciprocal refs.
         bool pending = false;
+        // The two control points sit on ADJACENT windings, not the same one:
+        // the V fiber's point one winding inside the H fiber's (horizontals
+        // lie on the front of the sheet, verticals on the back, so a V fiber
+        // showing through to the next wrap out is one sheet thickness from
+        // it). Which side is inside follows from the fibers' effective H/V
+        // tags; a pair that is not one H and one V (a tag can change, a new
+        // fiber has none yet) is not refused here but flagged as an error by
+        // the fiber map, and carries no winding constraint there. Immutable
+        // for a link (delete and re-link to change), mirrored on both
+        // reciprocal refs.
+        bool adjacent = false;
     };
 
     // Per-fiber data for the fiber overlay's "Show linked" mode. Only fibers
@@ -360,6 +398,11 @@ public:
     // for attach and detach it overlaps umbilicusGeneration(), which holders
     // still compare as the reviewer-prescribed mechanism for in-app changes.
     [[nodiscard]] QString umbilicusFingerprint() const;
+    // The current volume's open-data coordinate space
+    // ("<sample>/<volume>@L<level>", from its vc-open-data tags), naming the
+    // catalog entry that orients it; empty for a volume without the tags.
+    // A tag read, no parse, so it is cheap enough for dependency checks.
+    [[nodiscard]] std::string fiberMapCoordinateSpace() const;
     [[nodiscard]] std::vector<FiberLinkOverlayInfo> fiberLinkOverlayInfos() const;
     // Bumped whenever the loaded fiber set changes (load, save, delete, and the
     // edits that refresh the fiber summaries). Holders of derived data compare
@@ -471,6 +514,7 @@ public:
     [[nodiscard]] bool prepareForPackageSwitch();
 
 signals:
+    void volumeOverlayToggleRequested();
     void lineAnnotationWorkspaceRequested(LineAnnotationDialog* dialog, const QString& title);
     void fibersChanged(std::vector<LineAnnotationController::FiberSummary> fibers);
     void fiberAlignmentMetricsReset(bool pending);
@@ -524,6 +568,8 @@ private:
         std::vector<FiberSummary::AlignmentMetrics> spans;
     };
     struct StoredFiber {
+        double width = 0.0;
+        double widthGapFraction = vc::fiber_tracer::kDefaultFiberWidthGapFraction;
         uint64_t id = 0;
         std::string username;
         std::string startedAt;
@@ -547,6 +593,21 @@ private:
         // shape so a downsampled active volume can display them correctly.
         std::optional<std::array<std::size_t, 3>> coordinateBaseShapeZYX;
         bool needsSave = false;
+        // The file's write time as of the READ that produced this record
+        // (loadFiberFile), so a save decided from that read - the adjacent
+        // link heal - can tell a file the sync replaced in the meantime and
+        // leave it alone (the next load heals again). Unset for fibers not
+        // read from disk.
+        std::optional<std::filesystem::file_time_type> loadedWriteTime;
+        // Presence at read time, including an explicitly empty array. Only
+        // a missing array permits restoring adjacent refs from peers.
+        bool adjacentBranchesPresent = true;
+        // healOneSidedAdjacentLinks marked this record for saving.
+        bool adjacentHealed = false;
+        // Load put the gap span tags in step with the break point tags (a
+        // version-3 file, or one edited by hand); saved back under the same
+        // stale-file guard as the adjacent heal.
+        bool gapHealed = false;
     };
 
     struct StoredFiberSessionSnapshot {
@@ -664,7 +725,9 @@ private:
     void handleGeneratedControlPoint(const std::string& surfaceName,
                                      cv::Vec3f volumePoint,
                                      double linePosition,
-                                     std::optional<cv::Vec3f> lineAnchor = std::nullopt);
+                                     std::optional<cv::Vec3f> lineAnchor = std::nullopt,
+                                     std::optional<cv::Vec3d> displayNormal = std::nullopt,
+                                     std::optional<cv::Vec3d> direction = std::nullopt);
     void handleGeneratedControlPointDelete(const std::string& surfaceName,
                                            double linePosition,
                                            cv::Vec3f volumePoint);
@@ -682,6 +745,8 @@ private:
     struct LinkedSeedParent {
         uint64_t fiberId = 0;
         int controlPointIndex = -1;
+        // The seed's link to the parent is an adjacent-winding link.
+        bool adjacent = false;
         cv::Vec3d point{0.0, 0.0, 0.0};
         std::vector<cv::Vec3d> linePoints;
         std::function<void(const FiberBranchRef&)> addRef;
@@ -724,9 +789,63 @@ private:
     void handleGeneratedControlPointSetKollesisTermination(const std::string& surfaceName,
                                                            size_t controlPointIndex,
                                                            bool enabled);
+    void handleGeneratedControlPointSetBreak(const std::string& surfaceName,
+                                             size_t controlPointIndex,
+                                             bool enabled);
+    // Shared body of every per-control edit that is fiber content but not
+    // geometry (point tags, span tags): guards, `edit` on the named control,
+    // the gap span sync, the stored fiber mirror + save (the whole control
+    // list is restored from a pre-edit snapshot if the save cannot be
+    // scheduled, since the sync may have touched neighbouring spans), the
+    // same edit on the matching control of every other pane showing this
+    // fiber (and their rollback snapshots), and the overlay refreshes.
+    // Returns false when nothing changed or the edit was refused.
+    using ControlPointEdit = std::function<bool(vc3d::line_annotation::LineControlPoint&)>;
+    bool applyControlPointEditAndPersist(const std::string& surfaceName,
+                                         size_t controlPointIndex,
+                                         const QString& pendingSolveMessage,
+                                         const ControlPointEdit& edit);
+    // Whether adding `tag` to the control (or the matching control of any
+    // other pane showing this fiber, or of their rollback snapshots) would
+    // combine the kollesis and break tags.
+    [[nodiscard]] bool controlPointTagConflictsAcrossPanes(const LineAnnotationSession& session,
+                                                           size_t controlPointIndex,
+                                                           const char* tag) const;
+    // The point-tag toggle over applyControlPointEditAndPersist, with the
+    // kollesis/break exclusion preflight across panes.
+    bool setControlPointTagAndPersist(const std::string& surfaceName,
+                                      size_t controlPointIndex,
+                                      const char* tag,
+                                      bool enabled,
+                                      const QString& pendingSolveMessage);
+    // After a break tag edit: the gap spans that formed take the cubic-spline
+    // goal, those that dissolved while still cspline return to global, each
+    // through applySegmentInterpolationGoals.
+    void reconcileGapGoalsAfterBreakEdit(LineAnnotationSession& session,
+                                         const std::vector<size_t>& gapOwnersBefore,
+                                         bool enabled);
+    // The span menu captured its two controls before a nested event loop; a
+    // solve landing meanwhile can reorder the session. A span action runs
+    // only if the two are still neighbours in line-position order.
+    [[nodiscard]] bool spanControlsStillAdjacent(const LineAnnotationSession& session,
+                                                 size_t firstControlPointIndex,
+                                                 size_t secondControlPointIndex) const;
+    // A break is refused at or immediately next to a kollesis termination
+    // (line-order neighbours).
+    [[nodiscard]] bool breakRefusedNearKollesis(const LineAnnotationSession& session,
+                                                size_t controlPointIndex) const;
+    // Sets the interpolation goal of the spans owned by `owners` and starts
+    // the re-solve, with the mode-change rollback of the menu's goal change.
+    // Returns false (nothing changed) when every span already has the goal.
+    bool applySegmentInterpolationGoals(LineAnnotationSession& session,
+                                        const std::vector<size_t>& owners,
+                                        vc3d::line_annotation::SegmentInterpolationGoal goal);
+    // adjacent: designate the point as an ADJACENT link candidate (see
+    // LinkCandidate::adjacent) rather than an ordinary one.
     void handleGeneratedControlPointLinkCandidate(const std::string& surfaceName,
                                                   size_t controlPointIndex,
-                                                  cv::Vec3f volumePoint);
+                                                  cv::Vec3f volumePoint,
+                                                  bool adjacent = false);
     void handleGeneratedControlPointLinkWithCandidate(const std::string& surfaceName,
                                                       size_t controlPointIndex,
                                                       cv::Vec3f volumePoint);
@@ -738,19 +857,28 @@ private:
     void handleGeneratedControlPointMergeWithCandidate(const std::string& surfaceName,
                                                        size_t controlPointIndex,
                                                        cv::Vec3f volumePoint);
-    void handleGeneratedControlPointSplitCandidate(const std::string& surfaceName,
-                                                   size_t controlPointIndex,
-                                                   cv::Vec3f volumePoint);
-    // Splits the session's fiber between the split candidate and the clicked
-    // adjacent control point into two brand-new fibers (fresh identities,
-    // tags/mode/span metadata inherited, branch links remapped onto the
-    // halves), deletes the original, and reopens the candidate's half.
-    // linkHalves additionally records a reciprocal branch link between the
-    // two boundary control points ("Split from candidate and link").
-    void handleGeneratedControlPointSplitFromCandidate(const std::string& surfaceName,
-                                                       size_t controlPointIndex,
-                                                       cv::Vec3f volumePoint,
-                                                       bool linkHalves);
+    // Span menu (strips). Removes the span between the two (line-order
+    // adjacent) control points: both halves become brand-new fibers (fresh
+    // identities, tags/mode/span metadata inherited, branch links remapped
+    // onto the halves), the original is deleted and its workspace closed;
+    // nothing is reopened. linkHalves additionally records a reciprocal
+    // pending branch link between the two new ends ("same winding").
+    void handleGeneratedSpanSplit(const std::string& surfaceName,
+                                  size_t firstControlPointIndex,
+                                  size_t secondControlPointIndex,
+                                  bool linkHalves);
+    // Span menu: make the span a gap by tagging both ends as breaks (refused
+    // at or next to a kollesis termination), or undo that, removing the break
+    // only from ends no other gap span depends on.
+    void handleGeneratedSpanSetGap(const std::string& surfaceName,
+                                   size_t firstControlPointIndex,
+                                   size_t secondControlPointIndex,
+                                   bool enabled);
+    // Span menu: toggle the damaged span tag (never on a gap span).
+    void handleGeneratedSpanSetDamaged(const std::string& surfaceName,
+                                       size_t firstControlPointIndex,
+                                       size_t secondControlPointIndex,
+                                       bool enabled);
     void handleGeneratedOpenNearbyAnnotation(uint64_t fiberId, cv::Vec3f volumePoint);
     void handleGeneratedControlPointUnlink(const std::string& surfaceName,
                                            size_t controlPointIndex,
@@ -765,10 +893,6 @@ private:
         controlMarkersForSession(const LineAnnotationSession& session) const;
     [[nodiscard]] vc3d::line_annotation::GeneratedLinkCandidateMenuState
         linkCandidateMenuState(const LineAnnotationSession& session) const;
-    [[nodiscard]] vc3d::line_annotation::GeneratedLinkCandidateMenuState
-        splitCandidateMenuState(const LineAnnotationSession& session) const;
-    [[nodiscard]] vc3d::line_annotation::GeneratedLinkCandidateMenuState
-        splitAndLinkCandidateMenuState(const LineAnnotationSession& session) const;
     [[nodiscard]] vc3d::line_annotation::GeneratedLinkCandidateMenuState
         mergeCandidateMenuState(const LineAnnotationSession& session) const;
     [[nodiscard]] vc3d::line_annotation::GeneratedLinkCandidateMenuState
@@ -876,6 +1000,8 @@ private:
     // NaN entries mark invalid samples.
     [[nodiscard]] std::vector<cv::Vec3f> orientedLineNormalsForSession(
         const LineAnnotationSession& session);
+    [[nodiscard]] vc::fiber_tracer::FiberDisplayField displayFieldForSession(
+        const LineAnnotationSession& session, const std::vector<cv::Vec3f>& orientedNormals) const;
     bool materializeGeneratedViews(LineAnnotationSession& session);
     bool materializeGeneratedViews(LineAnnotationSession& session,
                                    const std::string& surfacePrefix);
@@ -913,6 +1039,21 @@ private:
                                   const std::vector<std::filesystem::path>& sourcePreference);
     [[nodiscard]] std::string loadedFiberLinkKey(const StoredFiber& from,
                                                  const std::string& branchFileName) const;
+    // Restore adjacent reciprocals only into files whose array was absent.
+    // Run before cross-file validation so an old save cannot remove the
+    // whole network as missing its reciprocals. A present array is untouched.
+    void healOneSidedAdjacentLinks(std::vector<StoredFiber>& fibers) const;
+    // The heal's save must not overwrite a file that changed on disk since it
+    // was READ (a concurrent sync download): stale when the write time moved,
+    // and, failing closed, when it cannot be read.
+    [[nodiscard]] bool adjacentHealSaveIsStale(const StoredFiber& fiber) const;
+    // `candidate` (a ref on the linked fiber) is the reciprocal of `branch`
+    // (a ref on `fiber`): the same two control points named from the other
+    // side, positions and directions agreeing. The one predicate for pairing
+    // refs across files, shared by the load-time validation and the heal.
+    [[nodiscard]] static bool isReciprocalBranchRef(const StoredFiber& fiber,
+                                                    const FiberBranchRef& branch,
+                                                    const FiberBranchRef& candidate);
     [[nodiscard]] bool validateLoadedFiberLinks(std::vector<StoredFiber>& fibers,
                                                 std::vector<std::string>& errors) const;
     // Fibers merged by the sync tool (scripts/fiber_merge.py) carry a
@@ -1061,7 +1202,11 @@ private:
     [[nodiscard]] std::optional<StoredFiber> loadFiberJson(const nlohmann::json& root,
                                                            const std::filesystem::path& path,
                                                            std::vector<std::string>* branchErrors = nullptr) const;
-    [[nodiscard]] std::optional<StoredFiber> loadFiberFile(const std::filesystem::path& path) const;
+    [[nodiscard]] // Reads and parses one fiber file, stamping StoredFiber::loadedWriteTime
+    // from before the read; branchErrors, when given, collects per-branch
+    // load problems the way loadFiberJson reports them.
+    std::optional<StoredFiber> loadFiberFile(const std::filesystem::path& path,
+                                             std::vector<std::string>* branchErrors = nullptr) const;
     [[nodiscard]] std::vector<BranchLinkValidationIssue> collectLoadedFiberBranchIssues(
         const std::vector<StoredFiber>& fibers) const;
     [[nodiscard]] bool repairLoadedFiberBranchLinks(
@@ -1090,9 +1235,11 @@ private:
     [[nodiscard]] bool isAlignmentPendingForFiber(uint64_t fiberId) const;
     [[nodiscard]] bool isAlignmentPendingForFiber(uint64_t fiberId,
                                                   uint64_t requestToken) const;
-    [[nodiscard]] std::optional<std::pair<std::filesystem::path, double>>
-        resolveAlignmentMetricsManifestPath();
+    [[nodiscard]] std::shared_ptr<vc::lasagna::LasagnaDataset>
+        resolveAlignmentMetricsDataset();
     void requestFiberAlignmentMetricsForFibers(std::vector<uint64_t> fiberIds);
+    void saveFiberDisplayAnnotations(LineAnnotationSession& session);
+    void setSessionFiberWidth(LineAnnotationSession& session, double width);
     void publishFiberAlignmentMetrics(uint64_t fiberId,
                                       CachedFiberAlignmentMetrics metrics);
     void publishPendingFiberAlignmentMetrics(const StoredFiber& fiber);
@@ -1339,18 +1486,19 @@ private:
     mutable QString _lastSuppressedError;
 
     // Transient (in-memory only) staging state for a designated control
-    // point: linking two CPs across fibers (_linkCandidate) or splitting a
-    // fiber between adjacent CPs (_splitCandidate). Position is the primary
-    // key; the stored index is a hint re-resolved at use time because
+    // point: linking two CPs across fibers (_linkCandidate). Position is the
+    // primary key; the stored index is a hint re-resolved at use time because
     // indices are remapped on save.
     struct LinkCandidate {
         uint64_t fiberId = 0;
         std::string fiberFileName;
         cv::Vec3d position{0.0, 0.0, 0.0};
         int storedControlPointIndexHint = -1;
+        // Designated as an ADJACENT link candidate: the link made from it
+        // ties adjacent windings (FiberBranchRef::adjacent).
+        bool adjacent = false;
     };
     std::optional<LinkCandidate> _linkCandidate;
-    std::optional<LinkCandidate> _splitCandidate;
 
     // Private pool for line-optimization solves. Its own pool rather than the
     // global one so teardown is bounded by waitForDone() in the destructor

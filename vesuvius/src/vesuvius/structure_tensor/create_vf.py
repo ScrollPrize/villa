@@ -2,7 +2,7 @@
 import torch
 import zarr
 import numpy as np
-from vesuvius.data.utils import open_zarr
+from vesuvius.data.utils import open_zarr, open_zarr_group, require_zarr_array
 from typing import Dict, Tuple, Optional
 from tqdm.auto import tqdm
 
@@ -53,14 +53,14 @@ class VectorFieldComputer:
         cz, cy, cx = chunk_size
 
         # prepare outputs
-        root = zarr.open_group(output_zarr, mode='a')
+        root = open_zarr_group(output_zarr, mode='a')
         if not ome_only:
-            U_ds = root.require_dataset('U', shape=(3,Z,Y,X), chunks=(3,cz,cy,cx),
-                                        dtype=np.float32, compressor=compressor, overwrite=True)
-            V_ds = root.require_dataset('V', shape=(3,Z,Y,X), chunks=(3,cz,cy,cx),
-                                        dtype=np.float32, compressor=compressor, overwrite=True)
-            N_ds = root.require_dataset('N', shape=(3,Z,Y,X), chunks=(3,cz,cy,cx),
-                                        dtype=np.float32, compressor=compressor, overwrite=True)
+            U_ds = require_zarr_array(root, 'U', shape=(3,Z,Y,X), chunks=(3,cz,cy,cx),
+                                      dtype=np.float32, compressor=compressor, overwrite=True)
+            V_ds = require_zarr_array(root, 'V', shape=(3,Z,Y,X), chunks=(3,cz,cy,cx),
+                                      dtype=np.float32, compressor=compressor, overwrite=True)
+            N_ds = require_zarr_array(root, 'N', shape=(3,Z,Y,X), chunks=(3,cz,cy,cx),
+                                      dtype=np.float32, compressor=compressor, overwrite=True)
         # OME-ish uint8 writer (writes component groups z/y/x at scale)
         writer = None
         if ome_u8:

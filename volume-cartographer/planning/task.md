@@ -1,6 +1,6 @@
-# QuadSurface cache invalidation race
+# Selective catalog project creation
 
-Fix the reproduced render-worker crash when switching projects or active
-surfaces clears derived caches during QuadSurface::gen(). Branch from current
-main. Preserve rendering results and in-flight work. Submit the PR title/body
-for user approval before publishing the PR.
+Add Create Project beside Open Sample. Nothing selected initially. Independently
+select source volumes, representations by type, and segments. Choose project name
+and JSON destination, save and immediately open. Reuse existing attachment logic.
+Also create the standard per-project fiber directory even before any fibers exist.

@@ -321,6 +321,12 @@ auto main(int argc, char* argv[]) -> int
     if (qEnvironmentVariableIsEmpty("QT_IMAGEIO_MAXALLOC")) {
         QImageReader::setAllocationLimit(512);
     }
+    // Render a surface location only when a complete bilinear quad backs it.
+    // The legacy nearest-vertex coverage keeps ragged-edge pixels whose
+    // coordinates are blended toward the (-1, -1, -1) invalid sentinel; they
+    // draw as a noisy fringe and make a single surface tile depend on
+    // thousands of chunks. Set before any surface is loaded.
+    QuadSurface::setStrictQuadRenderValidityDefault(true);
     WheelFocusFilter wheelFocusFilter;
     app.installEventFilter(&wheelFocusFilter);
     QApplication::setOrganizationName("Vesuvius Challenge");
@@ -505,9 +511,7 @@ auto main(int argc, char* argv[]) -> int
                 perf::REMOTE_DOWNLOAD_PARALLELISM,
                 perf::REMOTE_DOWNLOAD_PARALLELISM_DEFAULT).toInt(),
             1, perf::REMOTE_DOWNLOAD_WORKER_CAPACITY));
-        remoteCacheDelta3d = settings.value(
-            perf::REMOTE_CACHE_DELTA3D,
-            perf::REMOTE_CACHE_DELTA3D_DEFAULT).toBool();
+        remoteCacheDelta3d = vc::settings::remoteCacheDelta3dEnabled();
 
         // Per-segment rotating-backup count -> core (used by saveOverwrite/growth).
         QuadSurface::setBackupCount(

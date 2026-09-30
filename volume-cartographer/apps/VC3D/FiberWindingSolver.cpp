@@ -202,10 +202,10 @@ struct OrdinalPoint {
 
 } // namespace
 
-int inferChirality(const std::vector<FiberTrace>& fibers, int chiralityOverride)
+ChiralityVote tallyChirality(const std::vector<FiberTrace>& fibers)
 {
-    int chirality = chiralityOverride;
-    if (chirality == 0) {
+    ChiralityVote tally;
+    {
         // Radius one whole turn along the same fiber is the same ray one
         // winding out: crumpling in angle cancels exactly and only the
         // spiral's sign survives (z drift along the turn does not cancel,
@@ -282,9 +282,17 @@ int inferChirality(const std::vector<FiberTrace>& fibers, int chiralityOverride)
         // wrapping fibers resolves to the deterministic default rather than
         // letting one short crumpled fiber flip the map.
         const int vote = haveTurnEvidence ? turnVotes : covarianceVotes;
-        chirality = vote < 0 ? -1 : 1;
+        tally.sense = vote < 0 ? -1 : 1;
+        tally.haveTurnEvidence = haveTurnEvidence;
+        tally.netTurnVotes = haveTurnEvidence ? turnVotes : 0;
+        tally.covarianceVotes = covarianceVotes;
     }
-    return chirality;
+    return tally;
+}
+
+int inferChirality(const std::vector<FiberTrace>& fibers, int chiralityOverride)
+{
+    return chiralityOverride != 0 ? chiralityOverride : tallyChirality(fibers).sense;
 }
 
 CanonicalTrace canonicalizeTrace(const FiberTrace& fiber, int chirality)
@@ -1016,6 +1024,11 @@ std::vector<SeamAnchor> seamAnchors(const std::vector<CanonicalTrace>& traces,
         std::size_t bestDistance = static_cast<std::size_t>(-1);
         bool disagree = false;
         for (const LinkInput& link : links) {
+            if (link.skip || link.windingOffset != 0) {
+                // A seam anchor is a same-winding contact; an adjacent link
+                // asserts the opposite, and a skipped link asserts nothing.
+                continue;
+            }
             std::size_t hLink = kNoSample;
             std::size_t vLink = kNoSample;
             if (link.fiberA == hIndex && link.fiberB == vIndex) {
@@ -2044,15 +2057,19 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
     std::vector<bool> linkValid(links.size(), false);
     for (std::size_t l = 0; l < links.size(); ++l) {
         const LinkInput& link = links[l];
-        if (link.fiberA >= count || link.fiberB >= count ||
+        if (link.skip || link.fiberA >= count || link.fiberB >= count ||
             !usable(link.fiberA) || !usable(link.fiberB) ||
             link.pointA >= psi[link.fiberA].size() ||
             link.pointB >= psi[link.fiberB].size()) {
             continue;
         }
         linkValid[l] = true;
+        // W_A(pA) + offset == W_B(pB), i.e. k_A - k_B == delta - offset with
+        // delta the gauge difference in turns; the residual is what is left
+        // after rounding that to a whole turn.
         const double delta =
-            (psi[link.fiberB][link.pointB] - psi[link.fiberA][link.pointA]) / kTwoPi;
+            (psi[link.fiberB][link.pointB] - psi[link.fiberA][link.pointA]) / kTwoPi -
+            static_cast<double>(link.windingOffset);
         const long long a = static_cast<long long>(std::llround(delta));
         const double residual = std::abs(delta - static_cast<double>(a));
         // A clean link outranks any single crossing; a link half a turn out
@@ -2066,7 +2083,7 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
             // as suspect as the geometry it was measured over.
             confidence *= params.untrustedConfidenceFactor;
         }
-        // W_A(pA) == W_B(pB) is k_A - k_B == a; addPair encodes to - from.
+        // W_A(pA) + offset == W_B(pB) is k_A - k_B == a; addPair encodes to - from.
         addPair(link.fiberA, link.fiberB, -a, confidence,
                 SourceRef{SourceKind::Link, l});
         result.placements[link.fiberA].linked = true;
@@ -2655,8 +2672,10 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
             continue;
         }
         const LinkInput& link = links[l];
+        // How far the final map sits from the winding gap the link asserts.
         result.linkTurnErrors[l] = std::abs(
-            (psi[link.fiberA][link.pointA] / kTwoPi + static_cast<double>(k[link.fiberA])) -
+            (psi[link.fiberA][link.pointA] / kTwoPi + static_cast<double>(k[link.fiberA])) +
+            static_cast<double>(link.windingOffset) -
             (psi[link.fiberB][link.pointB] / kTwoPi + static_cast<double>(k[link.fiberB])));
     }
     std::sort(result.droppedLinks.begin(), result.droppedLinks.end());
