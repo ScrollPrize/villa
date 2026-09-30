@@ -28,6 +28,28 @@
 #include <string>
 #include <vector>
 
+TEST_CASE("Strip context spans include CP boundaries independently of click height")
+{
+    using namespace vc3d::line_annotation;
+    std::vector<GeneratedOverlay::ControlPointMarker> controls(3);
+    controls[0].linePosition = 2;
+    controls[1].linePosition = 10;
+    controls[2].linePosition = 18;
+    std::vector<const GeneratedOverlay::ControlPointMarker*> sorted{
+        &controls[0], &controls[1], &controls[2]};
+    CHECK(generatedControlSpanOwnerRank(sorted, 2) == 0);
+    CHECK(generatedControlSpanOwnerRank(sorted, 6) == 0);
+    CHECK(generatedControlSpanOwnerRank(sorted, 9.99) == 0);
+    CHECK(generatedControlSpanOwnerRank(sorted, 10) == 1);
+    CHECK(generatedControlSpanOwnerRank(sorted, 14) == 1);
+    CHECK(generatedControlSpanOwnerRank(sorted, 18) == 1);
+    CHECK_FALSE(generatedControlSpanOwnerRank(sorted, 1));
+    CHECK_FALSE(generatedControlSpanOwnerRank(sorted, 19));
+    CHECK_FALSE(generatedControlSpanOwnerRank(sorted, NAN));
+    CHECK_FALSE(generatedControlSpanOwnerRank({}, 6));
+    CHECK_FALSE(generatedControlSpanOwnerRank({&controls[0]}, 2));
+}
+
 TEST_CASE("Clearing CP corrections leaves other controls and span metadata intact")
 {
     using namespace vc3d::line_annotation;

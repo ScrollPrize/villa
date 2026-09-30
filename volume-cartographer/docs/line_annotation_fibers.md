@@ -218,14 +218,16 @@ unchanged), in place of the traced or interpolated style, and marks every
 break point with the dotted amber rim. The flag is display-only in the map:
 it does not change heat-map seeding, winding evidence or publishing.
 
-## Span menu (strips)
+## Combined span and control-point menu (strips)
 
-In the strip views a Ctrl+right-click on the centre line, away from every
-control point marker (12 scene units from a marker, within 12 of the line),
-opens the **span menu** for the span containing the click's line position;
-within a marker's reach the point menu opens as before, and far from both the
-nearest-point fallback stands. The span menu shows the span's state (mode
-marker, goal, gap or damaged) and holds everything that acts on a span:
+In either strip view, Ctrl+right-click anywhere across its height opens one
+menu with actions for the containing span and the nearest control point.
+Span selection uses only the click's longitudinal line position, not its
+distance from the centre line or a CP marker. At an exact CP position the
+outgoing span is selected; the final CP uses its incoming span. Extrapolated
+tails outside the control-point range have CP actions only.
+The menu identifies both targets and shows the span's state (mode marker,
+goal, gap or damaged). The span section contains:
 
 - **Interpolation goal** (Global / Cubic spline / Lasagna / Fiber trace):
   lives here and nowhere else now.
