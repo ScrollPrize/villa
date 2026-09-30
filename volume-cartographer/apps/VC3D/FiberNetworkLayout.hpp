@@ -301,8 +301,9 @@ struct CrossingEvent {
     long long groupId = -1;
 };
 
-// A pair's crossings on one translate and V branch read together (see
-// winding::CrossingGroup); members index GlobalResult::crossingEvents.
+// A pair's crossings on one translate and run of V branches read together
+// (see winding::CrossingGroup; vBranch is the run's first limb); members
+// index GlobalResult::crossingEvents.
 struct CrossingGroupRecord {
     uint64_t hFiberId = 0;
     uint64_t vFiberId = 0;

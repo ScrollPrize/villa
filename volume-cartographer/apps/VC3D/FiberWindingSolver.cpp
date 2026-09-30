@@ -1106,20 +1106,36 @@ PairCrossings classifyPairCrossings(const PairDetections& detections,
         double psiMax = 0.0;
         double zLo = 0.0;
         double zHi = 0.0;
-        // Height ranges of the run's sub-prominence limbs: the back-steps'
-        // bands. Any height the run's polyline visits more than once lies
-        // between a local top and a local bottom of the run, i.e. within a
-        // counter-direction limb, and every counter-direction limb of a run
-        // is sub-prominence (a longer one would have ended the run); so
-        // outside these bands the run is one limb, and inside them its
-        // curtain may be met more than once (see backStepKeys). Nested
-        // jitter is covered whole, not only where consecutive limbs overlap.
+        // The direction the run's limbs are read against: +1 when the
+        // polyline ascends along the run, -1 when it descends. A run of
+        // several limbs whose direction the hysteresis never fixed (the
+        // polyline within the prominence throughout) or a tie plateau
+        // (equal end heights) has no intrinsic direction, and any reference
+        // covers its repeated heights (see bands); the value is chosen
+        // sample-order independent.
+        int referenceDirection = 1;
+        // Height ranges of the run's counter-direction limbs: the
+        // back-steps' bands. A height the polyline leaves and first returns
+        // to along a non-constant stretch is left along one limb and
+        // returned to along a limb of the opposite direction, and both
+        // limbs' closed height ranges contain it; so, for either reference
+        // direction, the counter-direction limbs' ranges cover every height
+        // an excursion repeats, and outside them the run is one limb whose
+        // curtain a traversal meets once (see backStepKeys). Nested jitter
+        // is covered whole. Every counter-direction limb is sub-prominence
+        // (a longer counter-move would have ended the run); forward limbs,
+        // however short, need no bands of their own - whatever heights they
+        // repeat, a counter limb already spans. A height
+        // repeated along a constant-height stretch is not an excursion:
+        // identical samples are one vertex (vertexOf), a level segment or
+        // a radial step at one (psi, z) is read by detection's contact and
+        // unresolved gates.
         std::vector<std::pair<double, double>> bands;
     };
-    // Branches of a run of several whose own height extent is below the
-    // prominence: the back-steps themselves (see backStepKeys). A run of one
+    // Branches of a run of several running against the run's reference
+    // direction: the back-steps themselves (see backStepKeys). A run of one
     // branch has no back-step, however short.
-    std::vector<bool> backStepBranch(vTrace.branches.size(), false);
+    std::vector<bool> counterLimb(vTrace.branches.size(), false);
     std::vector<std::size_t> runOfBranch(vTrace.branches.size(), 0);
     std::vector<BranchRun> runs;
     if (!vTrace.branches.empty()) {
@@ -1135,6 +1151,9 @@ PairCrossings classifyPairCrossings(const PairDetections& detections,
             return branch.forwardAscending ? branch.z.back() : branch.z.front();
         };
         std::vector<std::size_t> reversals;
+        // Per reversal, the direction of the run ending there (before the
+        // flip); both indices of a tie plateau carry the same one.
+        std::vector<int> reversalDirections;
         int direction = 0;
         // The run's extreme: first and last extremum index at its height.
         std::size_t firstAtExtreme = 0;
@@ -1165,12 +1184,24 @@ PairCrossings classifyPairCrossings(const PairDetections& detections,
             } else if (std::abs(move) >= params.apexProminenceVx) {
                 if (firstAtExtreme != candidate) {
                     reversals.push_back(firstAtExtreme);
+                    reversalDirections.push_back(direction);
                 }
                 reversals.push_back(candidate);
+                reversalDirections.push_back(direction);
                 direction = -direction;
                 candidate = i;
                 firstAtExtreme = i;
             }
+        }
+        // A never-determined direction: the polyline's end height against
+        // its start (equal: +1). Reversing the samples negates it along with
+        // every limb's direction, so unequal ends select the same limbs; with
+        // equal ends the ascending and the descending limbs' ranges each
+        // cover the run's whole height, so either selection gives the same
+        // bands.
+        if (direction == 0) {
+            const double rise = extremum(branchCount) - extremum(0);
+            direction = rise < 0.0 ? -1 : 1;
         }
         std::size_t run = 0;
         std::size_t nextReversal = 0;
@@ -1182,8 +1213,16 @@ PairCrossings classifyPairCrossings(const PairDetections& detections,
             runOfBranch[b] = run;
             const Branch& branch = vTrace.branches[b];
             if (run == runs.size()) {
-                runs.push_back(BranchRun{b, b, branch.psiMin, branch.psiMax, branch.z.front(),
-                                         branch.z.back()});
+                BranchRun started;
+                started.first = b;
+                started.last = b;
+                started.psiMin = branch.psiMin;
+                started.psiMax = branch.psiMax;
+                started.zLo = branch.z.front();
+                started.zHi = branch.z.back();
+                started.referenceDirection =
+                    run < reversalDirections.size() ? reversalDirections[run] : direction;
+                runs.push_back(started);
             } else {
                 BranchRun& current = runs.back();
                 current.last = b;
@@ -1196,9 +1235,9 @@ PairCrossings classifyPairCrossings(const PairDetections& detections,
         for (std::size_t b = 0; b < branchCount; ++b) {
             BranchRun& run = runs[runOfBranch[b]];
             const Branch& branch = vTrace.branches[b];
-            backStepBranch[b] = run.first != run.last &&
-                                branch.z.back() - branch.z.front() < params.apexProminenceVx;
-            if (backStepBranch[b]) {
+            const int limbDirection = branch.forwardAscending ? 1 : -1;
+            counterLimb[b] = run.first != run.last && limbDirection != run.referenceDirection;
+            if (counterLimb[b]) {
                 run.bands.emplace_back(branch.z.front(), branch.z.back());
             }
         }
@@ -1729,20 +1768,20 @@ PairCrossings classifyPairCrossings(const PairDetections& detections,
     std::set<std::pair<long long, std::size_t>> curtainKeys;
     // Keys with an event inside a back-step's height band of the run, on
     // any of its limbs, counted or not. Outside the bands the run's curve is
-    // the curve of one smoothed limb (the polyline visits every height there
-    // once; see BranchRun::bands), so every crossing there is a crossing of
-    // both and the run's count is the smoothed limb's. Inside a band the curtain is
+    // the curve of one smoothed limb (no excursion of the polyline repeats a
+    // height there; see BranchRun::bands), so every crossing there is a
+    // crossing of both and the run's count is the smoothed limb's. Inside a band the curtain is
     // met more than once for one traversal - the limb before, the back-step,
     // the limb after, or the limb after twice where it wobbles in angle
     // around the back-step - and the extra crossings cancel in the inside
     // count only when they are of one kind, which the geometry does not
     // guarantee (the V fiber's radius or angle may step across the
     // back-step). Any event in a band therefore says the count is not one
-    // smoothed traversal's: no verdict. The back-step limb itself lies
-    // within its band; it is named as well so a rounding of its ends cannot
-    // let an event on it slip out. Traversals clear of the bands (kb-159 x
-    // lt-165, whose five events all lie far from the one-voxel back-step)
-    // count as on one limb.
+    // smoothed traversal's: no verdict. A counter limb lies within its own
+    // band; it is named as well so a rounding of its ends cannot let an
+    // event on it slip out. Traversals clear of the bands (kb-159 x lt-165,
+    // whose five events all lie far from the one-voxel back-step) count as
+    // on one limb.
     std::set<std::pair<long long, std::size_t>> backStepKeys;
     for (std::size_t e = 0; e < events.size(); ++e) {
         const std::pair<long long, std::size_t> key{events[e].n,
@@ -1767,7 +1806,7 @@ PairCrossings classifyPairCrossings(const PairDetections& detections,
                 heightLo = std::min(hZ[event.hSegment], hZ[event.hSegment + 1]);
                 heightHi = std::max(hZ[event.hSegment], hZ[event.hSegment + 1]);
             }
-            bool inBand = backStepBranch[event.vBranch];
+            bool inBand = counterLimb[event.vBranch];
             for (const auto& [bandLo, bandHi] : runs[key.second].bands) {
                 inBand = inBand || (heightHi >= bandLo && heightLo <= bandHi);
             }

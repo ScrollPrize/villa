@@ -1563,12 +1563,14 @@ private slots:
     // back-step [29997, 30000], not only the two half-voxel overlaps of
     // consecutive limbs; the H fiber slips through the middle, missing every
     // short limb, and meets the long limbs at 29998.5 (Outside), 29997.6
-    // and 30000.1 (Inside, Inside). The bands are the sub-prominence limbs'
-    // own ranges, so the middle is covered and the run takes no verdict.
-    // The H fiber is sampled every 0.1 vx of height around the encounters,
-    // so each event's segment enclosure is tight and meets only the
-    // 3 vx limb's range, not the two half-voxel overlaps: the fixture
-    // depends on the bands being the limbs' ranges. All four sample orders.
+    // and 30000.1 (Inside, Inside). The bands are the counter-direction
+    // limbs' own ranges - here the three descending limbs, of which the 3 vx
+    // one spans the whole back-step - so the middle is covered and the run
+    // takes no verdict. The H fiber is sampled every 0.1 vx of height around
+    // the encounters, so each event's segment enclosure is tight and meets
+    // only the 3 vx limb's range, not the two half-voxel overlaps: the
+    // fixture depends on the bands being whole limb ranges. All four sample
+    // orders.
     void nestedJitterIsCoveredWhole()
     {
         for (int variant = 0; variant < 4; ++variant) {
@@ -1726,6 +1728,137 @@ private slots:
             QCOMPARE(group.multiplicity, 3);
             QVERIFY(group.onCurtain);
             QVERIFY(!group.hasVerdict);
+        }
+    }
+
+    // A short FORWARD limb is no back-step (hendrikschilling, PR #1938): a V
+    // fiber that climbs 3 vx, steps back 0.1 vx and climbs on is one run
+    // whose repeated heights are the back-step's [29002.9, 29003] only. The
+    // three crossings of its 3 vx first limb, between 29001 and 29002, lie
+    // outside that band, and the limb's group keeps the verdict and the
+    // placement the per-branch solver gave it. Both sample orders of the V
+    // fiber (reversed, the short limb ends the run and the run descends).
+    void shortForwardLimbKeepsItsVerdict()
+    {
+        for (const bool reversed : {false, true}) {
+            World world;
+            // An H fiber weaving across the V fiber's angle three times at
+            // heights 29001, 29001.5 and 29002: inside, outside, outside.
+            FiberTrace h;
+            h.hvTag = 'H';
+            for (const auto& [theta, z, radius] :
+                 {std::array{-0.2, 29001.0, 19000.0}, std::array{0.2, 29001.0, 19000.0},
+                  std::array{0.2, 29001.5, 21000.0}, std::array{-0.2, 29001.5, 21000.0},
+                  std::array{-0.2, 29002.0, 21000.0}, std::array{0.2, 29002.0, 21000.0}}) {
+                h.theta.push_back(theta);
+                h.z.push_back(z);
+                h.radius.push_back(radius);
+            }
+            world.fibers.push_back(std::move(h));
+            world.trueM.push_back(0);
+            std::vector<std::array<double, 3>> vSamples = {{0.0, 29000.0, 20000.0},
+                                                          {0.0, 29003.0, 20000.0},
+                                                          {0.0, 29002.9, 20000.0},
+                                                          {0.0, 29100.0, 20000.0}};
+            if (reversed) {
+                std::reverse(vSamples.begin(), vSamples.end());
+            }
+            FiberTrace v;
+            v.hvTag = 'V';
+            for (const auto& [theta, z, radius] : vSamples) {
+                v.theta.push_back(theta);
+                v.z.push_back(z);
+                v.radius.push_back(radius);
+            }
+            world.fibers.push_back(std::move(v));
+            world.trueM.push_back(0);
+            SolverParams params;
+            params.chiralityOverride = 1;
+            const SolveResult result = solveWindings(world.fibers, world.links, params);
+            QCOMPARE(canonicalizeTrace(world.fibers[1], result.chirality).branches.size(),
+                     std::size_t{3});
+            QCOMPARE(result.events.size(), std::size_t{3});
+            const CrossingGroup& group = singleGroup(result);
+            QCOMPARE(group.multiplicity, 3);
+            QCOMPARE(group.insideCount, 1);
+            QVERIFY(!group.onCurtain);
+            QVERIFY(group.hasVerdict);
+            QCOMPARE(group.verdict, CrossingKind::Inside);
+            QCOMPARE(countDroppedCrossings(result), 0);
+            // The same placement as with the first limb alone.
+            World limb = world;
+            limb.fibers[1].theta.resize(2);
+            limb.fibers[1].z.resize(2);
+            limb.fibers[1].radius.resize(2);
+            if (reversed) {
+                limb.fibers[1].theta = {0.0, 0.0};
+                limb.fibers[1].z = {29003.0, 29000.0};
+                limb.fibers[1].radius = {20000.0, 20000.0};
+            }
+            const SolveResult alone = solveWindings(limb.fibers, limb.links, params);
+            QVERIFY(singleGroup(alone).hasVerdict);
+            QCOMPARE(singleGroup(alone).verdict, CrossingKind::Inside);
+            QCOMPARE(result.placements[1].turns - result.placements[0].turns,
+                     alone.placements[1].turns - alone.placements[0].turns);
+        }
+    }
+
+    // A run whose direction the hysteresis never fixes (the whole V fiber
+    // is below the prominence in height: 29000 -> 29003 -> 29002) reads its
+    // limbs against the sign of its end height minus its start height, so
+    // the counter limb - and the band [29002, 29003] - is the same limb in
+    // either sample order (a +1 default would band the long limb when the
+    // samples are reversed). Three crossings of the long limb below the
+    // band keep their verdict in both orders.
+    void undeterminedRunReferenceIsOrderIndependent()
+    {
+        for (const bool reversed : {false, true}) {
+            World world;
+            FiberTrace h;
+            h.hvTag = 'H';
+            for (const auto& [theta, z, radius] :
+                 {std::array{-0.2, 29000.5, 19000.0}, std::array{0.2, 29000.5, 19000.0},
+                  std::array{0.2, 29001.0, 21000.0}, std::array{-0.2, 29001.0, 21000.0},
+                  std::array{-0.2, 29001.5, 21000.0}, std::array{0.2, 29001.5, 21000.0}}) {
+                h.theta.push_back(theta);
+                h.z.push_back(z);
+                h.radius.push_back(radius);
+            }
+            world.fibers.push_back(std::move(h));
+            world.trueM.push_back(0);
+            std::vector<std::array<double, 3>> vSamples = {
+                {0.0, 29000.0, 20000.0}, {0.0, 29003.0, 20000.0}, {0.0, 29002.0, 20000.0}};
+            if (reversed) {
+                std::reverse(vSamples.begin(), vSamples.end());
+            }
+            FiberTrace v;
+            v.hvTag = 'V';
+            for (const auto& [theta, z, radius] : vSamples) {
+                v.theta.push_back(theta);
+                v.z.push_back(z);
+                v.radius.push_back(radius);
+            }
+            world.fibers.push_back(std::move(v));
+            world.trueM.push_back(0);
+            SolverParams params;
+            params.chiralityOverride = 1;
+            const SolveResult result = solveWindings(world.fibers, world.links, params);
+            QCOMPARE(canonicalizeTrace(world.fibers[1], result.chirality).branches.size(),
+                     std::size_t{2});
+            int counted = 0;
+            for (const Crossing& event : result.events) {
+                counted += (!event.touch && !event.tangential) ? 1 : 0;
+            }
+            QCOMPARE(counted, 3);
+            const CrossingGroup& group = singleGroup(result);
+            QCOMPARE(group.multiplicity, 3);
+            QCOMPARE(group.insideCount, 1);
+            QVERIFY(group.traversalCovered);
+            QVERIFY(!group.onCurtain);
+            QVERIFY(group.hasVerdict);
+            QCOMPARE(group.verdict, CrossingKind::Inside);
+            QCOMPARE(countDroppedCrossings(result), 0);
+            QCOMPARE(result.placements[1].turns - result.placements[0].turns, 0.0);
         }
     }
 
