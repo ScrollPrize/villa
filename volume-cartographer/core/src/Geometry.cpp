@@ -227,7 +227,6 @@ bool loc_valid_xy(const cv::Mat_<float> &m, const cv::Vec2d &l) {
     return loc_valid_xy_scalar(m, l);
 }
 
-
 float tdist(const cv::Vec3f &a, const cv::Vec3f &b, float t_dist)
 {
     cv::Vec3f d = a-b;

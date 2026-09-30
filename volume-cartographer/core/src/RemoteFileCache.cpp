@@ -49,7 +49,11 @@ std::filesystem::path checkedDestination(const RemoteFileCacheOptions& options)
     if (relative.empty() || *relative.begin() == "..")
         throw std::invalid_argument("remote file cache destination escapes cache root");
 
-    const auto root = std::filesystem::absolute(options.cacheRoot).lexically_normal();
+    auto root = std::filesystem::absolute(options.cacheRoot).lexically_normal();
+    // A root written with a trailing separator ("/cache/") ends in an empty
+    // element that no payload path contains; compare against the directory.
+    if (!root.has_filename() && root.has_relative_path())
+        root = root.parent_path();
     const auto payload = (root / relative).lexically_normal();
     auto mismatch = std::mismatch(root.begin(), root.end(), payload.begin(), payload.end());
     if (mismatch.first != root.end())

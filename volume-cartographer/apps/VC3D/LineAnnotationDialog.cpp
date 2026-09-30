@@ -1,4 +1,5 @@
 #include "LineAnnotationDialog.hpp"
+#include "vc/fiber_tracer/FiberDisplay.hpp"
 
 
 
@@ -50,6 +51,7 @@
 #include <QSplitter>
 #include <QPushButton>
 #include <QSpinBox>
+#include <QDoubleSpinBox>
 #include <QWidgetAction>
 #include <QVariant>
 #include <QTimer>
@@ -68,6 +70,10 @@
 #include <utility>
 
 namespace {
+
+// Scene-owned but QObject-observable: replacing a surface can delete overlays
+// before the dialog receives the new generated geometry.
+class CrossSectionDragPreview : public QObject, public QGraphicsPathItem {};
 
 // Half-width (in line-point indices) of the window used to least-squares-fit the side-view
 // plane orientation around the cursor. The fit is interpolated between adjacent window centers
@@ -329,6 +335,10 @@ QString spanAlignmentMetricText(
     QString firstLine(QChar(metric.modeMarker));
     if (!value.isEmpty())
         firstLine += QStringLiteral(" ") + value;
+    if (metric.gap)
+        firstLine += QObject::tr(" gap");
+    else if (metric.damaged)
+        firstLine += QObject::tr(" damaged");
     if (!metric.message.empty())
         return firstLine + QStringLiteral("\n") + QString::fromStdString(metric.message);
     return firstLine;
@@ -485,6 +495,8 @@ public:
         QColor color;
         // Edge colour; unset draws the fill's darker shade (the default look).
         std::optional<QColor> edge;
+        // Dotted edge (the break ring).
+        bool dottedEdge = false;
         qreal radius = 4.5;
         // Adjacent-winding link (or adjacent candidate): drawn as a triangle.
         bool triangle = false;
@@ -494,10 +506,15 @@ public:
 
     std::function<void(double, QPoint)> controlContextRequested;
 
-    void setLineData(size_t linePointCount, std::vector<ControlDot> dots)
+    void setLineData(size_t linePointCount,
+                     std::vector<ControlDot> dots,
+                     std::vector<std::pair<double, double>> gapLineRanges,
+                     std::vector<std::pair<double, double>> damagedLineRanges)
     {
         _linePointCount = linePointCount;
         _dots = std::move(dots);
+        _gapLineRanges = std::move(gapLineRanges);
+        _damagedLineRanges = std::move(damagedLineRanges);
         update();
     }
 
@@ -529,9 +546,53 @@ protected:
         }
         painter.setRenderHint(QPainter::Antialiasing, true);
         const qreal midY = height() * 0.5;
-        painter.setPen(QPen(QColor(190, 190, 190), 2.0));
-        painter.drawLine(QPointF(kMarginPx, midY),
-                         QPointF(width() - kMarginPx, midY));
+        // The baseline, with each gap span replaced (not overdrawn) by the
+        // dotted amber of the cut views and each damaged span by their
+        // alternating amber and red dashes: no solid pixels remain inside.
+        struct Piece {
+            qreal x0;
+            qreal x1;
+            bool damaged;
+            bool operator<(const Piece& other) const { return x0 < other.x0; }
+        };
+        std::vector<Piece> pieces;
+        for (const auto& [first, second] : _gapLineRanges) {
+            if (std::isfinite(first) && std::isfinite(second) && second > first) {
+                pieces.push_back({xForLinePosition(first), xForLinePosition(second), false});
+            }
+        }
+        for (const auto& [first, second] : _damagedLineRanges) {
+            if (std::isfinite(first) && std::isfinite(second) && second > first) {
+                pieces.push_back({xForLinePosition(first), xForLinePosition(second), true});
+            }
+        }
+        std::sort(pieces.begin(), pieces.end());
+        const QPen basePen(QColor(190, 190, 190), 2.0);
+        QPen gapPen(vc3d::line_annotation::generatedGapLineColor(255), 2.0);
+        gapPen.setCapStyle(Qt::FlatCap);
+        gapPen.setStyle(Qt::CustomDashLine);
+        gapPen.setDashPattern({vc3d::line_annotation::kSpanDashOn,
+                               vc3d::line_annotation::kSpanDashOff});
+        QPen damagedPen = gapPen;
+        damagedPen.setColor(vc3d::line_annotation::generatedDamagedColor(255));
+        qreal cursorX = kMarginPx;
+        const qreal lineEndX = width() - kMarginPx;
+        for (const auto& piece : pieces) {
+            if (piece.x0 > cursorX) {
+                painter.setPen(basePen);
+                painter.drawLine(QPointF(cursorX, midY), QPointF(piece.x0, midY));
+            }
+            const qreal from = std::max(cursorX, piece.x0);
+            if (piece.x1 > from) {
+                painter.setPen(piece.damaged ? damagedPen : gapPen);
+                painter.drawLine(QPointF(from, midY), QPointF(piece.x1, midY));
+            }
+            cursorX = std::max(cursorX, piece.x1);
+        }
+        if (lineEndX > cursorX) {
+            painter.setPen(basePen);
+            painter.drawLine(QPointF(cursorX, midY), QPointF(lineEndX, midY));
+        }
 
         if (std::isfinite(_currentPosition)) {
             painter.setPen(QPen(_currentColor, 2.0));
@@ -544,8 +605,11 @@ protected:
                 continue;
             }
             const qreal x = xForLinePosition(dot.linePosition);
-            painter.setPen(dot.edge ? QPen(*dot.edge, 1.5)
-                                    : QPen(dot.color.darker(150), 1.0));
+            QPen edgePen = dot.edge ? QPen(*dot.edge, 1.5) : QPen(dot.color.darker(150), 1.0);
+            if (dot.dottedEdge) {
+                edgePen.setStyle(Qt::DotLine);
+            }
+            painter.setPen(edgePen);
             painter.setBrush(dot.color);
             if (dot.triangle) {
                 painter.drawPath(vc3d::line_annotation::generatedTriangleMarkerPath(
@@ -598,6 +662,8 @@ private:
 
     size_t _linePointCount = 0;
     std::vector<ControlDot> _dots;
+    std::vector<std::pair<double, double>> _gapLineRanges;
+    std::vector<std::pair<double, double>> _damagedLineRanges;
     double _currentPosition = std::numeric_limits<double>::quiet_NaN();
     QColor _currentColor{0, 245, 255};
 };
@@ -792,6 +858,10 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
     connect(_resetViewsAction, &QAction::triggered, this, [this]() {
         resetGeneratedViews();
     });
+    annotationMenu->addSeparator();
+    auto* clearCorrectionsAction = annotationMenu->addAction(tr("Clear all normals and dirs"));
+    connect(clearCorrectionsAction, &QAction::triggered,
+            this, &LineAnnotationDialog::clearFiberCorrectionsRequested);
     annotationMenuButton->setMenu(annotationMenu);
     buttonLayout->addWidget(annotationMenuButton);
 
@@ -821,6 +891,52 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
             });
 
     rebuildDatasetMenus();
+
+    auto* toggleVolumeOverlay = annotationMenu->addAction(tr("Toggle volume overlay"));
+    toggleVolumeOverlay->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_Space));
+    toggleVolumeOverlay->setShortcutContext(Qt::WindowShortcut);
+    toggleVolumeOverlay->setAutoRepeat(false);
+    addAction(toggleVolumeOverlay);
+    connect(toggleVolumeOverlay, &QAction::triggered, this,
+            &LineAnnotationDialog::volumeOverlayToggleRequested);
+
+    buttonLayout->addWidget(new QLabel(tr("Fiber width"), buttonRow));
+    _fiberWidthSpin = new QDoubleSpinBox(buttonRow);
+    _fiberWidthSpin->setObjectName("fiberWidthSpin");
+    _fiberWidthSpin->setRange(0, 1000000);
+    _fiberWidthSpin->setDecimals(2);
+    _fiberWidthSpin->setSuffix(tr(" base vx"));
+    _fiberWidthSpin->setSpecialValueText(tr("unset"));
+    _fiberWidthSpin->setKeyboardTracking(false);
+    buttonLayout->addWidget(_fiberWidthSpin);
+    connect(_fiberWidthSpin, qOverload<double>(&QDoubleSpinBox::valueChanged), this,
+            &LineAnnotationDialog::fiberWidthChanged);
+    buttonLayout->addWidget(new QLabel(tr("CP angle offset"), buttonRow));
+    _controlAngleSpin = new QDoubleSpinBox(buttonRow);
+    _controlAngleSpin->setObjectName("controlDisplayAngleSpin");
+    _controlAngleSpin->setRange(-180, 180);
+    _controlAngleSpin->setDecimals(2);
+    _controlAngleSpin->setSuffix(tr(" deg"));
+    _controlAngleSpin->setKeyboardTracking(false);
+    _controlAngleSpin->setEnabled(false);
+    buttonLayout->addWidget(_controlAngleSpin);
+    connect(_controlAngleSpin, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+        if (_angleControlIndex) emit controlDisplayAngleChanged(*_angleControlIndex, value * _displayTangentSign);
+    });
+    _showFiberWidthAction = annotationMenu->addAction(tr("Show fiber width"));
+    _showFiberNormalAction = annotationMenu->addAction(tr("Show cross-section normal guide"));
+    for (auto* action : {_showFiberWidthAction, _showFiberNormalAction}) {
+        action->setCheckable(true);
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        const QString key = action == _showFiberWidthAction
+            ? "lineAnnotation/showFiberWidth" : "lineAnnotation/showFiberNormalGuide";
+        action->setChecked(settings.value(key, true).toBool());
+        connect(action, &QAction::toggled, this, [this, key](bool checked) {
+            QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+            settings.setValue(key, checked);
+            updateFiberDisplayControlsAndGuides();
+        });
+    }
 
     auto* maxDistanceLabel = new QLabel(tr("Max extrap CP dist"), buttonRow);
     const QString maxDistanceTooltip = tr(
@@ -1035,6 +1151,193 @@ void LineAnnotationDialog::rebuildDatasetMenus()
                  _fiberInferenceDatasetOptions,
                  _selectedFiberInferenceDatasetLocation,
                  true);
+}
+
+void LineAnnotationDialog::setFiberWidth(double baseVoxels, double gapFraction)
+{
+    const QSignalBlocker blocker(_fiberWidthSpin);
+    if (_fiberWidthSpin->value() != baseVoxels) _fiberWidthSpin->setValue(baseVoxels);
+    _generatedViews.fiberWidth = baseVoxels * _generatedViews.fiberBaseToVolumeScale;
+    _generatedViews.fiberWidthGapFraction = gapFraction;
+    updateFiberDisplayControlsAndGuides();
+}
+
+void LineAnnotationDialog::updateFiberDisplayControlsAndGuides()
+{
+    if (!_hasGeneratedViews || _closing) return;
+    _angleControlIndex.reset();
+    const auto& arcs = currentLineArclengths();
+    const double currentArc = vc3d::fiber_slice::arclengthAtLinePosition(arcs, _currentLinePosition);
+    double nearest = vc::lasagna::kLineViewAlongSamplingDistanceBaseVoxels *
+                     _generatedViews.fiberBaseToVolumeScale;
+    std::vector<double> positions;
+    for (const auto& cp : _generatedViews.controlPoints) positions.push_back(cp.linePosition);
+    const auto nearby = vc3d::fiber_slice::linePositionIndicesWithinArclengthRadius(
+        arcs, _currentLinePosition, positions, nearest);
+    for (const auto index : nearby) {
+        const auto& cp = _generatedViews.controlPoints[index];
+        const double distance = std::abs(vc3d::fiber_slice::arclengthAtLinePosition(arcs, cp.linePosition) - currentArc);
+        if (distance <= nearest && cp.controlIndex < _generatedViews.controlAngleOffsetsDegrees.size() &&
+            std::isfinite(_generatedViews.controlAngleOffsetsDegrees[cp.controlIndex])) {
+            nearest = distance;
+            _angleControlIndex = cp.controlIndex;
+        }
+    }
+    if (_controlAngleSpin) {
+        const QSignalBlocker blocker(_controlAngleSpin);
+        const double angle = _angleControlIndex
+            ? _generatedViews.controlAngleOffsetsDegrees[*_angleControlIndex] * _displayTangentSign : 0;
+        if (_controlAngleSpin->isEnabled() != _angleControlIndex.has_value())
+            _controlAngleSpin->setEnabled(_angleControlIndex.has_value());
+        if (std::abs(_controlAngleSpin->value() - angle) >= 0.005) _controlAngleSpin->setValue(angle);
+    }
+    for (size_t i = 0; i < _fiberGuides.size(); ++i) {
+        auto* viewer = i == 0 ? (_stripViewers.empty() ? nullptr : _stripViewers[0].data()) : _currentCutViewer.data();
+        if (!viewer) continue;
+        auto& guides = _fiberGuides[i];
+        if (guides.viewer != viewer || !guides.center) {
+            viewer->clearOverlayGroup("fiber-width-normal-guides");
+            guides = {};
+            guides.viewer = viewer;
+            guides.center = new QGraphicsPathItem;
+            guides.width = new QGraphicsPathItem;
+            guides.cursorWidth = new QGraphicsPathItem;
+            QPen pen(QColor(255, 220, 100, 210));
+            pen.setWidthF(1.0);
+            pen.setCosmetic(true);
+            for (auto* item : {guides.center, guides.width, guides.cursorWidth}) {
+                item->setPen(pen);
+                item->setZValue(145);
+            }
+            QPainterPath center;
+            center.moveTo(-1000000, 0); center.lineTo(1000000, 0);
+            guides.center->setPath(center);
+            QPen cursorPen(QColor(0, 245, 255, 245));
+            cursorPen.setWidthF(1.0);
+            cursorPen.setCosmetic(true);
+            guides.cursorWidth->setPen(cursorPen);
+            guides.cursorWidth->setZValue(154);
+            guides.cursorWidth->setVisible(false);
+            viewer->setOverlayGroup("fiber-width-normal-guides", {guides.center, guides.width, guides.cursorWidth});
+        }
+        const double width = _generatedViews.fiberWidth;
+        const double gap = _generatedViews.fiberWidthGapFraction;
+        const bool widthChanged = guides.cachedWidth != width || guides.cachedGapFraction != gap;
+        const auto guidePath = [i, width, gap](double halfLength) {
+            QPainterPath path;
+            for (double offset : vc::fiber_tracer::fiberWidthEdgeOffsets(width, gap)) {
+                if (i == 0) {
+                    path.moveTo(-halfLength, offset); path.lineTo(halfLength, offset);
+                } else {
+                    path.moveTo(offset, -halfLength); path.lineTo(offset, halfLength);
+                }
+            }
+            return path;
+        };
+        if (widthChanged) {
+            guides.width->setPath(guidePath(i == 0 ? 1000000 : 3));
+            guides.cachedWidth = width;
+            guides.cachedGapFraction = gap;
+        }
+        QPointF origin;
+        if (i == 0 && _generatedViews.lineSurface) {
+            const auto* grid = _generatedViews.lineSurface->rawPointsPtr();
+            if (!grid || grid->empty()) continue;
+            const auto center = _generatedViews.lineSurface->gridToSurface({0, double(grid->rows / 2)});
+            origin = viewer->surfaceCoordsToScene(float(center[0]), float(center[1]));
+        } else {
+            origin = viewer->volumeToScene(interpolatedLinePoint(_currentLinePosition));
+        }
+        const QPointF zero = viewer->surfaceCoordsToScene(0, 0);
+        const QPointF x = viewer->surfaceCoordsToScene(1, 0) - zero;
+        const QPointF y = viewer->surfaceCoordsToScene(0, 1) - zero;
+        if (const auto* view = viewer->graphicsView()) {
+            const auto camera = view->viewportTransform();
+            const QPointF pixelAxis = camera.map(i == 0 ? x : y) - camera.map(QPointF{});
+            const double pixelsPerUnit = std::hypot(pixelAxis.x(), pixelAxis.y());
+            if (pixelsPerUnit > 1e-9) {
+                const double halfLength = 6.0 / pixelsPerUnit;
+                if (widthChanged || guides.cachedCursorHalfLength != halfLength) {
+                    guides.cursorWidth->setPath(guidePath(halfLength));
+                    if (i == 1) guides.width->setPath(guidePath(halfLength));
+                    guides.cachedCursorHalfLength = halfLength;
+                }
+            }
+        }
+        const QTransform transform(x.x(), x.y(), y.x(), y.y(), origin.x(), origin.y());
+        for (auto* item : {guides.center, guides.width})
+            if (item->transform() != transform) item->setTransform(transform);
+        const bool centerVisible = !_crossSectionDrag && i == 1 &&
+            _generatedViews.hasManualDisplayNormals && _showFiberNormalAction->isChecked();
+        const bool widthVisible = !_crossSectionDrag && width > 0 && _showFiberWidthAction->isChecked();
+        if (guides.center->isVisible() != centerVisible) guides.center->setVisible(centerVisible);
+        if (guides.width->isVisible() != widthVisible) guides.width->setVisible(widthVisible);
+    }
+    refreshFiberWidthCursors();
+}
+
+void LineAnnotationDialog::refreshFiberWidthCursors()
+{
+    if (_closing || !_hasGeneratedViews) return;
+    auto* source = _linkedCursorSource.data();
+    auto* top = _stripViewers.empty() ? nullptr : _stripViewers[0].data();
+    const bool valid = !_crossSectionDrag && source && (source == top || source == _currentCutViewer.data()) &&
+                       _pendingLinkedCursorPoint.has_value();
+    for (auto& guides : _fiberGuides) {
+        auto* viewer = guides.viewer.data();
+        if (!viewer || !guides.cursorWidth) continue;
+        std::optional<QPointF> position;
+        if (valid && _generatedViews.fiberWidth > 0 && _showFiberWidthAction->isChecked()) {
+            // Project the same world-space hover used by linked cursors into
+            // the other pane; retain exact mouse coordinates in the source.
+            QPointF scene;
+            if (viewer == source && _pendingLinkedCursorScenePoint) {
+                scene = *_pendingLinkedCursorScenePoint;
+            } else if (viewer == top) {
+                // A cross-section hover may be well outside the strip's depth
+                // band. Project onto its current cross-section row direction,
+                // rather than run a global nearest-surface search or reject it.
+                auto* quad = dynamic_cast<QuadSurface*>(viewer->currentSurface());
+                const auto center = generatedStripSurfaceCenter(
+                    viewer, _currentLinePosition, &_generatedViews.stripPositionMap);
+                if (quad && center) {
+                    const cv::Vec3f uv{(*center)[0], (*center)[1], 0};
+                    const cv::Vec3f origin = quad->coord(quad->pointer(), uv);
+                    const cv::Vec3f across = quad->coord(quad->pointer(), uv + cv::Vec3f(0, 1, 0)) - origin;
+                    const float lengthSquared = across.dot(across);
+                    if (finitePoint(origin) && finitePoint(across) && lengthSquared > 1e-12f) {
+                        const float offset = (*_pendingLinkedCursorPoint - origin).dot(across) / lengthSquared;
+                        scene = viewer->surfaceCoordsToScene((*center)[0], (*center)[1] + offset);
+                    } else scene = {NAN, NAN};
+                } else scene = {NAN, NAN};
+            } else {
+                scene = viewer->volumeToScene(*_pendingLinkedCursorPoint);
+            }
+            if (std::isfinite(scene.x()) && std::isfinite(scene.y())) position = scene;
+        }
+        updateFiberWidthCursor(viewer, position);
+    }
+}
+
+void LineAnnotationDialog::updateFiberWidthCursor(
+    CChunkedVolumeViewer* viewer, std::optional<QPointF> scenePoint)
+{
+    if (_closing || !_hasGeneratedViews) return;
+    for (auto& guides : _fiberGuides) {
+        if (guides.viewer != viewer || !guides.cursorWidth) continue;
+        const bool visible = !_crossSectionDrag && scenePoint && _generatedViews.fiberWidth > 0 &&
+            _showFiberWidthAction->isChecked();
+        if (visible) {
+            // Reuse the guide's surface-to-scene scale/orientation but place
+            // the preview at the mouse instead of the existing fiber center.
+            const auto basis = guides.width->transform();
+            const QTransform transform(basis.m11(), basis.m12(), basis.m21(), basis.m22(),
+                                       scenePoint->x(), scenePoint->y());
+            if (guides.cursorWidth->transform() != transform)
+                guides.cursorWidth->setTransform(transform);
+        }
+        if (guides.cursorWidth->isVisible() != visible) guides.cursorWidth->setVisible(visible);
+    }
 }
 
 int LineAnnotationDialog::maxControlPointExtrapolationDistanceVx() const
@@ -1594,20 +1897,23 @@ void LineAnnotationDialog::connectLinkedCursorMirroring(
             pane,
             &CChunkedVolumeViewer::sendMouseMoveVolume,
             this,
-            [this, pane](cv::Vec3f volumePoint, Qt::MouseButtons, Qt::KeyboardModifiers, QPointF) {
+            [this, pane](cv::Vec3f volumePoint, Qt::MouseButtons, Qt::KeyboardModifiers, QPointF scenePoint) {
                 // Off-surface hovers emit non-finite positions; mirror those
                 // as "no point" instead of a NaN readout.
                 const bool finite = std::isfinite(volumePoint[0]) &&
                                     std::isfinite(volumePoint[1]) &&
                                     std::isfinite(volumePoint[2]);
                 requestLinkedCursorMirror(
-                    pane, finite ? std::optional<cv::Vec3f>(volumePoint) : std::nullopt);
+                    pane, finite ? std::optional<cv::Vec3f>(volumePoint) : std::nullopt,
+                    finite ? std::optional<QPointF>(scenePoint) : std::nullopt);
             }));
         _generatedOverlayRefreshConnections.push_back(connect(
             pane->graphicsView(),
             &CVolumeViewerView::sendMouseLeftView,
             this,
-            [this, pane]() { requestLinkedCursorMirror(pane, std::nullopt); }));
+            [this, pane]() {
+                requestLinkedCursorMirror(pane, std::nullopt);
+            }));
     }
     applyLinkedCursorMirroringToPanes();
 }
@@ -1631,10 +1937,13 @@ void LineAnnotationDialog::applyLinkedCursorMirroringToPanes()
 }
 
 void LineAnnotationDialog::requestLinkedCursorMirror(CChunkedVolumeViewer* source,
-                                                     const std::optional<cv::Vec3f>& point)
+                                                     const std::optional<cv::Vec3f>& point,
+                                                     std::optional<QPointF> scenePoint)
 {
     _linkedCursorSource = source;
     _pendingLinkedCursorPoint = point;
+    _pendingLinkedCursorScenePoint = scenePoint;
+    if (!point) refreshFiberWidthCursors();
     if (!_linkedCursorMirrorTimer) {
         _linkedCursorMirrorTimer = new QTimer(this);
         _linkedCursorMirrorTimer->setSingleShot(true);
@@ -1643,6 +1952,7 @@ void LineAnnotationDialog::requestLinkedCursorMirror(CChunkedVolumeViewer* sourc
             if (_closing) {
                 return;
             }
+            refreshFiberWidthCursors();
             for (const auto& panePtr : _linkedCursorPanes) {
                 auto* pane = panePtr.data();
                 if (pane && pane != _linkedCursorSource.data()) {
@@ -1671,6 +1981,7 @@ void LineAnnotationDialog::clearGeneratedOverlayRefreshConnections()
     _linkedCursorPanes.clear();
     _linkedCursorSource.clear();
     _pendingLinkedCursorPoint.reset();
+    _pendingLinkedCursorScenePoint.reset();
     _generatedOverlayRefreshQueued = false;
     _generatedOverlayRefreshGeneration = 0;
     _generatedOverlayRefreshCoveredGeneration = 0;
@@ -1778,6 +2089,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     GeneratedViews views,
     const CChunkedVolumeViewer::CameraState& camera)
 {
+    cancelCrossSectionDrag();
     if (!_viewerManager || !_layout || views.linePoints.empty() ||
         views.lineUpVectors.size() != views.linePoints.size() ||
         !views.lineSurface || !views.lineSideSlice ||
@@ -2123,13 +2435,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                    Qt::MouseButton button,
                    Qt::KeyboardModifiers modifiers,
                    QPointF) {
-                if (button == Qt::LeftButton && modifiers == Qt::ShiftModifier) {
-                    // Unlike a plain click this leaves follow untouched, so it
-                    // must stop a keyboard pan itself.
-                    cancelArrowPan();
-                    emit generatedPredSnapPointRequested(_generatedViews.currentCutName,
-                                                         volumePoint);
-                } else if (button == Qt::LeftButton && modifiers == Qt::NoModifier) {
+                if (button == Qt::LeftButton && modifiers == Qt::NoModifier) {
                     if (!controlPointPlacementAllowedAt(_currentLinePosition)) {
                         return;
                     }
@@ -2384,8 +2690,6 @@ LineAnnotationDialog::showGeneratedControlPointContextMenu(
     const QPointF& scenePoint,
     const QPoint& globalPos,
     const vc3d::line_annotation::GeneratedLinkCandidateMenuState& linkCandidateState,
-    const vc3d::line_annotation::GeneratedLinkCandidateMenuState& splitCandidateState,
-    const vc3d::line_annotation::GeneratedLinkCandidateMenuState& splitAndLinkCandidateState,
     const vc3d::line_annotation::GeneratedLinkCandidateMenuState& mergeCandidateState,
     const vc3d::line_annotation::GeneratedLinkCandidateMenuState& newLinkedToCandidateState,
     std::function<QString(uint64_t)> fiberDisplayNameForId)
@@ -2401,6 +2705,13 @@ LineAnnotationDialog::showGeneratedControlPointContextMenu(
     } else {
         for (size_t i = 0; i < _stripViewers.size(); ++i) {
             if (viewer == _stripViewers[i]) {
+                // While this strip still shows the held frame (its
+                // re-optimized frame is not displayed yet), the click would be
+                // resolved against geometry that is not on screen: no menu
+                // until the swap lands.
+                if (i < _stripOverlaySwapPending.size() && _stripOverlaySwapPending[i]) {
+                    return GeneratedControlPointContextResult::None;
+                }
                 linePosition = linePositionFromStripScene(viewer, scenePoint);
                 break;
             }
@@ -2421,6 +2732,9 @@ LineAnnotationDialog::showGeneratedControlPointContextMenu(
 
     vc3d::line_annotation::GeneratedControlPointContextMenuOptions options;
     options.parent = this;
+    options.clearControlCorrections = [this](size_t index) {
+        emit clearControlCorrectionsRequested(index);
+    };
     options.surfaceName = surfaceName;
     options.viewer = viewer;
     options.scenePoint = scenePoint;
@@ -2458,9 +2772,6 @@ LineAnnotationDialog::showGeneratedControlPointContextMenu(
     options.linkWithCandidateLabel = linkCandidateState.label;
     options.mergeWithCandidateEnabled = mergeCandidateState.enabled;
     options.mergeWithCandidateLabel = mergeCandidateState.label;
-    options.splitFromCandidateEnabled = splitCandidateState.enabled;
-    options.splitFromCandidateLabel = splitCandidateState.label;
-    options.splitFromCandidateAndLinkLabel = splitAndLinkCandidateState.label;
     options.newLinkedToCandidateLabel = newLinkedToCandidateState.label;
     options.fiberDisplayNameForId = std::move(fiberDisplayNameForId);
     options.branchLinkDirection = branchLinkDirectionForViewer(viewer, linePosition);
@@ -2503,23 +2814,14 @@ LineAnnotationDialog::showGeneratedControlPointContextMenu(
                                                               controlPointIndex,
                                                               volumePoint);
     };
-    options.designateSplitCandidate = [this, surfaceName](size_t controlPointIndex,
-                                                          cv::Vec3f volumePoint) {
-        emit generatedControlPointSplitCandidateRequested(surfaceName,
-                                                          controlPointIndex,
-                                                          volumePoint);
+    options.splitSpan = [this, surfaceName](size_t first, size_t second, bool linkHalves) {
+        emit generatedSpanSplitRequested(surfaceName, first, second, linkHalves);
     };
-    options.splitFromCandidate = [this, surfaceName](size_t controlPointIndex,
-                                                     cv::Vec3f volumePoint) {
-        emit generatedControlPointSplitFromCandidateRequested(surfaceName,
-                                                              controlPointIndex,
-                                                              volumePoint);
+    options.setSpanGap = [this, surfaceName](size_t first, size_t second, bool enabled) {
+        emit generatedSpanGapChangeRequested(surfaceName, first, second, enabled);
     };
-    options.splitFromCandidateAndLink = [this, surfaceName](size_t controlPointIndex,
-                                                            cv::Vec3f volumePoint) {
-        emit generatedControlPointSplitAndLinkFromCandidateRequested(surfaceName,
-                                                                     controlPointIndex,
-                                                                     volumePoint);
+    options.setSpanDamaged = [this, surfaceName](size_t first, size_t second, bool enabled) {
+        emit generatedSpanDamagedChangeRequested(surfaceName, first, second, enabled);
     };
     options.openNearbyAnnotation = [this](uint64_t fiberId, cv::Vec3f volumePoint) {
         emit generatedNearbyAnnotationOpenRequested(fiberId, volumePoint);
@@ -2556,6 +2858,9 @@ LineAnnotationDialog::showGeneratedControlPointContextMenu(
         emit generatedControlPointKollesisTerminationChangeRequested(surfaceName,
                                                                      controlPointIndex,
                                                                      enabled);
+    };
+    options.setBreak = [this, surfaceName](size_t controlPointIndex, bool enabled) {
+        emit generatedControlPointBreakChangeRequested(surfaceName, controlPointIndex, enabled);
     };
     return vc3d::line_annotation::showGeneratedControlPointContextMenu(options);
 }
@@ -2598,6 +2903,7 @@ double LineAnnotationDialog::linePositionFromStripScene(CChunkedVolumeViewer* vi
 
 void LineAnnotationDialog::requestCurrentLinePosition(double position)
 {
+    if (_crossSectionDrag) return;
     // Hot path: called once per mouse-move event while following a strip viewer. Defer the
     // actual (potentially O(N)) plane + overlay rebuild to a single render-tick-cadence flush so
     // a fast cursor doesn't back up the event loop with one full update per move.
@@ -2641,6 +2947,7 @@ void LineAnnotationDialog::setCurrentLinePosition(double position,
     if (!currentChanged) {
         return;
     }
+    cancelCrossSectionDrag();
     if (currentChanged && _generatedViews.currentCutSurface) {
         _currentCutNormalOffsetVx = 0.0;
         _currentCutStraightAheadActive = false;
@@ -3572,6 +3879,13 @@ bool LineAnnotationDialog::controlPointPlacementAllowedAt(double linePosition) c
             _generatedViews.controlPoints, linePosition)) {
         return false;
     }
+    // Nothing goes inside a gap span (two consecutive break points) either:
+    // unflag a break first.
+    if (vc3d::line_annotation::generatedLinePositionInsideGap(
+            vc3d::line_annotation::generatedGapLineRanges(_generatedViews.controlPoints),
+            linePosition)) {
+        return false;
+    }
     std::vector<double> controlLinePositions;
     controlLinePositions.reserve(_generatedViews.controlPoints.size());
     for (const auto& control : _generatedViews.controlPoints) {
@@ -3588,7 +3902,10 @@ vc3d::line_annotation::GeneratedCurrentLineMarkerState
 LineAnnotationDialog::currentLineMarkerState() const
 {
     if (vc3d::line_annotation::generatedLinePositionBeyondKollesisTermination(
-            _generatedViews.controlPoints, _currentLinePosition)) {
+            _generatedViews.controlPoints, _currentLinePosition) ||
+        vc3d::line_annotation::generatedLinePositionInsideGap(
+            vc3d::line_annotation::generatedGapLineRanges(_generatedViews.controlPoints),
+            _currentLinePosition)) {
         return vc3d::line_annotation::GeneratedCurrentLineMarkerState::Blocked;
     }
     if (maxControlPointExtrapolationDistanceVx() <= 0) {
@@ -3910,6 +4227,9 @@ void LineAnnotationDialog::updateStaticStripOverlaysForPan()
 
 void LineAnnotationDialog::clearFastGeneratedOverlayItemRefs()
 {
+    cancelCrossSectionDrag();
+    _crossSectionDragPreview = nullptr;
+    _fiberGuides = {};
     _fastStripOverlayItems.clear();
     _fastCurrentCutOverlayItems = {};
     _staticStripOverlayPlacements.clear();
@@ -3928,18 +4248,11 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
     // The schematic overview bar tracks the same inputs (control points +
     // current position) as the dynamic overlays; refresh it on the same cadence.
     updateOverviewBar();
+    updateFiberDisplayControlsAndGuides();
 
     const auto markerColorForState =
         [](vc3d::line_annotation::GeneratedCurrentLineMarkerState state) {
-            switch (state) {
-            case vc3d::line_annotation::GeneratedCurrentLineMarkerState::Allowed:
-                return QColor(40, 220, 120, 245);
-            case vc3d::line_annotation::GeneratedCurrentLineMarkerState::Blocked:
-                return QColor(255, 70, 70, 245);
-            case vc3d::line_annotation::GeneratedCurrentLineMarkerState::Neutral:
-            default:
-                return QColor(0, 245, 255, 245);
-            }
+            return vc3d::line_annotation::generatedCurrentLineMarkerColor(state, 245);
         };
 
     const auto ensureStripItems =
@@ -4296,12 +4609,12 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         !_fastCurrentCutOverlayItems.controlPoints ||
         !_fastCurrentCutOverlayItems.seedPoints ||
         !_fastCurrentCutOverlayItems.linkCandidatePoints ||
-        !_fastCurrentCutOverlayItems.splitCandidatePoints ||
         !_fastCurrentCutOverlayItems.branchControlPoints ||
         !_fastCurrentCutOverlayItems.pendingBranchControlPoints ||
         !_fastCurrentCutOverlayItems.sameHvBranchControlPoints ||
         !_fastCurrentCutOverlayItems.sameHvPendingBranchControlPoints ||
         !_fastCurrentCutOverlayItems.kollesisRings ||
+        !_fastCurrentCutOverlayItems.breakRings ||
         !_fastCurrentCutOverlayItems.fiberIntersections ||
         !_fastCurrentCutOverlayItems.linkCandidateFiberIntersections ||
         std::any_of(_fastCurrentCutOverlayItems.branchLinkFiberIntersections.begin(),
@@ -4346,13 +4659,6 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         _fastCurrentCutOverlayItems.linkCandidatePoints->setBrush(linkCandidateBrush);
         _fastCurrentCutOverlayItems.linkCandidatePoints->setZValue(163.0);
 
-        QPen splitCandidatePen(QColor(235, 60, 60, 245));
-        splitCandidatePen.setWidthF(2.0);
-        QBrush splitCandidateBrush(QColor(235, 60, 60, 175));
-        _fastCurrentCutOverlayItems.splitCandidatePoints = new QGraphicsPathItem();
-        _fastCurrentCutOverlayItems.splitCandidatePoints->setPen(splitCandidatePen);
-        _fastCurrentCutOverlayItems.splitCandidatePoints->setBrush(splitCandidateBrush);
-        _fastCurrentCutOverlayItems.splitCandidatePoints->setZValue(163.5);
 
         QPen branchControlPen(QColor(210, 95, 255, 245));
         branchControlPen.setWidthF(2.0);
@@ -4398,6 +4704,15 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         _fastCurrentCutOverlayItems.kollesisRings->setPen(kollesisRingPen);
         _fastCurrentCutOverlayItems.kollesisRings->setBrush(Qt::NoBrush);
         _fastCurrentCutOverlayItems.kollesisRings->setZValue(162.75);
+
+        // The break ring: dotted amber, layered like the kollesis ring.
+        QPen breakRingPen(vc3d::line_annotation::generatedBreakColor(245));
+        breakRingPen.setWidthF(2.5);
+        breakRingPen.setStyle(Qt::DotLine);
+        _fastCurrentCutOverlayItems.breakRings = new QGraphicsPathItem();
+        _fastCurrentCutOverlayItems.breakRings->setPen(breakRingPen);
+        _fastCurrentCutOverlayItems.breakRings->setBrush(Qt::NoBrush);
+        _fastCurrentCutOverlayItems.breakRings->setZValue(162.75);
 
         QPen fiberIntersectionPen(QColor(255, 245, 75, 245));
         fiberIntersectionPen.setWidthF(1.25);
@@ -4462,12 +4777,12 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
             _fastCurrentCutOverlayItems.controlPoints,
             _fastCurrentCutOverlayItems.seedPoints,
             _fastCurrentCutOverlayItems.linkCandidatePoints,
-            _fastCurrentCutOverlayItems.splitCandidatePoints,
             _fastCurrentCutOverlayItems.branchControlPoints,
             _fastCurrentCutOverlayItems.pendingBranchControlPoints,
             _fastCurrentCutOverlayItems.sameHvBranchControlPoints,
             _fastCurrentCutOverlayItems.sameHvPendingBranchControlPoints,
             _fastCurrentCutOverlayItems.kollesisRings,
+            _fastCurrentCutOverlayItems.breakRings,
             _fastCurrentCutOverlayItems.fiberIntersections,
             _fastCurrentCutOverlayItems.linkCandidateFiberIntersections};
         for (auto* item : _fastCurrentCutOverlayItems.branchLinkFiberIntersections) {
@@ -4503,16 +4818,31 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         centerPath.addEllipse(centerScenePoint, 2.5, 2.5);
     }
     _fastCurrentCutOverlayItems.centerPoint->setPath(centerPath);
+    // The marker takes the blocked colour where nothing may be placed: inside
+    // a gap span or beyond a kollesis termination, judged on the DISPLAYED
+    // controls and position (a pending swap shows the held views), like the
+    // strip marker and the overview bar do from the dialog's state.
+    {
+        const auto centerState = vc3d::line_annotation::generatedBlockedLineMarkerState(
+            cutViews.controlPoints,
+            vc3d::line_annotation::generatedGapLineRanges(cutViews.controlPoints),
+            cutPosition);
+        QPen centerPen(vc3d::line_annotation::generatedCurrentLineMarkerColor(centerState, 245));
+        centerPen.setWidthF(1.5);
+        _fastCurrentCutOverlayItems.centerPoint->setPen(centerPen);
+        _fastCurrentCutOverlayItems.centerPoint->setBrush(
+            QBrush(vc3d::line_annotation::generatedCurrentLineMarkerColor(centerState, 210)));
+    }
 
     QPainterPath controlPath;
     QPainterPath seedPath;
     QPainterPath linkCandidatePath;
-    QPainterPath splitCandidatePath;
     QPainterPath branchControlPath;
     QPainterPath pendingBranchControlPath;
     QPainterPath sameHvBranchControlPath;
     QPainterPath sameHvPendingBranchControlPath;
     QPainterPath kollesisRingPath;
+    QPainterPath breakRingPath;
     const double lineRadius =
         std::max(0.5, (_viewerManager ? _viewerManager->zScrollSensitivity() : 1.0) * 0.5);
     const double lower = cutPosition - lineRadius;
@@ -4553,11 +4883,6 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         // replaces the plain fill when the point is unlinked.
         const bool linked = control.hasPendingLinks || control.hasBranches;
         const double baseRadius = linked ? 12.0 : (control.isSeed ? 11.0 : 10.0);
-        if (control.isSplitCandidate) {
-            splitCandidatePath.addEllipse(scenePoint, control.isSeed ? 11.0 : 10.0,
-                                          control.isSeed ? 11.0 : 10.0);
-            continue;
-        }
         if (control.isLinkCandidate) {
             const double candidateRadius = control.isSeed ? 11.0 : 10.0;
             if (control.isAdjacentLinkCandidate) {
@@ -4570,6 +4895,13 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         }
         if (control.isKollesisTermination) {
             kollesisRingPath.addEllipse(scenePoint, baseRadius + 2.0, baseRadius + 2.0);
+            if (!linked) {
+                continue;
+            }
+        } else if (control.isBreak) {
+            // Same ring geometry in the dotted amber pen (a point with both
+            // tags, from an edited file, draws as the kollesis termination).
+            breakRingPath.addEllipse(scenePoint, baseRadius + 2.0, baseRadius + 2.0);
             if (!linked) {
                 continue;
             }
@@ -4598,13 +4930,13 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
     _fastCurrentCutOverlayItems.controlPoints->setPath(controlPath);
     _fastCurrentCutOverlayItems.seedPoints->setPath(seedPath);
     _fastCurrentCutOverlayItems.linkCandidatePoints->setPath(linkCandidatePath);
-    _fastCurrentCutOverlayItems.splitCandidatePoints->setPath(splitCandidatePath);
     _fastCurrentCutOverlayItems.branchControlPoints->setPath(branchControlPath);
     _fastCurrentCutOverlayItems.pendingBranchControlPoints->setPath(pendingBranchControlPath);
     _fastCurrentCutOverlayItems.sameHvBranchControlPoints->setPath(sameHvBranchControlPath);
     _fastCurrentCutOverlayItems.sameHvPendingBranchControlPoints->setPath(
         sameHvPendingBranchControlPath);
     _fastCurrentCutOverlayItems.kollesisRings->setPath(kollesisRingPath);
+    _fastCurrentCutOverlayItems.breakRings->setPath(breakRingPath);
 
     // Parallax ghosts: the nearest control point behind and ahead of the cursor
     // within the visibility distance slide in horizontally from the side they
@@ -4748,17 +5080,14 @@ cv::Vec3f LineAnnotationDialog::interpolatedLineTangent(double linePosition) con
     }
     const double maxPosition = static_cast<double>(_generatedViews.linePoints.size() - 1);
     linePosition = std::clamp(linePosition, 0.0, maxPosition);
-    // Smooth, continuous tangent: a central difference of the (piecewise-linear) line over a
-    // window around the cursor, rather than the raw difference of the two bracketing integer
-    // points. The raw adjacent-point difference is piecewise-constant in linePosition and snaps
-    // the cut-plane orientation at every integer crossing (the main source of the cross-section
-    // "jumpiness"); averaging over +/-kTangentHalfWindow line indices removes that stepping while
-    // staying locally faithful to the line direction. interpolatedLinePoint() is continuous, so
-    // the result varies continuously with the cursor.
-    constexpr double kTangentHalfWindow = 4.0;
-    const double lo = std::max(0.0, linePosition - kTangentHalfWindow);
-    const double hi = std::min(maxPosition, linePosition + kTangentHalfWindow);
-    cv::Vec3f tangent = interpolatedLinePoint(hi) - interpolatedLinePoint(lo);
+    // Share the regular line-view tangent with normal editing.
+    cv::Vec3f tangent(vc::fiber_tracer::displayTangentAt(_generatedViews.linePoints, linePosition));
+    for (const auto& cp : _generatedViews.controlPoints)
+        if (cp.direction && std::abs(cp.linePosition-linePosition)<1e-5) {
+            auto axis=cv::Vec3f(*cp.direction);
+            tangent=axis;
+            break;
+        }
     if (cv::norm(tangent) <= 1.0e-6f) {
         return {std::numeric_limits<float>::quiet_NaN(),
                 std::numeric_limits<float>::quiet_NaN(),
@@ -4812,7 +5141,8 @@ cv::Vec3f LineAnnotationDialog::interpolatedOrientedNormal(double linePosition) 
     const cv::Vec3f nan{std::numeric_limits<float>::quiet_NaN(),
                         std::numeric_limits<float>::quiet_NaN(),
                         std::numeric_limits<float>::quiet_NaN()};
-    const auto& normals = _generatedViews.lineNormals;
+    const auto& normals = _generatedViews.hasManualDisplayNormals && !_generatedViews.displayLineNormals.empty()
+        ? _generatedViews.displayLineNormals : _generatedViews.lineNormals;
     if (normals.empty() || !std::isfinite(linePosition)) {
         return nan;
     }
@@ -4971,6 +5301,7 @@ bool LineAnnotationDialog::event(QEvent* event)
 
 void LineAnnotationDialog::stopArrowPanForFocusLoss()
 {
+    cancelCrossSectionDrag();
     // The key-up goes to whichever window took focus (Alt-Tab mid-hold), and
     // an inactive window must not keep rendering a pan at all: braking into
     // the next target can mean minutes of four-pane rendering at low speeds
@@ -4982,6 +5313,7 @@ void LineAnnotationDialog::stopArrowPanForFocusLoss()
 
 void LineAnnotationDialog::hideEvent(QHideEvent* event)
 {
+    cancelCrossSectionDrag();
     QMainWindow::hideEvent(event);
     // Hiding the workspace in place (an embedding tab switch) fires no
     // activation change, and the key-up then goes elsewhere; a pan running in
@@ -5026,7 +5358,7 @@ bool LineAnnotationDialog::placeControlPointAtCurrentLinePosition()
     }
     // Unlike a click in the cut pane this leaves hover-follow as the user set it
     // -- the key is meant to be tapped mid-pan, where follow is deliberately
-    // paused -- so, like the shift-click snap, it has to stop the pan itself:
+    // paused -- so, like the cross-view drag, it has to stop the pan itself:
     // the placement renumbers the line positions the pan is steering by.
     cancelArrowPan();
     // The key places ON the line, so its point is also the position's anchor.
@@ -5041,6 +5373,11 @@ bool LineAnnotationDialog::handleKeyPress(QKeyEvent* event)
 {
     if (!event) {
         return false;
+    }
+    if (_crossSectionDrag) {
+        if (event->key() == Qt::Key_Escape) cancelCrossSectionDrag();
+        event->accept();
+        return true;
     }
     if (event->key() == Qt::Key_Space && event->modifiers() == Qt::NoModifier) {
         (void)toggleCurrentCutFollowFromKeyboard();
@@ -5126,6 +5463,12 @@ bool LineAnnotationDialog::handleKeyRelease(QKeyEvent* event)
     if (!event || !_hasGeneratedViews) {
         return false;
     }
+    if (_crossSectionDrag && event->key() == Qt::Key_Shift && !event->isAutoRepeat()) {
+        // If the mouse is still down, its release will finish the last stroke.
+        if (!_crossSectionDrag->mouseDown) finishCrossSectionDrag();
+        event->accept();
+        return true;
+    }
     if (event->key() != Qt::Key_Left && event->key() != Qt::Key_Right) {
         return false;
     }
@@ -5161,8 +5504,296 @@ bool LineAnnotationDialog::handleKeyRelease(QKeyEvent* event)
     return true;
 }
 
+void LineAnnotationDialog::cancelCrossSectionDrag()
+{
+    cancelDirectionDrag();
+    const bool wasDragging = _crossSectionDrag.has_value();
+    _crossSectionDrag.reset();
+    if (auto* item = dynamic_cast<QGraphicsPathItem*>(_crossSectionDragPreview.data()))
+        item->hide();
+    if (wasDragging && _currentCutViewer && _currentCutViewer->graphicsView()) {
+        auto* viewport = _currentCutViewer->graphicsView()->viewport();
+        if (QWidget::mouseGrabber() == viewport) viewport->releaseMouse();
+    }
+    if (wasDragging) {
+        // Cancellation also runs during surface/scene replacement. Restore
+        // guides after that finishes, when their cached item refs are current.
+        QTimer::singleShot(0, this, [this] { updateFiberDisplayControlsAndGuides(); });
+    }
+}
+
+void LineAnnotationDialog::finishCrossSectionDrag()
+{
+    if (!_crossSectionDrag) return;
+    const auto edit = *_crossSectionDrag;
+    cancelCrossSectionDrag();
+    if (edit.changed) {
+        emit crossSectionDragFinished(_generatedViews.currentCutName, cv::Vec3f(edit.center),
+            edit.linePosition, cv::Vec3f(edit.lineAnchor), cv::Vec3f(edit.normal), edit.normalChanged);
+    }
+}
+
+void LineAnnotationDialog::cancelDirectionDrag()
+{
+    if (_directionDrag && _directionDrag->viewer && _directionDrag->viewer->graphicsView()) {
+        auto* viewport=_directionDrag->viewer->graphicsView()->viewport();
+        if (QWidget::mouseGrabber()==viewport) viewport->releaseMouse();
+    }
+    _directionDrag.reset();
+    if (auto* item=dynamic_cast<QGraphicsPathItem*>(_directionPreview.data())) item->hide();
+}
+
+bool LineAnnotationDialog::handleDirectionDragEvent(QObject* watched, QEvent* event)
+{
+    if (_directionDrag && event->type()==QEvent::KeyPress &&
+        static_cast<QKeyEvent*>(event)->key()==Qt::Key_Escape) {
+        cancelDirectionDrag(); return true;
+    }
+    if (event->type()!=QEvent::MouseButtonPress && event->type()!=QEvent::MouseMove &&
+        event->type()!=QEvent::MouseButtonRelease && event->type()!=QEvent::Wheel) return false;
+    CChunkedVolumeViewer* viewer=nullptr;
+    size_t strip=0;
+    for (;strip<_stripViewers.size();++strip) {
+        auto* candidate=_stripViewers[strip].data();
+        if (candidate && candidate->graphicsView() &&
+            watched==candidate->graphicsView()->viewport()) { viewer=candidate; break; }
+    }
+    if (!viewer || strip>1) return false;
+    if (event->type()==QEvent::Wheel) return _directionDrag.has_value();
+    auto* mouse=static_cast<QMouseEvent*>(event);
+    auto* view=viewer->graphicsView();
+    const QPointF scene=view->mapToScene(mouse->pos());
+    if (event->type()==QEvent::MouseButtonPress) {
+        if (mouse->button()!=Qt::LeftButton || mouse->modifiers()!=Qt::ShiftModifier) return false;
+        if (_optimizationInputBlocked || !_hasGeneratedViews) return true;
+        auto surface=strip==0 ? _generatedViews.lineSurface : _generatedViews.lineSideSlice;
+        if (!surface) return true;
+        const auto uv=viewer->sceneToSurfaceCoords(scene);
+        const GeneratedOverlay::ControlPointMarker* chosen=nullptr;
+        cv::Vec2d chosenUV;
+        double best=vc::lasagna::kLineViewAlongSamplingDistanceBaseVoxels *
+                    _generatedViews.fiberBaseToVolumeScale;
+        for (const auto& cp : _generatedViews.controlPoints) {
+            const auto cpUV=surface->gridToSurface({
+                _generatedViews.stripPositionMap.originalPositionToStripGridColumn(cp.linePosition),
+                double(surface->rawPointsPtr()->rows/2)});
+            const double distance=cv::norm(cpUV-cv::Vec2d(uv));
+            if (distance<=best) { best=distance; chosen=&cp; chosenUV=cpUV; }
+        }
+        GeneratedOverlay::ControlPointMarker inserted;
+        const bool createControl = !chosen;
+        if (createControl) {
+            chosenUV=cv::Vec2d(uv);
+            const auto grid=surface->surfaceToGrid(chosenUV);
+            if (grid[0]<0 || grid[0]>surface->rawPointsPtr()->cols-1 ||
+                grid[1]<0 || grid[1]>surface->rawPointsPtr()->rows-1) return true;
+            inserted.linePosition=_generatedViews.stripPositionMap.stripGridColumnToOriginalPosition(grid[0]);
+            if (!controlPointPlacementAllowedAt(inserted.linePosition)) return true;
+            inserted.point=surface->sampleAtSurface(chosenUV).volume;
+            if (!std::isfinite(cv::norm(inserted.point))) return true;
+            chosen=&inserted;
+        }
+        cancelDirectionDrag(); cancelArrowPan();
+        DirectionDrag drag;
+        drag.viewer=viewer; drag.controlIndex=chosen->controlIndex;
+        drag.createControl=createControl;
+        drag.linePosition=chosen->linePosition;
+        drag.point=chosen->point;
+        drag.lineAnchor=interpolatedLinePoint(chosen->linePosition);
+        drag.pressPixel=mouse->pos();
+        drag.surfaceOrigin=cv::Vec2f(chosenUV);
+        drag.origin=viewer->surfaceCoordsToScene(float(chosenUV[0]),float(chosenUV[1]));
+        const auto frame=vc3d::line_annotation::generatedStripFrame(surface.get(),chosenUV);
+        if (!frame) return true;
+        drag.normal=frame->normal; drag.across=frame->across; drag.along=frame->along;
+        drag.axis=chosen->direction.value_or(vc::fiber_tracer::displayTangentAt(
+            _generatedViews.linePoints,chosen->linePosition));
+        _directionDrag=drag;
+        viewer->clearOverlayGroup("fiber-direction-drag");
+        auto* item=new CrossSectionDragPreview;
+        QPen pen(QColor(0,245,255)); pen.setCosmetic(true); pen.setWidthF(1.5);
+        item->setPen(pen); item->setZValue(170); item->setAcceptedMouseButtons(Qt::NoButton);
+        viewer->setOverlayGroup("fiber-direction-drag",{item}); _directionPreview=item;
+        view->setFocus(Qt::MouseFocusReason); view->viewport()->grabMouse();
+    }
+    if (!_directionDrag || _directionDrag->viewer!=viewer) return false;
+    if (event->type()==QEvent::MouseButtonRelease && mouse->button()!=Qt::LeftButton) return true;
+    auto& drag=*_directionDrag;
+    drag.moved=drag.moved || (mouse->pos()-drag.pressPixel).manhattanLength()>3;
+    const auto delta=viewer->sceneToSurfaceCoords(scene)-drag.surfaceOrigin;
+    drag.result=vc::fiber_tracer::editControlDirection(drag.axis,drag.normal,
+        drag.along*delta[0]+drag.across*delta[1],drag.along);
+    if (auto* item=dynamic_cast<QGraphicsPathItem*>(_directionPreview.data())) {
+        QPainterPath path; path.moveTo(drag.origin); path.lineTo(scene);
+        item->setPath(path); item->setVisible(drag.result.has_value());
+    }
+    if (event->type()==QEvent::MouseButtonRelease) {
+        const auto result=drag.moved ? drag.result : std::nullopt; const auto index=drag.controlIndex;
+        const auto completed=drag;
+        cancelDirectionDrag();
+        if (result) {
+            if (completed.createControl)
+                emit controlDirectionCreated(completed.point, completed.linePosition,
+                                             completed.lineAnchor, cv::Vec3f(*result));
+            else emit controlDirectionChanged(index,cv::Vec3f(*result));
+        }
+    }
+    return true;
+}
+
+bool LineAnnotationDialog::handleCrossSectionDragEvent(QObject* watched, QEvent* event)
+{
+    if (_crossSectionDrag && event->type() == QEvent::KeyPress) {
+        return handleKeyPress(static_cast<QKeyEvent*>(event));
+    }
+    // Do not dereference viewers on destruction/layout events: Qt delivers
+    // those while the derived viewer is already being torn down.
+    if (event->type() != QEvent::MouseButtonPress && event->type() != QEvent::MouseMove &&
+        event->type() != QEvent::MouseButtonRelease && event->type() != QEvent::Wheel) return false;
+    auto* viewer = _currentCutViewer.data();
+    if (!viewer || !viewer->graphicsView() || watched != viewer->graphicsView()->viewport()) return false;
+    auto* view = viewer->graphicsView();
+    if (_crossSectionDrag && event->type() == QEvent::Wheel) return true;
+    if (event->type() != QEvent::MouseButtonPress && event->type() != QEvent::MouseMove &&
+        event->type() != QEvent::MouseButtonRelease) return false;
+    auto* mouse = static_cast<QMouseEvent*>(event);
+    const QPointF scene = view->mapToScene(mouse->pos());
+    if (event->type() == QEvent::MouseButtonPress) {
+        if (_crossSectionDrag && _crossSectionDrag->mouseDown) return true;
+        if (mouse->button() != Qt::LeftButton || mouse->modifiers() != Qt::ShiftModifier)
+            return _crossSectionDrag.has_value();
+        if (!_hasGeneratedViews || _optimizationInputBlocked ||
+            !controlPointPlacementAllowedAt(_currentLinePosition) || !_generatedViews.currentCutSurface)
+            return true;
+        cancelArrowPan();
+        CrossSectionDrag drag = _crossSectionDrag.value_or(CrossSectionDrag{});
+        _lineUpdatePending = false;
+        if (_lineUpdateTimer) _lineUpdateTimer->stop();
+        drag.pressScene = scene;
+        drag.moved = false;
+        drag.mouseDown = true;
+        if (!_crossSectionDrag) {
+            drag.center = interpolatedLinePoint(_currentLinePosition);
+            drag.lineAnchor = drag.center;
+            drag.axis = _generatedViews.currentCutSurface->basisX();
+            drag.normal = _generatedViews.currentCutSurface->basisY();
+            drag.planeNormal = _generatedViews.currentCutSurface->normal({0, 0, 0});
+            drag.width = _generatedViews.fiberWidth;
+            drag.linePosition = _currentLinePosition;
+        }
+        const QPointF zero = viewer->surfaceCoordsToScene(0, 0);
+        const QPointF x = viewer->surfaceCoordsToScene(1, 0) - zero;
+        const QPointF y = viewer->surfaceCoordsToScene(0, 1) - zero;
+        bool invertible = false;
+        const auto inverse = QTransform(x.x(), x.y(), y.x(), y.y(), 0, 0).inverted(&invertible);
+        if (!invertible) return true;
+        // The image plane stays fixed between strokes, even though the preview
+        // axis/normal have rotated. Convert the mouse with that original plane.
+        const cv::Vec3d planeX = _generatedViews.currentCutSurface->basisX();
+        const cv::Vec3d planeY = _generatedViews.currentCutSurface->basisY();
+        drag.sceneX = planeX * inverse.m11() + planeY * inverse.m12();
+        drag.sceneY = planeX * inverse.m21() + planeY * inverse.m22();
+        if (!std::isfinite(cv::norm(drag.center)) || !std::isfinite(cv::norm(drag.sceneX)) ||
+            !std::isfinite(cv::norm(drag.sceneY))) return true;
+        double best = std::numeric_limits<double>::infinity();
+        for (int handle : {0, -1, 1}) {
+            if (handle && drag.width <= 0) continue;
+            const cv::Vec3d point = drag.center + drag.axis * (handle * drag.width / 2);
+            const QPointF screen = view->viewportTransform().map(viewer->volumeToScene(cv::Vec3f(point)));
+            const QPointF distance = screen - mouse->position();
+            const double squared = distance.x() * distance.x() + distance.y() * distance.y();
+            if (squared < best) {
+                best = squared;
+                drag.handle = handle;
+                drag.edgeScene = viewer->volumeToScene(cv::Vec3f(point));
+            }
+        }
+        _crossSectionDrag = drag;
+        updateFiberDisplayControlsAndGuides();
+        view->setFocus(Qt::MouseFocusReason);
+        view->viewport()->grabMouse();
+    }
+    if (!_crossSectionDrag) return false;
+    if (!_crossSectionDrag->mouseDown) return true;
+    if (event->type() == QEvent::MouseButtonRelease && mouse->button() != Qt::LeftButton) return true;
+    auto& drag = *_crossSectionDrag;
+    const QPointF movement = scene - drag.pressScene;
+    if (std::hypot(movement.x(), movement.y()) > 1e-6) drag.moved = true;
+    const QPointF offset = scene - (drag.handle ? drag.edgeScene : drag.pressScene);
+    const auto result = vc::fiber_tracer::dragFiberWidth(drag.center, drag.normal, drag.axis,
+        drag.planeNormal, drag.width, drag.handle, drag.sceneX * offset.x() + drag.sceneY * offset.y());
+    if (event->type() == QEvent::MouseButtonRelease) {
+        if (result && drag.moved) {
+            drag.center = result->center;
+            drag.normal = result->normal;
+            drag.axis = result->edgeAxis;
+            drag.changed = true;
+            drag.normalChanged = drag.normalChanged || drag.handle != 0;
+        }
+        drag.mouseDown = false;
+        if (QWidget::mouseGrabber() == view->viewport()) view->viewport()->releaseMouse();
+        if (!mouse->modifiers().testFlag(Qt::ShiftModifier)) finishCrossSectionDrag();
+        else drawCrossSectionDragPreview({drag.center, drag.normal, drag.axis, drag.width});
+        return true;
+    }
+    if (!result) {
+        if (auto* item = dynamic_cast<QGraphicsPathItem*>(_crossSectionDragPreview.data())) item->hide();
+        return true;
+    }
+    drawCrossSectionDragPreview(*result);
+    return true;
+}
+
+void LineAnnotationDialog::drawCrossSectionDragPreview(const vc::fiber_tracer::FiberWidthDragResult& geometry)
+{
+    auto* viewer = _currentCutViewer.data();
+    if (!viewer || !viewer->graphicsView()) return;
+    auto* view = viewer->graphicsView();
+    const auto* result = &geometry;
+    if (!_crossSectionDragPreview) {
+        auto* item = new CrossSectionDragPreview;
+        QPen pen(QColor(0, 245, 255));
+        pen.setCosmetic(true);
+        pen.setWidthF(1.5);
+        item->setPen(pen);
+        item->setZValue(160);
+        item->setAcceptedMouseButtons(Qt::NoButton);
+        viewer->setOverlayGroup("fiber-cross-drag", {item});
+        _crossSectionDragPreview = item;
+    }
+    QPainterPath path;
+    const double radius = 4.0 / std::max(1e-6, std::hypot(
+        view->viewportTransform().m11(), view->viewportTransform().m12()));
+    const QPointF left = viewer->volumeToScene(cv::Vec3f(result->center - result->edgeAxis * (result->width / 2)));
+    const QPointF right = viewer->volumeToScene(cv::Vec3f(result->center + result->edgeAxis * (result->width / 2)));
+    path.moveTo(left); path.lineTo(right);
+    for (const auto& point : {left, viewer->volumeToScene(cv::Vec3f(result->center)), right})
+        path.addEllipse(point, radius, radius);
+    if (result->width > 0 && _showFiberWidthAction->isChecked()) {
+        const QPointF center = viewer->volumeToScene(cv::Vec3f(result->center));
+        const QPointF normal = viewer->volumeToScene(cv::Vec3f(result->center + result->normal)) - center;
+        const auto camera = view->viewportTransform();
+        const QPointF pixelNormal = camera.map(normal) - camera.map(QPointF{});
+        const double pixelsPerUnit = std::hypot(pixelNormal.x(), pixelNormal.y());
+        if (pixelsPerUnit > 1e-9) {
+            const QPointF halfTick = normal * (6.0 / pixelsPerUnit);
+            for (double edgeOffset : vc::fiber_tracer::fiberWidthEdgeOffsets(
+                     result->width, _generatedViews.fiberWidthGapFraction)) {
+                const QPointF edge = left + (right - left) * (0.5 + edgeOffset / result->width);
+                path.moveTo(edge - halfTick);
+                path.lineTo(edge + halfTick);
+            }
+        }
+    }
+    auto* item = dynamic_cast<QGraphicsPathItem*>(_crossSectionDragPreview.data());
+    item->setPath(path);
+    item->show();
+}
+
 bool LineAnnotationDialog::eventFilter(QObject* watched, QEvent* event)
 {
+    if (handleDirectionDragEvent(watched,event)) return true;
+    if (handleCrossSectionDragEvent(watched, event)) return true;
     if (watched == _fiberNameLabel && event->type() == QEvent::Resize) {
         updateFiberNameLabel();
     }
@@ -5213,9 +5844,7 @@ void LineAnnotationDialog::updateOverviewBar()
         LineAnnotationOverviewBar::ControlDot dot;
         dot.linePosition = control.linePosition;
         // Same state palette as the cut-view overlays.
-        if (control.isSplitCandidate) {
-            dot.color = QColor(235, 60, 60);
-        } else if (control.isLinkCandidate) {
+        if (control.isLinkCandidate) {
             dot.color = QColor(60, 235, 120);
         } else if (control.hasPendingLinks) {
             dot.color = control.hasSameHvPendingLinks ? QColor(255, 190, 120)
@@ -5227,11 +5856,9 @@ void LineAnnotationDialog::updateOverviewBar()
             dot.color = QColor(255, 230, 0);
         }
         dot.radius = control.isSeed ? 6.0 : 4.5;
-        dot.triangle = !control.isSplitCandidate &&
-                       (control.isAdjacentLinkCandidate ||
-                        (control.hasAdjacentLinks && !control.isLinkCandidate));
-        if (control.isKollesisTermination && !control.isSplitCandidate &&
-            !control.isLinkCandidate) {
+        dot.triangle = control.isAdjacentLinkCandidate ||
+                       (control.hasAdjacentLinks && !control.isLinkCandidate);
+        if (control.isKollesisTermination && !control.isLinkCandidate) {
             // As in the cut views: a hollow yellow ring when unlinked, the
             // link fill inside a yellow ring when linked.
             if (!control.hasPendingLinks && !control.hasBranches) {
@@ -5239,10 +5866,21 @@ void LineAnnotationDialog::updateOverviewBar()
             }
             dot.edge = vc3d::line_annotation::generatedKollesisTerminationColor(255);
             dot.radius += 1.0;
+        } else if (control.isBreak && !control.isLinkCandidate) {
+            // The break ring: dotted amber, hollow when unlinked.
+            if (!control.hasPendingLinks && !control.hasBranches) {
+                dot.color = Qt::transparent;
+            }
+            dot.edge = vc3d::line_annotation::generatedBreakColor(255);
+            dot.dottedEdge = true;
+            dot.radius += 1.0;
         }
         dots.push_back(dot);
     }
-    bar->setLineData(_generatedViews.linePoints.size(), std::move(dots));
+    bar->setLineData(_generatedViews.linePoints.size(),
+                     std::move(dots),
+                     vc3d::line_annotation::generatedGapLineRanges(_generatedViews.controlPoints),
+                     vc3d::line_annotation::generatedDamagedLineRanges(_generatedViews.controlPoints));
 
     QColor markerColor(0, 245, 255);
     switch (currentLineMarkerState()) {
