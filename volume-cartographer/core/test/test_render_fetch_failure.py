@@ -37,6 +37,8 @@ import tempfile
 import threading
 import unittest
 
+from render_test_tiff import write_float_tiff
+
 if len(sys.argv) < 2:
     raise SystemExit("usage: test_render_fetch_failure.py /path/to/vc_render_tifxyz")
 RENDERER = str(Path(sys.argv.pop(1)).resolve())
@@ -146,31 +148,11 @@ def serve(fail_first, serve_first=0, separator=".", deny_cx=None):
     return httpd, "http://127.0.0.1:%d/" % httpd.server_address[1]
 
 
-# --- the two pieces that used to need numpy and tifffile ---------------------------------------
+# --- reading TIFFs without numpy or tifffile (the writer is in render_test_tiff.py) ------------
 
 TIFF_TAGS = {256: "ImageWidth", 257: "ImageLength", 258: "BitsPerSample", 259: "Compression",
              262: "Photometric", 273: "StripOffsets", 277: "SamplesPerPixel", 278: "RowsPerStrip",
              279: "StripByteCounts", 324: "TileOffsets", 325: "TileByteCounts", 339: "SampleFormat"}
-
-
-def write_float_tiff(path, width, height, values):
-    """A baseline single-strip float32 greyscale TIFF, which is what a tifxyz coordinate plane is."""
-    data = struct.pack("<%df" % len(values), *values)
-    entries = [(256, 3, 1, width), (257, 3, 1, height), (258, 3, 1, 32), (259, 3, 1, 1),
-               (262, 3, 1, 1), (273, 4, 1, 0), (277, 3, 1, 1), (278, 3, 1, height),
-               (279, 4, 1, len(data)), (339, 3, 1, 3)]          # 339 SampleFormat 3 = IEEE float
-    ifd_offset = 8
-    pixel_offset = ifd_offset + 2 + 12 * len(entries) + 4
-    entries = [(t, ty, n, pixel_offset if t == 273 else v) for (t, ty, n, v) in entries]
-    out = bytearray(struct.pack("<2sHI", b"II", 42, ifd_offset))
-    out += struct.pack("<H", len(entries))
-    for tag, typ, count, value in sorted(entries):
-        # a value of 2 bytes or 4 bytes lives in the entry itself, left-justified
-        raw = struct.pack("<I", value) if typ == 4 else struct.pack("<HH", value, 0)
-        out += struct.pack("<HHI", tag, typ, count) + raw
-    out += struct.pack("<I", 0)                                 # no second IFD
-    out += data
-    Path(path).write_bytes(bytes(out))
 
 
 TYPE_SIZE = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8}

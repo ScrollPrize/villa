@@ -690,6 +690,9 @@ static void renderBands(
 
     // Build offset list for readMultiSlice
     auto allOffsets = buildOffsetList(numSlices, sliceStep, accumOffsets);
+    const auto compositeOffsets = isComposite
+        ? buildCompositeOffsetList(compositeStart, compositeEnd, sliceStep)
+        : std::vector<float>{};
 
     auto wallStart = std::chrono::steady_clock::now();
     auto lastPrint = wallStart;
@@ -713,6 +716,35 @@ static void renderBands(
         cv::Mat_<cv::Vec3f> base, dirs;
         prepareBaseAndDirs(bandPts, bandNrm, scaleSeg, dsScale, hasAffine, aff, base, dirs);
 
+        // The band readers prefetch a bounding box around the band (readMultiSlice: all its
+        // samples; readCompositeFast: its surface points). A band runs the full width of the
+        // segment, so on a winding that box covers the area inside the winding while the
+        // samples touch a thin ring of it. Queue exactly the
+        // chunks this band samples instead (without waiting, as the box was queued) and
+        // read through a view that drops the box request; reads still reach the source.
+        // With --prefetch-remote the render was planned up front and cache is that view.
+        std::optional<vc::render::prefetch::PrefetchedArrayView> bandView;
+        vc::render::IChunkedArray* bandCache = cache;
+        if (ds && cache == ds) {
+            // The planner walks every sample x offset, so split the band's rows across threads.
+            const auto& offsets = isComposite ? compositeOffsets : allOffsets;
+            const auto method = vc::render::prefetch::samplingForRender(isComposite);
+            const int blocks = std::max(1, std::min(base.rows, omp_get_max_threads()));
+            std::vector<std::unordered_set<vc::render::ChunkKey, vc::render::ChunkKeyHash>> parts(blocks);
+            #pragma omp parallel for schedule(static)
+            for (int b = 0; b < blocks; ++b) {
+                const int r0 = base.rows * b / blocks;
+                const int r1 = base.rows * (b + 1) / blocks;
+                vc::render::prefetch::insertExactChunksForSamples(
+                    base.rowRange(r0, r1), dirs.rowRange(r0, r1), offsets, ds, level, method, parts[b]);
+            }
+            for (std::size_t b = 1; b < parts.size(); ++b)
+                parts[0].insert(parts[b].begin(), parts[b].end());
+            if (!parts[0].empty())
+                ds->prefetchChunks(std::vector<vc::render::ChunkKey>(parts[0].begin(), parts[0].end()), false);
+            bandCache = &bandView.emplace(*ds);
+        }
+
         std::vector<cv::Mat> slices;
 
         if (isComposite) {
@@ -721,7 +753,7 @@ static void renderBands(
             // skips non-finite pixels, so size + zero it here.
             cv::Mat_<uint8_t> compOut(base.rows, base.cols, uint8_t{0});
             if constexpr (std::is_same_v<T, uint8_t>) {
-                readCompositeFast(compOut, cache, level, base, dirs,
+                readCompositeFast(compOut, bandCache, level, base, dirs,
                                   float(sliceStep),
                                   compositeStart, compositeEnd,
                                   compositeParams, vc::render::prefetch::samplingForRender(true));
@@ -732,7 +764,7 @@ static void renderBands(
         } else {
             // Normal: bulk read + accumulate
             std::vector<cv::Mat_<T>> raw;
-            readMultiSlice(raw, cache, level, base, dirs, allOffsets);
+            readMultiSlice(raw, bandCache, level, base, dirs, allOffsets);
             slices = processRawSlices<T>(raw, numSlices, accumOffsets, accumType, cvType, rotQuad, flipAxis);
         }
 
