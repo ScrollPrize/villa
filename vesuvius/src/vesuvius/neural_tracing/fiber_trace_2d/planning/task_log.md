@@ -101,3 +101,10 @@
   idle ranks whenever the test set has enough batches (121 here); duplicate
   shared leases remain only as the bounded fallback for test sets smaller than
   the world size. Focused wave/broker tests pass (2 selected, 290 deselected).
+- The distinct-batch relaunch completed every full wave through 114:119, then
+  exposed a second parity condition: real batch 120 has 15 samples while the
+  distinct padding batches have 16, so ranks issued 15 versus 16 DDP forwards.
+  Managed evaluation now performs one metric-free local parity forward for a
+  partial logical batch. Its loss and refinement observer effects are discarded.
+  Focused parity tests pass (2 selected, 289 deselected); the broader affected
+  CPU suite passes (60 passed, 14 CUDA-only skips).

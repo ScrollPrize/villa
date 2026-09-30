@@ -2454,7 +2454,7 @@ class _FullResolutionEvaluation(torch.nn.Module):
 def _evaluate_loaded_batch(model, batch, config, *, device, microbatch_size,
                            direction_weight, presence_weight, mixed_precision,
                            conditioned_loss_options=None, prediction_observer=None,
-                           historical=False):
+                           historical=False, minimum_forward_count=0):
     """Shared per-logical-batch evaluation, including bounded physical splits."""
     take = int(batch.volume.shape[0])
     size = take if microbatch_size is None else microbatch_size
@@ -2464,11 +2464,15 @@ def _evaluate_loaded_batch(model, batch, config, *, device, microbatch_size,
         size = size // 2 * 2
     statistics = None
     embedding_diagnostics = []
+    forward_count = 0
+    padding_physical = None
     for offset in range(0, take, size):
         physical = _slice_batch(batch, offset, min(take, offset + size)).to(device)
         physical = materialize_targets(physical, config, output_stride=_model_output_stride(model))
         if historical:
             physical = replace(physical, presence_mask=historical_presence_mask(physical, config))
+        if padding_physical is None:
+            padding_physical = physical
         with _autocast_context(mixed_precision):
             part = _forward_loss_statistics(model, physical,
                 conditioned_loss_options=conditioned_loss_options, training_loss=False,
@@ -2476,6 +2480,21 @@ def _evaluate_loaded_batch(model, batch, config, *, device, microbatch_size,
                 embedding_diagnostics=embedding_diagnostics)
             # Diagnostics reuse the forward pair samples; no extra inference.
         statistics = part if statistics is None else statistics + part
+        forward_count += 1
+    # DDP evaluation must execute the same number of model forwards on every
+    # rank.  A final partial logical batch can otherwise leave the ranks with
+    # different microbatch counts.  Repeat a local physical batch solely for
+    # collective parity; deliberately discard its loss and observer effects.
+    if forward_count < int(minimum_forward_count):
+        if padding_physical is None:
+            raise ValueError("cannot pad evaluation forwards from an empty batch")
+        for _ in range(forward_count, int(minimum_forward_count)):
+            with _autocast_context(mixed_precision):
+                _forward_loss_statistics(model, padding_physical,
+                    conditioned_loss_options=conditioned_loss_options,
+                    training_loss=False, prediction_observer=None,
+                    historical_presence_mask=historical,
+                    embedding_diagnostics=None)
     options = conditioned_loss_options or {}
     result = _finalize_loss_statistics(statistics,
         direction_weight=direction_weight, presence_weight=presence_weight,
@@ -2512,6 +2531,7 @@ def _evaluate_dense_loss_rows(
     output_upsample: str | None = None,
     ema: ModelEMA | None = None,
     historical: bool = False,
+    minimum_forward_count: int = 0,
 ) -> list[tuple[int, dict[str, float]]]:
     model.eval()
     raw_model = model
@@ -2612,7 +2632,7 @@ def _evaluate_dense_loss_rows(
         batch_options = dict(device=device, microbatch_size=microbatch_size,
             direction_weight=direction_weight, presence_weight=presence_weight,
             mixed_precision=mixed_precision, conditioned_loss_options=conditioned_loss_options,
-            historical=historical)
+            historical=historical, minimum_forward_count=minimum_forward_count)
         loss_tensors = _evaluate_loaded_batch(model, batch, loader.config,
             **batch_options, prediction_observer=prediction_observer)
         ema_rows = {}
@@ -3749,11 +3769,17 @@ def training_units(
                         if padded
                         else options
                     )
+                    evaluation_microbatch = min(loader.config.batch_size,
+                        evaluation_microbatch_size or loader.config.batch_size)
+                    if evaluation_loader.config.embedding.paired_patches:
+                        evaluation_microbatch = evaluation_microbatch // 2 * 2
                     local = _evaluate_dense_loss_rows(raw_model, evaluation_loader, **local_options,
                         ema=ema, global_batch_indices=indices, batch_iterator=iterator,
-                        microbatch_size=(min(loader.config.batch_size,
-                            evaluation_microbatch_size or loader.config.batch_size)
-                            if pending_test is not None else evaluation_microbatch_size))
+                        microbatch_size=(evaluation_microbatch
+                            if pending_test is not None else evaluation_microbatch_size),
+                        minimum_forward_count=(
+                            math.ceil(evaluation_loader.config.batch_size / evaluation_microbatch)
+                            if pending_test is not None else 0))
                     if padded:
                         local = []
                 finally:
