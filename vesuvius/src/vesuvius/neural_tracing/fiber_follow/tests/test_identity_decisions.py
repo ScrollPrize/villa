@@ -12,7 +12,7 @@ from vesuvius.neural_tracing.fiber_follow.regression.identity_decisions import d
 from vesuvius.neural_tracing.fiber_follow.regression.data import IdentityObservationBuilder, reference_layout
 from vesuvius.neural_tracing.fiber_follow.regression.model import DirectConfig, DirectFollower
 from vesuvius.neural_tracing.fiber_follow.regression.supervision import loss_terms
-from vesuvius.neural_tracing.fiber_follow.regression.train import optimizer_update
+from vesuvius.neural_tracing.fiber_follow.regression.train import optimizer_update, prepare_training
 from vesuvius.neural_tracing.fiber_follow.shared.data import FollowDataset, OnPolicyStates, fiber_manifest
 from vesuvius.neural_tracing.fiber_follow.shared.reference import SEED_FIELDS, observed_seed
 from vesuvius.neural_tracing.fiber_follow.shared.trace import ModelTracer, TraceParams
@@ -44,7 +44,9 @@ def test_candidate_update_independent_of_microbatch_boundaries():
         return {k: take(v, sl) for k, v in value.items()} if isinstance(value, dict) else value[sl]
     results = []
     for model, batches in ((a, [data]), (b, [take(data, slice(0, 1)), take(data, slice(1, 2))])):
-        results.append(optimizer_update(model, copy.deepcopy(model), torch.optim.SGD(model.parameters(), lr=.001),
+        ema = copy.deepcopy(model)
+        prepare_training(model, backend='eager')
+        results.append(optimizer_update(model, ema, torch.optim.SGD(model.parameters(), lr=.001),
                                         batches, 1, .001, compute_metrics=True))
     np.testing.assert_allclose(results[0]['loss'], results[1]['loss'], rtol=2e-5)
     assert results[0]['identity']['candidate_states'] == results[1]['identity']['candidate_states'] == 1

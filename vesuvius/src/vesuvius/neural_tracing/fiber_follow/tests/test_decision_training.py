@@ -16,7 +16,7 @@ from vesuvius.neural_tracing.fiber_follow.regression.identity_decisions import d
 from vesuvius.neural_tracing.fiber_follow.regression.model import DirectFollower
 from vesuvius.neural_tracing.fiber_follow.regression.supervision import candidate_targets, loss_terms, geometry_mask
 from vesuvius.neural_tracing.fiber_follow.regression.survival_confidence import survival_predictions, survival_loss
-from vesuvius.neural_tracing.fiber_follow.regression.train import optimizer_update
+from vesuvius.neural_tracing.fiber_follow.regression.train import optimizer_update, prepare_training
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
 from vesuvius.neural_tracing.fiber_follow.shared.training_log import DirectTrainingInterval
 
@@ -148,7 +148,9 @@ def test_weighted_optimizer_update_is_microbatch_invariant_and_logs_budget():
     models = [copy.deepcopy(model), copy.deepcopy(model)]
     metrics = []
     for m, batches in zip(models, [[b], [take(b, 0), take(b, 1)]]):
-        metrics.append(optimizer_update(m, copy.deepcopy(m), torch.optim.SGD(m.parameters(), lr=.01),
+        ema = copy.deepcopy(m)
+        prepare_training(m, backend='eager')
+        metrics.append(optimizer_update(m, ema, torch.optim.SGD(m.parameters(), lr=.01),
                                         batches, 1, .01, compute_metrics=False))
     assert metrics[0]['loss'] == pytest.approx(metrics[1]['loss'], rel=1e-5)
     for a, z in zip(models[0].parameters(), models[1].parameters()):
@@ -181,12 +183,10 @@ def test_unlabeled_candidate_padding_does_not_run_scorer(monkeypatch):
     model = DirectFollower(config())
     b = candidate_batch(model.cfg)
     b['candidate_mask'].zero_()
-    calls = []
-    forward = model.forward
-    def observed(*args, **kwargs):
-        calls.append(kwargs.get('candidates'))
-        return forward(*args, **kwargs)
-    monkeypatch.setattr(model, 'forward', observed)
-    optimizer_update(model, copy.deepcopy(model), torch.optim.SGD(model.parameters(), lr=.01),
+    ema = copy.deepcopy(model)
+    prepare_training(model, backend='eager')
+    def unexpected_scoring(*args, **kwargs):
+        pytest.fail('Unlabeled candidates must not invoke the candidate scorer')
+    monkeypatch.setattr(model, 'score_candidates', unexpected_scoring)
+    optimizer_update(model, ema, torch.optim.SGD(model.parameters(), lr=.01),
                      [b], 1, .01, compute_metrics=False)
-    assert calls == [None]

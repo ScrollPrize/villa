@@ -10,7 +10,7 @@ import torch
 from test_regression import batch, config, proposal_output
 from vesuvius.neural_tracing.fiber_follow.regression.supervision import point_correctness, loss_terms
 from vesuvius.neural_tracing.fiber_follow.regression.model import DirectFollower
-from vesuvius.neural_tracing.fiber_follow.regression.train import optimizer_update
+from vesuvius.neural_tracing.fiber_follow.regression.train import optimizer_update, prepare_training
 from vesuvius.neural_tracing.fiber_follow.shared.training_log import DirectTrainingInterval, format_training_log
 from vesuvius.neural_tracing.fiber_follow.shared.diag import plot_curves
 from vesuvius.neural_tracing.fiber_follow.shared.runloop import RunLog
@@ -105,6 +105,7 @@ def test_every_optimizer_update_reports_point_counts_without_detailed_metrics():
     data['source'] = torch.tensor([0, 2])
     ema = copy.deepcopy(model)
     opt = torch.optim.SGD(model.parameters(), lr=.001)
+    prepare_training(model, backend='eager')
     metrics = optimizer_update(model,ema,opt,[data],1,.001,compute_metrics=False)
     assert 'fixed_fraction' not in metrics
     assert metrics['fresh_fraction'] == metrics['recent_fraction'] == .5
