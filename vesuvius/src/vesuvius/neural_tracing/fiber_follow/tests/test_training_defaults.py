@@ -24,10 +24,10 @@ def test_production_defaults_and_explicit_overrides():
                     memory_switch_probability=.3, decision_fraction=.3,
                     bank_wrong_continuation_probability=0., bank_following_probability=.2,
                     presence_dropout=0., diag_every=5000, dagger_after=96.,
-                    recurrent_refinement_steps=2, warmup=500)
+                    recurrent_refinement_steps=2, warmup=500, feature_history_decisions=2)
     assert {key: args[key] for key in expected} == expected
     assert 'compile' not in args
-    for option in ('--compile', '--no-compile'):
+    for option in ('--compile', '--no-compile', '--feature-replay-weight'):
         with pytest.raises(SystemExit):
             parser.parse_args(REQUIRED+[option])
     root = Path(__file__).resolve().parents[1]

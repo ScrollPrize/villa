@@ -1,17 +1,15 @@
-"""Sparse encoder gradients over a complete chronological memory replay.
+"""Visual history collection and differentiable memory reconstruction at decisions.
 
-Only three selected historical crops are retained on the CPU. Other observations
-retain detached compact features made by the live training model (and therefore
-possibly older weights). Every writer transition is recomputed at current weights
-within one optimizer update. This is a selective, stale-feature approximation,
-not an unbiased estimator of full-history encoder backpropagation.
+All observations contribute detached appearance tokens. Only crops selected for
+future encoder gradients are retained on the CPU. A decision reconstructs every
+preceding writer transition at current weights and re-encodes up to three past
+crops. This is sparse encoder training with possibly stale cached features, not
+full-history image backpropagation. There is one task loss per selected decision.
 """
-import numpy as np
-import torch
 
 
 def stratified_indices(length, rng):
-    """One observation per available age band; endpoint is always trained separately."""
+    """One observation per age band; the current decision is encoded separately."""
     selected = []
     for lo, hi in ((1, 4), (5, 16), (17, length-1)):
         hi = min(hi, length-1)
@@ -20,76 +18,71 @@ def stratified_indices(length, rng):
     return set(selected)
 
 
+def take_rows(batch, indices):
+    return {k: take_rows(v, indices) if isinstance(v, dict) else v[indices]
+            for k, v in batch.items()}
+
+
 def take_row(batch, j):
     return {k: take_row(v, j) if isinstance(v, dict) else v[j:j+1].detach().clone()
             for k, v in batch.items()}
 
 
-class StratifiedReplay:
+class ObservationHistory:
+    """Own detached stream evidence; never persist a writer autograd graph."""
     def __init__(self):
         self.streams = {}
-        self.pending = []
 
-    def record(self, cpu, output):
-        if 'replay_select' not in cpu:
-            return
-        for j, (key, reset, end, selected) in enumerate(zip(cpu['stream_id'].tolist(),
-                cpu['stream_reset'].tolist(), cpu['stream_end'].tolist(), cpu['replay_select'].tolist())):
+    def start(self, cpu):
+        keys = cpu['stream_id'].tolist()
+        if len(set(keys)) != len(keys):
+            raise ValueError('A crop batch must contain distinct streams')
+        for key, reset, index in zip(keys, cpu['stream_reset'].tolist(), cpu['stream_index'].tolist()):
             if reset:
+                if index or key in self.streams:
+                    raise ValueError('Stream reset must start a new history at index zero')
                 self.streams[key] = []
-            if key not in self.streams:
-                raise ValueError('Replay continuation without reset')
-            rows = self.streams[key]
-            # Clone only the small observation, never a view retaining the whole
-            # encoder output or a selected crop's other batch members.
-            row = dict(features=tuple(output['observation_'+name][j:j+1].detach().clone()
-                                      for name in ('tokens', 'xyz', 'valid')),
-                       pose={name: cpu['x'][name][j:j+1].clone() for name in
-                             ('query_position', 'query_frame', 'feature_seed_here')},
-                       batch=take_row(cpu if end else {k: cpu[k] for k in ('x', 'hist', 'hmask')}, j)
-                             if selected or end else None)
-            rows.append(row)
-            if end:
-                self.pending.append(self.streams.pop(key))
+            if key not in self.streams or len(self.streams[key]) != index:
+                raise ValueError('Missing or out-of-order observation history')
 
-    def backward(self, model, total, *, device, tolerance, n_commit, confidence_weight,
-                 candidate_weight):
-        from .train import (move_batch, training_prediction, training_observation_features,
-                            training_memory_transition)
-        from .supervision import commit_window, loss_terms, weighted_state_sum
-        weight = model.cfg.feature_replay_weight
-        metrics = dict(replay_endpoints=0, replay_observations=0, replay_encoder_crops=0, replay_loss=0.)
-        while self.pending:
-            rows = self.pending.pop(0)
-            if len(rows) < 2 or not weight:
+    def record(self, cpu, features):
+        for j, key in enumerate(cpu['stream_id'].tolist()):
+            rows = self.streams[key]
+            index = int(cpu['stream_index'][j])
+            if len(rows) != index:
+                raise ValueError('Observation history must be recorded exactly once')
+            if bool(cpu['stream_end'][j]):
+                del self.streams[key]
                 continue
-            state = None
-            with torch.autocast('cuda', dtype=torch.bfloat16, enabled=torch.device(device).type == 'cuda'):
-                for row in rows[:-1]:
-                    if row['batch'] is not None:
-                        batch = move_batch(row['batch'], device)
-                        # Checkpoint only selected image encodings. Do not detach
-                        # the recurrent state between selected observations.
-                        features = training_observation_features(model, batch['x'], batch['hist'], batch['hmask'])
-                        metrics['replay_encoder_crops'] += 1
-                    else:
-                        features = row['features']
-                    pose = move_batch(row['pose'], device)
-                    state, _ = training_memory_transition(model, *features, pose, state)
-                batch = move_batch(rows[-1]['batch'], device)
-                score = 'candidate_points' in batch and rows[-1]['batch']['candidate_mask'].any()
-                kwargs = dict(candidates=batch['candidate_points']) if score else {}
-                output = training_prediction(model, batch['x'], batch['hist'], batch['hmask'], memory=state,
-                               n_commit=commit_window(model.cfg, n_commit), **kwargs)
-                terms = loss_terms(output, batch, model.cfg, tolerance, n_commit=n_commit)
-                loss = weighted_state_sum(terms['geometry_per_state'], batch)+confidence_weight*weighted_state_sum(terms['confidence_per_state'], batch)
-                if 'candidate_per_state' in terms:
-                    loss = loss+candidate_weight*weighted_state_sum(terms['candidate_per_state'], batch)
-                loss = loss*(weight/total)
-            loss.backward()
-            # Stays on the device; the training update resolves all sums with one transfer.
-            metrics['replay_loss'] = metrics['replay_loss']+loss.detach().double()
-            metrics['replay_endpoints'] += 1
-            metrics['replay_observations'] += len(rows)
-            metrics['replay_encoder_crops'] += 1
-        return metrics
+            for row in rows:
+                if row['retain_until'] <= index:
+                    row['batch'] = None
+            retain = int(cpu['retain_until'][j])
+            rows.append(dict(features=tuple(v[j:j+1].detach().clone() for v in features),
+                pose={name: cpu['x'][name][j:j+1].clone() for name in
+                      ('query_position', 'query_frame', 'feature_seed_here')},
+                batch=take_row({k: cpu[k] for k in ('x', 'hist', 'hmask')}, j) if retain > index else None,
+                retain_until=retain))
+
+    def reconstruct(self, model, cpu, device):
+        """Only the prefix before this decision enters its gradient-bearing memory."""
+        from .train import move_batch, training_observation_features, training_memory_transition
+        if len(cpu['hist']) != 1:
+            raise ValueError('Reconstruct one independent decision history at a time')
+        rows = self.streams[int(cpu['stream_id'][0])]
+        if len(rows) != int(cpu['stream_index'][0]):
+            raise ValueError('Decision must follow exactly its causal observation prefix')
+        selected = set(cpu['encoder_indices'][0].tolist())-{-1}
+        if any(i < 0 or i >= len(rows) for i in selected):
+            raise ValueError('Encoder selection must precede the decision')
+        state = None
+        for i, row in enumerate(rows):
+            if i in selected:
+                if row['batch'] is None:
+                    raise ValueError('Selected historical crop was not retained')
+                batch = move_batch(row['batch'], device)
+                features = training_observation_features(model, batch['x'], batch['hist'], batch['hmask'])
+            else:
+                features = row['features']
+            state, _ = training_memory_transition(model, *features, move_batch(row['pose'], device), state)
+        return state, dict(memory_replay_observations=len(rows), history_encoder_crops=len(selected))

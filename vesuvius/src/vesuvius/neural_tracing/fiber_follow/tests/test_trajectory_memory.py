@@ -48,7 +48,10 @@ def training_chunk(c, start=0, end=False):
     steps = [memory_batch(c, 2, step=t) for t in range(start, start+2)]
     for t, b in enumerate(steps, start):
         b.update(stream_id=torch.tensor([10, 20]), stream_reset=torch.full((2,), t == 0),
-                 stream_end=torch.full((2,), end and t == start+1))
+                 stream_end=torch.full((2,), end and t == start+1),
+                 stream_index=torch.full((2,), t), decision_mask=torch.ones(2, dtype=torch.bool),
+                 loss_weight=torch.ones(2), retain_until=torch.full((2,), 256),
+                 encoder_indices=torch.tensor([[0 if t else -1, -1, -1]]).expand(2, -1).clone())
     return dict(feature_sequence=steps)
 
 
@@ -196,14 +199,15 @@ def test_training_sequence_checkpoint_and_optimizer_resume(tmp_path):
         for name, value in state.items():
             torch.testing.assert_close(restored_opt.state_dict()['state'][key][name], value, rtol=0, atol=0)
     # Matching tensor shapes do not make an older architecture acceptable.
-    for version in range(1, 8):
+    for version in range(1, 9):
         torch.save(dict(ck, architecture=f'axial_fiber_memory_v{version}'), path)
         with pytest.raises(ValueError, match='Checkpoint'):
             load_checkpoint(path, 'cpu')
 
 
 def test_builder_streams_causal_main_crops_and_keeps_paired_endpoints_identical(tmp_path, monkeypatch):
-    from vesuvius.neural_tracing.fiber_follow.regression.feature_sequences import sequence_batches, FeatureStreamStates
+    from vesuvius.neural_tracing.fiber_follow.regression.feature_sequences import sequence_batches
+    from vesuvius.neural_tracing.fiber_follow.regression.stratified_replay import ObservationHistory
     bank, parent = make_bank(tmp_path)
     publish(tmp_path, [add_shard(tmp_path, 0, x=4., z_range=(20., 180.))])
     c = cfg(fine=CropSpec(depth=40, width=25, behind=16, spacing=1.), memory_steps=4)
@@ -230,14 +234,14 @@ def test_builder_streams_causal_main_crops_and_keeps_paired_endpoints_identical(
         endpoints.extend(b['x']['fine'][b['stream_end']].unbind())
     torch.testing.assert_close(endpoints[0], endpoints[1], rtol=0, atol=0)
     model = build_model(c)
-    ema, opt, states = copy.deepcopy(model), torch.optim.AdamW(model.parameters()), FeatureStreamStates()
+    ema, opt, states = copy.deepcopy(model), torch.optim.AdamW(model.parameters()), ObservationHistory()
     prepare_training(model, backend='eager')
     for j, chunk in enumerate(chunks):
         metrics = optimizer_update(model, ema, opt, [chunk], j+1, .001, device='cpu',
                                    compute_metrics=False, stream_states=states)
         assert np.isfinite(metrics['loss'])
-        assert all(not v.requires_grad for state in states.states.values() for v in state.values())
-    assert not states.states
+        assert all(not v.requires_grad for rows in states.streams.values() for row in rows for v in row['features'])
+    assert not states.streams
 
 
 def test_streaming_keeps_remote_seed_and_cache_until_explicit_eviction():
@@ -341,26 +345,24 @@ def test_cold_remote_seed_is_encoded_once_and_warm_trace_reads_only_current_crop
 
 
 def test_stream_ownership_reset_detach_and_eviction_across_optimizer_updates():
-    from vesuvius.neural_tracing.fiber_follow.regression.feature_sequences import FeatureStreamStates
+    from vesuvius.neural_tracing.fiber_follow.regression.stratified_replay import ObservationHistory
     model = build_model(cfg())
-    ema, opt, states = copy.deepcopy(model), torch.optim.AdamW(model.parameters()), FeatureStreamStates()
+    ema, opt, states = copy.deepcopy(model), torch.optim.AdamW(model.parameters()), ObservationHistory()
     prepare_training(model, backend='eager')
-    with pytest.raises(ValueError, match='Missing carried'):
-        states.incoming(model, training_chunk(model.cfg, start=2)['feature_sequence'][0], 'cpu')
+    with pytest.raises(ValueError, match='Missing or out-of-order'):
+        states.start(training_chunk(model.cfg, start=2)['feature_sequence'][0])
     first = training_chunk(model.cfg)
     optimizer_update(model, ema, opt, [first], 1, .001, compute_metrics=False, stream_states=states)
-    assert set(states.states) == {10, 20}
-    assert all(not v.requires_grad for row in states.states.values() for v in row.values())
+    assert set(states.streams) == {10, 20}
+    assert all(not v.requires_grad for rows in states.streams.values() for row in rows for v in row['features'])
     later = training_chunk(model.cfg, start=2, end=True)
-    # Keep associations when a loader batch reorders its active traces.
+    # Keep associations when a loader batch reorders independent traces.
     later['feature_sequence'][0]['stream_id'] = torch.tensor([20, 10])
-    incoming = states.incoming(model, later['feature_sequence'][0], 'cpu')
-    torch.testing.assert_close(incoming['anchor'][0], states.states[20]['anchor'][0])
     diagnostic = {}
     result = optimizer_update(model, ema, opt, [later], 2, .001, compute_metrics=False,
                               stream_states=states, diagnostic=diagnostic)
     assert np.isfinite(result['loss']) and result['observed_states'] == 4
-    assert not states.states
+    assert not states.streams
     assert diagnostic['memory']['anchor_valid'].all()
 
 

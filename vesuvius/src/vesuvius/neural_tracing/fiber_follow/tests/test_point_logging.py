@@ -61,10 +61,10 @@ def test_point_masks_neighbors_departures_endpoints_and_nonfinite():
 
 
 def interval_row(crops, right, wrong, loss):
-    return dict(observed_states=crops, point_correct_count=right, point_wrong_count=wrong,
+    return dict(observed_states=crops, supervised_states=crops, point_correct_count=right, point_wrong_count=wrong,
                 point_unknown_count=0, geometry=loss, loss=loss, confidence_loss=.2,
                 geometry_count=right+wrong, error_sum=right+wrong,
-                replay_endpoints=1, replay_encoder_crops=4,
+                memory_replay_observations=1, history_encoder_crops=4,
                 memory_grad_norm=3., memory_grad_clip_scale=.5)
 
 
@@ -77,7 +77,7 @@ def test_interval_pools_counts_weights_crop_means_and_preserves_json(tmp_path,ca
     assert summary['loss'] == 3.5
     assert summary['refinement_attempts_mean'] == 2.5 and summary['refinement_attempts_sum'] == 10
     assert summary['crops'] == 4 and summary['updates'] == 2
-    assert summary['replay_endpoints'] == 2 and summary['replay_encoder_crops'] == 8
+    assert summary['memory_replay_observations'] == 2 and summary['history_encoder_crops'] == 8
     assert summary['memory_clipped_updates'] == 2
     row = dict(step=10050,geometry=4.,loss=4.,lr=.001,interval=summary,n_future=16,tolerance=1.5,
                interval_update_seconds=1.,interval_data_seconds=.1,interval_samples_per_second=4.)
@@ -90,8 +90,8 @@ def test_interval_pools_counts_weights_crop_means_and_preserves_json(tmp_path,ca
     assert 'fixed' not in printed
     assert 'last 2 updates / 4 crops' in printed
     assert '500 ms/update' in printed and '50 ms/update' in printed
-    assert '2.50 attempts/crop' in printed
-    assert '16-point correctness' not in printed and len(printed.splitlines()) <= 10
+    assert '2.50 attempts/decision' in printed
+    assert '16-point correctness' not in printed and len(printed.splitlines()) <= 11
     assert json.loads(path.read_text()) == row
     assert DirectTrainingInterval().summary()['crops'] == 0
     row['interval']['point_correct_count'] = row['interval']['point_wrong_count'] = 0
@@ -140,3 +140,12 @@ def test_curves_show_interval_point_accuracy_and_drop_rolled_back_steps(tmp_path
     with Image.open(tmp_path/'curves.png') as im:
         im.verify()
     assert not (tmp_path/'curves.tmp.png').exists()
+
+
+def test_interval_losses_are_weighted_by_decisions_not_observation_count():
+    interval = DirectTrainingInterval()
+    interval.add(dict(interval_row(20, 16, 0, 1.), supervised_states=2))
+    interval.add(dict(interval_row(2, 16, 0, 3.), supervised_states=2))
+    summary = interval.summary()
+    assert summary['crops'] == 22 and summary['decisions'] == 4
+    assert summary['loss'] == 2.

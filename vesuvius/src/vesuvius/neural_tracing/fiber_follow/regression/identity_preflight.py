@@ -58,9 +58,10 @@ def main(argv=None):
     it=iter(ds);args.out.mkdir(parents=True,exist_ok=True)
     model=build_model(cfg).to(args.device,memory_format=conv_memory_format(args.device)) if args.forward else None
     import copy
-    from .feature_sequences import FeatureStreamStates
+    from .stratified_replay import ObservationHistory
+    from .feature_sequences import decision_count
     from .train import optimizer_update
-    states = FeatureStreamStates()
+    states = ObservationHistory()
     ema = copy.deepcopy(model) if model is not None else None
     opt = torch.optim.AdamW(model.parameters(), lr=0.) if model is not None else None
     rows=[]
@@ -73,13 +74,14 @@ def main(argv=None):
         if index == 0:
             torch.save(cpu, args.out/'batch.pt')
         row = dict(batch=index, read_seconds=time.perf_counter()-started,
-                   states=sum(len(b['hist']) for b in steps), decisions=len(steps))
+                   states=sum(len(b['hist']) for b in steps), decisions=sum(decision_count(b) for b in steps))
         if model is not None:
             metrics = optimizer_update(model, ema, opt, [cpu], index+1, 0., device=args.device,
                                        compute_metrics=False, stream_states=states)
             assert all(p.grad is None or torch.isfinite(p.grad).all() for p in model.parameters())
-            assert model.encoder.compress.weight.grad.abs().sum() > 0
-            row.update(loss=metrics['loss'], retained_streams=len(states.states))
+            if metrics['optimizer_applied']:
+                assert model.encoder.compress.weight.grad.abs().sum() > 0
+            row.update(loss=metrics['loss'], retained_streams=len(states.streams))
         rows.append(row)
         print(json.dumps(row), flush=True)
     report=dict(config=cfg.to_dict(),sampling=asdict(sampling),bank=str(bank.root),bank_shards=bank.shard_count,rows=rows)

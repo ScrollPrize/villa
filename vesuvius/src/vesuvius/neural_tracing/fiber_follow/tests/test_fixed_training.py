@@ -11,7 +11,7 @@ from vesuvius.neural_tracing.fiber_follow.regression.train import (
     training_memory_transition, begin_training_update, finish_training_update,
 )
 from vesuvius.neural_tracing.fiber_follow.regression.supervision import loss_terms
-from vesuvius.neural_tracing.fiber_follow.regression.feature_sequences import FeatureStreamStates
+from vesuvius.neural_tracing.fiber_follow.regression.stratified_replay import ObservationHistory
 from vesuvius.neural_tracing.fiber_follow.regression.train import pack_feature_chunks
 
 
@@ -194,7 +194,7 @@ def test_packing_keeps_real_rows_weights_and_chunk_boundaries():
 
 def test_masked_retries_preserve_adamw_skipped_parameter_updates():
     torch.manual_seed(113)
-    eager = build_model(cfg(recurrent_refinement_steps=2, feature_replay_weight=0.))
+    eager = build_model(cfg(recurrent_refinement_steps=2))
     raw = copy.deepcopy(eager)
     compiled = prepare_training(raw, backend='eager')
     prepare_training(eager, backend='eager')
@@ -225,9 +225,9 @@ def test_masked_retries_preserve_adamw_skipped_parameter_updates():
     assert all(p.grad is None for p in raw.refinement_fusion.parameters())
 
 
-def test_packed_stream_gradients_and_detach_match_unpacked_training():
+def test_packed_decisions_and_cached_observations_match_unpacked_training():
     torch.manual_seed(114)
-    eager = build_model(cfg(recurrent_refinement_steps=2, feature_replay_weight=0.))
+    eager = build_model(cfg(recurrent_refinement_steps=2))
     raw = copy.deepcopy(eager)
     compiled = prepare_training(raw, backend='eager')
     chunks = [training_chunk(eager.cfg)]
@@ -239,7 +239,7 @@ def test_packed_stream_gradients_and_detach_match_unpacked_training():
     for j in range(2):
         partial.append(dict(feature_sequence=[row(batch, j) for batch in chunks[0]['feature_sequence']]))
     prepare_training(eager, batch_size=1, backend='eager')
-    states = [FeatureStreamStates(), FeatureStreamStates()]
+    states = [ObservationHistory(), ObservationHistory()]
     metrics = []
     for model, carried in zip((eager, compiled), states):
         metrics.append(optimizer_update(model, copy.deepcopy(eager), torch.optim.AdamW(model.parameters()),
@@ -247,7 +247,8 @@ def test_packed_stream_gradients_and_detach_match_unpacked_training():
     assert metrics[0]['observed_states'] == metrics[1]['observed_states'] == 4
     assert metrics[0]['loss'] == pytest.approx(metrics[1]['loss'], rel=1e-5, abs=1e-6)
     compare_gradients(eager, raw)
-    for key in states[0].states:
-        for name, value in states[0].states[key].items():
-            torch.testing.assert_close(value, states[1].states[key][name], rtol=1e-5, atol=1e-6)
-            assert not states[1].states[key][name].requires_grad
+    for key in states[0].streams:
+        for row, other in zip(states[0].streams[key], states[1].streams[key]):
+            for value, reference in zip(row['features'], other['features']):
+                torch.testing.assert_close(value, reference, rtol=1e-5, atol=1e-6)
+                assert not reference.requires_grad

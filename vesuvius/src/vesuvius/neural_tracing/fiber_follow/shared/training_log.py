@@ -14,12 +14,12 @@ def _number(value, spec='.3f'):
 
 
 class DirectTrainingInterval:
-    """Pool every update's counts; weight per-crop means by actual crop count."""
-    means = ('loss', 'geometry', 'confidence_loss', 'replay_loss', 'fresh_fraction',
+    """Pool counts and weight decision-normalized means by supervised decisions."""
+    means = ('loss', 'geometry', 'confidence_loss', 'fresh_fraction',
              'recent_fraction', 'bank_wrong_continuation_fraction',
              'bank_following_fraction', 'decision_pair_fraction', 'refinement_attempts_mean')
     counts = ('error_sum', 'geometry_count', 'point_correct_count', 'point_wrong_count',
-              'point_unknown_count', 'replay_endpoints', 'replay_observations', 'replay_encoder_crops',
+              'point_unknown_count', 'supervised_states', 'observation_only_states', 'memory_replay_observations', 'history_encoder_crops',
               'confidence_labeled_states', 'confidence_departed_states', 'refinement_attempts_sum',
               'supervision_weight', 'endpoint_weight', 'matched_endpoint_weight', 'choice_endpoint_weight',
               'endpoint_states', 'matched_endpoint_states', 'choice_endpoint_states',
@@ -33,19 +33,21 @@ class DirectTrainingInterval:
                     'memory': ('probe_identity_loss', 'probe_offset_loss')}
 
     def __init__(self):
-        self.values = dict(updates=0, crops=0)
+        self.values = dict(updates=0, crops=0, decisions=0)
 
     def add(self, row):
         crops = row['observed_states']
         self.values['updates'] += 1
         self.values['crops'] += crops
+        decisions = row['supervised_states']
+        self.values['decisions'] += decisions
         for key in self.means + self.counts:
-            self.values[key] = self.values.get(key, 0.)+row.get(key, 0.)*(crops if key in self.means else 1)
+            self.values[key] = self.values.get(key, 0.)+row.get(key, 0.)*(decisions if key in self.means else 1)
         for section in self.nested_counts:
             source = row.get(section, {})
             for key in self.nested_counts[section] + self.nested_means[section]:
                 name = section+'_'+key
-                weight = crops if key in self.nested_means[section] else 1
+                weight = decisions if key in self.nested_means[section] else 1
                 self.values[name] = self.values.get(name, 0.)+source.get(key, 0.)*weight
         for group in ('memory', 'rest'):
             key = group+'_grad_norm'
@@ -57,7 +59,7 @@ class DirectTrainingInterval:
         result = dict(self.values)
         means = list(self.means)+[s+'_'+k for s, keys in self.nested_means.items() for k in keys]
         for key in means:
-            result[key] = result.get(key, 0.)/max(1, result['crops'])
+            result[key] = result.get(key, 0.)/max(1, result['decisions'])
         result['error_mean'] = result.get('error_sum', 0.)/result['geometry_count'] if result.get('geometry_count') else None
         return result
 
@@ -74,7 +76,8 @@ def _interval_training_lines(row):
              f"  speed: {1000*row['interval_update_seconds']/updates:.0f} ms/update"
              f" | data wait {1000*row['interval_data_seconds']/updates:.0f} ms/update"
              f" | {row['interval_samples_per_second']:.1f} crops/s"
-             f" | {m['refinement_attempts_mean']:.2f} attempts/crop"]
+             f" | {row['interval_samples_per_second']*m['decisions']/max(1, m['crops']):.1f} decisions/s"
+             f" | {m['refinement_attempts_mean']:.2f} attempts/decision"]
     if row.get('cuda_peak_allocated_gib') is not None:
         lines[-1] += f" | peak allocated VRAM {row['cuda_peak_allocated_gib']:.2f} GiB (session)"
     if m['memory_identity_count']:
@@ -83,9 +86,10 @@ def _interval_training_lines(row):
                  f" | departed loss weight {row.get('memory_departed_weight', 1.):g}x")
         lines.append(f"  probe labels: departed {_rate(m['memory_departed_count'], m['memory_identity_count'])}"
                      f" | false departure {_rate(m['memory_identity_count']-m['memory_departed_count']-(m['memory_identity_correct']-m['memory_departed_correct']), m['memory_identity_count']-m['memory_departed_count'])}")
-    lines.append(f"  replay: {int(m['replay_endpoints'])} endpoints / {int(m['replay_encoder_crops'])} encoder crops"
-                 f" (loss {m['replay_loss']:.4f})")
-    lines.append(f"  scored crops: candidates {_rate(m['identity_candidate_states'], m['crops'])}"
+    lines.append(f"  memory: {int(m['memory_replay_observations'])} replayed observations / "
+                 f"{int(m['history_encoder_crops'])} historical encoder crops with gradients")
+    lines.append(f"  supervision: {int(m['decisions'])} decisions / {int(m['crops'])} observations")
+    lines.append(f"  scored crops: candidates {_rate(m['identity_candidate_states'], m['decisions'])}"
                  f" | departed {_rate(m.get('confidence_departed_states', 0), m.get('confidence_labeled_states', 0))}")
     if m.get('endpoint_states'):
         lines.append(f"  supervised endpoints: matched {_rate(m['matched_endpoint_states'], m['endpoint_states'])}"

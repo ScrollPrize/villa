@@ -12,7 +12,7 @@ from torch.utils.checkpoint import checkpoint
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
 from vesuvius.neural_tracing.fiber_follow.shared.policy import DEFAULT_CONFIDENCE, commit_prefix
 
-ARCHITECTURE = 'axial_fiber_memory_v8'
+ARCHITECTURE = 'axial_fiber_memory_v9'
 TOKEN_STRIDE = (8, 2, 2)
 TOKEN_OFFSET = (3, 0, 0)
 
@@ -39,7 +39,7 @@ class DirectConfig:
     feature_sequence_length: int = 2
     feature_detail_tokens: int = 16
     feature_stream_steps: int = 128
-    feature_replay_weight: float = .5
+    feature_history_decisions: int = 2
     feature_switch_crop_fraction: float = -1.
     feature_history_loss_fraction: float = .25
     recurrent_refinement_steps: int = 2
@@ -69,8 +69,8 @@ class DirectConfig:
             raise ValueError('Feature sequence length must be at least two')
         if not isinstance(self.feature_stream_steps, int) or self.feature_stream_steps < self.memory_steps:
             raise ValueError('Feature stream must cover at least the cache horizon')
-        if not math.isfinite(self.feature_replay_weight) or self.feature_replay_weight < 0:
-            raise ValueError('Nonnegative finite replay weight required')
+        if not isinstance(self.feature_history_decisions, int) or self.feature_history_decisions < 0:
+            raise ValueError('Historical decision count must be a nonnegative integer')
         if self.feature_switch_crop_fraction != -1 and not 0 <= self.feature_switch_crop_fraction < 1:
             raise ValueError('Switch crop fraction must be -1 (disabled) or in [0, 1)')
         if not math.isfinite(self.feature_history_loss_fraction) or not 0 <= self.feature_history_loss_fraction < 1:
@@ -506,6 +506,10 @@ class DirectFollower(nn.Module):
         """Re-encode a selected replay crop without decoding or reading memory."""
         ctx = self.context(x, hist, hmask)
         return self.recurrent_memory.extract(ctx['deep'], ctx['stem'], hist, hmask)
+
+    def collect_observation_features(self, x, hist, hmask):
+        """Separate no-grad compiler boundary for visual history collection."""
+        return self.observation_features(x, hist, hmask)
 
     def replay_observation_features(self, x, hist, hmask):
         # Keep recomputation inside the compiled operation. Wrapping a compiled

@@ -20,7 +20,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.runloop import RunLog
 
 class Tracer:
     def __init__(self):
-        self.p = SimpleNamespace(confidence=.7, max_len=8.)
+        self.p = SimpleNamespace(confidence=.7, max_len=8., n_commit=4)
         self.vol = SimpleNamespace(sample_image_nearest=lambda q: np.full(q.shape[:-1], 128, np.uint8))
         self.calls = 0
 
@@ -105,7 +105,7 @@ def test_direct_images_preserve_scores_rng_and_parameters(tmp_path, monkeypatch,
             image.verify()
     correction_labels = labels[str(tmp_path/'images/correction_001000.png')]
     assert 'GT' in correction_labels
-    assert ('corrected proposal' in correction_labels) == correction
+    assert ('feedback proposal 1' in correction_labels) == correction
     assert 'dense curve error (voxels)' in labels[str(tmp_path/'curves.png')]
 
 

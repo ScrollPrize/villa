@@ -228,12 +228,12 @@ def test_training_compilation_emulates_eager_bf16_rounding(monkeypatch):
     assert prepare_training(model) is model
     assert not hasattr(model, '_orig_mod')
     assert [fn.__name__ for fn, _ in compiled] == [
-        'training_forward', 'score_candidates', 'replay_observation_features', 'observe_tokens']
+        'training_forward', 'score_candidates', 'collect_observation_features', 'replay_observation_features', 'observe_tokens']
     assert all(options == dict(dynamic=False, fullgraph=True) for _, options in compiled)
     assert list(model.parameters()) == parameters
     assert list(model.state_dict()) == keys
     assert prepare_training(model) is model
-    assert len(compiled) == 4  # Setup is idempotent.
+    assert len(compiled) == 5  # Setup is idempotent.
     assert torch._inductor.config.emulate_precision_casts
 
 

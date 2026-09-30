@@ -36,7 +36,7 @@
    the scorer learns independent channel and physical XYZ projections. It retains
    segment-local fine samples as well. Its own K/V projections are reused across
    generated and supplied paths within one decision. No generator hidden states
-   enter scoring. Architecture `axial_fiber_memory_v8` requires newly trained
+   enter scoring. Architecture `axial_fiber_memory_v9` requires newly trained
    weights; older checkpoints have no migration or compatibility path.
 7. One linear readout predicts the conditional first-failure logit per segment.
    Prefix confidence is the product of conditional survival probabilities,
@@ -48,8 +48,9 @@
    limit is shorter. Only unaccepted rows enter further decoder/scorer calls;
    encoder features and projected K/V are reused. The step setting is a maximum
    number of additional attempts, so two means between one and three proposals.
-   This policy applies in training and inference. `refinement_mask` identifies
-   actual attempts in a batch; padded entries receive no loss or selection weight.
+   Inference skips inactive rows; compiled training computes fixed slots and
+   masks inactive results. `refinement_mask` identifies actual attempts; unused
+   slots receive no loss or selection weight.
 
 Holding observations and a prefix fixed, replacing its suffix leaves earlier
 scores unchanged. Truncating/extending it also preserves those scores, up to
@@ -69,11 +70,12 @@ the first-failure interval; training conservatively censors at the gap.
 Both generated and supplied candidate paths use this likelihood. Intervals sum
 within a path; generated paths average over actual attempts, while supplied
 candidates average separately per state. States receive fixed per-stream weights
-before division by the effective crop-batch size: .75 for the selected endpoint,
-.25 shared by earlier observations (one for a single-observation stream).
-The history share is configurable. Chunk-local renormalization is deliberately
-avoided because it would reintroduce history-length bias. Endpoint replay uses
-the same state weight in addition to its replay coefficient.
+before division by the update's supervised decision count: .75 for the endpoint,
+.25 shared by up to two uniformly sampled historical positions. All observations
+still enter memory; unsampled positions receive no task prediction. With no
+auxiliary decisions the endpoint receives weight one. The history share and
+auxiliary count are configurable. Each endpoint is predicted once using
+reconstructed memory, with no additional replay coefficient or endpoint loss.
 Commit-window weighting applies to geometry only. This changes confidence-loss
 scale from the former prefix BCE. Raw `confidence_count` remains a count of known
 prefix labels for correctness metrics, not a count of hazard training targets.
@@ -119,10 +121,14 @@ validity and stay readable outside the current crop. Every observation is cached
 including wrong turns. Slots compress independent observations using a learned
 update gate; retrieved historical interpretations are never written back.
 
-Training carries memory through two-decision gradient chunks. Endpoint replay
-recomputes writer transitions chronologically and re-encodes up to three selected
-historical crops, stratified by age. Other historical features are detached and
-potentially stale. This is not full-history encoder backpropagation. The immutable
+Training collects detached visual observations across loader chunks. At each
+sampled decision, it reconstructs every preceding writer transition with gradients
+at current weights and re-encodes up to three past images, stratified by age.
+Other cached features are detached and potentially stale. A later task loss
+trains both the memory writer and selected past encodings; the current observation
+is encoded and written by that decision's sole prediction. This is not full-history
+encoder backpropagation. Selected CPU images are released after their final use;
+completed streams are evicted. No decision reads future observations. The immutable
 seed survives cache eviction, and persistent slots can retain older evidence.
 
 See [training and validation commands](README.md).

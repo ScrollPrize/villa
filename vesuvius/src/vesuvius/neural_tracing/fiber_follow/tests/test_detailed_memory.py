@@ -8,7 +8,7 @@ from test_trajectory_memory import cfg, memory_batch, state_from, training_chunk
 from vesuvius.neural_tracing.fiber_follow.regression.model import build_model
 from vesuvius.neural_tracing.fiber_follow.regression.stratified_replay import stratified_indices
 from vesuvius.neural_tracing.fiber_follow.regression.train import optimizer_update, prepare_training
-from vesuvius.neural_tracing.fiber_follow.regression.feature_sequences import FeatureStreamStates
+from vesuvius.neural_tracing.fiber_follow.regression.stratified_replay import ObservationHistory
 
 
 def config(**kwargs):
@@ -104,19 +104,23 @@ def test_evicted_crop_receives_gradient_through_all_writer_updates():
 def test_replay_across_updates_keeps_selected_crops_only_and_evicts_finished_streams():
     torch.manual_seed(54)
     model = build_model(config())
-    ema, opt, states = copy.deepcopy(model), torch.optim.AdamW(model.parameters()), FeatureStreamStates()
+    ema, opt, states = copy.deepcopy(model), torch.optim.AdamW(model.parameters()), ObservationHistory()
     prepare_training(model, backend='eager')
     for start in (0, 2, 4):
         chunk = training_chunk(model.cfg, start=start, end=start == 4)
         for i, b in enumerate(chunk['feature_sequence']):
-            b['replay_select'] = torch.full((2,), start+i in (0, 3))
+            b['decision_mask'] = b['stream_end'].clone()
+            b['loss_weight'] = b['decision_mask'].float()
+            b['retain_until'] = torch.full((2,), 5 if start+i in (0, 3) else -1)
+            b['encoder_indices'] = torch.tensor([[0, 3, -1]]).expand(2, -1).clone() if start+i == 5 else torch.full((2, 3), -1)
         metrics = optimizer_update(model, ema, opt, [chunk], start+1, .001, compute_metrics=False, stream_states=states)
         assert np.isfinite(metrics['loss'])
         if start < 4:
-            assert not metrics['replay_endpoints']
-            assert all(not v.requires_grad for rows in states.replay.streams.values() for row in rows for v in row['features'])
-    assert metrics['replay_endpoints'] == 2 and metrics['replay_encoder_crops'] == 6
-    assert not states.states and not states.replay.streams and not states.replay.pending
+            assert not metrics['supervised_states'] and not metrics['optimizer_applied']
+            assert not opt.state
+            assert all(not v.requires_grad for rows in states.streams.values() for row in rows for v in row['features'])
+    assert metrics['supervised_states'] == 2 and metrics['history_encoder_crops'] == 4
+    assert not states.streams
 
 
 def test_memory_with_adaptive_refinement_compiled_backward():

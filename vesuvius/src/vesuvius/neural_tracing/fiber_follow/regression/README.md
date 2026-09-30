@@ -10,95 +10,111 @@ From `fiber_follow`, using the existing project environment:
 
 ```bash
 bash scripts/launch_memory.sh
-tail -F output/logs/axial_survival_memory_v8_run1.log
+tail -F output/logs/axial_survival_memory_v9_run1.log
 ```
 
-`launch_trajectory_memory.sh` delegates to the same launcher. Training defaults
-live in `regression.train.build_parser`; the launcher supplies the run name,
-data paths, and optional `BANK_PATH` override. The trainer defaults use
-CT/presence plus six unsigned local-frame direction channels, batch 8,
-microbatch 4, eight workers, 16-point maximum commit, history spacing 8,
-16 memory slots, 64 cached observations, two-decision gradient chunks,
-and at most two additional shared-decoder attempts. Every attempt uses the same
-absolute-coordinate head, with crop and first-connection bounds. A full-horizon
-acceptance ends the row's valid attempts immediately. Inference skips subsequent
-decoder/scorer work for accepted rows; compiled training retains fixed proposal
-slots and masks their computation out of the objective. The old correction-limit
-option is removed.
-The launcher starts random weights and refuses
-an existing destination. Set `RUN_NAME` for another fresh run; trailing trainer
-arguments override trainer defaults. No training is launched by editing code.
-The architecture is `axial_fiber_memory_v8`; older checkpoints are rejected,
-with no migration or compatibility mode.
+The architecture/training contract is `axial_fiber_memory_v9`. Start a fresh run;
+older checkpoints are rejected, with no migration or compatibility mode. The
+launcher refuses an existing destination. Set `RUN_NAME` for another fresh run;
+trailing arguments override `regression.train.build_parser` defaults.
 
-The loss combines geometry, generated-path survival likelihood, and candidate-path
-survival likelihood. Survival likelihood sums the supervised intervals per path;
-it does not average prefixes or reweight the commit window. Generated survival
-loss averages the attempts actually made for each state. Geometry gives the last
-attempt 75% and shares 25% across earlier attempts, or gives the sole attempt 100%.
-Skipped attempts contribute no loss. The previous proposal's conditional failure
-probabilities and prefix confidence feed the next decoder pass with detached
-gradients. There is no feedback warm-up schedule: low confidence uses the available
-retry budget; high full-path confidence masks further attempts. Training logs report
-`refinement_attempts_mean` including the initial proposal.
+Every historical crop is encoded into spatially located appearance tokens. Most
+crops use an observation-only, no-grad encoder path: they do not run the dense
+feature decoder, trajectory generator, confidence scorer, or refinement. The
+endpoint and at most `--feature-history-decisions 2` uniformly sampled earlier
+positions receive full supervised predictions. Sampling happens once per stream
+in the loader, independently of the model's confidence and label observability.
+Unknown supervision contributes zero and is not redistributed.
 
-Selection retains the longest acceptable prefix across attempted proposals,
-breaking ties by confidence at that prefix and then earlier attempt. All-rejected
-proposals still stop. Tracing uses its actual threshold and commit limit; recovery
-threshold sweeps rerun adaptive prediction separately for each threshold.
+Each selected decision reconstructs its entire preceding memory history at current
+writer weights. All writer transitions are differentiable. Up to three preceding
+images are re-encoded with gradients, one per available age band (1–4, 5–16,
+17+ observations before that decision). Other observations use detached cached
+features, potentially produced at older weights. This selectively trains the
+visual encoder from later losses; it is not full-history encoder backpropagation.
+Only selected images are retained on the CPU, and each is released after its last
+planned use. Finished streams are evicted. No writer graph crosses optimizer
+updates and no decision can see future observations.
+
+There is **one task prediction and one loss per selected decision**, including
+endpoints. There is no second endpoint replay loss or replay-weight option.
+The loss combines geometry, generated-path survival, and eligible candidate-path
+survival. By default endpoints receive .75 of a stream's task-loss weight and
+selected historical decisions share .25. A single-observation stream, zero
+history decisions, or zero history-loss fraction assigns weight one to its
+endpoint. Sampling weights preserve the expected direct auxiliary history-loss
+budget for fixed model/state; they do not make sparse encoder gradients unbiased.
+
+`--batch 8` now counts **supervised decisions per optimizer update**, not image
+observations. The loader gathers at least that many decisions without dropping
+rows. Weighted loss sums divide by the actual decision count in the update,
+never by observation count or realized loss-weight sum. Thus the loss scale and
+optimizer cadence differ from v8. Observation-only collection does not advance
+AdamW/EMA or the learning-rate schedule. Logs report both observation and decision
+throughput, supervised endpoints, writer replay observations, and selected
+historical encoder crops.
+
+`--microbatch 4` and `--feature-sequence-length 2` configure loader chunks of two
+traces by two observations. These chunk boundaries do not truncate memory
+gradients: each supervised decision reconstructs its prefix independently.
+Independent partial chunks can be packed within an update. Observation encoding
+is batched; gradient-bearing decisions currently reconstruct one stream at a time.
 
 Memory writing and the scorer's final normalization/confidence projection run in
-FP32; CUDA forward/backward otherwise uses BF16 autocast. Survival accumulation
-and proposal comparisons also use FP32. The small confidence head disables
-autocast before normalization/projection, rather than casting rounded BF16 logits
-afterward. Upstream BF16 features can still affect decisions near ties/thresholds.
-Gradient clipping remains separate for memory (5) and the rest of the model (20).
-`train.py` is the sole trainer. Compilation is always enabled: `prepare_training`
-compiles the model's existing methods in place, preserving the model object and
-parameter identities. There is no training wrapper, eager training alternative,
-or `--compile`/`--no-compile` switch. Historical checkpoint options remain readable.
-Training retains Inductor `emulate_precision_casts`. It compiles four
-bounded operations with `fullgraph=True`: crop prediction, optional candidate
-scoring, selected replay encoding, and replay memory transitions. The crop batch
-is `microbatch / feature_sequence_length` (two rows by default). Independent
-partial stream chunks are packed within their original optimizer update;
-single-row crops use their own specialization instead of computing duplicate rows.
-Larger partial batches retain padding, excluded from losses, metrics and persistent memory.
-Packing retains each stream's gradient-chunk boundary and its loss budget.
+FP32; other CUDA model computation uses BF16 autocast. Sampling coordinates,
+survival accumulation, and proposal comparisons remain FP32. Gradient clipping
+remains separate for memory (5) and the rest of the model (20).
 
-All proposal slots remain present during compiled training. Acceptance masks
-freeze completed rows and retain the original per-attempt loss weights. Candidate
-scoring uses a separate fixed four-path operation only when needed. Input layouts,
-memory key order and autograd metadata are normalized before compilation;
-detached history remains detached from earlier chunks. Unused refinement
-parameters keep `grad=None`, so masking does not introduce AdamW updates.
-Compilation preserves model parameters, checkpoint format, the precision policy
-above and adaptive inference.
-Replay encoder checkpointing is captured inside its compiled operation, so backward
-recomputation does not re-enter the compiler with different thread metadata.
-Packing can change floating-point accumulation order. Compiled BF16 rounding can
-also change an acceptance or selection decision near a threshold/tie; this is not
-a promise of bitwise-identical training trajectories.
-CPU graph checks alone do not establish CUDA numerical parity or throughput.
+`train.py` is the sole always-compiled trainer. Its model methods compile in place
+with full-graph boundaries for observation collection, supervised prediction,
+optional candidate scoring, selected historical encoding, and memory transitions.
+The no-grad collection and checkpointed gradient-bearing encoding use distinct
+boundaries. B=1 decisions avoid padded prediction rows. Inductor
+`emulate_precision_casts` remains enabled. CPU semantic tests can use an explicit
+eager graph-capture backend; CUDA checks use real Inductor.
 
-Cached CUDA BF16/FP16 cross-attention removes padding keys per row and prefers
-Flash attention. The key count may vary inside the compiled graph; query order
-and causal candidate self-attention are unchanged. CPU/FP32 retain masked
-attention, and CUDA backends remain available as fallbacks. This preserves the
-mask's meaning but changes floating-point reductions and retains gathered K/V
-tensors: the measured speed gain costs extra VRAM. The experiment log at
-`output/precision_review_20260930/EXPERIMENTS.txt` records timings, memory and
-numerical checks; the separate changes' speedups must not be added together.
+Every supervised decision uses fixed proposal slots, masking retries after
+full-horizon acceptance. Inference compacts accepted rows and skips their retries.
+Geometry gives the last attempted proposal 75% and shares 25% across earlier
+attempts; a sole attempt gets 100%. Generated survival averages actual attempts.
+Skipped refinement parameters retain `grad=None` for AdamW. Selection chooses
+the longest acceptable prefix, then its endpoint confidence, then earlier attempt.
 
-Before the final confidence head was promoted to FP32, on the RTX 5090 with
-PyTorch 2.12.1, a real-data fork of `axial_survival_memory_v8_run2`
-at step 12000 produced four graphs over 80 updates, with no recompilation or graph
-breaks. On 34 matched steady updates (20 warmup; compilation/profiling excluded),
-mean/p50/p95 update time changed from 1433/1347/2120 to 1296/1271/2011 ms; crop and
-replay counts matched. Peak allocated memory increased from 16.61 to 18.57 GiB.
-This is a short benchmark, not evidence of identical learned trajectories.
-Local commands, raw measurements and profiles are recorded in
-`output/step_time_review_20260930/REVIEW.txt`.
+CUDA BF16/FP16 cross-attention removes padded keys per row and prefers Flash;
+projection K/V is reused within each decision. This preserves mask semantics but
+changes floating-point reductions and consumes gathered-K/V storage. No promise
+of bitwise-identical training trajectories or unchanged trained accuracy is made.
+
+Use actual training data for steady-state throughput. Fork a current v9 checkpoint
+whose remaining schedule extends beyond the requested updates:
+
+```bash
+PYTHONPATH=../../.. OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=1 \
+  ../../../../.venv/bin/python -m vesuvius.neural_tracing.fiber_follow.regression.benchmark_feature_training \
+  --checkpoint output/axial_survival_memory_v9_run1/last.pt \
+  --out output/real_training_benchmark --updates 150 --warmup 50 --workers 8
+```
+
+The fork uses the checkpoint's real volumes, annotations, banks, and published
+replay caches. Its primary rates include data waiting and normal logging between
+updates. It measures the contiguous window after warmup and the final compilation
+event; inspect `measured_updates` and extend the run if that window is too short.
+Collector/diagnostic/checkpoint boundaries cannot be crossed. Report observations
+and completed endpoints per wall-clock second; also compare similar observation
+volumes and history lengths because v9 changes the meaning of an optimizer batch.
+
+A separate synthetic structural benchmark measures complete streams, including their selected
+historical encoder gradients and optimizer work, without loading a checkpoint:
+
+```bash
+PYTHONPATH=../../.. OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=1 \
+  ../../../../.venv/bin/python -m vesuvius.neural_tracing.fiber_follow.regression.benchmark_sparse_training \
+  --out output/sparse_benchmark.json --length 16 --streams 2 --warmup 3 --repeats 10
+```
+
+Compare equal observation streams and endpoint throughput; milliseconds/update
+alone is misleading when the supervised decision count changes. Synthetic speed
+and gradient tests do not establish tracing quality or memory-use accuracy.
 
 ## Inputs and sampling
 
@@ -130,15 +146,10 @@ seed is outside the current crop. Training streams retain observed geometry,
 including wrong turns, without using membership labels to filter memory writes.
 Unknown identity and censored annotation mask supervision.
 
-Sampling revision 4 budgets supervision per stream, independently of its length.
-With `--feature-history-loss-fraction .25`, a stream reserves .75 of its loss
-weight for the selected endpoint and shares .25 across earlier observations.
-A single-observation stream has weight one. Unknown labels contribute zero;
-their budget is not redistributed. All observations still enter memory in order.
-Weights are applied before the effective crop-batch denominator, including during
-endpoint replay; they are never renormalized within a gradient chunk. Loss scales
-and gradient norms therefore differ from earlier runs that weighted every crop
-equally; compare tracing metrics rather than raw historical losses.
+Sampling revision 8 emits the causal sparse-decision plan, per-decision encoder
+selection, and CPU crop-retention deadlines described above. Every admitted
+observation still contributes visual evidence, including wrong turns and unknown
+bridges. History losses use the same annotation and censoring rules as endpoints.
 
 The launcher requests matched pairs for .3 of endpoint proposals, with .75 of
 pair proposals being recoverable choices (`--decision-choice-fraction`). Both
@@ -224,7 +235,7 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=../../.. \
   tests/test_survival_confidence.py tests/test_detailed_memory.py \
   tests/test_trajectory_memory.py tests/test_recurrent_refinement.py \
   tests/test_feedback_refinement.py tests/test_fixed_training.py \
-  tests/test_feature_correctness.py tests/test_direction_inputs.py \
+  tests/test_feature_correctness.py tests/test_sparse_memory_training.py tests/test_direction_inputs.py \
   tests/test_decision_training.py tests/test_sampling_balance.py \
   tests/test_bank_failures.py tests/test_sampling_ratios.py \
   tests/test_output_plane_features.py \

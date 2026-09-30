@@ -114,7 +114,7 @@ def test_identity_supervision_and_training_cli_require_a_bank():
     from vesuvius.neural_tracing.fiber_follow.regression.train import main
     with pytest.raises(ValueError,match='requires --negative-bank'):
         main(['--name','unused','--fiber-zarrs','unused','--fibers','unused','--ct','unused',
-              '--manifest','unused','--device','cpu','--threads','1'])
+              '--manifest','unused','--device','cpu','--threads','1','--negative-bank',''])
 
 
 def test_changed_published_shards_fail_closed_and_resume_allows_growth(tmp_path):

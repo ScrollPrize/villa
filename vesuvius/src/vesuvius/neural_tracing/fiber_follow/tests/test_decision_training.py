@@ -11,7 +11,7 @@ from test_regression import proposal_output
 from test_neighbor_bank import make_bank, add_shard, publish
 from test_neighbor_following import clean_sample
 from vesuvius.neural_tracing.fiber_follow.regression.data import IdentityObservationBuilder, IdentitySampling
-from vesuvius.neural_tracing.fiber_follow.regression.feature_sequences import sequence_batches, stream_loss_weights
+from vesuvius.neural_tracing.fiber_follow.regression.feature_sequences import sequence_batches, decision_plan
 from vesuvius.neural_tracing.fiber_follow.regression.identity_decisions import decision_pair, path_candidates
 from vesuvius.neural_tracing.fiber_follow.regression.model import DirectFollower
 from vesuvius.neural_tracing.fiber_follow.regression.supervision import candidate_targets, loss_terms, geometry_mask
@@ -42,7 +42,7 @@ def test_stream_length_does_not_change_endpoint_or_total_budget(monkeypatch):
     np.testing.assert_allclose(list(endpoints.values()), .75)
     assert sum(endpoints.values())/sum(totals.values()) == pytest.approx(.75)
     assert (endpoints[0]+endpoints[1])/sum(totals.values()) == pytest.approx(.375)
-    assert stream_loss_weights(1, .25).tolist() == [1.]
+    assert decision_plan(1, Builder.cfg, np.random.default_rng(1))[0].tolist() == [1.]
 
 
 @pytest.mark.parametrize('value', [-.1, 1., float('nan')])

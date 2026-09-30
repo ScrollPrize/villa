@@ -87,6 +87,7 @@ def prepare_training(model, batch_size=2, *, backend=None):
     model._training_refined = None
     model.training_forward = torch.compile(model.training_forward, **options)
     model.score_candidates = torch.compile(model.score_candidates, **options)
+    model.collect_observation_features = torch.compile(model.collect_observation_features, **options)
     model.replay_observation_features = torch.compile(model.replay_observation_features, **options)
     model.recurrent_memory.observe_tokens = torch.compile(model.recurrent_memory.observe_tokens, **options)
     return model
@@ -107,7 +108,7 @@ def differentiable_state(state, size):
 
     Constant/detached fields become leaves whose input gradients are discarded.
     Already attached fields retain their graph, including learned reset slots
-    and the preceding decision in a truncated-BPTT chunk.
+    and every preceding writer transition reconstructed for this decision.
     """
     result = {}
     for name in sorted(state):
@@ -122,9 +123,9 @@ def differentiable_state(state, size):
 def pack_feature_chunks(chunks, size):
     """Pack independent partial chunks within their existing optimizer update.
 
-    Never join consecutive chunks of one stream: that would change its BPTT
-    boundary. Full worker chunks are reused without copying their large crops.
-    Real rows alone reach the losses, metrics and persistent stream state.
+    Keep chunks of a repeated stream in their original chronological order.
+    Full worker chunks are reused without copying their large crops.
+    Real rows alone reach the losses, metrics and persistent observation history.
     """
     if any('feature_sequence' not in chunk or 'stream_id' not in chunk['feature_sequence'][0]
            for chunk in chunks):
@@ -276,7 +277,7 @@ def initialize_training_optimizer(model, ema, args, resume=None):
 
 
 ARCHITECTURES = (ARCHITECTURE,)
-FEATURE_OPTIONS = ('feature_detail_tokens', 'feature_stream_steps', 'feature_replay_weight',
+FEATURE_OPTIONS = ('feature_detail_tokens', 'feature_stream_steps', 'feature_history_decisions',
                    'feature_switch_crop_fraction', 'feature_history_loss_fraction')
 MEMORY_GRAD_CLIP = 5.
 REST_GRAD_CLIP = 20.
@@ -401,6 +402,41 @@ def clip_training_gradients(model, memory_max_norm=MEMORY_GRAD_CLIP, rest_max_no
     return metrics
 
 
+def training_decisions(model, batches, history, device):
+    """Collect every observation; yield only supervised, causally replayed decisions.
+
+    The caller records the decision's observation after its single task backward.
+    No writer graph crosses decisions or optimizer updates. Only detached visual
+    evidence and the bounded selected CPU crops persist between loader chunks.
+    """
+    from .feature_sequences import sequence_steps
+    from .stratified_replay import take_rows
+    for chunk in batches:
+        for cpu in sequence_steps(chunk):
+            if 'stream_id' not in cpu:
+                yield cpu, None, {}
+                continue
+            history.start(cpu)
+            selected = cpu['decision_mask'].bool()
+            if (cpu['stream_end'] & ~selected).any():
+                raise ValueError('Every endpoint must be a supervised decision')
+            indices = (~selected).nonzero().flatten()
+            if len(indices):
+                observation = take_rows(cpu, indices)
+                batch = move_batch({k: observation[k] for k in ('x', 'hist', 'hmask')}, device)
+                with torch.no_grad(), torch.autocast('cuda', dtype=torch.bfloat16,
+                                                     enabled=torch.device(device).type == 'cuda'):
+                    features = model.collect_observation_features(
+                        *training_inputs(batch['x'], batch['hist'], batch['hmask'], len(indices)))
+                history.record(observation, features)
+                del features, batch
+            for j in selected.nonzero().flatten().tolist():
+                decision = take_rows(cpu, slice(j, j+1))
+                with torch.autocast('cuda', dtype=torch.bfloat16, enabled=torch.device(device).type == 'cuda'):
+                    state, counts = history.reconstruct(model, decision, device)
+                yield decision, state, counts
+
+
 def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolerance=1.5,
                      confidence_weight=.5, ema_decay=.999, n_commit=None, compute_metrics=True,
                      candidate_weight=1.,
@@ -408,18 +444,22 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
                      diagnostic=None):
     """Fixed stream loss budgets, independent of microbatch boundaries.
 
-    Geometry averages known points; survival sums known intervals. Fully
-    unknown states contribute zero. Geometry and confidence are evaluated in one pass.
-    Loss sums stay on the device until every microbatch is queued, so the host
-    synchronizes once per update rather than once per microbatch.
+    Every selected decision has one loss using reconstructed memory. Loss weights
+    sum to one per stream and the update divides by its supervised decision count,
+    never its observation count or its realized sum of weights. Observation-only
+    calls collect history without advancing AdamW/EMA; the main loop gathers at
+    least the requested decision batch before calling this function.
     """
-    from .feature_sequences import sequence_steps, FeatureStreamStates
-    stream_states = FeatureStreamStates() if stream_states is None else stream_states
+    from .feature_sequences import sequence_steps, decision_count
+    from .stratified_replay import ObservationHistory
+    stream_states = ObservationHistory() if stream_states is None else stream_states
     prepare_training(model, getattr(model, 'training_batch_size', 2))
     batches = pack_feature_chunks(batches, model.training_batch_size)
-    total = sum(len(b['hist']) for chunk in batches for b in sequence_steps(chunk))
-    if total < 1:
-        raise ValueError('An update needs at least one state')
+    observed = sum(len(b['hist']) for chunk in batches for b in sequence_steps(chunk))
+    total = sum(decision_count(b) for chunk in batches for b in sequence_steps(chunk))
+    if observed < 1:
+        raise ValueError('An update needs at least one observation')
+    denominator = max(1, total)
     for group in opt.param_groups:
         group['lr'] = lr
     opt.zero_grad(set_to_none=True)
@@ -434,114 +474,97 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
     decisions = []
     memory = {}
     model.train()
-    for chunk in batches:
-        sequence = sequence_steps(chunk)
-        chunk_losses = []
-        for cpu in sequence:
-            batch = move_batch(cpu, device)
-            if model.cfg.memory_slots:
-                sums['memory_observations_mean'] = sums.get('memory_observations_mean', 0.)+float(cpu['x']['memory_mask'].sum())/total
-                sums['memory_anchor_fraction'] = sums.get('memory_anchor_fraction', 0.)+float(cpu['x']['memory_seed_valid'].sum())/total
-            carried = stream_states.incoming(model, cpu, device) if 'stream_id' in cpu else None
-            if diagnostic is not None:
-                diagnostic.update(cpu_batch=cpu, memory=None if carried is None else
-                                  {k: v.detach() for k, v in carried.items()})
-            scoring = {}
-            if 'candidate_points' in batch and cpu['candidate_mask'].any():
-                scoring['candidates'] = batch['candidate_points']
-            with torch.autocast('cuda', dtype=torch.bfloat16, enabled=torch.device(device).type == 'cuda'):
-                output = training_prediction(model, batch['x'], batch['hist'], batch['hmask'], memory=carried,
-                               n_commit=commit_window(model.cfg, n_commit), **scoring)
-                if carried is not None:
-                    stream_states.update(cpu, output, carried)
-                    if model.cfg.feature_replay_weight:
-                        stream_states.replay.record(cpu, output)
-                terms = loss_terms(output, batch, model.cfg, tolerance, n_commit=n_commit)
-                geometry = weighted_state_sum(terms['geometry_per_state'], batch)/total
-                confidence = weighted_state_sum(terms['confidence_per_state'], batch)/total
-                loss = geometry + confidence_weight*confidence
-                if 'candidate_per_state' in terms:
-                    candidate_loss = weighted_state_sum(terms['candidate_per_state'], batch)/total
-                    loss = loss+candidate_weight*candidate_loss
-                    accumulate(identity, 'candidate_loss', candidate_loss)
-            if 'feature_sequence' in chunk:
-                chunk_losses.append(loss)
-            else:
-                loss.backward()
-            if compute_metrics:
-                decisions.extend(decision_rows(output, batch, model.cfg, n_commit, tolerance))
-                if 'candidate_confidence_logits' in output:
-                    for name, row in candidate_decisions(output, batch, model.cfg, n_commit).items():
-                        group = candidate_groups.setdefault(name, {})
-                        for key, value in row.items():
-                            group[key] = group.get(key, 0)+value
-            for key in IDENTITY_SUMS:
-                if key in terms:
-                    accumulate(identity, key, terms[key])
-            for key in ('presence_dropped', 'blurred', 'foreign_components', 'seed_present', 'identity_observable'):
-                if key in cpu:
-                    identity[key] = identity.get(key, 0.)+float((cpu[key] > 0).sum())
-            weights = cpu.get('loss_weight', torch.ones(len(cpu['hist'])))
-            endpoint = cpu.get('stream_end', torch.ones(len(weights), dtype=torch.bool))
-            matched = endpoint & (cpu.get('decision_kind', torch.zeros(len(weights))) > 0)
-            choice = endpoint & (cpu.get('decision_kind', torch.zeros(len(weights))) == 1)
-            for name, select in (('supervision', torch.ones_like(endpoint)), ('endpoint', endpoint),
-                                 ('matched_endpoint', matched), ('choice_endpoint', choice)):
-                sums[name+'_weight'] = sums.get(name+'_weight', 0.)+float(weights[select].sum())
-            sums['endpoint_states'] = sums.get('endpoint_states', 0)+int(endpoint.sum())
-            sums['matched_endpoint_states'] = sums.get('matched_endpoint_states', 0)+int(matched.sum())
-            sums['choice_endpoint_states'] = sums.get('choice_endpoint_states', 0)+int(choice.sum())
-            if 'failure_kind' in cpu:
-                for kind, name in enumerate(REPLAY_FAILURES[1:], 1):
-                    key = 'replay_'+name+'_endpoints'
-                    sums[key] = sums.get(key, 0)+int(((cpu['failure_kind'] == kind) & endpoint).sum())
-            if 'decision_requested' in cpu:
-                requested_decisions += float(cpu['decision_requested'].sum())
-            if 'negative_bank_shards' in cpu:
-                low,high = int(cpu['negative_bank_shards'].min()),int(cpu['negative_bank_shards'].max())
-                identity['negative_bank_shards_min'] = min(identity.get('negative_bank_shards_min',low),low)
-                identity['negative_bank_shards_max'] = max(identity.get('negative_bank_shards_max',high),high)
-            if 'location_source' in cpu:
-                for index, name in enumerate(LOCATION_SOURCES):
-                    key = f'location_{name}'
-                    identity[key] = identity.get(key, 0.)+float((cpu['location_source'] == index).sum())
-            for key, value in (('loss', loss), ('geometry', geometry), ('confidence_loss', confidence)):
-                accumulate(sums, key, value)
-            for key in ('error_sum', 'geometry_count', 'correct_count', 'confidence_count',
-                        'point_correct_count', 'point_wrong_count', 'point_unknown_count',
-                        'confidence_labeled_states', 'confidence_departed_states', 'refinement_attempts_sum'):
-                accumulate(sums, key, terms[key])
-            if 'source' in cpu:
-                for source in range(len(sources)):
-                    sources[source] += int((cpu['source'] == source).sum())
-                if 'bank_tail_length' in cpu:
-                    bank_tails.extend(cpu['bank_tail_length'][cpu['source'] == 3].tolist())
-        if chunk_losses:
-            torch.stack(chunk_losses).sum().backward()
-            stream_states.detach()
-            if model.cfg.feature_replay_weight:
-                replay = stream_states.replay.backward(model, total, device=device, tolerance=tolerance,
-                    n_commit=n_commit, confidence_weight=confidence_weight,
-                    candidate_weight=candidate_weight)
-                for key, value in replay.items():
-                    sums[key] = sums.get(key, 0.)+value
-                sums['loss'] = sums['loss']+replay['replay_loss']
+    sums.update(memory_replay_observations=0, history_encoder_crops=0)
+    for cpu, carried, replay_counts in training_decisions(model, batches, stream_states, device):
+        batch = move_batch(cpu, device)
+        for key, value in replay_counts.items():
+            sums[key] += value
+        if diagnostic is not None:
+            diagnostic.update(cpu_batch=cpu, memory=None if carried is None else
+                              {k: v.detach() for k, v in carried.items()})
+        scoring = {}
+        if 'candidate_points' in batch and cpu['candidate_mask'].any():
+            scoring['candidates'] = batch['candidate_points']
+        with torch.autocast('cuda', dtype=torch.bfloat16, enabled=torch.device(device).type == 'cuda'):
+            output = training_prediction(model, batch['x'], batch['hist'], batch['hmask'], memory=carried,
+                           n_commit=commit_window(model.cfg, n_commit), **scoring)
+            terms = loss_terms(output, batch, model.cfg, tolerance, n_commit=n_commit)
+            geometry = weighted_state_sum(terms['geometry_per_state'], batch)/denominator
+            confidence = weighted_state_sum(terms['confidence_per_state'], batch)/denominator
+            loss = geometry + confidence_weight*confidence
+            if 'candidate_per_state' in terms:
+                candidate_loss = weighted_state_sum(terms['candidate_per_state'], batch)/denominator
+                loss = loss+candidate_weight*candidate_loss
+                accumulate(identity, 'candidate_loss', candidate_loss)
+        loss.backward()
+        if 'stream_id' in cpu:
+            stream_states.record(cpu, tuple(output['observation_'+name] for name in ('tokens', 'xyz', 'valid')))
+        if compute_metrics:
+            decisions.extend(decision_rows(output, batch, model.cfg, n_commit, tolerance))
+            if 'candidate_confidence_logits' in output:
+                for name, row in candidate_decisions(output, batch, model.cfg, n_commit).items():
+                    group = candidate_groups.setdefault(name, {})
+                    for key, value in row.items():
+                        group[key] = group.get(key, 0)+value
+        for key in IDENTITY_SUMS:
+            if key in terms:
+                accumulate(identity, key, terms[key])
+        for key in ('presence_dropped', 'blurred', 'foreign_components', 'seed_present', 'identity_observable'):
+            if key in cpu:
+                identity[key] = identity.get(key, 0.)+float((cpu[key] > 0).sum())
+        weights = cpu.get('loss_weight', torch.ones(len(cpu['hist'])))
+        endpoint = cpu.get('stream_end', torch.ones(len(weights), dtype=torch.bool))
+        matched = endpoint & (cpu.get('decision_kind', torch.zeros(len(weights))) > 0)
+        choice = endpoint & (cpu.get('decision_kind', torch.zeros(len(weights))) == 1)
+        for name, select in (('supervision', torch.ones_like(endpoint)), ('endpoint', endpoint),
+                             ('matched_endpoint', matched), ('choice_endpoint', choice)):
+            sums[name+'_weight'] = sums.get(name+'_weight', 0.)+float(weights[select].sum())
+        sums['endpoint_states'] = sums.get('endpoint_states', 0)+int(endpoint.sum())
+        sums['matched_endpoint_states'] = sums.get('matched_endpoint_states', 0)+int(matched.sum())
+        sums['choice_endpoint_states'] = sums.get('choice_endpoint_states', 0)+int(choice.sum())
+        if 'failure_kind' in cpu:
+            for kind, name in enumerate(REPLAY_FAILURES[1:], 1):
+                key = 'replay_'+name+'_endpoints'
+                sums[key] = sums.get(key, 0)+int(((cpu['failure_kind'] == kind) & endpoint).sum())
+        if 'decision_requested' in cpu:
+            requested_decisions += float(cpu['decision_requested'].sum())
+        if 'negative_bank_shards' in cpu:
+            low,high = int(cpu['negative_bank_shards'].min()),int(cpu['negative_bank_shards'].max())
+            identity['negative_bank_shards_min'] = min(identity.get('negative_bank_shards_min',low),low)
+            identity['negative_bank_shards_max'] = max(identity.get('negative_bank_shards_max',high),high)
+        if 'location_source' in cpu:
+            for index, name in enumerate(LOCATION_SOURCES):
+                key = f'location_{name}'
+                identity[key] = identity.get(key, 0.)+float((cpu['location_source'] == index).sum())
+        for key, value in (('loss', loss), ('geometry', geometry), ('confidence_loss', confidence)):
+            accumulate(sums, key, value)
+        for key in ('error_sum', 'geometry_count', 'correct_count', 'confidence_count',
+                    'point_correct_count', 'point_wrong_count', 'point_unknown_count',
+                    'confidence_labeled_states', 'confidence_departed_states', 'refinement_attempts_sum'):
+            accumulate(sums, key, terms[key])
+        if 'source' in cpu:
+            for source in range(len(sources)):
+                sources[source] += int((cpu['source'] == source).sum())
+            if 'bank_tail_length' in cpu:
+                bank_tails.extend(cpu['bank_tail_length'][cpu['source'] == 3].tolist())
     resolve_device_sums(sums, identity, memory)
     # The summed loss is finite only if every microbatch loss was; checked before any update.
     if not math.isfinite(sums['loss']):
         raise FloatingPointError(f'Nonfinite loss at step {step}')
-    finish_training_update(model)
-    sums.update(clip_training_gradients(model, memory_grad_clip, rest_grad_clip))
-    opt.step()
-    update_ema(ema, model, step, ema_decay)
-    sums['observed_states'] = total
-    sums['refinement_attempts_mean'] = sums['refinement_attempts_sum']/total
+    if total:
+        finish_training_update(model)
+        sums.update(clip_training_gradients(model, memory_grad_clip, rest_grad_clip))
+        opt.step()
+        update_ema(ema, model, step, ema_decay)
+    sums.update(observed_states=observed, supervised_states=total,
+                observation_only_states=observed-total, optimizer_applied=bool(total))
+    sums['refinement_attempts_mean'] = sums.get('refinement_attempts_sum', 0.)/denominator
     sums.update(error_mean=sums['error_sum']/max(1., sums['geometry_count']),
                 prefix_correct_fraction=sums['correct_count']/max(1., sums['confidence_count']),
-                fresh_fraction=float(sources[0]/total),
-                recent_fraction=float(sources[2]/total),bank_wrong_continuation_fraction=float(sources[3]/total),
-                bank_following_fraction=float(sources[4]/total),
-                decision_pair_fraction=float(sources[5]/total), decision_requested_fraction=requested_decisions/total)
+                fresh_fraction=float(sources[0]/denominator),
+                recent_fraction=float(sources[2]/denominator),bank_wrong_continuation_fraction=float(sources[3]/denominator),
+                bank_following_fraction=float(sources[4]/denominator),
+                decision_pair_fraction=float(sources[5]/denominator), decision_requested_fraction=requested_decisions/denominator)
     sums.update(bank_wrong_continuation_tail_mean=float(np.mean(bank_tails)) if bank_tails else None,
                 bank_wrong_continuation_tail_min=min(bank_tails) if bank_tails else None,
                 bank_wrong_continuation_tail_max=max(bank_tails) if bank_tails else None)
@@ -549,9 +572,9 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
         memory.update(probe_identity_accuracy=memory.get('identity_correct', 0.)/max(1., memory.get('identity_count', 0.)),
                       probe_departed_recall=memory.get('departed_correct', 0.)/max(1., memory.get('departed_count', 0.)),
                       probe_offset_error_mean=memory.get('offset_error_sum', 0.)/max(1., memory.get('offset_count', 0.)),
-                      labeled_writes_per_state=memory.get('labeled_writes', 0.)/total,
-                      labeled_state_fraction=memory.get('labeled_states', 0.)/total,
-                      departed_state_fraction=memory.get('departed_states', 0.)/total)
+                      labeled_writes_per_state=memory.get('labeled_writes', 0.)/denominator,
+                      labeled_state_fraction=memory.get('labeled_states', 0.)/denominator,
+                      departed_state_fraction=memory.get('departed_states', 0.)/denominator)
         sums['memory'] = memory
     if identity:
         # Versioned separately from the distance metrics above.
@@ -561,7 +584,7 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
             identity['candidate_loss_eligible'] = identity['candidate_loss']*total/max(1e-12, identity.get('candidate_supervision_weight', 0.))
         for key in ('presence_dropped', 'blurred', 'foreign_components', 'seed_present', 'identity_observable', *(f'location_{n}' for n in LOCATION_SOURCES)):
             if key in identity:
-                identity[key+'_fraction'] = identity.pop(key)/total
+                identity[key+'_fraction'] = identity.pop(key)/denominator
         sums['identity'] = identity
     if compute_metrics:
         sums['decisions'] = summarize_decisions(decisions, commit_window(model.cfg, n_commit))
@@ -581,7 +604,7 @@ def build_parser():
     ap.add_argument('--out-root', default=str(Path(__file__).parents[1]/'output'))
     ap.add_argument('--device', default='cuda')
     ap.add_argument('--steps', type=int, default=100000)
-    ap.add_argument('--batch', type=int, default=8)
+    ap.add_argument('--batch', type=int, default=8, help='Target supervised decisions per optimizer update')
     ap.add_argument('--microbatch', type=int, default=4)
     ap.add_argument('--workers', type=int, default=8)
     ap.add_argument('--worker-cache-gb', type=float, default=.5)
@@ -603,12 +626,12 @@ def build_parser():
     ap.add_argument('--axial-layers', type=int, default=4)
     ap.add_argument('--hidden', type=int, default=128)
     ap.add_argument('--feature-sequence-length', type=int, default=DirectConfig.feature_sequence_length,
-                    help='V4 decisions per gradient chunk; microbatch counts crops across time and traces')
+                    help='Observation steps per loader chunk; no gradient truncation at chunk boundaries')
     for name in FEATURE_OPTIONS:
         default = .15 if name == 'feature_switch_crop_fraction' else getattr(DirectConfig, name)
         ap.add_argument('--'+name.replace('_', '-'), type=type(default), default=default)
     ap.add_argument('--feature-memory-grid', type=int, nargs=3, default=DirectConfig.feature_memory_grid,
-                    help='V4 pooled main-encoder spatial grid, depth height width')
+                    help='Pooled main-encoder spatial grid, depth height width')
     ap.add_argument('--memory-slots', type=int, default=16,
                     help='Positive number of persistent observation-memory slots')
     ap.add_argument('--memory-steps', type=int, default=64,
@@ -758,7 +781,7 @@ def main(argv=None):
     if args.decision_fraction and args.microbatch % 2:
         raise ValueError('Matched decisions require an even microbatch')
     if args.microbatch % cfg.feature_sequence_length:
-        raise ValueError('Microbatch must divide into feature_sequence_length decisions')
+        raise ValueError('Microbatch must divide into feature_sequence_length observations')
     stream_batch = args.microbatch//cfg.feature_sequence_length
     if args.decision_fraction and stream_batch % 2:
         raise ValueError('Matched decisions need an even number of traces: microbatch / feature_sequence_length')
@@ -837,11 +860,8 @@ def main(argv=None):
                    'decision_fraction','decision_choice_fraction','bank_following_probability','fresh_fraction',
                    'bank_hard_fraction','replay_failure_fraction','bank_switch_tolerance','bank_own_tolerance',
                    'n_commit','memory_stride','feature_switch_crop_fraction','feature_history_loss_fraction'}
-        defaults = build_parser()
         for key,value in vars(args).items():
-            # Options added after a run started had their default behavior.
-            recorded = resume['training_options'].get(key, getattr(DirectConfig, key, defaults.get_default(key))
-                                                       if key.startswith('memory_') else defaults.get_default(key))
+            recorded = resume['training_options'][key]
             if key not in ignored and json.dumps(recorded,sort_keys=True) != json.dumps(value,sort_keys=True):
                 raise ValueError(f'Resume option differs: {key}')
         if resume['seed_manifest_sha256'] != manifest['sha256'] or resume['fiber_manifest'] != fiber_manifest(fibers):
@@ -882,7 +902,7 @@ def main(argv=None):
                     '--bank-own-tolerance', args.bank_own_tolerance,
                     *[v for path in (args.negative_bank, args.near_negative_bank) if path for v in ('--failure-bank', path)]))
     progress(f'Memory slots={cfg.memory_slots}')
-    progress(f'Feature-memory streams: {stream_batch} traces x {cfg.feature_sequence_length} decisions per full chunk; state persists across chunks')
+    progress(f'Visual-history streams: {stream_batch} traces x {cfg.feature_sequence_length} observations per chunk; at most {cfg.feature_history_decisions} auxiliary decisions plus one endpoint')
     builder = IdentityObservationBuilder(cfg,train_f,identity_sampling,
         augment=True,negative_bank=negative_bank,**role_banks)
     dataset = FollowDataset(train_f, spec, sample, band, chunk=stream_batch, seed=args.seed+done,
@@ -930,12 +950,13 @@ def main(argv=None):
             from vesuvius.neural_tracing.fiber_follow.shared.trace import TraceParams
             tracer = DirectTracer(ema, FiberVolume(spec), cfg.fine, cfg.n_history,
                 TraceParams(n_commit=args.n_commit, max_len=args.diag_max_len), device=args.device)
-        progress(f'Starting data loader; waiting for {args.batch//args.microbatch} microbatches for update {done+1}')
+        progress(f'Starting data loader; collecting {args.batch} supervised decisions for update {done+1}')
         iterator = iter(loader)
-        from .feature_sequences import FeatureStreamStates, sequence_steps
-        stream_states = FeatureStreamStates()
+        from .feature_sequences import sequence_steps, decision_count
+        from .stratified_replay import ObservationHistory
+        stream_states = ObservationHistory()
         observed_states = interval_states = 0
-        prior_samples = int(resume.get('samples_seen', done*args.batch)) if resume else 0
+        prior_samples = int(resume['samples_seen']) if resume else 0
         for step in range(done+1, args.steps+1):
             event = collector.poll()
             if event:
@@ -949,9 +970,9 @@ def main(argv=None):
             while batch_states < args.batch:
                 chunk = next(iterator)
                 batches.append(chunk)
-                batch_states += sum(len(b['hist']) for b in sequence_steps(chunk))
+                batch_states += sum(decision_count(b) for b in sequence_steps(chunk))
                 if step == done+1:
-                    progress(f'Update {step}: received {batch_states}/{args.batch} crop states')
+                    progress(f'Update {step}: received {batch_states}/{args.batch} supervised decisions')
             data_seconds = time.monotonic()-batch_started
             update_started = time.monotonic()
             if early:

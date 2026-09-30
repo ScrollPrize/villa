@@ -1,4 +1,4 @@
-"""Causal, supervised streams of main crops, shared across gradient chunks.
+"""Causal observation streams with sparse supervised decision positions.
 
 Workers own observation streams; the training process owns their tensor states.
 Only geometry/labels, never encoder features, are created in loader workers.
@@ -11,7 +11,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength, fram
 from vesuvius.neural_tracing.fiber_follow.shared.data import training_state_allowed
 
 
-FEATURE_SAMPLING_REVISION = 7  # bank and lateral location categories
+FEATURE_SAMPLING_REVISION = 8  # sparse decisions with one reconstructed-memory objective
 
 def seed_observation(item, cfg):
     return dict(pos=np.asarray(item['seed_pos']).copy(),
@@ -24,8 +24,8 @@ def seed_observation(item, cfg):
 def stream_rows(item, builder, band=None):
     """Use observed paths (including drift), not annotation trajectories as inputs.
 
-    Retain the actual seed and the newest memory_steps historical decisions.
-    Every selected position is encoded once; known membership supplies supervision.
+    Retain the actual seed and the newest feature_stream_steps observations.
+    Known membership supplies supervision at the sampled decision positions.
     Unknown bridge states retain their observations but have masked supervision.
     Reject an entire stream if any crop/label crosses the held-out band.
     """
@@ -155,16 +155,12 @@ def sequence_batches(builder, items, vol, *, band=None, worker=0, requested_frac
         streams = builder._switch_crop_budget.admit(streams)
     if not streams:
         return
-    weights = [stream_loss_weights(len(rows), builder.cfg.feature_history_loss_fraction) for rows in streams]
+    plans = [decision_plan(len(rows), builder.cfg, np.random.default_rng(int(rows[-1]['identity_seed'])))
+             for rows in streams]
     group = getattr(builder, '_feature_group', 0)
     builder._feature_group = group+1
     ids = [(worker << 48)+(group << 16)+j for j in range(len(streams))]
     length = builder.cfg.feature_sequence_length
-    selected = None
-    if builder.cfg.feature_replay_weight:
-        from .stratified_replay import stratified_indices
-        selected = [stratified_indices(len(rows), np.random.default_rng(int(rows[-1].get('identity_seed', 0))))
-                    for rows in streams]
     for lo in range(0, max(map(len, streams)), length):
         sequence = []
         for t in range(lo, lo+length):
@@ -175,57 +171,46 @@ def sequence_batches(builder, items, vol, *, band=None, worker=0, requested_frac
             batch['stream_id'] = torch.tensor([ids[j] for j in active], dtype=torch.long)
             batch['stream_reset'] = torch.full((len(active),), t == 0, dtype=torch.bool)
             batch['stream_end'] = torch.tensor([t == len(streams[j])-1 for j in active])
-            batch['loss_weight'] = torch.tensor([weights[j][t] for j in active], dtype=torch.float32)
+            batch['stream_index'] = torch.full((len(active),), t, dtype=torch.long)
+            batch['loss_weight'] = torch.tensor([plans[j][0][t] for j in active], dtype=torch.float32)
+            batch['decision_mask'] = batch['loss_weight'] > 0
+            batch['encoder_indices'] = torch.tensor(np.stack([plans[j][1][t] for j in active]), dtype=torch.long)
+            batch['retain_until'] = torch.tensor([plans[j][2][t] for j in active], dtype=torch.long)
             batch['decision_requested'] = torch.full((len(active),), requested_fraction)
-            if selected is not None:
-                batch['replay_select'] = torch.tensor([t in selected[j] for j in active])
             sequence.append(batch)
         yield dict(feature_sequence=sequence)
 
 
-def stream_loss_weights(length, history_fraction):
-    """One unit of task loss per stream, irrespective of observation count.
+def decision_plan(length, cfg, rng):
+    """Uniform auxiliary queries; stratified encoder gradients for each causal prefix.
 
-    The endpoint receives the reserved share; earlier observations share the
-    history budget. Unknown labels still contribute zero. Do not renormalize
-    these weights within gradient chunks: that would restore length bias.
+    Selected histories share the history budget. Their inclusion probability
+    k/(length-1) makes this an unbiased estimator of the *direct* history loss
+    for a fixed model/state, not of full-history encoder backpropagation.
+    ``retain_until`` releases CPU image crops after their final selected use.
     """
-    if length == 1:
-        return np.ones(1)
-    return np.r_[np.full(length-1, history_fraction/(length-1)), 1-history_fraction]
+    from .stratified_replay import stratified_indices
+    if length < 1:
+        raise ValueError('A stream needs at least one observation')
+    count = min(cfg.feature_history_decisions, length-1) if cfg.feature_history_loss_fraction else 0
+    queries = sorted(rng.choice(length-1, count, replace=False).tolist()) if count else []
+    weights = np.zeros(length)
+    if queries:
+        weights[queries] = cfg.feature_history_loss_fraction/count
+    weights[-1] = 1-cfg.feature_history_loss_fraction if queries else 1.
+    indices = np.full((length, 3), -1, dtype=np.int64)
+    retained = np.full(length, -1, dtype=np.int64)
+    for t in queries+[length-1]:
+        selected = sorted(stratified_indices(t+1, rng))
+        indices[t, :len(selected)] = selected
+        retained[selected] = t
+    return weights, indices, retained
 
 
 def sequence_steps(batch):
     return batch.get('feature_sequence', [batch])
 
 
-class FeatureStreamStates:
-    """Training-only state ownership, with explicit reset, detach and eviction."""
-    def __init__(self):
-        self.states = {}
-        from .stratified_replay import StratifiedReplay
-        self.replay = StratifiedReplay()
-
-    def incoming(self, model, batch, device):
-        initial = model.initial_memory(1, device)
-        rows = []
-        for key, reset in zip(batch['stream_id'].tolist(), batch['stream_reset'].tolist()):
-            if reset:
-                self.states.pop(key, None)
-                rows.append(initial)
-            elif key in self.states:
-                rows.append(self.states[key])
-            else:
-                raise ValueError(f'Missing carried feature memory for stream {key}; a reset must precede continuation')
-        return {name: torch.cat([row[name] for row in rows]) for name in initial}
-
-    def update(self, batch, output, names):
-        for j, (key, end) in enumerate(zip(batch['stream_id'].tolist(), batch['stream_end'].tolist())):
-            if end:
-                self.states.pop(key, None)
-            else:
-                self.states[key] = {name: output['memory_'+name][j:j+1] for name in names}
-
-    def detach(self):
-        self.states = {key: {name: value.detach() for name, value in state.items()}
-                       for key, state in self.states.items()}
+def decision_count(batch):
+    """Independent non-stream batches are already supervised decision crops."""
+    return int(batch['decision_mask'].sum()) if 'stream_id' in batch else len(batch['hist'])
