@@ -123,4 +123,6 @@
   loss 0.881731, completed real startup calibration through update 18,012 and
   microbatch 8, saved calibration fingerprint `b0271f...b1724`, and registered
   its adaptive continuation. Temporary boundary logging was removed after
-  validation. Active run directory ends in `20260930_155132`.
+  validation. Startup validation used run directory suffix `20260930_155132`;
+  the active adaptive continuation uses suffix `20260930_155818` and was
+  verified training through update 18,042.
