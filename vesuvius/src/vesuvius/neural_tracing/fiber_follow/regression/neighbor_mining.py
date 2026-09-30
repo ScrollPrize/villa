@@ -137,7 +137,14 @@ class PolylineIndex:
         self.length2 = np.einsum('ij,ij->i', self.delta, self.delta)
         self.tree = cKDTree(self.a+self.delta/2)
         self.half = np.sqrt(self.length2.max())/2
-        self.seed_tree = cKDTree(dense_line(self.target, .5))
+
+    @property
+    def seed_tree(self):
+        # Exact-distance queries need only segment midpoints. Densifying a
+        # whole annotation is useful only to the mining seed-exclusion query.
+        if not hasattr(self, '_seed_tree'):
+            self._seed_tree = cKDTree(dense_line(self.target, .5))
+        return self._seed_tree
 
 
 def exact_nearest(points, target, index=None):

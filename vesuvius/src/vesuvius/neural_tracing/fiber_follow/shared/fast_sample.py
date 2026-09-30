@@ -11,6 +11,36 @@ import numba
 import numpy as np
 
 
+@numba.njit(cache=True, fastmath=False, nogil=True)
+def segment_history_distances(hist, mask, grid):
+    """CPU float32 equivalent of geometry.render_history's segment distances.
+
+    Keep each float32 operation and reduction order, including masked gaps and
+    the implicit origin. The caller retains torch.exp for identical rounding.
+    """
+    out = np.full((len(hist), len(grid)), np.inf, np.float32)
+    for row in range(len(hist)):
+        for k in range(hist.shape[1]):
+            if mask[row, k] <= 0:
+                continue
+            start = np.zeros(3, np.float32) if k == 0 else hist[row, k-1]
+            if k and not mask[row, k-1] > 0:
+                start = hist[row, k]
+            vx = hist[row, k, 0]-start[0]
+            vy = hist[row, k, 1]-start[1]
+            vz = hist[row, k, 2]-start[2]
+            vv = max((vx*vx+vy*vy)+vz*vz, np.float32(1e-12))
+            for p in range(len(grid)):
+                qx = grid[p, 0]-start[0]
+                qy = grid[p, 1]-start[1]
+                qz = grid[p, 2]-start[2]
+                t = min(max(((qx*vx+qy*vy)+qz*vz)/vv, np.float32(0)), np.float32(1))
+                dx, dy, dz = qx-t*vx, qy-t*vy, qz-t*vz
+                candidate = (dx*dx+dy*dy)+dz*dz
+                out[row, p] = np.minimum(out[row, p], candidate)
+    return out
+
+
 @numba.njit(cache=True, fastmath=False, inline="always")
 def trilinear_weight(fz, fy, fx, dz, dy, dx):
     return (fz if dz else 1-fz)*(fy if dy else 1-fy)*(fx if dx else 1-fx)

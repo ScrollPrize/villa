@@ -19,7 +19,7 @@ from scipy.spatial import cKDTree
 from vesuvius.neural_tracing.fiber_follow.regression.neighbor_bulk import BANK_VERSION, digest
 from vesuvius.neural_tracing.fiber_follow.shared.components import crop_indices
 from vesuvius.neural_tracing.fiber_follow.shared.data import fiber_manifest
-from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength, interp_at, crop_local_grid
+from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength, interp_at
 
 
 class NeighborBank:
@@ -54,6 +54,7 @@ class NeighborBank:
         self._signature, self._next_refresh = None, 0.
         self._cache, self._trees = OrderedDict(), OrderedDict()
         self._difficulty = OrderedDict()
+        self._draw_cache = OrderedDict()
         self._arc_bounds = {}
         self._spatial_bounds = {}
         self._cached_bytes = 0
@@ -61,13 +62,15 @@ class NeighborBank:
         self.refresh(force=True)
 
     def __getstate__(self):
-        return dict(self.__dict__, _cache=OrderedDict(), _trees=OrderedDict(), _difficulty=OrderedDict(), _cached_bytes=0,
+        return dict(self.__dict__, _cache=OrderedDict(), _trees=OrderedDict(), _difficulty=OrderedDict(),
+                    _draw_cache=OrderedDict(), _cached_bytes=0,
                     _next_refresh=0., _pid=None)
 
     def _worker(self):
         if self._pid != os.getpid():
             self._cache, self._trees = OrderedDict(), OrderedDict()
             self._difficulty = OrderedDict()
+            self._draw_cache = OrderedDict()
             self._cached_bytes, self._next_refresh = 0, 0.
             self._pid = os.getpid()
 
@@ -113,6 +116,7 @@ class NeighborBank:
         for rows in by_fiber.values():
             rows.sort(key=lambda s:(s['begin'],s['path']))
         self._known, self._by_fiber = incoming, by_fiber
+        self._draw_cache.clear()
         self._manifest_sha, self._signature = value['sha256'], signature
         return True
 
@@ -291,20 +295,11 @@ class NeighborBank:
         if not self.training:
             return None
         self.refresh()
-        local_ids = {global_id:local_id for local_id,global_id in enumerate(self.fiber_ids)}
-        shards = [s for fi,rows in self._by_fiber.items() if fi in local_ids for s in rows]
+        local_ids, shards, sizes = self._draw_distribution(unique, min_length)
         if not shards:
             return None
-        sizes = []
-        for s in shards:
-            count = s.get('draw_candidates',s['training_candidates']) if unique else s['training_candidates']
-            indices = s.get('draw_indices' if unique else 'training_indices')
-            if min_length and 'path_lengths' in s and indices is not None:
-                count = sum(s['path_lengths'][i] >= min_length for i in indices)
-            elif min_length and 'path_lengths' in s and max(s['path_lengths'],default=0.) < min_length:
-                count = 0
-            sizes.append(count)
-        sizes = np.asarray(sizes,float)
+        # Rejection can zero weights locally; never mutate the cached counts.
+        sizes = sizes.copy()
         if not sizes.any():
             return None
         for _ in range(8 if min_length else 1):
@@ -319,6 +314,27 @@ class NeighborBank:
             if not sizes.any():
                 break
         return None
+
+    def _draw_distribution(self, unique, min_length):
+        """Immutable metadata counts, invalidated whenever new shards appear."""
+        key = (unique, min_length)
+        if key not in self._draw_cache:
+            local_ids = {global_id: local_id for local_id, global_id in enumerate(self.fiber_ids)}
+            shards = [s for fi, rows in self._by_fiber.items() if fi in local_ids for s in rows]
+            sizes = []
+            for s in shards:
+                count = s.get('draw_candidates', s['training_candidates']) if unique else s['training_candidates']
+                indices = s.get('draw_indices' if unique else 'training_indices')
+                if min_length and 'path_lengths' in s and indices is not None:
+                    count = sum(s['path_lengths'][i] >= min_length for i in indices)
+                elif min_length and 'path_lengths' in s and max(s['path_lengths'], default=0.) < min_length:
+                    count = 0
+                sizes.append(count)
+            self._draw_cache[key] = (local_ids, shards, np.asarray(sizes, float))
+            if len(self._draw_cache) > 32:
+                self._draw_cache.popitem(last=False)
+        self._draw_cache.move_to_end(key)
+        return self._draw_cache[key]
 
     def _target_tree(self, fi):
         if fi not in self._trees:
@@ -396,7 +412,11 @@ class NeighborBank:
         if rasterize:
             voxels = np.unique(np.rint(crop_indices(mask_crop,local)).astype(int),axis=0)
             voxels = voxels[np.all((voxels >= 0) & (voxels < np.asarray(shape)),axis=1)]
-            points = crop_local_grid(mask_crop)[tuple(voxels.T)]
+            # Only these occupied cells are queried; avoid materializing the
+            # full million-voxel coordinate grid for every decision.
+            lateral, forward = mask_crop.lateral_coords, mask_crop.forward_coords
+            points = np.column_stack((lateral[voxels[:, 2]], lateral[voxels[:, 1]],
+                                      forward[voxels[:, 0]]))
             half_cell = np.sqrt(3)*mask_crop.spacing/2
             keep = tree.query(points @ frame.T+pos)[0]-gap-half_cell > max(self.exclusion,rule.own_radius)
             mask[tuple(voxels[keep].T)] = True

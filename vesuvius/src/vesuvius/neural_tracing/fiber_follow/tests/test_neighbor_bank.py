@@ -88,6 +88,41 @@ def test_live_refresh_obeys_interval_and_sees_new_shards_after_empty_lookup(tmp_
     assert bank._cache[first['path']] is cached
 
 
+def test_draw_weights_refresh_after_append_and_do_not_cross_workers(tmp_path):
+    bank, _ = make_bank(tmp_path, with_path=True)
+    rng = np.random.default_rng(4)
+    assert bank.draw_path(rng, min_length=30.) is not None
+    old = bank._draw_distribution(True, 30.)
+    second = add_shard(tmp_path, 1, x=9.)
+    publish(tmp_path, list(bank._known.values())+[second])
+    bank.refresh(force=True)
+    new = bank._draw_distribution(True, 30.)
+    assert len(old[1]) == 1 and len(new[1]) == 2
+    assert {bank.draw_path(rng, min_length=30.)[1][0, 0] for _ in range(30)} == {6., 9.}
+    restored = pickle.loads(pickle.dumps(bank))
+    assert not restored._draw_cache
+    assert restored.draw_path(rng, min_length=30.) is not None
+
+
+def test_nearest_query_skips_seed_densification_but_mining_retains_it(monkeypatch):
+    from vesuvius.neural_tracing.fiber_follow.regression import neighbor_mining as mining
+    line = np.array([[0., 0., 0.], [0., 0., 100.], [100., 0., 100.]])
+    index = mining.PolylineIndex(line)
+    dense = mining.dense_line
+    calls = []
+    def observed(*args):
+        calls.append(True)
+        return dense(*args)
+    monkeypatch.setattr(mining, 'dense_line', observed)
+    distances, points, _, _ = mining.exact_nearest(np.array([[1., 0., 50.]]), line, index)
+    np.testing.assert_array_equal(distances, [1.])
+    np.testing.assert_array_equal(points, [[0., 0., 50.]])
+    assert not calls
+    tree = index.seed_tree
+    assert index.seed_tree is tree and len(calls) == 1
+    np.testing.assert_array_equal(tree.data, dense(line, .5))
+
+
 def test_unpublished_and_heldout_shards_are_not_training_negatives(tmp_path):
     bank,_ = make_bank(tmp_path)
     first = add_shard(tmp_path,0)

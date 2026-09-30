@@ -84,6 +84,77 @@ and historical encoder gradient norms. Loader seconds are summed worker time,
 not end-to-end wall latency. Decision throughput and peak allocated VRAM are
 reported separately. Current crops per update now equal supervised decisions.
 
+### Measuring CPU data preparation
+
+Use the saved run configuration to benchmark actual image, bank, target and
+augmentation work without starting another model or modifying training data:
+
+```bash
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMBA_NUM_THREADS=1 \
+  ../../../../.venv/bin/python scripts/benchmark_loader.py \
+  --config output/patch4_run3/config.json --workers 0 --warmup 2 --batches 20 \
+  --hash-batches --out /tmp/loader.json
+```
+
+The report includes mean/p50/p95 latency and exact tensor hashes, excluding
+timing fields. Hashing is outside the timed region. Add `--profile /tmp/loader.prof`
+for cProfile hotspots, or use `--workers 10` to measure concurrent loader delivery.
+It uses the config's initial replay paths, a fixed seed, and the live bank;
+compare revisions with the same unchanged inputs. Worker profiling and concurrent
+delivery are separate measurements. Neither measures GPU transfer or optimizer time.
+
+CPU segment heatmaps fuse the original float32 distance arithmetic in Numba
+(without fast math) and retain Torch's exponential. Bank masks compute coordinates
+only at occupied cells. Bank draw weights are cached until the next published
+manifest, and exact-distance queries defer the dense seed index until mining
+actually requests it. These changes preserve sampling, crops, labels and model
+precision; checkpoint formats and resume options are unchanged. As before,
+resuming restarts loader RNG streams rather than reproducing uninterrupted draws.
+
+The September 30, 2026 check against `3a7658e02` used `patch4_run3`'s
+`neighbor_samples_r0_32_l80_160_v2` bank, S1 CT level 0 and configured fiber
+annotations. Both versions ran alongside the original training process on an
+Intel Core Ultra 7 270K Plus, with Python 3.14.4, PyTorch 2.12.1+cu130,
+NumPy 2.4.6 and Numba 0.66.0 (normal cached JIT, `fastmath=False`). The command
+above measured 20 microbatches of eight after two warmups, with seed 0:
+
+| CPU preparation, seconds/batch | Before | After |
+| --- | ---: | ---: |
+| Mean | 3.077 | 1.746 |
+| Median | 2.197 | 1.060 |
+| p95 | 6.099 | 5.813 |
+
+All 860 non-timing tensor hashes matched across those 160 decisions. These are
+single-worker measurements under concurrent training load, including occasional
+host-memory stalls; they are not end-to-end training throughput. Reports and
+profiles are in `output/loader_speedup/`. In the initial ten-batch cProfile
+comparison, unused dense seed-index construction consumed 13.0 seconds and
+full-grid construction 6.2 seconds; both were removed from those training paths.
+Segment rendering fell from 3.0 to 0.54 seconds before the additional draw-weight
+cache. Validation: `OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
+../../../../.venv/bin/python -m pytest tests -q -o cache_dir=/tmp/patch_loader_pytest`
+reported 279 passed, 15 skipped, one deselected and ten passing subtests. GPU
+tests were skipped in the sandbox; the running job provides the live GPU check.
+
+`patch4_run3` resumed at step 1,000 with model/EMA/AdamW/RNG state intact and
+the same 10 workers, microbatch 8, batch 16 and one refinement step. On the RTX
+5090, the original updates 51–1,000 versus resumed updates 1,051–1,200 gave:
+
+| Live measurement | Before | After |
+| --- | ---: | ---: |
+| Mean data wait / update | 786 ms | 130 ms |
+| Median data wait / update | 780 ms | 106 ms |
+| p95 data wait / update | 1,023 ms | 171 ms |
+| Overall crops / second | 16.38 | 44.09 |
+
+Wait statistics summarize 50-update logging windows (19 before, three after),
+excluding the initial startup windows. Throughput includes the full logged wall
+time. This is an 83.4% wait reduction and 2.69x throughput, with live sampling
+variation and a shorter post-resume observation period. See
+`output/loader_speedup/live_comparison.json` and `handover.json` for the measured
+intervals and exact resume command. The original checkpoint is retained at
+`output/patch4_run3/ckpt_001000.pt`.
+
 ## Source sampling and labels
 
 The default requested shares remain 30% matched decisions, 20% bank following,

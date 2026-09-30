@@ -108,6 +108,11 @@ def render_history(hist_local: torch.Tensor, hist_mask: torch.Tensor, local_grid
     if mode == 'points':
         d2 = torch.cdist(hist_local, g[None].expand(B, -1, -1)).square()
         d2 = d2.masked_fill(hist_mask[..., None] <= 0, float('inf')).amin(1)
+    elif (hist_local.device.type == local_grid.device.type == hist_mask.device.type == 'cpu'
+          and hist_local.dtype == local_grid.dtype == torch.float32
+          and not (hist_local.requires_grad or local_grid.requires_grad)):
+        from .fast_sample import segment_history_distances
+        d2 = torch.from_numpy(segment_history_distances(hist_local.numpy(), hist_mask.numpy(), g.numpy()))
     else:
         # Process one segment at a time to bound memory on full 64-cubed crops.
         d2 = hist_local.new_full((B, len(g)), float('inf'))
