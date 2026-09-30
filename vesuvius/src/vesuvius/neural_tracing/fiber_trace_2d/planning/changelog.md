@@ -3123,3 +3123,7 @@ identity remains unconfirmed. Global-assignment experiments not yet implemented.
 - Prepared the stopped full-resolution Gaussian run to resume from its update
   18,000 full checkpoint with half-width sigmas and managed GPUs 0-5, leaving
   GPUs 6-7 reserved.
+- Split Gaussian presence supervision into independently normalized ridge,
+  within-support distribution-negative, and background terms while preserving
+  the prior aggregate loss scale; hardened partial distributed test waves with
+  reference-counted padded-sample leases.

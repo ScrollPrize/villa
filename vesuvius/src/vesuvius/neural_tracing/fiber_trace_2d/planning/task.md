@@ -19,3 +19,8 @@ Also allow online refinement to rotate the anisotropic distribution around the
 local fiber tangent. Keep rotation updates small and weakly tether the refined
 orientation to the original native Lasagna normal. Persist this orientation
 state together with refined fiber geometry and use it for subsequent targets.
+
+Normalize Gaussian supervision explicitly into ridge-positive,
+within-support distribution-negative, and external background-negative terms.
+Keep the historical total presence-loss scale, assigning conceptual shares
+50%, 25%, and 25%, respectively.

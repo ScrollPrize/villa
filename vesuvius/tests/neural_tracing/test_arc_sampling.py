@@ -322,6 +322,7 @@ def test_anisotropic_gaussian_target_prepass_counts_match_loss_groups():
         statistics.direction_count,
         statistics.positive_presence_count,
         statistics.negative_presence_count,
+        statistics.distribution_presence_count,
     )).cpu()
     torch.testing.assert_close(counts, actual, rtol=0, atol=0)
 

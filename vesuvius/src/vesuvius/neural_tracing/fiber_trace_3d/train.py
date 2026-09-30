@@ -951,9 +951,10 @@ def _nonempty_group_statistics(
     group_count: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     valid = group_count > 0.0
+    minimum = torch.finfo(group_count.dtype).tiny
     group_mean = torch.where(
         valid,
-        group_sum / group_count.clamp_min(1.0),
+        group_sum / group_count.clamp_min(minimum),
         torch.zeros_like(group_sum),
     )
     return group_mean.sum(), valid.to(dtype=group_sum.dtype).sum()
@@ -972,6 +973,7 @@ def _finalize_loss_statistics(
         "direction",
         "positive_presence",
         "negative_presence",
+        "distribution_presence",
         "angle",
         "branch0",
         "branch1",
@@ -996,6 +998,10 @@ def _finalize_loss_statistics(
         "negative_presence": (
             statistics.negative_presence_sum,
             statistics.negative_presence_count,
+        ),
+        "distribution_presence": (
+            statistics.distribution_presence_sum,
+            statistics.distribution_presence_count,
         ),
         "angle": (statistics.angle_sum, statistics.angle_count),
         "branch0": (statistics.branch0_sum, statistics.branch_count),
@@ -1037,6 +1043,7 @@ def _finalize_loss_statistics(
     direction_loss = ratio("direction")
     positive_presence_loss = ratio("positive_presence")
     negative_presence_loss = ratio("negative_presence")
+    distribution_presence_loss = ratio("distribution_presence")
     positive_count = (
         global_values["positive_presence"][1]
         if global_values
@@ -1047,13 +1054,31 @@ def _finalize_loss_statistics(
         if global_values
         else statistics.negative_presence_count
     )
+    distribution_count = (
+        global_values["distribution_presence"][1]
+        if global_values
+        else statistics.distribution_presence_count
+    )
+    distribution_active = (distribution_count > 0.0).to(
+        dtype=positive_presence_loss.dtype
+    )
+    # Binary targets retain their historical 1:1 positive/background scale.
+    # Gaussian targets decompose the same total positive/negative pressure as
+    # 1.0 ridge-positive + 0.5 within-support distribution-negative + 0.5
+    # external background-negative (conceptual shares 50% / 25% / 25%).
     presence_loss = (
         float(positive_query_weight)
         * positive_presence_loss
         * (positive_count > 0.0).to(dtype=positive_presence_loss.dtype)
         + float(negative_query_weight)
-        * negative_presence_loss
-        * (negative_count > 0.0).to(dtype=negative_presence_loss.dtype)
+        * (
+            (1.0 - 0.5 * distribution_active)
+            * negative_presence_loss
+            * (negative_count > 0.0).to(dtype=negative_presence_loss.dtype)
+            + 0.5
+            * distribution_active
+            * distribution_presence_loss
+        )
     )
     split_embedding = (local_pairs["short_embedding"][1] > 0) | (local_pairs["long_embedding"][1] > 0)
     if global_values:
@@ -1069,6 +1094,9 @@ def _finalize_loss_statistics(
         "total": total,
         "direction": direction_loss,
         "presence": presence_loss,
+        "presence_ridge": positive_presence_loss,
+        "presence_distribution": distribution_presence_loss,
+        "presence_background": negative_presence_loss,
         "embedding": embedding_loss,
         "embedding_contrastive": ratio("contrastive_embedding"),
         "embedding_anchors": global_values["contrastive_embedding"][1] if global_values else statistics.contrastive_embedding_count,
@@ -1521,22 +1549,47 @@ def compute_losses(
         positive_mask = presence_target > 0.0
         if presence_loss_mask is not None:
             positive_mask = positive_mask & presence_loss_mask.unsqueeze(1)
-        soft_presence_bce = _safe_probability_bce(
+        positive_presence_bce = _safe_probability_bce(
             pred_presences.clamp(1.0e-6, 1.0 - 1.0e-6),
-            presence_target,
+            torch.ones_like(pred_presences),
             reduction="none",
         )
-        positive_mask_f = positive_mask.to(dtype=soft_presence_bce.dtype)
-        positive_group_sum = (soft_presence_bce * positive_mask_f).sum(
+        ridge_weight = presence_target.to(dtype=positive_presence_bce.dtype) * positive_mask
+        positive_group_sum = (positive_presence_bce * ridge_weight).sum(
             dim=(2, 3, 4, 5)
         ).reshape(-1)
-        positive_group_count = positive_mask_f.sum(dim=(2, 3, 4, 5)).reshape(-1)
+        positive_group_count = ridge_weight.sum(dim=(2, 3, 4, 5)).reshape(-1)
         positive_presence_sum, positive_presence_group_count = _nonempty_group_statistics(
             positive_group_sum,
             positive_group_count,
         )
+        distribution_presence_bce = _safe_probability_bce(
+            pred_presences.clamp(1.0e-6, 1.0 - 1.0e-6),
+            torch.zeros_like(pred_presences),
+            reduction="none",
+        )
+        distribution_weight = (
+            (1.0 - presence_target).to(dtype=distribution_presence_bce.dtype)
+            * positive_mask
+        )
+        distribution_group_sum = (distribution_presence_bce * distribution_weight).sum(
+            dim=(2, 3, 4, 5)
+        ).reshape(-1)
+        distribution_group_count = distribution_weight.sum(
+            dim=(2, 3, 4, 5)
+        ).reshape(-1)
+        distribution_presence_sum, distribution_presence_group_count = (
+            _nonempty_group_statistics(
+                distribution_group_sum,
+                distribution_group_count,
+            )
+        )
         negative_mask = presence_target == 0.0
     else:
+        distribution_presence_sum = pred_presences.sum() * 0.0
+        distribution_presence_group_count = torch.zeros(
+            (), dtype=pred_presences.dtype, device=pred_presences.device
+        )
         negative_mask = presence_target <= 0.5
     if presence_loss_mask is not None:
         negative_mask = negative_mask & presence_loss_mask.unsqueeze(1)
@@ -1561,6 +1614,8 @@ def compute_losses(
         positive_presence_count=positive_presence_group_count,
         negative_presence_sum=negative_presence_sum,
         negative_presence_count=negative_presence_group_count,
+        distribution_presence_sum=distribution_presence_sum,
+        distribution_presence_count=distribution_presence_group_count,
         angle_sum=angle_sum,
         angle_count=angle_count,
         branch0_sum=branch0_sum,
@@ -4045,20 +4100,23 @@ def training_units(
             batch: FiberTrace3DBatch | None = None
             loss_statistics: _LossStatistics | None = None
             component_accumulator = None
+            gaussian_presence = loader.config.presence_target_mode == "anisotropic_gaussian"
             def normalized_accumulator(counts):
                 accumulator = NormalizedGradientAccumulator(raw_model, counts,
                     direction_weight=direction_weight, presence_weight=presence_weight,
                     positive_query_weight=conditioned_loss_options["positive_query_weight"],
                     negative_query_weight=conditioned_loss_options["negative_query_weight"],
                     distributed=distributed.enabled,
-                    loss_scale=float(grad_scaler.get_scale()) if scaler_enabled else 1.0)
+                    loss_scale=float(grad_scaler.get_scale()) if scaler_enabled else 1.0,
+                    gaussian_presence=gaussian_presence)
                 if scaler_enabled:
                     grad_scaler.scale(accumulator.statistics[0])
                 return accumulator
 
             if target_only_accumulation and optimizer_microbatch_count == 0:
                 component_accumulator = normalized_accumulator(torch.zeros(
-                    len(loss_components(raw_model)), device=device))
+                    len(loss_components(raw_model, gaussian_presence=gaussian_presence)),
+                    device=device))
             for microbatch_index, take in enumerate(optimizer_microbatch_takes):
                 local_batch_ordinal = (
                     (step - 1) * optimizer_microbatch_count + microbatch_index + 1

@@ -64,6 +64,16 @@
     stale-commit regression tests before launching the half-sigma continuation.
     Preserve material identities through clipping so every emitted segment uses
     the matching persisted orientation and immutable baseline normal.
+12. Split Gaussian presence supervision into separately normalized ridge,
+    within-support distribution-negative, and zero-support background terms.
+    Preserve the former aggregate positive/negative scale with coefficients
+    1/0.5/0.5, carry the additional target-only count through the one-backward
+    accumulator, and expose each component as a metric.
+13. Keep distributed test forward/collective parity in partial final waves by
+    running metric-free padded forwards. Since several padded ranks can read
+    the same deterministic sample concurrently, make broker test leases
+    reference-counted and release the shared queue ticket only after the final
+    reader completes.
 
 ## Spec update
 

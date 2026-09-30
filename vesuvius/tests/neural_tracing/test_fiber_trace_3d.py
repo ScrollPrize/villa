@@ -4976,6 +4976,35 @@ def test_3d_presence_loss_balances_positive_and_negative_regions() -> None:
     expected = pos_expected + neg_expected
     assert torch.allclose(losses["presence"], expected)
 
+    gaussian_batch = replace(
+        batch,
+        presence_target=torch.tensor(
+            [1.0, 0.5, 0.0, 0.0], dtype=torch.float32
+        ).view(1, 1, 1, 1, 4),
+        presence_target_mode="anisotropic_gaussian",
+    )
+    gaussian = compute_losses(
+        output,
+        gaussian_batch,
+        direction_weight=0.0,
+        presence_weight=1.0,
+    )
+    ridge_expected = (
+        -torch.log(torch.tensor(0.9))
+        - 0.5 * torch.log(torch.tensor(0.2))
+    ) / 1.5
+    distribution_expected = -torch.log(1.0 - torch.tensor(0.2))
+    background_expected = -torch.log(
+        1.0 - torch.tensor([0.8, 0.4])
+    ).mean()
+    assert torch.allclose(gaussian["presence_ridge"], ridge_expected)
+    assert torch.allclose(gaussian["presence_distribution"], distribution_expected)
+    assert torch.allclose(gaussian["presence_background"], background_expected)
+    assert torch.allclose(
+        gaussian["presence"],
+        ridge_expected + 0.5 * distribution_expected + 0.5 * background_expected,
+    )
+
 
 def test_3d_negative_presence_loss_normalizes_per_patch_and_branch() -> None:
     output = torch.zeros((2, 7, 1, 1, 3), dtype=torch.float32)

@@ -81,3 +81,16 @@
   test rows or refinement proposals. Focused partition/gather tests: 6 passed.
 - Corrected the production allowlist to physical GPUs 0-5; GPUs 6-7 remain
   reserved.
+- The corrected six-rank launch completed ordinary test waves through 114:119,
+  then exposed a broker ownership bug in the padded 120:120 wave: multiple idle
+  ranks borrowed sample 1920 concurrently, but the first release deleted the
+  sole ticket and the next release raised `KeyError`. Test sample leases are now
+  reference-counted; the queue ticket is returned only after the final reader.
+  Focused broker/evaluation tests pass.
+- Replaced uniform soft-target BCE with explicit Gaussian components. Ridge
+  positive (`y`) is normalized by Gaussian mass, distribution negative
+  (`1-y`) by nonzero-support tail mass, and external background independently;
+  coefficients 1/0.5/0.5 retain the historical total scale. The fourth target
+  count and numerator are now carried through the single-backward accumulator,
+  not merely reported as metrics. Focused prepass, gradient, loss, and broker
+  tests pass (4 selected, 308 deselected).

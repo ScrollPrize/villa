@@ -99,17 +99,25 @@ refinement. The loader transforms them through each affine and smooth
 augmentation as covectors (`J^-T n`), then forms the local in-sheet axis from
 the transformed segment tangent. Invalid normals or singular transforms use
 the existing deterministic same-scroll sample replacement rather than a fake
-axis. Soft BCE is averaged over nonzero tube support per patch; pure-zero
-background is averaged separately, preserving the established equal
-positive/background patch weighting. BCE remains appropriate because its
-pointwise optimum is the configured Gaussian probability. The target-only
-macro-batch prepass uses the identical support/background group counts and
-Gaussian direction-weight sum.
+axis. Gaussian presence BCE is split into three independently normalized
+terms per patch: ridge-positive pressure uses `y * BCE(p, 1)` and normalizes by
+`sum(y)`; within-support distribution-negative pressure uses
+`(1-y) * BCE(p, 0)` and normalizes by `sum(1-y)` over nonzero support; external
+background pressure uses `BCE(p, 0)` where `y == 0`. Their coefficients are
+`1`, `0.5`, and `0.5`, respectively. Thus the historical unit positive plus
+unit negative loss scale is retained while the negative half is explicitly
+divided between the soft distribution and external background (conceptual
+shares 50%/25%/25%). TensorBoard exposes these as `presence_ridge`,
+`presence_distribution`, and `presence_background`. The target-only
+macro-batch prepass supplies all three target-derived group counts, so the
+single-backward gradient uses the same normalization. BCE remains appropriate
+because its pointwise optimum is the configured Gaussian probability.
 
 The half-sigma continuation resumes the preceding run's full raw checkpoint,
 including optimizer, EMA, update counter, refined curves, and material state.
 It changes thickness sigma from 2 to 1 input voxel and therefore in-sheet sigma
-from 8 to 4 voxels. It runs on the managed physical-GPU subset 0-6.
+from 8 to 4 voxels. It runs on the managed physical-GPU subset 0-5; physical
+GPUs 6 and 7 remain reserved.
 
 When `orientation_enabled` is true, refinement may also rotate the Gaussian
 cross-section about its local fiber tangent. The state is an unoriented axis,

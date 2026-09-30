@@ -13,7 +13,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.loss_statistics import LossStatistic
 from vesuvius.neural_tracing.fiber_trace_3d.sample_pipeline import MacroBatchTargetSource
 from vesuvius.neural_tracing.fiber_trace_3d.targets import materialize_targets
 from vesuvius.neural_tracing.fiber_trace_3d.train import compute_losses
-from test_arc_sampling import make_loader
+from test_arc_sampling import _gaussian_line_batch, make_loader
 
 
 @pytest.mark.parametrize("raw", [{"model_3d": {"direction_branch_count": 2}}, {"model": {"output_channels": 21}}])
@@ -140,6 +140,80 @@ def test_target_prepass_owns_reused_queue_slots(dense, stride):
         s = compute_losses(output, targets, direction_weight=10, presence_weight=1, _return_statistics=True)
         expected += torch.stack((s.direction_count, s.positive_presence_count, s.negative_presence_count))
     torch.testing.assert_close(result[0].normalization_counts, expected, rtol=0, atol=0)
+
+
+def test_gaussian_target_prepass_includes_distribution_negative_groups():
+    raw, config, targets = _gaussian_line_batch(stride=1)
+    source = MacroBatchTargetSource(
+        None, config=config, device=torch.device("cpu"), output_stride=1,
+        batch_sizes=[1],
+    )
+    counts = source._counts(raw)
+    output = torch.full(
+        (1, 7, *targets.presence_target.shape[-3:]),
+        0.5,
+        requires_grad=True,
+    )
+    statistics = compute_losses(
+        output, targets, direction_weight=10, presence_weight=1,
+        _return_statistics=True,
+    )
+    expected = torch.stack((
+        statistics.direction_count,
+        statistics.positive_presence_count,
+        statistics.negative_presence_count,
+        statistics.distribution_presence_count,
+    ))
+    torch.testing.assert_close(counts, expected, rtol=0, atol=0)
+
+
+def test_gaussian_single_backward_matches_explicit_three_way_presence_loss():
+    torch.manual_seed(23)
+    model = torch.nn.Linear(3, 4, bias=False)
+    oracle = copy.deepcopy(model)
+    inputs = torch.randn(7, 3)
+
+    def gaussian_statistics(output):
+        zero = output.sum() * 0.0
+        return LossStatistics(
+            direction_sum=output[:, 0].square().sum(),
+            direction_count=output.new_tensor(output.shape[0]),
+            positive_presence_sum=(output[:, 1] - 1.0).square().sum(),
+            positive_presence_count=output.new_tensor(output.shape[0]),
+            negative_presence_sum=output[:, 2].square().sum(),
+            negative_presence_count=output.new_tensor(output.shape[0]),
+            distribution_presence_sum=output[:, 3].square().sum(),
+            distribution_presence_count=output.new_tensor(output.shape[0]),
+            angle_sum=zero,
+            angle_count=zero.detach(),
+            branch0_sum=zero,
+            branch1_sum=zero,
+            branch_count=zero.detach(),
+            selected_score_sum=zero,
+            selected_score_count=zero.detach(),
+        )
+
+    expected = gaussian_statistics(oracle(inputs))
+    (
+        2.0 * expected.direction_sum / expected.direction_count
+        + 3.0 * expected.positive_presence_sum / expected.positive_presence_count
+        + 1.5 * expected.negative_presence_sum / expected.negative_presence_count
+        + 1.5 * expected.distribution_presence_sum
+        / expected.distribution_presence_count
+    ).backward()
+
+    accumulator = NormalizedGradientAccumulator(
+        model,
+        torch.tensor([7.0, 7.0, 7.0, 7.0]),
+        direction_weight=2.0,
+        presence_weight=3.0,
+        gaussian_presence=True,
+    )
+    for part in inputs.split(2):
+        accumulator.add(gaussian_statistics(model(part)))
+    accumulator.reduce_and_assign()
+    for actual, reference in zip(model.parameters(), oracle.parameters(), strict=True):
+        torch.testing.assert_close(actual.grad, reference.grad)
 
 
 def test_changed_counts_fail_before_optimizer_step():
