@@ -2508,6 +2508,50 @@ def _evaluate_loaded_batch(model, batch, config, *, device, microbatch_size,
 
 
 @torch.no_grad()
+def _run_metric_free_evaluation_forwards(
+    model: torch.nn.Module,
+    config: Any,
+    *,
+    device: torch.device,
+    physical_batch_size: int,
+    forward_count: int,
+    mixed_precision: _MixedPrecisionConfig | None,
+    ema: ModelEMA | None = None,
+) -> None:
+    """Match DDP evaluation forwards without loading or reporting a sample."""
+    raw_model = model
+    model.eval()
+    volume = torch.zeros(
+        (int(physical_batch_size), 1, *tuple(int(v) for v in config.patch_shape_zyx)),
+        dtype=torch.float32,
+        device=device,
+    )
+
+    def run() -> None:
+        for _ in range(int(forward_count)):
+            with _autocast_context(mixed_precision):
+                if _model_uses_conditioned_decoder(model):
+                    query = torch.zeros((int(physical_batch_size), 6), dtype=volume.dtype, device=device)
+                    model(
+                        volume,
+                        conditioned_random_query=query,
+                        conditioned_point_indices_bzyx=None,
+                        conditioned_point_query_n6=None,
+                        return_conditioned_components=True,
+                    )
+                elif bool(getattr(_unwrap_model(model), "embedding_channels", 0)):
+                    model(volume, return_embeddings=True)
+                else:
+                    model(volume)
+
+    run()
+    for name in (() if ema is None else ema.tracks):
+        with ema.apply(raw_model, name):
+            run()
+    model.train()
+
+
+@torch.no_grad()
 def _evaluate_dense_loss_rows(
     model: torch.nn.Module,
     loader: FiberTrace3DLoader,
@@ -3761,10 +3805,6 @@ def training_units(
                     total_batch_count=total,
                     pad_empty_ranks=pending_test is not None,
                 )
-                # Padding may replay an earlier logical index, but the central
-                # queue is intentionally one-pass and cannot reissue a consumed
-                # ticket. Load these metric-free parity batches directly in the
-                # worker; all real evaluation batches stay on the fast queue.
                 iterator = (None if padded else queued_evaluation(
                     indices, step, source=source, evaluation_loader=evaluation_loader,
                     count=count, offset=offset))
@@ -3778,15 +3818,23 @@ def training_units(
                         evaluation_microbatch_size or loader.config.batch_size)
                     if evaluation_loader.config.embedding.paired_patches:
                         evaluation_microbatch = evaluation_microbatch // 2 * 2
-                    local = _evaluate_dense_loss_rows(raw_model, evaluation_loader, **local_options,
-                        ema=ema, global_batch_indices=indices, batch_iterator=iterator,
-                        microbatch_size=(evaluation_microbatch
-                            if pending_test is not None else evaluation_microbatch_size),
-                        minimum_forward_count=(
-                            math.ceil(evaluation_loader.config.batch_size / evaluation_microbatch)
-                            if pending_test is not None else 0))
+                    minimum_forward_count = (
+                        math.ceil(evaluation_loader.config.batch_size / evaluation_microbatch)
+                        if pending_test is not None else 0)
                     if padded:
+                        _run_metric_free_evaluation_forwards(
+                            raw_model, evaluation_loader.config, device=distributed.device,
+                            physical_batch_size=evaluation_microbatch,
+                            forward_count=minimum_forward_count,
+                            mixed_precision=mixed_precision, ema=ema,
+                        )
                         local = []
+                    else:
+                        local = _evaluate_dense_loss_rows(raw_model, evaluation_loader, **local_options,
+                            ema=ema, global_batch_indices=indices, batch_iterator=iterator,
+                            microbatch_size=(evaluation_microbatch
+                                if pending_test is not None else evaluation_microbatch_size),
+                            minimum_forward_count=minimum_forward_count)
                 finally:
                     if iterator is not None:
                         iterator.close()

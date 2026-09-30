@@ -110,5 +110,6 @@
   CPU suite passes (60 passed, 14 CUDA-only skips).
 - That relaunch exposed one final transport constraint: the optimized central
   test queue is deliberately one-pass, so padding ranks cannot request old
-  indices 0-4 again. Metric-free padding now loads those exceptional batches
-  directly per worker; every real test batch remains on the central queue.
+  indices 0-4 again. Padding now performs shape-correct zero-input DDP forwards
+  without loading or reporting any sample; every real test batch remains on
+  the central queue.

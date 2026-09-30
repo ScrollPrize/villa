@@ -6,7 +6,8 @@ from vesuvius.neural_tracing.fiber_trace_3d.embedding import (
     EmbeddingConfig, embedding_statistics, local_competition, similarity_diagnostics,
 )
 from vesuvius.neural_tracing.fiber_trace_3d.train import (
-    _evaluate_loaded_batch, _mean_dense_test_rows, _slice_batch,
+    _evaluate_loaded_batch, _mean_dense_test_rows,
+    _run_metric_free_evaluation_forwards, _slice_batch,
 )
 from vesuvius.neural_tracing.fiber_trace_3d.model import build_fiber_trace_3d_model
 from test_fiber_trace_3d import _loader_with_mapping
@@ -123,3 +124,31 @@ def test_evaluation_partial_batch_pads_forwards_without_changing_statistics():
     assert model.calls == 2
     for key in baseline:
         torch.testing.assert_close(baseline[key], padded[key], rtol=0, atol=0)
+
+
+def test_metric_free_evaluation_forwards_need_no_sample_loading():
+    config = tiny_config()
+    config['embedding']['enabled'] = False
+    inner = build_fiber_trace_3d_model(config).eval()
+
+    class CountingModel(torch.nn.Module):
+        output_stride = inner.output_stride
+        embedding_channels = 0
+
+        def __init__(self):
+            super().__init__()
+            self.inner = inner
+            self.calls = 0
+
+        def forward(self, value):
+            self.calls += 1
+            return self.inner(value)
+
+    model = CountingModel()
+    loader = _loader_with_mapping({'augment_enabled': False, 'batch_size': 2})
+    _run_metric_free_evaluation_forwards(
+        model, loader.config, device=torch.device('cpu'), physical_batch_size=1,
+        forward_count=3, mixed_precision=None,
+    )
+    assert model.calls == 3
+    assert model.training
