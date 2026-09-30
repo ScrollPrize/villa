@@ -3370,44 +3370,19 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
 
     if (patch_normals_requested) {
         try {
-            // voxelsize is the level-0 um/voxel figure. Derive this level's
-            // voxel size from the true level shapes instead of assuming a
-            // dyadic pyramid: Volume::shape(level) reports the on-disk shape
-            // and the pyramid policy allows non-dyadic per-level factors.
+            // voxelsize is the level-0 um/voxel figure. It is only used as
+            // the target voxel size when tracing at level 0. Deriving a
+            // coarser level's figure from shape ratios carries ceil()
+            // rounding that compounds with depth, and no threshold can
+            // separate that rounding noise from genuine mild anisotropy —
+            // so any inferred figure risks a wrong uniform conversion of a
+            // scalar stamped voxel size. The declared per-level scales are
+            // not exposed by Volume, and the only in-tree caller traces at
+            // level 0, so coarser levels deliberately leave a stamped voxel
+            // size on the unverifiable path instead of guessing.
             std::optional<double> level_voxelsize_um;
-            try {
-                const std::array<int, 3> shape0 = volume.shape(0);
-                double factor = 1.0;
-                bool usable = true;
-                for (int i = 0; usable && i < 3; ++i) {
-                    if (shape0[i] <= 0 || volume_shape_zyx[i] <= 0) {
-                        usable = false;
-                        break;
-                    }
-                    const double r =
-                        static_cast<double>(shape0[i]) /
-                        static_cast<double>(volume_shape_zyx[i]);
-                    if (!std::isfinite(r) || r <= 0.0) {
-                        usable = false;
-                        break;
-                    }
-                    if (i == 0) {
-                        factor = r;
-                    } else if (std::abs(r - factor) > 0.02 * factor) {
-                        // Anisotropic pyramid: no single um/voxel figure
-                        // describes this level, so leave a stamped voxel size
-                        // on the unverifiable path instead of guessing.
-                        usable = false;
-                        break;
-                    }
-                }
-                if (usable) {
-                    level_voxelsize_um =
-                        static_cast<double>(voxelsize) * factor;
-                }
-            } catch (const std::exception&) {
-                // Level-0 shape unavailable: leave the stamp unverifiable
-                // rather than guessing a scale.
+            if (level == 0) {
+                level_voxelsize_um = static_cast<double>(voxelsize);
             }
             trace_data.patch_normals = load_patch_normal_context(
                 params, volume_shape_zyx, resume_surf, level_voxelsize_um);
