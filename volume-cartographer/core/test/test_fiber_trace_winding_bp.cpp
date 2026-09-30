@@ -1592,6 +1592,31 @@ TEST_CASE("Largest winding component uses effective factors and deterministic ti
     CHECK(withoutMixed.retainedPieceIndices == std::vector<std::size_t>{3, 4});
 }
 
+TEST_CASE("Reference neighborhood retains whole sources across disconnected pieces")
+{
+    auto report = pieces(7);
+    // Reference 0; pieces 1 and 2 share a source but no connecting factor.
+    report.pieces[2].traceIndex = 1;
+    report.pieces[2].pieceIndex = 1;
+    addMeasured(report, 0, 1, 0.0, -4.0);
+    addMeasured(report, 1, 3, 0.0, 0.5); // no ordinary graph flood
+    addMeasured(report, 0, 4, 1.0, 0.5); // parallel does not seed
+    addMeasured(report, 0, 5, 0.0, 0.5);
+    report.constraints.back().signedWindingDelta.reset(); // unknown is not zero
+    addMeasured(report, 0, 6, 0.0, 4.01); // outside inclusive scaled radius
+    const auto subset = selectFiberTraceReferenceNeighborhood(report, 1, 2.0, 0.5);
+    CHECK(subset.retainedPieceIndices == std::vector<std::size_t>{0, 1, 2});
+    REQUIRE(subset.report.constraints.size() == 1);
+    CHECK(subset.report.constraints[0].signedWindingDelta == -4.0);
+    CHECK(subset.report.pieces[1].traceIndex == subset.report.pieces[2].traceIndex);
+    CHECK(selectFiberTraceReferenceNeighborhood(report, 1, 1.99, 0.5)
+        .retainedPieceIndices == std::vector<std::size_t>{0});
+    CHECK(selectFiberTraceReferenceNeighborhood(report, 1, std::nullopt, 0.5)
+        .retainedPieceIndices.size() == 7);
+    CHECK_THROWS(selectFiberTraceReferenceNeighborhood(report, 1, -1.0, 0.5));
+    CHECK_THROWS(selectFiberTraceReferenceNeighborhood(report, 1, 2.0, 0.0));
+}
+
 TEST_CASE("Largest winding component honors cutoff and signed evidence")
 {
     const auto source = lines(4);

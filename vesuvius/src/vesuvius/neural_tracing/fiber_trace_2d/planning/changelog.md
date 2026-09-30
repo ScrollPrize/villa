@@ -1,3 +1,30 @@
+## 2026-09-28 — Ordinary-only N2 solve/readout
+
+- Same548 N2 source fibers solved without reference nodes or cross factors;
+  original IDs verified exactly and no largest-component filtering. Special
+  post-split reference attachments are unchanged and used only for readout.
+- Full-coverage gauge0 correctness/shift scores:3/10=15.38%/19.23%,
+  10/3=7.69%/15.38%,10/10=15.38%/34.62%. All28 gauge readouts retained;
+  gauge0 covers98.78% of reference observations. Ties and partial-gauge
+  limitations explicit; no fabricated all-gauge score or tuning promotion.
+- Native123/Python27 tests pass; all three runs complete. Full ladders and
+  provenance in volume-cartographer/docs/fiber_benchmark_runs/2026-09-28-n2-unconditioned.*.
+
+## 2026-09-28 — Complete-graph fixed-reference neighborhood diagnostic
+
+- BP-only now retains all winding components by default; legacy largest-only
+  filtering requires an explicit flag. No implicit loss of remote source pieces.
+- Added whole-source N-winding reference neighborhood selection, canonical fixed
+  references, shared combined-graph assembly and per-source/piece/continuation
+  diagnostics. Ordinary H/V/winding/defect states remain joint and free.
+- N2 retains548/2778 sources (19.73%). D10/C10 disables7.04% of pieces with1.29%
+  active continuation jumps, versus8.66%/1.40% for the same fibers scored from
+  the all-fiber solve. Cheaper step cost trades defects for substantially more
+  jumps. All220 reference pieces fixed; all-graph keeps665 unanchored gauges.
+- Four trials completed;123 native and26 Python tests pass. Full results,
+  provenance, commands and limitations in
+  volume-cartographer/docs/fiber_benchmark_runs/2026-09-28-reference-neighborhood.md.
+
 ## 2026-09-27 — Preserve certified constraints across piece splitting
 
 - Fixed post-split support filtering/clipping and source-pair parallel evidence

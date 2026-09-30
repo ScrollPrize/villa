@@ -157,6 +157,9 @@ struct Options {
     std::filesystem::path referenceFiberDirectory;
     std::string referenceFiberTag;
     bool referenceConditioningDiagnostic = false;
+    // Negative sentinel denotes the matched all-fiber control.
+    std::optional<double> referenceNeighborhoodWindings;
+    bool referenceNeighborhoodUnconditioned = false;
     bool referencePruneOffenders = false;
     vc::fiber_tracer::FiberTraceConditionedOffenderConfig
         referencePruneConfig;
@@ -184,6 +187,7 @@ struct Options {
     vc::fiber_tracer::FiberTraceWindingSolver windingSolver =
         vc::fiber_tracer::FiberTraceWindingSolver::JointGrid;
     bool windingFixedOrientation = false;
+    bool windingLargestComponentOnly = false;
     std::optional<std::size_t> windingMessageIterations;
     double windingDefectCost = 100.0;
     double pieceBreakCost = 0.0;
@@ -466,7 +470,10 @@ void usage(const char* executable)
               << "  --bp-residual F           message residual tolerance [1e-8]\n"
               << "  --bp-balance-tolerance F  target/field tolerance [1e-3]\n"
               << "  --winding-solver MODE     joint-grid, alternating, ceres, or ordered-cuts [joint-grid]\n"
+              << "  --reference-neighborhood-windings N|all  fixed-reference whole-fiber diagnostic\n"
+              << "  --reference-neighborhood-unconditioned  solve selected ordinary fibers only; independent reference readout\n"
               << "  --winding-fixed-orientation  solve H/V/Mixed first, then only winding\n"
+              << "  --winding-largest-component-only  legacy BP-only filtering (default: keep all components)\n"
               << "  --winding-defect-cost F   winding-stage Defect cost per constraint [100]\n"
               << "  --continuity-defect-mass all|ordinary|winding-ordinary|prepass-ordinary [all]\n"
               << "  --winding-decode-repair N deterministic local label optimization sweeps [0]\n"
@@ -772,6 +779,23 @@ Options parse(int argc, char** argv)
             options.lasagnaReplayStepBaseVoxels = number(
                 index, argc, argv, "--lasagna-step");
             options.hasDirectReplayOption = true;
+        } else if (argument == "--reference-neighborhood-unconditioned") {
+            options.referenceNeighborhoodUnconditioned = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--reference-neighborhood-windings") {
+            const auto cutoff = value(index, argc, argv, "--reference-neighborhood-windings");
+            if (cutoff == "all") {
+                options.referenceNeighborhoodWindings = -1.0;
+            } else {
+                std::size_t used = 0;
+                const double number = std::stod(cutoff, &used);
+                if (used != cutoff.size() || !std::isfinite(number) || number < 0.0)
+                    fail("--reference-neighborhood-windings requires nonnegative N or all");
+                options.referenceNeighborhoodWindings = number;
+            }
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
         } else if (argument == "--reference-conditioning-diagnostic") {
             options.referenceConditioningDiagnostic = true;
             options.hasAblationOnlyOption = true;
@@ -1183,6 +1207,10 @@ Options parse(int argc, char** argv)
                 fail("--winding-solver must be joint-grid, alternating, ceres, or ordered-cuts");
             }
             options.hasWindingSolverOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--winding-largest-component-only") {
+            options.windingLargestComponentOnly = true;
             options.hasAblationOnlyOption = true;
             options.hasConstraintOnlyOption = true;
         } else if (argument == "--winding-fixed-orientation") {
@@ -1883,6 +1911,25 @@ Options parse(int argc, char** argv)
         if (options.hasReferenceFiberTagOption &&
             options.referenceFiberTag.empty()) {
             fail("--reference-fiber-tag must not be empty");
+        }
+        if (options.referenceNeighborhoodUnconditioned &&
+            (!options.referenceNeighborhoodWindings || !options.referenceIndependent))
+            fail("--reference-neighborhood-unconditioned requires a neighborhood cutoff and --reference-independent");
+        if (options.referenceNeighborhoodUnconditioned &&
+            (options.hasWindingWeightSearchOption || options.hasWindingWeightSearchLocalOption))
+            fail("Unconditioned neighborhood evaluation does not allow reference-driven weight search");
+        if (options.referenceNeighborhoodWindings &&
+            (!options.hasReferenceFiberDirectoryOption || !options.bpOnly ||
+             options.bpInference != vc::fiber_tracer::FiberTraceBeliefInference::SumProductMixed ||
+             options.windingSolver != vc::fiber_tracer::FiberTraceWindingSolver::JointGrid ||
+             options.windingFixedOrientation || options.windingLargestComponentOnly ||
+             options.referenceConditioningDiagnostic || options.referencePruneOffenders ||
+             !options.windingContinuityCostByDistance || !options.windingContinuityCutCost ||
+             *options.windingContinuityCutCost <= 0.0)) {
+            fail("Reference neighborhood requires references, BP-only joint-grid sum-product-mixed, finite distance continuation, no prefilter/fixed orientation/pruning");
+        }
+        if (options.windingLargestComponentOnly && !options.bpOnly) {
+            fail("--winding-largest-component-only requires --bp-only");
         }
         if (options.referenceConditioningDiagnostic &&
             !options.hasReferenceFiberDirectoryOption) {
@@ -5258,40 +5305,17 @@ std::string formatReferenceCeresLeastSquaresBenchmark(
     return output.str();
 }
 
-FixedReferenceConditionedProblem makeFixedReferenceConditionedProblem(
+FixedReferenceConditionedProblem assembleFixedReferenceConditionedProblem(
     const ReferenceFiberDiagnostics& reference,
     const ReferenceBpCrossConstraints& cross,
     const std::vector<vc::fiber_tracer::FiberletCropTraceLine>& bpSourceLines,
     const vc::fiber_tracer::FiberTraceConstraintReport& bpConstraints,
-    const vc::fiber_tracer::FiberTraceInterleavedWindingReport& baseline,
-    const vc::fiber_tracer::FiberTraceReferenceWindingBenchmark& calibration,
-    const vc::fiber_tracer::FiberTraceLabelingConfig& labeling,
-    double phase)
+    const vc::fiber_tracer::FiberTraceLabelingConfig& labeling)
 {
-    constexpr double epsilon = 1.0e-8;
-    if (cross.referencePieces != reference.pieceLines.size() ||
-        cross.report.pieces.size() !=
-            cross.referencePieces + bpConstraints.pieces.size() ||
-        !reference.constraintReport ||
-        baseline.mapLatentCoordinate.size() != bpConstraints.pieces.size() ||
-        baseline.integerGaugeByPiece.size() != bpConstraints.pieces.size() ||
-        baseline.componentByPiece.size() != bpConstraints.pieces.size()) {
-        throw std::invalid_argument(
-            "Fixed-reference conditioned inputs do not match BP pieces");
-    }
-    if (!std::isfinite(phase) || phase < 0.0 || phase > 0.5 ||
-        (calibration.globalSign != -1 && calibration.globalSign != 1)) {
-        throw std::invalid_argument(
-            "Fixed-reference conditioned calibration is invalid");
-    }
-    std::map<std::size_t, double> offsetByGauge;
-    for (const auto& gauge : calibration.gauges) {
-        if (!offsetByGauge.emplace(gauge.integerGauge, gauge.offset).second) {
-            throw std::invalid_argument(
-                "Fixed-reference gauge calibration is ambiguous");
-        }
-    }
-
+    if (!reference.constraintReport ||
+        cross.referencePieces != reference.constraintReport->pieces.size() ||
+        cross.report.pieces.size() != cross.referencePieces + bpConstraints.pieces.size())
+        throw std::invalid_argument("Fixed-reference combined inputs do not match");
     FixedReferenceConditionedProblem result;
     result.referencePieces = cross.referencePieces;
     result.lines.reserve(reference.lines.size() + bpSourceLines.size());
@@ -5335,6 +5359,45 @@ FixedReferenceConditionedProblem makeFixedReferenceConditionedProblem(
         remapped.pieceB += result.referencePieces;
         result.constraints.constraints.push_back(std::move(remapped));
     }
+    return result;
+}
+
+FixedReferenceConditionedProblem makeFixedReferenceConditionedProblem(
+    const ReferenceFiberDiagnostics& reference,
+    const ReferenceBpCrossConstraints& cross,
+    const std::vector<vc::fiber_tracer::FiberletCropTraceLine>& bpSourceLines,
+    const vc::fiber_tracer::FiberTraceConstraintReport& bpConstraints,
+    const vc::fiber_tracer::FiberTraceInterleavedWindingReport& baseline,
+    const vc::fiber_tracer::FiberTraceReferenceWindingBenchmark& calibration,
+    const vc::fiber_tracer::FiberTraceLabelingConfig& labeling,
+    double phase)
+{
+    constexpr double epsilon = 1.0e-8;
+    if (cross.referencePieces != reference.pieceLines.size() ||
+        cross.report.pieces.size() !=
+            cross.referencePieces + bpConstraints.pieces.size() ||
+        !reference.constraintReport ||
+        baseline.mapLatentCoordinate.size() != bpConstraints.pieces.size() ||
+        baseline.integerGaugeByPiece.size() != bpConstraints.pieces.size() ||
+        baseline.componentByPiece.size() != bpConstraints.pieces.size()) {
+        throw std::invalid_argument(
+            "Fixed-reference conditioned inputs do not match BP pieces");
+    }
+    if (!std::isfinite(phase) || phase < 0.0 || phase > 0.5 ||
+        (calibration.globalSign != -1 && calibration.globalSign != 1)) {
+        throw std::invalid_argument(
+            "Fixed-reference conditioned calibration is invalid");
+    }
+    std::map<std::size_t, double> offsetByGauge;
+    for (const auto& gauge : calibration.gauges) {
+        if (!offsetByGauge.emplace(gauge.integerGauge, gauge.offset).second) {
+            throw std::invalid_argument(
+                "Fixed-reference gauge calibration is ambiguous");
+        }
+    }
+
+    auto result = assembleFixedReferenceConditionedProblem(
+        reference, cross, bpSourceLines, bpConstraints, labeling);
     struct RawGauge {
         double coordinate = 0.0;
         int phaseSign = 1;
@@ -5876,6 +5939,268 @@ void validateFixedReferenceConditionedResult(const FixedReferenceConditionedProb
             throw std::logic_error("Conditioned solve altered a fixed reference state");
         }
     }
+}
+
+void runReferenceNeighborhoodDiagnostic(
+    const Options& options,
+    const ReferenceFiberDiagnostics& reference,
+    const ReferenceBpCrossConstraints& cross,
+    const std::vector<vc::fiber_tracer::FiberletCropTraceLine>& sourceLines,
+    const vc::fiber_tracer::FiberTraceConstraintReport& sourceConstraints,
+    const std::vector<std::size_t>& originalTraceIndices,
+    const vc::fiber_tracer::FiberTraceWindingBeliefPropagationConfig& windingConfig,
+    const cv::Vec3d& cropMinimum, const cv::Vec3d& cropMaximum)
+{
+    using namespace vc::fiber_tracer;
+    using Json = nlohmann::json;
+    if (!options.jointGrid.fixedPhaseMagnitude ||
+        *options.jointGrid.fixedPhaseMagnitude != 0.5 ||
+        !options.jointGrid.fixedMeasurementScale || !reference.constraintReport)
+        throw std::invalid_argument("Reference neighborhood needs fixed phase 0.5 and scale");
+
+    // The reference gauge is independent of any ordinary solution. Audit normal
+    // components separately: disconnected alignment components need not agree.
+    std::map<std::size_t, std::array<double, 2>> agreement;
+    for (const auto& c : reference.constraintReport->constraints) {
+        if (c.hardContinuity || c.perpendicularScore < c.parallelScore ||
+            !(c.perpendicularScore > 0.0) || !c.signedWindingDelta ||
+            !std::isfinite(*c.signedWindingDelta) || *c.signedWindingDelta == 0.0)
+            continue;
+        const double delta = 0.5 * (static_cast<double>(reference.sourceIdsByPiece.at(c.pieceB)) -
+            static_cast<double>(reference.sourceIdsByPiece.at(c.pieceA)));
+        if (delta == 0.0) continue;
+        const double weight = c.evidenceWeight * c.perpendicularScore;
+        if (!std::isfinite(weight) || weight <= 0.0) continue;
+        auto& mass = agreement[c.windingNormalComponent.value_or(std::numeric_limits<std::size_t>::max())];
+        mass[delta * *c.signedWindingDelta > 0.0 ? 0 : 1] += weight;
+    }
+    int sign = 0;
+    Json signAudit = Json::array();
+    for (const auto& [component, mass] : agreement) {
+        if (mass[0] == mass[1])
+            throw std::runtime_error("Reference normal-component sign is ambiguous");
+        const int preferred = mass[0] > mass[1] ? 1 : -1;
+        signAudit.push_back({{"normal_component", component},
+            {"positive_agreement_mass", mass[0]}, {"negative_agreement_mass", mass[1]},
+            {"chosen_sign", preferred}});
+        if (sign != 0 && sign != preferred)
+            throw std::runtime_error("Reference normal components require incompatible winding gauges");
+        sign = preferred;
+    }
+    if (sign == 0) throw std::runtime_error("No signed reference-reference evidence for canonical gauge");
+    Json uncalibratedCrossComponents = Json::array();
+    std::set<std::size_t> seenCrossComponents;
+    for (const auto& c : cross.report.constraints) {
+        const auto component = c.windingNormalComponent.value_or(std::numeric_limits<std::size_t>::max());
+        if (!agreement.contains(component) && seenCrossComponents.insert(component).second)
+            uncalibratedCrossComponents.push_back(component);
+    }
+    auto full = assembleFixedReferenceConditionedProblem(
+        reference, cross, sourceLines, sourceConstraints, options.labeling);
+    const std::optional<double> cutoff = *options.referenceNeighborhoodWindings < 0.0
+        ? std::nullopt : options.referenceNeighborhoodWindings;
+    const auto selected = selectFiberTraceReferenceNeighborhood(
+        full.constraints, full.referencePieces, cutoff, *options.jointGrid.fixedMeasurementScale);
+    FixedReferenceConditionedProblem problem;
+    problem.referencePieces = full.referencePieces;
+    problem.constraints = selected.report;
+    for (const auto source : selected.retainedTraceIndices)
+        problem.lines.push_back(full.lines.at(source));
+    problem.fixedStates.resize(problem.constraints.pieces.size());
+    for (std::size_t p = 0; p < problem.referencePieces; ++p) {
+        if (selected.retainedPieceIndices.at(p) != p)
+            throw std::logic_error("Reference neighborhood lost a reference piece");
+        const auto id = reference.sourceIdsByPiece.at(p);
+        problem.fixedStates[p] = {true, id % 2 == 0
+            ? FiberTraceFixedOrientation::Horizontal : FiberTraceFixedOrientation::Vertical,
+            sign * static_cast<int>(id / 2), sign};
+    }
+    const auto topology = prepareFiberTraceBeliefTopology(
+        problem.lines, problem.constraints, cropMinimum, cropMaximum);
+    auto config = options.jointGrid;
+    static_cast<FiberTraceWindingBeliefPropagationConfig&>(config) = windingConfig;
+    config.mixedUnaryCost = options.windingDefectCost;
+    config.pieceBreakCost = options.pieceBreakCost;
+    config.orientationTemperature = options.bp.horizontalnessTemperature;
+    std::cout << "reference neighborhood solve status=started cutoff="
+              << (cutoff ? std::to_string(*cutoff) : "all")
+              << " pieces=" << problem.constraints.pieces.size()
+              << " full_pieces=" << full.constraints.pieces.size() << std::endl;
+    const auto started = std::chrono::steady_clock::now();
+    const auto result = solveFiberTraceJointGridWindingBeliefPropagation(
+        problem.constraints, topology, config, {}, {}, problem.fixedStates);
+    const double solveSeconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - started).count();
+    validateFixedReferenceConditionedResult(problem, result);
+    for (std::size_t p = 0; p < problem.referencePieces; ++p) {
+        const double expected = sign * 0.5 * reference.sourceIdsByPiece.at(p);
+        if (std::abs(result.mapLatentCoordinate.at(p) - expected) > 1.e-8 ||
+            result.componentPhaseSign.at(result.componentByPiece.at(p)) != sign)
+            throw std::logic_error("Reference neighborhood changed fixed physical coordinates");
+    }
+    const auto oldOrdinaryTrace = [&](std::size_t p) {
+        const auto oldPiece = selected.retainedPieceIndices.at(p);
+        return full.constraints.pieces.at(oldPiece).traceIndex - reference.lines.size();
+    };
+    std::map<std::size_t, std::vector<std::size_t>> byTrace;
+    std::map<std::size_t, std::array<std::size_t, 2>> gauges;
+    Json pieceRows = Json::array(), continuationRows = Json::array(), traceRows = Json::array();
+    std::size_t disabled = 0, ordinaryPieces = 0;
+    std::ostringstream pieceCsv, edgeCsv;
+    pieceCsv << "source_trace,piece,begin_arc,end_arc,active,orientation,winding,q\n";
+    edgeCsv << "source_trace,piece_a,piece_b,active_a,active_b,absolute_winding_jump\n";
+    for (std::size_t p = 0; p < problem.constraints.pieces.size(); ++p) {
+        const bool ref = p < problem.referencePieces;
+        ++gauges[result.integerGaugeByPiece.at(p)][ref ? 0 : 1];
+        if (ref) continue;
+        ++ordinaryPieces;
+        const auto source = oldOrdinaryTrace(p);
+        byTrace[source].push_back(p);
+        const auto& piece = problem.constraints.pieces[p];
+        const bool active = result.windingValid.at(p) != 0;
+        disabled += !active;
+        const auto oldPiece = selected.retainedPieceIndices[p] - full.referencePieces;
+        const auto originalSource = originalTraceIndices.at(source);
+        pieceRows.push_back({{"source_trace", originalSource}, {"original_piece", oldPiece},
+            {"begin_arc", piece.beginArcBaseVoxels}, {"end_arc", piece.endArcBaseVoxels},
+            {"active", active}, {"orientation", static_cast<int>(result.mapOrientationByPiece[p])},
+            {"winding", active ? Json(result.mapWinding[p]) : Json(nullptr)},
+            {"q", active ? Json(result.mapLatentCoordinate[p]) : Json(nullptr)}});
+        pieceCsv << originalSource << ',' << oldPiece << ',' << piece.beginArcBaseVoxels << ','
+            << piece.endArcBaseVoxels << ',' << active << ','
+            << static_cast<int>(result.mapOrientationByPiece[p]) << ',';
+        if (active) pieceCsv << result.mapWinding[p] << ',' << result.mapLatentCoordinate[p];
+        else pieceCsv << ',';
+        pieceCsv << '\n';
+    }
+    std::size_t continuation = 0, activeEdges = 0, jumps = 0, defectEdges = 0;
+    double jumpSum = 0.0, jumpMax = 0.0;
+    std::map<std::size_t, std::size_t> jumpsByTrace;
+    std::map<std::size_t, std::vector<std::pair<std::size_t, std::size_t>>> jumpEdgesByTrace;
+    for (const auto& c : problem.constraints.constraints) {
+        if (!c.hardContinuity || c.pieceA < problem.referencePieces || c.pieceB < problem.referencePieces)
+            continue;
+        ++continuation;
+        const bool a = result.windingValid[c.pieceA], b = result.windingValid[c.pieceB];
+        const double jump = a && b ? std::abs(result.mapLatentCoordinate[c.pieceB] - result.mapLatentCoordinate[c.pieceA]) : 0.0;
+        if (a && b) ++activeEdges; else ++defectEdges;
+        if (jump > 1.e-8) {
+            ++jumps; ++jumpsByTrace[oldOrdinaryTrace(c.pieceA)];
+            jumpEdgesByTrace[oldOrdinaryTrace(c.pieceA)].emplace_back(c.pieceA, c.pieceB);
+        }
+        jumpSum += jump;
+        jumpMax = std::max(jumpMax, jump);
+        const auto source = originalTraceIndices.at(oldOrdinaryTrace(c.pieceA));
+        const auto pa = selected.retainedPieceIndices[c.pieceA] - full.referencePieces;
+        const auto pb = selected.retainedPieceIndices[c.pieceB] - full.referencePieces;
+        continuationRows.push_back({{"source_trace", source}, {"piece_a", pa}, {"piece_b", pb},
+            {"active_a", a}, {"active_b", b}, {"absolute_winding_jump", a && b ? Json(jump) : Json(nullptr)}});
+        edgeCsv << source << ',' << pa << ',' << pb << ',' << a << ',' << b << ',';
+        if (a && b) edgeCsv << jump;
+        edgeCsv << '\n';
+    }
+    std::size_t disabledRuns = 0, affectedTraces = 0, jumpRuns = 0;
+    double totalLength = 0.0, disabledLength = 0.0;
+    for (auto& [source, indices] : byTrace) {
+        std::sort(indices.begin(), indices.end(), [&](auto a, auto b) {
+            const auto aa = problem.constraints.pieces[a].beginArcBaseVoxels;
+            const auto bb = problem.constraints.pieces[b].beginArcBaseVoxels;
+            return aa < bb || (aa == bb && a < b);
+        });
+        std::size_t defects = 0, runs = 0;
+        double unionEnd = -std::numeric_limits<double>::infinity();
+        double disabledEnd = unionEnd, previousEnd = unionEnd, length = 0.0, defectLength = 0.0;
+        bool previousDisabled = false;
+        for (auto p : indices) {
+            const auto& piece = problem.constraints.pieces[p];
+            const double begin = piece.beginArcBaseVoxels, end = piece.endArcBaseVoxels;
+            length += std::max(0.0, end - std::max(begin, unionEnd));
+            unionEnd = std::max(unionEnd, end);
+            const bool inactive = !result.windingValid[p];
+            if (inactive) {
+                ++defects;
+                if (!previousDisabled || begin > previousEnd + 1.e-8) ++runs;
+                defectLength += std::max(0.0, end - std::max(begin, disabledEnd));
+                disabledEnd = std::max(disabledEnd, end);
+            }
+            previousDisabled = inactive;
+            previousEnd = end;
+        }
+        totalLength += length; disabledLength += defectLength; disabledRuns += runs;
+        const auto traceJumps = jumpsByTrace[source];
+        // Connected jump-edge chains along the original source, not proximity
+        // in the global piece vector (which can interleave unrelated fibers).
+        std::map<std::size_t, std::size_t> jumpParent;
+        const auto root = [&](std::size_t p) {
+            while (jumpParent.at(p) != p) p = jumpParent.at(p);
+            return p;
+        };
+        for (const auto& [a, b] : jumpEdgesByTrace[source]) {
+            jumpParent.try_emplace(a, a); jumpParent.try_emplace(b, b);
+            jumpParent[root(b)] = root(a);
+        }
+        std::size_t traceJumpRuns = 0;
+        for (const auto& [p, parent] : jumpParent) traceJumpRuns += p == parent;
+        jumpRuns += traceJumpRuns;
+        affectedTraces += defects > 0 || traceJumps > 0;
+        traceRows.push_back({{"source_trace", originalTraceIndices.at(source)}, {"pieces", indices.size()},
+            {"disabled_pieces", defects}, {"disabled_runs", runs}, {"winding_jumps", traceJumps},
+            {"winding_jump_runs", traceJumpRuns},
+            {"length_base_voxels", length}, {"disabled_length_base_voxels", defectLength}});
+    }
+    std::size_t unanchored = 0, referenceOnly = 0;
+    for (const auto& [id, counts] : gauges) {
+        unanchored += counts[0] == 0; referenceOnly += counts[1] == 0;
+    }
+    const auto pct = [](double value, double count) { return count > 0 ? 100.0 * value / count : 0.0; };
+    Json summary = {{"ordinary_traces_all", sourceLines.size()}, {"ordinary_traces_retained", byTrace.size()},
+        {"ordinary_traces_retained_percent", pct(byTrace.size(), sourceLines.size())},
+        {"ordinary_pieces_all", sourceConstraints.pieces.size()}, {"ordinary_pieces_retained", ordinaryPieces},
+        {"ordinary_pieces_retained_percent", pct(ordinaryPieces, sourceConstraints.pieces.size())},
+        {"combined_factors_all", full.constraints.constraints.size()},
+        {"combined_factors_retained", problem.constraints.constraints.size()},
+        {"disabled_pieces", disabled}, {"disabled_pieces_percent", pct(disabled, ordinaryPieces)},
+        {"ordinary_length_base_voxels", totalLength}, {"disabled_length_base_voxels", disabledLength},
+        {"disabled_length_percent", pct(disabledLength, totalLength)}, {"disabled_runs", disabledRuns},
+        {"affected_traces", affectedTraces}, {"affected_traces_percent", pct(affectedTraces, byTrace.size())},
+        {"continuation_edges", continuation}, {"active_active_edges", activeEdges}, {"defect_incident_edges", defectEdges},
+        {"nonzero_winding_jumps", jumps}, {"nonzero_winding_jumps_percent", pct(jumps, activeEdges)},
+        {"absolute_jump_sum", jumpSum}, {"maximum_jump", jumpMax}, {"integer_gauge_components", gauges.size()},
+        {"winding_jump_runs", jumpRuns},
+        {"ordinary_unanchored_components", unanchored}, {"reference_only_components", referenceOnly},
+        {"reference_pieces_fixed", problem.referencePieces}, {"solver_status", result.status},
+        {"message_iterations", result.messageIterations}, {"decoded_energy", result.decodedEnergy},
+        {"solve_seconds", solveSeconds}};
+    Json factorAgreement = Json::object();
+    for (int group = 0; group < 3; ++group) {
+        auto groupResult = result;
+        std::erase_if(groupResult.factorDiagnostics, [&](const auto& factor) {
+            const bool a = factor.pieceA < problem.referencePieces;
+            const bool b = factor.pieceB < problem.referencePieces;
+            return (a && b ? 0 : a || b ? 1 : 2) != group;
+        });
+        const auto agreementSummary = summarizeFiberTraceConstraintAgreement(problem.constraints, groupResult);
+        Json classes = Json::object();
+        for (std::size_t i = 0; i < agreementSummary.classes.size(); ++i) {
+            const auto& count = agreementSummary.classes[i];
+            classes[fiberTraceConstraintAgreementClassName(static_cast<FiberTraceConstraintAgreementClass>(i))] = {
+                {"prepared", count.prepared}, {"evaluated", count.evaluated},
+                {"defect_neutralized", count.defectNeutralized}, {"infringed", count.infringed}};
+        }
+        factorAgreement[group == 0 ? "reference_only" : group == 1 ? "reference_cross" : "ordinary"] = classes;
+    }
+    const Json document = {{"version", 1}, {"cutoff_windings", cutoff ? Json(*cutoff) : Json(nullptr)},
+        {"measurement_scale", result.measurementScale}, {"canonical_reference_sign", sign},
+        {"reference_sign_audit", signAudit}, {"summary", summary}, {"traces", traceRows},
+        {"cross_normal_components_without_reference_sign_evidence", uncalibratedCrossComponents},
+        {"factor_agreement", factorAgreement},
+        {"pieces", pieceRows}, {"continuations", continuationRows},
+        {"interpretation", "Ordinary jumps/disablements are solver diagnostics, not known geometric ground-truth errors."}};
+    const auto prefix = options.output.string() + "_reference_neighborhood";
+    vc::core::util::atomicWriteString(prefix + ".json", document.dump(2) + "\n");
+    vc::core::util::atomicWriteString(prefix + "_pieces.csv", pieceCsv.str());
+    vc::core::util::atomicWriteString(prefix + "_continuations.csv", edgeCsv.str());
+    std::cout << "reference neighborhood complete " << summary.dump() << std::endl;
 }
 
 std::string formatFixedReferenceConditionedComparison(
@@ -8274,6 +8599,64 @@ int main(int argc, char** argv)
                             auto bpSourceLines = diagnosticLines;
                             auto bpSourceOriginalTraceIndices = diagnosticOriginalTraceIndices;
                             auto bpSourceDirections = diagnosticDirections;
+                            std::optional<ReferenceBpCrossConstraints> selectedNeighborhoodCross;
+                            if (options.referenceNeighborhoodWindings) {
+                                if (!referenceDiagnostics || !alignedNormalField)
+                                    throw std::logic_error("Reference neighborhood needs references and aligned normals");
+                                const auto pieceLines = vc::fiber_tracer::makeFiberTraceConstraintPieceLines(
+                                    diagnosticLines, selectedBpConstraints);
+                                const auto cross = extractReferenceBpCrossConstraints(
+                                    *referenceDiagnostics, pieceLines, diagnosticLines,
+                                    selectedBpConstraints, options, normals, *alignedNormalField);
+                                if (!options.referenceNeighborhoodUnconditioned) {
+                                    runReferenceNeighborhoodDiagnostic(options, *referenceDiagnostics,
+                                        cross, diagnosticLines, selectedBpConstraints,
+                                        diagnosticOriginalTraceIndices, windingConfig,
+                                        artifact.minimumBaseXYZ, artifact.maximumBaseXYZ);
+                                    return;
+                                }
+                                if (!options.jointGrid.fixedMeasurementScale)
+                                    throw std::invalid_argument("Neighborhood selection requires a fixed measurement scale");
+                                const auto combined = assembleFixedReferenceConditionedProblem(
+                                    *referenceDiagnostics, cross, diagnosticLines,
+                                    selectedBpConstraints, options.labeling);
+                                const std::optional<double> cutoff = *options.referenceNeighborhoodWindings < 0.0
+                                    ? std::nullopt : options.referenceNeighborhoodWindings;
+                                const auto neighborhood = vc::fiber_tracer::selectFiberTraceReferenceNeighborhood(
+                                    combined.constraints, combined.referencePieces, cutoff,
+                                    *options.jointGrid.fixedMeasurementScale);
+                                std::vector<std::size_t> ordinaryPieces;
+                                for (auto p : neighborhood.retainedPieceIndices)
+                                    if (p >= combined.referencePieces)
+                                        ordinaryPieces.push_back(p - combined.referencePieces);
+                                // Subset the ORIGINAL ordinary report, not the combined
+                                // report: reference nodes and cross factors never enter BP.
+                                const auto subset = vc::fiber_tracer::subsetFiberTraceConstraintReport(
+                                    selectedBpConstraints, ordinaryPieces);
+                                bpConstraints = subset.report;
+                                bpSourceLines.clear();
+                                bpSourceOriginalTraceIndices.clear();
+                                bpSourceDirections.clear();
+                                for (const auto old : subset.retainedTraceIndices) {
+                                    bpSourceLines.push_back(diagnosticLines.at(old));
+                                    bpSourceOriginalTraceIndices.push_back(diagnosticOriginalTraceIndices.at(old));
+                                    bpSourceDirections.push_back(diagnosticDirections.at(old));
+                                }
+                                selectedNeighborhoodCross = subsetReferenceBpCrossConstraints(cross, ordinaryPieces);
+                                const nlohmann::json cohort = {
+                                    {"reference_nodes_in_solve", 0}, {"reference_cross_factors_in_solve", 0},
+                                    {"ordinary_source_trace_ids", bpSourceOriginalTraceIndices},
+                                    {"ordinary_original_piece_ids", ordinaryPieces},
+                                    {"ordinary_pieces", bpConstraints.pieces.size()},
+                                    {"ordinary_factors", bpConstraints.constraints.size()},
+                                    {"cross_factors_for_readout_only", selectedNeighborhoodCross->report.constraints.size()}};
+                                vc::core::util::atomicWriteString(options.output.string() + "_neighborhood_cohort.json", cohort.dump(2) + "\n");
+                                std::cout << "ordinary-only reference neighborhood selected_sources="
+                                    << bpSourceLines.size() << " pieces=" << bpConstraints.pieces.size()
+                                    << " factors=" << bpConstraints.constraints.size()
+                                    << " reference_nodes_in_solve=0 reference_cross_factors_in_solve=0"
+                                    << " conditioned_initialization=0\n" << std::flush;
+                            }
                             std::vector<unsigned char> bpSourcePieceOne;
                             bpSourcePieceOne.reserve(bpConstraints.pieces.size());
                             for (const auto& piece : bpConstraints.pieces) {
@@ -8363,7 +8746,7 @@ int main(int argc, char** argv)
                             std::size_t componentRounds = 0;
                             while (true) {
                                 if (bpConstraints.pieces.empty()) {
-                                    throw std::runtime_error("BP main winding component is empty");
+                                    throw std::runtime_error("BP winding graph is empty");
                                 }
                                 fixedOrientations.clear();
                                 if (options.windingFixedOrientation) {
@@ -8371,6 +8754,11 @@ int main(int argc, char** argv)
                                     fixedOrientations = vc::fiber_tracer::
                                         fixedFiberTraceOrientations(report);
                                 }
+                                // Reference connections are constructed below. Dropping
+                                // components here can discard fibers those references
+                                // would connect, or only part of a linked source fiber.
+                                if (!options.windingLargestComponentOnly)
+                                    break;
                                 const auto component = vc::fiber_tracer::
                                     selectLargestFiberTraceWindingComponent(
                                         bpConstraints,
@@ -8431,7 +8819,9 @@ int main(int argc, char** argv)
                             if (!options.windingFixedOrientation && !jointGrid)
                                 solveOrientation();
                             std::cout
-                                << "fiber BP main winding component"
+                                << "fiber BP component selection"
+                                << " policy=" << (options.windingLargestComponentOnly
+                                    ? "largest-only" : "all")
                                 << " rounds=" << componentRounds
                                 << " traces=" << inputTraces << "->"
                                 << bpConstraints.inputTraces
@@ -8452,8 +8842,8 @@ int main(int argc, char** argv)
                                 bpOriginalTraceIndices.push_back(bpSourceOriginalTraceIndices.at(piece.traceIndex));
                                 bpDirections.push_back(bpSourceDirections.at(piece.traceIndex));
                             }
-                            std::optional<ReferenceBpCrossConstraints> referenceBpConstraints;
-                            if (referenceDiagnostics && options.bpInference == vc::fiber_tracer::FiberTraceBeliefInference::SumProductMixed) {
+                            auto referenceBpConstraints = std::move(selectedNeighborhoodCross);
+                            if (!referenceBpConstraints && referenceDiagnostics && options.bpInference == vc::fiber_tracer::FiberTraceBeliefInference::SumProductMixed) {
                                 if (!alignedNormalField) {
                                     throw std::logic_error("Reference/BP benchmark requires aligned normals");
                                 }

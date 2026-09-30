@@ -51,6 +51,9 @@ def bp_metrics(log):
 
 
 def run(config):
+    if 'neighborhood_readout_report' in config:
+        from .neighborhood_readout_report import report
+        return report(config)
     if 'local_cost_sweep' in config:
         from .local_cost_sweep import run_sweep
         return run_sweep(config)

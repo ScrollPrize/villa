@@ -179,6 +179,13 @@ struct FiberTraceConstraintSubsetResult {
     std::vector<std::size_t> retainedConstraintIndices;
 };
 
+// References occupy a prefix of pieces and have distinct source trace IDs.
+// A null cutoff retains all pieces; otherwise orthogonal reference measurements
+// seed whole ordinary source traces (no transitive graph expansion).
+[[nodiscard]] FiberTraceConstraintSubsetResult selectFiberTraceReferenceNeighborhood(
+    const FiberTraceConstraintReport& report, std::size_t referencePieces,
+    std::optional<double> maximumWindings, double measurementScale);
+
 using FiberTraceWindingDistance = std::function<double(
     const cv::Vec3d& aBaseXYZ,
     const cv::Vec3d& bBaseXYZ,

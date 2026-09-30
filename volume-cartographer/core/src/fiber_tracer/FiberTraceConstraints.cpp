@@ -1712,6 +1712,43 @@ std::vector<FiberletCropTraceLine> makeFiberTraceConstraintPieceLines(
     return result;
 }
 
+FiberTraceConstraintSubsetResult selectFiberTraceReferenceNeighborhood(
+    const FiberTraceConstraintReport& report, std::size_t referencePieces,
+    std::optional<double> maximumWindings, double measurementScale)
+{
+    if (referencePieces > report.pieces.size() || !std::isfinite(measurementScale) ||
+        measurementScale <= 0.0 || (maximumWindings &&
+        (!std::isfinite(*maximumWindings) || *maximumWindings < 0.0)))
+        throw std::invalid_argument("Invalid reference neighborhood cutoff or scale");
+    std::vector<unsigned char> referenceTrace(report.inputTraces, 0);
+    std::vector<unsigned char> keepTrace(report.inputTraces, maximumWindings ? 0 : 1);
+    for (std::size_t p = 0; p < report.pieces.size(); ++p) {
+        const auto trace = report.pieces[p].traceIndex;
+        if (trace >= report.inputTraces)
+            throw std::invalid_argument("Reference neighborhood has an invalid source trace");
+        if (p < referencePieces) referenceTrace[trace] = keepTrace[trace] = 1;
+    }
+    for (std::size_t p = referencePieces; p < report.pieces.size(); ++p)
+        if (referenceTrace[report.pieces[p].traceIndex])
+            throw std::invalid_argument("Reference and ordinary pieces share a source trace");
+    for (const auto& c : report.constraints) {
+        if (c.pieceA >= report.pieces.size() || c.pieceB >= report.pieces.size())
+            throw std::invalid_argument("Reference neighborhood has an invalid constraint");
+        if (!maximumWindings || c.hardContinuity ||
+            (c.pieceA < referencePieces) == (c.pieceB < referencePieces) ||
+            !(c.perpendicularScore > 0.0) || c.perpendicularScore < c.parallelScore ||
+            !c.signedWindingDelta || !std::isfinite(*c.signedWindingDelta) ||
+            std::abs(*c.signedWindingDelta) * measurementScale > *maximumWindings)
+            continue;
+        const auto ordinary = c.pieceA < referencePieces ? c.pieceB : c.pieceA;
+        keepTrace[report.pieces[ordinary].traceIndex] = 1;
+    }
+    std::vector<std::size_t> retained;
+    for (std::size_t p = 0; p < report.pieces.size(); ++p)
+        if (keepTrace[report.pieces[p].traceIndex]) retained.push_back(p);
+    return subsetFiberTraceConstraintReport(report, retained);
+}
+
 FiberTraceConstraintSubsetResult subsetFiberTraceConstraintReport(const FiberTraceConstraintReport& constraints, std::span<const std::size_t> retainedPieceIndices)
 {
     const std::size_t missing = std::numeric_limits<std::size_t>::max();

@@ -1,10 +1,8 @@
-# Winding-step continuation tuning
+# N2 ordinary-only status
 
-- [x] Commit checkpoint dd8c1331e.
-- [x] Write task/plan.
-- [x] Independent review and source audit.
-- [x] Coarse finite winding-step sweep; no baseline win.
-- [ ] Refine parameters and formulation fixes.
-- [ ] Full finalist benchmark,tests,docs/log.
-
-Iterations1–5complete; cold batch3/4complete (48total). Best fine initial26.92%, still below legacy38.46%. Native122 and targeted Python15tests pass. Filesystem recovery intermittent:23:26UTC full jobs and refinement startup again D/wait_transaction_locked, md0flush busy. Remaining1cold+4refine+3full incomplete. No default promotion or goal-completion claim; no more batches while filesystem blocked.
+- [x] Inspect existing diagnostics/readout and plan.
+- [x] Independent plan and implementation review.
+- [x] Wire shared selection into ordinary-only solver path.
+- [x] Tests and build (123 native,27 Python).
+- [x] Three N2 runs and correctness/shift metrics.
+- [x] Report ladders, limitations and persist logs; all runs finished.

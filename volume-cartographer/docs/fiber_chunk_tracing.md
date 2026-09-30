@@ -2449,6 +2449,70 @@ missing conditioned/removal scores are null. Matched full-run ladders validate
 the shortcut. Final candidates must receive the full benchmark. All trials use
 the same certified graph, frozen traces and500-message budget. See
 [winding-step search](fiber_benchmark_runs/2026-09-27-winding-step-search.md).
+### Winding component selection
+
+BP-only evaluation now retains **all winding components** by default, including
+components not connected to the central seed. Reference connections are built
+against that complete eligible graph. The previous largest-component filtering
+is available only through explicit `--winding-largest-component-only` for
+historical reproduction. Logs record `fiber BP component selection policy=all`
+or `policy=largest-only`, with before/after trace, piece and constraint counts.
+This changes the evaluated cohort; historical scores are not automatically
+comparable to runs retaining all components. Disconnected components can have
+independent winding gauges; keeping them does not establish their relative
+absolute winding offsets.
+
+### Restricted fixed-reference diagnostic
+
+`--reference-neighborhood-windings 2` selects ordinary source fibers with an
+orthogonal reference cross-constraint whose unquantized absolute signed normal
+distance times the fixed measurement scale is at most 2. Selection retains
+every piece of those source fibers and every induced factor, including their
+reference constraints beyond the selection radius. It is not recursive graph
+expansion. `all` instead supplies a matched all-fiber control.
+
+Requires BP-only joint-grid sum-product-mixed, fixed phase 0.5 and measurement
+scale, positive `--winding-continuity-step-cost`, and reference fibers. References
+are fixed active on their known half-winding ladder; ordinary H/V, winding and
+defect states remain free. A canonical even-H/odd-V reference gauge uses signed
+reference-reference evidence, audited separately per normal component; ambiguous
+or incompatible sign choices fail. This diagnostic does not run the ordinary
+prepass or reference-pruning/oracle solver. Existing combined-graph assembly is
+shared with the legacy conditioned benchmark.
+
+Outputs `<prefix>_reference_neighborhood.json`, `_pieces.csv`, and
+`_continuations.csv`, retaining original artifact trace IDs and original
+ordinary piece IDs. They report retention, disabled pieces and union-length,
+disabled runs, active-active physical winding jumps, and reference-unanchored
+integer gauges. These are solver diagnostics, not ground-truth error labels
+for ordinary fibers. Defect endpoints do not count as winding jumps.
+
+Reproducible configurations (cached 2048 Paris4 beam8 traces, EMA999 best u22000,
+prediction `7ff0ce6c`, no parallel events, 500-message limit) are in
+`vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/crop_benchmark_reference_neighborhood_*_20260928.json`.
+Use the existing approved `run_classic_fiber_evaluation.py crop-benchmark --config`
+runner; no inference or retracing is performed.
+
+For an ordinary-only solve of the identical selected cohort, additionally pass
+`--reference-neighborhood-unconditioned --reference-independent`. The combined
+reference graph is used only to select source IDs. The actual solver report is
+subset from the original ordinary graph: no reference nodes, cross factors,
+fixed reference states or reference-conditioned initialization enter BP. Cached
+cross constraints are remapped separately for the existing post-solve readout.
+Reference events remain special post-split attachments; this mode does not
+change piece boundaries. `<prefix>_neighborhood_cohort.json` records original
+source/piece IDs and graph counts for comparison with conditioned runs.
+
+Removing reference anchors can leave several independent integer gauges.
+The `neighborhood_readout_report` option in the approved crop runner audits cohort
+identity and uses the established accuracy/shift parsers. It preserves every
+gauge's readout, including ties/unbounded optima. It does not manufacture one
+aggregate ladder from disagreeing gauges. Per-gauge correctness uses the full
+reference denominator; incomplete ladders have no shift score. Full-coverage
+components are reported explicitly, not selected by accuracy. Gauge offsets and
+global sign are calibrated only after solving, using the existing reference
+readout convention; this is not reference-free evaluation calibration.
+
 ### Optional winding decode repair
 
 `--winding-decode-repair N` performs at most N deterministic coordinate-descent
