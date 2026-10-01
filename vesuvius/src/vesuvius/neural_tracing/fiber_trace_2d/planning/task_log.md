@@ -15,6 +15,9 @@
 - Materialized `/home/hendrik/data/2026-10-01_reviewed_failure_union_v1`:
   11 PHerc0139 + 6 PHerc1299 + 15 PHercParis4 = 32 pieces. Manifest validation
   checks exact membership and SHA-256 before dense loading and native tracing.
+- The first production launch exposed that a merge had lost the existing v4
+  fiber/editor-hint parser support. Restored the shared parser behavior rather
+  than rewriting the cohort; the v1 dataset remains byte-identical to source.
 - Added the reviewed32 training config. Its ordinary raw/EMA/refinement/cross-
   section tests use only the locked subset without changing metric semantics.
 - Native tracing reuses `run_classic_fiber_evaluation.py` and the shared live

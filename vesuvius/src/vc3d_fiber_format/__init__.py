@@ -226,13 +226,13 @@ def parse_vc3d_fiber_format(
     if obj.get("type", "vc3d_fiber") != "vc3d_fiber":
         raise ValueError(f"{label} type must be 'vc3d_fiber'")
     version = obj.get("version", 1)
-    if not isinstance(version, int) or isinstance(version, bool) or version not in {1, 3}:
-        raise ValueError(f"only vc3d_fiber versions 1 and 3 are supported, got {version!r}")
-    if version == 3 and "type" not in obj:
-        raise ValueError("version-3 vc3d_fiber is missing type")
+    if not isinstance(version, int) or isinstance(version, bool) or version not in {1, 3, 4}:
+        raise ValueError(f"only vc3d_fiber versions 1, 3 and 4 are supported, got {version!r}")
+    if version in {3, 4} and "type" not in obj:
+        raise ValueError("version-3/4 vc3d_fiber is missing type")
 
-    if version == 3 and "optimization_mode" not in obj:
-        raise ValueError("version-3 vc3d_fiber is missing optimization_mode")
+    if version in {3, 4} and "optimization_mode" not in obj:
+        raise ValueError("version-3/4 vc3d_fiber is missing optimization_mode")
     optimization_mode = obj.get("optimization_mode", "lasagna")
     if not isinstance(optimization_mode, str) or optimization_mode not in {
         "lasagna", "native_fiber_trace3d"
@@ -250,8 +250,17 @@ def parse_vc3d_fiber_format(
         positions: list[Any] = []
         parsed_segments: list[FiberTraceSegmentMetadata | None] = []
         for index, control in enumerate(raw_controls):
-            if not isinstance(control, dict) or not set(control) <= {"position", "segment_to_next"}:
-                raise ValueError("version-3 control points must contain only position and segment_to_next")
+            if not isinstance(control, dict) or not set(control) <= {
+                "position", "segment_to_next", "direction", "display_normal", "display_normal_source"
+            }:
+                raise ValueError("version-3/4 control point contains unknown fields")
+            # Editor hints do not replace the stored reference polyline or its
+            # segment eligibility metadata. Validate, but do not apply them.
+            for key in ("direction", "display_normal"):
+                if key in control:
+                    _points([control[key]], label=f"control point {key}")
+            if "display_normal_source" in control and not isinstance(control["display_normal_source"], str):
+                raise ValueError("control point display_normal_source must be a string")
             if "position" not in control:
                 raise ValueError("version-3 control point is missing position")
             positions.append(control["position"])
@@ -267,7 +276,7 @@ def parse_vc3d_fiber_format(
         segments = tuple(parsed_segments)
 
     generation = obj.get("generation", 1)
-    if version == 3:
+    if version in {3, 4}:
         if not isinstance(generation, int) or isinstance(generation, bool) or generation < 0:
             raise ValueError("vc3d_fiber generation must be a non-negative integer")
     else:

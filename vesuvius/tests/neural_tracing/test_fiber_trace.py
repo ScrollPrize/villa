@@ -111,7 +111,7 @@ def test_parse_vc3d_fiber_validates_and_preserves_xyz_order():
                 "control_points": [[1, 2, 3]],
             }
         )
-    with pytest.raises(ValueError, match="versions 1 and 3"):
+    with pytest.raises(ValueError, match="versions 1, 3 and 4"):
         parse_vc3d_fiber(
             {
                 "type": "vc3d_fiber",
@@ -182,6 +182,24 @@ def test_parse_vc3d_fiber_v3_segment_metadata(tmp_path):
     assert fiber.control_point_segments[1] is None
     from vc3d_fiber_format import serialize_segment_metadata
     assert serialize_segment_metadata(fiber.control_point_segments[0]) == segment
+
+    reviewed = {
+        "type": "vc3d_fiber", "version": 4,
+        "optimization_mode": "native_fiber_trace3d",
+        "line_points": [[1, 2, 3], [4, 5, 6]],
+        "control_points": [
+            {"position": [1, 2, 3], "segment_to_next": segment,
+             "direction": [1, 0, 0], "display_normal": [0, 1, 0],
+             "display_normal_source": "manual"},
+            {"position": [4, 5, 6]},
+        ],
+    }
+    reviewed_fiber = parse_vc3d_fiber(reviewed)
+    np.testing.assert_array_equal(reviewed_fiber.line_points_xyz, fiber.line_points_xyz)
+    assert reviewed_fiber.control_point_segments == fiber.control_point_segments
+    reviewed["control_points"][0]["unknown_hint"] = 1
+    with pytest.raises(ValueError, match="unknown fields"):
+        parse_vc3d_fiber(reviewed)
     from vesuvius.neural_tracing.fiber_trace_3d.refinement import GeometryStore, RefinementConfig, export_metadata
     import zipfile
     store = GeometryStore(tmp_path / "geometry")
