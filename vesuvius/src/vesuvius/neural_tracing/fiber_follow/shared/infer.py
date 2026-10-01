@@ -134,6 +134,8 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer):
         spec.fiber_zarr_dir = args.fiber_zarrs
     if args.ct:
         spec.ct_zarr = args.ct
+    from .ct_normalization import prepare_normalization
+    prepare_normalization(args.out, [spec], known=ck['ct_normalization'])
     vol = FiberVolume(spec, cache_bytes=8 << 30)
     tracer = tracer_class(model, vol, crop, n_hist, TraceParams(max_len=args.max_len, confidence=args.confidence,
         n_commit=args.n_commit, seed=args.sampling_seed), device=args.device)

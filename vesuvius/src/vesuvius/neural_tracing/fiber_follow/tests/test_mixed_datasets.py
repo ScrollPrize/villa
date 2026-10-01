@@ -80,11 +80,13 @@ def test_ct_only_reads_no_auxiliary_and_requires_auxiliary_when_enabled(tmp_path
     array_at(tmp_path/'ct'/'0',np.full((48,48,48),127,np.uint8))
     spec=FiberVolumeSpec('does-not-exist',ct_zarr=str(tmp_path/'ct'),ct_level=0,
         grid_scale=1.,ct_grid_scale=1.,inputs='ct',load_presence=False)
+    from test_ct_normalization import record
+    spec.ct_normalization = record(spec)
     vol=FiberVolume(spec);cfg=config(input_mode='ct')
     items=[dict(pos=np.array([24.,24.,24.]),frame=np.eye(3))]
     x=image_crop(items,vol,cfg.fine,input_mode='ct')
     assert x.shape[1]==1
-    torch.testing.assert_close(x,torch.full_like(x,127/255))
+    torch.testing.assert_close(x,torch.zeros_like(x))
     with pytest.raises(ValueError,match='Presence inputs'):
         image_crop(items,vol,cfg.fine)
     with pytest.raises(ValueError,match='CT-only'):
@@ -272,7 +274,11 @@ def test_real_collector_roundtrip_on_afv_with_ct_only_inputs(tmp_path):
     spec=FiberVolumeSpec('',ct_zarr=str(tmp_path/'ct'),ct_level=0,grid_scale=1.,ct_grid_scale=1.,inputs='ct',load_presence=False)
     sample=SampleConfig(crop=cfg.fine,n_history=cfg.n_history,n_future=cfg.n_future)
     ck=tmp_path/'ck.pt';out=tmp_path/'replay.npz'
-    save_checkpoint(ck,model,model,spec,sample,dict(step=1,dataset_config=document))
+    from test_ct_normalization import record
+    from vesuvius.neural_tracing.fiber_follow.shared.ct_normalization import METHOD, volume_key
+    spec.ct_normalization = record(spec)
+    normalization = dict(method=METHOD, volumes={volume_key(spec): spec.ct_normalization})
+    save_checkpoint(ck,model,model,spec,sample,dict(step=1,dataset_config=document, ct_normalization=normalization))
     collect(['--checkpoint',str(ck),'--fibers',str(p),'--dataset-name','fixture',
         '--device','cpu','--threads','2','--max-seeds','2','--batch','1','--trace-len','8',
         '--explore-calls','1','--after','4','--out',str(out)])

@@ -39,7 +39,8 @@ a matched pair is rejected as a unit if either member is unsafe.
 ## Features and attention
 
 A shared small 3D residual encoder uses widths 8,16,32 and strides (1,2,2),
-(2,2,2),(2,2,2), with one existing residual block per stage. The final 2x9x9 grid
+(2,2,2),(2,2,2), with a BasicBlockD (InstanceNorm/LeakyReLU) after each
+downsampling convolution. The final 2x9x9 grid
 is projected to 128 dimensions by default. Spatial position, relative translation
 and rotation, log historical age, slot order and seed role are embedded inside
 this encoder. Its output is only spatial tokens plus a padding mask.
@@ -51,16 +52,23 @@ including output bias. Encode once per decision, keeping gradients attached;
 reuse these features for generated candidates, retries and supplied candidates.
 No historical coordinates or path markings separately enter either head.
 
-The patch4 encoder now embeds overlapping 6x6x6 neighborhoods with a stride-4
-convolution (v11). Padding 1 plus high-edge padding to multiples of four retains
-the previous token centers and grid. The convolutional main encoder and local
-history inputs are unchanged. Dense models still
+The patch4 encoder embeds overlapping 6x6x6 neighborhoods with a stride-4
+convolution and boundary padding 1. It samples 120x104x104 crops directly,
+without extra image padding, yielding a 30x26x26 token grid. The optional image
+stem adds a full-resolution BasicBlockD and two downsampling residual stages
+(InstanceNorm/ReLU, widths 32 then 64) to the same tokens. The replacement
+encoders use architecture v13 and are trained fresh. Dense models still
 use full output-plane features; the patch token-only model still samples its
 coarse patch lattice. Refinement predicts absolute replacement paths through the
 same coordinate readout. Acceptance, commit limits and connection bounds retain
 the existing policy. Training uses fixed masked attempt slots; inference compacts
 active rows. The last attempted geometry gets 75% of geometry weight and earlier
 attempts share 25%; a sole attempt gets 100%.
+
+Patch4 axial attention applies fixed 3D RoPE to Q/K using the shared Dinovol
+implementation. With 32 channels per head, 30 rotate and two pass through;
+all axes share a common coordinate scale and coordinate augmentation is disabled.
+The additive absolute-coordinate embeddings and history metadata are retained.
 
 ## Loss and replay semantics
 

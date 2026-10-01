@@ -1,19 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 task_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-task_python="${FIBER_PYTHON:-$task_root/../../../../.venv/bin/python}"
-task_run="${STEM_RUN_NAME:-mixed_ct_afv_stem32_run2}"
+task_run="${STEM_RUN_NAME:-mixed_ct_afv_stem32_fresh_run1}"
 cd "$task_root"
-# Use the migrated checkpoint's complete settings, then apply explicit overrides.
-exec "$task_python" - "$task_root/output/$task_run/migration.json" "$@" <<'PY'
-import json
-import os
-from pathlib import Path
-import sys
-
-manifest = Path(sys.argv[1])
-command = json.loads(manifest.read_text())['command']
-command[0] = sys.executable
-command += ['--resume', str(manifest.parent/'last.pt'), *sys.argv[2:]]
-os.execv(command[0], command)
-PY
+# Fresh initialization; use the same mixed datasets, volume cache and workers.
+exec bash "$task_root/scripts/train_mixed_ct.sh" \
+  --name "$task_run" --stem-channels 32 --stem-blocks 2 \
+  --steps 100000 --lr 0.0001 --warmup 5000 \
+  --fresh-fraction 0.9 --bank-following-probability 0 \
+  --remote-prefetch-connections 48 "$@"

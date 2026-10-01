@@ -57,52 +57,54 @@ is still used. Replay v6 remains compatible. Recurrent checkpoints and older rep
 are rejected; there is no weight migration or memory compatibility interface.
 The existing regression `train`, `collect`, and `infer` module entry points remain.
 
-### Residual image stem continuation
+### BasicBlockD image and history encoders
 
-To add image capacity to a trained v11 token-only patch4 model, prepare a separate
-run (the source run must be quiescent):
+Start a fresh mixed-CT run with the replacement image stem and history encoder:
 
 ```bash
-../../../../.venv/bin/python -m vesuvius.neural_tracing.fiber_follow.regression.stem_resume \
-  --checkpoint output/mixed_ct_afv_run1/ckpt_100000.pt \
-  --name mixed_ct_afv_stem32_run2 \
-  --channels 32 --blocks 2 --additional-steps 100000 \
-  --lr 0.0001 --warmup 5000 \
-  --fresh-fraction 0.9 --bank-following-probability 0
 bash scripts/train_mixed_ct_stem.sh
 ```
 
-Preparation transfers the original model weights and EMA outside the history
-encoder, which is initialized fresh (including its projections and embeddings).
-It preserves RNG, step count, frozen recovery fixture and replay references.
-The source crop dimensions are rounded up to multiples of four (101 to 104),
-and the crop/sample metadata are updated together. Predictions change because
-the history encoder is fresh and the sampled image grid has changed.
-Preparation creates a fresh AdamW optimizer for all parameters and restarts
-warmup/cosine decay at the source step, using LR 1e-4 and 5000 warmup steps. Here training
-runs from update 100001 through 200000. The launcher reads the complete settings
-from `migration.json` and resumes the new run's `last.pt`; subsequent launches
-retain its optimizer and LR position. Extra trainer flags can be appended, and
-`STEM_RUN_NAME` selects another prepared run. The original run is unchanged.
+The launcher creates `mixed_ct_afv_stem32_fresh_run1` with random model weights
+and a fresh AdamW optimizer: 100000 total steps, LR 1e-4, 5000-step warmup,
+batch/microbatch 16, 10 workers and 48 remote prefetch connections. It uses the
+same mixed-dataset configuration and persistent volume cache. No checkpoint or
+migration is required. `STEM_RUN_NAME` selects another name, and extra trainer
+flags can be appended. To resume this new run later, use the same launcher with
+`--resume output/mixed_ct_afv_stem32_fresh_run1/last.pt`.
 
-The parallel stem follows `PatchEmbed_deeper`, reusing Vesuvius's shared
+The image stem follows `PatchEmbed_deeper`, reusing Vesuvius's shared
 `BasicBlockD`: one full-resolution block into 32 channels, then two downsampling
-stages at 32 and 64 channels. Each stage has two residual blocks (`--blocks 2`,
-or `--stem-blocks 2` in the trainer), the first with stride two. Thus there are
-five BasicBlockD blocks in total. They use affine InstanceNorm without running
-statistics, ReLU, and the ResNet-D average-pool/projection skips. A final 1x1x1
-convolution maps 64 channels into the existing 128-wide token embedding.
+stages at 32 and 64 channels. Each stage has two residual blocks
+(`--stem-blocks 2`), the first with stride two. There are five BasicBlockD blocks
+in total. They use affine InstanceNorm without running statistics, ReLU, and
+ResNet-D average-pool/projection skips. A final 1x1x1 convolution maps 64 channels
+into the 128-wide token embedding. All stem layers use normal random initialization.
 
-The stem output is added to the learned patch embedding before position/history
-conditioning and axial attention. Both paths consume the sampled image directly
-and output the same stride-four token grid. BasicBlockD combines odd-kernel
-convolutions and average-pool skips; its receptive-field footprints differ from
-the original patch projection. The final projection starts at zero, initially
-leaving the pretrained image branch intact; it receives gradients on the first update, and
-earlier stem layers start learning once it becomes nonzero. No extra tokens or
-decoder feature stream are introduced. Activation checkpointing includes the
-stem when enabled. Full-resolution feature extraction increases compute and
-activation memory; GPU capacity must be checked on the training machine.
+The stem output is added to the parallel patch projection before position/history
+conditioning and axial attention. Both paths consume the sampled 120x104x104
+image directly and output the same stride-four 30x26x26 token grid; no extra
+image padding, tokens, or decoder feature stream are introduced. BasicBlockD
+combines odd-kernel convolutions and average-pool skips, with different
+receptive-field footprints from the parallel patch projection. Activation
+checkpointing includes the stem when enabled. Full-resolution feature extraction
+increases compute and activation memory; GPU capacity must be checked on the
+training machine.
+
+The history encoder is also initialized fresh. Its residual blocks use the shared
+BasicBlockD with affine InstanceNorm and LeakyReLU(.01); its token layout is unchanged.
+
+Patch4 axial self-attention uses the fixed-axis 3D RoPE implementation shared
+with Dinovol (`vesuvius.models.build.pretrained_backbones.rope`). At width 128
+with four heads, 30 of each head's 32 channels rotate (10 per spatial axis),
+and two remain unchanged. Q and K rotate; V does not. All axes share the scale
+of the longest grid dimension, with base 100 and no random coordinate shift,
+jitter or rescaling. Sine/cosine and rotations use FP32 under BF16 autocast.
+For each axial line, the two constant coordinates can be omitted: their shared
+rotations cancel in Q/K dot products. Tests compare this directly with full-grid
+3D RoPE, including gradients. Absolute image-coordinate embeddings and the
+history position/pose/age/slot embeddings remain available to the decoder.
+History cross-attention does not apply RoPE independently in each slab's frame.
 
 `--fresh-fraction` applies to the budget left after matched decisions and
 bank-following samples. With decision fraction .3, bank-following 0, and fresh

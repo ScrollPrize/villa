@@ -19,6 +19,12 @@ PRIMARY_OPTIONS = ('fibers', 'fiber_zarrs', 'ct', 'manifest', 'val_z', 'negative
                    'near_negative_bank', 'following_bank', 'continuation_bank')
 
 
+def ct_source_spec(source, cache_dir):
+    return FiberVolumeSpec(source.get('fiber_zarrs', ''), ct_zarr=source['ct'],
+        ct_level=int(source.get('ct_level', 0)), ct_grid_scale=float(source.get('ct_grid_scale', 1.)),
+        grid_scale=float(source['grid_scale']), inputs='ct', load_presence=False, cache_dir=cache_dir)
+
+
 def read_dataset_config(path):
     path = Path(path).resolve()
     document = json.loads(path.read_text())
@@ -278,7 +284,8 @@ class WeightedDatasets(torch.utils.data.IterableDataset):
             yield batch
 
 
-def build_mixed_dataset(primary, document, cfg, sample, sampling, args, *, seed, out=None, resume=False):
+def build_mixed_dataset(primary, document, cfg, sample, sampling, args, *, seed, out=None, resume=False,
+                        normalization=None):
     if cfg.input_mode != 'ct' or cfg.direction_inputs:
         raise ValueError('The AFV sources have CT only; enable --input-mode ct --no-direction-inputs')
     datasets, names, weights, provenance = [], [], [], []
@@ -308,9 +315,10 @@ def build_mixed_dataset(primary, document, cfg, sample, sampling, args, *, seed,
                     's3://vesuvius-challenge-open-data/')
             if canonical(source['ct']) != canonical(native_url):
                 raise ValueError('AFV source CT differs from its embedded metadata')
-            spec = FiberVolumeSpec('', ct_zarr=source['ct'], ct_level=int(source.get('ct_level',0)),
-                ct_grid_scale=float(source.get('ct_grid_scale',1.)), grid_scale=scale,
-                inputs='ct', load_presence=False, cache_dir=document['cache_dir'])
+            spec = ct_source_spec(source, document['cache_dir'])
+            if normalization is not None:
+                from ..shared.ct_normalization import volume_key
+                spec.ct_normalization = normalization['volumes'][volume_key(spec)]
             local_sampling = sampling
             builder = IdentityObservationBuilder(cfg, fibers, local_sampling, augment=True,
                                                   negative_bank=AFVBank(fibers))

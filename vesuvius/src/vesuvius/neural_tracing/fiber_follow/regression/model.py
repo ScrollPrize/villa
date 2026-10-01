@@ -12,10 +12,10 @@ from torch.utils.checkpoint import checkpoint
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
 from vesuvius.neural_tracing.fiber_follow.shared.policy import DEFAULT_CONFIDENCE, commit_prefix
 
-ARCHITECTURE = 'axial_fiber_slabs_v13'
-PATCH_ARCHITECTURE = 'axial_patch4_overlap_fiber_slabs_v13'
-TOKEN_ARCHITECTURE = 'axial_patch4_overlap_tokens_fiber_slabs_v13'
-STEM_ARCHITECTURE = 'axial_patch4_residual_stem_tokens_fiber_slabs_v13'
+ARCHITECTURE = 'axial_fiber_slabs_v14'
+PATCH_ARCHITECTURE = 'axial_patch4_overlap_fiber_slabs_v14'
+TOKEN_ARCHITECTURE = 'axial_patch4_overlap_tokens_fiber_slabs_v14'
+STEM_ARCHITECTURE = 'axial_patch4_residual_stem_tokens_fiber_slabs_v14'
 TOKEN_STRIDE = (8, 2, 2)
 TOKEN_OFFSET = (3, 0, 0)
 
@@ -193,12 +193,14 @@ class ResidualConv(nn.Module):
 
 class AxisAttention(nn.Module):
     """Unmasked attention along one whole spatial axis of a BDHWC tensor."""
-    def __init__(self, width, heads, axis):
+    def __init__(self, width, heads, axis, *, rotary=False):
         super().__init__()
         self.heads, self.axis = heads, axis
         self.norm = nn.LayerNorm(width)
         self.qkv = nn.Linear(width,3*width)
         self.projection = nn.Linear(width,width)
+        from .rope import AxialRoPE3D
+        self.rotary = AxialRoPE3D(width//heads) if rotary else None
 
     def forward(self, x):
         moved = x.movedim(self.axis,-2)
@@ -206,6 +208,8 @@ class AxisAttention(nn.Module):
         seq = self.norm(moved).reshape(-1,shape[-2],shape[-1])
         qkv = self.qkv(seq).reshape(seq.shape[0],seq.shape[1],3,self.heads,shape[-1]//self.heads)
         q,k,v = qkv.permute(2,0,3,1,4).unbind(0)
+        if self.rotary is not None:
+            q, k = self.rotary(q, k, x.shape[1:4], self.axis-1)
         attended = F.scaled_dot_product_attention(q,k,v,dropout_p=0.,is_causal=False)
         attended = attended.transpose(1,2).reshape_as(seq)
         return x+self.projection(attended).reshape(shape).movedim(-2,self.axis)
@@ -277,9 +281,9 @@ class PathDecoderLayer(nn.TransformerDecoderLayer):
 
 
 class AxialBlock(nn.Module):
-    def __init__(self, width, heads, *, local_convolution=True):
+    def __init__(self, width, heads, *, local_convolution=True, rotary=False):
         super().__init__()
-        self.axes = nn.ModuleList(AxisAttention(width,heads,a) for a in (3,2,1))
+        self.axes = nn.ModuleList(AxisAttention(width,heads,a,rotary=rotary) for a in (3,2,1))
         self.norm = nn.LayerNorm(width)
         self.mlp = nn.Sequential(nn.Linear(width,4*width),nn.GELU(),nn.Linear(4*width,width))
         self.local = nn.Sequential(DepthwiseConv3d(width,width,3,padding=1,groups=width),

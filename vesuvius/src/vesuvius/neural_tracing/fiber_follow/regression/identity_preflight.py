@@ -55,6 +55,8 @@ def main(argv=None):
     if args.out.exists():
         raise FileExistsError('Use a fresh preflight output directory')
     it=iter(ds);args.out.mkdir(parents=True)
+    from ..shared.ct_normalization import prepare_normalization
+    prepare_normalization(args.out, [spec])
     model=build_model(cfg).to(args.device,memory_format=conv_memory_format(args.device)) if args.forward else None
     import copy
     from .train import optimizer_update

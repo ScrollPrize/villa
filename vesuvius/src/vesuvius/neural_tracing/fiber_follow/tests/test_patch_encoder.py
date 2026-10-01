@@ -141,7 +141,7 @@ def test_overlap_sees_and_backpropagates_across_all_three_patch_boundaries():
 
 @pytest.mark.parametrize('architecture', ['axial_patch4_fiber_slabs_v10', 'axial_patch4_tokens_fiber_slabs_v10'])
 def test_old_nonoverlapping_patch_checkpoints_require_fresh_training(architecture):
-    with pytest.raises(ValueError,match='overlapping patch embeddings require fresh v11'):
+    with pytest.raises(ValueError,match='Unsupported checkpoint architecture'):
         checkpoint_config(dict(architecture=architecture,model_cfg=config(encoder='patch4').to_dict()))
 
 

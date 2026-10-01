@@ -43,10 +43,10 @@ def test_every_lateral_pixel_has_correct_coordinates_and_depth_interpolation(wid
 def test_production_planes_cover_all_16_full_resolution_cross_sections():
     c = DirectConfig()
     features = OutputPlaneFeatures(c)
-    assert features.xyz.shape == (163216, 3)
-    assert math.prod(c.token_shape) == 39015
-    torch.testing.assert_close(features.xyz[0], torch.tensor([-25., -25., 1.]))
-    torch.testing.assert_close(features.xyz[-1], torch.tensor([25., 25., 16.]))
+    assert features.xyz.shape == (173056, 3)
+    assert math.prod(c.token_shape) == 40560
+    torch.testing.assert_close(features.xyz[0], torch.tensor([-25.75, -25.75, 1.]))
+    torch.testing.assert_close(features.xyz[-1], torch.tensor([25.75, 25.75, 16.]))
     assert features.lower.tolist() == list(range(50, 81, 2))
 
 

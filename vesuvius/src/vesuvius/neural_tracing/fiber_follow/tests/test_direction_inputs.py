@@ -53,8 +53,11 @@ def volume(root, nx=None, ny=None):
         array_at(root/f'fields/test_{name}.ome.zarr/3',value)
     z,y,x=np.indices((80,80,80))
     array_at(root/'ct/0',(x+2*y+z).clip(0,255).astype(np.uint8))
-    return FiberVolume(FiberVolumeSpec(str(root/'fields'),ct_zarr=str(root/'ct'),ct_level=0,
-                                     ct_grid_scale=4.,inputs='ct+presence'),cache_bytes=1<<20)
+    from test_ct_normalization import record
+    spec = FiberVolumeSpec(str(root/'fields'),ct_zarr=str(root/'ct'),ct_level=0,
+                           ct_grid_scale=4.,inputs='ct+presence')
+    spec.ct_normalization = record(spec)
+    return FiberVolume(spec,cache_bytes=1<<20)
 
 
 def config(**kwargs):

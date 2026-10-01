@@ -8,6 +8,7 @@ import torch
 
 from .data import _grid_flat, read_tight_blocks
 from .fast_sample import sample_scalar_crop
+from .ct_normalization import normalize_ct
 
 
 def empty_image_batch(shape):
@@ -57,6 +58,8 @@ def scalar_crops(items, vol, crop, pool=None, *, presence=False, out=None):
         item = items[j]
         sample_scalar_crop(raw[k], starts[k], item['pos']*scale, item['frame']*scale,
                            grid, result[j])
+        if not presence:
+            normalize_ct(result[j, 0], vol.spec.ct_normalization)
     for j, source in enumerate(sources):
         if j != source:
             result[j] = result[source]

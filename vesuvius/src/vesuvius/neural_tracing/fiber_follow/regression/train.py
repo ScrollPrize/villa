@@ -194,7 +194,7 @@ REST_GRAD_CLIP = 100.
 
 def checkpoint_config(ck):
     if ck['architecture'] not in ARCHITECTURES:
-        raise ValueError('Unsupported checkpoint architecture; overlapping patch embeddings require fresh v11 training')
+        raise ValueError('Unsupported checkpoint architecture; start a fresh run for the current encoders')
     cfg = DirectConfig(**ck['model_cfg'])
     if ck['architecture'] != cfg.architecture:
         raise ValueError('Checkpoint architecture does not match its encoder configuration')
@@ -747,7 +747,7 @@ def main(argv=None):
     spec = FiberVolumeSpec(args.fiber_zarrs, ct_zarr=args.ct,
         ct_level=primary_source.get('ct_level', 0), ct_grid_scale=primary_source.get('ct_grid_scale', 4.),
         grid_scale=primary_source.get('grid_scale', 8.), inputs=cfg.input_mode,
-        load_presence=cfg.input_mode != 'ct')
+        load_presence=cfg.input_mode != 'ct', cache_dir=dataset_document['cache_dir'] if dataset_document else None)
     if cfg.direction_inputs:
         # Validate sibling paths and grids before starting loaders or collectors.
         FiberVolume(spec, cache_bytes=1 << 20).direction_fields()
@@ -820,6 +820,15 @@ def main(argv=None):
         (out/'validation_paris4.json').write_text(json.dumps(manifest,indent=2)+'\n')
     if resume and Path(args.resume).resolve().parent != out.resolve():
         raise ValueError('Resume checkpoint must be inside the named run')
+    from ..shared.ct_normalization import prepare_normalization
+    calibration_specs = [spec]
+    if dataset_document:
+        from .datasets import ct_source_spec
+        calibration_specs.extend(ct_source_spec(s, dataset_document['cache_dir'])
+                                 for s in dataset_document['sources'] if s['kind'] != 'paris4')
+    progress('Preparing per-volume CT background normalization')
+    ct_normalization = prepare_normalization(out, calibration_specs,
+        resume=resume['ct_normalization'] if resume is not None else None)
     recovery_states = recovery_hash = None
     if args.recovery_every:
         progress('Preparing monitor recovery fixture')
@@ -863,7 +872,8 @@ def main(argv=None):
         from .datasets import build_mixed_dataset
         progress('Checking mixed-source datasets and AFV checksums')
         dataset, dataset_provenance = build_mixed_dataset(dataset, dataset_document, cfg, sample,
-            identity_sampling, args, seed=args.seed+done, out=out, resume=resume is not None)
+            identity_sampling, args, seed=args.seed+done, out=out, resume=resume is not None,
+            normalization=ct_normalization)
         from ..shared.online import MultiSourceCollector
         collectors = []
         for source, source_dataset in zip(dataset_document['sources'], dataset.datasets):
@@ -890,6 +900,7 @@ def main(argv=None):
         (out/'config.json').write_text(json.dumps(dict(vars(args), architecture=model.architecture,
             resolved_dataset_config=dataset_document, dataset_config_sha256=dataset_digest,
             dataset_provenance=dataset_provenance,
+            ct_normalization=ct_normalization,
             identity_sampling=asdict(identity_sampling),
             negative_bank_provenance=negative_bank.provenance() if negative_bank else None,
             bank_role_provenance=role_provenance(),
@@ -899,6 +910,7 @@ def main(argv=None):
             seed_manifest_sha256=manifest['sha256'], fiber_manifest=fiber_manifest(fibers),
             parameter_count=sum(p.numel() for p in model.parameters())), indent=2))
     log = RunLog(out/'log.jsonl', formatter=format_training_log)
+    log.record(dict(step=done, event='ct_normalization', calibration=ct_normalization))
     if dataset_document:
         log.record(dict(step=done, event='dataset_configuration', datasets=dataset_provenance,
                         names=dataset.names, probabilities=dataset.weights.tolist(),
@@ -1010,6 +1022,7 @@ def main(argv=None):
                 extra = dict(step=step, lr_restart_step=lr_restart_step, tolerance=args.tolerance, n_commit=args.n_commit,
                     dataset_config=dataset_document, dataset_config_sha256=dataset_digest,
                     dataset_provenance=dataset_provenance,
+                    ct_normalization=ct_normalization,
                     history_sampling_revision=SAMPLING_REVISION,
                     samples_seen=prior_samples+observed_states,
                     identity_sampling=asdict(identity_sampling),

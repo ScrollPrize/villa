@@ -10,6 +10,7 @@ from scipy.ndimage import gaussian_filter
 from vesuvius.neural_tracing.fiber_follow.shared.components import ComponentRule
 from vesuvius.neural_tracing.fiber_follow.shared.data import collate_targets
 from vesuvius.neural_tracing.fiber_follow.shared.crop_sampling import scalar_crops, empty_image_batch
+from vesuvius.neural_tracing.fiber_follow.shared.ct_normalization import BACKGROUND, LIMIT
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import interp_at
 from vesuvius.neural_tracing.fiber_follow.shared.trace import ModelTracer
 from vesuvius.neural_tracing.fiber_follow.shared.reference import SEED_FIELDS, observed_seed
@@ -19,7 +20,7 @@ from vesuvius.neural_tracing.fiber_follow.regression.model import DirectConfig
 def image_crop(items, vol, crop, pool=None, *, directions=False, input_mode='ct+presence'):
     """CT/presence, optionally followed by six unsigned local direction moments.
 
-    The scalar sampler normalizes both channels to [0,1]. An empty history
+    CT uses foreground-only robust z-scores; presence remains [0,1]. An empty history
     skips rendering. Sampling is identical in training
     and tracing, including the independently resolved presence grid.
     Each item reads only the axis-aligned block its own oriented crop needs.
@@ -183,13 +184,27 @@ def reference_layout(item,cfg):
 
 
 def photometric(image, params, rng):
-    """Contrast about the mean, brightness offset, then Gaussian noise; clipped to [0, 1]."""
+    """Augment normalized material only; keep masked background exactly -4."""
     contrast, brightness, noise = params
-    mean = float(image.mean())
-    out = (image-mean)*contrast+mean+brightness
+    material = image > BACKGROUND
+    mean = float(image[material].mean()) if material.any() else 0.
+    out = (image-mean)*contrast+mean+brightness*(2*LIMIT)
     if noise > 0:
-        out = out+rng.normal(0., noise, image.shape).astype(np.float32)
-    return np.clip(out, 0., 1.).astype(np.float32)
+        out = out+rng.normal(0., noise*(2*LIMIT), image.shape).astype(np.float32)
+    np.clip(out, BACKGROUND, LIMIT, out=out)
+    out[~material] = BACKGROUND
+    return out.astype(np.float32)
+
+
+def augment_ct(image, params, rng, blur_sigma=0.):
+    """Normalized convolution avoids bleeding black background into material."""
+    if blur_sigma > 0:
+        material = image > BACKGROUND
+        weights = gaussian_filter(material.astype(np.float32), blur_sigma, mode='reflect')
+        blurred = gaussian_filter(np.where(material, image, 0.), blur_sigma, mode='reflect')
+        np.divide(blurred, weights, out=blurred, where=weights > 0)
+        image[:] = np.where(material, blurred, BACKGROUND)
+    image[:] = photometric(image, params, rng)
 
 
 def augment_image_pair(image, params, rng, *, blur_sigma=0., drop_presence=False):
@@ -199,10 +214,9 @@ def augment_image_pair(image, params, rng, *, blur_sigma=0., drop_presence=False
     constant inputs constant; channel dropout remains exactly zero after blur.
     """
     values = image[:2].numpy()
-    if blur_sigma > 0:
-        gaussian_filter(values, sigma=(0., blur_sigma, blur_sigma, blur_sigma),
-                        mode='reflect', output=values)
-    values[0] = photometric(values[0], params, rng)
+    augment_ct(values[0], params, rng, blur_sigma)
+    if blur_sigma > 0 and len(values) > 1:
+        gaussian_filter(values[1], sigma=blur_sigma, mode='reflect', output=values[1])
     if drop_presence and len(values) > 1:
         values[1] = 0
 
@@ -464,9 +478,7 @@ class IdentityObservationBuilder(ObservationBuilder):
                 augment_image_pair(batch['x']['fine'][j], item['photometric'], rng, **augmentation)
                 for slot in batch['x']['history_valid'][j].nonzero().flatten().tolist():
                     ct = batch['x']['history_slabs'][j, slot, 0].numpy()
-                    if augmentation['blur_sigma'] > 0:
-                        gaussian_filter(ct, sigma=augmentation['blur_sigma'], mode='reflect', output=ct)
-                    ct[:] = photometric(ct, item['photometric'], rng)
+                    augment_ct(ct, item['photometric'], rng, augmentation['blur_sigma'])
                 if item['drop_presence']:
                     batch['presence_dropped'][j] = 1
         return batch

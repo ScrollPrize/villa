@@ -12,10 +12,10 @@ from .model import build_model
 from .train import build_parser, checkpoint_config, options_argv
 
 
-def fork_checkpoint(source, name, transform, *, allowed_changes, migration_key, describe, transform_fixture=None):
+def fork_checkpoint(source, name, transform, *, allowed_changes, migration_key, describe):
     """Prepare an independent run directory using only checkpoint settings.
 
-    The frozen monitor fixture is copied, optionally adapting its metadata. Published source replay
+    The frozen monitor fixture is copied byte-for-byte. Published source replay
     caches are referenced read-only; subsequent replay publication is independent.
     This prepares artifacts and a command, and does not stop or launch processes.
     """
@@ -64,15 +64,10 @@ def fork_checkpoint(source, name, transform, *, allowed_changes, migration_key, 
         config['parameter_count'] = sum(p.numel() for p in build_model(checkpoint_config(migrated)).parameters())
     staging = Path(tempfile.mkdtemp(prefix=f'.{name}-', dir=destination.parent))
     try:
-        if options['recovery_every']:
-            shutil.copyfile(fixture, staging/'monitor_recovery.npz')
-            if transform_fixture is not None:
-                transform_fixture(staging/'monitor_recovery.npz', original, migrated)
-                digest = hashlib.sha256((staging/'monitor_recovery.npz').read_bytes()).hexdigest()
-                migrated['monitor_recovery_sha256'] = config['monitor_recovery_sha256'] = digest
-                info['monitor_recovery_sha256'] = digest
         torch.save(migrated, staging/target.name)
         shutil.copyfile(staging/target.name, staging/'last.pt')
+        if options['recovery_every']:
+            shutil.copyfile(fixture, staging/'monitor_recovery.npz')
         (staging/'dagger').mkdir()
         (staging/'dagger/replay.json').write_text(json.dumps(replay, indent=2)+'\n')
         (staging/'config.json').write_text(json.dumps(config, indent=2)+'\n')

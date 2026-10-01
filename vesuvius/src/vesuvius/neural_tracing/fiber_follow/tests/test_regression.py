@@ -276,12 +276,18 @@ def test_image_sampler_matches_reference_at_fine_and_coarse_resolution(monkeypat
     monkeypatch.setattr(module, 'read_tight_blocks', lambda *a, **kw: (raw, starts))
     items = [dict(pos=np.array([8., 8., 8.]), frame=np.eye(3))]
     crop = CropSpec(depth=12, width=10, behind=4, spacing=.5)
-    vol = SimpleNamespace(input_scale=2.,presence=object())
+    from vesuvius.neural_tracing.fiber_follow.shared.ct_normalization import normalize_ct
+    # Avoid a hard-mask boundary at exactly representable native intensity 62:
+    # the two interpolation backends differ slightly in floating-point rounding.
+    calibration = dict(threshold=62.123, noise=4.)
+    vol = SimpleNamespace(input_scale=2.,presence=object(), spec=SimpleNamespace(ct_normalization=calibration))
     image = image_crop(items, vol, crop)
     grid = torch.from_numpy(crop_local_grid(crop)).float()
     for channel, scale in enumerate((2., 1.)):
         expected = sample_oriented_fast(torch.from_numpy(raw), torch.from_numpy(starts),
             torch.tensor([[8., 8., 8.]])*scale, torch.eye(3)[None]*scale, grid)
+        if channel == 0:
+            normalize_ct(expected.numpy()[0, 0], calibration)
         torch.testing.assert_close(image[:, channel:channel+1], expected, atol=3e-4, rtol=1e-3)
 
 
@@ -555,7 +561,10 @@ def test_tight_blocks_match_rotation_invariant_blocks_at_array_edges():
             return out
 
     ct, presence = Array((70, 60, 64)), Array((35, 30, 32))
-    vol = SimpleNamespace(presence=presence, input_scale=2., raw_block=lambda s, z: ct.read(s, z)[None])
+    from vesuvius.neural_tracing.fiber_follow.shared.ct_normalization import normalize_ct
+    calibration = dict(threshold=62., noise=4.)
+    vol = SimpleNamespace(presence=presence, input_scale=2., raw_block=lambda s, z: ct.read(s, z)[None],
+                          spec=SimpleNamespace(ct_normalization=calibration))
     crop = CropSpec(depth=14, width=10, behind=5, spacing=.5)
 
     def reference(items):
@@ -577,6 +586,8 @@ def test_tight_blocks_match_rotation_invariant_blocks_at_array_edges():
         items.append(dict(pos=pos, frame=q*np.sign(np.linalg.det(q))))
     image = image_crop(items, vol, crop)
     expected = reference(items)
+    for row in expected:
+        normalize_ct(row[0].numpy(), calibration)
     assert torch.equal(image, expected)
     assert 0 < float((expected != 0).float().mean()) < 1
 

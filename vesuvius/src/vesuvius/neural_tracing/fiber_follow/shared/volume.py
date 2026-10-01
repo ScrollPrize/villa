@@ -279,6 +279,7 @@ class FiberVolumeSpec:
     inputs: str = "fiber"
     load_presence: bool = True  # False: CT metadata alone defines tracing bounds.
     cache_dir: str | None = None  # Persistent uncompressed remote CT chunks.
+    ct_normalization: dict | None = None  # Bound at startup, persisted in run JSON/checkpoints.
 
     @property
     def mode(self) -> str:
@@ -354,6 +355,9 @@ class FiberVolume:
         if ct.dtype != np.dtype('uint8'):
             raise ValueError('CT intensity normalization currently requires uint8 data')
         self.ct = ct
+        if spec.ct_normalization is not None:
+            from .ct_normalization import validate_record
+            validate_record(spec.ct_normalization, spec)
         self.shape = (self.presence.shape if self.presence is not None else
                       tuple(np.ceil(np.asarray(self.ct.shape)/self.input_scale).astype(int)))
 

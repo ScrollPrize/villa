@@ -54,9 +54,10 @@ def load_dataset(args, checkpoint):
         raise ValueError('AFV source changed since training')
     scale = source['grid_scale']
     fibers = AFVFibers(source['path'],scale,validation=source['validation'],sha256=digest.hexdigest())
-    spec = FiberVolumeSpec('',ct_zarr=source['ct'],ct_level=source.get('ct_level',0),
-        ct_grid_scale=source.get('ct_grid_scale',1.),grid_scale=scale,inputs='ct',load_presence=False,
-        cache_dir=document['cache_dir'])
+    from .datasets import ct_source_spec
+    from ..shared.ct_normalization import volume_key
+    spec = ct_source_spec(source, document['cache_dir'])
+    spec.ct_normalization = checkpoint['ct_normalization']['volumes'][volume_key(spec)]
     return spec,fibers,None
 
 

@@ -35,7 +35,6 @@ class ResidualPatchStem(nn.Module):
     directly on a complete stride-four grid. BasicBlockD mixes
     odd-kernel convolution and average-pool skip footprints, so its receptive
     fields are not identical to those of the original patch projection.
-    Zero output initialization preserves the pretrained encoder.
     """
     def __init__(self, cfg):
         super().__init__()
@@ -51,8 +50,6 @@ class ResidualPatchStem(nn.Module):
             StackedResidualBlocks(n_blocks=cfg.stem_blocks, input_channels=c,
                 output_channels=2*c, initial_stride=2, conv_bias=False, **block_options))
         self.projection = nn.Conv3d(2*c, cfg.hidden, 1)
-        nn.init.zeros_(self.projection.weight)
-        nn.init.zeros_(self.projection.bias)
 
     def forward(self, image):
         return self.projection(self.blocks(self.input(image)))
@@ -70,7 +67,7 @@ class PatchShuffleEncoder(AxialEncoder):
         self.stem = ResidualPatchStem(cfg) if cfg.stem_channels else None
         self.position = nn.Linear(3, cfg.hidden)
         self.condition = nn.Linear(3, cfg.hidden, bias=False)
-        self.blocks = nn.ModuleList(AxialBlock(cfg.hidden, cfg.heads, local_convolution=False)
+        self.blocks = nn.ModuleList(AxialBlock(cfg.hidden, cfg.heads, local_convolution=False, rotary=True)
                                     for _ in range(cfg.layers))
         self.norm = nn.LayerNorm(cfg.hidden)
         self.reconstruction = None if cfg.token_only else nn.Linear(cfg.hidden, 64*cfg.channels)
