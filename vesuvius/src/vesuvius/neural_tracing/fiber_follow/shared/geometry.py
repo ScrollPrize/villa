@@ -72,12 +72,6 @@ def frame_from_heading(f: np.ndarray, u_hint: np.ndarray | None = None) -> np.nd
     return np.stack([u, v, f], axis=1)
 
 
-def random_rotation_about(frame: np.ndarray, angle: float) -> np.ndarray:
-    u, v, f = frame[:, 0], frame[:, 1], frame[:, 2]
-    c, s = np.cos(angle), np.sin(angle)
-    return np.stack([c * u + s * v, -s * u + c * v, f], axis=1)
-
-
 def crop_local_grid(spec: CropSpec) -> np.ndarray:
     """Local (a=u, b=v, c=f) coordinates, shape (D, H, W, 3)."""
     lc = spec.lateral_coords

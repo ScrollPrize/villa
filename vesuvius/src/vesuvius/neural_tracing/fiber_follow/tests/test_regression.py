@@ -448,7 +448,10 @@ def test_decision_metrics_score_actual_commits_censor_unknowns_and_pool_counts()
     json.dumps(bad, allow_nan=False)
 
 
-def test_monitor_fixtures_are_fixed_private_rng_and_exclude_other_splits(tmp_path):
+def test_monitor_fixtures_are_fixed_private_rng_and_exclude_other_splits(tmp_path,monkeypatch):
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.regression.recovery.FiberVolume',lambda *a,**kw:None)
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.ct_normal',
+                        lambda vol,pos: np.array([1., 0., 0.]))
     from vesuvius.neural_tracing.fiber_follow.shared.data import TracedFiber
     from vesuvius.neural_tracing.fiber_follow.regression.recovery import monitor_fixture
     arc = np.arange(300, dtype=float)
@@ -495,7 +498,9 @@ def test_diagnostic_logging_preserves_training_update_and_rng():
         torch.testing.assert_close(p, q, rtol=0, atol=0)
 
 
-def test_slab_recovery_evaluator_preserves_float_inputs_and_observed_states():
+def test_slab_recovery_evaluator_preserves_float_inputs_and_observed_states(monkeypatch):
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.ct_normal',
+                        lambda vol,pos: np.array([1., 0., 0.]))
     from vesuvius.neural_tracing.fiber_follow.shared.data import TracedFiber
     from vesuvius.neural_tracing.fiber_follow.shared.recovery import make_recovery_states, evaluate_recovery_states
     cfg = config()
@@ -503,7 +508,7 @@ def test_slab_recovery_evaluator_preserves_float_inputs_and_observed_states():
     fiber = TracedFiber('line', np.c_[arc*0, arc*0, arc], arc, '')
     sample = SampleConfig(crop=cfg.fine, n_history=cfg.n_history, recent_history_points=cfg.n_history,
                           n_future=cfg.n_future)
-    states = make_recovery_states([fiber], [dict(fiber=0, t=150., sign=1)], sample, dict(split='monitor'))
+    states = make_recovery_states([fiber], [dict(fiber=0, t=150., sign=1)], sample, dict(split='monitor'), None)
     inputs = batch(cfg, 1)
     inputs['x'] = {k: v.half() if v.is_floating_point() else v for k, v in inputs['x'].items()}
     class Model(torch.nn.Module):

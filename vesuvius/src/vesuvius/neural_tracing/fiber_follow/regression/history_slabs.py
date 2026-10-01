@@ -13,11 +13,12 @@ from vesuvius.neural_tracing.fiber_follow.shared.geometry import (
 )
 
 from vesuvius.neural_tracing.fiber_follow.shared.reference import observed_path
+from vesuvius.neural_tracing.fiber_follow.shared.heading import ct_frame, reframe_item, FRAME_POLICY
 
 SLOTS = 8
 SLAB = CropSpec(depth=8, width=65, behind=4, spacing=.5,
                 history_render='segments', history_sigma=1.)
-SAMPLING_REVISION = 'live_observed_slabs_v1'
+SAMPLING_REVISION = 'live_observed_slabs_ct_normal_v2'
 
 
 
@@ -80,6 +81,14 @@ def load_slabs(items, vol, cfg, pool=None):
     from vesuvius.neural_tracing.fiber_follow.shared.crop_sampling import scalar_crops, empty_image_batch
     started = time.perf_counter()
     layouts = [slab_layout(item) for item in items]
+    for item, layout in zip(items, layouts):
+        previous = None
+        for slab in layout:
+            frame = ct_frame(vol, slab['pos'], slab['frame'][:, 2], previous)
+            reframe_item(slab, frame)
+            slab['frame_policy'] = FRAME_POLICY
+            previous = frame
+        item['_sampled_slabs'] = layout
     flat = [slab for layout in layouts for slab in layout]
     images = scalar_crops(flat, vol, SLAB, pool, presence=False)
     grid = torch.from_numpy(crop_local_grid(SLAB)).float()

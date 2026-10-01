@@ -74,6 +74,8 @@ def test_short_degenerate_and_strict_prefix():
 
 def fake_ct(monkeypatch):
     calls = []
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.ct_normal',
+                        lambda vol,pos: np.array([0., 1., 0.]))
     def scalar(items, vol, crop, pool=None, *, presence=False, **kwargs):
         assert not presence
         calls.extend(items)

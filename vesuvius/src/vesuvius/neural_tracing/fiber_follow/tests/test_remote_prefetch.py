@@ -228,7 +228,7 @@ def test_prefetch_failure_propagates_without_foreground_fallback(tmp_path,monkey
     with pytest.raises(RuntimeError,match='remote source unavailable'):client.ensure_metadata(spec)
 
 
-def test_exact_main_and_history_footprints():
+def test_main_and_history_prefetch_covers_ct_normals_and_all_crop_rolls():
     from test_history_slabs import observation
     from slab_fixtures import cfg
     from vesuvius.neural_tracing.fiber_follow.regression.data import ObservationBuilder
@@ -237,10 +237,18 @@ def test_exact_main_and_history_footprints():
     model=cfg();builder=ObservationBuilder(model)
     item=observation([[100,100,0],[100,100,256]])
     bounds=list(builder.prefetch_bounds(item,SimpleNamespace(input_scale=2.)))
-    expected=[tight_block(item['pos'],item['frame'],model.fine,2.)]
-    expected += [tight_block(s['pos'],s['frame'],SLAB,2.) for s in slab_layout(item)]
-    assert len(bounds)==9
-    for got,want in zip(bounds,expected):np.testing.assert_array_equal(got,want)
+    observations=[(item,model.fine)]+[(s,SLAB) for s in slab_layout(item)]
+    assert len(bounds)==18
+    for j,(observation,crop) in enumerate(observations):
+        lo,size=bounds[2*j]
+        for angle in np.linspace(0,2*np.pi,33):
+            c,s=np.cos(angle),np.sin(angle)
+            rotation=np.array([[c,-s,0],[s,c,0],[0,0,1]])
+            start,extent=tight_block(observation['pos'],observation['frame']@rotation,crop,2.)
+            assert np.all(start>=lo) and np.all(start+extent<=lo+size)
+        start,extent=bounds[2*j+1]
+        center=observation['pos'][::-1]*2.
+        assert np.all(center-start>=32) and np.all(start+extent-center>32)
 
 
 def test_dataset_gates_reads_without_changing_samples(monkeypatch):

@@ -1,4 +1,4 @@
-"""Autoregressive fiber tracing (model policy) and a direction-field baseline."""
+"""Autoregressive fiber tracing with trusted twelve-voxel heading fits."""
 
 from __future__ import annotations
 
@@ -11,10 +11,11 @@ import numpy as np
 import torch
 
 from vesuvius.neural_tracing.fiber_follow.shared.data import build_inputs, read_blocks, render_count
-from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, crop_local_grid, frame_from_heading, normalize
+from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, crop_local_grid, normalize
 from vesuvius.neural_tracing.fiber_follow.shared.policy import DEFAULT_CONFIDENCE, DEFAULT_N_COMMIT, commit_prefix
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume
 from vesuvius.neural_tracing.fiber_follow.shared.reference import SEED_FIELDS, observed_path
+from vesuvius.neural_tracing.fiber_follow.shared.heading import linear12_heading, TRACE_HEADING_POLICY, FRAME_POLICY, ct_frame
 
 if TYPE_CHECKING:
     from vesuvius.neural_tracing.fiber_follow.flow_matching.model import FollowNet
@@ -28,9 +29,10 @@ class TraceParams:
     loop_radius: float = 1.5
     loop_skip: int = 40
     explore_calls: int = 0  # collection only: bounded suffix after first would-stop
-    # Stop policy. A would-stop call (the curve prefix clears ``confidence``)
+    # Stop policy. A would-stop call (no curve prefix clears ``confidence``)
     # ends the trace only after ``stop_patience`` consecutive such calls; the
-    # earlier ones commit a single point of the predicted curve.
+    # earlier ones commit a single point while preserving the incoming frame,
+    # as do forced low-confidence steps during collection exploration.
     # Defaults reproduce the immediate stop.
     stop_patience: int = 1
     seed: int = 0  # stochastic sampler seed; each directed trace has its own stream
@@ -41,34 +43,6 @@ class TraceParams:
         if self.stop_patience < 1:
             raise ValueError('stop_patience must be positive')
 
-
-def point_samples(vol: FiberVolume, pts_xyz: np.ndarray) -> np.ndarray:
-    """Nearest-voxel presence (0..1) at xyz points."""
-    out = np.zeros(len(pts_xyz), np.float32)
-    zyx = np.round(pts_xyz[:, ::-1]).astype(np.int64)
-    for i, q in enumerate(zyx):
-        presence = vol.presence_for_seeding() if hasattr(vol, 'presence_for_seeding') else vol.presence
-        out[i] = presence.read(q, (1, 1, 1))[0, 0, 0] / 255.0
-    return out
-
-
-def field_axis(vol: FiberVolume, p_xyz: np.ndarray) -> tuple[np.ndarray, float]:
-    """Local ridge axis of presence at a point -> (principal axis xyz, peak presence strength).
-
-    Initialization only; the model never sees presence-derived directions.
-    """
-    offsets = np.stack(np.meshgrid(*[np.arange(-3, 4)]*3, indexing='ij'), -1).reshape(-1, 3)
-    points = p_xyz[None]+offsets
-    presence = vol.presence_for_seeding() if hasattr(vol, 'presence_for_seeding') else vol.presence
-    weights = presence.sample_nearest(points[:, ::-1]).astype(float)/255
-    weights = np.where(weights >= .5*weights.max(), weights**2, 0)
-    if weights.sum() <= 1e-8:
-        raise ValueError('No presence support for a seed heading; supply an explicit heading')
-    center = np.average(points, axis=0, weights=weights)
-    delta = points-center
-    covariance = (delta*weights[:, None]).T @ delta/weights.sum()
-    _, axes = np.linalg.eigh(covariance)
-    return axes[:, -1], float(weights.max()**.5)
 
 class ModelTracer:
     # When set, build_inputs also receives each trace's seed segment and length.
@@ -126,6 +100,8 @@ class ModelTracer:
         if initial_states is not None:
             if len(initial_states) != n:
                 raise ValueError('One initial observed state is required per seed')
+            if any(s['frame_policy'] != FRAME_POLICY for s in initial_states):
+                raise ValueError('Unsupported crop frame policy; recollect replay')
             paths = [list(observed_path(dict(s, pos=p,
                       hist_local=(np.asarray(s['hist'])-p) @ s['frame'])))
                      for s,p in zip(initial_states,seeds_xyz)]
@@ -133,14 +109,21 @@ class ModelTracer:
                    for path, p in zip(paths, seeds_xyz)):
                 raise ValueError('Initial observed prefix must end at resumed head')
         hist_start = [len(p)-1 for p in paths]
-        frames = [frame_from_heading(h) for h in headings]
+        frames = ([ct_frame(self.vol, p, h) for p,h in zip(seeds_xyz, headings)]
+                  if initial_states is None else [np.asarray(s['frame']).copy() for s in initial_states])
         stochastic = (getattr(self.model.cfg, 'sampler_mode', 'zero') == 'gaussian'
                       or getattr(self.model.cfg, 'gaussian_candidates', 0) > 0)
         if stochastic:
             from vesuvius.neural_tracing.fiber_follow.flow_matching.sampling import trace_generator, trace_noise
             generators = [trace_generator(self.p.seed, p, h) for p, h in zip(seeds_xyz, headings)]
+        # Explicit histories supplied for a new trace are trusted. Resumed
+        # states carry the exact acceptance boundary saved at their decision.
+        heading_start = np.zeros(n, dtype=np.int64)
         if initial_states is not None:
-            frames = [np.asarray(s['frame']).copy() for s in initial_states]
+            for i, state in enumerate(initial_states):
+                heading_start[i] = int(state['heading_start'])
+                if not 0 <= heading_start[i] <= len(paths[i]):
+                    raise ValueError('Invalid trusted heading history boundary')
         references = [dict(seed_pos=np.asarray(p).copy(), seed_tangent=normalize(np.asarray(h)),
                            seed_age=0., seed_valid=True) for p, h in zip(seeds_xyz, headings)]
         if histories is not None:
@@ -206,7 +189,9 @@ class ModelTracer:
                              points=points[j].copy(), confidence=conf.copy(), n_commit=commit, would_stop=would_stop, exploratory=exploratory,
                              recovery_allowed=bool(allowed[j]), recovery_blocked=bool(recovery_blocked),
                              travelled=float(length[i]), last_segment=last_segment[i].copy(),
-                             observed_path=np.asarray(paths[i]).copy())
+                             observed_path=np.asarray(paths[i]).copy(),
+                             heading_start=int(heading_start[i]), heading_policy=TRACE_HEADING_POLICY,
+                             frame_policy=FRAME_POLICY)
                 state.update({**references[i], 'seed_age': references[i]['seed_age']+float(length[i])})
                 if on_decision is not None and on_decision(int(i), state) is False:
                     active[i], reasons[i] = False, 'oracle'
@@ -230,8 +215,9 @@ class ModelTracer:
                 world = pos[j]+points[j, :commit] @ fr[j].T
                 seg = np.concatenate([pos[j][None], world])
                 new = []
+                first_connection_count = 0
                 remaining = pp.max_len-length[i]
-                for a, b in zip(seg[:-1], seg[1:]):
+                for segment_index, (a, b) in enumerate(zip(seg[:-1], seg[1:])):
                     distance = float(np.linalg.norm(b-a))
                     if distance < 1e-8:
                         continue
@@ -239,6 +225,8 @@ class ModelTracer:
                     end = a+(b-a)*(used/distance)
                     steps = max(1, int(np.ceil(used)))
                     new.extend(a+(end-a)*(k/steps) for k in range(1, steps+1))
+                    if segment_index == 0:
+                        first_connection_count = len(new)
                     remaining -= used
                     if remaining <= 1e-7:
                         break
@@ -255,10 +243,20 @@ class ModelTracer:
                     continue
                 last_segment[i] = np.concatenate([pos[j][None], new])
                 length[i] += float(arclength(last_segment[i])[-1])
+                old_size = len(paths[i])
                 paths[i].extend(new)
-                # Heading uses committed geometry only, never a future prediction.
-                tangent = new[-1]-(new[-2] if len(new)>1 else pos[j])
-                frames[i] = frame_from_heading(normalize(tangent), frames[i][:, 0])
+                if would_stop:
+                    # Exclude forced geometry from all subsequent fits too.
+                    # The first accepted recovery point starts a fresh suffix.
+                    heading_start[i] = len(paths[i])
+                else:
+                    if heading_start[i] >= old_size:
+                        # Do not fit the connector from an untrusted head to
+                        # the first accepted prediction, including its resamples.
+                        heading_start[i] = old_size+first_connection_count-1
+                    tangent = linear12_heading(paths[i], int(heading_start[i]))
+                    heading = frames[i][:, 2] if tangent is None else tangent
+                    frames[i] = ct_frame(self.vol, paths[i][-1], heading, frames[i])
                 if abort is not None and abort(int(i), paths[i]):
                     active[i], reasons[i] = False, 'abort'
                 elif length[i] >= pp.max_len-1e-6:

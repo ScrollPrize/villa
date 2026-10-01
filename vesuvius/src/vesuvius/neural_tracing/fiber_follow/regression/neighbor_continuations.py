@@ -4,7 +4,7 @@ import numpy as np
 from vesuvius.neural_tracing.fiber_follow.regression.neighbor_mining import exact_nearest
 from vesuvius.neural_tracing.fiber_follow.shared.data import label_state
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import (
-    arclength, interp_at, frame_from_heading, random_rotation_about, normalize,
+    arclength, interp_at, frame_from_heading, normalize,
 )
 
 
@@ -89,7 +89,7 @@ def wrong_continuation(bank, cfg, rng, *, tail_length_range=(4., 128.), prefer_l
     heading = pos-interp_at(path,distance,np.array([distance[-1]-2]))[0]
     if np.linalg.norm(heading) < 1e-6:
         return None
-    frame = random_rotation_about(frame_from_heading(heading),rng.uniform(0,2*np.pi))
+    frame = frame_from_heading(heading)
     original_t = fiber.length-own_t[-1] if reverse else own_t[-1]
     item = label_state(fiber,pos,frame,history,mask,cfg,t=original_t,reverse=reverse,offtrack=True)
     item.update(fiber_ref=(fi,float(own_t[-1]),reverse),source=3,source_step=-1,stratum=4,

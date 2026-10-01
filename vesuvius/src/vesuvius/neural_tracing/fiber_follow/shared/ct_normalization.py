@@ -137,6 +137,9 @@ def prepare_normalization(out, specs, *, resume=None, known=None):
     for spec in specs:
         key = volume_key(spec)
         ct = open_ct(spec)
+        if (known is not None and key in known['volumes'] and key in document['volumes']
+                and known['volumes'][key] != document['volumes'][key]):
+            raise ValueError(f'Inference CT normalization differs from the checkpoint: {key}')
         if key not in document['volumes']:
             if resume is not None:
                 raise ValueError(f'Resumed checkpoint lacks CT calibration: {key}')

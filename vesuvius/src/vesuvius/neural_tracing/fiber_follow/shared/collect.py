@@ -19,6 +19,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength, tang
 from vesuvius.neural_tracing.fiber_follow.shared.trace import DEFAULT_CONFIDENCE, DEFAULT_N_COMMIT, ModelTracer, TraceParams
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume
 from vesuvius.neural_tracing.fiber_follow.shared.reference import SEED_FIELDS, SEED_DEFAULTS
+from vesuvius.neural_tracing.fiber_follow.shared.heading import SEED_HEADING_POLICY, TRACE_HEADING_POLICY, FRAME_POLICY
 
 
 class DecisionCollector:
@@ -141,6 +142,7 @@ class DecisionCollector:
         drift = float('nan') if offtrack else float(np.linalg.norm(item['gt_history'][0]))
         row.update(source_cache=-1, source_row=len(self.rows), fiber_idx=self.fi, t=self.t, reverse=sign < 0, offtrack=offtrack, hard=hard, drift=drift)
         row['travelled'] = travelled
+        row['heading_start'] = int(state.get('heading_start', 0))
         if self.bank_switch is not None:
             row.update(self.bank_switch, failure_kind=1)
         elif self.boundary_crossed:
@@ -238,7 +240,7 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer, bank_loader=
     seeds = []
     for fi in rng.permutation(len(train_f)):
         seed_pool = make_seeds([train_f[fi]], vol, per_fiber=args.seeds_per_fiber,
-                                min_presence=.8, seed=int(rng.integers(2**31)), use_presence=spec.mode != 'ct')
+                                seed=int(rng.integers(2**31)))
         for seed in seed_pool:
             seed['fiber'] = int(fi)
             if band is None or not band.lo-64 <= seed['pos'][2] < band.hi+64:
@@ -271,6 +273,7 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer, bank_loader=
         raise ValueError('No eligible decision states; no cache was published')
     st = OnPolicyStates(manifest=fiber_manifest(train_f),
                         provenance=dict(checkpoint=os.path.abspath(args.checkpoint), step=ck.get('step'),
+                                        seed_heading_policy=SEED_HEADING_POLICY, heading_policy=TRACE_HEADING_POLICY,frame_policy=FRAME_POLICY,
                                         model_cfg=model.cfg.to_dict(), crop=asdict(crop),
                                         sampler_mode=getattr(model.cfg, 'sampler_mode', 'zero'),
                                         volume=spec.to_dict(), collection=vars(args),
@@ -285,8 +288,8 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer, bank_loader=
     st.save(temp)
     # Pre-create mmap before publishing so multiple loader workers never race.
     OnPolicyStates.load(temp)
-    temp_mmap = Path(str(temp)[:-4]+'_mmap_v6')
-    final_mmap = Path(str(path)[:-4]+'_mmap_v6')
+    temp_mmap = Path(str(temp)[:-4]+'_mmap_v8')
+    final_mmap = Path(str(path)[:-4]+'_mmap_v8')
     os.replace(temp_mmap, final_mmap)
     os.replace(temp, path)
     print(json.dumps(dict(states=len(st), hard=int(st.hard.sum()), offtrack=int(st.offtrack.sum()), out=str(path))))

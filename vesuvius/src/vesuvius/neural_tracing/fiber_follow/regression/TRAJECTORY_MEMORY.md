@@ -51,13 +51,16 @@ and before the feed-forward block. Empty history has exactly zero contribution,
 including output bias. Encode once per decision, keeping gradients attached;
 reuse these features for generated candidates, retries and supplied candidates.
 No historical coordinates or path markings separately enter either head.
+Current and historical CT crops share per-volume background + 3-noise masking
+and per-crop foreground median/MAD normalization. Background stays at -4;
+normalization calibration is persisted in the run JSON and checkpoints.
 
 The patch4 encoder embeds overlapping 6x6x6 neighborhoods with a stride-4
 convolution and boundary padding 1. It samples 120x104x104 crops directly,
 without extra image padding, yielding a 30x26x26 token grid. The optional image
 stem adds a full-resolution BasicBlockD and two downsampling residual stages
 (InstanceNorm/ReLU, widths 32 then 64) to the same tokens. The replacement
-encoders use architecture v13 and are trained fresh. Dense models still
+encoders use architecture v14 and are trained fresh. Dense models still
 use full output-plane features; the patch token-only model still samples its
 coarse patch lattice. Refinement predicts absolute replacement paths through the
 same coordinate readout. Acceptance, commit limits and connection bounds retain

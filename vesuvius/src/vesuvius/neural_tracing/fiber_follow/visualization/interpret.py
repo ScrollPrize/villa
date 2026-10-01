@@ -34,62 +34,22 @@ VARIANTS = {
 }
 
 
-def legacy_prefix(hist, mask, pos, seed, seed_age, history_step):
-    """v5 has sampled history, not the complete committed polyline required by v6.
-
-    Only adapt histories reaching the seed: never bridge an unobserved long gap.
-    The short seed-to-oldest-sample segment is an explicit resampling approximation.
-    """
-    mask = np.asarray(mask).astype(bool)
-    count = int(mask.sum())
-    if not np.array_equal(mask, np.arange(len(mask)) < count):
-        raise ValueError('Legacy history must be a contiguous observed prefix')
-    history = np.asarray(hist)[mask][::-1]
-    first = history[0] if len(history) else pos
-    if seed_age > (count + 1.5) * history_step or np.linalg.norm(first - seed) > 1.5 * history_step:
-        raise ValueError('Legacy replay truncates the seed path; use replay v6 with complete prefixes')
-    path = np.concatenate((np.asarray(seed)[None], history, np.asarray(pos)[None]))
-    return path[np.r_[True, np.linalg.norm(np.diff(path, axis=0), axis=1) > 1e-9]]
-
-
 def replay_item(source, row, fibers, sample):
-    """Read current replay through its loader, or explicitly adapt read-only v5 arrays."""
-    source = Path(source)
-    if source.is_dir():
-        metadata = json.loads((source / 'metadata.json').read_text())
-    else:
-        with np.load(source) as archive:
-            metadata = json.loads(str(archive['__metadata__'].item()))
-    version = metadata['version']
-    if version == 6:
-        states = OnPolicyStates.load(source)
-        states.validate_fibers(fibers)
-        if not 0 <= row < len(states):
-            raise ValueError('Replay row outside cache')
-        get = lambda key: getattr(states, key)[row]
-        prefix = states.observed_prefix(row)
-        provenance = 'Complete committed replay-v6 prefix'
-    elif version == 5 and source.is_dir():
-        if metadata['fibers'] != fiber_manifest(fibers):
-            raise ValueError('Replay fibers do not match the selected fiber split')
-        def get(key):
-            values = np.load(source / (key + '.npy'), mmap_mode='r')
-            if not 0 <= row < len(values):
-                raise ValueError('Replay row outside cache')
-            return np.array(values[row], copy=True)
-        if not bool(get('seed_valid')):
-            raise ValueError('Legacy adaptation requires a saved seed')
-        prefix = legacy_prefix(get('hist'), get('hmask'), get('pos'), get('seed_pos'),
-                               float(get('seed_age')), sample.history_step)
-        provenance = ('Legacy v5: saved resampled observed history plus saved seed; '
-                      'not the original per-commit polyline. No annotation-derived history.')
-    else:
-        raise ValueError('Use a replay-v6 cache or an existing v5 mmap directory')
+    """Read only current CT-normal replay with complete observed prefixes."""
+    states = OnPolicyStates.load(source)
+    states.validate_fibers(fibers)
+    if not 0 <= row < len(states):
+        raise ValueError('Replay row outside cache')
+    get = lambda key: getattr(states, key)[row]
+    prefix = states.observed_prefix(row)
+    provenance = 'Complete committed CT-normal replay prefix'
     index = int(get('fiber_idx'))
     item = label_state(fibers[index], get('pos'), get('frame'), get('hist'), get('hmask'), sample,
                       t=float(get('t')), reverse=bool(get('reverse')), offtrack=bool(get('offtrack')))
     item.update({key: get(key) for key in SEED_FIELDS})
     item['observed_path'] = prefix
+    from ..shared.heading import FRAME_POLICY
+    item['frame_policy'] = FRAME_POLICY
     observed_path(item)  # Validate endpoints before reading any volume.
     return item, index, provenance
 
@@ -265,7 +225,7 @@ def main(argv=None):
         for key, value in x.items():
             if key != 'fine' and key != 'history_load_seconds':
                 arrays['input_' + key] = array(value[0])
-    layout = slab_layout(item)
+    layout = item['_sampled_slabs']
     arrays['slab_positions'] = np.stack([s['pos'] for s in layout])
     arrays['slab_frames'] = np.stack([s['frame'] for s in layout])
     validate_attention(arrays)

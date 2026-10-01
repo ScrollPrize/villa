@@ -10,9 +10,10 @@ from vesuvius.neural_tracing.fiber_follow.shared.labels import prefix_labels
 from vesuvius.neural_tracing.fiber_follow.shared.trace import ModelTracer, TraceParams
 from vesuvius.neural_tracing.fiber_follow.shared.policy import DIAGNOSTIC_THRESHOLDS, select_candidate
 from vesuvius.neural_tracing.fiber_follow.shared.reference import SEED_FIELDS, observed_seed
+from vesuvius.neural_tracing.fiber_follow.shared.heading import FRAME_POLICY, orient_item
 
 
-def make_recovery_states(fibers, seeds, cfg, provenance, seed=20260925):
+def make_recovery_states(fibers, seeds, cfg, provenance, vol, seed=20260925):
     """Freeze four drift bands per seed using a private RNG, preserving identity."""
     rng = np.random.default_rng(seed)
     rows, track = [], []
@@ -29,6 +30,7 @@ def make_recovery_states(fibers, seeds, cfg, provenance, seed=20260925):
                     break
             else:
                 raise ValueError('Could not draw fixture drift band')
+            orient_item(item, vol)
             rows.append(dict(fiber_idx=fi, t=entry['t'], reverse=reverse, pos=item['pos'], frame=item['frame'],
                 hist=item['hist_local']@item['frame'].T+item['pos'], hmask=item['hmask'],
                 offtrack=False, hard=True, exploratory=False, drift=drift,
@@ -67,6 +69,7 @@ def evaluate_recovery_states(model, vol, states, fibers, sample, *, device='cpu'
                          t=float(states.t[j]),reverse=bool(states.reverse[j]),offtrack=bool(states.offtrack[j]))
         item.update({k: getattr(states, k)[j] for k in SEED_FIELDS if hasattr(states, k)})
         item['observed_path'] = states.observed_prefix(j)
+        item['frame_policy'] = FRAME_POLICY
         cpu = batch_builder([item], vol) if batch_builder else collate_with_volume([item],vol,sample.crop,grid)
         b = move(cpu)
         sampling={}
@@ -111,6 +114,8 @@ def evaluate_recovery_states(model, vol, states, fibers, sample, *, device='cpu'
                             n_commit=n_commit),device=device)
             state={k:getattr(states,k)[j] for k in ('hist','hmask','frame')}
             state['observed_path'] = states.observed_prefix(j)
+            state['heading_start'] = int(states.heading_start[j])
+            state['frame_policy'] = FRAME_POLICY
             state.update({k: getattr(states, k)[j] for k in SEED_FIELDS if hasattr(states, k)})
             try:
                 paths,reasons=tracer.trace(states.pos[j:j+1],states.frame[j:j+1,:,2],initial_states=[state])

@@ -44,18 +44,118 @@ while preparing the fork. Existing destinations, zero-stage source models, and
 nonstandard optimizer layouts are rejected. As with ordinary resumes, loader
 random streams restart. No source config defaults are used.
 
-Architecture identifiers are `axial_fiber_slabs_v13`,
-`axial_patch4_overlap_fiber_slabs_v13`, `axial_patch4_overlap_tokens_fiber_slabs_v13`,
-and `axial_patch4_residual_stem_tokens_fiber_slabs_v13`.
+Architecture identifiers are `axial_fiber_slabs_v14`,
+`axial_patch4_overlap_fiber_slabs_v14`, `axial_patch4_overlap_tokens_fiber_slabs_v14`,
+and `axial_patch4_residual_stem_tokens_fiber_slabs_v14`.
 Patch4 uses a learned 6x6x6 convolution with stride 4 and padding 1. Adjacent
 neighborhoods overlap by two voxels. The sampled crop is 120x104x104; patch4
 dimensions must be multiples of four, with no extra image padding. The token
 grid is 30x26x26 with centers at offset 1.5 input samples; dense reconstruction
 uses 4x4x4 output cells. Crop sampling and physical token positions remain
 centered laterally, including even crop widths. Convolution boundary padding
-is still used. Replay v6 remains compatible. Recurrent checkpoints and older replay
+is still used. Replay v8 stores CT-normal frames and the trusted heading-history boundary. Recollect
+older replay caches. Recurrent checkpoints and older replay
 are rejected; there is no weight migration or memory compatibility interface.
 The existing regression `train`, `collect`, and `infer` module entry points remain.
+
+### Heading initialization and updates
+
+Inference, rollout collection, and validation initialize every seed from raw CT
+plus an H/V family. The unchanged seed locates a 65³ native CT cube. A structure
+tensor (derivative sigma 1, integration sigma 4) estimates the sheet normal;
+V projects world z into the sheet, and H follows its intersection with xy.
+No seed snapping, presence PCA, direction zarr, or annotation tangent estimates
+the seed axis. Unusable CT or ambiguous H/V orientation is reported; collection
+skips those seeds. Model input channels remain controlled by the model config.
+
+Supply `--family H` or `--family V` alongside inference seeds. One family applies
+to all seeds; repeat it once per seed for mixed families. Both signs are traced:
+
+```bash
+../../../../.venv/bin/python -m vesuvius.neural_tracing.fiber_follow.regression.infer \
+  --checkpoint output/run/last.pt --seed 18529.9,13044.9,51234.1 --family H --out output/traced
+```
+
+After confident commits, heading is a free-intercept linear fit to 13 equally
+spaced samples spanning the last 12 trace-grid voxels of trusted committed path.
+With less than 12 voxels, the current heading is retained. Failed decisions
+retain the entire frame, including its rotation. Forced exploratory moves are excluded from subsequent
+fits, including the connector to the first accepted recovery point; fitting
+resumes after 12 voxels of accepted recovery geometry. Replay v8 preserves this
+boundary when a decision is resumed. There is no alternate heading policy.
+
+All image crops use CT-normal rotation: u is the CT sheet normal projected
+perpendicular to the heading, and v is heading × u. An independent seed chooses
+a deterministic sign; accepted trace steps carry the previous u sign forward to
+prevent eigenvector flips. Accepted short steps may update roll while retaining
+their heading. If a later normal is unusable or nearly parallel to the heading,
+the last CT-established roll is transported. Initialization requires a usable
+normal. Failed steps do not reestimate either heading or roll.
+
+Fresh training still perturbs annotation-based heading and position, but CT
+resolves roll before image sampling. History, labels, and candidate coordinates
+rotate together. There is no random-roll augmentation or old-frame switch.
+Replay uses its exact saved frame, including held failure views. Historical slabs
+also use local CT-normal frames with sign continuity in chronological order.
+Remote prefetch covers the normal-estimation cube and every possible roll until
+CT resolves the final frame. Holdout checks include those read footprints.
+
+Real-CT comparisons and implementation checks are in
+`output/heading_investigation_20261001/ct_rotation_implementation/`; the visual
+experiment is in the adjacent `ct_frame_rotation/` directory.
+
+### Default CT normalization
+
+Every CT input uses a per-volume background estimate and foreground-only robust
+z-scores. Startup samples up to 128 available chunks (64 candidate 8x8x8 blocks
+each), excluding almost-zero-filled blocks. The dominant block-median intensity
+among the quietest quarter by local MAD estimates background; nearby quiet blocks
+estimate its noise scale, with a minimum of two native uint8 levels. This is
+unsupervised intensity calibration, not a labeled tissue segmentation. Local cache
+coverage can bias the estimate; a new remote volume with an empty cache requires
+initial chunk reads. The run logs each volume's estimated background and threshold.
+
+`ct_normalization.json` in the output directory records source/level, array metadata,
+sampled chunk coordinates, seed and estimates. Checkpoints embed the same document.
+Resume reuses it exactly, restores a missing JSON from the checkpoint without
+recalibration, and rejects a JSON/checkpoint mismatch. Mixed-source workers,
+validation and replay collectors share those records. Inference writes its own
+output JSON, reuses checkpoint estimates for known volumes, and calibrates each
+new volume once. There is no alternate input-normalization mode; older architecture
+checkpoints are not accepted by the v14 trainer.
+
+After trilinear interpolation, CT values strictly above `background + 3*noise`
+form the material mask. Each current crop and each historical CT slab estimates
+its own foreground median/MAD from every fourth voxel on each axis (a full pass
+handles a sparse foreground missed by that grid). Statistics use native uint8 bins;
+interpolated intensities remain continuous. Divide by
+`max(1.4826*MAD, 2*background_noise)` and clip to [-4,4]. Excluded voxels become -4,
+the black/background value in normalized model space. Empty crops stay entirely
+background. This is the reviewed **background + 3 noise scales** method, with no
+spatial smoothing or connected-component mask.
+
+Training applies contrast, brightness and noise after normalization, preserving
+the background mask. Brightness/noise parameters express fractions of the full
+8-unit normalized range. Optional blur averages material with material only;
+presence remains in [0,1], direction moments and history heatmaps are unchanged.
+The persistent volume cache continues to store original uint8 intensities.
+
+Reproduce the real-volume CPU benchmark using the project Python:
+
+```bash
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+python scripts/benchmark_ct_normalization.py
+```
+
+Results are in `output/ct_normalization_validation/benchmark.json`. On this host,
+40 timed repetitions after 3 warmups across nine reviewed crops gave main-crop
+(120x104x104 float32) median 0.227–0.272 ms, mean 0.230–0.274 ms and p95
+0.233–0.289 ms. A plain copy baseline took median 0.207–0.210 ms. Normalization
+adds its full kernel time to sampling; the copy is a bandwidth reference, not
+existing loader work it replaces. Historical 8x65x65 slabs took median
+0.0065–0.0212 ms. Measurements exclude I/O, interpolation, allocation and JIT.
+Initial calibration of all three cached volumes took 2.94 s; saved-estimate reuse
+with metadata checks took 0.00063 s. GPU/end-to-end training throughput is unmeasured.
 
 ### BasicBlockD image and history encoders
 

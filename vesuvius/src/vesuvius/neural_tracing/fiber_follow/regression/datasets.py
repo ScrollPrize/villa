@@ -82,19 +82,25 @@ def validation_manifest(fibers, spec, seed=0, monitor_count=32):
     """Freeze distinct monitor/calibration/final fiber IDs and CT-only seeds."""
     from ..shared.evaluate import make_seeds
     from ..shared.experiment import jsonable
+    from ..shared.heading import SEED_HEADING_POLICY, TRACE_HEADING_POLICY, FRAME_POLICY
+    from ..shared.volume import FiberVolume
+    from dataclasses import replace
+    # Seed geometry reads CT only, even when the model itself has extra channels.
+    seed_volume = FiberVolume(replace(spec, inputs='ct', load_presence=False), cache_bytes=256 << 20)
     rng = np.random.default_rng(seed)
     ids = rng.permutation(len(fibers)).tolist()
     n = min(monitor_count, max(1,len(ids)//3))
     groups = dict(monitor=ids[:n],calibration=ids[n:n+max(1,(len(ids)-n)//2)],
                   final=ids[n+max(1,(len(ids)-n)//2):])
-    result = dict(version=1,fibers=fiber_manifest(fibers),volume=spec.to_dict())
+    result = dict(version=3,fibers=fiber_manifest(fibers),volume=spec.to_dict(),
+                  seed_heading_policy=SEED_HEADING_POLICY,heading_policy=TRACE_HEADING_POLICY,frame_policy=FRAME_POLICY)
     for name,members in groups.items():
         result[name+'_fibers'] = members
         seeds = []
         # Keep manifest generation bounded: reserve all IDs, but only generate
         # monitor-sized seed subsets for calibration/final on large AFV catalogs.
         for fi in members[:monitor_count]:
-            candidates = make_seeds([fibers[fi]],None,per_fiber=1,seed=seed+fi,use_presence=False)
+            candidates = make_seeds([fibers[fi]],seed_volume,per_fiber=1,seed=seed+fi)
             if candidates:
                 value = candidates[0]
                 seeds.append(dict(value,fiber=fi))

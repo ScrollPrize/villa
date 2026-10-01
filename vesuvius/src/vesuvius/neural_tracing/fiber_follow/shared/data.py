@@ -24,7 +24,6 @@ from vesuvius.neural_tracing.fiber_follow.shared.geometry import (
     frame_from_heading,
     interp_at,
     normalize,
-    random_rotation_about,
     render_history,
     sample_oriented_fast,
     tangent_at,
@@ -188,7 +187,7 @@ def training_state_allowed(item, crop: CropSpec, band: ZBand | None):
 
     Keep the original 48-voxel position guard and also check the actual rotated
     crop's read footprint (including interpolation support). Applied before I/O
-    to fresh and cached states, after their random roll/offset is selected.
+    to fresh and cached states. The circumsphere covers any CT-selected roll.
     """
     if band is None:
         return True
@@ -260,7 +259,7 @@ def make_sample(fiber: TracedFiber, t: float, reverse: bool, cfg: SampleConfig, 
     axis_ang = rng.uniform(0, 2 * np.pi)
     ax = math.cos(axis_ang) * fr[:, 0] + math.sin(axis_ang) * fr[:, 1]
     heading = normalize(math.cos(ang) * tau + math.sin(ang) * ax)
-    frame = random_rotation_about(frame_from_heading(heading), rng.uniform(0, 2 * np.pi))
+    frame = frame_from_heading(heading)  # provisional basis; CT resolves crop roll before sampling
 
     # history: GT points behind with the drift ramping in
     count = cfg.n_history
@@ -478,10 +477,17 @@ class FollowDataset(torch.utils.data.IterableDataset):
         return item
 
     def state_allowed(self, item):
-        return (all(training_state_allowed(item, crop, self.exclude)
+        allowed = (all(training_state_allowed(item, crop, self.exclude)
                     for crop in (self.cfg.crop, *self.additional_crops))
                 and (not hasattr(self.batch_builder, 'footprint_allowed')
                      or self.batch_builder.footprint_allowed(item, self.exclude)))
+        if allowed and self.exclude is not None:
+            from types import SimpleNamespace
+            scale = self.vol_spec.grid_scale/self.vol_spec.ct_grid_scale
+            for start,size in self.prefetch_bounds([item],SimpleNamespace(input_scale=scale)):
+                if start[0]/scale < self.exclude.hi and (start[0]+size[0])/scale > self.exclude.lo:
+                    return False
+        return allowed
 
     def replay_item(self, draw, rng):
         source,band,op,j = draw
@@ -500,6 +506,8 @@ class FollowDataset(torch.utils.data.IterableDataset):
                     fiber_ref=(fi,self.fibers[fi].length-t if reverse else t,reverse))
         item.update({k: getattr(op, k)[j] for k in SEED_FIELDS if hasattr(op, k)})
         item['observed_path'] = op.observed_prefix(j)
+        from .heading import FRAME_POLICY
+        item['frame_policy'] = FRAME_POLICY
         item = self.prepare(item,rng)
         return item if self.state_allowed(item) else None
 
@@ -510,7 +518,8 @@ class FollowDataset(torch.utils.data.IterableDataset):
     def prefetch_bounds(self, items, vol):
         if hasattr(self.batch_builder, 'prefetch_bounds'):
             return [bound for item in items for bound in self.batch_builder.prefetch_bounds(item,vol)]
-        return [tight_block(item['pos'],item['frame'],self.cfg.crop,vol.input_scale) for item in items]
+        from .heading import frame_prefetch_bounds
+        return [bound for item in items for bound in frame_prefetch_bounds(item,self.cfg.crop,vol.input_scale)]
 
     def prefetch_items(self, items, vol, *, required=False):
         if self.remote_prefetch is None or not items:
@@ -734,6 +743,9 @@ def build_inputs(raw, starts, pos, frames, hist, hmask, grid: torch.Tensor, n_re
 def collate_with_volume(items, vol: FiberVolume, crop: CropSpec, grid: torch.Tensor | None = None):
     """Worker-side batch. With ``grid`` the model input ``x`` (fp16) is built
     here on CPU; otherwise raw blocks + geometry are returned."""
+    from .heading import orient_item
+    for item in items:
+        orient_item(item, vol)
     if grid is None and vol.spec.mode == 'ct+presence':
         grid = torch.from_numpy(crop_local_grid(crop)).float()
     raw, starts = read_blocks(items, vol, crop)
@@ -796,7 +808,7 @@ def label_state(fiber, pos, frame, hist_world, hmask, cfg, *, t, reverse, offtra
                 **continuation_targets(fiber, traversal_t, reverse, pos, frame, cfg, offtrack))
 
 
-STATE_VERSION = 6
+STATE_VERSION = 8
 
 class OnPolicyStates:
     """States (pos, heading, own-trace history) visited by a tracer on GT fibers.
@@ -817,6 +829,8 @@ class OnPolicyStates:
                 "source_row": lambda n: np.full(n, -1, np.int64),
                 "failure_kind": lambda n: np.zeros(n, np.int8),
                 "travelled": lambda n: np.full(n, np.nan, np.float64),
+                # First trusted vertex within this trace's observed prefix.
+                "heading_start": lambda n: np.zeros(n, np.int64),
                 "switch_distance": lambda n: np.full(n, np.nan, np.float64),
                 "switch_pos": lambda n: np.full((n,3), np.nan, np.float64),
                 "switch_decision": lambda n: np.full(n, -1, np.int64),
@@ -854,7 +868,7 @@ class OnPolicyStates:
         """Actual committed polyline through this decision; no future vertices."""
         start, end = int(self.seq_start[j]), int(self.seq_end[j])
         if not 0 <= start < end <= len(self.track_pos):
-            raise ValueError('Replay needs complete observed prefixes; recollect with replay v6')
+            raise ValueError('Replay needs complete observed prefixes; recollect with replay v8')
         path = self.track_pos[start:end]
         if not np.allclose(path[-1], self.pos[j], atol=1e-5, rtol=0):
             raise ValueError('Replay prefix does not end at decision head')
@@ -882,7 +896,7 @@ class OnPolicyStates:
         """``path``: .npz from collect.py (converted once to a sibling ``_mmap/``
         dir of .npy files) or such a directory."""
         path = os.fspath(path)
-        d = path[:-4] + "_mmap_v6" if path.endswith(".npz") else path
+        d = path[:-4] + "_mmap_v8" if path.endswith(".npz") else path
         metadata_path = os.path.join(d, "metadata.json")
         if path.endswith(".npz"):
             with np.load(path, allow_pickle=False) as z:

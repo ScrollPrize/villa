@@ -4,20 +4,21 @@ from __future__ import annotations
 
 
 import numpy as np
+import warnings
 from scipy.spatial import cKDTree
 
 from vesuvius.neural_tracing.fiber_follow.shared.data import DATA_VERSION, TracedFiber
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import interp_at, tangent_at
-from vesuvius.neural_tracing.fiber_follow.shared.trace import field_axis, point_samples
+from vesuvius.neural_tracing.fiber_follow.shared.heading import ct_seed_heading, SeedHeadingError, SEED_HEADING_POLICY
 
 
-def make_seeds(fibers: list[TracedFiber], vol, per_fiber: int = 3, min_presence: float = 0.8,
-               margin: float = 32.0, seed: int = 0, *, use_presence=True):
-    """Seed states at high-presence GT points; one entry per (seed, direction).
+def make_seeds(fibers: list[TracedFiber], vol, per_fiber: int = 3,
+               margin: float = 32.0, seed: int = 0):
+    """Annotated positions, CT/HV axes; one entry per (seed, direction).
 
-    Initial heading is the local presence PCA axis, signed to agree with the
-    GT direction being evaluated. With ``use_presence=False``, positions and
-    headings come from GT alone, without reading auxiliary predictions."""
+    Annotation chooses only the scoring sign of the estimated axis. Missing
+    CT orientation is reported and skipped, never replaced by a GT tangent.
+    """
     rng = np.random.default_rng(seed)
     out = []
     for fi, f in enumerate(fibers):
@@ -25,18 +26,22 @@ def make_seeds(fibers: list[TracedFiber], vol, per_fiber: int = 3, min_presence:
             continue
         ts = np.arange(margin, f.length - margin, 4.0)
         good = ts
-        if use_presence:
-            pres = point_samples(vol, interp_at(f.points, f.s, ts))
-            good = ts[pres >= min_presence]
         if len(good) == 0:
             continue
         for t in rng.choice(good, size=min(per_fiber, len(good)), replace=False):
             p = interp_at(f.points, f.s, np.array([t]))[0]
             tau = tangent_at(f.points, f.s, t)
-            ax = field_axis(vol, p)[0] if use_presence else tau
+            try:
+                ax = ct_seed_heading(vol, p, f.tag)
+            except SeedHeadingError as error:
+                warnings.warn(f'Skipping seed for {f.name} at {p.tolist()}: {error}', stacklevel=2)
+                continue
+            if np.dot(ax, tau) < 0:
+                ax = -ax
             for sgn in (1.0, -1.0):
-                h = ax if np.dot(ax, sgn * tau) >= 0 else -ax
-                out.append(dict(fiber=fi, t=float(t), sign=sgn, pos=p, heading=h))
+                h = sgn*ax
+                out.append(dict(fiber=fi, t=float(t), sign=sgn, pos=p, heading=h,
+                                family=f.tag, seed_heading_policy=SEED_HEADING_POLICY))
     return out
 
 

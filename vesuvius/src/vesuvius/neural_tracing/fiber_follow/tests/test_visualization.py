@@ -7,19 +7,17 @@ from types import SimpleNamespace
 from test_identity import config, batch
 from vesuvius.neural_tracing.fiber_follow.regression.model import build_model
 from vesuvius.neural_tracing.fiber_follow.visualization.capture import attention, capture, validate_attention, array
-from vesuvius.neural_tracing.fiber_follow.visualization.interpret import legacy_prefix, analyze, annotation_item
+from vesuvius.neural_tracing.fiber_follow.visualization.interpret import replay_item, analyze, annotation_item
 from vesuvius.neural_tracing.fiber_follow.shared.data import SampleConfig
 from vesuvius.neural_tracing.fiber_follow.shared.reference import observed_path
 
 
-def test_legacy_prefix_keeps_observations_and_small_seed_gap():
-    hist = np.array([[0., 0, 2], [0, 0, 1], [0, 0, 0]])
-    path = legacy_prefix(hist, [1, 1, 0], np.array([0., 0, 3]), np.array([0., 0, .5]), 2.5, 1.)
-    np.testing.assert_array_equal(path, [[0, 0, .5], [0, 0, 1], [0, 0, 2], [0, 0, 3]])
-    with pytest.raises(ValueError, match='truncates'):
-        legacy_prefix(hist, [1, 1, 0], np.array([0., 0, 3]), np.array([0., 0, -30]), 33., 1.)
-    with pytest.raises(ValueError, match='contiguous'):
-        legacy_prefix(hist, [1, 0, 1], np.array([0., 0, 3]), np.zeros(3), 3., 1.)
+@pytest.mark.parametrize('version', [5, 6, 7])
+def test_replay_rejects_pre_ct_normal_versions(tmp_path,version):
+    import json
+    (tmp_path/'metadata.json').write_text(json.dumps(dict(version=version)))
+    with pytest.raises(ValueError,match='Incompatible replay version'):
+        replay_item(tmp_path,0,[],None)
 
 
 @pytest.mark.parametrize('empty', [False, True])

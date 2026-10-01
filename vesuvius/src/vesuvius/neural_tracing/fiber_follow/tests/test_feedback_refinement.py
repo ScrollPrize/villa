@@ -202,6 +202,8 @@ def test_threshold_diagnostics_label_the_chosen_proposal():
 
 
 def test_recovery_sweeps_rerun_the_adaptive_policy_at_each_threshold(monkeypatch):
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.ct_normal',
+                        lambda vol,pos: np.array([1., 0., 0.]))
     from vesuvius.neural_tracing.fiber_follow.shared.data import TracedFiber, SampleConfig
     from vesuvius.neural_tracing.fiber_follow.shared.recovery import make_recovery_states, evaluate_recovery_states
     c = cfg()
@@ -209,7 +211,7 @@ def test_recovery_sweeps_rerun_the_adaptive_policy_at_each_threshold(monkeypatch
     sample = SampleConfig(crop=c.fine, n_history=c.n_history, n_future=c.n_future)
     arc = np.arange(300, dtype=float)
     fiber = TracedFiber('line', np.c_[arc*0, arc*0, arc], arc, '')
-    states = make_recovery_states([fiber], [dict(fiber=0, t=150., sign=1)], sample, {})
+    states = make_recovery_states([fiber], [dict(fiber=0, t=150., sign=1)], sample, {}, None)
     calls = []
     def forward(*args, confidence_threshold, n_commit):
         calls.append((confidence_threshold, n_commit))

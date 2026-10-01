@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from vesuvius.neural_tracing.fiber_follow.shared.data import OnPolicyStates
+from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume
 from vesuvius.neural_tracing.fiber_follow.shared.recovery import make_recovery_states, evaluate_recovery_states, recovery_counts
 from vesuvius.neural_tracing.fiber_follow.regression.data import observation_builder, DirectTracer
 from vesuvius.neural_tracing.fiber_follow.regression.diagnostics import decision_rows, summarize_decisions
@@ -27,7 +28,7 @@ def monitor_fixture(path, fibers, manifest, sample, spec, seed_count=8):
         if recorded != provenance:
             raise ValueError('Monitor recovery fixture settings changed')
     else:
-        states = make_recovery_states(fibers, seeds, sample, provenance)
+        states = make_recovery_states(fibers, seeds, sample, provenance, FiberVolume(spec, cache_bytes=256 << 20))
         states.save(path)
         # Replay loading canonicalizes geometry to float32. Use that same
         # representation on the first run and after resume.

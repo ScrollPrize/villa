@@ -50,6 +50,8 @@ def test_resume_reuses_exact_json_and_checkpoint_without_calibrating(tmp_path, m
     (out/'ct_normalization.json').write_text(json.dumps(bad))
     with pytest.raises(ValueError, match='differs'):
         norm.prepare_normalization(out, [spec], resume=document)
+    with pytest.raises(ValueError, match='differs from the checkpoint'):
+        norm.prepare_normalization(out, [spec], known=document)
 
 
 def test_new_inference_volume_gets_own_estimate_and_metadata_changes_fail(tmp_path):

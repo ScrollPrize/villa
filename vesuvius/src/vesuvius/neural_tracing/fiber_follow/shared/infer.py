@@ -1,15 +1,10 @@
 """Trace fibers from seed points and write VC3D fiber JSON.
 
-Seeds are base-voxel ``x,y,z`` (the fiber JSON coordinate space). Each seed
-is snapped to the local presence maximum, then traced in both directions
-and written as one ``vc3d_fiber`` v3 file.
+Seeds are unchanged base-voxel ``x,y,z`` (the fiber JSON coordinate space).
+CT plus the supplied H/V family initializes each bidirectional trace.
 
   python -m vesuvius.neural_tracing.fiber_follow.flow_matching.infer --checkpoint last.pt \
-      --seed 18529.9,13044.9,51234.1 --out traced/
-
-  # automatic seeds: the N strongest presence maxima in a base-voxel box
-  python -m vesuvius.neural_tracing.fiber_follow.flow_matching.infer --checkpoint last.pt \
-      --auto-seeds 50 --box x0,y0,z0,x1,y1,z1 --out traced/
+      --seed 18529.9,13044.9,51234.1 --family H --out traced/
 """
 
 from __future__ import annotations
@@ -21,32 +16,14 @@ import time
 from datetime import datetime, timezone
 
 import numpy as np
-from scipy import ndimage
 from scipy.spatial import cKDTree
 
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength, resample_polyline
-from vesuvius.neural_tracing.fiber_follow.shared.trace import DEFAULT_CONFIDENCE, DEFAULT_N_COMMIT, ModelTracer, TraceParams, field_axis
+from vesuvius.neural_tracing.fiber_follow.shared.trace import DEFAULT_CONFIDENCE, DEFAULT_N_COMMIT, ModelTracer, TraceParams
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume
-
-
-def snap_to_presence(vol: FiberVolume, p_xyz: np.ndarray, radius: int = 2) -> np.ndarray:
-    base = np.round(p_xyz[::-1]).astype(np.int64) - radius
-    blk = vol.presence.read(base, (2 * radius + 1,) * 3).astype(np.float32)
-    if blk.max() <= 0:
-        return p_xyz
-    z, y, x = np.unravel_index(np.argmax(blk), blk.shape)
-    return (base + np.array([z, y, x]))[::-1].astype(np.float64)
-
-
-def auto_seeds(vol: FiberVolume, box_grid_zyx: tuple[np.ndarray, np.ndarray], n: int, min_presence: float = 0.9,
-               min_sep: int = 6) -> np.ndarray:
-    lo, hi = box_grid_zyx
-    blk = vol.presence.read(lo, hi - lo).astype(np.float32) / 255.0
-    mx = ndimage.maximum_filter(blk, size=2 * min_sep + 1)
-    peaks = np.argwhere((blk == mx) & (blk >= min_presence))
-    order = np.argsort(-blk[tuple(peaks.T)], kind="stable")
-    peaks = peaks[order][:n]
-    return (peaks + lo)[:, ::-1].astype(np.float64)  # xyz grid
+from vesuvius.neural_tracing.fiber_follow.shared.heading import (
+    ct_seed_heading, SEED_HEADING_POLICY, TRACE_HEADING_POLICY, FRAME_POLICY,
+)
 
 
 def make_fiber_json(points_base_xyz: np.ndarray, cp_every: float, meta: dict) -> dict:
@@ -92,10 +69,17 @@ def make_fiber_json(points_base_xyz: np.ndarray, cp_every: float, meta: dict) ->
     }
 
 
-def trace_bidirectional(tracer: ModelTracer, vol: FiberVolume, seeds_grid_xyz: np.ndarray, headings=None):
+def trace_bidirectional(tracer: ModelTracer, vol: FiberVolume, seeds_grid_xyz: np.ndarray, families):
     """Returns per-seed full polylines (grid xyz), ordered backward->forward."""
-    seeds = np.stack([snap_to_presence(vol, s) for s in seeds_grid_xyz])
-    axes = np.stack([field_axis(vol, s)[0] for s in seeds]) if headings is None else np.asarray(headings)
+    seeds = np.asarray(seeds_grid_xyz, dtype=np.float64)
+    if seeds.ndim != 2 or seeds.shape[1] != 3 or not np.isfinite(seeds).all():
+        raise ValueError('Seeds must be finite xyz positions')
+    families = [families]*len(seeds) if isinstance(families, str) else list(families)
+    if len(families) != len(seeds):
+        raise ValueError('Supply one H/V family per seed')
+    if not len(seeds):
+        return []
+    axes = np.stack([ct_seed_heading(vol, s, family) for s, family in zip(seeds, families)])
     fw, rf = tracer.trace(seeds, axes)
     bw, rb = tracer.trace(seeds, -axes)
     out = []
@@ -110,10 +94,9 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer):
     ap.add_argument("--fiber-zarrs", default=None, help="override the checkpoint's fiber zarr dir")
     ap.add_argument("--ct", default=None, help="override the checkpoint's CT zarr")
     ap.add_argument("--seed", action="append", default=[], help="base-voxel x,y,z (repeatable)")
-    ap.add_argument("--heading", action="append", default=[], help="Optional seed direction x,y,z; otherwise estimate from the initialization field (presence PCA for CT)")
+    ap.add_argument("--family", action="append", choices=('H', 'V'), required=True,
+                    help="One H/V family for all seeds, or repeat once per seed")
     ap.add_argument("--seeds-file", default=None, help="JSON list of base-voxel [x,y,z]")
-    ap.add_argument("--auto-seeds", type=int, default=0)
-    ap.add_argument("--box", default=None, help="base-voxel x0,y0,z0,x1,y1,z1 for --auto-seeds")
     ap.add_argument("--min-length", type=float, default=400.0, help="drop traces shorter than this (base voxels)")
     ap.add_argument("--dedupe", type=float, default=16.0,
                     help="skip seeds within this base-voxel distance of an already-written trace")
@@ -134,6 +117,8 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer):
         spec.fiber_zarr_dir = args.fiber_zarrs
     if args.ct:
         spec.ct_zarr = args.ct
+    if spec.mode == 'ct':
+        spec.load_presence = False
     from .ct_normalization import prepare_normalization
     prepare_normalization(args.out, [spec], known=ck['ct_normalization'])
     vol = FiberVolume(spec, cache_bytes=8 << 30)
@@ -145,41 +130,29 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer):
     if args.seeds_file:
         seeds += [np.asarray(s, float) for s in json.load(open(args.seeds_file))]
     seeds = [s / g for s in seeds]
-    if args.auto_seeds:
-        if not args.box:
-            raise SystemExit("--auto-seeds needs --box")
-        b = np.array([float(v) for v in args.box.split(",")]) / g
-        lo = np.floor(b[:3][::-1]).astype(np.int64)
-        hi = np.ceil(b[3:][::-1]).astype(np.int64)
-        seeds += list(auto_seeds(vol, (lo, hi), args.auto_seeds))
     if not seeds:
         raise SystemExit("no seeds given")
-    headings = None
-    if args.heading:
-        headings = np.array([[float(v) for v in h.split(',')] for h in args.heading])
-        if headings.shape != (len(seeds), 3) or not np.isfinite(headings).all() or np.any(np.linalg.norm(headings, axis=1) == 0):
-            raise SystemExit('--heading must supply one finite nonzero xyz vector per seed')
+    families = np.asarray(args.family*len(seeds) if len(args.family) == 1 else args.family)
+    if len(families) != len(seeds):
+        raise SystemExit('--family must be supplied once, or once per seed')
 
     os.makedirs(args.out, exist_ok=True)
-    manifest = [n for n in os.listdir(spec.fiber_zarr_dir) if n.endswith(".lasagna.json")]
-    meta = {"username": "fiber_follow",
-            "fiber_manifest": os.path.join(spec.fiber_zarr_dir, manifest[0]) if manifest else ""}
+    meta = {"username": "fiber_follow", "fiber_manifest": ""}
     written, tree_pts = [], np.zeros((0, 3))
     t0 = time.time()
     n_skipped = 0
     for b in range(0, len(seeds), args.batch):
         chunk = np.stack(seeds[b : b + args.batch])
-        chunk_headings = None if headings is None else headings[b : b + args.batch]
+        chunk_families = families[b : b + args.batch]
         if len(tree_pts):
             d, _ = cKDTree(tree_pts).query(chunk)
             keep = d * g > args.dedupe
             n_skipped += int((~keep).sum())
             chunk = chunk[keep]
-            if chunk_headings is not None:
-                chunk_headings = chunk_headings[keep]
+            chunk_families = chunk_families[keep]
             if not len(chunk):
                 continue
-        for poly, reasons in trace_bidirectional(tracer, vol, chunk, chunk_headings):
+        for seed_index, (poly, reasons) in enumerate(trace_bidirectional(tracer, vol, chunk, chunk_families)):
             base = resample_polyline(poly * g, g)  # 1 grid voxel spacing, like VC3D traces
             L = arclength(base)[-1]
             if L < args.min_length:
@@ -194,6 +167,10 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer):
             obj = make_fiber_json(base, args.cp_every, dict(meta, filename=name, started_at=stamp,
                                                              sequence=len(written),
                                                              fiber_follow={"stop_reasons": list(reasons),
+                                                                           "seed_family": str(chunk_families[seed_index]),
+                                                                           "seed_heading_policy": SEED_HEADING_POLICY,
+                                                                           "heading_policy": TRACE_HEADING_POLICY,
+                                                                           "frame_policy": FRAME_POLICY,
                                                                            "sampling_seed": args.sampling_seed,
                                                                            "sampler_mode": getattr(model.cfg, 'sampler_mode', 'zero'),
                                                                            "checkpoint": os.path.abspath(args.checkpoint)}))

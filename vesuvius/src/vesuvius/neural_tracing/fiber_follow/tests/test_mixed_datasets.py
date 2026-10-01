@@ -265,7 +265,13 @@ def test_real_collector_roundtrip_on_afv_with_ct_only_inputs(tmp_path):
     from vesuvius.neural_tracing.fiber_follow.regression.train import save_checkpoint
     from vesuvius.neural_tracing.fiber_follow.shared.data import OnPolicyStates
     p=tmp_path/'test.afv';afv_fixture(p)
-    array_at(tmp_path/'ct'/'0',np.full((160,64,64),100,np.uint8))
+    # These fibers run along z inside a CT sheet with normal y. Collection now
+    # estimates seed headings from CT plus the family, so uniform CT is invalid.
+    with sqlite3.connect(p) as c:
+        c.execute("UPDATE fibers SET family='V'")
+    sheet = 50+150*np.exp(-.5*((np.arange(96)-32)/2.)**2)
+    ct = np.broadcast_to(sheet[None,:,None], (160,96,96)).astype(np.uint8)
+    array_at(tmp_path/'ct'/'0',ct)
     validation=dict(strategy='fiber_hash',fraction=.1,seed=7349)
     source=dict(name='fixture',kind='afv',path=str(p),ct=str(tmp_path/'ct'),grid_scale=1.,
                 ct_grid_scale=1.,sha256=hashlib.sha256(p.read_bytes()).hexdigest(),validation=validation)

@@ -96,7 +96,9 @@ def test_replay_preserves_seed_but_distant_seed_is_not_observable(tmp_path):
             np.testing.assert_array_equal(getattr(loaded, field), getattr(states, field))
 
 
-def test_trace_keeps_seed_from_first_decision_through_recovery():
+def test_trace_keeps_seed_from_first_decision_through_recovery(monkeypatch):
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.ct_normal',
+                        lambda vol,pos: np.array([1., 0., 0.]))
     class Model(torch.nn.Module):
         cfg = SimpleNamespace(max_recovery_distance=4.)
         def forward(self, x, hist, hmask):

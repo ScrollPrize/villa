@@ -5,7 +5,7 @@ from vesuvius.neural_tracing.fiber_follow.regression.data import LOCATION_SOURCE
 
 from vesuvius.neural_tracing.fiber_follow.shared.data import continuation_targets, label_state
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import (
-    arclength, interp_at, tangent_at, frame_from_heading, random_rotation_about, normalize,
+    arclength, interp_at, tangent_at, frame_from_heading, normalize,
 )
 from vesuvius.neural_tracing.fiber_follow.regression.neighbor_following import bank_fiber
 from vesuvius.neural_tracing.fiber_follow.regression.neighbor_mining import exact_nearest
@@ -91,7 +91,7 @@ def decision_pair(bank, sample, model, rng, *, attempts=32, choice=None, hard_fr
         heading = tangent_at(line, s, head)
         if choice:
             heading = normalize(heading+tangent_at(parent.points, parent.s, own_t)*(-1 if reverse else 1))
-        frame = random_rotation_about(frame_from_heading(heading), rng.uniform(0, 2*np.pi))
+        frame = frame_from_heading(heading)
         pos = (apos+bpos)/2 if choice else bpos
         back = head-np.arange(1, sample.n_history+1)*sample.history_step
         mask = (np.arange(1, sample.n_history+1)*sample.history_step <= tail).astype(np.float32)

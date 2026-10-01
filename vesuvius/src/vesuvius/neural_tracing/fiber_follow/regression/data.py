@@ -14,6 +14,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.ct_normalization import BACKGRO
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import interp_at
 from vesuvius.neural_tracing.fiber_follow.shared.trace import ModelTracer
 from vesuvius.neural_tracing.fiber_follow.shared.reference import SEED_FIELDS, observed_seed
+from vesuvius.neural_tracing.fiber_follow.shared.heading import orient_item, frame_prefetch_bounds, FRAME_POLICY
 from vesuvius.neural_tracing.fiber_follow.regression.model import DirectConfig
 
 
@@ -49,14 +50,18 @@ class ObservationBuilder:
         self.cfg = cfg
 
     def prefetch_bounds(self,item,vol):
-        """Exact CT footprints, including all selected historical observations."""
-        from ..shared.data import tight_block
+        """CT footprints covering unresolved roll and normal-estimation context."""
         from .history_slabs import slab_layout, SLAB
-        yield tight_block(item['pos'],item['frame'],self.cfg.fine,vol.input_scale)
+        yield from frame_prefetch_bounds(item,self.cfg.fine,vol.input_scale)
         for slab in slab_layout(item):
-            yield tight_block(slab['pos'],slab['frame'],SLAB,vol.input_scale)
+            yield from frame_prefetch_bounds(slab,SLAB,vol.input_scale)
+
+    def finalize_frames(self,items,vol):
+        for item in items:
+            orient_item(item,vol)
 
     def images(self,items,vol,pool=None):
+        self.finalize_frames(items,vol)
         for item in items:
             reference_layout(item,self.cfg)
         stack = lambda key: torch.from_numpy(np.stack([item[key] for item in items]).astype(np.float32))
@@ -223,6 +228,25 @@ def augment_image_pair(image, params, rng, *, blur_sigma=0., drop_presence=False
 
 class IdentityObservationBuilder(ObservationBuilder):
     """Bank-derived following, foreign masks, and history-dependent path decisions."""
+
+    def finalize_frames(self,items,vol):
+        super().finalize_frames(items,vol)
+        from scipy.spatial import cKDTree
+        for item in items:
+            reference_layout(item,self.cfg)
+            if 'identity_curve' in item:
+                curve = item['identity_curve']
+                distance = (cKDTree(curve).query(item['reference_points'])[0] if len(curve)
+                            else np.full(len(item['reference_points']),np.inf))
+                on = (distance <= self.sampling.on_fiber_tolerance) & item['reference_mask'].astype(bool)
+                item['reference_on_fiber'] = on.astype(np.float32)
+                item['identity_reference_valid'] = bool(on[:-1].sum() >= 2 or on[-1])
+                item['identity_observable'] = bool(not item.get('offtrack',False)
+                    or item['identity_reference_valid'] or item.get('slab_identity_observable',False))
+            if 'candidate_points' in item:
+                inside = visible_points(item['candidate_points'],self.cfg.fine)
+                item['candidate_mask'] = np.minimum.accumulate(item['candidate_mask']*inside,axis=-1)
+
     def __init__(self,cfg: DirectConfig,fibers=None,sampling=IdentitySampling(),*,
                  augment=False,negative_bank=None,
                  near_negative_bank=None,following_bank=None,continuation_bank=None):
@@ -348,7 +372,8 @@ class IdentityObservationBuilder(ObservationBuilder):
             # Membership affects labels only; every observed slab is still input.
             from scipy.spatial import cKDTree
             distance = cKDTree(fiber.points).query(np.stack([o['pos'] for o in observations]))[0]
-            item['identity_observable'] |= bool((distance <= s.on_fiber_tolerance).any())
+            item['slab_identity_observable'] = bool((distance <= s.on_fiber_tolerance).any())
+            item['identity_observable'] |= item['slab_identity_observable']
         item['identity_curve'] = curve
         visible = visible_points(curve,cfg.fine)
         item['identity_label_z'] = (curve[visible] @ frame.T+pos)[:,2] if visible.any() else pos[2:3]
@@ -498,7 +523,7 @@ class DirectTracer(ModelTracer):
         self.observations = observation_builder(model.cfg)
 
     def build_inputs(self,pos,frames,hist,hmask,paths=None):
-        items = [dict(pos=p,frame=f,hist_local=h,hmask=m) for p,f,h,m in zip(pos,frames,hist,hmask)]
+        items = [dict(pos=p,frame=f,hist_local=h,hmask=m,frame_policy=FRAME_POLICY) for p,f,h,m in zip(pos,frames,hist,hmask)]
         if paths is not None:
             for item,path in zip(items,paths):
                 item.update({k:path[k] for k in SEED_FIELDS if k in path})
