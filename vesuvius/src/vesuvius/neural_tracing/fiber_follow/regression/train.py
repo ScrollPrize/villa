@@ -272,7 +272,7 @@ class DecisionBatchPrefetch:
 
 
 @torch.no_grad()
-def training_diagnostics(model, cpu_batch, tracer, fibers, seeds, out, step, log, *, device):
+def training_diagnostics(model, cpu_batch, tracer, fibers, seeds, out, step, log, *, device, dataset_name=None):
     """Plot EMA proposals and the same monitor rollouts used for logged metrics."""
     from vesuvius.neural_tracing.fiber_follow.shared.diag import plot_batch, plot_curves, plot_refinement, plot_rollouts
     from vesuvius.neural_tracing.fiber_follow.shared.evaluate import evaluate
@@ -317,6 +317,7 @@ def training_diagnostics(model, cpu_batch, tracer, fibers, seeds, out, step, log
             plot_rollouts(tracer.vol, fibers, seeds, paths, reasons,
                           images/f'rollout_{step:06d}_c{threshold}.png', tracer.p.max_len, rows=rows)
             log.record(dict(step=step, split='monitor', threshold=threshold,
+                            **({'dataset':dataset_name} if dataset_name else {}),
                             coverage_max_len=tracer.p.max_len, **rollout_summary(rows)))
         plot_curves(Path(out)/'log.jsonl', Path(out)/'curves.png', loss_key='geometry')
     finally:
@@ -519,7 +520,7 @@ def build_parser():
     ap.add_argument('--fibers')
     ap.add_argument('--ct')
     ap.add_argument('--manifest', help='Frozen Paris 4 monitor/calibration/test seeds; also configurable in --dataset-config')
-    ap.add_argument('--dataset-config', help='JSON source paths, validation bands, cache directory and sampling weights')
+    ap.add_argument('--dataset-config', help='JSON source paths, fiber holdouts, cache directory and sampling weights')
     ap.add_argument('--input-mode', choices=('ct', 'ct+presence'), default='ct+presence',
                     help='Image channels; CT-only requires --no-direction-inputs and --presence-dropout 0')
     ap.add_argument('--onpolicy', nargs='*', default=[])
@@ -530,6 +531,12 @@ def build_parser():
     ap.add_argument('--microbatch', type=int, default=4)
     ap.add_argument('--workers', type=int, default=8)
     ap.add_argument('--worker-cache-gb', type=float, default=.5)
+    ap.add_argument('--remote-prefetch-connections', type=int, default=0,
+                    help='Concurrent async chunk fetches in a separate process; 0 disables')
+    ap.add_argument('--remote-prefetch-queue-size', type=int, default=512,
+                    help='Bound per priority queue; required batches override speculative fetches')
+    ap.add_argument('--remote-prefetch-timeout', type=float, default=120,
+                    help='Maximum seconds waiting for batch cache readiness; no foreground network fallback')
     ap.add_argument('--threads', type=int, default=4)
     ap.add_argument('--lr', type=float, default=3e-4)
     ap.add_argument('--warmup', type=int, default=500)
@@ -665,6 +672,9 @@ def main(argv=None):
         raise ValueError('Gradient clipping limits must be finite and nonnegative (0 disables clipping)')
     if not math.isfinite(args.fresh_fraction) or not 0 <= args.fresh_fraction <= 1:
         raise ValueError('Fresh fraction must be finite and in [0, 1]')
+    if (args.remote_prefetch_connections < 0 or args.remote_prefetch_queue_size < 1
+            or not math.isfinite(args.remote_prefetch_timeout) or args.remote_prefetch_timeout <= 0):
+        raise ValueError('Prefetch connections must be nonnegative; queue size and timeout must be positive')
     if min(args.steps, args.batch, args.microbatch, args.log_every, args.ckpt_every,
            args.threads, args.replay_keep, args.dagger_seeds, args.recovery_seeds) < 1 or args.batch % args.microbatch:
         raise ValueError('Positive counts required; microbatch must divide effective batch')
@@ -784,6 +794,7 @@ def main(argv=None):
     if resume:
         # Allow a new base LR without resetting AdamW or the schedule origin.
         ignored = {'resume','reset_optimizer','lr','out_root','device','batch','microbatch','workers','threads','worker_cache_gb','dataset_config',
+                   'remote_prefetch_connections','remote_prefetch_queue_size','remote_prefetch_timeout',
                    'log_every','ckpt_every','diag_every','dagger_device',
                    'negative_bank_refresh_seconds','negative_bank_cache_mb','activation_checkpointing',
                    'history_grad_clip','rest_grad_clip','presence_dropout','blur_probability','blur_sigma',
@@ -907,7 +918,23 @@ def main(argv=None):
     interval_data_seconds = interval_update_seconds = 0.
     interval_metrics = DirectTrainingInterval()
     updates = None
+    remote_prefetch = None
     try:
+        if args.remote_prefetch_connections:
+            sources = getattr(dataset,'datasets',[dataset])
+            remote_sources = [source for source in sources
+                if source.vol_spec.ct_zarr.startswith(('s3://','http://','https://'))]
+            if remote_sources:
+                from ..shared.remote_prefetch import RemotePrefetcher
+                remote_prefetch = RemotePrefetcher(args.remote_prefetch_connections,args.remote_prefetch_queue_size,
+                                                  args.remote_prefetch_timeout)
+                for source in remote_sources:
+                    source.remote_prefetch = remote_prefetch.client
+                progress(f'Remote CT prefetch: {args.remote_prefetch_connections} concurrent fetches, '
+                         f'{args.remote_prefetch_queue_size} requests per priority queue, separate async process')
+            log.record(dict(step=done,event='remote_prefetch_configuration',
+                enabled=remote_prefetch is not None,connections=args.remote_prefetch_connections,
+                queue_size=args.remote_prefetch_queue_size,timeout=args.remote_prefetch_timeout,sources=len(remote_sources)))
         if args.diag_every or args.long_diag_every:
             from vesuvius.neural_tracing.fiber_follow.shared.trace import TraceParams
             tracer = DirectTracer(ema, FiberVolume(spec), cfg.fine, cfg.n_history,
@@ -951,6 +978,7 @@ def main(argv=None):
             if step % args.log_every == 0 or step == args.steps:
                 now = time.monotonic()
                 log.record(dict(step=step, lr=lr, **metrics, samples_seen=prior_samples+observed_states,
+                    **({'remote_prefetch':remote_prefetch.snapshot()} if remote_prefetch else {}),
                     train_seconds=now-started,
                     samples_per_second=observed_states/(now-started),
                     interval_samples_per_second=interval_states/(now-interval_started),
@@ -993,7 +1021,8 @@ def main(argv=None):
             if tracer is not None and args.diag_every and step % args.diag_every == 0:
                 began = time.monotonic()
                 training_diagnostics(ema, diagnostic['cpu_batch'], tracer, val_f, manifest['monitor'], out, step, log,
-                                     device=args.device)
+                                     device=args.device,dataset_name=next((s['name'] for s in dataset_document['sources']
+                                         if s['kind']=='paris4'),None) if dataset_document else None)
                 if dataset_document:
                     from ..shared.evaluate import evaluate
                     from ..shared.experiment import rollout_summary
@@ -1010,6 +1039,8 @@ def main(argv=None):
                                 threshold=.5,coverage_max_len=args.diag_max_len,**rollout_summary(rows)))
                         finally:
                             source_tracer.close()
+                    from ..shared.diag import plot_curves
+                    plot_curves(out/'log.jsonl',out/'curves.png',loss_key='geometry')
                 periodic['diagnostics_seconds'] = time.monotonic()-began
             if tracer is not None and args.long_diag_every and step % args.long_diag_every == 0:
                 from vesuvius.neural_tracing.fiber_follow.shared.evaluate import evaluate
@@ -1047,6 +1078,9 @@ def main(argv=None):
                 # Wall time spent outside optimizer updates, so throughput can be read from the log.
                 log.record(dict(step=step, **periodic))
     finally:
+        if remote_prefetch is not None:
+            remote_prefetch.close()
+            log.record(dict(event='remote_prefetch_shutdown',remote_prefetch=remote_prefetch.snapshot()))
         if updates is not None:
             updates.close()
         event = collector.close()

@@ -16,8 +16,8 @@ from .geometry import arclength, interp_at
 class AFVFibers(Sequence):
     """Keep only a catalog in memory; decode polylines into a bounded LRU.
 
-    A reserved Z band is in native AFV coordinates. Entire fibers touching it
-    are excluded from training, in addition to downstream crop/history guards.
+    Validation holds out entire fiber IDs, including from neighbor queries.
+    A legacy native-coordinate Z-band split is available for old callers.
     """
     def __init__(self, path, grid_scale=1., *, validation_z=None, validation=None, split='train', cache_size=32, sha256=None):
         self.path = str(Path(path).resolve())

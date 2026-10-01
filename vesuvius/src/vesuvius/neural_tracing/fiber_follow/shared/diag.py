@@ -244,13 +244,14 @@ def plot_curves(log_path, path, *, loss_key='flow'):
             scores.append(m['point_correct_count']/total if total else float('nan'))
         axes[3].plot(steps,scores,label='individual points correct (interval)')
         axes[3].set_ylim(0,1)
-    for threshold in DIAGNOSTIC_THRESHOLDS:
-        selected = [r for r in rollout if r['threshold']==threshold]
+    groups = sorted({(r.get('dataset',''),r.get('split','monitor'),r['threshold']) for r in rollout})
+    for dataset,split,threshold in groups:
+        selected = [r for r in rollout if (r.get('dataset',''),r.get('split','monitor'),r['threshold']) == (dataset,split,threshold)]
         for name in ('coverage','precision','diverged'):
             key = dict(coverage='coverage_mean', precision='length_precision', diverged='diverged')[name]
             axes[-1].plot([r['step'] for r in selected],
                           [r['roll_'+name] if 'roll_'+name in r else r[key] for r in selected],
-                          label=f'{name} @ {threshold}')
+                          label=f'{dataset} {split} {name} @ {threshold}'.strip())
     for ax in axes:
         ax.legend(fontsize=7);ax.set_xlabel('optimizer updates')
     axes[-1].set_ylim(0,1)

@@ -37,8 +37,8 @@ def read_dataset_config(path):
         if not np.isfinite(weight) or weight <= 0:
             raise ValueError('Every dataset weight must be finite and positive')
         source['weight'] = weight
-        from ..shared.dataset_split import heldout_ids
-        heldout_ids([0,1],source['validation'])  # Validate policy before dataset I/O.
+        from ..shared.dataset_split import validate_split_policy
+        validate_split_policy(source['validation'])  # Validate policy before dataset I/O.
         if source['kind'] == 'paris4':
             for key in PRIMARY_OPTIONS:
                 if key in source and key != 'val_z':

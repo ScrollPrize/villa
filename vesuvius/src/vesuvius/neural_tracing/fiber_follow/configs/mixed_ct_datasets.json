@@ -38,8 +38,8 @@
       "native_voxel_size_um": 8.64,
       "validation": {
         "strategy": "fiber_hash",
-        "fraction": 0.1,
-        "seed": 7349
+        "seed": 7349,
+        "count": 406
       }
     },
     {
@@ -56,8 +56,8 @@
       "native_voxel_size_um": 8.64,
       "validation": {
         "strategy": "fiber_hash",
-        "fraction": 0.1,
-        "seed": 7349
+        "seed": 7349,
+        "count": 406
       }
     }
   ]

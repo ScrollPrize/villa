@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import os
+import hashlib
+import tempfile
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -156,36 +158,107 @@ class ChunkedArray:
 
 
 class RemoteChunkedArray(ChunkedArray):
-    """Use the shared persistent remote cache plus a bounded decoded-chunk LRU."""
-    def __init__(self, path, level, cache_dir, cache_bytes):
+    """Fetch on demand into an uncompressed, memory-mapped local Zarr v2.
+
+    Only decoded chunks are persisted. Atomic replacement permits independent
+    loader/collector processes to share the cache. Cached reads need no network.
+    """
+    def __init__(self, path, level, cache_dir, cache_bytes, *, cache_only=False):
         if not cache_dir:
             raise ValueError('Remote CT requires a persistent cache_dir')
-        self.path, self.level, self.cache_dir = str(path), int(level), str(cache_dir)
-        self._array = self._open()
-        self.shape, self.chunks = tuple(self._array.shape), tuple(self._array.chunks)
-        self.dtype, self.fill = np.dtype(self._array.dtype), self._array.fill_value or 0
-        self.cache_bytes = int(cache_bytes)
-        self._cache, self._cached = OrderedDict(), 0
-        self._chunk_nbytes = int(np.prod(self.chunks))*self.dtype.itemsize
-        self._lock = threading.Lock()
+        self.remote_url, self.level = str(path).rstrip('/'), int(level)
+        self.cache_dir = str(cache_dir)
+        self.cache_only = cache_only
+        local = self.cache_path(self.remote_url,self.level,cache_dir)
+        self._array = None
+        if not (local/'.zarray').exists():
+            if cache_only:
+                raise FileNotFoundError(f'Remote CT metadata is not prefetched: {local}')
+            self._array = self._open()
+            self.publish_metadata(local,self._array,self.remote_url,self.level)
+        super().__init__(local,cache_bytes)
+
+    @staticmethod
+    def cache_path(url,level,cache_dir):
+        namespace = hashlib.sha256(str(url).rstrip('/').encode()).hexdigest()
+        return Path(cache_dir)/'uncompressed'/namespace/str(level)
+
+    @classmethod
+    def publish_metadata(cls,local,array,url,level):
+        if len(array.shape) != 3:
+            raise ValueError('Remote CT must be a three-dimensional ZYX array')
+        metadata = dict(zarr_format=2,shape=list(array.shape),chunks=list(array.chunks),
+            dtype=np.dtype(array.dtype).str,fill_value=np.asarray(array.fill_value or 0).item(),
+            compressor=None,filters=None,order='C',dimension_separator='.')
+        cls._atomic_write(local/'.zattrs',json.dumps(dict(remote_url=url,level=level)).encode())
+        cls._atomic_write(local/'.zarray',json.dumps(metadata).encode())
+
+    @staticmethod
+    def _atomic_write(path, data):
+        path = Path(path)
+        path.parent.mkdir(parents=True,exist_ok=True)
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=path.parent,prefix='.partial-',delete=False) as stream:
+                temporary = Path(stream.name)
+                stream.write(data)
+            os.replace(temporary,path)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
 
     def _open(self):
-        from vesuvius.neural_tracing.datasets.common import open_zarr
-        return open_zarr(self.path, scale=self.level, config={
-            'volume_cache_dir': self.cache_dir, 'volume_cache_retry_seconds': 30})
+        import zarr
+        return zarr.open(remote_store(self.remote_url),path=str(self.level),mode='r')
 
     def __getstate__(self):
         return {**super().__getstate__(), '_array': None}
 
-    def _load(self, key):
-        if self._array is None:
-            self._array = self._open()
-        start = np.asarray(key)*self.chunks
-        stop = np.minimum(start+self.chunks, self.shape)
-        values = np.asarray(self._array[tuple(slice(int(a), int(b)) for a,b in zip(start,stop))])
-        result = np.full(self.chunks, self.fill, self.dtype)
-        result[tuple(slice(0,n) for n in values.shape)] = values
-        return result
+    def _load(self, key, *, blocking=True):
+        cached = super()._load(key)
+        if cached is not None:
+            return cached
+        if self.cache_only:
+            raise FileNotFoundError(f'Remote CT chunk is not prefetched: {self.path}/{key}')
+        # POSIX advisory locks work on both supported platforms (Linux/macOS).
+        # Separate file handles serialize threads as well as loader processes.
+        # Cached reads avoid the lock. Prefetch skips chunks already in flight;
+        # a foreground reader waits for that exact chunk, without downloading it twice.
+        import fcntl
+        lock_path = Path(self.path)/'.locks'/'.'.join(map(str,key))
+        lock_path.parent.mkdir(exist_ok=True)
+        with lock_path.open('a+b') as lock:
+            try:
+                fcntl.flock(lock,fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+            except BlockingIOError:
+                return None
+            cached = super()._load(key)
+            if cached is not None:
+                return cached
+            with self._lock:
+                if self._array is None:
+                    self._array = self._open()
+            start = np.asarray(key)*self.chunks
+            stop = np.minimum(start+self.chunks, self.shape)
+            values = np.asarray(self._array[tuple(slice(int(a), int(b)) for a,b in zip(start,stop))])
+            result = np.full(self.chunks, self.fill, self.dtype)
+            result[tuple(slice(0,n) for n in values.shape)] = values
+            self._atomic_write(Path(self.path)/self.sep.join(map(str,key)),result.tobytes(order='C'))
+            return super()._load(key)
+
+
+def remote_store(url):
+    from vesuvius.neural_tracing.datasets.common import _make_remote_store
+    from vesuvius.neural_tracing.s3_utils import s3_storage_options_for_path
+    _register_vcz1()
+    options = s3_storage_options_for_path(url) if url.startswith('s3://') else {}
+    return _make_remote_store(url,options,missing_exceptions=(KeyError,FileNotFoundError))
+
+
+async def open_remote_array(url,level):
+    """Native async Zarr I/O; no synchronous array reads on the event loop."""
+    from zarr.api.asynchronous import open_array
+    return await open_array(store=remote_store(url),path=str(level),mode='r')
 
 
 @dataclass
@@ -201,7 +274,7 @@ class FiberVolumeSpec:
     # retired "fiber" default is kept so older metadata compares unchanged.
     inputs: str = "fiber"
     load_presence: bool = True  # False: CT metadata alone defines tracing bounds.
-    cache_dir: str | None = None  # Persistent compressed remote CT chunks.
+    cache_dir: str | None = None  # Persistent uncompressed remote CT chunks.
 
     @property
     def mode(self) -> str:
@@ -247,7 +320,7 @@ class FiberVolume:
     remain in trace units.
     """
 
-    def __init__(self, spec: FiberVolumeSpec, cache_bytes: int = 3 << 30) -> None:
+    def __init__(self, spec: FiberVolumeSpec, cache_bytes: int = 3 << 30, *, cache_only=False) -> None:
         self.spec = spec
         self._directions = None
         self._cache_bytes = int(cache_bytes)
@@ -265,7 +338,7 @@ class FiberVolume:
         if not spec.ct_zarr:
             raise ValueError("CT input mode needs ct_zarr")
         # Native CT is the larger field; presence keeps its own cache.
-        ct = (RemoteChunkedArray(spec.ct_zarr, spec.ct_level, spec.cache_dir, int(cache_bytes * .75))
+        ct = (RemoteChunkedArray(spec.ct_zarr, spec.ct_level, spec.cache_dir, int(cache_bytes * .75),cache_only=cache_only)
               if spec.ct_zarr.startswith(('s3://','http://','https://')) else
               ChunkedArray(os.path.join(spec.ct_zarr, str(spec.ct_level)), int(cache_bytes * 0.75)))
         expected = np.asarray(self.presence.shape)*spec.grid_scale/spec.ct_grid_scale if self.presence is not None else np.asarray(ct.shape)

@@ -50,6 +50,26 @@ def test_wrong_continuations_discover_paths_published_after_empty_lookup(tmp_pat
     assert state is not None and state['source'] == 3 and bank.shard_count == 1
 
 
+def test_repeated_prefix_start_has_a_nonzero_observed_seed_heading(tmp_path,monkeypatch):
+    from vesuvius.neural_tracing.fiber_follow.regression import neighbor_continuations as module
+    bank,_=make_bank(tmp_path,with_path=True)
+    _,sample=configuration()
+    original=module.interp_at
+    def repeated_start(points,arc,at):
+        result=original(points,arc,at)
+        if len(at)>2:
+            result[1]=result[0]
+        return result
+    monkeypatch.setattr(module,'interp_at',repeated_start)
+    state=wrong_continuation(bank,sample,np.random.default_rng(8),tail_length_range=(4.,12.))
+    assert state is not None
+    path=state['observed_path']
+    np.testing.assert_array_equal(path[0],path[1])
+    assert np.linalg.norm(state['seed_tangent'])==pytest.approx(1.)
+    moving=np.flatnonzero(np.linalg.norm(path-path[0],axis=1)>1e-6)[0]
+    assert np.dot(state['seed_tangent'],path[moving]-path[0])>0
+
+
 def test_unsafe_synthetic_departure_falls_back_to_original_replay(tmp_path):
     bank,fiber = make_bank(tmp_path,with_path=True)
     cfg,sample = configuration()

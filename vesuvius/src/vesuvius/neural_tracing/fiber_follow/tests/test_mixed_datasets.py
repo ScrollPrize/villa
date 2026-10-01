@@ -128,6 +128,7 @@ def test_real_config_has_requested_sources_and_stable_paths():
     p=Path(__file__).resolve().parents[1]/'configs/mixed_ct_datasets.json'
     d,digest=read_dataset_config(p)
     assert [s['weight'] for s in d['sources']]==[.1,.45,.45]
+    assert [s['validation']['count'] for s in d['sources'] if s['kind']=='afv']==[406,406]
     assert 'SMALLMORE' not in json.dumps(d)
     assert Path(d['cache_dir']).is_relative_to(p.parent.parent/'datasets')
     assert digest==read_dataset_config(p)[1]
@@ -145,6 +146,20 @@ def test_remote_array_chunk_edges_and_pickle(tmp_path,monkeypatch):
     block=a.read([-1,-1,-1],[3,3,3])
     assert not block[0].any()
     np.testing.assert_array_equal(block[1:,1:,1:],values[:2,:2,:2])
+    # Persist raw full-size chunks, then reopen with network access forbidden.
+    metadata=json.loads((Path(a.path)/'.zarray').read_text())
+    assert metadata['compressor'] is None and metadata['filters'] is None
+    assert (Path(a.path)/'1.2.2').stat().st_size==4**3*values.dtype.itemsize
+    assert isinstance(a.chunk((1,2,2)),np.memmap)
+    def forbidden(self):raise AssertionError('Cached reads must not open the remote store')
+    monkeypatch.setattr(RemoteChunkedArray,'_open',forbidden)
+    reopened=RemoteChunkedArray('s3://fixture/ct/',0,tmp_path,1024)
+    np.testing.assert_array_equal(reopened.read([7,8,9],[2,2,2]),values[7:9,8:10,9:11])
+    with pytest.raises(AssertionError,match='remote store'):
+        reopened.read([4,4,4],[1,1,1])
+    # A different volume cannot reuse the first volume's metadata or chunks.
+    with pytest.raises(AssertionError,match='remote store'):
+        RemoteChunkedArray('s3://fixture/other',0,tmp_path,1024)
 
 
 def test_whole_fiber_holdout_excludes_neighbor_queries_and_manifest(tmp_path):
@@ -158,6 +173,20 @@ def test_whole_fiber_holdout_excludes_neighbor_queries_and_manifest(tmp_path):
     for f in tr:
         assert not (set(tr.nearby_fiber_ids([36,32,40],100,-1)) & va.ids)
     assert AFVFibers(p,validation=validation).ids==tr.ids
+
+
+def test_fixed_count_holdout_is_exact_stable_and_rejects_invalid_sizes():
+    from vesuvius.neural_tracing.fiber_follow.shared.dataset_split import heldout_ids
+    policy=dict(strategy='fiber_hash',count=406,seed=7349)
+    ids=list(range(2000))
+    reserved=heldout_ids(ids,policy)
+    assert len(reserved)==406
+    assert reserved==heldout_ids(ids[::-1],policy)
+    assert reserved < heldout_ids(ids,dict(policy,count=500))
+    for changes in (dict(count=0),dict(count=-1),dict(count=2.5),dict(count=True),
+                    dict(count=len(ids)),dict(fraction=.1)):
+        with pytest.raises(ValueError):
+            heldout_ids(ids,dict(policy,**changes))
 
 
 def test_afv_supports_switches_choices_departures_and_following(tmp_path):

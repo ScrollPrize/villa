@@ -14,9 +14,8 @@ import torch
 from vesuvius.neural_tracing.fiber_follow.regression.datasets import read_dataset_config, build_mixed_dataset,load_primary_dataset,HoldoutFilteredBank
 from vesuvius.neural_tracing.fiber_follow.regression.data import IdentityObservationBuilder, IdentitySampling
 from vesuvius.neural_tracing.fiber_follow.regression.model import DirectConfig, build_model
-from vesuvius.neural_tracing.fiber_follow.regression.neighbor_bank import NeighborBank
 from vesuvius.neural_tracing.fiber_follow.regression.supervision import loss_terms
-from vesuvius.neural_tracing.fiber_follow.shared.data import FollowDataset, SampleConfig, ZBand, load_fibers, split_fibers
+from vesuvius.neural_tracing.fiber_follow.shared.data import FollowDataset, SampleConfig, ZBand
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolumeSpec
 
@@ -40,13 +39,22 @@ def main():
         ct_grid_scale=source['ct_grid_scale'],grid_scale=source['grid_scale'],inputs='ct',load_presence=False)
     band=ZBand(*(v/spec.grid_scale for v in source['val_z']))
     print('Loading Paris 4 annotations',flush=True)
-    _,fibers,heldout,_=load_primary_dataset(document,spec)
+    _,fibers,heldout,manifest=load_primary_dataset(document,spec)
     bank=HoldoutFilteredBank(source['negative_bank'],fibers,band,grid_scale=spec.grid_scale,heldout=heldout)
     bank.validate_volume(spec)
     primary=FollowDataset(fibers,spec,sample,None,chunk=2,seed=17,cache_bytes=64<<20,
         batch_builder=IdentityObservationBuilder(cfg,fibers,sampling,augment=True,negative_bank=bank))
     options=SimpleNamespace(microbatch=2,worker_cache_gb=.0625,fresh_fraction=.7)
     mixed,provenance=build_mixed_dataset(primary,document,cfg,sample,sampling,options,seed=17)
+    splits=Path(args.out).parent/'splits'
+    splits.mkdir(parents=True,exist_ok=True)
+    for name,dataset in zip(mixed.names,mixed.datasets):
+        validation=getattr(dataset,'validation_fibers',heldout)
+        value=dict(dataset_config_sha256=digest,training_fibers=len(dataset.fibers),
+            validation_fibers=len(validation),
+            validation_ids=sorted(validation.ids) if hasattr(validation,'ids') else [f.name for f in validation],
+            manifest=getattr(dataset,'validation_manifest',manifest))
+        (splits/f'{name}.json').write_text(json.dumps(value,indent=2)+'\n')
     results=[]
     for name,dataset in zip(mixed.names,mixed.datasets):
         print('Reading',name,flush=True)

@@ -379,6 +379,64 @@ compare equal hardware, precision and supervised decision counts.
 
 See [recorded validation](SLAB_VALIDATION.md) for measured results and limits.
 
+## Mixed Paris 4 and AFV training
+
+Run from `fiber_follow/`:
+
+```bash
+bash scripts/train_mixed_ct.sh
+# Optional CPU check of real crops, supervision and forward/backward for all sources:
+/home/sean/Documents/villa4/vesuvius/.venv/bin/python scripts/check_mixed_ct.py
+```
+
+The launcher uses [mixed_ct_datasets.json](../configs/mixed_ct_datasets.json):
+10% Paris 4, 45% `0175A_5mm_v1.afv`, and 45% `1447_5mm_v1.afv`.
+`0175A_SMALLMORE.afv` is excluded. Weights apply to microbatches, preserving
+adjacent matched decision pairs. Source counts and actual shares are logged.
+The new run uses one CT channel, patch4, three refinement steps, batch/microbatch
+16, and initial LR 0.0003. Trailing command-line options override launcher defaults.
+It starts a new model; CT-plus-prediction checkpoints have different input shapes.
+Modes using presence/direction predictions still require those volumes.
+
+AFV geometry is read lazily from SQLite in native L0 XYZ coordinates. Its embedded
+scan identity and the file SHA256 must match the config. The CT sources are
+PHerc0175A/20250521115057 and PHerc1447/20250521151220 (8.64 µm native voxels).
+AFV trace coordinates use two native voxels (17.28 µm); the existing Paris 4 trace
+grid is approximately 16 µm. Main crop spacing is half a trace voxel in both.
+
+Remote CT chunks are fetched on demand into
+`datasets/automated_fiber_volumes/ct_cache/uncompressed/`, namespaced by URL and
+level. Local Zarr v2 metadata has `compressor: null` and `filters: null`.
+Chunks are decoded once, written atomically without compression, then memory
+mapped across workers and collectors. Reopening a cached region needs no network;
+uncached regions still require access to the source. The disk cache grows with
+visited regions and has no eviction policy; each worker has a bounded RAM/mapping
+cache. Cache paths are relative to the dataset JSON unless absolute.
+
+Validation reserves deterministic whole fiber IDs independently in each source;
+training does not exclude a Z band. Each AFV source reserves exactly 406 fibers
+(`validation.count`), for **1,000 held-out fibers total** across all sources. Paris 4
+keeps its 124 previously reserved fibers and reserves another 10% of the remaining
+641, leaving 577 training and 188 validation fibers. This preserves the existing
+neighbor bank's parent compatibility. Its old `val_z` remains mining provenance
+only. Validation geometry is excluded from AFV neighbor queries and filtered out
+of Paris 4 mined paths, so it cannot reenter through intentional switches,
+neighbor following, matched choice/departure pairs, or foreign labels.
+
+Each source supports those neighbor tasks and its own rollout replay. Collection
+cycles through all sources, running one subprocess at a time, with separate replay
+caches. Only training fibers seed replay, and replay identity manifests must match
+the source's training split. Monitor rollout metrics are evaluated and plotted
+separately for each source. The legacy recovery fixture and optional long diagnostic
+remain Paris 4 diagnostics. Held-out monitor, calibration and final groups are
+distinct; seed generation is bounded to 32 fibers per group.
+
+The CPU preflight writes the exact reserved IDs and evaluation manifests under
+`datasets/automated_fiber_volumes/splits/`, plus `training_preflight.json`.
+Training writes its manifests into the run directory and saves the resolved
+dataset config and its digest in checkpoints. Resuming rejects a changed dataset
+config or split. Editing weights or holdouts requires a separate experiment.
+
 ## Historical v9 checkpointing measurements
 
 The following existing measurements are preserved from before the slab replacement.

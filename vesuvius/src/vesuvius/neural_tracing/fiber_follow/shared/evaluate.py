@@ -16,7 +16,8 @@ def make_seeds(fibers: list[TracedFiber], vol, per_fiber: int = 3, min_presence:
     """Seed states at high-presence GT points; one entry per (seed, direction).
 
     Initial heading is the local presence PCA axis, signed to agree with the
-    GT direction being evaluated."""
+    GT direction being evaluated. With ``use_presence=False``, positions and
+    headings come from GT alone, without reading auxiliary predictions."""
     rng = np.random.default_rng(seed)
     out = []
     for fi, f in enumerate(fibers):

@@ -47,6 +47,14 @@ class ObservationBuilder:
     def __init__(self,cfg):
         self.cfg = cfg
 
+    def prefetch_bounds(self,item,vol):
+        """Exact CT footprints, including all selected historical observations."""
+        from ..shared.data import tight_block
+        from .history_slabs import slab_layout, SLAB
+        yield tight_block(item['pos'],item['frame'],self.cfg.fine,vol.input_scale)
+        for slab in slab_layout(item):
+            yield tight_block(slab['pos'],slab['frame'],SLAB,vol.input_scale)
+
     def images(self,items,vol,pool=None):
         for item in items:
             reference_layout(item,self.cfg)

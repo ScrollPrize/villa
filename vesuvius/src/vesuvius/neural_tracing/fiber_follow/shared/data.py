@@ -391,6 +391,7 @@ class FollowDataset(torch.utils.data.IterableDataset):
         self.window, self.pool_size, self.window_samples = window, pool_size, window_samples
         self.replay_index, self.refresh_chunks = replay_index, refresh_chunks
         self.batch_builder = batch_builder
+        self.remote_prefetch = None  # Optional trainer-owned process queue client.
         self.additional_crops = tuple(additional_crops)
         self._replay_paths = None
         self._set_replay(list(onpolicy or []))
@@ -504,11 +505,27 @@ class FollowDataset(torch.utils.data.IterableDataset):
         prepared = [self.prepare(item, rng) for item in pair]
         return prepared if all(self.state_allowed(item) for item in prepared) else []
 
+    def prefetch_items(self, items, vol, *, required=False):
+        if self.remote_prefetch is None or not items:
+            return
+        if hasattr(self.batch_builder, 'prefetch_bounds'):
+            bounds = [bound for item in items for bound in self.batch_builder.prefetch_bounds(item,vol)]
+        else:
+            bounds = [tight_block(item['pos'],item['frame'],self.cfg.crop,vol.input_scale) for item in items]
+        if required:
+            self.remote_prefetch.ensure(vol.ct,bounds)
+        else:
+            self.remote_prefetch.submit(vol.ct,bounds)
+
     def __iter__(self):
         info = torch.utils.data.get_worker_info()
         rng = np.random.default_rng(self.seed*1000 + (0 if info is None else info.id))
         torch.set_num_threads(1)
-        vol = FiberVolume(self.vol_spec, cache_bytes=self.cache_bytes)
+        if self.remote_prefetch is not None:
+            self.remote_prefetch.ensure_metadata(self.vol_spec)
+            vol = FiberVolume(self.vol_spec,cache_bytes=self.cache_bytes,cache_only=True)
+        else:
+            vol = FiberVolume(self.vol_spec,cache_bytes=self.cache_bytes)
         cfg = self.cfg
         grid = torch.from_numpy(crop_local_grid(cfg.crop)).float()
         windows = []
@@ -523,12 +540,15 @@ class FollowDataset(torch.utils.data.IterableDataset):
             for _ in range(requested):
                 pair = self.batch_builder.decision_pair(cfg, rng)
                 if pair is not None:
-                    items.extend(self.prepare_pair(pair, rng))
+                    prepared = self.prepare_pair(pair, rng)
+                    self.prefetch_items(prepared,vol)
+                    items.extend(prepared)
             for _ in range(following):
                 item = self.batch_builder.bank_following(cfg, rng)
                 if item is not None:
                     item = self.prepare(item, rng)
                     if self.state_allowed(item):
+                        self.prefetch_items([item],vol)
                         items.append(item)
             for attempt in range(max(10000, self.chunk*1000)):
                 if len(items) == self.chunk:
@@ -569,11 +589,15 @@ class FollowDataset(torch.utils.data.IterableDataset):
                     item['location_source'] = location['source'] if location else 0
                     item = self.prepare(item, rng)
                 if self.state_allowed(item):
+                    self.prefetch_items([item],vol)
                     items.append(item)
                 if len(items) == self.chunk:
                     break
             if len(items) != self.chunk:
                 raise ValueError('Could not fill a training batch outside the held-out band')
+            # Promote the batch needed now above speculative work. Every crop
+            # read below is local-only; a missing chunk cannot trigger S3 I/O.
+            self.prefetch_items(items,vol,required=True)
             batch = (self.batch_builder(items, vol) if self.batch_builder is not None
                      else collate_with_volume(items, vol, cfg.crop, grid))
             if fraction:

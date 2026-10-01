@@ -276,7 +276,7 @@ def test_image_sampler_matches_reference_at_fine_and_coarse_resolution(monkeypat
     monkeypatch.setattr(module, 'read_tight_blocks', lambda *a, **kw: (raw, starts))
     items = [dict(pos=np.array([8., 8., 8.]), frame=np.eye(3))]
     crop = CropSpec(depth=12, width=10, behind=4, spacing=.5)
-    vol = SimpleNamespace(input_scale=2.)
+    vol = SimpleNamespace(input_scale=2.,presence=object())
     image = image_crop(items, vol, crop)
     grid = torch.from_numpy(crop_local_grid(crop)).float()
     for channel, scale in enumerate((2., 1.)):

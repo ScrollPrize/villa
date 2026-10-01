@@ -70,6 +70,13 @@ def wrong_continuation(bank, cfg, rng, *, tail_length_range=(4., 128.), prefer_l
     transition = own*(1-weight[:,None])+neighbor*weight[:,None]
     prefix_t = np.arange(max(0.,own_t[0]-max(cfg.n_history*cfg.history_step+4,prefix_length)),own_t[0],.25)
     path = np.concatenate((interp_at(own_points,own_arc,prefix_t),transition))
+    # A clipped prefix/bridge join can repeat the first point (notably when
+    # a reversed AFV path's catalog length differs by roundoff). Preserve the
+    # join indices below, but derive the seed heading from actual movement.
+    moving = np.flatnonzero(np.linalg.norm(path-path[0],axis=1) > 1e-6)
+    if not len(moving):
+        return None
+    seed_tangent = normalize(path[moving[0]]-path[0])
     distance = arclength(path)
     back = distance[-1]-np.arange(1,cfg.n_history+1)*cfg.history_step
     mask = (back >= 0).astype(np.float32)
@@ -88,7 +95,7 @@ def wrong_continuation(bank, cfg, rng, *, tail_length_range=(4., 128.), prefer_l
     item.update(fiber_ref=(fi,float(own_t[-1]),reverse),source=3,source_step=-1,stratum=4,
                 bank_transition_length=bridge_length,bank_tail_length=tail_length,
                 bank_prefix_end_t=float(own_t[0]), seed_pos=path[0].copy(),
-                seed_tangent=normalize(path[1]-path[0]),seed_age=float(distance[-1]),seed_valid=True)
+                seed_tangent=seed_tangent,seed_age=float(distance[-1]),seed_valid=True)
     # Certification metadata only: never enters the model.
     item.update(_seed_original_certified=True, _constructed_path=path,
                 _constructed_arc=distance, _leave_arc=distance[len(prefix_t)],
