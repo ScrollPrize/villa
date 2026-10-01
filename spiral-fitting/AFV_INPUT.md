@@ -23,13 +23,13 @@ to the native fiber directory, which is unchanged.
 
 The fibers are read directly from the `.afv`, read-only, and go through the
 same loader as native fibers: coordinate mapping, control spans, decimation and
-H/V classification. Only fibers whose bounds overlap the fit's Z range are
-decoded.
+H/V classification. Only fibers whose bounds overlap the fit's Z range,
+widened by `patch_loss_z_margin`, are decoded.
 
 In addition to the documented format, Spiral requires:
 
-* `coordinate_base_shape_zyx` in the `frame` metadata: the shape of the CT
-  volume the coordinates refer to, as native fibers carry it;
+* `coordinate_base_shape_zyx` in the `frame` or `root` metadata: the shape of
+  the CT volume the coordinates refer to, as native fibers carry it;
 * no cross-fiber branch references in the fiber annotations.
 
 ## Tests

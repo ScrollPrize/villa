@@ -40,7 +40,7 @@ def _bounds(points):
     return [f(p[axis] for p in points) for axis in range(3) for f in (min, max)]
 
 
-def write_afv(path, fibers, *, frame=FRAME):
+def write_afv(path, fibers, *, frame=FRAME, root=None):
     db = sqlite3.connect(path)
     try:
         db.executescript(SCHEMA)
@@ -61,7 +61,7 @@ def write_afv(path, fibers, *, frame=FRAME):
                     block_id, fiber_id, start, b''.join(struct.pack('<ddd', *p) for p in part)))
                 db.execute('INSERT INTO block_bounds VALUES(?,?,?,?,?,?,?)', (block_id, *_bounds(part)))
             point_total += len(points)
-        metadata = {'complete': True, 'uuid': str(uuid.uuid4()), 'frame': frame, 'root': {},
+        metadata = {'complete': True, 'uuid': str(uuid.uuid4()), 'frame': frame, 'root': root or {},
                     'fiber_count': len(fibers), 'point_count': point_total}
         db.executemany('INSERT INTO metadata VALUES(?,?)', [(k, json.dumps(v)) for k, v in metadata.items()])
         db.commit()

@@ -2133,7 +2133,8 @@ class FitContext:
             automated_fiber_volume=getattr(self, "automated_fiber_volume_path", None),
             min_point_spacing=self.config['pcl_fiber_min_point_spacing'],
             base_shape_zyx=getattr(self, 'base_shape_zyx', None),
-            z_range=(self.z_begin, self.z_end),
+            z_range=(self.z_begin - self.config['patch_loss_z_margin'],
+                     self.z_end + self.config['patch_loss_z_margin']),
         )
         # All fibers (horizontal, vertical, and merged link components) form one
         # sampling group, rather than one group per source file like the regular pcls.

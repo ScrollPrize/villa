@@ -7,7 +7,8 @@ import pytest
 
 from afv_fixture import BASE_SHAPE_ZYX, fiber, write_afv
 from afv_input import iter_afv_fibers, validate_afv_container
-from spiral_helpers import _fiber_data_point_collection, load_fiber_point_collection
+from spiral_helpers import (
+    _fiber_data_point_collection, load_fiber_point_collection, load_fiber_point_collections)
 
 
 @pytest.fixture
@@ -43,10 +44,30 @@ def test_z_range_selects_fibers_and_is_validated(afv):
         next(iter_afv_fibers(afv, z_range=(100, 0)))
 
 
+def test_fit_z_range_selects_fibers_on_a_downsampled_volume(afv):
+    def heights(z_range):
+        pcls, _ = load_fiber_point_collections(
+            None, 0, base_shape_zyx=[100, 75, 75], z_range=z_range, automated_fiber_volume=afv)
+        return [next(iter(pcl['points'].values()))['p'][2] for pcl in pcls.values()]
+    assert heights((40, 60)) == [50]  # Native Z=200 at a quarter of the AFV domain.
+    assert heights((0, 100)) == [25, 50, 75]
+
+
 def test_requires_the_coordinate_domain(tmp_path):
     path = write_afv(tmp_path / 'no-domain.afv', [fiber(100)], frame={'vc_open_data_coordinate_space': 'test'})
     with pytest.raises(ValueError, match='coordinate domain'):
         validate_afv_container(path)
+
+
+def test_reads_the_coordinate_domain_from_root(tmp_path):
+    path = write_afv(tmp_path / 'root.afv', [fiber(100)], frame={'vc_open_data_coordinate_space': 'test'},
+                     root={'coordinate_base_shape_zyx': BASE_SHAPE_ZYX})
+    assert validate_afv_container(path)['coordinate_base_shape_zyx'] == BASE_SHAPE_ZYX
+    (_, data, _), = iter_afv_fibers(path)
+    assert data['coordinate_base_shape_zyx'] == BASE_SHAPE_ZYX
+    conflict = write_afv(tmp_path / 'conflict.afv', [fiber(100)], root={'coordinate_base_shape_zyx': [100, 75, 75]})
+    with pytest.raises(ValueError, match='disagree'):
+        validate_afv_container(conflict)
 
 
 def test_rejects_an_unrelated_sqlite_database(tmp_path):

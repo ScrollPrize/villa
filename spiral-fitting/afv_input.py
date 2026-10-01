@@ -21,31 +21,40 @@ def _metadata(db):
     if meta.get('complete') is not True:
         raise ValueError('AFV is incomplete')
     root, frame = meta['root'], meta['frame']
+    # The format allows the coordinate fields in frame or root.
+    coordinates = dict(frame)
+    for key, value in root.items():
+        if key == 'coordinate_base_shape_zyx' or key.startswith('vc_open_data_'):
+            if coordinates.setdefault(key, value) != value:
+                raise ValueError(f'AFV frame and root disagree on {key}')
     if (root.get('scale', 1) != 1
-            or frame.get('vc_open_data_source_coordinate_level', 0) != 0
-            or frame.get('vc_open_data_source_coordinate_scale_factor', 1) != 1):
+            or coordinates.get('vc_open_data_source_coordinate_level', 0) != 0
+            or coordinates.get('vc_open_data_source_coordinate_scale_factor', 1) != 1):
         raise ValueError('AFV inputs must use native L0 coordinates')
-    shape = frame.get('coordinate_base_shape_zyx')
+    shape = coordinates.get('coordinate_base_shape_zyx')
     if not isinstance(shape, list) or len(shape) != 3:
         raise ValueError('AFV must declare its coordinate domain')
-    return meta
+    return meta, coordinates
 
 
 def validate_afv_container(path):
-    """Check the shared container contract without decoding every fiber."""
+    """Check the shared container contract without decoding every fiber.
+
+    Returns the coordinate fields the fibers inherit.
+    """
     db = sqlite3.connect(Path(path).resolve(strict=True).as_uri()+'?mode=ro', uri=True)
     try:
-        return _metadata(db)
+        return _metadata(db)[1]
     finally:
         db.close()
 
 
 def iter_afv_fibers(path, *, z_range=None):
+    """Yield the fibers; z_range filters native AFV coordinates."""
     path = Path(path).resolve(strict=True)
     db = sqlite3.connect(path.as_uri() + '?mode=ro', uri=True)
     try:
-        meta = _metadata(db)
-        root, frame = meta['root'], meta['frame']
+        meta, coordinates = _metadata(db)
         query = 'SELECT id,name,point_count,annotation FROM fibers'
         params = ()
         if z_range is not None:
@@ -79,7 +88,7 @@ def iter_afv_fibers(path, *, z_range=None):
             data = json.loads(annotation)
             if data.get('branches') or data.get('adjacent_branches'):
                 raise ValueError('AFV cross-fiber branch references are not supported by this reader')
-            for key, value in frame.items():
+            for key, value in coordinates.items():
                 if key in data and data[key] != value:
                     raise ValueError(f'AFV fiber {identity} has a conflicting coordinate frame')
                 data[key] = value

@@ -149,32 +149,37 @@ def load_fiber_point_collection(path, collection_id, coordinate_scale=0.25, min_
         base_shape_zyx=base_shape_zyx)
 
 
+def _fiber_coordinate_scale(source_shape, base_shape_zyx):
+    """Factor mapping coordinates of the source domain to the dataset domain."""
+    for name, shape in (('coordinate_base_shape_zyx', source_shape),
+                        ('base_shape_zyx', base_shape_zyx)):
+        if (not isinstance(shape, (list, tuple)) or len(shape) != 3
+                or any(isinstance(v, bool) or not isinstance(v, (int, np.integer))
+                       or v <= 0 for v in shape)):
+            raise ValueError(f'{name} must contain three positive integers')
+    # Match VC3D's published domains: pyramids may round extents up or
+    # down, and same-level shapes may use inclusive maximum coordinates.
+    # Use the dyadic scale, not a ratio of rounded dimensions.
+    scales = []
+    for exponent in range(-5, 6):
+        factor = 2 ** abs(exponent)
+        large, small = ((source_shape, base_shape_zyx) if exponent <= 0
+                        else (base_shape_zyx, source_shape))
+        if all((abs(a - b) <= 1 if exponent == 0 else
+                b in ((a + factor - 1) // factor, max(1, a // factor)))
+               for a, b in zip(large, small)):
+            scales.append(2.0 ** exponent)
+    if len(scales) != 1:
+        raise ValueError('Fiber and dataset coordinate domains are incompatible or ambiguous')
+    return scales[0]
+
+
 def _fiber_data_point_collection(data, path, collection_id, coordinate_scale=0.25,
                                 min_point_spacing=20.0, *, base_shape_zyx=None):
 
     source_shape = data.get('coordinate_base_shape_zyx')
     if source_shape is not None:
-        for name, shape in (('coordinate_base_shape_zyx', source_shape),
-                            ('base_shape_zyx', base_shape_zyx)):
-            if (not isinstance(shape, (list, tuple)) or len(shape) != 3
-                    or any(isinstance(v, bool) or not isinstance(v, (int, np.integer))
-                           or v <= 0 for v in shape)):
-                raise ValueError(f'{name} must contain three positive integers')
-        # Match VC3D's published domains: pyramids may round extents up or
-        # down, and same-level shapes may use inclusive maximum coordinates.
-        # Use the dyadic scale, not a ratio of rounded dimensions.
-        scales = []
-        for exponent in range(-5, 6):
-            factor = 2 ** abs(exponent)
-            large, small = ((source_shape, base_shape_zyx) if exponent <= 0
-                            else (base_shape_zyx, source_shape))
-            if all((abs(a - b) <= 1 if exponent == 0 else
-                    b in ((a + factor - 1) // factor, max(1, a // factor)))
-                   for a, b in zip(large, small)):
-                scales.append(2.0 ** exponent)
-        if len(scales) != 1:
-            raise ValueError('Fiber and dataset coordinate domains are incompatible or ambiguous')
-        coordinate_scale = scales[0]
+        coordinate_scale = _fiber_coordinate_scale(source_shape, base_shape_zyx)
 
     if data.get('version', 1) == 1 and not data.get('control_points'):
         print(f'WARNING: fiber {path} has no control_points; skipping')
@@ -382,7 +387,13 @@ def load_fiber_point_collections(path, next_id, min_point_spacing=20.0, *, base_
         next_id += 1
 
     if automated_fiber_volume:
-        from afv_input import iter_afv_fibers
+        from afv_input import iter_afv_fibers, validate_afv_container
+        if z_range is not None:
+            # z_range is in dataset coordinates; the AFV filters native ones.
+            scale = _fiber_coordinate_scale(
+                validate_afv_container(automated_fiber_volume)['coordinate_base_shape_zyx'],
+                base_shape_zyx)
+            z_range = tuple(z / scale for z in z_range)
         for logical_id, data, origin in iter_afv_fibers(automated_fiber_volume, z_range=z_range):
             # Same geometry and H/V interpretation as native fibers.
             source = os.path.join(str(automated_fiber_volume), logical_id + '.json')
