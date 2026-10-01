@@ -70,3 +70,4 @@ volume-cartographer/AGENTS.md
 /volume-cartographer/scripts/spiral/out
 /spiral-fitting/.claude
 /vesuvius/src/vesuvius/neural_tracing/fiber_follow/direct/ct_slice_judge_examples
+/vesuvius/src/vesuvius/neural_tracing/fiber_follow/datasets/automated_fiber_volumes

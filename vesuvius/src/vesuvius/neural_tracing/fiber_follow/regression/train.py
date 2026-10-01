@@ -40,7 +40,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.training_log import format_trai
 
 def validate_volume_source(spec, manifest):
     """Allow a different CT pyramid level, retaining frozen physical data/seeds."""
-    for key in ('fiber_zarr_dir', 'ct_zarr', 'fiber_level', 'grid_scale', 'inputs'):
+    for key in ('fiber_zarr_dir', 'ct_zarr', 'fiber_level', 'grid_scale'):
         if spec.to_dict()[key] != manifest['volume'][key]:
             raise ValueError(f'Volume source {key} differs from frozen manifest')
 
@@ -391,6 +391,11 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
     decisions = []
     model.train()
     for cpu in batches:
+        if 'dataset_id' in cpu:
+            counts = sums.setdefault('dataset_counts', {})
+            ids, sizes = torch.unique(cpu['dataset_id'], return_counts=True)
+            for source_id, size in zip(ids.tolist(), sizes.tolist()):
+                counts[str(source_id)] = counts.get(str(source_id), 0)+size
         batch = move_batch(cpu, device)
         valid = cpu['x']['history_valid']
         for name, value in dict(history_valid_slabs=valid.sum(),
@@ -510,10 +515,13 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
 def build_parser():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--name', required=True)
-    ap.add_argument('--fiber-zarrs', required=True)
-    ap.add_argument('--fibers', required=True)
-    ap.add_argument('--ct', required=True)
-    ap.add_argument('--manifest', required=True)
+    ap.add_argument('--fiber-zarrs')
+    ap.add_argument('--fibers')
+    ap.add_argument('--ct')
+    ap.add_argument('--manifest', help='Frozen Paris 4 monitor/calibration/test seeds; also configurable in --dataset-config')
+    ap.add_argument('--dataset-config', help='JSON source paths, validation bands, cache directory and sampling weights')
+    ap.add_argument('--input-mode', choices=('ct', 'ct+presence'), default='ct+presence',
+                    help='Image channels; CT-only requires --no-direction-inputs and --presence-dropout 0')
     ap.add_argument('--onpolicy', nargs='*', default=[])
     ap.add_argument('--out-root', default=str(Path(__file__).parents[1]/'output'))
     ap.add_argument('--device', default='cuda')
@@ -636,6 +644,15 @@ def options_argv(options):
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    dataset_document = dataset_digest = None
+    if args.dataset_config:
+        from .datasets import read_dataset_config, apply_primary_source
+        dataset_document, dataset_digest = read_dataset_config(args.dataset_config)
+        apply_primary_source(args, dataset_document)
+    if any(not getattr(args, key) for key in ('manifest', 'fiber_zarrs', 'fibers', 'ct')):
+        raise ValueError('Provide source paths and --manifest, or --dataset-config')
+    if args.input_mode == 'ct' and (args.direction_inputs or args.presence_dropout):
+        raise ValueError('CT-only requires --no-direction-inputs and --presence-dropout 0')
     launch_started = time.monotonic()
 
     def progress(message):
@@ -669,7 +686,7 @@ def main(argv=None):
     resume = read_checkpoint(args.resume,ARCHITECTURES,args.device) if args.resume else None
     cfg = DirectConfig(encoder=resolve_encoder(args.encoder, resume),
                        token_only=resolve_token_only(args.token_only, resume),
-                       direction_inputs=args.direction_inputs,channels=args.channels,hidden=args.hidden,layers=args.axial_layers,
+                       direction_inputs=args.direction_inputs,input_mode=args.input_mode,channels=args.channels,hidden=args.hidden,layers=args.axial_layers,
                        decoder_layers=args.decoder_layers,
                        activation_checkpointing=args.activation_checkpointing,
                        recurrent_refinement_steps=args.recurrent_refinement_steps)
@@ -677,6 +694,10 @@ def main(argv=None):
         cfg = checkpoint_config(resume)
         if args.direction_inputs != cfg.direction_inputs:
             raise ValueError('Direction inputs must match the resumed checkpoint; start a new run to change them')
+        if args.input_mode != cfg.input_mode:
+            raise ValueError('Input mode must match the checkpoint; CT-only starts a separate model')
+        if resume.get('dataset_config_sha256') != dataset_digest:
+            raise ValueError('Resume dataset configuration changed')
     args.encoder = cfg.encoder
     args.token_only = cfg.token_only
     if args.decision_fraction and args.microbatch % 2:
@@ -704,8 +725,12 @@ def main(argv=None):
     if not 1 <= args.n_commit <= cfg.n_future:
         raise ValueError('Commit window must fit forecast')
     # Finest-level CT in a single enlarged crop.
-    spec = FiberVolumeSpec(args.fiber_zarrs, ct_zarr=args.ct, ct_level=0, ct_grid_scale=4.,
-                           inputs='ct+presence')
+    primary_source = (next(s for s in dataset_document['sources'] if s['kind'] == 'paris4')
+                      if dataset_document else {})
+    spec = FiberVolumeSpec(args.fiber_zarrs, ct_zarr=args.ct,
+        ct_level=primary_source.get('ct_level', 0), ct_grid_scale=primary_source.get('ct_grid_scale', 4.),
+        grid_scale=primary_source.get('grid_scale', 8.), inputs=cfg.input_mode,
+        load_presence=cfg.input_mode != 'ct')
     if cfg.direction_inputs:
         # Validate sibling paths and grids before starting loaders or collectors.
         FiberVolume(spec, cache_bytes=1 << 20).direction_fields()
@@ -713,11 +738,17 @@ def main(argv=None):
                           future_step=cfg.future_step, recent_history_points=cfg.n_history,
                           no_history_prob=args.no_history_prob, short_history_prob=args.short_history_prob)
     progress('Loading manifest and fiber annotations')
-    manifest = read_manifest(args.manifest)
-    validate_volume_source(spec, manifest)
-    fibers = load_fibers(args.fibers, grid_scale=spec.grid_scale)
-    band = ZBand(*(v/spec.grid_scale for v in args.val_z))
-    train_f, val_f = split_fibers(fibers, band)
+    bank_band = ZBand(*(v/spec.grid_scale for v in args.val_z))
+    if dataset_document:
+        from .datasets import load_primary_dataset, HoldoutFilteredBank
+        fibers,train_f,val_f,manifest = load_primary_dataset(dataset_document,spec)
+        band = None
+    else:
+        manifest = read_manifest(args.manifest)
+        validate_volume_source(spec, manifest)
+        fibers = load_fibers(args.fibers, grid_scale=spec.grid_scale)
+        band = bank_band
+        train_f, val_f = split_fibers(fibers, band)
     progress(f'Loaded {len(train_f)} training fibers and {len(val_f)} validation fibers')
     if fiber_manifest(val_f) != manifest['fibers']:
         raise ValueError('Frozen validation geometry differs from dataset/holdout')
@@ -725,7 +756,9 @@ def main(argv=None):
     role_banks = {}
     if args.negative_bank:
         from vesuvius.neural_tracing.fiber_follow.regression.neighbor_bank import NeighborBank
-        negative_bank = NeighborBank(args.negative_bank,train_f,band,grid_scale=spec.grid_scale,
+        bank_class = HoldoutFilteredBank if dataset_document else NeighborBank
+        bank_kwargs = dict(heldout=val_f) if dataset_document else {}
+        negative_bank = bank_class(args.negative_bank,train_f,bank_band,grid_scale=spec.grid_scale,**bank_kwargs,
             refresh_seconds=args.negative_bank_refresh_seconds,cache_bytes=int(args.negative_bank_cache_mb*(1 << 20)))
         negative_bank.validate_volume(spec)
         if resume and (resume.get('negative_bank_provenance') is not None or resume['training_options'].get('negative_bank')):
@@ -740,7 +773,7 @@ def main(argv=None):
             if root.name == 'bank.json':
                 root = root.parent
             if root not in by_path:
-                by_path[root] = NeighborBank(root,train_f,band,grid_scale=spec.grid_scale,
+                by_path[root] = bank_class(root,train_f,bank_band,grid_scale=spec.grid_scale,**bank_kwargs,
                     refresh_seconds=args.negative_bank_refresh_seconds,cache_bytes=int(args.negative_bank_cache_mb*(1 << 20)))
                 by_path[root].validate_volume(spec)
             role_banks[role] = by_path[root]
@@ -749,7 +782,8 @@ def main(argv=None):
     def role_provenance():
         return {role:bank.provenance() for role,bank in role_banks.items()}
     if resume:
-        ignored = {'resume','reset_optimizer','out_root','device','batch','microbatch','workers','threads','worker_cache_gb',
+        # Allow a new base LR without resetting AdamW or the schedule origin.
+        ignored = {'resume','reset_optimizer','lr','out_root','device','batch','microbatch','workers','threads','worker_cache_gb','dataset_config',
                    'log_every','ckpt_every','diag_every','dagger_device',
                    'negative_bank_refresh_seconds','negative_bank_cache_mb','activation_checkpointing',
                    'history_grad_clip','rest_grad_clip','presence_dropout','blur_probability','blur_sigma',
@@ -757,12 +791,14 @@ def main(argv=None):
                    'bank_hard_fraction','replay_failure_fraction','bank_switch_tolerance','bank_own_tolerance',
                    'n_commit'}
         for key,value in vars(args).items():
-            recorded = resume['training_options'][key]
+            recorded = resume['training_options'].get(key, {'input_mode': 'ct+presence', 'dataset_config': None}.get(key))
             if key not in ignored and json.dumps(recorded,sort_keys=True) != json.dumps(value,sort_keys=True):
                 raise ValueError(f'Resume option differs: {key}')
         if resume['seed_manifest_sha256'] != manifest['sha256'] or resume['fiber_manifest'] != fiber_manifest(fibers):
             raise ValueError('Resume data/manifest changed')
     out = prepare_run_dir(args.out_root, args.name, resume is not None)
+    if dataset_document:
+        (out/'validation_paris4.json').write_text(json.dumps(manifest,indent=2)+'\n')
     if resume and Path(args.resume).resolve().parent != out.resolve():
         raise ValueError('Resume checkpoint must be inside the named run')
     recovery_states = recovery_hash = None
@@ -803,6 +839,29 @@ def main(argv=None):
     dataset = FollowDataset(train_f, spec, sample, band, chunk=args.microbatch, seed=args.seed+done,
         cache_bytes=int(args.worker_cache_gb*(1 << 30)), onpolicy=caches,
         replay_index=str(collector.index), batch_builder=builder, additional_crops=(), fresh_fraction=args.fresh_fraction)
+    dataset_provenance = None
+    if dataset_document:
+        from .datasets import build_mixed_dataset
+        progress('Checking mixed-source datasets and AFV checksums')
+        dataset, dataset_provenance = build_mixed_dataset(dataset, dataset_document, cfg, sample,
+            identity_sampling, args, seed=args.seed+done, out=out, resume=resume is not None)
+        from ..shared.online import MultiSourceCollector
+        collectors = []
+        for source, source_dataset in zip(dataset_document['sources'], dataset.datasets):
+            if source['kind'] == 'paris4':
+                collector.extra_args += ['--dataset-name',source['name']]
+                collectors.append((source['name'],collector))
+                continue
+            (out/f'validation_{source["name"]}.json').write_text(json.dumps(source_dataset.validation_manifest,indent=2)+'\n')
+            collectors.append((source['name'],OnlineCollector(out/'dagger'/source['name'],
+                source['path'], (0,1), args.dagger_device or args.device,
+                every=args.dagger_every,max_seeds=args.dagger_seeds,seed=args.seed,replay_keep=args.replay_keep,
+                initial=[c._dir for c in source_dataset.onpolicy],trace_len=args.dagger_trace_len,n_commit=args.n_commit,
+                collector_module='vesuvius.neural_tracing.fiber_follow.regression.collect',
+                extra_args=('--dataset-name',source['name'],'--after',args.dagger_after,
+                    '--bank-switch-tolerance',args.bank_switch_tolerance,'--bank-own-tolerance',args.bank_own_tolerance))))
+        collector = MultiSourceCollector(collectors)
+        progress('Dataset sampling: '+', '.join(f'{name}={weight:.1%}' for name,weight in zip(dataset.names,dataset.weights)))
     loader_args = dict(batch_size=None, num_workers=args.workers,
                        pin_memory=torch.device(args.device).type == 'cuda')
     if args.workers:
@@ -810,6 +869,8 @@ def main(argv=None):
     loader = torch.utils.data.DataLoader(dataset, **loader_args)
     if not resume:
         (out/'config.json').write_text(json.dumps(dict(vars(args), architecture=model.architecture,
+            resolved_dataset_config=dataset_document, dataset_config_sha256=dataset_digest,
+            dataset_provenance=dataset_provenance,
             identity_sampling=asdict(identity_sampling),
             negative_bank_provenance=negative_bank.provenance() if negative_bank else None,
             bank_role_provenance=role_provenance(),
@@ -819,6 +880,11 @@ def main(argv=None):
             seed_manifest_sha256=manifest['sha256'], fiber_manifest=fiber_manifest(fibers),
             parameter_count=sum(p.numel() for p in model.parameters())), indent=2))
     log = RunLog(out/'log.jsonl', formatter=format_training_log)
+    if dataset_document:
+        log.record(dict(step=done, event='dataset_configuration', datasets=dataset_provenance,
+                        names=dataset.names, probabilities=dataset.weights.tolist(),
+                        dataset_config_sha256=dataset_digest, input_mode=cfg.input_mode,
+                        evaluation_scope='Source-specific held-out fibers; Paris 4 recovery fixture'))
     if resume:
         log.record(dict(step=done, event='resume_configuration', checkpoint=str(args.resume),
                         training_options=vars(args), model_cfg=cfg.to_dict()))
@@ -902,6 +968,8 @@ def main(argv=None):
 
             def save(path, resumable=False):
                 extra = dict(step=step, lr_restart_step=lr_restart_step, tolerance=args.tolerance, n_commit=args.n_commit,
+                    dataset_config=dataset_document, dataset_config_sha256=dataset_digest,
+                    dataset_provenance=dataset_provenance,
                     history_sampling_revision=SAMPLING_REVISION,
                     samples_seen=prior_samples+observed_states,
                     identity_sampling=asdict(identity_sampling),
@@ -926,6 +994,22 @@ def main(argv=None):
                 began = time.monotonic()
                 training_diagnostics(ema, diagnostic['cpu_batch'], tracer, val_f, manifest['monitor'], out, step, log,
                                      device=args.device)
+                if dataset_document:
+                    from ..shared.evaluate import evaluate
+                    from ..shared.experiment import rollout_summary
+                    from ..shared.trace import TraceParams
+                    for source, source_dataset in zip(dataset_document['sources'],dataset.datasets):
+                        if source['kind'] != 'afv':
+                            continue
+                        source_tracer = DirectTracer(ema,FiberVolume(source_dataset.vol_spec),cfg.fine,cfg.n_history,
+                            TraceParams(n_commit=args.n_commit,max_len=args.diag_max_len),device=args.device)
+                        try:
+                            rows,_ = evaluate(source_tracer,source_dataset.validation_fibers,
+                                source_dataset.validation_manifest['monitor'],batch=1,coverage_max_len=args.diag_max_len)
+                            log.record(dict(step=step,split='monitor',dataset=source['name'],
+                                threshold=.5,coverage_max_len=args.diag_max_len,**rollout_summary(rows)))
+                        finally:
+                            source_tracer.close()
                 periodic['diagnostics_seconds'] = time.monotonic()-began
             if tracer is not None and args.long_diag_every and step % args.long_diag_every == 0:
                 from vesuvius.neural_tracing.fiber_follow.shared.evaluate import evaluate

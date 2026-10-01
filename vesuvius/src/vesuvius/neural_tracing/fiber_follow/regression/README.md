@@ -21,6 +21,29 @@ loader workers, and a fresh `axial_patch4_overlap_tokens_slabs_v11_run1` destina
 The convolutional launcher defaults to `axial_survival_slabs_v10_run1`.
 Existing output directories are never overwritten.
 
+When resuming, `--lr` may change the base learning rate while retaining AdamW
+moments, EMA, and the existing warmup/cosine schedule position. Omit
+`--reset-optimizer` to preserve that state; the active LR includes cosine decay.
+
+To prepare a separate continuation with more refinement stages, use a completed
+training checkpoint as the source of all effective settings:
+
+```bash
+../../../../.venv/bin/python -m vesuvius.neural_tracing.fiber_follow.regression.refinement_resume \
+  --checkpoint output/patch4_run3/ckpt_017000.pt \
+  --name patch4_run3_refine3 --refinement-steps 3
+```
+
+This only prepares the new directory; `migration.json` records the exact trainer
+command to launch. It preserves weights, EMA, RNG, update count, LR schedule and
+existing AdamW moments. Added stage embeddings copy the last learned stage;
+their moment rows start at zero, retaining the embedding tensor's Adam step.
+The frozen recovery fixture is copied unchanged and published replay caches are
+referenced from an independent replay index. The source run must be quiescent
+while preparing the fork. Existing destinations, zero-stage source models, and
+nonstandard optimizer layouts are rejected. As with ordinary resumes, loader
+random streams restart. No source config defaults are used.
+
 Architecture identifiers are `axial_fiber_slabs_v10`,
 `axial_patch4_overlap_fiber_slabs_v11`, and `axial_patch4_overlap_tokens_fiber_slabs_v11`.
 Patch4 now uses a learned 6x6x6 convolution with stride 4 and padding 1, after
@@ -154,6 +177,107 @@ variation and a shorter post-resume observation period. See
 `output/loader_speedup/live_comparison.json` and `handover.json` for the measured
 intervals and exact resume command. The original checkpoint is retained at
 `output/patch4_run3/ckpt_001000.pt`.
+
+### Second loader optimization round
+
+The next round, measured against `a0d3a940b` with the same hardware and run
+configuration, removes more repeated CPU work:
+
+- Rotate the 65,536 possible direction-byte pairs once per crop, then interpolate
+  through that lookup table without expanding the source block into six fields.
+- Sample identical crop geometry once per batch. Matched decisions still receive
+  independent output storage, historical slabs, augmentation and labels.
+- Batch exact nearest-polyline queries, retaining the original arithmetic and
+  unsorted tree traversal for identical tie breaking. Large queries are bounded
+  to 256 points per batch.
+- Cache resampled bank-path lengths alongside the shard geometry.
+
+Sequential CPU-only runs of these algorithmic changes alongside training measured 40 microbatches of eight
+after four warmups, with seed 0 and the config's initial (empty) replay list.
+Both used one loader thread, normal cached Numba JIT without fast math, and no
+profiler in the timed comparison:
+
+| CPU preparation, seconds/batch | `a0d3a940b` | Optimized |
+| --- | ---: | ---: |
+| Mean | 1.887 | 1.139 |
+| Median | 1.637 | 1.069 |
+| p95 | 3.277 | 1.614 |
+
+This is **1.66x loader throughput**, with all **1,720 non-timing tensor hashes
+identical** across 320 decisions. No sampling probabilities, image precision,
+augmentation or supervision rules changed. The baseline cProfile run attributed
+20.2 of 55.1 seconds to direction crops, 8.0 to scalar interpolation, and 7.8 to
+nearest-polyline queries. An intermediate profile reduced the latter to 1.8
+seconds; use the unprofiled table above for overall timing, since profiling and
+concurrent workloads affect the measurements.
+
+From the fiber-follow directory, the CPU benchmark command is:
+
+```bash
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMBA_NUM_THREADS=1 \
+  ../../../../.venv/bin/python scripts/benchmark_loader.py \
+  --config output/patch4_run3/config.json --workers 0 --warmup 4 --batches 40 \
+  --hash-batches --out /tmp/loader-round2.json
+```
+
+Reports, profiles, unchanged baseline source snapshots and its benchmark harness
+are retained in `output/loader_speedup_round2/`. The full suite passed 287
+tests (15 skipped, one deselected, ten passing subtests). The final guard against
+reusing mixed-dtype coordinates also passed all 14 direction/crop tests. Validation used
+`NUMPY_MADVISE_HUGEPAGE=0 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
+../../../../.venv/bin/python -m pytest tests -q -o cache_dir=/tmp/fiber-round2-pytest`.
+GPU tests were skipped in the sandbox. These CPU measurements are specific to
+this Ubuntu x86-64 host; the changes introduce no platform-specific dependencies.
+
+The larger microbatch exposed additional allocation and IPC costs. Main images
+and historical slabs now use the same direct shared-storage allocation as
+PyTorch's default worker collator. NumPy views write into that storage, and the
+original shared tensor is returned, eliminating the worker queue's full image
+copy. Outside a worker, allocation remains ordinary CPU tensor storage. A real
+one-worker loader also matched all 1,720 baseline hashes after this change.
+
+`launch_memory.sh` defaults `NUMPY_MADVISE_HUGEPAGE=0` (overridable). On this
+Linux host, large transient NumPy allocations were incurring huge-page compaction
+stalls. This process-local setting changes allocation policy, not values or
+system-wide settings. A CPU-only 20-batch transfer benchmark, after three warmups,
+used the actual `(16,8,120,101,101)` float32 image shape: mean/median/p95 delivery
+fell from 506/442/1,023 ms to 282/281/341 ms with direct shared storage. This measures
+synthetic filling and IPC, not complete training; see `batch_transfer.json` and
+`benchmark_batch_transfer.py` in the results directory. Run the latter with the
+project Python and `OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1`, adding `--shared`
+for direct allocation. The helper uses PyTorch's internal storage API, as its
+collator does; storage-preservation and worker-delivery checks cover this boundary.
+
+`patch4_run3` finally resumed from `ckpt_005000.pt` with model, EMA, AdamW and RNG state
+restored (283 optimizer entries, no optimizer or LR reset). At the user's request,
+the resumed run uses **batch 16 / microbatch 16**, with 10 workers and the other
+training options retained. Both step-5,000 evaluations finished before stopping:
+diagnostics took 31.98 seconds and recovery took 23.89 seconds; their reports and
+images remain in the run directory. `output/loader_speedup_round2/handover_after_eval.json`
+records completion evidence, the exact launch command, environment override and PID.
+As with every existing resume, loader
+random streams restart; changing microbatch grouping also changes sampled batches.
+Live throughput therefore reflects both loader improvements and the requested
+microbatch change; the fixed-microbatch CPU table isolates the loader changes.
+
+The final live comparison uses 19 pre-work logging windows (950 updates ending
+at steps 1,500–2,450, excluding the window containing the step-2,000 evaluation)
+and nine post-restart windows (450 updates ending at steps 5,100–5,500). Startup,
+periodic evaluation and active benchmarks are excluded. Wait percentiles describe
+the 50-update window averages, not individual-update tail latencies.
+
+| Live training measurement | Before this round | Final run |
+| --- | ---: | ---: |
+| Mean data wait / update | 151.8 ms | 31.0 ms |
+| Median data wait / update | 146.9 ms | 29.3 ms |
+| p95 data wait / update | 220.6 ms | 38.9 ms |
+| Crops / second | 40.35 | 71.89 |
+| Peak allocated GPU memory | 6.83 GiB | 13.30 GiB |
+
+This is **79.6% less data wait and 1.78x live throughput**, including the requested
+microbatch increase. GPU memory remains within the RTX 5090's capacity. Detailed
+windows and the comparison are saved in `output/loader_speedup_round2/live_after.json`
+and `live_comparison.json`. Training remained active beyond step 5,500.
 
 ## Source sampling and labels
 

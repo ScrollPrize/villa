@@ -33,6 +33,10 @@ class DirectTrainingInterval:
         self.values = dict(updates=0, crops=0, decisions=0)
 
     def add(self, row):
+        if 'dataset_counts' in row:
+            counts = self.values.setdefault('dataset_counts', {})
+            for key, value in row['dataset_counts'].items():
+                counts[key] = counts.get(key, 0)+value
         crops = row['observed_states']
         self.values['updates'] += 1
         self.values['crops'] += crops
@@ -86,6 +90,10 @@ def _interval_training_lines(row):
     lines.append(f"  supervision: {int(m['decisions'])} decisions / {int(m['crops'])} observations")
     lines.append(f"  scored crops: candidates {_rate(m['identity_candidate_states'], m['decisions'])}"
                  f" | departed {_rate(m.get('confidence_departed_states', 0), m.get('confidence_labeled_states', 0))}")
+    if 'dataset_counts' in m:
+        lines.append('  datasets (IDs from dataset_configuration): '+', '.join(
+            f'{key}: {value}/{int(m["decisions"])} ({value/max(1,m["decisions"]):.1%})'
+            for key,value in sorted(m['dataset_counts'].items())))
     if m.get('endpoint_states'):
         lines.append(f"  supervised endpoints: matched {_rate(m['matched_endpoint_states'], m['endpoint_states'])}"
                      f" | geometry choices {_rate(m['choice_endpoint_states'], m['endpoint_states'])}")

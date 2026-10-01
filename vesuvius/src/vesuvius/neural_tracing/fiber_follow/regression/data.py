@@ -9,14 +9,14 @@ from scipy.ndimage import gaussian_filter
 
 from vesuvius.neural_tracing.fiber_follow.shared.components import ComponentRule
 from vesuvius.neural_tracing.fiber_follow.shared.data import collate_targets
-from vesuvius.neural_tracing.fiber_follow.shared.crop_sampling import scalar_crops
+from vesuvius.neural_tracing.fiber_follow.shared.crop_sampling import scalar_crops, empty_image_batch
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import interp_at
 from vesuvius.neural_tracing.fiber_follow.shared.trace import ModelTracer
 from vesuvius.neural_tracing.fiber_follow.shared.reference import SEED_FIELDS, observed_seed
 from vesuvius.neural_tracing.fiber_follow.regression.model import DirectConfig
 
 
-def image_crop(items, vol, crop, pool=None, *, directions=False):
+def image_crop(items, vol, crop, pool=None, *, directions=False, input_mode='ct+presence'):
     """CT/presence, optionally followed by six unsigned local direction moments.
 
     The scalar sampler normalizes both channels to [0,1]. An empty history
@@ -24,17 +24,22 @@ def image_crop(items, vol, crop, pool=None, *, directions=False):
     and tracing, including the independently resolved presence grid.
     Each item reads only the axis-aligned block its own oriented crop needs.
     """
-    if not directions:
-        return torch.stack([scalar_crops(items, vol, crop, pool, presence=presence)[:, 0]
-                            for presence in (False, True)], 1)
-    from vesuvius.neural_tracing.fiber_follow.shared.direction_fields import direction_crops
     # Write every channel directly into its final storage: concatenating eight
-    # full-resolution channels was an avoidable copy on every observation.
-    output = np.empty((len(items), 8, crop.depth, crop.width, crop.width), np.float32)
+    # full-resolution channels and copying them for IPC are both avoidable.
+    if input_mode == 'ct' and directions:
+        raise ValueError('CT-only image inputs cannot include direction fields')
+    channels = 1 if input_mode == 'ct' else (8 if directions else 2)
+    tensor = empty_image_batch((len(items), channels, crop.depth, crop.width, crop.width))
+    output = tensor.numpy()
     scalar_crops(items, vol, crop, pool, presence=False, out=output[:, :1])
-    scalar_crops(items, vol, crop, pool, presence=True, out=output[:, 1:2])
-    direction_crops(items, vol, crop, pool, out=output[:, 2:])
-    return torch.from_numpy(output)
+    if input_mode != 'ct':
+        if vol.presence is None:
+            raise ValueError('Presence inputs require a presence prediction volume')
+        scalar_crops(items, vol, crop, pool, presence=True, out=output[:, 1:2])
+    if directions:
+        from vesuvius.neural_tracing.fiber_follow.shared.direction_fields import direction_crops
+        direction_crops(items, vol, crop, pool, out=output[:, 2:])
+    return tensor
 
 
 class ObservationBuilder:
@@ -46,7 +51,7 @@ class ObservationBuilder:
         for item in items:
             reference_layout(item,self.cfg)
         stack = lambda key: torch.from_numpy(np.stack([item[key] for item in items]).astype(np.float32))
-        crop_images = partial(image_crop, directions=self.cfg.direction_inputs)
+        crop_images = partial(image_crop, directions=self.cfg.direction_inputs, input_mode=self.cfg.input_mode)
         x = dict(fine=crop_images(items,vol,self.cfg.fine,pool),seed=stack('visible_seed'),
                  seed_mask=stack('visible_seed_mask'),seed_age=stack('visible_seed_age'),
                  seed_tangent=stack('visible_seed_tangent'))
@@ -190,7 +195,7 @@ def augment_image_pair(image, params, rng, *, blur_sigma=0., drop_presence=False
         gaussian_filter(values, sigma=(0., blur_sigma, blur_sigma, blur_sigma),
                         mode='reflect', output=values)
     values[0] = photometric(values[0], params, rng)
-    if drop_presence:
+    if drop_presence and len(values) > 1:
         values[1] = 0
 
 

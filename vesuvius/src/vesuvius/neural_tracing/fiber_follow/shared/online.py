@@ -18,6 +18,43 @@ def publish_replay(index, paths):
     os.replace(temp, index)
 
 
+class MultiSourceCollector:
+    """Round-robin source-local replay; at most one GPU collector at a time."""
+    def __init__(self, collectors):
+        self.collectors = list(collectors)
+        self.next_source = 0
+        self.active = None
+
+    def poll(self):
+        if self.active is None:
+            return None
+        name, collector = self.collectors[self.active]
+        event = collector.poll()
+        if event is not None:
+            self.active = None
+            return dict(event, dataset=name)
+        return None
+
+    def launch(self, step, save):
+        if self.active is not None:
+            return False
+        index = self.next_source
+        _,collector = self.collectors[index]
+        if not collector.launch(step,save):
+            return False
+        self.active = index
+        self.next_source = (index+1)%len(self.collectors)
+        return True
+
+    def close(self):
+        events = []
+        for name,collector in self.collectors:
+            event = collector.close()
+            if event:
+                events.append(dict(event,dataset=name))
+        return dict(dagger_shutdown=events) if events else None
+
+
 class OnlineCollector:
     """Training owns this process and continues updating its existing optimizer.
 

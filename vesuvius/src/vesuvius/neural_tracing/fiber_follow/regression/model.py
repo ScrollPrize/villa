@@ -22,6 +22,7 @@ TOKEN_OFFSET = (3, 0, 0)
 @dataclass
 class DirectConfig:
     direction_inputs: bool = False
+    input_mode: str = 'ct+presence'
     fine: CropSpec = field(default_factory=lambda: CropSpec(depth=120, width=101, behind=48, spacing=.5))
     channels: int = 32
     hidden: int = 128
@@ -39,6 +40,8 @@ class DirectConfig:
     token_only: bool = False
 
     def __post_init__(self):
+        if self.input_mode not in ('ct', 'ct+presence') or (self.input_mode == 'ct' and self.direction_inputs):
+            raise ValueError('CT-only inputs exclude presence and direction fields')
         if self.encoder not in ('conv', 'patch4'):
             raise ValueError('Encoder must be conv or patch4')
         if not isinstance(self.token_only, bool) or (self.token_only and self.encoder != 'patch4'):
@@ -64,7 +67,7 @@ class DirectConfig:
 
     @property
     def input_channels(self):
-        return 8 if self.direction_inputs else 2
+        return 1 if self.input_mode == 'ct' else (8 if self.direction_inputs else 2)
 
     @property
     def recent_history_points(self):

@@ -8,6 +8,8 @@ export PYTHON="${PYTHON:-$VES/.venv/bin/python}"
 export TORCHINDUCTOR_COMPILE_THREADS=${TORCHINDUCTOR_COMPILE_THREADS:-4}
 export AGENTS_AGENT_MODE=1 PYTHONDONTWRITEBYTECODE=1
 export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=1 NUMBA_NUM_THREADS=1
+# Large, short-lived worker arrays otherwise trigger costly Linux THP compaction.
+export NUMPY_MADVISE_HUGEPAGE=${NUMPY_MADVISE_HUGEPAGE:-0}
 RUN_NAME=${RUN_NAME:-axial_survival_slabs_v10_run1}
 BANK_PATH=${BANK_PATH:-$FF/output/neighbor_samples_r0_32_l80_160_v2}
 if [[ -e "$FF/output/$RUN_NAME" || -e "$FF/output/logs/$RUN_NAME.log" ]]; then

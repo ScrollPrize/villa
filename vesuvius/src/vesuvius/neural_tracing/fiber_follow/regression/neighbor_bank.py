@@ -205,6 +205,11 @@ class NeighborBank:
             # Same quarter-voxel arclength interpolation as the target annotation.
             lines[i] = interp_at(line,arc,np.arange(0.,arc[-1]+1e-9,.25))
         data['lines'] = lines
+        # Draw filtering uses the resampled path length, which can be slightly
+        # shorter than the manifest's original path. Compute it once per shard.
+        data['sampled_lengths'] = np.zeros(n, dtype=np.float64)
+        for i, line in lines.items():
+            data['sampled_lengths'][i] = arclength(line)[-1]
         self._arc_bounds[key] = ((float(ranges[:,0].min()), float(ranges[:,1].max()))
                                  if len(ranges) else (float('inf'), -float('inf')))
         self._spatial_bounds[key] = ((p.min(0), p.max(0)) if len(p)
@@ -305,8 +310,8 @@ class NeighborBank:
         for _ in range(8 if min_length else 1):
             entry = shards[int(rng.choice(len(shards),p=sizes/sizes.sum()))]
             data = self._shard(entry)
-            ids = [i for i,p in data['lines'].items() if (not unique or data['draw_eligible'][i])
-                   and (not min_length or arclength(p)[-1] >= min_length)]
+            ids = [i for i in data['lines'] if (not unique or data['draw_eligible'][i])
+                   and (not min_length or data['sampled_lengths'][i] >= min_length)]
             if ids:
                 i = int(rng.choice(ids))
                 return local_ids[entry['fiber']],data['lines'][i],data['arc_ranges'][i]

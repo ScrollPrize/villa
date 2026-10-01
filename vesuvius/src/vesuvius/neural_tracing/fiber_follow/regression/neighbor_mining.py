@@ -151,25 +151,32 @@ def exact_nearest(points, target, index=None):
     """Exact nearest points on a polyline, including interiors of long segments."""
     p = np.asarray(points, float)
     index = index or PolylineIndex(target)
+    # Bound temporary candidate arrays for large offline mining queries.
+    if len(p) > 256:
+        chunks = [exact_nearest(p[i:i+256], target, index) for i in range(0, len(p), 256)]
+        return tuple(np.concatenate(values) for values in zip(*chunks))
     a, delta, length2 = index.a, index.delta, index.length2
     # Midpoint broad phase: the nearest segment must be within current best
     # distance + half the longest segment of the query point.
     tree = index.tree
     _, first = tree.query(p)
-    def project(i, ids):
-        u = np.clip(((p[i]-a[ids])*delta[ids]).sum(-1)/np.maximum(length2[ids], 1e-20), 0, 1)
+    def project(points, ids):
+        u = np.clip(((points-a[ids])*delta[ids]).sum(-1)/np.maximum(length2[ids], 1e-20), 0, 1)
         q = a[ids]+u[:, None]*delta[ids]
-        d = np.linalg.norm(p[i]-q, axis=-1)
-        j = int(d.argmin())
-        return d[j], q[j], ids[j], u[j]
-    out = []
-    half = index.half
-    for i, j in enumerate(first):
-        best = project(i, np.array([j]))[0]
-        ids = np.asarray(tree.query_ball_point(p[i], best+half+1e-8), dtype=int)
-        out.append(project(i, ids))
-    return (np.array([x[0] for x in out]), np.stack([x[1] for x in out]),
-            np.array([x[2] for x in out]), np.array([x[3] for x in out]))
+        return np.linalg.norm(points-q, axis=-1), q, u
+    best = project(p, first)[0]
+    # Preserve the traversal order of the former single-point queries, including
+    # first-candidate tie breaking. SciPy otherwise sorts batched query results.
+    groups = tree.query_ball_point(p, best+index.half+1e-8, return_sorted=False)
+    counts = np.fromiter(map(len, groups), dtype=np.int64, count=len(p))
+    offsets = np.r_[0, np.cumsum(counts)[:-1]]
+    ids = np.concatenate(groups).astype(np.int64, copy=False)
+    distance, nearest, u = project(np.repeat(p, counts, axis=0), ids)
+    minima = np.minimum.reduceat(distance, offsets)
+    positions = np.arange(len(ids))
+    chosen = np.minimum.reduceat(np.where(distance == np.repeat(minima, counts),
+                                         positions, len(ids)), offsets)
+    return distance[chosen], nearest[chosen], ids[chosen], u[chosen]
 
 
 def traversed_voxels(points):

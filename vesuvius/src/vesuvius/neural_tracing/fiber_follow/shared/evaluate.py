@@ -12,7 +12,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.trace import field_axis, point_
 
 
 def make_seeds(fibers: list[TracedFiber], vol, per_fiber: int = 3, min_presence: float = 0.8,
-               margin: float = 32.0, seed: int = 0):
+               margin: float = 32.0, seed: int = 0, *, use_presence=True):
     """Seed states at high-presence GT points; one entry per (seed, direction).
 
     Initial heading is the local presence PCA axis, signed to agree with the
@@ -23,14 +23,16 @@ def make_seeds(fibers: list[TracedFiber], vol, per_fiber: int = 3, min_presence:
         if f.length < 2 * margin:
             continue
         ts = np.arange(margin, f.length - margin, 4.0)
-        pres = point_samples(vol, interp_at(f.points, f.s, ts))
-        good = ts[pres >= min_presence]
+        good = ts
+        if use_presence:
+            pres = point_samples(vol, interp_at(f.points, f.s, ts))
+            good = ts[pres >= min_presence]
         if len(good) == 0:
             continue
         for t in rng.choice(good, size=min(per_fiber, len(good)), replace=False):
             p = interp_at(f.points, f.s, np.array([t]))[0]
             tau = tangent_at(f.points, f.s, t)
-            ax, _ = field_axis(vol, p)
+            ax = field_axis(vol, p)[0] if use_presence else tau
             for sgn in (1.0, -1.0):
                 h = ax if np.dot(ax, sgn * tau) >= 0 else -ax
                 out.append(dict(fiber=fi, t=float(t), sign=sgn, pos=p, heading=h))

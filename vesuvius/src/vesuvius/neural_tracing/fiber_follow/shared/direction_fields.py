@@ -18,6 +18,7 @@ from functools import lru_cache
 
 from .data import _grid_flat, tight_block
 from .fast_sample import trilinear_weight
+from .crop_sampling import unique_crop_indices
 
 DIRECTION_CHANNELS = ('uu', 'vv', 'ff', 'uv', 'uf', 'vf')
 
@@ -63,7 +64,7 @@ def _decoded_directions():
 
 
 @numba.njit(cache=True, fastmath=False, nogil=True)
-def _sample_moments(raw, start, pos, frame, grid, out):
+def _sample_moments(raw, table, start, pos, frame, grid, out):
     """Six-channel trilinear sampling without per-voxel arrays or BLAS calls."""
     for p in range(len(grid)):
         a, b, c = grid[p, 0], grid[p, 1], grid[p, 2]
@@ -82,12 +83,13 @@ def _sample_moments(raw, start, pos, frame, grid, out):
                 for dx in numba.literal_unroll((0, 1)):
                     x = x0+dx
                     weight = trilinear_weight(fz, fy, fx, dz, dy, dx)
-                    uu += weight * raw[z, y, x, 0]
-                    vv += weight * raw[z, y, x, 1]
-                    ff += weight * raw[z, y, x, 2]
-                    uv += weight * raw[z, y, x, 3]
-                    uf += weight * raw[z, y, x, 4]
-                    vf += weight * raw[z, y, x, 5]
+                    code = raw[z, y, x]
+                    uu += weight * table[code, 0]
+                    vv += weight * table[code, 1]
+                    ff += weight * table[code, 2]
+                    uv += weight * table[code, 3]
+                    uf += weight * table[code, 4]
+                    vf += weight * table[code, 5]
         out[0, p], out[1, p], out[2, p] = uu, vv, ff
         out[3, p], out[4, p], out[5, p] = uv, uf, vf
 
@@ -118,15 +120,22 @@ def direction_crops(items, vol, crop, pool=None, *, out=None):
         start, size = tight_block(pos, frame, crop)
         # Exact lookup, not quantization: the source already consists of bytes.
         indices = nx.read(start, size).astype(np.uint16)*256 + ny.read(start, size)
-        vectors = decoded[indices]
-        moments = local_direction_moments(vectors, frame)
-        _sample_moments(moments, start, pos, frame, grid, result[j].reshape(6, -1))
+        # Rotate the byte-pair dictionary, rather than expanding the entire
+        # source block to vectors and six moments. Lookup preserves the exact
+        # float32 rotation/products and the interpolation summation order.
+        moments = local_direction_moments(decoded, frame)
+        _sample_moments(indices, moments, start, pos, frame, grid, result[j].reshape(6, -1))
 
+    sources = unique_crop_indices(items)
+    unique = [(j, items[j]) for j, source in enumerate(sources) if j == source]
     if pool is None:
-        for entry in enumerate(items):
+        for entry in unique:
             sample(entry)
     else:
         # Exhaust map so exceptions propagate and all output slices are ready.
-        for _ in pool.map(sample, enumerate(items)):
+        for _ in pool.map(sample, unique):
             pass
+    for j, source in enumerate(sources):
+        if j != source:
+            result[j] = result[source]
     return torch.from_numpy(result)

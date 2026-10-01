@@ -292,3 +292,15 @@ def test_persistent_loader_worker_discovers_appended_paths_without_restart(tmp_p
     finally:
         if loader._iterator is not None:
             loader._iterator._shutdown_workers()
+
+
+def test_draw_reuses_exact_resampled_lengths(tmp_path, monkeypatch):
+    from vesuvius.neural_tracing.fiber_follow.regression import neighbor_bank as module
+    bank, _ = make_bank(tmp_path, with_path=True)
+    data = bank._shard(next(iter(bank._known.values())))
+    for i, line in data['lines'].items():
+        assert data['sampled_lengths'][i] == module.arclength(line)[-1]
+    def unexpected(*args):
+        raise AssertionError('Repeated draw recalculated a cached path length')
+    monkeypatch.setattr(module, 'arclength', unexpected)
+    assert bank.draw_path(np.random.default_rng(4), min_length=30.) is not None

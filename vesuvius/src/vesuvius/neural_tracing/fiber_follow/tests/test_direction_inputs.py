@@ -242,3 +242,61 @@ class DirectionInputTests(unittest.TestCase):
 
 
 if __name__=='__main__':unittest.main()
+
+
+def test_shared_crop_geometry_is_sampled_once_with_independent_outputs(tmp_path):
+    vol = volume(tmp_path)
+    crop = CropSpec(depth=7, width=5, behind=3, spacing=.5)
+    a = dict(pos=np.array([20., 20., 20.]), frame=np.eye(3))
+    b = dict(pos=a['pos'].copy(), frame=frame_from_heading(np.array([.4, .3, .8])))
+    items = [a, dict(pos=a['pos'].copy(), frame=a['frame'].copy()), b, a]
+    expected = torch.cat([image_crop([item], vol, crop, directions=True) for item in items])
+    nx, ny = vol.direction_fields()
+    with patch.object(vol.ct, 'read', wraps=vol.ct.read) as ct_read, \
+         patch.object(vol.presence, 'read', wraps=vol.presence.read) as presence_read, \
+         patch.object(nx, 'read', wraps=nx.read) as nx_read, \
+         patch.object(ny, 'read', wraps=ny.read) as ny_read, ThreadPoolExecutor(2) as pool:
+        actual = image_crop(items, vol, crop, pool, directions=True)
+        assert [reader.call_count for reader in (ct_read, presence_read, nx_read, ny_read)] == [2]*4
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    actual[0].zero_()
+    torch.testing.assert_close(actual[1:], expected[1:], rtol=0, atol=0)
+
+
+def test_rotated_dictionary_matches_expanded_source_exactly():
+    from vesuvius.neural_tracing.fiber_follow.shared.direction_fields import _decoded_directions
+    rng = np.random.default_rng(91)
+    codes = rng.integers(0, 65536, size=(7, 11, 13), dtype=np.uint16)
+    for _ in range(5):
+        frame = frame_from_heading(rng.normal(size=3))
+        expanded = local_direction_moments(_decoded_directions()[codes], frame)
+        lookup = local_direction_moments(_decoded_directions(), frame)[codes]
+        np.testing.assert_array_equal(lookup, expanded)
+
+
+def test_worker_images_keep_shared_storage_and_identical_values(tmp_path):
+    cfg = config(direction_inputs=True)
+    vol = volume(tmp_path)
+    builder = ObservationBuilder(cfg)
+    state = item(cfg)
+    expected = builder.images([state], vol)
+    with patch('torch.utils.data.get_worker_info', return_value=object()):
+        actual = builder.images([state], vol)
+    assert actual['fine'].is_shared()
+    assert actual['history_slabs'].is_shared()
+    for key in expected:
+        if key != 'history_load_seconds':
+            torch.testing.assert_close(actual[key], expected[key], rtol=0, atol=0)
+
+
+def test_scalar_crop_reuse_preserves_coordinate_dtype_rounding(tmp_path):
+    from vesuvius.neural_tracing.fiber_follow.shared.crop_sampling import scalar_crops
+    vol = volume(tmp_path)
+    vol.input_scale = 3.
+    crop = CropSpec(depth=3, width=3, behind=1, spacing=.5)
+    pos = np.array([20.1, 20.2, 20.3], np.float32)
+    frame = frame_from_heading(np.array([.3, .4, .8])).astype(np.float32)
+    items = [dict(pos=pos, frame=frame), dict(pos=pos.astype(np.float64), frame=frame.astype(np.float64))]
+    expected = torch.cat([scalar_crops([state], vol, crop) for state in items])
+    assert not torch.equal(expected[0], expected[1])
+    torch.testing.assert_close(scalar_crops(items, vol, crop), expected, rtol=0, atol=0)

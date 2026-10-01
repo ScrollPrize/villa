@@ -13,6 +13,8 @@ Layout:
   load; the model families pass their checkpoint loaders to `shared.collect` and
   `shared.infer`.
 - `output/` stays at this level for both trainers.
+- `visualization/`: configurable interpretation atlases for the current patch4
+  slab model ([usage and reproduction](visualization/README.md)).
 
 The current slab follower and its training workflow are documented in
 [regression/README.md](regression/README.md). The remaining model description

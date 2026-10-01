@@ -155,6 +155,39 @@ class ChunkedArray:
         return out
 
 
+class RemoteChunkedArray(ChunkedArray):
+    """Use the shared persistent remote cache plus a bounded decoded-chunk LRU."""
+    def __init__(self, path, level, cache_dir, cache_bytes):
+        if not cache_dir:
+            raise ValueError('Remote CT requires a persistent cache_dir')
+        self.path, self.level, self.cache_dir = str(path), int(level), str(cache_dir)
+        self._array = self._open()
+        self.shape, self.chunks = tuple(self._array.shape), tuple(self._array.chunks)
+        self.dtype, self.fill = np.dtype(self._array.dtype), self._array.fill_value or 0
+        self.cache_bytes = int(cache_bytes)
+        self._cache, self._cached = OrderedDict(), 0
+        self._chunk_nbytes = int(np.prod(self.chunks))*self.dtype.itemsize
+        self._lock = threading.Lock()
+
+    def _open(self):
+        from vesuvius.neural_tracing.datasets.common import open_zarr
+        return open_zarr(self.path, scale=self.level, config={
+            'volume_cache_dir': self.cache_dir, 'volume_cache_retry_seconds': 30})
+
+    def __getstate__(self):
+        return {**super().__getstate__(), '_array': None}
+
+    def _load(self, key):
+        if self._array is None:
+            self._array = self._open()
+        start = np.asarray(key)*self.chunks
+        stop = np.minimum(start+self.chunks, self.shape)
+        values = np.asarray(self._array[tuple(slice(int(a), int(b)) for a,b in zip(start,stop))])
+        result = np.full(self.chunks, self.fill, self.dtype)
+        result[tuple(slice(0,n) for n in values.shape)] = values
+        return result
+
+
 @dataclass
 class FiberVolumeSpec:
     fiber_zarr_dir: str
@@ -168,13 +201,18 @@ class FiberVolumeSpec:
     # retired "fiber" default is kept so older metadata compares unchanged.
     inputs: str = "fiber"
     load_presence: bool = True  # False: CT metadata alone defines tracing bounds.
+    cache_dir: str | None = None  # Persistent compressed remote CT chunks.
 
     @property
     def mode(self) -> str:
         return self.inputs
 
     def to_dict(self) -> dict:
-        return dict(self.__dict__)
+        result = dict(self.__dict__)
+        # Keep legacy volume metadata byte-for-byte comparable on old resumes.
+        if self.cache_dir is None:
+            result.pop('cache_dir')
+        return result
 
 
 def _find_channel_zarr(root: str, channel: str) -> str:
@@ -227,7 +265,9 @@ class FiberVolume:
         if not spec.ct_zarr:
             raise ValueError("CT input mode needs ct_zarr")
         # Native CT is the larger field; presence keeps its own cache.
-        ct = ChunkedArray(os.path.join(spec.ct_zarr, str(spec.ct_level)), int(cache_bytes * 0.75))
+        ct = (RemoteChunkedArray(spec.ct_zarr, spec.ct_level, spec.cache_dir, int(cache_bytes * .75))
+              if spec.ct_zarr.startswith(('s3://','http://','https://')) else
+              ChunkedArray(os.path.join(spec.ct_zarr, str(spec.ct_level)), int(cache_bytes * 0.75)))
         expected = np.asarray(self.presence.shape)*spec.grid_scale/spec.ct_grid_scale if self.presence is not None else np.asarray(ct.shape)
         if np.any(np.abs(np.asarray(ct.shape)-expected) > 1):
             raise ValueError(

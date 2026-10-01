@@ -126,6 +126,8 @@ def load_fibers(fiber_dir: str, grid_scale: float = 8.0, spacing: float = 1.0) -
 
 def fiber_manifest(fibers):
     """Ordered identities for caches containing fiber indices and arc positions."""
+    if hasattr(fibers, 'manifest_entries'):
+        return fibers.manifest_entries()
     return [dict(name=f.name, source_hash=f.source_hash,
                  geometry_hash=hashlib.sha256(np.asarray(f.points, dtype="<f8").tobytes()).hexdigest(),
                  endpoint_stop=list(f.endpoint_stop)) for f in fibers]

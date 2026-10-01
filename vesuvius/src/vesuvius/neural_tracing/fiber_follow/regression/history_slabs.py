@@ -76,13 +76,13 @@ def slabs_allowed(item, band):
 
 def load_slabs(items, vol, cfg, pool=None):
     from .data import visible_points
-    from vesuvius.neural_tracing.fiber_follow.shared.crop_sampling import scalar_crops
+    from vesuvius.neural_tracing.fiber_follow.shared.crop_sampling import scalar_crops, empty_image_batch
     started = time.perf_counter()
     layouts = [slab_layout(item) for item in items]
     flat = [slab for layout in layouts for slab in layout]
     images = scalar_crops(flat, vol, SLAB, pool, presence=False)
     grid = torch.from_numpy(crop_local_grid(SLAB)).float()
-    output = torch.zeros(len(items), SLOTS, 2, 8, 65, 65)
+    output = empty_image_batch((len(items), SLOTS, 2, 8, 65, 65)).zero_()
     valid = torch.zeros(len(items), SLOTS, dtype=torch.bool)
     # Translation (3), relative rotation (9), log age (1), seed role (1).
     pose = torch.zeros(len(items), SLOTS, 14)

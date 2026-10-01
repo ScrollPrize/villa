@@ -189,10 +189,11 @@ def track_arrays(track):
     return {'track_pos': np.asarray(track, np.float64).reshape(-1, 3)}
 
 
-def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer, bank_loader=None):
+def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer, bank_loader=None, dataset_loader=None):
     ap = argparse.ArgumentParser()
     ap.add_argument('--checkpoint', required=True)
     ap.add_argument('--fibers', required=True)
+    ap.add_argument('--dataset-name', help='Source in the checkpoint dataset configuration')
     ap.add_argument('--fiber-zarrs')
     ap.add_argument('--val-z', type=float, nargs=2, default=(45000., 48500.))
     ap.add_argument('--seeds-per-fiber', type=int, default=2)
@@ -222,20 +223,25 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer, bank_loader=
                        n_future=model.cfg.n_future, future_step=model.cfg.future_step)
     if args.fiber_zarrs:
         spec.fiber_zarr_dir = args.fiber_zarrs
+    if args.dataset_name:
+        if dataset_loader is None:
+            raise ValueError('This collector does not support named datasets')
+        spec, train_f, band = dataset_loader(args, ck)
+    else:
+        fibers = load_fibers(args.fibers, grid_scale=spec.grid_scale)
+        band = ZBand(args.val_z[0]/spec.grid_scale, args.val_z[1]/spec.grid_scale)
+        train_f, _ = split_fibers(fibers, band)
     vol = FiberVolume(spec, cache_bytes=2 << 30)
-    fibers = load_fibers(args.fibers, grid_scale=spec.grid_scale)
-    band = ZBand(args.val_z[0]/spec.grid_scale, args.val_z[1]/spec.grid_scale)
-    train_f, _ = split_fibers(fibers, band)
     bank_detector = bank_loader(args, ck, train_f, band, spec) if bank_loader is not None else None
     # Limit volume reads as well as rollouts when collecting a bounded batch.
     rng = np.random.default_rng(args.seed)
     seeds = []
     for fi in rng.permutation(len(train_f)):
         seed_pool = make_seeds([train_f[fi]], vol, per_fiber=args.seeds_per_fiber,
-                                min_presence=.8, seed=int(rng.integers(2**31)))
+                                min_presence=.8, seed=int(rng.integers(2**31)), use_presence=spec.mode != 'ct')
         for seed in seed_pool:
             seed['fiber'] = int(fi)
-            if not band.lo-64 <= seed['pos'][2] < band.hi+64:
+            if band is None or not band.lo-64 <= seed['pos'][2] < band.hi+64:
                 seeds.append(seed)
         if args.max_seeds and len(seeds) >= args.max_seeds:
             seeds = seeds[:args.max_seeds]
