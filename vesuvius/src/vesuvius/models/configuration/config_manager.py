@@ -25,9 +25,7 @@ class ConfigManager:
     def load_config(self, config_path):
         config_path = Path(config_path)
         self._config_path = config_path
-        # utf-8-sig: configs must not depend on the machine locale codec.
-        # Windows editors often emit a UTF-8 BOM that would otherwise glue
-        # onto the first key and silently drop that whole section (#1524).
+        # utf-8-sig drops a leading BOM so the first key stays intact (#1524).
         try:
             with open(config_path, "r", encoding="utf-8-sig") as f:
                 config = yaml.safe_load(f)
