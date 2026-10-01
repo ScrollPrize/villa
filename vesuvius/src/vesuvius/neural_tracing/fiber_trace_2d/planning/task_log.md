@@ -28,6 +28,9 @@
   inference/native replay implementation through its restricted
   `training-full` inherited-allocation mode. It evaluates current raw weights,
   64 directions, at the configured test interval.
+- Startup and periodic evaluation now use the same trace-test lifecycle.
+  Startup traces use the just-written raw `best.pt`; periodic traces use
+  `current.pt`, so TensorBoard metrics exist from the initial test onward.
 - DDP ranks remain in a one-second collective poll while the rank-zero child
   uses all manager-assigned GPU UUIDs. Startup/completion failures are
   broadcast before raising, avoiding a stranded rank. The dedicated transient

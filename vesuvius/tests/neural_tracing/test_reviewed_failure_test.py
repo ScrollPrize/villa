@@ -164,3 +164,36 @@ def test_training_trace_subprocess_start_failure_is_reported(monkeypatch, tmp_pa
             step=1, run_dir=tmp_path / "run", snapshot_dir=checkpoint.parent,
             distributed=distributed, writer=None,
         )
+
+
+def test_training_trace_uses_startup_best_snapshot(monkeypatch, tmp_path):
+    checkpoint = tmp_path / "snapshots/best.pt"
+    checkpoint.parent.mkdir()
+    checkpoint.write_bytes(b"checkpoint")
+    for name in ("template.json", "native", "runner.py"):
+        (tmp_path / name).write_text("x")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-test")
+
+    class Process:
+        def __init__(self, command, **_kwargs):
+            job = json.loads((tmp_path / "run/reviewed_trace_test/step_00000001/job.json").read_text())
+            assert job["checkpoint"] == str(checkpoint)
+            output = tmp_path / "run/reviewed_trace_test/step_00000001"
+            values = {key: 1.0 for key in (
+                "restarts_forward", "restarts_reverse", "restarts_combined",
+                "reference_mm_forward", "reference_mm_reverse", "reference_mm_combined",
+                "implied_mean_mm_forward", "implied_mean_mm_reverse", "implied_mean_mm_combined",
+                "wall_seconds")}
+            (output / "training_metrics.json").write_text(json.dumps(values))
+
+        def poll(self):
+            return 0
+
+    monkeypatch.setattr(train.subprocess, "Popen", Process)
+    distributed = train._distributed_config_from_env(train.torch.device("cpu"), env={})
+    train._run_reviewed_trace_test(
+        settings={"template": str(tmp_path / "template.json"), "split_root": str(tmp_path),
+                  "native_binary": str(tmp_path / "native"), "runner": str(tmp_path / "runner.py")},
+        step=1, run_dir=tmp_path / "run", snapshot_dir=checkpoint.parent,
+        distributed=distributed, writer=None,
+    )

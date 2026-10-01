@@ -713,6 +713,10 @@ def _run_reviewed_trace_test(*, settings: dict[str, Any], step: int, run_dir: Pa
     gpu_tokens = _distributed_visible_gpu_tokens(distributed)
     output = run_dir / "reviewed_trace_test" / f"step_{step:08d}"
     checkpoint = snapshot_dir / "current.pt"
+    if not checkpoint.is_file():
+        # Startup tests write the current raw weights as `best.pt`; periodic
+        # tests write `current.pt`. Both are snapshots of the tested step.
+        checkpoint = snapshot_dir / "best.pt"
     process = None
     log_stream = None
     startup_error = None
@@ -4380,6 +4384,11 @@ def training_units(
             initial_metric = _distributed_broadcast_object(initial_metric, distributed)
             initial_metric_name = _distributed_broadcast_object(initial_metric_name, distributed)
             save_test_snapshots(start_step, initial_metric, initial_metric_name, initial=is_initial)
+            if reviewed_trace_test is not None:
+                _run_reviewed_trace_test(
+                    settings=reviewed_trace_test, step=start_step, run_dir=run_dir,
+                    snapshot_dir=snapshot_dir, distributed=distributed, writer=writer,
+                )
             pending_test = None
     except BaseException:
         # This can yield before the training prefetcher exists. Closing a
