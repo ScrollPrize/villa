@@ -71,12 +71,36 @@ class ObservationBuilder:
                  seed_tangent=stack('visible_seed_tangent'))
         from .history_slabs import load_slabs
         x.update(load_slabs(items, vol, self.cfg, pool))
+        # Recorded replay frames have unknown quality unless it was supplied;
+        # do not count them as newly successful CT estimates.
+        quality = [item.get('ct_frame_diagnostics', {}) for item in items]
+        for key, default, dtype in (('source', -1, torch.int64), ('energy', 0., torch.float32),
+                                    ('gap', 0., torch.float32)):
+            x['ct_frame_'+key] = torch.tensor([q.get(key, default) for q in quality], dtype=dtype)
         return x
 
     def observations(self, items, vol):
-        return dict(x=self.images(items,vol),
+        batch = dict(x=self.images(items,vol),
                     hist=torch.as_tensor(np.stack([i['hist_local'] for i in items]),dtype=torch.float32),
                     hmask=torch.as_tensor(np.stack([i['hmask'] for i in items]),dtype=torch.float32))
+        # Small, CPU-side geometry for truthful crop diagnostics. It is never
+        # passed to the model and does not require another CT read.
+        annotation = np.zeros((len(items), 257, 3), dtype=np.float32)
+        valid = np.zeros((len(items), 257), dtype=bool)
+        for row, item in enumerate(items):
+            curve = item.get('identity_curve')
+            if curve is None and 'fut_local' in item:
+                curve = np.concatenate((item['gt_history'][::-1], item['fut_local']))
+            if curve is not None and len(curve):
+                curve = np.asarray(curve)
+                index = np.linspace(0, len(curve)-1, min(257, len(curve))).round().astype(int)
+                annotation[row, :len(index)] = curve[index]
+                valid[row, :len(index)] = np.isfinite(curve[index]).all(-1)
+        batch.update(diagnostic_annotation=torch.from_numpy(annotation),
+                     diagnostic_annotation_mask=torch.from_numpy(valid),
+                     crop_frame=torch.as_tensor(np.stack([i['frame'] for i in items]), dtype=torch.float64),
+                     crop_pos=torch.as_tensor(np.stack([i['pos'] for i in items]), dtype=torch.float64))
+        return batch
 
     def __call__(self,items,vol):
         return dict(self.observations(items, vol), **collate_targets(items))

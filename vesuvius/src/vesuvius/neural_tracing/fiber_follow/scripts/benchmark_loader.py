@@ -19,6 +19,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.data import (
 )
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolumeSpec
+from vesuvius.neural_tracing.fiber_follow.shared.training_options import normalize_batch_options
 from vesuvius.neural_tracing.fiber_follow.shared.runloop import raise_open_file_limit
 from vesuvius.neural_tracing.fiber_follow.regression.model import DirectConfig
 from vesuvius.neural_tracing.fiber_follow.regression.data import IdentityObservationBuilder, IdentitySampling
@@ -51,7 +52,7 @@ def main():
         ap.error('Positive batches, nonnegative warmup/workers; profiling requires workers=0')
     raise_open_file_limit()
     torch.set_num_threads(1)
-    c = json.loads(args.config.read_text())
+    c = normalize_batch_options(json.loads(args.config.read_text()))
     cfg = DirectConfig(**dict(c['model_cfg'], fine=CropSpec(**c['model_cfg']['fine'])))
     sample = SampleConfig(**dict(c['sample_cfg'], crop=cfg.fine))
     spec = FiberVolumeSpec(**c['vol_spec'])
@@ -64,7 +65,7 @@ def main():
              if c.get(role)}
     builder = IdentityObservationBuilder(cfg, fibers, IdentitySampling(**c['identity_sampling']),
                                          augment=True, **banks)
-    dataset = FollowDataset(fibers, spec, sample, band, chunk=c['microbatch'], seed=args.seed,
+    dataset = FollowDataset(fibers, spec, sample, band, chunk=c['batch'], seed=args.seed,
         cache_bytes=int(c['worker_cache_gb']*(1 << 30)), batch_builder=builder,
         onpolicy=[OnPolicyStates.load(p) for p in c['onpolicy']], fresh_fraction=c['fresh_fraction'])
     loader = torch.utils.data.DataLoader(dataset, batch_size=None, num_workers=args.workers)
@@ -90,11 +91,11 @@ def main():
         profiler.dump_stats(str(args.profile))
     values = [r['seconds'] for r in rows]
     report = dict(config=str(args.config.resolve()), workers=args.workers, seed=args.seed,
-        warmup=args.warmup, batches=args.batches, microbatch=c['microbatch'],
+        warmup=args.warmup, batches=args.batches, batch=c['batch'],
         torch_version=torch.__version__, numpy_version=np.__version__,
         mean_seconds=float(np.mean(values)), p50_seconds=float(np.median(values)),
         p95_seconds=float(np.percentile(values, 95)),
-        samples_per_second=c['microbatch']*args.batches/sum(values), rows=rows)
+        samples_per_second=c['batch']*args.batches/sum(values), rows=rows)
     args.out.write_text(json.dumps(report, indent=2)+'\n')
     print(json.dumps({k: v for k, v in report.items() if k != 'rows'}), flush=True)
 

@@ -15,8 +15,8 @@ bash scripts/launch_patch4_memory.sh
 bash scripts/launch_memory.sh
 ```
 
-Set `RUN_NAME`, `BATCH_SIZE`, `MICROBATCH_SIZE`, `WORKERS`, and `BANK_PATH` as needed.
-The patch launcher defaults to 16 decisions per update and microbatch, eight
+Set `RUN_NAME`, `BATCH_SIZE`, `GRAD_STEPS`, `WORKERS`, and `BANK_PATH` as needed.
+The patch launcher defaults to batch 16 and one gradient accumulation step, eight
 loader workers, and a fresh `axial_patch4_overlap_tokens_slabs_v11_run1` destination.
 The convolutional launcher defaults to `axial_survival_slabs_v10_run1`.
 Existing output directories are never overwritten.
@@ -84,25 +84,54 @@ fits, including the connector to the first accepted recovery point; fitting
 resumes after 12 voxels of accepted recovery geometry. Replay v8 preserves this
 boundary when a decision is resumed. There is no alternate heading policy.
 
-All image crops use CT-normal rotation: u is the CT sheet normal projected
-perpendicular to the heading, and v is heading × u. An independent seed chooses
-a deterministic sign; accepted trace steps carry the previous u sign forward to
-prevent eigenvector flips. Accepted short steps may update roll while retaining
-their heading. If a later normal is unusable or nearly parallel to the heading,
-the last CT-established roll is transported. Initialization requires a usable
-normal. Failed steps do not reestimate either heading or roll.
+All image crops use the `ct_transverse_uv_v2` frame policy. With heading h
+fixed, restrict the local CT structure tensor J to an orthonormal basis B of
+h's perpendicular plane. The principal eigenvector of BᵀJB determines u;
+v is h × u. Derivative sigma is 1 native voxel and integration sigma is 4,
+using a 65³ native CT context. Independent frames choose a deterministic sign;
+accepted trace steps preserve sign continuity against the transported previous
+frame. Failed steps retain the full frame.
 
-Fresh training still perturbs annotation-based heading and position, but CT
-resolves roll before image sampling. History, labels, and candidate coordinates
-rotate together. There is no random-roll augmentation or old-frame switch.
-Replay uses its exact saved frame, including held failure views. Historical slabs
-also use local CT-normal frames with sign continuity in chronological order.
-Remote prefetch covers the normal-estimation cube and every possible roll until
-CT resolves the final frame. Holdout checks include those read footprints.
+A reliable estimate requires transverse principal energy > 1e-12 (CT divided
+by 255), at least 1e-4 of total tensor energy, and transverse eigenvalue gap
+(max − min)/max >= 0.05. These numerical confidence gates do not certify
+anatomical orientation. Weak evidence transports the previous observation's
+frame. A first historical slab can borrow the current observation's frame;
+without an established frame, a deterministic perpendicular basis supplies roll.
+The heading is unchanged by every roll fallback. Initial H/V seed-heading
+selection still requires an identifiable unrestricted CT sheet normal.
 
-Real-CT comparisons and implementation checks are in
-`output/heading_investigation_20261001/ct_rotation_implementation/`; the visual
-experiment is in the adjacent `ct_frame_rotation/` directory.
+Fresh training perturbs annotation-based heading and position, then resolves
+roll before sampling images. History, labels, and candidate coordinates rotate
+together. Replay holds its recorded frame; historical slabs resolve local CT
+frames in chronological order. Weak orientation does not discard training pairs.
+Invalid geometry or CT context still rejects the whole batch within its
+source, with a contextual error after 64 consecutive rejections. I/O errors
+propagate. The log reports `ct_frame_rejected_batches` separately from roll
+fallbacks.
+
+Training logs current and historical frame counts, transported/deterministic
+fallback counts, and mean transverse gap. JSON also records summed transverse
+energy and gap. Batch tensors contain `ct_frame_source/energy/gap` and
+`history_frame_source/energy/gap`; source codes are 0 = CT, 1 = transported,
+2 = deterministic, and -1 = unmeasured or padded. Trace decision records include
+`ct_frame_diagnostics`. Remote prefetch and holdout checks cover the tensor's
+CT context and every possible crop roll until the final frame is resolved.
+
+Real-CT failure examples and measurements are in
+`output/ct_normal_failures_20261001/report/index.html`.
+The production estimator passes all 46 saved contexts, including 14 failures;
+measurements are in `output/ct_normal_failures_20261001/production_validation.json`.
+This validates frame construction, not training or tracing accuracy. Frozen
+recovery fixtures record the frame policy and must match the current policy.
+
+Validation from `fiber_follow` (176 passed, 5 GPU tests skipped):
+
+```bash
+AGENTS_AGENT_MODE=1 MPLCONFIGDIR=/tmp/fiber-tests-mpl ../../../../.venv/bin/python -m pytest -q \
+  -o cache_dir=/tmp/fiber-pytest-cache \
+  tests/test_{heading,ct_frames,transverse_frames,trace_heading,history_slabs,ct_frame_retries,point_logging,regression,batch_diagnostic,feedback_refinement,decision_training,identity_decisions,observation_preparation,mixed_datasets,diagnostic_images}.py
+```
 
 ### Default CT normalization
 
@@ -167,7 +196,7 @@ bash scripts/train_mixed_ct_stem.sh
 
 The launcher creates `mixed_ct_afv_stem32_fresh_run1` with random model weights
 and a fresh AdamW optimizer: 100000 total steps, LR 1e-4, 5000-step warmup,
-batch/microbatch 16, 10 workers and 48 remote prefetch connections. It uses the
+batch 16 and grad steps 1, 10 workers and 48 remote prefetch connections. It uses the
 same mixed-dataset configuration and persistent volume cache. No checkpoint or
 migration is required. `STEM_RUN_NAME` selects another name, and extra trainer
 flags can be appended. To resume this new run later, use the same launcher with
@@ -210,12 +239,19 @@ History cross-attention does not apply RoPE independently in each slab's frame.
 bank-following samples. With decision fraction .3, bank-following 0, and fresh
 fraction .9, the requested mix is 63% annotation-fresh, 7% replay, and 30% matched
 decisions. These are sampling targets; availability and paired batching affect
-realized counts. Both sampling flags may change on resume. Negative-bank data
+realized counts. Both sampling flags may change on resume. `--tolerance` may also change on resume;
+it changes distance-based supervision and correctness reporting, while preserving
+optimizer state and the frozen monitor inputs. Negative-bank data
 still supports matched decisions and supervision even with bank-following disabled.
 
-`--batch` is the minimum number of independent supervised decisions per optimizer
-update; `--microbatch` is the number loaded and predicted together. Complete
-microbatches are retained, including both members of matched pairs. Every decision
+`--batch` is the number of independent decisions loaded and predicted together.
+`--grad-steps` is the number of batches accumulated before one optimizer update.
+For example, `--batch 12 --grad-steps 2` gives an effective batch of 24 decisions.
+Matched pairs stay in the same batch, so batch size must be even when matched
+decision sampling is enabled. Defaults are batch 4 and grad steps 2; the patch
+and mixed-CT launchers use batch 16 and grad steps 1. Saved legacy configs are
+translated automatically (old batch 24 / microbatch 12 becomes batch 12 / grad
+steps 2); the trainer CLI now accepts only the new names. Every decision
 gets equal weight. Geometry, generated survival and supplied-candidate survival
 keep their coefficients (1, .5, 1). There are no observation-only steps, streamed
 loss budgets, writer replay or cached historical main-encoder features.
@@ -300,7 +336,7 @@ The September 30, 2026 check against `3a7658e02` used `patch4_run3`'s
 annotations. Both versions ran alongside the original training process on an
 Intel Core Ultra 7 270K Plus, with Python 3.14.4, PyTorch 2.12.1+cu130,
 NumPy 2.4.6 and Numba 0.66.0 (normal cached JIT, `fastmath=False`). The command
-above measured 20 microbatches of eight after two warmups, with seed 0:
+above measured 20 batches of eight after two warmups, with seed 0:
 
 | CPU preparation, seconds/batch | Before | After |
 | --- | ---: | ---: |
@@ -321,7 +357,7 @@ reported 279 passed, 15 skipped, one deselected and ten passing subtests. GPU
 tests were skipped in the sandbox; the running job provides the live GPU check.
 
 `patch4_run3` resumed at step 1,000 with model/EMA/AdamW/RNG state intact and
-the same 10 workers, microbatch 8, batch 16 and one refinement step. On the RTX
+the same 10 workers, batch 8, grad steps 2 and one refinement step. On the RTX
 5090, the original updates 51–1,000 versus resumed updates 1,051–1,200 gave:
 
 | Live measurement | Before | After |
@@ -353,7 +389,7 @@ configuration, removes more repeated CPU work:
   to 256 points per batch.
 - Cache resampled bank-path lengths alongside the shard geometry.
 
-Sequential CPU-only runs of these algorithmic changes alongside training measured 40 microbatches of eight
+Sequential CPU-only runs of these algorithmic changes alongside training measured 40 batches of eight
 after four warmups, with seed 0 and the config's initial (empty) replay list.
 Both used one loader thread, normal cached Numba JIT without fast math, and no
 profiler in the timed comparison:
@@ -390,7 +426,7 @@ reusing mixed-dtype coordinates also passed all 14 direction/crop tests. Validat
 GPU tests were skipped in the sandbox. These CPU measurements are specific to
 this Ubuntu x86-64 host; the changes introduce no platform-specific dependencies.
 
-The larger microbatch exposed additional allocation and IPC costs. Main images
+The larger batch exposed additional allocation and IPC costs. Main images
 and historical slabs now use the same direct shared-storage allocation as
 PyTorch's default worker collator. NumPy views write into that storage, and the
 original shared tensor is returned, eliminating the worker queue's full image
@@ -411,15 +447,15 @@ collator does; storage-preservation and worker-delivery checks cover this bounda
 
 `patch4_run3` finally resumed from `ckpt_005000.pt` with model, EMA, AdamW and RNG state
 restored (283 optimizer entries, no optimizer or LR reset). At the user's request,
-the resumed run uses **batch 16 / microbatch 16**, with 10 workers and the other
+the resumed run uses **batch 16 / grad steps 1**, with 10 workers and the other
 training options retained. Both step-5,000 evaluations finished before stopping:
 diagnostics took 31.98 seconds and recovery took 23.89 seconds; their reports and
 images remain in the run directory. `output/loader_speedup_round2/handover_after_eval.json`
 records completion evidence, the exact launch command, environment override and PID.
 As with every existing resume, loader
-random streams restart; changing microbatch grouping also changes sampled batches.
+random streams restart; changing batch grouping also changes sampled batches.
 Live throughput therefore reflects both loader improvements and the requested
-microbatch change; the fixed-microbatch CPU table isolates the loader changes.
+batch-size change; the fixed-batch CPU table isolates the loader changes.
 
 The final live comparison uses 19 pre-work logging windows (950 updates ending
 at steps 1,500–2,450, excluding the window containing the step-2,000 evaluation)
@@ -436,7 +472,7 @@ the 50-update window averages, not individual-update tail latencies.
 | Peak allocated GPU memory | 6.83 GiB | 13.30 GiB |
 
 This is **79.6% less data wait and 1.78x live throughput**, including the requested
-microbatch increase. GPU memory remains within the RTX 5090's capacity. Detailed
+batch-size increase. GPU memory remains within the RTX 5090's capacity. Detailed
 windows and the comparison are saved in `output/loader_speedup_round2/live_after.json`
 and `live_comparison.json`. Training remained active beyond step 5,500.
 
@@ -510,7 +546,7 @@ OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 ../../../../.venv/bin/python -m pytest tests
 ../../../../.venv/bin/python -m vesuvius.neural_tracing.fiber_follow.regression.benchmark_slabs \
   --warmup 2 --repeats 10 --decisions 6 --out /tmp/slab-benchmark.json
 
-# Match the launcher's microbatch, including batched attention and candidate padding:
+# Match the launcher's batch, including batched attention and candidate padding:
 ../../../../.venv/bin/python -m vesuvius.neural_tracing.fiber_follow.regression.benchmark_slabs \
   --warmup 3 --repeats 10 --decisions 16 --microbatch 16 --out /tmp/slab-benchmark-b16.json
 ```
@@ -552,10 +588,10 @@ bash scripts/train_mixed_ct.sh
 
 The launcher uses [mixed_ct_datasets.json](../configs/mixed_ct_datasets.json):
 10% Paris 4, 45% `0175A_5mm_v1.afv`, and 45% `1447_5mm_v1.afv`.
-`0175A_SMALLMORE.afv` is excluded. Weights apply to microbatches, preserving
+`0175A_SMALLMORE.afv` is excluded. Weights apply to batches, preserving
 adjacent matched decision pairs. Source counts and actual shares are logged.
-The new run uses one CT channel, patch4, three refinement steps, batch/microbatch
-16, and initial LR 0.0003. Trailing command-line options override launcher defaults.
+The new run uses one CT channel, patch4, three refinement steps, batch 16 and grad steps
+1, and initial LR 0.0003. Trailing command-line options override launcher defaults.
 It starts a new model; CT-plus-prediction checkpoints have different input shapes.
 Modes using presence/direction predictions still require those volumes.
 
@@ -592,7 +628,7 @@ requests. The S3 connection pool limit per client automatically matches
 `--remote-prefetch-connections`; it does not create a worker per connection. It has its
 own Python GIL; the training workers never execute remote reads in this mode.
 Workers plan exact main-crop and historical-slab footprints before CT assembly.
-`--remote-prefetch-lookahead` defaults to 16 future microbatches per remote source
+`--remote-prefetch-lookahead` defaults to 16 future batches per remote source
 per worker; 0 restores the shallow per-item hints. The first batch is delivered
 before filling the deeper queue. Plans hold geometry, augmentation seeds and
 labels, without CT tensors or dense foreign masks. Neighbor coverage feedback
@@ -605,7 +641,7 @@ The async process retains each worker/source's bounded chunk window and feeds
 the smaller fetch queue as slots free, including while compilation stops batch
 consumption. Updated windows replace old ones, and sources/workers are serviced
 round-robin. With ten workers and two remote sources, the default plans up to
-320 future microbatches beyond the usual DataLoader buffers. It stops fetching
+320 future batches beyond the usual DataLoader buffers. It stops fetching
 when those regions are cached; it does not scan arbitrary parts of the volumes.
 Replay and live neighbor-bank updates can affect newly planned batches; already
 planned batches remain ordered and are not resampled. Consequently deeper
@@ -686,7 +722,7 @@ Each source supports those neighbor tasks and its own rollout replay. Collection
 cycles through all sources, running one subprocess at a time, with separate replay
 caches. Only training fibers seed replay, and replay identity manifests must match
 the source's training split. Monitor rollout metrics are evaluated and plotted
-separately for each source. The legacy recovery fixture and optional long diagnostic
+separately for each source. The rollout recovery fixture and optional long diagnostic
 remain Paris 4 diagnostics. Held-out monitor, calibration and final groups are
 distinct; seed generation is bounded to 32 fibers per group.
 
@@ -716,3 +752,68 @@ Disabling it used **1.658 GiB more live tensor memory** in this workload. The
 measured time reduction was only 2.2%, from a short sample. This excludes I/O and
 is not a tracing-quality comparison. The default remains enabled. Full local
 results and exact commands are in `output/token_only_validation/comparison.json`.
+
+### Current microbatch diagnostics
+
+`--batch-diag-every 1000` writes the entire latest training microbatch, in loader
+order, using EMA inference. Its row count follows the actual microbatch size.
+All image types include the same examples, and all layers are captured at every
+image event. Set the cadence to zero to disable these outputs.
+On resume, the first completed update also writes a sheet set so the active
+diagnostics can be checked immediately.
+
+Each `output/<run>/diagnostic_images/<iteration>/` contains exactly:
+
+- `predictions.png`: two crop-local CT views with annotation, observed history,
+  initial and selected predictions, actual committed prefix, and confidence.
+- `crop_orientation.png`: fixed u=0, v=0 and forward=0 CT sections plus an
+  orthographic view of the real crop box and annotation. Green segments are
+  clipped to the crop and to half a crop voxel on either side of each section;
+  out-of-plane paths are not projected onto the CT. The blue dot is the crop
+  origin. The full in-crop path and heading are shown in the 3D panel. No
+  target-following reslicing is used. Heading/annotation angle is measured near
+  the crop head.
+- `encoder.png`: patch/stem embedding, early/middle/final encoder blocks and
+  encoder output. Spatial channel-contrast RMS reveals variation even after
+  LayerNorm. Scales are shared across examples within each stage.
+- `decoder.png`: actual query-by-hidden-channel activations through each decoder
+  stage for the selected refinement attempt. These are not spatial CT images.
+- `history.png`: each historical CT/path input, convolution and token features,
+  and generator/scorer history attention at the selected attempt. Padding stays
+  explicit. Attention is averaged across heads/layers; it is not attribution.
+- `metrics.json`: source, supervision availability, errors, confidence/hazards,
+  prefix calibration, commits/refinements, frame quality, world frame/position,
+  CT/activation statistics, history attention/ages, existing optimizer-update
+  metrics, and measured inference/render time. Unknown values are JSON null.
+
+The diagnostic path writes no fixtures, tensor archives, NPY or NPZ files.
+Annotation coordinates are carried as small CPU metadata with the training
+batch; diagnostics do not read CT again or construct extra datasets. Activations
+are reduced before copying to CPU. Singleton eager inference bounds GPU memory
+and preserves adaptive-refinement row identity. Direct raster contact sheets
+and concurrent low-compression PNG writes avoid per-panel plotting overhead.
+These current, augmented training examples are not held-out accuracy estimates.
+The separate rollout/recovery evaluation cadence is unchanged.
+
+Validation:
+
+```bash
+../../../../.venv/bin/python -m pytest -q -o cache_dir=/tmp/fiber-pytest-cache \
+  tests/test_batch_diagnostic.py tests/test_observation_preparation.py \
+  tests/test_training_defaults.py tests/test_point_logging.py \
+  tests/test_decision_training.py tests/test_history_slabs.py
+```
+
+GPU timing on RTX 5090, the running stem32 checkpoint at update 3000, 12
+full-size examples (six copies of an existing matched pair), four CPU threads,
+with concurrent training: forcing all three refinement retries took 4.27 s on
+the first event and 2.63 s warm, including five PNGs and JSON. Peak diagnostic
+allocation was 0.50 GiB. These are measured examples, not a hard time guarantee
+for arbitrary batch sizes or hardware. Run the benchmark with
+`AGENTS_AGENT_MODE=1 MPLCONFIGDIR=/tmp/fiber-tests-mpl ../../../../.venv/bin/python
+/tmp/benchmark_microbatch_refinements.py`; measurements and previews are in
+`/tmp/microbatch_diagnostic_benchmark/`.
+
+After checkpoint-5000 evaluation completed, the live run resumed from that
+checkpoint. Its first current-microbatch diagnostic at step 5001 rendered all
+12 examples and wrote all six files in 1.30 s (0.64 s inference/measurement).

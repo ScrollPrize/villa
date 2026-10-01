@@ -450,8 +450,8 @@ def test_decision_metrics_score_actual_commits_censor_unknowns_and_pool_counts()
 
 def test_monitor_fixtures_are_fixed_private_rng_and_exclude_other_splits(tmp_path,monkeypatch):
     monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.regression.recovery.FiberVolume',lambda *a,**kw:None)
-    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.ct_normal',
-                        lambda vol,pos: np.array([1., 0., 0.]))
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.ct_tensor',
+                        lambda vol,pos: np.outer(np.array([1., 0., 0.]), np.array([1., 0., 0.])))
     from vesuvius.neural_tracing.fiber_follow.shared.data import TracedFiber
     from vesuvius.neural_tracing.fiber_follow.regression.recovery import monitor_fixture
     arc = np.arange(300, dtype=float)
@@ -499,8 +499,8 @@ def test_diagnostic_logging_preserves_training_update_and_rng():
 
 
 def test_slab_recovery_evaluator_preserves_float_inputs_and_observed_states(monkeypatch):
-    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.ct_normal',
-                        lambda vol,pos: np.array([1., 0., 0.]))
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.ct_tensor',
+                        lambda vol,pos: np.outer(np.array([1., 0., 0.]), np.array([1., 0., 0.])))
     from vesuvius.neural_tracing.fiber_follow.shared.data import TracedFiber
     from vesuvius.neural_tracing.fiber_follow.shared.recovery import make_recovery_states, evaluate_recovery_states
     cfg = config()

@@ -35,6 +35,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.reference import SEED_FIELDS, S
 
 DATA_VERSION = 2
 DATA_POLICY = "controlled_spans_v3"
+MAX_CT_FRAME_REJECTIONS = 64
 
 
 @dataclass(frozen=True)
@@ -396,7 +397,8 @@ class FollowDataset(torch.utils.data.IterableDataset):
         self.additional_crops = tuple(additional_crops)
         self._replay_paths = None
         self._set_replay(list(onpolicy or []))
-        lengths = np.array([f.length for f in fibers])
+        lengths = (fibers.lengths if hasattr(fibers, 'lengths')
+                   else np.array([f.length for f in fibers]))
         if not len(lengths):
             raise ValueError('No training fibers')
         self.weights = lengths / lengths.sum()
@@ -452,7 +454,7 @@ class FollowDataset(torch.utils.data.IterableDataset):
         if not (0 <= decisions <= 1 and 0 <= following <= 1 and decisions+following <= 1):
             raise ValueError('Decision and bank-following endpoint fractions must sum to at most one')
         if decisions and self.chunk % 2:
-            raise ValueError('Matched identity decisions require an even microbatch')
+            raise ValueError('Matched identity decisions require an even batch')
         pairs = int(rng.binomial(self.chunk//2, decisions)) if decisions else 0
         remaining = self.chunk-2*pairs
         bank = int(rng.binomial(remaining, min(1., following/(1-decisions)))) if following and remaining else 0
@@ -507,7 +509,7 @@ class FollowDataset(torch.utils.data.IterableDataset):
         item.update({k: getattr(op, k)[j] for k in SEED_FIELDS if hasattr(op, k)})
         item['observed_path'] = op.observed_prefix(j)
         from .heading import FRAME_POLICY
-        item['frame_policy'] = FRAME_POLICY
+        item['frame_policy'] = op.provenance.get('frame_policy', FRAME_POLICY)
         item = self.prepare(item,rng)
         return item if self.state_allowed(item) else None
 
@@ -535,6 +537,7 @@ class FollowDataset(torch.utils.data.IterableDataset):
             self.remote_prefetch.submit(vol.ct,bounds)
 
     def __iter__(self):
+        from .heading import SeedHeadingError
         torch.set_num_threads(1)
         if self.remote_prefetch is not None:
             self.remote_prefetch.ensure_metadata(self.vol_spec)
@@ -547,6 +550,7 @@ class FollowDataset(torch.utils.data.IterableDataset):
             raise ValueError('Remote prefetch lookahead must be nonnegative')
         plans, pending = self._iter_plans(vol), deque()
         first = True
+        rejected = 0
         while True:
             # Deliver the first batch promptly. Fill the deeper plan queue when
             # the loader asks for its next batch, overlapping the first update.
@@ -563,10 +567,29 @@ class FollowDataset(torch.utils.data.IterableDataset):
                 self.remote_prefetch.ensure(vol.ct,bounds)
             else:
                 self.prefetch_items(items,vol,required=True)
-            batch = (self.batch_builder(items, vol) if self.batch_builder is not None
-                     else collate_with_volume(items, vol, self.cfg.crop, grid))
+            try:
+                batch = (self.batch_builder(items, vol) if self.batch_builder is not None
+                         else collate_with_volume(items, vol, self.cfg.crop, grid))
+            except SeedHeadingError as exc:
+                # Invalid geometry/context still rejects the whole plan to
+                # preserve pairs. Weak CT orientation now falls back in ct_frame
+                # and never reaches this retry path. I/O errors propagate.
+                rejected += 1
+                if rejected >= MAX_CT_FRAME_REJECTIONS:
+                    worker = torch.utils.data.get_worker_info()
+                    raise SeedHeadingError(
+                        f'Could not build a CT-oriented training batch after {rejected} consecutive rejected plans '
+                        f'(source={getattr(self.vol_spec, "ct_zarr", "unknown")}, '
+                        f'worker={worker.id if worker else 0}): {exc}') from exc
+                continue
             if fraction:
                 batch['decision_requested'] = torch.full((self.chunk,), 2*requested/self.chunk)
+            if rejected:
+                # A row-aligned counter survives the usual tensor batch movers;
+                # put the total in one row so summing never multiplies it by B.
+                batch['ct_frame_rejected_batches'] = torch.zeros(self.chunk, dtype=torch.int64)
+                batch['ct_frame_rejected_batches'][0] = rejected
+                rejected = 0
             yield batch
 
     def _iter_plans(self, vol):
@@ -887,7 +910,10 @@ class OnPolicyStates:
         if len(self) and (np.any(self.fiber_idx < 0) or np.any(self.fiber_idx >= len(fibers))):
             raise ValueError("On-policy cache contains invalid fiber indices")
         if len(self):
-            lengths = np.array([f.length for f in fibers])[self.fiber_idx]
+            # Decode only referenced fibers in lazy collections, and compare
+            # against the same geometry that supplies the collector's arcs.
+            indices, inverse = np.unique(self.fiber_idx, return_inverse=True)
+            lengths = np.array([fibers[int(i)].length for i in indices])[inverse]
             if np.any(~np.isfinite(self.t)) or np.any((self.t < 0) | (self.t > lengths)):
                 raise ValueError("On-policy cache contains arc positions outside controlled spans")
 

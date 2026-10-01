@@ -1,6 +1,8 @@
 """Terminal formatting for follower training; JSON remains the analysis format."""
 import json
 
+from .training_options import normalize_batch_options
+
 from vesuvius.neural_tracing.fiber_follow.shared.policy import DIAGNOSTIC_THRESHOLDS
 
 
@@ -18,7 +20,9 @@ class DirectTrainingInterval:
     means = ('loss', 'geometry', 'confidence_loss', 'fresh_fraction',
              'recent_fraction', 'bank_wrong_continuation_fraction',
              'bank_following_fraction', 'decision_pair_fraction', 'refinement_attempts_mean')
-    counts = ('error_sum', 'geometry_count', 'point_correct_count', 'point_wrong_count',
+    counts = tuple(p+'_'+s for p in ('ct_frame', 'history_frame')
+                   for s in ('count', 'transported', 'deterministic', 'energy_sum', 'gap_sum')) + (
+              'ct_frame_rejected_batches', 'error_sum', 'geometry_count', 'point_correct_count', 'point_wrong_count',
               'point_unknown_count', 'supervised_states', 'observation_only_states', 'history_valid_slabs', 'history_age_sum', 'history_overlap_sum', 'history_load_seconds', 'history_encode_seconds',
               'confidence_labeled_states', 'confidence_departed_states', 'refinement_attempts_sum',
               'supervision_weight', 'endpoint_weight', 'matched_endpoint_weight', 'choice_endpoint_weight',
@@ -88,6 +92,18 @@ def _interval_training_lines(row):
                  f" | load {m.get('history_load_seconds', 0.):.3f}s"
                  f" | encode {m.get('history_encode_seconds', 0.):.3f}s")
     lines.append(f"  supervision: {int(m['decisions'])} decisions / {int(m['crops'])} observations")
+    frames = []
+    for prefix, label in (('ct_frame', 'current'), ('history_frame', 'history')):
+        count = m.get(prefix+'_count', 0)
+        if count:
+            transported, deterministic = (int(m.get(prefix+'_'+key, 0)) for key in ('transported', 'deterministic'))
+            frames.append(f"{label} {transported+deterministic}/{int(count)} fallbacks"
+                          f" ({transported} transported, {deterministic} deterministic)"
+                          f"; mean gap {m.get(prefix+'_gap_sum', 0)/count:.3f}")
+    if frames:
+        lines.append('  CT frames: '+' | '.join(frames))
+    if m.get('ct_frame_rejected_batches', 0):
+        lines.append(f"  CT frames: {int(m['ct_frame_rejected_batches'])} unusable batch plans rejected; retried within source")
     lines.append(f"  scored crops: candidates {_rate(m['identity_candidate_states'], m['decisions'])}"
                  f" | departed {_rate(m.get('confidence_departed_states', 0), m.get('confidence_labeled_states', 0))}")
     if 'dataset_counts' in m:
@@ -211,10 +227,10 @@ def _identity_lines(stats):
 def format_training_log(row):
     step = f"Step {row['step']:,}" if 'step' in row else 'Training'
     if row.get('event') == 'resume_configuration':
-        options, cfg = row.get('training_options', {}), row.get('model_cfg', {})
+        options = normalize_batch_options(row.get('training_options', {}))
         return (f"{step} | resumed {row['checkpoint']}\n"
                 f"  commit {options.get('n_commit', '?')} | historical slabs: 8 slots, minimum spacing 32 vox"
-                f" | batch {options.get('batch', '?')} / microbatch {options.get('microbatch', '?')}"
+                f" | batch {options.get('batch', '?')} / grad steps {options.get('grad_steps', '?')}"
                 f"\n  live CT/path slabs | causal survival confidence")
     if row.get('event') == 'identity_sampling':
         bank = row.get('negative_bank_provenance') or {}

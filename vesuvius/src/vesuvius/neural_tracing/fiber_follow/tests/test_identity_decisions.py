@@ -79,6 +79,7 @@ def test_replay_preserves_seed_but_distant_seed_is_not_observable(tmp_path):
                   frame=[np.eye(3)], hist=np.zeros((1, cfg.n_history, 3)), hmask=np.zeros((1, cfg.n_history)),
                   offtrack=[False], hard=[False], exploratory=[False])
     ds = object.__new__(FollowDataset)
+    ds.vol_spec = SimpleNamespace(grid_scale=8., ct_grid_scale=4.)
     ds.fibers, ds.cfg, ds.exclude, ds.additional_crops = [parent], clean_sample(cfg), bank.band, ()
     ds.batch_builder = IdentityObservationBuilder(cfg, [parent], negative_bank=bank)
     for valid in (False, True):
@@ -97,8 +98,8 @@ def test_replay_preserves_seed_but_distant_seed_is_not_observable(tmp_path):
 
 
 def test_trace_keeps_seed_from_first_decision_through_recovery(monkeypatch):
-    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.ct_normal',
-                        lambda vol,pos: np.array([1., 0., 0.]))
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.ct_tensor',
+                        lambda vol,pos: np.outer(np.array([1., 0., 0.]), np.array([1., 0., 0.])))
     class Model(torch.nn.Module):
         cfg = SimpleNamespace(max_recovery_distance=4.)
         def forward(self, x, hist, hmask):

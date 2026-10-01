@@ -39,7 +39,7 @@ def _curved_slab(vol, centers, axis, half=2):
 
 
 def plot_batch(x, pred, fut, fmask, crop, path, observed, hmask, history_gt, history_mask,
-               n=6, source=None, offtrack=None, confidence=None, history_channel=-1):
+               n=6, source=None, offtrack=None, confidence=None, history_channel=-1, ct_range=None):
     """Crops exactly as the model sees them (sample-index space, forward = up).
 
     Each panel is a thin curved slab (+-2 samples) that follows the GT fiber
@@ -81,6 +81,8 @@ def plot_batch(x, pred, fut, fmask, crop, path, observed, hmask, history_gt, his
             other = 1 - comp
             cen = np.interp(rows, rr, np.concatenate([[mid], gi[:, other]]))
             pres = _curved_slab(x[i, 0], cen, axis)
+            if ct_range is not None:
+                pres = (pres-ct_range[0])/(ct_range[1]-ct_range[0])
             hist = (_curved_slab(x[i, history_channel], cen, axis)
                     if history_channel is not None else np.zeros_like(pres))
             alpha = .8*hist[..., None]
@@ -119,7 +121,7 @@ def plot_batch(x, pred, fut, fmask, crop, path, observed, hmask, history_gt, his
         if confidence is not None:
             title += f'\nnext-step confidence {confidence[i, 0]:.2f}'
         ax[0, i].set_title(title, fontsize=8)
-    fig.suptitle("red observed history | green GT | orange full proposal\n"
+    fig.suptitle("GT-following thin CT projection | red history | green GT | orange full proposal\n"
                  "cyan: actual current point | dotted orange: actual first step", fontsize=9)
     fig.tight_layout(rect=(0, 0, 1, .96))
     fig.savefig(path, dpi=80)
@@ -253,7 +255,9 @@ def plot_curves(log_path, path, *, loss_key='flow'):
                           [r['roll_'+name] if 'roll_'+name in r else r[key] for r in selected],
                           label=f'{dataset} {split} {name} @ {threshold}'.strip())
     for ax in axes:
-        ax.legend(fontsize=7);ax.set_xlabel('optimizer updates')
+        if ax.get_legend_handles_labels()[0]:
+            ax.legend(fontsize=7)
+        ax.set_xlabel('optimizer updates')
     axes[-1].set_ylim(0,1)
     fig.tight_layout()
     temporary = Path(path).with_name(Path(path).stem+'.tmp.png')

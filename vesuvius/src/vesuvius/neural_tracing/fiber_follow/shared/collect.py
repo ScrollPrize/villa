@@ -282,6 +282,8 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer, bank_loader=
                         **{key: np.asarray([row[key] for row in rows])
                            for key in OnPolicyStates.FIELDS + tuple(OnPolicyStates.OPTIONAL) + tuple(OnPolicyStates.ROW_TRACK)},
                         **track_arrays(track))
+    # Fail in the collector before publishing a cache to live training workers.
+    st.validate_fibers(train_f)
     path = Path(args.out)
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_name(path.stem+'.partial.npz')

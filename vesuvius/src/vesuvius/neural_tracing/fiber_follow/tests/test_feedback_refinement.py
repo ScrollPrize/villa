@@ -202,8 +202,8 @@ def test_threshold_diagnostics_label_the_chosen_proposal():
 
 
 def test_recovery_sweeps_rerun_the_adaptive_policy_at_each_threshold(monkeypatch):
-    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.ct_normal',
-                        lambda vol,pos: np.array([1., 0., 0.]))
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.ct_tensor',
+                        lambda vol,pos: np.outer(np.array([1., 0., 0.]), np.array([1., 0., 0.])))
     from vesuvius.neural_tracing.fiber_follow.shared.data import TracedFiber, SampleConfig
     from vesuvius.neural_tracing.fiber_follow.shared.recovery import make_recovery_states, evaluate_recovery_states
     c = cfg()

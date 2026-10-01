@@ -261,7 +261,7 @@ class AFVBank(NeighborBank):
 
 
 class WeightedDatasets(torch.utils.data.IterableDataset):
-    """Choose a source per equal-sized microbatch; preserve matched pairs.
+    """Choose a source per equal-sized batch; preserve matched pairs.
 
     Workers use independent deterministic RNG streams. Never fall back to a
     different source on an I/O failure, which would silently change weights.
@@ -273,7 +273,7 @@ class WeightedDatasets(torch.utils.data.IterableDataset):
         if not np.isfinite(weights).all() or (weights <= 0).any():
             raise ValueError('Invalid dataset sampling weights')
         if len({d.chunk for d in datasets}) != 1:
-            raise ValueError('Weighted datasets require equal microbatch sizes')
+            raise ValueError('Weighted datasets require equal batch sizes')
         self.datasets, self.names = datasets, names
         self.weights, self.seed = weights/weights.sum(), seed
 
@@ -333,7 +333,7 @@ def build_mixed_dataset(primary, document, cfg, sample, sampling, args, *, seed,
             from ..shared.data import OnPolicyStates
             replay_paths = json.loads(replay_index.read_text()) if resume and replay_index and replay_index.exists() else []
             replay = [OnPolicyStates.load(p) for p in replay_paths]
-            dataset = FollowDataset(fibers, spec, sample, band, chunk=args.microbatch,
+            dataset = FollowDataset(fibers, spec, sample, band, chunk=args.batch,
                 seed=seed+100003*(index+1), cache_bytes=int(args.worker_cache_gb*(1<<30)),
                 batch_builder=builder, fresh_fraction=args.fresh_fraction,
                 onpolicy=replay, replay_index=str(replay_index) if replay_index else None)

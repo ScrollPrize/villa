@@ -8,6 +8,7 @@ import tempfile
 
 import torch
 
+from ..shared.training_options import normalize_batch_options
 from .model import build_model
 from .train import build_parser, checkpoint_config, options_argv
 
@@ -24,7 +25,8 @@ def fork_checkpoint(source, name, transform, *, allowed_changes, migration_key, 
         raise ValueError('Run name must be a single directory name')
     original = torch.load(source, map_location='cpu', weights_only=False)
     migrated = transform(original)
-    options = migrated['training_options']
+    options = migrated['training_options'] = normalize_batch_options(migrated['training_options'])
+    original_options = normalize_batch_options(original['training_options'])
     parser = build_parser()
     missing_defaults = {'remote_prefetch_connections','remote_prefetch_queue_size','remote_prefetch_timeout',
                          'remote_prefetch_lookahead','stem_channels','stem_blocks'}-options.keys()
@@ -48,8 +50,8 @@ def fork_checkpoint(source, name, transform, *, allowed_changes, migration_key, 
     parsed = vars(build_parser().parse_args(argv))
     if json.dumps(parsed, sort_keys=True) != json.dumps(options, sort_keys=True):
         raise ValueError('Checkpoint options do not round-trip through the current trainer CLI')
-    changes = {k:dict(before=original['training_options'].get(k), after=v)
-               for k,v in options.items() if v != original['training_options'].get(k)}
+    changes = {k:dict(before=original_options.get(k), after=v)
+               for k,v in options.items() if v != original_options.get(k)}
     if changes.keys() - {'name', 'out_root', 'resume'} - allowed_changes - missing_defaults:
         raise ValueError('Unexpected training setting change')
     info = dict(source_checkpoint=str(source), source_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),

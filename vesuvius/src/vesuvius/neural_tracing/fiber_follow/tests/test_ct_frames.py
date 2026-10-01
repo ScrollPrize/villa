@@ -1,4 +1,4 @@
-"""The sole CT-normal crop convention, coordinate labels and held failure views."""
+"""The transverse CT crop convention, coordinate labels and held failure views."""
 from copy import deepcopy
 from types import SimpleNamespace
 import numpy as np
@@ -7,7 +7,7 @@ import pytest
 from test_heading import sheet, CTOnlyVolume
 from test_trace_heading import record
 from vesuvius.neural_tracing.fiber_follow.shared.heading import (
-    ct_frame, normal_frame, ct_normal, orient_item, FRAME_POLICY, SeedHeadingError,
+    ct_frame, transverse_frame, orient_item, FRAME_POLICY, SeedHeadingError,
 )
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import frame_from_heading, arclength
 from vesuvius.neural_tracing.fiber_follow.shared.data import TracedFiber, SampleConfig, make_sample, continuation_targets
@@ -29,20 +29,21 @@ def test_eigenvector_sign_flips_cannot_flip_a_trace_frame():
     h=np.array([0.,0.,1.]);previous=None
     for angle in np.linspace(0,2*np.pi,101):
         normal=np.array([np.cos(angle),np.sin(angle),0.])
-        frame=normal_frame(h,normal,previous)
-        np.testing.assert_allclose(frame,normal_frame(h,-normal,previous),atol=1e-12)
+        frame=transverse_frame(np.outer(normal,normal),h,previous)
+        np.testing.assert_allclose(frame,transverse_frame(np.outer(-normal,-normal),h,previous),atol=1e-12)
         if previous is not None:assert frame[:,0]@previous[:,0]>.99
         previous=frame
 
 
-def test_unusable_ct_retains_only_an_already_established_roll(monkeypatch):
-    h=np.array([0.,0.,1.]);previous=normal_frame(h,np.array([1.,2.,0.]))
-    def unusable(vol,pos):raise SeedHeadingError('no identifiable sheet normal')
-    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.ct_normal',unusable)
-    np.testing.assert_allclose(ct_frame(None,[0]*3,h,previous),previous,atol=1e-12)
-    with pytest.raises(SeedHeadingError):ct_frame(None,[0]*3,h)
-    np.testing.assert_allclose(normal_frame(h,h,previous),previous,atol=1e-12)
-    with pytest.raises(SeedHeadingError):normal_frame(h,h)
+def test_weak_ct_transports_roll_or_uses_deterministic_frame(monkeypatch):
+    h=np.array([0.,0.,1.]);previous=transverse_frame(np.outer([1.,2.,0.],[1.,2.,0.]),h)
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.ct_tensor',
+                        lambda vol,pos: np.zeros((3,3)))
+    quality={}
+    np.testing.assert_allclose(ct_frame(None,[0]*3,h,previous,diagnostics=quality),previous,atol=1e-12)
+    assert quality['source']==1
+    np.testing.assert_allclose(ct_frame(None,[0]*3,h,diagnostics=quality),frame_from_heading(h),atol=1e-12)
+    assert quality['source']==2
 
 
 def test_training_rotation_preserves_world_history_candidates_and_supervision():
@@ -73,8 +74,9 @@ def test_failed_decisions_never_reestimate_roll_but_accepted_short_steps_do(monk
     def changing_normal(vol,pos):
         calls.append(np.asarray(pos).copy())
         angle=.2*(len(calls)-1)
-        return np.array([np.cos(angle),np.sin(angle),0.])
-    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.ct_normal',changing_normal)
+        n=np.array([np.cos(angle),np.sin(angle),0.])
+        return np.outer(n,n)
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.ct_tensor',changing_normal)
     fail=([[0.,0.,1.],[0.,0.,2.]],[.1,.1])
     rows=record([fail]*3,explore_calls=3)
     assert len(calls)==1

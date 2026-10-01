@@ -21,7 +21,7 @@ def checkpoint(tmp_path):
     for p in model.parameters(): p.grad = torch.ones_like(p)
     opt.step()
     args = vars(build_parser().parse_args(['--name','source','--fiber-zarrs','z','--fibers','f','--ct','c','--manifest','m',
-        '--out-root',str(tmp_path),'--lr','.0003','--batch','16','--microbatch','16','--workers','10',
+        '--out-root',str(tmp_path),'--lr','.0003','--batch','16','--grad-steps','1','--workers','10',
         '--warmup','1000','--recurrent-refinement-steps','1']))
     return dict(architecture=model.architecture,model_cfg=model.cfg.to_dict(),model=model.state_dict(),ema=ema.state_dict(),
                 optimizer=opt.state_dict(),rng=training_rng_state(),step=17000,samples_seen=272000,lr_restart_step=0,
@@ -56,9 +56,13 @@ def test_expansion_preserves_weights_moments_rng_and_can_update(tmp_path):
 
 
 @pytest.mark.parametrize('legacy_prefetch',[False,True])
-def test_fork_uses_checkpoint_settings_fixture_and_live_replay(tmp_path,legacy_prefetch):
+@pytest.mark.parametrize('legacy_batch',[False,True])
+def test_fork_uses_checkpoint_settings_fixture_and_live_replay(tmp_path,legacy_prefetch,legacy_batch):
     source=tmp_path/'source'; source.mkdir()
     ck=checkpoint(tmp_path)
+    if legacy_batch:
+        ck['training_options'].pop('grad_steps')
+        ck['training_options']['microbatch'] = 16
     prefetch_keys={'remote_prefetch_connections','remote_prefetch_queue_size','remote_prefetch_timeout','remote_prefetch_lookahead'}
     if legacy_prefetch:
         for key in prefetch_keys:ck['training_options'].pop(key)
@@ -73,7 +77,7 @@ def test_fork_uses_checkpoint_settings_fixture_and_live_replay(tmp_path,legacy_p
     (source/'dagger/replay.json').write_text(json.dumps([str(replay)]))
     info=fork_run(path,'refine3',3)
     dest=tmp_path/'refine3';saved=json.loads((dest/'config.json').read_text())
-    assert (saved['lr'],saved['batch'],saved['microbatch'],saved['workers'])==(.0003,16,16,10)
+    assert (saved['lr'],saved['batch'],saved['grad_steps'],saved['workers'])==(.0003,16,1,10)
     assert saved['recurrent_refinement_steps']==saved['model_cfg']['recurrent_refinement_steps']==3
     assert (dest/'monitor_recovery.npz').read_bytes()==fixture
     assert json.loads((dest/'dagger/replay.json').read_text())==[str(replay)]

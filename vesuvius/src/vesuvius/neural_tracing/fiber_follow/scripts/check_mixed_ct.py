@@ -47,7 +47,7 @@ def main():
     bank.validate_volume(spec)
     primary=FollowDataset(fibers,spec,sample,None,chunk=2,seed=17,cache_bytes=64<<20,
         batch_builder=IdentityObservationBuilder(cfg,fibers,sampling,augment=True,negative_bank=bank))
-    options=SimpleNamespace(microbatch=2,worker_cache_gb=.0625,fresh_fraction=.7)
+    options=SimpleNamespace(batch=2,worker_cache_gb=.0625,fresh_fraction=.7)
     mixed,provenance=build_mixed_dataset(primary,document,cfg,sample,sampling,options,seed=17)
     splits=Path(args.out).parent/'splits'
     splits.mkdir(parents=True,exist_ok=True)

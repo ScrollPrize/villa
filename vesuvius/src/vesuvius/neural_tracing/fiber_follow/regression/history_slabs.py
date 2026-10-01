@@ -18,7 +18,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.heading import ct_frame, refram
 SLOTS = 8
 SLAB = CropSpec(depth=8, width=65, behind=4, spacing=.5,
                 history_render='segments', history_sigma=1.)
-SAMPLING_REVISION = 'live_observed_slabs_ct_normal_v2'
+SAMPLING_REVISION = 'live_observed_slabs_ct_transverse_v3'
 
 
 
@@ -84,9 +84,13 @@ def load_slabs(items, vol, cfg, pool=None):
     for item, layout in zip(items, layouts):
         previous = None
         for slab in layout:
-            frame = ct_frame(vol, slab['pos'], slab['frame'][:, 2], previous)
+            diagnostics = {}
+            fallback = item['frame'] if item.get('frame_policy') == FRAME_POLICY else None
+            frame = ct_frame(vol, slab['pos'], slab['frame'][:, 2], previous,
+                             fallback=fallback, diagnostics=diagnostics)
             reframe_item(slab, frame)
             slab['frame_policy'] = FRAME_POLICY
+            slab['ct_frame_diagnostics'] = diagnostics
             previous = frame
         item['_sampled_slabs'] = layout
     flat = [slab for layout in layouts for slab in layout]
@@ -97,6 +101,8 @@ def load_slabs(items, vol, cfg, pool=None):
     # Translation (3), relative rotation (9), log age (1), seed role (1).
     pose = torch.zeros(len(items), SLOTS, 14)
     ages, overlap = torch.zeros(len(items), SLOTS), torch.zeros(len(items), SLOTS)
+    frame_source = torch.full((len(items), SLOTS), -1, dtype=torch.int64)
+    frame_energy, frame_gap = torch.zeros(len(items), SLOTS), torch.zeros(len(items), SLOTS)
     cursor = 0
     for row, (item, layout) in enumerate(zip(items, layouts)):
         for slot, slab in enumerate(layout):
@@ -104,6 +110,9 @@ def load_slabs(items, vol, cfg, pool=None):
                                   torch.as_tensor(slab['hmask'])[None], grid, 1., 'segments')[0]
             output[row, slot] = torch.cat((images[cursor], heat), 0)
             valid[row, slot] = True
+            quality = slab['ct_frame_diagnostics']
+            frame_source[row, slot] = quality['source']
+            frame_energy[row, slot], frame_gap[row, slot] = quality['energy'], quality['gap']
             relative = (slab['pos']-item['pos']) @ item['frame']
             rotation = np.asarray(item['frame']).T @ slab['frame']
             pose[row, slot] = torch.tensor(np.r_[relative/128., rotation.ravel(),
@@ -114,7 +123,8 @@ def load_slabs(items, vol, cfg, pool=None):
             cursor += 1
     elapsed = torch.full((len(items),), (time.perf_counter()-started)/max(1, len(items)))
     return dict(history_slabs=output, history_valid=valid, history_pose=pose,
-                history_ages=ages, history_overlap=overlap, history_load_seconds=elapsed)
+                history_ages=ages, history_overlap=overlap, history_load_seconds=elapsed,
+                history_frame_source=frame_source, history_frame_energy=frame_energy, history_frame_gap=frame_gap)
 
 
 class SlabInstanceNorm(nn.InstanceNorm3d):

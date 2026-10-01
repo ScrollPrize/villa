@@ -8,7 +8,12 @@ from .geometry import arclength, interp_at, frame_from_heading, normalize, block
 
 SEED_HEADING_POLICY = 'ct_sheet_hv_v1'
 TRACE_HEADING_POLICY = 'linear12_trusted_v1'
-FRAME_POLICY = 'ct_normal_uv_v1'
+FRAME_POLICY = 'ct_transverse_uv_v2'
+# CT is scaled to [0, 1]. Require both directional evidence and enough
+# transverse energy to avoid orienting a crop from numerical residue.
+MIN_FRAME_ENERGY = 1e-12
+MIN_FRAME_ENERGY_FRACTION = 1e-4
+MIN_FRAME_GAP = .05
 HEADING_SPAN = 12.0  # trace voxels, not vertices or model calls
 
 
@@ -24,8 +29,8 @@ def fiber_family(value):
     return family
 
 
-def ct_sheet_normal(cube, center_zyx):
-    """Unsigned xyz sheet normal; native CT derivative sigma 1, integration 4."""
+def ct_structure_tensor(cube, center_zyx):
+    """XYZ gradient tensor; native CT derivative sigma 1, integration 4."""
     image = np.asarray(cube, dtype=np.float64) / 255.
     center = np.asarray(center_zyx, dtype=np.float64)
     if image.ndim != 3 or center.shape != (3,) or not np.isfinite(image).all() or not np.isfinite(center).all():
@@ -39,7 +44,13 @@ def ct_sheet_normal(cube, center_zyx):
     weight = weights[0][:, None, None]*weights[1][None, :, None]*weights[2][None, None, :]
     weight /= weight.sum()
     tensor = np.array([[np.sum(weight*a*b) for b in gradients] for a in gradients])
-    values, vectors = np.linalg.eigh(tensor)
+    return tensor[::-1, ::-1]  # zyx array axes -> world xyz
+
+
+def ct_sheet_normal(cube, center_zyx):
+    """Unrestricted sheet normal for selecting an initial H/V heading."""
+    # Solve in array-axis order for the seed-heading sign convention.
+    values, vectors = np.linalg.eigh(ct_structure_tensor(cube, center_zyx)[::-1, ::-1])
     if values[-1] <= 1e-12 or values[-1]-values[-2] <= 1e-6*values[-1]:
         raise SeedHeadingError('CT seed context has no identifiable sheet normal')
     return vectors[::-1, -1]  # zyx array axes -> world xyz
@@ -69,12 +80,20 @@ def normal_context(pos_xyz, input_scale):
     return start, np.array([65, 65, 65])
 
 
-def ct_normal(vol, pos_xyz):
+def _ct_context(vol, pos_xyz):
     start, size = normal_context(pos_xyz, vol.input_scale)
     if np.any(start < 0) or np.any(start+65 > np.asarray(vol.ct.shape)):
         raise SeedHeadingError('CT seed context crosses the volume boundary')
     center = np.asarray(pos_xyz)[::-1]*vol.input_scale-start
-    return ct_sheet_normal(vol.ct.read(start, size), center)
+    return vol.ct.read(start, size), center
+
+
+def ct_normal(vol, pos_xyz):
+    return ct_sheet_normal(*_ct_context(vol, pos_xyz))
+
+
+def ct_tensor(vol, pos_xyz):
+    return ct_structure_tensor(*_ct_context(vol, pos_xyz))
 
 
 def ct_seed_heading(vol, pos_xyz, family):
@@ -82,36 +101,58 @@ def ct_seed_heading(vol, pos_xyz, family):
     return sheet_heading(ct_normal(vol, pos_xyz), family)
 
 
-def normal_frame(heading, normal, previous=None):
-    """u crosses the sheet; v lies in it. Transport the unsigned normal's sign."""
+def transverse_frame(tensor, heading, previous=None, *, fallback=None, diagnostics=None):
+    """Estimate roll in the heading's plane; weak evidence uses a held frame.
+
+    ``previous`` also controls eigenvector sign continuity. ``fallback`` is an
+    optional anchor used only for weak evidence (the first historical slab can
+    borrow the current observation's roll without changing its normal sign).
+    Diagnostic source codes: 0 = CT, 1 = transported, 2 = deterministic.
+    """
     h = np.asarray(heading, dtype=np.float64)
     if h.shape != (3,) or not np.isfinite(h).all() or np.linalg.norm(h) < 1e-8:
         raise SeedHeadingError('Frame heading must be a finite nonzero xyz vector')
     h = normalize(h)
-    normal = np.asarray(normal, dtype=np.float64)
-    u = normal-(normal @ h)*h
-    support = float(np.linalg.norm(u))
-    if not np.isfinite(support) or support < .2:
-        if previous is None:
-            raise SeedHeadingError('CT normal nearly parallels the heading')
-        return frame_from_heading(h, previous[:, 0])
-    u /= support
-    sign = u[np.argmax(np.abs(u))] if previous is None else u @ frame_from_heading(h, previous[:, 0])[:, 0]
-    if sign < 0:
-        u = -u
-    return np.stack([u, np.cross(h, u), h], axis=1)
+    tensor = np.asarray(tensor, dtype=np.float64)
+    if tensor.shape != (3, 3) or not np.isfinite(tensor).all():
+        raise SeedHeadingError('CT frame tensor must be a finite 3x3 matrix')
+    for anchor in (previous, fallback):
+        if anchor is not None and (np.shape(anchor) != (3, 3) or not np.isfinite(anchor).all()):
+            raise SeedHeadingError('Previous frame must be a finite 3x3 matrix')
+    base = frame_from_heading(h)
+    basis = base[:, :2]
+    values, vectors = np.linalg.eigh(basis.T @ tensor @ basis)
+    energy = max(0., float(values[-1]))
+    fraction = energy/max(float(np.trace(tensor)), MIN_FRAME_ENERGY)
+    gap = max(0., float(values[-1]-values[0]))/max(energy, MIN_FRAME_ENERGY)
+    reliable = (energy > MIN_FRAME_ENERGY and fraction >= MIN_FRAME_ENERGY_FRACTION
+                and gap >= MIN_FRAME_GAP)
+    source = 0
+    if reliable:
+        u = basis @ vectors[:, -1]
+        sign = (u[np.argmax(np.abs(u))] if previous is None
+                else u @ frame_from_heading(h, previous[:, 0])[:, 0])
+        if sign < 0:
+            u = -u
+        frame = np.stack([u, np.cross(h, u), h], axis=1)
+    else:
+        anchor = previous if previous is not None else fallback
+        if anchor is not None:
+            hint = np.asarray(anchor)[:, 0]
+            if np.linalg.norm(hint-(hint @ h)*h) < 1e-3:
+                anchor = None
+        source = 2 if anchor is None else 1
+        frame = base if anchor is None else frame_from_heading(h, np.asarray(anchor)[:, 0])
+    if diagnostics is not None:
+        diagnostics.update(source=source, energy=energy, energy_fraction=fraction, gap=gap)
+    return frame
 
 
-def ct_frame(vol, pos, heading, previous=None):
-    try:
-        normal = ct_normal(vol, pos)
-    except SeedHeadingError:
-        if previous is None:
-            raise
-        # A weak/degenerate CT observation cannot invent a new roll. Retain the
-        # last CT-established roll while transporting it to the new heading.
-        return frame_from_heading(heading, previous[:, 0])
-    return normal_frame(heading, normal, previous)
+def ct_frame(vol, pos, heading, previous=None, *, fallback=None, diagnostics=None):
+    # Invalid input and CT I/O errors remain explicit. Only weak orientation
+    # evidence falls back; initial H/V heading selection still uses ct_normal.
+    return transverse_frame(ct_tensor(vol, pos), heading, previous,
+                            fallback=fallback, diagnostics=diagnostics)
 
 
 def reframe_item(item, frame):
@@ -133,7 +174,9 @@ def orient_item(item, vol):
         if item['frame_policy'] != FRAME_POLICY:
             raise ValueError('Unsupported crop frame policy; recollect replay')
         return
-    reframe_item(item, ct_frame(vol, item['pos'], np.asarray(item['frame'])[:, 2]))
+    diagnostics = {}
+    reframe_item(item, ct_frame(vol, item['pos'], np.asarray(item['frame'])[:, 2], diagnostics=diagnostics))
+    item['ct_frame_diagnostics'] = diagnostics
     item['frame_policy'] = FRAME_POLICY
 
 

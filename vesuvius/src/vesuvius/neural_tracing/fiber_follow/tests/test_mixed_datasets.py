@@ -21,7 +21,7 @@ from vesuvius.neural_tracing.fiber_follow.regression.model import build_model, D
 from vesuvius.neural_tracing.fiber_follow.regression.supervision import loss_terms
 
 
-def afv_fixture(path, length=80., neighbor_x=40.):
+def afv_fixture(path, length=80., neighbor_x=40., offset=0.):
     with sqlite3.connect(path) as c:
         c.executescript('''PRAGMA application_id=1447249475; PRAGMA user_version=1;
             CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT);
@@ -34,13 +34,14 @@ def afv_fixture(path, length=80., neighbor_x=40.):
                         frame={'vc_open_data_coordinate_space':'fixture/scan'}).items():
             c.execute('INSERT INTO metadata VALUES(?,?)',(k,json.dumps(v)))
         for fid,x,z0,z1 in [(1,32.,0.,length),(2,neighbor_x,0.,length),(3,32.,120.,140.)]:
-            pts=np.array([[x,32.,z0],[x,32.,(z0+z1)/2],[x,32.,z1]],dtype='<f8')
+            x, y, z0, z1 = x+offset, 32.+offset, z0+offset, z1+offset
+            pts=np.array([[x,y,z0],[x,y,(z0+z1)/2],[x,y,z1]],dtype='<f8')
             c.execute('INSERT INTO fibers VALUES(?,?,?,?,?,?)',(fid,str(fid),'H',z1-z0,z0,z1))
             # Two blocks share exactly one endpoint.
             for j in range(2):
                 bid=2*fid+j
                 c.execute('INSERT INTO blocks VALUES(?,?,?,?)',(bid,fid,j,pts[j:j+2].tobytes()))
-                c.execute('INSERT INTO block_bounds VALUES(?,?,?,?,?,?,?)',(bid,x,x,32.,32.,pts[j,2],pts[j+1,2]))
+                c.execute('INSERT INTO block_bounds VALUES(?,?,?,?,?,?,?)',(bid,x,x,y,y,pts[j,2],pts[j+1,2]))
 
 
 def test_afv_native_coordinates_block_overlap_holdout_and_pickle(tmp_path):
@@ -264,13 +265,15 @@ def test_real_collector_roundtrip_on_afv_with_ct_only_inputs(tmp_path):
     from vesuvius.neural_tracing.fiber_follow.regression.collect import main as collect
     from vesuvius.neural_tracing.fiber_follow.regression.train import save_checkpoint
     from vesuvius.neural_tracing.fiber_follow.shared.data import OnPolicyStates
-    p=tmp_path/'test.afv';afv_fixture(p)
+    # Leave room for the 65-voxel CT context throughout this short trace, even
+    # when the randomly initialized model makes a small lateral correction.
+    p=tmp_path/'test.afv';afv_fixture(p, offset=16.)
     # These fibers run along z inside a CT sheet with normal y. Collection now
     # estimates seed headings from CT plus the family, so uniform CT is invalid.
     with sqlite3.connect(p) as c:
         c.execute("UPDATE fibers SET family='V'")
-    sheet = 50+150*np.exp(-.5*((np.arange(96)-32)/2.)**2)
-    ct = np.broadcast_to(sheet[None,:,None], (160,96,96)).astype(np.uint8)
+    sheet = 50+150*np.exp(-.5*((np.arange(128)-48)/2.)**2)
+    ct = np.broadcast_to(sheet[None,:,None], (192,128,128)).astype(np.uint8)
     array_at(tmp_path/'ct'/'0',ct)
     validation=dict(strategy='fiber_hash',fraction=.1,seed=7349)
     source=dict(name='fixture',kind='afv',path=str(p),ct=str(tmp_path/'ct'),grid_scale=1.,

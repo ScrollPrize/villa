@@ -109,7 +109,9 @@ class ModelTracer:
                    for path, p in zip(paths, seeds_xyz)):
                 raise ValueError('Initial observed prefix must end at resumed head')
         hist_start = [len(p)-1 for p in paths]
-        frames = ([ct_frame(self.vol, p, h) for p,h in zip(seeds_xyz, headings)]
+        frame_diagnostics = ([{} for _ in range(n)] if initial_states is None else
+                             [dict(s.get('ct_frame_diagnostics', {})) for s in initial_states])
+        frames = ([ct_frame(self.vol, p, h, diagnostics=d) for p,h,d in zip(seeds_xyz, headings, frame_diagnostics)]
                   if initial_states is None else [np.asarray(s['frame']).copy() for s in initial_states])
         stochastic = (getattr(self.model.cfg, 'sampler_mode', 'zero') == 'gaussian'
                       or getattr(self.model.cfg, 'gaussian_candidates', 0) > 0)
@@ -191,7 +193,7 @@ class ModelTracer:
                              travelled=float(length[i]), last_segment=last_segment[i].copy(),
                              observed_path=np.asarray(paths[i]).copy(),
                              heading_start=int(heading_start[i]), heading_policy=TRACE_HEADING_POLICY,
-                             frame_policy=FRAME_POLICY)
+                             frame_policy=FRAME_POLICY, ct_frame_diagnostics=frame_diagnostics[i].copy())
                 state.update({**references[i], 'seed_age': references[i]['seed_age']+float(length[i])})
                 if on_decision is not None and on_decision(int(i), state) is False:
                     active[i], reasons[i] = False, 'oracle'
@@ -256,7 +258,7 @@ class ModelTracer:
                         heading_start[i] = old_size+first_connection_count-1
                     tangent = linear12_heading(paths[i], int(heading_start[i]))
                     heading = frames[i][:, 2] if tangent is None else tangent
-                    frames[i] = ct_frame(self.vol, paths[i][-1], heading, frames[i])
+                    frames[i] = ct_frame(self.vol, paths[i][-1], heading, frames[i], diagnostics=frame_diagnostics[i])
                 if abort is not None and abort(int(i), paths[i]):
                     active[i], reasons[i] = False, 'abort'
                 elif length[i] >= pp.max_len-1e-6:

@@ -74,8 +74,8 @@ def test_short_degenerate_and_strict_prefix():
 
 def fake_ct(monkeypatch):
     calls = []
-    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.ct_normal',
-                        lambda vol,pos: np.array([0., 1., 0.]))
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.ct_tensor',
+                        lambda vol,pos: np.outer(np.array([0., 1., 0.]), np.array([0., 1., 0.])))
     def scalar(items, vol, crop, pool=None, *, presence=False, **kwargs):
         assert not presence
         calls.extend(items)
@@ -336,3 +336,44 @@ def test_history_residuals_use_shared_basicblock_d():
         assert isinstance(block.conv1.norm, torch.nn.InstanceNorm3d)
         assert isinstance(block.nonlin2, torch.nn.LeakyReLU)
         assert block.nonlin2.negative_slope == .01
+
+
+@pytest.mark.parametrize('failure', ['parallel', 'unidentifiable'])
+def test_first_unusable_slab_transports_current_ct_roll_without_dropping_history(monkeypatch, failure):
+    from vesuvius.neural_tracing.fiber_follow.shared.heading import FRAME_POLICY
+    from vesuvius.neural_tracing.fiber_follow.shared.geometry import frame_from_heading
+    calls = fake_ct(monkeypatch)
+    path = np.c_[np.zeros(129), np.zeros(129), np.arange(129)]
+    item = observation(path)
+    item['frame'] = frame_from_heading([0., 0., 1.], [1., 1., 0.])
+    item['frame_policy'] = FRAME_POLICY
+    def normal(vol, pos):
+        if failure == 'unidentifiable':
+            return np.zeros((3,3))
+        return np.diag([0., 0., 1.])
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.ct_tensor', normal)
+    expected = slab_layout(item)
+    result = load_slabs([item], None, cfg())
+    assert result['history_valid'].sum() == len(expected) == len(calls)
+    np.testing.assert_array_equal(item['observed_path'], path)
+    for before, after in zip(expected, item['_sampled_slabs']):
+        np.testing.assert_allclose(after['frame'], item['frame'], atol=1e-12)
+        np.testing.assert_allclose(after['hist_local'] @ after['frame'].T,
+                                   before['hist_local'] @ before['frame'].T, atol=1e-12)
+        np.testing.assert_array_equal(after['hmask'], before['hmask'])
+    assert (result['history_frame_source'][result['history_valid']] == 1).all()
+    # Without a validated anchor the first slab chooses deterministic roll.
+    other = load_slabs([observation(path)], None, cfg())
+    assert other['history_frame_source'][0,0] == 2
+    assert (other['history_frame_source'][other['history_valid']][1:] == 1).all()
+
+
+def test_valid_first_slab_keeps_independent_sign_despite_opposite_current_roll(monkeypatch):
+    from vesuvius.neural_tracing.fiber_follow.shared.heading import FRAME_POLICY, transverse_frame
+    fake_ct(monkeypatch)
+    item = observation([[0., 0., 0.], [0., 0., 4.]])
+    expected = transverse_frame(np.diag([0., 1., 0.]), [0., 0., 1.])
+    item['frame'] = expected @ np.diag([-1., -1., 1.])
+    item['frame_policy'] = FRAME_POLICY
+    load_slabs([item], None, cfg())
+    np.testing.assert_allclose(item['_sampled_slabs'][0]['frame'], expected, atol=1e-12)

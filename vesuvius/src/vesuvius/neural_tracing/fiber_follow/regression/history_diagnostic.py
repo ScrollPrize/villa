@@ -8,8 +8,28 @@ import torch
 from .train import load_checkpoint, move_batch
 
 
+def history_inputs(batch, mode):
+    """Change historical slabs only; retain current crop, local history and poses."""
+    x = dict(batch['x'])
+    valid = x['history_valid'].clone()
+    if mode == 'seed_only':
+        valid[:, 1:] = False
+    elif mode == 'none':
+        valid[:] = False
+    elif mode == 'shuffled_imagery':
+        if len(valid) % 2:
+            raise ValueError('Imagery swaps require complete matched pairs')
+        x['history_slabs'] = x['history_slabs'].clone()
+        partner = torch.arange(len(valid), device=valid.device)^1
+        x['history_slabs'][:, :, 0] = batch['x']['history_slabs'][partner, :, 0]
+    elif mode != 'full':
+        raise ValueError(f'Unknown history diagnostic mode: {mode}')
+    x['history_valid'] = valid
+    return x
+
+
 @torch.no_grad()
-def paired_history_report(model, batch, threshold=.5):
+def paired_history_report(model, batch, threshold=.5, *, n_commit=None, on_prediction=None):
     """Batch contains matched identities in adjacent rows and known candidate labels.
 
     The fixture is frozen by the caller. Shuffle swaps imagery within each pair,
@@ -22,33 +42,26 @@ def paired_history_report(model, batch, threshold=.5):
     result = {}
     try:
         for mode in ('full', 'seed_only', 'none', 'shuffled_imagery'):
-            x = dict(batch['x'])
-            valid = x['history_valid'].clone()
-            if mode == 'seed_only':
-                valid[:, 1:] = False
-            elif mode == 'none':
-                valid[:] = False
-            elif mode == 'shuffled_imagery':
-                x['history_slabs'] = x['history_slabs'].clone()
-                partner = torch.arange(len(valid), device=valid.device)^1
-                x['history_slabs'][:, :, 0] = batch['x']['history_slabs'][partner, :, 0]
-            x['history_valid'] = valid
+            x = history_inputs(batch, mode)
             out = model(x, batch['hist'], batch['hmask'], candidates=batch['candidate_points'],
-                        confidence_threshold=threshold)
-            known = batch['candidate_mask'].bool().all(-1)
-            correct = (batch['candidate_labels'] > .5).all(-1) & known
-            wrong = ((batch['candidate_labels'] <= .5) & batch['candidate_mask'].bool()).any(-1)
-            accepted = out['candidate_confidence'][..., -1] >= threshold
+                        confidence_threshold=threshold, n_commit=n_commit)
+            window = n_commit or model.cfg.n_future
+            known = batch['candidate_mask'][..., :window].bool().all(-1)
+            correct = (batch['candidate_labels'][..., :window] > .5).all(-1) & known
+            wrong = ((batch['candidate_labels'][..., :window] <= .5) & batch['candidate_mask'][..., :window].bool()).any(-1)
+            accepted = out['candidate_confidence'][..., window-1] >= threshold
             distances = (out['points'][:, None]-batch['candidate_points']).square().sum(-1).mean(-1)
             choice = distances.argmin(-1)
             selected_correct = correct.gather(1, choice[:, None]).squeeze(1)
-            row = dict(states=len(valid), geometry_correct=int(selected_correct.sum()),
+            row = dict(states=len(batch['hist']), geometry_correct=int(selected_correct.sum()),
                        correct_continuations=int(correct.sum()), correct_accepted=int((correct & accepted).sum()),
                        wrong_continuations=int(wrong.sum()), wrong_rejected=int((wrong & ~accepted).sum()))
-            row.update(geometry_choice_accuracy=row['geometry_correct']/len(valid),
+            row.update(geometry_choice_accuracy=row['geometry_correct']/len(batch['hist']),
                        correct_acceptance=row['correct_accepted']/max(1, row['correct_continuations']),
                        wrong_rejection=row['wrong_rejected']/max(1, row['wrong_continuations']))
             result[mode] = row
+            if on_prediction is not None:
+                on_prediction(mode, out)
     finally:
         model.train(was_training)
     return result

@@ -62,6 +62,8 @@ class AFVFibers(Sequence):
             raise ValueError(f'No AFV fibers in {split} split')
         self.ids = {r[0] for r in self.catalog}
         self.id_to_index = {r[0]: i for i,r in enumerate(self.catalog)}
+        # Catalog lengths are cheap sampling weights. Geometry bounds must use
+        # the recomputed arc array: densification can change its last bits.
         self.lengths = np.array([r[3]/self.grid_scale for r in self.catalog])
 
     def connection(self):
@@ -151,8 +153,11 @@ class _Fiber:
     def __init__(self, collection, index, row):
         self.collection, self.index = collection, index
         self.name, self.tag = row[1:3]
-        self.length = row[3]/collection.grid_scale
         self.endpoint_stop = (False, False)
+
+    @property
+    def length(self):
+        return self.collection.geometry(self.index).length
 
     def __getattr__(self, key):
         return getattr(self.collection.geometry(self.index), key)

@@ -5,20 +5,24 @@ import json
 from pathlib import Path
 
 from vesuvius.neural_tracing.fiber_follow.shared.data import OnPolicyStates
+from vesuvius.neural_tracing.fiber_follow.shared.heading import FRAME_POLICY
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume
 from vesuvius.neural_tracing.fiber_follow.shared.recovery import make_recovery_states, evaluate_recovery_states, recovery_counts
 from vesuvius.neural_tracing.fiber_follow.regression.data import observation_builder, DirectTracer
 from vesuvius.neural_tracing.fiber_follow.regression.diagnostics import decision_rows, summarize_decisions
 
 
-def monitor_fixture(path, fibers, manifest, sample, spec, seed_count=8):
+def monitor_fixture(path, fibers, manifest, sample, spec, seed_count=8, *, drift_bands=None):
     path = Path(path)
     seeds = manifest['monitor'][:seed_count]
     if seed_count < 1 or any(s['fiber'] not in manifest['monitor_fibers'] for s in seeds):
         raise ValueError('Recovery diagnostics require monitor seeds')
     provenance = dict(split='monitor', seed_manifest_sha256=manifest['sha256'],
                       volume=spec.to_dict(), sample_cfg=asdict(sample), seeds=seeds,
-                      construction='frozen augmented states; no confirmed departures', rng_seed=20260925)
+                      construction='frozen augmented states; no confirmed departures', rng_seed=20260925,
+                      frame_policy=FRAME_POLICY)
+    if drift_bands is not None:
+        provenance['drift_bands'] = drift_bands
     # Canonical JSON matches arrays/tuples loaded back from the archive.
     provenance = json.loads(json.dumps(provenance))
     if path.exists():
@@ -28,7 +32,8 @@ def monitor_fixture(path, fibers, manifest, sample, spec, seed_count=8):
         if recorded != provenance:
             raise ValueError('Monitor recovery fixture settings changed')
     else:
-        states = make_recovery_states(fibers, seeds, sample, provenance, FiberVolume(spec, cache_bytes=256 << 20))
+        options = {} if drift_bands is None else dict(drift_bands=drift_bands)
+        states = make_recovery_states(fibers, seeds, sample, provenance, FiberVolume(spec, cache_bytes=256 << 20), **options)
         states.save(path)
         # Replay loading canonicalizes geometry to float32. Use that same
         # representation on the first run and after resume.

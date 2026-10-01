@@ -51,8 +51,8 @@ def test_ct_reframed_candidates_score_under_bf16_autocast(tmp_path, monkeypatch,
     from vesuvius.neural_tracing.fiber_follow.regression.train import move_batch
     from test_survival_confidence import scoring_context
 
-    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.ct_normal',
-                        lambda vol, pos: np.array([1., 2., 0.]))
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.ct_tensor',
+                        lambda vol, pos: np.outer(np.array([1., 2., 0.]), np.array([1., 2., 0.])))
     cfg, rows, candidates = matched_batch(tmp_path, monkeypatch, True, orient=True)
     # Frame rotation uses double precision, but model inputs must remain FP32.
     assert rows[0]['candidate_points'].dtype == np.float64

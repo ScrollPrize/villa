@@ -20,6 +20,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.runloop import (
     RunLog, lr_at, prepare_run_dir, read_checkpoint, save_checkpoint as write_checkpoint,
     update_ema, training_rng_state, resume_training, raise_open_file_limit,
 )
+from vesuvius.neural_tracing.fiber_follow.shared.training_options import normalize_batch_options
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume, FiberVolumeSpec
 from vesuvius.neural_tracing.fiber_follow.regression.model import (
     ARCHITECTURE, PATCH_ARCHITECTURE, TOKEN_ARCHITECTURE, STEM_ARCHITECTURE, DirectConfig, build_model,
@@ -34,6 +35,7 @@ from vesuvius.neural_tracing.fiber_follow.regression.diagnostics import (
 )
 from vesuvius.neural_tracing.fiber_follow.regression.recovery import monitor_fixture, evaluate_monitor
 from vesuvius.neural_tracing.fiber_follow.regression.history_slabs import SAMPLING_REVISION
+from vesuvius.neural_tracing.fiber_follow.shared.heading import FRAME_POLICY
 from vesuvius.neural_tracing.fiber_follow.regression.identity_decisions import CANDIDATE_COUNT
 from vesuvius.neural_tracing.fiber_follow.shared.training_log import format_training_log, DirectTrainingInterval
 
@@ -238,23 +240,21 @@ class DecisionBatchPrefetch:
     """Assemble one CPU update ahead while the current update uses the GPU.
 
     Only this thread consumes the loader iterator. Chunks remain ordered and
-    the same first whole chunk reaching the decision budget ends each update.
+    exactly grad_steps whole batches form each update.
     The complete denominator is therefore known before any task backward.
     """
-    def __init__(self, iterator, decisions):
-        if decisions < 1:
-            raise ValueError('Positive decision budget required')
-        self.iterator, self.decisions = iterator, decisions
+    def __init__(self, iterator, grad_steps):
+        if grad_steps < 1:
+            raise ValueError('Positive gradient accumulation steps required')
+        self.iterator, self.grad_steps = iterator, grad_steps
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='decision-batch')
         self.pending = self.executor.submit(self.collect)
         self.closed = False
 
     def collect(self):
-        chunks, count = [], 0
-        while count < self.decisions:
-            chunk = next(self.iterator)
-            chunks.append(chunk)
-            count += len(chunk['hist'])
+        chunks = []
+        for _ in range(self.grad_steps):
+            chunks.append(next(self.iterator))
         return chunks
 
     def __next__(self):
@@ -280,7 +280,7 @@ def training_diagnostics(model, cpu_batch, tracer, fibers, seeds, out, step, log
 
     images = Path(out)/'images'
     images.mkdir(exist_ok=True)
-    # Bound image size even when training with larger microbatches.
+    # Bound image size even when training with larger batches.
     def take(value):
         return {k: take(v) for k, v in value.items()} if isinstance(value, dict) else value[:6]
     batch = move_batch(take(cpu_batch), device)
@@ -298,7 +298,7 @@ def training_diagnostics(model, cpu_batch, tracer, fibers, seeds, out, step, log
             plot_batch(batch['x'][scale], points, target, batch['plane_mask'], crop, images/filename,
                        batch['hist'], batch['hmask'], batch['gt_history'], batch['gt_history_mask'],
                        source=batch['source'], offtrack=batch['offtrack'], confidence=prediction['confidence'],
-                       history_channel=None)
+                       history_channel=None, ct_range=(-4, 4))
         curves = prediction['refinement_points']
         labels = ['initial proposal']+[f'feedback proposal {i}' for i in range(1, curves.shape[1])]
         plot_refinement(curves, batch['hist'], batch['hmask'],
@@ -392,11 +392,24 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
     decisions = []
     model.train()
     for cpu in batches:
+        if 'ct_frame_rejected_batches' in cpu:
+            sums['ct_frame_rejected_batches'] = sums.get('ct_frame_rejected_batches', 0)+int(cpu['ct_frame_rejected_batches'].sum())
         if 'dataset_id' in cpu:
             counts = sums.setdefault('dataset_counts', {})
             ids, sizes = torch.unique(cpu['dataset_id'], return_counts=True)
             for source_id, size in zip(ids.tolist(), sizes.tolist()):
                 counts[str(source_id)] = counts.get(str(source_id), 0)+size
+        for prefix in ('ct_frame', 'history_frame'):
+            if prefix+'_source' not in cpu['x']:
+                continue
+            source = cpu['x'][prefix+'_source']
+            known = source >= 0
+            for suffix, value in dict(count=known.sum(), transported=(source == 1).sum(),
+                    deterministic=(source == 2).sum(),
+                    energy_sum=cpu['x'][prefix+'_energy'][known].sum(),
+                    gap_sum=cpu['x'][prefix+'_gap'][known].sum()).items():
+                name = prefix+'_'+suffix
+                sums[name] = sums.get(name, 0.)+float(value)
         batch = move_batch(cpu, device)
         valid = cpu['x']['history_valid']
         for name, value in dict(history_valid_slabs=valid.sum(),
@@ -472,7 +485,7 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
     resolve_device_sums(sums, identity)
     sums['history_encode_seconds'] = sum(t[0].elapsed_time(t[1])/1000 if isinstance(t, tuple) else t
                                          for t in model._history_timings)
-    # The summed loss is finite only if every microbatch loss was; checked before any update.
+    # The summed loss is finite only if every batch loss was; checked before any update.
     if not math.isfinite(sums['loss']):
         raise FloatingPointError(f'Nonfinite loss at step {step}')
     if total:
@@ -527,8 +540,9 @@ def build_parser():
     ap.add_argument('--out-root', default=str(Path(__file__).parents[1]/'output'))
     ap.add_argument('--device', default='cuda')
     ap.add_argument('--steps', type=int, default=100000)
-    ap.add_argument('--batch', type=int, default=8, help='Target supervised decisions per optimizer update')
-    ap.add_argument('--microbatch', type=int, default=4)
+    ap.add_argument('--batch', type=int, default=4, help='Decisions per forward/backward pass')
+    ap.add_argument('--grad-steps', type=int, default=2,
+                    help='Batches accumulated per optimizer update; effective batch = batch * grad steps')
     ap.add_argument('--workers', type=int, default=8)
     ap.add_argument('--worker-cache-gb', type=float, default=.5)
     ap.add_argument('--remote-prefetch-connections', type=int, default=0,
@@ -536,7 +550,7 @@ def build_parser():
     ap.add_argument('--remote-prefetch-queue-size', type=int, default=512,
                     help='Bound per priority queue; required batches override speculative fetches')
     ap.add_argument('--remote-prefetch-lookahead', type=int, default=16,
-                    help='Future microbatch plans per remote source per worker; 0 disables deeper lookahead')
+                    help='Future batch plans per remote source per worker; 0 disables deeper lookahead')
     ap.add_argument('--remote-prefetch-timeout', type=float, default=120.,
                     help='Maximum seconds waiting for batch cache readiness; no foreground network fallback')
     ap.add_argument('--threads', type=int, default=4)
@@ -614,6 +628,8 @@ def build_parser():
     ap.add_argument('--log-every', type=int, default=50)
     ap.add_argument('--ckpt-every', type=int, default=1000)
     ap.add_argument('--diag-every', type=int, default=5000)
+    ap.add_argument('--batch-diag-every', type=int, default=1000,
+                    help='Current microbatch prediction, orientation and model-layer contact sheets; 0 disables')
     ap.add_argument('--diag-max-len', type=float, default=400.)
     ap.add_argument('--long-diag-every', type=int, default=0, help='Additional long monitor rollouts; 0 disables')
     ap.add_argument('--long-diag-max-len', type=float, default=1200.)
@@ -637,6 +653,7 @@ def build_parser():
 
 def options_argv(options):
     """Serialize effective trainer settings for a bounded benchmark run."""
+    options = normalize_batch_options(options)
     argv = []
     for action in build_parser()._actions:
         if action.dest == 'help' or action.dest not in options:
@@ -681,10 +698,11 @@ def main(argv=None):
     if (args.remote_prefetch_connections < 0 or args.remote_prefetch_queue_size < 1 or args.remote_prefetch_lookahead < 0
             or not math.isfinite(args.remote_prefetch_timeout) or args.remote_prefetch_timeout <= 0):
         raise ValueError('Prefetch connections and lookahead must be nonnegative; queue size and timeout must be positive')
-    if min(args.steps, args.batch, args.microbatch, args.log_every, args.ckpt_every,
-           args.threads, args.replay_keep, args.dagger_seeds, args.recovery_seeds) < 1 or args.batch % args.microbatch:
-        raise ValueError('Positive counts required; microbatch must divide effective batch')
-    if min(args.workers, args.warmup, args.diag_every, args.long_diag_every, args.dagger_every, args.recovery_every, args.confidence_weight) < 0:
+    if min(args.steps, args.batch, args.grad_steps, args.log_every, args.ckpt_every,
+           args.threads, args.replay_keep, args.dagger_seeds, args.recovery_seeds) < 1:
+        raise ValueError('Positive counts required, including batch and grad steps')
+    if min(args.workers, args.warmup, args.diag_every, args.batch_diag_every,
+           args.long_diag_every, args.dagger_every, args.recovery_every, args.confidence_weight) < 0:
         raise ValueError('Invalid training settings')
     if not 0 <= args.ema_decay < 1 or min(args.lr, args.tolerance, args.worker_cache_gb,
                                        args.diag_max_len, args.long_diag_max_len, args.dagger_trace_len, args.recovery_length) <= 0:
@@ -717,8 +735,8 @@ def main(argv=None):
         validate_dataset_resume(resume,dataset_document,dataset_digest)
     args.encoder = cfg.encoder
     args.token_only = cfg.token_only
-    if args.decision_fraction and args.microbatch % 2:
-        raise ValueError('Matched decisions require an even microbatch')
+    if args.decision_fraction and args.batch % 2:
+        raise ValueError('Matched decisions require an even batch')
     if not np.isfinite(args.candidate_weight) or args.candidate_weight <= 0:
         raise ValueError('Candidate weight must be finite and positive')
     if args.dagger_after <= 0:
@@ -800,14 +818,14 @@ def main(argv=None):
         return {role:bank.provenance() for role,bank in role_banks.items()}
     if resume:
         # Allow a new base LR without resetting AdamW or the schedule origin.
-        ignored = {'resume','reset_optimizer','lr','out_root','device','batch','microbatch','workers','threads','worker_cache_gb','dataset_config',
+        ignored = {'resume','reset_optimizer','lr','out_root','device','batch','grad_steps','workers','threads','worker_cache_gb','dataset_config',
                    'remote_prefetch_connections','remote_prefetch_queue_size','remote_prefetch_timeout','remote_prefetch_lookahead',
-                   'log_every','ckpt_every','diag_every','dagger_device',
+                   'log_every','ckpt_every','diag_every','batch_diag_every','dagger_device',
                    'negative_bank_refresh_seconds','negative_bank_cache_mb','activation_checkpointing',
                    'history_grad_clip','rest_grad_clip','presence_dropout','blur_probability','blur_sigma',
                    'decision_fraction','decision_choice_fraction','bank_following_probability','fresh_fraction',
                    'bank_hard_fraction','replay_failure_fraction','bank_switch_tolerance','bank_own_tolerance',
-                   'n_commit'}
+                   'n_commit','tolerance'}
         for key,value in vars(args).items():
             recorded = resume['training_options'].get(key, {'input_mode': 'ct+presence', 'dataset_config': None,
                                                            'stem_channels': 0, 'stem_blocks': 2}.get(key))
@@ -846,7 +864,7 @@ def main(argv=None):
     if args.reset_optimizer:
         progress(f'Fresh AdamW: one parameter group, all parameters trainable; LR restarts at update {done+1} '
                  f'with {args.warmup} warmup updates to {args.lr:g}')
-    prepare_training(model, args.microbatch)
+    prepare_training(model, args.batch)
     progress('Compiling training operations; first forward/backward passes may take several minutes')
     if done >= args.steps:
         raise ValueError('Run has already reached its requested update count')
@@ -861,10 +879,10 @@ def main(argv=None):
         extra_args=('--after', args.dagger_after, '--bank-switch-tolerance', args.bank_switch_tolerance,
                     '--bank-own-tolerance', args.bank_own_tolerance,
                     *[v for path in (args.negative_bank, args.near_negative_bank) if path for v in ('--failure-bank', path)]))
-    progress(f'Live historical slabs: eight slots; {args.microbatch} independent decisions per microbatch')
+    progress(f'Live historical slabs: eight slots; {args.batch} independent decisions per batch')
     builder = IdentityObservationBuilder(cfg,train_f,identity_sampling,
         augment=True,negative_bank=negative_bank,**role_banks)
-    dataset = FollowDataset(train_f, spec, sample, band, chunk=args.microbatch, seed=args.seed+done,
+    dataset = FollowDataset(train_f, spec, sample, band, chunk=args.batch, seed=args.seed+done,
         cache_bytes=int(args.worker_cache_gb*(1 << 30)), onpolicy=caches,
         replay_index=str(collector.index), batch_builder=builder, additional_crops=(), fresh_fraction=args.fresh_fraction)
     dataset_provenance = None
@@ -905,7 +923,7 @@ def main(argv=None):
             negative_bank_provenance=negative_bank.provenance() if negative_bank else None,
             bank_role_provenance=role_provenance(),
             model_cfg=cfg.to_dict(), sample_cfg=asdict(sample), vol_spec=spec.to_dict(),
-            data_policy=DATA_POLICY,
+            data_policy=DATA_POLICY, frame_policy=FRAME_POLICY,
             monitor_recovery_sha256=recovery_hash,
             seed_manifest_sha256=manifest['sha256'], fiber_manifest=fiber_manifest(fibers),
             parameter_count=sum(p.numel() for p in model.parameters())), indent=2))
@@ -927,7 +945,7 @@ def main(argv=None):
         source_sampling=dict(decision=args.decision_fraction,bank_following=args.bank_following_probability,
             fresh=(1-args.decision_fraction-args.bank_following_probability)*args.fresh_fraction,
             recent=(1-args.decision_fraction-args.bank_following_probability)*(1-args.fresh_fraction)),
-        history_sampling_revision=SAMPLING_REVISION,
+        history_sampling_revision=SAMPLING_REVISION, frame_policy=FRAME_POLICY,
         history_policy='live_observed_slabs',sampling=asdict(identity_sampling),
         negative_bank_path=str(negative_bank.root),negative_bank_provenance=negative_bank.provenance(),
         bank_role_provenance=role_provenance()))
@@ -954,7 +972,7 @@ def main(argv=None):
                     source.remote_prefetch_lookahead = args.remote_prefetch_lookahead
                 progress(f'Remote CT prefetch: {args.remote_prefetch_connections} concurrent fetches, '
                          f'{args.remote_prefetch_queue_size} requests per priority queue, '
-                         f'{args.remote_prefetch_lookahead} future microbatch plans per remote source/worker, separate async process')
+                         f'{args.remote_prefetch_lookahead} future batch plans per remote source/worker, separate async process')
             log.record(dict(step=done,event='remote_prefetch_configuration',
                 enabled=remote_prefetch is not None,connections=args.remote_prefetch_connections,
                 queue_size=args.remote_prefetch_queue_size,lookahead=args.remote_prefetch_lookahead,
@@ -963,9 +981,10 @@ def main(argv=None):
             from vesuvius.neural_tracing.fiber_follow.shared.trace import TraceParams
             tracer = DirectTracer(ema, FiberVolume(spec), cfg.fine, cfg.n_history,
                 TraceParams(n_commit=args.n_commit, max_len=args.diag_max_len), device=args.device)
-        progress(f'Starting data loader; collecting {args.batch} supervised decisions for update {done+1}')
+        progress(f'Starting data loader; batch {args.batch} × grad steps {args.grad_steps} = '
+                 f'{args.batch * args.grad_steps} decisions per update; starting update {done+1}')
         iterator = iter(loader)
-        updates = DecisionBatchPrefetch(iterator, args.batch)
+        updates = DecisionBatchPrefetch(iterator, args.grad_steps)
         observed_states = interval_states = 0
         prior_samples = int(resume['samples_seen']) if resume else 0
         for step in range(done+1, args.steps+1):
@@ -1023,7 +1042,7 @@ def main(argv=None):
                     dataset_config=dataset_document, dataset_config_sha256=dataset_digest,
                     dataset_provenance=dataset_provenance,
                     ct_normalization=ct_normalization,
-                    history_sampling_revision=SAMPLING_REVISION,
+                    history_sampling_revision=SAMPLING_REVISION, frame_policy=FRAME_POLICY,
                     samples_seen=prior_samples+observed_states,
                     identity_sampling=asdict(identity_sampling),
                     negative_bank_provenance=negative_bank.provenance() if negative_bank else None,
@@ -1043,6 +1062,19 @@ def main(argv=None):
             if step < args.steps and collector.launch(step, save):
                 log.record(dict(step=step, dagger_launched=True))
             periodic = {}
+            if args.batch_diag_every and (step % args.batch_diag_every == 0
+                                         or (resume is not None and step == done+1)):
+                from .batch_diagnostic import render_microbatch
+                began = time.monotonic()
+                names = dataset.names if dataset_document else [primary_source.get('name', 'paris4')]
+                report = render_microbatch(ema, batches[-1], out, step, device=args.device,
+                    n_commit=args.n_commit, tolerance=args.tolerance, dataset_names=names,
+                    training_metrics=dict(metrics, lr=lr, data_seconds=data_seconds,
+                        update_seconds=update_seconds,
+                        cuda_peak_allocated_gib=torch.cuda.max_memory_allocated(args.device)/2**30
+                            if torch.device(args.device).type == 'cuda' else None))
+                log.record(dict(step=step, split='current_training_microbatch', diagnostic_images=report))
+                periodic['batch_diagnostics_seconds'] = time.monotonic()-began
             if tracer is not None and args.diag_every and step % args.diag_every == 0:
                 began = time.monotonic()
                 training_diagnostics(ema, diagnostic['cpu_batch'], tracer, val_f, manifest['monitor'], out, step, log,

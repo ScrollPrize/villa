@@ -13,7 +13,8 @@ from vesuvius.neural_tracing.fiber_follow.shared.reference import SEED_FIELDS, o
 from vesuvius.neural_tracing.fiber_follow.shared.heading import FRAME_POLICY, orient_item
 
 
-def make_recovery_states(fibers, seeds, cfg, provenance, vol, seed=20260925):
+def make_recovery_states(fibers, seeds, cfg, provenance, vol, seed=20260925,
+                         drift_bands=((0., 1.), (1., 1.5), (1.5, 2.), (2., 3.5))):
     """Freeze four drift bands per seed using a private RNG, preserving identity."""
     rng = np.random.default_rng(seed)
     rows, track = [], []
@@ -22,7 +23,7 @@ def make_recovery_states(fibers, seeds, cfg, provenance, vol, seed=20260925):
         fiber = fibers[fi]
         reverse = entry['sign'] < 0
         t = fiber.length-entry['t'] if reverse else entry['t']
-        for lo, hi in ((0., 1.), (1., 1.5), (1.5, 2.), (2., 3.5)):
+        for lo, hi in drift_bands:
             for _ in range(1000):
                 item = make_sample(fiber, t, reverse, cfg, rng)
                 drift = float(np.linalg.norm(item['gt_history'][0]))
@@ -39,9 +40,24 @@ def make_recovery_states(fibers, seeds, cfg, provenance, vol, seed=20260925):
             track.extend(item['observed_path'])
     if not rows:
         raise ValueError('Recovery fixtures need at least one seed')
-    return OnPolicyStates(manifest=fiber_manifest(fibers), provenance=provenance,
+    return OnPolicyStates(manifest=fiber_manifest(fibers), provenance=dict(provenance, frame_policy=FRAME_POLICY),
         **{k: np.asarray([r[k] for r in rows]) for k in OnPolicyStates.FIELDS+('drift',)+SEED_FIELDS+tuple(OnPolicyStates.ROW_TRACK)},
         track_pos=np.asarray(track, dtype=np.float64))
+
+
+def recovery_batches(vol, states, fibers, sample, batch_builder=None, limit=0):
+    """Reconstruct frozen observations identically for images and recovery traces."""
+    grid = torch.from_numpy(crop_local_grid(sample.crop)).float()
+    count = len(states) if limit == 0 else min(limit, len(states))
+    for j in range(count):
+        f = fibers[int(states.fiber_idx[j])]
+        item = label_state(f, states.pos[j], states.frame[j], states.hist[j], states.hmask[j], sample,
+                          t=float(states.t[j]), reverse=bool(states.reverse[j]), offtrack=bool(states.offtrack[j]))
+        item.update({k: getattr(states, k)[j] for k in SEED_FIELDS if hasattr(states, k)})
+        item['observed_path'] = states.observed_prefix(j)
+        item['frame_policy'] = states.provenance.get('frame_policy', FRAME_POLICY)
+        cpu = batch_builder([item], vol) if batch_builder else collate_with_volume([item], vol, sample.crop, grid)
+        yield j, cpu
 
 
 @torch.no_grad()
@@ -61,16 +77,9 @@ def evaluate_recovery_states(model, vol, states, fibers, sample, *, device='cpu'
             return {k: move(v, float_inputs=float_inputs) for k,v in value.items()}
         dtype = torch.float32 if float_inputs and value.is_floating_point() else value.dtype
         return value.to(device=device, dtype=dtype)
-    grid = torch.from_numpy(crop_local_grid(sample.crop)).float()
     rows, predictions = [], []
-    for j in range(count):
+    for j, cpu in recovery_batches(vol, states, fibers, sample, batch_builder, limit):
         fi=int(states.fiber_idx[j]);f=fibers[fi]
-        item=label_state(f,states.pos[j],states.frame[j],states.hist[j],states.hmask[j],sample,
-                         t=float(states.t[j]),reverse=bool(states.reverse[j]),offtrack=bool(states.offtrack[j]))
-        item.update({k: getattr(states, k)[j] for k in SEED_FIELDS if hasattr(states, k)})
-        item['observed_path'] = states.observed_prefix(j)
-        item['frame_policy'] = FRAME_POLICY
-        cpu = batch_builder([item], vol) if batch_builder else collate_with_volume([item],vol,sample.crop,grid)
         b = move(cpu)
         sampling={}
         if (getattr(model.cfg,'sampler_mode','zero')=='gaussian'
@@ -115,7 +124,7 @@ def evaluate_recovery_states(model, vol, states, fibers, sample, *, device='cpu'
             state={k:getattr(states,k)[j] for k in ('hist','hmask','frame')}
             state['observed_path'] = states.observed_prefix(j)
             state['heading_start'] = int(states.heading_start[j])
-            state['frame_policy'] = FRAME_POLICY
+            state['frame_policy'] = states.provenance.get('frame_policy', FRAME_POLICY)
             state.update({k: getattr(states, k)[j] for k in SEED_FIELDS if hasattr(states, k)})
             try:
                 paths,reasons=tracer.trace(states.pos[j:j+1],states.frame[j:j+1,:,2],initial_states=[state])

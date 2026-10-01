@@ -9,14 +9,14 @@ from vesuvius.neural_tracing.fiber_follow.shared.geometry import (
     CropSpec, frame_from_heading, normalize,
 )
 from vesuvius.neural_tracing.fiber_follow.shared.trace import ModelTracer, TraceParams
-from vesuvius.neural_tracing.fiber_follow.shared.heading import normal_frame
+from vesuvius.neural_tracing.fiber_follow.shared.heading import transverse_frame
 
 
 @pytest.fixture(autouse=True)
 def ct_sheet(monkeypatch):
     # Isolate commit policy from image I/O using an exact, constant sheet normal.
-    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.ct_normal',
-                        lambda vol,pos: np.array([0., -1., 0.]))
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.ct_tensor',
+                        lambda vol,pos: np.outer(np.array([0., -1., 0.]), np.array([0., -1., 0.])))
 
 
 class ScriptedModel(torch.nn.Module):
@@ -61,7 +61,7 @@ def test_failed_steps_preserve_crop_frame_and_short_recovery_cannot_steer(policy
 
     try:
         seed = np.array([100., 100., 100.])
-        original_frame = normal_frame(np.array([1., 1., 1.]),np.array([0., -1., 0.]))
+        original_frame = transverse_frame(np.diag([0., 1., 0.]),np.array([1., 1., 1.]))
         direction = original_frame @ normalize(np.array([1., 0., 1.]))
         history = seed-np.arange(14., 0., -1)[:, None]*direction
         tracer.trace(seed[None], np.array([[1., 1., 1.]]), histories=[history], on_decision=capture)

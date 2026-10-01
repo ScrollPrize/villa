@@ -103,6 +103,12 @@ def test_every_optimizer_update_reports_point_counts_without_detailed_metrics():
     model = DirectFollower(config())
     data = batch(model.cfg)
     data['source'] = torch.tensor([0, 2])
+    data['ct_frame_rejected_batches'] = torch.tensor([3, 0])
+    data['x'].update(ct_frame_source=torch.tensor([0, 2]),
+                     ct_frame_energy=torch.tensor([.2, 0.]), ct_frame_gap=torch.tensor([.8, 0.]),
+                     history_frame_source=torch.tensor([[0, 1, -1], [2, -1, -1]]),
+                     history_frame_energy=torch.tensor([[.1, 0., 0.], [0., 0., 0.]]),
+                     history_frame_gap=torch.tensor([[.6, 0., 0.], [0., 0., 0.]]))
     ema = copy.deepcopy(model)
     opt = torch.optim.SGD(model.parameters(), lr=.001)
     prepare_training(model, backend='eager')
@@ -112,7 +118,34 @@ def test_every_optimizer_update_reports_point_counts_without_detailed_metrics():
     assert 'decisions' not in metrics
     assert metrics['refinement_attempts_mean'] == 1.
     assert metrics['refinement_attempts_sum'] == 2
+    assert metrics['ct_frame_rejected_batches'] == 3
+    assert metrics['ct_frame_count'] == 2 and metrics['ct_frame_deterministic'] == 1
+    assert metrics['ct_frame_transported'] == 0
+    assert metrics['history_frame_count'] == 3
+    assert metrics['history_frame_transported'] == metrics['history_frame_deterministic'] == 1
+    interval = DirectTrainingInterval()
+    interval.add(metrics)
+    interval.add(metrics)
+    summary = interval.summary()
+    assert summary['ct_frame_count'] == 4 and summary['history_frame_count'] == 6
+    row = dict(step=50, geometry=1., loss=1., lr=.001, interval=summary, n_future=4, tolerance=1.5,
+               interval_update_seconds=1., interval_data_seconds=.1, interval_samples_per_second=4.)
+    printed = format_training_log(row)
+    assert 'current 2/4 fallbacks (0 transported, 2 deterministic); mean gap 0.400' in printed
+    assert 'history 4/6 fallbacks (2 transported, 2 deterministic); mean gap 0.200' in printed
     assert sum(metrics[k] for k in ('point_correct_count','point_wrong_count','point_unknown_count')) == 8
+
+
+def test_interval_reports_ct_rejections_without_counting_them_as_training_crops():
+    interval = DirectTrainingInterval()
+    interval.add(dict(interval_row(16, 16, 0, 1.), ct_frame_rejected_batches=3))
+    interval.add(interval_row(16, 16, 0, 1.))
+    summary = interval.summary()
+    assert summary['ct_frame_rejected_batches'] == 3
+    assert summary['crops'] == summary['decisions'] == 32
+    row = dict(step=50, geometry=1., loss=1., lr=.001, interval=summary, n_future=16, tolerance=1.5,
+               interval_update_seconds=1., interval_data_seconds=.1, interval_samples_per_second=32.)
+    assert '3 unusable batch plans rejected; retried within source' in format_training_log(row)
 
 
 def test_curves_show_interval_point_accuracy_and_drop_rolled_back_steps(tmp_path,monkeypatch):
