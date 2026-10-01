@@ -1,3 +1,66 @@
+## 2026-10-01 — Checkpoint reviewed evaluation work
+
+- Audited the pending working tree: reviewed v4 fiber reader support existed in both C++ and Python but was not committed after the September 30 branch/merge setup. Included it with the accumulated reverse-consistency, reviewed evaluation, numerical diagnostics, TTA and result-documentation work.
+- Validation: 89 focused Python tests; approved build runner rebuilt the native target and passed 23 replay, 88 tracing, 25 reference-benchmark and 86 crop tests, plus 4 native-queue Python integration tests. Initial sandbox tracing tests could not open sockets; approved unsandboxed runner passed. No new evaluation or inference launched for this checkpoint.
+
+## 2026-10-01 — Two-product TTA experiment
+
+- Completed 91-fiber / 182-direction comparison: matched float32 baseline 24 restarts, mean TTA 24, median TTA 19 (20.83% reduction). Mean distance 55.447 / 55.447 / 69.309 mm. Detailed global and per-scroll results: docs/benchmarks/reviewed_tta13_20261001.md/.json. One evaluation per variant, no production default change.
+
+- Replaced the rejected seven-product expansion with 13 GPU transforms of one input and exactly two seven-channel outputs (mean/median), using the original shared accumulator/publication pipeline. Removed experimental pinned-copy and memfd/result-storage changes. Incomplete v1 artifacts are excluded by fresh v2 identity/namespaces. Strict float32 matched baseline and TTA evaluation underway; no production defaults changed.
+
+## 2026-10-01 — Float32/TF32 batch-shape follow-up
+
+- Same four u31500 tiles with autocast off: B4 versus B1 changes 0.463176% of presence bytes (max1), raw MAE0.00001802788. Fixed-batch repeats identical; similar magnitude to fp16, substantially below bf16. TF32 allowed, no strict-fp32 claim. Full matrix/provenance: docs/benchmarks/reviewed_tile_float32_sweep_20261001.md/.json. Approved runner, six tests, no production defaults changed.
+
+## 2026-10-01 — Inference-only repeatability
+
+- Four frozen u31500 tiles: fixed-batch repeats identical in bf16/fp16/autocast-off; changing B4 to B1 changes encoded presence 3.2741% for bf16 versus 0.4169% for fp16, without accumulation. Shared production reader/model/finalizer, approved runner, six tests. Full matrix/provenance in docs/benchmarks/reviewed_tile_repeatability_20261001.md/.json. No production defaults changed.
+
+## 2026-10-01 — Accumulation repeatability comparison
+
+- Three fresh reviewed-cohort repeats each fp16/fp32, frozen u31500/output64³/GPU0–5. Restarts22/24/25 versus24/23/23; varying cases5→1. Actual cached-voxel differences improve only modestly (presence0.1436%→0.1398%,nx1.0224%→0.9604%,ny0.8357%→0.7883%). Reusable approved runner, bounded parallel comparison, exact histograms/coverage and11focused tests. Constant504GiBhotbudget, modelbf16unchanged. Report: docs/benchmarks/reviewed_accumulation_repeats_20261001.md. Not a complete reproducibility fix; productiondefaultsunchanged.
+
+## 2026-10-01 — Reviewed GPU/output-chunk profile
+
+- Frozen u31500,91fibers/182directions, exclusive GPUs0–5: output32/64/128³ took310/241/357s; GPU inference-interval utilization53/73/74%. Keep64³. Smaller chunks expose coordinator/accumulator acknowledgement overhead; larger chunks require more inference. Added opt-in existing pipeline timing persistence and reusable approved sweep/report;17tests. Detailed metrics and caveats in reviewed_chunk_profile_20261001.md/.json. No production defaults changed.
+
+## 2026-10-01 — Raw u31500 reviewed evaluation
+
+-182/182directions complete,24restarts matching u31200,mean55.447mm. Full report reviewed_halfsigma_current_raw_v3_20261001.md. Previous u31200 failed-fiber list reviewed_u31200_failed_fibers_20261001.md:15fibers/24counted restarts, case IDs and paths.
+
+## 2026-10-01 — u31200 Lasagna cache export
+
+- Published-only5scroll export with portable inference.lasagna.json manifests,2.407GiB payload,13368chunklinks; scratch/checkpoints excluded. Shared exporter+approved runner, no inference rerun. Path/sync command in reviewed_u31200_cache_export_20261001.md.
+
+## 2026-10-01 — Half-sigma current raw u31200
+
+- Fresh latest raw on unchanged91reviewedfibers/182directions:24restarts,mean55.447mm,new best aggregate vs28previousbest/32u22400.0139=8,1299=7,Paris4=9,others0. No fw/bw/embedding;0–5GPUs. Separatev2 output/cache and immediate selection record. Full table/provenance in reviewed_halfsigma_current_raw_v2_20261001.md/.json;10tests pass.
+
+## 2026-09-30 — Half-sigma current raw u22400
+
+- Immediately froze current.pt per request and completed unchanged reviewed91fiber/182direction evaluation:32restarts,mean42.005mm; worse overall than priorraw28.0139=16,1299=4,Paris4=12; other scrolls0. Saved reviewed_halfsigma_current_raw_v1_20260930.md/.json. Shortened rejected cache namespace and retained initial preflight evidence; added length regression.10tests pass.
+
+## 2026-09-30 — Half-sigma best EMA99 evaluation
+
+- Frozen EMA99u18700:29restarts on91reviewedfibers/182directions, no fw/bw or embedding; rawu18600 remains28. Paris4improves14→12,0139worsens9→12. Full metrics/provenance in docs/benchmarks/reviewed_halfsigma_ema99_20260930.md. Shared runner selector halfsigma_ema99,9focused tests pass, no native/scheduling changes.
+
+## 2026-09-30 — Half-sigma raw evaluation
+
+- Evaluated frozen best raw u18600 from20260930_155818 on unchanged reviewed91fibers/182directions, no fw/bw or embedding.28restarts vs29bestlowres/32Gaussian/36oldfullres; mean47.799mm. Full comparison and reproduction in docs/benchmarks/reviewed_halfsigma_raw_20260930.md; reusable reviewed runner model halfsigma_raw. No native/scheduling changes.
+
+## 2026-09-30 — Reference-seeded reverse diagnostics
+
+- Completed108parallel native probes on27remaining failures. Wrong paths can reproduce in reverse while GT-seeded reverse traces follow a separate correct path (Gaussian7/12, lowres11/15). Production filter unchanged. Reusable driver, provenance/seed checks and per-case results in docs/benchmarks/reviewed_reference_reverse_20260930.md.
+
+## 2026-09-30 — Periodic reverse-consistency replay
+
+- Opt-in256base periodic reverse check with shared native crop verifier, separate filtered stops and GT-assisted10/20ellipse peak/alignment reseeding. Gaussian32→12ordinary+62filtered,97.29%retained; lowres29→15ordinary+51filtered,97.70%retained. Both182directions complete. Default unchanged; more interruptions overall. Full protocol, tests, commands and per-scroll data in docs/benchmarks/reviewed_reverse_consistency_20260930.md.
+
+## 2026-09-30 — Reviewed evaluation cache links
+
+- Separate per-model/per-scroll published-only sync exports with portable VC3D manifests, immutable inventories and logical transfer sizes; exclude hidden scratch and checkpoints. Reuse existing exporter with optional level3 support, keeping default level1. See docs/benchmarks/reviewed_cache_export_20260930.md.
+
 ## 2026-09-28 — Correct failure-trial coordinates and parallel export
 
 - Fix run-local versus original-fiber arc mismatch in global reproduction trials; version coordinate contract and validate independent expected start/end XYZ within0.25 base voxel, both before tracing and when auditing saved results.
@@ -3379,3 +3442,23 @@ identity remains unconfirmed. Global-assignment experiments not yet implemented.
   evaluation rerun; source worktrees and untracked artifacts left untouched.
 - Focused Python suites: 430 passed, 38 skipped, two expected failures;
   short/long embedding mock corrected after initial regression detection.
+## 2026-09-30 — Reviewed-reference three-model tracing comparison
+
+- Freeze91 reviewed annotations from2026-09-30 cohort and reuse the existing
+  fast beam/on-demand inference benchmark.97eligible runs/194directions,
+  686.127mm reference length; one all-Lasagna annotation excluded by policy.
+- Lowres212757 best EMA999:28 restarts/47.319mm; previous fullres213753:
+  30/44.266mm;Gaussian092844 best EMA999u17700:32/41.583mm. No infrastructure
+  failures. Lowres remains best here; selected cohort is not an unbiased holdout.
+- Shared readers accept reviewed v4 object CPs and validated optional editor
+  hints without changing stored reference geometry. Frozen source bytes retained.
+  Approved runner only, GPU0–5 for new inference; completed lowres used no GPUs.
+- Full tables, checkpoint hashes, cache/timing caveats and commands in
+  docs/benchmarks/reviewed_fibers_20260930.md; exact results in adjacentJSON.
+## 2026-09-30 — Corrected approved-reference rerun
+
+- All91 reference annotations now approved,zero Lasagna spans;91pieces and
+  182directions with693.088mm reference length. Freeze v3, preserve v2 evidence.
+- Same frozen models/cache/protocol,GPUs0–5:lowres29 restarts/46.206mm mean,
+  previous fullres36/37.464mm,Gaussianu17700 32/42.005mm. Zero infrastructure
+  failures. Exact results and full tables: docs/benchmarks/reviewed_fibers_corrected_20260930.*.

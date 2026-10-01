@@ -166,6 +166,41 @@ if __name__ == '__main__':
     elif not sys.argv[1:]:
         control = REPO / 'scripts/training_failure_mining_control.json'
         action = json.loads(control.read_text()).get('action', 'start') if control.exists() else 'start'
+        if action == 'reviewed_tta_sweep':
+            subprocess.run([sys.executable, '-u', str(REPO / 'scripts/reviewed_tta_sweep.py')], check=True)
+            raise SystemExit(0)
+        if action == 'reviewed_tta_stop':
+            control_data = json.loads(control.read_text())
+            pid = int(control_data['pid'])
+            command = Path(f'/proc/{pid}/cmdline').read_bytes().replace(b'\x00', b' ').decode()
+            if 'run_classic_fiber_evaluation.py full' not in command or '/tta13_u31500_v1/identity/workload.json' not in command:
+                raise RuntimeError('unexpected TTA process; refusing signal')
+            import signal
+            os.kill(pid, signal.SIGINT)
+            print(f'Stopped verified TTA evaluation {pid}', flush=True)
+            raise SystemExit(0)
+        if action in ('reviewed_tile_repeatability','reviewed_tile_float32_sweep'):
+            extra=['--float32-sweep'] if action=='reviewed_tile_float32_sweep' else []
+            subprocess.run([sys.executable, '-u', str(REPO / 'scripts/reviewed_tile_repeatability.py'),*extra], check=True)
+            raise SystemExit(0)
+        if action == 'reviewed_accumulation_sweep':
+            subprocess.run([sys.executable, '-u', str(REPO / 'scripts/reviewed_accumulation_sweep.py')], check=True)
+            raise SystemExit(0)
+        if action == 'reviewed_profile_sweep':
+            subprocess.run([sys.executable, '-u', str(REPO / 'scripts/reviewed_profile_sweep.py')], check=True)
+            raise SystemExit(0)
+        if action == 'extract_reviewed_test_image':
+            subprocess.run([sys.executable, '-u', str(REPO / 'scripts/extract_reviewed_test_image.py')], check=True)
+            raise SystemExit(0)
+        if action == 'reviewed_cache_export':
+            subprocess.run([sys.executable, '-u', str(REPO / 'scripts/reviewed_cache_export.py')], check=True)
+            raise SystemExit(0)
+        if action == 'reviewed_reference_reverse':
+            subprocess.run([sys.executable, '-u', str(REPO / 'scripts/reviewed_reference_reverse.py')], check=True)
+            raise SystemExit(0)
+        if action in ('reviewed_eval', 'reviewed_reverse'):
+            subprocess.run([sys.executable, '-u', str(REPO / 'scripts/reviewed_fiber_evaluation.py')], check=True)
+            raise SystemExit(0)
         if action == 'discard_invalid_reproduction':
             with (ROOT/'workflow.lock').open('a') as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -230,7 +265,7 @@ if __name__ == '__main__':
                 '-o', '/tmp/villa3_test_fiber_case_queue'], check=True)
             subprocess.run(['/tmp/villa3_test_fiber_case_queue'], check=True)
             subprocess.run(['bash', str(REPO / 'vesuvius/scripts/run_fiber3d_native_build')], check=True)
-            for test in ('test_fiber_replay', 'test_fiber_trace3d', 'test_fiber_reference_replay_benchmark'):
+            for test in ('test_fiber_replay', 'test_fiber_trace3d', 'test_fiber_reference_replay_benchmark', 'test_fiberlet_crop_trace'):
                 subprocess.run([str(REPO / 'volume-cartographer/build/fiber-evaluation/bin' / test)], check=True)
             subprocess.run([sys.executable, '-m', 'pytest', '-o', f'pythonpath={REPO}/vesuvius/src', '-q',
                 'vesuvius/tests/neural_tracing/test_native_replay_evaluation.py',

@@ -317,7 +317,11 @@ def create_demand_store(cache, source_identity, model_identity, geometry, effect
     adapter_options = {}
     if settings.get("embedding_bank") is not None:
         adapter_options["embedding_bank"] = settings["embedding_bank"]
-    adapter = inference_adapter.FiberTrace3DPredictAdapter(effective, checkpoint=snapshot,
+    adapter_class = inference_adapter.FiberTrace3DPredictAdapter
+    if settings.get("tta"):
+        from .tta import TtaPredictAdapter
+        adapter_class = TtaPredictAdapter
+    adapter = adapter_class(effective, checkpoint=snapshot,
         level=level + power, scaledown=(1 << level) * geometry.scale, inference_scaledown=geometry.scale,
         chunk_size=geometry.chunk, product_prefix="fiber", zarr_path_prefix=cache / "fiber",
         emit_embeddings=bool(settings.get("emit_embeddings", False)),
@@ -325,6 +329,9 @@ def create_demand_store(cache, source_identity, model_identity, geometry, effect
     # Construction restores checkpoint config; reapply the resolved precision.
     adapter.config["training"] = {**adapter.config.get("training", {}),
         "mixed_precision": effective["training"]["mixed_precision"]}
+    if 'allow_tf32' in settings:
+        adapter.config['inference'] = {**adapter.config.get('inference', {}),
+                                       'allow_tf32': settings['allow_tf32']}
     products = adapter.output_products
     output = tiled.OmeZarrOutputAdapter(products=products, n_levels=level + power + 1)
     def prepare_output():
@@ -350,11 +357,19 @@ def resolve_inference_model(cache_root, checkpoint, model_config, settings, devi
     snapshot, checkpoint_digest = freeze_checkpoint(Path(checkpoint), cache_root)
     effective, _ = _checkpoint_config_for_inference(snapshot, model_config)
     settings = dict(settings)
+    if settings.get('tta'):
+        if settings.get('allow_tf32', False) is not False:
+            raise ValueError('TTA requires allow_tf32=False')
+        settings['allow_tf32'] = False
     precision, _ = _resolve_inference_precision(
         settings.get("precision", "auto"), checkpoint=snapshot,
         devices=device_list, validate_devices=validate_devices)
     effective = dict(effective)
     effective["training"] = {**effective.get("training", {}), "mixed_precision": precision}
+    if 'allow_tf32' in settings:
+        if type(settings['allow_tf32']) is not bool:
+            raise ValueError('inference.allow_tf32 must be boolean')
+        effective['inference'] = {**effective.get('inference', {}), 'allow_tf32': settings['allow_tf32']}
     tile, overlap, border = (int(settings.get(k, default)) for k, default in
                              (("tile_size", 192), ("overlap", 64), ("border", 16)))
     power = int(settings.get("scaledown_power", 2))
@@ -371,6 +386,11 @@ def resolve_inference_model(cache_root, checkpoint, model_config, settings, devi
                       "compressor": settings.get("compressor", "blosc-zstd"),
                       "max_batch_size": max_batch_size,
                       "embedding_channels": "signed-float32-v2" if settings.get("emit_embeddings", False) else None}
+    if settings.get("tta"):
+        from .tta import SCHEMA, VARIANTS
+        if settings['tta'] not in VARIANTS or precision != 'off' or max_batch_size != 1:
+            raise ValueError('TTA requires valid variant, precision off and max_batch_size1')
+        model_identity['tta'] = SCHEMA  # Selection is a view, not a new prediction.
     return dict(snapshot=snapshot, effective=effective, settings=settings,
                 identity=model_identity, tile=tile, overlap=overlap, border=border,
                 scale=scale, chunk=chunk, power=power)
@@ -438,6 +458,8 @@ def run(config_path, checkpoint, devices, native_binary, model_config=None, *, r
     settings = dict(config.get("inference", {}))
     trace_args = config.get("trace_args", [])
     mixed = config.get("embedding_inference")
+    if settings.get('tta') and mixed is not None:
+        raise ValueError('TTA pilot does not support mixed embedding inference')
     if mixed is not None and (not isinstance(mixed, dict) or not mixed.get("checkpoint")):
         raise ValueError("embedding_inference requires a checkpoint")
     if "--embedding-weight" in trace_args:
@@ -558,8 +580,14 @@ def run(config_path, checkpoint, devices, native_binary, model_config=None, *, r
             source_to_store[source_id] = role_keys if mixed is not None else role_keys[0]
             entry = dict(source)
             # Scientific producer identity, independent of manifests' runtime locations.
-            bind_fiberlet_identity(entry, source_identity, models[0][0]["identity"], manifests[0])
+            graph_identity = models[0][0]["identity"]
+            if settings.get('tta'):
+                graph_identity = {**graph_identity, 'tta_selected_product': settings['tta']}
+            bind_fiberlet_identity(entry, source_identity, graph_identity, manifests[0])
             entry["fiber_manifest"] = str(manifests[0])
+            if settings.get('tta'):
+                from .tta import selected_manifest
+                entry['fiber_manifest'] = str(selected_manifest(manifests[0], settings['tta']))
             if mixed is not None:
                 from .mixed_inference import write_mixed_manifest
                 entry["fiber_manifest"] = str(write_mixed_manifest(
@@ -616,6 +644,7 @@ def create_managed_demand_pool(stores, readers, device_list, settings, pool_grou
         accumulator_hot_slots=accumulator_hot_slots,
         accumulator_spill_segment_slots=int(settings.get("accumulator_spill_segment_slots", 256)),
         flush_workers=int(settings.get("flush_workers", 4)),
+        profile_pipeline=bool(settings.get("profile_pipeline", False)),
         deferred_gpu=adaptive is not None)
     try:
         lease = DemandGpuLease(pool, adaptive) if adaptive is not None else None
@@ -852,6 +881,14 @@ def coordinate_native(evaluation, binary, stores, source_to_store, channel_indic
                 queue_log.write(json.dumps({"elapsed_seconds": time.monotonic() - started,
                     "phase": "complete", "trace_requests_waiting": 0, **pool.queue_snapshot()}) + "\n")
             summary_path = Path(evaluation["output"]) / "summary.json"
+            if pool is not None and settings.get("profile_pipeline", False) and pool_groups is None:
+                atomic_write(Path(evaluation["output"]) / "pipeline_profile.json", {
+                    "scope": "session cumulative" if inference_session is not None else "batch",
+                    "worker_samples": pool.profile_samples,
+                    "stage_samples": pool.stage_samples,
+                    "accumulator_seconds": pool.accumulator_samples,
+                    "accumulator_queue_plus_ack_seconds": pool.accumulator_queue_samples,
+                    "note": "Overlapping stage times; worker samples are per tile (batch times divided by batch size)."})
             atomic_write(summary_path, finalize_native_summary(json.loads(summary_path.read_text())))
             atomic_write(Path(evaluation["output"]) / "inference_summary.json", {
                 "producer_implementation": producer_implementation,

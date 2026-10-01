@@ -1,0 +1,191 @@
+{
+  "same_reference_hashes_normals_and_protocol": true,
+  "results": {
+    "lowres": {
+      "checkpoint_sha256": "67edd3a1bde162c7105ee37d849a0f0b60a9b840dd37fc7ff6e17e0c3a2e9742",
+      "summary_path": "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v2/lowres/full/summary.json",
+      "completed": true,
+      "cases": 194,
+      "evaluated_cases": 194,
+      "selected_fibers": 91,
+      "eligible_runs": 97,
+      "directed_reference_length_mm": 1372.2532412256974,
+      "failures": 28,
+      "route_state_limit_cases": 0,
+      "mean_segment_length_mm": 47.319077283644724,
+      "median_segment_length_mm": 4.887044690469814,
+      "p05_segment_length_mm": 1.420683607168157,
+      "p95_segment_length_mm": 17.775041818691076,
+      "failures_per_directed_mm": 0.02040439705938708,
+      "native_wall_seconds": 12.156989209,
+      "coordinator_wall_seconds": 23.538832126010675,
+      "inference_tiles": 0,
+      "scrolls": {
+        "PHerc0139": {
+          "failures": 8,
+          "mean_segment_length_mm": 30.772928715684007,
+          "median_segment_length_mm": 3.597718159204869,
+          "p05_segment_length_mm": 1.3733980319299146,
+          "p95_segment_length_mm": 9.69033749940807,
+          "failures_per_directed_mm": 0.028885417345273667
+        },
+        "PHerc0332": {
+          "failures": 0,
+          "mean_segment_length_mm": 11.128700947265296,
+          "median_segment_length_mm": 5.564350473632648,
+          "p05_segment_length_mm": 5.564350473632648,
+          "p95_segment_length_mm": 5.564350473632648,
+          "failures_per_directed_mm": 0
+        },
+        "PHerc1299": {
+          "failures": 4,
+          "mean_segment_length_mm": 29.48543926968327,
+          "median_segment_length_mm": 4.702480668526456,
+          "p05_segment_length_mm": 1.9568162435537328,
+          "p95_segment_length_mm": 15.538625140982392,
+          "failures_per_directed_mm": 0.02713203600878874
+        },
+        "PHerc1451": {
+          "failures": 0,
+          "mean_segment_length_mm": 10.495755239703156,
+          "median_segment_length_mm": 5.247877619851578,
+          "p05_segment_length_mm": 5.247877619851578,
+          "p95_segment_length_mm": 5.247877619851578,
+          "failures_per_directed_mm": 0
+        },
+        "PHercParis4": {
+          "failures": 16,
+          "mean_segment_length_mm": 54.485013544068,
+          "median_segment_length_mm": 5.266254856115054,
+          "p05_segment_length_mm": 1.4476822673452372,
+          "p95_segment_length_mm": 24.289486694652236,
+          "failures_per_directed_mm": 0.017274043069237795
+        }
+      }
+    },
+    "fullres": {
+      "checkpoint_sha256": "5ec278f71b15b27187b55805310176fe2fa3b00c5264fc528b95bc6d0690206e",
+      "summary_path": "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v2/fullres/full/summary.json",
+      "completed": true,
+      "cases": 194,
+      "evaluated_cases": 194,
+      "selected_fibers": 91,
+      "eligible_runs": 97,
+      "directed_reference_length_mm": 1372.2532412256974,
+      "failures": 30,
+      "route_state_limit_cases": 0,
+      "mean_segment_length_mm": 44.266233587925704,
+      "median_segment_length_mm": 4.777802656283029,
+      "p05_segment_length_mm": 1.3968178841473822,
+      "p95_segment_length_mm": 17.77735725365315,
+      "failures_per_directed_mm": 0.021861853992200444,
+      "native_wall_seconds": 29.466712794,
+      "coordinator_wall_seconds": 40.95092038300936,
+      "inference_tiles": 18,
+      "scrolls": {
+        "PHerc0139": {
+          "failures": 10,
+          "mean_segment_length_mm": 25.177850767377823,
+          "median_segment_length_mm": 3.4199381829285596,
+          "p05_segment_length_mm": 1.3776731875791326,
+          "p95_segment_length_mm": 9.605387209442927,
+          "failures_per_directed_mm": 0.036106771681592084
+        },
+        "PHerc0332": {
+          "failures": 0,
+          "mean_segment_length_mm": 11.128700947265296,
+          "median_segment_length_mm": 5.564350473632648,
+          "p05_segment_length_mm": 5.564350473632648,
+          "p95_segment_length_mm": 5.564350473632648,
+          "failures_per_directed_mm": 0
+        },
+        "PHerc1299": {
+          "failures": 4,
+          "mean_segment_length_mm": 29.48543926968327,
+          "median_segment_length_mm": 4.811145793313715,
+          "p05_segment_length_mm": 1.534856137701472,
+          "p95_segment_length_mm": 15.538625140982392,
+          "failures_per_directed_mm": 0.02713203600878874
+        },
+        "PHerc1451": {
+          "failures": 0,
+          "mean_segment_length_mm": 10.495755239703156,
+          "median_segment_length_mm": 5.247877619851578,
+          "p05_segment_length_mm": 5.247877619851578,
+          "p95_segment_length_mm": 5.247877619851578,
+          "failures_per_directed_mm": 0
+        },
+        "PHercParis4": {
+          "failures": 16,
+          "mean_segment_length_mm": 54.485013544068,
+          "median_segment_length_mm": 5.1867677913806745,
+          "p05_segment_length_mm": 1.4841021983222373,
+          "p95_segment_length_mm": 24.659864167623105,
+          "failures_per_directed_mm": 0.017274043069237795
+        }
+      }
+    },
+    "gaussian": {
+      "checkpoint_sha256": "274acb0c686bfb030646d039f2740f7ad6349cd507a4de0843cf26e4f638ccec",
+      "summary_path": "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v2/gaussian/full/summary.json",
+      "completed": true,
+      "cases": 194,
+      "evaluated_cases": 194,
+      "selected_fibers": 91,
+      "eligible_runs": 97,
+      "directed_reference_length_mm": 1372.2532412256974,
+      "failures": 32,
+      "route_state_limit_cases": 0,
+      "mean_segment_length_mm": 41.583431552293845,
+      "median_segment_length_mm": 4.7629548918680245,
+      "p05_segment_length_mm": 1.370974901269411,
+      "p95_segment_length_mm": 17.77735725365315,
+      "failures_per_directed_mm": 0.023319310925013808,
+      "native_wall_seconds": 217.055612554,
+      "coordinator_wall_seconds": 228.78031505199033,
+      "inference_tiles": 4942,
+      "scrolls": {
+        "PHerc0139": {
+          "failures": 11,
+          "mean_segment_length_mm": 23.079696536763006,
+          "median_segment_length_mm": 3.5253038935043413,
+          "p05_segment_length_mm": 1.370974901269411,
+          "p95_segment_length_mm": 8.883309744739242,
+          "failures_per_directed_mm": 0.03971744884975129
+        },
+        "PHerc0332": {
+          "failures": 0,
+          "mean_segment_length_mm": 11.128700947265296,
+          "median_segment_length_mm": 5.564350473632648,
+          "p05_segment_length_mm": 5.564350473632648,
+          "p95_segment_length_mm": 5.564350473632648,
+          "failures_per_directed_mm": 0
+        },
+        "PHerc1299": {
+          "failures": 4,
+          "mean_segment_length_mm": 29.48543926968327,
+          "median_segment_length_mm": 4.811145793313715,
+          "p05_segment_length_mm": 1.002923057777945,
+          "p95_segment_length_mm": 15.538625140982392,
+          "failures_per_directed_mm": 0.02713203600878874
+        },
+        "PHerc1451": {
+          "failures": 0,
+          "mean_segment_length_mm": 10.495755239703156,
+          "median_segment_length_mm": 5.247877619851578,
+          "p05_segment_length_mm": 5.247877619851578,
+          "p95_segment_length_mm": 5.247877619851578,
+          "failures_per_directed_mm": 0
+        },
+        "PHercParis4": {
+          "failures": 17,
+          "mean_segment_length_mm": 51.458068347175335,
+          "median_segment_length_mm": 5.1594858871461335,
+          "p05_segment_length_mm": 1.502824311086109,
+          "p95_segment_length_mm": 24.564501287137738,
+          "failures_per_directed_mm": 0.018353670761065158
+        }
+      }
+    }
+  }
+}

@@ -323,6 +323,12 @@ class FiberTrace3DPredictAdapter:
         )
 
     def load_model(self, *, device: torch.device) -> torch.nn.Module:
+        allow_tf32 = self.config.get('inference', {}).get('allow_tf32')
+        if allow_tf32 is not None:
+            if type(allow_tf32) is not bool:
+                raise ValueError('inference.allow_tf32 must be boolean')
+            torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+            torch.backends.cudnn.allow_tf32 = allow_tf32
         budget = os.environ.get("FIBER_INFERENCE_VRAM_BUDGET_BYTES")
         if budget is not None and device.type == "cuda":
             from .cooperative_resources import configure_cuda_memory_budget
