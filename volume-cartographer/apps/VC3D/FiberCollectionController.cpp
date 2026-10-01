@@ -38,7 +38,6 @@
 #include <QSlider>
 #include <QSpinBox>
 #include <QStyleHints>
-#include <QTemporaryDir>
 #include <QTimer>
 #include <QtConcurrent/QtConcurrentRun>
 #include <nlohmann/json.hpp>
@@ -339,7 +338,7 @@ FiberCollectionController::FiberCollectionController(CState* state, ViewerManage
         clear();
         QFile::remove(file);
     });
-    connect(state_, &CState::volumeChanged, this, [this]() { projectChanged(); });
+    connect(state_, &CState::volumeChanged, this, [this]() { volumeChanged(); });
     connect(state_, &CState::volumeClosing, this, [this]() { clear(); });
     bindToViewerManager(manager);
 }
@@ -378,7 +377,9 @@ void FiberCollectionController::clear()
     selected_ = 0;
     pendingAnnotation_ = 0;
     path_.clear();
+    attachment_.clear();
     uuid_.clear();
+    coordinateSpace_.clear();
     for (auto& [v, s] : views_) {
         if (s->cancelled)
             s->cancelled->store(true);
@@ -428,10 +429,29 @@ void FiberCollectionController::projectChanged()
         }
     }
 }
+void FiberCollectionController::volumeChanged()
+{
+    // Another volume of the same scan keeps the open collection, its selection
+    // and caches; only the native-to-viewer factor may differ.
+    if (enabled_ && state_->currentVolume() && state_->vpkg() && attachment_ == attachmentPath()) {
+        const auto identity = vc3d::opendata::coordinateIdentityForVolume(*state_->vpkg(), state_->currentVolumeId());
+        if (identity && identity->coordinateSpace == coordinateSpace_ && identity->sourceOriginalResolution == sourceResolution_) {
+            const double factor = 1.0 / double(identity->sourceCoordinateScaleFactor);
+            if (factor != nativeToViewer_) {
+                nativeToViewer_ = factor;
+                invalidate();
+            }
+            return;
+        }
+    }
+    projectChanged();
+}
 void FiberCollectionController::openCollection(const QString& path, bool persist, const std::string& expectedUuid)
 {
     clear();
-    dock_->show();
+    // Restoring the project's attachment leaves the dock as the user left it.
+    if (persist)
+        dock_->show();
     if (!state_->currentVolume() || !state_->vpkg()) {
         status_->setText(tr("Open the CT volume first."));
         return;
@@ -475,6 +495,9 @@ void FiberCollectionController::openCollection(const QString& path, bool persist
             // Collection lengths are L0 voxels; the identity resolution is in
             // micrometres, independent of the displayed pyramid/zoom level.
             nativeVoxelMm_ = identity->sourceOriginalResolution / 1000.0;
+            coordinateSpace_ = identity->coordinateSpace;
+            sourceResolution_ = identity->sourceOriginalResolution;
+            attachment_ = attachmentPath();
             uuid_ = result.value.at("uuid").get<std::string>();
             totalFibers_ = result.value.at("fiber_count").get<int64_t>();
             enabled_ = true;
@@ -1074,24 +1097,12 @@ void FiberCollectionController::startPendingAnnotation()
         uint64_t nativeId = existing;
         if (!nativeId) {
             // Only the requested fiber enters the native editable store.
-            QTemporaryDir temp;
-            QFile file(temp.filePath(filename));
-            const auto payload = result.value.dump();
-            if (!temp.isValid() || !file.open(QIODevice::WriteOnly) || file.write(payload.data(), qint64(payload.size())) != qint64(payload.size())) {
-                annotationStatus_->setText(tr("Could not prepare fiber #%1.").arg(id));
-                return;
-            }
-            file.close();
             QString error;
-            std::vector<uint64_t> imported;
-            const bool importedOk = annotations_->importFibersFromPath(file.fileName().toStdString(), 1.0, &error, nullptr, nullptr, &imported);
-            if (rev != revision_ || token != annotationRevision_)
-                return;
-            if (!importedOk || imported.size() != 1) {
+            nativeId = annotations_->importFiberJson(result.value, filename.toStdString(), &error);
+            if (!nativeId) {
                 annotationStatus_->setText(error.isEmpty() ? tr("Could not open fiber #%1.").arg(id) : error);
                 return;
             }
-            nativeId = imported.front();
         }
         annotationStatus_->setText(tr("Building flattened views for fiber #%1…").arg(id));
         QString error;

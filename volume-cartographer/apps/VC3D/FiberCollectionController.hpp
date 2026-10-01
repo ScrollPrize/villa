@@ -68,8 +68,9 @@ private:
     QPushButton* next_{};
     QPushButton* openAnnotation_{};
     QPushButton* detach_{};
-    QString path_;
-    std::string uuid_;
+    QString path_, attachment_;
+    std::string uuid_, coordinateSpace_;
+    double sourceResolution_{};
     int64_t totalFibers_{};
     bool annotationBusy_{false};
     bool lineAnnotationActive_{false};
@@ -95,6 +96,7 @@ private:
     void finishAnnotationRequest();
     void watchAnnotationRender(class LineAnnotationDialog* dialog, int64_t id, uint64_t token);
     void projectChanged();
+    void volumeChanged();
     void listPage(bool reset);
     vc::fibers::FamilyFilter familyFilter() const;
     void selectFiber(int64_t id, bool focusView = true, bool openAnnotation = false);

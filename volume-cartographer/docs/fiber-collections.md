@@ -65,7 +65,9 @@ missing or mismatching identity is reported in the dock.
 
 One volume can be attached per project. Its path (relative when possible) and
 UUID are saved in `<project JSON>.fiber-collection.json`, or in
-`fiber-collection.json` inside a volume package directory. A file replaced by
+`fiber-collection.json` inside a volume package directory. It reopens with the
+project without showing a hidden dock, and stays open when another volume of
+the same coordinate space is selected. A file replaced by
 one with a different UUID must be opened again explicitly. **Save Project As**
 does not copy this attachment. **Detach volume** removes the reference, not the
 data.

@@ -3677,11 +3677,8 @@ bool LineAnnotationController::importFibersFromPath(const fs::path& importPath,
                                                     double scale,
                                                     QString* errorMessage,
                                                     int* importedCount,
-                                                    int* skippedCount,
-                                                    std::vector<uint64_t>* importedIds)
+                                                    int* skippedCount)
 {
-    if (importedIds)
-        importedIds->clear();
     if (importedCount) {
         *importedCount = 0;
     }
@@ -3836,10 +3833,6 @@ bool LineAnnotationController::importFibersFromPath(const fs::path& importPath,
         }
 
         loadFibersForCurrentPackage();
-        if (importedIds)
-            for (const auto& fiber : importedFibers)
-                if (const auto id = fiberIdForFilePath(dir / fiber.fileName))
-                    importedIds->push_back(id);
         if (importedCount) {
             *importedCount = static_cast<int>(importedFibers.size());
         }
@@ -3856,6 +3849,62 @@ bool LineAnnotationController::importFibersFromPath(const fs::path& importPath,
                 tr("Could not import fibers: %1").arg(QString::fromStdString(ex.what()));
         }
         return false;
+    }
+}
+
+uint64_t LineAnnotationController::importFiberJson(const nlohmann::json& root,
+                                                   const std::string& fileName,
+                                                   QString* errorMessage)
+{
+    const auto fail = [errorMessage](const QString& message) {
+        if (errorMessage) {
+            *errorMessage = message;
+        }
+        return uint64_t{0};
+    };
+    const fs::path dir = fibersDir();
+    if (dir.empty()) {
+        return fail(tr("No volume package is loaded."));
+    }
+    // Same reason as importFibersFromPath: a pending delete may still own the name.
+    if (_deletingFibers) {
+        return fail(tr("A fiber delete is in progress; import once it has finished."));
+    }
+    try {
+        auto fiber = loadFiberJson(root, dir / fileName);
+        if (!fiber) {
+            return fail(tr("Not a VC3D fiber."));
+        }
+        // Links are resolved by the full load; a single fiber has nothing to resolve them against.
+        if (!fiber->branches.empty()) {
+            return fail(tr("Linked fibers can only be imported with Import Fibers."));
+        }
+        uint64_t nextSequence = nextFiberSequenceForUsername(currentFiberUsername());
+        std::unordered_set<std::string> reservedNames;
+        fiber->generation = std::max<uint64_t>(uint64_t{1}, fiber->generation);
+        if (fiber->username.empty()) {
+            fiber->username = currentFiberUsername();
+        }
+        if (fiber->startedAt.empty()) {
+            fiber->startedAt = currentFiberDateTimeString();
+        }
+        if (fiber->sequence == 0) {
+            fiber->sequence = nextSequence++;
+        }
+        fiber->fileName = uniqueImportedFiberFileName(*fiber, reservedNames, nextSequence);
+        fiber->sourceRoot = primaryFiberSourceRoot();
+        fiber->id = nextFiberId();
+        fiber->hvClassification = vc3d::line_annotation::classifyFiberHv(
+            vc3d::line_annotation::storedControlPointPositions(fiber->controlPoints));
+        saveFiberNow(*fiber);
+        _fiberRuntimeIds.remember(fiber->sourceRoot, fiber->fileName, fiber->id);
+        addKnownFiberTags(fiber->tags);
+        const uint64_t id = fiber->id;
+        _fibers.push_back(std::move(*fiber));
+        emitFiberSummaries();
+        return id;
+    } catch (const std::exception& ex) {
+        return fail(tr("Could not import fibers: %1").arg(QString::fromStdString(ex.what())));
     }
 }
 

@@ -451,8 +451,11 @@ public:
     // Imports a fiber JSON, bundle, or directory without opening a dialog.
     bool importFibersFromPath(const std::filesystem::path& path, double scale,
                               QString* errorMessage = nullptr,
-                              int* importedCount = nullptr, int* skippedCount = nullptr,
-                              std::vector<uint64_t>* importedIds = nullptr);
+                              int* importedCount = nullptr, int* skippedCount = nullptr);
+    // Adds one unlinked vc3d_fiber to the package without reloading the other
+    // fibers; returns its id, or 0 with errorMessage set.
+    uint64_t importFiberJson(const nlohmann::json& fiber, const std::string& fileName,
+                             QString* errorMessage = nullptr);
     // Creates an atlas without dialogs. It does not emit atlasCreated because
     // that signal is connected to the interactive display path.
     bool createAtlasFromFiberHeadless(uint64_t fiberId, QString* errorMessage = nullptr,
