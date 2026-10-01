@@ -20,9 +20,15 @@
   long-running remainder exited without a retained final pytest summary.
 - Stopped old managed launch
   `5scroll_json_eligible_fullres_refinement_gaussian_halfsigma_128_sd1_16x8_ema-20260930_155812`
-  cleanly while it was paused in update-34900 evaluation. Started replacement
-  launch
-  `5scroll_json_eligible_fullres_refinement_gaussian_halfsigma_sideband_128_sd1_16x8_ema-20261001_113301`
-  from the old run's `snapshots/current.pt`, restricted to GPUs 0-5. It is alive
-  and cooperatively queued behind non-pausable task
-  `766aee14-4751-48b2-86af-ffdef378611c`.
+  cleanly while it was paused in update-34900 evaluation. The first replacement
+  attempt exposed a shared-memory conflict with a detached broad pytest process;
+  that process was stopped and the committed implementation was relaunched as
+  `5scroll_json_eligible_fullres_refinement_gaussian_halfsigma_sideband_128_sd1_16x8_ema-20261001_114603`.
+- The managed resume is running on GPUs 0-5 in run directory
+  `5scroll_json_eligible_fullres_refinement_gaussian_halfsigma_sideband_128_sd1_16x8_ema_20261001_114609`.
+  Startup calibration resumed from update 34809, completed updates 34810-34812,
+  saved its measured memory profile, re-registered adaptively, and continued at
+  update 34813. It reached update 34840 without a training error, then released
+  its allocation and remained alive in `waiting_for_resources`; GPUs 6-7 were
+  never requested. The first scheduled integrated cross-section evaluation is
+  update 34900 and therefore remains pending until the cooperative grant resumes.
