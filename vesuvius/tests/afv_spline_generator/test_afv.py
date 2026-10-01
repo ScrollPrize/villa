@@ -1,4 +1,5 @@
 import json
+import os
 import sqlite3
 
 import numpy as np
@@ -86,6 +87,17 @@ def test_never_replaces_an_existing_file(tmp_path):
         write_afv(path, [fiber("a", 3)], frame=FRAME, root=ROOT)
     assert path.read_bytes() == b"keep"
     assert [p.name for p in tmp_path.iterdir()] == ["fibers.afv"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows renames without replacing")
+def test_refuses_to_publish_without_hard_links(tmp_path, monkeypatch):
+    def no_hard_links(source, destination):
+        raise PermissionError("no hard links")
+
+    monkeypatch.setattr(os, "link", no_hard_links)
+    with pytest.raises(OSError, match="hard links"):
+        write_afv(tmp_path / "fibers.afv", [fiber("a", 3)], frame=FRAME, root=ROOT)
+    assert list(tmp_path.iterdir()) == []
 
 
 def invalid(change):

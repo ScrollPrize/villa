@@ -226,9 +226,15 @@ def load_model(model_folder: str, fold: Union[int, str] = 0, checkpoint_name: st
             checkpoint_name = alt_checkpoint_name
 
     # Flat exports, such as Hugging Face repositories, keep the checkpoint next to plans.json.
-    flat_checkpoint_file = os.path.join(model_path, checkpoint_name)
-    if not os.path.exists(checkpoint_file) and os.path.exists(flat_checkpoint_file):
-        checkpoint_file = flat_checkpoint_file
+    flat_names = [checkpoint_name]
+    if checkpoint_name == 'checkpoint_final.pth':
+        flat_names.append('checkpoint_best.pth')
+    for flat_name in flat_names:
+        flat_checkpoint_file = os.path.join(model_path, flat_name)
+        if not os.path.exists(checkpoint_file) and os.path.exists(flat_checkpoint_file):
+            checkpoint_file = flat_checkpoint_file
+            if flat_name != checkpoint_name and should_print:
+                print(f"WARNING: '{checkpoint_name}' not found; using '{flat_name}' instead.")
 
     if not os.path.exists(checkpoint_file):
         raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_file}")

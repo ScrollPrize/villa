@@ -77,11 +77,11 @@ def _publish(temporary: Path, destination: Path) -> None:
         os.link(temporary, destination)
     except FileExistsError:
         raise
-    except OSError:
+    except OSError as error:
         # Some file systems have no hard links. os.rename never replaces an
-        # existing file on Windows; elsewhere this check leaves only a race.
-        if destination.exists():
-            raise FileExistsError(destination) from None
+        # existing file on Windows; elsewhere it could replace a concurrent result.
+        if os.name != "nt":
+            raise OSError(f"{destination.parent} does not support hard links, needed to create {destination.name} safely") from error
         os.rename(temporary, destination)
     else:
         temporary.unlink()

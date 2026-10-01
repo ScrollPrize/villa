@@ -131,11 +131,11 @@ def test_initialize_network_uses_nnunet_factory(monkeypatch):
     )]
 
 
-@pytest.mark.parametrize('layout', ['fold', 'flat'])
-def test_load_model_finds_fold_and_flat_checkpoints(tmp_path, monkeypatch, layout):
+@pytest.mark.parametrize('relative', ['fold_0/checkpoint_final.pth', 'checkpoint_final.pth', 'checkpoint_best.pth'])
+def test_load_model_finds_fold_and_flat_checkpoints(tmp_path, monkeypatch, relative):
     (tmp_path / 'plans.json').write_text(json.dumps({'configurations': {}}))
     (tmp_path / 'dataset.json').write_text(json.dumps({'labels': {'background': 0}}))
-    checkpoint = tmp_path / 'fold_0' / 'checkpoint_final.pth' if layout == 'fold' else tmp_path / 'checkpoint_final.pth'
+    checkpoint = tmp_path / relative
     checkpoint.parent.mkdir(exist_ok=True)
     checkpoint.touch()
     loaded = []

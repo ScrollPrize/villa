@@ -34,7 +34,8 @@ volume is a downsampled version of the native scan, `--native-scale` is the
 number of native voxels per voxel of the volume (`2^level`). `--voxel-size`
 is the native voxel size in micrometres; it adds fiber lengths in
 millimetres. An existing output is never replaced, and the output appears
-only once it is complete.
+only once it is complete. On Linux and macOS, this needs an output folder
+whose file system supports hard links.
 
 | Option | Default | |
 | --- | --- | --- |
