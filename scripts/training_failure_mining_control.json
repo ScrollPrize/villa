@@ -1,1 +1,1 @@
-{"action":"start","devices":"0,1,2,3,4,5","evaluation_names":["lowres"],"cpu_cores":192}
+{"action":"reviewed_tta_sweep"}

@@ -1,5 +1,6 @@
 #include "vc/fiber_tracer/FiberTrace.hpp"
 #include "vc/fiber_tracer/FiberReferenceReplayCore.hpp"
+#include "vc/fiber_tracer/FiberReverseConsistency.hpp"
 #include "vc/fiber_tracer/PolylineGeometry.hpp"
 #include "vc/fiber_tracer/FiberJson.hpp"
 #include "vc/fiber_tracer/FiberLocalScoring.hpp"
@@ -4565,6 +4566,111 @@ FiberTraceWholeFiberResult traceWholeFiberMetric(
     return result;
 }
 
+double verifyFiberReverseSpan(const FiberPredictionSource& predictions,
+    const vc::lasagna::NormalSampler& normals, const FiberTraceConfig& config,
+    const PolylineArcGeometry& geometry, double startArc,
+    double normalRadiusBase, double tangentialRadiusBase)
+{
+    const auto start = samplePolylineArc(geometry, startArc);
+    double verifiedArc = startArc;
+    cv::Vec3d previous = start.point;
+    const double scale = config.traceToBaseScale;
+    try {
+        (void)traceFiberExtrapolation(predictions, start.point / scale,
+            -start.tangent, std::max(3.0 * startArc / scale,
+                2.0 * config.stepVoxels), config, &normals, {},
+            [&](const cv::Vec3d& tracePoint, double, int) {
+                const cv::Vec3d point = tracePoint * scale;
+                const double advance = cv::norm(point - previous);
+                if (!(advance > kEpsilon))
+                    return true;
+                previous = point;
+                // Restrict each match to a small monotone arc window, so
+                // a nearby fold cannot jump the validator along the line.
+                const auto projection = projectPointToPolylineArc(geometry,
+                    point, std::max(0.0, verifiedArc - 2.0 * advance), verifiedArc);
+                const auto measurement = measureFiberReplayThreshold(point,
+                    projection.point, normals, scale,
+                    normalRadiusBase,
+                    tangentialRadiusBase /
+                        normalRadiusBase);
+                if (fiberReplayThresholdExceeded(measurement,
+                        normalRadiusBase) ||
+                    !(projection.arc < verifiedArc - kEpsilon))
+                    return false;
+                verifiedArc = projection.arc;
+                return verifiedArc > kEpsilon;
+            });
+    } catch (const std::invalid_argument& error) {
+        // Same missing-start policy as reference replay. A reverse
+        // seed in a prediction hole is an immediate failed check;
+        // never hide configuration or other sampling failures.
+        if (std::string_view(error.what()) !=
+            "fiber trace start point has no valid prediction direction")
+            throw;
+    }
+    return verifiedArc;
+}
+
+std::optional<PolylineArcSample> findFiberReplayRestartSeed(
+    const FiberPredictionSource& predictions, const FiberReplayTraceRequest& request,
+    const vc::lasagna::NormalSampler& normalSampler, double normalWorkingToBaseScale,
+    const PolylineArcGeometry& reference, double fromArc, double endArcBase,
+    double nominalStepBase)
+{
+    const double grid = request.traceToBaseScale;
+    const double minDot = std::cos(25.0 * std::acos(-1.0) / 180.0);
+    for (double arc = fromArc; arc < endArcBase; arc += nominalStepBase) {
+        auto ref = samplePolylineArc(reference, arc);
+        const auto tangent = ref.tangent / cv::norm(ref.tangent);
+        const auto normal = normalSampler.sampleNormal(ref.point / normalWorkingToBaseScale);
+        cv::Vec3d u = normal.valid ? normal.normal : cv::Vec3d(0, 0, 1);
+        u -= tangent * u.dot(tangent);
+        if (cv::norm(u) < 1e-6) {
+            u = cv::Vec3d(0, 1, 0) - tangent * tangent[1];
+            if (cv::norm(u) < 1e-6) u = cv::Vec3d(1, 0, 0) - tangent * tangent[0];
+        }
+        u /= cv::norm(u);
+        const cv::Vec3d v = tangent.cross(u);
+        const auto sample = [&](const cv::Vec3d& point) {
+            FiberPredictionSampleOption best;
+            for (const auto& option : predictions.sample(point / grid, tangent).options)
+                if (option.valid && option.presence > best.presence) best = option;
+            return best;
+        };
+        std::optional<PolylineArcSample> chosen;
+        double bestDistance = std::numeric_limits<double>::infinity();
+        for (int i = -int(std::ceil(10 / grid)); i <= int(std::ceil(10 / grid)); ++i)
+            for (int j = -int(std::ceil(20 / grid)); j <= int(std::ceil(20 / grid)); ++j) {
+                const cv::Vec3d point = ref.point + grid * (i * u + j * v);
+                const auto distance = measureFiberReplayThreshold(point, ref.point,
+                    normalSampler, normalWorkingToBaseScale, 10, 2);
+                if (fiberReplayThresholdExceeded(distance, 10)) continue;
+                const auto value = sample(point);
+                cv::Vec3d dir(value.direction);
+                if (!value.valid || value.presence <= 0 || cv::norm(dir) <= kEpsilon) continue;
+                dir /= cv::norm(dir);
+                const double dot = dir.dot(tangent);
+                if (std::abs(dot) < minDot) continue;
+                bool peak = true, strict = false;
+                for (int a = -1; a <= 1; ++a) for (int b = -1; b <= 1; ++b) {
+                    if (!a && !b) continue;
+                    const double other = sample(point + grid * (a * u + b * v)).presence;
+                    if (other > value.presence) peak = false;
+                    if (other < value.presence) strict = true;
+                }
+                if (peak && strict && distance.thresholdErrorRatio < bestDistance) {
+                    bestDistance = distance.thresholdErrorRatio;
+                    chosen = ref;
+                    chosen->point = point;
+                    chosen->tangent = dot < 0 ? -dir : dir;
+                }
+            }
+        if (chosen) return chosen;
+    }
+    return std::nullopt;
+}
+
 static FiberReplayTraceResult traceFiberReplayImpl(
     const FiberPredictionSource& predictions,
     const FiberReplayTraceRequest& request,
@@ -4667,11 +4773,26 @@ static FiberReplayTraceResult traceFiberReplayImpl(
                 return std::string("invalid_initial_prediction");
             }
         };
+    ReplayConsistencyPolicy consistency;
+    consistency.intervalBase = request.config.replayReverseIntervalBase;
+    if (consistency.intervalBase > 0) {
+        consistency.verify = [&](const std::vector<cv::Vec3d>& points) {
+            const auto geometry = makePolylineArcGeometry(points);
+            auto config = request.config;
+            config.traceToBaseScale = request.traceToBaseScale;
+            return verifyFiberReverseSpan(predictions, normalSampler, config,
+                geometry, geometry.length(), 20.0, 40.0) <= kEpsilon;
+        };
+        consistency.nextSeed = [&](double fromArc) -> std::optional<PolylineArcSample> {
+            return findFiberReplayRestartSeed(predictions, request, normalSampler,
+                normalWorkingToBaseScale, reference, fromArc, endArcBase, nominalStepBase);
+        };
+    }
     return traceReferenceReplayCore(
         reference, startArcBase, endArcBase, nominalStepBase,
         request.config.maxStepFactor, request.errorThresholdBaseVoxels,
         request.excursionGraceBaseVoxels, request.tangentialThresholdFactor, request.matchRefineSteps, normalSampler, normalWorkingToBaseScale,
-        runSegment, progress, failureCallback);
+        runSegment, progress, failureCallback, consistency);
 }
 
 FiberReplayTraceResult traceFiberReplay(

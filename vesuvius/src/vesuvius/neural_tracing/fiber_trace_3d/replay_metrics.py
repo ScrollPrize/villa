@@ -175,4 +175,41 @@ def correct_summary(summary: dict) -> dict:
             stats[key] = new[key]
         if not new["directions"]:
             stats["mean_segment_length_mm"] = None
+    if any(case.get('reverse_checks', 0) for source in result['sources'] for case in source['cases']):
+        result['consistency'] = consistency_report(result)
     return result
+
+
+def consistency_report(summary):
+    """Separate GT failures from model consistency rejection; never credit gaps."""
+    rows = {}
+    for source in summary['sources']:
+        scale = source['summary']['base_voxel_size_um'] / 1000
+        cases = source['cases']
+        skipped = 0.0
+        for case in cases:
+            last = 0.0
+            length = case['reference_length_base_voxels']
+            for begin, detected, end in case.get('filtered_stops', []):
+                if not (last <= begin <= detected <= end <= length + 1e-7):
+                    raise ValueError('invalid/overlapping filtered interval')
+                skipped += (end - begin) * scale
+                last = end
+        reference = sum(c['reference_length_base_voxels'] for c in cases) * scale
+        retained = sum(c['traced_length_base_voxels'] for c in cases) * scale
+        if retained + skipped > reference + 1e-6:
+            raise ValueError('retained and skipped coverage overlap')
+        ordinary = sum(c['restart_count'] for c in cases)
+        filtered = sum(len(c.get('filtered_stops', [])) for c in cases)
+        rows[source['source_id']] = dict(ordinary_restarts=ordinary,
+            filtered_stops=filtered, reverse_checks=sum(c.get('reverse_checks', 0) for c in cases),
+            reference_mm=reference, retained_mm=retained, filtered_skipped_mm=skipped,
+            other_untraced_mm=max(0., reference-retained-skipped),
+            directions=len(cases))
+    total = {k: sum(r[k] for r in rows.values()) for k in next(iter(rows.values()))}
+    for row in [*rows.values(), total]:
+        row['retained_percent'] = 100 * row['retained_mm']/row['reference_mm'] if row['reference_mm'] else 0
+        row['mean_retained_mm_per_termination'] = row['retained_mm']/(row['ordinary_restarts']+row['filtered_stops']+row['directions'])
+    return dict(protocol='periodic-reverse256-20x40-reseed10x20-angle25-v1',
+                mean_note='retained distance / (ordinary restart episodes + filtered stops + directed runs); legacy means elsewhere count reference gaps',
+                scrolls=rows, combined=total)

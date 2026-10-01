@@ -1,4 +1,5 @@
 #include "vc/fiber_tracer/FiberletCropTrace.hpp"
+#include "vc/fiber_tracer/FiberReverseConsistency.hpp"
 
 #include "vc/core/io/PolylineObj.hpp"
 #include "vc/core/util/AtomicFile.hpp"
@@ -806,44 +807,9 @@ void verifyDenseCandidate(
         double startArc = geometry.length();
         while (startArc > kEpsilon) {
             ++candidate.reverseAttempts;
-            const auto start = samplePolylineArc(geometry, startArc);
-            double verifiedArc = startArc;
-            cv::Vec3d previous = start.point;
-            const double scale = denseConfig.traceToBaseScale;
-            try {
-                (void)traceFiberExtrapolation(predictions, start.point / scale,
-                    -start.tangent, std::max(3.0 * startArc / scale,
-                        2.0 * denseConfig.stepVoxels), denseConfig, &normals, {},
-                    [&](const cv::Vec3d& tracePoint, double, int) {
-                        const cv::Vec3d point = tracePoint * scale;
-                        const double advance = length(point - previous);
-                        if (!(advance > kEpsilon))
-                            return true;
-                        previous = point;
-                        // Restrict each match to a small monotone arc window, so
-                        // a nearby fold cannot jump the validator along the line.
-                        const auto projection = projectPointToPolylineArc(geometry,
-                            point, std::max(0.0, verifiedArc - 2.0 * advance), verifiedArc);
-                        const auto measurement = measureFiberReplayThreshold(point,
-                            projection.point, normals, scale,
-                            config.reverseNormalRadiusBaseVoxels,
-                            config.reverseTangentialRadiusBaseVoxels /
-                                config.reverseNormalRadiusBaseVoxels);
-                        if (fiberReplayThresholdExceeded(measurement,
-                                config.reverseNormalRadiusBaseVoxels) ||
-                            !(projection.arc < verifiedArc - kEpsilon))
-                            return false;
-                        verifiedArc = projection.arc;
-                        return verifiedArc > kEpsilon;
-                    });
-            } catch (const std::invalid_argument& error) {
-                // Same missing-start policy as reference replay. A reverse
-                // seed in a prediction hole is an immediate failed check;
-                // never hide configuration or other sampling failures.
-                if (std::string_view(error.what()) !=
-                    "fiber trace start point has no valid prediction direction")
-                    throw;
-            }
+            const double verifiedArc = verifyFiberReverseSpan(predictions, normals,
+                denseConfig, geometry, startArc, config.reverseNormalRadiusBaseVoxels,
+                config.reverseTangentialRadiusBaseVoxels);
             if (startArc - verifiedArc > kEpsilon)
                 intervals.push_back({verifiedArc, startArc});
             if (verifiedArc <= kEpsilon)

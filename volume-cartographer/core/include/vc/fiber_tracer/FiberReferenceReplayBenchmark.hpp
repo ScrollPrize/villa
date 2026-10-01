@@ -49,6 +49,8 @@ struct FiberReferenceReplayFailure {
 };
 
 struct FiberReferenceReplayOutcome {
+    std::vector<std::array<double, 3>> filteredStops;
+    size_t reverseChecks = 0;
     std::size_t sourceIndex = 0;
     std::size_t runIndex = 0;
     bool reverse = false;

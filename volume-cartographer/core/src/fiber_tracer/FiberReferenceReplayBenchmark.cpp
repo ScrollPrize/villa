@@ -242,7 +242,11 @@ FiberReferenceReplayOutcome measureFiberReferenceReplayOutcome(
     outcome.evaluatedThroughBaseVoxels = evaluatedLength(replayCase, replay);
     outcome.evaluationComplete = outcome.evaluatedThroughBaseVoxels >=
         replayCase.referenceLengthBaseVoxels - kEpsilon;
-    outcome.failureFree = replay.failures.empty();
+    outcome.failureFree = replay.failures.empty() && replay.filteredStops.empty();
+    outcome.filteredStops = replay.filteredStops;
+    for (auto& stop : outcome.filteredStops)
+        for (auto& arc : stop) arc -= replay.referenceBeginArcBase;
+    outcome.reverseChecks = replay.reverseChecks;
 
     std::vector<std::pair<double, double>> tracedIntervals;
     for (const auto& segment : replay.segments) {
@@ -428,6 +432,8 @@ nlohmann::json fiberReferenceReplayBenchmarkJson(
             });
         }
         cases.push_back({
+            {"filtered_stops", outcome.filteredStops},
+            {"reverse_checks", outcome.reverseChecks},
             {"source_index", outcome.sourceIndex},
             {"run_index", outcome.runIndex},
             {"direction", outcome.reverse ? "reverse" : "forward"},

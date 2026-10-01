@@ -3,6 +3,7 @@
 #include "../../apps/src/FiberLiveBridge.hpp"
 
 #include "vc/fiber_tracer/FiberTrace.hpp"
+#include "vc/fiber_tracer/FiberReverseConsistency.hpp"
 #include "vc/fiber_tracer/FiberEmbedding.hpp"
 #include "vc/fiber_tracer/FiberReplay.hpp"
 #include "vc/fiber_tracer/PolylineGeometry.hpp"
@@ -2645,4 +2646,52 @@ TEST_CASE("sample pooling max-pools or averages presence and weights direction b
     pooled = vc::fiber_tracer::testing::debugPoolPredictionSamples(empty, 3, config);
     CHECK_FALSE(pooled[0].options[0].valid);
     CHECK_THROWS(vc::fiber_tracer::testing::debugPoolPredictionSamples(expanded, 2, config));
+}
+
+TEST_CASE("Consistency restart requires transverse peak ellipse and unsigned alignment")
+{
+    using namespace vc::fiber_tracer;
+    class Peak final : public FiberPredictionSource {
+    public:
+        bool flat = false;
+        cv::Vec3f dir{-1,0,0};
+        double y = 1;
+        FiberPredictionSample sample(const cv::Vec3d& p, const cv::Vec3d&) const override {
+            FiberPredictionSample s;
+            const auto value = flat ? 1.0 : std::exp(-((p[1]-y)*(p[1]-y)+(p[2]-2)*(p[2]-2))/8);
+            s.options.push_back({dir, float(value), true});
+            return s;
+        }
+    } predictions;
+    ConstantNormalSampler normals;
+    FiberReplayTraceRequest request;
+    request.traceToBaseScale = 2;
+    const auto ref = makePolylineArcGeometry({{0,0,0},{100,0,0}});
+    const auto find = [&] { return findFiberReplayRestartSeed(predictions, request, normals, 2, ref, 20, 100, 8); };
+    auto seed = find();
+    REQUIRE(seed.has_value());
+    CHECK(seed->arc == 20);
+    CHECK(seed->point[1] == doctest::Approx(2));
+    CHECK(seed->point[2] == doctest::Approx(4));
+    CHECK(seed->tangent[0] == doctest::Approx(1));
+    predictions.flat = true;
+    CHECK_FALSE(find().has_value());
+    predictions.flat = false;
+    predictions.dir = {0,1,0};
+    CHECK_FALSE(find().has_value());
+    predictions.dir = {-1,0,0};
+    predictions.y = 10; // peak20 base voxels away exceeds normal radius10
+    CHECK_FALSE(find().has_value());
+}
+
+TEST_CASE("Periodic native reverse verifier accepts straight paths without changing forward geometry")
+{
+    using namespace vc::fiber_tracer;
+    StraightPrediction predictions;
+    ConstantNormalSampler normals;
+    FiberTraceConfig config;
+    config.traceToBaseScale = 1;
+    config.stepVoxels = 4;
+    const auto geometry = makePolylineArcGeometry({{0,0,0},{100,0,0}});
+    CHECK(verifyFiberReverseSpan(predictions, normals, config, geometry, 100, 20, 40) == doctest::Approx(0));
 }

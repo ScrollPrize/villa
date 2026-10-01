@@ -1,0 +1,190 @@
+[
+  {
+    "model": "gaussian",
+    "baseline_failures": 32,
+    "baseline_by_scroll": {
+      "PHerc0139": 12,
+      "PHerc0332": 0,
+      "PHerc1299": 4,
+      "PHerc1451": 0,
+      "PHercParis4": 16
+    },
+    "consistency": {
+      "combined": {
+        "directions": 182,
+        "filtered_skipped_mm": 37.5082343161496,
+        "filtered_stops": 62,
+        "mean_retained_mm_per_termination": 5.26816118324976,
+        "ordinary_restarts": 12,
+        "other_untraced_mm": 0.018108137281949155,
+        "reference_mm": 1386.1756053653703,
+        "retained_mm": 1348.6492629119386,
+        "retained_percent": 97.292814683206,
+        "reverse_checks": 2319
+      },
+      "mean_note": "retained distance / (ordinary restart episodes + filtered stops + directed runs); legacy means elsewhere count reference gaps",
+      "protocol": "periodic-reverse256-20x40-reseed10x20-angle25-v1",
+      "scrolls": {
+        "PHerc0139": {
+          "directions": 44,
+          "filtered_skipped_mm": 11.717603790075822,
+          "filtered_stops": 20,
+          "mean_retained_mm_per_termination": 4.022119144228157,
+          "ordinary_restarts": 4,
+          "other_untraced_mm": 1.758593271006248e-13,
+          "reference_mm": 285.2217055975907,
+          "retained_mm": 273.5041018075147,
+          "retained_percent": 95.89175593578143,
+          "reverse_checks": 482
+        },
+        "PHerc0332": {
+          "directions": 2,
+          "filtered_skipped_mm": 0,
+          "filtered_stops": 0,
+          "mean_retained_mm_per_termination": 5.564350473632644,
+          "ordinary_restarts": 0,
+          "other_untraced_mm": 7.105427357601002e-15,
+          "reference_mm": 11.128700947265296,
+          "retained_mm": 11.128700947265289,
+          "retained_percent": 99.99999999999993,
+          "reverse_checks": 20
+        },
+        "PHerc1299": {
+          "directions": 22,
+          "filtered_skipped_mm": 6.3327783154125985,
+          "filtered_stops": 10,
+          "mean_retained_mm_per_termination": 3.81336264954064,
+          "ordinary_restarts": 5,
+          "other_untraced_mm": 6.927791673660977e-14,
+          "reference_mm": 147.42719634841635,
+          "retained_mm": 141.09441803300368,
+          "retained_percent": 95.70447076776368,
+          "reverse_checks": 246
+        },
+        "PHerc1451": {
+          "directions": 2,
+          "filtered_skipped_mm": 0,
+          "filtered_stops": 0,
+          "mean_retained_mm_per_termination": 5.247877619851578,
+          "ordinary_restarts": 0,
+          "other_untraced_mm": 0,
+          "reference_mm": 10.495755239703156,
+          "retained_mm": 10.495755239703156,
+          "retained_percent": 100,
+          "reverse_checks": 18
+        },
+        "PHercParis4": {
+          "directions": 112,
+          "filtered_skipped_mm": 19.457852210661176,
+          "filtered_stops": 32,
+          "mean_retained_mm_per_termination": 6.206981543431645,
+          "ordinary_restarts": 3,
+          "other_untraced_mm": 0.018108137281696912,
+          "reference_mm": 931.9022472323948,
+          "retained_mm": 912.4262868844519,
+          "retained_percent": 97.9100854831305,
+          "reverse_checks": 1553
+        }
+      }
+    },
+    "cases": 182,
+    "infra": [],
+    "coordinator_seconds": 76.24640333201387,
+    "native_seconds": 65.301994093,
+    "tiles": 863
+  },
+  {
+    "model": "lowres",
+    "baseline_failures": 29,
+    "baseline_by_scroll": {
+      "PHerc0139": 10,
+      "PHerc0332": 0,
+      "PHerc1299": 4,
+      "PHerc1451": 0,
+      "PHercParis4": 15
+    },
+    "consistency": {
+      "combined": {
+        "directions": 182,
+        "filtered_skipped_mm": 31.849864590620204,
+        "filtered_stops": 51,
+        "mean_retained_mm_per_termination": 5.460990890220764,
+        "ordinary_restarts": 15,
+        "other_untraced_mm": 6.301625887772389e-13,
+        "reference_mm": 1386.1756053653703,
+        "retained_mm": 1354.3257407747494,
+        "retained_percent": 97.7023210863514,
+        "reverse_checks": 2301
+      },
+      "mean_note": "retained distance / (ordinary restart episodes + filtered stops + directed runs); legacy means elsewhere count reference gaps",
+      "protocol": "periodic-reverse256-20x40-reseed10x20-angle25-v1",
+      "scrolls": {
+        "PHerc0139": {
+          "directions": 44,
+          "filtered_skipped_mm": 13.58891040741963,
+          "filtered_stops": 22,
+          "mean_retained_mm_per_termination": 3.8258140167629704,
+          "ordinary_restarts": 5,
+          "other_untraced_mm": 1.723066134218243e-13,
+          "reference_mm": 285.2217055975907,
+          "retained_mm": 271.6327951901709,
+          "retained_percent": 95.23566750330288,
+          "reverse_checks": 482
+        },
+        "PHerc0332": {
+          "directions": 2,
+          "filtered_skipped_mm": 0,
+          "filtered_stops": 0,
+          "mean_retained_mm_per_termination": 5.564350473632644,
+          "ordinary_restarts": 0,
+          "other_untraced_mm": 7.105427357601002e-15,
+          "reference_mm": 11.128700947265296,
+          "retained_mm": 11.128700947265289,
+          "retained_percent": 99.99999999999993,
+          "reverse_checks": 18
+        },
+        "PHerc1299": {
+          "directions": 22,
+          "filtered_skipped_mm": 0.6366073635435545,
+          "filtered_stops": 1,
+          "mean_retained_mm_per_termination": 5.4366884809212115,
+          "ordinary_restarts": 4,
+          "other_untraced_mm": 9.192646643896296e-14,
+          "reference_mm": 147.42719634841635,
+          "retained_mm": 146.7905889848727,
+          "retained_percent": 99.56818865222185,
+          "reverse_checks": 244
+        },
+        "PHerc1451": {
+          "directions": 2,
+          "filtered_skipped_mm": 0,
+          "filtered_stops": 0,
+          "mean_retained_mm_per_termination": 5.247877619851578,
+          "ordinary_restarts": 0,
+          "other_untraced_mm": 0,
+          "reference_mm": 10.495755239703156,
+          "retained_mm": 10.495755239703156,
+          "retained_percent": 100,
+          "reverse_checks": 18
+        },
+        "PHercParis4": {
+          "directions": 112,
+          "filtered_skipped_mm": 17.624346819657017,
+          "filtered_stops": 28,
+          "mean_retained_mm_per_termination": 6.262177400087243,
+          "ordinary_restarts": 6,
+          "other_untraced_mm": 3.588240815588506e-13,
+          "reference_mm": 931.9022472323948,
+          "retained_mm": 914.2779004127374,
+          "retained_percent": 98.10877730234057,
+          "reverse_checks": 1539
+        }
+      }
+    },
+    "cases": 182,
+    "infra": [],
+    "coordinator_seconds": 33.92658121700515,
+    "native_seconds": 23.288579226,
+    "tiles": 0
+  }
+]

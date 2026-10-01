@@ -1270,6 +1270,13 @@ void validateNativeReplayStructure(const FiberReplayTraceResult& replay)
         !inInterval(replay.completedReferenceArcBase, begin, end))
         throw std::invalid_argument("invalid native replay interval/progress");
     double previousEnd = begin;
+    double previousFilteredEnd = begin;
+    for (const auto& stop : replay.filteredStops) {
+        if (!inInterval(stop[0], previousFilteredEnd, end) ||
+            !inInterval(stop[1], stop[0], end) || !inInterval(stop[2], stop[1], end))
+            throw std::invalid_argument("invalid filtered replay interval");
+        previousFilteredEnd = stop[2];
+    }
     for (const auto& segment : replay.segments) {
         if (!inInterval(segment.startReferenceArcBase, previousEnd, end) ||
             !inInterval(segment.endReferenceArcBase, segment.startReferenceArcBase, end) ||
@@ -1487,6 +1494,8 @@ nlohmann::json greedyReplayJson(
 {
     nlohmann::json root = {
         {"format", "vc_greedy_fiber_replay"},
+        {"filtered_stops", replay.filteredStops},
+        {"reverse_checks", replay.reverseChecks},
         {"version", 2},
         {"reference_begin_arc_base", replay.referenceBeginArcBase},
         {"reference_end_arc_base", replay.referenceEndArcBase},
@@ -2931,6 +2940,8 @@ FiberReplayTraceResult fiberReplayTraceFromJson(const nlohmann::json& document)
         return m;
     };
     FiberReplayTraceResult replay;
+    replay.filteredStops = document.value("filtered_stops", std::vector<std::array<double, 3>>{});
+    replay.reverseChecks = document.value("reverse_checks", size_t(0));
     replay.geometryBackend = document.value("geometry_backend", std::string{});
     replay.graphGeometry = replay.geometryBackend == "fiberlet";
     replay.tangentialThresholdFactor = factor;

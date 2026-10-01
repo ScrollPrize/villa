@@ -229,10 +229,10 @@ def parse_vc3d_fiber_format(
     if not isinstance(version, int) or isinstance(version, bool) or version not in {1, 3, 4}:
         raise ValueError(f"only vc3d_fiber versions 1, 3 and 4 are supported, got {version!r}")
     if version in {3, 4} and "type" not in obj:
-        raise ValueError("version-3/4 vc3d_fiber is missing type")
+        raise ValueError("version-3 vc3d_fiber is missing type")
 
     if version in {3, 4} and "optimization_mode" not in obj:
-        raise ValueError("version-3/4 vc3d_fiber is missing optimization_mode")
+        raise ValueError("version-3 vc3d_fiber is missing optimization_mode")
     optimization_mode = obj.get("optimization_mode", "lasagna")
     if not isinstance(optimization_mode, str) or optimization_mode not in {
         "lasagna", "native_fiber_trace3d"
@@ -253,9 +253,9 @@ def parse_vc3d_fiber_format(
             if not isinstance(control, dict) or not set(control) <= {
                 "position", "segment_to_next", "direction", "display_normal", "display_normal_source"
             }:
-                raise ValueError("version-3/4 control point contains unknown fields")
-            # Editor hints do not replace the stored reference polyline or its
-            # segment eligibility metadata. Validate, but do not apply them.
+                raise ValueError("version-3 control point contains unknown fields")
+            # Optional editor hints do not replace the stored reference polyline
+            # or its segment eligibility metadata. Validate, but do not apply.
             for key in ("direction", "display_normal"):
                 if key in control:
                     _points([control[key]], label=f"control point {key}")

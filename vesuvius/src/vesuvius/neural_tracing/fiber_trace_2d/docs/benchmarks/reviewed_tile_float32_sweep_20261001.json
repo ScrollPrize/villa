@@ -1,0 +1,873 @@
+{
+  "baselines": {
+    "off": {
+      "batch_sizes": [
+        1,
+        1,
+        1,
+        1
+      ],
+      "model_output_dtypes": [
+        "torch.float32"
+      ]
+    }
+  },
+  "checkpoint": "/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v3/halfsigma_current_raw_v3/frozen/live_inference/_models/ffd7aff24441e82e53b5f3fef69ab19d24a7b632e1dee4dac6487401694d244d/snapshot.pt",
+  "checkpoint_sha256": "ffd7aff24441e82e53b5f3fef69ab19d24a7b632e1dee4dac6487401694d244d",
+  "completed": true,
+  "cuda_version": "12.8",
+  "flags": {
+    "cudnn_allow_tf32": true,
+    "cudnn_benchmark": false,
+    "cudnn_deterministic": false,
+    "deterministic_algorithms": false,
+    "matmul_allow_tf32": false
+  },
+  "gpu": "NVIDIA H100 80GB HBM3",
+  "inputs": [
+    {
+      "input_dtype": "uint8",
+      "input_level": 1,
+      "input_sha256": "5160f370b9fdf60ffb04a53e3362bec54505bf68e629f68bc9703fc245907ff3",
+      "input_shape": [
+        256,
+        256,
+        256
+      ],
+      "input_start_zyx": [
+        17248,
+        3968,
+        8128
+      ],
+      "normalized_sha256": "e4b0964c47f3a2d42700542c25dae75ef3921c67625812385af6fcb1970ed254",
+      "probe_base_xyz": [
+        16659.91015625,
+        8288.6904296875,
+        34716.62109375
+      ],
+      "source": "PHercParis4",
+      "source_to_base": 2,
+      "tile_zyx": [
+        17280,
+        4000,
+        8160
+      ]
+    },
+    {
+      "input_dtype": "uint8",
+      "input_level": 1,
+      "input_sha256": "93528f780897565b61acf78a517e1b698873e8fcdb8f31d0b791a01cb4e51ec5",
+      "input_shape": [
+        256,
+        256,
+        256
+      ],
+      "input_start_zyx": [
+        26368,
+        6688,
+        5088
+      ],
+      "normalized_sha256": "6a0b174d6b2341401f460935cf9fd071175643b53a36070489e6611e09422d31",
+      "probe_base_xyz": [
+        10422.154296875,
+        13791.169921875,
+        52847.34765625
+      ],
+      "source": "PHercParis4",
+      "source_to_base": 2,
+      "tile_zyx": [
+        26400,
+        6720,
+        5120
+      ]
+    },
+    {
+      "input_dtype": "uint8",
+      "input_level": 1,
+      "input_sha256": "fbcdf4b6bd542012c06ca3ac702eaf3ff2c667ce3e92d15beb04549c316ec2cb",
+      "input_shape": [
+        256,
+        256,
+        256
+      ],
+      "input_start_zyx": [
+        22528,
+        7008,
+        9248
+      ],
+      "normalized_sha256": "76bb5f969fd7600b68471e1d0285aa0c47ba05cb5185a5447bac434388c6fed5",
+      "probe_base_xyz": [
+        18808.806640625,
+        14414.2451171875,
+        45236.375
+      ],
+      "source": "PHerc0139",
+      "source_to_base": 2,
+      "tile_zyx": [
+        22560,
+        7040,
+        9280
+      ]
+    },
+    {
+      "input_dtype": "uint8",
+      "input_level": 1,
+      "input_sha256": "576e6f03db761687a2d2489efd8f348a1c57efeca784f17232b7d3d7ef7385ff",
+      "input_shape": [
+        256,
+        256,
+        256
+      ],
+      "input_start_zyx": [
+        5408,
+        5248,
+        8448
+      ],
+      "normalized_sha256": "0c64193c0fa05400f35e884d82953ac4c36219bbe371740fd9a9530ac69f1011",
+      "probe_base_xyz": [
+        17109.6328125,
+        10644.4814453125,
+        11206.9765625
+      ],
+      "source": "PHerc0139",
+      "source_to_base": 2,
+      "tile_zyx": [
+        5440,
+        5280,
+        8480
+      ]
+    }
+  ],
+  "note": "No blending/accumulation. Same GPU/process/model/input tensors; four selected tiles, full output including borders. nx/ny comparisons include nonlinear direction reconstruction, not just rounding.",
+  "rows": [
+    {
+      "batch_sizes": [
+        1,
+        1,
+        1,
+        1
+      ],
+      "kind": "same_precision",
+      "mode": "off",
+      "model_output_dtypes": [
+        "torch.float32"
+      ],
+      "name": "repeat1",
+      "presence_rounding": {
+        "changed_values": 0,
+        "mean_distance_to_rounding_boundary_bytes": 0,
+        "mean_raw_delta_at_changed_bytes": 0,
+        "raw_equal_but_byte_changed": 0
+      },
+      "raw": {
+        "0": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "1": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "2": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "3": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "4": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "5": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "6": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        }
+      },
+      "rounded": {
+        "nx": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "ny": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "presence": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        }
+      },
+      "wall_seconds": 16.35214400899713
+    },
+    {
+      "batch_sizes": [
+        1,
+        1,
+        1,
+        1
+      ],
+      "kind": "same_precision",
+      "mode": "off",
+      "model_output_dtypes": [
+        "torch.float32"
+      ],
+      "name": "repeat2",
+      "presence_rounding": {
+        "changed_values": 0,
+        "mean_distance_to_rounding_boundary_bytes": 0,
+        "mean_raw_delta_at_changed_bytes": 0,
+        "raw_equal_but_byte_changed": 0
+      },
+      "raw": {
+        "0": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "1": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "2": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "3": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "4": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "5": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "6": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        }
+      },
+      "rounded": {
+        "nx": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "ny": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "presence": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        }
+      },
+      "wall_seconds": 16.575030206004158
+    },
+    {
+      "batch_sizes": [
+        2,
+        2
+      ],
+      "kind": "same_precision",
+      "mode": "off",
+      "model_output_dtypes": [
+        "torch.float32"
+      ],
+      "name": "batch2",
+      "presence_rounding": {
+        "changed_values": 305347,
+        "mean_distance_to_rounding_boundary_bytes": 0.010513301007449627,
+        "mean_raw_delta_at_changed_bytes": 0.00008249746315414086,
+        "raw_equal_but_byte_changed": 0
+      },
+      "raw": {
+        "0": {
+          "changed_percent": 99.98586177825928,
+          "mae": 0.00014749222841236882,
+          "max": 0.00145035982131958,
+          "nonfinite": 0,
+          "rmse": 0.0001999085040748645,
+          "values": 67108864
+        },
+        "1": {
+          "changed_percent": 99.99080747365952,
+          "mae": 0.00019361135595277398,
+          "max": 0.0021976232528686523,
+          "nonfinite": 0,
+          "rmse": 0.0002550242237457132,
+          "values": 67108864
+        },
+        "2": {
+          "changed_percent": 99.98365044593811,
+          "mae": 0.00018059825422311188,
+          "max": 0.0023283958435058594,
+          "nonfinite": 0,
+          "rmse": 0.00024787834205314827,
+          "values": 67108864
+        },
+        "3": {
+          "changed_percent": 99.99060928821564,
+          "mae": 0.00020650215415822515,
+          "max": 0.002401679754257202,
+          "nonfinite": 0,
+          "rmse": 0.00027160761277844397,
+          "values": 67108864
+        },
+        "4": {
+          "changed_percent": 99.98928904533386,
+          "mae": 0.00020264282330097194,
+          "max": 0.0013499855995178223,
+          "nonfinite": 0,
+          "rmse": 0.00025975173312910404,
+          "values": 67108864
+        },
+        "5": {
+          "changed_percent": 99.9857097864151,
+          "mae": 0.00023267460451564803,
+          "max": 0.001820683479309082,
+          "nonfinite": 0,
+          "rmse": 0.0002991549651940064,
+          "values": 67108864
+        },
+        "6": {
+          "changed_percent": 99.98674988746643,
+          "mae": 0.000017711009914738437,
+          "max": 0.0006712973117828369,
+          "nonfinite": 0,
+          "rmse": 0.000038292875209099216,
+          "values": 67108864
+        }
+      },
+      "rounded": {
+        "nx": {
+          "changed_percent": 4.2339712381362915,
+          "mae": 0.13789485394954681,
+          "max": 254,
+          "nonfinite": 0,
+          "rmse": 4.1985088812946625,
+          "values": 67108864
+        },
+        "ny": {
+          "changed_percent": 3.1975671648979187,
+          "mae": 0.11757025122642517,
+          "max": 254,
+          "nonfinite": 0,
+          "rmse": 3.9518748519308606,
+          "values": 67108864
+        },
+        "presence": {
+          "changed_percent": 0.45500248670578003,
+          "mae": 0.0045500248670578,
+          "max": 1,
+          "nonfinite": 0,
+          "rmse": 0.06745387214280438,
+          "values": 67108864
+        }
+      },
+      "wall_seconds": 15.926376527000684
+    },
+    {
+      "batch_sizes": [
+        3,
+        1
+      ],
+      "kind": "same_precision",
+      "mode": "off",
+      "model_output_dtypes": [
+        "torch.float32"
+      ],
+      "name": "batch3",
+      "presence_rounding": {
+        "changed_values": 218274,
+        "mean_distance_to_rounding_boundary_bytes": 0.010385129600763321,
+        "mean_raw_delta_at_changed_bytes": 0.00008153035741997883,
+        "raw_equal_but_byte_changed": 0
+      },
+      "raw": {
+        "0": {
+          "changed_percent": 74.98929053544998,
+          "mae": 0.00011099681131403541,
+          "max": 0.00145035982131958,
+          "nonfinite": 0,
+          "rmse": 0.00017424315487264892,
+          "values": 67108864
+        },
+        "1": {
+          "changed_percent": 74.99310076236725,
+          "mae": 0.00014631706482567258,
+          "max": 0.0021976232528686523,
+          "nonfinite": 0,
+          "rmse": 0.00022354512852640327,
+          "values": 67108864
+        },
+        "2": {
+          "changed_percent": 74.98879581689835,
+          "mae": 0.0001411125792359219,
+          "max": 0.0023283958435058594,
+          "nonfinite": 0,
+          "rmse": 0.00022007057713582432,
+          "values": 67108864
+        },
+        "3": {
+          "changed_percent": 74.9930202960968,
+          "mae": 0.00015735200290543927,
+          "max": 0.0023967325687408447,
+          "nonfinite": 0,
+          "rmse": 0.0002384284260724947,
+          "values": 67108864
+        },
+        "4": {
+          "changed_percent": 74.99192208051682,
+          "mae": 0.00015540581608494697,
+          "max": 0.0013499855995178223,
+          "nonfinite": 0,
+          "rmse": 0.00022860269514820737,
+          "values": 67108864
+        },
+        "5": {
+          "changed_percent": 74.98869150876999,
+          "mae": 0.0001757126859035854,
+          "max": 0.001820683479309082,
+          "nonfinite": 0,
+          "rmse": 0.0002621537060014066,
+          "values": 67108864
+        },
+        "6": {
+          "changed_percent": 74.98997449874878,
+          "mae": 0.000012638477202083511,
+          "max": 0.0006402134895324707,
+          "nonfinite": 0,
+          "rmse": 0.00003218664205611472,
+          "values": 67108864
+        }
+      },
+      "rounded": {
+        "nx": {
+          "changed_percent": 3.3504679799079895,
+          "mae": 0.10163725912570953,
+          "max": 254,
+          "nonfinite": 0,
+          "rmse": 3.4745691156654916,
+          "values": 67108864
+        },
+        "ny": {
+          "changed_percent": 2.349559962749481,
+          "mae": 0.09052245318889618,
+          "max": 254,
+          "nonfinite": 0,
+          "rmse": 3.5525340526574216,
+          "values": 67108864
+        },
+        "presence": {
+          "changed_percent": 0.32525360584259033,
+          "mae": 0.0032525360584259033,
+          "max": 1,
+          "nonfinite": 0,
+          "rmse": 0.05703100962130956,
+          "values": 67108864
+        }
+      },
+      "wall_seconds": 16.24220180802513
+    },
+    {
+      "batch_sizes": [
+        4
+      ],
+      "kind": "same_precision",
+      "mode": "off",
+      "model_output_dtypes": [
+        "torch.float32"
+      ],
+      "name": "batch4",
+      "presence_rounding": {
+        "changed_values": 310832,
+        "mean_distance_to_rounding_boundary_bytes": 0.010625268332660198,
+        "mean_raw_delta_at_changed_bytes": 0.00008338462794199586,
+        "raw_equal_but_byte_changed": 0
+      },
+      "raw": {
+        "0": {
+          "changed_percent": 99.9855324625969,
+          "mae": 0.00014761760901485163,
+          "max": 0.0014414787292480469,
+          "nonfinite": 0,
+          "rmse": 0.00020016877283455088,
+          "values": 67108864
+        },
+        "1": {
+          "changed_percent": 99.990613758564,
+          "mae": 0.00018904133855180381,
+          "max": 0.0020763278007507324,
+          "nonfinite": 0,
+          "rmse": 0.00024859980570777357,
+          "values": 67108864
+        },
+        "2": {
+          "changed_percent": 99.98339116573334,
+          "mae": 0.00017960706281560518,
+          "max": 0.0023894906044006348,
+          "nonfinite": 0,
+          "rmse": 0.0002453202373703401,
+          "values": 67108864
+        },
+        "3": {
+          "changed_percent": 99.9903216958046,
+          "mae": 0.00020258401901837586,
+          "max": 0.0023835599422454834,
+          "nonfinite": 0,
+          "rmse": 0.0002650964832719862,
+          "values": 67108864
+        },
+        "4": {
+          "changed_percent": 99.98888671398163,
+          "mae": 0.00019948838079540676,
+          "max": 0.0013818144798278809,
+          "nonfinite": 0,
+          "rmse": 0.0002563929342516304,
+          "values": 67108864
+        },
+        "5": {
+          "changed_percent": 99.98461604118347,
+          "mae": 0.0002254060669684213,
+          "max": 0.0017800331115722656,
+          "nonfinite": 0,
+          "rmse": 0.000290913644324599,
+          "values": 67108864
+        },
+        "6": {
+          "changed_percent": 99.98689591884613,
+          "mae": 0.000018027879814603383,
+          "max": 0.0006355345249176025,
+          "nonfinite": 0,
+          "rmse": 0.00003885271336588249,
+          "values": 67108864
+        }
+      },
+      "rounded": {
+        "nx": {
+          "changed_percent": 4.106351733207703,
+          "mae": 0.13561448454856873,
+          "max": 254,
+          "nonfinite": 0,
+          "rmse": 4.1914127346248184,
+          "values": 67108864
+        },
+        "ny": {
+          "changed_percent": 3.1297877430915833,
+          "mae": 0.11414705216884613,
+          "max": 254,
+          "nonfinite": 0,
+          "rmse": 3.8761171626364495,
+          "values": 67108864
+        },
+        "presence": {
+          "changed_percent": 0.46317577362060547,
+          "mae": 0.004631757736206055,
+          "max": 1,
+          "nonfinite": 0,
+          "rmse": 0.06805701827296032,
+          "values": 67108864
+        }
+      },
+      "wall_seconds": 16.09756959101651
+    },
+    {
+      "batch_sizes": [
+        1,
+        1,
+        1,
+        1
+      ],
+      "kind": "same_precision",
+      "mode": "off",
+      "model_output_dtypes": [
+        "torch.float32"
+      ],
+      "name": "reverse_batch1",
+      "presence_rounding": {
+        "changed_values": 0,
+        "mean_distance_to_rounding_boundary_bytes": 0,
+        "mean_raw_delta_at_changed_bytes": 0,
+        "raw_equal_but_byte_changed": 0
+      },
+      "raw": {
+        "0": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "1": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "2": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "3": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "4": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "5": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "6": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        }
+      },
+      "rounded": {
+        "nx": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "ny": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "presence": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        }
+      },
+      "wall_seconds": 16.68091111400281
+    },
+    {
+      "batch_sizes": [
+        1,
+        1,
+        1,
+        1
+      ],
+      "kind": "same_precision",
+      "mode": "off",
+      "model_output_dtypes": [
+        "torch.float32"
+      ],
+      "name": "repeat_after_shapes",
+      "presence_rounding": {
+        "changed_values": 0,
+        "mean_distance_to_rounding_boundary_bytes": 0,
+        "mean_raw_delta_at_changed_bytes": 0,
+        "raw_equal_but_byte_changed": 0
+      },
+      "raw": {
+        "0": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "1": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "2": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "3": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "4": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "5": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "6": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        }
+      },
+      "rounded": {
+        "nx": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "ny": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        },
+        "presence": {
+          "changed_percent": 0,
+          "mae": 0,
+          "max": 0,
+          "nonfinite": 0,
+          "rmse": 0,
+          "values": 67108864
+        }
+      },
+      "wall_seconds": 16.782267950009555
+    }
+  ],
+  "torch_version": "2.11.0+cu128"
+}

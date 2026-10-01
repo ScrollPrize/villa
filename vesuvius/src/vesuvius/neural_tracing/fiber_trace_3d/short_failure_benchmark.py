@@ -1021,8 +1021,11 @@ def _fill_union_corridor(workload, fill, required_by_root, output):
     print(json.dumps({'coverage_fill_complete': result}), flush=True)
 
 
-def _export_channel_subset(source_root, destination, keys, channels, *, chunk_mode='copy'):
-    """Copy Zarr metadata and only selected level-1 chunks for inspection."""
+def _export_channel_subset(source_root, destination, keys, channels, *, chunk_mode='copy', level=1):
+    """Copy Zarr metadata and selected chunks at one level for inspection."""
+    level = int(level)
+    if level < 0:
+        raise ValueError('level must be nonnegative')
     source_root, destination = Path(source_root), Path(destination)
     if chunk_mode not in ('copy', 'symlink'):
         raise ValueError('chunk_mode must be copy or symlink')
@@ -1034,7 +1037,7 @@ def _export_channel_subset(source_root, destination, keys, channels, *, chunk_mo
         for metadata in source.glob('*'):
             if metadata.name in ('.zarray', '.zattrs', '.zgroup', '.zmetadata') and metadata.is_file():
                 shutil.copy2(metadata, target / metadata.name)
-        source_level, target_level = source / '1', target / '1'
+        source_level, target_level = source / str(level), target / str(level)
         target_level.mkdir(exist_ok=True)
         for metadata in source_level.glob('*'):
             if metadata.name in ('.zarray', '.zattrs', '.zgroup', '.zmetadata') and metadata.is_file():
@@ -1055,7 +1058,7 @@ def _export_channel_subset(source_root, destination, keys, channels, *, chunk_mo
                 pass
     atomic_write(destination / 'subset_manifest.json', {
         'version': 1, 'source_root': str(source_root),
-        'level': 1, 'channels': list(channels),
+        'level': level, 'channels': list(channels),
         'chunk_count': len(keys),
         'chunk_mode': chunk_mode,
     }, durable=False)

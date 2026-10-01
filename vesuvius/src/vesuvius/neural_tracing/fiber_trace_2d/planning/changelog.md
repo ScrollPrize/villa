@@ -3412,3 +3412,22 @@ identity remains unconfirmed. Global-assignment experiments not yet implemented.
   32-piece/64-direction regression cohort. Ordinary training tests and the
   optimized live-inference/native trace test now use the same SHA-validated
   subset and report directional restart counts plus implied mean lengths.
+
+## 2026-09-30 — Reviewed-reference three-model tracing comparison
+
+- Froze 91 reviewed annotations from the 2026-09-30 cohort and reused the
+  fast beam/on-demand inference benchmark: 97 eligible runs/194 directions and
+  686.127 mm reference length; one all-Lasagna annotation was excluded.
+- Lowres 212757 best EMA999: 28 restarts/47.319 mm; previous fullres 213753:
+  30/44.266 mm; Gaussian u17700: 32/41.583 mm. No infrastructure failures.
+- Shared readers accept reviewed v4 object control points and validated editor
+  hints without changing reference geometry. Full provenance is in
+  `docs/benchmarks/reviewed_fibers_20260930.*`.
+
+## 2026-09-30 — Corrected approved-reference rerun
+
+- All 91 reference annotations are approved with zero Lasagna spans: 91 pieces,
+  182 directions, and 693.088 mm reference length.
+- With the same models/cache/protocol on GPUs 0-5: lowres 29 restarts/46.206 mm,
+  previous fullres 36/37.464 mm, and Gaussian u17700 32/42.005 mm. Exact results
+  are in `docs/benchmarks/reviewed_fibers_corrected_20260930.*`.

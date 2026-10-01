@@ -30,6 +30,7 @@ reference-conditioned diagnostics are not held-out tracing scores.
 
 | Family | Status | Purpose | Current evidence |
 |---|---|---|---|
+| Reviewed fibers 2026-09-30 | **Current reviewed-reference comparison** | Corrected v3: 91 approved annotations,91 eligible pieces,182 directions; native beam replay with cache reuse, lowres/old-fullres/Gaussian EMA999 comparison | [results](benchmarks/reviewed_fibers_corrected_20260930.md), [cache sync export](benchmarks/reviewed_cache_export_20260930.md) |
 | Five-scroll, 50-fiber evaluation | **Canonical scientific evaluation** | Broad model/tracer comparison on the held-out cohort | [full-resolution best EMA999](benchmarks/fullres_refinement_213753_best_ema999_20260917.md) |
 | Beam parameter search on the cohort | **Tuning result, optimized on the cohort itself** | Step-by-step search of native beam parameters for the full-resolution model | [search result](benchmarks/fullres_beam_search_20260919.md) |
 | Frozen short200 v3 | **Canonical targeted regression set** | Reproduce difficult restart regions cheaply; it is deliberately failure-enriched and is not an unbiased model-quality estimate | [dataset definition](short_failure_benchmark.md) |

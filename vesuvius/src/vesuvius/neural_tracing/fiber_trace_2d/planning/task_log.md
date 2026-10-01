@@ -1,5 +1,8 @@
 # Training-integrated reviewed failure benchmark
 
+- Merged the committed `fiber-exp5` reviewed-benchmark base (`00eb345bd`),
+  including native v4/editor-hint parsing, rather than maintaining a local port.
+
 - Reviewed-v3 contains 91 truncated eligible pieces / 182 directions, derived
   from 46 source-run identifiers and 36 original source fibers.
 - Canonical union over `lowres`, `fullres`, `gaussian`, `halfsigma_raw`, and

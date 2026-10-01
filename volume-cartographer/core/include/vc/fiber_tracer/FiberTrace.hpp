@@ -91,6 +91,8 @@ struct FiberTraceProfile {
 };
 
 struct FiberTraceConfig {
+    // Reference-replay experiment only; zero preserves the ordinary protocol.
+    double replayReverseIntervalBase = 0.0;
     double embeddingWeight = 0.0;
     // Opt-in calibrated mapping. Zero temperature preserves the linear cost.
     double embeddingDistanceThreshold = 0.0;
@@ -570,6 +572,9 @@ struct FiberReplayTraceSegment {
 };
 
 struct FiberReplayTraceResult {
+    // [rejected-window begin, detection arc, next seed/end arc], base voxels.
+    std::vector<std::array<double, 3>> filteredStops;
+    size_t reverseChecks = 0;
     // Geometry adapter for graph replay; costs remain in its graph artifact.
     bool graphGeometry = false;
     // Optional backend label serialized as `geometry_backend`. Graph replay
