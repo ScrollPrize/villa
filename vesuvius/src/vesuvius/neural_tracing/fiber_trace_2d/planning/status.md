@@ -1,11 +1,12 @@
-# Status: local sideband supervision
+# Status: training-integrated reviewed failure benchmark
 
 - [x] Capture the requested task.
+- [x] Identify the reviewed cohort and canonical failure union.
 - [x] Write and self-review the implementation plan.
-- [x] Implement swept left/right sideband target masks.
-- [x] Integrate globally synchronized sideband loss statistics.
-- [x] Integrate mean, q0.1, and Gaussian-fit visualization into configured tests.
-- [x] Add/update configuration and documentation.
-- [x] Run focused CPU validation; managed run is the GPU integration check.
-- [x] Stop the previous run and launch the managed resume.
-- [x] Record the launch state and validation results.
+- [x] Materialize and validate the persistent 32-piece dataset.
+- [x] Point dense training tests at the locked subset.
+- [x] Integrate current-model native trace evaluation.
+- [x] Log directional restarts and implied mean lengths.
+- [x] Add regression tests and run focused validation.
+- [x] Update specification, runbook, and changelog.
+- [ ] Relaunch and verify the training integration.

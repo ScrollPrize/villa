@@ -1031,6 +1031,24 @@ def _resolve_fiber_paths(dataset_config: dict[str, Any], config: FiberTrace3DCon
         paths.extend(Path(path) for path in sorted(glob.glob(resolved)))
     if not paths:
         raise ValueError("dataset entry must define fiber_paths or fiber_glob")
+    manifest_path = dataset_config.get("fiber_manifest_path")
+    if manifest_path is not None:
+        from .reviewed_failure_test import validate_failure_union
+        resolved_manifest = Path(_resolve_path(manifest_path, config.config_dir)).resolve()
+        manifest = validate_failure_union(
+            resolved_manifest.parent,
+            expected_count=int(dataset_config.get("fiber_manifest_expected_total", 32)),
+        )
+        collection = dataset_config.get("fiber_manifest_collection", dataset_config.get("scroll_id"))
+        expected = {
+            str((resolved_manifest.parent / "test" / row["path"]).resolve())
+            for row in manifest["files"] if row["source"] == collection
+        }
+        actual = {str(path.resolve()) for path in paths}
+        if actual != expected:
+            raise ValueError(
+                f"dataset paths do not exactly match reviewed-failure manifest collection {collection}"
+            )
     return paths
 
 

@@ -1,13 +1,15 @@
-# Local fiber sideband supervision and test visualization
+# Training-integrated reviewed failure benchmark
 
-Add separately normalized, Lasagna-normal-oriented left and right negative
-sidebands around each densely supervised fiber. Preserve the existing
-anisotropic Gaussian tube, but explicitly suppress presence outside its width
-support in a swept rectangle covering the observed approximately +/-40-base-
-voxel secondary peaks.
+Integrate the optimized native/live-inference reviewed-fiber benchmark into the
+fiber training test cycle.
 
-During configured training tests, accumulate the aligned predicted presence
-cross-section over the complete deterministic test set and write/log the mean
-and 10% exceedance (`q0.1`) images. Stop the previous training only after the
-implementation is validated, then resume its latest checkpoint with the new
-loss and visualization enabled.
+- Freeze a persistent test dataset containing the union of truncated reviewed
+  pieces that failed in any canonical reviewed-model evaluation.
+- Use that smaller locked dataset for the existing deterministic dense test
+  losses and cross-section diagnostics.
+- At each configured trace-test interval, evaluate the current raw training
+  model with the existing highly parallel live-inference/native replay runner.
+- Report and log forward, reverse, and combined restart counts plus the implied
+  aggregate segment length: total directed reference length divided by total
+  restarts plus one.
+- Preserve exact membership, hashes, trace settings, and per-step summaries.

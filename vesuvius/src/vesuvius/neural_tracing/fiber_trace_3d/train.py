@@ -11,6 +11,8 @@ import os
 import re
 import signal
 import socket
+import subprocess
+import sys
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
@@ -672,6 +674,140 @@ def _distributed_broadcast_object(value: Any, config: _DistributedConfig, *, src
     objects = [value]
     dist.broadcast_object_list(objects, src=src)
     return objects[0]
+
+
+def _reviewed_trace_test_config(training: dict[str, Any]) -> dict[str, Any] | None:
+    raw = training.get("reviewed_trace_test")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("training.reviewed_trace_test must be an object")
+    required = {"interval", "template", "split_root", "native_binary", "runner"}
+    missing = required - raw.keys()
+    if missing:
+        raise ValueError(f"training.reviewed_trace_test is missing {sorted(missing)}")
+    interval = raw["interval"]
+    if type(interval) is not int or interval < 1:
+        raise ValueError("training.reviewed_trace_test.interval must be positive")
+    return dict(raw)
+
+
+def _distributed_visible_gpu_tokens(config: _DistributedConfig) -> list[str]:
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    local = [token.strip() for token in visible.split(",") if token.strip()]
+    if config.enabled:
+        gathered: list[Any] = [None] * config.world_size
+        dist.all_gather_object(gathered, local)
+        tokens = [token for row in gathered for token in row]
+    else:
+        tokens = local
+    if len(tokens) != config.world_size or len(set(tokens)) != len(tokens):
+        raise RuntimeError("reviewed trace test requires one distinct manager-assigned GPU per rank")
+    return tokens
+
+
+def _run_reviewed_trace_test(*, settings: dict[str, Any], step: int, run_dir: Path,
+                             snapshot_dir: Path, distributed: _DistributedConfig,
+                             writer: Any | None) -> dict[str, float]:
+    """Run under the training task's existing grant while ranks poll together."""
+    gpu_tokens = _distributed_visible_gpu_tokens(distributed)
+    output = run_dir / "reviewed_trace_test" / f"step_{step:08d}"
+    checkpoint = snapshot_dir / "current.pt"
+    process = None
+    log_stream = None
+    startup_error = None
+    if distributed.is_main:
+        try:
+            if not checkpoint.is_file():
+                raise RuntimeError(f"reviewed trace test checkpoint is missing: {checkpoint}")
+            output.mkdir(parents=True, exist_ok=False)
+            job = {
+                "step": step,
+                "checkpoint": str(checkpoint),
+                "output_root": str(output),
+                "template": str(Path(settings["template"]).expanduser().resolve()),
+                "split_root": str(Path(settings["split_root"]).expanduser().resolve()),
+                "native_binary": str(Path(settings["native_binary"]).expanduser().resolve()),
+                "runner": str(Path(settings["runner"]).expanduser().resolve()),
+                "devices": ",".join(str(index) for index in range(len(gpu_tokens))),
+            }
+            job_path = output / "job.json"
+            job_path.write_text(json.dumps(job, indent=2) + "\n")
+            environment = dict(os.environ)
+            for name in ("RANK", "WORLD_SIZE", "LOCAL_RANK", "MASTER_ADDR", "MASTER_PORT"):
+                environment.pop(name, None)
+            environment["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_tokens)
+            log_stream = (output / "runner.log").open("w")
+            process = subprocess.Popen(
+                [sys.executable, "-m", "vesuvius.neural_tracing.fiber_trace_3d.training_trace_benchmark", str(job_path)],
+                cwd=Path(__file__).resolve().parents[5], env=environment,
+                stdout=log_stream, stderr=subprocess.STDOUT,
+            )
+            print(f"training reviewed trace: step={step} pieces=32 directions=64 output={output}", flush=True)
+        except BaseException as error:
+            startup_error = f"{type(error).__name__}: {error}"
+    try:
+        startup_error = _distributed_broadcast_object(startup_error, distributed)
+        if startup_error is not None:
+            raise RuntimeError(f"reviewed trace test failed to start: {startup_error}")
+        while True:
+            status = None
+            if distributed.is_main:
+                returncode = process.poll()
+                error = None
+                if returncode:
+                    if log_stream is not None:
+                        log_stream.flush()
+                    error = (output / "runner.log").read_text(errors="replace")[-8000:]
+                status = {"done": returncode is not None, "returncode": returncode, "error": error}
+            status = _distributed_broadcast_object(status, distributed)
+            if status["done"]:
+                if status["returncode"]:
+                    raise RuntimeError(
+                        f"reviewed trace test failed with exit {status['returncode']}:\n{status['error']}"
+                    )
+                break
+            time.sleep(1.0)
+        payload = None
+        if distributed.is_main:
+            try:
+                payload = {"metrics": json.loads((output / "training_metrics.json").read_text()), "error": None}
+            except BaseException as error:
+                payload = {"metrics": None, "error": f"{type(error).__name__}: {error}"}
+        payload = _distributed_broadcast_object(payload, distributed)
+        if payload["error"] is not None:
+            raise RuntimeError(f"reviewed trace result is invalid: {payload['error']}")
+        metrics = payload["metrics"]
+        if distributed.is_main:
+            print(
+                "training reviewed trace result: "
+                f"step={step} forward_restarts={metrics['restarts_forward']} "
+                f"reverse_restarts={metrics['restarts_reverse']} "
+                f"combined_restarts={metrics['restarts_combined']} "
+                f"forward_implied_mm={metrics['implied_mean_mm_forward']:.6f} "
+                f"reverse_implied_mm={metrics['implied_mean_mm_reverse']:.6f} "
+                f"combined_implied_mm={metrics['implied_mean_mm_combined']:.6f}",
+                flush=True,
+            )
+            if writer is not None:
+                for key in ("restarts_forward", "restarts_reverse", "restarts_combined",
+                            "reference_mm_forward", "reference_mm_reverse", "reference_mm_combined",
+                            "implied_mean_mm_forward", "implied_mean_mm_reverse", "implied_mean_mm_combined",
+                            "wall_seconds"):
+                    writer.add_scalar(f"reviewed_trace/{key}", metrics[key], step)
+                writer.flush()
+        return metrics
+    finally:
+        if distributed.is_main:
+            if process is not None and process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+            if log_stream is not None:
+                log_stream.close()
 
 
 def _distributed_should_use_sync_batchnorm(
@@ -3193,6 +3329,7 @@ def training_units(
         raw_config = {**raw_config, "training": {**raw_config.get("training", {}), **training_overrides}}
     loader_config = load_config(config_path)
     training = dict(raw_config.get("training", {}))
+    reviewed_trace_test = _reviewed_trace_test_config(training)
     refinement = RefinementObserver(RefinementConfig.parse(raw_config))
     if refinement.config.enabled and raw_config.get("historical_test_datasets"):
         raise ValueError("disable historical_test_datasets when refining train/test ground truth")
@@ -3623,6 +3760,12 @@ def training_units(
         kept_snapshot_interval=kept_snapshot_interval,
         test_interval=test_interval,
     )
+    if reviewed_trace_test is not None:
+        trace_interval = int(reviewed_trace_test["interval"])
+        if test_interval <= 0 or trace_interval % test_interval:
+            raise ValueError("reviewed trace interval must be a multiple of test_interval")
+        if checkpoint_interval <= 0 or trace_interval % checkpoint_interval:
+            raise ValueError("reviewed trace interval must be a multiple of checkpoint_interval")
     sample_vis_interval = int(
         training.get("sample_vis_interval", training.get("train_sample_vis_interval", 1000))
     )
@@ -4682,6 +4825,11 @@ def training_units(
                 test_metric_name = _distributed_broadcast_object(test_metric_name, distributed)
 
             save_test_snapshots(step, test_metric, test_metric_name)
+            if reviewed_trace_test is not None and test_due and step % int(reviewed_trace_test["interval"]) == 0:
+                _run_reviewed_trace_test(
+                    settings=reviewed_trace_test, step=step, run_dir=run_dir,
+                    snapshot_dir=snapshot_dir, distributed=distributed, writer=writer,
+                )
             pending_test = None
             if test_due:
                 admit_training_until_test(step)

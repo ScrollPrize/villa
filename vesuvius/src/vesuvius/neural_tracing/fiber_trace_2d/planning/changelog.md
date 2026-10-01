@@ -3406,3 +3406,9 @@ identity remains unconfirmed. Global-assignment experiments not yet implemented.
   the configured supervised target.
 - Replaced the stopped half-sigma refinement run with a managed GPUs-0-5 resume
   using 64x16-base sideband half-extents and 0.1 total sideband weight.
+## 2026-10-01 — Training-integrated reviewed failure test
+
+- Locked the union of failures from five canonical reviewed evaluations as a
+  32-piece/64-direction regression cohort. Ordinary training tests and the
+  optimized live-inference/native trace test now use the same SHA-validated
+  subset and report directional restart counts plus implied mean lengths.

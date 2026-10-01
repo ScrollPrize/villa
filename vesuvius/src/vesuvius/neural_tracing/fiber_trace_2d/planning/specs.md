@@ -7743,3 +7743,25 @@ The inspection channel export includes inference.lasagna.json and its
 inference.json provenance per physical scroll. Channel paths are relative to
 the exported manifest so copying the directory preserves bindings. Exact
 source base dimensions and scale must be preserved, including for subsets.
+# Training-integrated reviewed-failure regression
+
+- The version-1 reviewed failure test contains exactly 32 CP-bounded truncated
+  pieces selected as the union of pieces with a restart in either direction in
+  the canonical `lowres`, `fullres`, `gaussian`, `halfsigma_raw`, and
+  `halfsigma_ema99` reviewed evaluations.
+- Its immutable membership is 11 PHerc0139, 6 PHerc1299, and 15 PHercParis4
+  pieces. Membership and annotation SHA-256 values must be validated before
+  use. It is a failure-enriched regression set, not an unbiased scientific
+  evaluation cohort.
+- Configured training runs derive their ordinary deterministic test metrics
+  from this same 32-piece set and run the shared optimized live-inference/native
+  tracer over exactly 64 directions at the configured trace interval.
+- Trace tests inherit the enclosing managed training allocation. They must not
+  create a nested manager task or silently use an unallocated GPU.
+- A trace test is valid only with all 64 directed cases complete and zero
+  infrastructure failures. Forward, reverse, and combined restart episodes and
+  implied mean lengths are retained. Implied mean length is total directed
+  reference millimetres divided by `(restart episodes + 1)`.
+- Workload, bindings, native summary, inference summary, logs, and compact
+  metrics are retained per training step. Missing inputs, changed membership,
+  incomplete output, or runner failure abort rather than falling back.

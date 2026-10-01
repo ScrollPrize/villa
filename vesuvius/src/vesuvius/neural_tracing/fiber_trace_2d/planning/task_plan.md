@@ -1,41 +1,62 @@
-# Plan
+# Plan: training-integrated reviewed failure benchmark
 
-1. Extend fiber target materialization with an opt-in swept rectangle in the
-   local tangent/surface-normal/in-sheet frame. Use half-width 64 and
-   half-height 16 base voxels, excluding the existing nonzero Gaussian support.
-   Track left and right masks separately.
-2. Add left/right sideband BCE-to-zero sums and counts to the existing
-   target-only, globally synchronized loss-statistics protocol. Normalize each
-   side independently and add their mean at weight 0.1 relative to the presence
-   ridge term. Preserve one forward/backward pass and all existing losses.
-3. Reuse the shared cross-section sampler during configured tests. Accumulate
-   raw-model predictions over the deterministic complete test set on every
-   rank, merge bounded sum/count/histogram state, and log/write float mean and
-   `q0.1` exceedance images. Do not alter crops, targets, refinement, metrics,
-   or checkpoint selection.
-4. Add focused CPU tests for swept-sideband geometry, exclusion of Gaussian
-   support, independent left/right statistics, disabled behavior, distributed
-   merge semantics, and image generation. Run the relevant loss, target,
-   refinement, and cross-section suites plus static validation.
-5. Add a derived resume config enabling the sideband loss and periodic
-   cross-section visualization. After validation, stop any surviving prior
-   run cleanly and launch a managed resume from its latest checkpoint.
+## Dataset
+
+1. Define the canonical source evaluations as `lowres`, `fullres`, `gaussian`,
+   `halfsigma_raw`, and `halfsigma_ema99` from reviewed cohort v3.
+2. Select a whole truncated piece when either direction has at least one saved
+   failure in any canonical source evaluation; deduplicate by scroll and source
+   index. The expected frozen membership is 32 pieces.
+3. Materialize those exact JSON files under a new versioned local test root and
+   write a manifest containing source evaluations, source paths, and SHA-256.
+   Validation must fail on missing, extra, or changed files.
+
+## Dense training tests
+
+4. Add a derived training configuration whose `test_datasets` point only to the
+   frozen failure-union root. Retain the current deterministic dense loss,
+   refinement, EMA, cross-section, and TensorBoard implementations unchanged.
+5. Make the expected test membership explicit so accidental glob growth fails.
+
+## Native trace test
+
+6. Extract a reusable training-trace benchmark adapter around the existing
+   `run_classic_fiber_evaluation.py` preparation/live inference/native replay
+   implementation; do not copy its inference or tracing logic.
+7. At a configured interval, rank zero freezes the current raw model, prepares
+   a per-step workload over the same frozen 32 pieces, and invokes the existing
+   optimized runner as a child of the already managed training task. Other DDP
+   ranks remain responsive through periodic distributed completion polling.
+8. Parse only complete summaries with all 64 directed cases and no
+   infrastructure failures. Persist the workload, bindings, summary, inference
+   summary, and compact metrics under the training run.
+9. Log forward/reverse/combined restarts, reference lengths, and implied mean
+   lengths to stdout and TensorBoard. The combined implied length is total
+   directed reference millimetres divided by `(combined_restarts + 1)`.
+10. Bound transient prediction storage and fail loudly rather than silently
+    skipping a trace test.
+
+## Validation
+
+11. Unit-test failure-union selection, manifest validation, directional restart
+    aggregation, implied-length arithmetic, subprocess completion/failure, and
+    distributed polling without requiring CUDA.
+12. Run focused Python tests and existing native replay tests. Then stop the
+    currently running old-test configuration and launch a resume using GPUs
+    0-5. Confirm one dense test and one 64-direction trace test complete.
 
 ## Spec update
 
-Document the optional local-sideband target geometry, independent global
-normalization, and test-only cross-section visualization settings in
-`planning/specs.md`. No GPU-manager protocol change.
+- Add the immutable 32-piece reviewed-failure test membership, selection bias,
+  canonical source evaluations, trace metrics, and no-fallback requirements.
 
-## Docs updates
+## Documentation updates
 
-Record the settings, validation, source checkpoint, replacement run, artifact
-locations, and any measured test overhead in the task log and changelog.
+- Add the training-integrated benchmark to `docs/benchmark_runbook.md`, clearly
+  identifying it as a failure-enriched regression metric rather than an
+  unbiased generalization estimate.
 
-## Plan review
+## Changelog
 
-The repository process requests an independent agent review. The active
-orchestration policy forbids spawning sub-agents unless the user explicitly
-requests delegation, so this plan received an explicit self-review against
-`specs.md`, `plan.md`, and the task before implementation; this is the only
-process deviation.
+- Record the locked failure-union dataset and training-integrated native trace
+  metrics.

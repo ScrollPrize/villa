@@ -41,6 +41,39 @@ reference-conditioned diagnostics are not held-out tracing scores.
 | Live-inference/cache profiles | **Performance diagnostics** | Isolate input, inference, publication, readiness and cached tracing throughput | [live evaluation architecture](live_inference_trace_evaluation.md), [cached trace profile](cached_trace_profile_20260911.md) |
 | Older snapshot, embedding and fixed-path sweeps | **Historical** | Preserve model-selection and experimental history; do not use as the current headline baseline | Dated files under [`benchmarks/`](benchmarks/) |
 
+## Training-integrated reviewed-failure regression
+
+Training uses a locked 32-piece subset of the September 30 reviewed cohort for
+both its ordinary dense test metrics and its native tracing regression. A piece
+is included when either direction restarted in any of the canonical `lowres`,
+`fullres`, `gaussian`, `halfsigma_raw`, or `halfsigma_ema99` evaluations. The
+membership is 11 PHerc0139, 6 PHerc1299, and 15 PHercParis4 pieces (64 directed
+traces). This is deliberately failure-enriched: it is useful for regression and
+model selection, but it is not an unbiased estimate of generalization.
+
+The persistent split is
+`/home/hendrik/data/2026-10-01_reviewed_failure_union_v1`. Its manifest fixes
+the exact filenames and SHA-256 values; training fails at startup if a file is
+missing, added, or changed. Recreate a new version (never mutate this one) with
+`vesuvius/scripts/materialize_reviewed_failure_test.py` and explicit canonical
+`full/summary.json` paths.
+
+The training configuration's `training.reviewed_trace_test` runs after the
+ordinary test and current snapshot at its configured interval. It inherits the
+training task's manager allocation rather than registering a nested task. All
+DDP ranks poll a collective while the existing optimized live-inference/native
+runner executes, preventing the NCCL watchdog from mistaking a long trace test
+for a dead rank. Each step retains its workload, bindings, inference summary,
+native summary, runner log, and compact metrics under
+`RUN/reviewed_trace_test/step_NNNNNNNN/`.
+
+TensorBoard group `reviewed_trace/` records actual restart episodes separately
+for forward and reverse directions and in combination. The implied mean is the
+corresponding total directed reference length divided by `(restarts + 1)`, so
+zero combined restarts yields the sum of all directed reference pieces and one
+restart yields half that sum. An incomplete direction, infrastructure failure,
+or changed cohort aborts the test; there is no fallback to a different set.
+
 The current benchmark model checkpoint is SHA-256
 `5ec278f71b15b27187b55805310176fe2fa3b00c5264fc528b95bc6d0690206e`
 for the full-resolution 20260916-213753 best EMA999 snapshot. The anchor and

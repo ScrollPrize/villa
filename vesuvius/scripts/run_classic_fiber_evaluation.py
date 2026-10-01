@@ -216,7 +216,7 @@ def prepare(workload, *, pilot_only=False):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=["crop-benchmark", "contrast-prepare", "benchmark-remove-case", "benchmark-review", "benchmark-render", "benchmark-full", "pair-connectivity", "short-failures", "failure-union", "integration-report", "integration-fit", "integration-audit", "fixed-path-report", "fixed-path-extract", "fixed-path-fit", "freeze-snapshot", "prepare", "prepare-pilot", "validate-pilot", "validate-full", "pilot", "full", "resume-visualization", "cached-full", "report-metrics", "profile", "observe", "report-progress", "reference-plan"])
+    parser.add_argument("mode", choices=["crop-benchmark", "contrast-prepare", "benchmark-remove-case", "benchmark-review", "benchmark-render", "benchmark-full", "pair-connectivity", "short-failures", "failure-union", "integration-report", "integration-fit", "integration-audit", "fixed-path-report", "fixed-path-extract", "fixed-path-fit", "freeze-snapshot", "prepare", "prepare-pilot", "validate-pilot", "validate-full", "pilot", "full", "training-full", "resume-visualization", "cached-full", "report-metrics", "profile", "observe", "report-progress", "reference-plan"])
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--export-manifests-only", action="store_true",
                         help="failure-union: export Lasagna manifests from completed output")
@@ -409,7 +409,7 @@ def main():
         return
     from lasagna.inference_provenance import json_digest, sha256_file
     from vesuvius.neural_tracing.fiber_trace_3d.live_evaluate import run
-    prepared_mode = "full" if args.mode == "resume-visualization" else args.mode
+    prepared_mode = "full" if args.mode in ("resume-visualization", "training-full") else args.mode
     audit = json.loads((ROOT / f"{prepared_mode}_bindings.json").read_text())
     if audit["workload_sha256"] != json_digest(workload):
         raise ValueError("workload mapping/settings changed after preparation")
@@ -451,6 +451,8 @@ def main():
         return
     runtime_overrides = ({"resume_visualization": True, "resume_render_limit": 96}
                          if args.mode == "resume-visualization" else None)
+    if args.mode == "training-full" and not args.unmanaged:
+        raise ValueError("training-full must inherit an existing managed training allocation")
     result = run(ROOT / f"{prepared_mode}.json", CHECKPOINT, devices, BINARY,
                  runtime_overrides=runtime_overrides, **live_run_manager_options(args))
     if config.get("render") and result in (None, 0):
