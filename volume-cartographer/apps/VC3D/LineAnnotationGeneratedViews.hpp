@@ -1821,6 +1821,25 @@ inline bool generatedLineOrderNeighbourIsKollesisTermination(
     return false;
 }
 
+// Strip span selection depends only on longitudinal position, never click height.
+// At a CP use its outgoing span; the final CP uses its incoming span.
+inline std::optional<size_t> generatedControlSpanOwnerRank(
+    const std::vector<const GeneratedOverlay::ControlPointMarker*>& sortedControls,
+    double linePosition)
+{
+    if (sortedControls.size() < 2 || !std::isfinite(linePosition) ||
+        linePosition < sortedControls.front()->linePosition ||
+        linePosition > sortedControls.back()->linePosition) {
+        return std::nullopt;
+    }
+    for (size_t rank = 1; rank < sortedControls.size(); ++rank) {
+        if (linePosition < sortedControls[rank]->linePosition) {
+            return rank - 1;
+        }
+    }
+    return sortedControls.size() - 2;
+}
+
 struct GeneratedControlPointContextMenuOptions {
     QWidget* parent = nullptr;
     std::string surfaceName;

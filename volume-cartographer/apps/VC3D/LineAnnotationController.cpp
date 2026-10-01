@@ -10,6 +10,8 @@
 #include "OpenDataLasagna.hpp"
 #include "FiberSliceGeometry.hpp"
 #include "LineAnnotationAdjacentLinks.hpp"
+#include "LineAnnotationFiberLinks.hpp"
+#include "LineAnnotationStructuralEdits.hpp"
 #include "LineAnnotationFiberNaming.hpp"
 #include "LineAnnotationFiberSaveJob.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
@@ -356,6 +358,22 @@ struct LineAnnotationController::IntersectionInspectionSession {
 
 namespace {
 
+// Link predicates shared with the save/validation helpers and the
+// structural-edit planners (LineAnnotationFiberLinks.hpp).
+using vc3d::line_annotation::branchDirectionsCompatible;
+using vc3d::line_annotation::branchReferencesFiber;
+using vc3d::line_annotation::endpointTangentFromLinePoints;
+using vc3d::line_annotation::fiberErrorName;
+using vc3d::line_annotation::finiteDirection;
+using vc3d::line_annotation::finitePoint;
+using vc3d::line_annotation::matchingStoredControlPointIndex;
+using vc3d::line_annotation::normalizedOrZero;
+using vc3d::line_annotation::pointsApproximatelyEqual;
+using vc3d::line_annotation::storedControlPointIndexByPosition;
+using vc3d::line_annotation::tangentAtLinePosition;
+using vc3d::line_annotation::fiberGeometryKey;
+using vc3d::line_annotation::kNeedsReoptimizationTag;
+
 // Arclength radius within which a placement click replaces the existing
 // control(s) instead of adding one. Tied to the strip's along-line sampling
 // so no control span can be created shorter than one strip column (#1484:
@@ -411,7 +429,6 @@ void copyCoordinateIdentityToJson(
         identity->sourceOriginalResolution;
 }
 
-constexpr double kEpsilon = 1.0e-12;
 constexpr double kLineSegmentLength = 32.0;
 // Quiet window between a control-point edit and the solve it dispatches;
 // rapid placement coalesces into one solve over the union of dirty spans.
@@ -428,7 +445,6 @@ constexpr double kControlPointLabelLinePositionTolerance = 1.0e-3;
 // Applied by the sync tool's three-way merge (scripts/fiber_merge.py,
 // REOPTIMIZE_TAG) when it had to synthesize line_points it cannot fit to
 // the volume; keep the literal in sync with that module.
-constexpr const char* kNeedsReoptimizationTag = "needs_reoptimization";
 using Clock = std::chrono::steady_clock;
 
 struct InitialLineDiscretization {
@@ -629,12 +645,11 @@ void writeJsonAtomic(const fs::path& finalPath, const nlohmann::json& root)
     }
 
     const fs::path tempPath = finalPath.string() + ".tmp";
-    {
-        std::ofstream out(tempPath);
-        if (!out) {
-            throw std::runtime_error("Failed to open " + tempPath.string());
-        }
-        out << root.dump(2) << '\n';
+    try {
+        vc3d::line_annotation::writeTextFileChecked(tempPath, root.dump(2) + '\n');
+    } catch (...) {
+        fs::remove(tempPath, ec);
+        throw;
     }
     fs::rename(tempPath, finalPath, ec);
     if (ec) {
@@ -656,7 +671,6 @@ void atlasDebug(const std::string& message)
     }
 }
 
-bool finitePoint(const cv::Vec3d& v);
 cv::Vec3f toVec3f(const cv::Vec3d& v);
 
 const char* sideStripProgressPhaseName(vc::atlas::FiberSideStripProgressPhase phase)
@@ -783,29 +797,6 @@ double elapsedMs(Clock::time_point start, Clock::time_point end)
     return std::chrono::duration<double, std::milli>(end - start).count();
 }
 
-bool finiteDirection(const cv::Vec3d& v)
-{
-    return std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2]) &&
-           std::sqrt(v.dot(v)) > kEpsilon;
-}
-
-cv::Vec3d normalizedOrZero(const cv::Vec3d& v)
-{
-    if (!std::isfinite(v[0]) || !std::isfinite(v[1]) || !std::isfinite(v[2])) {
-        return {0.0, 0.0, 0.0};
-    }
-    const double n = std::sqrt(v.dot(v));
-    if (n <= kEpsilon) {
-        return {0.0, 0.0, 0.0};
-    }
-    return v * (1.0 / n);
-}
-
-bool finitePoint(const cv::Vec3d& v)
-{
-    return std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2]);
-}
-
 bool finitePoint(const cv::Vec3f& v)
 {
     return std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2]);
@@ -851,48 +842,6 @@ cv::Vec3d toVec3d(const cv::Vec3f& v)
 bool approximatelyEqual(double a, double b)
 {
     return std::abs(a - b) <= 1.0e-9;
-}
-
-bool pointsApproximatelyEqual(const cv::Vec3d& a,
-                              const cv::Vec3d& b,
-                              double tolerance = 1.0e-6)
-{
-    if (!finitePoint(a) || !finitePoint(b)) {
-        return false;
-    }
-    const cv::Vec3d delta = a - b;
-    return delta.dot(delta) <= tolerance * tolerance;
-}
-
-std::optional<int> storedControlPointIndexByPosition(
-    const std::vector<vc3d::line_annotation::StoredControlPoint>& controlPoints,
-    const cv::Vec3d& point)
-{
-    if (!finitePoint(point)) {
-        return std::nullopt;
-    }
-    for (size_t i = 0; i < controlPoints.size(); ++i) {
-        if (pointsApproximatelyEqual(controlPoints[i], point)) {
-            return static_cast<int>(i);
-        }
-    }
-    return std::nullopt;
-}
-
-std::optional<int> matchingStoredControlPointIndex(
-    const std::vector<vc3d::line_annotation::StoredControlPoint>& controlPoints,
-    int fallbackIndex,
-    const cv::Vec3d& point)
-{
-    if (auto index = storedControlPointIndexByPosition(controlPoints, point)) {
-        return index;
-    }
-    if (fallbackIndex < 0 ||
-        static_cast<size_t>(fallbackIndex) >= controlPoints.size() ||
-        !pointsApproximatelyEqual(controlPoints[static_cast<size_t>(fallbackIndex)], point)) {
-        return std::nullopt;
-    }
-    return fallbackIndex;
 }
 
 std::optional<int> sessionControlPointIndexByPosition(
@@ -964,24 +913,6 @@ std::optional<int> matchingSessionControlPointIndex(
     return fallbackIndex;
 }
 
-std::string fiberErrorName(const std::string& fileName)
-{
-    const std::string baseName = fs::path(fileName).filename().string();
-    return baseName.empty() ? std::string{"<unknown>"} : baseName;
-}
-
-bool branchDirectionsCompatible(const cv::Vec3d& a,
-                                const cv::Vec3d& b,
-                                double tolerance = 1.0e-5)
-{
-    const cv::Vec3d na = normalizedOrZero(a);
-    const cv::Vec3d nb = normalizedOrZero(b);
-    if (!finiteDirection(na) || !finiteDirection(nb)) {
-        return false;
-    }
-    return std::abs(std::abs(na.dot(nb)) - 1.0) <= tolerance;
-}
-
 void addUniqueFiberId(std::vector<uint64_t>& ids, uint64_t fiberId)
 {
     if (fiberId == 0 ||
@@ -989,19 +920,6 @@ void addUniqueFiberId(std::vector<uint64_t>& ids, uint64_t fiberId)
         return;
     }
     ids.push_back(fiberId);
-}
-
-// Runtime ids are unique across every registered source and stable across
-// reloads (FiberRuntimeIds). Once both sides have one, do not let an equal
-// filename in another source create a false match. Filename matching remains
-// the legacy/on-load fallback. The rule is sameFiberIdentity, shared with the
-// deletion helpers and the branch synchronizers.
-bool branchReferencesFiber(const LineAnnotationController::FiberBranchRef& branch,
-                           uint64_t fiberId,
-                           const std::string& fileName)
-{
-    return vc3d::line_annotation::sameFiberIdentity(branch.branchFiberId, branch.branchFileName,
-                                                    fiberId, fileName);
 }
 
 bool controlPointHasBranchLink(
@@ -1309,39 +1227,6 @@ cv::Vec3d interpolatedPointAtLinePosition(const std::vector<cv::Vec3d>& points,
     const double t = linePosition - static_cast<double>(lower);
     return points[static_cast<size_t>(lower)] * (1.0 - t) +
            points[static_cast<size_t>(upper)] * t;
-}
-
-cv::Vec3d tangentAtLinePosition(const std::vector<cv::Vec3d>& points,
-                                double linePosition)
-{
-    if (points.size() < 2 || !std::isfinite(linePosition)) {
-        return {1.0, 0.0, 0.0};
-    }
-    linePosition = std::clamp(linePosition, 0.0, static_cast<double>(points.size() - 1));
-    int lower = static_cast<int>(std::floor(linePosition));
-    int upper = std::min<int>(lower + 1, static_cast<int>(points.size()) - 1);
-    if (lower == upper && lower > 0) {
-        --lower;
-    }
-    cv::Vec3d tangent = points[static_cast<size_t>(upper)] - points[static_cast<size_t>(lower)];
-    tangent = normalizedOrZero(tangent);
-    return finiteDirection(tangent) ? tangent : cv::Vec3d{1.0, 0.0, 0.0};
-}
-
-cv::Vec3d endpointTangentFromLinePoints(const std::vector<cv::Vec3d>& linePoints,
-                                        const cv::Vec3d& controlPoint,
-                                        const cv::Vec3d& fallback = {0.0, 0.0, 0.0})
-{
-    if (linePoints.size() >= 2 && finitePoint(controlPoint)) {
-        const size_t index =
-            vc3d::fiber_slice::nearestLinePointIndex(linePoints, controlPoint);
-        const cv::Vec3d tangent =
-            tangentAtLinePosition(linePoints, static_cast<double>(index));
-        if (finiteDirection(tangent)) {
-            return normalizedOrZero(tangent);
-        }
-    }
-    return finiteDirection(fallback) ? normalizedOrZero(fallback) : cv::Vec3d{0.0, 0.0, 0.0};
 }
 
 std::vector<cv::Vec3d> linePointPositions(const vc::lasagna::LineModel& line)
@@ -3298,6 +3183,12 @@ vc3d::line_annotation::FiberDeleteOutcome LineAnnotationController::deleteFibers
         showError(QString::fromStdString(outcome.error), true);
         return outcome;
     }
+    if (_structuralEditInProgress) {
+        outcome.error = tr("A merge or split is in progress; delete once it has finished.")
+                            .toStdString();
+        showError(QString::fromStdString(outcome.error), true);
+        return outcome;
+    }
     _deletingFibers = true;
     const auto releaseDeleting = qScopeGuard([this]() { _deletingFibers = false; });
 
@@ -3443,6 +3334,10 @@ void LineAnnotationController::renameFiberFile(uint64_t fiberId)
     // delete would then remove that other fiber. Renames wait their turn.
     if (_deletingFibers) {
         showError(tr("A fiber delete is in progress; rename the file once it has finished."));
+        return;
+    }
+    if (_structuralEditInProgress) {
+        showError(tr("A merge or split is in progress; rename the file once it has finished."));
         return;
     }
 
@@ -3636,6 +3531,12 @@ bool LineAnnotationController::importFibersFromPath(const fs::path& importPath,
     }
     if (skippedCount) {
         *skippedCount = 0;
+    }
+    if (_structuralEditInProgress) {
+        if (errorMessage) {
+            *errorMessage = tr("A merge or split is in progress; import once it has finished.");
+        }
+        return false;
     }
     const fs::path dir = fibersDir();
     if (dir.empty()) {
@@ -8766,6 +8667,673 @@ void LineAnnotationController::handleGeneratedControlPointLinkWithCandidate(
     refreshBranchLineViews(localFiberId);
 }
 
+// ---------------------------------------------------------------------------
+// Structural edits: merge two fibers into one, split one into two.
+//
+// Phase A (the menu callback) validates, captures the participants by
+// identity and position, runs the one modal it needs, and schedules phase B
+// on a clean stack. Phase B drains the save queue, re-resolves everything,
+// plans on stored snapshots (LineAnnotationStructuralEdits.hpp), redirects
+// the peers' links, canonicalizes and validates the whole batch, checks the
+// graph the next load will see, and commits with ONE runFiberSaveJob (new
+// files + redirected peers as payloads, originals as retirements). Only
+// after that commit is the prebuilt memory state installed, with swaps and
+// flag writes that cannot throw. A failure anywhere before the commit leaves
+// disk and memory as they were; the save job restores disk on its own
+// failure. The re-fit that follows is ordinary and its outcome does not
+// change the committed graph.
+// ---------------------------------------------------------------------------
+
+bool LineAnnotationController::structuralEditParticipantAllowed(
+    const std::filesystem::path& sourceRoot,
+    const std::string& fileName,
+    std::string* error) const
+{
+    const fs::path primary = primaryFiberSourceRoot();
+    if (!sourceRoot.empty() && !primary.empty() && sourceRoot != primary) {
+        if (error) {
+            *error = fiberErrorName(fileName) +
+                     " belongs to another fiber source; merge and split only work on "
+                     "fibers of the project's own fiber directory";
+        }
+        return false;
+    }
+    const std::string key = vc3d::fiberSourceFileKey(sourceRoot, fileName);
+    for (const auto& [dropped, survivor] : _loadedFiberLinkAliases) {
+        if (dropped == key || survivor == key) {
+            if (error) {
+                *error = fiberErrorName(fileName) +
+                         " is a duplicate of another loaded fiber file; resolve the "
+                         "duplicate first";
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
+bool LineAnnotationController::structuralEditPreflight(uint64_t packageGeneration,
+                                                       uint64_t loadSequence,
+                                                       std::string* error)
+{
+    if (_packageGeneration != packageGeneration) {
+        Logger()->warn("Structural edit abandoned: the package changed");
+        return false;
+    }
+    if (_structuralEditRecoveryRequired) {
+        if (error) {
+            *error = "an earlier merge or split could not fully restore the fiber files; "
+                     "reload the project first";
+        }
+        return false;
+    }
+    if (_fiberSaveFailureCount != _fiberSaveFailureCountAtLoad) {
+        if (error) {
+            *error = "a fiber save failed earlier in this session, so the loaded fibers may "
+                     "differ from the files; reload the project first";
+        }
+        return false;
+    }
+    // Every session edit still behind a debounced autosave, and every queued
+    // job, lands before the edit plans: the plan reads _fibers, and a job
+    // that ran later would overwrite a redirected peer with its old links.
+    flushAllPendingSessionAutoSaves();
+    waitForFiberSaves();
+    if (_packageGeneration != packageGeneration) {
+        Logger()->warn("Structural edit abandoned: the package changed while saves drained");
+        return false;
+    }
+    if (_fiberLoadSequence != loadSequence) {
+        if (error) {
+            *error = "the fibers were reloaded meanwhile";
+        }
+        return false;
+    }
+    if (_fiberSaveFailureCount != _fiberSaveFailureCountAtLoad) {
+        if (error) {
+            *error = "a pending fiber save failed";
+        }
+        return false;
+    }
+    return true;
+}
+
+std::optional<std::string> LineAnnotationController::structuralEditStaleLinkOnDisk(
+    const std::vector<StoredFiber>& originals,
+    const std::unordered_set<std::string>& writeSetKeys) const
+{
+    std::unordered_set<std::string> originalKeys;
+    for (const auto& original : originals) {
+        originalKeys.insert(vc3d::fiberSourceFileKey(original.sourceRoot, original.fileName));
+    }
+    // Raw read: the lenient parser would discard a malformed entry a second
+    // time and hide the reference it still carries.
+    const auto referencesOnDisk = [](const fs::path& path,
+                                     std::vector<std::string>& names) -> std::optional<std::string> {
+        try {
+            std::ifstream in(path);
+            if (!in) {
+                return "could not be opened";
+            }
+            names = vc3d::line_annotation::referencedFiberFileNames(nlohmann::json::parse(in));
+            return std::nullopt;
+        } catch (const std::exception& ex) {
+            return ex.what();
+        }
+    };
+    // Resolution as the loader does it: the owner's source root plus the
+    // basename, then the dedupe alias table.
+    const auto resolve = [this](const fs::path& ownerSourceRoot, const std::string& name) {
+        std::string key = vc3d::fiberSourceFileKey(ownerSourceRoot, name);
+        if (const auto alias = _loadedFiberLinkAliases.find(key);
+            alias != _loadedFiberLinkAliases.end()) {
+            key = alias->second;
+        }
+        return key;
+    };
+    const auto check = [&](const fs::path& path, const fs::path& ownerSourceRoot,
+                           const std::string& ownerFileName, const char* what)
+        -> std::optional<std::string> {
+        std::vector<std::string> names;
+        if (const auto error = referencesOnDisk(path, names)) {
+            return fiberErrorName(ownerFileName) + " (" + what +
+                   ") could not be re-read to verify its links (" + *error +
+                   "); use 'Remove broken branch links' on the next load first";
+        }
+        for (const auto& name : names) {
+            const std::string key = resolve(ownerSourceRoot, name);
+            if (originalKeys.count(key) != 0) {
+                return fiberErrorName(ownerFileName) + " (" + what +
+                       ") still holds a broken link to " + fiberErrorName(name) +
+                       " on disk; use 'Remove broken branch links' on the next load first";
+            }
+        }
+        return std::nullopt;
+    };
+
+    // 1. Flagged records the edit does not rewrite. A flagged record IN the
+    //    write set is rewritten from the record, which drops the stale
+    //    entry on disk as this edit's own change.
+    for (const auto& fiber : _fibers) {
+        if (!fiber.linkEntriesDroppedAtLoad) {
+            continue;
+        }
+        const std::string key = vc3d::fiberSourceFileKey(fiber.sourceRoot, fiber.fileName);
+        if (originalKeys.count(key) != 0) {
+            continue;
+        }
+        if (writeSetKeys.count(key) != 0) {
+            Logger()->info("Structural edit rewrites {}, which drops the link entries the load "
+                           "ignored in it",
+                           fiber.fileName);
+            continue;
+        }
+        if (const auto problem =
+                check(fiberPath(fiber), fiber.sourceRoot, fiber.fileName, "loaded")) {
+            return problem;
+        }
+    }
+    // 2. Files the source dedupe hid: their links are in no record. The
+    //    alias key is the hidden file's own path; its source root is the
+    //    key's directory.
+    for (const auto& [hiddenKey, survivorKey] : _loadedFiberLinkAliases) {
+        (void)survivorKey;
+        const fs::path hiddenPath(hiddenKey);
+        std::error_code ec;
+        const bool present = fs::exists(hiddenPath, ec);
+        if (ec) {
+            return fiberErrorName(hiddenPath.filename().string()) +
+                   " (hidden duplicate) could not be checked (" + ec.message() +
+                   "); use 'Remove broken branch links' on the next load first";
+        }
+        if (!present) {
+            continue;
+        }
+        if (const auto problem = check(hiddenPath, hiddenPath.parent_path(),
+                                       hiddenPath.filename().string(), "hidden duplicate")) {
+            return problem;
+        }
+    }
+    return std::nullopt;
+}
+
+LineAnnotationController::StructuralEditOutcome
+LineAnnotationController::commitStructuralEdit(StructuralEditRequest request, bool* committed)
+{
+    namespace la = vc3d::line_annotation;
+    StructuralEditOutcome outcome;
+    if (committed) {
+        *committed = false;
+    }
+    const auto fail = [&outcome](std::string message) {
+        outcome.error = std::move(message);
+        return outcome;
+    };
+    const auto isOriginal = [&request](uint64_t id, const std::string& fileName) {
+        return std::any_of(request.originals.begin(), request.originals.end(),
+                           [id, &fileName](const StoredFiber& original) {
+                               return la::sameFiberIdentity(id, fileName, original.id,
+                                                            original.fileName);
+                           });
+    };
+    // The redirect sources point at the originals' snapshots held by this
+    // request; bind them here so no caller keeps a pointer into a vector it
+    // then moves.
+    for (auto& source : request.sources) {
+        const auto it = std::find_if(
+            request.originals.begin(), request.originals.end(),
+            [&source](const StoredFiber& original) {
+                return la::sameFiberIdentity(source.id, source.fileName, original.id,
+                                             original.fileName);
+            });
+        if (it == request.originals.end()) {
+            return fail("internal: a redirect source is not one of the originals");
+        }
+        source.stored = &*it;
+    }
+
+    // 1. The result must not collide with a loaded fiber, by geometry (the
+    //    loader's dedupe would hide it with its links) or by file name.
+    for (const auto& fiber : request.newFibers) {
+        const std::string key = fiberGeometryKey(fiber.controlPoints, fiber.linePoints);
+        for (const auto& existing : _fibers) {
+            if (isOriginal(existing.id, existing.fileName)) {
+                continue;
+            }
+            if (!key.empty() &&
+                key == fiberGeometryKey(existing.controlPoints, existing.linePoints)) {
+                return fail("the result is geometrically identical to " +
+                            fiberErrorName(existing.fileName));
+            }
+        }
+        std::error_code ec;
+        if (fs::exists(fiberPath(fiber), ec)) {
+            return fail("a fiber file with the new name already exists: " + fiber.fileName);
+        }
+    }
+
+    // 2. Peers: every stored record linking to an original gets a redirected
+    //    copy; every open pane session of a non-participant likewise (its
+    //    target index may be a session index, resolved by position).
+    std::vector<StoredFiber> peers;
+    for (const auto& fiber : _fibers) {
+        if (isOriginal(fiber.id, fiber.fileName)) {
+            continue;
+        }
+        const bool linksToOriginal = std::any_of(
+            fiber.branches.begin(), fiber.branches.end(), [&](const FiberBranchRef& branch) {
+                return std::any_of(request.originals.begin(), request.originals.end(),
+                                   [&branch](const StoredFiber& original) {
+                                       return branchReferencesFiber(branch, original.id,
+                                                                    original.fileName);
+                                   });
+            });
+        if (!linksToOriginal) {
+            continue;
+        }
+        StoredFiber copy = fiber;
+        std::string error;
+        if (!la::redirectBranchRefs(copy.branches, request.sources, &error)) {
+            return fail(fiberErrorName(fiber.fileName) + ": " + error);
+        }
+        copy.generation = std::max<uint64_t>(1, copy.generation + 1);
+        peers.push_back(std::move(copy));
+    }
+    // Every session of a retired fiber is consumed, not only the ones the
+    // caller planned from: an inspection session or a second pane of the
+    // same fiber would otherwise stay saveable and recreate the file.
+    std::vector<std::shared_ptr<LineAnnotationSession>> consumed;
+    for (const auto& weak : request.consumedSessions) {
+        if (auto session = weak.lock()) {
+            consumed.push_back(std::move(session));
+        }
+    }
+    for (const auto& pane : _panes) {
+        if (pane.session && !pane.session->fiberDeleted &&
+            isOriginal(pane.session->fiberId, pane.session->fiberFileName) &&
+            std::find(consumed.begin(), consumed.end(), pane.session) == consumed.end()) {
+            consumed.push_back(pane.session);
+        }
+    }
+    for (const auto& session : consumed) {
+        if (session->taskState == LineAnnotationSession::TaskState::Running) {
+            return fail("a session of " + fiberErrorName(session->fiberFileName) +
+                        " is still optimizing");
+        }
+    }
+    // Two sessions of the same original (a dialog and an inspection pane,
+    // say) may hold different unsaved versions; the plan used one of them,
+    // so the other's edits would be silently discarded. Refuse unless they
+    // agree on geometry, links and tags.
+    for (std::size_t i = 0; i < consumed.size(); ++i) {
+        for (std::size_t j = i + 1; j < consumed.size(); ++j) {
+            auto& a = *consumed[i];
+            auto& b = *consumed[j];
+            if (!la::sameFiberIdentity(a.fiberId, a.fiberFileName, b.fiberId, b.fiberFileName)) {
+                continue;
+            }
+            const StoredFiber sa = makeStoredFiberSessionSnapshot(a).fiber;
+            const StoredFiber sb = makeStoredFiberSessionSnapshot(b).fiber;
+            const auto sameLinks = [](std::vector<FiberBranchRef> x, std::vector<FiberBranchRef> y) {
+                if (x.size() != y.size()) {
+                    return false;
+                }
+                const auto order = [](const FiberBranchRef& l, const FiberBranchRef& r) {
+                    return std::tie(l.controlPointIndex, l.branchFileName, l.branchControlPointIndex) <
+                           std::tie(r.controlPointIndex, r.branchFileName, r.branchControlPointIndex);
+                };
+                std::sort(x.begin(), x.end(), order);
+                std::sort(y.begin(), y.end(), order);
+                for (std::size_t k = 0; k < x.size(); ++k) {
+                    const auto& l = x[k];
+                    const auto& r = y[k];
+                    if (l.controlPointIndex != r.controlPointIndex ||
+                        l.branchControlPointIndex != r.branchControlPointIndex ||
+                        fs::path(l.branchFileName).filename() != fs::path(r.branchFileName).filename() ||
+                        l.pending != r.pending || l.adjacent != r.adjacent ||
+                        !pointsApproximatelyEqual(l.controlPointPosition, r.controlPointPosition) ||
+                        !pointsApproximatelyEqual(l.branchControlPointPosition,
+                                                  r.branchControlPointPosition)) {
+                        return false;
+                    }
+                }
+                return true;
+            };
+            const bool same = sa.linePoints == sb.linePoints && sa.tags == sb.tags &&
+                la::storedControlPointPositions(sa.controlPoints) ==
+                    la::storedControlPointPositions(sb.controlPoints) &&
+                sameLinks(sa.branches, sb.branches);
+            if (!same) {
+                return fail("two windows hold different unsaved versions of " +
+                            fiberErrorName(a.fiberFileName) + "; close one of them first");
+            }
+        }
+    }
+    // A running peer session could later publish or roll back branches that
+    // still name an original; refuse it now. Stored peers are matched to
+    // their sessions by identity, whether or not the session's live branches
+    // currently hold the link.
+    for (const auto& pane : _panes) {
+        if (!pane.session || pane.session->fiberDeleted ||
+            pane.session->taskState != LineAnnotationSession::TaskState::Running) {
+            continue;
+        }
+        const bool isPeer = std::any_of(
+            peers.begin(), peers.end(), [&pane](const StoredFiber& peer) {
+                return la::sameFiberIdentity(pane.session->fiberId, pane.session->fiberFileName,
+                                             peer.id, peer.fileName);
+            }) ||
+            std::any_of(pane.session->branches.begin(), pane.session->branches.end(),
+                        [&](const FiberBranchRef& branch) {
+                            return std::any_of(request.originals.begin(), request.originals.end(),
+                                               [&branch](const StoredFiber& original) {
+                                                   return branchReferencesFiber(
+                                                       branch, original.id, original.fileName);
+                                               });
+                        });
+        if (isPeer) {
+            return fail("the linked fiber " + fiberErrorName(pane.session->fiberFileName) +
+                        " is still optimizing; try again when it finishes");
+        }
+    }
+    struct LiveRedirect {
+        std::shared_ptr<LineAnnotationSession> session;
+        std::vector<FiberBranchRef> branches;
+        // Armed rollbacks hold branch vectors too; a later failing solve
+        // would reinstate them, so they are redirected alongside.
+        std::optional<std::vector<FiberBranchRef>> branchesBeforeModeChange;
+        std::optional<std::vector<FiberBranchRef>> collapseRollbackBranches;
+    };
+    std::vector<LiveRedirect> live;
+    const auto linksToAnyOriginal = [&](const std::vector<FiberBranchRef>& branches) {
+        return std::any_of(branches.begin(), branches.end(), [&](const FiberBranchRef& branch) {
+            return std::any_of(request.originals.begin(), request.originals.end(),
+                               [&branch](const StoredFiber& original) {
+                                   return branchReferencesFiber(branch, original.id,
+                                                                original.fileName);
+                               });
+        });
+    };
+    for (const auto& pane : _panes) {
+        if (!pane.session ||
+            std::find(consumed.begin(), consumed.end(), pane.session) != consumed.end()) {
+            continue;
+        }
+        auto& session = *pane.session;
+        const bool touched = linksToAnyOriginal(session.branches) ||
+            (session.branchesBeforeModeChange &&
+             linksToAnyOriginal(*session.branchesBeforeModeChange)) ||
+            (session.controlPointCollapseRollback &&
+             linksToAnyOriginal(session.controlPointCollapseRollback->branches));
+        if (!touched) {
+            continue;
+        }
+        LiveRedirect redirect;
+        redirect.session = pane.session;
+        redirect.branches = session.branches;
+        std::string error;
+        if (!la::redirectBranchRefs(redirect.branches, request.sources, &error)) {
+            return fail("the open session of " + fiberErrorName(session.fiberFileName) + ": " +
+                        error);
+        }
+        if (session.branchesBeforeModeChange) {
+            redirect.branchesBeforeModeChange = *session.branchesBeforeModeChange;
+            if (!la::redirectBranchRefs(*redirect.branchesBeforeModeChange, request.sources,
+                                        &error)) {
+                return fail("the open session of " + fiberErrorName(session.fiberFileName) +
+                            ": " + error);
+            }
+        }
+        if (session.controlPointCollapseRollback) {
+            redirect.collapseRollbackBranches = session.controlPointCollapseRollback->branches;
+            if (!la::redirectBranchRefs(*redirect.collapseRollbackBranches, request.sources,
+                                        &error)) {
+                return fail("the open session of " + fiberErrorName(session.fiberFileName) +
+                            ": " + error);
+            }
+        }
+        live.push_back(std::move(redirect));
+    }
+
+    // 2b. Files outside the write set that still name an original on disk
+    //     (entries the load dropped in memory, files the dedupe hid).
+    {
+        std::unordered_set<std::string> writeSetKeys;
+        for (const auto& fiber : request.newFibers) {
+            writeSetKeys.insert(vc3d::fiberSourceFileKey(fiber.sourceRoot, fiber.fileName));
+        }
+        for (const auto& peer : peers) {
+            writeSetKeys.insert(vc3d::fiberSourceFileKey(peer.sourceRoot, peer.fileName));
+        }
+        if (const auto stale = structuralEditStaleLinkOnDisk(request.originals, writeSetKeys)) {
+            return fail(*stale);
+        }
+    }
+
+    // 3. One batch: the new fibers and every redirected peer. Canonicalizing
+    //    them together recomputes every link direction from the FINAL lines
+    //    on both sides (the incident: directions copied onto a reversed
+    //    line), and the validator checks reciprocity with the loader's own
+    //    predicate.
+    std::vector<FiberSaveSnapshot> batch;
+    batch.reserve(request.newFibers.size() + peers.size());
+    for (const auto& fiber : request.newFibers) {
+        batch.push_back(makeFiberSaveSnapshot(fiber));
+    }
+    for (const auto& peer : peers) {
+        batch.push_back(makeFiberSaveSnapshot(peer));
+    }
+    try {
+        canonicalizeFiberSaveSnapshots(batch);
+        validateFiberSaveSnapshots(batch);
+    } catch (const std::exception& ex) {
+        return fail(std::string{"the result would not load back: "} + ex.what());
+    }
+
+    // 4. The graph the next load sees: untouched records + the batch, the
+    //    originals gone. Any issue touching the batch or a retired original
+    //    aborts; defects between untouched records are the loader prompt's.
+    const auto sourceKey = [](const StoredFiber& fiber, const std::string& fileName) {
+        return vc3d::fiberSourceFileKey(fiber.sourceRoot, fileName);
+    };
+    std::unordered_set<std::string> batchKeys;
+    std::unordered_set<std::string> retiredKeys;
+    for (const auto& snapshot : batch) {
+        batchKeys.insert(sourceKey(snapshot.fiber, snapshot.fiber.fileName));
+    }
+    for (const auto& original : request.originals) {
+        retiredKeys.insert(sourceKey(original, original.fileName));
+    }
+    std::vector<StoredFiber> graph;
+    graph.reserve(_fibers.size() + request.newFibers.size());
+    for (const auto& fiber : _fibers) {
+        if (isOriginal(fiber.id, fiber.fileName) ||
+            batchKeys.count(sourceKey(fiber, fiber.fileName)) != 0) {
+            continue;
+        }
+        graph.push_back(fiber);
+    }
+    for (const auto& snapshot : batch) {
+        graph.push_back(snapshot.fiber);
+    }
+    const auto check = la::checkStructuralEditGraph(
+        graph, batchKeys, retiredKeys,
+        [this](const std::vector<StoredFiber>& current) {
+            return collectLoadedFiberBranchIssues(current);
+        },
+        sourceKey);
+    for (const auto& issue : check.unrelated) {
+        Logger()->warn("Structural edit: pre-existing link issue left alone: {}: {}",
+                       fiberErrorName(graph[issue.fiberIndex].fileName), issue.reason);
+    }
+    if (!check.blocking.empty()) {
+        std::string reasons = "the result would not load back:";
+        std::size_t shown = 0;
+        for (const auto& issue : check.blocking) {
+            if (shown++ == 4) {
+                reasons += " ...";
+                break;
+            }
+            reasons += "\n" + fiberErrorName(graph[issue.fiberIndex].fileName) + ": " +
+                       issue.reason;
+        }
+        return fail(reasons);
+    }
+
+    // 5. Prebuild the post-commit memory state: nothing below the commit
+    //    allocates.
+    std::vector<StoredFiber> replacement;
+    replacement.reserve(_fibers.size() + request.newFibers.size());
+    const auto batchRecord = [&batch, &sourceKey](const StoredFiber& fiber) -> const StoredFiber* {
+        for (const auto& snapshot : batch) {
+            if (sourceKey(snapshot.fiber, snapshot.fiber.fileName) ==
+                sourceKey(fiber, fiber.fileName)) {
+                return &snapshot.fiber;
+            }
+        }
+        return nullptr;
+    };
+    for (const auto& fiber : _fibers) {
+        if (isOriginal(fiber.id, fiber.fileName)) {
+            continue;
+        }
+        if (const StoredFiber* canonical = batchRecord(fiber)) {
+            replacement.push_back(*canonical);
+        } else {
+            replacement.push_back(fiber);
+        }
+    }
+    for (std::size_t i = 0; i < request.newFibers.size(); ++i) {
+        replacement.push_back(batch[i].fiber);
+    }
+    vc3d::FiberRuntimeIds registry = _fiberRuntimeIds;
+    for (const auto& original : request.originals) {
+        registry.forget(original.sourceRoot, original.fileName);
+    }
+    for (const auto& fiber : request.newFibers) {
+        registry.remember(fiber.sourceRoot, fiber.fileName, fiber.id);
+    }
+    std::vector<la::FiberSavePayload> payloads;
+    payloads.reserve(batch.size());
+    for (const auto& snapshot : batch) {
+        payloads.push_back({snapshot.fiberId, snapshot.generation, snapshot.path,
+                            fiberSaveSnapshotToJson(snapshot)});
+    }
+    std::vector<fs::path> retirePaths;
+    std::vector<uint64_t> retiredIds;
+    for (const auto& original : request.originals) {
+        retirePaths.push_back(fiberPath(original));
+        retiredIds.push_back(original.id);
+    }
+    std::vector<std::pair<uint64_t, uint64_t>> savedIds;
+    for (const auto& snapshot : batch) {
+        savedIds.emplace_back(snapshot.fiberId, snapshot.generation);
+    }
+    const bool candidateOnOriginal =
+        _linkCandidate && std::any_of(request.originals.begin(), request.originals.end(),
+                                      [this](const StoredFiber& original) {
+                                          return original.id == _linkCandidate->fiberId;
+                                      });
+
+    // 6. Commit. The recovery latch is set BEFORE the job and cleared only
+    //    when the job reports a clean outcome (success, or a failure whose
+    //    undo left nothing behind): a job that cannot even return normally
+    //    leaves it set without allocating anything.
+    _structuralEditRecoveryRequired = true;
+    const auto saveResult =
+        la::runFiberSaveJob(++_nextFiberSaveSequence, std::move(payloads), retirePaths);
+    if (saveResult.ok || saveResult.recoveryFiles.empty()) {
+        _structuralEditRecoveryRequired = false;
+    }
+    if (!saveResult.ok) {
+        outcome.recoveryRequired = !saveResult.recoveryFiles.empty();
+        outcome.error = saveResult.error;
+        for (const auto& path : saveResult.recoveryFiles) {
+            outcome.error += "\n" + path.string();
+        }
+        return outcome;
+    }
+
+    // 7. Install: swaps and flag writes only.
+    if (committed) {
+        *committed = true;
+    }
+    _fibers.swap(replacement);
+    {
+        using std::swap;
+        swap(_fiberRuntimeIds, registry);
+    }
+    for (auto& redirect : live) {
+        redirect.session->branches.swap(redirect.branches);
+        if (redirect.branchesBeforeModeChange && redirect.session->branchesBeforeModeChange) {
+            redirect.session->branchesBeforeModeChange->swap(*redirect.branchesBeforeModeChange);
+        }
+        if (redirect.collapseRollbackBranches && redirect.session->controlPointCollapseRollback) {
+            redirect.session->controlPointCollapseRollback->branches.swap(
+                *redirect.collapseRollbackBranches);
+        }
+    }
+    for (const auto& session : consumed) {
+        session->fiberDeleted = true;
+        session->suppressFiberSave = true;
+        session->autoSaveScheduled = false;
+        if (session->runningSolveCancel) {
+            session->runningSolveCancel->store(true);
+        }
+        session->solveQueue.shutdown();
+    }
+    ++_fiberDataGeneration;
+    if (candidateOnOriginal) {
+        _linkCandidate.reset();
+    }
+    outcome.ok = true;
+
+    // 8. Notify. Memory is consistent from here on; a throw below leaves the
+    //    edit committed and only the views stale, which the caller reports
+    //    as such (never as "nothing was changed").
+    try {
+        for (std::size_t i = 0; i < request.newFibers.size(); ++i) {
+            outcome.writtenFileNames.push_back(batch[i].fiber.fileName);
+        }
+        for (const auto& [id, generation] : savedIds) {
+            emit fiberSaved(id, generation);
+        }
+        for (const auto& path : retirePaths) {
+            emit fiberFileRemoved(QString::fromStdString(path.string()));
+        }
+        for (const uint64_t id : retiredIds) {
+            invalidateFiberAlignmentMetrics(id, false);
+        }
+        for (std::size_t i = 0; i < request.newFibers.size(); ++i) {
+            invalidateFiberAlignmentMetrics(batch[i].fiberId, true);
+        }
+        emit fibersDeleted(retiredIds);
+        emitFiberSummaries();
+        refreshBranchLineViews();
+
+        // 9. The originals' panes close without a finalize or a close-save
+        //    (a deleted session cannot save); when they actually go away is
+        //    irrelevant to the committed state.
+        for (const auto& pane : _panes) {
+            if (pane.session && pane.dialog &&
+                std::find(consumed.begin(), consumed.end(), pane.session) != consumed.end()) {
+                closeLineAnnotationDialogAfterFinalization(pane.dialog);
+            }
+        }
+        closeIntersectionInspectionForRetiredFibers(retiredIds);
+    } catch (const std::exception& ex) {
+        // Best effort: the diagnostics allocate; if that fails too the
+        // caller still sees `committed` and reports a stale-view warning.
+        try {
+            Logger()->warn("Structural edit committed, but refreshing the views failed: {}",
+                           ex.what());
+            outcome.warning = ex.what();
+        } catch (...) {
+        }
+    }
+    return outcome;
+}
+
 void LineAnnotationController::handleGeneratedControlPointMergeWithCandidate(
     const std::string& surfaceName,
     size_t controlPointIndex,
@@ -8778,8 +9346,6 @@ void LineAnnotationController::handleGeneratedControlPointMergeWithCandidate(
     }
     auto& session = *pane->session;
     if (session.fiberDeleted) {
-        // The fiber was deleted underneath this session; a structural edit
-        // would be persisted as a new file under the deleted name.
         showError(tr("This fiber was deleted; it can no longer be edited."),
                   session.suppressErrorDialogs);
         return;
@@ -8788,9 +9354,6 @@ void LineAnnotationController::handleGeneratedControlPointMergeWithCandidate(
         showError(tr("Line optimization is already running."));
         return;
     }
-    // Cross-fiber operation: make sure no participating fiber's newest
-    // geometry is still session-only behind a debounced autosave.
-    flushAllPendingSessionAutoSaves();
     if (controlPointIndex >= session.controlPoints.size()) {
         return;
     }
@@ -8808,466 +9371,264 @@ void LineAnnotationController::handleGeneratedControlPointMergeWithCandidate(
         return;
     }
     const bool suppressErrors = session.suppressErrorDialogs;
-
-    // Bake unsaved session edits into a stored snapshot; everything below
-    // works on snapshots so no in-memory state mutates until the merged
-    // fiber is safely on disk.
-    const StoredFiber clicked = storedFiberFromSession(session);
-    const uint64_t clickedId = clicked.id;
-    const std::string clickedFileName = clicked.fileName;
-    const std::filesystem::path clickedPath = fiberPath(clicked);
-
-    const LinkCandidate candidate = *_linkCandidate;
-    // The candidate fiber can be open in a dialog-less editing session with
-    // unsaved changes; merging (and then deleting) the stale stored snapshot
-    // would discard them. Bake such a session into _fibers first — same
-    // eligibility guards as scheduleBranchMetadataSaves. A candidate whose
-    // solve is still RUNNING refuses outright: its session holds edits the
-    // Succeeded gate below would skip, and the merge deletes the original
-    // files, so proceeding would persist the stale stored geometry and
-    // discard the edits.
-    for (const auto& otherPane : _panes) {
-        if (otherPane.session &&
-            otherPane.session->fiberId == candidate.fiberId &&
-            otherPane.session->taskState ==
-                LineAnnotationSession::TaskState::Running) {
-            showError(tr("The merge candidate's fiber is still optimizing; "
-                         "try again when it finishes."),
-                      suppressErrors);
-            return;
-        }
-    }
-    for (const auto& otherPane : _panes) {
-        if (!otherPane.session ||
-            otherPane.session->fiberId != candidate.fiberId ||
-            otherPane.session->suppressFiberSave ||
-            otherPane.session->taskState != LineAnnotationSession::TaskState::Succeeded ||
-            otherPane.session->optimizedLine.points.empty() ||
-            otherPane.session->controlPoints.empty()) {
-            continue;
-        }
-        StoredFiber liveFar = storedFiberFromSession(*otherPane.session);
-        auto liveIt = std::find_if(
-            _fibers.begin(), _fibers.end(), [&liveFar](const StoredFiber& fiber) {
-                return fiber.id == liveFar.id ||
-                    (!liveFar.fileName.empty() && fiber.fileName == liveFar.fileName);
-            });
-        if (liveIt == _fibers.end()) {
-            _fibers.push_back(std::move(liveFar));
-        } else {
-            *liveIt = std::move(liveFar);
-        }
-        break;
-    }
-    const auto candidateIt = std::find_if(
-        _fibers.begin(), _fibers.end(), [&candidate](const StoredFiber& fiber) {
-            return fiber.id == candidate.fiberId;
-        });
-    if (candidateIt == _fibers.end()) {
-        _linkCandidate.reset();
-        showError(tr("The merge candidate's fiber no longer exists."), suppressErrors);
+    if (_structuralEditInProgress) {
+        showError(tr("Another merge or split is still in progress."), suppressErrors);
         return;
     }
-    const StoredFiber far = *candidateIt;
-    const uint64_t farId = far.id;
-    const std::string farFileName = far.fileName;
-    const std::filesystem::path farPath = fiberPath(far);
-
-    const auto candidateIndex = matchingStoredControlPointIndex(
-        far.controlPoints, candidate.storedControlPointIndexHint, candidate.position);
-    if (!candidateIndex) {
-        _linkCandidate.reset();
-        showError(tr("The merge candidate control point no longer exists."),
-                  suppressErrors);
-        return;
-    }
-    int clickedIndexHint = -1;
-    const auto storedIndexMap = storedIndexMapForSessionControls(session.controlPoints);
-    if (controlPointIndex < storedIndexMap.size()) {
-        clickedIndexHint = storedIndexMap[controlPointIndex];
-    }
-    const auto clickedIndex = matchingStoredControlPointIndex(
-        clicked.controlPoints,
-        clickedIndexHint,
-        session.controlPoints[controlPointIndex].volumePoint);
-    if (!clickedIndex) {
-        showError(tr("Could not resolve the clicked control point."), suppressErrors);
-        return;
-    }
-    const size_t clickedCount = clicked.controlPoints.size();
-    const size_t farCount = far.controlPoints.size();
-    const bool clickedIsEndpoint = *clickedIndex == 0 ||
-        static_cast<size_t>(*clickedIndex) + 1 == clickedCount;
-    const bool candidateIsEndpoint = *candidateIndex == 0 ||
-        static_cast<size_t>(*candidateIndex) + 1 == farCount;
-    if (!clickedIsEndpoint || !candidateIsEndpoint) {
-        showError(tr("Merge joins fiber endpoints; pick the first or last "
-                     "control point on both fibers."),
-                  suppressErrors);
-        return;
-    }
-
-    // The only consumable mutual link is one between exactly the two merge
-    // endpoints; anything else connecting these fibers blocks the merge.
-    const auto isPairLink = [&](const FiberBranchRef& branch, uint64_t otherId,
-                                const std::string& otherFile, int localIdx,
-                                int otherIdx) {
-        return branchReferencesFiber(branch, otherId, otherFile) &&
-            branch.controlPointIndex == localIdx &&
-            branch.branchControlPointIndex == otherIdx;
-    };
-    for (const auto& branch : clicked.branches) {
-        if (branchReferencesFiber(branch, farId, farFileName) &&
-            !isPairLink(branch, farId, farFileName, *clickedIndex, *candidateIndex)) {
-            showError(tr("These fibers are linked elsewhere; unlink first."),
-                      suppressErrors);
-            return;
-        }
-    }
-    for (const auto& branch : far.branches) {
-        if (branchReferencesFiber(branch, clickedId, clickedFileName) &&
-            !isPairLink(branch, clickedId, clickedFileName, *candidateIndex,
-                        *clickedIndex)) {
-            showError(tr("These fibers are linked elsewhere; unlink first."),
-                      suppressErrors);
-            return;
-        }
-    }
-
-    const auto pickedMode = pickMergeOptimizationMode(
-        session, clicked.optimizationMode, far.optimizationMode);
-    if (!pickedMode) {
-        return;
-    }
-
-    // Orient both sides so the clicked fiber ends at the join and the
-    // candidate fiber starts at it; the merged line reads clicked-first.
-    const bool reverseClicked = *clickedIndex == 0;
-    const bool reverseCandidate =
-        static_cast<size_t>(*candidateIndex) + 1 == farCount;
-    std::vector<vc3d::line_annotation::StoredControlPoint> clickedControls =
-        reverseClicked
-            ? vc3d::line_annotation::reversedStoredControlPoints(clicked.controlPoints)
-            : clicked.controlPoints;
-    std::vector<cv::Vec3d> clickedLine = clicked.linePoints;
-    if (reverseClicked) {
-        std::reverse(clickedLine.begin(), clickedLine.end());
-    }
-    std::vector<vc3d::line_annotation::StoredControlPoint> farControls =
-        reverseCandidate
-            ? vc3d::line_annotation::reversedStoredControlPoints(far.controlPoints)
-            : far.controlPoints;
-    std::vector<cv::Vec3d> farLine = far.linePoints;
-    if (reverseCandidate) {
-        std::reverse(farLine.begin(), farLine.end());
-    }
-    // The join makes both join-side ends interior, and a kollesis
-    // termination is a claim that the fiber ends there. Refuse rather than
-    // silently drop the claim; the user untags first if the merge is right.
-    if ((!clickedControls.empty() &&
-         vc3d::line_annotation::hasControlPointTag(
-             clickedControls.back().tags,
-             vc3d::line_annotation::kKollesisTerminationTag)) ||
-        (!farControls.empty() &&
-         vc3d::line_annotation::hasControlPointTag(
-             farControls.front().tags,
-             vc3d::line_annotation::kKollesisTerminationTag))) {
-        showError(tr("Cannot merge: a join control point is tagged as a kollesis "
-                     "termination. Remove the tag first."),
-                  suppressErrors);
-        return;
-    }
-    auto geometry = vc3d::line_annotation::computeFiberMergeGeometry(
-        clickedControls, clickedLine, farControls, farLine);
-    if (!geometry) {
-        showError(tr("Cannot merge: the stored control points do not resolve "
-                     "on the stored lines."),
-                  suppressErrors);
-        return;
-    }
-    const auto clickedRemap = [&](int idx) {
-        return reverseClicked ? static_cast<int>(clickedCount) - 1 - idx : idx;
-    };
-    const auto farRemap = [&](int idx) {
-        const int within = reverseCandidate
-            ? static_cast<int>(farCount) - 1 - idx
-            : idx;
-        return static_cast<int>(clickedCount) + within;
-    };
-
-    StoredFiber merged;
-    merged.username = currentFiberUsername();
-    merged.startedAt = currentFiberDateTimeString();
-    merged.sequence = nextFiberSequenceForUsername(merged.username);
-    merged.fileName = vc3d::line_annotation::fiberFileName(
-        merged.username, merged.startedAt, merged.sequence);
-    merged.id = std::max(nextFiberId(), std::max(clickedId, farId) + 1);
-    merged.sourceRoot = primaryFiberSourceRoot();
-    merged.generation = 1;
-    // A merged fiber has one width: prefer the clicked fiber's annotation.
-    merged.width = clicked.width > 0 ? clicked.width : far.width;
-    merged.widthGapFraction = clicked.width > 0 ? clicked.widthGapFraction : far.widthGapFraction;
-    merged.controlPoints = std::move(geometry->controlPoints);
-    merged.linePoints = std::move(geometry->linePoints);
-    // The join can put two break points next to each other: the live copy
-    // (saved, inserted into _fibers and re-optimized below) carries the gap
-    // tag and its cubic-spline goal like any other structural edit, not only
-    // the writer's serialization copy.
-    vc3d::line_annotation::applyGapSpanPolicy(merged.controlPoints);
-    merged.optimizationMode = *pickedMode;
-    merged.manualHvTag =
-        clicked.manualHvTag == far.manualHvTag ? clicked.manualHvTag : std::string{};
-    for (const auto& tag : clicked.tags) {
-        addUniqueSorted(merged.tags, tag);
-    }
-    for (const auto& tag : far.tags) {
-        addUniqueSorted(merged.tags, tag);
-    }
-    // The join span has no real geometry until the merged line is re-fit.
-    addUniqueSorted(merged.tags, std::string{kNeedsReoptimizationTag});
-    merged.hvClassification = vc3d::line_annotation::classifyFiberHv(
-        vc3d::line_annotation::storedControlPointPositions(merged.controlPoints));
-    // Third-party links only: the pair link between the merge endpoints is
-    // consumed, and other mutual links were rejected above.
-    for (const auto& branch : clicked.branches) {
-        if (branchReferencesFiber(branch, farId, farFileName) ||
-            branch.controlPointIndex < 0) {
-            continue;
-        }
-        FiberBranchRef moved = branch;
-        moved.controlPointIndex = clickedRemap(branch.controlPointIndex);
-        merged.branches.push_back(std::move(moved));
-    }
-    for (const auto& branch : far.branches) {
-        if (branchReferencesFiber(branch, clickedId, clickedFileName) ||
-            branch.controlPointIndex < 0) {
-            continue;
-        }
-        FiberBranchRef moved = branch;
-        moved.controlPointIndex = farRemap(branch.controlPointIndex);
-        merged.branches.push_back(std::move(moved));
-    }
-
-    // Persist the merged fiber (temp write + atomic rename) before touching
-    // any in-memory state.
-    std::error_code collisionError;
-    if (std::filesystem::exists(fiberPath(merged), collisionError)) {
-        showError(tr("A fiber file with the new name already exists."), suppressErrors);
-        return;
-    }
-    {
-        const auto saveResult = vc3d::line_annotation::runFiberSaveJob(
-            ++_nextFiberSaveSequence,
-            {vc3d::line_annotation::FiberSavePayload{
-                merged.id, merged.generation, fiberPath(merged), fiberToJson(merged)}});
-        if (!saveResult.ok) {
-            showError(tr("Could not save the merged fiber: %1")
-                          .arg(QString::fromStdString(saveResult.error)),
-                      suppressErrors);
-            return;
-        }
-        // Persisted: the next reload finds this file under this id.
-        _fiberRuntimeIds.remember(merged.sourceRoot, merged.fileName, merged.id);
-    }
-
-    const uint64_t mergedId = merged.id;
-    const std::string mergedFileName = merged.fileName;
-    const size_t joinControlIndex = geometry->joinControlIndex;
-    {
-        auto it = std::find_if(
-            _fibers.begin(), _fibers.end(), [&merged](const StoredFiber& existing) {
-                return (!merged.fileName.empty() &&
-                        existing.fileName == merged.fileName) ||
-                    existing.id == merged.id;
-            });
-        if (it == _fibers.end()) {
-            _fibers.push_back(std::move(merged));
-        } else {
-            *it = std::move(merged);
-        }
-    }
-    // _fibers now deviates from what the previous generation described — the
-    // merged fiber coexists with both originals until the deferred retirement
-    // below settles — and that retirement runs nested event loops. Bumping here
-    // makes any map built before this edit stale immediately, and the settling
-    // emitFiberSummaries() bumping again makes a map built *inside* the window
-    // stale at settlement. What no counter can give is a map built inside the
-    // window reading as stale while still inside it; the gates catch it at the
-    // settling bump instead.
-    ++_fiberDataGeneration;
-
-    // Redirect third-party reciprocal refs from either original onto the
-    // merged fiber, indices through the orientation remaps.
-    std::vector<uint64_t> affectedFiberIds;
-    const auto redirectBranches = [&](std::vector<FiberBranchRef>& branches,
-                                      uint64_t ownerFiberId) {
-        bool changed = false;
-        for (auto& branch : branches) {
-            const bool toClicked =
-                branchReferencesFiber(branch, clickedId, clickedFileName);
-            const bool toFar = branchReferencesFiber(branch, farId, farFileName);
-            if ((!toClicked && !toFar) || branch.branchControlPointIndex < 0) {
-                continue;
-            }
-            branch.branchFiberId = mergedId;
-            branch.branchFileName = mergedFileName;
-            branch.branchControlPointIndex = toClicked
-                ? clickedRemap(branch.branchControlPointIndex)
-                : farRemap(branch.branchControlPointIndex);
-            changed = true;
-        }
-        if (changed) {
-            addUniqueFiberId(affectedFiberIds, ownerFiberId);
-        }
-    };
-    for (const auto& otherPane : _panes) {
-        if (otherPane.session && otherPane.session->fiberId != clickedId &&
-            otherPane.session->fiberId != farId) {
-            redirectBranches(otherPane.session->branches, otherPane.session->fiberId);
-        }
-    }
-    for (auto& fiber : _fibers) {
-        if (fiber.id != clickedId && fiber.id != farId) {
-            redirectBranches(fiber.branches, fiber.id);
-        }
-    }
-    scheduleBranchMetadataSaves(affectedFiberIds, 0);
-
-    _linkCandidate.reset();
-
-    // Retire both originals. Not deleteFibers: removeBranchLinksToFiber
-    // would strip the peer links just redirected. suppressFiberSave covers
-    // dialog-less inspection sessions too.
-    // Only the suppression this merge sets is its to release on failure: a
-    // session already suppressed (or deleted) stays as it was.
-    std::vector<std::weak_ptr<LineAnnotationSession>> suppressedByMerge;
-    for (const auto& otherPane : _panes) {
-        if (otherPane.session && (otherPane.session->fiberId == clickedId ||
-                                  otherPane.session->fiberId == farId) &&
-            !otherPane.session->suppressFiberSave) {
-            otherPane.session->suppressFiberSave = true;
-            suppressedByMerge.push_back(otherPane.session);
-        }
-    }
-    // This handler runs inside the dialog's own menu-callback stack, and
-    // both waitForFiberSaves and the re-optimization spin nested event
-    // loops that would process the closed dialog's deferred deletion while
-    // its frames are still below us. Retire the originals and re-fit the
-    // merged line on a clean stack.
-    QTimer::singleShot(0, this, [this, clickedId, farId, clickedPath, farPath,
-                                 mergedId, mergedFileName,
-                                 joinControlIndex, suppressErrors,
-                                 suppressedByMerge,
-                                 packageGeneration = _packageGeneration]() {
-        // The originals, their paths and their ids belong to the package the
-        // merge ran in; a package switch before or during this callback
-        // (its drain yields) tore that package's sessions down, and the new
-        // package's list and id space must not be touched with them.
-        const auto packageChanged = [this, packageGeneration]() {
-            if (_packageGeneration == packageGeneration) {
-                return false;
-            }
-            Logger()->warn("Merge retirement abandoned: the package changed");
-            return true;
-        };
-        if (packageChanged()) {
-            return;
-        }
-        closeDialogPanesForFibers({clickedId, farId});
-        // Closing can yield through a pane's finalization or error dialog.
-        if (packageChanged()) {
-            return;
-        }
-        closeIntersectionInspectionForRetiredFibers({clickedId, farId});
-        // Fail loudly instead of reconciling: on any problem below, the
-        // originals are kept, their surviving sessions are made saveable
-        // again, and a full reload rebuilds memory from disk (branch refs
-        // re-derive from branch_file; the merged fiber's
-        // needs_reoptimization tag re-prompts the re-fit). The user
-        // resolves the duplicate old/new fibers.
-        const auto bailOut = [this, suppressedByMerge,
-                              suppressErrors](const QString& reason) {
-            // Release only what this merge suppressed, and never a session
-            // whose fiber was deleted meanwhile.
-            for (const auto& weak : suppressedByMerge) {
-                if (const auto session = weak.lock(); session && !session->fiberDeleted) {
-                    session->suppressFiberSave = false;
-                }
-            }
-            showError(tr("The merge could not be completed: %1\nReloading fibers from disk.")
-                          .arg(reason),
-                      suppressErrors);
-            loadFibersForCurrentPackage();
-        };
-        // Flush the queue (the redirected peer links ride it) and the close
-        // before retiring, so a failed save or a pane that refused to close
-        // (failed finalization) is caught while the originals still exist.
-        const uint64_t saveFailuresBefore = _fiberSaveFailureCount;
-        waitForFiberSaves();
-        if (packageChanged()) {
-            return;
-        }
-        if (_fiberSaveFailureCount != saveFailuresBefore) {
-            bailOut(tr("a pending fiber save failed"));
-            return;
-        }
+    _structuralEditInProgress = true;
+    auto release = qScopeGuard([this]() { _structuralEditInProgress = false; });
+    try {
+        const LinkCandidate candidate = *_linkCandidate;
         for (const auto& otherPane : _panes) {
-            if (otherPane.session && otherPane.dialog &&
-                (otherPane.session->fiberId == clickedId ||
-                 otherPane.session->fiberId == farId)) {
-                bailOut(tr("the annotation workspace did not close"));
+            if (otherPane.session && otherPane.session->fiberId == candidate.fiberId &&
+                otherPane.session->taskState == LineAnnotationSession::TaskState::Running) {
+                showError(tr("The merge candidate's fiber is still optimizing; "
+                             "try again when it finishes."),
+                          suppressErrors);
                 return;
             }
         }
-        // The originals must still be the fibers the merge consumed (same
-        // id, same file) before their files are removed.
-        const auto stillOriginal = [this](uint64_t id, const fs::path& path) {
-            return std::any_of(_fibers.begin(), _fibers.end(), [id, &path](const StoredFiber& f) {
-                return f.id == id && f.fileName == path.filename().string();
+        const auto candidateIt = std::find_if(
+            _fibers.begin(), _fibers.end(), [&candidate](const StoredFiber& fiber) {
+                return fiber.id == candidate.fiberId;
             });
-        };
-        if (!stillOriginal(clickedId, clickedPath) || !stillOriginal(farId, farPath)) {
-            bailOut(tr("the original fibers changed meanwhile"));
+        if (candidateIt == _fibers.end()) {
+            _linkCandidate.reset();
+            showError(tr("The merge candidate's fiber no longer exists."), suppressErrors);
             return;
         }
-        // A failure rolls the removed originals back where the save job can
-        // (it reports recovery copies where it cannot).
-        const auto retireResult = vc3d::line_annotation::runFiberSaveJob(
-            ++_nextFiberSaveSequence, {}, {clickedPath, farPath});
-        if (!retireResult.ok) {
-            bailOut(QString::fromStdString(retireResult.error));
+        std::string reason;
+        const fs::path sessionRoot = session.fiberSourceRoot.empty()
+            ? primaryFiberSourceRoot()
+            : session.fiberSourceRoot;
+        if (!structuralEditParticipantAllowed(sessionRoot, session.fiberFileName, &reason) ||
+            !structuralEditParticipantAllowed(candidateIt->sourceRoot, candidateIt->fileName,
+                                              &reason)) {
+            showError(tr("Cannot merge: %1").arg(QString::fromStdString(reason)), suppressErrors);
             return;
         }
-        // The originals' names are free (their ids stay retired); the files
-        // are gone, so a fiber imported under either name is a different one.
-        forgetFiberRuntimeBinding(clickedId);
-        forgetFiberRuntimeBinding(farId);
-        _fibers.erase(std::remove_if(_fibers.begin(),
-                                     _fibers.end(),
-                                     [clickedId, farId](const StoredFiber& fiber) {
-                                         return fiber.id == clickedId ||
-                                             fiber.id == farId;
-                                     }),
-                      _fibers.end());
-        invalidateFiberAlignmentMetrics(clickedId, false);
-        invalidateFiberAlignmentMetrics(farId, false);
-        emit fibersDeleted(
-            {std::min(clickedId, farId), std::max(clickedId, farId)});
 
-        // Re-fit the merged line (join span + extrapolation tails); consumes
-        // the needs_reoptimization tag, which otherwise re-prompts on load.
+        StructuralEditCapture capture;
+        capture.packageGeneration = _packageGeneration;
+        capture.loadSequence = _fiberLoadSequence;
+        capture.session = pane->session;
+        capture.surfaceName = surfaceName;
+        capture.sessionFiberId = session.fiberId;
+        capture.sessionFileName = session.fiberFileName;
+        capture.firstPoint = session.controlPoints[controlPointIndex].volumePoint;
+        {
+            const auto storedIndexMap = storedIndexMapForSessionControls(session.controlPoints);
+            capture.firstHint =
+                controlPointIndex < storedIndexMap.size() ? storedIndexMap[controlPointIndex] : -1;
+        }
+        capture.farId = candidateIt->id;
+        capture.farFileName = candidateIt->fileName;
+        capture.farSourceRoot = candidateIt->sourceRoot;
+        capture.farPoint = candidate.position;
+        capture.farHint = candidate.storedControlPointIndexHint;
+        capture.suppressErrors = suppressErrors;
+        const auto candidateMode = candidateIt->optimizationMode;
+
+        // The only modal of phase A. Nothing captured above is read from
+        // live state again: a package switch or a pane close during the
+        // prompt is caught by phase B's re-resolution.
+        const auto pickedMode =
+            pickMergeOptimizationMode(session, session.fiberOptimizationMode, candidateMode);
+        if (!pickedMode || _packageGeneration != capture.packageGeneration) {
+            return;
+        }
+        capture.mode = *pickedMode;
+        QTimer::singleShot(0, this, [this, capture = std::move(capture)]() mutable {
+            commitFiberMerge(std::move(capture));
+        });
+        release.dismiss();
+    } catch (const std::exception& ex) {
+        Logger()->warn("Merge aborted: {}", ex.what());
+        showError(tr("The merge could not be started: %1").arg(QString::fromUtf8(ex.what())),
+                  suppressErrors);
+    }
+}
+
+void LineAnnotationController::commitFiberMerge(StructuralEditCapture capture)
+{
+    namespace la = vc3d::line_annotation;
+    auto release = qScopeGuard([this]() { _structuralEditInProgress = false; });
+    const auto abort = [this, &capture](const QString& reason) {
+        Logger()->warn("Merge aborted: {}", reason.toStdString());
+        showError(tr("The merge could not be completed: %1\nNothing was changed.").arg(reason),
+                  capture.suppressErrors);
+    };
+    bool committed = false;
+    try {
+        std::string reason;
+        if (!structuralEditPreflight(capture.packageGeneration, capture.loadSequence, &reason)) {
+            if (!reason.empty()) {
+                abort(QString::fromStdString(reason));
+            }
+            return;
+        }
+        const auto clickedSession = capture.session.lock();
+        if (!clickedSession || clickedSession->fiberDeleted ||
+            clickedSession->fiberId != capture.sessionFiberId ||
+            clickedSession->fiberFileName != capture.sessionFileName) {
+            abort(tr("the fiber's annotation session changed meanwhile"));
+            return;
+        }
+        if (clickedSession->taskState == LineAnnotationSession::TaskState::Running) {
+            abort(tr("line optimization is running on the fiber"));
+            return;
+        }
+        std::shared_ptr<LineAnnotationSession> farSession;
+        for (const auto& pane : _panes) {
+            if (pane.session && !pane.session->fiberDeleted &&
+                pane.session->fiberId == capture.farId &&
+                pane.session->fiberFileName == capture.farFileName) {
+                if (pane.session->taskState == LineAnnotationSession::TaskState::Running) {
+                    abort(tr("the merge candidate's fiber is still optimizing"));
+                    return;
+                }
+                farSession = pane.session;
+                break;
+            }
+        }
+        // Planning snapshots: a session's current state where one is open
+        // (its unsaved edits included), the stored record otherwise.
+        const StoredFiber clicked = makeStoredFiberSessionSnapshot(*clickedSession).fiber;
+        StoredFiber far;
+        if (farSession) {
+            far = makeStoredFiberSessionSnapshot(*farSession).fiber;
+        } else {
+            const auto it = std::find_if(
+                _fibers.begin(), _fibers.end(), [&capture](const StoredFiber& fiber) {
+                    return fiber.id == capture.farId && fiber.fileName == capture.farFileName;
+                });
+            if (it == _fibers.end()) {
+                abort(tr("the merge candidate's fiber no longer exists"));
+                return;
+            }
+            far = *it;
+        }
+        const auto clickedIndex = matchingStoredControlPointIndex(
+            clicked.controlPoints, capture.firstHint, capture.firstPoint);
+        if (!clickedIndex) {
+            abort(tr("the clicked control point could not be resolved"));
+            return;
+        }
+        const auto candidateIndex =
+            matchingStoredControlPointIndex(far.controlPoints, capture.farHint, capture.farPoint);
+        if (!candidateIndex) {
+            abort(tr("the merge candidate control point no longer exists"));
+            return;
+        }
+        if (!structuralEditParticipantAllowed(clicked.sourceRoot, clicked.fileName, &reason) ||
+            !structuralEditParticipantAllowed(far.sourceRoot, far.fileName, &reason)) {
+            abort(QString::fromStdString(reason));
+            return;
+        }
+        // Coordinate domains are compared as DECLARED in the stored records
+        // (a session resolves an unset one through the manifest at open
+        // time, so two compatible unset records could otherwise differ);
+        // the merged fiber then inherits the clicked side's, resolved or not.
+        {
+            const auto declaredDomain = [this](const StoredFiber& snapshot) {
+                const auto it = std::find_if(
+                    _fibers.begin(), _fibers.end(), [&snapshot](const StoredFiber& fiber) {
+                        return la::sameFiberIdentity(fiber.id, fiber.fileName, snapshot.id,
+                                                     snapshot.fileName);
+                    });
+                return it == _fibers.end() ? snapshot.coordinateBaseShapeZYX
+                                           : it->coordinateBaseShapeZYX;
+            };
+            if (declaredDomain(clicked) != declaredDomain(far)) {
+                abort(tr("the fibers are stored in different coordinate domains"));
+                return;
+            }
+            far.coordinateBaseShapeZYX = clicked.coordinateBaseShapeZYX;
+        }
+
+        la::NewFiberIdentity identity;
+        identity.username = currentFiberUsername();
+        identity.startedAt = currentFiberDateTimeString();
+        identity.sequence = nextFiberSequenceForUsername(identity.username);
+        identity.fileName =
+            la::fiberFileName(identity.username, identity.startedAt, identity.sequence);
+        identity.id = std::max(nextFiberId(), std::max(clicked.id, far.id) + 1);
+        identity.sourceRoot = primaryFiberSourceRoot();
+
+        auto plan = std::make_shared<la::MergePlan>();
+        {
+            auto planned = la::planFiberMerge(clicked, *clickedIndex, far, *candidateIndex,
+                                              capture.mode, identity, &reason);
+            if (!planned) {
+                abort(QString::fromStdString(reason));
+                return;
+            }
+            *plan = std::move(*planned);
+        }
+        const uint64_t mergedId = plan->merged.id;
+        const std::string mergedFileName = plan->merged.fileName;
+        const auto joinControlIndex = static_cast<int>(plan->joinControlIndex);
+
+        StructuralEditRequest request;
+        request.verb = "merge";
+        request.newFibers.push_back(plan->merged);
+        request.originals = {clicked, far};
+        request.sources.push_back({clicked.id, clicked.fileName, nullptr,
+                                   [plan, mergedId, mergedFileName](int index) {
+                                       return la::RedirectTarget{mergedId, mergedFileName,
+                                                                 plan->clickedRemap(index)};
+                                   }});
+        request.sources.push_back({far.id, far.fileName, nullptr,
+                                   [plan, mergedId, mergedFileName](int index) {
+                                       return la::RedirectTarget{mergedId, mergedFileName,
+                                                                 plan->farRemap(index)};
+                                   }});
+        request.consumedSessions.push_back(clickedSession);
+        if (farSession) {
+            request.consumedSessions.push_back(farSession);
+        }
+        const auto outcome = commitStructuralEdit(std::move(request), &committed);
+        if (!outcome.ok) {
+            if (outcome.recoveryRequired) {
+                Logger()->warn("Merge failed and the files were not fully restored: {}",
+                               outcome.error);
+                showError(tr("The merge failed and the fiber files could not be fully "
+                             "restored:\n%1\nReload the project before continuing.")
+                              .arg(QString::fromStdString(outcome.error)),
+                          capture.suppressErrors);
+            } else {
+                abort(QString::fromStdString(outcome.error));
+            }
+            return;
+        }
+        if (!outcome.warning.empty()) {
+            showError(tr("The merge was saved, but refreshing the views failed: %1\n"
+                         "Reload the project to see the result.")
+                          .arg(QString::fromStdString(outcome.warning)),
+                      capture.suppressErrors);
+        }
+        Logger()->info("Merged {} and {} into {}", clicked.fileName, far.fileName, mergedFileName);
+
+        // The re-fit yields (dataset picker, save drain): release the guard
+        // first. Its outcome does not change the committed graph.
+        _structuralEditInProgress = false;
+        release.dismiss();
         reoptimizeMergedFibers({mergedFileName});
-        // The re-fit yields (dataset picker, save drain); the merged fiber's
-        // id belongs to the package the merge ran in.
-        if (packageChanged()) {
+        if (_packageGeneration != capture.packageGeneration) {
             return;
         }
-
-        invalidateFiberAlignmentMetrics(mergedId, true);
-        emitFiberSummaries();
-        refreshBranchLineViews();
-        openFiberAtControlPoint(mergedId, static_cast<int>(joinControlIndex));
-    });
+        openFiberAtControlPoint(mergedId, joinControlIndex);
+    } catch (const std::exception& ex) {
+        if (committed) {
+            Logger()->warn("Merge committed, but a later step failed: {}", ex.what());
+            showError(tr("The merge was saved, but refreshing the views failed: %1\n"
+                         "Reload the project to see the result.")
+                          .arg(QString::fromUtf8(ex.what())),
+                      capture.suppressErrors);
+        } else {
+            abort(QString::fromUtf8(ex.what()));
+        }
+    }
 }
 
 void LineAnnotationController::handleGeneratedSpanSplit(
@@ -9282,8 +9643,6 @@ void LineAnnotationController::handleGeneratedSpanSplit(
     }
     auto& session = *pane->session;
     if (session.fiberDeleted) {
-        // The fiber was deleted underneath this session; a structural edit
-        // would be persisted as a new file under the deleted name.
         showError(tr("This fiber was deleted; it can no longer be edited."),
                   session.suppressErrorDialogs);
         return;
@@ -9292,9 +9651,6 @@ void LineAnnotationController::handleGeneratedSpanSplit(
         showError(tr("Line optimization is already running."));
         return;
     }
-    // Cross-fiber operation: make sure no participating fiber's newest
-    // geometry is still session-only behind a debounced autosave.
-    flushAllPendingSessionAutoSaves();
     if (firstControlPointIndex >= session.controlPoints.size() ||
         secondControlPointIndex >= session.controlPoints.size() ||
         firstControlPointIndex == secondControlPointIndex) {
@@ -9310,371 +9666,183 @@ void LineAnnotationController::handleGeneratedSpanSplit(
         session.fiberId = nextFiberId();
     }
     const bool suppressErrors = session.suppressErrorDialogs;
-
-    // Bake unsaved session edits (and the branch-metadata sync they imply)
-    // into a stored snapshot; everything below works on that snapshot so no
-    // in-memory state mutates until both halves are safely on disk.
-    const StoredFiber parent = storedFiberFromSession(session);
-    const uint64_t parentId = parent.id;
-    const std::string parentFileName = parent.fileName;
-    const std::filesystem::path parentPath = fiberPath(parent);
-
-    // The span's two session controls, resolved onto the stored snapshot
-    // (indices are remapped on save; position is the primary key).
-    const auto storedIndexMap = storedIndexMapForSessionControls(session.controlPoints);
-    const auto resolve = [&](size_t sessionIndex) {
-        const int hint = sessionIndex < storedIndexMap.size()
-            ? storedIndexMap[sessionIndex]
-            : -1;
-        return matchingStoredControlPointIndex(
-            parent.controlPoints, hint, session.controlPoints[sessionIndex].volumePoint);
-    };
-    const auto firstIndex = resolve(firstControlPointIndex);
-    const auto secondIndex = resolve(secondControlPointIndex);
-    if (!firstIndex || !secondIndex) {
-        showError(tr("Could not resolve the span's control points."), suppressErrors);
+    if (_structuralEditInProgress) {
+        showError(tr("Another merge or split is still in progress."), suppressErrors);
         return;
     }
-    if (std::abs(*firstIndex - *secondIndex) != 1) {
-        showError(tr("The span's control points are not adjacent on the stored line."),
-                  suppressErrors);
+    std::string reason;
+    const fs::path sessionRoot =
+        session.fiberSourceRoot.empty() ? primaryFiberSourceRoot() : session.fiberSourceRoot;
+    if (!structuralEditParticipantAllowed(sessionRoot, session.fiberFileName, &reason)) {
+        showError(tr("Cannot split: %1").arg(QString::fromStdString(reason)), suppressErrors);
         return;
     }
-    const size_t splitAfter = static_cast<size_t>(std::min(*firstIndex, *secondIndex));
-    const auto plan = vc3d::line_annotation::computeFiberSplitPlan(
-        vc3d::line_annotation::storedControlPointPositions(parent.controlPoints),
-        parent.linePoints,
-        splitAfter);
-    if (!plan) {
-        showError(tr("Cannot split here: each half must keep at least 2 control "
-                     "points on the stored line."),
-                  suppressErrors);
-        return;
-    }
-
-    // Both halves are brand-new fibers: fresh canonical identities, geometry
-    // and per-span metadata inherited verbatim, branch links partitioned by
-    // control-point range.
-    const std::string username = currentFiberUsername();
-    const std::string startedAt = currentFiberDateTimeString();
-    const uint64_t prefixSequence = nextFiberSequenceForUsername(username);
-    const uint64_t prefixId = std::max(nextFiberId(), parentId + 1);
-    // Allocated, not derived from prefixId: the registry never hands an
-    // allocated id out again, a computed one it does not know about.
-    const uint64_t suffixId = std::max(nextFiberId(), prefixId + 1);
-
-    const auto makeHalf = [&](uint64_t id, uint64_t sequence) {
-        StoredFiber half;
-        half.id = id;
-        half.username = username;
-        half.startedAt = startedAt;
-        half.sequence = sequence;
-        half.fileName = vc3d::line_annotation::fiberFileName(username, startedAt, sequence);
-        half.sourceRoot = primaryFiberSourceRoot();
-        half.generation = 1;
-        half.manualHvTag = parent.manualHvTag;
-        half.tags = parent.tags;
-        half.width = parent.width;
-        half.widthGapFraction = parent.widthGapFraction;
-        // The parent's extrapolated tails don't survive the cut: each half
-        // ends exactly on its split CP until its line is re-fit. The tag
-        // arms the immediate re-optimization below and, should that batch
-        // abort, the next load's prompt.
-        addUniqueSorted(half.tags, std::string{kNeedsReoptimizationTag});
-        half.optimizationMode = parent.optimizationMode;
-        return half;
-    };
-    StoredFiber prefix = makeHalf(prefixId, prefixSequence);
-    StoredFiber suffix = makeHalf(suffixId, prefixSequence + 1);
-
-    prefix.controlPoints.assign(parent.controlPoints.begin(),
-                                parent.controlPoints.begin() + plan->prefixControlCount);
-    // The removed span's descriptor lives on the new final CP; clearing it
-    // is the span deletion and restores the v3 final-CP contract.
-    prefix.controlPoints.back().segmentToNext.reset();
-    prefix.linePoints.assign(parent.linePoints.begin(),
-                             parent.linePoints.begin() + plan->prefixLineCount);
-    suffix.controlPoints.assign(parent.controlPoints.begin() + plan->suffixControlBegin,
-                                parent.controlPoints.end());
-    suffix.linePoints.assign(parent.linePoints.begin() + plan->suffixLineBegin,
-                             parent.linePoints.end());
-    // The halves' live copies stay consistent with what the writer saves.
-    vc3d::line_annotation::applyGapSpanPolicy(prefix.controlPoints);
-    vc3d::line_annotation::applyGapSpanPolicy(suffix.controlPoints);
-
-    for (const auto& branch : parent.branches) {
-        const auto remapped =
-            vc3d::line_annotation::remappedSplitControlPointIndex(*plan,
-                                                                  branch.controlPointIndex);
-        if (!remapped) {
-            continue;
-        }
-        FiberBranchRef moved = branch;
-        moved.controlPointIndex = remapped->second;
-        (remapped->first ? suffix : prefix).branches.push_back(std::move(moved));
-    }
-    prefix.hvClassification = vc3d::line_annotation::classifyFiberHv(
-        vc3d::line_annotation::storedControlPointPositions(prefix.controlPoints));
-    suffix.hvClassification = vc3d::line_annotation::classifyFiberHv(
-        vc3d::line_annotation::storedControlPointPositions(suffix.controlPoints));
-
-    if (linkHalves) {
-        // "Split and link, same winding": record the boundary connection as
-        // a reciprocal branch link. It lands pending like any manual link —
-        // the split asserts these are different fibers, but whether they
-        // share a winding is a separate call for a reviewer to approve.
-        const cv::Vec3d prefixPoint = prefix.controlPoints.back();
-        const cv::Vec3d suffixPoint = suffix.controlPoints.front();
-        const cv::Vec3d fallbackDirection = normalizedOrZero(suffixPoint - prefixPoint);
-
-        FiberBranchRef prefixRef;
-        prefixRef.pending = true;
-        prefixRef.controlPointIndex =
-            static_cast<int>(prefix.controlPoints.size()) - 1;
-        prefixRef.branchFiberId = suffix.id;
-        prefixRef.branchControlPointIndex = 0;
-        prefixRef.branchFileName = suffix.fileName;
-        prefixRef.controlPointDirection = endpointTangentFromLinePoints(
-            prefix.linePoints, prefixPoint, fallbackDirection);
-        prefixRef.branchControlPointDirection = endpointTangentFromLinePoints(
-            suffix.linePoints, suffixPoint, -fallbackDirection);
-        prefixRef.controlPointPosition = prefixPoint;
-        prefixRef.branchControlPointPosition = suffixPoint;
-
-        FiberBranchRef suffixRef;
-        suffixRef.pending = true;
-        suffixRef.controlPointIndex = 0;
-        suffixRef.branchFiberId = prefix.id;
-        suffixRef.branchControlPointIndex = prefixRef.controlPointIndex;
-        suffixRef.branchFileName = prefix.fileName;
-        suffixRef.controlPointDirection = prefixRef.branchControlPointDirection;
-        suffixRef.branchControlPointDirection = prefixRef.controlPointDirection;
-        suffixRef.controlPointPosition = suffixPoint;
-        suffixRef.branchControlPointPosition = prefixPoint;
-
-        prefix.branches.push_back(std::move(prefixRef));
-        suffix.branches.push_back(std::move(suffixRef));
-    }
-
-    // Persist both halves in one transaction (temp writes + atomic renames
-    // with rollback) before touching any in-memory state; a failure aborts
-    // the split with nothing to undo.
-    std::error_code collisionError;
-    if (std::filesystem::exists(fiberPath(prefix), collisionError) ||
-        std::filesystem::exists(fiberPath(suffix), collisionError)) {
-        showError(tr("A fiber file with the new name already exists."), suppressErrors);
-        return;
-    }
+    _structuralEditInProgress = true;
+    auto release = qScopeGuard([this]() { _structuralEditInProgress = false; });
+    try {
+    StructuralEditCapture capture;
+    capture.packageGeneration = _packageGeneration;
+    capture.loadSequence = _fiberLoadSequence;
+    capture.session = pane->session;
+    capture.surfaceName = surfaceName;
+    capture.sessionFiberId = session.fiberId;
+    capture.sessionFileName = session.fiberFileName;
+    capture.firstPoint = session.controlPoints[firstControlPointIndex].volumePoint;
+    capture.secondPoint = session.controlPoints[secondControlPointIndex].volumePoint;
     {
-        const auto saveResult = vc3d::line_annotation::runFiberSaveJob(
-            ++_nextFiberSaveSequence,
-            {vc3d::line_annotation::FiberSavePayload{
-                 prefix.id, prefix.generation, fiberPath(prefix), fiberToJson(prefix)},
-             vc3d::line_annotation::FiberSavePayload{
-                 suffix.id, suffix.generation, fiberPath(suffix), fiberToJson(suffix)}});
-        if (!saveResult.ok) {
-            showError(tr("Could not save the split fibers: %1")
-                          .arg(QString::fromStdString(saveResult.error)),
-                      suppressErrors);
-            return;
-        }
-        // Persisted: the next reload finds both files under these ids.
-        _fiberRuntimeIds.remember(prefix.sourceRoot, prefix.fileName, prefix.id);
-        _fiberRuntimeIds.remember(suffix.sourceRoot, suffix.fileName, suffix.id);
+        const auto storedIndexMap = storedIndexMapForSessionControls(session.controlPoints);
+        capture.firstHint = firstControlPointIndex < storedIndexMap.size()
+            ? storedIndexMap[firstControlPointIndex]
+            : -1;
+        capture.secondHint = secondControlPointIndex < storedIndexMap.size()
+            ? storedIndexMap[secondControlPointIndex]
+            : -1;
     }
+    capture.linkHalves = linkHalves;
+    capture.suppressErrors = suppressErrors;
+    QTimer::singleShot(0, this, [this, capture = std::move(capture)]() mutable {
+        commitFiberSplit(std::move(capture));
+    });
+    release.dismiss();
+    } catch (const std::exception& ex) {
+        Logger()->warn("Split aborted: {}", ex.what());
+        showError(tr("The split could not be started: %1").arg(QString::fromUtf8(ex.what())),
+                  suppressErrors);
+    }
+}
 
-    const auto upsertFiber = [this](StoredFiber fiber) {
-        auto it = std::find_if(
-            _fibers.begin(),
-            _fibers.end(),
-            [&fiber](const StoredFiber& existing) {
-                return (!fiber.fileName.empty() && existing.fileName == fiber.fileName) ||
-                       existing.id == fiber.id;
-            });
-        if (it == _fibers.end()) {
-            _fibers.push_back(std::move(fiber));
-        } else {
-            *it = std::move(fiber);
-        }
+void LineAnnotationController::commitFiberSplit(StructuralEditCapture capture)
+{
+    namespace la = vc3d::line_annotation;
+    auto release = qScopeGuard([this]() { _structuralEditInProgress = false; });
+    const auto abort = [this, &capture](const QString& reason) {
+        Logger()->warn("Split aborted: {}", reason.toStdString());
+        showError(tr("The split could not be completed: %1\nNothing was changed.").arg(reason),
+                  capture.suppressErrors);
     };
-    const uint64_t prefixFiberId = prefix.id;
-    const uint64_t suffixFiberId = suffix.id;
-    const std::string prefixFileName = prefix.fileName;
-    const std::string suffixFileName = suffix.fileName;
-    upsertFiber(std::move(prefix));
-    upsertFiber(std::move(suffix));
-    // As in the merge above: both halves coexist with the parent until the
-    // deferred retirement settles, and that retirement runs nested event
-    // loops. A map built before this edit goes stale now; one built inside the
-    // window goes stale at the settling bump.
-    ++_fiberDataGeneration;
+    bool committed = false;
+    try {
+        std::string reason;
+        if (!structuralEditPreflight(capture.packageGeneration, capture.loadSequence, &reason)) {
+            if (!reason.empty()) {
+                abort(QString::fromStdString(reason));
+            }
+            return;
+        }
+        const auto parentSession = capture.session.lock();
+        if (!parentSession || parentSession->fiberDeleted ||
+            parentSession->fiberId != capture.sessionFiberId ||
+            parentSession->fiberFileName != capture.sessionFileName) {
+            abort(tr("the fiber's annotation session changed meanwhile"));
+            return;
+        }
+        if (parentSession->taskState == LineAnnotationSession::TaskState::Running) {
+            abort(tr("line optimization is running on the fiber"));
+            return;
+        }
+        const StoredFiber parent = makeStoredFiberSessionSnapshot(*parentSession).fiber;
+        const auto firstIndex = matchingStoredControlPointIndex(
+            parent.controlPoints, capture.firstHint, capture.firstPoint);
+        const auto secondIndex = matchingStoredControlPointIndex(
+            parent.controlPoints, capture.secondHint, capture.secondPoint);
+        if (!firstIndex || !secondIndex) {
+            abort(tr("the span's control points could not be resolved"));
+            return;
+        }
+        if (std::abs(*firstIndex - *secondIndex) != 1) {
+            abort(tr("the span's control points are not adjacent on the stored line"));
+            return;
+        }
+        const auto splitAfter = static_cast<std::size_t>(std::min(*firstIndex, *secondIndex));
+        if (!structuralEditParticipantAllowed(parent.sourceRoot, parent.fileName, &reason)) {
+            abort(QString::fromStdString(reason));
+            return;
+        }
 
-    // Fan-out of syncBranchFiberFileRename: reciprocal refs on peers move to
-    // whichever half now owns their control point.
-    std::vector<uint64_t> affectedFiberIds;
-    const auto redirectBranches = [&](std::vector<FiberBranchRef>& branches,
-                                      uint64_t ownerFiberId) {
-        bool changed = false;
-        for (auto& branch : branches) {
-            if (!branchReferencesFiber(branch, parentId, parentFileName)) {
-                continue;
-            }
-            const auto remapped = vc3d::line_annotation::remappedSplitControlPointIndex(
-                *plan, branch.branchControlPointIndex);
-            if (!remapped) {
-                continue;
-            }
-            const auto halfIt = std::find_if(
-                _fibers.begin(),
-                _fibers.end(),
-                [halfId = remapped->first ? suffixFiberId : prefixFiberId](
-                    const StoredFiber& fiber) { return fiber.id == halfId; });
-            if (halfIt == _fibers.end()) {
-                continue;
-            }
-            branch.branchFiberId = halfIt->id;
-            branch.branchFileName = halfIt->fileName;
-            branch.branchControlPointIndex = remapped->second;
-            changed = true;
-        }
-        if (changed) {
-            addUniqueFiberId(affectedFiberIds, ownerFiberId);
-        }
-    };
-    for (const auto& otherPane : _panes) {
-        if (otherPane.session && otherPane.session->fiberId != parentId) {
-            redirectBranches(otherPane.session->branches, otherPane.session->fiberId);
-        }
-    }
-    for (auto& fiber : _fibers) {
-        redirectBranches(fiber.branches, fiber.id);
-    }
-    scheduleBranchMetadataSaves(affectedFiberIds, parentId);
+        const std::string username = currentFiberUsername();
+        const std::string startedAt = currentFiberDateTimeString();
+        const uint64_t prefixSequence = nextFiberSequenceForUsername(username);
+        la::NewFiberIdentity prefixIdentity;
+        prefixIdentity.username = username;
+        prefixIdentity.startedAt = startedAt;
+        prefixIdentity.sequence = prefixSequence;
+        prefixIdentity.fileName = la::fiberFileName(username, startedAt, prefixSequence);
+        prefixIdentity.id = std::max(nextFiberId(), parent.id + 1);
+        prefixIdentity.sourceRoot = primaryFiberSourceRoot();
+        la::NewFiberIdentity suffixIdentity = prefixIdentity;
+        suffixIdentity.sequence = prefixSequence + 1;
+        suffixIdentity.fileName = la::fiberFileName(username, startedAt, suffixIdentity.sequence);
+        // Allocated, not derived: the registry never hands an allocated id
+        // out again, a computed one it does not know about.
+        suffixIdentity.id = std::max(nextFiberId(), prefixIdentity.id + 1);
 
-    if (_linkCandidate && _linkCandidate->fiberId == parentId) {
-        _linkCandidate.reset();
-    }
-
-    // Retire the original. Not deleteFibers: removeBranchLinksToFiber would
-    // strip and re-save the peer links redirected above. cleanupSurfaceName
-    // runs on the deferred dialog destruction and skips the closing save via
-    // suppressFiberSave.
-    // Only the suppression this split sets is its to release on failure.
-    std::vector<std::weak_ptr<LineAnnotationSession>> suppressedBySplit;
-    for (const auto& otherPane : _panes) {
-        if (otherPane.session && otherPane.session->fiberId == parentId &&
-            !otherPane.session->suppressFiberSave) {
-            otherPane.session->suppressFiberSave = true;
-            suppressedBySplit.push_back(otherPane.session);
-        }
-    }
-    // Neither half is reopened: the workspace closes with the original.
-    // This handler runs inside the dialog's own menu-callback stack, and
-    // both waitForFiberSaves and the re-optimization spin nested event
-    // loops that would process the closed dialog's deferred deletion while
-    // its frames are still below us. Retire the original and re-fit the
-    // halves on a clean stack.
-    QTimer::singleShot(0, this, [this, parentId, parentPath,
-                                 prefixFiberId, suffixFiberId, prefixFileName,
-                                 suffixFileName, suppressErrors,
-                                 suppressedBySplit,
-                                 packageGeneration = _packageGeneration]() {
-        // As in the merge: the parent, its path and its id belong to the
-        // package the split ran in, and a package switch before or during
-        // this callback means none of them may be acted on.
-        const auto packageChanged = [this, packageGeneration]() {
-            if (_packageGeneration == packageGeneration) {
-                return false;
-            }
-            Logger()->warn("Split retirement abandoned: the package changed");
-            return true;
-        };
-        if (packageChanged()) {
-            return;
-        }
-        closeDialogPanesForFibers({parentId});
-        // Closing can yield through a pane's finalization or error dialog.
-        if (packageChanged()) {
-            return;
-        }
-        closeIntersectionInspectionForRetiredFibers({parentId});
-        // Fail loudly instead of reconciling: on any problem below, the
-        // original is kept, its surviving sessions are made saveable again,
-        // and a full reload rebuilds memory from disk (branch refs re-derive
-        // from branch_file; the halves' needs_reoptimization tag re-prompts
-        // the re-fit). The user resolves the duplicate old/new fibers.
-        const auto bailOut = [this, suppressedBySplit, suppressErrors](const QString& reason) {
-            for (const auto& weak : suppressedBySplit) {
-                if (const auto session = weak.lock(); session && !session->fiberDeleted) {
-                    session->suppressFiberSave = false;
-                }
-            }
-            showError(tr("The split could not be completed: %1\nReloading fibers from disk.")
-                          .arg(reason),
-                      suppressErrors);
-            loadFibersForCurrentPackage();
-        };
-        // Flush the queue (the redirected peer links ride it) and the close
-        // before retiring, so a failed save or a pane that refused to close
-        // (failed finalization) is caught while the original still exists.
-        const uint64_t saveFailuresBefore = _fiberSaveFailureCount;
-        waitForFiberSaves();
-        if (packageChanged()) {
-            return;
-        }
-        if (_fiberSaveFailureCount != saveFailuresBefore) {
-            bailOut(tr("a pending fiber save failed"));
-            return;
-        }
-        for (const auto& otherPane : _panes) {
-            if (otherPane.session && otherPane.dialog &&
-                otherPane.session->fiberId == parentId) {
-                bailOut(tr("the annotation workspace did not close"));
+        auto plan = std::make_shared<la::SplitPlanResult>();
+        {
+            auto planned = la::planFiberSplit(parent, splitAfter, prefixIdentity, suffixIdentity,
+                                              capture.linkHalves, &reason);
+            if (!planned) {
+                abort(QString::fromStdString(reason));
                 return;
             }
+            *plan = std::move(*planned);
         }
-        // The parent must still be the fiber the split consumed (same id,
-        // same file) before its file is removed.
-        const bool stillParent = std::any_of(
-            _fibers.begin(), _fibers.end(), [parentId, &parentPath](const StoredFiber& f) {
-                return f.id == parentId && f.fileName == parentPath.filename().string();
-            });
-        if (!stillParent) {
-            bailOut(tr("the original fiber changed meanwhile"));
-            return;
-        }
-        const auto retireResult = vc3d::line_annotation::runFiberSaveJob(
-            ++_nextFiberSaveSequence, {}, {parentPath});
-        if (!retireResult.ok) {
-            bailOut(QString::fromStdString(retireResult.error));
-            return;
-        }
-        // The parent's name is free (its id stays retired).
-        forgetFiberRuntimeBinding(parentId);
-        _fibers.erase(std::remove_if(_fibers.begin(),
-                                     _fibers.end(),
-                                     [parentId](const StoredFiber& fiber) {
-                                         return fiber.id == parentId;
-                                     }),
-                      _fibers.end());
-        invalidateFiberAlignmentMetrics(parentId, false);
-        emit fibersDeleted({parentId});
+        const std::string prefixFileName = plan->prefix.fileName;
+        const std::string suffixFileName = plan->suffix.fileName;
 
+        StructuralEditRequest request;
+        request.verb = "split";
+        request.newFibers = {plan->prefix, plan->suffix};
+        request.originals = {parent};
+        request.sources.push_back(
+            {parent.id, parent.fileName, nullptr,
+             [plan](int index) -> std::optional<la::RedirectTarget> {
+                 const auto remapped = la::remappedSplitControlPointIndex(plan->plan, index);
+                 if (!remapped) {
+                     return std::nullopt;
+                 }
+                 const StoredFiber& half = remapped->first ? plan->suffix : plan->prefix;
+                 return la::RedirectTarget{half.id, half.fileName, remapped->second};
+             }});
+        request.consumedSessions.push_back(parentSession);
+        const auto outcome = commitStructuralEdit(std::move(request), &committed);
+        if (!outcome.ok) {
+            if (outcome.recoveryRequired) {
+                Logger()->warn("Split failed and the files were not fully restored: {}",
+                               outcome.error);
+                showError(tr("The split failed and the fiber files could not be fully "
+                             "restored:\n%1\nReload the project before continuing.")
+                              .arg(QString::fromStdString(outcome.error)),
+                          capture.suppressErrors);
+            } else {
+                abort(QString::fromStdString(outcome.error));
+            }
+            return;
+        }
+        if (!outcome.warning.empty()) {
+            showError(tr("The split was saved, but refreshing the views failed: %1\n"
+                         "Reload the project to see the result.")
+                          .arg(QString::fromStdString(outcome.warning)),
+                      capture.suppressErrors);
+        }
+        Logger()->info("Split {} into {} and {}", parent.fileName, prefixFileName, suffixFileName);
+
+        // Neither half is reopened: the workspace closes with the original.
         // Re-fit both halves so their lines regrow extrapolation tails past
-        // the split CPs. Consumes the needs_reoptimization tag set at
-        // creation; an aborted batch keeps it for the next load's prompt.
+        // the split CPs; the guard is released first because the re-fit yields.
+        _structuralEditInProgress = false;
+        release.dismiss();
         reoptimizeMergedFibers({prefixFileName, suffixFileName});
-        // The re-fit yields (dataset picker, save drain); the halves' ids
-        // belong to the package the split ran in.
-        if (packageChanged()) {
-            return;
+    } catch (const std::exception& ex) {
+        if (committed) {
+            Logger()->warn("Split committed, but a later step failed: {}", ex.what());
+            showError(tr("The split was saved, but refreshing the views failed: %1\n"
+                         "Reload the project to see the result.")
+                          .arg(QString::fromUtf8(ex.what())),
+                      capture.suppressErrors);
+        } else {
+            abort(QString::fromUtf8(ex.what()));
         }
-
-        invalidateFiberAlignmentMetrics(prefixFiberId, true);
-        invalidateFiberAlignmentMetrics(suffixFiberId, true);
-        emitFiberSummaries();
-        refreshBranchLineViews();
-    });
+    }
 }
 
 void LineAnnotationController::handleGeneratedControlPointUnlink(
@@ -13988,6 +14156,17 @@ void LineAnnotationController::loadFibersForCurrentPackage()
         Logger()->warn("Fiber load superseded while {} was open; discarding it", where);
         return true;
     };
+    // Queued saves land before the files are read: a job still holding a
+    // session snapshot from before this load would otherwise write links
+    // the load is about to reconcile straight back over the reconciled
+    // files. The wait yields; a newer load or a package switch inside it
+    // wins.
+    if (_fiberSaveRunning || !_pendingFiberSaveJobs.empty()) {
+        waitForFiberSaves();
+        if (superseded("the pre-load save drain")) {
+            return;
+        }
+    }
     _linkCandidate.reset();
     // Where each fiber id lived before this load (source root + file name):
     // the key an open session's link to it would have to follow through the
@@ -14063,39 +14242,23 @@ void LineAnnotationController::loadFibersForCurrentPackage()
                   });
     };
 
-    auto loadStrictFibers = [&]() {
-        std::vector<StoredFiber> strictFibers;
-        std::vector<std::string> strictErrors;
-        for (const auto& [source, path] : fiberFiles) {
-            try {
-                if (auto fiber = loadFiberFile(path)) {
-                    fiber->sourceRoot = source;
-                    strictFibers.push_back(std::move(*fiber));
-                }
-            } catch (const std::exception& ex) {
-                strictErrors.push_back(
-                    fiberErrorName(path.filename().string()) + ": " + ex.what());
-            }
-        }
-        sortLoadedFibers(strictFibers);
-        dedupeLoadedFiberSources(strictFibers, sources);
-        healOneSidedAdjacentLinks(strictFibers);
-        (void)validateLoadedFiberLinks(strictFibers, strictErrors);
-        return std::pair<std::vector<StoredFiber>, std::vector<std::string>>{
-            std::move(strictFibers),
-            std::move(strictErrors)};
-    };
-
     std::vector<StoredFiber> loadedFibers;
     std::vector<std::string> fatalLoadErrors;
     std::vector<std::string> branchLoadErrors;
+    std::size_t neutralizedLinkEntries = 0;
+    std::vector<DroppedLinkEntry> droppedAtLoad;
+    // Entries the lenient parser discarded: their owners' files still hold
+    // them until a repair rewrites the file.
+    std::vector<DroppedLinkEntry> parseStrippedAtLoad;
+    bool deferHealWrites = false;
     std::unordered_set<std::string> fibersWithRemovedBranchEntries;
     for (const auto& [source, path] : fiberFiles) {
         try {
             std::vector<std::string> branchErrors;
+            std::vector<DroppedLinkEntry> strippedHere;
             // The one file reader, so this path stamps loadedWriteTime too:
             // without it every heal's save would be refused as stale.
-            if (auto fiber = loadFiberFile(path, &branchErrors)) {
+            if (auto fiber = loadFiberFile(path, &branchErrors, &strippedHere)) {
                 fiber->sourceRoot = source;
                 if (!branchErrors.empty()) {
                     fibersWithRemovedBranchEntries.insert(
@@ -14103,6 +14266,10 @@ void LineAnnotationController::loadFibersForCurrentPackage()
                     branchLoadErrors.insert(branchLoadErrors.end(),
                                             branchErrors.begin(),
                                             branchErrors.end());
+                }
+                for (auto& entry : strippedHere) {
+                    entry.ownerSourceRoot = source;
+                    parseStrippedAtLoad.push_back(std::move(entry));
                 }
                 loadedFibers.push_back(std::move(*fiber));
             }
@@ -14161,11 +14328,17 @@ void LineAnnotationController::loadFibersForCurrentPackage()
         }
 
         bool repairRequested = false;
-        if (_errorDialogsSuppressed) {
-            // Without dialogs, take the conservative "keep files unchanged"
-            // path and log the details.
-            Logger()->warn("Line Annotation (suppressed dialog): broken fiber "
-                           "branch links, keeping files unchanged:\n{}",
+        // Sampled before every modal below: a save job scheduled while a
+        // modal is open (queued, running or already completed) bumps this,
+        // and its session snapshot predates the reconciliation.
+        uint64_t saveSequenceBeforeModal = _nextFiberSaveSequence;
+        if (_errorDialogsSuppressed || _fiberLoadAutoKeepUnchanged) {
+            // Without dialogs (or after too many restarts), take the
+            // conservative "keep files unchanged" path and log the details.
+            Logger()->warn("Line Annotation ({}): broken fiber branch links, keeping files "
+                           "unchanged:\n{}",
+                           _errorDialogsSuppressed ? "suppressed dialog"
+                                                   : "prompt answered automatically",
                            details.toStdString());
         } else {
             QMessageBox prompt(_parentWidget.data());
@@ -14184,19 +14357,83 @@ void LineAnnotationController::loadFibersForCurrentPackage()
         if (superseded("the broken-link prompt")) {
             return;
         }
+        // A save queued while a prompt was open holds a session snapshot
+        // taken before this load reconciles the sessions; it would write
+        // the entries this load drops straight back. Start over (bounded),
+        // so the drain above lands it first and the files are re-read.
+        const auto restartIfSavesQueued = [this, &saveSequenceBeforeModal]() {
+            const bool arrived = _fiberSaveRunning || !_pendingFiberSaveJobs.empty() ||
+                _nextFiberSaveSequence != saveSequenceBeforeModal;
+            if (!arrived) {
+                return false;
+            }
+            // Never continue against records that predate a save: restart
+            // (the fresh load drains first and re-reads). The prompts are
+            // application-modal, so normally only work armed before a
+            // prompt (an autosave timer, a solve finishing) can schedule a
+            // save while it is open and the restarts run out with it; a
+            // producer that does not need the GUI (the agent bridge) could
+            // keep them coming, so past the bound the next load answers the
+            // prompt itself with "Keep files unchanged": no modal, nothing
+            // can be scheduled during it, and that answer changes no file.
+            if (++_fiberLoadRestartsForSaves > 8) {
+                Logger()->warn("Fiber load restarted {} times while saves kept arriving during "
+                               "the broken-link prompt; the next load keeps the files "
+                               "unchanged without asking",
+                               _fiberLoadRestartsForSaves);
+                _fiberLoadAutoKeepUnchanged = true;
+            } else {
+                Logger()->info("Fiber load restarted: a save was scheduled while the "
+                               "broken-link prompt was open");
+            }
+            loadFibersForCurrentPackage();
+            return true;
+        };
+        if (restartIfSavesQueued()) {
+            return;
+        }
 
         if (repairRequested) {
             std::vector<std::string> repairErrors;
-            if (repairLoadedFiberBranchLinks(loadedFibers,
-                                             fibersWithRemovedBranchEntries,
-                                             branchLinkIssues,
-                                             repairErrors)) {
+            const std::vector<StoredFiber> beforeRepair = loadedFibers;
+            std::unordered_set<std::string> writtenFiles;
+            const bool repaired = repairLoadedFiberBranchLinks(loadedFibers,
+                                                               fibersWithRemovedBranchEntries,
+                                                               branchLinkIssues,
+                                                               repairErrors,
+                                                               &writtenFiles);
+            // Whatever the repair dropped from the files (and whatever the
+            // parser had already discarded) must leave the open sessions
+            // too, before the reload below (which reads the clean files and
+            // would find nothing left to drop). The records are the repaired
+            // ones, not _fibers, which still predates this load.
+            std::vector<DroppedLinkEntry> droppedByRepair =
+                droppedLinkEntries(beforeRepair, loadedFibers);
+            droppedByRepair.insert(droppedByRepair.end(), parseStrippedAtLoad.begin(),
+                                   parseStrippedAtLoad.end());
+            dropLinkEntriesFromOpenSessions(droppedByRepair, loadedFibers);
+            if (repaired) {
                 loadFibersForCurrentPackage();
                 return;
+            }
+            // Records the repair changed but whose files it did not write
+            // still differ from disk: flag them like a neutralized record.
+            for (const auto& entry : droppedByRepair) {
+                const std::string key =
+                    vc3d::fiberSourceFileKey(entry.ownerSourceRoot, entry.ownerFileName);
+                if (writtenFiles.count(key) != 0) {
+                    continue;
+                }
+                for (auto& fiber : loadedFibers) {
+                    if (vc3d::fiberSourceFileKey(fiber.sourceRoot, fiber.fileName) == key) {
+                        fiber.linkEntriesDroppedAtLoad = true;
+                    }
+                }
             }
             for (const auto& error : repairErrors) {
                 Logger()->warn("{}", error);
             }
+            saveSequenceBeforeModal = _nextFiberSaveSequence;
             showError(tr("Could not repair broken branch links:\n%1")
                           .arg(QString::fromStdString(
                               repairErrors.empty() ? std::string{"unknown error"}
@@ -14204,21 +14441,45 @@ void LineAnnotationController::loadFibersForCurrentPackage()
             if (superseded("the repair error dialog")) {
                 return;
             }
+            if (restartIfSavesQueued()) {
+                return;
+            }
         }
 
-        auto strict = loadStrictFibers();
-        loadedFibers = std::move(strict.first);
-        fatalLoadErrors = std::move(strict.second);
+        // "Keep files unchanged" (and the dialog-less path, and a repair
+        // that could not save): drop the offending entries in memory only.
+        // Every fiber stays loaded; the files are not written, not even the
+        // heals below (they are re-derived on the next load).
+        // A failed repair already dropped entries: its issue indices are
+        // stale, so the set is re-collected before neutralizing.
+        const std::vector<StoredFiber> beforeNeutralize = loadedFibers;
+        neutralizedLinkEntries = neutralizeLoadedFiberBranchLinks(
+            loadedFibers,
+            repairRequested ? collectLoadedFiberBranchIssues(loadedFibers) : branchLinkIssues);
+        droppedAtLoad = droppedLinkEntries(beforeNeutralize, loadedFibers);
+        // Nothing is written on this path, so every owner of a parser-
+        // stripped entry keeps that entry on disk: flag it, and let the
+        // sessions drop it like a neutralized one.
+        for (const auto& entry : parseStrippedAtLoad) {
+            for (auto& fiber : loadedFibers) {
+                if (fiber.sourceRoot == entry.ownerSourceRoot &&
+                    fiber.fileName == entry.ownerFileName) {
+                    fiber.linkEntriesDroppedAtLoad = true;
+                }
+            }
+        }
+        droppedAtLoad.insert(droppedAtLoad.end(), parseStrippedAtLoad.begin(),
+                             parseStrippedAtLoad.end());
+        deferHealWrites = true;
     }
 
     std::vector<std::string> loadErrors = std::move(fatalLoadErrors);
-    if (branchErrors.empty()) {
-        (void)validateLoadedFiberLinks(loadedFibers, loadErrors);
-    }
+    (void)validateLoadedFiberLinks(loadedFibers, loadErrors);
+    (void)neutralizedLinkEntries;
 
     for (auto& fiber : loadedFibers) {
         addKnownFiberTags(fiber.tags);
-        if (fiber.needsSave && fiber.sourceRoot == primarySource) {
+        if (!deferHealWrites && fiber.needsSave && fiber.sourceRoot == primarySource) {
             if (adjacentHealSaveIsStale(fiber)) {
                 fiber.needsSave = false;
                 continue;
@@ -14239,6 +14500,12 @@ void LineAnnotationController::loadFibersForCurrentPackage()
         return;
     }
     _fibers = std::move(loadedFibers);
+    // Structural edits refuse to run after a save failure: the loaded records
+    // may then be ahead of the files. A reload resets the baseline.
+    _fiberSaveFailureCountAtLoad = _fiberSaveFailureCount;
+    _structuralEditRecoveryRequired = false;
+    _fiberLoadRestartsForSaves = 0;
+    _fiberLoadAutoKeepUnchanged = false;
     // The stored fibers' branch refs were remapped onto the survivors' ids
     // above (validateLoadedFiberLinks); an open session's refs were written
     // before this load and can still hold the id of a copy the dedupe just
@@ -14303,6 +14570,7 @@ void LineAnnotationController::loadFibersForCurrentPackage()
             refreshBranchLineViews(sessionFiberId);
         }
     }
+    dropLinkEntriesFromOpenSessions(droppedAtLoad, _fibers);
     if (!loadErrors.empty()) {
         for (const auto& error : loadErrors) {
             Logger()->warn("{}", error);
@@ -14388,10 +14656,10 @@ void LineAnnotationController::promptReoptimizationForMergedFibers()
 
     QMessageBox prompt(_parentWidget.data());
     prompt.setIcon(QMessageBox::Question);
-    prompt.setWindowTitle(tr("Merged fibers need re-optimization"));
-    prompt.setText(tr("%1 fiber(s) were merged during sync and need their "
-                      "lines re-optimized against the volume. Re-optimize "
-                      "now?")
+    prompt.setWindowTitle(tr("Merged or split fibers need re-optimization"));
+    prompt.setText(tr("%1 fiber(s) were merged or split (here or during sync) and "
+                      "need their lines re-optimized against the volume. "
+                      "Re-optimize now?")
                        .arg(static_cast<int>(tagged.size())));
     prompt.setInformativeText(
         tr("Until re-optimized they render as straight segments between "
@@ -17885,212 +18153,13 @@ LineAnnotationController::makeFiberSaveSnapshot(const StoredFiber& fiber) const
 void LineAnnotationController::canonicalizeFiberSaveSnapshots(
     std::vector<FiberSaveSnapshot>& snapshots) const
 {
-    auto findSnapshotForBranch =
-        [&snapshots](const FiberBranchRef& branch) -> FiberSaveSnapshot* {
-        for (auto& snapshot : snapshots) {
-            if (branchReferencesFiber(branch,
-                                      snapshot.fiber.id,
-                                      snapshot.fiber.fileName)) {
-                return &snapshot;
-            }
-        }
-        return nullptr;
-    };
-
-    for (auto& snapshot : snapshots) {
-        for (auto& branch : snapshot.fiber.branches) {
-            if (auto localIndex = matchingStoredControlPointIndex(
-                    snapshot.fiber.controlPoints,
-                    branch.controlPointIndex,
-                    branch.controlPointPosition)) {
-                branch.controlPointIndex = *localIndex;
-                branch.controlPointPosition =
-                    snapshot.fiber.controlPoints[static_cast<size_t>(*localIndex)];
-            }
-            branch.controlPointDirection =
-                endpointTangentFromLinePoints(snapshot.fiber.linePoints,
-                                              branch.controlPointPosition,
-                                              branch.controlPointDirection);
-            if (finiteDirection(branch.branchControlPointDirection)) {
-                branch.branchControlPointDirection =
-                    normalizedOrZero(branch.branchControlPointDirection);
-            }
-
-            auto* target = findSnapshotForBranch(branch);
-            if (!target) {
-                continue;
-            }
-            branch.branchFiberId = target->fiber.id;
-            branch.branchFileName = target->fiber.fileName;
-            if (auto targetIndex = matchingStoredControlPointIndex(
-                    target->fiber.controlPoints,
-                    branch.branchControlPointIndex,
-                    branch.branchControlPointPosition)) {
-                branch.branchControlPointIndex = *targetIndex;
-                branch.branchControlPointPosition =
-                    target->fiber.controlPoints[static_cast<size_t>(*targetIndex)];
-            }
-            branch.branchControlPointDirection =
-                endpointTangentFromLinePoints(target->fiber.linePoints,
-                                              branch.branchControlPointPosition,
-                                              branch.branchControlPointDirection);
-        }
-    }
-
-    for (auto& snapshot : snapshots) {
-        for (auto& branch : snapshot.fiber.branches) {
-            if (branch.controlPointIndex < 0 ||
-                branch.branchControlPointIndex < 0 ||
-                static_cast<size_t>(branch.controlPointIndex) >=
-                    snapshot.fiber.controlPoints.size()) {
-                continue;
-            }
-            auto* target = findSnapshotForBranch(branch);
-            if (!target ||
-                static_cast<size_t>(branch.branchControlPointIndex) >=
-                    target->fiber.controlPoints.size()) {
-                continue;
-            }
-            auto reciprocal = std::find_if(
-                target->fiber.branches.begin(),
-                target->fiber.branches.end(),
-                [&snapshot, &branch](const FiberBranchRef& candidate) {
-                    return candidate.adjacent == branch.adjacent &&
-                           branchReferencesFiber(candidate,
-                                                 snapshot.fiber.id,
-                                                 snapshot.fiber.fileName) &&
-                           (candidate.controlPointIndex ==
-                                branch.branchControlPointIndex ||
-                            pointsApproximatelyEqual(candidate.controlPointPosition,
-                                                     branch.branchControlPointPosition)) &&
-                           (candidate.branchControlPointIndex ==
-                                branch.controlPointIndex ||
-                            pointsApproximatelyEqual(candidate.branchControlPointPosition,
-                                                     branch.controlPointPosition));
-                });
-            if (reciprocal == target->fiber.branches.end()) {
-                continue;
-            }
-
-            branch.branchFiberId = target->fiber.id;
-            branch.branchFileName = target->fiber.fileName;
-            branch.controlPointPosition =
-                snapshot.fiber.controlPoints[static_cast<size_t>(branch.controlPointIndex)];
-            branch.branchControlPointPosition =
-                target->fiber.controlPoints[static_cast<size_t>(branch.branchControlPointIndex)];
-
-            reciprocal->controlPointIndex = branch.branchControlPointIndex;
-            reciprocal->branchFiberId = snapshot.fiber.id;
-            reciprocal->branchControlPointIndex = branch.controlPointIndex;
-            reciprocal->branchFileName = snapshot.fiber.fileName;
-            reciprocal->controlPointPosition = branch.branchControlPointPosition;
-            reciprocal->branchControlPointPosition = branch.controlPointPosition;
-            reciprocal->controlPointDirection = branch.branchControlPointDirection;
-            reciprocal->branchControlPointDirection = branch.controlPointDirection;
-            reciprocal->pending = branch.pending;
-        }
-    }
+    vc3d::line_annotation::canonicalizeFiberSaveSnapshots(snapshots);
 }
 
 void LineAnnotationController::validateFiberSaveSnapshots(
     const std::vector<FiberSaveSnapshot>& snapshots) const
 {
-    // Geometry guard for every snapshot, linked or not: the v3 loader (and
-    // split/merge planning) requires control points to be an exact ordered
-    // subset of line_points. A violation here means a session was serialized
-    // before its geometry was finalized by a solve; writing it would produce
-    // a fiber that fails to load. Refuse the save instead.
-    for (const auto& snapshot : snapshots) {
-        if (snapshot.fiber.controlPoints.empty()) {
-            continue;
-        }
-        if (snapshot.fiber.linePoints.empty()) {
-            // Control points with no line at all cannot satisfy the subset
-            // contract either; the loader would reject the file.
-            throw std::runtime_error(
-                fiberErrorName(snapshot.fiber.fileName) +
-                ": control points present but line_points is empty; the "
-                "fiber was not finalized before saving");
-        }
-        if (!vc3d::line_annotation::orderedControlPointLineIndices(
-                vc3d::line_annotation::storedControlPointPositions(
-                    snapshot.fiber.controlPoints),
-                snapshot.fiber.linePoints)) {
-            throw std::runtime_error(
-                fiberErrorName(snapshot.fiber.fileName) +
-                ": control points are not an ordered exact subset of "
-                "line_points; the fiber was not finalized before saving");
-        }
-    }
-
-    if (snapshots.size() < 2) {
-        return;
-    }
-
-    auto findSnapshotForBranch =
-        [&snapshots](const FiberBranchRef& branch) -> const FiberSaveSnapshot* {
-        for (const auto& snapshot : snapshots) {
-            if (branchReferencesFiber(branch,
-                                      snapshot.fiber.id,
-                                      snapshot.fiber.fileName)) {
-                return &snapshot;
-            }
-        }
-        return nullptr;
-    };
-    auto fail = [](const FiberSaveSnapshot& snapshot, const std::string& reason) {
-        throw std::runtime_error(fiberErrorName(snapshot.fiber.fileName) + ": " + reason);
-    };
-
-    for (const auto& snapshot : snapshots) {
-        for (const auto& branch : snapshot.fiber.branches) {
-            const auto localIndex = matchingStoredControlPointIndex(
-                snapshot.fiber.controlPoints,
-                branch.controlPointIndex,
-                branch.controlPointPosition);
-            if (!localIndex) {
-                fail(snapshot, "local CP position mismatch");
-            }
-            if (branch.branchFileName.empty()) {
-                fail(snapshot, "missing branch_file");
-            }
-
-            const FiberSaveSnapshot* target = findSnapshotForBranch(branch);
-            if (!target) {
-                continue;
-            }
-            const auto targetIndex = matchingStoredControlPointIndex(
-                target->fiber.controlPoints,
-                branch.branchControlPointIndex,
-                branch.branchControlPointPosition);
-            if (!targetIndex) {
-                fail(snapshot, "linked CP position mismatch");
-            }
-
-            const auto reciprocal = std::find_if(
-                target->fiber.branches.begin(),
-                target->fiber.branches.end(),
-                [&snapshot, &branch](const FiberBranchRef& candidate) {
-                    return candidate.adjacent == branch.adjacent &&
-                           branchReferencesFiber(candidate,
-                                                 snapshot.fiber.id,
-                                                 snapshot.fiber.fileName) &&
-                           candidate.controlPointIndex == branch.branchControlPointIndex &&
-                           candidate.branchControlPointIndex == branch.controlPointIndex &&
-                           pointsApproximatelyEqual(candidate.controlPointPosition,
-                                                    branch.branchControlPointPosition) &&
-                           pointsApproximatelyEqual(candidate.branchControlPointPosition,
-                                                    branch.controlPointPosition) &&
-                           branchDirectionsCompatible(candidate.controlPointDirection,
-                                                      branch.branchControlPointDirection) &&
-                           branchDirectionsCompatible(candidate.branchControlPointDirection,
-                                                      branch.controlPointDirection);
-                });
-            if (reciprocal == target->fiber.branches.end()) {
-                fail(snapshot, "missing reciprocal branch");
-            }
-        }
-    }
+    vc3d::line_annotation::validateFiberSaveSnapshots(snapshots);
 }
 
 void LineAnnotationController::scheduleFiberSave(const StoredFiber& fiber)
@@ -18296,7 +18365,8 @@ void LineAnnotationController::waitForFiberSaves()
 std::optional<LineAnnotationController::StoredFiber> LineAnnotationController::loadFiberJson(
     const nlohmann::json& root,
     const fs::path& path,
-    std::vector<std::string>* branchErrors) const
+    std::vector<std::string>* branchErrors,
+    std::vector<DroppedLinkEntry>* stripped) const
 {
     std::string stem = path.stem().string();
     const std::string originalStem = stem;
@@ -18425,19 +18495,65 @@ std::optional<LineAnnotationController::StoredFiber> LineAnnotationController::l
         if (!branches.is_array()) {
             if (recordBranchError(std::string(kind) + " must be an array")) {
                 fiber.needsSave = true;
+                if (stripped) {
+                    DroppedLinkEntry entry;
+                    entry.ownerFileName = fiber.fileName;
+                    entry.adjacent = std::string_view(kind) == kAdjacentBranchesJsonKey;
+                    entry.wholeKind = true;
+                    stripped->push_back(std::move(entry));
+                }
             }
         } else {
             for (const auto& branchJson : branches) {
+                // Whatever an entry the parser discards did carry is
+                // recorded, so the load can tell open sessions and the
+                // structural-edit preflight what the file still names.
+                auto noteStripped = [&]() {
+                    if (!stripped) {
+                        return;
+                    }
+                    DroppedLinkEntry entry;
+                    entry.ownerFileName = fiber.fileName;
+                    entry.adjacent = std::string_view(kind) == kAdjacentBranchesJsonKey;
+                    if (branchJson.is_object()) {
+                        if (const auto it = branchJson.find("branch_file");
+                            it != branchJson.end() && it->is_string()) {
+                            entry.targetFileName =
+                                fs::path(it->get<std::string>()).filename().string();
+                        }
+                        if (const auto it = branchJson.find("control_point_index");
+                            it != branchJson.end() && it->is_number_integer()) {
+                            entry.localIndex = it->get<int>();
+                        }
+                        for (const auto* key : {"control_point_position",
+                                                "branch_control_point_position"}) {
+                            try {
+                                if (const auto it = branchJson.find(key); it != branchJson.end()) {
+                                    const cv::Vec3d point = pointFromJson(*it);
+                                    if (finitePoint(point)) {
+                                        (std::string_view(key) == "control_point_position"
+                                             ? entry.controlPointPosition
+                                             : entry.branchControlPointPosition) = point;
+                                    }
+                                }
+                            } catch (const std::exception&) {
+                            }
+                        }
+                    }
+                    stripped->push_back(std::move(entry));
+                };
                 try {
                     if (!branchJson.is_object()) {
                         if (recordBranchError("branch entries must be objects")) {
                             fiber.needsSave = true;
+                            noteStripped();
                             continue;
                         }
                     }
                     if (branchJson.contains("link_direction")) {
                         if (recordBranchError("obsolete branch metadata: link_direction")) {
                             fiber.needsSave = true;
+                            noteStripped();
                             continue;
                         }
                     }
@@ -18450,12 +18566,14 @@ std::optional<LineAnnotationController::StoredFiber> LineAnnotationController::l
                         !branchJson.contains("branch_control_point_position")) {
                         if (recordBranchError("invalid branch metadata")) {
                             fiber.needsSave = true;
+                            noteStripped();
                             continue;
                         }
                     }
                     if (!branchJson.contains("branch_file")) {
                         if (recordBranchError("missing branch_file")) {
                             fiber.needsSave = true;
+                            noteStripped();
                             continue;
                         }
                     }
@@ -18484,18 +18602,21 @@ std::optional<LineAnnotationController::StoredFiber> LineAnnotationController::l
                             fiber.controlPoints.size()) {
                         if (recordBranchError("local CP index out of range")) {
                             fiber.needsSave = true;
+                            noteStripped();
                             continue;
                         }
                     }
                     if (branch.branchControlPointIndex < 0) {
                         if (recordBranchError("linked CP index out of range")) {
                             fiber.needsSave = true;
+                            noteStripped();
                             continue;
                         }
                     }
                     if (branch.branchFileName.empty()) {
                         if (recordBranchError("missing branch_file")) {
                             fiber.needsSave = true;
+                            noteStripped();
                             continue;
                         }
                     }
@@ -18503,6 +18624,7 @@ std::optional<LineAnnotationController::StoredFiber> LineAnnotationController::l
                         !finiteDirection(branch.branchControlPointDirection)) {
                         if (recordBranchError("invalid branch directions")) {
                             fiber.needsSave = true;
+                            noteStripped();
                             continue;
                         }
                     }
@@ -18511,6 +18633,7 @@ std::optional<LineAnnotationController::StoredFiber> LineAnnotationController::l
                             branch.controlPointPosition)) {
                         if (recordBranchError("local CP position mismatch")) {
                             fiber.needsSave = true;
+                            noteStripped();
                             continue;
                         }
                     }
@@ -18522,6 +18645,7 @@ std::optional<LineAnnotationController::StoredFiber> LineAnnotationController::l
                 } catch (const std::exception& ex) {
                     if (recordBranchError(ex.what())) {
                         fiber.needsSave = true;
+                        noteStripped();
                         continue;
                     }
                 }
@@ -18572,7 +18696,9 @@ std::optional<LineAnnotationController::StoredFiber> LineAnnotationController::l
 }
 
 std::optional<LineAnnotationController::StoredFiber> LineAnnotationController::loadFiberFile(
-    const fs::path& path, std::vector<std::string>* branchErrors) const
+    const fs::path& path,
+    std::vector<std::string>* branchErrors,
+    std::vector<DroppedLinkEntry>* stripped) const
 {
     // Stamped BEFORE the read: a replacement landing between the stamp and
     // the read moves the write time past it and reads as changed later,
@@ -18584,7 +18710,7 @@ std::optional<LineAnnotationController::StoredFiber> LineAnnotationController::l
         throw std::runtime_error("Failed to open fiber file");
     }
     const nlohmann::json root = nlohmann::json::parse(in);
-    auto fiber = loadFiberJson(root, path, branchErrors);
+    auto fiber = loadFiberJson(root, path, branchErrors, stripped);
     if (fiber && !stampError) {
         fiber->loadedWriteTime = writeTime;
     }
@@ -18609,99 +18735,15 @@ std::vector<LineAnnotationController::BranchLinkValidationIssue>
 LineAnnotationController::collectLoadedFiberBranchIssues(
     const std::vector<StoredFiber>& fibers) const
 {
-    const auto sourceFileKey = [](const StoredFiber& fiber,
-                                  const std::string& fileName) {
-        return (fiber.sourceRoot / fileName).lexically_normal().string();
-    };
-    std::vector<BranchLinkValidationIssue> issues;
-    std::unordered_map<std::string, size_t> indexByFileName;
-    indexByFileName.reserve(fibers.size());
-    for (size_t i = 0; i < fibers.size(); ++i) {
-        if (!fibers[i].fileName.empty()) {
-            indexByFileName[sourceFileKey(fibers[i], fibers[i].fileName)] = i;
-        }
-    }
-
-    for (size_t fiberIndex = 0; fiberIndex < fibers.size(); ++fiberIndex) {
-        const StoredFiber& fiber = fibers[fiberIndex];
-        for (size_t branchIndex = 0; branchIndex < fiber.branches.size(); ++branchIndex) {
-            const FiberBranchRef& branch = fiber.branches[branchIndex];
-            auto addIssue = [&](const std::string& reason) {
-                issues.push_back({fiberIndex, branchIndex, reason});
-            };
-
-            if (branch.controlPointIndex < 0 ||
-                static_cast<size_t>(branch.controlPointIndex) >= fiber.controlPoints.size()) {
-                addIssue("local CP index out of range");
-                continue;
-            }
-            if (!pointsApproximatelyEqual(
-                    fiber.controlPoints[static_cast<size_t>(branch.controlPointIndex)],
-                    branch.controlPointPosition)) {
-                addIssue("local CP position mismatch");
-                continue;
-            }
-            if (!finiteDirection(branch.controlPointDirection) ||
-                !finiteDirection(branch.branchControlPointDirection)) {
-                addIssue("invalid branch directions");
-                continue;
-            }
-            if (fiber.linePoints.size() >= 2) {
-                const cv::Vec3d expectedLocal =
-                    endpointTangentFromLinePoints(fiber.linePoints,
-                                                  branch.controlPointPosition);
-                if (!branchDirectionsCompatible(branch.controlPointDirection,
-                                                expectedLocal)) {
-                    addIssue("branch endpoint direction mismatch");
-                    continue;
-                }
-            }
-            if (branch.branchFileName.empty()) {
-                addIssue("missing branch_file");
-                continue;
-            }
-            const auto targetIndex = indexByFileName.find(
-                loadedFiberLinkKey(fiber, branch.branchFileName));
-            if (targetIndex == indexByFileName.end()) {
-                addIssue("missing linked fiber");
-                continue;
-            }
-            const StoredFiber& target = fibers[targetIndex->second];
-            if (branch.branchControlPointIndex < 0 ||
-                static_cast<size_t>(branch.branchControlPointIndex) >=
-                    target.controlPoints.size()) {
-                addIssue("linked CP index out of range");
-                continue;
-            }
-            if (!pointsApproximatelyEqual(
-                    target.controlPoints[static_cast<size_t>(branch.branchControlPointIndex)],
-                    branch.branchControlPointPosition)) {
-                addIssue("linked CP position mismatch");
-                continue;
-            }
-            if (target.linePoints.size() >= 2) {
-                const cv::Vec3d expectedLinked =
-                    endpointTangentFromLinePoints(target.linePoints,
-                                                  branch.branchControlPointPosition);
-                if (!branchDirectionsCompatible(branch.branchControlPointDirection,
-                                                expectedLinked)) {
-                    addIssue("branch endpoint direction mismatch");
-                    continue;
-                }
-            }
-
-            const auto reciprocal = std::find_if(
-                target.branches.begin(),
-                target.branches.end(),
-                [&fiber, &branch](const FiberBranchRef& candidate) {
-                    return isReciprocalBranchRef(fiber, branch, candidate);
-                });
-            if (reciprocal == target.branches.end()) {
-                addIssue("missing reciprocal branch");
-            }
-        }
-    }
-    return issues;
+    return vc3d::line_annotation::collectFiberBranchIssues(
+        fibers,
+        [](const StoredFiber& fiber, const std::string& fileName) {
+            return (fiber.sourceRoot / fileName).lexically_normal().string();
+        },
+        [this](const StoredFiber& fiber, const std::string& branchFileName) {
+            return loadedFiberLinkKey(fiber, branchFileName);
+        },
+        isReciprocalBranchRef);
 }
 
 void LineAnnotationController::healOneSidedAdjacentLinks(std::vector<StoredFiber>& fibers) const
@@ -18731,56 +18773,212 @@ bool LineAnnotationController::adjacentHealSaveIsStale(const StoredFiber& fiber)
     return stale;
 }
 
+std::vector<LineAnnotationController::DroppedLinkEntry>
+LineAnnotationController::droppedLinkEntries(const std::vector<StoredFiber>& before,
+                                             const std::vector<StoredFiber>& after)
+{
+    std::vector<DroppedLinkEntry> dropped;
+    for (const auto& old : before) {
+        const auto now = std::find_if(after.begin(), after.end(), [&old](const StoredFiber& f) {
+            return f.sourceRoot == old.sourceRoot && f.fileName == old.fileName;
+        });
+        for (const auto& branch : old.branches) {
+            const bool stillThere = now != after.end() &&
+                std::any_of(now->branches.begin(), now->branches.end(),
+                            [&branch](const FiberBranchRef& kept) {
+                                return kept.adjacent == branch.adjacent &&
+                                    fs::path(kept.branchFileName).filename() ==
+                                        fs::path(branch.branchFileName).filename() &&
+                                    pointsApproximatelyEqual(kept.controlPointPosition,
+                                                             branch.controlPointPosition) &&
+                                    pointsApproximatelyEqual(kept.branchControlPointPosition,
+                                                             branch.branchControlPointPosition);
+                            });
+            if (!stillThere) {
+                DroppedLinkEntry entry;
+                entry.ownerSourceRoot = old.sourceRoot;
+                entry.ownerFileName = old.fileName;
+                entry.targetFileName = fs::path(branch.branchFileName).filename().string();
+                entry.adjacent = branch.adjacent;
+                entry.localIndex = branch.controlPointIndex;
+                entry.controlPointPosition = branch.controlPointPosition;
+                entry.branchControlPointPosition = branch.branchControlPointPosition;
+                dropped.push_back(std::move(entry));
+            }
+        }
+    }
+    return dropped;
+}
+
+void LineAnnotationController::dropLinkEntriesFromOpenSessions(
+    const std::vector<DroppedLinkEntry>& dropped,
+    const std::vector<StoredFiber>& records)
+{
+    if (dropped.empty()) {
+        return;
+    }
+    // A descriptor NARROWS the candidates (its target and kind, each
+    // position that parsed; a local index is a stored index and is never
+    // compared with a session index); the cleaned record DECIDES: a
+    // candidate the record still holds is kept, one it does not hold goes.
+    // A descriptor that identifies nothing (neither target nor positions, or
+    // a whole unreadable array) leaves every entry of its kind a candidate,
+    // so the record alone decides for that kind; the unsaved addition that
+    // rule can cost is logged. Two links to the same target differ by
+    // position, so a malformed entry never takes a retained sibling with it.
+    for (auto& pane : _panes) {
+        if (!pane.session || pane.session->fiberDeleted) {
+            continue;
+        }
+        auto& session = *pane.session;
+        const fs::path sessionRoot =
+            session.fiberSourceRoot.empty() ? primaryFiberSourceRoot() : session.fiberSourceRoot;
+        const auto record = std::find_if(
+            records.begin(), records.end(), [&session](const StoredFiber& fiber) {
+                return vc3d::line_annotation::sameFiberIdentity(
+                    fiber.id, fiber.fileName, session.fiberId, session.fiberFileName);
+            });
+        if (record == records.end()) {
+            continue;
+        }
+        // A descriptor of this owner that identifies its entry by positions
+        // only, and matches no entry of this session at all (corrupted but
+        // finite positions), is unresolved: it degrades to "every entry of
+        // its kind is a candidate", like an unreadable one.
+        const auto ownsDescriptor = [&](const DroppedLinkEntry& d) {
+            return d.ownerSourceRoot == sessionRoot && d.ownerFileName == session.fiberFileName;
+        };
+        const auto positionsMatchAny = [&](const DroppedLinkEntry& d) {
+            const auto matchesIn = [&](const std::vector<FiberBranchRef>& branches) {
+                return std::any_of(branches.begin(), branches.end(), [&](const FiberBranchRef& b) {
+                    return b.adjacent == d.adjacent &&
+                        pointsApproximatelyEqual(*d.controlPointPosition, b.controlPointPosition) &&
+                        pointsApproximatelyEqual(*d.branchControlPointPosition,
+                                                 b.branchControlPointPosition);
+                });
+            };
+            return matchesIn(session.branches) ||
+                (session.branchesBeforeModeChange && matchesIn(*session.branchesBeforeModeChange)) ||
+                (session.controlPointCollapseRollback &&
+                 matchesIn(session.controlPointCollapseRollback->branches));
+        };
+        std::vector<bool> unresolved(dropped.size(), false);
+        for (std::size_t i = 0; i < dropped.size(); ++i) {
+            const auto& d = dropped[i];
+            if (!ownsDescriptor(d)) {
+                continue;
+            }
+            const bool positional = d.targetFileName.empty() && !d.wholeKind &&
+                d.controlPointPosition && d.branchControlPointPosition;
+            unresolved[i] = d.wholeKind ||
+                (d.targetFileName.empty() && !positional) ||
+                (positional && !positionsMatchAny(d));
+        }
+        bool unidentified = false;
+        const auto matches = [&](const FiberBranchRef& branch) {
+            const std::string target = fs::path(branch.branchFileName).filename().string();
+            bool candidate = false;
+            for (std::size_t i = 0; i < dropped.size() && !candidate; ++i) {
+                const auto& d = dropped[i];
+                if (!ownsDescriptor(d) || d.adjacent != branch.adjacent) {
+                    continue;
+                }
+                if (unresolved[i]) {
+                    // Every entry of the kind is a candidate; the record
+                    // decides.
+                    unidentified = true;
+                    candidate = true;
+                } else if (!d.targetFileName.empty()) {
+                    // A corrupted position must not shield the entry: the
+                    // target alone qualifies as a candidate.
+                    candidate = d.targetFileName == target;
+                } else {
+                    candidate =
+                        pointsApproximatelyEqual(*d.controlPointPosition,
+                                                 branch.controlPointPosition) &&
+                        pointsApproximatelyEqual(*d.branchControlPointPosition,
+                                                 branch.branchControlPointPosition);
+                }
+            }
+            if (!candidate) {
+                return false;
+            }
+            return std::none_of(
+                record->branches.begin(), record->branches.end(),
+                [&](const FiberBranchRef& kept) {
+                    return kept.adjacent == branch.adjacent &&
+                        fs::path(kept.branchFileName).filename().string() == target &&
+                        pointsApproximatelyEqual(kept.controlPointPosition,
+                                                 branch.controlPointPosition) &&
+                        pointsApproximatelyEqual(kept.branchControlPointPosition,
+                                                 branch.branchControlPointPosition);
+                });
+        };
+        const auto prune = [&matches](std::vector<FiberBranchRef>& branches) {
+            const auto before = branches.size();
+            branches.erase(std::remove_if(branches.begin(), branches.end(), matches),
+                           branches.end());
+            return before - branches.size();
+        };
+        std::size_t removed = prune(session.branches);
+        if (session.branchesBeforeModeChange) {
+            removed += prune(*session.branchesBeforeModeChange);
+        }
+        if (session.controlPointCollapseRollback) {
+            removed += prune(session.controlPointCollapseRollback->branches);
+        }
+        if (removed > 0) {
+            Logger()->warn("Line Annotation: dropped {} link entr{} from the open session of {} "
+                           "that the load dropped from its file{}",
+                           removed, removed == 1 ? "y" : "ies", session.fiberFileName,
+                           unidentified ? " (an unreadable entry could not be identified, so "
+                                          "every entry of its kind the file no longer holds "
+                                          "was dropped, unsaved additions included)"
+                                        : "");
+        }
+    }
+}
+
+std::size_t LineAnnotationController::neutralizeLoadedFiberBranchLinks(
+    std::vector<StoredFiber>& fibers,
+    const std::vector<BranchLinkValidationIssue>& issues) const
+{
+    const auto neutralized = vc3d::line_annotation::neutralizeFiberBranchIssues(
+        fibers, issues,
+        [this](const std::vector<StoredFiber>& current) {
+            return collectLoadedFiberBranchIssues(current);
+        });
+    for (const std::size_t index : neutralized.changedFibers) {
+        fibers[index].linkEntriesDroppedAtLoad = true;
+    }
+    if (neutralized.removedEntries > 0) {
+        Logger()->warn("Line Annotation: ignored {} broken link entr{} on {} fiber(s); "
+                       "the files are unchanged and every fiber stays loaded",
+                       neutralized.removedEntries,
+                       neutralized.removedEntries == 1 ? "y" : "ies",
+                       neutralized.changedFibers.size());
+    }
+    return neutralized.removedEntries;
+}
+
 bool LineAnnotationController::repairLoadedFiberBranchLinks(
     std::vector<StoredFiber>& fibers,
     const std::unordered_set<std::string>& fibersWithRemovedBranchEntries,
     const std::vector<BranchLinkValidationIssue>& initialIssues,
-    std::vector<std::string>& errors) const
+    std::vector<std::string>& errors,
+    std::unordered_set<std::string>* writtenFiles) const
 {
     std::unordered_set<std::string> changedFiles = fibersWithRemovedBranchEntries;
 
-    auto removeIssues = [&](const std::vector<BranchLinkValidationIssue>& issues) {
-        std::unordered_map<size_t, std::vector<size_t>> branchIndicesByFiber;
-        for (const auto& issue : issues) {
-            if (issue.fiberIndex >= fibers.size()) {
-                continue;
-            }
-            if (issue.branchIndex >= fibers[issue.fiberIndex].branches.size()) {
-                continue;
-            }
-            branchIndicesByFiber[issue.fiberIndex].push_back(issue.branchIndex);
-        }
-
-        bool changed = false;
-        for (auto& [fiberIndex, branchIndices] : branchIndicesByFiber) {
-            auto& fiber = fibers[fiberIndex];
-            std::sort(branchIndices.begin(), branchIndices.end());
-            branchIndices.erase(std::unique(branchIndices.begin(), branchIndices.end()),
-                                branchIndices.end());
-            for (auto it = branchIndices.rbegin(); it != branchIndices.rend(); ++it) {
-                if (*it >= fiber.branches.size()) {
-                    continue;
-                }
-                fiber.branches.erase(fiber.branches.begin() +
-                                     static_cast<std::ptrdiff_t>(*it));
-                fiber.needsSave = true;
-                changedFiles.insert(
-                    (fiber.sourceRoot / fiber.fileName).lexically_normal().string());
-                changed = true;
-            }
-        }
-        return changed;
-    };
-
-    (void)removeIssues(initialIssues);
-    for (;;) {
-        const auto issues = collectLoadedFiberBranchIssues(fibers);
-        if (issues.empty()) {
-            break;
-        }
-        if (!removeIssues(issues)) {
-            break;
-        }
+    const auto neutralized = vc3d::line_annotation::neutralizeFiberBranchIssues(
+        fibers, initialIssues,
+        [this](const std::vector<StoredFiber>& current) {
+            return collectLoadedFiberBranchIssues(current);
+        });
+    for (const std::size_t index : neutralized.changedFibers) {
+        auto& fiber = fibers[index];
+        fiber.needsSave = true;
+        changedFiles.insert((fiber.sourceRoot / fiber.fileName).lexically_normal().string());
     }
 
     for (auto& fiber : fibers) {
@@ -18796,6 +18994,9 @@ bool LineAnnotationController::repairLoadedFiberBranchLinks(
         try {
             fiber.needsSave = false;
             saveFiberNow(fiber);
+            if (writtenFiles) {
+                writtenFiles->insert(sourceFile);
+            }
         } catch (const std::exception& ex) {
             fiber.needsSave = true;
             errors.push_back(fiberErrorName(fiber.fileName) + ": " + ex.what());
@@ -18806,28 +19007,6 @@ bool LineAnnotationController::repairLoadedFiberBranchLinks(
 }
 
 namespace {
-
-// Exact geometry fingerprint used to recognise the same fiber stored under
-// two names. Raw double bits keep the comparison exact and format-independent.
-std::string fiberGeometryKey(const std::vector<vc3d::line_annotation::StoredControlPoint>& controls,
-                             const std::vector<cv::Vec3d>& linePoints)
-{
-    if (controls.empty() && linePoints.empty()) return {};
-    std::string key;
-    key.reserve(sizeof(uint64_t) + (controls.size() + linePoints.size()) * 3 * sizeof(uint64_t));
-    auto appendPoint = [&key](const cv::Vec3d& point) {
-        for (int axis = 0; axis < 3; ++axis) {
-            uint64_t bits = 0;
-            std::memcpy(&bits, &point[axis], sizeof(bits));
-            key.append(reinterpret_cast<const char*>(&bits), sizeof(bits));
-        }
-    };
-    const uint64_t controlCount = controls.size();
-    key.append(reinterpret_cast<const char*>(&controlCount), sizeof(controlCount));
-    for (const auto& control : controls) appendPoint(control);
-    for (const auto& point : linePoints) appendPoint(point);
-    return key;
-}
 
 }  // namespace
 
@@ -18871,39 +19050,12 @@ std::string LineAnnotationController::loadedFiberLinkKey(
 bool LineAnnotationController::validateLoadedFiberLinks(std::vector<StoredFiber>& fibers,
                                                         std::vector<std::string>& errors) const
 {
-    bool removedInvalidFibers = false;
-    for (;;) {
-        const auto issues = collectLoadedFiberBranchIssues(fibers);
-        if (issues.empty()) {
-            break;
-        }
-
-        std::unordered_set<std::string> invalidFiles;
-        for (const auto& issue : issues) {
-            if (issue.fiberIndex >= fibers.size()) {
-                continue;
-            }
-            const auto& fiber = fibers[issue.fiberIndex];
-            invalidFiles.insert(
-                (fiber.sourceRoot / fiber.fileName).lexically_normal().string());
-            errors.push_back(fiberErrorName(fiber.fileName) + ": " + issue.reason);
-        }
-        if (invalidFiles.empty()) {
-            break;
-        }
-        removedInvalidFibers = true;
-        fibers.erase(std::remove_if(fibers.begin(),
-                                    fibers.end(),
-                                    [&invalidFiles](const StoredFiber& fiber) {
-                                        const std::string sourceFile =
-                                            (fiber.sourceRoot / fiber.fileName)
-                                                .lexically_normal().string();
-                                        return invalidFiles.find(sourceFile) !=
-                                               invalidFiles.end();
-                                    }),
-                     fibers.end());
-    }
-
+    // Link problems are neutralized entry-wise before this point
+    // (neutralizeLoadedFiberBranchLinks / repairLoadedFiberBranchLinks);
+    // what remains here is the runtime-id assignment and the link-id remap.
+    // Never remove a fiber for a link problem: that only manufactures
+    // "missing linked fiber" on its peers and cascades through the network.
+    (void)errors;
     const auto sourceFileKey = [](const StoredFiber& fiber,
                                   const std::string& fileName) {
         return (fiber.sourceRoot / fileName).lexically_normal().string();
@@ -18925,7 +19077,7 @@ bool LineAnnotationController::validateLoadedFiberLinks(std::vector<StoredFiber>
             }
         }
     }
-    return !removedInvalidFibers;
+    return true;
 }
 
 std::string LineAnnotationController::uniqueImportedFiberFileName(
@@ -19028,3 +19180,4 @@ QString LineAnnotationController::takeLastSuppressedError()
     _lastSuppressedError.clear();
     return message;
 }
+

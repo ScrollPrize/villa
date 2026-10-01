@@ -30,7 +30,7 @@ Any other `*.tif` files are interpreted as additional channels (by filename stem
 	- `Y = y.tif[row, col]`
 	- `Z = z.tif[row, col]`
 
-The grid is a *regular* 2D lattice in index space; physical spacing of the grid in “surface units” is given by `meta.json.scale`.
+The grid is a *regular* 2D lattice in index space; the spacing of adjacent vertices in surface units (voxels) is `1 / meta.json.scale` (see §5.1).
 
 ## 3. Data types (TIFF)
 
@@ -108,15 +108,17 @@ Common fields produced by tools:
 
 ### 5.1 `scale` meaning
 
-`scale = [sx, sy]` describes the grid spacing in surface-parameter space.
+`scale = [sx, sy]` is the grid density: grid cells per surface unit (voxel) along columns (`sx`) and rows (`sy`). It is the **reciprocal** of the vertex spacing, not the spacing itself.
 
-- Many tools interpret the parametric coordinate of a vertex `(row, col)` as `(u = col * sx, v = row * sy)`.
-- Some operations may also use `1/sx` and `1/sy` as a “pixels-per-unit” scaling.
+- A surface sampled every 20 voxels has `scale = [0.05, 0.05]`; one sampled every 12.5 voxels has `scale = [0.08, 0.08]`.
+- Surface coordinates in voxels, measured from the surface origin, map to grid indices by multiplying, and back by dividing: `col = u * sx`, `row = v * sy`, and `u = col / sx`, `v = row / sy`.
+- The nominal surface size in voxels is therefore `(W / sx, H / sy)`, and a quad covers about `(1 / sx) * (1 / sy)` voxels².
 
 To stay compatible:
 
 - Preserve `scale` when copying/transforming surfaces.
-- If you resample the grid resolution, update `scale` consistently.
+- If you resample the grid resolution by a factor `f` (new size ≈ `f * W`), multiply `scale` by `f`.
+- Never write the step (e.g. `20`) into `scale`; readers will size outputs as `UV_range * scale` and fail or collapse.
 
 ## 6. Writing rules (recommended)
 
@@ -143,6 +145,8 @@ A compatible reader should:
 
 ## 8. Reference implementation pointers
 
-- Writer populates `meta.json.format = "tifxyz"` & `meta.json.scale = [sx, sy]`: [`core/src/QuadSurface.cpp:729`](core/src/QuadSurface.cpp:729)
-- Reader loads `x/y/z.tif`, invalidates `Z <= 0`, then applies optional `mask.tif`: [`core/src/QuadSurface.cpp:848`](core/src/QuadSurface.cpp:848)
+All in [`volume-cartographer/core/src/QuadSurface.cpp`](../volume-cartographer/core/src/QuadSurface.cpp):
 
+- Writer populates `meta.json.format = "tifxyz"` & `meta.json.scale = [sx, sy]`: `QuadSurface::save`.
+- Reader loads `x/y/z.tif`, invalidates `Z <= 0`, then applies optional `mask.tif`: `load_quad_from_tifxyz`.
+- `scale` convention: `QuadSurface::surfaceToGrid` multiplies by `scale`, `QuadSurface::gridToSurface` divides by it, and `QuadSurface::size` returns `cols / scale[0]`, `rows / scale[1]`.

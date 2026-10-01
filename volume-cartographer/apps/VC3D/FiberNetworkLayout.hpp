@@ -301,8 +301,9 @@ struct CrossingEvent {
     long long groupId = -1;
 };
 
-// A pair's crossings on one translate and V branch read together (see
-// winding::CrossingGroup); members index GlobalResult::crossingEvents.
+// A pair's crossings on one translate and run of V branches read together
+// (see winding::CrossingGroup; vBranch is the run's first limb); members
+// index GlobalResult::crossingEvents.
 struct CrossingGroupRecord {
     uint64_t hFiberId = 0;
     uint64_t vFiberId = 0;
@@ -489,6 +490,23 @@ struct SheetModel {
 // to be negative there) or the model is degenerate (rRef or radius0 not
 // positive).
 [[nodiscard]] double sheetXForDistanceVx(const SheetModel& model, double distanceVx);
+// The map x below which the modelled radius is negative and sheet distance
+// has no meaning: -infinity without a pitch or for a degenerate model.
+[[nodiscard]] double sheetDomainFloorXVx(const SheetModel& model);
+// The Fiber Map draws its scene with x scaled by sheet distance, so that a
+// centimetre of sheet is the same width on every winding: this is that
+// scaling. It is sheetDistanceVx wherever the modelled radius is positive;
+// below the domain floor the map's own arclength takes over at the floor's
+// distance, so the mapping is monotone for every map x of the data's
+// magnitude (the quadratic overflows only for |x| far beyond any volume) and
+// every fiber has exactly one scene position. Identity for a degenerate
+// model (rRef or radius0 not positive).
+[[nodiscard]] double sheetDistanceMonotoneVx(const SheetModel& model, double xVx);
+// Inverse of sheetDistanceMonotoneVx, to rounding: on the domain and on the
+// continuation the round trip is exact to a few ulps; at the floor itself
+// the quadratic is flat, so a distance within rounding of the floor's maps
+// back to within about 1e-8 relative of the floor's x.
+[[nodiscard]] double sheetXForDistanceMonotoneVx(const SheetModel& model, double distanceVx);
 // The sheet model a result carries.
 [[nodiscard]] SheetModel sheetModelOf(const GlobalResult& result);
 

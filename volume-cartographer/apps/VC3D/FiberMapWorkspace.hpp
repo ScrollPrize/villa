@@ -254,6 +254,13 @@ private:
     // scene; it is never allowed to produce displayed text, because when the
     // voxel size is unknown it is a guess.
     [[nodiscard]] double sceneVxPerCm() const;
+    // Scene x for a layout x: the layout's x is arclength at one reference
+    // radius (winding-linear); the scene stretches it by the fitted sheet
+    // model so that a centimetre of sheet is the same width on every winding
+    // and the distance ruler reads scene x directly. Every placed coordinate
+    // goes through it, and nothing converts back: clicks resolve against the
+    // placed entries.
+    [[nodiscard]] double sceneXOf(double layoutXVx) const;
     // A layout length (voxels) as display text: centimetres when the voxel size
     // is known, otherwise the voxel count itself, which is the one figure still
     // true when the package cannot say how big a voxel is.

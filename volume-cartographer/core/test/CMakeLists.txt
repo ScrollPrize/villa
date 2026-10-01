@@ -229,6 +229,26 @@ vc_add_test(NAME test_spiral_config_profile_editor
 
 qt6_wrap_cpp(line_annotation_vccollection_moc ${PROJECT_SOURCE_DIR}/core/include/vc/ui/VCCollection.hpp)
 qt6_wrap_cpp(line_annotation_cstate_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.hpp)
+vc_add_test(NAME test_line_annotation_link_validation
+    SOURCES test_line_annotation_link_validation.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberSliceGeometry.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberSliceGeometry.hpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSegments.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSegments.hpp
+    LIBS doctest::doctest Qt6::Core vc_core vc_lasagna vc_fiber_tracer
+    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+vc_add_test(NAME test_line_annotation_structural_edits
+    SOURCES test_line_annotation_structural_edits.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberSliceGeometry.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberSliceGeometry.hpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSegments.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSegments.hpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationStructuralEdits.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationStructuralEdits.hpp
+    LIBS doctest::doctest Qt6::Core vc_core vc_lasagna vc_fiber_tracer
+    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
 vc_add_test(NAME test_line_annotation_generated_views
     SOURCES test_line_annotation_generated_views.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSaveJob.cpp
@@ -867,6 +887,12 @@ if(TARGET vc_render_tifxyz)
             $<TARGET_FILE:vc_render_tifxyz>)
     set_tests_properties(test_render_fetch_failure PROPERTIES TIMEOUT 300)
     vc_register_ctest(test_render_fetch_failure vc_render_tifxyz)
+    add_test(NAME test_render_band_prefetch
+        COMMAND ${Python3_EXECUTABLE}
+            "${CMAKE_CURRENT_SOURCE_DIR}/test_render_band_prefetch.py"
+            $<TARGET_FILE:vc_render_tifxyz>)
+    set_tests_properties(test_render_band_prefetch PROPERTIES TIMEOUT 120)
+    vc_register_ctest(test_render_band_prefetch vc_render_tifxyz)
 endif()
 
 vc_add_test(NAME test_fiber_intersections LIBS doctest::doctest vc_atlas)
@@ -880,6 +906,7 @@ vc_add_test(NAME test_plane_surface_branches)
 vc_add_test(NAME test_affine_transform_surface)
 
 vc_add_test(NAME test_quadsurface_more)
+vc_add_test(NAME test_quadsurface_smooth)
 
 vc_add_test(NAME test_surface_cache_dependencies)
 

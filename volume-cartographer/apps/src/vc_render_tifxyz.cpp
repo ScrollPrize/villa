@@ -11,6 +11,7 @@
 
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VcDataset.hpp"
+#include "vc/core/util/VoxelSizeMetadata.hpp"
 #include "utils/Json.hpp"
 #include "utils/http_fetch.hpp"
 
@@ -644,6 +645,9 @@ static void renderBands(
 
     // Build offset list for readMultiSlice
     auto allOffsets = buildOffsetList(numSlices, sliceStep, accumOffsets);
+    const auto compositeOffsets = isComposite
+        ? buildCompositeOffsetList(compositeStart, compositeEnd, sliceStep)
+        : std::vector<float>{};
 
     auto wallStart = std::chrono::steady_clock::now();
     auto lastPrint = wallStart;
@@ -667,6 +671,35 @@ static void renderBands(
         cv::Mat_<cv::Vec3f> base, dirs;
         prepareBaseAndDirs(bandPts, bandNrm, scaleSeg, dsScale, hasAffine, aff, base, dirs);
 
+        // The band readers prefetch a bounding box around the band (readMultiSlice: all its
+        // samples; readCompositeFast: its surface points). A band runs the full width of the
+        // segment, so on a winding that box covers the area inside the winding while the
+        // samples touch a thin ring of it. Queue exactly the
+        // chunks this band samples instead (without waiting, as the box was queued) and
+        // read through a view that drops the box request; reads still reach the source.
+        // With --prefetch-remote the render was planned up front and cache is that view.
+        std::optional<vc::render::prefetch::PrefetchedArrayView> bandView;
+        vc::render::IChunkedArray* bandCache = cache;
+        if (ds && cache == ds) {
+            // The planner walks every sample x offset, so split the band's rows across threads.
+            const auto& offsets = isComposite ? compositeOffsets : allOffsets;
+            const auto method = vc::render::prefetch::samplingForRender(isComposite);
+            const int blocks = std::max(1, std::min(base.rows, omp_get_max_threads()));
+            std::vector<std::unordered_set<vc::render::ChunkKey, vc::render::ChunkKeyHash>> parts(blocks);
+            #pragma omp parallel for schedule(static)
+            for (int b = 0; b < blocks; ++b) {
+                const int r0 = base.rows * b / blocks;
+                const int r1 = base.rows * (b + 1) / blocks;
+                vc::render::prefetch::insertExactChunksForSamples(
+                    base.rowRange(r0, r1), dirs.rowRange(r0, r1), offsets, ds, level, method, parts[b]);
+            }
+            for (std::size_t b = 1; b < parts.size(); ++b)
+                parts[0].insert(parts[b].begin(), parts[b].end());
+            if (!parts[0].empty())
+                ds->prefetchChunks(std::vector<vc::render::ChunkKey>(parts[0].begin(), parts[0].end()), false);
+            bandCache = &bandView.emplace(*ds);
+        }
+
         std::vector<cv::Mat> slices;
 
         if (isComposite) {
@@ -675,7 +708,7 @@ static void renderBands(
             // skips non-finite pixels, so size + zero it here.
             cv::Mat_<uint8_t> compOut(base.rows, base.cols, uint8_t{0});
             if constexpr (std::is_same_v<T, uint8_t>) {
-                readCompositeFast(compOut, cache, level, base, dirs,
+                readCompositeFast(compOut, bandCache, level, base, dirs,
                                   float(sliceStep),
                                   compositeStart, compositeEnd,
                                   compositeParams, vc::render::prefetch::samplingForRender(true));
@@ -686,7 +719,7 @@ static void renderBands(
         } else {
             // Normal: bulk read + accumulate
             std::vector<cv::Mat_<T>> raw;
-            readMultiSlice(raw, cache, level, base, dirs, allOffsets);
+            readMultiSlice(raw, bandCache, level, base, dirs, allOffsets);
             slices = processRawSlices<T>(raw, numSlices, accumOffsets, accumType, cvType, rotQuad, flipAxis);
         }
 
@@ -1075,26 +1108,154 @@ static void renderTiles(
 
 
 // ============================================================
-// readVolumeVoxelSize – read voxelsize from volume metadata
+// Voxel size resolution
 // ============================================================
 
-static std::optional<double> readVolumeVoxelSize(const std::filesystem::path& volPath)
+// Where a usable physical voxel size came from. "Unspecified" means the value is
+// a placeholder: callers must not present it as a physical measurement.
+enum class VoxelSizeSource {
+    Cli,
+    LocalStoreMetadata,
+    RemoteVolume,
+    Unspecified,
+};
+
+struct ResolvedVoxelSize {
+    double micrometerPerVoxel = 1.0;   // always micrometres per voxel
+    VoxelSizeSource source = VoxelSizeSource::Unspecified;
+
+    [[nodiscard]] bool isUsable() const
+    {
+        return source != VoxelSizeSource::Unspecified;
+    }
+};
+
+static const char* voxelSizeSourceName(VoxelSizeSource source)
 {
-    auto tryFile = [](const std::filesystem::path& p, const char* key) -> std::optional<double> {
-        if (!std::filesystem::exists(p)) return std::nullopt;
-        try {
-            Json j = Json::parse_file(p.string());
-            Json sub = key ? (j.is_object() && j.contains(key) ? j[key] : Json{}) : j;
-            if (key && !sub.is_object()) return std::nullopt;
-            if (sub.is_object() && sub.contains("voxelsize") && sub["voxelsize"].is_number())
-                return sub["voxelsize"].get_double();
-        } catch (...) {}
+    switch (source) {
+    case VoxelSizeSource::Cli:                return "command line";
+    case VoxelSizeSource::LocalStoreMetadata: return "local store metadata";
+    case VoxelSizeSource::RemoteVolume:       return "remote volume metadata";
+    case VoxelSizeSource::Unspecified:        return "unspecified";
+    }
+    return "unspecified";
+}
+
+// The OME-Zarr axis unit and the numeric value that must accompany it.
+//
+// These travel as a PAIR: `writeZarrAttrs` writes `scale = <value> / pixelsPerVoxel`
+// and `axis.unit = <unit>` independently, with nothing checking that they agree. A
+// micrometre number labelled "nanometer" is therefore a silent 1000x error -- the
+// same class of defect this patch exists to remove.
+//
+// The value resolved internally is always micrometres. How it is *declared* depends
+// on where it came from:
+//
+//   * explicit CLI value -- declared in the caller's own unit, exactly as the
+//     pre-patch renderer did. `--voxel-unit` has always meant "the unit of the
+//     number I am giving you" (the pre-patch code multiplied by 0.001 for
+//     `nanometer` to get micrometres for the TIFF tag), and the flag's help text
+//     describes the number the caller supplies. Preserving that is what keeps
+//     `--voxel-size 8640 --voxel-unit nanometer` meaning 8640 nm, as it did before.
+//   * store metadata / the open volume -- both are micrometres by definition, so
+//     both are declared as micrometres.
+//
+// In every case `.zattrs` and the TIFF resolution describe the same physical size.
+static const char* zarrVoxelUnit(const ResolvedVoxelSize& resolved,
+                                 const std::string& explicitUnit)
+{
+    switch (resolved.source) {
+    case VoxelSizeSource::Cli:                return explicitUnit.c_str();
+    case VoxelSizeSource::LocalStoreMetadata:
+    case VoxelSizeSource::RemoteVolume:
+        // Both resolve to micrometres by definition: the store document's
+        // `voxelsize` is µm and Volume::voxelSize() is µm.
+        return "micrometer";
+    case VoxelSizeSource::Unspecified:        return nullptr;
+    }
+    return nullptr;
+}
+
+// The number that `unit` describes, for the same resolved size.
+//
+// For a CLI value this is what the caller typed. Otherwise the resolved value is in
+// micrometres and so is the unit, so the number passes through unchanged.
+static double zarrVoxelValue(const ResolvedVoxelSize& resolved,
+                             double explicitValue)
+{
+    return (resolved.source == VoxelSizeSource::Cli) ? explicitValue
+                                                     : resolved.micrometerPerVoxel;
+}
+
+// Convert a --voxel-size / --voxel-unit pair to micrometres per voxel.
+//
+// nullopt when the value is not positive and finite, or when the unit is not one
+// we know how to convert: a unit we cannot read is a user error, not a missing
+// measurement, and guessing it is a silent 1000x mistake.
+static std::optional<double> explicitMicrometerPerVoxel(double value,
+                                                        const std::string& unit)
+{
+    if (!std::isfinite(value) || value <= 0.0)
         return std::nullopt;
-    };
-    if (auto v = tryFile(volPath / "meta.json", nullptr)) return v;
-    if (auto v = tryFile(volPath / "metadata.json", "scan")) return v;
-    if (auto v = tryFile(volPath / "metadata.json", nullptr)) return v;
+
+    if (unit == "nanometer" || unit == "nanometre" || unit == "nm")
+        return value * 0.001;
+    if (unit == "micrometer" || unit == "micrometre" || unit == "um" ||
+        unit == "\xC2\xB5m")
+        return value;
+    if (unit == "millimeter" || unit == "millimetre" || unit == "mm")
+        return value * 1000.0;
+    if (unit == "meter" || unit == "metre" || unit == "m")
+        return value * 1000000.0;
     return std::nullopt;
+}
+
+// Resolve the physical voxel size this render must use, in micrometres.
+//
+// The store's own document is the authority, and it is read the way every other
+// VC3D tool reads it -- vc::metadata::resolveLocalStoreVoxelSize(), which
+// Volume::NewFromUrl() and vc_grow_seg_from_segments already share. The reader
+// that used to live here looked only for a top-level "voxelsize", so a store
+// publishing its resolution as an acquisition record resolved to nothing and the
+// render continued at a scale of 1.0 with no physical meaning.
+//
+// Order, and why it is this order:
+//
+//   1. the opened volume, when there is one. Volume construction has already
+//      fetched and normalised the store's own document, so this is the value the
+//      rest of the process agrees on: no extra request, and it cannot disagree
+//      with the volume actually being streamed.
+//   2. the local store document, for a run with no Volume open.
+//
+// The opened volume comes first because --volume is often a chunk cache for a
+// remote source rather than the store itself; where such a cache mirrors the
+// store's metadata it may be stale, and it is the streamed volume, not the cache
+// directory, that is being rendered. Consulting the cache first would let a stale
+// document win over the freshly fetched one.
+static ResolvedVoxelSize resolveRenderVoxelSize(
+    const std::filesystem::path& volPath,
+    const Volume* remoteVolume,
+    bool hasExplicitVoxelSize,
+    double explicitValue,
+    const std::string& explicitUnit)
+{
+    if (hasExplicitVoxelSize) {
+        // Validated by the caller, which errors out on a bad pair; this is not a
+        // fallback for an unusable --voxel-size, and must not become one.
+        if (const auto cli = explicitMicrometerPerVoxel(explicitValue, explicitUnit))
+            return {*cli, VoxelSizeSource::Cli};
+    }
+
+    if (remoteVolume != nullptr) {
+        const double fromVolume = remoteVolume->voxelSize();
+        if (std::isfinite(fromVolume) && fromVolume > 0.0)
+            return {fromVolume, VoxelSizeSource::RemoteVolume};
+    }
+
+    if (const auto local = vc::metadata::resolveLocalStoreVoxelSize(volPath))
+        return {*local, VoxelSizeSource::LocalStoreMetadata};
+
+    return {};
 }
 
 // ============================================================
@@ -1142,6 +1303,15 @@ int main(int argc, char *argv[])
         // left-handed frame. So --flip-normals is usually what we want: it negates N so the
         // slice stack grows in front of the sheet rather than behind it.
         ("flip-normals", po::bool_switch()->default_value(false), "Negate surface normals (reverses slice ordering along the normal)")
+        // How the surface itself is resampled, as opposed to how the volume is
+        // sampled along the normal (which is always trilinear here).
+        ("surface-interpolation", po::value<std::string>()->default_value("linear"),
+            "Surface resampling: linear (bilinear positions, nearest-neighbour normals) or "
+            "smooth/bicubic (Catmull-Rom positions with normals differentiated from the same "
+            "basis). The source grid is far coarser than the render, so linear leaves the normal "
+            "constant across each grid cell and every offset layer steps at the cell edges; "
+            "smooth removes those steps and the creases between them, at ~3-5x the surface-warp "
+            "cost (a few percent end to end).")
         ("zarr-output", po::value<std::string>(), "Output path for .zarr (optional)")
         ("zarr-compressor", po::value<std::string>()->default_value("blosc"), "Zarr compressor: blosc, zstd, gzip, lz4, none")
         ("zarr-compression-level", po::value<int>()->default_value(-1), "Zarr compression level (<=0 = compressor default)")
@@ -1176,7 +1346,7 @@ int main(int argc, char *argv[])
         ("resume", po::bool_switch()->default_value(false), "Skip chunks that already exist on disk")
         ("pre", po::bool_switch()->default_value(false), "Create zarr + all level datasets")
         ("voxel-size", po::value<double>(), "Physical voxel size for OME-Zarr scale metadata (reads from volume metadata if omitted)")
-        ("voxel-unit", po::value<std::string>()->default_value("nanometer"), "Physical unit for OME-Zarr axes (e.g. nanometer, micrometer)");
+        ("voxel-unit", po::value<std::string>()->default_value("nanometer"), "Unit of the number given to --voxel-size (nanometer, micrometer, millimeter, meter). Sizes read from volume metadata are always declared in micrometer.");
     // clang-format on
 
     po::options_description all("Usage");
@@ -1292,6 +1462,15 @@ int main(int argc, char *argv[])
     else if (accum_type_str == "alpha")  accumType = AccumType::Alpha;
     else if (accum_type_str == "beerlam" || accum_type_str == "beerlambert") accumType = AccumType::BeerLambert;
     else { logPrintf(stderr, "Error: invalid --accum-type\n"); return EXIT_FAILURE; }
+
+    std::string surf_interp_str = parsed["surface-interpolation"].as<std::string>();
+    std::transform(surf_interp_str.begin(), surf_interp_str.end(), surf_interp_str.begin(),
+                   [](unsigned char c){ return char(std::tolower(c)); });
+    GenInterpolation genInterp;
+    if      (surf_interp_str == "linear") genInterp = GenInterpolation::Linear;
+    else if (surf_interp_str == "smooth" || surf_interp_str == "bicubic")
+        genInterp = GenInterpolation::Smooth;
+    else { logPrintf(stderr, "Error: invalid --surface-interpolation\n"); return EXIT_FAILURE; }
 
     // alpha/beerlambert reducers only make sense over a collapsed band, so they always imply
     // composite mode. --composite-collapse extends the same band-collapsing path to max/mean/median,
@@ -1468,62 +1647,106 @@ int main(int argc, char *argv[])
     }
 
     // --- Resolve voxel size for OME-Zarr metadata ---
+    //
+    // The value itself is resolved below, once the source volume is open: a
+    // streamed volume's own resolved metadata is the authoritative size, and
+    // reusing it is both cheaper and impossible to disagree with. What is
+    // settled here is only the command line.
     const std::string voxel_unit = parsed["voxel-unit"].as<std::string>();
-    double base_voxel_size = 1.0;
-    bool hasPhysicalVoxelSize = false;
-    bool voxelSizeFromCli = false;
+    bool hasExplicitVoxelSize = false;
+    double explicitVoxelSize = 0.0;
     if (parsed.count("voxel-size")) {
-        base_voxel_size = parsed["voxel-size"].as<double>();
-        if (!std::isfinite(base_voxel_size) || base_voxel_size <= 0.0) {
+        explicitVoxelSize = parsed["voxel-size"].as<double>();
+        if (!std::isfinite(explicitVoxelSize) || explicitVoxelSize <= 0.0) {
             logPrintf(stderr, "Error: --voxel-size must be a positive finite number\n");
             return EXIT_FAILURE;
         }
-        hasPhysicalVoxelSize = true;
-        voxelSizeFromCli = true;
-        logPrintf(stdout, "Voxel size (from CLI): %g %s\n", base_voxel_size, voxel_unit.c_str());
-    } else if (auto mv = readVolumeVoxelSize(vol_path); mv.has_value()) {
-        if (std::isfinite(*mv) && *mv > 0.0) {
-            base_voxel_size = *mv;
-            hasPhysicalVoxelSize = true;
-            logPrintf(stdout, "Voxel size (from volume metadata): %g %s\n", base_voxel_size, voxel_unit.c_str());
-        } else {
-            logPrintf(stderr, "Warning: ignoring invalid metadata voxelsize; using default 1.0\n");
+        if (!explicitMicrometerPerVoxel(explicitVoxelSize, voxel_unit)) {
+            logPrintf(stderr, "Error: unsupported --voxel-unit: %s\n", voxel_unit.c_str());
+            return EXIT_FAILURE;
         }
-    } else {
-        logPrintf(stdout, "Voxel size: 1.0 (no metadata found; override with --voxel-size)\n");
-    }
-    if (hasPhysicalVoxelSize) {
-        double voxelSizeUm = base_voxel_size;
-        if (voxelSizeFromCli) {
-            if (voxel_unit == "nanometer" || voxel_unit == "nanometre" || voxel_unit == "nm")
-                voxelSizeUm *= 0.001;
-            else if (voxel_unit == "millimeter" || voxel_unit == "millimetre" || voxel_unit == "mm")
-                voxelSizeUm *= 1000.0;
-            else if (voxel_unit == "meter" || voxel_unit == "metre" || voxel_unit == "m")
-                voxelSizeUm *= 1000000.0;
-            else if (voxel_unit != "micrometer" && voxel_unit != "micrometre" &&
-                     voxel_unit != "um" && voxel_unit != "µm") {
-                logPrintf(stderr, "Error: unsupported --voxel-unit for TIFF resolution: %s\n",
-                          voxel_unit.c_str());
-                return EXIT_FAILURE;
-            }
-        }
-        // TIFF resolution describes output *pixels*: one pixel spans
-        // 1/tgt_scale level-g voxels (--scale is pixels per level-g voxel).
-        const double umPerOutputPixel = (ds_scale > 0 && tgt_scale > 0)
-            ? voxelSizeUm / double(ds_scale) / double(tgt_scale)
-            : voxelSizeUm;
-        tifDpi = voxelSizeToDpi(umPerOutputPixel);
+        hasExplicitVoxelSize = true;
     }
 
-    // Physical size of one *level-g* voxel, in voxel_unit. The output raster
-    // is not necessarily isotropic in it: in-plane, one output pixel spans
-    // 1/tgt_scale level-g voxels (--scale), and through-plane, adjacent
-    // layers sit --slice-step level-g voxels apart (buildOffsetList).
-    // writeZarrAttrs derives the per-axis .zattrs scale from this base value.
-    const double render_level_voxel_size = ds_scale > 0
-        ? base_voxel_size / double(ds_scale)
-        : base_voxel_size;
+    // Filled in once the source volume is open.
+    double base_voxel_size = 1.0;
+    double render_level_voxel_size = 1.0;
+    // The number and the unit that describe one level-g voxel *in .zattrs*. They
+    // are written as a pair by writeZarrAttrs and nothing checks that they agree, so
+    // they are computed together below. `base_voxel_size` is always micrometres;
+    // these are in the caller's own unit for an explicit --voxel-size.
+    //
+    // The value starts at 0 = "unknown", which is what writeZarrAttrs needs in
+    // order to omit the physical scale rather than declare a placeholder one.
+    double zarr_voxel_value = 0.0;
+    std::string zarr_voxel_unit = voxel_unit;
+
+    // --- Resolve the physical voxel size -------------------------------------
+    // The source volume is open by now, so a streamed volume's own metadata is
+    // available to reuse. Computing this earlier is what made the renderer miss
+    // remote resolutions entirely.
+    {
+        const ResolvedVoxelSize resolved = resolveRenderVoxelSize(
+            vol_path, remoteVolume.get(), hasExplicitVoxelSize, explicitVoxelSize,
+            voxel_unit);
+
+        base_voxel_size = resolved.micrometerPerVoxel;
+
+        // Emit the number and the unit as a matched pair.
+        //
+        // For store metadata and the opened volume the resolved value is
+        // micrometres, so both are micrometres: passing --voxel-unit through
+        // unchanged is what let `.zattrs` declare nanometre voxels for micrometre
+        // data.
+        //
+        // For an explicit --voxel-size the caller's own number and unit are kept,
+        // as the pre-patch renderer did. Emitting the *converted* micrometre number
+        // under the caller's unit label is a silent 1000x error, and is exactly
+        // what the first version of this patch did for
+        // `--voxel-size 8640 --voxel-unit nanometer`.
+        if (const char* unit = zarrVoxelUnit(resolved, voxel_unit)) {
+            zarr_voxel_unit = unit;
+            zarr_voxel_value = zarrVoxelValue(resolved, explicitVoxelSize);
+        }
+
+        if (resolved.isUsable()) {
+            // Log exactly what .zattrs will declare, so the log line can be
+            // checked against the output instead of needing its own conversion.
+            logPrintf(stdout, "Voxel size (%s): %g %s\n",
+                      voxelSizeSourceName(resolved.source), zarr_voxel_value,
+                      zarr_voxel_unit.c_str());
+
+            const double umPerOutputPixel = (ds_scale > 0 && tgt_scale > 0)
+                ? base_voxel_size / double(ds_scale) / double(tgt_scale)
+                : base_voxel_size;
+            tifDpi = voxelSizeToDpi(umPerOutputPixel);
+        } else {
+            // There is no measurement to declare. Passing 0 tells writeZarrAttrs
+            // that the physical size is unknown: it then writes no axis unit and
+            // encodes only the relative pyramid scaling, keeping the multiscales
+            // discovery metadata intact. A zero tifDpi leaves the TIFF resolution
+            // tags unset. Both outputs therefore say "unknown" instead of
+            // inventing a size, and neither loses the image structure.
+            logPrintf(stderr,
+                      "Warning: this volume publishes no usable voxel size, so its "
+                      "physical scale is unknown and none will be declared. Pass "
+                      "--voxel-size <value> --voxel-unit micrometer to supply one.\n");
+            zarr_voxel_value = 0.0;
+            zarr_voxel_unit.clear();
+        }
+
+        // Physical size of one *level-g* voxel, stated in `zarr_voxel_unit`. The
+        // output raster is not necessarily isotropic in it: in-plane, one output
+        // pixel spans 1/tgt_scale level-g voxels (--scale), and through-plane,
+        // adjacent layers sit --slice-step level-g voxels apart (buildOffsetList).
+        // writeZarrAttrs derives the per-axis .zattrs scale from this base value,
+        // so this argument MUST be in the same unit as zarr_voxel_unit -- and 0
+        // when there is no size to declare, which is the flag that switches
+        // writeZarrAttrs from a physical scale to a relative one.
+        render_level_voxel_size = ds_scale > 0
+            ? zarr_voxel_value / double(ds_scale)
+            : zarr_voxel_value;
+    }
 
     int rotQuadGlobal = -1;
     if (std::abs(rotate_angle) > 1e-6) {
@@ -1534,6 +1757,8 @@ int main(int argc, char *argv[])
     }
     if (flip_axis >= 0) logPrintf(stdout, "Flip: %s\n", flip_axis == 0 ? "V" : flip_axis == 1 ? "H" : "Both");
     if (g_flipNormals) logPrintf(stdout, "Flip normals: on\n");
+    if (genInterp == GenInterpolation::Smooth)
+        logPrintf(stdout, "Surface interpolation: smooth (bicubic)\n");
 
     if (wantZarr) {
         if (auto p = std::filesystem::path(zarrOutputArg).parent_path(); !p.empty())
@@ -1575,6 +1800,15 @@ int main(int argc, char *argv[])
                 logPrintf(stderr, "Warning: ABF++ failed, using original\n");
             }
         }
+
+        // Set the surface resampling mode here, AFTER the --flatten block above
+        // (which does surf.reset() and would drop it) and BEFORE both the
+        // prefetch planning pass and the render pass. The planner re-runs
+        // gen() itself to work out which chunks the render will touch, so if
+        // this moved below it the planner and the sampler would disagree
+        // silently: prefetching chunks that are never read and missing ones
+        // that are.
+        surf->setGenInterpolation(genInterp);
 
         // Replace sentinel -1 with NaN
         auto* raw_points = surf->rawPointsPtr();
@@ -1678,7 +1912,7 @@ int main(int argc, char *argv[])
                 if (rotQuad >= 0 && (rotQuad % 2) == 1) std::swap(attrXY.width, attrXY.height);
                 writeZarrAttrs(outFilePath, vol_path, group_idx, baseZ, slice_step, accum_step,
                                accum_type_str, accumOffsets.size(), attrXY, baseZ, CH, CW,
-                               render_level_voxel_size, voxel_unit, tgt_scale);
+                               render_level_voxel_size, zarr_voxel_unit, tgt_scale);
                 return true;
             } else if (numParts > 1) {
                 if (!std::filesystem::exists(std::filesystem::path(zarrOutputArg) / "0" / ".zarray")) {
@@ -1899,7 +2133,7 @@ int main(int argc, char *argv[])
                 if (rotQuad >= 0 && (rotQuad % 2) == 1) std::swap(attrXY.width, attrXY.height);
                 writeZarrAttrs(outFilePath, vol_path, group_idx, baseZ, slice_step, accum_step,
                                accum_type_str, accumOffsets.size(), attrXY, baseZ, CH, CW,
-                               render_level_voxel_size, voxel_unit, tgt_scale);
+                               render_level_voxel_size, zarr_voxel_unit, tgt_scale);
             }
         }
         return true;

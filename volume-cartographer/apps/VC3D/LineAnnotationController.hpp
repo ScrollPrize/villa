@@ -35,6 +35,9 @@
 #include "LineAnnotationFiberClassification.hpp"
 #include "LineAnnotationFiberDeletion.hpp"
 #include "LineAnnotationFiberSegments.hpp"
+#include "LineAnnotationFiberLinkValidation.hpp"
+#include "LineAnnotationStoredFiber.hpp"
+#include "LineAnnotationStructuralEdits.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
 #include "vc/atlas/FiberIntersections.hpp"
 #include "vc/core/util/Umbilicus.hpp"
@@ -257,29 +260,7 @@ public:
     // legacy writer, while an empty array is a deliberate absence of links.
     static constexpr const char* kAdjacentBranchesJsonKey = "adjacent_branches";
 
-    struct FiberBranchRef {
-        int controlPointIndex = -1;
-        uint64_t branchFiberId = 0;
-        int branchControlPointIndex = -1;
-        std::string branchFileName;
-        cv::Vec3d controlPointDirection{0.0, 0.0, 0.0};
-        cv::Vec3d branchControlPointDirection{0.0, 0.0, 0.0};
-        cv::Vec3d controlPointPosition{0.0, 0.0, 0.0};
-        cv::Vec3d branchControlPointPosition{0.0, 0.0, 0.0};
-        // Link awaits reviewer approval; kept in sync on both reciprocal refs.
-        bool pending = false;
-        // The two control points sit on ADJACENT windings, not the same one:
-        // the V fiber's point one winding inside the H fiber's (horizontals
-        // lie on the front of the sheet, verticals on the back, so a V fiber
-        // showing through to the next wrap out is one sheet thickness from
-        // it). Which side is inside follows from the fibers' effective H/V
-        // tags; a pair that is not one H and one V (a tag can change, a new
-        // fiber has none yet) is not refused here but flagged as an error by
-        // the fiber map, and carries no winding constraint there. Immutable
-        // for a link (delete and re-link to change), mirrored on both
-        // reciprocal refs.
-        bool adjacent = false;
-    };
+    using FiberBranchRef = vc3d::line_annotation::FiberBranchRef;
 
     // Per-fiber data for the fiber overlay's "Show linked" mode. Only fibers
     // with at least one valid cross-fiber link are returned. linkGroupId is
@@ -567,48 +548,7 @@ private:
         FiberSummary::AlignmentMetrics fiber;
         std::vector<FiberSummary::AlignmentMetrics> spans;
     };
-    struct StoredFiber {
-        double width = 0.0;
-        double widthGapFraction = vc::fiber_tracer::kDefaultFiberWidthGapFraction;
-        uint64_t id = 0;
-        std::string username;
-        std::string startedAt;
-        uint64_t sequence = 0;
-        std::string fileName;
-        std::filesystem::path sourceRoot;
-        uint64_t generation = 1;
-        std::vector<vc3d::line_annotation::StoredControlPoint> controlPoints;
-        std::vector<cv::Vec3d> linePoints;
-        // Stored snapshots only. Live-session branch metadata must be converted
-        // through storedFiberFromSession()/saveSessionAsFiber() so the central
-        // hook can remap linked control-point indices before serialization.
-        std::vector<FiberBranchRef> branches;
-        vc3d::line_annotation::FiberHvClassification hvClassification;
-        std::string manualHvTag;
-        std::vector<std::string> tags;
-        vc3d::line_annotation::FiberOptimizationMode optimizationMode =
-            vc3d::line_annotation::FiberOptimizationMode::Lasagna;
-        // Coordinate domain in which control_points and line_points are
-        // stored. New Spiral-created fibers record the fiber manifest's L0
-        // shape so a downsampled active volume can display them correctly.
-        std::optional<std::array<std::size_t, 3>> coordinateBaseShapeZYX;
-        bool needsSave = false;
-        // The file's write time as of the READ that produced this record
-        // (loadFiberFile), so a save decided from that read - the adjacent
-        // link heal - can tell a file the sync replaced in the meantime and
-        // leave it alone (the next load heals again). Unset for fibers not
-        // read from disk.
-        std::optional<std::filesystem::file_time_type> loadedWriteTime;
-        // Presence at read time, including an explicitly empty array. Only
-        // a missing array permits restoring adjacent refs from peers.
-        bool adjacentBranchesPresent = true;
-        // healOneSidedAdjacentLinks marked this record for saving.
-        bool adjacentHealed = false;
-        // Load put the gap span tags in step with the break point tags (a
-        // version-3 file, or one edited by hand); saved back under the same
-        // stale-file guard as the adjacent heal.
-        bool gapHealed = false;
-    };
+    using StoredFiber = vc3d::line_annotation::StoredFiber;
 
     struct StoredFiberSessionSnapshot {
         StoredFiber fiber;
@@ -630,11 +570,7 @@ private:
         std::vector<std::shared_ptr<FiberSaveBatchTracker>> batches;
     };
 
-    struct BranchLinkValidationIssue {
-        size_t fiberIndex = 0;
-        size_t branchIndex = 0;
-        std::string reason;
-    };
+    using BranchLinkValidationIssue = vc3d::line_annotation::BranchLinkValidationIssue;
 
     struct FiberSaveTaskResult {
         bool ok = false;
@@ -1199,21 +1135,52 @@ private:
     [[nodiscard]] static nlohmann::json fiberSaveSnapshotToJson(
         const FiberSaveSnapshot& snapshot,
         double scale = 1.0);
-    [[nodiscard]] std::optional<StoredFiber> loadFiberJson(const nlohmann::json& root,
-                                                           const std::filesystem::path& path,
-                                                           std::vector<std::string>* branchErrors = nullptr) const;
+    // A link entry a load dropped from a stored record (neutralized, removed
+    // by a repair, or stripped by the lenient parser). Fields a stripped
+    // entry did not parse stay unset; a descriptor without a target matches
+    // nothing.
+    struct DroppedLinkEntry {
+        std::filesystem::path ownerSourceRoot;
+        std::string ownerFileName;
+        std::string targetFileName;
+        bool adjacent = false;
+        std::optional<int> localIndex;
+        std::optional<cv::Vec3d> controlPointPosition;
+        std::optional<cv::Vec3d> branchControlPointPosition;
+        // The whole array of this kind was unreadable (not an array): every
+        // entry of the kind is unaccounted for.
+        bool wholeKind = false;
+    };
+    // `stripped` (optional, lenient mode only) receives one descriptor per
+    // link entry the parser discarded, with whatever fields it could read.
+    [[nodiscard]] std::optional<StoredFiber> loadFiberJson(
+        const nlohmann::json& root,
+        const std::filesystem::path& path,
+        std::vector<std::string>* branchErrors = nullptr,
+        std::vector<DroppedLinkEntry>* stripped = nullptr) const;
     [[nodiscard]] // Reads and parses one fiber file, stamping StoredFiber::loadedWriteTime
     // from before the read; branchErrors, when given, collects per-branch
     // load problems the way loadFiberJson reports them.
     std::optional<StoredFiber> loadFiberFile(const std::filesystem::path& path,
-                                             std::vector<std::string>* branchErrors = nullptr) const;
+                                             std::vector<std::string>* branchErrors = nullptr,
+                                             std::vector<DroppedLinkEntry>* stripped = nullptr) const;
     [[nodiscard]] std::vector<BranchLinkValidationIssue> collectLoadedFiberBranchIssues(
         const std::vector<StoredFiber>& fibers) const;
+    // Drops the offending entries (and, through the fixed point, their
+    // reciprocals) in memory without touching the files; marks the fibers
+    // whose record now differs from disk. Returns the number of entries
+    // dropped.
+    std::size_t neutralizeLoadedFiberBranchLinks(
+        std::vector<StoredFiber>& fibers,
+        const std::vector<BranchLinkValidationIssue>& issues) const;
+    // `writtenFiles` receives the source-qualified keys of the records
+    // saveFiberNow completed (a stale-skipped or failed write is not in it).
     [[nodiscard]] bool repairLoadedFiberBranchLinks(
         std::vector<StoredFiber>& fibers,
         const std::unordered_set<std::string>& fibersWithRemovedBranchEntries,
         const std::vector<BranchLinkValidationIssue>& initialIssues,
-        std::vector<std::string>& errors) const;
+        std::vector<std::string>& errors,
+        std::unordered_set<std::string>* writtenFiles = nullptr) const;
     [[nodiscard]] std::string uniqueImportedFiberFileName(const StoredFiber& fiber,
                                                           std::unordered_set<std::string>& reserved,
                                                           uint64_t& nextSequence) const;
@@ -1480,6 +1447,93 @@ private:
     // deleteFibers is running (it yields to the event loop while draining
     // saves); a second delete meanwhile is refused.
     bool _deletingFibers = false;
+    // A merge or split from its menu callback to the end of its commit; the
+    // second one refuses, and deletes/renames/imports refuse meanwhile.
+    bool _structuralEditInProgress = false;
+    // _fiberSaveFailureCount as of the last load: structural edits refuse to
+    // run when a save has failed since (memory may be ahead of disk).
+    uint64_t _fiberSaveFailureCountAtLoad = 0;
+    // A structural edit's disk undo left artifacts behind: memory and disk
+    // are known to differ until the next load. Latched until then.
+    bool _structuralEditRecoveryRequired = false;
+    // Loads restarted because a save was scheduled while the broken-link
+    // prompt was open (its snapshot predates the reconciliation). Past the
+    // bound the next load answers the prompt itself with "Keep files
+    // unchanged" (no modal, so nothing can schedule a save during it).
+    int _fiberLoadRestartsForSaves = 0;
+    bool _fiberLoadAutoKeepUnchanged = false;
+
+    // Everything a merge/split needs from the menu callback, captured by
+    // identity and position (never by index or iterator) because phase B
+    // runs after the callback returned and after a save drain.
+    struct StructuralEditCapture {
+        uint64_t packageGeneration = 0;
+        uint64_t loadSequence = 0;
+        std::weak_ptr<LineAnnotationSession> session;
+        std::string surfaceName;
+        uint64_t sessionFiberId = 0;
+        std::string sessionFileName;
+        cv::Vec3d firstPoint{0.0, 0.0, 0.0};
+        int firstHint = -1;
+        cv::Vec3d secondPoint{0.0, 0.0, 0.0};
+        int secondHint = -1;
+        uint64_t farId = 0;
+        std::string farFileName;
+        std::filesystem::path farSourceRoot;
+        cv::Vec3d farPoint{0.0, 0.0, 0.0};
+        int farHint = -1;
+        vc3d::line_annotation::FiberOptimizationMode mode =
+            vc3d::line_annotation::FiberOptimizationMode::Lasagna;
+        bool linkHalves = false;
+        bool suppressErrors = false;
+    };
+    struct StructuralEditRequest {
+        const char* verb = "";
+        std::vector<StoredFiber> newFibers;
+        std::vector<StoredFiber> originals;
+        std::vector<vc3d::line_annotation::BranchRedirectSource> sources;
+        std::vector<std::weak_ptr<LineAnnotationSession>> consumedSessions;
+    };
+    struct StructuralEditOutcome {
+        bool ok = false;
+        bool recoveryRequired = false;
+        // ok, but a notification after the commit threw: views may be stale.
+        std::string warning;
+        std::string error;
+        std::vector<std::string> writtenFileNames;
+    };
+    void commitFiberMerge(StructuralEditCapture capture);
+    void commitFiberSplit(StructuralEditCapture capture);
+    // `committed` is set the moment the disk transaction succeeded, before
+    // any step that allocates, so a caller catching an exception knows
+    // whether "nothing was changed" is still true.
+    StructuralEditOutcome commitStructuralEdit(StructuralEditRequest request, bool* committed);
+    // Entries the current load dropped from stored records (neutralize or
+    // repair): the same entries are removed from open sessions, including
+    // their armed rollback copies, so no session writes a one-way link back.
+    static std::vector<DroppedLinkEntry> droppedLinkEntries(
+        const std::vector<StoredFiber>& before, const std::vector<StoredFiber>& after);
+    // Removes from every open session (its live branches and its armed
+    // rollback copies) the entries in `dropped` that the session's own
+    // record in `records` no longer holds, matched on every field the
+    // descriptor knows.
+    void dropLinkEntriesFromOpenSessions(const std::vector<DroppedLinkEntry>& dropped,
+                                         const std::vector<StoredFiber>& records);
+    bool structuralEditPreflight(uint64_t packageGeneration, uint64_t loadSequence,
+                                 std::string* error);
+    [[nodiscard]] bool structuralEditParticipantAllowed(const std::filesystem::path& sourceRoot,
+                                                        const std::string& fileName,
+                                                        std::string* error) const;
+    // Files that may still reference an original although no record in the
+    // write set does: flagged records outside the write set (their file
+    // holds entries the record dropped at load) and files hidden by the
+    // source dedupe (their links are in no record at all). Read raw, so the
+    // lenient parser cannot hide an entry a second time; references resolve
+    // the way the loader resolves them (owner source root + basename,
+    // through the alias table).
+    [[nodiscard]] std::optional<std::string> structuralEditStaleLinkOnDisk(
+        const std::vector<StoredFiber>& originals,
+        const std::unordered_set<std::string>& writeSetKeys) const;
     // Deduplicates the deferred re-optimization prompt across reentrant
     // fiber (re)loads.
     bool _reoptimizationPromptPending = false;
