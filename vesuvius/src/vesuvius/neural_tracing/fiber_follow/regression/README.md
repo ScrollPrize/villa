@@ -305,6 +305,22 @@ with metadata checks took 0.00063 s. GPU/end-to-end training throughput is unmea
 
 ### BasicBlockD image and history encoders
 
+To initialize a fresh model with the settings captured directly from
+`mixed_ct_afv_stem32_fresh_run1/ckpt_031000.pt`, use:
+
+```bash
+bash scripts/train_mixed_ct_stem_fresh.sh
+```
+
+This script uses batch 6 and two gradient accumulation steps (12 examples per
+optimizer update), the fine history encoder, and the checkpoint's remaining
+training settings, including live continuation at 4–8 steps, tolerance 3,
+LR 1e-4 and 5000 warmup updates. It starts at step zero with random weights and
+a fresh optimizer; no checkpoint is opened at launch. Its default output name is
+`mixed_ct_afv_stem32_fresh_run2`; set `STEM_RUN_NAME` to choose another name.
+`FIBER_PYTHON` can select the Python executable. Settings are explicit in the
+script, and its header records the source checkpoint's SHA256.
+
 Start a fresh mixed-CT run with the replacement image stem and history encoder:
 
 ```bash
@@ -406,7 +422,9 @@ attention work; measure GPU memory before choosing the training batch size.
 Position, pose, age,
 slot and seed role are embedded inside the encoder. Generator and scorer have
 separate residual history attention shared across their respective decoder
-layers. History features stay attached and are reused across all attempts and
+layers. The survival scorer has four transformer layers with model width 128
+and feed-forward width 256 at the default settings. History features stay attached
+and are reused across all attempts and
 supplied candidates within a decision. Fully masked history contributes zero.
 
 Training compiles supervised prediction, supplied-candidate scoring, and losses. Valid

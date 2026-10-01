@@ -55,7 +55,8 @@ def layer_capture(model):
     Store reduced spatial maps, query activations and per-slot attention, never
     full spatial feature banks. Restore everything even after a failed forward.
     """
-    record = dict(encoder={}, decoder={}, scorer={}, history={}, statistics={})
+    record = dict(encoder={}, decoder={}, scorer={}, history={}, statistics={},
+                  history_depths=dict(generator=len(model.decoder.layers), scorer=len(model.confidence_scorer.layers)))
     handles, methods = [], []
 
     def spatial(name, value, channels_last=False):

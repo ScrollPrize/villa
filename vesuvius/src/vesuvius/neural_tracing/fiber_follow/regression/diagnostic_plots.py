@@ -51,7 +51,7 @@ def display_example(batch, output, details, layers, cfg, label, metrics):
     selected = int(output['selected_refinement'][0])
     decoder = {key: array(values[selected]) for key, values in layers['decoder'].items()}
     attentions = {}
-    for name, depth in (('generator', cfg.decoder_layers), ('scorer', 2)):
+    for name, depth in layers['history_depths'].items():
         values = layers['history'].get(name+'_attention', [])
         chosen = values[selected*depth:(selected+1)*depth]
         attentions[name] = np.mean([array(a) for a in chosen], axis=0) if chosen else np.zeros((cfg.n_future, len(valid)))

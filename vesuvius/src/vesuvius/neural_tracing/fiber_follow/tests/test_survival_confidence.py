@@ -125,6 +125,10 @@ def test_first_segment_reads_all_observations_but_no_future_segment_features():
     padding[:, -1] = True
     logits = scorer(spatial, points, scorer.project_memory(memory, padding), padding, (memory, padding))
     logits[:, 0].sum().backward()
+    assert len(scorer.layers) == 4
+    for layer in scorer.layers:
+        grad = layer.linear1.weight.grad
+        assert grad is not None and torch.isfinite(grad).all() and grad.abs().sum() > 0
     assert spatial.grad[:, 0].abs().sum() > 0
     assert spatial.grad[:, 1:].count_nonzero() == 0
     assert (memory.grad[:, :-1].abs().sum(-1) > 0).all()

@@ -28,9 +28,9 @@ def test_layer_capture_preserves_predictions_and_cleans_up(empty, variant):
     weights = copy.deepcopy(model.state_dict())
     rng = torch.get_rng_state()
     with torch.no_grad():
-        expected = model(data['x'], data['hist'], data['hmask'])
+        expected = model(data['x'], data['hist'], data['hmask'], confidence_threshold=1.)
         with layer_capture(model) as layers:
-            actual = model(data['x'], data['hist'], data['hmask'])
+            actual = model(data['x'], data['hist'], data['hmask'], confidence_threshold=1.)
     for key in expected:
         torch.testing.assert_close(actual[key], expected[key], rtol=0, atol=0)
     torch.testing.assert_close(torch.get_rng_state(), rng, rtol=0, atol=0)
@@ -39,6 +39,8 @@ def test_layer_capture_preserves_predictions_and_cleans_up(empty, variant):
     assert layers['statistics']['CT stem']['rms'] > 0
     assert layers['statistics']['patch embedding']['rms'] > 0
     assert set(layers['decoder']) == {'input', 'block 1', 'output'}
+    assert set(layers['scorer']) == {'input', 'block 1', 'block 2', 'block 3', 'block 4'}
+    assert layers['history_depths'] == {'generator': 1, 'scorer': 4}
     assert layers['encoder']['encoder output'].ndim == 2
     lateral = 17 if variant == 'fine' else 9
     assert layers['history']['tokens'].shape == (8, lateral, lateral)
@@ -48,6 +50,16 @@ def test_layer_capture_preserves_predictions_and_cleans_up(empty, variant):
             assert torch.isfinite(attention).all()
             torch.testing.assert_close(attention.sum(-1), torch.full((cfg.n_future,), 0. if empty else 1.))
             assert not attention[:, 2:].any()
+    # Distinct layer/attempt values catch averaging the wrong retry or only two layers.
+    from vesuvius.neural_tracing.fiber_follow.regression.diagnostic_plots import display_example
+    assert len(layers['history']['scorer_attention']) == 8
+    for head, depth in layers['history_depths'].items():
+        layers['history'][head+'_attention'] = [torch.full((cfg.n_future, 8), 100.*attempt+layer)
+            for attempt in range(2) for layer in range(depth)]
+    selected = dict(actual, selected_refinement=torch.ones(1, dtype=torch.long))
+    example = display_example(data, selected, {}, layers, cfg, 'test', {})
+    np.testing.assert_allclose(example['attention']['scorer'], 101.5)
+    np.testing.assert_allclose(example['attention']['generator'], 100.)
     assert 'forward_cached' not in model.history_attention.__dict__
     assert not model.encoder.patch_projection._forward_hooks
     with pytest.raises(RuntimeError):

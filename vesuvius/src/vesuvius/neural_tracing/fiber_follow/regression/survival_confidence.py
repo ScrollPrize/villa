@@ -19,7 +19,7 @@ class SegmentSurvivalScorer(nn.Module):
         width = self.samples_per_segment*evidence_width+10
         self.query = nn.Sequential(nn.LayerNorm(width), nn.Linear(width, h), nn.SiLU())
         self.layers = nn.ModuleList(PathDecoderLayer(h, cfg.heads, 2*h, dropout=0.,
-            activation='gelu', batch_first=True, norm_first=True) for _ in range(2))
+            activation='gelu', batch_first=True, norm_first=True) for _ in range(4))
         from .history_slabs import HistoryAttention
         self.history_attention = HistoryAttention(h, cfg.heads)
         self.norm = nn.LayerNorm(h)
