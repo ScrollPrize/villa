@@ -3379,3 +3379,17 @@ identity remains unconfirmed. Global-assignment experiments not yet implemented.
   evaluation rerun; source worktrees and untracked artifacts left untouched.
 - Focused Python suites: 430 passed, 38 skipped, two expected failures;
   short/long embedding mock corrected after initial regression detection.
+
+# 2026-09-30 — Online Gaussian orientation refinement
+
+- Added opt-in, persistent modulo-pi rotation of anisotropic Gaussian fiber
+  targets during online refinement. Rotation uses equal-radius presence probes,
+  a capped angular update, and a weak tether to the immutable Lasagna normal;
+  legacy geometry-only refinement archives migrate to zero rotation.
+- Prepared the stopped full-resolution Gaussian run to resume from its update
+  18,000 full checkpoint with half-width sigmas and managed GPUs 0-5, leaving
+  GPUs 6-7 reserved.
+- Split Gaussian presence supervision into independently normalized ridge,
+  within-support distribution-negative, and background terms while preserving
+  the prior aggregate loss scale; hardened partial distributed test waves with
+  reference-counted padded-sample leases.

@@ -951,9 +951,10 @@ def _nonempty_group_statistics(
     group_count: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     valid = group_count > 0.0
+    minimum = torch.finfo(group_count.dtype).tiny
     group_mean = torch.where(
         valid,
-        group_sum / group_count.clamp_min(1.0),
+        group_sum / group_count.clamp_min(minimum),
         torch.zeros_like(group_sum),
     )
     return group_mean.sum(), valid.to(dtype=group_sum.dtype).sum()
@@ -972,6 +973,7 @@ def _finalize_loss_statistics(
         "direction",
         "positive_presence",
         "negative_presence",
+        "distribution_presence",
         "angle",
         "branch0",
         "branch1",
@@ -996,6 +998,10 @@ def _finalize_loss_statistics(
         "negative_presence": (
             statistics.negative_presence_sum,
             statistics.negative_presence_count,
+        ),
+        "distribution_presence": (
+            statistics.distribution_presence_sum,
+            statistics.distribution_presence_count,
         ),
         "angle": (statistics.angle_sum, statistics.angle_count),
         "branch0": (statistics.branch0_sum, statistics.branch_count),
@@ -1037,6 +1043,7 @@ def _finalize_loss_statistics(
     direction_loss = ratio("direction")
     positive_presence_loss = ratio("positive_presence")
     negative_presence_loss = ratio("negative_presence")
+    distribution_presence_loss = ratio("distribution_presence")
     positive_count = (
         global_values["positive_presence"][1]
         if global_values
@@ -1047,13 +1054,31 @@ def _finalize_loss_statistics(
         if global_values
         else statistics.negative_presence_count
     )
+    distribution_count = (
+        global_values["distribution_presence"][1]
+        if global_values
+        else statistics.distribution_presence_count
+    )
+    distribution_active = (distribution_count > 0.0).to(
+        dtype=positive_presence_loss.dtype
+    )
+    # Binary targets retain their historical 1:1 positive/background scale.
+    # Gaussian targets decompose the same total positive/negative pressure as
+    # 1.0 ridge-positive + 0.5 within-support distribution-negative + 0.5
+    # external background-negative (conceptual shares 50% / 25% / 25%).
     presence_loss = (
         float(positive_query_weight)
         * positive_presence_loss
         * (positive_count > 0.0).to(dtype=positive_presence_loss.dtype)
         + float(negative_query_weight)
-        * negative_presence_loss
-        * (negative_count > 0.0).to(dtype=negative_presence_loss.dtype)
+        * (
+            (1.0 - 0.5 * distribution_active)
+            * negative_presence_loss
+            * (negative_count > 0.0).to(dtype=negative_presence_loss.dtype)
+            + 0.5
+            * distribution_active
+            * distribution_presence_loss
+        )
     )
     split_embedding = (local_pairs["short_embedding"][1] > 0) | (local_pairs["long_embedding"][1] > 0)
     if global_values:
@@ -1069,6 +1094,9 @@ def _finalize_loss_statistics(
         "total": total,
         "direction": direction_loss,
         "presence": presence_loss,
+        "presence_ridge": positive_presence_loss,
+        "presence_distribution": distribution_presence_loss,
+        "presence_background": negative_presence_loss,
         "embedding": embedding_loss,
         "embedding_contrastive": ratio("contrastive_embedding"),
         "embedding_anchors": global_values["contrastive_embedding"][1] if global_values else statistics.contrastive_embedding_count,
@@ -1521,22 +1549,47 @@ def compute_losses(
         positive_mask = presence_target > 0.0
         if presence_loss_mask is not None:
             positive_mask = positive_mask & presence_loss_mask.unsqueeze(1)
-        soft_presence_bce = _safe_probability_bce(
+        positive_presence_bce = _safe_probability_bce(
             pred_presences.clamp(1.0e-6, 1.0 - 1.0e-6),
-            presence_target,
+            torch.ones_like(pred_presences),
             reduction="none",
         )
-        positive_mask_f = positive_mask.to(dtype=soft_presence_bce.dtype)
-        positive_group_sum = (soft_presence_bce * positive_mask_f).sum(
+        ridge_weight = presence_target.to(dtype=positive_presence_bce.dtype) * positive_mask
+        positive_group_sum = (positive_presence_bce * ridge_weight).sum(
             dim=(2, 3, 4, 5)
         ).reshape(-1)
-        positive_group_count = positive_mask_f.sum(dim=(2, 3, 4, 5)).reshape(-1)
+        positive_group_count = ridge_weight.sum(dim=(2, 3, 4, 5)).reshape(-1)
         positive_presence_sum, positive_presence_group_count = _nonempty_group_statistics(
             positive_group_sum,
             positive_group_count,
         )
+        distribution_presence_bce = _safe_probability_bce(
+            pred_presences.clamp(1.0e-6, 1.0 - 1.0e-6),
+            torch.zeros_like(pred_presences),
+            reduction="none",
+        )
+        distribution_weight = (
+            (1.0 - presence_target).to(dtype=distribution_presence_bce.dtype)
+            * positive_mask
+        )
+        distribution_group_sum = (distribution_presence_bce * distribution_weight).sum(
+            dim=(2, 3, 4, 5)
+        ).reshape(-1)
+        distribution_group_count = distribution_weight.sum(
+            dim=(2, 3, 4, 5)
+        ).reshape(-1)
+        distribution_presence_sum, distribution_presence_group_count = (
+            _nonempty_group_statistics(
+                distribution_group_sum,
+                distribution_group_count,
+            )
+        )
         negative_mask = presence_target == 0.0
     else:
+        distribution_presence_sum = pred_presences.sum() * 0.0
+        distribution_presence_group_count = torch.zeros(
+            (), dtype=pred_presences.dtype, device=pred_presences.device
+        )
         negative_mask = presence_target <= 0.5
     if presence_loss_mask is not None:
         negative_mask = negative_mask & presence_loss_mask.unsqueeze(1)
@@ -1561,6 +1614,8 @@ def compute_losses(
         positive_presence_count=positive_presence_group_count,
         negative_presence_sum=negative_presence_sum,
         negative_presence_count=negative_presence_group_count,
+        distribution_presence_sum=distribution_presence_sum,
+        distribution_presence_count=distribution_presence_group_count,
         angle_sum=angle_sum,
         angle_count=angle_count,
         branch0_sum=branch0_sum,
@@ -2284,6 +2339,44 @@ def _distributed_test_batch_indices(
     return tuple(range(int(config.rank), batch_count, int(config.world_size)))
 
 
+def _distributed_evaluation_wave_indices(
+    remaining: Sequence[int],
+    *,
+    start: int,
+    wave_size: int,
+    rank: int,
+    world_size: int,
+    total_batch_count: int,
+    pad_empty_ranks: bool,
+) -> tuple[list[int], bool]:
+    """Assign one evaluation wave while preserving DDP forward parity.
+
+    Managed evaluation yields between world-sized waves.  Its final wave can
+    contain fewer batches than ranks, but every DDP rank must still execute the
+    same number of forwards before the following collective.  Empty ranks load
+    a deterministic duplicate solely to preserve that sequencing; callers
+    discard its row and disable stateful prediction observers.
+    """
+    wave = list(remaining[int(start):int(start) + int(wave_size)])
+    indices = wave[int(rank)::int(world_size)]
+    if indices or not pad_empty_ranks or not wave:
+        return indices, False
+    # Prefer a distinct, already-defined test batch for every padding rank.
+    # Reusing one live shared-memory ticket across processes is not a safe
+    # transport primitive, even though all readers are logically read-only.
+    occupied = set(wave)
+    wanted = int(rank) - len(wave)
+    for candidate in range(int(total_batch_count)):
+        if candidate in occupied:
+            continue
+        if wanted == 0:
+            return [candidate], True
+        wanted -= 1
+    # Very small test sets can have fewer batches than ranks. The broker's
+    # reference-counted lease remains the bounded fallback for that case.
+    return [wave[int(rank) % len(wave)]], True
+
+
 def _test_batch_take(*, sample_count: int, batch_size: int, global_batch_index: int) -> int:
     remaining = int(sample_count) - int(global_batch_index) * int(batch_size)
     if remaining <= 0:
@@ -2361,7 +2454,7 @@ class _FullResolutionEvaluation(torch.nn.Module):
 def _evaluate_loaded_batch(model, batch, config, *, device, microbatch_size,
                            direction_weight, presence_weight, mixed_precision,
                            conditioned_loss_options=None, prediction_observer=None,
-                           historical=False):
+                           historical=False, minimum_forward_count=0):
     """Shared per-logical-batch evaluation, including bounded physical splits."""
     take = int(batch.volume.shape[0])
     size = take if microbatch_size is None else microbatch_size
@@ -2371,11 +2464,15 @@ def _evaluate_loaded_batch(model, batch, config, *, device, microbatch_size,
         size = size // 2 * 2
     statistics = None
     embedding_diagnostics = []
+    forward_count = 0
+    padding_physical = None
     for offset in range(0, take, size):
         physical = _slice_batch(batch, offset, min(take, offset + size)).to(device)
         physical = materialize_targets(physical, config, output_stride=_model_output_stride(model))
         if historical:
             physical = replace(physical, presence_mask=historical_presence_mask(physical, config))
+        if padding_physical is None:
+            padding_physical = physical
         with _autocast_context(mixed_precision):
             part = _forward_loss_statistics(model, physical,
                 conditioned_loss_options=conditioned_loss_options, training_loss=False,
@@ -2383,6 +2480,21 @@ def _evaluate_loaded_batch(model, batch, config, *, device, microbatch_size,
                 embedding_diagnostics=embedding_diagnostics)
             # Diagnostics reuse the forward pair samples; no extra inference.
         statistics = part if statistics is None else statistics + part
+        forward_count += 1
+    # DDP evaluation must execute the same number of model forwards on every
+    # rank.  A final partial logical batch can otherwise leave the ranks with
+    # different microbatch counts.  Repeat a local physical batch solely for
+    # collective parity; deliberately discard its loss and observer effects.
+    if forward_count < int(minimum_forward_count):
+        if padding_physical is None:
+            raise ValueError("cannot pad evaluation forwards from an empty batch")
+        for _ in range(forward_count, int(minimum_forward_count)):
+            with _autocast_context(mixed_precision):
+                _forward_loss_statistics(model, padding_physical,
+                    conditioned_loss_options=conditioned_loss_options,
+                    training_loss=False, prediction_observer=None,
+                    historical_presence_mask=historical,
+                    embedding_diagnostics=None)
     options = conditioned_loss_options or {}
     result = _finalize_loss_statistics(statistics,
         direction_weight=direction_weight, presence_weight=presence_weight,
@@ -2393,6 +2505,55 @@ def _evaluate_loaded_batch(model, batch, config, *, device, microbatch_size,
         result['embedding_similarity/'+key] = torch.stack(values).mean()
         result['embedding_similarity_count/'+key] = torch.tensor(len(values), device=device)
     return result
+
+
+@torch.no_grad()
+def _run_metric_free_evaluation_forwards(
+    model: torch.nn.Module,
+    config: Any,
+    *,
+    device: torch.device,
+    physical_batch_size: int,
+    forward_count: int,
+    mixed_precision: _MixedPrecisionConfig | None,
+    ema: ModelEMA | None = None,
+) -> None:
+    """Match DDP evaluation forwards without loading or reporting a sample."""
+    raw_model = model
+    model.eval()
+    volume = torch.zeros(
+        (int(physical_batch_size), 1, *tuple(int(v) for v in config.patch_shape_zyx)),
+        dtype=torch.float32,
+        device=device,
+    )
+
+    def run() -> None:
+        for _ in range(int(forward_count)):
+            with _autocast_context(mixed_precision):
+                if _model_uses_conditioned_decoder(model):
+                    query = torch.zeros((int(physical_batch_size), 6), dtype=volume.dtype, device=device)
+                    model(
+                        volume,
+                        conditioned_random_query=query,
+                        conditioned_point_indices_bzyx=None,
+                        conditioned_point_query_n6=None,
+                        return_conditioned_components=True,
+                    )
+                elif bool(getattr(_unwrap_model(model), "embedding_channels", 0)):
+                    model(volume, return_embeddings=True)
+                else:
+                    model(volume)
+
+    run()
+    for name in (() if ema is None else ema.tracks):
+        with ema.apply(raw_model, name):
+            run()
+    if device.type == "cuda":
+        # Real evaluation synchronizes while converting loss statistics to
+        # host scalars. Padding has no statistics, so make that boundary
+        # explicit before the next NCCL object collective.
+        torch.cuda.synchronize(device)
+    model.train()
 
 
 @torch.no_grad()
@@ -2419,6 +2580,7 @@ def _evaluate_dense_loss_rows(
     output_upsample: str | None = None,
     ema: ModelEMA | None = None,
     historical: bool = False,
+    minimum_forward_count: int = 0,
 ) -> list[tuple[int, dict[str, float]]]:
     model.eval()
     raw_model = model
@@ -2519,7 +2681,7 @@ def _evaluate_dense_loss_rows(
         batch_options = dict(device=device, microbatch_size=microbatch_size,
             direction_weight=direction_weight, presence_weight=presence_weight,
             mixed_precision=mixed_precision, conditioned_loss_options=conditioned_loss_options,
-            historical=historical)
+            historical=historical, minimum_forward_count=minimum_forward_count)
         loss_tensors = _evaluate_loaded_batch(model, batch, loader.config,
             **batch_options, prediction_observer=prediction_observer)
         ema_rows = {}
@@ -3639,23 +3801,57 @@ def training_units(
             wave_size = distributed.world_size if pending_test is not None else max(1, total)
             all_rows = []
             for start in range(0, len(remaining), wave_size):
-                indices = remaining[start:start + wave_size][distributed.rank::distributed.world_size]
-                iterator = queued_evaluation(indices, step, source=source,
-                    evaluation_loader=evaluation_loader, count=count, offset=offset)
+                indices, padded = _distributed_evaluation_wave_indices(
+                    remaining,
+                    start=start,
+                    wave_size=wave_size,
+                    rank=distributed.rank,
+                    world_size=distributed.world_size,
+                    total_batch_count=total,
+                    pad_empty_ranks=pending_test is not None,
+                )
+                iterator = (None if padded else queued_evaluation(
+                    indices, step, source=source, evaluation_loader=evaluation_loader,
+                    count=count, offset=offset))
                 try:
-                    local = _evaluate_dense_loss_rows(raw_model, evaluation_loader, **options,
-                        ema=ema, global_batch_indices=indices, batch_iterator=iterator,
-                        microbatch_size=(min(loader.config.batch_size,
-                            evaluation_microbatch_size or loader.config.batch_size)
-                            if pending_test is not None else evaluation_microbatch_size))
+                    local_options = (
+                        {**options, "prediction_observer": None}
+                        if padded
+                        else options
+                    )
+                    evaluation_microbatch = min(loader.config.batch_size,
+                        evaluation_microbatch_size or loader.config.batch_size)
+                    if evaluation_loader.config.embedding.paired_patches:
+                        evaluation_microbatch = evaluation_microbatch // 2 * 2
+                    minimum_forward_count = (
+                        math.ceil(evaluation_loader.config.batch_size / evaluation_microbatch)
+                        if pending_test is not None else 0)
+                    if padded:
+                        _run_metric_free_evaluation_forwards(
+                            raw_model, evaluation_loader.config, device=distributed.device,
+                            physical_batch_size=evaluation_microbatch,
+                            forward_count=minimum_forward_count,
+                            mixed_precision=mixed_precision, ema=ema,
+                        )
+                        local = []
+                    else:
+                        local = _evaluate_dense_loss_rows(raw_model, evaluation_loader, **local_options,
+                            ema=ema, global_batch_indices=indices, batch_iterator=iterator,
+                            microbatch_size=(evaluation_microbatch
+                                if pending_test is not None else evaluation_microbatch_size),
+                            minimum_forward_count=minimum_forward_count)
                 finally:
-                    iterator.close()
+                    if iterator is not None:
+                        iterator.close()
                 refinement_stats = empty_refinement_statistics()
                 if source == "test" and refinement.config.enabled and refinement.config.update_enabled:
                     # Raw and all EMA tracks have now consumed identical batch
                     # targets. Commit before a possible managed yield/restart.
-                    refinement_stats = refinement.flush(distributed, phase="test", step=step,
-                        batch=f"{remaining[start]}:{remaining[min(start+wave_size,len(remaining))-1]}")
+                    refinement_stats = (
+                        refinement.flush_empty(distributed, phase="test")
+                        if padded else refinement.flush(distributed, phase="test", step=step,
+                            batch=f"{remaining[start]}:{remaining[min(start+wave_size,len(remaining))-1]}")
+                    )
                 rows = _distributed_gather_dense_test_rows(local, distributed)
                 if pending_test is None:
                     test_refinement_totals[:] = [a+b for a,b in zip(test_refinement_totals,refinement_stats)]
@@ -4007,20 +4203,23 @@ def training_units(
             batch: FiberTrace3DBatch | None = None
             loss_statistics: _LossStatistics | None = None
             component_accumulator = None
+            gaussian_presence = loader.config.presence_target_mode == "anisotropic_gaussian"
             def normalized_accumulator(counts):
                 accumulator = NormalizedGradientAccumulator(raw_model, counts,
                     direction_weight=direction_weight, presence_weight=presence_weight,
                     positive_query_weight=conditioned_loss_options["positive_query_weight"],
                     negative_query_weight=conditioned_loss_options["negative_query_weight"],
                     distributed=distributed.enabled,
-                    loss_scale=float(grad_scaler.get_scale()) if scaler_enabled else 1.0)
+                    loss_scale=float(grad_scaler.get_scale()) if scaler_enabled else 1.0,
+                    gaussian_presence=gaussian_presence)
                 if scaler_enabled:
                     grad_scaler.scale(accumulator.statistics[0])
                 return accumulator
 
             if target_only_accumulation and optimizer_microbatch_count == 0:
                 component_accumulator = normalized_accumulator(torch.zeros(
-                    len(loss_components(raw_model)), device=device))
+                    len(loss_components(raw_model, gaussian_presence=gaussian_presence)),
+                    device=device))
             for microbatch_index, take in enumerate(optimizer_microbatch_takes):
                 local_batch_ordinal = (
                     (step - 1) * optimizer_microbatch_count + microbatch_index + 1

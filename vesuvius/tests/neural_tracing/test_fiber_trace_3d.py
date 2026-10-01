@@ -454,6 +454,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.train import (
     _oblique_line_presence_for_display,
     _distributed_config_from_env,
     _distributed_gather_dense_test_rows,
+    _distributed_evaluation_wave_indices,
     _distributed_should_use_sync_batchnorm,
     _distributed_test_batch_indices,
     _distributed_training_batch_index,
@@ -1928,6 +1929,28 @@ def test_3d_distributed_test_batches_are_disjoint_and_complete(
             )
             for index in range(expected_count)
         ) == sample_count
+
+
+def test_distributed_evaluation_partial_wave_pads_ddp_without_duplicating_results() -> None:
+    remaining = list(range(121))
+    assignments = [
+        _distributed_evaluation_wave_indices(
+            remaining,
+            start=119,
+            wave_size=7,
+            rank=rank,
+            world_size=7,
+            total_batch_count=121,
+            pad_empty_ranks=True,
+        )
+        for rank in range(7)
+    ]
+
+    assert assignments[:2] == [([119], False), ([120], False)]
+    assert all(len(indices) == 1 and padded for indices, padded in assignments[2:])
+    assert [indices[0] for indices, _ in assignments[2:]] == [0, 1, 2, 3, 4]
+    assert len({indices[0] for indices, _ in assignments}) == 7
+    assert [indices[0] for indices, padded in assignments if not padded] == [119, 120]
 
 
 def test_3d_gathered_test_rows_restore_serial_global_batch_mean(monkeypatch) -> None:
@@ -4958,6 +4981,35 @@ def test_3d_presence_loss_balances_positive_and_negative_regions() -> None:
     neg_expected = -torch.log(1.0 - torch.tensor([0.2, 0.8, 0.4])).mean()
     expected = pos_expected + neg_expected
     assert torch.allclose(losses["presence"], expected)
+
+    gaussian_batch = replace(
+        batch,
+        presence_target=torch.tensor(
+            [1.0, 0.5, 0.0, 0.0], dtype=torch.float32
+        ).view(1, 1, 1, 1, 4),
+        presence_target_mode="anisotropic_gaussian",
+    )
+    gaussian = compute_losses(
+        output,
+        gaussian_batch,
+        direction_weight=0.0,
+        presence_weight=1.0,
+    )
+    ridge_expected = (
+        -torch.log(torch.tensor(0.9))
+        - 0.5 * torch.log(torch.tensor(0.2))
+    ) / 1.5
+    distribution_expected = -torch.log(1.0 - torch.tensor(0.2))
+    background_expected = -torch.log(
+        1.0 - torch.tensor([0.8, 0.4])
+    ).mean()
+    assert torch.allclose(gaussian["presence_ridge"], ridge_expected)
+    assert torch.allclose(gaussian["presence_distribution"], distribution_expected)
+    assert torch.allclose(gaussian["presence_background"], background_expected)
+    assert torch.allclose(
+        gaussian["presence"],
+        ridge_expected + 0.5 * distribution_expected + 0.5 * background_expected,
+    )
 
 
 def test_3d_negative_presence_loss_normalizes_per_patch_and_branch() -> None:

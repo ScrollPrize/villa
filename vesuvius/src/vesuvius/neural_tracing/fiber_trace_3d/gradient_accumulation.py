@@ -14,16 +14,18 @@ from .loss_statistics import LossStatistics
 
 
 COMPONENTS = ("direction", "positive_presence", "negative_presence")
+GAUSSIAN_COMPONENTS = COMPONENTS + ("distribution_presence",)
 EMBEDDING_COMPONENTS = ("positive_embedding", "negative_embedding")
 SPLIT_EMBEDDING_COMPONENTS = ("short_embedding", "long_embedding")
 
 
-def loss_components(model):
+def loss_components(model, *, gaussian_presence=False):
+    components = GAUSSIAN_COMPONENTS if gaussian_presence else COMPONENTS
     if not getattr(model, "embedding_channels", 0):
-        return COMPONENTS
+        return components
     if getattr(model, "embedding_short_range_channels", 0):
-        return COMPONENTS + EMBEDDING_COMPONENTS + ("contrastive_embedding",) + SPLIT_EMBEDDING_COMPONENTS
-    return COMPONENTS + EMBEDDING_COMPONENTS + (("contrastive_embedding",)
+        return components + EMBEDDING_COMPONENTS + ("contrastive_embedding",) + SPLIT_EMBEDDING_COMPONENTS
+    return components + EMBEDDING_COMPONENTS + (("contrastive_embedding",)
         if getattr(model, "embedding_objective", "pairwise") == "local_contrastive" else ())
 
 
@@ -46,22 +48,34 @@ class NormalizedGradientAccumulator:
 
     def __init__(self, model, counts, *, direction_weight, presence_weight,
                  positive_query_weight=1.0, negative_query_weight=1.0,
-                 distributed=False, process_group=None, loss_scale=1.0):
+                 distributed=False, process_group=None, loss_scale=1.0,
+                 gaussian_presence=False):
         validate_sample_independent_model(model)
         self.parameters = tuple(p for p in model.parameters() if p.requires_grad)
         if not self.parameters or any(p.dtype != torch.float32 for p in self.parameters):
             raise ValueError("requires FP32 master parameters; use autocast for mixed precision")
         self.distributed, self.process_group = distributed, process_group
-        self.components = loss_components(model)
+        self.components = loss_components(model, gaussian_presence=gaussian_presence)
         self.counts = counts.detach().to(device=self.parameters[0].device, dtype=torch.float32).clone()
         if self.counts.shape != (len(self.components),):
             raise ValueError(f"expected {len(self.components)} target-derived normalization counts")
         if distributed:
             dist.all_reduce(self.counts, group=process_group)
+        distribution_active = bool(
+            gaussian_presence
+            and self.counts[self.components.index("distribution_presence")] > 0
+        )
         component_weights = {
             "direction": direction_weight,
             "positive_presence": presence_weight * positive_query_weight,
-            "negative_presence": presence_weight * negative_query_weight,
+            "negative_presence": (
+                presence_weight * negative_query_weight
+                * (0.5 if distribution_active else 1.0)
+            ),
+            "distribution_presence": (
+                presence_weight * negative_query_weight
+                * (0.5 if distribution_active else 0.0)
+            ),
             "positive_embedding": 0.5,
             "negative_embedding": 0.5,
             "contrastive_embedding": 1.0,

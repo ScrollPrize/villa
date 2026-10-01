@@ -29,6 +29,7 @@ class CanonicalSampleBroker:
         self.test_step = start_step if self.test_count and initial_test else None
         self._train = {}
         self._test = {}
+        self._test_leases = {}
         self._next_train = self.frontier
         self._next_test = self.test_start
         self._test_released = 0
@@ -126,15 +127,29 @@ class CanonicalSampleBroker:
                 self._test[index] = ticket[0]
         if not all(index in self._test for index in indices):
             return None
-        return self.queue.batch(tuple(self._test[index] for index in indices))
+        batch = self.queue.batch(tuple(self._test[index] for index in indices))
+        if batch is None:
+            return None
+        for index in indices:
+            self._test_leases[index] = self._test_leases.get(index, 0) + 1
+        return batch
 
     def release_test(self, step, indices):
         if step != self.test_step:
             raise RuntimeError("test completion belongs to a different phase")
-        self.queue.release(tuple(self._test[index] for index in indices))
+        released = []
         for index in indices:
-            del self._test[index]
-        self._test_done.update(indices)
+            leases = self._test_leases.get(index, 0)
+            if leases <= 0 or index not in self._test:
+                raise RuntimeError(f"test sample {index} has no live lease")
+            if leases == 1:
+                released.append(self._test.pop(index))
+                del self._test_leases[index]
+                self._test_done.add(index)
+            else:
+                self._test_leases[index] = leases - 1
+        if released:
+            self.queue.release(tuple(released))
         self._test_released = len(self._test_done)
 
     def begin_test(self, step):
@@ -147,7 +162,8 @@ class CanonicalSampleBroker:
     def end_test(self, step):
         if not self.test_count:
             return
-        if self.test_step != step or self._test_released != self.test_count or self._test:
+        if (self.test_step != step or self._test_released != self.test_count
+                or self._test or self._test_leases):
             raise RuntimeError("test phase ended with unconsumed sample ownership")
         self.test_step = None
         self.test_source = "test"
@@ -155,19 +171,21 @@ class CanonicalSampleBroker:
         self._next_test = self.test_start
         self._test_released = 0
         self._test_done.clear()
+        self._test_leases.clear()
 
     def select_test_source(self, step, source):
         if self.test_step != step or source not in self.test_sources:
             raise RuntimeError("invalid test source/phase selection")
         if source == self.test_source:
             return
-        if self._test or self._test_released != self.test_count:
+        if self._test or self._test_leases or self._test_released != self.test_count:
             raise RuntimeError("cannot switch test source with unconsumed sample ownership")
         self.test_source = source
         self.test_count, self.test_start = self.test_sources[source]
         self._next_test = self.test_start
         self._test_released = 0
         self._test_done.clear()
+        self._test_leases.clear()
 
     def commit(self, completed_step):
         target = completed_step * self.effective_batch_size

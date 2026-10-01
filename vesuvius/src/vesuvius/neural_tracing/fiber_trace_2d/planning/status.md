@@ -1,11 +1,9 @@
-# Status
+# Status: fiber cross-section evaluation
 
-- [x] Commit previous code (8ed2c7911)
-- [x] Independent plan and implementation review
-- [x] Parallel audit and downstream export; measure equivalence/speed
-- [x] Fix discovered arc-coordinate bug with independently checked XYZ
-- [x] Native/Python regression tests and real-candidate endpoint validation
-- [x] Discard invalid reproduction data, preserve inference caches
-- [x] Restart corrected extraction, GPUs0–5 and192 trace workers
-- [x] Verify sustained native progress after startup (18100 trials handled;128 saved audits checked)
-- [ ] Corrected extraction finished (background run)
+- [x] Reconcile `fiber-exp5` with the latest `fiber-exps4` training history on `exps5-train`.
+- [ ] Identify the shared test-evaluation, native-normal, coordinate-transform, and visualization paths.
+- [ ] Implement opt-in cross-section histogram and mean accumulation.
+- [ ] Add focused regression tests and documentation.
+- [ ] Run the experiment on best/current raw and EMA snapshots from the latest Gaussian-refinement run.
+- [ ] Compare and report generated cross-section images and statistics.
+

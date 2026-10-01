@@ -131,6 +131,31 @@ def test_partial_test_resume_and_repeated_visualization_do_not_double_consume():
         broker.close()
 
 
+def test_concurrent_padded_test_batch_uses_reference_counted_read_leases():
+    owner, _ = _queue()
+    broker = CanonicalSampleBroker(owner, effective_batch_size=4, start_step=0,
+        max_steps=1, test_interval=1, test_sample_count=1, test_batch_size=1,
+        test_start_sample_index=17)
+    try:
+        first = _await(broker, lambda: broker.test_batch(0, (17,)))
+        second = _await(broker, lambda: broker.test_batch(0, (17,)))
+        assert first.stream_indices.tolist() == second.stream_indices.tolist() == [17]
+        assert broker._test_leases == {17: 2}
+
+        broker.release_test(0, (17,))
+        assert broker._test_leases == {17: 1}
+        assert broker._test_released == 0
+        assert owner.pipeline.leased
+
+        broker.release_test(0, (17,))
+        assert not broker._test_leases
+        assert broker._test_released == 1
+        broker.end_test(0)
+        assert not owner.pipeline.leased
+    finally:
+        broker.close()
+
+
 def test_logical_test_group_must_fit_credits_before_workers_are_used():
     queue = SimpleNamespace(pipeline=SimpleNamespace(max_in_flight=4), transport=None)
     with pytest.raises(ValueError, match="logical test batch"):

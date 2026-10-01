@@ -2108,6 +2108,10 @@ class FiberTrace3DLoader:
                 raise ValueError("anisotropic Gaussian presence targets require lasagna_manifest_path for every dataset")
             if any(not d.get("dense_supervision", False) for d in config.datasets):
                 raise ValueError("anisotropic Gaussian presence targets require dense_supervision for every dataset")
+        if config.refinement.orientation_enabled and config.presence_target_mode != "anisotropic_gaussian":
+            raise ValueError("orientation refinement requires anisotropic_gaussian presence targets")
+        if config.refinement.orientation_enabled and config.presence_gaussian_width_ratio <= 1.0:
+            raise ValueError("orientation refinement requires Gaussian width ratio > 1")
         self._embedding_normal_records = {}
         self._missing_normal_samples = 0
         self._replacement_pools = {}
@@ -3039,6 +3043,9 @@ class FiberTrace3DLoader:
         patch_shape: tuple[int, int, int],
         radius: float,
         profile_timings_ms: dict[str, float] | None = None,
+        refinement_orientation: np.ndarray | None = None,
+        refinement_material: np.ndarray | None = None,
+        refinement_baseline: np.ndarray | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
         start = time.perf_counter()
         line_points, _local_line_index = self._line_window_for_labels(
@@ -3057,6 +3064,23 @@ class FiberTrace3DLoader:
         segment_start = points_out[:-1].astype(np.float32)
         segment_end = points_out[1:].astype(np.float32)
         segment_mid_source = (line_points[:-1] + line_points[1:]) * 0.5
+        segment_orientation = None
+        normal_sample_mid_base = segment_mid_source * float(record.volume_spacing_base)
+        if refinement_orientation is not None:
+            from .refinement import interpolate_orientation, orientation_angles
+            if (refinement_material is None or refinement_baseline is None or
+                    len(refinement_orientation) != len(line_points) or
+                    len(refinement_material) != len(line_points)):
+                raise ValueError("refined target orientation/material geometry mismatch")
+            midpoint_state = interpolate_orientation(
+                refinement_orientation,
+                refinement_material,
+                0.5 * (refinement_material[:-1] + refinement_material[1:]),
+            )
+            segment_orientation = orientation_angles(midpoint_state)
+            baseline_nodes = interpolate(
+                refinement_baseline[:, :3], refinement_baseline[:, 3], refinement_material)
+            normal_sample_mid_base = 0.5 * (baseline_nodes[:-1] + baseline_nodes[1:])
         valid_segments = np.isfinite(segment_start).all(axis=1) & np.isfinite(segment_end).all(axis=1)
         if record.label_breaks:
             valid_segments[list(record.label_breaks)] = False
@@ -3074,6 +3098,10 @@ class FiberTrace3DLoader:
         segment_start = segment_start[valid_segments]
         segment_end = segment_end[valid_segments]
         segment_mid_source = segment_mid_source[valid_segments]
+        segment_tangent_source = np.diff(line_points, axis=0)[valid_segments]
+        normal_sample_mid_base = normal_sample_mid_base[valid_segments]
+        if segment_orientation is not None:
+            segment_orientation = segment_orientation[valid_segments]
         if profile_timings_ms is not None:
             profile_timings_ms["target_points_to_output_ms"] = (
                 time.perf_counter() - start
@@ -3087,9 +3115,15 @@ class FiberTrace3DLoader:
         bbox_los: list[np.ndarray] = []
         bbox_his: list[np.ndarray] = []
         source_midpoints: list[np.ndarray] = []
+        normal_sample_midpoints: list[np.ndarray] = []
+        source_tangents: list[np.ndarray] = []
+        orientations: list[float] = []
         bbox_voxels = 0
-        for p0_raw, p1_raw, midpoint_source in zip(
-            segment_start, segment_end, segment_mid_source, strict=True
+        orientation_values = (np.zeros(len(segment_start)) if segment_orientation is None
+                              else segment_orientation)
+        for p0_raw, p1_raw, midpoint_source, normal_midpoint, tangent_source, angle in zip(
+            segment_start, segment_end, segment_mid_source, normal_sample_mid_base,
+            segment_tangent_source, orientation_values, strict=True
         ):
             clipped = _clip_segment_to_aabb(
                 p0_raw,
@@ -3117,6 +3151,9 @@ class FiberTrace3DLoader:
             bbox_los.append(lo.astype(np.int64))
             bbox_his.append(hi.astype(np.int64))
             source_midpoints.append(midpoint_source)
+            normal_sample_midpoints.append(normal_midpoint)
+            source_tangents.append(tangent_source)
+            orientations.append(float(angle))
         if profile_timings_ms is not None:
             profile_timings_ms["target_clip_ms"] = (time.perf_counter() - start) * 1000.0
             profile_timings_ms["target_spec_segments"] = float(len(starts))
@@ -3128,9 +3165,18 @@ class FiberTrace3DLoader:
             midpoints = np.stack(source_midpoints, axis=0).astype(np.float64)
             normals_base = self._sample_native_normals(
                 record,
-                midpoints * float(record.volume_spacing_base),
+                np.stack(normal_sample_midpoints, axis=0).astype(np.float64),
                 profile_timings_ms,
             )
+            if refinement_orientation is not None:
+                from .refinement import rotate_normals_about_tangent
+                # Rotation is defined in the unaugmented source frame. Clipping
+                # and uniform scale do not change the segment direction.
+                normals_base = rotate_normals_about_tangent(
+                    normals_base,
+                    np.stack(source_tangents, axis=0),
+                    np.asarray(orientations),
+                )
             normals_out = self._transform_surface_normals_to_output(
                 midpoints,
                 normals_base,
@@ -3155,6 +3201,10 @@ class FiberTrace3DLoader:
         cp_index: int | FiberLocation,
         params: _Augment3DParams,
         profile_timings_ms: dict[str, float] | None = None,
+        *,
+        refinement_orientation: np.ndarray | None = None,
+        refinement_baseline: np.ndarray | None = None,
+        refinement_material: np.ndarray | None = None,
     ) -> tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         patch_shape = tuple(int(v) for v in self.config.patch_shape_zyx)
         radius = float(self.config.presence_radius_voxels)
@@ -3170,6 +3220,9 @@ class FiberTrace3DLoader:
             patch_shape=patch_shape,
             radius=radius,
             profile_timings_ms=profile_timings_ms,
+            refinement_orientation=refinement_orientation,
+            refinement_material=refinement_material,
+            refinement_baseline=refinement_baseline,
         )
         if not _uses_dense_fiber_supervision(record):
             target = self._cp_only_target_spec(
@@ -3336,6 +3389,8 @@ class FiberTrace3DLoader:
             value_index=stream_index // 2 if self.config.embedding.paired_patches else None)
             if fixed_test else None)
         refinement_current = None
+        refinement_orientation = None
+        refinement_baseline = None
         if self._refinement_store is not None:
             key = self._refinement_keys[record_index]
             if fixed_test:
@@ -3343,7 +3398,11 @@ class FiberTrace3DLoader:
                 refinement_current = resample(baseline[:, :3], baseline[:, 3],
                     max(2, int(np.ceil(baseline[-1, 3] / self.config.refinement.spacing_base)) + 1))
             else:
-                refinement_current = self._refinement_store.read(key)
+                refinement_current, refinement_orientation = self._refinement_store.read_state(key)
+            if fixed_test:
+                refinement_orientation = np.zeros((len(refinement_current), 2), dtype=np.float64)
+                refinement_orientation[:, 0] = 1.0
+            refinement_baseline = self._refinement_store.baseline(key)
             reference_arc = arclength(record.fiber.line_points_zyx.astype(np.float64))
             if isinstance(cp_index, FiberLocation):
                 location = reference_arc[cp_index.segment_index] + cp_index.fraction * (
@@ -3371,19 +3430,21 @@ class FiberTrace3DLoader:
                 section_start, section_stop = max(0, int(group[0])-1), min(len(refinement_current), int(group[-1])+2)
                 current = refinement_current[section_start:section_stop].copy()
                 if len(current) >= 3:
-                    baseline = self._refinement_store.baseline(key)
+                    baseline = refinement_baseline
                     lo = max(0, int(np.searchsorted(baseline[:, 3], current[0, 3])-1))
                     hi = min(len(baseline), int(np.searchsorted(baseline[:, 3], current[-1, 3]))+2)
                     local_baseline = baseline[lo:hi].copy()
                     observation_start = section_start
                     if fixed_test:
-                        key, current = self._refinement_store.test_patch(key, data_index, params,
+                        local_orientation = refinement_orientation[section_start:section_stop].copy()
+                        key, current, local_orientation = self._refinement_store.test_patch(key, data_index, params,
                             self.config.patch_shape_zyx, record.volume_spacing_base,
-                            section_start, current, local_baseline)
+                            section_start, current, local_baseline, local_orientation)
                         observation_start = 0
                         # Keep other visits of the same fiber as original GT;
                         # never replace the whole target with a clipped polyline.
                         refinement_current[section_start:section_stop] = current
+                        refinement_orientation[section_start:section_stop] = local_orientation
                         cp_index = self._refined_location(refinement_current, location)
                         record = replace(record, fiber=replace(record.fiber,
                             line_points_xyz=refinement_current[:, :3][:, ::-1].astype(np.float32)),
@@ -3397,10 +3458,15 @@ class FiberTrace3DLoader:
                         # valid CT/GT training samples, without a fake normal.
                         normals = None
                     if normals is not None:
-                        refinement_geometry = RefinementObservation(key, observation_start, current,
-                            local_baseline, normals, params, record.volume_spacing_base,
-                            self.config.patch_shape_zyx, self.config.refinement, self.config.embedding.output_stride,
-                            independent_piece=fixed_test)
+                        refinement_geometry = RefinementObservation(
+                            key, observation_start, current, local_baseline, normals, params,
+                            record.volume_spacing_base, self.config.patch_shape_zyx,
+                            self.config.refinement, self.config.embedding.output_stride,
+                            independent_piece=fixed_test,
+                            orientation=refinement_orientation[section_start:section_stop].copy(),
+                            orientation_sigma_thickness_output=float(self.config.presence_radius_voxels),
+                            orientation_width_ratio=float(self.config.presence_gaussian_width_ratio),
+                        )
         if timings is not None:
             timings["augment_params_ms"] = (time.perf_counter() - start) * 1000.0
         embedding_start = time.perf_counter()
@@ -3443,6 +3509,13 @@ class FiberTrace3DLoader:
             cp_index,
             params,
             timings,
+            refinement_orientation=(refinement_orientation
+                                    if self.config.refinement.orientation_enabled else None),
+            refinement_baseline=(refinement_baseline
+                                 if self.config.refinement.orientation_enabled else None),
+            refinement_material=(refinement_current[:, 3]
+                                 if (refinement_current is not None and
+                                     self.config.refinement.orientation_enabled) else None),
         )
         if timings is not None:
             timings["target_spec_total_ms"] = (time.perf_counter() - start) * 1000.0
