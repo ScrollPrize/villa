@@ -138,17 +138,20 @@ pressed and dried to form a single sheet.
   papyrus surface connects those locations. The fibers may belong to different
   windings.
 
-- After tracing the RECTO and VERSO surfaces of a sheet in one region, we may
-  find more papyrus beyond them in a direction perpendicular to the sheet. This
-  does not necessarily mean we have reached a different sheet. The same sheet
-  can continue into another winding. It can also fold back on itself, so we
-  encounter it again in the same winding.
+- After tracing a sheet’s RECTO and VERSO surfaces in one region, we may
+  encounter more papyrus farther along a direction perpendicular to the local
+  sheet surface. That material may be another part of the same sheet: the sheet
+  can extend into another winding, or it can fold back so that we encounter it
+  again within the same winding. Encountering more papyrus therefore does not,
+  by itself, establish that it belongs to a different sheet or winding.
 
-  Finding another pair of surfaces, with RECTO-associated fibers on one and
-  VERSO-associated fibers on the other, does not by itself distinguish these
-  possibilities. At a kollesis, an additional pair may belong to the overlapping
-  sheet within the same winding. We need the surrounding papyrus geometry to
-  determine which sheet and winding the material belongs to.
+  Even if the additional papyrus has a RECTO surface with its associated fibers
+  and a VERSO surface with its associated fibers, identifying that pair does not
+  tell us how it relates to the sheet we traced first. It could belong to the
+  same sheet in another winding, to a folded part of the same sheet within the
+  same winding, or, at a kollesis, to a different sheet overlapping within the
+  same winding. We need the surrounding papyrus geometry to determine which
+  sheet and winding the additional material belongs to.
 
 - An intact fiber follows a continuous three-dimensional course, although CT
   may not resolve all of it. Where visible, a single slice shows only the
