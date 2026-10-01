@@ -34,6 +34,9 @@ def build_workload(template: dict, *, checkpoint: Path, output_root: Path,
     for key in ("input_workers", "flush_workers", "accumulator_workers"):
         evaluation["inference"][key] = min(int(evaluation["inference"][key]), 128)
     evaluation["inference_cache_namespace"] = "training-reviewed-failure-v1"
+    # The benchmark is launched as a descendant of the training supervisor and
+    # uses that task's already-held grant.  Registering it as another manager
+    # task would overlap the same process tree and deadlock the handoff.
     evaluation["gpu_manager"]["enabled"] = False
     result["training_cleanup_prediction_cache"] = True
     return result
@@ -62,6 +65,8 @@ def cleanup_prediction_cache(workload: dict, output: Path) -> None:
 
 def run_job(job_path: Path) -> dict[str, float]:
     job = json.loads(job_path.read_text())
+    if job.get("inherited_manager_grant") is not True:
+        raise ValueError("training trace benchmark requires an inherited manager grant")
     output = Path(job["output_root"]).resolve()
     output.mkdir(parents=True, exist_ok=True)
     workload = build_workload(

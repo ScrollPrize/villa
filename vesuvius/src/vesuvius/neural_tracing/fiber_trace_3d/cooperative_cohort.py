@@ -31,9 +31,12 @@ class FiberCohort:
         self.broker = broker
         self.grant = grant
         self._draining = False
+        self._maintenance_draining = False
+        self._maintenance_ready = False
         self._queues_closed = False
         self._sent, self._drained = [], []
         self._pending = {}
+        self.maintenance = None
         if drain_timeout <= 0:
             raise ValueError("CPU drain timeout must be positive")
         self._drain_timeout = float(drain_timeout)
@@ -120,8 +123,10 @@ class FiberCohort:
         frontier = self.broker.frontier // self.broker.effective_batch_size
         if step != frontier:
             self.broker.commit(step)
-        elif rows[0].get("phase") not in ("test", "update"):
+        elif rows[0].get("phase") not in ("test", "update", "reviewed_trace"):
             raise RuntimeError("invalid repeated training boundary")
+        if rows[0].get("phase") == "reviewed_trace":
+            self.maintenance = {"kind": "reviewed_trace", "step": int(step)}
         if self._on_startup_observation is not None:
             observations = []
             for row in rows:
@@ -141,7 +146,10 @@ class FiberCohort:
 
     @property
     def idle(self):
-        return self.gpu.idle
+        # Hold the cohort at the completed trace boundary until the CPU
+        # supervisor has requested a pause/drain.  It must not admit the next
+        # optimizer unit in the same manager tick.
+        return self.gpu.idle and self.maintenance is None
 
     @property
     def done(self):
@@ -158,7 +166,7 @@ class FiberCohort:
 
     @property
     def closed(self):
-        return self.gpu.closed and self._queues_closed and (
+        return self.maintenance is None and self.gpu.closed and self._queues_closed and (
             self.broker.pipeline.closed or self.broker.workers_within_limit())
 
     def authorize(self):
@@ -177,10 +185,38 @@ class FiberCohort:
         self.gpu.drain()
         # Do NOT park loaders yet: a running unit may still need its CPU inputs.
 
+    def begin_maintenance(self):
+        """Unload the GPU cohort while retaining this task's grant and broker."""
+        if self.maintenance is None or self._draining or self._maintenance_draining:
+            raise RuntimeError("cohort is not at a maintenance boundary")
+        self._maintenance_draining = True
+        self.gpu.drain()
+
+    @property
+    def maintenance_ready(self):
+        return self._maintenance_ready
+
+    def maintenance_state(self):
+        if not self._maintenance_ready:
+            raise RuntimeError("maintenance handoff is not ready")
+        return self.gpu.state
+
     def poll(self):
         self._check_publication()
         self.broker.poll()
         self.gpu.poll()
+        if self._maintenance_draining:
+            if not self.gpu.closed:
+                return
+            if self._memory_monitor is not None:
+                self._memory_monitor.close()
+                self._memory_monitor = None
+            self.broker.set_worker_limit(0)
+            self._drain_queues()
+            if self._queues_closed:
+                self._temp.cleanup()
+                self._maintenance_ready = True
+            return
         if self.gpu.closed:
             if self._memory_monitor is not None:
                 self._memory_monitor.close()

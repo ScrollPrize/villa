@@ -88,6 +88,7 @@ class ProbeWorker:
         slots = max(size, int(training.get("sample_pipeline_slots", 512)))
         slots = ((slots + size - 1) // size) * size
         self.units = training_units(settings.config_path, physical_microbatch_sizes=(size,) * len(self.devices),
+                                    enable_reviewed_trace=False,
             distributed_init_method=settings.rendezvous,
             training_overrides={"bounded_gradient_accumulation": True,
                 "device": "cuda:0",

@@ -96,7 +96,8 @@ def test_build_workload_locks_sources_and_runtime(tmp_path):
         "evaluation": {"render": True, "workers": 192,
                        "gpu_manager": {"enabled": True},
                        "inference": {"input_workers": 192, "flush_workers": 192,
-                                     "accumulator_workers": 192}},
+                                     "accumulator_workers": 192,
+                                     "max_batch_size": 4}},
     }
     result = build_workload(template, checkpoint=checkpoint, output_root=tmp_path / "out",
                             split_root=split, devices="0,1", native_binary=binary)
@@ -104,8 +105,8 @@ def test_build_workload_locks_sources_and_runtime(tmp_path):
         ("A", 11), ("B", 6), ("C", 15)]
     assert result["evaluation"]["gpu_manager"]["enabled"] is False
     assert result["evaluation"]["workers"] == 128
+    assert result["evaluation"]["inference"]["max_batch_size"] == 4
     assert result["devices"] == "0,1"
-
 
 def test_reviewed_trace_config_validation():
     value = {"interval": 100, "template": "a", "split_root": "b",

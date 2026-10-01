@@ -151,7 +151,7 @@
     }
   ],
   "training": {
-    "resume": "/ephemeral/hendrik/fiber3d_train2/runs/5scroll_json_eligible_fullres_refinement_gaussian_halfsigma_sideband_reviewed32_128_sd1_16x8_ema_20261001_151953/snapshots/current.pt",
+    "resume": "/ephemeral/hendrik/fiber3d_train2/runs/5scroll_json_eligible_fullres_refinement_gaussian_halfsigma_sideband_reviewed32_128_sd1_16x8_ema_20261001_170053/snapshots/current.pt",
     "checkpoint_interval": 100,
     "device": "auto",
     "direction_weight": 10,

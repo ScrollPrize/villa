@@ -193,6 +193,7 @@ class FiberTrainingWorker:
             batch_source=self.source, summary_writer_factory=factory.writer_factory,
             distributed_init_method=factory.rendezvous,
             training_overrides=factory.training_overrides,
+            enable_reviewed_trace=not factory.measure_startup_memory,
         )
         self.boundary = next(self.units)
         self._saw_test = self.boundary.phase == "test"

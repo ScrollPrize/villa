@@ -734,6 +734,7 @@ def _run_reviewed_trace_test(*, settings: dict[str, Any], step: int, run_dir: Pa
                 "native_binary": str(Path(settings["native_binary"]).expanduser().resolve()),
                 "runner": str(Path(settings["runner"]).expanduser().resolve()),
                 "devices": ",".join(str(index) for index in range(len(gpu_tokens))),
+                "inherited_manager_grant": True,
             }
             job_path = output / "job.json"
             job_path.write_text(json.dumps(job, indent=2) + "\n")
@@ -3319,6 +3320,7 @@ def training_units(
     summary_writer_factory: Any | None = None,
     distributed_init_method: str | None = None,
     training_overrides: dict[str, Any] | None = None,
+    enable_reviewed_trace: bool = True,
 ):
     """Shared training loop, yielding only after completed logical work.
 
@@ -4384,11 +4386,24 @@ def training_units(
             initial_metric = _distributed_broadcast_object(initial_metric, distributed)
             initial_metric_name = _distributed_broadcast_object(initial_metric_name, distributed)
             save_test_snapshots(start_step, initial_metric, initial_metric_name, initial=is_initial)
-            if reviewed_trace_test is not None:
-                _run_reviewed_trace_test(
-                    settings=reviewed_trace_test, step=start_step, run_dir=run_dir,
-                    snapshot_dir=snapshot_dir, distributed=distributed, writer=writer,
-                )
+            if reviewed_trace_test is not None and enable_reviewed_trace:
+                if physical_microbatch_sizes is not None:
+                    # The cooperative supervisor tears this GPU cohort down,
+                    # runs the trace test as a descendant under the unchanged
+                    # training grant, then restores training from this exact
+                    # boundary. Never nest a second model inside resident
+                    # training CUDA processes or register an overlapping task.
+                    # The dense test is complete: do not capture it as pending
+                    # or replacement workers will attempt the same test twice.
+                    pending_test = None
+                    yield TrainingBoundary(
+                        start_step, False, capture_boundary, "reviewed_trace"
+                    )
+                else:
+                    _run_reviewed_trace_test(
+                        settings=reviewed_trace_test, step=start_step, run_dir=run_dir,
+                        snapshot_dir=snapshot_dir, distributed=distributed, writer=writer,
+                    )
             pending_test = None
     except BaseException:
         # This can yield before the training prefetcher exists. Closing a
@@ -4834,11 +4849,19 @@ def training_units(
                 test_metric_name = _distributed_broadcast_object(test_metric_name, distributed)
 
             save_test_snapshots(step, test_metric, test_metric_name)
-            if reviewed_trace_test is not None and test_due and step % int(reviewed_trace_test["interval"]) == 0:
-                _run_reviewed_trace_test(
-                    settings=reviewed_trace_test, step=step, run_dir=run_dir,
-                    snapshot_dir=snapshot_dir, distributed=distributed, writer=writer,
-                )
+            if (reviewed_trace_test is not None and enable_reviewed_trace and test_due
+                    and step % int(reviewed_trace_test["interval"]) == 0):
+                if physical_microbatch_sizes is not None:
+                    # The shared dense-test transaction has committed before
+                    # the external trace boundary.  Handoff resumes with the
+                    # next training update, not by replaying this test.
+                    pending_test = None
+                    yield TrainingBoundary(step, False, capture_boundary, "reviewed_trace")
+                else:
+                    _run_reviewed_trace_test(
+                        settings=reviewed_trace_test, step=step, run_dir=run_dir,
+                        snapshot_dir=snapshot_dir, distributed=distributed, writer=writer,
+                    )
             pending_test = None
             if test_due:
                 admit_training_until_test(step)

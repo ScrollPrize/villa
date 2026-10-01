@@ -464,9 +464,17 @@ def production_status(stop=False):
     if stop:
         stop_production_identity(identity)
     print('production:', folder, 'state:', process_state(identity, os.getuid()))
-    with (folder / 'train.log').open('rb') as stream:
-        stream.seek(max(0, os.fstat(stream.fileno()).st_size - 10000))
-        print(stream.read().decode(errors='replace'))
+    text = (folder / 'train.log').read_text(errors='replace')
+    markers = [line for line in text.splitlines() if (
+        line.startswith('fiber cooperative:')
+        or line.startswith('fiber_trace_3d train:')
+        or line.startswith('fiber_trace_3d resume:')
+        or line.startswith('test_timing ')
+        or line.startswith('samples=')
+        or 'Traceback (most recent call last)' in line
+        or line.startswith('RuntimeError:')
+    )]
+    print('\n'.join(markers[-80:]))
 
 
 def audit_latest():

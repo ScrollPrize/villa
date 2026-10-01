@@ -246,6 +246,72 @@ def test_queue_publication_failure_is_not_silently_counted_as_delivery():
         cohort._check_publication()
 
 
+def test_reviewed_trace_boundary_holds_cohort_idle_until_supervisor_drains():
+    from vesuvius.neural_tracing.fiber_trace_3d.cooperative_cohort import FiberCohort
+
+    cohort = FiberCohort.__new__(FiberCohort)
+    cohort.broker = SimpleNamespace(frontier=500, effective_batch_size=5)
+    cohort.maintenance = None
+    cohort.gpu = SimpleNamespace(idle=True)
+    cohort._on_startup_observation = None
+    assert cohort._completed_unit([
+        {"step": 100, "done": False, "phase": "reviewed_trace"},
+        {"step": 100, "done": False, "phase": "reviewed_trace"},
+    ]) is False
+    assert cohort.maintenance == {"kind": "reviewed_trace", "step": 100}
+    assert cohort.idle is False
+
+
+def test_reviewed_trace_maintenance_unloads_only_gpu_cohort():
+    from vesuvius.neural_tracing.fiber_trace_3d.cooperative_cohort import FiberCohort
+
+    events = []
+
+    class Gpu:
+        closed = False
+        state = object()
+
+        def drain(self):
+            events.append("gpu-drain")
+
+        def poll(self):
+            events.append("gpu-poll")
+
+    class Broker:
+        def poll(self):
+            events.append("broker-poll")
+
+        def set_worker_limit(self, value):
+            events.append(("worker-limit", value))
+
+    cohort = FiberCohort.__new__(FiberCohort)
+    cohort.gpu = Gpu()
+    cohort.broker = Broker()
+    cohort.maintenance = {"kind": "reviewed_trace", "step": 100}
+    cohort._draining = False
+    cohort._maintenance_draining = False
+    cohort._maintenance_ready = False
+    cohort._queues_closed = False
+    cohort._memory_monitor = None
+    cohort._check_publication = lambda: None
+    cohort._drain_queues = lambda: setattr(cohort, "_queues_closed", True)
+    cohort._temp = SimpleNamespace(cleanup=lambda: events.append("temp-cleanup"))
+
+    cohort.begin_maintenance()
+    assert events == ["gpu-drain"]
+    assert cohort.closed is False
+    cohort.poll()
+    assert not cohort.maintenance_ready
+    cohort.gpu.closed = True
+    cohort.poll()
+    assert cohort.maintenance_ready
+    assert cohort.maintenance_state() is cohort.gpu.state
+    assert ("worker-limit", 0) in events
+    assert "temp-cleanup" in events
+    # The broker is retained and remains serviceable throughout maintenance.
+    assert events.count("broker-poll") == 2
+
+
 def test_cohort_constructor_failure_reaps_children(monkeypatch, tmp_path):
     from villa_gpu_manager import cohort as process_cohort, processes
     from vesuvius.neural_tracing.fiber_trace_3d.cooperative_cohort import FiberCohort
