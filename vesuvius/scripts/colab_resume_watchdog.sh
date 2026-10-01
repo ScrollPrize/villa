@@ -148,13 +148,6 @@ json.dump(cfg, open(sys.argv[2], 'w'), indent=2)
         PATCH_CMDS+="rclone copyto --config /root/.config/rclone/rclone.conf 'gdrive:vesuvius/configs/$name' /root/villa/vesuvius/$f
 "
     done
-    remote_bash "
-mkdir -p /content/vesuvius_volume_cache '$(dirname "$CONFIG_REMOTE")'
-$PATCH_CMDS
-rclone copyto --config /root/.config/rclone/rclone.conf 'gdrive:vesuvius/configs/$(basename "$CONFIG_LOCAL")' '$CONFIG_REMOTE'
-echo patched
-" 120
-
     # $SESSION (not just $n) must be in this path: $n resets to 1 for every
     # fresh watchdog *instance*, so two concurrent instances' attempts can
     # collide on the same filename. Observed live: a presumed-dead session
@@ -164,7 +157,25 @@ echo patched
     # file. $SESSION already embeds the instance prefix, so this is unique
     # per attempt regardless of how many instances are running.
     TRAIN_LOG_REMOTE="/content/drive/vesuvius/runs/${RUN_NAME}_${SESSION}.log"
-    remote_bash "
+
+    # remote_bash calls `exit 1` internally (colab_lib.sh's check_exec_rc /
+    # check_remote_ok) on any exec-level failure, e.g. a client-side
+    # connection hang. Called as a bare statement, that `exit 1` would kill
+    # this entire watchdog script, not just the current attempt — observed
+    # live: patching/launch hit "Connection was lost" after a long, healthy
+    # stretch of bootstrap-quota retries, and the whole process was simply
+    # gone with no further attempts, silently ending unattended training.
+    # Running both calls in a subshell confines that `exit 1` to the
+    # subshell, so a failure here is just another reason to retry with a
+    # fresh session, exactly like a bootstrap failure already is.
+    if ! (
+        remote_bash "
+mkdir -p /content/vesuvius_volume_cache '$(dirname "$CONFIG_REMOTE")'
+$PATCH_CMDS
+rclone copyto --config /root/.config/rclone/rclone.conf 'gdrive:vesuvius/configs/$(basename "$CONFIG_LOCAL")' '$CONFIG_REMOTE'
+echo patched
+" 120
+        remote_bash "
 export PATH=\"\$HOME/.local/bin:\$PATH\"
 export WANDB_API_KEY='${WANDB_API_KEY:-}'
 cd \$HOME/villa/vesuvius
@@ -172,6 +183,11 @@ nohup uv run --no-sync --extra models python -m vesuvius.ink_detection.training.
 echo launched \$!
 disown
 " 60
+    ); then
+        log "patch/launch failed for $SESSION (connection issue) — retrying with a new session"
+        sleep 10
+        continue
+    fi
     log "launched attempt $n, log at $TRAIN_LOG_REMOTE"
 
     VOLUME_CACHE_DIR="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('volume_cache_dir',''))" "$CONFIG_LOCAL")"

@@ -21,8 +21,8 @@
   "mixed_precision": "fp16",
   "dataloader_workers": 4,
 
-  "val_every": 500,
-  "save_every": 1000,
+  "val_every": 250,
+  "save_every": 250,
 
   "verify_finite_gradients_steps": 200,
   "max_amp_overflow_events": 4,
