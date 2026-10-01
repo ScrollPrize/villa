@@ -71,6 +71,9 @@ class FiberTrace3DConfig:
     presence_target_mode: str = "binary"
     presence_gaussian_width_ratio: float = 4.0
     presence_gaussian_truncate_sigma: float = 3.0
+    presence_sideband_weight: float = 0.0
+    presence_sideband_half_width_base: float = 64.0
+    presence_sideband_half_height_base: float = 16.0
     presence_negative_edge_margin_voxels: int | None = None
     image_normalization: str = "zscore"
     augment_enabled: bool = True
@@ -219,7 +222,9 @@ class FiberTrace3DSample:
     target_segment_bbox_hi_zyx: torch.Tensor
     target_tangent_zyx: torch.Tensor
     target_segment_normals_zyx: torch.Tensor | None = None
+    volume_spacing_base: float = 1.0
     presence_target_mode: str = "binary"
+    presence_sideband_weight: float = 0.0
     profile_timings_ms: dict[str, float] | None = None
     embedding_geometry: EmbeddingGeometry | None = None
     refinement_geometry: RefinementObservation | None = None
@@ -433,7 +438,9 @@ class FiberTrace3DBatch:
     target_segment_bbox_hi_zyx: torch.Tensor
     target_tangent_zyx: torch.Tensor
     target_segment_normals_zyx: torch.Tensor | None = None
+    volume_spacing_base: torch.Tensor | None = None
     presence_target_mode: str = "binary"
+    presence_sideband_weight: float = 0.0
     direction_target: torch.Tensor | None = None
     direction_weight: torch.Tensor | None = None
     direction_mask: torch.Tensor | None = None
@@ -442,6 +449,7 @@ class FiberTrace3DBatch:
     direction_weight_sparse: torch.Tensor | None = None
     direction_tangent_sparse_zyx: torch.Tensor | None = None
     presence_target: torch.Tensor | None = None
+    presence_sideband_mask: torch.Tensor | None = None
     presence_mask: torch.Tensor | None = None
     deferred_augmentation_params: tuple[_Augment3DParams, ...] | None = None
     deferred_blur_kernels: tuple[_BlurKernels3D | None, ...] | None = None
@@ -460,6 +468,7 @@ class FiberTrace3DBatch:
     ) -> "FiberTrace3DBatch":
         return FiberTrace3DBatch(
             presence_target_mode=self.presence_target_mode,
+            presence_sideband_weight=self.presence_sideband_weight,
             refinement_geometry=self.refinement_geometry,
             normalization_counts=None if self.normalization_counts is None else self.normalization_counts.to(device, non_blocking=non_blocking),
             embedding_geometry=None if self.embedding_geometry is None else tuple(
@@ -495,6 +504,9 @@ class FiberTrace3DBatch:
             target_segment_normals_zyx=None
             if self.target_segment_normals_zyx is None
             else self.target_segment_normals_zyx.to(device, non_blocking=non_blocking),
+            volume_spacing_base=None
+            if self.volume_spacing_base is None
+            else self.volume_spacing_base.to(device, non_blocking=non_blocking),
             direction_target=None
             if self.direction_target is None
             else self.direction_target.to(device, non_blocking=non_blocking),
@@ -521,6 +533,9 @@ class FiberTrace3DBatch:
             presence_target=None
             if self.presence_target is None
             else self.presence_target.to(device, non_blocking=non_blocking),
+            presence_sideband_mask=None
+            if self.presence_sideband_mask is None
+            else self.presence_sideband_mask.to(device, non_blocking=non_blocking),
             presence_mask=None
             if self.presence_mask is None
             else self.presence_mask.to(device, non_blocking=non_blocking),
@@ -555,6 +570,7 @@ class FiberTrace3DBatch:
             target_segment_ends_zyx=pin(self.target_segment_ends_zyx),
             target_tangent_zyx=pin(self.target_tangent_zyx),
             target_segment_normals_zyx=pin(self.target_segment_normals_zyx),
+            volume_spacing_base=pin(self.volume_spacing_base),
             direction_target=pin(self.direction_target),
             direction_weight=pin(self.direction_weight),
             direction_mask=pin(self.direction_mask),
@@ -563,6 +579,7 @@ class FiberTrace3DBatch:
             direction_weight_sparse=pin(self.direction_weight_sparse),
             direction_tangent_sparse_zyx=pin(self.direction_tangent_sparse_zyx),
             presence_target=pin(self.presence_target),
+            presence_sideband_mask=pin(self.presence_sideband_mask),
             presence_mask=pin(self.presence_mask),
         )
 
@@ -599,6 +616,8 @@ def collate_fiber_trace_3d_samples(
     timings: dict[str, float] | None = None
     if len({sample.presence_target_mode for sample in samples}) != 1:
         raise ValueError("cannot collate mixed presence target modes")
+    if len({sample.presence_sideband_weight for sample in samples}) != 1:
+        raise ValueError("cannot collate mixed presence sideband weights")
     if profile:
         timings = {}
         keys = set().union(*(set(sample.profile_timings_ms or {}) for sample in samples))
@@ -641,6 +660,7 @@ def collate_fiber_trace_3d_samples(
         raise ValueError("deferred augmentation-parameter count does not match sample count")
     return FiberTrace3DBatch(
         presence_target_mode=samples[0].presence_target_mode,
+        presence_sideband_weight=samples[0].presence_sideband_weight,
         refinement_geometry=tuple(sample.refinement_geometry for sample in samples),
         embedding_geometry=tuple(sample.embedding_geometry for sample in samples),
         volume=volume_batch,
@@ -668,6 +688,9 @@ def collate_fiber_trace_3d_samples(
         target_modes=torch.as_tensor([sample.target_mode for sample in samples], dtype=torch.long),
         target_segment_offsets=torch.as_tensor(segment_offsets, dtype=torch.long),
         target_segment_counts=torch.as_tensor(segment_counts, dtype=torch.long),
+        volume_spacing_base=torch.as_tensor(
+            [sample.volume_spacing_base for sample in samples], dtype=torch.float32
+        ),
         target_segment_starts_zyx=segment_starts,
         target_segment_ends_zyx=segment_ends,
         target_segment_bbox_lo_zyx=segment_bbox_lo,
@@ -827,6 +850,13 @@ def load_config(path: str | Path) -> FiberTrace3DConfig:
         presence_target_mode=presence_target_mode,
         presence_gaussian_width_ratio=float(raw.get("presence_gaussian_width_ratio", 4.0)),
         presence_gaussian_truncate_sigma=float(raw.get("presence_gaussian_truncate_sigma", 3.0)),
+        presence_sideband_weight=float(raw.get("presence_sideband_weight", 0.0)),
+        presence_sideband_half_width_base=float(
+            raw.get("presence_sideband_half_width_base", 64.0)
+        ),
+        presence_sideband_half_height_base=float(
+            raw.get("presence_sideband_half_height_base", 16.0)
+        ),
         presence_negative_edge_margin_voxels=(
             None
             if raw.get("presence_negative_edge_margin_voxels") is None
@@ -2066,6 +2096,15 @@ class FiberTrace3DLoader:
             raise ValueError("presence_gaussian_width_ratio must be finite and >= 1")
         if not math.isfinite(config.presence_gaussian_truncate_sigma) or config.presence_gaussian_truncate_sigma <= 0.0:
             raise ValueError("presence_gaussian_truncate_sigma must be positive finite")
+        if not math.isfinite(config.presence_sideband_weight) or config.presence_sideband_weight < 0.0:
+            raise ValueError("presence_sideband_weight must be finite and >= 0")
+        if config.presence_sideband_weight > 0.0:
+            if config.presence_target_mode != "anisotropic_gaussian":
+                raise ValueError("presence sidebands require anisotropic_gaussian targets")
+            if not math.isfinite(config.presence_sideband_half_width_base) or config.presence_sideband_half_width_base <= 0.0:
+                raise ValueError("presence_sideband_half_width_base must be positive finite")
+            if not math.isfinite(config.presence_sideband_half_height_base) or config.presence_sideband_half_height_base <= 0.0:
+                raise ValueError("presence_sideband_half_height_base must be positive finite")
         if config.augment_scale_min <= 0.0 or config.augment_scale_max <= 0.0:
             raise ValueError("augment_scale_min/max must be > 0")
         if config.augment_scale_min > config.augment_scale_max:
@@ -3213,6 +3252,12 @@ class FiberTrace3DLoader:
                 float(self.config.presence_gaussian_width_ratio)
                 * float(self.config.presence_gaussian_truncate_sigma)
             )
+        if self.config.presence_sideband_weight > 0.0:
+            radius = max(
+                radius,
+                float(self.config.presence_sideband_half_width_base)
+                / float(record.volume_spacing_base),
+            )
         segment_starts, segment_ends, segment_bbox_lo, segment_bbox_hi, segment_normals = self._line_segment_spec(
             record,
             cp_index,
@@ -3526,6 +3571,8 @@ class FiberTrace3DLoader:
             timings["raw_sample_cpu_ms"] = load_cpu_ms
         sample = FiberTrace3DSample(
             presence_target_mode=self.config.presence_target_mode,
+            presence_sideband_weight=self.config.presence_sideband_weight,
+            volume_spacing_base=float(record.volume_spacing_base),
             embedding_geometry=embedding_geometry,
             refinement_geometry=refinement_geometry,
             stream_index=stream_index,
@@ -4044,6 +4091,9 @@ def config_from_mapping(raw: dict[str, Any], *, config_dir: Path | None = None) 
         presence_target_mode=str(raw.get("presence_target_mode", "binary")).lower(),
         presence_gaussian_width_ratio=float(raw.get("presence_gaussian_width_ratio", 4.0)),
         presence_gaussian_truncate_sigma=float(raw.get("presence_gaussian_truncate_sigma", 3.0)),
+        presence_sideband_weight=float(raw.get("presence_sideband_weight", 0.0)),
+        presence_sideband_half_width_base=float(raw.get("presence_sideband_half_width_base", 64.0)),
+        presence_sideband_half_height_base=float(raw.get("presence_sideband_half_height_base", 16.0)),
         presence_negative_edge_margin_voxels=(
             None
             if raw.get("presence_negative_edge_margin_voxels") is None

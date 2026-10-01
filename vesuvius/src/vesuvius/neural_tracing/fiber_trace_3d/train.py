@@ -39,6 +39,12 @@ from vesuvius.neural_tracing.fiber_trace_3d.training_state import (
     checkpoint_sources as _checkpoint_sources, config_fingerprint,
 )
 from vesuvius.neural_tracing.fiber_trace_3d.cooperative_resources import EffectiveBatchSampleIndex
+from vesuvius.neural_tracing.fiber_trace_3d.cross_section import (
+    CrossSectionAccumulator,
+    CrossSectionConfig,
+    fit_mean_gaussian,
+    write_cross_section_artifacts,
+)
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, Dataset
 from vesuvius.neural_tracing.fiber_trace_3d.training_profile import (
@@ -967,6 +973,7 @@ def _finalize_loss_statistics(
     presence_weight: float,
     positive_query_weight: float = 1.0,
     negative_query_weight: float = 1.0,
+    sideband_weight: float = 0.0,
     distributed: "_DistributedConfig | None" = None,
 ) -> dict[str, torch.Tensor]:
     names = (
@@ -974,6 +981,8 @@ def _finalize_loss_statistics(
         "positive_presence",
         "negative_presence",
         "distribution_presence",
+        "sideband_left_presence",
+        "sideband_right_presence",
         "angle",
         "branch0",
         "branch1",
@@ -1002,6 +1011,14 @@ def _finalize_loss_statistics(
         "distribution_presence": (
             statistics.distribution_presence_sum,
             statistics.distribution_presence_count,
+        ),
+        "sideband_left_presence": (
+            statistics.sideband_left_presence_sum,
+            statistics.sideband_left_presence_count,
+        ),
+        "sideband_right_presence": (
+            statistics.sideband_right_presence_sum,
+            statistics.sideband_right_presence_count,
         ),
         "angle": (statistics.angle_sum, statistics.angle_count),
         "branch0": (statistics.branch0_sum, statistics.branch_count),
@@ -1044,6 +1061,8 @@ def _finalize_loss_statistics(
     positive_presence_loss = ratio("positive_presence")
     negative_presence_loss = ratio("negative_presence")
     distribution_presence_loss = ratio("distribution_presence")
+    sideband_left_presence_loss = ratio("sideband_left_presence")
+    sideband_right_presence_loss = ratio("sideband_right_presence")
     positive_count = (
         global_values["positive_presence"][1]
         if global_values
@@ -1079,6 +1098,9 @@ def _finalize_loss_statistics(
             * distribution_active
             * distribution_presence_loss
         )
+        + float(sideband_weight)
+        * 0.5
+        * (sideband_left_presence_loss + sideband_right_presence_loss)
     )
     split_embedding = (local_pairs["short_embedding"][1] > 0) | (local_pairs["long_embedding"][1] > 0)
     if global_values:
@@ -1097,6 +1119,8 @@ def _finalize_loss_statistics(
         "presence_ridge": positive_presence_loss,
         "presence_distribution": distribution_presence_loss,
         "presence_background": negative_presence_loss,
+        "presence_sideband_left": sideband_left_presence_loss,
+        "presence_sideband_right": sideband_right_presence_loss,
         "embedding": embedding_loss,
         "embedding_contrastive": ratio("contrastive_embedding"),
         "embedding_anchors": global_values["contrastive_embedding"][1] if global_values else statistics.contrastive_embedding_count,
@@ -1607,6 +1631,17 @@ def compute_losses(
         negative_group_sum,
         negative_group_count,
     )
+    sideband_statistics = []
+    for side in range(2):
+        if batch.presence_sideband_mask is None:
+            sideband_zero = pred_presences.sum() * 0.0
+            sideband_statistics.append((sideband_zero, sideband_zero.detach()))
+            continue
+        mask = batch.presence_sideband_mask[:, side].unsqueeze(1).unsqueeze(1)
+        mask = mask.expand_as(pred_presences).to(dtype=negative_presence_bce.dtype)
+        group_sum = (negative_presence_bce * mask).sum(dim=(2, 3, 4, 5)).reshape(-1)
+        group_count = mask.sum(dim=(2, 3, 4, 5)).reshape(-1)
+        sideband_statistics.append(_nonempty_group_statistics(group_sum, group_count))
     statistics = _LossStatistics(
         direction_sum=direction_sum,
         direction_count=direction_count,
@@ -1616,6 +1651,10 @@ def compute_losses(
         negative_presence_count=negative_presence_group_count,
         distribution_presence_sum=distribution_presence_sum,
         distribution_presence_count=distribution_presence_group_count,
+        sideband_left_presence_sum=sideband_statistics[0][0],
+        sideband_left_presence_count=sideband_statistics[0][1],
+        sideband_right_presence_sum=sideband_statistics[1][0],
+        sideband_right_presence_count=sideband_statistics[1][1],
         angle_sum=angle_sum,
         angle_count=angle_count,
         branch0_sum=branch0_sum,
@@ -1646,6 +1685,7 @@ def compute_losses(
         statistics,
         direction_weight=direction_weight,
         presence_weight=presence_weight,
+        sideband_weight=batch.presence_sideband_weight,
     )
 
 
@@ -2430,6 +2470,31 @@ def _distributed_gather_dense_test_rows(
     return [item for rank_rows in gathered for item in rank_rows]
 
 
+def _distributed_reduce_cross_section(accumulator, config: _DistributedConfig, device: torch.device):
+    """SUM-reduce bounded cross-section state without object serialization."""
+    if not config.enabled:
+        return accumulator
+    arrays = (
+        ("sum", torch.float64, np.float64),
+        ("count", torch.float32, np.uint32),
+        ("histogram", torch.float32, np.uint32),
+    )
+    for name, tensor_dtype, numpy_dtype in arrays:
+        tensor = torch.as_tensor(getattr(accumulator, name), device=device, dtype=tensor_dtype)
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        if config.is_main:
+            getattr(accumulator, name)[...] = tensor.cpu().numpy().astype(numpy_dtype)
+    totals = torch.tensor(
+        [accumulator.sections, accumulator.skipped],
+        dtype=torch.float64,
+        device=device,
+    )
+    dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+    if config.is_main:
+        accumulator.sections, accumulator.skipped = map(int, totals.cpu().tolist())
+    return accumulator
+
+
 class _FullResolutionEvaluation(torch.nn.Module):
     """Evaluate low-resolution predictions against the historical full-grid targets."""
     output_stride = 1
@@ -2498,6 +2563,7 @@ def _evaluate_loaded_batch(model, batch, config, *, device, microbatch_size,
     options = conditioned_loss_options or {}
     result = _finalize_loss_statistics(statistics,
         direction_weight=direction_weight, presence_weight=presence_weight,
+        sideband_weight=config.presence_sideband_weight,
         positive_query_weight=options.get("positive_query_weight", 1.0),
         negative_query_weight=options.get("negative_query_weight", 1.0))
     for key in {k for row in embedding_diagnostics for k in row}:
@@ -2815,6 +2881,7 @@ def _slice_batch(batch: FiberTrace3DBatch, start: int, stop: int) -> FiberTrace3
             sparse_tangent = sparse_tangent[sparse_mask]
     return FiberTrace3DBatch(
         presence_target_mode=batch.presence_target_mode,
+        presence_sideband_weight=batch.presence_sideband_weight,
         embedding_geometry=None if batch.embedding_geometry is None else batch.embedding_geometry[start:stop],
         refinement_geometry=None if batch.refinement_geometry is None else batch.refinement_geometry[start:stop],
         volume=batch.volume[start:stop],
@@ -2837,6 +2904,9 @@ def _slice_batch(batch: FiberTrace3DBatch, start: int, stop: int) -> FiberTrace3
         target_segment_normals_zyx=None
         if batch.target_segment_normals_zyx is None
         else batch.target_segment_normals_zyx[segment_start:segment_stop],
+        volume_spacing_base=None
+        if batch.volume_spacing_base is None
+        else batch.volume_spacing_base[start:stop],
         direction_target=None
         if batch.direction_target is None
         else batch.direction_target[start:stop],
@@ -2851,6 +2921,9 @@ def _slice_batch(batch: FiberTrace3DBatch, start: int, stop: int) -> FiberTrace3
         presence_target=None
         if batch.presence_target is None
         else batch.presence_target[start:stop],
+        presence_sideband_mask=None
+        if batch.presence_sideband_mask is None
+        else batch.presence_sideband_mask[start:stop],
         presence_mask=None if batch.presence_mask is None else batch.presence_mask[start:stop],
         profile_timings_ms=batch.profile_timings_ms,
     )
@@ -2981,9 +3054,13 @@ def _log_embedding_scalars(writer, prefix, losses, model, step):
 def _log_test_scalars(writer, prefix, losses, model, step):
     """Raw, EMA and historical observations use the same component tags."""
     for key in ("total", "direction", "presence", "angle_mean_deg",
+                "presence_sideband_left", "presence_sideband_right",
                 "branch0_fraction", "branch1_fraction", "selected_score_mean"):
         if key in losses:
-            tag = f"loss_{key}" if key in {"total", "direction", "presence"} else key
+            tag = f"loss_{key}" if key in {
+                "total", "direction", "presence",
+                "presence_sideband_left", "presence_sideband_right",
+            } else key
             writer.add_scalar(f"{prefix}/{tag}", losses[key], step)
     _log_embedding_scalars(writer, prefix, losses, model, step)
 
@@ -3577,6 +3654,27 @@ def training_units(
     test_sample_vis_count = int(training.get("test_sample_vis_count", sample_vis_count))
     if test_sample_vis_count <= 0:
         raise ValueError("training.test_sample_vis_count must be > 0")
+    test_cross_section_vis_interval = int(training.get("test_cross_section_vis_interval", 0))
+    if test_cross_section_vis_interval < 0:
+        raise ValueError("training.test_cross_section_vis_interval must be >= 0")
+    test_cross_section_config = None
+    if test_cross_section_vis_interval > 0:
+        test_dataset_scales = {
+            int(dataset.get("base_volume_scale", 0))
+            for dataset in raw_config.get("test_datasets", ())
+        }
+        if len(test_dataset_scales) != 1:
+            raise ValueError(
+                "test cross-section visualization requires one common test base_volume_scale"
+            )
+        (test_dataset_scale,) = test_dataset_scales
+        test_cross_section_config = CrossSectionConfig(
+            width_base=int(training.get("test_cross_section_width_base", 160)),
+            height_base=int(training.get("test_cross_section_height_base", 80)),
+            spacing_base=float(1 << test_dataset_scale),
+            histogram_bins=int(training.get("test_cross_section_histogram_bins", 256)),
+            quantiles=(0.1,),
+        )
     test_control_points, test_start_sample_index, test_sample_mode = _resolve_dense_test_selection(
         training,
         loader_sample_count=test_loader.sample_count if test_loader is not None else loader.sample_count,
@@ -3887,6 +3985,16 @@ def training_units(
             metric: float | None = None
             metric_name: str | None = None
             test_vis_due = test_sample_vis_interval > 0 and step % test_sample_vis_interval == 0
+            cross_section_due = (
+                test_cross_section_config is not None
+                and step % test_cross_section_vis_interval == 0
+                and (pending_test is None or not pending_test["dense_logged"])
+            )
+            cross_section = (
+                CrossSectionAccumulator(test_cross_section_config)
+                if cross_section_due
+                else None
+            )
             test_sheets = pending_test.setdefault("visualization_sheets", []) if pending_test is not None else []
             test_visualization = _ForwardVisualization(test_sample_vis_count, test_sheets)
             if test_loader is not None and test_interval > 0:
@@ -3899,11 +4007,16 @@ def training_units(
                     output_upsample=training.get("test_output_upsample"),
                     prediction_observer=_combine_prediction_observers(
                         refinement if refinement.config.enabled and refinement.config.update_enabled else None,
-                        test_visualization if distributed.is_main and writer is not None and test_vis_due else None),
+                        test_visualization if distributed.is_main and writer is not None and test_vis_due else None,
+                        cross_section),
                 )
                 gathered_rows = yield from collect_evaluation(
                     test_loader, options, source="test", rows_key="rows",
                     visualization=test_visualization if test_vis_due else None)
+                if cross_section is not None:
+                    _distributed_reduce_cross_section(
+                        cross_section, distributed, distributed.device
+                    )
                 if distributed.is_main:
                     test_losses = _mean_dense_test_rows(gathered_rows)
                     metric = float(test_losses["total"])
@@ -3925,6 +4038,83 @@ def training_units(
                         _log_test_scalars(writer, "test", test_losses, raw_model, step)
                         log_refinement_scalars(writer,"test",test_refinement_totals,step)
                         diagnostics.marker("test-tensorboard-scalars-end", step=step)
+                    if cross_section is not None and (
+                        pending_test is None or not pending_test["dense_logged"]
+                    ):
+                        artifact_dir = run_dir / "test_cross_sections" / f"step_{step:08d}"
+                        _fit_image, fit = fit_mean_gaussian(
+                            cross_section.mean(), cross_section.config
+                        )
+                        target_sigma_normal_base = (
+                            float(test_loader.config.presence_radius_voxels)
+                            * float(cross_section.config.spacing_base)
+                        )
+                        target_sigma_width_base = (
+                            target_sigma_normal_base
+                            * float(test_loader.config.presence_gaussian_width_ratio)
+                        )
+                        fit["supervised_sigma_normal_base"] = target_sigma_normal_base
+                        fit["supervised_sigma_width_base"] = target_sigma_width_base
+                        fit["sigma_normal_target_multiple"] = (
+                            float(fit["sigma_normal_base"]) / target_sigma_normal_base
+                        )
+                        fit["sigma_width_target_multiple"] = (
+                            float(fit["sigma_width_base"]) / target_sigma_width_base
+                        )
+                        paths = write_cross_section_artifacts(
+                            cross_section,
+                            artifact_dir,
+                            metadata={
+                                "optimizer_step": int(step),
+                                "samples": int(sample_progress.at(step)),
+                                "model": "raw",
+                                "dataset": "full_deterministic_test_set",
+                                "supervised_target": {
+                                    "sigma_normal_base": target_sigma_normal_base,
+                                    "sigma_width_base": target_sigma_width_base,
+                                },
+                                "fit_target_comparison": {
+                                    "sigma_normal_target_multiple": fit[
+                                        "sigma_normal_target_multiple"
+                                    ],
+                                    "sigma_width_target_multiple": fit[
+                                        "sigma_width_target_multiple"
+                                    ],
+                                },
+                            },
+                        )
+                        if writer is not None:
+                            mean_image = torch.from_numpy(cross_section.mean()).unsqueeze(0)
+                            q01_image = torch.from_numpy(
+                                cross_section.exceedance_threshold(0.1)
+                            ).unsqueeze(0)
+                            writer.add_image("test_cross_section/mean", mean_image, step)
+                            writer.add_image("test_cross_section/q0.1", q01_image, step)
+                            for key in (
+                                "background",
+                                "amplitude",
+                                "center_normal_base",
+                                "center_width_base",
+                                "sigma_normal_base",
+                                "sigma_width_base",
+                                "sigma_normal_target_multiple",
+                                "sigma_width_target_multiple",
+                                "rmse",
+                            ):
+                                writer.add_scalar(
+                                    f"test_cross_section/fit_{key}", float(fit[key]), step
+                                )
+                        print(
+                            "test cross-section: "
+                            f"sections={cross_section.sections} skipped={cross_section.skipped} "
+                            f"sigma_normal={float(fit['sigma_normal_base']):.3f}base "
+                            f"({float(fit['sigma_normal_target_multiple']):.3f}x target) "
+                            f"sigma_width={float(fit['sigma_width_base']):.3f}base "
+                            f"({float(fit['sigma_width_target_multiple']):.3f}x target) "
+                            f"rmse={float(fit['rmse']):.6f} "
+                            f"mean={paths['mean']} q0.1={paths['q0.1']}",
+                            flush=True,
+                        )
                 if (
                     distributed.is_main
                     and writer is not None
@@ -4204,6 +4394,7 @@ def training_units(
             loss_statistics: _LossStatistics | None = None
             component_accumulator = None
             gaussian_presence = loader.config.presence_target_mode == "anisotropic_gaussian"
+            sideband_presence = loader.config.presence_sideband_weight > 0.0
             def normalized_accumulator(counts):
                 accumulator = NormalizedGradientAccumulator(raw_model, counts,
                     direction_weight=direction_weight, presence_weight=presence_weight,
@@ -4211,14 +4402,20 @@ def training_units(
                     negative_query_weight=conditioned_loss_options["negative_query_weight"],
                     distributed=distributed.enabled,
                     loss_scale=float(grad_scaler.get_scale()) if scaler_enabled else 1.0,
-                    gaussian_presence=gaussian_presence)
+                    gaussian_presence=gaussian_presence,
+                    sideband_presence=sideband_presence,
+                    sideband_weight=loader.config.presence_sideband_weight)
                 if scaler_enabled:
                     grad_scaler.scale(accumulator.statistics[0])
                 return accumulator
 
             if target_only_accumulation and optimizer_microbatch_count == 0:
                 component_accumulator = normalized_accumulator(torch.zeros(
-                    len(loss_components(raw_model, gaussian_presence=gaussian_presence)),
+                    len(loss_components(
+                        raw_model,
+                        gaussian_presence=gaussian_presence,
+                        sideband_presence=sideband_presence,
+                    )),
                     device=device))
             for microbatch_index, take in enumerate(optimizer_microbatch_takes):
                 local_batch_ordinal = (
@@ -4331,6 +4528,7 @@ def training_units(
                     presence_weight=presence_weight,
                     positive_query_weight=conditioned_loss_options["positive_query_weight"],
                     negative_query_weight=conditioned_loss_options["negative_query_weight"],
+                    sideband_weight=loader.config.presence_sideband_weight,
                     distributed=None if bounded_accumulation else distributed,
                 )
             if bounded_accumulation:

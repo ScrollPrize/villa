@@ -685,6 +685,110 @@ def evaluate():
     return result
 
 
+def cross_section_series():
+    """Evaluate configured raw/EMA snapshots under one managed GPU grant."""
+    from vesuvius.neural_tracing.fiber_trace_3d.evaluation_benchmark import main as benchmark
+
+    settings = json.loads(CONTROL.read_text())["cross_section_series"]
+    run = Path(settings["run"])
+    variants = settings.get(
+        "variants",
+        ["best.pt", "current.pt", "best_ema_0p99.pt", "current_ema_0p99.pt",
+         "best_ema_0p999.pt", "current_ema_0p999.pt"],
+    )
+    source_checkpoints = [run / "snapshots" / name for name in variants]
+    missing = [str(path) for path in source_checkpoints if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(f"missing configured cross-section snapshots: {missing}")
+    output = Path(settings["output"])
+    if output.exists():
+        raise FileExistsError(f"cross-section output already exists: {output}")
+    output.mkdir(parents=True)
+    from vesuvius.neural_tracing.fiber_trace_3d.live_evaluate import freeze_checkpoint
+    frozen_root = output / "frozen"
+    frozen_root.mkdir()
+    selections = []
+    checkpoints = []
+    import torch
+    for source in source_checkpoints:
+        frozen, digest = freeze_checkpoint(source, frozen_root)
+        target = frozen_root / source.name
+        os.link(frozen, target)
+        payload = torch.load(target, map_location="cpu", weights_only=False, mmap=True)
+        refinement_state = payload.get("refinement_state")
+        if refinement_state:
+            archive_source = source.parent / refinement_state["file"]
+            archive_target = frozen_root / refinement_state["file"]
+            if not archive_target.exists():
+                os.link(archive_source, archive_target)
+        checkpoints.append(target)
+        selections.append({
+            "source": str(source),
+            "frozen": str(target),
+            "sha256": digest,
+            "step": int(payload.get("step", 0)),
+            "samples_seen": payload.get("samples_seen"),
+            "metric": payload.get("metric"),
+            "metric_name": payload.get("metric_name"),
+            "refinement_state": refinement_state,
+        })
+    (output / "selection.json").write_text(json.dumps(selections, indent=2) + "\n")
+    argv = [
+        "--evaluation-only",
+        "--reference", str((ROOT / settings["config"]).resolve()),
+        "--output", str(output),
+        "--backend", "pipeline",
+        "--devices", str(settings.get("devices", "all")),
+        "--samples", str(settings.get("samples", 0)),
+        "--batch-size", str(settings.get("batch_size", 8)),
+        "--passes", "1",
+        "--cpu-workers", str(settings.get("cpu_workers", 128)),
+        "--timeout", str(settings.get("timeout_seconds", 3600)),
+        "--cross-section",
+        "--cross-section-width-base", str(settings.get("width_base", 160)),
+        "--cross-section-height-base", str(settings.get("height_base", 80)),
+        "--cross-section-histogram-bins", str(settings.get("histogram_bins", 1024)),
+        "--checkpoint-series", *map(str, checkpoints),
+    ]
+    return benchmark(argv)
+
+
+def cross_section_rerender():
+    """Re-render configured cross sections from completed histogram shards."""
+    from dataclasses import replace
+    from vesuvius.neural_tracing.fiber_trace_3d.cross_section import (
+        merge_shards,
+        write_cross_section_artifacts,
+    )
+
+    settings = json.loads(CONTROL.read_text())["cross_section_series"]
+    output = Path(settings["output"])
+    variants = settings.get(
+        "variants",
+        ["best.pt", "current.pt", "best_ema_0p99.pt", "current_ema_0p99.pt",
+         "best_ema_0p999.pt", "current_ema_0p999.pt"],
+    )
+    for variant in variants:
+        label = Path(variant).stem
+        shards = sorted((output / "shards").glob(f"{label}-rank*.npz"))
+        if not shards:
+            raise FileNotFoundError(f"no completed cross-section shards for {label}")
+        directory = output / label
+        old_metadata = json.loads((directory / "cross_section.json").read_text())
+        metadata = {
+            key: old_metadata[key]
+            for key in ("checkpoint", "base_volume_scale", "samples_requested")
+            if key in old_metadata
+        }
+        accumulator = merge_shards(shards)
+        accumulator.config = replace(
+            accumulator.config,
+            quantiles=tuple(settings.get("exceedance_fractions", (0.001, 0.01, 0.1, 0.2, 0.5))),
+        )
+        paths = write_cross_section_artifacts(accumulator, directory, metadata=metadata)
+        print(f"cross-section rerendered label={label} files={paths}", flush=True)
+
+
 def inspect():
     import torch
     from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
@@ -791,7 +895,7 @@ def main():
         return subprocess.call([sys.executable, '-m',
             'vesuvius.neural_tracing.fiber_trace_3d.embedding_consistency', str(CONTROL)])
     parser = argparse.ArgumentParser()
-    parser.add_argument('command', choices=['inspect', 'start', 'status', 'stop', 'summarize', 'inputs', 'evaluate', 'audit-latest', 'production-start', 'production-status', 'production-stop', 'production-watch', 'trace-evaluate', 'comparison', 'comparison-followup', 'trace-series-prepare', 'trace-series-next', 'trace-series-retry', 'remote-auth-probe'])
+    parser.add_argument('command', choices=['inspect', 'start', 'status', 'stop', 'summarize', 'inputs', 'evaluate', 'cross-section-series', 'cross-section-rerender', 'audit-latest', 'production-start', 'production-status', 'production-stop', 'production-watch', 'trace-evaluate', 'comparison', 'comparison-followup', 'trace-series-prepare', 'trace-series-next', 'trace-series-retry', 'remote-auth-probe'])
     parser.add_argument('--resume', type=Path,
                         help='checkpoint passed to production-start')
     args = parser.parse_args()
@@ -832,6 +936,10 @@ def main():
         print({key: len(rows) for key, rows in result.items()})
     elif args.command == 'evaluate':
         evaluate()
+    elif args.command == 'cross-section-series':
+        cross_section_series()
+    elif args.command == 'cross-section-rerender':
+        cross_section_rerender()
     else:
         status(stop=args.command == 'stop')
 

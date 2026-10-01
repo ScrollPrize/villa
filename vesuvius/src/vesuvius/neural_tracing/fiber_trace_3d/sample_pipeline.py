@@ -715,6 +715,13 @@ class MacroBatchTargetSource:
                     ((targets.presence_target > 0.0) & (targets.presence_target < 1.0))
                     .flatten(1).any(dim=1).sum().float()
                 )
+                if self.config.presence_sideband_weight > 0.0:
+                    if targets.presence_sideband_mask is None:
+                        raise RuntimeError("enabled sideband target was not materialized")
+                    sideband_groups = torch.stack([
+                        targets.presence_sideband_mask[:, side].flatten(1).any(dim=1).sum().float()
+                        for side in range(2)
+                    ])
             else:
                 positive_groups = targets.presence_target.new_tensor(
                     torch.unique(indices[:, 0]).numel()
@@ -735,6 +742,8 @@ class MacroBatchTargetSource:
                 negative_groups))
             if targets.presence_target_mode == "anisotropic_gaussian":
                 counts = torch.cat((counts, distribution_groups.reshape(1)))
+                if self.config.presence_sideband_weight > 0.0:
+                    counts = torch.cat((counts, sideband_groups))
             if self.config.embedding.enabled:
                 from .embedding import embedding_pair_counts
                 counts = torch.cat((counts, counts.new_tensor(embedding_pair_counts(batch))))

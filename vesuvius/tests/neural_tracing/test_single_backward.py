@@ -216,6 +216,63 @@ def test_gaussian_single_backward_matches_explicit_three_way_presence_loss():
         torch.testing.assert_close(actual.grad, reference.grad)
 
 
+def test_sideband_single_backward_matches_explicit_left_right_loss():
+    torch.manual_seed(29)
+    model = torch.nn.Linear(3, 6, bias=False)
+    oracle = copy.deepcopy(model)
+    inputs = torch.randn(7, 3)
+
+    def sideband_statistics(output):
+        zero = output.sum() * 0.0
+        count = output.new_tensor(output.shape[0])
+        return LossStatistics(
+            direction_sum=output[:, 0].square().sum(),
+            direction_count=count,
+            positive_presence_sum=(output[:, 1] - 1.0).square().sum(),
+            positive_presence_count=count,
+            negative_presence_sum=output[:, 2].square().sum(),
+            negative_presence_count=count,
+            distribution_presence_sum=output[:, 3].square().sum(),
+            distribution_presence_count=count,
+            sideband_left_presence_sum=output[:, 4].square().sum(),
+            sideband_left_presence_count=count,
+            sideband_right_presence_sum=output[:, 5].square().sum(),
+            sideband_right_presence_count=count,
+            angle_sum=zero,
+            angle_count=zero.detach(),
+            branch0_sum=zero,
+            branch1_sum=zero,
+            branch_count=zero.detach(),
+            selected_score_sum=zero,
+            selected_score_count=zero.detach(),
+        )
+
+    expected = sideband_statistics(oracle(inputs))
+    (
+        2.0 * expected.direction_sum / expected.direction_count
+        + 3.0 * expected.positive_presence_sum / expected.positive_presence_count
+        + 1.5 * expected.negative_presence_sum / expected.negative_presence_count
+        + 1.5 * expected.distribution_presence_sum / expected.distribution_presence_count
+        + 0.15 * expected.sideband_left_presence_sum / expected.sideband_left_presence_count
+        + 0.15 * expected.sideband_right_presence_sum / expected.sideband_right_presence_count
+    ).backward()
+
+    accumulator = NormalizedGradientAccumulator(
+        model,
+        torch.full((6,), 7.0),
+        direction_weight=2.0,
+        presence_weight=3.0,
+        gaussian_presence=True,
+        sideband_presence=True,
+        sideband_weight=0.1,
+    )
+    for part in inputs.split(2):
+        accumulator.add(sideband_statistics(model(part)))
+    accumulator.reduce_and_assign()
+    for actual, reference in zip(model.parameters(), oracle.parameters(), strict=True):
+        torch.testing.assert_close(actual.grad, reference.grad)
+
+
 def test_changed_counts_fail_before_optimizer_step():
     model = torch.nn.Linear(3,2)
     a = NormalizedGradientAccumulator(model, torch.zeros(3), direction_weight=1, presence_weight=1)

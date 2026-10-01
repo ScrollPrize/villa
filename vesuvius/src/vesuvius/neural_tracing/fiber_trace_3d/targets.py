@@ -205,7 +205,7 @@ def _materialize_anisotropic_gaussian_presence(
     config: FiberTrace3DConfig,
     patch_shape: tuple[int, int, int],
     coordinate_scale: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Rasterize a soft tube in the local fiber/sheet frame.
 
     The local surface normal is the thickness axis. The in-sheet axis
@@ -240,11 +240,22 @@ def _materialize_anisotropic_gaussian_presence(
     tangent_target = torch.zeros(
         (int(batch.volume.shape[0]), *patch_shape, 3), dtype=torch.float32, device=device
     )
+    sideband = (
+        torch.zeros(
+            (int(batch.volume.shape[0]), 2, *patch_shape),
+            dtype=torch.bool,
+            device=device,
+        )
+        if config.presence_sideband_weight > 0.0
+        else None
+    )
+    if sideband is not None and batch.volume_spacing_base is None:
+        raise ValueError("presence sidebands require per-sample base-voxel spacing")
     if int(starts.shape[0]) == 0:
         empty_indices = torch.zeros((0, 4), dtype=torch.long, device=device)
         empty_tangents = torch.zeros((0, 3), dtype=torch.float32, device=device)
         empty_weights = torch.zeros((0,), dtype=torch.float32, device=device)
-        return target, empty_indices, empty_tangents, empty_weights
+        return target, empty_indices, empty_tangents, empty_weights, sideband
 
     scale = float(coordinate_scale)
     starts = starts / scale
@@ -275,14 +286,14 @@ def _materialize_anisotropic_gaussian_presence(
         slices = tuple(slice(lo[axis], hi[axis]) for axis in range(3))
         coordinates = grid[slices]
         from_start = coordinates - p0
-        along = torch.minimum(
-            torch.sum(from_start * tangent, dim=-1).clamp_min(0.0),
-            length,
-        )
+        along_unclamped = torch.sum(from_start * tangent, dim=-1)
+        along = torch.minimum(along_unclamped.clamp_min(0.0), length)
         delta = coordinates - (p0 + along.unsqueeze(-1) * tangent)
+        normal_distance = torch.sum(delta * normal, dim=-1)
+        width_distance = torch.sum(delta * width, dim=-1)
         standardized2 = (
-            (torch.sum(delta * normal, dim=-1) / sigma_thickness) ** 2
-            + (torch.sum(delta * width, dim=-1) / sigma_width) ** 2
+            (normal_distance / sigma_thickness) ** 2
+            + (width_distance / sigma_width) ** 2
             + (torch.sum(delta * tangent, dim=-1) / sigma_width) ** 2
         )
         probability = torch.where(
@@ -298,9 +309,26 @@ def _materialize_anisotropic_gaussian_presence(
         tangent_target[sample][slices] = torch.where(
             replace.unsqueeze(-1), tangent.view(1, 1, 1, 3), tangent_view
         )
+        if sideband is not None:
+            spacing_base = float(batch.volume_spacing_base[sample])
+            if not math.isfinite(spacing_base) or spacing_base <= 0.0:
+                raise ValueError("presence sideband base spacing must be positive finite")
+            half_width = float(config.presence_sideband_half_width_base) / (spacing_base * scale)
+            half_height = float(config.presence_sideband_half_height_base) / (spacing_base * scale)
+            inner_width = sigma_width * float(config.presence_gaussian_truncate_sigma)
+            rectangle = (
+                (along_unclamped >= 0.0)
+                & (along_unclamped <= length)
+                & (torch.abs(normal_distance) <= half_height)
+                & (torch.abs(width_distance) <= half_width)
+            )
+            sideband[sample, 0][slices] |= rectangle & (width_distance < -inner_width)
+            sideband[sample, 1][slices] |= rectangle & (width_distance > inner_width)
     support = target > 0.0
+    if sideband is not None:
+        sideband &= ~support[:, None]
     indices_bzyx = torch.nonzero(support, as_tuple=False).to(dtype=torch.long)
-    return target, indices_bzyx, tangent_target[support], target[support]
+    return target, indices_bzyx, tangent_target[support], target[support], sideband
 
 
 def _materialize_coarse_cp_only_sample(
@@ -370,6 +398,7 @@ def materialize_targets(
         and batch.direction_target_sparse is not None
         and batch.direction_weight_sparse is not None
         and batch.presence_target is not None
+        and (config.presence_sideband_weight <= 0.0 or batch.presence_sideband_mask is not None)
     ):
         return batch
 
@@ -454,7 +483,7 @@ def materialize_targets(
         timings["target_cp_points"] = float(cp_direction_points)
     scatter_start = time.perf_counter()
     if config.presence_target_mode == "anisotropic_gaussian":
-        presence, gaussian_indices, gaussian_tangents, gaussian_falloff = _materialize_anisotropic_gaussian_presence(
+        presence, gaussian_indices, gaussian_tangents, gaussian_falloff, presence_sideband_mask = _materialize_anisotropic_gaussian_presence(
             batch=geometry_batch,
             config=config,
             patch_shape=patch_shape,
@@ -467,6 +496,7 @@ def materialize_targets(
     else:
         presence = positive.to(dtype=torch.float32)
         gaussian_falloff = None
+        presence_sideband_mask = None
     presence_target = presence.view(
         int(batch.volume.shape[0]),
         1,
@@ -519,6 +549,7 @@ def materialize_targets(
         direction_weight_sparse=direction_weight_sparse,
         direction_tangent_sparse_zyx=tangents_zyx,
         presence_target=presence_target,
+        presence_sideband_mask=presence_sideband_mask,
         presence_mask=None,
         profile_timings_ms=profile_timings if profile_timings else batch.profile_timings_ms,
     )

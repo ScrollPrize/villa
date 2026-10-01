@@ -34,6 +34,10 @@ class LossStatistics:
     long_embedding_count: torch.Tensor | None = None
     distribution_presence_sum: torch.Tensor | None = None
     distribution_presence_count: torch.Tensor | None = None
+    sideband_left_presence_sum: torch.Tensor | None = None
+    sideband_left_presence_count: torch.Tensor | None = None
+    sideband_right_presence_sum: torch.Tensor | None = None
+    sideband_right_presence_count: torch.Tensor | None = None
 
     def __post_init__(self):
         for name in ("positive_embedding_sum", "positive_embedding_count",
@@ -41,7 +45,9 @@ class LossStatistics:
                      "contrastive_embedding_sum", "contrastive_embedding_count",
                      "short_embedding_sum", "short_embedding_count",
                      "long_embedding_sum", "long_embedding_count",
-                     "distribution_presence_sum", "distribution_presence_count"):
+                     "distribution_presence_sum", "distribution_presence_count",
+                     "sideband_left_presence_sum", "sideband_left_presence_count",
+                     "sideband_right_presence_sum", "sideband_right_presence_count"):
             if getattr(self, name) is None:
                 object.__setattr__(self, name, torch.zeros_like(self.direction_count))
 

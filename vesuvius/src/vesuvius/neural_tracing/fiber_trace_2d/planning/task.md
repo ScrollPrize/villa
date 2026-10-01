@@ -1,14 +1,13 @@
-# Fiber cross-section evaluation
+# Local fiber sideband supervision and test visualization
 
-Add an opt-in training-test diagnostic which samples the predicted fiber
-presence in a cross-section centered on the supervised fiber and oriented by
-the Lasagna surface normal. The physical field is 160 base voxels in the
-in-sheet transverse direction and 80 base voxels in the surface-normal
-direction. Accumulate a per-pixel mean and bounded histograms, then write a
-float TIFF mean image and per-pixel 0.1%, 1%, and 10% quantile float TIFFs.
+Add separately normalized, Lasagna-normal-oriented left and right negative
+sidebands around each densely supervised fiber. Preserve the existing
+anisotropic Gaussian tube, but explicitly suppress presence outside its width
+support in a swept rectangle covering the observed approximately +/-40-base-
+voxel secondary peaks.
 
-Run the diagnostic on the best/current raw and EMA snapshots of the latest
-Gaussian-refinement training run so their learned cross-sectional profiles can
-be compared. This is evaluation-only and must not alter training targets,
-metrics, refinement state, or checkpoint selection.
-
+During configured training tests, accumulate the aligned predicted presence
+cross-section over the complete deterministic test set and write/log the mean
+and 10% exceedance (`q0.1`) images. Stop the previous training only after the
+implementation is validated, then resume its latest checkpoint with the new
+loss and visualization enabled.

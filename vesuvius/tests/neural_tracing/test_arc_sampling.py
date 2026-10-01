@@ -327,6 +327,76 @@ def test_anisotropic_gaussian_target_prepass_counts_match_loss_groups():
     torch.testing.assert_close(counts, actual, rtol=0, atol=0)
 
 
+def test_anisotropic_gaussian_sidebands_cover_both_sides_outside_support():
+    raw, config, _batch = _gaussian_line_batch()
+    raw = replace(raw, volume_spacing_base=torch.tensor([2.0]))
+    config = replace(
+        config,
+        presence_gaussian_width_ratio=1.0,
+        presence_sideband_weight=0.1,
+        presence_sideband_half_width_base=12.0,
+        presence_sideband_half_height_base=8.0,
+    )
+    batch = materialize_targets(raw, config)
+    assert batch.presence_sideband_mask is not None
+    left, right = batch.presence_sideband_mask[0]
+    assert left.any() and right.any()
+    assert not (left & right).any()
+    support = batch.presence_target[0, 0] > 0.0
+    assert not (left & support).any()
+    assert not (right & support).any()
+
+    center = torch.round(raw.cp_local_zyx[0]).long()
+    # The synthetic line's in-sheet transverse direction is output Y. At
+    # scale 1, 12 base voxels span six input voxels on either side.
+    centerline_left = torch.nonzero(
+        left[center[0], :, center[2]], as_tuple=False
+    ).flatten()
+    centerline_right = torch.nonzero(
+        right[center[0], :, center[2]], as_tuple=False
+    ).flatten()
+    assert int(centerline_left.min()) == int(center[1] - 6)
+    assert int(centerline_right.max()) == int(center[1] + 6)
+    assert int(centerline_left.max()) < int(center[1] - 3)
+    assert int(centerline_right.min()) > int(center[1] + 3)
+
+
+def test_sideband_loss_is_separately_normalized_per_side():
+    raw, config, _batch = _gaussian_line_batch()
+    config = replace(
+        config,
+        presence_gaussian_width_ratio=1.0,
+        presence_sideband_weight=0.1,
+        presence_sideband_half_width_base=6.0,
+        presence_sideband_half_height_base=4.0,
+    )
+    batch = materialize_targets(raw, config)
+    assert batch.presence_sideband_mask is not None
+    output = torch.full((1, 7, *batch.presence_target.shape[-3:]), 0.5)
+    output[:, 6][batch.presence_sideband_mask[:, 0]] = 0.8
+    output[:, 6][batch.presence_sideband_mask[:, 1]] = 0.2
+    losses = compute_losses(output, batch, direction_weight=0, presence_weight=1)
+    assert losses["presence_sideband_left"] == pytest.approx(-math.log(0.2), abs=1e-5)
+    assert losses["presence_sideband_right"] == pytest.approx(-math.log(0.8), abs=1e-5)
+
+    source = MacroBatchTargetSource(
+        None, config=config, device=torch.device("cpu"), output_stride=1, batch_sizes=[1]
+    )
+    counts = source._counts(raw)
+    statistics = compute_losses(
+        output, batch, direction_weight=1, presence_weight=1, _return_statistics=True
+    )
+    actual = torch.stack((
+        statistics.direction_count,
+        statistics.positive_presence_count,
+        statistics.negative_presence_count,
+        statistics.distribution_presence_count,
+        statistics.sideband_left_presence_count,
+        statistics.sideband_right_presence_count,
+    )).cpu()
+    torch.testing.assert_close(counts, actual, rtol=0, atol=0)
+
+
 def test_whole_selected_line_reentering_patch_remains_positive():
     line = [[16, 32, 32], [32, 32, 32], [1000, 32, 32], [1000, 36, 32], [16, 36, 32]]
     loader = make_loader(points=line, balanced=False)

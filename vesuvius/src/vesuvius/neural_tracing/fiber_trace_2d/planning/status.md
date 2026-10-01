@@ -1,9 +1,11 @@
-# Status: fiber cross-section evaluation
+# Status: local sideband supervision
 
-- [x] Reconcile `fiber-exp5` with the latest `fiber-exps4` training history on `exps5-train`.
-- [ ] Identify the shared test-evaluation, native-normal, coordinate-transform, and visualization paths.
-- [ ] Implement opt-in cross-section histogram and mean accumulation.
-- [ ] Add focused regression tests and documentation.
-- [ ] Run the experiment on best/current raw and EMA snapshots from the latest Gaussian-refinement run.
-- [ ] Compare and report generated cross-section images and statistics.
-
+- [x] Capture the requested task.
+- [x] Write and self-review the implementation plan.
+- [x] Implement swept left/right sideband target masks.
+- [x] Integrate globally synchronized sideband loss statistics.
+- [x] Integrate mean, q0.1, and Gaussian-fit visualization into configured tests.
+- [x] Add/update configuration and documentation.
+- [x] Run focused CPU validation; managed run is the GPU integration check.
+- [x] Stop the previous run and launch the managed resume.
+- [x] Record the launch state and validation results.

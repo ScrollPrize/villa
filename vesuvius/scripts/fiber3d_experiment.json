@@ -302,7 +302,7 @@
     "continuation_config": "/ephemeral/hendrik/fiber3d_train2/comparisons/nml_json_combined_20260912/continuation_config.json"
   },
   "production": {
-    "config": "/home/hendrik/villa/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/train_5scroll_json_eligible_fullres_refinement_ema_16x8.json",
+    "config": "/home/hendrik/villa/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/train_5scroll_json_eligible_fullres_refinement_gaussian_sideband_ema_16x8.json",
     "cuda_visible_devices": "0,1,2,3,4,5"
   },
   "trace_series": {
@@ -393,5 +393,27 @@
         "output": "/ephemeral/hendrik/fiber3d_train2/comparisons/finetune_four_20260913/best"
       }
     ]
+  },
+  "cross_section_series": {
+    "config": "vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/train_5scroll_json_eligible_fullres_refinement_ema_16x8.json",
+    "run": "/ephemeral/hendrik/fiber3d_train2/runs/5scroll_json_eligible_fullres_refinement_gaussian_halfsigma_128_sd1_16x8_ema_20260930_155818",
+    "output": "/ephemeral/hendrik/fiber3d_train2/evaluations/cross_sections_gaussian_halfsigma_20261001_v3",
+    "variants": [
+      "best.pt",
+      "current.pt",
+      "best_ema_0p99.pt",
+      "current_ema_0p99.pt",
+      "best_ema_0p999.pt",
+      "current_ema_0p999.pt"
+    ],
+    "devices": "all",
+    "samples": 0,
+    "batch_size": 8,
+    "cpu_workers": 128,
+    "timeout_seconds": 7200,
+    "width_base": 160,
+    "height_base": 80,
+    "histogram_bins": 1024,
+    "exceedance_fractions": [0.001, 0.01, 0.1, 0.2, 0.5]
   }
 }

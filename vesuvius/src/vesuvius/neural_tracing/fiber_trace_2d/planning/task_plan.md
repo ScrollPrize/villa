@@ -1,34 +1,41 @@
 # Plan
 
-1. Reconcile the crop/BP `fiber-exp5` history with the latest `fiber-exps4`
-   training history on a new `exps5-train` branch; preserve both durable
-   changelog histories and replace only active task documents.
-2. Trace the existing deterministic test path, compact fiber geometry, native
-   Lasagna normals, augmentation transforms, model-output coordinates, EMA
-   evaluation, and TIFF visualization helpers. Reuse shared implementations.
-3. Define an opt-in cross-section diagnostic. At eligible supervised fiber
-   centers, construct tangent, transformed surface-normal, and in-sheet
-   transverse axes. Sample predicted presence across a fixed 160 x 80
-   base-voxel field without changing the evaluated test crop or refinement.
-4. Accumulate sum/count and a fixed bounded per-pixel histogram on each rank;
-   reduce accumulators deterministically after evaluation. Derive per-pixel
-   0.001, 0.01, and 0.10 quantiles without retaining all sample planes.
-5. Write model/snapshot-qualified float TIFFs plus compact metadata describing
-   axes, physical extent, resolution, histogram bins, sample count, and source
-   checkpoint. Keep raw and EMA outputs separate and overwrite-safe.
-6. Add CPU regression tests for orientation, coordinate scaling, histogram
-   quantiles, distributed merge semantics, empty/invalid normals, and unchanged
-   evaluation metrics when disabled. Run focused existing test suites.
-7. Add a reusable approved-runner experiment mode/config, run best/current raw
-   and EMA snapshots from the latest run through the cooperative GPU manager,
-   and report the resulting image paths and numeric profile comparisons.
+1. Extend fiber target materialization with an opt-in swept rectangle in the
+   local tangent/surface-normal/in-sheet frame. Use half-width 64 and
+   half-height 16 base voxels, excluding the existing nonzero Gaussian support.
+   Track left and right masks separately.
+2. Add left/right sideband BCE-to-zero sums and counts to the existing
+   target-only, globally synchronized loss-statistics protocol. Normalize each
+   side independently and add their mean at weight 0.1 relative to the presence
+   ridge term. Preserve one forward/backward pass and all existing losses.
+3. Reuse the shared cross-section sampler during configured tests. Accumulate
+   raw-model predictions over the deterministic complete test set on every
+   rank, merge bounded sum/count/histogram state, and log/write float mean and
+   `q0.1` exceedance images. Do not alter crops, targets, refinement, metrics,
+   or checkpoint selection.
+4. Add focused CPU tests for swept-sideband geometry, exclusion of Gaussian
+   support, independent left/right statistics, disabled behavior, distributed
+   merge semantics, and image generation. Run the relevant loss, target,
+   refinement, and cross-section suites plus static validation.
+5. Add a derived resume config enabling the sideband loss and periodic
+   cross-section visualization. After validation, stop any surviving prior
+   run cleanly and launch a managed resume from its latest checkpoint.
 
 ## Spec update
 
-No protocol/spec change: this is an opt-in evaluation artifact only.
+Document the optional local-sideband target geometry, independent global
+normalization, and test-only cross-section visualization settings in
+`planning/specs.md`. No GPU-manager protocol change.
 
 ## Docs updates
 
-Document settings, TIFF semantics, commands, snapshot identities, results, and
-limitations in the task log and durable changelog.
+Record the settings, validation, source checkpoint, replacement run, artifact
+locations, and any measured test overhead in the task log and changelog.
 
+## Plan review
+
+The repository process requests an independent agent review. The active
+orchestration policy forbids spawning sub-agents unless the user explicitly
+requests delegation, so this plan received an explicit self-review against
+`specs.md`, `plan.md`, and the task before implementation; this is the only
+process deviation.

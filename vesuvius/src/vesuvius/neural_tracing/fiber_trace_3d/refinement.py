@@ -399,8 +399,6 @@ class GeometryStore:
         New deterministic crops may be first encountered after a checkpoint.
         They always start from immutable GT, including after legacy resumes.
         """
-        if self.read_only:
-            raise RuntimeError("frozen refinement cannot create test-patch state")
         from dataclasses import asdict
         identity = dict(protocol="fixed-test-crop-v1", parent=parent,
                         sample_index=int(sample_index), params=asdict(params),
@@ -411,6 +409,8 @@ class GeometryStore:
         path = self.root / key
         with file_lock(self.root / "catalog.lock"):
             if not path.exists():
+                if self.read_only:
+                    raise RuntimeError("frozen refinement archive is missing a deterministic test patch")
                 parent_metadata = json.loads((self.root / parent / "metadata.json").read_text())
                 metadata = {**parent_metadata, "split": "test_patch", "crop": json.loads(serialized)}
                 metadata.pop("export", None)  # cropped endpoints, not whole-fiber CP metadata
@@ -591,6 +591,41 @@ def refinement_session(function):
                 os.environ.pop(_FROZEN_ENV, None)
                 os.environ.pop(_ENV, None)
     return wrapped
+
+
+@contextmanager
+def frozen_refinement_state(checkpoint):
+    """Expose one checkpoint's refined geometry to evaluation-only loaders."""
+    if _ENV in os.environ:
+        raise RuntimeError("refinement state is already active in this process")
+    checkpoint = Path(checkpoint)
+    import torch
+    state = torch.load(checkpoint, map_location="cpu", weights_only=False, mmap=True)
+    saved = state.get("refinement_state")
+    if state.get("config", {}).get("refinement", {}).get("enabled") and not saved:
+        raise ValueError("refinement checkpoint is missing its fiber state")
+    with tempfile.TemporaryDirectory(prefix="fiber-refinement-eval-") as root:
+        if saved:
+            GeometryStore(root).restore(checkpoint.parent / saved["file"], saved["sha256"])
+        with frozen_refinement_root(root):
+            yield
+
+
+@contextmanager
+def frozen_refinement_root(root):
+    """Bind a pre-restored, shared read-only geometry root for evaluation."""
+    if _ENV in os.environ:
+        raise RuntimeError("refinement state is already active in this process")
+    root = Path(root)
+    if not (root / "restored.json").is_file():
+        raise ValueError(f"refinement root is not a complete restore: {root}")
+    os.environ[_ENV] = str(root)
+    os.environ[_FROZEN_ENV] = "1"
+    try:
+        yield
+    finally:
+        os.environ.pop(_FROZEN_ENV, None)
+        os.environ.pop(_ENV, None)
 
 
 def active_store():

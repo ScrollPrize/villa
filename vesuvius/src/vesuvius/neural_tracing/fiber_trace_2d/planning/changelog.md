@@ -3393,3 +3393,16 @@ identity remains unconfirmed. Global-assignment experiments not yet implemented.
   within-support distribution-negative, and background terms while preserving
   the prior aggregate loss scale; hardened partial distributed test waves with
   reference-counted padded-sample leases.
+
+# 2026-10-01 — Gaussian sideband supervision and live cross-sections
+
+- Added opt-in Lasagna-normal-oriented left/right negative sidebands outside
+  dense Gaussian fiber support. The two sides are independently globally
+  normalized and participate in the existing target-counted single-backward
+  training path.
+- Reused deterministic test forwards to publish raw-model aligned presence
+  cross-section mean and q0.1 TIFF/TensorBoard images. Central mean-crop
+  Gaussian fits now report RMSE and normal/width sigma multiples relative to
+  the configured supervised target.
+- Replaced the stopped half-sigma refinement run with a managed GPUs-0-5 resume
+  using 64x16-base sideband half-extents and 0.1 total sideband weight.

@@ -233,6 +233,29 @@
 - See `docs/training_refinement.md` for configuration, explicit unsupported
   modes, stale-lookahead semantics, measurements and snapshot inspection.
 
+## Optional Gaussian sideband supervision and test cross-sections (2026-10-01)
+
+- `presence_sideband_weight > 0` is supported only with dense anisotropic-
+  Gaussian presence targets. In each segment's tangent/surface-normal/in-sheet
+  frame, materialization sweeps a rectangular negative region with configurable
+  base-voxel half-width and half-height. The existing Gaussian support is
+  excluded, and the two in-sheet sides are retained as separate target-only
+  masks. Their BCE-to-zero means are normalized independently across the global
+  optimizer batch and each receives half of the configured sideband weight.
+  This supplements, rather than replaces, the ordinary background loss.
+- Sideband target descriptors remain compact in loader workers. Dense masks are
+  materialized only with the other device targets, their normalization counts
+  are included in the pre-forward target pass, and bounded accumulation keeps
+  one backward per physical microbatch.
+- Positive `training.test_cross_section_vis_interval` reuses raw predictions
+  from the complete deterministic configured test pass. It aligns presence to
+  the GT tangent and Lasagna normal, globally reduces bounded sum/count/
+  histogram state, and writes/logs float mean and q0.1-exceedance images. It
+  also fits the central 51x25-pixel mean crop with an axis-aligned 2-D Gaussian
+  and logs RMSE, absolute sigmas, and sigma multiples relative to the supervised
+  normal/width target. This observer does not change losses, refinement,
+  checkpoint selection, crops, or EMA evaluation.
+
 ## Reported combined-distance mean (user override 2026-09-14)
 
 - At each aggregation scope (scroll, collection, paired fiber, pooled total),
