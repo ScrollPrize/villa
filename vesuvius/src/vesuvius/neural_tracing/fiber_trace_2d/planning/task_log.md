@@ -2,6 +2,9 @@
 
 - Merged the committed `fiber-exp5` reviewed-benchmark base (`00eb345bd`),
   including native v4/editor-hint parsing, rather than maintaining a local port.
+- The first periodic integrated trace reached update 35400 but failed against
+  the stale pre-merge native binary. Rebuilt from the merged source and advanced
+  the resume pointer to the already-written update-35400 checkpoint.
 
 - Reviewed-v3 contains 91 truncated eligible pieces / 182 directions, derived
   from 46 source-run identifiers and 36 original source fibers.
