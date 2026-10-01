@@ -66,6 +66,7 @@ struct Attributes {
     uint64_t size = 0;
     uint32_t permissions = 0;
     bool hasSize = false;
+    bool hasPermissions = false;
 };
 Attributes attributes(Packet& p)
 {
@@ -79,8 +80,10 @@ Attributes attributes(Packet& p)
         p.integer();
         p.integer();
     }
-    if (flags & 4)
+    if (flags & 4) {
         a.permissions = p.integer();
+        a.hasPermissions = true;
+    }
     if (flags & 8) {
         p.integer();
         p.integer();
@@ -380,14 +383,17 @@ public:
                 if (!path.endsWith('/'))
                     path += '/';
                 child.setPath(path + name);
-                if ((a.permissions & 0170000) == 0120000) {
+                const bool unknownType = !a.hasPermissions || (a.permissions & 0170000) == 0;
+                if (unknownType || (a.permissions & 0170000) == 0120000) {
                     try {
                         a = stat(child.path().toUtf8());
                     } catch (const StatusError& e) {
-                        if (e.status != 2 && e.status != 3)
+                        if (unknownType || (e.status != 2 && e.status != 3))
                             throw;
                     }
                 }
+                if (!a.hasPermissions || (a.permissions & 0170000) == 0)
+                    throw std::runtime_error("SFTP server did not supply an entry type for " + child.path().toStdString());
                 const bool directory = (a.permissions & 0170000) == 0040000;
                 if (directory)
                     child.setPath(child.path() + '/');

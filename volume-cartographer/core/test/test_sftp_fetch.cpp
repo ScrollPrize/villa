@@ -152,7 +152,10 @@ int server(int argc, char** argv)
                 continue;
             }
             auto out = reply(105, id);
-            attrs(out, false, path == "/large" ? 2 * 1024 * 1024 : 100000);
+            if (path.find("/unknown-type/") == 0)
+                integer(out, 0);
+            else
+                attrs(out, path.find("zarr") != std::string::npos, path == "/large" ? 2 * 1024 * 1024 : 100000);
             packet(out);
         } else if (type == 3 || type == 11) {
             listed = false;
@@ -191,7 +194,13 @@ int server(int argc, char** argv)
             for (const auto& name : {".", "volume space.zarr", "file#%.json"}) {
                 string(out, name);
                 string(out, "ignored longname");
-                attrs(out, std::string(name).find("zarr") != std::string::npos);
+                if (path == "/no-permissions" || path == "/unknown-type")
+                    integer(out, 0);
+                else if (path == "/no-type-bits") {
+                    integer(out, 4);
+                    integer(out, 0755);
+                } else
+                    attrs(out, std::string(name).find("zarr") != std::string::npos);
             }
             packet(out);
         } else
@@ -289,11 +298,19 @@ TEST_CASE("Persistent SFTP reads ranges listing missing and errors")
     REQUIRE(f.open(QIODevice::ReadOnly));
     CHECK(f.readAll() == "start\n");
     f.close();
+    for (const auto* path : {"/no-permissions", "/no-type-bits"}) {
+        const auto listing = utils::list_sftp_directory(base + path);
+        REQUIRE(listing.size() == 2);
+        CHECK(listing[0].directory);
+        CHECK(listing[0].url == base + path + "/volume%20space.zarr/");
+        CHECK_FALSE(listing[1].directory);
+    }
     CHECK_FALSE(client.get(base + "/broken").ok());
     CHECK(client.get(base + "/data").ok());
     REQUIRE(f.open(QIODevice::ReadOnly));
     CHECK(f.readAll() == "start\nstart\n");
     f.close();
+    CHECK_THROWS_AS(utils::list_sftp_directory(base + "/unknown-type"), std::runtime_error);
     CHECK_THROWS(client.put(base + "/data", {}));
     CHECK_FALSE(client.get(base + "/malformed").ok());
     {
