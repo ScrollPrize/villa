@@ -103,6 +103,9 @@ def test_every_optimizer_update_reports_point_counts_without_detailed_metrics():
     model = DirectFollower(config())
     data = batch(model.cfg)
     data['source'] = torch.tensor([0, 2])
+    data['gt_unperturbed'] = torch.tensor([True, False])
+    data['gt_perturbed'] = torch.tensor([False, False])
+    data['replay_correct_continuation'] = torch.tensor([False, True])
     data['ct_frame_rejected_batches'] = torch.tensor([3, 0])
     data['x'].update(ct_frame_source=torch.tensor([0, 2]),
                      ct_frame_energy=torch.tensor([.2, 0.]), ct_frame_gap=torch.tensor([.8, 0.]),
@@ -115,6 +118,8 @@ def test_every_optimizer_update_reports_point_counts_without_detailed_metrics():
     metrics = optimizer_update(model,ema,opt,[data],1,.001,compute_metrics=False)
     assert 'fixed_fraction' not in metrics
     assert metrics['fresh_fraction'] == metrics['recent_fraction'] == .5
+    assert metrics['gt_unperturbed_fraction'] == metrics['replay_correct_continuation_fraction'] == .5
+    assert metrics['gt_perturbed_fraction'] == 0.
     assert 'decisions' not in metrics
     assert metrics['refinement_attempts_mean'] == 1.
     assert metrics['refinement_attempts_sum'] == 2
@@ -131,6 +136,7 @@ def test_every_optimizer_update_reports_point_counts_without_detailed_metrics():
     row = dict(step=50, geometry=1., loss=1., lr=.001, interval=summary, n_future=4, tolerance=1.5,
                interval_update_seconds=1., interval_data_seconds=.1, interval_samples_per_second=4.)
     printed = format_training_log(row)
+    assert 'clean GT 50.0% / light GT 0.0% / correct continuation replay 50.0%' in printed
     assert 'current 2/4 fallbacks (0 transported, 2 deterministic); mean gap 0.400' in printed
     assert 'history 4/6 fallbacks (2 transported, 2 deterministic); mean gap 0.200' in printed
     assert sum(metrics[k] for k in ('point_correct_count','point_wrong_count','point_unknown_count')) == 8

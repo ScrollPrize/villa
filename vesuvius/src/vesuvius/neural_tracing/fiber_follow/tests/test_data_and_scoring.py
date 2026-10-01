@@ -88,6 +88,62 @@ def make_states(f, z=0, offtrack=False):
         offtrack=[offtrack], hard=[offtrack], exploratory=[False])
 
 
+@pytest.mark.parametrize('reverse', [False, True])
+@pytest.mark.parametrize('t', [0., 2.5, 60.])
+def test_light_gt_is_bounded_keeps_seed_full_history_and_gt_targets(reverse, t):
+    f = fiber()
+    cfg = replace(sample_config(), full_observed_history=True, no_history_prob=1.,
+                  short_history_prob=1., history_jitter=20., history_drift=20., history_wobble=20.)
+    clean = D.make_sample(f, t, reverse, cfg, np.random.default_rng(0), perturb=False)
+    for seed in range(20):
+        item = D.make_sample(f, t, reverse, cfg, np.random.default_rng(seed),
+                             perturb=False, light_perturbation=(.5, 2.))
+        np.testing.assert_array_equal(item['hmask'], clean['hmask'])
+        np.testing.assert_allclose(item['seed_pos'], clean['seed_pos'], atol=1e-12, rtol=0)
+        delta = item['observed_path']-clean['observed_path']
+        assert np.linalg.norm(delta, axis=1).max() <= .5+1e-12
+        assert np.linalg.norm(item['pos']-clean['pos']) <= .5+1e-12
+        assert np.dot(item['frame'][:, 2], clean['frame'][:, 2]) >= np.cos(np.deg2rad(2.))-1e-12
+        # Old observations, including the seed, are untouched; the tip moves smoothly.
+        old = np.linalg.norm(clean['observed_path']-clean['pos'], axis=1) >= 32.
+        np.testing.assert_array_equal(delta[old], np.zeros_like(delta[old]))
+        target = item['fut_local'] @ item['frame'].T+item['pos']
+        expected = clean['fut_local'] @ clean['frame'].T+clean['pos']
+        np.testing.assert_allclose(target, expected, atol=1e-6)
+
+
+@pytest.mark.parametrize('reverse', [False, True])
+@pytest.mark.parametrize('replay_options', [dict(correct_replay_only=True), dict(replay_continuation_fraction=.8)])
+def test_correct_replay_uses_committed_prefix_and_supervises_only_beyond_tip(reverse, replay_options):
+    from types import SimpleNamespace
+    f, cfg = fiber(), sample_config()
+    sign = -1 if reverse else 1
+    prefix = np.c_[50+sign*np.arange(-4, 1), np.full(5, .2), np.zeros(5)]
+    frame = frame_from_heading(np.array([sign, 0., 0.]))
+    op = D.OnPolicyStates(manifest=D.fiber_manifest([f]), fiber_idx=[0], t=[50.], reverse=[reverse],
+        pos=prefix[-1:], frame=frame[None], hist=prefix[-2::-1][None], hmask=np.ones((1, 4)),
+        offtrack=[False], hard=[False], exploratory=[False], drift=[.2], travelled=[4.],
+        seed_pos=prefix[:1], seed_valid=[True], seq_start=[0], seq_end=[5],
+        # The archive can contain later points, but the row must never expose them.
+        track_pos=np.concatenate((prefix, [[99., 7., 0.]])))
+
+    def reject_replacement(*args):
+        raise AssertionError('Correct replay must never be synthetically replaced')
+
+    ds = D.FollowDataset([f], None, cfg, None, **replay_options,
+        batch_builder=SimpleNamespace(replace_replay=reject_replacement))
+    item = ds.replay_item((2, 0, op, 0), np.random.default_rng(1))
+    np.testing.assert_array_equal(item['observed_path'], prefix)
+    np.testing.assert_array_equal(item['seed_pos'], prefix[0])
+    assert item['seed_valid']
+    assert item['replay_correct_continuation']
+    np.testing.assert_allclose(item['hist_local'] @ frame.T+item['pos'], prefix[-2::-1])
+    target = item['fut_local'] @ frame.T+item['pos']
+    np.testing.assert_allclose(target[:, 0], 50+sign*cfg.future_s)
+    np.testing.assert_allclose(target[:, 1:], 0.)
+    assert item['fmask'].all() and not item['offtrack']
+
+
 def decision_at(x, travelled, previous=None, would_stop=False):
     pos = np.array([x, 0., 0.])
     return dict(pos=pos, frame=frame_from_heading(np.array([1., 0, 0])), hist=np.zeros((4, 3)),

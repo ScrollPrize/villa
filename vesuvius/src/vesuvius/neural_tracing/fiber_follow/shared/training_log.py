@@ -19,7 +19,9 @@ class DirectTrainingInterval:
     """Pool counts and weight decision-normalized means by supervised decisions."""
     means = ('loss', 'geometry', 'confidence_loss', 'fresh_fraction',
              'recent_fraction', 'bank_wrong_continuation_fraction',
-             'bank_following_fraction', 'decision_pair_fraction', 'refinement_attempts_mean')
+             'bank_following_fraction', 'decision_pair_fraction', 'refinement_attempts_mean',
+             'gt_unperturbed_fraction', 'gt_perturbed_fraction', 'replay_correct_continuation_fraction',
+             'real_wrong_turn_fraction', 'real_wrong_turn_pre_switch_fraction', 'light_gt_replay_fraction')
     counts = tuple(p+'_'+s for p in ('ct_frame', 'history_frame')
                    for s in ('count', 'transported', 'deterministic', 'energy_sum', 'gap_sum')) + (
               'ct_frame_rejected_batches', 'error_sum', 'geometry_count', 'point_correct_count', 'point_wrong_count',
@@ -134,8 +136,18 @@ def _interval_training_lines(row):
                  (('fresh','fresh_fraction'), ('recent','recent_fraction'),
                   ('wrong turns','bank_wrong_continuation_fraction'), ('following','bank_following_fraction'),
                   ('pairs','decision_pair_fraction'))))
+    if any(m.get(k, 0) for k in ('gt_unperturbed_fraction', 'gt_perturbed_fraction', 'replay_correct_continuation_fraction')):
+        lines.append(f"  data detail (% of all): clean GT {m['gt_unperturbed_fraction']:.1%}"
+                     f" / light GT {m['gt_perturbed_fraction']:.1%}"
+                     f" / correct continuation replay {m['replay_correct_continuation_fraction']:.1%}")
+        if m.get('light_gt_replay_fraction', 0):
+            lines[-1] += f" (light-GT replacement {m['light_gt_replay_fraction']:.1%})"
 
     failures = ('bank_switch', 'pre_switch', 'premature_stop', 'endpoint_overshoot')
+    if m.get('real_wrong_turn_fraction', 0):
+        lines.append(f"  wrong turns (% of all): real {m['real_wrong_turn_fraction']:.1%}"
+                     f" (pre-switch {m['real_wrong_turn_pre_switch_fraction']:.1%})"
+                     f" / synthetic {max(0., m['bank_wrong_continuation_fraction']-m['real_wrong_turn_fraction']):.1%}")
     if any(m.get('replay_'+name+'_endpoints', 0) for name in failures):
         lines.append('  replay failure endpoints: '+' / '.join(
             f'{name.replace("_", " ")} {int(m.get("replay_"+name+"_endpoints", 0))}' for name in failures))

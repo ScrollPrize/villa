@@ -222,7 +222,9 @@ def resolve_token_only(requested, checkpoint=None):
 
 
 def load_checkpoint(path,device='cuda'):
-    ck = read_checkpoint(path,ARCHITECTURES,device)
+    # Collection shares a GPU with training. Keep duplicate weights and any
+    # optimizer state on the CPU; only the EMA inference model needs VRAM.
+    ck = read_checkpoint(path,ARCHITECTURES,'cpu')
     cfg = checkpoint_config(ck)
     model = build_model(cfg).to(device,memory_format=conv_memory_format(device))
     model.load_state_dict(ck['ema'])
@@ -463,6 +465,11 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
                 sums[key] = sums.get(key, 0)+int(((cpu['failure_kind'] == kind) & endpoint).sum())
         if 'decision_requested' in cpu:
             requested_decisions += float(cpu['decision_requested'].sum())
+        for name in ('gt_unperturbed', 'gt_perturbed', 'replay_correct_continuation',
+                     'real_wrong_turn', 'real_wrong_turn_pre_switch', 'light_gt_replay'):
+            if name in cpu:
+                key = name+'_fraction'
+                sums[key] = sums.get(key, 0.)+float(cpu[name].sum())/denominator
         if 'negative_bank_shards' in cpu:
             low,high = int(cpu['negative_bank_shards'].min()),int(cpu['negative_bank_shards'].max())
             identity['negative_bank_shards_min'] = min(identity.get('negative_bank_shards_min',low),low)
@@ -594,7 +601,21 @@ def build_parser():
     ap.add_argument('--fresh-fraction', type=float, default=.7,
                     help='Fresh-versus-replay weight for hard-source allocation; clean GT share is --clean-fraction')
     ap.add_argument('--clean-fraction', type=float, default=.8,
-                    help='Unconditional clean GT share; remaining budget mixes pairs, switches, following and replay')
+                    help='Reserved GT share; clean unless --gt-perturb-probability is nonzero')
+    ap.add_argument('--gt-perturb-probability', type=float, default=0.,
+                    help='Fraction of reserved GT examples receiving bounded light perturbations')
+    ap.add_argument('--gt-perturb-max-offset', type=float, default=.5,
+                    help='Maximum light GT lateral offset in tracing voxels; seed and older history preserved')
+    ap.add_argument('--gt-perturb-max-angle-deg', type=float, default=2.,
+                    help='Maximum absolute light GT heading perturbation in degrees')
+    ap.add_argument('--correct-replay-only', action='store_true',
+                    help='Replay only nondeparted, nonexploratory committed prefixes with real model progress')
+    ap.add_argument('--replay-continuation-fraction', type=float,
+                    help='Replay share of correct committed prefixes; remainder uses failures, overriding --replay-failure-fraction')
+    ap.add_argument('--prefer-real-wrong-turns', action='store_true',
+                    help='Fill wrong-turn slots from confirmed nonexploratory replay switches before synthetic fallback')
+    ap.add_argument('--prefer-replay-for-light-gt', action='store_true',
+                    help='Use correct continuation replay in light-GT slots when available; otherwise retain light GT')
     ap.add_argument('--negative-bank', default=str(Path(__file__).parents[1]/'output'/'neighbor_samples_r0_32_l80_160_v2'), help='Shared live bank for foreign-fiber masks, wrong continuations and following supervision')
     ap.add_argument('--near-negative-bank', help='Additional bank of validated nearby negative relationships')
     ap.add_argument('--following-bank', help='Following path source (default: negative-bank)')
@@ -830,6 +851,9 @@ def main(argv=None):
                    'negative_bank_refresh_seconds','negative_bank_cache_mb','activation_checkpointing',
                    'history_grad_clip','rest_grad_clip','presence_dropout','blur_probability','blur_sigma',
                    'decision_fraction','decision_choice_fraction','bank_following_probability','fresh_fraction','clean_fraction',
+                   'correct_replay_only','memory_switch_probability',
+                   'gt_perturb_probability','gt_perturb_max_offset','gt_perturb_max_angle_deg',
+                   'replay_continuation_fraction','prefer_real_wrong_turns','prefer_replay_for_light_gt',
                    'bank_hard_fraction','replay_failure_fraction','bank_switch_tolerance','bank_own_tolerance',
                    'n_commit','tolerance'}
         for key,value in vars(args).items():
@@ -879,7 +903,7 @@ def main(argv=None):
     progress('Loading replay banks and preparing data loader')
     caches = [OnPolicyStates.load(p) for p in replay_paths]
     collector = OnlineCollector(out/'dagger', args.fibers, args.val_z, args.dagger_device or args.device,
-        every=args.dagger_every, max_seeds=args.dagger_seeds, seed=args.seed, replay_keep=args.replay_keep,
+        every=args.dagger_every, max_seeds=args.dagger_seeds, batch=1, seed=args.seed, replay_keep=args.replay_keep,
         initial=[c._dir for c in caches], trace_len=args.dagger_trace_len, n_commit=args.n_commit,
         collector_module='vesuvius.neural_tracing.fiber_follow.regression.collect',
         extra_args=('--after', args.dagger_after, '--bank-switch-tolerance', args.bank_switch_tolerance,
@@ -891,7 +915,12 @@ def main(argv=None):
     dataset = FollowDataset(train_f, spec, sample, band, chunk=args.batch, seed=args.seed+done,
         cache_bytes=int(args.worker_cache_gb*(1 << 30)), onpolicy=caches,
         replay_index=str(collector.index), batch_builder=builder, additional_crops=(), fresh_fraction=args.fresh_fraction,
-        clean_fraction=args.clean_fraction)
+        clean_fraction=args.clean_fraction, correct_replay_only=args.correct_replay_only,
+        replay_continuation_fraction=args.replay_continuation_fraction,
+        gt_perturb_probability=args.gt_perturb_probability, gt_perturb_max_offset=args.gt_perturb_max_offset,
+        gt_perturb_max_angle_deg=args.gt_perturb_max_angle_deg,
+        prefer_real_wrong_turns=args.prefer_real_wrong_turns,
+        prefer_replay_for_light_gt=args.prefer_replay_for_light_gt)
     dataset_provenance = None
     if dataset_document:
         from .datasets import build_mixed_dataset
@@ -909,7 +938,7 @@ def main(argv=None):
             (out/f'validation_{source["name"]}.json').write_text(json.dumps(source_dataset.validation_manifest,indent=2)+'\n')
             collectors.append((source['name'],OnlineCollector(out/'dagger'/source['name'],
                 source['path'], (0,1), args.dagger_device or args.device,
-                every=args.dagger_every,max_seeds=args.dagger_seeds,seed=args.seed,replay_keep=args.replay_keep,
+                every=args.dagger_every,max_seeds=args.dagger_seeds,batch=1,seed=args.seed,replay_keep=args.replay_keep,
                 initial=[c._dir for c in source_dataset.onpolicy],trace_len=args.dagger_trace_len,n_commit=args.n_commit,
                 collector_module='vesuvius.neural_tracing.fiber_follow.regression.collect',
                 extra_args=('--dataset-name',source['name'],'--after',args.dagger_after,
@@ -950,7 +979,18 @@ def main(argv=None):
                     trainable_parameters=sum(p.numel() for p in model.parameters() if p.requires_grad)))
     log.record(dict(step=done,event='identity_sampling',architecture=model.architecture,
         source_sampling=(dataset.datasets[0] if dataset_document else dataset).sampling_probabilities(),
-        clean_gt_geometry='unperturbed position, tangent and complete available GT history; photometric augmentation only',
+        clean_gt_geometry=('bounded light GT perturbations on the configured subset; complete history retained'
+                           if args.gt_perturb_probability else
+                           'unperturbed position, tangent and complete available GT history; photometric augmentation only'),
+        gt_perturbation=dict(probability=args.gt_perturb_probability, max_offset=args.gt_perturb_max_offset,
+                            max_angle_deg=args.gt_perturb_max_angle_deg,
+                            unperturbed_total_fraction=args.clean_fraction*(1-args.gt_perturb_probability)),
+        correct_replay_only=args.correct_replay_only,
+        replay_continuation_fraction=args.replay_continuation_fraction,
+        prefer_real_wrong_turns=args.prefer_real_wrong_turns,
+        prefer_replay_for_light_gt=args.prefer_replay_for_light_gt,
+        replay_collection=dict(batch=1, max_concurrent_collectors=1,
+                               device=args.dagger_device or args.device, checkpoint_storage='cpu'),
         history_sampling_revision=SAMPLING_REVISION, frame_policy=FRAME_POLICY,
         history_policy='live_observed_slabs',sampling=asdict(identity_sampling),
         negative_bank_path=str(negative_bank.root),negative_bank_provenance=negative_bank.provenance(),

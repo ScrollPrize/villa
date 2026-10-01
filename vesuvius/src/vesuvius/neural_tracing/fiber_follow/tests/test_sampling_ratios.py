@@ -10,14 +10,16 @@ from vesuvius.neural_tracing.fiber_follow.regression.data import IdentitySamplin
 
 
 @pytest.mark.parametrize('available', [True, False])
-def test_clean_budget_is_unconditional_and_hard_fallback_stays_clean(monkeypatch, available):
+@pytest.mark.parametrize('light_probability', [0., .25])
+def test_clean_budget_is_unconditional_and_hard_fallback_stays_clean(monkeypatch, available, light_probability):
     import vesuvius.neural_tracing.fiber_follow.shared.data as module
     monkeypatch.setattr(module, 'FiberVolume', lambda *a, **kw: None)
     monkeypatch.setattr(module, 'crop_local_grid', lambda crop: np.zeros((1, 3)))
 
-    def sample(*args, perturb=True):
+    def sample(*args, perturb=True, light_perturbation=None):
         assert not perturb
-        return dict(allowed=True, clean=True)
+        assert light_perturbation in (None, (.5, 2.))
+        return dict(allowed=True, clean=light_perturbation is None)
 
     monkeypatch.setattr(module, 'make_sample', sample)
 
@@ -39,24 +41,38 @@ def test_clean_budget_is_unconditional_and_hard_fallback_stays_clean(monkeypatch
 
     ds = FollowDataset([SimpleNamespace(length=100.)], None,
         SimpleNamespace(crop=None, future_s=[16.]), None, chunk=12,
-        batch_builder=Builder(), fresh_fraction=.9, clean_fraction=.8)
+        batch_builder=Builder(), fresh_fraction=.9, clean_fraction=.8,
+        gt_perturb_probability=light_probability)
     monkeypatch.setattr(ds, 'state_allowed', lambda item: item['allowed'])
     monkeypatch.setattr(ds, 'draw_replay', lambda rng, force=False: 'replay' if available else None)
     monkeypatch.setattr(ds, 'replay_item', lambda *args: dict(source=2, allowed=True))
     batches = iter(ds)
     counts = np.zeros(6)
+    light = 0
     for _ in range(2000):
         items = next(batches)['items']
         assert len(items) == 12
         assert sum(i['source'] == 5 for i in items) % 2 == 0
         for item in items:
             if item['source'] == 0:
-                assert item['clean']
+                assert item['clean'] == (not item['gt_perturbed']) == item['gt_unperturbed']
+                light += item['gt_perturbed']
             counts[item['source']] += 1
     probabilities = ds.sampling_probabilities()
     expected = ([.8, 0., probabilities['recent'], probabilities['memory_switch'], 0., probabilities['decision']]
                 if available else [1., 0., 0., 0., 0., 0.])
     np.testing.assert_allclose(counts/counts.sum(), expected, atol=.015)
+    assert light/counts[0] == pytest.approx(light_probability, abs=.015)
+
+
+def test_70_10_10_10_source_budget():
+    ds = FollowDataset([SimpleNamespace(length=100.)], None, None, None,
+        clean_fraction=.7, fresh_fraction=.75, gt_perturb_probability=.25,
+        batch_builder=SimpleNamespace(sampling=IdentitySampling(
+            decision_fraction=.2, bank_following_probability=0., memory_switch_probability=1/3)))
+    assert ds.sampling_probabilities() == pytest.approx(
+        dict(clean=.7, decision=.1, bank_following=0., memory_switch=.1, recent=.1))
+    assert ds.clean_fraction*(1-ds.gt_perturb_probability) > .5
 
 
 @pytest.mark.parametrize('value', [-.1, 1.1, float('nan')])
@@ -177,3 +193,35 @@ class SamplingRatiosTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+@pytest.mark.parametrize('available', [True, False])
+def test_light_gt_slots_prefer_correct_replay_and_preserve_clean_gt(monkeypatch, available):
+    import vesuvius.neural_tracing.fiber_follow.shared.data as module
+    monkeypatch.setattr(module, 'FiberVolume', lambda *a, **kw: None)
+    monkeypatch.setattr(module, 'crop_local_grid', lambda crop: np.zeros((1, 3)))
+    monkeypatch.setattr(module, 'make_sample', lambda *a, **kw: dict(allowed=True))
+    builder = SimpleNamespace(sampling=IdentitySampling(decision_fraction=0., bank_following_probability=0.),
+                              __call__=lambda items, vol: dict(items=items))
+    class Builder:
+        sampling = builder.sampling
+        def __call__(self, items, vol):
+            return dict(items=items)
+    ds = FollowDataset([SimpleNamespace(length=100.)], None,
+        SimpleNamespace(crop=None, future_s=[16.]), None, chunk=10, batch_builder=Builder(),
+        clean_fraction=1., gt_perturb_probability=.25, prefer_replay_for_light_gt=True)
+    monkeypatch.setattr(ds, 'state_allowed', lambda item: True)
+    monkeypatch.setattr(ds, 'correct_continuation_item', lambda rng:
+        dict(source=2, replay_correct_continuation=True, light_gt_replay=True) if available else None)
+    counts = dict(clean=0, light=0, replay=0)
+    batches = iter(ds)
+    for _ in range(1000):
+        for item in next(batches)['items']:
+            if item['source'] == 2:
+                assert item['replay_correct_continuation'] and item['light_gt_replay']
+                counts['replay'] += 1
+            else:
+                counts['light' if item['gt_perturbed'] else 'clean'] += 1
+    assert counts['clean']/10000 == pytest.approx(.75, abs=.02)
+    assert counts['replay' if available else 'light']/10000 == pytest.approx(.25, abs=.02)
+    assert counts['light' if available else 'replay'] == 0

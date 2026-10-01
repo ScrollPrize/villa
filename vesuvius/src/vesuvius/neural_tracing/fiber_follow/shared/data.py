@@ -243,7 +243,7 @@ def plane_targets(p, s, t, t_end, pos, frame, planes):
 
 
 def make_sample(fiber: TracedFiber, t: float, reverse: bool, cfg: SampleConfig, rng: np.random.Generator,
-                *, perturb=True):
+                *, perturb=True, light_perturbation=None):
     """Sample GT geometry; perturb=False preserves position, tangent and history."""
     p, s = fiber.points, fiber.s
     if reverse:
@@ -255,10 +255,21 @@ def make_sample(fiber: TracedFiber, t: float, reverse: bool, cfg: SampleConfig, 
     # lateral offset perpendicular to tau
     fr = frame_from_heading(tau)
     lat = rng.normal(size=2) * _mix(rng, cfg.lateral_sigmas, cfg.lateral_probs) if perturb else np.zeros(2)
+    if light_perturbation is not None:
+        if perturb:
+            raise ValueError('Light perturbation requires the legacy perturbations to be disabled')
+        max_offset, max_angle = light_perturbation
+        if t < cfg.history_step:
+            max_offset = max_angle = 0.  # A seed-only state has no committed tip to move.
+        azimuth = rng.uniform(0, 2*np.pi)
+        lat = max_offset*np.sqrt(rng.random())*np.array([np.cos(azimuth), np.sin(azimuth)])
     delta = fr[:, 0] * lat[0] + fr[:, 1] * lat[1]
     pos = g + delta
     ang = math.radians(_mix(rng, cfg.angle_sigmas_deg, cfg.angle_probs)) * rng.normal() if perturb else 0.
     axis_ang = rng.uniform(0, 2 * np.pi) if perturb else 0.
+    if light_perturbation is not None:
+        ang = math.radians(rng.uniform(-max_angle, max_angle))
+        axis_ang = rng.uniform(0, 2*np.pi)
     ax = math.cos(axis_ang) * fr[:, 0] + math.sin(axis_ang) * fr[:, 1]
     heading = normalize(math.cos(ang) * tau + math.sin(ang) * ax)
     frame = frame_from_heading(heading)  # provisional basis; CT resolves crop roll before sampling
@@ -303,6 +314,13 @@ def make_sample(fiber: TracedFiber, t: float, reverse: bool, cfg: SampleConfig, 
     drift = fr[:,:2] @ displacement
     hist += ramp[:,None]*drift
     pos += drift
+    if light_perturbation is not None:
+        # Move only the recent tip smoothly. Preserve the earliest observation
+        # (the seed), including on startup prefixes shorter than 32 voxels.
+        valid = np.flatnonzero(hmask)
+        span = min(32., float(k[valid[-1]])) if len(valid) else 0.
+        ramp = np.clip(1-k/max(span, 1e-9), 0, 1)
+        hist += (ramp*ramp*(3-2*ramp))[:,None]*delta
     observed = np.concatenate((hist[hmask > 0][::-1], pos[None]))
     seed = observed_seed(pos, frame, (hist-pos) @ frame, hmask)
     return dict(_generated_original_history=True, _seed_original_certified=True,
@@ -353,12 +371,33 @@ DRIFT_BANDS = ((0.,1.), (1.,1.5), (1.5,2.), (2.,3.5))
 REPLAY_FAILURES = ('ordinary', 'bank_switch', 'premature_stop', 'endpoint_overshoot', 'pre_switch')
 
 
-def replay_pools(caches, *, failures=False):
+def replay_pools(caches, *, failures=False, correct_only=False, natural_switch_only=False):
     """Drift/departure strata, optionally split by recorded failure, then fiber."""
     pools = [dict() for _ in range(9 if failures else 5)]
     for op in caches:
         off = np.asarray(op.offtrack,bool)
         kinds = np.asarray(op.failure_kind) if failures else np.zeros(len(op), np.int8)
+        eligible = np.ones(len(op), bool)
+        if natural_switch_only:
+            if not failures:
+                raise ValueError('Natural switches require failure strata')
+            recorded = ((op.seq_start >= 0) & (op.seq_end > op.seq_start+1)
+                        & np.isfinite(op.travelled) & (op.travelled > 0))
+            # A pre-switch row alone may precede a later forced exploration.
+            # Require a witnessed, nonexploratory switched state on that trace.
+            natural = recorded & ~op.exploratory & off & (op.failure_kind == 1)
+            traces = np.unique(op.seq_start[natural])
+            eligible &= (recorded & ~op.exploratory & np.isin(op.seq_start, traces)
+                         & np.isin(op.failure_kind, (1, 4)))
+        if correct_only:
+            # Collector departures are sticky across the entire committed prefix;
+            # exploration remains marked after the first forced move. Hard rows
+            # also cover stops and retrospective pre-failure windows. Require real
+            # model progress: skip zero-progress states and unknown old caches.
+            # Eligible prefixes still include their original annotated seed.
+            eligible = (~off & ~np.asarray(op.hard, bool) & ~np.asarray(op.exploratory, bool)
+                        & (np.asarray(op.failure_kind) == 0) & np.isfinite(op.travelled)
+                        & (op.travelled > 0) & (op.seq_start >= 0) & (op.seq_end > op.seq_start+1))
         for band in range(len(pools)):
             if band >= 5:
                 member = kinds == band-4
@@ -367,6 +406,7 @@ def replay_pools(caches, *, failures=False):
             else:
                 lo, hi = DRIFT_BANDS[band]
                 member = ~off & (kinds == 0) & (op.drift>=lo) & (op.drift<hi)
+            member &= eligible
             for fi in np.unique(op.fiber_idx[member]):
                 idx = np.flatnonzero(member & (op.fiber_idx==fi))
                 pools[band].setdefault(int(fi),[]).append((op,idx))
@@ -387,13 +427,33 @@ class FollowDataset(torch.utils.data.IterableDataset):
     def __init__(self, fibers, vol_spec, cfg, exclude_band, chunk=2, seed=0,
                  cache_bytes=1 << 30, onpolicy=None,
                  window=256., pool_size=12, window_samples=192, replay_index=None, refresh_chunks=8,
-                 batch_builder=None, additional_crops=(), fresh_fraction=.7, clean_fraction=None):
+                 batch_builder=None, additional_crops=(), fresh_fraction=.7, clean_fraction=None,
+                 correct_replay_only=False, replay_continuation_fraction=None,
+                 gt_perturb_probability=0., gt_perturb_max_offset=.5, gt_perturb_max_angle_deg=2.,
+                 prefer_real_wrong_turns=False, prefer_replay_for_light_gt=False):
         if not np.isfinite(fresh_fraction) or not 0 <= fresh_fraction <= 1:
             raise ValueError('Fresh fraction must be finite and in [0, 1]')
         self.fresh_fraction = float(fresh_fraction)
         if clean_fraction is not None and (not np.isfinite(clean_fraction) or not 0 <= clean_fraction <= 1):
             raise ValueError('Clean fraction must be finite and in [0, 1]')
         self.clean_fraction = clean_fraction
+        self.correct_replay_only = correct_replay_only
+        self.prefer_real_wrong_turns = prefer_real_wrong_turns
+        self.prefer_replay_for_light_gt = prefer_replay_for_light_gt
+        if replay_continuation_fraction is not None:
+            if not np.isfinite(replay_continuation_fraction) or not 0 <= replay_continuation_fraction <= 1:
+                raise ValueError('Replay continuation fraction must be finite and in [0, 1]')
+            if correct_replay_only:
+                raise ValueError('Choose correct-only replay or a continuation/failure mix')
+        if not np.isfinite(gt_perturb_probability) or not 0 <= gt_perturb_probability <= 1:
+            raise ValueError('GT perturb probability must be finite and in [0, 1]')
+        if any(not np.isfinite(v) or v < 0 for v in (gt_perturb_max_offset, gt_perturb_max_angle_deg)):
+            raise ValueError('GT perturb limits must be finite and nonnegative')
+        if gt_perturb_probability and clean_fraction is None:
+            raise ValueError('Light GT perturbation requires a reserved GT fraction')
+        self.replay_continuation_fraction = replay_continuation_fraction
+        self.gt_perturb_probability = gt_perturb_probability
+        self.gt_perturbation = (gt_perturb_max_offset, gt_perturb_max_angle_deg)
         self.fibers, self.vol_spec, self.cfg, self.exclude = fibers, vol_spec, cfg, exclude_band
         self.chunk, self.seed, self.cache_bytes = chunk, seed, cache_bytes
         self.window, self.pool_size, self.window_samples = window, pool_size, window_samples
@@ -423,14 +483,32 @@ class FollowDataset(torch.utils.data.IterableDataset):
         self.onpolicy = caches
         self.replay_failure_fraction = getattr(getattr(self.batch_builder, 'sampling', None),
                                               'replay_failure_fraction', None)
-        self.recent_pools = replay_pools(caches, failures=self.replay_failure_fraction is not None)
+        self.recent_pools = replay_pools(caches, failures=(self.replay_failure_fraction is not None
+                                                        or self.replay_continuation_fraction is not None),
+                                        correct_only=self.correct_replay_only)
+        self.continuation_pools = (replay_pools(caches, correct_only=True)
+                                   if self.replay_continuation_fraction is not None or self.prefer_replay_for_light_gt else None)
+        self.wrong_turn_pools = (replay_pools(caches, failures=True, natural_switch_only=True)
+                                if self.prefer_real_wrong_turns else None)
         if hasattr(self.batch_builder, 'set_replay'):
             self.batch_builder.set_replay(caches)
 
     def draw_replay(self,rng, *, force=False):
         source = REPLAY_SOURCES['recent'] if force else int(rng.choice((0, REPLAY_SOURCES['recent']),
                                 p=(self.fresh_fraction, 1-self.fresh_fraction)))
-        if self.replay_failure_fraction is None:
+        pools = self.recent_pools
+        if self.replay_continuation_fraction is not None:
+            continuation = rng.random() < self.replay_continuation_fraction
+            pools = self.continuation_pools if continuation else self.recent_pools
+            options = [i for i in (range(4) if continuation else range(4, len(pools))) if pools[i]]
+            if not options and not continuation:
+                pools = self.continuation_pools
+                options = [i for i in range(4) if pools[i]]
+            # Never fill a missing correct-prefix slot with a failed trace.
+            if not options:
+                return None
+            band = int(rng.choice(options))
+        elif self.replay_failure_fraction is None:
             band = 4 if rng.random()<.1 else int(rng.integers(4))
         else:
             failures = [i for i in range(4, len(self.recent_pools)) if self.recent_pools[i]]
@@ -440,14 +518,49 @@ class FollowDataset(torch.utils.data.IterableDataset):
             band = int(rng.choice(options)) if options else 0
         if source == 0:
             return None
-        pool = self.recent_pools[band]
+        pool = pools[band]
         if not pool:
             return None
+        return self.draw_pool(pool, source, band, rng)
+
+    @staticmethod
+    def draw_pool(pool, source, band, rng):
         fi = rng.choice(sorted(pool))
         entries = pool[fi]
         sizes = np.array([len(idx) for _,idx in entries])
         op,idx = entries[rng.choice(len(entries),p=sizes/sizes.sum())]
         return source,band,op,int(rng.choice(idx))
+
+    def wrong_turn_item(self, rng):
+        """Use a real natural switch first; synthetic history is the fallback."""
+        if self.wrong_turn_pools is not None:
+            bands = [i for i in (5, 8) if self.wrong_turn_pools[i]]
+            for _ in range(3 if bands else 0):
+                band = int(rng.choice(bands))
+                draw = self.draw_pool(self.wrong_turn_pools[band], 3, band, rng)
+                item = self.replay_item(draw, rng)
+                if item is not None:
+                    item['real_wrong_turn'] = True
+                    item['real_wrong_turn_pre_switch'] = item['failure_kind'] == 4
+                    return item
+        item = self.batch_builder.memory_switch(self.cfg, rng)
+        if item is not None:
+            item = self.prepare(item, rng)
+            if self.state_allowed(item):
+                return item
+        return None
+
+    def correct_continuation_item(self, rng):
+        bands = [i for i in range(4) if self.continuation_pools[i]]
+        for _ in range(3 if bands else 0):
+            band = int(rng.choice(bands))
+            draw = self.draw_pool(self.continuation_pools[band], REPLAY_SOURCES['recent'], band, rng)
+            item = self.replay_item(draw, rng)
+            if item is not None:
+                item['replay_correct_continuation'] = True
+                item['light_gt_replay'] = True
+                return item
+        return None
 
     def endpoint_requests(self, rng):
         """Reserve paired decisions and bank following before annotation/replay.
@@ -527,7 +640,9 @@ class FollowDataset(torch.utils.data.IterableDataset):
 
     def replay_item(self, draw, rng):
         source,band,op,j = draw
-        if hasattr(self.batch_builder,'replace_replay'):
+        if (source == REPLAY_SOURCES['recent'] and not self.correct_replay_only
+                and not self.prefer_replay_for_light_gt and self.replay_continuation_fraction is None
+                and hasattr(self.batch_builder,'replace_replay')):
             replacement = self.batch_builder.replace_replay(source,band,self.cfg,rng)
             if replacement is not None:
                 replacement = self.prepare(replacement,rng)
@@ -542,6 +657,8 @@ class FollowDataset(torch.utils.data.IterableDataset):
                     fiber_ref=(fi,self.fibers[fi].length-t if reverse else t,reverse))
         item.update({k: getattr(op, k)[j] for k in SEED_FIELDS if hasattr(op, k)})
         item['observed_path'] = op.observed_prefix(j)
+        item['replay_correct_continuation'] = bool(
+            (self.correct_replay_only or self.replay_continuation_fraction is not None) and band < 4)
         from .heading import FRAME_POLICY
         item['frame_policy'] = op.provenance.get('frame_policy', FRAME_POLICY)
         item = self.prepare(item,rng)
@@ -659,12 +776,10 @@ class FollowDataset(torch.utils.data.IterableDataset):
                         items.append(item)
             if requests is not None:
                 for _ in range(requests['memory_switch']):
-                    item = self.batch_builder.memory_switch(cfg, rng)
+                    item = self.wrong_turn_item(rng)
                     if item is not None:
-                        item = self.prepare(item, rng)
-                        if self.state_allowed(item):
-                            self.prefetch_items([item], vol)
-                            items.append(item)
+                        self.prefetch_items([item], vol)
+                        items.append(item)
                 for _ in range(requests['recent']):
                     draw = self.draw_replay(rng, force=True)
                     item = self.replay_item(draw, rng) if draw is not None else None
@@ -704,12 +819,21 @@ class FollowDataset(torch.utils.data.IterableDataset):
                             t = f.length-original_t if rev else original_t
                     else:
                         fi, t, rev = location['fiber'], location['t'], location['reverse']
-                    item = make_sample(self.fibers[fi], t, rev, cfg, rng,
-                                       **({'perturb': False} if requests is not None else {}))
-                    item['source'], item['source_step'], item['stratum'] = 0, -1, -1
-                    item['fiber_ref'] = (int(fi), float(t), bool(rev))
-                    item['location_source'] = location['source'] if location else 0
-                    item = self.prepare(item, rng)
+                    sample_options = {'perturb': False} if requests is not None else {}
+                    gt_perturbed = bool(requests is not None and self.gt_perturb_probability
+                                        and rng.random() < self.gt_perturb_probability)
+                    if gt_perturbed and self.prefer_replay_for_light_gt:
+                        item = self.correct_continuation_item(rng)
+                    if item is None:
+                        if gt_perturbed:
+                            sample_options['light_perturbation'] = self.gt_perturbation
+                        item = make_sample(self.fibers[fi], t, rev, cfg, rng, **sample_options)
+                        item['gt_perturbed'] = gt_perturbed
+                        item['gt_unperturbed'] = requests is not None and not gt_perturbed
+                        item['source'], item['source_step'], item['stratum'] = 0, -1, -1
+                        item['fiber_ref'] = (int(fi), float(t), bool(rev))
+                        item['location_source'] = location['source'] if location else 0
+                        item = self.prepare(item, rng)
                 if self.state_allowed(item):
                     self.prefetch_items([item],vol)
                     items.append(item)
@@ -868,6 +992,9 @@ def collate_targets(items):
         out['source_step'] = st('source_step')
         out['stratum'] = st('stratum')
         out['failure_kind'] = torch.tensor([it.get('failure_kind', 0) for it in items], dtype=torch.long)
+        for key in ('gt_unperturbed', 'gt_perturbed', 'replay_correct_continuation',
+                    'real_wrong_turn', 'real_wrong_turn_pre_switch', 'light_gt_replay'):
+            out[key] = torch.tensor([it.get(key, False) for it in items], dtype=torch.bool)
     return out
 
 

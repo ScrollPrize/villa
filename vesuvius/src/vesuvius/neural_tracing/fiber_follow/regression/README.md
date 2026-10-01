@@ -25,27 +25,83 @@ When resuming, `--lr` may change the base learning rate while retaining AdamW
 moments, EMA, and the existing warmup/cosine schedule position. Omit
 `--reset-optimizer` to preserve that state; the active LR includes cosine decay.
 
-Training reserves `--clean-fraction 0.8` of examples for clean GT. These samples
-use the annotation position and tangent, with all available GT history at the
-configured history spacing. They have no lateral offset, heading noise, history
-drift, wobble, jitter, random history dropout or artificial shortening. Local
-history retains the model's usual point limit; older GT remains available to
-historical slabs. Noise, blur, contrast and brightness augmentation still apply.
+Training reserves `--clean-fraction` of examples for GT (default .8). With
+`--gt-perturb-probability 0` (the default), these samples use the annotation
+position and tangent and all available history: no offsets, heading noise,
+drift, wobble, jitter, history dropout or artificial shortening. Local history
+retains the usual point limit; older history remains available to the slabs.
+Noise, blur, contrast and brightness augmentation still apply to every source.
 
-The remaining 20% is divided among identity pairs, bank following, synthetic
-switch histories and replay, preserving their relative weights from the existing
-sampling options. For the mixed stem launcher this targets 80% clean, 10.7%
-paired decisions, 6.8% switches and 2.5% replay. Allocation is stochastic in
-two-example units; unavailable or rejected hard examples fall back to clean GT,
-so the realized clean fraction can be higher. Logs report the unconditional
-budgets in `identity_sampling.source_sampling`; `fresh_fraction` in training
-intervals measures the realized clean share. Geometry perturbation settings only
-affect legacy samplers and frozen recovery construction, not clean training GT.
-The recovery fixture remains unchanged across resumes.
+The mixed stem launcher uses 70% GT, 10% identity pairs, 10% wrong turns
+and 10% model replay. Its options are:
 
-`--clean-fraction` can change on resume, including for older checkpoints. Resume
-the trainer to apply this policy to an already running job; existing workers do
-not reload Python code or sampling settings.
+```text
+--clean-fraction .7 --gt-perturb-probability .25
+--gt-perturb-max-offset .5 --gt-perturb-max-angle-deg 2
+--decision-fraction .2 --fresh-fraction .75 --memory-switch-probability .3333333333333333
+--bank-following-probability 0 --replay-continuation-fraction .8 --prefer-real-wrong-turns
+--prefer-replay-for-light-gt --batch 10 --grad-steps 1
+```
+
+The source weights normalize into the 30% non-GT budget, producing 10% each.
+`--prefer-real-wrong-turns` fills wrong-turn slots from source-local replay of
+confirmed natural switches first, with synthetic wrong turns as fallback.
+Eligible traces must contain a recorded, nonexploratory switched state. Samples
+balance available pre-switch and post-switch states, then fibers; exploratory
+states and prefixes preceding only a forced switch are excluded. Original seed,
+history and geometry are retained. Before-switch samples teach continuation;
+after-switch samples teach stopping. Missing or rejected real proposals fall
+back to synthetic proposals, then GT. The separate 10% replay budget is unchanged.
+`real_wrong_turn_fraction` and `real_wrong_turn_pre_switch_fraction` report actual
+shares of all training; `bank_wrong_continuation_fraction` includes both real and
+synthetic wrong-turn slots for compatibility with existing logs.
+
+With `--prefer-replay-for-light-gt`, light-GT slots first try source-local correct
+continuation replay, retaining its actual seed and history without perturbation.
+Unavailable or rejected replay falls back to light GT. Thus the nominal 17.5%
+light-GT allocation becomes additional correct replay when available: 52.5%
+untouched GT, 25.5% correct replay, 2% failure replay, 10% identity and 10% wrong
+turns. `light_gt_replay_fraction` reports the replaced share separately.
+
+The mixed stem launcher uses batch 10, grad steps 1. Collection explicitly uses
+batch 1 and at most one concurrent collector across sources. Inference checkpoint
+storage stays on CPU; only the EMA inference model transfers to the requested
+GPU. `scripts/stop.sh RUN_NAME` freezes the trainer and its descendants, includes
+orphaned collectors identified by this run's checkpoint AND output paths, stops
+the owned process trees, and verifies no matching collectors remain before a
+restart proceeds. Other runs' collectors are excluded.
+
+Without available replay, only one quarter of gt samples receive light perturbation: 52.5% of all examples
+are untouched GT and 17.5% are lightly perturbed GT. Offset is uniform in a
+lateral disk of radius .5 tracing voxels; heading tilt is bounded by 2 degrees.
+The offset blends smoothly into only the last 32 voxels of history, preserving
+the original seed and older observations, including on shorter startup prefixes.
+Seed-only states remain untouched. There is no history dropout, shortening,
+independent point jitter or wobble. Future labels still come from the GT fiber.
+
+`--replay-continuation-fraction .8` reserves 80% of replay for correct committed
+prefixes and 20% for recorded failures (8% and 2% of total training). It overrides
+`--replay-failure-fraction`; without it, legacy replay sampling stays unchanged.
+Continuation eligibility requires positive model travel, a recorded prefix, no
+collector-confirmed departure, no exploration, and no hard/failure label
+(including pre-failure windows). Correctness follows the collector's
+original-fiber checks. Replay preserves the original seed, actual committed
+prefix, pose and historical slabs without synthetic perturbation or replacement.
+Supervision covers the forward segment beyond the current tip; future trace
+vertices never enter the input. Missing correct replay falls back to GT, never
+failed replay. Missing failures may use correct continuation. The optional
+`--correct-replay-only` selects exclusively correct prefixes and cannot be
+combined with `--replay-continuation-fraction`.
+
+Allocation is stochastic in two-example units. Unavailable or rejected hard
+examples fall back to GT, so realized GT share may exceed its target. Logs report
+budgets in `identity_sampling.source_sampling`; `fresh_fraction` measures total
+GT, while `gt_unperturbed_fraction`, `gt_perturbed_fraction` and
+`replay_correct_continuation_fraction` report separate shares of all training
+examples. These sampling settings can change on resume, including from older
+checkpoints; workers require a restart. Optimizer state and the frozen recovery
+fixture remain unchanged. Legacy heavy perturbation settings still apply only
+to legacy samplers and recovery construction.
 
 To prepare a separate continuation with more refinement stages, use a completed
 training checkpoint as the source of all effective settings:

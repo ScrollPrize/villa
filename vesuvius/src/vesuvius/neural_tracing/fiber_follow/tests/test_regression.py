@@ -651,3 +651,24 @@ def test_removed_model_cli_options_rejected(option):
     with pytest.raises(SystemExit) as error:
         build_parser().parse_args(required+option)
     assert error.value.code == 2
+
+
+def test_inference_checkpoint_keeps_checkpoint_storage_on_cpu(monkeypatch):
+    import vesuvius.neural_tracing.fiber_follow.regression.train as module
+    cfg = config()
+    spec = FiberVolumeSpec('unused', ct_zarr='unused')
+    ck = dict(ema={}, vol_spec=spec.to_dict())
+    calls = []
+    monkeypatch.setattr(module, 'read_checkpoint', lambda path, arch, device: calls.append(('read', device)) or ck)
+    monkeypatch.setattr(module, 'checkpoint_config', lambda checkpoint: cfg)
+    class Model:
+        def to(self, device, **kwargs):
+            calls.append(('model', device))
+            return self
+        def load_state_dict(self, weights):
+            assert weights is ck['ema']
+        def eval(self):
+            return self
+    monkeypatch.setattr(module, 'build_model', lambda config: Model())
+    module.load_checkpoint('unused', 'cuda')
+    assert calls == [('read', 'cpu'), ('model', 'cuda')]
