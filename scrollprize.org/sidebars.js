@@ -37,15 +37,15 @@ const sidebars = {
       collapsible: true,
       collapsed: false,
       items: [
+        { type: 'doc', id: 'tutorial_VC3D' },
+        { type: 'doc', id: 'tutorial_spiral' },
+        { type: 'doc', id: 'winding_annotations' },
+        { type: 'doc', id: 'tutorial5' },
         {
           type: 'link',
           label: 'Scroll Anatomy',
           href: 'https://github.com/ScrollPrize/villa/blob/main/SCROLL_ANATOMY.md',
         },
-        { type: 'doc', id: 'tutorial_VC3D' },
-        { type: 'doc', id: 'tutorial_spiral' },
-        { type: 'doc', id: 'winding_annotations' },
-        { type: 'doc', id: 'tutorial5' },
       ],
     },
     {
