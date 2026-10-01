@@ -242,8 +242,9 @@ def plane_targets(p, s, t, t_end, pos, frame, planes):
     return ab, m
 
 
-def make_sample(fiber: TracedFiber, t: float, reverse: bool, cfg: SampleConfig, rng: np.random.Generator):
-    """Geometry of one perturbed training state (no volume access)."""
+def make_sample(fiber: TracedFiber, t: float, reverse: bool, cfg: SampleConfig, rng: np.random.Generator,
+                *, perturb=True):
+    """Sample GT geometry; perturb=False preserves position, tangent and history."""
     p, s = fiber.points, fiber.s
     if reverse:
         p = p[::-1]
@@ -253,11 +254,11 @@ def make_sample(fiber: TracedFiber, t: float, reverse: bool, cfg: SampleConfig, 
     tau = tangent_at(p, s, t)
     # lateral offset perpendicular to tau
     fr = frame_from_heading(tau)
-    lat = rng.normal(size=2) * _mix(rng, cfg.lateral_sigmas, cfg.lateral_probs)
+    lat = rng.normal(size=2) * _mix(rng, cfg.lateral_sigmas, cfg.lateral_probs) if perturb else np.zeros(2)
     delta = fr[:, 0] * lat[0] + fr[:, 1] * lat[1]
     pos = g + delta
-    ang = math.radians(_mix(rng, cfg.angle_sigmas_deg, cfg.angle_probs)) * rng.normal()
-    axis_ang = rng.uniform(0, 2 * np.pi)
+    ang = math.radians(_mix(rng, cfg.angle_sigmas_deg, cfg.angle_probs)) * rng.normal() if perturb else 0.
+    axis_ang = rng.uniform(0, 2 * np.pi) if perturb else 0.
     ax = math.cos(axis_ang) * fr[:, 0] + math.sin(axis_ang) * fr[:, 1]
     heading = normalize(math.cos(ang) * tau + math.sin(ang) * ax)
     frame = frame_from_heading(heading)  # provisional basis; CT resolves crop roll before sampling
@@ -266,13 +267,13 @@ def make_sample(fiber: TracedFiber, t: float, reverse: bool, cfg: SampleConfig, 
     count = cfg.n_history
     if cfg.full_observed_history:
         available = max(1, int(t/cfg.history_step))
-        count = max(count, int(rng.integers(1, available+1)))
+        count = max(count, int(rng.integers(1, available+1)) if perturb else available)
     k = np.arange(1, count + 1) * cfg.history_step
     th = t - k
     hmask = (th >= 0).astype(np.float32)
-    if rng.random() < cfg.no_history_prob:
+    if perturb and rng.random() < cfg.no_history_prob:
         hmask[:] = 0
-    else:
+    elif perturb:
         # Balance very short and intermediate startup histories. With this
         # option off, retain the existing sampler's random draws exactly.
         if cfg.short_history_prob > 0 and rng.random() < cfg.short_history_prob:
@@ -283,8 +284,9 @@ def make_sample(fiber: TracedFiber, t: float, reverse: bool, cfg: SampleConfig, 
             hmask[int(rng.integers(0, cfg.n_history)):] = 0
     hist = interp_at(p, s, np.clip(th, 0, L))
     ramp = np.clip(1.0 - k / (cfg.n_history * cfg.history_step), 0, 1)[:, None]
-    hist = hist + ramp * delta[None] + rng.normal(size=hist.shape) * cfg.history_jitter
-    if cfg.history_wobble > 0:
+    if perturb:
+        hist = hist + ramp * delta[None] + rng.normal(size=hist.shape) * cfg.history_jitter
+    if perturb and cfg.history_wobble > 0:
         # slow lateral wander of our own past path, zero at the current point
         amp = rng.uniform(0, cfg.history_wobble, size=2)
         lam = rng.uniform(15.0, 45.0, size=2)
@@ -294,10 +296,10 @@ def make_sample(fiber: TracedFiber, t: float, reverse: bool, cfg: SampleConfig, 
 
     # A smooth displacement accumulates near the present; old observations
     # remain aligned. Include the endpoint displacement in the current point.
-    span = rng.uniform(16., 64.)
+    span = rng.uniform(16., 64.) if perturb else 16.
     ramp = np.clip(1-k/span, 0, 1)
     ramp = ramp*ramp*(3-2*ramp)
-    displacement = rng.normal(size=2)*cfg.history_drift
+    displacement = rng.normal(size=2)*cfg.history_drift if perturb else np.zeros(2)
     drift = fr[:,:2] @ displacement
     hist += ramp[:,None]*drift
     pos += drift
@@ -379,14 +381,19 @@ class FollowDataset(torch.utils.data.IterableDataset):
     failure budget, uniform over available kinds, then fibers. Remaining draws
     use drift bands and then fibers. Empty legacy strata use fresh
     augmentation. Every draw is relabeled and holdout checked before crop I/O.
+    clean_fraction reserves unperturbed GT separately and normalizes the existing
+    hard-source weights into the remainder. Generic/legacy callers keep None.
     """
     def __init__(self, fibers, vol_spec, cfg, exclude_band, chunk=2, seed=0,
                  cache_bytes=1 << 30, onpolicy=None,
                  window=256., pool_size=12, window_samples=192, replay_index=None, refresh_chunks=8,
-                 batch_builder=None, additional_crops=(), fresh_fraction=.7):
+                 batch_builder=None, additional_crops=(), fresh_fraction=.7, clean_fraction=None):
         if not np.isfinite(fresh_fraction) or not 0 <= fresh_fraction <= 1:
             raise ValueError('Fresh fraction must be finite and in [0, 1]')
         self.fresh_fraction = float(fresh_fraction)
+        if clean_fraction is not None and (not np.isfinite(clean_fraction) or not 0 <= clean_fraction <= 1):
+            raise ValueError('Clean fraction must be finite and in [0, 1]')
+        self.clean_fraction = clean_fraction
         self.fibers, self.vol_spec, self.cfg, self.exclude = fibers, vol_spec, cfg, exclude_band
         self.chunk, self.seed, self.cache_bytes = chunk, seed, cache_bytes
         self.window, self.pool_size, self.window_samples = window, pool_size, window_samples
@@ -420,8 +427,8 @@ class FollowDataset(torch.utils.data.IterableDataset):
         if hasattr(self.batch_builder, 'set_replay'):
             self.batch_builder.set_replay(caches)
 
-    def draw_replay(self,rng):
-        source = int(rng.choice((0, REPLAY_SOURCES['recent']),
+    def draw_replay(self,rng, *, force=False):
+        source = REPLAY_SOURCES['recent'] if force else int(rng.choice((0, REPLAY_SOURCES['recent']),
                                 p=(self.fresh_fraction, 1-self.fresh_fraction)))
         if self.replay_failure_fraction is None:
             band = 4 if rng.random()<.1 else int(rng.integers(4))
@@ -459,6 +466,33 @@ class FollowDataset(torch.utils.data.IterableDataset):
         remaining = self.chunk-2*pairs
         bank = int(rng.binomial(remaining, min(1., following/(1-decisions)))) if following and remaining else 0
         return pairs, bank
+
+    def sampling_probabilities(self):
+        """Unconditional budgets; unavailable hard examples fall back to clean GT."""
+        s = getattr(self.batch_builder, 'sampling', None)
+        decision = getattr(s, 'decision_fraction', 0.)
+        following = getattr(s, 'bank_following_probability', 0.)
+        remaining = 1-decision-following
+        weights = dict(decision=decision, bank_following=following,
+                       memory_switch=remaining*self.fresh_fraction*getattr(s, 'memory_switch_probability', 0.),
+                       recent=remaining*(1-self.fresh_fraction))
+        if self.clean_fraction is None:
+            return dict(decision=decision, bank_following=following,
+                        fresh=remaining*self.fresh_fraction, recent=weights['recent'])
+        total = sum(weights.values())
+        if total <= 0:
+            return dict(clean=1., **dict.fromkeys(weights, 0.))
+        return dict(clean=self.clean_fraction,
+                    **{k: (1-self.clean_fraction)*v/total for k,v in weights.items()})
+
+    def clean_requests(self, rng):
+        # Allocate in pairs so identity pairs cannot consume the clean budget.
+        # Counts vary by batch; expected clean share is exactly clean_fraction.
+        if self.chunk % 2:
+            raise ValueError('Clean/hard allocation requires an even batch')
+        probabilities = self.sampling_probabilities()
+        counts = rng.multinomial(self.chunk//2, list(probabilities.values()))*2
+        return dict(zip(probabilities, counts.tolist()))
 
     def refresh_replay(self):
         if self.replay_index is None or not os.path.exists(self.replay_index):
@@ -605,7 +639,11 @@ class FollowDataset(torch.utils.data.IterableDataset):
             chunks += 1
             items = []
             fraction = getattr(getattr(self.batch_builder, 'sampling', None), 'decision_fraction', 0.)
-            requested, following = self.endpoint_requests(rng)
+            requests = self.clean_requests(rng) if self.clean_fraction is not None else None
+            requested, following = ((requests['decision']//2, requests['bank_following']) if requests is not None
+                                    else self.endpoint_requests(rng))
+            if requests is not None:
+                fraction = self.sampling_probabilities()['decision']
             for _ in range(requested):
                 pair = self.batch_builder.decision_pair(cfg, rng)
                 if pair is not None:
@@ -619,14 +657,28 @@ class FollowDataset(torch.utils.data.IterableDataset):
                     if self.state_allowed(item):
                         self.prefetch_items([item],vol)
                         items.append(item)
+            if requests is not None:
+                for _ in range(requests['memory_switch']):
+                    item = self.batch_builder.memory_switch(cfg, rng)
+                    if item is not None:
+                        item = self.prepare(item, rng)
+                        if self.state_allowed(item):
+                            self.prefetch_items([item], vol)
+                            items.append(item)
+                for _ in range(requests['recent']):
+                    draw = self.draw_replay(rng, force=True)
+                    item = self.replay_item(draw, rng) if draw is not None else None
+                    if item is not None:
+                        self.prefetch_items([item], vol)
+                        items.append(item)
             for attempt in range(max(10000, self.chunk*1000)):
                 if len(items) == self.chunk:
                     break
-                draw = self.draw_replay(rng) if attempt < self.chunk*10 else None
+                draw = self.draw_replay(rng) if requests is None and attempt < self.chunk*10 else None
                 item = None
                 if draw is not None:
                     item = self.replay_item(draw,rng)
-                if item is None and hasattr(self.batch_builder, 'replace_fresh'):
+                if item is None and requests is None and hasattr(self.batch_builder, 'replace_fresh'):
                     item = self.batch_builder.replace_fresh(cfg,rng)
                     if item is not None:
                         item = self.prepare(item,rng)
@@ -652,7 +704,8 @@ class FollowDataset(torch.utils.data.IterableDataset):
                             t = f.length-original_t if rev else original_t
                     else:
                         fi, t, rev = location['fiber'], location['t'], location['reverse']
-                    item = make_sample(self.fibers[fi], t, rev, cfg, rng)
+                    item = make_sample(self.fibers[fi], t, rev, cfg, rng,
+                                       **({'perturb': False} if requests is not None else {}))
                     item['source'], item['source_step'], item['stratum'] = 0, -1, -1
                     item['fiber_ref'] = (int(fi), float(t), bool(rev))
                     item['location_source'] = location['source'] if location else 0

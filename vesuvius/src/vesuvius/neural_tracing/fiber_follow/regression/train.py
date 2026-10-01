@@ -579,7 +579,7 @@ def build_parser():
     ap.add_argument('--axial-layers', type=int, default=4)
     ap.add_argument('--hidden', type=int, default=128)
     ap.add_argument('--memory-switch-probability', type=float, default=.3,
-                    help='Fresh draws replaced by original-then-neighbor memory sequences')
+                    help='Fresh replacement weight for switches when dividing the non-clean budget')
     ap.add_argument('--memory-switch-tail', type=float, nargs=2, default=(16.,96.), metavar=('MIN', 'MAX'),
                     help='Neighbor tail length of memory-switch sequences in trace voxels')
     ap.add_argument('--activation-checkpointing', action=argparse.BooleanOptionalAction, default=False)
@@ -587,12 +587,14 @@ def build_parser():
     ap.add_argument('--short-history-prob', type=float, default=.4,
                     help='Given history is present, probability of a balanced 1-8/9-32 point startup history')
     ap.add_argument('--decision-fraction', type=float, default=.3,
-                    help='Fraction of endpoint proposals reserved for matched pairs with remote observed seeds')
+                    help='Matched-pair weight before normalizing hard sources into the non-clean budget')
     ap.add_argument('--decision-choice-fraction', type=float, default=.75,
                     help='Requested fraction of matched pairs teaching recoverable geometry choices')
     ap.add_argument('--candidate-weight', type=float, default=1., help='Weight of candidate first-failure survival likelihood')
     ap.add_argument('--fresh-fraction', type=float, default=.7,
-                    help='Annotation-fresh share after decision and bank-following budgets; remainder uses replay')
+                    help='Fresh-versus-replay weight for hard-source allocation; clean GT share is --clean-fraction')
+    ap.add_argument('--clean-fraction', type=float, default=.8,
+                    help='Unconditional clean GT share; remaining budget mixes pairs, switches, following and replay')
     ap.add_argument('--negative-bank', default=str(Path(__file__).parents[1]/'output'/'neighbor_samples_r0_32_l80_160_v2'), help='Shared live bank for foreign-fiber masks, wrong continuations and following supervision')
     ap.add_argument('--near-negative-bank', help='Additional bank of validated nearby negative relationships')
     ap.add_argument('--following-bank', help='Following path source (default: negative-bank)')
@@ -695,6 +697,10 @@ def main(argv=None):
         raise ValueError('Gradient clipping limits must be finite and nonnegative (0 disables clipping)')
     if not math.isfinite(args.fresh_fraction) or not 0 <= args.fresh_fraction <= 1:
         raise ValueError('Fresh fraction must be finite and in [0, 1]')
+    if not math.isfinite(args.clean_fraction) or not 0 <= args.clean_fraction <= 1:
+        raise ValueError('Clean fraction must be finite and in [0, 1]')
+    if args.batch % 2:
+        raise ValueError('Clean/hard allocation requires an even batch')
     if (args.remote_prefetch_connections < 0 or args.remote_prefetch_queue_size < 1 or args.remote_prefetch_lookahead < 0
             or not math.isfinite(args.remote_prefetch_timeout) or args.remote_prefetch_timeout <= 0):
         raise ValueError('Prefetch connections and lookahead must be nonnegative; queue size and timeout must be positive')
@@ -823,7 +829,7 @@ def main(argv=None):
                    'log_every','ckpt_every','diag_every','batch_diag_every','dagger_device',
                    'negative_bank_refresh_seconds','negative_bank_cache_mb','activation_checkpointing',
                    'history_grad_clip','rest_grad_clip','presence_dropout','blur_probability','blur_sigma',
-                   'decision_fraction','decision_choice_fraction','bank_following_probability','fresh_fraction',
+                   'decision_fraction','decision_choice_fraction','bank_following_probability','fresh_fraction','clean_fraction',
                    'bank_hard_fraction','replay_failure_fraction','bank_switch_tolerance','bank_own_tolerance',
                    'n_commit','tolerance'}
         for key,value in vars(args).items():
@@ -884,7 +890,8 @@ def main(argv=None):
         augment=True,negative_bank=negative_bank,**role_banks)
     dataset = FollowDataset(train_f, spec, sample, band, chunk=args.batch, seed=args.seed+done,
         cache_bytes=int(args.worker_cache_gb*(1 << 30)), onpolicy=caches,
-        replay_index=str(collector.index), batch_builder=builder, additional_crops=(), fresh_fraction=args.fresh_fraction)
+        replay_index=str(collector.index), batch_builder=builder, additional_crops=(), fresh_fraction=args.fresh_fraction,
+        clean_fraction=args.clean_fraction)
     dataset_provenance = None
     if dataset_document:
         from .datasets import build_mixed_dataset
@@ -942,9 +949,8 @@ def main(argv=None):
                     groups=[dict(parameters=len(g['params'])) for g in opt.param_groups],
                     trainable_parameters=sum(p.numel() for p in model.parameters() if p.requires_grad)))
     log.record(dict(step=done,event='identity_sampling',architecture=model.architecture,
-        source_sampling=dict(decision=args.decision_fraction,bank_following=args.bank_following_probability,
-            fresh=(1-args.decision_fraction-args.bank_following_probability)*args.fresh_fraction,
-            recent=(1-args.decision_fraction-args.bank_following_probability)*(1-args.fresh_fraction)),
+        source_sampling=(dataset.datasets[0] if dataset_document else dataset).sampling_probabilities(),
+        clean_gt_geometry='unperturbed position, tangent and complete available GT history; photometric augmentation only',
         history_sampling_revision=SAMPLING_REVISION, frame_policy=FRAME_POLICY,
         history_policy='live_observed_slabs',sampling=asdict(identity_sampling),
         negative_bank_path=str(negative_bank.root),negative_bank_provenance=negative_bank.provenance(),

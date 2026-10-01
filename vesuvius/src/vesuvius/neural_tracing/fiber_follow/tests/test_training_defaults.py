@@ -23,7 +23,7 @@ def test_production_defaults_and_explicit_overrides():
     args = vars(parser.parse_args(REQUIRED))
     expected = dict(steps=100000, batch=4, grad_steps=2, workers=8, n_commit=16,
                     direction_inputs=True,
-                    memory_switch_probability=.3, decision_fraction=.3,
+                    memory_switch_probability=.3, decision_fraction=.3, clean_fraction=.8,
                     bank_wrong_continuation_probability=0., bank_following_probability=.2,
                     presence_dropout=0., diag_every=5000, dagger_after=96.,
                     recurrent_refinement_steps=2, warmup=500,remote_prefetch_lookahead=16)

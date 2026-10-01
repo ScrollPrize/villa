@@ -25,6 +25,28 @@ When resuming, `--lr` may change the base learning rate while retaining AdamW
 moments, EMA, and the existing warmup/cosine schedule position. Omit
 `--reset-optimizer` to preserve that state; the active LR includes cosine decay.
 
+Training reserves `--clean-fraction 0.8` of examples for clean GT. These samples
+use the annotation position and tangent, with all available GT history at the
+configured history spacing. They have no lateral offset, heading noise, history
+drift, wobble, jitter, random history dropout or artificial shortening. Local
+history retains the model's usual point limit; older GT remains available to
+historical slabs. Noise, blur, contrast and brightness augmentation still apply.
+
+The remaining 20% is divided among identity pairs, bank following, synthetic
+switch histories and replay, preserving their relative weights from the existing
+sampling options. For the mixed stem launcher this targets 80% clean, 10.7%
+paired decisions, 6.8% switches and 2.5% replay. Allocation is stochastic in
+two-example units; unavailable or rejected hard examples fall back to clean GT,
+so the realized clean fraction can be higher. Logs report the unconditional
+budgets in `identity_sampling.source_sampling`; `fresh_fraction` in training
+intervals measures the realized clean share. Geometry perturbation settings only
+affect legacy samplers and frozen recovery construction, not clean training GT.
+The recovery fixture remains unchanged across resumes.
+
+`--clean-fraction` can change on resume, including for older checkpoints. Resume
+the trainer to apply this policy to an already running job; existing workers do
+not reload Python code or sampling settings.
+
 To prepare a separate continuation with more refinement stages, use a completed
 training checkpoint as the source of all effective settings:
 

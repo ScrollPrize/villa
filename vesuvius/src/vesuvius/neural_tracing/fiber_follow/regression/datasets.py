@@ -336,6 +336,7 @@ def build_mixed_dataset(primary, document, cfg, sample, sampling, args, *, seed,
             dataset = FollowDataset(fibers, spec, sample, band, chunk=args.batch,
                 seed=seed+100003*(index+1), cache_bytes=int(args.worker_cache_gb*(1<<30)),
                 batch_builder=builder, fresh_fraction=args.fresh_fraction,
+                clean_fraction=getattr(args, 'clean_fraction', None),
                 onpolicy=replay, replay_index=str(replay_index) if replay_index else None)
             dataset.validation_fibers = validation_fibers
             dataset.validation_manifest = validation_manifest(validation_fibers,spec,source['validation']['seed'])

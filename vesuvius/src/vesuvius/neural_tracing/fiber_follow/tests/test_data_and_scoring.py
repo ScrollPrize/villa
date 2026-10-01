@@ -57,6 +57,30 @@ def sample_config():
     return D.SampleConfig(crop=CropSpec(depth=12, width=9, behind=2), n_history=4, n_future=4)
 
 
+@pytest.mark.parametrize('reverse', [False, True])
+@pytest.mark.parametrize('t', [0., 2.5, 60.])
+def test_clean_gt_preserves_position_heading_and_all_available_history(reverse, t):
+    from vesuvius.neural_tracing.fiber_follow.shared.geometry import interp_at, tangent_at
+    u = np.linspace(0, 100, 401)
+    points = np.c_[u, 4*np.sin(u/12), 2*np.cos(u/9)]
+    f = D.TracedFiber('clean', points, arclength(points), 'H')
+    cfg = replace(sample_config(), full_observed_history=True, no_history_prob=1.,
+                  short_history_prob=1., history_jitter=20., history_drift=20., history_wobble=20.)
+    p = points[::-1] if reverse else points
+    s = f.s[-1]-f.s[::-1] if reverse else f.s
+    for seed in [1, 19]:
+        item = D.make_sample(f, t, reverse, cfg, np.random.default_rng(seed), perturb=False)
+        np.testing.assert_allclose(item['pos'], interp_at(p, s, np.array([t]))[0], atol=1e-12)
+        np.testing.assert_allclose(item['frame'][:, 2], tangent_at(p, s, t), atol=1e-12)
+        back = t-np.arange(int(t/cfg.history_step), 0, -1)*cfg.history_step
+        expected = interp_at(p, s, np.r_[back, t])
+        np.testing.assert_allclose(item['observed_path'], expected, atol=1e-12)
+        valid = item['hmask'].astype(bool)
+        history = item['hist_local'][valid] @ item['frame'].T+item['pos']
+        np.testing.assert_allclose(history, expected[:-1][::-1][:cfg.n_history], atol=1e-12)
+        np.testing.assert_allclose(item['seed_pos'], expected[0], atol=1e-12)
+
+
 def make_states(f, z=0, offtrack=False):
     return D.OnPolicyStates(manifest=D.fiber_manifest([f]),
         fiber_idx=[0], t=[50.], reverse=[False], pos=[[50., 0., z]],

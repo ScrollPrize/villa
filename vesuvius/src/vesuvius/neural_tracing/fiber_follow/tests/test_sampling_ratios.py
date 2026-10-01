@@ -9,6 +9,62 @@ from vesuvius.neural_tracing.fiber_follow.shared.data import FollowDataset
 from vesuvius.neural_tracing.fiber_follow.regression.data import IdentitySampling
 
 
+@pytest.mark.parametrize('available', [True, False])
+def test_clean_budget_is_unconditional_and_hard_fallback_stays_clean(monkeypatch, available):
+    import vesuvius.neural_tracing.fiber_follow.shared.data as module
+    monkeypatch.setattr(module, 'FiberVolume', lambda *a, **kw: None)
+    monkeypatch.setattr(module, 'crop_local_grid', lambda crop: np.zeros((1, 3)))
+
+    def sample(*args, perturb=True):
+        assert not perturb
+        return dict(allowed=True, clean=True)
+
+    monkeypatch.setattr(module, 'make_sample', sample)
+
+    class Builder:
+        sampling = IdentitySampling(decision_fraction=.3, memory_switch_probability=.3,
+                                    bank_following_probability=0.)
+
+        def decision_pair(self, cfg, rng):
+            return [dict(source=5, allowed=True)]*2 if available else None
+
+        def memory_switch(self, cfg, rng):
+            return dict(source=3, allowed=True) if available else None
+
+        def replace_fresh(self, *args):
+            raise AssertionError('Reserved clean GT must not be replaced')
+
+        def __call__(self, items, vol):
+            return dict(items=items)
+
+    ds = FollowDataset([SimpleNamespace(length=100.)], None,
+        SimpleNamespace(crop=None, future_s=[16.]), None, chunk=12,
+        batch_builder=Builder(), fresh_fraction=.9, clean_fraction=.8)
+    monkeypatch.setattr(ds, 'state_allowed', lambda item: item['allowed'])
+    monkeypatch.setattr(ds, 'draw_replay', lambda rng, force=False: 'replay' if available else None)
+    monkeypatch.setattr(ds, 'replay_item', lambda *args: dict(source=2, allowed=True))
+    batches = iter(ds)
+    counts = np.zeros(6)
+    for _ in range(2000):
+        items = next(batches)['items']
+        assert len(items) == 12
+        assert sum(i['source'] == 5 for i in items) % 2 == 0
+        for item in items:
+            if item['source'] == 0:
+                assert item['clean']
+            counts[item['source']] += 1
+    probabilities = ds.sampling_probabilities()
+    expected = ([.8, 0., probabilities['recent'], probabilities['memory_switch'], 0., probabilities['decision']]
+                if available else [1., 0., 0., 0., 0., 0.])
+    np.testing.assert_allclose(counts/counts.sum(), expected, atol=.015)
+
+
+@pytest.mark.parametrize('value', [-.1, 1.1, float('nan')])
+def test_invalid_clean_fraction(value):
+    with pytest.raises(ValueError, match='Clean fraction'):
+        FollowDataset([SimpleNamespace(length=100.)], None, None, None, clean_fraction=value)
+
+
 @pytest.mark.parametrize('fresh', [0., .7, 1.])
 def test_bank_budget_is_independent_of_fresh_and_preserves_pair_slots(fresh):
     builder = SimpleNamespace(sampling=IdentitySampling(decision_fraction=.3, bank_following_probability=.2))

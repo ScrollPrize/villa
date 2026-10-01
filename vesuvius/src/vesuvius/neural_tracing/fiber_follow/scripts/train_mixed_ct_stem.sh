@@ -7,5 +7,5 @@ cd "$task_root"
 exec bash "$task_root/scripts/train_mixed_ct.sh" \
   --name "$task_run" --stem-channels 32 --stem-blocks 2 \
   --steps 100000 --lr 0.0001 --warmup 5000 \
-  --fresh-fraction 0.9 --bank-following-probability 0 \
+  --clean-fraction 0.8 --fresh-fraction 0.9 --bank-following-probability 0 \
   --remote-prefetch-connections 48 "$@"
