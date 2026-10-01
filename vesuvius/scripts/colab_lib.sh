@@ -11,6 +11,16 @@
 
 log() { printf '\n[bootstrap] %s\n' "$*"; }
 
+# Extracts a single printed value from captured `colab exec` output (stdin).
+# google-colab-cli intermittently mixes "[colab] ..." update-check lines into
+# exec output, both before AND after the real value (observed: "[colab] To
+# silence this check, ..." landing last, so a bare `tail -1` handed that
+# banner text to `uv pip install` as the wheel path). Drop [colab]-prefixed,
+# blank, and CR characters, then take the last remaining line. Always exits
+# 0 (empty output is a legitimate answer, e.g. a wheel-cache miss), since
+# grep's exit 1 on no matches would otherwise abort `set -e -o pipefail`.
+last_value() { { grep -v '^\[colab\]' || true; } | { grep -v '^[[:space:]]*$' || true; } | tr -d '\r' | tail -1; }
+
 # `colab exec` always exits 0 even when the executed code raises a traceback
 # (verified against a live session), so failures are detected by scanning
 # the captured output instead of relying on the process exit code.

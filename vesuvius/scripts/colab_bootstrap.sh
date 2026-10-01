@@ -74,15 +74,10 @@ if grep -q "has no attribute 'KernelClient'" <<<"$HOME_PROBE"; then
 fi
 check_exec_rc "$HP_RC" "$HOME_PROBE" 30
 check_remote_ok "$HOME_PROBE"
-# google-colab-cli intermittently prepends an "[colab] A new version ..."
-# update-nag banner (and related [colab]-prefixed lines) to exec output,
-# ahead of the actual printed value. Left unfiltered, that banner text ends
-# up embedded in $REMOTE_HOME (with literal newlines), silently corrupting
-# every path built from it later (observed: a garbled multi-line path fed to
-# `colab upload`, which failed with a raw 500 rather than a clear error).
-# Strip [colab]-prefixed and blank lines; the real answer is always last.
-REMOTE_HOME="$(grep -v '^\[colab\]' <<<"$HOME_PROBE" | grep -v '^[[:space:]]*$' | tail -1)"
-REMOTE_HOME="${REMOTE_HOME//$'\r'/}"
+# Unfiltered, the colab CLI's update-nag lines end up embedded in
+# $REMOTE_HOME, silently corrupting every path built from it (observed: a
+# garbled multi-line path fed to `colab upload` failed with a raw 500).
+REMOTE_HOME="$(last_value <<<"$HOME_PROBE")"
 log "remote home: $REMOTE_HOME"
 
 if [[ -f "$RCLONE_CONF_LOCAL" ]]; then
@@ -130,13 +125,13 @@ remote_bash "export PATH=\"\$HOME/.local/bin:\$PATH\"; command -v uv >/dev/null 
 WHEEL_CACHE_DIR="/root/.cache/vc-wheel"
 CACHED_WHEEL=""
 if [[ -f "$RCLONE_CONF_LOCAL" ]]; then
-    VC_TREE_HASH=$(remote_bash "git -C '$REMOTE_HOME/villa' rev-parse HEAD:volume-cartographer" 30 | tail -1)
+    VC_TREE_HASH=$(remote_bash "git -C '$REMOTE_HOME/villa' rev-parse HEAD:volume-cartographer" 30 | last_value)
     WHEEL_CACHE_DIR="/content/drive/vesuvius/vc-wheel-cache/$VC_TREE_HASH"
     log "checking Drive wheel cache for volume-cartographer @ $VC_TREE_HASH"
     # rclone's Drive VFS mount can be slow to resolve a path, especially one
     # that doesn't exist yet (first-ever cache check) — 30s was observed to
     # be too tight and timed out; give it real headroom.
-    CACHED_WHEEL=$(remote_bash "ls '$WHEEL_CACHE_DIR'/*.whl 2>/dev/null | head -1 || true" 90 | tail -1)
+    CACHED_WHEEL=$(remote_bash "ls '$WHEEL_CACHE_DIR'/*.whl 2>/dev/null | head -1 || true" 90 | last_value)
 fi
 
 log "uv sync --extra models, excluding volume-cartographer (fast — no compile)"
@@ -185,7 +180,7 @@ jobs=\$(( mem_gb / $MEM_PER_JOB_GB ))
 [ \"\$jobs\" -lt 1 ] && jobs=1
 [ \"\$jobs\" -gt \"\$cores\" ] && jobs=\$cores
 echo \$jobs
-" 30 | tail -1)
+" 30 | last_value)
         log "using CMAKE_BUILD_PARALLEL_LEVEL=$BUILD_JOBS on the remote VM"
         JOB_CAP_EXPORT="export CMAKE_BUILD_PARALLEL_LEVEL=$BUILD_JOBS;"
     fi
@@ -193,7 +188,7 @@ echo \$jobs
     log "building a volume-cartographer wheel (this is the slow step — up to \$EXEC_TIMEOUT=${EXEC_TIMEOUT}s)"
     remote_bash "export PATH=\"\$HOME/.local/bin:\$PATH\"; $JOB_CAP_EXPORT mkdir -p '$WHEEL_CACHE_DIR' && uv build --wheel -o '$WHEEL_CACHE_DIR' '$REMOTE_HOME/villa/volume-cartographer'" "$EXEC_TIMEOUT"
 
-    BUILT_WHEEL=$(remote_bash "ls '$WHEEL_CACHE_DIR'/*.whl | head -1" 30 | tail -1)
+    BUILT_WHEEL=$(remote_bash "ls '$WHEEL_CACHE_DIR'/*.whl | head -1" 30 | last_value)
     log "installing freshly built wheel: $BUILT_WHEEL"
     # --no-deps: see the cache-hit branch above for why this matters.
     remote_bash "export PATH=\"\$HOME/.local/bin:\$PATH\"; cd '$REMOTE_HOME/villa/vesuvius' && uv pip install --python .venv/bin/python --force-reinstall --no-deps '$BUILT_WHEEL'" 300
