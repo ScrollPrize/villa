@@ -473,8 +473,11 @@ class IdentityObservationBuilder(ObservationBuilder):
             from .identity_decisions import CANDIDATE_COUNT
             from .supervision import candidate_targets
             shape = (CANDIDATE_COUNT,self.cfg.n_future)
+            # CT frame rotation promotes local coordinates to NumPy float64.
+            # Match the other FP32 model inputs before candidate scoring/autocast.
             for key,trailing in (('candidate_points',(3,)),('candidate_mask',())):
-                batch[key] = torch.from_numpy(np.stack([i.get(key,np.zeros((*shape,*trailing),np.float32)) for i in items]))
+                batch[key] = torch.as_tensor(np.stack([
+                    i.get(key,np.zeros((*shape,*trailing),np.float32)) for i in items]), dtype=torch.float32)
             batch['candidate_kind'] = torch.from_numpy(np.stack([i.get('candidate_kind',
                 np.full(CANDIDATE_COUNT, -1, np.int64)) for i in items]))
             # Most rows have no supplied candidate paths, even at decisions.

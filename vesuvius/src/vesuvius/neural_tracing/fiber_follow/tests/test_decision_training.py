@@ -24,7 +24,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.training_log import DirectTrain
 
 
 
-def matched_batch(tmp_path, monkeypatch, choice):
+def matched_batch(tmp_path, monkeypatch, choice, *, orient=False):
     bank, parent = make_bank(tmp_path)
     publish(tmp_path, [add_shard(tmp_path, 0, x=4., z_range=(20., 180.))])
     cfg = config(n_future=16, fine=CropSpec(depth=48, width=25, behind=24, spacing=1.))
@@ -36,8 +36,45 @@ def matched_batch(tmp_path, monkeypatch, choice):
     for row in pair:
         builder.prepare(row, row.get('supervision_fiber', parent), rng)
     # Test geometry/labels without volume reads or the image encoder.
-    monkeypatch.setattr(builder, 'images', lambda items, vol: dict(seed_mask=torch.zeros(len(items), 1)))
+    def images(items, vol):
+        if orient:
+            builder.finalize_frames(items, vol)
+        return dict(seed_mask=torch.zeros(len(items), 1))
+    monkeypatch.setattr(builder, 'images', images)
     return cfg, pair, builder(pair, None)
+
+
+@pytest.mark.parametrize('compiled', [False, True])
+@pytest.mark.parametrize('device', ['cpu', pytest.param('cuda', marks=pytest.mark.skipif(
+    not torch.cuda.is_available(), reason='CUDA unavailable'))])
+def test_ct_reframed_candidates_score_under_bf16_autocast(tmp_path, monkeypatch, compiled, device):
+    from vesuvius.neural_tracing.fiber_follow.regression.train import move_batch
+    from test_survival_confidence import scoring_context
+
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.ct_normal',
+                        lambda vol, pos: np.array([1., 2., 0.]))
+    cfg, rows, candidates = matched_batch(tmp_path, monkeypatch, True, orient=True)
+    # Frame rotation uses double precision, but model inputs must remain FP32.
+    assert rows[0]['candidate_points'].dtype == np.float64
+    assert candidates['candidate_points'].dtype == torch.float32
+    expected = torch.from_numpy(np.stack([row['candidate_points'] for row in rows]).astype(np.float32))
+    torch.testing.assert_close(candidates['candidate_points'], expected, rtol=0, atol=0)
+
+    torch.manual_seed(65)
+    model = DirectFollower(cfg).to(device)
+    inputs = move_batch(batch(cfg), device)
+    curves = candidates['candidate_points'].to(device)
+    score = (torch.compile(model.score_candidates, backend='eager', fullgraph=True)
+             if compiled else model.score_candidates)
+    with torch.autocast(device, dtype=torch.bfloat16):
+        with torch.no_grad():
+            context = scoring_context(model, inputs)
+        result = score(context, curves)
+    logits = result['candidate_hazard_logits']
+    assert logits.dtype == torch.float32 and torch.isfinite(logits).all()
+    # CPU BF16 attention backward is not supported on every host.
+    grad, = torch.autograd.grad(logits.square().mean(), (model.confidence_scorer.failure.weight,))
+    assert torch.isfinite(grad).all() and grad.abs().sum() > 0
 
 
 def test_same_local_observation_has_opposite_geometry_choices_and_late_failures(tmp_path, monkeypatch):
