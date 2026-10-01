@@ -367,7 +367,7 @@ class GeometryStore:
         self.root.mkdir(parents=True, exist_ok=True)
         self.read_only = bool(read_only)
 
-    def register(self, key, points, metadata, cfg):
+    def register(self, key, points, metadata, cfg, *, allow_resume_addition=False):
         path = self.root / key
         with file_lock(self.root / "catalog.lock"):
             if path.exists():
@@ -376,7 +376,7 @@ class GeometryStore:
                 return
             if self.read_only:
                 raise ValueError("frozen refinement archive is missing a configured training fiber")
-            if (self.root / "restored.json").exists():
+            if (self.root / "restored.json").exists() and not allow_resume_addition:
                 raise ValueError("refinement resume sources differ from the saved geometry; refusing to reset GT")
             arc = arclength(points)
             curve = resample(points, arc, max(2, int(np.ceil(arc[-1] / cfg.spacing_base)) + 1))
@@ -386,11 +386,12 @@ class GeometryStore:
             np.save(path / "orientation.npy", zero_orientation(len(curve)))
             (path / "metadata.json").write_text(json.dumps(metadata))
 
-    def validate_split(self, keys, split):
+    def validate_split(self, keys, split, *, allow_extra=False):
         if (self.root / "restored.json").exists():
             expected = {p.name for p in self.root.iterdir() if p.is_dir() and
                         json.loads((p / "metadata.json").read_text()).get("split") == split}
-            if expected != set(keys):
+            valid = set(keys) <= expected if allow_extra else expected == set(keys)
+            if not valid:
                 raise ValueError(f"refinement resume {split} dataset membership changed")
 
     def test_patch(self, parent, sample_index, params, shape, spacing, start, current, baseline, orientation=None):

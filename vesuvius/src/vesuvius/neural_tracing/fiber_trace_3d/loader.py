@@ -2191,8 +2191,11 @@ class FiberTrace3DLoader:
                      "source_identity": record.fiber_identity,
                      "normal_manifest": str(_resolve_path(record.dataset_config["lasagna_manifest_path"], config.config_dir)),
                      "control_span": record.fiber.metadata.get("training_control_span"),
-                     "export": export_metadata(record.fiber)}, config.refinement)
-            self._refinement_store.validate_split(self._refinement_keys, config.refinement_split)
+                     "export": export_metadata(record.fiber)}, config.refinement,
+                    allow_resume_addition=config.refinement_split == "test")
+            self._refinement_store.validate_split(
+                self._refinement_keys, config.refinement_split,
+                allow_extra=config.refinement_split == "test")
         if config.sampling_strategy not in {"control_points", "scroll_balanced_arclength"}:
             raise ValueError("sampling_strategy must be control_points or scroll_balanced_arclength")
         for record in self.records:

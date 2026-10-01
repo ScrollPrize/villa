@@ -18,6 +18,10 @@
 - The first production launch exposed that a merge had lost the existing v4
   fiber/editor-hint parser support. Restored the shared parser behavior rather
   than rewriting the cohort; the v1 dataset remains byte-identical to source.
+- Resume keeps exact training-refinement membership locked, while permitting a
+  replacement deterministic test cohort to add independent test parents to a
+  restored store. Historical test entries may remain but cannot affect current
+  test sampling or metrics.
 - Added the reviewed32 training config. Its ordinary raw/EMA/refinement/cross-
   section tests use only the locked subset without changing metric semantics.
 - Native tracing reuses `run_classic_fiber_evaluation.py` and the shared live

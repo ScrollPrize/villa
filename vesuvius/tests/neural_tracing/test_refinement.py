@@ -734,6 +734,23 @@ def test_restore_rejects_changed_dataset(tmp_path):
     restored.validate_split(["a"*64], "train")
 
 
+def test_restore_allows_new_independent_test_sources_only(tmp_path):
+    cfg = RefinementConfig()
+    source = GeometryStore(tmp_path / "source")
+    source.register("a"*64, line()[:, :3], {"split": "train"}, cfg)
+    source.register("b"*64, line()[:, :3], {"split": "test"}, cfg)
+    saved = source.save(tmp_path / "snapshot.zip")
+    restored = GeometryStore(tmp_path / "restored")
+    restored.restore(tmp_path / saved["file"], saved["sha256"])
+    restored.register("c"*64, line()[:, :3], {"split": "test"}, cfg,
+                      allow_resume_addition=True)
+    restored.validate_split(["c"*64], "test", allow_extra=True)
+    with pytest.raises(ValueError, match="membership"):
+        restored.validate_split(["c"*64], "test")
+    with pytest.raises(ValueError, match="sources differ"):
+        restored.register("d"*64, line()[:, :3], {"split": "train"}, cfg)
+
+
 def test_augmented_mapping_quadrature_and_cost():
     from vesuvius.neural_tracing.fiber_trace_3d.loader import FiberTrace3DLoader, _Augment3DParams
     from tests.neural_tracing.test_fiber_trace_3d import _loader_with_mapping
