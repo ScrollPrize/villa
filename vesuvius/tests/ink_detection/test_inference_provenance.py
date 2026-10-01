@@ -125,12 +125,13 @@ def test_non_micrometre_units_are_recorded_but_produce_no_resolution(tmp_path, u
 @pytest.mark.parametrize(
     "scale, expect",
     [
-        ([1.0, 1.0, 1.0], "placeholder when no meta.json"),  # --remote-url render, no meta.json
-        ([9.362, 9.362, 9.362], "default label"),  # meta.json value under the nanometer label
+        ([1.0, 1.0, 1.0], "placeholder vc_render_tifxyz wrote without a meta.json"),  # --remote-url render, no meta.json
+        ([9.362, 9.362, 9.362], "wrote the meta.json micrometre value under this default label"),  # meta.json value under the nanometer label
     ],
 )
 def test_renderer_nanometer_cases_get_no_tags_and_a_named_reason(tmp_path, scale, expect):
-    # The two outputs khj1222 measured from the released VC3D build (villa #1893).
+    # The two outputs khj1222 measured from the released VC3D build (villa #1893);
+    # builds after villa #1831 no longer produce them, and the note says so.
     root = _ome_root(tmp_path, {"0": scale}, unit="nanometer")
     record = physical_scale_from_root(root, "0", depth_axis_first=True)
     assert record["um_per_px_y"] is None

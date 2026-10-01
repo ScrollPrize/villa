@@ -191,13 +191,16 @@ def physical_scale_from_root(
 
 
 def renderer_default_note(scale_record: Mapping[str, Any]) -> str | None:
-    """Name the case where the scale metadata is the renderer's placeholder.
+    """Name the case where a nanometre label is not a usable physical scale.
 
-    ``vc_render_tifxyz`` defaults ``--voxel-unit`` to ``nanometer`` and, when
-    it has no ``meta.json`` (the usual ``--remote-url`` case), writes a scale
-    of 1.0; with a ``meta.json`` it writes the micrometre value under the
-    nanometre label (villa #1893). Neither is a usable physical scale, so no
-    resolution tags are written; this note says why and what fixes it.
+    Before villa #1831 (merged 2026-09-30, villa #1893) ``vc_render_tifxyz``
+    defaulted ``--voxel-unit`` to ``nanometer``: without a ``meta.json`` (the
+    usual ``--remote-url`` case) it wrote a scale of 1.0, and with one it wrote
+    the micrometre value under the nanometre label. Current builds write
+    ``micrometer`` from the volume metadata, no unit when there is none, and
+    ``nanometer`` only when ``--voxel-unit nanometer`` was given. Resolution
+    tags are written only for micrometre units, so this note says why a
+    nanometre record gets none and what produces tags.
     """
 
     unit = str(scale_record.get("unit") or "").lower()
@@ -206,14 +209,17 @@ def renderer_default_note(scale_record: Mapping[str, Any]) -> str | None:
     scale = scale_record.get("scale") or []
     if scale and all(abs(float(value) - 1.0) < 1e-9 for value in scale):
         return (
-            "scale 1.0 nanometer is vc_render_tifxyz's placeholder when no "
-            "meta.json is available (villa #1893); re-render with "
-            "--voxel-size <um> --voxel-unit micrometer to get resolution tags"
+            "scale 1.0 nanometer is the placeholder vc_render_tifxyz wrote "
+            "without a meta.json before villa #1831 (villa #1893); re-render "
+            "on a current build, or pass --voxel-size <um> --voxel-unit "
+            "micrometer, to get resolution tags"
         )
     return (
-        "unit nanometer is vc_render_tifxyz's default label; if the value is "
-        "really micrometres (villa #1893), re-render with --voxel-unit "
-        "micrometer to get resolution tags"
+        "unit nanometer: builds before villa #1831 wrote the meta.json "
+        "micrometre value under this default label (villa #1893), and current "
+        "builds write it only for --voxel-unit nanometer; resolution tags are "
+        "written for micrometre units, so re-render on a current build or "
+        "with --voxel-unit micrometer if the value is really micrometres"
     )
 
 
