@@ -59,6 +59,11 @@ inline bool parseTraceOption(
     };
     if (argument == "--step-voxels")
         config.stepVoxels = parseDouble(value("step-voxels"), "step-voxels");
+    else if (argument == "--replay-reverse-interval-base") {
+        config.replayReverseIntervalBase = parseDouble(value("replay-reverse-interval-base"), "replay-reverse-interval-base");
+        if (!std::isfinite(config.replayReverseIntervalBase) || config.replayReverseIntervalBase <= 0)
+            throw std::invalid_argument("replay reverse interval must be positive");
+    }
     else if (argument == "--sample-pool-radius-voxels")
         config.samplePoolRadiusVoxels = parseDouble(value("sample-pool-radius-voxels"), "sample-pool-radius-voxels");
     else if (argument == "--sample-pool-mode")
@@ -202,6 +207,7 @@ inline void validateTraceOptions(const FiberTraceConfig& config)
 inline nlohmann::json traceConfigJson(const FiberTraceConfig& config)
 {
     return {
+        {"replay_reverse_interval_base", config.replayReverseIntervalBase},
         {"embedding_weight", config.embeddingWeight},
         {"embedding_integration", {{"kind",config.embeddingIntegration.kind},{"spacing",config.embeddingIntegration.spacing},
             {"gate_bias",config.embeddingIntegration.gateBias},{"gate_presence",config.embeddingIntegration.gatePresence},{"gate_distance",config.embeddingIntegration.gateDistance},

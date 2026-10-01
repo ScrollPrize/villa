@@ -34,6 +34,13 @@ using ReplaySegmentRunner = std::function<std::string(
     const ReplayPointObserver&,
     const FiberTraceProgressCallback&)>;
 
+struct ReplayConsistencyPolicy {
+    double intervalBase = 0;
+    std::function<bool(const std::vector<cv::Vec3d>&)> verify;
+    // Return prediction-derived seed, with its corresponding reference arc.
+    std::function<std::optional<PolylineArcSample>(double)> nextSeed;
+};
+
 [[nodiscard]] FiberReplayTraceResult traceReferenceReplayCore(
     const PolylineArcGeometry& reference,
     double startArcBase,
@@ -48,6 +55,7 @@ using ReplaySegmentRunner = std::function<std::string(
     double normalWorkingToBaseScale,
     const ReplaySegmentRunner& runSegment,
     const FiberTraceProgressCallback& progress,
-    const FiberReplayFailureCallback& failureCallback);
+    const FiberReplayFailureCallback& failureCallback,
+    const ReplayConsistencyPolicy& consistency = {});
 
 }  // namespace vc::fiber_tracer

@@ -2,6 +2,7 @@
 #include <doctest/doctest.h>
 
 #include "vc/fiber_tracer/FiberReferenceReplayBenchmark.hpp"
+#include "vc/fiber_tracer/FiberReferenceReplayCore.hpp"
 #include "vc/fiber_tracer/FiberAnchorCoverage.hpp"
 #include "vc/fiber_tracer/FiberAnchors.hpp"
 #include "vc/fiber_tracer/FiberletPipeline.hpp"
@@ -10,6 +11,71 @@
 
 #include <cmath>
 #include <limits>
+
+TEST_CASE("Periodic consistency checks final partial span and accounts rejected tail")
+{
+    using namespace vc::fiber_tracer;
+    class Normals final : public vc::lasagna::NormalSampler {
+        vc::lasagna::NormalSample sampleNormal(const cv::Vec3d&) const override {
+            return {{0, 1, 0}, true, {}};
+        }
+    } normals;
+    const auto reference = makePolylineArcGeometry({{0,0,0},{250,0,0}});
+    ReplaySegmentRunner runner = [](const PolylineArcSample& seed, double, int,
+            const ReplayPointObserver& observer, const FiberTraceProgressCallback&) {
+        for (double x = seed.arc + 10; x <= 250; x += 10)
+            if (!observer({x,0,0}, 0, int(x/10))) break;
+        return std::string("stopped");
+    };
+    ReplayConsistencyPolicy policy;
+    policy.intervalBase = 100;
+    policy.verify = [](const auto&) { return true; };
+    policy.nextSeed = [](double) -> std::optional<PolylineArcSample> { return {}; };
+    const auto run = [&] {
+        return traceReferenceReplayCore(reference, 0, 250, 10, 3, 40, 160, 2, 1,
+                                       normals, 1, runner, {}, {}, policy);
+    };
+    auto result = run();
+    CHECK(result.reverseChecks == 3);
+    CHECK(result.filteredStops.empty());
+    CHECK(result.failures.empty());
+    CHECK(result.completedReferenceArcBase == 250);
+    size_t calls = 0;
+    policy.verify = [&](const auto&) { return ++calls == 1; };
+    result = run();
+    REQUIRE(result.filteredStops.size() == 1);
+    CHECK(result.filteredStops[0][0] == doctest::Approx(100));
+    CHECK(result.filteredStops[0][1] == doctest::Approx(200));
+    CHECK(result.filteredStops[0][2] == doctest::Approx(250));
+    CHECK(result.segments[0].tracePointsBase.back()[0] == doctest::Approx(100));
+    CHECK(result.failures.empty());
+    CHECK(result.completedReferenceArcBase == 250);
+    calls = 0;
+    policy.nextSeed = [&](double arc) -> std::optional<PolylineArcSample> {
+        return samplePolylineArc(reference, arc);
+    };
+    policy.verify = [&](const auto&) { return ++calls != 1; };
+    result = run();
+    REQUIRE(result.filteredStops.size() == 1);
+    CHECK(result.filteredStops[0][2] == doctest::Approx(110));
+    CHECK(result.segments.size() == 2);
+    CHECK(result.failures.empty());
+    CHECK(result.completedReferenceArcBase == 250);
+    runner = [](const PolylineArcSample& seed, double, int,
+            const ReplayPointObserver& observer, const FiberTraceProgressCallback&) {
+        for (double x = seed.arc + 10; x <= 250; x += 10)
+            if (!observer({x,200,0}, 0, int(x/10))) break;
+        return std::string("stopped");
+    };
+    policy.verify = [](const auto&) { return false; };
+    // A sustained excursion exceeds grace160. Keep the interval huge so
+    // the GT failure necessarily arrives before a periodic check.
+    policy.intervalBase = 100000;
+    result = run();
+    CHECK_FALSE(result.failures.empty());
+    CHECK(result.filteredStops.empty());
+    CHECK(result.reverseChecks == 0);
+}
 
 namespace
 {
@@ -35,6 +101,23 @@ private:
 
 }  // namespace
 
+TEST_CASE("reviewed control-point editor hints preserve reference geometry")
+{
+    using namespace vc::fiber_tracer;
+    nlohmann::json root = {{"type", "vc3d_fiber"}, {"version", 3},
+        {"optimization_mode", "native_fiber_trace3d"},
+        {"line_points", {{1,2,3},{4,5,6}}},
+        {"control_points", {{{"position", {1,2,3}}, {"direction", {1,0,0}},
+            {"display_normal", {0,0,1}}, {"display_normal_source", "manual"}}}}};
+    const auto parsed = parseVc3dFiberJson(root, "fixture");
+    CHECK(parsed.linePoints.size() == 2);
+    CHECK(parsed.controlPoints.front() == cv::Vec3d(1,2,3));
+    root["version"] = 4;
+    CHECK(parseVc3dFiberJson(root, "fixture").linePoints == parsed.linePoints);
+    root["control_points"][0]["direction"] = {1,2};
+    CHECK_THROWS(parseVc3dFiberJson(root, "fixture"));
+}
+
 TEST_CASE("reference replay interval tolerates accumulated roundoff but not missing coverage")
 {
     using namespace vc::fiber_tracer;
@@ -59,6 +142,23 @@ TEST_CASE("reference replay interval tolerates accumulated roundoff but not miss
     };
     check(FiberReplayTraceResult{});
     check(FiberletGraphReplayResult{});
+}
+
+TEST_CASE("version-four reference eligibility retains native spans and excludes Lasagna")
+{
+    using namespace vc::fiber_tracer;
+    Vc3dFiberJson fiber;
+    fiber.version = 4;
+    fiber.optimizationMode = "native_fiber_trace3d";
+    fiber.linePoints = {{0,0,0}, {10,0,0}, {20,0,0}, {30,0,0}};
+    fiber.controlPoints = fiber.linePoints;
+    fiber.segmentMetadata = {{{"interp_mode", "trace"}}, {{"interp_mode", "lasagna"}},
+                             {{"interp_mode", "trace"}}, nlohmann::json{}};
+    const auto plan = vc3dEvaluationReferencePlan(fiber, "fixture");
+    CHECK(plan.at("runs").size() == 2);
+    CHECK(plan.at("eligible_length_base_voxels").get<double>() == doctest::Approx(20));
+    fiber.version = 3;
+    CHECK(vc3dEvaluationReferencePlan(fiber, "fixture") == plan);
 }
 
 TEST_CASE("precomputed replay emits fixed offset geometry and terminal samples")

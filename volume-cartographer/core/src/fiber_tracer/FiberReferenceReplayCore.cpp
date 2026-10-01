@@ -28,8 +28,12 @@ FiberReplayTraceResult traceReferenceReplayCore(
     double normalWorkingToBaseScale,
     const ReplaySegmentRunner& runSegment,
     const FiberTraceProgressCallback& progress,
-    const FiberReplayFailureCallback& failureCallback)
+    const FiberReplayFailureCallback& failureCallback,
+    const ReplayConsistencyPolicy& consistency)
 {
+    if (!std::isfinite(consistency.intervalBase) || consistency.intervalBase < 0 ||
+        (consistency.intervalBase > 0 && (!consistency.verify || !consistency.nextSeed)))
+        throw std::invalid_argument("invalid replay consistency policy");
     if (!std::isfinite(excursionGraceBaseVoxels) || excursionGraceBaseVoxels < 0)
         throw std::invalid_argument("replay excursion grace must be finite and nonnegative");
     const double remainingArcBase = endArcBase - startArcBase;
@@ -42,18 +46,38 @@ FiberReplayTraceResult traceReferenceReplayCore(
         static_cast<size_t>(std::ceil(remainingArcBase / nominalStepBase)) + 1;
 
     double segmentStartArc = startArcBase;
+    std::optional<PolylineArcSample> predictedSeed;
     for (size_t iteration = 0; iteration < maximumSegments &&
          segmentStartArc < endArcBase - kEpsilon; ++iteration) {
         FiberReplayTraceSegment segment;
         segment.startReferenceArcBase = segmentStartArc;
         segment.endReferenceArcBase = segmentStartArc;
-        const auto start = samplePolylineArc(reference, segmentStartArc);
+        const auto start = predictedSeed.value_or(samplePolylineArc(reference, segmentStartArc));
+        predictedSeed.reset();
         segment.tracePointsBase.push_back(start.point);
         segment.cumulativeLosses.push_back(0.0);
 
         double previousArcBase = segmentStartArc;
         bool referenceExhausted = false;
         bool distanceFailed = false;
+        bool filtered = false;
+        size_t checkedPoint = 0;
+        size_t checkedMatches = 0;
+        double checkedArc = segmentStartArc;
+        double uncheckedTravel = 0;
+        const auto checkSpan = [&]() {
+            if (consistency.intervalBase <= 0 || segment.tracePointsBase.size() <= checkedPoint + 1)
+                return true;
+            ++result.reverseChecks;
+            const std::vector<cv::Vec3d> span(segment.tracePointsBase.begin() + checkedPoint,
+                                             segment.tracePointsBase.end());
+            if (!consistency.verify(span)) { filtered = true; return false; }
+            checkedPoint = segment.tracePointsBase.size() - 1;
+            checkedMatches = segment.matches.size();
+            checkedArc = previousArcBase;
+            uncheckedTravel = 0;
+            return true;
+        };
         FiberReplayExcursion excursion{excursionGraceBaseVoxels, std::nullopt};
         const ReplayPointObserver observe =
             [&](const cv::Vec3d& pointBase, double cumulativeLoss, int) {
@@ -92,6 +116,11 @@ FiberReplayTraceResult traceReferenceReplayCore(
                 if (previousArcBase >= endArcBase - kEpsilon)
                     referenceExhausted = true;
                 if (referenceExhausted && excursion.outsideTravel) distanceFailed = true;
+                uncheckedTravel += stepTravel;
+                // Earlier GT failure wins. A consistency rejection never hides it.
+                if (!distanceFailed && consistency.intervalBase > 0 &&
+                    (uncheckedTravel >= consistency.intervalBase || referenceExhausted))
+                    if (!checkSpan()) return false;
                 return !distanceFailed && !referenceExhausted;
             };
 
@@ -118,6 +147,26 @@ FiberReplayTraceResult traceReferenceReplayCore(
             segmentProgress);
 
         if (excursion.outsideTravel) distanceFailed = true;
+
+        if (!filtered && !distanceFailed) (void)checkSpan();
+        if (filtered) {
+            const double detectedArc = previousArcBase;
+            segment.tracePointsBase.resize(checkedPoint + 1);
+            segment.cumulativeLosses.resize(checkedPoint + 1);
+            segment.matches.resize(checkedMatches);
+            segment.endReferenceArcBase = checkedArc;
+            segment.terminationReason = "reverse_consistency_filtered";
+            result.segments.push_back(std::move(segment));
+            const double searchArc = std::max(detectedArc, segmentStartArc) + nominalStepBase;
+            if (searchArc < endArcBase) predictedSeed = consistency.nextSeed(searchArc);
+            const double nextArc = predictedSeed ? predictedSeed->arc : endArcBase;
+            if (!(nextArc > segmentStartArc) || nextArc > endArcBase)
+                throw std::logic_error("filtered replay reseed did not advance within reference");
+            result.filteredStops.push_back({checkedArc, detectedArc, nextArc});
+            segmentStartArc = nextArc;
+            result.completedReferenceArcBase = nextArc;
+            continue;
+        }
 
         if (referenceExhausted && !distanceFailed) {
             segment.endReferenceArcBase = endArcBase;

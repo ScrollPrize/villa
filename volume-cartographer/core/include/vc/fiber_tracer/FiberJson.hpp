@@ -206,15 +206,22 @@ inline std::vector<cv::Vec3d> vc3dFiberPointArrayFromJson(const nlohmann::json& 
             points.push_back(detail::pointFromJson(value, context));
             continue;
         }
-        if (version != 3 || !value.is_object()) {
+        if ((version != 3 && version != 4) || !value.is_object()) {
             throw std::runtime_error(context + " version-3 control point must be an object");
         }
         for (const auto& [field, item] : value.items()) {
             (void)item;
-            if (field != "position" && field != "segment_to_next") {
+            if (field != "position" && field != "segment_to_next" &&
+                field != "direction" && field != "display_normal" && field != "display_normal_source") {
                 throw std::runtime_error(context + " control point contains unknown field: " + field);
             }
         }
+        // Editor hints do not alter the reference polyline or span eligibility.
+        for (const auto* field : {"direction", "display_normal"}) {
+            if (value.contains(field)) detail::pointFromJson(value.at(field), context);
+        }
+        if (value.contains("display_normal_source") && !value.at("display_normal_source").is_string())
+            throw std::runtime_error(context + " display_normal_source must be a string");
         points.push_back(detail::pointFromJson(value.at("position"), context));
         if (index + 1 == array.size()) {
             if (value.contains("segment_to_next")) {
@@ -239,10 +246,10 @@ inline Vc3dFiberJson parseVc3dFiberJson(const nlohmann::json& root,
 
     Vc3dFiberJson fiber;
     fiber.version = root.value("version", 1);
-    if (fiber.version != 1 && fiber.version != 3)
+    if (fiber.version != 1 && fiber.version != 3 && fiber.version != 4)
         throw std::runtime_error(context + " has unsupported vc3d_fiber version");
 
-    if (fiber.version == 3 && !root.contains("optimization_mode"))
+    if (fiber.version >= 3 && !root.contains("optimization_mode"))
         throw std::runtime_error(context + " version-3 fiber is missing optimization_mode");
     if (root.contains("optimization_mode")) {
         if (!root.at("optimization_mode").is_string())
@@ -259,7 +266,7 @@ inline Vc3dFiberJson parseVc3dFiberJson(const nlohmann::json& root,
     fiber.controlPoints = vc3dFiberPointArrayFromJson(
         root, "control_points", fiber.version, context);
     fiber.segmentMetadata.resize(fiber.controlPoints.size());
-    if (fiber.version == 3) {
+    if (fiber.version >= 3) {
         const auto& controls = root.at("control_points");
         for (size_t index = 0; index + 1 < controls.size(); ++index)
             fiber.segmentMetadata[index] = controls.at(index).at("segment_to_next");
@@ -354,7 +361,7 @@ inline nlohmann::json vc3dEvaluationReferencePlan(const Vc3dFiberJson& fiber,
         begin.reset();
     };
     for (size_t i = 0; i + 1 < indices.size(); ++i) {
-        const auto mode = fiber.version == 3 ? fiber.segmentMetadata.at(i).at("interp_mode").get<std::string>()
+        const auto mode = fiber.version >= 3 ? fiber.segmentMetadata.at(i).at("interp_mode").get<std::string>()
             : fiber.optimizationMode;
         result["cp_spans"].push_back({{"control_point_indices", {i, i + 1}},
             {"line_indices", {indices[i], indices[i + 1]}}, {"actual_interp_mode", mode},
