@@ -99,8 +99,12 @@ CREATE VIRTUAL TABLE block_bounds USING rtree(id, min_x, max_x, min_y, max_y, mi
 | `complete` | `true` once the file is fully written; other files are refused |
 | `uuid` | a string identifying this file |
 | `frame` | an object with `vc_open_data_coordinate_space`, and optionally `vc_open_data_source_coordinate_level` (must be 0) and `vc_open_data_source_coordinate_scale_factor` (must be 1) |
-| `root` | an object whose `coordinate_base_shape_zyx` and `vc_open_data_*` fields are copied into fibers opened in Line Annotation |
+| `root` | an object with collection-level fields |
 | `fiber_count`, `point_count` | integers |
+
+The `coordinate_base_shape_zyx` and `vc_open_data_*` fields of `frame` and
+`root` are copied into fibers opened in Line Annotation. Either object may
+declare them; when both do, the values must match.
 
 * **fibers** has one row per fiber. `family` is `H`, `V` or empty. `length` is
   the complete polyline length in native L0 voxels, and the bounds cover all

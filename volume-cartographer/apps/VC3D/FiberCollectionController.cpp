@@ -1074,13 +1074,22 @@ void FiberCollectionController::startPendingAnnotation()
         if (points.size() != size_t(summary.pointCount))
             throw std::runtime_error("Incomplete fiber geometry");
         entry["line_points"] = std::move(points);
-        // Coordinate metadata may live at collection level. Native annotation
-        // files must be self-contained because they outlive this attachment.
+        // Coordinate metadata may live at collection level, in frame or root.
+        // Native annotation files must be self-contained because they outlive
+        // this attachment.
+        const auto frame = Json::parse(collection.metadata("frame"));
         const auto root = Json::parse(collection.metadata("root"));
         for (const auto* key : {"coordinate_base_shape_zyx", "vc_open_data_coordinate_space", "vc_open_data_source_path",
-             "vc_open_data_source_coordinate_level", "vc_open_data_source_coordinate_scale_factor", "vc_open_data_source_original_resolution"})
-            if (!entry.contains(key) && root.contains(key))
+             "vc_open_data_source_coordinate_level", "vc_open_data_source_coordinate_scale_factor", "vc_open_data_source_original_resolution"}) {
+            if (frame.contains(key) && root.contains(key) && frame.at(key) != root.at(key))
+                throw std::runtime_error(std::string("Conflicting ") + key + " in the volume metadata");
+            if (entry.contains(key))
+                continue;
+            if (frame.contains(key))
+                entry[key] = frame.at(key);
+            else if (root.contains(key))
                 entry[key] = root.at(key);
+        }
         if (!entry.contains("control_points"))
             entry["control_points"] = Json::array({entry["line_points"].front(), entry["line_points"].back()});
         return entry;
