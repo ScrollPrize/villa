@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Callable
 
 import numpy as np
@@ -15,6 +16,41 @@ def surface_patch_bbox(
     depth, height, width = patch_size
     z0 = int(surface - depth // 2)
     return z0, int(y0), int(x0), z0 + depth, int(y0) + height, int(x0) + width
+
+
+# Below this share of supervised background voxels (at scan scale, over all
+# training patches of a segment) the model effectively never sees a negative.
+MIN_BACKGROUND_SHARE = 0.01
+
+
+def report_training_composition(
+    segment: Segment, patches: int, ink_voxels: int, background_voxels: int
+) -> None:
+    """Print the ink / background split of a segment's training patches.
+
+    Warn when there is (almost) no supervised background: training then only
+    ever shows the model ink, and it learns to answer "ink" everywhere. This
+    happens silently when a supervision mask is a thin band around the labels,
+    because ``min_labeled_coverage`` keeps only patches that contain ink.
+    """
+    supervised = ink_voxels + background_voxels
+    if patches == 0 or supervised == 0:
+        return
+    background_share = background_voxels / supervised
+    summary = (
+        f"{segment.inklabels}: {patches} training patches, supervised voxels "
+        f"at scan scale: {100 * (1 - background_share):.1f}% ink, "
+        f"{100 * background_share:.1f}% background"
+    )
+    print(summary)
+    if background_share < MIN_BACKGROUND_SHARE:
+        warnings.warn(
+            f"{summary}. The model will see (almost) no background: check "
+            "that the supervision mask also covers papyrus without ink, not "
+            "only the labeled ink.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
 
 def labeled_patch_coverage(label_patch: np.ndarray) -> float:
@@ -106,6 +142,8 @@ def find_segment_patches(
     scan_w = max(1, int(round(patch_size[2] / scale_x)))
     training: list[Patch] = []
     held_out: list[Patch] = []
+    ink_voxels = 0
+    background_voxels = 0
     for y_scan, x_scan in corners.tolist():
         y_scan, x_scan = int(y_scan), int(x_scan)
         supervision_patch = supervision[
@@ -113,6 +151,7 @@ def find_segment_patches(
         ]
         has_training = bool(supervision_patch.size and np.any(supervision_patch))
         has_validation = False
+        trainable = np.asarray(supervision_patch) > 0
         if validation is not None:
             validation_patch = validation[
                 validation_surface,
@@ -121,9 +160,8 @@ def find_segment_patches(
             ]
             has_validation = bool(validation_patch.size and np.any(validation_patch))
             if has_training and has_validation:
-                has_training = bool(
-                    np.any(np.asarray(supervision_patch) & ~np.asarray(validation_patch))
-                )
+                trainable = trainable & ~(np.asarray(validation_patch) > 0)
+                has_training = bool(np.any(trainable))
         y0 = int(round(y_scan * scale_y))
         x0 = int(round(x_scan * scale_x))
         bbox = surface_patch_bbox(surface, y0, x0, patch_size)
@@ -143,8 +181,14 @@ def find_segment_patches(
             segment.data_config.patch_finding.min_labeled_coverage
         ):
             training.append(Patch(segment=segment, bbox=bbox))
+            ink = trainable & (np.asarray(label_patch) > 0)
+            ink_voxels += int(ink.sum())
+            background_voxels += int(trainable.sum()) - int(ink.sum())
     if not training and not held_out:
         raise ValueError(f"{segment.inklabels} produced no valid patches")
+    report_training_composition(
+        segment, len(training), ink_voxels, background_voxels
+    )
     return training, held_out
 
 
