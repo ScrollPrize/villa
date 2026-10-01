@@ -309,3 +309,28 @@ def test_cached_history_attention_matches_mha_and_reuses_attached_projections(de
     torch.testing.assert_close(*outputs, rtol=rtol, atol=atol)
     for a, b in zip(*gradients):
         torch.testing.assert_close(a, b, rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize('batch_size', [0, 2])
+def test_slab_instance_norm_matches_native_and_supports_empty_backward(batch_size):
+    from vesuvius.neural_tracing.fiber_follow.regression.history_slabs import SlabInstanceNorm
+    native = torch.nn.InstanceNorm3d(8, affine=True)
+    norm = SlabInstanceNorm(8)
+    norm.load_state_dict(native.state_dict())
+    x = torch.randn(batch_size, 8, 2, 9, 9, requires_grad=True)
+    actual = norm(x)
+    if batch_size:
+        torch.testing.assert_close(actual, native(x), atol=1e-6, rtol=1e-5)
+    actual.square().sum().backward()
+    assert x.grad is not None and torch.isfinite(x.grad).all()
+
+
+def test_history_residuals_use_shared_basicblock_d():
+    from vesuvius.models.build.resblocks import BasicBlockD
+    encoder = build_model(cfg()).history_encoder
+    for stage in (1, 3, 5):
+        block = encoder.convolution[stage]
+        assert isinstance(block, BasicBlockD)
+        assert isinstance(block.conv1.norm, torch.nn.InstanceNorm3d)
+        assert isinstance(block.nonlin2, torch.nn.LeakyReLU)
+        assert block.nonlin2.negative_slope == .01

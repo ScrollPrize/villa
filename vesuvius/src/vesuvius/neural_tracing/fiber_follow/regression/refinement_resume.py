@@ -1,17 +1,13 @@
 """Fork a resumable checkpoint with additional learned refinement stages."""
 import argparse
 import copy
-import hashlib
 import json
-from pathlib import Path
-import shutil
-import sys
-import tempfile
 
 import torch
 
 from .model import build_model
-from .train import build_parser, checkpoint_config, options_argv
+from .train import checkpoint_config
+from .checkpoint_migration import fork_checkpoint
 
 
 STAGE = 'refinement_stage.weight'
@@ -71,68 +67,12 @@ def expand_refinement_checkpoint(checkpoint, steps):
 
 
 def fork_run(source, name, steps):
-    """Prepare an independent run directory using only checkpoint settings.
-
-    The frozen monitor fixture is copied byte-for-byte. Published source replay
-    caches are referenced read-only; subsequent replay publication is independent.
-    This prepares artifacts and a command, and does not stop or launch processes.
-    """
-    source = Path(source).resolve()
-    if not name or Path(name).name != name or name in ('.', '..'):
-        raise ValueError('Run name must be a single directory name')
-    original = torch.load(source, map_location='cpu', weights_only=False)
-    migrated = expand_refinement_checkpoint(original, steps)
-    options = migrated['training_options']
-    if options['reset_optimizer']:
-        raise ValueError('Refusing a continuation that would reset optimizer state')
-    destination = Path(options['out_root']).resolve()/name
-    if destination.exists():
-        raise FileExistsError(destination)
-    fixture = source.parent/'monitor_recovery.npz'
-    if options['recovery_every'] and hashlib.sha256(fixture.read_bytes()).hexdigest() != original['monitor_recovery_sha256']:
-        raise ValueError('Source monitor fixture does not match checkpoint')
-    replay_file = source.parent/'dagger/replay.json'
-    replay = json.loads(replay_file.read_text()) if replay_file.exists() else options['onpolicy']
-    if any(not Path(p).exists() for p in replay):
-        raise ValueError('A source replay cache is missing')
-    target = destination/f"ckpt_{original['step']:06d}.pt"
-    options.update(name=name, out_root=str(destination.parent), resume=str(target))
-    argv = options_argv(options)
-    parsed = vars(build_parser().parse_args(argv))
-    if json.dumps(parsed, sort_keys=True) != json.dumps(options, sort_keys=True):
-        raise ValueError('Checkpoint options do not round-trip through the current trainer CLI')
-    changes = {k:dict(before=original['training_options'][k], after=v)
-               for k,v in options.items() if v != original['training_options'][k]}
-    if changes.keys() - {'name', 'out_root', 'resume', 'recurrent_refinement_steps'}:
-        raise ValueError('Unexpected training setting change')
-    info = dict(source_checkpoint=str(source), source_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
-                source_step=original['step'], source_refinements=original['model_cfg']['recurrent_refinement_steps'],
-                refinement_steps=steps, initialization='copy last learned stage; zero new Adam moment rows; retain Adam step',
-                changes=changes, replay_paths=replay,
-                command=[sys.executable, '-u', '-m', 'vesuvius.neural_tracing.fiber_follow.regression.train', *argv])
-    migrated['refinement_migration'] = info
-    config = dict(options)
-    config.update({k:v for k,v in migrated.items() if k not in
-                   ('model','ema','optimizer','rng','training_options','step','samples_seen','lr_restart_step')})
-    with torch.random.fork_rng(devices=[]):
-        config['parameter_count'] = sum(p.numel() for p in build_model(checkpoint_config(migrated)).parameters())
-    staging = Path(tempfile.mkdtemp(prefix=f'.{name}-', dir=destination.parent))
-    try:
-        torch.save(migrated, staging/target.name)
-        shutil.copyfile(staging/target.name, staging/'last.pt')
-        if options['recovery_every']:
-            shutil.copyfile(fixture, staging/'monitor_recovery.npz')
-        (staging/'dagger').mkdir()
-        (staging/'dagger/replay.json').write_text(json.dumps(replay, indent=2)+'\n')
-        (staging/'config.json').write_text(json.dumps(config, indent=2)+'\n')
-        (staging/'migration.json').write_text(json.dumps(info, indent=2)+'\n')
-        if destination.exists():
-            raise FileExistsError(destination)
-        staging.rename(destination)
-    except BaseException:
-        shutil.rmtree(staging)
-        raise
-    return info
+    return fork_checkpoint(source, name, lambda ck: expand_refinement_checkpoint(ck, steps),
+        allowed_changes={'recurrent_refinement_steps'}, migration_key='refinement_migration',
+        describe=lambda original, migrated: dict(
+            source_refinements=original['model_cfg']['recurrent_refinement_steps'],
+            refinement_steps=steps,
+            initialization='copy last learned stage; zero new Adam moment rows; retain Adam step'))
 
 
 def main():

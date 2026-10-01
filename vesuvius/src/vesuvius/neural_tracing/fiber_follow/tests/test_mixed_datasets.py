@@ -130,17 +130,41 @@ def test_real_config_has_requested_sources_and_stable_paths():
     assert [s['weight'] for s in d['sources']]==[.1,.45,.45]
     assert [s['validation']['count'] for s in d['sources'] if s['kind']=='afv']==[406,406]
     assert 'SMALLMORE' not in json.dumps(d)
-    assert Path(d['cache_dir']).is_relative_to(p.parent.parent/'datasets')
+    assert d['cache_dir']=='/mnt/raid_nvme/volume_cache'
     assert digest==read_dataset_config(p)[1]
 
 
-def test_remote_array_chunk_edges_and_pickle(tmp_path,monkeypatch):
+def test_resume_allows_cache_relocation_but_not_dataset_changes():
+    from copy import deepcopy
+    from vesuvius.neural_tracing.fiber_follow.regression.datasets import validate_dataset_resume
+    p=Path(__file__).resolve().parents[1]/'configs/mixed_ct_datasets.json'
+    document,digest=read_dataset_config(p)
+    old=deepcopy(document);old['cache_dir']='/old/cache'
+    checkpoint=dict(dataset_config=old,dataset_config_sha256='old-digest')
+    validate_dataset_resume(checkpoint,document,digest)
+    validate_dataset_resume(dict(dataset_config_sha256=digest),document,digest)
+    validate_dataset_resume({},None,None)  # Legacy single-source checkpoints.
+    for key,value in [('ct','s3://different/volume'),('weight',.2),
+                      ('validation',dict(strategy='fiber_hash',count=405,seed=7349))]:
+        changed=deepcopy(document);changed['sources'][1][key]=value
+        with pytest.raises(ValueError,match='dataset configuration changed'):
+            validate_dataset_resume(checkpoint,changed,'changed-digest')
+    for missing in ({},dict(dataset_config_sha256='old-digest')):
+        with pytest.raises(ValueError,match='dataset configuration changed'):
+            validate_dataset_resume(missing,document,digest)
+    assert checkpoint['dataset_config']['cache_dir']=='/old/cache'
+
+
+@pytest.mark.parametrize('separator',['.','/'])
+def test_remote_array_chunk_edges_and_pickle(tmp_path,monkeypatch,separator):
     values=np.arange(9*10*11,dtype=np.uint16).reshape(9,10,11)
     class Array:
         shape=values.shape;chunks=(4,4,4);dtype=values.dtype;fill_value=0
+        dimension_separator=separator
         def __getitem__(self,key):return values[key]
     monkeypatch.setattr(RemoteChunkedArray,'_open',lambda self:Array())
     a=RemoteChunkedArray('s3://fixture/ct',0,tmp_path,1024)
+    assert Path(a.path)==tmp_path/'s3/fixture/ct/0'
     a=pickle.loads(pickle.dumps(a))
     np.testing.assert_array_equal(a.read([7,8,9],[2,2,2]),values[7:9,8:10,9:11])
     block=a.read([-1,-1,-1],[3,3,3])
@@ -149,7 +173,8 @@ def test_remote_array_chunk_edges_and_pickle(tmp_path,monkeypatch):
     # Persist raw full-size chunks, then reopen with network access forbidden.
     metadata=json.loads((Path(a.path)/'.zarray').read_text())
     assert metadata['compressor'] is None and metadata['filters'] is None
-    assert (Path(a.path)/'1.2.2').stat().st_size==4**3*values.dtype.itemsize
+    assert metadata['dimension_separator']==separator
+    assert (Path(a.path)/separator.join(['1','2','2'])).stat().st_size==4**3*values.dtype.itemsize
     assert isinstance(a.chunk((1,2,2)),np.memmap)
     def forbidden(self):raise AssertionError('Cached reads must not open the remote store')
     monkeypatch.setattr(RemoteChunkedArray,'_open',forbidden)

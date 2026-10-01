@@ -3,6 +3,7 @@
 Reads only requested remote chunks. Does not launch or modify training.
 """
 import argparse
+from contextlib import ExitStack
 from dataclasses import asdict
 import json
 from pathlib import Path
@@ -24,7 +25,9 @@ def main():
     ap=argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--dataset-config',default=str(Path(__file__).resolve().parents[1]/'configs/mixed_ct_datasets.json'))
     ap.add_argument('--out',default=str(Path(__file__).resolve().parents[1]/'datasets/automated_fiber_volumes/training_preflight.json'))
+    ap.add_argument('--prefetch-connections',type=int,default=0)
     args=ap.parse_args()
+    if args.prefetch_connections < 0:raise ValueError('Prefetch connections must be nonnegative')
     torch.set_num_threads(2);torch.manual_seed(7349)
     document,digest=read_dataset_config(args.dataset_config)
     cfg=DirectConfig(input_mode='ct',direction_inputs=False,encoder='patch4',token_only=True,
@@ -55,24 +58,35 @@ def main():
             validation_ids=sorted(validation.ids) if hasattr(validation,'ids') else [f.name for f in validation],
             manifest=getattr(dataset,'validation_manifest',manifest))
         (splits/f'{name}.json').write_text(json.dumps(value,indent=2)+'\n')
-    results=[]
-    for name,dataset in zip(mixed.names,mixed.datasets):
-        print('Reading',name,flush=True)
-        data=next(iter(dataset));model=build_model(cfg)
-        kwargs={'candidates':data['candidate_points']} if 'candidate_points' in data and data['candidate_mask'].any() else {}
-        output=model(data['x'],data['hist'],data['hmask'],**kwargs)
-        terms=loss_terms(output,data,cfg)
-        loss=terms['geometry_per_state'].mean()+.5*terms['confidence_per_state'].mean()
-        if 'candidate_per_state' in terms:loss=loss+terms['candidate_per_state'].mean()
-        loss.backward()
-        assert torch.isfinite(loss) and data['x']['fine'].shape[1]==1
-        assert any(p.grad is not None and p.grad.abs().sum()>0 for p in model.parameters())
-        row=dict(name=name,shape=list(data['x']['fine'].shape),loss=float(loss.detach()),
-            valid_history_slabs=int(data['x']['history_valid'].sum()),sources=data['source'].tolist(),
-            foreign_voxels=int(data['foreign'].sum()),forward_backward='passed')
-        print(json.dumps(row),flush=True);results.append(row)
+    prefetch_stats=None
+    with ExitStack() as stack:
+        service=None
+        if args.prefetch_connections:
+            from vesuvius.neural_tracing.fiber_follow.shared.remote_prefetch import RemotePrefetcher
+            service=stack.enter_context(RemotePrefetcher(args.prefetch_connections))
+            for dataset in mixed.datasets:
+                if dataset.vol_spec.ct_zarr.startswith(('s3://','http://','https://')):
+                    dataset.remote_prefetch=service.client
+        results=[]
+        for name,dataset in zip(mixed.names,mixed.datasets):
+            print('Reading',name,flush=True)
+            data=next(iter(dataset));model=build_model(cfg)
+            kwargs={'candidates':data['candidate_points']} if 'candidate_points' in data and data['candidate_mask'].any() else {}
+            output=model(data['x'],data['hist'],data['hmask'],**kwargs)
+            terms=loss_terms(output,data,cfg)
+            loss=terms['geometry_per_state'].mean()+.5*terms['confidence_per_state'].mean()
+            if 'candidate_per_state' in terms:loss=loss+terms['candidate_per_state'].mean()
+            loss.backward()
+            assert torch.isfinite(loss) and data['x']['fine'].shape[1]==1
+            assert any(p.grad is not None and p.grad.abs().sum()>0 for p in model.parameters())
+            row=dict(name=name,shape=list(data['x']['fine'].shape),loss=float(loss.detach()),
+                valid_history_slabs=int(data['x']['history_valid'].sum()),sources=data['source'].tolist(),
+                foreign_voxels=int(data['foreign'].sum()),forward_backward='passed')
+            print(json.dumps(row),flush=True);results.append(row)
+        if service:prefetch_stats=service.snapshot()
     report=dict(dataset_config_sha256=digest,model_cfg=cfg.to_dict(),sampling=asdict(sampling),
-                probabilities=mixed.weights.tolist(),datasets=provenance,checks=results)
+                probabilities=mixed.weights.tolist(),datasets=provenance,checks=results,
+                remote_prefetch=prefetch_stats)
     Path(args.out).write_text(json.dumps(report,indent=2)+'\n')
 
 

@@ -22,7 +22,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.runloop import (
 )
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume, FiberVolumeSpec
 from vesuvius.neural_tracing.fiber_follow.regression.model import (
-    ARCHITECTURE, PATCH_ARCHITECTURE, TOKEN_ARCHITECTURE, DirectConfig, build_model,
+    ARCHITECTURE, PATCH_ARCHITECTURE, TOKEN_ARCHITECTURE, STEM_ARCHITECTURE, DirectConfig, build_model,
 )
 from vesuvius.neural_tracing.fiber_follow.regression.data import (
     IdentityObservationBuilder, IdentitySampling, DirectTracer, LOCATION_SOURCES,
@@ -187,7 +187,7 @@ def initialize_training_optimizer(model, ema, args, resume=None):
     return opt, done, origin
 
 
-ARCHITECTURES = (ARCHITECTURE, PATCH_ARCHITECTURE, TOKEN_ARCHITECTURE)
+ARCHITECTURES = (ARCHITECTURE, PATCH_ARCHITECTURE, TOKEN_ARCHITECTURE, STEM_ARCHITECTURE)
 HISTORY_GRAD_CLIP = 5.
 REST_GRAD_CLIP = 100.
 
@@ -532,10 +532,12 @@ def build_parser():
     ap.add_argument('--workers', type=int, default=8)
     ap.add_argument('--worker-cache-gb', type=float, default=.5)
     ap.add_argument('--remote-prefetch-connections', type=int, default=0,
-                    help='Concurrent async chunk fetches in a separate process; 0 disables')
+                    help='Concurrent async chunk fetches and S3 pool limit per client in a separate process; 0 disables')
     ap.add_argument('--remote-prefetch-queue-size', type=int, default=512,
                     help='Bound per priority queue; required batches override speculative fetches')
-    ap.add_argument('--remote-prefetch-timeout', type=float, default=120,
+    ap.add_argument('--remote-prefetch-lookahead', type=int, default=16,
+                    help='Future microbatch plans per remote source per worker; 0 disables deeper lookahead')
+    ap.add_argument('--remote-prefetch-timeout', type=float, default=120.,
                     help='Maximum seconds waiting for batch cache readiness; no foreground network fallback')
     ap.add_argument('--threads', type=int, default=4)
     ap.add_argument('--lr', type=float, default=3e-4)
@@ -549,6 +551,10 @@ def build_parser():
     ap.add_argument('--tolerance', type=float, default=1.5)
     ap.add_argument('--n-commit', type=int, default=16)
     ap.add_argument('--channels', type=int, default=DirectConfig.channels, help='Base image encoder width')
+    ap.add_argument('--stem-channels', type=int, default=DirectConfig.stem_channels,
+                    help='Parallel residual patch stem width; 0 disables (token-only patch4 models)')
+    ap.add_argument('--stem-blocks', type=int, default=DirectConfig.stem_blocks,
+                    help='BasicBlockD blocks per downsampling stage in the optional patch stem')
     ap.add_argument('--encoder', choices=('conv', 'patch4'), default=None,
                     help='Image encoder: conv (default) or overlapping 6x6x6 patches at stride 4; inferred on resume')
     ap.add_argument('--token-only', action=argparse.BooleanOptionalAction, default=None,
@@ -672,9 +678,9 @@ def main(argv=None):
         raise ValueError('Gradient clipping limits must be finite and nonnegative (0 disables clipping)')
     if not math.isfinite(args.fresh_fraction) or not 0 <= args.fresh_fraction <= 1:
         raise ValueError('Fresh fraction must be finite and in [0, 1]')
-    if (args.remote_prefetch_connections < 0 or args.remote_prefetch_queue_size < 1
+    if (args.remote_prefetch_connections < 0 or args.remote_prefetch_queue_size < 1 or args.remote_prefetch_lookahead < 0
             or not math.isfinite(args.remote_prefetch_timeout) or args.remote_prefetch_timeout <= 0):
-        raise ValueError('Prefetch connections must be nonnegative; queue size and timeout must be positive')
+        raise ValueError('Prefetch connections and lookahead must be nonnegative; queue size and timeout must be positive')
     if min(args.steps, args.batch, args.microbatch, args.log_every, args.ckpt_every,
            args.threads, args.replay_keep, args.dagger_seeds, args.recovery_seeds) < 1 or args.batch % args.microbatch:
         raise ValueError('Positive counts required; microbatch must divide effective batch')
@@ -696,6 +702,7 @@ def main(argv=None):
     resume = read_checkpoint(args.resume,ARCHITECTURES,args.device) if args.resume else None
     cfg = DirectConfig(encoder=resolve_encoder(args.encoder, resume),
                        token_only=resolve_token_only(args.token_only, resume),
+                       stem_channels=args.stem_channels, stem_blocks=args.stem_blocks,
                        direction_inputs=args.direction_inputs,input_mode=args.input_mode,channels=args.channels,hidden=args.hidden,layers=args.axial_layers,
                        decoder_layers=args.decoder_layers,
                        activation_checkpointing=args.activation_checkpointing,
@@ -706,8 +713,8 @@ def main(argv=None):
             raise ValueError('Direction inputs must match the resumed checkpoint; start a new run to change them')
         if args.input_mode != cfg.input_mode:
             raise ValueError('Input mode must match the checkpoint; CT-only starts a separate model')
-        if resume.get('dataset_config_sha256') != dataset_digest:
-            raise ValueError('Resume dataset configuration changed')
+        from .datasets import validate_dataset_resume
+        validate_dataset_resume(resume,dataset_document,dataset_digest)
     args.encoder = cfg.encoder
     args.token_only = cfg.token_only
     if args.decision_fraction and args.microbatch % 2:
@@ -794,7 +801,7 @@ def main(argv=None):
     if resume:
         # Allow a new base LR without resetting AdamW or the schedule origin.
         ignored = {'resume','reset_optimizer','lr','out_root','device','batch','microbatch','workers','threads','worker_cache_gb','dataset_config',
-                   'remote_prefetch_connections','remote_prefetch_queue_size','remote_prefetch_timeout',
+                   'remote_prefetch_connections','remote_prefetch_queue_size','remote_prefetch_timeout','remote_prefetch_lookahead',
                    'log_every','ckpt_every','diag_every','dagger_device',
                    'negative_bank_refresh_seconds','negative_bank_cache_mb','activation_checkpointing',
                    'history_grad_clip','rest_grad_clip','presence_dropout','blur_probability','blur_sigma',
@@ -802,7 +809,8 @@ def main(argv=None):
                    'bank_hard_fraction','replay_failure_fraction','bank_switch_tolerance','bank_own_tolerance',
                    'n_commit'}
         for key,value in vars(args).items():
-            recorded = resume['training_options'].get(key, {'input_mode': 'ct+presence', 'dataset_config': None}.get(key))
+            recorded = resume['training_options'].get(key, {'input_mode': 'ct+presence', 'dataset_config': None,
+                                                           'stem_channels': 0, 'stem_blocks': 2}.get(key))
             if key not in ignored and json.dumps(recorded,sort_keys=True) != json.dumps(value,sort_keys=True):
                 raise ValueError(f'Resume option differs: {key}')
         if resume['seed_manifest_sha256'] != manifest['sha256'] or resume['fiber_manifest'] != fiber_manifest(fibers):
@@ -927,14 +935,18 @@ def main(argv=None):
             if remote_sources:
                 from ..shared.remote_prefetch import RemotePrefetcher
                 remote_prefetch = RemotePrefetcher(args.remote_prefetch_connections,args.remote_prefetch_queue_size,
-                                                  args.remote_prefetch_timeout)
+                    args.remote_prefetch_timeout,
+                    lookahead_slots=max(1,args.workers)*len(remote_sources) if args.remote_prefetch_lookahead else 0)
                 for source in remote_sources:
                     source.remote_prefetch = remote_prefetch.client
+                    source.remote_prefetch_lookahead = args.remote_prefetch_lookahead
                 progress(f'Remote CT prefetch: {args.remote_prefetch_connections} concurrent fetches, '
-                         f'{args.remote_prefetch_queue_size} requests per priority queue, separate async process')
+                         f'{args.remote_prefetch_queue_size} requests per priority queue, '
+                         f'{args.remote_prefetch_lookahead} future microbatch plans per remote source/worker, separate async process')
             log.record(dict(step=done,event='remote_prefetch_configuration',
                 enabled=remote_prefetch is not None,connections=args.remote_prefetch_connections,
-                queue_size=args.remote_prefetch_queue_size,timeout=args.remote_prefetch_timeout,sources=len(remote_sources)))
+                queue_size=args.remote_prefetch_queue_size,lookahead=args.remote_prefetch_lookahead,
+                timeout=args.remote_prefetch_timeout,sources=len(remote_sources)))
         if args.diag_every or args.long_diag_every:
             from vesuvius.neural_tracing.fiber_follow.shared.trace import TraceParams
             tracer = DirectTracer(ema, FiberVolume(spec), cfg.fine, cfg.n_history,

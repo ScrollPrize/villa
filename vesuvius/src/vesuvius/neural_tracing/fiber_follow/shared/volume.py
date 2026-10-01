@@ -9,12 +9,12 @@ from __future__ import annotations
 
 import json
 import os
-import hashlib
 import tempfile
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import numcodecs
 import numpy as np
@@ -180,16 +180,17 @@ class RemoteChunkedArray(ChunkedArray):
 
     @staticmethod
     def cache_path(url,level,cache_dir):
-        namespace = hashlib.sha256(str(url).rstrip('/').encode()).hexdigest()
-        return Path(cache_dir)/'uncompressed'/namespace/str(level)
+        source = urlsplit(str(url).rstrip('/'))
+        return Path(cache_dir)/source.scheme/source.netloc/source.path.lstrip('/')/str(level)
 
     @classmethod
     def publish_metadata(cls,local,array,url,level):
         if len(array.shape) != 3:
             raise ValueError('Remote CT must be a three-dimensional ZYX array')
         metadata = dict(zarr_format=2,shape=list(array.shape),chunks=list(array.chunks),
-            dtype=np.dtype(array.dtype).str,fill_value=np.asarray(array.fill_value or 0).item(),
-            compressor=None,filters=None,order='C',dimension_separator='.')
+            dtype=np.dtype(array.dtype).str,fill_value=np.asarray(getattr(array,'metadata',array).fill_value or 0).item(),
+            compressor=None,filters=None,order='C',
+            dimension_separator=getattr(getattr(array,'metadata',array),'dimension_separator','.'))
         cls._atomic_write(local/'.zattrs',json.dumps(dict(remote_url=url,level=level)).encode())
         cls._atomic_write(local/'.zarray',json.dumps(metadata).encode())
 
@@ -247,18 +248,21 @@ class RemoteChunkedArray(ChunkedArray):
             return super()._load(key)
 
 
-def remote_store(url):
+def remote_store(url, *, max_pool_connections=None):
     from vesuvius.neural_tracing.datasets.common import _make_remote_store
     from vesuvius.neural_tracing.s3_utils import s3_storage_options_for_path
     _register_vcz1()
     options = s3_storage_options_for_path(url) if url.startswith('s3://') else {}
+    if url.startswith('s3://') and max_pool_connections is not None:
+        options['config_kwargs'] = {'max_pool_connections': max_pool_connections}
     return _make_remote_store(url,options,missing_exceptions=(KeyError,FileNotFoundError))
 
 
-async def open_remote_array(url,level):
+async def open_remote_array(url,level, *, max_pool_connections=None):
     """Native async Zarr I/O; no synchronous array reads on the event loop."""
     from zarr.api.asynchronous import open_array
-    return await open_array(store=remote_store(url),path=str(level),mode='r')
+    return await open_array(store=remote_store(url,max_pool_connections=max_pool_connections),
+                            path=str(level),mode='r')
 
 
 @dataclass

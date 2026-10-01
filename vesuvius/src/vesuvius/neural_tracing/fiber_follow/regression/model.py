@@ -12,9 +12,10 @@ from torch.utils.checkpoint import checkpoint
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
 from vesuvius.neural_tracing.fiber_follow.shared.policy import DEFAULT_CONFIDENCE, commit_prefix
 
-ARCHITECTURE = 'axial_fiber_slabs_v10'
-PATCH_ARCHITECTURE = 'axial_patch4_overlap_fiber_slabs_v11'
-TOKEN_ARCHITECTURE = 'axial_patch4_overlap_tokens_fiber_slabs_v11'
+ARCHITECTURE = 'axial_fiber_slabs_v13'
+PATCH_ARCHITECTURE = 'axial_patch4_overlap_fiber_slabs_v13'
+TOKEN_ARCHITECTURE = 'axial_patch4_overlap_tokens_fiber_slabs_v13'
+STEM_ARCHITECTURE = 'axial_patch4_residual_stem_tokens_fiber_slabs_v13'
 TOKEN_STRIDE = (8, 2, 2)
 TOKEN_OFFSET = (3, 0, 0)
 
@@ -23,7 +24,7 @@ TOKEN_OFFSET = (3, 0, 0)
 class DirectConfig:
     direction_inputs: bool = False
     input_mode: str = 'ct+presence'
-    fine: CropSpec = field(default_factory=lambda: CropSpec(depth=120, width=101, behind=48, spacing=.5))
+    fine: CropSpec = field(default_factory=lambda: CropSpec(depth=120, width=104, behind=48, spacing=.5))
     channels: int = 32
     hidden: int = 128
     heads: int = 4
@@ -38,6 +39,8 @@ class DirectConfig:
     recurrent_refinement_steps: int = 2
     encoder: str = 'conv'
     token_only: bool = False
+    stem_channels: int = 0
+    stem_blocks: int = 2
 
     def __post_init__(self):
         if self.input_mode not in ('ct', 'ct+presence') or (self.input_mode == 'ct' and self.direction_inputs):
@@ -46,9 +49,15 @@ class DirectConfig:
             raise ValueError('Encoder must be conv or patch4')
         if not isinstance(self.token_only, bool) or (self.token_only and self.encoder != 'patch4'):
             raise ValueError('Token-only features require the patch4 encoder')
+        if type(self.stem_channels) is not int or self.stem_channels < 0 or type(self.stem_blocks) is not int or self.stem_blocks < 1:
+            raise ValueError('Stem channels must be a nonnegative integer and stem blocks a positive integer')
+        if self.stem_channels and not self.token_only:
+            raise ValueError('Residual stem requires the token-only patch4 encoder')
         if isinstance(self.fine, dict):
             self.fine = CropSpec(**self.fine)
         c = self.fine
+        if self.encoder == 'patch4' and (c.depth % 4 or c.width % 4):
+            raise ValueError('Patch4 crop dimensions must be multiples of four')
         if min(c.depth, c.width) < 8 or not 0 <= c.behind < c.depth or not math.isfinite(c.spacing) or c.spacing <= 0:
             raise ValueError('Invalid fine crop')
         if min(self.channels, self.hidden, self.heads, self.layers, self.decoder_layers,
@@ -79,6 +88,8 @@ class DirectConfig:
 
     @property
     def architecture(self):
+        if self.stem_channels:
+            return STEM_ARCHITECTURE
         if self.token_only:
             return TOKEN_ARCHITECTURE
         return PATCH_ARCHITECTURE if self.encoder == 'patch4' else ARCHITECTURE
@@ -282,7 +293,7 @@ class AxialBlock(nn.Module):
 
 
 def token_coordinates(cfg):
-    """Token centers in crop-local XYZ, including patch padding at crop edges."""
+    """Token centers in crop-local XYZ."""
     d,y,x = torch.meshgrid(*(torch.arange(n).float() for n in cfg.token_shape),indexing='ij')
     xyz = torch.stack((x,y,d),-1)
     xyz = (xyz*xyz.new_tensor(tuple(reversed(cfg.token_stride)))

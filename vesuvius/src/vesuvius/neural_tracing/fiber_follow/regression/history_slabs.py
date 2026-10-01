@@ -5,6 +5,7 @@ import numpy as np
 import torch
 from torch import nn
 import torch.nn.functional as F
+from vesuvius.models.build.resblocks import BasicBlockD
 
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import (
     CropSpec, arclength, interp_at, frame_from_heading, normalize, crop_local_grid,
@@ -107,14 +108,30 @@ def load_slabs(items, vol, cfg, pool=None):
                 history_ages=ages, history_overlap=overlap, history_load_seconds=elapsed)
 
 
+class SlabInstanceNorm(nn.InstanceNorm3d):
+    """Affine instance normalization that also supports zero valid slabs.
+
+    One group per channel computes the same per-instance spatial statistics
+    without native InstanceNorm's empty-batch failure or running statistics.
+    This also avoids branching on a dynamic batch size inside torch.compile.
+    """
+    def __init__(self, channels, eps=1e-5, affine=True):
+        super().__init__(channels, eps=eps, affine=affine, track_running_stats=False)
+
+    def forward(self, x):
+        return F.group_norm(x, self.num_features, self.weight, self.bias, self.eps)
+
+
 class HistoryEncoder(nn.Module):
     """The sole history interface: spatial feature tokens and padding mask."""
     def __init__(self, cfg):
         super().__init__()
-        from .model import ResidualConv
         stages, previous = [], 2  # CT and observed-path heatmap
         for channels, stride in zip((8, 16, 32), ((1, 2, 2), (2, 2, 2), (2, 2, 2))):
-            stages.extend((nn.Conv3d(previous, channels, 3, stride=stride, padding=1), ResidualConv(channels)))
+            stages.extend((nn.Conv3d(previous, channels, 3, stride=stride, padding=1),
+                BasicBlockD(nn.Conv3d, channels, channels, 3, 1,
+                    norm_op=SlabInstanceNorm, norm_op_kwargs=dict(eps=1e-5, affine=True),
+                    nonlin=nn.LeakyReLU, nonlin_kwargs=dict(negative_slope=.01, inplace=True))))
             previous = channels
         self.convolution = nn.Sequential(*stages)
         self.projection = nn.Linear(32, cfg.hidden)
@@ -129,7 +146,7 @@ class HistoryEncoder(nn.Module):
         b, slots = valid.shape
         indices = valid.flatten().nonzero().flatten()
         selected = slabs.flatten(0, 1).index_select(0, indices)
-        # Empty batches are supported by Conv3d/GroupNorm: no dummy slab work.
+        # SlabInstanceNorm supports empty batches: no dummy slab work.
         features = self.convolution(selected).flatten(2).transpose(1, 2)
         projected = self.projection(features)
         tokens = projected.new_zeros(b*slots, 162, projected.shape[-1])

@@ -4,7 +4,9 @@ Two bounded IPC queues feed a priority heap. Loader workers only memory-map
 ready chunks; all remote metadata/chunk I/O uses Zarr's async API here.
 """
 import asyncio
+from collections import deque, OrderedDict
 import heapq
+from functools import lru_cache
 from itertools import product
 import json
 import multiprocessing as mp
@@ -20,7 +22,8 @@ from .volume import RemoteChunkedArray, open_remote_array
 
 DEMAND, AHEAD = 0, 10
 COUNTERS = ('submitted', 'deferred', 'cached', 'completed', 'completed_bytes',
-            'deduplicated', 'promoted', 'preempted', 'errors', 'active')
+            'deduplicated', 'promoted', 'preempted', 'errors', 'active',
+            'lookahead_windows', 'lookahead_chunks')
 
 
 def _add(counters, name, amount=1):
@@ -37,26 +40,59 @@ def chunk_keys(start, size, shape, chunks):
     yield from product(*(range(int(a), int(b)+1) for a,b in zip(lo//chunks, (hi-1)//chunks)))
 
 
+@lru_cache(maxsize=128)
+def _chunk_separator(root):
+    # Metadata is published before chunk requests and stays fixed for this array.
+    return json.loads((root/'.zarray').read_text()).get('dimension_separator','.')
+
+
 def _paths(descriptor, key, session):
     root = RemoteChunkedArray.cache_path(*descriptor)
     name = '.zarray' if key is None else '.'.join(map(str,key))
-    return root/name, root/'.prefetch_errors'/session/(name+'.json')
+    chunk_path = name if key is None else _chunk_separator(root).join(map(str,key))
+    return root/chunk_path, root/'.prefetch_errors'/session/(name+'.json')
 
 
 class PrefetchClient:
     """Picklable endpoint for regular workers; submission never waits for space."""
-    def __init__(self, urgent, ahead, stopped, heartbeat, counters, session, timeout):
+    def __init__(self, urgent, ahead, stopped, heartbeat, counters, session, timeout, windows=None):
         self.urgent, self.ahead, self.stopped = urgent, ahead, stopped
         self.heartbeat, self.counters = heartbeat, counters
         self.session, self.timeout, self._pid = session, timeout, None
+        self.windows = windows
+        self._pending_windows = {}
+
+    def _connect(self):
+        if self._pid != os.getpid():
+            for requests in (self.urgent,self.ahead,self.windows):
+                if requests is not None:
+                    requests.cancel_join_thread()
+            self._pid = os.getpid()
+
+    def _publish_windows(self):
+        self._connect()
+        for (scope,descriptor),keys in list(self._pending_windows.items()):
+            try:
+                self.windows.put_nowait(((os.getpid(),scope),descriptor,keys))
+            except queue.Full:
+                _add(self.counters,'deferred')
+                break
+            del self._pending_windows[(scope,descriptor)]
+
+    def lookahead(self, reader, batches, *, scope=None):
+        """Publish the bounded plan window; chunk-queue capacity does not trim it."""
+        if not isinstance(reader,RemoteChunkedArray) or self.windows is None:
+            return
+        descriptor = (reader.remote_url,reader.level,reader.cache_dir)
+        # Preserve batch order while downloading each overlapping chunk once.
+        keys = tuple(dict.fromkeys(key for bounds in batches for key in self._keys(reader,bounds)))
+        self._pending_windows[(scope,descriptor)] = keys
+        self._publish_windows()
 
     def _submit(self, descriptor, keys, priority):
         if self.stopped.is_set():
             return
-        if self._pid != os.getpid():
-            self.urgent.cancel_join_thread()
-            self.ahead.cancel_join_thread()
-            self._pid = os.getpid()
+        self._connect()
         destination = self.urgent if priority == DEMAND else self.ahead
         for key in keys:
             path,_ = _paths(descriptor,key,self.session)
@@ -82,6 +118,8 @@ class PrefetchClient:
         pending = list(keys)
         deadline, next_submit = time.monotonic()+self.timeout, 0.
         while pending:
+            if self._pending_windows:
+                self._publish_windows()
             pending = [key for key in pending if not _paths(descriptor,key,self.session)[0].is_file()]
             if not pending:
                 return
@@ -102,6 +140,8 @@ class PrefetchClient:
             self.stopped.wait(.01)
 
     def ensure_metadata(self, spec):
+        if not spec.cache_dir:
+            raise ValueError('Remote CT prefetch requires a persistent cache_dir')
         self._ensure((str(spec.ct_zarr).rstrip('/'),int(spec.ct_level),str(spec.cache_dir)),[None])
 
     def ensure(self, reader, bounds):
@@ -110,12 +150,14 @@ class PrefetchClient:
 
 
 class AsyncFetcher:
-    def __init__(self, session):
+    def __init__(self, session, connections):
         self.session, self.opening = session, {}
+        self.connections = connections
 
     async def array(self, descriptor):
         if descriptor not in self.opening:
-            self.opening[descriptor] = asyncio.create_task(open_remote_array(*descriptor[:2]))
+            self.opening[descriptor] = asyncio.create_task(open_remote_array(
+                *descriptor[:2],max_pool_connections=self.connections))
         task = self.opening[descriptor]
         try:
             # Preempting one chunk must not cancel shared metadata needed by others.
@@ -134,7 +176,7 @@ class AsyncFetcher:
             array = await self.array(descriptor)
             await asyncio.to_thread(RemoteChunkedArray.publish_metadata,path.parent,array,*descriptor[:2])
             return 'completed',0
-        lock_path = path.parent/'.locks'/path.name
+        lock_path = RemoteChunkedArray.cache_path(*descriptor)/'.locks'/'.'.join(map(str,key))
         lock_path.parent.mkdir(parents=True,exist_ok=True)
         with lock_path.open('a+b') as lock:
             while True:
@@ -150,7 +192,7 @@ class AsyncFetcher:
             start = np.asarray(key)*array.chunks
             stop = np.minimum(start+array.chunks,array.shape)
             values = await array.getitem(tuple(slice(int(a),int(b)) for a,b in zip(start,stop)))
-            result = np.full(array.chunks,array.fill_value or 0,array.dtype)
+            result = np.full(array.chunks,getattr(array,'metadata',array).fill_value or 0,array.dtype)
             result[tuple(slice(0,n) for n in values.shape)] = values
             # Disk writes run off the network event loop. Finish an atomic write
             # before releasing its chunk lock, even when the request is preempted.
@@ -182,9 +224,11 @@ class AsyncFetcher:
         await asyncio.gather(*self.opening.values(),return_exceptions=True)
 
 
-async def _run(urgent,ahead,stopped,heartbeat,counters,session,connections,queue_size):
-    fetcher = AsyncFetcher(session)
+async def _run(urgent,ahead,stopped,heartbeat,counters,session,connections,queue_size,
+               window_queue=None,lookahead_slots=0):
+    fetcher = AsyncFetcher(session,connections)
     heap, waiting, active = [], {}, {}
+    windows = OrderedDict()
     serial = 0
 
     def enqueue(request,priority):
@@ -248,6 +292,42 @@ async def _run(urgent,ahead,stopped,heartbeat,counters,session,connections,queue
                     enqueue(ahead.get_nowait(),AHEAD)
                 except queue.Empty:
                     break
+            if window_queue is not None:
+                # Drain plan updates even with a full chunk heap. Each source
+                # and worker replaces its old window; only keys are retained.
+                for _ in range(2*lookahead_slots):
+                    try:
+                        owner,descriptor,keys = window_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    slot = (owner,descriptor)
+                    if not keys:
+                        windows.pop(slot,None)
+                    elif slot in windows or len(windows) < lookahead_slots:
+                        windows[slot] = deque(keys)
+                    else:
+                        _add(counters,'deferred')
+                # Round-robin sources/workers; nearby batches lead each window.
+                # Keep in-flight/evicted keys until the file exists, so demand
+                # preemption and a small chunk queue cannot lose future work.
+                visits = 0
+                remaining = sum(map(len,windows.values()))
+                while windows and len(waiting) < queue_size and visits < min(remaining,queue_size):
+                    slot,keys = windows.popitem(last=False)
+                    descriptor = slot[1]
+                    key = keys.popleft()
+                    path,error = _paths(descriptor,key,session)
+                    if not path.is_file() and not error.is_file():
+                        request = (descriptor,key)
+                        if request not in waiting and request not in active:
+                            enqueue(request,AHEAD)
+                        keys.append(key)
+                    if keys:
+                        windows[slot] = keys
+                    visits += 1
+                with counters.get_lock():
+                    counters[COUNTERS.index('lookahead_windows')] = len(windows)
+                    counters[COUNTERS.index('lookahead_chunks')] = sum(map(len,windows.values()))
             while heap and len(active) < connections:
                 priority,_,request = heapq.heappop(heap)
                 if waiting.get(request) != priority:
@@ -267,6 +347,9 @@ async def _run(urgent,ahead,stopped,heartbeat,counters,session,connections,queue
         await asyncio.gather(*tasks,return_exceptions=True)
         await fetcher.close()
         _add(counters,'active',-len(active))
+        with counters.get_lock():
+            counters[COUNTERS.index('lookahead_windows')] = 0
+            counters[COUNTERS.index('lookahead_chunks')] = 0
 
 
 def _serve(*args):
@@ -278,18 +361,20 @@ def _serve(*args):
 
 class RemotePrefetcher:
     """Trainer-owned lifetime; DataLoader daemons never create child processes."""
-    def __init__(self, connections=8, queue_size=512, timeout=120):
-        if connections < 1 or queue_size < 1 or not np.isfinite(timeout) or timeout <= 0:
+    def __init__(self, connections=8, queue_size=512, timeout=120, *, lookahead_slots=0):
+        if connections < 1 or queue_size < 1 or lookahead_slots < 0 or not np.isfinite(timeout) or timeout <= 0:
             raise ValueError('Prefetch connections, queue size and timeout must be positive')
         context = mp.get_context('spawn')
         self.urgent, self.ahead = (context.Queue(maxsize=queue_size) for _ in range(2))
+        self.windows = context.Queue(maxsize=2*lookahead_slots) if lookahead_slots else None
         self.stopped = context.Event()
         self.heartbeat = context.Value('d',time.monotonic())
         self.counters = context.Array('q',len(COUNTERS))
         session = uuid.uuid4().hex
-        self.client = PrefetchClient(self.urgent,self.ahead,self.stopped,self.heartbeat,self.counters,session,timeout)
+        self.client = PrefetchClient(self.urgent,self.ahead,self.stopped,self.heartbeat,self.counters,session,timeout,self.windows)
         self.process = context.Process(target=_serve,
-            args=(self.urgent,self.ahead,self.stopped,self.heartbeat,self.counters,session,connections,queue_size),
+            args=(self.urgent,self.ahead,self.stopped,self.heartbeat,self.counters,session,connections,queue_size,
+                  self.windows,lookahead_slots),
             name='remote-ct-prefetch',daemon=True)
         self.process.start()
 
@@ -307,9 +392,10 @@ class RemotePrefetcher:
         if self.process.is_alive():
             self.process.kill()
             self.process.join()
-        for requests in (self.urgent,self.ahead):
-            requests.cancel_join_thread()
-            requests.close()
+        for requests in (self.urgent,self.ahead,self.windows):
+            if requests is not None:
+                requests.cancel_join_thread()
+                requests.close()
 
     def __enter__(self):
         return self

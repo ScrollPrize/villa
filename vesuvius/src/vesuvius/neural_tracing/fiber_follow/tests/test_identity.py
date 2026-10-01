@@ -24,6 +24,9 @@ def config(**kwargs):
     options=dict(fine=CropSpec(depth=24,width=17,behind=8),channels=4,hidden=16,
         heads=2,layers=1,decoder_layers=1,n_future=4,n_history=32,activation_checkpointing=False,recurrent_refinement_steps=0)
     options.update(kwargs)
+    if options.get('encoder') == 'patch4':
+        crop = options['fine']
+        options['fine'] = replace(crop, depth=4*((crop.depth+3)//4), width=4*((crop.width+3)//4))
     return DirectConfig(**options)
 
 

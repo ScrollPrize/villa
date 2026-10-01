@@ -24,7 +24,7 @@ def test_production_defaults_and_explicit_overrides():
                     memory_switch_probability=.3, decision_fraction=.3,
                     bank_wrong_continuation_probability=0., bank_following_probability=.2,
                     presence_dropout=0., diag_every=5000, dagger_after=96.,
-                    recurrent_refinement_steps=2, warmup=500)
+                    recurrent_refinement_steps=2, warmup=500,remote_prefetch_lookahead=16)
     assert {key: args[key] for key in expected} == expected
     assert 'compile' not in args
     for option in ('--compile', '--no-compile', '--feature-replay-weight', '--memory-slots', '--memory-steps', '--memory-stride', '--feature-sequence-length', '--history-encoder-checkpointing'):
@@ -33,9 +33,10 @@ def test_production_defaults_and_explicit_overrides():
     root = Path(__file__).resolve().parents[1]
     assert args['negative_bank'] == str(root/'output'/'neighbor_samples_r0_32_l80_160_v2')
     custom = parser.parse_args(REQUIRED+['--batch', '16', '--no-direction-inputs',
-                                      '--negative-bank', '/tmp/custom-bank'])
+                                      '--negative-bank', '/tmp/custom-bank','--remote-prefetch-lookahead','0'])
     assert custom.batch == 16 and not custom.direction_inputs
     assert custom.negative_bank == '/tmp/custom-bank'
+    assert custom.remote_prefetch_lookahead==0
 
 
 @pytest.mark.parametrize('option', ['--contacts', '--hard-spans', '--contact-fraction', '--hard-span-fraction'])

@@ -44,17 +44,72 @@ while preparing the fork. Existing destinations, zero-stage source models, and
 nonstandard optimizer layouts are rejected. As with ordinary resumes, loader
 random streams restart. No source config defaults are used.
 
-Architecture identifiers are `axial_fiber_slabs_v10`,
-`axial_patch4_overlap_fiber_slabs_v11`, and `axial_patch4_overlap_tokens_fiber_slabs_v11`.
-Patch4 now uses a learned 6x6x6 convolution with stride 4 and padding 1, after
-padding the high image edges to multiples of four. Adjacent neighborhoods overlap
-by two voxels. The 30x26x26 token grid and centers at offset 1.5 input samples
-are preserved; dense reconstruction still uses 4x4x4 output cells.
-Overlapping patch models require fresh training; v10 nonoverlapping patch
-checkpoints are rejected rather than silently reshaped. The conv model remains
-v10, and replay v6 remains compatible. Recurrent checkpoints and older replay
+Architecture identifiers are `axial_fiber_slabs_v13`,
+`axial_patch4_overlap_fiber_slabs_v13`, `axial_patch4_overlap_tokens_fiber_slabs_v13`,
+and `axial_patch4_residual_stem_tokens_fiber_slabs_v13`.
+Patch4 uses a learned 6x6x6 convolution with stride 4 and padding 1. Adjacent
+neighborhoods overlap by two voxels. The sampled crop is 120x104x104; patch4
+dimensions must be multiples of four, with no extra image padding. The token
+grid is 30x26x26 with centers at offset 1.5 input samples; dense reconstruction
+uses 4x4x4 output cells. Crop sampling and physical token positions remain
+centered laterally, including even crop widths. Convolution boundary padding
+is still used. Replay v6 remains compatible. Recurrent checkpoints and older replay
 are rejected; there is no weight migration or memory compatibility interface.
 The existing regression `train`, `collect`, and `infer` module entry points remain.
+
+### Residual image stem continuation
+
+To add image capacity to a trained v11 token-only patch4 model, prepare a separate
+run (the source run must be quiescent):
+
+```bash
+../../../../.venv/bin/python -m vesuvius.neural_tracing.fiber_follow.regression.stem_resume \
+  --checkpoint output/mixed_ct_afv_run1/ckpt_100000.pt \
+  --name mixed_ct_afv_stem32_run2 \
+  --channels 32 --blocks 2 --additional-steps 100000 \
+  --lr 0.0001 --warmup 5000 \
+  --fresh-fraction 0.9 --bank-following-probability 0
+bash scripts/train_mixed_ct_stem.sh
+```
+
+Preparation transfers the original model weights and EMA outside the history
+encoder, which is initialized fresh (including its projections and embeddings).
+It preserves RNG, step count, frozen recovery fixture and replay references.
+The source crop dimensions are rounded up to multiples of four (101 to 104),
+and the crop/sample metadata are updated together. Predictions change because
+the history encoder is fresh and the sampled image grid has changed.
+Preparation creates a fresh AdamW optimizer for all parameters and restarts
+warmup/cosine decay at the source step, using LR 1e-4 and 5000 warmup steps. Here training
+runs from update 100001 through 200000. The launcher reads the complete settings
+from `migration.json` and resumes the new run's `last.pt`; subsequent launches
+retain its optimizer and LR position. Extra trainer flags can be appended, and
+`STEM_RUN_NAME` selects another prepared run. The original run is unchanged.
+
+The parallel stem follows `PatchEmbed_deeper`, reusing Vesuvius's shared
+`BasicBlockD`: one full-resolution block into 32 channels, then two downsampling
+stages at 32 and 64 channels. Each stage has two residual blocks (`--blocks 2`,
+or `--stem-blocks 2` in the trainer), the first with stride two. Thus there are
+five BasicBlockD blocks in total. They use affine InstanceNorm without running
+statistics, ReLU, and the ResNet-D average-pool/projection skips. A final 1x1x1
+convolution maps 64 channels into the existing 128-wide token embedding.
+
+The stem output is added to the learned patch embedding before position/history
+conditioning and axial attention. Both paths consume the sampled image directly
+and output the same stride-four token grid. BasicBlockD combines odd-kernel
+convolutions and average-pool skips; its receptive-field footprints differ from
+the original patch projection. The final projection starts at zero, initially
+leaving the pretrained image branch intact; it receives gradients on the first update, and
+earlier stem layers start learning once it becomes nonzero. No extra tokens or
+decoder feature stream are introduced. Activation checkpointing includes the
+stem when enabled. Full-resolution feature extraction increases compute and
+activation memory; GPU capacity must be checked on the training machine.
+
+`--fresh-fraction` applies to the budget left after matched decisions and
+bank-following samples. With decision fraction .3, bank-following 0, and fresh
+fraction .9, the requested mix is 63% annotation-fresh, 7% replay, and 30% matched
+decisions. These are sampling targets; availability and paired batching affect
+realized counts. Both sampling flags may change on resume. Negative-bank data
+still supports matched decisions and supervision even with bank-following disabled.
 
 `--batch` is the minimum number of independent supervised decisions per optimizer
 update; `--microbatch` is the number loaded and predicted together. Complete
@@ -63,7 +118,7 @@ gets equal weight. Geometry, generated survival and supplied-candidate survival
 keep their coefficients (1, .5, 1). There are no observation-only steps, streamed
 loss budgets, writer replay or cached historical main-encoder features.
 
-The current crop remains 120x101x101 at spacing .5, with CT/presence and optional
+The current crop is 120x104x104 at spacing .5, with CT/presence and optional
 six direction moments. History reads only CT plus a rendered observed-path
 heatmap: neither presence nor direction volumes are read for slabs. Slabs are
 8x65x65 at spacing .5, with depth offsets -2 through +1.5 tracing voxels.
@@ -80,8 +135,12 @@ training holdout before images are loaded; either unsafe member rejects a pair.
 Replay and resumed recovery use saved committed prefixes, without connecting a
 remote seed to a truncated local history.
 
-The shared slab encoder uses three residual convolution stages, widths 8/16/32,
-and strides (1,2,2), (2,2,2), (2,2,2). Each valid slab contributes 162 spatial
+The shared slab encoder uses three convolution stages, widths 8/16/32,
+and strides (1,2,2), (2,2,2), (2,2,2). Each downsampling convolution is followed
+by a shared Vesuvius BasicBlockD with affine InstanceNorm and LeakyReLU(.01).
+Instance normalization uses one group per channel to support an empty valid-slab
+batch with the same per-instance spatial statistics and no running statistics.
+Each valid slab contributes 162 spatial
 feature tokens, projected to model width (128 by default). Position, pose, age,
 slot and seed role are embedded inside the encoder. Generator and scorer have
 separate residual history attention shared across their respective decoder
@@ -405,13 +464,111 @@ AFV trace coordinates use two native voxels (17.28 µm); the existing Paris 4 tr
 grid is approximately 16 µm. Main crop spacing is half a trace voxel in both.
 
 Remote CT chunks are fetched on demand into
-`datasets/automated_fiber_volumes/ct_cache/uncompressed/`, namespaced by URL and
-level. Local Zarr v2 metadata has `compressor: null` and `filters: null`.
+`<cache_dir>/<scheme>/<bucket>/<volume-path>/<level>/`, using the normal URL-based
+layout. The mixed dataset JSON sets `cache_dir` to `/mnt/raid_nvme/volume_cache`,
+for example `/mnt/raid_nvme/volume_cache/s3/vesuvius-challenge-open-data/PHerc0175A/volumes/<scan>.zarr/0/`.
+Local Zarr v2 metadata has `compressor: null` and `filters: null`, preserving the
+source's chunk separator. There is no separate `uncompressed` directory.
 Chunks are decoded once, written atomically without compression, then memory
 mapped across workers and collectors. Reopening a cached region needs no network;
 uncached regions still require access to the source. The disk cache grows with
 visited regions and has no eviction policy; each worker has a bounded RAM/mapping
-cache. Cache paths are relative to the dataset JSON unless absolute.
+cache. Cache paths are relative to the dataset JSON unless absolute. Edit the
+top-level `cache_dir` to relocate future writes, then restart/resume training.
+Cache-only path changes are allowed on resume; existing cache files are not
+moved automatically, and missing chunks are fetched again at the new location.
+
+Optional async remote prefetch:
+
+```bash
+bash scripts/train_mixed_ct.sh --remote-prefetch-connections 8 \
+  --remote-prefetch-lookahead 16 --remote-prefetch-queue-size 512 --remote-prefetch-timeout 120
+```
+
+With these options, one separate process runs up to eight concurrent async Zarr
+requests. The S3 connection pool limit per client automatically matches
+`--remote-prefetch-connections`; it does not create a worker per connection. It has its
+own Python GIL; the training workers never execute remote reads in this mode.
+Workers plan exact main-crop and historical-slab footprints before CT assembly.
+`--remote-prefetch-lookahead` defaults to 16 future microbatches per remote source
+per worker; 0 restores the shallow per-item hints. The first batch is delivered
+before filling the deeper queue. Plans hold geometry, augmentation seeds and
+labels, without CT tensors or dense foreign masks. Neighbor coverage feedback
+advances during planning so fixed source/replay banks produce the same sample
+sequence and targets. Mixed-source selection and matched pairs stay ordered.
+Initial metadata is also fetched by the async service. Local Paris 4 reads
+bypass this service.
+
+The async process retains each worker/source's bounded chunk window and feeds
+the smaller fetch queue as slots free, including while compilation stops batch
+consumption. Updated windows replace old ones, and sources/workers are serviced
+round-robin. With ten workers and two remote sources, the default plans up to
+320 future microbatches beyond the usual DataLoader buffers. It stops fetching
+when those regions are cached; it does not scan arbitrary parts of the volumes.
+Replay and live neighbor-bank updates can affect newly planned batches; already
+planned batches remain ordered and are not resampled. Consequently deeper
+lookahead delays incorporating newly published replay by the bounded plan queue
+plus the existing replay refresh interval. Geometry-only neighbor feedback can
+add CPU work, although dense masks and image augmentation are deferred.
+
+A priority heap distinguishes speculative ahead requests from chunks needed to
+finish a batch now. A needed batch promotes matching queued or active fetches;
+unrelated speculative requests already in flight can be cancelled to free
+connections, then retried behind demand. Each IPC priority queue and the pending
+heap are bounded by `--remote-prefetch-queue-size`; full queues defer requests
+without blocking submission, and the readiness gate resubmits missing demands.
+Plan windows have a separate bounded IPC queue and one retained window per
+remote source/worker, so a full chunk heap does not discard accepted windows.
+Atomic uncompressed writes and per-chunk process locks prevent partial reads and
+duplicate downloads across training and collector processes.
+
+Before assembling crops, a loader waits until all required chunks are cached,
+then uses a **cache-only** reader: there is no synchronous network fallback.
+Training can still stall when downloading cannot keep up. Fetches retry up to
+three times; exhausted retries, a dead service, or the configured batch-readiness
+timeout raise a visible error rather than skipping samples. Prefetch is disabled
+by default (`--remote-prefetch-connections 0`) and its settings can change on
+resume. Cumulative completion bytes, promotions, preemptions, deferred requests,
+errors, retained lookahead chunk references/windows, and service status are
+recorded under `remote_prefetch` in training logs.
+These switches affect the training loader; standalone evaluation and replay
+collectors retain their existing readers and share the same disk cache.
+
+Verification commands (CPU only):
+
+```bash
+OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 CUDA_VISIBLE_DEVICES='' \
+  /home/sean/Documents/villa4/vesuvius/.venv/bin/python scripts/check_mixed_ct.py \
+  --prefetch-connections 8 --out datasets/automated_fiber_volumes/training_prefetch_preflight.json
+OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 CUDA_VISIBLE_DEVICES='' \
+  /home/sean/Documents/villa4/vesuvius/.venv/bin/python scripts/check_remote_prefetch.py
+OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 CUDA_VISIBLE_DEVICES='' \
+  /home/sean/Documents/villa4/vesuvius/.venv/bin/python scripts/check_prefetch_lookahead.py \
+  --out datasets/automated_fiber_volumes/lookahead_benchmark.json
+```
+
+The lookahead benchmark uses temporary caches and simulated 50 ms chunk latency,
+four concurrent fetches, a two-entry chunk heap, and a 0.5 s idle-loader pause.
+Across three alternating repetitions, lookahead cached all 16 future chunks
+during the pause; shallow prefetch cached none. Mean subsequent demand wait was
+0.00076 s versus 0.276 s, with identical voxel hashes. This isolates scheduler
+behavior; it does not measure real S3 bandwidth or training throughput.
+
+The recorded cold-cache check fetched eight 128³ uint8 chunks from each S3 scan
+(32 MiB total), with three repetitions per connection count and alternating
+order. Voxel hashes matched across all runs. Process and metadata startup were
+excluded; remote/network cache state was not controlled.
+
+| Concurrent requests | Mean fetch time | Median | p95 |
+| --- | --- | --- | --- |
+| 1 | 7.53 s | 8.51 s | 9.37 s |
+| 8 | 2.58 s | 2.45 s | 3.40 s |
+
+This is fetch throughput, not measured training throughput. Full measurements
+are in `datasets/automated_fiber_volumes/prefetch_benchmark.json`. Unit tests also
+exercise demand promotion/preemption, concurrent async reads, bounded queues,
+multiple loader processes, retry failure, unchanged sampling, and cache-only
+reads from compressed remote sources.
 
 Validation reserves deterministic whole fiber IDs independently in each source;
 training does not exclude a Z band. Each AFV source reserves exactly 406 fibers

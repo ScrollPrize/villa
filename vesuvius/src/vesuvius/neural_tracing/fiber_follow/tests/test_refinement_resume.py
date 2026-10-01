@@ -55,9 +55,13 @@ def test_expansion_preserves_weights_moments_rng_and_can_update(tmp_path):
     assert torch.isfinite(model.refinement_stage.weight).all()
 
 
-def test_fork_uses_checkpoint_settings_fixture_and_live_replay(tmp_path):
+@pytest.mark.parametrize('legacy_prefetch',[False,True])
+def test_fork_uses_checkpoint_settings_fixture_and_live_replay(tmp_path,legacy_prefetch):
     source=tmp_path/'source'; source.mkdir()
     ck=checkpoint(tmp_path)
+    prefetch_keys={'remote_prefetch_connections','remote_prefetch_queue_size','remote_prefetch_timeout','remote_prefetch_lookahead'}
+    if legacy_prefetch:
+        for key in prefetch_keys:ck['training_options'].pop(key)
     fixture=b'fixture bytes preserved exactly'
     (source/'monitor_recovery.npz').write_bytes(fixture)
     ck['monitor_recovery_sha256']=hashlib.sha256(fixture).hexdigest()
@@ -74,7 +78,8 @@ def test_fork_uses_checkpoint_settings_fixture_and_live_replay(tmp_path):
     assert (dest/'monitor_recovery.npz').read_bytes()==fixture
     assert json.loads((dest/'dagger/replay.json').read_text())==[str(replay)]
     assert hashlib.sha256(path.read_bytes()).hexdigest()==digest
-    assert set(info['changes'])=={'name','resume','recurrent_refinement_steps'}
+    assert saved['remote_prefetch_connections']==0
+    assert set(info['changes'])=={'name','resume','recurrent_refinement_steps'} | (prefetch_keys if legacy_prefetch else set())
     with pytest.raises(FileExistsError):fork_run(path,'refine3',3)
 
 

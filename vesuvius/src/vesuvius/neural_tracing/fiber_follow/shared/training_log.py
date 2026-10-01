@@ -94,6 +94,14 @@ def _interval_training_lines(row):
         lines.append('  datasets (IDs from dataset_configuration): '+', '.join(
             f'{key}: {value}/{int(m["decisions"])} ({value/max(1,m["decisions"]):.1%})'
             for key,value in sorted(m['dataset_counts'].items())))
+    if 'remote_prefetch' in row:
+        p = row['remote_prefetch']
+        lines.append(f"  remote CT prefetch (cumulative): alive={p['alive']} | active {p['active']}"
+                     f" | completed {p['completed']} chunks / {p['completed_bytes']/2**20:.1f} MiB"
+                     f" | promoted {p['promoted']} | preempted {p['preempted']}"
+                     f" | deferred {p['deferred']} | errors {p['errors']}")
+        if 'lookahead_chunks' in p:
+            lines[-1] += f" | lookahead {p['lookahead_chunks']} chunk references / {p['lookahead_windows']} windows"
     if m.get('endpoint_states'):
         lines.append(f"  supervised endpoints: matched {_rate(m['matched_endpoint_states'], m['endpoint_states'])}"
                      f" | geometry choices {_rate(m['choice_endpoint_states'], m['endpoint_states'])}")

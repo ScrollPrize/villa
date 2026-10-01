@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "cache_dir": "../datasets/automated_fiber_volumes/ct_cache",
+  "cache_dir": "/mnt/raid_nvme/volume_cache",
   "sources": [
     {
       "name": "paris4",

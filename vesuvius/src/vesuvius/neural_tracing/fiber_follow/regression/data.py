@@ -361,6 +361,12 @@ class IdentityObservationBuilder(ObservationBuilder):
         z = np.asarray(item.get('identity_label_z',np.asarray(item['pos'])[2:3]))
         return not (z.min()-2 < band.hi and z.max()+2 >= band.lo)
 
+    def prepare_sampling_feedback(self, items):
+        """Advance geometry-only sampling feedback before planning another batch."""
+        self.bank_targets(items,np.zeros(len(items),bool))
+        for item in items:
+            item['_sampling_feedback_prepared'] = True
+
     def bank_targets(self, items, decision_mask=None):
         """Foreign-path masks and coverage feedback; no contrastive point queries."""
         if self.negative_bank is None:
@@ -378,7 +384,8 @@ class IdentityObservationBuilder(ObservationBuilder):
             out['location_source'][j] = item.get('location_source', 0)
             if 'identity_curve' not in item:
                 continue
-            feedback = self.fibers is not None and item.get('source') == 0
+            feedback = (self.fibers is not None and item.get('source') == 0
+                        and not item.get('_sampling_feedback_prepared',False))
             if not selected[j] and not feedback:
                 continue
             found = bank.candidates(item, cfg.fine, self.sampling.rule, mask_crop=cfg.fine,

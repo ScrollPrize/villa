@@ -14,20 +14,50 @@ from vesuvius.neural_tracing.fiber_follow.shared import remote_prefetch as modul
 from vesuvius.neural_tracing.fiber_follow.shared.volume import RemoteChunkedArray
 
 
-def source_at(tmp_path):
+@pytest.mark.parametrize('connections',[3,32])
+def test_prefetch_connection_limit_reaches_s3_pool(tmp_path,monkeypatch,connections):
+    from zarr.api import asynchronous
+    from vesuvius.neural_tracing.fiber_follow.shared.volume import remote_store
+    opened=[]
+    async def open_array(*,store,path,mode):
+        # Use the real Zarr/fsspec store and S3 filesystem without remote I/O.
+        assert store.fs.config_kwargs['max_pool_connections']==connections
+        assert store.fs.anon and path=='0' and mode=='r'
+        opened.append(store)
+        return store
+    monkeypatch.setattr(asynchronous,'open_array',open_array)
+    async def scenario():
+        fetcher=module.AsyncFetcher('test',connections)
+        try:
+            for scan in ('first','second'):
+                descriptor=(f's3://vesuvius-challenge-open-data/{scan}.zarr',0,str(tmp_path))
+                first=await fetcher.array(descriptor)
+                assert await fetcher.array(descriptor) is first
+            assert len(opened)==2
+            # Synchronous users keep the backend default.
+            assert 'max_pool_connections' not in remote_store(descriptor[0]).fs.config_kwargs
+        finally:
+            await fetcher.close()
+    asyncio.run(scenario())
+
+
+def source_at(tmp_path,separator='.'):
     import zarr
     from numcodecs import Blosc
     values=np.arange(9*10*11,dtype=np.uint8).reshape(9,10,11)
     root=tmp_path/'source.zarr'
     array=zarr.open_array(str(root/'0'),mode='w',zarr_format=2,shape=values.shape,
-        chunks=(4,4,4),dtype=values.dtype,compressor=Blosc(cname='zstd'))
+        chunks=(4,4,4),dtype=values.dtype,compressor=Blosc(cname='zstd'),dimension_separator=separator)
     array[:]=values
     spec=SimpleNamespace(ct_zarr=root.as_uri(),ct_level=0,cache_dir=str(tmp_path/'cache'))
     return spec,values
 
 
-def test_async_process_prefetches_compressed_source_and_never_downloads_in_reader(tmp_path,monkeypatch):
-    spec,values=source_at(tmp_path)
+@pytest.mark.parametrize('separator',['.','/'])
+def test_async_process_prefetches_compressed_source_and_never_downloads_in_reader(tmp_path,monkeypatch,separator):
+    import json
+    import zarr
+    spec,values=source_at(tmp_path,separator)
     def forbidden(self):raise AssertionError('Foreground remote I/O is forbidden')
     monkeypatch.setattr(RemoteChunkedArray,'_open',forbidden)
     with pytest.raises(FileNotFoundError,match='metadata'):
@@ -35,6 +65,7 @@ def test_async_process_prefetches_compressed_source_and_never_downloads_in_reade
     with module.RemotePrefetcher(connections=4,queue_size=2,timeout=30) as service:
         service.client.ensure_metadata(spec)
         reader=RemoteChunkedArray(spec.ct_zarr,0,spec.cache_dir,1024,cache_only=True)
+        assert Path(reader.path)==Path(spec.cache_dir)/'file'/str(tmp_path/'source.zarr').lstrip('/')/'0'
         bounds=[(np.zeros(3,dtype=int),values.shape)]
         with pytest.raises(FileNotFoundError,match='chunk'):
             reader.read([0,0,0],[1,1,1])
@@ -42,11 +73,39 @@ def test_async_process_prefetches_compressed_source_and_never_downloads_in_reade
         service.client.ensure(reader,bounds)
         np.testing.assert_array_equal(reader.read([0,0,0],values.shape),values)
         # More required chunks than either queue can hold: none may be lost.
-        assert len(list(Path(reader.path).glob('[0-9]*')))==27
-        assert (Path(reader.path)/'2.2.2').stat().st_size==64
+        pattern='[0-9]*' if separator=='.' else '[0-9]*/[0-9]*/[0-9]*'
+        assert len(list(Path(reader.path).glob(pattern)))==27
+        assert (Path(reader.path)/separator.join(['2','2','2'])).stat().st_size==64
+        metadata=json.loads((Path(reader.path)/'.zarray').read_text())
+        assert metadata['compressor'] is None and metadata['filters'] is None
+        assert metadata['dimension_separator']==separator
+        np.testing.assert_array_equal(zarr.open_array(reader.path,mode='r')[:],values)
         assert service.snapshot()['deferred']>0
     assert not service.snapshot()['alive']
     np.testing.assert_array_equal(reader.read([7,8,9],[2,2,2]),values[7:9,8:10,9:11])
+
+
+@pytest.mark.parametrize('scopes',[1,2])
+def test_retained_lookahead_downloads_past_chunk_queue_while_loader_is_idle(tmp_path,scopes):
+    spec,values=source_at(tmp_path,'/')
+    with module.RemotePrefetcher(connections=4,queue_size=2,lookahead_slots=scopes) as service:
+        service.client.ensure_metadata(spec)
+        reader=RemoteChunkedArray(spec.ct_zarr,0,spec.cache_dir,0,cache_only=True)
+        # Publish once, then stop consuming/producing batches like compilation.
+        # The 27-chunk window is much larger than either two-entry chunk queue.
+        if scopes==1:
+            service.client.lookahead(reader,[[(np.zeros(3,dtype=int),values.shape)]])
+        else:
+            # Different fiber collections may share one CT volume; neither
+            # collection's plans may replace the other's window.
+            service.client.lookahead(reader,[[([0,0,0],[4,10,11])]],scope=0)
+            service.client.lookahead(reader,[[([4,0,0],[5,10,11])]],scope=1)
+        deadline=time.monotonic()+15
+        while service.snapshot()['completed_bytes']<27*64:
+            assert time.monotonic()<deadline, service.snapshot()
+            time.sleep(.02)
+        np.testing.assert_array_equal(reader.read([0,0,0],values.shape),values)
+        assert service.snapshot()['completed_bytes']==27*64
 
 
 class WorkerProbe(torch.utils.data.IterableDataset):
@@ -61,11 +120,12 @@ class WorkerProbe(torch.utils.data.IterableDataset):
         yield dict(worker=worker,data=reader.read(start,size))
 
 
-def test_multiple_spawned_loader_workers_share_one_prefetch_process(tmp_path):
+@pytest.mark.parametrize('start_method',sorted({'spawn',mp.get_start_method()}))
+def test_multiple_spawned_loader_workers_share_one_prefetch_process(tmp_path,start_method):
     spec,values=source_at(tmp_path)
     with module.RemotePrefetcher(connections=4,queue_size=8,timeout=30) as service:
         loader=torch.utils.data.DataLoader(WorkerProbe(spec,service.client),batch_size=None,
-            num_workers=2,multiprocessing_context='spawn')
+            num_workers=2,multiprocessing_context=start_method)
         batches=list(loader)
         assert len(batches)==2
         for batch in batches:
@@ -73,29 +133,38 @@ def test_multiple_spawned_loader_workers_share_one_prefetch_process(tmp_path):
             np.testing.assert_array_equal(batch['data'].numpy(),values[start:start+4])
 
 
-def test_priority_promotes_matching_fetch_and_preempts_unrelated_inflight_work(monkeypatch):
+@pytest.mark.parametrize('windowed',[False,True])
+def test_priority_promotes_matching_fetch_and_preempts_unrelated_inflight_work(monkeypatch,tmp_path,windowed):
     async def scenario():
         context=mp.get_context('spawn')
         stopped=context.Event();heartbeat=context.Value('d',time.monotonic())
         counters=context.Array('q',len(module.COUNTERS))
         urgent,ahead=queue.Queue(),queue.Queue()
+        windows=queue.Queue()
+        monkeypatch.setattr(module,'_paths',lambda descriptor,key,session:
+            (tmp_path/str(key),tmp_path/(str(key)+'.error')))
         began={key:asyncio.Event() for key in ('far_a','far_b','urgent')}
         release=asyncio.Event();done=asyncio.Event();cancelled=[];finished=[]
         class Fetcher:
-            def __init__(self,session):pass
+            def __init__(self,session,connections):assert connections==2
             async def request(self,descriptor,key):
                 began[key].set()
                 if key=='urgent':
+                    (tmp_path/key).touch()
                     finished.append(key);done.set();return 'completed',1
                 try:
                     await release.wait()
+                    (tmp_path/key).touch()
                     finished.append(key);return 'completed',1
                 except asyncio.CancelledError:
                     cancelled.append(key);raise
             async def close(self):pass
         monkeypatch.setattr(module,'AsyncFetcher',Fetcher)
-        ahead.put(('source','far_a'));ahead.put(('source','far_b'))
-        task=asyncio.create_task(module._run(urgent,ahead,stopped,heartbeat,counters,'test',2,8))
+        if windowed:windows.put((0,'source',('far_a','far_b')))
+        else:
+            ahead.put(('source','far_a'));ahead.put(('source','far_b'))
+        task=asyncio.create_task(module._run(urgent,ahead,stopped,heartbeat,counters,'test',2,8,
+                                           windows,1))
         try:
             await asyncio.wait_for(asyncio.gather(began['far_a'].wait(),began['far_b'].wait()),2)
             # Both connections are occupied. A current batch needs far_a and a
@@ -129,9 +198,9 @@ def test_fetch_uses_concurrent_async_zarr_getitem_and_atomic_raw_writes(tmp_path
                 await asyncio.sleep(.01)
                 active-=1
                 return np.full((4,4,4),selection[0].start,np.uint8)
-        async def open_array(*args):return Array()
+        async def open_array(*args,**kwargs):return Array()
         monkeypatch.setattr(module,'open_remote_array',open_array)
-        fetcher=module.AsyncFetcher('test')
+        fetcher=module.AsyncFetcher('test',2)
         descriptor=('s3://fixture/scan',0,str(tmp_path))
         try:
             await fetcher.fetch(descriptor,None)
@@ -144,11 +213,11 @@ def test_fetch_uses_concurrent_async_zarr_getitem_and_atomic_raw_writes(tmp_path
 
 
 def test_prefetch_failure_propagates_without_foreground_fallback(tmp_path,monkeypatch):
-    async def fail(*args):raise OSError('remote source unavailable')
+    async def fail(*args,**kwargs):raise OSError('remote source unavailable')
     monkeypatch.setattr(module,'open_remote_array',fail)
     descriptor=('s3://fixture/broken',0,str(tmp_path));session='test'
     async def attempt():
-        fetcher=module.AsyncFetcher(session)
+        fetcher=module.AsyncFetcher(session,2)
         try:assert await fetcher.request(descriptor,None)==('errors',0)
         finally:await fetcher.close()
     asyncio.run(attempt())

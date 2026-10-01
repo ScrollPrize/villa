@@ -60,6 +60,18 @@ def read_dataset_config(path):
     return document, digest
 
 
+def validate_dataset_resume(checkpoint, document, digest):
+    """Allow cache relocation while requiring identical resolved training data."""
+    if checkpoint.get('dataset_config_sha256') == digest:
+        return
+    recorded = checkpoint.get('dataset_config')
+    if isinstance(recorded,dict) and isinstance(document,dict):
+        without_cache = lambda value: {k:v for k,v in value.items() if k != 'cache_dir'}
+        if without_cache(recorded) == without_cache(document):
+            return
+    raise ValueError('Resume dataset configuration changed')
+
+
 def validation_manifest(fibers, spec, seed=0, monitor_count=32):
     """Freeze distinct monitor/calibration/final fiber IDs and CT-only seeds."""
     from ..shared.evaluate import make_seeds

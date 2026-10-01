@@ -6,6 +6,7 @@ import glob
 import hashlib
 import math
 import os
+from collections import deque
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -392,6 +393,7 @@ class FollowDataset(torch.utils.data.IterableDataset):
         self.replay_index, self.refresh_chunks = replay_index, refresh_chunks
         self.batch_builder = batch_builder
         self.remote_prefetch = None  # Optional trainer-owned process queue client.
+        self.remote_prefetch_lookahead = 0  # Planned microbatches per source/worker.
         self.additional_crops = tuple(additional_crops)
         self._replay_paths = None
         self._set_replay(list(onpolicy or []))
@@ -505,29 +507,64 @@ class FollowDataset(torch.utils.data.IterableDataset):
         prepared = [self.prepare(item, rng) for item in pair]
         return prepared if all(self.state_allowed(item) for item in prepared) else []
 
+    def prefetch_bounds(self, items, vol):
+        if hasattr(self.batch_builder, 'prefetch_bounds'):
+            return [bound for item in items for bound in self.batch_builder.prefetch_bounds(item,vol)]
+        return [tight_block(item['pos'],item['frame'],self.cfg.crop,vol.input_scale) for item in items]
+
     def prefetch_items(self, items, vol, *, required=False):
         if self.remote_prefetch is None or not items:
             return
-        if hasattr(self.batch_builder, 'prefetch_bounds'):
-            bounds = [bound for item in items for bound in self.batch_builder.prefetch_bounds(item,vol)]
-        else:
-            bounds = [tight_block(item['pos'],item['frame'],self.cfg.crop,vol.input_scale) for item in items]
+        # Whole lookahead windows are retained by the remote process instead of
+        # sending disposable per-item hints into a potentially full queue.
+        if not required and self.remote_prefetch_lookahead:
+            return
+        bounds = self.prefetch_bounds(items,vol)
         if required:
             self.remote_prefetch.ensure(vol.ct,bounds)
         else:
             self.remote_prefetch.submit(vol.ct,bounds)
 
     def __iter__(self):
-        info = torch.utils.data.get_worker_info()
-        rng = np.random.default_rng(self.seed*1000 + (0 if info is None else info.id))
         torch.set_num_threads(1)
         if self.remote_prefetch is not None:
             self.remote_prefetch.ensure_metadata(self.vol_spec)
             vol = FiberVolume(self.vol_spec,cache_bytes=self.cache_bytes,cache_only=True)
         else:
             vol = FiberVolume(self.vol_spec,cache_bytes=self.cache_bytes)
+        grid = torch.from_numpy(crop_local_grid(self.cfg.crop)).float()
+        lookahead = self.remote_prefetch_lookahead if self.remote_prefetch is not None else 0
+        if lookahead < 0:
+            raise ValueError('Remote prefetch lookahead must be nonnegative')
+        plans, pending = self._iter_plans(vol), deque()
+        first = True
+        while True:
+            # Deliver the first batch promptly. Fill the deeper plan queue when
+            # the loader asks for its next batch, overlapping the first update.
+            while len(pending) < (1 if first else lookahead+1):
+                plan = next(plans)
+                bounds = self.prefetch_bounds(plan[0],vol) if lookahead else None
+                pending.append((*plan,bounds))
+            first = False
+            if lookahead:
+                self.remote_prefetch.lookahead(vol.ct,
+                    [bounds for *_,bounds in pending],scope=id(self))
+            items, requested, fraction, bounds = pending.popleft()
+            if lookahead:
+                self.remote_prefetch.ensure(vol.ct,bounds)
+            else:
+                self.prefetch_items(items,vol,required=True)
+            batch = (self.batch_builder(items, vol) if self.batch_builder is not None
+                     else collate_with_volume(items, vol, self.cfg.crop, grid))
+            if fraction:
+                batch['decision_requested'] = torch.full((self.chunk,), 2*requested/self.chunk)
+            yield batch
+
+    def _iter_plans(self, vol):
+        """Ordered geometry/augmentation plans, without CT or dense image tensors."""
+        info = torch.utils.data.get_worker_info()
+        rng = np.random.default_rng(self.seed*1000 + (0 if info is None else info.id))
         cfg = self.cfg
-        grid = torch.from_numpy(crop_local_grid(cfg.crop)).float()
         windows = []
         chunks = 0
         while True:
@@ -595,14 +632,10 @@ class FollowDataset(torch.utils.data.IterableDataset):
                     break
             if len(items) != self.chunk:
                 raise ValueError('Could not fill a training batch outside the held-out band')
-            # Promote the batch needed now above speculative work. Every crop
-            # read below is local-only; a missing chunk cannot trigger S3 I/O.
-            self.prefetch_items(items,vol,required=True)
-            batch = (self.batch_builder(items, vol) if self.batch_builder is not None
-                     else collate_with_volume(items, vol, cfg.crop, grid))
-            if fraction:
-                batch['decision_requested'] = torch.full((self.chunk,), 2*requested/self.chunk)
-            yield batch
+            if (self.remote_prefetch is not None and self.remote_prefetch_lookahead
+                    and hasattr(self.batch_builder,'prepare_sampling_feedback')):
+                self.batch_builder.prepare_sampling_feedback(items)
+            yield items, requested, fraction
 
 
 FUSED_SAMPLER = os.environ.get("FIBER_FOLLOW_FUSED", "1") != "0"
