@@ -126,7 +126,13 @@ class FiberCohort:
         elif rows[0].get("phase") not in ("test", "update", "reviewed_trace"):
             raise RuntimeError("invalid repeated training boundary")
         if rows[0].get("phase") == "reviewed_trace":
-            self.maintenance = {"kind": "reviewed_trace", "step": int(step)}
+            samples_seen = rows[0].get("samples_seen")
+            if type(samples_seen) is not int or samples_seen < 0:
+                raise RuntimeError("reviewed trace boundary lacks cumulative sample progress")
+            self.maintenance = {
+                "kind": "reviewed_trace", "step": int(step),
+                "samples_seen": samples_seen,
+            }
         if self._on_startup_observation is not None:
             observations = []
             for row in rows:

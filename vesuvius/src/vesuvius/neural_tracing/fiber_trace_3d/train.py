@@ -708,7 +708,7 @@ def _distributed_visible_gpu_tokens(config: _DistributedConfig) -> list[str]:
 
 def _run_reviewed_trace_test(*, settings: dict[str, Any], step: int, run_dir: Path,
                              snapshot_dir: Path, distributed: _DistributedConfig,
-                             writer: Any | None) -> dict[str, float]:
+                             writer: Any | None, samples_seen: int) -> dict[str, float]:
     """Run under the training task's existing grant while ranks poll together."""
     gpu_tokens = _distributed_visible_gpu_tokens(distributed)
     output = run_dir / "reviewed_trace_test" / f"step_{step:08d}"
@@ -727,6 +727,7 @@ def _run_reviewed_trace_test(*, settings: dict[str, Any], step: int, run_dir: Pa
             output.mkdir(parents=True, exist_ok=False)
             job = {
                 "step": step,
+                "samples_seen": int(samples_seen),
                 "checkpoint": str(checkpoint),
                 "output_root": str(output),
                 "template": str(Path(settings["template"]).expanduser().resolve()),
@@ -4397,12 +4398,14 @@ def training_units(
                     # or replacement workers will attempt the same test twice.
                     pending_test = None
                     yield TrainingBoundary(
-                        start_step, False, capture_boundary, "reviewed_trace"
+                        start_step, False, capture_boundary, "reviewed_trace",
+                        samples_seen=sample_progress.at(start_step),
                     )
                 else:
                     _run_reviewed_trace_test(
                         settings=reviewed_trace_test, step=start_step, run_dir=run_dir,
                         snapshot_dir=snapshot_dir, distributed=distributed, writer=writer,
+                        samples_seen=sample_progress.at(start_step),
                     )
             pending_test = None
     except BaseException:
@@ -4856,11 +4859,15 @@ def training_units(
                     # the external trace boundary.  Handoff resumes with the
                     # next training update, not by replaying this test.
                     pending_test = None
-                    yield TrainingBoundary(step, False, capture_boundary, "reviewed_trace")
+                    yield TrainingBoundary(
+                        step, False, capture_boundary, "reviewed_trace",
+                        samples_seen=sample_progress.at(step),
+                    )
                 else:
                     _run_reviewed_trace_test(
                         settings=reviewed_trace_test, step=step, run_dir=run_dir,
                         snapshot_dir=snapshot_dir, distributed=distributed, writer=writer,
+                        samples_seen=sample_progress.at(step),
                     )
             pending_test = None
             if test_due:

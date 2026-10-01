@@ -89,7 +89,7 @@ def run_job(job_path: Path) -> dict[str, float]:
             subprocess.run(command, check=True, cwd=runner.parents[2])
         summary_path = output / "full" / "summary.json"
         metrics = directional_restart_metrics(json.loads(summary_path.read_text()), expected_pieces=32)
-        metrics.update(step=int(job["step"]), pieces=32, directions=64,
+        metrics.update(samples_seen=int(job["samples_seen"]), pieces=32, directions=64,
                        wall_seconds=time.monotonic() - started)
         (output / "training_metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
         print("training reviewed trace: " + " ".join(f"{key}={value}" for key, value in metrics.items()), flush=True)

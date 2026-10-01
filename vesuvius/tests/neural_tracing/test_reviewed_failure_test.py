@@ -127,6 +127,7 @@ def test_training_trace_subprocess_completion(monkeypatch, tmp_path):
     class Process:
         def __init__(self, command, **_kwargs):
             job = json.loads((tmp_path / "run/reviewed_trace_test/step_00000001/job.json").read_text())
+            assert job["samples_seen"] == 128
             output = tmp_path / "run/reviewed_trace_test/step_00000001"
             values = {key: 1.0 for key in (
                 "restarts_forward", "restarts_reverse", "restarts_combined",
@@ -144,7 +145,7 @@ def test_training_trace_subprocess_completion(monkeypatch, tmp_path):
         settings={"template": str(tmp_path / "template.json"), "split_root": str(tmp_path),
                   "native_binary": str(tmp_path / "native"), "runner": str(tmp_path / "runner.py")},
         step=1, run_dir=tmp_path / "run", snapshot_dir=checkpoint.parent,
-        distributed=distributed, writer=None,
+        distributed=distributed, writer=None, samples_seen=128,
     )
     assert metrics["restarts_combined"] == 1.0
 
@@ -163,7 +164,7 @@ def test_training_trace_subprocess_start_failure_is_reported(monkeypatch, tmp_pa
             settings={"template": str(tmp_path / "template.json"), "split_root": str(tmp_path),
                       "native_binary": str(tmp_path / "native"), "runner": str(tmp_path / "runner.py")},
             step=1, run_dir=tmp_path / "run", snapshot_dir=checkpoint.parent,
-            distributed=distributed, writer=None,
+            distributed=distributed, writer=None, samples_seen=128,
         )
 
 
@@ -179,6 +180,7 @@ def test_training_trace_uses_startup_best_snapshot(monkeypatch, tmp_path):
         def __init__(self, command, **_kwargs):
             job = json.loads((tmp_path / "run/reviewed_trace_test/step_00000001/job.json").read_text())
             assert job["checkpoint"] == str(checkpoint)
+            assert job["samples_seen"] == 128
             output = tmp_path / "run/reviewed_trace_test/step_00000001"
             values = {key: 1.0 for key in (
                 "restarts_forward", "restarts_reverse", "restarts_combined",
@@ -196,5 +198,5 @@ def test_training_trace_uses_startup_best_snapshot(monkeypatch, tmp_path):
         settings={"template": str(tmp_path / "template.json"), "split_root": str(tmp_path),
                   "native_binary": str(tmp_path / "native"), "runner": str(tmp_path / "runner.py")},
         step=1, run_dir=tmp_path / "run", snapshot_dir=checkpoint.parent,
-        distributed=distributed, writer=None,
+        distributed=distributed, writer=None, samples_seen=128,
     )

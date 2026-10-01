@@ -230,6 +230,8 @@ class FiberTrainingWorker:
                 raise
         self._check_memory()
         row = {"step": self.boundary.step, "done": self.boundary.done, "phase": self.boundary.phase}
+        if self.boundary.samples_seen is not None:
+            row["samples_seen"] = self.boundary.samples_seen
         if self.factory.measure_startup_memory:
             import torch
             torch.cuda.synchronize(0)

@@ -26,6 +26,7 @@ class TrainingBoundary:
     done: bool
     capture: Any
     phase: str = "update"
+    samples_seen: int | None = None
 
 
 def config_fingerprint(config):

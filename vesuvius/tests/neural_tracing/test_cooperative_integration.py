@@ -255,10 +255,12 @@ def test_reviewed_trace_boundary_holds_cohort_idle_until_supervisor_drains():
     cohort.gpu = SimpleNamespace(idle=True)
     cohort._on_startup_observation = None
     assert cohort._completed_unit([
-        {"step": 100, "done": False, "phase": "reviewed_trace"},
-        {"step": 100, "done": False, "phase": "reviewed_trace"},
+        {"step": 100, "done": False, "phase": "reviewed_trace", "samples_seen": 500},
+        {"step": 100, "done": False, "phase": "reviewed_trace", "samples_seen": 500},
     ]) is False
-    assert cohort.maintenance == {"kind": "reviewed_trace", "step": 100}
+    assert cohort.maintenance == {
+        "kind": "reviewed_trace", "step": 100, "samples_seen": 500,
+    }
     assert cohort.idle is False
 
 

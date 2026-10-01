@@ -235,6 +235,7 @@ def run_cooperative_training(config_path, *, socket=None, resume_checkpoint=None
         output.mkdir(parents=True, exist_ok=False)
         job = {
             "step": step,
+            "samples_seen": int(request["samples_seen"]),
             "checkpoint": str(checkpoint),
             "output_root": str(output),
             "template": str(Path(trace["template"]).expanduser().resolve()),
@@ -283,7 +284,7 @@ def run_cooperative_training(config_path, *, socket=None, resume_checkpoint=None
                     "implied_mean_mm_combined", "wall_seconds",
                 ):
                     hub.writer.add_scalar(
-                        f"reviewed_trace/{key}", metrics[key], int(request["step"])
+                        f"reviewed_trace/{key}", metrics[key], int(request["samples_seen"])
                     )
                 hub.writer.flush()
             print(
