@@ -44,6 +44,71 @@ class TraceParams:
             raise ValueError('stop_patience must be positive')
 
 
+def trace_history(path, size):
+    """Inference history at unit arclength spacing, newest first, excluding head."""
+    from .geometry import arclength, interp_at
+    past = np.asarray(path[-2*size-2:])
+    arc = arclength(past)
+    target = arc[-1]-np.arange(1, size+1)
+    return interp_at(past, arc, target.clip(0)), (target >= 0).astype(np.float32)
+
+
+def advance_trace_path(path, frame, points, commit, heading_start, shape, params,
+                       travelled=0., loop_start=0, *, would_stop=False):
+    """Shared committed geometry for inference and live training; no CT or labels.
+
+    The caller applies commit_prefix first and resolves the returned heading's
+    CT frame only after checking the new state's data split and read footprint.
+    """
+    from .geometry import arclength
+    path = np.asarray(path, dtype=np.float64)
+    if commit < 1:
+        return None, 'confidence'
+    world = path[-1]+np.asarray(points)[:commit] @ np.asarray(frame).T
+    if not np.isfinite(world).all():
+        return None, 'invalid'
+    seg = np.concatenate([path[-1][None], world])
+    new = []
+    first_connection_count = 0
+    remaining = params.max_len-travelled
+    for segment_index, (a, b) in enumerate(zip(seg[:-1], seg[1:])):
+        distance = float(np.linalg.norm(b-a))
+        if distance < 1e-8:
+            continue
+        used = min(remaining, distance)
+        end = a+(b-a)*(used/distance)
+        steps = max(1, int(np.ceil(used)))
+        new.extend(a+(end-a)*(k/steps) for k in range(1, steps+1))
+        if segment_index == 0:
+            first_connection_count = len(new)
+        remaining -= used
+        if remaining <= 1e-7:
+            break
+    new = np.asarray(new)
+    if not len(new) or not np.isfinite(new).all():
+        return None, 'invalid'
+    if np.any(new < 0) or np.any(new[:, ::-1] >= np.asarray(shape)):
+        return None, 'bounds'
+    old = path[loop_start:-params.loop_skip]
+    if len(old) and np.min(np.linalg.norm(old[:, None]-new[None], axis=-1)) < params.loop_radius:
+        return None, 'loop'
+    last_segment = np.concatenate([path[-1][None], new])
+    travelled += float(arclength(last_segment)[-1])
+    old_size = len(path)
+    path = np.concatenate([path, new])
+    heading = np.asarray(frame)[:, 2]
+    if would_stop:
+        heading_start = len(path)
+    else:
+        if heading_start >= old_size:
+            heading_start = old_size+first_connection_count-1
+        tangent = linear12_heading(path, heading_start)
+        if tangent is not None:
+            heading = tangent
+    return dict(path=path, last_segment=last_segment, travelled=travelled,
+                heading_start=heading_start, heading=heading), ''
+
+
 class ModelTracer:
     # When set, build_inputs also receives each trace's seed segment and length.
     path_context = False
@@ -153,11 +218,7 @@ class ModelTracer:
                     hist_world[j] = initial_states[i]['hist']
                     hm[j] = initial_states[i]['hmask']
                     continue
-                past = np.asarray(paths[i][-2*H-2:])
-                arc = arclength(past)
-                target = arc[-1]-np.arange(1, H+1)
-                hm[j] = target >= 0
-                hist_world[j] = interp_at(past, arc, target.clip(0))
+                hist_world[j], hm[j] = trace_history(paths[i], H)
             hist = np.einsum('bhi,bij->bhj', hist_world-pos[:, None], fr)
             tensor = lambda a: torch.from_numpy(np.ascontiguousarray(a)).to(self.device)
             context = {}
@@ -214,51 +275,19 @@ class ModelTracer:
                 if exploratory:
                     exploration[i] += 1
                 commit = max(1, commit)
-                world = pos[j]+points[j, :commit] @ fr[j].T
-                seg = np.concatenate([pos[j][None], world])
-                new = []
-                first_connection_count = 0
-                remaining = pp.max_len-length[i]
-                for segment_index, (a, b) in enumerate(zip(seg[:-1], seg[1:])):
-                    distance = float(np.linalg.norm(b-a))
-                    if distance < 1e-8:
-                        continue
-                    used = min(remaining, distance)
-                    end = a+(b-a)*(used/distance)
-                    steps = max(1, int(np.ceil(used)))
-                    new.extend(a+(end-a)*(k/steps) for k in range(1, steps+1))
-                    if segment_index == 0:
-                        first_connection_count = len(new)
-                    remaining -= used
-                    if remaining <= 1e-7:
-                        break
-                new = np.asarray(new)
-                if not len(new) or not np.isfinite(new).all():
-                    active[i], reasons[i] = False, 'invalid'
+                advanced, reason = advance_trace_path(
+                    paths[i], fr[j], points[j], commit, int(heading_start[i]),
+                    self.vol.shape, pp, length[i], hist_start[i], would_stop=would_stop)
+                if advanced is None:
+                    active[i], reasons[i] = False, reason
                     continue
-                if np.any(new < 0) or np.any(new[:, ::-1] >= np.asarray(self.vol.shape)):
-                    active[i], reasons[i] = False, 'bounds'
-                    continue
-                old = np.asarray(paths[i][hist_start[i]:-pp.loop_skip])
-                if len(old) and np.min(np.linalg.norm(old[:, None]-new[None], axis=-1)) < pp.loop_radius:
-                    active[i], reasons[i] = False, 'loop'
-                    continue
-                last_segment[i] = np.concatenate([pos[j][None], new])
-                length[i] += float(arclength(last_segment[i])[-1])
-                old_size = len(paths[i])
-                paths[i].extend(new)
-                if would_stop:
-                    # Exclude forced geometry from all subsequent fits too.
-                    # The first accepted recovery point starts a fresh suffix.
-                    heading_start[i] = len(paths[i])
-                else:
-                    if heading_start[i] >= old_size:
-                        # Do not fit the connector from an untrusted head to
-                        # the first accepted prediction, including its resamples.
-                        heading_start[i] = old_size+first_connection_count-1
-                    tangent = linear12_heading(paths[i], int(heading_start[i]))
-                    heading = frames[i][:, 2] if tangent is None else tangent
-                    frames[i] = ct_frame(self.vol, paths[i][-1], heading, frames[i], diagnostics=frame_diagnostics[i])
+                paths[i] = list(advanced['path'])
+                last_segment[i] = advanced['last_segment']
+                length[i] = advanced['travelled']
+                heading_start[i] = advanced['heading_start']
+                if not would_stop:
+                    frames[i] = ct_frame(self.vol, paths[i][-1], advanced['heading'], frames[i],
+                                         diagnostics=frame_diagnostics[i])
                 if abort is not None and abort(int(i), paths[i]):
                     active[i], reasons[i] = False, 'abort'
                 elif length[i] >= pp.max_len-1e-6:

@@ -190,6 +190,7 @@ def initialize_training_optimizer(model, ema, args, resume=None):
 
 
 ARCHITECTURES = (ARCHITECTURE, PATCH_ARCHITECTURE, TOKEN_ARCHITECTURE, STEM_ARCHITECTURE)
+ARCHITECTURES += tuple(name.replace('_v15', '_v14') for name in ARCHITECTURES)
 HISTORY_GRAD_CLIP = 5.
 REST_GRAD_CLIP = 100.
 
@@ -197,7 +198,10 @@ REST_GRAD_CLIP = 100.
 def checkpoint_config(ck):
     if ck['architecture'] not in ARCHITECTURES:
         raise ValueError('Unsupported checkpoint architecture; start a fresh run for the current encoders')
-    cfg = DirectConfig(**ck['model_cfg'])
+    options = dict(ck['model_cfg'])
+    # Missing history metadata belongs to the original v14 slab encoder.
+    options.setdefault('history_encoder', 'legacy')
+    cfg = DirectConfig(**options)
     if ck['architecture'] != cfg.architecture:
         raise ValueError('Checkpoint architecture does not match its encoder configuration')
     return cfg
@@ -221,6 +225,15 @@ def resolve_token_only(requested, checkpoint=None):
     return saved
 
 
+def resolve_history_encoder(requested, checkpoint=None):
+    if checkpoint is None:
+        return requested or DirectConfig.history_encoder
+    saved = checkpoint_config(checkpoint).history_encoder
+    if requested is not None and requested != saved:
+        raise ValueError('History encoder must match the resumed checkpoint; start a new run to change it')
+    return saved
+
+
 def load_checkpoint(path,device='cuda'):
     # Collection shares a GPU with training. Keep duplicate weights and any
     # optimizer state on the CPU; only the EMA inference model needs VRAM.
@@ -235,7 +248,7 @@ def load_checkpoint(path,device='cuda'):
 def move_batch(batch, device):
     # Pinned loader batches copy asynchronously; the compute stream orders later use.
     return {k: move_batch(v, device) if isinstance(v, dict) else v.to(device, non_blocking=True)
-            for k, v in batch.items()}
+            for k, v in batch.items() if not k.startswith('_')}
 
 
 class DecisionBatchPrefetch:
@@ -373,7 +386,7 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
                      confidence_weight=.5, ema_decay=.999, n_commit=None, compute_metrics=True,
                      candidate_weight=1.,
                      history_grad_clip=HISTORY_GRAD_CLIP, rest_grad_clip=REST_GRAD_CLIP,
-                     diagnostic=None):
+                     diagnostic=None, live_continuation=None):
     """One equally weighted task loss per independent supervised decision."""
     prepare_training(model, getattr(model, 'training_batch_size', 2))
     total = observed = sum(len(batch['hist']) for batch in batches)
@@ -436,6 +449,8 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
                 loss = loss+candidate_weight*candidate_loss
                 accumulate(identity, 'candidate_loss', candidate_loss)
         loss.backward()
+        if live_continuation is not None:
+            live_continuation.feedback(cpu, output, step)
         if compute_metrics:
             decisions.extend(decision_rows(output, batch, model.cfg, n_commit, tolerance))
             if 'candidate_confidence_logits' in output:
@@ -466,10 +481,19 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
         if 'decision_requested' in cpu:
             requested_decisions += float(cpu['decision_requested'].sum())
         for name in ('gt_unperturbed', 'gt_perturbed', 'replay_correct_continuation',
-                     'real_wrong_turn', 'real_wrong_turn_pre_switch', 'light_gt_replay'):
+                     'real_wrong_turn', 'real_wrong_turn_pre_switch', 'light_gt_replay',
+                     'live_requested', 'live_continuation', 'live_correct_continuation', 'live_failure',
+                     'live_fallback', 'live_light_slot'):
             if name in cpu:
                 key = name+'_fraction'
                 sums[key] = sums.get(key, 0.)+float(cpu[name].sum())/denominator
+        if 'live_continuation' in cpu:
+            cpu['live_policy_age'] = torch.where(cpu['live_continuation'],
+                step-cpu['source_step'].long(), 0)
+        for name in ('live_depth', 'live_policy_age'):
+            if name in cpu:
+                sums[name+'_sum'] = sums.get(name+'_sum', 0.)+float(cpu[name].sum())
+                sums[name+'_max'] = max(sums.get(name+'_max', 0), int(cpu[name].max()))
         if 'negative_bank_shards' in cpu:
             low,high = int(cpu['negative_bank_shards'].min()),int(cpu['negative_bank_shards'].max())
             identity['negative_bank_shards_min'] = min(identity.get('negative_bank_shards_min',low),low)
@@ -578,6 +602,8 @@ def build_parser():
                     help='BasicBlockD blocks per downsampling stage in the optional patch stem')
     ap.add_argument('--encoder', choices=('conv', 'patch4'), default=None,
                     help='Image encoder: conv (default) or overlapping 6x6x6 patches at stride 4; inferred on resume')
+    ap.add_argument('--history-encoder', choices=('fine', 'legacy'), default=None,
+                    help='Historical slabs: fine (default, 2x17x17 tokens) or legacy (2x9x9); inferred on resume')
     ap.add_argument('--token-only', action=argparse.BooleanOptionalAction, default=None,
                     help='Use only patch4 tokens throughout; no reconstructed fine features or output planes')
     ap.add_argument('--direction-inputs', action=argparse.BooleanOptionalAction, default=True,
@@ -608,6 +634,10 @@ def build_parser():
                     help='Maximum light GT lateral offset in tracing voxels; seed and older history preserved')
     ap.add_argument('--gt-perturb-max-angle-deg', type=float, default=2.,
                     help='Maximum absolute light GT heading perturbation in degrees')
+    ap.add_argument('--live-continuation', action='store_true',
+                    help='Replace correct replay slots with recent training predictions advanced by inference policy')
+    ap.add_argument('--live-continuation-steps', type=int, nargs=2, default=(4, 8), metavar=('MIN', 'MAX'),
+                    help='Number of live continuation decisions before reseeding a chain')
     ap.add_argument('--correct-replay-only', action='store_true',
                     help='Replay only nondeparted, nonexploratory committed prefixes with real model progress')
     ap.add_argument('--replay-continuation-fraction', type=float,
@@ -747,6 +777,7 @@ def main(argv=None):
     resume = read_checkpoint(args.resume,ARCHITECTURES,args.device) if args.resume else None
     cfg = DirectConfig(encoder=resolve_encoder(args.encoder, resume),
                        token_only=resolve_token_only(args.token_only, resume),
+                       history_encoder=resolve_history_encoder(args.history_encoder, resume),
                        stem_channels=args.stem_channels, stem_blocks=args.stem_blocks,
                        direction_inputs=args.direction_inputs,input_mode=args.input_mode,channels=args.channels,hidden=args.hidden,layers=args.axial_layers,
                        decoder_layers=args.decoder_layers,
@@ -762,10 +793,15 @@ def main(argv=None):
         validate_dataset_resume(resume,dataset_document,dataset_digest)
     args.encoder = cfg.encoder
     args.token_only = cfg.token_only
+    args.history_encoder = cfg.history_encoder
     if args.decision_fraction and args.batch % 2:
         raise ValueError('Matched decisions require an even batch')
     if not np.isfinite(args.candidate_weight) or args.candidate_weight <= 0:
         raise ValueError('Candidate weight must be finite and positive')
+    if not 1 <= args.live_continuation_steps[0] <= args.live_continuation_steps[1]:
+        raise ValueError('Live continuation requires 1 <= minimum steps <= maximum steps')
+    if args.live_continuation and args.replay_continuation_fraction is None and not args.correct_replay_only:
+        raise ValueError('Live continuation requires explicit continuation/failure allocation or correct-only replay')
     if args.dagger_after <= 0:
         raise ValueError('--dagger-after must be positive')
     from vesuvius.neural_tracing.fiber_follow.regression.bank_geometry import BankSwitchDetector
@@ -851,14 +887,15 @@ def main(argv=None):
                    'negative_bank_refresh_seconds','negative_bank_cache_mb','activation_checkpointing',
                    'history_grad_clip','rest_grad_clip','presence_dropout','blur_probability','blur_sigma',
                    'decision_fraction','decision_choice_fraction','bank_following_probability','fresh_fraction','clean_fraction',
-                   'correct_replay_only','memory_switch_probability',
+                   'correct_replay_only','memory_switch_probability','live_continuation','live_continuation_steps',
                    'gt_perturb_probability','gt_perturb_max_offset','gt_perturb_max_angle_deg',
                    'replay_continuation_fraction','prefer_real_wrong_turns','prefer_replay_for_light_gt',
                    'bank_hard_fraction','replay_failure_fraction','bank_switch_tolerance','bank_own_tolerance',
                    'n_commit','tolerance'}
         for key,value in vars(args).items():
             recorded = resume['training_options'].get(key, {'input_mode': 'ct+presence', 'dataset_config': None,
-                                                           'stem_channels': 0, 'stem_blocks': 2}.get(key))
+                                                           'stem_channels': 0, 'stem_blocks': 2,
+                                                           'history_encoder': 'legacy'}.get(key))
             if key not in ignored and json.dumps(recorded,sort_keys=True) != json.dumps(value,sort_keys=True):
                 raise ValueError(f'Resume option differs: {key}')
         if resume['seed_manifest_sha256'] != manifest['sha256'] or resume['fiber_manifest'] != fiber_manifest(fibers):
@@ -945,8 +982,17 @@ def main(argv=None):
                     '--bank-switch-tolerance',args.bank_switch_tolerance,'--bank-own-tolerance',args.bank_own_tolerance))))
         collector = MultiSourceCollector(collectors)
         progress('Dataset sampling: '+', '.join(f'{name}={weight:.1%}' for name,weight in zip(dataset.names,dataset.weights)))
+    live_continuation = None
+    if args.live_continuation:
+        from .live_continuation import LiveContinuation, preserve_live_metadata
+        live_continuation = LiveContinuation(dataset, steps=args.live_continuation_steps,
+            n_commit=args.n_commit, max_recovery_distance=cfg.max_recovery_distance,
+            switch_tolerance=args.bank_switch_tolerance, own_tolerance=args.bank_own_tolerance)
+        live_continuation.set_step(done)
     loader_args = dict(batch_size=None, num_workers=args.workers,
                        pin_memory=torch.device(args.device).type == 'cuda')
+    if live_continuation is not None:
+        loader_args['collate_fn'] = preserve_live_metadata
     if args.workers:
         loader_args.update(prefetch_factor=2, persistent_workers=True)
     loader = torch.utils.data.DataLoader(dataset, **loader_args)
@@ -985,6 +1031,7 @@ def main(argv=None):
         gt_perturbation=dict(probability=args.gt_perturb_probability, max_offset=args.gt_perturb_max_offset,
                             max_angle_deg=args.gt_perturb_max_angle_deg,
                             unperturbed_total_fraction=args.clean_fraction*(1-args.gt_perturb_probability)),
+        live_continuation=args.live_continuation, live_continuation_steps=args.live_continuation_steps,
         correct_replay_only=args.correct_replay_only,
         replay_continuation_fraction=args.replay_continuation_fraction,
         prefer_real_wrong_turns=args.prefer_real_wrong_turns,
@@ -1034,6 +1081,8 @@ def main(argv=None):
         observed_states = interval_states = 0
         prior_samples = int(resume['samples_seen']) if resume else 0
         for step in range(done+1, args.steps+1):
+            if live_continuation is not None:
+                live_continuation.set_step(step)
             event = collector.poll()
             if event:
                 log.record(dict(step=step, **event))
@@ -1053,7 +1102,7 @@ def main(argv=None):
                 n_commit=args.n_commit, compute_metrics=step % args.log_every == 0 or step == args.steps,
                 candidate_weight=args.candidate_weight,
                 history_grad_clip=args.history_grad_clip, rest_grad_clip=args.rest_grad_clip,
-                diagnostic=diagnostic)
+                diagnostic=diagnostic, live_continuation=live_continuation)
             observed_states += metrics['observed_states']
             interval_states += metrics['observed_states']
             update_seconds = time.monotonic()-update_started
@@ -1186,6 +1235,8 @@ def main(argv=None):
             log.record(dict(event='remote_prefetch_shutdown',remote_prefetch=remote_prefetch.snapshot()))
         if updates is not None:
             updates.close()
+        if live_continuation is not None:
+            live_continuation.close()
         event = collector.close()
         if event:
             log.record(event)

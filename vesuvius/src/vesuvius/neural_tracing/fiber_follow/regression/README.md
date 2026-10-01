@@ -63,6 +63,40 @@ light-GT allocation becomes additional correct replay when available: 52.5%
 untouched GT, 25.5% correct replay, 2% failure replay, 10% identity and 10% wrong
 turns. `light_gt_replay_fraction` reports the replaced share separately.
 
+With `--live-continuation --live-continuation-steps 4 8`, correct-continuation
+slots (including light-GT replacement slots) instead use recent training
+predictions. Clean training examples seed source-local chains. The selected
+prediction is detached, confidence/recovery gated, committed using the same
+geometry and history resampling as inference, and relabeled against its original
+fiber. Workers resolve the next CT frame with inference sign continuity and
+rebuild all current/historical observations. No future vertices enter the input.
+Confirmed departures/switches remain supervised failure examples and end their
+chain; annotation boundaries and held-out footprints censor it. Stops do not
+force progress. Chains reset after 4–8 live decisions; empty queues fall back to
+clean GT and are counted explicitly. Failure and wrong-turn replay remain active.
+
+Feedback uses bounded per-source queues and prioritizes existing chains over new
+seeds. Workers reject predictions older than 64 optimizer updates when taking
+feedback; ordinary loader prefetch can add a few more updates before training.
+Live positions resolve after geometry lookahead, so future plans cannot reserve
+old feedback. There is no extra model forward or gradient through prior steps.
+The policy uses the current training weights and augmented training observation;
+it is not an EMA rollout on unaugmented CT. Queue availability/order depends on
+worker timing. A resume starts empty queues and the usual restarted loader RNG
+streams while preserving optimizer, EMA and schedule state.
+
+Logs distinguish `live_correct_continuation_fraction`, `live_failure_fraction`,
+`live_fallback_fraction`, chain depth and policy age from saved replay. With the
+mixed-run allocation above, 25.5% of samples request live continuation. Some of
+those become failures or clean fallback; this is measured rather than assumed.
+
+Validate real CT, source-local supervision and model feedback without GPU use:
+
+```bash
+../../../../.venv/bin/python scripts/validate_live_continuation.py \
+  --checkpoint output/RUN/last.pt --out /tmp/live-continuation-validation.json
+```
+
 The mixed stem launcher uses batch 10, grad steps 1. Collection explicitly uses
 batch 1 and at most one concurrent collector across sources. Inference checkpoint
 storage stays on CPU; only the EMA inference model transfers to the requested
@@ -122,9 +156,14 @@ while preparing the fork. Existing destinations, zero-stage source models, and
 nonstandard optimizer layouts are rejected. As with ordinary resumes, loader
 random streams restart. No source config defaults are used.
 
-Architecture identifiers are `axial_fiber_slabs_v14`,
-`axial_patch4_overlap_fiber_slabs_v14`, `axial_patch4_overlap_tokens_fiber_slabs_v14`,
-and `axial_patch4_residual_stem_tokens_fiber_slabs_v14`.
+Fresh runs use the fine history encoder (`--history-encoder fine`), with architecture
+identifiers `axial_fiber_slabs_v15`, `axial_patch4_overlap_fiber_slabs_v15`,
+`axial_patch4_overlap_tokens_fiber_slabs_v15`, and
+`axial_patch4_residual_stem_tokens_fiber_slabs_v15`. Existing v14 checkpoints
+load and resume with their original history encoder; an omitted history setting
+is inferred from the checkpoint. `--history-encoder legacy` also permits a fresh
+v14 baseline. Changing history architecture during an ordinary resume is rejected:
+the wider convolutions need new weights and optimizer state, so use a fresh run.
 Patch4 uses a learned 6x6x6 convolution with stride 4 and padding 1. Adjacent
 neighborhoods overlap by two voxels. The sampled crop is 120x104x104; patch4
 dimensions must be multiples of four, with no extra image padding. The token
@@ -282,10 +321,10 @@ flags can be appended. To resume this new run later, use the same launcher with
 
 The image stem follows `PatchEmbed_deeper`, reusing Vesuvius's shared
 `BasicBlockD`: one full-resolution block into 32 channels, then two downsampling
-stages at 32 and 64 channels. Each stage has two residual blocks
+stages at 64 and 128 channels. Each stage has two residual blocks
 (`--stem-blocks 2`), the first with stride two. There are five BasicBlockD blocks
 in total. They use affine InstanceNorm without running statistics, ReLU, and
-ResNet-D average-pool/projection skips. A final 1x1x1 convolution maps 64 channels
+ResNet-D average-pool/projection skips. A final 1x1x1 convolution maps 128 channels
 into the 128-wide token embedding. All stem layers use normal random initialization.
 
 The stem output is added to the parallel patch projection before position/history
@@ -351,13 +390,20 @@ training holdout before images are loaded; either unsafe member rejects a pair.
 Replay and resumed recovery use saved committed prefixes, without connecting a
 remote seed to a truncated local history.
 
-The shared slab encoder uses three convolution stages, widths 8/16/32,
-and strides (1,2,2), (2,2,2), (2,2,2). Each downsampling convolution is followed
+The fine slab encoder uses three convolution stages, widths 32/64/128,
+and strides (1,1,1), (2,2,2), (2,2,2). The first stage processes the full
+8x65x65 crop before any downsampling. Each convolution is followed
 by a shared Vesuvius BasicBlockD with affine InstanceNorm and LeakyReLU(.01).
 Instance normalization uses one group per channel to support an empty valid-slab
 batch with the same per-instance spatial statistics and no running statistics.
-Each valid slab contributes 162 spatial
-feature tokens, projected to model width (128 by default). Position, pose, age,
+Each valid slab contributes 578 spatial tokens on a 2x17x17 grid, with 128 image
+features projected to model width (128 by default). Lateral token spacing is
+2 tracing voxels; the input crop and its field of view are unchanged. Up to eight
+slabs contribute 4,624 tokens. Legacy v14 uses widths 8/16/32 and strides
+(1,2,2), (2,2,2), (2,2,2), producing 162 tokens on a 2x9x9 grid with
+4-voxel lateral spacing. The finer encoder increases activation memory and history
+attention work; measure GPU memory before choosing the training batch size.
+Position, pose, age,
 slot and seed role are embedded inside the encoder. Generator and scorer have
 separate residual history attention shared across their respective decoder
 layers. History features stay attached and are reused across all attempts and

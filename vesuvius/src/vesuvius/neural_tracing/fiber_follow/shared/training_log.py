@@ -21,10 +21,12 @@ class DirectTrainingInterval:
              'recent_fraction', 'bank_wrong_continuation_fraction',
              'bank_following_fraction', 'decision_pair_fraction', 'refinement_attempts_mean',
              'gt_unperturbed_fraction', 'gt_perturbed_fraction', 'replay_correct_continuation_fraction',
-             'real_wrong_turn_fraction', 'real_wrong_turn_pre_switch_fraction', 'light_gt_replay_fraction')
+             'real_wrong_turn_fraction', 'real_wrong_turn_pre_switch_fraction', 'light_gt_replay_fraction',
+             'live_requested_fraction', 'live_continuation_fraction', 'live_correct_continuation_fraction',
+             'live_failure_fraction', 'live_fallback_fraction', 'live_light_slot_fraction')
     counts = tuple(p+'_'+s for p in ('ct_frame', 'history_frame')
                    for s in ('count', 'transported', 'deterministic', 'energy_sum', 'gap_sum')) + (
-              'ct_frame_rejected_batches', 'error_sum', 'geometry_count', 'point_correct_count', 'point_wrong_count',
+              'live_depth_sum', 'live_policy_age_sum', 'ct_frame_rejected_batches', 'error_sum', 'geometry_count', 'point_correct_count', 'point_wrong_count',
               'point_unknown_count', 'supervised_states', 'observation_only_states', 'history_valid_slabs', 'history_age_sum', 'history_overlap_sum', 'history_load_seconds', 'history_encode_seconds',
               'confidence_labeled_states', 'confidence_departed_states', 'refinement_attempts_sum',
               'supervision_weight', 'endpoint_weight', 'matched_endpoint_weight', 'choice_endpoint_weight',
@@ -136,6 +138,14 @@ def _interval_training_lines(row):
                  (('fresh','fresh_fraction'), ('recent','recent_fraction'),
                   ('wrong turns','bank_wrong_continuation_fraction'), ('following','bank_following_fraction'),
                   ('pairs','decision_pair_fraction'))))
+    if m.get('live_requested_fraction', 0):
+        live = max(1., m['live_continuation_fraction']*m['decisions'])
+        lines.append(f"  live continuation: {m['live_continuation_fraction']:.1%}"
+                     f" / correct {m['live_correct_continuation_fraction']:.1%}"
+                     f" / failure {m['live_failure_fraction']:.1%}"
+                     f" / GT fallback {m['live_fallback_fraction']:.1%}"
+                     f" | depth {m['live_depth_sum']/live:.2f}"
+                     f" | policy age {m['live_policy_age_sum']/live:.1f} updates")
     if any(m.get(k, 0) for k in ('gt_unperturbed_fraction', 'gt_perturbed_fraction', 'replay_correct_continuation_fraction')):
         lines.append(f"  data detail (% of all): clean GT {m['gt_unperturbed_fraction']:.1%}"
                      f" / light GT {m['gt_perturbed_fraction']:.1%}"

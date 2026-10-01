@@ -109,7 +109,7 @@ def layer_capture(model):
             slots = a[1].shape[1]
             record['statistics']['history tokens'] = tensor_stats(tokens[~padding])
             # Center spatial features within each slot before reducing channels.
-            values = tokens.detach().float().reshape(1, slots, 2, 9, 9, -1)
+            values = tokens.detach().float().reshape(1, slots, *m.token_shape, -1)
             contrast = (values-values.mean((2, 3, 4), keepdim=True)).square().mean(-1).sqrt().mean(2)
             record['history']['tokens'] = contrast[0].cpu()
         handles.append(model.history_encoder.register_forward_hook(history_tokens))
@@ -125,8 +125,9 @@ def layer_capture(model):
                     scores = (q.float() @ k.float().transpose(-1, -2))/(width//heads)**.5
                     probabilities = scores.masked_fill(~allowed, -torch.inf).softmax(-1)
                     probabilities = probabilities.masked_fill(empty[:, None, None, None], 0.)
-                    slots = probabilities.shape[-1]//162
-                    weights = probabilities.reshape(*probabilities.shape[:-1], slots, 162).sum(-1).mean(1)
+                    per_slab = model.history_encoder.tokens_per_slab
+                    slots = probabilities.shape[-1]//per_slab
+                    weights = probabilities.reshape(*probabilities.shape[:-1], slots, per_slab).sum(-1).mean(1)
                     record['history'].setdefault(name+'_attention', []).append(weights[0].detach().cpu())
                     return original(query, k, v, allowed, empty)
                 return forward
@@ -261,6 +262,9 @@ def render_microbatch(model, cpu_batch, out, step, *, device, n_commit, toleranc
         errors = [r['mean_error'] for r in rows if r['mean_error'] is not None]
         report = dict(step=step, split='current_training_microbatch', model='EMA', examples=len(rows),
             n_commit=n_commit, tolerance=tolerance,
+            history_encoder=dict(variant=model.cfg.history_encoder, token_shape=model.history_encoder.token_shape,
+                tokens_per_slab=model.history_encoder.tokens_per_slab,
+                feature_channels=model.history_encoder.projection.in_features),
             summary=dict(committed_points=sum(r['commit'] for r in rows),
                 stopped=sum(r['commit'] == 0 for r in rows),
                 mean_example_error=sum(errors)/len(errors) if errors else None,

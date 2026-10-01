@@ -55,7 +55,7 @@ def display_example(batch, output, details, layers, cfg, label, metrics):
         values = layers['history'].get(name+'_attention', [])
         chosen = values[selected*depth:(selected+1)*depth]
         attentions[name] = np.mean([array(a) for a in chosen], axis=0) if chosen else np.zeros((cfg.n_future, len(valid)))
-    convolution = np.zeros((len(valid), 9, 9))
+    convolution = np.zeros_like(array(layers['history']['tokens']))
     convolution[valid] = array(layers['history']['convolution'])
     return dict(label=label, sections=sections, annotation=annotation, history=history,
         points=array(output['points'][0]), initial=array(output['initial_points'][0]),

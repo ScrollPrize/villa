@@ -30,7 +30,8 @@ class ResidualPatchStem(nn.Module):
     """BasicBlockD patch embedding, adapted to the existing stride-four grid.
 
     Following PatchEmbed_deeper: one full-resolution block, then two residual
-    downsampling stages, with InstanceNorm and ReLU. stem_blocks specifies the
+    downsampling stages at twice and four times the base width, with InstanceNorm
+    and ReLU. stem_blocks specifies the
     depth of each downsampling stage. Both paths consume the sampled image
     directly on a complete stride-four grid. BasicBlockD mixes
     odd-kernel convolution and average-pool skip footprints, so its receptive
@@ -46,10 +47,10 @@ class ResidualPatchStem(nn.Module):
             output_channels=c, initial_stride=1, conv_bias=True, **block_options)
         self.blocks = nn.Sequential(
             StackedResidualBlocks(n_blocks=cfg.stem_blocks, input_channels=c,
-                output_channels=c, initial_stride=2, conv_bias=False, **block_options),
-            StackedResidualBlocks(n_blocks=cfg.stem_blocks, input_channels=c,
-                output_channels=2*c, initial_stride=2, conv_bias=False, **block_options))
-        self.projection = nn.Conv3d(2*c, cfg.hidden, 1)
+                output_channels=2*c, initial_stride=2, conv_bias=False, **block_options),
+            StackedResidualBlocks(n_blocks=cfg.stem_blocks, input_channels=2*c,
+                output_channels=4*c, initial_stride=2, conv_bias=False, **block_options))
+        self.projection = nn.Conv3d(4*c, cfg.hidden, 1)
 
     def forward(self, image):
         return self.projection(self.blocks(self.input(image)))

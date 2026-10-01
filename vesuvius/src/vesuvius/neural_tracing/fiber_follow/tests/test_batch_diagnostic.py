@@ -15,8 +15,10 @@ from vesuvius.neural_tracing.fiber_follow.regression.batch_diagnostic import (
 
 
 @pytest.mark.parametrize('empty', [False, True])
-def test_layer_capture_preserves_predictions_and_cleans_up(empty):
+@pytest.mark.parametrize('variant', ['fine', 'legacy'])
+def test_layer_capture_preserves_predictions_and_cleans_up(empty, variant):
     cfg = config()
+    cfg.history_encoder = variant
     cfg.encoder, cfg.token_only, cfg.stem_channels = 'patch4', True, 4
     cfg.recurrent_refinement_steps = 1
     model = DirectFollower(cfg).eval()
@@ -38,6 +40,9 @@ def test_layer_capture_preserves_predictions_and_cleans_up(empty):
     assert layers['statistics']['patch embedding']['rms'] > 0
     assert set(layers['decoder']) == {'input', 'block 1', 'output'}
     assert layers['encoder']['encoder output'].ndim == 2
+    lateral = 17 if variant == 'fine' else 9
+    assert layers['history']['tokens'].shape == (8, lateral, lateral)
+    assert layers['history']['convolution'].shape == (0 if empty else 2, lateral, lateral)
     for head in ('generator', 'scorer'):
         for attention in layers['history'][head+'_attention']:
             assert torch.isfinite(attention).all()
@@ -96,6 +101,8 @@ def test_render_emits_readable_images_strict_json_and_preserves_rng(tmp_path):
     assert report['rows'][1]['attempts'][0]['error'] is None
     assert report['examples'] == rows['examples'] == 2
     assert report['training_update']['loss'] == .2
+    assert report['history_encoder'] == dict(variant='fine', token_shape=[2, 17, 17],
+        tokens_per_slab=578, feature_channels=128)
     assert [r['dataset'] for r in report['rows']] == ['ordinary', 'unknown']
     assert {p.name for p in folder.iterdir()} == {
         'predictions.png', 'crop_orientation.png', 'encoder.png', 'decoder.png', 'history.png', 'metrics.json'}

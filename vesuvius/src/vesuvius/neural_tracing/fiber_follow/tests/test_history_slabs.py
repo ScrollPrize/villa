@@ -327,10 +327,11 @@ def test_slab_instance_norm_matches_native_and_supports_empty_backward(batch_siz
     assert x.grad is not None and torch.isfinite(x.grad).all()
 
 
-def test_history_residuals_use_shared_basicblock_d():
+@pytest.mark.parametrize('variant', ['fine', 'legacy'])
+def test_history_residuals_use_shared_basicblock_d(variant):
     from vesuvius.models.build.resblocks import BasicBlockD
-    encoder = build_model(cfg()).history_encoder
-    for stage in (1, 3, 5):
+    encoder = build_model(cfg(history_encoder=variant)).history_encoder
+    for stage in range(1, len(encoder.convolution), 2):
         block = encoder.convolution[stage]
         assert isinstance(block, BasicBlockD)
         assert isinstance(block.conv1.norm, torch.nn.InstanceNorm3d)

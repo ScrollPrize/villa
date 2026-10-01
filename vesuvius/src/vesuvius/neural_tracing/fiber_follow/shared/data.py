@@ -459,6 +459,7 @@ class FollowDataset(torch.utils.data.IterableDataset):
         self.window, self.pool_size, self.window_samples = window, pool_size, window_samples
         self.replay_index, self.refresh_chunks = replay_index, refresh_chunks
         self.batch_builder = batch_builder
+        self.live_continuation = None  # Optional trainer-to-worker prediction feedback.
         self.remote_prefetch = None  # Optional trainer-owned process queue client.
         self.remote_prefetch_lookahead = 0  # Planned microbatches per source/worker.
         self.additional_crops = tuple(additional_crops)
@@ -499,8 +500,12 @@ class FollowDataset(torch.utils.data.IterableDataset):
         pools = self.recent_pools
         if self.replay_continuation_fraction is not None:
             continuation = rng.random() < self.replay_continuation_fraction
+            if self.live_continuation is not None and source and continuation:
+                return source, -2, None, -1
             pools = self.continuation_pools if continuation else self.recent_pools
             options = [i for i in (range(4) if continuation else range(4, len(pools))) if pools[i]]
+            if not options and not continuation and self.live_continuation is not None and source:
+                return source, -2, None, -1
             if not options and not continuation:
                 pools = self.continuation_pools
                 options = [i for i in range(4) if pools[i]]
@@ -508,6 +513,8 @@ class FollowDataset(torch.utils.data.IterableDataset):
             if not options:
                 return None
             band = int(rng.choice(options))
+        elif self.correct_replay_only and self.live_continuation is not None and source:
+            return source, -2, None, -1
         elif self.replay_failure_fraction is None:
             band = 4 if rng.random()<.1 else int(rng.integers(4))
         else:
@@ -551,6 +558,8 @@ class FollowDataset(torch.utils.data.IterableDataset):
         return None
 
     def correct_continuation_item(self, rng):
+        if self.live_continuation is not None:
+            return self.live_continuation.placeholder(self, rng, light=True)
         bands = [i for i in range(4) if self.continuation_pools[i]]
         for _ in range(3 if bands else 0):
             band = int(rng.choice(bands))
@@ -640,6 +649,8 @@ class FollowDataset(torch.utils.data.IterableDataset):
 
     def replay_item(self, draw, rng):
         source,band,op,j = draw
+        if band == -2:
+            return self.live_continuation.placeholder(self, rng)
         if (source == REPLAY_SOURCES['recent'] and not self.correct_replay_only
                 and not self.prefer_replay_for_light_gt and self.replay_continuation_fraction is None
                 and hasattr(self.batch_builder,'replace_replay')):
@@ -701,6 +712,8 @@ class FollowDataset(torch.utils.data.IterableDataset):
             raise ValueError('Remote prefetch lookahead must be nonnegative')
         plans, pending = self._iter_plans(vol), deque()
         first = True
+        worker = torch.utils.data.get_worker_info()
+        live_rng = np.random.default_rng(np.random.SeedSequence([self.seed, 8123, 0 if worker is None else worker.id]))
         rejected = 0
         while True:
             # Deliver the first batch promptly. Fill the deeper plan queue when
@@ -714,6 +727,11 @@ class FollowDataset(torch.utils.data.IterableDataset):
                 self.remote_prefetch.lookahead(vol.ct,
                     [bounds for *_,bounds in pending],scope=id(self))
             items, requested, fraction, bounds = pending.popleft()
+            if self.live_continuation is not None:
+                items = [self.live_continuation.resolve(item, self, vol, live_rng)
+                         if item.get('live_requested') else item for item in items]
+                # Resolved positions differ from the geometry lookahead plan.
+                bounds = self.prefetch_bounds(items, vol) if lookahead else None
             if lookahead:
                 self.remote_prefetch.ensure(vol.ct,bounds)
             else:
@@ -733,6 +751,12 @@ class FollowDataset(torch.utils.data.IterableDataset):
                         f'(source={getattr(self.vol_spec, "ct_zarr", "unknown")}, '
                         f'worker={worker.id if worker else 0}): {exc}') from exc
                 continue
+            if self.live_continuation is not None:
+                batch['_live_states'] = [self.live_continuation.metadata(item) for item in items]
+                batch['live_depth'] = torch.tensor([item.get('live_depth', 0) for item in items])
+                batch['live_policy_age'] = torch.tensor([
+                    max(0, self.live_continuation.step.value-item['source_step'])
+                    if item.get('live_continuation') else 0 for item in items])
             if fraction:
                 batch['decision_requested'] = torch.full((self.chunk,), 2*requested/self.chunk)
             if rejected:
@@ -993,7 +1017,9 @@ def collate_targets(items):
         out['stratum'] = st('stratum')
         out['failure_kind'] = torch.tensor([it.get('failure_kind', 0) for it in items], dtype=torch.long)
         for key in ('gt_unperturbed', 'gt_perturbed', 'replay_correct_continuation',
-                    'real_wrong_turn', 'real_wrong_turn_pre_switch', 'light_gt_replay'):
+                    'real_wrong_turn', 'real_wrong_turn_pre_switch', 'light_gt_replay',
+                    'live_requested', 'live_continuation', 'live_correct_continuation', 'live_failure',
+                    'live_fallback', 'live_light_slot'):
             out[key] = torch.tensor([it.get(key, False) for it in items], dtype=torch.bool)
     return out
 

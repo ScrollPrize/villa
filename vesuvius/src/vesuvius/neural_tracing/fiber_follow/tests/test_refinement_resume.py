@@ -14,8 +14,8 @@ from vesuvius.neural_tracing.fiber_follow.shared.runloop import training_rng_sta
 from types import SimpleNamespace
 
 
-def checkpoint(tmp_path):
-    model = build_model(cfg(recurrent_refinement_steps=1))
+def checkpoint(tmp_path, history_encoder='fine'):
+    model = build_model(cfg(recurrent_refinement_steps=1, history_encoder=history_encoder))
     ema = copy.deepcopy(model)
     opt = torch.optim.AdamW(model.parameters(),lr=.0003)
     for p in model.parameters(): p.grad = torch.ones_like(p)
@@ -23,6 +23,7 @@ def checkpoint(tmp_path):
     args = vars(build_parser().parse_args(['--name','source','--fiber-zarrs','z','--fibers','f','--ct','c','--manifest','m',
         '--out-root',str(tmp_path),'--lr','.0003','--batch','16','--grad-steps','1','--workers','10',
         '--warmup','1000','--recurrent-refinement-steps','1']))
+    args['history_encoder'] = history_encoder
     return dict(architecture=model.architecture,model_cfg=model.cfg.to_dict(),model=model.state_dict(),ema=ema.state_dict(),
                 optimizer=opt.state_dict(),rng=training_rng_state(),step=17000,samples_seen=272000,lr_restart_step=0,
                 training_options=args)
@@ -57,9 +58,13 @@ def test_expansion_preserves_weights_moments_rng_and_can_update(tmp_path):
 
 @pytest.mark.parametrize('legacy_prefetch',[False,True])
 @pytest.mark.parametrize('legacy_batch',[False,True])
-def test_fork_uses_checkpoint_settings_fixture_and_live_replay(tmp_path,legacy_prefetch,legacy_batch):
+@pytest.mark.parametrize('legacy_history',[False,True])
+def test_fork_uses_checkpoint_settings_fixture_and_live_replay(tmp_path,legacy_prefetch,legacy_batch,legacy_history):
     source=tmp_path/'source'; source.mkdir()
-    ck=checkpoint(tmp_path)
+    ck=checkpoint(tmp_path, 'legacy' if legacy_history else 'fine')
+    if legacy_history:
+        ck['training_options'].pop('history_encoder')
+        ck['model_cfg'].pop('history_encoder')
     if legacy_batch:
         ck['training_options'].pop('grad_steps')
         ck['training_options']['microbatch'] = 16
@@ -83,7 +88,9 @@ def test_fork_uses_checkpoint_settings_fixture_and_live_replay(tmp_path,legacy_p
     assert json.loads((dest/'dagger/replay.json').read_text())==[str(replay)]
     assert hashlib.sha256(path.read_bytes()).hexdigest()==digest
     assert saved['remote_prefetch_connections']==0
-    assert set(info['changes'])=={'name','resume','recurrent_refinement_steps'} | (prefetch_keys if legacy_prefetch else set())
+    assert saved['history_encoder'] == ('legacy' if legacy_history else 'fine')
+    assert set(info['changes'])==({'name','resume','recurrent_refinement_steps'}
+        | (prefetch_keys if legacy_prefetch else set()) | ({'history_encoder'} if legacy_history else set()))
     with pytest.raises(FileExistsError):fork_run(path,'refine3',3)
 
 

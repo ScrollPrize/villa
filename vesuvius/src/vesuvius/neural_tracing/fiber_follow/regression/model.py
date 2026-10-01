@@ -12,10 +12,10 @@ from torch.utils.checkpoint import checkpoint
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
 from vesuvius.neural_tracing.fiber_follow.shared.policy import DEFAULT_CONFIDENCE, commit_prefix
 
-ARCHITECTURE = 'axial_fiber_slabs_v14'
-PATCH_ARCHITECTURE = 'axial_patch4_overlap_fiber_slabs_v14'
-TOKEN_ARCHITECTURE = 'axial_patch4_overlap_tokens_fiber_slabs_v14'
-STEM_ARCHITECTURE = 'axial_patch4_residual_stem_tokens_fiber_slabs_v14'
+ARCHITECTURE = 'axial_fiber_slabs_v15'
+PATCH_ARCHITECTURE = 'axial_patch4_overlap_fiber_slabs_v15'
+TOKEN_ARCHITECTURE = 'axial_patch4_overlap_tokens_fiber_slabs_v15'
+STEM_ARCHITECTURE = 'axial_patch4_residual_stem_tokens_fiber_slabs_v15'
 TOKEN_STRIDE = (8, 2, 2)
 TOKEN_OFFSET = (3, 0, 0)
 
@@ -41,8 +41,11 @@ class DirectConfig:
     token_only: bool = False
     stem_channels: int = 0
     stem_blocks: int = 2
+    history_encoder: str = 'fine'
 
     def __post_init__(self):
+        if self.history_encoder not in ('fine', 'legacy'):
+            raise ValueError('History encoder must be fine or legacy')
         if self.input_mode not in ('ct', 'ct+presence') or (self.input_mode == 'ct' and self.direction_inputs):
             raise ValueError('CT-only inputs exclude presence and direction fields')
         if self.encoder not in ('conv', 'patch4'):
@@ -89,10 +92,12 @@ class DirectConfig:
     @property
     def architecture(self):
         if self.stem_channels:
-            return STEM_ARCHITECTURE
-        if self.token_only:
-            return TOKEN_ARCHITECTURE
-        return PATCH_ARCHITECTURE if self.encoder == 'patch4' else ARCHITECTURE
+            architecture = STEM_ARCHITECTURE
+        elif self.token_only:
+            architecture = TOKEN_ARCHITECTURE
+        else:
+            architecture = PATCH_ARCHITECTURE if self.encoder == 'patch4' else ARCHITECTURE
+        return architecture.replace('_v15', '_v14') if self.history_encoder == 'legacy' else architecture
 
     @property
     def path_evidence_width(self):

@@ -1,5 +1,6 @@
 """Live causal observations. No annotation, cached feature, or writer inputs."""
 import time
+import math
 
 import numpy as np
 import torch
@@ -146,20 +147,29 @@ class HistoryEncoder(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         stages, previous = [], 2  # CT and observed-path heatmap
-        for channels, stride in zip((8, 16, 32), ((1, 2, 2), (2, 2, 2), (2, 2, 2))):
+        fine = cfg.history_encoder == 'fine'
+        widths = (32, 64, 128) if fine else (8, 16, 32)
+        strides = ((1, 1, 1), (2, 2, 2), (2, 2, 2)) if fine else (
+            (1, 2, 2), (2, 2, 2), (2, 2, 2))
+        shape = (SLAB.depth, SLAB.width, SLAB.width)
+        for channels, stride in zip(widths, strides):
             stages.extend((nn.Conv3d(previous, channels, 3, stride=stride, padding=1),
                 BasicBlockD(nn.Conv3d, channels, channels, 3, 1,
                     norm_op=SlabInstanceNorm, norm_op_kwargs=dict(eps=1e-5, affine=True),
                     nonlin=nn.LeakyReLU, nonlin_kwargs=dict(negative_slope=.01, inplace=True))))
             previous = channels
+            shape = tuple(math.ceil(n/s) for n, s in zip(shape, stride))
+        self.token_shape = shape
+        self.tokens_per_slab = math.prod(shape)
         self.convolution = nn.Sequential(*stages)
-        self.projection = nn.Linear(32, cfg.hidden)
+        self.projection = nn.Linear(previous, cfg.hidden)
         self.position = nn.Linear(3, cfg.hidden)
         self.pose = nn.Sequential(nn.Linear(14, cfg.hidden), nn.SiLU(), nn.Linear(cfg.hidden, cfg.hidden))
         self.slot = nn.Embedding(SLOTS, cfg.hidden)
         self.norm = nn.LayerNorm(cfg.hidden)
-        z, y, x = torch.meshgrid(torch.arange(2), torch.arange(9), torch.arange(9), indexing='ij')
-        self.register_buffer('xyz', torch.stack((x/8., y/8., z.float()), -1).reshape(162, 3), persistent=False)
+        z, y, x = torch.meshgrid(*(torch.arange(n) for n in shape), indexing='ij')
+        xyz = torch.stack((x/(shape[2]-1), y/(shape[1]-1), z/(shape[0]-1)), -1)
+        self.register_buffer('xyz', xyz.reshape(self.tokens_per_slab, 3), persistent=False)
 
     def forward(self, slabs, valid, pose):
         b, slots = valid.shape
@@ -168,12 +178,12 @@ class HistoryEncoder(nn.Module):
         # SlabInstanceNorm supports empty batches: no dummy slab work.
         features = self.convolution(selected).flatten(2).transpose(1, 2)
         projected = self.projection(features)
-        tokens = projected.new_zeros(b*slots, 162, projected.shape[-1])
-        tokens = tokens.index_copy(0, indices, projected).reshape(b, slots, 162, -1)
+        tokens = projected.new_zeros(b*slots, self.tokens_per_slab, projected.shape[-1])
+        tokens = tokens.index_copy(0, indices, projected).reshape(b, slots, self.tokens_per_slab, -1)
         metadata = self.pose(torch.where(valid[..., None], pose, 0.))
         tokens = self.norm(tokens+self.position(self.xyz)[None, None]
                            +metadata[:, :, None]+self.slot.weight[None, :, None])
-        padding = (~valid[:, :, None]).expand(-1, -1, 162).reshape(b, -1)
+        padding = (~valid[:, :, None]).expand(-1, -1, self.tokens_per_slab).reshape(b, -1)
         tokens = tokens.flatten(1, 2).masked_fill(padding[..., None], 0.)
         return tokens, padding
 

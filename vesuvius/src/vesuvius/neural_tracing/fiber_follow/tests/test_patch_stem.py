@@ -57,7 +57,7 @@ def test_stem_uses_shared_basicblock_d_at_full_half_and_quarter_resolution():
     stem = build_model(config).encoder.stem
     blocks = [m for m in stem.modules() if isinstance(m, BasicBlockD)]
     assert len(blocks) == 5
-    assert [b.output_channels for b in blocks] == [32, 32, 32, 64, 64]
+    assert [b.output_channels for b in blocks] == [32, 64, 64, 128, 128]
     assert [tuple(b.stride) for b in blocks] == [(1, 1, 1), (2, 2, 2), (1, 1, 1), (2, 2, 2), (1, 1, 1)]
     image = torch.randn(1, config.input_channels, 24, 20, 20)
     with torch.no_grad():
@@ -65,11 +65,11 @@ def test_stem_uses_shared_basicblock_d_at_full_half_and_quarter_resolution():
         half = stem.blocks[0](full)
         quarter = stem.blocks[1](half)
     assert full.shape == (1, 32, 24, 20, 20)
-    assert half.shape == (1, 32, 12, 10, 10)
-    assert quarter.shape == (1, 64, 6, 5, 5)
+    assert half.shape == (1, 64, 12, 10, 10)
+    assert quarter.shape == (1, 128, 6, 5, 5)
+    assert stem.projection.in_channels == 128
     assert all(isinstance(b.conv1.norm, torch.nn.InstanceNorm3d) and
                isinstance(b.nonlin2, torch.nn.ReLU) for b in blocks)
     assert isinstance(blocks[1].skip[0], torch.nn.AvgPool3d)
     assert isinstance(blocks[3].skip[0], torch.nn.AvgPool3d)
-
 

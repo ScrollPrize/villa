@@ -29,9 +29,10 @@ def fork_checkpoint(source, name, transform, *, allowed_changes, migration_key, 
     original_options = normalize_batch_options(original['training_options'])
     parser = build_parser()
     missing_defaults = {'remote_prefetch_connections','remote_prefetch_queue_size','remote_prefetch_timeout',
-                         'remote_prefetch_lookahead','stem_channels','stem_blocks'}-options.keys()
+                         'remote_prefetch_lookahead','stem_channels','stem_blocks','history_encoder'}-options.keys()
     for key in sorted(missing_defaults):
-        options.setdefault(key,parser.get_default(key))
+        options.setdefault(key, checkpoint_config(migrated).history_encoder if key == 'history_encoder'
+                           else parser.get_default(key))
     if options['reset_optimizer']:
         raise ValueError('Refusing a continuation that would reset optimizer state')
     destination = Path(options['out_root']).resolve()/name
