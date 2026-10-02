@@ -233,7 +233,7 @@ int main(int argc, char *argv[])
             ("skip-overlap-check", "Do not perform overlap check with other surfaces after tracing")
             ("inpaint", "perform automatic inpainting on all detected holes.")
             ("resume-opt", po::value<std::string>(), "Resume optimization option (skip, local, global)")
-            ("resume-generations", po::value<int>(), "Number of additional generations to grow from current (overrides JSON generations)")
+            ("resume-generations", po::value<int>(), "Grow this many additional generations past the resumed generation (requires --resume, extends the JSON generations limit)")
             ("segment-name", po::value<std::string>(), "Output segment name (uses target-dir directly instead of creating subfolder)");
 
         po::variables_map vm;
@@ -306,6 +306,10 @@ int main(int argc, char *argv[])
         }
 
         if (vm.count("resume-generations")) {
+            if (!vm.count("resume")) {
+                std::cerr << "ERROR: --resume-generations can only be used with --resume" << std::endl;
+                return EXIT_FAILURE;
+            }
             params["resume_generations"] = vm["resume-generations"].as<int>();
         }
 
