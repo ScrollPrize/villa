@@ -54,12 +54,20 @@ def scalar_crops(items, vol, crop, pool=None, *, presence=False, out=None):
         raise ValueError('Scalar crop destination must have the expected shape and float32 dtype')
     if any(not result[j].flags.c_contiguous for j in range(len(items))):
         raise ValueError('Each scalar crop destination must be contiguous')
-    for k, j in enumerate(unique):
+    def sample(k):
+        j = unique[k]
         item = items[j]
         sample_scalar_crop(raw[k], starts[k], item['pos']*scale, item['frame']*scale,
                            grid, result[j])
         if not presence:
             normalize_ct(result[j, 0], vol.spec.ct_normalization)
+    # Rows are independent and the Numba kernel releases the GIL, so a pool only
+    # changes scheduling; each row's values are identical to the serial loop.
+    if pool is None:
+        for k in range(len(unique)):
+            sample(k)
+    else:
+        list(pool.map(sample, range(len(unique))))
     for j, source in enumerate(sources):
         if j != source:
             result[j] = result[source]

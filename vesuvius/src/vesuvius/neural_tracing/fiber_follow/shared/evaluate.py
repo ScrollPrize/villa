@@ -9,7 +9,7 @@ from scipy.spatial import cKDTree
 
 from vesuvius.neural_tracing.fiber_follow.shared.data import DATA_VERSION, TracedFiber
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import interp_at, tangent_at
-from vesuvius.neural_tracing.fiber_follow.shared.heading import ct_seed_heading, SeedHeadingError, SEED_HEADING_POLICY
+from vesuvius.neural_tracing.fiber_follow.shared.heading import oriented_seed_heading, SeedHeadingError, SEED_HEADING_POLICY
 
 
 def make_seeds(fibers: list[TracedFiber], vol, per_fiber: int = 3,
@@ -32,12 +32,10 @@ def make_seeds(fibers: list[TracedFiber], vol, per_fiber: int = 3,
             p = interp_at(f.points, f.s, np.array([t]))[0]
             tau = tangent_at(f.points, f.s, t)
             try:
-                ax = ct_seed_heading(vol, p, f.tag)
+                ax = oriented_seed_heading(vol, p, f.tag, tau)
             except SeedHeadingError as error:
                 warnings.warn(f'Skipping seed for {f.name} at {p.tolist()}: {error}', stacklevel=2)
                 continue
-            if np.dot(ax, tau) < 0:
-                ax = -ax
             for sgn in (1.0, -1.0):
                 h = sgn*ax
                 out.append(dict(fiber=fi, t=float(t), sign=sgn, pos=p, heading=h,

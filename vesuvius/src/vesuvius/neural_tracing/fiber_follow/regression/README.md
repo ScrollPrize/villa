@@ -1,5 +1,29 @@
 # Live historical slab regression
 
+The optional v17 `--path-geometry-tokens` (requires v16 path tokens) adds 29 memory
+tokens shared by the path decoder and survival scorer. They sample the committed
+observed polyline 1–512 arclength voxels behind the head, plus its first point,
+in the current crop frame without crop masking: local references are crop
+supported, so only ~24 of the 128 local-history points otherwise reach either
+head. Each token embeds position (multi-scale Fourier, 2–1024 voxels), unit
+tangent, arclength behind the head and the first-point role. The final layer
+starts at zero; masked tokens leave v16 outputs unchanged. No annotation geometry
+enters them.
+
+To fork a path-token run with these tokens, a fresh AdamW (no moments, warmup
+restarting at the fork step), new source weights and a new rest-gradient clip:
+
+```bash
+../../../../.venv/bin/python -m vesuvius.neural_tracing.fiber_follow.regression.geometry_resume \
+  --checkpoint output/SOURCE/ckpt_022000.pt --name NEW_RUN \
+  --dataset-config configs/mixed_ct_datasets_paris50.json --rest-grad-clip 60
+```
+
+The dataset config may differ only in source weights. `configs/mixed_ct_datasets_paris50.json`
+samples Paris 4 at 50% and each AFV source at 25%. As with `memory_resume`,
+`migration.json` records the exact trainer command, and this command does not
+stop or launch processes.
+
 The optional v16 memory continuation adds three explicit observed-path tokens per
 historical slab, retaining all 578 spatial tokens. Each token samples the encoded
 CT/path features at the committed path and four lateral neighbors one tracing
@@ -308,6 +332,23 @@ AGENTS_AGENT_MODE=1 MPLCONFIGDIR=/tmp/fiber-tests-mpl ../../../../.venv/bin/pyth
   -o cache_dir=/tmp/fiber-pytest-cache \
   tests/test_{heading,ct_frames,transverse_frames,trace_heading,history_slabs,ct_frame_retries,point_logging,regression,batch_diagnostic,feedback_refinement,decision_training,identity_decisions,observation_preparation,mixed_datasets,diagnostic_images}.py
 ```
+
+### Rollout CPU work
+
+`ModelTracer` runs the per-trace CPU work of each step in its thread pool: the
+initial and per-step CT frames, the fine and history-slab crop sampling, each
+item's slab-frame chain, and slab packing. Each row is computed exactly as in the
+serial loop, so inputs are bit-identical (`tests/test_rollout_threading.py`). This
+holds under `torch.inference_mode` as well. Without a pool (`pool=None`) the code
+runs serially, as training loader workers do.
+
+The gain needs several traces per step. On 24 held-out Paris 4 seeds × 600 voxels
+(81k checkpoint, free RTX 5090), rollout throughput rose from 148 to 306 voxels/s
+at batch 8, and from 154 to 412 at batch 24. Batch size did not matter before the
+change because the step was CPU-bound. Traces were identical before and after.
+Batch-1 callers (the in-trainer monitors and DAgger collection) see little change.
+For held-out evaluation, use `--batch 24` or more. The 96-seed, 2000-voxel Paris 4
+long-range eval then takes about 4 minutes in one process.
 
 ### Default CT normalization
 

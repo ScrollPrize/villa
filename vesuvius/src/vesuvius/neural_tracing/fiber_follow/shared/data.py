@@ -166,8 +166,10 @@ class SampleConfig:
     lateral_probs: tuple = (0.5, 0.35, 0.15)
     angle_sigmas_deg: tuple = (2.0, 5.0, 10.0)
     angle_probs: tuple = (0.5, 0.35, 0.15)
-    no_history_prob: float = 0.1
-    short_history_prob: float = 0.0  # conditional on history being present; opt-in for direct training
+    no_history_prob: float = 0.1  # seed-only decisions (a trace's first call)
+    short_history_prob: float = 0.0  # otherwise, 1-8/9-32 voxel trace starts
+    trace_noise_sigma: tuple = (.175, 1.)  # log-uniform per-trace lateral error scale, per transverse axis
+    trace_noise_length: float = 40.  # correlation length of simulated tracing error, trace voxels
     history_jitter: float = 0.0  # independent point noise; disable for smooth history
     history_drift: float = 2.0  # accumulated lateral displacement, smooth over 16--64 voxels
     history_wobble: float = 1.0  # max amplitude (voxels) of slow lateral wobble on the own-trace history
@@ -242,34 +244,128 @@ def plane_targets(p, s, t, t_end, pos, frame, planes):
     return ab, m
 
 
-def make_sample(fiber: TracedFiber, t: float, reverse: bool, cfg: SampleConfig, rng: np.random.Generator,
-                *, perturb=True, light_perturbation=None):
-    """Sample GT geometry; perturb=False preserves position, tangent and history."""
-    p, s = fiber.points, fiber.s
+def traversal_curve(fiber, reverse):
+    """Annotation points and arclength in the traversal direction."""
     if reverse:
-        p = p[::-1]
-        s = s[-1] - s[::-1]
+        return fiber.points[::-1], fiber.s[-1]-fiber.s[::-1]
+    return fiber.points, fiber.s
+
+
+def trace_prefix_length(t, cfg: SampleConfig, rng):
+    """Arclength already traced at this decision, i.e. how far back its seed lies.
+
+    Seed-only and 1-8/9-32 voxel trace starts are reserved; otherwise the trace
+    began uniformly anywhere earlier on the annotation.
+    """
+    if rng.random() < cfg.no_history_prob:
+        return 0.
+    if cfg.short_history_prob > 0 and rng.random() < cfg.short_history_prob:
+        lo, hi = (1, 8) if rng.random() < .5 else (9, 32)
+        return min(float(t), float(rng.integers(lo, hi+1)))
+    return float(rng.uniform(0., t))
+
+
+def trace_noise(arcs, p, s, cfg: SampleConfig, rng):
+    """Smooth lateral tracing error along a simulated observed path, zero at its seed.
+
+    An Ornstein-Uhlenbeck process in 3D with the GT-tangential part removed. Each
+    trace draws its scale log-uniformly from ``cfg.trace_noise_sigma`` (per
+    transverse axis) with correlation length ``cfg.trace_noise_length``; both fit
+    on-track held-out rollouts (lateral residual p50 0.47, p90 1.1, p99 2.1 voxels).
+    """
+    from scipy.signal import lfilter
+    lo, hi = cfg.trace_noise_sigma
+    noise = np.zeros((len(arcs), 3))
+    if hi <= 0 or len(arcs) < 2:
+        return noise, 0.
+    sigma = float(np.exp(rng.uniform(np.log(lo), np.log(hi))))
+    decay = math.exp(-cfg.history_step/cfg.trace_noise_length)
+    shocks = rng.normal(size=noise.shape)*sigma*math.sqrt(1-decay*decay)
+    shocks[0] = 0.
+    noise = lfilter([1.], [1., -decay], shocks, axis=0)
+    tangent = interp_at(p, s, np.clip(arcs+3., 0., s[-1]))-interp_at(p, s, np.clip(arcs-3., 0., s[-1]))
+    tangent /= np.maximum(np.linalg.norm(tangent, axis=1, keepdims=True), 1e-9)
+    return noise-(noise*tangent).sum(-1, keepdims=True)*tangent, sigma
+
+
+def make_sample(fiber: TracedFiber, t: float, reverse: bool, cfg: SampleConfig, rng: np.random.Generator):
+    """One tracer decision on a simulated trace of this fiber, built exactly like inference.
+
+    The trace started ``trace_prefix_length`` back at an annotated seed and followed
+    GT with smooth lateral error (``trace_noise``), so the head is offset from GT.
+    Crop heading, history and seed reference come from that observed path through
+    the tracer's own functions. A path shorter than 12 voxels still holds the seed's
+    CT heading; it and the seed tangent are resolved once CT is readable
+    (``resolve_trace_seed``). Labels are the GT continuation from the offset head.
+    """
+    from .heading import linear12_heading, trace_heading
+    from .trace import trace_history
+    p, s = traversal_curve(fiber, reverse)
+    count = int(trace_prefix_length(t, cfg, rng)//cfg.history_step)
+    arcs = t-np.arange(count, -1, -1)*cfg.history_step
+    noise, sigma = trace_noise(arcs, p, s, cfg, rng)
+    path = interp_at(p, s, arcs)+noise
+    pos = path[-1]
+    # Only the CT seed axis's sign comes from the direction of travel.
+    seed_direction = tangent_at(p, s, arcs[0])
+    heading = trace_heading(path, 0, seed_direction)
+    frame = frame_from_heading(heading)  # provisional basis; CT resolves crop roll before sampling
+    hist, hmask = trace_history(list(path), cfg.n_history)
+    item = dict(_generated_original_history=True, _seed_original_certified=True,
+                observed_path=path, seed_pos=path[0].copy(), seed_tangent=seed_direction,
+                seed_age=float(arclength(path)[-1]), seed_valid=True, seed_heading_family=fiber.tag,
+                trace_noise_sigma=sigma, trace_prefix_length=float(arcs[-1]-arcs[0]),
+                pos=pos, frame=frame, hist_local=(hist-pos) @ frame, hmask=hmask.astype(np.float32),
+                **continuation_targets(fiber, t, reverse, pos, frame, cfg))
+    if linear12_heading(path, 0) is None:
+        item['_pending_seed_heading'] = (fiber, t, reverse, cfg)
+    return item
+
+
+def resolve_trace_seed(item, vol):
+    """Give a simulated trace the tracer's CT seed heading before its image is built.
+
+    Sets the seed tangent. A path still holding the seed heading (< 12 voxels) also
+    takes it as crop heading: local geometry is re-expressed and labels recomputed.
+    Unusable CT (where the tracer would skip this seed) keeps the travel direction.
+    Synthetic sources mark themselves with ``seed_heading_family`` the same way.
+    """
+    family = item.pop('seed_heading_family', None)
+    pending = item.pop('_pending_seed_heading', None)
+    if family is None:
+        return item
+    from .heading import SeedHeadingError, oriented_seed_heading, reframe_item
+    try:
+        heading = oriented_seed_heading(vol, item['seed_pos'], family, item['seed_tangent'])
+    except SeedHeadingError:
+        item['seed_heading_fallback'] = True
+        return item
+    item['seed_tangent'] = heading
+    if pending is not None:
+        fiber, t, reverse, cfg = pending
+        frame = frame_from_heading(heading)
+        reframe_item(item, frame)
+        item.update(continuation_targets(fiber, t, reverse, item['pos'], frame, cfg,
+                                         offtrack=bool(item.get('offtrack', False))))
+    return item
+
+
+def drift_sample(fiber: TracedFiber, t: float, reverse: bool, cfg: SampleConfig, rng: np.random.Generator):
+    """GT state with a drifted head and ramped history; only for frozen recovery fixtures.
+
+    Training never uses it: ``make_sample`` simulates the tracer instead.
+    """
+    p, s = traversal_curve(fiber, reverse)
     L = s[-1]
     g = interp_at(p, s, np.array([t]))[0]
     tau = tangent_at(p, s, t)
     # lateral offset perpendicular to tau
     fr = frame_from_heading(tau)
-    lat = rng.normal(size=2) * _mix(rng, cfg.lateral_sigmas, cfg.lateral_probs) if perturb else np.zeros(2)
-    if light_perturbation is not None:
-        if perturb:
-            raise ValueError('Light perturbation requires the legacy perturbations to be disabled')
-        max_offset, max_angle = light_perturbation
-        if t < cfg.history_step:
-            max_offset = max_angle = 0.  # A seed-only state has no committed tip to move.
-        azimuth = rng.uniform(0, 2*np.pi)
-        lat = max_offset*np.sqrt(rng.random())*np.array([np.cos(azimuth), np.sin(azimuth)])
+    lat = rng.normal(size=2) * _mix(rng, cfg.lateral_sigmas, cfg.lateral_probs)
     delta = fr[:, 0] * lat[0] + fr[:, 1] * lat[1]
     pos = g + delta
-    ang = math.radians(_mix(rng, cfg.angle_sigmas_deg, cfg.angle_probs)) * rng.normal() if perturb else 0.
-    axis_ang = rng.uniform(0, 2 * np.pi) if perturb else 0.
-    if light_perturbation is not None:
-        ang = math.radians(rng.uniform(-max_angle, max_angle))
-        axis_ang = rng.uniform(0, 2*np.pi)
+    ang = math.radians(_mix(rng, cfg.angle_sigmas_deg, cfg.angle_probs)) * rng.normal()
+    axis_ang = rng.uniform(0, 2 * np.pi)
     ax = math.cos(axis_ang) * fr[:, 0] + math.sin(axis_ang) * fr[:, 1]
     heading = normalize(math.cos(ang) * tau + math.sin(ang) * ax)
     frame = frame_from_heading(heading)  # provisional basis; CT resolves crop roll before sampling
@@ -278,13 +374,13 @@ def make_sample(fiber: TracedFiber, t: float, reverse: bool, cfg: SampleConfig, 
     count = cfg.n_history
     if cfg.full_observed_history:
         available = max(1, int(t/cfg.history_step))
-        count = max(count, int(rng.integers(1, available+1)) if perturb else available)
+        count = max(count, int(rng.integers(1, available+1)))
     k = np.arange(1, count + 1) * cfg.history_step
     th = t - k
     hmask = (th >= 0).astype(np.float32)
-    if perturb and rng.random() < cfg.no_history_prob:
+    if rng.random() < cfg.no_history_prob:
         hmask[:] = 0
-    elif perturb:
+    else:
         # Balance very short and intermediate startup histories. With this
         # option off, retain the existing sampler's random draws exactly.
         if cfg.short_history_prob > 0 and rng.random() < cfg.short_history_prob:
@@ -295,9 +391,8 @@ def make_sample(fiber: TracedFiber, t: float, reverse: bool, cfg: SampleConfig, 
             hmask[int(rng.integers(0, cfg.n_history)):] = 0
     hist = interp_at(p, s, np.clip(th, 0, L))
     ramp = np.clip(1.0 - k / (cfg.n_history * cfg.history_step), 0, 1)[:, None]
-    if perturb:
-        hist = hist + ramp * delta[None] + rng.normal(size=hist.shape) * cfg.history_jitter
-    if perturb and cfg.history_wobble > 0:
+    hist = hist + ramp * delta[None] + rng.normal(size=hist.shape) * cfg.history_jitter
+    if cfg.history_wobble > 0:
         # slow lateral wander of our own past path, zero at the current point
         amp = rng.uniform(0, cfg.history_wobble, size=2)
         lam = rng.uniform(15.0, 45.0, size=2)
@@ -307,20 +402,13 @@ def make_sample(fiber: TracedFiber, t: float, reverse: bool, cfg: SampleConfig, 
 
     # A smooth displacement accumulates near the present; old observations
     # remain aligned. Include the endpoint displacement in the current point.
-    span = rng.uniform(16., 64.) if perturb else 16.
+    span = rng.uniform(16., 64.)
     ramp = np.clip(1-k/span, 0, 1)
     ramp = ramp*ramp*(3-2*ramp)
-    displacement = rng.normal(size=2)*cfg.history_drift if perturb else np.zeros(2)
+    displacement = rng.normal(size=2)*cfg.history_drift
     drift = fr[:,:2] @ displacement
     hist += ramp[:,None]*drift
     pos += drift
-    if light_perturbation is not None:
-        # Move only the recent tip smoothly. Preserve the earliest observation
-        # (the seed), including on startup prefixes shorter than 32 voxels.
-        valid = np.flatnonzero(hmask)
-        span = min(32., float(k[valid[-1]])) if len(valid) else 0.
-        ramp = np.clip(1-k/max(span, 1e-9), 0, 1)
-        hist += (ramp*ramp*(3-2*ramp))[:,None]*delta
     observed = np.concatenate((hist[hmask > 0][::-1], pos[None]))
     seed = observed_seed(pos, frame, (hist-pos) @ frame, hmask)
     return dict(_generated_original_history=True, _seed_original_certified=True,
@@ -429,8 +517,8 @@ class FollowDataset(torch.utils.data.IterableDataset):
                  window=256., pool_size=12, window_samples=192, replay_index=None, refresh_chunks=8,
                  batch_builder=None, additional_crops=(), fresh_fraction=.7, clean_fraction=None,
                  correct_replay_only=False, replay_continuation_fraction=None,
-                 gt_perturb_probability=0., gt_perturb_max_offset=.5, gt_perturb_max_angle_deg=2.,
-                 prefer_real_wrong_turns=False, prefer_replay_for_light_gt=False):
+                 gt_perturb_probability=0., prefer_real_wrong_turns=False, prefer_replay_for_light_gt=False,
+                 length_power=1.):
         if not np.isfinite(fresh_fraction) or not 0 <= fresh_fraction <= 1:
             raise ValueError('Fresh fraction must be finite and in [0, 1]')
         self.fresh_fraction = float(fresh_fraction)
@@ -445,15 +533,14 @@ class FollowDataset(torch.utils.data.IterableDataset):
                 raise ValueError('Replay continuation fraction must be finite and in [0, 1]')
             if correct_replay_only:
                 raise ValueError('Choose correct-only replay or a continuation/failure mix')
+        # Share of reserved GT slots offered to live continuation / correct replay
+        # (prefer_replay_for_light_gt). Every GT fallback is the same simulated trace.
         if not np.isfinite(gt_perturb_probability) or not 0 <= gt_perturb_probability <= 1:
             raise ValueError('GT perturb probability must be finite and in [0, 1]')
-        if any(not np.isfinite(v) or v < 0 for v in (gt_perturb_max_offset, gt_perturb_max_angle_deg)):
-            raise ValueError('GT perturb limits must be finite and nonnegative')
         if gt_perturb_probability and clean_fraction is None:
-            raise ValueError('Light GT perturbation requires a reserved GT fraction')
+            raise ValueError('Light GT slots require a reserved GT fraction')
         self.replay_continuation_fraction = replay_continuation_fraction
         self.gt_perturb_probability = gt_perturb_probability
-        self.gt_perturbation = (gt_perturb_max_offset, gt_perturb_max_angle_deg)
         self.fibers, self.vol_spec, self.cfg, self.exclude = fibers, vol_spec, cfg, exclude_band
         self.chunk, self.seed, self.cache_bytes = chunk, seed, cache_bytes
         self.window, self.pool_size, self.window_samples = window, pool_size, window_samples
@@ -469,6 +556,12 @@ class FollowDataset(torch.utils.data.IterableDataset):
                    else np.array([f.length for f in fibers]))
         if not len(lengths):
             raise ValueError('No training fibers')
+        if not np.isfinite(length_power) or length_power < 0:
+            raise ValueError('Fiber length power must be finite and nonnegative')
+        # Power 1 draws uniformly over annotated arclength; larger powers favor long fibers.
+        lengths = np.asarray(lengths, dtype=np.float64)
+        if length_power != 1:
+            lengths = lengths**length_power
         self.weights = lengths / lengths.sum()
 
     def _validate(self,caches):
@@ -845,15 +938,12 @@ class FollowDataset(torch.utils.data.IterableDataset):
                             t = f.length-original_t if rev else original_t
                     else:
                         fi, t, rev = location['fiber'], location['t'], location['reverse']
-                    sample_options = {'perturb': False} if requests is not None else {}
                     gt_perturbed = bool(requests is not None and self.gt_perturb_probability
                                         and rng.random() < self.gt_perturb_probability)
                     if gt_perturbed and self.prefer_replay_for_light_gt:
                         item = self.correct_continuation_item(rng)
                     if item is None:
-                        if gt_perturbed:
-                            sample_options['light_perturbation'] = self.gt_perturbation
-                        item = make_sample(self.fibers[fi], t, rev, cfg, rng, **sample_options)
+                        item = make_sample(self.fibers[fi], t, rev, cfg, rng)
                         item['gt_perturbed'] = gt_perturbed
                         item['gt_unperturbed'] = requests is not None and not gt_perturbed
                         item['source'], item['source_step'], item['stratum'] = 0, -1, -1

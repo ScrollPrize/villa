@@ -162,8 +162,8 @@ def _interval_training_lines(row):
                          f" | reached depths: {m.get('live_depth_counts', {})}"
                          f" | mean travel {m.get('live_travelled_sum', 0)/live:.1f} voxels")
     if any(m.get(k, 0) for k in ('gt_unperturbed_fraction', 'gt_perturbed_fraction', 'replay_correct_continuation_fraction')):
-        lines.append(f"  data detail (% of all): clean GT {m['gt_unperturbed_fraction']:.1%}"
-                     f" / light GT {m['gt_perturbed_fraction']:.1%}"
+        lines.append(f"  data detail (% of all): simulated GT traces {m['gt_unperturbed_fraction']:.1%}"
+                     f" / live-slot GT fallback {m['gt_perturbed_fraction']:.1%}"
                      f" / correct continuation replay {m['replay_correct_continuation_fraction']:.1%}")
         if m.get('light_gt_replay_fraction', 0):
             lines[-1] += f" (light-GT replacement {m['light_gt_replay_fraction']:.1%})"

@@ -46,10 +46,13 @@ class DirectConfig:
     stem_blocks: int = 2
     history_encoder: str = 'fine'
     history_path_tokens: bool = False
+    path_geometry_tokens: bool = False
 
     def __post_init__(self):
         if type(self.history_path_tokens) is not bool or (self.history_path_tokens and self.history_encoder != 'fine'):
             raise ValueError('Path tokens require the fine history encoder')
+        if type(self.path_geometry_tokens) is not bool or (self.path_geometry_tokens and not self.history_path_tokens):
+            raise ValueError('Path geometry tokens require explicit history path tokens')
         if any(type(value) is not int or value < 1 for value in
                (self.encoder_ffn, self.decoder_ffn)):
             raise ValueError('Feed-forward widths must be positive integers')
@@ -108,6 +111,8 @@ class DirectConfig:
             architecture = TOKEN_ARCHITECTURE
         else:
             architecture = PATCH_ARCHITECTURE if self.encoder == 'patch4' else ARCHITECTURE
+        if self.path_geometry_tokens:
+            return architecture.replace('_v15', '_v17')
         if self.history_path_tokens:
             return architecture.replace('_v15', '_v16')
         return architecture.replace('_v15', '_v14') if self.history_encoder == 'legacy' else architecture
@@ -468,6 +473,9 @@ class DirectFollower(nn.Module):
             self.refinement_stage = nn.Embedding(cfg.recurrent_refinement_steps, cfg.hidden)
             nn.init.zeros_(self.refinement_stage.weight)
         self.output_plane_features = None if cfg.token_only else OutputPlaneFeatures(cfg)
+        if cfg.path_geometry_tokens:
+            from .path_geometry import PathGeometryTokens
+            self.path_geometry = PathGeometryTokens(cfg)
 
     def references(self, x, hist, hmask):
         cfg = self.cfg
@@ -495,6 +503,13 @@ class DirectFollower(nn.Module):
         ref_tokens = self.reference_token(torch.cat((local,metadata),-1))
         memory = torch.cat((image_tokens,ref_tokens.to(image_tokens.dtype)),1)
         padding = torch.cat((torch.zeros(image_tokens.shape[:2],device=hist.device,dtype=torch.bool),~mask),1)
+        if cfg.path_geometry_tokens:
+            # Older observed path in this frame, unmasked by crop support. Shared by
+            # generator and scorer through the same memory and padding.
+            valid = x['path_geometry_valid'].bool()
+            geometry = self.path_geometry(x['path_geometry'], valid)
+            memory = torch.cat((memory,geometry.to(memory.dtype)),1)
+            padding = torch.cat((padding,~valid),1)
         ctx = dict(fine=dense,deep=deep,memory=memory,padding=padding,reference_mask=mask)
         if cfg.recurrent_refinement_steps:
             ctx.update(fine_fp32=sampling_dense, deep_fp32=sampling_dense if cfg.token_only else deep.float())

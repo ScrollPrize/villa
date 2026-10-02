@@ -30,9 +30,11 @@ def fork_checkpoint(source, name, transform, *, allowed_changes, migration_key, 
     parser = build_parser()
     missing_defaults = {'remote_prefetch_connections','remote_prefetch_queue_size','remote_prefetch_timeout',
                          'remote_prefetch_lookahead','stem_channels','stem_blocks','history_encoder',
-                         'history_path_tokens','pair_rank_weight','live_continuation_stratified'}-options.keys()
+                         'history_path_tokens','path_geometry_tokens','pair_rank_weight',
+                         'live_continuation_stratified'}-options.keys()
+    model_options = ('history_encoder', 'history_path_tokens', 'path_geometry_tokens')
     for key in sorted(missing_defaults):
-        options.setdefault(key, getattr(checkpoint_config(migrated), key) if key in ('history_encoder', 'history_path_tokens')
+        options.setdefault(key, getattr(checkpoint_config(migrated), key) if key in model_options
                            else parser.get_default(key))
     if options['reset_optimizer']:
         raise ValueError('Refusing a continuation that would reset optimizer state')

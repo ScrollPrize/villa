@@ -115,6 +115,8 @@ def training_inputs(x, hist, hmask, size):
                     seed_tangent=hist.new_zeros(b, 3), seed_age=hist.new_zeros(b))
     names = ('fine', 'seed', 'seed_mask', 'seed_tangent', 'seed_age',
              'history_tokens', 'history_padding')
+    # Optional observed-path geometry exists only for models that consume it.
+    names += tuple(name for name in ('path_geometry', 'path_geometry_valid') if name in x)
     image = {name: fixed_rows(x[name] if name in x else defaults[name], size) for name in names}
     return image, fixed_rows(hist, size), fixed_rows(hmask, size)
 
@@ -191,6 +193,7 @@ def initialize_training_optimizer(model, ema, args, resume=None):
 
 ARCHITECTURES = (ARCHITECTURE, PATCH_ARCHITECTURE, TOKEN_ARCHITECTURE, STEM_ARCHITECTURE)
 ARCHITECTURES += tuple(name.replace('_v15', '_v16') for name in ARCHITECTURES)
+ARCHITECTURES += tuple(name.replace('_v15', '_v17') for name in ARCHITECTURES if '_v15' in name)
 ARCHITECTURES += tuple(name.replace('_v15', '_v14') for name in ARCHITECTURES)
 HISTORY_GRAD_CLIP = 5.
 REST_GRAD_CLIP = 100.
@@ -239,6 +242,13 @@ def resolve_history_path_tokens(requested, checkpoint=None):
     saved = checkpoint_config(checkpoint).history_path_tokens if checkpoint else False
     if checkpoint and requested is not None and requested != saved:
         raise ValueError('History path tokens must match checkpoint; use memory_resume to migrate')
+    return saved if requested is None else requested
+
+
+def resolve_path_geometry_tokens(requested, checkpoint=None):
+    saved = checkpoint_config(checkpoint).path_geometry_tokens if checkpoint else False
+    if checkpoint and requested is not None and requested != saved:
+        raise ValueError('Path geometry tokens must match checkpoint; use geometry_resume to migrate')
     return saved if requested is None else requested
 
 
@@ -628,6 +638,8 @@ def build_parser():
                     help='Historical slabs: fine (default, 2x17x17 tokens) or legacy (2x9x9); inferred on resume')
     ap.add_argument('--history-path-tokens', action=argparse.BooleanOptionalAction, default=None,
                     help='Add observed-path neighborhood tokens to historical slabs; inferred on resume')
+    ap.add_argument('--path-geometry-tokens', action=argparse.BooleanOptionalAction, default=None,
+                    help='Give decoder and scorer the observed path beyond the crop (needs path tokens); inferred on resume')
     ap.add_argument('--token-only', action=argparse.BooleanOptionalAction, default=None,
                     help='Use only patch4 tokens throughout; no reconstructed fine features or output planes')
     ap.add_argument('--direction-inputs', action=argparse.BooleanOptionalAction, default=True,
@@ -646,9 +658,10 @@ def build_parser():
     ap.add_argument('--memory-switch-tail', type=float, nargs=2, default=(16.,96.), metavar=('MIN', 'MAX'),
                     help='Neighbor tail length of memory-switch sequences in trace voxels')
     ap.add_argument('--activation-checkpointing', action=argparse.BooleanOptionalAction, default=False)
-    ap.add_argument('--no-history-prob', type=float, default=.15, help='Fresh-state probability of absent observed history')
-    ap.add_argument('--short-history-prob', type=float, default=.4,
-                    help='Given history is present, probability of a balanced 1-8/9-32 point startup history')
+    ap.add_argument('--no-history-prob', type=float, default=.05,
+                    help="Simulated-trace share of seed-only decisions (a trace's first call)")
+    ap.add_argument('--short-history-prob', type=float, default=.1,
+                    help='Otherwise, share of balanced 1-8/9-32 voxel trace starts; the rest begin anywhere earlier')
     ap.add_argument('--decision-fraction', type=float, default=.3,
                     help='Matched-pair weight before normalizing hard sources into the non-clean budget')
     ap.add_argument('--decision-choice-fraction', type=float, default=.75,
@@ -659,13 +672,9 @@ def build_parser():
     ap.add_argument('--fresh-fraction', type=float, default=.7,
                     help='Fresh-versus-replay weight for hard-source allocation; clean GT share is --clean-fraction')
     ap.add_argument('--clean-fraction', type=float, default=.8,
-                    help='Reserved GT share; clean unless --gt-perturb-probability is nonzero')
+                    help='Reserved GT share; each is a simulated trace with tracing error, built like inference')
     ap.add_argument('--gt-perturb-probability', type=float, default=0.,
-                    help='Fraction of reserved GT examples receiving bounded light perturbations')
-    ap.add_argument('--gt-perturb-max-offset', type=float, default=.5,
-                    help='Maximum light GT lateral offset in tracing voxels; seed and older history preserved')
-    ap.add_argument('--gt-perturb-max-angle-deg', type=float, default=2.,
-                    help='Maximum absolute light GT heading perturbation in degrees')
+                    help='Share of reserved GT slots offered to live continuation (with --prefer-replay-for-light-gt)')
     ap.add_argument('--live-continuation', action='store_true',
                     help='Replace correct replay slots with recent training predictions advanced by inference policy')
     ap.add_argument('--live-continuation-steps', type=int, nargs=2, default=(4, 8), metavar=('MIN', 'MAX'),
@@ -725,6 +734,8 @@ def build_parser():
     ap.add_argument('--recovery-length', type=float, default=32.)
     ap.add_argument('--dagger-every', type=int, default=1000)
     ap.add_argument('--dagger-seeds', type=int, default=64)
+    ap.add_argument('--afv-length-power', type=float, default=1.,
+                    help='AFV fiber draws (training and DAgger) proportional to length**p; 1 is uniform over arclength')
     ap.add_argument('--dagger-device')
     ap.add_argument('--dagger-trace-len', type=float, default=6000.)
     ap.add_argument('--dagger-after', type=float, default=96.,
@@ -800,6 +811,8 @@ def main(argv=None):
         raise ValueError('Invalid loss, learning rate, cache, or rollout settings')
     if args.val_z[0] >= args.val_z[1]:
         raise ValueError('Holdout interval must be increasing')
+    if not math.isfinite(args.afv_length_power) or args.afv_length_power < 0:
+        raise ValueError('AFV length power must be finite and nonnegative')
     if not all(0 <= p <= 1 for p in (args.no_history_prob, args.short_history_prob)):
         raise ValueError('History probabilities must be in [0, 1]')
     if torch.device(args.device).type == 'cuda' and not torch.cuda.is_available():
@@ -813,6 +826,7 @@ def main(argv=None):
                        token_only=resolve_token_only(args.token_only, resume),
                        history_encoder=resolve_history_encoder(args.history_encoder, resume),
                        history_path_tokens=resolve_history_path_tokens(args.history_path_tokens, resume),
+                       path_geometry_tokens=resolve_path_geometry_tokens(args.path_geometry_tokens, resume),
                        stem_channels=args.stem_channels, stem_blocks=args.stem_blocks,
                        direction_inputs=args.direction_inputs,input_mode=args.input_mode,channels=args.channels,hidden=args.hidden,layers=args.axial_layers,
                        encoder_ffn=args.encoder_ffn,
@@ -833,6 +847,7 @@ def main(argv=None):
     args.token_only = cfg.token_only
     args.history_encoder = cfg.history_encoder
     args.history_path_tokens = cfg.history_path_tokens
+    args.path_geometry_tokens = cfg.path_geometry_tokens
     if args.decision_fraction and args.batch % 2:
         raise ValueError('Matched decisions require an even batch')
     if not np.isfinite(args.candidate_weight) or args.candidate_weight <= 0:
@@ -932,14 +947,15 @@ def main(argv=None):
                    'decision_fraction','decision_choice_fraction','bank_following_probability','fresh_fraction','clean_fraction',
                    'correct_replay_only','memory_switch_probability','live_continuation','live_continuation_steps',
                    'pair_rank_weight','live_continuation_stratified',
-                   'gt_perturb_probability','gt_perturb_max_offset','gt_perturb_max_angle_deg',
+                   'gt_perturb_probability','no_history_prob','short_history_prob',
                    'replay_continuation_fraction','prefer_real_wrong_turns','prefer_replay_for_light_gt',
                    'bank_hard_fraction','replay_failure_fraction','bank_switch_tolerance','bank_own_tolerance',
-                   'n_commit','tolerance'}
+                   'n_commit','tolerance','afv_length_power'}
         for key,value in vars(args).items():
             recorded = resume['training_options'].get(key, {'input_mode': 'ct+presence', 'dataset_config': None,
                                                            'stem_channels': 0, 'stem_blocks': 2,
-                                                           'history_encoder': 'legacy', 'history_path_tokens': False}.get(key))
+                                                           'history_encoder': 'legacy', 'history_path_tokens': False,
+                                                           'path_geometry_tokens': False}.get(key))
             if key not in ignored and json.dumps(recorded,sort_keys=True) != json.dumps(value,sort_keys=True):
                 raise ValueError(f'Resume option differs: {key}')
         if resume['seed_manifest_sha256'] != manifest['sha256'] or resume['fiber_manifest'] != fiber_manifest(fibers):
@@ -998,8 +1014,7 @@ def main(argv=None):
         replay_index=str(collector.index), batch_builder=builder, additional_crops=(), fresh_fraction=args.fresh_fraction,
         clean_fraction=args.clean_fraction, correct_replay_only=args.correct_replay_only,
         replay_continuation_fraction=args.replay_continuation_fraction,
-        gt_perturb_probability=args.gt_perturb_probability, gt_perturb_max_offset=args.gt_perturb_max_offset,
-        gt_perturb_max_angle_deg=args.gt_perturb_max_angle_deg,
+        gt_perturb_probability=args.gt_perturb_probability,
         prefer_real_wrong_turns=args.prefer_real_wrong_turns,
         prefer_replay_for_light_gt=args.prefer_replay_for_light_gt)
     dataset_provenance = None
@@ -1023,9 +1038,11 @@ def main(argv=None):
                 initial=[c._dir for c in source_dataset.onpolicy],trace_len=args.dagger_trace_len,n_commit=args.n_commit,
                 collector_module='vesuvius.neural_tracing.fiber_follow.regression.collect',
                 extra_args=('--dataset-name',source['name'],'--after',args.dagger_after,
-                    '--bank-switch-tolerance',args.bank_switch_tolerance,'--bank-own-tolerance',args.bank_own_tolerance))))
+                    '--bank-switch-tolerance',args.bank_switch_tolerance,'--bank-own-tolerance',args.bank_own_tolerance,
+                    *(('--fiber-length-power',args.afv_length_power) if args.afv_length_power != 1 else ())))))
         collector = MultiSourceCollector(collectors)
-        progress('Dataset sampling: '+', '.join(f'{name}={weight:.1%}' for name,weight in zip(dataset.names,dataset.weights)))
+        progress('Dataset sampling: '+', '.join(f'{name}={weight:.1%}' for name,weight in zip(dataset.names,dataset.weights))
+                 +f'; AFV fiber draws proportional to length**{args.afv_length_power:g}')
     live_continuation = None
     if args.live_continuation:
         from .live_continuation import LiveContinuation, preserve_live_metadata
@@ -1070,12 +1087,11 @@ def main(argv=None):
                     trainable_parameters=sum(p.numel() for p in model.parameters() if p.requires_grad)))
     log.record(dict(step=done,event='identity_sampling',architecture=model.architecture,
         source_sampling=(dataset.datasets[0] if dataset_document else dataset).sampling_probabilities(),
-        clean_gt_geometry=('bounded light GT perturbations on the configured subset; complete history retained'
-                           if args.gt_perturb_probability else
-                           'unperturbed position, tangent and complete available GT history; photometric augmentation only'),
-        gt_perturbation=dict(probability=args.gt_perturb_probability, max_offset=args.gt_perturb_max_offset,
-                            max_angle_deg=args.gt_perturb_max_angle_deg,
-                            unperturbed_total_fraction=args.clean_fraction*(1-args.gt_perturb_probability)),
+        clean_gt_geometry=('simulated traces: annotated seed, smooth lateral tracing error (OU), tracer heading/history/'
+                           'CT seed heading; labels are the GT continuation from the offset head'),
+        simulated_traces=dict(trace_noise_sigma=sample.trace_noise_sigma, trace_noise_length=sample.trace_noise_length,
+                              seed_only=args.no_history_prob, short_start=args.short_history_prob),
+        live_gt_slots=dict(probability=args.gt_perturb_probability, replay=args.prefer_replay_for_light_gt),
         live_continuation=args.live_continuation, live_continuation_steps=args.live_continuation_steps,
         correct_replay_only=args.correct_replay_only,
         replay_continuation_fraction=args.replay_continuation_fraction,

@@ -60,7 +60,7 @@ def main():
                     fi = int(rng.choice(len(fibers), p=ds.weights))
                     f = fibers[fi]
                     t = float(rng.uniform(.2, .7)*f.length)
-                    item = make_sample(f, t, False, sample, rng, perturb=False)
+                    item = make_sample(f, t, False, sample, rng)
                     item.update(fiber_ref=(fi, t, False), gt_unperturbed=True,
                                 source=0, source_step=-1, stratum=-1)
                     item = ds.prepare(item, rng)

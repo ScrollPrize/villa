@@ -6,6 +6,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.data import label_state
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import (
     arclength, interp_at, frame_from_heading, normalize,
 )
+from vesuvius.neural_tracing.fiber_follow.shared.heading import trace_heading
 
 
 def validate_tail_range(lengths):
@@ -86,16 +87,18 @@ def wrong_continuation(bank, cfg, rng, *, tail_length_range=(4., 128.), prefer_l
     tail = interp_at(line,s,np.arange(finish,head+1e-9,.25))
     if not bank.clear_of_target(fi,np.concatenate((tail,pos[None]))).all():
         return None
-    heading = pos-interp_at(path,distance,np.array([distance[-1]-2]))[0]
-    if np.linalg.norm(heading) < 1e-6:
+    chord = pos-interp_at(path,distance,np.array([distance[-1]-2]))[0]
+    if np.linalg.norm(chord) < 1e-6:
         return None
-    frame = frame_from_heading(heading)
+    # The tracer's heading for this observed path (its trusted 12-voxel fit).
+    frame = frame_from_heading(trace_heading(path,0,chord))
     original_t = fiber.length-own_t[-1] if reverse else own_t[-1]
     item = label_state(fiber,pos,frame,history,mask,cfg,t=original_t,reverse=reverse,offtrack=True)
     item.update(fiber_ref=(fi,float(own_t[-1]),reverse),source=3,source_step=-1,stratum=4,
                 bank_transition_length=bridge_length,bank_tail_length=tail_length,
                 bank_prefix_end_t=float(own_t[0]), seed_pos=path[0].copy(),
-                seed_tangent=seed_tangent,seed_age=float(distance[-1]),seed_valid=True)
+                seed_tangent=seed_tangent,seed_age=float(distance[-1]),seed_valid=True,
+                seed_heading_family=fiber.tag)
     # Certification metadata only: never enters the model.
     item.update(_seed_original_certified=True, _constructed_path=path,
                 _constructed_arc=distance, _leave_arc=distance[len(prefix_t)],

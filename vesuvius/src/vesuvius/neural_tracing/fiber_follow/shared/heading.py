@@ -101,6 +101,16 @@ def ct_seed_heading(vol, pos_xyz, family):
     return sheet_heading(ct_normal(vol, pos_xyz), family)
 
 
+def oriented_seed_heading(vol, pos_xyz, family, direction):
+    """The tracer's seed heading: the CT sheet axis for the family, signed along ``direction``.
+
+    Only the sign comes from ``direction`` (annotation or a simulated trace's own
+    path); the axis itself is CT-only, exactly as in inference and collection.
+    """
+    axis = ct_seed_heading(vol, pos_xyz, family)
+    return -axis if np.dot(axis, direction) < 0 else axis
+
+
 def transverse_frame(tensor, heading, previous=None, *, fallback=None, diagnostics=None):
     """Estimate roll in the heading's plane; weak evidence uses a held frame.
 
@@ -191,6 +201,26 @@ def frame_prefetch_bounds(item, crop, input_scale):
         hi = np.ceil((block_start(item['pos'], item['frame'], crop)+crop.block_size)*input_scale).astype(np.int64)+2
         yield lo, hi-lo
         yield normal_context(item['pos'], input_scale)
+
+
+def heading_free_bounds(pos, crop, input_scale):
+    """Native CT block holding the crop for any heading and roll about ``pos``."""
+    lateral = (crop.width-1)*crop.spacing/2
+    reach = np.sqrt(2*lateral**2+(max(crop.behind, crop.depth-1-crop.behind)*crop.spacing)**2)+1.
+    center = np.asarray(pos, dtype=np.float64)[::-1]*input_scale
+    lo = np.floor(center-reach*input_scale).astype(np.int64)-1
+    hi = np.ceil(center+reach*input_scale).astype(np.int64)+2
+    return lo, hi-lo
+
+
+def trace_heading(path, start, held):
+    """Crop heading after a commit: the trusted 12-voxel fit, else the held heading.
+
+    Shared by tracing and every training sample source. At a trace start (or after
+    an untrusted boundary) the held heading is the previous one, i.e. the seed's.
+    """
+    tangent = linear12_heading(path, start)
+    return np.asarray(held, dtype=np.float64) if tangent is None else tangent
 
 
 def linear12_heading(path, start=0):

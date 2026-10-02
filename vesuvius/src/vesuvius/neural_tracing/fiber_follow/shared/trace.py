@@ -15,7 +15,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, crop_
 from vesuvius.neural_tracing.fiber_follow.shared.policy import DEFAULT_CONFIDENCE, DEFAULT_N_COMMIT, commit_prefix
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume
 from vesuvius.neural_tracing.fiber_follow.shared.reference import SEED_FIELDS, observed_path
-from vesuvius.neural_tracing.fiber_follow.shared.heading import linear12_heading, TRACE_HEADING_POLICY, FRAME_POLICY, ct_frame
+from vesuvius.neural_tracing.fiber_follow.shared.heading import trace_heading, TRACE_HEADING_POLICY, FRAME_POLICY, ct_frame
 
 if TYPE_CHECKING:
     from vesuvius.neural_tracing.fiber_follow.flow_matching.model import FollowNet
@@ -102,9 +102,7 @@ def advance_trace_path(path, frame, points, commit, heading_start, shape, params
     else:
         if heading_start >= old_size:
             heading_start = old_size+first_connection_count-1
-        tangent = linear12_heading(path, heading_start)
-        if tangent is not None:
-            heading = tangent
+        heading = trace_heading(path, heading_start, heading)
     return dict(path=path, last_segment=last_segment, travelled=travelled,
                 heading_start=heading_start, heading=heading), ''
 
@@ -125,6 +123,11 @@ class ModelTracer:
 
     def close(self):
         self.pool.shutdown(wait=True)
+
+    def map(self, fn, values):
+        """Per-trace CPU work in the tracer's pool; results keep input order."""
+        pool = getattr(self, "pool", None)  # tests may build tracers without a pool
+        return map(fn, values) if pool is None else pool.map(fn, values)
 
     def build_inputs(self, pos, frames, hist, hmask):
         """Read this model's observation; subclasses can supply other image scales."""
@@ -176,7 +179,8 @@ class ModelTracer:
         hist_start = [len(p)-1 for p in paths]
         frame_diagnostics = ([{} for _ in range(n)] if initial_states is None else
                              [dict(s.get('ct_frame_diagnostics', {})) for s in initial_states])
-        frames = ([ct_frame(self.vol, p, h, diagnostics=d) for p,h,d in zip(seeds_xyz, headings, frame_diagnostics)]
+        frames = (list(self.map(lambda a: ct_frame(self.vol, a[0], a[1], diagnostics=a[2]),
+                                zip(seeds_xyz, headings, frame_diagnostics)))
                   if initial_states is None else [np.asarray(s['frame']).copy() for s in initial_states])
         stochastic = (getattr(self.model.cfg, 'sampler_mode', 'zero') == 'gaussian'
                       or getattr(self.model.cfg, 'gaussian_candidates', 0) > 0)
@@ -240,6 +244,9 @@ class ModelTracer:
                                              self.model.cfg.max_recovery_distance)
             commits, allowed = [v.cpu().numpy() for v in (commits, allowed)]
             points, confidence = [out[k].float().cpu().numpy() for k in ('points', 'confidence')]
+            # Next-step CT frames, resolved together after this step's commits.
+            # Each depends only on its own trace, so the pool is a pure speedup.
+            reframe = {}
             for j, i in enumerate(idx):
                 conf = np.minimum.accumulate(confidence[j], axis=-1)
                 commit = int(commits[j])
@@ -286,10 +293,13 @@ class ModelTracer:
                 length[i] = advanced['travelled']
                 heading_start[i] = advanced['heading_start']
                 if not would_stop:
-                    frames[i] = ct_frame(self.vol, paths[i][-1], advanced['heading'], frames[i],
-                                         diagnostics=frame_diagnostics[i])
+                    reframe[i] = advanced['heading']
                 if abort is not None and abort(int(i), paths[i]):
                     active[i], reasons[i] = False, 'abort'
                 elif length[i] >= pp.max_len-1e-6:
                     active[i], reasons[i] = False, 'max_len'
+            update = lambda i: ct_frame(self.vol, paths[i][-1], reframe[i], frames[i],
+                                        diagnostics=frame_diagnostics[i])
+            for i, frame in zip(reframe, self.map(update, reframe)):
+                frames[i] = frame
         return [np.asarray(p[h:]) for p, h in zip(paths, hist_start)], reasons

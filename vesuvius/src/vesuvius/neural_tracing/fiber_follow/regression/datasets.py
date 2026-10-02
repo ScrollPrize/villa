@@ -340,10 +340,9 @@ def build_mixed_dataset(primary, document, cfg, sample, sampling, args, *, seed,
                 correct_replay_only=getattr(args, 'correct_replay_only', False),
                 replay_continuation_fraction=getattr(args, 'replay_continuation_fraction', None),
                 gt_perturb_probability=getattr(args, 'gt_perturb_probability', 0.),
-                gt_perturb_max_offset=getattr(args, 'gt_perturb_max_offset', .5),
-                gt_perturb_max_angle_deg=getattr(args, 'gt_perturb_max_angle_deg', 2.),
                 prefer_real_wrong_turns=getattr(args, 'prefer_real_wrong_turns', False),
                 prefer_replay_for_light_gt=getattr(args, 'prefer_replay_for_light_gt', False),
+                length_power=getattr(args, 'afv_length_power', 1.),
                 onpolicy=replay, replay_index=str(replay_index) if replay_index else None)
             dataset.validation_fibers = validation_fibers
             dataset.validation_manifest = validation_manifest(validation_fibers,spec,source['validation']['seed'])

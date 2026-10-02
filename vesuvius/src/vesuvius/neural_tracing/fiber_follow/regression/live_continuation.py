@@ -58,7 +58,7 @@ class LiveContinuationSource:
         fi = int(rng.choice(len(dataset.fibers), p=dataset.weights))
         fiber = dataset.fibers[fi]
         t, reverse = float(rng.uniform(0, fiber.length)), bool(rng.integers(2))
-        item = make_sample(fiber, t, reverse, dataset.cfg, rng, perturb=False)
+        item = make_sample(fiber, t, reverse, dataset.cfg, rng)
         item.update(fiber_ref=(fi, t, reverse), source=0, source_step=-1, stratum=-1,
                     gt_unperturbed=True, live_requested=True, live_light_slot=light,
                     live_fallback=True)
@@ -82,6 +82,7 @@ class LiveContinuationSource:
                     heading_start=int(item.get('heading_start', 0)),
                     loop_start=int(item.get('live_loop_start', len(path)-1)),
                     travelled=float(item.get('live_travelled', 0.)), depth=depth, limit=limit,
+                    bad_run=int(item.get('live_bad_run', 0)), bad_run_start=item.get('live_bad_run_start'),
                     **{key: item[key] for key in SEED_FIELDS})
 
     def publish(self, state):
@@ -137,6 +138,9 @@ class LiveContinuationSource:
         oracle = DecisionCollector(fiber, fi, t, -1 if reverse else 1, dataset.cfg,
                                    dataset.exclude, bank_detector=self.detector)
         oracle.last_travelled = state['travelled']
+        # Resume the departure run of earlier chain steps (an evaluation-style patience).
+        oracle.bad_run, oracle.bad_run_start = state.get('bad_run', 0), state.get('bad_run_start')
+        oracle.started = state['depth'] > 0
         current = dict(pos=path[-1], frame=frame, hist=hist, hmask=mask,
             observed_path=path, last_segment=advanced['last_segment'],
             travelled=advanced['travelled'], heading_start=advanced['heading_start'],
@@ -156,7 +160,8 @@ class LiveContinuationSource:
             live_continuation=True, live_correct_continuation=not row['offtrack'],
             live_failure=bool(row['offtrack']), live_depth=state['depth']+1,
             live_limit=(self.draw_limit(rng) if state['depth'] == 0 else state['limit']),
-            live_travelled=advanced['travelled'], live_loop_start=state['loop_start'])
+            live_travelled=advanced['travelled'], live_loop_start=state['loop_start'],
+            live_bad_run=oracle.bad_run, live_bad_run_start=oracle.bad_run_start)
         item = dataset.prepare(item, rng)
         if not dataset.state_allowed(item):
             return None

@@ -3,7 +3,7 @@ import numpy as np
 import torch
 
 from vesuvius.neural_tracing.fiber_follow.shared.data import (
-    OnPolicyStates, fiber_manifest, make_sample, label_state, collate_with_volume,
+    OnPolicyStates, fiber_manifest, drift_sample, label_state, collate_with_volume,
 )
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import crop_local_grid
 from vesuvius.neural_tracing.fiber_follow.shared.labels import prefix_labels
@@ -25,7 +25,7 @@ def make_recovery_states(fibers, seeds, cfg, provenance, vol, seed=20260925,
         t = fiber.length-entry['t'] if reverse else entry['t']
         for lo, hi in drift_bands:
             for _ in range(1000):
-                item = make_sample(fiber, t, reverse, cfg, rng)
+                item = drift_sample(fiber, t, reverse, cfg, rng)
                 drift = float(np.linalg.norm(item['gt_history'][0]))
                 if lo <= drift < hi:
                     break

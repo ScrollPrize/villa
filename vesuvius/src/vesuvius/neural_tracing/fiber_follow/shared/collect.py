@@ -24,10 +24,17 @@ from vesuvius.neural_tracing.fiber_follow.shared.heading import SEED_HEADING_POL
 
 class DecisionCollector:
     """Original-fiber, progress-bounded labeler, including pre-failure windows."""
-    def __init__(self, fiber, fiber_idx, t0, sign, cfg, band=None, off_dist=3.5,
-                 before=48., after=24., stride=16., max_states=192, additional_crops=(), bank_detector=None):
+    def __init__(self, fiber, fiber_idx, t0, sign, cfg, band=None, off_dist=3.0,
+                 before=48., after=24., stride=16., max_states=192, additional_crops=(), bank_detector=None,
+                 *, off_patience=3):
+        # Departure is the evaluation's: off_patience consecutive committed points
+        # beyond off_dist (score_trace tolerance and patience), dated at the first.
+        if not np.isfinite(off_dist) or off_dist <= 0 or int(off_patience) != off_patience or off_patience < 1:
+            raise ValueError('Departure needs a positive distance and a positive integer patience')
         self.fiber, self.fi, self.t, self.sign = fiber, fiber_idx, t0, sign
-        self.cfg, self.band, self.off_dist = cfg, band, off_dist
+        self.cfg, self.band, self.off_dist, self.off_patience = cfg, band, off_dist, int(off_patience)
+        # Off-track run carried across commits; resumable for live chains.
+        self.bad_run, self.bad_run_start, self.started = 0, None, False
         self.before, self.after, self.stride, self.max_states = before, after, stride, max_states
         self.additional_crops = tuple(additional_crops)
         self.rows, self.distances = [], []
@@ -107,15 +114,29 @@ class DecisionCollector:
         if self.departed is None:
             bad = distances.min(-1) > self.off_dist
             crossing_idx = np.flatnonzero(crosses)
-            bad_idx = np.flatnonzero(bad)
-            crossing_first = len(crossing_idx) and (not len(bad_idx) or crossing_idx[0] <= bad_idx[0])
+            along = self.last_travelled+arclength(segment)
+            # Carry the off-track run across commits. The segment's first vertex is
+            # the previous head, already counted unless this is the first decision.
+            sustained, run_index = None, None
+            for k in range(1 if self.started else 0, len(segment)):
+                if not bad[k]:
+                    self.bad_run, self.bad_run_start = 0, None
+                    continue
+                if not self.bad_run:
+                    self.bad_run_start, run_index = float(along[k]), k
+                self.bad_run += 1
+                if self.bad_run >= self.off_patience:
+                    sustained = run_index if run_index is not None else -1  # -1: began in an earlier commit
+                    break
+            self.started = True
+            crossing_first = len(crossing_idx) and (sustained is None or
+                                                     (sustained >= 0 and crossing_idx[0] <= sustained))
             if crossing_first:
                 self.boundary_crossed = True
             if self.boundary_crossed and not f.endpoint_stop[0 if sign < 0 else 1]:
                 return False  # never call unannotated continuation a failure
-            if len(bad_idx) or self.boundary_crossed:
-                first = int(bad_idx[0]) if len(bad_idx) else int(crossing_idx[0])
-                self.departed = self.last_travelled+float(arclength(segment[:first+1])[-1])
+            if sustained is not None or self.boundary_crossed:
+                self.departed = self.bad_run_start if sustained is not None else float(along[int(crossing_idx[0])])
             else:
                 self.t = float(f.s[nearest[-1]])
         self.observe_bank_segment(segment, travelled)
@@ -191,6 +212,20 @@ def track_arrays(track):
     return {'track_pos': np.asarray(track, np.float64).reshape(-1, 3)}
 
 
+def fiber_visit_order(fibers, power, rng):
+    """Uniform permutation at power 1; otherwise weighted draws without replacement.
+
+    Gumbel top-k keys make each next fiber proportional to length**power among
+    those not yet visited.
+    """
+    if not np.isfinite(power) or power < 0:
+        raise ValueError('Fiber length power must be finite and nonnegative')
+    if power == 1:
+        return rng.permutation(len(fibers))
+    lengths = np.asarray(fibers.lengths if hasattr(fibers, 'lengths') else [f.length for f in fibers], dtype=np.float64)
+    return np.argsort(-(power*np.log(lengths)+rng.gumbel(size=len(lengths))), kind='stable')
+
+
 def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer, bank_loader=None, dataset_loader=None):
     ap = argparse.ArgumentParser()
     ap.add_argument('--checkpoint', required=True)
@@ -200,9 +235,12 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer, bank_loader=
     ap.add_argument('--val-z', type=float, nargs=2, default=(45000., 48500.))
     ap.add_argument('--seeds-per-fiber', type=int, default=2)
     ap.add_argument('--max-seeds', type=int, default=0, help='0 selects all eligible seeds')
+    ap.add_argument('--fiber-length-power', type=float, default=1.,
+                    help='1 visits fibers uniformly; p != 1 orders them by draws proportional to length**p')
     ap.add_argument('--batch', type=int, default=8)
     ap.add_argument('--trace-len', type=float, default=6000.)
-    ap.add_argument('--off-dist', type=float, default=3.5)
+    ap.add_argument('--off-dist', type=float, default=3.0, help='Departure distance from GT (evaluation tolerance)')
+    ap.add_argument('--off-patience', type=int, default=3, help='Consecutive committed points beyond --off-dist')
     ap.add_argument('--before', type=float, default=48.)
     ap.add_argument('--after', type=float, default=24.)
     ap.add_argument('--stride', type=float, default=16.)
@@ -238,7 +276,7 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer, bank_loader=
     # Limit volume reads as well as rollouts when collecting a bounded batch.
     rng = np.random.default_rng(args.seed)
     seeds = []
-    for fi in rng.permutation(len(train_f)):
+    for fi in fiber_visit_order(train_f, args.fiber_length_power, rng):
         seed_pool = make_seeds([train_f[fi]], vol, per_fiber=args.seeds_per_fiber,
                                 seed=int(rng.integers(2**31)))
         for seed in seed_pool:
@@ -259,7 +297,7 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer, bank_loader=
             collectors = [DecisionCollector(train_f[s['fiber']], s['fiber'], s['t'], s['sign'], cfg, band,
                                            args.off_dist, args.before, args.after, args.stride,
                                            additional_crops=getattr(tracer, 'additional_crops', ()),
-                                           bank_detector=bank_detector) for s in chunk]
+                                           bank_detector=bank_detector, off_patience=args.off_patience) for s in chunk]
             paths, reasons = tracer.trace(np.stack([s['pos'] for s in chunk]), np.stack([s['heading'] for s in chunk]),
                                           on_decision=lambda i, state: collectors[i](state))
             for collector, path, reason in zip(collectors, paths, reasons):

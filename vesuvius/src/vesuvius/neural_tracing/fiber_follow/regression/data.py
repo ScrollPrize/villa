@@ -8,13 +8,15 @@ import torch
 from scipy.ndimage import gaussian_filter
 
 from vesuvius.neural_tracing.fiber_follow.shared.components import ComponentRule
-from vesuvius.neural_tracing.fiber_follow.shared.data import collate_targets
+from vesuvius.neural_tracing.fiber_follow.shared.data import collate_targets, resolve_trace_seed
 from vesuvius.neural_tracing.fiber_follow.shared.crop_sampling import scalar_crops, empty_image_batch
 from vesuvius.neural_tracing.fiber_follow.shared.ct_normalization import BACKGROUND, LIMIT
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import interp_at
 from vesuvius.neural_tracing.fiber_follow.shared.trace import ModelTracer
 from vesuvius.neural_tracing.fiber_follow.shared.reference import SEED_FIELDS, observed_seed
-from vesuvius.neural_tracing.fiber_follow.shared.heading import orient_item, frame_prefetch_bounds, FRAME_POLICY
+from vesuvius.neural_tracing.fiber_follow.shared.heading import (
+    orient_item, frame_prefetch_bounds, heading_free_bounds, reframe_item, FRAME_POLICY,
+)
 from vesuvius.neural_tracing.fiber_follow.regression.model import DirectConfig
 
 
@@ -52,12 +54,16 @@ class ObservationBuilder:
     def prefetch_bounds(self,item,vol):
         """CT footprints covering unresolved roll and normal-estimation context."""
         from .history_slabs import slab_layout, SLAB
+        if '_pending_seed_heading' in item:
+            # A trace start takes its CT seed heading only once the image is built.
+            yield heading_free_bounds(item['pos'],self.cfg.fine,vol.input_scale)
         yield from frame_prefetch_bounds(item,self.cfg.fine,vol.input_scale)
         for slab in slab_layout(item):
             yield from frame_prefetch_bounds(slab,SLAB,vol.input_scale)
 
     def finalize_frames(self,items,vol):
         for item in items:
+            resolve_trace_seed(item,vol)
             orient_item(item,vol)
 
     def images(self,items,vol,pool=None):
@@ -71,6 +77,10 @@ class ObservationBuilder:
                  seed_tangent=stack('visible_seed_tangent'))
         from .history_slabs import load_slabs
         x.update(load_slabs(items, vol, self.cfg, pool))
+        if self.cfg.path_geometry_tokens:
+            # Final frames are resolved above; samples use the same observed path as slabs.
+            from .path_geometry import path_geometry_inputs
+            x.update(path_geometry_inputs(items))
         # Recorded replay frames have unknown quality unless it was supplied;
         # do not count them as newly successful CT estimates.
         quality = [item.get('ct_frame_diagnostics', {}) for item in items]
@@ -132,6 +142,11 @@ class IdentitySampling:
     # Fresh draws replaced by long original-then-neighbor observed paths.
     memory_switch_probability: float = 0.
     memory_switch_tail: tuple = (16., 96.)
+    # Crop roll about the heading: exact 180-degree flips make the tracer's roll-sign
+    # convention irrelevant; jitter covers CT roll-estimate noise (p99 ~5 degrees).
+    roll_flip_probability: float = .5
+    roll_jitter_deg: float = 5.
+    roll_jitter_max_deg: float = 15.
 
     def __post_init__(self):
         if isinstance(self.rule, dict):
@@ -144,6 +159,9 @@ class IdentitySampling:
             raise ValueError('Invalid identity sample counts or augmentation')
         if not np.isfinite(self.blur_probability) or not 0 <= self.blur_probability <= 1:
             raise ValueError('Blur probability must be in [0, 1]')
+        if (not 0 <= self.roll_flip_probability <= 1 or not np.isfinite(self.roll_jitter_deg) or self.roll_jitter_deg < 0
+                or not np.isfinite(self.roll_jitter_max_deg) or self.roll_jitter_max_deg < 0):
+            raise ValueError('Roll augmentation needs a flip probability in [0, 1] and finite nonnegative jitter')
         if (len(self.blur_sigma) != 2 or not all(np.isfinite(v) for v in self.blur_sigma)
                 or not 0 <= self.blur_sigma[0] <= self.blur_sigma[1]):
             raise ValueError('Blur sigma must be a finite, nonnegative MIN MAX range')
@@ -268,6 +286,13 @@ class IdentityObservationBuilder(ObservationBuilder):
         super().finalize_frames(items,vol)
         from scipy.spatial import cKDTree
         for item in items:
+            # Observation-only roll after CT roll resolution: every local label and
+            # input follows the rotated frame; world geometry is unchanged.
+            angle = item.pop('roll_augmentation', 0.) if self.augment else 0.
+            if angle:
+                c, s = np.cos(angle), np.sin(angle)
+                reframe_item(item, np.asarray(item['frame']) @ np.array([[c, -s, 0.], [s, c, 0.], [0., 0., 1.]]))
+                item['roll_augmented'] = angle
             reference_layout(item,self.cfg)
             if 'identity_curve' in item:
                 curve = item['identity_curve']
@@ -422,6 +447,8 @@ class IdentityObservationBuilder(ObservationBuilder):
             item.update(photometric=draw,drop_presence=bool(rng.random() < s.presence_dropout))
             item['blur_sigma'] = (float(rng.uniform(*s.blur_sigma))
                                   if s.blur_probability and rng.random() < s.blur_probability else 0.)
+            jitter = float(np.clip(rng.normal(0., s.roll_jitter_deg), -s.roll_jitter_max_deg, s.roll_jitter_max_deg))
+            item['roll_augmentation'] = float(np.deg2rad(jitter)+(np.pi if rng.random() < s.roll_flip_probability else 0.))
         item['identity_seed'] = int(rng.integers(2**63))
         item.setdefault('location_source',0)
         return item

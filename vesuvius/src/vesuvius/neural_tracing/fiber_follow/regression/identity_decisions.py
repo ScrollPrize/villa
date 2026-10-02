@@ -9,6 +9,8 @@ from vesuvius.neural_tracing.fiber_follow.shared.geometry import (
 )
 from vesuvius.neural_tracing.fiber_follow.regression.neighbor_following import bank_fiber
 from vesuvius.neural_tracing.fiber_follow.regression.neighbor_mining import exact_nearest
+from vesuvius.neural_tracing.fiber_follow.shared.heading import trace_heading
+from vesuvius.neural_tracing.fiber_follow.shared.trace import trace_history
 
 
 CANDIDATE_COUNT = 4
@@ -51,9 +53,9 @@ def decision_pair(bank, sample, model, rng, *, attempts=32, choice=None, hard_fr
     recent observations. Only certified bank relationships are used.
     """
     choice = bool(rng.integers(2)) if choice is None else choice
-    tails = [v for v in (4.,8.,12.) if v+8 < model.fine.behind*model.fine.spacing]
-    if not tails:
-        return None
+    # The shared tail covers the crop-visible history, so both rows keep identical
+    # local inputs while each carries its full traced history, as in tracing.
+    tails = [model.fine.behind*model.fine.spacing+v for v in (4., 16., 28.)]
     tail = float(rng.choice(tails))
     reference_gap = (max(8.,model.fine.behind*model.fine.spacing+
                          17*model.fine.spacing/2+2.))
@@ -88,10 +90,6 @@ def decision_pair(bank, sample, model, rng, *, attempts=32, choice=None, hard_fr
         neighbor = bank_fiber(parent, line)
         bpos = interp_at(line, s, np.array([head]))[0]
         apos = interp_at(parent.points, parent.s, np.array([own_t]))[0]
-        heading = tangent_at(line, s, head)
-        if choice:
-            heading = normalize(heading+tangent_at(parent.points, parent.s, own_t)*(-1 if reverse else 1))
-        frame = frame_from_heading(heading)
         pos = (apos+bpos)/2 if choice else bpos
         back = head-np.arange(1, sample.n_history+1)*sample.history_step
         mask = (np.arange(1, sample.n_history+1)*sample.history_step <= tail).astype(np.float32)
@@ -99,6 +97,9 @@ def decision_pair(bank, sample, model, rng, *, attempts=32, choice=None, hard_fr
         if choice:
             original = interp_at(parent.points, parent.s, np.interp(np.clip(back, 0, s[-1]), s, matched))
             history = (history+original)/2
+        # The tracer's heading: its 12-voxel fit over the shared tail (identical in both rows).
+        chord = tangent_at(line, s, head)
+        frame = frame_from_heading(trace_heading(np.concatenate((history[mask > 0][::-1], pos[None])), 0, chord))
         ta = parent.length-own_t if reverse else own_t
         targets = [continuation_targets(parent, ta, reverse, pos, frame, sample),
                    continuation_targets(neighbor, head, False, pos, frame, sample)]
@@ -132,20 +133,6 @@ def decision_pair(bank, sample, model, rng, *, attempts=32, choice=None, hard_fr
         for target in range(2):
             offtrack = not choice and target == 0
             fiber, t, rev = (parent, own_t, reverse) if target == 0 else (neighbor, head, False)
-            row = label_state(fiber, pos.copy(), frame.copy(), history.copy(), mask.copy(), sample,
-                              t=t, reverse=rev, offtrack=offtrack)
-            row['_seed_original_certified'] = True
-            row.update(fiber_ref=(fi, ta if target == 0 else head, rev), source=5, source_step=-1,
-                       stratum=4 if offtrack else -1, location_source=LOCATION_SOURCES.index('decision_pair'),
-                       seed_pos=refs[target], seed_tangent=tangents[target], seed_valid=True,
-                       seed_age=float(arclength(np.concatenate((refs[target][None], history[mask > 0][::-1], pos[None])))[-1]),
-                       candidate_points=curves.copy(), candidate_mask=supported.copy(),
-                       candidate_kind=candidate_kind.copy(),
-                       decision_kind=1 if choice else (2 if offtrack else 3),
-                       decision_tail=tail, bank_tail_length=tail if offtrack else 0.)
-            if target == 1:
-                row.update(supervision_fiber=neighbor, bank_parent_arc_range=arc_range)
-            row['pair_observation_seed'] = pair_observation_seed
             # Observed synthetic paths differ before the shared local tail.
             # Only the actual synthetic observed polyline enters slab inputs.
             prefix_s = np.arange(reference_b,head-tail,.5)
@@ -157,6 +144,22 @@ def decision_pair(bank, sample, model, rng, *, attempts=32, choice=None, hard_fr
             blend = blend*blend*(3-2*blend)
             prefix = prefix*(1-blend[:,None])+common*blend[:,None]
             observed = np.concatenate((prefix,history[mask > 0][::-1],pos[None]))
+            row_history, row_mask = trace_history(list(observed), sample.n_history)
+            row = label_state(fiber, pos.copy(), frame.copy(), row_history, row_mask, sample,
+                              t=t, reverse=rev, offtrack=offtrack)
+            row['_seed_original_certified'] = True
+            row.update(fiber_ref=(fi, ta if target == 0 else head, rev), source=5, source_step=-1,
+                       stratum=4 if offtrack else -1, location_source=LOCATION_SOURCES.index('decision_pair'),
+                       seed_pos=refs[target], seed_tangent=tangents[target], seed_valid=True,
+                       seed_heading_family=fiber.tag,
+                       seed_age=float(arclength(np.concatenate((refs[target][None], history[mask > 0][::-1], pos[None])))[-1]),
+                       candidate_points=curves.copy(), candidate_mask=supported.copy(),
+                       candidate_kind=candidate_kind.copy(),
+                       decision_kind=1 if choice else (2 if offtrack else 3),
+                       decision_tail=tail, bank_tail_length=tail if offtrack else 0.)
+            if target == 1:
+                row.update(supervision_fiber=neighbor, bank_parent_arc_range=arc_range)
+            row['pair_observation_seed'] = pair_observation_seed
             observed_arc = arclength(observed)
             row['observed_path'] = observed
             row['seed_age'] = float(observed_arc[-1])

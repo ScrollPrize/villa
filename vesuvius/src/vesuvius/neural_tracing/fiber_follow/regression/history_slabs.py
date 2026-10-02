@@ -101,8 +101,9 @@ def load_slabs(items, vol, cfg, pool=None):
     from .data import visible_points
     from vesuvius.neural_tracing.fiber_follow.shared.crop_sampling import scalar_crops, empty_image_batch
     started = time.perf_counter()
-    layouts = [slab_layout(item) for item in items]
-    for item, layout in zip(items, layouts):
+    def orient(item):
+        # Frames chain within an item (sign continuity), never across items.
+        layout = slab_layout(item)
         previous = None
         for slab in layout:
             diagnostics = {}
@@ -114,6 +115,8 @@ def load_slabs(items, vol, cfg, pool=None):
             slab['ct_frame_diagnostics'] = diagnostics
             previous = frame
         item['_sampled_slabs'] = layout
+        return layout
+    layouts = list(map(orient, items) if pool is None else pool.map(orient, items))
     flat = [slab for layout in layouts for slab in layout]
     images = scalar_crops(flat, vol, SLAB, pool, presence=False)
     grid = torch.from_numpy(crop_local_grid(SLAB)).float()
@@ -129,27 +132,39 @@ def load_slabs(items, vol, cfg, pool=None):
                            history_path_valid=torch.zeros(len(items), SLOTS, PATH_SAMPLES, dtype=torch.bool))
     frame_source = torch.full((len(items), SLOTS), -1, dtype=torch.int64)
     frame_energy, frame_gap = torch.zeros(len(items), SLOTS), torch.zeros(len(items), SLOTS)
-    cursor = 0
-    for row, (item, layout) in enumerate(zip(items, layouts)):
-        for slot, slab in enumerate(layout):
-            if cfg.history_path_tokens:
-                for key, value in zip(path_inputs, slab_path_samples(item, slab)):
-                    path_inputs[key][row, slot] = torch.as_tensor(value)
-            heat = render_history(torch.as_tensor(slab['hist_local'])[None].float(),
-                                  torch.as_tensor(slab['hmask'])[None], grid, 1., 'segments')[0]
-            output[row, slot] = torch.cat((images[cursor], heat), 0)
-            valid[row, slot] = True
-            quality = slab['ct_frame_diagnostics']
-            frame_source[row, slot] = quality['source']
-            frame_energy[row, slot], frame_gap[row, slot] = quality['energy'], quality['gap']
-            relative = (slab['pos']-item['pos']) @ item['frame']
-            rotation = np.asarray(item['frame']).T @ slab['frame']
-            pose[row, slot] = torch.tensor(np.r_[relative/128., rotation.ravel(),
-                                                   np.log1p(slab['age'])/8., float(slab['seed'])])
-            ages[row, slot] = slab['age']
-            world = grid.numpy().reshape(-1, 3) @ slab['frame'].T+slab['pos']
-            overlap[row, slot] = float(visible_points((world-item['pos']) @ item['frame'], cfg.fine).mean())
-            cursor += 1
+    offsets = np.cumsum([0]+[len(layout) for layout in layouts])
+
+    inference = torch.is_inference_mode_enabled()
+
+    def fill(row):
+        # Writes only this row of each preallocated tensor. Pool threads do not inherit
+        # the caller's inference mode, which in-place writes to its tensors require.
+        with torch.inference_mode(inference):
+            item, layout = items[row], layouts[row]
+            for slot, slab in enumerate(layout):
+                cursor = int(offsets[row])+slot
+                if cfg.history_path_tokens:
+                    for key, value in zip(path_inputs, slab_path_samples(item, slab)):
+                        path_inputs[key][row, slot] = torch.as_tensor(value)
+                heat = render_history(torch.as_tensor(slab['hist_local'])[None].float(),
+                                      torch.as_tensor(slab['hmask'])[None], grid, 1., 'segments')[0]
+                output[row, slot] = torch.cat((images[cursor], heat), 0)
+                valid[row, slot] = True
+                quality = slab['ct_frame_diagnostics']
+                frame_source[row, slot] = quality['source']
+                frame_energy[row, slot], frame_gap[row, slot] = quality['energy'], quality['gap']
+                relative = (slab['pos']-item['pos']) @ item['frame']
+                rotation = np.asarray(item['frame']).T @ slab['frame']
+                pose[row, slot] = torch.tensor(np.r_[relative/128., rotation.ravel(),
+                                                       np.log1p(slab['age'])/8., float(slab['seed'])])
+                ages[row, slot] = slab['age']
+                world = grid.numpy().reshape(-1, 3) @ slab['frame'].T+slab['pos']
+                overlap[row, slot] = float(visible_points((world-item['pos']) @ item['frame'], cfg.fine).mean())
+    if pool is None:
+        for row in range(len(items)):
+            fill(row)
+    else:
+        list(pool.map(fill, range(len(items))))
     elapsed = torch.full((len(items),), (time.perf_counter()-started)/max(1, len(items)))
     return dict(history_slabs=output, history_valid=valid, history_pose=pose,
                 history_ages=ages, history_overlap=overlap, history_load_seconds=elapsed,
