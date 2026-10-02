@@ -190,6 +190,7 @@ def initialize_training_optimizer(model, ema, args, resume=None):
 
 
 ARCHITECTURES = (ARCHITECTURE, PATCH_ARCHITECTURE, TOKEN_ARCHITECTURE, STEM_ARCHITECTURE)
+ARCHITECTURES += tuple(name.replace('_v15', '_v16') for name in ARCHITECTURES)
 ARCHITECTURES += tuple(name.replace('_v15', '_v14') for name in ARCHITECTURES)
 HISTORY_GRAD_CLIP = 5.
 REST_GRAD_CLIP = 100.
@@ -232,6 +233,13 @@ def resolve_history_encoder(requested, checkpoint=None):
     if requested is not None and requested != saved:
         raise ValueError('History encoder must match the resumed checkpoint; start a new run to change it')
     return saved
+
+
+def resolve_history_path_tokens(requested, checkpoint=None):
+    saved = checkpoint_config(checkpoint).history_path_tokens if checkpoint else False
+    if checkpoint and requested is not None and requested != saved:
+        raise ValueError('History path tokens must match checkpoint; use memory_resume to migrate')
+    return saved if requested is None else requested
 
 
 def load_checkpoint(path,device='cuda'):
@@ -355,7 +363,8 @@ def resolve_device_sums(*tables):
 
 IDENTITY_SUMS = ('identity_correct_count',
                  'identity_flipped_count', 'candidate_states', 'candidate_intervals',
-                 'candidate_late_failures', 'candidate_first_failures', 'candidate_supervision_weight')
+                 'candidate_late_failures', 'candidate_first_failures', 'candidate_supervision_weight',
+                 'pair_rank_comparisons', 'pair_rank_correct', 'pair_rank_margin_sum')
 
 
 def clip_training_gradients(model, history_max_norm=HISTORY_GRAD_CLIP, rest_max_norm=REST_GRAD_CLIP):
@@ -384,7 +393,7 @@ def clip_training_gradients(model, history_max_norm=HISTORY_GRAD_CLIP, rest_max_
 
 def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolerance=1.5,
                      confidence_weight=.5, ema_decay=.999, n_commit=None, compute_metrics=True,
-                     candidate_weight=1.,
+                     candidate_weight=1., pair_rank_weight=0.,
                      history_grad_clip=HISTORY_GRAD_CLIP, rest_grad_clip=REST_GRAD_CLIP,
                      diagnostic=None, live_continuation=None):
     """One equally weighted task loss per independent supervised decision."""
@@ -448,6 +457,10 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
                 candidate_loss = terms['candidate_per_state'].sum()/denominator
                 loss = loss+candidate_weight*candidate_loss
                 accumulate(identity, 'candidate_loss', candidate_loss)
+                if pair_rank_weight:
+                    paired_loss = terms['pair_rank_per_state'].sum()/denominator
+                    loss = loss+pair_rank_weight*paired_loss
+                    accumulate(identity, 'pair_rank_loss', paired_loss)
         loss.backward()
         if live_continuation is not None:
             live_continuation.feedback(cpu, output, step)
@@ -494,6 +507,15 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
             if name in cpu:
                 sums[name+'_sum'] = sums.get(name+'_sum', 0.)+float(cpu[name].sum())
                 sums[name+'_max'] = max(sums.get(name+'_max', 0), int(cpu[name].max()))
+        if 'live_limit' in cpu:
+            for name, selected in (('live_depth_counts', cpu['live_depth'] > 0),
+                                   ('live_start_limit_counts', cpu['live_depth'] == 1)):
+                values = cpu['live_depth' if name == 'live_depth_counts' else 'live_limit'][selected]
+                counts = sums.setdefault(name, {})
+                for value, count in zip(*torch.unique(values, return_counts=True)):
+                    key = str(int(value))
+                    counts[key] = counts.get(key, 0)+int(count)
+            sums['live_travelled_sum'] = sums.get('live_travelled_sum', 0.)+float(cpu['live_travelled'].sum())
         if 'negative_bank_shards' in cpu:
             low,high = int(cpu['negative_bank_shards'].min()),int(cpu['negative_bank_shards'].max())
             identity['negative_bank_shards_min'] = min(identity.get('negative_bank_shards_min',low),low)
@@ -604,13 +626,21 @@ def build_parser():
                     help='Image encoder: conv (default) or overlapping 6x6x6 patches at stride 4; inferred on resume')
     ap.add_argument('--history-encoder', choices=('fine', 'legacy'), default=None,
                     help='Historical slabs: fine (default, 2x17x17 tokens) or legacy (2x9x9); inferred on resume')
+    ap.add_argument('--history-path-tokens', action=argparse.BooleanOptionalAction, default=None,
+                    help='Add observed-path neighborhood tokens to historical slabs; inferred on resume')
     ap.add_argument('--token-only', action=argparse.BooleanOptionalAction, default=None,
                     help='Use only patch4 tokens throughout; no reconstructed fine features or output planes')
     ap.add_argument('--direction-inputs', action=argparse.BooleanOptionalAction, default=True,
                     help='Add six sign-invariant direction channels to main crops; no image augmentations on these channels')
     ap.add_argument('--decoder-layers', type=int, default=4)
+    ap.add_argument('--decoder-ffn', type=int, default=DirectConfig.decoder_ffn,
+                    help='Path decoder feed-forward width; scorer stays at 1024')
+    ap.add_argument('--scorer-layers', type=int, default=DirectConfig.scorer_layers,
+                    help='Causal segment survival decoder depth')
     ap.add_argument('--axial-layers', type=int, default=4)
     ap.add_argument('--hidden', type=int, default=128)
+    ap.add_argument('--encoder-ffn', type=int, default=DirectConfig.encoder_ffn,
+                    help='Axial image encoder feed-forward width')
     ap.add_argument('--memory-switch-probability', type=float, default=.3,
                     help='Fresh replacement weight for switches when dividing the non-clean budget')
     ap.add_argument('--memory-switch-tail', type=float, nargs=2, default=(16.,96.), metavar=('MIN', 'MAX'),
@@ -624,6 +654,8 @@ def build_parser():
     ap.add_argument('--decision-choice-fraction', type=float, default=.75,
                     help='Requested fraction of matched pairs teaching recoverable geometry choices')
     ap.add_argument('--candidate-weight', type=float, default=1., help='Weight of candidate first-failure survival likelihood')
+    ap.add_argument('--pair-rank-weight', type=float, default=0.,
+                    help='Weight of paired-history candidate prefix ranking; 0 preserves the original objective')
     ap.add_argument('--fresh-fraction', type=float, default=.7,
                     help='Fresh-versus-replay weight for hard-source allocation; clean GT share is --clean-fraction')
     ap.add_argument('--clean-fraction', type=float, default=.8,
@@ -638,6 +670,8 @@ def build_parser():
                     help='Replace correct replay slots with recent training predictions advanced by inference policy')
     ap.add_argument('--live-continuation-steps', type=int, nargs=2, default=(4, 8), metavar=('MIN', 'MAX'),
                     help='Number of live continuation decisions before reseeding a chain')
+    ap.add_argument('--live-continuation-stratified', action='store_true',
+                    help='Balance chain starts across three equal contiguous decision-limit bands')
     ap.add_argument('--correct-replay-only', action='store_true',
                     help='Replay only nondeparted, nonexploratory committed prefixes with real model progress')
     ap.add_argument('--replay-continuation-fraction', type=float,
@@ -778,9 +812,13 @@ def main(argv=None):
     cfg = DirectConfig(encoder=resolve_encoder(args.encoder, resume),
                        token_only=resolve_token_only(args.token_only, resume),
                        history_encoder=resolve_history_encoder(args.history_encoder, resume),
+                       history_path_tokens=resolve_history_path_tokens(args.history_path_tokens, resume),
                        stem_channels=args.stem_channels, stem_blocks=args.stem_blocks,
                        direction_inputs=args.direction_inputs,input_mode=args.input_mode,channels=args.channels,hidden=args.hidden,layers=args.axial_layers,
+                       encoder_ffn=args.encoder_ffn,
                        decoder_layers=args.decoder_layers,
+                       decoder_ffn=args.decoder_ffn,
+                       scorer_layers=args.scorer_layers,
                        activation_checkpointing=args.activation_checkpointing,
                        recurrent_refinement_steps=args.recurrent_refinement_steps)
     if resume:
@@ -794,10 +832,15 @@ def main(argv=None):
     args.encoder = cfg.encoder
     args.token_only = cfg.token_only
     args.history_encoder = cfg.history_encoder
+    args.history_path_tokens = cfg.history_path_tokens
     if args.decision_fraction and args.batch % 2:
         raise ValueError('Matched decisions require an even batch')
     if not np.isfinite(args.candidate_weight) or args.candidate_weight <= 0:
         raise ValueError('Candidate weight must be finite and positive')
+    if not np.isfinite(args.pair_rank_weight) or args.pair_rank_weight < 0:
+        raise ValueError('Pair ranking weight must be finite and nonnegative')
+    if args.pair_rank_weight and not args.decision_fraction:
+        raise ValueError('Pair ranking requires matched decision sampling')
     if not 1 <= args.live_continuation_steps[0] <= args.live_continuation_steps[1]:
         raise ValueError('Live continuation requires 1 <= minimum steps <= maximum steps')
     if args.live_continuation and args.replay_continuation_fraction is None and not args.correct_replay_only:
@@ -888,6 +931,7 @@ def main(argv=None):
                    'history_grad_clip','rest_grad_clip','presence_dropout','blur_probability','blur_sigma',
                    'decision_fraction','decision_choice_fraction','bank_following_probability','fresh_fraction','clean_fraction',
                    'correct_replay_only','memory_switch_probability','live_continuation','live_continuation_steps',
+                   'pair_rank_weight','live_continuation_stratified',
                    'gt_perturb_probability','gt_perturb_max_offset','gt_perturb_max_angle_deg',
                    'replay_continuation_fraction','prefer_real_wrong_turns','prefer_replay_for_light_gt',
                    'bank_hard_fraction','replay_failure_fraction','bank_switch_tolerance','bank_own_tolerance',
@@ -895,7 +939,7 @@ def main(argv=None):
         for key,value in vars(args).items():
             recorded = resume['training_options'].get(key, {'input_mode': 'ct+presence', 'dataset_config': None,
                                                            'stem_channels': 0, 'stem_blocks': 2,
-                                                           'history_encoder': 'legacy'}.get(key))
+                                                           'history_encoder': 'legacy', 'history_path_tokens': False}.get(key))
             if key not in ignored and json.dumps(recorded,sort_keys=True) != json.dumps(value,sort_keys=True):
                 raise ValueError(f'Resume option differs: {key}')
         if resume['seed_manifest_sha256'] != manifest['sha256'] or resume['fiber_manifest'] != fiber_manifest(fibers):
@@ -986,6 +1030,7 @@ def main(argv=None):
     if args.live_continuation:
         from .live_continuation import LiveContinuation, preserve_live_metadata
         live_continuation = LiveContinuation(dataset, steps=args.live_continuation_steps,
+            stratified=args.live_continuation_stratified,
             n_commit=args.n_commit, max_recovery_distance=cfg.max_recovery_distance,
             switch_tolerance=args.bank_switch_tolerance, own_tolerance=args.bank_own_tolerance)
         live_continuation.set_step(done)
@@ -1101,6 +1146,7 @@ def main(argv=None):
                 tolerance=args.tolerance, confidence_weight=args.confidence_weight, ema_decay=args.ema_decay,
                 n_commit=args.n_commit, compute_metrics=step % args.log_every == 0 or step == args.steps,
                 candidate_weight=args.candidate_weight,
+                pair_rank_weight=args.pair_rank_weight,
                 history_grad_clip=args.history_grad_clip, rest_grad_clip=args.rest_grad_clip,
                 diagnostic=diagnostic, live_continuation=live_continuation)
             observed_states += metrics['observed_states']

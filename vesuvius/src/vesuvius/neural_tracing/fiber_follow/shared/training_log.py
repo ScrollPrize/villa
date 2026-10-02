@@ -26,7 +26,7 @@ class DirectTrainingInterval:
              'live_failure_fraction', 'live_fallback_fraction', 'live_light_slot_fraction')
     counts = tuple(p+'_'+s for p in ('ct_frame', 'history_frame')
                    for s in ('count', 'transported', 'deterministic', 'energy_sum', 'gap_sum')) + (
-              'live_depth_sum', 'live_policy_age_sum', 'ct_frame_rejected_batches', 'error_sum', 'geometry_count', 'point_correct_count', 'point_wrong_count',
+              'live_depth_sum', 'live_policy_age_sum', 'live_travelled_sum', 'ct_frame_rejected_batches', 'error_sum', 'geometry_count', 'point_correct_count', 'point_wrong_count',
               'point_unknown_count', 'supervised_states', 'observation_only_states', 'history_valid_slabs', 'history_age_sum', 'history_overlap_sum', 'history_load_seconds', 'history_encode_seconds',
               'confidence_labeled_states', 'confidence_departed_states', 'refinement_attempts_sum',
               'supervision_weight', 'endpoint_weight', 'matched_endpoint_weight', 'choice_endpoint_weight',
@@ -34,13 +34,19 @@ class DirectTrainingInterval:
               'replay_bank_switch_endpoints', 'replay_premature_stop_endpoints',
               'replay_endpoint_overshoot_endpoints', 'replay_pre_switch_endpoints')
     nested_counts = {'identity': ('candidate_states', 'candidate_intervals', 'candidate_late_failures',
-                                 'candidate_first_failures', 'candidate_supervision_weight')}
-    nested_means = {'identity': ('candidate_loss',)}
+                                 'candidate_first_failures', 'candidate_supervision_weight',
+                                 'pair_rank_comparisons', 'pair_rank_correct', 'pair_rank_margin_sum')}
+    nested_means = {'identity': ('candidate_loss', 'pair_rank_loss')}
 
     def __init__(self):
         self.values = dict(updates=0, crops=0, decisions=0)
 
     def add(self, row):
+        for name in ('live_depth_counts', 'live_start_limit_counts'):
+            if name in row:
+                counts = self.values.setdefault(name, {})
+                for key, value in row[name].items():
+                    counts[key] = counts.get(key, 0)+value
         if 'dataset_counts' in row:
             counts = self.values.setdefault('dataset_counts', {})
             for key, value in row['dataset_counts'].items():
@@ -134,6 +140,11 @@ def _interval_training_lines(row):
                      f" | {int(m['identity_candidate_late_failures'])} later failures")
     lines.append(f"  candidate survival loss {m['identity_candidate_loss']:.4f}"
                  f" ({int(m['identity_candidate_states'])} eligible crops)")
+    comparisons = m.get('identity_pair_rank_comparisons', 0)
+    if comparisons:
+        lines.append(f"  paired identity: ranking loss {m.get('identity_pair_rank_loss', 0):.4f}"
+                     f" | correctly ordered {_rate(m['identity_pair_rank_correct'], comparisons)}"
+                     f" | mean logit margin {m['identity_pair_rank_margin_sum']/comparisons:.3f}")
     lines.append('  data: '+' / '.join(f'{name} {m[key]:.0%}' for name, key in
                  (('fresh','fresh_fraction'), ('recent','recent_fraction'),
                   ('wrong turns','bank_wrong_continuation_fraction'), ('following','bank_following_fraction'),
@@ -146,6 +157,10 @@ def _interval_training_lines(row):
                      f" / GT fallback {m['live_fallback_fraction']:.1%}"
                      f" | depth {m['live_depth_sum']/live:.2f}"
                      f" | policy age {m['live_policy_age_sum']/live:.1f} updates")
+        if 'live_start_limit_counts' in m:
+            lines.append(f"  live chain starts by limit: {m['live_start_limit_counts']}"
+                         f" | reached depths: {m.get('live_depth_counts', {})}"
+                         f" | mean travel {m.get('live_travelled_sum', 0)/live:.1f} voxels")
     if any(m.get(k, 0) for k in ('gt_unperturbed_fraction', 'gt_perturbed_fraction', 'replay_correct_continuation_fraction')):
         lines.append(f"  data detail (% of all): clean GT {m['gt_unperturbed_fraction']:.1%}"
                      f" / light GT {m['gt_perturbed_fraction']:.1%}"

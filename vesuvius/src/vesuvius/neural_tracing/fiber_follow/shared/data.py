@@ -754,6 +754,8 @@ class FollowDataset(torch.utils.data.IterableDataset):
             if self.live_continuation is not None:
                 batch['_live_states'] = [self.live_continuation.metadata(item) for item in items]
                 batch['live_depth'] = torch.tensor([item.get('live_depth', 0) for item in items])
+                batch['live_limit'] = torch.tensor([item.get('live_limit', 0) for item in items])
+                batch['live_travelled'] = torch.tensor([item.get('live_travelled', 0.) for item in items])
                 batch['live_policy_age'] = torch.tensor([
                     max(0, self.live_continuation.step.value-item['source_step'])
                     if item.get('live_continuation') else 0 for item in items])

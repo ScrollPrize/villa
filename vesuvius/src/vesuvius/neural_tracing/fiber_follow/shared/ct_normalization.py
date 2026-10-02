@@ -8,6 +8,8 @@ import numpy as np
 from scipy.ndimage import gaussian_filter1d
 
 METHOD = 'background_3noise_foreground_mad_v1'
+ZSCORE_METHOD = 'crop_zscore_v1'
+ZSCORE_EPSILON = 1e-6
 BACKGROUND = -4.
 LIMIT = 4.
 CALIBRATION_SEED = 532
@@ -105,6 +107,10 @@ def calibrate(ct, *, count=128, seed=CALIBRATION_SEED):
 
 
 def validate_record(record, spec):
+    if record is not None and record.get('method') == ZSCORE_METHOD:
+        if record.get('volume') != volume_key(spec) or record.get('epsilon') != ZSCORE_EPSILON:
+            raise ValueError('Invalid z-score normalization record or different volume')
+        return record
     if record is None or record.get('method') != METHOD or record.get('volume') != volume_key(spec):
         raise ValueError('CT background calibration missing or belongs to a different volume')
     center, noise, threshold = (record[k] for k in ('center', 'noise', 'threshold'))
@@ -129,9 +135,11 @@ def prepare_normalization(out, specs, *, resume=None, known=None):
             raise ValueError('CT normalization JSON differs from the resumed checkpoint')
         document = resume
     elif document is None:
-        document = dict(method=METHOD, volumes={})
-    if document.get('method') != METHOD:
+        document = dict(method=known['method'] if known is not None else METHOD, volumes={})
+    if document.get('method') not in (METHOD, ZSCORE_METHOD):
         raise ValueError('Unsupported CT normalization policy')
+    if known is not None and document['method'] != known['method']:
+        raise ValueError('Inference CT normalization differs from the checkpoint')
     # Do not mutate an embedded checkpoint document while adding an inference volume.
     document = json.loads(json.dumps(document))
     for spec in specs:
@@ -145,16 +153,23 @@ def prepare_normalization(out, specs, *, resume=None, known=None):
                 raise ValueError(f'Resumed checkpoint lacks CT calibration: {key}')
             if known is not None and key in known['volumes']:
                 record = known['volumes'][key]
+            elif document['method'] == ZSCORE_METHOD:
+                record = dict(method=ZSCORE_METHOD, volume=key, epsilon=ZSCORE_EPSILON, **array_identity(ct))
             else:
                 print(f'Calibrating CT background: {key}', flush=True)
                 record = dict(calibrate(ct), method=METHOD, volume=key)
             document['volumes'][key] = record
         record = validate_record(document['volumes'][key], spec)
+        if record['method'] != document['method']:
+            raise ValueError('CT record and document normalization methods differ')
         if any(record[k] != v for k, v in array_identity(ct).items()):
             raise ValueError(f'CT array metadata changed since calibration: {key}')
         spec.ct_normalization = dict(record)
-        print(f'CT background {record["center"]:.2f}, noise {record["noise"]:.2f}, '
-              f'foreground > {record["threshold"]:.2f}: {key}', flush=True)
+        if record['method'] == ZSCORE_METHOD:
+            print(f'CT per-crop z-score, epsilon {ZSCORE_EPSILON:g}: {key}', flush=True)
+        else:
+            print(f'CT background {record["center"]:.2f}, noise {record["noise"]:.2f}, '
+                  f'foreground > {record["threshold"]:.2f}: {key}', flush=True)
     if not path.exists() or json.loads(path.read_text()) != document:
         RemoteChunkedArray._atomic_write(path, (json.dumps(document, indent=2)+'\n').encode())
     return document
@@ -211,4 +226,12 @@ def normalize_ct(image, record):
         raise ValueError('CT background calibration is required before sampling model inputs')
     if image.dtype != np.float32 or image.ndim != 3 or not image.flags.c_contiguous:
         raise ValueError('CT normalization requires a contiguous float32 3D crop')
+    if record.get('method') == ZSCORE_METHOD:
+        if not np.isfinite(image).all():
+            raise ValueError('Z-score CT crop contains nonfinite values')
+        mean = image.mean(dtype=np.float64)
+        std = image.std(dtype=np.float64)
+        image -= np.float32(mean)
+        image /= np.float32(max(float(std), ZSCORE_EPSILON))
+        return
     _normalize(image, np.float32(record['threshold']/255.), record['noise'])

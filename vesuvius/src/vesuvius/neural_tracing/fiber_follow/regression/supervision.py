@@ -162,6 +162,7 @@ def loss_terms(output, batch, cfg, tolerance=1.5, *, n_commit=None):
         terms.update(identity_correct_count=(supervised*supervised_known).sum(),
                      identity_flipped_count=(labels*known*(1-supervised)).sum())
     if 'candidate_confidence_logits' in output:
+        terms.update(paired_identity_loss(output['candidate_confidence_logits'], batch))
         mask = batch['candidate_mask'].bool()
         if 'identity_observable' in batch:
             mask = mask & batch['identity_observable'][:,None,None]
@@ -176,3 +177,36 @@ def loss_terms(output, batch, cfg, tolerance=1.5, *, n_commit=None):
         terms['candidate_first_failures'] = failures[..., 0].sum()
         terms['candidate_supervision_weight'] = valid.any(-1).float().sum()
     return terms
+
+
+def paired_identity_loss(logits, batch):
+    """Rank the same known candidate prefix under two certified histories.
+
+    IDs, not adjacency, identify pairs. Unknown prefixes are excluded, and
+    geometric equality prevents mismatched candidate order/frame comparisons.
+    Means are per eligible row, like the existing candidate survival loss.
+    """
+    zero = logits.sum((1, 2))*0.
+    if 'identity_pair_id' not in batch:
+        return dict(pair_rank_per_state=zero, pair_rank_comparisons=zero.sum(),
+                    pair_rank_correct=zero.sum(), pair_rank_margin_sum=zero.sum())
+    ids = batch['identity_pair_id']
+    labels = batch['candidate_labels'] > .5
+    known = batch['candidate_mask'].bool()
+    if 'identity_observable' in batch:
+        known = known & batch['identity_observable'][:, None, None].bool()
+    paired = (ids[:, None] == ids[None, :]) & (ids[:, None] >= 0)
+    paired &= ~torch.eye(len(ids), device=ids.device, dtype=torch.bool)
+    # Reject duplicate/corrupt groups rather than silently comparing >2 rows.
+    paired &= (paired.sum(1) == 1)[:, None]
+    points = batch['candidate_points']
+    same = (points[:, None]-points[None, :]).abs().amax((-1, -2)) < 1e-5
+    valid = paired[:, :, None, None] & same[..., None]
+    valid = valid & known[:, None] & known[None, :] & (labels[:, None] != labels[None, :])
+    margin = (logits.float()[:, None]-logits.float()[None, :])*(2*labels[:, None].float()-1)
+    count = valid.sum((1, 2, 3))
+    loss = torch.where(valid, F.softplus(-margin), 0.).sum((1, 2, 3))/count.clamp_min(1)
+    # Each comparison occurs twice, once from each row's perspective.
+    return dict(pair_rank_per_state=loss, pair_rank_comparisons=valid.sum()/2,
+                pair_rank_correct=(valid & (margin > 0)).sum()/2,
+                pair_rank_margin_sum=torch.where(valid, margin, 0.).sum()/2)

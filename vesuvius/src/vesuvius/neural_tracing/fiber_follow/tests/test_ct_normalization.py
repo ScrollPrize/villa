@@ -14,6 +14,44 @@ from vesuvius.neural_tracing.fiber_follow.regression.data import augment_image_p
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
 
 
+def test_zscore_uses_all_pixels_without_clipping_or_background_sentinel():
+    image = np.arange(512, dtype=np.float32).reshape(8, 8, 8)/512
+    image[0, 0, 0] = 100.
+    expected = (image.astype(np.float64)-image.mean(dtype=np.float64))/image.std(dtype=np.float64)
+    norm.normalize_ct(image, dict(method=norm.ZSCORE_METHOD))
+    np.testing.assert_allclose(image, expected, atol=2e-6)
+    assert abs(image.mean()) < 1e-6 and abs(image.std()-1) < 1e-6
+    assert image.max() > 4
+    for value in (0., .37):
+        constant = np.full((8, 8, 8), value, np.float32)
+        norm.normalize_ct(constant, dict(method=norm.ZSCORE_METHOD))
+        assert np.isfinite(constant).all() and not constant.any()
+
+
+def test_zscore_inference_and_resume_preserve_policy_without_calibration(tmp_path, monkeypatch):
+    spec = volume(tmp_path)
+    document = dict(method=norm.ZSCORE_METHOD, volumes={norm.volume_key(spec): dict(
+        method=norm.ZSCORE_METHOD, volume=norm.volume_key(spec), epsilon=norm.ZSCORE_EPSILON,
+        shape=[48, 16, 16], chunks=[16, 16, 16], dtype='|u1')})
+    monkeypatch.setattr(norm, 'calibrate', lambda *a: pytest.fail('Z-score must not calibrate background'))
+    norm.prepare_normalization(tmp_path/'run', [spec], resume=document)
+    image = image_crop([dict(pos=np.array([8., 8., 36.]), frame=np.eye(3))],
+                       FiberVolume(spec), CropSpec(8, 8, 4, 1.), input_mode='ct')
+    assert abs(float(image.mean())) < 1e-5
+    assert abs(float(image.std(correction=0))-1) < 1e-5
+    second = volume(tmp_path/'second')
+    inferred = norm.prepare_normalization(tmp_path/'inference', [second], known=document)
+    assert inferred['method'] == norm.ZSCORE_METHOD
+    assert second.ct_normalization['method'] == norm.ZSCORE_METHOD
+
+
+def test_zscore_augmentation_does_not_mask_values_below_minus_four():
+    image = np.linspace(-8, 8, 64, dtype=np.float32).reshape(1, 4, 4, 4)
+    before = image.copy()
+    augment_image_pair(torch.from_numpy(image), (1., 0., 0.), np.random.default_rng(1), zscore=True)
+    np.testing.assert_array_equal(image, before)
+
+
 def record(spec, center=50., noise=4.):
     return dict(method=norm.METHOD, volume=norm.volume_key(spec), center=center, noise=noise,
                 threshold=center+3*noise)

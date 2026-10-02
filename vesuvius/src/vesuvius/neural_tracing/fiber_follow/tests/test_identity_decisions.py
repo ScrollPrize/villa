@@ -79,6 +79,7 @@ def test_replay_preserves_seed_but_distant_seed_is_not_observable(tmp_path):
                   frame=[np.eye(3)], hist=np.zeros((1, cfg.n_history, 3)), hmask=np.zeros((1, cfg.n_history)),
                   offtrack=[False], hard=[False], exploratory=[False])
     ds = object.__new__(FollowDataset)
+    ds.correct_replay_only, ds.replay_continuation_fraction = False, None
     ds.vol_spec = SimpleNamespace(grid_scale=8., ct_grid_scale=4.)
     ds.fibers, ds.cfg, ds.exclude, ds.additional_crops = [parent], clean_sample(cfg), bank.band, ()
     ds.batch_builder = IdentityObservationBuilder(cfg, [parent], negative_bank=bank)

@@ -225,8 +225,19 @@ def photometric(image, params, rng):
     return out.astype(np.float32)
 
 
-def augment_ct(image, params, rng, blur_sigma=0.):
+def augment_ct(image, params, rng, blur_sigma=0., *, zscore=False):
     """Normalized convolution avoids bleeding black background into material."""
+    if zscore:
+        if blur_sigma > 0:
+            image[:] = gaussian_filter(image, blur_sigma, mode='reflect')
+        contrast, brightness, noise = params
+        # Retain configured augmentation magnitudes, with no sentinel/masking
+        # or clipping of the new z-score distribution.
+        mean = float(image.mean())
+        image[:] = (image-mean)*contrast+mean+brightness*(2*LIMIT)
+        if noise > 0:
+            image += rng.normal(0., noise*(2*LIMIT), image.shape).astype(np.float32)
+        return
     if blur_sigma > 0:
         material = image > BACKGROUND
         weights = gaussian_filter(material.astype(np.float32), blur_sigma, mode='reflect')
@@ -236,14 +247,14 @@ def augment_ct(image, params, rng, blur_sigma=0.):
     image[:] = photometric(image, params, rng)
 
 
-def augment_image_pair(image, params, rng, *, blur_sigma=0., drop_presence=False):
+def augment_image_pair(image, params, rng, *, blur_sigma=0., drop_presence=False, zscore=False):
     """Augment only CT/presence in place; extra direction channels are untouched.
 
     Blur both channels before adding CT intensity noise. Reflect padding keeps
     constant inputs constant; channel dropout remains exactly zero after blur.
     """
     values = image[:2].numpy()
-    augment_ct(values[0], params, rng, blur_sigma)
+    augment_ct(values[0], params, rng, blur_sigma, zscore=zscore)
     if blur_sigma > 0 and len(values) > 1:
         gaussian_filter(values[1], sigma=blur_sigma, mode='reflect', output=values[1])
     if drop_presence and len(values) > 1:
@@ -516,21 +527,24 @@ class IdentityObservationBuilder(ObservationBuilder):
                 target, mask = candidate_targets(target_batch, self.cfg, self.sampling.candidate_tolerance)
                 labels[eligible], known[eligible] = target, mask
             batch['candidate_labels'], batch['candidate_mask'] = labels, known
+            batch['identity_pair_id'] = torch.tensor([i.get('pair_observation_seed', -1) for i in items], dtype=torch.int64)
             for key in ('decision_kind','decision_tail'):
                 batch[key] = torch.tensor([i.get(key,0) for i in items],dtype=torch.float32)
         batch['seed_present'] = batch['x']['seed_mask'].flatten()
         if self.augment:
+            from ..shared.ct_normalization import ZSCORE_METHOD
+            zscore = (vol.spec.ct_normalization or {}).get('method') == ZSCORE_METHOD
             batch['blurred'] = torch.zeros(len(items))
             for j,item in enumerate(items):
                 if 'photometric' not in item:
                     continue
                 rng = np.random.default_rng(item['identity_seed']+1)
-                augmentation = dict(blur_sigma=item.get('blur_sigma', 0.), drop_presence=item['drop_presence'])
+                augmentation = dict(blur_sigma=item.get('blur_sigma', 0.), drop_presence=item['drop_presence'], zscore=zscore)
                 batch['blurred'][j] = augmentation['blur_sigma'] > 0
                 augment_image_pair(batch['x']['fine'][j], item['photometric'], rng, **augmentation)
                 for slot in batch['x']['history_valid'][j].nonzero().flatten().tolist():
                     ct = batch['x']['history_slabs'][j, slot, 0].numpy()
-                    augment_ct(ct, item['photometric'], rng, augmentation['blur_sigma'])
+                    augment_ct(ct, item['photometric'], rng, augmentation['blur_sigma'], zscore=zscore)
                 if item['drop_presence']:
                     batch['presence_dropped'][j] = 1
         return batch

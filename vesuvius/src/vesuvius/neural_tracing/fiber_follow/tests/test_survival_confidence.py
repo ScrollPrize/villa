@@ -64,9 +64,10 @@ def test_confidence_head_computes_fp32_inside_bf16_autocast(device):
 
 
 @pytest.mark.parametrize('training', [False, True])
-def test_replacing_truncating_or_extending_suffix_preserves_prefix(training):
+@pytest.mark.parametrize('scorer_layers', [2, 4])
+def test_replacing_truncating_or_extending_suffix_preserves_prefix(training, scorer_layers):
     torch.manual_seed(61)
-    model = build_model(config()).train(training)
+    model = build_model(config(scorer_layers=scorer_layers)).train(training)
     first = memory_batch(model.cfg, 1)
     with torch.no_grad():
         batch = memory_batch(model.cfg, 1, step=1)
@@ -125,7 +126,7 @@ def test_first_segment_reads_all_observations_but_no_future_segment_features():
     padding[:, -1] = True
     logits = scorer(spatial, points, scorer.project_memory(memory, padding), padding, (memory, padding))
     logits[:, 0].sum().backward()
-    assert len(scorer.layers) == 4
+    assert len(scorer.layers) == 2
     for layer in scorer.layers:
         grad = layer.linear1.weight.grad
         assert grad is not None and torch.isfinite(grad).all() and grad.abs().sum() > 0

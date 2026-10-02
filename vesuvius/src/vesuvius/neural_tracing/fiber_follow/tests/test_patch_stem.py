@@ -14,7 +14,9 @@ from vesuvius.neural_tracing.fiber_follow.regression.supervision import loss_ter
 def test_fresh_stem_learns_through_compiled_geometry_and_candidate_scoring(activation_checkpointing):
     torch.manual_seed(21)
     model = build_model(cfg(encoder='patch4', token_only=True, stem_channels=32,
-        stem_blocks=2, recurrent_refinement_steps=1, activation_checkpointing=activation_checkpointing))
+        stem_blocks=2, hidden=256, encoder_ffn=256, layers=2,
+        decoder_layers=6, decoder_ffn=2048, scorer_layers=4,
+        recurrent_refinement_steps=1, activation_checkpointing=activation_checkpointing))
     prepare_training(model, backend='eager')
     batch = slab_batch(model.cfg)
     candidates = torch.zeros(2, 1, model.cfg.n_future, 3)
@@ -28,6 +30,9 @@ def test_fresh_stem_learns_through_compiled_geometry_and_candidate_scoring(activ
         loss = (terms['geometry_per_state']+.5*terms['confidence_per_state']).mean()
         loss = loss+out['candidate_hazard_logits'].square().mean()
         loss.backward()
+        for layer in (*model.decoder.layers, *model.confidence_scorer.layers):
+            grad = layer.linear1.weight.grad
+            assert grad is not None and torch.isfinite(grad).all() and grad.abs().sum() > 0
         projection = model.encoder.stem.projection.weight.grad
         assert torch.isfinite(projection).all() and projection.abs().sum() > 0
         for name, p in model.encoder.stem.named_parameters():
@@ -72,4 +77,3 @@ def test_stem_uses_shared_basicblock_d_at_full_half_and_quarter_resolution():
                isinstance(b.nonlin2, torch.nn.ReLU) for b in blocks)
     assert isinstance(blocks[1].skip[0], torch.nn.AvgPool3d)
     assert isinstance(blocks[3].skip[0], torch.nn.AvgPool3d)
-

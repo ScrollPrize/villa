@@ -110,7 +110,8 @@ def layer_capture(model):
             slots = a[1].shape[1]
             record['statistics']['history tokens'] = tensor_stats(tokens[~padding])
             # Center spatial features within each slot before reducing channels.
-            values = tokens.detach().float().reshape(1, slots, *m.token_shape, -1)
+            values = tokens.detach().float().reshape(1, slots, m.tokens_per_slab, -1)
+            values = values[:, :, :m.spatial_tokens_per_slab].reshape(1, slots, *m.token_shape, -1)
             contrast = (values-values.mean((2, 3, 4), keepdim=True)).square().mean(-1).sqrt().mean(2)
             record['history']['tokens'] = contrast[0].cpu()
         handles.append(model.history_encoder.register_forward_hook(history_tokens))

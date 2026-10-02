@@ -1,5 +1,53 @@
 # Live historical slab regression
 
+The optional v16 memory continuation adds three explicit observed-path tokens per
+historical slab, retaining all 578 spatial tokens. Each token samples the encoded
+CT/path features at the committed path and four lateral neighbors one tracing
+voxel away. Position, tangent, age, seed role and slab pose accompany the features.
+Samples are at observation arclength offsets -1, 0 and +1; samples outside the
+observed prefix or physical slab are masked. No annotation geometry enters them.
+
+`--pair-rank-weight .25` adds a paired-history logistic ranking loss to the
+existing geometry and survival objectives. Only matching explicit pair IDs,
+identical candidate geometry, and known opposite prefix labels contribute.
+It averages eligible candidate/prefix comparisons per decision; logged comparison
+counts count each pair once. Source sampling weights are unchanged. Ranking
+accuracy and mean logit margin are logged separately from survival calibration.
+
+`--live-continuation-steps 12 32 --live-continuation-stratified` cycles chain-limit
+draws across 12–18, 19–25 and 26–32 decisions, uniformly within each band. A shared
+counter per dataset balances draws across workers. Limits stay fixed for a chain;
+stops, departures, annotation boundaries and stale feedback still end it early.
+Logs include started-chain limit counts, reached-depth counts and mean travel.
+This balances requested limits, not surviving depths. Worker timing still affects
+the live sample stream; counters/queues restart on resume.
+
+To fork a stopped training run using its actual checkpoint configuration:
+
+```bash
+../../../../.venv/bin/python -m vesuvius.neural_tracing.fiber_follow.regression.memory_resume \
+  --checkpoint output/SOURCE/ckpt_010000.pt --name NEW_RUN \
+  --pair-rank-weight .25 --live-steps 12 32 --zscore
+```
+
+The command prepares an independent run and records the exact trainer command
+and intentional changes in `migration.json`. It preserves every existing model
+and EMA tensor, remaps Adam moments by parameter name, and preserves the update
+count, RNG and LR schedule. New path-projection parameters use seed 20261001;
+their final layer starts at zero and their Adam state starts fresh. Extra tokens
+change attention normalization slightly even before their new projection learns.
+Primary and dataset-specific replay indexes reference existing geometry caches;
+new rollouts are written inside the new run.
+
+`--zscore` records `crop_zscore_v1` preprocessing in the checkpoint: each current
+and historical CT crop uses `(image - mean) / max(population_std, 1e-6)` over all
+sampled voxels, before augmentation. There is no foreground threshold, clipping,
+or background sentinel. Constant crops become zero. Augmentation keeps its saved
+magnitudes but applies to the entire image without masking/clipping. Inference
+and collection use the checkpoint's normalization policy. The frozen recovery
+fixture retains every geometry array; only its normalization provenance and hash
+change. Existing v14/v15 checkpoints retain their original behavior.
+
 The direct follower predicts continuous paths and causal survival confidence from
 one current crop and up to eight live historical slabs. The main encoder, local
 128-point history, 16-point forecast and adaptive refinement policy are unchanged.
@@ -20,6 +68,17 @@ The patch launcher defaults to batch 16 and one gradient accumulation step, eigh
 loader workers, and a fresh `axial_patch4_overlap_tokens_slabs_v11_run1` destination.
 The convolutional launcher defaults to `axial_survival_slabs_v10_run1`.
 Existing output directories are never overwritten.
+
+`bash scripts/train_mixed_ct_stem_fresh.sh` starts a fresh mixed-CT model with
+two axial encoder blocks at width 256 and FFN 256, six path decoder layers at
+width 256 and FFN 2048, and four survival scorer layers at width 256 and FFN 1024.
+The encoder and heads share width 256; the stem remains 32/64/128 and the history
+encoder retains width-256 output.
+The launcher sets `--axial-layers 2 --encoder-ffn 256
+--hidden 256 --decoder-layers 6 --decoder-ffn 2048 --scorer-layers 4` and uses
+batch 4 with three gradient accumulation steps. These dimensions are saved in
+the model configuration. Its default run name is `mixed_ct_afv_stem32_fresh_run3`;
+set `STEM_RUN_NAME` to select another new run.
 
 When resuming, `--lr` may change the base learning rate while retaining AdamW
 moments, EMA, and the existing warmup/cosine schedule position. Omit
@@ -313,7 +372,9 @@ bash scripts/train_mixed_ct_stem_fresh.sh
 ```
 
 This script uses batch 6 and two gradient accumulation steps (12 examples per
-optimizer update), the fine history encoder, and the checkpoint's remaining
+optimizer update), the fine history encoder, model width 256, four image-transformer
+blocks, two coordinate-decoder layers, and two scorer layers. All three transformer
+components use feed-forward width 1024. It retains the checkpoint's remaining
 training settings, including live continuation at 4–8 steps, tolerance 3,
 LR 1e-4 and 5000 warmup updates. It starts at step zero with random weights and
 a fresh optimizer; no checkpoint is opened at launch. Its default output name is
@@ -422,8 +483,10 @@ attention work; measure GPU memory before choosing the training batch size.
 Position, pose, age,
 slot and seed role are embedded inside the encoder. Generator and scorer have
 separate residual history attention shared across their respective decoder
-layers. The survival scorer has four transformer layers with model width 128
-and feed-forward width 256 at the default settings. History features stay attached
+layers. The survival scorer has two transformer layers. The image transformer,
+coordinate decoder, and survival scorer use feed-forward width 1024. The mixed-CT
+run script uses model width 256, four image-transformer blocks, and two
+coordinate-decoder layers. History features stay attached
 and are reused across all attempts and
 supplied candidates within a decision. Fully masked history contributes zero.
 

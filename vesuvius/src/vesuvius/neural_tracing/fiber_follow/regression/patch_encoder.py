@@ -68,7 +68,7 @@ class PatchShuffleEncoder(AxialEncoder):
         self.stem = ResidualPatchStem(cfg) if cfg.stem_channels else None
         self.position = nn.Linear(3, cfg.hidden)
         self.condition = nn.Linear(3, cfg.hidden, bias=False)
-        self.blocks = nn.ModuleList(AxialBlock(cfg.hidden, cfg.heads, local_convolution=False, rotary=True)
+        self.blocks = nn.ModuleList(AxialBlock(cfg.hidden, cfg.heads, ffn=cfg.encoder_ffn, local_convolution=False, rotary=True)
                                     for _ in range(cfg.layers))
         self.norm = nn.LayerNorm(cfg.hidden)
         self.reconstruction = None if cfg.token_only else nn.Linear(cfg.hidden, 64*cfg.channels)

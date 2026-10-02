@@ -13,7 +13,7 @@ from .model import build_model
 from .train import build_parser, checkpoint_config, options_argv
 
 
-def fork_checkpoint(source, name, transform, *, allowed_changes, migration_key, describe):
+def fork_checkpoint(source, name, transform, *, allowed_changes, migration_key, describe, transform_fixture=None):
     """Prepare an independent run directory using only checkpoint settings.
 
     The frozen monitor fixture is copied byte-for-byte. Published source replay
@@ -29,9 +29,10 @@ def fork_checkpoint(source, name, transform, *, allowed_changes, migration_key, 
     original_options = normalize_batch_options(original['training_options'])
     parser = build_parser()
     missing_defaults = {'remote_prefetch_connections','remote_prefetch_queue_size','remote_prefetch_timeout',
-                         'remote_prefetch_lookahead','stem_channels','stem_blocks','history_encoder'}-options.keys()
+                         'remote_prefetch_lookahead','stem_channels','stem_blocks','history_encoder',
+                         'history_path_tokens','pair_rank_weight','live_continuation_stratified'}-options.keys()
     for key in sorted(missing_defaults):
-        options.setdefault(key, checkpoint_config(migrated).history_encoder if key == 'history_encoder'
+        options.setdefault(key, getattr(checkpoint_config(migrated), key) if key in ('history_encoder', 'history_path_tokens')
                            else parser.get_default(key))
     if options['reset_optimizer']:
         raise ValueError('Refusing a continuation that would reset optimizer state')
@@ -41,10 +42,18 @@ def fork_checkpoint(source, name, transform, *, allowed_changes, migration_key, 
     fixture = source.parent/'monitor_recovery.npz'
     if options['recovery_every'] and hashlib.sha256(fixture.read_bytes()).hexdigest() != original['monitor_recovery_sha256']:
         raise ValueError('Source monitor fixture does not match checkpoint')
+    fixture_bytes = fixture.read_bytes() if options['recovery_every'] else None
+    if fixture_bytes is not None and transform_fixture is not None:
+        fixture_bytes = transform_fixture(fixture_bytes, migrated)
+        migrated['monitor_recovery_sha256'] = hashlib.sha256(fixture_bytes).hexdigest()
     replay_file = source.parent/'dagger/replay.json'
     replay = json.loads(replay_file.read_text()) if replay_file.exists() else options['onpolicy']
+    source_replay = {str(path.relative_to(source.parent/'dagger')): json.loads(path.read_text())
+                     for path in sorted((source.parent/'dagger').glob('*/replay.json'))}
     if any(not Path(p).exists() for p in replay):
         raise ValueError('A source replay cache is missing')
+    if any(not Path(p).exists() for paths in source_replay.values() for p in paths):
+        raise ValueError('A dataset-specific source replay cache is missing')
     target = destination/f"ckpt_{original['step']:06d}.pt"
     options.update(name=name, out_root=str(destination.parent), resume=str(target))
     argv = options_argv(options)
@@ -57,7 +66,7 @@ def fork_checkpoint(source, name, transform, *, allowed_changes, migration_key, 
         raise ValueError('Unexpected training setting change')
     info = dict(source_checkpoint=str(source), source_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
                 source_step=original['step'], **describe(original, migrated),
-                changes=changes, replay_paths=replay,
+                changes=changes, replay_paths=replay, dataset_replay_paths=source_replay,
                 command=[sys.executable, '-u', '-m', 'vesuvius.neural_tracing.fiber_follow.regression.train', *argv])
     migrated[migration_key] = info
     config = dict(options)
@@ -70,9 +79,13 @@ def fork_checkpoint(source, name, transform, *, allowed_changes, migration_key, 
         torch.save(migrated, staging/target.name)
         shutil.copyfile(staging/target.name, staging/'last.pt')
         if options['recovery_every']:
-            shutil.copyfile(fixture, staging/'monitor_recovery.npz')
+            (staging/'monitor_recovery.npz').write_bytes(fixture_bytes)
         (staging/'dagger').mkdir()
         (staging/'dagger/replay.json').write_text(json.dumps(replay, indent=2)+'\n')
+        for relative, paths in source_replay.items():
+            target_index = staging/'dagger'/relative
+            target_index.parent.mkdir(parents=True, exist_ok=True)
+            target_index.write_text(json.dumps(paths, indent=2)+'\n')
         (staging/'config.json').write_text(json.dumps(config, indent=2)+'\n')
         (staging/'migration.json').write_text(json.dumps(info, indent=2)+'\n')
         if destination.exists():

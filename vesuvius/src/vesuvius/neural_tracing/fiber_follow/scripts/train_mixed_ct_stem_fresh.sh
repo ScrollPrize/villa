@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# Settings captured directly from mixed_ct_afv_stem32_fresh_run1/ckpt_031000.pt.
+# Base settings from mixed_ct_afv_stem32_fresh_run1/ckpt_031000.pt.
 # Checkpoint SHA256: 9ce8501427e73674b591e2244ac975f6149534406bc3a9681054cf39bd4c6efa
 # The checkpoint is provenance only; this script does not load it.
-# Batch 6 with two accumulation steps gives 12 examples per optimizer update.
+# Encoder: 2 blocks, width 256, FFN 256; path decoder: 6 layers, width 256, FFN 2048.
+# Scorer stays at 4 layers, width 256, FFN 1024.
+# Batch 4 with three accumulation steps gives 12 examples per optimizer update.
 task_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 task_python="${FIBER_PYTHON:-$task_root/../../../../.venv/bin/python}"
-task_run="${STEM_RUN_NAME:-mixed_ct_afv_stem32_fresh_run2}"
+task_run="${STEM_RUN_NAME:-mixed_ct_afv_stem32_fresh_run3}"
 cd "$task_root"
 exec "$task_python" -u -m vesuvius.neural_tracing.fiber_follow.regression.train \
   --name "$task_run" \
@@ -20,8 +22,8 @@ exec "$task_python" -u -m vesuvius.neural_tracing.fiber_follow.regression.train 
   --out-root "$task_root/output" \
   --device cuda \
   --steps 100000 \
-  --batch 6 \
-  --grad-steps 2 \
+  --batch 4 \
+  --grad-steps 3 \
   --workers 10 \
   --worker-cache-gb 0.5 \
   --remote-prefetch-connections 48 \
@@ -44,9 +46,12 @@ exec "$task_python" -u -m vesuvius.neural_tracing.fiber_follow.regression.train 
   --history-encoder fine \
   --token-only \
   --no-direction-inputs \
-  --decoder-layers 4 \
-  --axial-layers 4 \
-  --hidden 128 \
+  --decoder-layers 6 \
+  --decoder-ffn 2048 \
+  --scorer-layers 4 \
+  --axial-layers 2 \
+  --encoder-ffn 256 \
+  --hidden 256 \
   --memory-switch-probability 0.3333333333333333 \
   --memory-switch-tail 16.0 96.0 \
   --no-activation-checkpointing \

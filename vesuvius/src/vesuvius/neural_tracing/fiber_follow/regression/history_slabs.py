@@ -20,6 +20,26 @@ SLOTS = 8
 SLAB = CropSpec(depth=8, width=65, behind=4, spacing=.5,
                 history_render='segments', history_sigma=1.)
 SAMPLING_REVISION = 'live_observed_slabs_ct_transverse_v3'
+PATH_SAMPLES = 3
+
+
+def slab_path_samples(item, slab):
+    """Sample the actual committed polyline near this observation, never GT."""
+    path = observed_path(item)
+    arc = arclength(path)
+    at = arc[-1]-slab['age']+np.array([-1., 0., 1.])
+    points = interp_at(path, arc, np.clip(at, 0., arc[-1]))
+    before = interp_at(path, arc, np.clip(at-.25, 0., arc[-1]))
+    after = interp_at(path, arc, np.clip(at+.25, 0., arc[-1]))
+    tangent = (after-before) @ slab['frame']
+    norm = np.linalg.norm(tangent, axis=-1, keepdims=True)
+    tangent = tangent/np.maximum(norm, 1e-8)
+    points = (points-slab['pos']) @ slab['frame']
+    lo = np.array([-16., -16., -2.])
+    hi = np.array([16., 16., 1.5])
+    valid = (at >= -1e-8) & (at <= arc[-1]+1e-8) & (norm[:, 0] > 1e-8)
+    valid &= ((points >= lo-1e-6) & (points <= hi+1e-6)).all(-1)
+    return points, tangent, valid
 
 
 
@@ -102,11 +122,19 @@ def load_slabs(items, vol, cfg, pool=None):
     # Translation (3), relative rotation (9), log age (1), seed role (1).
     pose = torch.zeros(len(items), SLOTS, 14)
     ages, overlap = torch.zeros(len(items), SLOTS), torch.zeros(len(items), SLOTS)
+    path_inputs = {}
+    if cfg.history_path_tokens:
+        path_inputs = dict(history_path_points=torch.zeros(len(items), SLOTS, PATH_SAMPLES, 3),
+                           history_path_tangents=torch.zeros(len(items), SLOTS, PATH_SAMPLES, 3),
+                           history_path_valid=torch.zeros(len(items), SLOTS, PATH_SAMPLES, dtype=torch.bool))
     frame_source = torch.full((len(items), SLOTS), -1, dtype=torch.int64)
     frame_energy, frame_gap = torch.zeros(len(items), SLOTS), torch.zeros(len(items), SLOTS)
     cursor = 0
     for row, (item, layout) in enumerate(zip(items, layouts)):
         for slot, slab in enumerate(layout):
+            if cfg.history_path_tokens:
+                for key, value in zip(path_inputs, slab_path_samples(item, slab)):
+                    path_inputs[key][row, slot] = torch.as_tensor(value)
             heat = render_history(torch.as_tensor(slab['hist_local'])[None].float(),
                                   torch.as_tensor(slab['hmask'])[None], grid, 1., 'segments')[0]
             output[row, slot] = torch.cat((images[cursor], heat), 0)
@@ -125,7 +153,8 @@ def load_slabs(items, vol, cfg, pool=None):
     elapsed = torch.full((len(items),), (time.perf_counter()-started)/max(1, len(items)))
     return dict(history_slabs=output, history_valid=valid, history_pose=pose,
                 history_ages=ages, history_overlap=overlap, history_load_seconds=elapsed,
-                history_frame_source=frame_source, history_frame_energy=frame_energy, history_frame_gap=frame_gap)
+                history_frame_source=frame_source, history_frame_energy=frame_energy, history_frame_gap=frame_gap,
+                **path_inputs)
 
 
 class SlabInstanceNorm(nn.InstanceNorm3d):
@@ -160,7 +189,9 @@ class HistoryEncoder(nn.Module):
             previous = channels
             shape = tuple(math.ceil(n/s) for n, s in zip(shape, stride))
         self.token_shape = shape
-        self.tokens_per_slab = math.prod(shape)
+        self.spatial_tokens_per_slab = math.prod(shape)
+        self.path_tokens = PATH_SAMPLES if cfg.history_path_tokens else 0
+        self.tokens_per_slab = self.spatial_tokens_per_slab+self.path_tokens
         self.convolution = nn.Sequential(*stages)
         self.projection = nn.Linear(previous, cfg.hidden)
         self.position = nn.Linear(3, cfg.hidden)
@@ -169,21 +200,50 @@ class HistoryEncoder(nn.Module):
         self.norm = nn.LayerNorm(cfg.hidden)
         z, y, x = torch.meshgrid(*(torch.arange(n) for n in shape), indexing='ij')
         xyz = torch.stack((x/(shape[2]-1), y/(shape[1]-1), z/(shape[0]-1)), -1)
-        self.register_buffer('xyz', xyz.reshape(self.tokens_per_slab, 3), persistent=False)
+        self.register_buffer('xyz', xyz.reshape(self.spatial_tokens_per_slab, 3), persistent=False)
+        if self.path_tokens:
+            # Center and four lateral neighbors, position and observed tangent.
+            self.path_projection = nn.Sequential(nn.Linear(5*previous+6, cfg.hidden), nn.SiLU(),
+                                                 nn.Linear(cfg.hidden, cfg.hidden))
+            nn.init.zeros_(self.path_projection[-1].weight)
+            nn.init.zeros_(self.path_projection[-1].bias)
+            self.register_buffer('path_stencil', torch.tensor([[0.,0.,0.],[-1.,0.,0.],
+                [1.,0.,0.],[0.,-1.,0.],[0.,1.,0.]]), persistent=False)
 
-    def forward(self, slabs, valid, pose):
+    def forward(self, slabs, valid, pose, *, path_points=None, path_tangents=None, path_valid=None):
         b, slots = valid.shape
         indices = valid.flatten().nonzero().flatten()
         selected = slabs.flatten(0, 1).index_select(0, indices)
         # SlabInstanceNorm supports empty batches: no dummy slab work.
-        features = self.convolution(selected).flatten(2).transpose(1, 2)
+        volume = self.convolution(selected)
+        features = volume.flatten(2).transpose(1, 2)
         projected = self.projection(features)
+        positions = self.position(self.xyz)[None].expand(len(indices), -1, -1)
+        token_valid = valid[:, :, None].expand(-1, -1, self.spatial_tokens_per_slab)
+        if self.path_tokens:
+            from .model import feature_grid
+            points = path_points.flatten(0, 1).index_select(0, indices)
+            tangents = path_tangents.flatten(0, 1).index_select(0, indices)
+            supported = path_valid.flatten(0, 1).index_select(0, indices)
+            points = torch.where(supported[..., None], points, 0.).float()
+            tangents = torch.where(supported[..., None], tangents, 0.).float()
+            grid = feature_grid(points[:, :, None]+self.path_stencil, SLAB, self.token_shape, stride=4)
+            # Border sampling only extends the feature lattice; path validity is
+            # separately checked against the physical CT crop by the loader.
+            local = F.grid_sample(volume.float(), grid[:, :, :, None], padding_mode='border',
+                                  align_corners=True).squeeze(-1).permute(0, 2, 3, 1).to(projected.dtype)
+            extra = self.projection(local[:, :, 0])+self.path_projection(torch.cat(
+                (local.flatten(2), (points/16.).to(local.dtype), tangents.to(local.dtype)), -1))
+            projected = torch.cat((projected, extra), 1)
+            xyz = (points+points.new_tensor([16.,16.,2.]))/points.new_tensor([32.,32.,3.5])
+            positions = torch.cat((positions, self.position(xyz)), 1)
+            token_valid = torch.cat((token_valid, valid[..., None] & path_valid), -1)
+        projected = projected+positions
         tokens = projected.new_zeros(b*slots, self.tokens_per_slab, projected.shape[-1])
         tokens = tokens.index_copy(0, indices, projected).reshape(b, slots, self.tokens_per_slab, -1)
         metadata = self.pose(torch.where(valid[..., None], pose, 0.))
-        tokens = self.norm(tokens+self.position(self.xyz)[None, None]
-                           +metadata[:, :, None]+self.slot.weight[None, :, None])
-        padding = (~valid[:, :, None]).expand(-1, -1, self.tokens_per_slab).reshape(b, -1)
+        tokens = self.norm(tokens+metadata[:, :, None]+self.slot.weight[None, :, None])
+        padding = (~token_valid).reshape(b, -1)
         tokens = tokens.flatten(1, 2).masked_fill(padding[..., None], 0.)
         return tokens, padding
 

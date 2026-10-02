@@ -27,9 +27,12 @@ class DirectConfig:
     fine: CropSpec = field(default_factory=lambda: CropSpec(depth=120, width=104, behind=48, spacing=.5))
     channels: int = 32
     hidden: int = 128
+    encoder_ffn: int = 1024
+    decoder_ffn: int = 1024
     heads: int = 4
     layers: int = 4
     decoder_layers: int = 4
+    scorer_layers: int = 2
     activation_checkpointing: bool = False
     n_future: int = 16
     future_step: float = 1.
@@ -42,8 +45,14 @@ class DirectConfig:
     stem_channels: int = 0
     stem_blocks: int = 2
     history_encoder: str = 'fine'
+    history_path_tokens: bool = False
 
     def __post_init__(self):
+        if type(self.history_path_tokens) is not bool or (self.history_path_tokens and self.history_encoder != 'fine'):
+            raise ValueError('Path tokens require the fine history encoder')
+        if any(type(value) is not int or value < 1 for value in
+               (self.encoder_ffn, self.decoder_ffn)):
+            raise ValueError('Feed-forward widths must be positive integers')
         if self.history_encoder not in ('fine', 'legacy'):
             raise ValueError('History encoder must be fine or legacy')
         if self.input_mode not in ('ct', 'ct+presence') or (self.input_mode == 'ct' and self.direction_inputs):
@@ -63,6 +72,8 @@ class DirectConfig:
             raise ValueError('Patch4 crop dimensions must be multiples of four')
         if min(c.depth, c.width) < 8 or not 0 <= c.behind < c.depth or not math.isfinite(c.spacing) or c.spacing <= 0:
             raise ValueError('Invalid fine crop')
+        if type(self.scorer_layers) is not int or self.scorer_layers < 1:
+            raise ValueError('Scorer layers must be a positive integer')
         if min(self.channels, self.hidden, self.heads, self.layers, self.decoder_layers,
                self.n_future, self.n_history) < 1 or self.hidden % self.heads:
             raise ValueError('Positive dimensions required; hidden must divide by heads')
@@ -97,6 +108,8 @@ class DirectConfig:
             architecture = TOKEN_ARCHITECTURE
         else:
             architecture = PATCH_ARCHITECTURE if self.encoder == 'patch4' else ARCHITECTURE
+        if self.history_path_tokens:
+            return architecture.replace('_v15', '_v16')
         return architecture.replace('_v15', '_v14') if self.history_encoder == 'legacy' else architecture
 
     @property
@@ -286,11 +299,11 @@ class PathDecoderLayer(nn.TransformerDecoderLayer):
 
 
 class AxialBlock(nn.Module):
-    def __init__(self, width, heads, *, local_convolution=True, rotary=False):
+    def __init__(self, width, heads, *, ffn=1024, local_convolution=True, rotary=False):
         super().__init__()
         self.axes = nn.ModuleList(AxisAttention(width,heads,a,rotary=rotary) for a in (3,2,1))
         self.norm = nn.LayerNorm(width)
-        self.mlp = nn.Sequential(nn.Linear(width,4*width),nn.GELU(),nn.Linear(4*width,width))
+        self.mlp = nn.Sequential(nn.Linear(width,ffn),nn.GELU(),nn.Linear(ffn,width))
         self.local = nn.Sequential(DepthwiseConv3d(width,width,3,padding=1,groups=width),
                                    nn.SiLU(),nn.Conv3d(width,width,1)) if local_convolution else None
 
@@ -322,7 +335,7 @@ class AxialEncoder(nn.Module):
         self.position = nn.Linear(3,h)
         # Observed path occupancy, mean age and seed occupancy. No annotation masks.
         self.condition = nn.Linear(3,h,bias=False)
-        self.blocks = nn.ModuleList(AxialBlock(h,cfg.heads) for _ in range(cfg.layers))
+        self.blocks = nn.ModuleList(AxialBlock(h,cfg.heads,ffn=cfg.encoder_ffn) for _ in range(cfg.layers))
         self.norm = nn.LayerNorm(h)
         self.dense_projection = nn.Conv3d(h,c,1)
         self.dense_decoder = nn.Sequential(nn.Conv3d(2*c,c,3,padding=1,bias=False),
@@ -433,7 +446,7 @@ class DirectFollower(nn.Module):
             self.encoder = AxialEncoder(cfg)
         self.reference_token = nn.Sequential(nn.Linear(c+8,h),nn.SiLU(),nn.Linear(h,h))
         self.query = nn.Sequential(nn.Linear((c if cfg.token_only else 9*c)+1,h),nn.SiLU(),nn.Linear(h,h))
-        layer = PathDecoderLayer(h,cfg.heads,2*h,dropout=0.,activation='gelu',batch_first=True,norm_first=True)
+        layer = PathDecoderLayer(h,cfg.heads,cfg.decoder_ffn,dropout=0.,activation='gelu',batch_first=True,norm_first=True)
         self.decoder = nn.TransformerDecoder(layer,cfg.decoder_layers,norm=nn.LayerNorm(h))
         self.coordinates = nn.Linear(h,2)
         nn.init.normal_(self.coordinates.weight,std=.005)
@@ -517,7 +530,8 @@ class DirectFollower(nn.Module):
         return torch.cat((local,deep,valid[...,None]),-1)
 
     def encode_history(self, x):
-        return self.history_encoder(x['history_slabs'], x['history_valid'], x['history_pose'])
+        extra = {key: x['history_'+key] for key in ('path_points', 'path_tangents', 'path_valid')} if self.cfg.history_path_tokens else {}
+        return self.history_encoder(x['history_slabs'], x['history_valid'], x['history_pose'], **extra)
 
     def context(self, x, hist, hmask):
         references, mask = self.references(x, hist, hmask)
