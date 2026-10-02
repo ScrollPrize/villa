@@ -108,19 +108,16 @@ When resuming, `--lr` may change the base learning rate while retaining AdamW
 moments, EMA, and the existing warmup/cosine schedule position. Omit
 `--reset-optimizer` to preserve that state; the active LR includes cosine decay.
 
-Training reserves `--clean-fraction` of examples for GT (default .8). With
-`--gt-perturb-probability 0` (the default), these samples use the annotation
-position and tangent and all available history: no offsets, heading noise,
-drift, wobble, jitter, history dropout or artificial shortening. Local history
-retains the usual point limit; older history remains available to the slabs.
-Noise, blur, contrast and brightness augmentation still apply to every source.
+Training reserves `--clean-fraction` of examples for GT (default .8). Each one is
+a simulated trace, built exactly like a tracer decision; see "Tracing-consistent
+samples" below. No GT sample is unperturbed. Noise, blur, contrast, brightness and
+roll augmentation apply to every source.
 
 The mixed stem launcher uses 70% GT, 10% identity pairs, 10% wrong turns
 and 10% model replay. Its options are:
 
 ```text
 --clean-fraction .7 --gt-perturb-probability .25
---gt-perturb-max-offset .5 --gt-perturb-max-angle-deg 2
 --decision-fraction .2 --fresh-fraction .75 --memory-switch-probability .3333333333333333
 --bank-following-probability 0 --replay-continuation-fraction .8 --prefer-real-wrong-turns
 --prefer-replay-for-light-gt --batch 10 --grad-steps 1
@@ -139,12 +136,14 @@ back to synthetic proposals, then GT. The separate 10% replay budget is unchange
 shares of all training; `bank_wrong_continuation_fraction` includes both real and
 synthetic wrong-turn slots for compatibility with existing logs.
 
-With `--prefer-replay-for-light-gt`, light-GT slots first try source-local correct
-continuation replay, retaining its actual seed and history without perturbation.
-Unavailable or rejected replay falls back to light GT. Thus the nominal 17.5%
-light-GT allocation becomes additional correct replay when available: 52.5%
-untouched GT, 25.5% correct replay, 2% failure replay, 10% identity and 10% wrong
-turns. `light_gt_replay_fraction` reports the replaced share separately.
+`--gt-perturb-probability` now only selects "light" GT slots. With
+`--prefer-replay-for-light-gt`, these slots first try source-local correct
+continuation replay (or live continuation), keeping its actual seed and history.
+Unavailable or rejected replay falls back to the same simulated trace as any GT
+slot. The nominal 17.5% light-slot allocation thus becomes extra correct replay
+when available: 52.5% simulated GT traces, 25.5% correct replay, 2% failure replay,
+10% identity and 10% wrong turns. `light_gt_replay_fraction` reports the replaced
+share separately.
 
 With `--live-continuation --live-continuation-steps 4 8`, correct-continuation
 slots (including light-GT replacement slots) instead use recent training
@@ -188,14 +187,6 @@ orphaned collectors identified by this run's checkpoint AND output paths, stops
 the owned process trees, and verifies no matching collectors remain before a
 restart proceeds. Other runs' collectors are excluded.
 
-Without available replay, only one quarter of gt samples receive light perturbation: 52.5% of all examples
-are untouched GT and 17.5% are lightly perturbed GT. Offset is uniform in a
-lateral disk of radius .5 tracing voxels; heading tilt is bounded by 2 degrees.
-The offset blends smoothly into only the last 32 voxels of history, preserving
-the original seed and older observations, including on shorter startup prefixes.
-Seed-only states remain untouched. There is no history dropout, shortening,
-independent point jitter or wobble. Future labels still come from the GT fiber.
-
 `--replay-continuation-fraction .8` reserves 80% of replay for correct committed
 prefixes and 20% for recorded failures (8% and 2% of total training). It overrides
 `--replay-failure-fraction`; without it, legacy replay sampling stays unchanged.
@@ -217,8 +208,69 @@ GT, while `gt_unperturbed_fraction`, `gt_perturbed_fraction` and
 `replay_correct_continuation_fraction` report separate shares of all training
 examples. These sampling settings can change on resume, including from older
 checkpoints; workers require a restart. Optimizer state and the frozen recovery
-fixture remain unchanged. Legacy heavy perturbation settings still apply only
-to legacy samplers and recovery construction.
+fixture remain unchanged. The legacy heavy perturbation settings (`lateral_sigmas`,
+`history_drift`, ...) apply only to the frozen recovery fixture (`drift_sample`).
+
+### Tracing-consistent samples
+
+Training simulates the tracer. Every decision state is built from an observed
+path by the tracer's own functions, whatever its source:
+
+- **Crop heading.** `trace_heading` is the trusted 12-voxel trailing fit. Paths
+  shorter than 12 voxels hold the seed heading. Inference, live chains, simulated
+  GT traces, wrong continuations and decision pairs all use it. Fresh GT no longer
+  uses the GT tangent at the head, a chord that reached 3 voxels of future GT
+  (median 8.5° and p90 21° from the tracer's heading).
+- **Seed heading.** `oriented_seed_heading` is the CT sheet axis for the fiber
+  family, signed along travel, as in `make_seeds`. Training resolves it when the
+  image is built (`resolve_trace_seed`), from the seed slab's prefetched CT. For a
+  path shorter than 12 voxels it is also the crop heading: local geometry is
+  re-expressed and labels recomputed, and an orientation-independent block is
+  prefetched for that crop.
+- **History.** `trace_history`, the inference unit-arclength history of the
+  observed path.
+
+`make_sample` draws a trace that began at an annotated seed. It is a seed-only
+first call with probability `--no-history-prob` (default .05), otherwise a
+1-8/9-32 voxel start with probability `--short-history-prob` (default .1),
+otherwise a start anywhere earlier on the fiber. The trace follows GT with smooth
+lateral error. That error is an Ornstein-Uhlenbeck process, zero at the seed,
+with a per-trace scale log-uniform in [0.175, 1.0] voxels per transverse axis and
+a 40-voxel correlation length. This was fit to on-track held-out 81k rollouts:
+lateral residual p50 0.47, p90 1.11, p99 2.09 voxels, correlation 0.46 at 32
+voxels. The head is therefore offset from GT, and labels are the GT continuation
+from that head.
+
+Decision pairs share a tail longer than the crop-visible history (crop behind
++4/16/28 voxels). Both rows keep identical local inputs while each carries its
+full traced history. The old 4-12 voxel tails masked history that tracing never
+masks.
+
+`IdentitySampling` rotates every training observation about its heading, after
+CT roll resolution. It applies a 180° flip with probability .5, which makes the
+tracer's roll-sign convention irrelevant, plus N(0, 5°) jitter clipped at ±15°.
+That covers CT roll-estimate noise; the measured model sensitivity was 1.3% gate
+flips at ±5°. Matched pair rows share the rotation. Live chains map proposals
+with the rotated frame the model saw.
+
+DAgger and live-chain labels use the evaluation's departure rule: 3 consecutive
+committed points beyond 3.0 voxels (`score_trace`), dated at the first. The old
+rule was a single point beyond 3.5.
+
+`tests/test_trace_sampling.py` checks each of these against the tracer's
+functions. `output/trace_sampling_20261002/audit_training_samples.py` audits the
+real loader on CPU. On the 81k run's sources, the crop heading's mismatch with the
+tracer's fit fell from median 5-10° (p99 22-49°) to 0° for GT, and from 7-20° to
+0° for pairs. GT head offsets moved from 0 to median 0.35 and p90 0.9-1.1 voxels.
+Loader time is +7-15% per batch.
+
+To fine-tune an existing run on these samples with a fresh optimizer:
+
+```bash
+../../../../.venv/bin/python -m vesuvius.neural_tracing.fiber_follow.regression.sampling_fork \
+  --checkpoint output/RUN/ckpt_NNNNNN.pt --name NEW_RUN --steps TOTAL_STEPS --warmup 2000
+bash output/NEW_RUN/launch_command.sh  # written from migration.json
+```
 
 To prepare a separate continuation with more refinement stages, use a completed
 training checkpoint as the source of all effective settings:

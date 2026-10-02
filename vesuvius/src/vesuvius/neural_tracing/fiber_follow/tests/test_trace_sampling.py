@@ -195,3 +195,32 @@ def test_decision_pairs_are_tracer_states_with_identical_local_inputs(tmp_path):
         visible = [visible_points(r['hist_local'], cfg.fine) & (r['hmask'] > 0) for r in rows]
         np.testing.assert_array_equal(visible[0], visible[1])
         np.testing.assert_allclose(rows[0]['hist_local'][visible[0]], rows[1]['hist_local'][visible[1]], atol=1e-9)
+
+
+def test_sampling_fork_preserves_weights_resets_optimizer_and_retires_light_gt_options(tmp_path):
+    import copy
+    import torch
+    from types import SimpleNamespace
+    from test_path_geometry import source_checkpoint
+    from vesuvius.neural_tracing.fiber_follow.regression.model import build_model
+    from vesuvius.neural_tracing.fiber_follow.regression.sampling_fork import RETIRED_OPTIONS, trace_sampling_checkpoint
+    from vesuvius.neural_tracing.fiber_follow.regression.train import checkpoint_config, initialize_training_optimizer
+    original = source_checkpoint(tmp_path)
+    original['training_options'].update(gt_perturb_max_offset=.5, gt_perturb_max_angle_deg=2.,
+                                        no_history_prob=.15, short_history_prob=.4)  # the 81k run's values
+    before = copy.deepcopy(original['training_options'])
+    changed = trace_sampling_checkpoint(original, steps=40000, warmup=2000, no_history_prob=.05, short_history_prob=.1)
+    assert original['training_options'] == before  # the source checkpoint is not modified
+    assert changed['lr_restart_step'] == changed['step'] == 22000 and changed['optimizer']['state'] == {}
+    for section in ('model', 'ema'):
+        for name, value in original[section].items():
+            torch.testing.assert_close(changed[section][name], value, rtol=0, atol=0)
+    new = build_model(checkpoint_config(changed))
+    new.load_state_dict(changed['model'], strict=True)
+    opt, done, origin = initialize_training_optimizer(new, copy.deepcopy(new), SimpleNamespace(lr=.0001, reset_optimizer=False), changed)
+    assert (done, origin) == (22000, 22000) and not opt.state
+    options = changed['training_options']
+    assert not set(RETIRED_OPTIONS) & set(options)
+    assert {k for k in options if options[k] != before[k]} == {'steps', 'warmup', 'no_history_prob', 'short_history_prob'}
+    with pytest.raises(ValueError, match='beyond its source step'):
+        trace_sampling_checkpoint(original, steps=22000, warmup=0, no_history_prob=0., short_history_prob=0.)
