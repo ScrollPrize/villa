@@ -880,6 +880,8 @@ class SurfaceMapper:
             )
         )
         transformed = apply_affine(source_points, self.affine)
+        # The affine result owns its coordinates; release the gathered input.
+        del source_points
         self.tree: Optional[cKDTree] = None
         self.grid_index: Optional[GridVertexIndex] = None
         self.index_guaranteed_distance = math.inf
@@ -1601,13 +1603,14 @@ def transfer_array(
         uv_rows, uv_cols, uv_valid = cached_uv
         mapping_progress(mapping_batches, mapping_batches)
     else:
-        uv_rows, uv_cols, _, uv_valid = mapper.build_target_uv_map(
+        uv_rows, uv_cols, mapped_distances, uv_valid = mapper.build_target_uv_map(
             target,
             max_distance=max_distance,
             query_batch_size=query_batch_size,
             progress=mapping_progress,
             workers=workers,
         )
+        del mapped_distances
         if uv_cache_path is not None:
             # Unique per writer: concurrent jobs sharing a cache path must
             # not clobber each other's partial file (os.replace stays the
@@ -1624,6 +1627,8 @@ def transfer_array(
                     meta=cache_meta,
                 )
             os.replace(temporary, uv_cache_path)
+    # Only this private mapper loses search state, after workers have joined.
+    del mapper.tree, mapper.grid_index, mapper.valid_flat
     progress_offset = mapping_batches
 
     filled_uv_rows: Optional[NDArray[np.float64]] = None
