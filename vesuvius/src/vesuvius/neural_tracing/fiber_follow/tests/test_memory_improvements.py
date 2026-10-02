@@ -2,7 +2,7 @@
 import torch
 
 from model_fixtures import aligned_config, aligned_batch
-from vesuvius.neural_tracing.fiber_follow.regression.history_slabs import HistoryEncoder
+from vesuvius.neural_tracing.fiber_follow.models.history_slabs import HistoryEncoder
 
 
 def test_history_tokens_keep_fine_stages_spatial_bank_path_tokens_and_padding():

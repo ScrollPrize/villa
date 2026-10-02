@@ -4,9 +4,9 @@ import copy
 import torch
 
 from model_fixtures import aligned_config, aligned_batch
-from vesuvius.neural_tracing.fiber_follow.regression.model import build_model
-from vesuvius.neural_tracing.fiber_follow.regression.train import prepare_training, training_prediction
-from vesuvius.neural_tracing.fiber_follow.regression.supervision import loss_terms
+from vesuvius.neural_tracing.fiber_follow.models.model import build_model
+from vesuvius.neural_tracing.fiber_follow.train.train import prepare_training, training_prediction
+from vesuvius.neural_tracing.fiber_follow.train.supervision import loss_terms
 
 # Inputs of zero-initialized output layers: no gradient until those layers move.
 ZERO_INIT_UPSTREAM = {'history_encoder.path_projection.0.weight', 'history_encoder.path_projection.0.bias',

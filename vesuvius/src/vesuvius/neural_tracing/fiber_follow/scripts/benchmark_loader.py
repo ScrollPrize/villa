@@ -14,16 +14,14 @@ import time
 import numpy as np
 import torch
 
-from vesuvius.neural_tracing.fiber_follow.shared.data import (
-    FollowDataset, SampleConfig, TaskBudget, ZBand, load_fibers, split_fibers, OnPolicyStates,
-)
+from vesuvius.neural_tracing.fiber_follow.data.data import FollowDataset, SampleConfig, TaskBudget, ZBand, load_fibers, split_fibers, OnPolicyStates
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
-from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolumeSpec
-from vesuvius.neural_tracing.fiber_follow.shared.training_options import normalize_batch_options
-from vesuvius.neural_tracing.fiber_follow.shared.runloop import raise_open_file_limit
-from vesuvius.neural_tracing.fiber_follow.regression.model import DirectConfig
-from vesuvius.neural_tracing.fiber_follow.regression.data import IdentityObservationBuilder, IdentitySampling
-from vesuvius.neural_tracing.fiber_follow.regression.neighbor_bank import NeighborBank
+from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolumeSpec
+from vesuvius.neural_tracing.fiber_follow.train.training_options import normalize_batch_options
+from vesuvius.neural_tracing.fiber_follow.train.runloop import raise_open_file_limit
+from vesuvius.neural_tracing.fiber_follow.models.model import DirectConfig
+from vesuvius.neural_tracing.fiber_follow.data.observations import IdentityObservationBuilder, IdentitySampling
+from vesuvius.neural_tracing.fiber_follow.data.neighbor_bank import NeighborBank
 
 
 def tensor_hashes(batch, prefix=''):

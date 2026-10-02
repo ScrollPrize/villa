@@ -18,12 +18,9 @@ import sys
 
 import numpy as np
 
-from vesuvius.neural_tracing.fiber_follow.shared.data import (
-    FALLBACKS, SEED_AGE_STRATA, SOURCE, STARTUP_CATEGORIES, TASKS, FollowDataset, OnPolicyStates, SampleConfig,
-    TaskBudget, seed_age_stratum, traversal_curve,
-)
+from vesuvius.neural_tracing.fiber_follow.data.data import FALLBACKS, SEED_AGE_STRATA, SOURCE, STARTUP_CATEGORIES, TASKS, FollowDataset, OnPolicyStates, SampleConfig, TaskBudget, seed_age_stratum, traversal_curve
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import tangent_at
-from vesuvius.neural_tracing.fiber_follow.shared.state_labels import REPLAY_CLASSES, SUPERVISION
+from vesuvius.neural_tracing.fiber_follow.data.state_labels import REPLAY_CLASSES, SUPERVISION
 
 CORRECT_REPLAY = ('dagger_pre_excursion', 'dagger_recoverable', 'dagger_premature_stop', 'dagger_ordinary')
 
@@ -78,14 +75,13 @@ def summarize(items, fibers):
 
 
 def main(argv=None):
-    from vesuvius.neural_tracing.fiber_follow.regression.data import IdentityObservationBuilder, IdentitySampling
-    from vesuvius.neural_tracing.fiber_follow.regression.datasets import (
-        AFVBank, HoldoutFilteredBank, load_primary_dataset, open_afv_source, read_dataset_config)
-    from vesuvius.neural_tracing.fiber_follow.regression.train import checkpoint_config
-    from vesuvius.neural_tracing.fiber_follow.shared.data import ZBand
-    from vesuvius.neural_tracing.fiber_follow.shared.runloop import read_checkpoint
-    from vesuvius.neural_tracing.fiber_follow.regression.train import ARCHITECTURES
-    from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolumeSpec
+    from vesuvius.neural_tracing.fiber_follow.data.observations import IdentityObservationBuilder, IdentitySampling
+    from vesuvius.neural_tracing.fiber_follow.data.datasets import AFVBank, HoldoutFilteredBank, load_primary_dataset, open_afv_source, read_dataset_config
+    from vesuvius.neural_tracing.fiber_follow.train.train import checkpoint_config
+    from vesuvius.neural_tracing.fiber_follow.data.data import ZBand
+    from vesuvius.neural_tracing.fiber_follow.train.runloop import read_checkpoint
+    from vesuvius.neural_tracing.fiber_follow.train.train import ARCHITECTURES
+    from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolumeSpec
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--checkpoint', required=True, help='Supplies the model crop/horizon and label tolerance')
     ap.add_argument('--dataset-config', default=str(Path(__file__).parents[1]/'configs'/'mixed_ct_datasets_paris50.json'))

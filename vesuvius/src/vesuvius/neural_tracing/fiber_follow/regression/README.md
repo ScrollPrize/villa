@@ -144,7 +144,7 @@ roll pending; their planned block already covers every roll about the heading.
 # 1. CPU tests (targeted files; see tests/test_alignment.py for the acceptance checks)
 PYTHONPATH=../../.. ../../../../.venv/bin/python -m pytest tests/test_alignment.py -q
 # 2. A bounded collection on the baseline, then the sampler check (nonzero correct replay)
-../../../../.venv/bin/python -m vesuvius.neural_tracing.fiber_follow.regression.collect \
+../../../../.venv/bin/python -m vesuvius.neural_tracing.fiber_follow.tracing.collect \
   --checkpoint output/mixed_ct_afv_stem32_run3_pathgeom_paris50/ckpt_081000.pt \
   --fibers /mnt/raid_nvme/spiral_dataset_working/fibers --dataset-name paris4 --out output/CHECK/paris4.npz
 ../../../../.venv/bin/python scripts/check_task_sampler.py --checkpoint CKPT --replay paris4=output/CHECK/paris4.npz \
@@ -161,12 +161,12 @@ options and optimizer are new, and source splits and CT normalization must match
 `regression/evaluate.py` is the single protocol on the shared threaded tracer:
 
 ```bash
-python -m vesuvius.neural_tracing.fiber_follow.regression.evaluate calibrate --checkpoint CK --out EVAL
-python -m vesuvius.neural_tracing.fiber_follow.regression.evaluate run --checkpoint CK \
+python -m vesuvius.neural_tracing.fiber_follow.evaluation.evaluate calibrate --checkpoint CK --out EVAL
+python -m vesuvius.neural_tracing.fiber_follow.evaluation.evaluate run --checkpoint CK \
   --policy EVAL/selection.json --splits final --max-len 2000 --out EVAL/final.json
-python -m vesuvius.neural_tracing.fiber_follow.regression.evaluate run --checkpoint CK --confidence .5 \
+python -m vesuvius.neural_tracing.fiber_follow.evaluation.evaluate run --checkpoint CK --confidence .5 \
   --splits monitor calibration final --out EVAL/all_c0.5.json
-python -m vesuvius.neural_tracing.fiber_follow.regression.evaluate compare BASE.json NEW.json
+python -m vesuvius.neural_tracing.fiber_follow.evaluation.evaluate compare BASE.json NEW.json
 ```
 
 Calibration uses calibration seeds only and selects coverage among thresholds with at
@@ -210,7 +210,7 @@ Supply `--family H` or `--family V` alongside inference seeds. One family applie
 to all seeds; repeat it once per seed for mixed families. Both signs are traced:
 
 ```bash
-../../../../.venv/bin/python -m vesuvius.neural_tracing.fiber_follow.regression.infer \
+../../../../.venv/bin/python -m vesuvius.neural_tracing.fiber_follow.tracing.infer \
   --checkpoint output/run/last.pt --seed 18529.9,13044.9,51234.1 --family H --out output/traced
 ```
 
@@ -653,11 +653,11 @@ Separate negative and continuation banks remain supported.
 OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 ../../../../.venv/bin/python -m pytest tests -q \
   -o cache_dir=/tmp/fiber-slab-pytest
 
-../../../../.venv/bin/python -m vesuvius.neural_tracing.fiber_follow.regression.benchmark_slabs \
+../../../../.venv/bin/python -m vesuvius.neural_tracing.fiber_follow.evaluation.benchmark_slabs \
   --warmup 2 --repeats 10 --decisions 6 --out /tmp/slab-benchmark.json
 
 # Match the launcher's batch, including batched attention:
-../../../../.venv/bin/python -m vesuvius.neural_tracing.fiber_follow.regression.benchmark_slabs \
+../../../../.venv/bin/python -m vesuvius.neural_tracing.fiber_follow.evaluation.benchmark_slabs \
   --warmup 3 --repeats 10 --decisions 16 --microbatch 16 --out /tmp/slab-benchmark-b16.json
 ```
 

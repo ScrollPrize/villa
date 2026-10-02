@@ -1,8 +1,8 @@
 """Small replay caches in the sole schema; tests state only the fields they exercise."""
 import numpy as np
 
-from vesuvius.neural_tracing.fiber_follow.shared.data import OnPolicyStates, fiber_manifest
-from vesuvius.neural_tracing.fiber_follow.shared.state_labels import FOLLOWING, REASON, REPLAY_CLASS
+from vesuvius.neural_tracing.fiber_follow.data.data import OnPolicyStates, fiber_manifest
+from vesuvius.neural_tracing.fiber_follow.data.state_labels import FOLLOWING, REASON, REPLAY_CLASS
 
 
 def default_row(n_history, n_future=4):

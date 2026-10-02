@@ -8,13 +8,13 @@ import torch
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import (
     CropSpec, normalize,
 )
-from vesuvius.neural_tracing.fiber_follow.shared.trace import ModelTracer, TraceParams
+from vesuvius.neural_tracing.fiber_follow.tracing.trace import ModelTracer, TraceParams
 
 
 @pytest.fixture(autouse=True)
 def ct_sheet(monkeypatch):
     # Isolate commit policy from image I/O using an exact, constant sheet normal.
-    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.ct_tensor',
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.tracing.heading.ct_tensor',
                         lambda vol,pos: np.outer(np.array([0., -1., 0.]), np.array([0., -1., 0.])))
 
 
@@ -45,7 +45,7 @@ class RecordingTracer(ModelTracer):
 def test_rejected_decision_stops_immediately_and_is_observed_without_a_forced_commit(monkeypatch):
     calls = []
     sheet = np.outer(np.array([0., -1., 0.]), np.array([0., -1., 0.]))
-    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.ct_tensor',
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.tracing.heading.ct_tensor',
                         lambda vol, pos: calls.append(1) or sheet)
     predictions = [
         ([[0., 0., 1.], [1., 0., 2.]], [.9, .9]),
@@ -106,7 +106,7 @@ def test_one_point_commits_accumulate_a_twelve_voxel_heading_baseline(monkeypatc
         calls.append(1)
         n = np.array([np.cos(.2*(len(calls)-1)), np.sin(.2*(len(calls)-1)), 0.])
         return np.outer(n, n)
-    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.ct_tensor', changing_normal)
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.tracing.heading.ct_tensor', changing_normal)
     rows = record([([[0., 0., 1.], [0., 0., 2.]], [.9, .1])]*3)
     assert len(calls) == 3
     for row in rows:

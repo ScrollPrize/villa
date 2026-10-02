@@ -6,10 +6,10 @@ import numpy as np
 import torch
 
 from model_fixtures import array_at
-from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume, FiberVolumeSpec
+from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolume, FiberVolumeSpec
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, frame_from_heading
-from vesuvius.neural_tracing.fiber_follow.regression.model import DirectConfig
-from vesuvius.neural_tracing.fiber_follow.regression.data import image_crop, ObservationBuilder
+from vesuvius.neural_tracing.fiber_follow.models.model import DirectConfig
+from vesuvius.neural_tracing.fiber_follow.data.observations import image_crop, ObservationBuilder
 
 
 def volume(root):
@@ -73,7 +73,7 @@ def test_worker_images_keep_shared_storage_and_identical_values(tmp_path):
 
 
 def test_scalar_crop_reuse_preserves_coordinate_dtype_rounding(tmp_path):
-    from vesuvius.neural_tracing.fiber_follow.shared.crop_sampling import scalar_crops
+    from vesuvius.neural_tracing.fiber_follow.data.crop_sampling import scalar_crops
     vol = volume(tmp_path)
     vol.input_scale = 3.
     crop = CropSpec(depth=3, width=3, behind=1, spacing=.5)

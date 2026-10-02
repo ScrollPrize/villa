@@ -6,12 +6,12 @@ import pytest
 import torch
 
 from model_fixtures import aligned_batch, aligned_config, proposal_output
-from vesuvius.neural_tracing.fiber_follow.regression.model import build_model, select_refinement
-from vesuvius.neural_tracing.fiber_follow.regression.supervision import loss_terms
-from vesuvius.neural_tracing.fiber_follow.regression.diagnostics import decision_rows
-from vesuvius.neural_tracing.fiber_follow.regression.data import DirectTracer
-from vesuvius.neural_tracing.fiber_follow.shared.policy import commit_prefix
-from vesuvius.neural_tracing.fiber_follow.shared.trace import TraceParams
+from vesuvius.neural_tracing.fiber_follow.models.model import build_model, select_refinement
+from vesuvius.neural_tracing.fiber_follow.train.supervision import loss_terms
+from vesuvius.neural_tracing.fiber_follow.evaluation.diagnostics import decision_rows
+from vesuvius.neural_tracing.fiber_follow.data.observations import DirectTracer
+from vesuvius.neural_tracing.fiber_follow.tracing.policy import commit_prefix
+from vesuvius.neural_tracing.fiber_follow.tracing.trace import TraceParams
 
 
 def policy_output():
@@ -128,7 +128,7 @@ def test_tracer_passes_operating_threshold_into_adaptive_model(monkeypatch):
     from test_history_slabs import fake_ct
     fake_ct(monkeypatch)
     model = build_model(aligned_config(recurrent_refinement_steps=2)).eval()
-    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.regression.data.image_crop',
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.data.observations.image_crop',
         lambda items, vol, crop, pool=None, **kw: torch.ones(len(items), 1, crop.depth, crop.width, crop.width)*.25)
     thresholds = []
     original = model.forward
@@ -146,12 +146,12 @@ def test_tracer_passes_operating_threshold_into_adaptive_model(monkeypatch):
 
 
 def test_recovery_evaluator_reruns_policy_per_threshold_on_float_inputs_and_observed_states(monkeypatch):
-    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.ct_tensor',
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.tracing.heading.ct_tensor',
                         lambda vol, pos: np.outer(np.array([1., 0., 0.]), np.array([1., 0., 0.])))
-    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.oriented_seed_heading',
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.tracing.heading.oriented_seed_heading',
                         lambda vol, pos, family, direction: np.asarray(direction))
-    from vesuvius.neural_tracing.fiber_follow.shared.data import TracedFiber, SampleConfig
-    from vesuvius.neural_tracing.fiber_follow.shared.recovery import make_recovery_states, evaluate_recovery_states
+    from vesuvius.neural_tracing.fiber_follow.data.data import TracedFiber, SampleConfig
+    from vesuvius.neural_tracing.fiber_follow.evaluation.recovery_fixtures import make_recovery_states, evaluate_recovery_states
     c = aligned_config()
     model = build_model(c)
     sample = SampleConfig(crop=c.fine, n_history=c.n_history, recent_history_points=c.n_history, n_future=c.n_future)

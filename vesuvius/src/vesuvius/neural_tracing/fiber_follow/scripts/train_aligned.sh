@@ -11,7 +11,7 @@ task_python="${FIBER_PYTHON:-$task_root/../../../../.venv/bin/python}"
 task_run="${ALIGNED_RUN_NAME:-mixed_ct_afv_stem32_aligned_run1}"
 source_checkpoint="${ALIGNED_INIT:-$task_root/output/mixed_ct_afv_stem32_run3_pathgeom_paris50/ckpt_081000.pt}"
 cd "$task_root"
-exec "$task_python" -u -m vesuvius.neural_tracing.fiber_follow.regression.train \
+exec "$task_python" -u -m vesuvius.neural_tracing.fiber_follow.train.train \
   --name "$task_run" --init-weights "$source_checkpoint" \
   --dataset-config "$task_root/configs/mixed_ct_datasets_paris50.json" \
   --input-mode ct --no-direction-inputs --presence-dropout 0 \

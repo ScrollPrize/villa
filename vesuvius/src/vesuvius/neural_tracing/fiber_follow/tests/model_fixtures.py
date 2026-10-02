@@ -11,8 +11,8 @@ from dataclasses import replace
 import numpy as np
 import torch
 
-from vesuvius.neural_tracing.fiber_follow.regression.model import DirectConfig
-from vesuvius.neural_tracing.fiber_follow.shared.data import TracedFiber
+from vesuvius.neural_tracing.fiber_follow.models.model import DirectConfig
+from vesuvius.neural_tracing.fiber_follow.data.data import TracedFiber
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
 from label_fixtures import state_labels
 
@@ -77,7 +77,7 @@ def path_batch(c, count=2):
 
 
 def geometry_batch(c, count=2, length=100.):
-    from vesuvius.neural_tracing.fiber_follow.regression.path_geometry import path_geometry_inputs
+    from vesuvius.neural_tracing.fiber_follow.models.path_geometry import path_geometry_inputs
     from test_history_slabs import observation
     out = path_batch(c, count)
     path = np.c_[np.zeros(int(length)+1), np.zeros(int(length)+1), np.arange(int(length)+1.)]
@@ -99,7 +99,7 @@ def forward(m, b):
 
 def proposal_output(curves, hazards, selected=-1):
     """Build the current all-proposal output contract for loss/policy fixtures."""
-    from vesuvius.neural_tracing.fiber_follow.regression.survival_confidence import survival_predictions
+    from vesuvius.neural_tracing.fiber_follow.models.survival_confidence import survival_predictions
     logits, confidence = survival_predictions(hazards)
     return dict(points=curves[:, selected], initial_points=curves[:, 0],
                 hazard_logits=hazards[:, selected], confidence_logits=logits[:, selected],

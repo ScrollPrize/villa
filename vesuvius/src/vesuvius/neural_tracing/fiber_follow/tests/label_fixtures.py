@@ -1,7 +1,7 @@
 """State-contract fields for hand-built batches."""
 import torch
 
-from vesuvius.neural_tracing.fiber_follow.shared.state_labels import FOLLOWING, REASON, TERMINAL, UNKNOWN
+from vesuvius.neural_tracing.fiber_follow.data.state_labels import FOLLOWING, REASON, TERMINAL, UNKNOWN
 
 
 def state_labels(b):

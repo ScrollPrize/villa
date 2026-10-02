@@ -3,11 +3,11 @@ import numpy as np
 import pytest
 
 from test_neighbor_bank import make_bank, add_shard, publish
-from vesuvius.neural_tracing.fiber_follow.regression.data import IdentityObservationBuilder, IdentitySampling
-from vesuvius.neural_tracing.fiber_follow.regression.model import DirectConfig
-from vesuvius.neural_tracing.fiber_follow.regression.neighbor_continuations import wrong_continuation
-from vesuvius.neural_tracing.fiber_follow.shared.data import SOURCE, SampleConfig
-from vesuvius.neural_tracing.fiber_follow.shared.state_labels import REASON, TERMINAL
+from vesuvius.neural_tracing.fiber_follow.data.observations import IdentityObservationBuilder, IdentitySampling
+from vesuvius.neural_tracing.fiber_follow.models.model import DirectConfig
+from vesuvius.neural_tracing.fiber_follow.data.neighbor_continuations import wrong_continuation
+from vesuvius.neural_tracing.fiber_follow.data.data import SOURCE, SampleConfig
+from vesuvius.neural_tracing.fiber_follow.data.state_labels import REASON, TERMINAL
 
 
 def configuration():
@@ -45,7 +45,7 @@ def test_synthetic_terminal_discovers_paths_published_after_empty_lookup(tmp_pat
 
 
 def test_repeated_prefix_start_has_a_nonzero_observed_seed_heading(tmp_path,monkeypatch):
-    from vesuvius.neural_tracing.fiber_follow.regression import neighbor_continuations as module
+    from vesuvius.neural_tracing.fiber_follow.data import neighbor_continuations as module
     bank,_=make_bank(tmp_path,with_path=True)
     _,sample=configuration()
     sample.trace_noise_sigma = (0., 0.)

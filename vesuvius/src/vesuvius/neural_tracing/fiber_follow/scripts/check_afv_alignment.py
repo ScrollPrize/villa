@@ -13,11 +13,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 from scipy.ndimage import map_coordinates
 
-from vesuvius.neural_tracing.fiber_follow.regression.datasets import read_dataset_config
-from vesuvius.neural_tracing.fiber_follow.shared.afv import AFVFibers
+from vesuvius.neural_tracing.fiber_follow.data.datasets import read_dataset_config
+from vesuvius.neural_tracing.fiber_follow.data.afv import AFVFibers
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import interp_at
-from vesuvius.neural_tracing.fiber_follow.shared.remote_prefetch import RemotePrefetcher
-from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolumeSpec,RemoteChunkedArray
+from vesuvius.neural_tracing.fiber_follow.data.remote_prefetch import RemotePrefetcher
+from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolumeSpec, RemoteChunkedArray
 
 
 def main():

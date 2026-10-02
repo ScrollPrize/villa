@@ -11,13 +11,13 @@ import torch
 
 from model_fixtures import aligned_batch, aligned_config, config
 from model_fixtures import array_at
-from vesuvius.neural_tracing.fiber_follow.shared.afv import AFVFibers
-from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume, FiberVolumeSpec, RemoteChunkedArray
-from vesuvius.neural_tracing.fiber_follow.shared.data import make_sample, SampleConfig
-from vesuvius.neural_tracing.fiber_follow.regression.datasets import AFVBank, WeightedDatasets, read_dataset_config
-from vesuvius.neural_tracing.fiber_follow.regression.data import image_crop, IdentityObservationBuilder, IdentitySampling
-from vesuvius.neural_tracing.fiber_follow.regression.model import build_model, DirectConfig
-from vesuvius.neural_tracing.fiber_follow.regression.supervision import loss_terms
+from vesuvius.neural_tracing.fiber_follow.data.afv import AFVFibers
+from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolume, FiberVolumeSpec, RemoteChunkedArray
+from vesuvius.neural_tracing.fiber_follow.data.data import make_sample, SampleConfig
+from vesuvius.neural_tracing.fiber_follow.data.datasets import AFVBank, WeightedDatasets, read_dataset_config
+from vesuvius.neural_tracing.fiber_follow.data.observations import image_crop, IdentityObservationBuilder, IdentitySampling
+from vesuvius.neural_tracing.fiber_follow.models.model import build_model, DirectConfig
+from vesuvius.neural_tracing.fiber_follow.train.supervision import loss_terms
 
 
 def afv_fixture(path, length=80., neighbor_x=40., offset=0.):
@@ -137,7 +137,7 @@ def test_real_config_has_requested_sources_and_stable_paths():
 
 def test_resume_allows_cache_relocation_but_not_dataset_changes():
     from copy import deepcopy
-    from vesuvius.neural_tracing.fiber_follow.regression.datasets import validate_dataset_resume
+    from vesuvius.neural_tracing.fiber_follow.data.datasets import validate_dataset_resume
     p=Path(__file__).resolve().parents[1]/'configs/mixed_ct_datasets_paris50.json'
     document,digest=read_dataset_config(p)
     old=deepcopy(document);old['cache_dir']='/old/cache'
@@ -189,7 +189,7 @@ def test_remote_array_chunk_edges_and_pickle(tmp_path,monkeypatch,separator):
 
 
 def test_whole_fiber_holdout_excludes_neighbor_queries_and_manifest(tmp_path):
-    from vesuvius.neural_tracing.fiber_follow.shared.data import fiber_manifest
+    from vesuvius.neural_tracing.fiber_follow.data.data import fiber_manifest
     p=tmp_path/'test.afv';afv_fixture(p)
     validation=dict(strategy='fiber_hash',fraction=.34,seed=19)
     tr=AFVFibers(p,validation=validation);va=AFVFibers(p,validation=validation,split='validation')
@@ -202,7 +202,7 @@ def test_whole_fiber_holdout_excludes_neighbor_queries_and_manifest(tmp_path):
 
 
 def test_fixed_count_holdout_is_exact_stable_and_rejects_invalid_sizes():
-    from vesuvius.neural_tracing.fiber_follow.shared.dataset_split import heldout_ids
+    from vesuvius.neural_tracing.fiber_follow.data.dataset_split import heldout_ids
     policy=dict(strategy='fiber_hash',count=406,seed=7349)
     ids=list(range(2000))
     reserved=heldout_ids(ids,policy)
@@ -216,8 +216,8 @@ def test_fixed_count_holdout_is_exact_stable_and_rejects_invalid_sizes():
 
 
 def test_afv_supports_certified_synthetic_failures_and_switch_detection(tmp_path):
-    from vesuvius.neural_tracing.fiber_follow.regression.neighbor_continuations import wrong_continuation
-    from vesuvius.neural_tracing.fiber_follow.shared.state_labels import TERMINAL
+    from vesuvius.neural_tracing.fiber_follow.data.neighbor_continuations import wrong_continuation
+    from vesuvius.neural_tracing.fiber_follow.data.state_labels import TERMINAL
     from sampling_fixtures import clean_sample
     p=tmp_path/'test.afv';afv_fixture(p,length=800,neighbor_x=36)
     fibers=AFVFibers(p);bank=AFVBank(fibers)
@@ -230,12 +230,12 @@ def test_afv_supports_certified_synthetic_failures_and_switch_detection(tmp_path
         pytest.fail('Could not construct synthetic AFV task')
     switch=find(lambda:wrong_continuation(bank,sample,rng,tail_length_range=(16.,32.),prefix_length=128))
     assert switch['supervision']==TERMINAL and switch['terminal'] and not switch['geometry_valid']
-    from vesuvius.neural_tracing.fiber_follow.regression.bank_geometry import BankSwitchDetector
+    from vesuvius.neural_tracing.fiber_follow.data.bank_geometry import BankSwitchDetector
     assert BankSwitchDetector([bank]).first_contact(0,40.,np.array([[32.,32.,40.],[36.,32.,44.]])) is not None
 
 
 def test_replay_scheduler_cycles_all_sources_without_parallel_collectors():
-    from vesuvius.neural_tracing.fiber_follow.shared.online import MultiSourceCollector
+    from vesuvius.neural_tracing.fiber_follow.train.online import MultiSourceCollector
     class Collector:
         def __init__(self):self.calls=[];self.busy_skips=0
         def due(self,step):return step%10==0
@@ -254,9 +254,9 @@ def test_replay_scheduler_cycles_all_sources_without_parallel_collectors():
 
 def test_real_collector_roundtrip_on_afv_with_ct_only_inputs(tmp_path):
     import hashlib
-    from vesuvius.neural_tracing.fiber_follow.regression.collect import main as collect
-    from vesuvius.neural_tracing.fiber_follow.regression.train import save_checkpoint
-    from vesuvius.neural_tracing.fiber_follow.shared.data import OnPolicyStates
+    from vesuvius.neural_tracing.fiber_follow.tracing.collect import main as collect
+    from vesuvius.neural_tracing.fiber_follow.train.train import save_checkpoint
+    from vesuvius.neural_tracing.fiber_follow.data.data import OnPolicyStates
     # Leave room for the 65-voxel CT context throughout this short trace, even
     # when the randomly initialized model makes a small lateral correction.
     p=tmp_path/'test.afv';afv_fixture(p, offset=16.)
@@ -276,7 +276,7 @@ def test_real_collector_roundtrip_on_afv_with_ct_only_inputs(tmp_path):
     sample=SampleConfig(crop=cfg.fine,n_history=cfg.n_history,n_future=cfg.n_future)
     ck=tmp_path/'ck.pt';out=tmp_path/'replay.npz'
     from test_ct_normalization import record
-    from vesuvius.neural_tracing.fiber_follow.shared.ct_normalization import METHOD, volume_key
+    from vesuvius.neural_tracing.fiber_follow.data.ct_normalization import METHOD, volume_key
     spec.ct_normalization = record(spec)
     normalization = dict(method=METHOD, volumes={volume_key(spec): spec.ct_normalization})
     save_checkpoint(ck,model,model,spec,sample,dict(step=1,dataset_config=document, ct_normalization=normalization))

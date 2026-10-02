@@ -7,12 +7,12 @@ import numpy as np
 import pytest
 
 from vc3d_fiber_format import legacy_lasagna_segments
-from vesuvius.neural_tracing.fiber_follow.shared import data as D
-from vesuvius.neural_tracing.fiber_follow.shared.collect import DecisionCollector
+from vesuvius.neural_tracing.fiber_follow.data import data as D
+from vesuvius.neural_tracing.fiber_follow.tracing.collection import DecisionCollector
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, arclength, frame_from_heading
-from vesuvius.neural_tracing.fiber_follow.shared.online import OnlineCollector
-from vesuvius.neural_tracing.fiber_follow.shared.trace import TraceParams
-from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolumeSpec
+from vesuvius.neural_tracing.fiber_follow.train.online import OnlineCollector
+from vesuvius.neural_tracing.fiber_follow.tracing.trace import TraceParams
+from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolumeSpec
 
 
 def fiber(length=100, z=0, endpoints=(False, False)):
@@ -221,7 +221,7 @@ def test_onpolicy_identity_and_mmap_roundtrip(tmp_path):
 
 
 def test_collector_censors_unknown_boundary_and_keeps_the_stop_decision():
-    from vesuvius.neural_tracing.fiber_follow.shared.state_labels import FOLLOWING, REASON, REPLAY_CLASS, TERMINAL
+    from vesuvius.neural_tracing.fiber_follow.data.state_labels import FOLLOWING, REASON, REPLAY_CLASS, TERMINAL
     c = DecisionCollector(fiber(), 0, 50, 1, sample_config(), stride=16)
     assert c(decision_at(50, 0))
     assert c(decision_at(58, 8, [50., 0, 0], would_stop=True))
@@ -244,7 +244,7 @@ def test_collector_censors_unknown_boundary_and_keeps_the_stop_decision():
 def test_departure_is_the_evaluation_rule_and_a_return_restores_supervision():
     # Three consecutive committed points beyond 3 voxels (score_trace tolerance and
     # patience), dated at the run's first point, including runs spanning commits.
-    from vesuvius.neural_tracing.fiber_follow.shared.state_labels import FOLLOWING, RECOVERABLE, REPLAY_CLASS
+    from vesuvius.neural_tracing.fiber_follow.data.state_labels import FOLLOWING, RECOVERABLE, REPLAY_CLASS
     c = DecisionCollector(fiber(length=300), 0, 50, 1, sample_config(), stride=16)
     assert c(decision_at(50, 0))
     # Isolated off-track points are not departures.
@@ -279,7 +279,7 @@ def test_departure_is_the_evaluation_rule_and_a_return_restores_supervision():
 
 def test_correspondence_progress_is_bounded_in_both_directions():
     """A head far from the fiber cannot jump along it: the window bounds each update."""
-    from vesuvius.neural_tracing.fiber_follow.shared.state_labels import MATCH_AHEAD, MATCH_BEHIND, TERMINAL
+    from vesuvius.neural_tracing.fiber_follow.data.state_labels import MATCH_AHEAD, MATCH_BEHIND, TERMINAL
     c = DecisionCollector(fiber(length=300), 0, 50, 1, sample_config(), stride=16)
     assert c(decision_at(50, 0))
     # Travel 10 voxels but appear 200 voxels ahead and far off: progress grows by at most 10+32.
@@ -310,7 +310,7 @@ def test_collector_stops_on_holdout_and_preserves_original_frame():
 
 
 def test_online_collection_does_not_wait_and_publishes_only_complete_caches(tmp_path, monkeypatch):
-    import vesuvius.neural_tracing.fiber_follow.shared.online as online
+    import vesuvius.neural_tracing.fiber_follow.train.online as online
     class Process:
         returncode = None
         def poll(self): return self.returncode
@@ -335,7 +335,7 @@ def test_online_collection_does_not_wait_and_publishes_only_complete_caches(tmp_
     assert '--checkpoint' in commands[0] and '--explore-calls' not in commands[0]
     assert commands[0][commands[0].index('--fibers-per-collection')+1] == '64'
     # Collection takes the checkpoint's operating policy (default confidence shared with rollout), no exploration.
-    from vesuvius.neural_tracing.fiber_follow.shared.trace import DEFAULT_CONFIDENCE
+    from vesuvius.neural_tracing.fiber_follow.tracing.trace import DEFAULT_CONFIDENCE
     assert TraceParams().confidence == DEFAULT_CONFIDENCE == .5
     assert manager.confidence is None and manager.settings()['exploration'] == 'none'
     manager.close()

@@ -78,7 +78,7 @@ def main():
     ap.add_argument('--device', default='cpu')
     ap.add_argument('--out', help='optional JSON report path')
     args = ap.parse_args()
-    from vesuvius.neural_tracing.fiber_follow.shared.runloop import raise_open_file_limit
+    from vesuvius.neural_tracing.fiber_follow.train.runloop import raise_open_file_limit
     raise_open_file_limit()  # memory-mapped CT chunks
     config = read_config(args.config)
     model, checkpoint = load_heading_model(args.checkpoint, args.device)

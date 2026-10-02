@@ -6,10 +6,10 @@ import numpy as np
 import torch
 
 from model_fixtures import aligned_config, batch, proposal_output
-from vesuvius.neural_tracing.fiber_follow.regression.supervision import point_correctness, loss_terms
-from vesuvius.neural_tracing.fiber_follow.shared.training_log import DirectTrainingInterval, format_training_log
-from vesuvius.neural_tracing.fiber_follow.shared.diag import plot_curves
-from vesuvius.neural_tracing.fiber_follow.shared.runloop import RunLog
+from vesuvius.neural_tracing.fiber_follow.train.supervision import point_correctness, loss_terms
+from vesuvius.neural_tracing.fiber_follow.train.training_log import DirectTrainingInterval, format_training_log
+from vesuvius.neural_tracing.fiber_follow.evaluation.diag import plot_curves
+from vesuvius.neural_tracing.fiber_follow.train.runloop import RunLog
 from label_fixtures import set_terminal, set_unknown
 
 

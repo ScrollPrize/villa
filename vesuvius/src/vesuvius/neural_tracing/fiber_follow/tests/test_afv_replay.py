@@ -8,9 +8,9 @@ import pytest
 
 from test_data_and_scoring import make_states, sample_config
 from test_mixed_datasets import afv_fixture
-from vesuvius.neural_tracing.fiber_follow.shared.afv import AFVFibers
-from vesuvius.neural_tracing.fiber_follow.shared.data import FollowDataset, fiber_manifest
-from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolumeSpec
+from vesuvius.neural_tracing.fiber_follow.data.afv import AFVFibers
+from vesuvius.neural_tracing.fiber_follow.data.data import FollowDataset, fiber_manifest
+from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolumeSpec
 
 
 @pytest.fixture

@@ -8,20 +8,15 @@ import numpy as np
 import pytest
 import torch
 
-from vesuvius.neural_tracing.fiber_follow.regression.live_continuation import LiveContinuation, LiveContinuationSource
-from vesuvius.neural_tracing.fiber_follow.regression.train import move_batch
-from vesuvius.neural_tracing.fiber_follow.shared.data import (
-    SOURCE, STARTUP_CATEGORIES, TASK, FollowDataset, SampleConfig, TaskBudget, TracedFiber, ZBand, collate_targets,
-    make_sample,
-)
+from vesuvius.neural_tracing.fiber_follow.train.live_continuation import LiveContinuation, LiveContinuationSource
+from vesuvius.neural_tracing.fiber_follow.train.train import move_batch
+from vesuvius.neural_tracing.fiber_follow.data.data import SOURCE, STARTUP_CATEGORIES, TASK, FollowDataset, SampleConfig, TaskBudget, TracedFiber, ZBand, collate_targets, make_sample
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, arclength
-from vesuvius.neural_tracing.fiber_follow.shared.heading import orient_item
-from vesuvius.neural_tracing.fiber_follow.shared.policy import OperatingPolicy
-from vesuvius.neural_tracing.fiber_follow.shared.state_labels import (
-    FOLLOWING, REASON, RECOVERABLE, REPLAY_CLASS, TERMINAL,
-)
-from vesuvius.neural_tracing.fiber_follow.shared.trace import ModelTracer, TraceParams
-from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolumeSpec
+from vesuvius.neural_tracing.fiber_follow.tracing.heading import orient_item
+from vesuvius.neural_tracing.fiber_follow.tracing.policy import OperatingPolicy
+from vesuvius.neural_tracing.fiber_follow.data.state_labels import FOLLOWING, REASON, RECOVERABLE, REPLAY_CLASS, TERMINAL
+from vesuvius.neural_tracing.fiber_follow.tracing.trace import ModelTracer, TraceParams
+from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolumeSpec
 
 POLICY = OperatingPolicy(n_commit=16)
 
@@ -38,10 +33,10 @@ class Values:
 
 @pytest.fixture
 def setup(monkeypatch):
-    import vesuvius.neural_tracing.fiber_follow.regression.live_continuation as module
+    import vesuvius.neural_tracing.fiber_follow.train.live_continuation as module
     # Deterministic in-process queues for numeric tests; real IPC is tested below.
     monkeypatch.setattr(module.mp, 'get_context', lambda: SimpleNamespace(Queue=Queue, Value=Values))
-    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.ct_tensor',
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.tracing.heading.ct_tensor',
                         lambda vol, pos: np.diag([3., 1., .1]))
     z = np.arange(500.)
     p = np.c_[100.+.4*np.sin(z/20), np.full(len(z), 100.), z+100.]
@@ -198,7 +193,7 @@ def test_holdout_rejected_before_ct_read(setup, monkeypatch):
     live, ds, vol, rng, item = setup
     state = proposal(live, item)
     ds.exclude = ZBand(210., 230.)
-    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.regression.live_continuation.ct_frame',
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.train.live_continuation.ct_frame',
                         lambda *a, **kw: pytest.fail('Held-out CT must not be read'))
     assert live.advance(state, ds, vol, rng) is None
 
@@ -264,7 +259,7 @@ def test_metadata_excludes_replay_slots_synthetic_and_terminal_rows(setup):
     cpu = dict(x={'a': torch.ones(1)}, _live_states=[live.metadata(item)])
     assert set(move_batch(cpu, 'cpu')) == {'x'}
     # Loader workers hand feedback geometry over on the CPU as numpy.
-    from vesuvius.neural_tracing.fiber_follow.regression.live_continuation import preserve_live_metadata
+    from vesuvius.neural_tracing.fiber_follow.train.live_continuation import preserve_live_metadata
     cpu = dict(hist=torch.ones(1, 3, 3), _live_states=[live.metadata(item)])
     loader = torch.utils.data.DataLoader([cpu], batch_size=None, collate_fn=preserve_live_metadata)
     batch = next(iter(loader))
@@ -299,9 +294,9 @@ def test_feedback_queue_crosses_spawn_boundary():
 
 def test_live_feedback_is_consumed_by_loader_next_batch(setup, monkeypatch):
     live, ds, vol, rng, item = setup
-    import vesuvius.neural_tracing.fiber_follow.shared.data as module
+    import vesuvius.neural_tracing.fiber_follow.data.data as module
     monkeypatch.setattr(module, 'FiberVolume', lambda *a, **kw: vol)
-    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.oriented_seed_heading',
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.tracing.heading.oriented_seed_heading',
                         lambda vol, pos, family, direction: np.asarray(direction))
     class Builder:
         def __call__(self, items, volume):
@@ -343,7 +338,7 @@ def test_mixed_source_feedback_never_crosses_volumes(setup):
 
 
 def test_invalid_ct_context_falls_back_but_io_errors_propagate(setup, monkeypatch):
-    from vesuvius.neural_tracing.fiber_follow.shared.heading import SeedHeadingError
+    from vesuvius.neural_tracing.fiber_follow.tracing.heading import SeedHeadingError
     live, ds, vol, rng, item = setup
     live.step.value = 100
     fallback = dict(item, live_requested=True, task_requested=TASK['live'])

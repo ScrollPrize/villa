@@ -4,11 +4,9 @@ import copy
 import torch
 
 from model_fixtures import aligned_batch, aligned_config
-from vesuvius.neural_tracing.fiber_follow.regression.model import build_model
-from vesuvius.neural_tracing.fiber_follow.regression.train import (
-    prepare_training, optimizer_update, training_prediction,
-)
-from vesuvius.neural_tracing.fiber_follow.regression.supervision import loss_terms
+from vesuvius.neural_tracing.fiber_follow.models.model import build_model
+from vesuvius.neural_tracing.fiber_follow.train.train import prepare_training, optimizer_update, training_prediction
+from vesuvius.neural_tracing.fiber_follow.train.supervision import loss_terms
 
 
 def predict(model, *args, **kwargs):
@@ -77,7 +75,7 @@ def test_masked_retries_preserve_adamw_skipped_parameter_updates():
 
 def test_compiled_loss_preserves_terms_and_prediction_gradients():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    from vesuvius.neural_tracing.fiber_follow.regression.train import move_batch
+    from vesuvius.neural_tracing.fiber_follow.train.train import move_batch
     torch.manual_seed(341)
     model = build_model(aligned_config(recurrent_refinement_steps=1)).to(device)
     batch = move_batch(aligned_batch(model.cfg), device)

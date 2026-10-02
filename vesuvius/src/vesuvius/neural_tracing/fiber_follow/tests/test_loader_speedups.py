@@ -3,10 +3,10 @@ import json
 
 import numpy as np
 
-from vesuvius.neural_tracing.fiber_follow.regression.neighbor_mining import dense_line
-from vesuvius.neural_tracing.fiber_follow.shared.data import SampleConfig, TracedFiber, make_sample, simulated_trace, traversal_curve
+from vesuvius.neural_tracing.fiber_follow.data.neighbor_mining import dense_line
+from vesuvius.neural_tracing.fiber_follow.data.data import SampleConfig, TracedFiber, make_sample, simulated_trace, traversal_curve
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength
-from vesuvius.neural_tracing.fiber_follow.shared.volume import ChunkedArray
+from vesuvius.neural_tracing.fiber_follow.data.volume import ChunkedArray
 
 
 def loop_dense_line(points, step):

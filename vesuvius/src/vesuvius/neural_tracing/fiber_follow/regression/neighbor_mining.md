@@ -27,7 +27,7 @@ AGENTS_AGENT_MODE=1 ninja -C /home/sean/Documents/villa4/volume-cartographer/bui
 AGENTS_AGENT_MODE=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=../../.. \
 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 MPLCONFIGDIR=/tmp/fiber-review-matplotlib \
 /home/sean/Documents/villa4/vesuvius/.venv/bin/python -m \
-  vesuvius.neural_tracing.fiber_follow.regression.neighbor_mining \
+  vesuvius.neural_tracing.fiber_follow.data.neighbor_mining \
   --fibers /mnt/raid_nvme/spiral_dataset_working/fibers \
   --fiber-zarrs /mnt/raid_nvme/spiral_dataset_working/fiber_zarrs \
   --ct /mnt/raid_nvme/volpkgs/s1_2um_ds2.volpkg/volumes/s1_ds2.zarr/1 \

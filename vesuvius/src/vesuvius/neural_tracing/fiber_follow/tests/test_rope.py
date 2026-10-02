@@ -4,7 +4,7 @@ import math
 import torch
 
 from vesuvius.models.build.pretrained_backbones.rope import apply_rotary_embedding
-from vesuvius.neural_tracing.fiber_follow.regression.rope import AxialRoPE3D
+from vesuvius.neural_tracing.fiber_follow.models.rope import AxialRoPE3D
 
 
 def test_axial_rope_matches_full_3d_grid_scores_and_gradients():

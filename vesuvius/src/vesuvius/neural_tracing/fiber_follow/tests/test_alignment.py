@@ -13,12 +13,10 @@ import pytest
 import torch
 
 from replay_fixtures import replay_states
-from vesuvius.neural_tracing.fiber_follow.shared import data as D
+from vesuvius.neural_tracing.fiber_follow.data import data as D
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, arclength, frame_from_heading
-from vesuvius.neural_tracing.fiber_follow.shared.policy import commit_prefix, recovery_allowed
-from vesuvius.neural_tracing.fiber_follow.shared.state_labels import (
-    FOLLOWING, REASON, RECOVERABLE, REPLAY_CLASS, TERMINAL, UNKNOWN, TraceLabeler, classify, facts,
-)
+from vesuvius.neural_tracing.fiber_follow.tracing.policy import commit_prefix, recovery_allowed
+from vesuvius.neural_tracing.fiber_follow.data.state_labels import FOLLOWING, REASON, RECOVERABLE, REPLAY_CLASS, TERMINAL, UNKNOWN, TraceLabeler, classify, facts
 
 
 def line_fiber(length=400, endpoints=(False, False), x=0.):
@@ -112,8 +110,7 @@ def connector_batch(cfg, foreign_at):
 
 def test_foreign_contact_between_origin_and_first_plane_rejects_a_correct_endpoint():
     from model_fixtures import config
-    from vesuvius.neural_tracing.fiber_follow.regression.supervision import (
-        connector_failures, geometry_mask, proposal_labels)
+    from vesuvius.neural_tracing.fiber_follow.train.supervision import connector_failures, geometry_mask, proposal_labels
     cfg = config()
     points = torch.zeros(1, cfg.n_future, 3)
     points[..., 0] = 4.
@@ -148,7 +145,7 @@ def test_displaced_origin_recovery_is_a_positive_continuation():
     assert item['supervision'] == RECOVERABLE and item['geometry_valid']
     batch = {k: torch.as_tensor(np.asarray(item[k]), dtype=torch.float32)[None] for k in
              ('dense_ab', 'dense_mask', 'endpoint_known', 'end_local', 'terminal', 'confidence_valid')}
-    from vesuvius.neural_tracing.fiber_follow.shared.labels import prefix_labels
+    from vesuvius.neural_tracing.fiber_follow.data.labels import prefix_labels
     # Return straight to the annotated crossings from the displaced origin.
     back = torch.as_tensor(np.c_[item['plane_ab'], item['planes']], dtype=torch.float32)[None]
     assert np.linalg.norm(item['plane_ab'][0]) == pytest.approx(5.)
@@ -160,9 +157,9 @@ def test_displaced_origin_recovery_is_a_positive_continuation():
 
 def test_recorded_frame_takes_its_roll_before_the_read_is_planned(monkeypatch):
     from model_fixtures import config
-    from vesuvius.neural_tracing.fiber_follow.regression.data import IdentityObservationBuilder, IdentitySampling
-    from vesuvius.neural_tracing.fiber_follow.shared.heading import FRAME_POLICY
-    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.oriented_seed_heading',
+    from vesuvius.neural_tracing.fiber_follow.data.observations import IdentityObservationBuilder, IdentitySampling
+    from vesuvius.neural_tracing.fiber_follow.tracing.heading import FRAME_POLICY
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.tracing.heading.oriented_seed_heading',
                         lambda vol, pos, family, direction: np.asarray(direction))
     cfg = config(fine=CropSpec(depth=120, width=104, behind=48, spacing=.5))
     fiber = line_fiber(800)
@@ -205,14 +202,14 @@ def test_recorded_frame_takes_its_roll_before_the_read_is_planned(monkeypatch):
 # --------------------------------------------------------------------------- collection
 
 def test_collection_takes_one_directed_episode_per_distinct_fiber_and_records_skips(monkeypatch):
-    from vesuvius.neural_tracing.fiber_follow.shared.collect import CoverageCursor, select_seeds
-    from vesuvius.neural_tracing.fiber_follow.shared.heading import SeedHeadingError
+    from vesuvius.neural_tracing.fiber_follow.tracing.collection import CoverageCursor, select_seeds
+    from vesuvius.neural_tracing.fiber_follow.tracing.heading import SeedHeadingError
     fibers = [line_fiber(200, x=10.*i) for i in range(6)]
     def heading(vol, pos, family, direction):
         if pos[0] == 30.:
             raise SeedHeadingError('CT seed context has no identifiable sheet normal')
         return np.asarray(direction)
-    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.evaluate.oriented_seed_heading', heading)
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.evaluation.legacy_evaluate.oriented_seed_heading', heading)
     cursor = CoverageCursor(fibers, seed=4)
     rng = np.random.default_rng(0)
     first, skipped = select_seeds(fibers, None, cursor, 3, rng)
@@ -241,7 +238,7 @@ def follow(x, travelled, previous=None, y=0., stop=False):
 
 
 def test_event_windows_survive_thinning_and_failures_keep_a_bounded_suffix():
-    from vesuvius.neural_tracing.fiber_follow.shared.collect import DecisionCollector
+    from vesuvius.neural_tracing.fiber_follow.tracing.collection import DecisionCollector
     cfg = D.SampleConfig(crop=CropSpec(depth=24, width=17, behind=8), n_history=32, n_future=16)
     c = DecisionCollector(line_fiber(600), 0, 50., 1, cfg, before=48., after=24., stride=16.)
     previous = None
@@ -360,7 +357,7 @@ def test_event_cap_is_shared_by_loader_workers():
 
 
 def test_failed_ct_seed_is_redrawn_within_its_task(monkeypatch):
-    from vesuvius.neural_tracing.fiber_follow.shared.heading import SeedHeadingError
+    from vesuvius.neural_tracing.fiber_follow.tracing.heading import SeedHeadingError
     fiber = line_fiber()
     ds = budget_dataset(fiber, D.TaskBudget())
     calls = []
@@ -369,7 +366,7 @@ def test_failed_ct_seed_is_redrawn_within_its_task(monkeypatch):
         if len(calls) == 1:
             raise SeedHeadingError('CT seed context has no identifiable sheet normal')
         return np.asarray(direction)
-    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.oriented_seed_heading', heading)
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.tracing.heading.oriented_seed_heading', heading)
     rng = np.random.default_rng(5)
     items = [ds.task_item(D.TASK['fresh'], rng, [])]
     first = items[0]
@@ -380,7 +377,7 @@ def test_failed_ct_seed_is_redrawn_within_its_task(monkeypatch):
     monkeypatch.undo()
     def unavailable(vol, pos, family):
         raise SeedHeadingError('CT seed context has no identifiable sheet normal')
-    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.ct_seed_heading', unavailable)
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.tracing.heading.ct_seed_heading', unavailable)
     seed_only = D.make_sample(fiber, 50., False, replace(ds.cfg, startup_shares=(1., 0., 0., 0.)), rng)
     with pytest.raises(SeedHeadingError):
         D.resolve_trace_seed(seed_only, vol=object())
@@ -390,8 +387,8 @@ def test_failed_ct_seed_is_redrawn_within_its_task(monkeypatch):
 # --------------------------------------------------------------------------- export and evaluation
 
 def test_export_keeps_short_valid_traces_and_records_every_seed(tmp_path, monkeypatch):
-    from vesuvius.neural_tracing.fiber_follow.shared import infer
-    from vesuvius.neural_tracing.fiber_follow.shared.heading import SeedHeadingError
+    from vesuvius.neural_tracing.fiber_follow.tracing import inference as infer
+    from vesuvius.neural_tracing.fiber_follow.tracing.heading import SeedHeadingError
     def heading(vol, seed, family):
         if seed[0] > 50:
             raise SeedHeadingError('H/V is ambiguous for this sheet orientation')
@@ -414,7 +411,7 @@ def test_export_keeps_short_valid_traces_and_records_every_seed(tmp_path, monkey
 
 
 def test_geometric_outcomes_count_returns_without_erasing_the_first_departure():
-    from vesuvius.neural_tracing.fiber_follow.shared.evaluate import geometric_outcomes, score_trace
+    from vesuvius.neural_tracing.fiber_follow.evaluation.legacy_evaluate import geometric_outcomes, score_trace
     fiber = line_fiber(600)
     z = np.arange(100., 400.)
     lateral = np.where((z > 150) & (z < 180), 4., 0.)+np.where(z > 300, 8., 0.)
@@ -436,7 +433,7 @@ def protocol_sources():
 
 
 def test_calibration_requires_95_percent_precision_and_final_needs_a_locked_policy(tmp_path):
-    from vesuvius.neural_tracing.fiber_follow.shared import evaluation
+    from vesuvius.neural_tracing.fiber_follow.evaluation import evaluation
     cfg = SimpleNamespace(n_future=4, max_recovery_distance=6., recurrent_refinement_steps=0,
                           recent_history_points=4, future_step=1.)
     def loader(path, device):

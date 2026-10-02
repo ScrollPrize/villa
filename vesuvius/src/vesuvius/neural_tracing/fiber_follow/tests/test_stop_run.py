@@ -5,9 +5,7 @@ import sys
 import psutil
 import pytest
 
-from vesuvius.neural_tracing.fiber_follow.shared.stop_run import (
-    collector_matches, stop_run, alive, PREFIX,
-)
+from vesuvius.neural_tracing.fiber_follow.train.stop_run import collector_matches, stop_run, alive, PREFIX
 
 
 def collector_args(root):

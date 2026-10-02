@@ -10,14 +10,14 @@ import numpy as np
 import pytest
 import torch
 
-from vesuvius.neural_tracing.fiber_follow.shared import remote_prefetch as module
-from vesuvius.neural_tracing.fiber_follow.shared.volume import RemoteChunkedArray
+from vesuvius.neural_tracing.fiber_follow.data import remote_prefetch as module
+from vesuvius.neural_tracing.fiber_follow.data.volume import RemoteChunkedArray
 
 
 def test_prefetch_connection_limit_reaches_s3_pool(tmp_path,monkeypatch):
     connections=3
     from zarr.api import asynchronous
-    from vesuvius.neural_tracing.fiber_follow.shared.volume import remote_store
+    from vesuvius.neural_tracing.fiber_follow.data.volume import remote_store
     opened=[]
     async def open_array(*,store,path,mode):
         # Use the real Zarr/fsspec store and S3 filesystem without remote I/O.
@@ -219,9 +219,9 @@ def test_prefetch_failure_propagates_without_foreground_fallback(tmp_path,monkey
 def test_main_and_history_prefetch_covers_ct_normals_and_all_crop_rolls():
     from test_history_slabs import observation
     from model_fixtures import config as cfg
-    from vesuvius.neural_tracing.fiber_follow.regression.data import ObservationBuilder
-    from vesuvius.neural_tracing.fiber_follow.regression.history_slabs import slab_layout,SLAB
-    from vesuvius.neural_tracing.fiber_follow.shared.data import tight_block
+    from vesuvius.neural_tracing.fiber_follow.data.observations import ObservationBuilder
+    from vesuvius.neural_tracing.fiber_follow.models.history_slabs import slab_layout, SLAB
+    from vesuvius.neural_tracing.fiber_follow.data.data import tight_block
     model=cfg();builder=ObservationBuilder(model)
     item=observation([[100,100,0],[100,100,256]])
     bounds=list(builder.prefetch_bounds(item,SimpleNamespace(input_scale=2.)))

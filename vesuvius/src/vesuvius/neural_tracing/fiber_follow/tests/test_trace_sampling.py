@@ -4,10 +4,10 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
-from vesuvius.neural_tracing.fiber_follow.shared import data as D
+from vesuvius.neural_tracing.fiber_follow.data import data as D
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, arclength, frame_from_heading, interp_at, normalize
-from vesuvius.neural_tracing.fiber_follow.shared.heading import heading_free_bounds, trace_heading
-from vesuvius.neural_tracing.fiber_follow.shared.trace import trace_history
+from vesuvius.neural_tracing.fiber_follow.tracing.heading import heading_free_bounds, trace_heading
+from vesuvius.neural_tracing.fiber_follow.tracing.trace import trace_history
 
 
 def curved_fiber():
@@ -100,7 +100,7 @@ def test_trace_start_takes_ct_seed_heading_and_relabels(monkeypatch):
                 if '_pending_seed_heading' in i and len(i['observed_path']) > 3)
     travel = item['seed_tangent']
     axis = normalize(np.array([1., .35, -.2]))
-    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.ct_seed_heading', lambda vol, pos, family: -axis)
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.tracing.heading.ct_seed_heading', lambda vol, pos, family: -axis)
     world_hist = item['hist_local'] @ item['frame'].T+item['pos']
     D.resolve_trace_seed(item, vol=object())
     assert 'seed_heading_family' not in item and '_pending_seed_heading' not in item
@@ -117,7 +117,7 @@ def test_trace_start_takes_ct_seed_heading_and_relabels(monkeypatch):
     item = next(i for i in (D.make_sample(f, 300., False, cfg, np.random.default_rng(k)) for k in range(20))
                 if arclength(i['observed_path'])[-1] > 20)
     frame = item['frame'].copy()
-    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.ct_seed_heading',
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.tracing.heading.ct_seed_heading',
                         lambda vol, pos, family: np.array([-.6, .8, 0.]))
     D.resolve_trace_seed(item, vol=object())
     np.testing.assert_allclose(item['seed_tangent'], [.6, -.8, 0.])  # signed along travel (+x)
@@ -149,8 +149,7 @@ def test_excursions_displace_established_heads_on_departure_and_return():
     for item in excursions:
         np.testing.assert_allclose(item['seed_pos'][1:], 0., atol=1e-12)  # seed stays on the annotation
         assert item['match_distance'] == pytest.approx(item['excursion_head_offset'], abs=1e-6)
-        from vesuvius.neural_tracing.fiber_follow.shared.state_labels import (
-            FOLLOWING, RECOVERABLE, REASON, UNKNOWN, connection_certified)
+        from vesuvius.neural_tracing.fiber_follow.data.state_labels import FOLLOWING, RECOVERABLE, REASON, UNKNOWN, connection_certified
         certified = connection_certified(item['plane_ab'][0], item['planes'][0], cfg.max_recovery_distance)
         if certified:
             assert item['supervision'] == (RECOVERABLE if item['match_distance'] > 3 else FOLLOWING)

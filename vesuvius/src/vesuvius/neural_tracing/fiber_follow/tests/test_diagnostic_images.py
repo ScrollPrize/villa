@@ -8,12 +8,12 @@ from PIL import Image
 import torch
 
 from model_fixtures import aligned_batch as batch, aligned_config
-from vesuvius.neural_tracing.fiber_follow.shared.data import TracedFiber
-from vesuvius.neural_tracing.fiber_follow.regression.model import DirectFollower
-from vesuvius.neural_tracing.fiber_follow.regression.train import training_diagnostics
-from vesuvius.neural_tracing.fiber_follow.shared.evaluate import evaluate, monitor_coverage
+from vesuvius.neural_tracing.fiber_follow.data.data import TracedFiber
+from vesuvius.neural_tracing.fiber_follow.models.model import DirectFollower
+from vesuvius.neural_tracing.fiber_follow.train.train import training_diagnostics
+from vesuvius.neural_tracing.fiber_follow.evaluation.legacy_evaluate import evaluate, monitor_coverage
 from vesuvius.neural_tracing.fiber_follow.shared.experiment import rollout_summary
-from vesuvius.neural_tracing.fiber_follow.shared.runloop import RunLog
+from vesuvius.neural_tracing.fiber_follow.train.runloop import RunLog
 
 
 class Tracer:

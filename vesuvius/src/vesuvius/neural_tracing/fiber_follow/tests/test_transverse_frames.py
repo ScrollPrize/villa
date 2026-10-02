@@ -5,10 +5,8 @@ import numpy as np
 import pytest
 
 from test_heading import sheet, CTOnlyVolume
-from vesuvius.neural_tracing.fiber_follow.shared.heading import (
-    FRAME_POLICY, SeedHeadingError, ct_frame, ct_seed_heading, orient_item, transverse_frame,
-)
-from vesuvius.neural_tracing.fiber_follow.shared.data import SampleConfig, TracedFiber, continuation_targets, make_sample
+from vesuvius.neural_tracing.fiber_follow.tracing.heading import FRAME_POLICY, SeedHeadingError, ct_frame, ct_seed_heading, orient_item, transverse_frame
+from vesuvius.neural_tracing.fiber_follow.data.data import SampleConfig, TracedFiber, continuation_targets, make_sample
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength, frame_from_heading
 
 

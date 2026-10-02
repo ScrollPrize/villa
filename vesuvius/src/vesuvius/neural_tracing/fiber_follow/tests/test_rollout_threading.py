@@ -6,12 +6,12 @@ import pytest
 import torch
 
 from model_fixtures import aligned_config, array_at
-from vesuvius.neural_tracing.fiber_follow.regression.model import DirectFollower
-from vesuvius.neural_tracing.fiber_follow.regression.data import DirectTracer
-from vesuvius.neural_tracing.fiber_follow.shared import ct_normalization as norm
+from vesuvius.neural_tracing.fiber_follow.models.model import DirectFollower
+from vesuvius.neural_tracing.fiber_follow.data.observations import DirectTracer
+from vesuvius.neural_tracing.fiber_follow.data import ct_normalization as norm
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import frame_from_heading
-from vesuvius.neural_tracing.fiber_follow.shared.trace import TraceParams
-from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume, FiberVolumeSpec
+from vesuvius.neural_tracing.fiber_follow.tracing.trace import TraceParams
+from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolume, FiberVolumeSpec
 
 
 def ct_volume(root):

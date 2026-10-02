@@ -8,9 +8,9 @@ import numpy as np
 import pytest
 import torch
 
-from vesuvius.neural_tracing.fiber_follow.shared import ct_normalization as norm
-from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolumeSpec, FiberVolume
-from vesuvius.neural_tracing.fiber_follow.regression.data import augment_image_pair, image_crop
+from vesuvius.neural_tracing.fiber_follow.data import ct_normalization as norm
+from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolumeSpec, FiberVolume
+from vesuvius.neural_tracing.fiber_follow.data.observations import augment_image_pair, image_crop
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
 
 

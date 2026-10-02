@@ -10,15 +10,15 @@ from vesuvius.neural_tracing.fiber_follow.heading_model.model import (
     HeadingConfig, HeadingNet, HeadingPredictor, main_crop_forward, path_features, prior_frames)
 from vesuvius.neural_tracing.fiber_follow.heading_model.targets import in_crop_heading, lateral_extent
 from vesuvius.neural_tracing.fiber_follow.heading_model.train import learning_rate, read_config
-from vesuvius.neural_tracing.fiber_follow.shared.data import TracedFiber
+from vesuvius.neural_tracing.fiber_follow.data.data import TracedFiber
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength, frame_from_heading, normalize, tangent_at
 
 
 
 def volume(root):
     """Tiny CT-only volume (80^3 native CT, trace grid at half resolution) with per-crop z-score records."""
-    from vesuvius.neural_tracing.fiber_follow.shared.ct_normalization import ZSCORE_EPSILON, ZSCORE_METHOD, volume_key
-    from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume, FiberVolumeSpec
+    from vesuvius.neural_tracing.fiber_follow.data.ct_normalization import ZSCORE_EPSILON, ZSCORE_METHOD, volume_key
+    from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolume, FiberVolumeSpec
     path = root/'ct/0'
     path.mkdir(parents=True)
     (path/'.zarray').write_text(json.dumps(dict(shape=[80, 80, 80], chunks=[80, 80, 80], dtype='|u1', fill_value=0,
@@ -89,7 +89,7 @@ def test_states_come_from_make_sample_with_seed_priors_not_given_the_answer():
     long = [s for s in (heading_state(f, rng, cfg, sampling, sampling.follower_sample_config()) for _ in range(60))
             if s['history'] >= 12]
     assert long
-    from vesuvius.neural_tracing.fiber_follow.shared.heading import linear12_heading
+    from vesuvius.neural_tracing.fiber_follow.tracing.heading import linear12_heading
     for state in long:
         np.testing.assert_allclose(state['prior'], linear12_heading(state['path'], 0), atol=1e-12)
 
@@ -139,11 +139,11 @@ def test_heading_batches_flow_through_the_follower_loader_pipeline(tmp_path):
 
 def test_downsampled_patch_lands_where_the_follower_ct_would(tmp_path, monkeypatch):
     """Level 1 holds 2x block means; on a linear field (trilinear-exact) its raw patch must equal the level-0 patch."""
-    from vesuvius.neural_tracing.fiber_follow.shared import crop_sampling
+    from vesuvius.neural_tracing.fiber_follow.data import crop_sampling
     monkeypatch.setattr(crop_sampling, 'normalize_ct', lambda image, record: None)  # z-score would hide offsets/scale
     from vesuvius.neural_tracing.fiber_follow.heading_model.model import model_inputs, patch_volume_spec
-    from vesuvius.neural_tracing.fiber_follow.shared.ct_normalization import ZSCORE_EPSILON, ZSCORE_METHOD, volume_key
-    from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume, FiberVolumeSpec
+    from vesuvius.neural_tracing.fiber_follow.data.ct_normalization import ZSCORE_EPSILON, ZSCORE_METHOD, volume_key
+    from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolume, FiberVolumeSpec
     z, y, x = np.indices((42, 42, 42))
     level0 = 2*(x+y+z)
     level1 = level0.reshape(21, 2, 21, 2, 21, 2).mean((1, 3, 5))

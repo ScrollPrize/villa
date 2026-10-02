@@ -4,7 +4,7 @@ import copy
 import torch
 
 from model_fixtures import aligned_config, aligned_batch
-from vesuvius.neural_tracing.fiber_follow.regression.model import build_model, PathDecoderLayer
+from vesuvius.neural_tracing.fiber_follow.models.model import build_model, PathDecoderLayer
 
 
 def test_cached_decoder_matches_recomputed_forward_masks_keys_and_reuses_projections():

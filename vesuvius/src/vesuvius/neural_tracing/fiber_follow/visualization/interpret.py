@@ -12,17 +12,16 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
-from ..regression.data import ObservationBuilder
-from ..regression.history_slabs import slab_layout
-from ..regression.model import TOKEN_ARCHITECTURE
-from ..regression.train import load_checkpoint
-from ..shared.state_labels import constructed_facts
-from ..shared.data import (SampleConfig, fiber_manifest, label_state, replay_facts, load_fibers,
-                           OnPolicyStates, split_fibers, ZBand)
+from vesuvius.neural_tracing.fiber_follow.data.observations import ObservationBuilder
+from vesuvius.neural_tracing.fiber_follow.models.history_slabs import slab_layout
+from vesuvius.neural_tracing.fiber_follow.models.model import TOKEN_ARCHITECTURE
+from vesuvius.neural_tracing.fiber_follow.train.train import load_checkpoint
+from vesuvius.neural_tracing.fiber_follow.data.state_labels import constructed_facts
+from vesuvius.neural_tracing.fiber_follow.data.data import SampleConfig, fiber_manifest, label_state, replay_facts, load_fibers, OnPolicyStates, split_fibers, ZBand
 from ..shared.geometry import arclength, frame_from_heading, interp_at, tangent_at
-from ..shared.policy import commit_prefix
+from vesuvius.neural_tracing.fiber_follow.tracing.policy import commit_prefix
 from ..shared.reference import SEED_FIELDS, observed_path, observed_seed
-from ..shared.volume import FiberVolume
+from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolume
 from .capture import array, capture, validate_attention
 
 
@@ -49,7 +48,7 @@ def replay_item(source, row, fibers, sample):
                       t=float(get('t')), reverse=bool(get('reverse')), trace=replay_facts(states, row, sample))
     item.update({key: get(key) for key in SEED_FIELDS})
     item['observed_path'] = prefix
-    from ..shared.heading import FRAME_POLICY
+    from vesuvius.neural_tracing.fiber_follow.tracing.heading import FRAME_POLICY
     item['frame_policy'] = FRAME_POLICY
     observed_path(item)  # Validate endpoints before reading any volume.
     return item, index, provenance
@@ -79,7 +78,7 @@ def annotation_item(fiber, at, reverse, sample):
 
 def fixed_curve_confidence(model, x, hist, hmask, points):
     """Survival confidence of one fixed curve under this decision's (possibly ablated) scorer."""
-    from ..regression.survival_confidence import survival_predictions
+    from vesuvius.neural_tracing.fiber_follow.models.survival_confidence import survival_predictions
     ctx = model.context(x, hist, hmask)
     model.prepare_prediction(ctx, hist)
     return survival_predictions(model.hazard_logits(ctx, points))[1]

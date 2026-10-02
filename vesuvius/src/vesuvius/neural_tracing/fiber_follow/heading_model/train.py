@@ -25,8 +25,8 @@ from vesuvius.neural_tracing.fiber_follow.heading_model.data import (
 from vesuvius.neural_tracing.fiber_follow.heading_model.evaluate import (
     alignment_report, format_report, model_headings, summary_metric)
 from vesuvius.neural_tracing.fiber_follow.heading_model.model import HeadingConfig, HeadingNet, save_heading_model
-from vesuvius.neural_tracing.fiber_follow.shared.remote_prefetch import attach_remote_prefetch
-from vesuvius.neural_tracing.fiber_follow.shared.runloop import raise_open_file_limit
+from vesuvius.neural_tracing.fiber_follow.data.remote_prefetch import attach_remote_prefetch
+from vesuvius.neural_tracing.fiber_follow.train.runloop import raise_open_file_limit
 
 DEFAULTS = dict(name='heading_model', steps=30000, batch=128, workers=8, lr=3e-3, weight_decay=1e-4, warmup=500,
                 log_every=100, val_every=2000, ckpt_every=2000, val_states_per_source=1500, seed=0,

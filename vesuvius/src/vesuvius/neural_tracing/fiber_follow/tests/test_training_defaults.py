@@ -6,13 +6,11 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from vesuvius.neural_tracing.fiber_follow.regression.data import (
-    IdentityObservationBuilder, IdentitySampling, LOCATION_SOURCES,
-)
-from vesuvius.neural_tracing.fiber_follow.regression import train
-from vesuvius.neural_tracing.fiber_follow.regression.model import STEM_ARCHITECTURE, DirectConfig
-from vesuvius.neural_tracing.fiber_follow.regression.train import build_parser, main
-from vesuvius.neural_tracing.fiber_follow.shared.data import TASKS, TaskBudget
+from vesuvius.neural_tracing.fiber_follow.data.observations import IdentityObservationBuilder, IdentitySampling, LOCATION_SOURCES
+from vesuvius.neural_tracing.fiber_follow.train import train
+from vesuvius.neural_tracing.fiber_follow.models.model import STEM_ARCHITECTURE, DirectConfig
+from vesuvius.neural_tracing.fiber_follow.train.train import build_parser, main
+from vesuvius.neural_tracing.fiber_follow.data.data import TASKS, TaskBudget
 from model_fixtures import REQUIRED
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def launcher_argv():
     text = (ROOT/'scripts'/'train_aligned.sh').read_text().replace('\\\n', ' ')
     command = shlex.split(next(line for line in text.splitlines() if line.startswith('exec ')))
-    argv = command[command.index('vesuvius.neural_tracing.fiber_follow.regression.train')+1:]
+    argv = command[command.index('vesuvius.neural_tracing.fiber_follow.train.train')+1:]
     substitute = {'$task_root': str(ROOT), '$task_run': 'aligned', '$source_checkpoint': '/unused/ckpt.pt'}
     for name, value in substitute.items():
         argv = [arg.replace(name, value) for arg in argv]

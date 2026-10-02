@@ -11,13 +11,13 @@ import pytest
 import torch
 
 from model_fixtures import config, line_fiber, slab_inputs
-from vesuvius.neural_tracing.fiber_follow.regression.data import IdentityObservationBuilder, reference_layout
-from vesuvius.neural_tracing.fiber_follow.regression.model import DirectConfig
-from vesuvius.neural_tracing.fiber_follow.regression.neighbor_bank import NeighborBank
-from vesuvius.neural_tracing.fiber_follow.regression.neighbor_bulk import digest, pack_paths, write_json
-from vesuvius.neural_tracing.fiber_follow.regression.neighbor_mining import MiningConfig
-from vesuvius.neural_tracing.fiber_follow.shared.components import ComponentRule, crop_indices
-from vesuvius.neural_tracing.fiber_follow.shared.data import SampleConfig, TracedFiber, ZBand, fiber_manifest, make_sample
+from vesuvius.neural_tracing.fiber_follow.data.observations import IdentityObservationBuilder, reference_layout
+from vesuvius.neural_tracing.fiber_follow.models.model import DirectConfig
+from vesuvius.neural_tracing.fiber_follow.data.neighbor_bank import NeighborBank
+from vesuvius.neural_tracing.fiber_follow.data.neighbor_bulk import digest, pack_paths, write_json
+from vesuvius.neural_tracing.fiber_follow.data.neighbor_mining import MiningConfig
+from vesuvius.neural_tracing.fiber_follow.data.components import ComponentRule, crop_indices
+from vesuvius.neural_tracing.fiber_follow.data.data import SampleConfig, TracedFiber, ZBand, fiber_manifest, make_sample
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength, crop_local_grid
 
 
@@ -71,7 +71,7 @@ def item(cfg, reverse=False):
 
 def test_live_refresh_obeys_interval_and_sees_new_shards_after_empty_lookup(tmp_path,monkeypatch):
     clock = [100.]
-    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.regression.neighbor_bank.time.monotonic',lambda:clock[0])
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.data.neighbor_bank.time.monotonic',lambda:clock[0])
     bank,_ = make_bank(tmp_path,refresh_seconds=30.)
     assert not bank.paths(0,80.)
     first = add_shard(tmp_path,0)
@@ -146,7 +146,7 @@ def test_identity_supervision_and_training_cli_require_a_bank(monkeypatch):
     result = builder(items,None)
     assert set(result['x']) == set(images) and 'dense_mask' in result
     assert 'identity_points' not in result and 'negative_mask' not in result
-    from vesuvius.neural_tracing.fiber_follow.regression.train import main
+    from vesuvius.neural_tracing.fiber_follow.train.train import main
     with pytest.raises(ValueError,match='requires --negative-bank'):
         main(['--name','unused','--fiber-zarrs','unused','--fibers','unused','--ct','unused',
               '--manifest','unused','--device','cpu','--threads','1','--negative-bank',''])

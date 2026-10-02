@@ -17,7 +17,7 @@ export MPLCONFIGDIR=${MPLCONFIGDIR:-/tmp/neighbor-bank-128-mpl}
 cd "$FF"
 priority=(nice -n 19)
 if command -v ionice >/dev/null 2>&1; then priority+=(ionice -c 3); fi
-command=("${priority[@]}" "$PYTHON" -u -m vesuvius.neural_tracing.fiber_follow.regression.neighbor_bulk
+command=("${priority[@]}" "$PYTHON" -u -m vesuvius.neural_tracing.fiber_follow.data.neighbor_bulk
     --fibers /mnt/raid_nvme/spiral_dataset_working/fibers
     --fiber-zarrs /mnt/raid_nvme/spiral_dataset_working/fiber_zarrs
     --ct /mnt/raid_nvme/volpkgs/s1_2um_ds2.volpkg/volumes/s1_ds2.zarr/1

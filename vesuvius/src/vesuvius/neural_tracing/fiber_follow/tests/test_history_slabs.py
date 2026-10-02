@@ -7,14 +7,12 @@ import pytest
 import torch
 
 from model_fixtures import config as cfg, aligned_config, aligned_batch
-from vesuvius.neural_tracing.fiber_follow.regression.history_slabs import (
-    selected_arcs, slab_layout, fitted_heading, observed_path, load_slabs, slabs_allowed,
-)
-from vesuvius.neural_tracing.fiber_follow.regression.model import build_model
-from vesuvius.neural_tracing.fiber_follow.regression.data import ObservationBuilder, DirectTracer
+from vesuvius.neural_tracing.fiber_follow.models.history_slabs import selected_arcs, slab_layout, fitted_heading, observed_path, load_slabs, slabs_allowed
+from vesuvius.neural_tracing.fiber_follow.models.model import build_model
+from vesuvius.neural_tracing.fiber_follow.data.observations import ObservationBuilder, DirectTracer
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength
-from vesuvius.neural_tracing.fiber_follow.shared.data import OnPolicyStates, ZBand, SampleConfig, make_sample
-from vesuvius.neural_tracing.fiber_follow.shared.trace import trace_history
+from vesuvius.neural_tracing.fiber_follow.data.data import OnPolicyStates, ZBand, SampleConfig, make_sample
+from vesuvius.neural_tracing.fiber_follow.tracing.trace import trace_history
 
 
 def observation(path):
@@ -70,14 +68,14 @@ def test_short_degenerate_and_strict_prefix():
 
 def fake_ct(monkeypatch):
     calls = []
-    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.ct_tensor',
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.tracing.heading.ct_tensor',
                         lambda vol,pos: np.outer(np.array([0., 1., 0.]), np.array([0., 1., 0.])))
     def scalar(items, vol, crop, pool=None, *, presence=False, **kwargs):
         assert not presence
         calls.extend(items)
         return torch.stack([torch.full((1,crop.depth,crop.width,crop.width),float(i['pos'][2])/512)
                             for i in items])
-    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.crop_sampling.scalar_crops',scalar)
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.data.crop_sampling.scalar_crops',scalar)
     return calls
 
 
@@ -129,7 +127,7 @@ def replay_for(item):
 
 def test_fresh_replay_inference_and_resume_inputs_identical(monkeypatch,tmp_path):
     fake_ct(monkeypatch)
-    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.regression.data.image_crop',
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.data.observations.image_crop',
         lambda items,vol,crop,pool=None,**kw:torch.zeros(len(items),2,crop.depth,crop.width,crop.width))
     item = observation(np.c_[np.sin(np.arange(301)/12),np.zeros(301),np.arange(301)])
     states = replay_for(item)
@@ -212,9 +210,9 @@ def test_complete_synthetic_prefix_precedes_local_history_truncation():
 
 
 def test_actual_trace_commits_and_resumed_slabs_use_same_prefix(monkeypatch):
-    from vesuvius.neural_tracing.fiber_follow.shared.trace import TraceParams
+    from vesuvius.neural_tracing.fiber_follow.tracing.trace import TraceParams
     fake_ct(monkeypatch)
-    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.regression.data.image_crop',
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.data.observations.image_crop',
         lambda items,vol,crop,pool=None,**kw:torch.zeros(len(items),1,crop.depth,crop.width,crop.width))
     c=aligned_config()
     class Model(torch.nn.Module):
@@ -246,7 +244,7 @@ def test_actual_trace_commits_and_resumed_slabs_use_same_prefix(monkeypatch):
 
 def test_cached_history_attention_matches_mha_and_reuses_attached_projections():
     device = 'cpu'
-    from vesuvius.neural_tracing.fiber_follow.regression.history_slabs import HistoryAttention
+    from vesuvius.neural_tracing.fiber_follow.models.history_slabs import HistoryAttention
     torch.manual_seed(91)
     dtype = torch.float32 if device == 'cuda' else torch.float64
     original = HistoryAttention(32, 4).to(device=device, dtype=dtype)
@@ -283,7 +281,7 @@ def test_cached_history_attention_matches_mha_and_reuses_attached_projections():
 
 
 def test_slab_instance_norm_matches_native_and_supports_empty_backward():
-    from vesuvius.neural_tracing.fiber_follow.regression.history_slabs import SlabInstanceNorm
+    from vesuvius.neural_tracing.fiber_follow.models.history_slabs import SlabInstanceNorm
     native = torch.nn.InstanceNorm3d(8, affine=True)
     norm = SlabInstanceNorm(8)
     norm.load_state_dict(native.state_dict())
@@ -297,14 +295,14 @@ def test_slab_instance_norm_matches_native_and_supports_empty_backward():
 
 
 def test_first_unusable_slab_transports_current_ct_roll_without_dropping_history(monkeypatch):
-    from vesuvius.neural_tracing.fiber_follow.shared.heading import FRAME_POLICY
+    from vesuvius.neural_tracing.fiber_follow.tracing.heading import FRAME_POLICY
     from vesuvius.neural_tracing.fiber_follow.shared.geometry import frame_from_heading
     calls = fake_ct(monkeypatch)
     path = np.c_[np.zeros(129), np.zeros(129), np.arange(129)]
     item = observation(path)
     item['frame'] = frame_from_heading([0., 0., 1.], [1., 1., 0.])
     item['frame_policy'] = FRAME_POLICY
-    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.ct_tensor', lambda vol, pos: np.zeros((3,3)))
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.tracing.heading.ct_tensor', lambda vol, pos: np.zeros((3,3)))
     expected = slab_layout(item)
     result = load_slabs([item], None, cfg())
     assert result['history_valid'].sum() == len(expected) == len(calls)
@@ -322,7 +320,7 @@ def test_first_unusable_slab_transports_current_ct_roll_without_dropping_history
 
 
 def test_valid_first_slab_keeps_independent_sign_despite_opposite_current_roll(monkeypatch):
-    from vesuvius.neural_tracing.fiber_follow.shared.heading import FRAME_POLICY, transverse_frame
+    from vesuvius.neural_tracing.fiber_follow.tracing.heading import FRAME_POLICY, transverse_frame
     fake_ct(monkeypatch)
     item = observation([[0., 0., 0.], [0., 0., 4.]])
     expected = transverse_frame(np.diag([0., 1., 0.]), [0., 0., 1.])

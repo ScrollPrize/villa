@@ -5,7 +5,7 @@ import pytest
 import torch
 
 from model_fixtures import aligned_config
-from vesuvius.neural_tracing.fiber_follow.regression.model import DirectConfig, build_model
+from vesuvius.neural_tracing.fiber_follow.models.model import DirectConfig, build_model
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, crop_local_grid
 
 

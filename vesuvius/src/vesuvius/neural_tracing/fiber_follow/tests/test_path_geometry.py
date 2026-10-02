@@ -2,7 +2,7 @@
 import numpy as np
 
 from test_history_slabs import observation
-from vesuvius.neural_tracing.fiber_follow.regression.path_geometry import COUNT, OFFSETS, path_geometry_samples
+from vesuvius.neural_tracing.fiber_follow.models.path_geometry import COUNT, OFFSETS, path_geometry_samples
 
 
 def test_samples_follow_observed_path_without_crop_mask_and_differ_only_beyond_shared_tail():

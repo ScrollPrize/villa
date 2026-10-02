@@ -42,7 +42,7 @@ PY=/home/sean/Documents/villa4/vesuvius/.venv/bin/python
 "$PY" -c 'import runpy; import vesuvius.neural_tracing.fiber_follow as p; p.__path__=["/tmp/fiber_slab_baseline/vesuvius/src/vesuvius/neural_tracing/fiber_follow"]; runpy.run_module("vesuvius.neural_tracing.fiber_follow.regression.benchmark_sparse_training",run_name="__main__")' \
   --encoder patch4 --token-only --length 24 --streams 2 --warmup 3 --repeats 10 \
   --out /tmp/fiber_slab_baseline/baseline_final.json
-"$PY" -m vesuvius.neural_tracing.fiber_follow.regression.benchmark_slabs \
+"$PY" -m vesuvius.neural_tracing.fiber_follow.evaluation.benchmark_slabs \
   --warmup 3 --repeats 10 --decisions 6 \
   --out /tmp/fiber_slab_baseline/slabs_final.json
 ```
@@ -95,11 +95,11 @@ rate to validate backpropagation without claiming a trained checkpoint.
 
 ```bash
 OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 "$PY" \
-  -m vesuvius.neural_tracing.fiber_follow.regression.identity_preflight \
+  -m vesuvius.neural_tracing.fiber_follow.evaluation.identity_preflight \
   --encoder patch4 --token-only --microbatch 2 --batches 1 \
   --out /tmp/fiber_slab_preflight
 OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 "$PY" \
-  -m vesuvius.neural_tracing.fiber_follow.regression.identity_preflight \
+  -m vesuvius.neural_tracing.fiber_follow.evaluation.identity_preflight \
   --encoder patch4 --token-only --direction-inputs --device cuda --forward \
   --microbatch 2 --batches 1 --out /tmp/fiber_slab_cuda_preflight
 OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 "$PY" -m pytest tests -q \
@@ -187,10 +187,10 @@ Commands from `fiber_follow`:
 PY=/home/sean/Documents/villa4/vesuvius/.venv/bin/python
 OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 "$PY" -m pytest tests -q \
   -o addopts='' -o cache_dir=/tmp/fiber_perf_audit/pytest_cuda
-"$PY" -m vesuvius.neural_tracing.fiber_follow.regression.benchmark_slabs \
+"$PY" -m vesuvius.neural_tracing.fiber_follow.evaluation.benchmark_slabs \
   --warmup 3 --repeats 10 --decisions 6 \
   --out /tmp/fiber_perf_audit/single_after_final.json
-"$PY" -m vesuvius.neural_tracing.fiber_follow.regression.benchmark_slabs \
+"$PY" -m vesuvius.neural_tracing.fiber_follow.evaluation.benchmark_slabs \
   --warmup 3 --repeats 10 --decisions 16 --microbatch 16 \
   --out /tmp/fiber_perf_audit/batch16_after_final.json
 ```
@@ -306,7 +306,7 @@ Commands from `fiber_follow` (use fresh output filenames when repeating):
 PY=/home/sean/Documents/villa4/vesuvius/.venv/bin/python
 OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 "$PY" -m pytest tests -q \
   -o addopts='' -o cache_dir=/tmp/fiber_overlap/pytest_cuda
-"$PY" -m vesuvius.neural_tracing.fiber_follow.regression.benchmark_slabs \
+"$PY" -m vesuvius.neural_tracing.fiber_follow.evaluation.benchmark_slabs \
   --warmup 3 --repeats 10 --decisions 16 --microbatch 16 \
   --out /tmp/fiber_overlap/after.json
 "$PY" /tmp/fiber_overlap/profile_embedding.py

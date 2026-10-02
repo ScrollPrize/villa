@@ -15,8 +15,8 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from vesuvius.neural_tracing.fiber_follow.shared.remote_prefetch import RemotePrefetcher
-from vesuvius.neural_tracing.fiber_follow.shared.volume import RemoteChunkedArray
+from vesuvius.neural_tracing.fiber_follow.data.remote_prefetch import RemotePrefetcher
+from vesuvius.neural_tracing.fiber_follow.data.volume import RemoteChunkedArray
 
 
 def main():

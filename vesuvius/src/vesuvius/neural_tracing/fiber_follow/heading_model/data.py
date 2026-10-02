@@ -18,12 +18,11 @@ import torch
 from vesuvius.neural_tracing.fiber_follow.heading_model.model import (
     HeadingConfig, ct_shift, model_inputs, patch_volume_spec, prior_frames)
 from vesuvius.neural_tracing.fiber_follow.heading_model.targets import in_crop_heading
-from vesuvius.neural_tracing.fiber_follow.regression.datasets import (
-    WeightedDatasets, load_primary_dataset, open_afv_source, primary_source_spec, read_dataset_config)
-from vesuvius.neural_tracing.fiber_follow.shared.data import FollowDataset, SampleConfig, simulated_trace, tight_block, traversal_curve
+from vesuvius.neural_tracing.fiber_follow.data.datasets import WeightedDatasets, load_primary_dataset, open_afv_source, primary_source_spec, read_dataset_config
+from vesuvius.neural_tracing.fiber_follow.data.data import FollowDataset, SampleConfig, simulated_trace, tight_block, traversal_curve
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength, interp_at, normalize
-from vesuvius.neural_tracing.fiber_follow.shared.heading import linear12_heading
-from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume
+from vesuvius.neural_tracing.fiber_follow.tracing.heading import linear12_heading
+from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolume
 
 HISTORY_BINS = (('seed', 0., 1e-9), ('1-11', 1e-9, 12.), ('12-31', 12., 32.), ('32+', 32., float('inf')))
 
@@ -64,7 +63,7 @@ def load_sources(dataset_config, out, *, ct_normalization=None, ct_downsample_le
     coarser pyramid levels of it (``model.patch_volume_spec``). ``ct_normalization`` (a follower run's
     ct_normalization.json) reuses that run's exact records; a coarser level gets its own per-crop z-score record.
     """
-    from vesuvius.neural_tracing.fiber_follow.shared.ct_normalization import prepare_normalization
+    from vesuvius.neural_tracing.fiber_follow.data.ct_normalization import prepare_normalization
     document, digest = read_dataset_config(dataset_config)
     known = json.loads(Path(ct_normalization).read_text()) if ct_normalization else None
     sources = []

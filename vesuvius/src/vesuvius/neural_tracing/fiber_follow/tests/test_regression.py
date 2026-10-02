@@ -7,19 +7,16 @@ import numpy as np
 import pytest
 import torch
 
-from vesuvius.neural_tracing.fiber_follow.regression.model import DirectFollower, build_model, feature_grid
-from vesuvius.neural_tracing.fiber_follow.regression.supervision import geometry_mask, loss_terms
-from vesuvius.neural_tracing.fiber_follow.regression import train
-from vesuvius.neural_tracing.fiber_follow.regression.train import (
-    ARCHITECTURES, checkpoint_config, clip_training_gradients, initialize_training_optimizer, load_checkpoint,
-    optimizer_update, prepare_training, save_checkpoint,
-)
-from vesuvius.neural_tracing.fiber_follow.regression.data import image_crop
-from vesuvius.neural_tracing.fiber_follow.shared.data import SampleConfig, TracedFiber, fiber_identities, fiber_manifest
+from vesuvius.neural_tracing.fiber_follow.models.model import DirectFollower, build_model, feature_grid
+from vesuvius.neural_tracing.fiber_follow.train.supervision import geometry_mask, loss_terms
+from vesuvius.neural_tracing.fiber_follow.train import train
+from vesuvius.neural_tracing.fiber_follow.train.train import ARCHITECTURES, checkpoint_config, clip_training_gradients, initialize_training_optimizer, load_checkpoint, optimizer_update, prepare_training, save_checkpoint
+from vesuvius.neural_tracing.fiber_follow.data.observations import image_crop
+from vesuvius.neural_tracing.fiber_follow.data.data import SampleConfig, TracedFiber, fiber_identities, fiber_manifest
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, crop_local_grid, sample_oriented_fast
-from vesuvius.neural_tracing.fiber_follow.shared.runloop import read_checkpoint, training_rng_state
-from vesuvius.neural_tracing.fiber_follow.shared.training_log import DirectTrainingInterval, SamplingLedger, format_training_log
-from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolumeSpec
+from vesuvius.neural_tracing.fiber_follow.train.runloop import read_checkpoint, training_rng_state
+from vesuvius.neural_tracing.fiber_follow.train.training_log import DirectTrainingInterval, SamplingLedger, format_training_log
+from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolumeSpec
 from label_fixtures import set_terminal
 from model_fixtures import aligned_batch, aligned_config, batch as label_batch, forward, proposal_output
 
@@ -304,9 +301,9 @@ def test_inference_checkpoint_keeps_checkpoint_storage_on_cpu(monkeypatch):
 
 def test_ct_crops_match_reference_sampling_at_edges_and_native_resolution():
     """Per-item tight blocks give the reference values, zero fill beyond the array, on the 2x CT grid."""
-    from vesuvius.neural_tracing.fiber_follow.shared.data import _grid_flat, read_blocks
+    from vesuvius.neural_tracing.fiber_follow.data.data import _grid_flat, read_blocks
     from vesuvius.neural_tracing.fiber_follow.shared.fast_sample import sample_crop
-    from vesuvius.neural_tracing.fiber_follow.shared.ct_normalization import normalize_ct
+    from vesuvius.neural_tracing.fiber_follow.data.ct_normalization import normalize_ct
     rng = np.random.default_rng(11)
     data = rng.integers(1, 256, (70, 60, 64), dtype=np.uint8)
 
@@ -393,7 +390,7 @@ def test_loss_supervises_every_proposal():
 
 def test_decision_metrics_score_actual_commits_censor_unknowns_and_pool_counts():
     import json
-    from vesuvius.neural_tracing.fiber_follow.regression.diagnostics import decision_rows, summarize_decisions
+    from vesuvius.neural_tracing.fiber_follow.evaluation.diagnostics import decision_rows, summarize_decisions
     cfg = config()
     b = label_batch(cfg, 5)
     b['match_distance'] = torch.tensor([.5, 1.25, 1.75, 2.5, 7.])
@@ -436,13 +433,13 @@ def test_decision_metrics_score_actual_commits_censor_unknowns_and_pool_counts()
 
 
 def test_monitor_fixtures_are_fixed_private_rng_and_exclude_other_splits(tmp_path, monkeypatch):
-    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.regression.recovery.FiberVolume', lambda *a, **kw: None)
-    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.ct_tensor',
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.evaluation.recovery.FiberVolume', lambda *a, **kw: None)
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.tracing.heading.ct_tensor',
                         lambda vol, pos: np.outer(np.array([1., 0., 0.]), np.array([1., 0., 0.])))
-    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.oriented_seed_heading',
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.tracing.heading.oriented_seed_heading',
                         lambda vol, pos, family, direction: np.asarray(direction))
-    from vesuvius.neural_tracing.fiber_follow.regression.recovery import monitor_fixture
-    from vesuvius.neural_tracing.fiber_follow.shared.recovery import FIXTURE_STRATA
+    from vesuvius.neural_tracing.fiber_follow.evaluation.recovery import monitor_fixture
+    from vesuvius.neural_tracing.fiber_follow.evaluation.recovery_fixtures import FIXTURE_STRATA
     arc = np.arange(300, dtype=float)
     fibers = [TracedFiber(str(i), np.c_[arc*0+i*10, arc*0, arc], arc, '') for i in range(3)]
     manifest = dict(sha256='frozen', monitor_fibers=[0], calibration_fibers=[1], final_fibers=[2],

@@ -3,7 +3,7 @@ import pytest
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from vesuvius.neural_tracing.fiber_follow.regression.model import PathDecoderLayer
+from vesuvius.neural_tracing.fiber_follow.models.model import PathDecoderLayer
 
 
 @pytest.mark.parametrize('device,compiled', [('cpu', False), ('cuda', True)])

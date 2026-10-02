@@ -6,14 +6,14 @@ VES="$(cd "$FF/../../../.." && pwd)"
 PYTHON=${PYTHON:-$VES/.venv/bin/python}
 export PYTHONPATH="$VES/src${PYTHONPATH:+:$PYTHONPATH}"
 if [[ ${1:-} == --help || ${1:-} == -h ]]; then
-    exec "$PYTHON" -m vesuvius.neural_tracing.fiber_follow.regression.train --help
+    exec "$PYTHON" -m vesuvius.neural_tracing.fiber_follow.train.train --help
 fi
 name=${1:?Usage: launch_regression.sh NAME [train options...]}
 shift
 case "$name" in
     ''|.|..|*/*) echo 'Run name must be a single directory name.' >&2; exit 1 ;;
 esac
-command=("$PYTHON" -u -m vesuvius.neural_tracing.fiber_follow.regression.train \
+command=("$PYTHON" -u -m vesuvius.neural_tracing.fiber_follow.train.train \
     --name "$name" \
     --fiber-zarrs /mnt/raid_nvme/spiral_dataset_working/fiber_zarrs \
     --fibers /mnt/raid_nvme/spiral_dataset_working/fibers \

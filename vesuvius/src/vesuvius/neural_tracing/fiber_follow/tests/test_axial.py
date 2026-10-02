@@ -1,7 +1,7 @@
 """Receptive field of the patch encoder's axial attention block."""
 import torch
 
-from vesuvius.neural_tracing.fiber_follow.regression.model import AxialBlock
+from vesuvius.neural_tracing.fiber_follow.models.model import AxialBlock
 
 
 def test_one_patch_axial_block_connects_distant_positions_in_both_directions():

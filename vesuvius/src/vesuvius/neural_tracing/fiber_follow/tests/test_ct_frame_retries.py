@@ -6,9 +6,9 @@ import numpy as np
 import pytest
 import torch
 
-from vesuvius.neural_tracing.fiber_follow.shared import data as data_module
-from vesuvius.neural_tracing.fiber_follow.shared.heading import orient_item, SeedHeadingError
-from vesuvius.neural_tracing.fiber_follow.regression.datasets import WeightedDatasets
+from vesuvius.neural_tracing.fiber_follow.data import data as data_module
+from vesuvius.neural_tracing.fiber_follow.tracing.heading import orient_item, SeedHeadingError
+from vesuvius.neural_tracing.fiber_follow.data.datasets import WeightedDatasets
 
 
 def dataset(monkeypatch, bad=(0, 2), lookahead=None, error=None):
@@ -21,7 +21,7 @@ def dataset(monkeypatch, bad=(0, 2), lookahead=None, error=None):
                 raise error('unrelated failure')
             raise SeedHeadingError('CT seed context crosses the volume boundary')
         return np.diag([1., 0., 0.])
-    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.ct_tensor', normal)
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.tracing.heading.ct_tensor', normal)
     class Builder:
         def __call__(self, items, vol):
             events.append(('build', int(items[0]['pos'][0])))
@@ -64,7 +64,7 @@ def test_rejects_whole_pair_advances_prefetch_and_resets_counter(monkeypatch, lo
         return
     # Ambiguous CT orientation falls back inside ct_frame: both members kept, nothing retried.
     ds, events = dataset(monkeypatch)
-    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.ct_tensor',
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.tracing.heading.ct_tensor',
                         lambda vol, pos: np.diag([0., 0., 1.]))
     stream = iter(ds)
     batches = [next(stream) for _ in range(3)]

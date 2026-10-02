@@ -2,7 +2,7 @@
 set -euo pipefail
 task_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 task_python="${FIBER_PYTHON:-$task_root/../../../../.venv/bin/python}"
-exec "$task_python" -m vesuvius.neural_tracing.fiber_follow.regression.train \
+exec "$task_python" -m vesuvius.neural_tracing.fiber_follow.train.train \
   --name mixed_ct_afv_run1 \
   --dataset-config "$task_root/configs/mixed_ct_datasets.json" \
   --input-mode ct --no-direction-inputs --presence-dropout 0 \

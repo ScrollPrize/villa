@@ -7,9 +7,9 @@ import torch
 from model_fixtures import config
 from test_neighbor_bank import make_bank, add_shard, publish
 from sampling_fixtures import clean_sample
-from vesuvius.neural_tracing.fiber_follow.shared import data as module
+from vesuvius.neural_tracing.fiber_follow.data import data as module
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
-from vesuvius.neural_tracing.fiber_follow.regression.data import IdentityObservationBuilder, IdentitySampling
+from vesuvius.neural_tracing.fiber_follow.data.observations import IdentityObservationBuilder, IdentitySampling
 
 
 class RecordingClient:
@@ -67,7 +67,7 @@ def test_lookahead_preserves_real_bank_feedback_labels_and_sample_sequence(tmp_p
     cfg=config(fine=CropSpec(depth=40,width=25,behind=16,spacing=1.))
     sampling=IdentitySampling(lateral_fraction=.8)
     monkeypatch.setattr(module,'FiberVolume',lambda *a,**kw:SimpleNamespace(ct=None,input_scale=1.))
-    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.oriented_seed_heading',
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.tracing.heading.oriented_seed_heading',
                         lambda vol, pos, family, direction: np.asarray(direction))
     class GeometryBuilder(IdentityObservationBuilder):
         def __call__(self,items,vol):

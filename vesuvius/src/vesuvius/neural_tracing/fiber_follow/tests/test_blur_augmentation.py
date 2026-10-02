@@ -3,8 +3,8 @@ import numpy as np
 import pytest
 import torch
 
-from vesuvius.neural_tracing.fiber_follow.regression.data import IdentitySampling, augment_image_pair, photometric
-from vesuvius.neural_tracing.fiber_follow.shared.ct_normalization import BACKGROUND
+from vesuvius.neural_tracing.fiber_follow.data.observations import IdentitySampling, augment_image_pair, photometric
+from vesuvius.neural_tracing.fiber_follow.data.ct_normalization import BACKGROUND
 
 
 def test_ct_blur_conserves_material_mass_and_keeps_background_and_constants():

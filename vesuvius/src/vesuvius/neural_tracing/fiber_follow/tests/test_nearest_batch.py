@@ -1,7 +1,7 @@
 """Batched broad-phase queries retain scalar projection and tie ordering."""
 import numpy as np
 
-from vesuvius.neural_tracing.fiber_follow.regression.neighbor_mining import PolylineIndex, exact_nearest
+from vesuvius.neural_tracing.fiber_follow.data.neighbor_mining import PolylineIndex, exact_nearest
 
 
 def scalar_nearest(points, index):

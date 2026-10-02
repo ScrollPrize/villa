@@ -18,7 +18,7 @@ def test_block_mean_rounds_half_to_even_like_the_remote_pyramid():
 
 
 def test_builds_only_coarse_chunks_with_every_child_cached(tmp_path):
-    from vesuvius.neural_tracing.fiber_follow.shared.volume import RemoteChunkedArray
+    from vesuvius.neural_tracing.fiber_follow.data.volume import RemoteChunkedArray
     url, chunks = 's3://bucket/volume.zarr', (8, 8, 8)
     fine_root, coarse_root = (RemoteChunkedArray.cache_path(url, level, tmp_path) for level in (0, 1))
     volume = np.random.default_rng(1).integers(0, 256, (32, 32, 32)).astype(np.uint8)

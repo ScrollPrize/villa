@@ -1,5 +1,5 @@
 """Sample configurations shared by tests."""
-from vesuvius.neural_tracing.fiber_follow.shared.data import SampleConfig
+from vesuvius.neural_tracing.fiber_follow.data.data import SampleConfig
 
 
 def clean_sample(cfg, **overrides):

@@ -13,8 +13,8 @@ import numpy as np
 import torch
 from torch import nn
 
-from vesuvius.neural_tracing.fiber_follow.regression.model import DirectConfig
-from vesuvius.neural_tracing.fiber_follow.shared.crop_sampling import scalar_crops
+from vesuvius.neural_tracing.fiber_follow.models.model import DirectConfig
+from vesuvius.neural_tracing.fiber_follow.data.crop_sampling import scalar_crops
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, arclength, frame_from_heading, interp_at
 
 ARCHITECTURE = 'crop_heading_ct_path_v1'
@@ -105,7 +105,7 @@ def patch_volume_spec(spec, levels):
     """
     if not levels:
         return spec
-    from vesuvius.neural_tracing.fiber_follow.shared.ct_normalization import ZSCORE_EPSILON, ZSCORE_METHOD, volume_key
+    from vesuvius.neural_tracing.fiber_follow.data.ct_normalization import ZSCORE_EPSILON, ZSCORE_METHOD, volume_key
     record = spec.ct_normalization
     if record is not None and record.get('method') != ZSCORE_METHOD:
         raise ValueError('Downsampled heading patches need per-crop z-score CT normalization')
@@ -168,7 +168,7 @@ class HeadingPredictor:
             return vol
         key = (vol.spec.ct_zarr, vol.spec.ct_level, vol.spec.cache_dir)
         if key not in self._volumes:
-            from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume
+            from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolume
             self._volumes[key] = FiberVolume(patch_volume_spec(vol.spec, levels), cache_bytes=256 << 20)
         return self._volumes[key]
 

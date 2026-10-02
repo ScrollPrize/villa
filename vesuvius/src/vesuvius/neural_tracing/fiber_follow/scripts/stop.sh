@@ -8,5 +8,5 @@ case "$name" in
     ''|.|..|*/*) echo 'Run name must be a single directory name.' >&2; exit 1 ;;
 esac
 export PYTHONPATH="$VES/src${PYTHONPATH:+:$PYTHONPATH}"
-exec "$VES/.venv/bin/python" -m vesuvius.neural_tracing.fiber_follow.shared.stop_run \
+exec "$VES/.venv/bin/python" -m vesuvius.neural_tracing.fiber_follow.train.stop_run \
     "$FF/output/logs/$name.pid" "$name"

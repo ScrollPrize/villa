@@ -2,8 +2,8 @@ import json
 
 import numpy as np
 
-from vesuvius.neural_tracing.fiber_follow.shared import data as D
-from vesuvius.neural_tracing.fiber_follow.shared.annotation_repair import foldbacks, repair_kinks, turning, unit_curve
+from vesuvius.neural_tracing.fiber_follow.data import data as D
+from vesuvius.neural_tracing.fiber_follow.data.annotation_repair import foldbacks, repair_kinks, turning, unit_curve
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength
 
 from test_data_and_scoring import write_fiber

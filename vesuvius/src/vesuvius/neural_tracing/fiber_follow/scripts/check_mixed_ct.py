@@ -12,13 +12,13 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from vesuvius.neural_tracing.fiber_follow.regression.datasets import read_dataset_config, build_mixed_dataset,load_primary_dataset,HoldoutFilteredBank
-from vesuvius.neural_tracing.fiber_follow.regression.data import IdentityObservationBuilder, IdentitySampling
-from vesuvius.neural_tracing.fiber_follow.regression.model import DirectConfig, build_model
-from vesuvius.neural_tracing.fiber_follow.regression.supervision import loss_terms
-from vesuvius.neural_tracing.fiber_follow.shared.data import FollowDataset, SampleConfig, TaskBudget, ZBand
+from vesuvius.neural_tracing.fiber_follow.data.datasets import read_dataset_config, build_mixed_dataset, load_primary_dataset, HoldoutFilteredBank
+from vesuvius.neural_tracing.fiber_follow.data.observations import IdentityObservationBuilder, IdentitySampling
+from vesuvius.neural_tracing.fiber_follow.models.model import DirectConfig, build_model
+from vesuvius.neural_tracing.fiber_follow.train.supervision import loss_terms
+from vesuvius.neural_tracing.fiber_follow.data.data import FollowDataset, SampleConfig, TaskBudget, ZBand
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
-from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolumeSpec
+from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolumeSpec
 
 
 def main():
@@ -61,7 +61,7 @@ def main():
     with ExitStack() as stack:
         service=None
         if args.prefetch_connections:
-            from vesuvius.neural_tracing.fiber_follow.shared.remote_prefetch import RemotePrefetcher
+            from vesuvius.neural_tracing.fiber_follow.data.remote_prefetch import RemotePrefetcher
             service=stack.enter_context(RemotePrefetcher(args.prefetch_connections))
             for dataset in mixed.datasets:
                 if dataset.vol_spec.ct_zarr.startswith(('s3://','http://','https://')):

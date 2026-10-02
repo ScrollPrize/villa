@@ -9,10 +9,8 @@ import torch
 
 from model_fixtures import aligned_batch as batch, aligned_config
 from label_fixtures import set_terminal
-from vesuvius.neural_tracing.fiber_follow.regression.model import DirectFollower
-from vesuvius.neural_tracing.fiber_follow.regression.batch_diagnostic import (
-    layer_capture, render_microbatch,
-)
+from vesuvius.neural_tracing.fiber_follow.models.model import DirectFollower
+from vesuvius.neural_tracing.fiber_follow.evaluation.batch_diagnostic import layer_capture, render_microbatch
 
 
 def test_layer_capture_preserves_predictions_and_cleans_up():
@@ -44,7 +42,7 @@ def test_layer_capture_preserves_predictions_and_cleans_up():
             torch.testing.assert_close(attention.sum(-1), torch.ones(cfg.n_future))
             assert not attention[:, 2:].any()
     # Distinct layer/attempt values catch averaging the wrong retry or layer count.
-    from vesuvius.neural_tracing.fiber_follow.regression.diagnostic_plots import display_example
+    from vesuvius.neural_tracing.fiber_follow.evaluation.diagnostic_plots import display_example
     assert len(layers['history']['scorer_attention']) == 4
     for head, depth in layers['history_depths'].items():
         layers['history'][head+'_attention'] = [torch.full((cfg.n_future, 8), 100.*attempt+layer)
@@ -99,15 +97,15 @@ def test_render_emits_readable_images_strict_json_and_preserves_rng(tmp_path):
 
 
 def test_diagnostic_annotation_uses_final_crop_frame_without_changing_world_geometry(monkeypatch):
-    from vesuvius.neural_tracing.fiber_follow.regression.data import ObservationBuilder
-    from vesuvius.neural_tracing.fiber_follow.regression.batch_diagnostic import measured_geometry
-    from vesuvius.neural_tracing.fiber_follow.shared.heading import orient_item
+    from vesuvius.neural_tracing.fiber_follow.data.observations import ObservationBuilder
+    from vesuvius.neural_tracing.fiber_follow.evaluation.batch_diagnostic import measured_geometry
+    from vesuvius.neural_tracing.fiber_follow.tracing.heading import orient_item
     cfg = aligned_config()
     builder = ObservationBuilder(cfg)
     curve = np.c_[np.ones(9), np.zeros(9), np.arange(-4, 5)]
     item = dict(pos=np.array([10., 20., 30.]), frame=np.eye(3), identity_curve=curve.copy(),
                 hist_local=np.array([[0., 0., -1.]]), hmask=np.ones(1))
-    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.ct_tensor',
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.tracing.heading.ct_tensor',
                         lambda *a: np.diag([1., 2., .1]))
     def images(items, vol):
         for value in items:
@@ -122,8 +120,8 @@ def test_diagnostic_annotation_uses_final_crop_frame_without_changing_world_geom
 
 
 def test_diagnostic_helpers_report_unknown_values_and_clip_annotation_to_sections():
-    from vesuvius.neural_tracing.fiber_follow.regression.batch_diagnostic import tensor_stats
-    from vesuvius.neural_tracing.fiber_follow.regression.diagnostic_plots import clipped_polyline, orientation_sheet, CELL
+    from vesuvius.neural_tracing.fiber_follow.evaluation.batch_diagnostic import tensor_stats
+    from vesuvius.neural_tracing.fiber_follow.evaluation.diagnostic_plots import clipped_polyline, orientation_sheet, CELL
     assert tensor_stats(torch.tensor([float('nan')]))['rms'] is None
     assert tensor_stats(torch.empty(0))['rms'] is None
     measured = tensor_stats(torch.tensor([1., 3., float('nan')]))

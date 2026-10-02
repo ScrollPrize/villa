@@ -18,8 +18,8 @@ from unittest.mock import patch
 
 import numpy as np
 
-from vesuvius.neural_tracing.fiber_follow.shared import remote_prefetch as module
-from vesuvius.neural_tracing.fiber_follow.shared.volume import RemoteChunkedArray
+from vesuvius.neural_tracing.fiber_follow.data import remote_prefetch as module
+from vesuvius.neural_tracing.fiber_follow.data.volume import RemoteChunkedArray
 
 
 async def measure(folder,lookahead,args):

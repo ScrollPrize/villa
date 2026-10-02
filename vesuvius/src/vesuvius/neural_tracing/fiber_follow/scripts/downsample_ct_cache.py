@@ -24,7 +24,7 @@ from pathlib import Path
 import numpy as np
 from tqdm import tqdm
 
-from vesuvius.neural_tracing.fiber_follow.shared.volume import RemoteChunkedArray
+from vesuvius.neural_tracing.fiber_follow.data.volume import RemoteChunkedArray
 
 REMOTE = ('s3://', 'http://', 'https://')
 

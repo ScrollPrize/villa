@@ -2,7 +2,7 @@
 import torch
 
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import render_history, crop_local_grid
-from vesuvius.neural_tracing.fiber_follow.regression.history_slabs import SLAB
+from vesuvius.neural_tracing.fiber_follow.models.history_slabs import SLAB
 
 
 def test_segment_renderer_exact():

@@ -4,7 +4,7 @@ import threading
 import pytest
 import torch
 
-from vesuvius.neural_tracing.fiber_follow.regression.train import DecisionBatchPrefetch
+from vesuvius.neural_tracing.fiber_follow.train.train import DecisionBatchPrefetch
 
 
 def test_prefetch_preserves_boundaries_prepares_next_update_and_propagates_failures():

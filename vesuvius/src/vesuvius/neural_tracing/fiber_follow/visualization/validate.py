@@ -10,9 +10,9 @@ from PIL import Image
 import torch
 import torch.nn.functional as F
 
-from ..regression.patch_encoder import pad_to_patch_grid
-from ..regression.survival_confidence import survival_predictions
-from ..shared.policy import commit_prefix
+from vesuvius.neural_tracing.fiber_follow.models.patch_encoder import pad_to_patch_grid
+from vesuvius.neural_tracing.fiber_follow.models.survival_confidence import survival_predictions
+from vesuvius.neural_tracing.fiber_follow.tracing.policy import commit_prefix
 from .capture import validate_attention
 
 

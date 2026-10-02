@@ -4,15 +4,11 @@ import pytest
 
 from test_neighbor_bank import make_bank, add_shard, publish
 from sampling_fixtures import clean_sample
-from vesuvius.neural_tracing.fiber_follow.regression.bank_geometry import (
-    difficulty_scores, first_foreign_contact, tube_intervals, BankSwitchDetector,
-)
-from vesuvius.neural_tracing.fiber_follow.regression.model import DirectConfig
-from vesuvius.neural_tracing.fiber_follow.shared.collect import DecisionCollector, append_traces, collected_states
-from vesuvius.neural_tracing.fiber_follow.shared.data import OnPolicyStates, TracedFiber
-from vesuvius.neural_tracing.fiber_follow.shared.state_labels import (
-    FOLLOWING, REASON, REPLAY_CLASS, TERMINAL,
-)
+from vesuvius.neural_tracing.fiber_follow.data.bank_geometry import difficulty_scores, first_foreign_contact, tube_intervals, BankSwitchDetector
+from vesuvius.neural_tracing.fiber_follow.models.model import DirectConfig
+from vesuvius.neural_tracing.fiber_follow.tracing.collection import DecisionCollector, append_traces, collected_states
+from vesuvius.neural_tracing.fiber_follow.data.data import OnPolicyStates, TracedFiber
+from vesuvius.neural_tracing.fiber_follow.data.state_labels import FOLLOWING, REASON, REPLAY_CLASS, TERMINAL
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength, frame_from_heading
 
 
