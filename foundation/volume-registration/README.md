@@ -127,3 +127,53 @@ The registration method uses the lower resolution Zarr levels and the Mattes mut
 #### Saving the transform
 
 - `w` - Write the current transform to the output file. This also prints a shareable neuroglancer URL that can be used to view the volumes with the transform applied.
+
+## Checking points against a second scan (`interface_distance.py`)
+
+Once a `transform.json` exists between two scans of the same object, it can be
+used in the other direction: take points you already have in one volume's
+voxel frame (predicted ink voxels, the centre of a measured depth band on a
+segment, hand-placed landmarks) and ask whether the second scan sees a sharp
+intensity change at the same place. `interface_distance.py` maps each point
+through one or more transform files, reads a short intensity profile along a
+local normal in the reference volume, and reports the distance `D` from the
+point to the nearest qualifying `|gradient|` peak, in voxels of the frame the
+points were given in.
+
+What `D` does and does not mean: a small `D` says the point sits at an
+interface that an independent scan also sees. Papyrus backs, folds and dense
+fibres all produce interfaces, so it does not say which side of a sheet the
+point is on, and it says nothing about ink. It is a geometric consistency
+check, useful for catching depth that is off by several voxels or that wanders
+between neighbouring points.
+
+```bash
+# points in the canonical 2.4um PHerc. Paris 4 frame, reference is the 1.129um
+# rescan; its transform.json registers 1.129um (moving) to canonical (fixed),
+# so the chain is one inverse step
+python interface_distance.py \
+    --points w00_20231016151002_depth_anchors.csv \
+    --step inv:/path/to/1.129um/transform.json \
+    --reference https://vesuvius-challenge-open-data.s3.amazonaws.com/PHercParis4/volumes/20260608103018-1.129um-0.2m-78keV-masked.zarr/0 \
+    --normal points \
+    --output w00_interface_distance.json --csv w00_interface_distance.csv
+```
+
+- `--step PATH` applies `p_fixed = M @ p_moving` as written in the file;
+  `--step inv:PATH` applies the inverse. Steps compose in order, so a chain
+  through a shared fixed volume is `--step a.json --step inv:b.json`.
+- `--points` accepts a plain CSV with `x,y,z` (optional `nx,ny,nz`) columns, or
+  the `*_depth_anchors.csv` written by `export_depth_anchors.py` in
+  khj1222/vesuvius-challenge, in which case the point is the band centre.
+- `--normal volume` (default) estimates the normal from the reference window's
+  structure tensor and rejects points without a dominant direction;
+  `--normal points` uses the normal supplied with each point.
+- `--moving-offset-zyx dz dy dx` adds a constant shift before the chain, for a
+  residual registration offset you have measured separately.
+- Reading a window per point straight from the bucket is slow; point
+  `--reference` at a local copy when scoring more than a few hundred points.
+
+The output JSON holds the composed chain, the per-point records (profile,
+normal, `D`, reasons a point was not evaluable) and a summary with the median
+`D`, the fraction at or below `--threshold`, and its Wilson 95% interval.
+Tests: `python -m pytest tests/test_interface_distance.py`.
