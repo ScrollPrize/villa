@@ -1,4 +1,4 @@
-"""AFV catalog rounding must not invalidate replay at geometry endpoints."""
+"""AFV catalog rounding must not invalidate replay at geometry endpoints; length-weighted fiber draws."""
 import json
 import pickle
 import sqlite3
@@ -13,14 +13,13 @@ from vesuvius.neural_tracing.fiber_follow.shared.data import FollowDataset, fibe
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolumeSpec
 
 
-@pytest.fixture(params=[-np.inf, np.inf])
-def rounded_catalog(tmp_path, request):
+@pytest.fixture
+def rounded_catalog(tmp_path):
     path = tmp_path/'rounded.afv'
     afv_fixture(path)
-    # Either rounding direction is possible when summing densified segments.
+    # Summing densified segments can round the catalog length below the geometry's own length.
     with sqlite3.connect(path) as connection:
-        connection.execute('UPDATE fibers SET length=? WHERE id=1',
-                           (float(np.nextafter(80., request.param)),))
+        connection.execute('UPDATE fibers SET length=? WHERE id=1', (float(np.nextafter(80., -np.inf)),))
     return AFVFibers(path, grid_scale=2.)
 
 
@@ -32,27 +31,27 @@ def endpoint_states(fibers):
     return states
 
 
-def test_afv_length_uses_geometry_with_lazy_catalog_sampling(rounded_catalog):
-    fibers = rounded_catalog
-    dataset = FollowDataset(fibers, FiberVolumeSpec('unused', grid_scale=2.),
-                            sample_config(), None)
-    assert not fibers._cache  # Constructing sampling weights decodes no geometry.
-    np.testing.assert_array_equal(dataset.weights, fibers.lengths/fibers.lengths.sum())
-    assert fibers[0].length == fibers[0].s[-1] == 40.
-    assert fibers[0].length != fibers.lengths[0]
-
-
 def test_afv_endpoint_replay_refresh_and_worker_roundtrip(tmp_path, rounded_catalog):
     fibers = rounded_catalog
+    spec = FiberVolumeSpec('unused', grid_scale=2.)
+    # Sampling weights are catalog length**power and decode no geometry.
+    lengths = fibers.lengths
+    for power in (1., 3.):
+        dataset = FollowDataset(fibers, spec, sample_config(), None, length_power=power)
+        np.testing.assert_allclose(dataset.weights, lengths**power/np.sum(lengths**power))
+    assert not fibers._cache
+    for power in (-1., float('nan'), float('inf')):
+        with pytest.raises(ValueError, match='length power'):
+            FollowDataset(fibers, spec, sample_config(), None, length_power=power)
+    assert fibers[0].length == fibers[0].s[-1] == 40. and fibers[0].length != fibers.lengths[0]
     states = endpoint_states(fibers)
     archive = tmp_path/'endpoint.npz'
     states.save(archive)
     index = tmp_path/'replay.json'
     index.write_text(json.dumps([str(archive)]))
     # A worker starts with a cold geometry cache and discovers new replay later.
-    worker_fibers = pickle.loads(pickle.dumps(fibers))
-    dataset = FollowDataset(worker_fibers, FiberVolumeSpec('unused', grid_scale=2.),
-                            sample_config(), None, replay_index=index)
+    worker_fibers = pickle.loads(pickle.dumps(AFVFibers(fibers.path, grid_scale=2.)))
+    dataset = FollowDataset(worker_fibers, spec, sample_config(), None, replay_index=index)
     dataset.refresh_replay()
     loaded, = dataset.onpolicy
     assert loaded.t[0] == states.t[0]
@@ -61,9 +60,9 @@ def test_afv_endpoint_replay_refresh_and_worker_roundtrip(tmp_path, rounded_cata
     pickle.loads(pickle.dumps(loaded)).validate_fibers(worker_fibers)
 
 
-@pytest.mark.parametrize('arc', [-1., np.nan, np.inf, np.nextafter(40., np.inf)])
-def test_afv_replay_still_rejects_invalid_geometry_arcs(rounded_catalog, arc):
-    states = endpoint_states(rounded_catalog)
-    states.t[0] = arc
-    with pytest.raises(ValueError, match='arc positions outside controlled spans'):
-        states.validate_fibers(rounded_catalog)
+def test_afv_replay_still_rejects_invalid_geometry_arcs(rounded_catalog):
+    for arc in (-1., np.nan, np.nextafter(40., np.inf)):
+        states = endpoint_states(rounded_catalog)
+        states.t[0] = arc
+        with pytest.raises(ValueError, match='arc positions outside controlled spans'):
+            states.validate_fibers(rounded_catalog)

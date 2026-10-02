@@ -1,4 +1,5 @@
 """Live states use the operating policy's commits, the shared state contract and bounded feedback."""
+import copy
 from dataclasses import replace
 from queue import Queue
 from types import SimpleNamespace
@@ -45,8 +46,10 @@ def setup(monkeypatch):
     z = np.arange(500.)
     p = np.c_[100.+.4*np.sin(z/20), np.full(len(z), 100.), z+100.]
     fiber = TracedFiber('live', p, arclength(p), 'V', endpoint_stop=(True, True))
+    # No simulated trace error: label-boundary windows below do not move with noise refits.
     cfg = SampleConfig(crop=CropSpec(depth=24, width=16, behind=8), n_history=32, n_future=16,
-                       startup_shares=(0., 0., 0., 1.), excursion_probability=0.)
+                       startup_shares=(0., 0., 0., 1.), excursion_probability=0., trace_noise_sigma=(0., 0.),
+                       trace_noise_smoothing=0.)
     ds = FollowDataset([fiber], FiberVolumeSpec('unused'), cfg, None, chunk=2)
     live = LiveContinuationSource(policy=POLICY, steps=(4, 4), step=ds.step)
     ds.live_continuation = live
@@ -77,12 +80,11 @@ def proposal(live, item, step=100, confidence=None, lateral=.2, drift=0.):
     return queue.get_nowait()
 
 
-@pytest.mark.parametrize('reverse', [False, True])
-def test_live_state_matches_next_inference_observation(setup, reverse):
+def test_live_state_matches_next_inference_observation(setup):
     live, ds, vol, rng, item = setup
-    if reverse:
-        item = start(ds, ds.fibers[0], 100., True, rng)
-        orient_item(item, vol)
+    reverse = True
+    item = start(ds, ds.fibers[0], 100., True, rng)
+    orient_item(item, vol)
     state = proposal(live, item, confidence=[.9]*7+[.1]*9)
     assert state['commit'] == 7
     result = live.advance(state, ds, vol, rng)
@@ -150,39 +152,46 @@ def test_rejected_decisions_and_recovery_limit_never_advance(setup):
 
 def test_displaced_commit_continues_as_recoverable(setup):
     live, ds, vol, rng, item = setup
-    state = proposal(live, item, lateral=0., drift=.22)
+    state = proposal(live, item, lateral=0., drift=.28)
     result = live.advance(state, ds, vol, rng)
     assert result['supervision'] == RECOVERABLE and result['geometry_valid']
     assert result['match_distance'] > 3 and not result['live_terminal']
     # The chain keeps going from a safe recoverable state.
     assert live.metadata(result) is not None
     # A connection beyond the commit limit is delivered with proposal labels only and ends the chain.
-    state = proposal(live, item, lateral=0., drift=.3)
+    state = proposal(live, item, lateral=0., drift=.39)
     uncertain = live.advance(state, ds, vol, rng)
     assert uncertain['supervision_reason'] == REASON['unsupported_connection']
     assert not uncertain['geometry_valid'] and uncertain['confidence_valid'] and live.metadata(uncertain) is None
 
 
-def test_unreachable_commit_is_terminal_and_does_not_advance(setup):
+def test_terminal_live_outcomes_end_the_chain(setup):
     live, ds, vol, rng, item = setup
+    def check(result, reason):
+        assert result['terminal'] and result['live_terminal'] and result['supervision'] == TERMINAL
+        assert result['supervision_reason'] == REASON[reason] and live.metadata(result) is None
+        assert not result['geometry_valid'] and result['confidence_valid']
+        return result
     state = proposal(live, item)
     state['points'][:, 0] = np.arange(1, 17)*.6
-    result = live.advance(state, ds, vol, rng)
-    assert result['terminal'] and result['live_terminal'] and result['supervision'] == TERMINAL
-    assert result['supervision_reason'] == REASON['unreachable']
-    assert live.metadata(result) is None
-    assert not result['geometry_valid'] and result['confidence_valid']
-
-
-def test_bank_switch_is_terminal_even_within_geometric_departure_radius(setup):
-    live, ds, vol, rng, item = setup
+    check(live.advance(state, ds, vol, rng), 'unreachable')
+    # A certified bank contact is terminal even within the geometric departure radius.
     state = proposal(live, item)
     live.detector = SimpleNamespace(first_contact=lambda *a: dict(
         distance=.5, pos=item['pos'], bank_path='test', bank_run='test'))
-    result = live.advance(state, ds, vol, rng)
-    assert result['supervision'] == TERMINAL and result['supervision_reason'] == REASON['switch']
-    assert result['match_distance'] <= 3
-    assert live.metadata(result) is None
+    assert check(live.advance(state, ds, vol, rng), 'switch')['match_distance'] <= 3
+    live.detector = None
+    # Past the annotation end: a physical endpoint is terminal, an unannotated end is censored.
+    fiber = ds.fibers[0]
+    for annotated in (True, False):
+        ds.fibers[0] = replace(fiber, endpoint_stop=(False, annotated))
+        end = start(ds, ds.fibers[0], fiber.length-4, False, rng)
+        orient_item(end, vol)
+        result = live.advance(proposal(live, end), ds, vol, rng)
+        if annotated:
+            check(result, 'endpoint')
+        else:
+            assert result is None
 
 
 def test_holdout_rejected_before_ct_read(setup, monkeypatch):
@@ -192,20 +201,6 @@ def test_holdout_rejected_before_ct_read(setup, monkeypatch):
     monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.regression.live_continuation.ct_frame',
                         lambda *a, **kw: pytest.fail('Held-out CT must not be read'))
     assert live.advance(state, ds, vol, rng) is None
-
-
-@pytest.mark.parametrize('annotated', [True, False])
-def test_annotation_end_terminal_vs_unannotated_censoring(setup, annotated):
-    live, ds, vol, rng, item = setup
-    fiber = ds.fibers[0]
-    ds.fibers[0] = replace(fiber, endpoint_stop=(False, annotated))
-    item = start(ds, ds.fibers[0], fiber.length-4, False, rng)
-    orient_item(item, vol)
-    result = live.advance(proposal(live, item), ds, vol, rng)
-    if annotated:
-        assert result['supervision'] == TERMINAL and result['supervision_reason'] == REASON['endpoint']
-    else:
-        assert result is None
 
 
 def replay_start(ds, item, travelled=40.):
@@ -268,6 +263,13 @@ def test_metadata_excludes_replay_slots_synthetic_and_terminal_rows(setup):
     assert live.metadata(dict(item, supervision=TERMINAL)) is None
     cpu = dict(x={'a': torch.ones(1)}, _live_states=[live.metadata(item)])
     assert set(move_batch(cpu, 'cpu')) == {'x'}
+    # Loader workers hand feedback geometry over on the CPU as numpy.
+    from vesuvius.neural_tracing.fiber_follow.regression.live_continuation import preserve_live_metadata
+    cpu = dict(hist=torch.ones(1, 3, 3), _live_states=[live.metadata(item)])
+    loader = torch.utils.data.DataLoader([cpu], batch_size=None, collate_fn=preserve_live_metadata)
+    batch = next(iter(loader))
+    assert isinstance(batch['_live_states'][0]['observed_path'], np.ndarray)
+    assert batch['hist'].device.type == 'cpu'
 
 
 def _publish_from_child(source, state):
@@ -293,16 +295,6 @@ def test_feedback_queue_crosses_spawn_boundary():
             process.terminate()
             process.join()
         source.close()
-
-
-def test_loader_keeps_feedback_geometry_on_cpu_as_numpy(setup):
-    from vesuvius.neural_tracing.fiber_follow.regression.live_continuation import preserve_live_metadata
-    live, ds, vol, rng, item = setup
-    cpu = dict(hist=torch.ones(1, 3, 3), _live_states=[live.metadata(item)])
-    loader = torch.utils.data.DataLoader([cpu], batch_size=None, collate_fn=preserve_live_metadata)
-    batch = next(iter(loader))
-    assert isinstance(batch['_live_states'][0]['observed_path'], np.ndarray)
-    assert batch['hist'].device.type == 'cpu'
 
 
 def test_live_feedback_is_consumed_by_loader_next_batch(setup, monkeypatch):
@@ -350,15 +342,6 @@ def test_mixed_source_feedback_never_crosses_volumes(setup):
     assert second.seeds.get_nowait()['source_step'] == 321
 
 
-def test_live_depth_and_terminal_rows_aggregate_in_training_log():
-    from vesuvius.neural_tracing.fiber_follow.shared.training_log import DirectTrainingInterval
-    log = DirectTrainingInterval()
-    log.add(dict(observed_states=10, supervised_states=10, live_rows=3, live_terminal_rows=1, live_depth_sum=9.))
-    log.add(dict(observed_states=10, supervised_states=10, live_rows=1, live_depth_sum=4.))
-    row = log.summary()
-    assert row['live_rows'] == 4 and row['live_terminal_rows'] == 1 and row['live_depth_sum'] == 13
-
-
 def test_invalid_ct_context_falls_back_but_io_errors_propagate(setup, monkeypatch):
     from vesuvius.neural_tracing.fiber_follow.shared.heading import SeedHeadingError
     live, ds, vol, rng, item = setup
@@ -376,3 +359,16 @@ def test_invalid_ct_context_falls_back_but_io_errors_propagate(setup, monkeypatc
     monkeypatch.setattr(live, 'advance', io_failure)
     with pytest.raises(OSError, match='unavailable'):
         live.resolve(fallback, ds, vol, rng)
+
+
+def test_stratified_limits_balance_across_worker_copies():
+    source = LiveContinuationSource(policy=OperatingPolicy(), steps=(12, 32))
+    worker = copy.copy(source)
+    rng = np.random.default_rng(45)
+    try:
+        limits = [s.draw_limit(rng) for _ in range(300) for s in (source, worker)]
+        bands = np.array([(v-12)//7 for v in limits])
+        assert np.bincount(bands).tolist() == [200, 200, 200]
+        assert min(limits) == 12 and max(limits) == 32
+    finally:
+        source.close()

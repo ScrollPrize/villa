@@ -1,4 +1,4 @@
-"""Certified synthetic failures: OU-noised original prefix, smooth bridge, short neighbor tail."""
+"""Certified synthetic failures: trace-noised original prefix, smooth bridge, short neighbor tail."""
 import numpy as np
 import pytest
 
@@ -76,11 +76,9 @@ def test_requested_tails_are_honored_and_short_paths_are_not_silently_substitute
     assert {s['fiber_ref'][2] for s in states} == {False,True}
     short,_ = make_bank(tmp_path/'short',with_path=True)
     assert wrong_continuation(short,sample,rng,tail_length_range=(128.,128.)) is None
-
-
-def test_distant_switch_gets_longer_bridge_without_clipping_tail(tmp_path):
-    bank,_=make_bank(tmp_path)
-    publish(tmp_path,[add_shard(tmp_path,0,x=30.,z_range=(20.,180.))])
+    # A distant switch gets a longer bridge without clipping the tail.
+    bank,_=make_bank(tmp_path/'distant')
+    publish(bank.root,[add_shard(bank.root,0,x=30.,z_range=(20.,180.))])
     cfg=DirectConfig()
     from sampling_fixtures import clean_sample
     state=wrong_continuation(bank,clean_sample(cfg),np.random.default_rng(4),tail_length_range=(64.,64.))
@@ -90,7 +88,7 @@ def test_distant_switch_gets_longer_bridge_without_clipping_tail(tmp_path):
     assert wrong_continuation(bank,clean_sample(cfg),np.random.default_rng(4),tail_length_range=(128.,128.)) is None
 
 
-@pytest.mark.parametrize('lengths',[(0.,128.),(128.,4.),(4.,float('nan')),(4.,float('inf')),(4.,)])
-def test_invalid_tail_ranges_fail_closed(lengths):
-    with pytest.raises(ValueError,match='tail lengths'):
-        IdentitySampling(synthetic_tail=lengths)
+def test_invalid_tail_ranges_fail_closed():
+    for lengths in ((0.,128.),(128.,4.),(4.,float('nan')),(4.,float('inf')),(4.,)):
+        with pytest.raises(ValueError,match='tail lengths'):
+            IdentitySampling(synthetic_tail=lengths)

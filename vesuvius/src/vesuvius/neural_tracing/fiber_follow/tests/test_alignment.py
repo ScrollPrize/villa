@@ -128,6 +128,15 @@ def test_foreign_contact_between_origin_and_first_plane_rejects_a_correct_endpoi
     assert labels[0].eq(1).all()
     # The annotated target's own connection crosses the same neighbor: no geometry is taught.
     assert not geometry_mask(crossing, cfg).any() and geometry_mask(clear, cfg).any()
+    # A foreign component under the third point, within tolerance of the annotation, ends the prefix there.
+    under = connector_batch(cfg, [])
+    near = points.clone()
+    near[..., 0] = 4.5
+    c, a = int(round(3+cfg.fine.behind)), int(round(4.5+(cfg.fine.width-1)/2))
+    under['foreign'][0, c, :, a-1:a+2] = 1
+    labels, known, _, _ = proposal_labels(near, under, cfg, 1.5)
+    assert labels[0].tolist() == [1., 1., 0., 0.] and known[0].all()
+    assert geometry_mask(under, cfg).any()
 
 
 def test_displaced_origin_recovery_is_a_positive_continuation():
@@ -149,32 +158,48 @@ def test_displaced_origin_recovery_is_a_positive_continuation():
 
 # --------------------------------------------------------------------------- augmentation footprints
 
-def test_recorded_frame_takes_its_roll_before_the_read_is_planned():
+def test_recorded_frame_takes_its_roll_before_the_read_is_planned(monkeypatch):
     from model_fixtures import config
     from vesuvius.neural_tracing.fiber_follow.regression.data import IdentityObservationBuilder, IdentitySampling
     from vesuvius.neural_tracing.fiber_follow.shared.heading import FRAME_POLICY
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.oriented_seed_heading',
+                        lambda vol, pos, family, direction: np.asarray(direction))
     cfg = config(fine=CropSpec(depth=120, width=104, behind=48, spacing=.5))
     fiber = line_fiber(800)
-    builder = IdentityObservationBuilder(cfg, [fiber], IdentitySampling(roll_flip_probability=0., roll_jitter_deg=15.,
-                                                                         roll_jitter_max_deg=15.), augment=True)
+    builder = IdentityObservationBuilder(cfg, [fiber], IdentitySampling(), augment=True)
     sample = D.SampleConfig(crop=cfg.fine, n_history=cfg.n_history, n_future=cfg.n_future,
                             startup_shares=(0., 0., 0., 1.), excursion_probability=0.)
-    item = D.make_sample(fiber, 400., False, sample, np.random.default_rng(2))
-    item.pop('_pending_seed_heading', None)
-    unrolled = item['frame'].copy()
-    item.update(fiber_ref=(0, 400., False), frame_policy=FRAME_POLICY)
-    builder.prepare(item, fiber, np.random.default_rng(3))
-    assert abs(item['roll_augmented']) > 0 and 'roll_augmentation' not in item
     vol = SimpleNamespace(input_scale=2.)
-    planned = next(iter(builder.prefetch_bounds(item, vol)))
-    final = D.tight_block(item['pos'], item['frame'], cfg.fine, 2.)
-    np.testing.assert_array_equal(planned[0], final[0])
-    np.testing.assert_array_equal(planned[1], final[1])
-    before = D.tight_block(item['pos'], unrolled, cfg.fine, 2.)
-    assert not np.array_equal(before[1], final[1])  # the unrolled plan would not cover the final crop
-    # Every local quantity is already expressed in the final frame.
-    world = item['fut_local'] @ item['frame'].T+item['pos']
-    np.testing.assert_allclose(world[:, :2], 0., atol=1e-9)
+    world = lambda i: dict(hist=i['hist_local'] @ i['frame'].T+i['pos'], fut=i['fut_local'] @ i['frame'].T+i['pos'],
+                           plane=np.c_[i['plane_ab'], i['planes']] @ i['frame'].T+i['pos'])
+    angles, moved = [], False
+    for seed in range(40):
+        item = D.make_sample(fiber, 400., False, sample, np.random.default_rng(seed))
+        item.pop('_pending_seed_heading', None)
+        item.update(fiber_ref=(0, 400., False), frame_policy=FRAME_POLICY)
+        before, heading, unrolled = world(item), item['frame'][:, 2].copy(), item['frame'].copy()
+        # A recorded frame takes its roll during preparation, before any footprint is planned.
+        item = builder.prepare(item, fiber, np.random.default_rng(100+seed))
+        assert 'roll_augmentation' not in item
+        angles.append(item.get('roll_augmented', 0.))
+        planned = next(iter(builder.prefetch_bounds(item, vol)))
+        final = D.tight_block(item['pos'], item['frame'], cfg.fine, 2.)
+        np.testing.assert_array_equal(planned[0], final[0])
+        np.testing.assert_array_equal(planned[1], final[1])
+        moved |= not np.array_equal(D.tight_block(item['pos'], unrolled, cfg.fine, 2.)[1], final[1])
+        frame = item['frame'].copy()
+        builder.finalize_frames([item], None)
+        np.testing.assert_array_equal(item['frame'], frame)
+        # Every local quantity is already expressed in the final frame.
+        after = world(item)
+        for key in before:
+            np.testing.assert_allclose(after[key], before[key], atol=1e-9)
+        np.testing.assert_allclose(item['frame'][:, 2], heading, atol=1e-12)
+        np.testing.assert_allclose(after['fut'][:, :2], 0., atol=1e-9)
+    assert moved  # an unrolled plan would not cover the final crop
+    flipped = np.abs(np.angle(np.exp(1j*np.asarray(angles)))) > np.pi/2
+    jitter = np.rad2deg(np.angle(np.exp(1j*(np.asarray(angles)+np.pi*flipped))))
+    assert 8 < flipped.sum() < 32 and np.abs(jitter).max() <= 15+1e-9 and np.abs(jitter).std() > 1
 
 
 # --------------------------------------------------------------------------- collection
@@ -198,6 +223,12 @@ def test_collection_takes_one_directed_episode_per_distinct_fiber_and_records_sk
     taken = [s['fiber'] for s in first+second]
     assert set(taken[:5]) == {0, 1, 2, 4, 5}  # every eligible fiber before any repeat
     assert all(s['sign'] in (-1., 1.) and np.isclose(abs(s['heading'][2]), 1.) for s in first+second)
+    # Every fiber once per epoch regardless of length; the next epoch traces each the other way.
+    cursor = CoverageCursor([line_fiber(5000 if i == 9 else 350, x=10.*i) for i in range(10)], seed=3)
+    epoch = [cursor.take(rng) for _ in range(10)]
+    assert sorted(fi for fi, _ in epoch) == list(range(10))
+    signs = dict(epoch)
+    assert all(signs[fi] == -s for fi, s in (cursor.take(rng) for _ in range(10)))
 
 
 def follow(x, travelled, previous=None, y=0., stop=False):
@@ -345,6 +376,15 @@ def test_failed_ct_seed_is_redrawn_within_its_task(monkeypatch):
     assert ds.resolve_seeds(items, None, rng, []) == 1
     assert items[0] is not first and items[0]['task_requested'] == D.TASK['fresh']
     assert 'seed_heading_family' not in items[0] and len(calls) == 2
+    # Missing CT orientation raises; there is no annotation fallback.
+    monkeypatch.undo()
+    def unavailable(vol, pos, family):
+        raise SeedHeadingError('CT seed context has no identifiable sheet normal')
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.ct_seed_heading', unavailable)
+    seed_only = D.make_sample(fiber, 50., False, replace(ds.cfg, startup_shares=(1., 0., 0., 0.)), rng)
+    with pytest.raises(SeedHeadingError):
+        D.resolve_trace_seed(seed_only, vol=object())
+    assert 'seed_heading_fallback' not in seed_only
 
 
 # --------------------------------------------------------------------------- export and evaluation

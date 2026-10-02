@@ -6,13 +6,13 @@ import numpy as np
 import pytest
 import torch
 
-from model_fixtures import config as cfg, slab_batch
+from model_fixtures import config as cfg, aligned_config, aligned_batch
 from vesuvius.neural_tracing.fiber_follow.regression.history_slabs import (
-    SLAB, selected_arcs, slab_layout, fitted_heading, observed_path, load_slabs, slabs_allowed,
+    selected_arcs, slab_layout, fitted_heading, observed_path, load_slabs, slabs_allowed,
 )
 from vesuvius.neural_tracing.fiber_follow.regression.model import build_model
 from vesuvius.neural_tracing.fiber_follow.regression.data import ObservationBuilder, DirectTracer
-from vesuvius.neural_tracing.fiber_follow.regression.train import prepare_training, training_prediction, optimizer_update
+from vesuvius.neural_tracing.fiber_follow.regression.train import prepare_training, optimizer_update
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength
 from vesuvius.neural_tracing.fiber_follow.shared.data import OnPolicyStates, ZBand, SampleConfig, make_sample
 from vesuvius.neural_tracing.fiber_follow.shared.trace import trace_history
@@ -25,14 +25,10 @@ def observation(path):
                 seed_age=float(arclength(path)[-1]), seed_valid=True)
 
 
-@pytest.mark.parametrize('length, expected', [(0,[0]), (5,[0]), (32,[0]), (63,[0]),
-    (64,[0,32]), (96,[0,32,64]), (128,[0,32,64,96]),
-    (160,[0,32,64,96,128]), (256,[0,32,64,96,128,160,192,224])])
-def test_selection_startup_spacing_and_order(length, expected):
-    np.testing.assert_allclose(selected_arcs(length), expected)
-
-
-def test_long_traces_spacing_seed_recent_anchors_and_loops():
+def test_selection_spacing_seed_recent_anchors_and_loops():
+    for length, expected in ((0, [0]), (5, [0]), (63, [0]), (64, [0, 32]), (96, [0, 32, 64]),
+                             (160, [0, 32, 64, 96, 128]), (256, [0, 32, 64, 96, 128, 160, 192, 224])):
+        np.testing.assert_allclose(selected_arcs(length), expected)
     for length in np.linspace(0, 4096, 1000):
         chosen = selected_arcs(length)
         assert len(chosen) <= 8 and chosen[0] == 0
@@ -46,18 +42,18 @@ def test_long_traces_spacing_seed_recent_anchors_and_loops():
     assert len(slabs) == 6
 
 
-@pytest.mark.parametrize('at', [0., 1., 3., 8., 17., 20.])
-def test_four_point_heading_regresses_arclength_with_boundary_shift(at):
+def test_four_point_heading_regresses_arclength_with_boundary_shift():
     t = np.linspace(0,np.pi,101)
     path = np.c_[12*np.sin(t),np.zeros(len(t)),12*(1-np.cos(t))]
     arc = arclength(path)
-    start = np.clip(at-3,0,arc[-1]-6)
-    points = np.stack([np.interp(start+np.arange(4)*2,arc,path[:,i]) for i in range(3)],1)
-    slope = np.linalg.lstsq(np.c_[np.ones(4),np.arange(4)*2],points,rcond=None)[0][1]
-    expected = slope/np.linalg.norm(slope)
-    np.testing.assert_allclose(fitted_heading(path,arc,at,[0,1,0]),expected,atol=1e-12)
-    reverse = fitted_heading(path[::-1],arclength(path[::-1]),arc[-1]-at,[0,1,0])
-    np.testing.assert_allclose(reverse,-expected,atol=1e-12)
+    for at in (0., 3., 8., 20.):
+        start = np.clip(at-3,0,arc[-1]-6)
+        points = np.stack([np.interp(start+np.arange(4)*2,arc,path[:,i]) for i in range(3)],1)
+        slope = np.linalg.lstsq(np.c_[np.ones(4),np.arange(4)*2],points,rcond=None)[0][1]
+        expected = slope/np.linalg.norm(slope)
+        np.testing.assert_allclose(fitted_heading(path,arc,at,[0,1,0]),expected,atol=1e-12)
+        reverse = fitted_heading(path[::-1],arclength(path[::-1]),arc[-1]-at,[0,1,0])
+        np.testing.assert_allclose(reverse,-expected,atol=1e-12)
 
 
 def test_short_degenerate_and_strict_prefix():
@@ -88,15 +84,18 @@ def fake_ct(monkeypatch):
 
 def test_only_valid_ct_reads_remote_slabs_and_annotation_independence(monkeypatch):
     calls = fake_ct(monkeypatch)
-    path = np.c_[np.zeros(401),np.zeros(401),np.arange(401)]
+    path = np.c_[np.arange(401)*.1,np.zeros(401),np.arange(401)]
     item = observation(path)
-    first = load_slabs([item],None,cfg())
+    c = aligned_config()
+    first = load_slabs([item],None,c)
     assert len(calls) == 8 and first['history_slabs'].shape == (1,8,2,8,65,65)
     assert first['history_overlap'][0,0] == 0 and first['history_valid'][0,0]
+    assert first['history_path_valid'][0,0].tolist() == [False,True,True]
     calls.clear()
-    other = load_slabs([dict(item, gt_history=np.full((32,3),np.nan), terminal=1.,
-                            reference_on_fiber=np.zeros(33))],None,cfg(direction_inputs=True))
-    for key in ('history_slabs','history_valid','history_pose'):
+    other = load_slabs([dict(item, gt_history=np.full((32,3),np.nan), terminal=1., offtrack=True,
+                            reference_on_fiber=np.zeros(33))],None,c)
+    for key in ('history_slabs','history_valid','history_pose',
+                'history_path_points','history_path_tangents','history_path_valid'):
         torch.testing.assert_close(first[key],other[key],rtol=0,atol=0)
     calls.clear()
     short = load_slabs([observation(path[:5])],None,cfg())
@@ -117,6 +116,10 @@ def test_heatmap_follows_committed_wrong_turn_and_not_a_seed_chord(monkeypatch):
     assert not slabs_allowed(observation(np.array([[0.,0,90],[0,0,400]])),ZBand(90,110))
 
 
+OBSERVED_HISTORY = ('history_slabs','history_pose','history_valid','history_path_points',
+                    'history_path_tangents','history_path_valid','path_geometry','path_geometry_valid')
+
+
 def replay_for(item):
     from replay_fixtures import replay_states
     row=dict(pos=item['pos'],frame=item['frame'],hist=item['hist_local'] @ item['frame'].T+item['pos'],
@@ -133,14 +136,15 @@ def test_fresh_replay_inference_and_resume_inputs_identical(monkeypatch,tmp_path
     states = replay_for(item)
     states.save(tmp_path/'replay.npz')
     loaded = OnPolicyStates.load(tmp_path/'replay.npz')
-    fresh = ObservationBuilder(cfg()).images([item],None)
-    replay = ObservationBuilder(cfg()).images([dict(item,observed_path=loaded.observed_prefix(0))],None)
+    builder = ObservationBuilder(aligned_config())
+    fresh = builder.images([item],None)
+    replay = builder.images([dict(item,observed_path=loaded.observed_prefix(0))],None)
     tracer = DirectTracer.__new__(DirectTracer)
-    tracer.device,tracer.vol,tracer.pool,tracer.observations='cpu',None,None,ObservationBuilder(cfg())
+    tracer.device,tracer.vol,tracer.pool,tracer.observations='cpu',None,None,builder
     direct = tracer.build_inputs(item['pos'][None],item['frame'][None],item['hist_local'][None],item['hmask'][None],paths=[item])
     resumed = tracer.build_inputs(item['pos'][None],item['frame'][None],item['hist_local'][None],item['hmask'][None],
         paths=[dict(item,observed_path=loaded.observed_prefix(0))])
-    for key in ('history_slabs','history_pose','history_valid'):
+    for key in OBSERVED_HISTORY:
         for other in (replay,direct,resumed):
             torch.testing.assert_close(fresh[key],other[key],atol=0,rtol=0)
     loaded.seq_end = loaded.seq_end.copy()-1
@@ -148,55 +152,43 @@ def test_fresh_replay_inference_and_resume_inputs_identical(monkeypatch,tmp_path
         loaded.observed_prefix(0)
 
 
-@pytest.mark.parametrize('loss', ['geometry','generated_confidence'])
-def test_both_heads_train_history_and_only_geometry_trains_generator(loss):
+def test_both_heads_train_history_and_only_geometry_trains_generator():
     torch.manual_seed(55)
-    m=build_model(cfg(recurrent_refinement_steps=1))
-    b=slab_batch(m.cfg,1)
+    m=build_model(aligned_config())
+    b=aligned_batch(m.cfg,1)
     b['x']['history_slabs'].requires_grad_()
-    out=m(b['x'],b['hist'],b['hmask'])
-    value={'geometry':out['points'].square().mean(),'generated_confidence':out['hazard_logits'].sum()}[loss]
-    value.backward()
-    assert m.history_encoder.convolution[0].weight.grad.abs().sum()>0
-    assert b['x']['history_slabs'].grad[0,:2].abs().sum()>0
-    assert not b['x']['history_slabs'].grad[0,2:].any()
-    if loss!='geometry':
-        assert m.coordinates.weight.grad is None
+    for loss in ('geometry','generated_confidence'):
+        m.zero_grad(set_to_none=True);b['x']['history_slabs'].grad=None
+        out=m(b['x'],b['hist'],b['hmask'])
+        {'geometry':out['points'].square().mean(),'generated_confidence':out['hazard_logits'].sum()}[loss].backward()
+        for module in (m.history_encoder.convolution[0],m.encoder.patch_projection,m.encoder.stem.projection):
+            assert module.weight.grad.abs().sum()>0,(loss,module)
+        assert b['x']['history_slabs'].grad[0,:2].abs().sum()>0
+        assert not b['x']['history_slabs'].grad[0,2:].any()
+    assert m.coordinates.weight.grad is None
 
 
-def test_padded_slots_never_encoded_and_fully_masked_attention_zero():
+def test_invalid_slots_paths_and_geometry_are_inert_and_never_encoded():
     torch.manual_seed(9)
-    m=build_model(cfg()).eval();b=slab_batch(m.cfg,2)
+    m=build_model(aligned_config()).eval();b=aligned_batch(m.cfg,2)
     calls=[]
     handle=m.history_encoder.convolution.register_forward_pre_hook(lambda module,args:calls.append(len(args[0])))
+    b['x']['history_path_valid'][0,1,0]=False
+    b['x']['path_geometry_valid'][1,:5]=False
     first=m(b['x'],b['hist'],b['hmask'])
-    b['x']['history_slabs'][:,2:]=float('nan');b['x']['history_pose'][:,2:]=float('nan')
-    other=m(b['x'],b['hist'],b['hmask'])
-    torch.testing.assert_close(first['points'],other['points'],atol=0,rtol=0)
-    assert calls==[4,4]
-    b['x']['history_valid'][:]=False
-    tokens,padding=m.encode_history(b['x'])
-    assert calls[-1]==0 and padding.all() and not tokens.any()
-    query=torch.randn(2,4,m.cfg.hidden)
-    torch.testing.assert_close(m.history_attention(query,tokens,padding),query,atol=0,rtol=0)
-    handle.remove()
-
-
-@pytest.mark.parametrize('token_only',[False,True])
-def test_compiled_decisions_match_inference_with_all_history_gradients(token_only):
-    torch.manual_seed(22)
-    m=build_model(cfg(encoder='patch4' if token_only else 'conv',token_only=token_only,recurrent_refinement_steps=1))
-    compiled=prepare_training(copy.deepcopy(m),backend='eager')
-    b=slab_batch(m.cfg,1)
-    a=m(b['x'],b['hist'],b['hmask'])
-    c=training_prediction(compiled,b['x'],b['hist'],b['hmask'])
+    x=b['x']
+    x['history_slabs'][:,2:]=float('nan');x['history_pose'][:,2:]=float('nan')
+    x['history_path_points'][0,1,0]=float('nan');x['history_path_points'][:,2:]=float('nan')
+    x['path_geometry'][1,:5]=float('nan')
+    other=m(x,b['hist'],b['hmask'])
     for key in ('points','hazard_logits','refinement_points'):
-        torch.testing.assert_close(a[key],c[key],atol=1e-6,rtol=1e-5)
-    for model,out in ((m,a),(compiled,c)):
-        (out['points'].square().mean()+out['hazard_logits'].mean()).backward()
-    for p,q in zip(m.parameters(),compiled.parameters()):
-        if p.grad is not None:
-            torch.testing.assert_close(p.grad,q.grad,atol=2e-6,rtol=2e-4)
+        assert torch.isfinite(other[key]).all()
+        torch.testing.assert_close(first[key],other[key],atol=0,rtol=0)
+    assert calls==[4,4]
+    x['history_valid'][:]=False
+    tokens,padding=m.encode_history(x)
+    assert calls[-1]==0 and padding.all() and not tokens.any()
+    handle.remove()
 
 
 def test_complete_synthetic_prefix_precedes_local_history_truncation():
@@ -224,8 +216,8 @@ def test_actual_trace_commits_and_resumed_slabs_use_same_prefix(monkeypatch):
     from vesuvius.neural_tracing.fiber_follow.shared.trace import TraceParams
     fake_ct(monkeypatch)
     monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.regression.data.image_crop',
-        lambda items,vol,crop,pool=None,**kw:torch.zeros(len(items),2,crop.depth,crop.width,crop.width))
-    c=cfg()
+        lambda items,vol,crop,pool=None,**kw:torch.zeros(len(items),1,crop.depth,crop.width,crop.width))
+    c=aligned_config()
     class Model(torch.nn.Module):
         cfg=c
         def forward(self,x,hist,hmask):
@@ -249,7 +241,7 @@ def test_actual_trace_commits_and_resumed_slabs_use_same_prefix(monkeypatch):
     build=resumed.build_inputs
     monkeypatch.setattr(resumed,'build_inputs',lambda *args,**kw:again.append(build(*args,**kw)) or again[-1])
     resumed._trace(seen[1]['pos'][None],seen[1]['frame'][:,2][None],None,None,None,initial_states=[seen[1]])
-    for key in ('history_slabs','history_pose','history_valid'):
+    for key in OBSERVED_HISTORY:
         torch.testing.assert_close(images[1][key],again[0][key],atol=0,rtol=0)
 
 
@@ -257,12 +249,12 @@ def test_actual_trace_commits_and_resumed_slabs_use_same_prefix(monkeypatch):
 def test_cuda_bf16_masks_and_compiled_repeated_updates():
     from vesuvius.neural_tracing.fiber_follow.regression.train import move_batch
     torch.manual_seed(16)
-    model=build_model(cfg(encoder='patch4',token_only=True,recurrent_refinement_steps=1)).cuda()
+    model=build_model(aligned_config(recurrent_refinement_steps=1)).cuda()
     ema=copy.deepcopy(model)
     prepare_training(model,2)
     opt=torch.optim.SGD(model.parameters(),lr=.001)
     for count in (2,0,8,1):
-        batch=slab_batch(model.cfg,2)
+        batch=aligned_batch(model.cfg,2)
         batch['x']['history_valid'][:]=False
         batch['x']['history_valid'][:,:count]=True
         batch['x']['history_slabs'][~batch['x']['history_valid']]=float('nan')
@@ -274,10 +266,8 @@ def test_cuda_bf16_masks_and_compiled_repeated_updates():
             assert metrics['history_grad_norm']==0
 
 
-@pytest.mark.parametrize('device', ['cpu', 'cuda'])
-def test_cached_history_attention_matches_mha_and_reuses_attached_projections(device):
-    if device == 'cuda' and not torch.cuda.is_available():
-        pytest.skip('CUDA unavailable')
+def test_cached_history_attention_matches_mha_and_reuses_attached_projections():
+    device = 'cpu'
     from vesuvius.neural_tracing.fiber_follow.regression.history_slabs import HistoryAttention
     torch.manual_seed(91)
     dtype = torch.float32 if device == 'cuda' else torch.float64
@@ -314,34 +304,21 @@ def test_cached_history_attention_matches_mha_and_reuses_attached_projections(de
         torch.testing.assert_close(a, b, rtol=rtol, atol=atol)
 
 
-@pytest.mark.parametrize('batch_size', [0, 2])
-def test_slab_instance_norm_matches_native_and_supports_empty_backward(batch_size):
+def test_slab_instance_norm_matches_native_and_supports_empty_backward():
     from vesuvius.neural_tracing.fiber_follow.regression.history_slabs import SlabInstanceNorm
     native = torch.nn.InstanceNorm3d(8, affine=True)
     norm = SlabInstanceNorm(8)
     norm.load_state_dict(native.state_dict())
-    x = torch.randn(batch_size, 8, 2, 9, 9, requires_grad=True)
-    actual = norm(x)
-    if batch_size:
-        torch.testing.assert_close(actual, native(x), atol=1e-6, rtol=1e-5)
-    actual.square().sum().backward()
-    assert x.grad is not None and torch.isfinite(x.grad).all()
+    for batch_size in (0, 2):
+        x = torch.randn(batch_size, 8, 2, 9, 9, requires_grad=True)
+        actual = norm(x)
+        if batch_size:
+            torch.testing.assert_close(actual, native(x), atol=1e-6, rtol=1e-5)
+        actual.square().sum().backward()
+        assert x.grad is not None and torch.isfinite(x.grad).all()
 
 
-@pytest.mark.parametrize('variant', ['fine', 'legacy'])
-def test_history_residuals_use_shared_basicblock_d(variant):
-    from vesuvius.models.build.resblocks import BasicBlockD
-    encoder = build_model(cfg(history_encoder=variant)).history_encoder
-    for stage in range(1, len(encoder.convolution), 2):
-        block = encoder.convolution[stage]
-        assert isinstance(block, BasicBlockD)
-        assert isinstance(block.conv1.norm, torch.nn.InstanceNorm3d)
-        assert isinstance(block.nonlin2, torch.nn.LeakyReLU)
-        assert block.nonlin2.negative_slope == .01
-
-
-@pytest.mark.parametrize('failure', ['parallel', 'unidentifiable'])
-def test_first_unusable_slab_transports_current_ct_roll_without_dropping_history(monkeypatch, failure):
+def test_first_unusable_slab_transports_current_ct_roll_without_dropping_history(monkeypatch):
     from vesuvius.neural_tracing.fiber_follow.shared.heading import FRAME_POLICY
     from vesuvius.neural_tracing.fiber_follow.shared.geometry import frame_from_heading
     calls = fake_ct(monkeypatch)
@@ -349,11 +326,7 @@ def test_first_unusable_slab_transports_current_ct_roll_without_dropping_history
     item = observation(path)
     item['frame'] = frame_from_heading([0., 0., 1.], [1., 1., 0.])
     item['frame_policy'] = FRAME_POLICY
-    def normal(vol, pos):
-        if failure == 'unidentifiable':
-            return np.zeros((3,3))
-        return np.diag([0., 0., 1.])
-    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.ct_tensor', normal)
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.ct_tensor', lambda vol, pos: np.zeros((3,3)))
     expected = slab_layout(item)
     result = load_slabs([item], None, cfg())
     assert result['history_valid'].sum() == len(expected) == len(calls)

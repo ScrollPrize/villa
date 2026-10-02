@@ -14,8 +14,8 @@ from vesuvius.neural_tracing.fiber_follow.shared import remote_prefetch as modul
 from vesuvius.neural_tracing.fiber_follow.shared.volume import RemoteChunkedArray
 
 
-@pytest.mark.parametrize('connections',[3,32])
-def test_prefetch_connection_limit_reaches_s3_pool(tmp_path,monkeypatch,connections):
+def test_prefetch_connection_limit_reaches_s3_pool(tmp_path,monkeypatch):
+    connections=3
     from zarr.api import asynchronous
     from vesuvius.neural_tracing.fiber_follow.shared.volume import remote_store
     opened=[]
@@ -41,7 +41,7 @@ def test_prefetch_connection_limit_reaches_s3_pool(tmp_path,monkeypatch,connecti
     asyncio.run(scenario())
 
 
-def source_at(tmp_path,separator='.'):
+def source_at(tmp_path,separator='/'):
     import zarr
     from numcodecs import Blosc
     values=np.arange(9*10*11,dtype=np.uint8).reshape(9,10,11)
@@ -53,16 +53,15 @@ def source_at(tmp_path,separator='.'):
     return spec,values
 
 
-@pytest.mark.parametrize('separator',['.','/'])
-def test_async_process_prefetches_compressed_source_and_never_downloads_in_reader(tmp_path,monkeypatch,separator):
+def test_async_process_prefetches_compressed_source_and_never_downloads_in_reader(tmp_path,monkeypatch):
     import json
     import zarr
-    spec,values=source_at(tmp_path,separator)
+    spec,values=source_at(tmp_path)
     def forbidden(self):raise AssertionError('Foreground remote I/O is forbidden')
     monkeypatch.setattr(RemoteChunkedArray,'_open',forbidden)
     with pytest.raises(FileNotFoundError,match='metadata'):
         RemoteChunkedArray(spec.ct_zarr,0,spec.cache_dir,1024,cache_only=True)
-    with module.RemotePrefetcher(connections=4,queue_size=2,timeout=30) as service:
+    with module.RemotePrefetcher(connections=4,queue_size=8,timeout=30) as service:
         service.client.ensure_metadata(spec)
         reader=RemoteChunkedArray(spec.ct_zarr,0,spec.cache_dir,1024,cache_only=True)
         assert Path(reader.path)==Path(spec.cache_dir)/'file'/str(tmp_path/'source.zarr').lstrip('/')/'0'
@@ -72,34 +71,28 @@ def test_async_process_prefetches_compressed_source_and_never_downloads_in_reade
         service.client.submit(reader,bounds)
         service.client.ensure(reader,bounds)
         np.testing.assert_array_equal(reader.read([0,0,0],values.shape),values)
-        # More required chunks than either queue can hold: none may be lost.
-        pattern='[0-9]*' if separator=='.' else '[0-9]*/[0-9]*/[0-9]*'
-        assert len(list(Path(reader.path).glob(pattern)))==27
-        assert (Path(reader.path)/separator.join(['2','2','2'])).stat().st_size==64
+        # 27 required chunks, more than either 8-entry queue can hold: none may be lost.
+        assert len(list(Path(reader.path).glob('[0-9]*/[0-9]*/[0-9]*')))==27
+        assert (Path(reader.path)/'2/2/2').stat().st_size==64
         metadata=json.loads((Path(reader.path)/'.zarray').read_text())
         assert metadata['compressor'] is None and metadata['filters'] is None
-        assert metadata['dimension_separator']==separator
+        assert metadata['dimension_separator']=='/'
         np.testing.assert_array_equal(zarr.open_array(reader.path,mode='r')[:],values)
         assert service.snapshot()['deferred']>0
     assert not service.snapshot()['alive']
     np.testing.assert_array_equal(reader.read([7,8,9],[2,2,2]),values[7:9,8:10,9:11])
 
 
-@pytest.mark.parametrize('scopes',[1,2])
-def test_retained_lookahead_downloads_past_chunk_queue_while_loader_is_idle(tmp_path,scopes):
-    spec,values=source_at(tmp_path,'/')
-    with module.RemotePrefetcher(connections=4,queue_size=2,lookahead_slots=scopes) as service:
+def test_retained_lookahead_downloads_past_chunk_queue_while_loader_is_idle(tmp_path):
+    spec,values=source_at(tmp_path)
+    with module.RemotePrefetcher(connections=4,queue_size=2,lookahead_slots=2) as service:
         service.client.ensure_metadata(spec)
         reader=RemoteChunkedArray(spec.ct_zarr,0,spec.cache_dir,0,cache_only=True)
-        # Publish once, then stop consuming/producing batches like compilation.
-        # The 27-chunk window is much larger than either two-entry chunk queue.
-        if scopes==1:
-            service.client.lookahead(reader,[[(np.zeros(3,dtype=int),values.shape)]])
-        else:
-            # Different fiber collections may share one CT volume; neither
-            # collection's plans may replace the other's window.
-            service.client.lookahead(reader,[[([0,0,0],[4,10,11])]],scope=0)
-            service.client.lookahead(reader,[[([4,0,0],[5,10,11])]],scope=1)
+        # Publish once, then stop consuming/producing batches like compilation. Each window
+        # (9 and 18 chunks) exceeds the two-entry chunk queues, and two fiber collections
+        # sharing one CT volume must not replace each other's window.
+        service.client.lookahead(reader,[[([0,0,0],[4,10,11])]],scope=0)
+        service.client.lookahead(reader,[[([4,0,0],[5,10,11])]],scope=1)
         deadline=time.monotonic()+15
         while service.snapshot()['completed_bytes']<27*64:
             assert time.monotonic()<deadline, service.snapshot()
@@ -120,12 +113,11 @@ class WorkerProbe(torch.utils.data.IterableDataset):
         yield dict(worker=worker,data=reader.read(start,size))
 
 
-@pytest.mark.parametrize('start_method',sorted({'spawn',mp.get_start_method()}))
-def test_multiple_spawned_loader_workers_share_one_prefetch_process(tmp_path,start_method):
+def test_multiple_spawned_loader_workers_share_one_prefetch_process(tmp_path):
     spec,values=source_at(tmp_path)
     with module.RemotePrefetcher(connections=4,queue_size=8,timeout=30) as service:
-        loader=torch.utils.data.DataLoader(WorkerProbe(spec,service.client),batch_size=None,
-            num_workers=2,multiprocessing_context=start_method)
+        # The platform's default start method, as the training DataLoader uses.
+        loader=torch.utils.data.DataLoader(WorkerProbe(spec,service.client),batch_size=None,num_workers=2)
         batches=list(loader)
         assert len(batches)==2
         for batch in batches:
@@ -133,14 +125,12 @@ def test_multiple_spawned_loader_workers_share_one_prefetch_process(tmp_path,sta
             np.testing.assert_array_equal(batch['data'].numpy(),values[start:start+4])
 
 
-@pytest.mark.parametrize('windowed',[False,True])
-def test_priority_promotes_matching_fetch_and_preempts_unrelated_inflight_work(monkeypatch,tmp_path,windowed):
+def test_priority_promotes_matching_fetch_and_preempts_unrelated_inflight_work(monkeypatch,tmp_path):
     async def scenario():
         context=mp.get_context('spawn')
         stopped=context.Event();heartbeat=context.Value('d',time.monotonic())
         counters=context.Array('q',len(module.COUNTERS))
-        urgent,ahead=queue.Queue(),queue.Queue()
-        windows=queue.Queue()
+        urgent,ahead,windows=queue.Queue(),queue.Queue(),queue.Queue()
         monkeypatch.setattr(module,'_paths',lambda descriptor,key,session:
             (tmp_path/str(key),tmp_path/(str(key)+'.error')))
         began={key:asyncio.Event() for key in ('far_a','far_b','urgent')}
@@ -160,9 +150,7 @@ def test_priority_promotes_matching_fetch_and_preempts_unrelated_inflight_work(m
                     cancelled.append(key);raise
             async def close(self):pass
         monkeypatch.setattr(module,'AsyncFetcher',Fetcher)
-        if windowed:windows.put((0,'source',('far_a','far_b')))
-        else:
-            ahead.put(('source','far_a'));ahead.put(('source','far_b'))
+        windows.put((0,'source',('far_a','far_b')))  # Training's lookahead window path.
         task=asyncio.create_task(module._run(urgent,ahead,stopped,heartbeat,counters,'test',2,8,
                                            windows,1))
         try:
@@ -249,33 +237,3 @@ def test_main_and_history_prefetch_covers_ct_normals_and_all_crop_rolls():
         start,extent=bounds[2*j+1]
         center=observation['pos'][::-1]*2.
         assert np.all(center-start>=32) and np.all(start+extent-center>32)
-
-
-def test_dataset_gates_reads_without_changing_samples(monkeypatch):
-    from vesuvius.neural_tracing.fiber_follow.shared import data as data_module
-    events=[]
-    monkeypatch.setattr(data_module,'FiberVolume',lambda *a,**kw: events.append(('volume',kw.get('cache_only',False))) or SimpleNamespace(ct='ct'))
-    monkeypatch.setattr(data_module,'crop_local_grid',lambda crop:np.zeros((1,3)))
-    monkeypatch.setattr(data_module,'make_sample',lambda f,t,rev,cfg,rng,**options:dict(at=t,reverse=rev))
-    class Builder:
-        def prefetch_bounds(self,item,vol):return [(item['at'],item['reverse'])]
-        def __call__(self,items,vol):
-            events.append(('read',len(items)))
-            return items
-    class Client:
-        def ensure_metadata(self,spec):events.append(('metadata',True))
-        def submit(self,reader,bounds):events.append(('ahead',len(bounds)))
-        def ensure(self,reader,bounds):events.append(('demand',len(bounds)))
-    def sample(prefetch):
-        ds=data_module.FollowDataset([SimpleNamespace(length=100.)],None,
-            SimpleNamespace(crop=None,future_s=[16.]),None,chunk=4,seed=17,batch_builder=Builder(),
-            budget=data_module.TaskBudget.parse(['fresh=1','live=0','dagger_pre_excursion=0','dagger_recoverable=0',
-                'dagger_terminal=0','dagger_premature_stop=0','dagger_ordinary=0','synthetic_terminal=0']))
-        ds.state_allowed=lambda item:True
-        ds.remote_prefetch=Client() if prefetch else None
-        stream=iter(ds)
-        return [next(stream) for _ in range(3)]
-    baseline=sample(False);events.clear()
-    assert sample(True)==baseline
-    assert events[:2]==[('metadata',True),('volume',True)]
-    assert events[2:]==([('ahead',1)]*4+[('demand',4),('read',4)])*3

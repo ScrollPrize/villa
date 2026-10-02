@@ -18,7 +18,7 @@ def repaired(points):
     return out, runs
 
 
-def test_v_kink_is_bridged_and_nothing_else_moves():
+def test_v_and_step_kinks_are_bridged_and_nothing_else_moves():
     p = line()
     p[38:43, 1] = [1., 2., 3., 2., 1.]  # a 3-voxel V over 6 voxels
     out, runs = repaired(p)
@@ -27,9 +27,16 @@ def test_v_kink_is_bridged_and_nothing_else_moves():
     start, end = runs[0]
     outside = (p[:, 0] < start) | (p[:, 0] > end)
     np.testing.assert_array_equal(out[outside], p[outside])
+    # A sideways step becomes smooth.
+    p = line()
+    p[40:, 1] = 2.
+    out, runs = repaired(p)
+    assert len(runs) == 1
+    _, curve = unit_curve(out, arclength(out))
+    assert turning(curve).max() < 15
 
 
-def test_repair_is_idempotent_on_survey_shapes():
+def test_repair_is_idempotent_and_leaves_real_geometry_untouched():
     p = line(121)
     p[38:43, 1] = [1., 2., 3., 2., 1.]
     p[80:, 1] = 2.
@@ -39,18 +46,6 @@ def test_repair_is_idempotent_on_survey_shapes():
     twice, again = repaired(once)
     assert again == []
     np.testing.assert_array_equal(twice, once)
-
-
-def test_step_kink_becomes_smooth():
-    p = line()
-    p[40:, 1] = 2.  # the annotation jumps sideways and continues parallel
-    out, runs = repaired(p)
-    assert len(runs) == 1
-    _, curve = unit_curve(out, arclength(out))
-    assert turning(curve).max() < 15
-
-
-def test_real_geometry_is_untouched():
     t = np.arange(0., 120.)
     smooth = np.c_[t, 2*np.sin(2*np.pi*t/30), np.zeros_like(t)]
     corner = np.r_[line(41), np.c_[np.full(40, 40.), np.arange(1., 41), np.zeros(40)]]  # a 90 degree corner

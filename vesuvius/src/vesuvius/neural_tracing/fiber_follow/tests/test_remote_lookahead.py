@@ -13,16 +13,17 @@ from vesuvius.neural_tracing.fiber_follow.regression.data import IdentityObserva
 
 
 class RecordingClient:
-    def __init__(self):self.windows=[]
-    def ensure_metadata(self,spec):pass
+    def __init__(self,events=None):self.windows,self.events=[],[] if events is None else events
+    def ensure_metadata(self,spec):self.events.append('metadata')
     def submit(self,reader,bounds):pass
     def ensure(self,reader,bounds):pass
     def lookahead(self,reader,batches,**kwargs):self.windows.append(batches)
 
 
 def test_plan_count_is_bounded_and_first_batch_does_not_wait_for_horizon(monkeypatch):
-    planned=[];built=[]
-    monkeypatch.setattr(module,'FiberVolume',lambda *a,**kw:SimpleNamespace(ct=None))
+    planned=[];built=[];events=[]
+    monkeypatch.setattr(module,'FiberVolume',lambda *a,**kw:events.append(('volume',kw.get('cache_only',False)))
+                        or SimpleNamespace(ct=None))
     monkeypatch.setattr(module,'crop_local_grid',lambda crop:np.zeros((1,3)))
     def sample(f,t,rev,cfg,rng,**options):
         planned.append(t)
@@ -39,20 +40,24 @@ def test_plan_count_is_bounded_and_first_batch_does_not_wait_for_horizon(monkeyp
             budget=module.TaskBudget.parse(['fresh=1','live=0','dagger_pre_excursion=0','dagger_recoverable=0',
                 'dagger_terminal=0','dagger_premature_stop=0','dagger_ordinary=0','synthetic_terminal=0']))
         ds.state_allowed=lambda item:True
-        ds.remote_prefetch=RecordingClient()
-        ds.remote_prefetch_lookahead=lookahead
+        ds.remote_prefetch=None if lookahead is None else RecordingClient(events)
+        ds.remote_prefetch_lookahead=lookahead or 0
         return ds,iter(ds)
-    baseline,plain=stream(0)
-    expected=[next(plain) for _ in range(10)]
-    planned.clear();built.clear()
+    # Remote gating, with or without lookahead, never changes the realized batches.
+    _,local=stream(None)
+    expected=[next(local) for _ in range(10)]
+    _,plain=stream(0)
+    assert [next(plain) for _ in range(10)]==expected
+    planned.clear();built.clear();events.clear()
     ds,ahead=stream(3)
     assert next(ahead)==expected[0]
+    assert events[:2]==['metadata',('volume',True)]
     assert len(planned)==2 and len(built)==1
     for i in range(1,10):
         assert next(ahead)==expected[i]
         assert len(planned)==2*(i+1+3) and len(built)==i+1
     assert max(map(len,ds.remote_prefetch.windows))==4
-    ahead.close();plain.close()
+    ahead.close();plain.close();local.close()
 
 
 def test_lookahead_preserves_real_bank_feedback_labels_and_sample_sequence(tmp_path,monkeypatch):

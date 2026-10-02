@@ -1,6 +1,10 @@
 import pytest
 import torch
 
+# Small test models gain nothing from many intra-op threads, and on a busy host the default
+# (one per core) oversubscribes and slows compile/update tests several-fold.
+torch.set_num_threads(min(4, torch.get_num_threads()))
+
 
 @pytest.fixture(autouse=True)
 def isolate_compiler_cache():

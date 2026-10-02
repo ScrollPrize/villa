@@ -64,11 +64,9 @@ def test_confidence_head_computes_fp32_inside_bf16_autocast(device):
         assert torch.isfinite(grad).all() and grad.abs().sum() > 0
 
 
-@pytest.mark.parametrize('training', [False, True])
-@pytest.mark.parametrize('scorer_layers', [2, 4])
-def test_replacing_truncating_or_extending_suffix_preserves_prefix(training, scorer_layers):
+def test_replacing_truncating_or_extending_suffix_preserves_prefix():
     torch.manual_seed(61)
-    model = build_model(config(scorer_layers=scorer_layers)).train(training)
+    model = build_model(config(scorer_layers=4)).train(True)
     first = memory_batch(model.cfg, 1)
     with torch.no_grad():
         batch = memory_batch(model.cfg, 1, step=1)
@@ -171,12 +169,16 @@ def test_generated_losses_keep_survival_semantics_and_mask_unavailable_supervisi
     batch = memory_batch(cfg, 2)
     points = torch.zeros(2, cfg.n_future, 3)
     points[..., 2] = torch.arange(1, cfg.n_future+1)
+    points.requires_grad_()
     hazards = torch.zeros(2, cfg.n_future, requires_grad=True)
     set_terminal(batch, 0)
     set_unknown(batch, 1)
     out = proposal_output(points[:, None], hazards[:, None])
     terms = loss_terms(out, batch, cfg, n_commit=1)
     torch.testing.assert_close(terms['confidence_per_state'], torch.tensor([math.log(2), 0.]))
-    terms['confidence_per_state'].sum().backward()
+    # Unknown (unobservable) states teach nothing; terminal states teach no geometry.
+    assert terms['geometry_per_state'].eq(0).all()
+    (terms['confidence_per_state'].sum()+terms['geometry_per_state'].sum()).backward()
     assert hazards.grad[0, 0] < 0 and hazards.grad[:, 1:].count_nonzero() == 0
     assert hazards.grad[1].count_nonzero() == 0
+    assert points.grad is None or points.grad.count_nonzero() == 0

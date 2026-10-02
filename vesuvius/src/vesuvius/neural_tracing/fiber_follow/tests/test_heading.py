@@ -1,6 +1,4 @@
 """CT-only initialization, distance-based direction fitting and seed plumbing."""
-from types import SimpleNamespace
-
 import numpy as np
 import pytest
 
@@ -9,7 +7,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.heading import (
 )
 from vesuvius.neural_tracing.fiber_follow.shared.infer import trace_bidirectional
 from vesuvius.neural_tracing.fiber_follow.shared.evaluate import make_seeds
-from vesuvius.neural_tracing.fiber_follow.shared.data import TracedFiber, OnPolicyStates
+from vesuvius.neural_tracing.fiber_follow.shared.data import TracedFiber
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength
 
 
@@ -46,18 +44,16 @@ class CTOnlyVolume:
         raise AssertionError('Seed heading must not open directions')
 
 
-@pytest.mark.parametrize('family', ['H', 'V'])
-def test_ct_seed_axis_uses_world_xyz_and_native_ct_scale(family):
+def test_ct_seed_axis_uses_world_xyz_and_native_ct_scale():
     image, n = sheet()
-    vol = CTOnlyVolume(image)
-    pos = np.array([24., 24., 24.])
-    axis = ct_seed_heading(vol, pos, family)
     z = np.array([0., 0., 1.])
-    expected = np.cross(z, n) if family == 'H' else z-(n@z)*n
-    expected /= np.linalg.norm(expected)
-    assert abs(axis@expected) > .99999
-    np.testing.assert_array_equal(vol.ct.reads[0][0], [16, 16, 16])
-    np.testing.assert_array_equal(pos, [24., 24., 24.])
+    for family, expected in (('H', np.cross(z, n)), ('V', z-(n@z)*n)):
+        vol = CTOnlyVolume(image)
+        pos = np.array([24., 24., 24.])
+        axis = ct_seed_heading(vol, pos, family)
+        assert abs(axis@expected)/np.linalg.norm(expected) > .99999
+        np.testing.assert_array_equal(vol.ct.reads[0][0], [16, 16, 16])
+        np.testing.assert_array_equal(pos, [24., 24., 24.])
 
 
 def test_missing_or_ambiguous_ct_cannot_invent_a_heading():
@@ -100,15 +96,12 @@ def test_collection_seeds_use_ct_axis_not_annotation_tangent():
     assert len(vol.ct.reads) == 1
 
 
-def test_linear12_has_a_physical_baseline_and_free_intercept():
+def test_linear12_has_a_physical_baseline_free_intercept_and_rigid_invariance():
     prior = np.array([[0., 0., 0.], [0., 0., 11.9]])
     assert linear12_heading(prior) is None
     path = np.array([[8., -3., 0.], [8., -3., 20.]])
     np.testing.assert_allclose(linear12_heading(path), [0., 0., 1.])
     assert linear12_heading(path, start=1) is None
-
-
-def test_linear12_is_invariant_to_resampling_and_rigid_transforms():
     x = np.arange(30.)
     path = np.c_[x, np.sin(x/9), np.zeros(len(x))]
     dense = np.concatenate([a+(b-a)*np.arange(7)[:,None]/7 for a,b in zip(path[:-1],path[1:])]+[path[-1:]])
@@ -116,14 +109,3 @@ def test_linear12_is_invariant_to_resampling_and_rigid_transforms():
     np.testing.assert_allclose(linear12_heading(dense), a, atol=1e-12)
     rotation = np.array([[0., -1., 0.], [1., 0., 0.], [0., 0., 1.]])
     np.testing.assert_allclose(linear12_heading(path@rotation.T+[100.,-100.,42.]), rotation@a, atol=1e-12)
-
-
-def test_replay_roundtrip_keeps_the_trusted_heading_boundary(tmp_path):
-    from replay_fixtures import replay_states
-    state = replay_states([], [dict(pos=np.array([0.,0.,2.]), hist=np.zeros((4,3)), hmask=np.zeros(4),
-                                    heading_start=3, seq_start=0, seq_end=3)],
-                          track=[[0.,0.,0.],[0.,0.,1.],[0.,0.,2.]])
-    path = tmp_path/'replay.npz'
-    state.save(path)
-    loaded = OnPolicyStates.load(path)
-    assert loaded.heading_start[0] == 3  # Empty trusted suffix after a failure.

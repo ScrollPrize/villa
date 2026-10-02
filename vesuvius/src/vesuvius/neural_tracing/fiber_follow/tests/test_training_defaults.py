@@ -1,5 +1,6 @@
-"""Production training defaults and removal of mined-location inputs."""
+"""The aligned launcher's configuration, removed options and fresh-location sampling."""
 from pathlib import Path
+import shlex
 from types import SimpleNamespace
 
 import numpy as np
@@ -8,91 +9,77 @@ import pytest
 from vesuvius.neural_tracing.fiber_follow.regression.data import (
     IdentityObservationBuilder, IdentitySampling, LOCATION_SOURCES,
 )
-from vesuvius.neural_tracing.fiber_follow.regression.model import DirectConfig
-from vesuvius.neural_tracing.fiber_follow.regression.train import build_parser, main, options_argv
-from vesuvius.neural_tracing.fiber_follow.shared.training_options import normalize_batch_options
-from vesuvius.neural_tracing.fiber_follow.shared.training_log import format_training_log
+from vesuvius.neural_tracing.fiber_follow.regression import train
+from vesuvius.neural_tracing.fiber_follow.regression.model import STEM_ARCHITECTURE, DirectConfig
+from vesuvius.neural_tracing.fiber_follow.regression.train import build_parser, main
+from vesuvius.neural_tracing.fiber_follow.shared.data import TASKS, TaskBudget
 from model_fixtures import REQUIRED
 
+ROOT = Path(__file__).resolve().parents[1]
 
 
+def launcher_argv():
+    text = (ROOT/'scripts'/'train_aligned.sh').read_text().replace('\\\n', ' ')
+    command = shlex.split(next(line for line in text.splitlines() if line.startswith('exec ')))
+    argv = command[command.index('vesuvius.neural_tracing.fiber_follow.regression.train')+1:]
+    substitute = {'$task_root': str(ROOT), '$task_run': 'aligned', '$source_checkpoint': '/unused/ckpt.pt'}
+    for name, value in substitute.items():
+        argv = [arg.replace(name, value) for arg in argv]
+    return [arg for arg in argv if arg != '$@']
 
-def test_production_defaults_and_explicit_overrides():
-    parser = build_parser()
-    args = vars(parser.parse_args(REQUIRED))
-    expected = dict(steps=100000, batch=4, grad_steps=2, workers=8, n_commit=16,
-                    direction_inputs=True, task_share=[], startup_shares=(.15, .17, .17, .51),
-                    excursion_probability=.2, synthetic_tail=(4., 16.), live_continuation_steps=(12, 32),
-                    presence_dropout=0., diag_every=5000, dagger_every=1000, dagger_fibers=64, dagger_batch=8,
-                    dagger_trace_len=768., dagger_before=48., dagger_after=64., dagger_stride=16.,
-                    recurrent_refinement_steps=2, warmup=500,remote_prefetch_lookahead=16)
-    assert {key: args[key] for key in expected} == expected
-    from vesuvius.neural_tracing.fiber_follow.shared.data import TaskBudget, TASKS
-    budget = TaskBudget.parse(args['task_share'])
+
+def test_aligned_launcher_parses_to_the_planned_model_and_budget():
+    args = build_parser().parse_args(launcher_argv())
+    assert args.dataset_config == str(ROOT/'configs'/'mixed_ct_datasets_paris50.json')
+    assert args.init_weights == '/unused/ckpt.pt' and args.resume is None
+    assert args.input_mode == 'ct' and not args.direction_inputs and args.presence_dropout == 0
+    assert (args.batch, args.grad_steps, args.n_commit, args.steps) == (4, 3, 16, 40000)
+    cfg = DirectConfig(encoder=train.resolve_encoder(args.encoder), token_only=train.resolve_token_only(args.token_only),
+                       history_encoder=train.resolve_history_encoder(args.history_encoder),
+                       history_path_tokens=train.resolve_history_path_tokens(args.history_path_tokens),
+                       path_geometry_tokens=train.resolve_path_geometry_tokens(args.path_geometry_tokens),
+                       stem_channels=args.stem_channels, stem_blocks=args.stem_blocks,
+                       direction_inputs=args.direction_inputs, input_mode=args.input_mode, channels=args.channels,
+                       hidden=args.hidden, layers=args.axial_layers, encoder_ffn=args.encoder_ffn,
+                       decoder_layers=args.decoder_layers, decoder_ffn=args.decoder_ffn, scorer_layers=args.scorer_layers,
+                       recurrent_refinement_steps=args.recurrent_refinement_steps)
+    assert cfg.architecture == STEM_ARCHITECTURE.replace('_v15', '_v17')
+    assert cfg.input_channels == 1 and cfg.recurrent_refinement_steps == 3
+    budget = TaskBudget.parse(args.task_share, terminal_fallback_cap=args.terminal_fallback_cap,
+                              replay_max_age=args.replay_max_age, replay_event_cap=args.replay_event_cap)
     assert dict(zip(TASKS, budget.shares)) == dict(
         fresh=.40, live=.25, dagger_pre_excursion=.08, dagger_recoverable=.06, dagger_terminal=.08,
         dagger_premature_stop=.03, dagger_ordinary=.05, synthetic_terminal=.05)
-    assert 'compile' not in args
-    for option in ('--microbatch', '--compile', '--no-compile', '--feature-replay-weight', '--memory-slots', '--memory-steps', '--memory-stride', '--feature-sequence-length', '--history-encoder-checkpointing'):
-        with pytest.raises(SystemExit):
-            parser.parse_args(REQUIRED+[option])
-    root = Path(__file__).resolve().parents[1]
-    assert args['negative_bank'] == str(root/'output'/'neighbor_samples_r0_32_l80_160_v2')
-    custom = parser.parse_args(REQUIRED+['--batch', '16', '--no-direction-inputs',
-                                      '--negative-bank', '/tmp/custom-bank','--remote-prefetch-lookahead','0'])
-    assert custom.batch == 16 and not custom.direction_inputs
-    assert custom.negative_bank == '/tmp/custom-bank'
-    assert custom.remote_prefetch_lookahead==0
+    assert (budget.replay_max_age, budget.replay_event_cap, budget.terminal_fallback_cap) == (12000, 64, .5)
+    for option, value in (('--batch', '0'), ('--grad-steps', '0'), ('--grad-steps', '-1')):
+        with pytest.raises(ValueError, match='Positive counts'):
+            main(REQUIRED+[option, value])
 
 
-@pytest.mark.parametrize('option', ['--contacts', '--hard-spans', '--contact-fraction', '--hard-span-fraction',
-    # Superseded allocation switches, objectives and exploration have no fallback handling.
-    '--fresh-fraction', '--clean-fraction', '--decision-fraction', '--decision-choice-fraction', '--candidate-weight',
-    '--pair-rank-weight', '--gt-perturb-probability', '--replay-continuation-fraction', '--replay-failure-fraction',
-    '--memory-switch-probability', '--bank-following-probability', '--bank-wrong-continuation-probability',
-    '--no-history-prob', '--short-history-prob', '--dagger-seeds', '--following-bank'])
-def test_removed_options_are_rejected(option):
-    with pytest.raises(SystemExit):
-        build_parser().parse_args(REQUIRED+[option, '0'])
+def test_removed_options_are_rejected():
+    removed = ['--contacts', '--hard-spans', '--contact-fraction', '--hard-span-fraction', '--fresh-fraction',
+               '--clean-fraction', '--decision-fraction', '--decision-choice-fraction', '--candidate-weight',
+               '--pair-rank-weight', '--gt-perturb-probability', '--replay-continuation-fraction',
+               '--replay-failure-fraction', '--memory-switch-probability', '--bank-following-probability',
+               '--bank-wrong-continuation-probability', '--no-history-prob', '--short-history-prob', '--dagger-seeds',
+               '--following-bank', '--microbatch', '--feature-replay-weight', '--memory-slots', '--memory-steps',
+               '--memory-stride', '--feature-sequence-length', '--memory-version', '--proposal-step',
+               '--proposal-warmup-steps']
+    switches = ['--live-continuation', '--live-continuation-stratified', '--correct-replay-only',
+                '--prefer-real-wrong-turns', '--prefer-replay-for-light-gt', '--compile', '--no-compile',
+                '--history-encoder-checkpointing']
+    parser = build_parser()
+    assert 'compile' not in vars(parser.parse_args(REQUIRED))
+    for argv in [[option, '1'] for option in removed]+[[flag] for flag in switches]:
+        with pytest.raises(SystemExit) as error:
+            parser.parse_args(REQUIRED+argv)
+        assert error.value.code == 2, argv
 
 
-@pytest.mark.parametrize('flag', ['--live-continuation', '--live-continuation-stratified', '--correct-replay-only',
-                                  '--prefer-real-wrong-turns', '--prefer-replay-for-light-gt'])
-def test_removed_switches_are_rejected(flag):
-    with pytest.raises(SystemExit):
-        build_parser().parse_args(REQUIRED+[flag])
-
-
-@pytest.mark.parametrize('shares', [['fresh=.5'], ['unknown=.1'], ['fresh=-.1', 'live=.75']])
-def test_task_budget_must_be_a_complete_distribution(shares):
-    from vesuvius.neural_tracing.fiber_follow.shared.data import TaskBudget
-    with pytest.raises(ValueError):
-        TaskBudget.parse(shares)
-
-
-@pytest.mark.parametrize('options', [dict(batch=24, microbatch=12), dict(batch=12, grad_steps=2)])
-def test_saved_batch_options_preserve_effective_batch(options):
-    original = dict(options)
-    args = build_parser().parse_args(REQUIRED+options_argv(options))
-    assert (args.batch, args.grad_steps) == (12, 2)
-    assert options == original
-    text = format_training_log(dict(event='resume_configuration', step=1000,
-                                    checkpoint='checkpoint.pt', training_options=options))
-    assert 'batch 12 / grad steps 2' in text
-    assert 'microbatch' not in text
-
-
-@pytest.mark.parametrize('options', [dict(batch=24, microbatch=0), dict(batch=25, microbatch=12),
-                                   dict(batch=24, microbatch=12, grad_steps=1)])
-def test_invalid_legacy_batch_options_are_rejected(options):
-    with pytest.raises(ValueError):
-        normalize_batch_options(options)
-
-
-@pytest.mark.parametrize('option,value', [('--batch', '0'), ('--grad-steps', '0'), ('--grad-steps', '-1')])
-def test_nonpositive_accumulation_settings_are_rejected(option, value):
-    with pytest.raises(ValueError, match='Positive counts'):
-        main(REQUIRED+[option, value])
+def test_task_budget_must_be_a_complete_distribution():
+    for shares in (['fresh=.5'], ['unknown=.1'], ['fresh=-.1', 'live=.75']):
+        with pytest.raises(ValueError):
+            TaskBudget.parse(shares)
 
 
 def test_fresh_location_only_oversamples_available_lateral_history():

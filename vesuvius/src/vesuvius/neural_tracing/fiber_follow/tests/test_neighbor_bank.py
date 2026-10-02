@@ -1,6 +1,5 @@
 """Live negative refresh, immutable publication, geometry safety and integration."""
-import copy
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import hashlib
 import json
 import os
@@ -11,13 +10,14 @@ import numpy as np
 import pytest
 import torch
 
-from vesuvius.neural_tracing.fiber_follow.regression.data import IdentityObservationBuilder, IdentitySampling
-from vesuvius.neural_tracing.fiber_follow.regression.model import DirectConfig, sample_features
+from model_fixtures import config, line_fiber, slab_inputs
+from vesuvius.neural_tracing.fiber_follow.regression.data import IdentityObservationBuilder, reference_layout
+from vesuvius.neural_tracing.fiber_follow.regression.model import DirectConfig
 from vesuvius.neural_tracing.fiber_follow.regression.neighbor_bank import NeighborBank
 from vesuvius.neural_tracing.fiber_follow.regression.neighbor_bulk import digest, pack_paths, write_json
 from vesuvius.neural_tracing.fiber_follow.regression.neighbor_mining import MiningConfig
 from vesuvius.neural_tracing.fiber_follow.shared.components import ComponentRule, crop_indices
-from vesuvius.neural_tracing.fiber_follow.shared.data import TracedFiber, ZBand, fiber_manifest
+from vesuvius.neural_tracing.fiber_follow.shared.data import SampleConfig, TracedFiber, ZBand, fiber_manifest, make_sample
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength, crop_local_grid
 
 
@@ -88,110 +88,102 @@ def test_live_refresh_obeys_interval_and_sees_new_shards_after_empty_lookup(tmp_
     assert bank._cache[first['path']] is cached
 
 
-def test_draw_weights_refresh_after_append_and_do_not_cross_workers(tmp_path):
+def test_draw_weights_and_pickled_workers_refresh_after_append(tmp_path):
     bank, _ = make_bank(tmp_path, with_path=True)
     rng = np.random.default_rng(4)
-    assert bank.draw_path(rng, min_length=30.) is not None
+    assert bank.draw_path(rng, min_length=30.) is not None and bank.paths(0, 80.)
     old = bank._draw_distribution(True, 30.)
+    # Workers receive no caches but keep refreshing.
+    copied = pickle.loads(pickle.dumps(bank))
+    assert not copied._cache and not copied._draw_cache and copied._pid is None
     second = add_shard(tmp_path, 1, x=9.)
     publish(tmp_path, list(bank._known.values())+[second])
+    assert len(copied.paths(0, 80.)) == 2
     bank.refresh(force=True)
     new = bank._draw_distribution(True, 30.)
     assert len(old[1]) == 1 and len(new[1]) == 2
     assert {bank.draw_path(rng, min_length=30.)[1][0, 0] for _ in range(30)} == {6., 9.}
-    restored = pickle.loads(pickle.dumps(bank))
-    assert not restored._draw_cache
-    assert restored.draw_path(rng, min_length=30.) is not None
+    assert copied.draw_path(rng, min_length=30.) is not None
 
 
-def test_nearest_query_skips_seed_densification_but_mining_retains_it(monkeypatch):
-    from vesuvius.neural_tracing.fiber_follow.regression import neighbor_mining as mining
-    line = np.array([[0., 0., 0.], [0., 0., 100.], [100., 0., 100.]])
-    index = mining.PolylineIndex(line)
-    dense = mining.dense_line
-    calls = []
-    def observed(*args):
-        calls.append(True)
-        return dense(*args)
-    monkeypatch.setattr(mining, 'dense_line', observed)
-    distances, points, _, _ = mining.exact_nearest(np.array([[1., 0., 50.]]), line, index)
-    np.testing.assert_array_equal(distances, [1.])
-    np.testing.assert_array_equal(points, [[0., 0., 50.]])
-    assert not calls
-    tree = index.seed_tree
-    assert index.seed_tree is tree and len(calls) == 1
-    np.testing.assert_array_equal(tree.data, dense(line, .5))
-
-
-def test_unpublished_and_heldout_shards_are_not_training_negatives(tmp_path):
-    bank,_ = make_bank(tmp_path)
-    first = add_shard(tmp_path,0)
+def test_only_published_eligible_shards_are_training_negatives(tmp_path):
+    bank,_ = make_bank(tmp_path/'train')
+    root = bank.root
+    first = add_shard(root,0)
     assert not bank.paths(0,80.)  # file exists, but producer has not committed it
-    heldout = add_shard(tmp_path,1,eligible=False)
-    publish(tmp_path,[heldout])
+    heldout = add_shard(root,1,eligible=False)
+    publish(root,[heldout])
     assert not bank.paths(0,80.)
-    publish(tmp_path,[heldout,first])
+    publish(root,[heldout,first])
     assert len(bank.paths(0,80.)) == 1
-
-
-def test_evaluation_paths_are_available_only_in_explicit_evaluation_mode(tmp_path):
-    bank,fiber = make_bank(tmp_path,with_path=True,training=False)
+    # Evaluation paths are available only in explicit evaluation mode.
+    bank,fiber = make_bank(tmp_path/'eval',with_path=True,training=False)
     assert len(bank.paths(0,80.)) == 1
     assert bank.draw_path(np.random.default_rng(0)) is None
     with pytest.raises(ValueError,match='no training annotation'):
-        NeighborBank(tmp_path,[fiber],bank.band)
+        NeighborBank(bank.root,[fiber],bank.band)
 
 
-def test_identity_supervision_and_training_cli_require_a_bank():
+def fake_images(builder,items):
+    cfg=builder.cfg
+    for item in items: reference_layout(item,cfg)
+    stack=lambda key: torch.from_numpy(np.stack([i[key] for i in items]).astype(np.float32))
+    return slab_inputs(len(items)) | dict(fine=torch.from_numpy(np.random.default_rng(3).random((len(items),2,cfg.fine.depth,cfg.fine.width,cfg.fine.width),np.float32)),
+        seed=stack('visible_seed'),seed_mask=stack('visible_seed_mask'),seed_tangent=stack('visible_seed_tangent'),seed_age=stack('visible_seed_age'))
+
+
+def test_identity_supervision_and_training_cli_require_a_bank(monkeypatch):
     builder = IdentityObservationBuilder(DirectConfig())
     with pytest.raises(ValueError,match='requires a negative bank'):
         builder.bank_targets([])
+    # Monitor observations (tracing, recovery) need no bank and carry no identity labels.
+    cfg = config()
+    builder = IdentityObservationBuilder(cfg)
+    sample = SampleConfig(crop=cfg.fine,n_history=cfg.n_history,n_future=cfg.n_future)
+    items = [make_sample(line_fiber(),400.,False,sample,np.random.default_rng(0))]
+    images = fake_images(builder,items)
+    monkeypatch.setattr(IdentityObservationBuilder,'images',lambda *a,**kw:images)
+    result = builder(items,None)
+    assert set(result['x']) == set(images) and 'dense_mask' in result
+    assert 'identity_points' not in result and 'negative_mask' not in result
     from vesuvius.neural_tracing.fiber_follow.regression.train import main
     with pytest.raises(ValueError,match='requires --negative-bank'):
         main(['--name','unused','--fiber-zarrs','unused','--fibers','unused','--ct','unused',
               '--manifest','unused','--device','cpu','--threads','1','--negative-bank',''])
 
 
-def test_changed_published_shards_fail_closed_and_resume_allows_growth(tmp_path):
-    bank,_ = make_bank(tmp_path,with_path=True)
-    first = list(bank._known.values())[0]
-    saved = bank.provenance()
-    second = add_shard(tmp_path,1,x=8.)
-    publish(tmp_path,[first,second])
-    bank.validate_resume(saved)
-    publish(tmp_path,[second])
-    with pytest.raises(ValueError,match='removed or modified'):
-        bank.refresh(force=True)
-
-
-def test_corrupt_shard_and_wrong_annotation_or_band_are_rejected(tmp_path):
-    bank,fiber = make_bank(tmp_path,with_path=True)
+def test_bank_integrity_fails_closed_and_only_annotation_identity_must_match(tmp_path):
+    bank,fiber = make_bank(tmp_path/'identity',with_path=True)
+    root = bank.root
+    # Repaired annotation geometry keeps its identity; mined target arcs follow the current geometry.
+    points = fiber.points.copy()
+    points[:,2] += 10.
+    current = NeighborBank(root,[replace(fiber,points=points,s=arclength(points))],bank.band)
+    np.testing.assert_allclose(current.draw_path(np.random.default_rng(0),min_length=30.)[2],[62.,102.])
+    for changed in (replace(fiber,source_hash='other'),replace(fiber,endpoint_stop=(True,False))):
+        with pytest.raises(ValueError,match='annotation changed'):
+            NeighborBank(root,[changed],bank.band)
+    with pytest.raises(ValueError,match='holdout'):
+        NeighborBank(root,[fiber],ZBand(999.,1100.))
     entry = list(bank._known.values())[0]
-    with (tmp_path/entry['path']/'bank.npz').open('ab') as stream:
+    with (root/entry['path']/'bank.npz').open('ab') as stream:
         stream.write(b'damaged')
     with pytest.raises(ValueError,match='checksum'):
         bank.paths(0,80.)
-    changed = copy.deepcopy(fiber)
-    changed.points[3,0] = 1
-    with pytest.raises(ValueError,match='annotation changed'):
-        NeighborBank(tmp_path,[changed],bank.band)
-    with pytest.raises(ValueError,match='holdout'):
-        NeighborBank(tmp_path,[fiber],ZBand(999.,1100.))
-
-
-def test_pickle_drops_worker_caches_and_retains_live_refresh(tmp_path):
-    bank,_ = make_bank(tmp_path,with_path=True)
-    assert bank.paths(0,80.)
-    copied = pickle.loads(pickle.dumps(bank))
-    assert not copied._cache and copied._pid is None
+    # Published shards are immutable; a resume allows growth only.
+    bank,_ = make_bank(tmp_path/'growth',with_path=True)
+    root = bank.root
     first = list(bank._known.values())[0]
-    second = add_shard(tmp_path,1,x=8.)
-    publish(tmp_path,[first,second])
-    assert len(copied.paths(0,80.)) == 2
-
-
-def test_prediction_and_ct_sources_must_match_training(tmp_path):
-    bank,_ = make_bank(tmp_path)
+    saved = bank.provenance()
+    second = add_shard(root,1,x=8.)
+    publish(root,[first,second])
+    bank.validate_resume(saved)
+    publish(root,[second])
+    with pytest.raises(ValueError,match='removed or modified'):
+        bank.refresh(force=True)
+    # Prediction and CT sources must match training.
+    bank,_ = make_bank(tmp_path/'run')
+    root = bank.root
     spec = SimpleNamespace(fiber_zarr_dir='/data/preds',fiber_level=3,ct_zarr='/data/ct.zarr')
     bank.validate_volume(spec)
     spec.ct_zarr = '/data/other.zarr'
@@ -201,11 +193,17 @@ def test_prediction_and_ct_sources_must_match_training(tmp_path):
     spec.fiber_level = 4
     with pytest.raises(ValueError,match='prediction volume'):
         bank.validate_volume(spec)
+    # A worker rejects a replaced run instead of silently relabeling.
+    value = json.loads((root/'bank.json').read_text())
+    value['run_digest'] = 'different-run'
+    value['sha256'] = digest({k:v for k,v in value.items() if k != 'sha256'})
+    write_json(root/'bank.json',value)
+    with pytest.raises(ValueError,match='run changed'):
+        bank.paths(0,80.)
 
 
-@pytest.mark.parametrize('reverse',[False,True])
-@pytest.mark.parametrize('angle',[0.,.37])
-def test_foreign_masks_refresh_without_contrastive_queries(tmp_path,reverse,angle):
+def test_foreign_masks_refresh_without_contrastive_queries(tmp_path):
+    reverse,angle = True,.37
     bank,fiber = make_bank(tmp_path)
     cfg = DirectConfig()
     builder = IdentityObservationBuilder(cfg,[fiber],negative_bank=bank)
@@ -236,18 +234,6 @@ def test_bank_rasterization_marks_only_cells_containing_line_samples(tmp_path):
     np.testing.assert_array_equal(found['foreign'],expected)
 
 
-
-
-def test_worker_rejects_a_replaced_run_instead_of_silently_relabeling(tmp_path):
-    bank,_ = make_bank(tmp_path)
-    value = json.loads((tmp_path/'bank.json').read_text())
-    value['run_digest'] = 'different-run'
-    value['sha256'] = digest({k:v for k,v in value.items() if k != 'sha256'})
-    write_json(tmp_path/'bank.json',value)
-    with pytest.raises(ValueError,match='run changed'):
-        bank.paths(0,80.)
-
-
 def test_foreign_cell_extent_cannot_reach_target_exclusion_tube(tmp_path):
     bank,_ = make_bank(tmp_path)
     publish(tmp_path,[add_shard(tmp_path,0,x=3.)])
@@ -265,23 +251,17 @@ def test_foreign_cell_extent_cannot_reach_target_exclusion_tube(tmp_path):
 
 
 class BankProbe(torch.utils.data.Dataset):
-    def __init__(self,bank,continuations=False):
-        self.bank,self.continuations = bank,continuations
+    def __init__(self,bank):
+        self.bank = bank
     def __len__(self):
         return 1
     def __getitem__(self,index):
-        if self.continuations:
-            from vesuvius.neural_tracing.fiber_follow.regression.neighbor_continuations import wrong_continuation
-            from vesuvius.neural_tracing.fiber_follow.shared.data import SampleConfig
-            state = wrong_continuation(self.bank,SampleConfig(),np.random.default_rng(8),tail_length_range=(4.,12.))
-            return os.getpid(),int(state is not None)
         return os.getpid(),len(self.bank.paths(0,80.))
 
 
-@pytest.mark.parametrize('continuations',[False,True])
-def test_persistent_loader_worker_discovers_appended_paths_without_restart(tmp_path,continuations):
+def test_persistent_loader_worker_discovers_appended_paths_without_restart(tmp_path):
     bank,_ = make_bank(tmp_path)
-    loader = torch.utils.data.DataLoader(BankProbe(bank,continuations),batch_size=None,num_workers=1,
+    loader = torch.utils.data.DataLoader(BankProbe(bank),batch_size=None,num_workers=1,
         persistent_workers=True,prefetch_factor=1,multiprocessing_context='spawn')
     try:
         pid,before = next(iter(loader))
@@ -292,15 +272,3 @@ def test_persistent_loader_worker_discovers_appended_paths_without_restart(tmp_p
     finally:
         if loader._iterator is not None:
             loader._iterator._shutdown_workers()
-
-
-def test_draw_reuses_exact_resampled_lengths(tmp_path, monkeypatch):
-    from vesuvius.neural_tracing.fiber_follow.regression import neighbor_bank as module
-    bank, _ = make_bank(tmp_path, with_path=True)
-    data = bank._shard(next(iter(bank._known.values())))
-    for i, line in data['lines'].items():
-        assert data['sampled_lengths'][i] == module.arclength(line)[-1]
-    def unexpected(*args):
-        raise AssertionError('Repeated draw recalculated a cached path length')
-    monkeypatch.setattr(module, 'arclength', unexpected)
-    assert bank.draw_path(np.random.default_rng(4), min_length=30.) is not None

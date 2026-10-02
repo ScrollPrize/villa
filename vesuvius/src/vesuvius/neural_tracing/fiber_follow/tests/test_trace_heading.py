@@ -43,7 +43,11 @@ class RecordingTracer(ModelTracer):
         return torch.zeros(len(pos), 1)
 
 
-def test_rejected_decision_stops_immediately_and_is_observed_without_a_forced_commit():
+def test_rejected_decision_stops_immediately_and_is_observed_without_a_forced_commit(monkeypatch):
+    calls = []
+    sheet = np.outer(np.array([0., -1., 0.]), np.array([0., -1., 0.]))
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.ct_tensor',
+                        lambda vol, pos: calls.append(1) or sheet)
     predictions = [
         ([[0., 0., 1.], [1., 0., 2.]], [.9, .9]),
         ([[3., 0., 1.], [3., 0., 2.]], [.1, .1]),  # Rejected after refinement: the trace ends here.
@@ -57,6 +61,7 @@ def test_rejected_decision_stops_immediately_and_is_observed_without_a_forced_co
     finally:
         tracer.close()
     assert reasons == ['confidence'] and len(states) == 2 and len(tracer.inputs) == 2
+    assert len(calls) == 2  # Seed and accepted commit; a rejected decision never re-estimates roll.
     assert [s['n_commit'] for s in states] == [2, 0] and states[1]['would_stop']
     # The rejected proposal is retained in the observed decision but never committed.
     np.testing.assert_array_equal(states[1]['points'], np.asarray(predictions[1][0], np.float32))
@@ -64,18 +69,14 @@ def test_rejected_decision_stops_immediately_and_is_observed_without_a_forced_co
     assert not hasattr(TraceParams(), 'explore_calls') and not hasattr(TraceParams(), 'stop_patience')
 
 
-@pytest.mark.parametrize('first,confidence,reason', [
-    ([3., 0., 1.], .1, 'confidence'),
-    ([7., 0., 1.], .9, 'recovery_limit'),
-])
-def test_rejections_respect_stopping_and_recovery_limits(first, confidence, reason):
-    tracer = RecordingTracer([([first, [0., 0., 2.]], [confidence, confidence])])
+def test_confident_proposal_beyond_the_recovery_limit_is_rejected():
+    tracer = RecordingTracer([([[7., 0., 1.], [0., 0., 2.]], [.9, .9])])
     seed = np.array([[100., 100., 100.]])
     try:
         paths, reasons = tracer.trace(seed, np.array([[0., 0., 1.]]))
     finally:
         tracer.close()
-    assert reasons == [reason]
+    assert reasons == ['recovery_limit']
     np.testing.assert_array_equal(paths[0], seed)
     assert len(tracer.inputs) == 1
 
@@ -93,13 +94,25 @@ def record(predictions, *, histories=None, initial=None, **policy):
     return rows
 
 
-def test_one_point_commits_accumulate_a_twelve_voxel_heading_baseline():
+def test_one_point_commits_accumulate_a_twelve_voxel_heading_baseline(monkeypatch):
     step = ([[1., 0., 1.], [1., 0., 2.]], [.9, .1])
     rows = record([step]*10)
     for row in rows[:9]:
         np.testing.assert_array_equal(row['frame'], rows[0]['frame'])
     expected = rows[0]['frame'] @ normalize(np.array([1., 0., 1.]))
     np.testing.assert_allclose(rows[9]['frame'][:, 2], expected, atol=1e-12)
+    # Every accepted short step re-estimates roll from CT, keeping the heading.
+    calls = []
+    def changing_normal(vol, pos):
+        calls.append(1)
+        n = np.array([np.cos(.2*(len(calls)-1)), np.sin(.2*(len(calls)-1)), 0.])
+        return np.outer(n, n)
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.ct_tensor', changing_normal)
+    rows = record([([[0., 0., 1.], [0., 0., 2.]], [.9, .1])]*3)
+    assert len(calls) == 3
+    for row in rows:
+        np.testing.assert_array_equal(row['frame'][:, 2], [0., 0., 1.])
+    assert rows[0]['frame'][:, 0] @ rows[2]['frame'][:, 0] < .95
 
 
 def test_single_lateral_correction_cannot_replace_an_established_axis():

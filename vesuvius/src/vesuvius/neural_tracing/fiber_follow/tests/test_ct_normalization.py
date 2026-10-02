@@ -1,4 +1,4 @@
-"""Default CT calibration, restart persistence, masks, and shared crop semantics."""
+"""Per-crop z-score CT inputs, init/resume/inference persistence and the calibration guard."""
 import copy
 import json
 import pickle
@@ -12,44 +12,6 @@ from vesuvius.neural_tracing.fiber_follow.shared import ct_normalization as norm
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolumeSpec, FiberVolume
 from vesuvius.neural_tracing.fiber_follow.regression.data import augment_image_pair, image_crop
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
-
-
-def test_zscore_uses_all_pixels_without_clipping_or_background_sentinel():
-    image = np.arange(512, dtype=np.float32).reshape(8, 8, 8)/512
-    image[0, 0, 0] = 100.
-    expected = (image.astype(np.float64)-image.mean(dtype=np.float64))/image.std(dtype=np.float64)
-    norm.normalize_ct(image, dict(method=norm.ZSCORE_METHOD))
-    np.testing.assert_allclose(image, expected, atol=2e-6)
-    assert abs(image.mean()) < 1e-6 and abs(image.std()-1) < 1e-6
-    assert image.max() > 4
-    for value in (0., .37):
-        constant = np.full((8, 8, 8), value, np.float32)
-        norm.normalize_ct(constant, dict(method=norm.ZSCORE_METHOD))
-        assert np.isfinite(constant).all() and not constant.any()
-
-
-def test_zscore_inference_and_resume_preserve_policy_without_calibration(tmp_path, monkeypatch):
-    spec = volume(tmp_path)
-    document = dict(method=norm.ZSCORE_METHOD, volumes={norm.volume_key(spec): dict(
-        method=norm.ZSCORE_METHOD, volume=norm.volume_key(spec), epsilon=norm.ZSCORE_EPSILON,
-        shape=[48, 16, 16], chunks=[16, 16, 16], dtype='|u1')})
-    monkeypatch.setattr(norm, 'calibrate', lambda *a: pytest.fail('Z-score must not calibrate background'))
-    norm.prepare_normalization(tmp_path/'run', [spec], resume=document)
-    image = image_crop([dict(pos=np.array([8., 8., 36.]), frame=np.eye(3))],
-                       FiberVolume(spec), CropSpec(8, 8, 4, 1.), input_mode='ct')
-    assert abs(float(image.mean())) < 1e-5
-    assert abs(float(image.std(correction=0))-1) < 1e-5
-    second = volume(tmp_path/'second')
-    inferred = norm.prepare_normalization(tmp_path/'inference', [second], known=document)
-    assert inferred['method'] == norm.ZSCORE_METHOD
-    assert second.ct_normalization['method'] == norm.ZSCORE_METHOD
-
-
-def test_zscore_augmentation_does_not_mask_values_below_minus_four():
-    image = np.linspace(-8, 8, 64, dtype=np.float32).reshape(1, 4, 4, 4)
-    before = image.copy()
-    augment_image_pair(torch.from_numpy(image), (1., 0., 0.), np.random.default_rng(1), zscore=True)
-    np.testing.assert_array_equal(image, before)
 
 
 def record(spec, center=50., noise=4.):
@@ -70,35 +32,58 @@ def volume(tmp_path):
                            load_presence=False, grid_scale=1., ct_grid_scale=1.)
 
 
-def test_resume_reuses_exact_json_and_checkpoint_without_calibrating(tmp_path, monkeypatch):
+def test_zscore_uses_all_pixels_without_clipping_or_background_sentinel():
+    image = np.arange(512, dtype=np.float32).reshape(8, 8, 8)/512
+    image[0, 0, 0] = 100.
+    expected = (image.astype(np.float64)-image.mean(dtype=np.float64))/image.std(dtype=np.float64)
+    norm.normalize_ct(image, dict(method=norm.ZSCORE_METHOD))
+    np.testing.assert_allclose(image, expected, atol=2e-6)
+    assert abs(image.mean()) < 1e-6 and abs(image.std()-1) < 1e-6
+    assert image.max() > 4
+    for value in (0., .37):
+        constant = np.full((8, 8, 8), value, np.float32)
+        norm.normalize_ct(constant, dict(method=norm.ZSCORE_METHOD))
+        assert np.isfinite(constant).all() and not constant.any()
+    # Augmentation never masks values below the old -4 sentinel.
+    image = np.linspace(-8, 8, 64, dtype=np.float32).reshape(1, 4, 4, 4)
+    before = image.copy()
+    augment_image_pair(torch.from_numpy(image), (1., 0., 0.), np.random.default_rng(1), zscore=True)
+    np.testing.assert_array_equal(image, before)
+
+
+def test_zscore_init_resume_and_inference_reuse_the_checkpoint_policy(tmp_path, monkeypatch):
     spec = volume(tmp_path)
+    crop, items = CropSpec(8, 8, 4, 1.), [dict(pos=np.array([8., 8., 36.]), frame=np.eye(3))]
+    with pytest.raises(ValueError, match='calibration is required'):
+        image_crop(items, FiberVolume(spec), crop, input_mode='ct')
+    key = norm.volume_key(spec)
+    document = dict(method=norm.ZSCORE_METHOD, volumes={key: dict(
+        method=norm.ZSCORE_METHOD, volume=key, epsilon=norm.ZSCORE_EPSILON,
+        shape=[48, 16, 16], chunks=[16, 16, 16], dtype='|u1')})
+    monkeypatch.setattr(norm, 'calibrate', lambda *a, **kw: pytest.fail('Z-score must not calibrate'))
+    # Init weights and resume take the checkpoint document exactly; a lost JSON is restored from it.
     out = tmp_path/'run'
-    document = norm.prepare_normalization(out, [spec])
-    assert 47 <= spec.ct_normalization['center'] <= 53
-    saved = (out/'ct_normalization.json').read_bytes()
-    monkeypatch.setattr(norm, 'calibrate', lambda *a, **kw: pytest.fail('Recomputed calibration on resume'))
     assert norm.prepare_normalization(out, [spec], resume=document) == document
-    assert (out/'ct_normalization.json').read_bytes() == saved
+    saved = (out/'ct_normalization.json').read_bytes()
     (out/'ct_normalization.json').unlink()
     assert norm.prepare_normalization(out, [spec], resume=document) == document
     assert (out/'ct_normalization.json').read_bytes() == saved
     assert pickle.loads(pickle.dumps(spec)).ct_normalization == spec.ct_normalization
+    image = image_crop(items, FiberVolume(spec), crop, input_mode='ct')
+    assert abs(float(image.mean())) < 1e-5
+    assert abs(float(image.std(correction=0))-1) < 1e-5
     bad = copy.deepcopy(document)
-    bad['volumes'][norm.volume_key(spec)]['noise'] += 1
+    bad['volumes'][key]['epsilon'] = 1e-3
     (out/'ct_normalization.json').write_text(json.dumps(bad))
     with pytest.raises(ValueError, match='differs'):
         norm.prepare_normalization(out, [spec], resume=document)
     with pytest.raises(ValueError, match='differs from the checkpoint'):
         norm.prepare_normalization(out, [spec], known=document)
-
-
-def test_new_inference_volume_gets_own_estimate_and_metadata_changes_fail(tmp_path):
-    spec = volume(tmp_path)
-    known = norm.prepare_normalization(tmp_path/'train', [spec])
+    # A new inference volume gets its own record under the checkpoint's policy.
     second = volume(tmp_path/'second')
-    infer = norm.prepare_normalization(tmp_path/'infer', [second], known=known)
-    assert norm.volume_key(second) in infer['volumes']
-    assert norm.volume_key(second) not in known['volumes']
+    inferred = norm.prepare_normalization(tmp_path/'infer', [second], known=document)
+    assert inferred['method'] == second.ct_normalization['method'] == norm.ZSCORE_METHOD
+    assert norm.volume_key(second) in inferred['volumes'] and norm.volume_key(second) not in document['volumes']
     with pytest.raises(ValueError, match='different volume'):
         norm.validate_record(spec.ct_normalization, second)
     meta_path = Path(second.ct_zarr)/'0'/'.zarray'
@@ -106,64 +91,3 @@ def test_new_inference_volume_gets_own_estimate_and_metadata_changes_fail(tmp_pa
     meta_path.write_text(json.dumps(meta))
     with pytest.raises(ValueError, match='metadata changed'):
         norm.prepare_normalization(tmp_path/'infer', [second])
-
-
-def test_continuous_foreground_threshold_and_robust_statistics():
-    rng = np.random.default_rng(83)
-    image = rng.uniform(0, 1, (24, 20, 20)).astype(np.float32)
-    r = dict(threshold=62., noise=4.)
-    image[0,0,:6] = [0., np.nan, np.inf, 62/255, 61.999/255, 62.001/255]
-    original = image.copy()
-    sample = original[::4, ::4, ::4]
-    bins = np.floor(sample[np.isfinite(sample) & (sample > np.float32(62/255))]*255+.5)
-    center = np.quantile(bins, .5, method='inverted_cdf')
-    scale = max(8., 1.4826*np.quantile(np.abs(bins-center), .5, method='inverted_cdf'))
-    expected = np.where(np.isfinite(original) & (original > np.float32(62/255)),
-                        np.clip((original*255-center)/scale, -4, 4), -4)
-    norm.normalize_ct(image, r)
-    np.testing.assert_allclose(image, expected, atol=2e-6)
-    assert np.all(image[0,0,:5] == -4)
-    assert image[0,0,5] > -4
-
-
-def test_empty_and_thin_foreground_and_bright_spikes_are_safe():
-    r = dict(threshold=62., noise=4.)
-    for value in (0., 50/255, np.nan):
-        image = np.full((8, 9, 9), value, np.float32)
-        norm.normalize_ct(image, r)
-        assert np.all(image == -4)
-    image = np.full((8, 9, 9), 50/255, np.float32)
-    image[1,1,1] = 100/255  # Misses the sampled grid: full foreground fallback.
-    norm.normalize_ct(image, r)
-    assert abs(image[1,1,1]) < 1e-6
-    assert np.count_nonzero(image > -4) == 1
-    base = np.full((24,24,24), 100/255, np.float32)
-    spikes = base.copy(); spikes.ravel()[::101] = 1.
-    norm.normalize_ct(base, r); norm.normalize_ct(spikes, r)
-    np.testing.assert_allclose(spikes.ravel()[1:101], base.ravel()[1:101], atol=1e-6)
-
-
-def test_scalar_sampler_normalizes_ct_and_requires_calibration(tmp_path):
-    spec = volume(tmp_path)
-    vol = FiberVolume(spec)
-    crop = CropSpec(depth=8, width=8, behind=4, spacing=1.)
-    items = [dict(pos=np.array([8.,8.,36.]), frame=np.eye(3))]
-    with pytest.raises(ValueError, match='calibration is required'):
-        image_crop(items, vol, crop, input_mode='ct')
-    norm.prepare_normalization(tmp_path/'run', [spec])
-    image = image_crop(items, vol, crop, input_mode='ct')
-    assert torch.isfinite(image).all() and image.min() < 0 and image.max() > 0
-    items[0]['pos'][:] = -100
-    assert torch.all(image_crop(items, vol, crop, input_mode='ct') == -4)
-
-
-def test_augmentations_preserve_black_mask_and_auxiliary_channels():
-    image = torch.zeros(8, 16, 16, 16)
-    image[0] = -4; image[0,4:12,4:12,4:12] = .5
-    image[1:] = torch.rand_like(image[1:])
-    background = image[0] == -4; directions = image[2:].clone()
-    augment_image_pair(image, (1.3, .1, .07), np.random.default_rng(13), blur_sigma=1., drop_presence=True)
-    assert torch.all(image[0][background] == -4)
-    assert image[0][~background].std() > 0
-    assert image[1].count_nonzero() == 0
-    assert torch.equal(image[2:], directions)

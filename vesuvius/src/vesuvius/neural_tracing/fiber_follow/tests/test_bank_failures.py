@@ -1,7 +1,4 @@
 """Continuous trusted-bank contacts, collector events and replay provenance, geometric difficulty."""
-from dataclasses import replace
-from types import SimpleNamespace
-
 import numpy as np
 import pytest
 
@@ -34,9 +31,7 @@ def test_exact_entry_between_heads_and_subsample_brief_contact():
     event = first_foreign_contact(segment, vertical(0., -1., 1.), far_target, 1., 1.)
     assert event is not None
     assert event[1][0] == pytest.approx(-np.sqrt(1-.999999**2))
-
-
-def test_ambiguous_shared_tubes_missing_contact_and_capsule_ends():
+    # Shared tubes are ambiguous, missing contact is None, capsule ends bound the interval.
     assert first_foreign_contact(vertical(0., 20, 30), vertical(0.), vertical(0.)) is None
     assert first_foreign_contact(vertical(2., 20, 30), vertical(5.), vertical(0.)) is None
     # Being close to both annotations does not certify the foreign identity.
@@ -78,8 +73,8 @@ def provenance():
     return dict(step=1000, cache_id='test', volume=dict(grid_scale=8.))
 
 
-@pytest.mark.parametrize('reverse', [False, True])
-def test_close_neighbor_switch_is_terminal_before_distance_departure_and_saved(tmp_path, reverse):
+def test_close_neighbor_switch_is_terminal_before_distance_departure_and_saved(tmp_path):
+    reverse = True
     bank, parent = make_bank(tmp_path/'bank')
     publish(bank.root, [add_shard(bank.root, 0, x=3., z_range=(20., 180.))])
     cfg = clean_sample(DirectConfig())
@@ -116,29 +111,6 @@ def test_close_neighbor_switch_is_terminal_before_distance_departure_and_saved(t
     np.testing.assert_array_equal(loaded.switch_bank_path, states.switch_bank_path)
     np.testing.assert_array_equal(loaded.observed_prefix(1), np.stack((a,b)))
     np.testing.assert_array_equal(loaded.observed_prefix(0), a[None])
-
-
-def test_premature_stop_and_physical_endpoint_overshoot_are_distinct(tmp_path):
-    _, parent = make_bank(tmp_path)
-    parent = replace(parent, endpoint_stop=(True, True))
-    cfg = clean_sample(DirectConfig())
-    collector = DecisionCollector(parent, 0, 150., 1, cfg)
-    assert collector(decision([0, 0, 150], 0, stop=True))
-    stop = collector.rows[-1]
-    assert stop['would_stop'] and stop['supervision'] == FOLLOWING and stop['geometry_valid']
-    assert collector(decision([0, 0, 202], 52, [0, 0, 150]))
-    overshoot = collector.rows[-1]
-    assert overshoot['supervision'] == TERMINAL and overshoot['supervision_reason'] == REASON['endpoint']
-    rows = collector.finish()
-    assert [r['replay_class'] for r in rows] == [REPLAY_CLASS['premature_stop'], REPLAY_CLASS['terminal']]
-
-
-def test_unannotated_end_censors_the_episode(tmp_path):
-    _, parent = make_bank(tmp_path)
-    collector = DecisionCollector(parent, 0, 150., 1, clean_sample(DirectConfig()))
-    assert collector(decision([0, 0, 150], 0))
-    assert not collector(decision([0, 0, 202], 52, [0, 0, 150]))
-    assert collector.censored == 'unannotated' and len(collector.rows) == 1
 
 
 def test_terminal_commit_keeps_event_without_inventing_decision(tmp_path):

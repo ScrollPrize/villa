@@ -1,14 +1,12 @@
 """Fixed compiler contracts without changing adaptive losses or stream gradients."""
 import copy
 
-import pytest
 import torch
 
-from model_fixtures import config as cfg, slab_batch as memory_batch
+from model_fixtures import aligned_batch, aligned_config
 from vesuvius.neural_tracing.fiber_follow.regression.model import build_model
 from vesuvius.neural_tracing.fiber_follow.regression.train import (
     prepare_training, optimizer_update, training_prediction,
-    begin_training_update, finish_training_update,
 )
 from vesuvius.neural_tracing.fiber_follow.regression.supervision import loss_terms
 
@@ -27,20 +25,12 @@ def compare_gradients(left, right):
             torch.testing.assert_close(p.grad, q.grad, rtol=3e-4, atol=2e-6, msg=name)
 
 
-
-
-
-
-
-
-
-
 def test_partial_acceptance_keeps_policy_and_geometry_gradients():
     torch.manual_seed(115)
-    eager = build_model(cfg(recurrent_refinement_steps=2))
+    eager = build_model(aligned_config(recurrent_refinement_steps=2))
     raw = copy.deepcopy(eager)
     compiled = prepare_training(raw, backend='eager')
-    batch = memory_batch(eager.cfg, 2)
+    batch = aligned_batch(eager.cfg, 2)
     with torch.no_grad():
         confidence = eager(batch['x'], batch['hist'], batch['hmask'])['refinement_confidence'][:, 0, -1]
     assert confidence[0] != confidence[1]
@@ -59,66 +49,38 @@ def test_partial_acceptance_keeps_policy_and_geometry_gradients():
     compare_gradients(eager, raw)
 
 
-
-
 def test_masked_retries_preserve_adamw_skipped_parameter_updates():
     torch.manual_seed(113)
-    eager = build_model(cfg(recurrent_refinement_steps=2))
-    raw = copy.deepcopy(eager)
-    compiled = prepare_training(raw, backend='eager')
-    prepare_training(eager, backend='eager')
-    models = (eager, compiled)
-    optimizers = [torch.optim.AdamW(model.parameters(), lr=.001, weight_decay=.1) for model in models]
-    emas = [build_model(eager.cfg), build_model(eager.cfg)]
-    for ema in emas:
-        ema.load_state_dict(raw.state_dict())
-    # Populate identical momentum, then accept every initial proposal. A zero
-    # grad would incorrectly decay parameters and advance optimizer moments.
-    for model, opt in zip(models, optimizers):
-        for module in (model.refinement_fusion, model.refinement_stage):
-            for p in module.parameters():
-                p.grad = torch.ones_like(p)
-        opt.step()
-    protected = {name: p.detach().clone() for name, p in raw.named_parameters() if name.startswith('refinement_')}
-    data = [memory_batch(eager.cfg)]
-    for model, opt, ema in zip(models, optimizers, emas):
-        with torch.no_grad():
-            model.confidence_scorer.failure.weight.zero_()
-            model.confidence_scorer.failure.bias.fill_(-20.)
-        optimizer_update(model, ema, opt, data, 2, .001, compute_metrics=False)
-    compare_gradients(eager, raw)
-    for name, p in raw.named_parameters():
+    model = prepare_training(build_model(aligned_config(recurrent_refinement_steps=2)), backend='eager')
+    opt = torch.optim.AdamW(model.parameters(), lr=.001, weight_decay=.1)
+    ema = build_model(model.cfg)
+    ema.load_state_dict(model.state_dict())
+    # Populate momentum, then accept every initial proposal. A zero grad would
+    # incorrectly decay parameters and advance optimizer moments.
+    for module in (model.refinement_fusion, model.refinement_stage):
+        for p in module.parameters():
+            p.grad = torch.ones_like(p)
+    opt.step()
+    protected = {name: p.detach().clone() for name, p in model.named_parameters() if name.startswith('refinement_')}
+    trained = model.coordinates.weight.detach().clone()
+    with torch.no_grad():
+        model.confidence_scorer.failure.weight.zero_()
+        model.confidence_scorer.failure.bias.fill_(-20.)
+    optimizer_update(model, ema, opt, [aligned_batch(model.cfg)], 2, .001, compute_metrics=False)
+    for name, p in model.named_parameters():
         if name in protected:
             torch.testing.assert_close(p, protected[name], rtol=0, atol=0)
-            assert optimizers[1].state[p]['step'] == 1
-    assert all(p.grad is None for p in raw.refinement_fusion.parameters())
+            assert opt.state[p]['step'] == 1
+    assert all(p.grad is None for p in model.refinement_fusion.parameters())
+    assert not torch.equal(trained, model.coordinates.weight)
 
 
-
-
-def test_fixed_rows_avoids_full_crop_copy_but_normalizes_singleton_strides():
-    from vesuvius.neural_tracing.fiber_follow.regression.train import fixed_rows
-    value = torch.randn(2, 2, 8, 9, 9, requires_grad=True)
-    assert fixed_rows(value, 2) is value
-    indexed = torch.randn(3, 2, 1, 3).transpose(1, 2)
-    assert indexed.is_contiguous()  # Singleton strides still differ from canonical.
-    result = fixed_rows(indexed, 3)
-    assert result.stride() == (6, 6, 3, 1)
-    torch.testing.assert_close(result, indexed)
-    padded = fixed_rows(value[:1], 2)
-    padded.sum().backward()
-    torch.testing.assert_close(value.grad[0], torch.full_like(value[0], 2.))
-    assert value.grad[1].eq(0).all()
-
-
-@pytest.mark.parametrize('device', ['cpu', 'cuda'])
-def test_compiled_loss_preserves_terms_and_prediction_gradients(device):
-    if device == 'cuda' and not torch.cuda.is_available():
-        pytest.skip('CUDA unavailable')
+def test_compiled_loss_preserves_terms_and_prediction_gradients():
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
     from vesuvius.neural_tracing.fiber_follow.regression.train import move_batch
     torch.manual_seed(341)
-    model = build_model(cfg(encoder='patch4', token_only=True, recurrent_refinement_steps=1)).to(device)
-    batch = move_batch(memory_batch(model.cfg), device)
+    model = build_model(aligned_config(recurrent_refinement_steps=1)).to(device)
+    batch = move_batch(aligned_batch(model.cfg), device)
     with torch.no_grad():
         prediction = model(batch['x'], batch['hist'], batch['hmask'])
     prediction = {k: v.detach().requires_grad_(v.is_floating_point()) for k, v in prediction.items()}

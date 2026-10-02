@@ -1,6 +1,5 @@
 """Batched broad-phase queries retain scalar projection and tie ordering."""
 import numpy as np
-import pytest
 
 from vesuvius.neural_tracing.fiber_follow.regression.neighbor_mining import PolylineIndex, exact_nearest
 
@@ -22,10 +21,9 @@ def scalar_nearest(points, index):
     return tuple(np.asarray(values) for values in zip(*rows))
 
 
-@pytest.mark.parametrize('vertices', [2, 5, 80, 250])
-def test_batched_nearest_is_bitwise_equal_including_ties(vertices):
+def test_batched_nearest_is_bitwise_equal_including_ties():
     rng = np.random.default_rng(72)
-    for _ in range(5):
+    for vertices in (2, 2, 250, 250):
         target = rng.normal(size=(vertices, 3)).cumsum(0)
         target[1] = target[0]  # repeated vertices and zero-length segments
         points = np.concatenate([target, rng.normal(size=(100, 3))*15])

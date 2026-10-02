@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 import torch
 
-from model_fixtures import config, batch
+from model_fixtures import aligned_batch, aligned_config, config
 from model_fixtures import array_at
 from vesuvius.neural_tracing.fiber_follow.shared.afv import AFVFibers
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume, FiberVolumeSpec, RemoteChunkedArray
@@ -94,17 +94,16 @@ def test_ct_only_reads_no_auxiliary_and_requires_auxiliary_when_enabled(tmp_path
         DirectConfig(input_mode='ct',direction_inputs=True)
 
 
-@pytest.mark.parametrize('encoder,token_only',[('conv',False),('patch4',True)])
-def test_ct_only_model_backward_and_config_roundtrip(encoder,token_only):
+def test_ct_only_model_backward_and_config_roundtrip():
     torch.set_num_threads(2)
-    cfg=config(input_mode='ct',encoder=encoder,token_only=token_only)
-    m=build_model(cfg);b=batch(cfg,1);b['x']['fine']=b['x']['fine'][:,:1].contiguous()
+    cfg=aligned_config()
+    m=build_model(cfg);b=aligned_batch(cfg,1)
+    assert b['x']['fine'].shape[1]==1
     out=m(b['x'],b['hist'],b['hmask']);terms=loss_terms(out,b,cfg)
     loss=terms['geometry_per_state'].sum()+terms['confidence_per_state'].sum()
     loss.backward()
     assert torch.isfinite(loss) and any(p.grad is not None and p.grad.abs().sum()>0 for p in m.parameters())
     assert DirectConfig(**cfg.to_dict()).input_channels==1
-    assert DirectConfig().input_channels==2
 
 
 class FakeDataset:
@@ -128,9 +127,9 @@ def test_weighted_source_sampling_preserves_pairs_and_reproducibility():
 
 
 def test_real_config_has_requested_sources_and_stable_paths():
-    p=Path(__file__).resolve().parents[1]/'configs/mixed_ct_datasets.json'
+    p=Path(__file__).resolve().parents[1]/'configs/mixed_ct_datasets_paris50.json'
     d,digest=read_dataset_config(p)
-    assert [s['weight'] for s in d['sources']]==[.1,.45,.45]
+    assert [s['weight'] for s in d['sources']]==[.5,.25,.25]
     assert [s['validation']['count'] for s in d['sources'] if s['kind']=='afv']==[406,406]
     assert 'SMALLMORE' not in json.dumps(d)
     assert d['cache_dir']=='/mnt/raid_nvme/volume_cache'
@@ -140,7 +139,7 @@ def test_real_config_has_requested_sources_and_stable_paths():
 def test_resume_allows_cache_relocation_but_not_dataset_changes():
     from copy import deepcopy
     from vesuvius.neural_tracing.fiber_follow.regression.datasets import validate_dataset_resume
-    p=Path(__file__).resolve().parents[1]/'configs/mixed_ct_datasets.json'
+    p=Path(__file__).resolve().parents[1]/'configs/mixed_ct_datasets_paris50.json'
     document,digest=read_dataset_config(p)
     old=deepcopy(document);old['cache_dir']='/old/cache'
     checkpoint=dict(dataset_config=old,dataset_config_sha256='old-digest')

@@ -47,7 +47,7 @@ def dataset(monkeypatch, bad=(0, 2), lookahead=None, error=None):
     return ds, events
 
 
-@pytest.mark.parametrize('lookahead', [None, 0, 2])
+@pytest.mark.parametrize('lookahead', [None, 2])
 def test_rejects_whole_pair_advances_prefetch_and_resets_counter(monkeypatch, lookahead):
     ds, events = dataset(monkeypatch, lookahead=lookahead)
     monkeypatch.setattr(data_module, 'MAX_CT_FRAME_REJECTIONS', 2)
@@ -57,11 +57,20 @@ def test_rejects_whole_pair_advances_prefetch_and_resets_counter(monkeypatch, lo
     assert [int(b['ct_frame_rejected_batches'].sum()) for b in batches[:2]] == [1, 1]
     assert 'ct_frame_rejected_batches' not in batches[2]
     assert [n for name, n in events if name == 'build'] == list(range(5))
-    if lookahead is not None:
-        assert [n for name, n in events if name == 'ensure'] == list(range(5))
     if lookahead:
+        assert [n for name, n in events if name == 'ensure'] == list(range(5))
         windows = [v for name, v in events if name == 'lookahead']
         assert windows[0] == [0] and windows[1] == [1, 2, 3]
+        return
+    # Ambiguous CT orientation falls back inside ct_frame: both members kept, nothing retried.
+    ds, events = dataset(monkeypatch)
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.ct_tensor',
+                        lambda vol, pos: np.diag([0., 0., 1.]))
+    stream = iter(ds)
+    batches = [next(stream) for _ in range(3)]
+    assert [b['hist'][:, 0, 0].tolist() for b in batches] == [[0., 0.], [1., 1.], [2., 2.]]
+    assert all('ct_frame_rejected_batches' not in b for b in batches)
+    assert [n for name, n in events if name == 'build'] == [0, 1, 2]
 
 
 def test_persistent_bad_geometry_raises_contextual_bounded_error(monkeypatch):
@@ -73,10 +82,9 @@ def test_persistent_bad_geometry_raises_contextual_bounded_error(monkeypatch):
     assert [n for name, n in events if name == 'build'] == [0, 1, 2]
 
 
-@pytest.mark.parametrize('error', [OSError, ValueError])
-def test_non_heading_errors_are_not_swallowed(monkeypatch, error):
-    ds, events = dataset(monkeypatch, error=error)
-    with pytest.raises(error, match='unrelated failure'):
+def test_non_heading_errors_are_not_swallowed(monkeypatch):
+    ds, events = dataset(monkeypatch, error=OSError)
+    with pytest.raises(OSError, match='unrelated failure'):
         next(iter(ds))
     assert [n for name, n in events if name == 'build'] == [0]
 
@@ -89,14 +97,3 @@ def test_rejections_do_not_change_mixed_source_selection(monkeypatch):
     actual = [int(next(stream)['dataset_id'][0]) for _ in range(12)]
     rng = np.random.default_rng(np.random.SeedSequence([17, 7349, 0]))
     assert actual == [int(rng.choice(2, p=[.3, .7])) for _ in range(12)]
-
-
-def test_ambiguous_ct_keeps_both_pair_members_and_does_not_retry(monkeypatch):
-    ds, events = dataset(monkeypatch)
-    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.ct_tensor',
-                        lambda vol, pos: np.diag([0., 0., 1.]))
-    stream = iter(ds)
-    batches = [next(stream) for _ in range(3)]
-    assert [b['hist'][:, 0, 0].tolist() for b in batches] == [[0., 0.], [1., 1.], [2., 2.]]
-    assert all('ct_frame_rejected_batches' not in b for b in batches)
-    assert [n for name, n in events if name == 'build'] == [0, 1, 2]

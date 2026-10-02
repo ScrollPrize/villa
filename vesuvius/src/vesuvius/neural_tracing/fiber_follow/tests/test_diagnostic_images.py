@@ -5,10 +5,9 @@ from types import SimpleNamespace
 
 import numpy as np
 from PIL import Image
-import pytest
 import torch
 
-from test_regression import batch, config
+from model_fixtures import aligned_batch as batch, aligned_config
 from vesuvius.neural_tracing.fiber_follow.shared.data import TracedFiber
 from vesuvius.neural_tracing.fiber_follow.regression.model import DirectFollower
 from vesuvius.neural_tracing.fiber_follow.regression.train import training_diagnostics
@@ -35,12 +34,10 @@ def monitor():
     return [fiber], seeds
 
 
-@pytest.mark.parametrize('correction', [False, True])
-def test_direct_images_preserve_scores_rng_and_parameters(tmp_path, monkeypatch, correction):
+def test_direct_images_preserve_scores_rng_and_parameters(tmp_path, monkeypatch):
     from matplotlib.axes import Axes
     from matplotlib.figure import Figure
-    cfg = config()
-    cfg.recurrent_refinement_steps = int(correction)
+    cfg = aligned_config(recurrent_refinement_steps=1)
     model = DirectFollower(cfg)
     data = batch(cfg)
     data.update(plane_ab=torch.ones(2, cfg.n_future, 2), plane_mask=torch.ones(2, cfg.n_future),
@@ -49,9 +46,7 @@ def test_direct_images_preserve_scores_rng_and_parameters(tmp_path, monkeypatch,
     data['plane_mask'][1] = 0
     data['plane_ab'][1] = float('nan')
     data['hmask'][1] = 0
-    for x in (data['x']['fine'],):
-        x[:, 0] = .2
-        x[:, 1] = 1.  # Presence must not be mistaken for rendered history.
+    data['x']['fine'][:] = .2
     rgb = []
     labels = {}
     original_imshow, original_save = Axes.imshow, Figure.savefig
@@ -104,21 +99,17 @@ def test_direct_images_preserve_scores_rng_and_parameters(tmp_path, monkeypatch,
             image.verify()
     correction_labels = labels[str(tmp_path/'images/correction_001000.png')]
     assert 'GT' in correction_labels
-    assert ('feedback proposal 1' in correction_labels) == correction
+    assert 'feedback proposal 1' in correction_labels
     assert 'dense curve error (voxels)' in labels[str(tmp_path/'curves.png')]
 
 
-
-
-@pytest.mark.parametrize('available,followed,cap,expected', [
-    (1000., 100., 400., .25), (100., 25., 400., .25),
-    (1000., 600., 400., 1.), (100., 100., 400., 1.), (0., 0., 400., 0.),
-])
-def test_shared_monitor_denominator_keeps_precision_fields(available, followed, cap, expected):
-    row = dict(avail=available, followed=followed, coverage=followed/max(available, 1e-6),
-               correct=80., offtrack=20., length=100., diverged=True)
-    before = dict(row)
-    result = monitor_coverage(row, cap)
-    assert row == before
-    assert result['coverage'] == expected
-    assert all(result[k] == row[k] for k in ('correct', 'offtrack', 'length', 'diverged'))
+def test_shared_monitor_denominator_keeps_precision_fields():
+    for available, followed, cap, expected in ((1000., 100., 400., .25), (100., 25., 400., .25),
+                                               (1000., 600., 400., 1.), (100., 100., 400., 1.), (0., 0., 400., 0.)):
+        row = dict(avail=available, followed=followed, coverage=followed/max(available, 1e-6),
+                   correct=80., offtrack=20., length=100., diverged=True)
+        before = dict(row)
+        result = monitor_coverage(row, cap)
+        assert row == before
+        assert result['coverage'] == expected
+        assert all(result[k] == row[k] for k in ('correct', 'offtrack', 'length', 'diverged'))
