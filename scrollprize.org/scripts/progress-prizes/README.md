@@ -14,8 +14,12 @@ its cells, changes its link, moves it, or deletes it.
 A fresh copy is closed at the first possible Forms API call, before title, ACL,
 or capability reconciliation. At cutoff, the fingerprint-bound target records
 durable activation intent before the source is closed. Activation refetches and
-revalidates both forms after the preview gate, so a manual source closure or
-post-gate ACL/metadata change cannot be mistaken for a recoverable transition.
+revalidates both forms after the preview gate, so a post-gate ACL, metadata, or
+target publishing change cannot be mistaken for a recoverable transition.
+
+The source form only has to stay published. If someone closes it by hand at or
+before the deadline, `prepare`, `verify prepared`, and `activate` still proceed;
+activation records the source as closed and opens the target.
 
 The repository is public. Google authentication is therefore keyless: GitHub's
 short-lived OIDC token is exchanged through Google Workload Identity Federation
@@ -302,8 +306,9 @@ the immediately following month. Leave `request-id` empty for every manual run.
   fixed to seven days.
 - `prepare` is safe to dispatch repeatedly. It succeeds without opening a page
   PR outside the seven-day window. Inside the window it resumes the one managed
-  target for the cycle, keeps the form published but closed, and reconstructs
-  the one marker-only draft page PR.
+  target for the cycle, keeps the new form published but closed, and
+  reconstructs the one marker-only draft page PR. The source may be open or
+  already closed.
 - `verify` with `prepared` requires that exact page-only PR on current `main`;
   `active` requires the completed website and Google close/open state.
 - `activate` should be dispatched near 23:40 Pacific on the final day. The exact

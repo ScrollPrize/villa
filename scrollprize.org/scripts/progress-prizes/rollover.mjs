@@ -726,6 +726,15 @@ function publishingMatches(form, expected) {
     && actual.isAcceptingResponses === expected.isAcceptingResponses;
 }
 
+// The source may already have been closed by hand at or before the deadline.
+// Preparation and activation only need it to stay published; activation closes
+// it if it is still accepting responses.
+function assertSourcePublished(form) {
+  if (publishState(form).isPublished !== true) {
+    throw new Error('Form publishing state does not match the rollover state');
+  }
+}
+
 function activationTransition(sourceSnapshot, targetSnapshot) {
   const sourceState = sourceSnapshot.file.appProperties?.state;
   const targetState = targetSnapshot.file.appProperties?.state;
@@ -747,7 +756,7 @@ function activationTransition(sourceSnapshot, targetSnapshot) {
   });
 
   if (
-    sourceOpen
+    (sourceOpen || sourceClosed)
     && targetClosed
     && targetState === ROLLOVER_FILE_STATES.PREPARED
     && ![ROLLOVER_FILE_STATES.CLOSED, ROLLOVER_FILE_STATES.ARCHIVED].includes(sourceState)
@@ -1782,10 +1791,7 @@ export function createRolloverService({
       requireShare: true,
     });
     assertRequiredSourcePermissions(sourceSnapshot.permissions, collaboratorPermissions);
-    assertExpectedPublishing(sourceSnapshot.form, {
-      isPublished: true,
-      isAcceptingResponses: true,
-    });
+    assertSourcePublished(sourceSnapshot.form);
     const sourceTitle = managedTitle(
       runtime,
       clock,
@@ -2367,10 +2373,7 @@ export function createRolloverService({
     );
 
     if (mode === 'prepared') {
-      assertExpectedPublishing(sourceSnapshot.form, {
-        isPublished: true,
-        isAcceptingResponses: true,
-      });
+      assertSourcePublished(sourceSnapshot.form);
       assertExpectedPublishing(targetSnapshot.form, {
         isPublished: true,
         isAcceptingResponses: false,

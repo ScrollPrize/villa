@@ -1904,7 +1904,7 @@ test('prepare resumes the one appProperties copy after an injected failure and w
   });
 });
 
-test('prepare refuses to copy a source that is no longer live', async () => {
+test('prepare proceeds from a manually closed source without reopening it', async () => {
   const context = service();
   await context.rollover.bootstrapStagingSource({
     sourceFormId: LIVE_FORM_ID,
@@ -1913,6 +1913,40 @@ test('prepare refuses to copy a source that is no longer live', async () => {
   });
   const source = context.google.managed(ROLLOVER_FILE_ROLES.SOURCE, '2026-07')[0];
   context.google.forms.get(source.id).publishSettings.publishState.isAcceptingResponses = false;
+
+  const result = await context.rollover.prepare({
+    targetCycle: '2026-08',
+    collaboratorPermissions: [STAGING_EDITOR_PERMISSION],
+  });
+  assert.equal(result.status, 'prepared');
+  const target = context.google.managed(ROLLOVER_FILE_ROLES.TARGET, '2026-08')[0];
+  assert.equal(target.appProperties.state, ROLLOVER_FILE_STATES.PREPARED);
+  assert.deepEqual(context.google.forms.get(source.id).publishSettings.publishState, {
+    isPublished: true,
+    isAcceptingResponses: false,
+  });
+  assert.deepEqual(context.google.forms.get(target.id).publishSettings.publishState, {
+    isPublished: true,
+    isAcceptingResponses: false,
+  });
+  assert.equal(
+    (await context.rollover.verify({ targetCycle: '2026-08', mode: 'prepared' })).status,
+    'valid',
+  );
+});
+
+test('prepare refuses to copy an unpublished source', async () => {
+  const context = service();
+  await context.rollover.bootstrapStagingSource({
+    sourceFormId: LIVE_FORM_ID,
+    sourceCycle: '2026-07',
+    collaboratorPermissions: [STAGING_EDITOR_PERMISSION],
+  });
+  const source = context.google.managed(ROLLOVER_FILE_ROLES.SOURCE, '2026-07')[0];
+  context.google.forms.get(source.id).publishSettings.publishState = {
+    isPublished: false,
+    isAcceptingResponses: false,
+  };
 
   await assert.rejects(
     context.rollover.prepare({
@@ -3160,7 +3194,7 @@ test('activation rewind refuses to overwrite a freshly changed target state', as
   );
 });
 
-test('activate rejects publishing drift and resumes an explicitly marked target activation', async () => {
+test('activate completes after a manual source close, rejects target drift, and resumes marked activation', async () => {
   const manualGoogle = new FakeGoogle();
   const manualPage = new MemoryPage();
   await bootstrapAndPrepare(service({ google: manualGoogle, page: manualPage }));
@@ -3173,14 +3207,17 @@ test('activate rejects publishing drift and resumes an explicitly marked target 
     clock: fixedClock('2026-08-01T07:00:01Z'),
     runtime: stagingRuntime({ simulatedNow: '2026-08-01T07:00:01Z' }),
   });
-  await assert.rejects(
-    manualService.rollover.activate({ targetCycle: '2026-08' }),
-    /not in an allowed activation or recovery state/,
-  );
-  assert.equal(
-    manualGoogle.forms.get(manualTarget.id).publishSettings.publishState.isAcceptingResponses,
-    false,
-  );
+  assert.equal((await manualService.rollover.activate({ targetCycle: '2026-08' })).status, 'active');
+  assert.deepEqual(manualGoogle.forms.get(manualSource.id).publishSettings.publishState, {
+    isPublished: true,
+    isAcceptingResponses: false,
+  });
+  assert.deepEqual(manualGoogle.forms.get(manualTarget.id).publishSettings.publishState, {
+    isPublished: true,
+    isAcceptingResponses: true,
+  });
+  assert.equal(manualSource.appProperties.state, ROLLOVER_FILE_STATES.CLOSED);
+  assert.equal(manualTarget.appProperties.state, ROLLOVER_FILE_STATES.ACTIVE);
 
   const driftGoogle = new FakeGoogle();
   const driftPage = new MemoryPage();
