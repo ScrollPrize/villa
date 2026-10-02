@@ -4,7 +4,7 @@ import hashlib
 import json
 from pathlib import Path
 import numpy as np
-from vesuvius.neural_tracing.fiber_follow.evaluation.legacy_evaluate import summarize
+from vesuvius.neural_tracing.fiber_follow.evaluation.seeds import summarize
 
 
 def jsonable(x):

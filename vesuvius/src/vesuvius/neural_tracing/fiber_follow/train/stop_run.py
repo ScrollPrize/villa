@@ -5,8 +5,8 @@ import sys
 import psutil
 
 PREFIX = 'vesuvius.neural_tracing.fiber_follow.'
-TRAINERS = (PREFIX+'regression.train', PREFIX+'flow_matching.train')
-COLLECTORS = (PREFIX+'regression.collect', PREFIX+'flow_matching.collect', PREFIX+'shared.collect')
+TRAINERS = (PREFIX+'train.train',)
+COLLECTORS = (PREFIX+'tracing.collect',)
 
 
 def option(args, key):

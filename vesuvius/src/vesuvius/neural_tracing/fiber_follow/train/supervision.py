@@ -156,6 +156,8 @@ def loss_terms(output, batch, cfg, tolerance=1.5, *, n_commit=None):
     auxiliary = torch.where(earlier, geometry_losses, 0.).sum(1)/(count-1).clamp_min(1)
     geometry = torch.where(count > 1, .75*final+.25*auxiliary, final)
     confidence = torch.where(attempts, torch.stack(confidence_losses, 1), 0.).sum(1)/count
+    if cfg.model_type == 'flow_matching':
+        geometry = output['flow_per_state']
     # Distance-only labels keep their names; identity-aware labels add the neighbor raster.
     labels, known, _ = prefix_labels(output['points'], batch, tolerance, cfg.max_recovery_distance)
     supervised, supervised_known, _, extra = proposal_labels(output['points'], batch, cfg, tolerance)

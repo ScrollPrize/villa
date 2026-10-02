@@ -7,7 +7,7 @@ import time
 
 import torch
 
-from vesuvius.neural_tracing.fiber_follow.models.model import DirectConfig, build_model, crop_support
+from vesuvius.neural_tracing.fiber_follow.models.model import CoordinateRegressionConfig, build_model, crop_support
 from vesuvius.neural_tracing.fiber_follow.data.observations import IdentityObservationBuilder, IdentitySampling
 from vesuvius.neural_tracing.fiber_follow.data.neighbor_bank import NeighborBank
 from vesuvius.neural_tracing.fiber_follow.train.supervision import loss_terms
@@ -28,15 +28,12 @@ def main(argv=None):
     ap.add_argument('--microbatch',type=int,default=4)
     ap.add_argument('--batches',type=int,default=4)
     ap.add_argument('--forward',action='store_true')
-    ap.add_argument('--direction-inputs',action='store_true')
-    ap.add_argument('--encoder',choices=('conv','patch4'),default='conv')
-    ap.add_argument('--token-only',action='store_true')
     ap.add_argument('--synthetic-tail',type=float,nargs=2,default=(4.,16.))
     ap.add_argument('--onpolicy',nargs='*',default=[],help='Replay caches, e.g. collected with observed tracks')
     args=ap.parse_args(argv)
     torch.set_num_threads(4);torch.manual_seed(0)
-    cfg=DirectConfig(direction_inputs=args.direction_inputs,encoder=args.encoder,token_only=args.token_only)
-    spec=FiberVolumeSpec(args.fiber_zarrs,ct_zarr=args.ct,ct_level=0,ct_grid_scale=4.,inputs='ct+presence')
+    cfg=CoordinateRegressionConfig()
+    spec=FiberVolumeSpec(args.fiber_zarrs,ct_zarr=args.ct,ct_level=0,ct_grid_scale=4.,inputs='ct',load_presence=False)
     band=ZBand(45000/spec.grid_scale,48500/spec.grid_scale)
     fibers,_=split_fibers(load_fibers(args.fibers,grid_scale=spec.grid_scale),band)
     bank=NeighborBank(args.bank,fibers,band,grid_scale=spec.grid_scale)
@@ -56,9 +53,11 @@ def main(argv=None):
     prepare_normalization(args.out, [spec])
     model=build_model(cfg).to(args.device,memory_format=conv_memory_format(args.device)) if args.forward else None
     import copy
-    from vesuvius.neural_tracing.fiber_follow.train.train import optimizer_update
+    from vesuvius.neural_tracing.fiber_follow.train.train import optimizer_update, prepare_training
     ema = copy.deepcopy(model) if model is not None else None
     opt = torch.optim.AdamW(model.parameters(), lr=0.) if model is not None else None
+    if model is not None:
+        prepare_training(model, args.microbatch)
     rows=[]
     for index in range(args.batches):
         started=time.perf_counter();cpu=next(it)

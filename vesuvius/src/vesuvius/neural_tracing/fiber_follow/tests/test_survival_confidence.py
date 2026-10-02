@@ -5,7 +5,7 @@ import pytest
 import torch
 
 from model_fixtures import config
-from model_fixtures import slab_batch as memory_batch
+from model_fixtures import coordinate_batch as memory_batch
 from model_fixtures import proposal_output
 from label_fixtures import set_terminal, set_unknown
 from vesuvius.neural_tracing.fiber_follow.models.model import build_model
@@ -25,7 +25,7 @@ def test_confidence_head_computes_fp32_inside_bf16_autocast(device):
     torch.manual_seed(65)
     cfg = config()
     scorer = build_model(cfg).to(device).confidence_scorer
-    width = 27*(cfg.channels+1)+cfg.hidden+1
+    width = cfg.path_evidence_width
     spatial = torch.randn(2, 4, 4, width, device=device, requires_grad=True)
     points = torch.zeros(2, 4, 3, device=device)
     points[..., 2] = torch.arange(1, 5, device=device)
@@ -67,7 +67,7 @@ def test_replacing_truncating_or_extending_suffix_preserves_prefix():
     model = build_model(config(scorer_layers=4)).train(True)
     first = memory_batch(model.cfg, 1)
     with torch.no_grad():
-        batch = memory_batch(model.cfg, 1, step=1)
+        batch = memory_batch(model.cfg, 1)
         ctx = scoring_context(model, batch)
         curve = torch.zeros(1, 4, 3)
         curve[..., 2] = torch.arange(1, 5)
@@ -96,25 +96,25 @@ def test_segment_reads_cover_interior_and_do_not_receive_generator_state(monkeyp
     curve = torch.tensor([[[1., 0., 1.], [3., 2., 2.], [2., 0., 3.], [0., 0., 4.]]], requires_grad=True)
     sampled = []
     original = model.evidence
-    def capture(ctx, points, stage):
+    def capture(ctx, points):
         sampled.append(points.detach().clone())
-        return original(ctx, points, stage)
+        return original(ctx, points)
     monkeypatch.setattr(model, 'evidence', capture)
-    logits = model.confidence_logits(ctx, torch.full((1, 4, model.cfg.hidden), float('nan')), curve)
+    logits = model.hazard_logits(ctx, curve)
     torch.testing.assert_close(sampled[0][0, 4:8], torch.tensor([
         [1.5, .5, 1.25], [2., 1., 1.5], [2.5, 1.5, 1.75], [3., 2., 2.]]))
     logits.sum().backward()
     assert curve.grad is None
     assert all(p.grad is None for p in model.decoder.parameters())
     assert model.coordinates.weight.grad is None
-    assert model.encoder.stem[0].weight.grad.abs().sum() > 0
+    assert model.encoder.patch_projection.weight.grad.abs().sum() > 0
 
 
 def test_first_segment_reads_all_observations_but_no_future_segment_features():
     torch.manual_seed(62)
     model = build_model(config())
     scorer = model.confidence_scorer
-    width = 27*(model.cfg.channels+1)+model.cfg.hidden+1
+    width = model.cfg.path_evidence_width
     spatial = torch.randn(1, 4, 4, width, requires_grad=True)
     points = torch.zeros(1, 4, 3)
     points[..., 2] = torch.arange(1, 5)
@@ -123,7 +123,7 @@ def test_first_segment_reads_all_observations_but_no_future_segment_features():
     padding[:, -1] = True
     logits = scorer(spatial, points, scorer.project_memory(memory, padding), padding, (memory, padding))
     logits[:, 0].sum().backward()
-    assert len(scorer.layers) == 2
+    assert len(scorer.layers) == model.cfg.scorer_layers
     for layer in scorer.layers:
         grad = layer.linear1.weight.grad
         assert grad is not None and torch.isfinite(grad).all() and grad.abs().sum() > 0

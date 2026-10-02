@@ -1,14 +1,14 @@
 """History encoder layout: full-resolution fine stages, spatial plus path tokens, and padding."""
 import torch
 
-from model_fixtures import aligned_config, aligned_batch
+from model_fixtures import coordinate_config, coordinate_batch
 from vesuvius.neural_tracing.fiber_follow.models.history_slabs import HistoryEncoder
 
 
 def test_history_tokens_keep_fine_stages_spatial_bank_path_tokens_and_padding():
-    c = aligned_config()
+    c = coordinate_config()
     encoder = HistoryEncoder(c)
-    batch = aligned_batch(c)['x']
+    batch = coordinate_batch(c)['x']
     batch['history_path_valid'][0, 0, 0] = False
     batch['history_path_points'][0, 0, 0] = float('nan')
     stages = []

@@ -15,8 +15,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
 
 
 def record(spec, center=50., noise=4.):
-    return dict(method=norm.METHOD, volume=norm.volume_key(spec), center=center, noise=noise,
-                threshold=center+3*noise)
+    return dict(method=norm.ZSCORE_METHOD, volume=norm.volume_key(spec), epsilon=norm.ZSCORE_EPSILON)
 
 
 def volume(tmp_path):
@@ -47,20 +46,19 @@ def test_zscore_uses_all_pixels_without_clipping_or_background_sentinel():
     # Augmentation never masks values below the old -4 sentinel.
     image = np.linspace(-8, 8, 64, dtype=np.float32).reshape(1, 4, 4, 4)
     before = image.copy()
-    augment_image_pair(torch.from_numpy(image), (1., 0., 0.), np.random.default_rng(1), zscore=True)
+    augment_image_pair(torch.from_numpy(image), (1., 0., 0.), np.random.default_rng(1))
     np.testing.assert_array_equal(image, before)
 
 
 def test_zscore_init_resume_and_inference_reuse_the_checkpoint_policy(tmp_path, monkeypatch):
     spec = volume(tmp_path)
     crop, items = CropSpec(8, 8, 4, 1.), [dict(pos=np.array([8., 8., 36.]), frame=np.eye(3))]
-    with pytest.raises(ValueError, match='calibration is required'):
-        image_crop(items, FiberVolume(spec), crop, input_mode='ct')
+    with pytest.raises(ValueError, match='normalization record is required'):
+        image_crop(items, FiberVolume(spec), crop)
     key = norm.volume_key(spec)
     document = dict(method=norm.ZSCORE_METHOD, volumes={key: dict(
         method=norm.ZSCORE_METHOD, volume=key, epsilon=norm.ZSCORE_EPSILON,
         shape=[48, 16, 16], chunks=[16, 16, 16], dtype='|u1')})
-    monkeypatch.setattr(norm, 'calibrate', lambda *a, **kw: pytest.fail('Z-score must not calibrate'))
     # Init weights and resume take the checkpoint document exactly; a lost JSON is restored from it.
     out = tmp_path/'run'
     assert norm.prepare_normalization(out, [spec], resume=document) == document
@@ -69,7 +67,7 @@ def test_zscore_init_resume_and_inference_reuse_the_checkpoint_policy(tmp_path, 
     assert norm.prepare_normalization(out, [spec], resume=document) == document
     assert (out/'ct_normalization.json').read_bytes() == saved
     assert pickle.loads(pickle.dumps(spec)).ct_normalization == spec.ct_normalization
-    image = image_crop(items, FiberVolume(spec), crop, input_mode='ct')
+    image = image_crop(items, FiberVolume(spec), crop)
     assert abs(float(image.mean())) < 1e-5
     assert abs(float(image.std(correction=0))-1) < 1e-5
     bad = copy.deepcopy(document)
@@ -91,3 +89,14 @@ def test_zscore_init_resume_and_inference_reuse_the_checkpoint_policy(tmp_path, 
     meta_path.write_text(json.dumps(meta))
     with pytest.raises(ValueError, match='metadata changed'):
         norm.prepare_normalization(tmp_path/'infer', [second])
+
+
+def test_fresh_run_defaults_to_zscore_and_rejects_background_policy(tmp_path):
+    spec = volume(tmp_path)
+    document = norm.prepare_normalization(tmp_path/'fresh', [spec])
+    assert document['method'] == spec.ct_normalization['method'] == norm.ZSCORE_METHOD
+    assert json.loads((tmp_path/'fresh'/'ct_normalization.json').read_text()) == document
+    with pytest.raises(ValueError, match='Unsupported CT normalization'):
+        norm.prepare_normalization(tmp_path/'old', [spec], resume=dict(method='background', volumes={}))
+    with pytest.raises(ValueError, match='z-score'):
+        norm.normalize_ct(np.zeros((4, 4, 4), np.float32), dict(method='background'))

@@ -6,8 +6,8 @@ import numpy as np
 import pytest
 import torch
 
-from model_fixtures import config as cfg, aligned_config, aligned_batch
-from vesuvius.neural_tracing.fiber_follow.models.history_slabs import selected_arcs, slab_layout, fitted_heading, observed_path, load_slabs, slabs_allowed
+from model_fixtures import config as cfg, coordinate_config, coordinate_batch
+from vesuvius.neural_tracing.fiber_follow.data.history_slabs import selected_arcs, slab_layout, fitted_heading, observed_path, load_slabs, slabs_allowed
 from vesuvius.neural_tracing.fiber_follow.models.model import build_model
 from vesuvius.neural_tracing.fiber_follow.data.observations import ObservationBuilder, DirectTracer
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength
@@ -83,7 +83,7 @@ def test_only_valid_ct_reads_remote_slabs_and_annotation_independence(monkeypatc
     calls = fake_ct(monkeypatch)
     path = np.c_[np.arange(401)*.1,np.zeros(401),np.arange(401)]
     item = observation(path)
-    c = aligned_config()
+    c = coordinate_config()
     first = load_slabs([item],None,c)
     assert len(calls) == 8 and first['history_slabs'].shape == (1,8,2,8,65,65)
     assert first['history_overlap'][0,0] == 0 and first['history_valid'][0,0]
@@ -133,7 +133,7 @@ def test_fresh_replay_inference_and_resume_inputs_identical(monkeypatch,tmp_path
     states = replay_for(item)
     states.save(tmp_path/'replay.npz')
     loaded = OnPolicyStates.load(tmp_path/'replay.npz')
-    builder = ObservationBuilder(aligned_config())
+    builder = ObservationBuilder(coordinate_config())
     fresh = builder.images([item],None)
     replay = builder.images([dict(item,observed_path=loaded.observed_prefix(0))],None)
     tracer = DirectTracer.__new__(DirectTracer)
@@ -151,8 +151,8 @@ def test_fresh_replay_inference_and_resume_inputs_identical(monkeypatch,tmp_path
 
 def test_both_heads_train_history_and_only_geometry_trains_generator():
     torch.manual_seed(55)
-    m=build_model(aligned_config())
-    b=aligned_batch(m.cfg,1)
+    m=build_model(coordinate_config())
+    b=coordinate_batch(m.cfg,1)
     b['x']['history_slabs'].requires_grad_()
     for loss in ('geometry','generated_confidence'):
         m.zero_grad(set_to_none=True);b['x']['history_slabs'].grad=None
@@ -167,7 +167,7 @@ def test_both_heads_train_history_and_only_geometry_trains_generator():
 
 def test_invalid_slots_paths_and_geometry_are_inert_and_never_encoded():
     torch.manual_seed(9)
-    m=build_model(aligned_config()).eval();b=aligned_batch(m.cfg,2)
+    m=build_model(coordinate_config()).eval();b=coordinate_batch(m.cfg,2)
     calls=[]
     handle=m.history_encoder.convolution.register_forward_pre_hook(lambda module,args:calls.append(len(args[0])))
     b['x']['history_path_valid'][0,1,0]=False
@@ -214,7 +214,7 @@ def test_actual_trace_commits_and_resumed_slabs_use_same_prefix(monkeypatch):
     fake_ct(monkeypatch)
     monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.data.observations.image_crop',
         lambda items,vol,crop,pool=None,**kw:torch.zeros(len(items),1,crop.depth,crop.width,crop.width))
-    c=aligned_config()
+    c=coordinate_config()
     class Model(torch.nn.Module):
         cfg=c
         def forward(self,x,hist,hmask):

@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
-from vesuvius.neural_tracing.fiber_follow.data.data import build_inputs, read_blocks, render_count
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, crop_local_grid, normalize
 from vesuvius.neural_tracing.fiber_follow.tracing.policy import DEFAULT_CONFIDENCE, DEFAULT_N_COMMIT, commit_prefix
 from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolume
@@ -142,18 +141,7 @@ class ModelTracer:
         return map(fn, values) if pool is None else pool.map(fn, values)
 
     def build_inputs(self, pos, frames, hist, hmask):
-        """Read this model's observation; subclasses can supply other image scales."""
-        items = [dict(pos=p, frame=f) for p, f in zip(pos, frames)]
-        raw, starts = read_blocks(items, self.vol, self.crop, self.pool)
-        tensor = lambda a: torch.from_numpy(np.ascontiguousarray(a)).to(self.device)
-        x = build_inputs(tensor(raw), tensor(starts).float(), tensor(pos).float(), tensor(frames).float(),
-                         tensor(hist).float(), tensor(hmask), self.grid, n_render=render_count(self.crop),
-                         input_scale=getattr(self.vol, 'input_scale', 1.),
-                         history_sigma=self.crop.history_sigma, history_render=self.crop.history_render)
-        if self.vol.spec.mode == 'ct+presence':
-            from vesuvius.neural_tracing.fiber_follow.data.data import add_presence_input
-            x = add_presence_input(x, items, self.vol, self.crop, self.grid, self.pool)
-        return x
+        raise NotImplementedError('Use the common observation tracer')
 
     @torch.no_grad()
     def trace(self, seeds_xyz, headings, histories=None, abort=None, on_decision=None, initial_states=None):

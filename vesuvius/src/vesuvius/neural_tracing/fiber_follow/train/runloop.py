@@ -1,9 +1,9 @@
 """Method-agnostic pieces of a fiber_follow training run.
 
-Shared by the flow follower and direct follower:
+Shared by coordinate regression and flow matching:
 run directory creation, the JSON-lines log, the
 warmup-cosine schedule, one guarded optimizer step, and checkpoint I/O that
-records which architecture and data policy produced the weights.
+records which model type and data policy produced the weights.
 """
 from __future__ import annotations
 
@@ -76,18 +76,19 @@ def lr_at(step: int, base_lr: float, warmup: int, total_steps: int) -> float:
     return base_lr * min(1., step / max(1, warmup)) * .5 * (1 + math.cos(math.pi * (step - 1) / total_steps))
 
 
-def save_checkpoint(path, model, vol_spec, crop, n_history, architecture, extra=None):
-    torch.save(dict(architecture=architecture, data_policy=DATA_POLICY, model=model.state_dict(),
+def save_checkpoint(path, model, vol_spec, crop, n_history, model_type, extra=None):
+    torch.save(dict(model_type=model_type, data_policy=DATA_POLICY, model=model.state_dict(),
                     model_cfg=model.cfg.to_dict(), crop=dataclasses.asdict(crop),
                     n_history=n_history, vol_spec=vol_spec.to_dict(), **(extra or {})), path)
 
 
-def read_checkpoint(path, architecture, device='cuda'):
+def read_checkpoint(path, model_types, device='cuda'):
     ck = torch.load(path, map_location=device, weights_only=False)
-    accepted = (architecture,) if isinstance(architecture, str) else tuple(architecture)
-    if ck['architecture'] not in accepted or ck['data_policy'] != DATA_POLICY:
-        raise ValueError(f'Checkpoint {path} is {ck["architecture"]}/{ck["data_policy"]}, '
-                         f'not {architecture}/{DATA_POLICY}')
+    accepted = (model_types,) if isinstance(model_types, str) else tuple(model_types)
+    if ck.get('model_type') not in accepted:
+        raise ValueError(f'Unsupported checkpoint model type: {ck.get("model_type")}')
+    if ck.get('kind') != 'weights' and ck.get('data_policy') != DATA_POLICY:
+        raise ValueError(f'Checkpoint {path} uses a different training data policy')
     return ck
 
 

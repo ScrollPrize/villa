@@ -21,7 +21,7 @@ import numpy as np
 import torch
 
 from vesuvius.neural_tracing.fiber_follow.data.data import OnPolicyStates, SampleConfig, ZBand, load_fibers, split_fibers, fiber_manifest, label_state, training_state_allowed
-from vesuvius.neural_tracing.fiber_follow.evaluation.legacy_evaluate import directed_seed
+from vesuvius.neural_tracing.fiber_follow.evaluation.seeds import directed_seed
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength
 from vesuvius.neural_tracing.fiber_follow.tracing.heading import SeedHeadingError, SEED_HEADING_POLICY, TRACE_HEADING_POLICY, FRAME_POLICY
 from vesuvius.neural_tracing.fiber_follow.tracing.policy import checkpoint_policy
@@ -303,7 +303,7 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer, bank_loader=
     ap.add_argument('--confidence', type=float, help='Default: the checkpoint operating policy')
     ap.add_argument('--n-commit', type=int, help='Default: the checkpoint operating policy')
     ap.add_argument('--device', default='cuda')
-    ap.add_argument('--threads', type=int, default=2)
+    ap.add_argument('--threads', type=int, default=4)
     ap.add_argument('--out', required=True)
     ap.add_argument('--seed', type=int, default=1)
     ap.add_argument('--failure-bank', action='append', default=[], help='Trusted bank for switch labeling; repeat for multiple banks')
@@ -313,7 +313,10 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer, bank_loader=
     if args.fibers_per_collection < 1 or args.batch < 1 or args.trace_len <= 0 or args.forward_chunk < 0:
         raise ValueError('Positive fibers, batch and trace length required')
     started = time.monotonic()
+    if args.threads < 1:
+        raise ValueError('Positive collector thread count required')
     torch.set_num_threads(args.threads)
+    print(f'Collector PyTorch threads: {torch.get_num_threads()}', flush=True)
     model, crop, n_hist, spec, ck = checkpoint_loader(args.checkpoint, args.device)
     policy = checkpoint_policy(ck, model.cfg, confidence=args.confidence, n_commit=args.n_commit)
     cfg = SampleConfig(crop=crop, n_history=n_hist, recent_history_points=model.cfg.recent_history_points,

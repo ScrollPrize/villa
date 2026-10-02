@@ -7,15 +7,15 @@ from PIL import Image
 import pytest
 import torch
 
-from model_fixtures import aligned_batch as batch, aligned_config
+from model_fixtures import coordinate_batch as batch, coordinate_config
 from label_fixtures import set_terminal
-from vesuvius.neural_tracing.fiber_follow.models.model import DirectFollower
+from vesuvius.neural_tracing.fiber_follow.models.model import CoordinateRegressionFollower
 from vesuvius.neural_tracing.fiber_follow.evaluation.batch_diagnostic import layer_capture, render_microbatch
 
 
 def test_layer_capture_preserves_predictions_and_cleans_up():
-    cfg = aligned_config(recurrent_refinement_steps=1)
-    model = DirectFollower(cfg).eval()
+    cfg = coordinate_config(recurrent_refinement_steps=1)
+    model = CoordinateRegressionFollower(cfg).eval()
     data = batch(cfg, 1)
     weights = copy.deepcopy(model.state_dict())
     rng = torch.get_rng_state()
@@ -31,8 +31,8 @@ def test_layer_capture_preserves_predictions_and_cleans_up():
     assert layers['statistics']['CT stem']['rms'] > 0
     assert layers['statistics']['patch embedding']['rms'] > 0
     assert set(layers['decoder']) == {'input', 'block 1', 'output'}
-    assert set(layers['scorer']) == {'input', 'block 1', 'block 2'}
-    assert layers['history_depths'] == {'generator': 1, 'scorer': 2}
+    assert set(layers['scorer']) == {'input', *[f'block {i+1}' for i in range(model.cfg.scorer_layers)]}
+    assert layers['history_depths'] == {'generator': model.cfg.decoder_layers, 'scorer': model.cfg.scorer_layers}
     assert layers['encoder']['encoder output'].ndim == 2
     assert layers['history']['tokens'].shape == (8, 17, 17)
     assert layers['history']['convolution'].shape == (2, 17, 17)
@@ -43,13 +43,13 @@ def test_layer_capture_preserves_predictions_and_cleans_up():
             assert not attention[:, 2:].any()
     # Distinct layer/attempt values catch averaging the wrong retry or layer count.
     from vesuvius.neural_tracing.fiber_follow.evaluation.diagnostic_plots import display_example
-    assert len(layers['history']['scorer_attention']) == 4
+    assert len(layers['history']['scorer_attention']) == 2*model.cfg.scorer_layers
     for head, depth in layers['history_depths'].items():
         layers['history'][head+'_attention'] = [torch.full((cfg.n_future, 8), 100.*attempt+layer)
             for attempt in range(2) for layer in range(depth)]
     selected = dict(actual, selected_refinement=torch.ones(1, dtype=torch.long))
     example = display_example(data, selected, {}, layers, cfg, 'test', {})
-    np.testing.assert_allclose(example['attention']['scorer'], 100.5)
+    np.testing.assert_allclose(example['attention']['scorer'], 100.+(model.cfg.scorer_layers-1)/2)
     np.testing.assert_allclose(example['attention']['generator'], 100.)
     assert 'forward_cached' not in model.history_attention.__dict__
     assert not model.encoder.patch_projection._forward_hooks
@@ -60,9 +60,12 @@ def test_layer_capture_preserves_predictions_and_cleans_up():
     assert not model.encoder.blocks[0]._forward_pre_hooks
 
 
-def test_render_emits_readable_images_strict_json_and_preserves_rng(tmp_path):
-    cfg = aligned_config(recurrent_refinement_steps=1)
-    model = DirectFollower(cfg).train()
+@pytest.mark.parametrize('kind', ['coordinate_regression', 'flow_matching'])
+def test_render_emits_readable_images_strict_json_and_preserves_rng(tmp_path, kind):
+    from test_flow_model import config as flow_config
+    from vesuvius.neural_tracing.fiber_follow.models.model import build_model
+    cfg = coordinate_config(recurrent_refinement_steps=1) if kind == 'coordinate_regression' else flow_config()
+    model = build_model(cfg).train()
     data = batch(cfg, 3)
     data['identity_observable'] = torch.tensor([0., 1., 1.])
     data['dense_mask'][1] = 0
@@ -100,7 +103,7 @@ def test_diagnostic_annotation_uses_final_crop_frame_without_changing_world_geom
     from vesuvius.neural_tracing.fiber_follow.data.observations import ObservationBuilder
     from vesuvius.neural_tracing.fiber_follow.evaluation.batch_diagnostic import measured_geometry
     from vesuvius.neural_tracing.fiber_follow.tracing.heading import orient_item
-    cfg = aligned_config()
+    cfg = coordinate_config()
     builder = ObservationBuilder(cfg)
     curve = np.c_[np.ones(9), np.zeros(9), np.arange(-4, 5)]
     item = dict(pos=np.array([10., 20., 30.]), frame=np.eye(3), identity_curve=curve.copy(),
@@ -136,7 +139,7 @@ def test_diagnostic_helpers_report_unknown_values_and_clip_annotation_to_section
     assert not len(clipped_polyline([[-1., 3., -1.], [1., 3., 1.]], lower, upper))
     assert not len(clipped_polyline([[4., -2., 0.], [4., 2., 0.]], lower, upper))
     assert not len(clipped_polyline([[0., 0., 0.], [np.nan]*3, [1., 0., 1.]], lower, upper))
-    cfg = aligned_config()
+    cfg = coordinate_config()
     e = dict(label='off-plane', sections=[np.zeros((cfg.fine.depth, cfg.fine.width))]*2
              + [np.zeros((cfg.fine.width, cfg.fine.width))],
              annotation=np.array([[-1., 0., 2.], [1., 0., 3.]]),

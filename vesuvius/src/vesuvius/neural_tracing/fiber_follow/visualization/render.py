@@ -101,11 +101,13 @@ class Atlas:
         c, m, r = self.c, self.m, self.r
         fig = self.page('01  What the current model sees and decides',
                         f"Fiber {m['fiber_index']} · {m['fiber_name']} · step {m['checkpoint_step']:,} EMA · {m['precision']}")
+        generation = (f"{c['flow_steps']} midpoint integration steps" if m['capabilities']['solver']
+                      else f"Up to {c['recurrent_refinement_steps']} retries")
         boxes = [
-            ('INPUT', f"{self.a['input'].shape}\nCT / presence / direction moments\nObserved references and seed"),
+            ('INPUT', f"{self.a['input'].shape}\nZ-scored CT\nObserved references and seed"),
             ('PATCH ENCODER', f"6³ overlapping patches, stride 4\n{' × '.join(map(str, self.shape))} tokens, width {c['hidden']}\n{c['layers']} axial blocks + normalization"),
-            ('HISTORY', f"{m['observations']} valid CT/path slabs\n162 spatial tokens per slab\nSeparate residual decoder reads"),
-            ('PATH AND SCORE', f"{c['n_future']} future points; {c['decoder_layers']} generator layers\nCausal segment survival scorer\nUp to {c['recurrent_refinement_steps']} retries")]
+            ('HISTORY', f"{m['observations']} valid CT/path slabs\n{m['history_tokens_per_slab']} tokens per slab\nSeparate residual decoder reads"),
+            ('PATH AND SCORE', f"{c['n_future']} future points; {c['decoder_layers']} generator layers\nCausal segment survival scorer\n{generation}")]
         for i, (title, body) in enumerate(boxes):
             fig.text(.045+i*.24, .85, title+'\n\n'+body, fontsize=12, va='top', linespacing=1.6,
                      bbox=dict(boxstyle='round,pad=.7', facecolor='white', edgecolor='#cad7e5'))
@@ -129,8 +131,8 @@ class Atlas:
 
     def inputs(self, pdf):
         fig = self.page('02  Inputs and overlapping patch embeddings', 'Each token sees a 6 × 6 × 6 neighborhood; adjacent token centers are four input voxels apart.')
-        for col, channel in enumerate((0, 1)):
-            axes = self.pair(fig, [.045+col*.49, .56, .425, .30], ['CT and observed history', 'Fiber presence'][col])
+        for col, channel in enumerate(range(len(self.a['input']))):
+            axes = self.pair(fig, [.045+col*.49, .56, .425, .30], 'CT and observed history')
             for comp, ax in enumerate(axes):
                 self.spatial(ax, self.a['input'][channel], comp, limits=self.ct_limits if channel == 0 else (0, 1))
                 if channel == 0:
@@ -147,8 +149,8 @@ class Atlas:
         fig.text(.54, .16, f"Conv3d: {self.a['input'].shape[0]} channels × 6³ → {self.c['hidden']} features\n"
                  f"Stride 4; one-voxel halo; high edge padded to a multiple of 4.\n"
                  'Position and observed-reference conditioning enter before block 1.', fontsize=12, va='top', linespacing=1.5)
-        self.note(fig, 'Direction channels are the six unsigned local orientation moments (uu, vv, ff, uv, uf, vf); see the exact-input sheet.\nFeature axes have no assigned anatomical meanings. All similarity maps use the same [−1, 1] scale.')
-        self.finish(fig, '02_inputs', 'Inputs and patches', 'Actual CT, presence and overlapping convolution embeddings; all channels are available separately.', pdf)
+        self.note(fig, 'CT is normalized per crop, without clipping or a background sentinel.\nFeature axes have no assigned anatomical meanings. All similarity maps use the same [−1, 1] scale.')
+        self.finish(fig, '02_inputs', 'Inputs and patches', 'Actual CT and overlapping convolution embeddings; all channels are available separately.', pdf)
 
     def encoder(self, pdf):
         count = len(self.r['encoder_blocks'])
@@ -176,7 +178,7 @@ class Atlas:
     def memory(self, pdf):
         valid = np.flatnonzero(self.a['input_history_valid'])
         fig = self.page('04  Historical CT and observed-path slabs',
-                        f"{len(valid)} valid slots of {len(self.a['input_history_valid'])}; each 2 × 8 × 65 × 65 slab becomes 2 × 9 × 9 spatial tokens.", size=(22, 17))
+                        f"{len(valid)} valid slots of {len(self.a['input_history_valid'])}; each 2 × 8 × 65 × 65 slab becomes {self.m['history_tokens_per_slab']} tokens.", size=(22, 17))
         row_height = .48 / max(1, (len(valid)+3)//4)
         for j, slot in enumerate(valid):
             col, row = j % 4, j // 4
@@ -195,16 +197,18 @@ class Atlas:
                 values = ct[:, 32, :] if comp == 0 else ct[:, :, 32]
                 path = heat[:, 32, :] if comp == 0 else heat[:, :, 32]
                 extent = (-16.25, 16.25, -2.25, 1.75)
-                ax.imshow(values, origin='lower', cmap='gray', vmin=0, vmax=1,
+                ax.imshow(values, origin='lower', cmap='gray', vmin=self.ct_limits[0], vmax=self.ct_limits[1],
                           extent=extent, aspect='equal', interpolation='nearest')
                 ax.imshow(np.ma.masked_less(path, .05), origin='lower', cmap='autumn',
                           alpha=.6, vmin=0, vmax=1, extent=extent, aspect='equal', interpolation='nearest')
                 ax.set(xlabel='slab '+('u' if comp == 0 else 'v'), ylabel='forward')
         attempt = self.m['selected_refinement']
         for col, family in enumerate(('generator', 'scorer')):
-            layers = self.c['decoder_layers'] if family == 'generator' else 2
-            weights = self.a[f'{family}_history_attention_{attempt*layers+layers-1}']
-            mass = weights.reshape(len(weights), -1, 162).sum(-1)*100
+            layers = self.c['decoder_layers'] if family == 'generator' else self.c['scorer_layers']
+            keys = [k for k in self.a if k.startswith(f'{family}_history_attention_')]
+            index = max(int(k.rsplit('_', 1)[1]) for k in keys) if self.m.get('capabilities', {}).get('solver') else attempt*layers+layers-1
+            weights = self.a[f'{family}_history_attention_{index}']
+            mass = weights.reshape(len(weights), -1, self.m['history_tokens_per_slab']).sum(-1)*100
             ax = self.axis(fig, [.07+col*.49, .13, .38, .17], f'{family.title()}: last-layer history attention by slot')
             im = ax.imshow(mass.T, origin='lower', aspect='auto', cmap='magma', vmin=0, vmax=100,
                            extent=(.5, len(weights)+.5, -.5, mass.shape[1]-.5))
@@ -245,8 +249,11 @@ class Atlas:
         generator = family == 'generator'
         title = '06  How the decoder reads current evidence' if generator else '07  How the causal scorer evaluates the path'
         fig = self.page(title, 'Selected attempt, final layer, mean over heads. Each panel is a separate query; spatial maps marginalize one axis.', size=(22, 17))
-        layer = self.c['decoder_layers']-1 if generator else 1
-        weights = self.a[f'{family}_attention_{layer}_{self.m["selected_refinement"]}']
+        layer = self.c['decoder_layers']-1 if generator else self.c['scorer_layers']-1
+        index = self.m['selected_refinement']
+        if generator and self.m.get('capabilities', {}).get('solver'):
+            index = max(int(k.rsplit('_', 1)[1]) for k in self.a if k.startswith(f'{family}_attention_{layer}_'))
+        weights = self.a[f'{family}_attention_{layer}_{index}']
         queries = [0, self.c['n_future']-1]
         volumes = [weights[q, :self.nimage].reshape(self.shape)*100 for q in queries]
         vmax = max(volume.sum(axis).max() for volume in volumes for axis in (1, 2))
@@ -260,17 +267,24 @@ class Atlas:
             fig.colorbar(im, ax=axes, fraction=.025, pad=.025, label='% of image/reference attention per bin')
             fig.text(.05+col*.49, .48, f"Image mass: {weights[q, :self.nimage].sum()*100:.2f}% · observed-reference mass: {weights[q, self.nimage:].sum()*100:.2f}%", fontsize=11)
         if generator:
-            ax = self.axis(fig, [.055, .14, .4, .23], 'Each executed proposal and its final survival')
-            for attempt, (points, confidence) in enumerate(zip(self.a['refinement_points'], self.a['refinement_confidence'])):
-                ax.plot(points[:, 2], points[:, 0], label=f'Attempt {attempt+1}: S={confidence[-1]:.3f}')
+            ax = self.axis(fig, [.055, .14, .4, .23], 'Executed generation steps')
+            for attempt, points in enumerate(self.a.get('solver_points', self.a['refinement_points'])):
+                ax.plot(points[:, 2], points[:, 0], label=f'Step {attempt}')
             ax.set(xlabel='Forward plane', ylabel='u coordinate')
             ax.legend(fontsize=10)
-            fig.text(.54, .35, f"{self.c['hidden']} sampled image features + forward coordinate initialize each query.\n"
+            flow = self.m['capabilities']['solver']
+            description = ('Velocity queries combine image features, lateral state, forward plane and time.\n'
+                           'The shared decoder reads image, references and historical tokens.\n'
+                           'Midpoint integration starts at lateral x=0, y=0.\n'
+                           'Forward planes stay fixed; only the final path receives survival scores.\n'
+                           'Integration stages are not separate candidate proposals.' if flow else
+                           f"{self.c['hidden']} sampled image features + forward coordinate initialize each query.\n"
                      'Self-attention couples future points. Cross-attention reads image/references,\n'
                      'then a separate residual attention reads historical slab tokens.\n'
                      'LayerNorm and a bounded lateral readout produce u and v.\n'
                      'Forward planes stay fixed. Refinement refreshes path evidence\n'
-                     'and uses detached failure/survival feedback with the shared decoder.', fontsize=13, va='top', linespacing=1.7)
+                     'and uses detached failure/survival feedback with the shared decoder.')
+            fig.text(.54, .35, description, fontsize=13, va='top', linespacing=1.7)
         else:
             ax = self.axis(fig, [.055, .15, .4, .22], 'Conditional failure and prefix survival')
             logits = self.a['hazard_logits']
@@ -292,9 +306,9 @@ class Atlas:
                     'Measured spatial attention and executed proposals.' if generator else 'Measured scorer attention, conditional failures and monotone survival.', pdf)
 
     def raw_inputs(self):
-        names = ['CT', 'Presence', 'uu', 'vv', 'ff', 'uv', 'uf', 'vf'][:len(self.a['input'])]
+        names = ['CT']
         rows = (len(names)+1)//2
-        fig = self.page('Exact current-crop inputs', 'All channels in paired orthogonal central slices; signed off-diagonal moments keep their signs.', size=(22, 5*rows+2))
+        fig = self.page('Exact current-crop inputs', 'Z-scored CT in paired orthogonal central slices.', size=(22, 5*rows+2))
         for k, name in enumerate(names):
             row, col = divmod(k, 2)
             axes = self.pair(fig, [.045+col*.49, .84-(row+1)*(.74/rows), .425, .74/rows*.72], name)
@@ -308,7 +322,7 @@ class Atlas:
 
     def browser(self):
         m = self.m
-        header = f"Fiber {m['fiber_index']} · replay row {m['replay_row']} · step {m['checkpoint_step']:,} EMA · {m['architecture']}"
+        header = f"Fiber {m['fiber_index']} · replay row {m['replay_row']} · step {m['checkpoint_step']:,} EMA · {m['model_type']}"
         sections = ''.join(f'<section id="{p["name"]}"><h2>{escape(p["title"])}</h2><p>{escape(p["summary"])}</p>'
                            f'<a href="{p["name"]}.png"><img loading="lazy" src="{p["name"]}_preview.png" alt="{escape(p["title"])}"></a></section>' for p in self.pages)
         links = ''.join(f'<a href="#{p["name"]}">{escape(p["title"])}</a>' for p in self.pages)
@@ -320,7 +334,7 @@ class Atlas:
         (self.dest / 'index.html').write_text(html)
         (self.dest / 'README.txt').write_text(header+'\n\n'+self.r['protocol']+'\n\nHistory: '+m['history_source']+
             '\n\nCurrent model: overlapping 6-cube stride-4 convolution, axial token encoder, separate live CT/path slab encoder, '
-            'per-layer history residual reads, shared-decoder refinement, causal segment survival. No recurrent feature bank or grid injection.\n'
+            'per-layer history residual reads, coordinate refinement or flow integration, and causal segment survival.\n'
             '\nInstrumentation is removed before an exactly equal baseline rerun. All interventions are restored and the baseline is checked again.\n'
             'Spatial overlays are projections over central CT slices. Attention marginals sum the omitted dimension and average heads; '
             'historical attention has an independent normalization. Cosine and update maps summarize all hidden features.\n'
@@ -330,9 +344,44 @@ class Atlas:
         (self.dest / 'figure_manifest.json').write_text(json.dumps(dict(pages=self.pages, spatial_pairs=self.pairs), indent=2))
 
 
+def render_common(directory):
+    """A useful core report even without component-specific instrumentation."""
+    dest = Path(directory)
+    meta = json.loads((dest/'sample_provenance.json').read_text())
+    with np.load(dest/'sample_activations.npz') as data:
+        a = dict(data)
+    fig, axes = plt.subplots(1, 3, figsize=(20, 15))
+    crop = meta['model_cfg']['fine']
+    ct = a['input'][0]
+    half = crop['width']*crop['spacing']/2
+    extent = (-half, half, (-crop['behind']-.5)*crop['spacing'],
+              (crop['depth']-crop['behind']-.5)*crop['spacing'])
+    for axis, component in zip(axes[:2], (0, 1)):
+        middle = (ct.shape[1]-1)/2
+        indices = [int(np.floor(middle)), int(np.ceil(middle))]
+        section = ct[:, indices, :].mean(1) if component == 0 else ct[:, :, indices].mean(2)
+        axis.imshow(section, origin='lower', extent=extent, cmap='gray', vmin=-4, vmax=4, aspect='auto')
+        axis.plot(a['hist'][a['hmask'] > 0, component], a['hist'][a['hmask'] > 0, 2], label='Observed history')
+        for i, points in enumerate(a.get('solver_points', a['refinement_points'])):
+            axis.plot(points[:, component], points[:, 2], label=f'Generation step {i}')
+        axis.plot(a['points'][:, component], a['points'][:, 2], label='Selected path', linewidth=3)
+        axis.set(xlabel=('u', 'v')[component], ylabel='Forward plane'); axis.legend()
+    axes[2].plot(a['confidence']); axes[2].set(xlabel='Prefix', ylabel='Survival confidence', ylim=(0, 1))
+    fig.suptitle('Model decision — component attention and interventions unavailable')
+    for suffix, dpi in [('', 160), ('_preview', 75)]: fig.savefig(dest/('01_decision'+suffix+'.png'), dpi=dpi)
+    fig.savefig(dest/'01_decision.pdf'); fig.savefig(dest/'model_interpretation.pdf'); plt.close(fig)
+    pages = [dict(name='01_decision', title='Model decision', summary='CT, observed history, generated path and confidence')]
+    (dest/'figure_manifest.json').write_text(json.dumps(dict(pages=pages, spatial_pairs=[])))
+    (dest/'index.html').write_text('<!doctype html><title>Model decision</title><h1>Model decision</h1>'
+        '<p>Component attention and history interventions are unavailable.</p><img src="01_decision_preview.png">')
+
+
 def render(directory):
     plt.rcParams.update({'font.family': 'DejaVu Sans', 'font.size': 11, 'text.color': INK,
                          'axes.spines.top': False, 'axes.spines.right': False, 'pdf.fonttype': 42})
+    meta = json.loads((Path(directory)/'sample_provenance.json').read_text())
+    if not all(meta.get('capabilities', {}).get(key) for key in ('patch_features', 'history', 'attention')):
+        return render_common(directory)
     atlas = Atlas(directory)
     with PdfPages(atlas.dest / 'model_interpretation.pdf') as pdf:
         for method in (atlas.overview, atlas.inputs, atlas.encoder, atlas.memory, atlas.interventions):

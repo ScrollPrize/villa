@@ -1,7 +1,7 @@
 """Shared model, batch and CLI fixtures.
 
-``aligned_config``/``aligned_batch`` are a small version of the model the aligned run trains
-(scripts/train_aligned.sh): CT-only input, patch4 token-only encoder with a residual stem, fine
+``coordinate_config``/``coordinate_batch`` are a small version of the model the coordinate regression run trains
+(scripts/train_coordinate_regression.sh): CT-only input, patch4 token-only encoder with a residual stem, fine
 history encoder with path and path-geometry tokens, recurrent refinement. ``config``/``batch``
 are the small generic model fixtures.
 """
@@ -11,7 +11,7 @@ from dataclasses import replace
 import numpy as np
 import torch
 
-from vesuvius.neural_tracing.fiber_follow.models.model import DirectConfig
+from vesuvius.neural_tracing.fiber_follow.models.model import CoordinateRegressionConfig
 from vesuvius.neural_tracing.fiber_follow.data.data import TracedFiber
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
 from label_fixtures import state_labels
@@ -21,20 +21,17 @@ REQUIRED = ['--name', 'test', '--fiber-zarrs', 'unused', '--fibers', 'unused',
 
 
 def config(**kwargs):
-    options = dict(fine=CropSpec(depth=24, width=17, behind=8), channels=4, hidden=16,
+    options = dict(fine=CropSpec(depth=24, width=20, behind=8), hidden=16,
                    heads=2, layers=1, decoder_layers=1, n_future=4, n_history=32, activation_checkpointing=False,
-                   recurrent_refinement_steps=0)
+                   recurrent_refinement_steps=0, stem_channels=4, encoder_ffn=32, decoder_ffn=32, scorer_layers=1)
     options.update(kwargs)
-    if options.get('encoder') == 'patch4':
-        crop = options['fine']
-        options['fine'] = replace(crop, depth=4*((crop.depth+3)//4), width=4*((crop.width+3)//4))
-    return DirectConfig(**options)
+    crop = options['fine']
+    options['fine'] = replace(crop, depth=4*((crop.depth+3)//4), width=4*((crop.width+3)//4))
+    return CoordinateRegressionConfig(**options)
 
 
-def aligned_config(**kwargs):
-    options = dict(fine=CropSpec(depth=16, width=12, behind=7), input_mode='ct', direction_inputs=False,
-                   encoder='patch4', token_only=True, stem_channels=4, stem_blocks=2, history_encoder='fine',
-                   history_path_tokens=True, path_geometry_tokens=True, layers=2, recurrent_refinement_steps=3)
+def coordinate_config(**kwargs):
+    options = dict(fine=CropSpec(depth=16, width=12, behind=7), stem_channels=4, stem_blocks=2, layers=2, recurrent_refinement_steps=3)
     options.update(kwargs)
     return config(**options)
 
@@ -47,11 +44,11 @@ def slab_inputs(b):
                 history_overlap=torch.zeros(b, 8), history_load_seconds=torch.zeros(b))
 
 
-def batch(cfg, b=2):
+def raw_batch(cfg, b=2):
     hist = torch.zeros(b, cfg.n_history, 3)
     hist[..., 2] = -torch.arange(1, cfg.n_history+1)
     q = 4*(cfg.n_future-1)+1
-    x = dict(fine=torch.rand(b, 2, cfg.fine.depth, cfg.fine.width, cfg.fine.width),
+    x = dict(fine=torch.rand(b, cfg.input_channels, cfg.fine.depth, cfg.fine.width, cfg.fine.width),
              seed=torch.zeros(b, 1, 3), seed_mask=torch.ones(b, 1), seed_tangent=torch.tensor([0., 0., 1.]).expand(b, -1),
              seed_age=torch.zeros(b))
     x.update(slab_inputs(b))
@@ -62,7 +59,7 @@ def batch(cfg, b=2):
 
 
 def slab_batch(c, b=2, step=0):
-    return batch(c, b)
+    return raw_batch(c, b)
 
 
 def path_batch(c, count=2):
@@ -85,8 +82,8 @@ def geometry_batch(c, count=2, length=100.):
     return out
 
 
-def aligned_batch(c, b=2):
-    """A batch with every input the aligned model reads (CT-only image, slabs, path and geometry)."""
+def coordinate_batch(c, b=2):
+    """A batch with every input the coordinate regression model reads (CT-only image, slabs, path and geometry)."""
     out = geometry_batch(c, b)
     out['x']['fine'] = out['x']['fine'][:, :c.input_channels].contiguous()
     out['x']['history_pose'] = torch.rand_like(out['x']['history_pose'])
@@ -121,3 +118,7 @@ def array_at(path, values):
                                                 dtype='|u1', fill_value=0, order='C', filters=None, compressor=None,
                                                 zarr_format=2)))
     (path/'0.0.0').write_bytes(values.astype(np.uint8).tobytes())
+
+
+def batch(cfg, b=2):
+    return coordinate_batch(cfg, b)

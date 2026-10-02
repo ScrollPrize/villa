@@ -1,7 +1,6 @@
 """Terminal formatting for follower training; JSON remains the analysis format."""
 import json
 
-from vesuvius.neural_tracing.fiber_follow.train.training_options import normalize_batch_options
 
 from vesuvius.neural_tracing.fiber_follow.tracing.policy import DIAGNOSTIC_THRESHOLDS
 
@@ -130,6 +129,7 @@ class DirectTrainingInterval:
             counts = self.values.setdefault('dataset_counts', {})
             for key, value in row['dataset_counts'].items():
                 counts[key] = counts.get(key, 0)+value
+        self.values['prediction_loss_type'] = row.get('prediction_loss_type', 'geometry')
         crops = row['observed_states']
         self.values['updates'] += 1
         self.values['crops'] += crops
@@ -158,7 +158,7 @@ def _interval_training_lines(row):
     updates = m['updates']
     lines = [f"  points ({row['n_future']}/curve, tolerance {row['tolerance']:g} vox): "
              f"{right:,} right / {wrong:,} wrong | {score} correct | {unknown:,} unknown",
-             f"  loss {m['loss']:.4f} | geometry {m['geometry']:.4f} | confidence {m['confidence_loss']:.4f}"
+             f"  loss {m['loss']:.4f} | {m.get('prediction_loss_type', 'geometry')} {m['geometry']:.4f} | confidence {m['confidence_loss']:.4f}"
              f" | mean error {_number(m['error_mean'])} vox",
              f"  speed: {1000*row['interval_update_seconds']/updates:.0f} ms/update"
              f" | data wait {1000*row['interval_data_seconds']/updates:.0f} ms/update"
@@ -258,7 +258,7 @@ def _decision_lines(decisions):
 
 
 def _direct_training_lines(row):
-    lines = [f"  geometry {row['geometry']:.4f} | confidence {row['confidence_loss']:.4f}"
+    lines = [f"  {row.get('prediction_loss_type', 'geometry')} {row['geometry']:.4f} | confidence {row['confidence_loss']:.4f}"
              f" | mean error {_number(row['error_mean'])} voxels | prefix correct {row['prefix_correct_fraction']:.1%}"]
     if 'interval_samples_per_second' in row:
         lines.insert(0, f"  recent speed {row['interval_samples_per_second']:.2f} samples/s"
@@ -278,8 +278,7 @@ def _direct_training_lines(row):
 def _identity_lines(stats):
     lines = [f"  identity-aware prefix correct {stats.get('identity_prefix_correct_fraction', 0.):.1%}"
              +f" | labels flipped {int(stats.get('identity_flipped_count', 0))}",
-             f"  identity data: presence dropped {stats.get('presence_dropped_fraction', 0.):.0%}"
-             f" | neighbor coverage {stats.get('foreign_components_fraction', 0.):.0%}"
+             f"  identity data: neighbor coverage {stats.get('foreign_components_fraction', 0.):.0%}"
              +''.join(f" | {key[9:-9]} {value:.0%}" for key, value in stats.items()
                       if key.startswith('location_') and key.endswith('_fraction'))]
     if 'blurred_fraction' in stats:
@@ -290,7 +289,7 @@ def _identity_lines(stats):
 def format_training_log(row):
     step = f"Step {row['step']:,}" if 'step' in row else 'Training'
     if row.get('event') == 'resume_configuration':
-        options = normalize_batch_options(row.get('training_options', {}))
+        options = row.get('training_options', {})
         return (f"{step} | resumed {row['checkpoint']}\n"
                 f"  commit {options.get('n_commit', '?')} | historical slabs: 8 slots, minimum spacing 32 vox"
                 f" | batch {options.get('batch', '?')} / grad steps {options.get('grad_steps', '?')}"

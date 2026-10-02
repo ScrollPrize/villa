@@ -100,8 +100,8 @@ def connector_batch(cfg, foreign_at):
     q = 4*(cfg.n_future-1)+1
     foreign = torch.zeros(1, cfg.fine.depth, cfg.fine.width, cfg.fine.width, dtype=torch.uint8)
     for a, b, c in foreign_at:
-        centre = (cfg.fine.width-1)//2
-        foreign[0, int(c+cfg.fine.behind), int(b+centre), int(a+centre)] = 1
+        centre = (cfg.fine.width-1)/2
+        foreign[0, int(c+cfg.fine.behind), round(b+centre), round(a+centre)] = 1
     dense = torch.zeros(1, q, 2)
     dense[..., 0] = 4.
     return dict(dense_ab=dense, dense_mask=torch.ones(1, q), endpoint_known=torch.zeros(1),
@@ -209,7 +209,7 @@ def test_collection_takes_one_directed_episode_per_distinct_fiber_and_records_sk
         if pos[0] == 30.:
             raise SeedHeadingError('CT seed context has no identifiable sheet normal')
         return np.asarray(direction)
-    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.evaluation.legacy_evaluate.oriented_seed_heading', heading)
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.evaluation.seeds.oriented_seed_heading', heading)
     cursor = CoverageCursor(fibers, seed=4)
     rng = np.random.default_rng(0)
     first, skipped = select_seeds(fibers, None, cursor, 3, rng)
@@ -411,7 +411,7 @@ def test_export_keeps_short_valid_traces_and_records_every_seed(tmp_path, monkey
 
 
 def test_geometric_outcomes_count_returns_without_erasing_the_first_departure():
-    from vesuvius.neural_tracing.fiber_follow.evaluation.legacy_evaluate import geometric_outcomes, score_trace
+    from vesuvius.neural_tracing.fiber_follow.evaluation.seeds import geometric_outcomes, score_trace
     fiber = line_fiber(600)
     z = np.arange(100., 400.)
     lateral = np.where((z > 150) & (z < 180), 4., 0.)+np.where(z > 300, 8., 0.)

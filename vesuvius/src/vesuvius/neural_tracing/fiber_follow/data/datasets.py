@@ -25,14 +25,14 @@ def ct_source_spec(source, cache_dir):
         grid_scale=float(source['grid_scale']), inputs='ct', load_presence=False, cache_dir=cache_dir)
 
 
-def primary_source_spec(document, input_mode='ct', *, fiber_zarrs=None, ct=None):
+def primary_source_spec(document, *, fiber_zarrs=None, ct=None):
     """The Paris 4 CT/fiber volume spec the trainer builds from a dataset config (CLI paths may override)."""
     source = next((s for s in document['sources'] if s['kind'] == 'paris4'), {}) if document else {}
     return FiberVolumeSpec(fiber_zarrs if fiber_zarrs is not None else source.get('fiber_zarrs'),
         ct_zarr=ct if ct is not None else source.get('ct'),
         ct_level=source.get('ct_level', 0), ct_grid_scale=source.get('ct_grid_scale', 4.),
-        grid_scale=source.get('grid_scale', 8.), inputs=input_mode,
-        load_presence=input_mode != 'ct', cache_dir=document['cache_dir'] if document else None)
+        grid_scale=source.get('grid_scale', 8.), inputs='ct',
+        load_presence=False, cache_dir=document['cache_dir'] if document else None)
 
 
 def read_dataset_config(path):
@@ -90,7 +90,7 @@ def validate_dataset_resume(checkpoint, document, digest):
 
 def validation_manifest(fibers, spec, seed=0, monitor_count=32):
     """Freeze distinct monitor/calibration/final fiber IDs and CT-only seeds."""
-    from vesuvius.neural_tracing.fiber_follow.evaluation.legacy_evaluate import make_seeds
+    from vesuvius.neural_tracing.fiber_follow.evaluation.seeds import make_seeds
     from vesuvius.neural_tracing.fiber_follow.shared.experiment import jsonable
     from vesuvius.neural_tracing.fiber_follow.tracing.heading import SEED_HEADING_POLICY, TRACE_HEADING_POLICY, FRAME_POLICY
     from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolume
@@ -338,8 +338,6 @@ def open_afv_source(source, cache_dir, normalization=None):
 
 def build_mixed_dataset(primary, document, cfg, sample, sampling, args, *, seed, budget, out=None, resume=False,
                         normalization=None):
-    if cfg.input_mode != 'ct' or cfg.direction_inputs:
-        raise ValueError('The AFV sources have CT only; enable --input-mode ct --no-direction-inputs')
     datasets, names, weights, provenance = [], [], [], []
     for index, source in enumerate(document['sources']):
         if source['kind'] == 'paris4':

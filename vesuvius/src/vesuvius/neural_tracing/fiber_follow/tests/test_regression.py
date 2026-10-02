@@ -7,10 +7,10 @@ import numpy as np
 import pytest
 import torch
 
-from vesuvius.neural_tracing.fiber_follow.models.model import DirectFollower, build_model, feature_grid
+from vesuvius.neural_tracing.fiber_follow.models.model import CoordinateRegressionFollower, build_model, feature_grid
 from vesuvius.neural_tracing.fiber_follow.train.supervision import geometry_mask, loss_terms
 from vesuvius.neural_tracing.fiber_follow.train import train
-from vesuvius.neural_tracing.fiber_follow.train.train import ARCHITECTURES, checkpoint_config, clip_training_gradients, initialize_training_optimizer, load_checkpoint, optimizer_update, prepare_training, save_checkpoint
+from vesuvius.neural_tracing.fiber_follow.train.train import MODEL_TYPES, checkpoint_config, clip_training_gradients, initialize_training_optimizer, load_checkpoint, optimizer_update, prepare_training, save_checkpoint
 from vesuvius.neural_tracing.fiber_follow.data.observations import image_crop
 from vesuvius.neural_tracing.fiber_follow.data.data import SampleConfig, TracedFiber, fiber_identities, fiber_manifest
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, crop_local_grid, sample_oriented_fast
@@ -18,25 +18,25 @@ from vesuvius.neural_tracing.fiber_follow.train.runloop import read_checkpoint, 
 from vesuvius.neural_tracing.fiber_follow.train.training_log import DirectTrainingInterval, SamplingLedger, format_training_log
 from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolumeSpec
 from label_fixtures import set_terminal
-from model_fixtures import aligned_batch, aligned_config, batch as label_batch, forward, proposal_output
+from model_fixtures import coordinate_batch, coordinate_config, batch as label_batch, forward, proposal_output
 
 
 def config(**kwargs):
-    """Small aligned model; one refinement unless refinement is the subject."""
-    return aligned_config(**{'recurrent_refinement_steps': 1, **kwargs})
+    """Small coordinate regression model; one refinement unless refinement is the subject."""
+    return coordinate_config(**{'recurrent_refinement_steps': 1, **kwargs})
 
 
 def batch(cfg, b=2):
-    return aligned_batch(cfg, b)
+    return coordinate_batch(cfg, b)
 
 
 def take(value, sl):
     return {k: take(v, sl) for k, v in value.items()} if isinstance(value, dict) else value[sl]
 
 
-def test_aligned_forward_is_deterministic_causal_and_trainable():
+def test_coordinate_forward_is_deterministic_causal_and_trainable():
     torch.manual_seed(20)
-    m = DirectFollower(config())
+    m = CoordinateRegressionFollower(config())
     b = batch(m.cfg)
     b['hmask'][0] = 0
     b['x']['seed'][:] = torch.tensor([100., 100., 100.])  # outside the crop
@@ -97,7 +97,7 @@ def test_optimizer_update_partition_metrics_and_sampling_ledger():
     """Microbatches keep the objective and update; metrics and the ledger don't change training or RNG."""
     torch.manual_seed(3)
     cfg = config()
-    a = DirectFollower(cfg)
+    a = CoordinateRegressionFollower(cfg)
     bmodel = copy.deepcopy(a)
     data = batch(cfg, 2)
     data['dense_mask'][0, 5:] = 0
@@ -192,7 +192,7 @@ def test_nonfinite_microbatch_loss_raises_before_any_update():
     """Loss sums are read once per update; a nonfinite microbatch still blocks the step."""
     torch.manual_seed(4)
     cfg = config()
-    model = DirectFollower(cfg)
+    model = CoordinateRegressionFollower(cfg)
     data = batch(cfg, 2)
     poisoned = take(data, slice(1, 2))
     poisoned['x']['fine'] = torch.full_like(poisoned['x']['fine'], float('nan'))
@@ -211,7 +211,7 @@ def test_training_compilation_emulates_eager_bf16_rounding(monkeypatch):
     monkeypatch.setattr(torch._inductor.config, 'emulate_precision_casts', False)
     compiled = []
     monkeypatch.setattr(torch, 'compile', lambda module, **kwargs: compiled.append((module, kwargs)) or module)
-    model = DirectFollower(config())
+    model = CoordinateRegressionFollower(config())
     parameters, keys = list(model.parameters()), list(model.state_dict())
     assert prepare_training(model) is model
     assert not hasattr(model, '_orig_mod')
@@ -225,11 +225,11 @@ def test_training_compilation_emulates_eager_bf16_rounding(monkeypatch):
     assert not torch._inductor.config.emulate_precision_casts
 
 
-def test_checkpoint_resume_init_weights_and_architecture_contract(tmp_path):
+def test_checkpoint_resume_init_weights_and_model_type_contract(tmp_path):
     torch.manual_seed(7)
     cfg = config()
     args = SimpleNamespace(reset_optimizer=False, lr=.001)
-    m = DirectFollower(cfg)
+    m = CoordinateRegressionFollower(cfg)
     ema = copy.deepcopy(m)
     opt, done, origin = initialize_training_optimizer(m, ema, args)
     assert done == origin == 0
@@ -246,7 +246,7 @@ def test_checkpoint_resume_init_weights_and_architecture_contract(tmp_path):
     torch.testing.assert_close(forward(loaded, data)['points'], forward(ema, data)['points'], rtol=0, atol=0)
     assert crop == cfg.fine and nh == cfg.n_history and loaded_spec == spec
     # Resume restores optimizer, RNG stream and schedule origin: the next update is identical.
-    restored = DirectFollower(cfg)
+    restored = CoordinateRegressionFollower(cfg)
     restored_ema = copy.deepcopy(restored)
     restored_opt, done, origin = initialize_training_optimizer(restored, restored_ema, args, ck)
     assert (done, origin) == (1, 0)
@@ -257,19 +257,14 @@ def test_checkpoint_resume_init_weights_and_architecture_contract(tmp_path):
     for p, q in zip(m.parameters(), restored.parameters()):
         torch.testing.assert_close(p, q, rtol=0, atol=0)
     # --init-weights: the launcher's architecture flags must match; model and EMA load strictly.
-    initial = read_checkpoint(path, ARCHITECTURES, 'cpu')
+    initial = read_checkpoint(path, MODEL_TYPES, 'cpu')
     assert checkpoint_config(initial) == cfg
-    launcher = dict(encoder=('patch4', 'conv'), token_only=(True, False), history_encoder=('fine', 'legacy'),
-                    history_path_tokens=(True, False), path_geometry_tokens=(True, False))
-    for name, (requested, wrong) in launcher.items():
-        resolve = getattr(train, 'resolve_'+name)
-        assert resolve(requested, initial) == requested
-        with pytest.raises(ValueError, match='match'):
-            resolve(wrong, initial)
-    for key in ('model', 'ema'):
-        build_model(checkpoint_config(initial)).load_state_dict(initial[key], strict=True)
+    fresh, fresh_ema = train.initialize_model_weights(checkpoint_config(initial), 'cpu', initial)
+    for key, module in (('model', fresh), ('ema', fresh_ema)):
+        for name, value in module.state_dict().items():
+            torch.testing.assert_close(value, initial[key][name], rtol=0, atol=0)
     with pytest.raises(ValueError, match='Unsupported'):
-        checkpoint_config(dict(initial, architecture='axial_patch4_fiber_slabs_v10'))
+        checkpoint_config(dict(initial, model_type='unsupported'))
     # The init fiber check compares identities: repaired geometry passes, a changed source does not.
     arc = np.arange(50.)
     fiber = TracedFiber('f', np.c_[arc*0, arc*0, arc], arc, '', source_hash='abc')
@@ -302,7 +297,7 @@ def test_inference_checkpoint_keeps_checkpoint_storage_on_cpu(monkeypatch):
 def test_ct_crops_match_reference_sampling_at_edges_and_native_resolution():
     """Per-item tight blocks give the reference values, zero fill beyond the array, on the 2x CT grid."""
     from vesuvius.neural_tracing.fiber_follow.data.data import _grid_flat, read_blocks
-    from vesuvius.neural_tracing.fiber_follow.shared.fast_sample import sample_crop
+    from vesuvius.neural_tracing.fiber_follow.shared.fast_sample import sample_scalar_crop
     from vesuvius.neural_tracing.fiber_follow.data.ct_normalization import normalize_ct
     rng = np.random.default_rng(11)
     data = rng.integers(1, 256, (70, 60, 64), dtype=np.uint8)
@@ -313,8 +308,7 @@ def test_ct_crops_match_reference_sampling_at_edges_and_native_resolution():
         if np.all(hi > lo):
             out[tuple(slice(a-s, b-s) for a, b, s in zip(lo, hi, start))] = data[tuple(map(slice, lo, hi))]
         return out
-    # Avoid a hard-mask boundary at an exactly representable intensity: backends differ in rounding.
-    calibration = dict(threshold=62.123, noise=4.)
+    calibration = dict(method='crop_zscore_v1')
     vol = SimpleNamespace(presence=None, input_scale=2., raw_block=lambda s, z: read(s, z)[None],
                           spec=SimpleNamespace(ct_normalization=calibration))
     crop = CropSpec(depth=14, width=10, behind=5, spacing=.5)
@@ -323,13 +317,13 @@ def test_ct_crops_match_reference_sampling_at_edges_and_native_resolution():
         # Interior, straddling each face, and fully outside; arbitrary orientation.
         q, _ = np.linalg.qr(rng.normal(size=(3, 3)))
         items.append(dict(pos=rng.uniform(-6, 38, 3), frame=q*np.sign(np.linalg.det(q))))
-    image = image_crop(items, vol, crop, input_mode='ct')
+    image = image_crop(items, vol, crop)
     assert image.shape == (24, 1, crop.depth, crop.width, crop.width)
     raw, starts = read_blocks(items, vol, crop)
-    grid, empty, mask = _grid_flat(crop), np.empty((0, 3), np.float32), np.empty(0, np.float32)
-    expected = np.stack([sample_crop(raw[j], starts[j], item['pos']*2., item['frame']*2., grid, empty, mask, 2, 1.,
-                                     'points')[0].reshape(crop.depth, crop.width, crop.width)
-                         for j, item in enumerate(items)]).astype(np.float32)
+    grid = _grid_flat(crop)
+    expected = np.empty((len(items), crop.depth, crop.width, crop.width), np.float32)
+    for j, item in enumerate(items):
+        sample_scalar_crop(raw[j], starts[j], item['pos']*2., item['frame']*2., grid, expected[j])
     reference = torch.from_numpy(expected.copy())
     for row in expected:
         normalize_ct(row, calibration)

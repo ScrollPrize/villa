@@ -2,7 +2,7 @@
 import numpy as np
 import torch
 
-from vesuvius.neural_tracing.fiber_follow.data.data import OnPolicyStates, STARTUP_CATEGORIES, fiber_manifest, make_sample, label_state, replay_facts, resolve_trace_seed, collate_with_volume
+from vesuvius.neural_tracing.fiber_follow.data.data import OnPolicyStates, STARTUP_CATEGORIES, fiber_manifest, make_sample, label_state, replay_facts, resolve_trace_seed
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import crop_local_grid
 from vesuvius.neural_tracing.fiber_follow.data.labels import prefix_labels
 from vesuvius.neural_tracing.fiber_follow.tracing.trace import ModelTracer, TraceParams
@@ -74,7 +74,9 @@ def recovery_batches(vol, states, fibers, sample, batch_builder=None, limit=0):
         item.update({k: getattr(states, k)[j] for k in SEED_FIELDS if hasattr(states, k)})
         item['observed_path'] = states.observed_prefix(j)
         item['frame_policy'] = states.provenance.get('frame_policy', FRAME_POLICY)
-        cpu = batch_builder([item], vol) if batch_builder else collate_with_volume([item], vol, sample.crop, grid)
+        if batch_builder is None:
+            raise ValueError('Recovery evaluation requires the common observation builder')
+        cpu = batch_builder([item], vol)
         yield j, cpu
 
 
@@ -100,11 +102,6 @@ def evaluate_recovery_states(model, vol, states, fibers, sample, *, device='cpu'
         fi=int(states.fiber_idx[j]);f=fibers[fi]
         b = move(cpu)
         sampling={}
-        if (getattr(model.cfg,'sampler_mode','zero')=='gaussian'
-                or getattr(model.cfg,'gaussian_candidates',0)>0):
-            from vesuvius.neural_tracing.fiber_follow.flow_matching.sampling import trace_generator,trace_noise
-            generator=trace_generator(sampling_seed,states.pos[j],states.frame[j,:,2])
-            sampling['initial_noise']=trace_noise(model.cfg,[generator],device)
         # The original crop builder can return float16, while direct images
         # arrive as a dictionary with independent historical slabs.
         # Floating inputs enter in float32 before AMP; preserve boolean masks.

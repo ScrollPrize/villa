@@ -49,11 +49,12 @@ def display_example(batch, output, details, layers, cfg, label, metrics):
     rgb = gray*(1-.7*heat)+np.array([1., .15, .15])*.7*heat
     rgb[~valid] = .15
     selected = int(output['selected_refinement'][0])
-    decoder = {key: array(values[selected]) for key, values in layers['decoder'].items()}
+    flow = 'solver_points' in output
+    decoder = {key: array(values[-1 if flow else selected]) for key, values in layers['decoder'].items()}
     attentions = {}
     for name, depth in layers['history_depths'].items():
         values = layers['history'].get(name+'_attention', [])
-        chosen = values[selected*depth:(selected+1)*depth]
+        chosen = values[-depth:] if flow and name == 'generator' else values[selected*depth:(selected+1)*depth]
         attentions[name] = np.mean([array(a) for a in chosen], axis=0) if chosen else np.zeros((cfg.n_future, len(valid)))
     convolution = np.zeros_like(array(layers['history']['tokens']))
     convolution[valid] = array(layers['history']['convolution'])

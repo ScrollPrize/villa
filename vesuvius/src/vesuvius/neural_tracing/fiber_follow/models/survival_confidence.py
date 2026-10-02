@@ -24,12 +24,6 @@ class SegmentSurvivalScorer(nn.Module):
         self.history_attention = HistoryAttention(h, cfg.heads)
         self.norm = nn.LayerNorm(h)
         self.failure = nn.Linear(h, 1)
-        self.plane_projection = None if cfg.token_only else nn.Linear(cfg.channels, h)
-        self.plane_position = None if cfg.token_only else nn.Linear(3, h)
-
-    def plane_tokens(self, samples, xyz):
-        tokens = self.plane_projection(samples)
-        return tokens+self.plane_position(xyz/16.).to(tokens.dtype)
 
     def segment_samples(self, points):
         """Every location depends only on this endpoint and its predecessor."""

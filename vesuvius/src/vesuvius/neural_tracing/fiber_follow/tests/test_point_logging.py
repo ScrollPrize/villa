@@ -5,7 +5,7 @@ from dataclasses import replace
 import numpy as np
 import torch
 
-from model_fixtures import aligned_config, batch, proposal_output
+from model_fixtures import coordinate_config, batch, proposal_output
 from vesuvius.neural_tracing.fiber_follow.train.supervision import point_correctness, loss_terms
 from vesuvius.neural_tracing.fiber_follow.train.training_log import DirectTrainingInterval, format_training_log
 from vesuvius.neural_tracing.fiber_follow.evaluation.diag import plot_curves
@@ -14,7 +14,7 @@ from label_fixtures import set_terminal, set_unknown
 
 
 def test_point_correctness_counts_individual_points_with_masks_and_identity():
-    cfg = aligned_config(fine=replace(aligned_config().fine, depth=40), n_future=16)
+    cfg = coordinate_config(fine=replace(coordinate_config().fine, depth=40), n_future=16)
     data = batch(cfg, 1)
     points = torch.zeros(1, 16, 3)
     points[..., 2] = torch.arange(1, 17)
@@ -31,7 +31,7 @@ def test_point_correctness_counts_individual_points_with_masks_and_identity():
     for key in ('point_correct_count', 'point_wrong_count', 'point_unknown_count'):
         assert terms[key] == other[key]  # all predicted points, independent of commit policy
     # Neighbors, departures, unknown ends, endpoints and nonfinite points.
-    cfg = aligned_config()
+    cfg = coordinate_config()
     data = batch(cfg, 7)
     data['dense_ab'].zero_()
     points = torch.zeros(7, 4, 3)

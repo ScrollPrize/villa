@@ -19,10 +19,20 @@ def attention(q, k, allowed):
     return logits.masked_fill(~allowed, -torch.inf).softmax(-1, dtype=torch.float64).mean(1).float()
 
 
+def capabilities(model):
+    return dict(patch_features=hasattr(getattr(model, 'encoder', None), 'patch_projection'),
+                history=hasattr(model, 'history_encoder'),
+                attention=all(hasattr(model, name) for name in ('decoder', 'confidence_scorer', 'history_attention')),
+                solver=hasattr(model, 'velocity_field'))
+
+
 @contextmanager
 def capture(model):
     """Record real features and Q/K attention; retain the original forward kernels."""
     arrays = {}
+    if not all(capabilities(model)[key] for key in ('patch_features', 'history', 'attention')):
+        yield arrays
+        return
     counters = {}
 
     def append(key, value):

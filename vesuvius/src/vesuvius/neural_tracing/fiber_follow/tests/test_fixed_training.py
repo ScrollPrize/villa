@@ -3,7 +3,7 @@ import copy
 
 import torch
 
-from model_fixtures import aligned_batch, aligned_config
+from model_fixtures import coordinate_batch, coordinate_config
 from vesuvius.neural_tracing.fiber_follow.models.model import build_model
 from vesuvius.neural_tracing.fiber_follow.train.train import prepare_training, optimizer_update, training_prediction
 from vesuvius.neural_tracing.fiber_follow.train.supervision import loss_terms
@@ -25,10 +25,10 @@ def compare_gradients(left, right):
 
 def test_partial_acceptance_keeps_policy_and_geometry_gradients():
     torch.manual_seed(115)
-    eager = build_model(aligned_config(recurrent_refinement_steps=2))
+    eager = build_model(coordinate_config(recurrent_refinement_steps=2))
     raw = copy.deepcopy(eager)
     compiled = prepare_training(raw, backend='eager')
-    batch = aligned_batch(eager.cfg, 2)
+    batch = coordinate_batch(eager.cfg, 2)
     with torch.no_grad():
         confidence = eager(batch['x'], batch['hist'], batch['hmask'])['refinement_confidence'][:, 0, -1]
     assert confidence[0] != confidence[1]
@@ -49,7 +49,7 @@ def test_partial_acceptance_keeps_policy_and_geometry_gradients():
 
 def test_masked_retries_preserve_adamw_skipped_parameter_updates():
     torch.manual_seed(113)
-    model = prepare_training(build_model(aligned_config(recurrent_refinement_steps=2)), backend='eager')
+    model = prepare_training(build_model(coordinate_config(recurrent_refinement_steps=2)), backend='eager')
     opt = torch.optim.AdamW(model.parameters(), lr=.001, weight_decay=.1)
     ema = build_model(model.cfg)
     ema.load_state_dict(model.state_dict())
@@ -64,7 +64,7 @@ def test_masked_retries_preserve_adamw_skipped_parameter_updates():
     with torch.no_grad():
         model.confidence_scorer.failure.weight.zero_()
         model.confidence_scorer.failure.bias.fill_(-20.)
-    optimizer_update(model, ema, opt, [aligned_batch(model.cfg)], 2, .001, compute_metrics=False)
+    optimizer_update(model, ema, opt, [coordinate_batch(model.cfg)], 2, .001, compute_metrics=False)
     for name, p in model.named_parameters():
         if name in protected:
             torch.testing.assert_close(p, protected[name], rtol=0, atol=0)
@@ -77,8 +77,8 @@ def test_compiled_loss_preserves_terms_and_prediction_gradients():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     from vesuvius.neural_tracing.fiber_follow.train.train import move_batch
     torch.manual_seed(341)
-    model = build_model(aligned_config(recurrent_refinement_steps=1)).to(device)
-    batch = move_batch(aligned_batch(model.cfg), device)
+    model = build_model(coordinate_config(recurrent_refinement_steps=1)).to(device)
+    batch = move_batch(coordinate_batch(model.cfg), device)
     with torch.no_grad():
         prediction = model(batch['x'], batch['hist'], batch['hmask'])
     prediction = {k: v.detach().requires_grad_(v.is_floating_point()) for k, v in prediction.items()}

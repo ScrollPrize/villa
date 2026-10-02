@@ -8,8 +8,8 @@ import time
 import numpy as np
 import torch
 
-from vesuvius.neural_tracing.fiber_follow.models.history_slabs import selected_arcs
-from vesuvius.neural_tracing.fiber_follow.models.model import DirectConfig, build_model
+from vesuvius.neural_tracing.fiber_follow.data.history_slabs import selected_arcs
+from vesuvius.neural_tracing.fiber_follow.models.model import CoordinateRegressionConfig, build_model
 from vesuvius.neural_tracing.fiber_follow.train.train import conv_memory_format, optimizer_update, prepare_training
 
 
@@ -74,15 +74,13 @@ def main():
     ap.add_argument('--microbatch', type=int, default=1)
     ap.add_argument('--seed', type=int, default=194)
     ap.add_argument('--ages', type=float, nargs='+', help='Observed lengths; default matches six baseline decision ages')
-    ap.add_argument('--encoder', choices=('conv', 'patch4'), default='patch4')
-    ap.add_argument('--token-only', action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument('--device', default='cuda')
     args = ap.parse_args()
     if args.out.exists() or min(args.decisions, args.microbatch, args.repeats, args.warmup) < 1:
         ap.error('Need a fresh output path and positive dimensions')
     torch.set_num_threads(4)
     torch.manual_seed(args.seed)
-    cfg = DirectConfig(direction_inputs=True, encoder=args.encoder, token_only=args.token_only)
+    cfg = CoordinateRegressionConfig()
     decisions = synthetic_decisions(cfg, args.decisions, args.seed, args.ages)
     batches = decision_microbatches(decisions, args.microbatch)
     model = build_model(cfg).to(args.device, memory_format=conv_memory_format(args.device))

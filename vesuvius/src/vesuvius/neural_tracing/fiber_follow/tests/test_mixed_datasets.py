@@ -9,14 +9,14 @@ import numpy as np
 import pytest
 import torch
 
-from model_fixtures import aligned_batch, aligned_config, config
+from model_fixtures import coordinate_batch, coordinate_config, config
 from model_fixtures import array_at
 from vesuvius.neural_tracing.fiber_follow.data.afv import AFVFibers
 from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolume, FiberVolumeSpec, RemoteChunkedArray
 from vesuvius.neural_tracing.fiber_follow.data.data import make_sample, SampleConfig
 from vesuvius.neural_tracing.fiber_follow.data.datasets import AFVBank, WeightedDatasets, read_dataset_config
 from vesuvius.neural_tracing.fiber_follow.data.observations import image_crop, IdentityObservationBuilder, IdentitySampling
-from vesuvius.neural_tracing.fiber_follow.models.model import build_model, DirectConfig
+from vesuvius.neural_tracing.fiber_follow.models.model import build_model, CoordinateRegressionConfig
 from vesuvius.neural_tracing.fiber_follow.train.supervision import loss_terms
 
 
@@ -60,7 +60,7 @@ def test_afv_native_coordinates_block_overlap_holdout_and_pickle(tmp_path):
 
 def test_afv_foreign_masks_exclude_own_target(tmp_path):
     p=tmp_path/'test.afv';afv_fixture(p);fibers=AFVFibers(p,1.)
-    cfg=config(input_mode='ct')
+    cfg=config()
     # The neighbor sits at the crop edge; geometry here excludes simulated tracing error.
     s=SampleConfig(crop=cfg.fine,n_future=4,n_history=32,startup_shares=(0.,0.,0.,1.),excursion_probability=0.,
                    trace_noise_sigma=(0.,0.))
@@ -82,27 +82,25 @@ def test_ct_only_reads_no_auxiliary_and_requires_auxiliary_when_enabled(tmp_path
         grid_scale=1.,ct_grid_scale=1.,inputs='ct',load_presence=False)
     from test_ct_normalization import record
     spec.ct_normalization = record(spec)
-    vol=FiberVolume(spec);cfg=config(input_mode='ct')
+    vol=FiberVolume(spec);cfg=config()
     items=[dict(pos=np.array([24.,24.,24.]),frame=np.eye(3))]
-    x=image_crop(items,vol,cfg.fine,input_mode='ct')
+    x=image_crop(items,vol,cfg.fine)
     assert x.shape[1]==1
     torch.testing.assert_close(x,torch.zeros_like(x))
-    with pytest.raises(ValueError,match='Presence inputs'):
-        image_crop(items,vol,cfg.fine)
-    with pytest.raises(ValueError,match='CT-only'):
-        DirectConfig(input_mode='ct',direction_inputs=True)
+    with pytest.raises(TypeError, match='direction_inputs'):
+        CoordinateRegressionConfig(direction_inputs=True)
 
 
 def test_ct_only_model_backward_and_config_roundtrip():
     torch.set_num_threads(2)
-    cfg=aligned_config()
-    m=build_model(cfg);b=aligned_batch(cfg,1)
+    cfg=coordinate_config()
+    m=build_model(cfg);b=coordinate_batch(cfg,1)
     assert b['x']['fine'].shape[1]==1
     out=m(b['x'],b['hist'],b['hmask']);terms=loss_terms(out,b,cfg)
     loss=terms['geometry_per_state'].sum()+terms['confidence_per_state'].sum()
     loss.backward()
     assert torch.isfinite(loss) and any(p.grad is not None and p.grad.abs().sum()>0 for p in m.parameters())
-    assert DirectConfig(**cfg.to_dict()).input_channels==1
+    assert CoordinateRegressionConfig(**cfg.to_dict()).input_channels==1
 
 
 class FakeDataset:
@@ -221,7 +219,7 @@ def test_afv_supports_certified_synthetic_failures_and_switch_detection(tmp_path
     from sampling_fixtures import clean_sample
     p=tmp_path/'test.afv';afv_fixture(p,length=800,neighbor_x=36)
     fibers=AFVFibers(p);bank=AFVBank(fibers)
-    cfg=config(input_mode='ct',fine=replace(config().fine,depth=48,behind=24))
+    cfg=config(fine=replace(config().fine,depth=48,behind=24))
     sample=clean_sample(cfg);rng=np.random.default_rng(13)
     def find(fn):
         for _ in range(40):
@@ -252,7 +250,8 @@ def test_replay_scheduler_cycles_all_sources_without_parallel_collectors():
     assert scheduler.close() is None
 
 
-def test_real_collector_roundtrip_on_afv_with_ct_only_inputs(tmp_path):
+@pytest.mark.parametrize('kind', ['coordinate_regression', 'flow_matching'])
+def test_real_collector_roundtrip_on_afv_with_ct_only_inputs(tmp_path, kind):
     import hashlib
     from vesuvius.neural_tracing.fiber_follow.tracing.collect import main as collect
     from vesuvius.neural_tracing.fiber_follow.train.train import save_checkpoint
@@ -271,14 +270,16 @@ def test_real_collector_roundtrip_on_afv_with_ct_only_inputs(tmp_path):
     source=dict(name='fixture',kind='afv',path=str(p),ct=str(tmp_path/'ct'),grid_scale=1.,
                 ct_grid_scale=1.,sha256=hashlib.sha256(p.read_bytes()).hexdigest(),validation=validation)
     document=dict(sources=[source],cache_dir=str(tmp_path/'cache'))
-    cfg=config(input_mode='ct');model=build_model(cfg)
+    from test_flow_model import config as flow_config
+    cfg=config() if kind == 'coordinate_regression' else flow_config()
+    model=build_model(cfg)
     spec=FiberVolumeSpec('',ct_zarr=str(tmp_path/'ct'),ct_level=0,grid_scale=1.,ct_grid_scale=1.,inputs='ct',load_presence=False)
     sample=SampleConfig(crop=cfg.fine,n_history=cfg.n_history,n_future=cfg.n_future)
     ck=tmp_path/'ck.pt';out=tmp_path/'replay.npz'
     from test_ct_normalization import record
-    from vesuvius.neural_tracing.fiber_follow.data.ct_normalization import METHOD, volume_key
+    from vesuvius.neural_tracing.fiber_follow.data.ct_normalization import ZSCORE_METHOD, volume_key
     spec.ct_normalization = record(spec)
-    normalization = dict(method=METHOD, volumes={volume_key(spec): spec.ct_normalization})
+    normalization = dict(method=ZSCORE_METHOD, volumes={volume_key(spec): spec.ct_normalization})
     save_checkpoint(ck,model,model,spec,sample,dict(step=1,dataset_config=document, ct_normalization=normalization))
     collect(['--checkpoint',str(ck),'--fibers',str(p),'--dataset-name','fixture',
         '--device','cpu','--threads','2','--fibers-per-collection','2','--batch','2','--trace-len','8',

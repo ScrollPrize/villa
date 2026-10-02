@@ -7,7 +7,7 @@ point), CT-unavailable, deduplicated or filtered by an explicit ``--min-length``
 The checkpoint's operating policy is used unless ``--confidence``/``--n-commit``
 or a calibration ``--policy`` overrides it.
 
-  python -m vesuvius.neural_tracing.fiber_follow.flow_matching.infer --checkpoint last.pt \
+  python -m vesuvius.neural_tracing.fiber_follow.tracing.infer --checkpoint last.pt \
       --seed 18529.9,13044.9,51234.1 --family H --out traced/
 """
 

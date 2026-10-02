@@ -1,4 +1,4 @@
-"""Generate a seven-page measured interpretation atlas for the patch4 slab follower."""
+"""Generate a model decision report with optional shared-component interpretation."""
 import argparse
 from contextlib import ExitStack
 from dataclasses import replace
@@ -13,8 +13,7 @@ import numpy as np
 import torch
 
 from vesuvius.neural_tracing.fiber_follow.data.observations import ObservationBuilder
-from vesuvius.neural_tracing.fiber_follow.models.history_slabs import slab_layout
-from vesuvius.neural_tracing.fiber_follow.models.model import TOKEN_ARCHITECTURE
+from vesuvius.neural_tracing.fiber_follow.data.history_slabs import slab_layout
 from vesuvius.neural_tracing.fiber_follow.train.train import load_checkpoint
 from vesuvius.neural_tracing.fiber_follow.data.state_labels import constructed_facts
 from vesuvius.neural_tracing.fiber_follow.data.data import SampleConfig, fiber_manifest, label_state, replay_facts, load_fibers, OnPolicyStates, split_fibers, ZBand
@@ -22,7 +21,7 @@ from ..shared.geometry import arclength, frame_from_heading, interp_at, tangent_
 from vesuvius.neural_tracing.fiber_follow.tracing.policy import commit_prefix
 from ..shared.reference import SEED_FIELDS, observed_path, observed_seed
 from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolume
-from .capture import array, capture, validate_attention
+from .capture import array, capture, validate_attention, capabilities
 
 
 VARIANTS = {
@@ -86,6 +85,16 @@ def fixed_curve_confidence(model, x, hist, hmask, points):
 
 def analyze(model, x, hist, hmask, captured, threshold, n_commit):
     saved, metrics, stats = {}, {}, []
+    detail = all(capabilities(model)[key] for key in ('patch_features', 'history', 'attention'))
+    if not detail:
+        with torch.inference_mode():
+            out = model(x, hist, hmask, confidence_threshold=threshold, n_commit=n_commit)
+        for key, value in out.items():
+            saved['baseline_'+key] = array(value[0])
+            np.testing.assert_array_equal(saved['baseline_'+key], captured[key])
+        return saved, dict(metrics={}, encoder_blocks=[], interventions={},
+                           unavailable=['Component attention and history interventions'],
+                           protocol='Fixed-input model prediction; optional component instrumentation unavailable.')
     fixed = torch.from_numpy(captured['points'])[None, None]
     names = list(VARIANTS) + [f'without_block_{i+1}' for i in range(len(model.encoder.blocks))]
     with torch.inference_mode():
@@ -173,8 +182,6 @@ def main(argv=None):
     cp = args.checkpoint.resolve()
     digest = hashlib.sha256(cp.read_bytes()).hexdigest()
     model, _, _, spec, ck = load_checkpoint(cp, 'cpu')
-    if model.architecture != TOKEN_ARCHITECTURE:
-        raise ValueError(f'Only {TOKEN_ARCHITECTURE} is supported')
     overrides = {key: getattr(args, arg) for key, arg in [('ct_zarr', 'ct'), ('fiber_zarr_dir', 'fiber_zarrs'),
                   ('ct_level', 'ct_level'), ('fiber_level', 'fiber_level'), ('ct_grid_scale', 'ct_grid_scale'),
                   ('grid_scale', 'grid_scale')] if getattr(args, arg) is not None}
@@ -216,6 +223,8 @@ def main(argv=None):
     if any(dest.glob('*.npz')):
         raise ValueError('Output already contains an atlas; choose a fresh output directory')
     print(f'Loading volume inputs for {fiber.name}', flush=True)
+    from ..data.ct_normalization import prepare_normalization
+    prepare_normalization(dest, [spec], known=ck['ct_normalization'])
     x = ObservationBuilder(cfg).images([item], FiberVolume(spec, cache_bytes=256 << 20))
     hist = torch.as_tensor(np.array(item['hist_local'])[None], dtype=torch.float32)
     hmask = torch.as_tensor(np.array(item['hmask'])[None], dtype=torch.float32)
@@ -227,15 +236,17 @@ def main(argv=None):
             torch.testing.assert_close(out[key], check[key], rtol=0, atol=0)
             arrays[key] = array(out[key][0])
         arrays.update(input=array(x['fine'][0]), hist=array(hist[0]), hmask=array(hmask[0]),
-                      token_xyz=array(model.encoder.token_xyz).reshape(*cfg.token_shape, 3),
-                      segment_samples=array(model.confidence_scorer.segment_samples(out['points'])[0]),
                       plane_ab=item['plane_ab'], plane_mask=item['plane_mask'], observed_path=observed_path(item))
+        if capabilities(model)['patch_features']:
+            arrays['token_xyz'] = array(model.encoder.token_xyz).reshape(*cfg.token_shape, 3)
+        if hasattr(model, 'confidence_scorer'):
+            arrays['segment_samples'] = array(model.confidence_scorer.segment_samples(out['points'])[0])
         for key, value in x.items():
             if key != 'fine' and key != 'history_load_seconds':
                 arrays['input_' + key] = array(value[0])
     layout = item['_sampled_slabs']
-    arrays['slab_positions'] = np.stack([s['pos'] for s in layout])
-    arrays['slab_frames'] = np.stack([s['frame'] for s in layout])
+    arrays['slab_positions'] = np.asarray([s['pos'] for s in layout]).reshape(-1, 3)
+    arrays['slab_frames'] = np.asarray([s['frame'] for s in layout]).reshape(-1, 3, 3)
     validate_attention(arrays)
     comparison = None
     if args.compare_atlas:
@@ -254,7 +265,8 @@ def main(argv=None):
             assert np.isfinite(value).all(), key
     assert hashlib.sha256(cp.read_bytes()).hexdigest() == digest, 'Checkpoint changed during run; use a numbered checkpoint'
     meta = dict(checkpoint=str(cp), checkpoint_sha256=digest, checkpoint_step=ck['step'], weights='EMA',
-                model_cfg=cfg.to_dict(), architecture=model.architecture, volume_spec=spec.to_dict(),
+                model_cfg=cfg.to_dict(), model_type=model.model_type, volume_spec=spec.to_dict(),
+                capabilities=capabilities(model), history_tokens_per_slab=getattr(getattr(model, 'history_encoder', None), 'tokens_per_slab', None),
                 fibers=str(Path(fibers_path).resolve()), fiber_split=args.fiber_split, val_z=val_z,
                 source=str(args.replay.resolve()) if args.replay else 'annotation',
                 replay_row=args.row if args.replay else None, fiber_index=index, fiber_name=fiber.name,

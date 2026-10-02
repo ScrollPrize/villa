@@ -4,7 +4,7 @@ import pytest
 
 from vesuvius.neural_tracing.fiber_follow.tracing.heading import ct_sheet_heading, ct_seed_heading, linear12_heading, SeedHeadingError
 from vesuvius.neural_tracing.fiber_follow.tracing.inference import trace_bidirectional
-from vesuvius.neural_tracing.fiber_follow.evaluation.legacy_evaluate import make_seeds
+from vesuvius.neural_tracing.fiber_follow.evaluation.seeds import make_seeds
 from vesuvius.neural_tracing.fiber_follow.data.data import TracedFiber
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength
 

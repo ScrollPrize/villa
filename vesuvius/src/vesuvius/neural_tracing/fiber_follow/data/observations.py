@@ -15,7 +15,7 @@ from vesuvius.neural_tracing.fiber_follow.tracing.trace import ModelTracer
 from vesuvius.neural_tracing.fiber_follow.shared.reference import SEED_FIELDS, observed_seed
 from vesuvius.neural_tracing.fiber_follow.data.state_labels import DEPARTURE_DISTANCE, supervise
 from vesuvius.neural_tracing.fiber_follow.tracing.heading import orient_item, frame_prefetch_bounds, heading_free_bounds, reframe_item, FRAME_POLICY
-from vesuvius.neural_tracing.fiber_follow.models.model import DirectConfig
+from vesuvius.neural_tracing.fiber_follow.models.model import CoordinateRegressionConfig
 
 
 def image_crop(items, vol, crop, pool=None):
@@ -32,7 +32,7 @@ class ObservationBuilder:
 
     def prefetch_bounds(self,item,vol):
         """CT footprints covering unresolved roll and normal-estimation context."""
-        from vesuvius.neural_tracing.fiber_follow.models.history_slabs import slab_layout, SLAB
+        from vesuvius.neural_tracing.fiber_follow.data.history_slabs import slab_layout, SLAB
         if '_pending_seed_heading' in item:
             # A trace start takes its CT seed heading only once the image is built.
             yield heading_free_bounds(item['pos'],self.cfg.fine,vol.input_scale)
@@ -54,12 +54,10 @@ class ObservationBuilder:
         x = dict(fine=crop_images(items,vol,self.cfg.fine,pool),seed=stack('visible_seed'),
                  seed_mask=stack('visible_seed_mask'),seed_age=stack('visible_seed_age'),
                  seed_tangent=stack('visible_seed_tangent'))
-        from vesuvius.neural_tracing.fiber_follow.models.history_slabs import load_slabs
+        from vesuvius.neural_tracing.fiber_follow.data.history_slabs import load_slabs
         x.update(load_slabs(items, vol, self.cfg, pool))
-        if self.cfg.path_geometry_tokens:
-            # Final frames are resolved above; samples use the same observed path as slabs.
-            from vesuvius.neural_tracing.fiber_follow.models.path_geometry import path_geometry_inputs
-            x.update(path_geometry_inputs(items))
+        from vesuvius.neural_tracing.fiber_follow.models.path_geometry import path_geometry_inputs
+        x.update(path_geometry_inputs(items))
         # Recorded replay frames have unknown quality unless it was supplied;
         # do not count them as newly successful CT estimates.
         quality = [item.get('ct_frame_diagnostics', {}) for item in items]
@@ -100,7 +98,6 @@ class IdentitySampling:
     """Training-only identity targets, augmentation and fresh-location oversampling."""
     rule: ComponentRule = ComponentRule()
     on_fiber_tolerance: float = 1.5  # visible reference counts toward the anchor within this of GT
-    presence_dropout: float = .25
     contrast: float = 1.4  # log-uniform contrast factor in [1/c, c]
     brightness: float = .1
     noise: float = .03  # maximum Gaussian noise standard deviation
@@ -122,7 +119,7 @@ class IdentitySampling:
     def __post_init__(self):
         if isinstance(self.rule, dict):
             object.__setattr__(self, 'rule', ComponentRule(**self.rule))
-        if not all(0 <= f <= 1 for f in (self.presence_dropout, self.lateral_fraction)):
+        if not all(0 <= f <= 1 for f in (self.lateral_fraction,)):
             raise ValueError('Identity sampling probabilities must lie in [0, 1]')
         if self.lateral_memory < 1 or self.contrast < 1:
             raise ValueError('Invalid identity sample counts or augmentation')
@@ -209,7 +206,7 @@ def roll_frame(frame, angle):
 class IdentityObservationBuilder(ObservationBuilder):
     """Foreign masks, identity evidence and augmentation on top of the shared observation."""
 
-    def __init__(self,cfg: DirectConfig,fibers=None,sampling=IdentitySampling(),*,
+    def __init__(self,cfg: CoordinateRegressionConfig,fibers=None,sampling=IdentitySampling(),*,
                  augment=False,negative_bank=None,near_negative_bank=None,continuation_bank=None):
         super().__init__(cfg)
         self.fibers,self.sampling,self.augment = fibers,sampling,augment
@@ -328,7 +325,7 @@ class IdentityObservationBuilder(ObservationBuilder):
         curve = local(np.arange(max(0.,t-extent),min(fiber.length,t+extent)+1e-9,.25))
         if item['match_distance'] > DEPARTURE_DISTANCE or item.get('source') == SOURCE['synthetic']:
             from scipy.spatial import cKDTree
-            from vesuvius.neural_tracing.fiber_follow.models.history_slabs import slab_layout
+            from vesuvius.neural_tracing.fiber_follow.data.history_slabs import slab_layout
             # Membership affects labels only; every observed slab is still input.
             distance = cKDTree(fiber.points).query(np.stack([o['pos'] for o in slab_layout(item)]))[0]
             item['slab_identity_observable'] = bool((distance <= s.on_fiber_tolerance).any())
@@ -339,7 +336,7 @@ class IdentityObservationBuilder(ObservationBuilder):
         if self.augment:
             draw = (float(np.exp(rng.uniform(-np.log(s.contrast),np.log(s.contrast)))),
                     float(rng.uniform(-s.brightness,s.brightness)),float(rng.uniform(0,s.noise)))
-            item.update(photometric=draw,drop_presence=bool(rng.random() < s.presence_dropout))
+            item.update(photometric=draw)
             item['blur_sigma'] = (float(rng.uniform(*s.blur_sigma))
                                   if s.blur_probability and rng.random() < s.blur_probability else 0.)
             jitter = float(np.clip(rng.normal(0., s.roll_jitter_deg), -s.roll_jitter_max_deg, s.roll_jitter_max_deg))
@@ -350,7 +347,7 @@ class IdentityObservationBuilder(ObservationBuilder):
         return item
 
     def footprint_allowed(self,item,band):
-        from vesuvius.neural_tracing.fiber_follow.models.history_slabs import slabs_allowed
+        from vesuvius.neural_tracing.fiber_follow.data.history_slabs import slabs_allowed
         if not slabs_allowed(item, band):
             return False
         if band is None:
@@ -371,8 +368,7 @@ class IdentityObservationBuilder(ObservationBuilder):
         cfg, bank = self.cfg, self.negative_bank
         selected = np.ones(len(items), bool) if decision_mask is None else np.asarray(decision_mask, dtype=bool)
         shape = (cfg.fine.depth, cfg.fine.width, cfg.fine.width)
-        out = dict(presence_dropped=np.zeros(len(items), np.float32),
-                   location_source=np.zeros(len(items), np.float32),
+        out = dict(location_source=np.zeros(len(items), np.float32),
                    foreign_components=np.zeros(len(items), np.float32),
                    negative_bank_shards=np.zeros(len(items), np.int64))
         if selected.any() or not len(items):
@@ -434,14 +430,12 @@ class IdentityObservationBuilder(ObservationBuilder):
                 if 'photometric' not in item:
                     continue
                 rng = np.random.default_rng(item['identity_seed']+1)
-                augmentation = dict(blur_sigma=item.get('blur_sigma', 0.), drop_presence=item['drop_presence'])
+                augmentation = dict(blur_sigma=item.get('blur_sigma', 0.))
                 batch['blurred'][j] = augmentation['blur_sigma'] > 0
                 augment_image_pair(batch['x']['fine'][j], item['photometric'], rng, **augmentation)
                 for slot in batch['x']['history_valid'][j].nonzero().flatten().tolist():
                     ct = batch['x']['history_slabs'][j, slot, 0].numpy()
                     augment_ct(ct, item['photometric'], rng, augmentation['blur_sigma'])
-                if item['drop_presence']:
-                    batch['presence_dropped'][j] = 1
         return batch
 
 

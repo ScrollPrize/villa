@@ -5,14 +5,13 @@ import math
 import torch
 from torch import nn
 
-from .model import DirectConfig, ObservationFollower, PathDecoderLayer
+from .model import CoordinateRegressionConfig, ObservationFollower, PathDecoderLayer
 from .survival_confidence import survival_predictions
 
-ARCHITECTURE = 'aligned_path_flow_v1'
 
 
 @dataclass
-class FlowConfig(DirectConfig):
+class FlowConfig(CoordinateRegressionConfig):
     model_type: str = 'flow_matching'
     recurrent_refinement_steps: int = 0
     flow_steps: int = 4
@@ -29,10 +28,6 @@ class FlowConfig(DirectConfig):
         if self.flow_sigma and (len(self.flow_sigma) != self.n_future or any(
                 len(row) != 2 or any(not math.isfinite(v) or v < 1 for v in row) for row in self.flow_sigma)):
             raise ValueError('Flow scales must contain two finite values >= 1 per future plane')
-
-    @property
-    def architecture(self):
-        return ARCHITECTURE
 
 
 def time_embedding(t, width=64):

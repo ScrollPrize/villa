@@ -22,13 +22,13 @@ from scipy.spatial import cKDTree
 import torch
 
 from vesuvius.neural_tracing.fiber_follow.data.data import ZBand, fiber_manifest, load_fibers, split_fibers
-from vesuvius.neural_tracing.fiber_follow.evaluation.legacy_evaluate import evaluate, trace_events
+from vesuvius.neural_tracing.fiber_follow.evaluation.seeds import evaluate, trace_events
 from vesuvius.neural_tracing.fiber_follow.shared.experiment import jsonable, paired_bootstrap, read_manifest, rollout_summary
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import interp_at
 from vesuvius.neural_tracing.fiber_follow.tracing.trace import TraceParams
 from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolume
 from vesuvius.neural_tracing.fiber_follow.data.observations import DirectTracer, traversal
-from vesuvius.neural_tracing.fiber_follow.models.model import DirectConfig
+from vesuvius.neural_tracing.fiber_follow.models.model import CoordinateRegressionConfig
 from vesuvius.neural_tracing.fiber_follow.train.train import load_checkpoint, validate_volume_source
 
 IDENTITY_VERSION = 1
@@ -175,7 +175,7 @@ def run_rollouts(args):
             rows = identity_rows(rows, paths, logged, seeds, val, fibers, tree, ids, index)
             for n, row in enumerate(rows):
                 row.update(seed_index=n, ambiguous=n in ambiguous)
-            report = dict(checkpoint=str(Path(args.checkpoint).resolve()), architecture=ck['architecture'], step=ck.get('step'),
+            report = dict(checkpoint=str(Path(args.checkpoint).resolve()), model_type=ck['model_type'], step=ck.get('step'),
                           checkpoint_sha256=hashlib.sha256(Path(args.checkpoint).read_bytes()).hexdigest(),
                           split=args.split, threshold=threshold, max_len=args.max_len, subset_sha256=subset['sha256'],
                           seconds=seconds, decisions=sum(map(len, logged)), seconds_per_decision=seconds/max(1, sum(map(len, logged))),

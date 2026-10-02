@@ -12,7 +12,7 @@ import torch
 
 from model_fixtures import config, line_fiber, slab_inputs
 from vesuvius.neural_tracing.fiber_follow.data.observations import IdentityObservationBuilder, reference_layout
-from vesuvius.neural_tracing.fiber_follow.models.model import DirectConfig
+from vesuvius.neural_tracing.fiber_follow.models.model import CoordinateRegressionConfig
 from vesuvius.neural_tracing.fiber_follow.data.neighbor_bank import NeighborBank
 from vesuvius.neural_tracing.fiber_follow.data.neighbor_bulk import digest, pack_paths, write_json
 from vesuvius.neural_tracing.fiber_follow.data.neighbor_mining import MiningConfig
@@ -133,7 +133,7 @@ def fake_images(builder,items):
 
 
 def test_identity_supervision_and_training_cli_require_a_bank(monkeypatch):
-    builder = IdentityObservationBuilder(DirectConfig())
+    builder = IdentityObservationBuilder(CoordinateRegressionConfig())
     with pytest.raises(ValueError,match='requires a negative bank'):
         builder.bank_targets([])
     # Monitor observations (tracing, recovery) need no bank and carry no identity labels.
@@ -205,7 +205,7 @@ def test_bank_integrity_fails_closed_and_only_annotation_identity_must_match(tmp
 def test_foreign_masks_refresh_without_contrastive_queries(tmp_path):
     reverse,angle = True,.37
     bank,fiber = make_bank(tmp_path)
-    cfg = DirectConfig()
+    cfg = CoordinateRegressionConfig()
     builder = IdentityObservationBuilder(cfg,[fiber],negative_bank=bank)
     state = item(cfg,reverse)
     rotation = np.array([[np.cos(angle),-np.sin(angle),0.],[np.sin(angle),np.cos(angle),0.],[0.,0.,1.]])
@@ -225,7 +225,7 @@ def test_foreign_masks_refresh_without_contrastive_queries(tmp_path):
 
 def test_bank_rasterization_marks_only_cells_containing_line_samples(tmp_path):
     bank,_ = make_bank(tmp_path,with_path=True)
-    cfg = DirectConfig()
+    cfg = CoordinateRegressionConfig()
     state = item(cfg)
     found = bank.candidates(state,cfg.fine,ComponentRule())
     indices = np.rint(crop_indices(cfg.fine,found['local'])).astype(int)
@@ -237,7 +237,7 @@ def test_bank_rasterization_marks_only_cells_containing_line_samples(tmp_path):
 def test_foreign_cell_extent_cannot_reach_target_exclusion_tube(tmp_path):
     bank,_ = make_bank(tmp_path)
     publish(tmp_path,[add_shard(tmp_path,0,x=3.)])
-    cfg = DirectConfig()
+    cfg = CoordinateRegressionConfig()
     state = item(cfg)
     found = bank.candidates(state,cfg.fine,ComponentRule())
     grid = crop_local_grid(cfg.fine)[found['foreign']]

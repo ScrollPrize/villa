@@ -3,8 +3,7 @@ import numpy as np
 import pytest
 import torch
 
-from vesuvius.neural_tracing.fiber_follow.data.observations import IdentitySampling, augment_image_pair, photometric
-from vesuvius.neural_tracing.fiber_follow.data.ct_normalization import BACKGROUND
+from vesuvius.neural_tracing.fiber_follow.data.observations import IdentitySampling, augment_image_pair, augment_ct
 
 
 def test_ct_blur_conserves_material_mass_and_keeps_background_and_constants():
@@ -14,12 +13,9 @@ def test_ct_blur_conserves_material_mass_and_keeps_background_and_constants():
     assert 0 < image[0, 8, 8, 9].item() and image[0, 8, 8, 8].item() < 1
     assert image.sum().item() == pytest.approx(1., abs=1e-5)
     assert image[0].argmax().item() == 8*17*17+8*17+8
-    # Normalized convolution: masked background stays exactly background, constant material stays constant.
-    image = torch.full((1, 9, 9, 9), .75)
-    image[0, :, :, :3] = BACKGROUND
+    image = torch.full((1, 9, 9, 9), -8.)
     augment_image_pair(image, (1., 0., 0.), np.random.default_rng(2), blur_sigma=1.25)
-    assert torch.all(image[0, :, :, :3] == BACKGROUND)
-    torch.testing.assert_close(image[0, :, :, 3:], torch.full_like(image[0, :, :, 3:], .75))
+    torch.testing.assert_close(image, torch.full_like(image, -8.))
 
 
 def test_disabled_blur_is_exact_photometric_and_invalid_settings_are_rejected():
@@ -27,7 +23,7 @@ def test_disabled_blur_is_exact_photometric_and_invalid_settings_are_rejected():
     expected = image.clone()
     a, b = np.random.default_rng(3), np.random.default_rng(3)
     params = (1.2, -.05, .02)
-    expected[0] = torch.from_numpy(photometric(expected[0].numpy(), params, a))
+    augment_ct(expected[0].numpy(), params, a)
     augment_image_pair(image, params, b, blur_sigma=0.)
     torch.testing.assert_close(image, expected, rtol=0, atol=0)
     assert a.random() == b.random()

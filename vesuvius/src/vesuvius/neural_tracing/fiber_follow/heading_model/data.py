@@ -1,8 +1,8 @@
 """Training states for the crop-heading model, built with the follower's own data code.
 
 A share of states are seeds (an annotated point with no observed path, the follower's seed-only state); the rest
-are simulated tracer decisions from ``shared.data.simulated_trace`` (``make_sample``'s observed path, without its
-labels) with the follower's own startup mix and tracing error, on the same Paris 4 / AFV sources, fiber splits, CT volumes and CT normalization (``regression.datasets``).
+are simulated tracer decisions from ``data.data.simulated_trace`` (``make_sample``'s observed path, without its
+labels) with the follower's own startup mix and tracing error, on the same Paris 4 / AFV sources, fiber splits, CT volumes and CT normalization (``data.datasets``).
 The prior heading is what the tracer holds: its trailing 12-voxel fit (``linear12_heading``) once 12 voxels exist.
 Seeds and shorter paths hold a seed heading the model must not rely on, so their prior is the true continuation
 tilted within a wide cone (also used on a share of long paths). The target is ``targets.in_crop_heading`` over the

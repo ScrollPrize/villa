@@ -38,7 +38,7 @@ class ResidualPatchStem(nn.Module):
         return self.projection(self.blocks(self.input(image)))
 
 
-class PatchShuffleEncoder(nn.Module):
+class PatchEncoder(nn.Module):
     """Patch tokens with observed-path occupancy and a residual stem."""
     def __init__(self, cfg):
         nn.Module.__init__(self)
@@ -47,21 +47,20 @@ class PatchShuffleEncoder(nn.Module):
         # A one-voxel halo around each 4-cube gives two-voxel overlap.
         # Kernel center 2.5 minus padding 1 retains the old 1.5 offset.
         self.patch_projection = nn.Conv3d(cfg.input_channels, cfg.hidden, 6, stride=4, padding=1)
-        self.stem = ResidualPatchStem(cfg) if cfg.stem_channels else None
+        self.stem = ResidualPatchStem(cfg)
         self.position = nn.Linear(3, cfg.hidden)
         self.condition = nn.Linear(3, cfg.hidden, bias=False)
-        self.blocks = nn.ModuleList(AxialBlock(cfg.hidden, cfg.heads, ffn=cfg.encoder_ffn, local_convolution=False, rotary=True)
+        self.blocks = nn.ModuleList(AxialBlock(cfg.hidden, cfg.heads, ffn=cfg.encoder_ffn, rotary=True)
                                     for _ in range(cfg.layers))
         self.norm = nn.LayerNorm(cfg.hidden)
         self.register_buffer('token_xyz', token_coordinates(cfg).reshape(-1,3), persistent=False)
 
     def encode(self, image, references, mask):
         tokens = self.patch_projection(image)
-        if self.stem is not None:
-            if self.cfg.activation_checkpointing and self.training and torch.is_grad_enabled():
-                tokens = tokens+checkpoint(self.stem, image, use_reentrant=False)
-            else:
-                tokens = tokens+self.stem(image)
+        if self.cfg.activation_checkpointing and self.training and torch.is_grad_enabled():
+            tokens = tokens+checkpoint(self.stem, image, use_reentrant=False)
+        else:
+            tokens = tokens+self.stem(image)
         tokens = tokens.permute(0,2,3,4,1)
         tokens = tokens+self.position(self.token_xyz/16).reshape(*self.cfg.token_shape,self.cfg.hidden).to(tokens.dtype)
         tokens = tokens+self.condition(self.conditioning(references,mask)).to(tokens.dtype)
@@ -71,11 +70,8 @@ class PatchShuffleEncoder(nn.Module):
             else:
                 tokens = block(tokens)
         deep = self.norm(tokens).permute(0,4,1,2,3)
-        # Token-only mode returns this same coarse lattice for both consumers.
-        return self.decode(None, deep), deep
-
-    def decode(self, fine, deep):
-        return deep
+        # Both path queries and scoring sample the same contextual token lattice.
+        return deep, deep
 
     def forward(self, image, references, mask):
         fine, deep = self.encode(image, references, mask)

@@ -21,17 +21,6 @@ class CropSpec:
     width: int = 64  # samples along u and v
     behind: int = 16  # samples behind the current point
     spacing: float = 1.0
-    # Retired direction-field option; kept so saved crops still load.
-    gate_direction: bool = False
-    history_render: str = 'points'
-    history_sigma: float = 1.0  # trace-grid voxels
-
-    def __post_init__(self):
-        if self.history_render not in ('points', 'segments') or not np.isfinite(self.history_sigma) or self.history_sigma <= 0:
-            raise ValueError('Invalid history rendering mode or sigma')
-        if self.gate_direction:
-            raise ValueError('Direction-field inputs are no longer supported')
-
     @property
     def forward_coords(self) -> np.ndarray:
         return (np.arange(self.depth) - self.behind) * self.spacing

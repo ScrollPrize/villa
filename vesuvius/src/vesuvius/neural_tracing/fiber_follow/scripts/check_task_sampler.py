@@ -80,7 +80,7 @@ def main(argv=None):
     from vesuvius.neural_tracing.fiber_follow.train.train import checkpoint_config
     from vesuvius.neural_tracing.fiber_follow.data.data import ZBand
     from vesuvius.neural_tracing.fiber_follow.train.runloop import read_checkpoint
-    from vesuvius.neural_tracing.fiber_follow.train.train import ARCHITECTURES
+    from vesuvius.neural_tracing.fiber_follow.train.train import MODEL_TYPES
     from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolumeSpec
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--checkpoint', required=True, help='Supplies the model crop/horizon and label tolerance')
@@ -93,7 +93,7 @@ def main(argv=None):
     ap.add_argument('--batch', type=int, default=4)
     ap.add_argument('--out', required=True)
     args = ap.parse_args(argv)
-    ck = read_checkpoint(args.checkpoint, ARCHITECTURES, 'cpu')
+    ck = read_checkpoint(args.checkpoint, MODEL_TYPES, 'cpu')
     cfg = checkpoint_config(ck)
     sample = SampleConfig(crop=cfg.fine, n_history=cfg.n_history, n_future=cfg.n_future, future_step=cfg.future_step,
                           recent_history_points=cfg.n_history, label_tolerance=float(ck.get('tolerance', 1.5)),

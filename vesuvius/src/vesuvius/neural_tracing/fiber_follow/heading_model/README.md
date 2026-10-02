@@ -30,10 +30,10 @@ parameters and costs about 0.7 ms per 24 heads on CPU, about 10 ms with patch sa
 `data.py` builds every state from the follower's modules:
 
 - sources, fiber splits and CT volumes come from the follower dataset config, through
-  `regression.datasets.load_primary_dataset`, `open_afv_source` and `primary_source_spec`;
-- CT normalization comes from `shared.ct_normalization.prepare_normalization`. Pass a follower run's
+  `data.datasets.load_primary_dataset`, `open_afv_source` and `primary_source_spec`;
+- CT normalization comes from `data.ct_normalization.prepare_normalization`. Pass a follower run's
   `ct_normalization.json` to reuse its exact records;
-- the simulated tracer states come from `shared.data.make_sample`: the startup mix, the calibrated tracing
+- the simulated tracer states come from `data.data.make_sample`: the startup mix, the calibrated tracing
   error and the head offset;
 - the prior is the tracer's own heading rule, `shared.heading.linear12_heading`.
 

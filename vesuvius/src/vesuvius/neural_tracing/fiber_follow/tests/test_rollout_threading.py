@@ -5,8 +5,8 @@ import numpy as np
 import pytest
 import torch
 
-from model_fixtures import aligned_config, array_at
-from vesuvius.neural_tracing.fiber_follow.models.model import DirectFollower
+from model_fixtures import coordinate_config, array_at
+from vesuvius.neural_tracing.fiber_follow.models.model import CoordinateRegressionFollower
 from vesuvius.neural_tracing.fiber_follow.data.observations import DirectTracer
 from vesuvius.neural_tracing.fiber_follow.data import ct_normalization as norm
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import frame_from_heading
@@ -32,10 +32,10 @@ def one_intraop_thread():
 
 
 def test_pooled_rollout_matches_serial_including_inference_mode(tmp_path, one_intraop_thread):
-    cfg = aligned_config()
+    cfg = coordinate_config()
     vol = ct_volume(tmp_path)
     torch.manual_seed(0)
-    model = DirectFollower(cfg).eval()
+    model = CoordinateRegressionFollower(cfg).eval()
     seeds = np.array([[20., 20., 20.], [20.3, 19.8, 20.1], [19.7, 20.2, 19.9]])
     headings = np.array([[.3, .4, .8660254]]*3)
     results = []

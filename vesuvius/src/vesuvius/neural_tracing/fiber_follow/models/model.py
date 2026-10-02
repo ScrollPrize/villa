@@ -12,21 +12,12 @@ from torch.utils.checkpoint import checkpoint
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
 from vesuvius.neural_tracing.fiber_follow.tracing.policy import DEFAULT_CONFIDENCE, commit_prefix
 
-ARCHITECTURE = 'axial_fiber_slabs_v15'
-PATCH_ARCHITECTURE = 'axial_patch4_overlap_fiber_slabs_v15'
-TOKEN_ARCHITECTURE = 'axial_patch4_overlap_tokens_fiber_slabs_v15'
-STEM_ARCHITECTURE = 'axial_patch4_residual_stem_tokens_fiber_slabs_v15'
-TOKEN_STRIDE = (8, 2, 2)
-TOKEN_OFFSET = (3, 0, 0)
 
 
 @dataclass
-class DirectConfig:
-    model_type: str = "aligned"
-    direction_inputs: bool = False
-    input_mode: str = 'ct'
+class CoordinateRegressionConfig:
+    model_type: str = "coordinate_regression"
     fine: CropSpec = field(default_factory=lambda: CropSpec(depth=120, width=104, behind=48, spacing=.5))
-    channels: int = 32
     hidden: int = 256
     encoder_ffn: int = 256
     decoder_ffn: int = 2048
@@ -41,48 +32,25 @@ class DirectConfig:
     max_recovery_distance: float = 6.
     patch_radius: float = 1.
     recurrent_refinement_steps: int = 3
-    encoder: str = 'patch4'
-    token_only: bool = True
     stem_channels: int = 32
     stem_blocks: int = 2
-    history_encoder: str = 'fine'
-    history_path_tokens: bool = True
-    path_geometry_tokens: bool = True
 
     def __post_init__(self):
-        if (self.encoder, self.token_only, self.history_encoder, self.history_path_tokens,
-                self.path_geometry_tokens, self.input_mode, self.direction_inputs) != (
-                'patch4', True, 'fine', True, True, 'ct', False):
-            raise ValueError('Only CT-only patch4 tokens with fine path/geometry history are supported')
-        if type(self.history_path_tokens) is not bool or (self.history_path_tokens and self.history_encoder != 'fine'):
-            raise ValueError('Path tokens require the fine history encoder')
-        if type(self.path_geometry_tokens) is not bool or (self.path_geometry_tokens and not self.history_path_tokens):
-            raise ValueError('Path geometry tokens require explicit history path tokens')
         if any(type(value) is not int or value < 1 for value in
                (self.encoder_ffn, self.decoder_ffn)):
             raise ValueError('Feed-forward widths must be positive integers')
-        if self.history_encoder not in ('fine', 'legacy'):
-            raise ValueError('History encoder must be fine or legacy')
-        if self.input_mode not in ('ct', 'ct+presence') or (self.input_mode == 'ct' and self.direction_inputs):
-            raise ValueError('CT-only inputs exclude presence and direction fields')
-        if self.encoder not in ('conv', 'patch4'):
-            raise ValueError('Encoder must be conv or patch4')
-        if not isinstance(self.token_only, bool) or (self.token_only and self.encoder != 'patch4'):
-            raise ValueError('Token-only features require the patch4 encoder')
-        if type(self.stem_channels) is not int or self.stem_channels < 0 or type(self.stem_blocks) is not int or self.stem_blocks < 1:
-            raise ValueError('Stem channels must be a nonnegative integer and stem blocks a positive integer')
-        if self.stem_channels and not self.token_only:
-            raise ValueError('Residual stem requires the token-only patch4 encoder')
+        if type(self.stem_channels) is not int or self.stem_channels < 1 or type(self.stem_blocks) is not int or self.stem_blocks < 1:
+            raise ValueError('Stem channels must be a positive integer and stem blocks a positive integer')
         if isinstance(self.fine, dict):
             self.fine = CropSpec(**self.fine)
         c = self.fine
-        if self.encoder == 'patch4' and (c.depth % 4 or c.width % 4):
+        if c.depth % 4 or c.width % 4:
             raise ValueError('Patch4 crop dimensions must be multiples of four')
         if min(c.depth, c.width) < 8 or not 0 <= c.behind < c.depth or not math.isfinite(c.spacing) or c.spacing <= 0:
             raise ValueError('Invalid fine crop')
         if type(self.scorer_layers) is not int or self.scorer_layers < 1:
             raise ValueError('Scorer layers must be a positive integer')
-        if min(self.channels, self.hidden, self.heads, self.layers, self.decoder_layers,
+        if min(self.hidden, self.heads, self.layers, self.decoder_layers,
                self.n_future, self.n_history) < 1 or self.hidden % self.heads:
             raise ValueError('Positive dimensions required; hidden must divide by heads')
         if not 0 < self.future_step <= self.max_recovery_distance or not math.isfinite(self.max_recovery_distance):
@@ -93,8 +61,6 @@ class DirectConfig:
             raise ValueError('Future horizon exceeds fine image')
         if not isinstance(self.recurrent_refinement_steps, int) or self.recurrent_refinement_steps < 0:
             raise ValueError('Recurrent refinement steps must be a nonnegative integer')
-        if not isinstance(self.direction_inputs, bool):
-            raise ValueError('direction_inputs must be a boolean')
 
     @property
     def input_channels(self):
@@ -107,10 +73,6 @@ class DirectConfig:
     @property
     def lateral_limit(self):
         return (self.fine.width-1)*self.fine.spacing/2-self.patch_radius
-
-    @property
-    def architecture(self):
-        return 'axial_patch4_residual_stem_tokens_fiber_slabs_v17'
 
     @property
     def path_evidence_width(self):
@@ -136,9 +98,9 @@ def build_model(cfg):
     if cfg.model_type == 'flow_matching':
         from .flow import FlowFollower
         return FlowFollower(cfg)
-    if cfg.model_type != 'aligned':
+    if cfg.model_type != 'coordinate_regression':
         raise ValueError(f'Unsupported model type: {cfg.model_type}')
-    return DirectFollower(cfg)
+    return CoordinateRegressionFollower(cfg)
 
 
 def select_refinement(output, cfg, confidence_threshold=DEFAULT_CONFIDENCE, n_commit=None):
@@ -273,6 +235,12 @@ class PathDecoderLayer(nn.TransformerDecoderLayer):
         if not self.norm_first or self.multihead_attn.dropout:
             raise ValueError('Cached trajectory decoder requires pre-norm and zero attention dropout')
         x = x+self._sa_block(self.norm1(x), causal_mask, None, is_causal=causal_mask is not None)
+        x = self.cross_attention(x, kv, padding)
+        if history is not None:
+            x = history_attention.forward_cached(x, *history)
+        return x+self._ff_block(self.norm3(x))
+
+    def cross_attention(self, x, kv, padding):
         attn = self.multihead_attn
         h, heads = attn.embed_dim, attn.num_heads
         q = F.linear(self.norm2(x), attn.in_proj_weight[:h], attn.in_proj_bias[:h])
@@ -280,13 +248,22 @@ class PathDecoderLayer(nn.TransformerDecoderLayer):
         value = self.attend_memory(q, kv, padding)
         value = value.transpose(1, 2).contiguous().reshape(len(x), -1, h)
         x = x+self.dropout2(attn.out_proj(value))
-        if history is not None:
-            x = history_attention.forward_cached(x, *history)
-        return x+self._ff_block(self.norm3(x))
+        return x
+
+    def forward_draws(self, query, kv, padding, self_padding, *, history, history_attention):
+        """Independent self-attention draws sharing differentiable observation K/V."""
+        b, draws, planes, width = query.shape
+        x = query.reshape(b*draws, planes, width)
+        x = x+self._sa_block(self.norm1(x), None, self_padding, is_causal=False)
+        x = x.reshape(b, draws*planes, width)
+        x = self.cross_attention(x, kv, padding)
+        x = history_attention.forward_cached(x, *history)
+        x = x+self._ff_block(self.norm3(x))
+        return x.reshape(b, draws, planes, width)
 
 
 class AxialBlock(nn.Module):
-    def __init__(self, width, heads, *, ffn=1024, local_convolution=False, rotary=True):
+    def __init__(self, width, heads, *, ffn=1024, rotary=True):
         super().__init__()
         self.axes = nn.ModuleList(AxisAttention(width,heads,a,rotary=rotary) for a in (3,2,1))
         self.norm = nn.LayerNorm(width)
@@ -319,12 +296,12 @@ class ObservationFollower(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
-        self.architecture = cfg.architecture
-        from .patch_encoder import PatchShuffleEncoder
+        self.model_type = cfg.model_type
+        from .patch_encoder import PatchEncoder
         from .history_slabs import HistoryEncoder, HistoryAttention
         from .survival_confidence import SegmentSurvivalScorer
         from .path_geometry import PathGeometryTokens
-        self.encoder = PatchShuffleEncoder(cfg)
+        self.encoder = PatchEncoder(cfg)
         self.reference_token = nn.Sequential(nn.Linear(cfg.hidden+8,cfg.hidden),nn.SiLU(),nn.Linear(cfg.hidden,cfg.hidden))
         self.history_encoder = HistoryEncoder(cfg)
         self.history_attention = HistoryAttention(cfg.hidden, cfg.heads)
@@ -358,23 +335,20 @@ class ObservationFollower(nn.Module):
         ref_tokens = self.reference_token(torch.cat((local,metadata),-1))
         memory = torch.cat((image_tokens,ref_tokens.to(image_tokens.dtype)),1)
         padding = torch.cat((torch.zeros(image_tokens.shape[:2],device=hist.device,dtype=torch.bool),~mask),1)
-        if cfg.path_geometry_tokens:
-            # Older observed path in this frame, unmasked by crop support. Shared by
-            # generator and scorer through the same memory and padding.
-            valid = x['path_geometry_valid'].bool()
-            geometry = self.path_geometry(x['path_geometry'], valid)
-            memory = torch.cat((memory,geometry.to(memory.dtype)),1)
-            padding = torch.cat((padding,~valid),1)
+        valid = x['path_geometry_valid'].bool()
+        geometry = self.path_geometry(x['path_geometry'], valid)
+        memory = torch.cat((memory,geometry.to(memory.dtype)),1)
+        padding = torch.cat((padding,~valid),1)
         ctx = dict(fine=dense,deep=deep,memory=memory,padding=padding,reference_mask=mask)
         if cfg.recurrent_refinement_steps:
-            ctx.update(fine_fp32=sampling_dense, deep_fp32=sampling_dense if cfg.token_only else deep.float())
+            ctx.update(fine_fp32=sampling_dense, deep_fp32=sampling_dense)
         return ctx
 
     def sample_local(self, features, points):
         cfg = self.cfg
         return sample_features(features, points, cfg.fine,
-                               cfg.token_stride if cfg.token_only else 1,
-                               cfg.token_offset if cfg.token_only else (0,0,0))
+                               cfg.token_stride,
+                               cfg.token_offset)
 
     def patches(self, fine, points):
         return self.sample_local(fine, points)[0]
@@ -383,12 +357,12 @@ class ObservationFollower(nn.Module):
         patches = self.patches(ctx.get('fine_fp32', ctx['fine']),initial).to(ctx['fine'].dtype)
         return torch.cat((patches,initial[...,2:]/(self.cfg.n_future*self.cfg.future_step)),-1)
 
-    def evidence(self, ctx, points, stage):
+    def evidence(self, ctx, points):
         values, support = self.sample_local(ctx.get('deep_fp32', ctx['deep']), points)
         return torch.cat((values.to(ctx['deep'].dtype), support[..., None]), -1)
 
     def encode_history(self, x):
-        extra = {key: x['history_'+key] for key in ('path_points', 'path_tangents', 'path_valid')} if self.cfg.history_path_tokens else {}
+        extra = {key: x['history_'+key] for key in ('path_points', 'path_tangents', 'path_valid')}
         return self.history_encoder(x['history_slabs'], x['history_valid'], x['history_pose'], **extra)
 
     def context(self, x, hist, hmask):
@@ -407,15 +381,11 @@ class ObservationFollower(nn.Module):
     def select_prediction(self, output, confidence_threshold=DEFAULT_CONFIDENCE, n_commit=None):
         return select_refinement(output, self.cfg, confidence_threshold, n_commit)
 
-    def confidence_logits(self, ctx, decoded, points):
-        from vesuvius.neural_tracing.fiber_follow.models.survival_confidence import survival_predictions
-        return survival_predictions(self.hazard_logits(ctx, points))[0]
-
     def hazard_logits(self, ctx, points):
         # No generator state or proposed suffix enters a segment's evidence.
         points = points.detach()
         samples = self.confidence_scorer.segment_samples(points)
-        spatial = self.evidence(ctx, samples.flatten(1, 2), 'confidence')
+        spatial = self.evidence(ctx, samples.flatten(1, 2))
         spatial = spatial.reshape(*samples.shape[:3], -1)
         return self.confidence_scorer(spatial, points,
                                      ctx['confidence_projected'], ctx['confidence_padding'],
@@ -435,13 +405,13 @@ class ObservationFollower(nn.Module):
         return out
 
 
-class DirectFollower(ObservationFollower):
-    """Aligned direct coordinates with recurrent refinement."""
+class CoordinateRegressionFollower(ObservationFollower):
+    """Coordinate regression with recurrent refinement."""
 
     def __init__(self, cfg):
         super().__init__(cfg)
         c, h = cfg.hidden, cfg.hidden
-        self.query = nn.Sequential(nn.Linear((c if cfg.token_only else 9*c)+1,h),nn.SiLU(),nn.Linear(h,h))
+        self.query = nn.Sequential(nn.Linear(c+1,h),nn.SiLU(),nn.Linear(h,h))
         layer = PathDecoderLayer(h,cfg.heads,cfg.decoder_ffn,dropout=0.,activation='gelu',batch_first=True,norm_first=True)
         self.decoder = nn.TransformerDecoder(layer,cfg.decoder_layers,norm=nn.LayerNorm(h))
         self.coordinates = nn.Linear(h,2)
@@ -534,7 +504,7 @@ class DirectFollower(ObservationFollower):
         return self.proposal_output(initial, refinements, scores, valid)
 
     def refine_prediction(self, ctx, points, decoded, hazards, confidence, projected, padding, stage_embedding):
-        evidence = self.evidence(ctx, points, 'refinement')
+        evidence = self.evidence(ctx, points)
         # Geometry cannot teach the scorer to manufacture convenient feedback.
         feedback = torch.stack((hazards.sigmoid(), confidence), -1).detach()
         refreshed = self.refinement_fusion(torch.cat((evidence, points/16., feedback), -1))

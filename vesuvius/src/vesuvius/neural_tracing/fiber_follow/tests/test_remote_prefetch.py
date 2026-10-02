@@ -220,7 +220,7 @@ def test_main_and_history_prefetch_covers_ct_normals_and_all_crop_rolls():
     from test_history_slabs import observation
     from model_fixtures import config as cfg
     from vesuvius.neural_tracing.fiber_follow.data.observations import ObservationBuilder
-    from vesuvius.neural_tracing.fiber_follow.models.history_slabs import slab_layout, SLAB
+    from vesuvius.neural_tracing.fiber_follow.data.history_slabs import slab_layout, SLAB
     from vesuvius.neural_tracing.fiber_follow.data.data import tight_block
     model=cfg();builder=ObservationBuilder(model)
     item=observation([[100,100,0],[100,100,256]])

@@ -4,14 +4,14 @@ import pytest
 
 from test_neighbor_bank import make_bank, add_shard, publish
 from vesuvius.neural_tracing.fiber_follow.data.observations import IdentityObservationBuilder, IdentitySampling
-from vesuvius.neural_tracing.fiber_follow.models.model import DirectConfig
+from vesuvius.neural_tracing.fiber_follow.models.model import CoordinateRegressionConfig
 from vesuvius.neural_tracing.fiber_follow.data.neighbor_continuations import wrong_continuation
 from vesuvius.neural_tracing.fiber_follow.data.data import SOURCE, SampleConfig
 from vesuvius.neural_tracing.fiber_follow.data.state_labels import REASON, TERMINAL
 
 
 def configuration():
-    model = DirectConfig(n_history=64,n_future=4)
+    model = CoordinateRegressionConfig(n_history=64,n_future=4)
     sample = SampleConfig(crop=model.fine,n_history=64,recent_history_points=64,n_future=4)
     return model,sample
 
@@ -79,7 +79,7 @@ def test_requested_tails_are_honored_and_short_paths_are_not_silently_substitute
     # A distant switch gets a longer bridge without clipping the tail.
     bank,_=make_bank(tmp_path/'distant')
     publish(bank.root,[add_shard(bank.root,0,x=30.,z_range=(20.,180.))])
-    cfg=DirectConfig()
+    cfg=CoordinateRegressionConfig()
     from sampling_fixtures import clean_sample
     state=wrong_continuation(bank,clean_sample(cfg),np.random.default_rng(4),tail_length_range=(64.,64.))
     assert state is not None and state['bank_tail_length']==64.

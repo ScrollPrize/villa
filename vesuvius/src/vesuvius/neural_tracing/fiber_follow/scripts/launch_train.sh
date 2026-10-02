@@ -8,7 +8,7 @@ export PYTHONPATH="$VES/src${PYTHONPATH:+:$PYTHONPATH}"
 if [[ ${1:-} == --help || ${1:-} == -h ]]; then
     exec "$PYTHON" -m vesuvius.neural_tracing.fiber_follow.train.train --help
 fi
-name=${1:?Usage: launch_regression.sh NAME [train options...]}
+name=${1:?Usage: launch_train.sh NAME [train options...]}
 shift
 case "$name" in
     ''|.|..|*/*) echo 'Run name must be a single directory name.' >&2; exit 1 ;;

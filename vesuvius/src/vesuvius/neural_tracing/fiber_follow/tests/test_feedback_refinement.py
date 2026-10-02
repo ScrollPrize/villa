@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 import torch
 
-from model_fixtures import aligned_batch, aligned_config, proposal_output
+from model_fixtures import coordinate_batch, coordinate_config, proposal_output
 from vesuvius.neural_tracing.fiber_follow.models.model import build_model, select_refinement
 from vesuvius.neural_tracing.fiber_follow.train.supervision import loss_terms
 from vesuvius.neural_tracing.fiber_follow.evaluation.diagnostics import decision_rows
@@ -24,7 +24,7 @@ def policy_output():
 
 
 def test_selection_uses_actual_threshold_horizon_and_matching_scores():
-    output, c = policy_output(), aligned_config()
+    output, c = policy_output(), coordinate_config()
     for threshold, window, expected in ((.5, 4, 2), (.5, 1, 0), (.79, 4, 1), (1., 4, 0)):
         selected = select_refinement(output, c, threshold, window)
         assert selected['selected_refinement'].item() == expected
@@ -33,7 +33,7 @@ def test_selection_uses_actual_threshold_horizon_and_matching_scores():
     stopped = select_refinement(output, c, 1., 4)
     assert commit_prefix(stopped['points'], stopped['confidence'], 1., 4)[0].item() == 0
     # Diagnostics label the proposal the policy chose at each threshold.
-    rows = decision_rows(output, aligned_batch(c, 1), c, n_commit=1, thresholds=(.5, 1.))
+    rows = decision_rows(output, coordinate_batch(c, 1), c, n_commit=1, thresholds=(.5, 1.))
     assert rows[0]['gate_0.5']['accepted_wrong'] == 0
     assert rows[0]['gate_1.0']['false_stops'] == 1
     # An invalid connection cannot win even with the longest confident prefix.
@@ -46,8 +46,8 @@ def test_selection_uses_actual_threshold_horizon_and_matching_scores():
 
 
 def test_retries_run_only_for_unaccepted_rows_and_mask_unused_attempts(monkeypatch):
-    model = build_model(aligned_config(recurrent_refinement_steps=4))
-    b = aligned_batch(model.cfg, 3)
+    model = build_model(coordinate_config(recurrent_refinement_steps=4))
+    b = coordinate_batch(model.cfg, 3)
     calls, decoder_batches = [], []
     accepted = []
     def score(ctx, points):
@@ -86,8 +86,8 @@ def test_retries_run_only_for_unaccepted_rows_and_mask_unused_attempts(monkeypat
 
 
 def test_partial_acceptance_uses_budget_and_absolute_head_can_replace_path(monkeypatch):
-    model = build_model(aligned_config(recurrent_refinement_steps=2))
-    b = aligned_batch(model.cfg, 1)
+    model = build_model(coordinate_config(recurrent_refinement_steps=2))
+    b = coordinate_batch(model.cfg, 1)
     calls = []
     def coordinates(decoded):
         calls.append(1)
@@ -107,8 +107,8 @@ def test_partial_acceptance_uses_budget_and_absolute_head_can_replace_path(monke
 
 def test_feedback_changes_new_proposal_but_geometry_cannot_train_scores(monkeypatch):
     torch.manual_seed(93)
-    model = build_model(aligned_config(recurrent_refinement_steps=1))
-    b = aligned_batch(model.cfg, 1)
+    model = build_model(coordinate_config(recurrent_refinement_steps=1))
+    b = coordinate_batch(model.cfg, 1)
     outputs, scores = [], []
     for value in (-1., 3.):
         def score(ctx, points, value=value):
@@ -127,7 +127,7 @@ def test_feedback_changes_new_proposal_but_geometry_cannot_train_scores(monkeypa
 def test_tracer_passes_operating_threshold_into_adaptive_model(monkeypatch):
     from test_history_slabs import fake_ct
     fake_ct(monkeypatch)
-    model = build_model(aligned_config(recurrent_refinement_steps=2)).eval()
+    model = build_model(coordinate_config(recurrent_refinement_steps=2)).eval()
     monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.data.observations.image_crop',
         lambda items, vol, crop, pool=None, **kw: torch.ones(len(items), 1, crop.depth, crop.width, crop.width)*.25)
     thresholds = []
@@ -152,13 +152,13 @@ def test_recovery_evaluator_reruns_policy_per_threshold_on_float_inputs_and_obse
                         lambda vol, pos, family, direction: np.asarray(direction))
     from vesuvius.neural_tracing.fiber_follow.data.data import TracedFiber, SampleConfig
     from vesuvius.neural_tracing.fiber_follow.evaluation.recovery_fixtures import make_recovery_states, evaluate_recovery_states
-    c = aligned_config()
+    c = coordinate_config()
     model = build_model(c)
     sample = SampleConfig(crop=c.fine, n_history=c.n_history, recent_history_points=c.n_history, n_future=c.n_future)
     arc = np.arange(300, dtype=float)
     fiber = TracedFiber('line', np.c_[arc*0, arc*0, arc], arc, '')
     states = make_recovery_states([fiber], [dict(fiber=0, t=150., sign=1)], sample, dict(split='monitor', volume={}), None)
-    inputs = aligned_batch(c, 1)
+    inputs = coordinate_batch(c, 1)
     # The crop builder can return float16; floating inputs enter the model in float32.
     inputs['x'] = {k: v.half() if v.is_floating_point() else v for k, v in inputs['x'].items()}
     calls = []

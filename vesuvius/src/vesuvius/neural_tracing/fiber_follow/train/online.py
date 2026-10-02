@@ -73,7 +73,7 @@ class OnlineCollector:
     def __init__(self, directory, fibers, val_z, device, every=1000, fibers_per_collection=64,
                  batch=8, forward_chunk=0, seed=0, replay_keep=4, initial=(), trace_len=768.,
                  before=48., after=64., stride=16., confidence=None, n_commit=None,
-                 collector_module='vesuvius.neural_tracing.fiber_follow.tracing.collect', extra_args=()):
+                 collector_module='vesuvius.neural_tracing.fiber_follow.tracing.collect', extra_args=(), threads=4):
         self.directory = Path(directory).resolve()
         self.directory.mkdir(parents=True, exist_ok=True)
         self.index = self.directory/'replay.json'
@@ -84,6 +84,9 @@ class OnlineCollector:
         self.trace_len, self.before, self.after, self.stride = trace_len, before, after, stride
         self.confidence, self.n_commit = confidence, n_commit
         self.collector_module = collector_module
+        if threads < 1:
+            raise ValueError('Positive collector thread count required')
+        self.threads = threads
         self.extra_args = [str(v) for v in extra_args]
         self.paths = list(initial)
         self.process = self.log = None
@@ -94,7 +97,7 @@ class OnlineCollector:
 
     def settings(self):
         return dict(every=self.every, fibers_per_collection=self.fibers_per_collection, batch=self.batch,
-                    forward_chunk=self.forward_chunk, trace_len=self.trace_len, before=self.before,
+                    threads=self.threads, forward_chunk=self.forward_chunk, trace_len=self.trace_len, before=self.before,
                     after=self.after, stride=self.stride, replay_keep=self.replay_keep,
                     confidence=self.confidence, n_commit=self.n_commit, exploration='none')
 
@@ -138,7 +141,7 @@ class OnlineCollector:
         self.output = self.directory/f'decisions_{step:06d}.npz'
         save(checkpoint)
         command = [sys.executable, '-m', self.collector_module,
-                   '--checkpoint', str(checkpoint), '--fibers', self.fibers,
+                   '--threads', str(self.threads), '--checkpoint', str(checkpoint), '--fibers', self.fibers,
                    '--val-z', *map(str, self.val_z), '--device', self.device,
                    '--fibers-per-collection', str(self.fibers_per_collection), '--batch', str(self.batch),
                    '--forward-chunk', str(self.forward_chunk), '--trace-len', str(self.trace_len),

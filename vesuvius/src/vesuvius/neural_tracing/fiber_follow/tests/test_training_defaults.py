@@ -1,4 +1,4 @@
-"""The aligned launcher's configuration, removed options and fresh-location sampling."""
+"""The coordinate_regression launcher's configuration, removed options and fresh-location sampling."""
 from pathlib import Path
 import shlex
 from types import SimpleNamespace
@@ -8,7 +8,7 @@ import pytest
 
 from vesuvius.neural_tracing.fiber_follow.data.observations import IdentityObservationBuilder, IdentitySampling, LOCATION_SOURCES
 from vesuvius.neural_tracing.fiber_follow.train import train
-from vesuvius.neural_tracing.fiber_follow.models.model import STEM_ARCHITECTURE, DirectConfig
+from vesuvius.neural_tracing.fiber_follow.models.model import CoordinateRegressionConfig
 from vesuvius.neural_tracing.fiber_follow.train.train import build_parser, main
 from vesuvius.neural_tracing.fiber_follow.data.data import TASKS, TaskBudget
 from model_fixtures import REQUIRED
@@ -17,31 +17,23 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def launcher_argv():
-    text = (ROOT/'scripts'/'train_aligned.sh').read_text().replace('\\\n', ' ')
+    text = (ROOT/'scripts'/'train_coordinate_regression.sh').read_text().replace('\\\n', ' ')
     command = shlex.split(next(line for line in text.splitlines() if line.startswith('exec ')))
     argv = command[command.index('vesuvius.neural_tracing.fiber_follow.train.train')+1:]
-    substitute = {'$task_root': str(ROOT), '$task_run': 'aligned', '$source_checkpoint': '/unused/ckpt.pt'}
+    substitute = {'$task_root': str(ROOT), '$task_run': 'coordinate_regression', '$source_checkpoint': '/unused/ckpt.pt'}
     for name, value in substitute.items():
         argv = [arg.replace(name, value) for arg in argv]
     return [arg for arg in argv if arg != '$@']
 
 
-def test_aligned_launcher_parses_to_the_planned_model_and_budget():
+def test_coordinate_regression_launcher_parses_to_the_planned_model_and_budget():
     args = build_parser().parse_args(launcher_argv())
     assert args.dataset_config == str(ROOT/'configs'/'mixed_ct_datasets_paris50.json')
     assert args.init_weights == '/unused/ckpt.pt' and args.resume is None
-    assert args.input_mode == 'ct' and not args.direction_inputs and args.presence_dropout == 0
     assert (args.batch, args.grad_steps, args.n_commit, args.steps) == (4, 3, 16, 40000)
-    cfg = DirectConfig(encoder=train.resolve_encoder(args.encoder), token_only=train.resolve_token_only(args.token_only),
-                       history_encoder=train.resolve_history_encoder(args.history_encoder),
-                       history_path_tokens=train.resolve_history_path_tokens(args.history_path_tokens),
-                       path_geometry_tokens=train.resolve_path_geometry_tokens(args.path_geometry_tokens),
-                       stem_channels=args.stem_channels, stem_blocks=args.stem_blocks,
-                       direction_inputs=args.direction_inputs, input_mode=args.input_mode, channels=args.channels,
-                       hidden=args.hidden, layers=args.axial_layers, encoder_ffn=args.encoder_ffn,
-                       decoder_layers=args.decoder_layers, decoder_ffn=args.decoder_ffn, scorer_layers=args.scorer_layers,
-                       recurrent_refinement_steps=args.recurrent_refinement_steps)
-    assert cfg.architecture == STEM_ARCHITECTURE.replace('_v15', '_v17')
+    cfg = train.model_config_from_args(args)
+    assert cfg.input_channels == 1
+    assert cfg.model_type == 'coordinate_regression'
     assert cfg.input_channels == 1 and cfg.recurrent_refinement_steps == 3
     budget = TaskBudget.parse(args.task_share, terminal_fallback_cap=args.terminal_fallback_cap,
                               replay_max_age=args.replay_max_age, replay_event_cap=args.replay_event_cap)
@@ -81,7 +73,7 @@ def test_task_budget_must_be_a_complete_distribution():
 
 
 def test_fresh_location_only_oversamples_available_lateral_history():
-    builder = IdentityObservationBuilder(DirectConfig(), [SimpleNamespace(length=100.)],
+    builder = IdentityObservationBuilder(CoordinateRegressionConfig(), [SimpleNamespace(length=100.)],
                                          IdentitySampling(lateral_fraction=1.))
     rng = np.random.default_rng(0)
     assert builder.fresh_location(rng) is None

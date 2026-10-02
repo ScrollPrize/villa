@@ -1,4 +1,4 @@
-"""Train a direct curve follower from scratch, with original-fiber online replay."""
+"""Train coordinate regression or flow-matching fiber followers with shared online replay."""
 import argparse
 import copy
 from concurrent.futures import ThreadPoolExecutor
@@ -16,14 +16,13 @@ from vesuvius.neural_tracing.fiber_follow.shared.experiment import read_manifest
 from vesuvius.neural_tracing.fiber_follow.train.online import OnlineCollector
 from vesuvius.neural_tracing.fiber_follow.tracing.policy import OperatingPolicy
 from vesuvius.neural_tracing.fiber_follow.train.runloop import RunLog, lr_at, prepare_run_dir, read_checkpoint, save_checkpoint as write_checkpoint, update_ema, training_rng_state, resume_training, raise_open_file_limit
-from vesuvius.neural_tracing.fiber_follow.train.training_options import normalize_batch_options
 from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolume, FiberVolumeSpec
-from vesuvius.neural_tracing.fiber_follow.models.model import ARCHITECTURE, PATCH_ARCHITECTURE, TOKEN_ARCHITECTURE, STEM_ARCHITECTURE, DirectConfig, build_model
+from vesuvius.neural_tracing.fiber_follow.models.model import CoordinateRegressionConfig, build_model
 from vesuvius.neural_tracing.fiber_follow.data.observations import IdentityObservationBuilder, IdentitySampling, DirectTracer, LOCATION_SOURCES
 from vesuvius.neural_tracing.fiber_follow.train.supervision import commit_window, loss_terms
 from vesuvius.neural_tracing.fiber_follow.evaluation.diagnostics import decision_rows, summarize_decisions
 from vesuvius.neural_tracing.fiber_follow.evaluation.recovery import monitor_fixture, evaluate_monitor
-from vesuvius.neural_tracing.fiber_follow.models.history_slabs import SAMPLING_REVISION
+from vesuvius.neural_tracing.fiber_follow.data.history_slabs import SAMPLING_REVISION
 from vesuvius.neural_tracing.fiber_follow.tracing.heading import FRAME_POLICY
 from vesuvius.neural_tracing.fiber_follow.train.training_log import format_training_log, DirectTrainingInterval, SamplingLedger
 
@@ -39,7 +38,7 @@ def save_checkpoint(path, model, ema, spec, sample, extra=None):
     # Atomic publication: collectors must never open a partial checkpoint.
     path = Path(path)
     temporary = path.with_suffix('.partial.pt')
-    write_checkpoint(temporary, model, spec, sample.crop, sample.n_history, model.architecture,
+    write_checkpoint(temporary, model, spec, sample.crop, sample.n_history, model.model_type,
                      dict({'n_commit': commit_window(model.cfg, None), **(extra or {})},
                           ema=ema.state_dict(), sample_cfg=asdict(sample)))
     temporary.replace(path)
@@ -57,11 +56,7 @@ def training_policy(cfg, n_commit, confidence=.5):
 
 
 def conv_memory_format(device):
-    """Channels-last is faster for the ordinary stem/decoder convolutions.
-
-    DepthwiseConv3d selects contiguous inputs and weights locally: its CUDA
-    kernels have the opposite layout preference on the measured hardware.
-    """
+    """Use the shared encoder convolution layout on CUDA."""
     return torch.channels_last_3d if torch.device(device).type == 'cuda' else torch.contiguous_format
 
 
@@ -132,7 +127,7 @@ def finish_training_update(model):
                 parameter.grad = None
 
 
-def training_prediction(model, x, hist, hmask, confidence_threshold=.5, n_commit=None):
+def training_prediction(model, x, hist, hmask, confidence_threshold=.5, n_commit=None, targets=None):
     actual = len(hist)
     # A single decision needs no duplicate encoder, proposal or scoring work.
     # Keep only two batch specializations: one row or the configured batch.
@@ -149,7 +144,10 @@ def training_prediction(model, x, hist, hmask, confidence_threshold=.5, n_commit
         model._history_timings.append(timing if hist.is_cuda else time.perf_counter()-timing)
     image, history, mask = training_inputs(dict(x, history_tokens=tokens, history_padding=padding), hist, hmask, size)
     threshold = hist.new_full((), confidence_threshold)
-    output = model.training_forward(image, history, mask, threshold)
+    padded_targets = None if targets is None else {
+        key: fixed_rows(value, size) for key, value in targets.items()
+        if isinstance(value, torch.Tensor) and value.ndim and len(value) == actual}
+    output = model.training_forward(image, history, mask, threshold, padded_targets)
     output = {name: value[:actual] for name, value in output.items()}
     if model._training_refined is None:
         begin_training_update(model)
@@ -180,71 +178,54 @@ def initialize_training_optimizer(model, ema, args, resume=None):
     return opt, done, origin
 
 
-ARCHITECTURES = (ARCHITECTURE, PATCH_ARCHITECTURE, TOKEN_ARCHITECTURE, STEM_ARCHITECTURE)
-ARCHITECTURES += tuple(name.replace('_v15', '_v16') for name in ARCHITECTURES)
-ARCHITECTURES += tuple(name.replace('_v15', '_v17') for name in ARCHITECTURES if '_v15' in name)
-ARCHITECTURES += tuple(name.replace('_v15', '_v14') for name in ARCHITECTURES)
+from vesuvius.neural_tracing.fiber_follow.models.flow import FlowConfig
+MODEL_TYPES = ('coordinate_regression', 'flow_matching')
 HISTORY_GRAD_CLIP = 5.
 REST_GRAD_CLIP = 100.
 
 
 def checkpoint_config(ck):
-    if ck['architecture'] not in ARCHITECTURES:
-        raise ValueError('Unsupported checkpoint architecture; start a fresh run for the current encoders')
-    options = dict(ck['model_cfg'])
-    # Missing history metadata belongs to the original v14 slab encoder.
-    options.setdefault('history_encoder', 'legacy')
-    cfg = DirectConfig(**options)
-    if ck['architecture'] != cfg.architecture:
-        raise ValueError('Checkpoint architecture does not match its encoder configuration')
+    if ck.get('model_type') not in MODEL_TYPES:
+        raise ValueError('Unsupported checkpoint model type')
+    cls = FlowConfig if ck.get('model_type') == 'flow_matching' else CoordinateRegressionConfig
+    cfg = cls(**ck['model_cfg'])
+    if cfg.model_type != ck['model_type']:
+        raise ValueError('Checkpoint model type does not match configuration')
     return cfg
 
 
-def resolve_encoder(requested, checkpoint=None):
-    if checkpoint is None:
-        return requested or DirectConfig.encoder
-    saved = checkpoint_config(checkpoint).encoder
-    if requested is not None and requested != saved:
-        raise ValueError('Encoder must match the resumed checkpoint; start a new run to change it')
-    return saved
+def model_config_from_args(args, checkpoint=None):
+    if checkpoint is not None:
+        cfg = checkpoint_config(checkpoint)
+        if args.model is not None and args.model != cfg.model_type:
+            raise ValueError('Model type must match checkpoint')
+        return cfg
+    cls = FlowConfig if args.model == 'flow_matching' else CoordinateRegressionConfig
+    options = {key: getattr(args, key) for key in ('stem_channels', 'stem_blocks', 'hidden',
+        'encoder_ffn', 'decoder_layers', 'decoder_ffn', 'scorer_layers', 'activation_checkpointing')}
+    options['layers'] = args.axial_layers
+    if cls is FlowConfig:
+        options.update(flow_steps=args.flow_steps, flow_draws=args.flow_draws)
+    else:
+        options['recurrent_refinement_steps'] = args.recurrent_refinement_steps
+    return cls(**options)
 
 
-def resolve_token_only(requested, checkpoint=None):
-    if checkpoint is None:
-        return bool(requested)
-    saved = checkpoint_config(checkpoint).token_only
-    if requested is not None and requested != saved:
-        raise ValueError('Token-only mode must match the resumed checkpoint; start a new run to change it')
-    return saved
-
-
-def resolve_history_encoder(requested, checkpoint=None):
-    if checkpoint is None:
-        return requested or DirectConfig.history_encoder
-    saved = checkpoint_config(checkpoint).history_encoder
-    if requested is not None and requested != saved:
-        raise ValueError('History encoder must match the resumed checkpoint; start a new run to change it')
-    return saved
-
-
-def resolve_history_path_tokens(requested, checkpoint=None):
-    saved = checkpoint_config(checkpoint).history_path_tokens if checkpoint else False
-    if checkpoint and requested is not None and requested != saved:
-        raise ValueError('History path tokens must match checkpoint; use memory_resume to migrate')
-    return saved if requested is None else requested
-
-
-def resolve_path_geometry_tokens(requested, checkpoint=None):
-    saved = checkpoint_config(checkpoint).path_geometry_tokens if checkpoint else False
-    if checkpoint and requested is not None and requested != saved:
-        raise ValueError('Path geometry tokens must match checkpoint; use geometry_resume to migrate')
-    return saved if requested is None else requested
+def initialize_model_weights(cfg, device, initial=None):
+    """Weight-only initialization never inherits optimizer, replay or run settings."""
+    model = build_model(cfg).to(device, memory_format=conv_memory_format(device))
+    if initial is not None:
+        model.load_state_dict(initial['model'], strict=True)
+    ema = copy.deepcopy(model).requires_grad_(False).eval()
+    if initial is not None:
+        ema.load_state_dict(initial['ema'], strict=True)
+    return model, ema
 
 
 def load_checkpoint(path,device='cuda'):
     # Collection shares a GPU with training. Keep duplicate weights and any
     # optimizer state on the CPU; only the EMA inference model needs VRAM.
-    ck = read_checkpoint(path,ARCHITECTURES,'cpu')
+    ck = read_checkpoint(path,MODEL_TYPES,'cpu')
     cfg = checkpoint_config(ck)
     model = build_model(cfg).to(device,memory_format=conv_memory_format(device))
     model.load_state_dict(ck['ema'])
@@ -297,7 +278,7 @@ class DecisionBatchPrefetch:
 def training_diagnostics(model, cpu_batch, tracer, fibers, seeds, out, step, log, *, device, dataset_name=None):
     """Plot EMA proposals and the same monitor rollouts used for logged metrics."""
     from vesuvius.neural_tracing.fiber_follow.evaluation.diag import plot_batch, plot_curves, plot_refinement, plot_rollouts
-    from vesuvius.neural_tracing.fiber_follow.evaluation.legacy_evaluate import evaluate
+    from vesuvius.neural_tracing.fiber_follow.evaluation.seeds import evaluate
     from vesuvius.neural_tracing.fiber_follow.shared.experiment import rollout_summary
 
     images = Path(out)/'images'
@@ -321,8 +302,9 @@ def training_diagnostics(model, cpu_batch, tracer, fibers, seeds, out, step, log
                        batch['hist'], batch['hmask'], batch['gt_history'], batch['gt_history_mask'],
                        source=batch['source'], terminal=batch['terminal'], confidence=prediction['confidence'],
                        history_channel=None, ct_range=(-4, 4))
-        curves = prediction['refinement_points']
-        labels = ['initial proposal']+[f'feedback proposal {i}' for i in range(1, curves.shape[1])]
+        curves = prediction.get('solver_points', prediction['refinement_points'])
+        labels = ([f'integration stage {i}' for i in range(curves.shape[1])] if 'solver_points' in prediction
+                  else ['initial proposal']+[f'feedback proposal {i}' for i in range(1, curves.shape[1])])
         plot_refinement(curves, batch['hist'], batch['hmask'],
                         images/f'correction_{step:06d}.png',
                         labels=labels,
@@ -341,7 +323,7 @@ def training_diagnostics(model, cpu_batch, tracer, fibers, seeds, out, step, log
             log.record(dict(step=step, split='monitor', threshold=threshold,
                             **({'dataset':dataset_name} if dataset_name else {}),
                             coverage_max_len=tracer.p.max_len, **rollout_summary(rows)))
-        plot_curves(Path(out)/'log.jsonl', Path(out)/'curves.png', loss_key='geometry')
+        plot_curves(Path(out)/'log.jsonl', Path(out)/'curves.png', loss_key='flow' if model.cfg.model_type == 'flow_matching' else 'geometry')
     finally:
         model.train(was_training)
         tracer.p.confidence = threshold_before
@@ -437,7 +419,7 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
             diagnostic.update(cpu_batch=cpu)
         with torch.autocast('cuda', dtype=torch.bfloat16, enabled=torch.device(device).type == 'cuda'):
             output = training_prediction(model, batch['x'], batch['hist'], batch['hmask'],
-                                         n_commit=commit_window(model.cfg, n_commit))
+                                         n_commit=commit_window(model.cfg, n_commit), targets=batch)
             terms = model.training_loss(output, batch, model.cfg, tolerance, n_commit=n_commit)
             geometry = terms['geometry_per_state'].sum()/denominator
             confidence = terms['confidence_per_state'].sum()/denominator
@@ -453,7 +435,7 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
         for key in IDENTITY_SUMS:
             if key in terms:
                 accumulate(identity, key, terms[key])
-        for key in ('presence_dropped', 'blurred', 'foreign_components', 'seed_present', 'identity_observable'):
+        for key in ('blurred', 'foreign_components', 'seed_present', 'identity_observable'):
             if key in cpu:
                 identity[key] = identity.get(key, 0.)+float((cpu[key] > 0).sum())
         if 'live_continuation' in cpu:
@@ -512,25 +494,33 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
                 prefix_correct_fraction=sums['correct_count']/max(1., sums['confidence_count']))
     if identity:
         identity['identity_prefix_correct_fraction'] = identity.get('identity_correct_count', 0.)/max(1., sums['confidence_count'])
-        for key in ('presence_dropped', 'blurred', 'foreign_components', 'seed_present', 'identity_observable', *(f'location_{n}' for n in LOCATION_SOURCES)):
+        for key in ('blurred', 'foreign_components', 'seed_present', 'identity_observable', *(f'location_{n}' for n in LOCATION_SOURCES)):
             if key in identity:
                 identity[key+'_fraction'] = identity.pop(key)/denominator
         sums['identity'] = identity
     if compute_metrics:
         sums['decisions'] = summarize_decisions(decisions, commit_window(model.cfg, n_commit))
+    sums['prediction_loss_type'] = 'flow' if model.cfg.model_type == 'flow_matching' else 'geometry'
+    sums['prediction_loss'] = sums['geometry']
+    if model.cfg.model_type == 'flow_matching':
+        sums['flow'] = sums['geometry']
     return sums
 
 
 def build_parser():
     ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument('--model', choices=('coordinate_regression', 'flow_matching'), default=None,
+                    help='Follower type; default coordinate_regression, inferred from checkpoint on resume/init')
+    ap.add_argument('--flow-steps', type=int, default=4)
+    ap.add_argument('--flow-draws', type=int, default=64)
+    ap.add_argument('--flow-calibration-states', type=int, default=2048)
+    ap.add_argument('--dagger-threads', type=int, default=4)
     ap.add_argument('--name', required=True)
     ap.add_argument('--fiber-zarrs')
     ap.add_argument('--fibers')
     ap.add_argument('--ct')
     ap.add_argument('--manifest', help='Frozen Paris 4 monitor/calibration/test seeds; also configurable in --dataset-config')
     ap.add_argument('--dataset-config', help='JSON source paths, fiber holdouts, cache directory and sampling weights')
-    ap.add_argument('--input-mode', choices=('ct', 'ct+presence'), default='ct+presence',
-                    help='Image channels; CT-only requires --no-direction-inputs and --presence-dropout 0')
     ap.add_argument('--onpolicy', nargs='*', default=[])
     ap.add_argument('--out-root', default=str(Path(__file__).parents[1]/'output'))
     ap.add_argument('--device', default='cuda')
@@ -559,31 +549,18 @@ def build_parser():
     ap.add_argument('--confidence-weight', type=float, default=.5)
     ap.add_argument('--tolerance', type=float, default=1.5)
     ap.add_argument('--n-commit', type=int, default=16)
-    ap.add_argument('--channels', type=int, default=DirectConfig.channels, help='Base image encoder width')
-    ap.add_argument('--stem-channels', type=int, default=DirectConfig.stem_channels,
+    ap.add_argument('--stem-channels', type=int, default=CoordinateRegressionConfig.stem_channels,
                     help='Parallel residual patch stem width; 0 disables (token-only patch4 models)')
-    ap.add_argument('--stem-blocks', type=int, default=DirectConfig.stem_blocks,
+    ap.add_argument('--stem-blocks', type=int, default=CoordinateRegressionConfig.stem_blocks,
                     help='BasicBlockD blocks per downsampling stage in the optional patch stem')
-    ap.add_argument('--encoder', choices=('conv', 'patch4'), default=None,
-                    help='Image encoder: conv (default) or overlapping 6x6x6 patches at stride 4; inferred on resume')
-    ap.add_argument('--history-encoder', choices=('fine', 'legacy'), default=None,
-                    help='Historical slabs: fine (default, 2x17x17 tokens) or legacy (2x9x9); inferred on resume')
-    ap.add_argument('--history-path-tokens', action=argparse.BooleanOptionalAction, default=None,
-                    help='Add observed-path neighborhood tokens to historical slabs; inferred on resume')
-    ap.add_argument('--path-geometry-tokens', action=argparse.BooleanOptionalAction, default=None,
-                    help='Give decoder and scorer the observed path beyond the crop (needs path tokens); inferred on resume')
-    ap.add_argument('--token-only', action=argparse.BooleanOptionalAction, default=None,
-                    help='Use only patch4 tokens throughout; no reconstructed fine features or output planes')
-    ap.add_argument('--direction-inputs', action=argparse.BooleanOptionalAction, default=True,
-                    help='Add six sign-invariant direction channels to main crops; no image augmentations on these channels')
-    ap.add_argument('--decoder-layers', type=int, default=4)
-    ap.add_argument('--decoder-ffn', type=int, default=DirectConfig.decoder_ffn,
+    ap.add_argument('--decoder-layers', type=int, default=CoordinateRegressionConfig.decoder_layers)
+    ap.add_argument('--decoder-ffn', type=int, default=CoordinateRegressionConfig.decoder_ffn,
                     help='Path decoder feed-forward width; scorer stays at 1024')
-    ap.add_argument('--scorer-layers', type=int, default=DirectConfig.scorer_layers,
+    ap.add_argument('--scorer-layers', type=int, default=CoordinateRegressionConfig.scorer_layers,
                     help='Causal segment survival decoder depth')
-    ap.add_argument('--axial-layers', type=int, default=4)
-    ap.add_argument('--hidden', type=int, default=128)
-    ap.add_argument('--encoder-ffn', type=int, default=DirectConfig.encoder_ffn,
+    ap.add_argument('--axial-layers', type=int, default=CoordinateRegressionConfig.layers)
+    ap.add_argument('--hidden', type=int, default=CoordinateRegressionConfig.hidden)
+    ap.add_argument('--encoder-ffn', type=int, default=CoordinateRegressionConfig.encoder_ffn,
                     help='Axial image encoder feed-forward width')
     ap.add_argument('--activation-checkpointing', action=argparse.BooleanOptionalAction, default=False)
     ap.add_argument('--task-share', action='append', default=[], metavar='TASK=SHARE',
@@ -618,8 +595,6 @@ def build_parser():
                     help='Foreign centerline contact radius for DAgger labels, in trace voxels')
     ap.add_argument('--bank-own-tolerance', type=float, default=1.5,
                     help='Annotation tube excluded from confirmed foreign contact')
-    ap.add_argument('--presence-dropout', type=float, default=0.,
-                    help='Probability of zeroing the presence crop; may be changed on resume')
     ap.add_argument('--blur-probability', type=float, default=.25,
                     help='Probability of shared CT/presence Gaussian blur; may be changed on resume')
     ap.add_argument('--blur-sigma', type=float, nargs=2, default=(.5, 1.25), metavar=('MIN', 'MAX'),
@@ -658,14 +633,13 @@ def build_parser():
     ap.add_argument('--resume', help='Resume last.pt inside this run with the same training options')
     ap.add_argument('--reset-optimizer', action='store_true',
                     help='With --resume: fresh AdamW, one LR for all parameters, no transfer freeze, and restart LR warmup/decay')
-    ap.add_argument('--recurrent-refinement-steps', type=int, default=DirectConfig.recurrent_refinement_steps,
+    ap.add_argument('--recurrent-refinement-steps', type=int, default=CoordinateRegressionConfig.recurrent_refinement_steps,
                     help='Maximum additional absolute-coordinate attempts; stop early when the full path is accepted')
     return ap
 
 
 def options_argv(options):
     """Serialize effective trainer settings for a bounded benchmark run."""
-    options = normalize_batch_options(options)
     argv = []
     for action in build_parser()._actions:
         if action.dest == 'help' or action.dest not in options:
@@ -693,8 +667,6 @@ def main(argv=None):
         apply_primary_source(args, dataset_document)
     if any(not getattr(args, key) for key in ('manifest', 'fiber_zarrs', 'fibers', 'ct')):
         raise ValueError('Provide source paths and --manifest, or --dataset-config')
-    if args.input_mode == 'ct' and (args.direction_inputs or args.presence_dropout):
-        raise ValueError('CT-only requires --no-direction-inputs and --presence-dropout 0')
     launch_started = time.monotonic()
 
     def progress(message):
@@ -713,7 +685,7 @@ def main(argv=None):
             or not math.isfinite(args.remote_prefetch_timeout) or args.remote_prefetch_timeout <= 0):
         raise ValueError('Prefetch connections and lookahead must be nonnegative; queue size and timeout must be positive')
     if min(args.steps, args.batch, args.grad_steps, args.log_every, args.ckpt_every,
-           args.threads, args.replay_keep, args.dagger_fibers, args.dagger_batch, args.recovery_seeds) < 1:
+           args.threads, args.dagger_threads, args.flow_calibration_states, args.replay_keep, args.dagger_fibers, args.dagger_batch, args.recovery_seeds) < 1:
         raise ValueError('Positive counts required, including batch and grad steps')
     if min(args.workers, args.warmup, args.diag_every, args.batch_diag_every,
            args.long_diag_every, args.dagger_every, args.recovery_every, args.confidence_weight) < 0:
@@ -731,45 +703,21 @@ def main(argv=None):
     torch.set_num_threads(args.threads)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    resume = read_checkpoint(args.resume,ARCHITECTURES,args.device) if args.resume else None
-    initial = read_checkpoint(args.init_weights,ARCHITECTURES,'cpu') if args.init_weights else None
+    resume = read_checkpoint(args.resume,MODEL_TYPES,args.device) if args.resume else None
+    if resume is not None and resume.get('kind') == 'weights':
+        raise ValueError('Weight-only files require --init-weights, not --resume')
+    initial = read_checkpoint(args.init_weights,MODEL_TYPES,'cpu') if args.init_weights else None
     origin = resume or initial
-    cfg = DirectConfig(encoder=resolve_encoder(args.encoder, origin),
-                       token_only=resolve_token_only(args.token_only, origin),
-                       history_encoder=resolve_history_encoder(args.history_encoder, origin),
-                       history_path_tokens=resolve_history_path_tokens(args.history_path_tokens, origin),
-                       path_geometry_tokens=resolve_path_geometry_tokens(args.path_geometry_tokens, origin),
-                       stem_channels=args.stem_channels, stem_blocks=args.stem_blocks,
-                       direction_inputs=args.direction_inputs,input_mode=args.input_mode,channels=args.channels,hidden=args.hidden,layers=args.axial_layers,
-                       encoder_ffn=args.encoder_ffn,
-                       decoder_layers=args.decoder_layers,
-                       decoder_ffn=args.decoder_ffn,
-                       scorer_layers=args.scorer_layers,
-                       activation_checkpointing=args.activation_checkpointing,
-                       recurrent_refinement_steps=args.recurrent_refinement_steps)
-    if origin:
-        # Matching weight tensors define the architecture; nothing else is inherited.
-        cfg = checkpoint_config(origin)
-        if args.direction_inputs != cfg.direction_inputs:
-            raise ValueError('Direction inputs must match the checkpoint; start a new run to change them')
-        if args.input_mode != cfg.input_mode:
-            raise ValueError('Input mode must match the checkpoint; CT-only starts a separate model')
-        if args.recurrent_refinement_steps != cfg.recurrent_refinement_steps:
-            raise ValueError('Refinement steps must match the checkpoint architecture')
+    cfg = model_config_from_args(args, origin)
+    args.model = cfg.model_type
     if resume:
         from vesuvius.neural_tracing.fiber_follow.data.datasets import validate_dataset_resume
         validate_dataset_resume(resume,dataset_document,dataset_digest)
-    args.encoder = cfg.encoder
-    args.token_only = cfg.token_only
-    args.history_encoder = cfg.history_encoder
-    args.history_path_tokens = cfg.history_path_tokens
-    args.path_geometry_tokens = cfg.path_geometry_tokens
     if not 1 <= args.live_continuation_steps[0] <= args.live_continuation_steps[1]:
         raise ValueError('Live continuation requires 1 <= minimum steps <= maximum steps')
     from vesuvius.neural_tracing.fiber_follow.data.bank_geometry import BankSwitchDetector
     BankSwitchDetector([], args.bank_switch_tolerance, args.bank_own_tolerance)
     identity_sampling = IdentitySampling(
-        presence_dropout=args.presence_dropout,
         blur_probability=args.blur_probability,blur_sigma=args.blur_sigma,
         lateral_fraction=args.lateral_fraction,bank_hard_fraction=args.bank_hard_fraction,
         bank_coverage_probability=args.bank_coverage_probability,synthetic_tail=args.synthetic_tail)
@@ -781,10 +729,7 @@ def main(argv=None):
     primary_source = (next(s for s in dataset_document['sources'] if s['kind'] == 'paris4')
                       if dataset_document else {})
     from vesuvius.neural_tracing.fiber_follow.data.datasets import primary_source_spec
-    spec = primary_source_spec(dataset_document, cfg.input_mode, fiber_zarrs=args.fiber_zarrs, ct=args.ct)
-    if cfg.direction_inputs:
-        # Validate sibling paths and grids before starting loaders or collectors.
-        FiberVolume(spec, cache_bytes=1 << 20).direction_fields()
+    spec = primary_source_spec(dataset_document, fiber_zarrs=args.fiber_zarrs, ct=args.ct)
     sample = SampleConfig(crop=cfg.fine, n_history=cfg.n_history, n_future=cfg.n_future,
                           future_step=cfg.future_step, recent_history_points=cfg.n_history,
                           startup_shares=tuple(args.startup_shares), excursion_probability=args.excursion_probability,
@@ -838,11 +783,11 @@ def main(argv=None):
     if resume:
         # Allow a new base LR without resetting AdamW or the schedule origin.
         # Operational settings may change on resume; sampling and label semantics may not.
-        ignored = {'resume','reset_optimizer','lr','out_root','device','batch','grad_steps','workers','threads','worker_cache_gb','dataset_config',
+        ignored = {'resume','reset_optimizer','lr','out_root','device','batch','grad_steps','workers','threads','dagger_threads','worker_cache_gb','dataset_config',
                    'remote_prefetch_connections','remote_prefetch_queue_size','remote_prefetch_timeout','remote_prefetch_lookahead',
                    'log_every','ckpt_every','diag_every','batch_diag_every','dagger_device','dagger_batch','dagger_forward_chunk',
                    'negative_bank_refresh_seconds','negative_bank_cache_mb','activation_checkpointing',
-                   'history_grad_clip','rest_grad_clip','presence_dropout','blur_probability','blur_sigma'}
+                   'history_grad_clip','rest_grad_clip','blur_probability','blur_sigma'}
         for key,value in vars(args).items():
             recorded = resume['training_options'].get(key)
             if key not in ignored and json.dumps(recorded,sort_keys=True) != json.dumps(value,sort_keys=True):
@@ -869,9 +814,9 @@ def main(argv=None):
         from vesuvius.neural_tracing.fiber_follow.data.datasets import ct_source_spec
         calibration_specs.extend(ct_source_spec(s, dataset_document['cache_dir'])
                                  for s in dataset_document['sources'] if s['kind'] != 'paris4')
-    progress('Preparing per-volume CT background normalization')
+    progress('Preparing per-crop CT z-score normalization')
     ct_normalization = prepare_normalization(out, calibration_specs,
-        resume=origin['ct_normalization'] if origin is not None else None)
+        resume=resume['ct_normalization'] if resume is not None else None)
     recovery_states = recovery_hash = None
     if args.recovery_every:
         progress('Preparing monitor recovery fixture')
@@ -883,15 +828,10 @@ def main(argv=None):
             raise ValueError('Monitor recovery fixture changed since checkpoint')
     progress('Initializing models and optimizer')
     progress(f'Independent gradient clipping: history={args.history_grad_clip:g}, rest={args.rest_grad_clip:g} (0 disables clipping)')
-    model = build_model(cfg).to(args.device, memory_format=conv_memory_format(args.device))
-    if initial:
-        model.load_state_dict(initial['model'], strict=True)
-    ema = copy.deepcopy(model).requires_grad_(False).eval()
-    if initial:
-        ema.load_state_dict(initial['ema'], strict=True)
-        progress(f'Initialized model and EMA tensors from {args.init_weights} (update {initial["step"]}); '
-                 f'fresh AdamW with {args.warmup} warmup updates; no sampler, label or option state is inherited')
-        del initial
+    # Flow scales are fitted after constructing the common training dataset below.
+    if isinstance(cfg, FlowConfig) and not cfg.flow_sigma:
+        cfg.flow_sigma = tuple((1., 1.) for _ in range(cfg.n_future))
+    model, ema = initialize_model_weights(cfg, args.device, initial)
     opt, done, lr_restart_step = initialize_training_optimizer(model, ema, args, resume)
     if args.reset_optimizer:
         progress(f'Fresh AdamW: one parameter group, all parameters trainable; LR restarts at update {done+1} '
@@ -908,7 +848,7 @@ def main(argv=None):
                       forward_chunk=args.dagger_forward_chunk, seed=args.seed, replay_keep=args.replay_keep,
                       trace_len=args.dagger_trace_len, before=args.dagger_before, after=args.dagger_after,
                       stride=args.dagger_stride, confidence=policy.confidence, n_commit=policy.n_commit,
-                      collector_module='vesuvius.neural_tracing.fiber_follow.tracing.collect')
+                      collector_module='vesuvius.neural_tracing.fiber_follow.tracing.collect', threads=args.dagger_threads)
     bank_args = ('--bank-switch-tolerance', args.bank_switch_tolerance, '--bank-own-tolerance', args.bank_own_tolerance)
     collector = OnlineCollector(out/'dagger', args.fibers, args.val_z, args.dagger_device or args.device,
         initial=[c._dir for c in caches], **collection,
@@ -955,8 +895,15 @@ def main(argv=None):
     if args.workers:
         loader_args.update(prefetch_factor=2, persistent_workers=True)
     loader = torch.utils.data.DataLoader(dataset, **loader_args)
+    if isinstance(cfg, FlowConfig) and origin is None:
+        from vesuvius.neural_tracing.fiber_follow.models.flow import fit_flow_sigma
+        progress('Fitting flow residual scales from training states')
+        cfg.flow_sigma = fit_flow_sigma(iter(loader), cfg, args.flow_calibration_states)
+        for follower in (model, ema):
+            follower.sigma.copy_(torch.tensor(cfg.flow_sigma, device=args.device))
+            follower.cfg.flow_sigma = cfg.flow_sigma
     if not resume:
-        (out/'config.json').write_text(json.dumps(dict(vars(args), architecture=model.architecture,
+        (out/'config.json').write_text(json.dumps(dict(vars(args), model_type=model.model_type,
             resolved_dataset_config=dataset_document, dataset_config_sha256=dataset_digest,
             dataset_provenance=dataset_provenance,
             ct_normalization=ct_normalization,
@@ -977,7 +924,7 @@ def main(argv=None):
     if dataset_document:
         log.record(dict(step=done, event='dataset_configuration', datasets=dataset_provenance,
                         names=dataset.names, probabilities=dataset.weights.tolist(),
-                        dataset_config_sha256=dataset_digest, input_mode=cfg.input_mode,
+                        dataset_config_sha256=dataset_digest, input_mode='ct',
                         evaluation_scope='Source-specific held-out fibers; Paris 4 recovery fixture'))
     if resume:
         log.record(dict(step=done, event='resume_configuration', checkpoint=str(args.resume),
@@ -986,7 +933,7 @@ def main(argv=None):
                     lr_restart_step=lr_restart_step, optimizer_state_entries=len(opt.state),
                     groups=[dict(parameters=len(g['params'])) for g in opt.param_groups],
                     trainable_parameters=sum(p.numel() for p in model.parameters() if p.requires_grad)))
-    log.record(dict(step=done,event='identity_sampling',architecture=model.architecture,
+    log.record(dict(step=done,event='identity_sampling',model_type=model.model_type,
         task_budget=budget.to_dict(), operating_policy=policy.to_dict(), collection=collector_settings(collector),
         fresh_geometry=('simulated traces: annotated seed, smooth lateral tracing error (OU) plus optional smooth '
                         'excursions, tracer heading/history/CT seed heading; labels from the shared state contract'),
@@ -1082,7 +1029,7 @@ def main(argv=None):
                     cuda_peak_allocated_gib=torch.cuda.max_memory_allocated(args.device)/2**30
                         if torch.device(args.device).type == 'cuda' else None))
                 from vesuvius.neural_tracing.fiber_follow.evaluation.diag import plot_curves
-                plot_curves(out/'log.jsonl', out/'curves.png', loss_key='geometry')
+                plot_curves(out/'log.jsonl', out/'curves.png', loss_key='flow' if model.cfg.model_type == 'flow_matching' else 'geometry')
                 interval_metrics = DirectTrainingInterval()
                 ledger = SamplingLedger()
                 interval_started, interval_step = now, step
@@ -1138,7 +1085,7 @@ def main(argv=None):
                                      device=args.device,dataset_name=next((s['name'] for s in dataset_document['sources']
                                          if s['kind']=='paris4'),None) if dataset_document else None)
                 if dataset_document:
-                    from vesuvius.neural_tracing.fiber_follow.evaluation.legacy_evaluate import evaluate
+                    from vesuvius.neural_tracing.fiber_follow.evaluation.seeds import evaluate
                     from vesuvius.neural_tracing.fiber_follow.shared.experiment import rollout_summary
                     from vesuvius.neural_tracing.fiber_follow.tracing.trace import TraceParams
                     for source, source_dataset in zip(dataset_document['sources'],dataset.datasets):
@@ -1154,10 +1101,10 @@ def main(argv=None):
                         finally:
                             source_tracer.close()
                     from vesuvius.neural_tracing.fiber_follow.evaluation.diag import plot_curves
-                    plot_curves(out/'log.jsonl',out/'curves.png',loss_key='geometry')
+                    plot_curves(out/'log.jsonl',out/'curves.png',loss_key='flow' if model.cfg.model_type == 'flow_matching' else 'geometry')
                 periodic['diagnostics_seconds'] = time.monotonic()-began
             if tracer is not None and args.long_diag_every and step % args.long_diag_every == 0:
-                from vesuvius.neural_tracing.fiber_follow.evaluation.legacy_evaluate import evaluate
+                from vesuvius.neural_tracing.fiber_follow.evaluation.seeds import evaluate
                 from vesuvius.neural_tracing.fiber_follow.shared.experiment import rollout_summary
                 from vesuvius.neural_tracing.fiber_follow.evaluation.diag import plot_rollouts
                 began = time.monotonic()

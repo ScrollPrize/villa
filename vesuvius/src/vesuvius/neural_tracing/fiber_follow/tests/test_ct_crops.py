@@ -8,7 +8,7 @@ import torch
 from model_fixtures import array_at
 from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolume, FiberVolumeSpec
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, frame_from_heading
-from vesuvius.neural_tracing.fiber_follow.models.model import DirectConfig
+from vesuvius.neural_tracing.fiber_follow.models.model import CoordinateRegressionConfig
 from vesuvius.neural_tracing.fiber_follow.data.observations import image_crop, ObservationBuilder
 
 
@@ -22,10 +22,10 @@ def volume(root):
 
 
 def config(**kwargs):
-    options = dict(fine=CropSpec(depth=16, width=9, behind=7, spacing=.5), channels=4, hidden=16, heads=2,
-                   layers=1, decoder_layers=1, n_future=4, n_history=8, input_mode='ct')
+    options = dict(fine=CropSpec(depth=16, width=12, behind=7, spacing=.5), hidden=16, heads=2,
+                   layers=1, decoder_layers=1, n_future=4, n_history=8)
     options.update(kwargs)
-    return DirectConfig(**options)
+    return CoordinateRegressionConfig(**options)
 
 
 def item(cfg):
@@ -46,10 +46,10 @@ def test_shared_crop_geometry_is_sampled_once_with_independent_outputs(tmp_path)
     a = dict(pos=np.array([20., 20., 20.]), frame=np.eye(3))
     b = dict(pos=a['pos'].copy(), frame=frame_from_heading(np.array([.4, .3, .8])))
     items = [a, dict(pos=a['pos'].copy(), frame=a['frame'].copy()), b, a]
-    expected = torch.cat([image_crop([item], vol, crop, input_mode='ct') for item in items])
+    expected = torch.cat([image_crop([item], vol, crop) for item in items])
     assert expected.shape[1] == 1
     with patch.object(vol.ct, 'read', wraps=vol.ct.read) as ct_read, ThreadPoolExecutor(2) as pool:
-        actual = image_crop(items, vol, crop, pool, input_mode='ct')
+        actual = image_crop(items, vol, crop, pool)
         assert ct_read.call_count == 2
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     actual[0].zero_()

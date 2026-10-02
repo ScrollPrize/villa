@@ -29,7 +29,6 @@ from vesuvius.neural_tracing.fiber_follow.shared.geometry import (
     tangent_at,
 )
 from vesuvius.neural_tracing.fiber_follow.data.annotation_repair import foldbacks, repair_kinks
-from vesuvius.neural_tracing.fiber_follow.shared.fast_sample import sample_crop
 from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolume
 from vesuvius.neural_tracing.fiber_follow.shared.reference import SEED_FIELDS, SEED_DEFAULTS, observed_seed
 
@@ -174,7 +173,7 @@ def split_fibers(fibers: list[TracedFiber], val_band: ZBand):
 
 @dataclass
 class SampleConfig:
-    crop: CropSpec = field(default_factory=lambda: CropSpec(depth=176, width=96, behind=128, history_render="segments", history_sigma=.35))
+    crop: CropSpec = field(default_factory=lambda: CropSpec(depth=176, width=96, behind=128))
     n_future: int = 16
     future_step: float = 1.0
     n_history: int = 128
@@ -952,8 +951,9 @@ class FollowDataset(torch.utils.data.IterableDataset):
                 self.prefetch_items(items,vol,required=True)
             seed_rejections += self.resolve_seeds(items, vol, live_rng, windows)
             try:
-                batch = (self.batch_builder(items, vol) if self.batch_builder is not None
-                         else collate_with_volume(items, vol, self.cfg.crop, grid))
+                if self.batch_builder is None:
+                    raise ValueError('Training requires the common observation builder')
+                batch = self.batch_builder(items, vol)
             except SeedHeadingError as exc:
                 # Invalid crop or slab orientation context rejects the whole plan.
                 # Weak CT orientation falls back in ct_frame; I/O errors propagate.
@@ -1065,69 +1065,6 @@ def read_tight_blocks(items, vol: FiberVolume, crop: CropSpec, pool=None, *, pre
     read = lambda b: vol.presence.read(b[0], b[1])[None] if presence else vol.raw_block(b[0], b[1])
     raw = list(map(read, bounds) if pool is None else pool.map(read, bounds))
     return raw, [start for start, _ in bounds]
-
-
-def add_presence_input(x, items, vol, crop, grid, pool=None):
-    """Insert presence before history, sampling the fiber grid independently of CT.
-
-    Shared by training and rollout. CT retains its native samples; the scalar
-    presence prediction is interpolated directly at the same world locations.
-    """
-    raw, starts = read_blocks(items, vol, crop, pool, presence=True)
-    tensor = lambda values: torch.as_tensor(np.asarray(values), device=x.device)
-    presence = sample_oriented_fast(tensor(raw), tensor(starts).float(),
-                                    tensor([it['pos'] for it in items]).float(),
-                                    tensor([it['frame'] for it in items]).float(), grid.to(x.device))
-    return torch.cat([x[:, :-1], presence.to(x.dtype), x[:, -1:]], 1)
-
-
-def render_count(crop: CropSpec) -> int:
-    """History points (1 voxel apart) that can land inside the crop."""
-    return int(np.ceil(crop.behind * crop.spacing)) + 4
-
-
-def build_inputs(raw, starts, pos, frames, hist, hmask, grid: torch.Tensor, n_render: int | None = None,
-                 input_scale: float = 1., history_sigma: float = 1., history_render: str = 'points') -> torch.Tensor:
-    """Tensors (any device) -> model input (B, C, D, H, W). Only the nearest
-    ``n_render`` history points are rendered (the rest lie behind the crop)."""
-    x = sample_oriented_fast(raw, starts.float(), pos*input_scale, frames*input_scale, grid)
-    if n_render is not None:
-        hist, hmask = hist[:, :n_render], hmask[:, :n_render]
-    return torch.cat([x, render_history(hist, hmask, grid, history_sigma, history_render)], 1)
-
-
-def collate_with_volume(items, vol: FiberVolume, crop: CropSpec, grid: torch.Tensor | None = None):
-    """Worker-side batch. With ``grid`` the model input ``x`` (fp16) is built
-    here on CPU; otherwise raw blocks + geometry are returned."""
-    from vesuvius.neural_tracing.fiber_follow.tracing.heading import orient_item
-    for item in items:
-        orient_item(item, vol)
-    if grid is None and vol.spec.mode == 'ct+presence':
-        grid = torch.from_numpy(crop_local_grid(crop)).float()
-    raw, starts = read_blocks(items, vol, crop)
-    scale = getattr(vol, 'input_scale', 1.)
-    st = lambda k: torch.from_numpy(np.stack([it[k] for it in items]).astype(np.float32))
-    out = dict(raw=torch.from_numpy(raw), starts=torch.from_numpy(starts), pos=st("pos"), frames=st("frame"),
-               hist=st("hist_local"), hmask=st("hmask"))
-    if grid is not None:
-        if FUSED_SAMPLER:
-            # one fused numba pass per sample (see fast_sample.py); same values as build_inputs
-            nr = render_count(crop)
-            gf = _grid_flat(crop)
-            x = np.empty((len(items), 2, crop.depth, crop.width, crop.width), np.float16)
-            for j, it in enumerate(items):
-                x[j] = sample_crop(raw[j], starts[j], it["pos"]*scale, it["frame"]*scale, gf,
-                                   it["hist_local"][:nr], it["hmask"][:nr], 2, crop.history_sigma, crop.history_render).reshape(x.shape[1:])
-            out = dict(x=torch.from_numpy(x), hist=out["hist"], hmask=out["hmask"])
-        else:
-            x = build_inputs(out.pop("raw"), out.pop("starts"), out["pos"], out["frames"], out["hist"], out["hmask"],
-                             grid, n_render=render_count(crop), input_scale=scale,
-                             history_sigma=crop.history_sigma, history_render=crop.history_render)
-            out = dict(x=x.half(), hist=out["hist"], hmask=out["hmask"])
-        if vol.spec.mode == 'ct+presence':
-            out['x'] = add_presence_input(out['x'], items, vol, crop, grid)
-    out.update(collate_targets(items))
-    return out
 
 
 def collate_targets(items):

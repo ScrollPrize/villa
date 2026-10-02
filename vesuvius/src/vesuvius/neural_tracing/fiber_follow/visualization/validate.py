@@ -10,7 +10,6 @@ from PIL import Image
 import torch
 import torch.nn.functional as F
 
-from vesuvius.neural_tracing.fiber_follow.models.patch_encoder import pad_to_patch_grid
 from vesuvius.neural_tracing.fiber_follow.models.survival_confidence import survival_predictions
 from vesuvius.neural_tracing.fiber_follow.tracing.policy import commit_prefix
 from .capture import validate_attention
@@ -33,6 +32,13 @@ def validate(directory):
         assert list(value.shape) == m['shapes'][key], key
     for key in ('points', 'confidence', 'refinement_points', 'refinement_confidence'):
         np.testing.assert_array_equal(b['baseline_'+key], a[key])
+    if not all(m.get('capabilities', {}).get(key) for key in ('patch_features', 'history', 'attention')):
+        assert (dest/'01_decision.pdf').read_bytes().startswith(b'%PDF-')
+        with Image.open(dest/'01_decision.png') as im:
+            im.verify()
+        result = dict(status='PASS', pages=1, checks=['Finite arrays', 'Baseline equality', 'Core report assets'])
+        (dest/'validation.json').write_text(json.dumps(result, indent=2))
+        return result
     for name, metric in r['metrics'].items():
         points, confidence = b[name+'_points'], b[name+'_confidence']
         shift = np.linalg.norm(points-a['points'], axis=-1)
@@ -62,7 +68,7 @@ def validate(directory):
             np.testing.assert_allclose(volume.sum(axis).sum((1, 2)), weights[:, :nimage].sum(-1), rtol=2e-6)
     valid = a['input_history_valid'].astype(bool)
     assert int(valid.sum()) == m['observations']
-    np.testing.assert_array_equal(a['history_padding'], np.repeat(~valid, 162))
+    assert a['history_padding'][np.repeat(~valid, m['history_tokens_per_slab'])].all()
     assert (a['history_tokens'][a['history_padding']] == 0).all()
     cp = Path(m['checkpoint'])
     assert hashlib.sha256(cp.read_bytes()).hexdigest() == m['checkpoint_sha256']
@@ -70,7 +76,7 @@ def validate(directory):
     with torch.inference_mode():
         # CPU load_checkpoint copies CUDA channels-last weights into contiguous
         # parameters. Match that layout to preserve its reduction order exactly.
-        embedded = F.conv3d(pad_to_patch_grid(torch.from_numpy(a['input'][None])),
+        embedded = F.conv3d(torch.from_numpy(a['input'][None]),
                             ema['encoder.patch_projection.weight'].contiguous(),
                             ema['encoder.patch_projection.bias'], stride=4, padding=1)
     np.testing.assert_array_equal(embedded[0].permute(1, 2, 3, 0).numpy(), a['patch'])

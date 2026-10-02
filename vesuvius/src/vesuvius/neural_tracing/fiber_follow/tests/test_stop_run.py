@@ -9,7 +9,7 @@ from vesuvius.neural_tracing.fiber_follow.train.stop_run import collector_matche
 
 
 def collector_args(root):
-    return ['-m', PREFIX+'regression.collect', '--checkpoint', str(root/'dagger/source.pt'),
+    return ['-m', PREFIX+'tracing.collect', '--checkpoint', str(root/'dagger/source.pt'),
             '--out', str(root/'dagger/afv/decisions.npz')]
 
 
@@ -21,7 +21,7 @@ def test_collector_scope_requires_module_and_both_paths(tmp_path):
     args[-1] = str(tmp_path/'other/decisions.npz')
     assert not collector_matches(args, root)
     assert not collector_matches(['echo', str(root)], root)
-    assert not collector_matches(['-m', PREFIX+'regression.collect', '--checkpoint'], root)
+    assert not collector_matches(['-m', PREFIX+'tracing.collect', '--checkpoint'], root)
 
 
 @pytest.mark.parametrize('with_trainer', [True, False])
@@ -32,7 +32,7 @@ def test_stop_cleans_orphan_collector_and_preserves_other_run(tmp_path, with_tra
     spawn = lambda args: subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(90)', *args])
     processes = []
     try:
-        trainer = spawn(['-m', PREFIX+'regression.train', '--name', 'run']) if with_trainer else None
+        trainer = spawn(['-m', PREFIX+'train.train', '--name', 'run']) if with_trainer else None
         if trainer:
             processes.append(trainer)
             pid_file.write_text(str(trainer.pid))

@@ -1,4 +1,4 @@
-"""Fast scalar crops for the direct follower.
+"""Fast scalar crops for both fiber followers.
 
 Read only each oriented crop's tight source block. ChunkedArray memory-maps
 uncompressed Zarr chunks; the fused Numba kernel interpolates them.

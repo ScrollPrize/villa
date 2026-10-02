@@ -1,9 +1,9 @@
-"""The aligned model end to end: compiled training decisions match inference and train every part."""
+"""The coordinate regression model end to end: compiled training decisions match inference and train every part."""
 import copy
 
 import torch
 
-from model_fixtures import aligned_config, aligned_batch
+from model_fixtures import coordinate_config, coordinate_batch
 from vesuvius.neural_tracing.fiber_follow.models.model import build_model
 from vesuvius.neural_tracing.fiber_follow.train.train import prepare_training, training_prediction
 from vesuvius.neural_tracing.fiber_follow.train.supervision import loss_terms
@@ -13,12 +13,12 @@ ZERO_INIT_UPSTREAM = {'history_encoder.path_projection.0.weight', 'history_encod
                       'path_geometry.embed.0.weight', 'path_geometry.embed.0.bias'}
 
 
-def test_aligned_model_compiles_matches_inference_and_trains_every_part():
+def test_coordinate_regression_model_compiles_matches_inference_and_trains_every_part():
     torch.manual_seed(21)
-    model = build_model(aligned_config())
-    assert model.architecture == 'axial_patch4_residual_stem_tokens_fiber_slabs_v17'
+    model = build_model(coordinate_config())
+    assert model.model_type == 'coordinate_regression'
     compiled = prepare_training(copy.deepcopy(model), backend='eager')
-    batch = aligned_batch(model.cfg)
+    batch = coordinate_batch(model.cfg)
     args = batch['x'], batch['hist'], batch['hmask']
     # Threshold one keeps every refinement active in both the compacting and fixed-slot paths.
     eager = model(*args, confidence_threshold=1.)

@@ -3,7 +3,7 @@ import copy
 
 import torch
 
-from model_fixtures import aligned_config, aligned_batch
+from model_fixtures import coordinate_config, coordinate_batch
 from vesuvius.neural_tracing.fiber_follow.models.model import build_model, PathDecoderLayer
 
 
@@ -43,8 +43,8 @@ def test_cached_decoder_matches_recomputed_forward_masks_keys_and_reuses_project
 
 def test_passes_share_coordinate_head_and_encode_write_project_once(monkeypatch):
     torch.manual_seed(42)
-    model = build_model(aligned_config()).eval()
-    b = aligned_batch(model.cfg)
+    model = build_model(coordinate_config()).eval()
+    b = coordinate_batch(model.cfg)
     calls = dict(encoder=0, writer=0, projection=0, scorer_projection=0, decoder=0, coordinates=0, scoring=0)
     for obj, method, key in ((model.encoder, 'encode', 'encoder'),
                              (model.history_encoder, 'forward', 'writer'),

@@ -4,13 +4,13 @@ from dataclasses import replace
 import pytest
 import torch
 
-from model_fixtures import aligned_config
-from vesuvius.neural_tracing.fiber_follow.models.model import DirectConfig, build_model
+from model_fixtures import coordinate_config
+from vesuvius.neural_tracing.fiber_follow.models.model import CoordinateRegressionConfig, build_model
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, crop_local_grid
 
 
 def test_token_lattice_centres_sampling_history_cues_and_stem_share_one_grid():
-    cfg = aligned_config()
+    cfg = coordinate_config()
     model = build_model(cfg)
     encoder = model.encoder
     xyz = encoder.token_xyz.reshape(*cfg.token_shape, 3)
@@ -36,14 +36,14 @@ def test_token_lattice_centres_sampling_history_cues_and_stem_share_one_grid():
         stem = encoder.stem(image)
     assert stem.shape == encoder.patch_projection(image).shape == (1, cfg.hidden, *cfg.token_shape)
     assert torch.isfinite(stem).all() and torch.count_nonzero(stem) > 0
-    torch.testing.assert_close(build_model(replace(cfg, stem_channels=0)).encoder.token_xyz, encoder.token_xyz,
-                               rtol=0, atol=0)
+    with pytest.raises(ValueError, match='positive integer'):
+        replace(cfg, stem_channels=0)
     with pytest.raises(ValueError, match='multiples of four'):
         replace(cfg, fine=CropSpec(depth=25, width=20, behind=8))
 
 
 def test_production_crop_and_tokens_are_laterally_centered():
-    cfg = DirectConfig(encoder='patch4', token_only=True)
+    cfg = CoordinateRegressionConfig()
     image_grid = torch.from_numpy(crop_local_grid(cfg.fine))
     assert image_grid.shape == (120, 104, 104, 3)
     torch.testing.assert_close(image_grid[0, 0, 0, :2], -image_grid[0, -1, -1, :2])

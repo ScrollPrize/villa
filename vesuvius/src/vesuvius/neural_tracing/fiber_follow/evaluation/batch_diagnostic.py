@@ -92,14 +92,14 @@ def layer_capture(model):
                 def wrap(original, head=head, index=index):
                     def forward(*args, **kwargs):
                         if index == 0:
-                            record[head].setdefault('input', []).append(args[0].detach().float()[0].cpu())
+                            record[head].setdefault('input', []).append(args[0].detach().float().reshape(-1, model.cfg.n_future, model.cfg.hidden)[0].cpu())
                         result = original(*args, **kwargs)
-                        record[head].setdefault(f'block {index+1}', []).append(result.detach().float()[0].cpu())
+                        record[head].setdefault(f'block {index+1}', []).append(result.detach().float().reshape(-1, model.cfg.n_future, model.cfg.hidden)[0].cpu())
                         return result
                     return forward
-                patch(head, module, 'forward_cached', wrap)
+                patch(head, module, 'forward_draws' if head == 'decoder' and hasattr(model, 'velocity_field') else 'forward_cached', wrap)
         handles.append(model.decoder.norm.register_forward_hook(
-            lambda m, a, y: record['decoder'].setdefault('output', []).append(y.detach().float()[0].cpu())))
+            lambda m, a, y: record['decoder'].setdefault('output', []).append(y.detach().float().reshape(-1, model.cfg.n_future, model.cfg.hidden)[0].cpu())))
 
         def history_conv(m, a, y):
             record['statistics']['history convolution'] = tensor_stats(y)
@@ -262,9 +262,9 @@ def render_microbatch(model, cpu_batch, out, step, *, device, n_commit, toleranc
             examples.append(display_example(batch, output, details, layers, model.cfg, label, row))
         plot_sheets(examples, model.cfg, folder, step)
         errors = [r['mean_error'] for r in rows if r['mean_error'] is not None]
-        report = dict(step=step, split='current_training_microbatch', model='EMA', examples=len(rows),
+        report = dict(step=step, split='current_training_microbatch', model='EMA', model_type=model.model_type, examples=len(rows),
             n_commit=n_commit, tolerance=tolerance,
-            history_encoder=dict(variant=model.cfg.history_encoder, token_shape=model.history_encoder.token_shape,
+            history_encoder=dict(variant='fine', token_shape=model.history_encoder.token_shape,
                 tokens_per_slab=model.history_encoder.tokens_per_slab,
                 feature_channels=model.history_encoder.projection.in_features),
             summary=dict(committed_points=sum(r['commit'] for r in rows),
@@ -275,7 +275,7 @@ def render_microbatch(model, cpu_batch, out, step, *, device, n_commit, toleranc
                         total_diagnostic_seconds=time.perf_counter()-started),
             training_update=training_metrics or {}, rows=rows,
             interpretation=dict(encoder='Channel RMS deviation from spatial mean, fixed central v token section.',
-                decoder='Actual query activations at the selected attempt; signed values, not spatial images.',
+                decoder='Actual query activations at the selected proposal (last velocity evaluation for flow); signed values, not spatial images.',
                 history='CT inputs, convolution/token features and attention mass; attention is not attribution.',
                 orientation='Fixed CT sections and annotation in the actual crop frame; no GT-following reslicing.',
                 confidence='Prefix survival; unknown labels excluded from error and calibration metrics.',

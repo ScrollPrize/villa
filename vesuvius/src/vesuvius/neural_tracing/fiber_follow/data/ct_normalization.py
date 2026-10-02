@@ -34,7 +34,7 @@ def validate_record(record, spec):
 
 
 def prepare_normalization(out, specs, *, resume=None, known=None):
-    """Persist calibration once, bind it to readers, and enforce exact resume reuse.
+    """Persist z-score provenance, bind it to readers, and enforce exact resume reuse.
 
     Checkpoints embed the document too, allowing a missing JSON to be restored
     without estimating again. A changed JSON on resume is an error.
@@ -62,7 +62,7 @@ def prepare_normalization(out, specs, *, resume=None, known=None):
             raise ValueError(f'Inference CT normalization differs from the checkpoint: {key}')
         if key not in document['volumes']:
             if resume is not None:
-                raise ValueError(f'Resumed checkpoint lacks CT calibration: {key}')
+                raise ValueError(f'Resumed checkpoint lacks CT normalization: {key}')
             if known is not None and key in known['volumes']:
                 record = known['volumes'][key]
             else:

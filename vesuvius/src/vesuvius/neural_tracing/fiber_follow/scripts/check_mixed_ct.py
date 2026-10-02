@@ -14,7 +14,7 @@ import torch
 
 from vesuvius.neural_tracing.fiber_follow.data.datasets import read_dataset_config, build_mixed_dataset, load_primary_dataset, HoldoutFilteredBank
 from vesuvius.neural_tracing.fiber_follow.data.observations import IdentityObservationBuilder, IdentitySampling
-from vesuvius.neural_tracing.fiber_follow.models.model import DirectConfig, build_model
+from vesuvius.neural_tracing.fiber_follow.models.model import CoordinateRegressionConfig, build_model
 from vesuvius.neural_tracing.fiber_follow.train.supervision import loss_terms
 from vesuvius.neural_tracing.fiber_follow.data.data import FollowDataset, SampleConfig, TaskBudget, ZBand
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
@@ -30,10 +30,9 @@ def main():
     if args.prefetch_connections < 0:raise ValueError('Prefetch connections must be nonnegative')
     torch.set_num_threads(2);torch.manual_seed(7349)
     document,digest=read_dataset_config(args.dataset_config)
-    cfg=DirectConfig(input_mode='ct',direction_inputs=False,encoder='patch4',token_only=True,
-        fine=CropSpec(depth=48,width=33,behind=24),n_future=4,n_history=32,
-        hidden=16,heads=2,channels=4,layers=1,decoder_layers=1,recurrent_refinement_steps=1)
-    sampling=IdentitySampling(presence_dropout=0.,bank_coverage_probability=.2)
+    cfg=CoordinateRegressionConfig(fine=CropSpec(depth=48,width=33,behind=24),n_future=4,n_history=32,
+        hidden=16,heads=2,layers=1,decoder_layers=1,recurrent_refinement_steps=1)
+    sampling=IdentitySampling(bank_coverage_probability=.2)
     sample=SampleConfig(crop=cfg.fine,n_future=4,n_history=32,recent_history_points=32)
     budget=TaskBudget.parse(['live=0','fresh=.55','synthetic_terminal=.1'])
     source=next(s for s in document['sources'] if s['kind']=='paris4')
