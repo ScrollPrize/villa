@@ -2,6 +2,7 @@
 #include "utils/Json.hpp"
 
 #include "vc/core/types/VcDataset.hpp"
+#include "vc/core/types/Volume.hpp"
 
 #include <algorithm>
 #include <boost/program_options.hpp>
@@ -20,6 +21,7 @@
 #include "vc/core/util/OpenCvCompat.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Surface.hpp"
+#include "vc/core/util/SeedScanCheck.hpp"
 #include "vc/core/util/SurfaceArea.hpp"
 #include "vc/core/util/VoxelSizeMetadata.hpp"
 
@@ -96,6 +98,13 @@ static std::string zero_padded_index(size_t idx, int width = 4)
     std::ostringstream os;
     os << std::setw(width) << std::setfill('0') << idx;
     return os.str();
+}
+
+static bool is_remote_volume_path(const std::string& path)
+{
+    return path.rfind("http://", 0) == 0 ||
+           path.rfind("https://", 0) == 0 ||
+           path.rfind("s3://", 0) == 0;
 }
 
 static std::string seed_label_from_point(const cv::Vec3f& p)
@@ -971,7 +980,8 @@ static void add_internal_volume_shape(utils::Json& params, const std::vector<siz
 
 int main(int argc, char *argv[])
 {
-    std::filesystem::path vol_path, src_dir, tgt_dir, params_path, src_path, sweep_target_path, sweep_ranges_path, seed_coords_path;
+    std::filesystem::path vol_path, src_dir, tgt_dir, params_path, src_path, sweep_target_path, sweep_ranges_path, seed_coords_path, scan_path;
+    vc::util::SeedScanPolicy scan_policy = vc::util::SeedScanPolicy::Warn;
     std::string sweep_strategy = "grid";
     std::vector<std::string> seed_coord_values;
     double sweep_cutout_cm = 5.0;
@@ -1005,6 +1015,8 @@ int main(int argc, char *argv[])
             ("src-segment", po::value<std::string>(), "Source segment path to grow from")
             ("seed-coord", po::value<std::vector<std::string>>()->composing(), "3D seed coordinate x,y,z. May be repeated")
             ("seed-coords", po::value<std::string>(), "File containing seed coordinates as JSON [[x,y,z],...] or text lines x,y,z")
+            ("scan-volume", po::value<std::string>(), "Raw masked scan OME-Zarr (path or URL) the volume was predicted from; seed coordinates are checked against it")
+            ("require-scan-data", "Skip a seed coordinate the --scan-volume has no data for instead of warning")
             ("max-width", po::value<int>(), "Override grow params max_width")
             ("sweep", po::value<std::string>(), "Target tifxyz surface to fill; enables parameter sweep mode")
             ("sweep-ranges", po::value<std::string>(), "JSON file describing parameter values/ranges for --sweep")
@@ -1055,6 +1067,16 @@ int main(int argc, char *argv[])
         }
         if (vm.count("seed-coords")) {
             seed_coords_path = vm["seed-coords"].as<std::string>();
+        }
+        if (vm.count("scan-volume")) {
+            scan_path = vm["scan-volume"].as<std::string>();
+        }
+        if (vm.count("require-scan-data")) {
+            if (!vm.count("scan-volume")) {
+                std::cerr << "ERROR: --require-scan-data can only be used with --scan-volume" << std::endl;
+                return EXIT_FAILURE;
+            }
+            scan_policy = vc::util::SeedScanPolicy::Require;
         }
         if (vm.count("max-width")) {
             cli_max_width = vm["max-width"].as<int>();
@@ -1157,6 +1179,29 @@ int main(int argc, char *argv[])
     std::cout << "zarr dataset size for scale group 0 " << ds->shape() << std::endl;
     std::cout << "chunk shape shape " << ds->defaultChunkShape() << std::endl;
     add_internal_volume_shape(params, ds->shape());
+
+    std::shared_ptr<Volume> scan_volume;
+    if (!scan_path.empty()) {
+        const std::string scan_arg = scan_path.string();
+        scan_volume = is_remote_volume_path(scan_arg)
+            ? Volume::NewFromUrl(scan_arg)
+            : Volume::New(scan_path);
+        if (!scan_volume->hasScaleLevel(0)) {
+            std::cerr << "ERROR: scan volume has no full-resolution level 0, which the seed check reads" << std::endl;
+            return EXIT_FAILURE;
+        }
+        const std::vector<size_t> scan_shape{
+            static_cast<size_t>(scan_volume->numSlices()),
+            static_cast<size_t>(scan_volume->sliceHeight()),
+            static_cast<size_t>(scan_volume->sliceWidth())};
+        if (scan_shape != ds->shape()) {
+            std::cerr << "ERROR: scan volume shape " << scan_shape
+                      << " differs from the traced volume's, so a seed coordinate is not the same voxel in both"
+                      << std::endl;
+            return EXIT_FAILURE;
+        }
+        std::cout << "scan volume " << scan_arg << std::endl;
+    }
 
     // Resolved the same way Volume does, so a store that states its voxel size
     // only through an acquisition record is not read as 0.
@@ -1458,6 +1503,21 @@ int main(int argc, char *argv[])
             std::cout << "Seed " << seed.label
                       << " point=" << seed.point
                       << " source=" << src->path << std::endl;
+
+            if (scan_volume) {
+                const cv::Vec3d seed_xyz(seed.point[0], seed.point[1], seed.point[2]);
+                const auto sample = vc::util::sampleSeedInScan(*scan_volume->chunkedCache(), seed_xyz);
+                const auto decision = vc::util::evaluateSeedScan(sample, seed_xyz, scan_policy);
+                if (decision.abort) {
+                    std::cerr << "ERROR: " << decision.message << std::endl;
+                    had_failure = true;
+                    continue;
+                }
+                if (!decision.message.empty()) {
+                    std::cerr << "WARNING: " << decision.message
+                              << ". Pass --require-scan-data to skip such a seed." << std::endl;
+                }
+            }
 
             QuadSurface* surf = nullptr;
             try {
