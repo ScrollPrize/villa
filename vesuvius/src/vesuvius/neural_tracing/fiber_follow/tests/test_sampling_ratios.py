@@ -16,10 +16,8 @@ def test_clean_budget_is_unconditional_and_hard_fallback_stays_clean(monkeypatch
     monkeypatch.setattr(module, 'FiberVolume', lambda *a, **kw: None)
     monkeypatch.setattr(module, 'crop_local_grid', lambda crop: np.zeros((1, 3)))
 
-    def sample(*args, perturb=True, light_perturbation=None):
-        assert not perturb
-        assert light_perturbation in (None, (.5, 2.))
-        return dict(allowed=True, clean=light_perturbation is None)
+    def sample(*args):
+        return dict(allowed=True)
 
     monkeypatch.setattr(module, 'make_sample', sample)
 
@@ -55,7 +53,8 @@ def test_clean_budget_is_unconditional_and_hard_fallback_stays_clean(monkeypatch
         assert sum(i['source'] == 5 for i in items) % 2 == 0
         for item in items:
             if item['source'] == 0:
-                assert item['clean'] == (not item['gt_perturbed']) == item['gt_unperturbed']
+                # Every GT slot is the same simulated trace; light slots are only tagged.
+                assert (not item['gt_perturbed']) == item['gt_unperturbed']
                 light += item['gt_perturbed']
             counts[item['source']] += 1
     probabilities = ds.sampling_probabilities()

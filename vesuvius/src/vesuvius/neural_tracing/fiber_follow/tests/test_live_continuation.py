@@ -36,7 +36,7 @@ def setup(monkeypatch):
     ds.live_continuation = live
     vol = SimpleNamespace(shape=(1000,)*3)
     rng = np.random.default_rng(5)
-    item = make_sample(fiber, 100., False, cfg, rng, perturb=False)
+    item = make_sample(fiber, 100., False, cfg, rng)
     item.update(fiber_ref=(0, 100., False), gt_unperturbed=True, source=0)
     orient_item(item, vol)
     return live, ds, vol, rng, item
@@ -59,7 +59,7 @@ def proposal(live, item, step=100, confidence=None):
 def test_live_state_matches_next_inference_observation(setup, reverse):
     live, ds, vol, rng, item = setup
     if reverse:
-        item = make_sample(ds.fibers[0], 100., True, ds.cfg, rng, perturb=False)
+        item = make_sample(ds.fibers[0], 100., True, ds.cfg, rng)
         item.update(fiber_ref=(0, 100., True), gt_unperturbed=True, source=0)
         orient_item(item, vol)
     state = proposal(live, item, confidence=[.9]*7+[.1]*9)
@@ -161,7 +161,7 @@ def test_annotation_end_stop_vs_unannotated_boundary(setup, annotated):
     live, ds, vol, rng, item = setup
     fiber = ds.fibers[0]
     ds.fibers[0] = replace(fiber, endpoint_stop=(False, annotated))
-    item = make_sample(ds.fibers[0], fiber.length-4, False, ds.cfg, rng, perturb=False)
+    item = make_sample(ds.fibers[0], fiber.length-4, False, ds.cfg, rng)
     item.update(fiber_ref=(0, fiber.length-4, False), source=0, gt_unperturbed=True)
     orient_item(item, vol)
     result = live.advance(proposal(live, item), ds, vol, rng)

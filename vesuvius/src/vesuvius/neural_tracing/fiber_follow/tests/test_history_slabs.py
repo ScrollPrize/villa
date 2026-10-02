@@ -15,6 +15,7 @@ from vesuvius.neural_tracing.fiber_follow.regression.data import ObservationBuil
 from vesuvius.neural_tracing.fiber_follow.regression.train import prepare_training, training_prediction, optimizer_update
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength
 from vesuvius.neural_tracing.fiber_follow.shared.data import OnPolicyStates, ZBand, SampleConfig, make_sample
+from vesuvius.neural_tracing.fiber_follow.shared.trace import trace_history
 
 
 def observation(path):
@@ -212,8 +213,11 @@ def test_complete_synthetic_prefix_precedes_local_history_truncation():
         assert item['hist_local'].shape==(128,3)
         np.testing.assert_allclose(path[0],item['seed_pos'])
         np.testing.assert_allclose(path[-1],item['pos'])
-        n=int(item['hmask'].sum())
-        np.testing.assert_allclose(item['hist_local'][:n] @ item['frame'].T+item['pos'],path[-2:-n-2:-1])
+        # The tracer's history of the observed path: unit arclength steps back from the head.
+        hist,mask=trace_history(list(path),128)
+        np.testing.assert_array_equal(item['hmask'],mask)
+        n=int(mask.sum())
+        np.testing.assert_allclose(item['hist_local'][:n] @ item['frame'].T+item['pos'],hist[:n],atol=1e-9)
     assert max(lengths)>128 and len(set(lengths))>10
     no=make_sample(fiber,1000.,False,SampleConfig(full_observed_history=True,no_history_prob=1.),np.random.default_rng(3))
     assert len(no['observed_path'])==1 and not no['hmask'].any()

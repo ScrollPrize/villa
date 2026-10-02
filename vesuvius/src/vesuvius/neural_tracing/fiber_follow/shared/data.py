@@ -327,12 +327,13 @@ def resolve_trace_seed(item, vol):
 
     Sets the seed tangent. A path still holding the seed heading (< 12 voxels) also
     takes it as crop heading: local geometry is re-expressed and labels recomputed.
-    Unusable CT (where the tracer would skip this seed) keeps the travel direction.
-    Synthetic sources mark themselves with ``seed_heading_family`` the same way.
+    Unusable CT (where the tracer would skip this seed) keeps the travel direction,
+    as does a call without a volume (unit tests of other stages). Synthetic sources
+    mark themselves with ``seed_heading_family`` the same way.
     """
     family = item.pop('seed_heading_family', None)
     pending = item.pop('_pending_seed_heading', None)
-    if family is None:
+    if family is None or vol is None:
         return item
     from .heading import SeedHeadingError, oriented_seed_heading, reframe_item
     try:

@@ -57,59 +57,11 @@ def sample_config():
     return D.SampleConfig(crop=CropSpec(depth=12, width=9, behind=2), n_history=4, n_future=4)
 
 
-@pytest.mark.parametrize('reverse', [False, True])
-@pytest.mark.parametrize('t', [0., 2.5, 60.])
-def test_clean_gt_preserves_position_heading_and_all_available_history(reverse, t):
-    from vesuvius.neural_tracing.fiber_follow.shared.geometry import interp_at, tangent_at
-    u = np.linspace(0, 100, 401)
-    points = np.c_[u, 4*np.sin(u/12), 2*np.cos(u/9)]
-    f = D.TracedFiber('clean', points, arclength(points), 'H')
-    cfg = replace(sample_config(), full_observed_history=True, no_history_prob=1.,
-                  short_history_prob=1., history_jitter=20., history_drift=20., history_wobble=20.)
-    p = points[::-1] if reverse else points
-    s = f.s[-1]-f.s[::-1] if reverse else f.s
-    for seed in [1, 19]:
-        item = D.make_sample(f, t, reverse, cfg, np.random.default_rng(seed), perturb=False)
-        np.testing.assert_allclose(item['pos'], interp_at(p, s, np.array([t]))[0], atol=1e-12)
-        np.testing.assert_allclose(item['frame'][:, 2], tangent_at(p, s, t), atol=1e-12)
-        back = t-np.arange(int(t/cfg.history_step), 0, -1)*cfg.history_step
-        expected = interp_at(p, s, np.r_[back, t])
-        np.testing.assert_allclose(item['observed_path'], expected, atol=1e-12)
-        valid = item['hmask'].astype(bool)
-        history = item['hist_local'][valid] @ item['frame'].T+item['pos']
-        np.testing.assert_allclose(history, expected[:-1][::-1][:cfg.n_history], atol=1e-12)
-        np.testing.assert_allclose(item['seed_pos'], expected[0], atol=1e-12)
-
-
 def make_states(f, z=0, offtrack=False):
     return D.OnPolicyStates(manifest=D.fiber_manifest([f]),
         fiber_idx=[0], t=[50.], reverse=[False], pos=[[50., 0., z]],
         frame=[frame_from_heading(np.array([1., 0, 0]))], hist=np.zeros((1, 4, 3)), hmask=np.zeros((1, 4)),
         offtrack=[offtrack], hard=[offtrack], exploratory=[False])
-
-
-@pytest.mark.parametrize('reverse', [False, True])
-@pytest.mark.parametrize('t', [0., 2.5, 60.])
-def test_light_gt_is_bounded_keeps_seed_full_history_and_gt_targets(reverse, t):
-    f = fiber()
-    cfg = replace(sample_config(), full_observed_history=True, no_history_prob=1.,
-                  short_history_prob=1., history_jitter=20., history_drift=20., history_wobble=20.)
-    clean = D.make_sample(f, t, reverse, cfg, np.random.default_rng(0), perturb=False)
-    for seed in range(20):
-        item = D.make_sample(f, t, reverse, cfg, np.random.default_rng(seed),
-                             perturb=False, light_perturbation=(.5, 2.))
-        np.testing.assert_array_equal(item['hmask'], clean['hmask'])
-        np.testing.assert_allclose(item['seed_pos'], clean['seed_pos'], atol=1e-12, rtol=0)
-        delta = item['observed_path']-clean['observed_path']
-        assert np.linalg.norm(delta, axis=1).max() <= .5+1e-12
-        assert np.linalg.norm(item['pos']-clean['pos']) <= .5+1e-12
-        assert np.dot(item['frame'][:, 2], clean['frame'][:, 2]) >= np.cos(np.deg2rad(2.))-1e-12
-        # Old observations, including the seed, are untouched; the tip moves smoothly.
-        old = np.linalg.norm(clean['observed_path']-clean['pos'], axis=1) >= 32.
-        np.testing.assert_array_equal(delta[old], np.zeros_like(delta[old]))
-        target = item['fut_local'] @ item['frame'].T+item['pos']
-        expected = clean['fut_local'] @ clean['frame'].T+clean['pos']
-        np.testing.assert_allclose(target, expected, atol=1e-6)
 
 
 @pytest.mark.parametrize('reverse', [False, True])
@@ -205,7 +157,8 @@ def test_every_interior_line_vertex_is_retained_and_review_tag_has_no_effect(tmp
     tagged, = D.load_fibers(str(tmp_path), grid_scale=1, spacing=2.5)
     after = D.make_sample(tagged, 8, False, sample_config(), np.random.default_rng(5))
     for key in before:
-        np.testing.assert_array_equal(before[key], after[key])
+        if not key.startswith('_'):  # private references to the loaded fiber object
+            np.testing.assert_array_equal(before[key], after[key])
 
 
 def test_spatial_split_is_invariant_to_dense_annotation_sampling():
@@ -318,16 +271,32 @@ def test_collector_censors_unknown_boundary_and_marks_pre_stop_window():
     assert not any(r['offtrack'] for r in c.finish())
 
 
-def test_collector_retains_predeparture_and_short_failure_suffix():
+def test_collector_departure_is_the_evaluation_rule_and_retains_predeparture_rows():
+    # Three consecutive committed points beyond 3 voxels (score_trace tolerance and
+    # patience), dated at the run's first point, including runs spanning commits.
     c = DecisionCollector(fiber(length=300), 0, 50, 1, sample_config(), stride=16)
     assert c(decision_at(50, 0))
-    d = decision_at(54, 6, [50., 0, 0])
-    d['pos'][1] = 5
-    d['last_segment'][-1, 1] = 5
-    assert c(d)
-    assert c.rows[0]['hard'] and c.rows[1]['offtrack']
+    first = np.array([[50., 0, 0], [51, 0, 0], [52, 0, 0], [53, 3.5, 0], [54, 3.5, 0]])
+    d = decision_at(54, float(arclength(first)[-1]))
+    d['pos'], d['last_segment'] = first[-1].copy(), first
+    assert c(d) and not c.rows[-1]['offtrack'] and c.departed is None  # two points: not yet
+    second = np.array([[54., 3.5, 0], [55, 3.5, 0], [56, 3.5, 0]])
+    d = decision_at(56, d['travelled']+2.)
+    d['pos'], d['last_segment'] = second[-1].copy(), second
+    assert c(d) and c.rows[-1]['offtrack']
+    assert c.departed == pytest.approx(arclength(first[:4])[-1])
+    assert c.rows[0]['hard']
     d['travelled'] = 40
     assert c(d) is False
+
+
+def test_collector_isolated_off_track_points_are_not_departures():
+    c = DecisionCollector(fiber(length=300), 0, 50, 1, sample_config(), stride=16)
+    assert c(decision_at(50, 0))
+    path = np.array([[50., 0, 0], [51, 3.5, 0], [52, 3.5, 0], [53, 0, 0], [54, 3.5, 0], [55, 0, 0]])
+    d = decision_at(55, float(arclength(path)[-1]))
+    d['pos'], d['last_segment'] = path[-1].copy(), path
+    assert c(d) and c.departed is None and not any(r['offtrack'] for r in c.rows)
 
 
 def test_collector_stops_on_holdout_and_preserves_original_frame():

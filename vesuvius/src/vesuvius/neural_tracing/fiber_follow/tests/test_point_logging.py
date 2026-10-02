@@ -136,7 +136,7 @@ def test_every_optimizer_update_reports_point_counts_without_detailed_metrics():
     row = dict(step=50, geometry=1., loss=1., lr=.001, interval=summary, n_future=4, tolerance=1.5,
                interval_update_seconds=1., interval_data_seconds=.1, interval_samples_per_second=4.)
     printed = format_training_log(row)
-    assert 'clean GT 50.0% / light GT 0.0% / correct continuation replay 50.0%' in printed
+    assert 'simulated GT traces 50.0% / live-slot GT fallback 0.0% / correct continuation replay 50.0%' in printed
     assert 'current 2/4 fallbacks (0 transported, 2 deterministic); mean gap 0.400' in printed
     assert 'history 4/6 fallbacks (2 transported, 2 deterministic); mean gap 0.200' in printed
     assert sum(metrics[k] for k in ('point_correct_count','point_wrong_count','point_unknown_count')) == 8

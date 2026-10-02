@@ -62,9 +62,8 @@ def test_afv_native_coordinates_block_overlap_holdout_and_pickle(tmp_path):
 def test_afv_foreign_masks_exclude_own_target(tmp_path):
     p=tmp_path/'test.afv';afv_fixture(p);fibers=AFVFibers(p,1.)
     cfg=config(input_mode='ct')
-    s=SampleConfig(crop=cfg.fine,n_future=4,n_history=32,no_history_prob=0.,
-        lateral_sigmas=(0.,),lateral_probs=(1.,),angle_sigmas_deg=(0.,),angle_probs=(1.,),
-        history_drift=0.,history_wobble=0.)
+    # The neighbor sits at the crop edge; geometry here excludes simulated tracing error.
+    s=SampleConfig(crop=cfg.fine,n_future=4,n_history=32,no_history_prob=0.,trace_noise_sigma=(0.,0.))
     rng=np.random.default_rng(17);item=make_sample(fibers[0],40.,False,s,rng)
     item['fiber_ref']=(0,40.,False)
     builder=IdentityObservationBuilder(cfg,fibers,IdentitySampling(decision_fraction=0.),negative_bank=AFVBank(fibers))
