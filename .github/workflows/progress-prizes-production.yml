@@ -16,7 +16,6 @@ on:
           - validate
           - dry-run
           - prepare
-          - sync-responses
           - activate
           - reconcile-active
           - verify
@@ -87,7 +86,6 @@ jobs:
               'validate',
               'dry-run',
               'prepare',
-              'sync-responses',
               'activate',
               'reconcile-active',
               'verify',
@@ -205,40 +203,6 @@ jobs:
             ].join('\n'),
           );
           NODE
-
-  sync-responses:
-    name: Append new responses to the current monthly Sheet
-    if: inputs.operation == 'sync-responses'
-    needs: preflight
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    environment: progress-prizes-production
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - name: Check out the exact trusted trigger commit
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-          clean: true
-          fetch-depth: 1
-      - name: Append only previously unseen response IDs
-        uses: ./.github/actions/progress-prizes-google
-        with:
-          operation: sync-responses
-          environment: production
-          source-cycle: ${{ inputs['source-cycle'] }}
-          branch: main
-          target-branch: main
-          workload-identity-provider: ${{ secrets.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
-          service-account-email: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
-          drive-admin-email: ${{ secrets.PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL }}
-          drive-id: ${{ secrets.PROGRESS_PRIZE_DRIVE_ID }}
-          folder-id: ${{ secrets.PROGRESS_PRIZE_FOLDER_ID }}
-          source-form-id: ${{ secrets.PROGRESS_PRIZE_SOURCE_FORM_ID }}
-          editor-group-email: ${{ secrets.PROGRESS_PRIZE_EDITOR_GROUP_EMAIL }}
 
   reconcile-approval:
     name: Approve marker-only active-state reconciliation
@@ -883,7 +847,6 @@ jobs:
       (needs.preflight.result == 'failure' ||
        needs.validate.result == 'failure' ||
        needs.dry-run.result == 'failure' ||
-       needs.sync-responses.result == 'failure' ||
        needs.prepare-google.result == 'failure' ||
        needs.prepare-page.result == 'failure' ||
        needs.activation-state.result == 'failure' ||
@@ -902,7 +865,6 @@ jobs:
       - preflight
       - validate
       - dry-run
-      - sync-responses
       - prepare-google
       - prepare-page
       - activation-state
