@@ -7,7 +7,7 @@ import logging
 import math
 import shutil
 import tempfile
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -857,6 +857,70 @@ def open_temp_zarr_array(
     )
 
 
+class _MappedScratch:
+    """Own one float32 scratch plane without exposing mapped views."""
+
+    def __init__(self, path: Path, shape: tuple[int, int]) -> None:
+        self.shape = tuple(int(value) for value in shape)
+        if len(self.shape) != 2 or min(self.shape) < 1:
+            raise ValueError("A positive two-dimensional shape is required")
+        self.path = Path(path)
+        self._array = np.memmap(
+            self.path, mode="w+", dtype=np.float32, shape=self.shape, order="C"
+        )
+        try:
+            self._array[:] = 0
+        except BaseException:
+            # The caller cannot register cleanup until construction succeeds.
+            self._array._mmap.close()
+            self._array = None
+            raise
+
+    def __getitem__(self, key: Any) -> np.ndarray:
+        if self._array is None:
+            raise ValueError("Scratch store is closed")
+        # TIFF normalization modifies its input in place. Match Zarr's copies
+        # so encoding cannot overwrite sums or retain a view after close().
+        return np.array(self._array[key], dtype=np.float32, copy=True)
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        if self._array is None:
+            raise ValueError("Scratch store is closed")
+        self._array[key] = value
+
+    def close(self) -> None:
+        if self._array is not None:
+            array, self._array = self._array, None
+            try:
+                array.flush()
+            finally:
+                # No mapped views escape this owner. Release the handle before
+                # the temporary directory is removed, including on Windows.
+                array._mmap.close()
+
+
+def open_temp_accumulation_array(
+    path: Path,
+    *,
+    shape: tuple[int, int],
+    chunks: tuple[int, int],
+    backend: str,
+    cleanup: ExitStack,
+) -> Any:
+    """Create scratch storage and register its close operation."""
+    if backend == "memmap":
+        result = _MappedScratch(path.with_suffix(".dat"), shape)
+        cleanup.callback(result.close)
+        return result
+    if backend != "zarr":
+        raise ValueError(f"Unknown scratch backend: {backend}")
+    result = open_temp_zarr_array(path, shape=shape, chunks=chunks)
+    close = getattr(result.store, "close", None)
+    if callable(close):
+        cleanup.callback(close)
+    return result
+
+
 def load_grayscale_mask(path: Path, target_shape: tuple[int, int]) -> np.ndarray:
     """Read a nonzero foreground TIFF with top-left crop/pad alignment."""
 
@@ -1090,20 +1154,27 @@ def infer_single_zarr(
     )
 
     temporary = Path(tempfile.mkdtemp(prefix="ink_flat_infer_"))
-    try:
+    with ExitStack() as scratch_cleanup:
+        # ExitStack closes both stores before attempting directory removal.
+        scratch_cleanup.callback(shutil.rmtree, temporary, ignore_errors=True)
+        scratch_backend = getattr(args, "scratch_backend", "zarr")
         accumulation_chunks = (
             min(tile_shape[0], height),
             min(tile_shape[1], width),
         )
-        probability_sum = open_temp_zarr_array(
+        probability_sum = open_temp_accumulation_array(
             temporary / "probability.zarr",
             shape=(height, width),
             chunks=accumulation_chunks,
+            backend=scratch_backend,
+            cleanup=scratch_cleanup,
         )
-        weight_sum = open_temp_zarr_array(
+        weight_sum = open_temp_accumulation_array(
             temporary / "weight.zarr",
             shape=(height, width),
             chunks=accumulation_chunks,
+            backend=scratch_backend,
+            cleanup=scratch_cleanup,
         )
         accumulator = ChunkAccumulator(
             shape=(height, width),
@@ -1137,8 +1208,6 @@ def infer_single_zarr(
             output_tiff,
             tile_shape,
         )
-    finally:
-        shutil.rmtree(temporary, ignore_errors=True)
 
 
 def resolve_run_directions(direction: str) -> tuple[str, ...]:
@@ -1310,6 +1379,15 @@ def parse_args(argv: Sequence[str] | None = None):
         "--num-workers", "--workers", dest="num_workers", type=int, default=4
     )
     parser.add_argument("--prefetch-factor", type=int, default=2)
+    parser.add_argument(
+        "--scratch-backend",
+        choices=("zarr", "memmap"),
+        default="zarr",
+        help=(
+            "Temporary accumulation storage: zarr keeps the existing settings; "
+            "memmap uses uncompressed files and can increase resident RAM."
+        ),
+    )
     parser.add_argument(
         "--overlap",
         type=float,
