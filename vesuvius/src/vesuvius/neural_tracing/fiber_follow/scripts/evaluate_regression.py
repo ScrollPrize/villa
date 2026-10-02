@@ -1,7 +1,5 @@
-"""Use the frozen calibration/final protocol for the direct follower."""
-from evaluate_single_path import main
-from vesuvius.neural_tracing.fiber_follow.regression.train import load_checkpoint, validate_volume_source
-from vesuvius.neural_tracing.fiber_follow.regression.data import DirectTracer
+"""The direct follower's evaluation protocol (see regression/evaluate.py)."""
+from vesuvius.neural_tracing.fiber_follow.regression.evaluate import main
 
 if __name__ == '__main__':
-    main(checkpoint_loader=load_checkpoint, model_tracer=DirectTracer, volume_validator=validate_volume_source)
+    main()

@@ -28,20 +28,19 @@ class TraceParams:
     confidence: float = DEFAULT_CONFIDENCE
     loop_radius: float = 1.5
     loop_skip: int = 40
-    explore_calls: int = 0  # collection only: bounded suffix after first would-stop
-    # Stop policy. A would-stop call (no curve prefix clears ``confidence``)
-    # ends the trace only after ``stop_patience`` consecutive such calls; the
-    # earlier ones commit a single point while preserving the incoming frame,
-    # as do forced low-confidence steps during collection exploration.
-    # Defaults reproduce the immediate stop.
-    stop_patience: int = 1
     seed: int = 0  # stochastic sampler seed; each directed trace has its own stream
+    # Rows per model forward call; 0 runs every active trace in one call. Chunking
+    # bounds memory only: each row's inputs and outputs are unchanged.
+    forward_chunk: int = 0
 
     def __post_init__(self):
-        if self.n_commit < 1 or self.max_len <= 0 or not 0 <= self.confidence <= 1 or self.explore_calls < 0:
+        if self.n_commit < 1 or self.max_len <= 0 or not 0 <= self.confidence <= 1 or self.forward_chunk < 0:
             raise ValueError('Invalid rollout parameters')
-        if self.stop_patience < 1:
-            raise ValueError('stop_patience must be positive')
+
+    @classmethod
+    def from_policy(cls, policy, **kwargs):
+        """Rollout limits for a resolved ``OperatingPolicy``."""
+        return cls(n_commit=policy.n_commit, confidence=policy.confidence, **kwargs)
 
 
 def trace_history(path, size):
@@ -54,7 +53,7 @@ def trace_history(path, size):
 
 
 def advance_trace_path(path, frame, points, commit, heading_start, shape, params,
-                       travelled=0., loop_start=0, *, would_stop=False):
+                       travelled=0., loop_start=0):
     """Shared committed geometry for inference and live training; no CT or labels.
 
     The caller applies commit_prefix first and resolves the returned heading's
@@ -96,13 +95,9 @@ def advance_trace_path(path, frame, points, commit, heading_start, shape, params
     travelled += float(arclength(last_segment)[-1])
     old_size = len(path)
     path = np.concatenate([path, new])
-    heading = np.asarray(frame)[:, 2]
-    if would_stop:
-        heading_start = len(path)
-    else:
-        if heading_start >= old_size:
-            heading_start = old_size+first_connection_count-1
-        heading = trace_heading(path, heading_start, heading)
+    if heading_start >= old_size:
+        heading_start = old_size+first_connection_count-1
+    heading = trace_heading(path, heading_start, np.asarray(frame)[:, 2])
     return dict(path=path, last_segment=last_segment, travelled=travelled,
                 heading_start=heading_start, heading=heading), ''
 
@@ -123,6 +118,23 @@ class ModelTracer:
 
     def close(self):
         self.pool.shutdown(wait=True)
+
+    def forward(self, x, hist, hmask, sampling):
+        """Model outputs for the active rows, in ``forward_chunk`` row chunks when set."""
+        chunk = self.p.forward_chunk or len(hist)
+        def rows(value, part):
+            if isinstance(value, dict):
+                return {k: rows(v, part) for k, v in value.items()}
+            return value[part] if torch.is_tensor(value) and value.ndim and len(value) == len(hist) else value
+        outputs = []
+        for start in range(0, len(hist), chunk):
+            part = slice(start, start+chunk)
+            with torch.autocast('cuda', dtype=torch.bfloat16, enabled=self.device.startswith('cuda')):
+                outputs.append(self.model(rows(x, part), hist[part], hmask[part], **rows(sampling, part)))
+        if len(outputs) == 1:
+            return outputs[0]
+        return {k: torch.cat([o[k] for o in outputs]) for k in outputs[0]
+                if torch.is_tensor(outputs[0][k]) and outputs[0][k].ndim}
 
     def map(self, fn, values):
         """Per-trace CPU work in the tracer's pool; results keep input order."""
@@ -206,8 +218,6 @@ class ModelTracer:
         active = np.ones(n, bool)
         reasons = ['']*n
         length = np.zeros(n)
-        exploration = np.full(n, -1, int)
-        stop_streak = np.zeros(n, int)
         last_segment = [np.asarray([p[-1]]) for p in paths]
         pp = self.p
         while active.any():
@@ -238,8 +248,7 @@ class ModelTracer:
             if (hasattr(self.model, 'select_prediction')
                     or getattr(self.model.cfg, 'candidate_selection', 'prefix') == 'stop_fallback'):
                 sampling.update(confidence_threshold=pp.confidence,n_commit=pp.n_commit)
-            with torch.autocast('cuda', dtype=torch.bfloat16, enabled=self.device.startswith('cuda')):
-                out = self.model(x, tensor(hist).float(), tensor(hm), **sampling)
+            out = self.forward(x, tensor(hist).float(), tensor(hm), sampling)
             commits, allowed = commit_prefix(out['points'], out['confidence'], pp.confidence, pp.n_commit,
                                              self.model.cfg.max_recovery_distance)
             commits, allowed = [v.cpu().numpy() for v in (commits, allowed)]
@@ -251,12 +260,11 @@ class ModelTracer:
                 conf = np.minimum.accumulate(confidence[j], axis=-1)
                 commit = int(commits[j])
                 recovery_blocked = not allowed[j]
+                # Same-position refinement is already exhausted inside the model: a
+                # rejected decision stops the trace immediately; nothing is forced.
                 would_stop = commit == 0
-                if would_stop and not recovery_blocked and exploration[i] < 0 and pp.explore_calls:
-                    exploration[i] = 0
-                exploratory = exploration[i] >= 0
                 state = dict(pos=pos[j].copy(), frame=fr[j].copy(), hist=hist_world[j].copy(), hmask=hm[j].copy(),
-                             points=points[j].copy(), confidence=conf.copy(), n_commit=commit, would_stop=would_stop, exploratory=exploratory,
+                             points=points[j].copy(), confidence=conf.copy(), n_commit=commit, would_stop=would_stop,
                              recovery_allowed=bool(allowed[j]), recovery_blocked=bool(recovery_blocked),
                              travelled=float(length[i]), last_segment=last_segment[i].copy(),
                              observed_path=np.asarray(paths[i]).copy(),
@@ -269,22 +277,12 @@ class ModelTracer:
                 if recovery_blocked:
                     active[i], reasons[i] = False, 'recovery_limit'
                     continue
-                if exploratory and exploration[i] >= pp.explore_calls:
-                    active[i], reasons[i] = False, 'exploration_limit'
+                if would_stop:
+                    active[i], reasons[i] = False, 'confidence'
                     continue
-                if would_stop and not exploratory:
-                    stop_streak[i] += 1
-                    if stop_streak[i] >= pp.stop_patience:
-                        active[i], reasons[i] = False, 'confidence'
-                        continue
-                elif not would_stop:
-                    stop_streak[i] = 0
-                if exploratory:
-                    exploration[i] += 1
-                commit = max(1, commit)
                 advanced, reason = advance_trace_path(
                     paths[i], fr[j], points[j], commit, int(heading_start[i]),
-                    self.vol.shape, pp, length[i], hist_start[i], would_stop=would_stop)
+                    self.vol.shape, pp, length[i], hist_start[i])
                 if advanced is None:
                     active[i], reasons[i] = False, reason
                     continue
@@ -292,8 +290,7 @@ class ModelTracer:
                 last_segment[i] = advanced['last_segment']
                 length[i] = advanced['travelled']
                 heading_start[i] = advanced['heading_start']
-                if not would_stop:
-                    reframe[i] = advanced['heading']
+                reframe[i] = advanced['heading']
                 if abort is not None and abort(int(i), paths[i]):
                     active[i], reasons[i] = False, 'abort'
                 elif length[i] >= pp.max_len-1e-6:

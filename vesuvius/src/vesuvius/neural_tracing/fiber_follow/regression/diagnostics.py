@@ -1,4 +1,4 @@
-"""Additive decision diagnostics on the original fiber, including drift strata."""
+"""Additive decision diagnostics on the original fiber, by state class and displacement."""
 import math
 
 import torch
@@ -7,6 +7,9 @@ import torch.nn.functional as F
 from vesuvius.neural_tracing.fiber_follow.shared.policy import DIAGNOSTIC_THRESHOLDS, commit_prefix, recovery_allowed
 from vesuvius.neural_tracing.fiber_follow.shared.labels import prefix_labels
 from vesuvius.neural_tracing.fiber_follow.regression.model import select_refinement
+from vesuvius.neural_tracing.fiber_follow.shared.state_labels import (
+    DISPLACEMENT_STRATA, SUPERVISION, TERMINAL, displacement_stratum,
+)
 from vesuvius.neural_tracing.fiber_follow.regression.supervision import (
     commit_window, dense_commit_mask, geometry_mask,
 )
@@ -21,10 +24,7 @@ def decision_rows(output, batch, cfg, n_commit=None, tolerance=1.5, thresholds=D
     output = select_refinement(output, cfg, n_commit=window)
     points = output['points']
     labels, known, _ = prefix_labels(points, batch, tolerance, cfg.max_recovery_distance)
-    identity_observable = batch.get('identity_observable', torch.ones(len(points), dtype=torch.bool)).bool()
-    known = known*identity_observable[:, None]
-    annotated = batch['dense_mask'].bool() & ~batch['offtrack'][:, None].bool()
-    annotated &= identity_observable[:, None]
+    annotated = batch['dense_mask'].bool() & batch['geometry_valid'][:, None].bool()
     observable = geometry_mask(batch, cfg)
     near = dense_commit_mask(observable.shape[1], cfg, window, points.device)
     mask = observable & near
@@ -39,14 +39,12 @@ def decision_rows(output, batch, cfg, n_commit=None, tolerance=1.5, thresholds=D
         chosen = select_refinement(output, cfg, threshold, window)
         counts, _ = commit_prefix(chosen['points'], chosen['confidence'], threshold, window, cfg.max_recovery_distance)
         gate_labels, gate_known, _ = prefix_labels(chosen['points'], batch, tolerance, cfg.max_recovery_distance)
-        policies[str(threshold)] = counts, gate_labels, gate_known*identity_observable[:, None]
+        policies[str(threshold)] = counts, gate_labels, gate_known
     rows = []
     for i in range(len(points)):
-        drift = None
-        if identity_observable[i] and 'gt_history' in batch and batch['gt_history_mask'][i, 0] > 0:
-            value = float(batch['gt_history'][i, 0].norm())
-            drift = value if math.isfinite(value) else None
-        row = dict(drift=drift, departed=bool(identity_observable[i] and batch['offtrack'][i]), states=1,
+        distance = float(batch['match_distance'][i])
+        row = dict(displacement=displacement_stratum(distance) if math.isfinite(distance) else 'unknown',
+                   state=SUPERVISION[int(batch['supervision'][i])], states=1,
                    history_points=int(batch['hmask'][i].sum()),
                    first_confidence_sum=float(output['confidence'][i, 0]),
                    first_known=int(known[i, 0]), first_correct=int(known[i, 0]*labels[i, 0]),
@@ -72,25 +70,22 @@ def decision_rows(output, batch, cfg, n_commit=None, tolerance=1.5, thresholds=D
                 accepted_known=int(assessed),
                 accepted_wrong=int(assessed and not gate_labels[i, count-1]),
                 accepted_unknown=int(count > 0 and not assessed),
-                departed_continues=int(row['departed'] and count > 0))
+                terminal_continues=int(int(batch['supervision'][i]) == TERMINAL and count > 0))
         rows.append(row)
     return rows
 
 
 def summarize_decisions(rows, n_commit):
-    """Pool numerators/counts before dividing, including empty drift bands."""
-    groups = {'all': rows}
-    for name, lo, hi in (('<1', 0, 1), ('1-1.5', 1, 1.5), ('1.5-2', 1.5, 2),
-                         ('2-3.5', 2, 3.5), ('>=3.5', 3.5, float('inf'))):
-        groups[name] = [r for r in rows if not r['departed'] and r['drift'] is not None and lo <= r['drift'] < hi]
-    groups['unknown'] = [r for r in rows if not r['departed'] and r['drift'] is None]
-    groups['departed'] = [r for r in rows if r['departed']]
+    """Pool numerators/counts before dividing, including empty strata."""
+    by_state = {'all': rows, **{name: [r for r in rows if r['state'] == name] for name in SUPERVISION}}
+    by_displacement = {name: [r for r in rows if r['displacement'] == name]
+                       for name in [s[0] for s in DISPLACEMENT_STRATA]+['unknown']}
     history_groups = {name: [r for r in rows if lo <= r['history_points'] <= hi]
                       for name, lo, hi in (('0', 0, 0), ('1-8', 1, 8), ('9-32', 9, 32), ('>32', 33, math.inf))}
 
     def add(total, row):
         for key, value in row.items():
-            if key in ('drift', 'departed', 'history_points'):
+            if key in ('displacement', 'state', 'history_points'):
                 continue
             if isinstance(value, dict):
                 add(total.setdefault(key, {}), value)
@@ -106,34 +101,6 @@ def summarize_decisions(rows, n_commit):
             sums[stage+'_error_mean'] = sums[stage+'_error_sum']/count if count else None
         sums['first_confidence_mean'] = sums.get('first_confidence_sum', 0)/len(members) if members else None
         return sums
-    return dict(n_commit=n_commit, by_drift={name: summarize(members) for name, members in groups.items()},
+    return dict(n_commit=n_commit, by_state={name: summarize(members) for name, members in by_state.items()},
+                by_displacement={name: summarize(members) for name, members in by_displacement.items()},
                 by_history={name: summarize(members) for name, members in history_groups.items()})
-
-
-
-@torch.no_grad()
-def candidate_decisions(output, batch, cfg, n_commit=None):
-    """Counts for the deployed prefix classifier on supplied candidate curves."""
-    window = commit_window(cfg, n_commit)-1
-    confidence = output['candidate_confidence_logits'].float().sigmoid().cummin(-1).values[:, :, window]
-    known = batch['candidate_mask'][:, :, window].bool()
-    positive = batch['candidate_labels'][:, :, window].bool()
-    accepted = confidence >= .5
-    kind, tail = batch['decision_kind'], batch['decision_tail']
-    groups = {'all': kind > 0, 'choice': kind == 1, 'departed': kind == 2, 'own_tail': kind == 3}
-    for name, lo, hi in (('tail_1_16', 0, 16), ('tail_17_48', 16, 48), ('tail_49_96', 48, 96), ('tail_97_plus', 96, float('inf'))):
-        groups[name] = (kind > 0) & (tail > lo) & (tail <= hi)
-    rows = {}
-    for name, member in groups.items():
-        pos = known & positive & member[:, None]
-        neg = known & ~positive & member[:, None]
-        rows[name] = dict(states=int(member.sum()), positive=int(pos.sum()), negative=int(neg.sum()),
-                          accepted_positive=int((pos & accepted).sum()), rejected_negative=int((neg & ~accepted).sum()),
-                          positive_confidence_sum=float(confidence[pos].sum()), negative_confidence_sum=float(confidence[neg].sum()))
-    return rows
-
-
-def summarize_candidates(groups):
-    return {name: dict(row, correct_acceptance=row['accepted_positive']/row['positive'] if row['positive'] else None,
-                       wrong_rejection=row['rejected_negative']/row['negative'] if row['negative'] else None)
-            for name, row in groups.items()}

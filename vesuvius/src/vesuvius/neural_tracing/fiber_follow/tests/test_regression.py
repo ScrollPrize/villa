@@ -17,6 +17,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.data import FollowDataset, Samp
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, crop_local_grid, sample_oriented_fast
 from vesuvius.neural_tracing.fiber_follow.shared.runloop import training_rng_state, resume_training
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolumeSpec
+from label_fixtures import set_terminal, state_labels
 
 
 def config():
@@ -32,7 +33,7 @@ def batch(cfg, b=2):
     return dict(x=slab_inputs(b) | {name: torch.rand(b, 2, crop.depth, crop.width, crop.width)
                    for name, crop in (('fine', cfg.fine),)},
                 hist=hist, hmask=torch.ones(b, cfg.n_history), dense_ab=torch.ones(b, q, 2),
-                dense_mask=torch.ones(b, q), offtrack=torch.zeros(b), endpoint_known=torch.zeros(b),
+                dense_mask=torch.ones(b, q), **state_labels(b), endpoint_known=torch.zeros(b),
                 end_local=torch.zeros(b, 3), source=torch.zeros(b))
 
 
@@ -86,7 +87,7 @@ def test_masked_history_nan_and_no_history_are_safe_and_gt_is_not_an_input():
 def test_departures_unknown_ends_and_crop_censoring():
     m = DirectFollower(config())
     b = batch(m.cfg, 3)
-    b['offtrack'][0] = 1
+    set_terminal(b, 0)
     b['dense_mask'][1] = 0
     b['dense_ab'][1] = float('nan')
     b['dense_ab'][2, 4, 0] = 100
@@ -116,7 +117,7 @@ def test_microbatch_partition_keeps_objective_and_update():
     bmodel = copy.deepcopy(a)
     data = batch(cfg, 3)
     data['dense_mask'][0, 5:] = 0
-    data['offtrack'][1] = 1
+    set_terminal(data, 1)
     data['source'] = torch.tensor([3, 0, 3])
     data['bank_tail_length'] = torch.tensor([16., 0., 128.])
     def take(value, sl):
@@ -418,7 +419,7 @@ def test_decision_metrics_score_actual_commits_censor_unknowns_and_pool_counts()
     b['gt_history'] = torch.zeros(5, 1, 3)
     b['gt_history'][:, 0, 0] = torch.tensor([.5, 1.25, 1.75, 2.5, 0.])
     b['gt_history_mask'] = torch.ones(5, 1)
-    b['offtrack'][4] = 1
+    set_terminal(b, 4)
     b['gt_history_mask'][4] = 0
     b['dense_mask'][3] = 0
     points = torch.zeros(5, 4, 3)

@@ -1,4 +1,4 @@
-"""Continuous trusted-bank contacts, replay provenance, and geometric difficulty."""
+"""Continuous trusted-bank contacts, collector events and replay provenance, geometric difficulty."""
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -6,15 +6,15 @@ import numpy as np
 import pytest
 
 from test_neighbor_bank import make_bank, add_shard, publish
-from test_neighbor_following import clean_sample
+from sampling_fixtures import clean_sample
 from vesuvius.neural_tracing.fiber_follow.regression.bank_geometry import (
     difficulty_scores, first_foreign_contact, tube_intervals, BankSwitchDetector,
 )
 from vesuvius.neural_tracing.fiber_follow.regression.model import DirectConfig
-from vesuvius.neural_tracing.fiber_follow.regression.data import IdentitySampling
-from vesuvius.neural_tracing.fiber_follow.shared.collect import DecisionCollector, append_traces, track_arrays
-from vesuvius.neural_tracing.fiber_follow.shared.data import (
-    OnPolicyStates, FollowDataset, fiber_manifest, replay_pools, TracedFiber,
+from vesuvius.neural_tracing.fiber_follow.shared.collect import DecisionCollector, append_traces, collected_states
+from vesuvius.neural_tracing.fiber_follow.shared.data import OnPolicyStates, TracedFiber
+from vesuvius.neural_tracing.fiber_follow.shared.state_labels import (
+    FOLLOWING, REASON, REPLAY_CLASS, TERMINAL,
 )
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength, frame_from_heading
 
@@ -67,12 +67,19 @@ def decision(pos, travelled, previous=None, *, stop=False, reverse=False):
     cfg = DirectConfig()
     return dict(pos=pos, frame=frame_from_heading(heading),
         hist=pos-np.arange(1, cfg.n_history+1)[:, None]*heading,
-        hmask=np.ones(cfg.n_history), exploratory=False, would_stop=stop,
+        hmask=np.ones(cfg.n_history), would_stop=stop, n_commit=0 if stop else 4,
+        points=np.zeros((cfg.n_future, 3)), confidence=np.ones(cfg.n_future), heading_start=0,
+        seed_pos=pos if previous is None else np.asarray(previous, float), seed_tangent=heading, seed_age=travelled,
+        seed_valid=True, observed_path=np.array([pos] if previous is None else [previous, pos]),
         travelled=travelled, last_segment=np.array([pos] if previous is None else [previous, pos]))
 
 
+def provenance():
+    return dict(step=1000, cache_id='test', volume=dict(grid_scale=8.))
+
+
 @pytest.mark.parametrize('reverse', [False, True])
-def test_close_neighbor_switch_is_labeled_before_distance_departure_and_saved(tmp_path, reverse):
+def test_close_neighbor_switch_is_terminal_before_distance_departure_and_saved(tmp_path, reverse):
     bank, parent = make_bank(tmp_path/'bank')
     publish(bank.root, [add_shard(bank.root, 0, x=3., z_range=(20., 180.))])
     cfg = clean_sample(DirectConfig())
@@ -81,44 +88,57 @@ def test_close_neighbor_switch_is_labeled_before_distance_departure_and_saved(tm
     collector = DecisionCollector(parent, 0, start, sign, cfg,
                                   bank_detector=BankSwitchDetector([bank]))
     a, b = np.array([0., 0., start]), np.array([3., 0., start+sign*8])
-    assert collector(decision(a, 0., reverse=reverse))
-    assert collector(decision(b, np.linalg.norm(b-a), a, reverse=reverse))
+    first = decision(a, 0., reverse=reverse)
+    second = decision(b, np.linalg.norm(b-a), a, reverse=reverse)
+    second['seed_pos'] = a
+    assert collector(first)
+    assert collector(second)
     before, after = collector.rows
-    assert before['failure_kind'] == 4 and not before['offtrack']
-    assert after['failure_kind'] == 1 and after['offtrack']
+    assert before['supervision'] == FOLLOWING and before['pre_excursion'] and before['event_id'] == after['event_id']
+    # Certified contact is terminal while the head is still within the departure distance.
+    assert after['supervision'] == TERMINAL and after['supervision_reason'] == REASON['switch']
+    assert after['match_distance'] <= 3. and after['switched']
     np.testing.assert_array_equal(collector.track, np.stack((a,b)))
     assert [r['prefix_end'] for r in collector.rows] == [1,2]
-    assert after['switch_decision'] == 0
     np.testing.assert_allclose(after['switch_pos'], [2.25, 0., start+sign*6])
     assert after['switch_distance'] == pytest.approx(np.linalg.norm(b-a)*.75)
     assert after['switch_bank_path'].endswith('shards/0000#0')
     assert after['switch_bank_run'] == bank.run['digest']
     rows, track = [], []
     append_traces([collector], rows, track)
-    states = OnPolicyStates(manifest=fiber_manifest([parent]),
-        **{k: np.asarray([row[k] for row in rows]) for k in
-           OnPolicyStates.FIELDS+tuple(OnPolicyStates.OPTIONAL)+tuple(OnPolicyStates.ROW_TRACK)},
-        **track_arrays(track))
+    assert [r['replay_class'] for r in rows] == [REPLAY_CLASS['pre_excursion'], REPLAY_CLASS['terminal']]
+    states = collected_states(rows, track, [parent], provenance())
     path = tmp_path/'replay.npz'
     states.save(path)
     loaded = OnPolicyStates.load(path)
-    np.testing.assert_array_equal(loaded.failure_kind, [4, 1])
+    np.testing.assert_array_equal(loaded.supervision, [FOLLOWING, TERMINAL])
     np.testing.assert_array_equal(loaded.switch_pos, states.switch_pos)
     np.testing.assert_array_equal(loaded.switch_bank_path, states.switch_bank_path)
     np.testing.assert_array_equal(loaded.observed_prefix(1), np.stack((a,b)))
     np.testing.assert_array_equal(loaded.observed_prefix(0), a[None])
 
 
-def test_premature_stopping_and_real_endpoint_overshoot_are_distinct(tmp_path):
+def test_premature_stop_and_physical_endpoint_overshoot_are_distinct(tmp_path):
     _, parent = make_bank(tmp_path)
     parent = replace(parent, endpoint_stop=(True, True))
     cfg = clean_sample(DirectConfig())
     collector = DecisionCollector(parent, 0, 150., 1, cfg)
     assert collector(decision([0, 0, 150], 0, stop=True))
-    assert collector.rows[-1]['failure_kind'] == 2
-    assert not collector.rows[-1]['offtrack']
+    stop = collector.rows[-1]
+    assert stop['would_stop'] and stop['supervision'] == FOLLOWING and stop['geometry_valid']
     assert collector(decision([0, 0, 202], 52, [0, 0, 150]))
-    assert collector.rows[-1]['failure_kind'] == 3 and collector.rows[-1]['offtrack']
+    overshoot = collector.rows[-1]
+    assert overshoot['supervision'] == TERMINAL and overshoot['supervision_reason'] == REASON['endpoint']
+    rows = collector.finish()
+    assert [r['replay_class'] for r in rows] == [REPLAY_CLASS['premature_stop'], REPLAY_CLASS['terminal']]
+
+
+def test_unannotated_end_censors_the_episode(tmp_path):
+    _, parent = make_bank(tmp_path)
+    collector = DecisionCollector(parent, 0, 150., 1, clean_sample(DirectConfig()))
+    assert collector(decision([0, 0, 150], 0))
+    assert not collector(decision([0, 0, 202], 52, [0, 0, 150]))
+    assert collector.censored == 'unannotated' and len(collector.rows) == 1
 
 
 def test_terminal_commit_keeps_event_without_inventing_decision(tmp_path):
@@ -129,120 +149,9 @@ def test_terminal_commit_keeps_event_without_inventing_decision(tmp_path):
     assert collector(decision([0,0,50], 0.))
     collector.observe_final_path(np.array([[0.,0.,50.], [3.,0.,58.]]))
     assert len(collector.rows) == 1 and len(collector.track) == 2
-    assert collector.rows[0]['failure_kind'] == 4 and not collector.rows[0]['offtrack']
-    np.testing.assert_allclose(collector.rows[0]['switch_pos'], [2.25,0,56])
-
-
-def replay_fixture():
-    # Unequal row counts should not overwhelm rarer failure types or fibers.
-    kinds = np.r_[np.zeros(40, int), np.ones(100, int), [2, 3, 4]]
-    n = len(kinds)
-    return OnPolicyStates(manifest=[], failure_kind=kinds,
-        fiber_idx=np.r_[np.zeros(90, int), np.ones(n-90, int)], t=np.zeros(n), reverse=np.zeros(n, bool),
-        pos=np.zeros((n,3)), frame=np.tile(np.eye(3), (n,1,1)), hist=np.zeros((n,1,3)), hmask=np.ones((n,1)),
-        offtrack=(kinds == 1) | (kinds == 3), hard=np.ones(n, bool), exploratory=np.zeros(n, bool),
-        drift=np.tile([.5,1.25,1.75,2.5], (n+3)//4)[:n])
-
-
-def test_failure_replay_balances_categories_then_fibers_with_drift_budget():
-    op = replay_fixture()
-    ds = FollowDataset([SimpleNamespace(length=100.)], None, None, None, fresh_fraction=0.,
-                       batch_builder=SimpleNamespace(sampling=IdentitySampling(replay_failure_fraction=.5)))
-    ds.recent_pools = replay_pools([op], failures=True)
-    rng = np.random.default_rng(8)
-    counts = np.zeros(9)
-    switches = np.zeros(2)
-    for _ in range(12000):
-        _, band, cache, row = ds.draw_replay(rng)
-        counts[band] += 1
-        if band == 5:
-            switches[cache.fiber_idx[row]] += 1
-    assert counts[:4].sum()/counts.sum() == pytest.approx(.5, abs=.02)
-    np.testing.assert_allclose(counts[5:]/counts.sum(), [.125]*4, atol=.015)
-    assert switches[0]/switches.sum() == pytest.approx(.5, abs=.04)
-    # Exhausted failure category falls back to drift, not fabricated negatives.
-    ds.recent_pools[4:] = [{} for _ in range(5)]
-    assert all(ds.draw_replay(rng)[1] < 4 for _ in range(100))
-
-
-@pytest.mark.parametrize('failures', [False, True])
-def test_correct_replay_excludes_seeds_departures_exploration_and_failure_windows(failures):
-    op = replay_fixture()
-    op.hard[:] = False
-    op.travelled[:] = 32.
-    op.seq_start[:] = 0
-    op.seq_end[:] = 8
-    op.hard[0] = True
-    op.exploratory[1] = True
-    op.offtrack[2] = True
-    op.travelled[3] = 0.  # Annotated seed, no model decisions yet.
-    op.travelled[4] = np.nan
-    op.seq_start[5] = -1
-    op.seq_end[6] = 1
-    op.drift[7] = np.nan
-    pools = replay_pools([op], failures=failures, correct_only=True)
-    selected = {int(i) for pool in pools for entries in pool.values() for _, indices in entries for i in indices}
-    assert selected == set(range(8, 40))
-    assert not any(pools[4:])
-    # Even a request for 100% failure replay cannot reintroduce excluded rows.
-    ds = FollowDataset([SimpleNamespace(length=100.)], None, None, None, fresh_fraction=0.,
-        correct_replay_only=True,
-        batch_builder=SimpleNamespace(sampling=IdentitySampling(replay_failure_fraction=1.)))
-    ds.recent_pools = pools
-    rng = np.random.default_rng(4)
-    assert all(ds.draw_replay(rng)[3] in selected for _ in range(100))
-    ds.recent_pools = [dict() for _ in pools]
-    assert ds.draw_replay(rng) is None
-
-
-def test_legacy_cache_without_failure_fields_defaults_to_existing_labels(tmp_path):
-    op = replay_fixture()
-    op.failure_kind[:] = 0
-    path = tmp_path/'legacy.npz'
-    op.save(path)
-    # Mimic old archives that predate all switch/failure metadata.
-    with np.load(path) as archive:
-        data = {k:archive[k] for k in archive.files if not k.startswith('switch_') and k not in ('failure_kind','travelled')}
-    np.savez(path, **data)
-    loaded = OnPolicyStates.load(path)
-    assert not loaded.failure_kind.any() and (loaded.switch_decision == -1).all()
-    assert np.isnan(loaded.switch_pos).all()
-    assert replay_pools([loaded], failures=True)[4]
-    np.testing.assert_array_equal(loaded.offtrack, op.offtrack)
-
-
-def test_continuation_replay_mix_and_safe_fallbacks(monkeypatch):
-    op = replay_fixture()
-    op.hard[:40] = False
-    op.travelled[:] = 32.
-    op.seq_start[:] = 0
-    op.seq_end[:] = 8
-    op.travelled[0] = 0.
-    op.exploratory[1] = True
-    op.hard[2] = True
-    ds = FollowDataset([SimpleNamespace(length=100.)], None, None, None,
-        fresh_fraction=0., replay_continuation_fraction=.8)
-    monkeypatch.setattr(ds, '_validate', lambda caches: None)
-    ds._set_replay([op])
-    rng = np.random.default_rng(9)
-    correct = 0
-    for _ in range(10000):
-        source, band, cache, j = ds.draw_replay(rng, force=True)
-        assert source == 2 and cache is op
-        if band < 4:
-            assert 3 <= j < 40 and not cache.offtrack[j] and not cache.exploratory[j]
-            correct += 1
-        else:
-            assert cache.failure_kind[j] > 0 or cache.offtrack[j]
-    assert correct/10000 == pytest.approx(.8, abs=.015)
-    # Missing failures may become correct continuation, never the reverse.
-    ds.recent_pools = [dict() for _ in ds.recent_pools]
-    assert all(ds.draw_replay(rng, force=True)[1] < 4 for _ in range(100))
-    ds._set_replay([op])
-    ds.continuation_pools = [dict() for _ in ds.continuation_pools]
-    draws = [ds.draw_replay(rng, force=True) for _ in range(1000)]
-    assert sum(d is None for d in draws)/1000 == pytest.approx(.8, abs=.04)
-    assert all(d is None or d[1] >= 4 for d in draws)
+    assert collector.rows[0]['supervision'] == FOLLOWING and collector.rows[0]['pre_excursion']
+    assert collector.labeler.switch is not None
+    np.testing.assert_allclose(collector.labeler.switch['switch_pos'], [2.25,0,56])
 
 
 def test_difficulty_is_orientation_invariant_and_ranks_near_similar_curved_converging():
@@ -272,43 +181,3 @@ def test_hard_sampling_keeps_uniform_support_and_does_not_change_bank(tmp_path):
     assert set(hard) == {3., 24.}
     assert np.mean(np.asarray(hard) == 3.) > np.mean(np.asarray(uniform) == 3.)
     assert bank.provenance() == before
-
-
-def test_natural_switch_pool_requires_nonexploratory_switch_on_same_trace():
-    op = replay_fixture()
-    op.seq_start[:] = -1
-    op.travelled[:] = 32.
-    op.failure_kind[:8] = [4, 1, 4, 1, 4, 1, 4, 0]
-    op.offtrack[:8] = [False, True, False, True, False, True, False, False]
-    op.seq_start[:8] = [0, 0, 10, 10, 20, 20, 30, 40]
-    op.seq_end[:8] = op.seq_start[:8]+5
-    op.exploratory[3] = True  # Its earlier clean prefix is not a natural-switch example.
-    op.seq_end[5] = 20  # Missing recorded switched prefix cannot certify its earlier row.
-    pools = replay_pools([op], failures=True, natural_switch_only=True)
-    selected = {int(j) for pool in pools for entries in pool.values() for _, idx in entries for j in idx}
-    assert selected == {0, 1}
-    assert set(pools[5]) == set(pools[8]) == {0}
-
-
-@pytest.mark.parametrize('status', ['available', 'missing', 'rejected'])
-def test_wrong_turn_prefers_real_and_falls_back_to_synthetic(monkeypatch, status):
-    calls = []
-    builder = SimpleNamespace(memory_switch=lambda cfg, rng: calls.append('synthetic') or dict(source=3))
-    ds = FollowDataset([SimpleNamespace(length=100.)], None, None, None,
-                       batch_builder=builder, prefer_real_wrong_turns=True)
-    op = replay_fixture()
-    if status != 'missing':
-        ds.wrong_turn_pools[5] = {0: [(op, np.array([40]))]}
-    def replay(draw, rng):
-        assert draw[0] == 3 and draw[1] == 5
-        calls.append('real')
-        return dict(source=3, failure_kind=1) if status == 'available' else None
-    monkeypatch.setattr(ds, 'replay_item', replay)
-    monkeypatch.setattr(ds, 'prepare', lambda item, rng: item)
-    monkeypatch.setattr(ds, 'state_allowed', lambda item: True)
-    item = ds.wrong_turn_item(np.random.default_rng(7))
-    assert item['source'] == 3
-    if status == 'available':
-        assert calls == ['real'] and item['real_wrong_turn'] and not item['real_wrong_turn_pre_switch']
-    else:
-        assert calls[-1] == 'synthetic' and not item.get('real_wrong_turn', False)

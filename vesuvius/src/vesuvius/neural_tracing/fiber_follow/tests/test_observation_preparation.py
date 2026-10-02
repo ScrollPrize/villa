@@ -8,9 +8,8 @@ import torch
 
 from test_identity import config
 from test_neighbor_bank import make_bank, add_shard, publish
-from test_neighbor_following import clean_sample
+from sampling_fixtures import clean_sample
 from vesuvius.neural_tracing.fiber_follow.regression.data import IdentityObservationBuilder, IdentitySampling
-from vesuvius.neural_tracing.fiber_follow.regression.supervision import candidate_targets
 from vesuvius.neural_tracing.fiber_follow.regression.train import DecisionBatchPrefetch
 from vesuvius.neural_tracing.fiber_follow.shared.data import make_sample
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
@@ -23,19 +22,16 @@ def test_sparse_targets_preserve_images_labels_and_sampling_feedback(tmp_path, m
     bank, fiber = make_bank(tmp_path)
     publish(tmp_path, [add_shard(tmp_path, 0, x=4., z_range=(20., 180.))])
     cfg = config(direction_inputs=True, fine=CropSpec(depth=40, width=25, behind=16, spacing=1.))
-    sampling = IdentitySampling(decision_fraction=.5)
+    sampling = IdentitySampling()
     full = IdentityObservationBuilder(cfg, [fiber], negative_bank=bank, augment=True, sampling=sampling)
     sparse = IdentityObservationBuilder(cfg, [fiber], negative_bank=bank, augment=True, sampling=sampling)
     rng = np.random.default_rng(782)
     items = []
-    for j, source in enumerate((0, 2, 0, 5)):
+    for j, source in enumerate((0, 2, 0, 3)):
         row = make_sample(fiber, 80.+j, False, clean_sample(cfg), rng)
-        row.update(source=source, source_step=-1, stratum=-1, fiber_ref=(0, 80.+j, False), memory_warm=True)
+        row.update(source=source, source_step=-1, fiber_ref=(0, 80.+j, False), memory_warm=True)
         full.prepare(row, fiber, rng)
         row.update(photometric=(1.1, .03, .02), blur_sigma=.8, drop_presence=j == 2)
-        if j < 2:
-            row['candidate_points'] = np.repeat(row['fut_local'][None], 4, axis=0)
-            row['candidate_mask'] = np.ones((4, cfg.n_future), np.float32)
         items.append(row)
     def images(rows, vol, crop, pool=None, **kwargs):
         image = torch.linspace(0., 1., 8*crop.depth*crop.width**2).reshape(8, crop.depth, crop.width, crop.width)
@@ -62,12 +58,8 @@ def test_sparse_targets_preserve_images_labels_and_sampling_feedback(tmp_path, m
         for key, value in reference.items():
             if key != 'x':
                 torch.testing.assert_close(got[key][selected], value[selected], rtol=0, atol=0)
-        labels, known = candidate_targets(reference, cfg, sampling.candidate_tolerance)
-        torch.testing.assert_close(got['candidate_mask'][selected], known[selected], rtol=0, atol=0)
-        valid = known[selected].bool()
-        torch.testing.assert_close(got['candidate_labels'][selected][valid], labels[selected][valid], rtol=0, atol=0)
     else:
-        assert not {'foreign', 'dense_ab', 'dense_mask', 'candidate_points', 'candidate_labels', 'fut'} & got.keys()
+        assert not {'foreign', 'dense_ab', 'dense_mask', 'fut'} & got.keys()
 
 
 

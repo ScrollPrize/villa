@@ -40,21 +40,16 @@ def synthetic_decisions(cfg, count=6, seed=194, ages=None):
         q = 4*(cfg.n_future-1)+1
         batch = dict(x=x, hist=hist, hmask=(torch.arange(cfg.n_history)[None] < age).float(),
             dense_ab=torch.zeros(1, q, 2), dense_mask=torch.ones(1, q),
-            offtrack=torch.zeros(1), endpoint_known=torch.zeros(1), end_local=torch.zeros(1, 3), source=torch.zeros(1),
+            terminal=torch.zeros(1), geometry_valid=torch.ones(1, dtype=torch.bool),
+            confidence_valid=torch.ones(1, dtype=torch.bool), supervision=torch.zeros(1, dtype=torch.long),
+            endpoint_known=torch.zeros(1), end_local=torch.zeros(1, 3), source=torch.zeros(1),
             foreign=torch.zeros(1, cfg.fine.depth, cfg.fine.width, cfg.fine.width, dtype=torch.uint8))
-        # Same supplied-candidate count as the old six-decision / two-endpoint benchmark.
-        if j >= count-2:
-            curves = torch.zeros(1, 4, cfg.n_future, 3)
-            curves[..., 2] = torch.arange(1, cfg.n_future+1)*cfg.future_step
-            curves[..., 0] = torch.arange(4)[None, :, None]*.5
-            batch.update(candidate_points=curves, candidate_mask=torch.ones(1, 4, cfg.n_future),
-                         candidate_labels=torch.ones(1, 4, cfg.n_future))
         rows.append(batch)
     return rows
 
 
 def decision_microbatches(rows, size):
-    """Group synthetic decisions; absent candidates receive zero supervision."""
+    """Group synthetic decisions into microbatches."""
     if size < 1:
         raise ValueError('Positive microbatch size required')
 

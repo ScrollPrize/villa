@@ -168,7 +168,7 @@ def test_roll_augmentation_keeps_world_geometry_and_pairs_share_it():
 def test_decision_pairs_are_tracer_states_with_identical_local_inputs(tmp_path):
     from test_mixed_datasets import afv_fixture
     from test_identity import config
-    from test_neighbor_following import clean_sample
+    from sampling_fixtures import clean_sample
     from vesuvius.neural_tracing.fiber_follow.regression.identity_decisions import decision_pair
     from vesuvius.neural_tracing.fiber_follow.regression.data import visible_points
     from vesuvius.neural_tracing.fiber_follow.shared.afv import AFVFibers

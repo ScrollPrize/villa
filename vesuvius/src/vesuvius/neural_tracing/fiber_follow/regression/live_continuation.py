@@ -1,7 +1,11 @@
 """Recent training predictions become the next source-local supervised state.
 
 Only small CPU geometry crosses the feedback queues. CT reads and labeling stay
-in loader workers; no model or autograd graph is retained by a chain.
+in loader workers; no model or autograd graph is retained by a chain. A chain
+advances only through prefixes the operating policy accepts, continues through
+following and recoverable states, and ends after retaining a terminal example.
+Starts are restored recorded prefixes (observed path, seed reference, heading
+state, correspondence and historical events) or fresh seed-only states.
 """
 import multiprocessing as mp
 from queue import Empty, Full
@@ -9,13 +13,15 @@ from queue import Empty, Full
 import numpy as np
 import torch
 
-from ..shared.collect import DecisionCollector
-from ..shared.data import label_state, make_sample
+from ..shared.data import SOURCE, label_state
 from ..shared.geometry import frame_from_heading
 from ..shared.heading import FRAME_POLICY, SeedHeadingError, ct_frame, reframe_item
 from ..shared.policy import commit_prefix
 from ..shared.reference import SEED_FIELDS, observed_path
+from ..shared.state_labels import FOLLOWING, RECOVERABLE, TERMINAL, TraceLabeler
 from ..shared.trace import TraceParams, advance_trace_path, trace_history
+
+OUTCOMES = ('advanced', 'stale', 'censored', 'empty')
 
 
 def preserve_live_metadata(batch):
@@ -28,25 +34,24 @@ def preserve_live_metadata(batch):
 
 
 class LiveContinuationSource:
-    def __init__(self, *, steps=(4, 8), capacity=32, max_age=64, n_commit=16,
-                 max_recovery_distance=6., switch_tolerance=.75, own_tolerance=1.5, stratified=False):
+    """Per-source chain queues; chain limits are balanced over three bands of [min, max]."""
+    def __init__(self, *, policy, steps=(12, 32), capacity=32, max_age=64,
+                 switch_tolerance=.75, own_tolerance=1.5, step=None):
         self.steps, self.max_age = tuple(steps), max_age
         if len(self.steps) != 2 or not 1 <= self.steps[0] <= self.steps[1]:
             raise ValueError('Invalid live chain step range')
-        self.stratified = stratified
         self.limit_bands = np.array_split(np.arange(self.steps[0], self.steps[1]+1), min(3, self.steps[1]-self.steps[0]+1))
-        self.params = TraceParams(n_commit=n_commit)
-        self.max_recovery_distance = max_recovery_distance
+        self.policy = policy
+        self.params = TraceParams.from_policy(policy)
         self.switch_tolerance, self.own_tolerance = switch_tolerance, own_tolerance
         ctx = mp.get_context()
         self.chains, self.seeds = ctx.Queue(capacity), ctx.Queue(capacity)
-        self.step = ctx.Value('q', 0)
-        self.limit_cursor = ctx.Value('q', 0) if stratified else None
+        self.step = ctx.Value('q', 0) if step is None else step
+        self.limit_cursor = ctx.Value('q', 0)
         self.detector = None
+        self.outcomes = dict.fromkeys(OUTCOMES, 0)
 
     def draw_limit(self, rng):
-        if not self.stratified:
-            return int(rng.integers(self.steps[0], self.steps[1]+1))
         # One counter per source shared by all loader workers: balance starts,
         # regardless of worker scheduling or how long preceding chains survive.
         with self.limit_cursor.get_lock():
@@ -54,35 +59,32 @@ class LiveContinuationSource:
             self.limit_cursor.value += 1
         return int(rng.integers(int(band[0]), int(band[-1])+1))
 
-    def placeholder(self, dataset, rng, *, light=False):
-        fi = int(rng.choice(len(dataset.fibers), p=dataset.weights))
-        fiber = dataset.fibers[fi]
-        t, reverse = float(rng.uniform(0, fiber.length)), bool(rng.integers(2))
-        item = make_sample(fiber, t, reverse, dataset.cfg, rng)
-        item.update(fiber_ref=(fi, t, reverse), source=0, source_step=-1, stratum=-1,
-                    gt_unperturbed=True, live_requested=True, live_light_slot=light,
-                    live_fallback=True)
-        return dataset.prepare(item, rng)
+    def placeholder(self, dataset, rng, windows):
+        """A chain start that is also a valid training item if no live state is ready."""
+        item = dataset.live_start(rng, windows)
+        item.update(live_requested=True)
+        return item
 
     def metadata(self, item):
-        # Clean sampled states bootstrap chains. Synthetic identity/wrong-turn
-        # rows and old replay never seed the live continuation distribution.
-        if not (item.get('gt_unperturbed') or item.get('live_continuation')):
+        """Chain state for an item the policy may continue from, else None."""
+        if not (item.get('live_start') or item.get('live_continuation')):
             return None
-        if item.get('offtrack', False):
+        if item['supervision'] not in (FOLLOWING, RECOVERABLE) or not item['geometry_valid']:
             return None
         depth = int(item.get('live_depth', 0))
         limit = int(item.get('live_limit', self.steps[1]))
         if depth >= limit:
             return None
-        path = observed_path(item)
         fi, traversal_t, reverse = item['fiber_ref']
+        labeler = item.get('labeler_state') or dict(
+            t=float(item['trace_facts']['t']), last_travelled=float(item.get('travelled', 0.)), bad_run=0,
+            bad_run_start=None, started=True, departure_distance=None, boundary_distance=None, switch=None)
         return dict(pos=np.asarray(item['pos']), frame=np.asarray(item['frame']),
-                    observed_path=path, fiber_idx=fi, traversal_t=traversal_t, reverse=reverse,
+                    observed_path=observed_path(item), fiber_idx=fi, reverse=reverse,
                     heading_start=int(item.get('heading_start', 0)),
-                    loop_start=int(item.get('live_loop_start', len(path)-1)),
-                    travelled=float(item.get('live_travelled', 0.)), depth=depth, limit=limit,
-                    bad_run=int(item.get('live_bad_run', 0)), bad_run_start=item.get('live_bad_run_start'),
+                    loop_start=int(item['live_loop_start']),
+                    travelled=float(labeler['last_travelled']), depth=depth, limit=limit, labeler=labeler,
+                    start=item.get('live_start') or item.get('live_chain_start'),
                     **{key: item[key] for key in SEED_FIELDS})
 
     def publish(self, state):
@@ -92,6 +94,10 @@ class LiveContinuationSource:
             return True
         except Full:
             return False
+
+    def take_outcomes(self):
+        outcomes, self.outcomes = self.outcomes, dict.fromkeys(OUTCOMES, 0)
+        return outcomes
 
     def resolve(self, fallback, dataset, vol, rng):
         # Resolve at image-build time, after geometry lookahead. Planned batches
@@ -103,17 +109,21 @@ class LiveContinuationSource:
                 except Empty:
                     break
                 if self.step.value-state['source_step'] > self.max_age:
+                    self.outcomes['stale'] += 1
                     continue
                 try:
                     item = self.advance(state, dataset, vol, rng)
                 except SeedHeadingError:
                     # As with ordinary sampling, invalid CT orientation/context
                     # rejects this proposal. I/O failures still propagate.
-                    continue
+                    item = None
                 if item is not None:
-                    item['live_requested'] = True
-                    item['live_light_slot'] = fallback.get('live_light_slot', False)
+                    self.outcomes['advanced'] += 1
+                    item.update(live_requested=True, task_requested=fallback['task_requested'],
+                                task_delivered=fallback['task_requested'], task_fallback=0)
                     return item
+                self.outcomes['censored'] += 1
+        self.outcomes['empty'] += 1
         return fallback
 
     def advance(self, state, dataset, vol, rng):
@@ -123,11 +133,13 @@ class LiveContinuationSource:
         if advanced is None:
             return None
         path = advanced['path']
+        if dataset.exclude is not None and np.any((advanced['last_segment'][:, 2] >= dataset.exclude.lo-48)
+                                                  & (advanced['last_segment'][:, 2] < dataset.exclude.hi+48)):
+            return None
         hist, mask = trace_history(path, dataset.cfg.n_history)
         frame = frame_from_heading(advanced['heading'], state['frame'][:, 0])
         fi, reverse = state['fiber_idx'], state['reverse']
         fiber = dataset.fibers[fi]
-        t = fiber.length-state['traversal_t'] if reverse else state['traversal_t']
         if self.detector is None:
             from .bank_geometry import BankSwitchDetector
             builder = dataset.batch_builder
@@ -135,42 +147,36 @@ class LiveContinuationSource:
                 getattr(builder, 'near_negative_bank', None), getattr(builder, 'continuation_bank', None))
                 if b is not None}.values())
             self.detector = BankSwitchDetector(banks, self.switch_tolerance, self.own_tolerance)
-        oracle = DecisionCollector(fiber, fi, t, -1 if reverse else 1, dataset.cfg,
-                                   dataset.exclude, bank_detector=self.detector)
-        oracle.last_travelled = state['travelled']
-        # Resume the departure run of earlier chain steps (an evaluation-style patience).
-        oracle.bad_run, oracle.bad_run_start = state.get('bad_run', 0), state.get('bad_run_start')
-        oracle.started = state['depth'] > 0
-        current = dict(pos=path[-1], frame=frame, hist=hist, hmask=mask,
-            observed_path=path, last_segment=advanced['last_segment'],
-            travelled=advanced['travelled'], heading_start=advanced['heading_start'],
-            would_stop=False, exploratory=False,
-            **{key: state[key] for key in SEED_FIELDS})
-        current['seed_age'] += advanced['travelled']-state['travelled']
-        if not oracle(current):
-            return None
-        row = oracle.rows[-1]
-        item = label_state(fiber, current['pos'], frame, hist, mask, dataset.cfg,
-                           t=oracle.t, reverse=reverse, offtrack=row['offtrack'])
-        item.update({key: current[key] for key in SEED_FIELDS})
+        labeler = TraceLabeler(fiber, state['labeler']['t'], -1 if reverse else 1,
+                               tolerance=dataset.cfg.label_tolerance,
+                               max_recovery_distance=dataset.cfg.max_recovery_distance,
+                               fiber_idx=fi, bank_detector=self.detector, state=state['labeler'])
+        facts = labeler.observe(advanced['last_segment'], advanced['travelled'])
+        item = label_state(fiber, path[-1], frame, hist, mask, dataset.cfg,
+                           t=facts['t'], reverse=reverse, trace=facts)
+        if item['supervision'] not in (FOLLOWING, RECOVERABLE, TERMINAL):
+            return None  # censored: no correspondence, unannotated or ambiguous
+        terminal = item['supervision'] == TERMINAL
+        item.update({key: state[key] for key in SEED_FIELDS})
+        item['seed_age'] = state['seed_age']+advanced['travelled']-state['travelled']
         item.update(observed_path=path, heading_start=advanced['heading_start'],
-            fiber_ref=(fi, fiber.length-oracle.t if reverse else oracle.t, reverse),
-            source=2, source_step=state['source_step'], stratum=4 if row['offtrack'] else 0,
-            failure_kind=int(row.get('failure_kind', 0)),
-            live_continuation=True, live_correct_continuation=not row['offtrack'],
-            live_failure=bool(row['offtrack']), live_depth=state['depth']+1,
+            fiber_ref=(fi, fiber.length-facts['t'] if reverse else facts['t'], reverse),
+            source=SOURCE['live'], source_step=state['source_step'], travelled=advanced['travelled'],
+            live_continuation=True, live_terminal=terminal, live_depth=state['depth']+1,
             live_limit=(self.draw_limit(rng) if state['depth'] == 0 else state['limit']),
             live_travelled=advanced['travelled'], live_loop_start=state['loop_start'],
-            live_bad_run=oracle.bad_run, live_bad_run_start=oracle.bad_run_start)
+            live_chain_start=state['start'], labeler_state=labeler.state_dict())
         item = dataset.prepare(item, rng)
         if not dataset.state_allowed(item):
             return None
         # The unresolved-frame footprint covers all rolls and the CT tensor.
         dataset.prefetch_items([item], vol, required=True)
         diagnostics = {}
-        frame = ct_frame(vol, current['pos'], advanced['heading'], state['frame'], diagnostics=diagnostics)
+        frame = ct_frame(vol, item['pos'], advanced['heading'], state['frame'], diagnostics=diagnostics)
         reframe_item(item, frame)
         item.update(frame_policy=FRAME_POLICY, ct_frame_diagnostics=diagnostics)
+        if hasattr(dataset.batch_builder, 'apply_roll'):
+            dataset.batch_builder.apply_roll(item)
         return item
 
     def close(self):
@@ -180,22 +186,22 @@ class LiveContinuationSource:
 
 
 class LiveContinuation:
-    def __init__(self, dataset, *, steps, n_commit, max_recovery_distance,
-                 switch_tolerance, own_tolerance, stratified=False):
+    def __init__(self, dataset, *, policy, steps, switch_tolerance, own_tolerance):
         datasets = getattr(dataset, 'datasets', [dataset])
         self.sources = []
+        self.policy = policy
         for source in datasets:
-            live = LiveContinuationSource(steps=steps, stratified=stratified, capacity=max(32, source.chunk*4),
-                n_commit=n_commit, max_recovery_distance=max_recovery_distance,
-                switch_tolerance=switch_tolerance, own_tolerance=own_tolerance)
+            live = LiveContinuationSource(policy=policy, steps=steps, capacity=max(32, source.chunk*4),
+                switch_tolerance=switch_tolerance, own_tolerance=own_tolerance, step=source.step)
             source.live_continuation = live
             self.sources.append(live)
 
-    def set_step(self, step):
-        for source in self.sources:
-            source.step.value = step
-
     def feedback(self, cpu, output, step):
+        """Advance chains with the operating policy's commit on the trained prediction.
+
+        ``output`` already went through same-position refinement and selection; a
+        rejected decision publishes nothing, so a chain never advances past a stop.
+        """
         states = cpu.get('_live_states')
         if states is None:
             return
@@ -207,8 +213,8 @@ class LiveContinuation:
         source = self.sources[int(ids[0])]
         points = output['points'][indices].detach().float()
         confidence = output['confidence'][indices].detach().float()
-        counts, _ = commit_prefix(points, confidence, source.params.confidence,
-                                  source.params.n_commit, source.max_recovery_distance)
+        counts, _ = commit_prefix(points, confidence, self.policy.confidence,
+                                  self.policy.n_commit, self.policy.max_recovery_distance)
         points, counts = points.cpu().numpy(), counts.cpu().numpy()
         for i, proposal, count in zip(indices, points, counts):
             if count:

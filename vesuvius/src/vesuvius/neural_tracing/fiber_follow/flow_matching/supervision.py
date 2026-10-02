@@ -25,7 +25,7 @@ def refinement_metrics(steps, batch, cfg, n_commit=DEFAULT_N_COMMIT):
     current = batch['gt_history'][:, 0].float()
     drift = current.norm(dim=-1)
     drift_known = (batch['gt_history_mask'][:, 0] > 0) & torch.isfinite(drift)
-    eligible = ~batch['offtrack'].bool()
+    eligible = batch['geometry_valid'].bool()
     bands = {'all': eligible}
     for name, lo, hi in (('<1',0.,1.), ('1-1.5',1.,1.5), ('1.5-2',1.5,2.),
                          ('2-3.5',2.,3.5), ('>=3.5',3.5,float('inf'))):
@@ -65,7 +65,7 @@ def candidate_prefix_labels(points, batch, tolerance=1.5, max_recovery_distance=
         return prefix_labels(points, batch, tolerance, max_recovery_distance)
     b, k, n, _ = points.shape
     expanded = {key: batch[key].repeat_interleave(k, dim=0) for key in
-                ('dense_ab', 'dense_mask', 'offtrack', 'endpoint_known', 'end_local')}
+                ('dense_ab', 'dense_mask', 'terminal', 'confidence_valid', 'endpoint_known', 'end_local')}
     labels, known, error = prefix_labels(points.reshape(b*k, n, 3), expanded, tolerance, max_recovery_distance)
     return labels.reshape(b, k, n), known.reshape(b, k, n), error.reshape(b, k)
 
@@ -136,6 +136,6 @@ def loss_fn(output, batch, cfg, tolerance=1.5, *, update=0, confidence_ramp=2000
             correct = gate_target[:,0].bool()
             metrics.update({f'false_stop_count_{threshold}': (known & correct & ~open_gate).sum().item(),
                             f'correct_first_count_{threshold}': (known & correct).sum().item(),
-                            f'departed_continue_count_{threshold}': (batch['offtrack'].bool() & open_gate).sum().item(),
-                            f'departed_count_{threshold}': batch['offtrack'].sum().item()})
+                            f'departed_continue_count_{threshold}': (batch['terminal'].bool() & open_gate).sum().item(),
+                            f'departed_count_{threshold}': batch['terminal'].sum().item()})
     return total,metrics

@@ -1,19 +1,15 @@
 """Direct dense curve regression plus correctness of the produced prefix."""
+import math
+
 import torch
 import torch.nn.functional as F
 
 from vesuvius.neural_tracing.fiber_follow.shared.labels import prefix_labels
+from vesuvius.neural_tracing.fiber_follow.shared.state_labels import RECOVERABLE, TERMINAL
 from vesuvius.neural_tracing.fiber_follow.regression.model import feature_grid
 from .survival_confidence import survival_loss
 
-
-def geometry_mask(batch, cfg):
-    annotated = batch['dense_mask'].bool() & ~batch['offtrack'][:, None].bool()
-    if 'identity_observable' in batch:
-        annotated &= batch['identity_observable'][:, None].bool()
-    target = torch.where(annotated[..., None], batch['dense_ab'], 0.)
-    observable = (target.abs().amax(-1) <= cfg.lateral_limit).int().cummin(-1).values.bool()
-    return annotated & observable
+CONNECTOR_SPACING = .25  # same dense spatial resolution as the supervised path
 
 
 def commit_window(cfg, n_commit):
@@ -35,43 +31,74 @@ def window_mean(values, mask, near):
     return .5*mean(mask & near)+.5*mean(mask)
 
 
-def foreign_failures(points, batch, cfg, count):
-    """Dense predictions in cells occupied by a validated neighboring path."""
-    dense = F.interpolate(points.detach().float().transpose(1, 2), size=count, mode='linear',
-                          align_corners=True).transpose(1, 2)
+def foreign_hits(points, batch, cfg):
+    """Which (B, N, 3) crop-local points fall in cells of a validated neighboring path."""
     foreign = batch['foreign']
-    grid = feature_grid(dense, cfg.fine, foreign.shape[-3:])
+    grid = feature_grid(points.detach().float(), cfg.fine, foreign.shape[-3:])
     values = F.grid_sample(foreign[:, None].float(), grid[:, :, None, None], mode='nearest', align_corners=True)
     return values[:, 0, :, 0, 0] > .5
 
 
-@torch.no_grad()
-def candidate_targets(batch, cfg, tolerance):
-    """Label supplied paths with the deployed dense first-failure contract.
+def foreign_failures(points, batch, cfg, count):
+    """Dense predictions in cells occupied by a validated neighboring path."""
+    dense = F.interpolate(points.detach().float().transpose(1, 2), size=count, mode='linear',
+                          align_corners=True).transpose(1, 2)
+    return foreign_hits(dense, batch, cfg)
 
-    Called by the loader after foreign masks are built, before augmentation.
-    Candidate support only censors; it never manufactures a positive prefix.
+
+def connector_failures(first, batch, cfg):
+    """Foreign contact on the origin-to-first-point segment, excluding the origin itself.
+
+    ``first`` is (B, 3). A safe endpoint does not make a connector safe if it crosses a
+    known foreign fiber. Samples are ``CONNECTOR_SPACING`` apart along the longest
+    allowed connection, so every committed connection is checked as densely as the path.
     """
-    labels, known = [], []
-    for points in batch['candidate_points'].unbind(1):
-        foreign = foreign_failures(points, batch, cfg, batch['dense_mask'].shape[-1])
-        target, mask, _ = prefix_labels(points, batch, tolerance, cfg.max_recovery_distance,
-                                        extra_failure=foreign)
-        labels.append(target)
-        known.append(mask)
-    mask = torch.stack(known, 1)*batch['candidate_mask']
-    mask *= batch['identity_observable'][:, None, None]
-    return torch.stack(labels, 1), mask
+    count = math.ceil(cfg.max_recovery_distance/CONNECTOR_SPACING)
+    fraction = torch.arange(1, count+1, device=first.device, dtype=torch.float32)/count
+    samples = first.detach().float()[:, None]*fraction[None, :, None]
+    return foreign_hits(samples, batch, cfg).any(-1)
+
+
+def geometry_mask(batch, cfg):
+    """Certified original-fiber continuation inside the observable crop.
+
+    Only states whose annotated first connection satisfies the commit limit carry
+    geometry (``geometry_valid``); with a neighbor raster, a target connection that
+    crosses a known foreign fiber is censored as well.
+    """
+    annotated = batch['dense_mask'].bool() & batch['geometry_valid'][:, None].bool()
+    target = torch.where(annotated[..., None], batch['dense_ab'], 0.)
+    observable = (target.abs().amax(-1) <= cfg.lateral_limit).int().cummin(-1).values.bool()
+    mask = annotated & observable
+    if 'foreign' in batch:
+        mask = mask & ~target_connector_foreign(batch, cfg)[:, None]
+    return mask
+
+
+def target_connector_foreign(batch, cfg):
+    first = torch.cat((batch['dense_ab'][:, 0], batch['dense_ab'].new_full((len(batch['dense_ab']), 1), cfg.future_step)), -1)
+    return connector_failures(first, batch, cfg) & batch['geometry_valid'].bool()
+
+
+def proposal_labels(points, batch, cfg, tolerance):
+    """Prefix labels with the neighbor raster applied to the path and its connection."""
+    extra = connector = None
+    if 'foreign' in batch:
+        extra = foreign_failures(points, batch, cfg, batch['dense_mask'].shape[1])
+        connector = connector_failures(points[:, 0], batch, cfg)
+    labels, known, error = prefix_labels(points, batch, tolerance, cfg.max_recovery_distance,
+                                         extra_failure=extra, connector_failure=connector)
+    return labels, known, error, extra
 
 
 @torch.no_grad()
 def point_correctness(points, batch, cfg, tolerance, foreign=None):
     """Independent predicted-point counts, not cumulative prefix labels.
 
-    Score every proposed point regardless of confidence. Unknown identity or
-    missing/crop-censored annotation is excluded; known departures/endpoints
-    and validated neighboring fibers are negatives. An earlier error does not
-    invalidate a later point. No origin-to-first-point policy is applied here.
+    Score every proposed point regardless of confidence. Unavailable supervision or
+    missing/crop-censored annotation is excluded; terminal states, known endpoints and
+    validated neighboring fibers are negatives. An earlier error does not invalidate a
+    later point. No origin-to-first-point policy is applied here.
     """
     points = points.detach().float()
     indices = torch.linspace(0, batch['dense_ab'].shape[1]-1, points.shape[1],
@@ -81,17 +108,15 @@ def point_correctness(points, batch, cfg, tolerance, foreign=None):
     visible = target.abs().amax(-1) <= cfg.lateral_limit
     annotated = annotated & visible & torch.isfinite(target).all(-1)
     error = (points[..., :2]-target).norm(dim=-1)
-    departed = batch['offtrack'].bool()[:, None]
+    terminal = batch['terminal'].bool()[:, None]
     beyond_end = (batch['endpoint_known'].bool()[:, None]
                   & (batch['end_local'][:, 2, None] >= 0)
                   & (points[..., 2] > batch['end_local'][:, 2, None]+1e-4)
                   & ~batch.get('plane_mask', batch['dense_mask'][:, indices]).bool())
     neighbor = torch.zeros_like(annotated) if foreign is None else foreign[:, indices].bool()
-    known = annotated | departed | beyond_end | neighbor
-    if 'identity_observable' in batch:
-        known &= batch['identity_observable'].bool()[:, None]
+    known = (annotated | terminal | beyond_end | neighbor) & batch['confidence_valid'].bool()[:, None]
     correct = (known & annotated & (error <= tolerance) & torch.isfinite(points).all(-1)
-               & ~departed & ~beyond_end & ~neighbor)
+               & ~terminal & ~beyond_end & ~neighbor)
     return dict(point_correct_count=correct.sum(), point_wrong_count=(known & ~correct).sum(),
                 point_unknown_count=(~known).sum())
 
@@ -99,9 +124,10 @@ def point_correctness(points, batch, cfg, tolerance, foreign=None):
 def loss_terms(output, batch, cfg, tolerance=1.5, *, n_commit=None):
     """Return numerators/counts so effective-batch means are independent of microbatch.
 
-    Unknown/crop-censored targets and departed states do not teach localization.
-    Confirmed departures still teach rejection. Prefix correctness uses the
-    same annotation semantics as the established tracer evaluation.
+    Unknown/crop-censored targets and uncertified connections do not teach
+    localization. Terminal states still teach rejection. Every generated proposal,
+    including refinement attempts, receives confidence supervision under the same
+    annotation, connection and neighbor semantics as the established evaluation.
     """
     mask = geometry_mask(batch, cfg)
     window = commit_window(cfg, n_commit)
@@ -119,11 +145,7 @@ def loss_terms(output, batch, cfg, tolerance=1.5, *, n_commit=None):
                               mode='linear', align_corners=True).transpose(1, 2)
         error = F.smooth_l1_loss(dense, target, beta=1., reduction='none').mean(-1)
         geometry_losses.append(window_mean(error, mask, near))
-        foreign = foreign_failures(curve, batch, cfg, mask.shape[1]) if 'foreign' in batch else None
-        labels, known, _ = prefix_labels(curve, batch, tolerance, cfg.max_recovery_distance,
-                                        extra_failure=foreign)
-        if 'identity_observable' in batch:
-            known = known*batch['identity_observable'][:, None]
+        labels, known, _, _ = proposal_labels(curve, batch, cfg, tolerance)
         confidence_losses.append(survival_loss(hazards, labels, known)[0])
     attempts = output['refinement_mask'].bool()
     count = attempts.sum(1)
@@ -134,79 +156,27 @@ def loss_terms(output, batch, cfg, tolerance=1.5, *, n_commit=None):
     auxiliary = torch.where(earlier, geometry_losses, 0.).sum(1)/(count-1).clamp_min(1)
     geometry = torch.where(count > 1, .75*final+.25*auxiliary, final)
     confidence = torch.where(attempts, torch.stack(confidence_losses, 1), 0.).sum(1)/count
+    # Distance-only labels keep their names; identity-aware labels add the neighbor raster.
     labels, known, _ = prefix_labels(output['points'], batch, tolerance, cfg.max_recovery_distance)
-    # Identity-aware labels: a point on a validated neighboring fiber is
-    # wrong even within the distance tolerance. Distance metrics keep their names.
-    identity = 'foreign' in batch
-    supervised, supervised_known = labels, known
-    extra = None
-    if identity:
-        extra = foreign_failures(output['points'], batch, cfg, mask.shape[1])
-        supervised, supervised_known, _ = prefix_labels(output['points'], batch, tolerance,
-                                                        cfg.max_recovery_distance, extra_failure=extra)
-    if 'identity_observable' in batch:
-        observed = batch['identity_observable'][:,None]
-        known = known*observed
-        supervised_known = supervised_known*observed
+    supervised, supervised_known, _, extra = proposal_labels(output['points'], batch, cfg, tolerance)
     _, confidence_valid = survival_loss(output['hazard_logits'], supervised, supervised_known)
+    labeled = confidence_valid.any(-1)
+    positive = (supervised*supervised_known).sum(-1)
+    negative = ((1-supervised)*supervised_known).sum(-1)
     terms = dict(geometry_per_state=geometry,
                  confidence_per_state=confidence,
                  refinement_attempts_sum=count.sum(),
-                 confidence_labeled_states=confidence_valid.any(-1).sum(),
-                 confidence_departed_states=(confidence_valid.any(-1) & batch['offtrack'].bool()).sum(),
+                 confidence_labeled_states=labeled.sum(),
+                 confidence_terminal_states=(labeled & (batch['supervision'] == TERMINAL)).sum(),
+                 confidence_recoverable_states=(labeled & (batch['supervision'] == RECOVERABLE)).sum(),
+                 positive_targets_per_state=positive, negative_targets_per_state=negative,
+                 geometry_states_per_state=mask.any(-1),
                  geometry_count=mask.sum(), confidence_count=supervised_known.sum(),
                  error_sum=torch.where(mask, (predicted-target).norm(dim=-1), 0.).sum(),
                  correct_count=(labels*known).sum())
-    terms.update(point_correctness(output['points'], batch, cfg, tolerance, foreign=extra))
-    if identity:
+    if 'foreign' in batch:
         terms.update(identity_correct_count=(supervised*supervised_known).sum(),
-                     identity_flipped_count=(labels*known*(1-supervised)).sum())
-    if 'candidate_confidence_logits' in output:
-        terms.update(paired_identity_loss(output['candidate_confidence_logits'], batch))
-        mask = batch['candidate_mask'].bool()
-        if 'identity_observable' in batch:
-            mask = mask & batch['identity_observable'][:,None,None]
-        labels = batch['candidate_labels'].float()
-        per_candidate, mask = survival_loss(output['candidate_hazard_logits'], labels, mask)
-        valid = mask.any(-1)
-        terms['candidate_per_state'] = per_candidate.sum(-1)/valid.sum(-1).clamp_min(1)
-        terms['candidate_states'] = valid.any(-1).sum()
-        terms['candidate_intervals'] = mask.sum()
-        failures = mask & (labels < .5)
-        terms['candidate_late_failures'] = failures[..., 1:].sum()
-        terms['candidate_first_failures'] = failures[..., 0].sum()
-        terms['candidate_supervision_weight'] = valid.any(-1).float().sum()
+                     identity_flipped_count=(labels*known*(1-supervised)).sum(),
+                     connector_rejected_targets=target_connector_foreign(batch, cfg).sum())
+    terms.update(point_correctness(output['points'], batch, cfg, tolerance, foreign=extra))
     return terms
-
-
-def paired_identity_loss(logits, batch):
-    """Rank the same known candidate prefix under two certified histories.
-
-    IDs, not adjacency, identify pairs. Unknown prefixes are excluded, and
-    geometric equality prevents mismatched candidate order/frame comparisons.
-    Means are per eligible row, like the existing candidate survival loss.
-    """
-    zero = logits.sum((1, 2))*0.
-    if 'identity_pair_id' not in batch:
-        return dict(pair_rank_per_state=zero, pair_rank_comparisons=zero.sum(),
-                    pair_rank_correct=zero.sum(), pair_rank_margin_sum=zero.sum())
-    ids = batch['identity_pair_id']
-    labels = batch['candidate_labels'] > .5
-    known = batch['candidate_mask'].bool()
-    if 'identity_observable' in batch:
-        known = known & batch['identity_observable'][:, None, None].bool()
-    paired = (ids[:, None] == ids[None, :]) & (ids[:, None] >= 0)
-    paired &= ~torch.eye(len(ids), device=ids.device, dtype=torch.bool)
-    # Reject duplicate/corrupt groups rather than silently comparing >2 rows.
-    paired &= (paired.sum(1) == 1)[:, None]
-    points = batch['candidate_points']
-    same = (points[:, None]-points[None, :]).abs().amax((-1, -2)) < 1e-5
-    valid = paired[:, :, None, None] & same[..., None]
-    valid = valid & known[:, None] & known[None, :] & (labels[:, None] != labels[None, :])
-    margin = (logits.float()[:, None]-logits.float()[None, :])*(2*labels[:, None].float()-1)
-    count = valid.sum((1, 2, 3))
-    loss = torch.where(valid, F.softplus(-margin), 0.).sum((1, 2, 3))/count.clamp_min(1)
-    # Each comparison occurs twice, once from each row's perspective.
-    return dict(pair_rank_per_state=loss, pair_rank_comparisons=valid.sum()/2,
-                pair_rank_correct=(valid & (margin > 0)).sum()/2,
-                pair_rank_margin_sum=torch.where(valid, margin, 0.).sum()/2)

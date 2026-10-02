@@ -355,14 +355,7 @@ class NeighborBank:
         return tree.query(np.asarray(world).reshape(-1,3))[0]-gap > self.exclusion
 
     def state_target_tree(self, item):
-        """Bank-following states are supervised against their own mined path."""
-        fiber = item.get('supervision_fiber')
-        if fiber is None:
-            return self._target_tree(item['fiber_ref'][0])
-        if '_supervision_tree' not in item:
-            item['_supervision_tree'] = (cKDTree(fiber.points),
-                float(np.linalg.norm(np.diff(fiber.points,axis=0),axis=1).max()/2))
-        return item['_supervision_tree']
+        return self._target_tree(item['fiber_ref'][0])
 
     def clear_of_state(self, item, world):
         tree,gap = self.state_target_tree(item)
@@ -381,19 +374,11 @@ class NeighborBank:
         do not need a dense confidence-label mask.
         """
         fi,t,reverse = item['fiber_ref']
-        fiber = self.fibers[fi]
-        if 'supervision_fiber' in item:
-            # The original annotated parent is a certified different fiber.
-            # Do not turn the mined positive itself into a negative by querying
-            # the parent's bank with this different path's arclength.
-            a,b = item['bank_parent_arc_range']
-            lines = [interp_at(fiber.points,fiber.s,np.arange(max(0.,a),min(fiber.length,b)+1e-9,.25))]
-        else:
-            lateral, forward = crop.lateral_coords[[0,-1]], crop.forward_coords[[0,-1]]
-            corners = np.array([[a,b,z] for a in lateral for b in lateral for z in forward])
-            world = corners @ np.asarray(item['frame']).T+item['pos']
-            lines = [r['samples'] for bank in (self, *additional_banks)
-                     for r in bank.spatial_records(fi, world)]
+        lateral, forward = crop.lateral_coords[[0,-1]], crop.forward_coords[[0,-1]]
+        corners = np.array([[a,b,z] for a in lateral for b in lateral for z in forward])
+        world = corners @ np.asarray(item['frame']).T+item['pos']
+        lines = [r['samples'] for bank in (self, *additional_banks)
+                 for r in bank.spatial_records(fi, world)]
         mask_crop = crop if mask_crop is None else mask_crop
         shape = (mask_crop.depth,mask_crop.width,mask_crop.width)
         mask = np.zeros(shape,bool) if rasterize else None

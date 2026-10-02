@@ -92,13 +92,14 @@ def read_checkpoint(path, architecture, device='cuda'):
 
 
 @torch.no_grad()
-def update_ema(ema, model, step, decay):
+def update_ema(ema, model, step, decay, *, ramp=True):
     """Update EMA once per optimizer update, ramping the decay in early updates.
 
     Without the ramp the average still carries 37% of the random initialization
     after 1,000 updates, which is what the first collector and diagnostics use.
+    A run initialized from trained model and EMA tensors uses the full decay.
     """
-    effective_decay = min(decay, (1+step)/(10+step))
+    effective_decay = min(decay, (1+step)/(10+step)) if ramp else decay
     for average, current in zip(ema.parameters(), model.parameters(), strict=True):
         average.lerp_(current.detach(), 1-effective_decay)
     for average, current in zip(ema.buffers(), model.buffers(), strict=True):

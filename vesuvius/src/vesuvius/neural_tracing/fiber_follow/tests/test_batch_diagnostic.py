@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from test_regression import batch, config, proposal_output
+from label_fixtures import set_terminal, state_labels
 from vesuvius.neural_tracing.fiber_follow.regression.model import DirectFollower
 from vesuvius.neural_tracing.fiber_follow.regression.batch_diagnostic import (
     layer_capture, decision_details, render_microbatch,
@@ -86,7 +87,8 @@ def test_decision_details_keep_wrong_unknown_and_skipped_distinct():
     details = decision_details(output, data, cfg, 4, 1.5)
     assert not details['known'].any()
     assert details['attempts'][1]['error'] is None
-    data['offtrack'][:] = 1
+    for row in range(len(data['terminal'])):
+        set_terminal(data, row)
     details = decision_details(output, data, cfg, 4, 1.5)
     assert details['known'].all() and not details['labels'].any()
     data['identity_observable'] = torch.zeros(1)

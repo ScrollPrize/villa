@@ -18,6 +18,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.components import ComponentRule
 from vesuvius.neural_tracing.fiber_follow.shared.data import SampleConfig, TracedFiber, ZBand
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, crop_local_grid, sample_oriented_fast
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolumeSpec
+from label_fixtures import set_terminal, state_labels
 
 
 def config(**kwargs):
@@ -40,7 +41,7 @@ def batch(cfg,b=2):
     from slab_fixtures import slab_inputs
     x.update(slab_inputs(b))
     return dict(x=x,hist=hist,hmask=torch.ones(b,cfg.n_history),dense_ab=torch.zeros(b,q,2),
-        dense_mask=torch.ones(b,q),offtrack=torch.zeros(b),endpoint_known=torch.zeros(b),
+        dense_mask=torch.ones(b,q),**state_labels(b),endpoint_known=torch.zeros(b),
         end_local=torch.zeros(b,3),source=torch.zeros(b),
         foreign=torch.zeros(b,cfg.fine.depth,cfg.fine.width,cfg.fine.width,dtype=torch.uint8))
 

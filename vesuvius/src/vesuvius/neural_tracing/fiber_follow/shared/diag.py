@@ -39,7 +39,7 @@ def _curved_slab(vol, centers, axis, half=2):
 
 
 def plot_batch(x, pred, fut, fmask, crop, path, observed, hmask, history_gt, history_mask,
-               n=6, source=None, offtrack=None, confidence=None, history_channel=-1, ct_range=None):
+               n=6, source=None, terminal=None, confidence=None, history_channel=-1, ct_range=None):
     """Crops exactly as the model sees them (sample-index space, forward = up).
 
     Each panel is a thin curved slab (+-2 samples) that follows the GT fiber
@@ -52,7 +52,7 @@ def plot_batch(x, pred, fut, fmask, crop, path, observed, hmask, history_gt, his
     Set history_channel=None for inputs without a rendered history channel.
     """
     source = source[:n].detach().cpu().numpy() if source is not None else None
-    offtrack = offtrack[:n].detach().cpu().numpy() if offtrack is not None else None
+    terminal = terminal[:n].detach().cpu().numpy() if terminal is not None else None
     confidence = confidence[:n].detach().float().cpu().numpy() if confidence is not None else None
     observed = observed[:n].detach().float().cpu().numpy()
     hmask = hmask[:n].detach().float().cpu().numpy()
@@ -112,12 +112,12 @@ def plot_batch(x, pred, fut, fmask, crop, path, observed, hmask, history_gt, his
         title = f"err {err.mean():.2f}" if len(err) else "no fut"
         if outside.any():
             title += f"; {outside.sum()} GT outside"
-        if offtrack is not None and offtrack[i]:
-            title = 'OFF TRACK: reject continuation'
+        if terminal is not None and terminal[i]:
+            title = 'TERMINAL: reject continuation'
         if source is not None:
-            # Codes follow data.REPLAY_SOURCES; unknown codes still get a label.
-            names = {0: 'fresh', 2: 'recent replay'}
-            title = names.get(int(source[i]), f'source {int(source[i])}') + '\n' + title
+            from .data import SOURCES
+            index = int(source[i])
+            title = (SOURCES[index] if 0 <= index < len(SOURCES) else f'source {index}') + '\n' + title
         if confidence is not None:
             title += f'\nnext-step confidence {confidence[i, 0]:.2f}'
         ax[0, i].set_title(title, fontsize=8)

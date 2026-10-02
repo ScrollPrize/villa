@@ -25,6 +25,16 @@ def ct_source_spec(source, cache_dir):
         grid_scale=float(source['grid_scale']), inputs='ct', load_presence=False, cache_dir=cache_dir)
 
 
+def primary_source_spec(document, input_mode='ct', *, fiber_zarrs=None, ct=None):
+    """The Paris 4 CT/fiber volume spec the trainer builds from a dataset config (CLI paths may override)."""
+    source = next((s for s in document['sources'] if s['kind'] == 'paris4'), {}) if document else {}
+    return FiberVolumeSpec(fiber_zarrs if fiber_zarrs is not None else source.get('fiber_zarrs'),
+        ct_zarr=ct if ct is not None else source.get('ct'),
+        ct_level=source.get('ct_level', 0), ct_grid_scale=source.get('ct_grid_scale', 4.),
+        grid_scale=source.get('grid_scale', 8.), inputs=input_mode,
+        load_presence=input_mode != 'ct', cache_dir=document['cache_dir'] if document else None)
+
+
 def read_dataset_config(path):
     path = Path(path).resolve()
     document = json.loads(path.read_text())
@@ -170,7 +180,7 @@ class AFVBank(NeighborBank):
     """Reuse existing foreign-mask clearance rules on AFV spatial queries.
 
     These are supervision-only paths, never image inputs. Nearby paths also
-    supply existing matched decisions, neighbor following and memory switches.
+    supply foreign masks and certified synthetic failures.
     """
     def __init__(self, fibers):
         self.fibers = fibers
@@ -261,7 +271,7 @@ class AFVBank(NeighborBank):
 
 
 class WeightedDatasets(torch.utils.data.IterableDataset):
-    """Choose a source per equal-sized batch; preserve matched pairs.
+    """Choose a source per equal-sized batch; each source applies its own task budget.
 
     Workers use independent deterministic RNG streams. Never fall back to a
     different source on an I/O failure, which would silently change weights.
@@ -290,7 +300,41 @@ class WeightedDatasets(torch.utils.data.IterableDataset):
             yield batch
 
 
-def build_mixed_dataset(primary, document, cfg, sample, sampling, args, *, seed, out=None, resume=False,
+def open_afv_source(source, cache_dir, normalization=None):
+    """Checked AFV training/validation fibers and CT spec for one dataset-config source.
+
+    Verifies the file checksum, coordinate space and that the configured CT is the recorded CT store.
+    Returns (training fibers, validation fibers, CT spec, sha256).
+    """
+    path = Path(source['path'])
+    digest = hashlib.sha256()
+    with path.open('rb') as stream:
+        for block in iter(lambda: stream.read(8 << 20), b''):
+            digest.update(block)
+    if digest.hexdigest() != source['sha256']:
+        raise ValueError(f'AFV checksum changed: {path}')
+    scale = float(source['grid_scale'])
+    fibers = AFVFibers(path, scale, validation=source['validation'],sha256=digest.hexdigest())
+    validation_fibers = AFVFibers(path,scale,validation=source['validation'],split='validation',sha256=digest.hexdigest())
+    if fibers.metadata['frame']['vc_open_data_coordinate_space'] != source['coordinate_space']:
+        raise ValueError('AFV coordinate identity mismatch')
+    root = fibers.metadata['root']
+    native_url = root.get('vc_open_data_source_path', '').rstrip('/')
+    # The configured source must refer to the same recorded CT store.
+    def canonical(url):
+        return str(url).rstrip('/').replace('https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/',
+            's3://vesuvius-challenge-open-data/').replace('https://vesuvius-challenge-open-data.s3.amazonaws.com/',
+            's3://vesuvius-challenge-open-data/')
+    if canonical(source['ct']) != canonical(native_url):
+        raise ValueError('AFV source CT differs from its embedded metadata')
+    spec = ct_source_spec(source, cache_dir)
+    if normalization is not None:
+        from ..shared.ct_normalization import volume_key
+        spec.ct_normalization = normalization['volumes'][volume_key(spec)]
+    return fibers, validation_fibers, spec, digest.hexdigest()
+
+
+def build_mixed_dataset(primary, document, cfg, sample, sampling, args, *, seed, budget, out=None, resume=False,
                         normalization=None):
     if cfg.input_mode != 'ct' or cfg.direction_inputs:
         raise ValueError('The AFV sources have CT only; enable --input-mode ct --no-direction-inputs')
@@ -300,33 +344,9 @@ def build_mixed_dataset(primary, document, cfg, sample, sampling, args, *, seed,
             dataset = primary
             entry = dict(name=source['name'], kind='paris4', fibers=len(primary.fibers))
         else:
-            path = Path(source['path'])
-            digest = hashlib.sha256()
-            with path.open('rb') as stream:
-                for block in iter(lambda: stream.read(8 << 20), b''):
-                    digest.update(block)
-            if digest.hexdigest() != source['sha256']:
-                raise ValueError(f'AFV checksum changed: {path}')
+            fibers, validation_fibers, spec, sha256 = open_afv_source(source, document['cache_dir'], normalization)
             scale = float(source['grid_scale'])
-            fibers = AFVFibers(path, scale, validation=source['validation'],sha256=digest.hexdigest())
-            validation_fibers = AFVFibers(path,scale,validation=source['validation'],split='validation',sha256=digest.hexdigest())
-            if fibers.metadata['frame']['vc_open_data_coordinate_space'] != source['coordinate_space']:
-                raise ValueError('AFV coordinate identity mismatch')
-            root = fibers.metadata['root']
-            native_url = root.get('vc_open_data_source_path', '').rstrip('/')
-            # The configured source must refer to the same recorded CT store.
-            def canonical(url):
-                return str(url).rstrip('/').replace('https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/',
-                    's3://vesuvius-challenge-open-data/').replace('https://vesuvius-challenge-open-data.s3.amazonaws.com/',
-                    's3://vesuvius-challenge-open-data/')
-            if canonical(source['ct']) != canonical(native_url):
-                raise ValueError('AFV source CT differs from its embedded metadata')
-            spec = ct_source_spec(source, document['cache_dir'])
-            if normalization is not None:
-                from ..shared.ct_normalization import volume_key
-                spec.ct_normalization = normalization['volumes'][volume_key(spec)]
-            local_sampling = sampling
-            builder = IdentityObservationBuilder(cfg, fibers, local_sampling, augment=True,
+            builder = IdentityObservationBuilder(cfg, fibers, sampling, augment=True,
                                                   negative_bank=AFVBank(fibers))
             band = None
             replay_index = Path(out)/'dagger'/source['name']/'replay.json' if out else None
@@ -335,20 +355,13 @@ def build_mixed_dataset(primary, document, cfg, sample, sampling, args, *, seed,
             replay = [OnPolicyStates.load(p) for p in replay_paths]
             dataset = FollowDataset(fibers, spec, sample, band, chunk=args.batch,
                 seed=seed+100003*(index+1), cache_bytes=int(args.worker_cache_gb*(1<<30)),
-                batch_builder=builder, fresh_fraction=args.fresh_fraction,
-                clean_fraction=getattr(args, 'clean_fraction', None),
-                correct_replay_only=getattr(args, 'correct_replay_only', False),
-                replay_continuation_fraction=getattr(args, 'replay_continuation_fraction', None),
-                gt_perturb_probability=getattr(args, 'gt_perturb_probability', 0.),
-                prefer_real_wrong_turns=getattr(args, 'prefer_real_wrong_turns', False),
-                prefer_replay_for_light_gt=getattr(args, 'prefer_replay_for_light_gt', False),
-                length_power=getattr(args, 'afv_length_power', 1.),
+                batch_builder=builder, budget=budget, length_power=args.afv_length_power,
                 onpolicy=replay, replay_index=str(replay_index) if replay_index else None)
             dataset.validation_fibers = validation_fibers
             dataset.validation_manifest = validation_manifest(validation_fibers,spec,source['validation']['seed'])
             entry = dict(name=source['name'], kind='afv', fibers=len(fibers),
                 excluded_fibers=fibers.metadata['fiber_count']-len(fibers),
-                sha256=digest.hexdigest(), coordinate_space=source['coordinate_space'],
+                sha256=sha256, coordinate_space=source['coordinate_space'],
                 validation=source['validation'], grid_scale=scale)
         datasets.append(dataset)
         names.append(source['name'])

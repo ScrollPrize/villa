@@ -9,7 +9,6 @@ import torch
 from slab_fixtures import cfg
 from test_history_slabs import observation
 from test_memory_improvements import path_batch
-from vesuvius.neural_tracing.fiber_follow.regression.geometry_resume import expand_geometry_checkpoint
 from vesuvius.neural_tracing.fiber_follow.regression.model import build_model
 from vesuvius.neural_tracing.fiber_follow.regression.path_geometry import (
     COUNT, OFFSETS, path_geometry_inputs, path_geometry_samples)
@@ -101,62 +100,3 @@ def test_compiled_update_trains_geometry_tokens():
 def test_cli_flag_is_optional_and_inferred_by_default():
     assert build_parser().parse_args(['--name', 'run', '--path-geometry-tokens']).path_geometry_tokens is True
     assert build_parser().parse_args(['--name', 'run']).path_geometry_tokens is None
-
-
-def dataset_config(tmp_path, name, weight):
-    document = dict(version=1, cache_dir='cache', sources=[dict(
-        name='paris4', kind='paris4', weight=weight, fibers='fibers', fiber_zarrs='zarrs', ct='ct.zarr',
-        manifest='seeds.json', negative_bank='bank', val_z=[0., 1.],
-        validation=dict(strategy='fiber_hash', fraction=.1, seed=7))])
-    path = tmp_path/name
-    path.write_text(json.dumps(document))
-    return path
-
-
-def source_checkpoint(tmp_path):
-    model = build_model(cfg(history_path_tokens=True, recurrent_refinement_steps=1))
-    opt = torch.optim.AdamW(model.parameters(), lr=.0001, weight_decay=1e-4)
-    for p in model.parameters():
-        p.grad = torch.ones_like(p)
-    opt.step()
-    original = dataset_config(tmp_path, 'original.json', .1)
-    args = vars(build_parser().parse_args(['--name', 'source', '--fiber-zarrs', 'z', '--fibers', 'f', '--ct', 'c',
-        '--manifest', 'm', '--out-root', str(tmp_path), '--lr', '.0001', '--recurrent-refinement-steps', '1',
-        '--history-path-tokens', '--dataset-config', str(original)]))
-    document, digest = read_dataset_config(original)
-    return dict(architecture=model.architecture, model_cfg=model.cfg.to_dict(), model=model.state_dict(),
-                ema=copy.deepcopy(model).state_dict(), optimizer=opt.state_dict(), rng=training_rng_state(),
-                step=22000, samples_seen=264000, lr_restart_step=0, training_options=args,
-                dataset_config=document, dataset_config_sha256=digest)
-
-
-def test_fork_preserves_weights_resets_optimizer_and_restarts_schedule(tmp_path):
-    original = source_checkpoint(tmp_path)
-    rng = torch.get_rng_state().clone()
-    changed = expand_geometry_checkpoint(original, dataset_config=dataset_config(tmp_path, 'paris50.json', .5),
-                                         rest_grad_clip=60.)
-    assert torch.equal(rng, torch.get_rng_state())
-    assert changed['architecture'].endswith('_v17') and changed['lr_restart_step'] == changed['step'] == 22000
-    assert changed['dataset_config']['sources'][0]['weight'] == .5
-    assert changed['dataset_config_sha256'] != original['dataset_config_sha256']
-    new = build_model(checkpoint_config(changed))
-    for section in ('model', 'ema'):
-        for name, value in original[section].items():
-            torch.testing.assert_close(changed[section][name], value, rtol=0, atol=0)
-        new.load_state_dict(changed[section], strict=True)
-        assert changed[section]['path_geometry.embed.2.weight'].eq(0).all()
-    assert changed['optimizer']['state'] == {}
-    options = SimpleNamespace(lr=.0001, reset_optimizer=False)
-    opt, done, origin = initialize_training_optimizer(new, copy.deepcopy(new), options, changed)
-    assert (done, origin) == (22000, 22000) and not opt.state
-    differences = {k for k in original['training_options'] if original['training_options'][k] != changed['training_options'][k]}
-    assert differences == {'path_geometry_tokens', 'rest_grad_clip', 'dataset_config'}
-
-
-def test_fork_rejects_dataset_changes_beyond_weights(tmp_path):
-    original = source_checkpoint(tmp_path)
-    other = dataset_config(tmp_path, 'other.json', .5)
-    document = json.loads(other.read_text()); document['sources'][0]['ct'] = 'different.zarr'
-    other.write_text(json.dumps(document))
-    with pytest.raises(ValueError, match='Only dataset sampling weights'):
-        expand_geometry_checkpoint(original, dataset_config=other, rest_grad_clip=60.)

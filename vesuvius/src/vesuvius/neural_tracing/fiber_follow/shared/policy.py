@@ -1,4 +1,7 @@
-"""Shared first-connection limits and confidence-gated prefix commit."""
+"""Shared first-connection limits, confidence-gated prefix commit and the operating policy."""
+from dataclasses import asdict, dataclass
+import math
+
 import torch
 
 
@@ -9,6 +12,55 @@ DEFAULT_MAX_RECOVERY_DISTANCE = 6.0
 # and curve plots report. Calibration sweeps its own grid; nothing here is
 # an operating point.
 DIAGNOSTIC_THRESHOLDS = (.5,)
+
+
+@dataclass(frozen=True)
+class OperatingPolicy:
+    """Resolved commit policy shared by live feedback, collection, evaluation and deployment.
+
+    Same-position refinement runs up to ``refinement_steps`` extra attempts; the decision
+    stops as soon as they are exhausted without an accepted prefix. These are run
+    parameters of the single implementation, not selectors of different semantics.
+    """
+    confidence: float = DEFAULT_CONFIDENCE
+    n_commit: int = DEFAULT_N_COMMIT
+    max_recovery_distance: float = DEFAULT_MAX_RECOVERY_DISTANCE
+    refinement_steps: int = 0
+
+    def __post_init__(self):
+        if not 0 <= self.confidence <= 1 or int(self.n_commit) != self.n_commit or self.n_commit < 1:
+            raise ValueError('Operating policy needs a confidence in [0, 1] and a positive commit count')
+        if not math.isfinite(self.max_recovery_distance) or self.max_recovery_distance <= 0:
+            raise ValueError('Operating policy needs a finite positive recovery limit')
+        if int(self.refinement_steps) != self.refinement_steps or self.refinement_steps < 0:
+            raise ValueError('Refinement steps must be a nonnegative integer')
+
+    def to_dict(self):
+        return asdict(self)
+
+    def validate_model(self, cfg):
+        """Recovery limit and refinement belong to the model; the policy must agree."""
+        if self.n_commit > cfg.n_future:
+            raise ValueError(f'n_commit={self.n_commit} exceeds the model horizon n_future={cfg.n_future}')
+        if self.max_recovery_distance != cfg.max_recovery_distance:
+            raise ValueError('Operating policy recovery limit differs from the model')
+        if self.refinement_steps != getattr(cfg, 'recurrent_refinement_steps', 0):
+            raise ValueError('Operating policy refinement differs from the model')
+
+
+def checkpoint_policy(checkpoint, cfg, *, confidence=None, n_commit=None):
+    """The checkpoint's recorded policy, optionally with an explicit threshold/commit override."""
+    recorded = dict(checkpoint.get('operating_policy') or dict(
+        confidence=DEFAULT_CONFIDENCE, n_commit=checkpoint.get('n_commit', DEFAULT_N_COMMIT),
+        max_recovery_distance=cfg.max_recovery_distance,
+        refinement_steps=getattr(cfg, 'recurrent_refinement_steps', 0)))
+    if confidence is not None:
+        recorded['confidence'] = float(confidence)
+    if n_commit is not None:
+        recorded['n_commit'] = int(n_commit)
+    policy = OperatingPolicy(**recorded)
+    policy.validate_model(cfg)
+    return policy
 
 
 def recovery_allowed(points, max_distance=DEFAULT_MAX_RECOVERY_DISTANCE):

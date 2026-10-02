@@ -14,6 +14,7 @@ from vesuvius.neural_tracing.fiber_follow.regression.train import optimizer_upda
 from vesuvius.neural_tracing.fiber_follow.shared.training_log import DirectTrainingInterval, format_training_log
 from vesuvius.neural_tracing.fiber_follow.shared.diag import plot_curves
 from vesuvius.neural_tracing.fiber_follow.shared.runloop import RunLog
+from label_fixtures import set_terminal, state_labels
 
 
 def test_individual_points_recover_after_wrong_point_and_ignore_confidence():
@@ -47,7 +48,7 @@ def test_point_masks_neighbors_departures_endpoints_and_nonfinite():
     data['plane_mask'][0,1] = 0
     data['plane_ab'][0,1] = float('nan')
     data['identity_observable'] = torch.tensor([True,False,True,True,True,True,True])
-    data['offtrack'][2] = 1
+    set_terminal(data, 2)
     data['plane_mask'][3,2:] = 0
     data['endpoint_known'][3] = 1
     data['end_local'][3,2] = 2.

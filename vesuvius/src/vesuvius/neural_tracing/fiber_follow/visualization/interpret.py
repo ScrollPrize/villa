@@ -16,7 +16,8 @@ from ..regression.data import ObservationBuilder
 from ..regression.history_slabs import slab_layout
 from ..regression.model import TOKEN_ARCHITECTURE
 from ..regression.train import load_checkpoint
-from ..shared.data import (SampleConfig, fiber_manifest, label_state, load_fibers,
+from ..shared.state_labels import constructed_facts
+from ..shared.data import (SampleConfig, fiber_manifest, label_state, replay_facts, load_fibers,
                            OnPolicyStates, split_fibers, ZBand)
 from ..shared.geometry import arclength, frame_from_heading, interp_at, tangent_at
 from ..shared.policy import commit_prefix
@@ -45,7 +46,7 @@ def replay_item(source, row, fibers, sample):
     provenance = 'Complete committed CT-normal replay prefix'
     index = int(get('fiber_idx'))
     item = label_state(fibers[index], get('pos'), get('frame'), get('hist'), get('hmask'), sample,
-                      t=float(get('t')), reverse=bool(get('reverse')), offtrack=bool(get('offtrack')))
+                      t=float(get('t')), reverse=bool(get('reverse')), trace=replay_facts(states, row, sample))
     item.update({key: get(key) for key in SEED_FIELDS})
     item['observed_path'] = prefix
     from ..shared.heading import FRAME_POLICY
@@ -65,8 +66,8 @@ def annotation_item(fiber, at, reverse, sample):
     history_at = at - np.arange(1, sample.n_history + 1) * sample.history_step
     hist = interp_at(points, arc, history_at.clip(0, fiber.length))
     mask = (history_at >= 0).astype(np.float32)
-    item = label_state(fiber, pos, frame, hist, mask, sample,
-                       t=fiber.length-at if reverse else at, reverse=reverse)
+    item = label_state(fiber, pos, frame, hist, mask, sample, t=fiber.length-at if reverse else at, reverse=reverse,
+                       trace=constructed_facts(fiber, at, reverse, pos, sample))
     # Entire known annotation prefix is explicitly a synthetic observed path.
     item['observed_path'] = np.concatenate((points[arc < at], pos[None]))
     seed_local = (points[:1] - pos) @ frame

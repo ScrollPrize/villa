@@ -43,6 +43,22 @@ def make_seeds(fibers: list[TracedFiber], vol, per_fiber: int = 3,
     return out
 
 
+def directed_seed(fiber: TracedFiber, vol, rng, sign: float, margin: float = 32.0):
+    """One annotated position and its CT/HV axis in one traversal direction.
+
+    Returns None for a fiber too short for the margin. Missing CT orientation raises
+    ``SeedHeadingError``; the caller skips that fiber with an explicit reason.
+    """
+    if fiber.length < 2*margin:
+        return None
+    ts = np.arange(margin, fiber.length-margin, 4.0)
+    t = float(ts[int(rng.integers(len(ts)))])
+    p = interp_at(fiber.points, fiber.s, np.array([t]))[0]
+    axis = oriented_seed_heading(vol, p, fiber.tag, tangent_at(fiber.points, fiber.s, t))
+    return dict(t=t, sign=float(sign), pos=p, heading=float(sign)*axis, family=fiber.tag,
+                seed_heading_policy=SEED_HEADING_POLICY)
+
+
 def trace_events(path, fiber, t0, sign, tol=3.0, patience=3, tree=None):
     """First sustained departure and first supported endpoint-plane crossing.
 
@@ -154,7 +170,7 @@ def evaluate(tracer, fibers, seeds, batch: int = 256, history_audit=None, on_tra
             history_audit.start_batch(fibers, chunk)
             kwargs['on_decision'] = history_audit
         paths, reasons = tracer.trace(np.stack([s["pos"] for s in chunk]), np.stack([s["heading"] for s in chunk]), **kwargs)
-        for s, p, r in zip(chunk, paths, reasons):
+        for position, (s, p, r) in enumerate(zip(chunk, paths, reasons)):
             f = fibers[s["fiber"]]
             if s["fiber"] not in trees:
                 trees[s["fiber"]] = cKDTree(f.points)
@@ -165,6 +181,8 @@ def evaluate(tracer, fibers, seeds, batch: int = 256, history_audit=None, on_tra
             m.update(reason=r, fiber=s["fiber"], fiber_name=f.name,
                      seed_span_mode=span.provenance.interp_mode if span else None,
                      t0=s["t"], sign=s["sign"])
+            if history_audit is not None and hasattr(history_audit, 'outcomes'):
+                m.update(history_audit.outcomes(position, p, r))
             rows.append(m)
             if on_trace is not None:
                 on_trace(s, p, r)
@@ -200,3 +218,184 @@ def summarize(rows):
         endpoint_overrun_length=sum(r["endpoint_overrun"] for r in rows),
         known_endpoint_traces=sum(r["endpoint_known"] for r in rows),
     )
+
+
+RETURN_DISTANCE = 2.0  # a geometric return: at most this far for RETURN_LENGTH voxels of travel
+RETURN_LENGTH = 32.0
+DISTANCE_EVENT = 6.0
+
+
+def distance_profile(path, fiber, t0, sign, chunk=8):
+    """Per-vertex distance to the original fiber under the shared bounded correspondence."""
+    from .geometry import arclength
+    from .state_labels import TraceLabeler
+    path = np.asarray(path, np.float64).reshape(-1, 3)
+    labeler = TraceLabeler(fiber, t0, sign, tolerance=1., max_recovery_distance=1.)
+    arc = arclength(path) if len(path) > 1 else np.zeros(len(path))
+    distances = []
+    labeler.observe(path[:1], 0.)
+    distances.extend(labeler.vertex_distances)
+    for start in range(0, len(path)-1, chunk):
+        end = min(len(path)-1, start+chunk)
+        labeler.observe(path[start:end+1], float(arc[end]))
+        distances.extend(labeler.vertex_distances)
+    return arc, np.asarray(distances)
+
+
+def sustained_onsets(bad, patience=3):
+    """Start indices of runs of at least ``patience`` consecutive True values."""
+    onsets, run = [], 0
+    for index, value in enumerate(bad):
+        run = run+1 if value else 0
+        if run == patience:
+            onsets.append(index-patience+1)
+    return onsets
+
+
+def returned_after(arc, distance, start):
+    """Travel at which the trace stays within RETURN_DISTANCE for RETURN_LENGTH voxels, or None."""
+    begin = None
+    for index in range(start, len(distance)):
+        if distance[index] <= RETURN_DISTANCE:
+            begin = index if begin is None else begin
+            if arc[index]-arc[begin] >= RETURN_LENGTH:
+                return float(arc[begin])
+        else:
+            begin = None
+    return None
+
+
+def geometric_outcomes(path, fiber, t0, sign, *, tolerance=3.0):
+    """Excursions/returns, distance events and current geometric agreement of one trace.
+
+    The strict first-departure metric stays in ``score_trace``; a later return never
+    erases it. Distance events (sustained > DISTANCE_EVENT) are not identity failures.
+    """
+    arc, distance = distance_profile(path, fiber, t0, sign)
+    segment = np.diff(arc, prepend=0.)
+    finite = np.isfinite(distance)
+    agreement = float(segment[finite & (distance <= tolerance)].sum())
+    outcome = dict(geometric_agreement=agreement, excursions=0, excursion_returns=0,
+                   distance_events=0, distance_event_returns=0, distance_events_ended=0)
+    for name, threshold in (('excursion', tolerance), ('distance_event', DISTANCE_EVENT)):
+        bad = ~(distance <= threshold)
+        cursor = 0
+        while True:
+            onsets = [o for o in sustained_onsets(bad[cursor:]) if o >= 0]
+            if not onsets:
+                break
+            onset = cursor+onsets[0]
+            outcome[name+'s'] += 1
+            back = returned_after(arc, distance, onset)
+            if back is None:
+                if name == 'distance_event' and arc[-1]-arc[onset] < RETURN_LENGTH:
+                    outcome['distance_events_ended'] += 1
+                break
+            outcome[name+'_returns'] += 1
+            cursor = int(np.searchsorted(arc, back+RETURN_LENGTH))
+            if cursor >= len(arc):
+                break
+    return outcome
+
+
+class EvaluationAudit:
+    """Decision-level outcomes under the shared state contract, without affecting the trace.
+
+    Counts rejected unsafe proposals, stops with a supported continuation, recovery commits
+    that cross a certified foreign fiber, and confirmed switches with the length accepted
+    after them. Neighbor-bank coverage is reported because absent contact is not proof
+    that no foreign fiber exists.
+    """
+    def __init__(self, tracer, tolerance=1.5, detector=None):
+        from .data import SampleConfig
+        cfg = tracer.model.cfg
+        self.cfg = SampleConfig(crop=tracer.crop, n_history=tracer.n_history, recent_history_points=cfg.recent_history_points,
+                                n_future=cfg.n_future, future_step=cfg.future_step, label_tolerance=tolerance,
+                                max_recovery_distance=cfg.max_recovery_distance)
+        self.tolerance, self.detector = tolerance, detector
+
+    def start_batch(self, fibers, seeds):
+        from .state_labels import TraceLabeler
+        self.seeds = list(seeds)
+        self.labelers = [TraceLabeler(fibers[s['fiber']], s['t'], s['sign'], tolerance=self.tolerance,
+                                      max_recovery_distance=self.cfg.max_recovery_distance, fiber_idx=s['fiber'],
+                                      bank_detector=self.detector) for s in seeds]
+        self.records = [dict(decisions=0, rejected_unsafe=0, rejected_safe=0, accepted_unsafe=0, premature_stop=0,
+                             stop_unknown=0, terminal_stop=0, recovery_foreign_contacts=0, recovery_commits=0,
+                             displaced_previous=False) for _ in seeds]
+
+    def __call__(self, index, state):
+        import torch
+        from .data import label_state
+        from .labels import prefix_labels
+        from .state_labels import FOLLOWING, RECOVERABLE, TERMINAL
+        labeler, record = self.labelers[index], self.records[index]
+        switched_before = labeler.switch is not None
+        facts = labeler.observe(state['last_segment'], state['travelled'])
+        if labeler.switch is not None and not switched_before and record['displaced_previous']:
+            record['recovery_foreign_contacts'] += 1
+        item = label_state(labeler.fiber, state['pos'], state['frame'], state['hist'], state['hmask'], self.cfg,
+                           t=facts['t'], reverse=labeler.sign < 0, trace=facts)
+        tensor = lambda a: torch.as_tensor(np.asarray(a), dtype=torch.float32)[None]
+        batch = {k: tensor(item[k]) for k in ('dense_ab', 'dense_mask', 'endpoint_known', 'end_local', 'terminal',
+                                              'confidence_valid')}
+        labels, known, _ = prefix_labels(tensor(state['points']), batch, self.tolerance, self.cfg.max_recovery_distance)
+        commit = int(state['n_commit'])
+        index_ = max(0, commit-1)
+        safe_known, safe = bool(known[0, 0]), bool(labels[0, 0])
+        supported = item['geometry_valid'] and int(item['supervision']) in (FOLLOWING, RECOVERABLE)
+        record['decisions'] += 1
+        displaced = facts['match_distance'] > 3.
+        if state['would_stop']:
+            if int(item['supervision']) == TERMINAL:
+                record['terminal_stop'] += 1
+            elif supported:
+                record['premature_stop'] += 1
+            else:
+                record['stop_unknown'] += 1
+            if safe_known:
+                record['rejected_safe' if safe else 'rejected_unsafe'] += 1
+        else:
+            if bool(known[0, index_]) and not bool(labels[0, index_]):
+                record['accepted_unsafe'] += 1
+            if displaced:
+                record['recovery_commits'] += 1
+        record['displaced_previous'] = displaced and not state['would_stop']
+
+    def outcomes(self, index, path, reason):
+        from .geometry import arclength
+        labeler, record = self.labelers[index], dict(self.records[index])
+        record.pop('displaced_previous')
+        path = np.asarray(path, np.float64).reshape(-1, 3)
+        arc = arclength(path) if len(path) > 1 else np.zeros(len(path))
+        total = float(arc[-1]) if len(arc) else 0.
+        tail = arc > labeler.last_travelled+1e-6
+        if self.detector is not None and labeler.switch is None and tail.any() and reason != 'oracle':
+            # The final commit had no following decision; check its contact too.
+            first = int(np.flatnonzero(tail)[0])
+            labeler.observe(path[max(0, first-1):], total)
+        switch = labeler.switch
+        record.update(confirmed_switch=switch is not None,
+                      length_after_switch=max(0., total-switch['switch_distance']) if switch else 0.,
+                      identity_coverage=bool(self.detector is not None and any(
+                          bank.spatial_records(labeler.fiber_idx, np.asarray(path), radius=8.)
+                          for bank in self.detector.banks)),
+                      **geometric_outcomes(path, labeler.fiber, self.seeds[index]['t'], labeler.sign))
+        return record
+
+
+OUTCOME_COUNTS = ('decisions', 'rejected_unsafe', 'rejected_safe', 'accepted_unsafe', 'premature_stop', 'stop_unknown',
+                  'terminal_stop', 'recovery_foreign_contacts', 'recovery_commits', 'confirmed_switch',
+                  'identity_coverage', 'excursions', 'excursion_returns', 'distance_events', 'distance_event_returns',
+                  'distance_events_ended')
+OUTCOME_LENGTHS = ('length_after_switch', 'geometric_agreement')
+
+
+def summarize_outcomes(rows):
+    """Totals of the decision and geometric outcomes, next to the first-failure summary."""
+    from .experiment import rollout_summary
+    result = rollout_summary(rows)
+    for key in OUTCOME_COUNTS+OUTCOME_LENGTHS:
+        if rows and key in rows[0]:
+            result[key] = float(sum(float(r[key]) for r in rows))
+    return result

@@ -8,12 +8,13 @@ import torch
 from scipy.ndimage import gaussian_filter
 
 from vesuvius.neural_tracing.fiber_follow.shared.components import ComponentRule
-from vesuvius.neural_tracing.fiber_follow.shared.data import collate_targets, resolve_trace_seed
+from vesuvius.neural_tracing.fiber_follow.shared.data import SOURCE, collate_targets, resolve_trace_seed
 from vesuvius.neural_tracing.fiber_follow.shared.crop_sampling import scalar_crops, empty_image_batch
 from vesuvius.neural_tracing.fiber_follow.shared.ct_normalization import BACKGROUND, LIMIT
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import interp_at
 from vesuvius.neural_tracing.fiber_follow.shared.trace import ModelTracer
 from vesuvius.neural_tracing.fiber_follow.shared.reference import SEED_FIELDS, observed_seed
+from vesuvius.neural_tracing.fiber_follow.shared.state_labels import DEPARTURE_DISTANCE, supervise
 from vesuvius.neural_tracing.fiber_follow.shared.heading import (
     orient_item, frame_prefetch_bounds, heading_free_bounds, reframe_item, FRAME_POLICY,
 )
@@ -118,7 +119,7 @@ class ObservationBuilder:
 
 @dataclass(frozen=True)
 class IdentitySampling:
-    """Training-only identity targets, augmentation and ambiguous-state oversampling."""
+    """Training-only identity targets, augmentation and fresh-location oversampling."""
     rule: ComponentRule = ComponentRule()
     on_fiber_tolerance: float = 1.5  # visible reference counts toward the anchor within this of GT
     presence_dropout: float = .25
@@ -127,21 +128,13 @@ class IdentitySampling:
     noise: float = .03  # maximum Gaussian noise standard deviation
     blur_probability: float = .25
     blur_sigma: tuple = (.5, 1.25)  # Gaussian sigma in sampled crop voxels
-    lateral_fraction: float = .1  # near earlier fresh states that had bank negatives
+    lateral_fraction: float = .1  # fresh locations near earlier fresh states that had bank negatives
     lateral_memory: int = 1024
-    bank_wrong_continuation_probability: float = .75
-    bank_wrong_continuation_tail: tuple = (4., 16.)
-    bank_following_probability: float = 0.  # independent fraction of endpoint proposals
     bank_hard_fraction: float = .5  # mix geometry-ranked proposals with uniform bank draws
-    replay_failure_fraction: float = .5  # remainder preserves recoverable drift bands
-    bank_coverage_probability: float = 0.  # reserved fresh slots on covered parent spans
-    prefer_long_continuations: bool = False
-    decision_fraction: float = 0.  # fraction of endpoint proposals reserved for matched pairs
-    decision_choice_fraction: float = .75  # requested choice share; remaining pairs teach departure
-    candidate_tolerance: float = 1.5
-    # Fresh draws replaced by long original-then-neighbor observed paths.
-    memory_switch_probability: float = 0.
-    memory_switch_tail: tuple = (16., 96.)
+    bank_coverage_probability: float = 0.  # fresh locations on covered parent spans
+    # Certified synthetic failures: OU-noised original prefix, bridge, short neighbor tail.
+    synthetic_tail: tuple = (4., 16.)
+    synthetic_prefix: tuple = (128., 1024.)
     # Crop roll about the heading: exact 180-degree flips make the tracer's roll-sign
     # convention irrelevant; jitter covers CT roll-estimate noise (p99 ~5 degrees).
     roll_flip_probability: float = .5
@@ -150,9 +143,7 @@ class IdentitySampling:
 
     def __post_init__(self):
         if isinstance(self.rule, dict):
-            # Checkpoints before pair sampling v5 stored a presence threshold.
-            rule = {k: v for k, v in self.rule.items() if k != 'threshold'}
-            object.__setattr__(self, 'rule', ComponentRule(**rule))
+            object.__setattr__(self, 'rule', ComponentRule(**self.rule))
         if not all(0 <= f <= 1 for f in (self.presence_dropout, self.lateral_fraction)):
             raise ValueError('Identity sampling probabilities must lie in [0, 1]')
         if self.lateral_memory < 1 or self.contrast < 1:
@@ -168,31 +159,17 @@ class IdentitySampling:
         object.__setattr__(self, 'blur_sigma', tuple(self.blur_sigma))
         if not np.isfinite(self.rule.lateral_max) or self.rule.lateral_max <= self.rule.own_radius:
             raise ValueError('Identity negative radius must exceed own-fiber radius')
-        if not 0 <= self.bank_wrong_continuation_probability <= 1:
-            raise ValueError('Bank wrong-continuation probability must be in [0,1]')
-        if not 0 <= self.bank_following_probability <= 1:
-            raise ValueError('Bank following probability must be in [0,1]')
-        if not all(np.isfinite(v) and 0 <= v <= 1 for v in (self.bank_hard_fraction, self.replay_failure_fraction)):
-            raise ValueError('Hard-bank and replay-failure fractions must be in [0,1]')
-        if not 0 <= self.decision_fraction <= 1:
-            raise ValueError('Decision fraction must be in [0,1]')
-        if self.decision_fraction+self.bank_following_probability > 1:
-            raise ValueError('Decision and bank-following endpoint fractions must sum to at most one')
-        if not 0 <= self.decision_choice_fraction <= 1:
-            raise ValueError('Decision choice fraction must be in [0,1]')
-        if not np.isfinite(self.candidate_tolerance) or self.candidate_tolerance <= 0:
-            raise ValueError('Candidate tolerance must be finite and positive')
+        if not np.isfinite(self.bank_hard_fraction) or not 0 <= self.bank_hard_fraction <= 1:
+            raise ValueError('Hard-bank fraction must be in [0,1]')
         if not 0 <= self.bank_coverage_probability <= 1:
             raise ValueError('Covered fresh probability must be in [0,1]')
-        if not 0 <= self.memory_switch_probability <= 1-self.bank_coverage_probability:
-            raise ValueError('Covered and memory-switch fresh probabilities must sum to at most one')
         from vesuvius.neural_tracing.fiber_follow.regression.neighbor_continuations import validate_tail_range
-        object.__setattr__(self, 'bank_wrong_continuation_tail', validate_tail_range(self.bank_wrong_continuation_tail))
-        object.__setattr__(self, 'memory_switch_tail', validate_tail_range(self.memory_switch_tail))
+        object.__setattr__(self, 'synthetic_tail', validate_tail_range(self.synthetic_tail))
+        object.__setattr__(self, 'synthetic_prefix', validate_tail_range(self.synthetic_prefix))
 
 
 # Oversampled fresh locations, recorded per state.
-LOCATION_SOURCES = ('uniform', 'lateral', 'bank_following', 'bank_covered', 'decision_pair', 'memory_switch')
+LOCATION_SOURCES = ('uniform', 'lateral', 'bank_covered')
 
 
 def traversal(fiber, reverse):
@@ -279,68 +256,69 @@ def augment_image_pair(image, params, rng, *, blur_sigma=0., drop_presence=False
         values[1] = 0
 
 
-class IdentityObservationBuilder(ObservationBuilder):
-    """Bank-derived following, foreign masks, and history-dependent path decisions."""
+def roll_frame(frame, angle):
+    c, s = np.cos(angle), np.sin(angle)
+    return np.asarray(frame) @ np.array([[c, -s, 0.], [s, c, 0.], [0., 0., 1.]])
 
-    def finalize_frames(self,items,vol):
-        super().finalize_frames(items,vol)
-        from scipy.spatial import cKDTree
-        for item in items:
-            # Observation-only roll after CT roll resolution: every local label and
-            # input follows the rotated frame; world geometry is unchanged.
-            angle = item.pop('roll_augmentation', 0.) if self.augment else 0.
-            if angle:
-                c, s = np.cos(angle), np.sin(angle)
-                reframe_item(item, np.asarray(item['frame']) @ np.array([[c, -s, 0.], [s, c, 0.], [0., 0., 1.]]))
-                item['roll_augmented'] = angle
-            reference_layout(item,self.cfg)
-            if 'identity_curve' in item:
-                curve = item['identity_curve']
-                distance = (cKDTree(curve).query(item['reference_points'])[0] if len(curve)
-                            else np.full(len(item['reference_points']),np.inf))
-                on = (distance <= self.sampling.on_fiber_tolerance) & item['reference_mask'].astype(bool)
-                item['reference_on_fiber'] = on.astype(np.float32)
-                item['identity_reference_valid'] = bool(on[:-1].sum() >= 2 or on[-1])
-                item['identity_observable'] = bool(not item.get('offtrack',False)
-                    or item['identity_reference_valid'] or item.get('slab_identity_observable',False))
-            if 'candidate_points' in item:
-                inside = visible_points(item['candidate_points'],self.cfg.fine)
-                item['candidate_mask'] = np.minimum.accumulate(item['candidate_mask']*inside,axis=-1)
+
+class IdentityObservationBuilder(ObservationBuilder):
+    """Foreign masks, identity evidence and augmentation on top of the shared observation."""
 
     def __init__(self,cfg: DirectConfig,fibers=None,sampling=IdentitySampling(),*,
-                 augment=False,negative_bank=None,
-                 near_negative_bank=None,following_bank=None,continuation_bank=None):
+                 augment=False,negative_bank=None,near_negative_bank=None,continuation_bank=None):
         super().__init__(cfg)
         self.fibers,self.sampling,self.augment = fibers,sampling,augment
         self.negative_bank,self.near_negative_bank = negative_bank,near_negative_bank
-        self.following_bank,self.continuation_bank = following_bank,continuation_bank
+        self.continuation_bank = continuation_bank
         self.lateral = deque(maxlen=sampling.lateral_memory)
 
-    def decision_pair(self, sample_cfg, rng):
-        from vesuvius.neural_tracing.fiber_follow.regression.identity_decisions import decision_pair
-        if self.negative_bank is None:
-            raise ValueError('Matched decisions require a bank')
-        return decision_pair(self.near_negative_bank or self.negative_bank, sample_cfg, self.cfg, rng,
-                             choice=rng.random() < self.sampling.decision_choice_fraction,
-                             hard_fraction=self.sampling.bank_hard_fraction)
+    def apply_roll(self, item):
+        """Apply a drawn roll once the frame is final, before any read is planned.
 
-    def bank_following(self, sample_cfg, rng):
-        """Draw a generated target from the dedicated endpoint budget."""
-        from vesuvius.neural_tracing.fiber_follow.regression.neighbor_following import following_sample
-        bank = self.following_bank or self.negative_bank
-        return None if bank is None else following_sample(bank, sample_cfg, rng,
-                                                        hard_fraction=self.sampling.bank_hard_fraction)
+        Every local label, reference and crop footprint then shares the rolled frame;
+        world geometry is unchanged. Unresolved CT frames keep the roll pending: their
+        planned footprint already covers every roll about the heading.
+        """
+        if item.get('frame_policy') != FRAME_POLICY or 'roll_augmentation' not in item:
+            return item
+        angle = item.pop('roll_augmentation')
+        if angle:
+            reframe_item(item, roll_frame(item['frame'], angle))
+            item['roll_augmented'] = angle
+        return item
 
-    def replace_fresh(self, sample_cfg, rng):
-        """Oversample covered annotations or switch histories with annotated targets."""
+    def identity_evidence(self, item, curve):
+        """Visible original-fiber evidence; it gates every displaced state's supervision."""
+        from scipy.spatial import cKDTree
+        reference_layout(item,self.cfg)
+        distance = (cKDTree(curve).query(item['reference_points'])[0] if len(curve)
+                    else np.full(len(item['reference_points']),np.inf))
+        on = (distance <= self.sampling.on_fiber_tolerance) & item['reference_mask'].astype(bool)
+        item['reference_on_fiber'] = on.astype(np.float32)
+        item['identity_reference_valid'] = bool(on[:-1].sum() >= 2 or on[-1])
+        item['identity_evidence'] = bool(item['identity_reference_valid'] or item.get('slab_identity_observable', False))
+        item['identity_observable'] = bool(item['match_distance'] <= DEPARTURE_DISTANCE or item['identity_evidence'])
+        if 'trace_facts' in item:
+            item['trace_facts']['identity_observable'] = item['identity_evidence']
+            supervise(item)
+        return item
+
+    def finalize_frames(self,items,vol):
+        super().finalize_frames(items,vol)
+        for item in items:
+            if self.augment:
+                self.apply_roll(item)
+            else:
+                item.pop('roll_augmentation', None)
+            if 'identity_curve' in item:
+                self.identity_evidence(item, item['identity_curve'])
+            else:
+                reference_layout(item,self.cfg)
+
+    def replace_fresh(self, sample_cfg, rng, **options):
+        """Oversample covered annotations with annotated targets."""
         s = self.sampling
-        reserved = s.bank_coverage_probability
-        if self.negative_bank is None or reserved+s.memory_switch_probability == 0:
-            return None
-        u = rng.random()
-        if u >= reserved:
-            if u < reserved+s.memory_switch_probability:
-                return self.memory_switch(sample_cfg,rng)
+        if self.negative_bank is None or not s.bank_coverage_probability or rng.random() >= s.bank_coverage_probability:
             return None
         from vesuvius.neural_tracing.fiber_follow.shared.data import make_sample
         banks = [self.negative_bank]+([self.near_negative_bank]
@@ -358,39 +336,26 @@ class IdentityObservationBuilder(ObservationBuilder):
             if hi <= lo:
                 continue
             t = float(rng.uniform(lo,hi))
-            item = make_sample(bank.fibers[fi],t,reverse,sample_cfg,rng)
-            item.update(fiber_ref=(fi,t,reverse),source=0,source_step=-1,stratum=-1,location_source=LOCATION_SOURCES.index('bank_covered'))
+            item = make_sample(bank.fibers[fi],t,reverse,sample_cfg,rng,**options)
+            item.update(fiber_ref=(fi,t,reverse),location_source=LOCATION_SOURCES.index('bank_covered'))
             self.prepare(item,bank.fibers[fi],rng)
             if item['reference_on_fiber'][:-1].sum() >= 2:
-                item['_identity_prepared'] = True
                 return item
         return None
 
-    def memory_switch(self, sample_cfg, rng):
-        """Original fiber, bridge, then a long neighbor tail in one observed prefix."""
+    def synthetic_terminal(self, sample_cfg, rng):
+        """Certified wrong continuation after an OU-noised original prefix; labeled terminal."""
         from vesuvius.neural_tracing.fiber_follow.regression.neighbor_continuations import wrong_continuation
-        for _ in range(3):
-            item = wrong_continuation(self.continuation_bank or self.negative_bank,sample_cfg,rng,
-                                      tail_length_range=self.sampling.memory_switch_tail,prefer_long=True,
-                                      prefix_length=float(rng.uniform(128., 1024.)))
-            if item is not None:
-                item['location_source'] = LOCATION_SOURCES.index('memory_switch')
-                return item
-        return None
-
-    def replace_replay(self, source, stratum, sample_cfg, rng):
-        """Prefer bank departures only within the recent DAgger departure slot."""
-        if (source != 2 or stratum != 4 or self.negative_bank is None
-                or rng.random() >= self.sampling.bank_wrong_continuation_probability):
+        bank = self.continuation_bank or self.negative_bank
+        if bank is None:
             return None
-        from vesuvius.neural_tracing.fiber_follow.regression.neighbor_continuations import wrong_continuation
         for _ in range(3):
-            item = wrong_continuation(self.continuation_bank or self.negative_bank,sample_cfg,rng,
-                                      tail_length_range=self.sampling.bank_wrong_continuation_tail,
-                                      prefer_long=self.sampling.prefer_long_continuations)
+            item = wrong_continuation(bank,sample_cfg,rng,tail_length_range=self.sampling.synthetic_tail,
+                                      prefix_length=float(rng.uniform(*self.sampling.synthetic_prefix)))
             if item is not None:
                 return item
         return None
+
     def fresh_location(self, rng):
         if rng.random() < self.sampling.lateral_fraction and self.lateral:
             fi, t, reverse = self.lateral[int(rng.integers(len(self.lateral)))]
@@ -400,47 +365,32 @@ class IdentityObservationBuilder(ObservationBuilder):
         return None
 
     def prepare(self,item,fiber,rng):
-        """Build observable references and labels; annotations never become inputs."""
-        if item.pop('_identity_prepared',False):
-            return item
+        """Build observable references, identity evidence and augmentation draws.
+
+        Annotations never become inputs. A recorded (final) frame takes its roll now,
+        before footprint checks and read planning.
+        """
         cfg,s = self.cfg,self.sampling
         _,t,reverse = item['fiber_ref']
         p,arc = traversal(fiber,reverse)
         pos,frame = np.asarray(item['pos']),np.asarray(item['frame'])
         local = lambda arcs: (interp_at(p,arc,np.clip(arcs,0,fiber.length))-pos) @ frame
-        if 'seed_valid' not in item and item.get('source',0) in (0,4):
+        if 'seed_valid' not in item:
             item.update(observed_seed(pos,frame,item['hist_local'],item['hmask']))
-        reference_layout(item,cfg)
         # Sample the label curve densely enough for reference membership, including
         # recovery offsets. Only visible references are eligible for supervision.
         extent = max(cfg.n_history,cfg.fine.depth*cfg.fine.spacing)+16
         curve = local(np.arange(max(0.,t-extent),min(fiber.length,t+extent)+1e-9,.25))
-        if len(curve):
+        if item['match_distance'] > DEPARTURE_DISTANCE or item.get('source') == SOURCE['synthetic']:
             from scipy.spatial import cKDTree
-            distance = cKDTree(curve).query(item['reference_points'])[0]
-            on = (distance <= s.on_fiber_tolerance) & item['reference_mask'].astype(bool)
-        else:
-            on = np.zeros(cfg.n_history+1,bool)
-        item['reference_on_fiber'] = on.astype(np.float32)
-        item['identity_reference_valid'] = bool(on[:-1].sum() >= 2 or on[-1])
-        # Confirmed old departures with no visible original-fiber evidence cannot
-        # be distinguished from ordinary following of the neighboring fiber.
-        item['identity_observable'] = bool(not item.get('offtrack',False) or item['identity_reference_valid'])
-        if item.get('offtrack', False):
             from .history_slabs import slab_layout
-            observations = slab_layout(item)
             # Membership affects labels only; every observed slab is still input.
-            from scipy.spatial import cKDTree
-            distance = cKDTree(fiber.points).query(np.stack([o['pos'] for o in observations]))[0]
+            distance = cKDTree(fiber.points).query(np.stack([o['pos'] for o in slab_layout(item)]))[0]
             item['slab_identity_observable'] = bool((distance <= s.on_fiber_tolerance).any())
-            item['identity_observable'] |= item['slab_identity_observable']
         item['identity_curve'] = curve
+        self.identity_evidence(item, curve)
         visible = visible_points(curve,cfg.fine)
         item['identity_label_z'] = (curve[visible] @ frame.T+pos)[:,2] if visible.any() else pos[2:3]
-        if 'pair_observation_seed' in item:
-            # Matched local inputs stay identical after augmentation as well;
-            # the earlier observations must supply the distinguishing evidence.
-            rng = np.random.default_rng(item['pair_observation_seed'])
         if self.augment:
             draw = (float(np.exp(rng.uniform(-np.log(s.contrast),np.log(s.contrast)))),
                     float(rng.uniform(-s.brightness,s.brightness)),float(rng.uniform(0,s.noise)))
@@ -449,6 +399,7 @@ class IdentityObservationBuilder(ObservationBuilder):
                                   if s.blur_probability and rng.random() < s.blur_probability else 0.)
             jitter = float(np.clip(rng.normal(0., s.roll_jitter_deg), -s.roll_jitter_max_deg, s.roll_jitter_max_deg))
             item['roll_augmentation'] = float(np.deg2rad(jitter)+(np.pi if rng.random() < s.roll_flip_probability else 0.))
+            self.apply_roll(item)
         item['identity_seed'] = int(rng.integers(2**63))
         item.setdefault('location_source',0)
         return item
@@ -485,7 +436,7 @@ class IdentityObservationBuilder(ObservationBuilder):
             out['location_source'][j] = item.get('location_source', 0)
             if 'identity_curve' not in item:
                 continue
-            feedback = (self.fibers is not None and item.get('source') == 0
+            feedback = (self.fibers is not None and item.get('source') == SOURCE['fresh']
                         and not item.get('_sampling_feedback_prepared',False))
             if not selected[j] and not feedback:
                 continue
@@ -531,32 +482,6 @@ class IdentityObservationBuilder(ObservationBuilder):
         batch.update(self.bank_targets(items, selected))
         batch['identity_observable'] = torch.tensor([i.get('identity_observable',True) for i in items])
         batch['bank_tail_length'] = torch.tensor([i.get('bank_tail_length',0.) for i in items],dtype=torch.float32)
-        if self.sampling.decision_fraction and len(indices):
-            from .identity_decisions import CANDIDATE_COUNT
-            from .supervision import candidate_targets
-            shape = (CANDIDATE_COUNT,self.cfg.n_future)
-            # CT frame rotation promotes local coordinates to NumPy float64.
-            # Match the other FP32 model inputs before candidate scoring/autocast.
-            for key,trailing in (('candidate_points',(3,)),('candidate_mask',())):
-                batch[key] = torch.as_tensor(np.stack([
-                    i.get(key,np.zeros((*shape,*trailing),np.float32)) for i in items]), dtype=torch.float32)
-            batch['candidate_kind'] = torch.from_numpy(np.stack([i.get('candidate_kind',
-                np.full(CANDIDATE_COUNT, -1, np.int64)) for i in items]))
-            # Most rows have no supplied candidate paths, even at decisions.
-            # Avoid sampling their full foreign volume for four all-masked paths.
-            eligible = (selected & batch['candidate_mask'].bool().flatten(1).any(1)
-                        & batch['identity_observable']).nonzero().flatten()
-            labels = torch.zeros_like(batch['candidate_mask'], dtype=torch.float32)
-            known = torch.zeros_like(labels)
-            if len(eligible):
-                target_batch = batch if len(eligible) == len(items) else {
-                    k: v[eligible] for k, v in batch.items() if torch.is_tensor(v)}
-                target, mask = candidate_targets(target_batch, self.cfg, self.sampling.candidate_tolerance)
-                labels[eligible], known[eligible] = target, mask
-            batch['candidate_labels'], batch['candidate_mask'] = labels, known
-            batch['identity_pair_id'] = torch.tensor([i.get('pair_observation_seed', -1) for i in items], dtype=torch.int64)
-            for key in ('decision_kind','decision_tail'):
-                batch[key] = torch.tensor([i.get(key,0) for i in items],dtype=torch.float32)
         batch['seed_present'] = batch['x']['seed_mask'].flatten()
         if self.augment:
             from ..shared.ct_normalization import ZSCORE_METHOD
@@ -575,7 +500,6 @@ class IdentityObservationBuilder(ObservationBuilder):
                 if item['drop_presence']:
                     batch['presence_dropped'][j] = 1
         return batch
-
 
 
 def observation_builder(cfg,**kwargs):

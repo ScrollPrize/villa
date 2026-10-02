@@ -141,8 +141,8 @@ def observable_half_width(cfg):
 def flow_targets(batch, cfg):
     """Annotated crossings the crop can observe: coordinates, token mask, censored mask.
 
-    A token is supervised when its plane is annotated, the state has not
-    departed, and no annotated plane up to it lies outside the observable
+    A token is supervised when its plane is annotated, the state contract
+    certifies its geometry (``geometry_valid``), and no annotated plane up to it lies outside the observable
     lateral extent. Once the curve leaves the crop, later crossings are
     unobservable even if it re-enters, so censoring is a prefix. Unannotated
     planes never break the prefix, whatever their padding holds. ``censored``
@@ -151,7 +151,7 @@ def flow_targets(batch, cfg):
     """
     ab = batch['plane_ab'].float()
     x1 = torch.cat([ab, future_planes(cfg, ab.device)[None, :, None].expand(len(ab), -1, 1)], -1)
-    annotated = batch['plane_mask'].float()*(1-batch['offtrack'].float())[:, None]
+    annotated = batch['plane_mask'].float()*batch['geometry_valid'].float()[:, None]
     lateral = torch.where(annotated[..., None] > 0, ab, 0.).abs().amax(-1)
     observable = (lateral <= observable_half_width(cfg)).int().cummin(-1).values.float()
     return x1, annotated*observable, annotated*(1-observable)

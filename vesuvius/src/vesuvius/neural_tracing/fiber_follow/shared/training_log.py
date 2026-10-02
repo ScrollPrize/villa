@@ -15,28 +15,107 @@ def _number(value, spec='.3f'):
     return format(value, spec) if value is not None else '--'
 
 
+class SamplingLedger:
+    """Per dataset source: requested and delivered task shares, fallbacks and supply.
+
+    Also label availability, positive/negative confidence targets, distinct fibers,
+    episodes and events, replay/live source age, startup draws and realized seed ages,
+    and replay travel strata. Accumulates CPU batch metadata between log lines.
+    """
+    def __init__(self):
+        self.sources = {}
+
+    def add(self, cpu, step, targets=None):
+        import numpy as np
+        import torch
+        from .data import FALLBACKS, SEED_AGE_STRATA, SOURCES, STARTUP_CATEGORIES, TASKS, TRAVEL_STRATA, seed_age_stratum
+        from .state_labels import REASONS, REPLAY_CLASSES, SUPERVISION
+        n = len(cpu['hist'])
+        ids = cpu.get('dataset_id', torch.zeros(n, dtype=torch.long)).tolist()
+        column = lambda key, default=-1: (cpu[key].tolist() if key in cpu else [default]*n)
+        requested, delivered, fallback = column('task_requested'), column('task_delivered'), column('task_fallback', 0)
+        supervision, reasons = column('supervision'), column('supervision_reason')
+        geometry, confidence = column('geometry_valid', False), column('confidence_valid', False)
+        sources, steps = column('source'), column('source_step')
+        fibers, episodes, events = column('fiber_id'), column('replay_episode'), column('replay_event')
+        startup, ages, travel = column('startup'), column('seed_age', 0.), column('travelled', 0.)
+        excursions, classes = column('excursion', False), column('replay_class')
+        for row, source in enumerate(ids):
+            entry = self.sources.setdefault(str(source), dict(
+                rows=0, requested={}, delivered={}, fallbacks={}, supervision={}, reasons={}, sources={},
+                replay_classes={}, geometry_valid=0, confidence_valid=0, positive_targets=0., negative_targets=0.,
+                geometry_states=0, fibers=set(), episodes=set(), events=set(), source_age_sum=0, source_age_count=0,
+                source_age_max=0, startup_requested={}, seed_age={}, replay_travel={}, excursions=0, counters={}))
+            entry['rows'] += 1
+            count = lambda table, key: table.__setitem__(key, table.get(key, 0)+1)
+            if requested[row] >= 0:
+                count(entry['requested'], TASKS[requested[row]])
+            if delivered[row] >= 0:
+                count(entry['delivered'], TASKS[delivered[row]])
+            if fallback[row] > 0 and requested[row] >= 0:
+                count(entry['fallbacks'], f'{TASKS[requested[row]]}->{FALLBACKS[fallback[row]]}')
+            if supervision[row] >= 0:
+                count(entry['supervision'], SUPERVISION[supervision[row]])
+                count(entry['reasons'], REASONS[reasons[row]])
+            if sources[row] >= 0:
+                count(entry['sources'], SOURCES[sources[row]])
+            if classes[row] >= 0:
+                count(entry['replay_classes'], REPLAY_CLASSES[classes[row]])
+            entry['geometry_valid'] += int(geometry[row])
+            entry['confidence_valid'] += int(confidence[row])
+            if fibers[row] >= 0:
+                entry['fibers'].add(fibers[row])
+            if episodes[row] >= 0:
+                entry['episodes'].add(episodes[row])
+                entry['events'].add(events[row])
+            if steps[row] >= 0:
+                age = int(step)-steps[row]
+                entry['source_age_sum'] += age
+                entry['source_age_count'] += 1
+                entry['source_age_max'] = max(entry['source_age_max'], age)
+            if startup[row] >= 0:
+                count(entry['startup_requested'], STARTUP_CATEGORIES[startup[row]])
+                count(entry['seed_age'], SEED_AGE_STRATA[seed_age_stratum(ages[row])][0])
+                entry['excursions'] += int(excursions[row])
+            if sources[row] == SOURCES.index('replay'):
+                stratum = int(np.digitize(travel[row], TRAVEL_STRATA[1:-1]))
+                count(entry['replay_travel'], f'{TRAVEL_STRATA[stratum]:g}-{TRAVEL_STRATA[stratum+1]:g}')
+            if targets is not None:
+                entry['positive_targets'] += float(targets[0][row])
+                entry['negative_targets'] += float(targets[1][row])
+                entry['geometry_states'] += int(targets[2][row])
+        # Row-0 totals from the loader (seed rejections, live outcomes, maximum reuse).
+        for key in [k for k in cpu if k.startswith(('ct_seed_', 'live_advanced', 'live_stale', 'live_censored',
+                                                     'live_empty', 'replay_max_event_reuse'))]:
+            counters = self.sources.setdefault(str(ids[0]), {}).setdefault('counters', {})
+            value = int(cpu[key][0])
+            counters[key] = max(counters.get(key, 0), value) if key == 'replay_max_event_reuse' else counters.get(key, 0)+value
+
+    def summary(self):
+        result = {}
+        for source, entry in self.sources.items():
+            entry = dict(entry)
+            rows = max(1, entry.get('rows', 0))
+            for key in ('fibers', 'episodes', 'events'):
+                entry[key] = len(entry.get(key, ()))
+            entry['requested_share'] = {k: v/rows for k, v in entry.get('requested', {}).items()}
+            entry['delivered_share'] = {k: v/rows for k, v in entry.get('delivered', {}).items()}
+            entry['source_age_mean'] = (entry['source_age_sum']/entry['source_age_count']
+                                        if entry.get('source_age_count') else None)
+            result[source] = entry
+        return result
+
+
 class DirectTrainingInterval:
     """Pool counts and weight decision-normalized means by supervised decisions."""
-    means = ('loss', 'geometry', 'confidence_loss', 'fresh_fraction',
-             'recent_fraction', 'bank_wrong_continuation_fraction',
-             'bank_following_fraction', 'decision_pair_fraction', 'refinement_attempts_mean',
-             'gt_unperturbed_fraction', 'gt_perturbed_fraction', 'replay_correct_continuation_fraction',
-             'real_wrong_turn_fraction', 'real_wrong_turn_pre_switch_fraction', 'light_gt_replay_fraction',
-             'live_requested_fraction', 'live_continuation_fraction', 'live_correct_continuation_fraction',
-             'live_failure_fraction', 'live_fallback_fraction', 'live_light_slot_fraction')
+    means = ('loss', 'geometry', 'confidence_loss', 'refinement_attempts_mean')
     counts = tuple(p+'_'+s for p in ('ct_frame', 'history_frame')
                    for s in ('count', 'transported', 'deterministic', 'energy_sum', 'gap_sum')) + (
-              'live_depth_sum', 'live_policy_age_sum', 'live_travelled_sum', 'ct_frame_rejected_batches', 'error_sum', 'geometry_count', 'point_correct_count', 'point_wrong_count',
+              'live_depth_sum', 'live_travelled_sum', 'live_rows', 'live_terminal_rows',
+              'ct_frame_rejected_batches', 'error_sum', 'geometry_count', 'point_correct_count', 'point_wrong_count',
               'point_unknown_count', 'supervised_states', 'observation_only_states', 'history_valid_slabs', 'history_age_sum', 'history_overlap_sum', 'history_load_seconds', 'history_encode_seconds',
-              'confidence_labeled_states', 'confidence_departed_states', 'refinement_attempts_sum',
-              'supervision_weight', 'endpoint_weight', 'matched_endpoint_weight', 'choice_endpoint_weight',
-              'endpoint_states', 'matched_endpoint_states', 'choice_endpoint_states',
-              'replay_bank_switch_endpoints', 'replay_premature_stop_endpoints',
-              'replay_endpoint_overshoot_endpoints', 'replay_pre_switch_endpoints')
-    nested_counts = {'identity': ('candidate_states', 'candidate_intervals', 'candidate_late_failures',
-                                 'candidate_first_failures', 'candidate_supervision_weight',
-                                 'pair_rank_comparisons', 'pair_rank_correct', 'pair_rank_margin_sum')}
-    nested_means = {'identity': ('candidate_loss', 'pair_rank_loss')}
+              'confidence_labeled_states', 'confidence_terminal_states', 'confidence_recoverable_states',
+              'connector_rejected_targets', 'refinement_attempts_sum')
 
     def __init__(self):
         self.values = dict(updates=0, crops=0, decisions=0)
@@ -58,12 +137,6 @@ class DirectTrainingInterval:
         self.values['decisions'] += decisions
         for key in self.means + self.counts:
             self.values[key] = self.values.get(key, 0.)+row.get(key, 0.)*(decisions if key in self.means else 1)
-        for section in self.nested_counts:
-            source = row.get(section, {})
-            for key in self.nested_counts[section] + self.nested_means[section]:
-                name = section+'_'+key
-                weight = decisions if key in self.nested_means[section] else 1
-                self.values[name] = self.values.get(name, 0.)+source.get(key, 0.)*weight
         for group in ('history', 'rest'):
             key = group+'_grad_norm'
             self.values[key+'_max'] = max(self.values.get(key+'_max', 0.), row.get(key, 0.))
@@ -72,8 +145,7 @@ class DirectTrainingInterval:
 
     def summary(self):
         result = dict(self.values)
-        means = list(self.means)+[s+'_'+k for s, keys in self.nested_means.items() for k in keys]
-        for key in means:
+        for key in self.means:
             result[key] = result.get(key, 0.)/max(1, result['decisions'])
         result['error_mean'] = result.get('error_sum', 0.)/result['geometry_count'] if result.get('geometry_count') else None
         return result
@@ -114,8 +186,9 @@ def _interval_training_lines(row):
         lines.append('  CT frames: '+' | '.join(frames))
     if m.get('ct_frame_rejected_batches', 0):
         lines.append(f"  CT frames: {int(m['ct_frame_rejected_batches'])} unusable batch plans rejected; retried within source")
-    lines.append(f"  scored crops: candidates {_rate(m['identity_candidate_states'], m['decisions'])}"
-                 f" | departed {_rate(m.get('confidence_departed_states', 0), m.get('confidence_labeled_states', 0))}")
+    lines.append(f"  confidence-labeled crops: terminal {_rate(m.get('confidence_terminal_states', 0), m.get('confidence_labeled_states', 0))}"
+                 f" | recoverable {_rate(m.get('confidence_recoverable_states', 0), m.get('confidence_labeled_states', 0))}"
+                 f" | target connections crossing a neighbor {int(m.get('connector_rejected_targets', 0))}")
     if 'dataset_counts' in m:
         lines.append('  datasets (IDs from dataset_configuration): '+', '.join(
             f'{key}: {value}/{int(m["decisions"])} ({value/max(1,m["decisions"]):.1%})'
@@ -128,54 +201,22 @@ def _interval_training_lines(row):
                      f" | deferred {p['deferred']} | errors {p['errors']}")
         if 'lookahead_chunks' in p:
             lines[-1] += f" | lookahead {p['lookahead_chunks']} chunk references / {p['lookahead_windows']} windows"
-    if m.get('endpoint_states'):
-        lines.append(f"  supervised endpoints: matched {_rate(m['matched_endpoint_states'], m['endpoint_states'])}"
-                     f" | geometry choices {_rate(m['choice_endpoint_states'], m['endpoint_states'])}")
-        weight = max(m['supervision_weight'], 1e-12)
-        lines.append(f"  task loss budget: endpoints {m['endpoint_weight']/weight:.1%}"
-                     f" | matched {m['matched_endpoint_weight']/weight:.1%}"
-                     f" | geometry choices {m['choice_endpoint_weight']/weight:.1%}")
-        lines.append(f"  candidate hazard targets: {int(m['identity_candidate_intervals'])} intervals"
-                     f" | {int(m['identity_candidate_first_failures'])} first-segment failures"
-                     f" | {int(m['identity_candidate_late_failures'])} later failures")
-    lines.append(f"  candidate survival loss {m['identity_candidate_loss']:.4f}"
-                 f" ({int(m['identity_candidate_states'])} eligible crops)")
-    comparisons = m.get('identity_pair_rank_comparisons', 0)
-    if comparisons:
-        lines.append(f"  paired identity: ranking loss {m.get('identity_pair_rank_loss', 0):.4f}"
-                     f" | correctly ordered {_rate(m['identity_pair_rank_correct'], comparisons)}"
-                     f" | mean logit margin {m['identity_pair_rank_margin_sum']/comparisons:.3f}")
-    lines.append('  data: '+' / '.join(f'{name} {m[key]:.0%}' for name, key in
-                 (('fresh','fresh_fraction'), ('recent','recent_fraction'),
-                  ('wrong turns','bank_wrong_continuation_fraction'), ('following','bank_following_fraction'),
-                  ('pairs','decision_pair_fraction'))))
-    if m.get('live_requested_fraction', 0):
-        live = max(1., m['live_continuation_fraction']*m['decisions'])
-        lines.append(f"  live continuation: {m['live_continuation_fraction']:.1%}"
-                     f" / correct {m['live_correct_continuation_fraction']:.1%}"
-                     f" / failure {m['live_failure_fraction']:.1%}"
-                     f" / GT fallback {m['live_fallback_fraction']:.1%}"
-                     f" | depth {m['live_depth_sum']/live:.2f}"
-                     f" | policy age {m['live_policy_age_sum']/live:.1f} updates")
-        if 'live_start_limit_counts' in m:
-            lines.append(f"  live chain starts by limit: {m['live_start_limit_counts']}"
-                         f" | reached depths: {m.get('live_depth_counts', {})}"
-                         f" | mean travel {m.get('live_travelled_sum', 0)/live:.1f} voxels")
-    if any(m.get(k, 0) for k in ('gt_unperturbed_fraction', 'gt_perturbed_fraction', 'replay_correct_continuation_fraction')):
-        lines.append(f"  data detail (% of all): simulated GT traces {m['gt_unperturbed_fraction']:.1%}"
-                     f" / live-slot GT fallback {m['gt_perturbed_fraction']:.1%}"
-                     f" / correct continuation replay {m['replay_correct_continuation_fraction']:.1%}")
-        if m.get('light_gt_replay_fraction', 0):
-            lines[-1] += f" (light-GT replacement {m['light_gt_replay_fraction']:.1%})"
-
-    failures = ('bank_switch', 'pre_switch', 'premature_stop', 'endpoint_overshoot')
-    if m.get('real_wrong_turn_fraction', 0):
-        lines.append(f"  wrong turns (% of all): real {m['real_wrong_turn_fraction']:.1%}"
-                     f" (pre-switch {m['real_wrong_turn_pre_switch_fraction']:.1%})"
-                     f" / synthetic {max(0., m['bank_wrong_continuation_fraction']-m['real_wrong_turn_fraction']):.1%}")
-    if any(m.get('replay_'+name+'_endpoints', 0) for name in failures):
-        lines.append('  replay failure endpoints: '+' / '.join(
-            f'{name.replace("_", " ")} {int(m.get("replay_"+name+"_endpoints", 0))}' for name in failures))
+    if m.get('live_rows'):
+        lines.append(f"  live continuation: {int(m['live_rows'])} rows | terminal {int(m.get('live_terminal_rows', 0))}"
+                     f" | depth {m['live_depth_sum']/m['live_rows']:.2f}"
+                     f" | mean travel {m.get('live_travelled_sum', 0)/m['live_rows']:.1f} voxels"
+                     f" | chain starts by limit {m.get('live_start_limit_counts', {})}"
+                     f" | reached depths {m.get('live_depth_counts', {})}")
+    for source, entry in sorted(row.get('sampling', {}).items()):
+        lines.append(f"  source {source}: requested "+', '.join(f'{k} {v:.0%}' for k, v in sorted(entry['requested_share'].items()))
+                     +' | delivered '+', '.join(f'{k} {v:.0%}' for k, v in sorted(entry['delivered_share'].items())))
+        lines.append(f"    fallbacks {entry['fallbacks'] or 'none'} | supervision {entry['supervision']}"
+                     f" | geometry {entry['geometry_valid']}/{entry['rows']} | confidence {entry['confidence_valid']}/{entry['rows']}"
+                     f" | targets +{entry['positive_targets']:.0f}/-{entry['negative_targets']:.0f}")
+        lines.append(f"    fibers {entry['fibers']} | episodes {entry['episodes']} | events {entry['events']}"
+                     f" | source age mean {_number(entry['source_age_mean'], '.0f')} max {entry['source_age_max']}"
+                     f" | startup {entry['startup_requested']} -> seed ages {entry['seed_age']}"
+                     f" | replay travel {entry['replay_travel']} | {entry['counters']}")
     lines.append('  gradients: '+' | '.join(
         f"{name} max {m[name+'_grad_norm_max']:.2g}, clipped {m[name+'_clipped_updates']}/{updates} updates"
         for name in ('history', 'rest')))
@@ -183,7 +224,7 @@ def _interval_training_lines(row):
 
 
 def _decision_lines(decisions):
-    bands = decisions['by_drift']
+    bands = decisions['by_state']
     stats = bands['all']
     if not stats['states']:
         return ['  decisions: no states']
@@ -195,10 +236,11 @@ def _decision_lines(decisions):
         lines.append(f"  gate @ {float(key[5:]):.2f}: false stops "
                      +_rate(gate['false_stops'], stats['first_correct'])
                      +' | accepted wrong '+_rate(gate['accepted_wrong'], gate['accepted_known'])
-                     +f" | accepted unknown {gate['accepted_unknown']} | departed continues "
-                     +_rate(gate['departed_continues'], bands['departed']['states']))
+                     +f" | accepted unknown {gate['accepted_unknown']} | terminal continues "
+                     +_rate(gate['terminal_continues'], bands['terminal']['states']))
     lines.append('  refinement: mean lateral error in voxels')
-    for title, groups in (('drift', bands), ('history', decisions.get('by_history', {}))):
+    for title, groups in (('state', bands), ('displaced', decisions.get('by_displacement', {})),
+                          ('history', decisions.get('by_history', {}))):
         if not groups:
             continue
         lines.append(f'    {title:<10} states  GT pts  initial    final')
@@ -217,19 +259,11 @@ def _decision_lines(decisions):
 
 def _direct_training_lines(row):
     lines = [f"  geometry {row['geometry']:.4f} | confidence {row['confidence_loss']:.4f}"
-             f" | mean error {row['error_mean']:.3f} voxels | prefix correct {row['prefix_correct_fraction']:.1%}",
-             f"  data: fresh {row['fresh_fraction']:.0%}"
-             f" | recent {row['recent_fraction']:.0%}"]
+             f" | mean error {_number(row['error_mean'])} voxels | prefix correct {row['prefix_correct_fraction']:.1%}"]
     if 'interval_samples_per_second' in row:
         lines.insert(0, f"  recent speed {row['interval_samples_per_second']:.2f} samples/s"
                         f" | data wait {row['interval_data_seconds']:.2f}s"
                         f" | optimizer {row['interval_update_seconds']:.2f}s per logging interval")
-    if 'bank_wrong_continuation_fraction' in row:
-        lines[-1] += f" | bank departures {row['bank_wrong_continuation_fraction']:.0%}"
-    if 'bank_following_fraction' in row:
-        lines[-1] += f" | bank following {row['bank_following_fraction']:.0%}"
-    if 'decision_pair_fraction' in row:
-        lines[-1] += f" | identity pairs {row['decision_pair_fraction']:.0%} (requested {row.get('decision_requested_fraction', 0.):.0%})"
     if 'history_grad_norm' in row:
         lines.append(f"  gradients before clipping: history {row['history_grad_norm']:.3g}"
                      f" (scale {row['history_grad_clip_scale']:.3g})"
@@ -250,14 +284,6 @@ def _identity_lines(stats):
                       if key.startswith('location_') and key.endswith('_fraction'))]
     if 'blurred_fraction' in stats:
         lines[-1] += f" | blurred {stats['blurred_fraction']:.0%}"
-    if 'candidate_loss' in stats:
-        lines.append(f"  candidate survival loss {stats['candidate_loss']:.4f}"
-                     +f" | per eligible state {stats['candidate_loss_eligible']:.4f}")
-    for name, group in stats.get('candidate_decisions', {}).items():
-        if group['states']:
-            lines.append(f"  identity decisions {name}: correct accepted "
-                         +_rate(group['accepted_positive'], group['positive'])
-                         +" | wrong rejected "+_rate(group['rejected_negative'], group['negative']))
     return lines
 
 
@@ -271,7 +297,7 @@ def format_training_log(row):
                 f"\n  live CT/path slabs | causal survival confidence")
     if row.get('event') == 'identity_sampling':
         bank = row.get('negative_bank_provenance') or {}
-        return (f"{step} | identity sampling v{row.get('pair_sampling_version', '?')}"
+        return (f"{step} | identity sampling"
                 f" | bank {row.get('negative_bank_path', '(see run configuration)')}"
                 f" | {len(bank.get('shard_hashes', {})):,} published shards"
                 f" | run {bank.get('run_digest', 'unknown')[:12]}")

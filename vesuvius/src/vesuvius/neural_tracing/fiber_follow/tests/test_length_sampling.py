@@ -5,7 +5,7 @@ import pytest
 
 from vesuvius.neural_tracing.fiber_follow.shared.data import FollowDataset
 from vesuvius.neural_tracing.fiber_follow.regression.train import build_parser
-from vesuvius.neural_tracing.fiber_follow.shared.collect import fiber_visit_order
+from vesuvius.neural_tracing.fiber_follow.shared.collect import CoverageCursor
 
 
 def dataset(lengths, **kwargs):
@@ -36,19 +36,20 @@ def test_cli_default_and_value():
     assert build_parser().parse_args(['--name', 'run', '--afv-length-power', '3']).afv_length_power == 3.
 
 
-def test_collector_order_is_length_weighted_without_replacement():
-    fibers = [SimpleNamespace(length=v) for v in np.r_[np.full(990, 350.), np.full(10, 1500.)]]
+def test_collection_covers_fibers_uniformly_unseen_first_and_alternates_directions():
+    fibers = [SimpleNamespace(name=f'f{i}', source_hash='', points=np.zeros((2, 3)), endpoint_stop=(False, False),
+                              length=v) for i, v in enumerate(np.r_[np.full(9, 350.), [5000.]])]
+    cursor = CoverageCursor(fibers, seed=3)
     rng = np.random.default_rng(0)
-    firsts = []
-    for _ in range(200):
-        order = fiber_visit_order(fibers, 3., rng)
-        assert sorted(order.tolist()) == list(range(len(fibers)))
-        firsts.append(order[0] >= 990)
-    expected = 10*1500.**3/(10*1500.**3+990*350.**3)
-    assert abs(np.mean(firsts)-expected) < .1
-
-
-def test_collector_default_order_is_the_original_permutation():
-    fibers = [SimpleNamespace(length=v) for v in (300., 900., 400.)]
-    np.testing.assert_array_equal(fiber_visit_order(fibers, 1., np.random.default_rng(5)),
-                                  np.random.default_rng(5).permutation(3))
+    first = [cursor.take(rng) for _ in range(10)]
+    # Every fiber once per epoch, regardless of length; no fiber repeats before all are seen.
+    assert sorted(fi for fi, _ in first) == list(range(10))
+    second = [cursor.take(rng) for _ in range(10)]
+    signs = {fi: [s] for fi, s in first}
+    for fi, s in second:
+        signs[fi].append(s)
+    assert all(a == -b for a, b in signs.values())
+    # Excluded fibers (already in this collection) are deferred, not dropped.
+    cursor = CoverageCursor(fibers, seed=3, state=cursor.state)
+    taken = cursor.take(rng, exclude={cursor.state['order'][cursor.state['position'] % 10]} if cursor.state['position'] < 10 else ())
+    assert taken is not None

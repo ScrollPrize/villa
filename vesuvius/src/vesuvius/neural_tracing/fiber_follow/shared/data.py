@@ -162,27 +162,51 @@ class SampleConfig:
     n_history: int = 128
     recent_history_points: int = 128  # GT history for observed-state diagnostics only
     history_step: float = 1.0
-    lateral_sigmas: tuple = (0.4, 1.0, 2.0)
-    lateral_probs: tuple = (0.5, 0.35, 0.15)
-    angle_sigmas_deg: tuple = (2.0, 5.0, 10.0)
-    angle_probs: tuple = (0.5, 0.35, 0.15)
-    no_history_prob: float = 0.1  # seed-only decisions (a trace's first call)
-    short_history_prob: float = 0.0  # otherwise, 1-8/9-32 voxel trace starts
+    # Fresh trace starts, as direct draw allocations: seed-only, 1-8 and 9-32 requested
+    # voxels of history, and a prefix drawn uniformly from the available history.
+    startup_shares: tuple = (.15, .17, .17, .51)
     trace_noise_sigma: tuple = (.175, 1.)  # log-uniform per-trace lateral error scale, per transverse axis
     trace_noise_length: float = 40.  # correlation length of simulated tracing error, trace voxels
-    history_jitter: float = 0.0  # independent point noise; disable for smooth history
-    history_drift: float = 2.0  # accumulated lateral displacement, smooth over 16--64 voxels
-    history_wobble: float = 1.0  # max amplitude (voxels) of slow lateral wobble on the own-trace history
-    full_observed_history: bool = False  # direct slab model preserves the complete synthetic prefix
+    # Smooth lateral excursions on established fresh traces; the head lies on the rise or return.
+    excursion_probability: float = .2
+    excursion_amplitude: tuple = (3., 6.)
+    excursion_rise: tuple = (16., 64.)
+    label_tolerance: float = 1.5  # confidence-label tolerance; separate from the departure threshold
+    max_recovery_distance: float = 6.0
     dense_substeps: int = 4
+
+    def __post_init__(self):
+        shares = np.asarray(self.startup_shares, np.float64)
+        if shares.shape != (len(STARTUP_CATEGORIES),) or not np.isfinite(shares).all() or (shares < 0).any() \
+                or abs(shares.sum()-1) > 1e-6:
+            raise ValueError('Startup shares need four nonnegative values summing to one')
+        self.startup_shares = tuple(float(v) for v in shares)
+        for name in ('excursion_amplitude', 'excursion_rise', 'trace_noise_sigma'):
+            lo, hi = getattr(self, name)
+            if not (np.isfinite(lo) and np.isfinite(hi) and 0 <= lo <= hi):
+                raise ValueError(f'{name} must be an ordered nonnegative range')
+            setattr(self, name, (float(lo), float(hi)))
+        if not 0 <= self.excursion_probability <= 1 or self.excursion_rise[0] <= 0:
+            raise ValueError('Excursion probability must lie in [0, 1] with positive rise lengths')
+        if not (np.isfinite(self.label_tolerance) and self.label_tolerance > 0
+                and np.isfinite(self.max_recovery_distance) and self.max_recovery_distance > self.future_step):
+            raise ValueError('Label tolerance and recovery limit must be finite and positive')
 
     @property
     def future_s(self) -> np.ndarray:
         return self.future_step * np.arange(1, self.n_future + 1)
 
 
-def _mix(rng, sigmas, probs):
-    return float(rng.choice(sigmas, p=probs))
+STARTUP_CATEGORIES = ('seed_only', 'short', 'early', 'established')
+STARTUP_REQUESTS = ((0, 0), (1, 8), (9, 32), None)
+# Realized seed ages, reported separately from draw categories.
+SEED_AGE_STRATA = (('seed_only', 0., 0.), ('below_12', 0., 12.), ('12_32', 12., 32.), ('established', 32., np.inf))
+
+
+def seed_age_stratum(age):
+    if age <= 0:
+        return 0
+    return 1 if age < 12 else 2 if age <= 32 else 3
 
 
 def training_state_allowed(item, crop: CropSpec, band: ZBand | None):
@@ -251,18 +275,17 @@ def traversal_curve(fiber, reverse):
     return fiber.points, fiber.s
 
 
-def trace_prefix_length(t, cfg: SampleConfig, rng):
+def trace_prefix_length(t, category, rng):
     """Arclength already traced at this decision, i.e. how far back its seed lies.
 
-    Seed-only and 1-8/9-32 voxel trace starts are reserved; otherwise the trace
-    began uniformly anywhere earlier on the annotation.
+    Requests are clipped to the available annotation; the realized seed age is
+    reported separately from the draw category.
     """
-    if rng.random() < cfg.no_history_prob:
-        return 0.
-    if cfg.short_history_prob > 0 and rng.random() < cfg.short_history_prob:
-        lo, hi = (1, 8) if rng.random() < .5 else (9, 32)
-        return min(float(t), float(rng.integers(lo, hi+1)))
-    return float(rng.uniform(0., t))
+    request = STARTUP_REQUESTS[category]
+    if request is None:
+        return float(rng.uniform(0., t))
+    lo, hi = request
+    return min(float(t), float(rng.integers(lo, hi+1))) if hi else 0.
 
 
 def trace_noise(arcs, p, s, cfg: SampleConfig, rng):
@@ -278,33 +301,72 @@ def trace_noise(arcs, p, s, cfg: SampleConfig, rng):
     noise = np.zeros((len(arcs), 3))
     if hi <= 0 or len(arcs) < 2:
         return noise, 0.
-    sigma = float(np.exp(rng.uniform(np.log(lo), np.log(hi))))
+    sigma = float(np.exp(rng.uniform(np.log(lo), np.log(hi)))) if lo > 0 else float(rng.uniform(lo, hi))
     decay = math.exp(-cfg.history_step/cfg.trace_noise_length)
     shocks = rng.normal(size=noise.shape)*sigma*math.sqrt(1-decay*decay)
     shocks[0] = 0.
     noise = lfilter([1.], [1., -decay], shocks, axis=0)
-    tangent = interp_at(p, s, np.clip(arcs+3., 0., s[-1]))-interp_at(p, s, np.clip(arcs-3., 0., s[-1]))
-    tangent /= np.maximum(np.linalg.norm(tangent, axis=1, keepdims=True), 1e-9)
+    tangent = local_tangents(arcs, p, s)
     return noise-(noise*tangent).sum(-1, keepdims=True)*tangent, sigma
 
 
-def make_sample(fiber: TracedFiber, t: float, reverse: bool, cfg: SampleConfig, rng: np.random.Generator):
+def local_tangents(arcs, p, s):
+    tangent = interp_at(p, s, np.clip(arcs+3., 0., s[-1]))-interp_at(p, s, np.clip(arcs-3., 0., s[-1]))
+    return tangent/np.maximum(np.linalg.norm(tangent, axis=1, keepdims=True), 1e-9)
+
+
+def smoothstep(u):
+    u = np.clip(u, 0., 1.)
+    return u*u*(3-2*u)
+
+
+def excursion_offsets(arcs, p, s, cfg: SampleConfig, rng):
+    """A smooth lateral departure and return ending at the head, zero before it starts.
+
+    Amplitude and rise length are uniform in their configured ranges. The head lies
+    uniformly on the rise or the return (within the available prefix), so both
+    departing and returning heads occur. The direction is one random lateral vector,
+    projected off the local annotation tangent at every point.
+    """
+    amplitude, rise = float(rng.uniform(*cfg.excursion_amplitude)), float(rng.uniform(*cfg.excursion_rise))
+    head = float(rng.uniform(0., min(2*rise, arcs[-1]-arcs[0])))
+    x = arcs-(arcs[-1]-head)
+    profile = amplitude*np.where(x <= rise, smoothstep(x/rise), smoothstep(2-x/rise))*(x >= 0)
+    tangent = local_tangents(arcs, p, s)
+    direction = rng.normal(size=3)
+    direction = direction[None]-(tangent @ direction)[:, None]*tangent
+    direction /= np.maximum(np.linalg.norm(direction, axis=1, keepdims=True), 1e-9)
+    return profile[:, None]*direction, dict(excursion_amplitude=amplitude, excursion_rise=rise,
+                                            excursion_phase=head/rise, excursion_head_offset=float(profile[-1]))
+
+
+def make_sample(fiber: TracedFiber, t: float, reverse: bool, cfg: SampleConfig, rng: np.random.Generator,
+                *, startup=None, excursion=None):
     """One tracer decision on a simulated trace of this fiber, built exactly like inference.
 
-    The trace started ``trace_prefix_length`` back at an annotated seed and followed
-    GT with smooth lateral error (``trace_noise``), so the head is offset from GT.
-    Crop heading, history and seed reference come from that observed path through
-    the tracer's own functions. A path shorter than 12 voxels still holds the seed's
-    CT heading; it and the seed tangent are resolved once CT is readable
-    (``resolve_trace_seed``). Labels are the GT continuation from the offset head.
+    The trace started ``trace_prefix_length`` back at an annotated seed and followed GT
+    with smooth lateral error (``trace_noise``), optionally plus a smooth excursion
+    (``excursion_offsets``) on established traces, so the head is offset from GT. Crop
+    heading, history and seed reference come from that observed path through the tracer's
+    own functions. A path shorter than 12 voxels still holds the seed's CT heading; it and
+    the seed tangent are resolved once CT is readable (``resolve_trace_seed``). Labels are
+    the GT continuation from the offset head under the shared state contract.
+    ``startup`` fixes the draw category; ``excursion`` forces or forbids an excursion.
     """
     from .heading import linear12_heading, trace_heading
+    from .state_labels import constructed_facts, supervise
     from .trace import trace_history
     p, s = traversal_curve(fiber, reverse)
-    count = int(trace_prefix_length(t, cfg, rng)//cfg.history_step)
+    category = int(rng.choice(len(STARTUP_CATEGORIES), p=cfg.startup_shares)) if startup is None else int(startup)
+    count = int(trace_prefix_length(t, category, rng)//cfg.history_step)
     arcs = t-np.arange(count, -1, -1)*cfg.history_step
     noise, sigma = trace_noise(arcs, p, s, cfg, rng)
     path = interp_at(p, s, arcs)+noise
+    details = {}
+    established = category == STARTUP_CATEGORIES.index('established') and arcs[-1]-arcs[0] >= 8.
+    if established and (excursion if excursion is not None else rng.random() < cfg.excursion_probability):
+        offsets, details = excursion_offsets(arcs, p, s, cfg, rng)
+        path = path+offsets
     pos = path[-1]
     # Only the CT seed axis's sign comes from the direction of travel.
     seed_direction = tangent_at(p, s, arcs[0])
@@ -314,9 +376,12 @@ def make_sample(fiber: TracedFiber, t: float, reverse: bool, cfg: SampleConfig, 
     item = dict(_generated_original_history=True, _seed_original_certified=True,
                 observed_path=path, seed_pos=path[0].copy(), seed_tangent=seed_direction,
                 seed_age=float(arclength(path)[-1]), seed_valid=True, seed_heading_family=fiber.tag,
-                trace_noise_sigma=sigma, trace_prefix_length=float(arcs[-1]-arcs[0]),
+                trace_noise_sigma=sigma, trace_prefix_length=float(arcs[-1]-arcs[0]), startup=category,
+                excursion=bool(details), heading_start=0, travelled=float(arclength(path)[-1]),
                 pos=pos, frame=frame, hist_local=(hist-pos) @ frame, hmask=hmask.astype(np.float32),
+                trace_facts=constructed_facts(fiber, t, reverse, pos, cfg), **details,
                 **continuation_targets(fiber, t, reverse, pos, frame, cfg))
+    supervise(item)
     if linear12_heading(path, 0) is None:
         item['_pending_seed_heading'] = (fiber, t, reverse, cfg)
     return item
@@ -327,122 +392,45 @@ def resolve_trace_seed(item, vol):
 
     Sets the seed tangent. A path still holding the seed heading (< 12 voxels) also
     takes it as crop heading: local geometry is re-expressed and labels recomputed.
-    Unusable CT (where the tracer would skip this seed) keeps the travel direction,
-    as does a call without a volume (unit tests of other stages). Synthetic sources
-    mark themselves with ``seed_heading_family`` the same way.
+    Missing CT orientation raises ``SeedHeadingError``: training rejects and resamples
+    that seed, exactly as collection and evaluation skip it. There is no annotation
+    fallback. Synthetic sources mark themselves with ``seed_heading_family``.
     """
     family = item.pop('seed_heading_family', None)
     pending = item.pop('_pending_seed_heading', None)
-    if family is None or vol is None:
+    if family is None:
         return item
-    from .heading import SeedHeadingError, oriented_seed_heading, reframe_item
-    try:
-        heading = oriented_seed_heading(vol, item['seed_pos'], family, item['seed_tangent'])
-    except SeedHeadingError:
-        item['seed_heading_fallback'] = True
-        return item
+    from .heading import oriented_seed_heading, reframe_item
+    from .state_labels import supervise
+    heading = oriented_seed_heading(vol, item['seed_pos'], family, item['seed_tangent'])
     item['seed_tangent'] = heading
     if pending is not None:
         fiber, t, reverse, cfg = pending
         frame = frame_from_heading(heading)
         reframe_item(item, frame)
-        item.update(continuation_targets(fiber, t, reverse, item['pos'], frame, cfg,
-                                         offtrack=bool(item.get('offtrack', False))))
+        item.update(continuation_targets(fiber, t, reverse, item['pos'], frame, cfg))
+        supervise(item)
     return item
 
 
-def drift_sample(fiber: TracedFiber, t: float, reverse: bool, cfg: SampleConfig, rng: np.random.Generator):
-    """GT state with a drifted head and ramped history; only for frozen recovery fixtures.
-
-    Training never uses it: ``make_sample`` simulates the tracer instead.
-    """
-    p, s = traversal_curve(fiber, reverse)
-    L = s[-1]
-    g = interp_at(p, s, np.array([t]))[0]
-    tau = tangent_at(p, s, t)
-    # lateral offset perpendicular to tau
-    fr = frame_from_heading(tau)
-    lat = rng.normal(size=2) * _mix(rng, cfg.lateral_sigmas, cfg.lateral_probs)
-    delta = fr[:, 0] * lat[0] + fr[:, 1] * lat[1]
-    pos = g + delta
-    ang = math.radians(_mix(rng, cfg.angle_sigmas_deg, cfg.angle_probs)) * rng.normal()
-    axis_ang = rng.uniform(0, 2 * np.pi)
-    ax = math.cos(axis_ang) * fr[:, 0] + math.sin(axis_ang) * fr[:, 1]
-    heading = normalize(math.cos(ang) * tau + math.sin(ang) * ax)
-    frame = frame_from_heading(heading)  # provisional basis; CT resolves crop roll before sampling
-
-    # history: GT points behind with the drift ramping in
-    count = cfg.n_history
-    if cfg.full_observed_history:
-        available = max(1, int(t/cfg.history_step))
-        count = max(count, int(rng.integers(1, available+1)))
-    k = np.arange(1, count + 1) * cfg.history_step
-    th = t - k
-    hmask = (th >= 0).astype(np.float32)
-    if rng.random() < cfg.no_history_prob:
-        hmask[:] = 0
-    else:
-        # Balance very short and intermediate startup histories. With this
-        # option off, retain the existing sampler's random draws exactly.
-        if cfg.short_history_prob > 0 and rng.random() < cfg.short_history_prob:
-            split = min(8, cfg.n_history)
-            lo, hi = (1, split) if cfg.n_history <= 8 or rng.random() < .5 else (9, min(32, cfg.n_history))
-            hmask[int(rng.integers(lo, hi+1)):] = 0
-        elif rng.random() < 0.2:
-            hmask[int(rng.integers(0, cfg.n_history)):] = 0
-    hist = interp_at(p, s, np.clip(th, 0, L))
-    ramp = np.clip(1.0 - k / (cfg.n_history * cfg.history_step), 0, 1)[:, None]
-    hist = hist + ramp * delta[None] + rng.normal(size=hist.shape) * cfg.history_jitter
-    if cfg.history_wobble > 0:
-        # slow lateral wander of our own past path, zero at the current point
-        amp = rng.uniform(0, cfg.history_wobble, size=2)
-        lam = rng.uniform(15.0, 45.0, size=2)
-        ph = rng.uniform(0, 2 * np.pi, size=2)
-        w = amp * (np.sin(2 * np.pi * k[:, None] / lam + ph) - np.sin(ph))
-        hist = hist + w[:, :1] * fr[:, 0] + w[:, 1:] * fr[:, 1]
-
-    # A smooth displacement accumulates near the present; old observations
-    # remain aligned. Include the endpoint displacement in the current point.
-    span = rng.uniform(16., 64.)
-    ramp = np.clip(1-k/span, 0, 1)
-    ramp = ramp*ramp*(3-2*ramp)
-    displacement = rng.normal(size=2)*cfg.history_drift
-    drift = fr[:,:2] @ displacement
-    hist += ramp[:,None]*drift
-    pos += drift
-    observed = np.concatenate((hist[hmask > 0][::-1], pos[None]))
-    seed = observed_seed(pos, frame, (hist-pos) @ frame, hmask)
-    return dict(_generated_original_history=True, _seed_original_certified=True,
-                observed_path=observed, **seed,
-                pos=pos, frame=frame, hist_local=((hist-pos) @ frame)[:cfg.n_history], hmask=hmask[:cfg.n_history],
-                **continuation_targets(fiber, t, reverse, pos, frame, cfg))
-
-
-def continuation_targets(fiber, t, reverse, pos, frame, cfg, offtrack=False):
+def continuation_targets(fiber, t, reverse, pos, frame, cfg):
     """Dense supervised geometry; prediction-support gaps never remove GT labels.
 
     t is traversal arclength. Missing forward crossings are unknown, except
-    continuation beyond an explicitly tagged physical endpoint.
+    continuation beyond an explicitly tagged physical endpoint. Whether the
+    geometry is supervised at all is the state contract's decision.
     """
-    p, s = fiber.points, fiber.s
-    if reverse:
-        p, s = p[::-1], s[-1]-s[::-1]
+    p, s = traversal_curve(fiber, reverse)
     tf = t + cfg.future_s
     fut = interp_at(p, s, np.clip(tf, 0, s[-1]))
     history_arc = t - np.arange(cfg.recent_history_points + 1) * cfg.history_step
     gt_history = (interp_at(p, s, np.clip(history_arc, 0, s[-1])) - pos) @ frame
     gt_history_mask = (history_arc >= 0).astype(np.float32)
-    if offtrack:
-        gt_history_mask[:] = 0
     dense_planes = np.linspace(cfg.future_step, cfg.future_s[-1],
                                (cfg.n_future-1)*cfg.dense_substeps+1)
     ab, mask = plane_targets(p, s, t, s[-1], pos, frame, cfg.future_s)
     dense_ab, dense_mask = plane_targets(p, s, t, s[-1], pos, frame, dense_planes)
     fmask = (tf <= s[-1]).astype(np.float32)
-    if offtrack:
-        mask[:] = 0
-        dense_mask[:] = 0
-        fmask[:] = 0
     end = (p[-1]-pos) @ frame
     # Only expose endpoint labels when it is within the local traversal window.
     known = fiber.endpoint_stop[0 if reverse else 1] and s[-1]-t <= 2.5*cfg.future_s[-1]
@@ -450,98 +438,141 @@ def continuation_targets(fiber, t, reverse, pos, frame, cfg, offtrack=False):
                 fut_local=(fut-pos) @ frame, fmask=fmask,
                 plane_ab=ab, plane_mask=mask, planes=cfg.future_s,
                 dense_ab=dense_ab, dense_mask=dense_mask, dense_planes=dense_planes,
-                end_local=end, endpoint_known=float(known), offtrack=float(offtrack))
+                end_local=end, endpoint_known=float(known))
 
 
-# Source is independent of the within-source drift/departure stratum.
-# Keep replay source IDs stable across saved diagnostics.
-REPLAY_SOURCES = dict(recent=2)
-DRIFT_BANDS = ((0.,1.), (1.,1.5), (1.5,2.), (2.,3.5))
-REPLAY_FAILURES = ('ordinary', 'bank_switch', 'premature_stop', 'endpoint_overshoot', 'pre_switch')
+# One task budget, applied within each dataset source. Sampling allocations, not label
+# ratios: every delivered action is labeled by the shared state contract.
+TASKS = ('fresh', 'live', 'dagger_pre_excursion', 'dagger_recoverable', 'dagger_terminal',
+         'dagger_premature_stop', 'dagger_ordinary', 'synthetic_terminal')
+TASK = {name: index for index, name in enumerate(TASKS)}
+DEFAULT_TASK_SHARES = dict(fresh=.40, live=.25, dagger_pre_excursion=.08, dagger_recoverable=.06,
+                           dagger_terminal=.08, dagger_premature_stop=.03, dagger_ordinary=.05,
+                           synthetic_terminal=.05)
+FALLBACKS = ('none', 'fresh', 'synthetic', 'no_live_state')
+SOURCES = ('fresh', 'live', 'replay', 'synthetic')
+SOURCE = {name: index for index, name in enumerate(SOURCES)}
+TRAVEL_STRATA = (0., 64., 256., np.inf)
+EVENT_TABLE_SIZE = 1 << 18
 
 
-def replay_pools(caches, *, failures=False, correct_only=False, natural_switch_only=False):
-    """Drift/departure strata, optionally split by recorded failure, then fiber."""
-    pools = [dict() for _ in range(9 if failures else 5)]
-    for op in caches:
-        off = np.asarray(op.offtrack,bool)
-        kinds = np.asarray(op.failure_kind) if failures else np.zeros(len(op), np.int8)
-        eligible = np.ones(len(op), bool)
-        if natural_switch_only:
-            if not failures:
-                raise ValueError('Natural switches require failure strata')
-            recorded = ((op.seq_start >= 0) & (op.seq_end > op.seq_start+1)
-                        & np.isfinite(op.travelled) & (op.travelled > 0))
-            # A pre-switch row alone may precede a later forced exploration.
-            # Require a witnessed, nonexploratory switched state on that trace.
-            natural = recorded & ~op.exploratory & off & (op.failure_kind == 1)
-            traces = np.unique(op.seq_start[natural])
-            eligible &= (recorded & ~op.exploratory & np.isin(op.seq_start, traces)
-                         & np.isin(op.failure_kind, (1, 4)))
-        if correct_only:
-            # Collector departures are sticky across the entire committed prefix;
-            # exploration remains marked after the first forced move. Hard rows
-            # also cover stops and retrospective pre-failure windows. Require real
-            # model progress: skip zero-progress states and unknown old caches.
-            # Eligible prefixes still include their original annotated seed.
-            eligible = (~off & ~np.asarray(op.hard, bool) & ~np.asarray(op.exploratory, bool)
-                        & (np.asarray(op.failure_kind) == 0) & np.isfinite(op.travelled)
-                        & (op.travelled > 0) & (op.seq_start >= 0) & (op.seq_end > op.seq_start+1))
-        for band in range(len(pools)):
-            if band >= 5:
-                member = kinds == band-4
-            elif band == 4:
-                member = off & (kinds == 0)
-            else:
-                lo, hi = DRIFT_BANDS[band]
-                member = ~off & (kinds == 0) & (op.drift>=lo) & (op.drift<hi)
-            member &= eligible
-            for fi in np.unique(op.fiber_idx[member]):
-                idx = np.flatnonzero(member & (op.fiber_idx==fi))
-                pools[band].setdefault(int(fi),[]).append((op,idx))
-    return pools
+@dataclass(frozen=True)
+class TaskBudget:
+    """Requested shares per task, plus replay age/reuse limits shared by loader workers.
+
+    ``terminal_fallback_cap`` bounds certified synthetic failures used in place of missing
+    real terminal replay, as a fraction of requested terminal slots.
+    """
+    shares: tuple = tuple(DEFAULT_TASK_SHARES[name] for name in TASKS)
+    terminal_fallback_cap: float = .5
+    replay_max_age: int = 12000
+    replay_event_cap: int = 64
+
+    def __post_init__(self):
+        shares = np.asarray(self.shares, np.float64)
+        if shares.shape != (len(TASKS),) or not np.isfinite(shares).all() or (shares < 0).any() or abs(shares.sum()-1) > 1e-6:
+            raise ValueError(f'Task shares need {len(TASKS)} nonnegative values summing to one ({", ".join(TASKS)})')
+        object.__setattr__(self, 'shares', tuple(float(v) for v in shares))
+        if not 0 <= self.terminal_fallback_cap <= 1 or self.replay_max_age < 1 or self.replay_event_cap < 1:
+            raise ValueError('Invalid terminal fallback cap, replay age ceiling or event cap')
+
+    @classmethod
+    def parse(cls, pairs=None, **limits):
+        shares = dict(DEFAULT_TASK_SHARES)
+        for pair in pairs or ():
+            name, _, value = str(pair).partition('=')
+            if name not in TASK:
+                raise ValueError(f'Unknown task {name!r}; choose from {", ".join(TASKS)}')
+            shares[name] = float(value)
+        return cls(tuple(shares[name] for name in TASKS), **limits)
+
+    def to_dict(self):
+        return dict(shares=dict(zip(TASKS, self.shares)), terminal_fallback_cap=self.terminal_fallback_cap,
+                    replay_max_age=self.replay_max_age, replay_event_cap=self.replay_event_cap)
+
+
+def stable_key(*parts):
+    digest = hashlib.blake2b(repr(parts).encode(), digest_size=8).digest()
+    return int.from_bytes(digest, 'little') & ((1 << 62)-1)
+
+
+class ReplayIndex:
+    """Eligibility index by class, fiber, episode and event; rows are drawn last.
+
+    Fibers are uniform, then episodes, then events, then rows, so dense windows cannot
+    dominate merely by containing more decisions. Ordinary following is additionally
+    stratified by travelled length. Each event group carries a stable key for the
+    shared reuse counter.
+    """
+    def __init__(self, caches):
+        from .state_labels import REPLAY_CLASS, REPLAY_CLASSES
+        self.caches = list(caches)
+        self.groups = {name: {} for name in REPLAY_CLASSES}
+        self.ordinary = [dict() for _ in range(len(TRAVEL_STRATA)-1)]
+        for ci, op in enumerate(self.caches):
+            identity = op.provenance["cache_id"]
+            classes = np.asarray(op.replay_class)
+            for name, index in REPLAY_CLASS.items():
+                rows = np.flatnonzero(classes == index)
+                if not len(rows):
+                    continue
+                if name == 'ordinary':
+                    strata = np.digitize(np.asarray(op.travelled)[rows], TRAVEL_STRATA[1:-1])
+                    keys = np.c_[np.asarray(op.episode)[rows], strata]
+                else:
+                    strata = None
+                    keys = np.c_[np.asarray(op.episode)[rows], np.asarray(op.event_id)[rows]]
+                for key in np.unique(keys, axis=0):
+                    members = rows[(keys == key).all(1)]
+                    episode, event = int(key[0]), int(key[1])
+                    group = (ci, episode, event, members, stable_key(identity, episode, name, event))
+                    fi = int(op.fiber_idx[members[0]])
+                    table = self.ordinary[event] if name == 'ordinary' else self.groups[name]
+                    table.setdefault(fi, {}).setdefault((ci, episode), []).append(group)
+
+    def counts(self):
+        tables = dict(self.groups, ordinary=None)
+        result = {}
+        for name, table in tables.items():
+            tables_ = self.ordinary if name == 'ordinary' else [table]
+            groups = [g for t in tables_ for episodes in t.values() for gs in episodes.values() for g in gs]
+            result[name] = dict(fibers=len({f for t in tables_ for f in t}), events=len(groups),
+                                rows=int(sum(len(g[3]) for g in groups)))
+        return result
+
+    def draw(self, name, rng, eligible):
+        """One event group from an eligible cache, or None."""
+        tables = [t for t in self.ordinary if t] if name == 'ordinary' else [self.groups[name]]
+        if name == 'ordinary' and tables:
+            tables = [tables[int(rng.integers(len(tables)))]]
+        for table in tables:
+            fibers = [f for f, episodes in table.items() if any(e[0] in eligible for e in episodes)]
+            if not fibers:
+                return None
+            episodes = table[fibers[int(rng.integers(len(fibers)))]]
+            choices = [key for key in episodes if key[0] in eligible]
+            groups = episodes[choices[int(rng.integers(len(choices)))]]
+            return groups[int(rng.integers(len(groups)))]
+        return None
 
 
 class FollowDataset(torch.utils.data.IterableDataset):
-    """Configurable fresh share; remaining draws use rotating recent replay.
+    """Explicit task budget per batch slot; every draw is relabeled before crop I/O.
 
-    Defaults to 70% fresh and 30% recent replay after dedicated builder budgets.
-    Legacy replay reserves 10% for departure. Builders may instead reserve a
-    failure budget, uniform over available kinds, then fibers. Remaining draws
-    use drift bands and then fibers. Empty legacy strata use fresh
-    augmentation. Every draw is relabeled and holdout checked before crop I/O.
-    clean_fraction reserves unperturbed GT separately and normalizes the existing
-    hard-source weights into the remainder. Generic/legacy callers keep None.
+    Tasks follow ``TaskBudget``: fresh simulated traces (with startup and excursion
+    allocations), live continuation (its own slots, never replay slots), five
+    mutually exclusive DAgger replay classes and certified synthetic failures.
+    Missing replay falls back to a fresh example of the corresponding kind; missing
+    terminal replay may use certified synthetic failures within the configured cap.
+    Fallbacks and deficits are recorded per item. Replay age ceilings and per-event
+    draw caps are shared across loader workers through shared memory.
     """
     def __init__(self, fibers, vol_spec, cfg, exclude_band, chunk=2, seed=0,
                  cache_bytes=1 << 30, onpolicy=None,
                  window=256., pool_size=12, window_samples=192, replay_index=None, refresh_chunks=8,
-                 batch_builder=None, additional_crops=(), fresh_fraction=.7, clean_fraction=None,
-                 correct_replay_only=False, replay_continuation_fraction=None,
-                 gt_perturb_probability=0., prefer_real_wrong_turns=False, prefer_replay_for_light_gt=False,
-                 length_power=1.):
-        if not np.isfinite(fresh_fraction) or not 0 <= fresh_fraction <= 1:
-            raise ValueError('Fresh fraction must be finite and in [0, 1]')
-        self.fresh_fraction = float(fresh_fraction)
-        if clean_fraction is not None and (not np.isfinite(clean_fraction) or not 0 <= clean_fraction <= 1):
-            raise ValueError('Clean fraction must be finite and in [0, 1]')
-        self.clean_fraction = clean_fraction
-        self.correct_replay_only = correct_replay_only
-        self.prefer_real_wrong_turns = prefer_real_wrong_turns
-        self.prefer_replay_for_light_gt = prefer_replay_for_light_gt
-        if replay_continuation_fraction is not None:
-            if not np.isfinite(replay_continuation_fraction) or not 0 <= replay_continuation_fraction <= 1:
-                raise ValueError('Replay continuation fraction must be finite and in [0, 1]')
-            if correct_replay_only:
-                raise ValueError('Choose correct-only replay or a continuation/failure mix')
-        # Share of reserved GT slots offered to live continuation / correct replay
-        # (prefer_replay_for_light_gt). Every GT fallback is the same simulated trace.
-        if not np.isfinite(gt_perturb_probability) or not 0 <= gt_perturb_probability <= 1:
-            raise ValueError('GT perturb probability must be finite and in [0, 1]')
-        if gt_perturb_probability and clean_fraction is None:
-            raise ValueError('Light GT slots require a reserved GT fraction')
-        self.replay_continuation_fraction = replay_continuation_fraction
-        self.gt_perturb_probability = gt_perturb_probability
+                 batch_builder=None, additional_crops=(), budget=None, length_power=1.):
+        import multiprocessing as mp
+        self.budget = budget or TaskBudget()
         self.fibers, self.vol_spec, self.cfg, self.exclude = fibers, vol_spec, cfg, exclude_band
         self.chunk, self.seed, self.cache_bytes = chunk, seed, cache_bytes
         self.window, self.pool_size, self.window_samples = window, pool_size, window_samples
@@ -551,6 +582,9 @@ class FollowDataset(torch.utils.data.IterableDataset):
         self.remote_prefetch = None  # Optional trainer-owned process queue client.
         self.remote_prefetch_lookahead = 0  # Planned microbatches per source/worker.
         self.additional_crops = tuple(additional_crops)
+        # Shared by every loader worker: current update and per-event replay draw counts.
+        self.step = mp.Value('q', 0)
+        self.event_draws = mp.Array('i', EVENT_TABLE_SIZE)
         self._replay_paths = None
         self._set_replay(list(onpolicy or []))
         lengths = (fibers.lengths if hasattr(fibers, 'lengths')
@@ -564,151 +598,43 @@ class FollowDataset(torch.utils.data.IterableDataset):
         if length_power != 1:
             lengths = lengths**length_power
         self.weights = lengths / lengths.sum()
+        self.terminal_requests = self.synthetic_fallbacks = 0
 
-    def _validate(self,caches):
+    def set_step(self, step):
+        self.step.value = int(step)
+
+    def _validate(self, caches):
         for op in caches:
             op.validate_fibers(self.fibers)
             if op.hist.shape[1] != self.cfg.n_history:
                 raise ValueError('Replay history length must equal n_history')
-            if op.provenance.get('volume',{}).get('grid_scale',8.) != self.vol_spec.grid_scale:
+            if op.provenance['volume']['grid_scale'] != self.vol_spec.grid_scale:
                 raise ValueError('Replay world coordinate scale differs from this run')
 
-    def _set_replay(self,caches):
+    def _set_replay(self, caches):
         self._validate(caches)
         self.onpolicy = caches
-        self.replay_failure_fraction = getattr(getattr(self.batch_builder, 'sampling', None),
-                                              'replay_failure_fraction', None)
-        self.recent_pools = replay_pools(caches, failures=(self.replay_failure_fraction is not None
-                                                        or self.replay_continuation_fraction is not None),
-                                        correct_only=self.correct_replay_only)
-        self.continuation_pools = (replay_pools(caches, correct_only=True)
-                                   if self.replay_continuation_fraction is not None or self.prefer_replay_for_light_gt else None)
-        self.wrong_turn_pools = (replay_pools(caches, failures=True, natural_switch_only=True)
-                                if self.prefer_real_wrong_turns else None)
-        if hasattr(self.batch_builder, 'set_replay'):
-            self.batch_builder.set_replay(caches)
+        self.index = ReplayIndex(caches)
+        self._eligible = (None, frozenset())
 
-    def draw_replay(self,rng, *, force=False):
-        source = REPLAY_SOURCES['recent'] if force else int(rng.choice((0, REPLAY_SOURCES['recent']),
-                                p=(self.fresh_fraction, 1-self.fresh_fraction)))
-        pools = self.recent_pools
-        if self.replay_continuation_fraction is not None:
-            continuation = rng.random() < self.replay_continuation_fraction
-            if self.live_continuation is not None and source and continuation:
-                return source, -2, None, -1
-            pools = self.continuation_pools if continuation else self.recent_pools
-            options = [i for i in (range(4) if continuation else range(4, len(pools))) if pools[i]]
-            if not options and not continuation and self.live_continuation is not None and source:
-                return source, -2, None, -1
-            if not options and not continuation:
-                pools = self.continuation_pools
-                options = [i for i in range(4) if pools[i]]
-            # Never fill a missing correct-prefix slot with a failed trace.
-            if not options:
-                return None
-            band = int(rng.choice(options))
-        elif self.correct_replay_only and self.live_continuation is not None and source:
-            return source, -2, None, -1
-        elif self.replay_failure_fraction is None:
-            band = 4 if rng.random()<.1 else int(rng.integers(4))
-        else:
-            failures = [i for i in range(4, len(self.recent_pools)) if self.recent_pools[i]]
-            drift = [i for i in range(4) if self.recent_pools[i]]
-            options = failures if rng.random() < self.replay_failure_fraction else drift
-            options = options or drift or failures
-            band = int(rng.choice(options)) if options else 0
-        if source == 0:
-            return None
-        pool = pools[band]
-        if not pool:
-            return None
-        return self.draw_pool(pool, source, band, rng)
+    def eligible_caches(self):
+        step = int(self.step.value)
+        if self._eligible[0] != step:
+            self._eligible = (step, frozenset(i for i, op in enumerate(self.onpolicy)
+                                              if step-int(op.provenance['step']) <= self.budget.replay_max_age))
+        return self._eligible[1]
 
-    @staticmethod
-    def draw_pool(pool, source, band, rng):
-        fi = rng.choice(sorted(pool))
-        entries = pool[fi]
-        sizes = np.array([len(idx) for _,idx in entries])
-        op,idx = entries[rng.choice(len(entries),p=sizes/sizes.sum())]
-        return source,band,op,int(rng.choice(idx))
+    def claim(self, key):
+        """Count one draw of an event against its shared cap; False once exhausted."""
+        slot = key % EVENT_TABLE_SIZE
+        with self.event_draws.get_lock():
+            if self.event_draws[slot] >= self.budget.replay_event_cap:
+                return False
+            self.event_draws[slot] += 1
+            return True
 
-    def wrong_turn_item(self, rng):
-        """Use a real natural switch first; synthetic history is the fallback."""
-        if self.wrong_turn_pools is not None:
-            bands = [i for i in (5, 8) if self.wrong_turn_pools[i]]
-            for _ in range(3 if bands else 0):
-                band = int(rng.choice(bands))
-                draw = self.draw_pool(self.wrong_turn_pools[band], 3, band, rng)
-                item = self.replay_item(draw, rng)
-                if item is not None:
-                    item['real_wrong_turn'] = True
-                    item['real_wrong_turn_pre_switch'] = item['failure_kind'] == 4
-                    return item
-        item = self.batch_builder.memory_switch(self.cfg, rng)
-        if item is not None:
-            item = self.prepare(item, rng)
-            if self.state_allowed(item):
-                return item
-        return None
-
-    def correct_continuation_item(self, rng):
-        if self.live_continuation is not None:
-            return self.live_continuation.placeholder(self, rng, light=True)
-        bands = [i for i in range(4) if self.continuation_pools[i]]
-        for _ in range(3 if bands else 0):
-            band = int(rng.choice(bands))
-            draw = self.draw_pool(self.continuation_pools[band], REPLAY_SOURCES['recent'], band, rng)
-            item = self.replay_item(draw, rng)
-            if item is not None:
-                item['replay_correct_continuation'] = True
-                item['light_gt_replay'] = True
-                return item
-        return None
-
-    def endpoint_requests(self, rng):
-        """Reserve paired decisions and bank following before annotation/replay.
-
-        Failed proposals return to annotation/replay, not another bank budget.
-        Pair allocation stays even; expected endpoint shares are unconditional.
-        """
-        sampling = getattr(self.batch_builder, 'sampling', None)
-        decisions = getattr(sampling, 'decision_fraction', 0.)
-        following = getattr(sampling, 'bank_following_probability', 0.)
-        if not (0 <= decisions <= 1 and 0 <= following <= 1 and decisions+following <= 1):
-            raise ValueError('Decision and bank-following endpoint fractions must sum to at most one')
-        if decisions and self.chunk % 2:
-            raise ValueError('Matched identity decisions require an even batch')
-        pairs = int(rng.binomial(self.chunk//2, decisions)) if decisions else 0
-        remaining = self.chunk-2*pairs
-        bank = int(rng.binomial(remaining, min(1., following/(1-decisions)))) if following and remaining else 0
-        return pairs, bank
-
-    def sampling_probabilities(self):
-        """Unconditional budgets; unavailable hard examples fall back to clean GT."""
-        s = getattr(self.batch_builder, 'sampling', None)
-        decision = getattr(s, 'decision_fraction', 0.)
-        following = getattr(s, 'bank_following_probability', 0.)
-        remaining = 1-decision-following
-        weights = dict(decision=decision, bank_following=following,
-                       memory_switch=remaining*self.fresh_fraction*getattr(s, 'memory_switch_probability', 0.),
-                       recent=remaining*(1-self.fresh_fraction))
-        if self.clean_fraction is None:
-            return dict(decision=decision, bank_following=following,
-                        fresh=remaining*self.fresh_fraction, recent=weights['recent'])
-        total = sum(weights.values())
-        if total <= 0:
-            return dict(clean=1., **dict.fromkeys(weights, 0.))
-        return dict(clean=self.clean_fraction,
-                    **{k: (1-self.clean_fraction)*v/total for k,v in weights.items()})
-
-    def clean_requests(self, rng):
-        # Allocate in pairs so identity pairs cannot consume the clean budget.
-        # Counts vary by batch; expected clean share is exactly clean_fraction.
-        if self.chunk % 2:
-            raise ValueError('Clean/hard allocation requires an even batch')
-        probabilities = self.sampling_probabilities()
-        counts = rng.multinomial(self.chunk//2, list(probabilities.values()))*2
-        return dict(zip(probabilities, counts.tolist()))
+    def max_event_reuse(self):
+        return int(max(self.event_draws[:])) if len(self.event_draws) else 0
 
     def refresh_replay(self):
         if self.replay_index is None or not os.path.exists(self.replay_index):
@@ -722,10 +648,7 @@ class FollowDataset(torch.utils.data.IterableDataset):
     def prepare(self, item, rng):
         """Let the batch builder attach geometry it reads later (e.g. path patches)."""
         if hasattr(self.batch_builder, 'prepare'):
-            fiber = item.get('supervision_fiber')
-            if fiber is None:
-                fiber = self.fibers[item['fiber_ref'][0]]
-            return self.batch_builder.prepare(item, fiber, rng)
+            return self.batch_builder.prepare(item, self.fibers[item['fiber_ref'][0]], rng)
         return item
 
     def state_allowed(self, item):
@@ -734,44 +657,148 @@ class FollowDataset(torch.utils.data.IterableDataset):
                 and (not hasattr(self.batch_builder, 'footprint_allowed')
                      or self.batch_builder.footprint_allowed(item, self.exclude)))
         if allowed and self.exclude is not None:
+            # The actual planned read footprint, in its final (augmented) frame.
             from types import SimpleNamespace
             scale = self.vol_spec.grid_scale/self.vol_spec.ct_grid_scale
-            for start,size in self.prefetch_bounds([item],SimpleNamespace(input_scale=scale)):
+            for start, size in self.prefetch_bounds([item], SimpleNamespace(input_scale=scale)):
                 if start[0]/scale < self.exclude.hi and (start[0]+size[0])/scale > self.exclude.lo:
                     return False
         return allowed
 
-    def replay_item(self, draw, rng):
-        source,band,op,j = draw
-        if band == -2:
-            return self.live_continuation.placeholder(self, rng)
-        if (source == REPLAY_SOURCES['recent'] and not self.correct_replay_only
-                and not self.prefer_replay_for_light_gt and self.replay_continuation_fraction is None
-                and hasattr(self.batch_builder,'replace_replay')):
-            replacement = self.batch_builder.replace_replay(source,band,self.cfg,rng)
-            if replacement is not None:
-                replacement = self.prepare(replacement,rng)
-                if self.state_allowed(replacement):
-                    return replacement
-        # A missing/unsafe bank proposal preserves the original replay draw.
-        fi,t,reverse = int(op.fiber_idx[j]),float(op.t[j]),bool(op.reverse[j])
-        item = label_state(self.fibers[fi],op.pos[j],op.frame[j],op.hist[j],op.hmask[j],self.cfg,
-                           t=t,reverse=reverse,offtrack=bool(op.offtrack[j]))
-        item.update(source=source,stratum=band,source_step=op.provenance.get('step',-1) or -1,
-                    failure_kind=int(op.failure_kind[j]) if hasattr(op, 'failure_kind') else 0,
-                    fiber_ref=(fi,self.fibers[fi].length-t if reverse else t,reverse))
-        item.update({k: getattr(op, k)[j] for k in SEED_FIELDS if hasattr(op, k)})
-        item['observed_path'] = op.observed_prefix(j)
-        item['replay_correct_continuation'] = bool(
-            (self.correct_replay_only or self.replay_continuation_fraction is not None) and band < 4)
+    # ----------------------------------------------------------------- task items
+
+    def fresh_location(self, rng, windows):
+        location = (self.batch_builder.fresh_location(rng)
+                    if hasattr(self.batch_builder, 'fresh_location') else None)
+        if location is not None:
+            return location['fiber'], location['t'], location['reverse'], location['source']
+        while len(windows) < self.pool_size:
+            fi = rng.choice(len(self.fibers), p=self.weights)
+            windows.append([fi, rng.uniform(0, self.fibers[fi].length), self.window_samples])
+        wi = rng.integers(len(windows))
+        fi, center, _ = windows[wi]
+        f = self.fibers[fi]
+        windows[wi][2] -= 1
+        if windows[wi][2] <= 0:
+            windows.pop(wi)
+        rev = bool(rng.integers(2))
+        if rng.random() < .1:
+            t = max(0, f.length-rng.uniform(0, self.cfg.future_s[-1]*1.5))
+        else:
+            original_t = np.clip(center+rng.uniform(-self.window/2, self.window/2), 0, f.length)
+            t = f.length-original_t if rev else original_t
+        return int(fi), float(t), rev, 0
+
+    def fresh_item(self, rng, windows, **options):
+        """A simulated trace; ``options`` fix the startup category or force an excursion."""
+        for _ in range(10000):
+            item = (self.batch_builder.replace_fresh(self.cfg, rng, **options)
+                    if hasattr(self.batch_builder, 'replace_fresh') else None)
+            if item is None:
+                fi, t, rev, location = self.fresh_location(rng, windows)
+                item = make_sample(self.fibers[fi], t, rev, self.cfg, rng, **options)
+                item.update(fiber_ref=(fi, t, rev), location_source=location)
+                item = self.prepare(item, rng)
+            item.update(source=SOURCE['fresh'], source_step=-1)
+            if self.state_allowed(item):
+                return item
+        raise ValueError('Could not draw a fresh training state outside the held-out band')
+
+    def recovery_item(self, rng, windows):
+        """Fresh substitute for missing recoverable replay: a displaced excursion head."""
+        from .state_labels import RECOVERABLE
+        for _ in range(8):
+            item = self.fresh_item(rng, windows, startup=STARTUP_CATEGORIES.index('established'), excursion=True)
+            if item['supervision'] == RECOVERABLE:
+                return item
+        return item
+
+    def synthetic_item(self, rng):
+        """Certified wrong continuation with visible original-fiber evidence, or None."""
+        if not hasattr(self.batch_builder, 'synthetic_terminal'):
+            return None
+        for _ in range(3):
+            item = self.batch_builder.synthetic_terminal(self.cfg, rng)
+            if item is None:
+                continue
+            item = self.prepare(item, rng)
+            if item.get('identity_evidence', False) and self.state_allowed(item):
+                return item
+        return None
+
+    def replay_draw(self, name, rng):
+        """One relabeled row of a replay class, honoring the age ceiling and event cap."""
+        eligible = self.eligible_caches()
+        for _ in range(8):
+            group = self.index.draw(name, rng, eligible)
+            if group is None:
+                return None
+            if not self.claim(group[4]):
+                continue
+            ci, episode, event, rows, key = group
+            item = self.replay_item(self.onpolicy[ci], int(rng.choice(rows)), rng)
+            if item is not None:
+                item.update(replay_event=key, replay_episode=stable_key(key, episode))
+                return item
+        return None
+
+    def replay_item(self, op, j, rng):
         from .heading import FRAME_POLICY
-        item['frame_policy'] = op.provenance.get('frame_policy', FRAME_POLICY)
-        item = self.prepare(item,rng)
+        fi, t, reverse = int(op.fiber_idx[j]), float(op.t[j]), bool(op.reverse[j])
+        item = label_state(self.fibers[fi], op.pos[j], op.frame[j], op.hist[j], op.hmask[j], self.cfg,
+                           t=t, reverse=reverse, trace=replay_facts(op, j, self.cfg))
+        item.update(source=SOURCE['replay'], source_step=int(op.provenance['step']),
+                    fiber_ref=(fi, self.fibers[fi].length-t if reverse else t, reverse),
+                    replay_class=int(op.replay_class[j]), travelled=float(op.travelled[j]),
+                    heading_start=int(op.heading_start[j]), frame_policy=FRAME_POLICY,
+                    labeler_state=replay_labeler_state(op, j))
+        item.update({k: getattr(op, k)[j] for k in SEED_FIELDS})
+        item['observed_path'] = op.observed_prefix(j)
+        item = self.prepare(item, rng)
         return item if self.state_allowed(item) else None
 
-    def prepare_pair(self, pair, rng):
-        prepared = [self.prepare(item, rng) for item in pair]
-        return prepared if all(self.state_allowed(item) for item in prepared) else []
+    def live_start(self, rng, windows):
+        """Chain starts: half recorded valid pre-excursion/recoverable prefixes, half seed-only."""
+        from .state_labels import FOLLOWING, RECOVERABLE
+        if rng.random() < .5:
+            for name in ('pre_excursion', 'recoverable') if rng.random() < .5 else ('recoverable', 'pre_excursion'):
+                item = self.replay_draw(name, rng)
+                if item is not None and item['geometry_valid'] and item['supervision'] in (FOLLOWING, RECOVERABLE):
+                    item.update(live_start='replay', live_loop_start=0)
+                    return item
+        item = self.fresh_item(rng, windows, startup=STARTUP_CATEGORIES.index('seed_only'))
+        item.update(live_start='seed', live_loop_start=len(item['observed_path'])-1)
+        return item
+
+    def task_item(self, task, rng, windows):
+        name, fallback, delivered = TASKS[task], 'none', TASKS[task]
+        if name == 'fresh':
+            item = self.fresh_item(rng, windows)
+        elif name == 'live':
+            item = (self.live_continuation.placeholder(self, rng, windows) if self.live_continuation is not None
+                    else None)
+            if item is None:
+                item, fallback, delivered = self.fresh_item(rng, windows), 'no_live_state', 'fresh'
+        elif name == 'synthetic_terminal':
+            item = self.synthetic_item(rng)
+            if item is None:
+                item, fallback, delivered = self.fresh_item(rng, windows), 'fresh', 'fresh'
+        else:
+            kind = name[len('dagger_'):]
+            item = self.replay_draw(kind, rng)
+            if kind == 'terminal':
+                self.terminal_requests += 1
+                if item is None and self.synthetic_fallbacks < self.budget.terminal_fallback_cap*self.terminal_requests:
+                    item = self.synthetic_item(rng)
+                    if item is not None:
+                        self.synthetic_fallbacks += 1
+                        fallback, delivered = 'synthetic', 'synthetic_terminal'
+            if item is None:
+                fallback, delivered = 'fresh', 'fresh'
+                item = (self.recovery_item(rng, windows) if kind == 'recoverable' else
+                        self.fresh_item(rng, windows, startup=STARTUP_CATEGORIES.index('established')))
+        item.update(task_requested=task, task_delivered=TASK[delivered], task_fallback=FALLBACKS.index(fallback))
+        return item
 
     def prefetch_bounds(self, items, vol):
         if hasattr(self.batch_builder, 'prefetch_bounds'):
@@ -792,6 +819,24 @@ class FollowDataset(torch.utils.data.IterableDataset):
         else:
             self.remote_prefetch.submit(vol.ct,bounds)
 
+    def resolve_seeds(self, items, vol, rng, windows):
+        """CT seed headings; a seed without CT orientation is rejected and its task redrawn."""
+        from .heading import SeedHeadingError
+        rejected = 0
+        for index, item in enumerate(items):
+            for _ in range(MAX_CT_FRAME_REJECTIONS):
+                try:
+                    resolve_trace_seed(item, vol)
+                    break
+                except SeedHeadingError:
+                    rejected += 1
+                    replacement = self.task_item(item['task_requested'], rng, windows)
+                    self.prefetch_items([replacement], vol, required=True)
+                    item = items[index] = replacement
+            else:
+                raise SeedHeadingError('No CT-oriented replacement seed after repeated rejections')
+        return rejected
+
     def __iter__(self):
         from .heading import SeedHeadingError
         torch.set_num_threads(1)
@@ -804,39 +849,42 @@ class FollowDataset(torch.utils.data.IterableDataset):
         lookahead = self.remote_prefetch_lookahead if self.remote_prefetch is not None else 0
         if lookahead < 0:
             raise ValueError('Remote prefetch lookahead must be nonnegative')
-        plans, pending = self._iter_plans(vol), deque()
+        windows = []
+        plans, pending = self._iter_plans(vol, windows), deque()
         first = True
         worker = torch.utils.data.get_worker_info()
         live_rng = np.random.default_rng(np.random.SeedSequence([self.seed, 8123, 0 if worker is None else worker.id]))
-        rejected = 0
+        rejected = seed_rejections = 0
         while True:
             # Deliver the first batch promptly. Fill the deeper plan queue when
             # the loader asks for its next batch, overlapping the first update.
             while len(pending) < (1 if first else lookahead+1):
                 plan = next(plans)
-                bounds = self.prefetch_bounds(plan[0],vol) if lookahead else None
-                pending.append((*plan,bounds))
+                bounds = self.prefetch_bounds(plan,vol) if lookahead else None
+                pending.append((plan,bounds))
             first = False
             if lookahead:
                 self.remote_prefetch.lookahead(vol.ct,
-                    [bounds for *_,bounds in pending],scope=id(self))
-            items, requested, fraction, bounds = pending.popleft()
+                    [bounds for _,bounds in pending],scope=id(self))
+            items, bounds = pending.popleft()
+            live_outcomes = None
             if self.live_continuation is not None:
                 items = [self.live_continuation.resolve(item, self, vol, live_rng)
                          if item.get('live_requested') else item for item in items]
+                live_outcomes = self.live_continuation.take_outcomes()
                 # Resolved positions differ from the geometry lookahead plan.
                 bounds = self.prefetch_bounds(items, vol) if lookahead else None
             if lookahead:
                 self.remote_prefetch.ensure(vol.ct,bounds)
             else:
                 self.prefetch_items(items,vol,required=True)
+            seed_rejections += self.resolve_seeds(items, vol, live_rng, windows)
             try:
                 batch = (self.batch_builder(items, vol) if self.batch_builder is not None
                          else collate_with_volume(items, vol, self.cfg.crop, grid))
             except SeedHeadingError as exc:
-                # Invalid geometry/context still rejects the whole plan to
-                # preserve pairs. Weak CT orientation now falls back in ct_frame
-                # and never reaches this retry path. I/O errors propagate.
+                # Invalid crop or slab orientation context rejects the whole plan.
+                # Weak CT orientation falls back in ct_frame; I/O errors propagate.
                 rejected += 1
                 if rejected >= MAX_CT_FRAME_REJECTIONS:
                     worker = torch.utils.data.get_worker_info()
@@ -850,118 +898,36 @@ class FollowDataset(torch.utils.data.IterableDataset):
                 batch['live_depth'] = torch.tensor([item.get('live_depth', 0) for item in items])
                 batch['live_limit'] = torch.tensor([item.get('live_limit', 0) for item in items])
                 batch['live_travelled'] = torch.tensor([item.get('live_travelled', 0.) for item in items])
-                batch['live_policy_age'] = torch.tensor([
-                    max(0, self.live_continuation.step.value-item['source_step'])
-                    if item.get('live_continuation') else 0 for item in items])
-            if fraction:
-                batch['decision_requested'] = torch.full((self.chunk,), 2*requested/self.chunk)
-            if rejected:
-                # A row-aligned counter survives the usual tensor batch movers;
-                # put the total in one row so summing never multiplies it by B.
-                batch['ct_frame_rejected_batches'] = torch.zeros(self.chunk, dtype=torch.int64)
-                batch['ct_frame_rejected_batches'][0] = rejected
-                rejected = 0
+            # Row-aligned counters survive the usual tensor batch movers; totals sit in
+            # row 0 so summing never multiplies them by the batch size.
+            counters = dict(ct_frame_rejected_batches=rejected, ct_seed_rejections=seed_rejections,
+                            replay_max_event_reuse=self.max_event_reuse() if self.onpolicy else 0)
+            if live_outcomes is not None:
+                counters.update({'live_'+name: value for name, value in live_outcomes.items()})
+            for name, value in counters.items():
+                batch[name] = torch.zeros(self.chunk, dtype=torch.int64)
+                batch[name][0] = value
+            rejected = seed_rejections = 0
             yield batch
 
-    def _iter_plans(self, vol):
+    def _iter_plans(self, vol, windows):
         """Ordered geometry/augmentation plans, without CT or dense image tensors."""
         info = torch.utils.data.get_worker_info()
         rng = np.random.default_rng(self.seed*1000 + (0 if info is None else info.id))
-        cfg = self.cfg
-        windows = []
         chunks = 0
         while True:
             if chunks % self.refresh_chunks == 0:
                 self.refresh_replay()
             chunks += 1
             items = []
-            fraction = getattr(getattr(self.batch_builder, 'sampling', None), 'decision_fraction', 0.)
-            requests = self.clean_requests(rng) if self.clean_fraction is not None else None
-            requested, following = ((requests['decision']//2, requests['bank_following']) if requests is not None
-                                    else self.endpoint_requests(rng))
-            if requests is not None:
-                fraction = self.sampling_probabilities()['decision']
-            for _ in range(requested):
-                pair = self.batch_builder.decision_pair(cfg, rng)
-                if pair is not None:
-                    prepared = self.prepare_pair(pair, rng)
-                    self.prefetch_items(prepared,vol)
-                    items.extend(prepared)
-            for _ in range(following):
-                item = self.batch_builder.bank_following(cfg, rng)
-                if item is not None:
-                    item = self.prepare(item, rng)
-                    if self.state_allowed(item):
-                        self.prefetch_items([item],vol)
-                        items.append(item)
-            if requests is not None:
-                for _ in range(requests['memory_switch']):
-                    item = self.wrong_turn_item(rng)
-                    if item is not None:
-                        self.prefetch_items([item], vol)
-                        items.append(item)
-                for _ in range(requests['recent']):
-                    draw = self.draw_replay(rng, force=True)
-                    item = self.replay_item(draw, rng) if draw is not None else None
-                    if item is not None:
-                        self.prefetch_items([item], vol)
-                        items.append(item)
-            for attempt in range(max(10000, self.chunk*1000)):
-                if len(items) == self.chunk:
-                    break
-                draw = self.draw_replay(rng) if requests is None and attempt < self.chunk*10 else None
-                item = None
-                if draw is not None:
-                    item = self.replay_item(draw,rng)
-                if item is None and requests is None and hasattr(self.batch_builder, 'replace_fresh'):
-                    item = self.batch_builder.replace_fresh(cfg,rng)
-                    if item is not None:
-                        item = self.prepare(item,rng)
-                if item is None:
-                    # A builder may oversample chosen locations; otherwise draw windows.
-                    location = (self.batch_builder.fresh_location(rng)
-                                if hasattr(self.batch_builder, 'fresh_location') else None)
-                    if location is None:
-                        while len(windows) < self.pool_size:
-                            fi = rng.choice(len(self.fibers), p=self.weights)
-                            windows.append([fi, rng.uniform(0, self.fibers[fi].length), self.window_samples])
-                        wi = rng.integers(len(windows))
-                        fi, center, _ = windows[wi]
-                        f = self.fibers[fi]
-                        windows[wi][2] -= 1
-                        if windows[wi][2] <= 0:
-                            windows.pop(wi)
-                        rev = bool(rng.integers(2))
-                        if rng.random() < .1:
-                            t = max(0, f.length-rng.uniform(0, cfg.future_s[-1]*1.5))
-                        else:
-                            original_t = np.clip(center+rng.uniform(-self.window/2, self.window/2), 0, f.length)
-                            t = f.length-original_t if rev else original_t
-                    else:
-                        fi, t, rev = location['fiber'], location['t'], location['reverse']
-                    gt_perturbed = bool(requests is not None and self.gt_perturb_probability
-                                        and rng.random() < self.gt_perturb_probability)
-                    if gt_perturbed and self.prefer_replay_for_light_gt:
-                        item = self.correct_continuation_item(rng)
-                    if item is None:
-                        item = make_sample(self.fibers[fi], t, rev, cfg, rng)
-                        item['gt_perturbed'] = gt_perturbed
-                        item['gt_unperturbed'] = requests is not None and not gt_perturbed
-                        item['source'], item['source_step'], item['stratum'] = 0, -1, -1
-                        item['fiber_ref'] = (int(fi), float(t), bool(rev))
-                        item['location_source'] = location['source'] if location else 0
-                        item = self.prepare(item, rng)
-                if self.state_allowed(item):
-                    self.prefetch_items([item],vol)
-                    items.append(item)
-                if len(items) == self.chunk:
-                    break
-            if len(items) != self.chunk:
-                raise ValueError('Could not fill a training batch outside the held-out band')
+            for task in rng.choice(len(TASKS), size=self.chunk, p=self.budget.shares):
+                item = self.task_item(int(task), rng, windows)
+                self.prefetch_items([item], vol)
+                items.append(item)
             if (self.remote_prefetch is not None and self.remote_prefetch_lookahead
                     and hasattr(self.batch_builder,'prepare_sampling_feedback')):
                 self.batch_builder.prepare_sampling_feedback(items)
-            yield items, requested, fraction
+            yield items
 
 
 FUSED_SAMPLER = os.environ.get("FIBER_FOLLOW_FUSED", "1") != "0"
@@ -1102,86 +1068,127 @@ def collate_targets(items):
         out["gt_history_mask"] = st("gt_history_mask")
         out["plane_ab"] = st("plane_ab")
         out["plane_mask"] = st("plane_mask")
-        for key in ("dense_ab", "dense_mask", "end_local", "endpoint_known", "offtrack"):
+        for key in ("dense_ab", "dense_mask", "end_local", "endpoint_known", "terminal", "match_distance"):
             out[key] = st(key)
+        for key in ('geometry_valid', 'confidence_valid'):
+            out[key] = torch.tensor([bool(it[key]) for it in items], dtype=torch.bool)
+        for key in ('supervision', 'supervision_reason'):
+            out[key] = torch.tensor([int(it[key]) for it in items], dtype=torch.long)
     if 'source' in items[0]:
-        out['source'] = st('source')
-        out['source_step'] = st('source_step')
-        out['stratum'] = st('stratum')
-        out['failure_kind'] = torch.tensor([it.get('failure_kind', 0) for it in items], dtype=torch.long)
-        for key in ('gt_unperturbed', 'gt_perturbed', 'replay_correct_continuation',
-                    'real_wrong_turn', 'real_wrong_turn_pre_switch', 'light_gt_replay',
-                    'live_requested', 'live_continuation', 'live_correct_continuation', 'live_failure',
-                    'live_fallback', 'live_light_slot'):
-            out[key] = torch.tensor([it.get(key, False) for it in items], dtype=torch.bool)
+        out['source'] = torch.tensor([it['source'] for it in items], dtype=torch.long)
+        out['source_step'] = torch.tensor([it.get('source_step', -1) for it in items], dtype=torch.long)
+        out['fiber_id'] = torch.tensor([it['fiber_ref'][0] for it in items], dtype=torch.long)
+        out['seed_age'] = torch.tensor([float(it.get('seed_age', 0.)) for it in items], dtype=torch.float32)
+        out['travelled'] = torch.tensor([float(it.get('travelled', 0.)) for it in items], dtype=torch.float32)
+        for key, default in (('task_requested', -1), ('task_delivered', -1), ('task_fallback', 0),
+                             ('startup', -1), ('replay_class', -1), ('replay_episode', -1), ('replay_event', -1)):
+            out[key] = torch.tensor([int(it.get(key, default)) for it in items], dtype=torch.long)
+        for key in ('excursion', 'live_requested', 'live_continuation', 'live_terminal'):
+            out[key] = torch.tensor([bool(it.get(key, False)) for it in items], dtype=torch.bool)
     return out
 
 
 # ------------------------------------------------------------ on-policy states
 
 
-def label_state(fiber, pos, frame, hist_world, hmask, cfg, *, t, reverse, offtrack=False):
-    """Relabel the exact inference frame/history against its original fiber."""
+def label_state(fiber, pos, frame, hist_world, hmask, cfg, *, t, reverse, trace):
+    """Relabel an exact observed frame/history against its original fiber.
+
+    ``t`` is the fiber's own arclength of the matched correspondence and ``trace`` the
+    state's trace facts (``state_labels.facts``). This is the one labeling call used by
+    the collector, replay, live continuation and synthetic sources.
+    """
+    from .state_labels import supervise
     if len(hist_world) != cfg.n_history or len(hmask) != cfg.n_history:
         raise ValueError('Replay history must equal n_history')
     traversal_t = fiber.length-t if reverse else t
-    return dict(pos=pos, frame=frame, hist_local=(hist_world-pos) @ frame,
-                hmask=np.asarray(hmask, np.float32),
-                **continuation_targets(fiber, traversal_t, reverse, pos, frame, cfg, offtrack))
+    item = dict(pos=pos, frame=frame, hist_local=(hist_world-pos) @ frame,
+                hmask=np.asarray(hmask, np.float32), trace_facts=dict(trace),
+                **continuation_targets(fiber, traversal_t, reverse, pos, frame, cfg))
+    if not (trace['match_valid'] and not trace['match_ambiguous']):
+        item['gt_history_mask'] = np.zeros_like(item['gt_history_mask'])
+    return supervise(item)
 
 
-STATE_VERSION = 8
+def replay_facts(op, j, cfg):
+    """Stored trace facts of one replay row, relabeled under this run's label contract."""
+    from .state_labels import DEPARTURE_PATIENCE, facts
+    return facts(match_distance=float(op.match_distance[j]), window_distance=float(op.window_distance[j]),
+                 match_valid=bool(op.match_valid[j]), match_ambiguous=bool(op.match_ambiguous[j]),
+                 switched=bool(op.switched[j]), beyond_end=bool(op.beyond_end[j]),
+                 tolerance=cfg.label_tolerance, max_recovery_distance=cfg.max_recovery_distance,
+                 t=float(op.t[j]), excursion=bool(op.bad_run[j] >= DEPARTURE_PATIENCE), bad_run=int(op.bad_run[j]),
+                 bad_run_start=float(op.bad_run_start[j]), departure_distance=float(op.departure_distance[j]),
+                 boundary_distance=float(op.boundary_distance[j]), switch_distance=float(op.switch_distance[j]))
+
+
+def replay_labeler_state(op, j):
+    """Exact ``TraceLabeler`` state after row ``j``; restarts resume from it."""
+    finite = lambda value: None if not np.isfinite(value) else float(value)
+    return dict(t=float(op.t[j]), last_travelled=float(op.travelled[j]), bad_run=int(op.bad_run[j]),
+                bad_run_start=finite(op.bad_run_start[j]), started=True,
+                departure_distance=finite(op.departure_distance[j]),
+                boundary_distance=finite(op.boundary_distance[j]), switch=None)
+
 
 class OnPolicyStates:
-    """States (pos, heading, own-trace history) visited by a tracer on GT fibers.
+    """Decision states (pos, frame, own-trace history) visited by a policy on GT fibers.
 
-    Loaded as memory-mapped .npy files so DataLoader workers share one copy
-    (pickling sends only the directory path)."""
+    One schema: every field below is required and validated on load; there are no
+    defaults for absent fields. Loaded as memory-mapped .npy files so DataLoader workers
+    share one copy (pickling sends only the directory path). Each trace's committed
+    polyline is stored once in ``track_pos``; rows reference it by ``seq_start:seq_end``
+    (the exclusive end includes the decision head). Nothing here except the observed
+    geometry ever becomes a model input.
+    """
 
-    FIELDS = ("fiber_idx", "t", "reverse", "pos", "frame", "hist", "hmask", "offtrack",
-              "hard", "exploratory")
-    # Fields later collectors add; caches without them load with the default.
-    # drift: current-position error in trace-grid voxels (NaN when departed or unknown).
-    # failure_kind indexes REPLAY_FAILURES. switch_* identifies the first certified
-    # foreign contact, including on retained pre-switch rows. None of it is input.
-    # Arc positions compared against float64 trace geometry keep full precision.
-    FLOAT64_FIELDS = ("t", "travelled", "switch_distance", "switch_pos", "pos", "frame", "hist", "seed_pos", "seed_tangent", "track_pos")
-    OPTIONAL = {"drift": lambda n: np.full(n, np.nan, np.float32),
-                "source_cache": lambda n: np.full(n, -1, np.int32),
-                "source_row": lambda n: np.full(n, -1, np.int64),
-                "failure_kind": lambda n: np.zeros(n, np.int8),
-                "travelled": lambda n: np.full(n, np.nan, np.float64),
-                # First trusted vertex within this trace's observed prefix.
-                "heading_start": lambda n: np.zeros(n, np.int64),
-                "switch_distance": lambda n: np.full(n, np.nan, np.float64),
-                "switch_pos": lambda n: np.full((n,3), np.nan, np.float64),
-                "switch_decision": lambda n: np.full(n, -1, np.int64),
-                "switch_bank_path": lambda n: np.full(n, '', dtype='U1'),
-                "switch_bank_run": lambda n: np.full(n, '', dtype='U64'), **SEED_DEFAULTS}
-    # Each trace is stored once. The exclusive end includes the decision head.
-    ROW_TRACK = {"seq_start": lambda n: np.full(n, -1, np.int64),
-                 "seq_end": lambda n: np.full(n, -1, np.int64)}
-    TRACK = {"track_pos": lambda n: np.zeros((n, 3), np.float64)}
+    # name: (dtype, trailing shape); None trailing dims are checked against arrays.
+    FIELDS = dict(
+        fiber_idx=('i8', ()), t=('f8', ()), reverse=('?', ()), pos=('f8', (3,)), frame=('f8', (3, 3)),
+        hist=('f8', (None, 3)), hmask=('f4', (None,)),
+        seed_pos=('f8', (3,)), seed_tangent=('f8', (3,)), seed_age=('f4', ()), seed_valid=('?', ()),
+        heading_start=('i8', ()), travelled=('f8', ()), episode=('i8', ()), source_row=('i8', ()),
+        seq_start=('i8', ()), seq_end=('i8', ()),
+        # Current supervision (state_labels.classify) and its trace facts.
+        supervision=('i1', ()), supervision_reason=('i1', ()), geometry_valid=('?', ()), confidence_valid=('?', ()),
+        match_distance=('f4', ()), window_distance=('f4', ()), match_valid=('?', ()), match_ambiguous=('?', ()),
+        switched=('?', ()), beyond_end=('?', ()),
+        # Historical events (NaN when absent) and resumable departure patience.
+        departure_distance=('f8', ()), boundary_distance=('f8', ()), switch_distance=('f8', ()),
+        switch_pos=('f8', (3,)), switch_bank_path=('U', ()), switch_bank_run=('U', ()),
+        bad_run=('i4', ()), bad_run_start=('f8', ()),
+        # The policy's own decision at this state.
+        would_stop=('?', ()), n_commit=('i4', ()), proposal_points=('f4', (None, 3)), proposal_confidence=('f4', (None,)),
+        # Replay membership.
+        replay_class=('i1', ()), event_id=('i8', ()), hard=('?', ()))
+    TRACK = dict(track_pos=('f8', (3,)))
 
-    def __init__(self, *, manifest, provenance=None, **arrays):
-        for key in self.FIELDS:
+    def __init__(self, *, manifest, provenance, **arrays):
+        expected = set(self.FIELDS) | set(self.TRACK)
+        if set(arrays) != expected:
+            raise ValueError(f'Replay fields differ from the schema: missing {sorted(expected-set(arrays))}, '
+                             f'unexpected {sorted(set(arrays)-expected)}')
+        for key in expected:
             setattr(self, key, np.asarray(arrays[key]))
-        for key, default in self.OPTIONAL.items():
-            setattr(self, key, np.asarray(arrays[key]) if key in arrays else default(len(self.pos)))
-        for key, default in self.ROW_TRACK.items():
-            setattr(self, key, np.asarray(arrays[key]) if key in arrays else default(len(self.pos)))
-        for key, default in self.TRACK.items():
-            setattr(self, key, np.asarray(arrays[key]) if key in arrays else default(0))
-        if any(len(getattr(self, k)) != len(self.pos) for k in self.FIELDS + tuple(self.OPTIONAL) + tuple(self.ROW_TRACK)):
-            raise ValueError('Replay arrays have different lengths')
-        if any(len(getattr(self, k)) != len(self.track_pos) for k in self.TRACK):
-            raise ValueError('Replay track arrays have different lengths')
-        present = self.seq_end >= 0
-        if np.any(present & ((self.seq_start < 0) | (self.seq_start > self.seq_end) | (self.seq_end > len(self.track_pos)))):
-            raise ValueError('Replay rows reference tracks outside the saved tracks')
         self._dir = None
         self.manifest = manifest
-        self.provenance = provenance or {}
+        self.provenance = provenance
+        self.validate()
+
+    def validate(self):
+        n = len(self.pos)
+        for key, (dtype, trailing) in {**self.FIELDS, **self.TRACK}.items():
+            value = getattr(self, key)
+            length = len(self.track_pos) if key in self.TRACK else n
+            if len(value) != length or value.ndim != 1+len(trailing) or any(
+                    expected is not None and actual != expected for expected, actual in zip(trailing, value.shape[1:])):
+                raise ValueError(f'Replay field {key} has shape {value.shape}')
+            if np.dtype(dtype).kind != value.dtype.kind:
+                raise ValueError(f'Replay field {key} has dtype {value.dtype}')
+        if n and np.any((self.seq_start < 0) | (self.seq_start >= self.seq_end) | (self.seq_end > len(self.track_pos))):
+            raise ValueError('Replay rows reference tracks outside the saved tracks')
+        if 'step' not in self.provenance or 'volume' not in self.provenance:
+            raise ValueError('Replay provenance must record its source step and volume')
 
     def __len__(self):
         return len(self.pos)
@@ -1189,8 +1196,6 @@ class OnPolicyStates:
     def observed_prefix(self, j):
         """Actual committed polyline through this decision; no future vertices."""
         start, end = int(self.seq_start[j]), int(self.seq_end[j])
-        if not 0 <= start < end <= len(self.track_pos):
-            raise ValueError('Replay needs complete observed prefixes; recollect with replay v8')
         path = self.track_pos[start:end]
         if not np.allclose(path[-1], self.pos[j], atol=1e-5, rtol=0):
             raise ValueError('Replay prefix does not end at decision head')
@@ -1199,8 +1204,8 @@ class OnPolicyStates:
         return path
 
     def save(self, path):
-        np.savez(path, __metadata__=json.dumps(dict(version=STATE_VERSION, fibers=self.manifest, provenance=self.provenance)),
-                 **{k: getattr(self, k) for k in self.FIELDS + tuple(self.OPTIONAL) + tuple(self.ROW_TRACK) + tuple(self.TRACK)})
+        np.savez(path, __metadata__=json.dumps(dict(fibers=self.manifest, provenance=self.provenance)),
+                 **{k: getattr(self, k) for k in (*self.FIELDS, *self.TRACK)})
 
     def validate_fibers(self, fibers):
         if self.manifest != fiber_manifest(fibers):
@@ -1218,35 +1223,29 @@ class OnPolicyStates:
 
     @classmethod
     def load(cls, path):
-        """``path``: .npz from collect.py (converted once to a sibling ``_mmap/``
-        dir of .npy files) or such a directory."""
+        """``path``: .npz from collect.py (mirrored once to a sibling ``_mmap`` directory of
+        .npy files) or such a directory."""
         path = os.fspath(path)
-        d = path[:-4] + "_mmap_v8" if path.endswith(".npz") else path
+        d = path[:-4] + "_mmap" if path.endswith(".npz") else path
         metadata_path = os.path.join(d, "metadata.json")
+        names = (*cls.FIELDS, *cls.TRACK)
         if path.endswith(".npz"):
             with np.load(path, allow_pickle=False) as z:
                 metadata = json.loads(str(z["__metadata__"].item()))
-                if metadata["version"] != STATE_VERSION:
-                    raise ValueError(f"Incompatible replay version {metadata['version']}; expected {STATE_VERSION}")
+                missing = [k for k in names if k not in z.files]
+                if missing:
+                    raise ValueError(f'Replay archive lacks schema fields {missing}; recollect it')
                 # Include archive identity so an overwritten NPZ cannot reuse stale mmap arrays.
                 stat = os.stat(path)
                 metadata["archive"] = [stat.st_size, stat.st_mtime_ns]
-                # Recorded so mirrors written with other precisions are rebuilt.
-                metadata["float64_fields"] = list(cls.FLOAT64_FIELDS)
                 existing = None
                 if os.path.exists(metadata_path):
                     with open(metadata_path) as fh:
                         existing = json.load(fh)
-                # Track arrays are mirrored only when the archive has them.
-                tracks = tuple(k for k in (*cls.ROW_TRACK, *cls.TRACK) if k in z.files)
-                if existing != metadata or any(not os.path.exists(os.path.join(d, k + ".npy"))
-                                               for k in cls.FIELDS + tuple(cls.OPTIONAL) + tracks):
+                if existing != metadata or any(not os.path.exists(os.path.join(d, k + ".npy")) for k in names):
                     os.makedirs(d, exist_ok=True)
-                    for k in cls.FIELDS + tuple(cls.OPTIONAL) + tracks:
-                        v = z[k] if k in z.files else cls.OPTIONAL[k](len(z["pos"]))
-                        if k not in cls.FLOAT64_FIELDS and v.dtype == np.float64:
-                            v = v.astype(np.float32)
-                        np.save(os.path.join(d, k + ".npy"), v)
+                    for k in names:
+                        np.save(os.path.join(d, k + ".npy"), z[k])
                     with open(metadata_path, "w") as fh:
                         json.dump(metadata, fh)
         obj = cls.__new__(cls)
@@ -1254,25 +1253,14 @@ class OnPolicyStates:
         return obj
 
     def _open(self, d):
-        metadata_path = os.path.join(d, "metadata.json")
-        with open(metadata_path) as fh:
+        with open(os.path.join(d, "metadata.json")) as fh:
             metadata = json.load(fh)
-        if metadata["version"] != STATE_VERSION:
-            raise ValueError(f"Incompatible replay version {metadata['version']}; expected {STATE_VERSION}")
         self.manifest = metadata["fibers"]
         self.provenance = metadata["provenance"]
         self._dir = d
-        for k in self.FIELDS:
+        for k in (*self.FIELDS, *self.TRACK):
             setattr(self, k, np.load(os.path.join(d, k + ".npy"), mmap_mode="r"))
-        for k, default in self.OPTIONAL.items():
-            file = os.path.join(d, k + ".npy")
-            setattr(self, k, np.load(file, mmap_mode="r") if os.path.exists(file) else default(len(self.pos)))
-        for k, default in self.ROW_TRACK.items():
-            file = os.path.join(d, k + ".npy")
-            setattr(self, k, np.load(file, mmap_mode="r") if os.path.exists(file) else default(len(self.pos)))
-        for k, default in self.TRACK.items():
-            file = os.path.join(d, k + ".npy")
-            setattr(self, k, np.load(file, mmap_mode="r") if os.path.exists(file) else default(0))
+        self.validate()
 
     def __getstate__(self):
         if self._dir is None:

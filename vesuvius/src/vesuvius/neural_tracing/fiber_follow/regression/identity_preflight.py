@@ -13,7 +13,7 @@ from vesuvius.neural_tracing.fiber_follow.regression.neighbor_bank import Neighb
 from vesuvius.neural_tracing.fiber_follow.regression.supervision import loss_terms
 from vesuvius.neural_tracing.fiber_follow.regression.train import move_batch,conv_memory_format
 from vesuvius.neural_tracing.fiber_follow.shared.components import ComponentRule
-from vesuvius.neural_tracing.fiber_follow.shared.data import FollowDataset,OnPolicyStates,SampleConfig,ZBand,load_fibers,split_fibers
+from vesuvius.neural_tracing.fiber_follow.shared.data import FollowDataset,OnPolicyStates,SampleConfig,TaskBudget,ZBand,load_fibers,split_fibers
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolumeSpec
 
 
@@ -31,8 +31,7 @@ def main(argv=None):
     ap.add_argument('--direction-inputs',action='store_true')
     ap.add_argument('--encoder',choices=('conv','patch4'),default='conv')
     ap.add_argument('--token-only',action='store_true')
-    ap.add_argument('--memory-switch-probability',type=float,default=0.)
-    ap.add_argument('--memory-switch-tail',type=float,nargs=2,default=(16.,96.))
+    ap.add_argument('--synthetic-tail',type=float,nargs=2,default=(4.,16.))
     ap.add_argument('--onpolicy',nargs='*',default=[],help='Replay caches, e.g. collected with observed tracks')
     args=ap.parse_args(argv)
     torch.set_num_threads(4);torch.manual_seed(0)
@@ -42,15 +41,13 @@ def main(argv=None):
     fibers,_=split_fibers(load_fibers(args.fibers,grid_scale=spec.grid_scale),band)
     bank=NeighborBank(args.bank,fibers,band,grid_scale=spec.grid_scale)
     bank.validate_volume(spec)
-    sampling=IdentitySampling(rule=ComponentRule(lateral_max=32.),decision_fraction=.5,
-        bank_coverage_probability=.2,bank_following_probability=.1,
-        memory_switch_probability=args.memory_switch_probability,memory_switch_tail=tuple(args.memory_switch_tail))
+    sampling=IdentitySampling(rule=ComponentRule(lateral_max=32.),bank_coverage_probability=.2,
+        synthetic_tail=tuple(args.synthetic_tail))
     builder=IdentityObservationBuilder(cfg,fibers,sampling,negative_bank=bank,augment=True)
-    sample=SampleConfig(full_observed_history=True,crop=cfg.fine,n_history=cfg.n_history,n_future=cfg.n_future,recent_history_points=cfg.n_history)
-    chunk = args.microbatch
-    if args.microbatch % 2:
-        raise ValueError('Preflight microbatch must contain complete pairs')
-    ds=FollowDataset(fibers,spec,sample,band,chunk=chunk,seed=37,batch_builder=builder,
+    sample=SampleConfig(crop=cfg.fine,n_history=cfg.n_history,n_future=cfg.n_future,recent_history_points=cfg.n_history)
+    # No live chains outside a trainer; their share goes to fresh traces.
+    ds=FollowDataset(fibers,spec,sample,band,chunk=args.microbatch,seed=37,batch_builder=builder,
+                     budget=TaskBudget.parse(['live=0','fresh=.65']),
                      onpolicy=[OnPolicyStates.load(p) for p in args.onpolicy])
     if args.out.exists():
         raise FileExistsError('Use a fresh preflight output directory')

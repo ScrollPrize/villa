@@ -6,7 +6,7 @@ import torch
 
 from test_identity import config
 from test_neighbor_bank import make_bank, add_shard, publish
-from test_neighbor_following import clean_sample
+from sampling_fixtures import clean_sample
 from vesuvius.neural_tracing.fiber_follow.shared import data as module
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
 from vesuvius.neural_tracing.fiber_follow.regression.data import IdentityObservationBuilder, IdentitySampling

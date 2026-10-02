@@ -12,8 +12,11 @@ import numpy as np
 import torch
 
 from vesuvius.neural_tracing.fiber_follow.shared.data import (
-    FollowDataset, OnPolicyStates, SampleConfig, ZBand, load_fibers, split_fibers, DATA_POLICY, fiber_manifest,
+    FollowDataset, OnPolicyStates, SampleConfig, TaskBudget, ZBand, load_fibers, split_fibers, DATA_POLICY, fiber_manifest,
 )
+
+# No live continuation or synthetic failures for this model: their shares go to fresh traces.
+FLOW_TASK_SHARES = ('fresh=.70', 'live=0', 'synthetic_terminal=0')
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
 from vesuvius.neural_tracing.fiber_follow.flow_matching.model import ARCHITECTURE, FollowNet, FollowNetConfig, flow_targets, prepare_model, prior_mean, initial_residuals
 from vesuvius.neural_tracing.fiber_follow.shared.online import OnlineCollector
@@ -97,7 +100,7 @@ def fit_flow_sigma(batches, cfg, states, progress=None):
     while seen < states:
         batch = next(batches)
         n = min(len(batch['hist']), states-seen)
-        x1, token_mask, censored = flow_targets({k: batch[k][:n] for k in ('plane_ab', 'plane_mask', 'offtrack')}, cfg)
+        x1, token_mask, censored = flow_targets({k: batch[k][:n] for k in ('plane_ab', 'plane_mask', 'geometry_valid')}, cfg)
         mu = prior_mean(batch['hist'][:n], batch['hmask'][:n], cfg)[..., :2].double()
         known = token_mask.bool()
         residual = torch.where(known[..., None], x1[..., :2].double()-mu, 0.)
@@ -192,7 +195,7 @@ def optimizer_update(model, ema, opt, batches, update, lr, *, device, tolerance=
         del x,hist,hmask,encoding_args
     if compute_metrics:
         targets={key:torch.cat([b[key] for b in batches]) for key in
-                 ('plane_ab','plane_mask','offtrack','gt_history','gt_history_mask')}
+                 ('plane_ab','plane_mask','geometry_valid','gt_history','gt_history_mask')}
         metrics['refinement']=refinement_metrics(torch.cat(refinement_steps),targets,model.cfg,n_commit)
         del refinement_steps,targets
     for cpu,points in zip(batches,curves):
@@ -212,15 +215,15 @@ def optimizer_update(model, ema, opt, batches, update, lr, *, device, tolerance=
         if 'source' in cpu:
             for source in range(3):
                 sources[source]+=int((cpu['source']==source).sum())
-            for band in range(5):
-                strata[band]+=int(((cpu['source']==2)&(cpu['stratum']==band)).sum())
+            for kind in range(5):
+                strata[kind]+=int(((cpu['source']==2)&(cpu['replay_class']==kind)).sum())
         last={k:v.detach() for k,v in batch.items()}
         del out,loss,batch,encoding_args
     torch.nn.utils.clip_grad_norm_(model.parameters(),1.,error_if_nonfinite=True)
     opt.step()
     update_ema(ema,model,update,decay)
     metrics.update(fresh_fraction=sources[0]/total,recent_fraction=sources[2]/total,
-                   replay_stratum_counts=strata.tolist(),replay_samples=int(sources[2]))
+                   replay_class_counts=strata.tolist(),replay_samples=int(sources[2]))
     return total_loss,metrics,last
 
 
@@ -257,17 +260,14 @@ def build_parser():
     ap.add_argument('--tolerance',type=float,default=1.5)
     ap.add_argument('--n-commit',type=int,default=DEFAULT_N_COMMIT,
                     help='Rollout commit limit; also the confidence near-window and refinement metric width')
-    ap.add_argument('--fresh-fraction',type=float,default=.7,
-                    help='Fresh share of draws; remainder uses current replay; may change on resume')
+    ap.add_argument('--task-share',action='append',default=[],metavar='TASK=SHARE',
+                    help='Override one task share; this model has no live continuation or synthetic failures')
     ap.add_argument('--onpolicy',nargs='*',default=[])
     ap.add_argument('--dagger-every',type=int,default=1000)
     ap.add_argument('--dagger-device')
-    ap.add_argument('--dagger-seeds',type=int,default=64)
-    ap.add_argument('--dagger-seeds-per-fiber',type=int,default=2,
-                    help='Seed positions per fiber, each traced in both directions; use 1 for broader coverage')
-    ap.add_argument('--dagger-batch',type=int,default=1)
-    ap.add_argument('--dagger-explore-calls',type=int,default=8)
-    ap.add_argument('--dagger-trace-len',type=float,default=6000.)
+    ap.add_argument('--dagger-fibers',type=int,default=64,help='Distinct fibers per collection, one directed episode each')
+    ap.add_argument('--dagger-batch',type=int,default=8)
+    ap.add_argument('--dagger-trace-len',type=float,default=768.)
     ap.add_argument('--replay-keep',type=int,default=4)
     ap.add_argument('--manifest',required=True,help='Frozen monitor, calibration and final seed manifest')
     ap.add_argument('--benchmark',required=True,help='Preflight JSON from scripts/benchmark_single_path.py')
@@ -287,8 +287,7 @@ def build_parser():
 def main(argv=None):
     raise_open_file_limit()
     args=build_parser().parse_args(argv)
-    if not np.isfinite(args.fresh_fraction) or not 0 <= args.fresh_fraction <= 1:
-        raise ValueError('fresh-fraction must be finite and in [0, 1]')
+    budget=TaskBudget.parse([*FLOW_TASK_SHARES,*args.task_share])
     if args.resume and args.init_from:
         raise ValueError('--resume and --init-from are mutually exclusive')
     if args.batch != 8 or args.batch % args.microbatch:
@@ -297,8 +296,8 @@ def main(argv=None):
         raise ValueError('Update counts, cadences and dimensions must be positive')
     if min(args.workers,args.diag_every,args.dagger_every,args.warmup)<0 or not 0<=args.ema_decay<1:
         raise ValueError('Invalid training settings')
-    if args.dagger_seeds_per_fiber < 1:
-        raise ValueError('dagger-seeds-per-fiber must be positive')
+    if min(args.dagger_fibers,args.dagger_batch) < 1:
+        raise ValueError('Collection fibers and batch must be positive')
     if str(args.device).startswith('cuda') and not torch.cuda.is_available():
         raise RuntimeError('CUDA unavailable; full training requires a working GPU')
     torch.manual_seed(args.seed); np.random.seed(args.seed)
@@ -306,7 +305,7 @@ def main(argv=None):
     if args.ct_level!=1 or args.ct_grid_scale!=8.:
         raise ValueError('This experiment requires CT level 1, ct_grid_scale=8')
     crop=CropSpec(depth=176,width=96,behind=128,history_render='segments',history_sigma=.35)
-    sample_cfg=SampleConfig(crop=crop,history_jitter=0.,history_wobble=1.,angle_sigmas_deg=(2.,5.,10.))
+    sample_cfg=SampleConfig(crop=crop,label_tolerance=args.tolerance)
     resume=read_checkpoint(args.resume,'cpu') if args.resume else None
     initial=read_checkpoint(args.init_from,'cpu') if args.init_from else None
     args.sampler_mode=resolve_sampler_mode(args.sampler_mode,resume)
@@ -360,14 +359,14 @@ def main(argv=None):
         replay_paths=list(args.onpolicy)
     caches=[OnPolicyStates.load(p) for p in replay_paths]
     collector=OnlineCollector(out/'dagger',args.fibers,args.val_z,args.dagger_device or args.device,
-                              every=args.dagger_every,max_seeds=args.dagger_seeds,batch=args.dagger_batch,
-                              explore_calls=args.dagger_explore_calls,seed=args.seed,replay_keep=args.replay_keep,
+                              every=args.dagger_every,fibers_per_collection=args.dagger_fibers,batch=args.dagger_batch,
+                              seed=args.seed,replay_keep=args.replay_keep,
                               initial=[c._dir for c in caches],trace_len=args.dagger_trace_len,confidence=DEFAULT_CONFIDENCE,n_commit=args.n_commit,
-                              seeds_per_fiber=args.dagger_seeds_per_fiber)
+                              collector_module='vesuvius.neural_tracing.fiber_follow.flow_matching.collect')
     # A resumed run reseeds its loader workers so it does not replay the run's first states.
     ds=FollowDataset(train_f,spec,sample_cfg,band,chunk=args.microbatch,seed=args.seed+(resume['step'] if resume else 0),
                      cache_bytes=int(args.worker_cache_gb*(1<<30)),onpolicy=caches,replay_index=str(collector.index),
-                     fresh_fraction=args.fresh_fraction)
+                     budget=budget)
     kwargs=dict(num_workers=args.workers,batch_size=None)
     if args.workers: kwargs.update(prefetch_factor=2,persistent_workers=True)
     loader=torch.utils.data.DataLoader(ds,**kwargs); it=iter(loader)
@@ -416,8 +415,7 @@ def main(argv=None):
     log=RunLog(out/'log.jsonl',formatter=format_training_log); start=time.monotonic()
     if first>1: log.record(dict(step=first,resumed_from=args.resume,replay_caches=len(caches),
                               compile_model=compile_model,cache_training_encoding=args.cache_training_encoding,
-                              candidate_selection=args.candidate_selection,dagger_seeds=args.dagger_seeds,
-                              dagger_seeds_per_fiber=args.dagger_seeds_per_fiber))
+                              candidate_selection=args.candidate_selection,dagger_fibers=args.dagger_fibers))
     try:
         for step in range(first,args.steps+1):
             event=collector.poll()
@@ -451,7 +449,7 @@ def main(argv=None):
                 pred=diagnostic['points']; gt=torch.cat([batch['plane_ab'],pred[...,2:]],-1)
                 plot_batch(batch['x'],pred,gt,batch['plane_mask'],crop,out/'images'/f'batch_{step:06d}.png',
                            batch['hist'],batch['hmask'],batch['gt_history'],batch['gt_history_mask'],
-                           source=batch['source'],offtrack=batch['offtrack'],confidence=diagnostic['confidence'])
+                           source=batch['source'],terminal=batch['terminal'],confidence=diagnostic['confidence'])
                 plot_denoising(diagnostic['denoising_steps'],batch['hist'],batch['hmask'],out/'images'/f'denoising_{step:06d}.png')
                 for threshold in DIAGNOSTIC_THRESHOLDS:
                     tracer.p.confidence=threshold

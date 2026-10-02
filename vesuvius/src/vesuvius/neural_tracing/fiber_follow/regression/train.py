@@ -12,10 +12,11 @@ import numpy as np
 import torch
 
 from vesuvius.neural_tracing.fiber_follow.shared.data import (
-    DATA_POLICY, FollowDataset, OnPolicyStates, SampleConfig, ZBand, fiber_manifest, load_fibers, split_fibers, REPLAY_FAILURES,
+    DATA_POLICY, FollowDataset, OnPolicyStates, SampleConfig, TaskBudget, ZBand, fiber_manifest, load_fibers, split_fibers,
 )
 from vesuvius.neural_tracing.fiber_follow.shared.experiment import read_manifest
 from vesuvius.neural_tracing.fiber_follow.shared.online import OnlineCollector
+from vesuvius.neural_tracing.fiber_follow.shared.policy import OperatingPolicy
 from vesuvius.neural_tracing.fiber_follow.shared.runloop import (
     RunLog, lr_at, prepare_run_dir, read_checkpoint, save_checkpoint as write_checkpoint,
     update_ema, training_rng_state, resume_training, raise_open_file_limit,
@@ -29,15 +30,13 @@ from vesuvius.neural_tracing.fiber_follow.regression.data import (
     IdentityObservationBuilder, IdentitySampling, DirectTracer, LOCATION_SOURCES,
 )
 from vesuvius.neural_tracing.fiber_follow.regression.supervision import commit_window, loss_terms
-from vesuvius.neural_tracing.fiber_follow.regression.diagnostics import (
-    decision_rows, summarize_decisions,
-    candidate_decisions, summarize_candidates,
-)
+from vesuvius.neural_tracing.fiber_follow.regression.diagnostics import decision_rows, summarize_decisions
 from vesuvius.neural_tracing.fiber_follow.regression.recovery import monitor_fixture, evaluate_monitor
 from vesuvius.neural_tracing.fiber_follow.regression.history_slabs import SAMPLING_REVISION
 from vesuvius.neural_tracing.fiber_follow.shared.heading import FRAME_POLICY
-from vesuvius.neural_tracing.fiber_follow.regression.identity_decisions import CANDIDATE_COUNT
-from vesuvius.neural_tracing.fiber_follow.shared.training_log import format_training_log, DirectTrainingInterval
+from vesuvius.neural_tracing.fiber_follow.shared.training_log import (
+    format_training_log, DirectTrainingInterval, SamplingLedger,
+)
 
 
 def validate_volume_source(spec, manifest):
@@ -55,6 +54,17 @@ def save_checkpoint(path, model, ema, spec, sample, extra=None):
                      dict({'n_commit': commit_window(model.cfg, None), **(extra or {})},
                           ema=ema.state_dict(), sample_cfg=asdict(sample)))
     temporary.replace(path)
+
+
+def collector_settings(collector):
+    members = getattr(collector, 'collectors', [(None, collector)])
+    return {name or 'primary': member.settings() for name, member in members}
+
+
+def training_policy(cfg, n_commit, confidence=.5):
+    """The operating policy used for live feedback and recorded with every checkpoint."""
+    return OperatingPolicy(confidence=confidence, n_commit=n_commit, max_recovery_distance=cfg.max_recovery_distance,
+                           refinement_steps=cfg.recurrent_refinement_steps)
 
 
 def conv_memory_format(device):
@@ -87,7 +97,6 @@ def prepare_training(model, batch_size=2, *, backend=None):
     model.training_batch_size = batch_size
     model._training_refined = None
     model.training_forward = torch.compile(model.training_forward, **options)
-    model.score_candidates = torch.compile(model.score_candidates, **options)
     model.training_loss = torch.compile(loss_terms, **options)
     return model
 
@@ -134,7 +143,7 @@ def finish_training_update(model):
                 parameter.grad = None
 
 
-def training_prediction(model, x, hist, hmask, candidates=None, confidence_threshold=.5, n_commit=None):
+def training_prediction(model, x, hist, hmask, confidence_threshold=.5, n_commit=None):
     actual = len(hist)
     # A single decision needs no duplicate encoder, proposal or scoring work.
     # Keep only two batch specializations: one row or the configured batch.
@@ -151,16 +160,7 @@ def training_prediction(model, x, hist, hmask, candidates=None, confidence_thres
         model._history_timings.append(timing if hist.is_cuda else time.perf_counter()-timing)
     image, history, mask = training_inputs(dict(x, history_tokens=tokens, history_padding=padding), hist, hmask, size)
     threshold = hist.new_full((), confidence_threshold)
-    output, context = model.training_forward(image, history, mask, threshold)
-    if candidates is not None:
-        count = candidates.shape[1]
-        if not 0 < count <= CANDIDATE_COUNT:
-            raise ValueError(f'Expected 1..{CANDIDATE_COUNT} candidate paths')
-        curves = candidates.detach()
-        if count < CANDIDATE_COUNT:
-            curves = torch.cat((curves, curves[:, :1].expand(-1, CANDIDATE_COUNT-count, -1, -1)), 1)
-        scored = model.score_candidates(context, fixed_rows(curves, size))
-        output.update({name: value[:, :count] for name, value in scored.items()})
+    output = model.training_forward(image, history, mask, threshold)
     output = {name: value[:actual] for name, value in output.items()}
     if model._training_refined is None:
         begin_training_update(model)
@@ -330,7 +330,7 @@ def training_diagnostics(model, cpu_batch, tracer, fibers, seeds, out, step, log
             filename = f'batch_{step:06d}.png'
             plot_batch(batch['x'][scale], points, target, batch['plane_mask'], crop, images/filename,
                        batch['hist'], batch['hmask'], batch['gt_history'], batch['gt_history_mask'],
-                       source=batch['source'], offtrack=batch['offtrack'], confidence=prediction['confidence'],
+                       source=batch['source'], terminal=batch['terminal'], confidence=prediction['confidence'],
                        history_channel=None, ct_range=(-4, 4))
         curves = prediction['refinement_points']
         labels = ['initial proposal']+[f'feedback proposal {i}' for i in range(1, curves.shape[1])]
@@ -371,10 +371,7 @@ def resolve_device_sums(*tables):
             table[key] = value
 
 
-IDENTITY_SUMS = ('identity_correct_count',
-                 'identity_flipped_count', 'candidate_states', 'candidate_intervals',
-                 'candidate_late_failures', 'candidate_first_failures', 'candidate_supervision_weight',
-                 'pair_rank_comparisons', 'pair_rank_correct', 'pair_rank_margin_sum')
+IDENTITY_SUMS = ('identity_correct_count', 'identity_flipped_count')
 
 
 def clip_training_gradients(model, history_max_norm=HISTORY_GRAD_CLIP, rest_max_norm=REST_GRAD_CLIP):
@@ -402,10 +399,9 @@ def clip_training_gradients(model, history_max_norm=HISTORY_GRAD_CLIP, rest_max_
 
 
 def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolerance=1.5,
-                     confidence_weight=.5, ema_decay=.999, n_commit=None, compute_metrics=True,
-                     candidate_weight=1., pair_rank_weight=0.,
+                     confidence_weight=.5, ema_decay=.999, ema_ramp=True, n_commit=None, compute_metrics=True,
                      history_grad_clip=HISTORY_GRAD_CLIP, rest_grad_clip=REST_GRAD_CLIP,
-                     diagnostic=None, live_continuation=None):
+                     diagnostic=None, live_continuation=None, ledger=None):
     """One equally weighted task loss per independent supervised decision."""
     prepare_training(model, getattr(model, 'training_batch_size', 2))
     total = observed = sum(len(batch['hist']) for batch in batches)
@@ -418,12 +414,9 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
     begin_training_update(model)
     sums = dict(loss=0., geometry=0., confidence_loss=0., error_sum=0., geometry_count=0.,
                 correct_count=0., confidence_count=0.)
-    sources = np.zeros(6, dtype=np.int64)
-    bank_tails = []
     identity = {}
-    candidate_groups = {}
-    requested_decisions = 0.
     decisions = []
+    per_state = []
     model.train()
     for cpu in batches:
         if 'ct_frame_rejected_batches' in cpu:
@@ -453,71 +446,34 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
             sums[name] = sums.get(name, 0.)+float(value)
         if diagnostic is not None:
             diagnostic.update(cpu_batch=cpu)
-        scoring = {}
-        if 'candidate_points' in batch and cpu['candidate_mask'].any():
-            scoring['candidates'] = batch['candidate_points']
         with torch.autocast('cuda', dtype=torch.bfloat16, enabled=torch.device(device).type == 'cuda'):
             output = training_prediction(model, batch['x'], batch['hist'], batch['hmask'],
-                           n_commit=commit_window(model.cfg, n_commit), **scoring)
+                                         n_commit=commit_window(model.cfg, n_commit))
             terms = model.training_loss(output, batch, model.cfg, tolerance, n_commit=n_commit)
             geometry = terms['geometry_per_state'].sum()/denominator
             confidence = terms['confidence_per_state'].sum()/denominator
             loss = geometry + confidence_weight*confidence
-            if 'candidate_per_state' in terms:
-                candidate_loss = terms['candidate_per_state'].sum()/denominator
-                loss = loss+candidate_weight*candidate_loss
-                accumulate(identity, 'candidate_loss', candidate_loss)
-                if pair_rank_weight:
-                    paired_loss = terms['pair_rank_per_state'].sum()/denominator
-                    loss = loss+pair_rank_weight*paired_loss
-                    accumulate(identity, 'pair_rank_loss', paired_loss)
         loss.backward()
         if live_continuation is not None:
             live_continuation.feedback(cpu, output, step)
         if compute_metrics:
             decisions.extend(decision_rows(output, batch, model.cfg, n_commit, tolerance))
-            if 'candidate_confidence_logits' in output:
-                for name, row in candidate_decisions(output, batch, model.cfg, n_commit).items():
-                    group = candidate_groups.setdefault(name, {})
-                    for key, value in row.items():
-                        group[key] = group.get(key, 0)+value
+        per_state.append(torch.stack((terms['positive_targets_per_state'].detach().float(),
+                                      terms['negative_targets_per_state'].detach().float(),
+                                      terms['geometry_states_per_state'].detach().float()), -1))
         for key in IDENTITY_SUMS:
             if key in terms:
                 accumulate(identity, key, terms[key])
         for key in ('presence_dropped', 'blurred', 'foreign_components', 'seed_present', 'identity_observable'):
             if key in cpu:
                 identity[key] = identity.get(key, 0.)+float((cpu[key] > 0).sum())
-        weights = torch.ones(len(cpu['hist']))
-        endpoint = torch.ones(len(weights), dtype=torch.bool)
-        matched = endpoint & (cpu.get('decision_kind', torch.zeros(len(weights))) > 0)
-        choice = endpoint & (cpu.get('decision_kind', torch.zeros(len(weights))) == 1)
-        for name, select in (('supervision', torch.ones_like(endpoint)), ('endpoint', endpoint),
-                             ('matched_endpoint', matched), ('choice_endpoint', choice)):
-            sums[name+'_weight'] = sums.get(name+'_weight', 0.)+float(weights[select].sum())
-        sums['endpoint_states'] = sums.get('endpoint_states', 0)+int(endpoint.sum())
-        sums['matched_endpoint_states'] = sums.get('matched_endpoint_states', 0)+int(matched.sum())
-        sums['choice_endpoint_states'] = sums.get('choice_endpoint_states', 0)+int(choice.sum())
-        if 'failure_kind' in cpu:
-            for kind, name in enumerate(REPLAY_FAILURES[1:], 1):
-                key = 'replay_'+name+'_endpoints'
-                sums[key] = sums.get(key, 0)+int(((cpu['failure_kind'] == kind) & endpoint).sum())
-        if 'decision_requested' in cpu:
-            requested_decisions += float(cpu['decision_requested'].sum())
-        for name in ('gt_unperturbed', 'gt_perturbed', 'replay_correct_continuation',
-                     'real_wrong_turn', 'real_wrong_turn_pre_switch', 'light_gt_replay',
-                     'live_requested', 'live_continuation', 'live_correct_continuation', 'live_failure',
-                     'live_fallback', 'live_light_slot'):
-            if name in cpu:
-                key = name+'_fraction'
-                sums[key] = sums.get(key, 0.)+float(cpu[name].sum())/denominator
         if 'live_continuation' in cpu:
-            cpu['live_policy_age'] = torch.where(cpu['live_continuation'],
-                step-cpu['source_step'].long(), 0)
-        for name in ('live_depth', 'live_policy_age'):
-            if name in cpu:
-                sums[name+'_sum'] = sums.get(name+'_sum', 0.)+float(cpu[name].sum())
-                sums[name+'_max'] = max(sums.get(name+'_max', 0), int(cpu[name].max()))
-        if 'live_limit' in cpu:
+            live = cpu['live_continuation']
+            sums['live_rows'] = sums.get('live_rows', 0)+int(live.sum())
+            sums['live_terminal_rows'] = sums.get('live_terminal_rows', 0)+int(cpu['live_terminal'].sum())
+        if 'live_depth' in cpu:
+            sums['live_depth_sum'] = sums.get('live_depth_sum', 0.)+float(cpu['live_depth'].sum())
+            sums['live_travelled_sum'] = sums.get('live_travelled_sum', 0.)+float(cpu['live_travelled'].sum())
             for name, selected in (('live_depth_counts', cpu['live_depth'] > 0),
                                    ('live_start_limit_counts', cpu['live_depth'] == 1)):
                 values = cpu['live_depth' if name == 'live_depth_counts' else 'live_limit'][selected]
@@ -525,11 +481,6 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
                 for value, count in zip(*torch.unique(values, return_counts=True)):
                     key = str(int(value))
                     counts[key] = counts.get(key, 0)+int(count)
-            sums['live_travelled_sum'] = sums.get('live_travelled_sum', 0.)+float(cpu['live_travelled'].sum())
-        if 'negative_bank_shards' in cpu:
-            low,high = int(cpu['negative_bank_shards'].min()),int(cpu['negative_bank_shards'].max())
-            identity['negative_bank_shards_min'] = min(identity.get('negative_bank_shards_min',low),low)
-            identity['negative_bank_shards_max'] = max(identity.get('negative_bank_shards_max',high),high)
         if 'location_source' in cpu:
             for index, name in enumerate(LOCATION_SOURCES):
                 key = f'location_{name}'
@@ -538,14 +489,17 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
             accumulate(sums, key, value)
         for key in ('error_sum', 'geometry_count', 'correct_count', 'confidence_count',
                     'point_correct_count', 'point_wrong_count', 'point_unknown_count',
-                    'confidence_labeled_states', 'confidence_departed_states', 'refinement_attempts_sum'):
+                    'confidence_labeled_states', 'confidence_terminal_states', 'confidence_recoverable_states',
+                    'refinement_attempts_sum', *(('connector_rejected_targets',) if 'connector_rejected_targets' in terms else ())):
             accumulate(sums, key, terms[key])
-        if 'source' in cpu:
-            for source in range(len(sources)):
-                sources[source] += int((cpu['source'] == source).sum())
-            if 'bank_tail_length' in cpu:
-                bank_tails.extend(cpu['bank_tail_length'][cpu['source'] == 3].tolist())
     resolve_device_sums(sums, identity)
+    per_state = torch.cat(per_state).cpu()
+    if ledger is not None:
+        offset = 0
+        for cpu in batches:
+            rows = per_state[offset:offset+len(cpu['hist'])]
+            offset += len(cpu['hist'])
+            ledger.add(cpu, step, rows.T.tolist())
     sums['history_encode_seconds'] = sum(t[0].elapsed_time(t[1])/1000 if isinstance(t, tuple) else t
                                          for t in model._history_timings)
     # The summed loss is finite only if every batch loss was; checked before any update.
@@ -555,37 +509,26 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
         finish_training_update(model)
         sums.update(clip_training_gradients(model, history_grad_clip, rest_grad_clip))
         opt.step()
-        update_ema(ema, model, step, ema_decay)
+        update_ema(ema, model, step, ema_decay, ramp=ema_ramp)
     sums.update(observed_states=observed, supervised_states=total,
-                observation_only_states=observed-total, optimizer_applied=bool(total))
+                observation_only_states=observed-total, optimizer_applied=bool(total),
+                positive_confidence_targets=float(per_state[:, 0].sum()),
+                negative_confidence_targets=float(per_state[:, 1].sum()))
     slab_count = max(1., sums['history_valid_slabs'])
     sums.update(history_age_mean=sums['history_age_sum']/slab_count,
                 history_overlap_mean=sums['history_overlap_sum']/slab_count,
                 history_valid_slabs_mean=sums['history_valid_slabs']/denominator)
     sums['refinement_attempts_mean'] = sums.get('refinement_attempts_sum', 0.)/denominator
-    sums.update(error_mean=sums['error_sum']/max(1., sums['geometry_count']),
-                prefix_correct_fraction=sums['correct_count']/max(1., sums['confidence_count']),
-                fresh_fraction=float(sources[0]/denominator),
-                recent_fraction=float(sources[2]/denominator),bank_wrong_continuation_fraction=float(sources[3]/denominator),
-                bank_following_fraction=float(sources[4]/denominator),
-                decision_pair_fraction=float(sources[5]/denominator), decision_requested_fraction=requested_decisions/denominator)
-    sums.update(bank_wrong_continuation_tail_mean=float(np.mean(bank_tails)) if bank_tails else None,
-                bank_wrong_continuation_tail_min=min(bank_tails) if bank_tails else None,
-                bank_wrong_continuation_tail_max=max(bank_tails) if bank_tails else None)
+    sums.update(error_mean=sums['error_sum']/max(1., sums['geometry_count']) if sums['geometry_count'] else None,
+                prefix_correct_fraction=sums['correct_count']/max(1., sums['confidence_count']))
     if identity:
-        # Versioned separately from the distance metrics above.
-        identity.update(identity_version=1,
-                        identity_prefix_correct_fraction=identity.get('identity_correct_count', 0.)/max(1., sums['confidence_count']))
-        if 'candidate_loss' in identity:
-            identity['candidate_loss_eligible'] = identity['candidate_loss']*total/max(1e-12, identity.get('candidate_supervision_weight', 0.))
+        identity['identity_prefix_correct_fraction'] = identity.get('identity_correct_count', 0.)/max(1., sums['confidence_count'])
         for key in ('presence_dropped', 'blurred', 'foreign_components', 'seed_present', 'identity_observable', *(f'location_{n}' for n in LOCATION_SOURCES)):
             if key in identity:
                 identity[key+'_fraction'] = identity.pop(key)/denominator
         sums['identity'] = identity
     if compute_metrics:
         sums['decisions'] = summarize_decisions(decisions, commit_window(model.cfg, n_commit))
-        if candidate_groups:
-            sums['identity']['candidate_decisions'] = summarize_candidates(candidate_groups)
     return sums
 
 
@@ -653,60 +596,35 @@ def build_parser():
     ap.add_argument('--hidden', type=int, default=128)
     ap.add_argument('--encoder-ffn', type=int, default=DirectConfig.encoder_ffn,
                     help='Axial image encoder feed-forward width')
-    ap.add_argument('--memory-switch-probability', type=float, default=.3,
-                    help='Fresh replacement weight for switches when dividing the non-clean budget')
-    ap.add_argument('--memory-switch-tail', type=float, nargs=2, default=(16.,96.), metavar=('MIN', 'MAX'),
-                    help='Neighbor tail length of memory-switch sequences in trace voxels')
     ap.add_argument('--activation-checkpointing', action=argparse.BooleanOptionalAction, default=False)
-    ap.add_argument('--no-history-prob', type=float, default=.05,
-                    help="Simulated-trace share of seed-only decisions (a trace's first call)")
-    ap.add_argument('--short-history-prob', type=float, default=.1,
-                    help='Otherwise, share of balanced 1-8/9-32 voxel trace starts; the rest begin anywhere earlier')
-    ap.add_argument('--decision-fraction', type=float, default=.3,
-                    help='Matched-pair weight before normalizing hard sources into the non-clean budget')
-    ap.add_argument('--decision-choice-fraction', type=float, default=.75,
-                    help='Requested fraction of matched pairs teaching recoverable geometry choices')
-    ap.add_argument('--candidate-weight', type=float, default=1., help='Weight of candidate first-failure survival likelihood')
-    ap.add_argument('--pair-rank-weight', type=float, default=0.,
-                    help='Weight of paired-history candidate prefix ranking; 0 preserves the original objective')
-    ap.add_argument('--fresh-fraction', type=float, default=.7,
-                    help='Fresh-versus-replay weight for hard-source allocation; clean GT share is --clean-fraction')
-    ap.add_argument('--clean-fraction', type=float, default=.8,
-                    help='Reserved GT share; each is a simulated trace with tracing error, built like inference')
-    ap.add_argument('--gt-perturb-probability', type=float, default=0.,
-                    help='Share of reserved GT slots offered to live continuation (with --prefer-replay-for-light-gt)')
-    ap.add_argument('--live-continuation', action='store_true',
-                    help='Replace correct replay slots with recent training predictions advanced by inference policy')
-    ap.add_argument('--live-continuation-steps', type=int, nargs=2, default=(4, 8), metavar=('MIN', 'MAX'),
-                    help='Number of live continuation decisions before reseeding a chain')
-    ap.add_argument('--live-continuation-stratified', action='store_true',
-                    help='Balance chain starts across three equal contiguous decision-limit bands')
-    ap.add_argument('--correct-replay-only', action='store_true',
-                    help='Replay only nondeparted, nonexploratory committed prefixes with real model progress')
-    ap.add_argument('--replay-continuation-fraction', type=float,
-                    help='Replay share of correct committed prefixes; remainder uses failures, overriding --replay-failure-fraction')
-    ap.add_argument('--prefer-real-wrong-turns', action='store_true',
-                    help='Fill wrong-turn slots from confirmed nonexploratory replay switches before synthetic fallback')
-    ap.add_argument('--prefer-replay-for-light-gt', action='store_true',
-                    help='Use correct continuation replay in light-GT slots when available; otherwise retain light GT')
+    ap.add_argument('--task-share', action='append', default=[], metavar='TASK=SHARE',
+                    help='Override one task share (fresh, live, dagger_pre_excursion, dagger_recoverable, '
+                         'dagger_terminal, dagger_premature_stop, dagger_ordinary, synthetic_terminal); shares sum to one')
+    ap.add_argument('--terminal-fallback-cap', type=float, default=TaskBudget.terminal_fallback_cap,
+                    help='Largest fraction of terminal replay slots filled by certified synthetic failures')
+    ap.add_argument('--replay-max-age', type=int, default=TaskBudget.replay_max_age,
+                    help='Updates after which a replay cache is no longer drawn')
+    ap.add_argument('--replay-event-cap', type=int, default=TaskBudget.replay_event_cap,
+                    help='Draws per replay event, shared by all loader workers of a source')
+    ap.add_argument('--startup-shares', type=float, nargs=4, default=SampleConfig.startup_shares,
+                    metavar=('SEED_ONLY', 'SHORT', 'EARLY', 'ESTABLISHED'),
+                    help='Fresh trace starts: seed only, 1-8 and 9-32 requested voxels, uniform available history')
+    ap.add_argument('--excursion-probability', type=float, default=SampleConfig.excursion_probability,
+                    help='Established fresh traces given a smooth lateral excursion')
+    ap.add_argument('--excursion-amplitude', type=float, nargs=2, default=SampleConfig.excursion_amplitude)
+    ap.add_argument('--excursion-rise', type=float, nargs=2, default=SampleConfig.excursion_rise)
+    ap.add_argument('--synthetic-tail', type=float, nargs=2, default=(4., 16.), metavar=('MIN', 'MAX'),
+                    help='Neighbor tail of certified synthetic failures, trace voxels')
+    ap.add_argument('--live-continuation-steps', type=int, nargs=2, default=(12, 32), metavar=('MIN', 'MAX'),
+                    help='Live chain decision limits, balanced over three contiguous bands')
     ap.add_argument('--negative-bank', default=str(Path(__file__).parents[1]/'output'/'neighbor_samples_r0_32_l80_160_v2'), help='Shared live bank for foreign-fiber masks, wrong continuations and following supervision')
     ap.add_argument('--near-negative-bank', help='Additional bank of validated nearby negative relationships')
-    ap.add_argument('--following-bank', help='Following path source (default: negative-bank)')
-    ap.add_argument('--continuation-bank', help='Wrong-continuation path source (default: negative-bank)')
-    ap.add_argument('--bank-coverage-probability', type=float, default=.2, help='Fresh slots reserved for covered parents with usable history (new runs: .2)')
-    ap.add_argument('--prefer-long-continuations', action=argparse.BooleanOptionalAction, default=False)
+    ap.add_argument('--continuation-bank', help='Synthetic failure path source (default: negative-bank)')
+    ap.add_argument('--bank-coverage-probability', type=float, default=.2, help='Fresh locations on covered parents with usable history')
     ap.add_argument('--negative-bank-refresh-seconds', type=float, default=30., help='Each loader worker checks for completed new negative shards at this interval')
     ap.add_argument('--negative-bank-cache-mb', type=float, default=64., help='Maximum cached negative geometry per loader worker')
-    ap.add_argument('--bank-wrong-continuation-probability', type=float, default=0.,
-                    help='Fraction of recent DAgger departure draws to replace with safe bank continuations when available')
-    ap.add_argument('--bank-wrong-continuation-tail', type=float, nargs=2, default=(4.,16.), metavar=('MIN', 'MAX'),
-                    help='Wrong-fiber tail range in trace voxels (default: 4 16)')
-    ap.add_argument('--bank-following-probability', type=float, default=.2,
-                    help='Independent fraction of endpoint proposals following validated bank paths (default: .2)')
     ap.add_argument('--bank-hard-fraction', type=float, default=.5,
                     help='Fraction of bank draws ranked by nearby similar, curved, or converging geometry')
-    ap.add_argument('--replay-failure-fraction', type=float, default=.5,
-                    help='Replay share balanced across available failure kinds; remainder uses drift bands')
     ap.add_argument('--bank-switch-tolerance', type=float, default=.75,
                     help='Foreign centerline contact radius for DAgger labels, in trace voxels')
     ap.add_argument('--bank-own-tolerance', type=float, default=1.5,
@@ -730,17 +648,24 @@ def build_parser():
     ap.add_argument('--long-diag-every', type=int, default=0, help='Additional long monitor rollouts; 0 disables')
     ap.add_argument('--long-diag-max-len', type=float, default=1200.)
     ap.add_argument('--recovery-every', type=int, default=1000, help='Fixed monitor recovery diagnostic cadence; 0 disables')
-    ap.add_argument('--recovery-seeds', type=int, default=8, help='First N frozen monitor seeds, four drift bands each')
+    ap.add_argument('--recovery-seeds', type=int, default=8, help='First N frozen monitor seeds, four displacement strata each')
     ap.add_argument('--recovery-length', type=float, default=32.)
-    ap.add_argument('--dagger-every', type=int, default=1000)
-    ap.add_argument('--dagger-seeds', type=int, default=64)
+    ap.add_argument('--dagger-every', type=int, default=1000,
+                    help='Global collection cadence; sources take turns and a busy launch is skipped')
+    ap.add_argument('--dagger-fibers', type=int, default=64,
+                    help='Distinct fibers per collection, one directed episode each')
+    ap.add_argument('--dagger-batch', type=int, default=8, help='Traces per collector forward batch')
+    ap.add_argument('--dagger-forward-chunk', type=int, default=0, help='Rows per collector model call; 0 = whole batch')
     ap.add_argument('--afv-length-power', type=float, default=1.,
-                    help='AFV fiber draws (training and DAgger) proportional to length**p; 1 is uniform over arclength')
+                    help='AFV training fiber draws proportional to length**p; collection always covers fibers uniformly')
     ap.add_argument('--dagger-device')
-    ap.add_argument('--dagger-trace-len', type=float, default=6000.)
-    ap.add_argument('--dagger-after', type=float, default=96.,
-                    help='Replay states recorded after a confirmed departure, in trace voxels')
+    ap.add_argument('--dagger-trace-len', type=float, default=768.)
+    ap.add_argument('--dagger-before', type=float, default=48., help='Dense decisions kept before an excursion')
+    ap.add_argument('--dagger-after', type=float, default=64., help='Voxels kept after the first terminal failure')
+    ap.add_argument('--dagger-stride', type=float, default=16., help='Travel between kept ordinary decisions')
     ap.add_argument('--replay-keep', type=int, default=4)
+    ap.add_argument('--init-weights', help='Start a new run from matching model and EMA tensors of this checkpoint; '
+                                           'fresh optimizer, sampler and options')
     ap.add_argument('--resume', help='Resume last.pt inside this run with the same training options')
     ap.add_argument('--reset-optimizer', action='store_true',
                     help='With --resume: fresh AdamW, one LR for all parameters, no transfer freeze, and restart LR warmup/decay')
@@ -789,32 +714,28 @@ def main(argv=None):
     progress(f'Starting training: device={args.device}, workers={args.workers}')
     if args.reset_optimizer and not args.resume:
         raise ValueError('--reset-optimizer requires --resume')
+    if args.init_weights and args.resume:
+        raise ValueError('--init-weights starts a new run; it cannot be combined with --resume')
     if any(not math.isfinite(v) or v < 0 for v in (args.history_grad_clip, args.rest_grad_clip)):
         raise ValueError('Gradient clipping limits must be finite and nonnegative (0 disables clipping)')
-    if not math.isfinite(args.fresh_fraction) or not 0 <= args.fresh_fraction <= 1:
-        raise ValueError('Fresh fraction must be finite and in [0, 1]')
-    if not math.isfinite(args.clean_fraction) or not 0 <= args.clean_fraction <= 1:
-        raise ValueError('Clean fraction must be finite and in [0, 1]')
-    if args.batch % 2:
-        raise ValueError('Clean/hard allocation requires an even batch')
+    budget = TaskBudget.parse(args.task_share, terminal_fallback_cap=args.terminal_fallback_cap,
+                              replay_max_age=args.replay_max_age, replay_event_cap=args.replay_event_cap)
     if (args.remote_prefetch_connections < 0 or args.remote_prefetch_queue_size < 1 or args.remote_prefetch_lookahead < 0
             or not math.isfinite(args.remote_prefetch_timeout) or args.remote_prefetch_timeout <= 0):
         raise ValueError('Prefetch connections and lookahead must be nonnegative; queue size and timeout must be positive')
     if min(args.steps, args.batch, args.grad_steps, args.log_every, args.ckpt_every,
-           args.threads, args.replay_keep, args.dagger_seeds, args.recovery_seeds) < 1:
+           args.threads, args.replay_keep, args.dagger_fibers, args.dagger_batch, args.recovery_seeds) < 1:
         raise ValueError('Positive counts required, including batch and grad steps')
     if min(args.workers, args.warmup, args.diag_every, args.batch_diag_every,
            args.long_diag_every, args.dagger_every, args.recovery_every, args.confidence_weight) < 0:
         raise ValueError('Invalid training settings')
-    if not 0 <= args.ema_decay < 1 or min(args.lr, args.tolerance, args.worker_cache_gb,
+    if not 0 <= args.ema_decay < 1 or min(args.lr, args.tolerance, args.worker_cache_gb, args.dagger_after,
                                        args.diag_max_len, args.long_diag_max_len, args.dagger_trace_len, args.recovery_length) <= 0:
         raise ValueError('Invalid loss, learning rate, cache, or rollout settings')
     if args.val_z[0] >= args.val_z[1]:
         raise ValueError('Holdout interval must be increasing')
     if not math.isfinite(args.afv_length_power) or args.afv_length_power < 0:
         raise ValueError('AFV length power must be finite and nonnegative')
-    if not all(0 <= p <= 1 for p in (args.no_history_prob, args.short_history_prob)):
-        raise ValueError('History probabilities must be in [0, 1]')
     if torch.device(args.device).type == 'cuda' and not torch.cuda.is_available():
         raise RuntimeError('CUDA unavailable')
     raise_open_file_limit()
@@ -822,11 +743,13 @@ def main(argv=None):
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     resume = read_checkpoint(args.resume,ARCHITECTURES,args.device) if args.resume else None
-    cfg = DirectConfig(encoder=resolve_encoder(args.encoder, resume),
-                       token_only=resolve_token_only(args.token_only, resume),
-                       history_encoder=resolve_history_encoder(args.history_encoder, resume),
-                       history_path_tokens=resolve_history_path_tokens(args.history_path_tokens, resume),
-                       path_geometry_tokens=resolve_path_geometry_tokens(args.path_geometry_tokens, resume),
+    initial = read_checkpoint(args.init_weights,ARCHITECTURES,'cpu') if args.init_weights else None
+    origin = resume or initial
+    cfg = DirectConfig(encoder=resolve_encoder(args.encoder, origin),
+                       token_only=resolve_token_only(args.token_only, origin),
+                       history_encoder=resolve_history_encoder(args.history_encoder, origin),
+                       history_path_tokens=resolve_history_path_tokens(args.history_path_tokens, origin),
+                       path_geometry_tokens=resolve_path_geometry_tokens(args.path_geometry_tokens, origin),
                        stem_channels=args.stem_channels, stem_blocks=args.stem_blocks,
                        direction_inputs=args.direction_inputs,input_mode=args.input_mode,channels=args.channels,hidden=args.hidden,layers=args.axial_layers,
                        encoder_ffn=args.encoder_ffn,
@@ -835,12 +758,16 @@ def main(argv=None):
                        scorer_layers=args.scorer_layers,
                        activation_checkpointing=args.activation_checkpointing,
                        recurrent_refinement_steps=args.recurrent_refinement_steps)
-    if resume:
-        cfg = checkpoint_config(resume)
+    if origin:
+        # Matching weight tensors define the architecture; nothing else is inherited.
+        cfg = checkpoint_config(origin)
         if args.direction_inputs != cfg.direction_inputs:
-            raise ValueError('Direction inputs must match the resumed checkpoint; start a new run to change them')
+            raise ValueError('Direction inputs must match the checkpoint; start a new run to change them')
         if args.input_mode != cfg.input_mode:
             raise ValueError('Input mode must match the checkpoint; CT-only starts a separate model')
+        if args.recurrent_refinement_steps != cfg.recurrent_refinement_steps:
+            raise ValueError('Refinement steps must match the checkpoint architecture')
+    if resume:
         from .datasets import validate_dataset_resume
         validate_dataset_resume(resume,dataset_document,dataset_digest)
     args.encoder = cfg.encoder
@@ -848,34 +775,15 @@ def main(argv=None):
     args.history_encoder = cfg.history_encoder
     args.history_path_tokens = cfg.history_path_tokens
     args.path_geometry_tokens = cfg.path_geometry_tokens
-    if args.decision_fraction and args.batch % 2:
-        raise ValueError('Matched decisions require an even batch')
-    if not np.isfinite(args.candidate_weight) or args.candidate_weight <= 0:
-        raise ValueError('Candidate weight must be finite and positive')
-    if not np.isfinite(args.pair_rank_weight) or args.pair_rank_weight < 0:
-        raise ValueError('Pair ranking weight must be finite and nonnegative')
-    if args.pair_rank_weight and not args.decision_fraction:
-        raise ValueError('Pair ranking requires matched decision sampling')
     if not 1 <= args.live_continuation_steps[0] <= args.live_continuation_steps[1]:
         raise ValueError('Live continuation requires 1 <= minimum steps <= maximum steps')
-    if args.live_continuation and args.replay_continuation_fraction is None and not args.correct_replay_only:
-        raise ValueError('Live continuation requires explicit continuation/failure allocation or correct-only replay')
-    if args.dagger_after <= 0:
-        raise ValueError('--dagger-after must be positive')
     from vesuvius.neural_tracing.fiber_follow.regression.bank_geometry import BankSwitchDetector
     BankSwitchDetector([], args.bank_switch_tolerance, args.bank_own_tolerance)
     identity_sampling = IdentitySampling(
         presence_dropout=args.presence_dropout,
         blur_probability=args.blur_probability,blur_sigma=args.blur_sigma,
-        lateral_fraction=args.lateral_fraction,
-        bank_wrong_continuation_probability=args.bank_wrong_continuation_probability,
-        bank_wrong_continuation_tail=args.bank_wrong_continuation_tail,
-        bank_following_probability=args.bank_following_probability,
-        bank_hard_fraction=args.bank_hard_fraction,replay_failure_fraction=args.replay_failure_fraction,
-        decision_fraction=args.decision_fraction,decision_choice_fraction=args.decision_choice_fraction,
-        candidate_tolerance=args.tolerance,bank_coverage_probability=args.bank_coverage_probability,
-        prefer_long_continuations=args.prefer_long_continuations,
-        memory_switch_probability=args.memory_switch_probability,memory_switch_tail=args.memory_switch_tail)
+        lateral_fraction=args.lateral_fraction,bank_hard_fraction=args.bank_hard_fraction,
+        bank_coverage_probability=args.bank_coverage_probability,synthetic_tail=args.synthetic_tail)
     if not args.negative_bank:
         raise ValueError('Training requires --negative-bank')
     if not 1 <= args.n_commit <= cfg.n_future:
@@ -883,16 +791,17 @@ def main(argv=None):
     # Finest-level CT in a single enlarged crop.
     primary_source = (next(s for s in dataset_document['sources'] if s['kind'] == 'paris4')
                       if dataset_document else {})
-    spec = FiberVolumeSpec(args.fiber_zarrs, ct_zarr=args.ct,
-        ct_level=primary_source.get('ct_level', 0), ct_grid_scale=primary_source.get('ct_grid_scale', 4.),
-        grid_scale=primary_source.get('grid_scale', 8.), inputs=cfg.input_mode,
-        load_presence=cfg.input_mode != 'ct', cache_dir=dataset_document['cache_dir'] if dataset_document else None)
+    from .datasets import primary_source_spec
+    spec = primary_source_spec(dataset_document, cfg.input_mode, fiber_zarrs=args.fiber_zarrs, ct=args.ct)
     if cfg.direction_inputs:
         # Validate sibling paths and grids before starting loaders or collectors.
         FiberVolume(spec, cache_bytes=1 << 20).direction_fields()
-    sample = SampleConfig(crop=cfg.fine, n_history=cfg.n_history, n_future=cfg.n_future, full_observed_history=True,
+    sample = SampleConfig(crop=cfg.fine, n_history=cfg.n_history, n_future=cfg.n_future,
                           future_step=cfg.future_step, recent_history_points=cfg.n_history,
-                          no_history_prob=args.no_history_prob, short_history_prob=args.short_history_prob)
+                          startup_shares=tuple(args.startup_shares), excursion_probability=args.excursion_probability,
+                          excursion_amplitude=tuple(args.excursion_amplitude), excursion_rise=tuple(args.excursion_rise),
+                          label_tolerance=args.tolerance, max_recovery_distance=cfg.max_recovery_distance)
+    policy = training_policy(cfg, args.n_commit)
     progress('Loading manifest and fiber annotations')
     bank_band = ZBand(*(v/spec.grid_scale for v in args.val_z))
     if dataset_document:
@@ -921,7 +830,7 @@ def main(argv=None):
             negative_bank.validate_resume(resume.get('negative_bank_provenance'))
         progress(f'Live negative bank: {negative_bank.shard_count} published shards, refresh every {args.negative_bank_refresh_seconds:g}s per worker')
         by_path = {negative_bank.root:negative_bank}
-        for role in ('near_negative_bank','following_bank','continuation_bank'):
+        for role in ('near_negative_bank','continuation_bank'):
             path = getattr(args,role)
             if path is None:
                 continue
@@ -939,27 +848,25 @@ def main(argv=None):
         return {role:bank.provenance() for role,bank in role_banks.items()}
     if resume:
         # Allow a new base LR without resetting AdamW or the schedule origin.
+        # Operational settings may change on resume; sampling and label semantics may not.
         ignored = {'resume','reset_optimizer','lr','out_root','device','batch','grad_steps','workers','threads','worker_cache_gb','dataset_config',
                    'remote_prefetch_connections','remote_prefetch_queue_size','remote_prefetch_timeout','remote_prefetch_lookahead',
-                   'log_every','ckpt_every','diag_every','batch_diag_every','dagger_device',
+                   'log_every','ckpt_every','diag_every','batch_diag_every','dagger_device','dagger_batch','dagger_forward_chunk',
                    'negative_bank_refresh_seconds','negative_bank_cache_mb','activation_checkpointing',
-                   'history_grad_clip','rest_grad_clip','presence_dropout','blur_probability','blur_sigma',
-                   'decision_fraction','decision_choice_fraction','bank_following_probability','fresh_fraction','clean_fraction',
-                   'correct_replay_only','memory_switch_probability','live_continuation','live_continuation_steps',
-                   'pair_rank_weight','live_continuation_stratified',
-                   'gt_perturb_probability','no_history_prob','short_history_prob',
-                   'replay_continuation_fraction','prefer_real_wrong_turns','prefer_replay_for_light_gt',
-                   'bank_hard_fraction','replay_failure_fraction','bank_switch_tolerance','bank_own_tolerance',
-                   'n_commit','tolerance','afv_length_power'}
+                   'history_grad_clip','rest_grad_clip','presence_dropout','blur_probability','blur_sigma'}
         for key,value in vars(args).items():
-            recorded = resume['training_options'].get(key, {'input_mode': 'ct+presence', 'dataset_config': None,
-                                                           'stem_channels': 0, 'stem_blocks': 2,
-                                                           'history_encoder': 'legacy', 'history_path_tokens': False,
-                                                           'path_geometry_tokens': False}.get(key))
+            recorded = resume['training_options'].get(key)
             if key not in ignored and json.dumps(recorded,sort_keys=True) != json.dumps(value,sort_keys=True):
                 raise ValueError(f'Resume option differs: {key}')
         if resume['seed_manifest_sha256'] != manifest['sha256'] or resume['fiber_manifest'] != fiber_manifest(fibers):
             raise ValueError('Resume data/manifest changed')
+    if initial:
+        # Source splits and fiber identities must match the weights' training data.
+        if initial['seed_manifest_sha256'] != manifest['sha256'] or initial['fiber_manifest'] != fiber_manifest(fibers):
+            raise ValueError('Initialization checkpoint used different fibers or evaluation splits')
+        splits = lambda document: [{k: v for k, v in s.items() if k != 'weight'} for s in (document or {}).get('sources', [])]
+        if splits(initial.get('dataset_config')) != splits(dataset_document):
+            raise ValueError('Initialization checkpoint used different dataset sources or holdouts')
     out = prepare_run_dir(args.out_root, args.name, resume is not None)
     if dataset_document:
         (out/'validation_paris4.json').write_text(json.dumps(manifest,indent=2)+'\n')
@@ -973,7 +880,7 @@ def main(argv=None):
                                  for s in dataset_document['sources'] if s['kind'] != 'paris4')
     progress('Preparing per-volume CT background normalization')
     ct_normalization = prepare_normalization(out, calibration_specs,
-        resume=resume['ct_normalization'] if resume is not None else None)
+        resume=origin['ct_normalization'] if origin is not None else None)
     recovery_states = recovery_hash = None
     if args.recovery_every:
         progress('Preparing monitor recovery fixture')
@@ -986,7 +893,14 @@ def main(argv=None):
     progress('Initializing models and optimizer')
     progress(f'Independent gradient clipping: history={args.history_grad_clip:g}, rest={args.rest_grad_clip:g} (0 disables clipping)')
     model = build_model(cfg).to(args.device, memory_format=conv_memory_format(args.device))
+    if initial:
+        model.load_state_dict(initial['model'], strict=True)
     ema = copy.deepcopy(model).requires_grad_(False).eval()
+    if initial:
+        ema.load_state_dict(initial['ema'], strict=True)
+        progress(f'Initialized model and EMA tensors from {args.init_weights} (update {initial["step"]}); '
+                 f'fresh AdamW with {args.warmup} warmup updates; no sampler, label or option state is inherited')
+        del initial
     opt, done, lr_restart_step = initialize_training_optimizer(model, ema, args, resume)
     if args.reset_optimizer:
         progress(f'Fresh AdamW: one parameter group, all parameters trainable; LR restarts at update {done+1} '
@@ -999,31 +913,28 @@ def main(argv=None):
     replay_paths = json.loads(replay_index.read_text()) if resume and replay_index.exists() else args.onpolicy
     progress('Loading replay banks and preparing data loader')
     caches = [OnPolicyStates.load(p) for p in replay_paths]
+    collection = dict(every=args.dagger_every, fibers_per_collection=args.dagger_fibers, batch=args.dagger_batch,
+                      forward_chunk=args.dagger_forward_chunk, seed=args.seed, replay_keep=args.replay_keep,
+                      trace_len=args.dagger_trace_len, before=args.dagger_before, after=args.dagger_after,
+                      stride=args.dagger_stride, confidence=policy.confidence, n_commit=policy.n_commit,
+                      collector_module='vesuvius.neural_tracing.fiber_follow.regression.collect')
+    bank_args = ('--bank-switch-tolerance', args.bank_switch_tolerance, '--bank-own-tolerance', args.bank_own_tolerance)
     collector = OnlineCollector(out/'dagger', args.fibers, args.val_z, args.dagger_device or args.device,
-        every=args.dagger_every, max_seeds=args.dagger_seeds, batch=1, seed=args.seed, replay_keep=args.replay_keep,
-        initial=[c._dir for c in caches], trace_len=args.dagger_trace_len, n_commit=args.n_commit,
-        collector_module='vesuvius.neural_tracing.fiber_follow.regression.collect',
-        extra_args=('--after', args.dagger_after, '--bank-switch-tolerance', args.bank_switch_tolerance,
-                    '--bank-own-tolerance', args.bank_own_tolerance,
-                    *[v for path in (args.negative_bank, args.near_negative_bank) if path for v in ('--failure-bank', path)]))
+        initial=[c._dir for c in caches], **collection,
+        extra_args=(*bank_args, *[v for path in (args.negative_bank, args.near_negative_bank) if path for v in ('--failure-bank', path)]))
     progress(f'Live historical slabs: eight slots; {args.batch} independent decisions per batch')
     builder = IdentityObservationBuilder(cfg,train_f,identity_sampling,
         augment=True,negative_bank=negative_bank,**role_banks)
     dataset = FollowDataset(train_f, spec, sample, band, chunk=args.batch, seed=args.seed+done,
         cache_bytes=int(args.worker_cache_gb*(1 << 30)), onpolicy=caches,
-        replay_index=str(collector.index), batch_builder=builder, additional_crops=(), fresh_fraction=args.fresh_fraction,
-        clean_fraction=args.clean_fraction, correct_replay_only=args.correct_replay_only,
-        replay_continuation_fraction=args.replay_continuation_fraction,
-        gt_perturb_probability=args.gt_perturb_probability,
-        prefer_real_wrong_turns=args.prefer_real_wrong_turns,
-        prefer_replay_for_light_gt=args.prefer_replay_for_light_gt)
+        replay_index=str(collector.index), batch_builder=builder, additional_crops=(), budget=budget)
     dataset_provenance = None
     if dataset_document:
         from .datasets import build_mixed_dataset
         progress('Checking mixed-source datasets and AFV checksums')
         dataset, dataset_provenance = build_mixed_dataset(dataset, dataset_document, cfg, sample,
             identity_sampling, args, seed=args.seed+done, out=out, resume=resume is not None,
-            normalization=ct_normalization)
+            normalization=ct_normalization, budget=budget)
         from ..shared.online import MultiSourceCollector
         collectors = []
         for source, source_dataset in zip(dataset_document['sources'], dataset.datasets):
@@ -1034,27 +945,22 @@ def main(argv=None):
             (out/f'validation_{source["name"]}.json').write_text(json.dumps(source_dataset.validation_manifest,indent=2)+'\n')
             collectors.append((source['name'],OnlineCollector(out/'dagger'/source['name'],
                 source['path'], (0,1), args.dagger_device or args.device,
-                every=args.dagger_every,max_seeds=args.dagger_seeds,batch=1,seed=args.seed,replay_keep=args.replay_keep,
-                initial=[c._dir for c in source_dataset.onpolicy],trace_len=args.dagger_trace_len,n_commit=args.n_commit,
-                collector_module='vesuvius.neural_tracing.fiber_follow.regression.collect',
-                extra_args=('--dataset-name',source['name'],'--after',args.dagger_after,
-                    '--bank-switch-tolerance',args.bank_switch_tolerance,'--bank-own-tolerance',args.bank_own_tolerance,
-                    *(('--fiber-length-power',args.afv_length_power) if args.afv_length_power != 1 else ())))))
+                initial=[c._dir for c in source_dataset.onpolicy], **collection,
+                extra_args=('--dataset-name',source['name'],*bank_args))))
         collector = MultiSourceCollector(collectors)
         progress('Dataset sampling: '+', '.join(f'{name}={weight:.1%}' for name,weight in zip(dataset.names,dataset.weights))
-                 +f'; AFV fiber draws proportional to length**{args.afv_length_power:g}')
-    live_continuation = None
-    if args.live_continuation:
-        from .live_continuation import LiveContinuation, preserve_live_metadata
-        live_continuation = LiveContinuation(dataset, steps=args.live_continuation_steps,
-            stratified=args.live_continuation_stratified,
-            n_commit=args.n_commit, max_recovery_distance=cfg.max_recovery_distance,
-            switch_tolerance=args.bank_switch_tolerance, own_tolerance=args.bank_own_tolerance)
-        live_continuation.set_step(done)
+                 +f'; AFV training fiber draws proportional to length**{args.afv_length_power:g}; collection covers fibers uniformly')
+    progress('Task budget per source: '+', '.join(f'{k} {v:.0%}' for k, v in budget.to_dict()['shares'].items())
+             +f'; replay age ceiling {budget.replay_max_age}, event cap {budget.replay_event_cap}, '
+             f'synthetic terminal fallback cap {budget.terminal_fallback_cap:.0%}')
+    sources = getattr(dataset, 'datasets', [dataset])
+    for source_dataset in sources:
+        source_dataset.set_step(done)
+    from .live_continuation import LiveContinuation, preserve_live_metadata
+    live_continuation = LiveContinuation(dataset, policy=policy, steps=args.live_continuation_steps,
+        switch_tolerance=args.bank_switch_tolerance, own_tolerance=args.bank_own_tolerance)
     loader_args = dict(batch_size=None, num_workers=args.workers,
-                       pin_memory=torch.device(args.device).type == 'cuda')
-    if live_continuation is not None:
-        loader_args['collate_fn'] = preserve_live_metadata
+                       pin_memory=torch.device(args.device).type == 'cuda', collate_fn=preserve_live_metadata)
     if args.workers:
         loader_args.update(prefetch_factor=2, persistent_workers=True)
     loader = torch.utils.data.DataLoader(dataset, **loader_args)
@@ -1067,6 +973,10 @@ def main(argv=None):
             negative_bank_provenance=negative_bank.provenance() if negative_bank else None,
             bank_role_provenance=role_provenance(),
             model_cfg=cfg.to_dict(), sample_cfg=asdict(sample), vol_spec=spec.to_dict(),
+            task_budget=budget.to_dict(), operating_policy=policy.to_dict(),
+            collection=collector_settings(collector),
+            initialization=dict(checkpoint=str(Path(args.init_weights).resolve()), optimizer='fresh AdamW',
+                                warmup=args.warmup) if args.init_weights else None,
             data_policy=DATA_POLICY, frame_policy=FRAME_POLICY,
             monitor_recovery_sha256=recovery_hash,
             seed_manifest_sha256=manifest['sha256'], fiber_manifest=fiber_manifest(fibers),
@@ -1086,19 +996,14 @@ def main(argv=None):
                     groups=[dict(parameters=len(g['params'])) for g in opt.param_groups],
                     trainable_parameters=sum(p.numel() for p in model.parameters() if p.requires_grad)))
     log.record(dict(step=done,event='identity_sampling',architecture=model.architecture,
-        source_sampling=(dataset.datasets[0] if dataset_document else dataset).sampling_probabilities(),
-        clean_gt_geometry=('simulated traces: annotated seed, smooth lateral tracing error (OU), tracer heading/history/'
-                           'CT seed heading; labels are the GT continuation from the offset head'),
+        task_budget=budget.to_dict(), operating_policy=policy.to_dict(), collection=collector_settings(collector),
+        fresh_geometry=('simulated traces: annotated seed, smooth lateral tracing error (OU) plus optional smooth '
+                        'excursions, tracer heading/history/CT seed heading; labels from the shared state contract'),
         simulated_traces=dict(trace_noise_sigma=sample.trace_noise_sigma, trace_noise_length=sample.trace_noise_length,
-                              seed_only=args.no_history_prob, short_start=args.short_history_prob),
-        live_gt_slots=dict(probability=args.gt_perturb_probability, replay=args.prefer_replay_for_light_gt),
-        live_continuation=args.live_continuation, live_continuation_steps=args.live_continuation_steps,
-        correct_replay_only=args.correct_replay_only,
-        replay_continuation_fraction=args.replay_continuation_fraction,
-        prefer_real_wrong_turns=args.prefer_real_wrong_turns,
-        prefer_replay_for_light_gt=args.prefer_replay_for_light_gt,
-        replay_collection=dict(batch=1, max_concurrent_collectors=1,
-                               device=args.dagger_device or args.device, checkpoint_storage='cpu'),
+                              startup_shares=sample.startup_shares, excursion_probability=sample.excursion_probability,
+                              excursion_amplitude=sample.excursion_amplitude, excursion_rise=sample.excursion_rise),
+        label_contract=dict(tolerance=sample.label_tolerance, max_recovery_distance=sample.max_recovery_distance),
+        live_continuation_steps=args.live_continuation_steps,
         history_sampling_revision=SAMPLING_REVISION, frame_policy=FRAME_POLICY,
         history_policy='live_observed_slabs',sampling=asdict(identity_sampling),
         negative_bank_path=str(negative_bank.root),negative_bank_provenance=negative_bank.provenance(),
@@ -1134,17 +1039,18 @@ def main(argv=None):
         if args.diag_every or args.long_diag_every:
             from vesuvius.neural_tracing.fiber_follow.shared.trace import TraceParams
             tracer = DirectTracer(ema, FiberVolume(spec), cfg.fine, cfg.n_history,
-                TraceParams(n_commit=args.n_commit, max_len=args.diag_max_len), device=args.device)
+                TraceParams.from_policy(policy, max_len=args.diag_max_len), device=args.device)
         progress(f'Starting data loader; batch {args.batch} × grad steps {args.grad_steps} = '
                  f'{args.batch * args.grad_steps} decisions per update; starting update {done+1}')
         iterator = iter(loader)
         updates = DecisionBatchPrefetch(iterator, args.grad_steps)
         observed_states = interval_states = 0
         prior_samples = int(resume['samples_seen']) if resume else 0
+        ledger = SamplingLedger()
         for step in range(done+1, args.steps+1):
-            if live_continuation is not None:
-                live_continuation.set_step(step)
-            event = collector.poll()
+            for source_dataset in sources:
+                source_dataset.set_step(step)
+            event = collector.poll(step)
             if event:
                 log.record(dict(step=step, **event))
             early = step <= done+5
@@ -1160,11 +1066,10 @@ def main(argv=None):
             diagnostic = {} if tracer is not None and args.diag_every and step % args.diag_every == 0 else None
             metrics = optimizer_update(model, ema, opt, batches, step, lr, device=args.device,
                 tolerance=args.tolerance, confidence_weight=args.confidence_weight, ema_decay=args.ema_decay,
+                ema_ramp=not args.init_weights,
                 n_commit=args.n_commit, compute_metrics=step % args.log_every == 0 or step == args.steps,
-                candidate_weight=args.candidate_weight,
-                pair_rank_weight=args.pair_rank_weight,
                 history_grad_clip=args.history_grad_clip, rest_grad_clip=args.rest_grad_clip,
-                diagnostic=diagnostic, live_continuation=live_continuation)
+                diagnostic=diagnostic, live_continuation=live_continuation, ledger=ledger)
             observed_states += metrics['observed_states']
             interval_states += metrics['observed_states']
             update_seconds = time.monotonic()-update_started
@@ -1183,19 +1088,23 @@ def main(argv=None):
                     samples_per_second=observed_states/(now-started),
                     interval_samples_per_second=interval_states/(now-interval_started),
                     interval_data_seconds=interval_data_seconds, interval_update_seconds=interval_update_seconds,
-                    interval=interval_metrics.summary(), n_future=cfg.n_future, tolerance=args.tolerance,
+                    interval=interval_metrics.summary(), sampling=ledger.summary(),
+                    n_future=cfg.n_future, tolerance=args.tolerance,
                     interval_updates=step-interval_step,
                     cuda_peak_allocated_gib=torch.cuda.max_memory_allocated(args.device)/2**30
                         if torch.device(args.device).type == 'cuda' else None))
                 from vesuvius.neural_tracing.fiber_follow.shared.diag import plot_curves
                 plot_curves(out/'log.jsonl', out/'curves.png', loss_key='geometry')
                 interval_metrics = DirectTrainingInterval()
+                ledger = SamplingLedger()
                 interval_started, interval_step = now, step
                 interval_data_seconds = interval_update_seconds = 0.
                 interval_states = 0
 
             def save(path, resumable=False):
                 extra = dict(step=step, lr_restart_step=lr_restart_step, tolerance=args.tolerance, n_commit=args.n_commit,
+                    operating_policy=policy.to_dict(), task_budget=budget.to_dict(), sample_contract=asdict(sample),
+                    initialization=str(Path(args.init_weights).resolve()) if args.init_weights else None,
                     dataset_config=dataset_document, dataset_config_sha256=dataset_digest,
                     dataset_provenance=dataset_provenance,
                     ct_normalization=ct_normalization,
@@ -1216,8 +1125,11 @@ def main(argv=None):
             if step % args.ckpt_every == 0 or step == args.steps:
                 save(out/f'ckpt_{step:06d}.pt', resumable=True)
                 save(out/'last.pt', resumable=True)
-            if step < args.steps and collector.launch(step, save):
-                log.record(dict(step=step, dagger_launched=True))
+            if step < args.steps:
+                if collector.launch(step, save):
+                    log.record(dict(step=step, dagger_launched=True))
+                elif step % args.dagger_every == 0 if args.dagger_every else False:
+                    log.record(dict(step=step, dagger_skipped_busy=True))
             periodic = {}
             if args.batch_diag_every and (step % args.batch_diag_every == 0
                                          or (resume is not None and step == done+1)):

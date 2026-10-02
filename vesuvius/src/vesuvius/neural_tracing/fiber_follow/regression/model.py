@@ -561,10 +561,9 @@ class DirectFollower(nn.Module):
         ctx['confidence_history_projected'] = self.confidence_scorer.history_attention.project_memory(*history)
         return ctx
 
-    def forward(self, x, hist, hmask, candidates=None,
-                confidence_threshold=DEFAULT_CONFIDENCE, n_commit=None):
+    def forward(self, x, hist, hmask, confidence_threshold=DEFAULT_CONFIDENCE, n_commit=None):
         ctx = self.context(x, hist, hmask)
-        out = self.predict(ctx, hist, candidates, confidence_threshold)
+        out = self.predict(ctx, hist, confidence_threshold)
         return self.select_prediction(out, confidence_threshold, n_commit)
 
     def select_prediction(self, output, confidence_threshold=DEFAULT_CONFIDENCE, n_commit=None):
@@ -584,9 +583,9 @@ class DirectFollower(nn.Module):
                                      ctx['confidence_projected'], ctx['confidence_padding'],
                                      ctx['confidence_history_projected'])
 
-    def predict(self, ctx, hist, candidates=None, confidence_threshold=DEFAULT_CONFIDENCE):
+    def predict(self, ctx, hist, confidence_threshold=DEFAULT_CONFIDENCE):
         decoded, points, projected, padding = self.prepare_prediction(ctx, hist)
-        return self.finish_prediction(ctx, decoded, points, projected, padding, candidates, confidence_threshold)
+        return self.finish_prediction(ctx, decoded, points, projected, padding, confidence_threshold)
 
     def prepare_prediction(self, ctx, hist):
         """Initial proposal and attention projections shared by every attempt."""
@@ -637,7 +636,7 @@ class DirectFollower(nn.Module):
         memory = torch.cat((memory, fine), 1)
         return memory, padding
 
-    def finish_prediction(self, ctx, decoded, points, projected, padding, candidates=None,
+    def finish_prediction(self, ctx, decoded, points, projected, padding,
                           confidence_threshold=DEFAULT_CONFIDENCE):
         from .survival_confidence import survival_predictions
         cfg = self.cfg
@@ -676,10 +675,7 @@ class DirectFollower(nn.Module):
             scores.append(tuple(previous.index_copy(0, indices, value)
                                 for previous, value in zip(scores[-1], (hazards, logits, confidence))))
             valid.append(torch.zeros_like(valid[0]).index_fill(0, indices, True))
-        out = self.proposal_output(initial, refinements, scores, valid)
-        if candidates is not None:
-            out.update(self.score_candidates(ctx, candidates))
-        return out
+        return self.proposal_output(initial, refinements, scores, valid)
 
     def proposal_output(self, initial, refinements, scores, valid):
         out = dict(initial_points=initial, refinement_points=torch.stack(refinements, 1),
@@ -687,13 +683,6 @@ class DirectFollower(nn.Module):
         out.update({'refinement_'+name: torch.stack([score[i] for score in scores], 1)
                     for i, name in enumerate(('hazard_logits', 'confidence_logits', 'confidence'))})
         return out
-
-    def score_candidates(self, ctx, candidates):
-        from .survival_confidence import survival_predictions
-        hazards = torch.stack([self.hazard_logits(ctx, curve) for curve in candidates.unbind(1)], 1)
-        logits, confidence = survival_predictions(hazards)
-        return dict(candidate_hazard_logits=hazards, candidate_confidence_logits=logits,
-                    candidate_confidence=confidence)
 
     def refine_prediction(self, ctx, points, decoded, hazards, confidence, projected, padding, stage_embedding):
         evidence = self.evidence(ctx, points, 'refinement')
@@ -735,12 +724,7 @@ class DirectFollower(nn.Module):
             refinements.append(points)
             scores.append((hazards, logits, confidence))
             valid.append(active)
-        out = self.proposal_output(initial, refinements, scores, valid)
-        score_context = {key: ctx[key] for key in
-                         ('fine', 'deep', 'confidence_projected', 'confidence_padding', 'confidence_history_projected')}
-        if self.cfg.recurrent_refinement_steps:
-            score_context.update(fine_fp32=ctx['fine_fp32'], deep_fp32=ctx['deep_fp32'])
-        return out, score_context
+        return self.proposal_output(initial, refinements, scores, valid)
 
     def decode_cached(self, query, projected, padding, ctx):
         for layer, kv in zip(self.decoder.layers, projected):

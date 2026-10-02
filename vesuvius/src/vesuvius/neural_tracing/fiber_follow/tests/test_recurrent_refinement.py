@@ -14,6 +14,7 @@ from vesuvius.neural_tracing.fiber_follow.regression.train import (
     checkpoint_config, optimizer_update, build_parser, prepare_training, training_prediction,
 )
 from vesuvius.neural_tracing.fiber_follow.shared.runloop import resume_training, training_rng_state
+from label_fixtures import set_terminal, state_labels
 
 
 def test_cached_decoder_matches_recomputed_forward_and_gradients():
@@ -70,7 +71,7 @@ def test_bounds_and_masked_geometry():
     with torch.no_grad():
         model.coordinates.bias.fill_(100.)
     b = memory_batch(c)
-    b['offtrack'][0] = 1
+    set_terminal(b, 0)
     b['dense_mask'][1].zero_()
     out = model(b['x'], b['hist'], b['hmask'])
     curves = out['refinement_points']

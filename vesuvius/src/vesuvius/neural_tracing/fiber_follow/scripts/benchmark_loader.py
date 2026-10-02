@@ -15,7 +15,7 @@ import numpy as np
 import torch
 
 from vesuvius.neural_tracing.fiber_follow.shared.data import (
-    FollowDataset, SampleConfig, ZBand, load_fibers, split_fibers, OnPolicyStates,
+    FollowDataset, SampleConfig, TaskBudget, ZBand, load_fibers, split_fibers, OnPolicyStates,
 )
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolumeSpec
@@ -61,13 +61,14 @@ def main():
     banks = {role: NeighborBank(c[role], fibers, band, grid_scale=spec.grid_scale,
                 refresh_seconds=c['negative_bank_refresh_seconds'],
                 cache_bytes=int(c['negative_bank_cache_mb']*(1 << 20)))
-             for role in ('negative_bank', 'near_negative_bank', 'following_bank', 'continuation_bank')
+             for role in ('negative_bank', 'near_negative_bank', 'continuation_bank')
              if c.get(role)}
     builder = IdentityObservationBuilder(cfg, fibers, IdentitySampling(**c['identity_sampling']),
                                          augment=True, **banks)
     dataset = FollowDataset(fibers, spec, sample, band, chunk=c['batch'], seed=args.seed,
         cache_bytes=int(c['worker_cache_gb']*(1 << 30)), batch_builder=builder,
-        onpolicy=[OnPolicyStates.load(p) for p in c['onpolicy']], fresh_fraction=c['fresh_fraction'])
+        onpolicy=[OnPolicyStates.load(p) for p in c['onpolicy']],
+        budget=TaskBudget(**dict(c['task_budget'], shares=tuple(c['task_budget']['shares'].values()))))
     loader = torch.utils.data.DataLoader(dataset, batch_size=None, num_workers=args.workers)
     iterator = iter(loader)
     for _ in range(args.warmup):

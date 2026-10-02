@@ -243,7 +243,7 @@ def render_microbatch(model, cpu_batch, out, step, *, device, n_commit, toleranc
                     stats[f'{head} {stage}'] = [tensor_stats(a) for a in attempts]
             row = dict(example=i, dataset=name, dataset_id=dataset_id,
                 source=int(batch['source'][0]) if 'source' in batch else None,
-                offtrack=bool(batch['offtrack'][0]),
+                terminal=bool(batch['terminal'][0]), supervision=int(batch['supervision'][0]),
                 identity_observable=bool(batch['identity_observable'][0]) if 'identity_observable' in batch else None,
                 selected_attempt=selected, **details, **measured_geometry(batch),
                 confidence=confidence, hazard_probability=output['hazard_logits'][0].sigmoid(),

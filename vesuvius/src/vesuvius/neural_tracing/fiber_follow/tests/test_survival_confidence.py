@@ -7,6 +7,7 @@ import torch
 from test_identity import config
 from slab_fixtures import slab_batch as memory_batch
 from test_regression import proposal_output
+from label_fixtures import set_terminal, state_labels
 from vesuvius.neural_tracing.fiber_follow.regression.model import build_model
 from vesuvius.neural_tracing.fiber_follow.regression.supervision import loss_terms
 from vesuvius.neural_tracing.fiber_follow.regression.survival_confidence import (
@@ -172,7 +173,7 @@ def test_generated_and_candidate_losses_share_survival_semantics_and_mask_identi
     points[..., 2] = torch.arange(1, cfg.n_future+1)
     hazards = torch.zeros(2, cfg.n_future, requires_grad=True)
     candidates = torch.zeros(2, 2, cfg.n_future, requires_grad=True)
-    batch['offtrack'][0] = 1
+    set_terminal(batch, 0)
     batch['identity_observable'] = torch.tensor([True, False])
     batch['candidate_labels'] = torch.zeros(2, 2, cfg.n_future)
     batch['candidate_mask'] = torch.ones(2, 2, cfg.n_future, dtype=torch.bool)

@@ -220,7 +220,7 @@ def test_afv_supports_switches_choices_departures_and_following(tmp_path):
     from vesuvius.neural_tracing.fiber_follow.regression.neighbor_continuations import wrong_continuation
     from vesuvius.neural_tracing.fiber_follow.regression.neighbor_following import following_sample
     from vesuvius.neural_tracing.fiber_follow.regression.identity_decisions import decision_pair
-    from test_neighbor_following import clean_sample
+    from sampling_fixtures import clean_sample
     p=tmp_path/'test.afv';afv_fixture(p,length=800,neighbor_x=36)
     fibers=AFVFibers(p);bank=AFVBank(fibers)
     cfg=config(input_mode='ct',fine=replace(config().fine,depth=48,behind=24))
