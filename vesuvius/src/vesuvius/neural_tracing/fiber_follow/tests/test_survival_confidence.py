@@ -7,7 +7,7 @@ import torch
 from model_fixtures import config
 from model_fixtures import slab_batch as memory_batch
 from model_fixtures import proposal_output
-from label_fixtures import set_terminal, set_unknown, state_labels
+from label_fixtures import set_terminal, set_unknown
 from vesuvius.neural_tracing.fiber_follow.regression.model import build_model
 from vesuvius.neural_tracing.fiber_follow.regression.supervision import loss_terms
 from vesuvius.neural_tracing.fiber_follow.regression.survival_confidence import (

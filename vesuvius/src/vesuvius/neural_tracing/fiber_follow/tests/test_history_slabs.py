@@ -247,7 +247,6 @@ def test_actual_trace_commits_and_resumed_slabs_use_same_prefix(monkeypatch):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA unavailable')
 def test_cuda_bf16_masks_and_compiled_repeated_updates():
-    from vesuvius.neural_tracing.fiber_follow.regression.train import move_batch
     torch.manual_seed(16)
     model=build_model(aligned_config(recurrent_refinement_steps=1)).cuda()
     ema=copy.deepcopy(model)

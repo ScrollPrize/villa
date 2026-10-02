@@ -6,10 +6,9 @@ import pytest
 import torch
 
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import (
-    CropSpec, frame_from_heading, normalize,
+    CropSpec, normalize,
 )
 from vesuvius.neural_tracing.fiber_follow.shared.trace import ModelTracer, TraceParams
-from vesuvius.neural_tracing.fiber_follow.shared.heading import transverse_frame
 
 
 @pytest.fixture(autouse=True)

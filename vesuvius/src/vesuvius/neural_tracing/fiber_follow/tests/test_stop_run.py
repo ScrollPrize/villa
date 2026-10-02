@@ -1,5 +1,4 @@
 """Scoped cleanup must include orphaned collectors without touching other runs."""
-from pathlib import Path
 import subprocess
 import sys
 

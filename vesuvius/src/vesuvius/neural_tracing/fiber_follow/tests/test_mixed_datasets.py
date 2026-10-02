@@ -4,7 +4,6 @@ import pickle
 import sqlite3
 from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
