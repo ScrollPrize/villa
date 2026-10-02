@@ -111,7 +111,7 @@ def connector_batch(cfg, foreign_at):
 
 
 def test_foreign_contact_between_origin_and_first_plane_rejects_a_correct_endpoint():
-    from test_identity import config
+    from model_fixtures import config
     from vesuvius.neural_tracing.fiber_follow.regression.supervision import (
         connector_failures, geometry_mask, proposal_labels)
     cfg = config()
@@ -150,7 +150,7 @@ def test_displaced_origin_recovery_is_a_positive_continuation():
 # --------------------------------------------------------------------------- augmentation footprints
 
 def test_recorded_frame_takes_its_roll_before_the_read_is_planned():
-    from test_identity import config
+    from model_fixtures import config
     from vesuvius.neural_tracing.fiber_follow.regression.data import IdentityObservationBuilder, IdentitySampling
     from vesuvius.neural_tracing.fiber_follow.shared.heading import FRAME_POLICY
     cfg = config(fine=CropSpec(depth=120, width=104, behind=48, spacing=.5))

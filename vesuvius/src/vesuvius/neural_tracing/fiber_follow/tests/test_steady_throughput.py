@@ -34,7 +34,7 @@ def test_warmup_and_missing_first_gap_are_not_timed():
 
 def test_synthetic_microbatch_preserves_decisions_and_supervision():
     import torch
-    from slab_fixtures import cfg
+    from model_fixtures import config as cfg
     from vesuvius.neural_tracing.fiber_follow.regression.benchmark_slabs import (
         synthetic_decisions, decision_microbatches,
     )

@@ -4,7 +4,7 @@ import pytest
 import torch
 from types import SimpleNamespace
 
-from test_identity import config, batch
+from model_fixtures import config, batch
 from vesuvius.neural_tracing.fiber_follow.regression.model import build_model
 from vesuvius.neural_tracing.fiber_follow.visualization.capture import attention, capture, validate_attention, array
 from vesuvius.neural_tracing.fiber_follow.visualization.interpret import replay_item, analyze, annotation_item

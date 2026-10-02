@@ -18,6 +18,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, crop_
 from vesuvius.neural_tracing.fiber_follow.shared.runloop import training_rng_state, resume_training
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolumeSpec
 from label_fixtures import set_terminal, state_labels
+from model_fixtures import proposal_output
 
 
 def config():
@@ -29,7 +30,7 @@ def batch(cfg, b=2):
     hist = torch.zeros(b, cfg.n_history, 3)
     hist[..., 2] = -torch.arange(1, cfg.n_history+1)
     q = 4*(cfg.n_future-1)+1
-    from slab_fixtures import slab_inputs
+    from model_fixtures import slab_inputs
     return dict(x=slab_inputs(b) | {name: torch.rand(b, 2, crop.depth, crop.width, crop.width)
                    for name, crop in (('fine', cfg.fine),)},
                 hist=hist, hmask=torch.ones(b, cfg.n_history), dense_ab=torch.ones(b, q, 2),
@@ -41,17 +42,6 @@ def forward(m, b):
     return m(b['x'], b['hist'], b['hmask'])
 
 
-def proposal_output(curves, hazards, selected=-1):
-    """Build the current all-proposal output contract for loss/policy fixtures."""
-    from vesuvius.neural_tracing.fiber_follow.regression.survival_confidence import survival_predictions
-    logits, confidence = survival_predictions(hazards)
-    return dict(points=curves[:, selected], initial_points=curves[:, 0],
-                hazard_logits=hazards[:, selected], confidence_logits=logits[:, selected],
-                confidence=confidence[:, selected], refinement_points=curves,
-                refinement_hazard_logits=hazards, refinement_confidence_logits=logits,
-                refinement_confidence=confidence,
-                refinement_mask=torch.ones(curves.shape[:2], device=curves.device, dtype=torch.bool),
-                selected_refinement=torch.full((len(curves),), selected % curves.shape[1], device=curves.device))
 
 
 def test_prediction_is_deterministic_and_geometry_trains_actual_coordinates():

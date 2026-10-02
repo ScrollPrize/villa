@@ -5,7 +5,7 @@ from dataclasses import replace
 import pytest
 import torch
 
-from slab_fixtures import cfg, slab_batch as memory_batch
+from model_fixtures import config as cfg, slab_batch as memory_batch
 from vesuvius.neural_tracing.fiber_follow.regression.model import (
     DirectConfig, PathDecoderLayer, TOKEN_ARCHITECTURE, PATCH_ARCHITECTURE, build_model,
 )

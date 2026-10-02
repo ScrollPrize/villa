@@ -3,9 +3,9 @@ import pytest
 import torch
 from torch import nn
 
-from test_identity import config
-from slab_fixtures import slab_batch as memory_batch
-from test_training_defaults import REQUIRED
+from model_fixtures import config
+from model_fixtures import slab_batch as memory_batch
+from model_fixtures import REQUIRED
 from vesuvius.neural_tracing.fiber_follow.regression.model import (
     ARCHITECTURE, PATCH_ARCHITECTURE, DirectConfig, build_model, sample_features,
 )

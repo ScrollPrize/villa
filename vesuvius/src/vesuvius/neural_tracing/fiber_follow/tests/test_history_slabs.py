@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 import torch
 
-from slab_fixtures import cfg, slab_batch
+from model_fixtures import config as cfg, slab_batch
 from vesuvius.neural_tracing.fiber_follow.regression.history_slabs import (
     SLAB, selected_arcs, slab_layout, fitted_heading, observed_path, load_slabs, slabs_allowed,
 )
@@ -200,7 +200,7 @@ def test_compiled_decisions_match_inference_with_all_history_gradients(token_onl
 
 
 def test_complete_synthetic_prefix_precedes_local_history_truncation():
-    from test_identity import line_fiber
+    from model_fixtures import line_fiber
     fiber=line_fiber(1500.)
     sample=SampleConfig(n_history=128,startup_shares=(0.,0.,0.,1.))
     lengths=[]

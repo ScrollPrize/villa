@@ -7,7 +7,8 @@ from PIL import Image
 import pytest
 import torch
 
-from test_regression import batch, config, proposal_output
+from test_regression import batch, config
+from model_fixtures import proposal_output
 from label_fixtures import set_terminal, state_labels
 from vesuvius.neural_tracing.fiber_follow.regression.model import DirectFollower
 from vesuvius.neural_tracing.fiber_follow.regression.batch_diagnostic import (

@@ -19,35 +19,13 @@ from vesuvius.neural_tracing.fiber_follow.shared.data import SampleConfig, Trace
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, crop_local_grid, sample_oriented_fast
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolumeSpec
 from label_fixtures import set_terminal, state_labels
+from model_fixtures import config, batch, forward, line_fiber
 
 
-def config(**kwargs):
-    options=dict(fine=CropSpec(depth=24,width=17,behind=8),channels=4,hidden=16,
-        heads=2,layers=1,decoder_layers=1,n_future=4,n_history=32,activation_checkpointing=False,recurrent_refinement_steps=0)
-    options.update(kwargs)
-    if options.get('encoder') == 'patch4':
-        crop = options['fine']
-        options['fine'] = replace(crop, depth=4*((crop.depth+3)//4), width=4*((crop.width+3)//4))
-    return DirectConfig(**options)
 
 
-def batch(cfg,b=2):
-    hist=torch.zeros(b,cfg.n_history,3)
-    hist[...,2]=-torch.arange(1,cfg.n_history+1)
-    q=4*(cfg.n_future-1)+1
-    x=dict(fine=torch.rand(b,2,cfg.fine.depth,cfg.fine.width,cfg.fine.width),
-        seed=torch.zeros(b,1,3),seed_mask=torch.ones(b,1),seed_tangent=torch.tensor([0.,0.,1.]).expand(b,-1),
-        seed_age=torch.zeros(b))
-    from slab_fixtures import slab_inputs
-    x.update(slab_inputs(b))
-    return dict(x=x,hist=hist,hmask=torch.ones(b,cfg.n_history),dense_ab=torch.zeros(b,q,2),
-        dense_mask=torch.ones(b,q),**state_labels(b),endpoint_known=torch.zeros(b),
-        end_local=torch.zeros(b,3),source=torch.zeros(b),
-        foreign=torch.zeros(b,cfg.fine.depth,cfg.fine.width,cfg.fine.width,dtype=torch.uint8))
 
 
-def forward(m, b):
-    return m(b['x'], b['hist'], b['hmask'])
 
 
 
@@ -81,14 +59,11 @@ def fake_images(builder,items):
     cfg=builder.cfg
     for item in items: reference_layout(item,cfg)
     stack=lambda key: torch.from_numpy(np.stack([i[key] for i in items]).astype(np.float32))
-    from slab_fixtures import slab_inputs
+    from model_fixtures import slab_inputs
     return slab_inputs(len(items)) | dict(fine=torch.from_numpy(np.random.default_rng(3).random((len(items),2,cfg.fine.depth,cfg.fine.width,cfg.fine.width),np.float32)),
         seed=stack('visible_seed'),seed_mask=stack('visible_seed_mask'),seed_tangent=stack('visible_seed_tangent'),seed_age=stack('visible_seed_age'))
 
 
-def line_fiber(length=600.):
-    arc = np.arange(length)
-    return TracedFiber('line', np.c_[arc*0+100, arc*0+100, arc+200], arc, '')
 
 
 def prepared(builder, fiber, rng, t=400.):

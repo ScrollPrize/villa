@@ -4,12 +4,12 @@ import copy
 import pytest
 import torch
 
-from slab_fixtures import cfg, slab_batch
+from model_fixtures import config as cfg, slab_batch
 from vesuvius.neural_tracing.fiber_follow.regression.model import build_model
 from vesuvius.neural_tracing.fiber_follow.regression.train import (
     build_parser, checkpoint_config, resolve_history_encoder,
 )
-from test_training_defaults import REQUIRED
+from model_fixtures import REQUIRED
 
 
 @pytest.mark.parametrize('variant,shapes', [

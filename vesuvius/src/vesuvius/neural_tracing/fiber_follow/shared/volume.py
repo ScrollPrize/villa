@@ -8,6 +8,7 @@ trace coordinates into the selected CT array. Fiber JSON uses base-voxel xyz.
 from __future__ import annotations
 
 import json
+import mmap
 import os
 import tempfile
 import threading
@@ -21,6 +22,35 @@ import numpy as np
 
 _VCZ1_REGISTERED = False
 _MISSING = object()
+_MADV_WILLNEED = getattr(mmap, 'MADV_WILLNEED', None)
+
+
+def _willneed_rows(arr, lo, hi) -> None:
+    """Queue reads of the pages that hold rows ``[lo[1], hi[1])`` of slices ``[lo[0], hi[0])`` of a mapped chunk.
+
+    A fault on a file mapping otherwise reads the device's whole read-around window
+    (3 MB on the md RAID, i.e. the full 2 MB chunk), one blocking fault at a time.
+    The hint reads only the touched pages, all in flight before the copy faults on
+    them. Advisory only: the copied values are unchanged.
+
+    Each hint is a syscall, so when the rows cover at least a quarter of each slice
+    one hint spans the whole slab (reading at most 4x the rows) instead of one per slice.
+    """
+    mm = getattr(arr, '_mmap', None)
+    if mm is None or _MADV_WILLNEED is None or getattr(arr, 'offset', 0) != 0:
+        return
+    page = mmap.PAGESIZE
+    plane, row = arr.strides[0], arr.strides[1]
+    z0, z1, first = int(lo[0]), int(hi[0]), int(lo[1])*row
+    need = (int(hi[1])-int(lo[1]))*row
+    spans = ([(z0*plane+first, (z1-1)*plane+first+need)] if plane-need <= 3*need else
+             [(z*plane+first, z*plane+first+need) for z in range(z0, z1)])
+    try:
+        for s, e in spans:
+            s = s//page*page
+            mm.madvise(_MADV_WILLNEED, s, -(-e//page)*page-s)
+    except OSError:
+        pass  # a hint the platform refuses only costs speed
 
 
 def _register_vcz1() -> None:
@@ -141,6 +171,7 @@ class ChunkedArray:
             return out
         c0 = lo // ch
         c1 = (hi - 1) // ch
+        pieces = []
         for cz in range(c0[0], c1[0] + 1):
             for cy in range(c0[1], c1[1] + 1):
                 for cx in range(c0[2], c1[2] + 1):
@@ -151,9 +182,15 @@ class ChunkedArray:
                     base = np.array(key) * ch
                     a = np.maximum(lo, base)
                     b = np.minimum(hi, base + ch)
-                    out[tuple(slice(a[i] - start[i], b[i] - start[i]) for i in range(3))] = arr[
-                        tuple(slice(a[i] - base[i], b[i] - base[i]) for i in range(3))
-                    ]
+                    pieces.append((arr, base, a, b))
+        if self.codec is None:
+            # Queue every mapped piece's pages before the first copy blocks on one.
+            for arr, base, a, b in pieces:
+                _willneed_rows(arr, a - base, b - base)
+        for arr, base, a, b in pieces:
+            out[tuple(slice(a[i] - start[i], b[i] - start[i]) for i in range(3))] = arr[
+                tuple(slice(a[i] - base[i], b[i] - base[i]) for i in range(3))
+            ]
         return out
 
 

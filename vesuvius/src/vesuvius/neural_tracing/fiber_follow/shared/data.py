@@ -402,6 +402,25 @@ def excursion_offsets(arcs, p, s, cfg: SampleConfig, rng):
                                             excursion_phase=head/rise, excursion_head_offset=float(profile[-1]))
 
 
+def simulated_trace(p, s, t, cfg: SampleConfig, rng: np.random.Generator, *, startup=None, excursion=None):
+    """The observed path of a simulated trace whose head is at traversal arclength ``t`` of curve (p, s).
+
+    Every random draw of ``make_sample`` happens here, in its order; the labels it adds use none.
+    Returns (path, arcs, startup category, trace noise sigma, excursion details).
+    """
+    category = int(rng.choice(len(STARTUP_CATEGORIES), p=cfg.startup_shares)) if startup is None else int(startup)
+    count = int(trace_prefix_length(t, category, rng)//cfg.history_step)
+    arcs = t-np.arange(count, -1, -1)*cfg.history_step
+    noise, sigma = trace_noise(arcs, p, s, cfg, rng)
+    path = interp_at(p, s, arcs)+noise
+    details = {}
+    established = category == STARTUP_CATEGORIES.index('established') and arcs[-1]-arcs[0] >= 8.
+    if established and (excursion if excursion is not None else rng.random() < cfg.excursion_probability):
+        offsets, details = excursion_offsets(arcs, p, s, cfg, rng)
+        path = path+offsets
+    return path, arcs, category, sigma, details
+
+
 def make_sample(fiber: TracedFiber, t: float, reverse: bool, cfg: SampleConfig, rng: np.random.Generator,
                 *, startup=None, excursion=None):
     """One tracer decision on a simulated trace of this fiber, built exactly like inference.
@@ -419,16 +438,7 @@ def make_sample(fiber: TracedFiber, t: float, reverse: bool, cfg: SampleConfig, 
     from .state_labels import constructed_facts, supervise
     from .trace import trace_history
     p, s = traversal_curve(fiber, reverse)
-    category = int(rng.choice(len(STARTUP_CATEGORIES), p=cfg.startup_shares)) if startup is None else int(startup)
-    count = int(trace_prefix_length(t, category, rng)//cfg.history_step)
-    arcs = t-np.arange(count, -1, -1)*cfg.history_step
-    noise, sigma = trace_noise(arcs, p, s, cfg, rng)
-    path = interp_at(p, s, arcs)+noise
-    details = {}
-    established = category == STARTUP_CATEGORIES.index('established') and arcs[-1]-arcs[0] >= 8.
-    if established and (excursion if excursion is not None else rng.random() < cfg.excursion_probability):
-        offsets, details = excursion_offsets(arcs, p, s, cfg, rng)
-        path = path+offsets
+    path, arcs, category, sigma, details = simulated_trace(p, s, t, cfg, rng, startup=startup, excursion=excursion)
     pos = path[-1]
     # Only the CT seed axis's sign comes from the direction of travel.
     seed_direction = tangent_at(p, s, arcs[0])

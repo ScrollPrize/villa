@@ -117,15 +117,24 @@ def dense_line(points, step):
         raise ValueError('Expected a finite polyline with at least two xyz points')
     if not np.isfinite(step) or step <= 0:
         raise ValueError('Sampling step must be positive')
-    pieces = []
-    for a, b in zip(points[:-1], points[1:]):
-        length = np.linalg.norm(b-a)
-        if length > 1e-9:
-            n = max(1, int(np.ceil(length/step)))
-            pieces.append(a + np.arange(n)[:, None]/n*(b-a))
-    if not pieces:
+    # Vectorized, bit-identical to the per-segment loop ``a + arange(n)/n*(b-a)`` with
+    # n = ceil(norm(b-a)/step). Only n and the zero-length test depend on the length;
+    # where the vectorized length could round across either threshold, the segment
+    # takes the loop's exact np.linalg.norm.
+    delta = points[1:]-points[:-1]
+    length = np.sqrt(np.einsum('ij,ij->i', delta, delta))
+    ratio = length/step
+    close = (np.abs(ratio-np.rint(ratio)) <= 1e-9*np.maximum(ratio, 1.)) | (np.abs(length-1e-9) <= 1e-12)
+    for i in np.flatnonzero(close):
+        length[i] = np.linalg.norm(delta[i])
+    keep = length > 1e-9
+    if not keep.any():
         raise ValueError('Polyline has zero length')
-    return np.concatenate([*pieces, points[-1:]])
+    counts = np.maximum(1, np.ceil(length[keep]/step).astype(np.int64))
+    segment = np.repeat(np.arange(len(counts)), counts)
+    k = np.arange(len(segment))-np.repeat(np.cumsum(counts)-counts, counts)
+    t = (k/counts[segment])[:, None]
+    return np.concatenate([points[:-1][keep][segment]+t*delta[keep][segment], points[-1:]])
 
 
 class PolylineIndex:

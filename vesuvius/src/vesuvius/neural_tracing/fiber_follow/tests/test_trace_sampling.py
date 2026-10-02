@@ -139,7 +139,7 @@ def test_heading_free_bounds_cover_any_crop_orientation():
 
 
 def roll_builder():
-    from test_identity import config
+    from model_fixtures import config
     from vesuvius.neural_tracing.fiber_follow.regression.data import IdentityObservationBuilder, IdentitySampling
     cfg = config()
     return cfg, IdentityObservationBuilder(cfg, [straight_fiber(400)], IdentitySampling(), augment=True)

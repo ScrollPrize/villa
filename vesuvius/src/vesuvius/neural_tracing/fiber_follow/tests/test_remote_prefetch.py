@@ -230,7 +230,7 @@ def test_prefetch_failure_propagates_without_foreground_fallback(tmp_path,monkey
 
 def test_main_and_history_prefetch_covers_ct_normals_and_all_crop_rolls():
     from test_history_slabs import observation
-    from slab_fixtures import cfg
+    from model_fixtures import config as cfg
     from vesuvius.neural_tracing.fiber_follow.regression.data import ObservationBuilder
     from vesuvius.neural_tracing.fiber_follow.regression.history_slabs import slab_layout,SLAB
     from vesuvius.neural_tracing.fiber_follow.shared.data import tight_block

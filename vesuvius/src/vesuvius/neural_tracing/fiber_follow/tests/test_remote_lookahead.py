@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from test_identity import config
+from model_fixtures import config
 from test_neighbor_bank import make_bank, add_shard, publish
 from sampling_fixtures import clean_sample
 from vesuvius.neural_tracing.fiber_follow.shared import data as module

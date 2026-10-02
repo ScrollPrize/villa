@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 import torch
 
-from test_identity import config
+from model_fixtures import config
 from test_neighbor_bank import make_bank, add_shard, publish
 from sampling_fixtures import clean_sample
 from vesuvius.neural_tracing.fiber_follow.regression.data import IdentityObservationBuilder, IdentitySampling

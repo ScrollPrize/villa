@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 import torch
 
-from slab_fixtures import cfg, slab_batch
+from model_fixtures import config as cfg, slab_batch
 from test_history_slabs import fake_ct, observation
 from vesuvius.neural_tracing.fiber_follow.regression.history_slabs import load_slabs, HistoryEncoder
 from vesuvius.neural_tracing.fiber_follow.regression.model import build_model
@@ -14,16 +14,9 @@ from vesuvius.neural_tracing.fiber_follow.regression.train import prepare_traini
 from vesuvius.neural_tracing.fiber_follow.shared.policy import OperatingPolicy
 from vesuvius.neural_tracing.fiber_follow.regression.live_continuation import LiveContinuationSource
 from vesuvius.neural_tracing.fiber_follow.shared.training_log import DirectTrainingInterval
+from model_fixtures import path_batch
 
 
-def path_batch(c, count=2):
-    batch = slab_batch(c, count)
-    points = torch.zeros(count, 8, 3, 3)
-    points[..., 2] = torch.tensor([-1., 0., 1.])
-    tangents = torch.zeros_like(points); tangents[..., 2] = 1
-    batch['x'].update(history_path_points=points, history_path_tangents=tangents,
-                      history_path_valid=batch['x']['history_valid'][..., None].expand(-1, -1, 3).clone())
-    return batch
 
 
 def test_path_samples_use_observed_geometry_and_mask_seed_boundary(monkeypatch):

@@ -6,9 +6,9 @@ import numpy as np
 import pytest
 import torch
 
-from slab_fixtures import cfg
+from model_fixtures import config as cfg
 from test_history_slabs import observation
-from test_memory_improvements import path_batch
+from model_fixtures import path_batch
 from vesuvius.neural_tracing.fiber_follow.regression.model import build_model
 from vesuvius.neural_tracing.fiber_follow.regression.path_geometry import (
     COUNT, OFFSETS, path_geometry_inputs, path_geometry_samples)
@@ -16,13 +16,9 @@ from vesuvius.neural_tracing.fiber_follow.regression.train import (
     build_parser, checkpoint_config, initialize_training_optimizer, optimizer_update, prepare_training)
 from vesuvius.neural_tracing.fiber_follow.regression.datasets import read_dataset_config
 from vesuvius.neural_tracing.fiber_follow.shared.runloop import training_rng_state
+from model_fixtures import geometry_batch
 
 
-def geometry_batch(c, count=2, length=100.):
-    batch = path_batch(c, count)
-    path = np.c_[np.zeros(int(length)+1), np.zeros(int(length)+1), np.arange(int(length)+1.)]
-    batch['x'].update(path_geometry_inputs([observation(path) for _ in range(count)]))
-    return batch
 
 
 def test_samples_follow_observed_path_without_crop_mask():

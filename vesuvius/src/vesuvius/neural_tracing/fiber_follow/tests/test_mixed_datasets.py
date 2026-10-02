@@ -10,8 +10,8 @@ import numpy as np
 import pytest
 import torch
 
-from test_identity import config, batch
-from test_direction_inputs import array_at
+from model_fixtures import config, batch
+from model_fixtures import array_at
 from vesuvius.neural_tracing.fiber_follow.shared.afv import AFVFibers
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume, FiberVolumeSpec, RemoteChunkedArray
 from vesuvius.neural_tracing.fiber_follow.shared.data import make_sample, SampleConfig

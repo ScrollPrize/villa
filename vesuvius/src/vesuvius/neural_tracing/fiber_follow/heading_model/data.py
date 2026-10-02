@@ -1,8 +1,8 @@
 """Training states for the crop-heading model, built with the follower's own data code.
 
 A share of states are seeds (an annotated point with no observed path, the follower's seed-only state); the rest
-are simulated tracer decisions from ``shared.data.make_sample`` with the follower's own startup mix and tracing
-error, on the same Paris 4 / AFV sources, fiber splits, CT volumes and CT normalization (``regression.datasets``).
+are simulated tracer decisions from ``shared.data.simulated_trace`` (``make_sample``'s observed path, without its
+labels) with the follower's own startup mix and tracing error, on the same Paris 4 / AFV sources, fiber splits, CT volumes and CT normalization (``regression.datasets``).
 The prior heading is what the tracer holds: its trailing 12-voxel fit (``linear12_heading``) once 12 voxels exist.
 Seeds and shorter paths hold a seed heading the model must not rely on, so their prior is the true continuation
 tilted within a wide cone (also used on a share of long paths). The target is ``targets.in_crop_heading`` over the
@@ -20,7 +20,7 @@ from vesuvius.neural_tracing.fiber_follow.heading_model.model import (
 from vesuvius.neural_tracing.fiber_follow.heading_model.targets import in_crop_heading
 from vesuvius.neural_tracing.fiber_follow.regression.datasets import (
     WeightedDatasets, load_primary_dataset, open_afv_source, primary_source_spec, read_dataset_config)
-from vesuvius.neural_tracing.fiber_follow.shared.data import FollowDataset, SampleConfig, make_sample, tight_block, traversal_curve
+from vesuvius.neural_tracing.fiber_follow.shared.data import FollowDataset, SampleConfig, simulated_trace, tight_block, traversal_curve
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength, interp_at, normalize
 from vesuvius.neural_tracing.fiber_follow.shared.heading import linear12_heading
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume
@@ -107,8 +107,9 @@ def heading_state(fiber, rng, cfg: HeadingConfig, sampling: HeadingSampling, sam
         pos = interp_at(p, s, np.array([t]))[0]
         path = pos[None]
     else:
-        item = make_sample(fiber, t, reverse, sample_cfg, rng)
-        pos, path = item['pos'], item['observed_path']
+        # make_sample's observed path and head, with the same draws, without the follower's labels.
+        path = simulated_trace(p, s, t, sample_cfg, rng)[0]
+        pos = path[-1]
     future = interp_at(p, s, t+np.arange(1., cfg.forward+1e-9))-pos
     init = normalize(future[-1])
     fit = linear12_heading(path, 0)  # the tracer's heading; None while it still holds the seed heading
@@ -123,9 +124,12 @@ def heading_state(fiber, rng, cfg: HeadingConfig, sampling: HeadingSampling, sam
 def plan_states(fibers, weights, n, rng, cfg, sampling, *, roll_rng=None):
     """n states (geometry only, no CT) with their patch frames; random patch roll when ``roll_rng`` is given."""
     sample_cfg = sampling.follower_sample_config()
+    # rng.choice(len(weights), p=weights) without rebuilding its CDF on every draw (same draws).
+    cdf = np.cumsum(weights)
+    cdf /= cdf[-1]
     states = []
     while len(states) < n:
-        state = heading_state(fibers[int(rng.choice(len(weights), p=weights))], rng, cfg, sampling, sample_cfg)
+        state = heading_state(fibers[int(cdf.searchsorted(rng.random(), side='right'))], rng, cfg, sampling, sample_cfg)
         if state is not None:
             states.append(state)
     for state, frame in zip(states, prior_frames([s['prior'] for s in states], roll_rng)):

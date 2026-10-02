@@ -18,7 +18,7 @@ from scipy.spatial import cKDTree
 
 from vesuvius.neural_tracing.fiber_follow.regression.neighbor_bulk import BANK_VERSION, digest
 from vesuvius.neural_tracing.fiber_follow.shared.components import crop_indices
-from vesuvius.neural_tracing.fiber_follow.shared.data import fiber_manifest
+from vesuvius.neural_tracing.fiber_follow.shared.data import fiber_identities, fiber_manifest
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength, interp_at
 
 
@@ -40,7 +40,9 @@ class NeighborBank:
         records = {r['name']:(i,r) for i,r in enumerate(self.run['fibers'])}
         self.fibers, self.band, self.training = fibers, band, training
         self.fiber_ids = []
-        for current in fiber_manifest(fibers):
+        # Mined paths are CT geometry; target correspondence is recomputed against the current
+        # (load-time repaired) annotation, so only the annotation's identity must match.
+        for current in fiber_identities(fiber_manifest(fibers)):
             entry = records.get(current['name'])
             if entry is None or entry[1]['training_fiber'] != training:
                 raise ValueError(f'Negative bank has no {"training" if training else "evaluation"} annotation {current["name"]}')
@@ -314,7 +316,8 @@ class NeighborBank:
                    and (not min_length or data['sampled_lengths'][i] >= min_length)]
             if ids:
                 i = int(rng.choice(ids))
-                return local_ids[entry['fiber']],data['lines'][i],data['arc_ranges'][i]
+                fi = local_ids[entry['fiber']]
+                return fi,data['lines'][i],self.target_arc_range(fi,data['lines'][i])
             sizes[shards.index(entry)] = 0
             if not sizes.any():
                 break
@@ -349,6 +352,12 @@ class NeighborBank:
                 self._trees.popitem(last=False)
         self._trees.move_to_end(fi)
         return self._trees[fi]
+
+    def target_arc_range(self, fi, line):
+        """Arclength span of the current target annotation nearest to ``line``."""
+        tree, _ = self._target_tree(fi)
+        s = self.fibers[fi].s[tree.query(np.asarray(line).reshape(-1,3))[1]]
+        return np.array([s.min(), s.max()])
 
     def clear_of_target(self, fi, world):
         tree,gap = self._target_tree(fi)

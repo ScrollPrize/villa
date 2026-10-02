@@ -12,10 +12,9 @@ from vesuvius.neural_tracing.fiber_follow.regression.model import DirectConfig
 from vesuvius.neural_tracing.fiber_follow.regression.train import build_parser, main, options_argv
 from vesuvius.neural_tracing.fiber_follow.shared.training_options import normalize_batch_options
 from vesuvius.neural_tracing.fiber_follow.shared.training_log import format_training_log
+from model_fixtures import REQUIRED
 
 
-REQUIRED = ['--name', 'test', '--fiber-zarrs', 'unused', '--fibers', 'unused',
-            '--ct', 'unused', '--manifest', 'unused']
 
 
 def test_production_defaults_and_explicit_overrides():

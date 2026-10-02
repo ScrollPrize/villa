@@ -4,7 +4,7 @@ import copy
 import pytest
 import torch
 
-from slab_fixtures import cfg, slab_batch as memory_batch
+from model_fixtures import config as cfg, slab_batch as memory_batch
 from vesuvius.neural_tracing.fiber_follow.regression.model import build_model
 from vesuvius.neural_tracing.fiber_follow.regression.train import (
     prepare_training, optimizer_update, training_prediction,

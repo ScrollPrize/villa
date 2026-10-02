@@ -7,7 +7,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from test_identity import config,batch,forward,line_fiber
+from model_fixtures import config, batch, forward, line_fiber
 from label_fixtures import set_unknown
 from vesuvius.neural_tracing.fiber_follow.regression.model import (
     ARCHITECTURE,DirectConfig,DirectFollower,AxialBlock,ResidualConv,feature_grid,sample_features,TOKEN_OFFSET,TOKEN_STRIDE,

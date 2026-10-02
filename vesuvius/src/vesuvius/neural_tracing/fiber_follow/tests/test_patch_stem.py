@@ -4,7 +4,7 @@ from dataclasses import replace
 import pytest
 import torch
 
-from slab_fixtures import cfg, slab_batch
+from model_fixtures import config as cfg, slab_batch
 from vesuvius.neural_tracing.fiber_follow.regression.model import build_model
 from vesuvius.neural_tracing.fiber_follow.regression.train import prepare_training, training_prediction
 from vesuvius.neural_tracing.fiber_follow.regression.supervision import loss_terms

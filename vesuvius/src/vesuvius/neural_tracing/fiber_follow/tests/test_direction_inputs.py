@@ -31,13 +31,9 @@ from vesuvius.neural_tracing.fiber_follow.regression.train import (
 )
 from vesuvius.neural_tracing.fiber_follow.shared.data import SampleConfig
 from vesuvius.neural_tracing.fiber_follow.shared.trace import TraceParams
+from model_fixtures import array_at
 
 
-def array_at(path, values):
-    path.mkdir(parents=True, exist_ok=True)
-    (path/'.zarray').write_text(json.dumps(dict(shape=list(values.shape),chunks=list(values.shape),
-        dtype='|u1',fill_value=0,order='C',filters=None,compressor=None,zarr_format=2)))
-    (path/'0.0.0').write_bytes(values.astype(np.uint8).tobytes())
 
 
 def encoded(n):
