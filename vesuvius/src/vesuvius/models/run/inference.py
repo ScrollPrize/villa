@@ -1393,7 +1393,14 @@ def main():
 
     try:
         print("\n--- Starting Inference ---")
-        logits_path, coords_path = inferer.infer()
+        result = inferer.infer()
+        if result is None:
+            # infer() already printed the exception and its traceback; do not
+            # bury it under "cannot unpack non-iterable NoneType object".
+            print("\n--- Inference Failed ---")
+            print("Inference raised the error shown above and wrote no output.")
+            return 1
+        logits_path, coords_path = result
 
         if logits_path and coords_path:
             # Check if paths exist, using fsspec for S3 paths
