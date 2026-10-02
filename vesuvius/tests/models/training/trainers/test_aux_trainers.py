@@ -1,8 +1,10 @@
 import numpy as np
+import pytest
 import torch
 from types import SimpleNamespace
 
 from vesuvius.models.training.trainers.auxiliary import (
+    AuxiliaryTrainer,
     DistanceTransformTrainer,
     SurfaceNormalsTrainer,
     StructureTensorTrainer,
@@ -126,3 +128,47 @@ def test_aux_trainer_loss_value_passes_source_predictions():
         outputs=outputs,
     )
     assert torch.isclose(value, torch.tensor(2.0))
+
+
+def _make_mixed_mgr():
+    mgr = _make_mgr("ink_dt", "distance_transform")
+    mgr.targets["ink_normals"] = {
+        "auxiliary_task": True,
+        "task_type": "surface_normals",
+        "source_target": "ink",
+    }
+    return mgr
+
+
+def test_auxiliary_trainer_generates_each_configured_task_type():
+    trainer = AuxiliaryTrainer(mgr=_make_mixed_mgr(), verbose=False)
+    sample = _base_sample((8, 8, 8))
+
+    augmented = trainer._prepare_sample(sample, is_training=True)
+
+    expected_dt = DistanceTransformTrainer(
+        mgr=_make_mgr("ink_dt", "distance_transform"), verbose=False
+    )._prepare_sample(sample, is_training=True)["ink_dt"]
+    expected_normals = SurfaceNormalsTrainer(
+        mgr=_make_mgr("ink_normals", "surface_normals"), verbose=False
+    )._prepare_sample(sample, is_training=True)["ink_normals"]
+    assert torch.equal(augmented["ink_dt"], expected_dt)
+    assert torch.equal(augmented["ink_normals"], expected_normals)
+    assert set(augmented["regression_keys"]) == {"ink_dt", "ink_normals"}
+
+
+def test_auxiliary_trainer_prepare_batch_stacks_each_task():
+    trainer = AuxiliaryTrainer(mgr=_make_mixed_mgr(), verbose=False)
+    sample = _base_sample((8, 8, 8))
+    batch = {key: torch.stack([value, value]) for key, value in sample.items()}
+
+    prepared = trainer._prepare_batch(batch, is_training=True)
+
+    assert prepared["ink_dt"].shape == (2, 1, 8, 8, 8)
+    assert prepared["ink_normals"].shape == (2, 3, 8, 8, 8)
+    trainer._check_auxiliary_targets()
+
+
+def test_auxiliary_trainer_rejects_unknown_task_type():
+    with pytest.raises(ValueError, match="ink_unknown"):
+        AuxiliaryTrainer(mgr=_make_mgr("ink_unknown", "unknown_task"), verbose=False)

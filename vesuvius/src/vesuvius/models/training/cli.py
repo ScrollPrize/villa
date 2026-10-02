@@ -380,9 +380,14 @@ def main(argv=None):
         trainer = MutexAffinityTrainer(mgr=mgr, verbose=args.verbose)
         print("Using Mutex Affinity Trainer")
     elif trainer_name == "base":
-        from vesuvius.models.training.train import BaseTrainer
-        trainer = BaseTrainer(mgr=mgr, verbose=args.verbose)
-        print("Using Base Trainer for supervised training")
+        if any(info.get("auxiliary_task", False) for info in (mgr.targets or {}).values()):
+            from vesuvius.models.training.trainers.auxiliary import AuxiliaryTrainer
+            trainer = AuxiliaryTrainer(mgr=mgr, verbose=args.verbose)
+            print("Using Auxiliary Trainer for supervised training with auxiliary targets")
+        else:
+            from vesuvius.models.training.train import BaseTrainer
+            trainer = BaseTrainer(mgr=mgr, verbose=args.verbose)
+            print("Using Base Trainer for supervised training")
     elif trainer_name == "surface_frame":
         from vesuvius.models.training.trainers.surface_frame_trainer import SurfaceFrameTrainer
         trainer = SurfaceFrameTrainer(mgr=mgr, verbose=args.verbose)

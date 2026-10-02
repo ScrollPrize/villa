@@ -1,6 +1,7 @@
 """Auxiliary trainers for task-specific supervision."""
 
 from .base_aux_trainer import BaseAuxTrainer
+from .auxiliary_trainer import AuxiliaryTrainer
 from .distance_transform_trainer import DistanceTransformTrainer
 from .surface_normals_trainer import SurfaceNormalsTrainer
 from .structure_tensor_trainer import StructureTensorTrainer
@@ -9,6 +10,7 @@ from .nearest_component_trainer import NearestComponentTrainer
 
 __all__ = [
     "BaseAuxTrainer",
+    "AuxiliaryTrainer",
     "DistanceTransformTrainer",
     "SurfaceNormalsTrainer",
     "StructureTensorTrainer",

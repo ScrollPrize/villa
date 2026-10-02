@@ -436,6 +436,22 @@ class BaseTrainer:
         """Allow subclasses to inject additional data into a batch dictionary."""
         return batch
 
+    def _generated_auxiliary_targets(self) -> set:
+        return set()
+
+    def _check_auxiliary_targets(self) -> None:
+        missing = [
+            name
+            for name, info in (getattr(self.mgr, "targets", {}) or {}).items()
+            if info.get("auxiliary_task", False) and name not in self._generated_auxiliary_targets()
+        ]
+        if missing:
+            raise ValueError(
+                f"{self.__class__.__name__} cannot generate auxiliary targets {missing}; their heads would train "
+                "against nothing and report Avg Loss = 0.0000. Use AuxiliaryTrainer (vesuvius.train selects it "
+                "for --trainer base) or remove these auxiliary_tasks."
+            )
+
     def _reset_epoch_aug_timers(self) -> None:
         if not self._profile_augmentations:
             return
@@ -1574,6 +1590,7 @@ class BaseTrainer:
         return train_dataloader, val_dataloader, train_indices, val_indices
 
     def _initialize_training(self):
+        self._check_auxiliary_targets()
         if detect_s3_paths(self.mgr):
             print("\nDetected S3 paths in configuration")
             setup_multiprocessing_for_s3()
