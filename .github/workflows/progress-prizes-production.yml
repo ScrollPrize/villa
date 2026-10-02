@@ -493,7 +493,14 @@ jobs:
 
   activation-gate:
     name: Gate the exact production PR and preview
-    if: inputs.operation == 'activate' && needs.activation-state.outputs.state == 'pending'
+    # refresh-page is normally skipped. Without !cancelled(), GitHub skips
+    # every job downstream of a skipped job, even with all direct needs green.
+    if: >-
+      !cancelled() &&
+      inputs.operation == 'activate' &&
+      needs.activation-state.outputs.state == 'pending' &&
+      needs.activation-state.result == 'success' &&
+      needs.activation-binding.result == 'success'
     needs:
       - activation-state
       - activation-binding
@@ -556,7 +563,12 @@ jobs:
 
   activation-approval:
     name: Approve the real production cutoff
-    if: inputs.operation == 'activate' && needs.activation-state.outputs.state == 'pending'
+    if: >-
+      !cancelled() &&
+      inputs.operation == 'activate' &&
+      needs.activation-state.outputs.state == 'pending' &&
+      needs.activation-state.result == 'success' &&
+      needs.activation-gate.result == 'success'
     needs:
       - activation-state
       - activation-gate
@@ -577,7 +589,13 @@ jobs:
 
   activate-production:
     name: Lease and activate production
-    if: inputs.operation == 'activate' && needs.activation-state.outputs.state == 'pending'
+    if: >-
+      !cancelled() &&
+      inputs.operation == 'activate' &&
+      needs.activation-state.outputs.state == 'pending' &&
+      needs.activation-state.result == 'success' &&
+      needs.activation-gate.result == 'success' &&
+      needs.activation-approval.result == 'success'
     needs:
       - activation-state
       - activation-gate
@@ -628,7 +646,12 @@ jobs:
 
   merge:
     name: Ready and merge the activated page
-    if: inputs.operation == 'activate' && needs.activation-state.outputs.state == 'pending'
+    if: >-
+      !cancelled() &&
+      inputs.operation == 'activate' &&
+      needs.activation-state.outputs.state == 'pending' &&
+      needs.activation-state.result == 'success' &&
+      needs.activate-production.result == 'success'
     needs:
       - activation-state
       - activate-production
