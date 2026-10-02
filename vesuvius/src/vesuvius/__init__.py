@@ -1,13 +1,11 @@
 """Public entry point for the Vesuvius package."""
 
 from . import data, install
+from ._optional import requires_extra as _requires_extra
 
-# Always expose Volume; protect VCDataset because it depends on PyTorch.
-from .data import Volume
-try:
-    from .data import VCDataset  # requires the 'models' extra (torch)
-except Exception:
-    VCDataset = None  # type: ignore
+# Volume needs only the core dependencies. VCDataset needs torch, and becomes
+# a placeholder that names the missing extra when it is absent.
+from .data import Volume, VCDataset
 
 # Guard optional heavy modules.  They will be None unless their extras are installed.
 try:
@@ -23,19 +21,19 @@ try:
 except Exception:
     tifxyz = None  # type: ignore
 
-# Attempt to import utils.  utils requires aiohttp and nest_asyncio; if they aren't
-# installed (e.g. when you install with [volume-only] or without extras), we silently
-# fall back to None.  Users who need catalog utilities should install the appropriate
-# optional extra.
+# utils needs aiohttp and nest_asyncio, which a bare `pip install vesuvius` and
+# the volume-only extra do not pull in.  Keep the module itself None so
+# `if vesuvius.utils is None` still works, but give the callables a placeholder
+# that explains what to install.
 try:
     from . import utils  # type: ignore
     from .utils import is_aws_ec2_instance, list_cubes, list_files, update_list  # type: ignore
-except Exception:
+except Exception as _utils_exc:  # pragma: no cover - depends on install extras
     utils = None  # type: ignore
-    is_aws_ec2_instance = None  # type: ignore
-    list_cubes = None  # type: ignore
-    list_files = None  # type: ignore
-    update_list = None  # type: ignore
+    is_aws_ec2_instance = _requires_extra("is_aws_ec2_instance", "all", _utils_exc)  # type: ignore
+    list_cubes = _requires_extra("list_cubes", "all", _utils_exc)  # type: ignore
+    list_files = _requires_extra("list_files", "all", _utils_exc)  # type: ignore
+    update_list = _requires_extra("update_list", "all", _utils_exc)  # type: ignore
 
 __all__ = [
     "Volume",
