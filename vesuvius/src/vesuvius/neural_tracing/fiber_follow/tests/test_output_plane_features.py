@@ -91,7 +91,14 @@ def test_all_generator_layers_read_fine_planes_and_keep_deep_and_history(monkeyp
         assert param.grad is not None and torch.isfinite(param.grad).all() and param.grad.abs().sum() > 0
 
 
-def test_generator_plane_projections_do_not_enter_candidate_scoring():
+def fixed_curve_scores(model, batch, curves):
+    """Survival hazards of fixed curves under one decision's scorer memory."""
+    ctx = model.context(batch['x'], batch['hist'], batch['hmask'])
+    model.prepare_prediction(ctx, batch['hist'])
+    return torch.stack([model.hazard_logits(ctx, curve) for curve in curves.unbind(1)], 1)
+
+
+def test_generator_plane_projections_do_not_enter_curve_scoring():
     torch.manual_seed(82)
     model = build_model(cfg(recurrent_refinement_steps=1)).eval()
     batch = memory_batch(model.cfg, 1)
@@ -99,8 +106,8 @@ def test_generator_plane_projections_do_not_enter_candidate_scoring():
     curves[..., 2] = model.planes
     curves[:, 1, :, 0] = 2.
     args = batch['x'], batch['hist'], batch['hmask']
-    first = model(*args, candidates=curves)
-    first['candidate_hazard_logits'].sum().backward()
+    first = dict(model(*args), fixed_hazard_logits=fixed_curve_scores(model, batch, curves))
+    first['fixed_hazard_logits'].sum().backward()
     assert all(p.grad is None for p in model.output_plane_features.parameters())
     assert model.encoder.dense_decoder[-1].weight.grad.abs().sum() > 0
     for module in (model.confidence_scorer.plane_projection, model.confidence_scorer.plane_position):
@@ -108,12 +115,12 @@ def test_generator_plane_projections_do_not_enter_candidate_scoring():
             assert param.grad is not None and torch.isfinite(param.grad).all() and param.grad.abs().sum() > 0
     with torch.no_grad():
         model.output_plane_features.projection.weight.normal_(std=2.)
-    second = model(*args, candidates=curves)
+    second = dict(model(*args), fixed_hazard_logits=fixed_curve_scores(model, batch, curves))
     assert (first['points']-second['points']).abs().max() > 1e-5
-    torch.testing.assert_close(first['candidate_hazard_logits'], second['candidate_hazard_logits'], rtol=0, atol=0)
+    torch.testing.assert_close(first['fixed_hazard_logits'], second['fixed_hazard_logits'], rtol=0, atol=0)
 
 
-@pytest.mark.parametrize('scored', ['hazard_logits', 'candidate_hazard_logits'])
+@pytest.mark.parametrize('scored', ['hazard_logits'])
 def test_all_scorer_layers_read_every_fine_pixel_and_reuse_projections(monkeypatch, scored):
     torch.manual_seed(84)
     model = build_model(cfg(recurrent_refinement_steps=1)).eval()
@@ -139,7 +146,7 @@ def test_all_scorer_layers_read_every_fine_pixel_and_reuse_projections(monkeypat
     with torch.no_grad():
         curves[..., 2] = model.planes
         curves[:, 1, :, 0] = 2.
-    output = model(batch['x'], batch['hist'], batch['hmask'], candidates=curves)
+    output = model(batch['x'], batch['hist'], batch['hmask'])
     # One shared plane gather, and one K/V projection per scorer layer for all paths.
     assert len(samples) == 1
     assert [index for index, _ in reads] == list(range(len(model.confidence_scorer.layers)))

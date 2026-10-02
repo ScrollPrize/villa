@@ -28,6 +28,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.geometry import (
     sample_oriented_fast,
     tangent_at,
 )
+from vesuvius.neural_tracing.fiber_follow.shared.annotation_repair import foldbacks, repair_kinks
 from vesuvius.neural_tracing.fiber_follow.shared.fast_sample import sample_crop
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume
 from vesuvius.neural_tracing.fiber_follow.shared.reference import SEED_FIELDS, SEED_DEFAULTS, observed_seed
@@ -55,6 +56,8 @@ class TracedFiber:
     endpoint_stop: tuple[bool, bool] = (False, False)
     source_hash: str = ""
     excluded_tail_length: float = 0.0
+    kink_repairs: int = 0  # annotation kinks replaced by smooth bridges at load (annotation_repair)
+    foldbacks: tuple[float, ...] = ()  # arcs where the annotation doubles back; kept out of training
 
     @property
     def length(self) -> float:
@@ -67,6 +70,7 @@ def load_fibers(fiber_dir: str, grid_scale: float = 8.0, spacing: float = 1.0) -
     Every line point between the outer controls is equally valid supervision,
     regardless of tags or interpolation provenance. An outer control without an
     explicit termination tag is a censored boundary, not a physical endpoint.
+    Short annotation kinks are repaired and fold-backs recorded (annotation_repair).
     """
     if grid_scale <= 0 or spacing <= 0:
         raise ValueError("grid_scale and spacing must be positive")
@@ -90,7 +94,7 @@ def load_fibers(fiber_dir: str, grid_scale: float = 8.0, spacing: float = 1.0) -
         if np.any(np.diff(anchors) <= 0):
             raise ValueError(f"{path}: control points must have distinct ordered line anchors")
         line = line / grid_scale
-        pieces, spans, start = [], [], 0.0
+        pieces, bounds = [], [0]
         for i, (a, b) in enumerate(zip(anchors[:-1], anchors[1:])):
             # Preserve every line vertex, not just human control anchors.
             original = line[a:b + 1]
@@ -103,13 +107,16 @@ def load_fibers(fiber_dir: str, grid_scale: float = 8.0, spacing: float = 1.0) -
             if not pieces_dense:
                 raise ValueError(f"{path}: zero-length controlled span")
             piece = np.concatenate([*pieces_dense, original[-1:]])
-            end = start + float(arclength(piece)[-1])
-            spans.append(FiberSpan(start, end, fib.control_point_segments[i]))
             pieces.append(piece if i == 0 else piece[1:])
-            start = end
+            bounds.append(bounds[-1]+len(piece)-1)
         pts = np.concatenate(pieces)
         if len(pts) < 8:
             continue
+        folds = foldbacks(pts, arclength(pts))
+        pts, repairs = repair_kinks(pts, arclength(pts))
+        s = arclength(pts)
+        spans = [FiberSpan(float(s[a]), float(s[b]), fib.control_point_segments[i])
+                 for i, (a, b) in enumerate(zip(bounds[:-1], bounds[1:]))]
         tag = (fib.metadata.get("hv_classification") or {}).get("automatic_tag", "")
         endpoints = (False, False)
         if fib.version == 3:
@@ -118,10 +125,10 @@ def load_fibers(fiber_dir: str, grid_scale: float = 8.0, spacing: float = 1.0) -
         full_s = arclength(line)
         tails = float(full_s[anchors[0]] + full_s[-1] - full_s[anchors[-1]])
         source_hash = hashlib.sha256(json.dumps(raw, sort_keys=True).encode()).hexdigest()
-        out.append(TracedFiber(os.path.basename(path), pts, arclength(pts), tag,
+        out.append(TracedFiber(os.path.basename(path), pts, s, tag,
                               spans=tuple(spans),
                               endpoint_stop=endpoints, source_hash=source_hash,
-                              excluded_tail_length=tails))
+                              excluded_tail_length=tails, kink_repairs=len(repairs), foldbacks=folds))
     return out
 
 
@@ -132,6 +139,11 @@ def fiber_manifest(fibers):
     return [dict(name=f.name, source_hash=f.source_hash,
                  geometry_hash=hashlib.sha256(np.asarray(f.points, dtype="<f8").tobytes()).hexdigest(),
                  endpoint_stop=list(f.endpoint_stop)) for f in fibers]
+
+
+def fiber_identities(entries):
+    """Fiber manifest entries without geometry: which annotations, not how they were repaired."""
+    return [{k: v for k, v in e.items() if k not in ('geometry_hash', 'annotation_repair')} for e in entries]
 
 
 @dataclass(frozen=True)
@@ -146,11 +158,17 @@ class ZBand:
 
 
 def split_fibers(fibers: list[TracedFiber], val_band: ZBand):
-    """Split by the controlled geometry centroid; filter training states separately."""
+    """Split by the controlled geometry centroid; filter training states separately.
+
+    Fibers whose annotation doubles back are kept out of training (validation is unchanged).
+    """
     train, val = [], []
     for f in fibers:
         z = np.average((f.points[:-1, 2]+f.points[1:, 2])/2, weights=np.diff(f.s))
-        (val if val_band.contains(z) else train).append(f)
+        if val_band.contains(z):
+            val.append(f)
+        elif not f.foldbacks:
+            train.append(f)
     return train, val
 
 
@@ -165,12 +183,21 @@ class SampleConfig:
     # Fresh trace starts, as direct draw allocations: seed-only, 1-8 and 9-32 requested
     # voxels of history, and a prefix drawn uniformly from the available history.
     startup_shares: tuple = (.15, .17, .17, .51)
-    trace_noise_sigma: tuple = (.175, 1.)  # log-uniform per-trace lateral error scale, per transverse axis
-    trace_noise_length: float = 40.  # correlation length of simulated tracing error, trace voxels
+    # Simulated tracing error (``trace_noise``), fit to on-track 81k rollouts against the repaired
+    # annotations (output/trace_noise_realism_20261002/refit_repaired): per-trace scale log-uniform
+    # around a median of .412 (spread 3.43), commit-end correlation length, mid-commit bulge and
+    # per-trace bias relative to that scale, and the annotation's small-scale wiggle the tracer
+    # does not follow (Gaussian sigma, voxels). A zero scale range disables simulated error.
+    trace_noise_sigma: tuple = (.2225, .7630)
+    trace_noise_length: float = 33.
+    trace_noise_bulge: float = .90
+    trace_noise_bias: float = .119
+    trace_noise_smoothing: float = 1.51
     # Smooth lateral excursions on established fresh traces; the head lies on the rise or return.
+    # The rise length is log-uniform (matches real 81k excursions measured the same way).
     excursion_probability: float = .2
     excursion_amplitude: tuple = (3., 6.)
-    excursion_rise: tuple = (16., 64.)
+    excursion_rise: tuple = (16., 128.)
     label_tolerance: float = 1.5  # confidence-label tolerance; separate from the departure threshold
     max_recovery_distance: float = 6.0
     dense_substeps: int = 4
@@ -188,6 +215,9 @@ class SampleConfig:
             setattr(self, name, (float(lo), float(hi)))
         if not 0 <= self.excursion_probability <= 1 or self.excursion_rise[0] <= 0:
             raise ValueError('Excursion probability must lie in [0, 1] with positive rise lengths')
+        if not (self.trace_noise_length > 0 and min(self.trace_noise_bulge, self.trace_noise_bias,
+                                                     self.trace_noise_smoothing) >= 0):
+            raise ValueError('Trace noise length must be positive and its shape terms nonnegative')
         if not (np.isfinite(self.label_tolerance) and self.label_tolerance > 0
                 and np.isfinite(self.max_recovery_distance) and self.max_recovery_distance > self.future_step):
             raise ValueError('Label tolerance and recovery limit must be finite and positive')
@@ -288,26 +318,57 @@ def trace_prefix_length(t, category, rng):
     return min(float(t), float(rng.integers(lo, hi+1))) if hi else 0.
 
 
-def trace_noise(arcs, p, s, cfg: SampleConfig, rng):
-    """Smooth lateral tracing error along a simulated observed path, zero at its seed.
+TRACE_COMMIT_LENGTH = 16  # voxels per simulated commit, plus an exponential extra (real commits: p50 16.6)
+TRACE_COMMIT_EXTRA = .8
 
-    An Ornstein-Uhlenbeck process in 3D with the GT-tangential part removed. Each
-    trace draws its scale log-uniformly from ``cfg.trace_noise_sigma`` (per
-    transverse axis) with correlation length ``cfg.trace_noise_length``; both fit
-    on-track held-out rollouts (lateral residual p50 0.47, p90 1.1, p99 2.1 voxels).
+
+def trace_noise(arcs, p, s, cfg: SampleConfig, rng):
+    """Lateral tracing error along a simulated observed path, zero at its seed.
+
+    Mirrors the tracer: the path is a chain of commits starting at the seed. At each commit
+    end the lateral offset takes one mean-reverting step (correlation length
+    ``cfg.trace_noise_length``) toward a small per-trace bias, so joins carry the kinks seen
+    in real traces; within a commit the offset moves smoothly with a quadratic bulge. The
+    per-trace scale is log-uniform in ``cfg.trace_noise_sigma``. The tracer also does not
+    follow the annotation's small-scale wiggle: the smoothed-minus-raw annotation
+    (``cfg.trace_noise_smoothing``) is added, ramped in from the seed. The GT-tangential part
+    of the commit error is removed. ``arcs`` are evenly spaced, starting at the seed.
     """
-    from scipy.signal import lfilter
     lo, hi = cfg.trace_noise_sigma
-    noise = np.zeros((len(arcs), 3))
-    if hi <= 0 or len(arcs) < 2:
+    n = len(arcs)
+    noise = np.zeros((n, 3))
+    if hi <= 0 or n < 2:
         return noise, 0.
     sigma = float(np.exp(rng.uniform(np.log(lo), np.log(hi)))) if lo > 0 else float(rng.uniform(lo, hi))
-    decay = math.exp(-cfg.history_step/cfg.trace_noise_length)
-    shocks = rng.normal(size=noise.shape)*sigma*math.sqrt(1-decay*decay)
-    shocks[0] = 0.
-    noise = lfilter([1.], [1., -decay], shocks, axis=0)
+    step = float(arcs[1]-arcs[0])
+    bias = rng.normal(size=3)*cfg.trace_noise_bias
+    start, current = 0, np.zeros(3)
+    while start < n-1:
+        size = min(n-1-start, max(1, int(round((TRACE_COMMIT_LENGTH+rng.exponential(TRACE_COMMIT_EXTRA))/step))))
+        rho = math.exp(-size*step/cfg.trace_noise_length)
+        end = bias+rho*(current-bias)+math.sqrt(1-rho*rho)*rng.normal(size=3)
+        u = np.arange(1, size+1)/size
+        noise[start+1:start+size+1] = (current+(end-current)*u[:, None]
+                                       + 4*cfg.trace_noise_bulge*rng.normal(size=3)*(u*(1-u))[:, None])
+        start, current = start+size, end
+    noise *= sigma
     tangent = local_tangents(arcs, p, s)
-    return noise-(noise*tangent).sum(-1, keepdims=True)*tangent, sigma
+    noise = noise-(noise*tangent).sum(-1, keepdims=True)*tangent
+    return noise+annotation_smoothing(arcs, p, s, cfg.trace_noise_smoothing), sigma
+
+
+def annotation_smoothing(arcs, p, s, sigma):
+    """Gaussian-smoothed minus raw annotation at evenly spaced ``arcs``, ramped in over 3 sigma
+    from ``arcs[0]`` so the path still starts on its seed."""
+    from scipy.ndimage import gaussian_filter1d
+    if sigma <= 0 or len(arcs) < 2:
+        return np.zeros((len(arcs), 3))
+    step = float(arcs[1]-arcs[0])
+    pad = int(math.ceil(4*sigma/step))
+    grid = arcs[0]+step*np.arange(-pad, len(arcs)+pad, dtype=np.float64)
+    raw = interp_at(p, s, np.clip(grid, 0., s[-1]))
+    offset = (gaussian_filter1d(raw, sigma/step, axis=0, mode='nearest')-raw)[pad:pad+len(arcs)]
+    return offset*smoothstep((arcs-arcs[0])/(3*sigma))[:, None]
 
 
 def local_tangents(arcs, p, s):
@@ -323,12 +384,13 @@ def smoothstep(u):
 def excursion_offsets(arcs, p, s, cfg: SampleConfig, rng):
     """A smooth lateral departure and return ending at the head, zero before it starts.
 
-    Amplitude and rise length are uniform in their configured ranges. The head lies
+    Amplitude is uniform and rise length log-uniform in their configured ranges. The head lies
     uniformly on the rise or the return (within the available prefix), so both
     departing and returning heads occur. The direction is one random lateral vector,
     projected off the local annotation tangent at every point.
     """
-    amplitude, rise = float(rng.uniform(*cfg.excursion_amplitude)), float(rng.uniform(*cfg.excursion_rise))
+    amplitude = float(rng.uniform(*cfg.excursion_amplitude))
+    rise = float(np.exp(rng.uniform(*np.log(cfg.excursion_rise))))
     head = float(rng.uniform(0., min(2*rise, arcs[-1]-arcs[0])))
     x = arcs-(arcs[-1]-head)
     profile = amplitude*np.where(x <= rise, smoothstep(x/rise), smoothstep(2-x/rise))*(x >= 0)
@@ -899,14 +961,15 @@ class FollowDataset(torch.utils.data.IterableDataset):
                 batch['live_limit'] = torch.tensor([item.get('live_limit', 0) for item in items])
                 batch['live_travelled'] = torch.tensor([item.get('live_travelled', 0.) for item in items])
             # Row-aligned counters survive the usual tensor batch movers; totals sit in
-            # row 0 so summing never multiplies them by the batch size.
+            # row 0 so summing never multiplies them by the batch size. Zero counts are omitted.
             counters = dict(ct_frame_rejected_batches=rejected, ct_seed_rejections=seed_rejections,
                             replay_max_event_reuse=self.max_event_reuse() if self.onpolicy else 0)
             if live_outcomes is not None:
                 counters.update({'live_'+name: value for name, value in live_outcomes.items()})
             for name, value in counters.items():
-                batch[name] = torch.zeros(self.chunk, dtype=torch.int64)
-                batch[name][0] = value
+                if value:
+                    batch[name] = torch.zeros(self.chunk, dtype=torch.int64)
+                    batch[name][0] = value
             rejected = seed_rejections = 0
             yield batch
 
@@ -1258,6 +1321,9 @@ class OnPolicyStates:
         self.manifest = metadata["fibers"]
         self.provenance = metadata["provenance"]
         self._dir = d
+        missing = [k for k in (*self.FIELDS, *self.TRACK) if not os.path.exists(os.path.join(d, k + ".npy"))]
+        if missing:
+            raise ValueError(f'Replay cache lacks schema fields {missing}; recollect it')
         for k in (*self.FIELDS, *self.TRACK):
             setattr(self, k, np.load(os.path.join(d, k + ".npy"), mmap_mode="r"))
         self.validate()

@@ -21,15 +21,19 @@ import torch
 from tqdm import tqdm
 
 from vesuvius.neural_tracing.fiber_follow.heading_model.data import (
-    HeadingStates, load_sources, sampling_from_dict, sampling_to_dict, validation_states)
+    load_sources, mixed_heading_states, sampling_from_dict, sampling_to_dict, validation_states)
 from vesuvius.neural_tracing.fiber_follow.heading_model.evaluate import (
     alignment_report, format_report, model_headings, summary_metric)
 from vesuvius.neural_tracing.fiber_follow.heading_model.model import HeadingConfig, HeadingNet, save_heading_model
+from vesuvius.neural_tracing.fiber_follow.shared.remote_prefetch import attach_remote_prefetch
 from vesuvius.neural_tracing.fiber_follow.shared.runloop import raise_open_file_limit
 
 DEFAULTS = dict(name='heading_model', steps=30000, batch=128, workers=8, lr=3e-3, weight_decay=1e-4, warmup=500,
                 log_every=100, val_every=2000, ckpt_every=2000, val_states_per_source=1500, seed=0,
-                worker_cache_gb=.5, device='cuda', model={}, sampling={}, ct_normalization=None, out_root=None)
+                worker_cache_gb=.5, device='cuda', model={}, sampling={}, ct_normalization=None, out_root=None,
+                # The follower trainer's remote CT prefetch (separate async process; workers read the cache only).
+                remote_prefetch_connections=48, remote_prefetch_queue_size=512, remote_prefetch_lookahead=16,
+                remote_prefetch_timeout=120.)
 
 
 PACKAGE = Path(__file__).resolve().parents[1]  # fiber_follow/
@@ -120,7 +124,8 @@ def main(argv=None):
     cfg, sampling = HeadingConfig(**config['model']), sampling_from_dict(config['sampling'])
     print('Loading sources', flush=True)
     _, digest, sources, normalization = load_sources(config['dataset_config'], run,
-                                                     ct_normalization=config['ct_normalization'])
+                                                     ct_normalization=config['ct_normalization'],
+                                                     ct_downsample_levels=cfg.ct_downsample_levels)
     for s in sources:
         print(f'  {s.name} ({s.kind}): {len(s.train)} training / {len(s.validation)} held-out fibers, weight {s.weight:g}', flush=True)
     print(f"Building {config['val_states_per_source']} held-out states per source", flush=True)
@@ -132,6 +137,8 @@ def main(argv=None):
     step, best = 0, float('inf')
     if args.resume:
         checkpoint = torch.load(run/'last.pt', map_location='cpu', weights_only=False)
+        if HeadingConfig(**checkpoint['config']).to_dict() != cfg.to_dict():
+            raise ValueError(f'{run}/last.pt was trained with a different model config (inputs); use another --name')
         model.load_state_dict(checkpoint['state'])
         opt.load_state_dict(checkpoint['optimizer'])
         step, best = int(checkpoint['step']), float(checkpoint.get('best', best))
@@ -142,11 +149,25 @@ def main(argv=None):
     (run/'config.json').write_text(json.dumps(dict(config, model_cfg=cfg.to_dict(), **provenance), indent=2)+'\n')
     print(f'Model: {sum(p.numel() for p in model.parameters())} parameters; training from step {step}', flush=True)
     workers = config['workers']
-    loader = torch.utils.data.DataLoader(
-        HeadingStates(sources, cfg, sampling, config['batch'], seed=config['seed']+step,
-                      cache_bytes=int(config['worker_cache_gb']*(1 << 30))),
-        batch_size=None, num_workers=workers, pin_memory=device.startswith('cuda'),
-        persistent_workers=workers > 0, prefetch_factor=4 if workers else None)
+    dataset, per_source = mixed_heading_states(sources, cfg, sampling, config['batch'], seed=config['seed']+step,
+                                               cache_bytes=int(config['worker_cache_gb']*(1 << 30)))
+    prefetcher, remote = attach_remote_prefetch(per_source, config['remote_prefetch_connections'],
+                                                config['remote_prefetch_queue_size'], config['remote_prefetch_timeout'],
+                                                config['remote_prefetch_lookahead'], workers)
+    if prefetcher is not None:
+        print(f"Remote CT prefetch for {len(remote)} sources: {config['remote_prefetch_connections']} connections, "
+              f"{config['remote_prefetch_lookahead']} planned batches per source/worker", flush=True)
+    loader = torch.utils.data.DataLoader(dataset, batch_size=None, num_workers=workers,
+                                         pin_memory=device.startswith('cuda'), persistent_workers=workers > 0,
+                                         prefetch_factor=4 if workers else None)
+    try:
+        train(config, run, model, opt, step, best, loader, held_out, provenance, device)
+    finally:
+        if prefetcher is not None:
+            prefetcher.close()
+
+
+def train(config, run, model, opt, step, best, loader, held_out, provenance, device):
     batches = iter(loader)
     interval = dict(loss=0., angle=0., n=0, data=0., started=time.monotonic())
     train_stats = val_stats = None

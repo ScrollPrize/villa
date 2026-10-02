@@ -57,50 +57,45 @@ def sample_config():
     return D.SampleConfig(crop=CropSpec(depth=12, width=9, behind=2), n_history=4, n_future=4)
 
 
-def make_states(f, z=0, offtrack=False):
-    return D.OnPolicyStates(manifest=D.fiber_manifest([f]),
-        fiber_idx=[0], t=[50.], reverse=[False], pos=[[50., 0., z]],
-        frame=[frame_from_heading(np.array([1., 0, 0]))], hist=np.zeros((1, 4, 3)), hmask=np.zeros((1, 4)),
-        offtrack=[offtrack], hard=[offtrack], exploratory=[False])
+def make_states(f, z=0):
+    from replay_fixtures import replay_states
+    return replay_states([f], [dict(t=50., pos=np.array([50., 0., z]), frame=frame_from_heading(np.array([1., 0, 0])),
+                                    hist=np.zeros((4, 3)), hmask=np.zeros(4))])
 
 
 @pytest.mark.parametrize('reverse', [False, True])
-@pytest.mark.parametrize('replay_options', [dict(correct_replay_only=True), dict(replay_continuation_fraction=.8)])
-def test_correct_replay_uses_committed_prefix_and_supervises_only_beyond_tip(reverse, replay_options):
-    from types import SimpleNamespace
+def test_replay_uses_committed_prefix_and_supervises_only_beyond_tip(reverse):
+    from replay_fixtures import replay_states
     f, cfg = fiber(), sample_config()
     sign = -1 if reverse else 1
     prefix = np.c_[50+sign*np.arange(-4, 1), np.full(5, .2), np.zeros(5)]
     frame = frame_from_heading(np.array([sign, 0., 0.]))
-    op = D.OnPolicyStates(manifest=D.fiber_manifest([f]), fiber_idx=[0], t=[50.], reverse=[reverse],
-        pos=prefix[-1:], frame=frame[None], hist=prefix[-2::-1][None], hmask=np.ones((1, 4)),
-        offtrack=[False], hard=[False], exploratory=[False], drift=[.2], travelled=[4.],
-        seed_pos=prefix[:1], seed_valid=[True], seq_start=[0], seq_end=[5],
-        # The archive can contain later points, but the row must never expose them.
-        track_pos=np.concatenate((prefix, [[99., 7., 0.]])))
-
-    def reject_replacement(*args):
-        raise AssertionError('Correct replay must never be synthetically replaced')
-
-    ds = D.FollowDataset([f], None, cfg, None, **replay_options,
-        batch_builder=SimpleNamespace(replace_replay=reject_replacement))
-    item = ds.replay_item((2, 0, op, 0), np.random.default_rng(1))
+    op = replay_states([f], [dict(t=50., reverse=reverse, pos=prefix[-1], frame=frame, hist=prefix[-2::-1],
+                                  hmask=np.ones(4), match_distance=.2, window_distance=.2, travelled=4.,
+                                  seed_pos=prefix[0], seed_valid=True, seq_start=0, seq_end=5)],
+                       # The archive can contain later points, but the row must never expose them.
+                       track=np.concatenate((prefix, [[99., 7., 0.]])))
+    ds = D.FollowDataset([f], None, cfg, None)
+    item = ds.replay_item(op, 0, np.random.default_rng(1))
     np.testing.assert_array_equal(item['observed_path'], prefix)
     np.testing.assert_array_equal(item['seed_pos'], prefix[0])
-    assert item['seed_valid']
-    assert item['replay_correct_continuation']
+    assert item['seed_valid'] and item['source'] == D.SOURCE['replay'] and item['source_step'] == 1000
     np.testing.assert_allclose(item['hist_local'] @ frame.T+item['pos'], prefix[-2::-1])
     target = item['fut_local'] @ frame.T+item['pos']
     np.testing.assert_allclose(target[:, 0], 50+sign*cfg.future_s)
     np.testing.assert_allclose(target[:, 1:], 0.)
-    assert item['fmask'].all() and not item['offtrack']
+    assert item['fmask'].all() and item['geometry_valid'] and not item['terminal']
+    assert item['labeler_state']['t'] == 50. and item['labeler_state']['last_travelled'] == 4.
 
 
-def decision_at(x, travelled, previous=None, would_stop=False):
-    pos = np.array([x, 0., 0.])
+def decision_at(x, travelled, previous=None, would_stop=False, y=0.):
+    pos = np.array([x, y, 0.])
+    segment = np.array([pos]) if previous is None else np.array([previous, pos])
     return dict(pos=pos, frame=frame_from_heading(np.array([1., 0, 0])), hist=np.zeros((4, 3)),
-                hmask=np.zeros(4), exploratory=False, would_stop=would_stop, travelled=travelled,
-                last_segment=np.array([pos]) if previous is None else np.array([previous, pos]))
+                hmask=np.zeros(4), would_stop=would_stop, n_commit=0 if would_stop else 4,
+                points=np.zeros((4, 3)), confidence=np.ones(4), heading_start=0, travelled=travelled,
+                seed_pos=segment[0], seed_tangent=np.array([1., 0, 0]), seed_age=travelled, seed_valid=False,
+                last_segment=segment)
 
 
 @pytest.mark.parametrize('reviewed', [False, True])
@@ -199,12 +194,23 @@ def test_plane_teacher_intersects_original_segments_without_smoothing_vertices()
     np.testing.assert_allclose(ab[0], [1.,1.])
 
 
-def test_onpolicy_cache_requires_identity(tmp_path):
+def test_onpolicy_cache_requires_identity_and_the_whole_schema(tmp_path):
     path = tmp_path / 'old.npz'
     np.savez(path, pos=np.zeros((1, 3)))
     with pytest.raises(KeyError, match='__metadata__'):
         D.OnPolicyStates.load(path)
-    assert not (tmp_path / 'old_mmap_v5').exists()
+    assert not (tmp_path / 'old_mmap').exists()
+    # A previous-pipeline cache (sticky offtrack, no supervision fields) is rejected outright.
+    op = make_states(fiber())
+    arrays = {k: getattr(op, k) for k in (*D.OnPolicyStates.FIELDS, *D.OnPolicyStates.TRACK)
+              if k not in ('supervision', 'confidence_valid')}
+    np.savez(path, __metadata__=json.dumps(dict(fibers=op.manifest, provenance=op.provenance)),
+             offtrack=np.zeros(1, bool), **arrays)
+    with pytest.raises(ValueError, match='lacks schema fields'):
+        D.OnPolicyStates.load(path)
+    with pytest.raises(ValueError, match='differ from the schema'):
+        D.OnPolicyStates(manifest=op.manifest, provenance=op.provenance, offtrack=np.zeros(1, bool),
+                         **{k: getattr(op, k) for k in (*D.OnPolicyStates.FIELDS, *D.OnPolicyStates.TRACK)})
 
 
 def test_onpolicy_identity_and_mmap_roundtrip(tmp_path):
@@ -261,33 +267,46 @@ def test_cache_history_must_match_training_configuration():
                         onpolicy=[make_states(f)])
 
 
-def test_collector_censors_unknown_boundary_and_marks_pre_stop_window():
+def test_collector_censors_unknown_boundary_and_keeps_the_stop_decision():
+    from vesuvius.neural_tracing.fiber_follow.shared.state_labels import REPLAY_CLASS
     c = DecisionCollector(fiber(), 0, 50, 1, sample_config(), stride=16)
     assert c(decision_at(50, 0))
     assert c(decision_at(58, 8, [50., 0, 0], would_stop=True))
-    assert all(row['hard'] for row in c.rows)
+    stop = c.rows[-1]
+    assert stop['hard'] and stop['would_stop'] and stop['event_id'] >= 0
     assert c(decision_at(96, 46, [58., 0, 0]))
-    assert c(decision_at(102, 52, [96., 0, 0])) is False
-    assert not any(r['offtrack'] for r in c.finish())
+    assert c(decision_at(102, 52, [96., 0, 0])) is False and c.censored == 'unannotated'
+    kept = c.finish()
+    assert [r['replay_class'] for r in kept] == [REPLAY_CLASS['ordinary'], REPLAY_CLASS['premature_stop'],
+                                                REPLAY_CLASS['ordinary']]
 
 
-def test_collector_departure_is_the_evaluation_rule_and_retains_predeparture_rows():
+def test_departure_is_the_evaluation_rule_and_a_return_restores_supervision():
     # Three consecutive committed points beyond 3 voxels (score_trace tolerance and
     # patience), dated at the run's first point, including runs spanning commits.
+    from vesuvius.neural_tracing.fiber_follow.shared.state_labels import FOLLOWING, RECOVERABLE, REPLAY_CLASS
     c = DecisionCollector(fiber(length=300), 0, 50, 1, sample_config(), stride=16)
     assert c(decision_at(50, 0))
     first = np.array([[50., 0, 0], [51, 0, 0], [52, 0, 0], [53, 3.5, 0], [54, 3.5, 0]])
-    d = decision_at(54, float(arclength(first)[-1]))
-    d['pos'], d['last_segment'] = first[-1].copy(), first
-    assert c(d) and not c.rows[-1]['offtrack'] and c.departed is None  # two points: not yet
+    d = decision_at(54, float(arclength(first)[-1]), y=3.5)
+    d['last_segment'] = first
+    assert c(d) and not c.rows[-1]['bad_run'] >= 3 and np.isnan(c.rows[-1]['departure_distance'])
+    assert c.rows[-1]['supervision'] == RECOVERABLE  # displaced now, but not yet a departure event
     second = np.array([[54., 3.5, 0], [55, 3.5, 0], [56, 3.5, 0]])
-    d = decision_at(56, d['travelled']+2.)
-    d['pos'], d['last_segment'] = second[-1].copy(), second
-    assert c(d) and c.rows[-1]['offtrack']
-    assert c.departed == pytest.approx(arclength(first[:4])[-1])
-    assert c.rows[0]['hard']
-    d['travelled'] = 40
-    assert c(d) is False
+    d = decision_at(56, d['travelled']+2., y=3.5)
+    d['last_segment'] = second
+    assert c(d) and c.rows[-1]['departure_distance'] == pytest.approx(arclength(first[:4])[-1])
+    assert c.rows[-1]['supervision'] == RECOVERABLE and c.rows[-1]['geometry_valid']
+    assert c.rows[0]['pre_excursion'] and c.rows[0]['hard']
+    # Back on the fiber: following again; the historical departure is retained.
+    back = np.array([[56., 3.5, 0], [60, 0, 0], [70, 0, 0]])
+    d = decision_at(70, d['travelled']+float(arclength(back)[-1]))
+    d['last_segment'] = back
+    assert c(d) and c.rows[-1]['supervision'] == FOLLOWING and c.rows[-1]['geometry_valid']
+    assert np.isfinite(c.rows[-1]['departure_distance']) and c.rows[-1]['event_id'] == -1
+    classes = [r['replay_class'] for r in c.finish()]
+    assert classes == [REPLAY_CLASS['pre_excursion'], REPLAY_CLASS['recoverable'], REPLAY_CLASS['recoverable'],
+                       REPLAY_CLASS['ordinary']]
 
 
 def test_collector_isolated_off_track_points_are_not_departures():
@@ -295,8 +314,25 @@ def test_collector_isolated_off_track_points_are_not_departures():
     assert c(decision_at(50, 0))
     path = np.array([[50., 0, 0], [51, 3.5, 0], [52, 3.5, 0], [53, 0, 0], [54, 3.5, 0], [55, 0, 0]])
     d = decision_at(55, float(arclength(path)[-1]))
-    d['pos'], d['last_segment'] = path[-1].copy(), path
-    assert c(d) and c.departed is None and not any(r['offtrack'] for r in c.rows)
+    d['last_segment'] = path
+    assert c(d) and c.labeler.departure_distance is None and all(np.isnan(r['departure_distance']) for r in c.rows)
+
+
+def test_correspondence_progress_is_bounded_in_both_directions():
+    """A head far from the fiber cannot jump along it: the window bounds each update."""
+    from vesuvius.neural_tracing.fiber_follow.shared.state_labels import MATCH_AHEAD, MATCH_BEHIND, TERMINAL
+    c = DecisionCollector(fiber(length=300), 0, 50, 1, sample_config(), stride=16)
+    assert c(decision_at(50, 0))
+    # Travel 10 voxels but appear 200 voxels ahead and far off: progress grows by at most 10+32.
+    far = decision_at(250, 10., [50., 0, 0], y=40.)
+    assert c(far)
+    assert 50. < c.labeler.t <= 50.+10.+MATCH_AHEAD
+    assert c.rows[-1]['supervision'] == TERMINAL  # unreachable from 40 voxels away
+    # Reversing direction moves progress back by at most MATCH_BEHIND.
+    t = c.labeler.t
+    back = decision_at(0, 20., [250., 40, 0], y=40.)
+    assert c(back)
+    assert t-MATCH_BEHIND <= c.labeler.t <= t
 
 
 def test_collector_stops_on_holdout_and_preserves_original_frame():
@@ -304,13 +340,14 @@ def test_collector_stops_on_holdout_and_preserves_original_frame():
     f.points = f.points[:, [1,2,0]]
     c = DecisionCollector(f, 0, 0, 1, sample_config(), D.ZBand(200,300))
     d = decision_at(0,0)
+    d['pos'], d['last_segment'] = np.zeros(3), np.zeros((1, 3))
     d['frame'] = frame_from_heading(np.array([0.,0,1]))
     assert c(d)
     np.testing.assert_array_equal(c.rows[0]['frame'], d['frame'])
     d['pos'] = np.array([0.,0,180.])
     d['last_segment'] = np.c_[np.zeros(181), np.zeros(181), np.arange(181)]
     d['travelled'] = 180
-    assert c(d) is False
+    assert c(d) is False and c.censored == 'holdout'
 
 
 def test_online_collection_does_not_wait_and_publishes_only_complete_caches(tmp_path, monkeypatch):
@@ -329,13 +366,15 @@ def test_online_collection_does_not_wait_and_publishes_only_complete_caches(tmp_
     assert not manager.launch(4, saved.append)  # collector busy; trainer keeps its optimizer
     assert len(saved) == 1 and json.loads(manager.index.read_text()) == []
     states = make_states(fiber())
-    states.provenance['step'] = 2
+    states.provenance.update(step=2, supply={}, coverage={}, operating_policy={})
     states.save(manager.output)
+    manager.output.with_suffix('.coverage.json').write_text('{}')
     process.returncode = 0
     event = manager.poll()
     assert event['dagger_source_step'] == 2 and event['dagger_states'] == 1
     assert len(json.loads(manager.index.read_text())) == 1
-    assert '--checkpoint' in commands[0]
+    assert '--checkpoint' in commands[0] and '--explore-calls' not in commands[0]
+    assert commands[0][commands[0].index('--fibers-per-collection')+1] == '64'
     manager.close()
 
 
@@ -343,5 +382,6 @@ def test_confidence_threshold_default_is_shared_by_rollout_and_collection(tmp_pa
     from vesuvius.neural_tracing.fiber_follow.shared.trace import DEFAULT_CONFIDENCE
     assert TraceParams().confidence == DEFAULT_CONFIDENCE == .5
     collector = OnlineCollector(tmp_path/'collector', 'fibers', [100, 200], 'cpu')
-    assert collector.confidence == DEFAULT_CONFIDENCE
+    # Collection takes the checkpoint's operating policy unless the trainer passes one.
+    assert collector.confidence is None and collector.settings()['exploration'] == 'none'
     collector.close()

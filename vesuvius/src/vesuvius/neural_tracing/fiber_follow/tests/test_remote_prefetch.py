@@ -256,7 +256,7 @@ def test_dataset_gates_reads_without_changing_samples(monkeypatch):
     events=[]
     monkeypatch.setattr(data_module,'FiberVolume',lambda *a,**kw: events.append(('volume',kw.get('cache_only',False))) or SimpleNamespace(ct='ct'))
     monkeypatch.setattr(data_module,'crop_local_grid',lambda crop:np.zeros((1,3)))
-    monkeypatch.setattr(data_module,'make_sample',lambda f,t,rev,cfg,rng:dict(at=t,reverse=rev))
+    monkeypatch.setattr(data_module,'make_sample',lambda f,t,rev,cfg,rng,**options:dict(at=t,reverse=rev))
     class Builder:
         def prefetch_bounds(self,item,vol):return [(item['at'],item['reverse'])]
         def __call__(self,items,vol):
@@ -268,7 +268,9 @@ def test_dataset_gates_reads_without_changing_samples(monkeypatch):
         def ensure(self,reader,bounds):events.append(('demand',len(bounds)))
     def sample(prefetch):
         ds=data_module.FollowDataset([SimpleNamespace(length=100.)],None,
-            SimpleNamespace(crop=None,future_s=[16.]),None,chunk=4,seed=17,batch_builder=Builder())
+            SimpleNamespace(crop=None,future_s=[16.]),None,chunk=4,seed=17,batch_builder=Builder(),
+            budget=data_module.TaskBudget.parse(['fresh=1','live=0','dagger_pre_excursion=0','dagger_recoverable=0',
+                'dagger_terminal=0','dagger_premature_stop=0','dagger_ordinary=0','synthetic_terminal=0']))
         ds.state_allowed=lambda item:True
         ds.remote_prefetch=Client() if prefetch else None
         stream=iter(ds)

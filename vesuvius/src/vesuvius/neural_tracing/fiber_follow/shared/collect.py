@@ -127,8 +127,10 @@ class DecisionCollector:
                    proposal_points=np.asarray(state['points'], np.float32),
                    proposal_confidence=np.asarray(state['confidence'], np.float32),
                    event_id=event, pre_excursion=False, hard=bool(displaced or state['would_stop']))
-        # last_segment is the actual committed polyline, including intermediate vertices.
-        prefix = np.asarray(state['observed_path'], dtype=np.float64)
+        # last_segment is the actual committed polyline, including intermediate vertices,
+        # so it extends the trace for callers that do not pass the whole observed prefix.
+        prefix = np.asarray(state.get('observed_path', list(self.track)+list(segment[1:] if self.track else segment)),
+                            dtype=np.float64)
         if self.track and not np.array_equal(np.asarray(self.track), prefix[:len(self.track)]):
             raise ValueError('Collected observed prefixes must extend the committed trace')
         self.track.extend(prefix[len(self.track):].copy())

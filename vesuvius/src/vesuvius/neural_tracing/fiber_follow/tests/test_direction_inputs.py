@@ -2,6 +2,7 @@
 
 Runnable without pytest: python -m unittest discover -s tests -p test_direction_inputs.py
 """
+from types import SimpleNamespace
 import copy
 from dataclasses import replace
 import json
@@ -214,7 +215,8 @@ class DirectionInputTests(unittest.TestCase):
                 actual=tracer.build_inputs(np.array([plain['pos']]),np.array([plain['frame']]),
                     np.array([plain['hist_local']]),np.array([plain['hmask']]),[plain])
                 for k in expected_x:
-                    if k != 'history_load_seconds':
+                    # Timing and frame-provenance diagnostics are not observations.
+                    if k != 'history_load_seconds' and not k.startswith('ct_frame_'):
                         torch.testing.assert_close(actual[k],expected_x[k],rtol=0,atol=0)
             finally:tracer.close()
             warm=dict(plain,memory_warm=True)
@@ -237,7 +239,7 @@ class DirectionInputTests(unittest.TestCase):
         state=dict(photometric=(1.3,.1,.07),identity_seed=3,blur_sigma=1.,drop_presence=True)
         with patch.object(ObservationBuilder,'observations',return_value=training), \
              patch.object(builder,'bank_targets',return_value=dict(presence_dropped=torch.zeros(1))):
-            got=builder([state],None)['x']
+            got=builder([state],SimpleNamespace(spec=SimpleNamespace(ct_normalization=None)))['x']
         torch.testing.assert_close(got['fine'][:,2:],original['x']['fine'][:,2:],rtol=0,atol=0)
         torch.testing.assert_close(got['history_slabs'][:,:,1],original['x']['history_slabs'][:,:,1],rtol=0,atol=0)
         torch.testing.assert_close(got['history_slabs'][:,1],original['x']['history_slabs'][:,1],rtol=0,atol=0)

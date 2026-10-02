@@ -84,7 +84,8 @@ def main():
     model, checkpoint = load_heading_model(args.checkpoint, args.device)
     # Bind the same CT records the model was trained with; a scratch directory receives the normalization JSON.
     scratch = Path(args.out).parent if args.out else Path(args.checkpoint).parent/'evaluation'
-    _, _, sources, _ = load_sources(config['dataset_config'], scratch, ct_normalization=config.get('ct_normalization'))
+    _, _, sources, _ = load_sources(config['dataset_config'], scratch, ct_normalization=config.get('ct_normalization'),
+                                    ct_downsample_levels=model.cfg.ct_downsample_levels)
     sampling = sampling_from_dict(checkpoint.get('sampling', config.get('sampling')))
     with ThreadPoolExecutor(16) as pool:
         held_out = validation_states(sources, model.cfg, sampling, args.states or config['val_states_per_source'],

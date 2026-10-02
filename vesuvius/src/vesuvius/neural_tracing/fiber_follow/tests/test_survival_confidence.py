@@ -7,7 +7,7 @@ import torch
 from test_identity import config
 from slab_fixtures import slab_batch as memory_batch
 from test_regression import proposal_output
-from label_fixtures import set_terminal, state_labels
+from label_fixtures import set_terminal, set_unknown, state_labels
 from vesuvius.neural_tracing.fiber_follow.regression.model import build_model
 from vesuvius.neural_tracing.fiber_follow.regression.supervision import loss_terms
 from vesuvius.neural_tracing.fiber_follow.regression.survival_confidence import (
@@ -166,41 +166,17 @@ def test_first_failure_censoring_and_missing_gaps_have_exact_likelihood_and_grad
     assert (hazards.grad[valid] != 0).all()
 
 
-def test_generated_and_candidate_losses_share_survival_semantics_and_mask_identity():
+def test_generated_losses_keep_survival_semantics_and_mask_unavailable_supervision():
     cfg = config()
     batch = memory_batch(cfg, 2)
     points = torch.zeros(2, cfg.n_future, 3)
     points[..., 2] = torch.arange(1, cfg.n_future+1)
     hazards = torch.zeros(2, cfg.n_future, requires_grad=True)
-    candidates = torch.zeros(2, 2, cfg.n_future, requires_grad=True)
     set_terminal(batch, 0)
-    batch['identity_observable'] = torch.tensor([True, False])
-    batch['candidate_labels'] = torch.zeros(2, 2, cfg.n_future)
-    batch['candidate_mask'] = torch.ones(2, 2, cfg.n_future, dtype=torch.bool)
-    logits, confidence = survival_predictions(hazards)
+    set_unknown(batch, 1)
     out = proposal_output(points[:, None], hazards[:, None])
-    out.update(candidate_hazard_logits=candidates, candidate_confidence_logits=survival_predictions(candidates)[0])
     terms = loss_terms(out, batch, cfg, n_commit=1)
     torch.testing.assert_close(terms['confidence_per_state'], torch.tensor([math.log(2), 0.]))
-    torch.testing.assert_close(terms['candidate_per_state'], torch.tensor([math.log(2), 0.]))
-    (terms['confidence_per_state'].sum()+terms['candidate_per_state'].sum()).backward()
+    terms['confidence_per_state'].sum().backward()
     assert hazards.grad[0, 0] < 0 and hazards.grad[:, 1:].count_nonzero() == 0
-    assert candidates.grad[0, :, 0].lt(0).all() and candidates.grad[:, :, 1:].count_nonzero() == 0
-    assert hazards.grad[1].count_nonzero() == candidates.grad[1].count_nonzero() == 0
-
-
-@torch.no_grad()
-def test_same_curve_gets_same_score_as_generated_or_supplied_candidate():
-    model = build_model(config()).eval()
-    batch = memory_batch(model.cfg, 1)
-    args = batch['x'], batch['hist'], batch['hmask']
-    generated = model(*args)
-    curve = generated['points']
-    alternative = curve.clone()
-    alternative[..., 0] += 2.
-    supplied = model(*args, candidates=torch.stack((alternative, curve), 1))
-    torch.testing.assert_close(supplied['candidate_hazard_logits'][:, 1], generated['hazard_logits'])
-    torch.testing.assert_close(supplied['candidate_confidence'][:, 1], generated['confidence'])
-    reordered = model(*args, candidates=torch.stack((curve, alternative), 1))
-    torch.testing.assert_close(reordered['candidate_hazard_logits'],
-                               supplied['candidate_hazard_logits'].flip(1))
+    assert hazards.grad[1].count_nonzero() == 0

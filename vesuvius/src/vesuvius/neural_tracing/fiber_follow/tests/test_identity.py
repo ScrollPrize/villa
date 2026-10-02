@@ -58,13 +58,6 @@ def forward(m, b):
 
 
 
-def test_saved_presence_threshold_loads_without_reapplying():
-    saved = dict(rule=dict(threshold=.7, own_radius=1.5, lateral_max=32., along_window=2.))
-    sampling = IdentitySampling(**saved)
-    assert sampling.rule == ComponentRule(lateral_max=32.)
-    assert not hasattr(sampling.rule, 'threshold')
-
-
 def tube(shape, crop, center, radius=.9, along=None):
     grid = crop_local_grid(crop)
     d = np.linalg.norm(grid[..., :2]-np.asarray(center), axis=-1)
@@ -102,9 +95,9 @@ def prepared(builder, fiber, rng, t=400.):
     from vesuvius.neural_tracing.fiber_follow.shared.data import make_sample
     cfg = builder.cfg
     sample = SampleConfig(crop=cfg.fine, n_history=cfg.n_history, n_future=cfg.n_future, recent_history_points=cfg.n_history,
-                          no_history_prob=0., short_history_prob=0.)
+                          startup_shares=(0., 0., 0., 1.), excursion_probability=0.)
     item = make_sample(fiber, t, False, sample, rng)
-    item.update(fiber_ref=(0, t, False), source=0, source_step=-1, stratum=-1)
+    item.update(fiber_ref=(0, t, False), source=0, source_step=-1)
     return builder.prepare(item, fiber, rng)
 
 
@@ -123,7 +116,7 @@ def test_presence_dropout_after_targets(monkeypatch):
         seen.append(float(images['fine'][:, 1].abs().sum()))
         return original(self, items, decision_mask)
     monkeypatch.setattr(IdentityObservationBuilder, 'bank_targets', targets)
-    out = builder(items, None)
+    out = builder(items, SimpleNamespace(spec=SimpleNamespace(ct_normalization=None)))
     assert seen[0] > 0 and out['x']['fine'][:, 1].abs().sum() == 0
     assert out['presence_dropped'].tolist() == [1.]
 

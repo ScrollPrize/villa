@@ -33,7 +33,7 @@ def lateral_tangents(p, s, arcs):
 @pytest.mark.parametrize('reverse', [False, True])
 @pytest.mark.parametrize('t', [0., 2.5, 60.])
 def test_simulated_trace_is_the_tracer_state_of_its_observed_path(reverse, t):
-    f, cfg = curved_fiber(), sample_config(no_history_prob=.2, short_history_prob=.3)
+    f, cfg = curved_fiber(), sample_config(startup_shares=(.2, .15, .15, .5), excursion_probability=0.)
     p, s = D.traversal_curve(f, reverse)
     for seed in range(12):
         item = D.make_sample(f, t, reverse, cfg, np.random.default_rng(seed))
@@ -61,17 +61,26 @@ def test_simulated_trace_is_the_tracer_state_of_its_observed_path(reverse, t):
 
 def test_trace_starts_follow_the_configured_shares():
     f = straight_fiber(400)
-    seed_only = D.make_sample(f, 300., False, sample_config(no_history_prob=1.), np.random.default_rng(0))
+    seed_only = D.make_sample(f, 300., False, sample_config(startup_shares=(1., 0., 0., 0.)), np.random.default_rng(0))
     assert len(seed_only['observed_path']) == 1 and not seed_only['hmask'].any() and seed_only['seed_age'] == 0
-    assert '_pending_seed_heading' in seed_only
-    lengths = [D.make_sample(f, 300., False, sample_config(no_history_prob=0., short_history_prob=1.),
+    assert '_pending_seed_heading' in seed_only and seed_only['startup'] == 0
+    lengths = [D.make_sample(f, 300., False, sample_config(startup_shares=(0., .5, .5, 0.)),
                              np.random.default_rng(seed))['trace_prefix_length'] for seed in range(200)]
     assert 1 <= min(lengths) and max(lengths) <= 32 and len(set(lengths)) > 20
+    # Default draws: 15% seed-only, 17% 1-8, 17% 9-32 requested voxels, 51% uniform available history.
+    rng = np.random.default_rng(1)
+    categories = np.bincount([D.make_sample(f, 300., False, sample_config(), rng)['startup'] for _ in range(4000)],
+                             minlength=4)/4000
+    np.testing.assert_allclose(categories, (.15, .17, .17, .51), atol=.025)
+    # Requests are clipped to the available annotation; realized ages are reported separately.
+    near_seed = D.make_sample(f, 5., False, sample_config(startup_shares=(0., 0., 1., 0.)), rng)
+    assert near_seed['trace_prefix_length'] <= 5. and near_seed['startup'] == 2
+    assert D.seed_age_stratum(near_seed['seed_age']) == 1
 
 
 def test_trace_noise_matches_held_out_rollout_residuals():
     # On-track 81k rollouts: lateral residual p50 0.47 / p90 1.11 voxels, correlation 0.46 at 32 voxels.
-    f, cfg = straight_fiber(1200), sample_config(no_history_prob=0., short_history_prob=0.)
+    f, cfg = straight_fiber(1200), sample_config(startup_shares=(0., 0., 0., 1.), excursion_probability=0.)
     magnitudes, lagged = [], []
     for seed in range(300):
         item = D.make_sample(f, 1200., False, cfg, np.random.default_rng(seed))
@@ -87,7 +96,7 @@ def test_trace_noise_matches_held_out_rollout_residuals():
 
 
 def test_trace_start_takes_ct_seed_heading_and_relabels(monkeypatch):
-    f, cfg = curved_fiber(), sample_config(no_history_prob=0., short_history_prob=1.)
+    f, cfg = curved_fiber(), sample_config(startup_shares=(0., .5, .5, 0.))
     item = next(i for i in (D.make_sample(f, 50., False, cfg, np.random.default_rng(k)) for k in range(50))
                 if '_pending_seed_heading' in i and len(i['observed_path']) > 3)
     travel = item['seed_tangent']
@@ -107,7 +116,7 @@ def test_trace_start_takes_ct_seed_heading_and_relabels(monkeypatch):
 
 
 def test_long_trace_only_takes_ct_seed_tangent(monkeypatch):
-    f, cfg = straight_fiber(400), sample_config(no_history_prob=0., short_history_prob=0.)
+    f, cfg = straight_fiber(400), sample_config(startup_shares=(0., 0., 0., 1.))
     item = next(i for i in (D.make_sample(f, 300., False, cfg, np.random.default_rng(k)) for k in range(20))
                 if arclength(i['observed_path'])[-1] > 20)
     frame = item['frame'].copy()
@@ -136,21 +145,29 @@ def roll_builder():
     return cfg, IdentityObservationBuilder(cfg, [straight_fiber(400)], IdentitySampling(), augment=True)
 
 
-def test_roll_augmentation_keeps_world_geometry_and_pairs_share_it():
+def test_roll_augmentation_keeps_world_geometry_and_is_final_before_planning(monkeypatch):
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.oriented_seed_heading',
+                        lambda vol, pos, family, direction: np.asarray(direction))
     cfg, builder = roll_builder()
     f = builder.fibers[0]
     sample = D.SampleConfig(crop=cfg.fine, n_history=cfg.n_history, n_future=cfg.n_future,
-                            no_history_prob=0., short_history_prob=0.)
+                            startup_shares=(0., 0., 0., 1.), excursion_probability=0.)
     angles = []
     for seed in range(40):
         item = D.make_sample(f, 300., False, sample, np.random.default_rng(seed))
-        item.update(fiber_ref=(0, 300., False), frame_policy=FRAME_POLICY)  # recorded frame: no CT roll needed
-        item = builder.prepare(item, f, np.random.default_rng(seed))
+        # Recorded frame (replay or a resolved live state): no CT roll or seed heading pending.
+        item.pop('_pending_seed_heading', None)
+        item.update(fiber_ref=(0, 300., False), frame_policy=FRAME_POLICY)
         world = lambda i: dict(hist=i['hist_local'] @ i['frame'].T+i['pos'], fut=i['fut_local'] @ i['frame'].T+i['pos'],
                                plane=np.c_[i['plane_ab'], i['planes']] @ i['frame'].T+i['pos'])
         before, heading = world(item), item['frame'][:, 2].copy()
-        builder.finalize_frames([item], None)
+        # A recorded frame takes its roll during preparation, before any footprint is planned.
+        item = builder.prepare(item, f, np.random.default_rng(seed))
+        assert 'roll_augmentation' not in item
         angles.append(item.get('roll_augmented', 0.))
+        planned = item['frame'].copy()
+        builder.finalize_frames([item], None)
+        np.testing.assert_array_equal(item['frame'], planned)
         after = world(item)
         for key in before:
             np.testing.assert_allclose(after[key], before[key], atol=1e-9)
@@ -158,69 +175,44 @@ def test_roll_augmentation_keeps_world_geometry_and_pairs_share_it():
     flipped = np.abs(np.angle(np.exp(1j*np.asarray(angles)))) > np.pi/2
     jitter = np.rad2deg(np.angle(np.exp(1j*(np.asarray(angles)+np.pi*flipped))))
     assert 8 < flipped.sum() < 32 and np.abs(jitter).max() <= 15+1e-9 and np.abs(jitter).std() > 1
-    # Matched pair rows draw from the same pair RNG, so their crops stay identical.
-    rows = [dict(D.make_sample(f, 300., False, sample, np.random.default_rng(1)), fiber_ref=(0, 300., False),
-                 pair_observation_seed=77) for _ in range(2)]
-    rows = [builder.prepare(row, f, np.random.default_rng(k)) for k, row in enumerate(rows)]
-    assert rows[0]['roll_augmentation'] == rows[1]['roll_augmentation']
 
 
-def test_decision_pairs_are_tracer_states_with_identical_local_inputs(tmp_path):
-    from test_mixed_datasets import afv_fixture
-    from test_identity import config
-    from sampling_fixtures import clean_sample
-    from vesuvius.neural_tracing.fiber_follow.regression.identity_decisions import decision_pair
-    from vesuvius.neural_tracing.fiber_follow.regression.data import visible_points
-    from vesuvius.neural_tracing.fiber_follow.shared.afv import AFVFibers
-    from vesuvius.neural_tracing.fiber_follow.regression.datasets import AFVBank
-    p = tmp_path/'test.afv'
-    afv_fixture(p, length=800, neighbor_x=36)
-    bank = AFVBank(AFVFibers(p))
-    cfg = config(input_mode='ct', fine=replace(config().fine, depth=48, behind=24))
-    sample, rng = clean_sample(cfg), np.random.default_rng(13)
-    for choice in (True, False):
-        rows = next(r for r in (decision_pair(bank, sample, cfg, rng, choice=choice) for _ in range(40)) if r)
-        assert rows[0]['decision_tail'] >= cfg.fine.behind*cfg.fine.spacing+4
-        np.testing.assert_array_equal(rows[0]['pos'], rows[1]['pos'])
-        np.testing.assert_array_equal(rows[0]['frame'], rows[1]['frame'])
-        tail = int(rows[0]['decision_tail'])
-        for row in rows:
-            path = row['observed_path']
-            hist, mask = trace_history(list(path), sample.n_history)
-            np.testing.assert_array_equal(row['hmask'], mask)
-            np.testing.assert_allclose(row['hist_local'][mask > 0] @ row['frame'].T+row['pos'], hist[mask > 0], atol=1e-9)
-            np.testing.assert_allclose(row['frame'][:, 2], trace_heading(path[-tail-1:], 0, row['frame'][:, 2]), atol=1e-9)
-            assert row['seed_heading_family'] == 'H'
-        # Crop-visible history (the shared tail) is identical in both rows.
-        visible = [visible_points(r['hist_local'], cfg.fine) & (r['hmask'] > 0) for r in rows]
-        np.testing.assert_array_equal(visible[0], visible[1])
-        np.testing.assert_allclose(rows[0]['hist_local'][visible[0]], rows[1]['hist_local'][visible[1]], atol=1e-9)
+def test_excursions_displace_established_heads_on_departure_and_return():
+    f = straight_fiber(1200)
+    cfg = sample_config(startup_shares=(0., 0., 0., 1.), excursion_probability=1., trace_noise_sigma=(0., 0.))
+    rng = np.random.default_rng(5)
+    items = [D.make_sample(f, 800., False, cfg, rng) for _ in range(400)]
+    excursions = [i for i in items if i['excursion']]
+    assert len(excursions) > 350
+    offsets = np.array([i['excursion_head_offset'] for i in excursions])
+    phases = np.array([i['excursion_phase'] for i in excursions])
+    assert ((phases < 1) & (offsets > 1)).any() and ((phases > 1) & (offsets > 1)).any()  # departing and returning
+    assert offsets.max() <= 6.+1e-9 and (offsets > 3).mean() > .2
+    for item in excursions:
+        np.testing.assert_allclose(item['seed_pos'][1:], 0., atol=1e-12)  # seed stays on the annotation
+        assert item['match_distance'] == pytest.approx(item['excursion_head_offset'], abs=1e-6)
+        from vesuvius.neural_tracing.fiber_follow.shared.state_labels import (
+            FOLLOWING, RECOVERABLE, REASON, UNKNOWN, connection_certified)
+        certified = connection_certified(item['plane_ab'][0], item['planes'][0], cfg.max_recovery_distance)
+        if certified:
+            assert item['supervision'] == (RECOVERABLE if item['match_distance'] > 3 else FOLLOWING)
+            assert item['geometry_valid']
+        else:
+            # A safe proposal may exist, but the annotated connection exceeds the commit limit.
+            assert item['supervision'] == UNKNOWN and item['supervision_reason'] == REASON['unsupported_connection']
+            assert not item['geometry_valid'] and item['confidence_valid']
+    # Startup draws are never given excursions.
+    early = D.make_sample(f, 800., False, sample_config(startup_shares=(0., 0., 1., 0.), excursion_probability=1.), rng)
+    assert not early['excursion']
 
 
-def test_sampling_fork_preserves_weights_resets_optimizer_and_retires_light_gt_options(tmp_path):
-    import copy
-    import torch
-    from types import SimpleNamespace
-    from test_path_geometry import source_checkpoint
-    from vesuvius.neural_tracing.fiber_follow.regression.model import build_model
-    from vesuvius.neural_tracing.fiber_follow.regression.sampling_fork import RETIRED_OPTIONS, trace_sampling_checkpoint
-    from vesuvius.neural_tracing.fiber_follow.regression.train import checkpoint_config, initialize_training_optimizer
-    original = source_checkpoint(tmp_path)
-    original['training_options'].update(gt_perturb_max_offset=.5, gt_perturb_max_angle_deg=2.,
-                                        no_history_prob=.15, short_history_prob=.4)  # the 81k run's values
-    before = copy.deepcopy(original['training_options'])
-    changed = trace_sampling_checkpoint(original, steps=40000, warmup=2000, no_history_prob=.05, short_history_prob=.1)
-    assert original['training_options'] == before  # the source checkpoint is not modified
-    assert changed['lr_restart_step'] == changed['step'] == 22000 and changed['optimizer']['state'] == {}
-    for section in ('model', 'ema'):
-        for name, value in original[section].items():
-            torch.testing.assert_close(changed[section][name], value, rtol=0, atol=0)
-    new = build_model(checkpoint_config(changed))
-    new.load_state_dict(changed['model'], strict=True)
-    opt, done, origin = initialize_training_optimizer(new, copy.deepcopy(new), SimpleNamespace(lr=.0001, reset_optimizer=False), changed)
-    assert (done, origin) == (22000, 22000) and not opt.state
-    options = changed['training_options']
-    assert not set(RETIRED_OPTIONS) & set(options)
-    assert {k for k in options if options[k] != before[k]} == {'steps', 'warmup', 'no_history_prob', 'short_history_prob'}
-    with pytest.raises(ValueError, match='beyond its source step'):
-        trace_sampling_checkpoint(original, steps=22000, warmup=0, no_history_prob=0., short_history_prob=0.)
+def test_ct_heading_failure_rejects_the_seed_without_annotation_fallback(monkeypatch):
+    from vesuvius.neural_tracing.fiber_follow.shared.heading import SeedHeadingError
+    f = curved_fiber()
+    item = D.make_sample(f, 50., False, sample_config(startup_shares=(1., 0., 0., 0.)), np.random.default_rng(0))
+    def unavailable(vol, pos, family):
+        raise SeedHeadingError('CT seed context has no identifiable sheet normal')
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.ct_seed_heading', unavailable)
+    with pytest.raises(SeedHeadingError):
+        D.resolve_trace_seed(item, vol=object())
+    assert 'seed_heading_fallback' not in item

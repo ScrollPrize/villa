@@ -11,10 +11,10 @@ from test_regression import batch, config, proposal_output
 from vesuvius.neural_tracing.fiber_follow.regression.supervision import point_correctness, loss_terms
 from vesuvius.neural_tracing.fiber_follow.regression.model import DirectFollower
 from vesuvius.neural_tracing.fiber_follow.regression.train import optimizer_update, prepare_training
-from vesuvius.neural_tracing.fiber_follow.shared.training_log import DirectTrainingInterval, format_training_log
+from vesuvius.neural_tracing.fiber_follow.shared.training_log import DirectTrainingInterval, SamplingLedger, format_training_log
 from vesuvius.neural_tracing.fiber_follow.shared.diag import plot_curves
 from vesuvius.neural_tracing.fiber_follow.shared.runloop import RunLog
-from label_fixtures import set_terminal, state_labels
+from label_fixtures import set_terminal, set_unknown, state_labels
 
 
 def test_individual_points_recover_after_wrong_point_and_ignore_confidence():
@@ -47,7 +47,7 @@ def test_point_masks_neighbors_departures_endpoints_and_nonfinite():
     data['plane_mask'] = torch.ones(7,4)
     data['plane_mask'][0,1] = 0
     data['plane_ab'][0,1] = float('nan')
-    data['identity_observable'] = torch.tensor([True,False,True,True,True,True,True])
+    set_unknown(data, 1)
     set_terminal(data, 2)
     data['plane_mask'][3,2:] = 0
     data['endpoint_known'][3] = 1
@@ -104,9 +104,9 @@ def test_every_optimizer_update_reports_point_counts_without_detailed_metrics():
     model = DirectFollower(config())
     data = batch(model.cfg)
     data['source'] = torch.tensor([0, 2])
-    data['gt_unperturbed'] = torch.tensor([True, False])
-    data['gt_perturbed'] = torch.tensor([False, False])
-    data['replay_correct_continuation'] = torch.tensor([False, True])
+    data['task_requested'] = torch.tensor([0, 6])
+    data['task_delivered'] = torch.tensor([0, 0])
+    data['task_fallback'] = torch.tensor([0, 1])
     data['ct_frame_rejected_batches'] = torch.tensor([3, 0])
     data['x'].update(ct_frame_source=torch.tensor([0, 2]),
                      ct_frame_energy=torch.tensor([.2, 0.]), ct_frame_gap=torch.tensor([.8, 0.]),
@@ -116,11 +116,15 @@ def test_every_optimizer_update_reports_point_counts_without_detailed_metrics():
     ema = copy.deepcopy(model)
     opt = torch.optim.SGD(model.parameters(), lr=.001)
     prepare_training(model, backend='eager')
-    metrics = optimizer_update(model,ema,opt,[data],1,.001,compute_metrics=False)
-    assert 'fixed_fraction' not in metrics
-    assert metrics['fresh_fraction'] == metrics['recent_fraction'] == .5
-    assert metrics['gt_unperturbed_fraction'] == metrics['replay_correct_continuation_fraction'] == .5
-    assert metrics['gt_perturbed_fraction'] == 0.
+    ledger = SamplingLedger()
+    metrics = optimizer_update(model,ema,opt,[data],1,.001,compute_metrics=False,ledger=ledger)
+    sampling = ledger.summary()['0']
+    assert sampling['requested_share'] == dict(fresh=.5, dagger_ordinary=.5)
+    assert sampling['delivered_share'] == dict(fresh=1.)
+    assert sampling['fallbacks'] == {'dagger_ordinary->fresh': 1}
+    assert sampling['sources'] == dict(fresh=1, replay=1)
+    assert sampling['positive_targets']+sampling['negative_targets'] == (
+        metrics['positive_confidence_targets']+metrics['negative_confidence_targets'])
     assert 'decisions' not in metrics
     assert metrics['refinement_attempts_mean'] == 1.
     assert metrics['refinement_attempts_sum'] == 2
@@ -135,9 +139,11 @@ def test_every_optimizer_update_reports_point_counts_without_detailed_metrics():
     summary = interval.summary()
     assert summary['ct_frame_count'] == 4 and summary['history_frame_count'] == 6
     row = dict(step=50, geometry=1., loss=1., lr=.001, interval=summary, n_future=4, tolerance=1.5,
+               sampling=ledger.summary(),
                interval_update_seconds=1., interval_data_seconds=.1, interval_samples_per_second=4.)
     printed = format_training_log(row)
-    assert 'simulated GT traces 50.0% / live-slot GT fallback 0.0% / correct continuation replay 50.0%' in printed
+    assert 'source 0: requested dagger_ordinary 50%, fresh 50% | delivered fresh 100%' in printed
+    assert "fallbacks {'dagger_ordinary->fresh': 1}" in printed
     assert 'current 2/4 fallbacks (0 transported, 2 deterministic); mean gap 0.400' in printed
     assert 'history 4/6 fallbacks (2 transported, 2 deterministic); mean gap 0.200' in printed
     assert sum(metrics[k] for k in ('point_correct_count','point_wrong_count','point_unknown_count')) == 8

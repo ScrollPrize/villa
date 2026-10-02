@@ -17,8 +17,12 @@ from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
 
 @pytest.mark.parametrize('selected', [[False]*4, [False, True, False, True], [True]*4])
 def test_sparse_targets_preserve_images_labels_and_sampling_feedback(tmp_path, monkeypatch, selected):
+    from types import SimpleNamespace
     from test_history_slabs import fake_ct
     fake_ct(monkeypatch)
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.oriented_seed_heading',
+                        lambda vol, pos, family, direction: np.asarray(direction))
+    vol = SimpleNamespace(spec=SimpleNamespace(ct_normalization=None))
     bank, fiber = make_bank(tmp_path)
     publish(tmp_path, [add_shard(tmp_path, 0, x=4., z_range=(20., 180.))])
     cfg = config(direction_inputs=True, fine=CropSpec(depth=40, width=25, behind=16, spacing=1.))
@@ -37,14 +41,14 @@ def test_sparse_targets_preserve_images_labels_and_sampling_feedback(tmp_path, m
         image = torch.linspace(0., 1., 8*crop.depth*crop.width**2).reshape(8, crop.depth, crop.width, crop.width)
         return image[None].repeat(len(rows), 1, 1, 1, 1)
     monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.regression.data.image_crop', images)
-    reference = full(copy.deepcopy(items), None)
+    reference = full(copy.deepcopy(items), vol)
     calls = []
     original = bank.candidates
     def tracked(item, *args, **kwargs):
         calls.append((item['source'], kwargs['rasterize']))
         return original(item, *args, **kwargs)
     monkeypatch.setattr(bank, 'candidates', tracked)
-    got = sparse(copy.deepcopy(items), None, decision_mask=selected)
+    got = sparse(copy.deepcopy(items), vol, decision_mask=selected)
     for key in reference['x']:
         if key == 'history_load_seconds':
             continue

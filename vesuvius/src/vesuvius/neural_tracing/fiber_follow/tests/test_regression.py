@@ -119,7 +119,6 @@ def test_microbatch_partition_keeps_objective_and_update():
     data['dense_mask'][0, 5:] = 0
     set_terminal(data, 1)
     data['source'] = torch.tensor([3, 0, 3])
-    data['bank_tail_length'] = torch.tensor([16., 0., 128.])
     def take(value, sl):
         return {k: take(v, sl) for k, v in value.items()} if isinstance(value, dict) else value[sl]
     averages = [copy.deepcopy(m) for m in (a, bmodel)]
@@ -130,11 +129,8 @@ def test_microbatch_partition_keeps_objective_and_update():
                optimizer_update(bmodel, averages[1], optimizers[1],
                                 [take(data, slice(0, 1)), take(data, slice(1, 3))], 1, .001)]
     assert results[0]['loss'] == pytest.approx(results[1]['loss'], rel=2e-6)
-    for result in results:
-        assert result['bank_wrong_continuation_fraction'] == pytest.approx(2/3)
-        assert result['bank_wrong_continuation_tail_mean'] == 72.
-        assert result['bank_wrong_continuation_tail_min'] == 16.
-        assert result['bank_wrong_continuation_tail_max'] == 128.
+    for key in ('positive_confidence_targets', 'negative_confidence_targets', 'confidence_terminal_states'):
+        assert results[0][key] == results[1][key]
     for p, q in zip(a.parameters(), bmodel.parameters()):
         torch.testing.assert_close(p, q, rtol=2e-5, atol=2e-7)
 
@@ -226,14 +222,13 @@ def test_training_compilation_emulates_eager_bf16_rounding(monkeypatch):
     parameters, keys = list(model.parameters()), list(model.state_dict())
     assert prepare_training(model) is model
     assert not hasattr(model, '_orig_mod')
-    assert [fn.__name__ for fn, _ in compiled] == [
-        'training_forward', 'score_candidates', 'loss_terms']
+    assert [fn.__name__ for fn, _ in compiled] == ['training_forward', 'loss_terms']
     assert all(options == dict(dynamic=False, fullgraph=True, options=dict(emulate_precision_casts=True))
                for _, options in compiled)
     assert list(model.parameters()) == parameters
     assert list(model.state_dict()) == keys
     assert prepare_training(model) is model
-    assert len(compiled) == 3  # Setup is idempotent.
+    assert len(compiled) == 2  # Setup is idempotent.
     assert not torch._inductor.config.emulate_precision_casts
 
 
@@ -391,12 +386,12 @@ def test_startup_sampling_and_history_diagnostics():
     from vesuvius.neural_tracing.fiber_follow.regression.diagnostics import decision_rows, summarize_decisions
     arc = np.arange(400, dtype=float)
     fiber = TracedFiber('line', np.c_[arc*0, arc*0, arc], arc, '')
-    sample = SampleConfig(no_history_prob=0., short_history_prob=1.)
+    sample = SampleConfig(startup_shares=(0., .5, .5, 0.))
     rng = np.random.default_rng(17)
     counts = [int(make_sample(fiber, 200., False, sample, rng)['hmask'].sum()) for _ in range(200)]
     assert all(1 <= n <= 32 for n in counts)
     assert 70 < sum(n <= 8 for n in counts) < 130
-    assert make_sample(fiber, 200., False, replace(sample, no_history_prob=1.), rng)['hmask'].sum() == 0
+    assert make_sample(fiber, 200., False, replace(sample, startup_shares=(1., 0., 0., 0.)), rng)['hmask'].sum() == 0
     # Grouping measures what the model actually receives, including replay.
     cfg = replace(config(), n_history=64)
     b = batch(cfg, 4)
@@ -416,11 +411,8 @@ def test_decision_metrics_score_actual_commits_censor_unknowns_and_pool_counts()
     cfg = config()
     b = batch(cfg, 5)
     b['dense_ab'].zero_()
-    b['gt_history'] = torch.zeros(5, 1, 3)
-    b['gt_history'][:, 0, 0] = torch.tensor([.5, 1.25, 1.75, 2.5, 0.])
-    b['gt_history_mask'] = torch.ones(5, 1)
+    b['match_distance'] = torch.tensor([.5, 1.25, 1.75, 2.5, 7.])
     set_terminal(b, 4)
-    b['gt_history_mask'][4] = 0
     b['dense_mask'][3] = 0
     points = torch.zeros(5, 4, 3)
     points[..., 2] = torch.arange(1, 5)
@@ -434,17 +426,18 @@ def test_decision_metrics_score_actual_commits_censor_unknowns_and_pool_counts()
                refinement_confidence=conf[:, None])
     rows = decision_rows(out, b, cfg, n_commit=4)
     stats = summarize_decisions(rows, 4)
-    all_stats = stats['by_drift']['all']
+    all_stats = stats['by_state']['all']
     assert all_stats['first_known'] == 4 and all_stats['first_correct'] == 2
     assert all_stats['commit_correct'] == 1
     assert all_stats['gate_0.5'] == dict(false_stops=1, accepted_known=3, accepted_wrong=2,
-                                      accepted_unknown=1, departed_continues=1)
-    assert stats['by_drift']['1-1.5']['gate_0.5']['accepted_wrong'] == 0
-    assert stats['by_drift']['>=3.5']['final_error_mean'] is None
+                                      accepted_unknown=1, terminal_continues=1)
+    assert stats['by_state']['terminal']['states'] == 1
+    assert stats['by_displacement']['d<=3']['states'] == 4 and stats['by_displacement']['d>6']['states'] == 1
+    assert stats['by_displacement']['d>6']['final_error_mean'] is None
     assert all_stats['final_error_mean'] == pytest.approx(all_stats['final_error_sum']/all_stats['final_error_count'])
     json.dumps(stats, allow_nan=False)
     points[0, 0, 0] = float('nan')
-    bad = summarize_decisions(decision_rows(out, b, cfg, n_commit=4), 4)['by_drift']['all']
+    bad = summarize_decisions(decision_rows(out, b, cfg, n_commit=4), 4)['by_state']['all']
     assert bad['recovery_blocked'] == 1 and bad['final_nonfinite_count'] > 0
     json.dumps(bad, allow_nan=False)
 
@@ -453,6 +446,8 @@ def test_monitor_fixtures_are_fixed_private_rng_and_exclude_other_splits(tmp_pat
     monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.regression.recovery.FiberVolume',lambda *a,**kw:None)
     monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.ct_tensor',
                         lambda vol,pos: np.outer(np.array([1., 0., 0.]), np.array([1., 0., 0.])))
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.oriented_seed_heading',
+                        lambda vol, pos, family, direction: np.asarray(direction))
     from vesuvius.neural_tracing.fiber_follow.shared.data import TracedFiber
     from vesuvius.neural_tracing.fiber_follow.regression.recovery import monitor_fixture
     arc = np.arange(300, dtype=float)
@@ -469,11 +464,12 @@ def test_monitor_fixtures_are_fixed_private_rng_and_exclude_other_splits(tmp_pat
     b, other = monitor_fixture(path, fibers, manifest, sample, spec, 1)
     assert digest == other and len(a) == 4 and set(a.fiber_idx) == {0}
     np.testing.assert_array_equal(a.hist, b.hist)
-    assert all(lo <= d < hi for d, (lo, hi) in zip(a.drift, [(0, 1), (1, 1.5), (1.5, 2), (2, 3.5)]))
+    from vesuvius.neural_tracing.fiber_follow.shared.recovery import FIXTURE_STRATA
+    assert all(lo <= d < hi for d, (lo, hi) in zip(a.match_distance, FIXTURE_STRATA))
     torch.testing.assert_close(torch_state, torch.get_rng_state())
     np.testing.assert_array_equal(numpy_state[1], np.random.get_state()[1])
     with pytest.raises(ValueError, match='settings changed'):
-        monitor_fixture(path, fibers, manifest, replace(sample, history_drift=3.), spec, 1)
+        monitor_fixture(path, fibers, manifest, replace(sample, excursion_amplitude=(3., 5.)), spec, 1)
     with pytest.raises(ValueError, match='monitor seeds'):
         monitor_fixture(path, fibers, dict(manifest, monitor=[dict(fiber=1, t=150., sign=1)]), sample, spec, 1)
 
@@ -502,6 +498,8 @@ def test_diagnostic_logging_preserves_training_update_and_rng():
 def test_slab_recovery_evaluator_preserves_float_inputs_and_observed_states(monkeypatch):
     monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.ct_tensor',
                         lambda vol,pos: np.outer(np.array([1., 0., 0.]), np.array([1., 0., 0.])))
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.oriented_seed_heading',
+                        lambda vol, pos, family, direction: np.asarray(direction))
     from vesuvius.neural_tracing.fiber_follow.shared.data import TracedFiber
     from vesuvius.neural_tracing.fiber_follow.shared.recovery import make_recovery_states, evaluate_recovery_states
     cfg = config()
@@ -509,7 +507,7 @@ def test_slab_recovery_evaluator_preserves_float_inputs_and_observed_states(monk
     fiber = TracedFiber('line', np.c_[arc*0, arc*0, arc], arc, '')
     sample = SampleConfig(crop=cfg.fine, n_history=cfg.n_history, recent_history_points=cfg.n_history,
                           n_future=cfg.n_future)
-    states = make_recovery_states([fiber], [dict(fiber=0, t=150., sign=1)], sample, dict(split='monitor'), None)
+    states = make_recovery_states([fiber], [dict(fiber=0, t=150., sign=1)], sample, dict(split='monitor', volume={}), None)
     inputs = batch(cfg, 1)
     inputs['x'] = {k: v.half() if v.is_floating_point() else v for k, v in inputs['x'].items()}
     class Model(torch.nn.Module):

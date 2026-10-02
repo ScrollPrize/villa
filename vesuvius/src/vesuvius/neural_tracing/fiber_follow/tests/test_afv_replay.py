@@ -27,7 +27,7 @@ def rounded_catalog(tmp_path, request):
 def endpoint_states(fibers):
     states = make_states(fibers[0], z=0)
     states.manifest = fiber_manifest(fibers)
-    states.provenance = {'volume': {'grid_scale': fibers.grid_scale}}
+    states.provenance = dict(states.provenance, volume={'grid_scale': fibers.grid_scale})
     states.t = np.array([fibers[0].s[-1]])
     return states
 

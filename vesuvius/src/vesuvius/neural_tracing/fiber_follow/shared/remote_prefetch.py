@@ -359,6 +359,23 @@ def _serve(*args):
         args[2].set()
 
 
+def attach_remote_prefetch(datasets, connections, queue_size, timeout, lookahead, workers):
+    """Start the async CT prefetch process and hand its client to every remote-CT dataset.
+
+    Datasets are FollowDataset-like (``vol_spec``, ``remote_prefetch``, ``remote_prefetch_lookahead``).
+    Returns (prefetcher or None, remote datasets). The caller owns the prefetcher's lifetime.
+    """
+    remote = [d for d in datasets if str(d.vol_spec.ct_zarr).startswith(('s3://', 'http://', 'https://'))]
+    if not connections or not remote:
+        return None, remote
+    prefetcher = RemotePrefetcher(connections, queue_size, timeout,
+                                  lookahead_slots=max(1, workers)*len(remote) if lookahead else 0)
+    for dataset in remote:
+        dataset.remote_prefetch = prefetcher.client
+        dataset.remote_prefetch_lookahead = lookahead
+    return prefetcher, remote
+
+
 class RemotePrefetcher:
     """Trainer-owned lifetime; DataLoader daemons never create child processes."""
     def __init__(self, connections=8, queue_size=512, timeout=120, *, lookahead_slots=0):

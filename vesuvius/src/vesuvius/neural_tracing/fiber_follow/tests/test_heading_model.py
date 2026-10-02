@@ -121,3 +121,51 @@ def test_cone_tilts_within_cap():
     d = np.array([0., 0., 1.])
     tilts = [np.degrees(np.arccos(np.clip(cone(d, rng, 25., 75.) @ d, -1, 1))) for _ in range(500)]
     assert max(tilts) <= 75+1e-6 and 10 < np.median(tilts) < 25
+
+
+def test_heading_batches_flow_through_the_follower_loader_pipeline(tmp_path):
+    from vesuvius.neural_tracing.fiber_follow.heading_model.data import Source, mixed_heading_states
+    vol = volume(tmp_path)
+    p = np.c_[np.arange(0., 41.), np.full(41, 20.), np.full(41, 20.)]
+    f = TracedFiber('ct', p, arclength(p), 'H')
+    cfg = HeadingConfig(patch=HeadingConfig().patch.__class__(depth=8, width=8, behind=2, spacing=1.), forward=6.)
+    source = Source('fixture', 'paris4', 1., vol.spec, [f], [f])
+    mixed, per_source = mixed_heading_states([source, source], cfg, HeadingSampling(), batch=4)
+    batch = next(iter(mixed))
+    assert batch['patch'].shape == (4, 1, 8, 8, 8) and batch['target'].shape == (4, 3)
+    assert batch['dataset_id'].shape == (4,) and per_source[0].remote_prefetch is None
+    torch.testing.assert_close(batch['target'].norm(dim=-1), torch.ones(4))
+
+
+def test_downsampled_patch_lands_where_the_follower_ct_would(tmp_path, monkeypatch):
+    """Level 1 holds 2x block means; on a linear field (trilinear-exact) its raw patch must equal the level-0 patch."""
+    from vesuvius.neural_tracing.fiber_follow.shared import crop_sampling
+    monkeypatch.setattr(crop_sampling, 'normalize_ct', lambda image, record: None)  # z-score would hide offsets/scale
+    from vesuvius.neural_tracing.fiber_follow.heading_model.model import model_inputs, patch_volume_spec
+    from vesuvius.neural_tracing.fiber_follow.shared.ct_normalization import ZSCORE_EPSILON, ZSCORE_METHOD, volume_key
+    from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume, FiberVolumeSpec
+    z, y, x = np.indices((42, 42, 42))
+    level0 = 2*(x+y+z)
+    level1 = level0.reshape(21, 2, 21, 2, 21, 2).mean((1, 3, 5))
+    for level, data in (('0', level0), ('1', level1)):
+        path = tmp_path/'ct'/level
+        path.mkdir(parents=True)
+        (path/'.zarray').write_text(json.dumps(dict(shape=list(data.shape), chunks=list(data.shape), dtype='|u1', fill_value=0,
+                                                    order='C', filters=None, compressor=None, zarr_format=2)))
+        (path/'0.0.0').write_bytes(data.astype(np.uint8).tobytes())
+    spec = FiberVolumeSpec(str(tmp_path/'fields'), ct_zarr=str(tmp_path/'ct'), ct_level=0, ct_grid_scale=4., inputs='ct',
+                           load_presence=False)
+    spec.ct_normalization = dict(method=ZSCORE_METHOD, volume=volume_key(spec), epsilon=ZSCORE_EPSILON)
+    fine, coarse = FiberVolume(spec), FiberVolume(patch_volume_spec(spec, 1))
+    assert coarse.input_scale == 1 and coarse.spec.ct_level == 1 and coarse.spec.ct_normalization['volume'].endswith('::1')
+    patch = HeadingConfig().patch.__class__(depth=6, width=6, behind=2, spacing=1.)
+    cfg0, cfg1 = HeadingConfig(patch=patch), HeadingConfig(patch=patch, ct_downsample_levels=1)
+    rng = np.random.default_rng(0)
+    positions = [10.5+rng.uniform(-1, 1, 3) for _ in range(4)]
+    frames = prior_frames([normalize(rng.normal(size=3)) for _ in range(4)], rng)
+    paths = [p[None] for p in positions]
+    expected, _ = model_inputs(fine, cfg0, positions, frames, paths)
+    actual, _ = model_inputs(coarse, cfg1, positions, frames, paths)
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=0)
+    unshifted, _ = model_inputs(coarse, cfg0, positions, frames, paths)  # ignoring the half-voxel offset is detectable
+    assert (unshifted-expected).abs().max() > 1e-2

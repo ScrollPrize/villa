@@ -94,7 +94,7 @@ def test_only_valid_ct_reads_remote_slabs_and_annotation_independence(monkeypatc
     assert len(calls) == 8 and first['history_slabs'].shape == (1,8,2,8,65,65)
     assert first['history_overlap'][0,0] == 0 and first['history_valid'][0,0]
     calls.clear()
-    other = load_slabs([dict(item, gt_history=np.full((32,3),np.nan), offtrack=True,
+    other = load_slabs([dict(item, gt_history=np.full((32,3),np.nan), terminal=1.,
                             reference_on_fiber=np.zeros(33))],None,cfg(direction_inputs=True))
     for key in ('history_slabs','history_valid','history_pose'):
         torch.testing.assert_close(first[key],other[key],rtol=0,atol=0)
@@ -118,12 +118,11 @@ def test_heatmap_follows_committed_wrong_turn_and_not_a_seed_chord(monkeypatch):
 
 
 def replay_for(item):
-    arrays=dict(fiber_idx=[0],t=[0.],reverse=[False],pos=item['pos'][None],frame=item['frame'][None],
-                hist=(item['hist_local'] @ item['frame'].T+item['pos'])[None],hmask=item['hmask'][None],
-                offtrack=[False],hard=[False],exploratory=[False],
-                seq_start=[0],seq_end=[len(item['observed_path'])],track_pos=item['observed_path'])
-    arrays.update({k:np.asarray([item[k]]) for k in ('seed_pos','seed_tangent','seed_age','seed_valid')})
-    return OnPolicyStates(manifest=[],**arrays)
+    from replay_fixtures import replay_states
+    row=dict(pos=item['pos'],frame=item['frame'],hist=item['hist_local'] @ item['frame'].T+item['pos'],
+             hmask=item['hmask'],seq_start=0,seq_end=len(item['observed_path']),
+             **{k:item[k] for k in ('seed_pos','seed_tangent','seed_age','seed_valid')})
+    return replay_states([],[row],track=item['observed_path'])
 
 
 def test_fresh_replay_inference_and_resume_inputs_identical(monkeypatch,tmp_path):
@@ -149,16 +148,14 @@ def test_fresh_replay_inference_and_resume_inputs_identical(monkeypatch,tmp_path
         loaded.observed_prefix(0)
 
 
-@pytest.mark.parametrize('loss', ['geometry','generated_confidence','candidate_confidence'])
+@pytest.mark.parametrize('loss', ['geometry','generated_confidence'])
 def test_both_heads_train_history_and_only_geometry_trains_generator(loss):
     torch.manual_seed(55)
     m=build_model(cfg(recurrent_refinement_steps=1))
     b=slab_batch(m.cfg,1)
     b['x']['history_slabs'].requires_grad_()
-    curve=torch.zeros(1,1,4,3);curve[...,2]=torch.arange(1,5)
-    out=m(b['x'],b['hist'],b['hmask'],candidates=curve)
-    value={'geometry':out['points'].square().mean(),'generated_confidence':out['hazard_logits'].sum(),
-           'candidate_confidence':out['candidate_hazard_logits'].sum()}[loss]
+    out=m(b['x'],b['hist'],b['hmask'])
+    value={'geometry':out['points'].square().mean(),'generated_confidence':out['hazard_logits'].sum()}[loss]
     value.backward()
     assert m.history_encoder.convolution[0].weight.grad.abs().sum()>0
     assert b['x']['history_slabs'].grad[0,:2].abs().sum()>0
@@ -205,7 +202,7 @@ def test_compiled_decisions_match_inference_with_all_history_gradients(token_onl
 def test_complete_synthetic_prefix_precedes_local_history_truncation():
     from test_identity import line_fiber
     fiber=line_fiber(1500.)
-    sample=SampleConfig(n_history=128,full_observed_history=True,no_history_prob=0.,short_history_prob=0.)
+    sample=SampleConfig(n_history=128,startup_shares=(0.,0.,0.,1.))
     lengths=[]
     for seed in range(20):
         item=make_sample(fiber,1000.,False,sample,np.random.default_rng(seed))
@@ -219,7 +216,7 @@ def test_complete_synthetic_prefix_precedes_local_history_truncation():
         n=int(mask.sum())
         np.testing.assert_allclose(item['hist_local'][:n] @ item['frame'].T+item['pos'],hist[:n],atol=1e-9)
     assert max(lengths)>128 and len(set(lengths))>10
-    no=make_sample(fiber,1000.,False,SampleConfig(full_observed_history=True,no_history_prob=1.),np.random.default_rng(3))
+    no=make_sample(fiber,1000.,False,SampleConfig(startup_shares=(1.,0.,0.,0.)),np.random.default_rng(3))
     assert len(no['observed_path'])==1 and not no['hmask'].any()
 
 

@@ -1,4 +1,4 @@
-"""Live states use inference commits, original-fiber labels and bounded feedback."""
+"""Live states use the operating policy's commits, the shared state contract and bounded feedback."""
 from dataclasses import replace
 from queue import Queue
 from types import SimpleNamespace
@@ -9,45 +9,67 @@ import torch
 
 from vesuvius.neural_tracing.fiber_follow.regression.live_continuation import LiveContinuation, LiveContinuationSource
 from vesuvius.neural_tracing.fiber_follow.regression.train import move_batch
-from vesuvius.neural_tracing.fiber_follow.shared.data import FollowDataset, SampleConfig, TracedFiber, ZBand, collate_targets, make_sample
+from vesuvius.neural_tracing.fiber_follow.shared.data import (
+    SOURCE, STARTUP_CATEGORIES, TASK, FollowDataset, SampleConfig, TaskBudget, TracedFiber, ZBand, collate_targets,
+    make_sample,
+)
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, arclength
 from vesuvius.neural_tracing.fiber_follow.shared.heading import orient_item
+from vesuvius.neural_tracing.fiber_follow.shared.policy import OperatingPolicy
+from vesuvius.neural_tracing.fiber_follow.shared.state_labels import (
+    FOLLOWING, REASON, RECOVERABLE, REPLAY_CLASS, TERMINAL,
+)
 from vesuvius.neural_tracing.fiber_follow.shared.trace import ModelTracer, TraceParams
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolumeSpec
+
+POLICY = OperatingPolicy(n_commit=16)
+
+
+class Values:
+    """In-process stand-in for a shared multiprocessing value."""
+    def __init__(self, *args):
+        self.value = 0
+
+    def get_lock(self):
+        from contextlib import nullcontext
+        return nullcontext()
 
 
 @pytest.fixture
 def setup(monkeypatch):
     import vesuvius.neural_tracing.fiber_follow.regression.live_continuation as module
     # Deterministic in-process queues for numeric tests; real IPC is tested below.
-    monkeypatch.setattr(module.mp, 'get_context', lambda: SimpleNamespace(
-        Queue=Queue, Value=lambda *a: SimpleNamespace(value=0)))
+    monkeypatch.setattr(module.mp, 'get_context', lambda: SimpleNamespace(Queue=Queue, Value=Values))
     monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.ct_tensor',
                         lambda vol, pos: np.diag([3., 1., .1]))
     z = np.arange(500.)
     p = np.c_[100.+.4*np.sin(z/20), np.full(len(z), 100.), z+100.]
     fiber = TracedFiber('live', p, arclength(p), 'V', endpoint_stop=(True, True))
-    cfg = SampleConfig(crop=CropSpec(depth=24, width=16, behind=8), n_history=32,
-                       n_future=16, full_observed_history=True)
-    ds = FollowDataset([fiber], FiberVolumeSpec('unused'), cfg, None, chunk=2,
-                       clean_fraction=.7, replay_continuation_fraction=.8,
-                       gt_perturb_probability=.25, prefer_replay_for_light_gt=True)
-    live = LiveContinuationSource(steps=(4, 4), n_commit=16)
+    cfg = SampleConfig(crop=CropSpec(depth=24, width=16, behind=8), n_history=32, n_future=16,
+                       startup_shares=(0., 0., 0., 1.), excursion_probability=0.)
+    ds = FollowDataset([fiber], FiberVolumeSpec('unused'), cfg, None, chunk=2)
+    live = LiveContinuationSource(policy=POLICY, steps=(4, 4), step=ds.step)
     ds.live_continuation = live
     vol = SimpleNamespace(shape=(1000,)*3)
     rng = np.random.default_rng(5)
-    item = make_sample(fiber, 100., False, cfg, rng)
-    item.update(fiber_ref=(0, 100., False), gt_unperturbed=True, source=0)
+    item = start(ds, fiber, 100., False, rng)
     orient_item(item, vol)
     return live, ds, vol, rng, item
 
 
-def proposal(live, item, step=100, confidence=None):
+def start(ds, fiber, t, reverse, rng):
+    item = make_sample(fiber, t, reverse, ds.cfg, rng)
+    item.update(fiber_ref=(0, t, reverse), source=SOURCE['fresh'], live_start='seed',
+                live_loop_start=len(item['observed_path'])-1)
+    return item
+
+
+def proposal(live, item, step=100, confidence=None, lateral=.2, drift=0.):
     meta = live.metadata(item)
     assert meta is not None
-    points = np.c_[np.full(16, .2), np.zeros(16), np.arange(1, 17)].astype(np.float32)
+    points = np.c_[lateral+drift*np.arange(1, 17), np.zeros(16), np.arange(1, 17)].astype(np.float32)
     wrapper = LiveContinuation.__new__(LiveContinuation)
-    wrapper.sources = [live]
+    wrapper.sources, wrapper.policy = [live], POLICY
     wrapper.feedback(dict(_live_states=[meta]),
         dict(points=torch.tensor(points[None], requires_grad=True),
              confidence=torch.tensor([confidence or [.9]*16])), step)
@@ -59,13 +81,13 @@ def proposal(live, item, step=100, confidence=None):
 def test_live_state_matches_next_inference_observation(setup, reverse):
     live, ds, vol, rng, item = setup
     if reverse:
-        item = make_sample(ds.fibers[0], 100., True, ds.cfg, rng)
-        item.update(fiber_ref=(0, 100., True), gt_unperturbed=True, source=0)
+        item = start(ds, ds.fibers[0], 100., True, rng)
         orient_item(item, vol)
     state = proposal(live, item, confidence=[.9]*7+[.1]*9)
     assert state['commit'] == 7
     result = live.advance(state, ds, vol, rng)
-    assert result['live_correct_continuation'] and result['live_depth'] == 1
+    assert result['live_continuation'] and result['live_depth'] == 1
+    assert result['supervision'] == FOLLOWING and not result['live_terminal']
 
     class Policy(torch.nn.Module):
         cfg = SimpleNamespace(n_future=16, max_recovery_distance=6.)
@@ -113,10 +135,10 @@ def test_chain_resets_at_limit_and_preserves_seed(setup):
     assert live.metadata(item) is None
 
 
-def test_low_confidence_and_recovery_limit_do_not_create_states(setup):
+def test_rejected_decisions_and_recovery_limit_never_advance(setup):
     live, ds, vol, rng, item = setup
     wrapper = LiveContinuation.__new__(LiveContinuation)
-    wrapper.sources = [live]
+    wrapper.sources, wrapper.policy = [live], POLICY
     for confidence, first in [(.1, 1.), (.9, 7.)]:
         points = torch.zeros(1, 16, 3)
         points[..., 2] = torch.arange(1, 17)
@@ -126,24 +148,40 @@ def test_low_confidence_and_recovery_limit_do_not_create_states(setup):
         assert live.seeds.empty() and live.chains.empty()
 
 
-def test_wrong_commit_gets_failure_labels_and_ends_chain(setup):
+def test_displaced_commit_continues_as_recoverable(setup):
+    live, ds, vol, rng, item = setup
+    state = proposal(live, item, lateral=0., drift=.22)
+    result = live.advance(state, ds, vol, rng)
+    assert result['supervision'] == RECOVERABLE and result['geometry_valid']
+    assert result['match_distance'] > 3 and not result['live_terminal']
+    # The chain keeps going from a safe recoverable state.
+    assert live.metadata(result) is not None
+    # A connection beyond the commit limit is delivered with proposal labels only and ends the chain.
+    state = proposal(live, item, lateral=0., drift=.3)
+    uncertain = live.advance(state, ds, vol, rng)
+    assert uncertain['supervision_reason'] == REASON['unsupported_connection']
+    assert not uncertain['geometry_valid'] and uncertain['confidence_valid'] and live.metadata(uncertain) is None
+
+
+def test_unreachable_commit_is_terminal_and_does_not_advance(setup):
     live, ds, vol, rng, item = setup
     state = proposal(live, item)
     state['points'][:, 0] = np.arange(1, 17)*.6
     result = live.advance(state, ds, vol, rng)
-    assert result['offtrack'] and result['live_failure']
-    assert not result['live_correct_continuation']
+    assert result['terminal'] and result['live_terminal'] and result['supervision'] == TERMINAL
+    assert result['supervision_reason'] == REASON['unreachable']
     assert live.metadata(result) is None
-    assert not result['plane_mask'].any()
+    assert not result['geometry_valid'] and result['confidence_valid']
 
 
-def test_bank_switch_is_failure_even_within_geometric_departure_radius(setup):
+def test_bank_switch_is_terminal_even_within_geometric_departure_radius(setup):
     live, ds, vol, rng, item = setup
     state = proposal(live, item)
     live.detector = SimpleNamespace(first_contact=lambda *a: dict(
         distance=.5, pos=item['pos'], bank_path='test', bank_run='test'))
     result = live.advance(state, ds, vol, rng)
-    assert result['offtrack'] and result['failure_kind'] == 1
+    assert result['supervision'] == TERMINAL and result['supervision_reason'] == REASON['switch']
+    assert result['match_distance'] <= 3
     assert live.metadata(result) is None
 
 
@@ -157,47 +195,77 @@ def test_holdout_rejected_before_ct_read(setup, monkeypatch):
 
 
 @pytest.mark.parametrize('annotated', [True, False])
-def test_annotation_end_stop_vs_unannotated_boundary(setup, annotated):
+def test_annotation_end_terminal_vs_unannotated_censoring(setup, annotated):
     live, ds, vol, rng, item = setup
     fiber = ds.fibers[0]
     ds.fibers[0] = replace(fiber, endpoint_stop=(False, annotated))
-    item = make_sample(ds.fibers[0], fiber.length-4, False, ds.cfg, rng)
-    item.update(fiber_ref=(0, fiber.length-4, False), source=0, gt_unperturbed=True)
+    item = start(ds, ds.fibers[0], fiber.length-4, False, rng)
     orient_item(item, vol)
     result = live.advance(proposal(live, item), ds, vol, rng)
     if annotated:
-        assert result['offtrack'] and result['failure_kind'] == 3
+        assert result['supervision'] == TERMINAL and result['supervision_reason'] == REASON['endpoint']
     else:
         assert result is None
 
 
-def test_live_slots_never_read_correct_replay_and_bootstrap_without_cache(setup):
+def replay_start(ds, item, travelled=40.):
+    """A recorded valid pre-excursion row whose prefix is the item's observed path."""
+    from replay_fixtures import replay_states
+    path = item['observed_path']
+    row = dict(t=item['trace_facts']['t'], pos=item['pos'], frame=item['frame'],
+               hist=item['hist_local'] @ item['frame'].T+item['pos'], hmask=item['hmask'],
+               seed_pos=path[0], seed_tangent=item['seed_tangent'], seed_age=item['seed_age'], seed_valid=True,
+               travelled=travelled, seq_start=0, seq_end=len(path), departure_distance=12., bad_run=1,
+               bad_run_start=travelled, replay_class=REPLAY_CLASS['pre_excursion'], event_id=0)
+    return replay_states(ds.fibers, [row], track=path, n_history=ds.cfg.n_history)
+
+
+def test_real_prefix_restart_preserves_seed_history_heading_and_events(setup, monkeypatch):
     live, ds, vol, rng, item = setup
-    # No saved replay at all: correct allocation still reserves live slots.
-    ds.replay_continuation_fraction = 1.
-    draw = ds.draw_replay(rng, force=True)
-    fallback = ds.replay_item(draw, rng)
-    assert fallback['live_requested'] and fallback['live_fallback']
-    assert fallback['gt_unperturbed']
-    light = ds.correct_continuation_item(rng)
-    assert light['live_light_slot'] and light['live_requested']
+    ds._set_replay([replay_start(ds, item)])
+    monkeypatch.setattr(ds, 'prepare', lambda value, rng: value)
+    class ReplayHalf:  # take the recorded-prefix half of live starts
+        def __init__(self, rng): self.rng = rng
+        def random(self): return .1
+        def __getattr__(self, name): return getattr(self.rng, name)
+    restart = ds.live_start(ReplayHalf(rng), [])
+    assert restart['live_start'] == 'replay' and restart['source'] == SOURCE['replay']
+    meta = live.metadata(restart)
+    np.testing.assert_array_equal(meta['observed_path'], item['observed_path'])
+    np.testing.assert_array_equal(meta['seed_pos'], item['observed_path'][0])
+    assert meta['loop_start'] == 0 and meta['travelled'] == 40.
+    assert meta['labeler']['departure_distance'] == 12. and meta['labeler']['bad_run'] == 1
+    assert meta['labeler']['t'] == pytest.approx(item['trace_facts']['t'])
+
+
+def test_live_slots_never_take_replay_task_slots(setup, monkeypatch):
+    live, ds, vol, rng, item = setup
+    ds._set_replay([replay_start(ds, item)])
+    monkeypatch.setattr(ds, 'prepare', lambda value, rng: value)
+    # A replay task slot is replay even when live states are queued.
+    live.publish(proposal(live, item, step=99))
+    replay = ds.task_item(TASK['dagger_pre_excursion'], rng, [])
+    assert replay['source'] == SOURCE['replay'] and not replay.get('live_requested')
+    assert not live.seeds.empty()
+    # A live slot resolves to a chain state, with the requested task preserved.
+    placeholder = ds.task_item(TASK['live'], rng, [])
+    assert placeholder['live_requested'] and placeholder['task_requested'] == TASK['live']
+    live.step.value = 100
+    result = live.resolve(placeholder, ds, vol, rng)
+    assert result['live_continuation'] and result['task_requested'] == TASK['live']
+    # Stale states are discarded and the start itself is delivered.
+    live.publish(proposal(live, item, step=10))
     live.step.value = 200
-    stale = proposal(live, item, step=100)
-    live.publish(stale)
-    assert live.resolve(fallback, ds, vol, rng) is fallback
-    state = proposal(live, item, step=199)
-    live.publish(state)
-    result = live.resolve(light, ds, vol, rng)
-    assert result['live_continuation'] and result['live_light_slot']
-    assert not result.get('replay_correct_continuation', False)
-    assert not result.get('live_fallback', False)
+    assert live.resolve(placeholder, ds, vol, rng) is placeholder
+    assert live.take_outcomes()['stale'] == 1
 
 
-def test_metadata_excludes_old_replay_and_synthetic_rows(setup):
+def test_metadata_excludes_replay_slots_synthetic_and_terminal_rows(setup):
     live, ds, vol, rng, item = setup
-    for source in (2, 3, 4, 5):
-        other = dict(item, source=source, gt_unperturbed=False)
-        assert live.metadata(other) is None
+    for source in (SOURCE['replay'], SOURCE['synthetic']):
+        other = {k: v for k, v in item.items() if k != 'live_start'}
+        assert live.metadata(dict(other, source=source)) is None
+    assert live.metadata(dict(item, supervision=TERMINAL)) is None
     cpu = dict(x={'a': torch.ones(1)}, _live_states=[live.metadata(item)])
     assert set(move_batch(cpu, 'cpu')) == {'x'}
 
@@ -210,7 +278,7 @@ def _publish_from_child(source, state):
 
 def test_feedback_queue_crosses_spawn_boundary():
     import multiprocessing as mp
-    source = LiveContinuationSource(capacity=2)
+    source = LiveContinuationSource(policy=POLICY, capacity=2)
     state = dict(depth=0, observed_path=np.array([[1., 2., 3.]]), source_step=123)
     process = mp.get_context().Process(target=_publish_from_child, args=(source, state))
     try:
@@ -241,6 +309,8 @@ def test_live_feedback_is_consumed_by_loader_next_batch(setup, monkeypatch):
     live, ds, vol, rng, item = setup
     import vesuvius.neural_tracing.fiber_follow.shared.data as module
     monkeypatch.setattr(module, 'FiberVolume', lambda *a, **kw: vol)
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.oriented_seed_heading',
+                        lambda vol, pos, family, direction: np.asarray(direction))
     class Builder:
         def __call__(self, items, volume):
             for row in items:
@@ -248,30 +318,30 @@ def test_live_feedback_is_consumed_by_loader_next_batch(setup, monkeypatch):
             return dict(collate_targets(items), hist=torch.tensor(np.stack([i['hist_local'] for i in items])),
                         hmask=torch.tensor(np.stack([i['hmask'] for i in items])))
     ds.batch_builder = Builder()
-    ds.clean_fraction = 0.
-    ds.replay_continuation_fraction = 1.
-    # Force precisely two continuation requests without independent source noise.
-    monkeypatch.setattr(ds, 'clean_requests', lambda rng: dict(decision=0, bank_following=0, memory_switch=0, recent=2))
+    ds.budget = TaskBudget.parse(['live=1', 'fresh=0', 'dagger_pre_excursion=0', 'dagger_recoverable=0',
+                                  'dagger_terminal=0', 'dagger_premature_stop=0', 'dagger_ordinary=0',
+                                  'synthetic_terminal=0'])
     live.step.value = 100
     stream = iter(ds)
     first = next(stream)
-    assert first['live_fallback'].all() and not first['live_continuation'].any()
+    assert first['live_requested'].all() and not first['live_continuation'].any()
+    assert (first['startup'] == STARTUP_CATEGORIES.index('seed_only')).all()  # no replay yet: seed-only starts
     wrapper = LiveContinuation.__new__(LiveContinuation)
-    wrapper.sources = [live]
+    wrapper.sources, wrapper.policy = [live], POLICY
     points = torch.zeros(2, 16, 3)
     points[..., 2] = torch.arange(1, 17)
     wrapper.feedback(first, dict(points=points, confidence=torch.ones(2, 16)), 100)
     second = next(stream)
-    assert second['live_continuation'].all() and not second['live_fallback'].any()
+    assert second['live_continuation'].all()
     assert second['live_depth'].tolist() == [1, 1]
-    assert not second['replay_correct_continuation'].any()
+    assert (second['source'] == SOURCE['live']).all() and (second['task_requested'] == TASK['live']).all()
 
 
 def test_mixed_source_feedback_never_crosses_volumes(setup):
     live, ds, vol, rng, item = setup
-    second = LiveContinuationSource(n_commit=16)
+    second = LiveContinuationSource(policy=POLICY)
     wrapper = LiveContinuation.__new__(LiveContinuation)
-    wrapper.sources = [live, second]
+    wrapper.sources, wrapper.policy = [live, second], POLICY
     points = torch.zeros(1, 16, 3)
     points[..., 2] = torch.arange(1, 17)
     wrapper.feedback(dict(_live_states=[live.metadata(item)], dataset_id=torch.ones(1, dtype=torch.long)),
@@ -280,35 +350,20 @@ def test_mixed_source_feedback_never_crosses_volumes(setup):
     assert second.seeds.get_nowait()['source_step'] == 321
 
 
-def test_failure_replay_allocation_remains_replay(setup, monkeypatch):
-    live, ds, vol, rng, item = setup
-    ds.replay_continuation_fraction = 0.
-    marker = object()
-    ds.recent_pools[5] = {0: marker}
-    monkeypatch.setattr(ds, 'draw_pool', lambda pool, source, band, rng: (source, band, pool[0], 0))
-    draw = ds.draw_replay(rng, force=True)
-    assert draw[1] == 5 and draw[2] is marker
-
-
-def test_live_depth_and_age_aggregate_in_training_log():
+def test_live_depth_and_terminal_rows_aggregate_in_training_log():
     from vesuvius.neural_tracing.fiber_follow.shared.training_log import DirectTrainingInterval
     log = DirectTrainingInterval()
-    log.add(dict(observed_states=10, supervised_states=10, live_continuation_fraction=.3,
-                 live_correct_continuation_fraction=.2, live_failure_fraction=.1,
-                 live_depth_sum=9., live_policy_age_sum=30.))
-    log.add(dict(observed_states=10, supervised_states=10, live_continuation_fraction=.1,
-                 live_correct_continuation_fraction=.1, live_depth_sum=4., live_policy_age_sum=20.))
+    log.add(dict(observed_states=10, supervised_states=10, live_rows=3, live_terminal_rows=1, live_depth_sum=9.))
+    log.add(dict(observed_states=10, supervised_states=10, live_rows=1, live_depth_sum=4.))
     row = log.summary()
-    assert row['live_continuation_fraction'] == pytest.approx(.2)
-    assert row['live_correct_continuation_fraction'] == pytest.approx(.15)
-    assert row['live_depth_sum'] == 13 and row['live_policy_age_sum'] == 50
+    assert row['live_rows'] == 4 and row['live_terminal_rows'] == 1 and row['live_depth_sum'] == 13
 
 
 def test_invalid_ct_context_falls_back_but_io_errors_propagate(setup, monkeypatch):
     from vesuvius.neural_tracing.fiber_follow.shared.heading import SeedHeadingError
     live, ds, vol, rng, item = setup
     live.step.value = 100
-    fallback = live.placeholder(ds, rng)
+    fallback = dict(item, live_requested=True, task_requested=TASK['live'])
     state = proposal(live, item)
     live.publish(state)
     def invalid(*args):

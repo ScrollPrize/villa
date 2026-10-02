@@ -168,8 +168,7 @@ def ct_frame(vol, pos, heading, previous=None, *, fallback=None, diagnostics=Non
 def reframe_item(item, frame):
     """Rotate every local geometric quantity while preserving world geometry."""
     rotation = np.asarray(item['frame']).T @ frame
-    for key in ('hist_local', 'gt_history', 'fut_local', 'end_local',
-                'candidate_points', 'identity_curve'):
+    for key in ('hist_local', 'gt_history', 'fut_local', 'end_local', 'identity_curve'):
         if key in item:
             item[key] = np.asarray(item[key]) @ rotation
     for key in ('plane_ab', 'dense_ab'):

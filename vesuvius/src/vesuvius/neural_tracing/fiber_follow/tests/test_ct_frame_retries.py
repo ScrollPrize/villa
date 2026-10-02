@@ -36,10 +36,10 @@ def dataset(monkeypatch, bad=(0, 2), lookahead=None, error=None):
         def lookahead(self, ct, windows, scope): events.append(('lookahead', [w[0][0] for w in windows]))
     ds = data_module.FollowDataset([SimpleNamespace(length=100.)], SimpleNamespace(ct_zarr='test-source'),
         SimpleNamespace(crop=None), None, chunk=2, batch_builder=Builder())
-    def plans(vol):
+    def plans(vol, windows):
         for index in count():
             # The valid first member gets oriented before the second can fail.
-            yield [dict(pos=np.array([index, member, 0.]), frame=np.eye(3)) for member in range(2)], 1, 1.
+            yield [dict(pos=np.array([index, member, 0.]), frame=np.eye(3)) for member in range(2)]
     ds._iter_plans = plans
     if lookahead is not None:
         ds.remote_prefetch = Client()
@@ -56,8 +56,6 @@ def test_rejects_whole_pair_advances_prefetch_and_resets_counter(monkeypatch, lo
     assert [b['hist'][:, 0, 0].tolist() for b in batches] == [[1., 1.], [3., 3.], [4., 4.]]
     assert [int(b['ct_frame_rejected_batches'].sum()) for b in batches[:2]] == [1, 1]
     assert 'ct_frame_rejected_batches' not in batches[2]
-    for b in batches:
-        assert b['decision_requested'].tolist() == [1., 1.]
     assert [n for name, n in events if name == 'build'] == list(range(5))
     if lookahead is not None:
         assert [n for name, n in events if name == 'ensure'] == list(range(5))

@@ -11,7 +11,7 @@ from vesuvius.neural_tracing.fiber_follow.regression.supervision import loss_ter
 
 
 @pytest.mark.parametrize('activation_checkpointing', [False, True])
-def test_fresh_stem_learns_through_compiled_geometry_and_candidate_scoring(activation_checkpointing):
+def test_fresh_stem_learns_through_compiled_geometry_and_scoring(activation_checkpointing):
     torch.manual_seed(21)
     model = build_model(cfg(encoder='patch4', token_only=True, stem_channels=32,
         stem_blocks=2, hidden=256, encoder_ffn=256, layers=2,
@@ -19,16 +19,13 @@ def test_fresh_stem_learns_through_compiled_geometry_and_candidate_scoring(activ
         recurrent_refinement_steps=1, activation_checkpointing=activation_checkpointing))
     prepare_training(model, backend='eager')
     batch = slab_batch(model.cfg)
-    candidates = torch.zeros(2, 1, model.cfg.n_future, 3)
-    candidates[..., 2] = model.planes
     opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
     for step in range(2):
         opt.zero_grad(set_to_none=True)
-        out = training_prediction(model, batch['x'], batch['hist'], batch['hmask'],
-                                  candidates, confidence_threshold=1.)
-        terms = loss_terms({k: v for k, v in out.items() if not k.startswith('candidate_')}, batch, model.cfg)
+        out = training_prediction(model, batch['x'], batch['hist'], batch['hmask'], confidence_threshold=1.)
+        terms = loss_terms(out, batch, model.cfg)
         loss = (terms['geometry_per_state']+.5*terms['confidence_per_state']).mean()
-        loss = loss+out['candidate_hazard_logits'].square().mean()
+        loss = loss+out['hazard_logits'].square().mean()
         loss.backward()
         for layer in (*model.decoder.layers, *model.confidence_scorer.layers):
             grad = layer.linear1.weight.grad

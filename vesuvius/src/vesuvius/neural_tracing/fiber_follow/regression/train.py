@@ -12,7 +12,8 @@ import numpy as np
 import torch
 
 from vesuvius.neural_tracing.fiber_follow.shared.data import (
-    DATA_POLICY, FollowDataset, OnPolicyStates, SampleConfig, TaskBudget, ZBand, fiber_manifest, load_fibers, split_fibers,
+    DATA_POLICY, FollowDataset, OnPolicyStates, SampleConfig, TaskBudget, ZBand, fiber_identities, fiber_manifest, load_fibers,
+    split_fibers,
 )
 from vesuvius.neural_tracing.fiber_follow.shared.experiment import read_manifest
 from vesuvius.neural_tracing.fiber_follow.shared.online import OnlineCollector
@@ -861,8 +862,10 @@ def main(argv=None):
         if resume['seed_manifest_sha256'] != manifest['sha256'] or resume['fiber_manifest'] != fiber_manifest(fibers):
             raise ValueError('Resume data/manifest changed')
     if initial:
-        # Source splits and fiber identities must match the weights' training data.
-        if initial['seed_manifest_sha256'] != manifest['sha256'] or initial['fiber_manifest'] != fiber_manifest(fibers):
+        # Fiber identities and source holdouts must match the weights' training data, so no
+        # held-out fiber was trained on. Geometry (load-time annotation repair) and the seeds
+        # placed on it may differ; the new run evaluates both checkpoints on its own seeds.
+        if fiber_identities(initial['fiber_manifest']) != fiber_identities(fiber_manifest(fibers)):
             raise ValueError('Initialization checkpoint used different fibers or evaluation splits')
         splits = lambda document: [{k: v for k, v in s.items() if k != 'weight'} for s in (document or {}).get('sources', [])]
         if splits(initial.get('dataset_config')) != splits(dataset_document):
@@ -999,7 +1002,10 @@ def main(argv=None):
         task_budget=budget.to_dict(), operating_policy=policy.to_dict(), collection=collector_settings(collector),
         fresh_geometry=('simulated traces: annotated seed, smooth lateral tracing error (OU) plus optional smooth '
                         'excursions, tracer heading/history/CT seed heading; labels from the shared state contract'),
-        simulated_traces=dict(trace_noise_sigma=sample.trace_noise_sigma, trace_noise_length=sample.trace_noise_length,
+        simulated_traces=dict(trace_noise='commit_v1', trace_noise_sigma=sample.trace_noise_sigma,
+                              trace_noise_length=sample.trace_noise_length, trace_noise_bulge=sample.trace_noise_bulge,
+                              trace_noise_bias=sample.trace_noise_bias, trace_noise_smoothing=sample.trace_noise_smoothing,
+                              excursion_rise_distribution='log-uniform',
                               startup_shares=sample.startup_shares, excursion_probability=sample.excursion_probability,
                               excursion_amplitude=sample.excursion_amplitude, excursion_rise=sample.excursion_rise),
         label_contract=dict(tolerance=sample.label_tolerance, max_recovery_distance=sample.max_recovery_distance),
@@ -1018,17 +1024,11 @@ def main(argv=None):
     remote_prefetch = None
     try:
         if args.remote_prefetch_connections:
-            sources = getattr(dataset,'datasets',[dataset])
-            remote_sources = [source for source in sources
-                if source.vol_spec.ct_zarr.startswith(('s3://','http://','https://'))]
-            if remote_sources:
-                from ..shared.remote_prefetch import RemotePrefetcher
-                remote_prefetch = RemotePrefetcher(args.remote_prefetch_connections,args.remote_prefetch_queue_size,
-                    args.remote_prefetch_timeout,
-                    lookahead_slots=max(1,args.workers)*len(remote_sources) if args.remote_prefetch_lookahead else 0)
-                for source in remote_sources:
-                    source.remote_prefetch = remote_prefetch.client
-                    source.remote_prefetch_lookahead = args.remote_prefetch_lookahead
+            from ..shared.remote_prefetch import attach_remote_prefetch
+            remote_prefetch, remote_sources = attach_remote_prefetch(getattr(dataset,'datasets',[dataset]),
+                args.remote_prefetch_connections, args.remote_prefetch_queue_size, args.remote_prefetch_timeout,
+                args.remote_prefetch_lookahead, args.workers)
+            if remote_prefetch is not None:
                 progress(f'Remote CT prefetch: {args.remote_prefetch_connections} concurrent fetches, '
                          f'{args.remote_prefetch_queue_size} requests per priority queue, '
                          f'{args.remote_prefetch_lookahead} future batch plans per remote source/worker, separate async process')

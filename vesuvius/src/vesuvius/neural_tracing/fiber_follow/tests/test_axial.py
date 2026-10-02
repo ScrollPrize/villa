@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from test_identity import config,batch,forward,line_fiber
+from label_fixtures import set_unknown
 from vesuvius.neural_tracing.fiber_follow.regression.model import (
     ARCHITECTURE,DirectConfig,DirectFollower,AxialBlock,ResidualConv,feature_grid,sample_features,TOKEN_OFFSET,TOKEN_STRIDE,
 )
@@ -93,7 +94,7 @@ def test_checkpointing_preserves_outputs_and_gradients(encoder):
 
 def test_unobservable_identity_has_no_supervision_gradient():
     m=DirectFollower(config());data=batch(m.cfg,1)
-    data['identity_observable']=torch.zeros(1,dtype=torch.bool)
+    set_unknown(data,0)
     out=forward(m,data);terms=loss_terms(out,data,m.cfg)
     for name in ('geometry_per_state','confidence_per_state'):
         assert terms[name].eq(0).all()

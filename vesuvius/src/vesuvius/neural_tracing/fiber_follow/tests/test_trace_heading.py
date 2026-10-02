@@ -43,54 +43,33 @@ class RecordingTracer(ModelTracer):
         return torch.zeros(len(pos), 1)
 
 
-@pytest.mark.parametrize('policy', [dict(explore_calls=5), dict(stop_patience=3)])
-def test_failed_steps_preserve_crop_frame_and_short_recovery_cannot_steer(policy):
+def test_rejected_decision_stops_immediately_and_is_observed_without_a_forced_commit():
     predictions = [
         ([[0., 0., 1.], [1., 0., 2.]], [.9, .9]),
-        ([[3., 0., 1.], [3., 0., 2.]], [.1, .1]),  # Forced lateral recovery step.
-        ([[-2., 1., 1.], [-2., 1., 2.]], [.1, .1]),  # Another failure, same frame.
-        ([[0., 2., 1.], [0., 5., 2.]], [.9, .1]),  # Too short to replace the retained heading.
-        ([[0., 0., 1.], [0., 0., 2.]], [.1, .1]),
+        ([[3., 0., 1.], [3., 0., 2.]], [.1, .1]),  # Rejected after refinement: the trace ends here.
+        ([[0., 0., 1.], [0., 0., 2.]], [.9, .9]),
     ]
-    tracer = RecordingTracer(predictions, **policy)
+    tracer = RecordingTracer(predictions)
     states = []
-
-    def capture(index, state):
-        states.append(state)
-        return len(states) < len(predictions)
-
     try:
-        seed = np.array([100., 100., 100.])
-        original_frame = transverse_frame(np.diag([0., 1., 0.]),np.array([1., 1., 1.]))
-        direction = original_frame @ normalize(np.array([1., 0., 1.]))
-        history = seed-np.arange(14., 0., -1)[:, None]*direction
-        tracer.trace(seed[None], np.array([[1., 1., 1.]]), histories=[history], on_decision=capture)
+        seed = np.array([[100., 100., 100.]])
+        paths, reasons = tracer.trace(seed, np.array([[1., 1., 1.]]), on_decision=lambda i, s: states.append(s))
     finally:
         tracer.close()
-
-    assert [s['n_commit'] for s in states] == [2, 0, 0, 1, 0]
-    original = states[0]['frame']
-    trusted = states[1]['frame']
-    assert not np.allclose(trusted, original)  # Preserve the pre-failure frame, not the seed frame.
-    for j in (1, 2):
-        np.testing.assert_array_equal(states[j+1]['frame'], states[j]['frame'])
-        np.testing.assert_allclose(states[j+1]['pos'],
-                                   states[j]['pos'] + trusted @ predictions[j][0][0])
-    np.testing.assert_array_equal(states[4]['frame'], trusted)
-    for j in (2, 3):
-        assert states[j]['heading_start'] == len(states[j]['observed_path'])
-    assert states[4]['heading_start'] == len(states[4]['observed_path'])-1
-    # Verify the frame supplied to the next model observation, not just metadata.
-    for (_, frames), state in zip(tracer.inputs, states):
-        np.testing.assert_array_equal(frames[0], state['frame'])
+    assert reasons == ['confidence'] and len(states) == 2 and len(tracer.inputs) == 2
+    assert [s['n_commit'] for s in states] == [2, 0] and states[1]['would_stop']
+    # The rejected proposal is retained in the observed decision but never committed.
+    np.testing.assert_array_equal(states[1]['points'], np.asarray(predictions[1][0], np.float32))
+    np.testing.assert_array_equal(paths[0][-1], states[1]['pos'])
+    assert not hasattr(TraceParams(), 'explore_calls') and not hasattr(TraceParams(), 'stop_patience')
 
 
-@pytest.mark.parametrize('policy,first,reason', [
-    ({}, [3., 0., 1.], 'confidence'),
-    (dict(explore_calls=5), [7., 0., 1.], 'recovery_limit'),
+@pytest.mark.parametrize('first,confidence,reason', [
+    ([3., 0., 1.], .1, 'confidence'),
+    ([7., 0., 1.], .9, 'recovery_limit'),
 ])
-def test_failed_steps_still_respect_stopping_and_recovery_limits(policy, first, reason):
-    tracer = RecordingTracer([( [first, [0., 0., 2.]], [.1, .1])], **policy)
+def test_rejections_respect_stopping_and_recovery_limits(first, confidence, reason):
+    tracer = RecordingTracer([([first, [0., 0., 2.]], [confidence, confidence])])
     seed = np.array([[100., 100., 100.]])
     try:
         paths, reasons = tracer.trace(seed, np.array([[0., 0., 1.]]))
@@ -132,25 +111,11 @@ def test_single_lateral_correction_cannot_replace_an_established_axis():
     assert turn < 6.  # Last-segment replacement would turn by 55 degrees.
 
 
-def test_forced_points_and_recovery_connector_never_enter_trusted_fit():
-    fail = ([[3., 0., 1.], [3., 0., 2.]], [.1, .1])
-    recover = ([[-3., 0., 1.], [-3., 0., 2.]], [.9, .1])
-    step = ([[1., 0., 1.], [1., 0., 2.]], [.9, .1])
-    rows = record([fail, fail, recover]+[step]*10, explore_calls=20)
-    for row in rows[:12]:
-        np.testing.assert_array_equal(row['frame'], rows[0]['frame'])
-    expected = rows[0]['frame'] @ normalize(np.array([1., 0., 1.]))
-    np.testing.assert_allclose(rows[12]['frame'][:,2], expected, atol=1e-12)
-    start = rows[3]['heading_start']
-    np.testing.assert_array_equal(rows[12]['observed_path'][start], rows[3]['pos'])
-
-
 def test_resume_preserves_the_trusted_boundary_and_next_heading():
-    fail = ([[3., 0., 1.], [3., 0., 2.]], [.1, .1])
     step = ([[1., 0., 1.], [1., 0., 2.]], [.9, .1])
-    predictions = [fail]+[step]*12
-    rows = record(predictions, stop_patience=2)
-    resumed = record(predictions[7:], initial=rows[7], stop_patience=2)
+    predictions = [step]*13
+    rows = record(predictions)
+    resumed = record(predictions[7:], initial=rows[7])
     for expected, actual in zip(rows[7:], resumed):
         np.testing.assert_array_equal(actual['frame'], expected['frame'])
         np.testing.assert_array_equal(actual['pos'], expected['pos'])

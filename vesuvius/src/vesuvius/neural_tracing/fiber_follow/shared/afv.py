@@ -9,6 +9,7 @@ import sqlite3
 
 import numpy as np
 
+from .annotation_repair import ANNOTATION_REPAIR, repair_kinks
 from .data import TracedFiber
 from .geometry import arclength, interp_at
 
@@ -91,7 +92,8 @@ class AFVFibers(Sequence):
         # A compact immutable collection manifest avoids hashing/expanding all
         # polylines each time a replay cache is opened by a loader worker.
         return [dict(kind='afv_catalog_v1', sha256=self.sha256, grid_scale=self.grid_scale,
-                     fiber_count=len(self), fiber_ids_sha256=hashlib.sha256(ids.tobytes()).hexdigest())]
+                     fiber_count=len(self), fiber_ids_sha256=hashlib.sha256(ids.tobytes()).hexdigest(),
+                     annotation_repair=ANNOTATION_REPAIR)]
 
     def __getitem__(self, index):
         if isinstance(index, slice):
@@ -117,8 +119,10 @@ class AFVFibers(Sequence):
             # Preserve corners while bounding nearest-vertex clearance error.
             from ..regression.neighbor_mining import dense_line
             points = dense_line(points, 1.)
+            points, repairs = repair_kinks(points, arclength(points))
             self._cache[index] = TracedFiber(name, points, arclength(points), family,
-                endpoint_stop=(False, False), source_hash=f'{self.metadata["uuid"]}:{fiber_id}')
+                endpoint_stop=(False, False), source_hash=f'{self.metadata["uuid"]}:{fiber_id}',
+                kink_repairs=len(repairs))
         self._cache.move_to_end(index)
         result = self._cache[index]
         while len(self._cache) > self.cache_size:

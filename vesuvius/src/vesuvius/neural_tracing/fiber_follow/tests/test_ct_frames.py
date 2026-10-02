@@ -46,19 +46,18 @@ def test_weak_ct_transports_roll_or_uses_deterministic_frame(monkeypatch):
     assert quality['source']==2
 
 
-def test_training_rotation_preserves_world_history_candidates_and_supervision():
+def test_training_rotation_preserves_world_history_and_supervision():
     image,_=sheet();vol=CTOnlyVolume(image)
     z=np.linspace(4,44,81)
     p=np.c_[24+np.sin(z/12),np.full(len(z),24.),z]
     fiber=TracedFiber('test',p,arclength(p),'V')
-    cfg=SampleConfig(n_history=8,n_future=4,lateral_sigmas=(0.,),lateral_probs=(1.,),
-        angle_sigmas_deg=(0.,),angle_probs=(1.,),history_drift=0.,history_jitter=0.,history_wobble=0.,no_history_prob=0.)
+    cfg=SampleConfig(n_history=8,n_future=4,startup_shares=(0.,0.,0.,1.),excursion_probability=0.,
+                     trace_noise_sigma=(0.,0.))
     item=make_sample(fiber,20.,False,cfg,np.random.default_rng(4))
-    item['candidate_points']=np.stack([item['fut_local']]*4)
     before=deepcopy(item)
     orient_item(item,vol)
     assert item['frame_policy']==FRAME_POLICY
-    for key in ('hist_local','gt_history','fut_local','end_local','candidate_points'):
+    for key in ('hist_local','gt_history','fut_local','end_local'):
         np.testing.assert_allclose(item[key]@item['frame'].T,before[key]@before['frame'].T,atol=2e-6)
     expected=continuation_targets(fiber,20.,False,item['pos'],item['frame'],cfg)
     for key in ('plane_ab','dense_ab','plane_mask','dense_mask','gt_history','fut_local','end_local'):
@@ -78,9 +77,8 @@ def test_failed_decisions_never_reestimate_roll_but_accepted_short_steps_do(monk
         return np.outer(n,n)
     monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.shared.heading.ct_tensor',changing_normal)
     fail=([[0.,0.,1.],[0.,0.,2.]],[.1,.1])
-    rows=record([fail]*3,explore_calls=3)
-    assert len(calls)==1
-    for row in rows:np.testing.assert_array_equal(row['frame'],rows[0]['frame'])
+    rows=record([fail]*3)
+    assert len(calls)==1 and len(rows)==1  # a rejected decision stops; nothing is re-estimated
     calls.clear()
     accept=([[0.,0.,1.],[0.,0.,2.]],[.9,.1])
     rows=record([accept]*3)

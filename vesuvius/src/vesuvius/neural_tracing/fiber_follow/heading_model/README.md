@@ -66,6 +66,20 @@ The run directory `output/<name>/` holds:
 - `ckpt_STEP.pt` checkpoints;
 - `best.pt`, the lowest held-out p90 off-axis distance over the crop extent.
 
+`model.ct_downsample_levels: 1` (the default config, run `heading_model_v2`) samples the patch from the CT pyramid
+level above the follower's: a 2x block mean, with a half-voxel shift so the patch lands where the follower's CT would.
+The patch spacing is 2.5 native voxels, so level 1 loses little, and it reads 8x fewer bytes. Level-0 reads were disk
+bound: each memory-mapped page fault pulled in a whole 2 MB chunk, 8-11 MB of reads per sample. Build level 1 locally
+from the cached level-0 chunks once; it is bit-identical to the remote pyramid, takes about 2 minutes and needs no
+download:
+
+```bash
+python scripts/downsample_ct_cache.py --dataset-config configs/mixed_ct_datasets_paris50.json
+```
+
+Chunks whose level-0 children are not all cached are fetched by the remote prefetcher. The notes below describe the
+level-0 loader.
+
 The loader is CT-read bound and the GPU is mostly idle. One worker builds a 128-state batch in about 0.5 s for
 Paris 4 (local), about 1 s for 0175A and about 2.7 s for 1447 (S3 via the local chunk cache). Ten workers give
 roughly 1,000 samples/s, so the default run takes about an hour. More `workers` or a larger `worker_cache_gb`

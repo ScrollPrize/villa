@@ -103,6 +103,68 @@ def trace_bidirectional(tracer: ModelTracer, vol: FiberVolume, seeds_grid_xyz: n
     return out
 
 
+def export_seeds(tracer, vol, seeds, families, out, *, grid_scale, batch, min_length, dedupe, cp_every, provenance):
+    """Trace seed batches and write fibers plus one status record per seed (``seeds.json``).
+
+    Valid polylines are exported regardless of length unless ``min_length`` (base voxels)
+    asks otherwise. Seed-only results, unavailable CT orientation, duplicates and filtered
+    traces keep their seed identity and reasons.
+    """
+    g = grid_scale
+    os.makedirs(out, exist_ok=True)
+    meta = {"username": "fiber_follow", "fiber_manifest": ""}
+    written, tree_pts = [], np.zeros((0, 3))
+    statuses = []
+    for b in range(0, len(seeds), batch):
+        chunk = np.stack(seeds[b : b + batch])
+        chunk_families = np.asarray(families)[b : b + batch]
+        record = lambda index, status, **extra: statuses.append(dict(
+            seed=int(b+index), position_base=[float(v) for v in chunk[index]*g], family=str(chunk_families[index]),
+            status=status, **extra))
+        keep = np.ones(len(chunk), bool)
+        if len(tree_pts):
+            d, _ = cKDTree(tree_pts).query(chunk)
+            keep = d * g > dedupe
+            for index in np.flatnonzero(~keep):
+                record(int(index), 'skipped_duplicate_seed', distance_base=float(d[index]*g))
+        traced = trace_bidirectional(tracer, vol, chunk[keep], chunk_families[keep]) if keep.any() else []
+        for index, (poly, reasons) in zip(np.flatnonzero(keep), traced):
+            if poly is None:
+                record(int(index), 'unavailable', reason=reasons)
+                continue
+            reasons = list(reasons)
+            if len(poly) < 2:
+                # Export requires a valid polyline; a seed-only result keeps its identity and reasons.
+                record(int(index), 'seed_only', stop_reasons=reasons)
+                continue
+            base = resample_polyline(poly * g, g)  # 1 grid voxel spacing, like VC3D traces
+            L = arclength(base)[-1]
+            if L < min_length:
+                record(int(index), 'filtered_min_length', length_base=float(L), stop_reasons=reasons)
+                continue
+            if len(tree_pts):
+                d, _ = cKDTree(tree_pts).query(poly)
+                if np.mean(d * g < dedupe) > 0.5:  # mostly re-traces an existing fiber
+                    record(int(index), 'skipped_duplicate_trace', length_base=float(L), stop_reasons=reasons)
+                    continue
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")[:-3]
+            name = f"fiber_follow_{stamp}_{len(written):06d}.json"
+            obj = make_fiber_json(base, cp_every, dict(meta, filename=name, started_at=stamp, sequence=len(written),
+                                                       fiber_follow={"stop_reasons": reasons,
+                                                                     "seed_family": str(chunk_families[index]),
+                                                                     "seed_heading_policy": SEED_HEADING_POLICY,
+                                                                     "heading_policy": TRACE_HEADING_POLICY,
+                                                                     "frame_policy": FRAME_POLICY, **provenance}))
+            with open(os.path.join(out, name), "w") as fh:
+                json.dump(obj, fh)
+            written.append(name)
+            record(int(index), 'exported', file=name, length_base=float(L), stop_reasons=reasons)
+            tree_pts = np.concatenate([tree_pts, poly], 0)
+    with open(os.path.join(out, "seeds.json"), "w") as fh:
+        json.dump(dict(min_length_base=min_length, seeds=statuses, **provenance), fh, indent=1)
+    return written, statuses
+
+
 def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer):
     ap = argparse.ArgumentParser()
     ap.add_argument("--checkpoint", required=True)
@@ -157,64 +219,16 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer):
     if len(families) != len(seeds):
         raise SystemExit('--family must be supplied once, or once per seed')
 
-    os.makedirs(args.out, exist_ok=True)
-    meta = {"username": "fiber_follow", "fiber_manifest": ""}
-    written, tree_pts = [], np.zeros((0, 3))
-    statuses = []
     t0 = time.time()
-    for b in range(0, len(seeds), args.batch):
-        chunk = np.stack(seeds[b : b + args.batch])
-        chunk_families = families[b : b + args.batch]
-        record = lambda index, status, **extra: statuses.append(dict(
-            seed=int(b+index), position_base=[float(v) for v in chunk[index]*g], family=str(chunk_families[index]),
-            status=status, **extra))
-        keep = np.ones(len(chunk), bool)
-        if len(tree_pts):
-            d, _ = cKDTree(tree_pts).query(chunk)
-            keep = d * g > args.dedupe
-            for index in np.flatnonzero(~keep):
-                record(int(index), 'skipped_duplicate_seed', distance_base=float(d[index]*g))
-        traced = trace_bidirectional(tracer, vol, chunk[keep], chunk_families[keep]) if keep.any() else []
-        for index, (poly, reasons) in zip(np.flatnonzero(keep), traced):
-            if poly is None:
-                record(int(index), 'unavailable', reason=reasons)
-                continue
-            reasons = list(reasons)
-            if len(poly) < 2:
-                # Export requires a valid polyline; a seed-only result keeps its identity and reasons.
-                record(int(index), 'seed_only', stop_reasons=reasons)
-                continue
-            base = resample_polyline(poly * g, g)  # 1 grid voxel spacing, like VC3D traces
-            L = arclength(base)[-1]
-            if L < args.min_length:
-                record(int(index), 'filtered_min_length', length_base=float(L), stop_reasons=reasons)
-                continue
-            if len(tree_pts):
-                d, _ = cKDTree(tree_pts).query(poly)
-                if np.mean(d * g < args.dedupe) > 0.5:  # mostly re-traces an existing fiber
-                    record(int(index), 'skipped_duplicate_trace', length_base=float(L), stop_reasons=reasons)
-                    continue
-            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")[:-3]
-            name = f"fiber_follow_{stamp}_{len(written):06d}.json"
-            obj = make_fiber_json(base, args.cp_every, dict(meta, filename=name, started_at=stamp,
-                                                             sequence=len(written),
-                                                             fiber_follow={"stop_reasons": reasons,
-                                                                           "seed_family": str(chunk_families[index]),
-                                                                           "seed_heading_policy": SEED_HEADING_POLICY,
-                                                                           "heading_policy": TRACE_HEADING_POLICY,
-                                                                           "frame_policy": FRAME_POLICY,
-                                                                           "operating_policy": policy.to_dict(),
-                                                                           "sampling_seed": args.sampling_seed,
-                                                                           "sampler_mode": getattr(model.cfg, 'sampler_mode', 'zero'),
-                                                                           "checkpoint": os.path.abspath(args.checkpoint)}))
-            with open(os.path.join(args.out, name), "w") as fh:
-                json.dump(obj, fh)
-            written.append(name)
-            record(int(index), 'exported', file=name, length_base=float(L), stop_reasons=reasons)
-            tree_pts = np.concatenate([tree_pts, poly], 0)
-    with open(os.path.join(args.out, "seeds.json"), "w") as fh:
-        json.dump(dict(operating_policy=policy.to_dict(), min_length_base=args.min_length,
-                       checkpoint=os.path.abspath(args.checkpoint), seeds=statuses), fh, indent=1)
+    provenance = {"operating_policy": policy.to_dict(), "sampling_seed": args.sampling_seed,
+                  "sampler_mode": getattr(model.cfg, 'sampler_mode', 'zero'),
+                  "checkpoint": os.path.abspath(args.checkpoint)}
+    try:
+        written, statuses = export_seeds(tracer, vol, seeds, families, args.out, grid_scale=g, batch=args.batch,
+                                         min_length=args.min_length, dedupe=args.dedupe, cp_every=args.cp_every,
+                                         provenance=provenance)
+    finally:
+        tracer.close()
     n_skipped = sum(s['status'] != 'exported' for s in statuses)
     dt = time.time() - t0
     print(json.dumps(dict(seeds=len(seeds), written=len(written), skipped=n_skipped, seconds=round(dt, 2),

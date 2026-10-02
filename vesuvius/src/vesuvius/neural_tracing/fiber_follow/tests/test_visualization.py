@@ -12,11 +12,11 @@ from vesuvius.neural_tracing.fiber_follow.shared.data import SampleConfig
 from vesuvius.neural_tracing.fiber_follow.shared.reference import observed_path
 
 
-@pytest.mark.parametrize('version', [5, 6, 7])
-def test_replay_rejects_pre_ct_normal_versions(tmp_path,version):
+def test_replay_rejects_caches_from_other_pipelines(tmp_path):
     import json
-    (tmp_path/'metadata.json').write_text(json.dumps(dict(version=version)))
-    with pytest.raises(ValueError,match='Incompatible replay version'):
+    (tmp_path/'metadata.json').write_text(json.dumps(dict(fibers=[], provenance=dict(step=0, volume={}))))
+    np.save(tmp_path/'offtrack.npy', np.zeros(1, bool))
+    with pytest.raises(ValueError,match='lacks schema fields'):
         replay_item(tmp_path,0,[],None)
 
 
@@ -43,7 +43,7 @@ def test_capture_preserves_refinement_outputs_and_masked_attention(empty):
         arrays, report = analyze(model, inputs['x'], inputs['hist'], inputs['hmask'], captured, 1., model.cfg.n_future)
         assert report['metrics']['baseline']['max_path_shift'] == 0
         # Removing generator history cannot change scores of an identical fixed curve.
-        np.testing.assert_array_equal(arrays['baseline_candidate_confidence'], arrays['no_generator_history_candidate_confidence'])
+        np.testing.assert_array_equal(arrays['baseline_fixed_curve_confidence'], arrays['no_generator_history_fixed_curve_confidence'])
 
 
 def test_capture_restores_methods_after_exception():

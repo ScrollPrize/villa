@@ -44,7 +44,7 @@ def validate(directory):
         np.testing.assert_allclose(confidence, expected.numpy(), rtol=2e-6, atol=1e-7)
         assert (np.diff(confidence) <= 0).all()
         np.testing.assert_allclose(confidence[-1], metric['last_confidence'])
-        np.testing.assert_allclose(b[name+'_candidate_confidence'][0, -1], metric['fixed_curve_last_confidence'])
+        np.testing.assert_allclose(b[name+'_fixed_curve_confidence'][-1], metric['fixed_curve_last_confidence'])
     validate_attention(a)
     for i, stats in enumerate(r['encoder_blocks']):
         before = a['encoder_input' if i == 0 else f'axial_{i-1}'].astype(np.float64)

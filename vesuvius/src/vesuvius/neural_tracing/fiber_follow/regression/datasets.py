@@ -125,6 +125,8 @@ def load_primary_dataset(document, spec):
 
     Existing Paris 4 neighbor shards only support the legacy training parents.
     Their old mining band remains provenance, not a training sampling filter.
+    Fibers whose annotation doubles back are kept out of training; the held-out
+    split is decided before that and does not change.
     """
     from ..shared.dataset_split import heldout_ids
     from ..shared.experiment import read_manifest
@@ -134,7 +136,7 @@ def load_primary_dataset(document, spec):
     reserved = {f['name'] for f in legacy['fibers']}
     extra = heldout_ids([f.name for f in fibers if f.name not in reserved],source['validation'])
     val = [f for f in fibers if f.name in reserved|extra]
-    train = [f for f in fibers if f.name not in reserved|extra]
+    train = [f for f in fibers if f.name not in reserved|extra and not f.foldbacks]
     manifest = validation_manifest(val,spec,source['validation']['seed'])
     return fibers,train,val,manifest
 
@@ -296,7 +298,7 @@ class WeightedDatasets(torch.utils.data.IterableDataset):
             if streams[index] is None:
                 streams[index] = iter(self.datasets[index])
             batch = next(streams[index])
-            batch['dataset_id'] = torch.full((len(batch['hist']),), index, dtype=torch.int64)
+            batch['dataset_id'] = torch.full((self.datasets[index].chunk,), index, dtype=torch.int64)
             yield batch
 
 

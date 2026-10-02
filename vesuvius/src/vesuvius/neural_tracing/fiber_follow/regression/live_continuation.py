@@ -154,8 +154,10 @@ class LiveContinuationSource:
         facts = labeler.observe(advanced['last_segment'], advanced['travelled'])
         item = label_state(fiber, path[-1], frame, hist, mask, dataset.cfg,
                            t=facts['t'], reverse=reverse, trace=facts)
-        if item['supervision'] not in (FOLLOWING, RECOVERABLE, TERMINAL):
-            return None  # censored: no correspondence, unannotated or ambiguous
+        if not item['confidence_valid']:
+            return None  # censored: no correspondence, unannotated, ambiguous or unobservable
+        # Unknown states with partial labels (an uncertified connection) are delivered but
+        # end the chain, like terminal states: only following/recoverable states advance.
         terminal = item['supervision'] == TERMINAL
         item.update({key: state[key] for key in SEED_FIELDS})
         item['seed_age'] = state['seed_age']+advanced['travelled']-state['travelled']

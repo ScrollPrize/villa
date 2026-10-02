@@ -45,9 +45,9 @@ below documents the older `single_path_flow_v11` implementation.
   model outputs can still vary across devices and batch shapes. No forecast is
   carried into the next decision.
 - Commit at most `n_commit` points per decision (default 8, at most the 16-point
-  horizon), respecting the six-voxel first connection limit,
-  bounds, loops, stop patience, and bounded collection exploration. History
-  coordinates and previous commits remain fixed.
+  horizon), respecting the six-voxel first connection limit, bounds and loops. A
+  rejected decision ends the trace; nothing is forced. History coordinates and
+  previous commits remain fixed.
 
 Flow matching retains 64 stratified time/noise draws per state. Residual scales
 are fitted from 2,048 masked training states. Confidence labels describe the
@@ -58,22 +58,35 @@ generated coordinates and labels are
 detached, while the final evaluation trains the shared features and denoiser.
 Confidence loss is half masked BCE over the commit window (prefixes 1 to
 `--n-commit`, default 8) and half over all 16.
-Its coefficient ramps from zero to one over 2,000 optimizer updates. Unknown
-annotation endings are censored; confirmed departures have confidence negatives
-and no localization loss. GT history is diagnostic data only.
+Its coefficient ramps from zero to one over 2,000 optimizer updates. Labels follow the
+shared state contract (`shared/state_labels.py`): unknown annotation endings and
+uncertified states are censored, terminal states have confidence negatives and no
+localization loss. GT history is diagnostic data only.
 
 ## Data and first run
 
-The default mixture is 70% fresh augmentation and 30% current replay, controlled
-by `--fresh-fraction` in either trainer. Replay reserves 10% of draws for confirmed departures;
-other draws balance the drift bands <1, 1–1.5, 1.5–2, 2–3.5 and fibers within each
-band. Missing strata fall back to fresh states. Logs contain realized source
-fractions and stratum counts. A smooth accumulated displacement over a uniformly
-sampled 16–64 history voxels augments existing drift, heading, wobble, missing
-and truncated histories.
+Both trainers sample by the shared task budget (`TaskBudget`, `--task-share`); this
+model has no live continuation or synthetic failures, so their shares go to fresh
+simulated traces (70% fresh, 30% DAgger replay classes). Fresh states are simulated
+tracer decisions (`make_sample`); missing replay classes fall back to fresh states and
+are logged. See the [direct follower](regression/README.md#aligned-training-and-tracing)
+for the shared state contract, collection and replay rules.
 
-Replay v5 stores observed states and original-fiber correspondence, independently
-of prediction shapes. Training uses the latest completed on-policy caches
+Annotations are cleaned once at load (`shared/annotation_repair.py`, Paris 4 and AFV):
+short kinks (a tick, V, hook or small step that turns more than 30 degrees within one voxel
+and then resumes its direction) are replaced by the shortest smooth bridge; real corners and
+hairpins, whose direction changes, are kept, and everything else is unchanged. Paris 4 fibers
+whose annotation doubles back on itself are kept out of training (validation is unchanged).
+On Paris 4 this repairs about 1,500 kinks (0.4% of annotated length) and keeps 14 fold-back
+fibers out of training; the CT validation is in `output/trace_noise_realism_20261002/`.
+Geometry hashes change accordingly, so replay collected before the repair is rejected. The
+older frozen seed manifest (`output/single_path_v11_preparation/seeds.json`, used by
+`launch_single_path.sh`, `launch_regression.sh` and `scripts/evaluate_single_path.py`) was
+built on unrepaired geometry and no longer matches; `--dataset-config` runs build their
+validation manifest from the loaded fibers.
+
+Replay stores observed states, their trace facts and original-fiber correspondence,
+independently of prediction shapes. Training uses the latest completed on-policy caches
 (default: four), rotating older caches out as new ones arrive. Every training
 replay draw is relabeled and checked again before recropping. The original 48-voxel holdout
 position guard and complete crop/history/target exclusion remain in force.
@@ -162,12 +175,10 @@ can be explicitly changed on resume and is saved in subsequent checkpoints.
 Training ranking metrics remain threshold independent. Gate metrics use the
 actual fallback policy and report how often the alternate first point is correct.
 
-To broaden online replay, `--dagger-seeds-per-fiber 1 --dagger-seeds 128` collects
-one seed position in both directions per fiber, targeting about 64 distinct
-fibers per collection instead of about 16 under the defaults. Replay publication
-logs include distinct fiber, hard-state and exploratory-state counts. Each
-resume writes its effective options to `resume_STEP.json` alongside the original
-run configuration.
+Each collection traces one directed episode per distinct fiber (`--dagger-fibers`,
+default 64) from a saved coverage cursor, without exploration. Replay publication logs
+include the collected class/event supply, coverage and skipped seeds. Each resume writes
+its effective options to `resume_STEP.json` alongside the original run configuration.
 
 Scorer type, pool size, and selection horizon are saved in checkpoints and
 verified by preflight/resume; changing scorer architecture requires fresh training.
@@ -221,8 +232,8 @@ continues from the caches the run had published). Collector snapshots under
 `dagger/` are not resumable. Loader workers restart their own streams, so the
 sampled states after a resume differ from an uninterrupted run. The EMA decay
 ramps from .1 toward .999 over the first updates. One background collector
-refreshes replay every 1,000 updates when idle, using EMA, 64 training seeds,
-a 6,000-voxel cap, the default confidence .5, and eight exploration calls. Diagnostics use the
+refreshes replay every 1,000 updates when idle, using EMA, 64 distinct training fibers,
+a 768-voxel cap, the default confidence .5 and no exploration. Diagnostics use the
 original monitor fibers at the diagnostic threshold .5 (`DIAGNOSTIC_THRESHOLDS`). Images show observed history,
 GT, the final curve, and successive denoising updates.
 Diagnostics have private RNG streams and do not advance training's noise stream.
@@ -261,34 +272,19 @@ are excluded as well as assessment fibers. Current seed counts are 32 monitor,
 python scripts/evaluate_recovery.py output/RUN/last.pt \
   --fixtures output/single_path_v11_preparation/calibration_recovery.npz \
   --out output/RUN/recovery.json
-python scripts/evaluate_single_path.py calibrate \
-  --manifest output/single_path_v11_preparation/seeds.json --out output/RUN/calibration \
-  --checkpoints output/RUN/ckpt_*.pt
-python scripts/evaluate_single_path.py final \
-  --manifest output/single_path_v11_preparation/seeds.json --out output/RUN/final \
-  --selection output/RUN/calibration/selection.json
+python scripts/evaluate_single_path.py calibrate --checkpoint output/RUN/ckpt_NNNNNN.pt --out output/RUN/calibration
+python scripts/evaluate_single_path.py run --checkpoint output/RUN/ckpt_NNNNNN.pt \
+  --policy output/RUN/calibration/selection.json --splits final --out output/RUN/final.json
+python scripts/evaluate_single_path.py compare BASE.json output/RUN/final.json
 ```
 
-Calibration selects the greatest coverage among checkpoint/threshold pairs
-reaching 95% scored precision, then locks the checkpoint hash, threshold and
-sampling seeds. Gaussian checkpoints default to three repeats (`--sampling-seeds
-0 1 2`), with both per-seed summaries and pooled metrics. Final evaluation uses
-the same locked repeats. Zero-start checkpoints default to seed 0; specify the
-same repeat set explicitly when preparing a paired baseline comparison.
-Final evaluation enforces that choice and uses actual 6,000-voxel rollouts.
-Reports include drift-band counts, four-plane correctness, false stops,
-departure continuations, coverage, divergence, total wrong length and its
-per-trace distribution. Fixed-state evaluation also measures subsequent recovery
-toward the original fiber from identical observed histories. Existing rollout
-scoring semantics (3-voxel tolerance, sustained departure) are preserved; dense
-prefix confidence labels use 1.5 voxels. Unknown length receives no verified
-continuation credit.
-
-Pass paired final baseline rows via `--baseline-rows` to compute fiber bootstrap
-intervals. Baseline and new rows must have identical physical and sampling seed
-identities; bootstrap resampling groups all repeats of each fiber together. The target
-is ≥20% relative coverage improvement at matched 95% precision with no worse
-sustained wrong continuations; no improvement is assumed from confidence shifts.
+Both followers use the shared protocol (`shared/evaluation.py`; the direct follower's
+entry point is `regression/evaluate.py`). Calibration uses calibration seeds only and
+selects the greatest coverage among thresholds reaching 95% scored precision, or reports
+that none qualifies. Runs report the strict first-departure metrics (3-voxel tolerance,
+sustained departure, sticky wrong length) with decision and geometric outcomes, by
+source and split; `compare` pairs identical seeds and resamples fibers. Fixed-state
+recovery fixtures must be regenerated in the current replay schema.
 
 ## Verification and current status
 

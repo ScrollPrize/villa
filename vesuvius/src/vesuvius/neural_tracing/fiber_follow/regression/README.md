@@ -1,314 +1,200 @@
 # Live historical slab regression
 
-The optional v17 `--path-geometry-tokens` (requires v16 path tokens) adds 29 memory
-tokens shared by the path decoder and survival scorer. They sample the committed
-observed polyline 1–512 arclength voxels behind the head, plus its first point,
-in the current crop frame without crop masking: local references are crop
-supported, so only ~24 of the 128 local-history points otherwise reach either
-head. Each token embeds position (multi-scale Fourier, 2–1024 voxels), unit
-tangent, arclength behind the head and the first-point role. The final layer
-starts at zero; masked tokens leave v16 outputs unchanged. No annotation geometry
-enters them.
-
-To fork a path-token run with these tokens, a fresh AdamW (no moments, warmup
-restarting at the fork step), new source weights and a new rest-gradient clip:
-
-```bash
-../../../../.venv/bin/python -m vesuvius.neural_tracing.fiber_follow.regression.geometry_resume \
-  --checkpoint output/SOURCE/ckpt_022000.pt --name NEW_RUN \
-  --dataset-config configs/mixed_ct_datasets_paris50.json --rest-grad-clip 60
-```
-
-The dataset config may differ only in source weights. `configs/mixed_ct_datasets_paris50.json`
-samples Paris 4 at 50% and each AFV source at 25%. As with `memory_resume`,
-`migration.json` records the exact trainer command, and this command does not
-stop or launch processes.
-
-The optional v16 memory continuation adds three explicit observed-path tokens per
-historical slab, retaining all 578 spatial tokens. Each token samples the encoded
-CT/path features at the committed path and four lateral neighbors one tracing
-voxel away. Position, tangent, age, seed role and slab pose accompany the features.
-Samples are at observation arclength offsets -1, 0 and +1; samples outside the
-observed prefix or physical slab are masked. No annotation geometry enters them.
-
-`--pair-rank-weight .25` adds a paired-history logistic ranking loss to the
-existing geometry and survival objectives. Only matching explicit pair IDs,
-identical candidate geometry, and known opposite prefix labels contribute.
-It averages eligible candidate/prefix comparisons per decision; logged comparison
-counts count each pair once. Source sampling weights are unchanged. Ranking
-accuracy and mean logit margin are logged separately from survival calibration.
-
-`--live-continuation-steps 12 32 --live-continuation-stratified` cycles chain-limit
-draws across 12–18, 19–25 and 26–32 decisions, uniformly within each band. A shared
-counter per dataset balances draws across workers. Limits stay fixed for a chain;
-stops, departures, annotation boundaries and stale feedback still end it early.
-Logs include started-chain limit counts, reached-depth counts and mean travel.
-This balances requested limits, not surviving depths. Worker timing still affects
-the live sample stream; counters/queues restart on resume.
-
-To fork a stopped training run using its actual checkpoint configuration:
-
-```bash
-../../../../.venv/bin/python -m vesuvius.neural_tracing.fiber_follow.regression.memory_resume \
-  --checkpoint output/SOURCE/ckpt_010000.pt --name NEW_RUN \
-  --pair-rank-weight .25 --live-steps 12 32 --zscore
-```
-
-The command prepares an independent run and records the exact trainer command
-and intentional changes in `migration.json`. It preserves every existing model
-and EMA tensor, remaps Adam moments by parameter name, and preserves the update
-count, RNG and LR schedule. New path-projection parameters use seed 20261001;
-their final layer starts at zero and their Adam state starts fresh. Extra tokens
-change attention normalization slightly even before their new projection learns.
-Primary and dataset-specific replay indexes reference existing geometry caches;
-new rollouts are written inside the new run.
-
-`--zscore` records `crop_zscore_v1` preprocessing in the checkpoint: each current
-and historical CT crop uses `(image - mean) / max(population_std, 1e-6)` over all
-sampled voxels, before augmentation. There is no foreground threshold, clipping,
-or background sentinel. Constant crops become zero. Augmentation keeps its saved
-magnitudes but applies to the entire image without masking/clipping. Inference
-and collection use the checkpoint's normalization policy. The frozen recovery
-fixture retains every geometry array; only its normalization provenance and hash
-change. Existing v14/v15 checkpoints retain their original behavior.
-
 The direct follower predicts continuous paths and causal survival confidence from
-one current crop and up to eight live historical slabs. The main encoder, local
-128-point history, 16-point forecast and adaptive refinement policy are unchanged.
-See [architecture and supervision](TRAJECTORY_MEMORY.md).
+one current crop and up to eight live historical slabs. See
+[architecture and supervision](TRAJECTORY_MEMORY.md). The v16 path tokens add three
+observed-path tokens per historical slab; the v17 `--path-geometry-tokens` add 29
+memory tokens sampling the committed observed polyline 1–512 arclength voxels
+behind the head plus its first point. No annotation geometry enters either.
+Checkpoints that record `crop_zscore_v1` normalize each current and historical CT
+crop by its own mean and population standard deviation before augmentation.
 
-## Training and tracing
+## Aligned training and tracing
 
-Use the existing project environment from `fiber_follow`:
+Training, collection, replay, live continuation, evaluation and deployment share one
+implementation (`plans/consolidated_training_tracing_alignment.md`). There are no
+alternative modes, legacy flags, compatibility readers or migration tools; replay and
+fixtures from earlier pipelines are rejected and must be recollected.
 
-```bash
-bash scripts/launch_patch4_memory.sh
-# Or the convolutional main encoder:
-bash scripts/launch_memory.sh
-```
+Labels, correspondence, replay and evaluation all use the load-time repaired annotations
+(kinks bridged, fold-back fibers out of training; see the top-level README). `--init-weights`
+therefore compares fiber identities and source holdouts with the initialization checkpoint,
+not geometry hashes; `--resume` still requires identical geometry.
 
-Set `RUN_NAME`, `BATCH_SIZE`, `GRAD_STEPS`, `WORKERS`, and `BANK_PATH` as needed.
-The patch launcher defaults to batch 16 and one gradient accumulation step, eight
-loader workers, and a fresh `axial_patch4_overlap_tokens_slabs_v11_run1` destination.
-The convolutional launcher defaults to `axial_survival_slabs_v10_run1`.
-Existing output directories are never overwritten.
+### State contract (`shared/state_labels.py`)
 
-`bash scripts/train_mixed_ct_stem_fresh.sh` starts a fresh mixed-CT model with
-two axial encoder blocks at width 256 and FFN 256, six path decoder layers at
-width 256 and FFN 2048, and four survival scorer layers at width 256 and FFN 1024.
-The encoder and heads share width 256; the stem remains 32/64/128 and the history
-encoder retains width-256 output.
-The launcher sets `--axial-layers 2 --encoder-ffn 256
---hidden 256 --decoder-layers 6 --decoder-ffn 2048 --scorer-layers 4` and uses
-batch 4 with three gradient accumulation steps. These dimensions are saved in
-the model configuration. Its default run name is `mixed_ct_afv_stem32_fresh_run3`;
-set `STEM_RUN_NAME` to select another new run.
+Every state from every source is labeled by `label_state` with one set of trace facts:
 
-When resuming, `--lr` may change the base learning rate while retaining AdamW
-moments, EMA, and the existing warmup/cosine schedule position. Omit
-`--reset-optimizer` to preserve that state; the active LR includes cosine decay.
+- **Historical events** of a directed trace: the first sustained geometric departure
+  (3 voxels for 3 committed points, as in `score_trace`), the first certified
+  foreign-fiber contact and the annotation-boundary crossing. Their locations persist.
+- **Correspondence** on the original fiber only, searched from 8 voxels behind the
+  previous match to the new travel plus 32 ahead. It keeps updating after a departure
+  and records validity and ambiguity. It never matches another fiber or winding.
+- **Current supervision**: `following`, `recoverable`, `terminal` or `unknown`, with a
+  reason and explicit `geometry_valid` / `confidence_valid` masks. The sticky
+  `offtrack` field is gone.
 
-Training reserves `--clean-fraction` of examples for GT (default .8). Each one is
-a simulated trace, built exactly like a tracer decision; see "Tracing-consistent
-samples" below. No GT sample is unperturbed. Noise, blur, contrast, brightness and
-roll augmentation apply to every source.
+| State | Supervision |
+| --- | --- |
+| Following (head within 3 voxels), certified connection | geometry and proposal confidence |
+| Displaced, certified connection | recovery geometry and proposal confidence; live chains continue |
+| Confirmed committed switch, tagged physical endpoint, or first plane unreachable within the commit limit | rejection; live chains end after this example |
+| No/ambiguous correspondence, unannotated continuation, no visible original-fiber evidence while displaced | censored |
+| Reachable first plane but the annotated connection exceeds the limit | proposal confidence only |
 
-The mixed stem launcher uses 70% GT, 10% identity pairs, 10% wrong turns
-and 10% model replay. Its options are:
+A geometric departure can become following again; a confirmed switch stays terminal
+for the episode. The six-voxel limit bounds the whole origin-to-first-point segment
+(`recovery_allowed`), so with the first plane at one voxel the lateral reach is
+`sqrt(35)`. The confidence-label tolerance (`--tolerance`) is separate from the
+3-voxel departure threshold. `d <= 3`, `3 < d <= 6` and `d > 6` are descriptive
+strata in diagnostics only.
 
-```text
---clean-fraction .7 --gt-perturb-probability .25
---decision-fraction .2 --fresh-fraction .75 --memory-switch-probability .3333333333333333
---bank-following-probability 0 --replay-continuation-fraction .8 --prefer-real-wrong-turns
---prefer-replay-for-light-gt --batch 10 --grad-steps 1
-```
+**First connection.** With a neighbor raster, a proposal fails at its first point when
+its origin-to-first-point segment crosses a foreign cell (sampled every 0.25 voxel),
+even if its endpoint is correct; a target whose own connection crosses one teaches no
+geometry (`connector_rejected_targets` is logged). Annotation and bank checks are
+supervision/evaluation oracles only; deployment relies on learned confidence.
 
-The source weights normalize into the 30% non-GT budget, producing 10% each.
-`--prefer-real-wrong-turns` fills wrong-turn slots from source-local replay of
-confirmed natural switches first, with synthetic wrong turns as fallback.
-Eligible traces must contain a recorded, nonexploratory switched state. Samples
-balance available pre-switch and post-switch states, then fibers; exploratory
-states and prefixes preceding only a forced switch are excluded. Original seed,
-history and geometry are retained. Before-switch samples teach continuation;
-after-switch samples teach stopping. Missing or rejected real proposals fall
-back to synthetic proposals, then GT. The separate 10% replay budget is unchanged.
-`real_wrong_turn_fraction` and `real_wrong_turn_pre_switch_fraction` report actual
-shares of all training; `bank_wrong_continuation_fraction` includes both real and
-synthetic wrong-turn slots for compatibility with existing logs.
+### Operating policy
 
-`--gt-perturb-probability` now only selects "light" GT slots. With
-`--prefer-replay-for-light-gt`, these slots first try source-local correct
-continuation replay (or live continuation), keeping its actual seed and history.
-Unavailable or rejected replay falls back to the same simulated trace as any GT
-slot. The nominal 17.5% light-slot allocation thus becomes extra correct replay
-when available: 52.5% simulated GT traces, 25.5% correct replay, 2% failure replay,
-10% identity and 10% wrong turns. `light_gt_replay_fraction` reports the replaced
-share separately.
+`OperatingPolicy` (confidence threshold, commit count, recovery limit, refinement
+steps) is saved in every checkpoint and used for live feedback, collection,
+evaluation and deployment. Same-position refinement runs inside the model; a decision
+that stays rejected stops the trace immediately. There is no stop patience and no
+forced exploration.
 
-With `--live-continuation --live-continuation-steps 4 8`, correct-continuation
-slots (including light-GT replacement slots) instead use recent training
-predictions. Clean training examples seed source-local chains. The selected
-prediction is detached, confidence/recovery gated, committed using the same
-geometry and history resampling as inference, and relabeled against its original
-fiber. Workers resolve the next CT frame with inference sign continuity and
-rebuild all current/historical observations. No future vertices enter the input.
-Confirmed departures/switches remain supervised failure examples and end their
-chain; annotation boundaries and held-out footprints censor it. Stops do not
-force progress. Chains reset after 4–8 live decisions; empty queues fall back to
-clean GT and are counted explicitly. Failure and wrong-turn replay remain active.
+### Collection (`shared/collect.py`)
 
-Feedback uses bounded per-source queues and prioritizes existing chains over new
-seeds. Workers reject predictions older than 64 optimizer updates when taking
-feedback; ordinary loader prefetch can add a few more updates before training.
-Live positions resolve after geometry lookahead, so future plans cannot reserve
-old feedback. There is no extra model forward or gradient through prior steps.
-The policy uses the current training weights and augmented training observation;
-it is not an EMA rollout on unaugmented CT. Queue availability/order depends on
-worker timing. A resume starts empty queues and the usual restarted loader RNG
-streams while preserving optimizer, EMA and schedule state.
+Each collection traces one directed episode per distinct eligible fiber (default 64)
+from a saved coverage cursor: unseen fibers come before repeats, directions alternate
+per fiber, and fibers are covered uniformly regardless of training length weights.
+Seeds without CT orientation are skipped with a recorded reason. Episodes are 768
+trace voxels, collector batch 8 (`--dagger-forward-chunk` bounds model rows per call).
+The rejected final decision and its proposal are retained. Dense decisions are kept
+within 48 voxels before an excursion, during recovery, at stops and at terminal
+failures (at most 64 voxels after the first terminal state); ordinary following is
+thinned every 16 voxels. Each row stores its supervision, trace facts, events, the
+policy's own proposal, an episode and event id, and one replay class (precedence:
+terminal, premature stop, recoverable, pre-excursion, ordinary). The trainer launches a
+collection every 1,000 updates, round-robin over sources, one at a time; busy launches
+are skipped and logged with the achieved interval and publication age.
 
-Logs distinguish `live_correct_continuation_fraction`, `live_failure_fraction`,
-`live_fallback_fraction`, chain depth and policy age from saved replay. With the
-mixed-run allocation above, 25.5% of samples request live continuation. Some of
-those become failures or clean fallback; this is measured rather than assumed.
+### Task budget (`shared/data.py`)
 
-Validate real CT, source-local supervision and model feedback without GPU use:
+One budget applies within each dataset source (`--task-share NAME=SHARE` overrides):
 
-```bash
-../../../../.venv/bin/python scripts/validate_live_continuation.py \
-  --checkpoint output/RUN/last.pt --out /tmp/live-continuation-validation.json
-```
+| Task | Share |
+| --- | ---: |
+| fresh simulated traces (startup and excursions included) | 40% |
+| live continuation | 25% |
+| DAgger pre-excursion (48 voxels before) | 8% |
+| DAgger recoverable | 6% |
+| DAgger terminal | 8% |
+| DAgger premature stop with a supported continuation | 3% |
+| DAgger ordinary following, stratified by travel | 5% |
+| certified synthetic terminal failures | 5% |
 
-The mixed stem launcher uses batch 10, grad steps 1. Collection explicitly uses
-batch 1 and at most one concurrent collector across sources. Inference checkpoint
-storage stays on CPU; only the EMA inference model transfers to the requested
-GPU. `scripts/stop.sh RUN_NAME` freezes the trainer and its descendants, includes
-orphaned collectors identified by this run's checkpoint AND output paths, stops
-the owned process trees, and verifies no matching collectors remain before a
-restart proceeds. Other runs' collectors are excluded.
+Replay is indexed by class, fiber, episode and event; draws pick a fiber, then an
+episode, then an event, then a row. `--replay-max-age` and `--replay-event-cap` are
+shared by all loader workers of a source. Missing positive replay falls back to a fresh
+example of the same kind (recoverable falls back to a fresh excursion), missing terminal
+replay to synthetic failures within `--terminal-fallback-cap`, and anything else to a
+fresh example; every fallback is logged. Live chains have their own slots and never take
+replay slots. Logs report, per source, requested and delivered shares, fallbacks,
+supervision and reasons, label masks, positive/negative confidence targets, distinct
+fibers/episodes/events, source age, event reuse, startup draws, realized seed ages and
+replay travel strata.
 
-`--replay-continuation-fraction .8` reserves 80% of replay for correct committed
-prefixes and 20% for recorded failures (8% and 2% of total training). It overrides
-`--replay-failure-fraction`; without it, legacy replay sampling stays unchanged.
-Continuation eligibility requires positive model travel, a recorded prefix, no
-collector-confirmed departure, no exploration, and no hard/failure label
-(including pre-failure windows). Correctness follows the collector's
-original-fiber checks. Replay preserves the original seed, actual committed
-prefix, pose and historical slabs without synthetic perturbation or replacement.
-Supervision covers the forward segment beyond the current tip; future trace
-vertices never enter the input. Missing correct replay falls back to GT, never
-failed replay. Missing failures may use correct continuation. The optional
-`--correct-replay-only` selects exclusively correct prefixes and cannot be
-combined with `--replay-continuation-fraction`.
+**Fresh traces.** `make_sample` draws 15% seed-only starts, 17% with 1–8 and 17% with
+9–32 requested voxels of history, and 51% with history uniform over the available
+annotation (`--startup-shares`). The trace follows GT with commit-structured lateral
+error (`trace_noise`): a chain of ~16-voxel commits from the seed, one mean-reverting
+step of the offset at each join (33-voxel correlation, small per-trace bias) and a smooth
+bulge within each commit, a per-trace scale log-uniform in 0.22–0.76, plus the
+annotation's small-scale wiggle that the tracer does not follow (Gaussian 1.5 voxels).
+It was fit to on-track 81k rollouts against the repaired annotations and matches their
+lateral residuals, 1–2 voxel turning and correlation on held-out traces
+(`output/trace_noise_realism_20261002/refit_repaired/REPORT.md`). 20% of established
+traces add a smooth lateral excursion (amplitude uniform 3–6, rise log-uniform 16–128
+voxels, matching real excursions) with the head on its departure or return. Heading, history and seed reference
+come from the tracer's own functions; the seed heading is the CT H/V axis, and a seed
+without CT orientation is rejected and redrawn within its task (no annotation fallback).
 
-Allocation is stochastic in two-example units. Unavailable or rejected hard
-examples fall back to GT, so realized GT share may exceed its target. Logs report
-budgets in `identity_sampling.source_sampling`; `fresh_fraction` measures total
-GT, while `gt_unperturbed_fraction`, `gt_perturbed_fraction` and
-`replay_correct_continuation_fraction` report separate shares of all training
-examples. These sampling settings can change on resume, including from older
-checkpoints; workers require a restart. Optimizer state and the frozen recovery
-fixture remain unchanged. The legacy heavy perturbation settings (`lateral_sigmas`,
-`history_drift`, ...) apply only to the frozen recovery fixture (`drift_sample`).
+**Live chains** start half from recorded valid pre-excursion/recoverable prefixes
+(restoring the observed prefix, seed reference, heading boundary, correspondence and
+events) and half from fresh seed-only states, run 12–32 decisions in three balanced
+bands, advance only through prefixes the operating policy accepts, continue through
+following and recoverable states and end after delivering a terminal or partially
+labeled state.
 
-### Tracing-consistent samples
+**Synthetic failures** follow a noised original prefix (the same `trace_noise`) and a short certified
+neighbor tail (`--synthetic-tail`, default 4–16 voxels) and require visible
+original-fiber evidence. Decision pairs, the pair-ranking loss and supplied-candidate
+supervision were removed.
 
-Training simulates the tracer. Every decision state is built from an observed
-path by the tracer's own functions, whatever its source:
+**Augmentation footprints.** A recorded or resolved frame takes its roll augmentation
+(flip .5, N(0, 5°) clipped at ±15°) before footprints and reads are planned, so the
+crop, slabs, references and labels share the final frame. Unresolved CT frames keep the
+roll pending; their planned block already covers every roll about the heading.
 
-- **Crop heading.** `trace_heading` is the trusted 12-voxel trailing fit. Paths
-  shorter than 12 voxels hold the seed heading. Inference, live chains, simulated
-  GT traces, wrong continuations and decision pairs all use it. Fresh GT no longer
-  uses the GT tangent at the head, a chord that reached 3 voxels of future GT
-  (median 8.5° and p90 21° from the tracer's heading).
-- **Seed heading.** `oriented_seed_heading` is the CT sheet axis for the fiber
-  family, signed along travel, as in `make_seeds`. Training resolves it when the
-  image is built (`resolve_trace_seed`), from the seed slab's prefetched CT. For a
-  path shorter than 12 voxels it is also the crop heading: local geometry is
-  re-expressed and labels recomputed, and an orientation-independent block is
-  prefetched for that crop.
-- **History.** `trace_history`, the inference unit-arclength history of the
-  observed path.
-
-`make_sample` draws a trace that began at an annotated seed. It is a seed-only
-first call with probability `--no-history-prob` (default .05), otherwise a
-1-8/9-32 voxel start with probability `--short-history-prob` (default .1),
-otherwise a start anywhere earlier on the fiber. The trace follows GT with smooth
-lateral error. That error is an Ornstein-Uhlenbeck process, zero at the seed,
-with a per-trace scale log-uniform in [0.175, 1.0] voxels per transverse axis and
-a 40-voxel correlation length. This was fit to on-track held-out 81k rollouts:
-lateral residual p50 0.47, p90 1.11, p99 2.09 voxels, correlation 0.46 at 32
-voxels. The head is therefore offset from GT, and labels are the GT continuation
-from that head.
-
-Decision pairs share a tail longer than the crop-visible history (crop behind
-+4/16/28 voxels). Both rows keep identical local inputs while each carries its
-full traced history. The old 4-12 voxel tails masked history that tracing never
-masks.
-
-`IdentitySampling` rotates every training observation about its heading, after
-CT roll resolution. It applies a 180° flip with probability .5, which makes the
-tracer's roll-sign convention irrelevant, plus N(0, 5°) jitter clipped at ±15°.
-That covers CT roll-estimate noise; the measured model sensitivity was 1.3% gate
-flips at ±5°. Matched pair rows share the rotation. Live chains map proposals
-with the rotated frame the model saw.
-
-DAgger and live-chain labels use the evaluation's departure rule: 3 consecutive
-committed points beyond 3.0 voxels (`score_trace`), dated at the first. The old
-rule was a single point beyond 3.5.
-
-`tests/test_trace_sampling.py` checks each of these against the tracer's
-functions. `output/trace_sampling_20261002/audit_training_samples.py` audits the
-real loader on CPU. On the 81k run's sources, the crop heading's mismatch with the
-tracer's fit fell from median 5-10° (p99 22-49°) to 0° for GT, and from 7-20° to
-0° for pairs. GT head offsets moved from 0 to median 0.35 and p90 0.9-1.1 voxels.
-Loader time is +7-15% per batch.
-
-To fine-tune an existing run on these samples with a fresh optimizer:
+### Running the aligned experiment
 
 ```bash
-../../../../.venv/bin/python -m vesuvius.neural_tracing.fiber_follow.regression.sampling_fork \
-  --checkpoint output/RUN/ckpt_NNNNNN.pt --name NEW_RUN --steps TOTAL_STEPS --warmup 2000
-bash output/NEW_RUN/launch_command.sh  # written from migration.json
+# 1. CPU tests (targeted files; see tests/test_alignment.py for the acceptance checks)
+PYTHONPATH=../../.. ../../../../.venv/bin/python -m pytest tests/test_alignment.py -q
+# 2. A bounded collection on the baseline, then the sampler check (nonzero correct replay)
+../../../../.venv/bin/python -m vesuvius.neural_tracing.fiber_follow.regression.collect \
+  --checkpoint output/mixed_ct_afv_stem32_run3_pathgeom_paris50/ckpt_081000.pt \
+  --fibers /mnt/raid_nvme/spiral_dataset_working/fibers --dataset-name paris4 --out output/CHECK/paris4.npz
+../../../../.venv/bin/python scripts/check_task_sampler.py --checkpoint CKPT --replay paris4=output/CHECK/paris4.npz \
+  --out output/CHECK/sampler_check.json
+# 3. The run: model/EMA tensors from 81k, fresh AdamW, empty replay, 40,000 updates
+bash scripts/train_aligned.sh
 ```
 
-To prepare a separate continuation with more refinement stages, use a completed
-training checkpoint as the source of all effective settings:
+`--init-weights` loads matching model and EMA tensors only; the sampler, labels,
+options and optimizer are new, and source splits and CT normalization must match.
+
+### Evaluation and export
+
+`regression/evaluate.py` is the single protocol on the shared threaded tracer:
 
 ```bash
-../../../../.venv/bin/python -m vesuvius.neural_tracing.fiber_follow.regression.refinement_resume \
-  --checkpoint output/patch4_run3/ckpt_017000.pt \
-  --name patch4_run3_refine3 --refinement-steps 3
+python -m vesuvius.neural_tracing.fiber_follow.regression.evaluate calibrate --checkpoint CK --out EVAL
+python -m vesuvius.neural_tracing.fiber_follow.regression.evaluate run --checkpoint CK \
+  --policy EVAL/selection.json --splits final --max-len 2000 --out EVAL/final.json
+python -m vesuvius.neural_tracing.fiber_follow.regression.evaluate run --checkpoint CK --confidence .5 \
+  --splits monitor calibration final --out EVAL/all_c0.5.json
+python -m vesuvius.neural_tracing.fiber_follow.regression.evaluate compare BASE.json NEW.json
 ```
 
-This only prepares the new directory; `migration.json` records the exact trainer
-command to launch. It preserves weights, EMA, RNG, update count, LR schedule and
-existing AdamW moments. Added stage embeddings copy the last learned stage;
-their moment rows start at zero, retaining the embedding tensor's Adam step.
-The frozen recovery fixture is copied unchanged and published replay caches are
-referenced from an independent replay index. The source run must be quiescent
-while preparing the fork. Existing destinations, zero-stage source models, and
-nonstandard optimizer layouts are rejected. As with ordinary resumes, loader
-random streams restart. No source config defaults are used.
+Calibration uses calibration seeds only and selects coverage among thresholds with at
+least 95% scored precision; if none qualifies it says so and locks nothing. Runs report
+the strict first-departure metrics and sticky wrong length together with geometric
+excursions and returns (two voxels for 32), sustained distance events beyond six voxels
+(returned, not returned, or ended), confirmed switches and length after them with
+identity coverage, rejected unsafe proposals, stops with a supported continuation,
+recovery commits crossing a certified neighbor and current geometric agreement, by
+source and split. Comparisons pair identical seeds with fiber-resampled intervals.
+
+`infer.py` exports every valid trace by default (`--min-length` is an opt-in filter) and
+writes `seeds.json` with one status per seed: exported, seed-only, CT-unavailable,
+duplicate or filtered, with reasons.
+
+### Architecture identifiers
 
 Fresh runs use the fine history encoder (`--history-encoder fine`), with architecture
 identifiers `axial_fiber_slabs_v15`, `axial_patch4_overlap_fiber_slabs_v15`,
 `axial_patch4_overlap_tokens_fiber_slabs_v15`, and
-`axial_patch4_residual_stem_tokens_fiber_slabs_v15`. Existing v14 checkpoints
-load and resume with their original history encoder; an omitted history setting
-is inferred from the checkpoint. `--history-encoder legacy` also permits a fresh
-v14 baseline. Changing history architecture during an ordinary resume is rejected:
-the wider convolutions need new weights and optimizer state, so use a fresh run.
-Patch4 uses a learned 6x6x6 convolution with stride 4 and padding 1. Adjacent
-neighborhoods overlap by two voxels. The sampled crop is 120x104x104; patch4
-dimensions must be multiples of four, with no extra image padding. The token
-grid is 30x26x26 with centers at offset 1.5 input samples; dense reconstruction
-uses 4x4x4 output cells. Crop sampling and physical token positions remain
-centered laterally, including even crop widths. Convolution boundary padding
-is still used. Replay v8 stores CT-normal frames and the trusted heading-history boundary. Recollect
-older replay caches. Recurrent checkpoints and older replay
-are rejected; there is no weight migration or memory compatibility interface.
-The existing regression `train`, `collect`, and `infer` module entry points remain.
+`axial_patch4_residual_stem_tokens_fiber_slabs_v15` (v16/v17 with path tokens).
+Changing history architecture during a resume is rejected. Patch4 uses a learned
+6x6x6 convolution with stride 4 and padding 1. The sampled crop is 120x104x104; patch4
+dimensions must be multiples of four. The token grid is 30x26x26 with centers at
+offset 1.5 input samples; dense reconstruction uses 4x4x4 output cells.
+
+`scripts/stop.sh RUN_NAME` freezes the trainer and its descendants, including orphaned
+collectors identified by this run's checkpoint and output paths.
 
 ### Heading initialization and updates
 
@@ -330,11 +216,9 @@ to all seeds; repeat it once per seed for mixed families. Both signs are traced:
 
 After confident commits, heading is a free-intercept linear fit to 13 equally
 spaced samples spanning the last 12 trace-grid voxels of trusted committed path.
-With less than 12 voxels, the current heading is retained. Failed decisions
-retain the entire frame, including its rotation. Forced exploratory moves are excluded from subsequent
-fits, including the connector to the first accepted recovery point; fitting
-resumes after 12 voxels of accepted recovery geometry. Replay v8 preserves this
-boundary when a decision is resumed. There is no alternate heading policy.
+With less than 12 voxels, the current heading is retained. A rejected decision ends
+the trace. Replay preserves the trusted heading boundary when a decision is resumed.
+There is no alternate heading policy.
 
 All image crops use the `ct_transverse_uv_v2` frame policy. With heading h
 fixed, restrict the local CT structure tensor J to an orthonormal basis B of
@@ -353,9 +237,8 @@ without an established frame, a deterministic perpendicular basis supplies roll.
 The heading is unchanged by every roll fallback. Initial H/V seed-heading
 selection still requires an identifiable unrestricted CT sheet normal.
 
-Fresh training perturbs annotation-based heading and position, then resolves
-roll before sampling images. History, labels, and candidate coordinates rotate
-together. Replay holds its recorded frame; historical slabs resolve local CT
+Fresh training simulates the tracer's own heading and position, then resolves
+roll before sampling images. History and labels rotate together. Replay holds its recorded frame; historical slabs resolve local CT
 frames in chronological order. Weak orientation does not discard training pairs.
 Invalid geometry or CT context still rejects the whole batch within its
 source, with a contextual error after 64 consecutive rejections. I/O errors
@@ -457,37 +340,9 @@ with metadata checks took 0.00063 s. GPU/end-to-end training throughput is unmea
 
 ### BasicBlockD image and history encoders
 
-To initialize a fresh model with the settings captured directly from
-`mixed_ct_afv_stem32_fresh_run1/ckpt_031000.pt`, use:
-
-```bash
-bash scripts/train_mixed_ct_stem_fresh.sh
-```
-
-This script uses batch 6 and two gradient accumulation steps (12 examples per
-optimizer update), the fine history encoder, model width 256, four image-transformer
-blocks, two coordinate-decoder layers, and two scorer layers. All three transformer
-components use feed-forward width 1024. It retains the checkpoint's remaining
-training settings, including live continuation at 4–8 steps, tolerance 3,
-LR 1e-4 and 5000 warmup updates. It starts at step zero with random weights and
-a fresh optimizer; no checkpoint is opened at launch. Its default output name is
-`mixed_ct_afv_stem32_fresh_run2`; set `STEM_RUN_NAME` to choose another name.
-`FIBER_PYTHON` can select the Python executable. Settings are explicit in the
-script, and its header records the source checkpoint's SHA256.
-
-Start a fresh mixed-CT run with the replacement image stem and history encoder:
-
-```bash
-bash scripts/train_mixed_ct_stem.sh
-```
-
-The launcher creates `mixed_ct_afv_stem32_fresh_run1` with random model weights
-and a fresh AdamW optimizer: 100000 total steps, LR 1e-4, 5000-step warmup,
-batch 16 and grad steps 1, 10 workers and 48 remote prefetch connections. It uses the
-same mixed-dataset configuration and persistent volume cache. No checkpoint or
-migration is required. `STEM_RUN_NAME` selects another name, and extra trainer
-flags can be appended. To resume this new run later, use the same launcher with
-`--resume output/mixed_ct_afv_stem32_fresh_run1/last.pt`.
+The aligned run (`scripts/train_aligned.sh`) uses this stem (32 channels, two blocks per
+stage) with two axial encoder blocks at width 256 and FFN 256, six path decoder layers at
+FFN 2048 and four survival scorer layers.
 
 The image stem follows `PatchEmbed_deeper`, reusing Vesuvius's shared
 `BasicBlockD`: one full-resolution block into 32 channels, then two downsampling
@@ -522,25 +377,18 @@ rotations cancel in Q/K dot products. Tests compare this directly with full-grid
 history position/pose/age/slot embeddings remain available to the decoder.
 History cross-attention does not apply RoPE independently in each slab's frame.
 
-`--fresh-fraction` applies to the budget left after matched decisions and
-bank-following samples. With decision fraction .3, bank-following 0, and fresh
-fraction .9, the requested mix is 63% annotation-fresh, 7% replay, and 30% matched
-decisions. These are sampling targets; availability and paired batching affect
-realized counts. Both sampling flags may change on resume. `--tolerance` may also change on resume;
-it changes distance-based supervision and correctness reporting, while preserving
-optimizer state and the frozen monitor inputs. Negative-bank data
-still supports matched decisions and supervision even with bank-following disabled.
+`--tolerance` may change on resume; it changes distance-based supervision and correctness
+reporting while preserving optimizer state and the frozen monitor inputs. Sampling and
+label options otherwise must match on resume.
 
 `--batch` is the number of independent decisions loaded and predicted together.
 `--grad-steps` is the number of batches accumulated before one optimizer update.
 For example, `--batch 12 --grad-steps 2` gives an effective batch of 24 decisions.
-Matched pairs stay in the same batch, so batch size must be even when matched
-decision sampling is enabled. Defaults are batch 4 and grad steps 2; the patch
-and mixed-CT launchers use batch 16 and grad steps 1. Saved legacy configs are
+Defaults are batch 4 and grad steps 2; the aligned launcher uses batch 4 and grad
+steps 3. Saved legacy configs are
 translated automatically (old batch 24 / microbatch 12 becomes batch 12 / grad
 steps 2); the trainer CLI now accepts only the new names. Every decision
-gets equal weight. Geometry, generated survival and supplied-candidate survival
-keep their coefficients (1, .5, 1). There are no observation-only steps, streamed
+gets equal weight. Geometry and generated survival keep their coefficients (1, .5). There are no observation-only steps, streamed
 loss budgets, writer replay or cached historical main-encoder features.
 
 The current crop is 120x104x104 at spacing .5, with CT/presence and optional
@@ -553,10 +401,9 @@ valid observations are at least 32 arclength voxels apart, including the seed.
 Unavailable slots are padded and perform no image reads or convolution work.
 
 Training samples a complete synthetic prefix before truncating the main model's
-local history, retaining short/no-history draws. Matched pairs and synthetic
-wrong-turn histories retain their actual constructed paths, including bridges.
-Annotations affect labels only. Every selected slab is checked against the
-training holdout before images are loaded; either unsafe member rejects a pair.
+local history, retaining short/no-history draws. Synthetic wrong-turn histories retain
+their actual constructed paths, including bridges. Annotations affect labels only.
+Every selected slab is checked against the training holdout before images are loaded.
 Replay and resumed recovery use saved committed prefixes, without connecting a
 remote seed to a truncated local history.
 
@@ -580,15 +427,14 @@ layers. The survival scorer has two transformer layers. The image transformer,
 coordinate decoder, and survival scorer use feed-forward width 1024. The mixed-CT
 run script uses model width 256, four image-transformer blocks, and two
 coordinate-decoder layers. History features stay attached
-and are reused across all attempts and
-supplied candidates within a decision. Fully masked history contributes zero.
+and are reused across all attempts within a decision. Fully masked history contributes zero.
 
-Training compiles supervised prediction, supplied-candidate scoring, and losses. Valid
+Training compiles supervised prediction and losses. Valid
 slabs are gathered and encoded before those fixed-shape compiler boundaries.
 Current-image attention uses batched, padding-masked SDPA with cuDNN preferred
 on CUDA. It needs no per-row key compaction or dynamic key dimensions.
 Current-image and historical attention K/V projections remain attached and are
-reused within the decision, including supplied-candidate scoring.
+reused within the decision.
 CUDA uses BF16 autocast with FP32 survival and coordinate policy; the slab encoder
 and other parameters have independent gradient clipping (5 and 100).
 `--activation-checkpointing` still controls the main axial blocks.
@@ -774,63 +620,32 @@ batch-size increase. GPU memory remains within the RTX 5090's capacity. Detailed
 windows and the comparison are saved in `output/loader_speedup_round2/live_after.json`
 and `live_comparison.json`. Training remained active beyond step 5,500.
 
-## Source sampling and labels
-
-The default requested shares remain 30% matched decisions, 20% bank following,
-35% annotation-fresh, and 15% replay before fallback/rejection. Of fresh draws,
-20% request covered-parent resampling and 30% request synthetic wrong turns.
-75% of requested matched pairs teach recoverable geometry choices; the rest
-contrast a departure with legitimate following. The retired stream-crop cap and
-auxiliary historical decision budgets no longer alter these decision shares.
+## Bank geometry and switch certification
 
 `--bank-hard-fraction .5` keeps half of bank proposals uniform. For the other
 half, the loader chooses one of three geometry criteria uniformly and selects
 the strongest of eight proposals: nearby paths with similar tangents and bending,
 curved paths, or converging/diverging neighbors. Comparisons use four-voxel
 arclength spacing; distances and curve similarity are independent of vertex
-density and trace direction. Following draws still honor unique-path eligibility;
-matched decisions and covered-parent draws use all valid relationships. This
-changes exposure to the existing trusted bank; it does not change its annotations
-or mine previously absent weak-signal examples.
+density and trace direction. This changes exposure to the existing trusted bank;
+it does not change its annotations or mine previously absent weak-signal examples.
 
-New DAgger collections use the negative and near-negative banks to detect foreign
-contact along the actual committed polyline, including between decision heads.
-The first intersection with a `.75`-voxel bank-path tube outside the intended
-annotation's `1.5`-voxel tube certifies a switch. Both radii are configurable
-(`--bank-switch-tolerance`, `--bank-own-tolerance`). Overlapping tubes remain
-ambiguous; absent bank coverage cannot establish fiber identity. Contact positions
-are continuous segment/capsule intersections, not rounded voxel or head locations.
-Once departed, the existing stopping-only supervision remains absorbing.
+Collection, live chains and evaluation use the negative and near-negative banks to
+detect foreign contact along the actual committed polyline, including between decision
+heads and on the origin-to-first-point connector. The first intersection with a
+`.75`-voxel bank-path tube outside the intended annotation's `1.5`-voxel tube certifies
+a switch (`--bank-switch-tolerance`, `--bank-own-tolerance`). Overlapping tubes remain
+ambiguous; absent bank coverage cannot establish fiber identity. Contact positions are
+continuous segment/capsule intersections, not rounded voxel or head locations. A
+certified switch is terminal for the rest of its episode. Replay stores `switch_pos`,
+`switch_distance`, `switch_bank_path` (shard/path index) and `switch_bank_run`; these
+labels never enter model inputs. Replay stores every committed vertex once per trace,
+with causal prefix indices for each decision; caches without the current schema are
+rejected.
 
-Replay stores `failure_kind`, `travelled`, `switch_pos`, `switch_distance`,
-`switch_decision` (the within-trace decision that committed the contacting segment),
-`switch_bank_path` (shard/path index), and `switch_bank_run`. The pre-switch window
-retains geometry targets and shares the event metadata; confirmed switched states
-have geometry masked. These labels never enter model inputs. Bank provenance is
-saved with the collection. `--replay-failure-fraction .5` reserves half of replay
-for available generic departures, bank switches, premature stops, endpoint
-overshoots, and pre-switch states, equally by category and then by fiber. The other
-half balances recoverable drift bands. If one side is empty, the other receives
-its budget; fully empty replay falls back to annotation-fresh draws. Logs report
-collected categories and realized training endpoint counts.
-
-Replay v6 requires newly collected caches. It stores every committed vertex once per trace,
-with causal prefix indices for each decision; old caches are rejected.
-
-Each matched endpoint scores four shuffled paths: the two bank/annotation
-continuations and two smooth transitions between them, with varied transition
-onsets. Paired observations share candidate geometry and order. Candidate labels
-use the same dense tolerance, recovery limit, foreign masks, endpoint semantics
-and censoring as generated paths. They are not assigned all-positive/all-negative
-labels by candidate identity. Logs count first-segment and later first failures.
-The transitions are rejected-path proposals, never geometry targets or certified
-bank following paths.
-
-The loader no longer samples contrastive points or emits embedding query tensors.
-Lateral resampling uses visible forward bank coverage directly. The obsolete
-`--negative-near-fraction`, `--negative-near-distance` and `--negative-lateral-max`
-options are removed; bank mining and crop support determine available foreign
-geometry. Separate negative, following and continuation banks remain supported.
+The loader samples no contrastive points. Lateral resampling uses visible forward bank
+coverage directly; bank mining and crop support determine available foreign geometry.
+Separate negative and continuation banks remain supported.
 
 ## Verification and diagnostics
 
@@ -838,39 +653,19 @@ geometry. Separate negative, following and continuation banks remain supported.
 OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 ../../../../.venv/bin/python -m pytest tests -q \
   -o cache_dir=/tmp/fiber-slab-pytest
 
-../../../../.venv/bin/python -m vesuvius.neural_tracing.fiber_follow.regression.history_learning \
-  --device cuda --steps 250 --out /tmp/slab-learning.json
-
 ../../../../.venv/bin/python -m vesuvius.neural_tracing.fiber_follow.regression.benchmark_slabs \
   --warmup 2 --repeats 10 --decisions 6 --out /tmp/slab-benchmark.json
 
-# Match the launcher's batch, including batched attention and candidate padding:
+# Match the launcher's batch, including batched attention:
 ../../../../.venv/bin/python -m vesuvius.neural_tracing.fiber_follow.regression.benchmark_slabs \
   --warmup 3 --repeats 10 --decisions 16 --microbatch 16 --out /tmp/slab-benchmark-b16.json
 ```
 
-Use fresh output paths. The controlled learning check has two fixed identity
-pairs with identical current crops and differing historical CT, one pair requiring
-non-seed evidence. It requires correct geometry, acceptance of valid supplied
-and generated paths, and rejection of wrong continuations. Rejecting everything
-fails. It reports full history, seed only, no history, and shuffled CT with all
-metadata and path heatmaps held fixed. This is a learning-capability check,
-not evidence of held-out tracing quality.
-
-For a frozen real paired tensor batch from `IdentityObservationBuilder`, run:
-
-```bash
-../../../../.venv/bin/python -m vesuvius.neural_tracing.fiber_follow.regression.history_diagnostic \
-  --checkpoint output/RUN/last.pt --fixture /tmp/paired-batch.pt \
-  --out /tmp/paired-history-report.json
-```
-
-The fixture must contain complete adjacent matched pairs, candidates and labels;
-it can be reused unchanged across checkpoints. Existing held-out rollout and
-monitor recovery evaluations remain part of training. `identity_preflight` checks
-real-data independent batches, and `benchmark_feature_training` measures a bounded
-fork of a compatible run using its actual data. The synthetic benchmark excludes I/O;
-compare equal hardware, precision and supervised decision counts.
+Use fresh output paths. `identity_preflight` checks real-data independent batches, and
+`benchmark_feature_training` measures a bounded fork of a compatible run using its actual
+data. The synthetic benchmark excludes I/O; compare equal hardware, precision and
+supervised decision counts. `scripts/check_task_sampler.py` is the pre-launch sampler
+check (delivered task shares, replay supply, startup ages and excursion geometry).
 
 See [recorded validation](SLAB_VALIDATION.md) for measured results and limits.
 
@@ -886,8 +681,8 @@ bash scripts/train_mixed_ct.sh
 
 The launcher uses [mixed_ct_datasets.json](../configs/mixed_ct_datasets.json):
 10% Paris 4, 45% `0175A_5mm_v1.afv`, and 45% `1447_5mm_v1.afv`.
-`0175A_SMALLMORE.afv` is excluded. Weights apply to batches, preserving
-adjacent matched decision pairs. Source counts and actual shares are logged.
+`0175A_SMALLMORE.afv` is excluded. Weights apply to batches; each source then applies
+the task budget. Source counts and actual shares are logged per source.
 The new run uses one CT channel, patch4, three refinement steps, batch 16 and grad steps
 1, and initial LR 0.0003. Trailing command-line options override launcher defaults.
 It starts a new model; CT-plus-prediction checkpoints have different input shapes.
@@ -931,7 +726,7 @@ per worker; 0 restores the shallow per-item hints. The first batch is delivered
 before filling the deeper queue. Plans hold geometry, augmentation seeds and
 labels, without CT tensors or dense foreign masks. Neighbor coverage feedback
 advances during planning so fixed source/replay banks produce the same sample
-sequence and targets. Mixed-source selection and matched pairs stay ordered.
+sequence and targets. Mixed-source selection stays ordered.
 Initial metadata is also fetched by the async service. Local Paris 4 reads
 bypass this service.
 
@@ -1013,10 +808,9 @@ keeps its 124 previously reserved fibers and reserves another 10% of the remaini
 641, leaving 577 training and 188 validation fibers. This preserves the existing
 neighbor bank's parent compatibility. Its old `val_z` remains mining provenance
 only. Validation geometry is excluded from AFV neighbor queries and filtered out
-of Paris 4 mined paths, so it cannot reenter through intentional switches,
-neighbor following, matched choice/departure pairs, or foreign labels.
+of Paris 4 mined paths, so it cannot reenter through synthetic failures or foreign labels.
 
-Each source supports those neighbor tasks and its own rollout replay. Collection
+Each source supports its own synthetic failures and rollout replay. Collection
 cycles through all sources, running one subprocess at a time, with separate replay
 caches. Only training fibers seed replay, and replay identity manifests must match
 the source's training split. Monitor rollout metrics are evaluated and plotted

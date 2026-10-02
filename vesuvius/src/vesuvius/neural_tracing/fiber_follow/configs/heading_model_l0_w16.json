@@ -1,5 +1,5 @@
 {
-  "name": "heading_model_v2",
+  "name": "heading_model_l0_w16",
   "dataset_config": "mixed_ct_datasets_paris50.json",
   "ct_normalization": "../output/mixed_ct_afv_stem32_run3_pathgeom_paris50/ct_normalization.json",
   "device": "cuda",
@@ -20,10 +20,10 @@
   "val_states_per_source": 1500,
   "seed": 0,
   "model": {
-    "width": 8,
+    "width": 16,
     "window": 32,
     "forward": 35.5,
-    "ct_downsample_levels": 1,
+    "ct_downsample_levels": 0,
     "patch": {
       "depth": 32,
       "width": 32,

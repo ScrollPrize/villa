@@ -77,6 +77,14 @@ def annotation_item(fiber, at, reverse, sample):
     return item
 
 
+def fixed_curve_confidence(model, x, hist, hmask, points):
+    """Survival confidence of one fixed curve under this decision's (possibly ablated) scorer."""
+    from ..regression.survival_confidence import survival_predictions
+    ctx = model.context(x, hist, hmask)
+    model.prepare_prediction(ctx, hist)
+    return survival_predictions(model.hazard_logits(ctx, points))[1]
+
+
 def analyze(model, x, hist, hmask, captured, threshold, n_commit):
     saved, metrics, stats = {}, {}, []
     fixed = torch.from_numpy(captured['points'])[None, None]
@@ -95,8 +103,8 @@ def analyze(model, x, hist, hmask, captured, threshold, n_commit):
                 if name.startswith('without_block_'):
                     block = model.encoder.blocks[int(name.rsplit('_', 1)[1]) - 1]
                     stack.enter_context(patch.object(block, 'forward', lambda value: value))
-                out = model(inputs, hist, hmask, candidates=fixed,
-                            confidence_threshold=threshold, n_commit=n_commit)
+                out = model(inputs, hist, hmask, confidence_threshold=threshold, n_commit=n_commit)
+                out['fixed_curve_confidence'] = fixed_curve_confidence(model, inputs, hist, hmask, fixed[:, 0])
             count, allowed = commit_prefix(out['points'], out['confidence'], threshold, n_commit,
                                            model.cfg.max_recovery_distance)
             shift = (out['points'] - fixed[:, 0]).norm(dim=-1)[0]
@@ -105,13 +113,13 @@ def analyze(model, x, hist, hmask, captured, threshold, n_commit):
                                  attempts=out['refinement_points'].shape[1],
                                  mean_path_shift=float(shift.mean()), max_path_shift=float(shift.max()),
                                  last_confidence=float(out['confidence'][0, -1]),
-                                 fixed_curve_last_confidence=float(out['candidate_confidence'][0, 0, -1]))
+                                 fixed_curve_last_confidence=float(out['fixed_curve_confidence'][0, -1]))
             for key, value in out.items():
                 saved[name + '_' + key] = array(value[0])
             if name == 'baseline':
                 for key in ('points', 'confidence', 'refinement_points', 'refinement_confidence'):
                     np.testing.assert_array_equal(saved[name + '_' + key], captured[key])
-                np.testing.assert_allclose(out['candidate_confidence'][0, 0], out['confidence'][0], rtol=1e-5, atol=1e-6)
+                np.testing.assert_allclose(out['fixed_curve_confidence'][0], out['confidence'][0], rtol=1e-5, atol=1e-6)
             print(name, metrics[name], flush=True)
         restored = model(x, hist, hmask, confidence_threshold=threshold, n_commit=n_commit)
         np.testing.assert_array_equal(array(restored['points'][0]), captured['points'])

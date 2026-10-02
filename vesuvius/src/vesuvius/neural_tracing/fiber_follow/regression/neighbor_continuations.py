@@ -1,4 +1,4 @@
-"""Synthetic wrong-fiber history: OU-noised original prefix, smooth bridge, traced tail."""
+"""Synthetic wrong-fiber history: noised original prefix (trace_noise), smooth bridge, traced tail."""
 import numpy as np
 
 from vesuvius.neural_tracing.fiber_follow.regression.neighbor_mining import exact_nearest
@@ -74,7 +74,7 @@ def wrong_continuation(bank, cfg, rng, *, tail_length_range=(4., 16.), prefix_le
     transition = own*(1-weight[:,None])+neighbor*weight[:,None]
     prefix_t = np.arange(max(0.,own_t[0]-max(cfg.n_history*cfg.history_step+4,prefix_length)),own_t[0],.25)
     path = np.concatenate((interp_at(own_points,own_arc,prefix_t),transition))
-    # Tracing error on the original prefix: OU at unit arclength, removed along the bridge.
+    # Tracing error on the original prefix at unit arclength, removed along the bridge.
     distance = arclength(path)
     units = np.arange(0., distance[-1]+1.)
     own_units = np.interp(units, distance, np.r_[prefix_t, own_t])

@@ -68,6 +68,9 @@ acceptance/rejection checks passed.
   --device cuda --steps 250 --out /tmp/fiber_slab_baseline/learning4.json
 ```
 
+Historical record: `history_learning` relied on supplied-candidate scoring, which the
+aligned pipeline removed together with decision pairs; the command no longer exists.
+
 This is an intentionally small learning-capability check with a reduced model
 and FP32 training. It establishes that historical imagery can control both heads
 and that rejecting everything cannot pass. It does not establish generalization

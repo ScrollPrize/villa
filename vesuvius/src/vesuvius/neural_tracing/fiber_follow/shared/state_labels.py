@@ -96,12 +96,14 @@ def classify(targets, trace):
         result = _result(TERMINAL, 'switch', False, True)
     elif not trace['match_valid']:
         return _result(UNKNOWN, 'no_correspondence', False, False)
-    elif trace['window_distance'] > limit+tol:
-        result = _result(TERMINAL, 'unreachable', False, True)
     elif trace['beyond_end']:
+        # Past the annotation's end: an explicit physical endpoint is terminal; an
+        # unannotated continuation is censored, however far the head has gone.
         if not targets['endpoint_known']:
             return _result(UNKNOWN, 'unannotated', False, False)
         result = _result(TERMINAL, 'endpoint', False, True)
+    elif trace['window_distance'] > limit+tol:
+        result = _result(TERMINAL, 'unreachable', False, True)
     elif trace['match_ambiguous']:
         return _result(UNKNOWN, 'ambiguous', False, False)
     elif not targets['plane_mask'][0]:

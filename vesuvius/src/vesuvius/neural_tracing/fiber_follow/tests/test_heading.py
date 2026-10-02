@@ -119,10 +119,10 @@ def test_linear12_is_invariant_to_resampling_and_rigid_transforms():
 
 
 def test_replay_roundtrip_keeps_the_trusted_heading_boundary(tmp_path):
-    state = OnPolicyStates(manifest=[],fiber_idx=[0],t=[0.],reverse=[False],pos=[[0.,0.,2.]],
-        frame=[np.eye(3)],hist=np.zeros((1,4,3)),hmask=np.zeros((1,4)),offtrack=[False],hard=[False],
-        exploratory=[True],heading_start=[3],seq_start=[0],seq_end=[3],
-        track_pos=[[0.,0.,0.],[0.,0.,1.],[0.,0.,2.]])
+    from replay_fixtures import replay_states
+    state = replay_states([], [dict(pos=np.array([0.,0.,2.]), hist=np.zeros((4,3)), hmask=np.zeros(4),
+                                    heading_start=3, seq_start=0, seq_end=3)],
+                          track=[[0.,0.,0.],[0.,0.,1.],[0.,0.,2.]])
     path = tmp_path/'replay.npz'
     state.save(path)
     loaded = OnPolicyStates.load(path)
