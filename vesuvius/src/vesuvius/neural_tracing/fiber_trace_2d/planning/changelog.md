@@ -1,3 +1,15 @@
+## 2026-10-02 — Cooperative maintenance survives allocation changes
+
+- Made reviewed-trace maintenance a durable supervisor-owned request rather
+  than an immediately executable cohort-local event.
+- Bound every trace attempt to its exact manager epoch, generation, GPU UUIDs,
+  and grant; revoked attempts are process-group reaped before release and then
+  retried after regrant.
+- Added staged/atomic trace output promotion and exact request deduplication.
+- Validated in production by pausing update-42700 trace attempt 1, observing
+  verified release, resuming into attempt 2, completing the trace once, and
+  continuing training through update 42704.
+
 ## 2026-09-28 — Correct failure-trial coordinates and parallel export
 
 - Fix run-local versus original-fiber arc mismatch in global reproduction trials; version coordinate contract and validate independent expected start/end XYZ within0.25 base voxel, both before tracing and when auditing saved results.

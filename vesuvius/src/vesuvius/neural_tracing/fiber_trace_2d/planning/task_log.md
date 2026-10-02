@@ -24,3 +24,11 @@
 - CPU validation: cooperative/reviewed/startup plus manager supervisor/policy
   suites: `92 passed, 2 skipped` in 43.73 s. Python compilation and
   `git diff --check` passed.
+- Production validation resumed the failed checkpoint at update 42600. At the
+  update-42700 reviewed-trace boundary, attempt 1 started under generation 1;
+  a forced manager pause caused it to be process-group reaped before release,
+  leaving the request pending. After resume/regrant as generation 3, attempt 2
+  ran the same step request and atomically promoted `step_00042700` with 21
+  combined restarts and 25.944478 mm implied length. Training then advanced
+  through updates 42701-42704, proving the pending boundary was neither lost
+  nor duplicated.

@@ -7,4 +7,5 @@
 - [x] Implement durable deferred maintenance.
 - [x] Add and run regression tests.
 - [x] Update specification, documentation, changelog, and task log.
-- [ ] Resume at update 42600 and validate the next trace boundary.
+- [x] Resume at update 42600 and validate the next trace boundary, including a
+  forced mid-trace pause/regrant and later optimizer progress.
