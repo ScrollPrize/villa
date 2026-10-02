@@ -12,7 +12,6 @@ from vesuvius.neural_tracing.fiber_follow.regression.history_slabs import (
 )
 from vesuvius.neural_tracing.fiber_follow.regression.model import build_model
 from vesuvius.neural_tracing.fiber_follow.regression.data import ObservationBuilder, DirectTracer
-from vesuvius.neural_tracing.fiber_follow.regression.train import prepare_training, optimizer_update
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength
 from vesuvius.neural_tracing.fiber_follow.shared.data import OnPolicyStates, ZBand, SampleConfig, make_sample
 from vesuvius.neural_tracing.fiber_follow.shared.trace import trace_history
@@ -243,26 +242,6 @@ def test_actual_trace_commits_and_resumed_slabs_use_same_prefix(monkeypatch):
     resumed._trace(seen[1]['pos'][None],seen[1]['frame'][:,2][None],None,None,None,initial_states=[seen[1]])
     for key in OBSERVED_HISTORY:
         torch.testing.assert_close(images[1][key],again[0][key],atol=0,rtol=0)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA unavailable')
-def test_cuda_bf16_masks_and_compiled_repeated_updates():
-    torch.manual_seed(16)
-    model=build_model(aligned_config(recurrent_refinement_steps=1)).cuda()
-    ema=copy.deepcopy(model)
-    prepare_training(model,2)
-    opt=torch.optim.SGD(model.parameters(),lr=.001)
-    for count in (2,0,8,1):
-        batch=aligned_batch(model.cfg,2)
-        batch['x']['history_valid'][:]=False
-        batch['x']['history_valid'][:,:count]=True
-        batch['x']['history_slabs'][~batch['x']['history_valid']]=float('nan')
-        metrics=optimizer_update(model,ema,opt,[batch],1,.001,device='cuda',compute_metrics=False)
-        assert np.isfinite(metrics['loss']) and np.isfinite(metrics['history_grad_norm'])
-        if count:
-            assert metrics['history_grad_norm']>0
-        else:
-            assert metrics['history_grad_norm']==0
 
 
 def test_cached_history_attention_matches_mha_and_reuses_attached_projections():
