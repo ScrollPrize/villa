@@ -192,13 +192,35 @@ uv run --extra models python -m vesuvius.ink_detection.preprocessing.validate_se
 uv run --extra models python -m vesuvius.ink_detection.preprocessing.clean_labels ROOT
 uv run --extra models python -m vesuvius.ink_detection.preprocessing.merge_predictions ROOT
 uv run --extra models python -m vesuvius.ink_detection.preprocessing.composite_from_zarr --input-root ROOT --method max
+uv run --extra models python -m vesuvius.ink_detection.preprocessing.composite_from_zarr --zarr VOLUME.zarr --method mean --median-radius 2 --resolution 1 --workers 16
 uv run --extra models python -m vesuvius.ink_detection.preprocessing.download_required_zarr_chunks --datasets-root DATASETS --volumes-json VOLUMES.json --output-root OUTPUT
 ```
 
 `validate_segments` checks label binary encodings and TIFF/Zarr spatial shape;
 `clean_labels` rewrites matching label images as `{0,255}` TIFFs after optional
 component and hole cleanup; `merge_predictions` aggregates directional
-prediction files; and `composite_from_zarr` writes max or mean TIFF projections.
+prediction files; and `composite_from_zarr` writes min, max or mean TIFF
+projections. Filters run in 3D on the volume *before* the projection:
+`--median-radius R` applies an exact `(2R+1)^3` median (numba sliding
+histogram for uint8, `vesuvius.utils.median3d`) whose Z window also uses real
+layers outside the selected range where they exist. It accepts either `--input-root` (one `.zarr` per folder) or a
+single `--zarr` path with an optional `--output`. Layers come from `--start_z`/
+`--end_z` (default: all) or `--center-layers N` for the middle N layers of the
+selected level. `--output-scale S` resizes the composite (0.25 for quarter size,
+2 for double; fractions like 1/3 also parse) with OpenCV area interpolation when
+shrinking and linear when enlarging (`--resize-interpolation` overrides). Tiles
+are resized with an aligned halo so seams do not appear; for integer or 1/N
+scales the result equals a whole-image resize exactly, for other scales it can
+differ by a grey level or two from OpenCV's coefficient rounding. After the
+resize, `--median-2d-radius R` applies an OpenCV `(2R+1)^2` median to the
+composite (2D stages are listed after the scale in the output name). Output is a
+tiled BigTIFF whose
+tile edge (`--tile-size`, default 1024) is rounded up to a multiple of the Zarr
+chunk size, so each tile's Z slab is read, filtered, projected, resized and
+compressed independently across `--workers`; larger tiles amortise the halo.
+Local Zarr v2 chunks are decoded directly in the workers (`--reader direct`,
+the `auto` default when supported) because zarr-python 3 serialises
+synchronous reads on one event loop; `--reader zarr` forces zarr-python.
 The downloader uses tifxyz patch geometry to copy only source chunks required
 by selected label patches. Use `--dry-run` to inspect its plan before writing.
 
@@ -217,7 +239,12 @@ reference spelling. The commands have these persistent-state guarantees:
   requested direction. An invocation that writes no merged output fails
   instead of reporting success; decoded floating predictions must be finite.
 - `composite_from_zarr` publishes each TIFF only after all projected tiles are
-  written. Existing outputs fail unless `--overwrite` is supplied.
+  written. Existing outputs fail unless `--overwrite` is supplied. Default
+  names are
+  `<stem>_<method>[_median<R>][_scale<S>_<interpolation>][_median2d<R>][_level<L>]_<z0>_<z1>.tif`;
+  the level suffix is omitted for level `0`, so pre-existing level-0 names are
+  unchanged, and the interpolation is the mode actually used (`area`/`linear`
+  for `auto`).
 - `download_required_zarr_chunks` writes an explicit Zarr-v2 sparse output
   readable by Zarr 2 and 3. Its root attributes record the normalized source,
   every array schema, exact per-scale chunk plan, recompression preset, and
