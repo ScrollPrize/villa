@@ -1019,15 +1019,18 @@ class ServiceState:
         validation_run = (
             dataclasses.replace(run, config=input_config)
             if input_config is not None else run)
-        errors = validate_session_request(paths, validation_run)
         # The scroll specification is resolved from the dataset root; it
         # carries the physical scroll facts (including the outward sense,
-        # which is not part of the session request).
+        # which is not part of the session request) and the Lasagna store
+        # layout validation needs to find the packed resident pools.
         scroll = None
+        spec_errors = []
         try:
             scroll = load_scroll_spec(paths.dataset_root)
         except ScrollSpecError as exc:
-            errors.append({"field": "scroll_spec", "message": str(exc)})
+            spec_errors.append({"field": "scroll_spec", "message": str(exc)})
+        errors = validate_session_request(paths, validation_run, scroll)
+        errors.extend(spec_errors)
         if errors:
             raise ApiError(HTTPStatus.BAD_REQUEST, "Session validation failed", errors)
         return paths, run, preview, scroll
