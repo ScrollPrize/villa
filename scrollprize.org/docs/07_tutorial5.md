@@ -554,7 +554,7 @@ The rendered surface volume goes through the same flat inference command as befo
 ```bash
 uv run --extra models python -m vesuvius.ink_detection.inference.infer \
   ink-dataset/pherc0139/w035/w035_9um.zarr \
-  checkpoints/ink_9um/hybrid_3d2d-seed42/step-075000.pth \
+  checkpoints/ink_9um/hybrid_3d2d-seed43/step-075000.pth \
   predictions/w035_9um.tif \
   --overlap 0.5 --blend-mode hann \
   --batch-size 32
@@ -564,10 +564,16 @@ The `--batch-size 32` assumes a large GPU; drop it to 4 or 1 if you run out of m
 
 Checkpoints embed their training config, so inference rebuilds the model and its normalization automatically. Two things to know when reading the output:
 
-* **The models are sensitive to depth offsets.** If a checkpoint doesn't respond well on your data, the surface may sit at a slightly different depth than the model expects. Try shifting the window with `--layer-start` / `--layer-end`, or average the predictions over a few nearby windows as a simple ensemble. Training jitters the depth window, so the models tolerate small offsets; larger ones can still throw them off.
+* **The models are sensitive to depth offsets.** If a checkpoint doesn't respond well on your data, the surface may sit at a slightly different depth than the model expects. Shifting the window with `--layer-start` / `--layer-end` is worth a try. Averaging a few nearby windows did not beat the better single run on the validation segments below. Training jitters the depth window, so the models tolerate small offsets; larger ones can still throw them off.
 * **The background doesn't sit at zero.** With label smoothing 0.5, the training targets are 0.25 for background and 0.75 for ink, so predictions tend to occupy a compressed range. If a prediction looks washed out, you may want to rescale it for display (for example `(p − 0.25) / 0.5`, clipped to [0, 1]).
 
-Run both seeds and a few different steps; and when you don't know which way the surface faces, run both directions too (`--direction both`). Here is how the two seeds compare on the w035 render from above:
+Which checkpoint to run, measured on the three validation segments these checkpoints report (`pherc0139-w016`, `pherc0814-46527`, `pherc1667-w029`). Centred forward runs, no retraining, AUC against the validation mask, with a 64-pixel block bootstrap. An arm counts only if it beats the better seed's centred run by more than that interval's half-width. The numbers and the preregistration are in [the evidence branch](https://github.com/Sartoshirelli/villa/tree/evidence-w035-2026-09/w016-ensembling-pilot).
+
+* **seed43, step-075000, centred, no ensemble.** That is the command above. It beat seed42's final checkpoint by 0.162 and 0.060 AUC on two segments and was tied on the third (0.863 vs 0.874, inside a ±0.07 interval).
+* **If you run seed42, use step-050000, not step-075000.** The earlier checkpoint won on all three segments (+0.037, +0.020, +0.020). seed43's final step was as good or better than its own step-050000.
+* **Don't average your way past a weak seed.** Means of seeds, of five depth windows, and of both plus mirror TTA cleared the rule on 0 of 3 segments. Mirror TTA did lift the weaker seed (up to +0.116). A depth shift that helps one segment hurts another.
+
+When you don't know which way the surface faces, run both directions (`--direction both`). The figure below is the two seeds at step-020000, earlier than either checkpoint above:
 
 <figure>
   <div className="max-w-[480px] mx-auto">
