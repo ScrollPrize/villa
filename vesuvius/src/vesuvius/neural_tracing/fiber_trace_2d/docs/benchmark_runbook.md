@@ -68,6 +68,13 @@ for a dead rank. Each step retains its workload, bindings, inference summary,
 native summary, runner log, and compact metrics under
 `RUN/reviewed_trace_test/step_NNNNNNNN/`.
 
+The boundary remains pending across manager pause or reallocation. A trace is
+launched only against the exact applied GPU UUID grant. If that ownership is
+revoked, its complete process group is reaped and the incomplete staged attempt
+is retained for diagnosis; the canonical step directory is created only by a
+validated successful retry. A genuine trace-runner failure still aborts the
+training run.
+
 TensorBoard group `reviewed_trace/` records actual restart episodes separately
 for forward and reverse directions and in combination. The implied mean is the
 corresponding total directed reference length divided by `(restarts + 1)`, so

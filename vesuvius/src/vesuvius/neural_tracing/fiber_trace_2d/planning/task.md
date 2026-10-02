@@ -1,15 +1,14 @@
-# Training-integrated reviewed failure benchmark
+# Graceful cooperative maintenance under allocation changes
 
-Integrate the optimized native/live-inference reviewed-fiber benchmark into the
-fiber training test cycle.
+Fix cooperative Fiber3D training so reviewed-trace maintenance requests are
+handled correctly regardless of when manager pause/reallocation directives
+arrive.
 
-- Freeze a persistent test dataset containing the union of truncated reviewed
-  pieces that failed in any canonical reviewed-model evaluation.
-- Use that smaller locked dataset for the existing deterministic dense test
-  losses and cross-section diagnostics.
-- At each configured trace-test interval, evaluate the current raw training
-  model with the existing highly parallel live-inference/native replay runner.
-- Report and log forward, reverse, and combined restart counts plus the implied
-  aggregate segment length: total directed reference length divided by total
-  restarts plus one.
-- Preserve exact membership, hashes, trace settings, and per-step summaries.
+- A maintenance request must remain pending across allocation-driven cohort
+  drain, release, and replacement.
+- Starting maintenance while its cohort is temporarily unable to hand off must
+  wait rather than fail.
+- A grant revoked during the reviewed-trace child must stop that GPU work,
+  release cleanly, and retry the same maintenance request after a new grant.
+- Training must resume from the last complete checkpoint without losing or
+  duplicating the requested periodic trace boundary.

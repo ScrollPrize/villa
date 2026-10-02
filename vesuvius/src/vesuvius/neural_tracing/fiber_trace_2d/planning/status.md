@@ -1,12 +1,10 @@
-# Status: training-integrated reviewed failure benchmark
+# Status: graceful cooperative maintenance under allocation changes
 
-- [x] Capture the requested task.
-- [x] Identify the reviewed cohort and canonical failure union.
-- [x] Write and self-review the implementation plan.
-- [x] Materialize and validate the persistent 32-piece dataset.
-- [x] Point dense training tests at the locked subset.
-- [x] Integrate current-model native trace evaluation.
-- [x] Log directional restarts and implied mean lengths.
-- [x] Add regression tests and run focused validation.
-- [x] Update specification, runbook, and changelog.
-- [ ] Relaunch and verify the training integration.
+- [x] Capture the failure and requested invariant.
+- [x] Identify the maintenance/allocation interleaving.
+- [x] Write the implementation and validation plan.
+- [x] Complete independent plan review and incorporate lifecycle corrections.
+- [x] Implement durable deferred maintenance.
+- [x] Add and run regression tests.
+- [x] Update specification, documentation, changelog, and task log.
+- [ ] Resume at update 42600 and validate the next trace boundary.

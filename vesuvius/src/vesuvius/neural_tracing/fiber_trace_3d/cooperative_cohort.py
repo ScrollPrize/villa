@@ -24,7 +24,8 @@ class FiberCohort:
                  queue_depth=2, writer_factory=None, resume_checkpoint=None,
                  drain_timeout=300.0, training_overrides=None, calibration_observations=(),
                  startup_microbatch_size=None, startup_reserve_bytes=4 * 1024**3,
-                 on_startup_observation=None, on_process_start=None):
+                 on_startup_observation=None, on_process_start=None,
+                 maintenance_mailbox=None):
         from villa_gpu_manager.cohort import ProcessCohort
         if type(queue_depth) is not int or queue_depth < 1:
             raise ValueError("GPU input queue depth must be positive")
@@ -36,7 +37,7 @@ class FiberCohort:
         self._queues_closed = False
         self._sent, self._drained = [], []
         self._pending = {}
-        self.maintenance = None
+        self.maintenance_mailbox = maintenance_mailbox
         if drain_timeout <= 0:
             raise ValueError("CPU drain timeout must be positive")
         self._drain_timeout = float(drain_timeout)
@@ -129,10 +130,12 @@ class FiberCohort:
             samples_seen = rows[0].get("samples_seen")
             if type(samples_seen) is not int or samples_seen < 0:
                 raise RuntimeError("reviewed trace boundary lacks cumulative sample progress")
-            self.maintenance = {
+            if self.maintenance_mailbox is None:
+                raise RuntimeError("reviewed trace boundary has no maintenance mailbox")
+            self.maintenance_mailbox.publish({
                 "kind": "reviewed_trace", "step": int(step),
                 "samples_seen": samples_seen,
-            }
+            })
         if self._on_startup_observation is not None:
             observations = []
             for row in rows:
@@ -155,7 +158,9 @@ class FiberCohort:
         # Hold the cohort at the completed trace boundary until the CPU
         # supervisor has requested a pause/drain.  It must not admit the next
         # optimizer unit in the same manager tick.
-        return self.gpu.idle and self.maintenance is None
+        return self.gpu.idle and not (
+            self.maintenance_mailbox is not None and self.maintenance_mailbox.pending
+        )
 
     @property
     def done(self):
@@ -172,7 +177,12 @@ class FiberCohort:
 
     @property
     def closed(self):
-        return self.maintenance is None and self.gpu.closed and self._queues_closed and (
+        maintenance_blocks_close = (
+            self.maintenance_mailbox is not None
+            and self.maintenance_mailbox.pending
+            and (not self._draining or self.maintenance_mailbox.attempt_active)
+        )
+        return not maintenance_blocks_close and self.gpu.closed and self._queues_closed and (
             self.broker.pipeline.closed or self.broker.workers_within_limit())
 
     def authorize(self):
@@ -192,15 +202,20 @@ class FiberCohort:
         # Do NOT park loaders yet: a running unit may still need its CPU inputs.
 
     def begin_maintenance(self):
-        """Unload the GPU cohort while retaining this task's grant and broker."""
-        if self.maintenance is None or self._draining or self._maintenance_draining:
-            raise RuntimeError("cohort is not at a maintenance boundary")
+        """Begin a pending handoff when possible; otherwise leave it queued."""
+        if self.maintenance_mailbox is None or not self.maintenance_mailbox.pending:
+            raise RuntimeError("cohort has no pending maintenance request")
+        if self._draining or self._maintenance_draining:
+            return False
+        if not self.authorized or not self.ready:
+            return False
         self._maintenance_draining = True
         self.gpu.drain()
+        return True
 
     @property
     def maintenance_ready(self):
-        return self._maintenance_ready
+        return self._maintenance_ready and not self._draining
 
     def maintenance_state(self):
         if not self._maintenance_ready:

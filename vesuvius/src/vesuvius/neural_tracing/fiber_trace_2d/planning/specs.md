@@ -7765,3 +7765,14 @@ source base dimensions and scale must be preserved, including for subsets.
 - Workload, bindings, native summary, inference summary, logs, and compact
   metrics are retained per training step. Missing inputs, changed membership,
   incomplete output, or runner failure abort rather than falling back.
+- A reviewed-trace boundary is published synchronously into supervisor-owned
+  pending state and survives cohort drain/replacement. Replacement cohorts may
+  not admit another optimizer unit while that request is pending. Identical
+  `(kind, step, samples_seen)` publication is idempotent; conflicts fail.
+- Each attempt is bound to the exact applied manager epoch, generation, GPU
+  UUID set, and per-GPU VRAM grant. Release, epoch change, or expired transport
+  grace stops and verifies the complete attempt process group before release is
+  acknowledged; the request retries after regrant. Genuine runner failure is
+  fatal. Explicit shutdown cancels without retry.
+- Attempts write staged output. Only a complete validated attempt is atomically
+  promoted to the canonical step directory, which is never overwritten.

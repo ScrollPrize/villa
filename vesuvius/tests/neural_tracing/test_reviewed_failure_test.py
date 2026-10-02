@@ -8,6 +8,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.reviewed_failure_test import (
     validate_failure_union,
 )
 from vesuvius.neural_tracing.fiber_trace_3d.training_trace_benchmark import build_workload
+from vesuvius.neural_tracing.fiber_trace_3d import training_trace_benchmark
 from vesuvius.neural_tracing.fiber_trace_3d.train import _reviewed_trace_test_config
 from vesuvius.neural_tracing.fiber_trace_3d import train
 
@@ -107,6 +108,18 @@ def test_build_workload_locks_sources_and_runtime(tmp_path):
     assert result["evaluation"]["workers"] == 128
     assert result["evaluation"]["inference"]["max_batch_size"] == 4
     assert result["devices"] == "0,1"
+
+
+def test_training_trace_job_rejects_gpu_binding_outside_inherited_grant(monkeypatch, tmp_path):
+    job = tmp_path / "job.json"
+    job.write_text(json.dumps({
+        "inherited_manager_grant": True,
+        "gpu_grant": {"GPU-a": 10, "GPU-b": 20},
+        "devices": "0,1",
+    }))
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-a,GPU-c")
+    with pytest.raises(ValueError, match="does not match inherited grant"):
+        training_trace_benchmark.run_job(job)
 
 def test_reviewed_trace_config_validation():
     value = {"interval": 100, "template": "a", "split_root": "b",

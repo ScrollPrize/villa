@@ -248,30 +248,41 @@ def test_queue_publication_failure_is_not_silently_counted_as_delivery():
 
 def test_reviewed_trace_boundary_holds_cohort_idle_until_supervisor_drains():
     from vesuvius.neural_tracing.fiber_trace_3d.cooperative_cohort import FiberCohort
+    from vesuvius.neural_tracing.fiber_trace_3d.cooperative_maintenance import MaintenanceMailbox
 
     cohort = FiberCohort.__new__(FiberCohort)
     cohort.broker = SimpleNamespace(frontier=500, effective_batch_size=5)
-    cohort.maintenance = None
+    cohort.maintenance_mailbox = MaintenanceMailbox()
     cohort.gpu = SimpleNamespace(idle=True)
     cohort._on_startup_observation = None
     assert cohort._completed_unit([
         {"step": 100, "done": False, "phase": "reviewed_trace", "samples_seen": 500},
         {"step": 100, "done": False, "phase": "reviewed_trace", "samples_seen": 500},
     ]) is False
-    assert cohort.maintenance == {
+    assert cohort.maintenance_mailbox.request == {
         "kind": "reviewed_trace", "step": 100, "samples_seen": 500,
     }
     assert cohort.idle is False
 
+    # A replacement cohort sharing the supervisor mailbox starts held before
+    # it can admit another optimizer unit.
+    replacement = FiberCohort.__new__(FiberCohort)
+    replacement.maintenance_mailbox = cohort.maintenance_mailbox
+    replacement.gpu = SimpleNamespace(idle=True)
+    assert replacement.idle is False
+
 
 def test_reviewed_trace_maintenance_unloads_only_gpu_cohort():
     from vesuvius.neural_tracing.fiber_trace_3d.cooperative_cohort import FiberCohort
+    from vesuvius.neural_tracing.fiber_trace_3d.cooperative_maintenance import MaintenanceMailbox
 
     events = []
 
     class Gpu:
         closed = False
         state = object()
+        authorized = True
+        ready = True
 
         def drain(self):
             events.append("gpu-drain")
@@ -289,7 +300,9 @@ def test_reviewed_trace_maintenance_unloads_only_gpu_cohort():
     cohort = FiberCohort.__new__(FiberCohort)
     cohort.gpu = Gpu()
     cohort.broker = Broker()
-    cohort.maintenance = {"kind": "reviewed_trace", "step": 100}
+    cohort.maintenance_mailbox = MaintenanceMailbox()
+    request = {"kind": "reviewed_trace", "step": 100, "samples_seen": 500}
+    cohort.maintenance_mailbox.publish(request)
     cohort._draining = False
     cohort._maintenance_draining = False
     cohort._maintenance_ready = False
@@ -299,7 +312,8 @@ def test_reviewed_trace_maintenance_unloads_only_gpu_cohort():
     cohort._drain_queues = lambda: setattr(cohort, "_queues_closed", True)
     cohort._temp = SimpleNamespace(cleanup=lambda: events.append("temp-cleanup"))
 
-    cohort.begin_maintenance()
+    assert cohort.begin_maintenance()
+    assert not cohort.begin_maintenance()
     assert events == ["gpu-drain"]
     assert cohort.closed is False
     cohort.poll()
@@ -312,6 +326,79 @@ def test_reviewed_trace_maintenance_unloads_only_gpu_cohort():
     assert "temp-cleanup" in events
     # The broker is retained and remains serviceable throughout maintenance.
     assert events.count("broker-poll") == 2
+
+
+def test_reviewed_trace_maintenance_defers_across_allocation_drain():
+    from vesuvius.neural_tracing.fiber_trace_3d.cooperative_cohort import FiberCohort
+    from vesuvius.neural_tracing.fiber_trace_3d.cooperative_maintenance import MaintenanceMailbox
+
+    events = []
+    gpu = SimpleNamespace(
+        authorized=True, ready=True, idle=True, closed=False, state=object(),
+        drain=lambda: events.append("gpu-drain"),
+    )
+    broker = SimpleNamespace(
+        pipeline=SimpleNamespace(closed=True), workers_within_limit=lambda: True,
+    )
+    mailbox = MaintenanceMailbox()
+    request = {"kind": "reviewed_trace", "step": 100, "samples_seen": 500}
+    mailbox.publish(request)
+    cohort = FiberCohort.__new__(FiberCohort)
+    cohort.gpu = gpu
+    cohort.broker = broker
+    cohort.maintenance_mailbox = mailbox
+    cohort._draining = False
+    cohort._maintenance_draining = False
+    cohort._maintenance_ready = False
+    cohort._queues_closed = True
+
+    # A manager release wins this cohort, but does not consume the mailbox.
+    cohort.drain()
+    assert events == ["gpu-drain"]
+    assert not cohort.begin_maintenance()
+    gpu.closed = True
+    mailbox.begin_attempt(request, ("epoch", 1, "grant"))
+    assert not cohort.closed  # Release cannot be acknowledged before child reap.
+    mailbox.end_attempt(("epoch", 1, "grant"))
+    assert cohort.closed
+    assert mailbox.request == request
+
+    # The replacement attaches to the same mailbox. It remains held while
+    # initializing, then starts exactly one maintenance drain when ready.
+    replacement_gpu = SimpleNamespace(
+        authorized=False, ready=False, idle=True, closed=False, state=object(),
+        drain=lambda: events.append("replacement-drain"),
+    )
+    replacement = FiberCohort.__new__(FiberCohort)
+    replacement.gpu = replacement_gpu
+    replacement.maintenance_mailbox = mailbox
+    replacement._draining = False
+    replacement._maintenance_draining = False
+    assert not replacement.idle
+    assert not replacement.begin_maintenance()
+    replacement_gpu.authorized = replacement_gpu.ready = True
+    assert replacement.begin_maintenance()
+    assert not replacement.begin_maintenance()
+    assert events == ["gpu-drain", "replacement-drain"]
+
+
+def test_maintenance_mailbox_is_idempotent_and_rejects_conflicts():
+    from vesuvius.neural_tracing.fiber_trace_3d.cooperative_maintenance import MaintenanceMailbox
+
+    mailbox = MaintenanceMailbox()
+    request = {"kind": "reviewed_trace", "step": 100, "samples_seen": 500}
+    assert mailbox.publish(request)
+    assert not mailbox.publish(dict(request))
+    with pytest.raises(RuntimeError, match="conflicting maintenance"):
+        mailbox.publish({"kind": "reviewed_trace", "step": 101, "samples_seen": 505})
+    token = ("epoch", 1, "grant")
+    mailbox.begin_attempt(request, token)
+    with pytest.raises(RuntimeError, match="attempt is active"):
+        mailbox.complete(request)
+    mailbox.end_attempt(token)
+    mailbox.complete(request)
+    assert not mailbox.publish(request)
+    assert not mailbox.pending
 
 
 def test_cohort_constructor_failure_reaps_children(monkeypatch, tmp_path):

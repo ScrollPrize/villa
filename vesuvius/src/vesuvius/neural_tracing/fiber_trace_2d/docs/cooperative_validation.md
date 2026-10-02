@@ -131,3 +131,18 @@ Host queues/parking are structurally tested; the planned extended pause-RAM
 settling study was omitted when the user requested short tests. The venv was not
 reinstalled. Default CPU/manager tests take about 84 s here, and every normal
 launcher invocation is capped at 300 s total. Long sweeps are explicitly rejected.
+
+## Deferred reviewed-trace maintenance
+
+Periodic reviewed-trace tests are supervisor-owned pending work, not state
+owned by a replaceable GPU cohort. The completed training boundary publishes an
+exact `(kind, step, samples_seen)` request synchronously. Any replacement cohort
+starts held until that request completes, so pause/reallocation cannot lose the
+test or admit the next optimizer unit first.
+
+The test starts only with an applied manager epoch/generation and exact GPU UUID
+and VRAM grant. Its output remains in an attempt directory until validation and
+is then atomically promoted to `reviewed_trace_test/step_NNNNNNNN`. If ownership
+is revoked, the complete child process group is reaped and its transient cache
+cleaned before release; the same request retries after regrant. A real benchmark
+failure remains fatal rather than being mistaken for a manager retry.

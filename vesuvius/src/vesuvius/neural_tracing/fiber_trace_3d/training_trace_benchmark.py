@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -67,6 +68,20 @@ def run_job(job_path: Path) -> dict[str, float]:
     job = json.loads(job_path.read_text())
     if job.get("inherited_manager_grant") is not True:
         raise ValueError("training trace benchmark requires an inherited manager grant")
+    grant = job.get("gpu_grant")
+    if (not isinstance(grant, dict) or not grant
+            or any(not isinstance(gpu, str) or not gpu.startswith("GPU-")
+                   or type(vram) is not int or vram <= 0
+                   for gpu, vram in grant.items())):
+        raise ValueError("training trace benchmark requires the exact inherited GPU grant")
+    visible = [token.strip() for token in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if token.strip()]
+    expected_uuids = sorted(grant)
+    expected_devices = ",".join(str(index) for index in range(len(expected_uuids)))
+    if visible != expected_uuids or job.get("devices") != expected_devices:
+        raise ValueError(
+            f"training trace GPU binding does not match inherited grant: "
+            f"visible={visible} devices={job.get('devices')!r} grant={expected_uuids}"
+        )
     output = Path(job["output_root"]).resolve()
     output.mkdir(parents=True, exist_ok=True)
     workload = build_workload(

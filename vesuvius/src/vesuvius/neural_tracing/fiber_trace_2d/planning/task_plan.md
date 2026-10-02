@@ -1,62 +1,60 @@
-# Plan: training-integrated reviewed failure benchmark
+# Plan: graceful cooperative maintenance under allocation changes
 
-## Dataset
+## Lifecycle
 
-1. Define the canonical source evaluations as `lowres`, `fullres`, `gaussian`,
-   `halfsigma_raw`, and `halfsigma_ema99` from reviewed cohort v3.
-2. Select a whole truncated piece when either direction has at least one saved
-   failure in any canonical source evaluation; deduplicate by scroll and source
-   index. The expected frozen membership is 32 pieces.
-3. Materialize those exact JSON files under a new versioned local test root and
-   write a manifest containing source evaluations, source paths, and SHA-256.
-   Validation must fail on missing, extra, or changed files.
-
-## Dense training tests
-
-4. Add a derived training configuration whose `test_datasets` point only to the
-   frozen failure-union root. Retain the current deterministic dense loss,
-   refinement, EMA, cross-section, and TensorBoard implementations unchanged.
-5. Make the expected test membership explicit so accidental glob growth fails.
-
-## Native trace test
-
-6. Extract a reusable training-trace benchmark adapter around the existing
-   `run_classic_fiber_evaluation.py` preparation/live inference/native replay
-   implementation; do not copy its inference or tracing logic.
-7. At a configured interval, rank zero freezes the current raw model, prepares
-   a per-step workload over the same frozen 32 pieces, and invokes the existing
-   optimized runner as a child of the already managed training task. Other DDP
-   ranks remain responsive through periodic distributed completion polling.
-8. Parse only complete summaries with all 64 directed cases and no
-   infrastructure failures. Persist the workload, bindings, summary, inference
-   summary, and compact metrics under the training run.
-9. Log forward/reverse/combined restarts, reference lengths, and implied mean
-   lengths to stdout and TensorBoard. The combined implied length is total
-   directed reference millimetres divided by `(combined_restarts + 1)`.
-10. Bound transient prediction storage and fail loudly rather than silently
-    skipping a trace test.
+1. Store the durable pending maintenance request in a supervisor-owned mailbox
+   passed to every replaceable GPU cohort. Publish synchronously from the
+   completed worker boundary, before the supervisor can observe a release.
+   Deduplicate by `(kind, step, samples_seen)`; conflicting requests fail.
+2. Make cohort maintenance admission idempotent and deferrable: attach the
+   request immediately to block new optimizer units, but begin GPU draining
+   only when the cohort is ready and is not already allocation-draining.
+3. Permit an allocation-draining cohort to close even when it carried a
+   maintenance request; the supervisor's handoff state remains authoritative.
+4. Replacement cohorts consult the same mailbox and start held while work is
+   pending. Execute only under an exact currently-applied
+   `(server epoch, generation, grant)` token.
+5. Bind the trace child to the exact granted GPU UUIDs, count, and VRAM rather
+   than the configured maximum or assumed physical ordinals.
+6. Track the cohort/token owning an active reviewed-trace child. If ownership
+   is revoked (including epoch change or expired disconnect grace), stop and
+   verify-reap its complete setsid process group before release acknowledgement,
+   clean its transient cache, retain the request, and retry after reallocation.
+   Explicit shutdown cancels without retry. A genuine child failure remains
+   fatal; only manager revocation retries.
+7. Write each attempt to a staging directory and atomically promote only a
+   validated complete result to the canonical step directory. Preserve or
+   safely clean incomplete attempts and never overwrite a completed result.
+8. Reconstruct directly after success only if the exact owning token remains
+   applied and is not draining; otherwise let normal supervisor release/regrant
+   reconstruct from its handoff state.
 
 ## Validation
 
-11. Unit-test failure-union selection, manifest validation, directional restart
-    aggregation, implied-length arithmetic, subprocess completion/failure, and
-    distributed polling without requiring CUDA.
-12. Run focused Python tests and existing native replay tests. Then stop the
-    currently running old-test configuration and launch a resume using GPUs
-    0-5. Confirm one dense test and one 64-direction trace test complete.
+9. Add CPU-only interleaving tests covering release before discovery, during
+   handoff, before child spawn, during the child, concurrent successful exit,
+   changed GPU UUID/count, pause/unpause, epoch change, grace expiry, explicit
+   stop, genuine child failure, retry-output collision, exact-once metrics, and
+   absence of duplicated optimizer boundaries. Assert release is never reported
+   while a trace GPU descendant remains alive.
+10. Run the focused cooperative integration and manager lifecycle tests plus
+   `git diff --check`.
+11. Resume the failed production run from its update-42600 checkpoint. Force a
+   pause/reallocation during a trace attempt, then verify retry, trace completion,
+   and later training progress.
 
 ## Spec update
 
-- Add the immutable 32-piece reviewed-failure test membership, selection bias,
-  canonical source evaluations, trace metrics, and no-fallback requirements.
+- Specify that application maintenance is pending durable state across manager
+  allocation changes, must never make release unacknowledgeable, and may run
+  only while its owning grant remains applied.
 
 ## Documentation updates
 
-- Add the training-integrated benchmark to `docs/benchmark_runbook.md`, clearly
-  identifying it as a failure-enriched regression metric rather than an
-  unbiased generalization estimate.
+- Update the cooperative validation/runbook lifecycle notes to describe
+  deferred maintenance and retry under pause/reallocation.
 
 ## Changelog
 
-- Record the locked failure-union dataset and training-integrated native trace
-  metrics.
+- Record the cooperative maintenance/reallocation race fix and production
+  validation.

@@ -3431,3 +3431,10 @@ identity remains unconfirmed. Global-assignment experiments not yet implemented.
 - With the same models/cache/protocol on GPUs 0-5: lowres 29 restarts/46.206 mm,
   previous fullres 36/37.464 mm, and Gaussian u17700 32/42.005 mm. Exact results
   are in `docs/benchmarks/reviewed_fibers_corrected_20260930.*`.
+
+## 2026-10-02 — Allocation-safe training maintenance
+
+- Made periodic reviewed-trace requests durable across cooperative GPU cohort
+  release/replacement. Attempts are tied to exact manager ownership, use exact
+  granted GPU UUIDs, stage output atomically, and are reaped/retried when a
+  manager allocation changes instead of crashing training or retaining GPUs.
