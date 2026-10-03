@@ -36,6 +36,11 @@ CPU_TESTS = [
     "tests/neural_tracing/test_cooperative_reference.py",
 ]
 SUITES = {
+    "resident-native": ["tests/neural_tracing/test_native_replay_evaluation.py", "-k", "complete_runner_cold_and_warm", "-s"],
+    "resident-api": ["tests/scripts/test_classic_fiber_evaluation.py", "tests/neural_tracing/test_resident_trace.py", "tests/neural_tracing/test_reviewed_failure_test.py", "tests/neural_tracing/test_reviewed_trace_selection.py", "tests/neural_tracing/test_cooperative_integration.py"],
+    "resident-trace": ["tests/neural_tracing/test_resident_trace.py", "tests/neural_tracing/test_reviewed_failure_test.py", "tests/neural_tracing/test_reviewed_trace_selection.py", "tests/neural_tracing/test_cooperative_integration.py", "tests/neural_tracing/test_demand_gpu.py", "../lasagna/tests/test_dynamic_inference_batching.py", "../lasagna/tests/test_demand_predict3d.py"],
+    "cuda-resident-state": ["tests/neural_tracing/test_resident_trace.py", "-k", "cuda", "-s"],
+    "cuda-resident-trace": ["tests/neural_tracing/test_cooperative_integration.py", "-k", "different_rank_count and cuda and not True", "-s"],
     "split-embedding-cpu": [
         "tests/neural_tracing/test_paired_embeddings.py",
         "tests/neural_tracing/test_refinement.py::test_config_rejects_invalid",
@@ -129,6 +134,8 @@ def main():
         env.pop("FIBER_COOPERATIVE_CUDA_TEST", None)
         env.pop("FIBER_COOPERATIVE_TEST_GPUS", None)
         env.pop("FIBER_EMBEDDING_DATA_TEST", None)
+        if suite == "resident-native":
+            env["VC_REPLAY_TEST_BINARY"] = str(ROOT / "volume-cartographer/build/fiber-evaluation/bin/vc_fiber_trace_metric")
         if suite == "demand-gpu-live":
             # This suite tests its own demand-scoped lease, not an outer
             # exclusive reservation which would prevent reacquisition.
@@ -201,6 +208,9 @@ def main():
                 from villa_gpu_manager.exclusive_command import ExclusiveCommand
                 wait_started = time.monotonic()
                 manager_socket, inventory = ensure_manager()
+                if suite.startswith("cuda-resident-"):
+                    inventory = {"cpu_cores": min(8, inventory["cpu_cores"]),
+                                 "gpus": {gpu: inventory["gpus"][gpu] for gpu in peaks}}
                 lease = resources.enter_context(ExclusiveTask(manager_socket, inventory,
                     label=f"fiber-tests-{suite}", priority=100))
                 # Resource waiting is not test execution time.

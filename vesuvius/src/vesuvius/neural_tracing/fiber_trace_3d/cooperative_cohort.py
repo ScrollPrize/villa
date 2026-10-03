@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import queue
 import tempfile
+import threading
 import time
 
 from .cooperative_resources import EffectiveBatchSampleIndex
@@ -32,8 +33,9 @@ class FiberCohort:
         self.broker = broker
         self.grant = grant
         self._draining = False
-        self._maintenance_draining = False
+        self._maintenance_active = False
         self._maintenance_ready = False
+        self._trace_start_requested = threading.Event()
         self._queues_closed = False
         self._sent, self._drained = [], []
         self._pending = {}
@@ -68,12 +70,16 @@ class FiberCohort:
             raise ValueError("grant cannot fit a calibrated microbatch")
         self._queues, self._received, self._maps = [], [], []
         self._test_connections, self._test_children, self._test_pending = [], [], {}
+        self._trace_connections, self._trace_children = [], []
         self._test_boundaries = {}
         self._ordinals = [0] * len(sizes)
         self._samples = [0] * len(sizes)
         start_step = broker.frontier // broker.effective_batch_size
         try:
             for rank in range(len(sizes)):
+                parent_trace, child_trace = context.Pipe(duplex=True)
+                self._trace_connections.append(parent_trace)
+                self._trace_children.append(child_trace)
                 parent_test, child_test = context.Pipe(duplex=True)
                 self._test_connections.append(parent_test)
                 self._test_children.append(child_test)
@@ -96,11 +102,14 @@ class FiberCohort:
                 calibrated_torch_versions=tuple(sorted({row["torch_version"] for row in calibration_observations})),
                 calibrated_cuda_versions=tuple(sorted({row["cuda_version"] for row in calibration_observations})),
                 test_connections=tuple(self._test_children),
+                trace_connections=tuple(self._trace_children),
                 measure_startup_memory=startup_microbatch_size is not None,
             )
             self.gpu = ProcessCohort(factory, grant, state, environment=native_thread_environment(),
                                      on_unit=self._completed_unit, on_process_start=on_process_start)
             self._gpu_pids = {row["pid"] for row in self.gpu.processes}
+            for connection in self._trace_children:
+                connection.close()
             if calibration_observations or startup_microbatch_size is not None:
                 from villa_gpu_manager.processes import NvidiaMonitor
                 self._memory_monitor = NvidiaMonitor(grant, 0, interval=1)
@@ -124,7 +133,7 @@ class FiberCohort:
         frontier = self.broker.frontier // self.broker.effective_batch_size
         if step != frontier:
             self.broker.commit(step)
-        elif rows[0].get("phase") not in ("test", "update", "reviewed_trace"):
+        elif rows[0].get("phase") not in ("test", "update", "reviewed_trace", "reviewed_trace_complete"):
             raise RuntimeError("invalid repeated training boundary")
         if rows[0].get("phase") == "reviewed_trace":
             samples_seen = rows[0].get("samples_seen")
@@ -156,7 +165,7 @@ class FiberCohort:
     @property
     def idle(self):
         # Hold the cohort at the completed trace boundary until the CPU
-        # supervisor has requested a pause/drain.  It must not admit the next
+        # supervisor has completed tracing. It must not admit the next
         # optimizer unit in the same manager tick.
         return self.gpu.idle and not (
             self.maintenance_mailbox is not None and self.maintenance_mailbox.pending
@@ -198,45 +207,52 @@ class FiberCohort:
 
     def drain(self):
         self._draining = True
-        self.gpu.drain()
+        if not self._maintenance_active or not self.maintenance_mailbox.attempt_active:
+            self._maintenance_active = self._maintenance_ready = False
+            self.gpu.drain()
         # Do NOT park loaders yet: a running unit may still need its CPU inputs.
 
     def begin_maintenance(self):
-        """Begin a pending handoff when possible; otherwise leave it queued."""
+        """Borrow the idle replicas for pending tracing; never unload them."""
         if self.maintenance_mailbox is None or not self.maintenance_mailbox.pending:
             raise RuntimeError("cohort has no pending maintenance request")
-        if self._draining or self._maintenance_draining:
+        if self._draining or self._maintenance_active:
             return False
-        if not self.authorized or not self.ready:
+        if not self.authorized or not self.ready or not self.gpu.idle:
             return False
-        self._maintenance_draining = True
-        self.gpu.drain()
+        self._maintenance_active = True
+        self._maintenance_ready = True
         return True
 
     @property
     def maintenance_ready(self):
         return self._maintenance_ready and not self._draining
 
-    def maintenance_state(self):
-        if not self._maintenance_ready:
-            raise RuntimeError("maintenance handoff is not ready")
-        return self.gpu.state
+    def resident_worker_factory(self, cancel_event):
+        from .resident_trace import ResidentWorkers
+        def create(arguments, count):
+            if count != len(self._trace_connections) or not self.maintenance_ready:
+                raise RuntimeError("resident trace requires the current complete GPU cohort")
+            return ResidentWorkers(self._trace_connections, arguments,
+                                   self._trace_start_requested.set, cancel_event)
+        return create
+
+    def finish_maintenance(self):
+        self._maintenance_ready = self._maintenance_active = False
+        if self._draining and not self.gpu.closed:
+            self.gpu.drain()
 
     def poll(self):
         self._check_publication()
         self.broker.poll()
         self.gpu.poll()
-        if self._maintenance_draining:
-            if not self.gpu.closed:
-                return
-            if self._memory_monitor is not None:
-                self._memory_monitor.close()
-                self._memory_monitor = None
-            self.broker.set_worker_limit(0)
-            self._drain_queues()
-            if self._queues_closed:
-                self._temp.cleanup()
-                self._maintenance_ready = True
+        if self._maintenance_active:
+            if self._trace_start_requested.is_set():
+                # Only the supervisor thread touches the nonblocking cohort
+                # channels. Descriptor writers wait independently for workers.
+                self.gpu.start_unit()
+                self._trace_start_requested.clear()
+            self._check_driver_memory()
             return
         if self.gpu.closed:
             if self._memory_monitor is not None:
@@ -356,7 +372,7 @@ class FiberCohort:
     def _close_queues(self, *, abort=False):
         if self._queues_closed:
             return
-        for connection in self._test_connections + self._test_children:
+        for connection in self._test_connections + self._test_children + self._trace_connections + self._trace_children:
             connection.close()
         for batches in self._queues:
             if abort:

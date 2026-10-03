@@ -143,8 +143,8 @@ test or admit the next optimizer unit first.
 The test starts only with an applied manager epoch/generation and exact GPU UUID
 and VRAM grant. Its output remains in an attempt directory until validation and
 is then atomically promoted to `reviewed_trace_test/step_NNNNNNNN`. If ownership
-is revoked, the complete child process group is reaped and its transient cache
-cleaned before release; the same request retries after regrant. A real benchmark
+is revoked, inference admission stops, resident GPU work finishes and its transient cache
+is cleaned before the normal cohort drain/release; the same request retries after regrant. A real benchmark
 failure remains fatal rather than being mistaken for a manager retry.
 
 Before launch, the supervisor freezes the exact raw checkpoint into the
@@ -161,3 +161,43 @@ This recovers interruption between successful tracing, checkpoint selection,
 and result-directory promotion without ever admitting incomplete or revoked
 work. Results from a changed locked split, tracer binary, template, runner, or
 effective workload are rejected as a different benchmark rather than compared.
+
+### Resident execution
+
+Training calls `training_trace_benchmark.run_job`, which uses shared
+`evaluation_workload.prepare`, `audit_prepared` and `run_prepared` functions.
+The command-line evaluator uses the same preparation and audit implementation.
+No Python benchmark interpreter or replacement model is launched per test.
+The CPU coordinator runs on a supervisor thread so manager polling continues.
+The existing native C++ tracer executable and parallel CPU data/accumulator
+workers remain; this is not a serial Python replacement for those workers.
+
+At a trace boundary, training CUDA prefetch is paused and the raw model,
+optimizer and EMA stay resident. `resident_trace` forwards shared-slot tile
+descriptors to those GPU replicas. `DemandWorkerPool` borrows this executor;
+it does not own or terminate training processes. Both paths use the same
+tiled inference preprocessing, precision, product conversion and blending.
+Per-module modes, RNG and TF32 flags are restored before training resumes.
+Only unused CUDA scratch is released. If necessary inference batches split
+on OOM without changing tile geometry; a single tile that cannot fit alongside
+training state fails explicitly rather than evacuating the optimizer silently.
+
+The borrowed executor acknowledges shutdown before shared buffers are freed.
+Large descriptors are sent only after a small command wakes the replicas,
+avoiding pipe-capacity startup deadlocks. Native and CPU workers are registered
+with the training stop guard and joined by the shared evaluator's cleanup.
+Only a real manager allocation change or training shutdown reconstructs workers.
+An explicitly unmanaged debug run must disable `reviewed_trace_test`: it has
+no resident managed executor and no longer falls back to a second model process.
+Mixed-checkpoint embedding inference is likewise not a resident raw-model test.
+
+Validation uses the fixed approved command (edit its adjacent JSON suite list):
+
+```bash
+/home/hendrik/villa/vesuvius/scripts/run_fiber3d_cooperative_tests
+```
+
+Suites `resident-trace`, `cuda-resident-state`, and `cuda-resident-trace` cover
+buffer delivery, cancellation, model/optimizer/RNG preservation, actual
+two-rank training → resident inference → training, and reallocation to one rank.
+CUDA suites obtain a manager grant only for the selected test GPU UUIDs.

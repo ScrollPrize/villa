@@ -12,12 +12,11 @@ from copy import deepcopy
 import json
 import os
 import signal
-import subprocess
-import sys
 import time
 
 from .cooperative_resources import MemoryCalibration
 from .training_state import checkpoint_sources, config_fingerprint
+from .training_trace_benchmark import run_job
 
 
 @dataclass(frozen=True)
@@ -223,9 +222,9 @@ def run_cooperative_training(config_path, *, socket=None, resume_checkpoint=None
 
     previous = {sig: signal.signal(sig, stop) for sig in (signal.SIGINT, signal.SIGTERM)}
     last_status = None
-    maintenance_process = None
-    maintenance_log = None
-    maintenance_group = None
+    maintenance_future = None
+    maintenance_thread = None
+    maintenance_cancel = None
     maintenance_owner = None
     maintenance_token = None
     maintenance_attempt = None
@@ -256,13 +255,11 @@ def run_cooperative_training(config_path, *, socket=None, resume_checkpoint=None
         )
 
     def start_reviewed_trace(request, token):
-        nonlocal maintenance_process, maintenance_log, maintenance_group
+        nonlocal maintenance_future, maintenance_thread, maintenance_cancel
         nonlocal maintenance_owner, maintenance_token, maintenance_attempt
         nonlocal maintenance_attempt_index
         from .train import _reviewed_trace_test_config
         from .reviewed_trace_selection import freeze_raw_checkpoint
-        from villa_gpu_manager.exclusive import OwnedProcessGroup
-        from villa_gpu_manager.processes import process_identity
         trace = _reviewed_trace_test_config(training)
         if trace is None:
             raise RuntimeError("reviewed trace boundary has no configured test")
@@ -303,125 +300,74 @@ def run_cooperative_training(config_path, *, socket=None, resume_checkpoint=None
         }
         job_path = attempt / "job.json"
         job_path.write_text(json.dumps(job, indent=2) + "\n")
-        environment = dict(os.environ)
-        for name in ("RANK", "WORLD_SIZE", "LOCAL_RANK", "MASTER_ADDR", "MASTER_PORT"):
-            environment.pop(name, None)
-        environment["CUDA_VISIBLE_DEVICES"] = ",".join(sorted(supervisor.grant["gpus"]))
-        maintenance_log = (attempt / "runner.log").open("w")
-        maintenance_mailbox.begin_attempt(request, token)
-        try:
-            maintenance_process = subprocess.Popen(
-                [sys.executable, "-m",
-                 "vesuvius.neural_tracing.fiber_trace_3d.training_trace_benchmark",
-                 str(job_path)],
-                cwd=Path(__file__).resolve().parents[5], env=environment,
-                stdout=maintenance_log, stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
-            maintenance_group = OwnedProcessGroup(process_identity(maintenance_process.pid))
-        except BaseException:
-            if maintenance_process is not None and maintenance_process.poll() is None:
-                try:
-                    os.killpg(maintenance_process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                maintenance_process.wait(timeout=5)
-            (attempt / "evaluated_raw.pt").unlink(missing_ok=True)
-            maintenance_mailbox.end_attempt(token)
-            maintenance_log.close()
-            maintenance_log = None
-            maintenance_process = None
-            maintenance_group = None
-            raise
+        from concurrent.futures import Future
+        import threading
+        maintenance_cancel = threading.Event()
+        maintenance_future = Future()
         maintenance_owner = supervisor.cohort
         maintenance_token = token
         maintenance_attempt = attempt
-        stop_guard.register([maintenance_process.pid])
-        print(
-            f"fiber cooperative: training model unloaded; reviewed trace started "
-            f"step={step} pid={maintenance_process.pid} output={attempt} "
-            f"generation={token[1]} gpus={','.join(sorted(supervisor.grant['gpus']))}",
-            flush=True,
-        )
+        maintenance_mailbox.begin_attempt(request, token)
+        factory = maintenance_owner.resident_worker_factory(maintenance_cancel)
+        future = maintenance_future
+        def evaluate():
+            try:
+                future.set_result(run_job(job_path, worker_factory=factory,
+                                          cancel_event=maintenance_cancel,
+                                          on_process_start=stop_guard.register))
+            except BaseException as error:
+                future.set_exception(error)
+        maintenance_thread = threading.Thread(target=evaluate, name="training-trace")
+        maintenance_thread.start()
+        print(f"fiber cooperative: resident reviewed trace started step={step} "
+              f"output={attempt} generation={token[1]}", flush=True)
 
-    def finish_reviewed_trace(request, returncode):
-        nonlocal maintenance_process, maintenance_log, maintenance_group
-        nonlocal maintenance_attempt
-        if maintenance_log is not None:
-            maintenance_log.flush()
-            maintenance_log.close()
-            maintenance_log = None
+    def finish_reviewed_trace(request):
+        nonlocal maintenance_future, maintenance_attempt, maintenance_owner, maintenance_token
+        from .reviewed_trace_selection import finalize_attempt
+        maintenance_future.result()
+        maintenance_thread.join()
         output = maintenance_attempt
-        if output is None:
-            raise RuntimeError("reviewed trace attempt path is missing")
-        if returncode == 0:
-            from .reviewed_trace_selection import finalize_attempt
-            canonical = output.parent / f"step_{int(request['step']):08d}"
-            metrics, selection, output = finalize_attempt(
-                output, snapshot_dir, canonical=canonical
-            )
-            if hub.writer is not None:
-                for key in (
-                    "restarts_forward", "restarts_reverse", "restarts_combined",
-                    "reference_mm_forward", "reference_mm_reverse", "reference_mm_combined",
-                    "implied_mean_mm_forward", "implied_mean_mm_reverse",
-                    "implied_mean_mm_combined", "wall_seconds",
-                ):
-                    hub.writer.add_scalar(
-                        f"reviewed_trace/{key}", metrics[key], int(request["samples_seen"])
-                    )
-                hub.writer.flush()
-            print(
-                "fiber cooperative: reviewed trace complete "
-                f"step={request['step']} combined_restarts={metrics['restarts_combined']} "
-                f"combined_implied_mm={metrics['implied_mean_mm_combined']:.6f} "
-                f"best_reviewed_trace={selection['best_restarts_combined']} "
-                f"selected={selection['selected']}",
-                flush=True,
-            )
-        else:
-            tail = (output / "runner.log").read_text(errors="replace")[-8000:]
-            raise RuntimeError(
-                f"reviewed trace failed step={request['step']} exit={returncode}\n{tail}"
-            )
-        maintenance_process = None
-        maintenance_group = None
-        maintenance_attempt = None
+        canonical = output.parent / f"step_{int(request['step']):08d}"
+        metrics, selection, output = finalize_attempt(output, snapshot_dir, canonical=canonical)
+        if hub.writer is not None:
+            for key in ("restarts_forward", "restarts_reverse", "restarts_combined",
+                        "reference_mm_forward", "reference_mm_reverse", "reference_mm_combined",
+                        "implied_mean_mm_forward", "implied_mean_mm_reverse",
+                        "implied_mean_mm_combined", "wall_seconds"):
+                hub.writer.add_scalar(f"reviewed_trace/{key}", metrics[key], int(request["samples_seen"]))
+            hub.writer.flush()
+        print(f"fiber cooperative: reviewed trace complete step={request['step']} "
+              f"combined_restarts={metrics['restarts_combined']} "
+              f"best_reviewed_trace={selection['best_restarts_combined']} "
+              f"selected={selection['selected']}", flush=True)
         maintenance_mailbox.end_attempt(maintenance_token)
-        return metrics
+        maintenance_mailbox.complete(request)
+        maintenance_owner.finish_maintenance()
+        maintenance_future = maintenance_attempt = maintenance_owner = maintenance_token = None
 
     def cancel_reviewed_trace(reason):
-        nonlocal maintenance_process, maintenance_log, maintenance_group
-        nonlocal maintenance_owner, maintenance_token, maintenance_attempt
-        if maintenance_process is None:
+        nonlocal maintenance_future, maintenance_attempt, maintenance_owner, maintenance_token
+        if maintenance_future is None:
             return
-        attempt = maintenance_attempt
-        if maintenance_process.poll() is None:
-            maintenance_group.close(reap=maintenance_process.poll)
-        maintenance_process.wait(timeout=1)
-        if maintenance_log is not None:
-            maintenance_log.flush()
-            maintenance_log.close()
-            maintenance_log = None
-        if attempt is not None and attempt.exists():
-            workload_path = attempt / "workload.json"
-            if workload_path.is_file():
-                from .training_trace_benchmark import cleanup_prediction_cache
-                cleanup_prediction_cache(json.loads(workload_path.read_text()), attempt)
-            (attempt / "evaluated_raw.pt").unlink(missing_ok=True)
-            aborted = attempt.with_name(attempt.name + f".revoked-{time.time_ns()}")
-            attempt.rename(aborted)
-        print(
-            f"fiber cooperative: reviewed trace deferred reason={reason}; "
-            "child process group reaped and request remains pending",
-            flush=True,
-        )
-        maintenance_process = None
-        maintenance_group = None
+        maintenance_cancel.set()
+        if not maintenance_future.done():
+            return
+        maintenance_thread.join()
+        # The callable's finally block has joined all tile workers and cleaned
+        # prediction buffers before ownership can be released.
+        try:
+            maintenance_future.result()
+        except BaseException as error:
+            print(f"fiber cooperative: cancelled trace: {type(error).__name__}: {error}", flush=True)
+        if maintenance_attempt is not None and maintenance_attempt.exists():
+            (maintenance_attempt / "evaluated_raw.pt").unlink(missing_ok=True)
+            maintenance_attempt.rename(maintenance_attempt.with_name(
+                maintenance_attempt.name + f".revoked-{time.time_ns()}"))
         maintenance_mailbox.end_attempt(maintenance_token)
-        maintenance_owner = None
-        maintenance_token = None
-        maintenance_attempt = None
+        maintenance_owner.finish_maintenance()
+        maintenance_future = maintenance_attempt = maintenance_owner = maintenance_token = None
+        print(f"fiber cooperative: reviewed trace deferred reason={reason}; request remains pending", flush=True)
     try:
         while True:
             stop_guard.check()
@@ -432,45 +378,15 @@ def run_cooperative_training(config_path, *, socket=None, resume_checkpoint=None
                     supervisor.fail(error)
             supervisor.tick()
             request = maintenance_mailbox.request
-            if maintenance_process is not None:
-                returncode = maintenance_process.poll()
-                ownership_current = owner_is_current()
-                if returncode is not None and returncode == 0:
-                    old = maintenance_owner
-                    finish_reviewed_trace(request, returncode)
-                    state = old.maintenance_state() if ownership_current else None
-                    maintenance_mailbox.complete(request)
-                    maintenance_owner = None
-                    maintenance_token = None
-                    if ownership_current:
-                        if supervisor.state is not None and supervisor.state is not state:
-                            supervisor.dispose_state(supervisor.state)
-                        supervisor.state = state
-                        supervisor.cohort = cohort_factory(supervisor.grant, state)
-                        print(
-                            "fiber cooperative: reviewed trace workers exited; "
-                            "reinitializing training under retained allocation",
-                            flush=True,
-                        )
-                    else:
-                        print(
-                            "fiber cooperative: reviewed trace completed while allocation changed; "
-                            "normal supervisor reconstruction will resume training",
-                            flush=True,
-                        )
-                elif not ownership_current:
+            if maintenance_future is not None:
+                if not owner_is_current() or maintenance_cancel.is_set():
                     cancel_reviewed_trace("manager allocation changed")
-                elif returncode is not None:
-                    finish_reviewed_trace(request, returncode)
+                elif maintenance_future.done():
+                    finish_reviewed_trace(request)
             request = maintenance_mailbox.request
-            if (request is not None and maintenance_process is None
+            if (request is not None and maintenance_future is None
                     and supervisor.cohort is not None):
-                if supervisor.cohort.begin_maintenance():
-                    print(
-                        f"fiber cooperative: reviewed trace boundary step={request['step']}; "
-                        "unloading training model while retaining allocation",
-                        flush=True,
-                    )
+                supervisor.cohort.begin_maintenance()
                 token = applied_ownership_token()
                 if supervisor.cohort.maintenance_ready and token is not None:
                     start_reviewed_trace(request, token)
@@ -517,13 +433,13 @@ def run_cooperative_training(config_path, *, socket=None, resume_checkpoint=None
         # in reverse order: workers must join before their CPU resources close.
         if not stop_guard.stopping:
             stop_guard.stop()
-        if maintenance_process is not None:
+        if maintenance_future is not None:
+            maintenance_cancel.set()
+            if supervisor.cohort is not None:
+                supervisor.cohort.gpu.abort()
+            maintenance_thread.join()
             cancel_reviewed_trace("training supervisor stopping")
         with ExitStack() as cleanup:
-            if maintenance_log is not None:
-                cleanup.callback(maintenance_log.close)
-            if maintenance_process is not None and maintenance_process.poll() is None:
-                cleanup.callback(maintenance_process.wait)
             cleanup.callback(stop_guard.close)
             for sig, handler in previous.items():
                 cleanup.callback(signal.signal, sig, handler)

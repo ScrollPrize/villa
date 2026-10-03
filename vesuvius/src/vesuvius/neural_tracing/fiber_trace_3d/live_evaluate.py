@@ -430,8 +430,14 @@ def runtime_inference_settings(settings, adaptive_manager):
     return runtime
 
 
+def _reference_worker_session():
+    if hasattr(os, "setsid"):
+        os.setsid()
+
+
 def run(config_path, checkpoint, devices, native_binary, model_config=None, *, render=False,
-        manager_socket=None, manager_priority=None, unmanaged=False, runtime_overrides=None):
+        manager_socket=None, manager_priority=None, unmanaged=False, runtime_overrides=None,
+        worker_factory=None, cancel_event=None, on_process_start=None):
     config_path = Path(config_path).resolve()
     config = json.loads(config_path.read_text())
     runtime_overrides = dict(runtime_overrides or {})
@@ -458,6 +464,8 @@ def run(config_path, checkpoint, devices, native_binary, model_config=None, *, r
     settings = dict(config.get("inference", {}))
     trace_args = config.get("trace_args", [])
     mixed = config.get("embedding_inference")
+    if worker_factory is not None and mixed is not None:
+        raise ValueError("resident training trace cannot use a different embedding checkpoint")
     if settings.get('tta') and mixed is not None:
         raise ValueError('TTA pilot does not support mixed embedding inference')
     if mixed is not None and (not isinstance(mixed, dict) or not mixed.get("checkpoint")):
@@ -472,7 +480,7 @@ def run(config_path, checkpoint, devices, native_binary, model_config=None, *, r
     if not device_list or len(set(device_list)) != len(device_list):
         raise ValueError("select a nonempty distinct comma-separated CUDA device list")
     primary = resolve_inference_model(cache_root, checkpoint, model_config, settings, device_list,
-        validate_devices=adaptive_manager is None)
+        validate_devices=adaptive_manager is None and worker_factory is None)
     models = [(primary, prediction_cache_root)]
     if mixed is not None:
         unknown = set(mixed) - {"checkpoint", "checkpoint_sha256", "model_config", "inference", "inference_cache_namespace"}
@@ -522,7 +530,16 @@ def run(config_path, checkpoint, devices, native_binary, model_config=None, *, r
         import multiprocessing
         prefetch_workers = min(32, max(1, int(config.get('workers', 32))))
         prefetch_pool = cleanup.enter_context(ProcessPoolExecutor(
-            max_workers=prefetch_workers, mp_context=multiprocessing.get_context('spawn')))
+            max_workers=prefetch_workers, mp_context=multiprocessing.get_context('spawn'),
+            initializer=_reference_worker_session if on_process_start is not None else None))
+        registered = set()
+        def submit_reference(*args):
+            job = prefetch_pool.submit(reference_chunk_job, *args)
+            if on_process_start is not None:
+                pids = set(prefetch_pool._processes) - registered
+                on_process_start(sorted(pids))
+                registered.update(pids)
+            return job
         prefetch_jobs = {}
         for source_index, source in enumerate(config["sources"]):
             source_id = source["id"]
@@ -568,13 +585,13 @@ def run(config_path, checkpoint, devices, native_binary, model_config=None, *, r
                     group["keys"].append(key)
                 if config.get("resume_visualization", False):
                     for points in resume_points.get(source_id, ()):
-                        job = prefetch_pool.submit(reference_chunk_job, (points,
+                        job = submit_reference((points,
                             (1 << level) * model["scale"], geometry.output_shape, model["chunk"]))
                         prefetch_jobs[job] = key
                 else:
                     for fiber in references["sources"][source_index]["fibers"]:
                         for run in fiber["runs"]:
-                            job = prefetch_pool.submit(reference_chunk_job, (run["points_base_xyz"],
+                            job = submit_reference((run["points_base_xyz"],
                                 (1 << level) * model["scale"], geometry.output_shape, model["chunk"]))
                             prefetch_jobs[job] = key
             source_to_store[source_id] = role_keys if mixed is not None else role_keys[0]
@@ -616,10 +633,12 @@ def run(config_path, checkpoint, devices, native_binary, model_config=None, *, r
         runtime_settings = runtime_inference_settings(settings, adaptive_manager)
         return coordinate_native(evaluation, binary, stores, source_to_store, channel_indices,
             backgrounds, readers, device_list, runtime_settings, started=started,
-            pool_groups=pool_groups if mixed is not None else None)
+            pool_groups=pool_groups if mixed is not None else None,
+            worker_factory=worker_factory, cancel_event=cancel_event, on_process_start=on_process_start)
 
 
-def create_managed_demand_pool(stores, readers, device_list, settings, pool_groups=None):
+def create_managed_demand_pool(stores, readers, device_list, settings, pool_groups=None,
+                               worker_factory=None, on_process_start=None):
     """Shared worker/lease setup for tracing and explicit inspection fills."""
     from .mixed_inference import ModelWorkerPools
     from .demand_gpu import DemandGpuLease
@@ -645,7 +664,9 @@ def create_managed_demand_pool(stores, readers, device_list, settings, pool_grou
         accumulator_spill_segment_slots=int(settings.get("accumulator_spill_segment_slots", 256)),
         flush_workers=int(settings.get("flush_workers", 4)),
         profile_pipeline=bool(settings.get("profile_pipeline", False)),
-        deferred_gpu=adaptive is not None)
+        deferred_gpu=adaptive is not None,
+        **({"worker_factory": worker_factory} if worker_factory is not None else {}),
+        **({"on_process_start": on_process_start} if on_process_start is not None else {}))
     try:
         lease = DemandGpuLease(pool, adaptive) if adaptive is not None else None
     except BaseException:
@@ -656,7 +677,8 @@ def create_managed_demand_pool(stores, readers, device_list, settings, pool_grou
 
 def coordinate_native(evaluation, binary, stores, source_to_store, channel_indices,
                       backgrounds, readers, device_list, settings, *, started=None, allow_inference=True,
-                      pool_groups=None, cancel_event=None, inference_session=None):
+                      pool_groups=None, cancel_event=None, inference_session=None,
+                      worker_factory=None, on_process_start=None):
     """Shared authenticated control loop for live inference and cached-only replay."""
     started = time.monotonic() if started is None else started
     max_batch_size = settings.get("max_batch_size", 1)
@@ -727,8 +749,11 @@ def coordinate_native(evaluation, binary, stores, source_to_store, channel_indic
             raise ValueError("native_environment must map strings to strings")
         native = subprocess.Popen([str(binary), "replay-set", "--config", str(runtime_config)],
                                   stdout=log, stderr=subprocess.STDOUT,
+                                  start_new_session=on_process_start is not None,
                                   env={**os.environ, **native_environment} if native_environment else None)
         try:
+            if on_process_start is not None:
+                on_process_start([native.pid])
             # Observe startup failure instead of waiting the whole accept timeout.
             listener.settimeout(0.1)
             deadline = time.monotonic() + 120
@@ -826,7 +851,8 @@ def coordinate_native(evaluation, binary, stores, source_to_store, channel_indic
                     if not allow_inference:
                         raise RuntimeError("cached-only replay cannot schedule inference")
                     pool, gpu_lease = create_managed_demand_pool(
-                        stores, readers, device_list, settings, pool_groups)
+                        stores, readers, device_list, settings, pool_groups,
+                        worker_factory=worker_factory, on_process_start=on_process_start)
                     if inference_session is not None:
                         inference_session.pool = pool
                         inference_session.gpu_lease = gpu_lease

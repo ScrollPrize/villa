@@ -1,5 +1,7 @@
-# Raw checkpoint selected by reviewed-trace restarts
+# Resident training trace evaluation
 
-Extend Fiber3D training with an additional raw-model best checkpoint selected
-by the periodic reviewed-trace benchmark's combined restart count. Preserve the
-existing independently loss-selected raw and EMA checkpoints.
+Call the optimized trace evaluation as a library from training. Keep training
+models and optimizer state resident through ordinary trace tests; reuse the
+existing GPU replicas for inference. Preserve manager pause/resize, trace
+numerics, restart-selected snapshots, and optimized CPU processing.
+Commit the existing evaluation/config changes first.

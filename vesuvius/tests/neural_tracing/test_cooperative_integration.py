@@ -166,6 +166,14 @@ def test_cpu_cohort_queue_training_and_restore_on_different_rank_count(monkeypat
             while broker.frontier // 5 < target:
                 cohort.start_unit()
                 wait_until(cohort, lambda: cohort.idle)
+            if target == 1:
+                from tests.neural_tracing.test_resident_trace import exercise_cohort
+                exercise_cohort(cohort, lambda predicate: wait_until(cohort, predicate))
+                resident_pids = list(cohort.gpu.processes)
+                cohort.start_unit()
+                wait_until(cohort, lambda: cohort.idle)
+                assert cohort.gpu.processes == resident_pids
+                target = 2
             cohort.drain()
             wait_until(cohort, lambda: cohort.closed)
             state = cohort.state
@@ -272,7 +280,8 @@ def test_reviewed_trace_boundary_holds_cohort_idle_until_supervisor_drains():
     assert replacement.idle is False
 
 
-def test_reviewed_trace_maintenance_unloads_only_gpu_cohort():
+def test_reviewed_trace_maintenance_retains_gpu_cohort():
+    import threading
     from vesuvius.neural_tracing.fiber_trace_3d.cooperative_cohort import FiberCohort
     from vesuvius.neural_tracing.fiber_trace_3d.cooperative_maintenance import MaintenanceMailbox
 
@@ -283,6 +292,7 @@ def test_reviewed_trace_maintenance_unloads_only_gpu_cohort():
         state = object()
         authorized = True
         ready = True
+        idle = True
 
         def drain(self):
             events.append("gpu-drain")
@@ -304,8 +314,9 @@ def test_reviewed_trace_maintenance_unloads_only_gpu_cohort():
     request = {"kind": "reviewed_trace", "step": 100, "samples_seen": 500}
     cohort.maintenance_mailbox.publish(request)
     cohort._draining = False
-    cohort._maintenance_draining = False
+    cohort._maintenance_active = False
     cohort._maintenance_ready = False
+    cohort._trace_start_requested = threading.Event()
     cohort._queues_closed = False
     cohort._memory_monitor = None
     cohort._check_publication = lambda: None
@@ -314,18 +325,19 @@ def test_reviewed_trace_maintenance_unloads_only_gpu_cohort():
 
     assert cohort.begin_maintenance()
     assert not cohort.begin_maintenance()
-    assert events == ["gpu-drain"]
+    assert events == []
     assert cohort.closed is False
     cohort.poll()
-    assert not cohort.maintenance_ready
-    cohort.gpu.closed = True
-    cohort.poll()
     assert cohort.maintenance_ready
-    assert cohort.maintenance_state() is cohort.gpu.state
-    assert ("worker-limit", 0) in events
-    assert "temp-cleanup" in events
+    assert ("worker-limit", 0) not in events
+    assert "temp-cleanup" not in events
     # The broker is retained and remains serviceable throughout maintenance.
-    assert events.count("broker-poll") == 2
+    assert events.count("broker-poll") == 1
+    cohort.maintenance_mailbox.begin_attempt(request, "test")
+    cohort.drain()
+    assert "gpu-drain" not in events
+    cohort.finish_maintenance()
+    assert events[-1] == "gpu-drain"
 
 
 def test_reviewed_trace_maintenance_defers_across_allocation_drain():
@@ -348,13 +360,14 @@ def test_reviewed_trace_maintenance_defers_across_allocation_drain():
     cohort.broker = broker
     cohort.maintenance_mailbox = mailbox
     cohort._draining = False
-    cohort._maintenance_draining = False
+    cohort._maintenance_active = False
     cohort._maintenance_ready = False
     cohort._queues_closed = True
 
     # A manager release wins this cohort, but does not consume the mailbox.
     cohort.drain()
     assert events == ["gpu-drain"]
+
     assert not cohort.begin_maintenance()
     gpu.closed = True
     mailbox.begin_attempt(request, ("epoch", 1, "grant"))
@@ -373,13 +386,18 @@ def test_reviewed_trace_maintenance_defers_across_allocation_drain():
     replacement.gpu = replacement_gpu
     replacement.maintenance_mailbox = mailbox
     replacement._draining = False
-    replacement._maintenance_draining = False
+    replacement._maintenance_active = False
     assert not replacement.idle
     assert not replacement.begin_maintenance()
     replacement_gpu.authorized = replacement_gpu.ready = True
     assert replacement.begin_maintenance()
     assert not replacement.begin_maintenance()
+    assert events == ["gpu-drain"]
+    # A revoke between arming maintenance and starting an attempt cannot leave
+    # an idle cohort waiting for a nonexistent evaluator to release it.
+    replacement.drain()
     assert events == ["gpu-drain", "replacement-drain"]
+    assert not replacement.maintenance_ready
 
 
 def test_maintenance_mailbox_is_idempotent_and_rejects_conflicts():

@@ -1,3 +1,11 @@
+## 2026-10-03 — Resident training trace evaluation
+
+- Replaced per-test Python benchmark launch and training-model evacuation with
+  shared callable evaluation and tile inference on resident training replicas.
+- Preserve optimizer/EMA/RNG state and existing inference/tracing math; retain
+  responsive manager polling and safe cancellation before buffer release.
+- Added CPU/native replay and manager-granted GPU lifecycle regression tests.
+
 ## 2026-10-03 — Raw best checkpoint by reviewed-trace restarts
 
 - Freeze and hash the exact raw checkpoint used by every reviewed trace, then

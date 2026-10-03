@@ -11,6 +11,7 @@ import sys
 import time
 
 from .reviewed_failure_test import directional_restart_metrics, validate_failure_union
+from .evaluation_workload import prepare, run_prepared
 from .reviewed_trace_selection import (
     sha256_file,
     write_benchmark_identity,
@@ -69,7 +70,7 @@ def cleanup_prediction_cache(workload: dict, output: Path) -> None:
     }, indent=2) + "\n")
 
 
-def run_job(job_path: Path) -> dict[str, float]:
+def run_job(job_path: Path, *, worker_factory=None, cancel_event=None, on_process_start=None) -> dict[str, float]:
     job = json.loads(job_path.read_text())
     if job.get("inherited_manager_grant") is not True:
         raise ValueError("training trace benchmark requires an inherited manager grant")
@@ -82,7 +83,7 @@ def run_job(job_path: Path) -> dict[str, float]:
     visible = [token.strip() for token in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if token.strip()]
     expected_uuids = sorted(grant)
     expected_devices = ",".join(str(index) for index in range(len(expected_uuids)))
-    if visible != expected_uuids or job.get("devices") != expected_devices:
+    if (worker_factory is None and visible != expected_uuids) or job.get("devices") != expected_devices:
         raise ValueError(
             f"training trace GPU binding does not match inherited grant: "
             f"visible={visible} devices={job.get('devices')!r} grant={expected_uuids}"
@@ -102,17 +103,15 @@ def run_job(job_path: Path) -> dict[str, float]:
     workload_path = output / "workload.json"
     workload_path.write_text(json.dumps(workload, indent=2) + "\n")
     identity = write_benchmark_identity(output, job, workload)
-    runner = Path(job["runner"])
-    commands = [
-        [sys.executable, str(runner), "prepare", "--config", str(workload_path)],
-        [sys.executable, str(runner), "training-full", "--config", str(workload_path),
-         "--devices", job["devices"], "--unmanaged"],
-    ]
+    from concurrent.futures import CancelledError
     started = time.monotonic()
     metrics = None
     try:
-        for command in commands:
-            subprocess.run(command, check=True, cwd=runner.parents[2])
+        prepare(workload)
+        if cancel_event is not None and cancel_event.is_set():
+            raise CancelledError("training trace allocation revoked during preparation")
+        run_prepared(workload, devices=job["devices"], worker_factory=worker_factory,
+                     cancel_event=cancel_event, on_process_start=on_process_start)
         summary_path = output / "full" / "summary.json"
         metrics = directional_restart_metrics(json.loads(summary_path.read_text()), expected_pieces=32)
         metrics.update(samples_seen=int(job["samples_seen"]), pieces=32, directions=64,

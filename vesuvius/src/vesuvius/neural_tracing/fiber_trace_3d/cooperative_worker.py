@@ -146,6 +146,7 @@ class FiberWorkerFactory:
     calibrated_torch_versions: tuple = ()
     calibrated_cuda_versions: tuple = ()
     test_connections: tuple = ()
+    trace_connections: tuple = ()
     measure_startup_memory: bool = False
 
     def __call__(self, rank, grant, state):
@@ -194,6 +195,7 @@ class FiberTrainingWorker:
             distributed_init_method=factory.rendezvous,
             training_overrides=factory.training_overrides,
             enable_reviewed_trace=not factory.measure_startup_memory,
+            on_model_ready=lambda model: setattr(self, "model", model),
         )
         self.boundary = next(self.units)
         self._saw_test = self.boundary.phase == "test"
@@ -215,6 +217,17 @@ class FiberTrainingWorker:
                 raise RuntimeError("training exceeded its calibrated VRAM allowance; recalibrate before retry")
 
     def run_unit(self):
+        connection = self.factory.trace_connections[self.rank] if self.factory.trace_connections else None
+        if connection is not None and connection.poll():
+            from .resident_trace import serve_resident
+            kind = connection.recv()
+            if kind != "trace":
+                raise RuntimeError(f"invalid resident trace command: {kind}")
+            arguments = connection.recv()
+            serve_resident(connection, self.model, self.rank, arguments)
+            self._check_memory()
+            return {"step": self.boundary.step, "done": False,
+                    "phase": "reviewed_trace_complete", "samples_seen": self.boundary.samples_seen}
         if not self.boundary.done:
             try:
                 self.boundary = next(self.units)

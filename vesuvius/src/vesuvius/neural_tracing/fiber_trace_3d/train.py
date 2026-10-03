@@ -706,131 +706,9 @@ def _distributed_visible_gpu_tokens(config: _DistributedConfig) -> list[str]:
     return tokens
 
 
-def _run_reviewed_trace_test(*, settings: dict[str, Any], step: int, run_dir: Path,
-                             snapshot_dir: Path, distributed: _DistributedConfig,
-                             writer: Any | None, samples_seen: int) -> dict[str, float]:
-    """Run under the training task's existing grant while ranks poll together."""
-    gpu_tokens = _distributed_visible_gpu_tokens(distributed)
-    output = run_dir / "reviewed_trace_test" / f"step_{step:08d}"
-    checkpoint = snapshot_dir / "current.pt"
-    if not checkpoint.is_file():
-        # Startup tests write the current raw weights as `best.pt`; periodic
-        # tests write `current.pt`. Both are snapshots of the tested step.
-        checkpoint = snapshot_dir / "best.pt"
-    process = None
-    log_stream = None
-    startup_error = None
-    reused = None
-    if distributed.is_main:
-        try:
-            if not checkpoint.is_file():
-                raise RuntimeError(f"reviewed trace test checkpoint is missing: {checkpoint}")
-            from .reviewed_trace_selection import finalize_attempt, freeze_raw_checkpoint
-            if output.exists() and (output / "completion.json").is_file():
-                metrics, selection, _ = finalize_attempt(output, snapshot_dir)
-                reused = {"metrics": metrics, "selection": selection}
-            else:
-                output.mkdir(parents=True, exist_ok=False)
-                frozen = output / "evaluated_raw.pt"
-                checkpoint_sha256 = freeze_raw_checkpoint(
-                    checkpoint, frozen, step=step, samples_seen=int(samples_seen)
-                )
-                job = {
-                    "step": step,
-                    "samples_seen": int(samples_seen),
-                    "checkpoint": str(frozen),
-                    "checkpoint_sha256": checkpoint_sha256,
-                    "output_root": str(output),
-                    "template": str(Path(settings["template"]).expanduser().resolve()),
-                    "split_root": str(Path(settings["split_root"]).expanduser().resolve()),
-                    "native_binary": str(Path(settings["native_binary"]).expanduser().resolve()),
-                    "runner": str(Path(settings["runner"]).expanduser().resolve()),
-                    "devices": ",".join(str(index) for index in range(len(gpu_tokens))),
-                    "inherited_manager_grant": True,
-                }
-                job_path = output / "job.json"
-                job_path.write_text(json.dumps(job, indent=2) + "\n")
-                environment = dict(os.environ)
-                for name in ("RANK", "WORLD_SIZE", "LOCAL_RANK", "MASTER_ADDR", "MASTER_PORT"):
-                    environment.pop(name, None)
-                environment["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_tokens)
-                log_stream = (output / "runner.log").open("w")
-                process = subprocess.Popen(
-                    [sys.executable, "-m", "vesuvius.neural_tracing.fiber_trace_3d.training_trace_benchmark", str(job_path)],
-                    cwd=Path(__file__).resolve().parents[5], env=environment,
-                    stdout=log_stream, stderr=subprocess.STDOUT,
-                )
-                print(f"training reviewed trace: step={step} pieces=32 directions=64 output={output}", flush=True)
-        except BaseException as error:
-            startup_error = f"{type(error).__name__}: {error}"
-    try:
-        startup_error = _distributed_broadcast_object(startup_error, distributed)
-        if startup_error is not None:
-            raise RuntimeError(f"reviewed trace test failed to start: {startup_error}")
-        reused = _distributed_broadcast_object(reused, distributed)
-        while reused is None:
-            status = None
-            if distributed.is_main:
-                returncode = process.poll()
-                error = None
-                if returncode:
-                    if log_stream is not None:
-                        log_stream.flush()
-                    error = (output / "runner.log").read_text(errors="replace")[-8000:]
-                status = {"done": returncode is not None, "returncode": returncode, "error": error}
-            status = _distributed_broadcast_object(status, distributed)
-            if status["done"]:
-                if status["returncode"]:
-                    raise RuntimeError(
-                        f"reviewed trace test failed with exit {status['returncode']}:\n{status['error']}"
-                    )
-                break
-            time.sleep(1.0)
-        payload = reused
-        if distributed.is_main and payload is None:
-            try:
-                from .reviewed_trace_selection import finalize_attempt
-                metrics, selection, _ = finalize_attempt(output, snapshot_dir)
-                payload = {"metrics": metrics, "selection": selection, "error": None}
-            except BaseException as error:
-                payload = {"metrics": None, "selection": None,
-                           "error": f"{type(error).__name__}: {error}"}
-        payload = _distributed_broadcast_object(payload, distributed)
-        if payload.get("error") is not None:
-            raise RuntimeError(f"reviewed trace result is invalid: {payload['error']}")
-        metrics = payload["metrics"]
-        if distributed.is_main:
-            print(
-                "training reviewed trace result: "
-                f"step={step} forward_restarts={metrics['restarts_forward']} "
-                f"reverse_restarts={metrics['restarts_reverse']} "
-                f"combined_restarts={metrics['restarts_combined']} "
-                f"forward_implied_mm={metrics['implied_mean_mm_forward']:.6f} "
-                f"reverse_implied_mm={metrics['implied_mean_mm_reverse']:.6f} "
-                f"combined_implied_mm={metrics['implied_mean_mm_combined']:.6f} "
-                f"best_reviewed_trace={payload['selection']['best_restarts_combined']} "
-                f"selected={payload['selection']['selected']}",
-                flush=True,
-            )
-            if writer is not None:
-                for key in ("restarts_forward", "restarts_reverse", "restarts_combined",
-                            "reference_mm_forward", "reference_mm_reverse", "reference_mm_combined",
-                            "implied_mean_mm_forward", "implied_mean_mm_reverse", "implied_mean_mm_combined",
-                            "wall_seconds"):
-                    writer.add_scalar(f"reviewed_trace/{key}", metrics[key], step)
-                writer.flush()
-        return metrics
-    finally:
-        if distributed.is_main:
-            if process is not None and process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=30)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait()
-            if log_stream is not None:
-                log_stream.close()
+def _run_reviewed_trace_test(**_kwargs):
+    raise ValueError("reviewed trace testing requires managed training and its resident GPU workers; "
+                     "disable reviewed_trace_test for an explicitly unmanaged debugging run")
 
 
 def _distributed_should_use_sync_batchnorm(
@@ -3339,6 +3217,7 @@ def training_units(
     distributed_init_method: str | None = None,
     training_overrides: dict[str, Any] | None = None,
     enable_reviewed_trace: bool = True,
+    on_model_ready=None,
 ):
     """Shared training loop, yielding only after completed logical work.
 
@@ -3354,6 +3233,8 @@ def training_units(
     loader_config = load_config(config_path)
     training = dict(raw_config.get("training", {}))
     reviewed_trace_test = _reviewed_trace_test_config(training)
+    if reviewed_trace_test is not None and physical_microbatch_sizes is None and enable_reviewed_trace:
+        _run_reviewed_trace_test()
     refinement = RefinementObserver(RefinementConfig.parse(raw_config))
     if refinement.config.enabled and raw_config.get("historical_test_datasets"):
         raise ValueError("disable historical_test_datasets when refining train/test ground truth")
@@ -3474,6 +3355,8 @@ def training_units(
             counts=normalization_module_counts,
         )
     raw_model = raw_model.to(device)
+    if on_model_ready is not None:
+        on_model_ready(raw_model)
     mixed_precision = _mixed_precision_config_from_training(training, device)
     grad_scaler = _make_grad_scaler(mixed_precision)
     optimizer_hparams = _optimizer_hparams_from_training(training)
@@ -4406,11 +4289,8 @@ def training_units(
             save_test_snapshots(start_step, initial_metric, initial_metric_name, initial=is_initial)
             if reviewed_trace_test is not None and enable_reviewed_trace:
                 if physical_microbatch_sizes is not None:
-                    # The cooperative supervisor tears this GPU cohort down,
-                    # runs the trace test as a descendant under the unchanged
-                    # training grant, then restores training from this exact
-                    # boundary. Never nest a second model inside resident
-                    # training CUDA processes or register an overlapping task.
+                    # Trace inference borrows these resident raw-model replicas
+                    # under the unchanged grant. Optimizer/EMA state stays put.
                     # The dense test is complete: do not capture it as pending
                     # or replacement workers will attempt the same test twice.
                     pending_test = None

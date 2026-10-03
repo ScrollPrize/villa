@@ -789,7 +789,8 @@ def test_live_coordinator_error_is_not_a_geometric_failure(replay_fixture):
     assert not (root / "evaluation/summary.json").exists()
 
 
-def test_complete_runner_cold_and_warm_with_identity_model(replay_fixture, monkeypatch):
+@pytest.mark.parametrize("resident", [False, True])
+def test_complete_runner_cold_and_warm_with_identity_model(replay_fixture, monkeypatch, resident):
     root, config, run_native = replay_fixture
     sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
     from vesuvius.neural_tracing.fiber_trace_3d import live_evaluate as runner
@@ -814,6 +815,30 @@ def test_complete_runner_cold_and_warm_with_identity_model(replay_fixture, monke
     config["workers"] = 1
     config["inference"] = {"tile_size": 8, "overlap": 2, "border": 1, "scaledown_power": 0,
                            "chunk_size": 4, "input_workers": 2, "slots_per_gpu": 2, "compressor": "none"}
+    borrowed_threads = []
+    borrowed_connections = []
+    owned_pids = []
+    def borrow(arguments, count):
+        import multiprocessing
+        from vesuvius.neural_tracing.fiber_trace_3d.resident_trace import ResidentWorkers, serve_resident
+        assert count == 1
+        model = torch.nn.Conv3d(1, 1, 1, bias=False)
+        with torch.no_grad():
+            model.weight.fill_(1)
+        model.train()
+        parent, child = multiprocessing.get_context("spawn").Pipe()
+        borrowed_connections.extend((parent, child))
+        def serve():
+            assert child.recv() == "trace"
+            descriptor = child.recv()
+            serve_resident(child, model, 0, descriptor)
+            assert model.training
+        thread = threading.Thread(target=serve)
+        borrowed_threads.append(thread)
+        return ResidentWorkers([parent], arguments, thread.start, threading.Event())
+    if resident:
+        monkeypatch.setattr(SyntheticFiberAdapter, "load_model",
+                            lambda *a, **k: pytest.fail("reloaded resident model"))
     for name in ("cold", "warm"):
         config["output"] = name
         if name == "warm":
@@ -825,7 +850,9 @@ def test_complete_runner_cold_and_warm_with_identity_model(replay_fixture, monke
         (root / "live-run.json").write_text(json.dumps(config))
         runner.run(root / "live-run.json", checkpoint, "0",
                    os.environ["VC_REPLAY_TEST_BINARY"], render=True,
-                   unmanaged=name == "cold")
+                   unmanaged=name == "cold",
+                   worker_factory=borrow if resident else None,
+                   on_process_start=owned_pids.extend if resident else None)
         summary = json.loads((root / name / "summary.json").read_text())
         assert summary["completed"] and summary["cases"] == 2 and summary["failures"] == 0
         assert summary["config"]["render"] is True
@@ -836,6 +863,16 @@ def test_complete_runner_cold_and_warm_with_identity_model(replay_fixture, monke
     warm = json.loads((root / "warm/inference_summary.json").read_text())
     assert cold["worker_pool"]["tiles"] > 0
     assert warm["worker_pool"] is None  # no model worker is even started on a full warm cache
+    if resident:
+        assert len(borrowed_threads) == 1
+        assert len(set(owned_pids)) >= 4  # reference, accumulator, and native workers
+        import psutil
+        assert all(not psutil.pid_exists(pid) for pid in owned_pids)
+        for thread in borrowed_threads:
+            thread.join(2)
+            assert not thread.is_alive()
+        for connection in borrowed_connections:
+            connection.close()
     for i in range(2):
         a = json.loads((root / f"cold/cases/{i}/trace.json").read_text())
         b = json.loads((root / f"warm/cases/{i}/trace.json").read_text())
