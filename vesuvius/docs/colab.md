@@ -143,8 +143,14 @@ The model, normalization and input geometry are rebuilt from the config embedded
 | `INFER_ARGS` | *(empty)* | Extra `infer` flags, e.g. `--tta-mirror --batch-size 4` |
 | `WAIT` / `STOP_SESSION` | `1` / `1` | Wait for completion locally, then stop the session |
 | `POLL_SECONDS` | `60` | Status-file polling interval |
+| `STALE_MINUTES` | `10` | Declare a session dead after this long without a heartbeat |
+| `RESUME_EVERY` | `1500` | Blocks between resume snapshots (~11 min on a T4) |
+| `RESUME_DIR_REMOTE` | `<OUTPUT_DIR_REMOTE>/<OUTPUT_NAME>.resume` | Durable resume state on Drive; deleted after success |
+| `MAX_ATTEMPTS` | `40` | Fresh sessions to try before giving up |
 
-Completion is detected from `<name>.status` on Drive (`ok`, or `failed (exit N)`), which is written only after the TIFF has been copied — the same "ground truth is a file on Drive, not the CLI's session status" approach as `colab_resume_watchdog.sh`.
+Completion is detected from `<name>.status` on Drive (`ok`, or `failed (exit N)`), which is written only after the TIFF has been copied — the same "ground truth is a file on Drive, not the CLI's session status" approach as `colab_resume_watchdog.sh`. While it runs, `<name>.progress` on Drive is rewritten every minute with the log tail, RAM and GPU usage; a session counts as dead once that file stops changing for `STALE_MINUTES` (`colab status` was observed listing no sessions at all while one was healthy, so it isn't used).
+
+**Inference is resumable, because a whole segment doesn't fit in one session.** Measured on a T4 (2026-10-03): a full PHercParis4 segment (`31960×51960`, 64 layers) is 85,750 patches at ~2.2 patches/s, i.e. ~9–10 hours, while free-tier sessions died after ~40 minutes — during both training and inference. So `colab_infer.sh` runs `infer` with `--resume-dir` on Drive: every `RESUME_EVERY` blocks it snapshots the completed output chunks, the still-open chunk buffers and the next block index (`vesuvius/ink_detection/inference/resume.py`). When a session dies, the script starts a fresh one (`<session>-r<N>`) and reruns the identical command, which continues from the last snapshot. The output is bit-identical to an uninterrupted run (same blocks, same accumulation order, buffers restored exactly — covered by `tests/ink_detection/test_flat_inference_resume.py`). Each attempt pays ~10 min of setup plus ~2 min of model load/compile/occupancy scan, so expect roughly two-thirds of each session to be useful inference. Resuming with a different input, checkpoint, geometry or batch size is refused instead of mixing results; use another `RESUME_DIR_REMOTE` or delete the old one.
 
 Set `REPO_BRANCH` whenever your fork's default branch lacks your changes: `colab_bootstrap.sh` otherwise clones the default branch, whose `volume-cartographer` tree may not match the Drive wheel cache (forcing a from-source compile) or may no longer build on Colab's Ubuntu at all.
 
