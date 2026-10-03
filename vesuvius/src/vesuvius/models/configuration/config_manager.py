@@ -25,8 +25,15 @@ class ConfigManager:
     def load_config(self, config_path):
         config_path = Path(config_path)
         self._config_path = config_path
-        with open(config_path, "r") as f:
-            config = yaml.safe_load(f)
+        # utf-8-sig drops a leading BOM so the first key stays intact (#1524).
+        try:
+            with open(config_path, "r", encoding="utf-8-sig") as f:
+                config = yaml.safe_load(f)
+        except UnicodeDecodeError as e:
+            raise ValueError(
+                f"Config file {config_path} is not valid UTF-8. "
+                "Config files must be UTF-8 encoded; re-save the file as UTF-8."
+            ) from e
 
         self.tr_info = config.get("tr_setup", {})
         self.tr_configs = config.get("tr_config", {})
@@ -940,8 +947,8 @@ class ConfigManager:
         config_filename = f"{self.model_name}_config.yaml"
         config_path = model_ckpt_dir / config_filename
 
-        with config_path.open("w") as f:
-            yaml.safe_dump(combined_config, f, sort_keys=False)
+        with config_path.open("w", encoding="utf-8") as f:
+            yaml.safe_dump(combined_config, f, sort_keys=False, allow_unicode=True)
 
         print(f"Configuration saved to: {config_path}")
 
