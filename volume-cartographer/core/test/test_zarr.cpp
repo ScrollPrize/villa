@@ -163,6 +163,32 @@ TEST_CASE("writeZarrAttrs derives per-axis scale from slice step and pixel densi
     fs::remove_all(d);
 }
 
+TEST_CASE("writeZarrAttrs preserves caller-supplied provenance")
+{
+    auto d = tmpDir("attrs_provenance");
+    utils::Json provenance = utils::Json::object();
+    provenance["render_provenance"] = utils::Json{
+        {"schema_version", 1},
+        {"tool", "vc_render_tifxyz"},
+        {"surface", utils::Json{{"effective_geometry_sha1", "abc123"}}},
+    };
+    writeZarrAttrs(/*outDir=*/d, /*volPath=*/d,
+                   /*groupIdx=*/0, /*baseZ=*/1,
+                   /*sliceStep=*/1.0, /*accumStep=*/0.0,
+                   /*accumTypeStr=*/"max", /*accumSamples=*/0,
+                   /*canvasSize=*/cv::Size(16, 16),
+                   /*CZ=*/1, /*CH=*/16, /*CW=*/16,
+                   /*baseVoxelSize=*/1.0, /*voxelUnit=*/"um",
+                   /*pixelsPerVoxel=*/1.0, /*extraAttributes=*/&provenance);
+    auto j = utils::Json::parse_file(d / ".zattrs");
+    REQUIRE(j.contains("render_provenance"));
+    CHECK(j["render_provenance"]["schema_version"].get_int() == 1);
+    CHECK(j["render_provenance"]["tool"].get_string() == "vc_render_tifxyz");
+    CHECK(j["render_provenance"]["surface"]["effective_geometry_sha1"].get_string()
+          == "abc123");
+    fs::remove_all(d);
+}
+
 TEST_CASE("buildMultiscales keeps the multiscales structure when the physical size is unknown")
 {
     // The review finding: omitting the whole block traded a dubious scale for a
@@ -246,6 +272,18 @@ TEST_CASE("buildMultiscales writes relative pyramid scaling when the size is unk
     // The transformation list keeps the order the spec requires: scale first.
     CHECK(ms["datasets"][size_t(0)]["coordinateTransformations"][size_t(0)]["type"] == "scale");
     CHECK(ms["datasets"][size_t(0)]["coordinateTransformations"][size_t(1)]["type"] == "translation");
+}
+
+TEST_CASE("buildMultiscales omits disabled pyramid levels without changing level zero")
+{
+    for (const double size : {0.0, 8.0}) {
+        const auto full = buildMultiscales(size, "micrometer", 3.0, 2.0);
+        const auto base = buildMultiscales(size, "micrometer", 3.0, 2.0, false);
+        REQUIRE(full["datasets"].size() == 6);
+        REQUIRE(base["datasets"].size() == 1);
+        CHECK(base["datasets"][size_t(0)].dump() == full["datasets"][size_t(0)].dump());
+        CHECK(base["axes"].dump() == full["axes"].dump());
+    }
 }
 
 TEST_CASE("buildMultiscales keeps the physical scale and unit when the size is known")

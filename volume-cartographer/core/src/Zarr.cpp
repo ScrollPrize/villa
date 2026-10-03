@@ -367,7 +367,7 @@ void createPyramidDatasets(const std::filesystem::path& outDir,
 //     anywhere in the document. A reader can still place the levels relative to
 //     each other, and cannot mistake the numbers for micrometres.
 Json buildMultiscales(double baseVoxelSize, const std::string& voxelUnit,
-                      double sliceStep, double pixelsPerVoxel)
+                      double sliceStep, double pixelsPerVoxel, bool includePyramid)
 {
     const bool physicalSizeKnown = std::isfinite(baseVoxelSize) && baseVoxelSize > 0.0;
 
@@ -393,7 +393,7 @@ Json buildMultiscales(double baseVoxelSize, const std::string& voxelUnit,
         ? pixelsPerVoxel : 1.0;
     const double step = (std::isfinite(sliceStep) && sliceStep > 0.0)
         ? sliceStep : 1.0;
-    for (int l = 0; l <= 5; l++) {
+    for (int l = 0; l <= (includePyramid ? 5 : 0); l++) {
         // Relative pyramid factor: levels are built by halving Y/X each step and
         // keeping Z unchanged, so Y/X double relative to level 0 while Z stays at
         // its level-0 spacing.
@@ -432,7 +432,8 @@ void writeZarrAttrs(const std::filesystem::path& outDir,
                     const std::string& accumTypeStr, size_t accumSamples,
                     const cv::Size& canvasSize, size_t CZ, size_t CH, size_t CW,
                     double baseVoxelSize, const std::string& voxelUnit,
-                    double pixelsPerVoxel)
+                    double pixelsPerVoxel,
+                    const utils::Json* extraAttributes, bool includePyramid)
 {
     Json attrs;
     attrs["source_zarr"] = volPath.string();
@@ -455,8 +456,15 @@ void writeZarrAttrs(const std::filesystem::path& outDir,
     attrs["note_axes_order"] = "ZYX (slice, row, col)";
 
     Json multiscales = Json::array();
-    multiscales.push_back(buildMultiscales(baseVoxelSize, voxelUnit, sliceStep, pixelsPerVoxel));
+    multiscales.push_back(buildMultiscales(baseVoxelSize, voxelUnit, sliceStep,
+                                         pixelsPerVoxel, includePyramid));
     attrs["multiscales"] = std::move(multiscales);
+
+    if (extraAttributes) {
+        if (!extraAttributes->is_object())
+            throw std::invalid_argument("writeZarrAttrs extra attributes must be a JSON object");
+        attrs.update(*extraAttributes);
+    }
 
     vc::writeZarrAttributes(outDir, attrs);
 }
