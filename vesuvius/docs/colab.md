@@ -6,7 +6,7 @@ If you'd rather stay inside the browser notebook UI, you can also attach a Colab
 
 ## TL;DR
 
-Most of this guide is automated by two scripts. From your local machine, once you have your own rclone Drive OAuth client set up (one-time — see "Mounting Google Drive" below) and `RCLONE_CONF_LOCAL` pointed at a working `rclone.conf`:
+Most of this guide is automated by a few scripts. From your local machine, once you have your own rclone Drive OAuth client set up (one-time — see "Mounting Google Drive" below) and `RCLONE_CONF_LOCAL` pointed at a working `rclone.conf`:
 
 ```bash
 # One-time: install the CLI
@@ -24,10 +24,16 @@ REPO_URL=https://github.com/<you>/villa.git \
 RCLONE_CONF_LOCAL=~/.config/rclone/rclone_vesuvius.conf \
 CONFIG_LOCAL=../configs/ink_tutorial.json \
 ./scripts/colab_train.sh
+
+# Run inference with a trained checkpoint; the prediction TIFF lands on Drive
+REPO_URL=https://github.com/<you>/villa.git \
+RCLONE_CONF_LOCAL=~/.config/rclone/rclone_vesuvius.conf \
+CHECKPOINT_REMOTE=/content/drive/vesuvius/runs/ink_tutorial_s3/ckpt_020000.pth \
+./scripts/colab_infer.sh
 ```
 
 - Training data can come from a Drive-synced dataset (see "6. Downloading datasets" below) or, for datasets already published to the Vesuvius Challenge S3 bucket, directly from `s3://` with no local copy at all (see "7. Reading input data" below) — either way, training *outputs* (checkpoints, logs, the uploaded config) still land on Drive.
-- Full details on both scripts, every environment variable, and real build-time/throughput numbers are in "Quick start: automation scripts" just below.
+- Full details on each script, every environment variable, and real build-time/throughput numbers are in "Quick start: automation scripts" just below.
 - The numbered steps further down (1–7) are the manual walkthrough these scripts automate — read them if you want to understand what's happening under the hood, do it by hand, or debug something the scripts don't surface clearly.
 
 ## Quick start: automation scripts
@@ -110,6 +116,37 @@ colab console -s vesuvius
 ```
 
 Checkpoints and previews land under the config's `out_dir` on Drive as training progresses, so they persist even if the session is later reclaimed — see the "Persistence of Colab sessions" note in step 2 below for why that matters.
+
+There is no separate "final model" file: the last `ckpt_<num_iterations>.pth` *is* the trained model, and inference loads it directly. A `best_<metric>.pth` (plus `best_checkpoint.json`) is only written when the config sets `best_checkpoint_metric` (`val_loss` or `val_balanced_accuracy`); without it you only get the periodic `ckpt_*.pth` files.
+
+### `scripts/colab_infer.sh`: running inference with a trained checkpoint
+
+[`scripts/colab_infer.sh`](../scripts/colab_infer.sh) runs flat ink-detection inference (`vesuvius.ink_detection.inference.infer`) on a Colab GPU session. It reuses `colab_bootstrap.sh` for setup, launches inference detached, writes the prediction TIFF to local VM disk and copies it onto Drive when finished, then (by default) waits for completion and stops the session so it doesn't keep holding a GPU slot.
+
+```bash
+REPO_URL=https://github.com/<you>/villa.git \
+REPO_BRANCH=<branch with your ink_detection changes> \
+RCLONE_CONF_LOCAL=~/.config/rclone/rclone_vesuvius.conf \
+CHECKPOINT_REMOTE=/content/drive/vesuvius/runs/ink_tutorial_s3/ckpt_020000.pth \
+./scripts/colab_infer.sh
+```
+
+The model, normalization and input geometry are rebuilt from the config embedded in the checkpoint, so no training config is required. The input surface volume defaults to the first `surface_volume_paths` entry of `CONFIG_LOCAL` (`../configs/ink_tutorial_s3.json`), i.e. the segment the checkpoint was trained on; `s3://` URLs are read directly.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `CHECKPOINT_REMOTE` | *(required)* | Checkpoint path on the mounted Drive |
+| `CONFIG_LOCAL` | `../configs/ink_tutorial_s3.json` | Config to read the default `INPUT_ZARR` from |
+| `INPUT_ZARR` | first `surface_volume_paths` entry | Surface volume zarr (local path or `s3://` URL) |
+| `OUTPUT_NAME` | `<run-dir>_<checkpoint-name>` | Basename of the outputs |
+| `OUTPUT_DIR_REMOTE` | `/content/drive/vesuvius/predictions` | Drive folder for `<name>.tif`, `<name>.log`, `<name>.status` |
+| `INFER_ARGS` | *(empty)* | Extra `infer` flags, e.g. `--tta-mirror --batch-size 4` |
+| `WAIT` / `STOP_SESSION` | `1` / `1` | Wait for completion locally, then stop the session |
+| `POLL_SECONDS` | `60` | Status-file polling interval |
+
+Completion is detected from `<name>.status` on Drive (`ok`, or `failed (exit N)`), which is written only after the TIFF has been copied — the same "ground truth is a file on Drive, not the CLI's session status" approach as `colab_resume_watchdog.sh`.
+
+Set `REPO_BRANCH` whenever your fork's default branch lacks your changes: `colab_bootstrap.sh` otherwise clones the default branch, whose `volume-cartographer` tree may not match the Drive wheel cache (forcing a from-source compile) or may no longer build on Colab's Ubuntu at all.
 
 ## `colab exec` reliability: client-side hangs and session death
 
