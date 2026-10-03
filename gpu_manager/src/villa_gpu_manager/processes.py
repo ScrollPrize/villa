@@ -121,38 +121,54 @@ class NvidiaMonitor:
         self.blocked = set(inventory["gpus"])  # fail closed until first probe
         self.last_snapshot = None
         self.last_snapshot_at = None
+        self.last_error = None
+        self.last_poll_at = None
+        self.poll_gap = 0.0
+
+    def _read_available(self):
+        while len(self.buffer) <= 1024**2:
+            try:
+                data = os.read(self.process.stdout.fileno(), 65536)
+            except BlockingIOError:
+                break
+            if not data:
+                break
+            self.buffer.extend(data)
 
     def poll(self, owned_pids):
         now = time.monotonic()
+        self.poll_gap = now - self.last_poll_at if self.last_poll_at is not None else 0.0
+        self.last_poll_at = now
         if self.process is None and now >= self.next_probe:
             try:
                 self.process = subprocess.Popen(["nvidia-smi", "-q", "-x"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
                 os.set_blocking(self.process.stdout.fileno(), False)
                 self.buffer.clear()
                 self.started = now
-            except OSError:
+            except OSError as error:
+                self.last_error = f"{type(error).__name__}: {error}"
                 self.blocked = set(self.inventory["gpus"])
                 self.next_probe = now + self.interval
         if self.process is not None:
-            while True:
-                try:
-                    data = os.read(self.process.stdout.fileno(), 65536)
-                except BlockingIOError:
-                    break
-                if not data:
-                    break
-                self.buffer.extend(data)
-                if len(self.buffer) > 1024**2:
-                    break
-            if now - self.started > 10 or len(self.buffer) > 1024**2:
+            self._read_available()
+            exited = self.process.poll() is not None
+            if not exited and (now - self.started > 10 or len(self.buffer) > 1024**2):
+                self.last_error = f"driver query timeout/size limit: age={now - self.started:.1f}s bytes={len(self.buffer)}"
                 self.process.kill()
                 self.blocked = set(self.inventory["gpus"])
-            if self.process.poll() is not None:
+            if exited or self.process.poll() is not None:
                 try:
+                    # Bytes can arrive after EAGAIN but before poll observes
+                    # exit. Drain them before parsing/closing the pipe.
+                    self._read_available()
+                    if len(self.buffer) > 1024**2:
+                        raise ValueError("driver query exceeded 1MiB output limit")
                     if self.process.returncode != 0:
-                        raise ValueError("driver query failed")
+                        raise ValueError(f"driver query exit={self.process.returncode}; {self.last_error or ''}")
                     self.blocked = self.parse(bytes(self.buffer), owned_pids() if callable(owned_pids) else owned_pids)
-                except (ValueError, ET.ParseError, TypeError):
+                    self.last_error = None
+                except (ValueError, ET.ParseError, TypeError) as error:
+                    self.last_error = f"{type(error).__name__}: {error} (bytes={len(self.buffer)}, age={now - self.started:.1f}s)"
                     self.blocked = set(self.inventory["gpus"])
                 self.process.stdout.close()
                 self.process = None
