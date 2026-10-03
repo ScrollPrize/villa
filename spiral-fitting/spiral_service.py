@@ -72,6 +72,7 @@ from fit_session import (API_VERSION, EDITABLE_PCL_ROLES, FIT_INPUT_CATALOG,
                          SessionState, SpiralInputPaths, default_user_cache_dir,
                          input_source_enabled, pcl_input_enabled,
                          winding_inference_enabled, load_scroll_spec,
+                         scroll_spec_config_defaults,
                          parse_session_request, resolve_dataset_root,
                          validate_session_request)
 from checkpoint_migrations import tolerate_config
@@ -832,7 +833,21 @@ class ServiceState:
         return response
 
     def configuration_catalog(self):
-        return {**self._base(), **self.config_catalog}
+        catalog = {**self._base(), **self.config_catalog}
+        generic = self.config_catalog["defaults"]
+        scroll_defaults = scroll_spec_config_defaults(self.scroll_spec, generic)
+        if scroll_defaults:
+            # The panel seeds its form from these, so a winding count in
+            # spiral-scroll.json reaches interactive fits as it reaches the
+            # CLI. A preset still holding the generic value inherits it; one
+            # that chose its own value keeps it.
+            catalog["defaults"] = {**generic, **scroll_defaults}
+            catalog["presets"] = {
+                name: {**preset, **{
+                    key: value for key, value in scroll_defaults.items()
+                    if preset.get(key) == generic.get(key)}}
+                for name, preset in self.config_catalog["presets"].items()}
+        return catalog
 
     def dataset(self):
         return {**self._base(), **self.dataset_resolution.to_dict(),
