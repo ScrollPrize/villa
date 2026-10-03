@@ -28,7 +28,13 @@ the volume can be fit and evaluated.
 
 ## Conventions
 
-- Coordinates are `(z, y, x)`, in full-resolution scroll-volume voxels.
+- Coordinates are in **9.6 µm voxels**, level 2 of the 2.4 µm volume `20260411134726-2.400um-0.2m-78keV-masked.zarr`
+  (multiply by 4 for that volume's level-0 voxels), matching `voxel_size_um: 9.6` in `spiral-scroll.json`.
+  Checked for `verified_patches/`, `outer_shell/`, `umbilicus.json`, `same_windings.json`, `relative_windings.json`
+  and `abs_winding.json`.
+- Exception: `eval_fibers/` are in level-0 (2.4 µm) voxels, as their `vc_open_data_*` fields state.
+- Axis order: `umbilicus.json` uses `x`/`y`/`z` keys; points in the winding files are `[x, y, z]`; patches are
+  tifxyz meshes with separate `x`, `y`, `z` images.
 
 ## License
 
