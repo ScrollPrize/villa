@@ -15,7 +15,7 @@ from vesuvius.neural_tracing.fiber_follow.data.observations import image_crop
 from vesuvius.neural_tracing.fiber_follow.data.data import SampleConfig, TracedFiber, fiber_identities, fiber_manifest
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, crop_local_grid, sample_oriented_fast
 from vesuvius.neural_tracing.fiber_follow.train.runloop import read_checkpoint, training_rng_state
-from vesuvius.neural_tracing.fiber_follow.train.training_log import DirectTrainingInterval, SamplingLedger, format_training_log
+from vesuvius.neural_tracing.fiber_follow.train.training_log import TrainingInterval, SamplingLedger, format_training_log
 from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolumeSpec
 from label_fixtures import set_terminal
 from model_fixtures import coordinate_batch, coordinate_config, batch as label_batch, forward, proposal_output
@@ -141,7 +141,7 @@ def test_optimizer_update_partition_metrics_and_sampling_ledger():
     assert sampling['sources'] == dict(fresh=1, replay=1)
     assert sampling['positive_targets']+sampling['negative_targets'] == (
         metrics['positive_confidence_targets']+metrics['negative_confidence_targets'])
-    interval = DirectTrainingInterval()
+    interval = TrainingInterval()
     interval.add(metrics)
     interval.add(metrics)
     summary = interval.summary()

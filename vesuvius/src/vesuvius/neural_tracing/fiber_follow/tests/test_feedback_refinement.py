@@ -9,7 +9,7 @@ from model_fixtures import coordinate_batch, coordinate_config, proposal_output
 from vesuvius.neural_tracing.fiber_follow.models.model import build_model, select_refinement
 from vesuvius.neural_tracing.fiber_follow.train.supervision import loss_terms
 from vesuvius.neural_tracing.fiber_follow.evaluation.diagnostics import decision_rows
-from vesuvius.neural_tracing.fiber_follow.data.observations import DirectTracer
+from vesuvius.neural_tracing.fiber_follow.data.observations import FiberTracer
 from vesuvius.neural_tracing.fiber_follow.tracing.policy import commit_prefix
 from vesuvius.neural_tracing.fiber_follow.tracing.trace import TraceParams
 
@@ -136,7 +136,7 @@ def test_tracer_passes_operating_threshold_into_adaptive_model(monkeypatch):
         thresholds.append((kwargs['confidence_threshold'], kwargs['n_commit']))
         return original(*args, **kwargs)
     monkeypatch.setattr(model, 'forward', forward)
-    tracer = DirectTracer(model, SimpleNamespace(shape=(1000, 1000, 1000)), model.cfg.fine,
+    tracer = FiberTracer(model, SimpleNamespace(shape=(1000, 1000, 1000)), model.cfg.fine,
                           model.cfg.n_history, TraceParams(n_commit=1, max_len=1., confidence=0.), device='cpu')
     try:
         tracer.trace(np.array([[100., 100., 400.]]), np.array([[0., 0., 1.]]))

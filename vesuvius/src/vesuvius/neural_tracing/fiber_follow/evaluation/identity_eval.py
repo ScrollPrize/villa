@@ -1,4 +1,4 @@
-"""Identity evaluation for direct followers: all seeds and a frozen ambiguous subset.
+"""Identity evaluation for both fiber followers: all seeds and a frozen ambiguous subset.
 
   # once, before comparing checkpoints (refuses to overwrite)
   python -m vesuvius.neural_tracing.fiber_follow.evaluation.identity_eval subset --out EVAL/ambiguous.json
@@ -27,7 +27,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.experiment import jsonable, pai
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import interp_at
 from vesuvius.neural_tracing.fiber_follow.tracing.trace import TraceParams
 from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolume
-from vesuvius.neural_tracing.fiber_follow.data.observations import DirectTracer, traversal
+from vesuvius.neural_tracing.fiber_follow.data.observations import FiberTracer, traversal
 from vesuvius.neural_tracing.fiber_follow.models.model import CoordinateRegressionConfig
 from vesuvius.neural_tracing.fiber_follow.train.train import load_checkpoint, validate_volume_source
 
@@ -161,7 +161,7 @@ def run_rollouts(args):
     seeds = manifest[args.split]
     ambiguous = {r['index'] for r in subset[args.split]}
     args.out.mkdir(parents=True, exist_ok=True)
-    tracer = DirectTracer(model, FiberVolume(spec), crop, nh, TraceParams(max_len=args.max_len, confidence=.5,
+    tracer = FiberTracer(model, FiberVolume(spec), crop, nh, TraceParams(max_len=args.max_len, confidence=.5,
                           n_commit=ck.get('n_commit', 4)), device=args.device)
     curve = []
     try:

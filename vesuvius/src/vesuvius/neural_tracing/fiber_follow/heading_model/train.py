@@ -24,13 +24,17 @@ from vesuvius.neural_tracing.fiber_follow.heading_model.data import (
     load_sources, mixed_heading_states, sampling_from_dict, sampling_to_dict, validation_states)
 from vesuvius.neural_tracing.fiber_follow.heading_model.evaluate import (
     alignment_report, format_report, model_headings, summary_metric)
-from vesuvius.neural_tracing.fiber_follow.heading_model.model import HeadingConfig, HeadingNet, save_heading_model
+from vesuvius.neural_tracing.fiber_follow.heading_model.model import ARCHITECTURE, HeadingConfig, HeadingNet, save_heading_model
 from vesuvius.neural_tracing.fiber_follow.data.remote_prefetch import attach_remote_prefetch
 from vesuvius.neural_tracing.fiber_follow.train.runloop import raise_open_file_limit
 
 DEFAULTS = dict(name='heading_model', steps=30000, batch=128, workers=8, lr=3e-3, weight_decay=1e-4, warmup=500,
                 log_every=100, val_every=2000, ckpt_every=2000, val_states_per_source=1500, seed=0,
                 worker_cache_gb=.5, device='cuda', model={}, sampling={}, ct_normalization=None, out_root=None,
+                # 'cosine' decays to zero at the final step; 'constant' holds lr after warmup.
+                lr_schedule='cosine',
+                # Weights (same architecture and model config) to start a new run from; ignored by --resume.
+                init_checkpoint=None,
                 # The follower trainer's remote CT prefetch (separate async process; workers read the cache only).
                 remote_prefetch_connections=48, remote_prefetch_queue_size=512, remote_prefetch_lookahead=16,
                 remote_prefetch_timeout=120.)
@@ -56,20 +60,24 @@ def read_config(path, overrides=None):
     path = config_path(path)
     config = dict(DEFAULTS, **json.loads(path.read_text()))
     config.update(overrides or {})
-    for key in ('dataset_config', 'ct_normalization', 'out_root'):
+    for key in ('dataset_config', 'ct_normalization', 'out_root', 'init_checkpoint'):
         if config.get(key) and '://' not in str(config[key]):
             config[key] = str((path.parent/config[key]).resolve())
     if not config.get('dataset_config'):
         raise ValueError('The heading-model config needs a dataset_config')
+    if config['lr_schedule'] not in ('cosine', 'constant'):
+        raise ValueError(f"lr_schedule must be 'cosine' or 'constant', not {config['lr_schedule']!r}")
     out_root = config['out_root'] or str(Path(__file__).resolve().parents[1]/'output')
     config['run_dir'] = str(Path(out_root)/config['name'])
     return config
 
 
 def learning_rate(step, config):
-    """Linear warmup, then cosine decay to zero at the final step."""
+    """Linear warmup, then cosine decay to zero at the final step (or constant with lr_schedule 'constant')."""
     if step < config['warmup']:
         return config['lr']*(step+1)/config['warmup']
+    if config.get('lr_schedule', 'cosine') == 'constant':
+        return config['lr']
     progress = (step-config['warmup'])/max(1, config['steps']-config['warmup'])
     return config['lr']*.5*(1+math.cos(math.pi*min(1., progress)))
 
@@ -137,11 +145,22 @@ def main(argv=None):
     step, best = 0, float('inf')
     if args.resume:
         checkpoint = torch.load(run/'last.pt', map_location='cpu', weights_only=False)
+        if checkpoint.get('architecture') != ARCHITECTURE:
+            raise ValueError(f"{run}/last.pt is a {checkpoint.get('architecture')} run; resume it only with that code, "
+                             f'or start a new --name')
         if HeadingConfig(**checkpoint['config']).to_dict() != cfg.to_dict():
             raise ValueError(f'{run}/last.pt was trained with a different model config (inputs); use another --name')
         model.load_state_dict(checkpoint['state'])
         opt.load_state_dict(checkpoint['optimizer'])
         step, best = int(checkpoint['step']), float(checkpoint.get('best', best))
+    elif config['init_checkpoint']:
+        init = torch.load(config['init_checkpoint'], map_location='cpu', weights_only=False)
+        if init.get('architecture') != ARCHITECTURE:
+            raise ValueError(f"{config['init_checkpoint']} is a {init.get('architecture')} checkpoint, not {ARCHITECTURE}")
+        if HeadingConfig(**init['config']).to_dict() != cfg.to_dict():
+            raise ValueError(f"{config['init_checkpoint']} has a different model config than this run")
+        model.load_state_dict(init['state'])
+        print(f"Initialized weights from {config['init_checkpoint']} (step {init.get('step')}); fresh optimizer", flush=True)
     provenance = dict(sampling=sampling_to_dict(sampling), dataset_config=config['dataset_config'],
                       dataset_config_sha256=digest, ct_normalization=normalization,
                       sources=[dict(name=s.name, kind=s.kind, weight=s.weight, train=len(s.train),

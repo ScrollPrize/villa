@@ -7,7 +7,7 @@ import torch
 
 from model_fixtures import coordinate_config, array_at
 from vesuvius.neural_tracing.fiber_follow.models.model import CoordinateRegressionFollower
-from vesuvius.neural_tracing.fiber_follow.data.observations import DirectTracer
+from vesuvius.neural_tracing.fiber_follow.data.observations import FiberTracer
 from vesuvius.neural_tracing.fiber_follow.data import ct_normalization as norm
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import frame_from_heading
 from vesuvius.neural_tracing.fiber_follow.tracing.trace import TraceParams
@@ -40,7 +40,7 @@ def test_pooled_rollout_matches_serial_including_inference_mode(tmp_path, one_in
     headings = np.array([[.3, .4, .8660254]]*3)
     results = []
     for pooled in (True, False):
-        tracer = DirectTracer(model, vol, cfg.fine, cfg.n_history,
+        tracer = FiberTracer(model, vol, cfg.fine, cfg.n_history,
                               TraceParams(n_commit=1, max_len=2., confidence=0.), device='cpu')
         if not pooled:
             tracer.pool.shutdown(wait=True)
@@ -60,7 +60,7 @@ def test_pooled_rollout_matches_serial_including_inference_mode(tmp_path, one_in
     items = [dict(pos=s, frame=frame, hist_local=np.zeros((cfg.n_history, 3)), hmask=np.zeros(cfg.n_history),
                   seed_valid=True, seed_pos=s-[0., 0., 1.], seed_tangent=np.array([0., 0., 1.]), seed_age=1.,
                   observed_path=np.stack([s-[0., 0., 1.], s])) for s in seeds]
-    tracer = DirectTracer(model, vol, cfg.fine, cfg.n_history, TraceParams(n_commit=1), device="cpu")
+    tracer = FiberTracer(model, vol, cfg.fine, cfg.n_history, TraceParams(n_commit=1), device="cpu")
     try:
         serial = tracer.observations.images(copy.deepcopy(items), vol)
         with torch.inference_mode():

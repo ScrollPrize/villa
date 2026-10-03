@@ -1,4 +1,4 @@
-"""Evaluate a direct follower with the shared protocol on the dataset-config held-out sources.
+"""Evaluate either fiber follower with the shared protocol on the dataset-config held-out sources.
 
 Paris 4 uses its frozen monitor/calibration/final seeds; each AFV source uses its own
 seeded validation manifest (the same seeds the trainer writes as ``validation_<name>.json``).
@@ -9,7 +9,7 @@ from pathlib import Path
 
 from vesuvius.neural_tracing.fiber_follow.evaluation.evaluation import main as protocol
 from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolume
-from vesuvius.neural_tracing.fiber_follow.data.observations import DirectTracer
+from vesuvius.neural_tracing.fiber_follow.data.observations import FiberTracer
 from vesuvius.neural_tracing.fiber_follow.train.train import load_checkpoint
 
 DATASET_CONFIG = Path(__file__).parents[1]/'configs'/'mixed_ct_datasets_paris50.json'
@@ -41,7 +41,7 @@ def dataset_sources(args, config=DATASET_CONFIG):
 
 
 def main(argv=None):
-    return protocol(argv, checkpoint_loader=load_checkpoint, tracer_class=DirectTracer, source_loader=dataset_sources)
+    return protocol(argv, checkpoint_loader=load_checkpoint, tracer_class=FiberTracer, source_loader=dataset_sources)
 
 
 if __name__ == '__main__':

@@ -7,7 +7,7 @@ import torch
 
 from model_fixtures import coordinate_config, batch, proposal_output
 from vesuvius.neural_tracing.fiber_follow.train.supervision import point_correctness, loss_terms
-from vesuvius.neural_tracing.fiber_follow.train.training_log import DirectTrainingInterval, format_training_log
+from vesuvius.neural_tracing.fiber_follow.train.training_log import TrainingInterval, format_training_log
 from vesuvius.neural_tracing.fiber_follow.evaluation.diag import plot_curves
 from vesuvius.neural_tracing.fiber_follow.train.runloop import RunLog
 from label_fixtures import set_terminal, set_unknown
@@ -63,7 +63,7 @@ def interval_row(crops, right, wrong, loss):
 
 
 def test_interval_pools_counts_weights_crops_and_decisions_and_preserves_json(tmp_path,capsys):
-    interval = DirectTrainingInterval()
+    interval = TrainingInterval()
     interval.add(dict(interval_row(1,16,0,2.), refinement_attempts_mean=1., refinement_attempts_sum=1))
     interval.add(dict(interval_row(3,0,48,4.), refinement_attempts_mean=3., refinement_attempts_sum=9))
     summary = interval.summary()
@@ -87,11 +87,11 @@ def test_interval_pools_counts_weights_crops_and_decisions_and_preserves_json(tm
     assert '2.50 attempts/decision' in printed
     assert '16-point correctness' not in printed and len(printed.splitlines()) <= 11
     assert json.loads(path.read_text()) == row
-    assert DirectTrainingInterval().summary()['crops'] == 0
+    assert TrainingInterval().summary()['crops'] == 0
     row['interval']['point_correct_count'] = row['interval']['point_wrong_count'] = 0
     assert 'n/a correct' in format_training_log(row)
     # CT plan rejections are not training crops; losses weight decisions, not observations.
-    interval = DirectTrainingInterval()
+    interval = TrainingInterval()
     interval.add(dict(interval_row(16, 16, 0, 1.), ct_frame_rejected_batches=3))
     interval.add(interval_row(16, 16, 0, 1.))
     summary = interval.summary()
@@ -100,7 +100,7 @@ def test_interval_pools_counts_weights_crops_and_decisions_and_preserves_json(tm
     row = dict(step=50, geometry=1., loss=1., lr=.001, interval=summary, n_future=16, tolerance=1.5,
                interval_update_seconds=1., interval_data_seconds=.1, interval_samples_per_second=32.)
     assert '3 unusable batch plans rejected; retried within source' in format_training_log(row)
-    interval = DirectTrainingInterval()
+    interval = TrainingInterval()
     interval.add(dict(interval_row(20, 16, 0, 1.), supervised_states=2))
     interval.add(dict(interval_row(2, 16, 0, 3.), supervised_states=2))
     summary = interval.summary()

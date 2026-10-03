@@ -1,4 +1,4 @@
-"""Shared training/rollout observation builder for the direct follower."""
+"""Shared training/rollout observation builder for both fiber followers."""
 from collections import deque
 from dataclasses import dataclass
 from functools import partial
@@ -443,7 +443,7 @@ def observation_builder(cfg,**kwargs):
     return IdentityObservationBuilder(cfg,**kwargs)
 
 
-class DirectTracer(ModelTracer):
+class FiberTracer(ModelTracer):
     path_context = True
 
     def __init__(self,model,*args,**kwargs):

@@ -1,4 +1,4 @@
-"""Direct dense curve regression plus correctness of the produced prefix."""
+"""Shared prediction and prefix-survival training objectives."""
 import math
 
 import torch

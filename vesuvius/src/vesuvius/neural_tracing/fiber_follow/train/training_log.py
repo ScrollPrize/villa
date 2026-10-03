@@ -105,7 +105,7 @@ class SamplingLedger:
         return result
 
 
-class DirectTrainingInterval:
+class TrainingInterval:
     """Pool counts and weight decision-normalized means by supervised decisions."""
     means = ('loss', 'geometry', 'confidence_loss', 'refinement_attempts_mean')
     counts = tuple(p+'_'+s for p in ('ct_frame', 'history_frame')

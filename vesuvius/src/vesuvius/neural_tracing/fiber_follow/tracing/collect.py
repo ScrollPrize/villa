@@ -1,7 +1,7 @@
-"""Collect original-fiber replay with the direct model and the enlarged crop exclusion."""
+"""Collect original-fiber replay with either fiber follower and the enlarged crop exclusion."""
 from vesuvius.neural_tracing.fiber_follow.tracing.collection import main as collect
 from vesuvius.neural_tracing.fiber_follow.train.train import load_checkpoint
-from vesuvius.neural_tracing.fiber_follow.data.observations import DirectTracer
+from vesuvius.neural_tracing.fiber_follow.data.observations import FiberTracer
 
 
 def failure_banks(args, checkpoint, fibers, band, spec):
@@ -62,7 +62,7 @@ def load_dataset(args, checkpoint):
 
 
 def main(argv=None):
-    return collect(argv, checkpoint_loader=load_checkpoint, tracer_class=DirectTracer,
+    return collect(argv, checkpoint_loader=load_checkpoint, tracer_class=FiberTracer,
                    bank_loader=failure_banks,dataset_loader=load_dataset)
 
 

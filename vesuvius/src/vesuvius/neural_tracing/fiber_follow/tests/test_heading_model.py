@@ -169,3 +169,55 @@ def test_downsampled_patch_lands_where_the_follower_ct_would(tmp_path, monkeypat
     torch.testing.assert_close(actual, expected, atol=1e-6, rtol=0)
     unshifted, _ = model_inputs(coarse, cfg0, positions, frames, paths)  # ignoring the half-voxel offset is detectable
     assert (unshifted-expected).abs().max() > 1e-2
+
+
+def test_encoder_cells_are_mirror_image_octants():
+    """With mirror-symmetric kernels, the opposite final cell's sensitivity is the exact mirror image (v1's
+    3-wide stride-2 kernels put the low cell on the patch edge, so this failed)."""
+    torch.manual_seed(0)
+    net = HeadingNet(HeadingConfig())
+    with torch.no_grad():
+        for layer in net.features:
+            if isinstance(layer, torch.nn.Conv3d):
+                layer.weight.copy_(layer.weight.abs()+layer.weight.abs().flip(2, 3, 4))
+    x = torch.ones(1, 1, 32, 32, 32, requires_grad=True)
+    cells = net.features[:-2](x)
+    assert cells.shape[2:] == (2, 2, 2)
+    low, = torch.autograd.grad(cells[0, :, 0, 0, 0].sum(), x, retain_graph=True)
+    high, = torch.autograd.grad(cells[0, :, 1, 1, 1].sum(), x)
+    torch.testing.assert_close(high, low.flip(2, 3, 4))
+
+
+def test_v1_checkpoint_converts_exactly_and_is_not_loaded_directly(tmp_path):
+    from vesuvius.neural_tracing.fiber_follow.heading_model.model import load_heading_model
+    from vesuvius.neural_tracing.fiber_follow.scripts.convert_heading_v1 import convert, v1_forward
+    torch.manual_seed(1)
+    cfg = HeadingConfig()
+    state = {k: torch.randn(v.shape[:2]+(3, 3, 3))*.2 if v.ndim == 5 else torch.randn(v.shape)*.2
+             for k, v in HeadingNet(cfg).state_dict().items()}
+    config = dict(cfg.to_dict(), patch=dict(cfg.to_dict()['patch'], gate_direction=False, history_render='points',
+                                            history_sigma=1.))  # as v1 runs saved it
+    torch.save(dict(architecture='crop_heading_ct_path_v1', config=config, state=state, step=7, optimizer={}),
+               tmp_path/'v1.pt')
+    with pytest.raises(ValueError, match='convert_heading_v1'):
+        load_heading_model(tmp_path/'v1.pt')
+    converted = convert(tmp_path/'v1.pt', tmp_path/'v2.pt')
+    assert converted['step'] == 7 and 'optimizer' not in converted
+    model, _ = load_heading_model(tmp_path/'v2.pt')
+    patch, path = torch.randn(5, 1, 32, 32, 32), torch.randn(5, 4*cfg.window)
+    with torch.no_grad():
+        expected = v1_forward(state, patch, path)
+        torch.testing.assert_close(model(patch, path), expected)
+    assert (expected-torch.tensor([0., 0., 1.])).abs().max() > 1e-2  # a real, non-prior output was compared
+    with pytest.raises(FileExistsError):
+        convert(tmp_path/'v1.pt', tmp_path/'v2.pt')
+
+
+def test_constant_schedule_holds_lr_and_unknown_schedules_are_rejected(tmp_path):
+    config = dict(lr=1.5e-4, warmup=0, steps=20000, lr_schedule='constant')
+    assert {learning_rate(s, config) for s in (0, 7000, 19999)} == {1.5e-4}
+    assert learning_rate(19999, dict(config, lr_schedule='cosine')) < 1e-8
+    path = tmp_path/'c.json'
+    path.write_text(json.dumps(dict(dataset_config='d.json', lr_schedule='linear')))
+    with pytest.raises(ValueError, match='lr_schedule'):
+        read_config(path)

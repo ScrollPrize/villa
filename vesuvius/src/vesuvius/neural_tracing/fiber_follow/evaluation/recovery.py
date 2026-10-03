@@ -8,7 +8,7 @@ from vesuvius.neural_tracing.fiber_follow.data.data import OnPolicyStates
 from vesuvius.neural_tracing.fiber_follow.tracing.heading import FRAME_POLICY
 from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolume
 from vesuvius.neural_tracing.fiber_follow.evaluation.recovery_fixtures import FIXTURE_STRATA, make_recovery_states, evaluate_recovery_states, recovery_counts
-from vesuvius.neural_tracing.fiber_follow.data.observations import observation_builder, DirectTracer
+from vesuvius.neural_tracing.fiber_follow.data.observations import observation_builder, FiberTracer
 from vesuvius.neural_tracing.fiber_follow.evaluation.diagnostics import decision_rows, summarize_decisions
 
 
@@ -43,7 +43,7 @@ def evaluate_monitor(model, vol, states, fibers, sample, *, device, n_commit=4,
     decisions = []
     thresholds = (.5,)
     rows, _ = evaluate_recovery_states(model, vol, states, fibers, sample, device=device,
-        tracer_class=DirectTracer, batch_builder=observation_builder(model.cfg),
+        tracer_class=FiberTracer, batch_builder=observation_builder(model.cfg),
         n_commit=n_commit, tolerance=tolerance, thresholds=thresholds, recovery_length=recovery_length,
         on_prediction=lambda out, batch: decisions.extend(decision_rows(out, batch, model.cfg, n_commit, tolerance)))
     return dict(states=len(states), recovery_length=recovery_length,

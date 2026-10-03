@@ -9,7 +9,7 @@ import torch
 from model_fixtures import config as cfg, coordinate_config, coordinate_batch
 from vesuvius.neural_tracing.fiber_follow.data.history_slabs import selected_arcs, slab_layout, fitted_heading, observed_path, load_slabs, slabs_allowed
 from vesuvius.neural_tracing.fiber_follow.models.model import build_model
-from vesuvius.neural_tracing.fiber_follow.data.observations import ObservationBuilder, DirectTracer
+from vesuvius.neural_tracing.fiber_follow.data.observations import ObservationBuilder, FiberTracer
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength
 from vesuvius.neural_tracing.fiber_follow.data.data import OnPolicyStates, ZBand, SampleConfig, make_sample
 from vesuvius.neural_tracing.fiber_follow.tracing.trace import trace_history
@@ -136,7 +136,7 @@ def test_fresh_replay_inference_and_resume_inputs_identical(monkeypatch,tmp_path
     builder = ObservationBuilder(coordinate_config())
     fresh = builder.images([item],None)
     replay = builder.images([dict(item,observed_path=loaded.observed_prefix(0))],None)
-    tracer = DirectTracer.__new__(DirectTracer)
+    tracer = FiberTracer.__new__(FiberTracer)
     tracer.device,tracer.vol,tracer.pool,tracer.observations='cpu',None,None,builder
     direct = tracer.build_inputs(item['pos'][None],item['frame'][None],item['hist_local'][None],item['hmask'][None],paths=[item])
     resumed = tracer.build_inputs(item['pos'][None],item['frame'][None],item['hist_local'][None],item['hmask'][None],
@@ -221,7 +221,7 @@ def test_actual_trace_commits_and_resumed_slabs_use_same_prefix(monkeypatch):
             p=hist.new_tensor([[[.2,0,1.],[-.3,0,2.],[.1,0,3.],[0,0,4.]]]).expand(len(hist),-1,-1)
             return dict(points=p,confidence=p.new_ones(len(hist),4))
     def tracer():
-        t=DirectTracer.__new__(DirectTracer)
+        t=FiberTracer.__new__(FiberTracer)
         t.model,t.device,t.n_history=Model(),'cpu',c.n_history
         t.vol,t.pool,t.observations=SimpleNamespace(shape=(1000,1000,1000)),None,ObservationBuilder(c)
         t.p=TraceParams(n_commit=4,max_len=12.,loop_radius=.01)

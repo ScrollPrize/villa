@@ -17,7 +17,6 @@ import torch
 from vesuvius.neural_tracing.fiber_follow.data.data import FollowDataset, SampleConfig, TaskBudget, ZBand, load_fibers, split_fibers, OnPolicyStates
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
 from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolumeSpec
-from vesuvius.neural_tracing.fiber_follow.train.training_options import normalize_batch_options
 from vesuvius.neural_tracing.fiber_follow.train.runloop import raise_open_file_limit
 from vesuvius.neural_tracing.fiber_follow.models.model import CoordinateRegressionConfig
 from vesuvius.neural_tracing.fiber_follow.data.observations import IdentityObservationBuilder, IdentitySampling
@@ -50,7 +49,7 @@ def main():
         ap.error('Positive batches, nonnegative warmup/workers; profiling requires workers=0')
     raise_open_file_limit()
     torch.set_num_threads(1)
-    c = normalize_batch_options(json.loads(args.config.read_text()))
+    c = json.loads(args.config.read_text())
     cfg = CoordinateRegressionConfig(**dict(c['model_cfg'], fine=CropSpec(**c['model_cfg']['fine'])))
     sample = SampleConfig(**dict(c['sample_cfg'], crop=cfg.fine))
     spec = FiberVolumeSpec(**c['vol_spec'])

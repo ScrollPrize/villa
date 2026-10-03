@@ -22,8 +22,20 @@ The network sees two inputs, both in a frame whose +z is the tracer's prior head
 The prior heading is the tracer's trailing 12-voxel fit, or the held seed heading on shorter paths.
 
 The patch is sampled with random roll during training, so inference can use any roll and no CT-derived roll
-is needed. The output is a residual on the prior; an untrained network returns its prior. The model has 74k
-parameters and costs about 0.7 ms per 24 heads on CPU, about 10 ms with patch sampling.
+is needed. The output is a residual on the prior; an untrained network returns its prior.
+
+The encoder halves the patch four times (32 → 16 → 8 → 4 → 2) with stride-2 convolutions whose kernels are 4
+wide, padding 1. Each output covers inputs 2o−1 to 2o+2, so every grid stays centered on the patch and each input
+feeds exactly two outputs per axis. The final 2×2×2 cells (64 features each) are mirror-image octants; patch
+depth and width must be divisible by 16. This is architecture `crop_heading_ct_path_v2`. The model has 136k
+parameters at width 8 and 473k at width 16. One CPU thread runs 24 heads in about 6 ms at width 8 and 15 ms at
+width 16, without patch sampling.
+
+v1 used 3-wide kernels, which centered every output on an even input. On each axis the low final cell then sat
+on the patch edge and the high cell saw nearly the whole patch, so one cell carried most of the decision.
+`scripts/convert_heading_v1.py SOURCE DEST` converts a v1 checkpoint exactly (a 3-wide kernel is a 4-wide one
+with a zero last tap). It checks the outputs against the v1 computation before writing; the result evaluates
+and predicts but does not resume. `output/heading_model_l0_w16/best_v2.pt` is the converted step-70000 model.
 
 ## Training data: the follower's own code
 
@@ -57,6 +69,12 @@ python heading_model/train.py            # uses configs/heading_model.json
 `configs/heading_model.json` trains on the sources in `configs/mixed_ct_datasets_paris50.json`: Paris 4,
 `0175A_5mm_v1.afv` and `1447_5mm_v1.afv` at 0.5/0.25/0.25. It reuses the CT normalization of
 `mixed_ct_afv_stem32_run3_pathgeom_paris50` and runs 30k steps of batch 128.
+
+`init_checkpoint` starts a new run from another checkpoint's weights, which must have the same architecture and
+model config; the optimizer starts fresh, and `--resume` ignores it. `lr_schedule: "constant"` holds `lr` after
+the warmup instead of the default cosine decay to zero. `configs/heading_model_l0_w16_centered.json` uses both:
+20k steps at a constant 1.5e-4 (the step-60k rate of `heading_model_l0_w16`), starting from the converted
+`best_v2.pt`.
 
 The run directory `output/<name>/` holds:
 

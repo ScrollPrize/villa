@@ -6,6 +6,12 @@ no CT-derived roll or structure tensor is needed):
 - the last ``window`` voxels of the observed path at unit arclength relative to the head, with validity (none at
   a seed).
 The output is a residual on the prior (+z), so an untrained network returns the prior.
+
+The encoder halves the patch four times with stride-2 convolutions whose kernels are 4 wide (padding 1): output o
+covers inputs 2o-1..2o+2, so every grid stays centered on the patch, each input feeds exactly two outputs per axis,
+and the final 2x2x2 cells are mirror-image octants. v1 used 3-wide kernels, which centered outputs on even inputs:
+on each axis the low final cell sat on the patch edge and the high one saw nearly the whole patch.
+(scripts/convert_heading_v1.py converts a v1 checkpoint exactly: a 3-wide kernel is a 4-wide one with a zero tap.)
 """
 from dataclasses import asdict, dataclass, field, replace
 
@@ -17,7 +23,8 @@ from vesuvius.neural_tracing.fiber_follow.models.model import CoordinateRegressi
 from vesuvius.neural_tracing.fiber_follow.data.crop_sampling import scalar_crops
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, arclength, frame_from_heading, interp_at
 
-ARCHITECTURE = 'crop_heading_ct_path_v1'
+ARCHITECTURE = 'crop_heading_ct_path_v2'
+DOWNSAMPLINGS = 4  # stride-2 encoder layers; patch sizes must be divisible by 2**DOWNSAMPLINGS
 
 
 def main_crop_forward(crop=None):
@@ -53,12 +60,15 @@ class HeadingNet(nn.Module):
     def __init__(self, cfg: HeadingConfig):
         super().__init__()
         self.cfg = cfg
+        if cfg.patch.depth % 2**DOWNSAMPLINGS or cfg.patch.width % 2**DOWNSAMPLINGS:
+            raise ValueError(f'Heading patch depth and width must be divisible by {2**DOWNSAMPLINGS} for a centered encoder grid')
         w = cfg.width
+        # 4-wide stride-2 kernels keep every grid centered on the patch (see module docstring).
         self.features = nn.Sequential(
-            nn.Conv3d(1, w, 3, stride=2, padding=1), nn.SiLU(),
-            nn.Conv3d(w, 2*w, 3, stride=2, padding=1), nn.SiLU(),
-            nn.Conv3d(2*w, 4*w, 3, stride=2, padding=1), nn.SiLU(),
-            nn.Conv3d(4*w, 4*w, 3, stride=2, padding=1), nn.SiLU(),
+            nn.Conv3d(1, w, 4, stride=2, padding=1), nn.SiLU(),
+            nn.Conv3d(w, 2*w, 4, stride=2, padding=1), nn.SiLU(),
+            nn.Conv3d(2*w, 4*w, 4, stride=2, padding=1), nn.SiLU(),
+            nn.Conv3d(4*w, 4*w, 4, stride=2, padding=1), nn.SiLU(),
             nn.AdaptiveAvgPool3d(2), nn.Flatten())
         self.path = nn.Sequential(nn.Linear(4*cfg.window, 64), nn.SiLU())
         self.head = nn.Sequential(nn.Linear(4*w*8+64, 64), nn.SiLU(), nn.Linear(64, 3))
@@ -144,6 +154,8 @@ def save_heading_model(path, model, **extra):
 
 def load_heading_model(path, device='cpu'):
     checkpoint = torch.load(path, map_location='cpu', weights_only=False)
+    if checkpoint.get('architecture') == 'crop_heading_ct_path_v1':
+        raise ValueError(f'{path} uses the v1 (off-center) encoder; convert it with scripts/convert_heading_v1.py')
     if checkpoint.get('architecture') != ARCHITECTURE:
         raise ValueError(f'Not a {ARCHITECTURE} checkpoint: {path}')
     model = HeadingNet(HeadingConfig(**checkpoint['config']))
