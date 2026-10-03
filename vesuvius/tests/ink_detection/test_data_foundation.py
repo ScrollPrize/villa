@@ -196,6 +196,29 @@ def test_explicit_label_version_requires_matching_required_assets(tmp_path):
         discover_segment_labels(_segment(config, tmp_path))
 
 
+def test_unused_validation_mask_warns_without_changing_selection(tmp_path):
+    segment_dir = tmp_path / "segment-a"
+    segment_dir.mkdir()
+    selected = [
+        segment_dir / "segment-a_inklabels.zarr",
+        segment_dir / "segment-a_supervision_mask.zarr",
+    ]
+    for path in selected:
+        path.mkdir()
+    (segment_dir / "segment_validation_mask_v2.zarr").mkdir()
+    with pytest.warns(UserWarning, match="no validation mask selected"):
+        discovered = discover_segment_labels(_segment(_config(tmp_path), tmp_path))
+    assert discovered.inklabels == selected[0]
+    assert discovered.supervision_mask == selected[1]
+    assert discovered.validation_mask is None
+
+    (segment_dir / "segment-a_validation_mask.zarr").mkdir()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        discovered = discover_segment_labels(_segment(_config(tmp_path), tmp_path))
+    assert discovered.validation_mask == segment_dir / "segment-a_validation_mask.zarr"
+
+
 def test_segment_gathering_preserves_remote_and_explicit_volume_paths(tmp_path):
     native_root = tmp_path / "native-segments"
     native_segment = native_root / "native-a"
