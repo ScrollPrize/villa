@@ -71,6 +71,35 @@ def test_learned_bounds_cover_any_new_heading_and_model_patch():
             assert np.all(xyz[:, ::-1] >= start) and np.all(xyz[:, ::-1] < start+size)
 
 
+@pytest.mark.parametrize('ambiguous', [False, True])
+def test_heading_change_recomputes_fixed_forward_plane_crossings(ambiguous):
+    from vesuvius.neural_tracing.fiber_follow.data.data import TracedFiber, SampleConfig, label_state
+    from vesuvius.neural_tracing.fiber_follow.data.state_labels import facts, classify
+    from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength
+    cfg = SampleConfig()
+    points = np.c_[np.zeros(201), np.zeros(201), np.arange(201.)]
+    fiber = TracedFiber('line', points, arclength(points), 'V')
+    pos = points[100]
+    sample = label_state(fiber, pos, np.eye(3), np.tile(pos, (cfg.n_history, 1)),
+                         np.zeros(cfg.n_history), cfg, t=100., reverse=False,
+                         trace=facts(match_distance=0., match_ambiguous=ambiguous,
+                                     tolerance=cfg.label_tolerance,
+                                     max_recovery_distance=cfg.max_recovery_distance))
+    sample['observed_path'] = points[90:101]
+    orient_items([sample], None, Predictor())
+    # A rotated old label would move off the fixed forward planes. The new label
+    # must instead intersect each plane with the original world-space fiber.
+    np.testing.assert_allclose(sample['planes'], cfg.future_s)
+    local = np.c_[sample['plane_ab'], sample['planes']]
+    world = local @ sample['frame'].T + pos
+    np.testing.assert_allclose(world[:, :2], 0., atol=1e-6)
+    np.testing.assert_allclose(world[:, 2], 100.+cfg.future_s/sample['frame'][2, 2], atol=1e-6)
+    expected = classify(sample, sample['trace_facts'])
+    for key in ('supervision', 'geometry_valid', 'confidence_valid'):
+        assert sample[key] == expected[key]
+    assert bool(sample['gt_history_mask'].any()) is not ambiguous
+
+
 def test_historical_roll_keeps_path_heading_and_only_supplies_prefix(monkeypatch):
     predictor, sample = Predictor(), item(160)
     sample['frame_policy'] = LEARNED_FRAME_POLICY

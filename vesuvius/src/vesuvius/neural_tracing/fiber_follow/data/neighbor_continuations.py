@@ -78,7 +78,12 @@ def wrong_continuation(bank, cfg, rng, *, tail_length_range=(4., 16.), prefix_le
     distance = arclength(path)
     units = np.arange(0., distance[-1]+1.)
     own_units = np.interp(units, distance, np.r_[prefix_t, own_t])
-    noise, sigma = trace_noise(own_units, own_points, own_arc, cfg, rng)
+    # Projection onto the original fiber is not uniformly spaced: it can stall
+    # at an endpoint while the bridge keeps moving. trace_noise (and its
+    # annotation smoothing) requires a regular, positive-spacing arclength grid.
+    noise_arcs = own_units[0]+np.arange(np.ceil(max(0., own_units.max()-own_units[0]))+1.)
+    noise, sigma = trace_noise(noise_arcs, own_points, own_arc, cfg, rng)
+    noise = np.stack([np.interp(own_units, noise_arcs, noise[:, k]) for k in range(3)], -1)
     keep = 1-np.r_[np.zeros(len(prefix_t)), weight]
     path = path+np.stack([np.interp(distance, units, noise[:, k]) for k in range(3)], -1)*keep[:, None]
     # A clipped prefix/bridge join can repeat the first point (notably when

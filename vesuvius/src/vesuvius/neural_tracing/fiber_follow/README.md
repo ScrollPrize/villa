@@ -56,6 +56,20 @@ crossings and supervision after a heading change. Frame diagnostics use source c
 
 `scripts/train_coordinate_regression.sh` records the fixed coordinate regression experiment settings; `scripts/launch_train.sh` launches a named run. `scripts/stop.sh NAME` stops that run and its collectors.
 
+For a fresh 100k-step run initialized from
+`output/mixed_ct_afv_stem32_run3_pathgeom_paris50/coordinate_regression_weights.pt` with learned frames:
+
+```bash
+bash scripts/train_coordinate_learned_frame.sh
+```
+
+This wraps the coordinate launcher with run name `mixed_ct_afv_coordinate_learned_frame_100k`, the tested 64k
+frame checkpoint, 100k updates, and the source run's 5k warmup, 6,000-voxel collection limit and 96-voxel
+post-failure window. It keeps batch 4 × 3 accumulation, LR 1e-4, 10 workers, 48 prefetch connections and Paris50
+dataset weights. AdamW and replay start fresh; the follower's model and EMA weights initialize from the source.
+After warmup, the follower LR follows its existing cosine schedule. `COORDINATE_RUN_NAME`, `COORDINATE_INIT`,
+`FRAME_CHECKPOINT`, and trailing CLI arguments can override the run name, weight source, frame model and settings.
+
 ## Organization
 
 | Package | Responsibility |

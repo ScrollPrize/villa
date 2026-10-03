@@ -181,8 +181,8 @@ def _interval_training_lines(row):
             transported, deterministic = (int(m.get(prefix+'_'+key, 0)) for key in ('transported', 'deterministic'))
             frames.append(f"{label} {transported+deterministic}/{int(count)} fallbacks"
                           f" ({transported} transported, {deterministic} deterministic)"
-                          f"; {int(m.get(prefix+'_learned', 0))} learned"
-                          f"; mean gap {m.get(prefix+'_gap_sum', 0)/count:.3f}")
+                          f"; mean gap {m.get(prefix+'_gap_sum', 0)/count:.3f}"
+                          +(f"; {int(m[prefix+'_learned'])} learned" if m.get(prefix+'_learned', 0) else ''))
     if frames:
         lines.append('  CT frames: '+' | '.join(frames))
     if m.get('ct_frame_rejected_batches', 0):

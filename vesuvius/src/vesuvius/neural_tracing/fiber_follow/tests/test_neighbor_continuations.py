@@ -92,3 +92,34 @@ def test_invalid_tail_ranges_fail_closed():
     for lengths in ((0.,128.),(128.,4.),(4.,float('nan')),(4.,float('inf')),(4.,)):
         with pytest.raises(ValueError,match='tail lengths'):
             IdentitySampling(synthetic_tail=lengths)
+
+
+@pytest.mark.parametrize('reverse', [False, True])
+@pytest.mark.parametrize('advance', [0., 1e-9, 1.])
+def test_synthetic_noise_handles_stalled_endpoint_projection(tmp_path, monkeypatch, reverse, advance):
+    bank, fiber = make_bank(tmp_path)
+    _, sample = configuration()
+    # A neighbor bends around an annotation endpoint: it moves, but every
+    # nearest annotation point stays at (or barely advances from) the endpoint.
+    angle = np.linspace(0., 8*np.pi, 601)
+    z = fiber.length if reverse else 0.
+    along = np.linspace(0., advance, len(angle))
+    line = np.c_[6*np.cos(angle), 6*np.sin(angle), z-along if reverse else along]
+    arc_range = (float(line[:, 2].min()), float(line[:, 2].max()))
+    monkeypatch.setattr(bank, 'draw_path', lambda *args, **kwargs: (0, line, arc_range))
+    class Rng:
+        def __init__(self):
+            self.rng = np.random.default_rng(8)
+        def integers(self, high):
+            assert high == 2
+            return int(reverse)
+        def __getattr__(self, name):
+            return getattr(self.rng, name)
+    state = wrong_continuation(bank, sample, Rng(), tail_length_range=(4., 12.), prefix_length=128.)
+    assert state is not None and state['terminal'] and not state['geometry_valid']
+    assert state['supervision_reason'] == REASON['switch']
+    assert np.isfinite(state['observed_path']).all()
+    np.testing.assert_allclose(state['seed_pos'], [0., 0., z], atol=1e-9)
+    assert np.linalg.norm(state['seed_tangent']) == pytest.approx(1.)
+    assert 4. <= state['bank_tail_length'] <= 12.
+    assert bank.clear_of_target(0, state['pos'][None]).all()

@@ -787,8 +787,10 @@ def main(argv=None):
         return {role:bank.provenance() for role,bank in role_banks.items()}
     if resume:
         # Allow a new base LR without resetting AdamW or the schedule origin.
+        # The frame selection comes from model_cfg unless explicitly overridden;
+        # an omitted CLI flag must not prevent resuming that recorded selection.
         # Operational settings may change on resume; sampling and label semantics may not.
-        ignored = {'resume','reset_optimizer','lr','out_root','device','batch','grad_steps','workers','threads','dagger_threads','worker_cache_gb','dataset_config',
+        ignored = {'resume','reset_optimizer','lr','frame_checkpoint','out_root','device','batch','grad_steps','workers','threads','dagger_threads','worker_cache_gb','dataset_config',
                    'remote_prefetch_connections','remote_prefetch_queue_size','remote_prefetch_timeout','remote_prefetch_lookahead',
                    'log_every','ckpt_every','diag_every','batch_diag_every','dagger_device','dagger_batch','dagger_forward_chunk',
                    'negative_bank_refresh_seconds','negative_bank_cache_mb','activation_checkpointing',
