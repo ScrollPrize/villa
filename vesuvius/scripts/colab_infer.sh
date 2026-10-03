@@ -31,6 +31,7 @@
 #   WAIT                1 to wait for completion locally       (default: 1)
 #   STOP_SESSION        1 to stop the session once finished    (default: 1, only applies with WAIT=1)
 #   POLL_SECONDS        How often to check Drive for the status file (default: 60)
+#   STALE_MINUTES       Declare the session dead after this long without a heartbeat (default: 10)
 #   All colab_bootstrap.sh env vars (REPO_BRANCH, VESUVIUS_COLAB_SESSION, VESUVIUS_COLAB_GPU, etc.) are passed through.
 
 set -euo pipefail
@@ -48,6 +49,7 @@ INFER_ARGS="${INFER_ARGS:-}"
 WAIT="${WAIT:-1}"
 STOP_SESSION="${STOP_SESSION:-1}"
 POLL_SECONDS="${POLL_SECONDS:-60}"
+STALE_MINUTES="${STALE_MINUTES:-10}"
 
 if [[ -z "${INPUT_ZARR:-}" ]]; then
     [[ -f "$CONFIG_LOCAL" ]] || { echo "[infer] INPUT_ZARR unset and config not found: $CONFIG_LOCAL" >&2; exit 1; }
@@ -128,28 +130,29 @@ if [[ "$WAIT" != "1" ]]; then
     exit 0
 fi
 
-# Completion is a file on Drive, but a dead session never writes one, so also
-# watch for the session disappearing. `colab status` is not trusted on a
-# single reading (see colab_resume_watchdog.sh), only after several
-# consecutive polls in a row without the session listed.
-log "waiting for $STATUS_RCLONE (polling every ${POLL_SECONDS}s)"
+# Completion is a file on Drive, but a dead session never writes one, so
+# also watch the heartbeat: <name>.progress is rewritten every minute while
+# inference runs, and a session counts as dead once it stops changing for
+# STALE_MINUTES. `colab status` is NOT used for this — observed live, it
+# listed no sessions at all while this one was healthy and mid-inference
+# (see also colab_resume_watchdog.sh on its unreliability).
+log "waiting for $STATUS_RCLONE (polling every ${POLL_SECONDS}s, dead after ${STALE_MINUTES} min without a heartbeat)"
 STATUS=""
-MISSING=0
+LAST_BEAT=""
+LAST_CHANGE=$SECONDS
 while [[ -z "$STATUS" ]]; do
     sleep "$POLL_SECONDS"
     STATUS="$(rclone cat --config "$RCLONE_CONF_LOCAL" "$STATUS_RCLONE" 2>/dev/null || true)"
     [[ -n "$STATUS" ]] && break
-    if colab status 2>/dev/null | grep -q "^\[$SESSION\]"; then
-        MISSING=0
-    else
-        MISSING=$((MISSING + 1))
-        log "session $SESSION not listed by colab status ($MISSING/3)"
-        if (( MISSING >= 3 )); then
-            log "session $SESSION is gone and no status file was written — inference died with it."
-            log "last progress snapshot ($PROGRESS_RCLONE):"
-            rclone cat --config "$RCLONE_CONF_LOCAL" "$PROGRESS_RCLONE" 2>/dev/null || echo "(none)"
-            exit 1
-        fi
+    BEAT="$(rclone lsl --config "$RCLONE_CONF_LOCAL" "$PROGRESS_RCLONE" 2>/dev/null || true)"
+    if [[ -n "$BEAT" && "$BEAT" != "$LAST_BEAT" ]]; then
+        LAST_BEAT="$BEAT"
+        LAST_CHANGE=$SECONDS
+    elif (( SECONDS - LAST_CHANGE > STALE_MINUTES * 60 )); then
+        log "no heartbeat for ${STALE_MINUTES} min and no status file — the session died with inference unfinished."
+        log "last progress snapshot ($PROGRESS_RCLONE):"
+        rclone cat --config "$RCLONE_CONF_LOCAL" "$PROGRESS_RCLONE" 2>/dev/null || echo "(none)"
+        exit 1
     fi
 done
 log "inference finished: $STATUS"
