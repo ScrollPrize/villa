@@ -133,6 +133,17 @@ uv run --extra models python -m vesuvius.ink_detection.inference.infer \
   /data/predictions/pherc0139-w016.tif
 ```
 
+Compare checkpoints, depth offsets and both directions on one volume, with a
+contact sheet and optional ROC AUC against labels (see
+[docs/ink_detection.md](../../../docs/ink_detection.md)):
+
+```bash
+uv run --extra models python -m vesuvius.ink_detection.inference.sweep \
+  /data/segments/w035/w035_9um.zarr /data/sweeps/w035 \
+  --checkpoints /data/ink_9um/seed42.pth /data/ink_9um/seed43.pth \
+  --offsets -4 -2 0 2 4
+```
+
 Run native inference:
 
 ```bash

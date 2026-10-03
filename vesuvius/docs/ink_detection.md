@@ -460,6 +460,52 @@ Flat inference has a narrower preprocessing contract than training. It accepts
 with `divisor: 255`. Other normalization modes are rejected rather than being
 silently replaced with robust normalization.
 
+### Compare checkpoints, depth windows and directions
+
+The flat models are sensitive to where the papyrus sits in their depth window
+and to which side of the surface volume faces the ink, and checkpoints differ
+from segment to segment. `sweep` runs every combination on one surface volume
+and writes the predictions, `sweep.json` and a `sweep.png` contact sheet:
+
+```bash
+uv run --extra models python -m vesuvius.ink_detection.inference.sweep \
+  /data/segments/w035/w035_9um.zarr \
+  /data/sweeps/w035 \
+  --checkpoints /data/ink_9um/hybrid_3d2d-seed42/step-075000.pth \
+                /data/ink_9um/hybrid_3d2d-seed43/step-075000.pth \
+  --offsets -4 -2 0 2 4 \
+  --batch-size 32
+```
+
+Each checkpoint is loaded and compiled once and reused for all of its runs.
+Every prediction goes through the same code path as `infer`, so a sweep TIFF
+is byte-identical to `infer` with the matching `--layer-start`,
+`--layer-end` and `--direction`. Offsets whose window would leave the volume
+are skipped and listed in `sweep.json`, instead of being clamped.
+
+The contact sheet has one row per checkpoint and direction and one column per
+depth offset, all shown with one shared display range. Above the grid it plots
+the mean intensity of each slice with a bar for each window, so you can see
+where the papyrus sits relative to the windows.
+
+With `--ink-labels` and `--eval-mask`, each run also gets an exact ROC AUC
+inside the mask, in `sweep.json` and under each tile. Use a held-out
+`_validation_mask` for a generalization number; on training regions the
+number mostly measures memorized labels.
+
+| Argument | Meaning |
+|---|---|
+| `input_zarr output_dir` | Surface volume, and the directory for TIFFs, `sweep.json` and `sweep.png`. |
+| `--checkpoints` | One or more flat checkpoints. Equal file names are prefixed with their folder. |
+| `--offsets` | Depth offsets in slices from the default centered window, default `-2 0 2`. Offset 0 is `infer` without a layer range. |
+| `--direction` | `forward`, `reverse`, or `both`; default `both`. |
+| `--ink-labels`, `--eval-mask` | Label image or Zarr and the region to score, given together. Zarr labels are read at level 0 and must match the input's Y/X shape. |
+| `--sheet-tile-px` | Longest side of each contact-sheet tile, default `320`. |
+
+All other flat inference options (`--batch-size`, `--num-workers`,
+`--mask-path`, `--overlap`, `--blend-mode`, `--amp-dtype`, `--tta-mirror`,
+`--gpus`, `--compile-mode`, `--no-compile`, ...) behave as in `infer`.
+
 ## Native 3D inference
 
 A tifxyz directory must contain `x.tif`, `y.tif`, `z.tif`, and
