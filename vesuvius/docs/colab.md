@@ -144,7 +144,8 @@ The model, normalization and input geometry are rebuilt from the config embedded
 | `WAIT` / `STOP_SESSION` | `1` / `1` | Wait for completion locally, then stop the session |
 | `POLL_SECONDS` | `60` | Status-file polling interval |
 | `STALE_MINUTES` | `10` | Declare a session dead after this long without a heartbeat |
-| `RESUME_EVERY` | `1500` | Blocks between resume snapshots (~11 min on a T4) |
+| `RESUME_EVERY` | `500` | Blocks between resume snapshots (~4 min on a T4) |
+| `KEEPALIVE_SECONDS` | `300` | Interval of a no-op `colab exec` while waiting (sessions were reclaimed ~20 min after the last exec); `0` disables |
 | `RESUME_DIR_REMOTE` | `<OUTPUT_DIR_REMOTE>/<OUTPUT_NAME>.resume` | Durable resume state on Drive; deleted after success |
 | `MAX_ATTEMPTS` | `40` | Fresh sessions to try before giving up |
 

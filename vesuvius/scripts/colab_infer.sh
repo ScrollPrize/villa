@@ -40,7 +40,8 @@
 #   STOP_SESSION        1 to stop the session once finished    (default: 1, only applies with WAIT=1)
 #   POLL_SECONDS        How often to check Drive for the status file (default: 60)
 #   STALE_MINUTES       Declare the session dead after this long without a heartbeat (default: 10)
-#   RESUME_EVERY        Blocks between resume snapshots        (default: 1500, ~11 min on a T4)
+#   RESUME_EVERY        Blocks between resume snapshots        (default: 500, ~4 min on a T4)
+#   KEEPALIVE_SECONDS   Interval of a no-op `colab exec` while waiting (default: 300; 0 disables)
 #   RESUME_DIR_REMOTE   Durable resume directory on Drive      (default: <OUTPUT_DIR_REMOTE>/<OUTPUT_NAME>.resume;
 #                       deleted after a successful run)
 #   MAX_ATTEMPTS        Sessions to try before giving up       (default: 40)
@@ -62,7 +63,8 @@ WAIT="${WAIT:-1}"
 STOP_SESSION="${STOP_SESSION:-1}"
 POLL_SECONDS="${POLL_SECONDS:-60}"
 STALE_MINUTES="${STALE_MINUTES:-10}"
-RESUME_EVERY="${RESUME_EVERY:-1500}"
+RESUME_EVERY="${RESUME_EVERY:-500}"
+KEEPALIVE_SECONDS="${KEEPALIVE_SECONDS:-300}"
 MAX_ATTEMPTS="${MAX_ATTEMPTS:-40}"
 
 if [[ -z "${INPUT_ZARR:-}" ]]; then
@@ -170,10 +172,20 @@ run_attempt() {
     # observed live, it listed no sessions at all while this one was healthy
     # and mid-inference (see also colab_resume_watchdog.sh).
     log "waiting for $STATUS_RCLONE (polling every ${POLL_SECONDS}s, dead after ${STALE_MINUTES} min without a heartbeat)"
+    # Keep-alive: sessions were reclaimed ~20 min after the last `colab exec`
+    # reached them, regardless of the detached job still running on the GPU
+    # (seen on training and inference sessions alike — every death came
+    # ~20 min after the launch exec or the last manual probe). A no-op exec
+    # every KEEPALIVE_SECONDS shows the session as in use. Failures are
+    # ignored (subshell: remote_py exits on error); the heartbeat decides.
     STATUS=""
-    local last_beat="" beat last_change=$SECONDS
+    local last_beat="" beat last_change=$SECONDS last_keepalive=$SECONDS
     while [[ -z "$STATUS" ]]; do
         sleep "$POLL_SECONDS"
+        if (( KEEPALIVE_SECONDS > 0 && SECONDS - last_keepalive >= KEEPALIVE_SECONDS )); then
+            ( remote_py "print('keepalive')" 60 ) >/dev/null 2>&1 || log "keep-alive exec to $SESSION failed (ignored)"
+            last_keepalive=$SECONDS
+        fi
         STATUS="$(rclone cat --config "$RCLONE_CONF_LOCAL" "$STATUS_RCLONE" 2>/dev/null || true)"
         [[ -n "$STATUS" ]] && break
         beat="$(rclone lsl --config "$RCLONE_CONF_LOCAL" "$PROGRESS_RCLONE" 2>/dev/null || true)"
