@@ -85,6 +85,23 @@ remote_bash() {
     check_remote_ok "$out"
 }
 
+# Runs colab_bootstrap.sh for $SESSION (output teed to the caller's stdout;
+# extra env such as REPO_URL can be passed as prefix assignments). Returns 0
+# on success, 3 when Colab refused to assign a runtime
+# (TooManyAssignmentsError: over the concurrent-session or GPU usage quota —
+# retrying soon is pointless and just hammers the API), 1 on any other
+# failure. Requires $SESSION and $SCRIPT_DIR set, and pipefail.
+run_bootstrap() {
+    local out rc=0
+    out="$(mktemp)"
+    VESUVIUS_COLAB_SESSION="$SESSION" "$SCRIPT_DIR/colab_bootstrap.sh" 2>&1 | tee "$out" || rc=$?
+    if (( rc != 0 )); then
+        if grep -q "TooManyAssignmentsError" "$out"; then rc=3; else rc=1; fi
+    fi
+    rm -f "$out"
+    return "$rc"
+}
+
 # Launches a detached background loop on the session that keeps a zarr
 # volume_cache_dir (an S3 chunk cache — see docs/ink_detection.md "Volume
 # paths and disk cache") under a total size bound for as long as training
