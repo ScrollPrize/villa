@@ -299,6 +299,8 @@ struct GeneratedViews {
     int seedLineIndex = -1;
     int initialCenterIndex = 0;
     std::optional<std::pair<double, double>> initialStripLinePositionRange;
+    // Fit the complete line in both strips once instead of restoring saved zooms.
+    bool initialFitWholeLine = false;
     bool initialCurrentCutFollowsStripMouse = true;
     std::vector<GeneratedOverlay::ControlPointMarker> controlPoints;
     std::vector<GeneratedOverlay::PredSnapMarker> predSnapPoints;

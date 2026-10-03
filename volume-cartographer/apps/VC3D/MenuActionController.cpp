@@ -229,6 +229,12 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _fileMenu->addSeparator();
     _fileMenu->addAction(_attachVolumeAct);
     _fileMenu->addAction(_attachSegmentsAct);
+    _fileMenu->addAction(QObject::tr("Open Automated Fiber Volume…"), this, [qWindow]() {
+        // macOS hides the native file-type selector when there is only one filter.
+        const auto path = QFileDialog::getOpenFileName(qWindow, QObject::tr("Open Automated Fiber Volume (.afv)"),
+                                                     {}, QObject::tr("Automated Fiber Volume (*.afv);;All files (*)"));
+        if (!path.isEmpty()) qWindow->openFiberCollection(path);
+    });
     _fileMenu->addAction(_attachNormalGridAct);
     _fileMenu->addAction(_attachUmbilicusAct);
     _fileMenu->addAction(_detachUmbilicusAct);

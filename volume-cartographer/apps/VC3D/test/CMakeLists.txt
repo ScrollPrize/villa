@@ -312,6 +312,18 @@ add_test(NAME seeding_batch_tracker COMMAND test_seeding_batch_tracker)
 vc_register_test_target(test_seeding_batch_tracker)
 vc_register_ctest(seeding_batch_tracker test_seeding_batch_tracker)
 
+add_executable(test_fiber_collection_generator
+    test_fiber_collection_generator.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberCollectionGenerator.cpp)
+set_target_properties(test_fiber_collection_generator PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+target_include_directories(test_fiber_collection_generator PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_fiber_collection_generator PRIVATE Qt6::Core Qt6::Test)
+add_test(NAME fiber_collection_generator COMMAND test_fiber_collection_generator)
+vc_register_test_target(test_fiber_collection_generator)
+vc_register_ctest(fiber_collection_generator test_fiber_collection_generator)
+
 add_executable(test_fiber_save_batch_tracker
     test_fiber_save_batch_tracker.cpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSaveJob.cpp)

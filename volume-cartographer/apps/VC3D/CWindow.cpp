@@ -139,6 +139,7 @@
 #include "CFiberWidget.hpp"
 #include "FiberAnnotationController.hpp"
 #include "overlays/FiberOverlayController.hpp"
+#include "FiberCollectionController.hpp"
 #include "LineAnnotationController.hpp"
 #include "LineAnnotationDialog.hpp"
 #include "SurfaceTreeWidget.hpp"
@@ -2746,13 +2747,15 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             configureChunkedViewerConnections(chunkedViewer);
         }
     });
-    // Fiber annotation gets first refusal on volume clicks before the shared
-    // Ctrl+click-to-focus policy runs.
+    // Fiber annotation gets first refusal on volume clicks, then Automated
+    // Fiber Volume picking, before the shared Ctrl+click-to-focus policy runs.
     _viewerManager->setVolumeClickInterceptor(
         [this](const cv::Vec3f& volLoc, const cv::Vec3f& normal, Surface* surf,
                Qt::MouseButton button, Qt::KeyboardModifiers modifiers) {
-            return _fiberController &&
-                   _fiberController->handleVolumeClick(volLoc, normal, surf, button, modifiers);
+            return (_fiberController &&
+                    _fiberController->handleVolumeClick(volLoc, normal, surf, button, modifiers)) ||
+                   (_fiberCollection && !(_segmentationModule && _segmentationModule->editingEnabled()) &&
+                    _fiberCollection->handleVolumeClick(button, modifiers));
         });
     connect(_viewerManager.get(), &ViewerManager::surfaceActivationRequested,
             this, [this](const std::string& surfaceId) {
@@ -2811,6 +2814,8 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
 
     _fiberOverlay = std::make_unique<FiberOverlayController>(this);
     _fiberOverlay->bindToViewerManager(_viewerManager.get());
+    _fiberCollection = std::make_unique<FiberCollectionController>(_state, _viewerManager.get(), this, _lineAnnotationController.get());
+    updateActiveWorkspaceViewerControls();
     if (_spiralWorkspace && _spiralWorkspace->viewerManager()) {
         _spiralWorkspace->viewerManager()->forEachBaseViewer(
             [this](VolumeViewerBase* viewer) {
@@ -3514,6 +3519,7 @@ void CWindow::populateDockToggleMenu(QMenu* menu) const
         auto* fiberMenu = menu->addMenu(tr("Fibers"));
         addDock(fiberMenu, _fiberWidget);
         addDock(fiberMenu, _fiberSliceWidget);
+        if (_fiberCollection) addDock(fiberMenu, _fiberCollection->dock());
     }
 }
 
@@ -4119,6 +4125,10 @@ ViewerManager* CWindow::activeWorkspaceViewerManager() const
 
 void CWindow::updateActiveWorkspaceViewerControls()
 {
+    if (_fiberCollection) {
+        _fiberCollection->setLineAnnotationActive(
+            _workspaceTabs && qobject_cast<LineAnnotationDialog*>(_workspaceTabs->currentWidget()));
+    }
     auto* manager = activeWorkspaceViewerManager();
     if (_viewerControlsPanel) {
         _viewerControlsPanel->setViewerManager(manager);
@@ -9009,6 +9019,11 @@ bool CWindow::OpenVolume(const QString& path,
         _fileWatcher->startWatching();
     }
     return true;
+}
+
+void CWindow::openFiberCollection(const QString& path)
+{
+    _fiberCollection->openCollection(path);
 }
 
 bool CWindow::openVolumePackage(const QString& path,

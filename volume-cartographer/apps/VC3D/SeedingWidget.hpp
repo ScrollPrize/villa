@@ -123,7 +123,6 @@ private:
     void runSegmentation();
     QString findExecutablePath();
     QString findNeuralTracePyPath();
-    QString findPythonExecutable();
     void updateParameterPreview();
     void updateModeUI();
     void analyzePaths();

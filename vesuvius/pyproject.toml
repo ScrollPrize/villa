@@ -220,6 +220,7 @@ Homepage = "https://github.com/ScrollPrize/villa"
 "vesuvius.zarr_tasks" = "vesuvius.image_proc.run.zarr_tasks.__main__:main"
 "vesuvius.find_patches" = "vesuvius.models.preprocessing.patches.cli:main"
 "vesuvius.surface_preflight" = "vesuvius.surface_preflight:main"
+"vesuvius.afv_spline_generator" = "vesuvius.afv_spline_generator.cli:main"
 
 [tool.setuptools]
 include-package-data = true
@@ -237,6 +238,7 @@ vesuvius = [
     "tifxyz_label_transfer/*.cpp",
     "tifxyz_label_transfer/*.md",
     "tifxyz_label_transfer/docs/*.md",
+    "afv_spline_generator/extend/*.pt",
 ]
 
 [tool.setuptools.cmdclass]

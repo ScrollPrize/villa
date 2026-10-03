@@ -102,6 +102,7 @@ required_formulae=(
   libtiff
   curl
   nlohmann-json
+  sqlite
   lapack
   # OpenBLAS provides cblas_* with the legacy ILP32 symbol names PaStiX
   # expects. Accelerate.framework's BLAS hides those symbols when linked

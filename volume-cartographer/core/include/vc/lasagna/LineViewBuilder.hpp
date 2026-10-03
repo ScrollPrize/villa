@@ -105,6 +105,12 @@ struct LineViewFrameDiagnostics {
 LineViewSurfaces buildLineViewSurfaces(const LineModel& line,
                                        const LineViewConfig& config = {});
 
+// Display-only frame for an already traced curve without sampled sheet normals.
+// Reuses the ribbon builder's parallel transport; positions are copied exactly.
+// The resulting normals describe a viewing frame, not a measured sheet field,
+// and must not be used as optimization evidence.
+LineModel lineModelForInspection(const std::vector<cv::Vec3d>& points);
+
 LineViewFrameDiagnostics diagnoseLineViewFrames(const LineModel& line,
                                                 const LineViewConfig& config = {});
 
