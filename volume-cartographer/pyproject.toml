@@ -22,7 +22,7 @@ license = { file = "LICENSE" }
 vcz1 = "vc.compression.vcz1_numcodecs:Vcz1"
 
 [tool.scikit-build]
-cmake.version = ">=3.22"
+cmake.version = ">=3.28"
 wheel.packages = []
 
 [tool.scikit-build.cmake.define]

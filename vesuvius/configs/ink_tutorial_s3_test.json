@@ -1,0 +1,48 @@
+{
+  "out_dir": "/content/drive/vesuvius/runs/ink_tutorial_s3_test",
+  "seed": 42,
+  "wandb_project": "ink-detection",
+  "wandb_entity": "priesgof",
+
+  "mode": "flat",
+  "model_type": "vesuvius_unet",
+  "in_channels": 1,
+  "model_config": { "autoconfigure": true, "z_projection_mode": "max" },
+  "targets": { "ink": { "out_channels": 1, "activation": "none", "z_projection_mode": "max" } },
+
+  "patch_size": [64, 256, 256],
+  "patch_overlap": 0.5,
+  "patch_min_labeled_coverage": 0.05,
+
+  "batch_size": 2,
+  "num_iterations": 100,
+  "learning_rate": 0.01,
+  "mixed_precision": "fp16",
+  "dataloader_workers": 4,
+
+  "val_every": 500,
+  "save_every": 1000,
+
+  "verify_finite_gradients_steps": 200,
+  "max_amp_overflow_events": 4,
+
+  "volume_cache_dir": "/content/vesuvius_volume_cache",
+  "volume_cache_max_gb": 20,
+
+  "datasets": [
+    {
+      "segments_path": "s3://vesuvius-challenge-open-data/PHercParis4/segments",
+      "segments": ["w00_20231016151002"],
+      "volume_scale": "0",
+      "surface_volume_paths": {
+        "w00_20231016151002": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20231016151002/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr"
+      },
+      "inklabels_paths": {
+        "w00_20231016151002": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20231016151002/ink-labels/2.4um-volume-20260411134726/20260918/inklabels.zarr"
+      },
+      "supervision_mask_paths": {
+        "w00_20231016151002": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20231016151002/ink-labels/2.4um-volume-20260411134726/20260918/supervision.zarr"
+      }
+    }
+  ]
+}
