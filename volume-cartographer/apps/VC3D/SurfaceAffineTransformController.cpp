@@ -14,6 +14,7 @@
 #include "vc/core/util/HttpFetch.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
+#include "utils/sftp_fetch.hpp"
 
 #include <QDir>
 #include <QFutureWatcher>
@@ -44,7 +45,8 @@ namespace
 bool isRemoteTransformSource(const QString& source)
 {
     const QString trimmed = source.trimmed();
-    return trimmed.startsWith("http://", Qt::CaseInsensitive) ||
+    return utils::is_sftp_url(trimmed.toStdString()) ||
+           trimmed.startsWith("http://", Qt::CaseInsensitive) ||
            trimmed.startsWith("https://", Qt::CaseInsensitive) ||
            trimmed.startsWith("s3://", Qt::CaseInsensitive) ||
            trimmed.startsWith("s3+", Qt::CaseInsensitive);
@@ -737,7 +739,7 @@ void SurfaceAffineTransformController::onSaveTransformedRequested()
 
 void SurfaceAffineTransformController::onLoadAffineRequested()
 {
-    const QString promptText = tr("Enter a local path or URL for an affine JSON (http://, https://, s3://).\n"
+    const QString promptText = tr("Enter a local path or URL for an affine JSON (http://, https://, s3://, sftp://).\n"
                                   "Leave blank to use the current volume transform.json.");
     bool accepted = false;
     const QString source = QInputDialog::getText(_dialogParent,
