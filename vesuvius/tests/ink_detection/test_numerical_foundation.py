@@ -381,6 +381,31 @@ def test_confusion_and_balanced_accuracy_match_binary_counts():
     assert BalancedAccuracy.from_counts(counts).item() == pytest.approx(0.25)
 
 
+_METRIC_DEVICES = (
+    ["cpu"]
+    + (["mps"] if torch.backends.mps.is_available() else [])
+    + (["cuda"] if torch.cuda.is_available() else [])
+)
+
+
+@pytest.mark.parametrize("device", _METRIC_DEVICES)
+def test_validation_counts_accumulate_on_the_training_device(device):
+    # train.py accumulates validation counts on accelerator.device, which is
+    # MPS on Apple Silicon, where float64 tensors cannot be created.
+    logits = torch.tensor([[[[10.0, -10.0], [10.0, -10.0]]]], device=device)
+    targets = torch.tensor([[[[1.0, 1.0], [0.0, 0.0]]]], device=device)
+    valid = torch.tensor([[[[True, True], [True, False]]]], device=device)
+    batch = MetricBatch(logits=logits, targets=targets, valid_mask=valid)
+    counts = Confusion.zero_counts(device=torch.device(device))
+    for _ in range(2):
+        counts = Confusion.add_counts(counts, Confusion().compute_batch(batch))
+    count_values = tuple(
+        value.item() for value in (counts.tp, counts.fp, counts.fn, counts.tn)
+    )
+    assert count_values == (2, 2, 2, 0)
+    assert BalancedAccuracy.from_counts(counts).item() == pytest.approx(0.25)
+
+
 def _sampling_config(tmp_path: Path, strategy: str) -> InkDataConfig:
     return InkDataConfig.from_mapping(
         {
