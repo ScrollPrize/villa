@@ -80,12 +80,16 @@ def main() -> None:
     if args.input is not None and not args.input.exists():
         parser.error(f"Input directory does not exist: {args.input}")
 
-    result = generate_patch_caches(
-        config_path=args.config,
-        input_path=args.input,
-        cache_dir=args.cache_dir,
-        force=args.force,
-    )
+    try:
+        result = generate_patch_caches(
+            config_path=args.config,
+            input_path=args.input,
+            cache_dir=args.cache_dir,
+            force=args.force,
+        )
+    except FileNotFoundError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1)
 
     print(
         f"Patch cache generation complete: "

@@ -292,8 +292,7 @@ def _discover_volumes(
     labels_dir = data_path / "labels"
 
     if not images_dir.exists():
-        logger.warning("Images directory not found: %s", images_dir)
-        return []
+        raise FileNotFoundError(f"Images directory not found: {images_dir}")
 
     # Find all image zarrs
     image_zarrs = {
