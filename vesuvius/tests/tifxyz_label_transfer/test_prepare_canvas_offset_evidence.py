@@ -31,6 +31,7 @@ from vesuvius.tifxyz_label_transfer.prepare_canvas_offset_evidence import (
     _surface_z_step_um,
     build_parser as build_prepare_parser,
     extract_composite,
+    inspect_zarr,
     main as prepare_evidence_main,
     _run_rclone,
 )
@@ -690,6 +691,23 @@ class PortabilityTests(unittest.TestCase):
             ),
             "my-mirror:bucket/datasets/ink/scroll-x",
         )
+
+
+class InspectZarrScaleWarningTests(unittest.TestCase):
+    def test_level_without_scale_transform_warns_and_defaults_to_one(self) -> None:
+        attrs = {"multiscales": [{"datasets": [{"path": "0", "coordinateTransformations": []}]}]}
+
+        def fake_cat_json(path):
+            return attrs if str(path).endswith(".zattrs") else {"shape": [1, 1, 1], "chunks": [1, 1, 1]}
+
+        with mock.patch(
+            "vesuvius.tifxyz_label_transfer.prepare_canvas_offset_evidence._cat_json",
+            side_effect=fake_cat_json,
+        ):
+            with self.assertWarns(UserWarning):
+                info = inspect_zarr("remote", 0)
+
+        self.assertEqual(info.scale_zyx, (1.0, 1.0, 1.0))
 
 
 if __name__ == "__main__":
