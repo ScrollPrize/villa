@@ -306,15 +306,20 @@
     "cuda_visible_devices": "0,1,2,3,4,5"
   },
   "trace_series": {
-    "launch": "/ephemeral/hendrik/fiber3d_train2/runs/.launches/finetune_5scroll_s1a_128_sd1_16x8_ema_lr0001-20260912_223739",
-    "run": "/ephemeral/hendrik/fiber3d_train2/runs/finetune_5scroll_s1a_128_sd1_16x8_ema_lr0001_20260912_223743",
-    "output": "/ephemeral/hendrik/fiber3d_train2/comparisons/finetune_best_emas_20260913",
+    "launch": "/ephemeral/hendrik/fiber3d_train2/runs/.launches/5scroll_json_eligible_fullres_refinement_gaussian_halfsigma_sideband1_reviewed32_128_sd1_16x8_ema-20261002_195721",
+    "run": "/ephemeral/hendrik/fiber3d_train2/runs/5scroll_json_eligible_fullres_refinement_gaussian_halfsigma_sideband1_reviewed32_128_sd1_16x8_ema_20261002_195727",
+    "output": "/ephemeral/hendrik/fiber3d_train2/comparisons/sideband1_195727_six_20261003_v2",
     "variants": [
+      "best",
+      "current",
       "best99",
-      "best999"
+      "current99",
+      "best999",
+      "current999"
     ],
-    "expected_training_state": "dead",
-    "template": "vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/eval_collection_182306_best11k_full.json",
+    "expected_training_state": "alive",
+    "template": ".fiber_eval_active.json",
+    "report_baselines": false,
     "baselines": [
       {
         "name": "Classic",

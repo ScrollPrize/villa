@@ -259,6 +259,7 @@ def test_series_next_order_and_failure_never_skips(runner, monkeypatch, tmp_path
     import villa_gpu_manager.processes as processes
     monkeypatch.syspath_prepend(str(Path(runner.__file__).parent))
     import fiber3d_comparison_report as reporting
+    from vesuvius.neural_tracing.fiber_trace_3d import replay_metrics
     control = tmp_path / 'control.json'
     control.write_text(json.dumps({'trace_series':{'output':str(tmp_path)}}))
     monkeypatch.setattr(runner, 'CONTROL', control)
@@ -272,9 +273,12 @@ def test_series_next_order_and_failure_never_skips(runner, monkeypatch, tmp_path
         called.append(output.name)
         if fail:
             raise RuntimeError('injected')
+        (output / 'full').mkdir(parents=True)
+        (output / 'full/summary.json').write_text('{"completed":true}')
     monkeypatch.setattr(runner, 'evaluate_frozen', evaluate)
     monkeypatch.setattr(runner.subprocess, 'check_output', lambda *a, **k: '{}')
     monkeypatch.setattr(reporting, 'series_report', lambda s: 'report')
+    monkeypatch.setattr(replay_metrics, 'complete_report', lambda summary: summary)
     monkeypatch.setattr(runner, 'stop_production_identity', Mock(side_effect=AssertionError('stop')))
     monkeypatch.setattr(runner, 'production_start', Mock(side_effect=AssertionError('start')))
     if fail:

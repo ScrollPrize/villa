@@ -188,6 +188,7 @@ def trace_series_prepare():
 
 def trace_series_next(*, retry_failed=False):
     from fiber3d_comparison_report import series_report
+    from vesuvius.neural_tracing.fiber_trace_3d.replay_metrics import complete_report
     root = Path(json.loads(CONTROL.read_text())['trace_series']['output'])
     path = root / 'series.json'
     state = json.loads(path.read_text())
@@ -201,23 +202,41 @@ def trace_series_next(*, retry_failed=False):
         raise RuntimeError('previous evaluation interrupted/failed; inspect before retrying')
     check_series_training_state(state['settings'], state['training_identity'])
     output = root / entry['name']
-    if retry_failed:
+    completed_output = (Path(entry.get('attempt_output', output))
+                        if retry_failed else None)
+    reuse_completed = bool(completed_output and
+        (completed_output / 'full/summary.json').is_file() and
+        json.loads((completed_output / 'full/summary.json').read_text()).get('completed'))
+    if retry_failed and not reuse_completed:
         attempts = entry.setdefault('failed_attempts', [])
         attempts.append(dict(output=entry.get('attempt_output', str(output)), error=entry.get('error')))
         output = root / f"{entry['name']}-retry{len(attempts)}"
-    output.mkdir(exist_ok=False)
+    elif reuse_completed:
+        output = completed_output
+    if not reuse_completed:
+        output.mkdir(exist_ok=False)
     entry['status'] = 'running'
     entry['attempt_output'] = str(output)
     entry.pop('error', None)
     path.write_text(json.dumps(state, indent=2))
     try:
-        evaluate_frozen(entry['selection'], state['settings']['template'], output)
-        script = ROOT / 'vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/docs/trace_restart_analysis_20260911.py'
-        audit = subprocess.check_output([sys.executable, str(script), str(output / 'full')], cwd=ROOT, text=True)
+        if not reuse_completed:
+            evaluate_frozen(entry['selection'], state['settings']['template'], output)
+        audit = json.dumps(complete_report(json.loads(
+            (output / 'full/summary.json').read_text())), indent=2)
         (output / 'trace_audit.json').write_text(audit)
         entry.update(status='done', metrics=json.loads(audit), output=str(output))
-        report = series_report(state)
-        report_path = root / f"comparison_after_{entry['name']}.md"
+        if state['settings'].get('report_baselines', True):
+            report = series_report(state)
+            report_path = root / f"comparison_after_{entry['name']}.md"
+        else:
+            report = json.dumps({
+                'completed': [
+                    {key: row[key] for key in ('name', 'selection', 'metrics', 'output')}
+                    for row in state['entries'] if row['status'] == 'done'
+                ]
+            }, indent=2)
+            report_path = root / f"results_after_{entry['name']}.json"
         report_path.write_text(report)
         entry['report'] = str(report_path)
         entry['training_root_state'] = check_series_training_state(state['settings'], state['training_identity'])
