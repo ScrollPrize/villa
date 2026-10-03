@@ -379,6 +379,9 @@ auto main(int argc, char* argv[]) -> int
         "Open a volume package at startup.",
         "path");
     parser.addOption(volumePackageOption);
+    QCommandLineOption fiberCollectionOption(
+        "fiber-collection", "Attach a read-only Automated Fiber Volume (.afv) to the opened CT volume.", "path");
+    parser.addOption(fiberCollectionOption);
 
     QCommandLineOption debugOption(
         "debug",
@@ -584,6 +587,10 @@ auto main(int argc, char* argv[]) -> int
                 std::cerr.flush();
                 std::_Exit(2);
             }
+        }
+
+        if (parser.isSet(fiberCollectionOption)) {
+            aWin.openFiberCollection(parser.value(fiberCollectionOption).trimmed());
         }
 
         // Agent bridge (opt-in, off by default). Constructed only when a bridge

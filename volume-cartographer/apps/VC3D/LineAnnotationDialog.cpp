@@ -2578,7 +2578,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                     &views.stripPositionMap)) {
                 stripCamera.scale = *focusedScale;
             }
-            if (stripIndex < _savedStripZooms.size()) {
+            if (!views.initialFitWholeLine && stripIndex < _savedStripZooms.size()) {
                 stripCamera.scale = _savedStripZooms[stripIndex];
             }
         }
@@ -2677,6 +2677,33 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         _fullOptimizationAction->setEnabled(true);
     }
     captureInitialGeneratedViewState();
+    if (!replacingGeneratedViews && views.initialFitWholeLine && !_stripViewers.empty()) {
+        // The dialog is embedded/shown by the controller after this method
+        // returns. Fit with the real viewport sizes once that layout is ready,
+        // not the old fiber's saved zoom or its endpoint control-point focus.
+        const QPointer<CChunkedVolumeViewer> firstStrip = _stripViewers.front();
+        QTimer::singleShot(0, this, [this, firstStrip]() {
+            if (_closing || !firstStrip || _stripViewers.empty() ||
+                _stripViewers.front() != firstStrip) {
+                return; // The session or generated surfaces were replaced.
+            }
+            float scale = std::numeric_limits<float>::infinity();
+            for (const auto& viewer : _stripViewers) {
+                if (viewer) {
+                    viewer->resetViewForCurrentContent(false);
+                    scale = std::min(scale, viewer->cameraState().scale);
+                }
+            }
+            // Linked strips share one zoom; use the smaller fit so both fit
+            // even when the user gave their panes different heights.
+            auto camera = firstStrip->cameraState();
+            camera.scale = scale;
+            firstStrip->applyCameraState(camera, false);
+            syncLinkedStripCamera(firstStrip);
+            rebuildGeneratedOverlays();
+            captureInitialGeneratedViewState();
+        });
+    }
     if (_resetViewsAction) {
         _resetViewsAction->setEnabled(true);
     }
