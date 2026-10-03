@@ -30,6 +30,19 @@ AGENTS_AGENT_MODE=1 PYTHONPATH=spiral-fitting spiral-fitting/.venv/bin/python -c
 
 See [NVIDIA's DGX Spark memory guidance](https://docs.nvidia.com/dgx/dgx-spark/known-issues.html).
 
+## Running without CUDA
+
+Fits run on CUDA whenever it is available. Without it they run on Apple's MPS
+backend, and without that on the CPU; `FIT_SPIRAL_DEVICE=cuda|mps|cpu` picks
+one explicitly (`devices.py`). The Triton kernels are CUDA only, so MPS and the
+CPU use the PyTorch paths, and the CUDA startup check is skipped.
+
+MPS has no float64. Device tensors that are float64 on CUDA take their dtype
+from `devices.float_hi()`, which is float32 on MPS;
+`FIT_SPIRAL_MAX_PRECISION_FLOAT=32` applies the same cap on every device, for
+comparing a CPU run with an MPS one. `get_ink_metrics.py --device` chooses the
+nnU-Net device the same way.
+
 ## Editing input snapshots
 
 The service snapshots patch directories, fiber JSON files and point collections

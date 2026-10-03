@@ -14,6 +14,8 @@ import math
 
 import torch
 
+from devices import float_hi
+
 
 # Elements per chunk of the masked update, bounding its temporaries to a
 # fraction of the lattice (the full-scroll high-resolution flow lattice is
@@ -56,7 +58,7 @@ def robust_clip_(grad, multiple):
 
     The median is read from a fixed-stride subsample of the stage's entries
     (see STATS_SUBSAMPLE), without any host synchronisation. Returns
-    ``(threshold, clipped_fraction)``, two float64 tensors of length
+    ``(threshold, clipped_fraction)``, two ``float_hi`` tensors of length
     ``stages`` on ``grad.device`` (threshold is +inf when the sample has no
     nonzero entry, even if unsampled entries are active), or ``None`` when
     ``multiple`` is not positive, in
@@ -66,18 +68,19 @@ def robust_clip_(grad, multiple):
         return None
     planes = _stage_view(grad)
     stride = _subsample_stride(planes.shape[1])
-    thresholds = torch.empty(planes.shape[0], dtype=torch.float64, device=grad.device)
+    hi = float_hi(grad.device)
+    thresholds = torch.empty(planes.shape[0], dtype=hi, device=grad.device)
     fractions = torch.zeros_like(thresholds)
     for index in range(planes.shape[0]):
         plane = planes[index]
         sub = plane[::stride]
         magnitude = torch.where(sub != 0, sub.abs(), torch.full_like(sub, math.nan))
-        threshold = _nan_to_inf(torch.nanmedian(magnitude).to(torch.float64) * float(multiple))
+        threshold = _nan_to_inf(torch.nanmedian(magnitude).to(hi) * float(multiple))
         bound = threshold.to(plane.dtype)
-        clipped = torch.zeros((), dtype=torch.float64, device=grad.device)
+        clipped = torch.zeros((), dtype=hi, device=grad.device)
         for start in range(0, plane.numel(), _CHUNK_ELEMENTS):
             chunk = plane[start:start + _CHUNK_ELEMENTS]
-            clipped += (chunk.abs() > bound).sum(dtype=torch.float64)
+            clipped += (chunk.abs() > bound).sum(dtype=hi)
             chunk.clamp_(min=-bound, max=bound)
         thresholds[index] = threshold
         fractions[index] = clipped / plane.numel()
@@ -188,26 +191,27 @@ class LazyMomentAdamW(torch.optim.AdamW):
         """Winsorised mean over positive second-moment entries, per slab."""
         planes = _stage_view(exp_avg_sq)
         stride = _subsample_stride(planes.shape[1])
-        shared_sq = torch.zeros(planes.shape[0], dtype=torch.float64, device=planes.device)
+        hi = float_hi(planes.device)
+        shared_sq = torch.zeros(planes.shape[0], dtype=hi, device=planes.device)
         winsorise = quantile is not None and 0.0 < float(quantile) < 1.0
         for index in range(planes.shape[0]):
             row = planes[index]
             cap = None
             if winsorise:
-                sub = row[::stride].to(torch.float64)
+                sub = row[::stride].to(hi)
                 touched_sub = torch.where(sub > 0, sub, torch.full_like(sub, math.nan))
                 cap = _nan_to_inf(torch.nanquantile(touched_sub, float(quantile))).to(row.dtype)
-            total = torch.zeros((), dtype=torch.float64, device=planes.device)
+            total = torch.zeros((), dtype=hi, device=planes.device)
             count = torch.zeros_like(total)
             for start in range(0, row.numel(), _CHUNK_ELEMENTS):
                 chunk = row[start:start + _CHUNK_ELEMENTS]
                 # Exclude zero moments from the scale estimate. This is a
                 # positivity test, not a stored activity mask; previously
                 # active moments can also become zero through underflow.
-                count += (chunk > 0).sum(dtype=torch.float64)
+                count += (chunk > 0).sum(dtype=hi)
                 if cap is not None:
                     chunk = torch.minimum(chunk, cap)
-                total += chunk.sum(dtype=torch.float64)
+                total += chunk.sum(dtype=hi)
             shared_sq[index] = total / count.clamp(min=1.0)
         return shared_sq
 
@@ -260,7 +264,8 @@ class LazyMomentAdamW(torch.optim.AdamW):
                 group.get('shared_second_moment_clip_quantile', DEFAULT_CLIP_QUANTILE))
             shared_denom = (shared_sq.sqrt() / bias_correction2_sqrt + eps).to(param.dtype)
 
-        update_sumsq = torch.zeros(stages, components, dtype=torch.float64, device=param.device)
+        hi = float_hi(param.device)
+        update_sumsq = torch.zeros(stages, components, dtype=hi, device=param.device)
         update_count = torch.zeros_like(update_sumsq)
         for stage in range(stages):
             denom_scalar = None if shared_denom is None else shared_denom[stage]
@@ -284,12 +289,12 @@ class LazyMomentAdamW(torch.optim.AdamW):
                         # Masked to the touched entries.
                         update.masked_fill_(g == 0, 0.0)
                     update_sumsq[stage, component] += torch.linalg.vector_norm(
-                        update, dtype=torch.float64) ** 2
-                    update_count[stage, component] += (update != 0).sum(dtype=torch.float64)
+                        update, dtype=hi) ** 2
+                    update_count[stage, component] += (update != 0).sum(dtype=hi)
                     flat_param[start:stop].sub_(update)
 
         self.conditioning_stats[param] = {
-            'scale': None if shared_denom is None else shared_denom.to(torch.float64),
+            'scale': None if shared_denom is None else shared_denom.to(hi),
             'update_rms': (update_sumsq / update_count.clamp(min=1.0)).sqrt(),
             'update_count': update_count,
         }
