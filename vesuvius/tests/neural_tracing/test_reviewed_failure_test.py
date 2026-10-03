@@ -1,6 +1,7 @@
 import json
 
 import pytest
+import torch
 
 from vesuvius.neural_tracing.fiber_trace_3d.reviewed_failure_test import (
     directional_restart_metrics,
@@ -11,6 +12,23 @@ from vesuvius.neural_tracing.fiber_trace_3d.training_trace_benchmark import buil
 from vesuvius.neural_tracing.fiber_trace_3d import training_trace_benchmark
 from vesuvius.neural_tracing.fiber_trace_3d.train import _reviewed_trace_test_config
 from vesuvius.neural_tracing.fiber_trace_3d import train
+
+
+def _write_training_snapshot(path, *, step=1, samples_seen=128):
+    torch.save({"model": {"weight": torch.tensor([1.0])}, "step": step,
+                "samples_seen": samples_seen, "metric": 1.0,
+                "metric_name": "test/loss_total"}, path)
+
+
+def _stub_trace_selection(monkeypatch):
+    from vesuvius.neural_tracing.fiber_trace_3d import reviewed_trace_selection
+
+    def finalize(output, _snapshot_dir, **_kwargs):
+        metrics = json.loads((output / "training_metrics.json").read_text())
+        return metrics, {"best_restarts_combined": int(metrics["restarts_combined"]),
+                         "selected": True}, output
+
+    monkeypatch.setattr(reviewed_trace_selection, "finalize_attempt", finalize)
 
 
 def _case(direction, length, failures=()):
@@ -132,10 +150,11 @@ def test_reviewed_trace_config_validation():
 def test_training_trace_subprocess_completion(monkeypatch, tmp_path):
     checkpoint = tmp_path / "snapshots/current.pt"
     checkpoint.parent.mkdir()
-    checkpoint.write_bytes(b"checkpoint")
+    _write_training_snapshot(checkpoint)
     for name in ("template.json", "native", "runner.py"):
         (tmp_path / name).write_text("x")
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-test")
+    _stub_trace_selection(monkeypatch)
 
     class Process:
         def __init__(self, command, **_kwargs):
@@ -166,7 +185,7 @@ def test_training_trace_subprocess_completion(monkeypatch, tmp_path):
 def test_training_trace_subprocess_start_failure_is_reported(monkeypatch, tmp_path):
     checkpoint = tmp_path / "snapshots/current.pt"
     checkpoint.parent.mkdir()
-    checkpoint.write_bytes(b"checkpoint")
+    _write_training_snapshot(checkpoint)
     for name in ("template.json", "native", "runner.py"):
         (tmp_path / name).write_text("x")
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-test")
@@ -184,15 +203,18 @@ def test_training_trace_subprocess_start_failure_is_reported(monkeypatch, tmp_pa
 def test_training_trace_uses_startup_best_snapshot(monkeypatch, tmp_path):
     checkpoint = tmp_path / "snapshots/best.pt"
     checkpoint.parent.mkdir()
-    checkpoint.write_bytes(b"checkpoint")
+    _write_training_snapshot(checkpoint)
     for name in ("template.json", "native", "runner.py"):
         (tmp_path / name).write_text("x")
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-test")
+    _stub_trace_selection(monkeypatch)
 
     class Process:
         def __init__(self, command, **_kwargs):
             job = json.loads((tmp_path / "run/reviewed_trace_test/step_00000001/job.json").read_text())
-            assert job["checkpoint"] == str(checkpoint)
+            assert job["checkpoint"] == str(
+                tmp_path / "run/reviewed_trace_test/step_00000001/evaluated_raw.pt"
+            )
             assert job["samples_seen"] == 128
             output = tmp_path / "run/reviewed_trace_test/step_00000001"
             values = {key: 1.0 for key in (

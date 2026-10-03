@@ -1,11 +1,9 @@
-# Status: graceful cooperative maintenance under allocation changes
+# Status: raw best checkpoint by reviewed-trace restarts
 
-- [x] Capture the failure and requested invariant.
-- [x] Identify the maintenance/allocation interleaving.
-- [x] Write the implementation and validation plan.
-- [x] Complete independent plan review and incorporate lifecycle corrections.
-- [x] Implement durable deferred maintenance.
-- [x] Add and run regression tests.
-- [x] Update specification, documentation, changelog, and task log.
-- [x] Resume at update 42600 and validate the next trace boundary, including a
-  forced mid-trace pause/regrant and later optimizer progress.
+- [x] Capture the requested checkpoint-selection behavior.
+- [x] Inspect dense snapshot and managed/unmanaged reviewed-trace lifecycles.
+- [x] Write implementation and validation plan.
+- [x] Complete independent plan review and incorporate findings.
+- [x] Implement shared restart-selected checkpoint handling.
+- [x] Add and run focused regression tests.
+- [x] Update specification, docs, changelog, and task log.

@@ -7776,3 +7776,19 @@ source base dimensions and scale must be preserved, including for subsets.
   fatal. Explicit shutdown cancels without retry.
 - Attempts write staged output. Only a complete validated attempt is atomically
   promoted to the canonical step directory, which is never overwritten.
+- Every attempt freezes and hashes the exact raw checkpoint before tracing.
+  Completion is durable only after the trace metrics validate and transient
+  inference cleanup succeeds. Startup reconciliation may finish checkpoint
+  selection and canonical promotion for such a completed attempt, but must
+  ignore incomplete or revoked attempts.
+- In addition to the dense-loss-selected raw `best.pt`, training maintains the
+  independent raw `snapshots/best_reviewed_trace.pt`. Startup and periodic
+  reviewed traces are eligible. Strictly fewer integer
+  `restarts_combined` wins; ties retain the earlier checkpoint. The evaluated
+  raw checkpoint, step, sample count, complete trace metrics, and benchmark
+  identity are retained in the selected checkpoint. Existing raw dense-loss
+  and EMA selection rules are unchanged.
+- Restart comparisons are valid only within one benchmark identity. That
+  identity covers the effective workload and the locked split manifest,
+  native tracer, template, and runner content; a changed identity requires a
+  new training run rather than silently replacing the prior trace best.

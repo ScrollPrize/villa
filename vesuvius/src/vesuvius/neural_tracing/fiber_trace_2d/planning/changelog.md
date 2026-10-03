@@ -1,3 +1,13 @@
+## 2026-10-03 — Raw best checkpoint by reviewed-trace restarts
+
+- Freeze and hash the exact raw checkpoint used by every reviewed trace, then
+  independently retain the strictly lowest-restart checkpoint as
+  `best_reviewed_trace.pt` without changing dense-loss or EMA best selection.
+- Bind comparisons to the complete reviewed benchmark identity and reconcile
+  interrupted successful finalization while excluding incomplete/revoked work.
+- Expose the new checkpoint as the `best_trace` experiment variant and add
+  focused CPU regression coverage for selection, validation, and recovery.
+
 ## 2026-10-02 — Cooperative maintenance survives allocation changes
 
 - Made reviewed-trace maintenance a durable supervisor-owned request rather

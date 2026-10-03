@@ -11,6 +11,11 @@ import sys
 import time
 
 from .reviewed_failure_test import directional_restart_metrics, validate_failure_union
+from .reviewed_trace_selection import (
+    sha256_file,
+    write_benchmark_identity,
+    write_completion,
+)
 
 
 def build_workload(template: dict, *, checkpoint: Path, output_root: Path,
@@ -84,14 +89,19 @@ def run_job(job_path: Path) -> dict[str, float]:
         )
     output = Path(job["output_root"]).resolve()
     output.mkdir(parents=True, exist_ok=True)
+    checkpoint = Path(job["checkpoint"])
+    checkpoint_sha256 = sha256_file(checkpoint)
+    if job.get("checkpoint_sha256") != checkpoint_sha256:
+        raise ValueError("training trace job checkpoint digest mismatch")
     workload = build_workload(
         json.loads(Path(job["template"]).read_text()),
-        checkpoint=Path(job["checkpoint"]), output_root=output,
+        checkpoint=checkpoint, output_root=output,
         split_root=Path(job["split_root"]), devices=job["devices"],
         native_binary=Path(job["native_binary"]),
     )
     workload_path = output / "workload.json"
     workload_path.write_text(json.dumps(workload, indent=2) + "\n")
+    identity = write_benchmark_identity(output, job, workload)
     runner = Path(job["runner"])
     commands = [
         [sys.executable, str(runner), "prepare", "--config", str(workload_path)],
@@ -99,6 +109,7 @@ def run_job(job_path: Path) -> dict[str, float]:
          "--devices", job["devices"], "--unmanaged"],
     ]
     started = time.monotonic()
+    metrics = None
     try:
         for command in commands:
             subprocess.run(command, check=True, cwd=runner.parents[2])
@@ -108,9 +119,15 @@ def run_job(job_path: Path) -> dict[str, float]:
                        wall_seconds=time.monotonic() - started)
         (output / "training_metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
         print("training reviewed trace: " + " ".join(f"{key}={value}" for key, value in metrics.items()), flush=True)
-        return metrics
     finally:
         cleanup_prediction_cache(workload, output)
+    write_completion(
+        output,
+        metrics=metrics,
+        checkpoint_sha256=checkpoint_sha256,
+        identity=identity,
+    )
+    return metrics
 
 
 def main() -> int:

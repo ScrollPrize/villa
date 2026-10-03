@@ -129,6 +129,14 @@ def run_cooperative_training(config_path, *, socket=None, resume_checkpoint=None
         "run_datestr": str(training.get("run_datestr") or datetime.now().strftime("%Y%m%d_%H%M%S")),
         "test_hang_diagnostics_enabled": bool(test_hang_diagnostics or training.get("test_hang_diagnostics_enabled", False)),
     }
+    from .train import _resolve_run_layout
+    from .reviewed_trace_selection import reconcile_completed_attempts
+    run_dir, snapshot_dir = _resolve_run_layout(
+        raw, date_str_override=overrides["run_datestr"]
+    )
+    reconciled = reconcile_completed_attempts(run_dir, snapshot_dir)
+    for path in reconciled:
+        print(f"fiber cooperative: reconciled completed reviewed trace {path}", flush=True)
     broker = None
     startup = None
     startup_complete = False
@@ -251,15 +259,13 @@ def run_cooperative_training(config_path, *, socket=None, resume_checkpoint=None
         nonlocal maintenance_process, maintenance_log, maintenance_group
         nonlocal maintenance_owner, maintenance_token, maintenance_attempt
         nonlocal maintenance_attempt_index
-        from .train import _resolve_run_layout, _reviewed_trace_test_config
+        from .train import _reviewed_trace_test_config
+        from .reviewed_trace_selection import freeze_raw_checkpoint
         from villa_gpu_manager.exclusive import OwnedProcessGroup
         from villa_gpu_manager.processes import process_identity
         trace = _reviewed_trace_test_config(training)
         if trace is None:
             raise RuntimeError("reviewed trace boundary has no configured test")
-        run_dir, snapshot_dir = _resolve_run_layout(
-            raw, date_str_override=overrides["run_datestr"]
-        )
         step = int(request["step"])
         checkpoint = snapshot_dir / "current.pt"
         if not checkpoint.is_file():
@@ -273,10 +279,16 @@ def run_cooperative_training(config_path, *, socket=None, resume_checkpoint=None
         maintenance_attempt_index += 1
         attempt = root / f".step_{step:08d}.attempt-{os.getpid()}-{maintenance_attempt_index}"
         attempt.mkdir(parents=True, exist_ok=False)
+        frozen = attempt / "evaluated_raw.pt"
+        checkpoint_sha256 = freeze_raw_checkpoint(
+            checkpoint, frozen, step=step,
+            samples_seen=int(request["samples_seen"]),
+        )
         job = {
             "step": step,
             "samples_seen": int(request["samples_seen"]),
-            "checkpoint": str(checkpoint),
+            "checkpoint": str(frozen),
+            "checkpoint_sha256": checkpoint_sha256,
             "output_root": str(attempt),
             "template": str(Path(trace["template"]).expanduser().resolve()),
             "split_root": str(Path(trace["split_root"]).expanduser().resolve()),
@@ -314,6 +326,7 @@ def run_cooperative_training(config_path, *, socket=None, resume_checkpoint=None
                 except ProcessLookupError:
                     pass
                 maintenance_process.wait(timeout=5)
+            (attempt / "evaluated_raw.pt").unlink(missing_ok=True)
             maintenance_mailbox.end_attempt(token)
             maintenance_log.close()
             maintenance_log = None
@@ -342,13 +355,11 @@ def run_cooperative_training(config_path, *, socket=None, resume_checkpoint=None
         if output is None:
             raise RuntimeError("reviewed trace attempt path is missing")
         if returncode == 0:
-            metrics = json.loads((output / "training_metrics.json").read_text())
-            run_dir = output.parent
-            canonical = run_dir / f"step_{int(request['step']):08d}"
-            if canonical.exists():
-                raise RuntimeError(f"refusing to overwrite reviewed trace result: {canonical}")
-            output.rename(canonical)
-            output = canonical
+            from .reviewed_trace_selection import finalize_attempt
+            canonical = output.parent / f"step_{int(request['step']):08d}"
+            metrics, selection, output = finalize_attempt(
+                output, snapshot_dir, canonical=canonical
+            )
             if hub.writer is not None:
                 for key in (
                     "restarts_forward", "restarts_reverse", "restarts_combined",
@@ -363,7 +374,9 @@ def run_cooperative_training(config_path, *, socket=None, resume_checkpoint=None
             print(
                 "fiber cooperative: reviewed trace complete "
                 f"step={request['step']} combined_restarts={metrics['restarts_combined']} "
-                f"combined_implied_mm={metrics['implied_mean_mm_combined']:.6f}",
+                f"combined_implied_mm={metrics['implied_mean_mm_combined']:.6f} "
+                f"best_reviewed_trace={selection['best_restarts_combined']} "
+                f"selected={selection['selected']}",
                 flush=True,
             )
         else:
@@ -395,6 +408,7 @@ def run_cooperative_training(config_path, *, socket=None, resume_checkpoint=None
             if workload_path.is_file():
                 from .training_trace_benchmark import cleanup_prediction_cache
                 cleanup_prediction_cache(json.loads(workload_path.read_text()), attempt)
+            (attempt / "evaluated_raw.pt").unlink(missing_ok=True)
             aborted = attempt.with_name(attempt.name + f".revoked-{time.time_ns()}")
             attempt.rename(aborted)
         print(

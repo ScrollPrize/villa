@@ -1,14 +1,5 @@
-# Graceful cooperative maintenance under allocation changes
+# Raw checkpoint selected by reviewed-trace restarts
 
-Fix cooperative Fiber3D training so reviewed-trace maintenance requests are
-handled correctly regardless of when manager pause/reallocation directives
-arrive.
-
-- A maintenance request must remain pending across allocation-driven cohort
-  drain, release, and replacement.
-- Starting maintenance while its cohort is temporarily unable to hand off must
-  wait rather than fail.
-- A grant revoked during the reviewed-trace child must stop that GPU work,
-  release cleanly, and retry the same maintenance request after a new grant.
-- Training must resume from the last complete checkpoint without losing or
-  duplicating the requested periodic trace boundary.
+Extend Fiber3D training with an additional raw-model best checkpoint selected
+by the periodic reviewed-trace benchmark's combined restart count. Preserve the
+existing independently loss-selected raw and EMA checkpoints.

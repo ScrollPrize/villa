@@ -146,3 +146,18 @@ is then atomically promoted to `reviewed_trace_test/step_NNNNNNNN`. If ownership
 is revoked, the complete child process group is reaped and its transient cache
 cleaned before release; the same request retries after regrant. A real benchmark
 failure remains fatal rather than being mistaken for a manager retry.
+
+Before launch, the supervisor freezes the exact raw checkpoint into the
+attempt and records its SHA-256. After a complete trace and successful cache
+cleanup, the raw checkpoint with the fewest combined restart episodes is
+atomically retained as `snapshots/best_reviewed_trace.pt`. Ties keep the
+earlier checkpoint. This selection is independent of dense `best.pt` and all
+EMA best snapshots. Its metadata records the trace metric, full trace summary,
+training step/sample count, evaluated checkpoint digest, and benchmark
+identity. The `best_trace` experiment snapshot variant resolves this file.
+
+On supervisor startup, completed staged attempts are reconciled idempotently.
+This recovers interruption between successful tracing, checkpoint selection,
+and result-directory promotion without ever admitting incomplete or revoked
+work. Results from a changed locked split, tracer binary, template, runner, or
+effective workload are rejected as a different benchmark rather than compared.

@@ -188,6 +188,25 @@ def test_exact_raw_freeze_accepts_training_ema_state_not_ema_export(runner, monk
         runner.freeze_snapshot_selection(tmp_path, 'current.pt', None, tmp_path)
 
 
+def test_exact_trace_best_freeze_requires_restart_metric(runner, monkeypatch, tmp_path):
+    import torch
+    from vesuvius.neural_tracing.fiber_trace_3d import live_evaluate
+    frozen = tmp_path / 'frozen.pt'
+    monkeypatch.setattr(live_evaluate, 'freeze_checkpoint', lambda *a: (frozen, 'digest'))
+    payload = dict(snapshot_kind='raw', metric_name='reviewed_trace/restarts_combined',
+                   metric=17, step=300, samples_seen=38400)
+    monkeypatch.setattr(torch, 'load', lambda *a, **kw: payload)
+    result = runner.freeze_snapshot_selection(
+        tmp_path, 'best_reviewed_trace.pt', None, tmp_path
+    )
+    assert result['selected']['metric'] == 17
+    payload['metric_name'] = 'test/loss_total'
+    with pytest.raises(ValueError, match='metadata'):
+        runner.freeze_snapshot_selection(
+            tmp_path, 'best_reviewed_trace.pt', None, tmp_path
+        )
+
+
 @pytest.mark.parametrize('variants', [None, ['best99', 'best999'], ['current999', 'current99', 'current'], ['current999', 'current99', 'current', 'best']])
 def test_series_prepares_all_exact_variants_without_training_mutations(runner, monkeypatch, tmp_path, variants):
     import villa_gpu_manager.processes as processes

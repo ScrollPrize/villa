@@ -125,7 +125,8 @@ EMA_SERIES = [('current999', 'current_ema_0p999.pt', 0.999),
               ('best999', 'best_ema_0p999.pt', 0.999),
               ('best99', 'best_ema_0p99.pt', 0.99)]
 SNAPSHOT_VARIANTS = [*EMA_SERIES, ('current99', 'current_ema_0p99.pt', 0.99),
-                     ('current', 'current.pt', None), ('best', 'best.pt', None)]
+                     ('current', 'current.pt', None), ('best', 'best.pt', None),
+                     ('best_trace', 'best_reviewed_trace.pt', None)]
 
 
 def check_series_training_state(settings, identity):
@@ -146,7 +147,9 @@ def freeze_snapshot_selection(run, filename, decay, cache):
     path = run / 'snapshots' / filename
     frozen, digest = freeze_checkpoint(path, cache)
     payload = torch.load(frozen, map_location='cpu', weights_only=True, mmap=True)
-    expected_metric = ('test/loss_total' if decay is None else
+    expected_metric = ('reviewed_trace/restarts_combined'
+                       if filename == 'best_reviewed_trace.pt' else
+                       'test/loss_total' if decay is None else
                        'test_' + filename.split('_', 1)[1][:-3] + '/loss_total')
     kind_matches = ((payload.get('snapshot_kind') in (None, 'raw') and
                      'ema_metadata' not in payload) if decay is None else

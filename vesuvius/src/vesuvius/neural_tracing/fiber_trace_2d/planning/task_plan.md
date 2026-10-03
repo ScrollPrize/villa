@@ -1,60 +1,57 @@
-# Plan: graceful cooperative maintenance under allocation changes
+# Plan: raw best checkpoint by reviewed-trace restarts
 
-## Lifecycle
+## Implementation
 
-1. Store the durable pending maintenance request in a supervisor-owned mailbox
-   passed to every replaceable GPU cohort. Publish synchronously from the
-   completed worker boundary, before the supervisor can observe a release.
-   Deduplicate by `(kind, step, samples_seen)`; conflicting requests fail.
-2. Make cohort maintenance admission idempotent and deferrable: attach the
-   request immediately to block new optimizer units, but begin GPU draining
-   only when the cohort is ready and is not already allocation-draining.
-3. Permit an allocation-draining cohort to close even when it carried a
-   maintenance request; the supervisor's handoff state remains authoritative.
-4. Replacement cohorts consult the same mailbox and start held while work is
-   pending. Execute only under an exact currently-applied
-   `(server epoch, generation, grant)` token.
-5. Bind the trace child to the exact granted GPU UUIDs, count, and VRAM rather
-   than the configured maximum or assumed physical ordinals.
-6. Track the cohort/token owning an active reviewed-trace child. If ownership
-   is revoked (including epoch change or expired disconnect grace), stop and
-   verify-reap its complete setsid process group before release acknowledgement,
-   clean its transient cache, retain the request, and retry after reallocation.
-   Explicit shutdown cancels without retry. A genuine child failure remains
-   fatal; only manager revocation retries.
-7. Write each attempt to a staging directory and atomically promote only a
-   validated complete result to the canonical step directory. Preserve or
-   safely clean incomplete attempts and never overwrite a completed result.
-8. Reconstruct directly after success only if the exact owning token remains
-   applied and is not draining; otherwise let normal supervisor release/regrant
-   reconstruct from its handoff state.
+1. Before either reviewed-trace path starts GPU work, atomically freeze the
+   exact raw checkpoint into its attempt directory and bind its SHA256 into the
+   job. The benchmark writes a completion marker only after validated metrics
+   and cleanup have both completed.
+2. Add one shared reviewed-trace checkpoint-selection/finalization helper used
+   by managed cooperative training and the unmanaged/test execution path. Bind
+   results to a benchmark identity covering the effective workload and hashes
+   of the locked split manifest, native binary, and runner; reject comparison
+   against a prior best from a different benchmark identity.
+3. After a reviewed trace completes successfully, compare its nonnegative
+   integer `restarts_combined` against the prior trace-selected raw best.
+   Strictly fewer restarts wins; a tie retains the existing checkpoint.
+4. Materialize the exact raw checkpoint evaluated as
+   `snapshots/best_reviewed_trace.pt`. Make its checkpoint metadata identify
+   `reviewed_trace/restarts_combined`, the evaluated checkpoint digest, step,
+   sample count, benchmark identity, and complete reviewed-trace metrics. The
+   checkpoint itself is authoritative and atomically replaced; mmap its small
+   metadata for comparisons rather than maintaining fallible duplicate global
+   state. Each result records its selection outcome.
+5. Make successful result finalization idempotent. On startup, reconcile a
+   completed attempt that was interrupted between checkpoint selection and
+   canonical result promotion, while never selecting aborted/incomplete work.
+   Delete non-needed frozen attempt checkpoints only after durable selection
+   outcome and canonical promotion.
+6. Preserve `best.pt`, `current.pt`, and all EMA snapshot selection behavior.
+   Expose `best_reviewed_trace.pt` as the `best_trace` variant in the existing
+   trace-series evaluation workflow.
 
 ## Validation
 
-9. Add CPU-only interleaving tests covering release before discovery, during
-   handoff, before child spawn, during the child, concurrent successful exit,
-   changed GPU UUID/count, pause/unpause, epoch change, grace expiry, explicit
-   stop, genuine child failure, retry-output collision, exact-once metrics, and
-   absence of duplicated optimizer boundaries. Assert release is never reported
-   while a trace GPU descendant remains alive.
-10. Run the focused cooperative integration and manager lifecycle tests plus
-   `git diff --check`.
-11. Resume the failed production run from its update-42600 checkpoint. Force a
-   pause/reallocation during a trace attempt, then verify retry, trace completion,
-   and later training progress.
+7. Add CPU-only tests for first selection, strict improvement, tie/regression,
+   restart recovery at transaction boundaries, benchmark-identity mismatch,
+   checkpoint mutation/digest mismatch, malformed metrics/state, raw-only
+   enforcement, incomplete/aborted work, and both reviewed-trace paths.
+8. Test `best_trace` selection metadata and confirm existing raw/EMA best files
+   are untouched. Run the focused reviewed-trace and experiment-selection tests, Python
+   compilation, and `git diff --check`. No GPU run is required because the
+   change occurs after already-validated trace output is produced.
 
 ## Spec update
 
-- Specify that application maintenance is pending durable state across manager
-  allocation changes, must never make release unacknowledgeable, and may run
-  only while its owning grant remains applied.
+- Specify the independent raw trace-selected checkpoint, its exact metric,
+  strict tie policy, startup eligibility, benchmark identity, persistence and
+  recovery behavior, and separation from dense test-loss and EMA selection.
 
 ## Documentation updates
 
-- Update the cooperative validation/runbook lifecycle notes to describe
-  deferred maintenance and retry under pause/reallocation.
+- Document the new snapshot filename and selection semantics in the cooperative
+  training validation/runbook.
 
 ## Changelog
 
-- Record the cooperative maintenance/reallocation race fix and production
-  validation.
+- Record the additional restart-selected raw checkpoint.

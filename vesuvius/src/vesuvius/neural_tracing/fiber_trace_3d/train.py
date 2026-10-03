@@ -720,43 +720,55 @@ def _run_reviewed_trace_test(*, settings: dict[str, Any], step: int, run_dir: Pa
     process = None
     log_stream = None
     startup_error = None
+    reused = None
     if distributed.is_main:
         try:
             if not checkpoint.is_file():
                 raise RuntimeError(f"reviewed trace test checkpoint is missing: {checkpoint}")
-            output.mkdir(parents=True, exist_ok=False)
-            job = {
-                "step": step,
-                "samples_seen": int(samples_seen),
-                "checkpoint": str(checkpoint),
-                "output_root": str(output),
-                "template": str(Path(settings["template"]).expanduser().resolve()),
-                "split_root": str(Path(settings["split_root"]).expanduser().resolve()),
-                "native_binary": str(Path(settings["native_binary"]).expanduser().resolve()),
-                "runner": str(Path(settings["runner"]).expanduser().resolve()),
-                "devices": ",".join(str(index) for index in range(len(gpu_tokens))),
-                "inherited_manager_grant": True,
-            }
-            job_path = output / "job.json"
-            job_path.write_text(json.dumps(job, indent=2) + "\n")
-            environment = dict(os.environ)
-            for name in ("RANK", "WORLD_SIZE", "LOCAL_RANK", "MASTER_ADDR", "MASTER_PORT"):
-                environment.pop(name, None)
-            environment["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_tokens)
-            log_stream = (output / "runner.log").open("w")
-            process = subprocess.Popen(
-                [sys.executable, "-m", "vesuvius.neural_tracing.fiber_trace_3d.training_trace_benchmark", str(job_path)],
-                cwd=Path(__file__).resolve().parents[5], env=environment,
-                stdout=log_stream, stderr=subprocess.STDOUT,
-            )
-            print(f"training reviewed trace: step={step} pieces=32 directions=64 output={output}", flush=True)
+            from .reviewed_trace_selection import finalize_attempt, freeze_raw_checkpoint
+            if output.exists() and (output / "completion.json").is_file():
+                metrics, selection, _ = finalize_attempt(output, snapshot_dir)
+                reused = {"metrics": metrics, "selection": selection}
+            else:
+                output.mkdir(parents=True, exist_ok=False)
+                frozen = output / "evaluated_raw.pt"
+                checkpoint_sha256 = freeze_raw_checkpoint(
+                    checkpoint, frozen, step=step, samples_seen=int(samples_seen)
+                )
+                job = {
+                    "step": step,
+                    "samples_seen": int(samples_seen),
+                    "checkpoint": str(frozen),
+                    "checkpoint_sha256": checkpoint_sha256,
+                    "output_root": str(output),
+                    "template": str(Path(settings["template"]).expanduser().resolve()),
+                    "split_root": str(Path(settings["split_root"]).expanduser().resolve()),
+                    "native_binary": str(Path(settings["native_binary"]).expanduser().resolve()),
+                    "runner": str(Path(settings["runner"]).expanduser().resolve()),
+                    "devices": ",".join(str(index) for index in range(len(gpu_tokens))),
+                    "inherited_manager_grant": True,
+                }
+                job_path = output / "job.json"
+                job_path.write_text(json.dumps(job, indent=2) + "\n")
+                environment = dict(os.environ)
+                for name in ("RANK", "WORLD_SIZE", "LOCAL_RANK", "MASTER_ADDR", "MASTER_PORT"):
+                    environment.pop(name, None)
+                environment["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_tokens)
+                log_stream = (output / "runner.log").open("w")
+                process = subprocess.Popen(
+                    [sys.executable, "-m", "vesuvius.neural_tracing.fiber_trace_3d.training_trace_benchmark", str(job_path)],
+                    cwd=Path(__file__).resolve().parents[5], env=environment,
+                    stdout=log_stream, stderr=subprocess.STDOUT,
+                )
+                print(f"training reviewed trace: step={step} pieces=32 directions=64 output={output}", flush=True)
         except BaseException as error:
             startup_error = f"{type(error).__name__}: {error}"
     try:
         startup_error = _distributed_broadcast_object(startup_error, distributed)
         if startup_error is not None:
             raise RuntimeError(f"reviewed trace test failed to start: {startup_error}")
-        while True:
+        reused = _distributed_broadcast_object(reused, distributed)
+        while reused is None:
             status = None
             if distributed.is_main:
                 returncode = process.poll()
@@ -774,14 +786,17 @@ def _run_reviewed_trace_test(*, settings: dict[str, Any], step: int, run_dir: Pa
                     )
                 break
             time.sleep(1.0)
-        payload = None
-        if distributed.is_main:
+        payload = reused
+        if distributed.is_main and payload is None:
             try:
-                payload = {"metrics": json.loads((output / "training_metrics.json").read_text()), "error": None}
+                from .reviewed_trace_selection import finalize_attempt
+                metrics, selection, _ = finalize_attempt(output, snapshot_dir)
+                payload = {"metrics": metrics, "selection": selection, "error": None}
             except BaseException as error:
-                payload = {"metrics": None, "error": f"{type(error).__name__}: {error}"}
+                payload = {"metrics": None, "selection": None,
+                           "error": f"{type(error).__name__}: {error}"}
         payload = _distributed_broadcast_object(payload, distributed)
-        if payload["error"] is not None:
+        if payload.get("error") is not None:
             raise RuntimeError(f"reviewed trace result is invalid: {payload['error']}")
         metrics = payload["metrics"]
         if distributed.is_main:
@@ -792,7 +807,9 @@ def _run_reviewed_trace_test(*, settings: dict[str, Any], step: int, run_dir: Pa
                 f"combined_restarts={metrics['restarts_combined']} "
                 f"forward_implied_mm={metrics['implied_mean_mm_forward']:.6f} "
                 f"reverse_implied_mm={metrics['implied_mean_mm_reverse']:.6f} "
-                f"combined_implied_mm={metrics['implied_mean_mm_combined']:.6f}",
+                f"combined_implied_mm={metrics['implied_mean_mm_combined']:.6f} "
+                f"best_reviewed_trace={payload['selection']['best_restarts_combined']} "
+                f"selected={payload['selection']['selected']}",
                 flush=True,
             )
             if writer is not None:
