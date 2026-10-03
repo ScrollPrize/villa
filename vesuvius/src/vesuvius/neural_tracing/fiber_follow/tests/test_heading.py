@@ -50,8 +50,28 @@ def test_ct_seed_axis_uses_world_xyz_and_native_ct_scale():
         pos = np.array([24., 24., 24.])
         axis = ct_seed_heading(vol, pos, family)
         assert abs(axis@expected)/np.linalg.norm(expected) > .99999
-        np.testing.assert_array_equal(vol.ct.reads[0][0], [16, 16, 16])
+        np.testing.assert_array_equal(vol.ct.reads[0][0], [10, 10, 10])
+        np.testing.assert_array_equal(vol.ct.reads[0][1], [77, 77, 77])
         np.testing.assert_array_equal(pos, [24., 24., 24.])
+
+
+def test_tensor_on_exact_patch_grid_preserves_axes_spacing_and_zscore_invariance():
+    from vesuvius.neural_tracing.fiber_follow.tracing.heading import ct_structure_tensor
+    from vesuvius.neural_tracing.fiber_follow.shared.geometry import frame_from_heading
+    frame = frame_from_heading(np.array([.3, .4, np.sqrt(.75)]))
+    center = np.array([4., 15.5, 15.5])
+    local = (np.indices((32,)*3).transpose(1, 2, 3, 0)-center)[..., ::-1]*2.5
+    world_normal = np.array([1., 2., .4])
+    world_normal /= np.linalg.norm(world_normal)
+    image = 100+50*np.tanh((local @ frame.T @ world_normal)/3.)
+    a = ct_structure_tensor(image, center, sample_spacing=2.5)
+    normalized = (image-image.mean())/image.std()
+    b = ct_structure_tensor(normalized, center, sample_spacing=2.5)
+    np.testing.assert_allclose(a/image.std()**2, b, rtol=1e-12, atol=1e-16)
+    local_normal = np.linalg.eigh(a)[1][:, -1]
+    assert abs((frame @ local_normal) @ world_normal) > .99
+    with pytest.raises(SeedHeadingError, match='spacing'):
+        ct_structure_tensor(image, center, sample_spacing=0)
 
 
 def test_missing_or_ambiguous_ct_cannot_invent_a_heading():

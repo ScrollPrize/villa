@@ -303,6 +303,7 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer, bank_loader=
     ap.add_argument('--confidence', type=float, help='Default: the checkpoint operating policy')
     ap.add_argument('--n-commit', type=int, help='Default: the checkpoint operating policy')
     ap.add_argument('--device', default='cuda')
+    ap.add_argument('--frame-checkpoint', help='Override the learned frame checkpoint recorded by the follower')
     ap.add_argument('--threads', type=int, default=4)
     ap.add_argument('--out', required=True)
     ap.add_argument('--seed', type=int, default=1)
@@ -318,6 +319,9 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer, bank_loader=
     torch.set_num_threads(args.threads)
     print(f'Collector PyTorch threads: {torch.get_num_threads()}', flush=True)
     model, crop, n_hist, spec, ck = checkpoint_loader(args.checkpoint, args.device)
+    if args.frame_checkpoint:
+        from vesuvius.neural_tracing.fiber_follow.tracing.crop_frames import bind_frame_checkpoint
+        bind_frame_checkpoint(model.cfg, args.frame_checkpoint)
     policy = checkpoint_policy(ck, model.cfg, confidence=args.confidence, n_commit=args.n_commit)
     cfg = SampleConfig(crop=crop, n_history=n_hist, recent_history_points=model.cfg.recent_history_points,
                        n_future=model.cfg.n_future, future_step=model.cfg.future_step,
@@ -351,8 +355,10 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer, bank_loader=
                                             before=args.before, after=args.after, stride=args.stride,
                                             additional_crops=getattr(tracer, 'additional_crops', ()),
                                             bank_detector=bank_detector) for s in chunk]
+            from vesuvius.neural_tracing.fiber_follow.tracing.crop_frames import trace_family_kwargs
             paths, chunk_reasons = tracer.trace(np.stack([s['pos'] for s in chunk]), np.stack([s['heading'] for s in chunk]),
-                                                on_decision=lambda i, state: collectors[i](state))
+                                                on_decision=lambda i, state: collectors[i](state),
+                                                **trace_family_kwargs(tracer, [train_f[s['fiber']].tag for s in chunk]))
             for collector, path, reason in zip(collectors, paths, chunk_reasons):
                 if reason != 'oracle':
                     collector.observe_final_path(path)
@@ -374,8 +380,9 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer, bank_loader=
                                                             max_recovery_distance=cfg.max_recovery_distance,
                                                             departure_distance=DEPARTURE_DISTANCE,
                                                             departure_patience=DEPARTURE_PATIENCE),
-                                        seed_heading_policy=SEED_HEADING_POLICY, heading_policy=TRACE_HEADING_POLICY,
-                                        frame_policy=FRAME_POLICY,
+                                        seed_heading_policy=SEED_HEADING_POLICY,
+                                        heading_policy=getattr(tracer, 'heading_policy', TRACE_HEADING_POLICY),
+                                        frame_policy=getattr(tracer, 'frame_policy', FRAME_POLICY),
                                         model_cfg=model.cfg.to_dict(), crop=asdict(crop),
                                         volume=spec.to_dict(), collection=vars(args),
                                         coverage=dict(requested=args.fibers_per_collection, seeds=len(seeds),

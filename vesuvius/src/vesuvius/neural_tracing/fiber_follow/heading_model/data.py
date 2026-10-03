@@ -18,6 +18,7 @@ import torch
 from vesuvius.neural_tracing.fiber_follow.heading_model.model import (
     HeadingConfig, ct_shift, model_inputs, patch_volume_spec, prior_frames)
 from vesuvius.neural_tracing.fiber_follow.heading_model.targets import in_crop_heading
+from vesuvius.neural_tracing.fiber_follow.heading_model.frames import family_ids, smoothed_tangent, fiber_corrected_normal
 from vesuvius.neural_tracing.fiber_follow.data.datasets import WeightedDatasets, load_primary_dataset, open_afv_source, primary_source_spec, read_dataset_config
 from vesuvius.neural_tracing.fiber_follow.data.data import FollowDataset, SampleConfig, simulated_trace, tight_block, traversal_curve
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength, interp_at, normalize
@@ -116,8 +117,11 @@ def heading_state(fiber, rng, cfg: HeadingConfig, sampling: HeadingSampling, sam
         prior = cone(init, rng, sampling.cone_deg, sampling.cone_cap_deg)
     else:
         prior = fit
-    return dict(pos=pos, path=path, prior=prior, future=future, init=init,
-                history=float(arclength(path)[-1]) if len(path) > 1 else 0.)
+    state = dict(pos=pos, path=path, prior=prior, future=future, init=init,
+                 history=float(arclength(path)[-1]) if len(path) > 1 else 0.)
+    if cfg.predict_frames:
+        state.update(family=int(family_ids([fiber.tag])[0]), fiber_tangent=smoothed_tangent(p, s, t))
+    return state
 
 
 def plan_states(fibers, weights, n, rng, cfg, sampling, *, roll_rng=None):
@@ -140,7 +144,14 @@ def finish_states(states, vol, cfg, pool=None):
     """Targets, CT patches and path features for planned states; targets in each patch frame."""
     targets = in_crop_heading(np.stack([s['future'] for s in states]), np.stack([s['init'] for s in states]))
     frames = [s['frame'] for s in states]
-    patch, path = model_inputs(vol, cfg, [s['pos'] for s in states], frames, [s['path'] for s in states], pool)
+    inputs = model_inputs(vol, cfg, [s['pos'] for s in states], frames, [s['path'] for s in states], pool,
+                          normal_targets=cfg.predict_normals)
+    patch, path = inputs[:2]
+    if cfg.predict_normals:
+        for state, normal, weight in zip(states, inputs[2].numpy(), inputs[3].numpy()):
+            if cfg.predict_frames:
+                normal, weight = fiber_corrected_normal(normal, state['fiber_tangent'] @ state['frame'], weight)
+            state['normal_target'], state['normal_weight'] = normal, float(weight)
     for state, target in zip(states, targets):
         state['target'] = target
     local = torch.from_numpy(np.stack([t @ f for t, f in zip(targets, frames)]).astype(np.float32))
@@ -159,12 +170,20 @@ class HeadingBatchBuilder:
         self.cfg = cfg
 
     def prefetch_bounds(self, item, vol):
-        yield tight_block(np.asarray(item['pos'])-ct_shift(self.cfg, vol), item['frame'], self.cfg.patch, vol.input_scale)
+        from vesuvius.neural_tracing.fiber_follow.heading_model.normals import training_crop
+        crop = training_crop(self.cfg, vol)[0] if self.cfg.predict_normals else self.cfg.patch
+        yield tight_block(np.asarray(item['pos'])-ct_shift(self.cfg, vol), item['frame'], crop, vol.input_scale)
 
     def __call__(self, items, vol):
         patch, path, target = finish_states(items, vol, self.cfg)
-        return dict(patch=patch, path=path, target=target,
-                    history=torch.tensor([s['history'] for s in items], dtype=torch.float32))
+        batch = dict(patch=patch, path=path, target=target,
+                     history=torch.tensor([s['history'] for s in items], dtype=torch.float32))
+        if self.cfg.predict_normals:
+            batch.update(normal_target=torch.from_numpy(np.stack([s['normal_target'] for s in items])),
+                         normal_weight=torch.tensor([s['normal_weight'] for s in items], dtype=torch.float32))
+        if self.cfg.predict_frames:
+            batch['family'] = torch.tensor([s['family'] for s in items], dtype=torch.long)
+        return batch
 
 
 class HeadingStates(FollowDataset):

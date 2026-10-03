@@ -150,7 +150,9 @@ def rollout_diag(tracer, fibers, seeds, path, max_len=400.0, half=15, batch=8):
         paths, reasons = [], []
         for start in range(0, len(seeds), batch):
             chunk = seeds[start:start+batch]
-            p, r = tracer.trace(np.stack([s["pos"] for s in chunk]), np.stack([s["heading"] for s in chunk]))
+            from vesuvius.neural_tracing.fiber_follow.tracing.crop_frames import trace_family_kwargs
+            p, r = tracer.trace(np.stack([s["pos"] for s in chunk]), np.stack([s["heading"] for s in chunk]),
+                               **trace_family_kwargs(tracer, [s.get('family', fibers[s['fiber']].tag) for s in chunk]))
             paths.extend(p)
             reasons.extend(r)
     finally:

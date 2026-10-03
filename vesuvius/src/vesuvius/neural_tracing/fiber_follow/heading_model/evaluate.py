@@ -16,6 +16,7 @@ import torch
 
 from vesuvius.neural_tracing.fiber_follow.heading_model.data import HISTORY_BINS
 from vesuvius.neural_tracing.fiber_follow.heading_model.targets import lateral_extent
+from vesuvius.neural_tracing.fiber_follow.heading_model.frames import orthonormal_frame, roll_supervision, frame_angles
 
 
 def angle(a, b):
@@ -27,10 +28,59 @@ def quantiles(values):
 
 
 @torch.no_grad()
-def model_headings(model, patch, path, frames, device='cpu', batch=512):
-    local = torch.cat([model(patch[i:i+batch].to(device), path[i:i+batch].to(device)).double().cpu()
+def model_headings(model, patch, path, frames, device='cpu', batch=512, family=None):
+    local = torch.cat([model(patch[i:i+batch].to(device), path[i:i+batch].to(device),
+                            family[i:i+batch].to(device) if family is not None else None).double().cpu()
                        for i in range(0, len(patch), batch)]).numpy()
     return [f @ d for f, d in zip(frames, local)]
+
+
+@torch.no_grad()
+def evaluate_states(model, states, patch, path, device='cpu', batch=512):
+    family = torch.tensor([s['family'] for s in states], dtype=torch.long, device=device) if model.cfg.predict_frames else None
+    outputs = [model.forward_outputs(patch[i:i+batch].to(device), path[i:i+batch].to(device),
+                                     family[i:i+batch] if family is not None else None)
+               for i in range(0, len(patch), batch)]
+    local = torch.cat([o['heading'].cpu() for o in outputs]).double().numpy()
+    report = alignment_report(states, [s['frame'] @ h for s, h in zip(states, local)], model.cfg.forward)
+    if model.cfg.predict_normals:
+        normals = torch.cat([o['normal'].cpu() for o in outputs]).double().numpy()
+        weights = np.array([s['normal_weight'] for s in states])
+        cosine = np.clip(np.abs(np.sum(normals*np.stack([s['normal_target'] for s in states]), axis=-1)), 0, 1)
+        for name, lo, hi in HISTORY_BINS:
+            if name not in report:
+                continue
+            idx = np.array([lo <= s['history'] < hi for s in states]) & (weights > 0)
+            report[name]['normal'] = dict(n=int(idx.sum()), angle_deg=quantiles(np.degrees(np.arccos(cosine[idx]))),
+                loss=float(np.average(1-cosine[idx]**2, weights=weights[idx])) if idx.any() else None)
+    if model.cfg.predict_frames:
+        target_h = torch.from_numpy(np.stack([s['target'] @ s['frame'] for s in states])).double()
+        target_n = torch.from_numpy(np.stack([s['normal_target'] for s in states])).double()
+        _, roll_cos, roll_weights = roll_supervision(torch.from_numpy(normals), target_n, target_h,
+                                                    torch.from_numpy(weights))
+        predicted = torch.cat([o['frame'].cpu() for o in outputs]).double()
+        errors = frame_angles(predicted, orthonormal_frame(target_h, target_n)).numpy()
+        roll_errors = torch.rad2deg(torch.acos(roll_cos.clamp(0, 1))).numpy()
+        for name, lo, hi in HISTORY_BINS:
+            if name not in report:
+                continue
+            idx = np.array([lo <= s['history'] < hi for s in states]) & (roll_weights.numpy() > 0)
+            report[name]['frame'] = dict(n=int(idx.sum()), angle_deg=quantiles(errors[idx]),
+                mean_angle_deg=float(errors[idx].mean()) if idx.any() else None,
+                roll_angle_deg=quantiles(roll_errors[idx]))
+    return report
+
+
+def normal_summary_metric(reports):
+    values = [b['normal']['loss'] for r in reports.values() for b in r.values()
+              if b.get('normal', {}).get('loss') is not None]
+    return float(np.mean(values)) if values else float('inf')
+
+
+def frame_summary_metric(reports):
+    values = [b['frame']['mean_angle_deg'] for r in reports.values() for b in r.values()
+              if b.get('frame', {}).get('mean_angle_deg') is not None]
+    return float(np.mean(values)) if values else float('inf')
 
 
 def alignment_report(states, headings, forward):
@@ -64,6 +114,11 @@ def format_report(name, report):
         lines.append(f"  history {bin_name:5s} n {b['n']:4d} | angle p50/p90/p99 prior {b['angle_prior']} -> model "
                      f"{b['angle_model']} (closer {b['model_closer']:.0%}) | crop off-axis p50/p90 prior "
                      f"{b['off_axis_crop_prior'][:2]} -> model {b['off_axis_crop_model'][:2]} (floor {b['off_axis_crop_target'][:2]})")
+        if 'normal' in b:
+            lines.append(f"    normal: n {b['normal']['n']} | unsigned angle p50/p90/p99 {b['normal']['angle_deg']} deg")
+        if 'frame' in b:
+            lines.append(f"    frame: n {b['frame']['n']} | rotation p50/p90/p99 {b['frame']['angle_deg']} deg | "
+                         f"roll about target heading {b['frame']['roll_angle_deg']} deg")
     return '\n'.join(lines)
 
 
@@ -92,8 +147,7 @@ def main():
                                      config['seed'], pool)
     reports = {}
     for name, (states, patch, path, _) in held_out.items():
-        reports[name] = alignment_report(states, model_headings(model, patch, path, [s['frame'] for s in states],
-                                                                args.device), model.cfg.forward)
+        reports[name] = evaluate_states(model, states, patch, path, args.device)
         print(format_report(name, reports[name]), flush=True)
     if args.out:
         Path(args.out).write_text(json.dumps(reports, indent=1))

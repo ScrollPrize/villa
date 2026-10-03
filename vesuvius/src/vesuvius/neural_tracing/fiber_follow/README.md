@@ -35,6 +35,19 @@ The converted file preserves model/EMA tensors and inference/data provenance. It
 
 DAgger subprocesses receive `--dagger-threads` (default 4), independently of the trainer's `--threads`. Both use the common collector. Other inference thread defaults are unchanged.
 
+New follower runs use the frozen `heading_model_l0_w16_centered_frame/ckpt_064000.pt` for current-crop
+heading and roll. CT initializes seed headings with derivative sigma 2 and integration sigma 8, using a
+77³ native CT context. Historical slabs retain their observed-path tangent and use the learned normal for roll.
+H/V family comes from the seed or fiber metadata; only CT and observed paths enter the frame model.
+The model runs in batches on CPU, once per worker/process, with no training gradients.
+
+`--frame-checkpoint PATH` selects a different frozen frame model for training, inference, or collection.
+Its absolute path and SHA-256 are saved in the follower model configuration, so subsequent tracing and
+collection use the same weights. Keep that checkpoint available. Resume retains the recorded selection unless
+explicitly overridden. Unknown-family observations use the 2/8 CT frame; recorded replay frames stay unchanged.
+Read planning covers the learned model patch and every possible new crop heading. Training recomputes plane
+crossings and supervision after a heading change. Frame diagnostics use source code 3 for learned frames.
+
 ```bash
 ../../../../.venv/bin/python -m vesuvius.neural_tracing.fiber_follow.tracing.infer --help
 ../../../../.venv/bin/python -m vesuvius.neural_tracing.fiber_follow.tracing.collect --help
@@ -53,7 +66,7 @@ DAgger subprocesses receive `--dagger-threads` (default 4), independently of the
 | `tracing` | Inference, collection, heading/frame resolution, commit policy, rollout |
 | `evaluation` | Frozen-seed evaluation, recovery, diagnostics, benchmarks |
 | `visualization` | Measured interpretation reports for either model |
-| `heading_model` | Independent heading model and trainer, retained for future integration |
+| `heading_model` | Heading/normal trainer and frozen frame predictor used by follower crop generation |
 | `shared` | Geometry, reference handling, sampling kernels, experiment utilities |
 
 Historical experiment documentation is under `docs/history` and `plans`. Datasets and existing run artifacts retain their locations. Old `regression.*` and `flow_matching.*` Python entrypoints have been removed.

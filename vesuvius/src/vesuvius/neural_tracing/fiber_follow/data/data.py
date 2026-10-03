@@ -445,6 +445,7 @@ def make_sample(fiber: TracedFiber, t: float, reverse: bool, cfg: SampleConfig, 
     frame = frame_from_heading(heading)  # provisional basis; CT resolves crop roll before sampling
     hist, hmask = trace_history(list(path), cfg.n_history)
     item = dict(_generated_original_history=True, _seed_original_certified=True,
+                _frame_label_context=(fiber, t, reverse, cfg),
                 observed_path=path, seed_pos=path[0].copy(), seed_tangent=seed_direction,
                 seed_age=float(arclength(path)[-1]), seed_valid=True, seed_heading_family=fiber.tag,
                 trace_noise_sigma=sigma, trace_prefix_length=float(arcs[-1]-arcs[0]), startup=category,
@@ -471,6 +472,7 @@ def resolve_trace_seed(item, vol):
     pending = item.pop('_pending_seed_heading', None)
     if family is None:
         return item
+    item['fiber_family'] = family
     from vesuvius.neural_tracing.fiber_follow.tracing.heading import oriented_seed_heading, reframe_item
     from vesuvius.neural_tracing.fiber_follow.data.state_labels import supervise
     heading = oriented_seed_heading(vol, item['seed_pos'], family, item['seed_tangent'])
@@ -510,6 +512,19 @@ def continuation_targets(fiber, t, reverse, pos, frame, cfg):
                 plane_ab=ab, plane_mask=mask, planes=cfg.future_s,
                 dense_ab=dense_ab, dense_mask=dense_mask, dense_planes=dense_planes,
                 end_local=end, endpoint_known=float(known))
+
+
+def refresh_frame_targets(item):
+    """Rebuild plane crossings and supervision after a learned heading change; labels only."""
+    context = item.get('_frame_label_context')
+    if context is None:
+        return
+    fiber, t, reverse, cfg = context
+    item.update(continuation_targets(fiber, t, reverse, item['pos'], item['frame'], cfg))
+    from vesuvius.neural_tracing.fiber_follow.data.state_labels import supervise
+    if not (item['trace_facts']['match_valid'] and not item['trace_facts']['match_ambiguous']):
+        item['gt_history_mask'] = np.zeros_like(item['gt_history_mask'])
+    supervise(item)
 
 
 # One task budget, applied within each dataset source. Sampling allocations, not label
@@ -821,7 +836,7 @@ class FollowDataset(torch.utils.data.IterableDataset):
         item.update(source=SOURCE['replay'], source_step=int(op.provenance['step']),
                     fiber_ref=(fi, self.fibers[fi].length-t if reverse else t, reverse),
                     replay_class=int(op.replay_class[j]), travelled=float(op.travelled[j]),
-                    heading_start=int(op.heading_start[j]), frame_policy=FRAME_POLICY,
+                    heading_start=int(op.heading_start[j]), frame_policy=op.provenance.get('frame_policy', FRAME_POLICY),
                     labeler_state=replay_labeler_state(op, j))
         item.update({k: getattr(op, k)[j] for k in SEED_FIELDS})
         item['observed_path'] = op.observed_prefix(j)
@@ -1113,6 +1128,7 @@ def label_state(fiber, pos, frame, hist_world, hmask, cfg, *, t, reverse, trace)
         raise ValueError('Replay history must equal n_history')
     traversal_t = fiber.length-t if reverse else t
     item = dict(pos=pos, frame=frame, hist_local=(hist_world-pos) @ frame,
+                _frame_label_context=(fiber, traversal_t, reverse, cfg), fiber_family=fiber.tag,
                 hmask=np.asarray(hmask, np.float32), trace_facts=dict(trace),
                 **continuation_targets(fiber, traversal_t, reverse, pos, frame, cfg))
     if not (trace['match_valid'] and not trace['match_ambiguous']):

@@ -10,11 +10,12 @@ from vesuvius.neural_tracing.fiber_follow.shared.geometry import (
 )
 
 from vesuvius.neural_tracing.fiber_follow.shared.reference import observed_path
-from vesuvius.neural_tracing.fiber_follow.tracing.heading import ct_frame, reframe_item, FRAME_POLICY
+from vesuvius.neural_tracing.fiber_follow.tracing.heading import ct_frame, reframe_item, FRAME_POLICY, FRAME_POLICIES, LEARNED_FRAME_POLICY
+from vesuvius.neural_tracing.fiber_follow.tracing.crop_frames import frame_predictor, predict_frames
 
 SLOTS = 8
 SLAB = CropSpec(depth=8, width=65, behind=4, spacing=.5)
-SAMPLING_REVISION = 'live_observed_slabs_ct_transverse_v3'
+SAMPLING_REVISION = 'live_observed_slabs_learned_roll_v4'
 PATH_SAMPLES = 3
 
 
@@ -83,6 +84,8 @@ def slab_layout(item):
         local = np.concatenate((np.zeros((1, 3)), local))
         slabs.append(dict(pos=pos, frame=frame, hist_local=local,
                           hmask=np.r_[0., np.ones(len(local)-1)],
+                          observed_path=np.concatenate((path[arc < at], pos[None])),
+                          fiber_family=item.get('fiber_family'),
                           age=arc[-1]-at, seed=slot == 0))
     return slabs
 
@@ -96,22 +99,39 @@ def load_slabs(items, vol, cfg, pool=None):
     from vesuvius.neural_tracing.fiber_follow.data.observations import visible_points
     from vesuvius.neural_tracing.fiber_follow.data.crop_sampling import scalar_crops, empty_image_batch
     started = time.perf_counter()
-    def orient(item):
+    predictor = frame_predictor(cfg)
+    layouts = [slab_layout(item) for item in items]
+    learned = [s for layout in layouts for s in layout if predictor is not None and s.get('fiber_family')]
+    if learned:
+        frames = predict_frames(predictor, vol, [s['pos'] for s in learned], [s['frame'][:, 2] for s in learned],
+            [s['observed_path'] for s in learned], [s['fiber_family'] for s in learned], keep_heading=True, pool=pool)
+        for slab, frame in zip(learned, frames):
+            slab['_learned_frame'] = frame
+    def orient(pair):
+        item, layout = pair
         # Frames chain within an item (sign continuity), never across items.
-        layout = slab_layout(item)
         previous = None
         for slab in layout:
             diagnostics = {}
-            fallback = item['frame'] if item.get('frame_policy') == FRAME_POLICY else None
-            frame = ct_frame(vol, slab['pos'], slab['frame'][:, 2], previous,
-                             fallback=fallback, diagnostics=diagnostics)
+            fallback = item['frame'] if item.get('frame_policy') in FRAME_POLICIES else None
+            if '_learned_frame' in slab:
+                frame = slab.pop('_learned_frame')
+                anchor = previous if previous is not None else fallback
+                if anchor is not None and frame[:, 0] @ anchor[:, 0] < 0:
+                    frame[:, :2] *= -1
+                diagnostics.update(source=3, energy=0., gap=0.)
+                policy = LEARNED_FRAME_POLICY
+            else:
+                frame = ct_frame(vol, slab['pos'], slab['frame'][:, 2], previous,
+                                 fallback=fallback, diagnostics=diagnostics)
+                policy = FRAME_POLICY
             reframe_item(slab, frame)
-            slab['frame_policy'] = FRAME_POLICY
+            slab['frame_policy'] = policy
             slab['ct_frame_diagnostics'] = diagnostics
             previous = frame
         item['_sampled_slabs'] = layout
         return layout
-    layouts = list(map(orient, items) if pool is None else pool.map(orient, items))
+    layouts = list(map(orient, zip(items, layouts)) if pool is None else pool.map(orient, zip(items, layouts)))
     flat = [slab for layout in layouts for slab in layout]
     images = scalar_crops(flat, vol, SLAB, pool, presence=False)
     grid = torch.from_numpy(crop_local_grid(SLAB)).float()
@@ -163,5 +183,4 @@ def load_slabs(items, vol, cfg, pool=None):
                 history_ages=ages, history_overlap=overlap, history_load_seconds=elapsed,
                 history_frame_source=frame_source, history_frame_energy=frame_energy, history_frame_gap=frame_gap,
                 **path_inputs)
-
 

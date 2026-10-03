@@ -6,9 +6,12 @@ from scipy.ndimage import gaussian_filter
 
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength, interp_at, frame_from_heading, normalize, block_start
 
-SEED_HEADING_POLICY = 'ct_sheet_hv_v1'
+SEED_HEADING_POLICY = 'ct_sheet_hv_sigma2_8_v2'
 TRACE_HEADING_POLICY = 'linear12_trusted_v1'
-FRAME_POLICY = 'ct_transverse_uv_v2'
+FRAME_POLICY = 'ct_transverse_uv_sigma2_8_v3'
+LEARNED_FRAME_POLICY = 'learned_heading_normal_v1'
+FRAME_POLICIES = (FRAME_POLICY, LEARNED_FRAME_POLICY, 'ct_transverse_uv_v2')
+CT_CONTEXT_RADIUS = 38  # four integration sigmas + three derivative sigmas
 # CT is scaled to [0, 1]. Require both directional evidence and enough
 # transverse energy to avoid orienting a crop from numerical residue.
 MIN_FRAME_ENERGY = 1e-12
@@ -29,18 +32,29 @@ def fiber_family(value):
     return family
 
 
-def ct_structure_tensor(cube, center_zyx):
-    """XYZ gradient tensor; native CT derivative sigma 1, integration 4."""
+def ct_structure_tensor(cube, center_zyx, *, sample_spacing=1., derivative_sigma=1., integration_sigma=4.):
+    """XYZ gradient tensor; CT-unit derivative/integration sigmas default to 1/4.
+
+    ``sample_spacing`` is the isotropic spacing in selected-CT voxels. The
+    default preserves native CT behavior; resampled crops can specify theirs.
+    Sigmas are in selected-CT voxel units, independent of sample spacing.
+    Returned axes follow the input array's reversed axis order, not its world
+    rotation: callers must rotate crop-local tensors/normals into world XYZ.
+    """
     image = np.asarray(cube, dtype=np.float64) / 255.
     center = np.asarray(center_zyx, dtype=np.float64)
     if image.ndim != 3 or center.shape != (3,) or not np.isfinite(image).all() or not np.isfinite(center).all():
         raise SeedHeadingError('CT seed context must be a finite 3D image and center')
+    if not np.isfinite(sample_spacing) or sample_spacing <= 0:
+        raise SeedHeadingError('CT sample spacing must be finite and positive')
+    if not all(np.isfinite(s) and s > 0 for s in (derivative_sigma, integration_sigma)):
+        raise SeedHeadingError('CT tensor sigmas must be finite and positive')
     gradients = []
     for axis in range(3):
         order = [0, 0, 0]
         order[axis] = 1
-        gradients.append(gaussian_filter(image, 1., order=order, mode='nearest', truncate=3.))
-    weights = [np.exp(-.5*((np.arange(n)-c)/4.)**2) for n, c in zip(image.shape, center)]
+        gradients.append(gaussian_filter(image, derivative_sigma/sample_spacing, order=order, mode='nearest', truncate=3.)/sample_spacing)
+    weights = [np.exp(-.5*((np.arange(n)-c)/(integration_sigma/sample_spacing))**2) for n, c in zip(image.shape, center)]
     weight = weights[0][:, None, None]*weights[1][None, :, None]*weights[2][None, None, :]
     weight /= weight.sum()
     tensor = np.array([[np.sum(weight*a*b) for b in gradients] for a in gradients])
@@ -50,7 +64,8 @@ def ct_structure_tensor(cube, center_zyx):
 def ct_sheet_normal(cube, center_zyx):
     """Unrestricted sheet normal for selecting an initial H/V heading."""
     # Solve in array-axis order for the seed-heading sign convention.
-    values, vectors = np.linalg.eigh(ct_structure_tensor(cube, center_zyx)[::-1, ::-1])
+    values, vectors = np.linalg.eigh(ct_structure_tensor(cube, center_zyx,
+        derivative_sigma=2., integration_sigma=8.)[::-1, ::-1])
     if values[-1] <= 1e-12 or values[-1]-values[-2] <= 1e-6*values[-1]:
         raise SeedHeadingError('CT seed context has no identifiable sheet normal')
     return vectors[::-1, -1]  # zyx array axes -> world xyz
@@ -76,13 +91,13 @@ def normal_context(pos_xyz, input_scale):
     if pos.shape != (3,) or not np.isfinite(pos).all():
         raise SeedHeadingError('Seed position must be a finite xyz vector')
     center = pos[::-1]*input_scale
-    start = np.floor(center).astype(np.int64)-32
-    return start, np.array([65, 65, 65])
+    start = np.floor(center).astype(np.int64)-CT_CONTEXT_RADIUS
+    return start, np.full(3, 2*CT_CONTEXT_RADIUS+1, dtype=np.int64)
 
 
 def _ct_context(vol, pos_xyz):
     start, size = normal_context(pos_xyz, vol.input_scale)
-    if np.any(start < 0) or np.any(start+65 > np.asarray(vol.ct.shape)):
+    if np.any(start < 0) or np.any(start+size > np.asarray(vol.ct.shape)):
         raise SeedHeadingError('CT seed context crosses the volume boundary')
     center = np.asarray(pos_xyz)[::-1]*vol.input_scale-start
     return vol.ct.read(start, size), center
@@ -93,7 +108,7 @@ def ct_normal(vol, pos_xyz):
 
 
 def ct_tensor(vol, pos_xyz):
-    return ct_structure_tensor(*_ct_context(vol, pos_xyz))
+    return ct_structure_tensor(*_ct_context(vol, pos_xyz), derivative_sigma=2., integration_sigma=8.)
 
 
 def ct_seed_heading(vol, pos_xyz, family):
@@ -171,16 +186,20 @@ def reframe_item(item, frame):
     for key in ('hist_local', 'gt_history', 'fut_local', 'end_local', 'identity_curve'):
         if key in item:
             item[key] = np.asarray(item[key]) @ rotation
-    for key in ('plane_ab', 'dense_ab'):
+    for key, planes in (('plane_ab', 'planes'), ('dense_ab', 'dense_planes')):
         if key in item:
-            item[key] = np.asarray(item[key]) @ rotation[:2, :2]
+            if planes in item:
+                points = np.c_[item[key], item[planes]] @ rotation
+                item[key], item[planes] = points[:, :2], points[:, 2]
+            else:
+                item[key] = np.asarray(item[key]) @ rotation[:2, :2]
     item['frame'] = frame
 
 
 def orient_item(item, vol):
     """Resolve synthetic geometry once; recorded tracing frames are immutable."""
     if 'frame_policy' in item:
-        if item['frame_policy'] != FRAME_POLICY:
+        if item['frame_policy'] not in FRAME_POLICIES:
             raise ValueError('Unsupported crop frame policy; recollect replay')
         return
     diagnostics = {}
@@ -192,7 +211,7 @@ def orient_item(item, vol):
 def frame_prefetch_bounds(item, crop, input_scale):
     """Cover every roll until CT is available, plus the normal's CT context."""
     from vesuvius.neural_tracing.fiber_follow.data.data import tight_block
-    if item.get('frame_policy') == FRAME_POLICY:
+    if item.get('frame_policy') in FRAME_POLICIES:
         yield tight_block(item['pos'], item['frame'], crop, input_scale)
     else:
         # block_start encloses the crop's circumsphere, independent of u/v.

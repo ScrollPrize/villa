@@ -24,6 +24,7 @@ from vesuvius.neural_tracing.fiber_follow.evaluation.diagnostics import decision
 from vesuvius.neural_tracing.fiber_follow.evaluation.recovery import monitor_fixture, evaluate_monitor
 from vesuvius.neural_tracing.fiber_follow.data.history_slabs import SAMPLING_REVISION
 from vesuvius.neural_tracing.fiber_follow.tracing.heading import FRAME_POLICY
+from vesuvius.neural_tracing.fiber_follow.tracing.crop_frames import DEFAULT_FRAME_CHECKPOINT, configured_frame_policy, frame_predictor, bind_frame_checkpoint
 from vesuvius.neural_tracing.fiber_follow.train.training_log import format_training_log, TrainingInterval, SamplingLedger
 
 
@@ -403,7 +404,7 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
             source = cpu['x'][prefix+'_source']
             known = source >= 0
             for suffix, value in dict(count=known.sum(), transported=(source == 1).sum(),
-                    deterministic=(source == 2).sum(),
+                    deterministic=(source == 2).sum(), learned=(source == 3).sum(),
                     energy_sum=cpu['x'][prefix+'_energy'][known].sum(),
                     gap_sum=cpu['x'][prefix+'_gap'][known].sum()).items():
                 name = prefix+'_'+suffix
@@ -524,6 +525,7 @@ def build_parser():
     ap.add_argument('--onpolicy', nargs='*', default=[])
     ap.add_argument('--out-root', default=str(Path(__file__).parents[1]/'output'))
     ap.add_argument('--device', default='cuda')
+    ap.add_argument('--frame-checkpoint', help='Frozen learned heading/normal checkpoint; new runs default to the tested 64k model')
     ap.add_argument('--steps', type=int, default=100000)
     ap.add_argument('--batch', type=int, default=4, help='Decisions per forward/backward pass')
     ap.add_argument('--grad-steps', type=int, default=2,
@@ -709,6 +711,9 @@ def main(argv=None):
     initial = read_checkpoint(args.init_weights,MODEL_TYPES,'cpu') if args.init_weights else None
     origin = resume or initial
     cfg = model_config_from_args(args, origin)
+    if args.frame_checkpoint or not resume:
+        bind_frame_checkpoint(cfg, args.frame_checkpoint or cfg.frame_checkpoint or DEFAULT_FRAME_CHECKPOINT)
+    frame_predictor(cfg)  # validate once before dataset loading; workers reuse a frozen CPU predictor
     args.model = cfg.model_type
     if resume:
         from vesuvius.neural_tracing.fiber_follow.data.datasets import validate_dataset_resume
@@ -915,7 +920,7 @@ def main(argv=None):
             collection=collector_settings(collector),
             initialization=dict(checkpoint=str(Path(args.init_weights).resolve()), optimizer='fresh AdamW',
                                 warmup=args.warmup) if args.init_weights else None,
-            data_policy=DATA_POLICY, frame_policy=FRAME_POLICY,
+            data_policy=DATA_POLICY, frame_policy=configured_frame_policy(cfg),
             monitor_recovery_sha256=recovery_hash,
             seed_manifest_sha256=manifest['sha256'], fiber_manifest=fiber_manifest(fibers),
             parameter_count=sum(p.numel() for p in model.parameters())), indent=2))
@@ -945,7 +950,7 @@ def main(argv=None):
                               excursion_amplitude=sample.excursion_amplitude, excursion_rise=sample.excursion_rise),
         label_contract=dict(tolerance=sample.label_tolerance, max_recovery_distance=sample.max_recovery_distance),
         live_continuation_steps=args.live_continuation_steps,
-        history_sampling_revision=SAMPLING_REVISION, frame_policy=FRAME_POLICY,
+        history_sampling_revision=SAMPLING_REVISION, frame_policy=configured_frame_policy(cfg),
         history_policy='live_observed_slabs',sampling=asdict(identity_sampling),
         negative_bank_path=str(negative_bank.root),negative_bank_provenance=negative_bank.provenance(),
         bank_role_provenance=role_provenance()))
@@ -1043,7 +1048,7 @@ def main(argv=None):
                     dataset_config=dataset_document, dataset_config_sha256=dataset_digest,
                     dataset_provenance=dataset_provenance,
                     ct_normalization=ct_normalization,
-                    history_sampling_revision=SAMPLING_REVISION, frame_policy=FRAME_POLICY,
+                    history_sampling_revision=SAMPLING_REVISION, frame_policy=configured_frame_policy(cfg),
                     samples_seen=prior_samples+observed_states,
                     identity_sampling=asdict(identity_sampling),
                     negative_bank_provenance=negative_bank.provenance() if negative_bank else None,

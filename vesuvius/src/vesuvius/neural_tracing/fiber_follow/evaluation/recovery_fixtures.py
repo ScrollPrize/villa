@@ -73,6 +73,7 @@ def recovery_batches(vol, states, fibers, sample, batch_builder=None, limit=0):
                           t=float(states.t[j]), reverse=bool(states.reverse[j]), trace=replay_facts(states, j, sample))
         item.update({k: getattr(states, k)[j] for k in SEED_FIELDS if hasattr(states, k)})
         item['observed_path'] = states.observed_prefix(j)
+        item['fiber_family'] = f.tag
         item['frame_policy'] = states.provenance.get('frame_policy', FRAME_POLICY)
         if batch_builder is None:
             raise ValueError('Recovery evaluation requires the common observation builder')
@@ -142,7 +143,9 @@ def evaluate_recovery_states(model, vol, states, fibers, sample, *, device='cpu'
             state['frame_policy'] = states.provenance.get('frame_policy', FRAME_POLICY)
             state.update({k: getattr(states, k)[j] for k in SEED_FIELDS if hasattr(states, k)})
             try:
-                paths,reasons=tracer.trace(states.pos[j:j+1],states.frame[j:j+1,:,2],initial_states=[state])
+                from vesuvius.neural_tracing.fiber_follow.tracing.crop_frames import trace_family_kwargs
+                paths,reasons=tracer.trace(states.pos[j:j+1],states.frame[j:j+1,:,2],initial_states=[state],
+                                           **trace_family_kwargs(tracer, [f.tag]))
             finally:tracer.close()
             # Match only the original fiber near the stored arc correspondence.
             path=paths[0];sign=-1 if states.reverse[j] else 1

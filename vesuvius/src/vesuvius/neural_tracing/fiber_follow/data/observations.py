@@ -14,7 +14,8 @@ from vesuvius.neural_tracing.fiber_follow.shared.geometry import interp_at
 from vesuvius.neural_tracing.fiber_follow.tracing.trace import ModelTracer
 from vesuvius.neural_tracing.fiber_follow.shared.reference import SEED_FIELDS, observed_seed
 from vesuvius.neural_tracing.fiber_follow.data.state_labels import DEPARTURE_DISTANCE, supervise
-from vesuvius.neural_tracing.fiber_follow.tracing.heading import orient_item, frame_prefetch_bounds, heading_free_bounds, reframe_item, FRAME_POLICY
+from vesuvius.neural_tracing.fiber_follow.tracing.heading import heading_free_bounds, reframe_item, FRAME_POLICY, FRAME_POLICIES
+from vesuvius.neural_tracing.fiber_follow.tracing.crop_frames import frame_predictor, orient_items, crop_frame_bounds
 from vesuvius.neural_tracing.fiber_follow.models.model import CoordinateRegressionConfig
 
 
@@ -36,14 +37,15 @@ class ObservationBuilder:
         if '_pending_seed_heading' in item:
             # A trace start takes its CT seed heading only once the image is built.
             yield heading_free_bounds(item['pos'],self.cfg.fine,vol.input_scale)
-        yield from frame_prefetch_bounds(item,self.cfg.fine,vol.input_scale)
+        predictor = frame_predictor(self.cfg)
+        yield from crop_frame_bounds(item,self.cfg.fine,vol,predictor)
         for slab in slab_layout(item):
-            yield from frame_prefetch_bounds(slab,SLAB,vol.input_scale)
+            yield from crop_frame_bounds(slab,SLAB,vol,predictor)
 
     def finalize_frames(self,items,vol):
         for item in items:
             resolve_trace_seed(item,vol)
-            orient_item(item,vol)
+        orient_items(items,vol,frame_predictor(self.cfg))
 
     def images(self,items,vol,pool=None):
         self.finalize_frames(items,vol)
@@ -221,7 +223,7 @@ class IdentityObservationBuilder(ObservationBuilder):
         world geometry is unchanged. Unresolved CT frames keep the roll pending: their
         planned footprint already covers every roll about the heading.
         """
-        if item.get('frame_policy') != FRAME_POLICY or 'roll_augmentation' not in item:
+        if item.get('frame_policy') not in FRAME_POLICIES or 'roll_augmentation' not in item:
             return item
         angle = item.pop('roll_augmentation')
         if angle:
@@ -313,6 +315,7 @@ class IdentityObservationBuilder(ObservationBuilder):
         before footprint checks and read planning.
         """
         cfg,s = self.cfg,self.sampling
+        item['fiber_family'] = fiber.tag
         _,t,reverse = item['fiber_ref']
         p,arc = traversal(fiber,reverse)
         pos,frame = np.asarray(item['pos']),np.asarray(item['frame'])
@@ -452,11 +455,14 @@ class FiberTracer(ModelTracer):
         self.observations = observation_builder(model.cfg)
 
     def build_inputs(self,pos,frames,hist,hmask,paths=None):
-        items = [dict(pos=p,frame=f,hist_local=h,hmask=m,frame_policy=FRAME_POLICY) for p,f,h,m in zip(pos,frames,hist,hmask)]
+        items = [dict(pos=p,frame=f,hist_local=h,hmask=m,frame_policy=getattr(self, 'frame_policy', FRAME_POLICY))
+                 for p,f,h,m in zip(pos,frames,hist,hmask)]
         if paths is not None:
             for item,path in zip(items,paths):
                 item.update({k:path[k] for k in SEED_FIELDS if k in path})
                 item['observed_path'] = path['observed_path']
+                if 'fiber_family' in path:
+                    item['fiber_family'] = path['fiber_family']
         def move(value):
             return {k: move(v) for k, v in value.items()} if isinstance(value, dict) else value.to(self.device)
         return move(self.observations.images(items,self.vol,self.pool))

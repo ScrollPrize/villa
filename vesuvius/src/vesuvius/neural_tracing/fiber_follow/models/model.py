@@ -34,6 +34,8 @@ class CoordinateRegressionConfig:
     recurrent_refinement_steps: int = 3
     stem_channels: int = 32
     stem_blocks: int = 2
+    frame_checkpoint: str | None = None  # frozen heading/normal model used by crop builders
+    frame_checkpoint_sha256: str | None = None
 
     def __post_init__(self):
         if any(type(value) is not int or value < 1 for value in
@@ -550,4 +552,3 @@ class CoordinateRegressionFollower(ObservationFollower):
             query = layer.forward_cached(query, kv, padding,
                 history=ctx['history_projected'], history_attention=self.history_attention)
         return self.decoder.norm(query)
-

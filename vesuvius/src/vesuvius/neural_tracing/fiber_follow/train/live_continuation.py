@@ -173,10 +173,16 @@ class LiveContinuationSource:
             return None
         # The unresolved-frame footprint covers all rolls and the CT tensor.
         dataset.prefetch_items([item], vol, required=True)
-        diagnostics = {}
-        frame = ct_frame(vol, item['pos'], advanced['heading'], state['frame'], diagnostics=diagnostics)
-        reframe_item(item, frame)
-        item.update(frame_policy=FRAME_POLICY, ct_frame_diagnostics=diagnostics)
+        from vesuvius.neural_tracing.fiber_follow.tracing.crop_frames import frame_predictor, orient_items
+        item['fiber_family'] = fiber.tag
+        predictor = frame_predictor(getattr(dataset.batch_builder, 'cfg', None))
+        if predictor is None:
+            diagnostics = {}
+            frame = ct_frame(vol, item['pos'], advanced['heading'], state['frame'], diagnostics=diagnostics)
+            reframe_item(item, frame)
+            item.update(frame_policy=FRAME_POLICY, ct_frame_diagnostics=diagnostics)
+        else:
+            orient_items([item], vol, predictor, previous=[state['frame']])
         if hasattr(dataset.batch_builder, 'apply_roll'):
             dataset.batch_builder.apply_roll(item)
         return item

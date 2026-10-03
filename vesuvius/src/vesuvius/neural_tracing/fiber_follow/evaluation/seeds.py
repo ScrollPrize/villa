@@ -10,6 +10,7 @@ from scipy.spatial import cKDTree
 from vesuvius.neural_tracing.fiber_follow.data.data import DATA_VERSION, TracedFiber
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import interp_at, tangent_at
 from vesuvius.neural_tracing.fiber_follow.tracing.heading import oriented_seed_heading, SeedHeadingError, SEED_HEADING_POLICY
+from vesuvius.neural_tracing.fiber_follow.tracing.crop_frames import trace_family_kwargs
 
 
 def make_seeds(fibers: list[TracedFiber], vol, per_fiber: int = 3,
@@ -165,7 +166,7 @@ def evaluate(tracer, fibers, seeds, batch: int = 256, history_audit=None, on_tra
     rows = []
     for b in range(0, len(seeds), batch):
         chunk = seeds[b:b + batch]
-        kwargs = {}
+        kwargs = trace_family_kwargs(tracer, [s.get('family', fibers[s['fiber']].tag) for s in chunk])
         if history_audit is not None:
             history_audit.start_batch(fibers, chunk)
             kwargs['on_decision'] = history_audit

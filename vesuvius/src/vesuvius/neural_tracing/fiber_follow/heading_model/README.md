@@ -76,6 +76,18 @@ the warmup instead of the default cosine decay to zero. `configs/heading_model_l
 20k steps at a constant 1.5e-4 (the step-60k rate of `heading_model_l0_w16`), starting from the converted
 `best_v2.pt`.
 
+For cosine continuation, `lr_decay_start` sets the absolute step where decay begins (defaults to the end of
+warmup). The frame config now continues from 40k to 70k: `lr: 0.00015`, `lr_schedule: "cosine"`,
+`lr_decay_start: 40000`, `steps: 70000`. Resume with:
+
+```bash
+OMP_NUM_THREADS=1 python heading_model/train.py --config configs/heading_model_l0_w16_centered_frame.json --resume
+```
+
+This restores model and optimizer state from `last.pt`; the first update at 40k uses 0.00015, the rate is
+0.000075 at 55k, and the cosine reaches zero at 70k (the final update at 69,999 uses approximately 4.1e-13).
+Keep the same decay start when resuming after an interruption so the schedule continues without restarting.
+
 The run directory `output/<name>/` holds:
 
 - `config.json`, with the resolved config and provenance;
@@ -128,6 +140,183 @@ headings = predictor.predict(vol, positions, prior_headings, observed_paths, poo
 The follower does not use it yet. To adopt it, call it wherever the tracer builds a crop frame. Training must
 call it in the same place: the simulated traces, synthetic switches and pairs, and live chains. Otherwise the
 follower sees crops oriented differently in training and in tracing.
+
+## H/V-conditioned crop frame
+
+`model.predict_frames: true` (with `predict_normals: true`) adds explicit H/V conditioning and returns a full
+right-handed frame with columns `(u, v, forward)` through `model.forward_outputs(..., family)['frame']`.
+Network family IDs are H=0, V=1; the predictor API accepts H/V strings. Both heads use a learned family
+embedding added to the existing path features. The embedding starts at zero, preserving the source model's
+heading and normal predictions exactly for either family.
+
+For this model, normal labels use the 2/8 CT tensor **projected perpendicular to a smoothed annotated fiber
+tangent**. The tangent is a least-squares line fit to 25 equally spaced samples over ±6 trace voxels around
+the annotation position used for the heading target; the window clips at fiber ends. It uses annotations
+only to construct labels, never as model input. Nearly parallel tensor/tangent pairs are rejected (remaining
+normal length <0.1); other labels are downweighted by the squared remaining normal length. Fiber family comes
+from the annotation's H/V tag. There is no extra CT read or sampling pass.
+
+The forward-looking crop-heading target is retained. Frame construction projects the predicted normal
+perpendicular to the predicted heading and obtains the other transverse axis with a cross product. This
+projection is distinct from the training-label correction against the local fiber tangent. The loss keeps
+heading and corrected-normal supervision and adds `roll_loss_weight: 0.25`: unsigned roll alignment with
+both normals projected around the target heading. Heading error cannot reduce this roll term. Flat CT and
+ill-defined target roll receive zero roll weight. Valid orthonormal frames are returned even for degenerate
+predictions; inference uses the previous frame for sign continuity and a reproducible sign at a seed.
+
+The completed step-20,000 normal model has been converted into
+`output/heading_model_l0_w16_centered_frame/last.pt`, including its AdamW moments and training step. Only
+the new family embedding starts without optimizer history. The new config continues for another 20,000
+steps (40,000 total), using the same source mix, learning rate, batch size and CT sampling. Run:
+
+```bash
+OMP_NUM_THREADS=1 python heading_model/train.py \
+  --config configs/heading_model_l0_w16_centered_frame.json --resume
+```
+
+To convert another completed run, `python scripts/convert_heading_frame.py SOURCE/last.pt NEW_RUN/last.pt`
+creates an exclusive destination and verifies exact heading/normal equality. Best scores start fresh in the
+new run. `best_frame.pt` selects the lowest mean held-out frame rotation error (averaged over source/history
+bins), allowing the equivalent simultaneous sign flip of the two transverse axes. Logs also show isolated
+roll error, corrected-normal error and the existing heading metrics. `last.pt` resumes all heads and optimizer.
+
+```python
+predictor = HeadingPredictor.load('output/heading_model_l0_w16_centered_frame/best_frame.pt', device='cuda')
+frames = predictor.predict_frames(vol, positions, prior_headings, observed_paths,
+                                  families=['H', 'V'], previous=previous_frames)
+```
+
+Each previous frame may be `None` for a seed. This API is ready for integration; the follower's tracing loop
+still uses its existing frame generator. No predicted tangent or annotated fiber information is required at inference.
+
+Verification: the frame, heading, tensor and crop regression suite passes (47 tests), including CPU
+train/save/resume and preservation of AdamW state. Conversion also preserved both predictions bit-for-bit on
+192 cached real CT inputs (64 each from Paris 4, 0175A and 1447, empty seed paths, alternating H/V).
+Five warmed single-thread CPU inference repetitions measured 0.733 ms/sample before and 0.723 after
+(approximately unchanged); this excludes CT sampling and training. Detailed timing is recorded in
+`output/heading_frame_conversion_check.json`. Run the focused tests with:
+
+```bash
+OMP_NUM_THREADS=1 python -m pytest -q tests/test_heading_frames.py tests/test_heading_model.py tests/test_heading_normals.py
+```
+
+## Joint heading and sheet-normal training
+
+`model.predict_normals: true` adds a separate normal head to the shared CT/path encoder (architecture
+`crop_heading_normal_ct_path_v3`). Heading supervision stays unchanged. The extra loss is
+`normal_loss_weight * (1 - dot(predicted_normal, target_normal)^2)`, confidence-weighted by the tensor's
+relative largest eigengap. The default loss weight is 0.25. Flat CT and eigengaps below 0.05 receive zero
+normal weight but still train the heading. Normals are unsigned axes; there is no direct signed-roll target
+or constraint forcing the normal perpendicular to the crop heading.
+
+Labels are generated on demand in loader workers. One oriented CT sample encloses both the original heading
+patch and the normal stencil. For the current level-0 Paris 4 and AFV volumes this is **44x34x34**, with the
+head at depth 16; slicing `[12:44, 1:33, 1:33]` recovers the original **32x32x32** input. The tensor uses a head-centered
+stencil inside that sample. The common grid has spacing 1.25 trace voxels = 2.5 selected-CT voxels. Derivative
+and integration sigmas are **2 and 8 selected-CT voxels** (0.8 and 3.2 grid samples), with context radius at least
+38 CT voxels. This is a tensor on resampled CT, not native CT. No intensity threshold is applied. Prefetch
+bounds include the enlarged sample; CT is read and interpolated once. Z-score normalization happens **after**
+the input is sliced, so enlarging the label context does not change input normalization. Other CT levels use
+the same sigmas in that selected level's voxel units.
+
+Convert a heading-only v2 checkpoint without changing its heading weights:
+
+```bash
+python scripts/convert_heading_normals.py output/heading_model_l0_w16_centered/best.pt \
+  output/heading_model_l0_w16_centered/best_with_normals_v3.pt
+python heading_model/train.py --config configs/heading_model_l0_w16_centered_normals.json
+```
+
+Conversion verifies exact heading-output equality, initializes only the normal branch, and saves the source
+path/step and initialization seed. It refuses to overwrite a checkpoint. The supplied new run uses the
+converted step-4000 best checkpoint, a fresh optimizer, constant learning rate 1.5e-4, batch 128, 16 workers,
+and 20,000 steps. Paris 4 / 0175A / 1447 sampling remains 50% / 25% / 25%.
+
+`best.pt` keeps its original heading-only selection criterion. **`best_normal.pt`** selects the lowest
+held-out confidence-weighted unsigned normal loss, averaged over source/history bins with valid labels.
+`last.pt` resumes both heads and optimizer. Logs include heading loss, normal loss, valid-label fraction,
+and held-out unsigned normal angle p50/p90/p99 per source/history bin. Assess both heading and normal metrics
+when choosing a joint checkpoint.
+
+The default supervision was upgraded from sigmas 1/4 (radius 19) to 2/8 (radius 38). Stop the existing
+process, then use the same config with `--resume`:
+
+```bash
+OMP_NUM_THREADS=1 python heading_model/train.py --config configs/heading_model_l0_w16_centered_normals.json --resume
+```
+
+This known policy transition preserves weights, optimizer, learning-rate schedule position, step and the
+heading-best score from `last.pt`. Training workers and fixed validation labels are rebuilt with 2/8.
+The normal-best score resets because it is measured against different labels. The old `best_normal.pt`
+is retained as `best_normal_sigma1_4_before_step_STEP.pt`; new normal-best selection starts at the next
+validation. The transition is recorded in `log.jsonl`, run config, and subsequent checkpoints. Unrelated
+policy or normal-loss-weight changes still fail resume validation. Later 2/8 resumes retain their normal-best
+score. Resume continues from the last saved checkpoint, not unsaved steps at interruption; `--steps` is the
+total target step count and can be increased if the run has already reached it.
+
+Inference still uses only the original patch and path. `HeadingPredictor.predict_with_normals(...)` returns
+`(world_headings, world_normal_axes)`; `predict(...)` retains the existing heading-only API. No tensor or extra
+context is computed at inference. Adopting predicted normals for the follower's frame remains a separate change.
+
+Verify the sampler and benchmark the cached 64-state-per-source experiment:
+
+```bash
+OMP_NUM_THREADS=1 python -m pytest -q tests/test_heading_normals.py tests/test_heading_model.py tests/test_ct_crops.py
+OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 python evaluation/benchmark_heading_normal_sampling.py
+```
+
+The benchmark requires the artifacts from `evaluation/compare_heading_patch_normals.py`. Add `--fetch` to
+download any missing public CT chunks into that experiment's cache. It checks exact input equality, compares
+normals to the saved native 65-cube reference, and times five repetitions of 64 samples per source on one CPU
+thread after warmup. `output/heading_normal_sampling_benchmark.json` records mean/median/min/max latency.
+These timings exclude heading-target optimization, initial downloads, and GPU training.
+For the original 1/4-sigma policy, on the saved October 2 samples, mean heading-only/shared/two-pass times were 1.61/2.06/3.67 ms per sample
+for Paris 4, 0.91/1.25/2.15 for 0175A, and 0.88/1.22/2.09 for 1447. All 192 heading inputs were bit-identical;
+normal/reference median angles were 7.39, 5.64 and 6.14 degrees respectively. CPU train/save/resume was tested;
+GPU throughput has not been measured for the joint trainer.
+
+For a small model-versus-Lasagna check on the cached Paris 4 and AFV 1447 regions, run:
+
+```bash
+OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 python evaluation/check_heading_normals_lasagna.py \
+  --checkpoints output/heading_model_l0_w16_centered_normals/ckpt_010000.pt \
+                output/heading_model_l0_w16_centered_normals/ckpt_012000.pt \
+  --out output/heading_model_lasagna_step012000
+```
+
+This uses empty path features and noisy H/V seed priors in both directions, with the exact model input sampler.
+It runs on CPU, downloads nothing, and reports any missing cached CT samples. Results include model/Lasagna,
+tensor/Lasagna and model/tensor unsigned angles, per-point arrays and a comparison plot. These cached regions
+are not guaranteed excluded from model training, so this is a diagnostic seed test, not a strict held-out score.
+
+`OMP_NUM_THREADS=1 python evaluation/check_heading_frame_meshes.py` runs a brief Paris 4 check using the
+frame run's `last.pt`: two interior locations each on the low, middle and top meshes in
+`/mnt/raid_nvme/spiral_dataset_working/verified_patches`, H/V CT-initialized seed priors, and no path history.
+It reports raw normal and projected roll errors against local mesh plane fits and saves a step-named JSON report.
+
+To compare how well frames contain annotated future fibers without running the follower:
+
+```bash
+OMP_NUM_THREADS=1 python evaluation/compare_future_crop_frames.py \
+  --checkpoint output/heading_model_l0_w16_centered_frame/ckpt_064000.pt \
+  --out output/future_crop_frames_step064000
+```
+
+This uses 512 deterministic held-out states per source (Paris 4 and both AFVs), the trainer's simulated observed
+paths and seed priors, and cached CT. It compares the 2/8 normal with the existing H/V heading rule, the input
+prior with tensor roll, model heading with tensor roll, and the full model frame. The raw tensor normal is not
+corrected using an annotated tangent. Missing CT cache entries stop evaluation rather than changing the sample.
+The current follower fine crop is scored at 16 and 35 voxels of future annotated arclength, including all points
+outside its axial bounds. The report contains full-containment rates, point coverage, lateral displacement,
+half-width sweeps, source/history/family breakdowns, and saved future geometry and frames. Narrow-width sweeps
+retain the same axial bounds. These are single-state geometry measurements, not rollout results.
+
+`OMP_NUM_THREADS=1 python evaluation/visualize_future_frames.py` reads that report and generates paired real CT
+crops with the same model heading and tensor versus learned roll. It selects median- and maximum-disagreement
+H/V seed states in each source, aligns unsigned normal signs, and uses matching contrast. The gallery in
+`output/future_crop_frames_step064000/visuals/index.html` shows head-centered face-on, side, and end-on planes;
+NPZ files preserve both full crops. The two central lateral samples are averaged to center the displayed planes.
+Gold crosses mark the seed; cyan points show future annotations lying within one CT voxel of the plane.
 
 ## Earlier prototype (Paris 4, one model, `output/trace_sampling_20261002/`)
 

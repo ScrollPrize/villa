@@ -47,8 +47,9 @@ def replay_item(source, row, fibers, sample):
                       t=float(get('t')), reverse=bool(get('reverse')), trace=replay_facts(states, row, sample))
     item.update({key: get(key) for key in SEED_FIELDS})
     item['observed_path'] = prefix
+    item['fiber_family'] = fibers[index].tag
     from vesuvius.neural_tracing.fiber_follow.tracing.heading import FRAME_POLICY
-    item['frame_policy'] = FRAME_POLICY
+    item['frame_policy'] = states.provenance.get('frame_policy', FRAME_POLICY)
     observed_path(item)  # Validate endpoints before reading any volume.
     return item, index, provenance
 

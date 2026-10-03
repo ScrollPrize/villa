@@ -27,6 +27,7 @@ from vesuvius.neural_tracing.fiber_follow.tracing.policy import checkpoint_polic
 from vesuvius.neural_tracing.fiber_follow.tracing.trace import ModelTracer, TraceParams
 from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolume
 from vesuvius.neural_tracing.fiber_follow.tracing.heading import SeedHeadingError, ct_seed_heading, SEED_HEADING_POLICY, TRACE_HEADING_POLICY, FRAME_POLICY
+from vesuvius.neural_tracing.fiber_follow.tracing.crop_frames import trace_family_kwargs
 
 
 def make_fiber_json(points_base_xyz: np.ndarray, cp_every: float, meta: dict) -> dict:
@@ -94,8 +95,9 @@ def trace_bidirectional(tracer: ModelTracer, vol: FiberVolume, seeds_grid_xyz: n
             out[index] = (None, str(error))
     if usable:
         axes = np.stack(axes)
-        fw, rf = tracer.trace(seeds[usable], axes)
-        bw, rb = tracer.trace(seeds[usable], -axes)
+        kwargs = trace_family_kwargs(tracer, [families[i] for i in usable])
+        fw, rf = tracer.trace(seeds[usable], axes, **kwargs)
+        bw, rb = tracer.trace(seeds[usable], -axes, **kwargs)
         for index, f, b, a, c in zip(usable, fw, bw, rf, rb):
             out[index] = (np.concatenate([b[::-1], f[1:]], 0), (c, a))
     return out
@@ -151,8 +153,8 @@ def export_seeds(tracer, vol, seeds, families, out, *, grid_scale, batch, min_le
                                                        fiber_follow={"stop_reasons": reasons,
                                                                      "seed_family": str(chunk_families[index]),
                                                                      "seed_heading_policy": SEED_HEADING_POLICY,
-                                                                     "heading_policy": TRACE_HEADING_POLICY,
-                                                                     "frame_policy": FRAME_POLICY, **provenance}))
+                                                                     "heading_policy": getattr(tracer, 'heading_policy', TRACE_HEADING_POLICY),
+                                                                     "frame_policy": getattr(tracer, 'frame_policy', FRAME_POLICY), **provenance}))
             with open(os.path.join(out, name), "w") as fh:
                 json.dump(obj, fh)
             written.append(name)
@@ -184,10 +186,14 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer):
     ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--out", required=True)
     ap.add_argument("--device", default="cuda")
+    ap.add_argument('--frame-checkpoint', help='Override the learned frame checkpoint recorded by the follower')
     ap.add_argument("--sampling-seed", type=int, default=0, help="Reproducible per-trace sampling noise")
     args = ap.parse_args(argv)
 
     model, crop, n_hist, spec, ck = checkpoint_loader(args.checkpoint, args.device)
+    if args.frame_checkpoint:
+        from vesuvius.neural_tracing.fiber_follow.tracing.crop_frames import bind_frame_checkpoint
+        bind_frame_checkpoint(model.cfg, args.frame_checkpoint)
     confidence, n_commit = args.confidence, args.n_commit
     if args.policy:
         selected = json.load(open(args.policy))['operating_policy']

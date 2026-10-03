@@ -14,7 +14,8 @@ from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, crop_
 from vesuvius.neural_tracing.fiber_follow.tracing.policy import DEFAULT_CONFIDENCE, DEFAULT_N_COMMIT, commit_prefix
 from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolume
 from vesuvius.neural_tracing.fiber_follow.shared.reference import SEED_FIELDS, observed_path
-from vesuvius.neural_tracing.fiber_follow.tracing.heading import trace_heading, TRACE_HEADING_POLICY, FRAME_POLICY, ct_frame
+from vesuvius.neural_tracing.fiber_follow.tracing.heading import trace_heading, TRACE_HEADING_POLICY, FRAME_POLICY, FRAME_POLICIES, ct_frame, fiber_family
+from vesuvius.neural_tracing.fiber_follow.tracing.crop_frames import frame_predictor, configured_frame_policy, predict_frames
 
 if TYPE_CHECKING:
     from vesuvius.neural_tracing.fiber_follow.models.model import ObservationFollower as FollowNet
@@ -109,6 +110,9 @@ class ModelTracer:
                  params: TraceParams | None = None, device: str = "cuda"):
         self.model, self.vol, self.crop = model, vol, crop
         self.n_history, self.p, self.device = n_history, params or TraceParams(), str(device)
+        self.frame_predictor = frame_predictor(model.cfg)
+        self.frame_policy = configured_frame_policy(model.cfg)
+        self.heading_policy = 'learned_heading_v1' if self.frame_predictor is not None else TRACE_HEADING_POLICY
         if self.p.n_commit > model.cfg.n_future:
             raise ValueError(f'n_commit={self.p.n_commit} exceeds the model horizon n_future={model.cfg.n_future}')
         self.grid = torch.from_numpy(crop_local_grid(crop)).float().to(device)
@@ -144,7 +148,7 @@ class ModelTracer:
         raise NotImplementedError('Use the common observation tracer')
 
     @torch.no_grad()
-    def trace(self, seeds_xyz, headings, histories=None, abort=None, on_decision=None, initial_states=None):
+    def trace(self, seeds_xyz, headings, histories=None, abort=None, on_decision=None, initial_states=None, families=None):
         """Greedy rollout, checking supervised confidence before committing.
 
         on_decision(i, state) observes the exact inference input and proposals,
@@ -155,20 +159,26 @@ class ModelTracer:
         was_training = self.model.training
         self.model.eval()
         try:
-            return self._trace(seeds_xyz, headings, histories, abort, on_decision, initial_states)
+            return self._trace(seeds_xyz, headings, histories, abort, on_decision, initial_states, families)
         finally:
             self.model.train(was_training)
 
-    def _trace(self, seeds_xyz, headings, histories, abort, on_decision, initial_states=None):
+    def _trace(self, seeds_xyz, headings, histories, abort, on_decision, initial_states=None, families=None):
         from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength, interp_at
         n = len(seeds_xyz)
+        predictor = getattr(self, 'frame_predictor', None)
+        if families is None and initial_states is not None and predictor is not None:
+            families = [s.get('fiber_family') for s in initial_states]
+        if predictor is not None and (families is None or len(families) != n):
+            raise ValueError('Learned crop frames require one H/V family per trace')
+        families = [fiber_family(f) for f in families] if families is not None else [None]*n
         paths = [[np.asarray(s, np.float64)] for s in seeds_xyz]
         if histories is not None:
             paths = [list(np.asarray(h, np.float64))+[np.asarray(s, np.float64)] for h, s in zip(histories, seeds_xyz)]
         if initial_states is not None:
             if len(initial_states) != n:
                 raise ValueError('One initial observed state is required per seed')
-            if any(s['frame_policy'] != FRAME_POLICY for s in initial_states):
+            if any(s['frame_policy'] not in FRAME_POLICIES for s in initial_states):
                 raise ValueError('Unsupported crop frame policy; recollect replay')
             paths = [list(observed_path(dict(s, pos=p,
                       hist_local=(np.asarray(s['hist'])-p) @ s['frame'])))
@@ -179,9 +189,15 @@ class ModelTracer:
         hist_start = [len(p)-1 for p in paths]
         frame_diagnostics = ([{} for _ in range(n)] if initial_states is None else
                              [dict(s.get('ct_frame_diagnostics', {})) for s in initial_states])
-        frames = (list(self.map(lambda a: ct_frame(self.vol, a[0], a[1], diagnostics=a[2]),
-                                zip(seeds_xyz, headings, frame_diagnostics)))
-                  if initial_states is None else [np.asarray(s['frame']).copy() for s in initial_states])
+        if initial_states is not None:
+            frames = [np.asarray(s['frame']).copy() for s in initial_states]
+        elif predictor is not None:
+            frames = predict_frames(predictor, self.vol, seeds_xyz, headings, [np.asarray(p) for p in paths], families,
+                                    pool=getattr(self, 'pool', None))
+            frame_diagnostics = [dict(source=3, energy=0., gap=0.) for _ in range(n)]
+        else:
+            frames = list(self.map(lambda a: ct_frame(self.vol, a[0], a[1], diagnostics=a[2]),
+                                   zip(seeds_xyz, headings, frame_diagnostics)))
         # Explicit histories supplied for a new trace are trusted. Resumed
         # states carry the exact acceptance boundary saved at their decision.
         heading_start = np.zeros(n, dtype=np.int64)
@@ -221,6 +237,7 @@ class ModelTracer:
             context = {}
             if self.path_context:
                 context['paths'] = [dict(observed_path=np.asarray(paths[i]),
+                                         fiber_family=families[i],
                                          seed_segment=np.asarray(paths[i][hist_start[i]:hist_start[i]+64]),
                                          travelled=float(length[i]),
                                          **{**references[i], 'seed_age': references[i]['seed_age']+float(length[i])}) for i in idx]
@@ -249,8 +266,11 @@ class ModelTracer:
                              recovery_allowed=bool(allowed[j]), recovery_blocked=bool(recovery_blocked),
                              travelled=float(length[i]), last_segment=last_segment[i].copy(),
                              observed_path=np.asarray(paths[i]).copy(),
-                             heading_start=int(heading_start[i]), heading_policy=TRACE_HEADING_POLICY,
-                             frame_policy=FRAME_POLICY, ct_frame_diagnostics=frame_diagnostics[i].copy())
+                             heading_start=int(heading_start[i]),
+                             heading_policy='learned_heading_v1' if predictor is not None else TRACE_HEADING_POLICY,
+                             frame_policy=(initial_states[i]['frame_policy'] if initial_states is not None and length[i] == 0
+                                           else getattr(self, 'frame_policy', FRAME_POLICY)),
+                             fiber_family=families[i], ct_frame_diagnostics=frame_diagnostics[i].copy())
                 state.update({**references[i], 'seed_age': references[i]['seed_age']+float(length[i])})
                 if on_decision is not None and on_decision(int(i), state) is False:
                     active[i], reasons[i] = False, 'oracle'
@@ -276,8 +296,17 @@ class ModelTracer:
                     active[i], reasons[i] = False, 'abort'
                 elif length[i] >= pp.max_len-1e-6:
                     active[i], reasons[i] = False, 'max_len'
-            update = lambda i: ct_frame(self.vol, paths[i][-1], reframe[i], frames[i],
-                                        diagnostics=frame_diagnostics[i])
-            for i, frame in zip(reframe, self.map(update, reframe)):
-                frames[i] = frame
+            if predictor is not None:
+                pending = [i for i in reframe if active[i]]
+                updated = predict_frames(predictor, self.vol, [paths[i][-1] for i in pending],
+                    [reframe[i] for i in pending], [np.asarray(paths[i]) for i in pending],
+                    [families[i] for i in pending], previous=[frames[i] for i in pending], pool=getattr(self, 'pool', None))
+                for i, frame in zip(pending, updated):
+                    frames[i] = frame
+                    frame_diagnostics[i] = dict(source=3, energy=0., gap=0.)
+            else:
+                update = lambda i: ct_frame(self.vol, paths[i][-1], reframe[i], frames[i],
+                                            diagnostics=frame_diagnostics[i])
+                for i, frame in zip(reframe, self.map(update, reframe)):
+                    frames[i] = frame
         return [np.asarray(p[h:]) for p, h in zip(paths, hist_start)], reasons

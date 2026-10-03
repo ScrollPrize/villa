@@ -24,6 +24,8 @@ from vesuvius.neural_tracing.fiber_follow.data.crop_sampling import scalar_crops
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, arclength, frame_from_heading, interp_at
 
 ARCHITECTURE = 'crop_heading_ct_path_v2'
+NORMAL_ARCHITECTURE = 'crop_heading_normal_ct_path_v3'
+FRAME_ARCHITECTURE = 'crop_frame_ct_path_family_v4'
 DOWNSAMPLINGS = 4  # stride-2 encoder layers; patch sizes must be divisible by 2**DOWNSAMPLINGS
 
 
@@ -41,6 +43,8 @@ class HeadingConfig:
     forward: float = field(default_factory=main_crop_forward)  # target span ahead of the head
     # CT pyramid levels above the follower's CT level for the patch (each a 2x block mean); 0 reads the follower's CT.
     ct_downsample_levels: int = 0
+    predict_normals: bool = False
+    predict_frames: bool = False
 
     def __post_init__(self):
         if isinstance(self.patch, dict):
@@ -49,6 +53,8 @@ class HeadingConfig:
             raise ValueError('Heading model width, window and forward span must be positive')
         if not (isinstance(self.ct_downsample_levels, int) and self.ct_downsample_levels >= 0):
             raise ValueError('ct_downsample_levels must be a nonnegative integer')
+        if self.predict_frames and not self.predict_normals:
+            raise ValueError('Frame prediction requires predict_normals')
 
     def to_dict(self):
         return asdict(self)
@@ -60,6 +66,7 @@ class HeadingNet(nn.Module):
     def __init__(self, cfg: HeadingConfig):
         super().__init__()
         self.cfg = cfg
+        self.architecture = FRAME_ARCHITECTURE if cfg.predict_frames else (NORMAL_ARCHITECTURE if cfg.predict_normals else ARCHITECTURE)
         if cfg.patch.depth % 2**DOWNSAMPLINGS or cfg.patch.width % 2**DOWNSAMPLINGS:
             raise ValueError(f'Heading patch depth and width must be divisible by {2**DOWNSAMPLINGS} for a centered encoder grid')
         w = cfg.width
@@ -74,10 +81,29 @@ class HeadingNet(nn.Module):
         self.head = nn.Sequential(nn.Linear(4*w*8+64, 64), nn.SiLU(), nn.Linear(64, 3))
         nn.init.zeros_(self.head[-1].weight)
         nn.init.zeros_(self.head[-1].bias)  # starts as the prior heading
+        if cfg.predict_normals:
+            self.normal_head = nn.Sequential(nn.Linear(4*w*8+64, 64), nn.SiLU(), nn.Linear(64, 3))
+        if cfg.predict_frames:
+            self.family_embedding = nn.Embedding(2, 64)
+            nn.init.zeros_(self.family_embedding.weight)
 
-    def forward(self, patch, path):
-        hidden = torch.cat((self.features(patch), self.path(path)), -1)
-        return nn.functional.normalize(self.head(hidden)+patch.new_tensor([0., 0., 1.]), dim=-1)
+    def forward(self, patch, path, family=None):
+        return self.forward_outputs(patch, path, family)['heading']
+
+    def forward_outputs(self, patch, path, family=None):
+        path_hidden = self.path(path)
+        if self.cfg.predict_frames:
+            if family is None or family.shape != (len(patch),) or family.dtype not in (torch.int32, torch.int64):
+                raise ValueError('Frame model requires a batch of family IDs (H=0, V=1)')
+            path_hidden = path_hidden+self.family_embedding(family)
+        hidden = torch.cat((self.features(patch), path_hidden), -1)
+        out = dict(heading=nn.functional.normalize(self.head(hidden)+patch.new_tensor([0., 0., 1.]), dim=-1))
+        if self.cfg.predict_normals:
+            out['normal'] = nn.functional.normalize(self.normal_head(hidden), dim=-1)
+        if self.cfg.predict_frames:
+            from vesuvius.neural_tracing.fiber_follow.heading_model.frames import orthonormal_frame
+            out['frame'] = orthonormal_frame(out['heading'], out['normal'])
+        return out
 
 
 def prior_frames(priors, rng=None):
@@ -136,29 +162,35 @@ def ct_shift(cfg, vol):
     return (f-1)/(2*f*vol.input_scale)
 
 
-def model_inputs(vol, cfg, positions, frames, paths, pool=None):
+def model_inputs(vol, cfg, positions, frames, paths, pool=None, *, normal_targets=False):
     """CT patches (tracer sampler and normalization) and path features for each head.
 
     ``vol`` is the patch volume: the follower's, or its ``patch_volume_spec`` level for a downsampled patch.
     """
     shift = ct_shift(cfg, vol)
     items = [dict(pos=np.asarray(p, np.float64)-shift, frame=np.asarray(f, np.float64)) for p, f in zip(positions, frames)]
-    patch = scalar_crops(items, vol, cfg.patch, pool)
+    if normal_targets:
+        from vesuvius.neural_tracing.fiber_follow.heading_model.normals import sample_training_crops
+        patch, normals, weights = sample_training_crops(items, vol, cfg, pool)
+    else:
+        patch = scalar_crops(items, vol, cfg.patch, pool)
     path = torch.from_numpy(np.stack([path_features(q, p, f, cfg.window) for q, p, f in zip(paths, positions, frames)]))
-    return patch, path
+    return (patch, path, normals, weights) if normal_targets else (patch, path)
 
 
 def save_heading_model(path, model, **extra):
-    torch.save(dict(architecture=ARCHITECTURE, config=model.cfg.to_dict(), state=model.state_dict(), **extra), path)
+    torch.save(dict(architecture=model.architecture, config=model.cfg.to_dict(), state=model.state_dict(), **extra), path)
 
 
 def load_heading_model(path, device='cpu'):
     checkpoint = torch.load(path, map_location='cpu', weights_only=False)
     if checkpoint.get('architecture') == 'crop_heading_ct_path_v1':
         raise ValueError(f'{path} uses the v1 (off-center) encoder; convert it with scripts/convert_heading_v1.py')
-    if checkpoint.get('architecture') != ARCHITECTURE:
+    if checkpoint.get('architecture') not in (ARCHITECTURE, NORMAL_ARCHITECTURE, FRAME_ARCHITECTURE):
         raise ValueError(f'Not a {ARCHITECTURE} checkpoint: {path}')
     model = HeadingNet(HeadingConfig(**checkpoint['config']))
+    if model.architecture != checkpoint['architecture']:
+        raise ValueError('Heading architecture and config disagree')
     model.load_state_dict(checkpoint['state'])
     return model.to(device).eval(), checkpoint
 
@@ -185,12 +217,52 @@ class HeadingPredictor:
         return self._volumes[key]
 
     @torch.no_grad()
-    def predict(self, vol, positions, priors, paths, pool=None):
+    def predict(self, vol, positions, priors, paths, pool=None, *, families=None):
         """World headings, each signed along its prior. ``vol`` is the tracer's (follower CT) volume."""
         if not len(positions):
             return []
         frames = prior_frames(priors)
         patch, path = model_inputs(self.patch_volume(vol), self.model.cfg, positions, frames, paths, pool)
-        local = self.model(patch.to(self.device), path.to(self.device)).double().cpu().numpy()
+        local = self.model(patch.to(self.device), path.to(self.device), self._families(families)).double().cpu().numpy()
         headings = [f @ d for f, d in zip(frames, local)]
         return [h if h @ np.asarray(p) >= 0 else -h for h, p in zip(headings, priors)]
+
+    @torch.no_grad()
+    def predict_with_normals(self, vol, positions, priors, paths, pool=None, *, families=None):
+        """World headings and unsigned world sheet-normal axes, using only the inference patch."""
+        if not self.model.cfg.predict_normals:
+            raise ValueError('This checkpoint has no normal head')
+        if not len(positions):
+            return [], []
+        frames = prior_frames(priors)
+        patch, path = model_inputs(self.patch_volume(vol), self.model.cfg, positions, frames, paths, pool)
+        out = self.model.forward_outputs(patch.to(self.device), path.to(self.device), self._families(families))
+        heads, normals = (out[k].double().cpu().numpy() for k in ('heading', 'normal'))
+        heads = [f @ h for f, h in zip(frames, heads)]
+        return ([h if h @ np.asarray(p) >= 0 else -h for h, p in zip(heads, priors)],
+                [f @ n for f, n in zip(frames, normals)])
+
+    def _families(self, families):
+        from vesuvius.neural_tracing.fiber_follow.heading_model.frames import family_ids
+        if not self.model.cfg.predict_frames:
+            return None
+        if families is None:
+            raise ValueError('Supply H/V families for the frame model')
+        return family_ids(families, self.device)
+
+    @torch.no_grad()
+    def predict_frames(self, vol, positions, priors, paths, families, previous=None, pool=None):
+        """World crop frames (u,v,forward); H/V supplied explicitly, optional previous frames prevent roll flips."""
+        from vesuvius.neural_tracing.fiber_follow.heading_model.frames import orthonormal_frame
+        if not self.model.cfg.predict_frames:
+            raise ValueError('This checkpoint is not a family-conditioned frame model')
+        if not len(positions):
+            return []
+        if previous is not None and len(previous) != len(positions):
+            raise ValueError('Previous frames must match the position count')
+        heads, normals = self.predict_with_normals(vol, positions, priors, paths, pool, families=families)
+        anchors = np.stack([np.zeros(3) if f is None else np.asarray(f)[:, 0]
+                            for f in (previous if previous is not None else [None]*len(heads))])
+        frames = orthonormal_frame(torch.from_numpy(np.stack(heads)), torch.from_numpy(np.stack(normals)),
+                                   torch.from_numpy(anchors))
+        return list(frames.numpy())

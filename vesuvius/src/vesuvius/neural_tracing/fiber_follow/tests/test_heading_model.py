@@ -123,6 +123,28 @@ def test_cone_tilts_within_cap():
     assert max(tilts) <= 75+1e-6 and 10 < np.median(tilts) < 25
 
 
+def test_cosine_continuation_keeps_fixed_start_across_resumes(tmp_path):
+    path = tmp_path/'heading.json'
+    path.write_text(json.dumps(dict(dataset_config='data.json', lr=1.5e-4, warmup=0,
+                                    steps=70000, lr_schedule='cosine', lr_decay_start=40000)))
+    config = read_config(path)
+    assert learning_rate(39999, config) == pytest.approx(1.5e-4)
+    assert learning_rate(40000, config) == pytest.approx(1.5e-4)
+    assert learning_rate(55000, config) == pytest.approx(7.5e-5)
+    assert learning_rate(70000, config) == 0.
+    assert learning_rate(70001, config) == 0.
+    rates = [learning_rate(s, config) for s in range(40000, 70001)]
+    assert np.all(np.diff(rates) <= 0)
+    resumed = read_config(path)
+    assert learning_rate(55000, resumed) == learning_rate(55000, config)
+    assert learning_rate(69999, resumed) < 1e-12
+    for start in (-1, 70000, 70001, 40000.5, True):
+        with pytest.raises(ValueError, match='lr_decay_start'):
+            read_config(path, dict(lr_decay_start=start))
+    with pytest.raises(ValueError, match='lr_decay_start'):
+        read_config(path, dict(warmup=50000))
+
+
 def test_heading_batches_flow_through_the_follower_loader_pipeline(tmp_path):
     from vesuvius.neural_tracing.fiber_follow.heading_model.data import Source, mixed_heading_states
     vol = volume(tmp_path)
