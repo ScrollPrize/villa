@@ -115,13 +115,18 @@ def apply_finalization(logits_np, num_classes, config: FinalizeConfig):
     if mode == "binary":
         output_np = np.clip(output_np * 255.0, 0, 255).astype(np.uint8)
     else:
-        # Scale to uint8 range [0, 255]
-        min_val = output_np.min()
-        max_val = output_np.max()
-        if min_val < max_val:
-            output_np = ((output_np - min_val) / (max_val - min_val) * 255).astype(np.uint8)
+        # Multiclass output is [softmax_c0..softmax_cN, argmax]: probabilities in [0, 1]
+        # concatenated with class indices in [0, C-1]. Rescaling the two together by this
+        # chunk's own min and max makes the factor depend on which classes happen to appear
+        # in it, so neither part survives and no two chunks share a scale. Each part gets a
+        # fixed factor instead, which is what the documented layout requires.
+        if output_np.shape[0] > 1:
+            probs = np.clip(output_np[:-1] * 255.0, 0, 255)
+            labels = np.clip(output_np[-1:], 0, 255)
+            output_np = np.concatenate([probs, labels], axis=0).astype(np.uint8)
         else:
-            return None, True
+            # argmax only (multiclass with --threshold): the class index is the value.
+            output_np = np.clip(output_np, 0, 255).astype(np.uint8)
 
         # Final check: if the processed data is homogeneous, don't write it
         first_processed_value = output_np.flat[0]
