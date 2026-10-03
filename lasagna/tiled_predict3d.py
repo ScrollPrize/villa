@@ -2936,6 +2936,25 @@ def _copy_tensor_to_shared_array(destination: np.ndarray, source: torch.Tensor) 
 	target.copy_(source)
 
 
+def _resident_tile_inference(model_adapter, model, tile, device):
+	"""Keep resident training state; reduce only the inference batch on OOM."""
+	try:
+		return model_adapter.run_tile_inference(model, tile, device=device)
+	except torch.cuda.OutOfMemoryError:
+		if tile.shape[0] == 1:
+			raise RuntimeError("resident trace cannot fit one inference tile alongside training state "
+				"in the current VRAM grant") from None
+	# Outside the exception handler so failed-forward activations are released.
+	if device.type == "cuda":
+		torch.cuda.empty_cache()
+	middle = tile.shape[0] // 2
+	print(f"[predict3d] resident trace VRAM: splitting inference batch {tile.shape[0]}", flush=True)
+	left = _resident_tile_inference(model_adapter, model, tile[:middle], device)
+	right = _resident_tile_inference(model_adapter, model, tile[middle:], device)
+	from torch.utils._pytree import tree_map
+	return tree_map(lambda a, b: torch.cat((a, b), dim=0), left, right)
+
+
 def _multi_gpu_worker_main(
 	worker_index: int,
 	device_text: str,
@@ -2952,18 +2971,22 @@ def _multi_gpu_worker_main(
 	profile_pipeline: bool = False,
 	max_batch_size: int = 1,
 	report_batches: bool = False,
+	resident_model: torch.nn.Module | None = None,
 ) -> None:
 	"""Shared worker for serial-tile and dynamic-batch descriptor schedulers."""
 	if type(max_batch_size) is not int or max_batch_size < 1:
 		raise ValueError("max_batch_size must be a positive integer")
-	_native_limits = _limit_native_worker_threads()
+	_native_limits = _limit_native_worker_threads() if resident_model is None else None
+	previous_modes = [(module, module.training) for module in resident_model.modules()] if resident_model is not None else []
 	device = torch.device(device_text)
 	if device.type == "cuda":
 		torch.cuda.set_device(device)
 	inputs = [_attach_slot(spec) for spec in input_specs]
 	results = [_attach_slot(spec) for spec in result_specs]
 	try:
-		model = model_adapter.load_model(device=device)
+		model = model_adapter.load_model(device=device) if resident_model is None else resident_model
+		if resident_model is not None and model_state is not None:
+			raise ValueError("resident inference must not replace training weights")
 		if model_state is not None:
 			prepare_state_load = getattr(model_adapter, "prepare_model_for_state_load", None)
 			if prepare_state_load is not None:
@@ -3061,7 +3084,8 @@ def _multi_gpu_worker_main(
 						cuda_events["model_inference"][0].record()
 				stage_started = time.perf_counter()
 				with torch.inference_mode():
-					raw_output = model_adapter.run_tile_inference(model, tile, device=device)
+					raw_output = (model_adapter.run_tile_inference(model, tile, device=device)
+						if resident_model is None else _resident_tile_inference(model_adapter, model, tile, device))
 				if profile is not None:
 					profile["model_inference_submit_wall_s"] = time.perf_counter() - stage_started
 					if cuda_events:
@@ -3136,6 +3160,8 @@ def _multi_gpu_worker_main(
 				result_queue.put(("error", seq, coord, worker_index, type(exc).__name__, str(exc)))
 				break
 	finally:
+		for module, training in previous_modes:
+			module.training = training
 		for shm in inputs + results:
 			shm.close()
 

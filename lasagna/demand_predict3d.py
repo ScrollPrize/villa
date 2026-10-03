@@ -648,6 +648,12 @@ def _gated_demand_worker(gate, arguments, vram_budget):
     tiled._multi_gpu_worker_main(*arguments)
 
 
+def _owned_accumulate_worker(*arguments):
+    if hasattr(os, "setsid"):
+        os.setsid()
+    tiled._accumulate_process_main(*arguments)
+
+
 class _SpillArenaBroker:
     """Own fixed preallocated spill segments and recycle slots globally.
 
@@ -786,7 +792,7 @@ class DemandWorkerPool:
     def __init__(self, stores, readers, devices, *, slots_per_gpu=2, input_workers=8, input_slots=None,
                  result_slots=None, accumulator_workers=None, flush_workers=4, profile_pipeline=False,
                  max_batch_size=1, deferred_gpu=False, accumulator_hot_slots=None,
-                 accumulator_spill_segment_slots=256):
+                 accumulator_spill_segment_slots=256, worker_factory=None, on_process_start=None):
         if type(max_batch_size) is not int or max_batch_size < 1:
             raise ValueError("max_batch_size must be a positive integer")
         if not stores or not devices or slots_per_gpu < 1 or input_workers < 1:
@@ -863,6 +869,8 @@ class DemandWorkerPool:
         self.gpu_gate = None
         self._gpu_stopping = None
         self._closed = False
+        self.external_workers = None
+        self.worker_factory = worker_factory
         self.last_gpu_activity = time.monotonic()
         self.stage_samples = [] if profile_pipeline else None
         self.input_workers = int(input_workers)
@@ -928,7 +936,8 @@ class DemandWorkerPool:
             for i in range(accumulator_workers):
                 work = context.Queue(maxsize=32)
                 self.accumulator_queues.append(work)
-                process = context.Process(target=tiled._accumulate_process_main,
+                process = context.Process(target=(tiled._accumulate_process_main if on_process_start is None
+                                                   else _owned_accumulate_worker),
                     args=(i, work, self.accumulator_events, self.record_spec, hot_counts[i],
                           int(accumulator_spill_segment_slots), str(first.root / ".accumulator_arena"),
                           self.spill_broker.requests, self.spill_broker.responses[i],
@@ -936,6 +945,8 @@ class DemandWorkerPool:
                     name=f"demand-accumulate-{i}")
                 process.start()
                 self.accumulator_processes.append(process)
+                if on_process_start is not None:
+                    on_process_start([process.pid])
             attached = set()
             deadline = time.monotonic() + 60
             while len(attached) < accumulator_workers:
@@ -971,6 +982,10 @@ class DemandWorkerPool:
             raise
 
     def start_gpu(self, devices, *, vram_budget=None):
+        if self.worker_factory is not None:
+            self.external_worker_count = len(devices)
+            self.external_workers = self.worker_factory(self.gpu_arguments, len(devices))
+            return
         if self.processes or self.active or self.input_owners:
             raise RuntimeError("GPU restart before submitted tiles drained")
         context = mp.get_context("spawn")
@@ -989,7 +1004,8 @@ class DemandWorkerPool:
             raise
 
     def authorize_gpu(self):
-        self.gpu_gate.set()
+        if self.gpu_gate is not None:
+            self.gpu_gate.set()
         self.gpu_authorized = True
 
     def stop_gpu(self):
@@ -1178,6 +1194,8 @@ class DemandWorkerPool:
         return min(choices, default=None)
 
     def pump(self):
+        if self.external_workers is not None:
+            self.external_workers.check()
         for process in ([] if self._gpu_stopping is not None else self.processes) + self.accumulator_processes:
             if process.exitcode is not None:
                 raise RuntimeError(f"inference/accumulator worker {process.name} exited unexpectedly: {process.exitcode}")
@@ -1191,7 +1209,9 @@ class DemandWorkerPool:
         # Refill at least two dynamic batches per GPU in one coordinator pass.
         # The old fixed 16/8 limits were adequate for batch-1 but visibly
         # starved eight batch-4 workers after a completion wave.
-        pump_budget = _pump_refill_budget(len(self.processes), self.stats["max_batch_size"])
+        pump_budget = _pump_refill_budget(
+            self.external_worker_count if self.external_workers is not None else len(self.processes),
+            self.stats["max_batch_size"])
         admitted = 0
         # Keep the executor's admitted window at most reader-sized. The deeper
         # priority queue stays in stores, where new foreground demands can
@@ -1308,6 +1328,13 @@ class DemandWorkerPool:
     def close(self):
         if self._closed:
             return
+        external_error = None
+        if self.external_workers is not None:
+            try:
+                self.external_workers.close()
+            except Exception as error:
+                external_error = error
+            self.external_workers = None
         # Cancel work on failure/exit; never block on a full data queue to send
         # a shutdown sentinel. No raw output from a terminated worker is ready.
         for process in self.processes + self.accumulator_processes:
@@ -1341,6 +1368,8 @@ class DemandWorkerPool:
             channel.cancel_join_thread()
             channel.close()
         self._closed = True
+        if external_error is not None:
+            raise external_error
 
     def __enter__(self):
         return self
