@@ -182,6 +182,28 @@ class TrackOmeZarrIntegrationTests(unittest.TestCase):
                 zarr.open_group(pipelined_path, mode='r')['0'][:],
             )
 
+    def test_unitless_scale_is_reported_when_no_voxel_size_is_available(self):
+        """A physical scale that had to be assumed must be visible, not silent."""
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary = Path(temporary)
+            database_path = temporary / 'tracks.dbm'
+            output_path = temporary / 'unitless.ome.zarr'
+            with dbm.open(str(database_path), 'c') as database:
+                database[b'a'] = pickle.dumps([
+                    np.asarray([[1, 1, 1], [1, 1, 8]], dtype=np.int32),
+                ])
+
+            result = CliRunner().invoke(main, [
+                str(database_path), '--shape', '16,16,16', '--chunk', '16',
+                '--out', str(output_path), '--workers', '1',
+            ])
+            if result.exception:
+                raise result.exception
+
+            # The warning names the option to pass; the written value is unchanged.
+            self.assertIn('no --voxel-size', result.output)
+
+
 
 if __name__ == '__main__':
     unittest.main()
