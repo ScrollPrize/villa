@@ -48,3 +48,31 @@
   `test_legacy_stale_scratch_is_cleaned_on_resume` expects unknown files inside
   abandoned sessions retained although current cleanup deletes the session.
   Those unrelated behaviors were not changed as part of this task.
+
+## Production resume (2026-10-03)
+
+- User requested actual resume and production verification. Approved experiment
+  runner resumed sideband1 `20261002_195727/current.pt` at step 51300, GPUs 0–5,
+  new run `20261003_221129`. Regular tests completed in 53.95s; resident tracing
+  reached 1942 tiles/1624 published chunks (~306s), then the supervisor's >20s
+  stale driver-memory check aborted. No training continuation claimed.
+- Found/proved a driver monitor read/exit race: final stdout arriving after
+  nonblocking EAGAIN and before child exit observation was discarded. Regression
+  failed before fix. Drain after observed exit (bounded 1MiB); consume completed
+  queries even after delayed polling; retain diagnostic error/ages. Preserve
+  budgets/protocol/fail-closed behavior. Production attribution not proven from
+  the old nondiagnostic error. Independent review approved this narrow followup.
+- Failed root is dead and GPU0–5 driver memory is clear. Approved production-stop
+  checked cleanup; GPU6–7 remain untouched.
+- Followup tests: manager suite 148 passed (56.81s). Driver regression + resident
+  API rerun: 2 passed + 45 passed/3 skipped (47.23s), results
+  `/ephemeral/hendrik/fiber3d_train2/cooperative-tests/20261003_222518_162005/`.
+  Updated the mocked monitor fields for the new stale-query diagnostics.
+- Production retry via `run_fiber3d_experiment production-start --resume
+  /ephemeral/hendrik/fiber3d_train2/runs/5scroll_json_eligible_fullres_refinement_gaussian_halfsigma_sideband1_reviewed32_128_sd1_16x8_ema_20261002_195727/snapshots/current.pt`:
+  new run `20261003_222625`, launch `20261003_222618`, root 3900191.
+  Regular test 41.368s; resident trace completed all 32 pieces/64 directions
+  in 273.920s (11 forward + 14 reverse restarts = 25, combined implied mean
+  21.9530mm). Same generation/cohort continued through training updates
+  51301, 51302, 51303. Training remains active on manager-granted GPUs 0–5.
+  No claim of trace speedup/comparative accuracy from this one resume check.

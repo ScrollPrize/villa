@@ -336,7 +336,10 @@ class FiberCohort:
             return
         monitor.poll(self._gpu_pids)
         if time.monotonic() - (monitor.last_snapshot_at or self._authorized_at) > 20:
-            raise RuntimeError("cannot verify task VRAM usage from the driver")
+            raise RuntimeError(f"cannot verify task VRAM usage from the driver: {monitor.last_error}; "
+                               f"snapshot_age={time.monotonic() - (monitor.last_snapshot_at or self._authorized_at):.1f}s "
+                               f"query_age={time.monotonic() - monitor.started:.1f}s "
+                               f"poll_gap={monitor.poll_gap:.1f}s")
         if monitor.last_snapshot is None:
             return
         for gpu, budget in self.grant["gpus"].items():

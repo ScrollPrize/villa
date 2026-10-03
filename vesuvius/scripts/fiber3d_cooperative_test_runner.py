@@ -84,6 +84,7 @@ SUITES = {
     "unified-managed": ["tests/neural_tracing/test_cooperative_integration.py", "tests/neural_tracing/test_startup_calibration.py", "tests/neural_tracing/test_cooperative_setup.py", "tests/neural_tracing/test_sample_broker.py", "../gpu_manager/tests/test_supervisor.py"],
     "cpu": CPU_TESTS,
     "manager": ["../gpu_manager/tests"],
+    "driver-monitor": ["../gpu_manager/tests/test_driver_monitor.py"],
     "reference-unit": ["tests/neural_tracing/test_cooperative_reference.py"],
     "cuda-amp": ["tests/neural_tracing/test_gradient_accumulation.py", "-k", "cuda_amp"],
     "cuda-cohort": ["tests/neural_tracing/test_cooperative_integration.py", "-k", "different_rank_count and cuda"],

@@ -457,6 +457,7 @@ def test_driver_memory_checks_only_owned_processes_and_fails_closed():
     cohort._gpu_pids = {123}
     cohort._authorized_at = time.monotonic()
     monitor = SimpleNamespace(poll=lambda pids: None, last_snapshot_at=time.monotonic(),
+        last_error='test query failure', started=time.monotonic(), poll_gap=0.1,
         last_snapshot={"GPU-fake": {"processes": {123: 100, 456: 900}}})
     cohort._memory_monitor = monitor
     cohort._check_driver_memory()

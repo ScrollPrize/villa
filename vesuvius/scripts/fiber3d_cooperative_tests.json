@@ -1,5 +1,5 @@
 {
-  "suites": ["resident-api", "resident-native", "cuda-resident-state", "cuda-resident-trace"],
+  "suites": ["driver-monitor", "resident-api"],
   "native_build": false,
   "gpu_devices": ["0", "1"],
   "timeout_seconds": 300,

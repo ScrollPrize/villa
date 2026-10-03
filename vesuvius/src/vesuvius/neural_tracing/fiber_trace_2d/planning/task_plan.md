@@ -36,3 +36,12 @@ and pause/retry behavior in cooperative_validation.md.
 ## Changelog
 
 Record resident-model trace evaluation and validation results.
+
+## Production resume verification
+
+Resume the stopped sideband1 run from current step 51300 on GPUs 0–5 and
+verify a real trace test followed by optimizer updates. First production attempt
+failed on stale driver-memory monitoring. Inspect and regression-test the
+nonblocking query read/exit race; drain stdout after observed exit before XML
+parsing and preserve query errors for diagnosis. Keep VRAM limits/timeouts and
+protocol unchanged. Use the approved runner for tests and production restart.
