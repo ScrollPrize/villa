@@ -66,9 +66,12 @@ OUTPUT_LOCAL="/content/predictions/$OUTPUT_NAME.tif"
 OUTPUT_REMOTE="$OUTPUT_DIR_REMOTE/$OUTPUT_NAME.tif"
 LOG_REMOTE="$OUTPUT_DIR_REMOTE/$OUTPUT_NAME.log"
 STATUS_REMOTE="$OUTPUT_DIR_REMOTE/$OUTPUT_NAME.status"
+PROGRESS_REMOTE="$OUTPUT_DIR_REMOTE/$OUTPUT_NAME.progress"
+LOG_LOCAL="/content/predictions/$OUTPUT_NAME.log"
 # The same Drive paths, as seen through the local rclone remote ("gdrive:"
 # is the remote name colab_bootstrap.sh mounts at /content/drive).
 STATUS_RCLONE="gdrive:${STATUS_REMOTE#/content/drive/}"
+PROGRESS_RCLONE="gdrive:${PROGRESS_REMOTE#/content/drive/}"
 
 log "input:      $INPUT_ZARR"
 log "checkpoint: $CHECKPOINT_REMOTE"
@@ -84,33 +87,70 @@ log "launching inference in the background"
 # status file is written last, so its presence means the TIFF is complete.
 # --no-sync for the same reason as colab_train.sh: a plain `uv run` would try
 # to rebuild volume-cartographer instead of using the installed wheel.
+#
+# The log also goes to local disk: the Drive mount only uploads a file once
+# it's closed, so a log written straight to Drive stays invisible (and is
+# lost) if the session dies mid-run — observed on the first T4 attempt, which
+# died ~5-25 min in with nothing on Drive to show for it. Instead a heartbeat
+# loop rewrites a small, closed <name>.progress file on Drive every minute
+# (log tail + RAM + GPU), so there's always a recent snapshot to diagnose a
+# dead session from; the full log is copied over at the end either way.
 remote_bash "
 export PATH=\"\$HOME/.local/bin:\$PATH\"
 mkdir -p /content/predictions '$OUTPUT_DIR_REMOTE'
 rm -f '$STATUS_REMOTE'
 cd \$HOME/villa/vesuvius
 nohup bash -c '
-uv run --no-sync --extra models python -m vesuvius.ink_detection.inference.infer \
+PYTHONUNBUFFERED=1 uv run --no-sync --extra models python -m vesuvius.ink_detection.inference.infer \
     \"$INPUT_ZARR\" \"$CHECKPOINT_REMOTE\" \"$OUTPUT_LOCAL\" $INFER_ARGS \
   && cp \"$OUTPUT_LOCAL\" \"$OUTPUT_REMOTE\" \
-  && echo ok > \"$STATUS_REMOTE\" \
-  || echo \"failed (exit \$?)\" > \"$STATUS_REMOTE\"
-' > '$LOG_REMOTE' 2>&1 &
-echo \"launched inference, pid \$!\"
+  && status=ok || status=\"failed (exit \$?)\"
+cp \"$LOG_LOCAL\" \"$LOG_REMOTE\"
+echo \"\$status\" > \"$STATUS_REMOTE\"
+' > '$LOG_LOCAL' 2>&1 &
+pid=\$!
 disown
+nohup bash -c \"
+while kill -0 \$pid 2>/dev/null; do
+  { date -u; free -m; nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total --format=csv,noheader;
+    echo ---; tail -c 4000 '$LOG_LOCAL' | tr '\\\\r' '\\\\n' | grep -v '^[[:space:]]*\\\$' | tail -20; } > /tmp/infer.progress 2>&1
+  cp /tmp/infer.progress '$PROGRESS_REMOTE'
+  sleep 60
+done
+\" > /dev/null 2>&1 &
+disown
+echo \"launched inference, pid \$pid\"
 " 120
 
-log "inference launched. Log: $LOG_REMOTE"
+log "inference launched. Progress snapshot (every 60s): $PROGRESS_REMOTE"
 if [[ "$WAIT" != "1" ]]; then
     log "not waiting (WAIT=$WAIT). Done when $STATUS_REMOTE exists; stop the session afterwards with: colab stop -s $SESSION"
     exit 0
 fi
 
+# Completion is a file on Drive, but a dead session never writes one, so also
+# watch for the session disappearing. `colab status` is not trusted on a
+# single reading (see colab_resume_watchdog.sh), only after several
+# consecutive polls in a row without the session listed.
 log "waiting for $STATUS_RCLONE (polling every ${POLL_SECONDS}s)"
 STATUS=""
+MISSING=0
 while [[ -z "$STATUS" ]]; do
     sleep "$POLL_SECONDS"
     STATUS="$(rclone cat --config "$RCLONE_CONF_LOCAL" "$STATUS_RCLONE" 2>/dev/null || true)"
+    [[ -n "$STATUS" ]] && break
+    if colab status 2>/dev/null | grep -q "^\[$SESSION\]"; then
+        MISSING=0
+    else
+        MISSING=$((MISSING + 1))
+        log "session $SESSION not listed by colab status ($MISSING/3)"
+        if (( MISSING >= 3 )); then
+            log "session $SESSION is gone and no status file was written — inference died with it."
+            log "last progress snapshot ($PROGRESS_RCLONE):"
+            rclone cat --config "$RCLONE_CONF_LOCAL" "$PROGRESS_RCLONE" 2>/dev/null || echo "(none)"
+            exit 1
+        fi
+    fi
 done
 log "inference finished: $STATUS"
 
