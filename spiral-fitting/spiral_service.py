@@ -139,7 +139,7 @@ _SAFE_SESSION_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 # Base input paths are owned by the service (every launch carries --dataset);
 # a load request may only choose among service-advertised values for these
 # keys.
-_DATASET_CLIENT_SELECTABLE = ("checkpoint", "tracks_dbm")
+_DATASET_CLIENT_SELECTABLE = ("checkpoint", "tracks_dbm", "automated_fiber_volume")
 
 
 def parse_gpu_ids(value):
@@ -937,6 +937,7 @@ class ServiceState:
         selected_paths = {
             "verified_patches": "verified_patches",
             "fibers": "fibers",
+            "automated_fiber_volume": "fibers",
             "outer_shell": "outer_shell",
             "tracks_dbm": "tracks_dbm",
             "normal_x": "normals",
@@ -966,6 +967,21 @@ class ServiceState:
                                "tracks_dbm must be one of the service-advertised candidates",
                                [{"field": "tracks_dbm", "message": "Not a service-advertised candidate"}])
             paths["tracks_dbm"] = str(Path(tracks).resolve(strict=False))
+
+        afv = str(requested_paths.get("automated_fiber_volume") or "").strip()
+        if afv and input_source_enabled(config, "fibers"):
+            candidate = Path(afv).resolve()
+            uploaded_root = (self._output_root() / "uploaded-fiber-volumes").resolve()
+            if (candidate.parent == uploaded_root and candidate.is_file()
+                    and re.fullmatch(r"[0-9a-f]{64}\.afv", candidate.name)):
+                from afv_input import validate_afv_container
+                try:
+                    validate_afv_container(candidate)
+                except Exception as exc:
+                    raise ApiError(400, f"Invalid Automated Fiber Volume: {exc}") from exc
+                paths["automated_fiber_volume"] = str(candidate)
+            else:
+                raise ApiError(400, "Automated Fiber Volume must be an uploaded .afv file")
 
         resolved_request = {**request, "paths": paths}
         if include_input_config:
@@ -2415,7 +2431,7 @@ class ServiceState:
             output_root=self._output_root,
             session_id=lambda: self.session_id,
             active_checkpoint=self._active_checkpoint,
-            allowed_kinds=("checkpoint",))
+            allowed_kinds=("checkpoint", "afv"))
 
     @staticmethod
     def _file_sha256(path):
@@ -2446,7 +2462,7 @@ class ServiceState:
             return self.session_paths.checkpoint if self.session_paths else ""
 
     def begin_upload(self, request):
-        manager = (self.checkpoint_uploads if request.get("kind") == "checkpoint"
+        manager = (self.checkpoint_uploads if request.get("kind") in ("checkpoint", "afv")
                    else self.editing().uploads)
         return {**self._base(), **manager.begin(request)}
 

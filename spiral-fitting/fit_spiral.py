@@ -1396,6 +1396,9 @@ class FitContext:
         self.fibers_path = (
             (paths.fibers or None)
             if input_source_enabled(config, 'fibers') else None)
+        self.automated_fiber_volume_path = (
+            (paths.automated_fiber_volume or None)
+            if input_source_enabled(config, "fibers") else None)
         self.fiber_directions_path = (
             (paths.fiber_directions or None)
             if input_source_enabled(config, 'fiber_directions') else None)
@@ -2127,8 +2130,11 @@ class FitContext:
         fiber_point_collections, next_id = load_fiber_point_collections(
             self.fibers_path,
             next_id,
+            automated_fiber_volume=getattr(self, "automated_fiber_volume_path", None),
             min_point_spacing=self.config['pcl_fiber_min_point_spacing'],
             base_shape_zyx=getattr(self, 'base_shape_zyx', None),
+            z_range=(self.z_begin - self.config['patch_loss_z_margin'],
+                     self.z_end + self.config['patch_loss_z_margin']),
         )
         # All fibers (horizontal, vertical, and merged link components) form one
         # sampling group, rather than one group per source file like the regular pcls.
@@ -2140,7 +2146,7 @@ class FitContext:
                 with open(source, 'rb') as stream:
                     revision = hashlib.sha256(stream.read()).hexdigest()
             except OSError:
-                revision = None
+                revision = pcl.get('metadata', {}).get('afv_revision')
             pcl.setdefault('metadata', {}).update({
                 'logical_input_kind': 'fiber',
                 'logical_input_id': logical_id,

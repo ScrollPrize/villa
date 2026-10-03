@@ -37,6 +37,7 @@ def test_disabled_sources_are_removed_before_any_loader_can_see_them():
         umbilicus="/inputs/umbilicus.json",
         verified_patches="/inputs/verified",
         fibers="/inputs/fibers",
+        automated_fiber_volume="/inputs/volume.afv",
         tracks_dbm="/inputs/tracks.dbm",
         normal_x="/inputs/nx.zarr",
         normal_y="/inputs/ny.zarr",
@@ -55,6 +56,7 @@ def test_disabled_sources_are_removed_before_any_loader_can_see_them():
 
     assert context.verified_patches_path is None
     assert context.fibers_path is None
+    assert context.automated_fiber_volume_path is None
     assert context.tracks_dbm_path is None
     assert context.normal_nx_zarr_path is None
     assert context.normal_ny_zarr_path is None
@@ -139,3 +141,10 @@ def test_disabling_normals_skips_the_normal_loss_graph(monkeypatch):
         cfg=Config().as_dict(), z_begin=1, z_end=3))
 
     assert [name for name, _ in values] == ['dense_spacing']
+
+
+def test_native_and_automated_fiber_paths_coexist_in_fit_context():
+    paths = SpiralInputPaths(fibers="/inputs/fibers", automated_fiber_volume="/inputs/volume.afv")
+    context = make_context(Config({"input_use_fibers": True}).as_dict(), paths)
+    assert context.fibers_path == "/inputs/fibers"
+    assert context.automated_fiber_volume_path == "/inputs/volume.afv"

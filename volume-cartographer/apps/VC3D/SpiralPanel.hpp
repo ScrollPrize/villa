@@ -42,6 +42,8 @@ public:
     {
         return _volumeSelector ? _volumeSelector->comboBox() : nullptr;
     }
+    void setOpenFiberVolume(const QString& path);
+    void keepCurrentFiberSourceForSingleFiber();
     void setLossMapOptions(const QStringList& names);
     void setLossMapLegend(const QString& text);
     void setLocalPatchDrafts(const QJsonArray& drafts);
@@ -112,6 +114,10 @@ private:
 
     SpiralServiceManager* _service = nullptr;
     QHash<QString, QLineEdit*> _paths;
+    QString _openFiberVolume, _autoFilledAfvPath;
+    QString _uploadedAfvLocal, _uploadedAfvHost;
+    bool _afvPathManual = false;
+    bool _fiberUploadActive = false;
     QHash<QString, QToolButton*> _pathBrowseButtons;
     QHash<QString, QCheckBox*> _visibilityChecks;
     QHash<QString, bool> _pathDirectories;

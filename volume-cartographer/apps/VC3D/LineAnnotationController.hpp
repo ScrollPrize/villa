@@ -321,6 +321,10 @@ public:
                                  const QPointF& scenePoint,
                                  bool replaceOwningAnnotation = true);
     void openFiber(uint64_t fiberId);
+    // Opens a fiber imported from an Automated Fiber Volume, fitting the whole
+    // line in both strips. A Lasagna dataset is optional. Errors are returned
+    // through error instead of dialogs.
+    LineAnnotationDialog* openCollectionFiber(uint64_t fiberId, QString* error = nullptr);
     void openFiberAtControlPoint(uint64_t fiberId, int controlPointIndex);
     void openFiberAtLinePointIndex(uint64_t fiberId, int linePointIndex);
     void openFiberSpan(uint64_t fiberId, int firstControlIndex, int secondControlIndex);
@@ -429,6 +433,10 @@ public:
     bool importFibersFromPath(const std::filesystem::path& path, double scale,
                               QString* errorMessage = nullptr,
                               int* importedCount = nullptr, int* skippedCount = nullptr);
+    // Adds one unlinked vc3d_fiber to the package without reloading the other
+    // fibers; returns its id, or 0 with errorMessage set.
+    uint64_t importFiberJson(const nlohmann::json& fiber, const std::string& fileName,
+                             QString* errorMessage = nullptr);
     // Creates an atlas without dialogs. It does not emit atlasCreated because
     // that signal is connected to the interactive display path.
     bool createAtlasFromFiberHeadless(uint64_t fiberId, QString* errorMessage = nullptr,
@@ -647,7 +655,8 @@ private:
     void openFiberWithControlPoint(uint64_t fiberId,
                                    std::optional<int> controlPointIndex,
                                    std::optional<int> linePointIndex = std::nullopt,
-                                   std::optional<std::pair<int, int>> spanControlIndices = std::nullopt);
+                                   std::optional<std::pair<int, int>> spanControlIndices = std::nullopt,
+                                   bool collectionInspection = false);
     // seedTags: per-control-point tags the seed keeps (a reopened
     // single-point fiber's stored tags); empty for a new placement.
     void handleLineSeed(const std::string& surfaceName,
@@ -850,7 +859,7 @@ private:
             std::vector<vc3d::line_annotation::GeneratedOverlay::FiberIntersectionMarker> markers,
             const LineAnnotationSession* session) const;
     [[nodiscard]] bool fibersShareHvDirection(uint64_t localFiberId, uint64_t linkedFiberId) const;
-    bool ensureDatasetForSession(LineAnnotationSession& session);
+    bool ensureDatasetForSession(LineAnnotationSession& session, bool required = true);
     bool ensureFiberInferenceDatasetForSession(LineAnnotationSession& session);
     void refreshLineAnnotationDatasetMenus() const;
     void refreshLineAnnotationDatasetMenu(LineAnnotationDialog* dialog) const;
