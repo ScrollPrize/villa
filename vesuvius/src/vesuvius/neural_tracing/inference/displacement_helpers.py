@@ -121,6 +121,12 @@ def predict_displacement(args, model_state, model_inputs, use_tta=None, profiler
             outlier_drop_min_keep=getattr(args, "tta_outlier_drop_min_keep", 4),
             tta_batch_size=getattr(args, "tta_batch_size", 2),
             profiler=profiler,
+            input_vector_channel_starts=(
+                (2, 5)
+                if model_state.get("model_config", {}).get("use_triplet_direction_priors", False)
+                and int(model_inputs.shape[1]) == 8
+                else ()
+            ),
         )
 
     return run_single_model_pass(model, model_inputs, amp_enabled, amp_dtype)
