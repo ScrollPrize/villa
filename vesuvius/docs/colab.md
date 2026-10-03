@@ -147,7 +147,8 @@ The model, normalization and input geometry are rebuilt from the config embedded
 | `RESUME_EVERY` | `500` | Blocks between resume snapshots (~4 min on a T4) |
 | `KEEPALIVE_SECONDS` | `300` | Interval of a no-op `colab exec` while waiting (sessions were reclaimed ~20 min after the last exec); `0` disables |
 | `RESUME_DIR_REMOTE` | `<OUTPUT_DIR_REMOTE>/<OUTPUT_NAME>.resume` | Durable resume state on Drive; deleted after success |
-| `MAX_ATTEMPTS` | `40` | Fresh sessions to try before giving up |
+| `MAX_ATTEMPTS` | `40` | Fresh sessions to try before giving up (quota refusals don't count) |
+| `QUOTA_BACKOFF_MAX` | `1800` | Longest wait between runtime requests while Colab refuses them (`TooManyAssignmentsError`); waits start at 2 min and double |
 
 Completion is detected from `<name>.status` on Drive (`ok`, or `failed (exit N)`), which is written only after the TIFF has been copied — the same "ground truth is a file on Drive, not the CLI's session status" approach as `colab_resume_watchdog.sh`. While it runs, `<name>.progress` on Drive is rewritten every minute with the log tail, RAM and GPU usage; a session counts as dead once that file stops changing for `STALE_MINUTES` (`colab status` was observed listing no sessions at all while one was healthy, so it isn't used).
 

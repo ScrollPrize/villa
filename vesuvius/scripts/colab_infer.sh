@@ -44,7 +44,8 @@
 #   KEEPALIVE_SECONDS   Interval of a no-op `colab exec` while waiting (default: 300; 0 disables)
 #   RESUME_DIR_REMOTE   Durable resume directory on Drive      (default: <OUTPUT_DIR_REMOTE>/<OUTPUT_NAME>.resume;
 #                       deleted after a successful run)
-#   MAX_ATTEMPTS        Sessions to try before giving up       (default: 40)
+#   MAX_ATTEMPTS        Sessions to try before giving up       (default: 40; quota refusals don't count)
+#   QUOTA_BACKOFF_MAX   Longest wait between quota-refused session requests, seconds (default: 1800)
 #   All colab_bootstrap.sh env vars (REPO_BRANCH, VESUVIUS_COLAB_SESSION, VESUVIUS_COLAB_GPU, etc.) are passed through.
 
 set -euo pipefail
@@ -66,6 +67,7 @@ STALE_MINUTES="${STALE_MINUTES:-10}"
 RESUME_EVERY="${RESUME_EVERY:-500}"
 KEEPALIVE_SECONDS="${KEEPALIVE_SECONDS:-300}"
 MAX_ATTEMPTS="${MAX_ATTEMPTS:-40}"
+QUOTA_BACKOFF_MAX="${QUOTA_BACKOFF_MAX:-1800}"
 
 if [[ -z "${INPUT_ZARR:-}" ]]; then
     [[ -f "$CONFIG_LOCAL" ]] || { echo "[infer] INPUT_ZARR unset and config not found: $CONFIG_LOCAL" >&2; exit 1; }
@@ -98,14 +100,20 @@ log "output:     $OUTPUT_REMOTE"
 log "resume dir: $RESUME_DIR_REMOTE (snapshot every $RESUME_EVERY blocks)"
 
 # One attempt = bootstrap a fresh session, launch (or resume) inference,
-# and wait. Returns 0 when finished ok, 1 on a real inference failure, and
-# 2 when the session died or could not be set up (worth another attempt).
+# and wait. Returns 0 when finished ok, 1 on a real inference failure, 2
+# when the session died or could not be set up (worth another attempt), and
+# 3 when Colab refused to assign a runtime at all (quota; wait, then retry).
 # remote_bash/colab_bootstrap.sh call `exit 1` on exec-level failures, so
 # every remote step runs in a subshell or child process to keep that from
 # killing the retry loop.
 run_attempt() {
     log "running colab_bootstrap.sh for environment setup (session: $SESSION)"
-    if ! VESUVIUS_COLAB_SESSION="$SESSION" RCLONE_CONF_LOCAL="$RCLONE_CONF_LOCAL" "$SCRIPT_DIR/colab_bootstrap.sh"; then
+    local rc=0
+    RCLONE_CONF_LOCAL="$RCLONE_CONF_LOCAL" run_bootstrap || rc=$?
+    if (( rc == 3 )); then
+        log "Colab refused to assign a runtime for $SESSION (TooManyAssignmentsError: usage/session quota)"
+        return 3
+    elif (( rc != 0 )); then
         log "bootstrap failed for $SESSION"
         return 2
     fi
@@ -209,11 +217,27 @@ run_attempt() {
 }
 
 BASE_SESSION="$SESSION"
-for (( attempt = 1; attempt <= MAX_ATTEMPTS; attempt++ )); do
-    SESSION="${BASE_SESSION}-r${attempt}"
+# Quota refusals (rc 3) don't use up an attempt: observed live, after a ~75
+# min session Colab refused every new runtime for 30+ min, and a fixed 30s
+# retry burned all 40 attempts on refusals alone. Back off exponentially
+# instead (2 min doubling up to QUOTA_BACKOFF_MAX) and retry indefinitely —
+# the resume state on Drive makes waiting free.
+quota_wait=120
+requests=0
+for (( attempt = 1; attempt <= MAX_ATTEMPTS; )); do
+    requests=$((requests + 1))
+    SESSION="${BASE_SESSION}-r${requests}"
     log "=== attempt $attempt/$MAX_ATTEMPTS: session '$SESSION' ==="
     rc=0
     run_attempt || rc=$?
+    if (( rc == 3 )); then
+        log "waiting ${quota_wait}s before requesting a runtime again"
+        sleep "$quota_wait"
+        quota_wait=$(( quota_wait * 2 > QUOTA_BACKOFF_MAX ? QUOTA_BACKOFF_MAX : quota_wait * 2 ))
+        continue
+    fi
+    quota_wait=120
+    attempt=$((attempt + 1))
     if (( rc == 0 )); then
         log "prediction: $OUTPUT_REMOTE"
         exit 0
