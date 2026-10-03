@@ -1,9 +1,11 @@
+#include <iomanip>
 #include <iostream>
 #include <random>
 
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/SurfaceSupport.hpp"
 #include "vc/core/util/Geometry.hpp"
 
 #include <opencv2/imgproc.hpp>
@@ -325,6 +327,34 @@ int main(int argc, char *argv[])
         set_space_tracing_use_cuda(true);
     }
 
+    // Validate the on-prediction support threshold before doing any expensive
+    // work: an out-of-range value is a configuration error, not something to
+    // silently ignore (a negative or NaN threshold would disable the #1675
+    // safety check entirely). The 0.4 default separates the observed real
+    // sample (good 44.8-62.7%, bad 25.9-34.8% on 65 eye-labelled patches),
+    // but the good sample is small (n=5): keep the threshold configurable.
+    const double min_on_prediction_support = params.value("min_on_prediction_support", 0.4);
+    const bool require_on_prediction_support = params.value("require_on_prediction_support", false);
+    if (!vc::surface::validSupportThreshold(min_on_prediction_support)) {
+        std::cerr << "ERROR: vc_grow_seg_from_seed: min_on_prediction_support must be within [0, 1]; got "
+                  << min_on_prediction_support << std::endl;
+        return EXIT_FAILURE;
+    }
+    // Margin above the measured background rate for the relative ("no better
+    // than chance") check: warn when support is within this margin of
+    // background. Real bad patches can score above the raw background rate
+    // (~20% background vs 25.9-34.8% bad patches), so a flat comparison is
+    // too weak; a +11 to +23 point margin separates the observed sample.
+    // Validated under the same rule as the threshold (finite, in [0, 1]).
+    const double min_support_margin_above_background =
+        params.value("min_support_margin_above_background", 0.1);
+    if (!vc::surface::validSupportThreshold(min_support_margin_above_background)) {
+        std::cerr << "ERROR: vc_grow_seg_from_seed: min_support_margin_above_background must be within "
+                     "[0, 1]; got "
+                  << min_support_margin_above_background << std::endl;
+        return EXIT_FAILURE;
+    }
+
     const std::string volume_arg = vol_path.string();
     const bool remote_volume = is_remote_volume_path(volume_arg);
     const double requested_voxelsize = params.value("voxelsize", 0.0);
@@ -392,6 +422,8 @@ int main(int argc, char *argv[])
     std::cout << "mode: " << mode << std::endl;
     std::cout << "step size: " << params.value("step_size", 20.0f) << std::endl;
     std::cout << "min_area_cm: " << min_area_cm << std::endl;
+    std::cout << "min_on_prediction_support: " << min_on_prediction_support << std::endl;
+    std::cout << "min_support_margin_above_background: " << min_support_margin_above_background << std::endl;
     std::cout << "voxelsize: " << voxelsize << std::endl;
     std::cout << "tgt_overlap_count: " << tgt_overlap_count << std::endl;
 
@@ -639,15 +671,10 @@ int main(int argc, char *argv[])
 
     std::string uuid;
     std::filesystem::path seg_dir;
-    if (!segment_name.empty()) {
-        // Use target-dir directly with custom segment name
-        uuid = segment_name;
-        seg_dir = tgt_dir;
-    } else {
-        // Default: create timestamped subfolder
-        uuid = name_prefix + time_str();
-        seg_dir = tgt_dir / uuid;
-    }
+    // True only when this run atomically created seg_dir (see
+    // claimFreshRunDir): rejection cleanup may only delete directories it
+    // owns, never a shared directory or a concurrent run's output.
+    bool owns_seg_dir = false;
 
     //
     // gen_neighbor mode: project a source tifxyz surface "in" or "out" along its vertex normals
@@ -1453,6 +1480,32 @@ int main(int argc, char *argv[])
         return EXIT_SUCCESS;
     }
 
+    // Growth-path segment directory: allocated only now, after the
+    // gen_neighbor early return, so that mode never creates an unused
+    // auto_grown_* directory (its result is written under neighbor_*).
+    if (!segment_name.empty()) {
+        // Use target-dir directly with custom segment name
+        uuid = segment_name;
+        seg_dir = tgt_dir;
+    } else {
+        // Default: claim a fresh timestamped subfolder for this run, so two
+        // runs started in the same millisecond cannot share one directory.
+        const auto claim =
+            vc::surface::claimFreshRunDir(tgt_dir, name_prefix + time_str());
+        if (claim.failed) {
+            // Every candidate name was already taken: the fallback path may
+            // belong to another run. Abort before tracing/saving instead of
+            // writing into it.
+            std::cerr << "ERROR: could not claim a fresh segment directory "
+                         "under "
+                      << tgt_dir << std::endl;
+            return EXIT_FAILURE;
+        }
+        uuid = claim.name;
+        seg_dir = claim.dir;
+        owns_seg_dir = claim.created;
+    }
+
     QuadSurface *surf = nullptr;
     try {
         surf = tracer(*volume, 1.0, 0, origin, params, cache_root.string(), voxelsize, direction_fields, resume_surf.get(), seg_dir, meta_params, corrections, nullptr);
@@ -1473,17 +1526,241 @@ int main(int argc, char *argv[])
         if (area_cm2 < min_area_cm) {
             std::cout << "discarding generated surface because area_cm2 " << area_cm2
                       << " is below min_area_cm " << min_area_cm << std::endl;
-            if (std::filesystem::exists(seg_dir)) {
-                std::filesystem::remove_all(seg_dir);
+            // Route this pre-existing unconditional cleanup through the same
+            // shared-directory guard as the support check: with
+            // --segment-name, seg_dir IS the shared target directory and
+            // must never be deleted. A rejection is not an error, so a clean
+            // cleanup keeps the pre-existing exit-0 behavior; but a failed
+            // deletion leaves debris on disk, so report it as a tool failure
+            // (see #1906 review: a failed deletion must not report success).
+            bool discard_failed = false;
+            switch (vc::surface::tryDiscardSegDir(segment_name, seg_dir,
+                                                  owns_seg_dir)) {
+                case vc::surface::SegDirCleanup::Deleted:
+                case vc::surface::SegDirCleanup::Missing:
+                    break;
+                case vc::surface::SegDirCleanup::DeleteFailed:
+                    std::cerr << "WARNING: vc_grow_seg_from_seed: could not "
+                                 "discard "
+                              << seg_dir << std::endl;
+                    discard_failed = true;
+                    break;
+                case vc::surface::SegDirCleanup::Skipped:
+                    std::cerr << "WARNING: vc_grow_seg_from_seed: the directory "
+                              << seg_dir
+                              << " is shared (--segment-name) or was not "
+                                 "created by this run, so it was left in "
+                                 "place; the rejected surface was not saved"
+                              << std::endl;
+                    break;
             }
 #if defined(_WIN32)
             // See end of main(): skip CRT teardown, worker threads deadlock it.
             std::cout.flush();
             std::cerr.flush();
-            std::_Exit(EXIT_SUCCESS);
+            std::_Exit(discard_failed ? EXIT_FAILURE : EXIT_SUCCESS);
 #else
-            return EXIT_SUCCESS;
+            return discard_failed ? EXIT_FAILURE : EXIT_SUCCESS;
 #endif
+        }
+    }
+
+    // #1675: post-growth acceptance check. A grown surface should follow the
+    // prediction it was traced from: sample the input prediction at each valid
+    // mesh vertex (native frame) and report the on-prediction fraction.
+    // On 65 eye-labelled real patches from 21 scrolls, bad (swirl-only)
+    // patches scored 25.9-34.8% and good (sheet-following) patches 44.8-62.7%,
+    // so the default 0.4 threshold separates the observed sample (good n=5 is
+    // small; keep it configurable). The background rate (same fraction over
+    // uniform random points in the surface's neighborhood) is reported
+    // alongside: a surface no more than min_support_margin_above_background
+    // above background follows the prediction no better than chance, which the
+    // absolute threshold cannot catch on dense predictions. The flat
+    // at-or-below-background comparison is too weak on real data (~20%
+    // background vs 25.9-34.8% bad patches flags only 3/21); the default 0.1
+    // margin sits just under the observed +11 to +23 point separating margin.
+    // The neighborhood is the bounding box of valid vertices dilated by 64
+    // voxels, so its chunks were already loaded by the growth itself (no
+    // volume-wide scattered reads, which would be punitive on remote
+    // volumes). Warn-only by default; set
+    // "require_on_prediction_support" to discard the surface and fail instead.
+    // If the prediction cannot be sampled at all (e.g. a transient remote
+    // chunk failure), the check reports that it could not run and the surface
+    // is kept; strict mode discards and fails instead, since the surface is
+    // unverified.
+    // Filesystem cleanup must not throw: this lambda runs inside the sampling
+    // try/catch below, so a throwing cleanup would be misreported as a
+    // sampling failure on the first call and escape uncaught on the second.
+    auto discard_seg_and_fail = [&]() -> int {
+        // With --segment-name, seg_dir IS tgt_dir: the shared target
+        // directory, which this run did not create and which may hold
+        // pre-existing segments. Strict-mode cleanup must never delete it, so
+        // only remove a segment directory this run atomically created (see
+        // claimFreshRunDir), which also protects concurrent runs that share
+        // a millisecond timestamp. Either way the rejected surface is not
+        // saved (this runs before the save) and the tool exits non-zero.
+        // The cleanup helper never throws, so a deletion failure cannot be
+        // misreported as a sampling failure or escape uncaught.
+        switch (vc::surface::tryDiscardSegDir(segment_name, seg_dir,
+                                               owns_seg_dir)) {
+            case vc::surface::SegDirCleanup::Deleted:
+            case vc::surface::SegDirCleanup::Missing:
+                std::cerr << "discarding generated surface because "
+                             "require_on_prediction_support is set"
+                          << std::endl;
+                break;
+            case vc::surface::SegDirCleanup::DeleteFailed:
+                std::cerr << "WARNING: vc_grow_seg_from_seed: could not "
+                             "discard "
+                          << seg_dir
+                          << "; the rejected surface was left on disk"
+                          << std::endl;
+                break;
+            case vc::surface::SegDirCleanup::Skipped:
+                std::cerr
+                    << "WARNING: vc_grow_seg_from_seed: strict mode rejects "
+                       "the surface, but the directory "
+                    << seg_dir
+                    << " is shared (--segment-name) or was not created by "
+                       "this run, so it was left in place (tracer snapshots "
+                       "from this run may remain); the final surface was not "
+                       "saved"
+                    << std::endl;
+                break;
+        }
+#if defined(_WIN32)
+        // See end of main(): skip CRT teardown, worker threads deadlock it.
+        std::cout.flush();
+        std::cerr.flush();
+        std::_Exit(EXIT_FAILURE);
+#else
+        return EXIT_FAILURE;
+#endif
+    };
+    {
+        // Sampling reads prediction chunks, which can throw on I/O failure
+        // (e.g. a transient remote fetch). That must not escape as an
+        // uncaught exception (SIGABRT): the try/catch around tracer() above
+        // exists for exactly this reason.
+        try {
+        const cv::Mat_<cv::Vec3f> pts = surf->rawPoints();
+        auto accessor = Chunked3dAccessor<uint8_t, passTroughComputor>::create(tensor);
+        auto sample_prediction = [&accessor, &volume_shape_zyx](int z, int y, int x) -> uint8_t {
+            if (z < 0 || z >= volume_shape_zyx[0] || y < 0 ||
+                y >= volume_shape_zyx[1] || x < 0 ||
+                x >= volume_shape_zyx[2]) {
+                return 0;
+            }
+            return accessor(z, y, x);
+        };
+        const vc::surface::OnPredictionSupport support =
+            vc::surface::onPredictionSupport(pts, sample_prediction);
+        // Background rate: the same fraction over uniform random points in
+        // the surface's neighborhood (bounding box of valid vertices, dilated
+        // by 64 voxels and clamped to the volume). Volume-wide uniform points
+        // would scatter one read per chunk -- up to ~2000 extra chunk fetches
+        // on remote (http/s3) volumes -- while the neighborhood's chunks were
+        // already loaded by the growth itself. Fixed seed keeps the estimate
+        // reproducible run to run.
+        vc::surface::OnPredictionSupport background;
+        const char* bg_unavailable_reason = "no valid vertices to sample around";
+        cv::Vec3f bb_lo, bb_hi;
+        if (vc::surface::validVertexBounds(pts, bb_lo, bb_hi)) {
+            constexpr float kBackgroundDilate = 64.0f;
+            constexpr int kBackgroundSamples = 2000;
+            const float lo_x = std::max(0.0f, bb_lo[0] - kBackgroundDilate);
+            const float lo_y = std::max(0.0f, bb_lo[1] - kBackgroundDilate);
+            const float lo_z = std::max(0.0f, bb_lo[2] - kBackgroundDilate);
+            // The hi bounds are the dimension length minus half a voxel (see
+            // backgroundSampleHiBound): uniform_real_distribution yields
+            // [lo, hi), and a sampled coordinate in the last half-voxel would
+            // round to `shape`, miss the volume, and be counted as
+            // off-prediction, biasing the background rate near volume edges.
+            const float hi_x = vc::surface::backgroundSampleHiBound(
+                volume_shape_zyx[2], bb_hi[0] + kBackgroundDilate);
+            const float hi_y = vc::surface::backgroundSampleHiBound(
+                volume_shape_zyx[1], bb_hi[1] + kBackgroundDilate);
+            const float hi_z = vc::surface::backgroundSampleHiBound(
+                volume_shape_zyx[0], bb_hi[2] + kBackgroundDilate);
+            if (lo_x >= hi_x || lo_y >= hi_y || lo_z >= hi_z) {
+                // The dilated neighborhood does not intersect the volume
+                // (every valid vertex lies outside it): there is nothing to
+                // sample, so leave the background unavailable instead of
+                // constructing distributions with reversed bounds.
+                bg_unavailable_reason =
+                    "surface neighborhood does not intersect the volume";
+            } else {
+            cv::Mat_<cv::Vec3f> bg_pts(kBackgroundSamples, 1);
+            std::mt19937 bg_rng(42);
+            std::uniform_real_distribution<float> bg_x(lo_x, hi_x);
+            std::uniform_real_distribution<float> bg_y(lo_y, hi_y);
+            std::uniform_real_distribution<float> bg_z(lo_z, hi_z);
+            for (int i = 0; i < bg_pts.rows; ++i) {
+                bg_pts(i, 0) = cv::Vec3f(bg_x(bg_rng), bg_y(bg_rng), bg_z(bg_rng));
+            }
+            background = vc::surface::onPredictionSupport(bg_pts, sample_prediction);
+            bg_unavailable_reason = nullptr;
+            }
+        }
+        std::cout << "on-prediction support: " << std::fixed << std::setprecision(1)
+                  << (support.fraction * 100.0) << "% (" << support.on << "/"
+                  << support.total << " vertices on nonzero prediction; ";
+        if (background.total == 0) {
+            // No neighborhood was sampled: report the background as
+            // unavailable rather than the default 1.0 fraction.
+            std::cout << "background unavailable (" << bg_unavailable_reason << "))";
+        } else {
+            std::cout << "background " << (background.fraction * 100.0) << "% over "
+                      << background.total
+                      << " random points in the surface neighborhood)";
+        }
+        std::cout << std::endl;
+        bool support_rejected = false;
+        if (support.fraction < min_on_prediction_support) {
+            std::cerr << "WARNING: vc_grow_seg_from_seed: on-prediction support "
+                      << std::fixed << std::setprecision(1)
+                      << (support.fraction * 100.0)
+                      << "% is below min_on_prediction_support "
+                      << (min_on_prediction_support * 100.0)
+                      << "%; the surface may cut across windings instead of "
+                         "following a sheet (#1675)."
+                      << std::endl;
+            support_rejected = true;
+        }
+        if (vc::surface::noBetterThanChance(support, background,
+                                                min_support_margin_above_background)) {
+            std::cerr << "WARNING: vc_grow_seg_from_seed: on-prediction support "
+                      << std::fixed << std::setprecision(1)
+                      << (support.fraction * 100.0)
+                      << "% is no more than "
+                      << (min_support_margin_above_background * 100.0)
+                      << " points above the background rate "
+                      << (background.fraction * 100.0)
+                      << "% for random points in the surface neighborhood; the "
+                         "surface follows the prediction no more than chance "
+                         "(#1675)."
+                      << std::endl;
+            support_rejected = true;
+        }
+        if (vc::surface::supportVerdict(support_rejected,
+                                        require_on_prediction_support) ==
+            vc::surface::SupportVerdict::Reject) {
+            return discard_seg_and_fail();
+        }
+        } catch (const std::exception& e) {
+            // The check is advisory by default: a sampling failure must not
+            // fail a successful growth. Report that the check could not run
+            // and continue with the save. In strict mode the surface is
+            // unverified, so discard it and fail like a rejected surface.
+            std::cerr << "WARNING: vc_grow_seg_from_seed: on-prediction support "
+                         "check could not be performed ("
+                      << e.what()
+                      << "); continuing without the acceptance check (#1675)."
+                      << std::endl;
+            if (vc::surface::samplingFailureVerdict(require_on_prediction_support) ==
+                vc::surface::SupportVerdict::Reject) {
+                return discard_seg_and_fail();
+            }
         }
     }
 
