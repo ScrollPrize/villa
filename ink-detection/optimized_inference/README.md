@@ -320,6 +320,39 @@ argo submit wf.yaml \
 Tip:
 - `END_LAYER` is exclusive. For layers `00.tif` through `25.tif`, use `START_LAYER=0`, `END_LAYER=26`.
 
+## Would this window have shown ink? (detectability probe)
+
+A blank prediction does not say whether the papyrus is blank or the window could not have shown
+ink: the surface may be off the sheet, the layer window misplaced, the layers read in the wrong
+order, or the scan outside what the model was trained on. `detectability_probe.py` measures it
+per window. It plants synthetic ink of known contrast on the sheet's face (pen-width strokes, in
+lines at a scroll's line spacing, following the sheet's measured depth), runs this module's
+`run_inference` again, and reports the faintest contrast that comes back as ink.
+
+```bash
+python detectability_probe.py SURFACE_VOLUME.zarr WEIGHTS.ckpt \
+    --model-type resnet3d-152-3d-decoder --start-layer 24 --end-layer 86
+```
+
+```
+  baseline ink 1.99%
+  near face  amplitude     8   lift +0.004
+  near face  amplitude    16   lift -0.000
+  near face  amplitude    32   lift +0.041
+  far  face  amplitude     8   lift -0.037
+  far  face  amplitude    16   lift -0.114
+  far  face  amplitude    32   lift -0.233
+threshold 32 of 255: ink at least this strong would have shown
+```
+
+That is PHerc0139's published surface volume, which the checkpoint reads letters from.
+Read with `--reverse`, the order `FORCE_REVERSE=true` gives, the same window reports 0.10%
+ink and the probe answers `blind`: no planted contrast up to 64 comes back, so that near-blank
+map is a statement about the pipeline, not about the papyrus. The lift is the rise in the fraction of stroke pixels above 0.5 against the
+same pixels before planting, so an output that already looks like strokes cannot pass without
+responding to them. `--reverse` reads the layers as `FORCE_REVERSE=true` does, and the input
+can also be a `.npy` stack. Tests: `python -m unittest tests.test_detectability_probe`.
+
 ## Notes on models
 
 The `MODEL` key maps to a Hugging Face repo via a small lookup table inside the code. You can look at all possible models in [the HF registry](https://huggingface.co/collections/scrollprize/ink-detection-models-678e2a316597a2e02398357c).
