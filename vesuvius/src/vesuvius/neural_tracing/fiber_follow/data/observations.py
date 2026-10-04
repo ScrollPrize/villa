@@ -39,6 +39,10 @@ class ObservationBuilder:
             yield heading_free_bounds(item['pos'],self.cfg.fine,vol.input_scale)
         predictor = frame_predictor(self.cfg)
         yield from crop_frame_bounds(item,self.cfg.fine,vol,predictor)
+        if self.cfg.memory == 'decisions':
+            from vesuvius.neural_tracing.fiber_follow.data.decision_memory import memory_bounds
+            yield from memory_bounds(item,self.cfg,vol,predictor)
+            return
         for slab in slab_layout(item):
             yield from crop_frame_bounds(slab,SLAB,vol,predictor)
 
@@ -56,8 +60,12 @@ class ObservationBuilder:
         x = dict(fine=crop_images(items,vol,self.cfg.fine,pool),seed=stack('visible_seed'),
                  seed_mask=stack('visible_seed_mask'),seed_age=stack('visible_seed_age'),
                  seed_tangent=stack('visible_seed_tangent'))
-        from vesuvius.neural_tracing.fiber_follow.data.history_slabs import load_slabs
-        x.update(load_slabs(items, vol, self.cfg, pool))
+        if self.cfg.memory == 'decisions':
+            from vesuvius.neural_tracing.fiber_follow.data.decision_memory import memory_inputs
+            x.update(memory_inputs(items, vol, self.cfg, pool))
+        else:
+            from vesuvius.neural_tracing.fiber_follow.data.history_slabs import load_slabs
+            x.update(load_slabs(items, vol, self.cfg, pool))
         from vesuvius.neural_tracing.fiber_follow.models.path_geometry import path_geometry_inputs
         x.update(path_geometry_inputs(items))
         # Recorded replay frames have unknown quality unless it was supplied;
@@ -328,9 +336,14 @@ class IdentityObservationBuilder(ObservationBuilder):
         curve = local(np.arange(max(0.,t-extent),min(fiber.length,t+extent)+1e-9,.25))
         if item['match_distance'] > DEPARTURE_DISTANCE or item.get('source') == SOURCE['synthetic']:
             from scipy.spatial import cKDTree
-            from vesuvius.neural_tracing.fiber_follow.data.history_slabs import slab_layout
-            # Membership affects labels only; every observed slab is still input.
-            distance = cKDTree(fiber.points).query(np.stack([o['pos'] for o in slab_layout(item)]))[0]
+            # Membership affects labels only; every observed slab/memory entry is still input.
+            if cfg.memory == 'decisions':
+                from vesuvius.neural_tracing.fiber_follow.data.decision_memory import memory_layout
+                positions = [e['pos'] for e in memory_layout(item)[0]]
+            else:
+                from vesuvius.neural_tracing.fiber_follow.data.history_slabs import slab_layout
+                positions = [o['pos'] for o in slab_layout(item)]
+            distance = cKDTree(fiber.points).query(np.stack(positions))[0] if positions else np.full(1,np.inf)
             item['slab_identity_observable'] = bool((distance <= s.on_fiber_tolerance).any())
         item['identity_curve'] = curve
         self.identity_evidence(item, curve)
@@ -350,9 +363,14 @@ class IdentityObservationBuilder(ObservationBuilder):
         return item
 
     def footprint_allowed(self,item,band):
-        from vesuvius.neural_tracing.fiber_follow.data.history_slabs import slabs_allowed
-        if not slabs_allowed(item, band):
-            return False
+        if self.cfg.memory == 'decisions':
+            from vesuvius.neural_tracing.fiber_follow.data.decision_memory import memory_allowed
+            if not memory_allowed(item, self.cfg, band):
+                return False
+        else:
+            from vesuvius.neural_tracing.fiber_follow.data.history_slabs import slabs_allowed
+            if not slabs_allowed(item, band):
+                return False
         if band is None:
             return True
         z = np.asarray(item.get('identity_label_z',np.asarray(item['pos'])[2:3]))
@@ -436,6 +454,12 @@ class IdentityObservationBuilder(ObservationBuilder):
                 augmentation = dict(blur_sigma=item.get('blur_sigma', 0.))
                 batch['blurred'][j] = augmentation['blur_sigma'] > 0
                 augment_image_pair(batch['x']['fine'][j], item['photometric'], rng, **augmentation)
+                if 'history_crops' in batch['x']:
+                    encoded = batch['x']['history_encode'].flatten().nonzero().flatten()
+                    for crop in (encoded // batch['x']['history_encode'].shape[1] == j).nonzero().flatten().tolist():
+                        augment_ct(batch['x']['history_crops'][crop, 0].numpy(), item['photometric'], rng,
+                                   augmentation['blur_sigma'])
+                    continue
                 for slot in batch['x']['history_valid'][j].nonzero().flatten().tolist():
                     ct = batch['x']['history_slabs'][j, slot, 0].numpy()
                     augment_ct(ct, item['photometric'], rng, augmentation['blur_sigma'])
@@ -463,6 +487,10 @@ class FiberTracer(ModelTracer):
                 item['observed_path'] = path['observed_path']
                 if 'fiber_family' in path:
                     item['fiber_family'] = path['fiber_family']
+                if 'memory_decisions' in path:
+                    item['memory_decisions'] = path['memory_decisions']
         def move(value):
             return {k: move(v) for k, v in value.items()} if isinstance(value, dict) else value.to(self.device)
-        return move(self.observations.images(items,self.vol,self.pool))
+        x = move(self.observations.images(items,self.vol,self.pool))
+        self._memory_entries = [item.get('_memory_entries') for item in items]
+        return x

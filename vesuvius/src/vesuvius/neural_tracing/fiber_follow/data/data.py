@@ -665,6 +665,10 @@ class FollowDataset(torch.utils.data.IterableDataset):
         self.replay_index, self.refresh_chunks = replay_index, refresh_chunks
         self.batch_builder = batch_builder
         self.live_continuation = None  # Optional trainer-to-worker prediction feedback.
+        # Decision memory reads a chain's own recorded decisions: chains then start at seeds,
+        # optionally within this leading fraction of the traversal (0: ordinary fresh location).
+        self.chain_seed_only = False
+        self.chain_seed_fraction = 0.
         self.remote_prefetch = None  # Optional trainer-owned process queue client.
         self.remote_prefetch_lookahead = 0  # Planned microbatches per source/worker.
         self.additional_crops = tuple(additional_crops)
@@ -775,13 +779,18 @@ class FollowDataset(torch.utils.data.IterableDataset):
             t = f.length-original_t if rev else original_t
         return int(fi), float(t), rev, 0
 
-    def fresh_item(self, rng, windows, **options):
+    def fresh_item(self, rng, windows, chain_start=False, **options):
         """A simulated trace; ``options`` fix the startup category or force an excursion."""
         for _ in range(10000):
+            leading = chain_start and self.chain_seed_fraction > 0
             item = (self.batch_builder.replace_fresh(self.cfg, rng, **options)
-                    if hasattr(self.batch_builder, 'replace_fresh') else None)
+                    if hasattr(self.batch_builder, 'replace_fresh') and not leading else None)
             if item is None:
-                fi, t, rev, location = self.fresh_location(rng, windows)
+                if leading:
+                    fi = int(rng.choice(len(self.fibers), p=self.weights))
+                    t, rev, location = float(rng.uniform(0, self.chain_seed_fraction*self.fibers[fi].length)), bool(rng.integers(2)), 0
+                else:
+                    fi, t, rev, location = self.fresh_location(rng, windows)
                 item = make_sample(self.fibers[fi], t, rev, self.cfg, rng, **options)
                 item.update(fiber_ref=(fi, t, rev), location_source=location)
                 item = self.prepare(item, rng)
@@ -846,13 +855,13 @@ class FollowDataset(torch.utils.data.IterableDataset):
     def live_start(self, rng, windows):
         """Chain starts: half recorded valid pre-excursion/recoverable prefixes, half seed-only."""
         from vesuvius.neural_tracing.fiber_follow.data.state_labels import FOLLOWING, RECOVERABLE
-        if rng.random() < .5:
+        if not self.chain_seed_only and rng.random() < .5:
             for name in ('pre_excursion', 'recoverable') if rng.random() < .5 else ('recoverable', 'pre_excursion'):
                 item = self.replay_draw(name, rng)
                 if item is not None and item['geometry_valid'] and item['supervision'] in (FOLLOWING, RECOVERABLE):
                     item.update(live_start='replay', live_loop_start=0)
                     return item
-        item = self.fresh_item(rng, windows, startup=STARTUP_CATEGORIES.index('seed_only'))
+        item = self.fresh_item(rng, windows, chain_start=True, startup=STARTUP_CATEGORIES.index('seed_only'))
         item.update(live_start='seed', live_loop_start=len(item['observed_path'])-1)
         return item
 

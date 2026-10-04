@@ -225,7 +225,8 @@ def test_training_compilation_emulates_eager_bf16_rounding(monkeypatch):
     assert not torch._inductor.config.emulate_precision_casts
 
 
-def test_checkpoint_resume_init_weights_and_model_type_contract(tmp_path):
+@pytest.mark.parametrize('resume_lr', [.001, .0005])
+def test_checkpoint_resume_init_weights_and_model_type_contract(tmp_path, resume_lr):
     torch.manual_seed(7)
     cfg = config()
     args = SimpleNamespace(reset_optimizer=False, lr=.001)
@@ -248,12 +249,13 @@ def test_checkpoint_resume_init_weights_and_model_type_contract(tmp_path):
     # Resume restores optimizer, RNG stream and schedule origin: the next update is identical.
     restored = CoordinateRegressionFollower(cfg)
     restored_ema = copy.deepcopy(restored)
+    args.lr = resume_lr
     restored_opt, done, origin = initialize_training_optimizer(restored, restored_ema, args, ck)
     assert (done, origin) == (1, 0)
     torch.testing.assert_close(torch.rand(3), expected_rng, rtol=0, atol=0)
     prepare_training(restored, backend='eager')
-    optimizer_update(m, ema, opt, [data], 2, .001, compute_metrics=False)
-    optimizer_update(restored, restored_ema, restored_opt, [data], 2, .001, compute_metrics=False)
+    optimizer_update(m, ema, opt, [data], 2, resume_lr, compute_metrics=False)
+    optimizer_update(restored, restored_ema, restored_opt, [data], 2, resume_lr, compute_metrics=False)
     for p, q in zip(m.parameters(), restored.parameters()):
         torch.testing.assert_close(p, q, rtol=0, atol=0)
     # --init-weights: the launcher's architecture flags must match; model and EMA load strictly.

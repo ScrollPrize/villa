@@ -38,6 +38,29 @@ class ResidualPatchStem(nn.Module):
         return self.projection(self.blocks(self.input(image)))
 
 
+class LightPatchStem(nn.Module):
+    """Stride-two stem: no full-resolution stage.
+
+    A stride-two 3x3x3 convolution with InstanceNorm and ReLU into ``stem_channels``,
+    then ``stem_blocks`` BasicBlockD blocks into twice that width, the first with
+    stride two, and a 1x1x1 projection onto the stride-four token grid. Like the
+    residual stem, its output is added to the parallel patch projection.
+    """
+    def __init__(self, cfg):
+        super().__init__()
+        c = cfg.stem_channels
+        self.input = nn.Sequential(nn.Conv3d(cfg.input_channels, c, 3, stride=2, padding=1),
+                                   nn.InstanceNorm3d(c, eps=1e-5, affine=True), nn.ReLU(inplace=True))
+        self.blocks = StackedResidualBlocks(n_blocks=cfg.stem_blocks, input_channels=c, output_channels=2*c,
+            initial_stride=2, conv_bias=False, conv_op=nn.Conv3d, kernel_size=3,
+            norm_op=nn.InstanceNorm3d, norm_op_kwargs=dict(eps=1e-5, affine=True),
+            nonlin=nn.ReLU, nonlin_kwargs=dict(inplace=True), block=BasicBlockD)
+        self.projection = nn.Conv3d(2*c, cfg.hidden, 1)
+
+    def forward(self, image):
+        return self.projection(self.blocks(self.input(image)))
+
+
 class PatchEncoder(nn.Module):
     """Patch tokens with observed-path occupancy and a residual stem."""
     def __init__(self, cfg):
@@ -47,7 +70,7 @@ class PatchEncoder(nn.Module):
         # A one-voxel halo around each 4-cube gives two-voxel overlap.
         # Kernel center 2.5 minus padding 1 retains the old 1.5 offset.
         self.patch_projection = nn.Conv3d(cfg.input_channels, cfg.hidden, 6, stride=4, padding=1)
-        self.stem = ResidualPatchStem(cfg)
+        self.stem = ResidualPatchStem(cfg) if cfg.stem == 'residual' else LightPatchStem(cfg)
         self.position = nn.Linear(3, cfg.hidden)
         self.condition = nn.Linear(3, cfg.hidden, bias=False)
         self.blocks = nn.ModuleList(AxialBlock(cfg.hidden, cfg.heads, ffn=cfg.encoder_ffn, rotary=True)

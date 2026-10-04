@@ -34,6 +34,8 @@ class CoordinateRegressionConfig:
     recurrent_refinement_steps: int = 3
     stem_channels: int = 32
     stem_blocks: int = 2
+    stem: str = 'residual'  # 'residual' full-resolution stem, or 'stride2' light stem
+    memory: str = 'slabs'  # 'slabs' separate historical-slab CNN, or 'decisions' encoder features of past decisions
     frame_checkpoint: str | None = None  # frozen heading/normal model used by crop builders
     frame_checkpoint_sha256: str | None = None
 
@@ -41,6 +43,8 @@ class CoordinateRegressionConfig:
         if any(type(value) is not int or value < 1 for value in
                (self.encoder_ffn, self.decoder_ffn)):
             raise ValueError('Feed-forward widths must be positive integers')
+        if self.stem not in ('residual', 'stride2') or self.memory not in ('slabs', 'decisions'):
+            raise ValueError("Stem must be 'residual' or 'stride2'; memory must be 'slabs' or 'decisions'")
         if type(self.stem_channels) is not int or self.stem_channels < 1 or type(self.stem_blocks) is not int or self.stem_blocks < 1:
             raise ValueError('Stem channels must be a positive integer and stem blocks a positive integer')
         if isinstance(self.fine, dict):
@@ -305,7 +309,11 @@ class ObservationFollower(nn.Module):
         from .path_geometry import PathGeometryTokens
         self.encoder = PatchEncoder(cfg)
         self.reference_token = nn.Sequential(nn.Linear(cfg.hidden+8,cfg.hidden),nn.SiLU(),nn.Linear(cfg.hidden,cfg.hidden))
-        self.history_encoder = HistoryEncoder(cfg)
+        if cfg.memory == 'decisions':
+            from .decision_memory import DecisionMemory
+            self.history_encoder = DecisionMemory(cfg)
+        else:
+            self.history_encoder = HistoryEncoder(cfg)
         self.history_attention = HistoryAttention(cfg.hidden, cfg.heads)
         self.confidence_scorer = SegmentSurvivalScorer(cfg)
         self.path_geometry = PathGeometryTokens(cfg)
@@ -365,7 +373,50 @@ class ObservationFollower(nn.Module):
 
     def encode_history(self, x):
         extra = {key: x['history_'+key] for key in ('path_points', 'path_tangents', 'path_valid')}
-        return self.history_encoder(x['history_slabs'], x['history_valid'], x['history_pose'], **extra)
+        if self.cfg.memory == 'slabs':
+            return self.history_encoder(x['history_slabs'], x['history_valid'], x['history_pose'], **extra)
+        return self.history_encoder(self.memory_features(x), x['history_valid'], x['history_pose'], **extra)
+
+    def memory_features(self, x):
+        """(B, SLOTS, ENTRY_FEATURES, C): recorded entries, plus entries encoded here from crops.
+
+        ``history_features`` holds entries recorded at earlier decisions (zeros elsewhere).
+        Slots flagged in ``history_encode`` have no recorded decision; their crops are encoded
+        by this model's own encoder without gradient, exactly as at a decision.
+        """
+        from .decision_memory import ENTRY_FEATURES
+        valid = x['history_valid']
+        features = x.get('history_features')
+        if features is None:
+            features = valid.new_zeros((*valid.shape, ENTRY_FEATURES, self.cfg.hidden), dtype=torch.bfloat16)
+        encode = x.get('history_encode')
+        if encode is not None and encode.any():
+            rows = encode.flatten().nonzero().flatten()
+            fresh = self.encode_memory_crops(x, rows)
+            features = features.flatten(0, 1).index_copy(0, rows, fresh.to(features.dtype)).reshape(features.shape)
+        return features
+
+    def encode_memory_crops(self, x, rows):
+        from .decision_memory import MEMORY_CHUNK
+        crops, references = x['history_crops'], x['history_references']
+        mask = x['history_reference_mask'].bool()
+        if len(crops) != len(rows):
+            raise ValueError('One memory crop is required per flagged slot')
+        points = x['history_path_points'].flatten(0, 1)[rows]
+        valid = x['history_path_valid'].flatten(0, 1)[rows]
+        out = []
+        with torch.no_grad():
+            for start in range(0, len(crops), MEMORY_CHUNK):
+                part = slice(start, start+MEMORY_CHUNK)
+                _, deep, _ = self.encoder(crops[part], references[part], mask[part])
+                out.append(self.history_encoder.entry_features(deep, points[part], valid[part]))
+        return torch.cat(out)
+
+    def current_memory_entry(self, deep, hist, hmask):
+        """This decision's own entry, as later decisions of the same trace will read it."""
+        path = torch.stack((hist[:, 1], hist[:, 0], torch.zeros_like(hist[:, 0])), 1)
+        valid = torch.stack((hmask[:, 1] > 0, hmask[:, 0] > 0, torch.ones_like(hmask[:, 0], dtype=torch.bool)), 1)
+        return self.history_encoder.entry_features(deep.detach(), path, valid)
 
     def context(self, x, hist, hmask):
         references, mask = self.references(x, hist, hmask)
@@ -377,6 +428,8 @@ class ObservationFollower(nn.Module):
             ctx['history_tokens'], ctx['history_padding'] = self.encode_history(x)
         history = (ctx['history_tokens'], ctx['history_padding'])
         ctx['history_projected'] = self.history_attention.project_memory(*history)
+        if self.cfg.memory == 'decisions':
+            ctx['memory_entry'] = self.current_memory_entry(deep, hist, hmask)
         ctx['confidence_history_projected'] = self.confidence_scorer.history_attention.project_memory(*history)
         return ctx
 
@@ -430,7 +483,10 @@ class CoordinateRegressionFollower(ObservationFollower):
     def forward(self, x, hist, hmask, confidence_threshold=DEFAULT_CONFIDENCE, n_commit=None):
         ctx = self.context(x, hist, hmask)
         out = self.predict(ctx, hist, confidence_threshold)
-        return self.select_prediction(out, confidence_threshold, n_commit)
+        out = self.select_prediction(out, confidence_threshold, n_commit)
+        if 'memory_entry' in ctx:
+            out['memory_entry'] = ctx['memory_entry']
+        return out
 
     def predict(self, ctx, hist, confidence_threshold=DEFAULT_CONFIDENCE):
         decoded, points, projected, padding = self.prepare_prediction(ctx, hist)
@@ -545,7 +601,10 @@ class CoordinateRegressionFollower(ObservationFollower):
             refinements.append(points)
             scores.append((hazards, logits, confidence))
             valid.append(active)
-        return self.proposal_output(initial, refinements, scores, valid)
+        out = self.proposal_output(initial, refinements, scores, valid)
+        if 'memory_entry' in ctx:
+            out['memory_entry'] = ctx['memory_entry']
+        return out
 
     def decode_cached(self, query, projected, padding, ctx):
         for layer, kv in zip(self.decoder.layers, projected):

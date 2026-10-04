@@ -23,6 +23,13 @@ From this directory, use the existing project environment:
 
 `--resume output/RUN/last.pt --name RUN` restores a new-format run. `--init-weights CHECKPOINT` strictly loads model and EMA weights into a fresh run, without optimizer, replay, scheduling, or normalization state. Runtime checkpoints use unversioned model types. Legacy checkpoints must be converted explicitly; old flow checkpoints are unsupported. The model type is inferred from checkpoints unless explicitly specified.
 
+Resumes may change `--steps` (the total update endpoint) while preserving AdamW state.
+Increasing it changes the cosine schedule and can raise the effective LR. For a continuous
+extension after warmup, use `--lr saved_lr / lr_at(saved_step - origin, 1, warmup, new_total - origin)`,
+where `saved_lr` is the checkpoint optimizer group's LR and `origin` is its `lr_restart_step`.
+Keep warmup and origin unchanged and omit `--reset-optimizer`; the remaining cosine then
+decays monotonically from the saved LR to approximately zero at the new endpoint.
+
 The one-off conversion for the existing 81,000-step weights is:
 
 ```bash
@@ -93,3 +100,36 @@ OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 MPLCONFIGDIR=/tmp/fiber-mpl \
 ```
 
 Tests cover both generators, compiled graph capture, weight initialization/resume, gradient paths, supervision masks, deterministic flow tracing, observation parity, collection, normalization, interpretation, and the standalone heading model. CUDA tests skip when CUDA is unavailable. Small-fixture checks establish implementation correctness; they do not establish trained tracing accuracy or production GPU throughput.
+
+Long held-out failure audits can reuse the shared tracer and scorers while recording every
+policy decision and scoring the same path at 400, 1,000, and 2,000 voxels:
+
+```bash
+../../../../.venv/bin/python -m vesuvius.neural_tracing.fiber_follow.evaluation.long_trace_audit \
+  --checkpoint output/RUN/ckpt_079000.pt --out output/RUN/long_audit/primary --count 64 --batch 8
+```
+
+This evaluates the fixed monitor seeds plus distinct calibration fibers sampled without
+replacement with probability proportional to annotated length. New seeds use CT headings,
+random directions, and the first 20% of a fiber (at least 32 voxels from its starting end)
+to favor long annotated continuations. Final-test fibers are excluded. The resulting
+`seeds.json` is frozen before rollout and can be reused with `--seed-manifest` for paired
+checkpoint or policy comparisons (`--confidence`, `--n-commit`, `--sources`, `--cohorts`).
+Results describe this length-biased diagnostic population, not uniform fiber performance.
+Saved NPZ files contain paths, annotations and decision inputs; JSON rows retain strict
+first-failure, local geometric agreement, annotation censoring and policy-audit outcomes.
+Local agreement is not independent confirmation of fiber identity.
+
+Render CT sections around selected departures and stops, plus aggregate diagnostics:
+
+```bash
+../../../../.venv/bin/python -m vesuvius.neural_tracing.fiber_follow.evaluation.summarize_long_audit \
+  output/RUN/long_audit --render
+../../../../.venv/bin/python -m vesuvius.neural_tracing.fiber_follow.evaluation.annotation_audit \
+  output/RUN/long_audit
+```
+
+The report expects the main evaluation in `long_audit/primary`. Optional paired runs
+in `confidence_030`, `confidence_080`, `commit_04`, and `checkpoint_055000` are compared on identical
+seed keys with fiber-resampled 95% intervals. Annotation proximity is a review aid,
+not a certified switch detector; the annotation audit uses the local Paris catalog.

@@ -82,3 +82,19 @@ def test_fresh_location_only_oversamples_available_lateral_history():
     assert location['fiber'] == 0 and 34 <= location['t'] <= 66
     assert LOCATION_SOURCES[location['source']] == 'lateral'
     assert 'contact' not in LOCATION_SOURCES and 'hard_span' not in LOCATION_SOURCES
+
+
+def test_initialized_run_can_resume_with_lower_lr_without_changing_training_contract():
+    original = build_parser().parse_args(launcher_argv())
+    resumed = SimpleNamespace(**vars(original))
+    resumed.init_weights = None
+    resumed.resume = '/unused/run/last.pt'
+    resumed.lr = 5e-5
+    train.validate_resume_options(resumed, vars(original))
+    resumed.steps = original.steps + 50000
+    train.validate_resume_options(resumed, vars(original))
+    for key, value in [('tolerance', 1.5), ('warmup', 0), ('n_commit', 8)]:
+        changed = SimpleNamespace(**vars(resumed))
+        setattr(changed, key, value)
+        with pytest.raises(ValueError, match=f'Resume option differs: {key}'):
+            train.validate_resume_options(changed, vars(original))

@@ -185,6 +185,13 @@ HISTORY_GRAD_CLIP = 5.
 REST_GRAD_CLIP = 100.
 
 
+def sampling_revision(cfg):
+    if cfg.memory == 'decisions':
+        from vesuvius.neural_tracing.fiber_follow.data.decision_memory import SAMPLING_REVISION as DECISIONS
+        return DECISIONS
+    return SAMPLING_REVISION
+
+
 def checkpoint_config(ck):
     if ck.get('model_type') not in MODEL_TYPES:
         raise ValueError('Unsupported checkpoint model type')
@@ -202,7 +209,7 @@ def model_config_from_args(args, checkpoint=None):
             raise ValueError('Model type must match checkpoint')
         return cfg
     cls = FlowConfig if args.model == 'flow_matching' else CoordinateRegressionConfig
-    options = {key: getattr(args, key) for key in ('stem_channels', 'stem_blocks', 'hidden',
+    options = {key: getattr(args, key) for key in ('stem_channels', 'stem_blocks', 'stem', 'memory', 'hidden',
         'encoder_ffn', 'decoder_layers', 'decoder_ffn', 'scorer_layers', 'activation_checkpointing')}
     options['layers'] = args.axial_layers
     if cls is FlowConfig:
@@ -212,14 +219,45 @@ def model_config_from_args(args, checkpoint=None):
     return cls(**options)
 
 
-def initialize_model_weights(cfg, device, initial=None):
+def load_matching_weights(model, state):
+    """Load tensors whose names and shapes match; new residual branches start at zero.
+
+    Returns the parameter/buffer names left at initialization. An encoder axial block or
+    image stem without loaded weights gets zero residual outputs, so the warm-started
+    network initially computes what the loaded tensors compute without them.
+    """
+    own = model.state_dict()
+    matched = {k: v for k, v in state.items() if k in own and own[k].shape == v.shape}
+    model.load_state_dict(matched, strict=False)
+    fresh = sorted(set(own)-set(matched))
+    with torch.no_grad():
+        for index, block in enumerate(model.encoder.blocks):
+            if f'encoder.blocks.{index}.mlp.2.weight' in fresh:
+                for layer in [axis.projection for axis in block.axes]+[block.mlp[-1]]:
+                    layer.weight.zero_()
+                    layer.bias.zero_()
+        if 'encoder.stem.projection.weight' in fresh:
+            model.encoder.stem.projection.weight.zero_()
+            model.encoder.stem.projection.bias.zero_()
+    return fresh
+
+
+def initialize_model_weights(cfg, device, initial=None, partial=False):
     """Weight-only initialization never inherits optimizer, replay or run settings."""
     model = build_model(cfg).to(device, memory_format=conv_memory_format(device))
+    fresh = []
     if initial is not None:
-        model.load_state_dict(initial['model'], strict=True)
+        if partial:
+            fresh = load_matching_weights(model, initial['model'])
+        else:
+            model.load_state_dict(initial['model'], strict=True)
     ema = copy.deepcopy(model).requires_grad_(False).eval()
     if initial is not None:
-        ema.load_state_dict(initial['ema'], strict=True)
+        if partial:
+            load_matching_weights(ema, initial['ema'])
+        else:
+            ema.load_state_dict(initial['ema'], strict=True)
+    model.reinitialized_tensors = fresh
     return model, ema
 
 
@@ -410,6 +448,19 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
                 name = prefix+'_'+suffix
                 sums[name] = sums.get(name, 0.)+float(value)
         batch = move_batch(cpu, device)
+        if model.cfg.memory == 'decisions':
+            # Entries recorded by earlier training forwards of the same live chain.
+            recorded = batch['x']['history_keys'] >= 0
+            if bool(recorded.any()):
+                if live_continuation is None:
+                    raise ValueError('Recorded decision memory requires the live continuation store')
+                features, found = live_continuation.attach_memory(batch['x'], model.cfg.hidden)
+                missing = recorded & ~found
+                batch['x']['history_features'] = features
+                batch['x']['history_valid'] = batch['x']['history_valid'] & ~missing
+                sums['memory_recorded'] = sums.get('memory_recorded', 0)+int(found.sum())
+                sums['memory_missing'] = sums.get('memory_missing', 0)+int(missing.sum())
+            sums['memory_encoded'] = sums.get('memory_encoded', 0)+int(cpu['x']['history_encode'].sum())
         valid = cpu['x']['history_valid']
         for name, value in dict(history_valid_slabs=valid.sum(),
                 history_age_sum=cpu['x']['history_ages'][valid].sum(),
@@ -561,6 +612,17 @@ def build_parser():
     ap.add_argument('--scorer-layers', type=int, default=CoordinateRegressionConfig.scorer_layers,
                     help='Causal segment survival decoder depth')
     ap.add_argument('--axial-layers', type=int, default=CoordinateRegressionConfig.layers)
+    ap.add_argument('--stem', choices=('residual', 'stride2'), default=CoordinateRegressionConfig.stem,
+                    help="Image stem: 'residual' full-resolution stem, or 'stride2' light stem")
+    ap.add_argument('--memory', choices=('slabs', 'decisions'), default=CoordinateRegressionConfig.memory,
+                    help="History memory: 'slabs' separate slab CNN, or 'decisions' main-encoder entries "
+                         "of earlier decisions (live chains start at seeds and reuse recorded entries)")
+    ap.add_argument('--chain-seed-fraction', type=float, default=0.,
+                    help='With --memory decisions: start live chains at a seed within this leading fraction '
+                         'of the traversal (0 keeps the ordinary fresh location)')
+    ap.add_argument('--init-partial', action='store_true',
+                    help='With --init-weights: build the model from these options and load only tensors whose '
+                         'names and shapes match; new axial blocks and the new stem start as identity residuals')
     ap.add_argument('--hidden', type=int, default=CoordinateRegressionConfig.hidden)
     ap.add_argument('--encoder-ffn', type=int, default=CoordinateRegressionConfig.encoder_ffn,
                     help='Axial image encoder feed-forward width')
@@ -660,6 +722,25 @@ def options_argv(options):
     return argv
 
 
+def validate_resume_options(args, recorded_options):
+    # Allow a new base LR without resetting AdamW or the schedule origin.
+    # Extending the endpoint also changes the cosine factor; callers preserving
+    # the current effective LR must rescale the base LR for the new endpoint.
+    # The frame selection comes from model_cfg unless explicitly overridden;
+    # an omitted CLI flag must not prevent resuming that recorded selection.
+    # Initialization is historical provenance, not a resume-time input.
+    # Operational settings may change on resume; sampling and label semantics may not.
+    ignored = {'resume','init_weights','reset_optimizer','lr','steps','frame_checkpoint','out_root','device','batch','grad_steps','workers','threads','dagger_threads','worker_cache_gb','dataset_config',
+               'remote_prefetch_connections','remote_prefetch_queue_size','remote_prefetch_timeout','remote_prefetch_lookahead',
+               'log_every','ckpt_every','diag_every','batch_diag_every','dagger_device','dagger_batch','dagger_forward_chunk',
+               'negative_bank_refresh_seconds','negative_bank_cache_mb','activation_checkpointing',
+               'history_grad_clip','rest_grad_clip','blur_probability','blur_sigma'}
+    for key,value in vars(args).items():
+        recorded = recorded_options.get(key)
+        if key not in ignored and json.dumps(recorded,sort_keys=True) != json.dumps(value,sort_keys=True):
+            raise ValueError(f'Resume option differs: {key}')
+
+
 def main(argv=None):
     args = build_parser().parse_args(argv)
     dataset_document = dataset_digest = None
@@ -709,10 +790,18 @@ def main(argv=None):
     if resume is not None and resume.get('kind') == 'weights':
         raise ValueError('Weight-only files require --init-weights, not --resume')
     initial = read_checkpoint(args.init_weights,MODEL_TYPES,'cpu') if args.init_weights else None
+    if args.init_partial and not args.init_weights:
+        raise ValueError('--init-partial requires --init-weights')
+    if not 0 <= args.chain_seed_fraction <= 1:
+        raise ValueError('Chain seed fraction must lie in [0, 1]')
     origin = resume or initial
-    cfg = model_config_from_args(args, origin)
+    initialization = resume.get('initialization') if resume else args.init_weights
+    # A partial warm start builds the requested architecture; a full one copies the source's.
+    cfg = model_config_from_args(args, resume or (None if args.init_partial else initial))
+    inherited_frame = initial['model_cfg'].get('frame_checkpoint') if args.init_partial else None
     if args.frame_checkpoint or not resume:
-        bind_frame_checkpoint(cfg, args.frame_checkpoint or cfg.frame_checkpoint or DEFAULT_FRAME_CHECKPOINT)
+        bind_frame_checkpoint(cfg, args.frame_checkpoint or cfg.frame_checkpoint or inherited_frame
+                              or DEFAULT_FRAME_CHECKPOINT)
     frame_predictor(cfg)  # validate once before dataset loading; workers reuse a frozen CPU predictor
     args.model = cfg.model_type
     if resume:
@@ -786,19 +875,7 @@ def main(argv=None):
     def role_provenance():
         return {role:bank.provenance() for role,bank in role_banks.items()}
     if resume:
-        # Allow a new base LR without resetting AdamW or the schedule origin.
-        # The frame selection comes from model_cfg unless explicitly overridden;
-        # an omitted CLI flag must not prevent resuming that recorded selection.
-        # Operational settings may change on resume; sampling and label semantics may not.
-        ignored = {'resume','reset_optimizer','lr','frame_checkpoint','out_root','device','batch','grad_steps','workers','threads','dagger_threads','worker_cache_gb','dataset_config',
-                   'remote_prefetch_connections','remote_prefetch_queue_size','remote_prefetch_timeout','remote_prefetch_lookahead',
-                   'log_every','ckpt_every','diag_every','batch_diag_every','dagger_device','dagger_batch','dagger_forward_chunk',
-                   'negative_bank_refresh_seconds','negative_bank_cache_mb','activation_checkpointing',
-                   'history_grad_clip','rest_grad_clip','blur_probability','blur_sigma'}
-        for key,value in vars(args).items():
-            recorded = resume['training_options'].get(key)
-            if key not in ignored and json.dumps(recorded,sort_keys=True) != json.dumps(value,sort_keys=True):
-                raise ValueError(f'Resume option differs: {key}')
+        validate_resume_options(args, resume['training_options'])
         if resume['seed_manifest_sha256'] != manifest['sha256'] or resume['fiber_manifest'] != fiber_manifest(fibers):
             raise ValueError('Resume data/manifest changed')
     if initial:
@@ -838,7 +915,9 @@ def main(argv=None):
     # Flow scales are fitted after constructing the common training dataset below.
     if isinstance(cfg, FlowConfig) and not cfg.flow_sigma:
         cfg.flow_sigma = tuple((1., 1.) for _ in range(cfg.n_future))
-    model, ema = initialize_model_weights(cfg, args.device, initial)
+    model, ema = initialize_model_weights(cfg, args.device, initial, partial=args.init_partial)
+    if args.init_partial:
+        progress(f'Partial warm start: {len(model.reinitialized_tensors)} tensors left at initialization')
     opt, done, lr_restart_step = initialize_training_optimizer(model, ema, args, resume)
     if args.reset_optimizer:
         progress(f'Fresh AdamW: one parameter group, all parameters trainable; LR restarts at update {done+1} '
@@ -894,6 +973,8 @@ def main(argv=None):
     sources = getattr(dataset, 'datasets', [dataset])
     for source_dataset in sources:
         source_dataset.set_step(done)
+        source_dataset.chain_seed_only = cfg.memory == 'decisions'
+        source_dataset.chain_seed_fraction = args.chain_seed_fraction if cfg.memory == 'decisions' else 0.
     from vesuvius.neural_tracing.fiber_follow.train.live_continuation import LiveContinuation, preserve_live_metadata
     live_continuation = LiveContinuation(dataset, policy=policy, steps=args.live_continuation_steps,
         switch_tolerance=args.bank_switch_tolerance, own_tolerance=args.bank_own_tolerance)
@@ -921,7 +1002,8 @@ def main(argv=None):
             task_budget=budget.to_dict(), operating_policy=policy.to_dict(),
             collection=collector_settings(collector),
             initialization=dict(checkpoint=str(Path(args.init_weights).resolve()), optimizer='fresh AdamW',
-                                warmup=args.warmup) if args.init_weights else None,
+                                warmup=args.warmup, partial=args.init_partial,
+                                reinitialized=model.reinitialized_tensors) if args.init_weights else None,
             data_policy=DATA_POLICY, frame_policy=configured_frame_policy(cfg),
             monitor_recovery_sha256=recovery_hash,
             seed_manifest_sha256=manifest['sha256'], fiber_manifest=fiber_manifest(fibers),
@@ -952,7 +1034,7 @@ def main(argv=None):
                               excursion_amplitude=sample.excursion_amplitude, excursion_rise=sample.excursion_rise),
         label_contract=dict(tolerance=sample.label_tolerance, max_recovery_distance=sample.max_recovery_distance),
         live_continuation_steps=args.live_continuation_steps,
-        history_sampling_revision=SAMPLING_REVISION, frame_policy=configured_frame_policy(cfg),
+        history_sampling_revision=sampling_revision(cfg), frame_policy=configured_frame_policy(cfg),
         history_policy='live_observed_slabs',sampling=asdict(identity_sampling),
         negative_bank_path=str(negative_bank.root),negative_bank_provenance=negative_bank.provenance(),
         bank_role_provenance=role_provenance()))
@@ -1008,7 +1090,7 @@ def main(argv=None):
             diagnostic = {} if tracer is not None and args.diag_every and step % args.diag_every == 0 else None
             metrics = optimizer_update(model, ema, opt, batches, step, lr, device=args.device,
                 tolerance=args.tolerance, confidence_weight=args.confidence_weight, ema_decay=args.ema_decay,
-                ema_ramp=not args.init_weights,
+                ema_ramp=not initialization,
                 n_commit=args.n_commit, compute_metrics=step % args.log_every == 0 or step == args.steps,
                 history_grad_clip=args.history_grad_clip, rest_grad_clip=args.rest_grad_clip,
                 diagnostic=diagnostic, live_continuation=live_continuation, ledger=ledger)
@@ -1046,11 +1128,11 @@ def main(argv=None):
             def save(path, resumable=False):
                 extra = dict(step=step, lr_restart_step=lr_restart_step, tolerance=args.tolerance, n_commit=args.n_commit,
                     operating_policy=policy.to_dict(), task_budget=budget.to_dict(), sample_contract=asdict(sample),
-                    initialization=str(Path(args.init_weights).resolve()) if args.init_weights else None,
+                    initialization=str(Path(initialization).resolve()) if initialization else None,
                     dataset_config=dataset_document, dataset_config_sha256=dataset_digest,
                     dataset_provenance=dataset_provenance,
                     ct_normalization=ct_normalization,
-                    history_sampling_revision=SAMPLING_REVISION, frame_policy=configured_frame_policy(cfg),
+                    history_sampling_revision=sampling_revision(cfg), frame_policy=configured_frame_policy(cfg),
                     samples_seen=prior_samples+observed_states,
                     identity_sampling=asdict(identity_sampling),
                     negative_bank_provenance=negative_bank.provenance() if negative_bank else None,
