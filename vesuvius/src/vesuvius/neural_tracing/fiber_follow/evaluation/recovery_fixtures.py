@@ -63,8 +63,14 @@ def make_recovery_states(fibers, seeds, cfg, provenance, vol, seed=20260925, str
         track_pos=np.asarray(track, dtype=np.float64))
 
 
-def recovery_batches(vol, states, fibers, sample, batch_builder=None, limit=0):
-    """Reconstruct frozen observations identically for images and recovery traces."""
+def recovery_batches(vol, states, fibers, sample, batch_builder=None, limit=0, learned_frames=False):
+    """Reconstruct frozen observations identically for images and recovery traces.
+
+    Fixture frames are CT structure-tensor frames. With ``learned_frames`` the recorded frame
+    is only the heading prior: the shared builder orients the crop with the model's learned
+    heading/normal predictor, exactly as for fresh training states and live traces, and
+    relabels targets in that frame.
+    """
     grid = torch.from_numpy(crop_local_grid(sample.crop)).float()
     count = len(states) if limit == 0 else min(limit, len(states))
     for j in range(count):
@@ -74,7 +80,8 @@ def recovery_batches(vol, states, fibers, sample, batch_builder=None, limit=0):
         item.update({k: getattr(states, k)[j] for k in SEED_FIELDS if hasattr(states, k)})
         item['observed_path'] = states.observed_prefix(j)
         item['fiber_family'] = f.tag
-        item['frame_policy'] = states.provenance.get('frame_policy', FRAME_POLICY)
+        if not learned_frames:
+            item['frame_policy'] = states.provenance.get('frame_policy', FRAME_POLICY)
         if batch_builder is None:
             raise ValueError('Recovery evaluation requires the common observation builder')
         cpu = batch_builder([item], vol)
@@ -85,8 +92,16 @@ def recovery_batches(vol, states, fibers, sample, batch_builder=None, limit=0):
 def evaluate_recovery_states(model, vol, states, fibers, sample, *, device='cpu',
                              tracer_class=ModelTracer, batch_builder=None, thresholds=DIAGNOSTIC_THRESHOLDS,
                              recovery_length=32., n_commit=8, tolerance=1.5, sampling_seed=0,
-                             limit=0, on_prediction=None, progress=None):
-    """Evaluate identical observed states; optional adapters change only model I/O."""
+                             limit=0, on_prediction=None, progress=None, learned_frames=None):
+    """Evaluate identical observed states; optional adapters change only model I/O.
+
+    ``learned_frames`` (default: whenever the model has a learned frame predictor) orients
+    each state's first crop like training and tracing do, instead of the fixture's CT frame.
+    """
+    from vesuvius.neural_tracing.fiber_follow.tracing.crop_frames import frame_predictor
+    from vesuvius.neural_tracing.fiber_follow.tracing.heading import LEARNED_FRAME_POLICY
+    if learned_frames is None:
+        learned_frames = frame_predictor(model.cfg) is not None
     states.validate_fibers(fibers)
     count = len(states) if limit == 0 else min(limit, len(states))
     if limit < 0 or recovery_length <= 0 or not 1 <= n_commit <= model.cfg.n_future:
@@ -99,7 +114,7 @@ def evaluate_recovery_states(model, vol, states, fibers, sample, *, device='cpu'
         dtype = torch.float32 if float_inputs and value.is_floating_point() else value.dtype
         return value.to(device=device, dtype=dtype)
     rows, predictions = [], []
-    for j, cpu in recovery_batches(vol, states, fibers, sample, batch_builder, limit):
+    for j, cpu in recovery_batches(vol, states, fibers, sample, batch_builder, limit, learned_frames):
         fi=int(states.fiber_idx[j]);f=fibers[fi]
         b = move(cpu)
         sampling={}
@@ -141,10 +156,14 @@ def evaluate_recovery_states(model, vol, states, fibers, sample, *, device='cpu'
             state['observed_path'] = states.observed_prefix(j)
             state['heading_start'] = int(states.heading_start[j])
             state['frame_policy'] = states.provenance.get('frame_policy', FRAME_POLICY)
+            if learned_frames:
+                # The trace starts from the same oriented crop as the batch above.
+                state['frame'] = cpu['crop_frame'][0].numpy()
+                state['frame_policy'] = LEARNED_FRAME_POLICY
             state.update({k: getattr(states, k)[j] for k in SEED_FIELDS if hasattr(states, k)})
             try:
                 from vesuvius.neural_tracing.fiber_follow.tracing.crop_frames import trace_family_kwargs
-                paths,reasons=tracer.trace(states.pos[j:j+1],states.frame[j:j+1,:,2],initial_states=[state],
+                paths,reasons=tracer.trace(states.pos[j:j+1],np.asarray(state["frame"])[None,:,2],initial_states=[state],
                                            **trace_family_kwargs(tracer, [f.tag]))
             finally:tracer.close()
             # Match only the original fiber near the stored arc correspondence.

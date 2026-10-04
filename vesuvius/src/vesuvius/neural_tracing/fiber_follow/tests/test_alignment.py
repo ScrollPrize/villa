@@ -228,6 +228,22 @@ def test_collection_takes_one_directed_episode_per_distinct_fiber_and_records_sk
     assert all(signs[fi] == -s for fi, s in (cursor.take(rng) for _ in range(10)))
 
 
+def test_length_weighted_coverage_favors_long_fibers_but_still_visits_each_once_per_epoch(tmp_path):
+    from vesuvius.neural_tracing.fiber_follow.tracing.collection import CoverageCursor
+    fibers = [line_fiber(3000 if i < 5 else 300, x=10.*i) for i in range(50)]
+    first = [CoverageCursor(fibers, seed=s, length_power=3.).state['order'][:5] for s in range(40)]
+    assert np.mean([fi < 5 for order in first for fi in order]) > .8
+    uniform = [CoverageCursor(fibers, seed=s).state['order'][:5] for s in range(40)]
+    assert np.mean([fi < 5 for order in uniform for fi in order]) < .3
+    cursor = CoverageCursor(fibers, seed=1, length_power=3.)
+    rng = np.random.default_rng(0)
+    assert sorted(cursor.take(rng)[0] for _ in range(50)) == list(range(50))
+    cursor.save(tmp_path/'coverage.json')
+    assert CoverageCursor.load(fibers, tmp_path/'coverage.json', 1, 3.).state == cursor.state
+    with pytest.raises(ValueError, match='length weighting'):
+        CoverageCursor.load(fibers, tmp_path/'coverage.json', 1, 0.)
+
+
 def follow(x, travelled, previous=None, y=0., stop=False):
     pos = np.array([y, 0., x])
     segment = np.array([pos]) if previous is None else np.array([previous, pos])

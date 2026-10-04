@@ -314,7 +314,7 @@ class DecisionBatchPrefetch:
 
 
 @torch.no_grad()
-def training_diagnostics(model, cpu_batch, tracer, fibers, seeds, out, step, log, *, device, dataset_name=None):
+def training_diagnostics(model, cpu_batch, tracer, fibers, seeds, out, step, log, *, device, dataset_name=None, memory=None):
     """Plot EMA proposals and the same monitor rollouts used for logged metrics."""
     from vesuvius.neural_tracing.fiber_follow.evaluation.diag import plot_batch, plot_curves, plot_refinement, plot_rollouts
     from vesuvius.neural_tracing.fiber_follow.evaluation.seeds import evaluate
@@ -325,6 +325,11 @@ def training_diagnostics(model, cpu_batch, tracer, fibers, seeds, out, step, log
     # Bound image size even when training with larger batches.
     def take(value):
         return {k: take(v) for k, v in value.items()} if isinstance(value, dict) else value[:6]
+    if getattr(model.cfg, 'memory', 'slabs') == 'decisions':
+        # Memory crops are stacked per batch, not per row: resolve them before taking rows.
+        from vesuvius.neural_tracing.fiber_follow.evaluation.batch_diagnostic import decision_memory_rows
+        with torch.no_grad():
+            cpu_batch = decision_memory_rows(model, cpu_batch, device, memory)
     batch = move_batch(take(cpu_batch), device)
     was_training = model.training
     threshold_before = tracer.p.confidence
@@ -682,10 +687,13 @@ def build_parser():
                     help='Global collection cadence; sources take turns and a busy launch is skipped')
     ap.add_argument('--dagger-fibers', type=int, default=64,
                     help='Distinct fibers per collection, one directed episode each')
+    ap.add_argument('--afv-dagger-fibers', type=int,
+                    help='Distinct fibers per AFV collection (default: --dagger-fibers); AFV coverage order '
+                         'favors fibers by length**--afv-length-power, like AFV training draws')
     ap.add_argument('--dagger-batch', type=int, default=8, help='Traces per collector forward batch')
     ap.add_argument('--dagger-forward-chunk', type=int, default=0, help='Rows per collector model call; 0 = whole batch')
     ap.add_argument('--afv-length-power', type=float, default=1.,
-                    help='AFV training fiber draws proportional to length**p; collection always covers fibers uniformly')
+                    help='AFV training fiber draws, and AFV collection order, proportional to length**p')
     ap.add_argument('--dagger-device')
     ap.add_argument('--dagger-trace-len', type=float, default=768.)
     ap.add_argument('--dagger-before', type=float, default=48., help='Dense decisions kept before an excursion')
@@ -770,6 +778,8 @@ def main(argv=None):
     if min(args.steps, args.batch, args.grad_steps, args.log_every, args.ckpt_every,
            args.threads, args.dagger_threads, args.flow_calibration_states, args.replay_keep, args.dagger_fibers, args.dagger_batch, args.recovery_seeds) < 1:
         raise ValueError('Positive counts required, including batch and grad steps')
+    if args.afv_dagger_fibers is not None and args.afv_dagger_fibers < 1:
+        raise ValueError('AFV collection fiber count must be positive')
     if min(args.workers, args.warmup, args.diag_every, args.batch_diag_every,
            args.long_diag_every, args.dagger_every, args.recovery_every, args.confidence_weight) < 0:
         raise ValueError('Invalid training settings')
@@ -960,13 +970,15 @@ def main(argv=None):
                 collectors.append((source['name'],collector))
                 continue
             (out/f'validation_{source["name"]}.json').write_text(json.dumps(source_dataset.validation_manifest,indent=2)+'\n')
+            afv_collection = dict(collection, length_power=args.afv_length_power,
+                                  fibers_per_collection=args.afv_dagger_fibers or args.dagger_fibers)
             collectors.append((source['name'],OnlineCollector(out/'dagger'/source['name'],
                 source['path'], (0,1), args.dagger_device or args.device,
-                initial=[c._dir for c in source_dataset.onpolicy], **collection,
+                initial=[c._dir for c in source_dataset.onpolicy], **afv_collection,
                 extra_args=('--dataset-name',source['name'],*bank_args))))
         collector = MultiSourceCollector(collectors)
         progress('Dataset sampling: '+', '.join(f'{name}={weight:.1%}' for name,weight in zip(dataset.names,dataset.weights))
-                 +f'; AFV training fiber draws proportional to length**{args.afv_length_power:g}; collection covers fibers uniformly')
+                 +f'; AFV training draws and AFV collection order proportional to length**{args.afv_length_power:g}')
     progress('Task budget per source: '+', '.join(f'{k} {v:.0%}' for k, v in budget.to_dict()['shares'].items())
              +f'; replay age ceiling {budget.replay_max_age}, event cap {budget.replay_event_cap}, '
              f'synthetic terminal fallback cap {budget.terminal_fallback_cap:.0%}')
@@ -1172,6 +1184,7 @@ def main(argv=None):
             if tracer is not None and args.diag_every and step % args.diag_every == 0:
                 began = time.monotonic()
                 training_diagnostics(ema, diagnostic['cpu_batch'], tracer, val_f, manifest['monitor'], out, step, log,
+                    memory=live_continuation,
                                      device=args.device,dataset_name=next((s['name'] for s in dataset_document['sources']
                                          if s['kind']=='paris4'),None) if dataset_document else None)
                 if dataset_document:

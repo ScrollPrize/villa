@@ -203,22 +203,35 @@ class CoverageCursor:
     traced twice in one collection. Each fiber alternates direction across its visits
     (random on the first).
     """
-    def __init__(self, fibers, seed, state=None):
+    def __init__(self, fibers, seed, state=None, length_power=0.):
         self.digest = hashlib.sha256(json.dumps(fiber_manifest(fibers), sort_keys=True).encode()).hexdigest()
         self.count, self.seed = len(fibers), int(seed)
+        if not np.isfinite(length_power) or length_power < 0:
+            raise ValueError('Coverage length power must be finite and nonnegative')
+        self.length_power = float(length_power)
+        lengths = np.asarray(fibers.lengths if hasattr(fibers, 'lengths') else [f.length for f in fibers], np.float64)
+        self.weights = lengths**self.length_power if self.length_power else None
         if state is None:
             state = dict(manifest=self.digest, seed=self.seed, epoch=0, position=0, order=self.permutation(0),
-                         directions=[[0, 0] for _ in range(self.count)])
+                         directions=[[0, 0] for _ in range(self.count)], length_power=self.length_power)
         if state['manifest'] != self.digest or len(state['directions']) != self.count or len(state['order']) != self.count:
             raise ValueError('Coverage cursor belongs to different fibers')
+        if float(state.get('length_power', 0.)) != self.length_power:
+            raise ValueError('Coverage cursor uses a different fiber length weighting')
         self.state = state
 
     @classmethod
-    def load(cls, fibers, path, seed):
-        return cls(fibers, seed, json.loads(Path(path).read_text()) if path and Path(path).exists() else None)
+    def load(cls, fibers, path, seed, length_power=0.):
+        return cls(fibers, seed, json.loads(Path(path).read_text()) if path and Path(path).exists() else None,
+                   length_power)
 
     def permutation(self, epoch):
-        return np.random.default_rng([self.seed, epoch]).permutation(self.count).tolist()
+        """Uniform, or weighted by length**power (sampling without replacement, Efraimidis-Spirakis)."""
+        rng = np.random.default_rng([self.seed, epoch])
+        if self.weights is None:
+            return rng.permutation(self.count).tolist()
+        keys = np.log(rng.random(self.count))/np.maximum(self.weights, 1e-300)
+        return np.argsort(-keys, kind='stable').tolist()
 
     def take(self, rng, exclude=()):
         """Next (fiber, sign) in coverage order outside ``exclude``; advances the cursor."""
@@ -292,6 +305,8 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer, bank_loader=
     ap.add_argument('--val-z', type=float, nargs=2, default=(45000., 48500.))
     ap.add_argument('--fibers-per-collection', type=int, default=64,
                     help='Distinct fibers; one seed position and one directed episode each')
+    ap.add_argument('--length-power', type=float, default=0.,
+                    help='Coverage order favors fibers by length**power (0: uniform), still visiting unseen fibers first')
     ap.add_argument('--coverage-state', help='Coverage cursor to continue (JSON); the updated cursor is '
                                              'written next to --out')
     ap.add_argument('--batch', type=int, default=8)
@@ -340,7 +355,7 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer, bank_loader=
     vol = FiberVolume(spec, cache_bytes=2 << 30)
     bank_detector = bank_loader(args, ck, train_f, band, spec) if bank_loader is not None else None
     rng = np.random.default_rng(args.seed)
-    cursor = CoverageCursor.load(train_f, args.coverage_state, args.seed)
+    cursor = CoverageCursor.load(train_f, args.coverage_state, args.seed, args.length_power)
     with warnings.catch_warnings():
         warnings.simplefilter('ignore')
         seeds, skipped = select_seeds(train_f, vol, cursor, args.fibers_per_collection, rng, band)

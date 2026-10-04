@@ -31,8 +31,13 @@ def simulated_decisions(path, arc):
 
 
 def memory_layout(item):
-    """Selected earlier decisions of this state: geometry, record and whether to encode."""
-    from vesuvius.neural_tracing.fiber_follow.data.history_slabs import fitted_heading
+    """Selected earlier decisions of this state: geometry, record and whether to encode.
+
+    An unrecorded entry gets the tracer's heading prior at that point (``trace_heading``:
+    the 12-voxel fit of the committed path, else the seed heading); ``orient_entries``
+    then resolves its crop frame with the tracer's frame rule.
+    """
+    from vesuvius.neural_tracing.fiber_follow.tracing.heading import trace_heading
     path = observed_path(item)
     arc = arclength(path)
     length = float(arc[-1])
@@ -53,7 +58,8 @@ def memory_layout(item):
         if record.get('frame') is not None:
             entry.update(frame=np.asarray(record['frame'], np.float64), frame_policy=item.get('frame_policy'))
         else:
-            entry['frame'] = frame_from_heading(fitted_heading(path, arc, at, heading))
+            entry['prior'] = trace_heading(entry['observed_path'], 0, heading)
+            entry['frame'] = frame_from_heading(entry['prior'])  # provisional, for read planning
         entries.append(entry)
     return entries, path, arc, length
 
@@ -99,32 +105,38 @@ def memory_allowed(item, cfg, band):
 
 
 def orient_entries(layouts, vol, cfg, pool=None):
-    """Final crop frames for unrecorded entries, using the slab frame rules; written back to records."""
+    """Final crop frames for unrecorded entries, by the tracer's decision rule; written back to records.
+
+    Like a tracer decision: the learned predictor resolves heading and normal from the
+    ``trace_heading`` prior and the committed path, with roll anchored to the preceding
+    decision (here the preceding entry of the same state; none for the first). Without a
+    learned predictor, the CT frame rule with the same prior and anchor.
+    """
     from vesuvius.neural_tracing.fiber_follow.tracing.crop_frames import frame_predictor, predict_frames
-    from vesuvius.neural_tracing.fiber_follow.tracing.heading import ct_frame, FRAME_POLICIES
+    from vesuvius.neural_tracing.fiber_follow.tracing.heading import ct_frame
     predictor = frame_predictor(cfg)
-    pending = [(item, e) for item, entries in layouts for e in entries
-               if e['encode'] and e['record'].get('frame') is None]
-    learned = [e for _, e in pending if predictor is not None and e.get('fiber_family')]
-    if learned:
-        frames = predict_frames(predictor, vol, [e['pos'] for e in learned], [e['frame'][:, 2] for e in learned],
-            [e['observed_path'] for e in learned], [e['fiber_family'] for e in learned], keep_heading=True, pool=pool)
-        for entry, frame in zip(learned, frames):
-            entry['_learned_frame'] = frame
-    previous = {}
-    for item, entry in pending:
-        anchor = previous.get(id(item), item['frame'] if item.get('frame_policy') in FRAME_POLICIES else None)
-        if '_learned_frame' in entry:
-            frame = entry.pop('_learned_frame')
-            if anchor is not None and frame[:, 0] @ anchor[:, 0] < 0:
-                frame[:, :2] *= -1
-            entry['frame_source'] = 3
-        else:
-            diagnostics = {}
-            frame = ct_frame(vol, entry['pos'], entry['frame'][:, 2], anchor, fallback=anchor, diagnostics=diagnostics)
-            entry['frame_source'] = diagnostics.get('source', -1)
-        entry['frame'] = entry['record']['frame'] = frame
-        previous[id(item)] = frame
+    pending = [[e for e in entries if e['encode'] and e['record'].get('frame') is None] for _, entries in layouts]
+    previous = [None]*len(pending)
+    # Entries of one state chain their roll anchor, so resolve them rank by rank across states.
+    for rank in range(max((len(p) for p in pending), default=0)):
+        batch = [(row, p[rank]) for row, p in enumerate(pending) if rank < len(p)]
+        learned = [(row, e) for row, e in batch if predictor is not None and e.get('fiber_family')]
+        if learned:
+            frames = predict_frames(predictor, vol, [e['pos'] for _, e in learned], [e['prior'] for _, e in learned],
+                [e['observed_path'] for _, e in learned], [e['fiber_family'] for _, e in learned],
+                previous=[previous[row] for row, _ in learned], pool=pool)
+            for (_, entry), frame in zip(learned, frames):
+                entry['_learned_frame'] = np.asarray(frame, np.float64)
+        for row, entry in batch:
+            if '_learned_frame' in entry:
+                frame = entry.pop('_learned_frame')
+                entry['frame_source'] = 3
+            else:
+                diagnostics = {}
+                frame = ct_frame(vol, entry['pos'], entry['prior'], previous[row], diagnostics=diagnostics)
+                entry['frame_source'] = diagnostics.get('source', -1)
+            entry['frame'] = entry['record']['frame'] = frame
+            previous[row] = frame
 
 
 def memory_inputs(items, vol, cfg, pool=None):
