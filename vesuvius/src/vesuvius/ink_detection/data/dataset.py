@@ -21,14 +21,16 @@ from vesuvius.ink_detection.config import InkDataConfig
 from vesuvius.ink_detection.data.geometry import (
     SURFACE_MASK_MAX_DISTANCE_LEVEL0_VOXELS,
     StoredResolutionIndex,
+    catmull_rom_vertex_mask,
     compute_native_crop_bbox,
-    filter_support_components,
+    filter_support_bands,
     native_tifxyz_pyramid_params,
     native_volume_downsample_factor,
+    paste_bands,
     project_labels_and_supervision,
     project_surface_distance,
     read_tifxyz_on_flat_grid,
-    select_flat_pixels_via_stored_resolution,
+    select_flat_pixel_bands_via_stored_resolution,
 )
 from vesuvius.ink_detection.data.normalization import (
     exclude_validation_voxels,
@@ -135,6 +137,7 @@ class InkDataset(Dataset):
         self._stored_resolution_index_cache: dict[
             tuple[str, float], StoredResolutionIndex
         ] = {}
+        self._vertex_mask_cache: dict[str, np.ndarray | None] = {}
         self.augmentations = None
         if self.do_augmentations and not config.augmentation.disabled:
             self.augmentations = build_augmentations(
@@ -272,6 +275,30 @@ class InkDataset(Dataset):
             self._stored_resolution_index_cache[key] = value
         return value
 
+    def _support_bands(self, segment: Segment, crop_bbox, *, required: bool):
+        patch_tifxyz = self._tifxyz(segment)
+        coarse_positions, coarse_valid = self._coarse_positions(
+            segment, patch_tifxyz
+        )
+        stride, coordinate_scale, coarse_pad = native_tifxyz_pyramid_params(
+            segment.scale
+        )
+        key = str(segment.segment_dir)
+        if key not in self._vertex_mask_cache:
+            self._vertex_mask_cache[key] = catmull_rom_vertex_mask(patch_tifxyz)
+        return select_flat_pixel_bands_via_stored_resolution(
+            patch_tifxyz,
+            crop_bbox,
+            coarse_native_pad=coarse_pad,
+            coarse_positions_zyx=coarse_positions,
+            coarse_valid=coarse_valid,
+            native_coordinate_scale=coordinate_scale,
+            flat_grid_stride=stride,
+            required=required,
+            coarse_index=self._coarse_index(segment, patch_tifxyz, coordinate_scale),
+            vertex_mask=self._vertex_mask_cache[key],
+        )
+
     def __len__(self) -> int:
         return len(self.patches)
 
@@ -332,10 +359,7 @@ class InkDataset(Dataset):
             else self._open(patch.segment.validation_mask, patch.segment.scale)
         )
         patch_tifxyz = self._tifxyz(patch.segment)
-        coarse_positions, coarse_valid = self._coarse_positions(
-            patch.segment, patch_tifxyz
-        )
-        stride, coordinate_scale, coarse_pad = native_tifxyz_pyramid_params(
+        stride, coordinate_scale, _ = native_tifxyz_pyramid_params(
             patch.segment.scale
         )
         patch_positions, patch_valid = read_tifxyz_on_flat_grid(
@@ -367,39 +391,43 @@ class InkDataset(Dataset):
             crop_bbox = maybe_translate_crop_bbox(
                 crop_bbox, patch_positions, patch_valid, patch_supervision
             )
-        support_bbox, support_positions, support_valid = (
-            select_flat_pixels_via_stored_resolution(
-                patch_tifxyz,
-                crop_bbox,
-                coarse_native_pad=coarse_pad,
-                coarse_positions_zyx=coarse_positions,
-                coarse_valid=coarse_valid,
-                native_coordinate_scale=coordinate_scale,
-                flat_grid_stride=stride,
-                coarse_index=self._coarse_index(
-                    patch.segment, patch_tifxyz, coordinate_scale
-                ),
+        bands = self._support_bands(patch.segment, crop_bbox, required=True)
+        band_supervision = []
+        for (band_y0, band_y1, band_x0, band_x1), _, _ in bands:
+            supervision = _read_flat_surface(
+                supervision_volume, y0=band_y0, y1=band_y1, x0=band_x0, x1=band_x1
             )
+            if validation_volume is not None:
+                validation = _read_flat_surface(
+                    validation_volume, y0=band_y0, y1=band_y1, x0=band_x0, x1=band_x1
+                )
+                supervision = exclude_validation_voxels(supervision, validation)
+            band_supervision.append(supervision)
+        support_bbox, band_keep = filter_support_bands(
+            bands,
+            band_supervision,
+            crop_bbox_zyx=crop_bbox,
+            patch_bbox_zyx=patch.bbox,
+            max_supervision_grid_distance=self.config.full_3d.support_grid_max_distance,
+        )
+        support_shape = (
+            support_bbox[1] - support_bbox[0],
+            support_bbox[3] - support_bbox[2],
+        )
+        support_limits = self.patch_size[1] * 4, self.patch_size[2] * 4
+        if support_shape[0] > support_limits[0] or support_shape[1] > support_limits[1]:
+            return None
+        # Points outside the kept mask are never projected, so the space
+        # between bands only needs a fill value.
+        band_boxes = [band[0] for band in bands]
+        support_positions = paste_bands(
+            band_boxes, [band[1] for band in bands], support_bbox, fill=np.nan
+        )
+        support_valid = paste_bands(band_boxes, band_keep, support_bbox, fill=False)
+        support_supervision = paste_bands(
+            band_boxes, band_supervision, support_bbox, fill=0
         )
         support_y0, support_y1, support_x0, support_x1 = support_bbox
-        support_supervision = _read_flat_surface(
-            supervision_volume,
-            y0=support_y0,
-            y1=support_y1,
-            x0=support_x0,
-            x1=support_x1,
-        )
-        if validation_volume is not None:
-            support_validation = _read_flat_surface(
-                validation_volume,
-                y0=support_y0,
-                y1=support_y1,
-                x0=support_x0,
-                x1=support_x1,
-            )
-            support_supervision = exclude_validation_voxels(
-                support_supervision, support_validation
-            )
         support_labels = _read_flat_surface(
             labels_volume,
             y0=support_y0,
@@ -407,27 +435,6 @@ class InkDataset(Dataset):
             x0=support_x0,
             x1=support_x1,
         )
-        (
-            support_bbox,
-            support_positions,
-            support_valid,
-            support_labels,
-            support_supervision,
-        ) = filter_support_components(
-            support_bbox_yx=support_bbox,
-            positions_zyx=support_positions,
-            valid_mask=support_valid,
-            inklabels_flat=support_labels,
-            supervision_flat=support_supervision,
-            crop_bbox_zyx=crop_bbox,
-            patch_bbox_zyx=patch.bbox,
-            max_supervision_grid_distance=self.config.full_3d.support_grid_max_distance,
-        )
-        support_shape = tuple(int(value) for value in support_valid.shape)
-        support_limits = self.patch_size[1] * 4, self.patch_size[2] * 4
-        if support_shape[0] > support_limits[0] or support_shape[1] > support_limits[1]:
-            return None
-        support_y0, support_y1, support_x0, support_x1 = support_bbox
         nx, ny, nz = patch_tifxyz.get_normals(
             support_y0 * stride,
             support_y1 * stride,
@@ -487,81 +494,65 @@ class InkDataset(Dataset):
                 continue
             if segment.inklabels is None or segment.supervision_mask is None:
                 continue
-            patch_tifxyz = self._tifxyz(segment)
-            coarse_positions, coarse_valid = self._coarse_positions(
-                segment, patch_tifxyz
-            )
-            stride, coordinate_scale, coarse_pad = native_tifxyz_pyramid_params(
-                segment.scale
-            )
-            selection = select_flat_pixels_via_stored_resolution(
-                patch_tifxyz,
-                crop_bbox,
-                coarse_native_pad=coarse_pad,
-                coarse_positions_zyx=coarse_positions,
-                coarse_valid=coarse_valid,
-                native_coordinate_scale=coordinate_scale,
-                flat_grid_stride=stride,
-                required=False,
-                coarse_index=self._coarse_index(
-                    segment, patch_tifxyz, coordinate_scale
-                ),
-            )
-            if selection is None:
+            bands = self._support_bands(segment, crop_bbox, required=False)
+            if not bands:
                 continue
-            support_bbox, positions, valid = selection
-            y0, y1, x0, x1 = support_bbox
+            patch_tifxyz = self._tifxyz(segment)
+            stride = native_tifxyz_pyramid_params(segment.scale)[0]
             active_supervision_path = (
                 segment.validation_mask
                 if patch.is_validation and segment.validation_mask is not None
                 else segment.supervision_mask
             )
-            other_supervision = _read_flat_surface(
-                self._open(active_supervision_path, segment.scale),
-                y0=y0,
-                y1=y1,
-                x0=x0,
-                x1=x1,
-            )
-            if not patch.is_validation and segment.validation_mask is not None:
-                other_validation = _read_flat_surface(
-                    self._open(segment.validation_mask, segment.scale),
+            # Bands never touch, so projecting them one by one marks the same
+            # voxels as projecting the window that spans them.
+            for (y0, y1, x0, x1), positions, valid in bands:
+                other_supervision = _read_flat_surface(
+                    self._open(active_supervision_path, segment.scale),
                     y0=y0,
                     y1=y1,
                     x0=x0,
                     x1=x1,
                 )
-                other_supervision = exclude_validation_voxels(
-                    other_supervision, other_validation
+                if not patch.is_validation and segment.validation_mask is not None:
+                    other_validation = _read_flat_surface(
+                        self._open(segment.validation_mask, segment.scale),
+                        y0=y0,
+                        y1=y1,
+                        x0=x0,
+                        x1=x1,
+                    )
+                    other_supervision = exclude_validation_voxels(
+                        other_supervision, other_validation
+                    )
+                valid &= np.asarray(other_supervision) > 0
+                if not np.any(valid):
+                    continue
+                other_labels = _read_flat_surface(
+                    self._open(segment.inklabels, segment.scale),
+                    y0=y0,
+                    y1=y1,
+                    x0=x0,
+                    x1=x1,
                 )
-            valid &= np.asarray(other_supervision) > 0
-            if not np.any(valid):
-                continue
-            other_labels = _read_flat_surface(
-                self._open(segment.inklabels, segment.scale),
-                y0=y0,
-                y1=y1,
-                x0=x0,
-                x1=x1,
-            )
-            nx, ny, nz = patch_tifxyz.get_normals(
-                y0 * stride, y1 * stride, x0 * stride, x1 * stride
-            )
-            normals = np.stack([nz, ny, nx], axis=-1)[::stride, ::stride].astype(
-                np.float32, copy=False
-            )
-            other_labels, other_supervision = project_labels_and_supervision(
-                positions_zyx=positions,
-                valid_mask=valid,
-                inklabels_flat=other_labels,
-                supervision_flat=other_supervision,
-                crop_bbox_zyx=crop_bbox,
-                normals_zyx=normals,
-                label_half_thickness=label_thickness,
-                background_half_thickness=background_thickness,
-            )
-            np.maximum(labels, other_labels, out=labels)
-            np.maximum(supervision, other_supervision, out=supervision)
+                nx, ny, nz = patch_tifxyz.get_normals(
+                    y0 * stride, y1 * stride, x0 * stride, x1 * stride
+                )
+                normals = np.stack([nz, ny, nx], axis=-1)[::stride, ::stride].astype(
+                    np.float32, copy=False
+                )
+                other_labels, other_supervision = project_labels_and_supervision(
+                    positions_zyx=positions,
+                    valid_mask=valid,
+                    inklabels_flat=other_labels,
+                    supervision_flat=other_supervision,
+                    crop_bbox_zyx=crop_bbox,
+                    normals_zyx=normals,
+                    label_half_thickness=label_thickness,
+                    background_half_thickness=background_thickness,
+                )
+                np.maximum(labels, other_labels, out=labels)
+                np.maximum(supervision, other_supervision, out=supervision)
         return labels, supervision
 
     def _tensor_sample(
