@@ -74,6 +74,8 @@ vc_add_test(NAME test_voxel_size_metadata)
 
 vc_add_test(NAME test_tifxyz_identity)
 
+vc_add_test(NAME test_inpaint_surface LIBS doctest::doctest vc_inpaint)
+
 vc_add_test(NAME test_appendmask_render)
 
 vc_add_test(NAME test_chunked_plane_sampler_fallback)
