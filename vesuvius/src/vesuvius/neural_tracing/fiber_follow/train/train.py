@@ -30,8 +30,12 @@ from vesuvius.neural_tracing.fiber_follow.train.training_log import format_train
 
 def validate_volume_source(spec, manifest):
     """Allow a different CT pyramid level, retaining frozen physical data/seeds."""
+    from vesuvius.neural_tracing.fiber_follow.shared.paths import recorded_path
     for key in ('fiber_zarr_dir', 'ct_zarr', 'fiber_level', 'grid_scale'):
-        if spec.to_dict()[key] != manifest['volume'][key]:
+        recorded = manifest['volume'][key]
+        if key in ('fiber_zarr_dir', 'ct_zarr') and recorded is not None:
+            recorded = recorded_path(recorded)
+        if spec.to_dict()[key] != recorded:
             raise ValueError(f'Volume source {key} differs from frozen manifest')
 
 
@@ -104,6 +108,7 @@ def fixed_rows(value, size):
 
 
 IDENTITY_INPUTS = ('identity_points', 'identity_point_mask', 'identity_anchor_mask', 'identity_anchor_features')
+VERIFY_INPUTS = ('identity_candidates', 'identity_samples')  # positions only; labels stay with the loss
 
 
 def training_inputs(x, hist, hmask, size):
@@ -114,7 +119,8 @@ def training_inputs(x, hist, hmask, size):
              'history_tokens', 'history_padding')
     # Optional observed-path geometry exists only for models that consume it; identity
     # points/anchors only for the memory-identity loss.
-    names += tuple(name for name in ('path_geometry', 'path_geometry_valid', *IDENTITY_INPUTS) if name in x)
+    names += tuple(name for name in ('path_geometry', 'path_geometry_valid', *IDENTITY_INPUTS, *VERIFY_INPUTS)
+                   if name in x)
     image = {name: fixed_rows(x[name] if name in x else defaults[name], size) for name in names}
     return image, fixed_rows(hist, size), fixed_rows(hmask, size)
 
@@ -149,12 +155,18 @@ def training_prediction(model, x, hist, hmask, confidence_threshold=.5, n_commit
         identity['identity_anchor_features'] = anchors.detach()
     else:
         tokens, padding = model.encode_history(x)
+        if model.cfg.identity_mode == 'verify' and targets is not None and 'identity_candidates' in targets:
+            identity = {key: targets[key] for key in VERIFY_INPUTS}
     if hist.is_cuda:
         timing[1].record()
     if hasattr(model, '_history_timings'):
         model._history_timings.append(timing if hist.is_cuda else time.perf_counter()-timing)
     image, history, mask = training_inputs(dict(x, history_tokens=tokens, history_padding=padding, **identity),
                                            hist, hmask, size)
+    if identity:
+        # Padding repeats row 0; the identity loss must see which rows are real and their fibers.
+        image['identity_row'] = torch.arange(size, device=hist.device) < actual
+        image['identity_fiber'] = fixed_rows(targets['fiber_id'], size)
     threshold = hist.new_full((), confidence_threshold)
     padded_targets = None if targets is None else {
         key: fixed_rows(value, size) for key, value in targets.items()
@@ -221,11 +233,13 @@ def model_config_from_args(args, checkpoint=None):
         return cfg
     cls = FlowConfig if args.model == 'flow_matching' else CoordinateRegressionConfig
     options = {key: getattr(args, key) for key in ('stem_channels', 'stem_blocks', 'stem', 'memory',
-        'identity_dim', 'identity_temperature', 'hidden',
+        'identity_dim', 'identity_temperature', 'identity_objective', 'identity_map', 'identity_feedback', 'hidden',
         'encoder_ffn', 'decoder_layers', 'decoder_ffn', 'scorer_layers', 'activation_checkpointing')}
     options['layers'] = args.axial_layers
     if cls is FlowConfig:
-        options.update(flow_steps=args.flow_steps, flow_draws=args.flow_draws)
+        options.update({key: getattr(args, key) for key in (
+            'flow_steps', 'flow_draws', 'flow_samples', 'flow_sample_scale', 'flow_time_conditioning',
+            'flow_sigma_floor', 'flow_unknown_planes')})
     else:
         options['recurrent_refinement_steps'] = args.recurrent_refinement_steps
     return cls(**options)
@@ -428,7 +442,8 @@ def clip_training_gradients(model, history_max_norm=HISTORY_GRAD_CLIP, rest_max_
 def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolerance=1.5,
                      confidence_weight=.5, ema_decay=.999, ema_ramp=True, n_commit=None, compute_metrics=True,
                      history_grad_clip=HISTORY_GRAD_CLIP, rest_grad_clip=REST_GRAD_CLIP,
-                     diagnostic=None, live_continuation=None, ledger=None, identity_weight=0.):
+                     diagnostic=None, live_continuation=None, ledger=None, identity_weight=0.,
+                     identity_exclude_synthetic=False):
     """One equally weighted task loss per independent supervised decision."""
     prepare_training(model, getattr(model, 'training_batch_size', 2))
     total = observed = sum(len(batch['hist']) for batch in batches)
@@ -495,16 +510,40 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
             loss = geometry + confidence_weight*confidence
             if 'identity_loss_per_state' in output:
                 loss = loss + identity_weight*output['identity_loss_per_state'].sum()/denominator
+            if 'identity_logits' in output:
+                from vesuvius.neural_tracing.fiber_follow.models.identity_verifier import verification_loss, verification_targets
+                verify = verification_targets(output, batch, identity_exclude_synthetic)
+                if getattr(model, '_identity_balance', None) is None:
+                    model._identity_balance = torch.ones(2, 2, device=verify['known'].device)
+                verify_loss, verify_planes = verification_loss(output['identity_logits'], verify, model._identity_balance)
+                loss = loss + identity_weight*verify_loss.sum()/denominator
         loss.backward()
+        if 'identity_logits' in output:
+            from vesuvius.neural_tracing.fiber_follow.models.identity_verifier import update_balance, verification_metrics
+            model._identity_balance = update_balance(model._identity_balance, verify['label'],
+                                                     verify['on_path'], verify['train'])
+            for key, value in verification_metrics(output, batch, verify, verify_loss, verify_planes).items():
+                accumulate(sums, key, value)
         if 'identity_pairs' in output:
             from vesuvius.neural_tracing.fiber_follow.data.state_labels import DEPARTURE_DISTANCE
             pairs, correct = output['identity_pairs'], output['identity_correct']
-            departed = (batch['match_distance'] > DEPARTURE_DISTANCE)[:, None]
-            for key, value in (('memory_identity_loss_sum', output['identity_loss_per_state'].detach().sum()),
-                               ('memory_identity_states', pairs.any(-1).sum()), ('memory_identity_pairs', pairs.sum()),
-                               ('memory_identity_correct', correct.sum()),
-                               ('memory_identity_departed_pairs', (pairs & departed).sum()),
-                               ('memory_identity_departed_correct', (correct & departed).sum())):
+            departed = batch['match_distance'] > DEPARTURE_DISTANCE
+            age = batch['identity_departure_age']
+            # Departures the crop can still see (<=24 voxels) vs older ones only memory can reveal.
+            groups = dict(departed_recent=departed & (age <= 24), departed_old=departed & (age > 24),
+                          departed_old_afv=departed & (age > 24) & (batch['dataset_id'] != 0 if 'dataset_id' in batch
+                                                                    else torch.zeros_like(departed)))
+            values = [('memory_identity_loss_sum', output['identity_loss_per_state'].detach().sum()),
+                      ('memory_identity_states', (pairs.any(-1) | output['identity_anchor_valid']).sum()),
+                      ('memory_identity_pairs', pairs.sum()), ('memory_identity_correct', correct.sum()),
+                      ('memory_identity_anchor_pairs', output['identity_anchor_valid'].sum()),
+                      ('memory_identity_anchor_correct', output['identity_anchor_correct'].sum()),
+                      ('memory_identity_control_pairs', output['identity_control_pairs'].sum()),
+                      ('memory_identity_control_correct', output['identity_control_correct'].sum())]
+            for name, rows in groups.items():
+                values += [(f'memory_identity_{name}_pairs', (pairs & rows[:, None]).sum()),
+                           (f'memory_identity_{name}_correct', (correct & rows[:, None]).sum())]
+            for key, value in values:
                 accumulate(sums, key, value)
         if live_continuation is not None:
             live_continuation.feedback(cpu, output, step)
@@ -595,6 +634,17 @@ def build_parser():
     ap.add_argument('--flow-steps', type=int, default=4)
     ap.add_argument('--flow-draws', type=int, default=64)
     ap.add_argument('--flow-calibration-states', type=int, default=2048)
+    ap.add_argument('--flow-samples', type=int, default=FlowConfig.flow_samples,
+                    help='Flow: Gaussian-start proposals after the zero-start path, scored in training and '
+                         'used as retries in tracing')
+    ap.add_argument('--flow-sample-scale', type=float, default=FlowConfig.flow_sample_scale,
+                    help='Flow: standard deviation of those starts, in residual-scale units')
+    ap.add_argument('--flow-time-conditioning', choices=('input', 'adaln'), default=FlowConfig.flow_time_conditioning,
+                    help="Flow: 'adaln' also modulates every decoder branch and the output norm by the time")
+    ap.add_argument('--flow-sigma-floor', type=float, default=FlowConfig.flow_sigma_floor,
+                    help='Flow: lower bound (voxels) of the fitted residual scales, the width of the noise prior')
+    ap.add_argument('--flow-unknown-planes', choices=('padded', 'own_path'), default=FlowConfig.flow_unknown_planes,
+                    help="Flow: 'own_path' keeps target-less planes in self-attention, following the model's own path")
     ap.add_argument('--dagger-threads', type=int, default=4)
     ap.add_argument('--name', required=True)
     ap.add_argument('--fiber-zarrs')
@@ -653,7 +703,26 @@ def build_parser():
                     help='With --memory decisions: width of the linear projection for the memory-identity '
                          'InfoNCE loss (0 disables it)')
     ap.add_argument('--identity-temperature', type=float, default=CoordinateRegressionConfig.identity_temperature)
-    ap.add_argument('--identity-weight', type=float, default=.1, help='Memory-identity InfoNCE coefficient')
+    ap.add_argument('--identity-weight', type=float, default=.1,
+                    help='Memory-identity loss coefficient (InfoNCE or verification)')
+    ap.add_argument('--identity-objective', choices=('infonce', 'verify'),
+                    default=CoordinateRegressionConfig.identity_objective,
+                    help="With --memory decisions: 'infonce' (needs --identity-dim) or 'verify', a verifier that "
+                         "reads decision-memory tokens and labels current-crop locations on/off the original fiber")
+    ap.add_argument('--identity-map', action=argparse.BooleanOptionalAction,
+                    default=CoordinateRegressionConfig.identity_map,
+                    help='With --identity-objective verify: add the dense identity field to decoder/scorer image tokens')
+    ap.add_argument('--identity-feedback', action=argparse.BooleanOptionalAction,
+                    default=CoordinateRegressionConfig.identity_feedback,
+                    help='With --identity-objective verify: feed identity-field samples to scorer segments and retries')
+    ap.add_argument('--identity-exclude-synthetic', action=argparse.BooleanOptionalAction, default=False,
+                    help='With --identity-objective verify: synthetic switch states (synthetic_terminal/'
+                         'synthetic_identity) only evaluate the verifier; its loss uses real states')
+    ap.add_argument('--identity-switch-tail', type=float, nargs=2, default=IdentitySampling.identity_switch_tail,
+                    metavar=('MIN', 'MAX'), help='Neighbor tail of the synthetic_identity task, trace voxels')
+    ap.add_argument('--memory-augmentation', choices=('shared', 'independent'),
+                    default=IdentitySampling.memory_augmentation,
+                    help="Photometric/blur draw of memory crops encoded in training: the current crop's, or per crop")
     ap.add_argument('--lr-step-offset', type=int, default=0,
                     help='Continue another schedule: the cosine is evaluated at step+offset over steps+offset '
                          '(warmup still counts this run\'s own updates)')
@@ -666,7 +735,8 @@ def build_parser():
     ap.add_argument('--activation-checkpointing', action=argparse.BooleanOptionalAction, default=False)
     ap.add_argument('--task-share', action='append', default=[], metavar='TASK=SHARE',
                     help='Override one task share (fresh, live, dagger_pre_excursion, dagger_recoverable, '
-                         'dagger_terminal, dagger_premature_stop, dagger_ordinary, synthetic_terminal); shares sum to one')
+                         'dagger_terminal, dagger_premature_stop, dagger_ordinary, synthetic_terminal, '
+                         'synthetic_identity); shares sum to one')
     ap.add_argument('--terminal-fallback-cap', type=float, default=TaskBudget.terminal_fallback_cap,
                     help='Largest fraction of terminal replay slots filled by certified synthetic failures')
     ap.add_argument('--replay-max-age', type=int, default=TaskBudget.replay_max_age,
@@ -776,8 +846,10 @@ def validate_resume_options(args, recorded_options):
                'negative_bank_refresh_seconds','negative_bank_cache_mb','activation_checkpointing',
                'history_grad_clip','rest_grad_clip','blur_probability','blur_sigma',
                'tolerance'}  # confidence-label tolerance; the departure threshold is a separate constant
+    defaults = build_parser()
     for key,value in vars(args).items():
-        recorded = recorded_options.get(key)
+        # Options added after a run started were recorded implicitly at their default.
+        recorded = recorded_options[key] if key in recorded_options else defaults.get_default(key)
         if key not in ignored and json.dumps(recorded,sort_keys=True) != json.dumps(value,sort_keys=True):
             raise ValueError(f'Resume option differs: {key}')
 
@@ -837,7 +909,6 @@ def main(argv=None):
         raise ValueError('--init-partial requires --init-weights')
     if not 0 <= args.chain_seed_fraction <= 1:
         raise ValueError('Chain seed fraction must lie in [0, 1]')
-    origin = resume or initial
     initialization = resume.get('initialization') if resume else args.init_weights
     # A partial warm start builds the requested architecture; a full one copies the source's.
     cfg = model_config_from_args(args, resume or (None if args.init_partial else initial))
@@ -857,7 +928,8 @@ def main(argv=None):
     identity_sampling = IdentitySampling(
         blur_probability=args.blur_probability,blur_sigma=args.blur_sigma,
         lateral_fraction=args.lateral_fraction,bank_hard_fraction=args.bank_hard_fraction,
-        bank_coverage_probability=args.bank_coverage_probability,synthetic_tail=args.synthetic_tail)
+        bank_coverage_probability=args.bank_coverage_probability,synthetic_tail=args.synthetic_tail,
+        identity_switch_tail=args.identity_switch_tail,memory_augmentation=args.memory_augmentation)
     if not args.negative_bank:
         raise ValueError('Training requires --negative-bank')
     if not 1 <= args.n_commit <= cfg.n_future:
@@ -927,8 +999,8 @@ def main(argv=None):
         # placed on it may differ; the new run evaluates both checkpoints on its own seeds.
         if fiber_identities(initial['fiber_manifest']) != fiber_identities(fiber_manifest(fibers)):
             raise ValueError('Initialization checkpoint used different fibers or evaluation splits')
-        splits = lambda document: [{k: v for k, v in s.items() if k != 'weight'} for s in (document or {}).get('sources', [])]
-        if splits(initial.get('dataset_config')) != splits(dataset_document):
+        from vesuvius.neural_tracing.fiber_follow.data.datasets import same_sources
+        if not same_sources(initial.get('dataset_config'), dataset_document):
             raise ValueError('Initialization checkpoint used different dataset sources or holdouts')
     out = prepare_run_dir(args.out_root, args.name, resume is not None)
     if dataset_document:
@@ -955,9 +1027,12 @@ def main(argv=None):
             raise ValueError('Monitor recovery fixture changed since checkpoint')
     progress('Initializing models and optimizer')
     progress(f'Independent gradient clipping: history={args.history_grad_clip:g}, rest={args.rest_grad_clip:g} (0 disables clipping)')
-    # Flow scales are fitted after constructing the common training dataset below.
-    if isinstance(cfg, FlowConfig) and not cfg.flow_sigma:
-        cfg.flow_sigma = tuple((1., 1.) for _ in range(cfg.n_future))
+    # Flow scales are fitted after constructing the common training dataset below, unless the
+    # configuration came with them (resume or a full flow warm start). A partial warm start builds
+    # the configuration from arguments and therefore fits them, even from a flow checkpoint.
+    fit_flow_scales = isinstance(cfg, FlowConfig) and not cfg.flow_sigma
+    if fit_flow_scales:
+        cfg.flow_sigma = tuple((cfg.flow_sigma_floor,)*2 for _ in range(cfg.n_future))
     model, ema = initialize_model_weights(cfg, args.device, initial, partial=args.init_partial)
     if args.init_partial:
         progress(f'Partial warm start: {len(model.reinitialized_tensors)} tensors left at initialization')
@@ -1028,7 +1103,7 @@ def main(argv=None):
     if args.workers:
         loader_args.update(prefetch_factor=2, persistent_workers=True)
     loader = torch.utils.data.DataLoader(dataset, **loader_args)
-    if isinstance(cfg, FlowConfig) and origin is None:
+    if fit_flow_scales:
         from vesuvius.neural_tracing.fiber_follow.models.flow import fit_flow_sigma
         progress('Fitting flow residual scales from training states')
         cfg.flow_sigma = fit_flow_sigma(iter(loader), cfg, args.flow_calibration_states)
@@ -1138,7 +1213,7 @@ def main(argv=None):
                 ema_ramp=not initialization,
                 n_commit=args.n_commit, compute_metrics=step % args.log_every == 0 or step == args.steps,
                 history_grad_clip=args.history_grad_clip, rest_grad_clip=args.rest_grad_clip,
-                identity_weight=args.identity_weight,
+                identity_weight=args.identity_weight, identity_exclude_synthetic=args.identity_exclude_synthetic,
                 diagnostic=diagnostic, live_continuation=live_continuation, ledger=ledger)
             observed_states += metrics['observed_states']
             interval_states += metrics['observed_states']

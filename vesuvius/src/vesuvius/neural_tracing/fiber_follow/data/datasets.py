@@ -17,6 +17,8 @@ from vesuvius.neural_tracing.fiber_follow.data.neighbor_bank import NeighborBank
 
 PRIMARY_OPTIONS = ('fibers', 'fiber_zarrs', 'ct', 'manifest', 'val_z', 'negative_bank',
                    'near_negative_bank', 'following_bank', 'continuation_bank')
+# Source values that read_dataset_config resolves to filesystem paths.
+DATASET_PATH_KEYS = tuple(k for k in PRIMARY_OPTIONS if k != 'val_z')+('path',)
 
 
 def ct_source_spec(source, cache_dir):
@@ -74,6 +76,19 @@ def read_dataset_config(path):
             raise ValueError(f'Paris 4 source is missing {key}')
     digest = hashlib.sha256(json.dumps(document, sort_keys=True).encode()).hexdigest()
     return document, digest
+
+
+def same_sources(recorded, document):
+    """Same dataset sources and holdouts (weights may differ). Paths in ``recorded`` that were
+    written on another machine are relocated (shared.paths) before the exact comparison."""
+    from vesuvius.neural_tracing.fiber_follow.shared.paths import recorded_path
+    def place(key, value, relocate):
+        if relocate and key in DATASET_PATH_KEYS and isinstance(value, str) and '://' not in value:
+            return recorded_path(value)
+        return value
+    splits = lambda value, relocate: [{k: place(k, v, relocate) for k, v in s.items() if k != 'weight'}
+                                      for s in (value or {}).get('sources', [])]
+    return splits(recorded, True) == splits(document, False)
 
 
 def validate_dataset_resume(checkpoint, document, digest):

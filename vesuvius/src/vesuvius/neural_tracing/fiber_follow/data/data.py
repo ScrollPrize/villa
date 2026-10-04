@@ -530,11 +530,11 @@ def refresh_frame_targets(item):
 # One task budget, applied within each dataset source. Sampling allocations, not label
 # ratios: every delivered action is labeled by the shared state contract.
 TASKS = ('fresh', 'live', 'dagger_pre_excursion', 'dagger_recoverable', 'dagger_terminal',
-         'dagger_premature_stop', 'dagger_ordinary', 'synthetic_terminal')
+         'dagger_premature_stop', 'dagger_ordinary', 'synthetic_terminal', 'synthetic_identity')
 TASK = {name: index for index, name in enumerate(TASKS)}
 DEFAULT_TASK_SHARES = dict(fresh=.40, live=.25, dagger_pre_excursion=.08, dagger_recoverable=.06,
                            dagger_terminal=.08, dagger_premature_stop=.03, dagger_ordinary=.05,
-                           synthetic_terminal=.05)
+                           synthetic_terminal=.05, synthetic_identity=0.)
 FALLBACKS = ('none', 'fresh', 'synthetic', 'no_live_state')
 SOURCES = ('fresh', 'live', 'replay', 'synthetic')
 SOURCE = {name: index for index, name in enumerate(SOURCES)}
@@ -808,12 +808,15 @@ class FollowDataset(torch.utils.data.IterableDataset):
                 return item
         return item
 
-    def synthetic_item(self, rng):
-        """Certified wrong continuation with visible original-fiber evidence, or None."""
+    def synthetic_item(self, rng, long_tail=False):
+        """Certified wrong continuation with visible original-fiber evidence, or None.
+
+        ``long_tail``: an identity switch, whose departure only memory can reveal."""
         if not hasattr(self.batch_builder, 'synthetic_terminal'):
             return None
         for _ in range(3):
-            item = self.batch_builder.synthetic_terminal(self.cfg, rng)
+            item = (self.batch_builder.synthetic_terminal(self.cfg, rng, long_tail=True) if long_tail
+                    else self.batch_builder.synthetic_terminal(self.cfg, rng))
             if item is None:
                 continue
             item = self.prepare(item, rng)
@@ -874,8 +877,8 @@ class FollowDataset(torch.utils.data.IterableDataset):
                     else None)
             if item is None:
                 item, fallback, delivered = self.fresh_item(rng, windows), 'no_live_state', 'fresh'
-        elif name == 'synthetic_terminal':
-            item = self.synthetic_item(rng)
+        elif name in ('synthetic_terminal', 'synthetic_identity'):
+            item = self.synthetic_item(rng, long_tail=name == 'synthetic_identity')
             if item is None:
                 item, fallback, delivered = self.fresh_item(rng, windows), 'fresh', 'fresh'
         else:

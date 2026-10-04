@@ -295,3 +295,16 @@ def test_real_collector_roundtrip_on_afv_with_ct_only_inputs(tmp_path, kind):
     assert len(states)>0 and states.provenance['volume']['ct_zarr']==str(tmp_path/'ct')
     with pytest.raises(ValueError,match='incompatible fibers'):
         states.validate_fibers(AFVFibers(p,validation=validation,split='validation'))
+
+
+def test_initialization_sources_match_after_explicit_relocation_only(monkeypatch):
+    from vesuvius.neural_tracing.fiber_follow.data.datasets import same_sources
+    source = lambda root, weight=.5: dict(name='paris4', kind='paris4', weight=weight, fibers=f'{root}/fibers',
+        manifest=f'{root}/seeds.json', ct='s3://bucket/ct.zarr', validation=dict(strategy='fiber_hash', seed=1))
+    recorded, here = dict(sources=[source('/mnt/a')]), dict(sources=[source('/copy', weight=1.)])
+    assert same_sources(recorded, dict(sources=[source('/mnt/a', weight=1.)]))  # weights may change
+    assert not same_sources(recorded, here)
+    monkeypatch.setenv('FIBER_FOLLOW_PATH_MAP', '/mnt/a=/copy')
+    assert same_sources(recorded, here)
+    here['sources'][0]['validation'] = dict(strategy='fiber_hash', seed=2)
+    assert not same_sources(recorded, here)  # holdouts never relocate

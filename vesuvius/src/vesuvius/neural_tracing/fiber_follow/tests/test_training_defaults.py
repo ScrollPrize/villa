@@ -39,7 +39,7 @@ def test_coordinate_regression_launcher_parses_to_the_planned_model_and_budget()
                               replay_max_age=args.replay_max_age, replay_event_cap=args.replay_event_cap)
     assert dict(zip(TASKS, budget.shares)) == dict(
         fresh=.40, live=.25, dagger_pre_excursion=.08, dagger_recoverable=.06, dagger_terminal=.08,
-        dagger_premature_stop=.03, dagger_ordinary=.05, synthetic_terminal=.05)
+        dagger_premature_stop=.03, dagger_ordinary=.05, synthetic_terminal=.05, synthetic_identity=0.)
     assert (budget.replay_max_age, budget.replay_event_cap, budget.terminal_fallback_cap) == (12000, 64, .5)
     for option, value in (('--batch', '0'), ('--grad-steps', '0'), ('--grad-steps', '-1')):
         with pytest.raises(ValueError, match='Positive counts'):
@@ -100,6 +100,11 @@ def test_initialized_run_can_resume_with_lower_lr_without_changing_training_cont
         setattr(changed, key, value)
         with pytest.raises(ValueError, match=f'Resume option differs: {key}'):
             train.validate_resume_options(changed, vars(original))
+    # An option added after the run started counts as recorded at its default, and only there.
+    older = {k: v for k, v in vars(original).items() if k != 'flow_sigma_floor'}
+    train.validate_resume_options(resumed, older)
+    with pytest.raises(ValueError, match='Resume option differs: flow_sigma_floor'):
+        train.validate_resume_options(SimpleNamespace(**dict(vars(resumed), flow_sigma_floor=3.)), older)
 
 
 def test_lr_step_offset_continues_the_original_cosine_after_its_warmup():

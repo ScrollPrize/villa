@@ -24,6 +24,11 @@ class SegmentSurvivalScorer(nn.Module):
         self.history_attention = HistoryAttention(h, cfg.heads)
         self.norm = nn.LayerNorm(h)
         self.failure = nn.Linear(h, 1)
+        if getattr(cfg, 'identity_feedback', False):
+            # Identity-field samples along each segment; zero-initialized so a warm start is unchanged.
+            self.identity_query = nn.Linear(self.samples_per_segment, h)
+            nn.init.zeros_(self.identity_query.weight)
+            nn.init.zeros_(self.identity_query.bias)
 
     def segment_samples(self, points):
         """Every location depends only on this endpoint and its predecessor."""
@@ -35,13 +40,15 @@ class SegmentSurvivalScorer(nn.Module):
     def project_memory(self, memory, padding):
         return [layer.project_memory(memory) for layer in self.layers]
 
-    def forward(self, spatial, points, projected, padding, history):
+    def forward(self, spatial, points, projected, padding, history, identity=None):
         if len(history) == 2:
             history = self.history_attention.project_memory(*history)
         start = torch.cat((torch.zeros_like(points[:, :1]), points[:, :-1]), 1)
         delta = points-start
         geometry = torch.cat((start, points, delta, delta.norm(dim=-1, keepdim=True)), -1)/16.
         query = self.query(torch.cat((spatial.flatten(2), geometry), -1))
+        if identity is not None:
+            query = query+self.identity_query(identity.to(query.dtype))
         # Only the proposed path is causal. Cross-attention reads all observed
         # deep/fine-plane/reference/memory tokens; no generator hidden state enters here.
         k = points.shape[1]

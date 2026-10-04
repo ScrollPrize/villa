@@ -111,14 +111,18 @@ class HistoryAttention(nn.Module):
         return k, v, allowed, empty
 
     def forward_cached(self, query, k, v, allowed, empty):
+        return query+self.attend(self.norm(query), k, v, allowed, empty)
+
+    def attend(self, normed, k, v, allowed, empty):
+        """The residual branch for already normalized queries; empty rows contribute zero."""
         attn = self.attention
         width, heads = attn.embed_dim, attn.num_heads
-        q = F.linear(self.norm(query), attn.in_proj_weight[:width], attn.in_proj_bias[:width])
-        q = q.reshape(len(query), -1, heads, width//heads).transpose(1, 2)
+        q = F.linear(normed, attn.in_proj_weight[:width], attn.in_proj_bias[:width])
+        q = q.reshape(len(normed), -1, heads, width//heads).transpose(1, 2)
         value = F.scaled_dot_product_attention(q, k, v, attn_mask=allowed)
-        value = value.transpose(1, 2).reshape(len(query), -1, width)
+        value = value.transpose(1, 2).reshape(len(normed), -1, width)
         value = attn.out_proj(value)
-        return query+torch.where(empty[:, None, None], 0., value)
+        return torch.where(empty[:, None, None], 0., value)
 
     def forward(self, query, tokens, padding):
         return self.forward_cached(query, *self.project_memory(tokens, padding))

@@ -38,6 +38,10 @@ class CoordinateRegressionConfig:
     memory: str = 'slabs'  # 'slabs' separate historical-slab CNN, or 'decisions' encoder features of past decisions
     identity_dim: int = 0  # >0 (decision memory): linear projection for the memory-identity InfoNCE loss
     identity_temperature: float = .1
+    # 'infonce' (with identity_dim) or 'verify': a memory-conditioned on-fiber verifier (identity_verifier.py).
+    identity_objective: str = 'infonce'
+    identity_map: bool = False  # verify: the dense identity field enters the decoder/scorer image tokens
+    identity_feedback: bool = False  # verify: field samples enter scorer segment queries and retry fusion
     frame_checkpoint: str | None = None  # frozen heading/normal model used by crop builders
     frame_checkpoint_sha256: str | None = None
 
@@ -49,6 +53,12 @@ class CoordinateRegressionConfig:
             raise ValueError('Identity projection width must be a nonnegative integer and its temperature positive')
         if self.identity_dim and self.memory != 'decisions':
             raise ValueError('The memory-identity loss requires decision memory')
+        if self.identity_objective not in ('infonce', 'verify'):
+            raise ValueError("Identity objective must be 'infonce' or 'verify'")
+        if self.identity_objective == 'verify' and (self.memory != 'decisions' or self.identity_dim):
+            raise ValueError('Identity verification requires decision memory and no InfoNCE projection')
+        if (self.identity_map or self.identity_feedback) and self.identity_objective != 'verify':
+            raise ValueError('The identity field requires the verification objective')
         if self.stem not in ('residual', 'stride2') or self.memory not in ('slabs', 'decisions'):
             raise ValueError("Stem must be 'residual' or 'stride2'; memory must be 'slabs' or 'decisions'")
         if type(self.stem_channels) is not int or self.stem_channels < 1 or type(self.stem_blocks) is not int or self.stem_blocks < 1:
@@ -101,6 +111,13 @@ class CoordinateRegressionConfig:
     @property
     def token_shape(self):
         return tuple(math.ceil(n/s) for n,s in zip((self.fine.depth,self.fine.width,self.fine.width),self.token_stride))
+
+    @property
+    def identity_mode(self):
+        """Which memory-identity training targets this model consumes, if any."""
+        if self.identity_objective == 'verify':
+            return 'verify'
+        return 'infonce' if self.identity_dim else None
 
     def to_dict(self):
         return asdict(self)
@@ -253,25 +270,45 @@ class PathDecoderLayer(nn.TransformerDecoderLayer):
         return x+self._ff_block(self.norm3(x))
 
     def cross_attention(self, x, kv, padding):
+        return x+self.dropout2(self.cross_attention_value(self.norm2(x), kv, padding))
+
+    def cross_attention_value(self, normed, kv, padding):
+        """Image attention output for already normalized queries (the residual branch)."""
         attn = self.multihead_attn
         h, heads = attn.embed_dim, attn.num_heads
-        q = F.linear(self.norm2(x), attn.in_proj_weight[:h], attn.in_proj_bias[:h])
-        q = q.reshape(len(x), -1, heads, h//heads).transpose(1, 2).contiguous()
+        q = F.linear(normed, attn.in_proj_weight[:h], attn.in_proj_bias[:h])
+        q = q.reshape(len(normed), -1, heads, h//heads).transpose(1, 2).contiguous()
         value = self.attend_memory(q, kv, padding)
-        value = value.transpose(1, 2).contiguous().reshape(len(x), -1, h)
-        x = x+self.dropout2(attn.out_proj(value))
-        return x
+        value = value.transpose(1, 2).contiguous().reshape(len(normed), -1, h)
+        return attn.out_proj(value)
 
-    def forward_draws(self, query, kv, padding, self_padding, *, history, history_attention):
-        """Independent self-attention draws sharing differentiable observation K/V."""
+    def forward_draws(self, query, kv, padding, self_padding, *, history, history_attention, modulation=None):
+        """Independent self-attention draws sharing differentiable observation K/V.
+
+        ``modulation`` (B, D, 4, 3, H) conditions each pre-norm branch (self-attention, image attention,
+        history attention, FFN) per draw: normalized input * (1+scale) + shift, branch output * (1+gate).
+        Zero modulation is exactly the unmodulated layer.
+        """
         b, draws, planes, width = query.shape
-        x = query.reshape(b*draws, planes, width)
-        x = x+self._sa_block(self.norm1(x), None, self_padding, is_causal=False)
-        x = x.reshape(b, draws*planes, width)
-        x = self.cross_attention(x, kv, padding)
-        x = history_attention.forward_cached(x, *history)
-        x = x+self._ff_block(self.norm3(x))
-        return x.reshape(b, draws, planes, width)
+        if modulation is None:
+            x = query.reshape(b*draws, planes, width)
+            x = x+self._sa_block(self.norm1(x), None, self_padding, is_causal=False)
+            x = x.reshape(b, draws*planes, width)
+            x = self.cross_attention(x, kv, padding)
+            x = history_attention.forward_cached(x, *history)
+            x = x+self._ff_block(self.norm3(x))
+            return x.reshape(b, draws, planes, width)
+        shift, scale, gate = modulation[:, :, None].unbind(-2)  # each (B, D, 1, 4, H)
+        branch_input = lambda x, norm, i: norm(x)*(1+scale[..., i, :])+shift[..., i, :]
+        residual = lambda x, value, i: x+(1+gate[..., i, :])*value.reshape(b, draws, planes, width)
+        x = query
+        x = residual(x, self._sa_block(branch_input(x, self.norm1, 0).reshape(b*draws, planes, width),
+                                       None, self_padding, is_causal=False), 0)
+        x = residual(x, self.dropout2(self.cross_attention_value(
+            branch_input(x, self.norm2, 1).reshape(b, draws*planes, width), kv, padding)), 1)
+        x = residual(x, history_attention.attend(
+            branch_input(x, history_attention.norm, 2).reshape(b, draws*planes, width), *history), 2)
+        return residual(x, self._ff_block(branch_input(x, self.norm3, 3)), 3)
 
 
 class AxialBlock(nn.Module):
@@ -320,6 +357,15 @@ class ObservationFollower(nn.Module):
             self.history_encoder = DecisionMemory(cfg)
             # Training-only head of the memory-identity loss; tracing never uses it.
             self.identity_projection = nn.Linear(cfg.hidden, cfg.identity_dim) if cfg.identity_dim else None
+            if cfg.identity_objective == 'verify':
+                from .identity_verifier import IdentityVerifier
+                self.identity_verifier = IdentityVerifier(cfg)
+            if cfg.identity_map:
+                # Zero output: a warm-started model initially computes what it did without the field.
+                self.identity_embedding = nn.Sequential(nn.Linear(1, cfg.hidden), nn.SiLU(),
+                                                        nn.Linear(cfg.hidden, cfg.hidden))
+                nn.init.zeros_(self.identity_embedding[-1].weight)
+                nn.init.zeros_(self.identity_embedding[-1].bias)
         else:
             self.history_encoder = HistoryEncoder(cfg)
         self.history_attention = HistoryAttention(cfg.hidden, cfg.heads)
@@ -336,9 +382,12 @@ class ObservationFollower(nn.Module):
         references = torch.where(mask[...,None],references.float(),0.)
         return references, mask
 
-    def context_from_features(self, x, hist, references, mask, dense, deep):
+    def context_from_features(self, x, hist, references, mask, dense, deep, identity=None):
         cfg = self.cfg
         image_tokens = deep.flatten(2).transpose(1,2)
+        if identity is not None and cfg.identity_map:
+            embedding = self.identity_embedding(identity.flatten(2).transpose(1, 2).to(image_tokens.dtype))
+            image_tokens = image_tokens+embedding.to(image_tokens.dtype)
         sampling_dense = dense.float() if cfg.recurrent_refinement_steps else dense
         local,_ = self.sample_local(sampling_dense, references)
         local = local.to(dense.dtype)
@@ -360,7 +409,13 @@ class ObservationFollower(nn.Module):
         ctx = dict(fine=dense,deep=deep,memory=memory,padding=padding,reference_mask=mask)
         if cfg.recurrent_refinement_steps:
             ctx.update(fine_fp32=sampling_dense, deep_fp32=sampling_dense)
+        if identity is not None:
+            ctx['identity_field'] = identity
         return ctx
+
+    def identity_samples(self, ctx, points):
+        """Identity-field probability at crop-local points (zero outside the crop)."""
+        return self.sample_local(ctx['identity_field'], points)[0][..., 0]
 
     def sample_local(self, features, points):
         cfg = self.cfg
@@ -389,28 +444,82 @@ class ObservationFollower(nn.Module):
         tokens, padding = self.history_encoder(features, x['history_valid'], x['history_pose'], **extra)
         return (tokens, padding, features[:, :, ANCHOR_FEATURE]) if return_anchors else (tokens, padding)
 
-    def identity_terms(self, ctx, x):
-        """Memory-identity InfoNCE: an old on-fiber memory entry (detached anchor) must be closer to the
-        own fiber in the current crop than to every annotated neighbor there, in a linear projection.
+    def verification_terms(self, ctx, x, predicted=None):
+        """Verifier logits at every identity query, with gradient into the current crop, the memory
+        tokens and the verifier: the crossing candidates (flattened), the dense samples and this
+        decision's own (detached) predicted path. Two gradient-free controls re-score the same queries
+        with the previous row's memory (another state) and with no memory at all."""
+        if getattr(self, 'identity_verifier', None) is None or 'identity_candidates' not in x:
+            return {}
+        verifier = self.identity_verifier
+        b = len(x['identity_candidates'])
+        predicted = (x['identity_candidates'].new_zeros(b, 0, 3) if predicted is None
+                     else predicted.detach().to(x['identity_candidates'].dtype))
+        points = torch.cat((x['identity_candidates'].reshape(b, -1, 3), x['identity_samples'], predicted), 1)
+        values, support = self.sample_local(ctx.get('deep_fp32', ctx['deep']).float(), points)
+        tokens, padding = ctx['history_tokens'], ctx['history_padding']
+        logits = verifier(values, points, verifier.project(tokens, padding))
+        with torch.no_grad():
+            shuffled = verifier(values, points, verifier.project(tokens.roll(1, 0), padding.roll(1, 0)))
+            empty = verifier(values, points, verifier.project(tokens, torch.ones_like(padding)))
+        # The shuffled control is meaningful only with a real row of another fiber (padding repeats row 0).
+        rows = x.get('identity_row', torch.ones(b, dtype=torch.bool, device=points.device)).bool()
+        fiber = x.get('identity_fiber', torch.arange(b, device=points.device))
+        return dict(identity_points=points, identity_predicted_points=predicted, identity_logits=logits,
+                    identity_shuffled_logits=shuffled, identity_empty_logits=empty, identity_support=support,
+                    identity_shuffled_valid=rows & rows.roll(1, 0) & (fiber.roll(1, 0) != fiber))
 
-        Point 0 of ``identity_points`` is the own fiber, the rest are neighbors. Gradient reaches the
-        encoder only through the current crop. Rows/anchors without a positive and a negative are inert.
+    def identity_terms(self, ctx, x):
+        """Memory-identity InfoNCE in a linear projection, contrasted in both directions.
+
+        Query side: an old on-fiber memory entry (detached anchor) must be closer to the own fiber
+        in the current crop (point 0 of ``identity_points``) than to every annotated neighbor there.
+        Anchor side: the own-fiber point must be closer to this state's anchors than to the anchors
+        of the other states in the batch (other fibers). Every anchor is a feature at the centre of
+        its own past crop, so crop position cannot separate them and a solution that ignores the
+        anchor fails this side. A control re-scores the query side with another state's anchors.
+        Gradient reaches the encoder only through the current crop; incomplete rows are inert.
         """
         if getattr(self, 'identity_projection', None) is None or 'identity_points' not in x:
             return {}
         values, support = self.sample_local(ctx.get('deep_fp32', ctx['deep']).float(), x['identity_points'])
-        points_ok = x['identity_point_mask'].bool() & support
+        rows = x.get('identity_row', torch.ones_like(support[:, 0])).bool()
+        fiber = x.get('identity_fiber', torch.arange(len(rows), device=rows.device))
+        points_ok = x['identity_point_mask'].bool() & support & rows[:, None]
+        anchor_ok = x['identity_anchor_mask'].bool() & rows[:, None]
         query = F.normalize(self.identity_projection(values.float()), dim=-1)
         anchor = F.normalize(self.identity_projection(x['identity_anchor_features'].float()), dim=-1)
-        similarity = torch.einsum('bsd,bkd->bsk', anchor, query)/self.cfg.identity_temperature
-        negatives = points_ok[:, 1:]
-        valid = x['identity_anchor_mask'].bool() & points_ok[:, :1] & negatives.any(-1, keepdim=True)
-        # Finite masking: no -inf/NaN can enter the gradient of an excluded anchor.
-        logits = similarity.masked_fill(~points_ok[:, None, :], -1e4)
-        loss = torch.where(valid, torch.logsumexp(logits, -1)-logits[..., 0], 0.)
-        best = similarity[..., 1:].masked_fill(~negatives[:, None, :], -1e4).amax(-1)
-        return dict(identity_loss_per_state=loss.sum(-1)/valid.sum(-1).clamp_min(1),
-                    identity_pairs=valid, identity_correct=valid & (similarity[..., 0] > best))
+        temperature = self.cfg.identity_temperature
+
+        def query_side(anchors, usable):
+            similarity = torch.einsum('bsd,bkd->bsk', anchors, query)/temperature
+            negatives = points_ok[:, 1:]
+            valid = usable & points_ok[:, :1] & negatives.any(-1, keepdim=True)
+            # Finite masking: no -inf/NaN can enter the gradient of an excluded anchor.
+            logits = similarity.masked_fill(~points_ok[:, None, :], -1e4)
+            loss = torch.where(valid, torch.logsumexp(logits, -1)-logits[..., 0], 0.)
+            best = similarity[..., 1:].masked_fill(~negatives[:, None, :], -1e4).amax(-1)
+            return loss, valid, valid & (similarity[..., 0] > best)
+
+        loss, valid, correct = query_side(anchor, anchor_ok)
+        b, slots = anchor_ok.shape
+        cross = query[:, 0] @ anchor.flatten(0, 1).T/temperature  # (B, B*S)
+        same_state = torch.eye(b, dtype=torch.bool, device=rows.device).repeat_interleave(slots, 1)
+        same_fiber = fiber[:, None] == fiber.repeat_interleave(slots)[None]
+        own = same_state & anchor_ok.flatten()[None]
+        other = ~same_fiber & anchor_ok.flatten()[None]
+        anchor_valid = points_ok[:, 0] & own.any(1) & other.any(1)
+        own_logits = cross.masked_fill(~own, -1e4)
+        anchor_loss = torch.where(anchor_valid, torch.logsumexp(cross.masked_fill(~(own | other), -1e4), 1)
+                                  - torch.logsumexp(own_logits, 1), 0.)
+        anchor_correct = anchor_valid & (own_logits.amax(1) > cross.masked_fill(~other, -1e4).amax(1))
+        # Control: the same query side, scored with the previous row's anchors (another fiber).
+        shifted = anchor_ok.roll(1, 0) & rows[:, None] & (fiber.roll(1, 0) != fiber)[:, None]
+        _, control_valid, control_correct = query_side(anchor.roll(1, 0), shifted)
+        return dict(identity_loss_per_state=loss.sum(-1)/valid.sum(-1).clamp_min(1)+anchor_loss,
+                    identity_pairs=valid, identity_correct=correct,
+                    identity_anchor_valid=anchor_valid, identity_anchor_correct=anchor_correct,
+                    identity_control_pairs=control_valid, identity_control_correct=control_correct)
 
     def memory_features(self, x):
         """(B, SLOTS, ENTRY_FEATURES, C): recorded entries, plus entries encoded here from crops.
@@ -456,11 +565,16 @@ class ObservationFollower(nn.Module):
     def context(self, x, hist, hmask):
         references, mask = self.references(x, hist, hmask)
         dense, deep, _ = self.encoder(x['fine'], references, mask)
-        ctx = self.context_from_features(x, hist, references, mask, dense, deep)
         if 'history_tokens' in x:
-            ctx['history_tokens'], ctx['history_padding'] = x['history_tokens'], x['history_padding']
+            tokens, padding = x['history_tokens'], x['history_padding']
         else:
-            ctx['history_tokens'], ctx['history_padding'] = self.encode_history(x)
+            tokens, padding = self.encode_history(x)
+        identity = None
+        if self.cfg.identity_map or self.cfg.identity_feedback:
+            from .identity_verifier import identity_field
+            identity = identity_field(self, deep, tokens, padding)
+        ctx = self.context_from_features(x, hist, references, mask, dense, deep, identity)
+        ctx['history_tokens'], ctx['history_padding'] = tokens, padding
         history = (ctx['history_tokens'], ctx['history_padding'])
         ctx['history_projected'] = self.history_attention.project_memory(*history)
         if self.cfg.memory == 'decisions':
@@ -477,9 +591,11 @@ class ObservationFollower(nn.Module):
         samples = self.confidence_scorer.segment_samples(points)
         spatial = self.evidence(ctx, samples.flatten(1, 2))
         spatial = spatial.reshape(*samples.shape[:3], -1)
+        identity = (self.identity_samples(ctx, samples.flatten(1, 2)).reshape(samples.shape[:3])
+                    if self.cfg.identity_feedback else None)
         return self.confidence_scorer(spatial, points,
                                      ctx['confidence_projected'], ctx['confidence_padding'],
-                                     ctx['confidence_history_projected'])
+                                     ctx['confidence_history_projected'], identity=identity)
 
     def decoder_memory(self, ctx):
         memory, padding = ctx['memory'], ctx['padding']
@@ -514,6 +630,11 @@ class CoordinateRegressionFollower(ObservationFollower):
                                                   nn.Linear(cfg.hidden, cfg.hidden))
             self.refinement_stage = nn.Embedding(cfg.recurrent_refinement_steps, cfg.hidden)
             nn.init.zeros_(self.refinement_stage.weight)
+            if cfg.identity_feedback:
+                # Identity-field probability at each proposed point; zero-initialized like the stage embedding.
+                self.identity_feedback = nn.Linear(1, cfg.hidden)
+                nn.init.zeros_(self.identity_feedback.weight)
+                nn.init.zeros_(self.identity_feedback.bias)
 
     def forward(self, x, hist, hmask, confidence_threshold=DEFAULT_CONFIDENCE, n_commit=None):
         ctx = self.context(x, hist, hmask)
@@ -582,7 +703,7 @@ class CoordinateRegressionFollower(ObservationFollower):
                 padding = padding[keep]
                 active_ctx = {key: active_ctx[key][keep] for key in
                               ('fine', 'deep', 'fine_fp32', 'deep_fp32', 'confidence_padding',
-                               'history_tokens', 'history_padding')} | dict(
+                               'history_tokens', 'history_padding', 'identity_field') if key in active_ctx} | dict(
                     confidence_projected=PathDecoderLayer.select_memory(active_ctx['confidence_projected'], keep),
                     history_projected=tuple(v[keep] for v in active_ctx['history_projected']),
                     confidence_history_projected=tuple(v[keep] for v in active_ctx['confidence_history_projected']))
@@ -601,6 +722,9 @@ class CoordinateRegressionFollower(ObservationFollower):
         # Geometry cannot teach the scorer to manufacture convenient feedback.
         feedback = torch.stack((hazards.sigmoid(), confidence), -1).detach()
         refreshed = self.refinement_fusion(torch.cat((evidence, points/16., feedback), -1))
+        if self.cfg.identity_feedback:
+            # The field carries no gradient, so geometry cannot shape the verifier's answer.
+            refreshed = refreshed+self.identity_feedback(self.identity_samples(ctx, points)[..., None].to(refreshed.dtype))
         query = decoded+refreshed+stage_embedding.to(decoded.dtype)
         decoded = self.decode_cached(query, projected, padding, ctx)
         return decoded, self.decode_coordinates(decoded)
@@ -640,6 +764,7 @@ class CoordinateRegressionFollower(ObservationFollower):
         if 'memory_entry' in ctx:
             out['memory_entry'] = ctx['memory_entry']
         out.update(self.identity_terms(ctx, x))
+        out.update(self.verification_terms(ctx, x, points))
         return out
 
     def decode_cached(self, query, projected, padding, ctx):

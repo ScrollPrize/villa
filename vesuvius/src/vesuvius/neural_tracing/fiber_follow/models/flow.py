@@ -4,6 +4,7 @@ import math
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 from .model import CoordinateRegressionConfig, ObservationFollower, PathDecoderLayer
 from .survival_confidence import survival_predictions
@@ -17,6 +18,19 @@ class FlowConfig(CoordinateRegressionConfig):
     flow_steps: int = 4
     flow_draws: int = 64
     flow_sigma: tuple = ()
+    # Proposals beyond the zero-start path, from Gaussian starts (flow_sample_scale, in residual-scale
+    # units). Training integrates and scores every proposal (the scorer learns sampled paths); tracing
+    # takes a later proposal only when no earlier one is accepted (select_refinement). 0: one path.
+    flow_samples: int = 0
+    flow_sample_scale: float = 1.
+    # 'input': the time embedding is added to the decoder queries once. 'adaln': it also modulates every
+    # decoder branch and the output norm per draw (zero-initialized, so a warm start is exact).
+    flow_time_conditioning: str = 'input'
+    # Lower bound of the fitted residual scales (voxels), i.e. of the noise prior's width.
+    flow_sigma_floor: float = 1.
+    # Planes without a target in training: 'padded' leaves them out of self-attention; 'own_path' keeps
+    # them, as tracing does, travelling from noise to this model's own zero-start path (no loss).
+    flow_unknown_planes: str = 'padded'
 
     def __post_init__(self):
         super().__post_init__()
@@ -25,9 +39,17 @@ class FlowConfig(CoordinateRegressionConfig):
             raise ValueError('Flow uses midpoint integration, not regression retries')
         if min(self.flow_steps, self.flow_draws) < 1:
             raise ValueError('Positive flow steps and draws required')
+        if type(self.flow_samples) is not int or self.flow_samples < 0 or not (
+                math.isfinite(self.flow_sample_scale) and self.flow_sample_scale > 0):
+            raise ValueError('Flow samples must be a nonnegative integer with a finite positive scale')
+        if self.flow_time_conditioning not in ('input', 'adaln') or self.flow_unknown_planes not in ('padded', 'own_path'):
+            raise ValueError("Flow time conditioning is 'input' or 'adaln'; unknown planes 'padded' or 'own_path'")
+        if not (math.isfinite(self.flow_sigma_floor) and self.flow_sigma_floor >= 1):
+            raise ValueError('The flow scale floor must be finite and at least one voxel')
         if self.flow_sigma and (len(self.flow_sigma) != self.n_future or any(
-                len(row) != 2 or any(not math.isfinite(v) or v < 1 for v in row) for row in self.flow_sigma)):
-            raise ValueError('Flow scales must contain two finite values >= 1 per future plane')
+                len(row) != 2 or any(not math.isfinite(v) or v < self.flow_sigma_floor for v in row)
+                for row in self.flow_sigma)):
+            raise ValueError('Flow scales must contain two finite values >= the scale floor per future plane')
 
 
 def time_embedding(t, width=64):
@@ -47,7 +69,7 @@ def flow_targets(batch, cfg):
 
 
 def fit_flow_sigma(batches, cfg, states=2048):
-    """Fit physical residual scales from training targets only."""
+    """Fit physical residual scales from training targets only, bounded below by the scale floor."""
     count = torch.zeros(cfg.n_future, dtype=torch.float64)
     total = torch.zeros(cfg.n_future, 2, dtype=torch.float64)
     square = torch.zeros_like(total)
@@ -66,11 +88,11 @@ def fit_flow_sigma(batches, cfg, states=2048):
     if (count < 2).any():
         raise ValueError('Flow calibration needs at least two known targets per plane; increase --flow-calibration-states')
     variance = (square/count[:, None]-(total/count[:, None]).square()).clamp_min(0)
-    return tuple(map(tuple, variance.sqrt().clamp_min(1).tolist()))
+    return tuple(map(tuple, variance.sqrt().clamp_min(cfg.flow_sigma_floor).tolist()))
 
 
 class FlowFollower(ObservationFollower):
-    """One deterministic tracing path; Gaussian/time draws only train velocity."""
+    """The zero-start path, optionally followed by sampled proposals; Gaussian/time draws train velocity."""
     def __init__(self, cfg):
         super().__init__(cfg)
         if not cfg.flow_sigma:
@@ -84,6 +106,13 @@ class FlowFollower(ObservationFollower):
         self.velocity = nn.Linear(h, 2)
         nn.init.normal_(self.velocity.weight, std=.01)
         nn.init.zeros_(self.velocity.bias)
+        if cfg.flow_time_conditioning == 'adaln':
+            # Per layer: shift/scale/gate for four branches; output norm: shift/scale.
+            self.time_modulation = nn.ModuleList(nn.Linear(h, 12*h) for _ in range(cfg.decoder_layers))
+            self.output_modulation = nn.Linear(h, 2*h)
+            for linear in (*self.time_modulation, self.output_modulation):
+                nn.init.zeros_(linear.weight)
+                nn.init.zeros_(linear.bias)
         self.register_buffer('sigma', torch.tensor(cfg.flow_sigma, dtype=torch.float32), persistent=False)
 
     def to_points(self, y):
@@ -107,37 +136,64 @@ class FlowFollower(ObservationFollower):
         forward = points[..., 2:]/(self.cfg.n_future*self.cfg.future_step)
         query = self.query(torch.cat((evidence.to(ctx['deep'].dtype), y, forward,
                                       support.reshape(b, draws, planes, 1)), -1))
-        query = query+self.time(time_embedding(t))[:, :, None]
+        time = self.time(time_embedding(t))
+        query = query+time[:, :, None]
         padding = (~known)[:, None].expand(-1, draws, -1).reshape(b*draws, planes).clone()
         padding[:, -1] &= ~padding.all(-1)
-        for layer, kv in zip(self.decoder.layers, ctx['generator_projected']):
-            query = layer.forward_draws(query, kv, ctx['padding'], padding,
-                history=ctx['history_projected'], history_attention=self.history_attention)
-        return self.velocity(self.decoder.norm(query)).float()
+        adaln = self.cfg.flow_time_conditioning == 'adaln'
+        condition = F.silu(time) if adaln else None
+        for index, (layer, kv) in enumerate(zip(self.decoder.layers, ctx['generator_projected'])):
+            modulation = self.time_modulation[index](condition).unflatten(-1, (4, 3, self.cfg.hidden)) if adaln else None
+            query = layer.forward_draws(query, kv, ctx['padding'], padding, history=ctx['history_projected'],
+                                        history_attention=self.history_attention, modulation=modulation)
+        output = self.decoder.norm(query)
+        if adaln:
+            shift, scale = self.output_modulation(condition)[:, :, None].chunk(2, -1)
+            output = output*(1+scale)+shift
+        return self.velocity(output).float()
 
-    def generate(self, ctx, hist):
-        b = len(hist)
-        y = hist.new_zeros(b, 1, self.cfg.n_future, 2)
-        curves = [self.to_points(y)[:, 0]]
+    def generate(self, ctx, hist, start=None):
+        """Midpoint integration from ``start`` (B, D, P, 2), by default the zero path (D=1).
+        Returns the (B, D, P, 3) points at every solver step."""
+        y = hist.new_zeros(len(hist), 1, self.cfg.n_future, 2) if start is None else start
+        curves = [self.to_points(y)]
         with torch.no_grad():
             for step in range(self.cfg.flow_steps):
-                t = y.new_full((b, 1), step/self.cfg.flow_steps)
+                t = y.new_full(y.shape[:2], step/self.cfg.flow_steps)
                 v = self.velocity_field(ctx, y, t)
                 y = y+self.velocity_field(ctx, y+v/(2*self.cfg.flow_steps),
                                            t+1/(2*self.cfg.flow_steps))/self.cfg.flow_steps
-                curves.append(self.to_points(y)[:, 0])
+                curves.append(self.to_points(y))
         return curves
+
+    def proposal_starts(self, hist):
+        """(B, 1+flow_samples, P, 2): the zero path, then scaled Gaussian starts."""
+        zero = hist.new_zeros(len(hist), 1, self.cfg.n_future, 2)
+        if not self.cfg.flow_samples:
+            return zero
+        noise = torch.randn(len(hist), self.cfg.flow_samples, self.cfg.n_future, 2, device=hist.device)
+        return torch.cat((zero, self.cfg.flow_sample_scale*noise.to(zero.dtype)), 1)
 
     def training_forward(self, x, hist, hmask, threshold, targets=None):
         ctx = self.context(x, hist, hmask)
         self.prepare_prediction(ctx, hist)
-        curves = self.generate(ctx, hist)
+        generated = self.generate(ctx, hist, self.proposal_starts(hist))
+        curves = [curve[:, 0] for curve in generated]
         points = curves[-1]
-        hazards = self.hazard_logits(ctx, points)
-        logits, confidence = survival_predictions(hazards)
-        result = self.proposal_output(curves[0], [points], [(hazards, logits, confidence)],
-                                      [torch.ones(len(hist), device=hist.device, dtype=torch.bool)])
+        # Every proposal is scored, so the confidence loss trains the scorer on sampled paths too.
+        proposals = list(generated[-1].unbind(1))
+        scores = []
+        for proposal in proposals:
+            hazards = self.hazard_logits(ctx, proposal)
+            scores.append((hazards, *survival_predictions(hazards)))
+        valid = [torch.ones(len(hist), device=hist.device, dtype=torch.bool)]*len(proposals)
+        result = self.proposal_output(curves[0], proposals, scores, valid)
         result['solver_points'] = torch.stack(curves, 1)
+        # Same memory record and identity heads as coordinate regression, at the integrated path.
+        if 'memory_entry' in ctx:
+            result['memory_entry'] = ctx['memory_entry']
+        result.update(self.identity_terms(ctx, x))
+        result.update(self.verification_terms(ctx, x, points))
         if targets is not None:
             target, known = flow_targets(targets, self.cfg)
             b, draws = len(hist), self.cfg.flow_draws
@@ -147,9 +203,14 @@ class FlowFollower(ObservationFollower):
             times = targets.get('flow_times')
             if times is None:
                 times = (torch.arange(draws, device=hist.device)[None]+torch.rand(b, draws, device=hist.device))/draws
-            end = torch.where(known[:, None, :, None], (target/self.sigma)[:, None], noise)
+            if self.cfg.flow_unknown_planes == 'own_path':
+                # Unknown planes stay in self-attention as at tracing, heading for the zero-start path.
+                fill, attended = (points[..., :2]/self.sigma)[:, None].to(noise.dtype), None
+            else:
+                fill, attended = noise, known
+            end = torch.where(known[:, None, :, None], (target/self.sigma)[:, None], fill)
             y = (1-times[..., None, None])*noise+times[..., None, None]*end
-            predicted = self.velocity_field(ctx, y, times, known)
+            predicted = self.velocity_field(ctx, y, times, attended)
             error = (predicted-(end-noise)).square()
             mask = known[:, None, :, None].expand_as(error)
             result['flow_per_state'] = torch.where(mask, error, 0.).sum((1, 2, 3))/mask.sum((1, 2, 3)).clamp_min(1)

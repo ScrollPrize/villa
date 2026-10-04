@@ -135,3 +135,122 @@ def test_flow_loss_and_gradients_are_weighted_per_state_across_microbatches():
         assert (p.grad is None) == (q.grad is None), name
         if p.grad is not None:
             torch.testing.assert_close(p.grad, q.grad, atol=2e-6, rtol=2e-4, msg=name)
+
+
+def test_flow_records_decision_memory_in_the_tracer_and_trains_the_identity_verifier(monkeypatch):
+    from test_decision_memory import memory_config, decision_inputs, StraightModel, run_tracer
+    from vesuvius.neural_tracing.fiber_follow.models.identity_verifier import (
+        IDENTITY_PLANES, IDENTITY_CANDIDATES, IDENTITY_SAMPLES)
+    torch.manual_seed(13)
+    memory = memory_config(identity_objective='verify', identity_map=True, identity_feedback=True).to_dict()
+    cfg = config(**{k: memory[k] for k in ('stem', 'stem_blocks', 'memory', 'identity_objective', 'identity_map',
+                                           'identity_feedback')})
+    model = build_model(cfg).eval()
+    # The tracer records this flow model's own decision entries and reads them back.
+    traced = StraightModel(model)
+    run_tracer(traced, monkeypatch)
+    assert len(traced.raw) > 10 and max(int(v.sum()) for _, _, v in traced.raw) >= 3
+    model.train()
+    batch = coordinate_batch(cfg, 2)
+    x = {k: v for k, v in batch['x'].items() if not k.startswith('history_')}
+    x.update(decision_inputs(cfg, 2))
+    x['history_valid'][:, :2] = True
+    x.update(identity_candidates=torch.randn(2, len(IDENTITY_PLANES), IDENTITY_CANDIDATES, 3),
+             identity_samples=torch.randn(2, IDENTITY_SAMPLES, 3))
+    out = model.training_forward(x, batch['hist'], batch['hmask'], .5)
+    torch.testing.assert_close(out['memory_entry'], model.context(x, batch['hist'], batch['hmask'])['memory_entry'])
+    # The verifier scores the integrated flow path, as coordinate regression scores its final refinement.
+    torch.testing.assert_close(out['identity_predicted_points'], out['refinement_points'][:, -1].detach())
+    out['identity_logits'].sum().backward()
+    assert sum(float(p.grad.abs().sum()) for p in model.identity_verifier.parameters() if p.grad is not None) > 0
+
+
+def test_inference_samples_retry_after_the_zero_start_path_only_when_it_is_not_accepted():
+    torch.manual_seed(17)
+    model = build_model(config()).eval()
+    sampled = build_model(config(flow_samples=3, flow_sample_scale=1.5)).eval()
+    sampled.load_state_dict(model.state_dict())
+    b = coordinate_batch(model.cfg)
+    with torch.no_grad():
+        for threshold in (0., .5, 1.):
+            plain = model(b['x'], b['hist'], b['hmask'], threshold)
+            out = sampled(b['x'], b['hist'], b['hmask'], threshold)
+            assert out['refinement_points'].shape[1] == 4
+            torch.testing.assert_close(out['refinement_points'][:, 0], plain['points'])
+            torch.testing.assert_close(out['refinement_confidence'][:, 0], plain['confidence'])
+            assert not torch.equal(out['refinement_points'][:, 1], out['refinement_points'][:, 0])
+            index = torch.arange(len(out['points']))
+            torch.testing.assert_close(out['points'], out['refinement_points'][index, out['selected_refinement']])
+            if threshold == 0.:  # the zero-start path is accepted, so no sample is used
+                assert (out['selected_refinement'] == 0).all()
+                torch.testing.assert_close(out['points'], plain['points'])
+
+
+def test_adaln_time_conditioning_starts_exactly_as_the_input_only_model_and_then_trains():
+    torch.manual_seed(19)
+    base = build_model(config()).eval()
+    model = build_model(config(flow_time_conditioning='adaln')).eval()
+    missing = model.load_state_dict(base.state_dict(), strict=False).missing_keys
+    assert {k.split('.')[0] for k in missing} == {'time_modulation', 'output_modulation'}
+    b = coordinate_batch(base.cfg)
+    b['flow_noise'] = torch.randn(2, base.cfg.flow_draws, base.cfg.n_future, 2)
+    b['flow_times'] = torch.tensor([[.1, .7], [.2, .9]])
+    with torch.no_grad():
+        before, after = (m.training_forward(b['x'], b['hist'], b['hmask'], .5, b) for m in (base, model))
+    for key in ('refinement_points', 'refinement_confidence', 'flow_per_state'):
+        torch.testing.assert_close(after[key], before[key], rtol=0, atol=0)
+    # The flow loss trains the modulation; once it is nonzero, time changes every layer's output.
+    model.train()
+    model.training_forward(b['x'], b['hist'], b['hmask'], .5, b)['flow_per_state'].sum().backward()
+    assert all(m.weight.grad.abs().sum() > 0 for m in (*model.time_modulation, model.output_modulation))
+    with torch.no_grad():
+        for linear in model.time_modulation:
+            linear.weight.normal_(std=.1)
+        ctx = model.context(b['x'], b['hist'], b['hmask']); model.prepare_prediction(ctx, b['hist'])
+        y = torch.randn(2, 1, base.cfg.n_future, 2)
+        early, late = (model.velocity_field(ctx, y, torch.full((2, 1), t)) for t in (.1, .9))
+        assert not torch.allclose(early, late)
+
+
+def test_sampled_proposals_are_scored_in_training_and_the_zero_start_path_is_unchanged():
+    torch.manual_seed(23)
+    model = build_model(config())
+    sampled = build_model(config(flow_samples=2, flow_sample_scale=2.))
+    sampled.load_state_dict(model.state_dict())
+    b = coordinate_batch(model.cfg)
+    out = sampled.training_forward(b['x'], b['hist'], b['hmask'], .5, b)
+    plain = model.training_forward(b['x'], b['hist'], b['hmask'], .5, b)
+    assert out['refinement_points'].shape[1] == 3 and out['refinement_mask'].all()
+    torch.testing.assert_close(out['refinement_points'][:, 0], plain['refinement_points'][:, 0])
+    terms = loss_terms(sampled.select_prediction(out), b, sampled.cfg)
+    assert int(terms['refinement_attempts_sum']) == 2*3
+    terms['confidence_per_state'].sum().backward()
+    assert sum(float(p.grad.abs().sum()) for p in sampled.confidence_scorer.parameters() if p.grad is not None) > 0
+
+
+def test_unknown_planes_are_attended_only_with_own_path_and_the_scale_floor_bounds_the_prior():
+    torch.manual_seed(29)
+    b = coordinate_batch(config())
+    b['dense_mask'][:, b['dense_mask'].shape[1]//2:] = 0  # the trailing planes have no target
+    for mode, attended in (('padded', False), ('own_path', True)):
+        model = build_model(config(flow_unknown_planes=mode)).eval()
+        _, known = flow_targets(b, model.cfg)
+        assert known.any() and not known.all()
+        losses = []
+        for seed in (0, 1):
+            noise = torch.randn(2, model.cfg.flow_draws, model.cfg.n_future, 2, generator=torch.Generator().manual_seed(7))
+            # Change the Gaussian draw at target-less planes only.
+            noise[~known[:, None].expand(-1, model.cfg.flow_draws, -1)] = torch.randn(
+                int((~known).sum())*model.cfg.flow_draws, 2, generator=torch.Generator().manual_seed(seed))
+            with torch.no_grad():
+                out = model.training_forward(b['x'], b['hist'], b['hmask'], .5,
+                                             dict(b, flow_noise=noise, flow_times=torch.tensor([[.3, .8]]*2)))
+            losses.append(out['flow_per_state'])
+        assert torch.isfinite(losses[0]).all()
+        assert (not torch.allclose(losses[0], losses[1])) == attended
+    cfg = config(flow_sigma_floor=3., flow_sigma=((3., 3.),)*4)
+    data = coordinate_batch(cfg)
+    data['dense_ab'][0, :, 0] = -2.; data['dense_ab'][1, :, 0] = 2.
+    assert fit_flow_sigma(iter([data]), cfg, 2) == ((3., 3.),)*cfg.n_future
+    with pytest.raises(ValueError, match='scale floor'):
+        config(flow_sigma_floor=3.)  # the fixture's unit scales lie below the floor

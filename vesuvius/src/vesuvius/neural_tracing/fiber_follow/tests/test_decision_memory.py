@@ -269,7 +269,7 @@ def test_identity_loss_trains_projection_and_current_crop_only():
     assert not anchors.grad[1].any() and not anchors.grad[0, 2:].any()
 
 
-def test_identity_targets_take_the_nearest_point_per_neighbor_path_and_on_fiber_old_anchors():
+def test_identity_targets_use_each_neighbor_path_crossing_of_the_positive_plane_and_on_fiber_old_anchors():
     from types import SimpleNamespace as NS
     from vesuvius.neural_tracing.fiber_follow.data.observations import IdentityObservationBuilder
     from vesuvius.neural_tracing.fiber_follow.models.decision_memory import IDENTITY_NEGATIVES
@@ -278,15 +278,50 @@ def test_identity_targets_take_the_nearest_point_per_neighbor_path_and_on_fiber_
     builder.sampling = NS(rule=NS(own_radius=1.5), on_fiber_tolerance=1.5)
     planes = np.arange(1., 17.)
     item = dict(planes=planes, plane_mask=np.ones(16), plane_ab=np.zeros((16, 2)), fiber_ref=(0, 100., False),
+                trace_facts=dict(departure_distance=10.), travelled=50.,
                 _memory_entries=[dict(age=200., pos=np.array([0., 0., 50.])), dict(age=40., pos=np.array([0., 0., 150.])),
                                  dict(age=150., pos=np.array([4., 0., 60.]))])
-    found = dict(local=np.array([[4., 0., 2.], [3., 0., 2.2], [6., 0., 2.], [0.5, 0., 2.], [5., 0., 9.]]),
-                 path_ids=np.array([7, 7, 8, 9, 10]))
+    found = dict(local=np.array([[3., 0., 1.5], [3., 0., 2.5],      # path 7 crosses z=2 at x=3
+                                 [6., 0., 1.], [6., 0., 3.],        # path 8 at x=6
+                                 [.5, 0., 1.5], [.5, 0., 2.5],      # path 9: inside the own radius
+                                 [5., 0., 8.], [5., 0., 9.],        # path 10: never reaches the plane
+                                 [8., 0., 1.], [8., 0., 5.]]),      # path 11: a filtered gap, not a crossing
+                 path_ids=np.array([7, 7, 8, 8, 9, 9, 10, 10, 11, 11]))
     out = dict(identity_points=np.zeros((1, 1+IDENTITY_NEGATIVES, 3), np.float32),
-               identity_point_mask=np.zeros((1, 1+IDENTITY_NEGATIVES), bool), identity_anchor_mask=np.zeros((1, SLOTS), bool))
+               identity_point_mask=np.zeros((1, 1+IDENTITY_NEGATIVES), bool), identity_anchor_mask=np.zeros((1, SLOTS), bool),
+               identity_departure_age=np.full(1, np.nan, np.float32))
     builder.identity_targets(item, found, out, 0)
     np.testing.assert_allclose(out['identity_points'][0, 0], [0., 0., 2.])
-    # Path 7 keeps its nearest point, path 8 follows; the own-radius point and the far plane are excluded.
-    np.testing.assert_allclose(out['identity_points'][0, 1:3], [[3., 0., 2.2], [6., 0., 2.]])
+    np.testing.assert_allclose(out['identity_points'][0, 1:3], [[3., 0., 2.], [6., 0., 2.]])
     assert out['identity_point_mask'][0].tolist() == [True, True, True]+[False]*(IDENTITY_NEGATIVES-2)
     assert out['identity_anchor_mask'][0].tolist() == [True, False, False]+[False]*(SLOTS-3)
+    assert out['identity_departure_age'][0] == 40.
+
+
+def test_identity_anchor_side_excludes_same_fiber_and_padded_rows_and_control_uses_other_anchors():
+    from vesuvius.neural_tracing.fiber_follow.models.decision_memory import IDENTITY_NEGATIVES
+    torch.manual_seed(4)
+    c = memory_config(identity_dim=8)
+    model = build_model(c).eval()
+    batch = coordinate_batch(c, 4)
+    x = {k: v for k, v in batch['x'].items() if not k.startswith('history_')}
+    x.update(decision_inputs(c, 4))
+    with torch.no_grad():
+        ctx = model.context(x, batch['hist'], batch['hmask'])
+    points = torch.zeros(4, 1+IDENTITY_NEGATIVES, 3)
+    points[:, 0, 2], points[:, 1] = 1., torch.tensor([1.5, 0., 1.])
+    point_mask = torch.zeros(4, 1+IDENTITY_NEGATIVES, dtype=torch.bool)
+    point_mask[:, :2] = True
+    anchor_mask = torch.zeros(4, SLOTS, dtype=torch.bool)
+    anchor_mask[:, 0] = True
+    inputs = dict(x, identity_points=points, identity_point_mask=point_mask, identity_anchor_mask=anchor_mask,
+                  identity_anchor_features=torch.randn(4, SLOTS, c.hidden),
+                  identity_fiber=torch.tensor([5, 5, 6, 5]), identity_row=torch.tensor([True, True, True, False]))
+    with torch.no_grad():
+        terms = model.identity_terms(ctx, inputs)
+    # Rows 0/1 share fiber 5, so each has only row 2 as another fiber; row 3 is padding.
+    assert terms['identity_anchor_valid'].tolist() == [True, True, True, False]
+    assert terms['identity_pairs'][:, 0].tolist() == [True, True, True, False]
+    # The control scores row r with row r-1's anchors only when that row is real and another fiber.
+    assert terms['identity_control_pairs'][:, 0].tolist() == [False, False, True, False]
+    assert torch.isfinite(terms['identity_loss_per_state']).all() and terms['identity_loss_per_state'][3] == 0

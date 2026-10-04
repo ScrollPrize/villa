@@ -152,7 +152,7 @@ def test_identity_supervision_and_training_cli_require_a_bank(monkeypatch):
               '--manifest','unused','--device','cpu','--threads','1','--negative-bank',''])
 
 
-def test_bank_integrity_fails_closed_and_only_annotation_identity_must_match(tmp_path):
+def test_bank_integrity_fails_closed_and_only_annotation_identity_must_match(tmp_path, monkeypatch):
     bank,fiber = make_bank(tmp_path/'identity',with_path=True)
     root = bank.root
     # Repaired annotation geometry keeps its identity; mined target arcs follow the current geometry.
@@ -193,6 +193,19 @@ def test_bank_integrity_fails_closed_and_only_annotation_identity_must_match(tmp
     spec.fiber_level = 4
     with pytest.raises(ValueError,match='prediction volume'):
         bank.validate_volume(spec)
+    # Copied data on another machine: recorded paths are relocated explicitly, then compared exactly.
+    from vesuvius.neural_tracing.fiber_follow.shared.paths import recorded_path, path_map
+    moved = SimpleNamespace(fiber_zarr_dir='/copy/preds',fiber_level=3,ct_zarr='/other/ct.zarr')
+    with pytest.raises(ValueError,match='prediction volume'):
+        bank.validate_volume(moved)
+    monkeypatch.setenv('FIBER_FOLLOW_PATH_MAP','/data/preds=/copy/preds;/data=/other')
+    bank.validate_volume(moved)
+    assert recorded_path('/data/predsx/3') == '/other/predsx/3'  # whole components only
+    moved.ct_zarr = '/copy/ct.zarr'
+    with pytest.raises(ValueError,match='CT source'):
+        bank.validate_volume(moved)
+    with pytest.raises(ValueError,match='OLD=NEW'):
+        path_map('/data')
     # A worker rejects a replaced run instead of silently relabeling.
     value = json.loads((root/'bank.json').read_text())
     value['run_digest'] = 'different-run'

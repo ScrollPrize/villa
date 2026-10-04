@@ -21,6 +21,14 @@ From this directory, use the existing project environment:
 
 `--batch` is decisions per forward pass; `--grad-steps` accumulates those batches. Training operations are compiled. Flow defaults to four midpoint steps and 64 training draws. Its residual scales are fitted once from 2,048 training states (`--flow-calibration-states`) and saved in the model configuration. Each state has equal loss weight; flow velocity loss replaces the coordinate regression geometry loss, while both train survival confidence using the same labels and loss.
 
+Flow options (defaults keep the original model and old checkpoints load unchanged):
+- `--flow-time-conditioning adaln`: the time embedding also modulates every decoder branch (self, image and history attention, FFN) and the output norm per draw. The modulation is zero-initialized, so a warm start is exact.
+- `--flow-samples K --flow-sample-scale S`: K proposals from Gaussian starts (standard deviation S in residual-scale units) after the zero-start path. Training integrates and scores all of them, so the scorer learns sampled paths; tracing uses a later proposal only when no earlier one is accepted.
+- `--flow-sigma-floor V`: lower bound in voxels for the fitted residual scales, which set the noise prior's width (default 1).
+- `--flow-unknown-planes own_path`: target-less planes stay in self-attention, as in tracing, and move from noise to the model's own zero-start path. They get no loss.
+
+`FIBER_FOLLOW_PATH_MAP='OLD=NEW;...'` relocates absolute paths recorded on another machine (seed manifest volume, negative-bank run, initialization dataset sources) before the exact startup checks.
+
 `--resume output/RUN/last.pt --name RUN` restores a new-format run. `--init-weights CHECKPOINT` strictly loads model and EMA weights into a fresh run, without optimizer, replay, scheduling, or normalization state. Runtime checkpoints use unversioned model types. Legacy checkpoints must be converted explicitly; old flow checkpoints are unsupported. The model type is inferred from checkpoints unless explicitly specified.
 
 Resumes may change `--steps` (the total update endpoint) while preserving AdamW state.

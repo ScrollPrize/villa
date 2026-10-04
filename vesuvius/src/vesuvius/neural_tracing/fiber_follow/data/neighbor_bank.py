@@ -140,11 +140,12 @@ class NeighborBank:
             raise ValueError('Checkpoint negative-bank shards were removed or modified')
 
     def validate_volume(self, spec):
+        from vesuvius.neural_tracing.fiber_follow.shared.paths import recorded_path
         groups = self.run['prediction_manifest']['groups']
-        if any(Path(g['zarr']).parent.parent.resolve() != Path(spec.fiber_zarr_dir).resolve()
+        if any(Path(recorded_path(g['zarr'])).parent.parent.resolve() != Path(spec.fiber_zarr_dir).resolve()
                or Path(g['zarr']).name != str(spec.fiber_level) for g in groups.values()):
             raise ValueError('Negative-bank prediction volume differs from training')
-        if Path(self.run['ct']).parent.resolve() != Path(spec.ct_zarr).resolve():
+        if Path(recorded_path(self.run['ct'])).parent.resolve() != Path(spec.ct_zarr).resolve():
             raise ValueError('Negative-bank CT source differs from training')
 
     def _archive(self, entry):

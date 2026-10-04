@@ -3,6 +3,7 @@ import json
 
 
 from vesuvius.neural_tracing.fiber_follow.tracing.policy import DIAGNOSTIC_THRESHOLDS
+from vesuvius.neural_tracing.fiber_follow.models.identity_verifier import VERIFY_METRICS
 
 
 def _rate(n, d):
@@ -105,6 +106,29 @@ class SamplingLedger:
         return result
 
 
+def _verification_lines(m):
+    """Accuracy with memory / shuffled memory / no memory: head-axis groups, decisive pairs, dense samples
+    by path stratum and the model's own predicted points."""
+    def rate(name):
+        count = m.get(f'verify_{name}_count', 0)
+        return f"{m.get(f'verify_{name}_correct', 0)/max(1, count):.1%}" if count else 'n/a'
+
+    lines = [f"  identity verification: loss {m.get('verify_loss_sum', 0.)/max(1, m['verify_states']):.3f}"
+             f" over {int(m['verify_states'])} states | original fiber ranks first in"
+             f" {m.get('verify_listwise_correct', 0)/max(1, m.get('verify_listwise_planes', 0)):.1%}"
+             f" of {int(m.get('verify_listwise_planes', 0))} planes"]
+    for name, label in (('own', 'on original'), ('switched_recent', 'switched <=64 vox'),
+                        ('switched_old', 'switched >64 real'), ('switched_old_synthetic', 'switched >64 synthetic'),
+                        ('pair_old', 'original beats path >64 real'),
+                        ('pair_old_synthetic', 'original beats path >64 synthetic'),
+                        ('dense_path_on', 'dense on path, on original'), ('dense_path_off', 'dense on path, off original'),
+                        ('dense_away_on', 'dense off path, on original'), ('dense_away_off', 'dense off path, off original'),
+                        ('predicted_on', 'own prediction on original'), ('predicted_off', 'own prediction off original')):
+        lines.append(f"    {label} ({int(m.get(f'verify_{name}_count', 0))}): memory {rate(name)}"
+                     f" | shuffled memory {rate('shuffled_'+name)} | no memory {rate('empty_'+name)}")
+    return lines
+
+
 class TrainingInterval:
     """Pool counts and weight decision-normalized means by supervised decisions."""
     means = ('loss', 'geometry', 'confidence_loss', 'refinement_attempts_mean')
@@ -117,7 +141,10 @@ class TrainingInterval:
               'connector_rejected_targets', 'refinement_attempts_sum',
               'memory_recorded', 'memory_missing', 'memory_encoded', 'memory_identity_loss_sum',
               'memory_identity_states', 'memory_identity_pairs', 'memory_identity_correct',
-              'memory_identity_departed_pairs', 'memory_identity_departed_correct')
+              'memory_identity_anchor_pairs', 'memory_identity_anchor_correct',
+              'memory_identity_control_pairs', 'memory_identity_control_correct',
+              *(f'memory_identity_{group}_{kind}' for group in ('departed_recent', 'departed_old', 'departed_old_afv')
+                for kind in ('pairs', 'correct')), *VERIFY_METRICS)
 
     def __init__(self):
         self.values = dict(updates=0, crops=0, decisions=0)
@@ -180,11 +207,15 @@ def _interval_training_lines(row):
         lines.append(f"  decision memory: recorded {int(m.get('memory_recorded', 0))}"
                      f" | encoded from crops {int(m.get('memory_encoded', 0))}"
                      f" | missing {int(m.get('memory_missing', 0))}")
-    if m.get('memory_identity_pairs'):
-        pairs, departed = m['memory_identity_pairs'], m.get('memory_identity_departed_pairs', 0)
+    if m.get('memory_identity_pairs') or m.get('memory_identity_anchor_pairs'):
+        rate = lambda name: (f"{m.get(f'memory_identity_{name}correct', 0)/max(1, m.get(f'memory_identity_{name}pairs', 0)):.1%}"
+                             f" of {int(m.get(f'memory_identity_{name}pairs', 0))}")
         lines.append(f"  memory identity: InfoNCE {m['memory_identity_loss_sum']/max(1, m['memory_identity_states']):.3f}"
-                     f" | rank {m['memory_identity_correct']/pairs:.1%} of {int(pairs)} anchors"
-                     f" | departed {m.get('memory_identity_departed_correct', 0)/max(1, departed):.1%} of {int(departed)}")
+                     f" | query rank {rate('')} | anchor rank {rate('anchor_')} | shuffled-anchor control {rate('control_')}")
+        lines.append(f"    departed query rank: recent (<=24 vox) {rate('departed_recent_')}"
+                     f" | old (>24) {rate('departed_old_')} | old AFV {rate('departed_old_afv_')}")
+    if m.get('verify_states'):
+        lines.extend(_verification_lines(m))
     lines.append(f"  supervision: {int(m['decisions'])} decisions / {int(m['crops'])} observations")
     frames = []
     for prefix, label in (('ct_frame', 'current'), ('history_frame', 'history')):
