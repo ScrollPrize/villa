@@ -730,7 +730,7 @@ def validate_resume_options(args, recorded_options):
     # an omitted CLI flag must not prevent resuming that recorded selection.
     # Initialization is historical provenance, not a resume-time input.
     # Operational settings may change on resume; sampling and label semantics may not.
-    ignored = {'resume','init_weights','reset_optimizer','lr','steps','frame_checkpoint','out_root','device','batch','grad_steps','workers','threads','dagger_threads','worker_cache_gb','dataset_config',
+    ignored = {'resume','init_weights','init_partial','reset_optimizer','lr','steps','frame_checkpoint','out_root','device','batch','grad_steps','workers','threads','dagger_threads','worker_cache_gb','dataset_config',
                'remote_prefetch_connections','remote_prefetch_queue_size','remote_prefetch_timeout','remote_prefetch_lookahead',
                'log_every','ckpt_every','diag_every','batch_diag_every','dagger_device','dagger_batch','dagger_forward_chunk',
                'negative_bank_refresh_seconds','negative_bank_cache_mb','activation_checkpointing',
@@ -1162,6 +1162,7 @@ def main(argv=None):
                 names = dataset.names if dataset_document else [primary_source.get('name', 'paris4')]
                 report = render_microbatch(ema, batches[-1], out, step, device=args.device,
                     n_commit=args.n_commit, tolerance=args.tolerance, dataset_names=names,
+                    memory=live_continuation,
                     training_metrics=dict(metrics, lr=lr, data_seconds=data_seconds,
                         update_seconds=update_seconds,
                         cuda_peak_allocated_gib=torch.cuda.max_memory_allocated(args.device)/2**30

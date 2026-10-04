@@ -149,3 +149,36 @@ def test_diagnostic_helpers_report_unknown_values_and_clip_annotation_to_section
     is_green = (pixels[..., 1].astype(int) > pixels[..., 0].astype(int)+30) & (pixels[..., 2] < 100)
     assert is_green[62:, :CELL[0]].any()
     assert not is_green[62:, 2*CELL[0]:3*CELL[0]].any()
+
+
+def test_render_resolves_decision_memory_before_slicing_rows(tmp_path):
+    from test_decision_memory import memory_config, decision_inputs
+    from vesuvius.neural_tracing.fiber_follow.models.model import build_model
+    from vesuvius.neural_tracing.fiber_follow.models.decision_memory import ENTRY_FEATURES
+    from vesuvius.neural_tracing.fiber_follow.train.live_continuation import DecisionStore, LiveContinuation
+    cfg = memory_config(recurrent_refinement_steps=1)
+    model = build_model(cfg).eval()
+    data = batch(cfg, 3)
+    data['x'] = {k: v for k, v in data['x'].items() if not k.startswith('history_')}
+    data['x'].update(decision_inputs(cfg, 3, crops=1))
+    # Row 1 reads one entry encoded from a crop; row 2 one recorded chain entry; row 0 none.
+    data['x']['history_valid'][1, 0] = data['x']['history_encode'][1, 0] = True
+    data['x']['history_crops'][:] = torch.rand_like(data['x']['history_crops'])
+    data['x']['history_valid'][2, 0] = True
+    data['x']['history_keys'][2, 0], data['x']['history_chain'][2] = 4, 77
+    data['x']['history_path_valid'][1:, 0] = True
+    live = LiveContinuation.__new__(LiveContinuation)
+    live.memory = DecisionStore(max_age=10)
+    live.memory.put(77, 4, torch.randn(ENTRY_FEATURES, cfg.hidden).to(torch.bfloat16), {4}, step=0)
+    data['dataset_id'] = torch.tensor([0, 0, 0])
+    rows = render_microbatch(model, data, tmp_path, 1000, device='cpu', n_commit=4, tolerance=1.5,
+                             dataset_names=['ordinary'], memory=live)
+    report = json.loads((tmp_path/'diagnostic_images'/'1000'/'metrics.json').read_text())
+    assert rows['examples'] == 3
+    assert [sum(r['history_valid']) for r in report['rows']] == [0, 1, 1]
+    assert report['history_encoder']['token_shape'] == [3, 11, 11]
+    # Without the store, recorded slots are dropped instead of read as zeros.
+    rows = render_microbatch(model, data, tmp_path/'none', 1000, device='cpu', n_commit=4, tolerance=1.5,
+                             dataset_names=['ordinary'])
+    report = json.loads((tmp_path/'none'/'diagnostic_images'/'1000'/'metrics.json').read_text())
+    assert [sum(r['history_valid']) for r in report['rows']] == [0, 1, 0]

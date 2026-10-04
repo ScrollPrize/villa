@@ -98,6 +98,7 @@ class DecisionMemory(nn.Module):
         width = cfg.hidden
         self.spatial_tokens_per_slab = SPATIAL_TOKENS
         self.tokens_per_slab = TOKENS_PER_ENTRY
+        self.token_shape = (len(PLANES), len(LATERAL), len(LATERAL))  # GRID order: plane, y, x
         self.register_buffer('grid', torch.from_numpy(GRID), persistent=False)
         self.register_buffer('stencil', torch.tensor(STENCIL), persistent=False)
         self.projection = nn.Linear(width, width)

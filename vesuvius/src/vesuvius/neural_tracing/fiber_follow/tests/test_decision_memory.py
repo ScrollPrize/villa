@@ -211,3 +211,31 @@ def test_data_side_entry_matches_the_decision_observation():
     observed = entry_item(item, entries[0], c)
     np.testing.assert_allclose(observed['reference_points'], expected['reference_points'], atol=1e-9)
     np.testing.assert_array_equal(observed['reference_mask'], expected['reference_mask'])
+
+
+def test_chain_records_and_store_keep_exactly_what_later_states_read():
+    from vesuvius.neural_tracing.fiber_follow.train.live_continuation import chain_memory, DecisionStore
+    from vesuvius.neural_tracing.fiber_follow.data.decision_memory import memory_layout
+    store = DecisionStore(max_age=10)
+    path = np.c_[np.zeros(1), np.zeros(1), np.zeros(1)]
+    item = dict(pos=path[-1], frame=np.eye(3), observed_path=path, seed_pos=path[0],
+                seed_tangent=np.array([0., 0., 1.]), seed_age=0., seed_valid=True)
+    chain = None
+    for depth in range(40):
+        chain_id, decisions = chain_memory(dict(item, **({} if chain is None else dict(live_chain_id=chain))), depth)
+        assert chain is None or chain_id == chain
+        chain = chain_id
+        assert decisions[-1]['key'] == depth and len(decisions) <= 40
+        store.put(chain, depth, torch.full((2,), float(depth)), {d['key'] for d in decisions}, step=depth)
+        # The next state reads only recorded decisions that the store still holds.
+        step = np.c_[np.zeros(9), np.zeros(9), item['pos'][2]+np.arange(1., 10.)]
+        item = dict(item, pos=step[-1], observed_path=np.concatenate((item['observed_path'], step)),
+                    memory_decisions=decisions)
+        entries = memory_layout(item)[0]
+        keys = torch.tensor([[e['record']['key'] for e in entries]+[-1]*(SLOTS-len(entries))])
+        features, found = store.gather(torch.tensor([chain]), keys, (2,), 'cpu')
+        assert found[0, :len(entries)].all() and not found[0, len(entries):].any()
+        assert not any(e['encode'] for e in entries)
+        torch.testing.assert_close(features[0, :len(entries), 0], keys[0, :len(entries)].float().to(torch.bfloat16))
+    store.evict(40+11)
+    assert len(store) == 0

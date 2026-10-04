@@ -104,7 +104,10 @@ def layer_capture(model):
         def history_conv(m, a, y):
             record['statistics']['history convolution'] = tensor_stats(y)
             record['history']['convolution'] = y.detach().float().square().mean((1, 2)).sqrt().cpu()
-        handles.append(model.history_encoder.convolution.register_forward_hook(history_conv))
+        if hasattr(model.history_encoder, 'convolution'):
+            handles.append(model.history_encoder.convolution.register_forward_hook(history_conv))
+        else:
+            record['history']['convolution'] = None  # decision memory: entries come from the main encoder
         def history_tokens(m, a, y):
             tokens, padding = y
             slots = a[1].shape[1]
@@ -205,9 +208,32 @@ def measured_geometry(batch):
                 frame_columns_uv_heading_xyz=cpu_values(batch['crop_frame'][0]) if 'crop_frame' in batch else None)
 
 
+def decision_memory_rows(model, cpu_batch, device, memory=None):
+    """Resolve batch-level decision memory into per-row features before rows are sliced.
+
+    Crops of unrecorded entries are stacked per batch, not per row, and recorded entries
+    live in the trainer's store. Without the store, recorded slots are dropped (invalid).
+    """
+    from vesuvius.neural_tracing.fiber_follow.train.train import move_batch
+    batch = move_batch(cpu_batch, device)
+    x = batch['x']
+    recorded = x['history_keys'] >= 0
+    if memory is not None and bool(recorded.any()):
+        x['history_features'], found = memory.attach_memory(x, model.cfg.hidden)
+    else:
+        found = torch.zeros_like(recorded)
+    x['history_valid'] = x['history_valid'] & ~(recorded & ~found)
+    with torch.autocast('cuda', dtype=torch.bfloat16, enabled=torch.device(device).type == 'cuda'):
+        x['history_features'] = model.memory_features(x)
+    for key in ('history_crops', 'history_references', 'history_reference_mask'):
+        x.pop(key)
+    x['history_encode'] = torch.zeros_like(x['history_encode'])
+    return batch
+
+
 @torch.no_grad()
 def render_microbatch(model, cpu_batch, out, step, *, device, n_commit, tolerance,
-                      dataset_names=(), training_metrics=None):
+                      dataset_names=(), training_metrics=None, memory=None):
     """One sheet per image type; every current-microbatch row, in loader order."""
     from vesuvius.neural_tracing.fiber_follow.train.train import move_batch
     from vesuvius.neural_tracing.fiber_follow.evaluation.diagnostic_plots import plot_sheets
@@ -219,6 +245,8 @@ def render_microbatch(model, cpu_batch, out, step, *, device, n_commit, toleranc
     examples, rows = [], []
     inference_seconds = 0.
     try:
+        if getattr(model.cfg, 'memory', 'slabs') == 'decisions':
+            cpu_batch = decision_memory_rows(model, cpu_batch, device, memory)
         for i in range(len(cpu_batch['hist'])):
             batch = move_batch(slice_batch(cpu_batch, slice(i, i+1)), device)
             # Singleton inference keeps each adaptive refinement's row identity
