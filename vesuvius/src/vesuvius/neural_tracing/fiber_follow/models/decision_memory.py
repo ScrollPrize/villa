@@ -31,6 +31,9 @@ GRID = np.array([(x, y, z) for z in PLANES for y in LATERAL for x in LATERAL], n
 SPATIAL_TOKENS = len(GRID)
 ENTRY_FEATURES = SPATIAL_TOKENS+len(PATH_OFFSETS)*len(STENCIL)
 TOKENS_PER_ENTRY = SPATIAL_TOKENS+len(PATH_OFFSETS)
+ANCHOR_FEATURE = SPATIAL_TOKENS+len(STENCIL)*PATH_OFFSETS.index(0.)  # stencil centre at the entry's own head
+IDENTITY_NEGATIVES = 8  # neighbor points per state for the memory-identity loss
+IDENTITY_MIN_AGE = 64.  # anchors only from entries the current crop cannot see
 MEMORY_CHUNK = 8  # crops per encoder call when encoding entries without a recorded decision
 
 

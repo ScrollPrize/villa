@@ -394,6 +394,12 @@ class IdentityObservationBuilder(ObservationBuilder):
                    negative_bank_shards=np.zeros(len(items), np.int64))
         if selected.any() or not len(items):
             out['foreign'] = np.zeros((len(items), *shape), np.uint8)
+        identity = bool(getattr(cfg, 'identity_dim', 0)) and self.fibers is not None
+        if identity:
+            from vesuvius.neural_tracing.fiber_follow.models.decision_memory import SLOTS, IDENTITY_NEGATIVES
+            out.update(identity_points=np.zeros((len(items), 1+IDENTITY_NEGATIVES, 3), np.float32),
+                       identity_point_mask=np.zeros((len(items), 1+IDENTITY_NEGATIVES), bool),
+                       identity_anchor_mask=np.zeros((len(items), SLOTS), bool))
         for j, item in enumerate(items):
             out['location_source'][j] = item.get('location_source', 0)
             if 'identity_curve' not in item:
@@ -410,6 +416,8 @@ class IdentityObservationBuilder(ObservationBuilder):
             out['foreign_components'][j] = found['counts']['foreign_components']
             out['negative_bank_shards'][j] = bank.shard_count+(self.near_negative_bank.shard_count
                 if self.near_negative_bank is not None and self.near_negative_bank is not bank else 0)
+            if identity and selected[j]:
+                self.identity_targets(item, found, out, j)
             # Remember covered locations directly, independent of randomly selected
             # contrastive queries. Missing coverage remains unknown.
             ahead = found['local']
@@ -418,6 +426,43 @@ class IdentityObservationBuilder(ObservationBuilder):
                          & (ahead[:, 2] <= cfg.n_future*cfg.future_step)).any()):
                 self.lateral.append(item['fiber_ref'])
         return {k: torch.from_numpy(v) for k, v in out.items()}
+
+    def identity_targets(self, item, found, out, row):
+        """Memory-identity points: the own fiber's crossing of the plane two voxels ahead (point 0),
+        the nearest point of each validated neighbor path near that plane, and anchors = memory
+        entries at least IDENTITY_MIN_AGE behind whose decision lay on the original fiber.
+        Annotation and bank geometry only label; nothing here becomes a model input feature."""
+        from scipy.spatial import cKDTree
+        from vesuvius.neural_tracing.fiber_follow.models.decision_memory import IDENTITY_NEGATIVES, IDENTITY_MIN_AGE
+        planes = np.asarray(item['planes'], np.float64)
+        k = int(np.argmin(np.abs(planes-2.)))
+        if not item['plane_mask'][k]:
+            return
+        positive = np.r_[np.asarray(item['plane_ab'][k], np.float64), planes[k]]
+        local = np.asarray(found['local'], np.float64).reshape(-1, 3)
+        paths = np.asarray(found['path_ids'])
+        nearest = {}
+        for point, path in zip(local, paths):
+            if abs(point[2]-planes[k]) > 1.:
+                continue
+            distance = float(np.linalg.norm(point[:2]-positive[:2]))
+            if distance > self.sampling.rule.own_radius and (path not in nearest or distance < nearest[path][0]):
+                nearest[path] = (distance, point)
+        negatives = [p for _, p in sorted(nearest.values(), key=lambda v: v[0])][:IDENTITY_NEGATIVES]
+        if not negatives:
+            return
+        out['identity_points'][row, 0], out['identity_point_mask'][row, 0] = positive, True
+        out['identity_points'][row, 1:1+len(negatives)] = np.stack(negatives)
+        out['identity_point_mask'][row, 1:1+len(negatives)] = True
+        trees = self.__dict__.setdefault('_identity_trees', {})
+        index = int(item['fiber_ref'][0])
+        if index not in trees:
+            if len(trees) > 4096:
+                trees.clear()
+            trees[index] = cKDTree(np.asarray(self.fibers[index].points))
+        for slot, entry in enumerate(item.get('_memory_entries') or []):
+            if entry['age'] >= IDENTITY_MIN_AGE and trees[index].query(entry['pos'])[0] <= self.sampling.on_fiber_tolerance:
+                out['identity_anchor_mask'][row, slot] = True
 
     def __call__(self,items,vol, *, decision_mask=None):
         """Images for every observation; expensive targets only for decisions.

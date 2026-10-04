@@ -103,14 +103,18 @@ def fixed_rows(value, size):
     return torch.empty_like(value, memory_format=torch.contiguous_format).copy_(value)
 
 
+IDENTITY_INPUTS = ('identity_points', 'identity_point_mask', 'identity_anchor_mask', 'identity_anchor_features')
+
+
 def training_inputs(x, hist, hmask, size):
     b = len(hist)
     defaults = dict(seed=hist.new_zeros(b, 1, 3), seed_mask=hist.new_zeros(b, 1),
                     seed_tangent=hist.new_zeros(b, 3), seed_age=hist.new_zeros(b))
     names = ('fine', 'seed', 'seed_mask', 'seed_tangent', 'seed_age',
              'history_tokens', 'history_padding')
-    # Optional observed-path geometry exists only for models that consume it.
-    names += tuple(name for name in ('path_geometry', 'path_geometry_valid') if name in x)
+    # Optional observed-path geometry exists only for models that consume it; identity
+    # points/anchors only for the memory-identity loss.
+    names += tuple(name for name in ('path_geometry', 'path_geometry_valid', *IDENTITY_INPUTS) if name in x)
     image = {name: fixed_rows(x[name] if name in x else defaults[name], size) for name in names}
     return image, fixed_rows(hist, size), fixed_rows(hmask, size)
 
@@ -138,12 +142,19 @@ def training_prediction(model, x, hist, hmask, confidence_threshold=.5, n_commit
     timing = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)) if hist.is_cuda else time.perf_counter()
     if hist.is_cuda:
         timing[0].record()
-    tokens, padding = model.encode_history(x)
+    identity = {}
+    if getattr(model, 'identity_projection', None) is not None and targets is not None and 'identity_points' in targets:
+        tokens, padding, anchors = model.encode_history(x, return_anchors=True)
+        identity = {key: targets[key] for key in IDENTITY_INPUTS[:3]}
+        identity['identity_anchor_features'] = anchors.detach()
+    else:
+        tokens, padding = model.encode_history(x)
     if hist.is_cuda:
         timing[1].record()
     if hasattr(model, '_history_timings'):
         model._history_timings.append(timing if hist.is_cuda else time.perf_counter()-timing)
-    image, history, mask = training_inputs(dict(x, history_tokens=tokens, history_padding=padding), hist, hmask, size)
+    image, history, mask = training_inputs(dict(x, history_tokens=tokens, history_padding=padding, **identity),
+                                           hist, hmask, size)
     threshold = hist.new_full((), confidence_threshold)
     padded_targets = None if targets is None else {
         key: fixed_rows(value, size) for key, value in targets.items()
@@ -209,7 +220,8 @@ def model_config_from_args(args, checkpoint=None):
             raise ValueError('Model type must match checkpoint')
         return cfg
     cls = FlowConfig if args.model == 'flow_matching' else CoordinateRegressionConfig
-    options = {key: getattr(args, key) for key in ('stem_channels', 'stem_blocks', 'stem', 'memory', 'hidden',
+    options = {key: getattr(args, key) for key in ('stem_channels', 'stem_blocks', 'stem', 'memory',
+        'identity_dim', 'identity_temperature', 'hidden',
         'encoder_ffn', 'decoder_layers', 'decoder_ffn', 'scorer_layers', 'activation_checkpointing')}
     options['layers'] = args.axial_layers
     if cls is FlowConfig:
@@ -416,7 +428,7 @@ def clip_training_gradients(model, history_max_norm=HISTORY_GRAD_CLIP, rest_max_
 def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolerance=1.5,
                      confidence_weight=.5, ema_decay=.999, ema_ramp=True, n_commit=None, compute_metrics=True,
                      history_grad_clip=HISTORY_GRAD_CLIP, rest_grad_clip=REST_GRAD_CLIP,
-                     diagnostic=None, live_continuation=None, ledger=None):
+                     diagnostic=None, live_continuation=None, ledger=None, identity_weight=0.):
     """One equally weighted task loss per independent supervised decision."""
     prepare_training(model, getattr(model, 'training_batch_size', 2))
     total = observed = sum(len(batch['hist']) for batch in batches)
@@ -481,7 +493,19 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
             geometry = terms['geometry_per_state'].sum()/denominator
             confidence = terms['confidence_per_state'].sum()/denominator
             loss = geometry + confidence_weight*confidence
+            if 'identity_loss_per_state' in output:
+                loss = loss + identity_weight*output['identity_loss_per_state'].sum()/denominator
         loss.backward()
+        if 'identity_pairs' in output:
+            from vesuvius.neural_tracing.fiber_follow.data.state_labels import DEPARTURE_DISTANCE
+            pairs, correct = output['identity_pairs'], output['identity_correct']
+            departed = (batch['match_distance'] > DEPARTURE_DISTANCE)[:, None]
+            for key, value in (('memory_identity_loss_sum', output['identity_loss_per_state'].detach().sum()),
+                               ('memory_identity_states', pairs.any(-1).sum()), ('memory_identity_pairs', pairs.sum()),
+                               ('memory_identity_correct', correct.sum()),
+                               ('memory_identity_departed_pairs', (pairs & departed).sum()),
+                               ('memory_identity_departed_correct', (correct & departed).sum())):
+                accumulate(sums, key, value)
         if live_continuation is not None:
             live_continuation.feedback(cpu, output, step)
         if compute_metrics:
@@ -625,6 +649,14 @@ def build_parser():
     ap.add_argument('--chain-seed-fraction', type=float, default=0.,
                     help='With --memory decisions: start live chains at a seed within this leading fraction '
                          'of the traversal (0 keeps the ordinary fresh location)')
+    ap.add_argument('--identity-dim', type=int, default=CoordinateRegressionConfig.identity_dim,
+                    help='With --memory decisions: width of the linear projection for the memory-identity '
+                         'InfoNCE loss (0 disables it)')
+    ap.add_argument('--identity-temperature', type=float, default=CoordinateRegressionConfig.identity_temperature)
+    ap.add_argument('--identity-weight', type=float, default=.1, help='Memory-identity InfoNCE coefficient')
+    ap.add_argument('--lr-step-offset', type=int, default=0,
+                    help='Continue another schedule: the cosine is evaluated at step+offset over steps+offset '
+                         '(warmup still counts this run\'s own updates)')
     ap.add_argument('--init-partial', action='store_true',
                     help='With --init-weights: build the model from these options and load only tensors whose '
                          'names and shapes match; new axial blocks and the new stem start as identity residuals')
@@ -742,7 +774,8 @@ def validate_resume_options(args, recorded_options):
                'remote_prefetch_connections','remote_prefetch_queue_size','remote_prefetch_timeout','remote_prefetch_lookahead',
                'log_every','ckpt_every','diag_every','batch_diag_every','dagger_device','dagger_batch','dagger_forward_chunk',
                'negative_bank_refresh_seconds','negative_bank_cache_mb','activation_checkpointing',
-               'history_grad_clip','rest_grad_clip','blur_probability','blur_sigma'}
+               'history_grad_clip','rest_grad_clip','blur_probability','blur_sigma',
+               'tolerance'}  # confidence-label tolerance; the departure threshold is a separate constant
     for key,value in vars(args).items():
         recorded = recorded_options.get(key)
         if key not in ignored and json.dumps(recorded,sort_keys=True) != json.dumps(value,sort_keys=True):
@@ -1098,13 +1131,14 @@ def main(argv=None):
             update_started = time.monotonic()
             if early:
                 progress(f'Update {step}: data ready in {data_seconds:.1f}s; running forward/backward and optimizer')
-            lr = lr_at(step-lr_restart_step, args.lr, args.warmup, args.steps-lr_restart_step)
+            lr = lr_at(step-lr_restart_step, args.lr, args.warmup, args.steps-lr_restart_step, args.lr_step_offset)
             diagnostic = {} if tracer is not None and args.diag_every and step % args.diag_every == 0 else None
             metrics = optimizer_update(model, ema, opt, batches, step, lr, device=args.device,
                 tolerance=args.tolerance, confidence_weight=args.confidence_weight, ema_decay=args.ema_decay,
                 ema_ramp=not initialization,
                 n_commit=args.n_commit, compute_metrics=step % args.log_every == 0 or step == args.steps,
                 history_grad_clip=args.history_grad_clip, rest_grad_clip=args.rest_grad_clip,
+                identity_weight=args.identity_weight,
                 diagnostic=diagnostic, live_continuation=live_continuation, ledger=ledger)
             observed_states += metrics['observed_states']
             interval_states += metrics['observed_states']

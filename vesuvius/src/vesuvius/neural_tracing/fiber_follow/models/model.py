@@ -36,6 +36,8 @@ class CoordinateRegressionConfig:
     stem_blocks: int = 2
     stem: str = 'residual'  # 'residual' full-resolution stem, or 'stride2' light stem
     memory: str = 'slabs'  # 'slabs' separate historical-slab CNN, or 'decisions' encoder features of past decisions
+    identity_dim: int = 0  # >0 (decision memory): linear projection for the memory-identity InfoNCE loss
+    identity_temperature: float = .1
     frame_checkpoint: str | None = None  # frozen heading/normal model used by crop builders
     frame_checkpoint_sha256: str | None = None
 
@@ -43,6 +45,10 @@ class CoordinateRegressionConfig:
         if any(type(value) is not int or value < 1 for value in
                (self.encoder_ffn, self.decoder_ffn)):
             raise ValueError('Feed-forward widths must be positive integers')
+        if type(self.identity_dim) is not int or self.identity_dim < 0 or not self.identity_temperature > 0:
+            raise ValueError('Identity projection width must be a nonnegative integer and its temperature positive')
+        if self.identity_dim and self.memory != 'decisions':
+            raise ValueError('The memory-identity loss requires decision memory')
         if self.stem not in ('residual', 'stride2') or self.memory not in ('slabs', 'decisions'):
             raise ValueError("Stem must be 'residual' or 'stride2'; memory must be 'slabs' or 'decisions'")
         if type(self.stem_channels) is not int or self.stem_channels < 1 or type(self.stem_blocks) is not int or self.stem_blocks < 1:
@@ -312,6 +318,8 @@ class ObservationFollower(nn.Module):
         if cfg.memory == 'decisions':
             from .decision_memory import DecisionMemory
             self.history_encoder = DecisionMemory(cfg)
+            # Training-only head of the memory-identity loss; tracing never uses it.
+            self.identity_projection = nn.Linear(cfg.hidden, cfg.identity_dim) if cfg.identity_dim else None
         else:
             self.history_encoder = HistoryEncoder(cfg)
         self.history_attention = HistoryAttention(cfg.hidden, cfg.heads)
@@ -371,11 +379,38 @@ class ObservationFollower(nn.Module):
         values, support = self.sample_local(ctx.get('deep_fp32', ctx['deep']), points)
         return torch.cat((values.to(ctx['deep'].dtype), support[..., None]), -1)
 
-    def encode_history(self, x):
+    def encode_history(self, x, return_anchors=False):
+        """Memory tokens and padding; with ``return_anchors`` also each entry's feature at its own head."""
         extra = {key: x['history_'+key] for key in ('path_points', 'path_tangents', 'path_valid')}
         if self.cfg.memory == 'slabs':
             return self.history_encoder(x['history_slabs'], x['history_valid'], x['history_pose'], **extra)
-        return self.history_encoder(self.memory_features(x), x['history_valid'], x['history_pose'], **extra)
+        from .decision_memory import ANCHOR_FEATURE
+        features = self.memory_features(x)
+        tokens, padding = self.history_encoder(features, x['history_valid'], x['history_pose'], **extra)
+        return (tokens, padding, features[:, :, ANCHOR_FEATURE]) if return_anchors else (tokens, padding)
+
+    def identity_terms(self, ctx, x):
+        """Memory-identity InfoNCE: an old on-fiber memory entry (detached anchor) must be closer to the
+        own fiber in the current crop than to every annotated neighbor there, in a linear projection.
+
+        Point 0 of ``identity_points`` is the own fiber, the rest are neighbors. Gradient reaches the
+        encoder only through the current crop. Rows/anchors without a positive and a negative are inert.
+        """
+        if getattr(self, 'identity_projection', None) is None or 'identity_points' not in x:
+            return {}
+        values, support = self.sample_local(ctx.get('deep_fp32', ctx['deep']).float(), x['identity_points'])
+        points_ok = x['identity_point_mask'].bool() & support
+        query = F.normalize(self.identity_projection(values.float()), dim=-1)
+        anchor = F.normalize(self.identity_projection(x['identity_anchor_features'].float()), dim=-1)
+        similarity = torch.einsum('bsd,bkd->bsk', anchor, query)/self.cfg.identity_temperature
+        negatives = points_ok[:, 1:]
+        valid = x['identity_anchor_mask'].bool() & points_ok[:, :1] & negatives.any(-1, keepdim=True)
+        # Finite masking: no -inf/NaN can enter the gradient of an excluded anchor.
+        logits = similarity.masked_fill(~points_ok[:, None, :], -1e4)
+        loss = torch.where(valid, torch.logsumexp(logits, -1)-logits[..., 0], 0.)
+        best = similarity[..., 1:].masked_fill(~negatives[:, None, :], -1e4).amax(-1)
+        return dict(identity_loss_per_state=loss.sum(-1)/valid.sum(-1).clamp_min(1),
+                    identity_pairs=valid, identity_correct=valid & (similarity[..., 0] > best))
 
     def memory_features(self, x):
         """(B, SLOTS, ENTRY_FEATURES, C): recorded entries, plus entries encoded here from crops.
@@ -604,6 +639,7 @@ class CoordinateRegressionFollower(ObservationFollower):
         out = self.proposal_output(initial, refinements, scores, valid)
         if 'memory_entry' in ctx:
             out['memory_entry'] = ctx['memory_entry']
+        out.update(self.identity_terms(ctx, x))
         return out
 
     def decode_cached(self, query, projected, padding, ctx):

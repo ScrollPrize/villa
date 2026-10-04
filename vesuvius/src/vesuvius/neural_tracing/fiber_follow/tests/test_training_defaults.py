@@ -93,8 +93,21 @@ def test_initialized_run_can_resume_with_lower_lr_without_changing_training_cont
     train.validate_resume_options(resumed, vars(original))
     resumed.steps = original.steps + 50000
     train.validate_resume_options(resumed, vars(original))
-    for key, value in [('tolerance', 1.5), ('warmup', 0), ('n_commit', 8)]:
+    # The confidence-label tolerance may change on resume; the departure threshold is a constant.
+    train.validate_resume_options(SimpleNamespace(**dict(vars(resumed), tolerance=original.tolerance+.5)), vars(original))
+    for key, value in [('warmup', 0), ('n_commit', 8)]:
         changed = SimpleNamespace(**vars(resumed))
         setattr(changed, key, value)
         with pytest.raises(ValueError, match=f'Resume option differs: {key}'):
             train.validate_resume_options(changed, vars(original))
+
+
+def test_lr_step_offset_continues_the_original_cosine_after_its_warmup():
+    import math
+    from vesuvius.neural_tracing.fiber_follow.train.runloop import lr_at
+    original = lambda step: lr_at(step, 1e-4, 1000, 100000)
+    offset, warmup, steps = 32000, 500, 68000
+    continued = lambda own: lr_at(own, 1e-4, warmup, steps, offset)
+    for own in (500, 1000, 20000, 68000):
+        assert math.isclose(continued(own), original(offset+own), rel_tol=1e-12)
+    assert continued(1) < original(offset+1)

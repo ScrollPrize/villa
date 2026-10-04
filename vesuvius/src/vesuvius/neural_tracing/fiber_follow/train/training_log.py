@@ -115,7 +115,9 @@ class TrainingInterval:
               'point_unknown_count', 'supervised_states', 'observation_only_states', 'history_valid_slabs', 'history_age_sum', 'history_overlap_sum', 'history_load_seconds', 'history_encode_seconds',
               'confidence_labeled_states', 'confidence_terminal_states', 'confidence_recoverable_states',
               'connector_rejected_targets', 'refinement_attempts_sum',
-              'memory_recorded', 'memory_missing', 'memory_encoded')
+              'memory_recorded', 'memory_missing', 'memory_encoded', 'memory_identity_loss_sum',
+              'memory_identity_states', 'memory_identity_pairs', 'memory_identity_correct',
+              'memory_identity_departed_pairs', 'memory_identity_departed_correct')
 
     def __init__(self):
         self.values = dict(updates=0, crops=0, decisions=0)
@@ -178,6 +180,11 @@ def _interval_training_lines(row):
         lines.append(f"  decision memory: recorded {int(m.get('memory_recorded', 0))}"
                      f" | encoded from crops {int(m.get('memory_encoded', 0))}"
                      f" | missing {int(m.get('memory_missing', 0))}")
+    if m.get('memory_identity_pairs'):
+        pairs, departed = m['memory_identity_pairs'], m.get('memory_identity_departed_pairs', 0)
+        lines.append(f"  memory identity: InfoNCE {m['memory_identity_loss_sum']/max(1, m['memory_identity_states']):.3f}"
+                     f" | rank {m['memory_identity_correct']/pairs:.1%} of {int(pairs)} anchors"
+                     f" | departed {m.get('memory_identity_departed_correct', 0)/max(1, departed):.1%} of {int(departed)}")
     lines.append(f"  supervision: {int(m['decisions'])} decisions / {int(m['crops'])} observations")
     frames = []
     for prefix, label in (('ct_frame', 'current'), ('history_frame', 'history')):

@@ -71,9 +71,14 @@ class RunLog:
         self._file.close()
 
 
-def lr_at(step: int, base_lr: float, warmup: int, total_steps: int) -> float:
-    """Linear warmup multiplied by a cosine decay over ``total_steps``."""
-    return base_lr * min(1., step / max(1, warmup)) * .5 * (1 + math.cos(math.pi * (step - 1) / total_steps))
+def lr_at(step: int, base_lr: float, warmup: int, total_steps: int, offset: int = 0) -> float:
+    """Linear warmup multiplied by a cosine decay over ``total_steps``.
+
+    With ``offset`` a fresh optimizer continues another run's cosine: the decay is evaluated
+    at ``step+offset`` over ``total_steps+offset``; warmup still counts this run's own updates.
+    """
+    return (base_lr * min(1., step / max(1, warmup))
+            * .5 * (1 + math.cos(math.pi * (step + offset - 1) / (total_steps + offset))))
 
 
 def save_checkpoint(path, model, vol_spec, crop, n_history, model_type, extra=None):

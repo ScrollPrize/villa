@@ -239,3 +239,54 @@ def test_chain_records_and_store_keep_exactly_what_later_states_read():
         torch.testing.assert_close(features[0, :len(entries), 0], keys[0, :len(entries)].float().to(torch.bfloat16))
     store.evict(40+11)
     assert len(store) == 0
+
+
+def test_identity_loss_trains_projection_and_current_crop_only():
+    from vesuvius.neural_tracing.fiber_follow.models.decision_memory import IDENTITY_NEGATIVES
+    torch.manual_seed(21)
+    c = memory_config(identity_dim=8)
+    model = build_model(c).train()
+    batch = coordinate_batch(c, 2)
+    x = {k: v for k, v in batch['x'].items() if not k.startswith('history_')}
+    x.update(decision_inputs(c, 2))
+    ctx = model.context(x, batch['hist'], batch['hmask'])
+    points = torch.zeros(2, 1+IDENTITY_NEGATIVES, 3)
+    points[:, 0, 2], points[:, 1, :] = 1., torch.tensor([1.5, 0., 1.])
+    point_mask = torch.zeros(2, 1+IDENTITY_NEGATIVES, dtype=torch.bool)
+    point_mask[:, :2] = True
+    anchor_mask = torch.zeros(2, SLOTS, dtype=torch.bool)
+    anchor_mask[0, :2] = True  # row 1 has no anchor: inert
+    anchors = torch.randn(2, SLOTS, c.hidden, requires_grad=True)
+    terms = model.identity_terms(ctx, dict(x, identity_points=points, identity_point_mask=point_mask,
+                                          identity_anchor_mask=anchor_mask, identity_anchor_features=anchors))
+    assert terms['identity_pairs'].sum() == 2 and terms['identity_loss_per_state'][1] == 0
+    assert torch.isfinite(terms['identity_loss_per_state']).all()
+    terms['identity_loss_per_state'].sum().backward()
+    assert model.identity_projection.weight.grad.abs().sum() > 0
+    assert model.encoder.patch_projection.weight.grad.abs().sum() > 0
+    # Masked negatives and anchors contribute nothing (finite masking, no NaN gradients).
+    assert torch.isfinite(model.identity_projection.weight.grad).all()
+    assert not anchors.grad[1].any() and not anchors.grad[0, 2:].any()
+
+
+def test_identity_targets_take_the_nearest_point_per_neighbor_path_and_on_fiber_old_anchors():
+    from types import SimpleNamespace as NS
+    from vesuvius.neural_tracing.fiber_follow.data.observations import IdentityObservationBuilder
+    from vesuvius.neural_tracing.fiber_follow.models.decision_memory import IDENTITY_NEGATIVES
+    builder = IdentityObservationBuilder.__new__(IdentityObservationBuilder)
+    builder.fibers = [NS(points=np.c_[np.zeros(300), np.zeros(300), np.arange(300.)])]
+    builder.sampling = NS(rule=NS(own_radius=1.5), on_fiber_tolerance=1.5)
+    planes = np.arange(1., 17.)
+    item = dict(planes=planes, plane_mask=np.ones(16), plane_ab=np.zeros((16, 2)), fiber_ref=(0, 100., False),
+                _memory_entries=[dict(age=200., pos=np.array([0., 0., 50.])), dict(age=40., pos=np.array([0., 0., 150.])),
+                                 dict(age=150., pos=np.array([4., 0., 60.]))])
+    found = dict(local=np.array([[4., 0., 2.], [3., 0., 2.2], [6., 0., 2.], [0.5, 0., 2.], [5., 0., 9.]]),
+                 path_ids=np.array([7, 7, 8, 9, 10]))
+    out = dict(identity_points=np.zeros((1, 1+IDENTITY_NEGATIVES, 3), np.float32),
+               identity_point_mask=np.zeros((1, 1+IDENTITY_NEGATIVES), bool), identity_anchor_mask=np.zeros((1, SLOTS), bool))
+    builder.identity_targets(item, found, out, 0)
+    np.testing.assert_allclose(out['identity_points'][0, 0], [0., 0., 2.])
+    # Path 7 keeps its nearest point, path 8 follows; the own-radius point and the far plane are excluded.
+    np.testing.assert_allclose(out['identity_points'][0, 1:3], [[3., 0., 2.2], [6., 0., 2.]])
+    assert out['identity_point_mask'][0].tolist() == [True, True, True]+[False]*(IDENTITY_NEGATIVES-2)
+    assert out['identity_anchor_mask'][0].tolist() == [True, False, False]+[False]*(SLOTS-3)

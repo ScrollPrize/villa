@@ -28,7 +28,11 @@ def monitor_fixture(path, fibers, manifest, sample, spec, seed_count=8):
         states = OnPolicyStates.load(path)
         states.validate_fibers(fibers)
         recorded = json.loads(json.dumps(states.provenance))
-        if recorded != provenance:
+        # Fixture states do not depend on the confidence-label tolerance: evaluation
+        # relabels every state under the current sample configuration.
+        unlabeled = lambda value: dict(value, sample_cfg={k: v for k, v in value.get('sample_cfg', {}).items()
+                                                          if k != 'label_tolerance'})
+        if unlabeled(recorded) != unlabeled(provenance):
             raise ValueError('Monitor recovery fixture settings changed')
     else:
         states = make_recovery_states(fibers, seeds, sample, provenance, FiberVolume(spec, cache_bytes=256 << 20))
