@@ -66,8 +66,9 @@ The raw catalog and validation sidecar live under `<cache_dir>/catalog`.
 using ETag/Last-Modified when available; a malformed refresh never replaces a
 valid cache, and a failed refresh falls back with a warning. Each indexed
 record retains its sample/volume IDs, full catalog entry, license, every OME
-origin/access root, selected public S3 origin, catalog hash, validators, and
-fetch timestamp for later provenance and Atlas ingestion.
+origin/access root, selected bulk-prefetch origin (existing S3 first, otherwise public-read
+HTTP(S)), catalog hash, validators, and fetch timestamp for later provenance
+and Atlas ingestion.
 
 Stable volume selectors are `sample_id/long_id`, a globally unique `long_id`,
 or a globally unique volume ID. Exact matching wins; otherwise a unique prefix
@@ -105,8 +106,13 @@ las_manager volume prefetch PHerc0332/20260411134726-2.400um-0.2m-78keV-masked.z
 
 The OME root is stored at
 `<cache_dir>/volumes/<sample>/<long_id>/`; inference reads its numbered group.
-Downloader `_download` metadata is retained, and the existing Lasagna
-downloader performs all listing, resume, and transfer work.
+Existing S3 origins continue to use the existing Lasagna downloader unchanged,
+including its listing, resume, transfer, and `_download` metadata behavior. If
+a catalog volume has no S3 origin, bulk prefetch falls back to its first
+`public-read` HTTP(S) origin and mirrors the selected Zarr-v2 group's raw
+metadata/chunk bytes atomically into the same cache layout. HTTP(S) bulk
+prefetch derives chunk keys from `.zarray` and therefore does not require a
+remote directory listing.
 
 Launch either backend with a stable snapshot and volume selector:
 
@@ -124,8 +130,9 @@ starts, so downloader activity cannot collide with inference workers. Follow it
 with `las_manager run ls`, `las_manager tmux attach <run>`, or inspect
 `<run>/run.log`. `--no-prefetch` skips this up-front phase, initializes only the
 local source descriptor, and leaves the backend's crop-aware on-demand
-downloading enabled during inference. `--download-workers` applies to either
-mode. An explicit backend `--no-download` after `--` still wins. Arguments
+downloading enabled during inference. This on-demand mode remains S3-only;
+HTTP(S)-fallback catalog volumes must use the default bulk-prefetch path.
+`--download-workers` applies to either mode. An explicit backend `--no-download` after `--` still wins. Arguments
 after `--` are passed unchanged to the selected backend.
 
 For a full volume that cannot remain entirely in the cache, replace the bulk
@@ -138,7 +145,7 @@ las_manager inference run fiber3d/my-run/best.pt \
 ```
 
 This initializes only the remote source descriptor, then launches inference
-immediately. Defaults are `--live-cache-gib 10240` and
+immediately. The rolling `--live-fetch` source path remains S3-only. Defaults are `--live-cache-gib 10240` and
 `--live-fetch-ahead-tiles 10000`. Completed selected-scale chunks count toward
 the target; only complete old Z-chunk planes behind the committed inference
 frontier may be removed. The settings and final cache counters are copied from
