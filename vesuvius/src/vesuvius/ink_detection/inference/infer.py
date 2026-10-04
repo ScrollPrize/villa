@@ -821,17 +821,22 @@ def write_output_tiff(
     """Write one tiled, LZW, BigTIFF-compatible flat probability image."""
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    tifffile.imwrite(
-        output_path,
-        iter_probability_tiles(prob_sum_store, weight_sum_store, tile_shape),
-        shape=tuple(int(value) for value in prob_sum_store.shape),
-        dtype=np.uint8,
-        compression="lzw",
-        tile=tuple(int(value) for value in tile_shape),
-        bigtiff=True,
-        metadata=None,
-        software="vesuvius.ink_detection.inference.infer",
-    )
+    with tempfile.TemporaryDirectory(
+        prefix=".ink_output_", dir=output_path.parent
+    ) as temporary:
+        staging_path = Path(temporary) / output_path.name
+        tifffile.imwrite(
+            staging_path,
+            iter_probability_tiles(prob_sum_store, weight_sum_store, tile_shape),
+            shape=tuple(int(value) for value in prob_sum_store.shape),
+            dtype=np.uint8,
+            compression="lzw",
+            tile=tuple(int(value) for value in tile_shape),
+            bigtiff=True,
+            metadata=None,
+            software="vesuvius.ink_detection.inference.infer",
+        )
+        staging_path.replace(output_path)
 
 
 def open_temp_zarr_array(

@@ -299,6 +299,22 @@ def test_tiff_export_is_tiled_lzw_truncating_and_replaceable(tmp_path):
     assert np.all(tifffile.imread(output)[0] == 255)
 
 
+def test_failed_tiff_write_keeps_the_previous_output(tmp_path, monkeypatch):
+    output = tmp_path / "prediction.tif"
+    output.write_bytes(b"previous")
+
+    def run_out_of_space(path, *args, **kwargs):
+        Path(path).write_bytes(b"partial")
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr(tifffile, "imwrite", run_out_of_space)
+    ones = np.ones((16, 16), dtype=np.float32)
+    with pytest.raises(OSError):
+        write_output_tiff(ones, ones, output, (16, 16))
+    assert output.read_bytes() == b"previous"
+    assert [p.name for p in tmp_path.iterdir()] == ["prediction.tif"]
+
+
 def test_cli_aliases_folder_shorthand_and_segment_resolution(tmp_path):
     args = parse_args(
         [
