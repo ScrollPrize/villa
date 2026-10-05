@@ -885,32 +885,15 @@
 }
 
 /* --------------------------------------------------------------------------
-   Sponsors — neutral tier headings, rows in a 3–4 col grid, dense Citizens.
+   Sponsors — one list in a 3-col grid, smaller gifts behind "Show more".
    -------------------------------------------------------------------------- */
-.vc-landing .vc-tier {
-  margin-top: 40px;
-}
-.vc-landing .vc-tier:first-of-type {
-  margin-top: 0;
-}
-.vc-landing .vc-tier__label {
-  margin: 0 0 2px;
-}
-.vc-landing .vc-tier__title {
-  font-size: 1.25rem;
-  font-weight: 650;
-  letter-spacing: 0;
-  color: var(--vc-text);
-  margin: 0 0 12px;
-}
-.vc-landing .vc-tier__grid {
+.vc-landing .vc-sponsors__grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 2px 24px;
 }
-.vc-landing .vc-tier__grid--dense {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  max-width: 768px;
+.vc-landing .vc-sponsors__more {
+  margin-top: 16px;
 }
 .vc-landing a.vc-sponsor {
   display: flex;
@@ -922,6 +905,10 @@
   color: var(--vc-text);
   text-decoration: none;
   transition: background-color 0.15s;
+}
+/* `display: flex` above would otherwise override the [hidden] attribute. */
+.vc-landing a.vc-sponsor[hidden] {
+  display: none;
 }
 .vc-landing a.vc-sponsor:hover {
   background: var(--vc-surface);
@@ -950,9 +937,6 @@
 .vc-landing .vc-sponsor__amount {
   font-size: 0.875rem;
   color: var(--vc-text);
-}
-.vc-landing a.vc-sponsor--dense {
-  padding: 3px 10px;
 }
 .vc-landing .vc-sponsors__cta {
   margin-top: 32px;
@@ -1020,16 +1004,6 @@
 .vc-landing .vc-collapse__body {
   padding-top: 8px;
   padding-bottom: 16px;
-}
-
-/* Sponsor tier as a collapsible: the tier label sits above the title in the
-   summary; drop the standalone top margin the plain tier carries. */
-.vc-landing .vc-tier.vc-collapse {
-  margin-top: 40px;
-}
-.vc-landing .vc-tier.vc-collapse > summary .vc-tier__label,
-.vc-landing .vc-tier.vc-collapse > summary .vc-tier__title {
-  margin: 0;
 }
 
 /* Team group as a collapsible: match the group heading scale, stay in-grid. */
@@ -1147,7 +1121,7 @@
    fluid type via clamp, media max-width 100%).
    -------------------------------------------------------------------------- */
 @media (max-width: 996px) {
-  .vc-landing .vc-tier__grid {
+  .vc-landing .vc-sponsors__grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
@@ -1265,8 +1239,7 @@
     border-left: 0;
     padding: 0;
   }
-  .vc-landing .vc-tier__grid,
-  .vc-landing .vc-tier__grid--dense {
+  .vc-landing .vc-sponsors__grid {
     grid-template-columns: minmax(0, 1fr);
   }
 }
