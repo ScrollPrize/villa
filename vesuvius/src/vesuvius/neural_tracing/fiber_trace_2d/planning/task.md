@@ -1,7 +1,7 @@
-# Resident training trace evaluation
+# Current seven-snapshot trace evaluation — 2026-10-05
 
-Call the optimized trace evaluation as a library from training. Keep training
-models and optimizer state resident through ordinary trace tests; reuse the
-existing GPU replicas for inference. Preserve manager pause/resize, trace
-numerics, restart-selected snapshots, and optimized CPU processing.
-Commit the existing evaluation/config changes first.
+Repeat the full 91-piece benchmark for current results of training
+`5scroll_json_eligible_fullres_refinement_gaussian_halfsigma_sideband1_reviewed32_128_sd1_16x8_ema_20261003_222625`:
+raw best by loss, raw best by restarts, raw current, best/current EMA99 and EMA999.
+Report sample counts and per-scroll restart counts. Keep training registered;
+use manager GPU0–5 and the approved runners only.

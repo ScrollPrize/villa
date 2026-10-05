@@ -306,10 +306,11 @@
     "cuda_visible_devices": "0,1,2,3,4,5"
   },
   "trace_series": {
-    "launch": "/ephemeral/hendrik/fiber3d_train2/runs/.launches/5scroll_json_eligible_fullres_refinement_gaussian_halfsigma_sideband1_reviewed32_128_sd1_16x8_ema-20261002_195721",
-    "run": "/ephemeral/hendrik/fiber3d_train2/runs/5scroll_json_eligible_fullres_refinement_gaussian_halfsigma_sideband1_reviewed32_128_sd1_16x8_ema_20261002_195727",
-    "output": "/ephemeral/hendrik/fiber3d_train2/comparisons/sideband1_195727_six_20261003_v2",
+    "launch": "/ephemeral/hendrik/fiber3d_train2/runs/.launches/5scroll_json_eligible_fullres_refinement_gaussian_halfsigma_sideband1_reviewed32_128_sd1_16x8_ema-20261003_222618",
+    "run": "/ephemeral/hendrik/fiber3d_train2/runs/5scroll_json_eligible_fullres_refinement_gaussian_halfsigma_sideband1_reviewed32_128_sd1_16x8_ema_20261003_222625",
+    "output": "/ephemeral/hendrik/fiber3d_train2/comparisons/sideband1_222625_seven_20261005",
     "variants": [
+      "best_trace",
       "best",
       "current",
       "best99",

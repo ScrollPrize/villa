@@ -1,47 +1,28 @@
-# Plan: resident training trace evaluation
+# Seven-snapshot plan
 
-1. Commit existing evaluation/config changes independently (done: e5245a30c).
-2. Extract prepared-workload audit/execution from the CLI into a reusable
-   library; CLI and training call the same preparation, audit and live runner.
-3. Extend the shared tiled worker with an optional resident model, retaining
-   preprocessing, product conversion, blending and shared-buffer behavior.
-   Restore model mode and numerical backend flags after evaluation.
-4. Give the demand pool an external GPU executor interface. The training
-   implementation routes shared-slot descriptors to existing GPU workers
-   over dedicated pipes, retaining model/optimizer state. CPU loading,
-   accumulation and native tracing retain the optimized implementations.
-5. Run CPU evaluation coordination in a cancellable supervisor thread. Keep
-   manager polling responsive. Hold the cohort at its trace boundary, service
-   inference in resident replicas, then resume the same cohort. On actual
-   resource revocation, cancel/join evaluation and then perform normal drain;
-   retain the pending trace request for retry after regrant.
-6. Preserve immutable checkpoint provenance and best-by-restarts selection.
-   Do not launch a fresh Python benchmark/model process or reload weights for
-   each test. Existing CPU workers and native C++ tracing remain parallel.
-7. Test library/CLI parity, model/optimizer identity and mode restoration,
-   descriptor delivery, cancellation/reallocation, successful continuation,
-   and trace result/selection using the approved test launcher. GPU validation
-   requests GPUs 0–5 through the manager; 6–7 are excluded.
+1. Freeze all seven current files with hashes, sample counts and selection metrics.
+2. Verify current raw/EMA sample counts agree; report any differences explicitly.
+3. Execute existing trace-series-next sequentially for all seven with unchanged
+   full91 workload (182 directions), native build, precision and tracer settings.
+   Verify template SHA256 before every entry. Manager GPU0–5 only; do not stop training.
+4. Validate completion and zero infrastructure failures, report each result and
+   compare final per-scroll counts with previous set. Use samples, not updates.
+5. Verify training alive after manager releases the final evaluation allocation.
 
 ## Spec update
 
-Replace trace-driven cohort teardown with resident inference. Only resource
-changes/shutdown trigger model evacuation. Keep the manager protocol unchanged.
+None: reuse shared standalone benchmark and existing manager semantics.
 
 ## Docs updates
 
-Document library entrypoints, external inference workers, resource ownership,
-and pause/retry behavior in cooperative_validation.md.
+Record snapshots/results in task_log.md; prior results preserved in
+evaluation_results_20261004.md and external comparison series directories.
+
+## Tests / validation
+
+Existing prepare, validate-full, complete_report; 182 directions and no
+infrastructure failures per snapshot. No model/inference implementation edits.
 
 ## Changelog
 
-Record resident-model trace evaluation and validation results.
-
-## Production resume verification
-
-Resume the stopped sideband1 run from current step 51300 on GPUs 0–5 and
-verify a real trace test followed by optimizer updates. First production attempt
-failed on stale driver-memory monitoring. Inspect and regression-test the
-nonblocking query read/exit race; drain stdout after observed exit before XML
-parsing and preserve query errors for diagnosis. Keep VRAM limits/timeouts and
-protocol unchanged. Use the approved runner for tests and production restart.
+Experiment only; no implementation change.

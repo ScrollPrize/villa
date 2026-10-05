@@ -1,78 +1,46 @@
-# Resident training trace evaluation
+# Seven-snapshot evaluation — 2026-10-05
 
-- Committed prior evaluation/config changes as e5245a30c.
-- Root cause: old live supervisor launched updated Python evaluator expecting
-  a new job field. Training stopped after saving step 51300. No restart yet.
-- Current architecture unnecessarily drains/reconstructs the whole GPU cohort
-  for each trace. Replace that with callable evaluation and resident replicas.
-- Independent plan review completed; addressed borrowed-worker ownership,
-  cancellation-before-buffer-release, preserved training state and VRAM limits.
-- Extracted shared preparation/audit; resident tile inference reuses the existing
-  kernel and buffer scheduler. Training model/optimizer remain resident.
-- Explicit limitations: unmanaged debug training must disable reviewed trace
-  (removed its broken extra-model subprocess fallback); resident tests cannot
-  load a second, different embedding checkpoint. Native C++ tracing and CPU
-  multiprocessing remain unchanged, not ported/duplicated into Python.
-- First CPU suite: 139 passed, 4 skipped; two failures in unrelated existing
-  cache tests (batch-size cache compatibility and legacy scratch cleanup).
-- Single-GPU resident state test passed (4.68s) through manager on GPU0/1 grant;
-  two-rank lifecycle validation in progress. No training restarted yet.
-- Native cold/warm runner passed through both owned and resident executors
-  (2 tests, 26.19s). Actual two-rank training → resident tile inference → same-PID
-  training → one-rank restore matched the uninterrupted reference (21.77s).
-- Final review caught and fixed pre-attempt revocation (no evaluator exists to
-  finish a drain) and pipe startup ordering. Tiny command precedes the work
-  unit; large config/slot descriptors follow only after workers can read.
-  Tests now send >512 KiB descriptors, exceeding pipe capacity.
-- Native/reference/accumulator CPU children are registered with the existing
-  stop guard, so removing the old enclosing process does not orphan them on
-  interrupted cleanup. Final suites rerunning with these lifecycle checks.
-- The >512 KiB test exposed a second startup dependency: cohort commands flush
-  only during supervisor polling. Made descriptor sends asynchronous and made
-  start-unit a supervisor-thread request (rather than touching its channel from
-  the evaluation thread). The failed fixture is bounded by the test runner's
-  300s timeout; no production training was running during this regression.
-- Final validation command: `/home/hendrik/villa/vesuvius/scripts/run_fiber3d_cooperative_tests`.
-  Results: `/ephemeral/hendrik/fiber3d_train2/cooperative-tests/20261003_202623_196625/results.json`.
-  CPU/API: 45 passed, 3 skipped (28.29s); native cold/warm replay: 2 passed
-  (25.75s); resident CUDA state: 1 passed (3.90s); two-GPU lifecycle: 1 passed
-  (21.90s). GPUs 0–1 only via manager; peak owned VRAM 1.47 GiB/GPU.
-- Fixtures: deterministic 8³ training patches and 32³ synthetic CT/normal/fiber
-  replay, existing optimized native binary in this checkout. Resident products
-  matched expected values; optimizer/model/EMA after continuation matched the
-  uninterrupted reference (existing rank-change tolerances 1e-5/1e-6).
-  No production-32-fiber performance measurement or training restart is claimed.
-- Broader suite separately ran 139 passed/4 skipped with two failures in
-  untouched cache semantics: `test_cache_extension_validates_parameters_not_code_hashes`
-  expects batch-size rejection although current implementation allows it;
-  `test_legacy_stale_scratch_is_cleaned_on_resume` expects unknown files inside
-  abandoned sessions retained although current cleanup deletes the session.
-  Those unrelated behaviors were not changed as part of this task.
+- Output `/ephemeral/hendrik/fiber3d_train2/comparisons/sideband1_222625_seven_20261005`.
+- Existing template `.fiber_eval_active.json` SHA256
+  `aa5857cfbaddd8a4a8825c49ce01e4ebeddc96c30a966eabf0a4e1ea48d07e49`.
+- Frozen selection uses both raw best choices and current; both EMAs best/current.
+- Previous task log archived as evaluation_results_20261004.md.
+- Independent plan review approved. Frozen samples: best_trace 6,604,800,
+  best raw 7,948,800, current raw/EMA99/EMA999 9,318,400,
+  best EMA99 9,228,800, best EMA999 9,203,200. Selection hashes/metrics
+  preserved in series.json. Best_trace remains the earlier 14-restart reviewed32
+  selection; its full91 rerun is a separate measurement.
 
-## Production resume (2026-10-03)
+## Completed results
 
-- User requested actual resume and production verification. Approved experiment
-  runner resumed sideband1 `20261002_195727/current.pt` at step 51300, GPUs 0–5,
-  new run `20261003_221129`. Regular tests completed in 53.95s; resident tracing
-  reached 1942 tiles/1624 published chunks (~306s), then the supervisor's >20s
-  stale driver-memory check aborted. No training continuation claimed.
-- Found/proved a driver monitor read/exit race: final stdout arriving after
-  nonblocking EAGAIN and before child exit observation was discarded. Regression
-  failed before fix. Drain after observed exit (bounded 1MiB); consume completed
-  queries even after delayed polling; retain diagnostic error/ages. Preserve
-  budgets/protocol/fail-closed behavior. Production attribution not proven from
-  the old nondiagnostic error. Independent review approved this narrow followup.
-- Failed root is dead and GPU0–5 driver memory is clear. Approved production-stop
-  checked cleanup; GPU6–7 remain untouched.
-- Followup tests: manager suite 148 passed (56.81s). Driver regression + resident
-  API rerun: 2 passed + 45 passed/3 skipped (47.23s), results
-  `/ephemeral/hendrik/fiber3d_train2/cooperative-tests/20261003_222518_162005/`.
-  Updated the mocked monitor fields for the new stale-query diagnostics.
-- Production retry via `run_fiber3d_experiment production-start --resume
-  /ephemeral/hendrik/fiber3d_train2/runs/5scroll_json_eligible_fullres_refinement_gaussian_halfsigma_sideband1_reviewed32_128_sd1_16x8_ema_20261002_195727/snapshots/current.pt`:
-  new run `20261003_222625`, launch `20261003_222618`, root 3900191.
-  Regular test 41.368s; resident trace completed all 32 pieces/64 directions
-  in 273.920s (11 forward + 14 reverse restarts = 25, combined implied mean
-  21.9530mm). Same generation/cohort continued through training updates
-  51301, 51302, 51303. Training remains active on manager-granted GPUs 0–5.
-  No claim of trace speedup/comparative accuracy from this one resume check.
+Every evaluation completed 182 directions with no infrastructure failures.
+Reported benchmark wall time 227–233 seconds each (excludes preparation/queueing).
+Native binary SHA256 stayed
+`78e14240bd2fbd475eb3622a16116debf7b61179de153a3c570ee503f09c8fe0`;
+template hash unchanged before every entry. No precision/tracer/code changes.
+
+| Snapshot | Samples | 0139 | 0332 | 1299 | 1451 | Paris4 | Total | Implied mm | Previous total |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Raw best by restarts | 6,604,800 | 5 | 0 | 3 | 2 | 9 | 19 | 69.31 | 19 |
+| Raw best by loss | 7,948,800 | 6 | 0 | 3 | 0 | 9 | 18 | 72.96 | 19 |
+| Raw current | 9,318,400 | 8 | 0 | 2 | 0 | 10 | 20 | 66.01 | 25 |
+| EMA99 best | 9,228,800 | 9 | 0 | 4 | 0 | 10 | 23 | 57.76 | 20 |
+| EMA99 current | 9,318,400 | 11 | 0 | 3 | 0 | 11 | 25 | 53.31 | 18 |
+| EMA999 best | 9,203,200 | 9 | 0 | 2 | 0 | 8 | 19 | 69.31 | 19 |
+| EMA999 current | 9,318,400 | 8 | 0 | 5 | 0 | 10 | 23 | 57.76 | 18 |
+
+Previous totals are from the October4 selected checkpoints (different sample
+counts except unchanged raw best-by-restarts). Implied mm uses directed total
+1386.175605/(restarts+1), not equal-scroll weighting. Small differences should
+not be overinterpreted given previously observed directed-trace variation.
+Unchanged best-by-restarts reproduced all per-scroll counts from the prior run.
+
+Executed existing approved `run_fiber3d_experiment trace-series-prepare`, then
+seven sequential `trace-series-next` invocations. Selection JSON contains exact
+snapshot SHA256 and dense-loss or reviewed-restarts selection metric. Every
+series entry verified the original training root alive after evaluation;
+training reinitializes its workers after final grant release. GPUs6–7 untouched.
+Detailed results under output directory above, `series.json`, each variant's
+`trace_audit.json`, `full/summary.json`, and `results_after_current999.json`.
+Final live check: manager generation29 running on GPU0–5; training progressed
+through samples 9,323,520 after evaluation, not merely an alive idle root.
