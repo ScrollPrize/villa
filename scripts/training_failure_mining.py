@@ -166,6 +166,208 @@ if __name__ == '__main__':
     elif not sys.argv[1:]:
         control = REPO / 'scripts/training_failure_mining_control.json'
         action = json.loads(control.read_text()).get('action', 'start') if control.exists() else 'start'
+        if action == 'iso20_tiled':
+            args=[sys.executable,'-u',str(REPO/'scripts/iso20_tiled.py')]
+            if json.loads(control.read_text()).get('pilot'):args.append('--pilot')
+            subprocess.run(args,check=True)
+            raise SystemExit(0)
+        if action == 'iso20_tiled_tests':
+            subprocess.run([sys.executable,'-m','pytest','-q','-o',
+                f'pythonpath={REPO}/scripts {REPO}/vesuvius/src',
+                'scripts/test_iso20_tiled.py','scripts/test_iso20_post_overlap.py',
+                'scripts/test_iso20_overlap2048.py'],cwd=REPO,check=True)
+            raise SystemExit(0)
+        if action == 'iso20_tiled_compare_pilots':
+            import tempfile
+            from lasagna.inference_provenance import atomic_write
+            base=Path('/ephemeral/hendrik/fiber_crop_bench')
+            roots=[base/f'20261004_iso20_tiled_pilot_v{i}' for i in (3,4)]
+            with tempfile.TemporaryDirectory(prefix='tiled-readback-') as temporary:
+                outputs=[]
+                for i,root in enumerate(roots):
+                    folder=Path(temporary)/str(i);folder.mkdir()
+                    subprocess.run([str(REPO/'volume-cartographer/build/fiber-evaluation/bin/vc_fiber_trace_chunk'),
+                        'visualize',str(root/'assembled.zarr'),'--output',str(folder/'lines.obj')],check=True)
+                    outputs.append({p.name:p.read_bytes() for p in folder.iterdir() if p.is_file()})
+                result=dict(native_artifact_readback=True,obj_geometry_equal=outputs[0]==outputs[1],
+                    files=list(outputs[0]))
+                atomic_write(roots[1]/'readback-check.json',result,durable=False)
+                print(json.dumps(result),flush=True)
+                if not result['obj_geometry_equal']:raise RuntimeError('pilot geometry differs')
+            raise SystemExit(0)
+        if action in ('stop_iso20_tiled_pilot','stop_iso20_tiled_preparation'):
+            root=(b'/ephemeral/hendrik/fiber_crop_bench/20261004_iso20_tiled_pilot_v1/' if action=='stop_iso20_tiled_pilot'
+                  else b'/ephemeral/hendrik/fiber_crop_bench/20261004_iso20_tiled2048_v1/prepare-anchors.json')
+            for proc in Path('/proc').iterdir():
+                if not proc.name.isdigit():continue
+                try:argv=(proc/'cmdline').read_bytes().split(b'\0')
+                except (FileNotFoundError,PermissionError,ProcessLookupError):continue
+                if (argv and argv[0]==str(REPO/'volume-cartographer/build/fiber-evaluation/bin/vc_fiber_trace_chunk').encode()
+                    and b'--output' in argv and argv[argv.index(b'--output')+1].startswith(root)):
+                    os.kill(int(proc.name),signal.SIGINT)
+                    print(f'Interrupted tiled worker {proc.name}',flush=True)
+            raise SystemExit(0)
+        if action == 'reviewed_bp_replay':
+            subprocess.run([sys.executable, '-u', str(REPO / 'scripts/reviewed_bp_replay.py')], check=True)
+            raise SystemExit(0)
+        if action == 'historical_bp_independent':
+            subprocess.run([sys.executable, '-u', str(REPO / 'scripts/historical_bp_independent.py')], check=True)
+            raise SystemExit(0)
+        if action == 'iso20_event_bp':
+            subprocess.run([sys.executable, '-u', str(REPO / 'scripts/iso20_event_bp.py')], check=True)
+            raise SystemExit(0)
+        if action == 'iso20_minimum_sweep':
+            subprocess.run([sys.executable, '-u', str(REPO / 'scripts/iso20_minimum_sweep.py')], check=True)
+            raise SystemExit(0)
+        if action == 'stop_iso20_overlap2048':
+            expected=b'/ephemeral/hendrik/fiber_crop_bench/20261004_iso20_overlap2048_v1/presence2048.zarr'
+            for proc in Path('/proc').iterdir():
+                if not proc.name.isdigit():continue
+                try:argv=(proc/'cmdline').read_bytes().split(b'\0')
+                except (FileNotFoundError,PermissionError,ProcessLookupError):continue
+                if (argv and argv[0]==str(REPO/'volume-cartographer/build/fiber-evaluation/bin/vc_fiber_trace_chunk').encode()
+                    and len(argv)>1 and argv[1]==b'deduplicate' and b'--output' in argv
+                    and argv[argv.index(b'--output')+1]==expected):
+                    os.kill(int(proc.name),signal.SIGINT)
+                    print(f'Interrupted 2048 deduplication PID {proc.name}',flush=True)
+            raise SystemExit(0)
+        if action == 'stop_iso20_high_iterations':
+            expected=b'/ephemeral/hendrik/fiber_crop_bench/20261002_iso20_stable_gap_v1/'
+            for proc in Path('/proc').iterdir():
+                if not proc.name.isdigit():continue
+                try:argv=(proc/'cmdline').read_bytes().split(b'\0')
+                except (FileNotFoundError,PermissionError,ProcessLookupError):continue
+                if (argv and argv[0]==str(REPO/'volume-cartographer/build/fiber-evaluation/bin/vc_fiber_trace_chunk').encode()
+                    and any(a.startswith(expected) for a in argv) and b'--winding-message-iterations' in argv
+                    and int(argv[argv.index(b'--winding-message-iterations')+1])>500):
+                    os.kill(int(proc.name),signal.SIGINT)
+                    print(f'Interrupted higher-iteration trial PID {proc.name}',flush=True)
+            raise SystemExit(0)
+        if action == 'iso20_stable_followups':
+            stage=int(json.loads(control.read_text())['stage'])
+            subprocess.run([sys.executable, '-u', str(REPO / 'scripts/iso20_stable_followups.py'),str(stage)], check=True)
+            raise SystemExit(0)
+        if action == 'iso20_source_memory':
+            args=[sys.executable, '-u', str(REPO / 'scripts/iso20_source_memory.py')]
+            if json.loads(control.read_text()).get('report_only'):args.append('--report-only')
+            subprocess.run(args, check=True)
+            raise SystemExit(0)
+        if action == 'iso20_constraint_isolation':
+            args=[sys.executable,'-u',str(REPO/'scripts/iso20_constraint_isolation.py')]
+            if json.loads(control.read_text()).get('report_only'):args.append('--report-only')
+            if json.loads(control.read_text()).get('supplement'):args.append('--supplement')
+            if json.loads(control.read_text()).get('analyze'):args.append('--analyze')
+            subprocess.run(args,check=True)
+            raise SystemExit(0)
+        if action == 'iso20_legacy_fine':
+            args=[sys.executable,'-u',str(REPO/'scripts/iso20_legacy_fine.py')]
+            if json.loads(control.read_text()).get('followup'):args.append('--followup')
+            if json.loads(control.read_text()).get('report_only'):args.append('--report-only')
+            subprocess.run(args,check=True)
+            raise SystemExit(0)
+        if action == 'iso20_overlap2048':
+            args=[sys.executable,'-u',str(REPO/'scripts/iso20_overlap2048.py')]
+            if json.loads(control.read_text()).get('report_only'):args.append('--report-only')
+            subprocess.run(args,check=True)
+            raise SystemExit(0)
+        if action == 'iso20_best2048':
+            args=[sys.executable, '-u', str(REPO/'scripts/iso20_best2048.py')]
+            if json.loads(control.read_text()).get('report_only'):args.append('--report-only')
+            subprocess.run(args, check=True)
+            raise SystemExit(0)
+        if action == 'iso20_overlap_costs':
+            args=[sys.executable,'-u',str(REPO/'scripts/iso20_overlap_costs.py')]
+            if json.loads(control.read_text()).get('report_only'):args.append('--report-only')
+            subprocess.run(args,check=True)
+            raise SystemExit(0)
+        if action == 'iso20_post_overlap':
+            args=[sys.executable,'-u',str(REPO/'scripts/iso20_post_overlap.py')]
+            if json.loads(control.read_text()).get('low'):args.append('--low')
+            if json.loads(control.read_text()).get('report_only'):args.append('--report-only')
+            subprocess.run(args,check=True)
+            raise SystemExit(0)
+        if action == 'iso20_coverage_stop':
+            args=[sys.executable,'-u',str(REPO/'scripts/iso20_coverage_stop.py')]
+            if json.loads(control.read_text()).get('report_only'):args.append('--report-only')
+            subprocess.run(args,check=True)
+            raise SystemExit(0)
+        if action == 'iso20_iterative':
+            args=[sys.executable, '-u', str(REPO/'scripts/iso20_iterative.py')]
+            if json.loads(control.read_text()).get('report_only'):args.append('--report-only')
+            subprocess.run(args, check=True)
+            raise SystemExit(0)
+        if action == 'iso20_median_costs':
+            args=[sys.executable, '-u', str(REPO/'scripts/iso20_median_costs.py')]
+            if json.loads(control.read_text()).get('report_only'):args.append('--report-only')
+            subprocess.run(args, check=True)
+            raise SystemExit(0)
+        if action == 'iso20_probe_removal':
+            args=[sys.executable, '-u', str(REPO/'scripts/iso20_probe_removal.py')]
+            if json.loads(control.read_text()).get('status'):args.append('--status')
+            subprocess.run(args, check=True)
+            raise SystemExit(0)
+        if action == 'iso20_probe_correctness':
+            subprocess.run([sys.executable, '-u', str(REPO/'scripts/iso20_probe_correctness.py')], check=True)
+            raise SystemExit(0)
+        if action == 'iso20_orthogonal_probes':
+            args=[sys.executable,'-u',str(REPO/'scripts/iso20_orthogonal_probes.py')]
+            if json.loads(control.read_text()).get('report_only'):args.append('--report-only')
+            if json.loads(control.read_text()).get('followup'):args.append('--followup')
+            if json.loads(control.read_text()).get('confirmation'):args.append('--confirmation')
+            subprocess.run(args,check=True)
+            raise SystemExit(0)
+        if action == 'iso20_stable_gap':
+            subprocess.run([sys.executable, '-u', str(REPO / 'scripts/iso20_stable_gap.py')], check=True)
+            raise SystemExit(0)
+        if action == 'iso20_gap_tuning':
+            subprocess.run([sys.executable, '-u', str(REPO / 'scripts/iso20_gap_tuning.py')], check=True)
+            raise SystemExit(0)
+        if action == 'iso20_gap_length_tuning':
+            args=[sys.executable, '-u', str(REPO / 'scripts/iso20_gap_tuning.py'), '--length-stage']
+            boundary=json.loads(control.read_text()).get('length_boundary')
+            if boundary is not None:args+=['--length-boundary',str(boundary)]
+            subprocess.run(args, check=True)
+            raise SystemExit(0)
+        if action == 'iso20_event_readout':
+            from iso20_event_bp import independent_diagnostic
+            independent_diagnostic()
+            raise SystemExit(0)
+        if action == 'strict_reverse_crop':
+            subprocess.run([sys.executable, '-u', str(REPO / 'scripts/strict_reverse_crop.py')], check=True)
+            raise SystemExit(0)
+        if action == 'strict_reverse_status':
+            from strict_reverse_crop import status
+            status()
+            raise SystemExit(0)
+        if action == 'reviewed_bp_independent':
+            subprocess.run([sys.executable, '-u', str(REPO / 'scripts/reviewed_bp_independent.py')], check=True)
+            raise SystemExit(0)
+        if action == 'reviewed_bp_prefix':
+            subprocess.run([sys.executable, '-u', str(REPO / 'scripts/reviewed_bp_prefix.py')], check=True)
+            raise SystemExit(0)
+        if action == 'reviewed_bp_prefix_report':
+            from reviewed_bp_prefix import report
+            report()
+            raise SystemExit(0)
+        if action == 'stop_reviewed_bp_prefix_native':
+            expected = b'/ephemeral/hendrik/fiber_crop_bench/20261002_raw40500_prefix512_v1/beam-'
+            for proc in Path('/proc').iterdir():
+                if not proc.name.isdigit():
+                    continue
+                try:
+                    argv = (proc/'cmdline').read_bytes().split(b'\0')
+                except (FileNotFoundError, PermissionError, ProcessLookupError):
+                    continue
+                if argv and argv[0] == str(REPO/'volume-cartographer/build/fiber-evaluation/bin/vc_fiber_trace_chunk').encode() and any(a.startswith(expected) for a in argv):
+                    os.kill(int(proc.name), signal.SIGINT)
+                    print(f'Interrupted crop trial native PID {proc.name}', flush=True)
+            raise SystemExit(0)
+        if action == 'reviewed_reverse_prefix':
+            subprocess.run([sys.executable, '-u', str(REPO / 'scripts/reviewed_reverse_prefix.py')], check=True)
+            raise SystemExit(0)
+        if action == 'reviewed_reverse_history':
+            subprocess.run([sys.executable, '-u', str(REPO / 'scripts/reviewed_reverse_history.py')], check=True)
+            raise SystemExit(0)
         if action == 'reviewed_tta_sweep':
             subprocess.run([sys.executable, '-u', str(REPO / 'scripts/reviewed_tta_sweep.py')], check=True)
             raise SystemExit(0)
@@ -265,7 +467,7 @@ if __name__ == '__main__':
                 '-o', '/tmp/villa3_test_fiber_case_queue'], check=True)
             subprocess.run(['/tmp/villa3_test_fiber_case_queue'], check=True)
             subprocess.run(['bash', str(REPO / 'vesuvius/scripts/run_fiber3d_native_build')], check=True)
-            for test in ('test_fiber_replay', 'test_fiber_trace3d', 'test_fiber_reference_replay_benchmark', 'test_fiberlet_crop_trace'):
+            for test in ('test_fiber_replay', 'test_fiber_trace3d', 'test_fiber_reference_replay_benchmark', 'test_fiberlet_crop_trace', 'test_fiber_anchors', 'test_fiber_trace_winding_bp', 'test_fiberlet_storage'):
                 subprocess.run([str(REPO / 'volume-cartographer/build/fiber-evaluation/bin' / test)], check=True)
             subprocess.run([sys.executable, '-m', 'pytest', '-o', f'pythonpath={REPO}/vesuvius/src', '-q',
                 'vesuvius/tests/neural_tracing/test_native_replay_evaluation.py',

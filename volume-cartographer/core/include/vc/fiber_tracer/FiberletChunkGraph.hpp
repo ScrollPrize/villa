@@ -259,7 +259,8 @@ public:
 
     [[nodiscard]] std::vector<FiberletStoredAnchor> anchorsInBaseBox(
         const cv::Vec3d& minimumBaseXYZ,
-        const cv::Vec3d& maximumBaseXYZ) const;
+        const cv::Vec3d& maximumBaseXYZ,
+        std::size_t prefetchWindow = 0) const;
     [[nodiscard]] FiberletMaterializedReplayGraph materializeBaseBox(
         const cv::Vec3d& minimumBaseXYZ,
         const cv::Vec3d& maximumBaseXYZ,

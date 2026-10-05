@@ -3,6 +3,57 @@ import pytest
 from reviewed_fiber_evaluation import capture_cohort, validate_result, validate_workload
 
 
+def test_sideband_current_selection():
+    from reviewed_fiber_evaluation import current_raw_source, SIDEBAND_MODEL, SIDEBAND_CURRENT, halfsigma_namespace
+    assert current_raw_source(SIDEBAND_MODEL) == SIDEBAND_CURRENT
+    assert SIDEBAND_CURRENT.name == 'current.pt'
+    assert '20261001_203634' in str(SIDEBAND_CURRENT)
+    namespace = halfsigma_namespace(SIDEBAND_MODEL)
+    assert len(namespace) <= 64
+    assert namespace != halfsigma_namespace('halfsigma_current_raw_v3')
+    assert current_raw_source('halfsigma_current_raw_v3') != SIDEBAND_CURRENT
+
+
+def test_best_checkpoint_metadata():
+    from reviewed_fiber_evaluation import BEST_MODELS, validate_best_model, halfsigma_namespace
+    names = set()
+    for model, (_, decay) in BEST_MODELS.items():
+        names.add(halfsigma_namespace(model))
+        assert len(halfsigma_namespace(model)) <= 64
+        saved = dict(metric_name='test/loss_total') if decay is None else dict(
+            snapshot_kind='ema', metric_name=f'test_ema_{str(decay).replace(".", "p")}/loss_total',
+            ema_metadata=dict(decay=decay))
+        validate_best_model(model, saved, dict(trace_args=[]))
+        with pytest.raises(ValueError):
+            validate_best_model(model, dict(saved, metric_name='wrong'), dict(trace_args=[]))
+    assert len(names) == 3
+
+
+def test_reverse_keeps_frozen_cache_and_pipeline(tmp_path, monkeypatch):
+    import json
+    import reviewed_fiber_evaluation as driver
+    from lasagna.inference_provenance import sha256_file
+    model = 'halfsigma_sideband_best_raw_20261002'
+    root = tmp_path/model
+    root.mkdir()
+    checkpoint = root/'frozen.pt'
+    checkpoint.write_bytes(b'frozen40500')
+    original = dict(checkpoint=str(checkpoint), checkpoint_sha256=sha256_file(checkpoint),
+        output_root=str(root), evaluation=dict(trace_args=['--beam-width','8'],
+        inference_cache_namespace='original_cache', inference=dict(max_batch_size=4),
+        gpu_manager=dict(label='original'),workers=192))
+    (root/'workload.json').write_text(json.dumps(original))
+    monkeypatch.setattr(driver, 'ROOT', tmp_path)
+    called=[]
+    monkeypatch.setattr(driver, 'execute_evaluation', lambda p,c,m: called.append(c))
+    driver.run_reverse(model)
+    actual=called[0]
+    assert actual['checkpoint']==original['checkpoint']
+    for key in ('inference_cache_namespace','inference','workers'):
+        assert actual['evaluation'][key]==original['evaluation'][key]
+    assert actual['evaluation']['trace_args']==['--beam-width','8','--replay-reverse-interval-base','256']
+
+
 def test_raw_unfiltered_selection():
     from reviewed_fiber_evaluation import validate_raw_unfiltered
     saved = dict(metric_name='test/loss_total')

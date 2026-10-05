@@ -31,11 +31,31 @@ def refine(scale, floor, tested, iteration):
             (scale, math.sqrt(lower * floor)), (scale, math.sqrt(upper * floor))]
 
 
+def independent_summary_rows(log):
+    """One scored gauge per reference; retain missing refs, ignore empty satellites."""
+    rows=list(csv.DictReader(io.StringIO(log.split('independent_reference_summary\n')[1]
+        .split('independent_reference_candidates')[0])))
+    grouped={}
+    for row in rows:
+        grouped.setdefault(row['reference'],[]).append(row)
+    result=[]
+    for group in grouped.values():
+        if len(group)==1:
+            result.extend(group)
+            continue
+        active=[r for r in group if int(r.get('evaluated','0'))>0]
+        empty=[r for r in group if int(r.get('evaluated','0'))==0]
+        if len(active)>1 or any(int(r.get('admitted','0'))>0 for r in empty):
+            raise ValueError('multiple independent gauges per reference require explicit reporting')
+        result.append(active[0] if active else group[0])
+    return result
+
+
 def independent_metrics(log):
     """Read initial winding assignments without requiring a reference-assisted solve."""
     result = {}
     rows = [r for r in csv.DictReader(io.StringIO(log.split('independent_reference_candidates\n')[1].split('independent_reference_end')[0])) if r['rank'] == '1']
-    summaries = list(csv.DictReader(io.StringIO(log.split('independent_reference_summary\n')[1].split('independent_reference_candidates')[0])))
+    summaries = independent_summary_rows(log)
     expected = {r['reference'] for r in summaries}
     if not expected:
         raise ValueError('empty independent reference summary')
@@ -45,7 +65,11 @@ def independent_metrics(log):
         raise ValueError('nonfinite independent reference winding')
     if len(expected) != len(summaries) or len({r['reference'] for r in rows}) != len(rows):
         raise ValueError('multiple independent gauges per reference require explicit reporting')
-    if any(r['calibrated'] != '1' for r in summaries):
+    # A reference with no admitted evidence can have no gauge at all. Keep it
+    # missing in the denominator, but never score an uncalibrated candidate.
+    assigned = {r['reference'] for r in rows}
+    if any(r['calibrated'] != '1' and
+           (r.get('evaluated') != '0' or r['reference'] in assigned) for r in summaries):
         raise ValueError('uncalibrated independent reference gauge')
     result['ladder'] = [{k: r[k] for k in ('reference', 'winding', 'hard_sign_errors')} for r in rows]
     result['independent_percent'] = 100 * sum(float(r['reference']) == float(r['winding']) for r in rows) / len(expected)

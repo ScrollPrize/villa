@@ -1,5 +1,167 @@
 # 2D Fiber Trace Initial Loader Specs
 
+## Current selected crop baseline (2026-10-04)
+
+- User explicitly promoted tuned presence10/20,f0 deduplication. Same frozen
+  raw40500 beam8/iso20/full-prefix512 source tracing,45degree overlap angle and
+  <=4base midpoint sampling; independent reverse-filter pieces, whole-piece removal.
+- BP near/far magnitudes.2/.2,P1.0375,others0;hard signs,disable100/128,boundary10,
+  min256/median64/blend1/scale.822/phase.5/500messages.1024scores65.3846%accuracy,
+  91.6667%shift,−55.1216%removal,88.4615%oracle. Accuracy-first selection.
+- Supersedes previous no-dedup benchmark designation only; production CLI and
+  reviewed91-fiber replay remain unchanged. Retain former scores as controls.
+- Apply exactly this configuration to2048context without retuning. Reuse validated
+  completed dense tracing; report all scores plus full independent ladder and
+  missingness. Expanded overlapping context is not held-out validation.
+
+## Zero-overlap BP cost retuning (2026-10-03)
+
+- All twelve f0 selections are independently tuned with frozen source pieces,
+  min256/median64/scale.822/phase.5 and500 messages. No new tracing/inference.
+- Bounded two-round frozen-incumbent coordinate sweep: disabling and boundary
+  costs, active magnitude weights and finite/hard sign penalties. Parallel-two
+  magnitude stays zero because cutoff1.5 excludes it. Separate sign terms stay
+  enabled even when magnitude weights are zero.
+- Rank by exact non-oracle accuracy, observed shift, then conditioned removal;
+  only tied finalists need removal solves. Preserve all26 reference denominator,
+  record missing/gauge results and exact-repeat winners. Tuning evidence only.
+- Approved runner action iso20_overlap_costs; full grids/configs/provenance and
+  before/after report in docs/fiber_benchmark_runs/2026-10-03-overlap-costs.
+- Completed576configurations,91removal solves and12paired exact-repeat winners.
+  Best tuning-set candidate: presence10/20,f0,near/far magnitude.2/.2,
+  parallel-one.0375,disable100/128,boundary10,hard signs. Non-oracle65.3846%,
+  shift91.6667%,removal−55.1216%,conditioned accuracy88.4615%.
+  Baseline61.5385%/87.5%/−28.9207%: primary metrics improve but removal worsens.
+  No production/default promotion without further review/held-out validation.
+
+## Optional post-fw/bw independent-piece overlap removal (2026-10-03)
+
+Historical pilot conclusions below precede cost retuning and the explicit
+2026-10-04 benchmark promotion above; production CLI defaults remain unchanged.
+
+- Native `deduplicate` mode processes saved full-length trace artifacts, after
+  reverse-consistency splitting. Each retained piece is independent regardless
+  of shared seed or original trace. Does not alter tracing/seeding defaults.
+- Collision uses sampled arc coverage of the shorter piece against one other
+  piece: midpoint samples at most4base voxels apart, shared sheet-normal ellipse,
+  unoriented45degree tangent gate. Whole-piece selection is global best-first;
+  suppressed pieces never suppress other pieces. No trimming or retracing.
+- Fraction0 is valid and requires strictly positive measured overlap (any matched
+  sample). Disjoint pairs are never edges, even at0. Follow-up tests0/10/20%
+  for ellipses10/20,20/40 and then isotropic10/10,20/20base voxels.
+- Native measured overlap graph stores all positive fractions independently of
+  rank/threshold. Optional cache key includes exact ordered geometry, source
+  fingerprint, immutable normal-manifest identity/contents, normal scale, radii,
+  direction gate, sample spacing and contract version. Reject mismatches/invalid
+  graph structure and publish atomically. No tracing/inference scheduler changes.
+- Higher geometric length, higher arc-weighted sampled presence, or lower saved
+  tracer cost/path length ranks pieces. Ties use length then original ordinal.
+  Presence uses existing prediction sampling, max valid option, and fails on
+  invalid samples. This cached postprocessing never requests inference.
+- Preserve exact survivor geometry and costs, source indices and full original
+  processing metadata. Record suppressor original ID and shorter-side overlap
+  fraction per removed piece. Inherit original trace configuration explicitly.
+- Pilot1024 only: ellipses10/20 and20/40, fractions50%/80%, all three rankings.
+  Compare all existing BP scores plus reference missingness and retained total
+  length. Unique tails can be lost; length is not reference coverage. No default
+  promotion based solely on graph reduction or oracle removal score.
+- Completed12setting pilot: none improves the baseline61.5385% non-oracle.
+  Best filtered53.8462% (cost20/40,f80); keep opt-in only. Full results in
+  volume-cartographer/docs/fiber_benchmark_runs/2026-10-03-post-overlap.md.
+- Follow-up36settings0/10/20% and isotropic10/20: best new non-oracle50%
+  (length,20/40,f0), isotropic maximum34.6154%. Baseline still61.5385%.
+  Best new oracle accuracy88.4615% versus baseline80.7692% is a separate
+  reference-conditioned result, not evidence of improved non-oracle solving.
+  Keep disabled; complete report2026-10-03-post-overlap-low.md/json.
+
+## Optional dense accepted-trace stopping (2026-10-03)
+
+- `--stop-at-covered-traces` is dense-beam-only and off by default. Use a local
+  accepted-segment bucket index, exact projection, shared normal ellipse and
+  unoriented coverage-angle gate. Stop at the first covered committed vertex,
+  including that terminal vertex; this is step-resolution stopping, not an
+  analytically interpolated ellipse-entry point.
+- `--covered-trace-normal` / `--covered-trace-tangential` override only the new
+  stopping ellipse in base voxels. Omission inherits seed-coverage radii.
+  Seed suppression remains unchanged, permitting isolated radius experiments.
+- Parallel workers query an append-only index restricted to their submission
+  watermark. Ordered acceptance rechecks both raw sides against all prior
+  accepted segments before publishing either side. If truncated, re-run the
+  existing reverse verifier including the new terminal endpoint; do not merely
+  clip already-verified intervals. Recovered intervals remain subsets of checked
+  prefixes. Index locks cover local lookup/publication, not normal sampling.
+- Persist effective stopping radii and counters. No-flag artifact semantics
+  remain unchanged. First trials are1024 only, using cached raw40500 inference,
+  iso20 reverse checks and unchanged BP parameters. Larger crop awaits review.
+
+## Previous no-dedup fine-split benchmark baseline (2026-10-03)
+
+- A matched2048 context test is reported separately from the1024 tuning history:
+  preserve the selected snapshot/tracer/BP parameters,26 references and500-message
+  budget; only expand crop bounds. Reuse inference/anchor caches and existing
+  managed coverage fill. Report independent ladder with missing/gauge diagnostics;
+  do not substitute older-model2048 trace artifacts or imply an oracle result.
+
+- Median +/-64 probes/blend1, minimum256, length cost100 per128 base voxels, boundary10,
+  parallel-one magnitude weight0.0375, other magnitude weights0, hard signs both,
+  fixed scale0.822/phase0.5. Raw40500 isotropic20 crop traces, legacy-fine pieces
+  and partition-length cost,500 message iterations.
+  Removal score-28.9207%, oracle80.7692%, independent61.5385%, observed shift87.50%.
+  Selected by user after the iterative sweep as future benchmark baseline;
+  supersedes length150/boundary0/P1=.05. Not a production-default or global dominance
+  claim (historical overlap removal-25.2365%).
+- Cost sweeps keep oracle protocol, geometry,500iterations and probe rules fixed;
+  compare actual removal and independent scores, with unavailable metrics explicit.
+
+## Conservative orthogonal probes (2026-10-02)
+
+- Opt-in `--orthogonal-probe-span`, `--orthogonal-probe-blend` and
+  `--orthogonal-probe-consensus` augment legacy orthogonal targets. Disabled by
+  default, including in explicit reference extraction.
+- Probe +/-span independently along each source against the other center.
+  Require four finite, same-normal-component signed samples. Median includes
+  the original center; consensus requires all signed half-winding bins agree.
+  Otherwise retain original. Preserve all old admission decisions, weights,
+  cut locations, orientation scores, alignments and parallel estimates.
+- When enabled this explicitly relaxes the legacy-fine guarantee of unchanged
+  perpendicular signed target and corresponding absolute winding distance only.
+  It does not enable the newer scorer's geometric rejection rules.
+
+## Legacy constraints with fine ownership (2026-10-02)
+
+- `--legacy-fine-pieces` measures using ordinary overlapping pieces, then
+  transfers each ordinary observation unchanged to source-arc owners on a
+  nonoverlapping orthogonal-midpoint subdivision. `--local-min-piece-length`
+  controls the subdivision minimum, not the measurement support.
+- Legacy overlapping observations remain distinct, with original weights and
+  signed values. No normalization, deduplication or remeasurement is applied.
+  Old continuity is removed and rebuilt once on the new adjacent pieces.
+- Incompatible with local-event/scorer extraction, preserve-input pieces, extra
+  cuts or omitted parallel observations. Explicit reference extraction resets
+  the port flag. Defaults are unchanged.
+- Approved runner action `iso20_legacy_fine` supports initial matrix, bounded
+  `followup:true`, and `report_only:true`; report includes exact input/build
+  provenance through ordinary benchmark run records.
+
+## Opt-in BP constraint isolation (2026-10-02)
+
+- `iso20_constraint_isolation` uses frozen iso20 source traces and the historical
+  overlap512/128 layout. No tracing/model/default changes;500 message iterations.
+- Native extraction exposes independent closest/legacy distance, winding probe
+  certification, local scorer, binary orientation, source-event normalization,
+  refinement, owner replication and one-event-per-owner-pair controls.
+- Reference measurement mode (`auto|old|events`) is independently selectable;
+  explicit old/events modes reset graph-only ablation switches. Readout-only
+  comparisons must preserve exact initial solved piece states.
+- Frozen piece priors identify original source and exact arc endpoints; missing
+  or duplicate identities are errors. Class and actual disabling-mass overrides
+  are separate. Coverage-partitioned physical-length costs count overlap once.
+- Multiple active gauges must not silently become a single reference ladder.
+  Isolation reports retain their summaries and mark aggregate scores unavailable.
+- Approved runner action supports `supplement`, `analyze`, and `report_only`.
+  Full commands, input/binary hashes, logs and results remain in the artifact
+  directory linked by the dated constraint-isolation report.
+
 ## Explicit contrast-choice benchmarks (2026-09-18)
 
 - A packaged contrast case binds one directed forward reference, which is the
@@ -6644,6 +6806,71 @@
   Defect/Defect, or measured cross-trace pairs. Multiple measurements merged
   into one prepared edge must not multiply the cost. Divide it by orientation
   temperature and preserve it in summary and CSV output.
+- Experimental `--winding-gap-boundary-cost` explicitly enables that same
+  active/Defect boundary penalty in hard-continuity joint-grid mixed BP.
+  Active/active equality remains hard; Defect/Defect remains free. An interior
+  disabled run costs two boundaries, an endpoint run one, and a wholly disabled
+  source zero boundaries. Default behavior is unchanged; explicit zero must
+  reproduce baseline states. This prior does not change the orientation prepass
+  or the final hard-sign projection; projection-created defects are reported
+  separately because that feasibility repair does not optimize gap costs.
+- Experimental local-event-only `--winding-defect-length-unit U` (finite U>0)
+  replaces incidence mass with nonoverlapping piece arc length/U using the
+  shared native length-measure model, blend1. Disabling cost is then per U base
+  voxels, with unchanged multiplier and prepass. It requires direction-ablation
+  joint-grid mixed BP and rejects legacy multiplier files. Unset preserves
+  incidence-based costs. The experiment verifies identical rebuilt zero-cost
+  controls and retains full input length/evidence.
+- Optional `--winding-defect-length-blend alpha` (0..1, requires length-unit)
+  interpolates incidence and length measures using the existing native model.
+  For `(1-alpha)*100*M + alpha*cL*L/128`, set defect cost100 and length unit12800/cL.
+  `--winding-damping` overrides only winding message updates, not the prepass;
+  it is the new-message fraction in (0,1]. Both require joint-grid mixed BP.
+- Opt-in `--winding-best-feasible` uses the shared normalized negative-log
+  objective, including temperature-scaled unaries and pair factors, to retain
+  a hard-feasible decoded report at fixed checkpoints and the actual terminal
+  decode. It never uses references/GT. The retained state includes physical
+  winding labels, phase/gain and component signs, not support indices.
+  Report selected iteration, terminal objective, selected objective and overhead.
+  The experimental runners are capped at500 iterations by explicit user request;
+  do not resume higher-budget sweeps without a new request.
+- Opt-in local-event `--winding-run-opening lambda` charges once per maximal
+  disabled source run, including wholly disabled traces. Start unary plus binary
+  active-to-disabled factors follow nonoverlapping source arc order, without
+  bridging source identities or geometry gaps. Fixed prepass Defects participate
+  as one-state variables, preserving their costs even when ordinary factors
+  have been pruned. These factors do not change winding gauges or orientation
+  prepass. Cost uses orientation temperature, identically in messages and decode
+  objective; lambda0 adds no factors.
+- Opt-in local-event `--winding-gap-repair N` performs bounded deterministic
+  native interval moves after feasible decoding: restore a whole gap or a single
+  gap endpoint; disable an active bridge no longer than256basevoxels. Preserve
+  fixed prepass Defects and gauges; evaluate all affected external factors.
+  Consider at most8 supported common winding labels (neighbors first, then
+  unary-cost rank),50000 proposals/sweep. Report cap hits, unvisited pieces,
+  accepted moves, changed lengths, objective and runtime. Only strictly improving
+  hard-feasible moves are accepted; this is not global optimization. Unset/zero
+  retains existing behavior. No experimental option is enabled by default.
+- Experimental local-event fixed-prepass `--winding-source-window V` adds
+  source-memory factors (0 off, positive window length, -1 whole compatible
+  source chain). `--winding-source-overlap O` uses midpoint membership in
+  half-open windows of stride V-O. Fine measured factors and disabling unaries
+  are not duplicated. Sequences stop at source/geometric gaps or incompatible
+  active integer gauges; fixed Defects cannot establish a gauge bridge.
+  A deterministic memory remembers the last retained class/winding through
+  disabled pieces. A different next retained label costs
+  `--winding-source-break C` (infinite by default), and each disabled run costs
+  `--winding-source-opening C` (default0), both temperature-scaled. There is
+  exactly one memory trajectory per fine assignment, no hidden-label entropy.
+  Existing hard adjacent continuity remains, so changes require disabled gaps.
+  Native forward/backward computes exact conditional factor messages, in
+  parallel per factor, but global BP remains approximate. Messages remap with
+  integer support; normalized decode objective includes these factors.
+  Hard-window final projection preserves fixed states/gauges and only disables
+  conflicting retained labels; report its count separately. Overlap may couple
+  spans longer than the nominal window. Cannot combine with interval repair,
+  decode repair or the separate run-edge prior. No default promotion: the
+  initial bounded matrix worsened scores; report2026-10-02-iso20-source-memory.
 - A newly available late-Defect state has log unary
   `-winding_defect_cost * incident_measurements / orientation_temperature`.
   In fixed-prepass mode, incidence counts only retained measurements with an
@@ -7435,6 +7662,13 @@
 
 # Reference endpoint replay benchmark
 
+- Optional replay reverse checks accept `--replay-reverse-normal-base` and
+  `--replay-reverse-tangential-base`, positive finite base-voxel radii with
+  unchanged defaults20/40. They affect only shared reverse-path acceptance,
+  not forward GT thresholds or restart-seed search. Equal radii give isotropic
+  distance in the existing monotone projection test. Effective radii are
+  serialized. Interval0 still disables reverse checking.
+
 - `vc_fiber_trace_chunk reference-replay-benchmark` evaluates tagged VC3D
   reference fibers with `fiberlet` (default), `greedy`, or `lasagna` tracing in
   a half-open base-XYZ crop. It clips each reference into every contiguous
@@ -7505,6 +7739,15 @@
   data runs are manual scientific benchmarks, not CI performance gates.
 
 # Fiber benchmark progress plots
+
+Local constraint-event segmentation uses only midpoints between consecutive
+orthogonal events; parallel measurements may share a piece and never introduce
+transition cuts. `--local-min-piece-length` is a finite nonnegative base-voxel
+minimum (default0): accept ascending candidate cuts only if the previous piece
+and final tail meet the minimum. Whole source lines shorter than it remain
+intact. No padding, discarded geometry, or altered certification/evidence
+weights. Accepted-cut counts exclude filtered proposals. This segmentation
+option does not change solver costs, calibration policy, or replay metrics.
 
 - The benchmark progress data records historical `algorithm_date` and
   `algorithm_revision` separately from `measurement_date`,
@@ -7705,6 +7948,16 @@ recomputed using report-metrics without mutating their trace artifacts.
   devices; only then may the worker gates be authorized.
   Bounded profile/fit/audit modes and short-failure extraction retain their
   separately specified fixed outer grants.
+# Iterative BP tuning (2026-10-03)
+
+For the current iterative sweep, rank non-oracle accuracy first, observed shift
+score second, constraint-disable score third. This supersedes the preceding
+cost-only sweep's fixed-geometry restriction: minimum piece length, median
+probe span/blend and end-to-end measurement scale may be varied explicitly.
+Keep source traces, reference labels, solver iteration budget and oracle protocol
+fixed. Report missing coverage and unsuccessful solves; do not treat missing
+oracle results as zero removal. No production-default change is implied.
+
 # Full hard-region failure union (2026-09-21)
 
 The full hard-region extractor consumes completed model evaluations as evidence
@@ -7720,3 +7973,13 @@ The inspection channel export includes inference.lasagna.json and its
 inference.json provenance per physical scroll. Channel paths are relative to
 the exported manifest so copying the directory preserves bindings. Exact
 source base dimensions and scale must be preserved, including for subsets.
+
+## Experimental tiled crop tracing
+
+Trace1024base-voxel cores with64base-voxel halos on both sides, and deduplicate
+each expanded tile independently. Clip to half-open cores and preserve multiple
+boundary continuation candidates with source-line/arc provenance. Do not build a
+global overlap graph. Artificial cuts are distinct from true reverse-filter gaps.
+Unique continuations have no artificial BP gap penalty; unresolved alternatives
+or unmatched internal cuts must not silently become hard equalities or real gaps.
+This is experimental and does not replace the historical benchmark baseline.

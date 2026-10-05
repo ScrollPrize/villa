@@ -45,7 +45,23 @@ struct FiberTraceConstraintConfig {
     bool enforceMaximumWindingDistance = true;
     bool preserveInputLinesAsPieces = false;
     bool localEvents = false;
+    // Measure on old overlapping pieces, then transfer unchanged observations
+    // to nonoverlapping orthogonal-midpoint pieces.
+    bool legacyFinePieces = false;
+    double orthogonalProbeSpan = 0.0;
+    double orthogonalProbeBlend = 1.0;
+    bool orthogonalProbeConsensus = false;
+    // Opt-in ablations separate measurements from piece layout.
+    bool localOverlapPieces = false;
+    bool localScorerOnly = false;
+    bool binaryOrientationScore = false;
+    std::optional<bool> certifyWinding;
+    std::optional<bool> closestParallelEstimator;
+    bool localNormalizeEvidence = true;
+    bool localOnePerPair = false;
+    bool localReplicateOverlap = false;
     bool localIncludeParallel = true;
+    double localMinimumPieceLengthBaseVoxels = 0.0;
     double localSpacingBaseVoxels = 64.0;
     double localTangentSpanBaseVoxels = 16.0;
     double localParallelSpanBaseVoxels = 64.0;
@@ -82,6 +98,7 @@ struct FiberTraceConstraint {
     double perpendicularScore = 0.0;
     double windingDistance = 0.0;
     bool hardContinuity = false;
+    bool artificialTileSeam = false; // Equality when active, never a physical break penalty.
     // Reference evidence may not opt out during conditioned benchmark solves.
     bool allowMeasurementDisable = true;
     double evidenceWeight = 1.0;
@@ -137,6 +154,10 @@ struct FiberTraceConstraintReport {
 void orientFiberTraceConstraintWindings(
     FiberTraceConstraintReport& report,
     const LasagnaNormalAlignmentField& alignedNormals);
+
+// Partition shared arc coverage equally among covering pieces, once per source.
+[[nodiscard]] std::vector<double> partitionFiberTracePieceLengths(
+    std::span<const FiberTraceConstraintPiece> pieces);
 
 struct FiberTraceConstraintGraphStats {
     std::size_t traces = 0;
@@ -233,7 +254,7 @@ struct FiberTraceConstraintObjReport {
     std::span<const FiberTraceConstraint> events,
     std::span<const FiberTraceConstraintPiece> sourcePieces,
     std::span<const FiberTraceConstraintPiece> targetPieces,
-    std::size_t& missingOwners);
+    std::size_t& missingOwners, bool replicateOverlap = false);
 
 struct FiberTraceOrderedCrossSourceConstraint {
     std::size_t constraintIndex = 0;

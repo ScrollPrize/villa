@@ -176,14 +176,17 @@ def analyze(model, allow_partial=False):
         print(kind, 'n=',len(selected), 'tight=',sum(r['tight_correct'] for r in selected),
               'regular=',sum(r['regular_correct'] for r in selected),
               'terminations=',{r.get('termination') for r in selected}, flush=True)
-    write_report()
+    write_report(model)
 
 
-def write_report():
-    destination = REPO/'vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/docs/benchmarks/reviewed_reference_reverse_20260930.md'
+def write_report(selected_model='gaussian'):
+    historical = selected_model in ('gaussian', 'lowres')
+    models = ('gaussian','lowres') if historical else ('gaussian','lowres',selected_model)
+    filename = 'reviewed_reference_reverse_20260930' if historical else f'reviewed_reference_reverse_{selected_model}'
+    destination = REPO/f'vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/docs/benchmarks/{filename}.md'
     lines = ['# Reference-seeded reverse diagnostic', '',
-        'Source: reviewed_fibers_20260930_v3/reverse256_v1. Only the remaining counted ordinary failures are tested: Gaussian12, lowres15. This is not a new full-cohort score.', '',
-        'Native beam8/lookahead2; unchanged model-specific step4 prediction voxels (Gaussian8base, lowres32base). All probes run through shared live_evaluate.run/native parallel evaluation; same inference namespaces and checkpoints, demand-managed GPUs0–5. No production filter changes.', '',
+        'Source: reviewed_fibers_20260930_v3/reverse256_v1. Only remaining counted ordinary failures after periodic filtering are probed. Historical Gaussian12/lowres15 included for comparison. This diagnostic is not a new full-cohort score.', '',
+        'Native beam8/lookahead2; unchanged model-specific step4 prediction voxels (full-resolution models8base, lowres32base). All probes run through shared live_evaluate.run/native parallel evaluation; same inference namespaces and checkpoints, demand-managed GPUs0–5. No production filter changes.', '',
         'Each failure has a reverse control along the final256base voxels of its saved erroneous trace, plus GT-tangent-seeded reverse probes at failure arc and +128/+256base along the original direction. GT probes end at max(segment start,failure−256). Offsets are clipped to the eligible span. These are directed cases, not necessarily distinct fibers.', '',
         'Online lateral stopping uses a finite1e9 radius; no periodic filtering, zero grace. Native endpoint/progress and unchanged step budget still bound each run. Score only the first uninterrupted segment. “Correct” requires reference_end termination AND every saved anisotropic absolute error ≤20 (tight20/40ellipse) or ≤40 (regular40/80ellipse). Merely reaching the projected endpoint is not sufficient. The control uses ordinary reference matching, not precisely the production local reverse checker.', '',
         'Convergence is conservative: ≥80base contiguous travel within10Euclidean base voxels and25° unsigned tangent agreement of saved wrong-branch segments; both paths must be outside regularGT40/80. The seed has no native match: diagnostic seed error is exactly zero by construction; the original segment first edge is conservatively excluded. No detection is not proof of no convergence.', '',
@@ -192,7 +195,7 @@ def write_report():
         '| Model | Probe | Completed artifacts | Within tight supplied reference | Within regular supplied reference |',
         '|---|---|---:|---:|---:|']
     datasets = []
-    for model in ('gaussian','lowres'):
+    for model in models:
         root = ROOT/'reference_reverse_diagnostic_v1'/model
         path = root/'results.json'
         if not path.exists():
@@ -224,14 +227,37 @@ def write_report():
             lines.append(f'| {key[0]} | {key[1]}/{key[2]} | '+ ' | '.join(cells)+' |')
         complete = [g for g in groups.values() if len(g)==4]
         both = sum(g['control']['tight_correct'] and any(g[k]['tight_correct'] for k in ('gt0','gt128','gt256')) for g in complete)
+        control_failed = sum(not g['control']['tight_correct'] for g in complete)
+        residual = len(complete) - both - control_failed
         convergence_count = sum(r.get('converged',False) for r in data['rows'])
         testable = sum(r.get('convergence_testable',False) for r in data['rows'])
         lines += ['', f'Complete four-probe groups: {len(complete)}; wrong-route control tight AND at least one GT probe tight: {both}. Sustained wrong-branch convergence: {convergence_count}/{testable} testable GT probes.', '',
+            f'Tight diagnostic partition: {control_failed} fail the saved-wrong-route reverse control; {both} reproduce the wrong route but also have a correct GT-seeded alternative; {residual} reproduce the wrong route with no tight-correct GT probe. The last count is an observed diagnostic remainder, not a proven count of undetectable errors.', '',
             'Interpretation: independently reversible wrong and correct paths can coexist. This supports investigating competing-path evidence, but does not establish a usable ground-truth-free filter. No precision/recall claim is possible without controls on successful traces.']
         clipped = [f'{r["name"]}: requested+{r["requested_offset_base"]}, effective+{r["effective_offset_base"]:.2f}'
                    for r in data['rows'] if r['requested_offset_base'] is not None and
                    abs(r['effective_offset_base']-r['requested_offset_base']) > .01]
         lines += ['', 'Clipped offsets (base voxels; duplicate seeds are not independent evidence): '+('; '.join(clipped) or 'none')+'.']
+    if not historical:
+        from vesuvius.neural_tracing.fiber_trace_3d.replay_metrics import consistency_report
+        metrics = {}
+        lines += ['', '## Full-cohort periodic-filter comparison', '',
+                  'Same 91 fibers / 182 directions. Filtering uses 256-base-voxel windows and a 20/40 ellipse; GT-assisted reseeding uses 10/20 with a local presence peak and direction alignment. Filtered stops are not ordinary restarts. Skipped regions receive no retained-length credit.', '',
+                  '| Model / mode | Ordinary restarts | Filtered stops | Retained % | Skipped mm |',
+                  '|---|---:|---:|---:|---:|']
+        for model in models:
+            for mode, folder in [('plain',ROOT/model),('filtered',ROOT/'reverse256_v1'/model)]:
+                summary = read(folder/'full/summary.json')
+                metrics[f'{model}/{mode}'] = consistency_report(summary)
+                s = metrics[f'{model}/{mode}']['combined']
+                lines.append(f'| {model}/{mode} | {s["ordinary_restarts"]} | {s["filtered_stops"]} | {s["retained_percent"]:.3f} | {s["filtered_skipped_mm"]:.3f} |')
+        atomic_write(destination.with_suffix('.json'),metrics,durable=False)
+        lines += ['', '### Current model per scroll', '',
+                  '| Scroll | Plain ordinary | Filtered ordinary | Filtered stops | Retained % |',
+                  '|---|---:|---:|---:|---:|']
+        for scroll,s in metrics[f'{selected_model}/filtered']['scrolls'].items():
+            before = metrics[f'{selected_model}/plain']['scrolls'][scroll]
+            lines.append(f'| {scroll} | {before["ordinary_restarts"]} | {s["ordinary_restarts"]} | {s["filtered_stops"]} | {s["retained_percent"]:.3f} |')
     destination.write_text('\n'.join(lines)+'\n')
 
 

@@ -1,10 +1,14 @@
-# Two-output TTA
-- Completed all three evaluations, each 91 fibers / 182 directions; approved runner exited successfully. Matched strict-float32 baseline: 24 restarts, mean 55.447 mm; TTA mean: 24 / 55.447 mm; TTA median: 19 / 69.309 mm. Median reduces counted restarts by 20.83%. Per-scroll baseline/mean/median: 0139=7/7/6, 0332=0/0/0, 1299=6/6/2, 1451=0/0/0, Paris4=11/11/11. Single evaluation per variant, not a repeated significance study. Full global/per-scroll metrics and provenance saved in docs/benchmarks/reviewed_tta13_20261001.md and .json. Mean pass wall time 5,195.50 s, including filling both outputs; median reuses that shared cache, so its time is not a standalone TTA inference measurement.
-- User rejected seven-output expansion. Replaced with exactlymean+median14channels after13GPUforwards of one uploaded input.
-- Removed all experimental shared-copy, pinned-staging and memfd changes; original Lasagna pipeline restored. Old incomplete v1 artifacts are not used by new v2 experiment.
-- Separate ordinary7channel strictfloat32baseline; shared2productTTAcache. Same GPU0–5, queues, workers, tracer and cohort. Hot payload budget preserved for32/60byte records.
-- Independent review confirmed restored shared pipeline, 14-channel output and cache isolation. Added rejection of explicit TF32 enabling for TTA after reviewer identified superclass override risk.
-- 62 regression tests passed (1.99 seconds), including the added TF32 guard test:
-  `/home/hendrik/.venv_las/bin/python -m pytest -q scripts/test_reviewed_tta.py scripts/test_reviewed_tile_repeatability.py vesuvius/tests/neural_tracing/test_inference_cache_identity.py vesuvius/tests/neural_tracing/test_live_inference_cache_namespace.py lasagna/tests/test_dynamic_inference_batching.py`.
-- `git diff --check` passed. Shared Lasagna worker/storage files have no diff. No production defaults changed; this remains an opt-in experiment. No planning/spec.md exists in this worktree.
-- Launched the approved `bash /home/hendrik/villa3/scripts/run_training_failure_mining` runner, action `reviewed_tta_sweep`. Baseline first, then mean/median; results under reviewed_fibers_20260930_v3/tta13_u31500_v2. Baseline at 139.8 seconds: 1,071 tiles and 844 published chunks; these are progress counters, not completed evaluation results.
+# Tiled seam repair
+
+Existing 2048 run completed: 8 local tiles, 7322 deduplicated lines, 3722 core fragments; 739 candidate links (715 unique, 24 ambiguous). Internal endpoints 2439, unmatched 985. Full run 4775.68s including 2347.49s anchor preparation; assembly 9.40s. Results remain in /ephemeral/hendrik/fiber_crop_bench/20261004_iso20_tiled2048_v2/results.json.
+
+Current task reuses those saved deduplicated artifacts only. No inference, tracing or dedup rerun. Existing large dirty worktree preserved. Review requested for ambiguity semantics before changing BP behavior.
+
+User requested report first, then a commit of current code/docs for integration.
+No seam/BP code changes were made. Independent review: remove both percentage
+gates for absolute support; ambiguous links require grouped alternatives, not
+independent hard/soft equality edges. This remains pending, not a completed fix.
+Completed tiled-run statistics and limitation are archived in tiled-tracing.md
+and changelog.md. Commit-only checks: source/docs diff whitespace check passes
+excluding generated SVG plots, which retain generator-produced trailing spaces.
+No build or evaluation rerun is required by this documentation/checkpoint action.

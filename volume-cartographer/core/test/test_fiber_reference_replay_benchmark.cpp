@@ -75,6 +75,56 @@ TEST_CASE("Periodic consistency checks final partial span and accounts rejected 
     CHECK_FALSE(result.failures.empty());
     CHECK(result.filteredStops.empty());
     CHECK(result.reverseChecks == 0);
+    policy.allEndpoints = true;
+    result = run();
+    CHECK(result.failures.empty());
+    CHECK_FALSE(result.filteredStops.empty());
+    REQUIRE(result.segments.front().filteredDistanceFailure.has_value());
+    CHECK(result.reverseChecks > 0);
+    policy.verify = [](const auto&) { return true; };
+    result = run();
+    CHECK_FALSE(result.failures.empty());
+    CHECK(result.filteredStops.empty());
+}
+
+TEST_CASE("Full prefix consistency verifies to segment start including final partial endpoint")
+{
+    using namespace vc::fiber_tracer;
+    class Normals final : public vc::lasagna::NormalSampler {
+        vc::lasagna::NormalSample sampleNormal(const cv::Vec3d&) const override {
+            return {{0,1,0},true,{}};
+        }
+    } normals;
+    const auto reference = makePolylineArcGeometry({{0,0,0},{250,0,0}});
+    ReplaySegmentRunner runner = [](const PolylineArcSample& seed, double, int,
+            const ReplayPointObserver& observe, const FiberTraceProgressCallback&) {
+        for (double x=seed.arc+10; x<=250; x+=10)
+            if (!observe({x,0,0},0,int(x/10))) break;
+        return std::string("stopped");
+    };
+    std::vector<std::pair<double,double>> spans;
+    ReplayConsistencyPolicy policy;
+    policy.intervalBase=100;
+    policy.toStart=true;
+    policy.allEndpoints=true;
+    policy.verify=[&](const auto& points) {
+        spans.emplace_back(points.front()[0],points.back()[0]); return true;
+    };
+    policy.nextSeed=[](double)->std::optional<PolylineArcSample>{return {};};
+    const auto run=[&] {
+        return traceReferenceReplayCore(reference,0,250,10,3,40,160,2,1,normals,1,runner,{},{},policy);
+    };
+    auto result=run();
+    REQUIRE(spans.size()==3);
+    CHECK(spans[0]==std::make_pair(0.,100.));
+    CHECK(spans[1]==std::make_pair(0.,200.));
+    CHECK(spans[2]==std::make_pair(0.,250.));
+    CHECK(result.reverseChecks==3); // No duplicate terminal call.
+    spans.clear(); policy.toStart=false;
+    result=run();
+    REQUIRE(spans.size()==3);
+    CHECK(spans[1]==std::make_pair(100.,200.));
+    CHECK(spans[2]==std::make_pair(200.,250.));
 }
 
 namespace

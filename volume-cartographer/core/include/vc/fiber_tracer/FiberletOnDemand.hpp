@@ -35,6 +35,7 @@ using FiberletOnDemandProgressCallback = std::function<void(const FiberletOnDema
 using FiberletAnchorCellPredicate = std::function<bool(const std::array<std::size_t, 3>& cellZYX)>;
 
 struct FiberletOnDemandConfig {
+    bool cachedOnly = false; // Read existing immutable chunks; missing data is an error.
     std::filesystem::path anchorRoot;
     std::filesystem::path fiberletRoot;
     FiberletDatasetMetadata anchorMetadata;

@@ -1,4 +1,5 @@
 #include "vc/fiber_tracer/FiberletCropTraceArtifact.hpp"
+#include "vc/fiber_tracer/FiberTiledTrace.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
 
 #include <algorithm>
@@ -202,11 +203,19 @@ FiberletDatasetMetadata traceMetadata(
     };
     if (!preprocessing.empty())
         result.processing["preprocessing"] = preprocessing;
+    if (config.stopAtCoveredTraces) {
+        result.processing["trace"]["stop_at_covered_traces"] = true;
+        result.processing["trace"]["covered_trace_normal_radius_base"] = config.coveredTraceNormalRadiusBaseVoxels.value_or(config.coverageNormalRadiusBaseVoxels);
+        result.processing["trace"]["covered_trace_tangential_radius_base"] = config.coveredTraceTangentialRadiusBaseVoxels.value_or(fiberletCropCoverageTangentialRadius(config));
+    }
     if (config.reverseConsistency)
         result.processing["trace"]["reverse_consistency"] = {
             {"normal_radius_base", config.reverseNormalRadiusBaseVoxels},
             {"tangential_radius_base", config.reverseTangentialRadiusBaseVoxels},
             {"backoff_base", config.reverseBackoffBaseVoxels}};
+    if (config.reversePrefixIntervalBaseVoxels > 0)
+        result.processing["trace"]["reverse_consistency"]["prefix_interval_base"] =
+            config.reversePrefixIntervalBaseVoxels;
     if (!traceSummary.empty())
         result.processing["artifact"]["trace_summary"] = traceSummary;
     finalizeFiberletDatasetIdentity(result);
@@ -266,11 +275,22 @@ void writeFiberletCropTraceArtifact(
     const FiberletCropTraceConfig& config,
     const std::vector<FiberletCropTraceLine>& lines,
     const nlohmann::json& preprocessing,
-    const nlohmann::json& traceSummary)
+    const nlohmann::json& traceSummary,
+    const nlohmann::json& inheritedTraceSettings)
 {
     if (std::filesystem::exists(output))
         throw std::invalid_argument("Fiber trace output already exists: " + output.string());
     auto summary = traceSummary;
+    // Optional per-segment costs survive local filtering and exact arc clipping.
+    summary.erase("segment_metric_costs");
+    if (std::any_of(lines.begin(), lines.end(), [](const auto& l){return !l.segmentMetricCosts.empty();})) {
+        summary["segment_metric_costs"] = nlohmann::json::array();
+        for (const auto& line : lines) {
+            if (line.segmentMetricCosts.size()+1 != line.pointsBaseXYZ.size())
+                throw std::invalid_argument("incomplete segment cost capture");
+            summary["segment_metric_costs"].push_back(line.segmentMetricCosts);
+        }
+    }
     if (config.reverseConsistency) {
         summary["reverse_piece_provenance"] = nlohmann::json::array();
         for (const auto& line : lines) {
@@ -307,6 +327,10 @@ void writeFiberletCropTraceArtifact(
     auto metadata = traceMetadata(
         sourceMetadata, normalManifest, config, populated, lines.size(),
         preprocessing, summary);
+    if (!inheritedTraceSettings.empty()) {
+        metadata.processing["trace"] = inheritedTraceSettings;
+        finalizeFiberletDatasetIdentity(metadata);
+    }
 
     const auto parent = output.parent_path().empty() ? std::filesystem::path{"."} : output.parent_path();
     std::filesystem::create_directories(parent);
@@ -367,6 +391,7 @@ FiberletCropTraceArtifact readFiberletCropTraceArtifact(const std::filesystem::p
     requireObjectKeys(processing.at("crop"), {"minimum_base_xyz", "maximum_base_xyz"}, "Fiber trace crop metadata");
     const auto& trace = processing.at("trace");
     const bool hasCoveredStop = trace.contains("stop_at_covered_anchors");
+    const bool hasTraceStop = trace.contains("stop_at_covered_traces");
     const bool hasQualityThreshold =
         trace.contains("maximum_accepted_cost_density");
     const bool hasAmbiguityMargin =
@@ -383,10 +408,25 @@ FiberletCropTraceArtifact readFiberletCropTraceArtifact(const std::filesystem::p
         "maximum_attempts", "maximum_fibers"};
     if (hasCoveredStop)
         traceKeys.push_back("stop_at_covered_anchors");
+    if (hasTraceStop) {
+        traceKeys.push_back("stop_at_covered_traces");
+        for(const auto* key:{"covered_trace_normal_radius_base","covered_trace_tangential_radius_base"}) {
+            traceKeys.push_back(key);
+            if(!trace.contains(key) || !trace.at(key).is_number() || !std::isfinite(trace.at(key).get<double>()) || trace.at(key).get<double>()<=0.)
+                throw std::invalid_argument("Invalid covered-trace radius");
+        }
+    }
     if (trace.contains("reverse_consistency")) {
         traceKeys.push_back("reverse_consistency");
         const auto& reverse = trace.at("reverse_consistency");
-        requireObjectKeys(reverse, {"normal_radius_base", "tangential_radius_base", "backoff_base"},
+        std::vector<std::string_view> reverseKeys{"normal_radius_base", "tangential_radius_base", "backoff_base"};
+        if (reverse.contains("prefix_interval_base")) {
+            reverseKeys.push_back("prefix_interval_base");
+            const auto& interval = reverse.at("prefix_interval_base");
+            if (!interval.is_number() || !std::isfinite(interval.get<double>()) || interval.get<double>() <= 0)
+                throw std::invalid_argument("Invalid reverse prefix interval");
+        }
+        requireObjectKeys(reverse, reverseKeys,
             "Reverse consistency parameters");
         for (const auto* key : {"normal_radius_base", "tangential_radius_base", "backoff_base"})
             if (!reverse.at(key).is_number() || !std::isfinite(reverse.at(key).get<double>()) ||
@@ -406,6 +446,8 @@ FiberletCropTraceArtifact readFiberletCropTraceArtifact(const std::filesystem::p
     if (hasQualityThreshold)
         traceKeys.push_back("maximum_accepted_cost_density");
     requireObjectKeys(trace, traceKeys, "Fiber trace parameters");
+    if (hasTraceStop && !trace.at("stop_at_covered_traces").is_boolean())
+        throw std::invalid_argument("Fiber trace covered-trace parameter is not boolean");
     if (hasCoveredStop && !trace.at("stop_at_covered_anchors").is_boolean())
         throw std::invalid_argument(
             "Fiber trace covered-anchor parameter is not boolean");
@@ -526,8 +568,21 @@ FiberletCropTraceArtifact readFiberletCropTraceArtifact(const std::filesystem::p
             line.negativeTermination = piece.at("negative_termination").get<std::string>();
             line.positiveTermination = piece.at("positive_termination").get<std::string>();
         }
+        if (artifactMetadata.contains("trace_summary") && artifactMetadata.at("trace_summary").contains("segment_metric_costs")) {
+            const auto& costs=artifactMetadata.at("trace_summary").at("segment_metric_costs");
+            if (!costs.is_array() || costs.size()!=ordered.size()) throw std::invalid_argument("segment cost trace count mismatch");
+            auto& line=ordered[index].line;
+            line.segmentMetricCosts=costs.at(index).get<std::vector<double>>();
+            if (line.segmentMetricCosts.size()+1!=line.pointsBaseXYZ.size()) throw std::invalid_argument("segment cost point count mismatch");
+            double sum=0;
+            for (double value:line.segmentMetricCosts) {if (!std::isfinite(value)) throw std::invalid_argument("nonfinite segment cost");sum+=value;}
+            if (std::abs(sum-line.totalMetricCost)>1e-6*std::max(1.,std::abs(line.totalMetricCost)))
+                throw std::invalid_argument("segment costs disagree with total");
+        }
         result.lines.push_back(std::move(ordered[index].line));
     }
+    if(processing.contains("preprocessing") && processing.at("preprocessing").contains("tiled_trace"))
+        validateFiberTiledTopology(processing.at("preprocessing").at("tiled_trace"),result.lines.size());
     return result;
 }
 

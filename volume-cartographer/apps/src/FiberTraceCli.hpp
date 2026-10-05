@@ -64,6 +64,22 @@ inline bool parseTraceOption(
         if (!std::isfinite(config.replayReverseIntervalBase) || config.replayReverseIntervalBase <= 0)
             throw std::invalid_argument("replay reverse interval must be positive");
     }
+    else if (argument == "--replay-reverse-normal-base" || argument == "--replay-reverse-tangential-base") {
+        const double radius = parseDouble(value(argument.c_str()), argument);
+        if (!(radius > 0.0))
+            throw std::invalid_argument("replay reverse radius must be finite and positive");
+        if (argument == "--replay-reverse-normal-base") config.replayReverseNormalRadiusBase = radius;
+        else config.replayReverseTangentialRadiusBase = radius;
+    }
+    else if (argument == "--replay-reverse-to-start")
+        config.replayReverseToStart = true;
+    else if (argument == "--replay-reverse-all-endpoints")
+        config.replayReverseAllEndpoints = true;
+    else if (argument == "--replay-reverse-history-steps") {
+        config.replayReverseHistorySteps = parseInt(value("replay-reverse-history-steps"), "replay-reverse-history-steps");
+        if (config.replayReverseHistorySteps < 0 || config.replayReverseHistorySteps > 64)
+            throw std::invalid_argument("reverse history steps must be in [0,64]");
+    }
     else if (argument == "--sample-pool-radius-voxels")
         config.samplePoolRadiusVoxels = parseDouble(value("sample-pool-radius-voxels"), "sample-pool-radius-voxels");
     else if (argument == "--sample-pool-mode")
@@ -208,6 +224,11 @@ inline nlohmann::json traceConfigJson(const FiberTraceConfig& config)
 {
     return {
         {"replay_reverse_interval_base", config.replayReverseIntervalBase},
+        {"replay_reverse_normal_radius_base", config.replayReverseNormalRadiusBase},
+        {"replay_reverse_tangential_radius_base", config.replayReverseTangentialRadiusBase},
+        {"replay_reverse_to_start", config.replayReverseToStart},
+        {"replay_reverse_all_endpoints", config.replayReverseAllEndpoints},
+        {"replay_reverse_history_steps", config.replayReverseHistorySteps},
         {"embedding_weight", config.embeddingWeight},
         {"embedding_integration", {{"kind",config.embeddingIntegration.kind},{"spacing",config.embeddingIntegration.spacing},
             {"gate_bias",config.embeddingIntegration.gateBias},{"gate_presence",config.embeddingIntegration.gatePresence},{"gate_distance",config.embeddingIntegration.gateDistance},

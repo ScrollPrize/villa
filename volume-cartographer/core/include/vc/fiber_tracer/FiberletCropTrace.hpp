@@ -30,15 +30,21 @@ struct FiberletCropTraceConfig {
     double reverseNormalRadiusBaseVoxels = 20.0;
     double reverseTangentialRadiusBaseVoxels = 40.0;
     double reverseBackoffBaseVoxels = 40.0;
+    // Zero preserves endpoint/backoff filtering. Positive enables full-prefix
+    // checks at this spacing and every terminal endpoint, without GT reseeding.
+    double reversePrefixIntervalBaseVoxels = 0.0;
     double coverageDirectionDegrees = 25.0;
     bool stopAtCoveredAnchors = false;
+    bool stopAtCoveredTraces = false; // Dense only; indexed accepted segments.
+    std::optional<double> coveredTraceNormalRadiusBaseVoxels;
+    std::optional<double> coveredTraceTangentialRadiusBaseVoxels;
     std::optional<double> ambiguityRelativeCostMargin;
     double ambiguityNormalRadiusBaseVoxels = 20.0;
     std::optional<double> maximumAcceptedCostDensity;
     std::size_t parallelThreads = 0;
     std::size_t maximumAttempts = 0;
     std::size_t maximumFibers = 0;
-    bool captureStepCosts = false; // Dense tracing diagnostics only; not serialized.
+    bool captureStepCosts = false; // Optional segment costs persisted by trace artifacts.
 };
 
 struct FiberletCropTraceSearchBox {
@@ -78,6 +84,10 @@ struct FiberletCropTraceResult {
     std::size_t oneSidedLines = 0;
     std::size_t bidirectionalLines = 0;
     std::size_t coveredAnchorStops = 0;
+    std::size_t coveredTraceStops = 0;
+    std::size_t coverageCommitRechecks = 0;
+    std::size_t coverageQueries = 0;
+    std::size_t coverageSegmentTests = 0;
     std::size_t ambiguityDecisions = 0;
     std::size_t ambiguityRouteComparisons = 0;
     std::size_t acceptedAmbiguityStops = 0;
@@ -271,5 +281,36 @@ void writeFiberletCropQualityArtifacts(
     const std::vector<FiberletCropTraceLine>& lines,
     std::span<const FiberTernaryState> states,
     const std::filesystem::path& outputBase);
+
+struct FiberPieceOverlapConfig {
+    double normalRadiusBase = 10, tangentialRadiusBase = 20;
+    double directionDegrees = 45, fraction = 0.8, sampleStepBase = 4;
+    int threads = 1;
+};
+struct FiberPieceOverlapSelection {
+    std::vector<std::size_t> retained;
+    // Original input ordinals; -1 means retained. Every removed piece has a retained suppressor.
+    std::vector<std::int64_t> suppressedBy;
+    std::vector<double> overlapFraction, lengthBase;
+};
+// All strictly positive overlaps, measured from the shorter piece. Independent
+// of ranking and suppression threshold, reusable across a parameter sweep.
+struct FiberPieceOverlapGraph {
+    std::vector<double> lengthBase;
+    std::vector<std::vector<std::pair<std::size_t,double>>> shorterPairs;
+};
+[[nodiscard]] FiberPieceOverlapGraph measureFiberPieceOverlap(
+    const std::vector<FiberletCropTraceLine>& lines,
+    const vc::lasagna::NormalSampler& normals, double normalScale,
+    const FiberPieceOverlapConfig& config,
+    std::span<const std::size_t> groups = {}, bool bothDirections = false);
+[[nodiscard]] FiberPieceOverlapSelection selectFiberPieceOverlap(
+    const FiberPieceOverlapGraph& graph, const std::vector<double>& quality, double fraction);
+// Higher quality wins, length breaks ties, then original ordinal. Every input
+// line is independent, including siblings produced by reverse consistency.
+[[nodiscard]] FiberPieceOverlapSelection selectFiberPieceOverlap(
+    const std::vector<FiberletCropTraceLine>& lines, const std::vector<double>& quality,
+    const vc::lasagna::NormalSampler& normals, double normalScale,
+    const FiberPieceOverlapConfig& config);
 
 }  // namespace vc::fiber_tracer

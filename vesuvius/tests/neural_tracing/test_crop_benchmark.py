@@ -78,10 +78,13 @@ def test_bp_metrics_use_raw_counts_and_all_references():
         crop_benchmark.bp_metrics('unfinished')
 
 
-def test_publish_custom_run_record_preserves_plot_exclusions(tmp_path, monkeypatch):
+@pytest.mark.parametrize('date', [None, '2026-10-02'])
+def test_publish_custom_run_record_preserves_plot_exclusions(tmp_path, monkeypatch, date):
     mock_tools(monkeypatch)
     cfg = config(tmp_path)
     cfg['commands'] = []
+    if date:
+        cfg['measurement_date'] = date
     cfg['publish_replay_plots'] = [dict(id='external', label='External fibers',
         result='replay.json', run_record='docs/custom.md')]
     output = Path(cfg['output_root'])
@@ -104,3 +107,6 @@ def test_publish_custom_run_record_preserves_plot_exclusions(tmp_path, monkeypat
     document = written['fiber_benchmark_plot_data.json']
     assert document['plot_excluded_measurements'] == {'old': 'reproduction'}
     assert document['benchmarks']['reference_replay']['points'][0]['run_record'] == 'docs/custom.md'
+    point = document['benchmarks']['reference_replay']['points'][0]
+    assert point['measurement_date'] == (date or '2026-09-23')
+    assert point['algorithm_date'] == (date or '2026-09-23')

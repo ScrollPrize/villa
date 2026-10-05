@@ -23,7 +23,8 @@ def test_reverse_requires_explicit_dense_mode(args):
     assert "reverse options require" in result.stdout + result.stderr
 
 
-@pytest.mark.parametrize("option", ["--reverse-normal", "--reverse-tangential", "--reverse-backoff"])
+@pytest.mark.parametrize("option", ["--reverse-normal", "--reverse-tangential", "--reverse-backoff",
+    "--replay-reverse-normal-base", "--replay-reverse-tangential-base"])
 @pytest.mark.parametrize("value", ["0", "-1", "nan", "inf"])
 def test_reverse_rejects_invalid_parameters(option, value):
     if not BINARY.is_file():

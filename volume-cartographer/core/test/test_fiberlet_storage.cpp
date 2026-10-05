@@ -2420,6 +2420,11 @@ TEST_CASE("Stored crop graph accepts canonical intermediate anchors with evaluat
     const auto selected = graph.anchorsInBaseBox({0,0,0}, {16,16,16});
     REQUIRE(selected.size() == 1);
     CHECK(selected.front().fittedAxisXYZ == cv::Vec3f(0,1,0));
+    const auto prefetched=graph.anchorsInBaseBox({0,0,0},{16,16,16},4);
+    REQUIRE(prefetched.size()==selected.size());
+    CHECK(prefetched.front().key==selected.front().key);
+    CHECK(prefetched.front().positionPredictionXYZ==selected.front().positionPredictionXYZ);
+    CHECK(prefetched.front().fittedAxisXYZ==selected.front().fittedAxisXYZ);
     CHECK(views > 0);
     pathCache->cancelPendingAndWait();
     anchorCache->cancelPendingAndWait();
