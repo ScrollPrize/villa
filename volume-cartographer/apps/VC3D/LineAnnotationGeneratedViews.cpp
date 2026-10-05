@@ -160,9 +160,7 @@ QPointF generatedStripLinePositionToScene(CChunkedVolumeViewer* viewer,
                                         static_cast<float>(surfacePoint[1]));
 }
 
-double generatedLinePositionFromStripScene(CChunkedVolumeViewer* viewer,
-                                           const QPointF& scenePoint,
-                                           const vc::lasagna::LineStripPositionMap* positionMap)
+double generatedStripGridColumnFromScene(CChunkedVolumeViewer* viewer, const QPointF& scenePoint)
 {
     if (!viewer) {
         return std::numeric_limits<double>::quiet_NaN();
@@ -178,8 +176,17 @@ double generatedLinePositionFromStripScene(CChunkedVolumeViewer* viewer,
     }
     const cv::Vec2d gridPoint = quad->surfaceToGrid(
         {static_cast<double>(surfacePoint[0]), static_cast<double>(surfacePoint[1])});
-    const double gridColumn = std::clamp(gridPoint[0], 0.0,
-                                         static_cast<double>(points->cols - 1));
+    return std::clamp(gridPoint[0], 0.0, static_cast<double>(points->cols - 1));
+}
+
+double generatedLinePositionFromStripScene(CChunkedVolumeViewer* viewer,
+                                           const QPointF& scenePoint,
+                                           const vc::lasagna::LineStripPositionMap* positionMap)
+{
+    const double gridColumn = generatedStripGridColumnFromScene(viewer, scenePoint);
+    if (!std::isfinite(gridColumn)) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
     return positionMap && positionMap->valid()
         ? positionMap->stripGridColumnToOriginalPosition(gridColumn)
         : gridColumn;
@@ -1100,62 +1107,35 @@ std::function<bool(QAction*)> appendGeneratedSpanContextActions(
     };
 }
 
-// The strip's control markers in line order: `scene` is where each marker
-// is drawn (generatedStripControlPointToScene, which follows a point edited
-// off the centre line), `sceneX` the scene x of its line position on the
-// centre line, the input of the target choice. The two differ only for an
-// off-line point, and only `sceneX` is monotonic in line order; the zones
-// run along the line, the glow sits on the marker. Markers without a control
-// index or without finite positions are left out; `controls` points into
-// `controlPoints`.
-struct StripContextControls {
-    std::vector<const GeneratedOverlay::ControlPointMarker*> controls;
-    std::vector<QPointF> scene;
-    std::vector<double> sceneX;
-};
-
-StripContextControls collectStripContextControls(
+// The glow of a strip target: a soft translucent halo, two widening layers
+// of the same warm colour, laid under the markers (z between the line at 150
+// and the control points at 160) so the markers keep their own look. Shared
+// by the hover and the preview shown while the menu is open. Only the one or
+// two controls the target consists of are projected (the marker position,
+// which follows a point edited off the centre line).
+std::vector<ViewerOverlayControllerBase::OverlayPrimitive> stripContextTargetPrimitives(
     CChunkedVolumeViewer* viewer,
     const std::vector<GeneratedOverlay::ControlPointMarker>& controlPoints,
-    size_t linePointCount,
-    const vc::lasagna::LineStripPositionMap& positionMap)
-{
-    StripContextControls result;
-    auto* quad = dynamic_cast<QuadSurface*>(viewer->currentSurface());
-    for (const auto& control : controlPoints) {
-        if (control.controlIndex == std::numeric_limits<size_t>::max() ||
-            !validGeneratedLinePosition(control.linePosition, linePointCount)) {
-            continue;
-        }
-        result.controls.push_back(&control);
-    }
-    std::sort(result.controls.begin(), result.controls.end(),
-              [](const auto* a, const auto* b) { return a->linePosition < b->linePosition; });
-    StripContextControls placed;
-    for (const auto* control : result.controls) {
-        const QPointF scene =
-            generatedStripControlPointToScene(viewer, quad, *control, positionMap);
-        const QPointF onLine =
-            generatedStripLinePositionToScene(viewer, quad, control->linePosition, &positionMap);
-        if (!finiteScenePoint(scene) || !finiteScenePoint(onLine)) {
-            continue;
-        }
-        placed.controls.push_back(control);
-        placed.scene.push_back(scene);
-        placed.sceneX.push_back(onLine.x());
-    }
-    return placed;
-}
-
-// The highlight of a strip target: a soft translucent glow, two widening
-// layers of the same warm colour, laid under the markers (z between the line
-// at 150 and the control points at 160) so the markers keep their own look.
-// Shared by the hover and the preview shown while the menu is open.
-std::vector<ViewerOverlayControllerBase::OverlayPrimitive> stripContextTargetPrimitives(
-    const StripContextControls& strip,
+    const GeneratedStripContextIndex& index,
+    const vc::lasagna::LineStripPositionMap& positionMap,
     const GeneratedStripContextTarget& target)
 {
     std::vector<ViewerOverlayControllerBase::OverlayPrimitive> primitives;
+    if (!viewer) {
+        return primitives;
+    }
+    auto* quad = dynamic_cast<QuadSurface*>(viewer->currentSurface());
+    const auto marker = [&](size_t rank) -> const GeneratedOverlay::ControlPointMarker* {
+        if (rank >= index.controlIndices.size() ||
+            index.controlIndices[rank] >= controlPoints.size()) {
+            return nullptr;
+        }
+        return &controlPoints[index.controlIndices[rank]];
+    };
+    const auto markerScene = [&](const GeneratedOverlay::ControlPointMarker& control) {
+        return generatedStripControlPointToScene(viewer, quad, control, positionMap);
+    };
+
     // Outer halo and inner core: the halo wide and faint, the core narrower
     // and a little stronger, both well short of opaque.
     ViewerOverlayControllerBase::OverlayStyle halo;
@@ -1165,36 +1145,41 @@ std::vector<ViewerOverlayControllerBase::OverlayPrimitive> stripContextTargetPri
     core.penColor = QColor(255, 150, 60, 80);
     core.z = 155.5;
     if (target.kind == GeneratedStripContextTarget::Kind::Span) {
-        if (target.rank + 1 >= strip.scene.size()) {
+        const auto* first = marker(target.rank);
+        const auto* second = marker(target.rank + 1);
+        if (!first || !second) {
             return primitives;
         }
-        const std::vector<QPointF> points{strip.scene[target.rank], strip.scene[target.rank + 1]};
+        const QPointF a = markerScene(*first);
+        const QPointF b = markerScene(*second);
+        if (!finiteScenePoint(a) || !finiteScenePoint(b)) {
+            return primitives;
+        }
+        const std::vector<QPointF> points{a, b};
         halo.penWidth = 14.0;
         core.penWidth = 7.0;
         primitives.push_back(ViewerOverlayControllerBase::LineStripPrimitive{points, false, halo});
         primitives.push_back(ViewerOverlayControllerBase::LineStripPrimitive{points, false, core});
         return primitives;
     }
-    if (target.rank >= strip.scene.size()) {
+    const auto* control = marker(target.rank);
+    if (!control) {
         return primitives;
     }
-    const auto& control = *strip.controls[target.rank];
+    const QPointF center = markerScene(*control);
+    if (!finiteScenePoint(center)) {
+        return primitives;
+    }
     // The marker radius drawn by applyGeneratedOverlay; the glow is a filled
     // disc behind it, feathered by the second, larger and fainter disc.
-    const qreal radius = control.hasBranches ? 6.25 : (control.isSeed ? 5.5 : 5.0);
+    const qreal radius = control->hasBranches ? 6.25 : (control->isSeed ? 5.5 : 5.0);
     halo.brushColor = halo.penColor;
     halo.penStyle = Qt::NoPen;
     core.brushColor = core.penColor;
     core.penStyle = Qt::NoPen;
-    const QPointF& center = strip.scene[target.rank];
     primitives.push_back(ViewerOverlayControllerBase::CirclePrimitive{center, radius + 9.0, true, halo});
     primitives.push_back(ViewerOverlayControllerBase::CirclePrimitive{center, radius + 5.0, true, core});
     return primitives;
-}
-
-std::string stripContextHoverKey(const std::string& surfaceName)
-{
-    return "line_annotation_context_hover_" + surfaceName;
 }
 
 // Nearest fiber-intersection "X" marker to the click, within a scene-space
@@ -1291,26 +1276,39 @@ struct ClickLocationActions {
 
 } // namespace
 
-void updateGeneratedStripContextHover(CChunkedVolumeViewer* viewer,
-                                      const std::string& surfaceName,
-                                      const std::vector<GeneratedOverlay::ControlPointMarker>& controlPoints,
-                                      size_t linePointCount,
-                                      const vc::lasagna::LineStripPositionMap& positionMap,
-                                      const QPointF& scenePoint)
+std::string generatedStripContextHoverKey(const std::string& surfaceName)
+{
+    return "line_annotation_context_hover_" + surfaceName;
+}
+
+std::optional<GeneratedStripContextTarget> resolveGeneratedStripContextTarget(
+    CChunkedVolumeViewer* viewer,
+    const GeneratedStripContextIndex& index,
+    const QPointF& scenePoint)
+{
+    if (!viewer || index.empty() || !finiteScenePoint(scenePoint)) {
+        return std::nullopt;
+    }
+    return generatedStripContextTarget(index.gridColumns,
+                                       generatedStripGridColumnFromScene(viewer, scenePoint));
+}
+
+void drawGeneratedStripContextHover(CChunkedVolumeViewer* viewer,
+                                    const std::string& surfaceName,
+                                    const std::vector<GeneratedOverlay::ControlPointMarker>& controlPoints,
+                                    const GeneratedStripContextIndex& index,
+                                    const vc::lasagna::LineStripPositionMap& positionMap,
+                                    const std::optional<GeneratedStripContextTarget>& target)
 {
     if (!viewer) {
         return;
     }
     std::vector<ViewerOverlayControllerBase::OverlayPrimitive> primitives;
-    if (linePointCount > 0 && finiteScenePoint(scenePoint)) {
-        const StripContextControls strip =
-            collectStripContextControls(viewer, controlPoints, linePointCount, positionMap);
-        if (const auto target = generatedStripContextTarget(strip.sceneX, scenePoint.x())) {
-            primitives = stripContextTargetPrimitives(strip, *target);
-        }
+    if (target) {
+        primitives = stripContextTargetPrimitives(viewer, controlPoints, index, positionMap, *target);
     }
     ViewerOverlayControllerBase::applyPrimitives(
-        viewer, stripContextHoverKey(surfaceName), std::move(primitives));
+        viewer, generatedStripContextHoverKey(surfaceName), std::move(primitives));
 }
 
 void clearGeneratedStripContextHover(CChunkedVolumeViewer* viewer,
@@ -1319,7 +1317,7 @@ void clearGeneratedStripContextHover(CChunkedVolumeViewer* viewer,
     if (!viewer) {
         return;
     }
-    ViewerOverlayControllerBase::applyPrimitives(viewer, stripContextHoverKey(surfaceName), {});
+    ViewerOverlayControllerBase::applyPrimitives(viewer, generatedStripContextHoverKey(surfaceName), {});
 }
 
 GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
@@ -1336,18 +1334,22 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
     // a span next to a control point is that point, the middle half is the
     // span, off the ends the nearest end point. The cut views draw no spans
     // and keep the nearest marker in 2D.
-    std::optional<StripContextControls> strip;
+    std::optional<GeneratedStripContextIndex> strip;
+    std::vector<const GeneratedOverlay::ControlPointMarker*> sortedControls;
     std::optional<GeneratedStripContextTarget> stripTarget;
     if (options.stripViewer) {
-        strip = collectStripContextControls(
-            options.viewer, options.controlPoints, options.linePointCount, options.stripPositionMap);
+        strip = buildGeneratedStripContextIndex(
+            options.controlPoints, options.linePointCount, options.stripPositionMap);
+        for (size_t i : strip->controlIndices) {
+            sortedControls.push_back(&options.controlPoints[i]);
+        }
         if (options.pinnedControlLinePosition && std::isfinite(*options.pinnedControlLinePosition) &&
-            !strip->controls.empty()) {
+            !sortedControls.empty()) {
             size_t bestRank = 0;
             double bestDistance = std::numeric_limits<double>::infinity();
-            for (size_t rank = 0; rank < strip->controls.size(); ++rank) {
+            for (size_t rank = 0; rank < sortedControls.size(); ++rank) {
                 const double distance =
-                    std::abs(strip->controls[rank]->linePosition - *options.pinnedControlLinePosition);
+                    std::abs(sortedControls[rank]->linePosition - *options.pinnedControlLinePosition);
                 if (distance < bestDistance) {
                     bestDistance = distance;
                     bestRank = rank;
@@ -1356,7 +1358,7 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
             stripTarget = GeneratedStripContextTarget{
                 GeneratedStripContextTarget::Kind::ControlPoint, bestRank};
         } else {
-            stripTarget = generatedStripContextTarget(strip->sceneX, options.scenePoint.x());
+            stripTarget = resolveGeneratedStripContextTarget(options.viewer, *strip, options.scenePoint);
         }
     }
 
@@ -1372,10 +1374,11 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
         ViewerOverlayControllerBase::applyPrimitives(
             options.viewer,
             "line_annotation_control_context_" + options.surfaceName,
-            stripContextTargetPrimitives(*strip, *stripTarget));
+            stripContextTargetPrimitives(options.viewer, options.controlPoints, *strip,
+                                         options.stripPositionMap, *stripTarget));
         QMenu menu(options.parent);
         const auto handleSpanAction =
-            appendGeneratedSpanContextActions(menu, options, strip->controls, stripTarget->rank);
+            appendGeneratedSpanContextActions(menu, options, sortedControls, stripTarget->rank);
         // The click's own actions, as in the control-point menu.
         menu.addSeparator();
         ClickLocationActions clickActions;
@@ -1394,9 +1397,10 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
     QPointF targetScene;
     bool haveSelection = false;
     if (stripTarget) {
-        const auto* control = strip->controls[stripTarget->rank];
-        selectedIndex = static_cast<size_t>(control - options.controlPoints.data());
-        targetScene = strip->scene[stripTarget->rank];
+        selectedIndex = strip->controlIndices[stripTarget->rank];
+        auto* quad = dynamic_cast<QuadSurface*>(options.viewer->currentSurface());
+        targetScene = generatedStripControlPointToScene(
+            options.viewer, quad, options.controlPoints[selectedIndex], options.stripPositionMap);
         haveSelection = true;
     } else {
         double bestDistanceSq = std::numeric_limits<double>::infinity();
@@ -1434,11 +1438,12 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
     const auto& selectedControl = options.controlPoints[selectedIndex];
 
     if (stripTarget) {
-        // Same ring the hover showed, now held while the menu is open.
+        // Same glow the hover showed, now held while the menu is open.
         ViewerOverlayControllerBase::applyPrimitives(
             options.viewer,
             "line_annotation_control_context_" + options.surfaceName,
-            stripContextTargetPrimitives(*strip, *stripTarget));
+            stripContextTargetPrimitives(options.viewer, options.controlPoints, *strip,
+                                         options.stripPositionMap, *stripTarget));
     } else if (finiteScenePoint(options.scenePoint) && finiteScenePoint(targetScene)) {
         ViewerOverlayControllerBase::OverlayStyle previewStyle;
         previewStyle.penColor = QColor(255, 120, 40, 245);

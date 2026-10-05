@@ -35,7 +35,7 @@ TEST_CASE("Strip context target: outer quarters of a span are its control points
     const auto cp = [](size_t rank) { return GeneratedStripContextTarget{Kind::ControlPoint, rank}; };
     const auto span = [](size_t rank) { return GeneratedStripContextTarget{Kind::Span, rank}; };
 
-    // Three markers at scene x 100, 200, 400: spans of length 100 and 200.
+    // Three controls at strip grid columns 100, 200, 400: spans of length 100 and 200.
     const std::vector<double> xs{100.0, 200.0, 400.0};
     CHECK(generatedStripContextTarget(xs, 100.0) == cp(0));
     CHECK(generatedStripContextTarget(xs, 124.0) == cp(0));
@@ -50,50 +50,56 @@ TEST_CASE("Strip context target: outer quarters of a span are its control points
     CHECK(generatedStripContextTarget(xs, 349.0) == span(1));
     CHECK(generatedStripContextTarget(xs, 351.0) == cp(2));
     CHECK(generatedStripContextTarget(xs, 400.0) == cp(2));
-    // Exactly on the quarter line the span wins only strictly inside it.
+    // Exactly on the quarter line the span wins.
     CHECK(generatedStripContextTarget(xs, 125.0) == span(0));
     CHECK(generatedStripContextTarget(xs, 175.0) == span(0));
 
-    // Off the ends: the nearest end point, however far.
+    // Beyond the ends: the end control, however far.
     CHECK(generatedStripContextTarget(xs, 0.0) == cp(0));
     CHECK(generatedStripContextTarget(xs, 99.0) == cp(0));
     CHECK(generatedStripContextTarget(xs, 401.0) == cp(2));
     CHECK(generatedStripContextTarget(xs, 5000.0) == cp(2));
 
-    // Height is not an input at all: only scene x is passed.
-    CHECK(generatedStripContextTarget(xs, 150.0) == span(0));
-
-    // A single marker is always the target; nothing yields nothing.
+    // A single control is always the target; nothing yields nothing.
     CHECK(generatedStripContextTarget({250.0}, 10.0) == cp(0));
     CHECK_FALSE(generatedStripContextTarget({}, 150.0));
     CHECK_FALSE(generatedStripContextTarget(xs, NAN));
 
-    // A strip running against scene x works the same way.
-    const std::vector<double> reversed{400.0, 200.0, 100.0};
-    CHECK(generatedStripContextTarget(reversed, 390.0) == cp(0));
-    CHECK(generatedStripContextTarget(reversed, 300.0) == span(0));
-    CHECK(generatedStripContextTarget(reversed, 190.0) == cp(1));
-    CHECK(generatedStripContextTarget(reversed, 150.0) == span(1));
-    CHECK(generatedStripContextTarget(reversed, 50.0) == cp(2));
-
-    // Two markers drawn at the same x: the span has no middle, its first point takes it.
-    CHECK(generatedStripContextTarget({100.0, 100.0, 300.0}, 100.0) == cp(0));
-
     // Two controls on one strip column (duplicate points map to one column):
     // the zero-length span claims nothing, the span beside them keeps its
-    // middle half, and on the shared x the first control wins.
+    // middle half, and on the shared column and in the quarter zone next to
+    // it the first of them wins.
     const std::vector<double> coincident{100.0, 100.0, 300.0};
     CHECK(generatedStripContextTarget(coincident, 100.0) == cp(0));
-    CHECK(generatedStripContextTarget(coincident, 120.0) == cp(1));
+    CHECK(generatedStripContextTarget(coincident, 120.0) == cp(0));
     CHECK(generatedStripContextTarget(coincident, 150.0) == span(1));
     CHECK(generatedStripContextTarget(coincident, 200.0) == span(1));
     CHECK(generatedStripContextTarget(coincident, 290.0) == cp(2));
+    CHECK(generatedStripContextTarget({50.0, 100.0, 100.0, 300.0}, 100.0) == cp(1));
+    CHECK(generatedStripContextTarget({50.0, 100.0, 100.0, 300.0}, 200.0) == span(2));
+    CHECK(generatedStripContextTarget({100.0, 300.0, 300.0}, 300.0) == cp(1));
+    CHECK(generatedStripContextTarget({100.0, 300.0, 300.0}, 900.0) == cp(1));
     CHECK(generatedStripContextTarget({100.0, 100.0, 100.0}, 100.0) == cp(0));
     CHECK(generatedStripContextTarget({100.0, 100.0, 100.0}, 7.0) == cp(0));
+}
 
-    // The input is the centre-line x of each control's line position, which
-    // is monotonic by construction; drawn marker positions (which a point
-    // edited off the centre line can put out of order) are never passed in.
+TEST_CASE("Strip context index: controls in line order with nondecreasing centre-line columns")
+{
+    using namespace vc3d::line_annotation;
+    std::vector<GeneratedOverlay::ControlPointMarker> controls(5);
+    // Out of line order on purpose; one without a control index, one off the line.
+    controls[0].linePosition = 30.0; controls[0].controlIndex = 0;
+    controls[1].linePosition = 10.0; controls[1].controlIndex = 1;
+    controls[2].linePosition = 20.0; controls[2].controlIndex = std::numeric_limits<size_t>::max();
+    controls[3].linePosition = 99.0; controls[3].controlIndex = 3;   // beyond the line
+    controls[4].linePosition = 20.0; controls[4].controlIndex = 4;
+    vc::lasagna::LineStripPositionMap noMap;
+    const auto index = buildGeneratedStripContextIndex(controls, 40, noMap);
+    REQUIRE(index.controlIndices.size() == 3);
+    CHECK(index.controlIndices == std::vector<size_t>{1, 4, 0});
+    CHECK(index.gridColumns == std::vector<double>{10.0, 20.0, 30.0});
+    CHECK_FALSE(index.empty());
+    CHECK(buildGeneratedStripContextIndex({}, 40, noMap).empty());
 }
 
 TEST_CASE("Clearing CP corrections leaves other controls and span metadata intact")

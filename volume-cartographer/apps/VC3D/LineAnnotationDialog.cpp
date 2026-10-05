@@ -1355,6 +1355,7 @@ void LineAnnotationDialog::setGeneratedControlPoints(
         return;
     }
     _generatedViews.controlPoints = std::move(controlPoints);
+    invalidateStripContextIndex();
     _generatedViews.spanAlignmentMetrics.clear();
     _generatedControlIndex =
         vc3d::line_annotation::buildGeneratedControlPointLinePositionIndex(
@@ -1404,6 +1405,7 @@ void LineAnnotationDialog::setGeneratedBranchOverlayData(
         std::move(branchLinePoints),
         std::move(branchLinks),
         std::move(spanAlignmentMetrics));
+    invalidateStripContextIndex();
     _generatedControlIndex =
         vc3d::line_annotation::buildGeneratedControlPointLinePositionIndex(
             _generatedViews.controlPoints);
@@ -1738,6 +1740,7 @@ bool LineAnnotationDialog::setGeneratedRows(
     _panes.clear();
     _stripViewers.clear();
     _stripHoverLocalPos.clear();
+    _stripHoverDrawn.clear();
     _overviewBar = nullptr;
     _currentCutOverlaySwapPending = false;
     _sideCutOverlaySwapPending = false;
@@ -1753,6 +1756,7 @@ bool LineAnnotationDialog::setGeneratedRows(
     }
     _suppressPaneClosed = false;
     _hasGeneratedViews = false;
+    _stripContextIndex.reset();
     _currentCutManualRotation = cv::Matx33f::eye();
     _currentCutManualRotationActive = false;
     _currentCutNormalOffsetVx = 0.0;
@@ -2126,6 +2130,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         const double previousLinePosition = _currentLinePosition;
         const float previousDisplayTangentSign = _displayTangentSign;
         _generatedViews = std::move(views);
+        invalidateStripContextIndex();
         _displayTangentSign = vc3d::line_annotation::generatedDisplayTangentSign(
             _generatedViews.linePoints,
             _generatedViews.lineNormals);
@@ -2157,6 +2162,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
             !updateSidePlaneSurface(_generatedViews.sideCutSurface.get(),
                                     _currentLinePosition)) {
             _generatedViews = _heldGeneratedViews;
+            invalidateStripContextIndex();
             _generatedControlIndex = _heldControlIndex;
             _currentLinePosition = previousLinePosition;
             _displayTangentSign = previousDisplayTangentSign;
@@ -2334,6 +2340,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     _panes.clear();
     _stripViewers.clear();
     _stripHoverLocalPos.clear();
+    _stripHoverDrawn.clear();
     _overviewBar = nullptr;
     _currentCutOverlaySwapPending = false;
     _sideCutOverlaySwapPending = false;
@@ -2358,6 +2365,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     _generatedTopWidget = nullptr;
 
     _generatedViews = views;
+    invalidateStripContextIndex();
     _displayTangentSign = vc3d::line_annotation::generatedDisplayTangentSign(
         _generatedViews.linePoints,
         _generatedViews.lineNormals);
@@ -2661,6 +2669,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         stripSplitter->addWidget(viewer);
         _stripViewers.push_back(viewer);
         _stripHoverLocalPos.push_back(std::nullopt);
+        _stripHoverDrawn.push_back({});
         _panes.push_back(Pane{surfaceName, viewer, {}});
         connectGeneratedOverlayRefresh(viewer);
         // Strips share their along-line position and zoom; overlaysUpdated is
@@ -2925,7 +2934,7 @@ LineAnnotationDialog::showGeneratedControlPointContextMenu(
     return result;
 }
 
-void LineAnnotationDialog::updateStripContextHover(size_t stripIndex, const QPointF& scenePoint)
+void LineAnnotationDialog::updateStripContextHover(size_t stripIndex, const QPointF& scenePoint, bool redraw)
 {
     if (_closing || stripIndex >= _stripViewers.size()) {
         return;
@@ -2944,12 +2953,66 @@ void LineAnnotationDialog::updateStripContextHover(size_t stripIndex, const QPoi
         vc3d::line_annotation::clearGeneratedStripContextHover(viewer, viewer->surfName());
         return;
     }
-    vc3d::line_annotation::updateGeneratedStripContextHover(viewer,
-                                                            viewer->surfName(),
-                                                            _generatedViews.controlPoints,
-                                                            _generatedViews.linePoints.size(),
-                                                            _generatedViews.stripPositionMap,
-                                                            scenePoint);
+    const auto target = vc3d::line_annotation::resolveGeneratedStripContextTarget(
+        viewer, stripContextIndex(), scenePoint);
+    const vc3d::line_annotation::GeneratedOverlayCameraBaseline camera{
+        viewer->surfaceCoordsToScene(0.0f, 0.0f),
+        static_cast<double>(viewer->cameraState().scale)};
+    if (!redraw && stripIndex < _stripHoverDrawn.size()) {
+        auto& drawn = _stripHoverDrawn[stripIndex];
+        if (drawn.target == target) {
+            if (!target) {
+                return;
+            }
+            // Same target: under the same camera nothing to do; under a
+            // panned camera shift the glow like the static markers, no
+            // projection. A zoom (no delta) falls through to a redraw.
+            const auto delta = vc3d::line_annotation::generatedOverlayPanTranslation(
+                drawn.camera, camera.referenceScene, camera.scale);
+            if (delta) {
+                if (*delta == QPointF()) {
+                    return;
+                }
+                if (viewer->translateOverlayGroup(
+                        vc3d::line_annotation::generatedStripContextHoverKey(viewer->surfName()),
+                        *delta)) {
+                    drawn.camera = camera;
+                    return;
+                }
+            }
+        }
+    }
+    vc3d::line_annotation::drawGeneratedStripContextHover(viewer,
+                                                          viewer->surfName(),
+                                                          _generatedViews.controlPoints,
+                                                          stripContextIndex(),
+                                                          _generatedViews.stripPositionMap,
+                                                          target);
+    if (stripIndex < _stripHoverDrawn.size()) {
+        _stripHoverDrawn[stripIndex] = StripHoverDrawn{target, camera};
+    }
+}
+
+const vc3d::line_annotation::GeneratedStripContextIndex& LineAnnotationDialog::stripContextIndex()
+{
+    if (!_stripContextIndex) {
+        _stripContextIndex = vc3d::line_annotation::buildGeneratedStripContextIndex(
+            _generatedViews.controlPoints,
+            _generatedViews.linePoints.size(),
+            _generatedViews.stripPositionMap);
+    }
+    return *_stripContextIndex;
+}
+
+void LineAnnotationDialog::invalidateStripContextIndex()
+{
+    _stripContextIndex.reset();
+    // A glow drawn from the old index may sit on a control that moved or is
+    // gone; the next refresh (the static rebuild that follows every such
+    // change) redraws it from the new one.
+    for (size_t i = 0; i < _stripViewers.size(); ++i) {
+        clearStripContextHover(i);
+    }
 }
 
 bool LineAnnotationDialog::stripStaticPlacementCurrent(size_t stripIndex) const
@@ -2973,7 +3036,7 @@ bool LineAnnotationDialog::stripStaticPlacementCurrent(size_t stripIndex) const
     return delta && *delta == QPointF();
 }
 
-void LineAnnotationDialog::refreshStripContextHover(size_t stripIndex)
+void LineAnnotationDialog::refreshStripContextHover(size_t stripIndex, bool redraw)
 {
     if (_closing || stripIndex >= _stripViewers.size()) {
         return;
@@ -2993,13 +3056,16 @@ void LineAnnotationDialog::refreshStripContextHover(size_t stripIndex)
         clearStripContextHover(stripIndex);
         return;
     }
-    updateStripContextHover(stripIndex, view->mapToScene(*local));
+    updateStripContextHover(stripIndex, view->mapToScene(*local), redraw);
 }
 
 void LineAnnotationDialog::clearStripContextHover(size_t stripIndex)
 {
     if (stripIndex >= _stripViewers.size()) {
         return;
+    }
+    if (stripIndex < _stripHoverDrawn.size()) {
+        _stripHoverDrawn[stripIndex] = StripHoverDrawn{};
     }
     if (auto* viewer = _stripViewers[stripIndex].data()) {
         vc3d::line_annotation::clearGeneratedStripContextHover(viewer, viewer->surfName());
@@ -4316,10 +4382,11 @@ void LineAnnotationDialog::rebuildGeneratedStaticStripOverlays()
         placement.camera.referenceScene = viewer->surfaceCoordsToScene(0.0f, 0.0f);
         placement.camera.scale = static_cast<double>(viewer->cameraState().scale);
     }
-    // The markers may have moved (a placed, deleted or re-optimized point):
-    // re-resolve the highlight under the mouse against the new positions.
+    // The markers were just re-projected (a placed, deleted or re-optimized
+    // point, or a normal-offset change with the camera unchanged): the glow
+    // is re-projected with them, whatever it showed before.
     for (size_t i = 0; i < _stripViewers.size(); ++i) {
-        refreshStripContextHover(i);
+        refreshStripContextHover(i, true);
     }
 }
 
