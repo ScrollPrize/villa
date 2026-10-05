@@ -339,6 +339,19 @@ if(VC_RUN_E2E)
         ENVIRONMENT "VC_RUN_E2E=1;VC_MERGE_TIFXYZ_BIN=$<TARGET_FILE:vc_merge_tifxyz>")
 endif()
 
+# End-to-end test that spawns the built vc_obj2tifxyz_legacy on two synthetic
+# plane meshes (clean, and with 3% stretched triangles) and checks that the
+# output grid keeps the 4 voxel cell size. Opt-in via VC_RUN_E2E=1.
+add_executable(test_obj2tifxyz_legacy_scale test_obj2tifxyz_legacy_scale.cpp)
+target_link_libraries(test_obj2tifxyz_legacy_scale PRIVATE doctest::doctest vc_core)
+vc_register_test_target(test_obj2tifxyz_legacy_scale)
+if(VC_RUN_E2E)
+    add_test(NAME test_obj2tifxyz_legacy_scale COMMAND test_obj2tifxyz_legacy_scale)
+    vc_register_ctest(test_obj2tifxyz_legacy_scale test_obj2tifxyz_legacy_scale)
+    set_tests_properties(test_obj2tifxyz_legacy_scale PROPERTIES
+        ENVIRONMENT "VC_RUN_E2E=1;VC_OBJ2TIFXYZ_LEGACY_BIN=$<TARGET_FILE:vc_obj2tifxyz_legacy>")
+endif()
+
 add_executable(bench_volume_sample bench_volume_sample.cpp)
 target_link_libraries(bench_volume_sample PRIVATE doctest::doctest vc_core)
 vc_register_test_target(bench_volume_sample)
