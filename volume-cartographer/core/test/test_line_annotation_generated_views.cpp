@@ -102,6 +102,504 @@ TEST_CASE("Strip context index: controls in line order with nondecreasing centre
     CHECK(buildGeneratedStripContextIndex({}, 40, noMap).empty());
 }
 
+TEST_CASE("Overview anchors: settled layout is kept while the geometry is in flight")
+{
+    using namespace vc3d::line_annotation;
+    auto control = [](float id, double linePosition, double arc = NAN, double total = NAN) {
+        GeneratedOverlay::ControlPointMarker m;
+        m.point = {id, 0.0f, 0.0f};
+        m.linePosition = linePosition;
+        m.arcLength = arc;
+        m.lineArcLength = total;
+        return m;
+    };
+    // A straight line along x: `count` points with `step` spacing.
+    auto line = [](size_t count, float step) {
+        std::vector<cv::Vec3f> points;
+        for (size_t i = 0; i < count; ++i) {
+            points.push_back({static_cast<float>(i) * step, 0.0f, 0.0f});
+        }
+        return points;
+    };
+
+    // Settled: 101 unit samples (arc length 100), controls at 0, 50, 100.
+    const auto settledLine = line(101, 1.0f);
+    const std::vector<GeneratedOverlay::ControlPointMarker> settledControls{
+        control(1.0f, 0.0), control(2.0f, 50.0), control(3.0f, 100.0)};
+    const auto settled = generatedOverviewSettledLayout(settledControls, settledLine);
+    REQUIRE(settled.anchors.size() == 3);
+    CHECK(settled.totalArcLength == doctest::Approx(100.0));
+    CHECK(settled.anchors[1].arcLength == doctest::Approx(50.0));
+    CHECK(settled.anchors[0].fraction == doctest::Approx(0.0));
+    CHECK(settled.anchors[1].fraction == doctest::Approx(0.5));
+    CHECK(settled.anchors[2].fraction == doctest::Approx(1.0));
+    // Identity mapping when settled, both ways, by arc length.
+    CHECK(generatedOverviewFraction(settled.anchors, 25.0, 100.0) == doctest::Approx(0.25));
+    CHECK(generatedOverviewArcLength(settled.anchors, 0.25, 100.0) == doctest::Approx(25.0));
+
+    // In flight, all controls in the displayed line's arc space: the old ones
+    // keep their fractions, a new one at arc 20 of the 0..50 span lands at 0.2.
+    const std::vector<GeneratedOverlay::ControlPointMarker> liveControls{
+        control(1.0f, 0.0, 0.0, 100.0), control(9.0f, 20.0, 20.0, 100.0),
+        control(2.0f, 50.0, 50.0, 100.0), control(3.0f, 100.0, 100.0, 100.0)};
+    const auto frozen = generatedOverviewFrozenAnchors(settled.anchors, liveControls, settledLine);
+    REQUIRE(frozen.size() == 4);
+    CHECK(frozen[0].fraction == doctest::Approx(0.0));
+    CHECK(frozen[1].fraction == doctest::Approx(0.2));
+    CHECK(frozen[2].fraction == doctest::Approx(0.5));
+    CHECK(frozen[3].fraction == doctest::Approx(1.0));
+    // Arc lengths come from the controls when present, else from the line.
+    const std::vector<GeneratedOverlay::ControlPointMarker> noArcs{
+        control(1.0f, 0.0), control(9.0f, 20.0), control(2.0f, 50.0), control(3.0f, 100.0)};
+    CHECK(generatedOverviewFrozenAnchors(settled.anchors, noArcs, settledLine)[1].fraction ==
+          doctest::Approx(0.2));
+
+    // Known fractions include controls placed earlier in the same flight:
+    // they keep theirs even when a later publish moves their arc length.
+    std::vector<GeneratedOverviewAnchor> known = settled.anchors;
+    known.push_back(frozen[1]);  // the new control at 0.2
+    const std::vector<GeneratedOverlay::ControlPointMarker> later{
+        control(1.0f, 0.0, 0.0, 110.0), control(9.0f, 30.0, 30.0, 110.0),
+        control(2.0f, 60.0, 60.0, 110.0), control(3.0f, 110.0, 110.0, 110.0)};
+    const auto kept = generatedOverviewFrozenAnchors(known, later, settledLine);
+    CHECK(kept[1].fraction == doctest::Approx(0.2));
+
+    // Extending at the end: a settled line with controls at 0 and 50 of 100
+    // (a 50-long tail). A point at arc 60 (20% into the tail) lands at
+    // 0.5 + 0.2 * 0.5 = 0.6, a point before the first control toward the start.
+    const auto settledTwo = generatedOverviewSettledLayout(
+        {control(1.0f, 0.0), control(2.0f, 50.0)}, settledLine);
+    const std::vector<GeneratedOverlay::ControlPointMarker> extended{
+        control(1.0f, 0.0, 0.0, 100.0), control(2.0f, 50.0, 50.0, 100.0), control(8.0f, 60.0, 60.0, 100.0)};
+    const auto frozenExtended = generatedOverviewFrozenAnchors(settledTwo.anchors, extended, settledLine);
+    REQUIRE(frozenExtended.size() == 3);
+    CHECK(frozenExtended[2].fraction == doctest::Approx(0.6));
+    const std::vector<GeneratedOverlay::ControlPointMarker> prepended{
+        control(7.0f, 5.0, 5.0, 100.0), control(2.0f, 50.0, 50.0, 100.0)};
+    const auto frozenPrepended = generatedOverviewFrozenAnchors(settledTwo.anchors, prepended, settledLine);
+    CHECK(frozenPrepended[0].fraction == doctest::Approx(0.05));
+    for (size_t i = 1; i < frozenExtended.size(); ++i) {
+        CHECK(frozenExtended[i].fraction >= frozenExtended[i - 1].fraction);
+    }
+
+    // Replacing a control in place: the old anchor B (arc 60, fraction .5)
+    // is gone with its point; the replacement at the same displayed arc
+    // takes its first fraction from the marker's mapping (A/B/C still there),
+    // .5, not from interpolation between the surviving dots (.6).
+    {
+        std::vector<GeneratedOverviewAnchor> mapping = {
+            {0, {1.0f, 0.0f, 0.0f}, 0.0, 0.0, 0.0},
+            {0, {2.0f, 0.0f, 0.0f}, 60.0, 60.0, 0.5},
+            {0, {3.0f, 0.0f, 0.0f}, 100.0, 100.0, 1.0}};
+        const std::vector<GeneratedOverlay::ControlPointMarker> replaced{
+            control(1.0f, 0.0, 0.0, 100.0), control(21.0f, 60.0, 60.0, 100.0), control(3.0f, 100.0, 100.0, 100.0)};
+        const auto withMapping = generatedOverviewFrozenAnchors(mapping, replaced, settledLine, &mapping);
+        CHECK(withMapping[1].fraction == doctest::Approx(0.5));
+        const auto withoutMapping = generatedOverviewFrozenAnchors(mapping, replaced, settledLine);
+        CHECK(withoutMapping[1].fraction == doctest::Approx(0.6));
+    }
+
+    // Two controls at (almost) one point of a line that returns on itself,
+    // at arcs 40 and 160 of 200: identities tell them apart whatever their
+    // arcs do between publishes (here an edit upstream moved both by +110,
+    // which by arc alone would swap them); each keeps its own fraction.
+    {
+        std::vector<GeneratedOverviewAnchor> twin = {
+            {11, {40.0f, 0.0f, 0.0f}, 40.0, 40.0, 0.2},
+            {12, {40.0f, 0.0005f, 0.0f}, 160.0, 160.0, 0.8}};
+        auto first = control(0.0f, 150.0, 150.0, 310.0);
+        first.point = {40.0f, 0.0f, 0.0f};
+        first.identity = 11;
+        auto second = control(0.0f, 270.0, 270.0, 310.0);
+        second.point = {40.0f, 0.0005f, 0.0f};
+        second.identity = 12;
+        const auto twinFrozen = generatedOverviewFrozenAnchors(twin, {first, second}, settledLine);
+        CHECK(twinFrozen[0].fraction == doctest::Approx(0.2));
+        CHECK(twinFrozen[1].fraction == doctest::Approx(0.8));
+        // Without identities the point stands in: first unused match, in order.
+        first.identity = 0;
+        second.identity = 0;
+        std::vector<GeneratedOverviewAnchor> twinNoId = twin;
+        twinNoId[0].identity = 0;
+        twinNoId[1].identity = 0;
+        const auto byPoint = generatedOverviewFrozenAnchors(twinNoId, {first, second}, settledLine);
+        CHECK(byPoint[0].fraction == doctest::Approx(0.2));
+        CHECK(byPoint[1].fraction == doctest::Approx(0.8));
+    }
+    // Unfit anchors (non-finite) are skipped by the mappings, not dereferenced.
+    {
+        std::vector<GeneratedOverviewAnchor> unfit = {{0, {0, 0, 0}, 0.0, NAN, 0.3}};
+        CHECK(generatedOverviewFraction(unfit, 50.0, 100.0) == doctest::Approx(0.5));
+        CHECK(generatedOverviewArcLength(unfit, 0.5, 100.0) == doctest::Approx(50.0));
+        CHECK(generatedOverviewFraction(unfit, 50.0, NAN) == 0.0);
+        const std::vector<cv::Vec3f> huge{{-3.0e38f, 0, 0}, {3.0e38f, 0, 0}};
+        const auto cumulativeHuge = generatedCumulativeArcLength(huge);
+        CHECK(std::isfinite(cumulativeHuge[1]));
+    }
+    // Malformed (unsorted, or NaN-masked) cumulative arcs are refused, not searched.
+    CHECK(generatedLinePositionAtArcLength({0.0, 20.0, 10.0, 30.0}, 15.0) == 0.0);
+    CHECK(generatedLinePositionAtArcLength({0.0, 20.0, NAN, 10.0, 30.0}, 15.0) == 0.0);
+    // Duplicate arc lengths (repeated points) invert to the FIRST position.
+    CHECK(generatedLinePositionAtArcLength({0.0, 10.0, 10.0, 20.0}, 10.0) == doctest::Approx(1.0));
+    CHECK(generatedLinePositionAtArcLength({0.0, 10.0, 10.0}, 10.0) == doctest::Approx(1.0));
+    CHECK(generatedLinePositionAtArcLength({0.0, 10.0, 10.0, 20.0}, 15.0) == doctest::Approx(2.5));
+
+    // Inconsistent metadata is clamped into the layout's invariants:
+    // decreasing arcs become nondecreasing, a zero total gives zero arcs.
+    {
+        const auto decreasing = generatedOverviewSettledLayout(
+            {control(1.0f, 0.0, 80.0, 100.0), control(2.0f, 10.0, 20.0, 100.0)}, settledLine);
+        CHECK(decreasing.anchors[1].arcLength >= decreasing.anchors[0].arcLength);
+        CHECK(decreasing.anchors[1].fraction >= decreasing.anchors[0].fraction);
+        const auto zeroTotal = generatedOverviewSettledLayout({control(1.0f, 0.0, 10.0, 0.0)}, settledLine);
+        CHECK(zeroTotal.anchors[0].arcLength == doctest::Approx(0.0));
+        CHECK(generatedOverviewArcLength(zeroTotal.anchors, 0.5, zeroTotal.totalArcLength) == doctest::Approx(0.0));
+        const auto negative = generatedOverviewSettledLayout({control(1.0f, 0.0, 10.0, -1.0)}, settledLine);
+        CHECK(negative.totalArcLength == doctest::Approx(0.0));
+        const auto frozenZero = generatedOverviewFrozenAnchors({}, {control(1.0f, 0.0, 10.0, 0.0)}, settledLine);
+        CHECK(frozenZero[0].arcLength == doctest::Approx(0.0));
+    }
+    // An anonymous anchor at the same point never shadows an identified control's own anchor.
+    {
+        std::vector<GeneratedOverviewAnchor> mixed = {{0, {5.0f, 0.0f, 0.0f}, 10.0, 10.0, 0.1},
+                                                      {12, {5.0f, 0.0f, 0.0f}, 80.0, 80.0, 0.8}};
+        auto identified = control(0.0f, 80.0, 80.0, 100.0);
+        identified.point = {5.0f, 0.0f, 0.0f};
+        identified.identity = 12;
+        CHECK(generatedOverviewFrozenAnchors(mixed, {identified}, settledLine)[0].fraction == doctest::Approx(0.8));
+    }
+
+    // Nothing known: arc-length fractions.
+    const auto none = generatedOverviewFrozenAnchors({}, {control(40.0f, 50.0, 50.0, 100.0)}, settledLine);
+    REQUIRE(none.size() == 1);
+    CHECK(none[0].fraction == doctest::Approx(0.5));
+
+    // Mapping by arc length agrees with the dots on a NON-uniformly sampled
+    // line: samples at arc 0, 40, 80, 100 (positions 0..3), controls at the
+    // ends; position 2 (arc 80) is at 0.8 both as a dot and as the marker.
+    const std::vector<cv::Vec3f> uneven{{0, 0, 0}, {40, 0, 0}, {80, 0, 0}, {100, 0, 0}};
+    const auto unevenLayout = generatedOverviewSettledLayout(
+        {control(1.0f, 0.0), control(3.0f, 3.0)}, uneven);
+    const auto cumulative = generatedCumulativeArcLength(uneven);
+    CHECK(generatedOverviewFraction(unevenLayout.anchors, generatedArcLengthAt(cumulative, 2.0), 100.0) ==
+          doctest::Approx(0.8));
+    const auto unevenDots = generatedOverviewFrozenAnchors(
+        unevenLayout.anchors, {control(1.0f, 0.0, 0.0, 100.0), control(9.0f, 2.0, 80.0, 100.0),
+                               control(3.0f, 3.0, 100.0, 100.0)}, uneven);
+    CHECK(unevenDots[1].fraction == doctest::Approx(0.8));
+    // ... and back: 0.8 of the bar is arc 80 is position 2.
+    CHECK(generatedLinePositionAtArcLength(
+              cumulative, generatedOverviewArcLength(unevenLayout.anchors, 0.8, 100.0)) ==
+          doctest::Approx(2.0));
+    CHECK(generatedLinePositionAtArcLength(cumulative, 60.0) == doctest::Approx(1.5));
+
+    // No anchors: plain arc-length fraction both ways; tails stretch.
+    CHECK(generatedOverviewFraction({}, 25.0, 100.0) == doctest::Approx(0.25));
+    CHECK(generatedOverviewArcLength({}, 0.25, 100.0) == doctest::Approx(25.0));
+    CHECK(generatedOverviewFraction(frozen, 100.5, 100.0) == doctest::Approx(1.0));
+    CHECK(generatedOverviewArcLength(frozen, 1.0, 100.0) == doctest::Approx(100.0));
+    CHECK(generatedOverviewFraction(frozen, NAN, 100.0) == 0.0);
+
+    // Arc length helpers: non-finite points add nothing, fractional positions interpolate.
+    std::vector<cv::Vec3f> broken = line(4, 2.0f);
+    broken[2] = {NAN, NAN, NAN};
+    CHECK(generatedCumulativeArcLength(broken) == std::vector<double>{0.0, 2.0, 2.0, 2.0});
+    CHECK(generatedArcLengthAt(generatedCumulativeArcLength(line(3, 2.0f)), 0.5) == doctest::Approx(1.0));
+}
+
+TEST_CASE("Display-space arc lengths: published controls are re-expressed on the displayed line")
+{
+    using namespace vc3d::line_annotation;
+    auto pendingAt = [](cv::Vec3f point, double arc, double position, uint64_t revision) {
+        GeneratedPendingPlacement p;
+        p.point = point;
+        p.anchor = point;
+        p.token = 1;
+        p.arcLength = arc;
+        p.linePosition = position;
+        p.lineRevision = revision;
+        return p;
+    };
+    auto control = [](float id, double linePosition, double arc, double total, uint64_t revision = 7) {
+        GeneratedOverlay::ControlPointMarker m;
+        m.point = {id, 0.0f, 0.0f};
+        m.identity = static_cast<uint64_t>(id);
+        m.linePosition = linePosition;
+        m.arcLength = arc;
+        m.lineArcLength = total;
+        m.lineRevision = revision;
+        return m;
+    };
+    // Displayed line (revision 6): 100 long, controls at 0, 60, 100 (identities 1, 2, 3).
+    GeneratedOverviewLayout displayed;
+    displayed.totalArcLength = 100.0;
+    displayed.anchors = {{1, {1.0f, 0.0f, 0.0f}, 0.0, 0.0, 0.0},
+                         {2, {2.0f, 0.0f, 0.0f}, 60.0, 60.0, 0.6},
+                         {3, {3.0f, 0.0f, 0.0f}, 100.0, 100.0, 1.0}};
+    // The user placed a point at displayed arc 45. The controller's splice
+    // through it (revision 7) is shorter: its arcs read 40 and 50 where the
+    // display has 45 and 60; the line's total became 90.
+    std::vector<GeneratedPendingPlacement> pending{pendingAt({9.0f, 0.0f, 0.0f}, 45.0, 45.0, 6)};
+    std::vector<GeneratedPendingPlacement> resolved;
+    const std::vector<GeneratedOverlay::ControlPointMarker> published{
+        control(1.0f, 0.0, 0.0, 90.0), control(9.0f, 4.0, 40.0, 90.0),
+        control(2.0f, 5.0, 50.0, 90.0), control(3.0f, 15.0, 90.0, 90.0)};
+    const auto display = generatedDisplaySpaceControlArcLengths(displayed, published, pending, resolved, 6);
+    REQUIRE(display.size() == 4);
+    CHECK(display[0].arcLength == doctest::Approx(0.0));
+    CHECK(display[1].arcLength == doctest::Approx(45.0));   // the recorded click, exactly
+    CHECK(display[2].arcLength == doctest::Approx(60.0));   // the displayed control, unmoved
+    CHECK(display[3].arcLength == doctest::Approx(100.0));
+    for (const auto& c : display) {
+        CHECK(c.lineArcLength == doctest::Approx(100.0));
+        CHECK(c.lineRevision == 6);                          // reads as the displayed line's now
+    }
+    CHECK(pending.empty());                                   // consumed ...
+    REQUIRE(resolved.size() == 1);                            // ... into the resolved list
+    CHECK(resolved[0].arcLength == doctest::Approx(45.0));
+    // An identical later publish (a link-state refresh, say) draws it in the
+    // same spot, from the resolved list, with nothing left to consume.
+    const auto again = generatedDisplaySpaceControlArcLengths(displayed, published, pending, resolved, 6);
+    CHECK(again[1].arcLength == doctest::Approx(45.0));
+    CHECK(resolved.size() == 1);
+
+    // A placement recorded for another displayed revision is ignored; the
+    // control is then interpolated by the ratio of its live arcs: 40/50 of
+    // 0..60 = 48, and that estimate is kept for later publishes too.
+    std::vector<GeneratedPendingPlacement> stale{pendingAt({9.0f, 0.0f, 0.0f}, 45.0, 45.0, 5)};
+    std::vector<GeneratedPendingPlacement> estimates;
+    const auto interpolated = generatedDisplaySpaceControlArcLengths(displayed, published, stale, estimates, 6);
+    CHECK(interpolated[1].arcLength == doctest::Approx(48.0));
+    CHECK(stale.size() == 1);
+    REQUIRE(estimates.size() == 1);
+    CHECK(estimates[0].arcLength == doctest::Approx(48.0));
+    const std::vector<GeneratedOverlay::ControlPointMarker> moved{
+        control(1.0f, 0.0, 0.0, 95.0), control(9.0f, 4.0, 44.0, 95.0),
+        control(2.0f, 5.0, 55.0, 95.0), control(3.0f, 15.0, 95.0, 95.0)};
+    CHECK(generatedDisplaySpaceControlArcLengths(displayed, moved, stale, estimates, 6)[1].arcLength ==
+          doctest::Approx(48.0));
+
+    // Two new controls close together (0.4 apart) with two placements: each
+    // takes its nearest, one placement per control.
+    std::vector<GeneratedPendingPlacement> two{pendingAt({9.0f, 0.0f, 0.0f}, 30.0, 30.0, 6), pendingAt({9.4f, 0.0f, 0.0f}, 80.0, 80.0, 6)};
+    std::vector<GeneratedPendingPlacement> twoResolved;
+    const std::vector<GeneratedOverlay::ControlPointMarker> pair{
+        control(1.0f, 0.0, 0.0, 90.0), control(9.0f, 3.0, 25.0, 90.0),
+        control(2.0f, 5.0, 50.0, 90.0), control(9.4f, 8.0, 75.0, 90.0), control(3.0f, 15.0, 90.0, 90.0)};
+    const auto both = generatedDisplaySpaceControlArcLengths(displayed, pair, two, twoResolved, 6);
+    CHECK(both[1].arcLength == doctest::Approx(30.0));
+    CHECK(both[3].arcLength == doctest::Approx(80.0));
+    CHECK(two.empty());
+    CHECK(twoResolved.size() == 2);
+    // Publishing only the second control: it takes ITS placement (the
+    // nearest point), not the first one recorded along the line.
+    {
+        std::vector<GeneratedPendingPlacement> twoAgain{
+            pendingAt({9.0f, 0.0f, 0.0f}, 30.0, 30.0, 6), pendingAt({9.4f, 0.0f, 0.0f}, 80.0, 80.0, 6)};
+        std::vector<GeneratedPendingPlacement> scratchAgain;
+        const auto onlySecond = generatedDisplaySpaceControlArcLengths(
+            displayed, {control(1.0f, 0.0, 0.0, 90.0), control(2.0f, 5.0, 50.0, 90.0),
+                        control(9.4f, 8.0, 75.0, 90.0), control(3.0f, 15.0, 90.0, 90.0)},
+            twoAgain, scratchAgain, 6);
+        CHECK(onlySecond[2].arcLength == doctest::Approx(80.0));
+        CHECK(twoAgain.size() == 1);
+    }
+    // Two new controls at ONE point (within tolerance) of a returning line,
+    // placements recorded at arcs 40 and 160: paired in line order with the
+    // placements in arc order, one each; a repeated publish keeps both.
+    {
+        std::vector<GeneratedPendingPlacement> twinPending{
+            pendingAt({50.0f, 0.0f, 0.0f}, 40.0, 40.0, 6), pendingAt({50.0f, 0.0005f, 0.0f}, 160.0, 160.0, 6)};
+        std::vector<GeneratedPendingPlacement> twinResolved;
+        GeneratedOverviewLayout longDisplayed;
+        longDisplayed.totalArcLength = 200.0;
+        longDisplayed.anchors = {{1, {1.0f, 0.0f, 0.0f}, 0.0, 0.0, 0.0},
+                                 {2, {2.0f, 0.0f, 0.0f}, 100.0, 100.0, 0.5},
+                                 {3, {3.0f, 0.0f, 0.0f}, 200.0, 200.0, 1.0}};
+        auto twinA = control(31.0f, 2.0, 35.0, 190.0);
+        twinA.point = {50.0f, 0.0f, 0.0f};
+        auto twinB = control(32.0f, 8.0, 150.0, 190.0);
+        twinB.point = {50.0f, 0.0005f, 0.0f};
+        const std::vector<GeneratedOverlay::ControlPointMarker> twins{
+            control(1.0f, 0.0, 0.0, 190.0), twinA, control(2.0f, 5.0, 95.0, 190.0), twinB,
+            control(3.0f, 15.0, 190.0, 190.0)};
+        const auto firstPublish = generatedDisplaySpaceControlArcLengths(longDisplayed, twins, twinPending, twinResolved, 6);
+        CHECK(firstPublish[1].arcLength == doctest::Approx(40.0));
+        CHECK(firstPublish[3].arcLength == doctest::Approx(160.0));
+        CHECK(twinPending.empty());
+        const auto secondPublish = generatedDisplaySpaceControlArcLengths(longDisplayed, twins, twinPending, twinResolved, 6);
+        CHECK(secondPublish[1].arcLength == doctest::Approx(40.0));
+        CHECK(secondPublish[3].arcLength == doctest::Approx(160.0));
+        CHECK(twinResolved.size() == 2);
+        CHECK(twinResolved[0].identity == 31);
+        CHECK(twinResolved[1].identity == 32);
+        // Without identities (identity 0) the resolved fallback by point is
+        // still one entry per control on the repeated publish.
+        auto twinA0 = twinA; twinA0.identity = 0;
+        auto twinB0 = twinB; twinB0.identity = 0;
+        std::vector<GeneratedPendingPlacement> noIdPending{
+            pendingAt({50.0f, 0.0f, 0.0f}, 40.0, 40.0, 6), pendingAt({50.0f, 0.0005f, 0.0f}, 160.0, 160.0, 6)};
+        std::vector<GeneratedPendingPlacement> noIdResolved;
+        const std::vector<GeneratedOverlay::ControlPointMarker> twins0{
+            control(1.0f, 0.0, 0.0, 190.0), twinA0, control(2.0f, 5.0, 95.0, 190.0), twinB0,
+            control(3.0f, 15.0, 190.0, 190.0)};
+        (void)generatedDisplaySpaceControlArcLengths(longDisplayed, twins0, noIdPending, noIdResolved, 6);
+        const auto repeat0 = generatedDisplaySpaceControlArcLengths(longDisplayed, twins0, noIdPending, noIdResolved, 6);
+        CHECK(repeat0[1].arcLength == doctest::Approx(40.0));
+        CHECK(repeat0[3].arcLength == doctest::Approx(160.0));
+        // An anonymous resolved entry at the same point never shadows an
+        // identified control's own resolved entry (and its provenance).
+        std::vector<GeneratedPendingPlacement> mixedResolved(2);
+        mixedResolved[0].point = {50.0f, 0.0f, 0.0f};
+        mixedResolved[0].arcLength = 10.0;
+        mixedResolved[0].lineRevision = 6;
+        mixedResolved[1].point = {50.0f, 0.0f, 0.0f};
+        mixedResolved[1].arcLength = 80.0;
+        mixedResolved[1].lineRevision = 6;
+        mixedResolved[1].identity = 31;
+        mixedResolved[1].fromPlacement = true;
+        std::vector<GeneratedPendingPlacement> noneLeft;
+        const auto mixed = generatedDisplaySpaceControlArcLengths(
+            longDisplayed, {control(1.0f, 0.0, 0.0, 190.0), twinA, control(3.0f, 15.0, 190.0, 190.0)},
+            noneLeft, mixedResolved, 6);
+        CHECK(mixed[1].arcLength == doctest::Approx(80.0));
+        CHECK(mixed[1].onLine);
+    }
+
+    // Past the displayed end: clamped to it; before the start: toward 0.
+    std::vector<GeneratedPendingPlacement> noPending, scratch;
+    const auto ext = generatedDisplaySpaceControlArcLengths(
+        displayed, {control(3.0f, 0.0, 100.0, 140.0), control(8.0f, 1.0, 110.0, 140.0)}, noPending, scratch, 6);
+    CHECK(ext[1].arcLength == doctest::Approx(100.0));
+    const auto pre = generatedDisplaySpaceControlArcLengths(
+        displayed, {control(7.0f, 0.0, 10.0, 100.0), control(1.0f, 1.0, 20.0, 100.0),
+                    control(2.0f, 2.0, 80.0, 100.0)}, noPending, scratch, 6);
+    CHECK(pre[0].arcLength == doctest::Approx(0.0));
+    CHECK(pre[1].arcLength == doctest::Approx(0.0));
+    CHECK(pre[2].arcLength == doctest::Approx(60.0));
+
+    // No displayed layout: controls are returned unchanged.
+    const auto same = generatedDisplaySpaceControlArcLengths({}, published, noPending, scratch, 6);
+    CHECK(same[1].arcLength == doctest::Approx(40.0));
+    CHECK(same[1].lineRevision == 7);
+
+    // A control this dialog placed (matched to its pending placement) is
+    // drawn on the displayed centre line at its placed-at arc, even when the
+    // click was across the strip (the solve pulls the line through it); a
+    // provisional control from elsewhere is judged against the displayed line.
+    std::vector<cv::Vec3f> displayedLine;
+    for (int i = 0; i <= 100; ++i) {
+        displayedLine.push_back({static_cast<float>(i), 0.0f, 0.0f});
+    }
+    auto offLine = control(9.0f, 4.0, 40.0, 90.0);
+    offLine.point = {45.0f, 10.0f, 0.0f};
+    offLine.onLine = true;
+    auto onLine = control(19.0f, 6.0, 55.0, 90.0);
+    onLine.point = {70.0f, 0.0f, 0.0f};
+    onLine.onLine = true;
+    std::vector<GeneratedPendingPlacement> twoMore{pendingAt({45.0f, 10.0f, 0.0f}, 45.0, 45.0, 6), pendingAt({70.0f, 0.0f, 0.0f}, 70.0, 70.0, 6)};
+    std::vector<GeneratedPendingPlacement> scratch2;
+    const auto judged = generatedDisplaySpaceControlArcLengths(
+        displayed, {control(1.0f, 0.0, 0.0, 90.0), offLine, control(2.0f, 5.0, 50.0, 90.0), onLine,
+                    control(3.0f, 15.0, 90.0, 90.0)},
+        twoMore, scratch2, 6, displayedLine);
+    CHECK(judged[1].arcLength == doctest::Approx(45.0));
+    CHECK(judged[1].onLine);
+    CHECK(judged[3].arcLength == doctest::Approx(70.0));
+    CHECK(judged[3].onLine);
+    // ... and still on a repeated publish, from the resolved entry's provenance.
+    const auto judgedAgain = generatedDisplaySpaceControlArcLengths(
+        displayed, {control(1.0f, 0.0, 0.0, 90.0), offLine, control(2.0f, 5.0, 50.0, 90.0), onLine,
+                    control(3.0f, 15.0, 90.0, 90.0)},
+        twoMore, scratch2, 6, displayedLine);
+    CHECK(judgedAgain[1].onLine);
+    CHECK(judgedAgain[1].arcLength == doctest::Approx(45.0));
+    // Provisional controls also learn their position on the displayed line,
+    // which the span pieces (gap, damaged) are drawn between.
+    CHECK(judged[1].displayedLinePosition == doctest::Approx(45.0));
+    CHECK(judged[3].displayedLinePosition == doctest::Approx(70.0));
+    {
+        auto owner = judged[1];
+        owner.hasGapToNext = true;
+        const auto ranges = generatedGapLineRanges({judged[0], owner, judged[2]});
+        REQUIRE(ranges.size() == 1);
+        CHECK(ranges[0].first == doctest::Approx(45.0));   // displayed, not the provisional index 4
+        CHECK(ranges[0].second == doctest::Approx(60.0));
+    }
+    // A provisional control from elsewhere (no placement of ours) that sits
+    // across the strip is NOT on the displayed line; one on it is.
+    {
+        auto acrossStrip = control(29.0f, 7.0, 60.0, 90.0);
+        acrossStrip.point = {80.0f, 3.0f, 0.0f};
+        acrossStrip.onLine = true;
+        auto onIt = control(28.0f, 6.0, 55.0, 90.0);
+        onIt.point = {65.0f, 0.0f, 0.0f};  // live 55 between live 50/90 -> displayed 60 + 0.125 * 40 = 65
+        onIt.onLine = false;
+        std::vector<GeneratedPendingPlacement> none2;
+        std::vector<GeneratedPendingPlacement> scratch3;
+        const auto judged2 = generatedDisplaySpaceControlArcLengths(
+            displayed, {control(1.0f, 0.0, 0.0, 90.0), control(2.0f, 5.0, 50.0, 90.0), onIt, acrossStrip,
+                        control(3.0f, 15.0, 90.0, 90.0)},
+            none2, scratch3, 6, displayedLine);
+        CHECK(judged2[2].onLine);
+        CHECK_FALSE(judged2[3].onLine);
+    }
+    CHECK(judged[2].onLine == false);  // untouched: a displayed control keeps the producer's flag (false by default here)
+}
+
+TEST_CASE("Strip grid column for an arc length follows the map's per-column arc lengths")
+{
+    using namespace vc3d::line_annotation;
+    vc::lasagna::LineStripPositionMap map;
+    map.originalArclengths = {0.0, 10.0, 20.0, 30.0};
+    map.stripGridArclengths = {0.0, 5.0, 10.0, 20.0, 30.0};  // uneven columns
+    map.totalArclength = 30.0;
+    map.stripGridSpacingBaseVoxels = 7.5;
+    map.stripGridColumnCount = 5;
+    REQUIRE(map.valid());
+    CHECK(generatedStripGridColumnForArcLength(map, 0.0) == doctest::Approx(0.0));
+    CHECK(generatedStripGridColumnForArcLength(map, 2.5) == doctest::Approx(0.5));
+    CHECK(generatedStripGridColumnForArcLength(map, 10.0) == doctest::Approx(2.0));
+    CHECK(generatedStripGridColumnForArcLength(map, 15.0) == doctest::Approx(2.5));
+    CHECK(generatedStripGridColumnForArcLength(map, 30.0) == doctest::Approx(4.0));
+    CHECK(generatedStripGridColumnForArcLength(map, -3.0) == doctest::Approx(0.0));
+    CHECK(generatedStripGridColumnForArcLength(map, 99.0) == doctest::Approx(4.0));
+    CHECK(std::isnan(generatedStripGridColumnForArcLength(map, NAN)));
+    CHECK(std::isnan(generatedStripGridColumnForArcLength(vc::lasagna::LineStripPositionMap{}, 1.0)));
+    // A malformed map (non-finite entry) is answered within bounds, never read past.
+    vc::lasagna::LineStripPositionMap broken = map;
+    broken.stripGridArclengths = {0.0, NAN};
+    broken.stripGridColumnCount = 2;
+    CHECK(std::isnan(generatedStripGridColumnForArcLength(broken, 5.0)));
+    broken.stripGridArclengths = {0.0, 20.0, 10.0, 30.0};
+    broken.stripGridColumnCount = 4;
+    CHECK(std::isnan(generatedStripGridColumnForArcLength(broken, 15.0)));
+    broken.stripGridArclengths = {0.0, 20.0, NAN, 10.0, 30.0};
+    broken.stripGridColumnCount = 5;
+    CHECK(std::isnan(generatedStripGridColumnForArcLength(broken, 15.0)));
+    broken.stripGridArclengths = {0.0, std::numeric_limits<double>::infinity(), 30.0};
+    broken.stripGridColumnCount = 3;
+    CHECK(std::isnan(generatedStripGridColumnForArcLength(broken, 15.0)));
+}
+
+TEST_CASE("Strip context index: provisional controls are kept by their displayed position")
+{
+    using namespace vc3d::line_annotation;
+    // Three displayed samples (positions 0..2); the controls' own indices
+    // {0, 5, 10} belong to the controller's longer line, their displayed
+    // positions {0, 1, 2} to the strip. All three stay in the index.
+    std::vector<GeneratedOverlay::ControlPointMarker> controls(3);
+    for (size_t i = 0; i < 3; ++i) {
+        controls[i].controlIndex = i;
+        controls[i].linePosition = 5.0 * static_cast<double>(i);
+        controls[i].displayedLinePosition = static_cast<double>(i);
+    }
+    vc::lasagna::LineStripPositionMap noMap;
+    const auto index = buildGeneratedStripContextIndex(controls, 3, noMap);
+    REQUIRE(index.controlIndices.size() == 3);
+    CHECK(index.gridColumns == std::vector<double>{0.0, 1.0, 2.0});
+}
+
 TEST_CASE("Clearing CP corrections leaves other controls and span metadata intact")
 {
     using namespace vc3d::line_annotation;
@@ -5313,4 +5811,130 @@ TEST_CASE("the JSON-level gap normalisation agrees with the typed sync")
     CHECK(!controls[0]["segment_to_next"].contains("tags"));
     CHECK(controls[1]["segment_to_next"]["tags"] == nlohmann::json::array({"gap"}));
     CHECK(controls[2]["segment_to_next"]["tags"] == nlohmann::json::array({"other"}));
+}
+
+TEST_CASE("Overview adoption gate: a publish alone never settles, the report does, requests hold")
+{
+    using namespace vc3d::line_annotation;
+    GeneratedOverviewGateState gate;
+    // First publish of a fiber: nothing to keep, adopt.
+    CHECK(generatedOverviewAdopts(gate));
+    gate.layoutEmpty = false;
+    // A placement publishes its spliced controls before the solve is queued:
+    // the publish marks the geometry unconfirmed, so no adoption on it ...
+    gate.geometryUnconfirmed = true;
+    CHECK_FALSE(generatedOverviewAdopts(gate));
+    // ... nor on the controller's report that a solve is pending / running.
+    gate.geometryUnconfirmed = false;
+    gate.solvePending = true;
+    CHECK_FALSE(generatedOverviewAdopts(gate));
+    gate.solvePending = false;
+    gate.solveRunning = true;
+    CHECK_FALSE(generatedOverviewAdopts(gate));
+    // The landing publishes (unconfirmed again) ...
+    gate.geometryUnconfirmed = true;
+    CHECK_FALSE(generatedOverviewAdopts(gate));
+    // ... and the report of an idle controller settles it.
+    gate.solveRunning = false;
+    gate.geometryUnconfirmed = false;
+    CHECK(generatedOverviewAdopts(gate));
+    // A landing epilogue still owing detached pending work reports pending.
+    gate.solvePending = true;
+    CHECK_FALSE(generatedOverviewAdopts(gate));
+    // In manual mode queued edits never dispatch: the spliced line is adopted.
+    gate.autoReoptimize = false;
+    CHECK(generatedOverviewAdopts(gate));
+    gate.autoReoptimize = true;
+    gate.solvePending = false;
+    // Controls re-expressed on the displayed line, or of another line, are
+    // never adopted, however idle the controller.
+    gate.controlsRebased = true;
+    CHECK_FALSE(generatedOverviewAdopts(gate));
+    gate.controlsRebased = false;
+    gate.controlsIndexDisplayedLine = false;
+    CHECK_FALSE(generatedOverviewAdopts(gate));
+    gate.controlsIndexDisplayedLine = true;
+    // A placement request of this dialog still out (its confirmation dialog
+    // open while another solve landed and reported idle) holds the layout
+    // it was made against; retiring the request releases it.
+    gate.placementOutstanding = true;
+    CHECK_FALSE(generatedOverviewAdopts(gate));
+    gate.placementOutstanding = false;
+    CHECK(generatedOverviewAdopts(gate));
+    // Rollback of a failed view installation restores the previous state's
+    // flags: the gate is a pure function of them, so the restored state
+    // decides the same way it did before.
+    GeneratedOverviewGateState before = gate;
+    before.geometryUnconfirmed = true;
+    GeneratedOverviewGateState restored = before;
+    CHECK(generatedOverviewAdopts(before) == generatedOverviewAdopts(restored));
+}
+
+TEST_CASE("Strip control column: revision-gated arc lengths agree with the builder's map")
+{
+    using namespace vc3d::line_annotation;
+    // The real strip map of the three-point line (x = 0, 10, 20), controls
+    // retained as supports at every point.
+    vc::lasagna::LineViewConfig config;
+    config.controlPointLinePositions = {0.0, 1.0, 2.0};
+    auto views = vc::lasagna::buildLineViewSurfaces(lineModel(), config);
+    auto& map = views.stripPositionMap;
+    REQUIRE(map.valid());
+    map.lineRevision = 5;
+    auto control = [](double linePosition, double arc, uint64_t revision) {
+        GeneratedOverlay::ControlPointMarker m;
+        m.linePosition = linePosition;
+        m.arcLength = arc;
+        m.lineArcLength = 20.0;
+        m.lineRevision = revision;
+        m.onLine = true;
+        return m;
+    };
+    // Matching revision: the arc-length column is the position's column, at
+    // the supports, at the endpoints and between them.
+    for (const double position : {0.0, 0.5, 1.0, 1.5, 2.0}) {
+        const double arc = position * 10.0;
+        CHECK(generatedStripControlGridColumn(control(position, arc, 5), map) ==
+              doctest::Approx(map.originalPositionToStripGridColumn(position)).epsilon(1e-6));
+    }
+    // A control whose arc and position disagree shows which path is taken:
+    // matching revision -> the arc; mismatched or unknown -> the position.
+    const auto disagreeing = [&](uint64_t revision) { return control(0.0, 20.0, revision); };
+    CHECK(generatedStripControlGridColumn(disagreeing(5), map) ==
+          doctest::Approx(map.originalPositionToStripGridColumn(2.0)));
+    CHECK(generatedStripControlGridColumn(disagreeing(6), map) ==
+          doctest::Approx(map.originalPositionToStripGridColumn(0.0)));
+    CHECK(generatedStripControlGridColumn(disagreeing(0), map) ==
+          doctest::Approx(map.originalPositionToStripGridColumn(0.0)));
+    // A map without a stamped revision (the dialog-less inspection panes)
+    // never takes the arc path.
+    auto unstamped = map;
+    unstamped.lineRevision = 0;
+    CHECK(generatedStripControlGridColumn(disagreeing(5), unstamped) ==
+          doctest::Approx(unstamped.originalPositionToStripGridColumn(0.0)));
+    // A provisional control re-expressed on the displayed line takes its
+    // displayed position for the fallback, not its own index.
+    auto provisional = control(7.0, 10.0, 6);
+    provisional.displayedLinePosition = 1.0;
+    CHECK(generatedStripControlGridColumn(provisional, map) ==
+          doctest::Approx(map.originalPositionToStripGridColumn(1.0)));
+    // Display scaling: the map of the line scaled by 0.5 is in display
+    // units, and so are the arc lengths the controller publishes.
+    auto scaled = lineModel();
+    for (auto& point : scaled.points) {
+        point.position *= 0.5;
+    }
+    for (auto& segment : scaled.segmentSamples) {
+        for (auto& sample : segment.samples) {
+            sample.position *= 0.5;
+        }
+    }
+    auto scaledViews = vc::lasagna::buildLineViewSurfaces(scaled, config);
+    auto& scaledMap = scaledViews.stripPositionMap;
+    REQUIRE(scaledMap.valid());
+    scaledMap.lineRevision = 5;
+    for (const double position : {0.0, 1.0, 1.5, 2.0}) {
+        CHECK(generatedStripControlGridColumn(control(position, position * 5.0, 5), scaledMap) ==
+              doctest::Approx(scaledMap.originalPositionToStripGridColumn(position)).epsilon(1e-6));
+    }
 }

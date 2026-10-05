@@ -118,6 +118,33 @@ struct GeneratedOverlay {
         std::vector<uint64_t> branchIds;
         std::vector<BranchLink> branchLinks;
         std::optional<cv::Vec3d> direction;
+        // Arc length from the line start to this control, and the whole
+        // line's arc length, both measured on the line the control's
+        // linePosition indexes (the session's live line, which may be a
+        // provisional splice the dialog does not hold yet). Non-finite when
+        // the producer did not know the line.
+        double arcLength = std::numeric_limits<double>::quiet_NaN();
+        double lineArcLength = std::numeric_limits<double>::quiet_NaN();
+        // The control's point lies on the line at its linePosition (every
+        // control except one edited off the line without re-optimization).
+        // On the strips such a control is drawn at its arc length along the
+        // strip's centre line, which stays right while the strip still shows
+        // the previous frame; an off-line control is drawn at its own point.
+        bool onLine = false;
+        // Revision of the line the marker's linePosition and arcLength index
+        // (the session's lineRevision); 0 when unknown. A control set whose
+        // revision differs from the displayed line's (GeneratedViews::
+        // lineRevision) indexes a line that is not on screen yet.
+        uint64_t lineRevision = 0;
+        // Session-lifetime identity of the control (LineControlPoint::
+        // identity); 0 when the producer has none. Views match controls
+        // across publishes by this, never by point or index.
+        uint64_t identity = 0;
+        // Set only while the marker's linePosition indexes a line other than
+        // the displayed one (a provisional publish, re-expressed on the
+        // displayed line): the control's position ON the displayed line, for
+        // everything that draws spans between controls on it.
+        double displayedLinePosition = std::numeric_limits<double>::quiet_NaN();
     };
 
     struct PredSnapMarker {
@@ -206,6 +233,12 @@ struct GeneratedOverlay {
     // Present for strip overlays. Line positions above remain in original
     // LineModel point-index coordinates and are mapped only while projecting.
     vc::lasagna::LineStripPositionMap stripPositionMap;
+    // Strip overlays: the surface to project through instead of the viewer's
+    // current one. Set while a strip still shows the frame of its previous
+    // surface (overlay swap pending): the viewer has already adopted the new
+    // surface, whose grid origin and scale differ, while what is on screen is
+    // the old one, so the held overlay must be placed through the held surface.
+    std::shared_ptr<QuadSurface> projectionSurface;
 };
 
 struct GeneratedSpanAlignmentMetric {
@@ -260,6 +293,8 @@ inline void scaleGeneratedMarkerForVolume(GeneratedOverlay::PredSnapMarker& mark
 }
 
 struct GeneratedViews {
+    // Revision of the line these views were built from; 0 when unknown.
+    uint64_t lineRevision = 0;
     double fiberWidth = 0.0; // Display-volume voxels, not persisted units.
     double fiberWidthGapFraction = vc::fiber_tracer::kDefaultFiberWidthGapFraction;
     double fiberBaseToVolumeScale = 1.0;
@@ -1423,11 +1458,17 @@ inline std::vector<std::pair<double, double>> generatedSpanLineRanges(
     std::sort(sorted.begin(), sorted.end(), [](const auto* a, const auto* b) {
         return a->linePosition < b->linePosition;
     });
+    // On the displayed line: a provisional publish's positions index the
+    // controller's line, which is not what the spans are drawn on.
+    const auto shownPosition = [](const GeneratedOverlay::ControlPointMarker& m) {
+        return std::isfinite(m.displayedLinePosition) ? m.displayedLinePosition : m.linePosition;
+    };
     std::vector<std::pair<double, double>> ranges;
     for (size_t i = 1; i < sorted.size(); ++i) {
-        if (ownerHasFlag(*sorted[i - 1]) &&
-            sorted[i - 1]->linePosition < sorted[i]->linePosition) {
-            ranges.emplace_back(sorted[i - 1]->linePosition, sorted[i]->linePosition);
+        const double first = shownPosition(*sorted[i - 1]);
+        const double second = shownPosition(*sorted[i]);
+        if (ownerHasFlag(*sorted[i - 1]) && first < second) {
+            ranges.emplace_back(first, second);
         }
     }
     return ranges;
@@ -1841,6 +1882,74 @@ struct GeneratedStripContextTarget {
 // control point belongs to that point, the middle half is the span.
 constexpr double kGeneratedStripContextControlFraction = 0.25;
 
+// A control's position on the DISPLAYED line: its displayedLinePosition
+// while it is a provisional control re-expressed on that line, else its own
+// linePosition (which then indexes the displayed line).
+// A table a binary search may run on: every entry finite and nondecreasing
+// (std::is_sorted alone lets interior NaNs through).
+inline bool generatedFiniteSortedTable(const std::vector<double>& table)
+{
+    for (size_t i = 0; i < table.size(); ++i) {
+        if (!std::isfinite(table[i]) || (i > 0 && table[i] < table[i - 1])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+inline double generatedShownLinePosition(const GeneratedOverlay::ControlPointMarker& control)
+{
+    return std::isfinite(control.displayedLinePosition) ? control.displayedLinePosition
+                                                        : control.linePosition;
+}
+
+// The strip grid column at an arc length along the centre line, from the
+// map's per-column arc lengths (nondecreasing); clamped to the strip.
+inline double generatedStripGridColumnForArcLength(
+    const vc::lasagna::LineStripPositionMap& positionMap,
+    double arcLength)
+{
+    const auto& arcs = positionMap.stripGridArclengths;
+    if (!positionMap.valid() || arcs.empty() || !std::isfinite(arcLength) ||
+        !generatedFiniteSortedTable(arcs)) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    if (arcLength <= arcs.front()) {
+        return 0.0;
+    }
+    if (arcLength >= arcs.back() || !std::isfinite(arcs.back())) {
+        return static_cast<double>(arcs.size() - 1);
+    }
+    const auto upper = std::upper_bound(arcs.begin(), arcs.end(), arcLength);
+    const size_t b = static_cast<size_t>(upper - arcs.begin());
+    if (b == 0 || b >= arcs.size()) {
+        // A map with non-finite or unsorted entries: no interpolation.
+        return b == 0 ? 0.0 : static_cast<double>(arcs.size() - 1);
+    }
+    const size_t a = b - 1;
+    const double span = arcs[b] - arcs[a];
+    const double t = span > 0.0 && std::isfinite(span) ? (arcLength - arcs[a]) / span : 0.0;
+    return static_cast<double>(a) + std::clamp(t, 0.0, 1.0);
+}
+
+// The strip grid column a control is drawn at on this map's strip: by arc
+// length when the control's arc length is measured on this map's line, else
+// by its position on the displayed line. The one mapping every strip-side
+// consumer (markers, hover zones, direction picking) must share.
+inline double generatedStripControlGridColumn(const GeneratedOverlay::ControlPointMarker& control,
+                                              const vc::lasagna::LineStripPositionMap& positionMap)
+{
+    if (std::isfinite(control.arcLength) && positionMap.valid() && control.lineRevision != 0 &&
+        control.lineRevision == positionMap.lineRevision) {
+        const double column = generatedStripGridColumnForArcLength(positionMap, control.arcLength);
+        if (std::isfinite(column)) {
+            return column;
+        }
+    }
+    const double shown = generatedShownLinePosition(control);
+    return positionMap.valid() ? positionMap.originalPositionToStripGridColumn(shown) : shown;
+}
+
 // The strip's controls in line order with the strip grid column of each
 // control's line position on the centre line: the space the click zones are
 // measured in. Grid columns are nondecreasing in line order by construction
@@ -1866,13 +1975,16 @@ inline GeneratedStripContextIndex buildGeneratedStripContextIndex(
     std::vector<std::pair<double, size_t>> ordered;
     for (size_t i = 0; i < controlPoints.size(); ++i) {
         const auto& control = controlPoints[i];
+        // Validity and the fallback column are judged on the displayed line
+        // (a provisional control's own index may lie beyond it).
+        const double shown = generatedShownLinePosition(control);
         if (control.controlIndex == std::numeric_limits<size_t>::max() ||
-            !validGeneratedLinePosition(control.linePosition, linePointCount)) {
+            !validGeneratedLinePosition(shown, linePointCount)) {
             continue;
         }
         const double column = positionMap.valid()
-            ? positionMap.originalPositionToStripGridColumn(control.linePosition)
-            : control.linePosition;
+            ? positionMap.originalPositionToStripGridColumn(shown)
+            : shown;
         if (!std::isfinite(column)) {
             continue;
         }
@@ -1884,9 +1996,8 @@ inline GeneratedStripContextIndex buildGeneratedStripContextIndex(
     index.controlIndices.reserve(ordered.size());
     index.gridColumns.reserve(ordered.size());
     for (const auto& [linePosition, i] : ordered) {
-        double column = positionMap.valid()
-            ? positionMap.originalPositionToStripGridColumn(linePosition)
-            : linePosition;
+        const auto& control = controlPoints[i];
+        double column = generatedStripControlGridColumn(control, positionMap);
         // Monotonic by construction; this only absorbs rounding in the map.
         if (!index.gridColumns.empty()) {
             column = std::max(column, index.gridColumns.back());
@@ -1939,6 +2050,712 @@ inline std::optional<GeneratedStripContextTarget> generatedStripContextTarget(
         return GeneratedStripContextTarget{Kind::ControlPoint, rank};
     }
     return GeneratedStripContextTarget{Kind::Span, rank - 1};
+}
+
+// ---- Overview bar layout --------------------------------------------------
+// The overview bar draws each control at a fraction of its width. While a
+// solve is running or queued the line the controller publishes runs ahead of
+// the one on screen (a placement publishes its spliced controls before any
+// landing, landings resample and regrow tails), so drawn from live positions
+// the dots wander until the end. The bar therefore keeps the FRACTIONS of
+// the last settled geometry, keyed by each control's volume point, and
+// everything is measured in ARC LENGTH on the displayed line: a control still
+// present keeps its fraction; a newly placed one is placed by its arc length
+// between its matched neighbours (which is where the current-position marker
+// stood when it was placed, see generatedDisplaySpaceControlArcLengths) and
+// keeps that fraction until the geometry settles; the marker, the gap and
+// damaged pieces and the bar's clicks map through the same anchors, by arc
+// length, so they agree with the dots whatever the line's sampling.
+struct GeneratedOverviewAnchor {
+    // The control's identity (ControlPointMarker::identity); 0 when the
+    // producer has none, then the point stands in for it.
+    uint64_t identity = 0;
+    cv::Vec3f point{std::numeric_limits<float>::quiet_NaN(),
+                    std::numeric_limits<float>::quiet_NaN(),
+                    std::numeric_limits<float>::quiet_NaN()};
+    // On the line the anchors were computed for.
+    double linePosition = 0.0;
+    // Arc length from that line's start to the control (display units).
+    double arcLength = 0.0;
+    // Across the bar, 0..1, nondecreasing in line order.
+    double fraction = 0.0;
+};
+
+struct GeneratedOverviewLayout {
+    std::vector<GeneratedOverviewAnchor> anchors;
+    // Arc length of the whole line the anchors belong to.
+    double totalArcLength = 0.0;
+
+    bool empty() const { return anchors.empty(); }
+};
+
+// Cumulative arc length per line point (non-finite points add nothing).
+inline std::vector<double> generatedCumulativeArcLength(const std::vector<cv::Vec3f>& linePoints)
+{
+    std::vector<double> cumulative(linePoints.size(), 0.0);
+    for (size_t i = 1; i < linePoints.size(); ++i) {
+        double step = 0.0;
+        if (finiteGeneratedPoint(linePoints[i]) && finiteGeneratedPoint(linePoints[i - 1])) {
+            // In double: float coordinates at the volume's scale overflow a
+            // float difference long before they are implausible.
+            const cv::Vec3d delta = cv::Vec3d(linePoints[i]) - cv::Vec3d(linePoints[i - 1]);
+            step = cv::norm(delta);
+            if (!std::isfinite(step)) {
+                step = 0.0;
+            }
+        }
+        cumulative[i] = cumulative[i - 1] + step;
+    }
+    return cumulative;
+}
+
+// Arc length at a (fractional) line position, clamped to the line.
+inline double generatedArcLengthAt(const std::vector<double>& cumulative, double linePosition)
+{
+    if (cumulative.empty() || !std::isfinite(linePosition)) {
+        return 0.0;
+    }
+    const double last = static_cast<double>(cumulative.size() - 1);
+    const double p = std::clamp(linePosition, 0.0, last);
+    const size_t a = static_cast<size_t>(std::floor(p));
+    const size_t b = std::min(a + 1, cumulative.size() - 1);
+    const double t = p - static_cast<double>(a);
+    return cumulative[a] * (1.0 - t) + cumulative[b] * t;
+}
+
+// The (fractional) line position at an arc length; flat stretches (repeated
+// points) resolve to their first position.
+inline double generatedLinePositionAtArcLength(const std::vector<double>& cumulative, double arcLength)
+{
+    if (cumulative.empty() || !std::isfinite(arcLength) || !generatedFiniteSortedTable(cumulative)) {
+        return 0.0;
+    }
+    if (arcLength <= cumulative.front()) {
+        return 0.0;
+    }
+    // First point whose arc length reaches `arcLength`: exactly on a point
+    // (or on a run of repeated points) that is the point itself, the first
+    // of the run; otherwise interpolate from the previous one.
+    const auto lower = std::lower_bound(cumulative.begin(), cumulative.end(), arcLength);
+    const size_t b = static_cast<size_t>(lower - cumulative.begin());
+    if (b >= cumulative.size()) {
+        return static_cast<double>(cumulative.size() - 1);
+    }
+    if (cumulative[b] == arcLength || b == 0) {
+        return static_cast<double>(b);
+    }
+    const size_t a = b - 1;
+    const double span = cumulative[b] - cumulative[a];
+    return static_cast<double>(a) + (span > 0.0 ? (arcLength - cumulative[a]) / span : 0.0);
+}
+
+namespace overview_detail {
+inline std::vector<const GeneratedOverlay::ControlPointMarker*> lineOrderedControls(
+    const std::vector<GeneratedOverlay::ControlPointMarker>& controls)
+{
+    std::vector<const GeneratedOverlay::ControlPointMarker*> ordered;
+    for (const auto& control : controls) {
+        if (std::isfinite(control.linePosition)) {
+            ordered.push_back(&control);
+        }
+    }
+    std::stable_sort(ordered.begin(), ordered.end(),
+                     [](const auto* a, const auto* b) { return a->linePosition < b->linePosition; });
+    return ordered;
+}
+inline bool samePoint(const cv::Vec3f& a, const cv::Vec3f& b)
+{
+    constexpr float kToleranceVx = 1.0e-3f;
+    return finiteGeneratedPoint(a) && finiteGeneratedPoint(b) &&
+           std::abs(a[0] - b[0]) <= kToleranceVx && std::abs(a[1] - b[1]) <= kToleranceVx &&
+           std::abs(a[2] - b[2]) <= kToleranceVx;
+}
+inline double lerp(double a, double b, double t)
+{
+    return a + (b - a) * std::clamp(t, 0.0, 1.0);
+}
+// A control's arc length: the one its producer measured, else measured on
+// `cumulative` (then assumed to be the control's line).
+inline double controlArcLength(const GeneratedOverlay::ControlPointMarker& control,
+                               const std::vector<double>& cumulative)
+{
+    return std::isfinite(control.arcLength) ? control.arcLength
+                                            : generatedArcLengthAt(cumulative, control.linePosition);
+}
+inline double lineArcLength(const std::vector<const GeneratedOverlay::ControlPointMarker*>& ordered,
+                            const std::vector<double>& cumulative)
+{
+    for (const auto* control : ordered) {
+        if (std::isfinite(control->lineArcLength)) {
+            return control->lineArcLength;
+        }
+    }
+    return cumulative.empty() ? 0.0 : cumulative.back();
+}
+inline double arcFraction(double arcLength, double totalArcLength)
+{
+    return totalArcLength > 0.0 ? std::clamp(arcLength / totalArcLength, 0.0, 1.0) : 0.0;
+}
+// The anchor for a control: by identity when both sides have one (exact,
+// one anchor per control); otherwise, for producers without identities, the
+// first unused anchor within tolerance of the point. Anchors already `used`
+// are skipped (one control per anchor).
+inline const GeneratedOverviewAnchor* findAnchor(const std::vector<GeneratedOverviewAnchor>& anchors,
+                                                 uint64_t identity,
+                                                 const cv::Vec3f& point,
+                                                 std::vector<bool>* used = nullptr)
+{
+    const GeneratedOverviewAnchor* best = nullptr;
+    size_t bestIndex = 0;
+    // Exact identity first, over all anchors; the point only stands in
+    // where one side has no identity (an anonymous anchor must not shadow
+    // an identified control's own anchor).
+    if (identity != 0) {
+        for (size_t i = 0; i < anchors.size(); ++i) {
+            if (used && i < used->size() && (*used)[i]) {
+                continue;
+            }
+            if (anchors[i].identity == identity) {
+                best = &anchors[i];
+                bestIndex = i;
+                break;
+            }
+        }
+    }
+    if (!best) {
+        for (size_t i = 0; i < anchors.size(); ++i) {
+            if (used && i < used->size() && (*used)[i]) {
+                continue;
+            }
+            if ((identity == 0 || anchors[i].identity == 0) && samePoint(anchors[i].point, point)) {
+                best = &anchors[i];
+                bestIndex = i;
+                break;
+            }
+        }
+    }
+    if (best && used) {
+        if (used->size() < anchors.size()) {
+            used->resize(anchors.size(), false);
+        }
+        (*used)[bestIndex] = true;
+    }
+    return best;
+}
+// Anchors fit for the piecewise mappings: finite, nondecreasing arc length
+// and fraction (an unfit anchor is dropped, order kept).
+inline std::vector<GeneratedOverviewAnchor> mappingAnchors(const std::vector<GeneratedOverviewAnchor>& anchors)
+{
+    std::vector<GeneratedOverviewAnchor> fit;
+    for (const auto& anchor : anchors) {
+        if (!std::isfinite(anchor.arcLength) || !std::isfinite(anchor.fraction)) {
+            continue;
+        }
+        GeneratedOverviewAnchor a = anchor;
+        if (!fit.empty()) {
+            a.arcLength = std::max(a.arcLength, fit.back().arcLength);
+            a.fraction = std::max(a.fraction, fit.back().fraction);
+        }
+        fit.push_back(a);
+    }
+    return fit;
+}
+} // namespace overview_detail
+
+// The layout of a settled geometry: every control at its arc-length fraction
+// of the line it indexes (`linePoints`, consistent with the controls in a
+// settled publish; the controls' own arc lengths take precedence).
+inline GeneratedOverviewLayout generatedOverviewSettledLayout(
+    const std::vector<GeneratedOverlay::ControlPointMarker>& controls,
+    const std::vector<cv::Vec3f>& linePoints)
+{
+    using namespace overview_detail;
+    GeneratedOverviewLayout layout;
+    const auto ordered = lineOrderedControls(controls);
+    const auto cumulative = generatedCumulativeArcLength(linePoints);
+    layout.totalArcLength = lineArcLength(ordered, cumulative);
+    if (!std::isfinite(layout.totalArcLength) || layout.totalArcLength < 0.0) {
+        layout.totalArcLength = 0.0;
+    }
+    for (const auto* control : ordered) {
+        double arc = controlArcLength(*control, cumulative);
+        if (!std::isfinite(arc)) {
+            continue;
+        }
+        // Invariants the mappings rely on: arcs within the line and
+        // nondecreasing in line order (inconsistent metadata is clamped).
+        arc = std::clamp(arc, 0.0, std::max(layout.totalArcLength, 0.0));
+        if (!layout.anchors.empty()) {
+            arc = std::max(arc, layout.anchors.back().arcLength);
+        }
+        layout.anchors.push_back({control->identity, control->point, control->linePosition, arc,
+                                  arcFraction(arc, layout.totalArcLength)});
+    }
+    return layout;
+}
+
+// An arc length's fraction across the bar: piecewise linear in arc length
+// through the anchors (sorted by arc length), the tails stretched to the
+// bar's ends; without anchors the plain arc-length fraction.
+inline double generatedOverviewFraction(const std::vector<GeneratedOverviewAnchor>& rawAnchors,
+                                        double arcLength,
+                                        double totalArcLength)
+{
+    using namespace overview_detail;
+    if (!std::isfinite(arcLength)) {
+        return 0.0;
+    }
+    if (!std::isfinite(totalArcLength)) {
+        totalArcLength = 0.0;
+    }
+    const auto anchors = mappingAnchors(rawAnchors);
+    if (anchors.empty()) {
+        return arcFraction(arcLength, totalArcLength);
+    }
+    const auto& first = anchors.front();
+    const auto& last = anchors.back();
+    if (arcLength <= first.arcLength) {
+        return first.arcLength > 0.0 ? lerp(0.0, first.fraction, arcLength / first.arcLength)
+                                     : first.fraction;
+    }
+    if (arcLength >= last.arcLength) {
+        const double span = totalArcLength - last.arcLength;
+        return span > 0.0 ? lerp(last.fraction, 1.0, (arcLength - last.arcLength) / span)
+                          : last.fraction;
+    }
+    const auto upper = std::upper_bound(
+        anchors.begin(), anchors.end(), arcLength,
+        [](double value, const GeneratedOverviewAnchor& anchor) { return value < anchor.arcLength; });
+    const auto& b = *upper;
+    const auto& a = *(upper - 1);
+    const double span = b.arcLength - a.arcLength;
+    return span > 0.0 ? lerp(a.fraction, b.fraction, (arcLength - a.arcLength) / span) : a.fraction;
+}
+
+// The inverse: the arc length drawn at `fraction` of the bar.
+inline double generatedOverviewArcLength(const std::vector<GeneratedOverviewAnchor>& rawAnchors,
+                                         double fraction,
+                                         double totalArcLength)
+{
+    using namespace overview_detail;
+    if (!std::isfinite(fraction)) {
+        return 0.0;
+    }
+    if (!std::isfinite(totalArcLength)) {
+        totalArcLength = 0.0;
+    }
+    fraction = std::clamp(fraction, 0.0, 1.0);
+    const auto anchors = mappingAnchors(rawAnchors);
+    if (anchors.empty()) {
+        return fraction * std::max(totalArcLength, 0.0);
+    }
+    const auto& first = anchors.front();
+    const auto& last = anchors.back();
+    if (fraction <= first.fraction) {
+        return first.fraction > 0.0 ? lerp(0.0, first.arcLength, fraction / first.fraction)
+                                    : first.arcLength;
+    }
+    if (fraction >= last.fraction) {
+        const double span = 1.0 - last.fraction;
+        return span > 0.0 ? lerp(last.arcLength, totalArcLength, (fraction - last.fraction) / span)
+                          : last.arcLength;
+    }
+    const auto upper = std::upper_bound(
+        anchors.begin(), anchors.end(), fraction,
+        [](double value, const GeneratedOverviewAnchor& anchor) { return value < anchor.fraction; });
+    const auto& b = *upper;
+    const auto& a = *(upper - 1);
+    const double span = b.fraction - a.fraction;
+    return span > 0.0 ? lerp(a.arcLength, b.arcLength, (fraction - a.fraction) / span) : a.arcLength;
+}
+
+// The anchors while the geometry is in flight. `known` holds fractions by
+// control point (the settled layout's, plus the fractions already given to
+// controls placed since). A control found there keeps its fraction. Any
+// other gets its first fraction from `positionMapping` when given: the
+// anchors the current-position marker maps through (the displayed line's
+// controls with their known fractions), so a new control lands exactly where
+// the marker stood at its arc length, even when it replaces a control whose
+// anchor it does not inherit. Without a mapping it is placed between its
+// nearest known line-order neighbours by the ratio of ARC LENGTHS (the
+// controls' arc lengths must all be on one line: the displayed line, see
+// generatedDisplaySpaceControlArcLengths), toward the line's start before
+// the first known control and toward its end past the last; with nothing
+// known at all, at its arc-length fraction. Fractions are made nondecreasing
+// in line order.
+inline std::vector<GeneratedOverviewAnchor> generatedOverviewFrozenAnchors(
+    const std::vector<GeneratedOverviewAnchor>& known,
+    const std::vector<GeneratedOverlay::ControlPointMarker>& controls,
+    const std::vector<cv::Vec3f>& linePoints,
+    const std::vector<GeneratedOverviewAnchor>* positionMapping = nullptr)
+{
+    using namespace overview_detail;
+    const auto ordered = lineOrderedControls(controls);
+    const auto cumulative = generatedCumulativeArcLength(linePoints);
+    double total = lineArcLength(ordered, cumulative);
+    if (!std::isfinite(total) || total < 0.0) {
+        total = 0.0;
+    }
+    std::vector<GeneratedOverviewAnchor> anchors(ordered.size());
+    std::vector<bool> matched(ordered.size(), false);
+    std::vector<bool> usedKnown(known.size(), false);
+    for (size_t i = 0; i < ordered.size(); ++i) {
+        anchors[i].identity = ordered[i]->identity;
+        anchors[i].point = ordered[i]->point;
+        anchors[i].linePosition = ordered[i]->linePosition;
+        double arc = controlArcLength(*ordered[i], cumulative);
+        if (!std::isfinite(arc)) {
+            arc = i > 0 ? anchors[i - 1].arcLength : 0.0;
+        }
+        arc = std::clamp(arc, 0.0, total);
+        anchors[i].arcLength = i > 0 ? std::max(arc, anchors[i - 1].arcLength) : arc;
+        if (const auto* anchor = findAnchor(known, ordered[i]->identity, ordered[i]->point, &usedKnown)) {
+            anchors[i].fraction = anchor->fraction;
+            matched[i] = true;
+        }
+    }
+    for (size_t i = 0; i < anchors.size(); ++i) {
+        if (matched[i]) {
+            continue;
+        }
+        const double arc = anchors[i].arcLength;
+        if (positionMapping && !positionMapping->empty()) {
+            anchors[i].fraction = generatedOverviewFraction(*positionMapping, arc, total);
+            continue;
+        }
+        std::optional<size_t> prev;
+        std::optional<size_t> next;
+        for (size_t j = i; j-- > 0;) {
+            if (matched[j]) { prev = j; break; }
+        }
+        for (size_t j = i + 1; j < anchors.size(); ++j) {
+            if (matched[j]) { next = j; break; }
+        }
+        if (prev && next) {
+            const double span = anchors[*next].arcLength - anchors[*prev].arcLength;
+            anchors[i].fraction = span > 0.0
+                ? lerp(anchors[*prev].fraction, anchors[*next].fraction,
+                       (arc - anchors[*prev].arcLength) / span)
+                : anchors[*prev].fraction;
+        } else if (prev) {
+            const double span = total - anchors[*prev].arcLength;
+            anchors[i].fraction = span > 0.0
+                ? lerp(anchors[*prev].fraction, 1.0, (arc - anchors[*prev].arcLength) / span)
+                : anchors[*prev].fraction;
+        } else if (next) {
+            const double span = anchors[*next].arcLength;
+            anchors[i].fraction = span > 0.0
+                ? lerp(0.0, anchors[*next].fraction, arc / span)
+                : anchors[*next].fraction;
+        } else {
+            anchors[i].fraction = arcFraction(arc, total);
+        }
+    }
+    for (size_t i = 0; i < anchors.size(); ++i) {
+        anchors[i].fraction = std::clamp(anchors[i].fraction, 0.0, 1.0);
+        if (i > 0) {
+            anchors[i].fraction = std::max(anchors[i].fraction, anchors[i - 1].fraction);
+        }
+    }
+    return anchors;
+}
+
+// When the overview bar may adopt the live geometry as its settled layout.
+// Every publish precedes the controller's report on it, so a publish alone
+// never counts as settled; a placement request of the dialog that is still
+// out keeps the layout it was made against; controls re-expressed on the
+// displayed line, or indexing another line, are never a layout.
+struct GeneratedOverviewGateState {
+    bool layoutEmpty = true;
+    bool controlsRebased = false;
+    bool controlsIndexDisplayedLine = true;
+    bool solveRunning = false;
+    bool solvePending = false;
+    bool autoReoptimize = true;
+    bool geometryUnconfirmed = false;
+    bool placementOutstanding = false;
+};
+
+inline bool generatedOverviewGeometryInFlight(const GeneratedOverviewGateState& gate)
+{
+    // Queued edits only ever dispatch in auto mode; in manual mode the
+    // spliced line is the geometry until the user asks for a solve.
+    return gate.solveRunning || (gate.solvePending && gate.autoReoptimize);
+}
+
+inline bool generatedOverviewAdopts(const GeneratedOverviewGateState& gate)
+{
+    if (gate.controlsRebased || !gate.controlsIndexDisplayedLine) {
+        return false;
+    }
+    if (gate.layoutEmpty) {
+        return true;
+    }
+    return !generatedOverviewGeometryInFlight(gate) && !gate.geometryUnconfirmed &&
+           !gate.placementOutstanding;
+}
+
+// A control point placement the dialog has requested but whose publish has
+// not arrived: the point it asked for, the arc length (on the line the
+// dialog showed, revision `lineRevision`) of the position it was placed at,
+// the current-position marker's spot.
+struct GeneratedPendingPlacement {
+    cv::Vec3f point{std::numeric_limits<float>::quiet_NaN(),
+                    std::numeric_limits<float>::quiet_NaN(),
+                    std::numeric_limits<float>::quiet_NaN()};
+    // The point ON the displayed line at the placed-at position: what the
+    // request is re-placed through on a later displayed line (the clicked
+    // point may sit across the strip, nearest to another pass of the line).
+    cv::Vec3f anchor{std::numeric_limits<float>::quiet_NaN(),
+                     std::numeric_limits<float>::quiet_NaN(),
+                     std::numeric_limits<float>::quiet_NaN()};
+    // The request this entry belongs to; retired when the request returns
+    // without having placed a control (rejected, failed), so no later
+    // control can take its arc length.
+    uint64_t token = 0;
+    double arcLength = std::numeric_limits<double>::quiet_NaN();
+    // The placed-at position on that same displayed line (to re-place the
+    // request on a later displayed line through its 3D point).
+    double linePosition = std::numeric_limits<double>::quiet_NaN();
+    // The overview bar fraction the marker stood at when the request was
+    // made: the control's fraction until the geometry settles, whatever
+    // landings do to the mapping meanwhile. NaN when unknown.
+    double fraction = std::numeric_limits<double>::quiet_NaN();
+    uint64_t lineRevision = 0;
+    // Resolved entries only: the control that took this arc length, and
+    // whether it came from a placement of this dialog (drawn on the centre
+    // line) rather than from an estimate.
+    uint64_t identity = 0;
+    bool fromPlacement = false;
+};
+
+// Re-expresses controls published for a line that is NOT on screen (their
+// lineRevision differs from `displayedRevision`) in the DISPLAYED line's
+// arc-length space, `displayed` being that line's layout: a control present
+// there takes its displayed arc length; a control resolved by an earlier
+// publish (`resolved`, by its own point, for this displayed revision) takes
+// the arc length it was given then; a control the dialog asked to place
+// takes the recorded arc length of the spot it was placed at (the nearest
+// pending placement within tolerance, recorded for this displayed revision;
+// consumed into `resolved` under the control's point, so no other control
+// can claim it and the control keeps it across later publishes); any other
+// control is interpolated between its nearest resolved line-order neighbours
+// by the ratio of its own live arc lengths (and recorded in `resolved` too).
+// Arc lengths are made nondecreasing in line order, lineArcLength becomes
+// the displayed total and lineRevision the displayed revision: the controls
+// then read as the displayed line's.
+inline std::vector<GeneratedOverlay::ControlPointMarker> generatedDisplaySpaceControlArcLengths(
+    const GeneratedOverviewLayout& displayed,
+    std::vector<GeneratedOverlay::ControlPointMarker> controls,
+    std::vector<GeneratedPendingPlacement>& pending,
+    std::vector<GeneratedPendingPlacement>& resolved,
+    uint64_t displayedRevision,
+    const std::vector<cv::Vec3f>& displayedLinePoints = {})
+{
+    using namespace overview_detail;
+    if (displayed.empty()) {
+        return controls;
+    }
+    const double displayedTotal =
+        std::isfinite(displayed.totalArcLength) ? std::max(displayed.totalArcLength, 0.0) : 0.0;
+    // `onLine` was judged on the controller's line. A control not already on
+    // the displayed line (a new one) is on the displayed centre line only if
+    // the displayed point at its displayed arc length is where it is; off it
+    // (a click across the strip) its own point must be drawn, not the line.
+    const auto displayedCumulative = generatedCumulativeArcLength(displayedLinePoints);
+    std::vector<size_t> order;
+    for (size_t i = 0; i < controls.size(); ++i) {
+        if (std::isfinite(controls[i].linePosition)) {
+            order.push_back(i);
+        }
+    }
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        return controls[a].linePosition < controls[b].linePosition;
+    });
+    std::vector<double> liveArc(order.size()), displayArc(order.size(), 0.0);
+    std::vector<bool> resolvedHere(order.size(), false);
+    std::vector<bool> usedDisplayed(displayed.anchors.size(), false);
+    std::vector<bool> usedResolved(resolved.size(), false);
+    std::vector<bool> fromPlacement(order.size(), false);
+    double liveTotal = std::numeric_limits<double>::quiet_NaN();
+    for (size_t k = 0; k < order.size(); ++k) {
+        const auto& control = controls[order[k]];
+        liveArc[k] = control.arcLength;
+        if (std::isfinite(control.lineArcLength) && !std::isfinite(liveTotal)) {
+            liveTotal = control.lineArcLength;
+        }
+        if (const auto* anchor = findAnchor(displayed.anchors, control.identity, control.point, &usedDisplayed)) {
+            displayArc[k] = anchor->arcLength;
+            resolvedHere[k] = true;
+            continue;
+        }
+        // Resolved earlier in this flight: exact identity first, over all
+        // entries; the point stands in only where one side is anonymous (an
+        // anonymous entry must not shadow an identified control's own).
+        const auto takeResolved = [&](size_t r) {
+            displayArc[k] = resolved[r].arcLength;
+            resolvedHere[k] = true;
+            fromPlacement[k] = resolved[r].fromPlacement;
+            usedResolved[r] = true;
+        };
+        const auto eligible = [&](size_t r) {
+            return !usedResolved[r] && resolved[r].lineRevision == displayedRevision &&
+                   std::isfinite(resolved[r].arcLength);
+        };
+        if (control.identity != 0) {
+            for (size_t r = 0; r < resolved.size() && !resolvedHere[k]; ++r) {
+                if (eligible(r) && resolved[r].identity == control.identity) {
+                    takeResolved(r);
+                }
+            }
+        }
+        for (size_t r = 0; r < resolved.size() && !resolvedHere[k]; ++r) {
+            if (eligible(r) && (control.identity == 0 || resolved[r].identity == 0) &&
+                samePoint(resolved[r].point, control.point)) {
+                takeResolved(r);
+            }
+        }
+    }
+    // Pending placements: controls still unresolved, in line order, take the
+    // nearest placement within tolerance of their point (ties: the one
+    // recorded first along the line, so two controls at one point of a
+    // returning line get their own), one placement each.
+    {
+        std::vector<size_t> candidates;
+        for (size_t p = 0; p < pending.size(); ++p) {
+            if (pending[p].lineRevision == displayedRevision && std::isfinite(pending[p].arcLength) &&
+                finiteGeneratedPoint(pending[p].point)) {
+                candidates.push_back(p);
+            }
+        }
+        std::stable_sort(candidates.begin(), candidates.end(), [&](size_t a, size_t b) {
+            return pending[a].arcLength < pending[b].arcLength;
+        });
+        std::vector<bool> taken(pending.size(), false);
+        for (size_t k = 0; k < order.size(); ++k) {
+            if (resolvedHere[k]) {
+                continue;
+            }
+            const auto& control = controls[order[k]];
+            if (!finiteGeneratedPoint(control.point)) {
+                continue;
+            }
+            constexpr float kPlacementToleranceVx = 0.5f;
+            std::optional<size_t> best;
+            float bestDistanceSq = kPlacementToleranceVx * kPlacementToleranceVx;
+            for (size_t p : candidates) {
+                if (taken[p]) {
+                    continue;
+                }
+                const cv::Vec3f delta = pending[p].point - control.point;
+                const float distanceSq = delta.dot(delta);
+                if (distanceSq < bestDistanceSq || (!best && distanceSq <= bestDistanceSq)) {
+                    bestDistanceSq = distanceSq;
+                    best = p;
+                }
+            }
+            if (best) {
+                const size_t p = *best;
+                displayArc[k] = pending[p].arcLength;
+                resolvedHere[k] = true;
+                fromPlacement[k] = true;
+                taken[p] = true;
+                GeneratedPendingPlacement done = pending[p];
+                done.point = control.point;
+                done.lineRevision = displayedRevision;
+                done.identity = control.identity;
+                done.fromPlacement = true;
+                resolved.push_back(done);
+            }
+        }
+        for (size_t p = pending.size(); p-- > 0;) {
+            if (taken[p]) {
+                pending.erase(pending.begin() + static_cast<std::ptrdiff_t>(p));
+            }
+        }
+    }
+    std::vector<bool> interpolated(order.size(), false);
+    for (size_t k = 0; k < order.size(); ++k) {
+        if (resolvedHere[k]) {
+            continue;
+        }
+        interpolated[k] = true;
+        std::optional<size_t> prev;
+        std::optional<size_t> next;
+        for (size_t j = k; j-- > 0;) {
+            if (resolvedHere[j]) { prev = j; break; }
+        }
+        for (size_t j = k + 1; j < order.size(); ++j) {
+            if (resolvedHere[j]) { next = j; break; }
+        }
+        const bool haveLive = std::isfinite(liveArc[k]);
+        if (prev && haveLive && std::isfinite(liveArc[*prev])) {
+            const double liveSpan = next && std::isfinite(liveArc[*next])
+                ? liveArc[*next] - liveArc[*prev]
+                : (std::isfinite(liveTotal) ? liveTotal - liveArc[*prev] : 0.0);
+            const double displayTo = next ? displayArc[*next] : displayedTotal;
+            displayArc[k] = liveSpan > 0.0
+                ? lerp(displayArc[*prev], displayTo, (liveArc[k] - liveArc[*prev]) / liveSpan)
+                : displayArc[*prev];
+        } else if (next && haveLive && std::isfinite(liveArc[*next])) {
+            const double liveSpan = liveArc[*next];
+            displayArc[k] = liveSpan > 0.0
+                ? lerp(displayArc[*next], 0.0, (liveArc[*next] - liveArc[k]) / liveSpan)
+                : displayArc[*next];
+        } else {
+            displayArc[k] = std::isfinite(liveArc[k]) ? liveArc[k] : 0.0;
+        }
+    }
+    for (size_t k = 0; k < order.size(); ++k) {
+        displayArc[k] = std::isfinite(displayArc[k]) ? std::clamp(displayArc[k], 0.0, displayedTotal) : 0.0;
+        if (k > 0) {
+            displayArc[k] = std::max(displayArc[k], displayArc[k - 1]);
+        }
+        auto& control = controls[order[k]];
+        control.arcLength = displayArc[k];
+        control.lineArcLength = displayedTotal;
+        control.lineRevision = displayedRevision;
+        if (fromPlacement[k]) {
+            // (see below: placed by this dialog, drawn on the centre line)
+            control.onLine = true;
+        }
+        if (!displayedCumulative.empty()) {
+            control.displayedLinePosition =
+                generatedLinePositionAtArcLength(displayedCumulative, displayArc[k]);
+            if (fromPlacement[k]) {
+                // A control this dialog placed is drawn ON the displayed
+                // centre line at the spot it was placed at: the solve now
+                // running pulls the line through the point, so that is where
+                // it ends up along the line; its across-strip offset is a
+                // transient the stale strip cannot show faithfully anyway
+                // (and the 3D projection onto that strip fails too often to
+                // be relied on for it).
+                control.onLine = true;
+            } else if (!findAnchor(displayed.anchors, control.identity, control.point) &&
+                       finiteGeneratedPoint(control.point)) {
+                // A provisional control from elsewhere: on the displayed
+                // centre line only if the displayed point at its displayed
+                // arc is (about) where it is.
+                const cv::Vec3f onDisplayed = interpolatedGeneratedLinePoint(
+                    displayedLinePoints, control.displayedLinePosition);
+                constexpr float kOnLineToleranceVx = 0.5f;
+                control.onLine = finiteGeneratedPoint(onDisplayed) &&
+                                 cv::norm(control.point - onDisplayed) <= kOnLineToleranceVx;
+            }
+        }
+        if (interpolated[k] && finiteGeneratedPoint(control.point)) {
+            // Keep the estimate: a later publish of the same control must
+            // not re-estimate it from arc lengths that moved meanwhile.
+            GeneratedPendingPlacement estimate;
+            estimate.point = control.point;
+            estimate.arcLength = displayArc[k];
+            estimate.linePosition = control.displayedLinePosition;
+            estimate.lineRevision = displayedRevision;
+            estimate.identity = control.identity;
+            resolved.push_back(estimate);
+        }
+    }
+    return controls;
 }
 
 struct GeneratedControlPointContextMenuOptions {
