@@ -1,6 +1,8 @@
 """Model crops from another CT level (FiberVolumeSpec.crop_ct_level) while frames/seed headings keep ct_level."""
 import json
 
+import pytest
+
 import numpy as np
 import torch
 
@@ -59,3 +61,20 @@ def test_level1_dataset_config_moves_only_model_crops():
         assert {k: v for k, v in b.items() if not k.startswith('crop_ct_')} == a
         assert b['crop_ct_level'] == a.get('ct_level', 0)+1
         assert b['crop_ct_grid_scale'] == 2*a.get('ct_grid_scale', 4. if a['kind'] == 'paris4' else 1.)
+
+
+def test_resume_may_append_sources_only_when_asked():
+    from vesuvius.neural_tracing.fiber_follow.data.datasets import validate_dataset_resume
+    source = dict(name='a', kind='afv', weight=.5, ct='x', validation={})
+    recorded = dict(version=1, cache_dir='c', sources=[source])
+    checkpoint = dict(dataset_config=recorded, dataset_config_sha256='old')
+    added = dict(version=1, cache_dir='elsewhere', sources=[dict(source, weight=.25), dict(source, name='b', weight=.25)])
+    validate_dataset_resume(checkpoint, added, 'new', allow_added=True)
+    for bad in (dict(added, sources=added['sources'][::-1]),                                  # reordered
+                dict(added, sources=[dict(source, ct='y'), added['sources'][1]]),             # changed source
+                dict(added, version=2),                                                       # changed document
+                dict(added, sources=[dict(source, weight=.25)])):                             # nothing appended
+        with pytest.raises(ValueError):
+            validate_dataset_resume(checkpoint, bad, 'new', allow_added=True)
+    with pytest.raises(ValueError):
+        validate_dataset_resume(checkpoint, added, 'new')

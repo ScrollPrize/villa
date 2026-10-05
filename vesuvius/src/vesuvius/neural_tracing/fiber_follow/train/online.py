@@ -72,7 +72,7 @@ class OnlineCollector:
     """
     def __init__(self, directory, fibers, val_z, device, every=1000, fibers_per_collection=64,
                  batch=8, forward_chunk=0, seed=0, replay_keep=4, initial=(), trace_len=768.,
-                 before=48., after=64., stride=16., confidence=None, n_commit=None,
+                 before=48., after=64., stride=16., confidence=None, n_commit=None, gate=None,
                  collector_module='vesuvius.neural_tracing.fiber_follow.tracing.collect', extra_args=(), threads=4,
                  length_power=0.):
         self.directory = Path(directory).resolve()
@@ -83,7 +83,7 @@ class OnlineCollector:
         self.every, self.fibers_per_collection, self.batch = every, fibers_per_collection, batch
         self.forward_chunk, self.seed, self.replay_keep = forward_chunk, seed, replay_keep
         self.trace_len, self.before, self.after, self.stride = trace_len, before, after, stride
-        self.confidence, self.n_commit = confidence, n_commit
+        self.confidence, self.n_commit, self.gate = confidence, n_commit, gate
         self.collector_module = collector_module
         if threads < 1:
             raise ValueError('Positive collector thread count required')
@@ -102,7 +102,7 @@ class OnlineCollector:
                     threads=self.threads, forward_chunk=self.forward_chunk, trace_len=self.trace_len, before=self.before,
                     after=self.after, stride=self.stride, replay_keep=self.replay_keep,
                     confidence=self.confidence, n_commit=self.n_commit, exploration='none',
-                    length_power=self.length_power)
+                    length_power=self.length_power, **({} if self.gate is None else dict(gate=self.gate)))
 
     def due(self, step):
         return bool(self.every) and step % self.every == 0
@@ -154,7 +154,7 @@ class OnlineCollector:
             command += ['--coverage-state', str(self.coverage)]
         if self.length_power:
             command += ['--length-power', str(self.length_power)]
-        for flag, value in (('--confidence', self.confidence), ('--n-commit', self.n_commit)):
+        for flag, value in (('--confidence', self.confidence), ('--n-commit', self.n_commit), ('--gate', self.gate)):
             if value is not None:
                 command += [flag, str(value)]
         self.log = self.output.with_suffix('.log').open('w')

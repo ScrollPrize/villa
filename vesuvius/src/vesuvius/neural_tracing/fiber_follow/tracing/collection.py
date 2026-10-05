@@ -317,6 +317,7 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer, bank_loader=
     ap.add_argument('--stride', type=float, default=16., help='Travel between kept ordinary following decisions')
     ap.add_argument('--confidence', type=float, help='Default: the checkpoint operating policy')
     ap.add_argument('--n-commit', type=int, help='Default: the checkpoint operating policy')
+    ap.add_argument('--gate', choices=('full', 'prefix'), help='Commit gate. Default: the checkpoint operating policy')
     ap.add_argument('--device', default='cuda')
     ap.add_argument('--frame-checkpoint', help='Override the learned frame checkpoint recorded by the follower')
     ap.add_argument('--threads', type=int, default=4)
@@ -337,7 +338,7 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer, bank_loader=
     if args.frame_checkpoint:
         from vesuvius.neural_tracing.fiber_follow.tracing.crop_frames import bind_frame_checkpoint
         bind_frame_checkpoint(model.cfg, args.frame_checkpoint)
-    policy = checkpoint_policy(ck, model.cfg, confidence=args.confidence, n_commit=args.n_commit)
+    policy = checkpoint_policy(ck, model.cfg, confidence=args.confidence, n_commit=args.n_commit, gate=args.gate)
     cfg = SampleConfig(crop=crop, n_history=n_hist, recent_history_points=model.cfg.recent_history_points,
                        n_future=model.cfg.n_future, future_step=model.cfg.future_step,
                        label_tolerance=float(ck.get('tolerance', 1.5)),

@@ -138,14 +138,22 @@ def main():
     ap.add_argument('--limit', type=int, help='Use only the first N frozen seeds per cohort for paired controls')
     ap.add_argument('--sources', nargs='+')
     ap.add_argument('--cohorts', nargs='+', default=['monitor','length_weighted'])
-    ap.add_argument('--confidence', type=float, default=.5)
-    ap.add_argument('--n-commit', type=int, default=16)
+    from ..tracing.policy import DEFAULT_CONFIDENCE, DEFAULT_GATE, DEFAULT_N_COMMIT, GATES
+    ap.add_argument('--confidence', type=float, default=DEFAULT_CONFIDENCE)
+    ap.add_argument('--n-commit', type=int, default=DEFAULT_N_COMMIT)
+    ap.add_argument('--gate', choices=GATES, default=DEFAULT_GATE)
     ap.add_argument('--max-len', type=float, default=2000.)
     ap.add_argument('--batch', type=int, default=8)
     ap.add_argument('--seed', type=int, default=20261003)
     ap.add_argument('--device', default='cuda')
+    ap.add_argument('--precision', choices=('bf16', 'fp32'), default='bf16',
+                    help='model arithmetic while tracing; fp32 (TF32 off) makes traces independent of batch composition')
+    ap.add_argument('--sampler-seed', type=int, default=0,
+                    help="seed of the flow model's sampled proposals (TraceParams.seed; keyed per trace and decision)")
     args = ap.parse_args()
     torch.set_num_threads(4)
+    if args.precision == 'fp32':
+        torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = False
     raise_open_file_limit()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -167,7 +175,7 @@ def main():
         print(source['name'], 'selected length quantiles', selection['selected_length_quantiles'], flush=True)
     write(out/'seeds.json', frozen)
     model, crop, nh, _, ck = load_checkpoint(args.checkpoint, args.device)
-    policy = checkpoint_policy(ck,model.cfg,confidence=args.confidence,n_commit=args.n_commit)
+    policy = checkpoint_policy(ck,model.cfg,confidence=args.confidence,n_commit=args.n_commit,gate=args.gate)
     provenance = dict(checkpoint=str(Path(args.checkpoint).resolve()), checkpoint_sha256=hashlib.sha256(Path(args.checkpoint).read_bytes()).hexdigest(),
         step=ck['step'], operating_policy=policy.to_dict(), max_len=args.max_len, batch=args.batch,
         seeds_sha256=hashlib.sha256((out/'seeds.json').read_bytes()).hexdigest(), final_fibers_used=False,
@@ -179,7 +187,7 @@ def main():
     for source in sources:
         name = source['name']
         fibers = source['fibers']
-        tracer = FiberTracer(model,source['volume'],crop,nh,TraceParams.from_policy(policy,max_len=args.max_len,forward_chunk=args.batch),device=args.device)
+        tracer = FiberTracer(model,source['volume'],crop,nh,TraceParams.from_policy(policy,max_len=args.max_len,forward_chunk=args.batch,precision=args.precision,seed=args.sampler_seed),device=args.device)
         try:
             for cohort in args.cohorts:
                 seeds = frozen['sources'][name][cohort]

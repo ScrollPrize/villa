@@ -90,7 +90,7 @@ def calibrate(args, sources, *, checkpoint_loader, tracer_class):
     model, _, _, _, ck = checkpoint_loader(args.checkpoint, 'cpu')
     reports = []
     for threshold in args.thresholds:
-        policy = checkpoint_policy(ck, model.cfg, confidence=threshold, n_commit=args.n_commit)
+        policy = checkpoint_policy(ck, model.cfg, confidence=threshold, n_commit=args.n_commit, gate=args.gate)
         rows, _ = run_policy(args.checkpoint, sources, ['calibration'], policy, checkpoint_loader=checkpoint_loader,
                              tracer_class=tracer_class, device=args.device, max_len=args.max_len, batch=args.batch,
                              forward_chunk=args.forward_chunk)
@@ -131,9 +131,10 @@ def run(args, sources, *, checkpoint_loader, tracer_class):
         if selection.get('split') != 'calibration' or selection.get('selected') is None:
             raise ValueError('The policy file is not a calibration selection')
         policy = checkpoint_policy(ck, model.cfg, confidence=selection['operating_policy']['confidence'],
-                                   n_commit=selection['operating_policy']['n_commit'])
+                                   n_commit=selection['operating_policy']['n_commit'],
+                                   gate=selection['operating_policy'].get('gate'))
     else:
-        policy = checkpoint_policy(ck, model.cfg, confidence=args.confidence, n_commit=args.n_commit)
+        policy = checkpoint_policy(ck, model.cfg, confidence=args.confidence, n_commit=args.n_commit, gate=args.gate)
     started = time.monotonic()
     rows, ck = run_policy(args.checkpoint, sources, args.splits, policy, checkpoint_loader=checkpoint_loader,
                           tracer_class=tracer_class, device=args.device, max_len=args.max_len, batch=args.batch,
@@ -209,6 +210,7 @@ def parser(description=__doc__):
         p.add_argument('--forward-chunk', type=int, default=0, help='Rows per model forward call; 0 = whole batch')
         p.add_argument('--max-len', type=float, default=2000.)
         p.add_argument('--n-commit', type=int, help='Default: the checkpoint operating policy')
+        p.add_argument('--gate', choices=('full', 'prefix'), help='Commit gate. Default: the checkpoint operating policy')
         p.add_argument('--sources', nargs='+', help='Dataset sources (default: all)')
         if name == 'calibrate':
             p.add_argument('--thresholds', type=float, nargs='+', default=THRESHOLDS)

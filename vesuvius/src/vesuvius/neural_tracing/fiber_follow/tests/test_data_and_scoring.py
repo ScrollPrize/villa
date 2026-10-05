@@ -335,7 +335,8 @@ def test_online_collection_does_not_wait_and_publishes_only_complete_caches(tmp_
     assert '--checkpoint' in commands[0] and '--explore-calls' not in commands[0]
     assert commands[0][commands[0].index('--fibers-per-collection')+1] == '64'
     # Collection takes the checkpoint's operating policy (default confidence shared with rollout), no exploration.
-    from vesuvius.neural_tracing.fiber_follow.tracing.trace import DEFAULT_CONFIDENCE
-    assert TraceParams().confidence == DEFAULT_CONFIDENCE == .5
+    from vesuvius.neural_tracing.fiber_follow.tracing.trace import DEFAULT_CONFIDENCE, DEFAULT_GATE, DEFAULT_N_COMMIT
+    assert (TraceParams().confidence, TraceParams().gate, TraceParams().n_commit) == (DEFAULT_CONFIDENCE, DEFAULT_GATE,
+                                                                                      DEFAULT_N_COMMIT) == (.4, 'full', 8)
     assert manager.confidence is None and manager.settings()['exploration'] == 'none'
     manager.close()

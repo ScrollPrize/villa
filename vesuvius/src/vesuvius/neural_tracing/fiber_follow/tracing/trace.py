@@ -11,7 +11,8 @@ import numpy as np
 import torch
 
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, crop_local_grid, normalize
-from vesuvius.neural_tracing.fiber_follow.tracing.policy import DEFAULT_CONFIDENCE, DEFAULT_N_COMMIT, commit_prefix
+from vesuvius.neural_tracing.fiber_follow.tracing.policy import (DEFAULT_CONFIDENCE, DEFAULT_GATE, DEFAULT_N_COMMIT, GATES,
+    commit_count, selection_window)
 from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolume
 from vesuvius.neural_tracing.fiber_follow.shared.reference import SEED_FIELDS, observed_path
 from vesuvius.neural_tracing.fiber_follow.tracing.heading import trace_heading, TRACE_HEADING_POLICY, FRAME_POLICY, FRAME_POLICIES, ct_frame, fiber_family
@@ -23,12 +24,13 @@ if TYPE_CHECKING:
 
 @dataclass
 class TraceParams:
-    n_commit: int = DEFAULT_N_COMMIT  # maximum per decision, at most the model horizon; confidence can shorten each commit
+    n_commit: int = DEFAULT_N_COMMIT  # points per committed decision, at most the model horizon
     max_len: float = 6000.0
     confidence: float = DEFAULT_CONFIDENCE
+    gate: str = DEFAULT_GATE  # 'full': commit n_commit only if last-plane confidence passes; 'prefix': confident prefix
     loop_radius: float = 1.5
     loop_skip: int = 40
-    seed: int = 0  # stochastic sampler seed; each directed trace has its own stream
+    seed: int = 0  # stochastic sampler seed; each directed trace has its own stream (decision_noise_key)
     # Rows per model forward call; 0 runs every active trace in one call. Chunking
     # bounds memory only: each row's inputs and outputs are unchanged.
     forward_chunk: int = 0
@@ -37,7 +39,8 @@ class TraceParams:
     precision: str = 'bf16'
 
     def __post_init__(self):
-        if self.n_commit < 1 or self.max_len <= 0 or not 0 <= self.confidence <= 1 or self.forward_chunk < 0:
+        if (self.n_commit < 1 or self.max_len <= 0 or not 0 <= self.confidence <= 1 or self.forward_chunk < 0
+                or self.gate not in GATES):
             raise ValueError('Invalid rollout parameters')
         if self.precision not in ('bf16', 'fp32'):
             raise ValueError("Rollout precision is 'bf16' or 'fp32'")
@@ -45,7 +48,18 @@ class TraceParams:
     @classmethod
     def from_policy(cls, policy, **kwargs):
         """Rollout limits for a resolved ``OperatingPolicy``."""
-        return cls(n_commit=policy.n_commit, confidence=policy.confidence, **kwargs)
+        return cls(n_commit=policy.n_commit, confidence=policy.confidence, gate=policy.gate, **kwargs)
+
+
+def decision_noise_key(seed, start, decision):
+    """Seed of one decision's sampled proposals: (sampler seed, the trace's start, decision index).
+
+    The start is rounded to 1e-3 voxel, so a trace draws the same noise however it is batched.
+    """
+    import hashlib
+    start = np.round(np.asarray(start, np.float64), 3)+0.  # +0. folds -0. into 0.
+    digest = hashlib.blake2b(np.asarray([seed, decision], np.int64).tobytes()+start.tobytes(), digest_size=8).digest()
+    return int.from_bytes(digest, 'little') & ((1 << 63)-1)
 
 
 def trace_history(path, size):
@@ -283,6 +297,7 @@ class ModelTracer:
         reasons = ['']*n
         length = np.zeros(n)
         last_segment = [np.asarray([p[-1]]) for p in paths]
+        decisions = np.zeros(n, np.int64)  # per trace, for the flow sampler's decision keys
         pp = self.p
         while active.any():
             idx = np.flatnonzero(active)
@@ -315,10 +330,15 @@ class ModelTracer:
             sampling = {}
             if (hasattr(self.model, 'select_prediction')
                     or getattr(self.model.cfg, 'candidate_selection', 'prefix') == 'stop_fallback'):
-                sampling.update(confidence_threshold=pp.confidence,n_commit=pp.n_commit)
+                sampling.update(confidence_threshold=pp.confidence,
+                                n_commit=selection_window(pp.n_commit, self.model.cfg.n_future, pp.gate))
+            if getattr(self.model.cfg, 'flow_samples', 0):
+                x['flow_noise_keys'] = tensor(np.asarray([decision_noise_key(pp.seed, seeds_xyz[i], decisions[i])
+                                                          for i in idx], np.int64))
             out = self.forward(x, tensor(hist).float(), tensor(hm), sampling)
-            commits, allowed = commit_prefix(out['points'], out['confidence'], pp.confidence, pp.n_commit,
-                                             self.model.cfg.max_recovery_distance)
+            decisions[idx] += 1
+            commits, allowed = commit_count(out['points'], out['confidence'], pp.confidence, pp.n_commit,
+                                            self.model.cfg.max_recovery_distance, pp.gate)
             commits, allowed = [v.cpu().numpy() for v in (commits, allowed)]
             if memory is not None:
                 self.memory_record(out['memory_entry'], idx, pos, fr, paths, memory)

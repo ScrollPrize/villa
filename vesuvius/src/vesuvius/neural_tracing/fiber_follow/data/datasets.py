@@ -101,8 +101,11 @@ def same_sources(recorded, document):
     return splits(recorded, True) == splits(document, False)
 
 
-def validate_dataset_resume(checkpoint, document, digest):
-    """Allow cache relocation while requiring identical resolved training data."""
+def validate_dataset_resume(checkpoint, document, digest, *, allow_added=False):
+    """Allow cache relocation while requiring identical resolved training data.
+
+    With ``allow_added`` the resumed run may append new sources after the recorded ones (dataset ids stay the
+    same); the recorded sources must be unchanged except for their sampling weights."""
     if checkpoint.get('dataset_config_sha256') == digest:
         return
     recorded = checkpoint.get('dataset_config')
@@ -110,6 +113,13 @@ def validate_dataset_resume(checkpoint, document, digest):
         without_cache = lambda value: {k:v for k,v in value.items() if k != 'cache_dir'}
         if without_cache(recorded) == without_cache(document):
             return
+        if allow_added:
+            old, new = recorded.get('sources', []), document.get('sources', [])
+            rest = lambda value: {k: v for k, v in value.items() if k not in ('cache_dir', 'description', 'sources')}
+            unweighted = lambda source: {k: v for k, v in source.items() if k != 'weight'}
+            if (rest(recorded) == rest(document) and len(new) > len(old)
+                    and all(unweighted(a) == unweighted(b) for a, b in zip(old, new))):
+                return
     raise ValueError('Resume dataset configuration changed')
 
 
@@ -352,7 +362,8 @@ def open_afv_source(source, cache_dir, normalization=None):
         return str(url).rstrip('/').replace('https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/',
             's3://vesuvius-challenge-open-data/').replace('https://vesuvius-challenge-open-data.s3.amazonaws.com/',
             's3://vesuvius-challenge-open-data/')
-    if canonical(source['ct']) != canonical(native_url):
+    # A local copy of the CT (same coordinate frame, read at ct_grid_scale) names the store it mirrors.
+    if canonical(source.get('ct_mirror_of', source['ct'])) != canonical(native_url):
         raise ValueError('AFV source CT differs from its embedded metadata')
     spec = ct_source_spec(source, cache_dir)
     if normalization is not None:

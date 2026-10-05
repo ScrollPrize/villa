@@ -15,7 +15,8 @@ from vesuvius.neural_tracing.fiber_follow.data.data import DATA_POLICY, FollowDa
 from vesuvius.neural_tracing.fiber_follow.shared.experiment import read_manifest
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
 from vesuvius.neural_tracing.fiber_follow.train.online import OnlineCollector
-from vesuvius.neural_tracing.fiber_follow.tracing.policy import OperatingPolicy
+from vesuvius.neural_tracing.fiber_follow.tracing.policy import (DEFAULT_CONFIDENCE, DEFAULT_GATE, DEFAULT_N_COMMIT, GATES,
+    OperatingPolicy, selection_window)
 from vesuvius.neural_tracing.fiber_follow.train.runloop import RunLog, lr_at, prepare_run_dir, read_checkpoint, save_checkpoint as write_checkpoint, update_ema, training_rng_state, resume_training, raise_open_file_limit
 from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolume, FiberVolumeSpec
 from vesuvius.neural_tracing.fiber_follow.models.model import CoordinateRegressionConfig, build_model
@@ -55,10 +56,10 @@ def collector_settings(collector):
     return {name or 'primary': member.settings() for name, member in members}
 
 
-def training_policy(cfg, n_commit, confidence=.5):
+def training_policy(cfg, n_commit, confidence=DEFAULT_CONFIDENCE, gate=DEFAULT_GATE):
     """The operating policy used for live feedback and recorded with every checkpoint."""
     return OperatingPolicy(confidence=confidence, n_commit=n_commit, max_recovery_distance=cfg.max_recovery_distance,
-                           refinement_steps=cfg.recurrent_refinement_steps)
+                           refinement_steps=cfg.recurrent_refinement_steps, gate=gate)
 
 
 def conv_memory_format(device):
@@ -456,7 +457,8 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
                      confidence_weight=.5, ema_decay=.999, ema_ramp=True, n_commit=None, compute_metrics=True,
                      history_grad_clip=HISTORY_GRAD_CLIP, rest_grad_clip=REST_GRAD_CLIP,
                      diagnostic=None, live_continuation=None, ledger=None, identity_weight=0.,
-                     identity_exclude_synthetic=False, tube_weight=1., tube_sigma=1.5):
+                     identity_exclude_synthetic=False, tube_weight=1., tube_sigma=1.5,
+                     confidence_threshold=.5, gate='prefix'):
     """One equally weighted task loss per independent supervised decision."""
     prepare_training(model, getattr(model, 'training_batch_size', 2))
     total = observed = sum(len(batch['hist']) for batch in batches)
@@ -516,8 +518,10 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
         if diagnostic is not None:
             diagnostic.update(cpu_batch=cpu)
         with torch.autocast('cuda', dtype=torch.bfloat16, enabled=torch.device(device).type == 'cuda'):
-            output = training_prediction(model, batch['x'], batch['hist'], batch['hmask'],
-                                         n_commit=commit_window(model.cfg, n_commit), targets=batch)
+            # Retries and proposal selection follow the operating policy, exactly as in tracing.
+            output = training_prediction(model, batch['x'], batch['hist'], batch['hmask'], confidence_threshold,
+                                         n_commit=selection_window(commit_window(model.cfg, n_commit), model.cfg.n_future, gate),
+                                         targets=batch)
             terms = model.training_loss(output, batch, model.cfg, tolerance, n_commit=n_commit)
             geometry = terms['geometry_per_state'].sum()/denominator
             confidence = terms['confidence_per_state'].sum()/denominator
@@ -705,7 +709,13 @@ def build_parser():
                     help='Independent gradient-norm limit for all other parameters; 0 disables clipping')
     ap.add_argument('--confidence-weight', type=float, default=.5)
     ap.add_argument('--tolerance', type=float, default=1.5)
-    ap.add_argument('--n-commit', type=int, default=16)
+    ap.add_argument('--n-commit', type=int, default=DEFAULT_N_COMMIT,
+                    help='Points per committed decision (tracing, live chains, DAgger collection)')
+    ap.add_argument('--trace-confidence', type=float, default=DEFAULT_CONFIDENCE,
+                    help='Commit-gate confidence threshold for tracing, live chains, collection and training retries')
+    ap.add_argument('--gate', choices=GATES, default=DEFAULT_GATE,
+                    help="Commit gate: 'full' commits n_commit points only when the last-plane confidence passes; "
+                         "'prefix' commits the confident prefix")
     ap.add_argument('--stem-channels', type=int, default=CoordinateRegressionConfig.stem_channels,
                     help='Parallel residual patch stem width; 0 disables (token-only patch4 models)')
     ap.add_argument('--stem-blocks', type=int, default=CoordinateRegressionConfig.stem_blocks,
@@ -739,6 +749,9 @@ def build_parser():
                     help='With --memory decisions: width of the linear projection for the memory-identity '
                          'InfoNCE loss (0 disables it)')
     ap.add_argument('--identity-temperature', type=float, default=CoordinateRegressionConfig.identity_temperature)
+    ap.add_argument('--add-dataset-sources', action='store_true',
+                    help='On resume, allow the dataset config to append new sources after the recorded ones '
+                         '(recorded sources unchanged except their weights)')
     ap.add_argument('--path-planes', choices=('future', 'crop'), default=CoordinateRegressionConfig.path_planes,
                     help="Path head: 'future' planes 1..n_future, or 'crop' one point per crop plane behind and ahead "
                          "of the head, trained toward the original fiber wherever it is (planes 1..n_future stay the "
@@ -889,16 +902,19 @@ def validate_resume_options(args, recorded_options):
     # an omitted CLI flag must not prevent resuming that recorded selection.
     # Initialization is historical provenance, not a resume-time input.
     # Operational settings may change on resume; sampling and label semantics may not.
-    ignored = {'resume','init_weights','init_partial','init_exclude','reset_optimizer','lr','steps','frame_checkpoint','out_root','device','batch','grad_steps','workers','threads','dagger_threads','worker_cache_gb','dataset_config',
+    ignored = {'resume','init_weights','init_partial','init_exclude','reset_optimizer','lr','steps','frame_checkpoint','out_root','device','batch','grad_steps','workers','threads','dagger_threads','worker_cache_gb','dataset_config','add_dataset_sources',
                'remote_prefetch_connections','remote_prefetch_queue_size','remote_prefetch_timeout','remote_prefetch_lookahead',
                'log_every','ckpt_every','diag_every','batch_diag_every','dagger_device','dagger_batch','dagger_forward_chunk',
                'negative_bank_refresh_seconds','negative_bank_cache_mb','activation_checkpointing',
                'history_grad_clip','rest_grad_clip','blur_probability','blur_sigma',
                'tolerance'}  # confidence-label tolerance; the departure threshold is a separate constant
     defaults = build_parser()
+    # Options whose default changed when they were introduced: a run started earlier used the old behaviour.
+    from vesuvius.neural_tracing.fiber_follow.tracing.policy import LEGACY_CONFIDENCE, LEGACY_GATE
+    legacy = dict(gate=LEGACY_GATE, trace_confidence=LEGACY_CONFIDENCE)
     for key,value in vars(args).items():
-        # Options added after a run started were recorded implicitly at their default.
-        recorded = recorded_options[key] if key in recorded_options else defaults.get_default(key)
+        # Options added after a run started were recorded implicitly at their default (or legacy behaviour).
+        recorded = recorded_options[key] if key in recorded_options else legacy.get(key, defaults.get_default(key))
         if key not in ignored and json.dumps(recorded,sort_keys=True) != json.dumps(value,sort_keys=True):
             raise ValueError(f'Resume option differs: {key}')
 
@@ -971,7 +987,7 @@ def main(argv=None):
     args.model = cfg.model_type
     if resume:
         from vesuvius.neural_tracing.fiber_follow.data.datasets import validate_dataset_resume
-        validate_dataset_resume(resume,dataset_document,dataset_digest)
+        validate_dataset_resume(resume,dataset_document,dataset_digest,allow_added=args.add_dataset_sources)
     if not 1 <= args.live_continuation_steps[0] <= args.live_continuation_steps[1]:
         raise ValueError('Live continuation requires 1 <= minimum steps <= maximum steps')
     from vesuvius.neural_tracing.fiber_follow.data.bank_geometry import BankSwitchDetector
@@ -996,7 +1012,7 @@ def main(argv=None):
                           excursion_amplitude=tuple(args.excursion_amplitude), excursion_rise=tuple(args.excursion_rise),
                           label_tolerance=args.tolerance, max_recovery_distance=cfg.max_recovery_distance,
                           crop_targets=getattr(cfg, 'path_planes', 'future') == 'crop' or getattr(cfg, 'tube_head', False))
-    policy = training_policy(cfg, args.n_commit)
+    policy = training_policy(cfg, args.n_commit, args.trace_confidence, args.gate)
     progress('Loading manifest and fiber annotations')
     bank_band = ZBand(*(v/spec.grid_scale for v in args.val_z))
     if dataset_document:
@@ -1104,7 +1120,7 @@ def main(argv=None):
     collection = dict(every=args.dagger_every, fibers_per_collection=args.dagger_fibers, batch=args.dagger_batch,
                       forward_chunk=args.dagger_forward_chunk, seed=args.seed, replay_keep=args.replay_keep,
                       trace_len=args.dagger_trace_len, before=args.dagger_before, after=args.dagger_after,
-                      stride=args.dagger_stride, confidence=policy.confidence, n_commit=policy.n_commit,
+                      stride=args.dagger_stride, confidence=policy.confidence, n_commit=policy.n_commit, gate=policy.gate,
                       collector_module='vesuvius.neural_tracing.fiber_follow.tracing.collect', threads=args.dagger_threads)
     bank_args = ('--bank-switch-tolerance', args.bank_switch_tolerance, '--bank-own-tolerance', args.bank_own_tolerance)
     collector = OnlineCollector(out/'dagger', args.fibers, args.val_z, args.dagger_device or args.device,
@@ -1268,6 +1284,7 @@ def main(argv=None):
                 history_grad_clip=args.history_grad_clip, rest_grad_clip=args.rest_grad_clip,
                 identity_weight=args.identity_weight, identity_exclude_synthetic=args.identity_exclude_synthetic,
                 tube_weight=args.tube_weight, tube_sigma=args.tube_sigma,
+                confidence_threshold=policy.confidence, gate=policy.gate,
                 diagnostic=diagnostic, live_continuation=live_continuation, ledger=ledger)
             observed_states += metrics['observed_states']
             interval_states += metrics['observed_states']
@@ -1358,7 +1375,7 @@ def main(argv=None):
                         if source['kind'] != 'afv':
                             continue
                         source_tracer = FiberTracer(ema,FiberVolume(source_dataset.vol_spec),cfg.fine,cfg.n_history,
-                            TraceParams(n_commit=args.n_commit,max_len=args.diag_max_len),device=args.device)
+                            TraceParams.from_policy(policy,max_len=args.diag_max_len),device=args.device)
                         try:
                             rows,_ = evaluate(source_tracer,source_dataset.validation_fibers,
                                 source_dataset.validation_manifest['monitor'],batch=1,coverage_max_len=args.diag_max_len)

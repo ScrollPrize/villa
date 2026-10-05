@@ -17,7 +17,7 @@ import torch
 from vesuvius.neural_tracing.fiber_follow.data.data import SOURCE, label_state
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import frame_from_heading
 from vesuvius.neural_tracing.fiber_follow.tracing.heading import FRAME_POLICY, SeedHeadingError, ct_frame, reframe_item
-from vesuvius.neural_tracing.fiber_follow.tracing.policy import commit_prefix
+from vesuvius.neural_tracing.fiber_follow.tracing.policy import commit_count
 from vesuvius.neural_tracing.fiber_follow.shared.reference import SEED_FIELDS, observed_path
 from vesuvius.neural_tracing.fiber_follow.data.state_labels import FOLLOWING, RECOVERABLE, TERMINAL, TraceLabeler
 from vesuvius.neural_tracing.fiber_follow.tracing.trace import TraceParams, advance_trace_path, trace_history
@@ -288,8 +288,8 @@ class LiveContinuation:
         source = self.sources[int(ids[0])]
         points = output['points'][indices].detach().float()
         confidence = output['confidence'][indices].detach().float()
-        counts, _ = commit_prefix(points, confidence, self.policy.confidence,
-                                  self.policy.n_commit, self.policy.max_recovery_distance)
+        counts, _ = commit_count(points, confidence, self.policy.confidence, self.policy.n_commit,
+                                 self.policy.max_recovery_distance, self.policy.gate)
         points, counts = points.cpu().numpy(), counts.cpu().numpy()
         entries = output.get('memory_entry')
         for i, proposal, count in zip(indices, points, counts):

@@ -136,13 +136,17 @@ def test_tracer_passes_operating_threshold_into_adaptive_model(monkeypatch):
         thresholds.append((kwargs['confidence_threshold'], kwargs['n_commit']))
         return original(*args, **kwargs)
     monkeypatch.setattr(model, 'forward', forward)
-    tracer = FiberTracer(model, SimpleNamespace(shape=(1000, 1000, 1000)), model.cfg.fine,
-                          model.cfg.n_history, TraceParams(n_commit=1, max_len=1., confidence=0.), device='cpu')
-    try:
-        tracer.trace(np.array([[100., 100., 400.]]), np.array([[0., 0., 1.]]))
-    finally:
-        tracer.close()
-    assert thresholds and all(value == (0., 1) for value in thresholds)
+    # The prefix gate ranks proposals by the committed prefix; the full gate (default) by the full horizon,
+    # because only the last plane decides acceptance.
+    for gate, window in (('prefix', 1), ('full', model.cfg.n_future)):
+        thresholds.clear()
+        tracer = FiberTracer(model, SimpleNamespace(shape=(1000, 1000, 1000)), model.cfg.fine, model.cfg.n_history,
+                             TraceParams(n_commit=1, max_len=1., confidence=0., gate=gate), device='cpu')
+        try:
+            tracer.trace(np.array([[100., 100., 400.]]), np.array([[0., 0., 1.]]))
+        finally:
+            tracer.close()
+        assert thresholds and all(value == (0., window) for value in thresholds)
 
 
 def test_recovery_evaluator_reruns_policy_per_threshold_on_float_inputs_and_observed_states(monkeypatch):

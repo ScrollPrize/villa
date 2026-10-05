@@ -34,7 +34,7 @@ class RecordingTracer(ModelTracer):
     def __init__(self, predictions, **policy):
         super().__init__(ScriptedModel(predictions), SimpleNamespace(shape=(1000,)*3),
                          CropSpec(depth=4, width=4, behind=1), n_history=4,
-                         params=TraceParams(n_commit=2, **policy), device='cpu')
+                         params=TraceParams(n_commit=2, **dict(dict(gate='prefix'), **policy)), device='cpu')  # scripted prefix commits
         self.inputs = []
 
     def build_inputs(self, pos, frames, hist, hmask):

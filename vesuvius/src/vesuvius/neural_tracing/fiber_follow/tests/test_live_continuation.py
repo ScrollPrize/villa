@@ -18,7 +18,7 @@ from vesuvius.neural_tracing.fiber_follow.data.state_labels import FOLLOWING, RE
 from vesuvius.neural_tracing.fiber_follow.tracing.trace import ModelTracer, TraceParams
 from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolumeSpec
 
-POLICY = OperatingPolicy(n_commit=16)
+POLICY = OperatingPolicy(n_commit=16, gate='prefix')  # these tests exercise prefix-length commits
 
 
 class Values:
@@ -96,7 +96,7 @@ def test_live_state_matches_next_inference_observation(setup):
         def build_inputs(self, *args):
             return None
 
-    tracer = Tracer(Policy(), vol, ds.cfg.crop, ds.cfg.n_history, TraceParams(n_commit=16), device='cpu')
+    tracer = Tracer(Policy(), vol, ds.cfg.crop, ds.cfg.n_history, TraceParams(n_commit=16, gate='prefix'), device='cpu')
     initial = dict(item, hist=item['hist_local'] @ item['frame'].T+item['pos'], heading_start=0)
     observations = []
     def observe(i, decision):

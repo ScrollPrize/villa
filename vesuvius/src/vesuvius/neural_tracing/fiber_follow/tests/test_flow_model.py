@@ -300,3 +300,29 @@ def test_sample_threshold_holds_samples_to_a_higher_bar_than_the_zero_start():
     from vesuvius.neural_tracing.fiber_follow.tracing.policy import commit_prefix
     barred = model.select_prediction(dict(output, refinement_mask=torch.tensor([[False, False, True]])), .5)
     assert int(commit_prefix(barred['points'], barred['confidence'], .5, cfg.n_future)[0]) == 0
+
+
+def test_keyed_proposal_noise_depends_only_on_each_rows_key_and_the_tracer_keys_each_decision(monkeypatch):
+    from test_decision_memory import memory_config, StraightModel, run_tracer
+    torch.manual_seed(43)
+    model = build_model(config(flow_samples=3))
+    hist = torch.zeros(3, model.cfg.n_history, 3)
+    keys = torch.tensor([11, 22, 33])
+    together = model.proposal_starts(hist, keys)
+    alone = model.proposal_starts(hist[:1], keys[1:2])
+    torch.testing.assert_close(alone[0], together[1], rtol=0, atol=0)  # independent of batch neighbours
+    torch.testing.assert_close(model.proposal_starts(hist, keys), together, rtol=0, atol=0)
+    assert not torch.equal(together[0, 1:], together[2, 1:]) and not together[:, 0].any()
+    assert not torch.equal(model.proposal_starts(hist)[:, 1:], model.proposal_starts(hist)[:, 1:])  # global RNG
+
+    class Capture(StraightModel):
+        def forward(self, x, hist, hmask, **kwargs):
+            self.keys = getattr(self, 'keys', [])+[x['flow_noise_keys'].tolist()]
+            return super().forward(x, hist, hmask, **kwargs)
+    memory = memory_config().to_dict()
+    flow = build_model(config(flow_samples=2, **{k: memory[k] for k in ('stem', 'stem_blocks', 'memory')})).eval()
+    first, second = Capture(flow), Capture(flow)
+    run_tracer(first, monkeypatch)
+    run_tracer(second, monkeypatch)
+    assert first.keys == second.keys and len(first.keys) > 3
+    assert len({k[0] for k in first.keys}) == len(first.keys)  # a fresh key every decision

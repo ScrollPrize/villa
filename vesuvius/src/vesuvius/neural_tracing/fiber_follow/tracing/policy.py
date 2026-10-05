@@ -1,12 +1,21 @@
-"""Shared first-connection limits, confidence-gated prefix commit and the operating policy."""
+"""Shared first-connection limits, the confidence-gated commit and the operating policy.
+
+Commit gates: 'full' (default) commits ``n_commit`` points only when the proposal's full-horizon (last-plane)
+survival confidence reaches the threshold, and nothing otherwise; 'prefix' (the earlier rule) commits the prefix
+whose cumulative confidence stays above the threshold, up to ``n_commit`` points.
+"""
 from dataclasses import asdict, dataclass
 import math
 
 import torch
 
 
-DEFAULT_CONFIDENCE = 0.5
+DEFAULT_CONFIDENCE = 0.4
 DEFAULT_N_COMMIT = 8
+DEFAULT_GATE = 'full'
+GATES = ('full', 'prefix')
+# Operating policies recorded before gates existed meant this (checkpoint_policy reads them unchanged).
+LEGACY_CONFIDENCE, LEGACY_GATE = 0.5, 'prefix'
 DEFAULT_MAX_RECOVERY_DISTANCE = 6.0
 # Gate thresholds at which training logs, monitor rollouts, recovery studies
 # and curve plots report. Calibration sweeps its own grid; nothing here is
@@ -26,8 +35,11 @@ class OperatingPolicy:
     n_commit: int = DEFAULT_N_COMMIT
     max_recovery_distance: float = DEFAULT_MAX_RECOVERY_DISTANCE
     refinement_steps: int = 0
+    gate: str = DEFAULT_GATE
 
     def __post_init__(self):
+        if self.gate not in GATES:
+            raise ValueError(f'Commit gate must be one of {GATES}')
         if not 0 <= self.confidence <= 1 or int(self.n_commit) != self.n_commit or self.n_commit < 1:
             raise ValueError('Operating policy needs a confidence in [0, 1] and a positive commit count')
         if not math.isfinite(self.max_recovery_distance) or self.max_recovery_distance <= 0:
@@ -48,16 +60,21 @@ class OperatingPolicy:
             raise ValueError('Operating policy refinement differs from the model')
 
 
-def checkpoint_policy(checkpoint, cfg, *, confidence=None, n_commit=None):
-    """The checkpoint's recorded policy, optionally with an explicit threshold/commit override."""
+def checkpoint_policy(checkpoint, cfg, *, confidence=None, n_commit=None, gate=None):
+    """The checkpoint's recorded policy, optionally with an explicit threshold/commit/gate override.
+
+    A policy recorded before commit gates existed used the prefix gate, and is read that way."""
     recorded = dict(checkpoint.get('operating_policy') or dict(
-        confidence=DEFAULT_CONFIDENCE, n_commit=checkpoint.get('n_commit', DEFAULT_N_COMMIT),
+        confidence=LEGACY_CONFIDENCE, n_commit=checkpoint.get('n_commit', DEFAULT_N_COMMIT),
         max_recovery_distance=cfg.max_recovery_distance,
         refinement_steps=getattr(cfg, 'recurrent_refinement_steps', 0)))
+    recorded.setdefault('gate', LEGACY_GATE)
     if confidence is not None:
         recorded['confidence'] = float(confidence)
     if n_commit is not None:
         recorded['n_commit'] = int(n_commit)
+    if gate is not None:
+        recorded['gate'] = gate
     policy = OperatingPolicy(**recorded)
     policy.validate_model(cfg)
     return policy
@@ -87,6 +104,26 @@ def commit_prefix(points, confidence, threshold=DEFAULT_CONFIDENCE, n_commit=DEF
     conf = confidence.float().cummin(-1).values
     count = (conf >= threshold).int().cumprod(-1).sum(-1).clamp(max=n_commit)
     return torch.where(allowed,count,0),allowed
+
+
+def commit_count(points, confidence, threshold=DEFAULT_CONFIDENCE, n_commit=DEFAULT_N_COMMIT,
+                 max_distance=DEFAULT_MAX_RECOVERY_DISTANCE, gate=DEFAULT_GATE):
+    """Points to commit per proposal under ``gate`` (module docstring) and whether its first connection is allowed."""
+    if gate == 'prefix':
+        return commit_prefix(points, confidence, threshold, n_commit, max_distance)
+    if gate != 'full':
+        raise ValueError(f'Commit gate must be one of {GATES}')
+    if not 1 <= n_commit <= confidence.shape[-1]:
+        raise ValueError(f'n_commit must lie in [1, {confidence.shape[-1]}]')
+    allowed = recovery_allowed(points, max_distance)
+    full = confidence.float().cummin(-1).values[..., -1] >= threshold
+    return torch.where(allowed & full, n_commit, 0), allowed
+
+
+def selection_window(n_commit, horizon, gate=DEFAULT_GATE):
+    """Prefix length by which a model ranks its proposals: the commit for 'prefix', the full horizon for 'full'
+    (where acceptance depends on the last plane)."""
+    return horizon if gate == 'full' else n_commit
 
 
 def select_candidate(points, confidence, n_commit, max_distance=DEFAULT_MAX_RECOVERY_DISTANCE,

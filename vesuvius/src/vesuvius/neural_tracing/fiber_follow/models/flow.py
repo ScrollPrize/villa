@@ -180,19 +180,30 @@ class FlowFollower(ObservationFollower):
                 curves.append(self.to_points(y))
         return curves
 
-    def proposal_starts(self, hist):
-        """(B, D, P, 2): the zero path (unless flow_zero_start is off), then scaled Gaussian starts."""
+    def proposal_starts(self, hist, keys=None):
+        """(B, D, P, 2): the zero path (unless flow_zero_start is off), then scaled Gaussian starts.
+
+        ``keys`` (B,) int64, given by the tracer, seeds each row's starts from its own generator, so a
+        decision's noise depends on its key only (not on batch neighbours, batch size or precision).
+        Without keys (training) the global RNG draws them.
+        """
         zero = hist.new_zeros(len(hist), 1, self.cfg.n_future, 2)
         if not self.cfg.flow_samples:
             return zero
-        noise = self.cfg.flow_sample_scale*torch.randn(len(hist), self.cfg.flow_samples, self.cfg.n_future, 2,
-                                                         device=hist.device).to(zero.dtype)
+        shape = (self.cfg.flow_samples, self.cfg.n_future, 2)
+        if keys is None:
+            noise = torch.randn(len(hist), *shape, device=hist.device)
+        else:
+            noise = torch.stack([torch.randn(*shape, device=hist.device,
+                                             generator=torch.Generator(hist.device).manual_seed(int(key)))
+                                 for key in keys.tolist()])
+        noise = self.cfg.flow_sample_scale*noise.to(zero.dtype)
         return torch.cat((zero, noise), 1) if self.cfg.flow_zero_start else noise
 
     def training_forward(self, x, hist, hmask, threshold, targets=None):
         ctx = self.context(x, hist, hmask)
         self.prepare_prediction(ctx, hist)
-        generated = self.generate(ctx, hist, self.proposal_starts(hist))
+        generated = self.generate(ctx, hist, self.proposal_starts(hist, x.get('flow_noise_keys')))
         curves = [curve[:, 0] for curve in generated]
         points = curves[-1]
         # Every proposal is scored, so the confidence loss trains the scorer on sampled paths too.
