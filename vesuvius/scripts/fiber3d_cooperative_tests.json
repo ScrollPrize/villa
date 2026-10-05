@@ -1,5 +1,5 @@
 {
-  "suites": ["driver-monitor", "resident-api"],
+  "suites": ["merge-annotation-build", "merge-annotation-tests"],
   "native_build": false,
   "gpu_devices": ["0", "1"],
   "timeout_seconds": 300,

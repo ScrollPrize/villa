@@ -681,8 +681,16 @@ QStringList CommandLineToolRunner::buildArguments(Tool tool)
             if (_flipAxis >= 0) {
                 args << "--flip" << QString::number(_flipAxis);
             }
-            if (_includeTifs) {
-                args << "--include-tifs";
+            // "Also write TIFF slices" only adds anything when the primary
+            // output is the zarr -- a TifStack render already writes them.
+            // vc_render_tifxyz accepts --zarr-output and --tif-output together,
+            // so ask for the slices in a sibling directory of the .zarr rather
+            // than through a flag of its own.
+            if (_includeTifs && _renderOutputFormat == RenderOutputFormat::Zarr) {
+                const QFileInfo zarrInfo(_outputPattern);
+                args << "--tif-output"
+                     << zarrInfo.dir().filePath(zarrInfo.completeBaseName()
+                                                + QStringLiteral("_layers"));
             }
             if (_flatten) {
                 args << "--flatten";

@@ -36,6 +36,10 @@ CPU_TESTS = [
     "tests/neural_tracing/test_cooperative_reference.py",
 ]
 SUITES = {
+    "merge-native-build": [],
+    "merge-native-tests": [],
+    "merge-annotation-build": [],
+    "merge-annotation-tests": [],
     "resident-native": ["tests/neural_tracing/test_native_replay_evaluation.py", "-k", "complete_runner_cold_and_warm", "-s"],
     "resident-api": ["tests/scripts/test_classic_fiber_evaluation.py", "tests/neural_tracing/test_resident_trace.py", "tests/neural_tracing/test_reviewed_failure_test.py", "tests/neural_tracing/test_reviewed_trace_selection.py", "tests/neural_tracing/test_cooperative_integration.py"],
     "resident-trace": ["tests/neural_tracing/test_resident_trace.py", "tests/neural_tracing/test_reviewed_failure_test.py", "tests/neural_tracing/test_reviewed_trace_selection.py", "tests/neural_tracing/test_cooperative_integration.py", "tests/neural_tracing/test_demand_gpu.py", "../lasagna/tests/test_dynamic_inference_batching.py", "../lasagna/tests/test_demand_predict3d.py"],
@@ -160,6 +164,20 @@ def main():
             env.update(FIBER_COOPERATIVE_TEST_CONTROL=str(output / "control.json"),
                        FIBER_COOPERATIVE_TEST_OUTPUT=str(output))
             command = [sys.executable, "-m", "vesuvius.neural_tracing.fiber_trace_3d.cooperative_reference_validation"]
+        elif suite == "merge-native-build":
+            command = ["bash", str(SCRIPT_DIR / "run_fiber3d_native_build")]
+        elif suite == "merge-annotation-build":
+            command = ["cmake", "--build", str(ROOT / "volume-cartographer/build/fiber-evaluation"),
+                       "--target", "test_fiber_json", "test_global_cache_root",
+                       "test_line_annotation_structural_edits", "test_line_annotation_generated_views", "-j", "8"]
+        elif suite == "merge-annotation-tests":
+            command = ["ctest", "--test-dir", str(ROOT / "volume-cartographer/build/fiber-evaluation"),
+                       "--output-on-failure", "--timeout", "120", "-R",
+                       "^(test_fiber_json|test_global_cache_root|test_line_annotation_structural_edits|test_line_annotation_generated_views)$"]
+        elif suite == "merge-native-tests":
+            command = ["ctest", "--test-dir", str(ROOT / "volume-cartographer/build/fiber-evaluation"),
+                       "--output-on-failure", "--timeout", "120", "-R",
+                       "^(test_fiber_trace3d|test_fiber_replay|test_fiberlet_storage|test_fiberlet_crop_trace)$"]
         elif suite == "embedding-native-build":
             env.update(CCACHE_DIR="/tmp/ccache", CCACHE_TEMPDIR="/tmp/ccache-tmp")
             command = ["cmake", "--build", str(ROOT / "volume-cartographer/build/dev-quickbuild-gcc"),

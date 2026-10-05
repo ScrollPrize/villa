@@ -4,6 +4,7 @@
 #include <QPersistentModelIndex>
 
 #include <unordered_map>
+#include <optional>
 #include <vector>
 
 #include "vc/ui/VCCollection.hpp"
@@ -44,7 +45,8 @@ public slots:
     void setSameWrapAnnotationEnabled(bool enabled);
     void setRelWindingAnnotationChecked(bool checked);
     void selectCollection(uint64_t collectionId);
-    void selectPoint(uint64_t pointId);
+    void clearSelection();
+    void selectPoint(vc::PointRef point);
 
 private slots:
     void refreshSameWrapTree();
@@ -54,15 +56,18 @@ private slots:
     void onPointAdded(const ColPoint& point);
     void onPointsAdded(const std::vector<ColPoint>& points);
     void onPointChanged(const ColPoint& point);
-    void onPointRemoved(uint64_t pointId);
+    void onPointRemoved(vc::PointRef point);
     void onSelectionChanged(const QItemSelection& selected, const QItemSelection& deselected);
     void showContextMenu(const QPoint& pos);
 
 signals:
     void collectionSelected(uint64_t collectionId);
-    void pointSelected(uint64_t pointId);
-    void pointDoubleClicked(uint64_t pointId);
-    void focusViewsRequested(uint64_t collectionId, uint64_t pointId);
+    void collectionSelectionCleared();
+    void pointSelected(vc::PointRef point);
+    void pointSelectionCleared();
+    void pointDoubleClicked(vc::PointRef point);
+    void focusCollectionRequested(uint64_t collectionId);
+    void focusPointRequested(vc::PointRef point);
     void sameWrapAnnotationToggled(bool enabled);
     void sameWrapAnnotationSpacingChanged(double spacing);
     void sameWrapAnnotationPolylineOpacityChanged(double opacity);
@@ -78,7 +83,7 @@ signals:
 private:
     void setupUi();
     QStandardItem* findCollectionItem(uint64_t collectionId) const;
-    QStandardItem* findPointItem(uint64_t pointId) const;
+    QStandardItem* findPointItem(vc::PointRef point) const;
     void appendCollectionRow(const VCCollection::Collection& collection);
     void appendPointRow(QStandardItem* collectionItem,
                         const VCCollection::Collection& collection,
@@ -86,8 +91,8 @@ private:
     void updateCollectionCount(QStandardItem* collectionItem);
 
     VCCollection* _pointCollection{nullptr};
-    uint64_t _selectedCollectionId{0};
-    uint64_t _selectedPointId{0};
+    std::optional<uint64_t> _selectedCollectionId;
+    std::optional<vc::PointRef> _selectedPoint;
     QCheckBox* _chkSameWrapAnnotation{nullptr};
     QCheckBox* _chkSameWrapMerge{nullptr};
     QComboBox* _sameWrapPathTypeCombo{nullptr};
@@ -101,5 +106,5 @@ private:
     QPushButton* _relWindingAnnotationButton{nullptr};
     QTreeView* _sameWrapTreeView{nullptr};
     QStandardItemModel* _sameWrapModel{nullptr};
-    std::unordered_map<uint64_t, QPersistentModelIndex> _pointItems;
+    std::unordered_map<vc::PointRef, QPersistentModelIndex> _pointItems;
 };

@@ -7,11 +7,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 import pyro.distributions
 from einops import rearrange
-from torchdiffeq import odeint
 
+import flow_grad_smoothing
 import gap_triton
 import sample_spiral
-from flow_fields import CartesianFlowField, CylindricalFlowField
+from flow_fields import (
+    BSplineCylindricalFlowField,
+    BSplineFlowField,
+    CartesianFlowField,
+    CylindricalFlowField,
+)
 from gap_parameterization import (
     calibrated_gap_softplus_scale,
     initial_dr_logit,
@@ -23,12 +28,21 @@ from sample_spiral import get_bounding_windings, get_theta_and_radii
 
 
 class IntegratedFlowDiffeomorphism(pyro.distributions.transforms.Transform):
+    """The diffeomorphism a piecewise-stationary flow field integrates to.
+
+    Each slab of the flow field is a stationary velocity field integrated for
+    unit time with ``num_steps`` RK4 steps; the slabs compose in order (spiral
+    -> slice), and the inverse runs them backwards in reverse order. The flow
+    and diffeomorphism represent shifts in normalised units [0, 1] over the
+    flow region.
+    """
 
     domain = pyro.distributions.constraints.real_vector
     codomain = domain
 
     def __init__(self, flow_field, flow_min_corner_zyx, flow_max_corner_zyx, num_steps, solver, truncate_at_step=None, event_dim=0, cache_size=0):
         super().__init__(cache_size=cache_size)
+        assert solver == 'rk4', solver
         self.flow_field = flow_field
         self.flow_min_corner_zyx = flow_min_corner_zyx
         self.flow_max_corner_zyx = flow_max_corner_zyx
@@ -37,58 +51,29 @@ class IntegratedFlowDiffeomorphism(pyro.distributions.transforms.Transform):
         self.truncate_at_step = truncate_at_step
         self._event_dim = event_dim
         self._flow_range_zyx = self.flow_max_corner_zyx - self.flow_min_corner_zyx
-        self.num_flow_timesteps = flow_field.num_flow_timesteps
-        # Cached sampler/integrator closure at t=0 for the num_flow_timesteps==1 fast path.
-        # Built once per diffeomorphism instance (one per training iteration), shared across
-        # forward and inverse calls so per-iteration setup (e.g. trilinear LR->HR upsampling)
-        # is amortised. A closure built under no_grad cannot route gradients to the field
-        # parameters, so it is upgraded (rebuilt) if a later call arrives with grad enabled.
-        self._cached_sampler = None
+        # Cached integrator closure. Built once per diffeomorphism instance
+        # (one per training iteration), shared across forward and inverse
+        # calls so per-iteration setup (e.g. trilinear LR->HR upsampling) is
+        # amortised. A closure built under no_grad cannot route gradients to
+        # the field parameters, so it is upgraded (rebuilt) if a later call
+        # arrives with grad enabled.
         self._cached_integrator = None
-        self._cached_sampler_grad_mode = False
-
-    def _velocity(self, t_int, current_zyx_scaled):
-        # t_int is a scalar in [0, 1]; flow_field expects t in [-1, 1]
-        t_flow = t_int * 2 - 1
-        return self.flow_field.get_sampler(t_flow)(current_zyx_scaled)
+        self._cached_integrator_grad_mode = False
 
     def _call(self, input_zyx, inverse=False):
-        # ODE integration of the temporally-varying flow to give a diffeomorphism.
-        # The flow & diffeomorphism represent shifts in normalised units [0,1] over the flow region.
         y = (input_zyx - self.flow_min_corner_zyx) / self._flow_range_zyx
+        # truncate_at_step integrates only the first steps of every slab (the
+        # warm-up ramp); the step size is always that of the full schedule.
         n_steps = self.num_steps if self.truncate_at_step is None else self.truncate_at_step
-        t_span = n_steps / self.num_steps
-        h = (-t_span if inverse else t_span) / n_steps
-        if self.num_flow_timesteps == 1:
-            # Time-invariant flow: skip torchdiffeq's per-step dispatch overhead.
-            assert self.solver == 'rk4'
-            get_integrator = getattr(self.flow_field, 'get_time_invariant_integrator', None)
-            if get_integrator is not None:
-                # Cartesian fast path: the whole RK4 integration runs as ONE
-                # autograd node (identical arithmetic and gradient values; see
-                # _RK4SparseFlowIntegrate), instead of ~42 nodes per call.
-                if self._cached_integrator is None or (torch.is_grad_enabled() and not self._cached_sampler_grad_mode):
-                    self._cached_integrator = get_integrator()
-                    self._cached_sampler_grad_mode = torch.is_grad_enabled()
-                if n_steps > 0:
-                    orig_shape = y.shape
-                    y = self._cached_integrator(y.reshape(-1, 3), h, n_steps).view(orig_shape)
-            else:
-                # e.g. CylindricalFlowField: build the sampler once and inline a manual rk4 loop.
-                if self._cached_sampler is None or (torch.is_grad_enabled() and not self._cached_sampler_grad_mode):
-                    self._cached_sampler = self.flow_field.get_sampler(0.0)
-                    self._cached_sampler_grad_mode = torch.is_grad_enabled()
-                sampler = self._cached_sampler
-                for _ in range(n_steps):
-                    k1 = sampler(y)
-                    k2 = sampler(y + (h / 2) * k1)
-                    k3 = sampler(y + (h / 2) * k2)
-                    k4 = sampler(y + h * k3)
-                    y = y + (h / 6) * (k1 + 2 * k2 + 2 * k3 + k4)
-        else:
-            t0 = 1. if inverse else 0.
-            ts = torch.linspace(t0, t0 + h * n_steps, n_steps + 1, device=y.device)
-            y = odeint(self._velocity, y, ts, method=self.solver)[-1]
+        h = (-1.0 if inverse else 1.0) / self.num_steps
+        if self._cached_integrator is None or (torch.is_grad_enabled() and not self._cached_integrator_grad_mode):
+            self._cached_integrator = self.flow_field.get_integrator()
+            self._cached_integrator_grad_mode = torch.is_grad_enabled()
+        if n_steps > 0:
+            # Every slab's RK4 walk runs as ONE autograd node on CUDA (see
+            # flow_triton); the eager fallback composes one node per slab.
+            orig_shape = y.shape
+            y = self._cached_integrator(y.reshape(-1, 3), h, n_steps, reverse=inverse).view(orig_shape)
         return y * self._flow_range_zyx + self.flow_min_corner_zyx
 
     def _inverse(self, input_yx):
@@ -387,98 +372,6 @@ class UmbilicusTransform(pyro.distributions.transforms.Transform):
         return self._call(input_zyx, inverse=True)
 
 
-def ray_gap_enabled():
-    # Per-ray specialization of the gap-expander stage for radial-ray sample
-    # batches (phase-bundle polylines / registration targets). The generic
-    # inverse chain recomputes the whole winding-radius walk per SAMPLE while
-    # every sample on a ray shares (theta, z); computing the [rays, windings]
-    # radii table once per ray and gathering per sample does the same
-    # arithmetic ~2 orders of magnitude fewer times. Tolerance class: equal to
-    # the eager per-point pipeline up to fp association (the fused gap_triton
-    # kernels it replaces already differ from eager by scan order / FMA).
-    return os.environ.get('FIT_SPIRAL_RAY_GAP', '1') != '0'
-
-
-def ray_specialized_spiral_to_scroll(
-    slice_to_spiral_transform, radii, theta, z, pair_id, sin_t, cos_t,
-):
-    """Spiral->scroll mapping for radial-ray samples, per-ray gap stage.
-
-    Equivalent to ``slice_to_spiral_transform.inv(spiral_poly)`` for
-    ``spiral_poly = [z[pair_id], sin_t[pair_id]*radii, cos_t[pair_id]*radii]``
-    when the transform is the production chain
-    ``Compose([gap, (flip,) diffeo, linear, umbilicus]).inv``. The gap
-    expander's transformed-winding-radii table is built once per ray
-    ([rays, windings], differentiable) instead of once per sample; the
-    per-sample part is a gather + lerp. The flow / linear / umbilicus stages
-    see post-gap (and post-flow) coordinates whose z varies per sample, so
-    they stay generic per-sample calls.
-
-    Returns the mapped points, or ``None`` when the chain does not match the
-    production shape (caller falls back to the generic transform).
-    """
-    # slice_to_spiral is Compose(parts).inv; depending on the torch/pyro
-    # version that is either a ComposeTransform of per-part inverses (in
-    # reversed order) or an _InverseTransform wrapping the forward compose.
-    # Recover the forward parts without relying on the weakref inv cache.
-    inv_parts = getattr(slice_to_spiral_transform, 'parts', None)
-    if inv_parts is not None:
-        try:
-            parts = [p.inv for p in reversed(inv_parts)]
-        except AttributeError:
-            return None
-    else:
-        base = getattr(slice_to_spiral_transform, '_inv', None)
-        parts = list(getattr(base, 'parts', None) or []) or None
-    if not parts or not isinstance(parts[0], GapExpandingTransform):
-        return None
-    gap, rest = parts[0], parts[1:]
-    flip = None
-    if rest and isinstance(rest[0], pyro.distributions.transforms.AffineTransform):
-        flip, rest = rest[0], rest[1:]
-    if len(rest) != 3 or not (
-            isinstance(rest[0], IntegratedFlowDiffeomorphism)
-            and isinstance(rest[1], VaryingLinearTransform)
-            and isinstance(rest[2], UmbilicusTransform)):
-        return None
-    diffeo, linear, umbilicus = rest
-
-    dr = gap.dr_per_winding
-    theta_norm = theta / (2 * torch.pi)
-    # Per-ray transformed winding radii (differentiable through logits + dr;
-    # includes the truncate_frac warm-up lerp exactly like the eager path).
-    table = gap.get_transformed_winding_radii(theta, z)
-    num_windings = table.shape[-1]
-
-    # Eager _call per-sample pipeline, with per-ray quantities gathered.
-    tn_s = theta_norm[pair_id]
-    shifted = (radii - tn_s * dr).clamp(min=0.)
-    inner = torch.floor(shifted / dr).to(torch.int64).clip(
-        min=0, max=num_windings - 2)
-    # Flat per-sample gather from the per-ray table; never materialize the
-    # [samples, windings] expansion. F.embedding rather than plain indexing:
-    # index backward is a pathological _index_put_impl_ accumulate here,
-    # embedding_dense_backward is the fused gather-accumulate kernel.
-    flat_table = table.reshape(-1, 1)
-    flat_idx = pair_id * num_windings + inner
-    r_in = F.embedding(flat_idx, flat_table).squeeze(-1)
-    r_out = F.embedding(flat_idx + 1, flat_table).squeeze(-1)
-    original_inner = (inner + tn_s) * dr
-    original_outer = original_inner + dr
-    frac = (radii - original_inner) / (original_outer - original_inner)
-    transformed_radius = torch.lerp(r_in, r_out, frac)
-    sin_s, cos_s = sin_t[pair_id], cos_t[pair_id]
-    x_sign = -1.0 if flip is not None else 1.0
-    pts = torch.stack([
-        z[pair_id],
-        sin_s * transformed_radius,
-        (cos_s * transformed_radius) * x_sign,
-    ], dim=-1)
-    pts = diffeo._call(pts)
-    pts = linear._call(pts)
-    return umbilicus._call(pts)
-
-
 class SpiralAndTransform(nn.Module):
 
     def __init__(self, flow_integration_steps, flow_integration_solver, flow_min_corner_zyx, flow_max_corner_zyx, umbilicus_zyx, config, spiral_outward_sense='CW'):
@@ -507,24 +400,26 @@ class SpiralAndTransform(nn.Module):
             float(config['model_initial_dr_per_winding']), self.gap_min_gap))
 
         flow_resolution = (flow_max_corner_zyx - flow_min_corner_zyx) // config['model_flow_voxel_resolution']
-        flow_field_cls = CylindricalFlowField if config['model_flow_field_type'] == 'cylindrical' else CartesianFlowField
+        flow_field_cls = {
+            'cartesian': CartesianFlowField,
+            'cylindrical': CylindricalFlowField,
+            'bspline': BSplineFlowField,
+            'bspline_cylindrical': BSplineCylindricalFlowField,
+        }[config['model_flow_field_type']]
 
-        def make_flow_field():
-            return flow_field_cls(
-                flow_resolution,
-                num_flow_timesteps=config['model_num_flow_timesteps'],
-                direct_lr=config.get('model_flow_field_direct_lr', False),
-            )
-
-        # num_flow_stages: number of independent stationary flow fields whose integrated
-        # diffeomorphisms are composed sequentially (phi = exp(v_N) o ... o exp(v_1) in the
-        # spiral->slice direction; the inverse applies the stage inverses in reverse order via
-        # ComposeTransform.inv). num_flow_stages == 1 is exactly the original single-field
-        # behaviour: `flow_field` keeps its name/state_dict keys and `extra_flow_fields` is empty.
+        # num_flow_stages: number of stationary velocity fields whose integrated diffeomorphisms
+        # are composed sequentially (phi = exp(v_N) o ... o exp(v_1) in the spiral->slice
+        # direction; the inverse runs them backwards in reverse order). They are the slabs of
+        # one flow field's lattices ([num_flow_stages, 3, ...]), integrated by one
+        # IntegratedFlowDiffeomorphism, so num_flow_stages == 1 is exactly the original
+        # single-field model with identical parameters and state_dict keys.
         self.num_flow_stages = int(config.get('model_num_flow_stages', 1) or 1)
         assert self.num_flow_stages >= 1
-        self.flow_field = make_flow_field()
-        self.extra_flow_fields = nn.ModuleList([make_flow_field() for _ in range(self.num_flow_stages - 1)])
+        self.flow_field = flow_field_cls(
+            flow_resolution,
+            num_stages=self.num_flow_stages,
+            direct_lr=config.get('model_flow_field_direct_lr', False),
+        )
 
         self.linear_logits = nn.Parameter(torch.zeros([int(flow_max_corner_zyx[0] - flow_min_corner_zyx[0]) // config['model_linear_z_resolution'], 2, 2], dtype=torch.float32))
 
@@ -542,17 +437,9 @@ class SpiralAndTransform(nn.Module):
     def device(self):
         return self.linear_logits.device
 
-    @property
-    def flow_fields(self):
-        # All flow stages, in application order (stage 0 first in the spiral->slice direction).
-        return [self.flow_field, *self.extra_flow_fields]
-
     def _get_transform_parts(self, truncate_at_step=None, shared=None):
         truncate_frac = None if truncate_at_step is None else truncate_at_step / (self.flow_integration_steps - 1)
-        diffeomorphisms = [
-            IntegratedFlowDiffeomorphism(flow_field, self.flow_min_corner_zyx, self.flow_max_corner_zyx, num_steps=self.flow_integration_steps, solver=self.flow_integration_solver, truncate_at_step=truncate_at_step)
-            for flow_field in self.flow_fields
-        ]
+        diffeomorphism = IntegratedFlowDiffeomorphism(self.flow_field, self.flow_min_corner_zyx, self.flow_max_corner_zyx, num_steps=self.flow_integration_steps, solver=self.flow_integration_solver, truncate_at_step=truncate_at_step)
         gap_expander = GapExpandingTransform(
             self.gap_expander_params,
             shared[0] if shared is not None else self.get_dr_per_winding(),
@@ -572,44 +459,60 @@ class SpiralAndTransform(nn.Module):
             assert self.spiral_outward_sense == 'ACW'
             # To make spiral go anticlockwise in slice space (going outwards from the centre), flip it horizontally
             maybe_flip = [pyro.distributions.transforms.AffineTransform(loc=0., scale=torch.tensor([1., 1., -1.], device=self.device))]
-        return gap_expander, maybe_flip, diffeomorphisms, truncate_frac
+        return gap_expander, maybe_flip, diffeomorphism, truncate_frac
 
     def get_slice_to_spiral_transform(self, truncate_at_step=None, shared=None):
         # `shared` optionally supplies the (dr_per_winding, scaled_linear_logits,
         # pinned_scaled_gap_logits) triple from get_shared_transform_tensors(),
         # typically as detached leaves so many separate loss backwards can run
         # through one transform instance without retain_graph.
-        gap_expander, maybe_flip, diffeomorphisms, truncate_frac = self._get_transform_parts(truncate_at_step, shared)
+        gap_expander, maybe_flip, diffeomorphism, truncate_frac = self._get_transform_parts(truncate_at_step, shared)
         scaled_linear_logits = (
             shared[1] if shared is not None
             else self.linear_logits * self.linear_logits_scale)
         return pyro.distributions.transforms.ComposeTransform([
             gap_expander,
             *maybe_flip,
-            # Sequential composition of the integrated stationary flows; ComposeTransform.inv
-            # applies the stage inverses in reverse order in the slice->spiral direction.
-            *diffeomorphisms,
+            diffeomorphism,
             VaryingLinearTransform(scaled_linear_logits, self.flow_min_corner_zyx[0], self.flow_max_corner_zyx[0], truncate_frac),
             self.umbilicus_transform,
         ]).inv
 
-    def get_flowbox_to_spiral_transform(self, include_diffeomorphism=True):
-        # Maps positions expressed in the flow lattice's coordinate frame (the
-        # spiral-side intermediate space in which the diffeomorphism integrates)
-        # back to canonical spiral space. With include_diffeomorphism a lattice
-        # position is treated as an integration-trajectory *end* point; without,
-        # as a trajectory *start* point. The two differ by at most the flow
-        # displacement, so evaluating both brackets the material coordinates a
-        # flow voxel can influence.
-        gap_expander, maybe_flip, diffeomorphisms, _ = self._get_transform_parts()
-        parts = [gap_expander, *maybe_flip]
-        if include_diffeomorphism:
-            parts.extend(diffeomorphisms)
-        return pyro.distributions.transforms.ComposeTransform(parts).inv
-
     def get_dr_per_winding(self):
         return lower_bounded_dr(
             self.dr_per_winding_logit, self.gap_min_gap)
+
+    def smooth_flow_grad_(self, sigma_voxels, across_sigma_voxels=0.0,
+                          low_res_sigma_voxels=0.0):
+        """Gaussian-smooth the flow lattices' gradients in place.
+
+        ``sigma_voxels`` is the z/around-ring width for cylindrical lattices
+        (isotropic for Cartesian), ``across_sigma_voxels`` the across-ring
+        width (cylindrical only), and ``low_res_sigma_voxels`` a coarse-lattice
+        override for the first width (0 = same as ``sigma_voxels``). Directions
+        approximate along/across-sheet directions; see flow_grad_smoothing.
+        All widths use scroll-voxel units of the flow frame, not distances
+        measured on the deformed sheet. Convert using the nominal fine cell
+        width model_flow_voxel_resolution; each field scales for its coarse
+        lattice.
+        Applies to every flow stage. Call after apply_accumulated_field_grad
+        (and after any all-reduce) and before the optimizer step.
+        """
+        cell_voxels = float(self.cfg['model_flow_voxel_resolution'])
+        self.flow_field.smooth_grad_(
+            float(sigma_voxels) / cell_voxels,
+            float(across_sigma_voxels) / cell_voxels,
+            float(low_res_sigma_voxels or 0.0) / cell_voxels)
+
+    def describe_flow_grad_smoothing(self, sigma_voxels, across_sigma_voxels=0.0,
+                                     low_res_sigma_voxels=0.0):
+        """The effective smoothing widths per lattice, for the startup log."""
+        return flow_grad_smoothing.describe_widths(
+            sigma_voxels, across_sigma_voxels,
+            float(self.cfg['model_flow_voxel_resolution']),
+            self.flow_field.spatial_scale_factor,
+            self.cfg['model_flow_field_type'],
+            low_res_along_voxels=low_res_sigma_voxels)
 
     def get_shared_transform_tensors(self):
         """The tiny graph paths every evaluation of one transform instance

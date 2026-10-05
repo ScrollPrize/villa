@@ -205,8 +205,12 @@ void set_surface_tree_item_text(SurfaceTreeWidgetItem* item,
     item->setToolTip(SURFACE_ID_COLUMN, idText);
     item->setText(SURFACE_LONG_ID_COLUMN, longIdText);
     item->setToolTip(SURFACE_LONG_ID_COLUMN, longIdText);
-    item->setText(SURFACE_AREA_COLUMN, QString::number(areaCm2, 'f', 3));
-    item->setText(SURFACE_AVG_COST_COLUMN, QString::number(avgCost, 'f', 3));
+    // Match the update path below: a surface whose voxel size was unknown has
+    // no area_cm2 at all, and "-" is honest where "-1.000" is not.
+    item->setText(SURFACE_AREA_COLUMN,
+                  areaCm2 >= 0.0 ? QString::number(areaCm2, 'f', 3) : QStringLiteral("-"));
+    item->setText(SURFACE_AVG_COST_COLUMN,
+                  avgCost >= 0.0 ? QString::number(avgCost, 'f', 3) : QStringLiteral("-"));
     item->setText(SURFACE_OVERLAPS_COLUMN, QString::number(surf->overlappingIds().size()));
     item->setText(TIMESTAMP_COLUMN, surface_timestamp(surf));
 }
@@ -1573,6 +1577,10 @@ bool SurfacePanelController::deleteSegmentsHeadless(const QStringList& segmentId
     for (const auto& id : segmentIds) {
         const std::string idStd = id.toStdString();
         try {
+            if (_managedDeletionHandler && _managedDeletionHandler(id)) {
+                ++successCount;
+                continue;
+            }
             // Must clean up CState before destroying the Surface
             // to avoid dangling pointers in signal handlers.
             // Suppress signals during batch deletion to prevent handlers from
@@ -2323,7 +2331,7 @@ void SurfacePanelController::connectFilterSignals()
         connect(_pointCollection, &VCCollection::pointChanged, this, [this](const ColPoint&) {
             applyFilters();
         });
-        connect(_pointCollection, &VCCollection::pointRemoved, this, [this](uint64_t) {
+        connect(_pointCollection, &VCCollection::pointRemoved, this, [this](vc::PointRef) {
             applyFilters();
         });
     }

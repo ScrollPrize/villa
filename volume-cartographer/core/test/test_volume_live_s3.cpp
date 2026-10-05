@@ -56,7 +56,7 @@ TEST_CASE("Volume::NewFromUrl: invalid credentials fall back to anonymous public
     invalid.region = "us-east-1";
 
     try {
-        const auto volume = Volume::NewFromUrl(kVolumeUrl, {}, invalid);
+        const auto volume = Volume::NewFromUrl(kVolumeUrl, invalid);
         REQUIRE(volume != nullptr);
         CHECK(volume->isRemote());
         CHECK(volume->remoteAuth().empty());

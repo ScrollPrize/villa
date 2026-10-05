@@ -1,7 +1,10 @@
 #pragma once
 
 #include <QObject>
+#include <QMetaType>
 #include "vc/core/PointCollections.hpp"
+
+Q_DECLARE_METATYPE(vc::PointRef)
 
 // Thin Qt shim over the Qt-free PointCollections: turns base change hooks
 // into signals. Data/IO all live in PointCollections.
@@ -23,8 +26,8 @@ signals:
     void pointAdded(const ColPoint& point);
     void pointsAdded(const std::vector<ColPoint>& points);
     void pointChanged(const ColPoint& point);
-    void pointRemoved(uint64_t pointId);
-    void pointsRemoved(const std::vector<uint64_t>& pointIds);
+    void pointRemoved(vc::PointRef point);
+    void pointsRemoved(const std::vector<vc::PointRef>& points);
 
 protected:
     void onCollectionChanged(uint64_t id) override { emit collectionChanged(id); }
@@ -33,6 +36,6 @@ protected:
     void onPointAdded(const ColPoint& p) override { emit pointAdded(p); }
     void onPointsAdded(const std::vector<ColPoint>& points) override { emit pointsAdded(points); }
     void onPointChanged(const ColPoint& p) override { emit pointChanged(p); }
-    void onPointRemoved(uint64_t id) override { emit pointRemoved(id); }
-    void onPointsRemoved(const std::vector<uint64_t>& ids) override { emit pointsRemoved(ids); }
+    void onPointRemoved(vc::PointRef point) override { emit pointRemoved(point); }
+    void onPointsRemoved(const std::vector<vc::PointRef>& points) override { emit pointsRemoved(points); }
 };

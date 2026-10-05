@@ -114,6 +114,63 @@ TEST_CASE("strict quad rendering is opt-in and default rendering is unchanged")
     }
 }
 
+TEST_CASE("strict quad render validity process default applies to new surfaces")
+{
+    REQUIRE_FALSE(QuadSurface::strictQuadRenderValidityDefault());
+    QuadSurface before(makePlanarGrid(4, 4), cv::Vec2f(1.0f, 1.0f));
+    QuadSurface::setStrictQuadRenderValidityDefault(true);
+    QuadSurface after(makePlanarGrid(4, 4), cv::Vec2f(1.0f, 1.0f));
+    QuadSurface::setStrictQuadRenderValidityDefault(false);
+    QuadSurface restored(makePlanarGrid(4, 4), cv::Vec2f(1.0f, 1.0f));
+    CHECK_FALSE(before.strictQuadRenderValidity());
+    CHECK(after.strictQuadRenderValidity());
+    CHECK_FALSE(restored.strictQuadRenderValidity());
+}
+
+TEST_CASE("strict quad rendering drops coordinates blended toward the invalid sentinel")
+{
+    // A plane far from the origin with a ragged edge: every column past 9 is
+    // invalid. Legacy coverage keeps pixels whose cell touches the (-1,-1,-1)
+    // vertices, and their coordinates are pulled toward the origin.
+    cv::Mat_<cv::Vec3f> points(8, 16);
+    for (int r = 0; r < points.rows; ++r)
+        for (int c = 0; c < points.cols; ++c)
+            points(r, c) = c <= 9 ? cv::Vec3f(1000.0f + float(c), 2000.0f + float(r), 3000.0f)
+                                  : cv::Vec3f(-1.0f, -1.0f, -1.0f);
+    QuadSurface legacy(points, cv::Vec2f(1.0f, 1.0f));
+    QuadSurface strict(points, cv::Vec2f(1.0f, 1.0f));
+    strict.setStrictQuadRenderValidity(true);
+
+    auto countOffPlane = [](const cv::Mat_<cv::Vec3f>& coords) {
+        int offPlane = 0;
+        for (int row = 0; row < coords.rows; ++row)
+            for (int col = 0; col < coords.cols; ++col)
+                if (finiteVec(coords(row, col)) &&
+                    std::abs(coords(row, col)[2] - 3000.0f) > 1.0f)
+                    ++offPlane;
+        return offPlane;
+    };
+    cv::Mat_<cv::Vec3f> legacyCoords;
+    cv::Mat_<cv::Vec3f> strictCoords;
+    // 4 pixels per grid cell; the offset puts the view's upper-left corner on
+    // the grid origin so the whole 16x8 grid is in view.
+    const cv::Vec3f wholeGrid(-32.0f, -16.0f, 0.0f);
+    // gen() returns views into thread-local scratch; clone before the next call.
+    legacy.gen(&legacyCoords, nullptr, cv::Size(64, 32),
+               cv::Vec3f(0, 0, 0), 4.0f, wholeGrid);
+    legacyCoords = legacyCoords.clone();
+    strict.gen(&strictCoords, nullptr, cv::Size(64, 32),
+               cv::Vec3f(0, 0, 0), 4.0f, wholeGrid);
+    CHECK(countOffPlane(legacyCoords) > 0);
+    CHECK(countOffPlane(strictCoords) == 0);
+    // Strict coverage only removes the blended fringe; the plane itself stays.
+    int strictOnPlane = 0;
+    for (int row = 0; row < strictCoords.rows; ++row)
+        for (int col = 0; col < strictCoords.cols; ++col)
+            strictOnPlane += finiteVec(strictCoords(row, col));
+    CHECK(strictOnPlane > 30 * 28);
+}
+
 TEST_CASE("strict quad rendering never exposes more support than legacy rendering")
 {
     auto points = makePlanarGrid(8, 8);
@@ -125,6 +182,7 @@ TEST_CASE("strict quad rendering never exposes more support than legacy renderin
     cv::Mat_<cv::Vec3f> strictCoords;
     legacy.gen(&legacyCoords, nullptr, cv::Size(24, 24),
                cv::Vec3f(0, 0, 0), 4.0f, cv::Vec3f(0, 0, 0));
+    legacyCoords = legacyCoords.clone();  // gen() output aliases thread-local scratch
     strict.gen(&strictCoords, nullptr, cv::Size(24, 24),
                cv::Vec3f(0, 0, 0), 4.0f, cv::Vec3f(0, 0, 0));
     int legacyFinite = 0;

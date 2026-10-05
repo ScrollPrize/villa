@@ -42,6 +42,34 @@ class PlanarTransferTests(unittest.TestCase):
             matrix[:, :2], np.eye(2), atol=1e-9
         )
 
+    def test_planar_default_radius_is_not_shrunk_by_a_denser_source(self) -> None:
+        # A source sampled twice as finely as the target must not halve the
+        # default matching radius: with a 0.6-voxel offset (inside the
+        # target-keyed 0.75, outside the old min-based 0.375) every sampled
+        # vertex still maps, so the fit gets its correspondences.
+        rows, cols = np.meshgrid(
+            np.arange(31, dtype=np.float32) * 0.5,
+            np.arange(31, dtype=np.float32) * 0.5,
+            indexing="ij",
+        )
+        source = Surface(
+            x=cols, y=rows, z=np.full((31, 31), 10.0, dtype=np.float32)
+        )
+        target = plane(16, 16)
+        target.z += 0.6
+        label = np.full((31, 31), 5, dtype=np.uint8)
+
+        output, valid, _, report = transfer_array_planar(
+            source, target, label, max_distance=None
+        )
+        self.assertEqual(
+            report["mapped_correspondences"],
+            report["sampled_target_vertices"],
+        )
+        # The half-pixel sampling convention pushes the last output row one
+        # label pixel past the canvas; every other pixel must be matched.
+        self.assertTrue(np.all(valid[:-1] == 255))
+
     def test_planar_recovers_transposed_parameterization(self) -> None:
         rows, cols = np.meshgrid(
             np.arange(20, dtype=np.float32),

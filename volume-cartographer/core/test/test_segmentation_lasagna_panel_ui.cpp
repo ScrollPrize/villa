@@ -567,6 +567,23 @@ int main(int argc, char** argv)
     require(panel._compactAtlasConfigCombo->count() == panel._atlasConfigCombo->count(),
             "Compact atlas config combo should mirror the full atlas config combo");
     panel.setLasagnaDataInputPath(QStringLiteral("/data/atlas_input.lasagna.json"));
+    QString headlessError;
+    require(panel.startOptimizationHeadless(
+                &state,
+                SegmentationLasagnaPanel::LasagnaMode::NewModel,
+                configPath,
+                cv::Vec3i{4, 5, 6},
+                QString(),
+                QStringLiteral("/service/pherc0332/init_shells"),
+                &headlessError),
+            "Headless New Model launch should accept an init-shell directory override");
+    QJsonObject shellOverrideConfig =
+        g_lastLasagnaOptimizationRequest[QStringLiteral("job_spec")].toObject()
+            [QStringLiteral("config")].toObject();
+    require(shellOverrideConfig[QStringLiteral("args")].toObject()
+                [QStringLiteral("init-shell-dir")].toString() ==
+                QStringLiteral("/service/pherc0332/init_shells"),
+            "Headless New Model launch should forward initShellDir to fit args");
     const QString outputPathsDir = volpkgRoot + QStringLiteral("/paths");
     require(QDir().mkpath(outputPathsDir + QStringLiteral("/my_sheet_v001.tifxyz")),
             "Failed to create atlas output collision directory");

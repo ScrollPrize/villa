@@ -1,58 +1,51 @@
 #pragma once
 
-#include <QDebug>
-#include <QDir>
-#include <QFileInfo>
 #include <QString>
-#include "vc/core/util/GlobalCacheRoot.hpp"
+
+#include <filesystem>
+
+#include "vc/core/util/RemoteCacheSettings.hpp"
 
 namespace vc3d {
 
-// Single source of truth for where downloaded remote-volume chunks land.
-//
-// Priority — first match wins (shared with headless consumers):
-//   0. explicit host override in <VC3D_CONFIG_DIR or ~/.VC3D>/cache.json
-//   1. /volpkgs/remote_cache    (typical EBS mount on EC2 dev hosts)
-//   2. /ephemeral/remote_cache  (NVMe instance store, scripts/ec2_setup.sh)
-//   3. `suggestion` if non-empty
-//   4. ~/.VC3D/remote_cache
-//
-// If /volpkgs or /ephemeral exists, the cache is forced there and any
-// `suggestion` is ignored: these mounts are the whole point of the host
-// being provisioned, and a stale per-volpkg or per-user setting pointing
-// elsewhere silently fills the root disk.
-//
-// Fail-fast: if /volpkgs or /ephemeral exists but isn't writable by the
-// running user (typical: directory owned by root, mode 0755), we abort
-// rather than fall through — that masks the real problem.
-//
-// The chosen path is created on disk before return.
-inline QString remoteCachePath(const QString& suggestion = {})
+inline QString pathToQString(const std::filesystem::path& path)
 {
-    try {
-        const auto path = vc::core::util::globalCacheRoot(suggestion.trimmed().toStdString());
-        const auto p = QString::fromStdString(path.string());
-        if (!QDir().mkpath(p) || !QFileInfo(p).isWritable())
-            qFatal("remoteCachePath: %s is not writable by this user", qUtf8Printable(p));
-        return p;
-    } catch (const std::exception& error) {
-        qFatal("remoteCachePath: %s", error.what());
-    }
-    return {}; // qFatal does not return
+#ifdef _WIN32
+    return QString::fromStdWString(path.native());
+#else
+    const auto& native = path.native();
+    return QString::fromUtf8(native.data(), static_cast<qsizetype>(native.size()));
+#endif
 }
+
+inline constexpr auto kRemoteCacheDirectorySetting =
+    vc::settings::kRemoteCacheDirectory;
 
 inline QString settingsFilePath()
 {
-    // Settings must stay in the user's home — /ephemeral is lost on stop.
-    // Tests may redirect the otherwise fixed per-user directory without
-    // changing production behavior.
-    QString configDir = qEnvironmentVariable("VC3D_CONFIG_DIR").trimmed();
-    if (configDir.isEmpty()) configDir = QDir::homePath() + "/.VC3D";
-    QDir dir;
-    if (!dir.exists(configDir)) {
-        dir.mkpath(configDir);
-    }
-    return configDir + "/VC3D.ini";
+    return pathToQString(vc::settings::settingsFilePath());
+}
+
+// Process-active root for downloaded remote-volume chunks. The value is fixed
+// on first use; settings changes take effect after VC3D restarts.
+//
+// Priority — first match wins:
+//   0. explicit host override in <VC3D_CONFIG_DIR or ~/.VC3D>/cache.json
+//   1. viewer/remote_cache_dir from the process-wide VC3D settings
+//   2. /volpkgs/remote_cache    (typical EBS mount on EC2 dev hosts)
+//   3. /ephemeral/remote_cache  (NVMe instance store, scripts/ec2_setup.sh)
+//   4. ~/.VC3D/remote_cache
+//
+// Resolution and directory creation are implemented in shared core code so
+// GUI and command-line project loading cannot diverge.
+inline QString remoteCachePath()
+{
+    return pathToQString(vc::settings::remoteCachePath());
+}
+
+inline std::filesystem::path remoteCachePathFs()
+{
+    return vc::settings::remoteCachePath();
 }
 
 // =============================================================================
@@ -159,9 +152,9 @@ namespace viewer {
     constexpr int AXIS_OVERLAY_OPACITY_DEFAULT = 70;
     constexpr bool USE_AXIS_ALIGNED_SLICES_DEFAULT = true;
 
-    // Remote volume chunk cache directory. Resolved through
-    // vc3d::remoteCachePath() — see that function for the priority rules.
-    constexpr auto REMOTE_CACHE_DIR = "viewer/remote_cache_dir";
+    // Process-wide remote volume cache directory. All VC3D consumers resolve
+    // it through vc3d::remoteCachePath().
+    constexpr auto REMOTE_CACHE_DIR = kRemoteCacheDirectorySetting;
 
     // Recent remote zarr URLs used to pre-fill attach dialog
     constexpr auto REMOTE_RECENT_URLS = "viewer/remote_recent_urls";
@@ -217,8 +210,9 @@ namespace perf {
     constexpr int RAM_CACHE_SIZE_GB_DEFAULT = 10;
 
     // Startup-only persistent representation for remote-volume chunks.
-    constexpr auto REMOTE_CACHE_DELTA3D = "perf/remote_cache_delta3d";
-    constexpr bool REMOTE_CACHE_DELTA3D_DEFAULT = false;
+    constexpr auto REMOTE_CACHE_DELTA3D = vc::settings::kRemoteCacheDelta3d;
+    constexpr bool REMOTE_CACHE_DELTA3D_DEFAULT =
+        vc::settings::kRemoteCacheDelta3dDefault;
 
     // Shared budget for every managed remote Zarr chunk beneath the resolved
     // vc3d cache root. Zero maximum means unlimited.

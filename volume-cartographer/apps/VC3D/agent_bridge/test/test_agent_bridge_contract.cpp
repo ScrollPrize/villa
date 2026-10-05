@@ -118,6 +118,18 @@ int main()
         CHECK(jsonRequireFiniteFloat(QJsonValue(123.5), "coord") == 123.5);
     });
 
+    // Imported point and collection identifiers may legitimately be zero.
+    AgentBridgeMethod zeroIdMethod{
+        .name = QStringLiteral("test.zero_ids"),
+        .params = {
+            AgentBridgeParams::requiredSafeId(QStringLiteral("pointId")),
+            AgentBridgeParams::optionalSafeId(QStringLiteral("collectionId")),
+        },
+    };
+    expectNoThrow("safe-id-zero", [&] {
+        zeroIdMethod.validate(QJsonObject{{"pointId", 0}, {"collectionId", 0}});
+    });
+
     // --- jsonToVec3 {x, y, z} ---
     expectParamError("vec3<-not-object", "point",
         [&] { jsonToVec3(QJsonValue(42), "point"); });

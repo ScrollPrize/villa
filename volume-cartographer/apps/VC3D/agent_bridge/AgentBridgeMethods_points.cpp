@@ -105,11 +105,12 @@ void AgentBridgeServer::registerPointsHandlers()
             .name = QStringLiteral("points.update_point"),
             .params = {
                 Params::requiredSafeId(QStringLiteral("pointId")),
+                Params::optionalSafeId(QStringLiteral("collectionId")),
                 point3(QStringLiteral("position"), false),
                 Params::nullable(
                     Params::optionalNumber(QStringLiteral("winding"))),
             },
-            .errors = {-32602, -32000, -32010, -32007},
+            .errors = {-32602, -32000, -32010, -32007, -32008},
             .mcp = Mcp::snakeCase(
                 QStringLiteral("vc3d_update_point"),
                 {QStringLiteral("clear_winding")}),
@@ -121,8 +122,9 @@ void AgentBridgeServer::registerPointsHandlers()
             .name = QStringLiteral("points.remove_point"),
             .params = {
                 Params::requiredSafeId(QStringLiteral("pointId")),
+                Params::optionalSafeId(QStringLiteral("collectionId")),
             },
-            .errors = {-32602, -32000, -32010, -32007},
+            .errors = {-32602, -32000, -32010, -32007, -32008},
             .mcp = Mcp::snakeCase(QStringLiteral("vc3d_remove_point")),
         },
         [this](const QJsonValue& p) { return handlePointsRemovePoint(p); });

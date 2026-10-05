@@ -15,12 +15,27 @@
 #include "vc/core/util/SurfacePatchIndex.hpp"
 #include "vc/ui/VCCollection.hpp"
 
+bool SegmentationModule::prepareEditingDestination(const std::shared_ptr<QuadSurface>& surface)
+{
+    if (!_editingDestinationResolver) return true;
+    // Save workers capture their destination; drain before creating its copy.
+    try {
+        if (_saveFuture.isRunning()) _saveFuture.waitForFinished();
+    } catch (const std::exception& error) {
+        emit statusMessageRequested(tr("Finish the failed surface save before changing destinations: %1")
+            .arg(QString::fromUtf8(error.what())), 15000);
+        return false;
+    }
+    return _editingDestinationResolver(surface);
+}
+
 bool SegmentationModule::beginEditingSession(std::shared_ptr<QuadSurface> surface)
 {
     if (!_editManager || !surface) {
         return false;
     }
 
+    if (!prepareEditingDestination(surface)) return false;
     stopAllPushPull();
     clearUndoStack();
     resetHoverLookupDetail();

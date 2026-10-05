@@ -1,22 +1,15 @@
 #!/usr/bin/env python3
-"""Estimate a constant canvas offset between a label raster and its TIFXYZ.
+"""Estimate a label-to-TIFXYZ canvas shift from CT renders.
 
-Annotations are drawn on rendered surface volumes. When the published render
-does not correspond pixel-for-pixel to the TIFXYZ canvas the transfer reads
-(for example because either side was re-exported), every transferred label
-is offset by a constant number of canvas pixels. Surface geometry cannot
-reveal this: the 3D surfaces still coincide, point-to-surface distances stay
-tiny, and — because the flattening's tangent frame rotates across the sheet —
-no single 3D transform can repair it. The offset is constant in canvas
-space, so it must be measured from image content and corrected in 2D.
+A rendered annotation canvas can be shifted relative to its TIFXYZ even
+when the 3D surfaces agree. Geometry cannot detect this 2D offset, so measure
+it from image content:
 
-This tool projects the source CT render onto the target canvas through the
-TIFXYZ geometry, measures robust tile-wise phase-correlation shifts against
-the native target render, verifies that their spatial field is consistent
-with one translation, and re-projects until the residual vanishes. The
-result is written as JSON whose value feeds
-``transfer.py --label-canvas-offset`` so the correction is always explicit
-and audited, never silently applied.
+1. Project source CT onto the target canvas using TIFXYZ geometry.
+2. Measure tile-wise phase correlation and check for a constant translation.
+3. Update the offset and re-project to check the residual.
+
+Write the offset to JSON for explicit use with ``transfer --label-canvas-offset``.
 """
 
 from __future__ import annotations
@@ -354,21 +347,12 @@ def estimate_canvas_offset(
     max_corner_drift_px: float = 1.5,
     verbose: bool = False,
 ) -> dict:
-    """Iteratively estimate the source render-to-TIFXYZ canvas offset.
+    """Iteratively estimate the source render-to-TIFXYZ offset.
 
-    The offset ``(dy, dx)`` means source render/label pixel ``(i, j)``
-    depicts source TIFXYZ canvas position ``(i + dy, j + dx)`` in the
-    render's own pixel units — the exact semantics of
-    ``transfer_array(label_offset_yx=...)``.
-
-    With current estimate ``o`` and true offset ``o*``, the projection
-    samples the render at canvas position minus ``o``, so the projected
-    image appears displaced by ``o* - o`` relative to the native target
-    render; the measured shift is therefore added directly. The residual is
-    re-measured after every update, so a wrong sign or scale cannot survive
-    silently. After the first correction the remaining shift is known to be
-    small, so later measurements restrict the correlation peak search and
-    cannot lock onto the neighbouring-winding periodicity.
+    In render pixels, ``(dy, dx)`` means pixel ``(i, j)`` depicts source
+    canvas position ``(i + dy, j + dx)``, matching ``label_offset_yx``.
+    The measured residual is true offset minus current estimate, so add it
+    at each iteration. Restrict later peak searches to avoid nearby windings.
     """
 
     offset = np.zeros(2, dtype=np.float64)

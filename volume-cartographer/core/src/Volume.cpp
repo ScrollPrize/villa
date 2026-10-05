@@ -30,7 +30,9 @@
 #include "vc/core/util/HttpFetch.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
 #include "vc/core/util/RemoteFileCache.hpp"
+#include "vc/core/util/RemoteCacheSettings.hpp"
 #include "vc/core/util/PostProcess.hpp"
+#include "vc/core/util/VoxelSizeMetadata.hpp"
 #include "vc/core/render/IChunkedArray.hpp"
 #include "vc/core/render/ChunkFetch.hpp"
 #include "utils/hash.hpp"
@@ -58,92 +60,44 @@ std::string deriveRemoteVolumeName(const std::string& url)
     return normalized.empty() ? std::string("remote") : normalized;
 }
 
+// Record the voxel size resolved from the store's document. When there is
+// none, say so: a volume without one reports 0, and every physical measurement
+// derived from it -- surface areas, the min_area_cm gate, the scale bar --
+// silently becomes 0 too (#1603).
+void applyResolvedVoxelSize(utils::Json& metadata,
+                            std::optional<double> resolved,
+                            const std::string& description)
+{
+    if (resolved) {
+        metadata["voxelsize"] = *resolved;
+        return;
+    }
+    if (vc::json::number_or(metadata, "voxelsize", 0.0) > 0.0) {
+        return;
+    }
+    Logger()->warn(
+        "volume '{}': no voxel size in its store metadata, so physical measurements "
+        "are unavailable for it",
+        description);
+}
+
 std::optional<utils::Json> loadRemoteVolumeMetadata(const std::string& remoteUrl,
                                                     const vc::HttpAuth& auth)
 {
-    const auto numberFromObject = [](const utils::Json& obj,
-                                     std::initializer_list<const char*> keys) -> std::optional<double> {
-        if (!obj.is_object()) {
-            return std::nullopt;
-        }
-        for (const char* key : keys) {
-            if (!obj.contains(key)) {
-                continue;
-            }
-            const auto& value = obj[key];
-            if (value.is_number()) {
-                return value.get_double();
-            }
-            if (value.is_string()) {
-                try {
-                    return std::stod(value.get_string());
-                } catch (...) {
-                }
-            }
-        }
-        return std::nullopt;
-    };
-
-    const auto voxelSizeFromMetadata = [&](const utils::Json& obj) -> std::optional<double> {
-        const auto keys = {
-            "voxelsize",
-            "voxel_size_um",
-            "voxelSizeUm",
-            "pixel_size_um",
-            "pixelSizeUm",
-            "resolution_um",
-        };
-        if (auto value = numberFromObject(obj, keys)) {
-            return value;
-        }
-        for (const char* key : {"scan", "volume", "properties", "metadata"}) {
-            if (obj.is_object() && obj.contains(key)) {
-                if (auto value = numberFromObject(obj[key], keys)) {
-                    return value;
-                }
-            }
-        }
-        return std::nullopt;
-    };
-
     const auto normalize = [&](utils::Json json, const std::string& url) -> utils::Json {
         if (!json.is_object()) {
             throw std::runtime_error("remote volume metadata is not an object: " + url);
         }
+        // Resolve from the document as published, before `scan` is flattened
+        // into the root.
+        const auto voxelSize = vc::metadata::voxelSizeFromStoreMetadata(json);
         if (json.contains("scan") && json["scan"].is_object()) {
             json.update(json["scan"]);
         }
         if (!json.contains("format")) {
             json["format"] = "zarr";
         }
-
-        bool hasVoxelSize = false;
-        if (json.contains("voxelsize") && json["voxelsize"].is_number()) {
-            hasVoxelSize = json["voxelsize"].get_double() > 0.0;
-        }
-        if (!hasVoxelSize) {
-            if (auto voxelSize = voxelSizeFromMetadata(json); voxelSize && *voxelSize > 0.0) {
-                json["voxelsize"] = *voxelSize;
-                hasVoxelSize = true;
-            }
-        }
-        if (!hasVoxelSize) {
-            const utils::Json* current = &json;
-            for (const char* key : {"scan", "tomo", "acquisition", "detector"}) {
-                if (!current->is_object() || !current->contains(key)) {
-                    current = nullptr;
-                    break;
-                }
-                current = &(*current)[key];
-            }
-            if (current && current->is_object() &&
-                current->contains("samplePixelSize") &&
-                (*current)["samplePixelSize"].is_number()) {
-                const double millimeters = (*current)["samplePixelSize"].get_double();
-                if (std::isfinite(millimeters) && millimeters > 0.0)
-                    json["voxelsize"] = millimeters * 1000.0;
-            }
-        }
+        applyResolvedVoxelSize(json, voxelSize, url);
         return json;
     };
 
@@ -1084,11 +1038,15 @@ void Volume::loadMetadata()
             throw std::runtime_error(
                 "metadata.json missing 'scan' key: " + altPath.string());
         }
+        // Resolve from the document as published, before `scan` is flattened
+        // into the root.
+        const auto voxelSize = vc::metadata::voxelSizeFromStoreMetadata(full);
         metadata_ = full;
         metadata_.update(full["scan"]);
         if (!metadata_.contains("format")) {
             metadata_["format"] = "zarr";
         }
+        applyResolvedVoxelSize(metadata_, voxelSize, altPath.string());
         metaPath = altPath;
     } else {
         metadata_["uuid"] = deriveLocalVolumeId(path_);
@@ -1323,7 +1281,6 @@ std::shared_ptr<Volume> Volume::New(std::filesystem::path path,
 
 std::shared_ptr<Volume> Volume::NewFromUrl(
     const std::string& url,
-    const std::filesystem::path& cacheRoot,
     const vc::HttpAuth& authIn,
     const utils::Json& metadata,
     bool discoverAwsCredentials)
@@ -1358,7 +1315,7 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
     vol->remoteLocator_ = spec.portableLocator;
     vol->baseScaleLevel_ = spec.baseScaleLevel;
     vol->remoteAuth_ = auth;
-    vol->remoteCacheRoot_ = cacheRoot;
+    vol->remoteCacheRoot_ = vc::settings::remoteCachePath();
     vol->remoteNumScales_ = opened.shapes.size();
     vol->zarrLevelShapes_ = opened.shapes;
     vol->zarrLevelChunkShapes_ = opened.chunkShapes;
@@ -1617,7 +1574,11 @@ size_t Volume::chunkCount(int level) const
 std::array<int, 3> Volume::shapeXyz() const noexcept { return {_width, _height, _slices}; }
 double Volume::voxelSize() const
 {
-    return metadata_["voxelsize"].get_double();
+    // 0 means unknown. A document may state the key as null, as text, or not
+    // at all, and a physical measurement must degrade to "unavailable" rather
+    // than throw from deep inside whatever asked for it.
+    const double value = vc::json::number_or(metadata_, "voxelsize", 0.0);
+    return std::isfinite(value) && value > 0.0 ? value : 0.0;
 }
 
 size_t Volume::dtypeSize() const noexcept

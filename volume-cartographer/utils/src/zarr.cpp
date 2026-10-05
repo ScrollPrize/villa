@@ -1777,10 +1777,7 @@ ZarrArray::decode_chunk_from_storage_object(
         return decode_chunk_payload(object_bytes);
 
     const auto location = storage_object_location(chunk_indices);
-    auto encoded = extract_inner_chunk(object_bytes, location.inner_indices);
-    if (!encoded)
-        return std::nullopt;
-    return decode_chunk_payload(*encoded);
+    return extract_inner_chunk(object_bytes, location.inner_indices);
 }
 
 std::optional<std::vector<std::size_t>>

@@ -7,6 +7,7 @@ import numpy as np
 import torch
 
 from sample_spiral import (
+    get_radial_normal_stretch,
     get_theta_and_radii,
     get_theta_crossing_step_adjustments,
     radius_from_unwrapped_shifted,
@@ -635,7 +636,10 @@ def _build_strip_spiral_context(slice_to_spiral_transform, dr_per_winding, flat,
     # Shared front-half of the per-strip satisfaction pass: given a flat bundle
     # from the caller, transform points into spiral space, unwrap theta across
     # strip boundaries, and produce the per-point normalised
-    # shifted-radius (`unwrapped_shifted - windings * dr`). Returns
+    # shifted-radius (`unwrapped_shifted - windings * dr - radial_offsets`, the
+    # offsets converted from input-frame voxels along the sheet normal to spiral
+    # radius by the transform's local normal stretch; positive = the fiber sits
+    # outside its winding, on the sheet's back face). Returns
     # `(ctx, lengths_cpu, num_strips)` where `ctx` is None when there are no
     # points; downstream target-winding selectors (median / mode) operate on
     # `ctx['normalised_radii']` and feed the picked per-strip target through
@@ -662,6 +666,9 @@ def _build_strip_spiral_context(slice_to_spiral_transform, dr_per_winding, flat,
 
     zyxs = flat['zyxs']
     windings = flat['windings']
+    radial_offsets = flat.get('radial_offsets')
+    if radial_offsets is None:
+        radial_offsets = torch.zeros_like(windings)
     strip_id = flat['strip_id']
     starts = flat['starts']
     lengths = flat['lengths']
@@ -670,6 +677,10 @@ def _build_strip_spiral_context(slice_to_spiral_transform, dr_per_winding, flat,
 
     with torch.no_grad():
         spiral_zyxs = transform_in_chunks(zyxs, slice_to_spiral_transform)
+        if bool((radial_offsets != 0).any()):
+            radial_offsets = radial_offsets * get_radial_normal_stretch(
+                slice_to_spiral_transform, zyxs, spiral_zyx=spiral_zyxs,
+                chunk_size=chunk)
         theta, _, shifted_radii = get_theta_and_radii(spiral_zyxs[..., 1:], dr_per_winding)
 
         # Segmented version of _unwrap_track_shifted_radii: build
@@ -690,7 +701,7 @@ def _build_strip_spiral_context(slice_to_spiral_transform, dr_per_winding, flat,
             adjustments = torch.zeros_like(shifted_radii)
         unwrapped_shifted = shifted_radii + adjustments
 
-        normalised_radii = unwrapped_shifted - windings * dr
+        normalised_radii = unwrapped_shifted - windings * dr - radial_offsets
 
     ctx = {
         'spiral_tolerance': spiral_tolerance,
@@ -703,6 +714,7 @@ def _build_strip_spiral_context(slice_to_spiral_transform, dr_per_winding, flat,
         'slice_to_spiral_transform': slice_to_spiral_transform,
         'zyxs': zyxs,
         'windings': windings,
+        'radial_offsets': radial_offsets,
         'strip_id': strip_id,
         'starts': starts,
         'lengths': lengths,
@@ -726,6 +738,7 @@ def _strip_satisfaction_from_target(ctx, target_normalised_per_strip):
     S = ctx['S']
     strip_id = ctx['strip_id']
     windings = ctx['windings']
+    radial_offsets = ctx['radial_offsets']
     theta = ctx['theta']
     adjustments = ctx['adjustments']
     unwrapped_shifted = ctx['unwrapped_shifted']
@@ -739,7 +752,7 @@ def _strip_satisfaction_from_target(ctx, target_normalised_per_strip):
 
     with torch.no_grad():
         target_normalised = target_normalised_per_strip[strip_id]
-        target_shifted = target_normalised + windings * dr
+        target_shifted = target_normalised + windings * dr + radial_offsets
         spiral_in_band = (unwrapped_shifted - target_shifted).abs() <= spiral_tolerance
 
         target_radii = radius_from_unwrapped_shifted(
@@ -809,9 +822,6 @@ def save_overlay_and_print_satisfaction(
     patch_atlas,
     unattached_pcl_strips,
     tracks,
-    unverified_patches_list,
-    unverified_patches_dict,
-    unverified_patch_atlas,
     out_path,
     cfg,
     z_begin,
@@ -828,6 +838,7 @@ def save_overlay_and_print_satisfaction(
     render_volume_scale,
     voxel_size_um,
     get_or_build_unattached_pcl_flat,
+    z_direction_is_top_to_bottom,
     run_tag=None,
     save_png_visualizations=False,
     progress=None,
@@ -940,44 +951,6 @@ def save_overlay_and_print_satisfaction(
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             print('WARNING: skipped satisfied_tracks metric (CUDA OOM during track evaluation)')
-    # Unverified patches are reported entirely separately so they never inflate the verified
-    # satisfaction numbers.
-    unverified_patch_satisfaction_entries = []
-    if unverified_patches_list:
-        unverified_evaluation = evaluate_patch_satisfaction_packed(
-            slice_to_spiral_transform, dr_per_winding,
-            unverified_patches_list, unverified_patch_atlas,
-            z_begin, z_end, include_splicing=False, verbose=False)
-        unverified_profile = unverified_evaluation.profiles['strict']
-        u_satisfied = unverified_profile.satisfied_patches
-        u_sat_areas = unverified_profile.satisfied_areas
-        u_tot_areas = unverified_profile.total_areas
-        u_count = int(u_satisfied.sum().item())
-        u_total = u_satisfied.numel()
-        u_ratio = u_count / max(u_total, 1)
-        print(f'unverified_satisfied_patches = {u_count}/{u_total} ({u_ratio * 100:.1f}%)')
-        u_sat_area = float(u_sat_areas.sum().item())
-        u_tot_area = float(u_tot_areas.sum().item())
-        u_area_ratio = u_sat_area / max(u_tot_area, 1e-9)
-        print(f'unverified_satisfied_area = {u_sat_area:.1f}/{u_tot_area:.1f} ({u_area_ratio * 100:.1f}%)')
-        satisfaction_summary.update({
-            'unverified_satisfied_patches': u_count,
-            'unverified_total_patches': u_total,
-            'unverified_satisfied_patches_fraction': u_ratio,
-            'unverified_satisfied_area': u_sat_area,
-            'unverified_total_area': u_tot_area,
-            'unverified_satisfied_area_fraction': u_area_ratio,
-        })
-        for pid, sat_area_t, tot_area_t in zip(unverified_patches_dict.keys(), u_sat_areas.tolist(), u_tot_areas.tolist()):
-            fraction = sat_area_t / tot_area_t if tot_area_t > 0 else 0.0
-            unverified_patch_satisfaction_entries.append({
-                'id': pid,
-                'satisfied_area': sat_area_t,
-                'total_area': tot_area_t,
-                'fraction': fraction,
-            })
-        unverified_patch_satisfaction_entries.sort(key=lambda e: e['fraction'])
-
     patch_ids = list(patches_dict.keys())
     patch_satisfaction_entries = []
     for pid, sat_area_t, tot_area_t in zip(patch_ids, satisfied_areas.tolist(), total_areas.tolist()):
@@ -1008,7 +981,6 @@ def save_overlay_and_print_satisfaction(
         json.dump({
             'patches': patch_satisfaction_entries,
             'pcls': pcl_satisfaction_entries,
-            'unverified_patches': unverified_patch_satisfaction_entries,
         }, f, indent=2)
     with open(f'{out_path}/satisfaction_metrics_{suffix}.json', 'w') as f:
         json.dump({'summary': satisfaction_summary}, f, indent=2)
@@ -1087,6 +1059,7 @@ def save_overlay_and_print_satisfaction(
             winding_range=winding_range,
             patch_satisfaction_evaluation=patch_evaluation,
             patch_atlas=patch_atlas,
+            z_direction_is_top_to_bottom=z_direction_is_top_to_bottom,
             tracks=tracks,
             run_tag=run_tag, name=suffix, progress=progress,
         )

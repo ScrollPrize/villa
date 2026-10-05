@@ -11,6 +11,7 @@ import fit_data
 @dataclass(frozen=True)
 class DataConfig:
 	input: str
+	init_shell_dir: str | None                           # optional fit-service path for shell-dir-crop init
 	device: str
 	downscale: float
 	crop: tuple[int, int, int, int, int, int] | None  # (x, y, z, w, h, d) fullres
@@ -30,6 +31,8 @@ class DataConfig:
 def add_args(p: argparse.ArgumentParser) -> None:
 	g = p.add_argument_group("data")
 	g.add_argument("--input", default=None)
+	g.add_argument("--init-shell-dir", default=None,
+		help="Shell directory for shell-dir-crop init; overrides init_shell_dir in the input manifest")
 	g.add_argument("--device", default="cuda")
 	g.add_argument("--downscale", type=float, default=4.0)
 	g.add_argument("--crop", type=int, nargs=6, default=None,
@@ -81,6 +84,11 @@ def from_args(args: argparse.Namespace) -> DataConfig:
 		winding_volume = str(winding_volume)
 	return DataConfig(
 		input=str(args.input),
+		init_shell_dir=(
+			str(args.init_shell_dir).strip()
+			if getattr(args, "init_shell_dir", None) not in (None, "")
+			else None
+		),
 		device=str(args.device),
 		downscale=float(args.downscale),
 		crop=crop,

@@ -524,14 +524,15 @@ void SegmentationModule::handleMousePress(VolumeViewerBase* viewer,
         }
         // Plain click: find nearest point for select or drag-to-move
         auto nearest = findNearestPoint(worldPos);
-        if (nearest.pointId != 0) {
+        if (nearest.point) {
             // Start point move drag (select happens on release if no movement)
-            beginPointMoveDrag(nearest.pointId, nearest.collectionId, viewer, worldPos);
+            beginPointMoveDrag(nearest.point->pointId, nearest.point->collectionId,
+                               viewer, worldPos);
             return;
         }
         // Click on empty space: deselect
-        emit annotationPointSelected(0);
-        emit annotationCollectionSelected(0);
+        _selectedAnnotationCollectionId.reset();
+        emit annotationSelectionCleared();
         return;
     }
 
@@ -827,11 +828,11 @@ void SegmentationModule::handleMouseDoubleClick(VolumeViewerBase* /*viewer*/,
 
     // Double-click on a point: select + focus
     auto nearest = findNearestPoint(worldPos);
-    if (nearest.pointId != 0) {
-        _selectedAnnotationCollectionId = nearest.collectionId;
-        emit annotationCollectionSelected(nearest.collectionId);
-        emit annotationPointSelected(nearest.pointId);
-        emit annotationPointFocused(nearest.pointId);
+    if (nearest.point) {
+        _selectedAnnotationCollectionId = nearest.point->collectionId;
+        emit annotationCollectionSelected(nearest.point->collectionId);
+        emit annotationPointSelected(*nearest.point);
+        emit annotationPointFocused(*nearest.point);
     }
 }
 

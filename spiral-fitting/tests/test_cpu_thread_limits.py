@@ -2,7 +2,6 @@ from pathlib import Path
 
 import numpy as np
 
-import fit_spiral
 import tracks
 from runners import run_sweep
 
@@ -34,24 +33,6 @@ def test_sweep_child_accepts_cpu_thread_override(tmp_path):
         args, "baseline", tmp_path / "baseline.json", (0,))
 
     assert command[command.index("--num-threads") + 1] == "3"
-
-
-def test_trusted_geometry_query_respects_configured_cpu_threads(monkeypatch):
-    class RecordingTree:
-        workers = None
-
-        def query(self, points, *, k, distance_upper_bound, workers):
-            self.workers = workers
-            return np.zeros(len(points)), np.zeros(len(points), dtype=np.intp)
-
-    tree = RecordingTree()
-    monkeypatch.setattr(fit_spiral.torch, "get_num_threads", lambda: 6)
-
-    result = fit_spiral._query_near_trusted_geometry(
-        np.zeros((2, 3)), tree, threshold=4.0)
-
-    assert tree.workers == 6
-    np.testing.assert_array_equal(result, np.ones(2, dtype=bool))
 
 
 def test_track_exclusion_query_respects_configured_cpu_threads(monkeypatch):

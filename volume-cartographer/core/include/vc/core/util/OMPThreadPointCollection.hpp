@@ -1,6 +1,7 @@
 #pragma once
 #include <vector>
 #include <opencv2/core/matx.hpp>
+#include <opencv2/core/types.hpp>
 
 #include "omp.h"
 
@@ -60,9 +61,12 @@ public:
         int t_id = omp_get_thread_num();
         if (_thread_idx[t_id] == -1)
             _thread_idx[t_id] = rand() % _thread_count;
-        _thread_points[t_id] = {-1,-1};
 #pragma omp critical
-        _thread_points[t_id] = extract_point_min_dist(_points, _thread_points, _thread_idx[t_id], _dist);
+        {
+            _thread_points[t_id] = {-1,-1};
+            _thread_points[t_id] = extract_point_min_dist(
+                _points, _thread_points, _thread_idx[t_id], _dist);
+        }
         return _thread_points[t_id];
     }
 

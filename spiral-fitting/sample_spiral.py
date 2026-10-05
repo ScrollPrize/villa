@@ -124,6 +124,91 @@ def radius_from_unwrapped_shifted(
     return raw_shifted_radii + theta / (2 * np.pi) * dr_per_winding
 
 
+def get_radial_covector_in_scroll_space(slice_to_spiral_transform, scroll_zyx, spiral_zyx=None, epsilon=6.0):
+    """Pull the spiral-space radial unit normal back to scroll space, unnormalised.
+
+    At each scroll-space point the outward radial direction of spiral space,
+    normalize(spiral_yx), is a surface normal of the fitted sheet; a normal
+    is a covector and transports as ``J^T n`` with ``J = d(spiral)/d(scroll)``
+    (unlike a tangent vector, which pushes forward as ``J d``). ``J`` is
+    estimated by central differences of ``epsilon`` along the three scroll
+    axes. Returns ``J^T n`` (num_points, 3) in zyx, *not* normalised: its
+    direction is the scroll-space sheet normal and its length is the local
+    stretch of the transform along that normal (see
+    get_radial_normal_stretch). Gradient flows through the transform
+    parameters via the Jacobian only; the sample positions and the radial
+    direction are held fixed. If the forward image ``spiral_zyx`` is supplied
+    it is reused for the radial direction (as a constant); otherwise it is
+    computed here.
+    """
+    device = scroll_zyx.device
+    num_points = scroll_zyx.shape[0]
+    scroll_zyx = scroll_zyx.detach()
+
+    basis_zyx = torch.eye(3, device=device, dtype=scroll_zyx.dtype) * epsilon
+    scroll_plus = (scroll_zyx[None, :, :] + basis_zyx[:, None, :]).reshape(-1, 3)
+    scroll_minus = (scroll_zyx[None, :, :] - basis_zyx[:, None, :]).reshape(-1, 3)
+    if spiral_zyx is None:
+        combined_spiral = slice_to_spiral_transform(torch.cat([scroll_zyx, scroll_plus, scroll_minus], dim=0))
+        spiral_zyx = combined_spiral[:num_points]
+        spiral_plus, spiral_minus = combined_spiral[num_points:].chunk(2, dim=0)
+    else:
+        spiral_plus, spiral_minus = slice_to_spiral_transform(torch.cat([scroll_plus, scroll_minus], dim=0)).chunk(2, dim=0)
+
+    spiral_outward_yx = torch.nn.functional.normalize(spiral_zyx[:, 1:].detach(), dim=-1)
+    spiral_outward_zyx = torch.cat([torch.zeros_like(spiral_outward_yx[:, :1]), spiral_outward_yx], dim=-1)
+
+    spiral_plus = spiral_plus.view(3, num_points, 3)
+    spiral_minus = spiral_minus.view(3, num_points, 3)
+    jacobian_columns = (spiral_plus - spiral_minus) / (2.0 * epsilon)  # scroll basis axis, point, spiral zyx
+    return (jacobian_columns * spiral_outward_zyx[None, :, :]).sum(dim=-1).transpose(0, 1)
+
+
+# Central-difference step (input-frame voxels) for the normal-stretch estimate
+# behind the vertical-fiber radial offset. Matches constraint_baking's
+# direction-transport default; the flow field is smooth at this scale.
+RADIAL_OFFSET_STRETCH_EPSILON = 2.0
+
+
+def get_radial_normal_stretch(slice_to_spiral_transform, scroll_zyx, spiral_zyx=None, *,
+                              epsilon=RADIAL_OFFSET_STRETCH_EPSILON, device=None,
+                              chunk_size=65536):
+    """Local stretch of the transform along the fitted sheet's normal, ``|J^T n|``.
+
+    A displacement of ``d`` input-frame voxels along the scroll-space sheet
+    normal ``m = J^T n / |J^T n|`` (the scan-space gradient of the fitted
+    winding, which is not in general the line to the umbilicus) lands
+    ``d * n . J m = d * |J^T n|`` further out in spiral radius, so a physical
+    offset measured in the input frame is converted to a spiral-space radial
+    offset by this factor (1 under a rigid motion; the gap expander and flow
+    make it vary per point). The vertical-fiber offset is applied along
+    ``m`` itself, the increasing-winding direction (the sheet's back face,
+    away from the umbilicus). Evaluated
+    under no_grad, chunked and RNG-free, with each chunk staged to ``device``
+    when given (the transform's device) and the result returned on
+    ``scroll_zyx``'s device as (num_points,) float32. ``spiral_zyx`` may
+    supply the already-computed forward image of ``scroll_zyx``.
+    """
+    scroll_zyx = torch.as_tensor(scroll_zyx)
+    flat = scroll_zyx.reshape(-1, 3)
+    out = torch.empty(flat.shape[0], dtype=torch.float32, device=flat.device)
+    if flat.shape[0] == 0:
+        return out
+    spiral_flat = None if spiral_zyx is None else torch.as_tensor(spiral_zyx).reshape(-1, 3)
+    target = device if device is not None else flat.device
+    with torch.no_grad():
+        for start in range(0, flat.shape[0], chunk_size):
+            points = flat[start:start + chunk_size].to(device=target, dtype=torch.float32)
+            image = None
+            if spiral_flat is not None:
+                image = spiral_flat[start:start + chunk_size].to(device=target, dtype=torch.float32)
+            covector = get_radial_covector_in_scroll_space(
+                slice_to_spiral_transform, points, spiral_zyx=image, epsilon=epsilon)
+            out[start:start + chunk_size] = torch.linalg.norm(covector, dim=-1).to(
+                device=out.device, dtype=out.dtype)
+    return out
+
+
 def get_bounding_windings(relative_yx, dr_per_winding):
     # The spiral has radius 0 at winding angle 0 then increases linearly at rate dr_per_winding
     # Want to find the two windings that bracket yx

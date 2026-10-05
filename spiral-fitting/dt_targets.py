@@ -30,7 +30,7 @@ import numpy as np
 import torch
 
 from spiral_sampling import load_spiral_sampling
-from sample_spiral import get_theta_and_radii
+from sample_spiral import get_radial_normal_stretch, get_theta_and_radii
 
 
 _spiral_sampling = load_spiral_sampling()
@@ -588,12 +588,17 @@ def _merge_endpoint_strip_caches(caches):
 def compute_strip_dt_target_cache(
     slice_to_spiral_transform, dr_per_winding, zyxs, starts,
     windings=None, floating_threshold=0.25, num_points_per_strip=None, max_stride=None,
-    chunk_size=65536, max_total_points=None,
+    chunk_size=65536, max_total_points=None, radial_offsets=None,
 ):
     # Whole-strip DT target determination for ordered point strips (unattached-pcl
     # strips and tracks), given their flat concatenated bundle: zyxs (N, 3) and
     # starts (T+1,) both on device, plus per-point winding-annotation offsets
-    # `windings` (N,; None => zeros, i.e. tracks). Long strips are decimated to at
+    # `windings` (N,; None => zeros, i.e. tracks) and per-point radial target
+    # offsets `radial_offsets` in input-frame voxels along the sheet normal (N,;
+    # None => zeros; vertical fiber strips sit on the sheet's back face, so a
+    # positive offset places the fiber outside its winding), which
+    # are converted to spiral radius per point by the transform's local normal
+    # stretch (sample_spiral.get_radial_normal_stretch). Long strips are decimated to at
     # approximately num_points_per_strip evenly-spaced points. max_stride is a hard
     # upper bound, in voxels, on the gap between retained points; strip points are
     # nominally at ~voxel spacing, so it is applied directly as an index stride, and
@@ -639,6 +644,8 @@ def compute_strip_dt_target_cache(
                 slice_to_spiral_transform, dr_per_winding,
                 zyxs[p0:p1], starts[s0:s1 + 1] - starts[s0],
                 windings=windings[p0:p1] if windings is not None else None,
+                radial_offsets=(radial_offsets[p0:p1]
+                                if radial_offsets is not None else None),
                 floating_threshold=floating_threshold,
                 num_points_per_strip=num_points_per_strip,
                 max_stride=max_stride, chunk_size=chunk_size,
@@ -678,6 +685,8 @@ def compute_strip_dt_target_cache(
         zyxs = zyxs[src.to(zyxs.device)].to(device)
         if windings is not None:
             windings = windings[src.to(windings.device)].to(device)
+        if radial_offsets is not None:
+            radial_offsets = radial_offsets[src.to(radial_offsets.device)].to(device)
         starts = new_starts
         lengths = counts
     else:
@@ -685,8 +694,14 @@ def compute_strip_dt_target_cache(
         zyxs = zyxs.to(device)
         if windings is not None:
             windings = windings.to(device)
+        if radial_offsets is not None:
+            radial_offsets = radial_offsets.to(device)
 
     spiral_zyxs = _transform_in_chunks(slice_to_spiral_transform, zyxs, chunk_size)
+    if radial_offsets is not None and bool((radial_offsets != 0).any()):
+        radial_offsets = radial_offsets * get_radial_normal_stretch(
+            slice_to_spiral_transform, zyxs, spiral_zyx=spiral_zyxs,
+            chunk_size=chunk_size)
     theta, _, shifted = get_theta_and_radii(spiral_zyxs[..., 1:], dr_per_winding)
     dr = dr_per_winding.detach()
 
@@ -709,6 +724,8 @@ def compute_strip_dt_target_cache(
     values = shifted + adjustments.to(shifted.dtype) * dr
     if windings is not None:
         values = values - windings * dr
+    if radial_offsets is not None:
+        values = values - radial_offsets
 
     # Determine the same ambiguity-aware whole-object target as patches, using
     # segmented sorts to obtain per-strip medians without a GPU-synchronising loop.

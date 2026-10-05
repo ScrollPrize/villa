@@ -23,7 +23,9 @@ struct CompositeParams {
     float blAmbient = 0.1f;           // Ambient light (background illumination)
 
     // Pre-processing
-    uint8_t isoCutoff = 0;           // Highpass filter: values below this are set to 0
+    uint8_t isoCutoff = 0;           // Highpass filter: layers whose value is below
+                                     // this are dropped from the stack, not zeroed,
+                                     // so they leave the mean/max/min denominator
 
     // Volumetric mode camera + transfer function (GUI viewer only; unused by
     // the CLI/scalar methods). Turntable model: camAzimuthDeg spins the patch

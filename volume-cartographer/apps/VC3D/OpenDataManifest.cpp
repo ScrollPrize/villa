@@ -5,6 +5,10 @@
 #include "vc/core/util/HttpFetch.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
 
+#include <QDir>
+#include <QStandardPaths>
+#include <QString>
+
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -756,6 +760,15 @@ OpenDataManifest fetchOpenDataManifest(std::string manifestUrl)
         throw std::runtime_error("Failed to fetch open-data manifest: " + manifestUrl);
     }
     return parseOpenDataManifest(body, std::move(manifestUrl));
+}
+
+std::filesystem::path cachedOpenDataManifestPath()
+{
+    QString base = QStandardPaths::writableLocation(QStandardPaths::CacheLocation);
+    if (base.isEmpty()) {
+        base = QDir::home().filePath(QStringLiteral(".VC3D"));
+    }
+    return std::filesystem::path(base.toStdString()) / "open-data-catalog" / "metadata.json";
 }
 
 std::string resolveOpenDataUrl(std::string url)

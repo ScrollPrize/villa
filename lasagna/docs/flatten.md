@@ -1,6 +1,6 @@
 # Flattening Implementation Status
 
-Status date: 2026-05-21
+Status date: 2026-09-09
 
 This document summarizes the current `model-init=flatten` implementation in
 `lasagna`, with enough context for a developer to continue the work.

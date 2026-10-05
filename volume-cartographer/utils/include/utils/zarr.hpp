@@ -746,7 +746,8 @@ public:
     [[nodiscard]] std::optional<ShardBytes>
     read_whole_shard(std::span<const std::size_t> chunk_indices) const;
 
-    /// Extract a single inner chunk from shard data.
+    /// Extract and decode a single inner chunk from shard data, including
+    /// byte-order conversion. The returned bytes must not be decoded again.
     [[nodiscard]] std::optional<std::vector<std::byte>>
     extract_inner_chunk(std::span<const std::byte> shard_data,
                         std::span<const std::size_t> inner_indices) const;

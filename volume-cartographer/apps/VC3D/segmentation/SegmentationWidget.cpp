@@ -167,6 +167,8 @@ void SegmentationWidget::buildUi()
             this, &SegmentationWidget::correctionsCreateRequested);
     connect(_correctionsPanel, &SegmentationCorrectionsPanel::correctionsCollectionSelected,
             this, &SegmentationWidget::correctionsCollectionSelected);
+    connect(_correctionsPanel, &SegmentationCorrectionsPanel::correctionsCollectionSelectionCleared,
+            this, &SegmentationWidget::correctionsCollectionSelectionCleared);
 
     // Forward neural tracer panel signals
     connect(_neuralTracerPanel, &SegmentationNeuralTracerPanel::neuralTracerEnabledChanged,

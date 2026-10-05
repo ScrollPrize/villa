@@ -6,6 +6,7 @@
 #include <QMetaObject>
 #include <QPointer>
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <functional>
@@ -42,8 +43,10 @@ class QVariantAnimation;
 class QVBoxLayout;
 class QSplitter;
 class QSpinBox;
+class QDoubleSpinBox;
 class ViewerManager;
 class PlaneSurface;
+namespace vc::fiber_tracer { struct FiberWidthDragResult; }
 class QuadSurface;
 
 class LineAnnotationDialog : public QMainWindow
@@ -51,6 +54,7 @@ class LineAnnotationDialog : public QMainWindow
     Q_OBJECT
 
 public:
+    void setFiberWidth(double baseVoxels, double gapFraction);
     enum class ReoptimizationMode {
         AutoReoptimize,
         NoOptimization,
@@ -82,16 +86,24 @@ public:
         QGraphicsPathItem* controlPoints = nullptr;
         QGraphicsPathItem* seedPoints = nullptr;
         QGraphicsPathItem* linkCandidatePoints = nullptr;
-        QGraphicsPathItem* splitCandidatePoints = nullptr;
         QGraphicsPathItem* branchControlPoints = nullptr;
         QGraphicsPathItem* pendingBranchControlPoints = nullptr;
         QGraphicsPathItem* sameHvBranchControlPoints = nullptr;
         QGraphicsPathItem* sameHvPendingBranchControlPoints = nullptr;
+        // Hollow yellow rings of kollesis-tagged points, drawn over whichever
+        // fill (link state) the point keeps; an unlinked tagged point has no
+        // fill at all.
+        QGraphicsPathItem* kollesisRings = nullptr;
+        // Dotted amber rings of break-tagged points, same layering rule.
+        QGraphicsPathItem* breakRings = nullptr;
         QGraphicsPathItem* fiberIntersections = nullptr;
         QGraphicsPathItem* linkCandidateFiberIntersections = nullptr;
-        QGraphicsPathItem* branchLinkFiberIntersections = nullptr;
-        QGraphicsPathItem* pendingBranchLinkFiberIntersections = nullptr;
-        QGraphicsPathItem* fiberIntersectionConnectors = nullptr;
+        // One item per link state (kLinkStateCount, indexed by
+        // linkStateIndex): the projected X of a linked fiber and the
+        // connector from the local control point, both in that state's colour.
+        static constexpr size_t kLinkStateCount = 4;
+        std::array<QGraphicsPathItem*, kLinkStateCount> branchLinkFiberIntersections{};
+        std::array<QGraphicsPathItem*, kLinkStateCount> fiberIntersectionConnectors{};
         QGraphicsPathItem* ghostControlPointPrev = nullptr;
         QGraphicsPathItem* ghostControlPointNext = nullptr;
     };
@@ -136,9 +148,9 @@ public:
         const QPointF& scenePoint,
         const QPoint& globalPos,
         const vc3d::line_annotation::GeneratedLinkCandidateMenuState& linkCandidateState = {},
-        const vc3d::line_annotation::GeneratedLinkCandidateMenuState& splitCandidateState = {},
-        const vc3d::line_annotation::GeneratedLinkCandidateMenuState& splitAndLinkCandidateState = {},
-        const vc3d::line_annotation::GeneratedLinkCandidateMenuState& mergeCandidateState = {});
+        const vc3d::line_annotation::GeneratedLinkCandidateMenuState& mergeCandidateState = {},
+        const vc3d::line_annotation::GeneratedLinkCandidateMenuState& newLinkedToCandidateState = {},
+        std::function<QString(uint64_t)> fiberDisplayNameForId = {});
     const std::vector<Pane>& panes() const { return _panes; }
     ReoptimizationMode reoptimizationMode() const;
     int initialCenterlineLengthVx() const;
@@ -197,6 +209,17 @@ public:
     bool cutFollowEnabled() const { return _currentCutFollowsStripMouse; }
 
 signals:
+    void volumeOverlayToggleRequested();
+    void fiberWidthChanged(double baseVoxels);
+    void controlDisplayAngleChanged(size_t controlIndex, double degrees);
+    void controlDirectionChanged(size_t controlIndex, cv::Vec3f direction);
+    void clearFiberCorrectionsRequested();
+    void clearControlCorrectionsRequested(size_t controlIndex);
+    void controlDirectionCreated(cv::Vec3f point, double linePosition,
+                                 cv::Vec3f lineAnchor, cv::Vec3f direction);
+    void crossSectionDragFinished(const std::string& surfaceName, cv::Vec3f point,
+                                  double linePosition, cv::Vec3f lineAnchor,
+                                  cv::Vec3f normal, bool edge);
     void paneClosed(const std::string& surfaceName);
     void lineSeedRequested(const std::string& surfaceName, cv::Vec3f volumePoint, QPointF scenePoint);
     // lineAnchor: the 3D point of linePosition on the DISPLAYED line, so the
@@ -209,31 +232,38 @@ signals:
     void generatedControlPointDeleteRequested(const std::string& surfaceName,
                                               double linePosition,
                                               cv::Vec3f volumePoint);
-    void generatedControlPointBranchRequested(const std::string& surfaceName,
-                                              size_t controlPointIndex,
-                                              cv::Vec3f linkedControlPoint,
-                                              bool openAfterCreate,
-                                              cv::Vec3f linkDirection);
+    // New fiber seeded at volumePoint, seed control point linked to the
+    // designated link candidate; linkDirection is the clicked view's normal.
+    void generatedNewLineAnnotationLinkedToCandidateRequested(const std::string& surfaceName,
+                                                              cv::Vec3f volumePoint,
+                                                              cv::Vec3f linkDirection);
     void generatedControlPointBranchOpenRequested(uint64_t branchFiberId,
                                                    int branchControlPointIndex);
     void generatedControlPointLinkCandidateRequested(const std::string& surfaceName,
                                                      size_t controlPointIndex,
                                                      cv::Vec3f volumePoint);
+    void generatedControlPointAdjacentLinkCandidateRequested(const std::string& surfaceName,
+                                                             size_t controlPointIndex,
+                                                             cv::Vec3f volumePoint);
     void generatedControlPointLinkWithCandidateRequested(const std::string& surfaceName,
                                                          size_t controlPointIndex,
                                                          cv::Vec3f volumePoint);
     void generatedControlPointMergeWithCandidateRequested(const std::string& surfaceName,
                                                           size_t controlPointIndex,
                                                           cv::Vec3f volumePoint);
-    void generatedControlPointSplitCandidateRequested(const std::string& surfaceName,
-                                                      size_t controlPointIndex,
-                                                      cv::Vec3f volumePoint);
-    void generatedControlPointSplitFromCandidateRequested(const std::string& surfaceName,
-                                                          size_t controlPointIndex,
-                                                          cv::Vec3f volumePoint);
-    void generatedControlPointSplitAndLinkFromCandidateRequested(const std::string& surfaceName,
-                                                                 size_t controlPointIndex,
-                                                                 cv::Vec3f volumePoint);
+    // Span menu (strips): the two controls of the span in line-position order.
+    void generatedSpanSplitRequested(const std::string& surfaceName,
+                                     size_t firstControlPointIndex,
+                                     size_t secondControlPointIndex,
+                                     bool linkHalves);
+    void generatedSpanGapChangeRequested(const std::string& surfaceName,
+                                         size_t firstControlPointIndex,
+                                         size_t secondControlPointIndex,
+                                         bool enabled);
+    void generatedSpanDamagedChangeRequested(const std::string& surfaceName,
+                                             size_t firstControlPointIndex,
+                                             size_t secondControlPointIndex,
+                                             bool enabled);
     void generatedNearbyAnnotationOpenRequested(uint64_t fiberId, cv::Vec3f volumePoint);
     void generatedControlPointUnlinkRequested(const std::string& surfaceName,
                                               size_t controlPointIndex,
@@ -248,6 +278,12 @@ signals:
                                                     size_t firstControlPointIndex,
                                                     size_t secondControlPointIndex,
                                                     const std::string& goal);
+    void generatedControlPointKollesisTerminationChangeRequested(const std::string& surfaceName,
+                                                                 size_t controlPointIndex,
+                                                                 bool enabled);
+    void generatedControlPointBreakChangeRequested(const std::string& surfaceName,
+                                                   size_t controlPointIndex,
+                                                   bool enabled);
     void generatedPredSnapPointRequested(const std::string& surfaceName,
                                          cv::Vec3f volumePoint);
     void generatedSideStripIntersectionQueryRequested(const std::string& surfaceName);
@@ -285,7 +321,8 @@ private:
     // requestCurrentLinePosition): a burst of mouse moves collapses into one
     // projection + crosshair update per non-hovered pane per tick.
     void requestLinkedCursorMirror(CChunkedVolumeViewer* source,
-                                   const std::optional<cv::Vec3f>& point);
+                                   const std::optional<cv::Vec3f>& point,
+                                   std::optional<QPointF> scenePoint = std::nullopt);
     // Pushes the "Mirror cursor across panes" state onto the panes. The block
     // has to sit on the receiving side: the panes belong to the same
     // ViewerManager as the main window, so the global cursor sync would keep
@@ -345,6 +382,12 @@ private:
     void jumpToNextControlPoint();
     void previewClosestControlPoint();
     bool shiftCurrentLinePositionByScrollSteps(int steps);
+    // Ctrl+Shift+wheel in the current cut: slide the cut plane straight along
+    // its normal by the arclength the marker advances, WITHOUT re-posing it on
+    // the model line, so a point can be placed where the true fiber is when the
+    // model prediction has diverged. The side cut and strips stay where they
+    // are; any along-line navigation snaps the plane back.
+    bool shiftCurrentCutStraightAheadByScrollSteps(int steps);
     bool shiftSideCutPlaneNormalOffsetByScrollSteps(int steps);
     bool shiftCutPlaneNormalOffsetByScrollSteps(PlaneSurface* plane,
                                                 CChunkedVolumeViewer* viewer,
@@ -354,9 +397,8 @@ private:
     bool applyCutPlaneNormalOffset(PlaneSurface* plane, double offsetVx) const;
     void resetGeneratedCutNormalOffsets(bool forceRender);
     // "B": zero every accumulated normal offset — the side cut plane's and
-    // both strips' surface offsets. The current cut cannot accumulate one
-    // (Shift-scroll steps along the line there) but is reset with the side
-    // cut for symmetry.
+    // both strips' surface offsets — and snap a straight-ahead displaced
+    // current cut (Ctrl+Shift-scroll) back onto the model line.
     void resetGeneratedNormalOffsets();
     void setCurrentCutFollowsStripMouse(bool follows);
     void requestGeneratedSideStripIntersections();
@@ -460,6 +502,55 @@ private:
     QAction* _showAsMeshAction = nullptr;
     QAction* _fullOptimizationAction = nullptr;
     QSpinBox* _initialCenterlineLengthSpin = nullptr;
+    QDoubleSpinBox* _fiberWidthSpin = nullptr;
+    QDoubleSpinBox* _controlAngleSpin = nullptr;
+    std::optional<size_t> _angleControlIndex;
+    QAction* _showFiberWidthAction = nullptr;
+    QAction* _showFiberNormalAction = nullptr;
+    struct FiberGuideItems {
+        QPointer<CChunkedVolumeViewer> viewer;
+        QGraphicsPathItem* center = nullptr;
+        QGraphicsPathItem* width = nullptr;
+        QGraphicsPathItem* cursorWidth = nullptr;
+        double cachedWidth = -1;
+        double cachedGapFraction = -1;
+        double cachedCursorHalfLength = -1;
+    };
+    std::array<FiberGuideItems, 2> _fiberGuides;
+    struct CrossSectionDrag {
+        QPointF pressScene, edgeScene;
+        cv::Vec3d center, normal, axis, planeNormal, sceneX, sceneY, lineAnchor;
+        double width = 0, linePosition = 0;
+        int handle = 0;
+        bool moved = false;
+        bool mouseDown = false, changed = false, normalChanged = false;
+    };
+    std::optional<CrossSectionDrag> _crossSectionDrag;
+    QPointer<QObject> _crossSectionDragPreview;
+    bool handleCrossSectionDragEvent(QObject* watched, QEvent* event);
+    struct DirectionDrag {
+        QPointer<CChunkedVolumeViewer> viewer;
+        size_t controlIndex = 0;
+        QPointF origin;
+        QPoint pressPixel;
+        bool moved = false;
+        bool createControl = false;
+        double linePosition = 0;
+        cv::Vec3f point, lineAnchor;
+        cv::Vec3d axis, normal, along, across;
+        cv::Vec2f surfaceOrigin;
+        std::optional<cv::Vec3d> result;
+    };
+    std::optional<DirectionDrag> _directionDrag;
+    QPointer<QObject> _directionPreview;
+    bool handleDirectionDragEvent(QObject* watched, QEvent* event);
+    void cancelDirectionDrag();
+    void cancelCrossSectionDrag();
+    void finishCrossSectionDrag();
+    void drawCrossSectionDragPreview(const vc::fiber_tracer::FiberWidthDragResult& result);
+    void updateFiberDisplayControlsAndGuides();
+    void updateFiberWidthCursor(CChunkedVolumeViewer* viewer, std::optional<QPointF> scenePoint);
+    void refreshFiberWidthCursors();
     QSpinBox* _extrapolationDistanceSpin = nullptr;
     // Values committed via the menu rows' Apply buttons; the spinboxes hold
     // uncommitted edits until then (and revert when the menu reopens).
@@ -560,6 +651,12 @@ private:
     cv::Matx33f _currentCutManualRotation = cv::Matx33f::eye();
     bool _currentCutManualRotationActive = false;
     double _currentCutNormalOffsetVx = 0.0;
+    // Set while Ctrl+Shift+wheel has slid the current cut plane off the model
+    // line; cleared wherever the plane is re-posed from the line.
+    bool _currentCutStraightAheadActive = false;
+    // Translation sign along the plane normal, fixed at the gesture's first
+    // notch (see straightAheadDirection).
+    double _currentCutStraightAheadDirection = 1.0;
     double _sideCutNormalOffsetVx = 0.0;
     bool _generatedOverlayRefreshQueued = false;
     // Generation-based deduplication of the coalesced overlay refresh: every
@@ -572,6 +669,7 @@ private:
     std::vector<QPointer<CChunkedVolumeViewer>> _linkedCursorPanes;
     QPointer<CChunkedVolumeViewer> _linkedCursorSource;
     std::optional<cv::Vec3f> _pendingLinkedCursorPoint;
+    std::optional<QPointF> _pendingLinkedCursorScenePoint;
     // Owned single-shot coalescing timer (like _lineUpdateTimer); stopped on
     // pane teardown so a pending mirror can't stamp a pre-rebuild point onto
     // freshly built panes.

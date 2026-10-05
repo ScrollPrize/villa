@@ -101,9 +101,20 @@ def _grid_center(xyz: torch.Tensor) -> torch.Tensor:
 class InitShellIndexErrorTest(unittest.TestCase):
 	def test_missing_manifest_init_shell_dir_key_errors(self) -> None:
 		with self.assertRaisesRegex(ValueError, "init_shell_dir"):
-			fit._require_manifest_init_shell_dir({})
+			fit._require_init_shell_dir({})
 		with self.assertRaisesRegex(ValueError, "init_shell_dir"):
-			fit._require_manifest_init_shell_dir({"init_shell_dir": ""})
+			fit._require_init_shell_dir({"init_shell_dir": ""})
+
+	def test_explicit_init_shell_dir_overrides_manifest_and_blank_falls_back(self) -> None:
+		params = {"init_shell_dir": "/manifest/shells"}
+		self.assertEqual(
+			fit._require_init_shell_dir(params, override=" /service/shells "),
+			"/service/shells",
+		)
+		self.assertEqual(
+			fit._require_init_shell_dir(params, override=""),
+			"/manifest/shells",
+		)
 
 	def test_manifest_init_shell_dir_resolves_relative_to_lasagna_json(self) -> None:
 		with tempfile.TemporaryDirectory() as td:
@@ -220,6 +231,18 @@ class InitShellCropTest(unittest.TestCase):
 		self.assertFalse(cfg.corr_point_roi)
 		self.assertEqual(cfg.corr_point_roi_init_margin, 80)
 		self.assertEqual(cfg.corr_point_roi_output_radius, 20)
+
+	def test_cli_data_accepts_init_shell_dir_override(self) -> None:
+		parser = argparse.ArgumentParser()
+		cli_data.add_args(parser)
+		args = parser.parse_args([
+			"--input", "/tmp/input.lasagna.json",
+			"--init-shell-dir", "/srv/pherc0332/init_shells",
+		])
+
+		cfg = cli_data.from_args(args)
+
+		self.assertEqual(cfg.init_shell_dir, "/srv/pherc0332/init_shells")
 
 	def test_cli_data_accepts_corr_point_roi_args(self) -> None:
 		parser = argparse.ArgumentParser()

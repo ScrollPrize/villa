@@ -9,6 +9,8 @@ from typing import Any, Mapping, Sequence
 
 import torch
 from torch import nn
+from torch._dynamo.exc import BackendCompilerFailed
+from torch._inductor.exc import TritonMissing
 
 from vesuvius.ink_detection.models.input_padding import center_pad_input_depth
 
@@ -147,13 +149,53 @@ def resolve_amp_dtype(
     raise ValueError(f"Unsupported --amp-dtype value {requested!r}")
 
 
+class _CompiledWithEagerFallback(nn.Module):
+    """A compiled model that drops to eager on a backend compilation failure.
+
+    ``torch.compile`` compiles nothing when it is called: it returns a wrapper,
+    and the backend runs on a forward. A new batch shape can trigger another
+    compilation even after earlier forwards succeeded, so every compiled call
+    stays guarded. Compiler failures disable compilation for this wrapper;
+    ordinary model errors propagate without retrying the model in eager mode.
+    TritonMissing is raised directly by Inductor on some installations rather
+    than being wrapped in BackendCompilerFailed.
+
+    The eager module is the registered child, so ``.to()`` and ``.eval()``
+    behave as before; the compiled wrapper holds that same module, and
+    registering it as well would duplicate every parameter.
+    """
+
+    def __init__(self, eager_model: nn.Module, compiled_model: nn.Module) -> None:
+        super().__init__()
+        self.model = eager_model
+        object.__setattr__(self, "_compiled_model", compiled_model)
+
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
+        compiled_model = self._compiled_model
+        if compiled_model is None:
+            return self.model(*args, **kwargs)
+        try:
+            return compiled_model(*args, **kwargs)
+        except (BackendCompilerFailed, TritonMissing) as exc:
+            LOGGER.warning(
+                "torch.compile backend failed during forward (%s); continuing eagerly", exc
+            )
+            object.__setattr__(self, "_compiled_model", None)
+            return self.model(*args, **kwargs)
+
+
 def maybe_compile_model(
     model: nn.Module,
     *,
     enabled: bool,
     mode: str,
 ) -> tuple[nn.Module, bool]:
-    """Return the model and whether compilation completed successfully."""
+    """Return the model and whether compilation was set up.
+
+    The flag reports that ``torch.compile`` accepted the model, not that the
+    backend works: the backend does not run until the first forward, which is
+    why the returned module carries its own fallback.
+    """
 
     if not enabled:
         return model, False
@@ -162,13 +204,11 @@ def maybe_compile_model(
         LOGGER.warning("torch.compile is unavailable; continuing eagerly")
         return model, False
     try:
-        return (
-            compile_fn(model, mode=str(mode), fullgraph=False, dynamic=False),
-            True,
-        )
+        compiled_model = compile_fn(model, mode=str(mode), fullgraph=False, dynamic=False)
     except Exception as exc:
         LOGGER.warning("torch.compile failed (%s); continuing eagerly", exc)
         return model, False
+    return _CompiledWithEagerFallback(model, compiled_model), True
 
 
 def prepare_model_for_inference(

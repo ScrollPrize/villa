@@ -5,6 +5,7 @@ from unittest.mock import patch
 from lasagna.scripts.bootstrap_venv import (
     main, parse_cuda_version, select_backend,
     volume_cartographer_build_environment,
+    environment_check_script,
 )
 
 
@@ -53,6 +54,13 @@ class BootstrapVenvTests(unittest.TestCase):
 
         self.assertEqual(environment["CC"], "/usr/bin/gcc-13")
         self.assertEqual(environment["CXX"], "/usr/bin/g++-13")
+
+    def test_check_script_runs_gpu_kernel_only_when_checking(self):
+        self.assertIn("device='cuda'", environment_check_script("cu128", False))
+        self.assertNotIn("device='cuda'", environment_check_script("cu128", True))
+        self.assertNotIn("device='cuda'", environment_check_script("cpu", False))
+        for backend, skip in (("cu128", False), ("cu128", True), ("cpu", False)):
+            compile(environment_check_script(backend, skip), "<check>", "exec")
 
 
 if __name__ == "__main__":

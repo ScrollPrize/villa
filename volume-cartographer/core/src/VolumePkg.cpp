@@ -34,7 +34,6 @@
 
 #include "vc/core/types/Segmentation.hpp"
 #include "vc/core/types/Volume.hpp"
-#include "vc/core/render/PersistentZarrCacheBudget.hpp"
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
 #include "vc/core/util/NormalGridVolume.hpp"
@@ -78,42 +77,6 @@ fs::path resolveLocalPath(const std::string& location, const fs::path& base)
         : fs::path(location);
     if (p.is_absolute() || base.empty()) return p;
     return base / p;
-}
-
-fs::path remoteVolumeCacheRootForEntry(
-    const fs::path& configuredRoot,
-    const Entry& entry)
-{
-    constexpr std::string_view sampleTagPrefix =
-        "vc-open-data-sample-id:";
-    const auto tag = std::find_if(
-        entry.tags.begin(), entry.tags.end(),
-        [sampleTagPrefix](const std::string& value) {
-            return value.rfind(sampleTagPrefix, 0) == 0;
-        });
-    if (configuredRoot.empty() || tag == entry.tags.end())
-        return configuredRoot;
-
-    std::string sample = tag->substr(sampleTagPrefix.size());
-    for (char& c : sample) {
-        const auto uc = static_cast<unsigned char>(c);
-        if (!std::isalnum(uc) && c != '-' && c != '_' && c != '.')
-            c = '_';
-    }
-    while (!sample.empty() &&
-           (sample.front() == '.' || sample.front() == '_')) {
-        sample.erase(sample.begin());
-    }
-    if (sample.empty())
-        sample = "sample";
-
-    const auto root = configuredRoot.lexically_normal();
-    if (root.filename() == sample &&
-        root.parent_path().filename() == "volumes" &&
-        root.parent_path().parent_path().filename() == "open_data") {
-        return root;
-    }
-    return root / "open_data" / "volumes" / sample;
 }
 
 }
@@ -201,63 +164,14 @@ constexpr const char* kDirectRemoteZarrRequired =
 
 std::shared_ptr<Volume> openRemoteVolumeEntry(
     const vc::project::Entry& entry,
-    const fs::path& configuredCacheRoot,
     const vc::HttpAuth& auth = {})
 {
-    const auto volumeCacheRoot =
-        vc::project::remoteVolumeCacheRootForEntry(configuredCacheRoot, entry);
     const bool anonymous = vc::project::usesAnonymousRemoteAuth(entry);
-    auto volume = Volume::NewFromUrl(
-        entry.location, volumeCacheRoot,
+    return Volume::NewFromUrl(
+        entry.location,
         anonymous ? vc::HttpAuth{} : auth,
         vc::project::volumeMetadataFromEntryTags(entry.tags),
         !anonymous);
-
-    const auto legacyRoot = configuredCacheRoot.lexically_normal();
-    if (legacyRoot.empty() || volumeCacheRoot == legacyRoot)
-        return volume;
-
-    const auto legacy = legacyRoot / volume->id();
-    const auto destination = volume->remotePersistentCachePath();
-    std::error_code ec;
-    if (!fs::exists(legacy, ec) || ec)
-        return volume;
-    if (fs::exists(destination, ec)) {
-        if (!ec) {
-            Logger()->info(
-                "Keeping legacy remote volume cache {} because the sample-scoped cache already exists at {}",
-                legacy.string(), destination.string());
-        }
-        return volume;
-    }
-    if (ec)
-        return volume;
-
-    bool moved = false;
-    const auto sourceBudget =
-        vc::render::PersistentZarrCacheBudget::findForPath(legacy);
-    const auto destinationBudget =
-        vc::render::PersistentZarrCacheBudget::findForPath(destination);
-    if (sourceBudget && sourceBudget == destinationBudget) {
-        moved = sourceBudget->moveCacheSubtree(legacy, destination, ec);
-    } else if (!sourceBudget && !destinationBudget) {
-        fs::create_directories(destination.parent_path(), ec);
-        if (!ec) {
-            fs::rename(legacy, destination, ec);
-            moved = !ec;
-        }
-    } else {
-        ec = std::make_error_code(std::errc::cross_device_link);
-    }
-
-    if (moved) {
-        Logger()->info("Migrated remote volume cache {} to {}",
-                       legacy.string(), destination.string());
-    } else {
-        Logger()->warn("Could not migrate remote volume cache {} to {}: {}",
-                       legacy.string(), destination.string(), ec.message());
-    }
-    return volume;
 }
 
 std::string validateRemoteVolumeLocation(
@@ -706,7 +620,6 @@ std::shared_ptr<VolumePkg> VolumePkg::newEmpty(
 {
     auto pkg = std::shared_ptr<VolumePkg>(new VolumePkg());
     pkg->opts_ = opts;
-    pkg->remoteCacheRoot_ = opts.remoteCacheRoot;
     return pkg;
 }
 
@@ -849,8 +762,7 @@ bool VolumePkg::addVolumeEntry(const std::string& location, std::vector<std::str
 VolumePkg::AttachVolumeResult VolumePkg::attachPreparedVolume(
     const std::string& location,
     std::vector<std::string> tags,
-    const std::shared_ptr<Volume>& volume,
-    const fs::path& remoteCacheRoot)
+    const std::shared_ptr<Volume>& volume)
 {
     if (location.empty() || !volume)
         throw std::invalid_argument("volume location and prepared volume are required");
@@ -885,13 +797,9 @@ VolumePkg::AttachVolumeResult VolumePkg::attachPreparedVolume(
 
     const bool insertVolume = loaded == loadedVolumes_.end();
     const bool insertEntry = !backingEntryExists;
-    const bool updateCacheRoot =
-        remoteCacheRoot_.empty() && !remoteCacheRoot.empty();
-    if (!insertVolume && !insertEntry && !updateCacheRoot)
+    if (!insertVolume && !insertEntry)
         return AttachVolumeResult::AlreadyAttached;
 
-    const fs::path previousCacheRoot = remoteCacheRoot_;
-    const fs::path previousOptionCacheRoot = opts_.remoteCacheRoot;
     const auto previousTags = volumeTagsByID_.find(volumeId);
     const std::optional<std::vector<std::string>> savedTags =
         previousTags == volumeTagsByID_.end()
@@ -907,11 +815,6 @@ VolumePkg::AttachVolumeResult VolumePkg::attachPreparedVolume(
         volumeTagsByID_[volumeId] = entry->tags;
     else if (insertEntry && !volumes_.back().tags.empty())
         volumeTagsByID_[volumeId] = volumes_.back().tags;
-    if (updateCacheRoot) {
-        remoteCacheRoot_ = remoteCacheRoot;
-        opts_.remoteCacheRoot = remoteCacheRoot;
-    }
-
     try {
         persistProjectState();
     } catch (...) {
@@ -923,8 +826,6 @@ VolumePkg::AttachVolumeResult VolumePkg::attachPreparedVolume(
             volumeTagsByID_[volumeId] = *savedTags;
         else
             volumeTagsByID_.erase(volumeId);
-        remoteCacheRoot_ = previousCacheRoot;
-        opts_.remoteCacheRoot = previousOptionCacheRoot;
         // persistProjectState writes the autosave first. Restore it after the
         // in-memory rollback when the canonical project write fails.
         if (automaticPersistence_) {
@@ -983,9 +884,6 @@ bool VolumePkg::reconcileVolumeEntryTags(
             try {
                 auto refreshed = openRemoteVolumeEntry(
                     entry,
-                    opts_.remoteCacheRoot.empty()
-                        ? volume->remoteCacheRoot()
-                        : opts_.remoteCacheRoot,
                     volume->remoteAuth());
                 const auto oldId = it->first;
                 const auto newId = refreshed->id();
@@ -1039,9 +937,6 @@ bool VolumePkg::mergeVolumeEntryTags(const std::string& location, const std::vec
                     try {
                         auto refreshed = openRemoteVolumeEntry(
                             e,
-                            opts_.remoteCacheRoot.empty()
-                                ? volume->remoteCacheRoot()
-                                : opts_.remoteCacheRoot,
                             volume->remoteAuth());
                         const auto refreshedId = refreshed->id();
                         if (refreshedId != id && loadedVolumes_.count(refreshedId) == 0) {
@@ -1337,7 +1232,6 @@ VolumePkg::AttachLasagnaResult VolumePkg::attachPreparedLasagnaDataset(
     std::vector<std::string> manifestTags,
     bool fiberInference,
     const std::vector<PreparedVolumeAttachment>& preparedVolumes,
-    const fs::path& remoteCacheRoot,
     bool updateSelection,
     bool persistChanges,
     const std::vector<std::string>& manifestSingletonPrefixes)
@@ -1402,8 +1296,6 @@ VolumePkg::AttachLasagnaResult VolumePkg::attachPreparedLasagnaDataset(
     const auto oldVolumeTags = volumeTagsByID_;
     const auto oldSelected = selectedLasagnaDataset_;
     const auto oldSelectedFiber = selectedFiberInferenceDataset_;
-    const auto oldCacheRoot = remoteCacheRoot_;
-    const auto oldOptionCacheRoot = opts_.remoteCacheRoot;
     bool changed = false;
     try {
         auto manifest = std::find_if(lasagnaDatasets_.begin(), lasagnaDatasets_.end(), [&](const auto& entry) {
@@ -1483,11 +1375,6 @@ VolumePkg::AttachLasagnaResult VolumePkg::attachPreparedLasagnaDataset(
             }
             volumeTagsByID_[prepared.volume->id()] = entry->tags;
         }
-        if (remoteCacheRoot_.empty() && !remoteCacheRoot.empty()) {
-            remoteCacheRoot_ = remoteCacheRoot;
-            opts_.remoteCacheRoot = remoteCacheRoot;
-            changed = true;
-        }
         if (!changed)
             return AttachLasagnaResult::AlreadyAttached;
         if (persistChanges)
@@ -1499,8 +1386,6 @@ VolumePkg::AttachLasagnaResult VolumePkg::attachPreparedLasagnaDataset(
         volumeTagsByID_ = oldVolumeTags;
         selectedLasagnaDataset_ = oldSelected;
         selectedFiberInferenceDataset_ = oldSelectedFiber;
-        remoteCacheRoot_ = oldCacheRoot;
-        opts_.remoteCacheRoot = oldOptionCacheRoot;
         throw;
     }
     return AttachLasagnaResult::Attached;
@@ -1957,23 +1842,6 @@ bool VolumePkg::isRemote() const
     return anyRemote(volumes_) || anyRemote(normalGrids_);
 }
 
-bool VolumePkg::hasRemoteCacheRoot() const
-{
-    return !remoteCacheRoot_.empty();
-}
-
-std::string VolumePkg::remoteCacheRootOrEmpty() const
-{
-    return remoteCacheRoot_.string();
-}
-
-void VolumePkg::setRemoteCacheRoot(const fs::path& dir)
-{
-    remoteCacheRoot_ = dir;
-    opts_.remoteCacheRoot = dir;
-    persistProjectState();
-}
-
 void VolumePkg::save(const fs::path& target)
 {
     writeJsonTo(target);
@@ -2023,8 +1891,7 @@ void VolumePkg::resolveAll()
 
     std::vector<RemoteVolumeResult> remoteResults(volumes_.size());
     if (!remoteIndices.empty()) {
-        const auto remoteCacheRoot = opts_.remoteCacheRoot;
-        auto loadRemote = [this, &remoteResults, remoteCacheRoot](std::size_t i) {
+        auto loadRemote = [this, &remoteResults](std::size_t i) {
             const auto& entry = volumes_[i];
             try {
                 if (!isDirectRemoteZarrLocation(entry.location)) {
@@ -2032,7 +1899,7 @@ void VolumePkg::resolveAll()
                     return;
                 }
                 remoteResults[i] = {
-                    openRemoteVolumeEntry(entry, remoteCacheRoot), {}};
+                    openRemoteVolumeEntry(entry), {}};
             } catch (const std::exception& ex) {
                 remoteResults[i] = {nullptr, ex.what()};
             } catch (...) {
@@ -2138,7 +2005,7 @@ void VolumePkg::resolveVolumeEntry(const vc::project::Entry& e)
                                e.location, kDirectRemoteZarrRequired);
                 return;
             }
-            auto v = openRemoteVolumeEntry(e, opts_.remoteCacheRoot);
+            auto v = openRemoteVolumeEntry(e);
             const auto id = v->id();
             if (loadedVolumes_.count(id) > 0) {
                 Logger()->warn("Duplicate remote volume id '{}' from '{}', skipping", id, e.location);
@@ -2372,7 +2239,6 @@ utils::Json VolumePkg::toJson() const
     j["segments"] = entriesToJson(segments_);
     j["normal_grids"] = entriesToJson(normalGrids_);
     j["lasagna_datasets"] = entriesToJson(lasagnaDatasets_);
-    if (!remoteCacheRoot_.empty()) j["remote_cache_root"] = remoteCacheRoot_.string();
     if (outputSegments_) j["output_segments"] = *outputSegments_;
     if (selectedLasagnaDataset_) j["selected_lasagna_dataset"] = *selectedLasagnaDataset_;
     if (selectedFiberInferenceDataset_) j["selected_fiber_inference_dataset"] = *selectedFiberInferenceDataset_;
@@ -2406,12 +2272,6 @@ void VolumePkg::fromJson(const utils::Json& j)
                     existing->tags.push_back(tag);
                 }
             }
-        }
-    }
-    if (j.contains("remote_cache_root")) {
-        remoteCacheRoot_ = j.at("remote_cache_root").get_string();
-        if (!remoteCacheRoot_.empty()) {
-            opts_.remoteCacheRoot = remoteCacheRoot_;
         }
     }
     if (j.contains("output_segments")) outputSegments_ = j.at("output_segments").get_string();

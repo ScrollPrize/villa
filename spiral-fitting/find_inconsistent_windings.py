@@ -71,7 +71,12 @@ counts reflect real branch transport (and whole windings on multi-winding patche
 instead of being thrown off by the wild theta swings of invalid regions. The
 endpoints (annotated point / seed) are spliced onto the path's ends so the delta
 is between the true points. The residual unwrapped shifted-radius gap is retained
-as a diagnostic, but propagation uses the integer seam-crossing delta.
+as a diagnostic, but propagation uses the integer seam-crossing delta. A strip
+starts and ends at an annotated point's *attachment* on the patch (its on_patch
+ij), which can lie across theta=0 from the point itself, so the branch transport
+of that short step is counted on the pcl side: relative edges are expressed
+between the two points' attachments, and absolute anchors carry it as
+attachment_branch_delta.
 
 The transform's flow field is shaped by the checkpoint's own z-range; the
 --z-range arg only filters patches/pcls (and must lie within the checkpoint's
@@ -188,12 +193,11 @@ def build_fit_inputs(checkpoint, patches_dir, pcl_paths, filter_z_begin, filter_
     # (disable_patches, e.g. the 2026-07-17 normals-only baseline) must not
     # stop the loaders from reading the patches it wants to analyse.
     cfg['input_disable_patches'] = False
-    # We compute no shell losses; zero their weights so the context's
+    # We compute no shell losses; zero the weight so the context's
     # shell_losses_enabled() gate stops load_host_inputs() from loading the
     # shell (replacing the old fs.shell_losses_enabled = lambda: False
-    # override). Nothing else in the host-loading path reads these weights.
+    # override). Nothing else in the host-loading path reads this weight.
     cfg['loss_weight_shell_outer'] = 0.0
-    cfg['loss_weight_shell_patch_radius'] = 0.0
     # The filtering z-range is the optimisation window this analysis uses.
     cfg['z_begin'] = int(filter_z_begin)
     cfg['z_end'] = int(filter_z_end)
@@ -206,9 +210,7 @@ def build_fit_inputs(checkpoint, patches_dir, pcl_paths, filter_z_begin, filter_
     # This analysis needs no scroll volume, track store, or outer shell:
     # leaving those paths empty keeps load_host_inputs() from touching the
     # training-only inputs. Legacy role-less PCL specs (role=None) retain the
-    # historical abs_winding.json basename inference. Attachment is over the
-    # verified patch set only, so the (slow, unrelated) unverified patches
-    # are skipped; they don't change the cross-patch / attached pcl set.
+    # historical abs_winding.json basename inference.
     # Fibers are same-winding annotations: when loaded they classify as 'neither'
     # pcls (delta-0 cross-patch edges), exactly like same_windings.json. Off
     # unless a fibers dir is passed.
@@ -408,12 +410,14 @@ def classify_pcl(pcl):
     return 'neither'
 
 
-def build_abs_anchors_by_patch(cross_patch_pcls, patches):
+def build_abs_anchors_by_patch(cross_patch_pcls, patches, transform, dr):
     """patch_id -> list of absolute-winding anchors attached to that patch.
 
     Each anchor is a dict carrying the source absolute-winding pcl, the point and
-    its absolute winding annotation, and the point's on-patch ij. Anchors with a
-    non-finite annotation are skipped (warned about elsewhere)."""
+    its absolute winding annotation, the point's on-patch ij, and the theta=0
+    branch transport from the point to its attachment (`attachment_branch_delta`:
+    the winding the annotation gains by the time the anchor's strip starts).
+    Anchors with a non-finite annotation are skipped (warned about elsewhere)."""
     anchors = {}
     for pid, pcl in cross_patch_pcls.items():
         if not pcl.get('metadata', {}).get('winding_is_absolute', False):
@@ -425,6 +429,8 @@ def build_abs_anchors_by_patch(cross_patch_pcls, patches):
                 w = float(p['winding_annotation'])
                 if not np.isfinite(w):
                     continue
+                attachment_branch_delta = -int(_tour_unwrap_adjustments(
+                    transform, dr, [p['zyx'], _strip_end_zyx(patches, p)])[1])
                 anchors.setdefault(patch_id, []).append({
                     'pcl_id': int(pid),
                     'pcl_name': pcl.get('name'),
@@ -432,6 +438,7 @@ def build_abs_anchors_by_patch(cross_patch_pcls, patches):
                     'point_id': int(p['id']),
                     # Absolute-winding annotations are integer winding numbers.
                     'winding': int(round(w)),
+                    'attachment_branch_delta': attachment_branch_delta,
                     'ij': np.array(p['on_patch']['ij'], dtype=np.float32),
                     'distance': float(p['on_patch'].get('distance', float('nan'))),
                     # Source [z, y, x]; point['p'] is [x, y, z] from the pcl json.
@@ -440,10 +447,22 @@ def build_abs_anchors_by_patch(cross_patch_pcls, patches):
     return anchors
 
 
-def _tour_unwrap_adjustments(transform, dr, tour):
-    """Cumulative theta=0 branch adjustment (winding units) at each tour point."""
+def _strip_end_zyx(patches, p):
+    """The point's attachment on its patch, where the within-patch strips through
+    it start and end; the point itself if the bilinear lookup rejects that ij."""
+    on_patch = p['on_patch']
+    patch = patches[on_patch['id']]
+    zyx, valid = patch.ij_to_zyx(torch.as_tensor(
+        np.asarray(on_patch['ij'], dtype=np.float32), device=patch.zyxs.device))
+    if not bool(valid):
+        return p['zyx']
+    return zyx.cpu().numpy()
+
+
+def _tour_unwrap_adjustments(transform, dr, zyxs):
+    """Cumulative theta=0 branch adjustment (winding units) at each of `zyxs`."""
     zyx = torch.as_tensor(
-        np.stack([p['zyx'] for p in tour], axis=0).astype(np.float32),
+        np.stack(zyxs, axis=0).astype(np.float32),
         device=dr.device,
     )
     with torch.no_grad():
@@ -468,8 +487,9 @@ def build_rel_adjacency(cross_patch_pcls, patches, transform, dr):
     departure point (`from_ij`) on this patch, the arrival point (`to_ij`) on
     the neighbour, and the edge's winding delta = wind_a(arrival) -
     wind_a(departure), corrected for any theta=0 seam crossings accumulated
-    along the chain between the two points (through unattached points and, for
-    merged components, fiber-hopping junctions). Only consecutive pairs are
+    along the chain between the two points' attachments (through unattached
+    points and, for merged components, fiber-hopping junctions), so the delta
+    is expressed where the within-patch strips end. Only consecutive pairs are
     used, so the edge set stays a chain through the pcl's points; more distant
     patches are reached transitively by BFS."""
     adjacency = {}
@@ -484,7 +504,8 @@ def build_rel_adjacency(cross_patch_pcls, patches, transform, dr):
                     and np.isfinite(float(p['winding_annotation'])))
 
         tour = list(pcl['chain'].iter_chain())
-        tour_adjustments = _tour_unwrap_adjustments(transform, dr, tour)
+        tour_adjustments = _tour_unwrap_adjustments(
+            transform, dr, [_strip_end_zyx(patches, p) if attached(p) else p['zyx'] for p in tour])
         attached_tour = [(k, p) for k, p in enumerate(tour) if attached(p)]
         pairs = []
         seen_pairs = set()
@@ -1032,7 +1053,7 @@ def main(checkpoint, patches_dir, umbilicus, fibers_flag, patch_id, pcl_paths, z
           f'model raw winding = {seed_model_winding_raw:.3f} (rounded to {seed_model_winding})')
 
     # --- build the absolute anchors and the relative-pcl patch graph ---
-    abs_anchors_by_patch = build_abs_anchors_by_patch(cross_patch_pcls, patches)
+    abs_anchors_by_patch = build_abs_anchors_by_patch(cross_patch_pcls, patches, transform, dr)
     rel_adjacency = build_rel_adjacency(cross_patch_pcls, patches, transform, dr)
     # Per-pcl classification (absolute / relative / neither) so it is clear what each
     # pcl is doing: absolute pcls anchor windings, relative pcls supply long-range edges
@@ -1104,8 +1125,10 @@ def main(checkpoint, patches_dir, umbilicus, fibers_flag, patch_id, pcl_paths, z
             'abs_ij': anchor['ij'].tolist(),
             'abs_distance_to_patch': anchor['distance'],
             'abs_zyx_raw': _to_py(anchor['zyx']),
-            # winding(seed) = acc_seed_minus_entry + abs_winding + anchor_to_entry_delta
+            # winding(seed) = acc_seed_minus_entry + abs_winding + abs_attachment_branch_delta
+            #                 + anchor_to_entry_delta
             'acc_seed_minus_entry': acc,
+            'abs_attachment_branch_delta': anchor['attachment_branch_delta'],
             'anchor_to_entry_delta': anchor_strip['delta_windings'],
             'anchor_to_entry_residual_unwrapped_delta': anchor_strip['residual_unwrapped_delta_windings'],
             'anchor_to_entry_unwrap_adjustment': anchor_strip['unwrap_adjustment_windings'],
@@ -1137,7 +1160,8 @@ def main(checkpoint, patches_dir, umbilicus, fibers_flag, patch_id, pcl_paths, z
                       f'point {anchor["point_id"]} on patch {P}: anchor->entry strip had <2 valid '
                       f'points; skipped')
                 continue
-            expected = acc + anchor['winding'] + anchor_strip['delta_windings']
+            expected = (acc + anchor['winding'] + anchor['attachment_branch_delta']
+                        + anchor_strip['delta_windings'])
             record_vote(expected, anchor, hops, acc, anchor_strip, path)
 
         # (b) relative edges: grow the BFS tree into unreached neighbours, and check

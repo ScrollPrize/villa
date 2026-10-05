@@ -609,7 +609,7 @@ bool SameWrapAnnotationTool::commit(VCCollection* pointCollection,
     std::vector<uint64_t> committedCollectionIds;
     const std::string collectionName = pointCollection->generateNewCollectionName("same_wrap");
     pointCollection->addPoints(collectionName, _state.sampledVolumePoints);
-    const uint64_t collectionId = pointCollection->getCollectionId(collectionName);
+    const uint64_t collectionId = pointCollection->getCollectionId(collectionName).value();
     if (collectionId != 0) {
         markSameWrapCollectionMetadata(pointCollection, collectionId);
         if (const auto color = colorDistinctFromVisibleCollections(
@@ -731,7 +731,7 @@ bool SameWrapAnnotationTool::manualMergePointClicked(VCCollection* pointCollecti
     pointCollection->clearCollection(firstCollectionId);
     pointCollection->clearCollection(collectionId);
     pointCollection->addPoints(mergedCollectionName, mergedPoints);
-    const uint64_t mergedCollectionId = pointCollection->getCollectionId(mergedCollectionName);
+    const uint64_t mergedCollectionId = pointCollection->getCollectionId(mergedCollectionName).value();
     if (mergedCollectionId != 0) {
         markSameWrapCollectionMetadata(pointCollection, mergedCollectionId);
         pointCollection->setCollectionTag(mergedCollectionId, "same_wrap_direction", directionKey);

@@ -10,6 +10,7 @@
 #include "vc/core/types/VcDataset.hpp"
 
 #include <utils/zarr.hpp>
+#include <utils/Json.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -72,7 +73,8 @@ std::vector<std::byte> readBytes(const fs::path& path)
 }
 
 std::shared_ptr<utils::ZarrArray> makeShardedArray(
-    const fs::path& root, bool missingSecondChunk = false)
+    const fs::path& root, bool missingSecondChunk = false,
+    const std::string& compressor = "")
 {
     utils::ZarrMetadata meta;
     meta.version = utils::ZarrVersion::v3;
@@ -83,6 +85,8 @@ std::shared_ptr<utils::ZarrArray> makeShardedArray(
     meta.chunk_key_encoding = "default";
     utils::ShardConfig shard;
     shard.sub_chunks = {2, 2, 2};
+    if (!compressor.empty())
+        shard.sub_codecs.push_back({compressor, {}});
     meta.shard_config = std::move(shard);
 
     fs::create_directories(root);
@@ -90,7 +94,10 @@ std::shared_ptr<utils::ZarrArray> makeShardedArray(
         std::ofstream group(root / "zarr.json");
         group << R"({"zarr_format":3,"node_type":"group"})";
     }
-    auto array = utils::ZarrArray::create(root / "0", meta);
+    const auto registry = vc::buildZarrCodecRegistry(1);
+    const auto codec = compressor.empty()
+        ? utils::ZarrArray::Codec{} : registry.at(compressor);
+    auto array = utils::ZarrArray::create(root / "0", meta, codec);
     std::vector<std::optional<std::vector<std::byte>>> chunks(8);
     for (std::size_t i = 0; i < chunks.size(); ++i)
         chunks[i] = std::vector<std::byte>(8, static_cast<std::byte>(i + 1));
@@ -100,7 +107,7 @@ std::shared_ptr<utils::ZarrArray> makeShardedArray(
 
     auto store = std::make_shared<utils::FileSystemStore>(root);
     return std::make_shared<utils::ZarrArray>(
-        utils::ZarrArray::open(store, "0"));
+        utils::ZarrArray::open(store, "0", registry));
 }
 
 class BlockingCountingStore final : public utils::Store {
@@ -403,13 +410,70 @@ TEST_CASE("ZarrChunkFetcher fetches a present chunk from local")
     fs::remove_all(d);
 }
 
+TEST_CASE("storage-object decoding decompresses each inner chunk once")
+{
+    std::string compressor;
+    SUBCASE("zstd") { compressor = "zstd"; }
+    SUBCASE("gzip") { compressor = "gzip"; }
+    const auto source = tmpDir("decode_shard_once");
+    const auto array = makeShardedArray(source, true, compressor);
+    const std::array<std::size_t, 3> first{0, 0, 0};
+    const std::array<std::size_t, 3> missing{0, 0, 1};
+    const std::array<std::size_t, 3> sibling{1, 1, 1};
+    const auto object = array->read_storage_object(first);
+    REQUIRE(object);
+    CHECK(array->decode_chunk_from_storage_object(first, *object) ==
+          array->read_chunk(first));
+    CHECK_FALSE(array->decode_chunk_from_storage_object(missing, *object));
+    CHECK(array->decode_chunk_from_storage_object(sibling, *object) ==
+          array->read_chunk(sibling));
+    fs::remove_all(source);
+}
+
+TEST_CASE("storage-object decoding does not repeat the extraction byte swap")
+{
+    const auto source = tmpDir("decode_shard_endian_once");
+    utils::ZarrMetadata meta;
+    meta.version = utils::ZarrVersion::v3;
+    meta.shape = meta.chunks = {1, 1, 2};
+    meta.dtype = utils::ZarrDtype::uint16;
+    utils::ShardConfig shard;
+    shard.sub_chunks = meta.chunks;
+    meta.shard_config = std::move(shard);
+    // Exercise the existing outer-codec swap contract, independent of nested
+    // shard codec metadata support. write_shard() expects stored-order bytes.
+    auto config = std::make_shared<utils::JsonValue>(utils::json_parse(
+        utils::detail::is_little_endian()
+            ? R"({"endian":"big"})" : R"({"endian":"little"})"));
+    meta.codecs.push_back({"bytes", config});
+    auto array = utils::ZarrArray::create(source, meta);
+    const std::array<std::uint16_t, 2> values{0x1234, 0xabcd};
+    const auto bytes = std::as_bytes(std::span{values});
+    const std::vector<std::byte> expected(bytes.begin(), bytes.end());
+    auto stored = expected;
+    utils::detail::byteswap_inplace(stored, 2);
+    const std::vector<std::optional<std::vector<std::byte>>> chunks{stored};
+    const std::array<std::size_t, 3> key{0, 0, 0};
+    array.write_shard(key, chunks);
+    const auto object = array.read_storage_object(key);
+    REQUIRE(object);
+    CHECK(array.extract_inner_chunk(*object, key) == expected);
+    CHECK(array.decode_chunk_from_storage_object(key, *object) == expected);
+    fs::remove_all(source);
+}
+
 TEST_CASE("native mirror stores a complete shard and serves sibling inner chunks")
 {
+    std::string compressor;
+    SUBCASE("uncompressed") {}
+    SUBCASE("zstd") { compressor = "zstd"; }
+    SUBCASE("gzip") { compressor = "gzip"; }
     auto source = tmpDir("mirror_sharded_source");
     auto mirror = tmpDir("mirror_sharded_cache");
-    auto array = makeShardedArray(source);
+    auto array = makeShardedArray(source, false, compressor);
 
     vc::render::ChunkCache::Options options;
+    options.persistentCacheLayout = vc::render::PersistentCacheLayout::ZarrMirror;
     options.persistentCachePath = mirror;
     options.zarrMirrorMetadata = {
         {"zarr.json", readBytes(source / "zarr.json")},
@@ -417,13 +481,13 @@ TEST_CASE("native mirror stores a complete shard and serves sibling inner chunks
     };
     const auto identity = "test:mirror-sharded:" + source.string();
     auto cache = vc::render::acquireProcessChunkCache(
-        identity, array, std::move(options));
+        identity, array, options);
     REQUIRE(cache);
 
     const auto first = cache->getChunkBlocking(0, 0, 0, 0);
     REQUIRE(first.status == vc::render::ChunkStatus::Data);
     REQUIRE(first.bytes);
-    CHECK(first.bytes->front() == std::byte{1});
+    CHECK(*first.bytes == std::vector<std::byte>(8, std::byte{1}));
 
     const auto object = array->storage_object_location(
         std::array<std::size_t, 3>{0, 0, 0});
@@ -438,14 +502,19 @@ TEST_CASE("native mirror stores a complete shard and serves sibling inner chunks
     CHECK(cache->storageObjectRepresentatives(0).size() == 1);
 
     fs::remove(sourceShard);
+    cache.reset();
+    vc::render::processChunkCacheService()->invalidateSource(identity);
+    const auto reopenIdentity = identity + ":reopen";
+    cache = vc::render::acquireProcessChunkCache(reopenIdentity, array, options);
+    REQUIRE(cache);
     const auto sibling = cache->getChunkBlocking(0, 0, 0, 1);
     REQUIRE(sibling.status == vc::render::ChunkStatus::Data);
     REQUIRE(sibling.bytes);
-    CHECK(sibling.bytes->front() == std::byte{2});
+    CHECK(*sibling.bytes == std::vector<std::byte>(8, std::byte{2}));
     CHECK_FALSE(fs::exists(mirrorShard.string() + ".empty"));
 
     cache.reset();
-    vc::render::processChunkCacheService()->invalidateSource(identity);
+    vc::render::processChunkCacheService()->invalidateSource(reopenIdentity);
     fs::remove_all(source);
     fs::remove_all(mirror);
 }
@@ -626,9 +695,13 @@ TEST_CASE("native mirror coalesces inner requests into one full shard transfer")
 
 TEST_CASE("missing inner shard chunks do not mark the whole shard empty")
 {
+    std::string compressor;
+    SUBCASE("uncompressed") {}
+    SUBCASE("zstd") { compressor = "zstd"; }
+    SUBCASE("gzip") { compressor = "gzip"; }
     auto source = tmpDir("mirror_shard_inner_missing_source");
     auto mirror = tmpDir("mirror_shard_inner_missing_cache");
-    auto array = makeShardedArray(source, true);
+    auto array = makeShardedArray(source, true, compressor);
     const auto object = array->storage_object_location(
         std::array<std::size_t, 3>{0, 0, 0});
 

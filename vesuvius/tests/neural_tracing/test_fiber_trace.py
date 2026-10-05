@@ -182,6 +182,9 @@ def test_parse_vc3d_fiber_v3_segment_metadata(tmp_path):
     assert fiber.control_point_segments[1] is None
     from vc3d_fiber_format import serialize_segment_metadata
     assert serialize_segment_metadata(fiber.control_point_segments[0]) == segment
+    from vc3d_fiber_format import parse_segment_metadata
+    tagged = dict(segment, tags=["damaged"])
+    assert serialize_segment_metadata(parse_segment_metadata(tagged, version=4)) == tagged
 
     reviewed = {
         "type": "vc3d_fiber", "version": 4,

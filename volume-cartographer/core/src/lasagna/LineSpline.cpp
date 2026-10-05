@@ -1,4 +1,5 @@
 #include "vc/lasagna/LineSpline.hpp"
+#include "vc/core/util/ArcHermite.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -21,20 +22,6 @@ cv::Vec3d unit(const cv::Vec3d& value, const char* name)
         throw std::invalid_argument(std::string(name) + " must be finite and non-zero");
     }
     return value * (1.0 / length);
-}
-
-cv::Vec3d hermite(const cv::Vec3d& p0,
-                  const cv::Vec3d& p1,
-                  const cv::Vec3d& m0,
-                  const cv::Vec3d& m1,
-                  double t)
-{
-    const double t2 = t * t;
-    const double t3 = t2 * t;
-    return (2.0 * t3 - 3.0 * t2 + 1.0) * p0 +
-           (t3 - 2.0 * t2 + t) * m0 +
-           (-2.0 * t3 + 3.0 * t2) * p1 +
-           (t3 - t2) * m1;
 }
 
 } // namespace
@@ -85,6 +72,15 @@ LineSplineResult interpolateLineControlPoints(const LineSplineRequest& request)
         derivatives[i] = tangent * handle;
     }
 
+    if (!request.controlDirections.empty()) {
+        if (request.controlDirections.size()!=count)
+            throw std::invalid_argument("spline control direction count mismatch");
+        for (size_t i=0; i<count; ++i) {
+            if (!request.controlDirections[i]) continue;
+            auto axis=unit(*request.controlDirections[i],"control spline direction");
+            derivatives[i]=axis*cv::norm(derivatives[i]);
+        }
+    }
     LineSplineResult result;
     result.controlPointIndices.reserve(count);
     result.points.push_back(request.controlPoints.front());
@@ -114,11 +110,11 @@ LineSplineResult interpolateLineControlPoints(const LineSplineRequest& request)
             usable = true;
             for (int sample = 1; sample <= samples; ++sample) {
                 const double t = static_cast<double>(sample) / samples;
-                cv::Vec3d point = hermite(request.controlPoints[span],
+                cv::Vec3d point = vc::geometry::hermite(request.controlPoints[span],
                                           request.controlPoints[span + 1],
                                           left,
                                           right,
-                                          t);
+                                          1.0, t).value;
                 if (sample == samples)
                     point = request.controlPoints[span + 1];
                 const double progress =

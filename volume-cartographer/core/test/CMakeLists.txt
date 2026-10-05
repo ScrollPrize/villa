@@ -66,6 +66,12 @@ endfunction()
 
 vc_add_test(NAME test_smoke LIBS doctest::doctest)
 
+vc_add_test(NAME test_omp_thread_point_collection)
+
+vc_add_test(NAME test_surface_area_units)
+
+vc_add_test(NAME test_voxel_size_metadata)
+
 vc_add_test(NAME test_tifxyz_identity)
 
 vc_add_test(NAME test_appendmask_render)
@@ -119,18 +125,25 @@ vc_add_test(NAME test_ink_detection_overlay
 
 qt6_wrap_cpp(viewer_overlay_base_surface_primitives_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/ViewerOverlayControllerBase.hpp)
 qt6_wrap_cpp(fiber_overlay_surface_primitives_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/FiberOverlayController.hpp)
+qt6_wrap_cpp(points_overlay_surface_primitives_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/PointsOverlayController.hpp)
+qt6_wrap_cpp(vccollection_surface_primitives_moc ${PROJECT_SOURCE_DIR}/core/include/vc/ui/VCCollection.hpp)
 vc_add_test(NAME test_viewer_overlay_surface_primitives
     SOURCES test_viewer_overlay_surface_primitives.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/ViewerOverlayControllerBase.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/FiberOverlayController.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/PointsOverlayController.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/OverlayBatchItem.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/AtlasOverlayController.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/AtlasControlPointsOverlayController.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/AtlasControlPointsDock.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/COutlinedTextItem.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/volume_viewers/CVolumeViewerView.cpp
+            ${PROJECT_SOURCE_DIR}/core/src/VCCollection.cpp
             test_viewer_manager_stub.cpp
             ${viewer_overlay_base_surface_primitives_moc}
             ${fiber_overlay_surface_primitives_moc}
+            ${points_overlay_surface_primitives_moc}
+            ${vccollection_surface_primitives_moc}
             ${viewer_manager_overlay_test_moc}
     LIBS Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test vc_core vc_atlas
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
@@ -218,6 +231,26 @@ vc_add_test(NAME test_spiral_config_profile_editor
 
 qt6_wrap_cpp(line_annotation_vccollection_moc ${PROJECT_SOURCE_DIR}/core/include/vc/ui/VCCollection.hpp)
 qt6_wrap_cpp(line_annotation_cstate_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.hpp)
+vc_add_test(NAME test_line_annotation_link_validation
+    SOURCES test_line_annotation_link_validation.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberSliceGeometry.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberSliceGeometry.hpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSegments.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSegments.hpp
+    LIBS doctest::doctest Qt6::Core vc_core vc_lasagna vc_fiber_tracer
+    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+vc_add_test(NAME test_line_annotation_structural_edits
+    SOURCES test_line_annotation_structural_edits.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberSliceGeometry.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberSliceGeometry.hpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSegments.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSegments.hpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationStructuralEdits.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationStructuralEdits.hpp
+    LIBS doctest::doctest Qt6::Core vc_core vc_lasagna vc_fiber_tracer
+    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
 vc_add_test(NAME test_line_annotation_generated_views
     SOURCES test_line_annotation_generated_views.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSaveJob.cpp
@@ -615,11 +648,6 @@ if(VC_RUN_RENDER_BENCHMARKS)
         set(_render_valgrind_ci_gate_outputs)
 
         foreach(_fixture serial parallel)
-            if(_fixture STREQUAL "serial")
-                set(_render_workers 1)
-            else()
-                set(_render_workers 4)
-            endif()
             foreach(_scenario full_res fallback_3 mixed_correlated mixed_shuffled)
                 set(_case_dir
                     "${_render_valgrind_ci_root}/${_fixture}/${_scenario}")
@@ -631,77 +659,33 @@ if(VC_RUN_RENDER_BENCHMARKS)
                 set(_callgrind_metadata
                     "${_callgrind_dir}/metadata.json")
                 set(_callgrind_scheduler)
-                set(_callgrind_scheduler_args)
                 set(_callgrind_byproducts
                     "${_callgrind_metadata}")
                 if(_fixture STREQUAL "parallel")
                     set(_callgrind_scheduler
                         "${_callgrind_dir}/scheduler.log")
-                    list(APPEND _callgrind_scheduler_args
-                        --trace-sched=yes
-                        --trace-syscalls=yes
-                        --time-stamp=yes
-                        "--log-file=${_callgrind_scheduler}")
                     list(APPEND _callgrind_byproducts
                         "${_callgrind_scheduler}")
                 endif()
+                set(_evaluation "${_case_dir}/evaluation.json")
                 add_custom_command(
-                    OUTPUT "${_callgrind_stamp}"
+                    OUTPUT "${_evaluation}" "${_callgrind_stamp}"
                     BYPRODUCTS ${_callgrind_byproducts}
-                    COMMAND ${CMAKE_COMMAND} -E remove_directory
-                        "${_callgrind_dir}"
-                    COMMAND ${CMAKE_COMMAND} -E make_directory
-                        "${_callgrind_dir}"
-                    COMMAND ${CMAKE_COMMAND} -E env
-                        "VC_RENDER_SAMPLER_THREADS=${_render_workers}"
-                        ${VC_VALGRIND_EXECUTABLE}
-                        --tool=callgrind
-                        --instr-atstart=no
-                        --fair-sched=yes
-                        --scheduling-quantum=10000
-                        --separate-threads=yes
-                        --dump-every-bb=10000
-                        --combine-dumps=no
-                        --collect-systime=no
-                        --cache-sim=yes
-                        --branch-sim=yes
-                        --I1=32768,8,64
-                        --D1=32768,8,64
-                        --LL=8388608,16,64
-                        ${_callgrind_scheduler_args}
-                        "--callgrind-out-file=${_callgrind_prefix}"
-                        $<TARGET_FILE:bench_render_synthetic>
+                    COMMAND ${Python3_EXECUTABLE}
+                        "${PROJECT_SOURCE_DIR}/scripts/run_render_valgrind_ci.py"
+                        collect-evaluate
+                        --valgrind "${VC_VALGRIND_EXECUTABLE}"
+                        --benchmark $<TARGET_FILE:bench_render_synthetic>
+                        --replay $<TARGET_FILE:bench_thread_sync_replay>
                         --fixture ${_fixture}
                         --scenario ${_scenario}
-                        --native-trials 1
-                        --metadata "${_callgrind_metadata}"
-                        --repetitions 1
-                        --callgrind
-                    COMMAND ${CMAKE_COMMAND} -E touch "${_callgrind_stamp}"
+                        --model "${_render_valgrind_ci_model}"
+                        --case-dir "${_case_dir}"
                     DEPENDS
                         bench_render_synthetic
-                    VERBATIM)
-
-                set(_evaluation "${_case_dir}/evaluation.json")
-                set(_evaluation_command
-                    $<TARGET_FILE:bench_thread_sync_replay>
-                    evaluate-render
-                    --fixture ${_fixture}
-                    --scenario ${_scenario}
-                    --callgrind-prefix "${_callgrind_prefix}"
-                    --callgrind-metadata "${_callgrind_metadata}"
-                    --model "${_render_valgrind_ci_model}"
-                    --output "${_evaluation}")
-                if(_fixture STREQUAL "parallel")
-                    list(APPEND _evaluation_command
-                        --callgrind-scheduler "${_callgrind_scheduler}")
-                endif()
-                add_custom_command(
-                    OUTPUT "${_evaluation}"
-                    COMMAND ${_evaluation_command}
-                    DEPENDS
-                        "${_callgrind_stamp}"
                         bench_thread_sync_replay
+                        "${PROJECT_SOURCE_DIR}/scripts/run_render_valgrind_ci.py"
+                        "${PROJECT_SOURCE_DIR}/scripts/render_valgrind_common.py"
                         "${_render_valgrind_ci_model}"
                     VERBATIM)
                 list(APPEND _render_valgrind_ci_measure_outputs "${_evaluation}")
@@ -885,6 +869,8 @@ vc_add_test(NAME test_atlas LIBS doctest::doctest vc_atlas)
 # with the command-line tool so the tested code is the shipped code).
 vc_add_test(NAME test_tifxyz_selfcross LIBS doctest::doctest opencv_core)
 
+vc_add_test(NAME test_seg_add_overlap_metrics)
+
 # End-to-end CLI contract for the same tool: exit codes, report
 # serialization, collection envelope. Needs the binary, so it only exists
 # in configurations that build the apps -- the test shards configure with
@@ -895,6 +881,36 @@ if(TARGET vc_tifxyz_selfcross)
         LIBS doctest::doctest vc_core opencv_core opencv_imgcodecs
         DEFS VC_SELFCROSS_BIN="$<TARGET_FILE:vc_tifxyz_selfcross>")
     add_dependencies(test_tifxyz_selfcross_cli vc_tifxyz_selfcross)
+endif()
+
+if(TARGET vc_seg_add_overlap)
+    vc_add_test(NAME test_seg_add_overlap_cli
+        LIBS doctest::doctest vc_core opencv_core opencv_imgcodecs
+        DEFS VC_SEG_ADD_OVERLAP_BIN="$<TARGET_FILE:vc_seg_add_overlap>")
+    add_dependencies(test_seg_add_overlap_cli vc_seg_add_overlap)
+endif()
+
+if(TARGET vc_render_tifxyz)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    vc_register_test_target(vc_render_tifxyz)
+    add_test(NAME test_render_tifxyz_logging
+        COMMAND ${Python3_EXECUTABLE}
+            "${CMAKE_CURRENT_SOURCE_DIR}/test_render_tifxyz_logging.py"
+            $<TARGET_FILE:vc_render_tifxyz>)
+    set_tests_properties(test_render_tifxyz_logging PROPERTIES TIMEOUT 90)
+    vc_register_ctest(test_render_tifxyz_logging vc_render_tifxyz)
+    add_test(NAME test_render_fetch_failure
+        COMMAND ${Python3_EXECUTABLE}
+            "${CMAKE_CURRENT_SOURCE_DIR}/test_render_fetch_failure.py"
+            $<TARGET_FILE:vc_render_tifxyz>)
+    set_tests_properties(test_render_fetch_failure PROPERTIES TIMEOUT 300)
+    vc_register_ctest(test_render_fetch_failure vc_render_tifxyz)
+    add_test(NAME test_render_band_prefetch
+        COMMAND ${Python3_EXECUTABLE}
+            "${CMAKE_CURRENT_SOURCE_DIR}/test_render_band_prefetch.py"
+            $<TARGET_FILE:vc_render_tifxyz>)
+    set_tests_properties(test_render_band_prefetch PROPERTIES TIMEOUT 120)
+    vc_register_ctest(test_render_band_prefetch vc_render_tifxyz)
 endif()
 
 vc_add_test(NAME test_fiber_intersections LIBS doctest::doctest vc_atlas)
@@ -908,6 +924,9 @@ vc_add_test(NAME test_plane_surface_branches)
 vc_add_test(NAME test_affine_transform_surface)
 
 vc_add_test(NAME test_quadsurface_more)
+vc_add_test(NAME test_quadsurface_smooth)
+
+vc_add_test(NAME test_surface_cache_dependencies)
 
 vc_add_test(NAME test_thinning)
 
@@ -924,6 +943,8 @@ vc_add_test(NAME test_quadsurface_pointto)
 vc_add_test(NAME test_quadsurface_snapshot)
 
 vc_add_test(NAME test_quadsurface_save_concurrency)
+
+vc_add_test(NAME test_quadsurface_cache_concurrency)
 
 vc_add_test(NAME test_quadsurface_save_paths)
 
@@ -962,6 +983,10 @@ vc_add_test(NAME test_zarr_helpers)
 vc_add_test(NAME test_chunked_plane_sampler)
 
 vc_add_test(NAME test_slicing)
+# The vc_render_tifxyz prefetch planner and PrefetchedArrayView (header-only
+# under apps/src, shared with the command-line tool so the tested code is the
+# shipped code).
+vc_add_test(NAME test_render_prefetch)
 
 vc_add_test(NAME test_volume_pkg)
 

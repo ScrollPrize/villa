@@ -73,15 +73,20 @@ def _perfect_spiral_fiber(wraps, winding=66, spacing=40.0, theta0=0.0):
     return np.asarray(pts, dtype=np.float32)
 
 
-def _flat_bundle(zyxs_list):
+def _flat_bundle(zyxs_list, radial_offsets=None):
     lengths = np.array([len(z) for z in zyxs_list], dtype=np.int64)
     starts = np.concatenate([[0], np.cumsum(lengths)])
-    return {
+    flat = {
         'zyxs': torch.from_numpy(np.concatenate(zyxs_list, axis=0)),
         'windings': torch.zeros(int(starts[-1]), dtype=torch.float32),
         'starts_cpu': torch.from_numpy(starts),
         'total': int(starts[-1]),
     }
+    if radial_offsets is not None:
+        flat['radial_offsets'] = torch.from_numpy(np.concatenate([
+            np.full(len(z), float(o), dtype=np.float32)
+            for z, o in zip(zyxs_list, radial_offsets)]))
+    return flat
 
 
 def _strips(zyxs_list):
@@ -96,11 +101,12 @@ def _strips(zyxs_list):
 def _run_losses(
         zyxs_list, cfg, num_steps=25, compute_dt=True, seed=0,
         num_points_per_pcl=None, transform=None, whole_object_cache=False,
-        components=None, component_edges=None, num_pcls_per_step=None):
+        components=None, component_edges=None, num_pcls_per_step=None,
+        radial_offsets=None):
     np.random.seed(seed)
     torch.manual_seed(seed)
     strips = _strips(zyxs_list)
-    flat = _flat_bundle(zyxs_list)
+    flat = _flat_bundle(zyxs_list, radial_offsets)
     crossing_map = ThetaCrossingMap('cpu')
     node_start = crossing_map.register_nodes(
         flat['total'], lambda lo, hi: flat['zyxs'][lo:hi])
@@ -121,23 +127,28 @@ def _run_losses(
         ]
         if junctions:
             crossing_map.register_edges(junctions)
-    crossing_map.force_refresh(IdentityTransform())
+    transform = transform or IdentityTransform()
+    crossing_map.force_refresh(transform)
     strata = build_pcl_sampling_strata(
         ['fibers'] * len(components), cfg,
         member_weights=[len(members) for members in components])
     dr = torch.tensor(DR)
-    transform = transform or IdentityTransform()
     dt_target_cache = None
     if whole_object_cache:
         dt_target_cache = compute_strip_dt_target_cache(
-            IdentityTransform(), dr, flat['zyxs'], flat['starts_cpu'],
+            transform, dr, flat['zyxs'], flat['starts_cpu'],
             windings=flat['windings'], num_points_per_strip=512,
-            max_stride=128)
+            max_stride=128, radial_offsets=flat.get('radial_offsets'))
     if num_points_per_pcl is None:
         num_points_per_pcl = cfg[
             'sample_count_unattached_pcl_points_per_step']
     if num_pcls_per_step is None:
         num_pcls_per_step = len(zyxs_list)
+    # Counting/recording transforms measure the loss evaluations only, not
+    # the topology refresh or the whole-object cache build.
+    for attribute in ('forward_counts', 'inverse_counts', 'forward_inputs'):
+        if hasattr(transform, attribute):
+            getattr(transform, attribute).clear()
     radius_losses, dt_losses = [], []
     for _ in range(num_steps):
         radius_loss, dt_loss = get_unattached_pcl_strip_losses(
@@ -283,5 +294,187 @@ def test_subwrap_strip_across_seam_still_has_zero_loss():
     cfg = _make_cfg()
     fiber = _perfect_spiral_fiber(0.5, theta0=1.75 * np.pi)
     radius_losses, dt_losses = _run_losses([fiber], cfg)
+    assert radius_losses.max() < 1e-3
+    assert dt_losses.max() < 1e-3
+
+
+def _radially_displaced(fiber, delta):
+    # Move every point of a spiral fiber outward by `delta` voxels along its
+    # own radial direction (the sheet normal for a near-circular winding).
+    out = fiber.copy()
+    r = np.linalg.norm(fiber[:, 1:], axis=1, keepdims=True)
+    out[:, 1:] = fiber[:, 1:] * (1.0 + delta / r)
+    return out
+
+
+def test_back_face_vertical_strip_is_satisfied_with_its_radial_offset():
+    # A fiber 4 voxels outside a perfect winding (on the sheet's back face) is
+    # off the sheet by far more than the 2.5%-of-a-winding hinge margins
+    # (0.3 vx at DR=12): without an offset the DT term pulls it in, with
+    # radial_offsets=4 both terms are zero, in strip-median and whole-object
+    # DT target modes alike.
+    cfg = _make_cfg()
+    fiber = _radially_displaced(_perfect_spiral_fiber(3.0), 4.0)
+    _, dt_without = _run_losses([fiber], cfg, num_steps=5)
+    assert dt_without.min() > 1.0
+    for whole_object_cache in (False, True):
+        radius_with, dt_with = _run_losses(
+            [fiber], cfg, num_steps=5, radial_offsets=[4.0],
+            whole_object_cache=whole_object_cache)
+        assert radius_with.max() < 1e-3
+        assert dt_with.max() < 1e-3
+
+
+class RadialScaleTransform(IdentityTransform):
+    """Scroll -> spiral map that scales the yx plane about the axis by `scale`
+    (z untouched): a uniform radial stretch, so a scroll distance d along the
+    sheet normal is d * scale in spiral radius."""
+
+    def __init__(self, scale):
+        self.scale = float(scale)
+
+    def __call__(self, zyxs):
+        out = zyxs.clone()
+        out[..., 1:] = out[..., 1:] * self.scale
+        return out
+
+    def inv(self, spiral_zyxs):
+        out = spiral_zyxs.clone()
+        out[..., 1:] = out[..., 1:] / self.scale
+        return out
+
+
+def test_radial_offset_is_a_scroll_distance_under_a_stretching_transform():
+    # The sheet is a perfect winding in spiral space; the transform stretches
+    # the yx plane by 2, so in scroll space the fiber is half as far out and a
+    # back-face fiber 4 scroll voxels outside the sheet lands 8 spiral units
+    # out. A constant spiral-space offset of 4 would leave a 4-unit residual
+    # (far beyond the hinge margins); the physical offset must read ~zero in
+    # strip-median and whole-object DT target modes alike.
+    cfg = _make_cfg()
+    scale = 2.0
+    transform = RadialScaleTransform(scale)
+    sheet_scroll = transform.inv(torch.from_numpy(_perfect_spiral_fiber(3.0)))
+    fiber = _radially_displaced(sheet_scroll.numpy(), 4.0)
+    _, dt_without = _run_losses(
+        [fiber], cfg, num_steps=5, transform=transform)
+    assert dt_without.min() > 1.0
+    for whole_object_cache in (False, True):
+        radius_with, dt_with = _run_losses(
+            [fiber], cfg, num_steps=5, radial_offsets=[4.0],
+            transform=transform, whole_object_cache=whole_object_cache)
+        assert radius_with.max() < 1e-3
+        assert dt_with.max() < 1e-3
+    # The same fiber, read with a 4-unit constant, sits a whole 4 spiral
+    # units off: the stretch is what makes the offset land.
+    _, dt_constant = _run_losses(
+        [_radially_displaced(sheet_scroll.numpy(), 4.0 / scale)], cfg,
+        num_steps=5, radial_offsets=[4.0], transform=transform)
+    assert dt_constant.min() > 1.0
+
+
+class AnisotropicScaleTransform(IdentityTransform):
+    """Scroll -> spiral map scaling y by `sy` and x by `sx` about the axis, so
+    the scan-space sheet normal (the pulled-back winding gradient) and the
+    line to the umbilicus point different ways off the axes."""
+
+    def __init__(self, sy, sx):
+        self.sy, self.sx = float(sy), float(sx)
+
+    def __call__(self, zyxs):
+        out = zyxs.clone()
+        out[..., 1] = out[..., 1] * self.sy
+        out[..., 2] = out[..., 2] * self.sx
+        return out
+
+    def inv(self, spiral_zyxs):
+        out = spiral_zyxs.clone()
+        out[..., 1] = out[..., 1] / self.sy
+        out[..., 2] = out[..., 2] / self.sx
+        return out
+
+
+def test_offset_direction_is_the_winding_gradient_not_the_umbilicus_line():
+    # Under an anisotropic map the fitted sheet in scan space is an ellipse-
+    # like curve whose normal is J^T n, the scan-space gradient of the fitted
+    # winding. A fiber 4 scroll voxels off the sheet along J^T n (increasing
+    # winding) is exactly what offset=4 expects; the same 4 voxels along the
+    # straight line to the umbilicus is not on the expected surface.
+    cfg = _make_cfg()
+    sy, sx = 1.0, 3.0
+    transform = AnisotropicScaleTransform(sy, sx)
+    sheet_spiral = torch.from_numpy(_perfect_spiral_fiber(3.0))
+    sheet_scroll = transform.inv(sheet_spiral)
+    n = torch.nn.functional.normalize(sheet_spiral[:, 1:], dim=-1)  # spiral radial
+    gradient = torch.stack([n[:, 0] * sy, n[:, 1] * sx], dim=-1)  # J^T n (yx)
+    gradient = torch.nn.functional.normalize(gradient, dim=-1)
+    radial = torch.nn.functional.normalize(sheet_scroll[:, 1:], dim=-1)
+    # The two directions genuinely differ off the axes.
+    assert float((gradient * radial).sum(-1).min()) < 0.9
+
+    along_gradient = sheet_scroll.clone()
+    along_gradient[:, 1:] += 4.0 * gradient
+    along_umbilicus_line = sheet_scroll.clone()
+    along_umbilicus_line[:, 1:] += 4.0 * radial
+    for whole_object_cache in (False, True):
+        radius_loss, dt_loss = _run_losses(
+            [along_gradient.numpy()], cfg, num_steps=5, radial_offsets=[4.0],
+            transform=transform, whole_object_cache=whole_object_cache)
+        assert radius_loss.max() < 1e-3
+        assert dt_loss.max() < 1e-3
+    radius_loss, dt_loss = _run_losses(
+        [along_umbilicus_line.numpy()], cfg, num_steps=5,
+        radial_offsets=[4.0], transform=transform)
+    assert radius_loss.max() > 0.1
+
+
+def test_zero_offsets_add_no_transform_evaluations():
+    # The stretch estimate costs six extra transform evaluations per sampled
+    # point; a bundle whose offsets are all zero must not pay for it.
+    cfg = _make_cfg()
+    base = _perfect_spiral_fiber(1.0)
+    transform = CountingIdentityTransform()
+    _run_losses(
+        [base[:3], base[:5]], cfg, num_steps=1, num_points_per_pcl=1024,
+        transform=transform, radial_offsets=[0.0, 0.0])
+    assert transform.forward_counts == [10]
+
+
+def test_offset_strip_is_satisfied_under_a_stretching_transform():
+    # Under a 2.5x radial stretch a back-face fiber 4 scroll voxels outside
+    # the sheet is 10 spiral units out; the physical offset of 4 puts every
+    # point on the sheet. A fiber only 4 *spiral* units out (what a constant
+    # spiral-space offset of 4 would have expected) reads 6 units inside its
+    # winding with the same offset -- the largest possible residual, outside
+    # the 0.45*DR satisfaction band -- so none of it is satisfied.
+    from fit_spiral import _build_strip_flat_bundle
+    from satisfaction_metrics import get_unattached_pcl_satisfied_counts
+    scale = 2.5
+    transform = RadialScaleTransform(scale)
+    sheet_scroll = transform.inv(torch.from_numpy(_perfect_spiral_fiber(2.0)))
+    physical = _radially_displaced(sheet_scroll.numpy(), 4.0)
+    constant = _radially_displaced(sheet_scroll.numpy(), 4.0 / scale)
+    for fiber, expect_all in ((physical, True), (constant, False)):
+        strips = _strips([fiber])
+        flat = _build_strip_flat_bundle(
+            [(fiber, np.zeros(len(fiber), np.float32),
+              np.full(len(fiber), 4.0, np.float32))],
+            torch.device('cpu'))
+        satisfied, total, _ = get_unattached_pcl_satisfied_counts(
+            transform, torch.tensor(DR), strips, lambda _s, _d: flat)
+        assert int(total[0]) == len(fiber)
+        assert int(satisfied[0]) == (len(fiber) if expect_all else 0)
+
+
+def test_radial_offset_only_moves_the_offset_strip():
+    # Mixed row of an on-sheet horizontal (offset 0) and a back-face vertical
+    # (offset 4) walked through a junction: both read as the same winding.
+    cfg = _make_cfg()
+    horizontal = _perfect_spiral_fiber(1.0)
+    vertical = _radially_displaced(_perfect_spiral_fiber(1.0, theta0=0.3), 4.0)
+    radius_losses, dt_losses = _run_losses(
+        [horizontal, vertical], cfg, num_steps=5,
+        radial_offsets=[0.0, 4.0],
+        components=[[0, 1]], component_edges=[[(0, 1, 1, 0)]])
     assert radius_losses.max() < 1e-3
     assert dt_losses.max() < 1e-3

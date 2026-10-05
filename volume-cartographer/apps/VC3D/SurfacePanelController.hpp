@@ -1,3 +1,4 @@
+#include <functional>
 #pragma once
 
 #include <QObject>
@@ -44,6 +45,9 @@ class SurfacePanelController : public QObject
     Q_OBJECT
 
 public:
+    // True means a managed deletion was staged and dataset removal is deferred.
+    void setManagedDeletionHandler(std::function<bool(const QString&)> handler)
+    { _managedDeletionHandler = std::move(handler); }
     struct UiRefs {
         QTreeWidget* treeWidget{nullptr};
         QPushButton* reloadButton{nullptr};
@@ -218,6 +222,7 @@ signals:
 
 
 private:
+    std::function<bool(const QString&)> _managedDeletionHandler;
     struct SurfaceChanges {
         std::vector<std::string> toAdd;
         std::vector<std::string> toRemove;

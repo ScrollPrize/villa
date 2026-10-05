@@ -2,10 +2,15 @@
 #include <doctest/doctest.h>
 
 #include "OpenDataManifest.hpp"
+#include "OpenDataCoordinateIdentity.hpp"
 #include "OpenDataLasagna.hpp"
 #include "OpenDataNormalGrids.hpp"
 #include "OpenDataSampleProject.hpp"
+#include "ProjectFiberPaths.hpp"
+#include "ProjectCreationDefaults.hpp"
+#include "VolumeDisplayNames.hpp"
 #include "OpenDataSegmentCache.hpp"
+#include "VCSettings.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/MemMap.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -16,7 +21,37 @@
 #include <fstream>
 #include <utility>
 
+#include <QSettings>
+
 using namespace vc3d::opendata;
+
+TEST_CASE("Overlay coordinate compatibility permits untagged local volumes")
+{
+    const auto scan = coordinateSpaceTag({
+        "vc-open-data-source-coordinate-level:0",
+        "vc-open-data-coordinate-space:PHerc0139/scan@L0"});
+    const auto fiber = coordinateSpaceTag({"vc-lasagna-group:presence"});
+    REQUIRE(scan == "PHerc0139/scan@L0");
+    REQUIRE(fiber.empty());
+    CHECK(coordinateSpaceTagsCompatible(scan, fiber));
+    CHECK(coordinateSpaceTagsCompatible(fiber, scan));
+    CHECK(coordinateSpaceTagsCompatible(fiber, fiber));
+    CHECK(coordinateSpaceTagsCompatible(scan, scan));
+    CHECK_FALSE(coordinateSpaceTagsCompatible(scan, "PHerc0139/scan@L1"));
+    CHECK_FALSE(coordinateSpaceTagsCompatible(scan, "PHerc0139/other@L0"));
+    CHECK(coordinateSpaceTag({}).empty());
+}
+
+TEST_CASE("Volume aliases use semantic tags, not long filenames")
+{
+    CHECK(vc3d::volumeDisplayAlias({"vc-lasagna-group:presence"}) == "fiber");
+    CHECK(vc3d::volumeDisplayAlias({"vc-lasagna-group:nx"}).isEmpty());
+    CHECK(vc3d::volumeDisplayAlias({"surface-prediction"}) == "surf");
+    CHECK(vc3d::volumeDisplayAlias({"vc-open-data-preferred-source"}) == "scan");
+    CHECK(vc3d::volumeDisplayAlias({"vc-open-data-virtual-source"}) == "scan");
+    CHECK(vc3d::volumeDisplayAlias({"prediction", "normal3d"}).isEmpty());
+    CHECK(vc3d::volumeDisplayAlias({}).isEmpty());
+}
 
 namespace {
 
@@ -450,20 +485,42 @@ TEST_CASE("Manual project Lasagna resolution materializes a selected remote mani
     openOptions.remoteCacheRoot = root;
     openOptions.remoteFileFetcher = [&](const std::string&, const std::filesystem::path& temporary) {
         ++fetches;
-        std::ofstream(temporary) << R"({"version":2,"groups":{}})";
+        std::ofstream(temporary) << R"({"version":2,"groups":{
+            "nx":{"zarr":"nx.ome.zarr/4","scaledown":4,"channels":["nx"]}
+        }})";
     };
     const auto cached = vc::lasagna::LasagnaDataset::openLocation(
         location, openOptions);
 
+    const QByteArray previousConfigDir = qgetenv("VC3D_CONFIG_DIR");
+    qputenv("VC3D_CONFIG_DIR", QByteArray::fromStdString((root / "settings").string()));
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    settings.setValue(
+        vc3d::settings::viewer::REMOTE_CACHE_DIR,
+        QString::fromStdString(root.string()));
+    settings.sync();
+
     auto pkg = VolumePkg::newEmpty();
-    pkg->setRemoteCacheRoot(root);
     REQUIRE(pkg->addLasagnaDatasetEntry(location));
     pkg->setSelectedLasagnaDataset(location);
     const auto resolved = resolveLasagnaForCoordinateTags(*pkg, {});
     REQUIRE(resolved.has_value());
     CHECK(resolved->manifestPath == cached.manifest().manifestPath);
     CHECK(resolved->sourceManifestLocation == location);
+    // Alignment metrics must retain this remote dataset, not reopen its cached
+    // manifest as a local file and interpret the relative channel as local.
+    openOptions.workingToBaseScale = resolved->workingToBaseScale;
+    const auto metricsDataset = std::make_shared<vc::lasagna::LasagnaDataset>(
+        vc::lasagna::LasagnaDataset::openLocation(
+            resolved->sourceManifestLocation, openOptions));
+    REQUIRE(metricsDataset->manifest().groups.size() == 1);
+    const auto& channel = metricsDataset->manifest().groups.front();
+    CHECK(channel.isRemote());
+    CHECK(channel.remoteZarrBaseUrl == "https://example.test/manual");
+    CHECK(channel.remoteZarrKey == "nx.ome.zarr/4");
+    CHECK(metricsDataset->manifest().workingToBaseScale == resolved->workingToBaseScale);
     CHECK(fetches == 1);
+    qputenv("VC3D_CONFIG_DIR", previousConfigDir);
     std::filesystem::remove_all(root);
 }
 
@@ -546,6 +603,46 @@ TEST_CASE("Open-data Lasagna alone requests its declared rebased source view")
                     pkg->volumeEntries()[1].tags.end(),
                     "vc-open-data-lasagna-artifact:http://127.0.0.1:9/lasagna") !=
           pkg->volumeEntries()[1].tags.end());
+}
+
+TEST_CASE("Selected Lasagna does not implicitly attach scan views")
+{
+    OpenDataSample sample;
+    sample.id = "sample";
+    OpenDataVolume volume;
+    volume.id = "v";
+    volume.pixelSizeUm = 2.4;
+    OpenDataArtifact source, lasagna;
+    source.type = "ome-zarr";
+    source.resolvedUrl = "http://127.0.0.1:9/source.zarr";
+    lasagna.type = "lasagna";
+    lasagna.resolvedUrl = "http://127.0.0.1:9/lasagna";
+    lasagna.levelParameterPresent = true;
+    lasagna.sourceCoordinateLevel = 2;
+    volume.artifacts = {source, lasagna};
+    sample.volumes = {volume};
+    OpenDataResourceSelection selection;
+    selection.rawVolumeIds.emplace();
+    selection.representations = derivedRepresentations(sample);
+    vc::project::LoadOptions options;
+    options.deferResolution = true;
+    auto pkg = VolumePkg::newDetached(options);
+    attachOpenDataSampleVolumes(*pkg, sample, &selection);
+    CHECK(pkg->volumeEntries().empty());
+
+    selection.rawVolumeIds->push_back(volume.id);
+    auto withScan = VolumePkg::newDetached(options);
+    attachOpenDataSampleVolumes(*withScan, sample, &selection);
+    REQUIRE(withScan->volumeEntries().size() == 1);
+    CHECK(withScan->volumeEntries().front().location == source.resolvedUrl);
+    REQUIRE(withScan->addLasagnaDatasetEntry("/cache/selected.lasagna.json", {
+        "vc-open-data-lasagna", "vc-open-data-sample-id:sample",
+        "vc-open-data-volume-id:v", "vc-open-data-source-coordinate-level:2"}));
+    const auto resolved = resolveLasagnaForCoordinateTags(
+        *withScan, withScan->volumeEntries().front().tags);
+    REQUIRE(resolved.has_value());
+    CHECK(resolved->workingToBaseScale == doctest::Approx(1.0));
+    CHECK(resolved->manifestPath == std::filesystem::path("/cache/selected.lasagna.json"));
 }
 
 TEST_CASE("OpenDataNormalGrids preserves distinct level artifacts and cache identities")
@@ -1092,6 +1189,147 @@ TEST_CASE("OpenDataSampleProject attaches all supported zarr artifacts for a cat
           pkg->volumeEntries()[0].tags.end());
 }
 
+TEST_CASE("Project creation defaults to the shared autosave directory")
+{
+    const auto root = std::filesystem::current_path() /
+        ("project_defaults_test_" + std::to_string(vc::memmap::pid()));
+    const auto previous = VolumePkg::autosaveRoot();
+    VolumePkg::setAutosaveRoot(root / "vc3d");
+    {
+        QSettings settings(QString::fromStdString((root / "settings.ini").string()), QSettings::IniFormat);
+        settings.setValue(vc3d::settings::project::DEFAULT_PATH, "different-directory");
+        CHECK(vc3d::defaultNewProjectDirectory(settings).toStdString() == (root / "vc3d").string());
+        CHECK(std::filesystem::is_directory(root / "vc3d"));
+    }
+    VolumePkg::setAutosaveRoot(previous);
+    std::filesystem::remove_all(root);
+}
+
+TEST_CASE("Project fiber paths share annotation filename sanitization")
+{
+    CHECK(vc3d::projectFiberDirectory("projects/My Project.volpkg.json") ==
+          std::filesystem::path("projects/fibers/My_Project.volpkg.json"));
+    CHECK(vc3d::projectFiberDirectory("local.volpkg.json") ==
+          std::filesystem::path("fibers/local.volpkg.json"));
+    CHECK(vc3d::projectFiberDirectory({}, "legacy") ==
+          std::filesystem::path("legacy/fibers/legacy"));
+    CHECK(vc3d::projectFiberDirectory({}).empty());
+}
+
+TEST_CASE("Catalog source selection is independent of derived representations")
+{
+    OpenDataSample sample;
+    sample.id = "selection";
+    OpenDataVolume volume;
+    volume.id = "v";
+    volume.dataFormat = "zarr";
+    OpenDataArtifact source, prediction;
+    source.type = "ome-zarr";
+    source.resolvedUrl = "http://127.0.0.1:9/base.zarr";
+    prediction.type = "surface-prediction-zarr";
+    prediction.resolvedUrl = "http://127.0.0.1:9/prediction.zarr";
+    volume.artifacts = {source, prediction};
+    sample.volumes = {volume};
+    vc::project::LoadOptions options;
+    options.deferResolution = true;
+    OpenDataResourceSelection selection;
+    selection.rawVolumeIds.emplace();
+    selection.representations.emplace();
+    auto empty = VolumePkg::newEmpty(options);
+    attachOpenDataSampleVolumes(*empty, sample, &selection);
+    CHECK(empty->volumeEntries().empty());
+
+    selection.representations = derivedRepresentations(sample);
+    auto derived = VolumePkg::newEmpty(options);
+    attachOpenDataSampleVolumes(*derived, sample, &selection);
+    REQUIRE(derived->volumeEntries().size() == 1);
+    CHECK(derived->volumeEntries().front().location == prediction.resolvedUrl);
+
+    selection.rawVolumeIds = std::vector<std::string>{"v"};
+    selection.representations->clear();
+    auto raw = VolumePkg::newEmpty(options);
+    attachOpenDataSampleVolumes(*raw, sample, &selection);
+    REQUIRE(raw->volumeEntries().size() == 1);
+    CHECK(raw->volumeEntries().front().location == source.resolvedUrl);
+}
+
+TEST_CASE("Selective catalog projects isolate cached projects and individual segments")
+{
+    auto manifest = parseOpenDataManifest(kFixture);
+    auto sample = *manifest.findSample("PHerc0139");
+    const auto root = std::filesystem::current_path() /
+        ("selective_catalog_test_" + std::to_string(vc::memmap::pid()));
+    std::filesystem::remove_all(root);
+    const auto oldAutosave = VolumePkg::autosaveRoot();
+    VolumePkg::setAutosaveRoot(root / "autosave");
+    // Prepare the full catalog cache first, including an unrelated segment.
+    auto extra = sample.segments.front();
+    extra.id = "unselected-segment";
+    extra.longId = "unselected-segment";
+    sample.segments.push_back(extra);
+    vc::project::LoadOptions options;
+    options.deferResolution = true;
+    auto full = VolumePkg::newEmpty(options);
+    reconcileOpenDataSampleSegments(*full, sample, root);
+    full->setSelectedLasagnaDataset("full-project-marker");
+    const auto cachedPath = root / "open_data/projects/PHerc0139.volpkg.json";
+    full->save(cachedPath);
+    const auto autosaveBefore = [&]() {
+        std::ifstream stream(VolumePkg::autosaveRoot() / "current_project.json");
+        return nlohmann::json::parse(stream);
+    }();
+    const auto extraDir = openDataCanonicalSegmentCacheDirectory(root, sample, extra);
+    const auto originBefore = [&]() {
+        std::ifstream stream(extraDir / "catalog-origin.json");
+        return nlohmann::json::parse(stream);
+    }();
+
+    OpenDataResourceSelection selection;
+    selection.rawVolumeIds.emplace();
+    selection.representations.emplace();
+    selection.segmentIds.emplace();
+    OpenDataNewProject destination{root / "empty.volpkg.json", "Empty chosen project"};
+    auto empty = createOpenDataSampleProject(sample, root, nullptr, {}, &selection, &destination);
+    CHECK(empty->volumeEntries().empty());
+    CHECK(empty->segmentEntries().empty());
+    CHECK(empty->selectedLasagnaDataset().empty());
+    CHECK(empty->name() == destination.name);
+    CHECK(empty->path() == destination.path);
+    const auto fiberDir = vc3d::projectFiberDirectory(destination.path);
+    CHECK(fiberDir == root / "fibers" / "empty.volpkg.json");
+    CHECK(std::filesystem::is_directory(fiberDir));
+    CHECK(std::filesystem::is_empty(fiberDir));
+    writeFile(fiberDir / "existing.json", "{}");
+    const auto recreated = createOpenDataSampleProject(sample, root, nullptr, {}, &selection, &destination);
+    CHECK(std::filesystem::is_regular_file(fiberDir / "existing.json"));
+
+    selection.segmentIds->push_back(sample.segments.front().id);
+    destination = {root / "selected.volpkg.json", "Only selected"};
+    auto selected = createOpenDataSampleProject(sample, root, nullptr, {}, &selection, &destination);
+    CHECK(selected->volumeEntries().empty());
+    REQUIRE_FALSE(selected->segmentEntries().empty());
+    for (const auto& entry : selected->segmentEntries()) {
+        CHECK(isOpenDataSegmentPlaceholder(entry.location));
+        CHECK(entry.location.find("unselected-segment") == std::string::npos);
+        CHECK(std::find(entry.tags.begin(), entry.tags.end(), "vc-open-data-segment-aggregate") == entry.tags.end());
+    }
+    auto reloaded = VolumePkg::load(destination.path, options);
+    CHECK(reloaded->name() == destination.name);
+    CHECK(reloaded->segmentEntries().size() == selected->segmentEntries().size());
+    auto cached = VolumePkg::load(cachedPath, options);
+    CHECK(cached->selectedLasagnaDataset() == "full-project-marker");
+    std::ifstream originStream(extraDir / "catalog-origin.json");
+    CHECK(nlohmann::json::parse(originStream) == originBefore);
+    originStream.close();
+    OpenDataNewProject invalid{root, "Cannot save onto directory"};
+    CHECK_THROWS(createOpenDataSampleProject(sample, root, nullptr, {}, &selection, &invalid));
+    std::ifstream autosaveStream(VolumePkg::autosaveRoot() / "current_project.json");
+    CHECK(nlohmann::json::parse(autosaveStream) == autosaveBefore);
+    autosaveStream.close();
+    VolumePkg::setAutosaveRoot(oldAutosave);
+    std::filesystem::remove_all(root);
+}
+
 TEST_CASE("OpenDataSampleProject prefers the volume sourcing the most segments")
 {
     OpenDataSample sample;
@@ -1591,7 +1829,7 @@ TEST_CASE("OpenDataSegmentCache names editable copies after the current segments
           editableSegmentsFolder / "segment-100");
 }
 
-TEST_CASE("OpenDataSegmentCache editable copy is selectable from its new folder")
+TEST_CASE("OpenDataSegmentCache editable copy inherits routing from an aggregate root")
 {
     const auto testRoot = std::filesystem::temp_directory_path() /
                           ("vc_open_data_editable_selection_test_" +
@@ -1599,7 +1837,8 @@ TEST_CASE("OpenDataSegmentCache editable copy is selectable from its new folder"
     std::filesystem::remove_all(testRoot);
 
     const auto sourceRoot = testRoot / "catalog-segments";
-    const auto sourceSegment = sourceRoot / "20241113070770";
+    const auto sourceFolder = sourceRoot / "published-L0";
+    const auto sourceSegment = sourceFolder / "20241113070770";
     const auto fixtureSegment = std::filesystem::path(VC_TEST_FIXTURES_DIR) /
                                 "segments" / "20241113070770";
     copyFixtureFile(fixtureSegment / "meta.json", sourceSegment / "meta.json");
@@ -1607,20 +1846,78 @@ TEST_CASE("OpenDataSegmentCache editable copy is selectable from its new folder"
     copyFixtureFile(fixtureSegment / "y.tif", sourceSegment / "y.tif");
     copyFixtureFile(fixtureSegment / "z.tif", sourceSegment / "z.tif");
     writeFile(sourceSegment / "catalog-origin.json", "{}");
-
-    const auto editableSegment =
-        defaultEditableCopyPathForCatalogSegment(sourceSegment, sourceRoot);
-    const auto editableRoot = editableSegment.parent_path();
-    copyCatalogSegmentToEditableDirectory(sourceSegment, editableSegment);
+    const auto otherCatalogRoot = testRoot / "other-catalog-segments";
+    const auto otherCatalogSegment =
+        otherCatalogRoot / "published-L0" / "other-segment";
+    copyFixtureFile(fixtureSegment / "meta.json", otherCatalogSegment / "meta.json");
+    copyFixtureFile(fixtureSegment / "x.tif", otherCatalogSegment / "x.tif");
+    copyFixtureFile(fixtureSegment / "y.tif", otherCatalogSegment / "y.tif");
+    copyFixtureFile(fixtureSegment / "z.tif", otherCatalogSegment / "z.tif");
+    writeFile(otherCatalogSegment / "catalog-origin.json", "{}");
 
     const auto previousAutosaveRoot = VolumePkg::autosaveRoot();
     VolumePkg::setAutosaveRoot(testRoot / "autosave");
     auto pkg = VolumePkg::newEmpty();
-    REQUIRE(pkg->addSegmentsEntry(sourceRoot.string(), {"open-data", "immutable"}));
-    REQUIRE(pkg->addSegmentsEntry(editableRoot.string(), {"open-data-editable"}));
-    pkg->setOutputSegments(editableRoot.string());
+    REQUIRE(pkg->addSegmentsEntry(
+        sourceRoot.string(),
+        {"open-data", "immutable", "vc-open-data-target-volume-id:vol1",
+         "vc-open-data-coordinate-space:sample/vol1@L0",
+         "vc-open-data-source-coordinate-level:0"}));
+    REQUIRE(pkg->addSegmentsEntry(sourceFolder.string(), {"manual"}));
+    REQUIRE(pkg->addSegmentsEntry(
+        otherCatalogRoot.string(),
+        {"open-data", "immutable", "vc-open-data-target-volume-id:vol2"}));
+
+    const auto registeredCatalogRoot =
+        registeredOpenDataCatalogRootForSegment(*pkg, sourceSegment);
+    REQUIRE(registeredCatalogRoot == sourceRoot);
+    const auto editableSegment =
+        defaultEditableCopyPathForCatalogSegment(
+            sourceSegment, registeredCatalogRoot);
+    const auto editableRoot = editableSegment.parent_path();
+    CHECK_THROWS_WITH_AS(
+        copyCatalogSegmentToEditableDirectory(
+            *pkg, sourceSegment, sourceSegment),
+        doctest::Contains("immutable catalog"),
+        std::runtime_error);
+    CHECK_THROWS_WITH_AS(
+        copyCatalogSegmentToEditableDirectory(
+            *pkg, sourceSegment, sourceRoot / "unsafe-copy"),
+        doctest::Contains("immutable catalog"),
+        std::runtime_error);
+    CHECK_THROWS_WITH_AS(
+        copyCatalogSegmentToEditableDirectory(
+            *pkg, sourceSegment, otherCatalogSegment),
+        doctest::Contains("immutable catalog"),
+        std::runtime_error);
+    const auto sourceAlias = testRoot / "catalog-segment-alias";
+    std::error_code symlinkError;
+    std::filesystem::create_directory_symlink(
+        sourceSegment, sourceAlias, symlinkError);
+    if (!symlinkError) {
+        CHECK_THROWS_WITH_AS(
+            copyCatalogSegmentToEditableDirectory(
+                *pkg, sourceSegment, sourceAlias),
+            doctest::Contains("immutable catalog"),
+            std::runtime_error);
+    }
+    copyCatalogSegmentToEditableDirectory(
+        *pkg, sourceSegment, editableSegment);
+
+    attachEditableOpenDataSegmentRoot(
+        *pkg, sourceSegment, editableRoot, true);
 
     CHECK(pkg->outputSegmentsPath() == editableRoot);
+    const auto editableEntry = std::find_if(
+        pkg->segmentEntries().begin(), pkg->segmentEntries().end(),
+        [&](const auto& entry) { return entry.location == editableRoot.string(); });
+    REQUIRE(editableEntry != pkg->segmentEntries().end());
+    CHECK(editableEntry->tags == std::vector<std::string>{
+        "open-data-editable",
+        "vc-open-data-target-volume-id:vol1",
+        "vc-open-data-coordinate-space:sample/vol1@L0",
+        "vc-open-data-source-coordinate-level:0",
+    });
     CHECK_FALSE(std::filesystem::exists(editableSegment / "catalog-origin.json"));
     const auto surface = pkg->loadSurface("20241113070770");
     REQUIRE(surface);

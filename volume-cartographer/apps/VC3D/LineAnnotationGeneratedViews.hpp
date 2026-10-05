@@ -1,12 +1,16 @@
 #pragma once
 
 #include "vc/lasagna/LineViewBuilder.hpp"
+#include "vc/fiber_tracer/FiberDisplay.hpp"
+#include "vc/core/util/QuadSurface.hpp"
 
 #include <opencv2/core/types.hpp>
 
 #include <QPoint>
 #include <QPointF>
 #include <QString>
+
+class QPainterPath;
 
 #include <algorithm>
 #include <cstddef>
@@ -22,10 +26,36 @@
 
 class CChunkedVolumeViewer;
 class PlaneSurface;
+class QColor;
 class QuadSurface;
 class QWidget;
 
 namespace vc3d::line_annotation {
+
+struct GeneratedStripFrame {
+    cv::Vec3d along, across, normal;
+};
+inline std::optional<GeneratedStripFrame> generatedStripFrame(QuadSurface* surface,
+                                                            const cv::Vec2d& uv)
+{
+    if (!surface || !surface->rawPointsPtr() || surface->rawPointsPtr()->empty())
+        return std::nullopt;
+    const cv::Vec3f ptr{float(uv[0]*surface->scale()[0]),
+                       float(uv[1]*surface->scale()[1]),0};
+    const auto across=vc::fiber_tracer::displayUnit(cv::Vec3d(
+        surface->coord(ptr,{0,1,0})-surface->coord(ptr,{0,-1,0})));
+    const double col=surface->surfaceToGrid(uv)[0];
+    const double row=surface->rawPointsPtr()->rows/2;
+    const auto left=surface->gridToSurface({std::max(0.0,col-0.5),row});
+    const auto right=surface->gridToSurface({
+        std::min(double(surface->rawPointsPtr()->cols-1),col+0.5),row});
+    const auto along=vc::fiber_tracer::displayUnit(cv::Vec3d(
+        surface->sampleAtSurface(right).volume-surface->sampleAtSurface(left).volume));
+    const auto normal=across && along ?
+        vc::fiber_tracer::displayUnit(along->cross(*across)) : std::nullopt;
+    if (!normal) return std::nullopt;
+    return GeneratedStripFrame{across->cross(*normal),*across,*normal};
+}
 
 enum class GeneratedControlPointContextResult {
     None,
@@ -49,10 +79,25 @@ struct GeneratedOverlay {
             uint64_t fiberId = 0;
             int controlPointIndex = -1;
             bool pending = false;
+            // Adjacent-winding link (FiberBranchRef::adjacent).
+            bool adjacent = false;
         };
 
         size_t controlIndex = std::numeric_limits<size_t>::max();
         bool isSeed = false;
+        // Tagged kollesis_termination: hollow yellow ring. A linked tagged
+        // point keeps the link-state fill inside the yellow ring.
+        bool isKollesisTermination = false;
+        // Tagged break: dotted amber ring.
+        bool isBreak = false;
+        // The span this point owns (to the next control in line order)
+        // carries the gap span tag: drawn as the dotted amber line, closed
+        // to placement. Read from the span descriptor, never inferred from
+        // two break rings, so what is drawn is what the file says.
+        bool hasGapToNext = false;
+        // The span this point owns carries the damaged span tag: drawn as
+        // alternating amber and red dashes, nothing else changes.
+        bool hasDamagedToNext = false;
         bool hasBranches = false;
         bool hasPendingLinks = false;
         // Same-orientation links (H-H / V-V) render in the orange warning
@@ -60,13 +105,19 @@ struct GeneratedOverlay {
         // controller, which owns the fiber HV state.
         bool hasSameHvBranches = false;
         bool hasSameHvPendingLinks = false;
+        // An adjacent-winding link on this point: the marker is a triangle
+        // in the link-state colour instead of a circle.
+        bool hasAdjacentLinks = false;
         bool isLinkCandidate = false;
-        bool isSplitCandidate = false;
+        // With isLinkCandidate: designated as an ADJACENT link candidate, a
+        // green triangle rather than a green circle.
+        bool isAdjacentLinkCandidate = false;
         bool hasTracedSegmentToNext = false;
         std::string interpolationGoal = "global";
         char interpolationModeMarker = 'L';
         std::vector<uint64_t> branchIds;
         std::vector<BranchLink> branchLinks;
+        std::optional<cv::Vec3d> direction;
     };
 
     struct PredSnapMarker {
@@ -111,6 +162,9 @@ struct GeneratedOverlay {
         double distance = std::numeric_limits<double>::quiet_NaN();
         bool projectedBranchLink = false;
         bool pendingBranchLink = false;
+        // Set with projectedBranchLink when the local and linked fibers share
+        // an H/V classification (the orange warning palette).
+        bool sameHvBranchLink = false;
         bool isLinkCandidateFiber = false;
         std::optional<cv::Vec3f> connectorStart;
     };
@@ -122,6 +176,15 @@ struct GeneratedOverlay {
     // a subset of the controls sets the full fiber's range here so interior
     // spans are not mistaken for tails.
     std::optional<std::pair<double, double>> lineTailControlRange;
+    // Line-position ranges [first, second] of the fiber's gap spans: the
+    // owner control's span descriptor carries the gap tag. Drawn as a dotted
+    // amber line in place of the fiber's own line. Computed by the overlay
+    // builders from the FULL control list (generatedGapLineRanges) before any
+    // visibility filtering, so a hidden neighbour cannot move a range's end.
+    std::vector<std::pair<double, double>> gapLineRanges;
+    // Same, for spans carrying the damaged span tag: drawn as alternating
+    // amber and red dashes in place of the fiber's own line.
+    std::vector<std::pair<double, double>> damagedLineRanges;
     cv::Vec3f seedPoint{std::numeric_limits<float>::quiet_NaN(),
                         std::numeric_limits<float>::quiet_NaN(),
                         std::numeric_limits<float>::quiet_NaN()};
@@ -172,9 +235,36 @@ struct GeneratedSpanAlignmentMetric {
     std::string failureDetail;
     char modeMarker = 'L';
     std::string message;
+    // The span carries the gap span tag (shown in the label so the metadata
+    // can be read as text, not only as the dotted amber line).
+    bool gap = false;
+    // The span carries the damaged span tag.
+    bool damaged = false;
 };
 
+// Positions cross from the stored fiber grid to the viewer grid together;
+// directions and line indices are independent of that uniform scale.
+inline void scaleGeneratedMarkerForVolume(GeneratedOverlay::BranchLinkMarker& marker,
+                                          double scale)
+{
+    marker.localControlPoint *= static_cast<float>(scale);
+    marker.linkedControlPoint *= static_cast<float>(scale);
+    marker.planePoint *= static_cast<float>(scale);
+}
+
+inline void scaleGeneratedMarkerForVolume(GeneratedOverlay::PredSnapMarker& marker,
+                                          double scale)
+{
+    marker.controlPoint *= static_cast<float>(scale);
+    marker.snapPoint *= static_cast<float>(scale);
+}
+
 struct GeneratedViews {
+    double fiberWidth = 0.0; // Display-volume voxels, not persisted units.
+    double fiberWidthGapFraction = vc::fiber_tracer::kDefaultFiberWidthGapFraction;
+    double fiberBaseToVolumeScale = 1.0;
+    bool hasManualDisplayNormals = false;
+    std::vector<double> controlAngleOffsetsDegrees;
     std::string lineSurfaceName;
     QString lineSurfaceTitle;
     std::shared_ptr<QuadSurface> lineSurface;
@@ -192,6 +282,9 @@ struct GeneratedViews {
     // scroll center (NaN where the sample is invalid). Empty when
     // unavailable.
     std::vector<cv::Vec3f> lineNormals;
+    // Optional directed display correction; lineNormals still owns the
+    // fiber-wide viewer orientation convention.
+    std::vector<cv::Vec3f> displayLineNormals;
     // Unwrapped winding angle (radians) of each line point about the scroll
     // center, or empty when no center reference exists. See
     // unwrappedGeneratedWindingAngles.
@@ -461,12 +554,7 @@ inline cv::Vec3f interpolatedGeneratedLinePoint(const std::vector<cv::Vec3f>& li
                 std::numeric_limits<float>::quiet_NaN(),
                 std::numeric_limits<float>::quiet_NaN()};
     }
-    linePosition = std::clamp(linePosition, 0.0, static_cast<double>(linePoints.size() - 1));
-    const int lower = static_cast<int>(std::floor(linePosition));
-    const int upper = std::min<int>(lower + 1, static_cast<int>(linePoints.size()) - 1);
-    const float t = static_cast<float>(linePosition - static_cast<double>(lower));
-    return linePoints[static_cast<size_t>(lower)] * (1.0f - t) +
-           linePoints[static_cast<size_t>(upper)] * t;
+    return cv::Vec3f(vc::fiber_tracer::displayVectorAt(linePoints, linePosition));
 }
 
 // The side cut shows the stretch of the fiber within this winding distance of
@@ -479,9 +567,12 @@ inline constexpr double kGeneratedSideCutHalfWrapAngle = 3.14159265358979323846;
 // the point to the center at that point's z (non-finite when unknown). A point
 // without a usable direction gets NaN and does not break the chain: the next
 // finite angle continues from the last finite one. No towardCenter: all NaN.
+// pointToCenterFrameScale maps all three query coordinates into the center
+// provider's grid (including z for a center that varies along the scroll).
 inline std::vector<double> unwrappedGeneratedWindingAngles(
     const std::vector<cv::Vec3f>& linePoints,
-    const std::function<cv::Vec3f(const cv::Vec3f&)>& towardCenter)
+    const std::function<cv::Vec3f(const cv::Vec3f&)>& towardCenter,
+    float pointToCenterFrameScale = 1.0f)
 {
     constexpr double kTwoPi = 2.0 * kGeneratedSideCutHalfWrapAngle;
     std::vector<double> angles(linePoints.size(), std::numeric_limits<double>::quiet_NaN());
@@ -494,7 +585,7 @@ inline std::vector<double> unwrappedGeneratedWindingAngles(
         if (!std::isfinite(point[0]) || !std::isfinite(point[1]) || !std::isfinite(point[2])) {
             continue;
         }
-        const cv::Vec3f toCenter = towardCenter(point);
+        const cv::Vec3f toCenter = towardCenter(point * pointToCenterFrameScale);
         if (!std::isfinite(toCenter[0]) || !std::isfinite(toCenter[1])) {
             continue;
         }
@@ -1303,6 +1394,117 @@ inline bool generatedLineSegmentIsTail(
     return midpoint < controlRange->first || midpoint > controlRange->second;
 }
 
+// Defined further down (with the other tagged-end helpers); declared here for
+// the overlay builders' blocked-marker state.
+inline bool generatedLinePositionBeyondKollesisTermination(
+    const std::vector<GeneratedOverlay::ControlPointMarker>& controlPoints,
+    double linePosition);
+
+// The gap spans of a fiber as line-position ranges: a control whose span
+// descriptor carries the gap tag (hasGapToNext) spans to the next control in
+// line position order. Read from the span tag, not from the break rings, so
+// the drawn line reports the file's span metadata. Must be given the complete
+// control list. Inline: this header is compiled into QtCore-only tests
+// without the .cpp.
+template <typename SpanFlag>
+inline std::vector<std::pair<double, double>> generatedSpanLineRanges(
+    const std::vector<GeneratedOverlay::ControlPointMarker>& controlPoints,
+    SpanFlag ownerHasFlag)
+{
+    std::vector<const GeneratedOverlay::ControlPointMarker*> sorted;
+    sorted.reserve(controlPoints.size());
+    for (const auto& control : controlPoints) {
+        if (std::isfinite(control.linePosition)) {
+            sorted.push_back(&control);
+        }
+    }
+    std::sort(sorted.begin(), sorted.end(), [](const auto* a, const auto* b) {
+        return a->linePosition < b->linePosition;
+    });
+    std::vector<std::pair<double, double>> ranges;
+    for (size_t i = 1; i < sorted.size(); ++i) {
+        if (ownerHasFlag(*sorted[i - 1]) &&
+            sorted[i - 1]->linePosition < sorted[i]->linePosition) {
+            ranges.emplace_back(sorted[i - 1]->linePosition, sorted[i]->linePosition);
+        }
+    }
+    return ranges;
+}
+
+inline std::vector<std::pair<double, double>> generatedGapLineRanges(
+    const std::vector<GeneratedOverlay::ControlPointMarker>& controlPoints)
+{
+    return generatedSpanLineRanges(controlPoints, [](const GeneratedOverlay::ControlPointMarker& m) {
+        return m.hasGapToNext;
+    });
+}
+
+// The damaged spans, same rule (a span is never both: the gap wins).
+inline std::vector<std::pair<double, double>> generatedDamagedLineRanges(
+    const std::vector<GeneratedOverlay::ControlPointMarker>& controlPoints)
+{
+    return generatedSpanLineRanges(controlPoints, [](const GeneratedOverlay::ControlPointMarker& m) {
+        return m.hasDamagedToNext && !m.hasGapToNext;
+    });
+}
+
+// Strictly inside a gap span: nothing may be placed there until a break is
+// removed. The endpoints themselves stay available (a click there replaces
+// the break point).
+inline bool generatedLinePositionInsideGap(
+    const std::vector<std::pair<double, double>>& gapLineRanges,
+    double linePosition)
+{
+    if (!std::isfinite(linePosition)) {
+        return false;
+    }
+    for (const auto& [first, second] : gapLineRanges) {
+        if (linePosition > first && linePosition < second) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Whether the dense line segment between two line positions belongs to a gap
+// span: its midpoint lies within a gap range (the dense points at the
+// endpoints are the controls themselves, so the midpoint test assigns every
+// segment between them and nothing outside).
+inline bool generatedLineSegmentInGap(
+    double previousLinePosition,
+    double currentLinePosition,
+    const std::vector<std::pair<double, double>>& gapLineRanges)
+{
+    const double midpoint = 0.5 * (previousLinePosition + currentLinePosition);
+    if (!std::isfinite(midpoint)) {
+        return false;
+    }
+    for (const auto& [first, second] : gapLineRanges) {
+        if (midpoint >= first && midpoint <= second) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The marker state the shared renderer draws when the overlay's builder has
+// no dialog to ask: Blocked strictly inside a gap span or beyond a kollesis
+// termination (the two placement rules that need no extrapolation-distance
+// setting), Neutral otherwise. The dialog's own current-cut marker adds the
+// Allowed state from its extrapolation limit; the intersection-inspection
+// panes only ever see this.
+inline GeneratedCurrentLineMarkerState generatedBlockedLineMarkerState(
+    const std::vector<GeneratedOverlay::ControlPointMarker>& fullControlPoints,
+    const std::vector<std::pair<double, double>>& gapLineRanges,
+    double linePosition)
+{
+    if (generatedLinePositionInsideGap(gapLineRanges, linePosition) ||
+        generatedLinePositionBeyondKollesisTermination(fullControlPoints, linePosition)) {
+        return GeneratedCurrentLineMarkerState::Blocked;
+    }
+    return GeneratedCurrentLineMarkerState::Neutral;
+}
+
 inline GeneratedOverlay makeGeneratedStripOverlay(
     const GeneratedViews& views,
     double currentLinePosition,
@@ -1316,6 +1518,10 @@ inline GeneratedOverlay makeGeneratedStripOverlay(
     overlay.useSurfaceCenterLine = true;
     overlay.currentLinePosition = currentLinePosition;
     overlay.controlPoints = views.controlPoints;
+    overlay.gapLineRanges = generatedGapLineRanges(views.controlPoints);
+    overlay.damagedLineRanges = generatedDamagedLineRanges(views.controlPoints);
+    overlay.currentLineMarkerState = generatedBlockedLineMarkerState(
+        views.controlPoints, overlay.gapLineRanges, currentLinePosition);
     overlay.predSnapPoints = views.predSnapPoints;
     overlay.markerLinePositions = markerLinePositions;
     overlay.stripPositionMap = views.stripPositionMap;
@@ -1331,6 +1537,8 @@ inline GeneratedOverlay makeGeneratedStaticStripOverlay(const GeneratedViews& vi
     overlay.seedLineIndex = views.controlPoints.empty() ? views.seedLineIndex : -1;
     overlay.useSurfaceCenterLine = true;
     overlay.controlPoints = views.controlPoints;
+    overlay.gapLineRanges = generatedGapLineRanges(views.controlPoints);
+    overlay.damagedLineRanges = generatedDamagedLineRanges(views.controlPoints);
     overlay.predSnapPoints = views.predSnapPoints;
     overlay.stripPositionMap = views.stripPositionMap;
     return overlay;
@@ -1344,6 +1552,8 @@ inline GeneratedOverlay makeGeneratedDynamicStripOverlay(
     GeneratedOverlay overlay;
     overlay.useSurfaceCenterLine = true;
     overlay.currentLinePosition = currentLinePosition;
+    overlay.currentLineMarkerState = generatedBlockedLineMarkerState(
+        views.controlPoints, generatedGapLineRanges(views.controlPoints), currentLinePosition);
     overlay.markerLinePositions = markerLinePositions;
     overlay.stripPositionMap = views.stripPositionMap;
     return overlay;
@@ -1360,6 +1570,12 @@ inline GeneratedOverlay makeGeneratedCrossSliceOverlay(
 {
     GeneratedOverlay overlay;
     overlay.branchLinePoints = views.branchLinePoints;
+    // From the full list, before the plane-distance filter below keeps only
+    // the nearby controls.
+    overlay.gapLineRanges = generatedGapLineRanges(views.controlPoints);
+    overlay.damagedLineRanges = generatedDamagedLineRanges(views.controlPoints);
+    overlay.currentLineMarkerState = generatedBlockedLineMarkerState(
+        views.controlPoints, overlay.gapLineRanges, linePosition);
     overlay.pointMarker = emphasized && finiteGeneratedPoint(views.focusPoint)
         ? views.focusPoint
         : interpolatedGeneratedLinePoint(views.linePoints, linePosition);
@@ -1419,6 +1635,211 @@ struct GeneratedLinkCandidateMenuState {
     QString label;
 };
 
+// The link-state palette shared by linked control points, their connector
+// lines and the linked fiber's projected X marker: purple approved, blue
+// pending, orange same-H/V approved, light orange same-H/V pending.
+// Defined in the .cpp: this header is also compiled into QtCore-only tests.
+[[nodiscard]] QColor generatedLinkStateColor(bool pending, bool sameHv, int alpha);
+
+// The kollesis-termination ring colour: the ordinary control-point yellow.
+// The tag is told apart by form, not hue: a tagged point draws as a hollow
+// yellow ring (a linked one keeps its link-state fill inside the ring).
+// Shared with the overview bar and the Fiber Map so the tag looks the same
+// everywhere.
+[[nodiscard]] QColor generatedKollesisTerminationColor(int alpha);
+
+// The current-position marker colour per placement state: green allowed,
+// red blocked, cyan neutral. Shared by the renderer, the dialog's fast
+// overlays and the overview bar. Defined in the .cpp (QtCore-only tests).
+[[nodiscard]] QColor generatedCurrentLineMarkerColor(GeneratedCurrentLineMarkerState state,
+                                                     int alpha);
+
+// The break colour: amber, told apart from the cyan line and the yellow
+// control points by hue and from every solid stroke by form (a break point is
+// a dotted ring, a gap span a dotted line). Shared with the overview bar and
+// the Fiber Map so the tag looks the same everywhere.
+[[nodiscard]] QColor generatedBreakColor(int alpha);
+
+// The dash pattern of the gap and damaged span lines, in pen widths: dashes
+// three long, six apart. Shared with the overview bar so they look the same.
+inline constexpr qreal kSpanDashOn = 3.0;
+inline constexpr qreal kSpanDashOff = 6.0;
+
+// The span line colours: a gap span's dashes in a pastel red, a damaged
+// span's in a pastel pink (same dash pattern, told apart by hue). The break
+// rings keep the amber of generatedBreakColor.
+[[nodiscard]] QColor generatedGapLineColor(int alpha);
+[[nodiscard]] QColor generatedDamagedColor(int alpha);
+
+
+namespace detail
+{
+
+struct GeneratedControlPointExtent {
+    const GeneratedOverlay::ControlPointMarker* first = nullptr;
+    const GeneratedOverlay::ControlPointMarker* last = nullptr;
+};
+
+inline GeneratedControlPointExtent generatedControlPointExtent(
+    const std::vector<GeneratedOverlay::ControlPointMarker>& controlPoints)
+{
+    GeneratedControlPointExtent extent;
+    for (const auto& control : controlPoints) {
+        if (!std::isfinite(control.linePosition)) {
+            continue;
+        }
+        if (!extent.first || control.linePosition < extent.first->linePosition) {
+            extent.first = &control;
+        }
+        if (!extent.last || control.linePosition > extent.last->linePosition) {
+            extent.last = &control;
+        }
+    }
+    return extent;
+}
+
+} // namespace detail
+
+// A kollesis termination may only sit on a fiber end: the control point with
+// the smallest or the largest line position (a single point is both). Markers
+// without a finite line position do not take part. Defined inline: this
+// header is compiled into QtCore-only tests without the .cpp.
+inline bool generatedControlPointIsEndpoint(
+    const std::vector<GeneratedOverlay::ControlPointMarker>& controlPoints,
+    size_t controlIndex)
+{
+    const auto extent = detail::generatedControlPointExtent(controlPoints);
+    if (!extent.first || !extent.last) {
+        return false;
+    }
+    const auto atIndex = [controlIndex](const GeneratedOverlay::ControlPointMarker* marker) {
+        return marker && marker->controlIndex == controlIndex;
+    };
+    if (atIndex(extent.first) || atIndex(extent.last)) {
+        return true;
+    }
+    // Ties on the extreme line position (collapsed points not yet re-fit)
+    // count too: any of them is the fiber's end.
+    for (const auto& control : controlPoints) {
+        if (control.controlIndex != controlIndex || !std::isfinite(control.linePosition)) {
+            continue;
+        }
+        return control.linePosition == extent.first->linePosition ||
+               control.linePosition == extent.last->linePosition;
+    }
+    return false;
+}
+
+// The placement rule itself, on parallel per-control-point vectors so the
+// dialog (overlay markers) and the controller (session controls) enforce the
+// same thing: true when linePosition lies strictly before a tagged first
+// control point or strictly after a tagged last one. The fiber is declared to
+// end there, so no control point may be placed beyond it; placing at the
+// endpoint's own position (which replaces it) stays allowed. Entries without
+// a finite position do not take part; a size mismatch means no tags.
+inline bool generatedLinePositionBeyondTaggedEnd(const std::vector<double>& controlLinePositions,
+                                                 const std::vector<bool>& tagged,
+                                                 double linePosition)
+{
+    if (!std::isfinite(linePosition) || tagged.size() != controlLinePositions.size()) {
+        return false;
+    }
+    bool haveExtent = false;
+    double first = 0.0;
+    double last = 0.0;
+    for (const double position : controlLinePositions) {
+        if (!std::isfinite(position)) {
+            continue;
+        }
+        if (!haveExtent) {
+            first = last = position;
+            haveExtent = true;
+            continue;
+        }
+        first = std::min(first, position);
+        last = std::max(last, position);
+    }
+    if (!haveExtent) {
+        return false;
+    }
+    const auto taggedAt = [&](double extremePosition) {
+        for (size_t i = 0; i < tagged.size(); ++i) {
+            if (tagged[i] && controlLinePositions[i] == extremePosition) {
+                return true;
+            }
+        }
+        return false;
+    };
+    if (linePosition < first && taggedAt(first)) {
+        return true;
+    }
+    return linePosition > last && taggedAt(last);
+}
+
+// generatedLinePositionBeyondTaggedEnd over overlay markers.
+inline bool generatedLinePositionBeyondKollesisTermination(
+    const std::vector<GeneratedOverlay::ControlPointMarker>& controlPoints,
+    double linePosition)
+{
+    std::vector<double> positions;
+    std::vector<bool> tagged;
+    positions.reserve(controlPoints.size());
+    tagged.reserve(controlPoints.size());
+    for (const auto& control : controlPoints) {
+        positions.push_back(control.linePosition);
+        tagged.push_back(control.isKollesisTermination);
+    }
+    return generatedLinePositionBeyondTaggedEnd(positions, tagged, linePosition);
+}
+
+// Whether a control's neighbour in line-position order (either side) is a
+// kollesis termination. A break is refused at or immediately next to a
+// termination, so the span between them can never become a gap at the
+// sheet join. Inline: compiled into QtCore-only tests.
+inline bool generatedLineOrderNeighbourIsKollesisTermination(
+    const std::vector<GeneratedOverlay::ControlPointMarker>& controlPoints,
+    size_t controlIndex)
+{
+    std::vector<const GeneratedOverlay::ControlPointMarker*> sorted;
+    sorted.reserve(controlPoints.size());
+    for (const auto& control : controlPoints) {
+        if (std::isfinite(control.linePosition) &&
+            control.controlIndex != std::numeric_limits<size_t>::max()) {
+            sorted.push_back(&control);
+        }
+    }
+    std::sort(sorted.begin(), sorted.end(), [](const auto* a, const auto* b) {
+        return a->linePosition < b->linePosition;
+    });
+    for (size_t rank = 0; rank < sorted.size(); ++rank) {
+        if (sorted[rank]->controlIndex != controlIndex) {
+            continue;
+        }
+        return (rank > 0 && sorted[rank - 1]->isKollesisTermination) ||
+               (rank + 1 < sorted.size() && sorted[rank + 1]->isKollesisTermination);
+    }
+    return false;
+}
+
+// Strip span selection depends only on longitudinal position, never click height.
+// At a CP use its outgoing span; the final CP uses its incoming span.
+inline std::optional<size_t> generatedControlSpanOwnerRank(
+    const std::vector<const GeneratedOverlay::ControlPointMarker*>& sortedControls,
+    double linePosition)
+{
+    if (sortedControls.size() < 2 || !std::isfinite(linePosition) ||
+        linePosition < sortedControls.front()->linePosition ||
+        linePosition > sortedControls.back()->linePosition) {
+        return std::nullopt;
+    }
+    for (size_t rank = 1; rank < sortedControls.size(); ++rank) {
+        if (linePosition < sortedControls[rank]->linePosition) {
+            return rank - 1;
+        }
+    }
+    return sortedControls.size() - 2;
+}
+
 struct GeneratedControlPointContextMenuOptions {
     QWidget* parent = nullptr;
     std::string surfaceName;
@@ -1435,27 +1856,58 @@ struct GeneratedControlPointContextMenuOptions {
     QString linkWithCandidateLabel;
     bool mergeWithCandidateEnabled = false;
     QString mergeWithCandidateLabel;
-    bool splitFromCandidateEnabled = false;
-    QString splitFromCandidateLabel;
-    QString splitFromCandidateAndLinkLabel;
     cv::Vec3f branchLinkDirection{std::numeric_limits<float>::quiet_NaN(),
                                   std::numeric_limits<float>::quiet_NaN(),
                                   std::numeric_limits<float>::quiet_NaN()};
+    // Shown only while a link candidate is designated (empty label = hidden).
+    QString newLinkedToCandidateLabel;
+    // Fiber file stem for menu labels, resolved when the menu opens.
+    std::function<QString(uint64_t)> fiberDisplayNameForId;
     std::function<void(double, cv::Vec3f)> deleteControlPoint;
-    std::function<void(size_t, cv::Vec3f, bool, cv::Vec3f)> addBranch;
+    std::function<void(size_t)> clearControlCorrections;
+    // (clicked volume point, link direction): start a new fiber seeded at the
+    // click whose seed control point is linked to the designated candidate.
+    std::function<void(cv::Vec3f, cv::Vec3f)> newLineAnnotationLinkedToCandidate;
     std::function<void(uint64_t, int)> openBranch;
     std::function<void(size_t, uint64_t, int)> unlinkBranch;
     // (controlIndex, linkedFiberId, linkedControlPointIndex, newPendingState)
     std::function<void(size_t, uint64_t, int, bool)> setBranchLinkPending;
     std::function<void(size_t, cv::Vec3f)> designateLinkCandidate;
+    // Same as designateLinkCandidate, for a link across adjacent windings.
+    std::function<void(size_t, cv::Vec3f)> designateAdjacentLinkCandidate;
     std::function<void(size_t, cv::Vec3f)> linkWithCandidate;
     std::function<void(size_t, cv::Vec3f)> mergeWithCandidate;
-    std::function<void(size_t, cv::Vec3f)> designateSplitCandidate;
-    std::function<void(size_t, cv::Vec3f)> splitFromCandidate;
-    std::function<void(size_t, cv::Vec3f)> splitFromCandidateAndLink;
     std::function<void(uint64_t, cv::Vec3f)> openNearbyAnnotation;
+    // --- Span menu (strip viewers only: a Ctrl+right-click on the centre
+    // line away from every control point). Each takes the two controls of
+    // the span, in line-position order. The interpolation goal lives here
+    // and nowhere else.
     std::function<void(size_t, size_t, std::string)> setSegmentInterpolationGoal;
+    // (first, second, linkHalves): remove the span, saving both halves as
+    // new fibers and closing this one; linkHalves records a pending link
+    // between the two new ends ("same winding").
+    std::function<void(size_t, size_t, bool)> splitSpan;
+    // (first, second, enabled): make the span a gap by tagging both ends as
+    // breaks (or undo that where no other gap depends on an end).
+    std::function<void(size_t, size_t, bool)> setSpanGap;
+    // (first, second, enabled): toggle the damaged span tag.
+    std::function<void(size_t, size_t, bool)> setSpanDamaged;
+    // (controlIndex, enabled): toggle the kollesis_termination tag on the
+    // point. The menu item is checkable and reflects the marker's state.
+    std::function<void(size_t, bool)> setKollesisTermination;
+    // (controlIndex, enabled): toggle the break tag on the point. Checkable;
+    // adding it is disabled while the point is a kollesis termination.
+    std::function<void(size_t, bool)> setBreak;
 };
+
+// The marker of an adjacent-winding link: an upright triangle whose
+// circumradius is the circle radius the point would otherwise draw with, so
+// it reads at the same size next to the circles. Shared by every view that
+// draws control markers. Declared with QPainterPath incomplete: this header
+// is also compiled into QtCore-only tests, so it must not pull in QtGui;
+// callers include <QPainterPath> themselves (the forward declaration sits
+// at global scope, above the namespace).
+QPainterPath generatedTriangleMarkerPath(const QPointF& center, qreal radius);
 
 QPointF generatedStripLinePositionToScene(CChunkedVolumeViewer* viewer,
                                           QuadSurface* surface,

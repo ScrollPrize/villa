@@ -1,4 +1,5 @@
 #include "vc/lasagna/LineViewBuilder.hpp"
+#include "vc/fiber_tracer/FiberDisplay.hpp"
 
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -291,22 +292,8 @@ std::vector<cv::Vec3d> resolvedNormals(const std::vector<SegmentNormalSample>& s
 
 cv::Vec3d tangentAt(const std::vector<SegmentNormalSample>& samples, size_t row)
 {
-    if (samples.size() < 2) {
-        return {1.0, 0.0, 0.0};
-    }
-    cv::Vec3d tangent{0.0, 0.0, 0.0};
-    if (row == 0) {
-        tangent = samples[1].position - samples[0].position;
-    } else if (row + 1 == samples.size()) {
-        tangent = samples[row].position - samples[row - 1].position;
-    } else {
-        tangent = samples[row + 1].position - samples[row - 1].position;
-    }
-    tangent = normalizedOrZero(tangent);
-    if (!validDirection(tangent)) {
-        return {1.0, 0.0, 0.0};
-    }
-    return tangent;
+    return vc::geometry::lineTangent(samples.size(), row,
+        [&](size_t i) { return samples[i].position; });
 }
 
 cv::Vec3d sideDirection(const cv::Vec3d& normal, const cv::Vec3d& tangent)
@@ -349,14 +336,8 @@ cv::Vec3d transportNormal(const cv::Vec3d& previousNormal,
                           const cv::Vec3d& previousTangent,
                           const cv::Vec3d& tangent)
 {
-    const cv::Vec3d axis = previousTangent.cross(tangent);
-    const double sinAngle = norm(axis);
-    const double cosAngle = clamped(previousTangent.dot(tangent), -1.0, 1.0);
-    cv::Vec3d transported = previousNormal;
-    if (sinAngle > kEpsilon) {
-        transported = rotateAroundAxis(previousNormal, axis, std::atan2(sinAngle, cosAngle));
-    }
-    transported = projectToTangentPlane(transported, tangent);
+    cv::Vec3d transported = vc::geometry::transportFrameNormal(
+        previousNormal, previousTangent, tangent);
     if (validDirection(transported)) {
         return transported;
     }
@@ -781,22 +762,8 @@ LineViewFrameData buildLineFrameData(const LineModel& line,
 
 cv::Vec3d pointTangent(const LineModel& line, size_t index)
 {
-    if (line.points.size() < 2) {
-        return {1.0, 0.0, 0.0};
-    }
-    cv::Vec3d tangent{0.0, 0.0, 0.0};
-    if (index == 0) {
-        tangent = line.points[1].position - line.points[0].position;
-    } else if (index + 1 == line.points.size()) {
-        tangent = line.points[index].position - line.points[index - 1].position;
-    } else {
-        tangent = line.points[index + 1].position - line.points[index - 1].position;
-    }
-    tangent = normalizedOrZero(tangent);
-    if (validDirection(tangent)) {
-        return tangent;
-    }
-    return {1.0, 0.0, 0.0};
+    return vc::geometry::lineTangent(line.points.size(), index,
+        [&](size_t i) { return line.points[i].position; });
 }
 
 } // namespace
@@ -877,7 +844,18 @@ LineViewSurfaces buildLineViewSurfaces(const LineModel& line, const LineViewConf
         throw std::invalid_argument(
             "LineViewConfig::targetSpacingBaseVoxels must be finite and positive");
     }
-    const auto frameData = buildLineFrameData(line, config.orientedPointNormals);
+    // Corrections are input normals, not a second rotation of finished frames.
+    auto displayLine = line;
+    if (config.displayPointNormals.size() == line.points.size()) {
+        for (size_t i=0; i<line.points.size(); ++i) {
+            displayLine.points[i].sampledNormal.normal = cv::Vec3d(config.displayPointNormals[i]);
+            displayLine.points[i].sampledNormal.valid = validDirection(
+                displayLine.points[i].sampledNormal.normal);
+        }
+    }
+    const auto& orientation = config.displayPointNormals.size() == line.points.size()
+        ? config.displayPointNormals : config.orientedPointNormals;
+    const auto frameData = buildLineFrameData(displayLine, orientation);
     if (frameData.samples.empty()) {
         throw std::invalid_argument("Cannot build line annotation views for an empty LineModel");
     }

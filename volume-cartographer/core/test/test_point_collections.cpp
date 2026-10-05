@@ -22,14 +22,13 @@ TEST_CASE("add/query points and collections")
     const auto p0 = c.addPoint("alpha", {1, 2, 3});
     const auto p1 = c.addPoint("alpha", {4, 5, 6});
 
-    const uint64_t cid = c.getCollectionId("alpha");
-    CHECK(cid != 0);
+    const uint64_t cid = c.getCollectionId("alpha").value();
     CHECK(c.getAllCollections().size() == 1);
     CHECK(c.getAllCollections().at(cid).points.size() == 2);
     CHECK(p0.id != p1.id);
     CHECK(p0.collectionId == cid);
 
-    auto got = c.getPoint(p0.id);
+    auto got = c.getPoint({cid, p0.id});
     REQUIRE(got.has_value());
     CHECK(got->p == cv::Vec3f(1, 2, 3));
 
@@ -42,20 +41,20 @@ TEST_CASE("update and remove")
     auto p = c.addPoint("a", {0, 0, 0});
     p.p = {9, 9, 9};
     c.updatePoint(p);
-    CHECK(c.getPoint(p.id)->p == cv::Vec3f(9, 9, 9));
+    CHECK(c.getPoint({p.collectionId, p.id})->p == cv::Vec3f(9, 9, 9));
 
-    c.removePoint(p.id);
-    CHECK_FALSE(c.getPoint(p.id).has_value());
+    c.removePoint({p.collectionId, p.id});
+    CHECK_FALSE(c.getPoint({p.collectionId, p.id}).has_value());
 }
 
 TEST_CASE("rename, clear, clearAll")
 {
     PointCollections c;
     c.addPoint("a", {0, 0, 0});
-    const uint64_t cid = c.getCollectionId("a");
+    const uint64_t cid = c.getCollectionId("a").value();
     c.renameCollection(cid, "b");
     CHECK(c.getCollectionId("b") == cid);
-    CHECK(c.getCollectionId("a") == 0);
+    CHECK_FALSE(c.getCollectionId("a").has_value());
 
     c.clearCollection(cid);  // removes the collection entirely
     CHECK(c.getAllCollections().count(cid) == 0);
@@ -69,7 +68,7 @@ TEST_CASE("tags and anchor2d + offset")
 {
     PointCollections c;
     c.addPoint("a", {0, 0, 0});
-    const uint64_t cid = c.getCollectionId("a");
+    const uint64_t cid = c.getCollectionId("a").value();
 
     c.setCollectionTag(cid, "k", "v");
     CHECK(c.getCollectionTag(cid, "k") == std::optional<std::string>("v"));
@@ -101,7 +100,7 @@ TEST_CASE("setCollectionMetadata round-trips the flag")
 {
     PointCollections c;
     c.addPoint("a", {0, 0, 0});
-    const uint64_t cid = c.getCollectionId("a");
+    const uint64_t cid = c.getCollectionId("a").value();
     CollectionMetadata m;
     m.absolute_winding_number = false;
     c.setCollectionMetadata(cid, m);
@@ -121,7 +120,7 @@ TEST_CASE("autofill winding modes")
     {
         PointCollections c;
         c.addPoints("a", {{0, 0, 0}, {1, 1, 1}, {2, 2, 2}});
-        const uint64_t cid = c.getCollectionId("a");
+        const uint64_t cid = c.getCollectionId("a").value();
         c.autoFillWindingNumbers(cid, PointCollections::WindingFillMode::Incremental);
         CHECK(windings(c, "a") == std::vector<float>{1, 2, 3});
     }
@@ -129,7 +128,7 @@ TEST_CASE("autofill winding modes")
     {
         PointCollections c;
         c.addPoints("a", {{0, 0, 0}, {1, 1, 1}, {2, 2, 2}});
-        const uint64_t cid = c.getCollectionId("a");
+        const uint64_t cid = c.getCollectionId("a").value();
         c.autoFillWindingNumbers(cid, PointCollections::WindingFillMode::Decremental);
         CHECK(windings(c, "a") == std::vector<float>{1, 2, 3});  // sorted; values are 3,2,1
     }
@@ -137,7 +136,7 @@ TEST_CASE("autofill winding modes")
     {
         PointCollections c;
         c.addPoints("a", {{0, 0, 0}, {1, 1, 1}});
-        const uint64_t cid = c.getCollectionId("a");
+        const uint64_t cid = c.getCollectionId("a").value();
         c.autoFillWindingNumbers(cid, PointCollections::WindingFillMode::Constant, 7.5f);
         CHECK(windings(c, "a") == std::vector<float>{7.5f, 7.5f});
     }
@@ -147,7 +146,7 @@ TEST_CASE("setAutoFillMode + computeAutoFillValue")
 {
     PointCollections c;
     c.addPoints("a", {{0, 0, 0}, {1, 1, 1}});
-    const uint64_t cid = c.getCollectionId("a");
+    const uint64_t cid = c.getCollectionId("a").value();
 
     c.setAutoFillMode(cid, PointCollections::WindingFillMode::Constant, 4.0f);
     CHECK(c.getAutoFillMode(cid) == PointCollections::WindingFillMode::Constant);
@@ -164,8 +163,8 @@ TEST_CASE("setAutoFillMode + computeAutoFillValue")
 TEST_CASE("missing-id queries are safe")
 {
     PointCollections c;
-    CHECK(c.getCollectionId("nope") == 0);
-    CHECK_FALSE(c.getPoint(424242).has_value());
+    CHECK_FALSE(c.getCollectionId("nope").has_value());
+    CHECK_FALSE(c.getPoint({0, 424242}).has_value());
     CHECK(c.getPoints("nope").empty());
     CHECK(c.getAutoFillMode(999) == PointCollections::WindingFillMode::None);
 }
@@ -179,7 +178,7 @@ TEST_CASE("segment-path round-trip (anchored collections only)")
     PointCollections c;
     c.addPoint("anchored", {1, 2, 3});
     c.addPoint("plain", {4, 5, 6});
-    const uint64_t anchored = c.getCollectionId("anchored");
+    const uint64_t anchored = c.getCollectionId("anchored").value();
     c.setCollectionAnchor2d(anchored, cv::Vec2f(8, 9));
     REQUIRE(c.saveToSegmentPath(dir));
     CHECK(fs::exists(dir / "corrections.json"));
@@ -204,7 +203,7 @@ TEST_CASE("JSON round-trip preserves data")
     c.addPoint("alpha", {1, 2, 3});
     c.addPoint("alpha", {4, 5, 6});
     c.addPoint("beta", {7, 8, 9});
-    const uint64_t alpha = c.getCollectionId("alpha");
+    const uint64_t alpha = c.getCollectionId("alpha").value();
     c.setCollectionColor(alpha, {0.1f, 0.2f, 0.3f});
     c.setCollectionTag(alpha, "kind", "correction");
 
@@ -217,11 +216,75 @@ TEST_CASE("JSON round-trip preserves data")
     fs::remove(tmp);
 
     CHECK(loaded.getAllCollections().size() == c.getAllCollections().size());
-    const uint64_t la = loaded.getCollectionId("alpha");
+    const uint64_t la = loaded.getCollectionId("alpha").value();
     CHECK(la != 0);
     CHECK(loaded.getPoints("alpha").size() == 2);
     CHECK(loaded.getPoints("beta").size() == 1);
     CHECK(loaded.getCollectionTag(la, "kind") == std::optional<std::string>("correction"));
+}
+
+TEST_CASE("zero and duplicate point ids retain collection-local identity")
+{
+    const fs::path input = fs::temp_directory_path() /
+        ("pc_duplicate_ids_" + std::to_string(::getpid()) + ".json");
+    {
+        std::ofstream out(input);
+        out << R"({
+            "vc_pointcollections_json_version": "1",
+            "collections": {
+                "0": {
+                    "name": "zero_collection",
+                    "points": {
+                        "0": {"p": [1, 2, 3], "creation_time": 1, "links": [5]},
+                        "5": {"p": [4, 5, 6], "creation_time": 2}
+                    },
+                    "metadata": {"winding_is_absolute": true},
+                    "color": [1, 0, 0]
+                },
+                "7": {
+                    "name": "other",
+                    "points": {
+                        "0": {"p": [10, 20, 30], "creation_time": 3},
+                        "5": {"p": [40, 50, 60], "creation_time": 4}
+                    },
+                    "metadata": {"winding_is_absolute": true},
+                    "color": [0, 1, 0]
+                }
+            }
+        })";
+    }
+
+    PointCollections points;
+    REQUIRE(points.loadFromJSON(input.string()));
+    REQUIRE(points.getCollectionId("zero_collection") == std::optional<uint64_t>{0});
+    CHECK_FALSE(points.getCollectionId("missing").has_value());
+    CHECK(points.getPoint({0, 0})->p == cv::Vec3f(1, 2, 3));
+    CHECK(points.getPoint({7, 0})->p == cv::Vec3f(10, 20, 30));
+    CHECK(points.findPointRefs(0) ==
+          std::vector<vc::PointRef>{{0, 0}, {7, 0}});
+
+    ColPoint changed = *points.getPoint({0, 0});
+    changed.p = {9, 8, 7};
+    points.updatePoint(changed);
+    CHECK(points.getPoint({0, 0})->p == cv::Vec3f(9, 8, 7));
+    CHECK(points.getPoint({7, 0})->p == cv::Vec3f(10, 20, 30));
+
+    points.removePoint({7, 5});
+    CHECK_FALSE(points.getPoint({7, 5}).has_value());
+    CHECK(points.getPoint({0, 5}).has_value());
+
+    const fs::path output = fs::temp_directory_path() /
+        ("pc_duplicate_ids_roundtrip_" + std::to_string(::getpid()) + ".json");
+    REQUIRE(points.saveToJSON(output.string()));
+    PointCollections loaded;
+    REQUIRE(loaded.loadFromJSON(output.string()));
+    REQUIRE(loaded.getPoint({0, 0}).has_value());
+    CHECK(loaded.getPoint({0, 0})->links == std::vector<uint64_t>{5});
+    CHECK(loaded.getPoint({7, 0})->p == cv::Vec3f(10, 20, 30));
+    CHECK_FALSE(loaded.getPoint({7, 5}).has_value());
+
+    fs::remove(input);
+    fs::remove(output);
 }
 
 TEST_CASE("JSON round-trip preserves per-point fields")
@@ -311,6 +374,35 @@ TEST_CASE("old point JSON defaults links and fiber direction")
     CHECK(loaded.getAllCollections().begin()->second.windings_linked.empty());
 }
 
+TEST_CASE("minimal display-only PCL JSON defaults collection presentation")
+{
+    const fs::path tmp = fs::temp_directory_path() /
+        ("pc_minimal_pcl_" + std::to_string(::getpid()) + ".json");
+    std::ofstream out(tmp);
+    out << R"({
+        "vc_pointcollections_json_version": "1",
+        "collections": {
+            "1": {
+                "name": "same_winding",
+                "points": {"2": {"p": [1, 2, 3]}}
+            }
+        }
+    })";
+    out.close();
+
+    PointCollections loaded;
+    REQUIRE(loaded.loadFromJSON(tmp.string()));
+    fs::remove(tmp);
+
+    const auto& collection = loaded.getAllCollections().begin()->second;
+    CHECK(collection.metadata.absolute_winding_number);
+    CHECK(collection.color == cv::Vec3f{0.2f, 0.8f, 1.0f});
+    const auto points = loaded.getPoints("same_winding");
+    REQUIRE(points.size() == 1);
+    CHECK(points.front().creation_time == 0);
+    CHECK(std::isnan(points.front().winding_annotation));
+}
+
 TEST_CASE("loadFromJSON rejects bad input and returns false")
 {
     const fs::path tmp = fs::temp_directory_path() /
@@ -377,7 +469,7 @@ TEST_CASE("segment correction files carry top-level coordinate metadata")
 
     PointCollections points;
     points.addPoint("correction", {1, 2, 3});
-    points.setCollectionAnchor2d(points.getCollectionId("correction"), cv::Vec2f(4, 5));
+    points.setCollectionAnchor2d(points.getCollectionId("correction").value(), cv::Vec2f(4, 5));
     utils::Json metadata = utils::Json::object();
     metadata["vc_open_data_coordinate_space"] = "PHerc1451/20260319101107@L2";
     points.setFileMetadata(metadata);

@@ -43,7 +43,6 @@ from umbilicus import json_umbilicus_z_to_yx
 MODEL_CONFIG_KEYS = (
     "num_flow_integration_steps",
     "flow_integration_solver",
-    "num_flow_timesteps",
     "num_flow_stages",
     "flow_bounds_z_margin",
     "flow_bounds_radius",
@@ -247,8 +246,10 @@ def _export_source_surface(
         step,
         voxel_size_um,
         source="flatten_spiral_checkpoint.py",
+        z_direction_is_top_to_bottom=checkpoint.get("z_direction_is_top_to_bottom"),
         first_winding=first,
         cleanup_erosion_cells=3,
+        base_shape_zyx=checkpoint.get("base_shape_zyx"),
     )
     del transform, model, dr_per_winding, winding_grids
     gc.collect()
@@ -281,7 +282,13 @@ def _store_surface(surface: Path, object_store: Path) -> dict:
         object_store / ref["type"] / manifest_hash
         / quote(ref["name"], safe=""))
     destination.mkdir(parents=True)
-    (destination / "segment").symlink_to(surface, target_is_directory=True)
+    try:
+        (destination / "segment").symlink_to(surface, target_is_directory=True)
+    except OSError:
+        # Symlinks need a privilege or developer mode on Windows and do not
+        # exist on exFAT at all. This store is private to the run and is only
+        # ever read, so a copy serves the same reads.
+        shutil.copytree(surface, destination / "segment")
     (destination / "object.json").write_text(
         json.dumps(ref, indent=2) + "\n", encoding="utf-8")
     return ref
@@ -359,6 +366,10 @@ def _flatten(
                 "--port", "0",
                 "--allow-no-data-dir",
                 "--object-store-dir", str(object_store),
+                # gpu_pause coordination is built on fcntl and unix sockets.
+                # This service is private to the flatten and owns its GPU for
+                # the run, so there is nothing to coordinate with.
+                *(["--no-gpu-pause"] if os.name != "posix" else []),
             ],
             cwd=str(service_path.parent),
             stdout=subprocess.PIPE,

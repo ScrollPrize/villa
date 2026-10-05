@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -258,6 +259,29 @@ class NativeDifferentialTests(unittest.TestCase):
             fill_seams=True,
         )
 
+    def test_content_anchored_seam_gate_is_exact(self) -> None:
+        # The content anchor changes only which distance field feeds the
+        # seam gate; the native kernel must apply it identically, including
+        # blocking the whole disagreeing right side.
+        source = plane(8, 24)
+        target = plane(8, 24)
+        target.z[:, 16:] += 5.0
+        label = np.zeros((8, 24), dtype=np.uint8)
+        label[:, :3] = 7
+        self.assert_differential(
+            source,
+            target,
+            label,
+            output_shape=(8, 24),
+            max_distance=0.2,
+            nearest_vertices=4,
+            tile_size=16,
+            workers=2,
+            fill_seams=True,
+            max_seam_distance=6.0,
+            seam_anchor="content",
+        )
+
     def test_extreme_canvas_offset_is_safely_rejected(self) -> None:
         source = plane(5, 6)
         label = np.arange(30, dtype=np.uint8).reshape(source.shape)
@@ -311,5 +335,6 @@ class NativeDifferentialTests(unittest.TestCase):
                     tile_size=7 + seed,
                     workers=1 + seed % 4,
                     fill_seams=bool(seed % 2),
+                    max_seam_distance=1.0 + 0.75 * seed,
                     fill_value=37,
                 )

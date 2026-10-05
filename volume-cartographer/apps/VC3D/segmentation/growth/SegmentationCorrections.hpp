@@ -28,6 +28,7 @@ public:
     void setCollection(VCCollection* collection);
 
     void setActiveCollection(uint64_t collectionId, bool userInitiated);
+    void clearActiveCollection();
     uint64_t createCollection(bool announce);
     void handlePointAdded(const cv::Vec3f& worldPos, float wind_a = NAN);
     void handlePointRemoved(const cv::Vec3f& worldPos);
@@ -40,8 +41,8 @@ public:
     void pruneMissing();
 
     [[nodiscard]] bool growthInProgress() const { return _growthInProgress; }
-    [[nodiscard]] uint64_t activeCollection() const { return _activeCollectionId; }
-    [[nodiscard]] bool hasActiveCollection() const { return _activeCollectionId != 0; }
+    [[nodiscard]] std::optional<uint64_t> activeCollection() const { return _activeCollectionId; }
+    [[nodiscard]] bool hasActiveCollection() const { return _activeCollectionId.has_value(); }
     [[nodiscard]] std::optional<std::pair<int, int>> zRange() const;
     [[nodiscard]] SegmentationCorrectionsPayload buildPayload(bool onlyActiveCollection = false) const;
     [[nodiscard]] SegmentationCorrectionsPayload buildPayloadForCollection(uint64_t collectionId) const;
@@ -57,7 +58,7 @@ private:
     SegmentationWidget* _widget{nullptr};
     VCCollection* _collection{nullptr};
 
-    uint64_t _activeCollectionId{0};
+    std::optional<uint64_t> _activeCollectionId;
     std::vector<uint64_t> _pendingCollectionIds;
     std::unordered_set<uint64_t> _managedCollectionIds;
     bool _growthInProgress{false};

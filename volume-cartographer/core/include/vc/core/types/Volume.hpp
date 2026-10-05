@@ -84,11 +84,10 @@ public:
     // Create a Volume backed by a remote zarr store over HTTP.
     // If auth is provided, it is used as-is. Otherwise credentials are read
     // from the ambient AWS configuration only when discoverAwsCredentials is
-    // true; false forces an anonymous request. When cacheRoot is non-empty,
-    // remote chunks are persisted under a volume-specific subdirectory.
+    // true; false forces an anonymous request. Remote chunks are always
+    // persisted beneath the process-wide remote cache root.
     static std::shared_ptr<Volume> NewFromUrl(
         const std::string& url,
-        const std::filesystem::path& cacheRoot = {},
         const vc::HttpAuth& auth = {},
         const utils::Json& metadata = {},
         bool discoverAwsCredentials = true);

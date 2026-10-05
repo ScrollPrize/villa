@@ -216,6 +216,7 @@ signals:
     void volumeSelectionChanged(const QString& volumeId);
     void correctionsCreateRequested();
     void correctionsCollectionSelected(uint64_t collectionId);
+    void correctionsCollectionSelectionCleared();
     void correctionsZRangeChanged(bool enabled, int zMin, int zMax);
     void hoverMarkerToggled(bool enabled);
     void showApprovalMaskChanged(bool enabled);

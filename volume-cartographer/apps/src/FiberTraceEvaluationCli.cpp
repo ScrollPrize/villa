@@ -13,6 +13,7 @@
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/AtomicFile.hpp"
 #include "vc/core/util/GlobalCacheRoot.hpp"
+#include "vc/core/util/RemoteCacheSettings.hpp"
 #include "vc/core/util/SurfaceTexture.hpp"
 #include "vc/core/render/ChunkCache.hpp"
 
@@ -835,8 +836,12 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
             if (entry.value("ct_base_volume", false)) {
                 // The input pyramid's level zero defines base coordinates;
                 // no inferred power-of-two transform for selected groups.
-                source.renderVolume = source.renderCt.find("://") != std::string::npos
-                    ? Volume::NewFromUrl(source.renderCt, options.remoteCacheRoot)
+                const bool remoteCt = source.renderCt.find("://") != std::string::npos;
+                if (remoteCt && std::filesystem::weakly_canonical(options.remoteCacheRoot) !=
+                    std::filesystem::weakly_canonical(vc::settings::remoteCachePath()))
+                    throw std::invalid_argument("render CT cache root must match the process-wide VC3D cache root");
+                source.renderVolume = remoteCt
+                    ? Volume::NewFromUrl(source.renderCt)
                     : Volume::New(source.renderCt);
                 if (source.renderVolume->dtype() != vc::render::ChunkDtype::UInt8 ||
                     !source.renderVolume->hasScaleLevel(0))

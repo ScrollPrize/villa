@@ -66,6 +66,20 @@ _VC3D_SOURCE_HEADER = "X-VC3D-Source"
 os.environ.setdefault("LASAGNA_CHECK_SPARSE_CACHE", "1")
 
 
+def _gpu_pause_or_null():
+    """Return the GPU-pause context, or a no-op where pausing is disabled.
+
+    gpu_pause is imported here rather than at module scope because it is
+    built on fcntl and unix sockets. A host started with --no-gpu-pause has
+    nothing to coordinate with and may not have either.
+    """
+    if not _gpu_pause_enabled:
+        from contextlib import nullcontext
+        return nullcontext()
+    from gpu_pause import gpu_pause_context
+    return gpu_pause_context()
+
+
 def _mib(n_bytes: int) -> float:
     return float(n_bytes) / (1024.0 * 1024.0)
 
@@ -1812,6 +1826,18 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
         if not model_output:
             model_output = str(Path(tmp_dir) / "model_reopt.pt")
 
+        # A flatten client that consumes only the exported tifxyz and the
+        # flatten-map sidecar can skip the checkpoint file entirely: the
+        # exports below run from the in-memory state instead.
+        omit_model_output = bool(body.get("omit_model_output", False))
+        if omit_model_output:
+            if model_init_requested != "flatten":
+                raise ValueError("omit_model_output requires args.model-init=flatten")
+            if not body.get("omit_model", False):
+                raise ValueError("omit_model_output requires omit_model")
+            if body.get("embed_job_metadata", True):
+                raise ValueError("omit_model_output requires embed_job_metadata=false")
+
         # Build argv for fit.py from the config dict.
         cfg = dict(config)
         if request_volume_shape_zyx is not None:
@@ -1849,7 +1875,8 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
             args_section.setdefault("sparse-prefetch-backend", _sparse_prefetch_backend)
         if model_init == "model" and model_input:
             args_section["model-input"] = str(model_input)
-        args_section["model-output"] = str(model_output)
+        if not omit_model_output:
+            args_section["model-output"] = str(model_output)
         # Only set fit.py out-dir if explicitly requested. pred_dt_flow_gate
         # debug slices use their own debug_out_dir so enabling them does not
         # make fit.py export model_final/tifxyz into the service cwd.
@@ -1901,11 +1928,8 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
             kwargs["cancel_fn"] = _check_cancel
             return _orig_optimize(**kwargs)
 
-        from contextlib import nullcontext
-        from gpu_pause import gpu_pause_context
-
         opt_mod.optimize = _patched_optimize
-        with (gpu_pause_context() if _gpu_pause_enabled else nullcontext()):
+        with _gpu_pause_or_null():
             try:
                 import fit as fit_mod
                 job.set_running("loading", 0, 0, 0.0)
@@ -1915,7 +1939,12 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
                         stage, 0, 0, 0.0, stage_name=stage_name)
                     _check_cancel()
 
-                fit_mod.main([cfg_path], lifecycle_fn=_fit_lifecycle)
+                # Flatten runs hand their checkpoint state back in host
+                # memory; the exports below then never re-read the multi-GB
+                # checkpoint file they just asked fit.py to write.
+                fit_state_sink: dict = {}
+                fit_mod.main([cfg_path], lifecycle_fn=_fit_lifecycle,
+                             state_sink=fit_state_sink)
                 if (body.get("embed_job_metadata", True)
                         and isinstance(job_spec, dict)
                         and Path(model_output).is_file()):
@@ -1923,7 +1952,9 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
                         "saving", 0, 0, 0.0,
                         stage_name="Embedding Lasagna job metadata")
                     import torch
-                    st = torch.load(str(model_output), map_location="cpu", weights_only=False)
+                    st = fit_state_sink.get("flatten_state")
+                    if st is None:
+                        st = torch.load(str(model_output), map_location="cpu", weights_only=False)
                     if isinstance(st, dict):
                         st["_job_spec_"] = job_spec
                         object_refs = body.get("_object_refs_")
@@ -1971,7 +2002,9 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
                     str(int(request_volume_shape_zyx[2])),
                 ])
             _check_cancel()
-            fit2tifxyz.main(export_argv, cancel_fn=_check_cancel)
+            fit2tifxyz.main(export_argv, cancel_fn=_check_cancel,
+                            state=fit_state_sink.get("flatten_state"))
+            fit_state_sink.clear()
             job.set_running(
                 "finalizing", 0, 0, 0.0,
                 stage_name="Finalizing Lasagna preview export")
@@ -2348,9 +2381,7 @@ class _Handler(BaseHTTPRequestHandler):
                         data_input = str(candidate)
 
             import lasagna_analyze
-            from contextlib import nullcontext
-            from gpu_pause import gpu_pause_context
-            with (gpu_pause_context() if _gpu_pause_enabled else nullcontext()):
+            with _gpu_pause_or_null():
                 lasagna_analyze.export_vis_obj(
                     model_path=str(model_input),
                     data_path=str(data_input),

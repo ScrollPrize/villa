@@ -117,8 +117,8 @@ class ArtifactRegistry:
 
     def _get(self, artifact_id):
         artifact = self._artifacts.get(artifact_id)
-        if artifact is None:
-            if artifact_id in self._pruned_ids:
+        if artifact is None or artifact.pruned:
+            if artifact is not None or artifact_id in self._pruned_ids:
                 raise ApiError(HTTPStatus.GONE, "Artifact has been pruned")
             raise ApiError(HTTPStatus.NOT_FOUND, "Unknown artifact")
         return artifact
@@ -152,14 +152,55 @@ class ArtifactRegistry:
         if delete_root is not None:
             shutil.rmtree(delete_root, ignore_errors=True)
 
-    def prune(self, kind, session_id, keep):
-        """Prune all but the newest ``keep`` artifacts of one kind."""
+    def retire_root(self, root, timeout=15):
+        """Reject new readers and drain existing readers before external cleanup."""
+        root = Path(root).resolve()
+        deadline = time.monotonic() + timeout
+        while True:
+            with self._lock:
+                matching = [a for a in self._artifacts.values()
+                            if a.root.is_relative_to(root)]
+                for artifact in matching:
+                    artifact.pruned = True
+                if not any(a.inflight for a in matching):
+                    for artifact in matching:
+                        del self._artifacts[artifact.artifact_id]
+                        self._pruned_ids[artifact.artifact_id] = True
+                    return
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"Artifact readers did not stop; retained {root}")
+            time.sleep(0.05)
+
+    def find(self, kind, root, session_id=None):
+        """The live artifact of one kind already registered on ``root``.
+
+        Returns its reference, or None; ``session_id`` narrows the search to
+        one session. Two artifacts must never both own one directory, since
+        pruning either would delete the other's files.
+        """
+        root = Path(root).resolve(strict=False)
+        with self._lock:
+            for artifact in self._artifacts.values():
+                if (artifact.kind == kind and Path(artifact.root) == root
+                        and (session_id is None
+                             or artifact.session_id == session_id)):
+                    return artifact.ref()
+        return None
+
+    def prune(self, kind, session_id, keep, retain=None):
+        """Prune all but the newest ``keep`` artifacts of one kind.
+
+        ``retain(artifact)`` may exempt an older artifact from this pass; it
+        stays registered and is reconsidered at the next one.
+        """
         to_delete = []
         with self._lock:
             matching = [a for a in self._artifacts.values()
                         if a.kind == kind and a.session_id == session_id]
             matching.sort(key=lambda a: a.generation)
             for artifact in matching[:-keep] if keep else matching:
+                if retain is not None and retain(artifact):
+                    continue
                 del self._artifacts[artifact.artifact_id]
                 self._pruned_ids[artifact.artifact_id] = True
                 while len(self._pruned_ids) > MAX_PRUNED_IDS_REMEMBERED:

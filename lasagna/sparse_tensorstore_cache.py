@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import time
+from urllib.parse import urlsplit, urlunsplit
 
 import numpy as np
 import tensorstore as ts
@@ -16,6 +17,37 @@ def _fmt_mib(value: int | float) -> str:
     return f"{float(value) / 1024.0 ** 2:.1f}MiB"
 
 
+def zarr_kvstore_spec(zarr_path: str, *, remote: bool) -> dict[str, str]:
+    """Build the TensorStore kvstore for a local array or catalog artifact."""
+
+    if not remote:
+        return {"driver": "file", "path": str(zarr_path)}
+    parsed = urlsplit(str(zarr_path))
+    if parsed.scheme in {"http", "https"} and parsed.netloc:
+        base_url = urlunsplit((
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path.rstrip("/") + "/",
+            parsed.query,
+            "",
+        ))
+        return {"driver": "http", "base_url": base_url}
+    if parsed.scheme == "s3" and parsed.netloc:
+        return {"driver": "s3", "bucket": parsed.netloc, "path": parsed.path.lstrip("/")}
+    raise ValueError(f"unsupported remote Zarr URL: {zarr_path!r}")
+
+
+def _zarr_spec(zarr_path: str, *, remote: bool) -> dict[str, object]:
+    return {"driver": "zarr", "kvstore": zarr_kvstore_spec(zarr_path, remote=remote)}
+
+
+def probe_zarr_shape(zarr_path: str, *, remote: bool) -> tuple[int, ...]:
+    """Read only Zarr metadata to validate a remote streaming source."""
+
+    store = ts.open(_zarr_spec(zarr_path, remote=remote), open=True, read=True).result()
+    return tuple(int(value) for value in store.shape)
+
+
 class TensorStoreSparseChunkGroupCache:
     """PyTorch-facing sparse cache using TensorStore for parallel chunk reads."""
 
@@ -24,6 +56,7 @@ class TensorStoreSparseChunkGroupCache:
         *,
         channels: list[str],
         zarr_path: str,
+        remote: bool = False,
         vol_shape_zyx: tuple[int, int, int],
         channel_indices: dict[str, int],
         is_3d_zarr: bool,
@@ -34,6 +67,7 @@ class TensorStoreSparseChunkGroupCache:
     ) -> None:
         self.channels = channels
         self.zarr_path = zarr_path
+        self.remote = bool(remote)
         self.n_channels = len(channels)
         self.vol_shape_zyx = tuple(int(v) for v in vol_shape_zyx)
         self.channel_indices = channel_indices
@@ -61,10 +95,7 @@ class TensorStoreSparseChunkGroupCache:
             "data_copy_concurrency": {"limit": int(data_copy_threads)},
         })
         self._store = ts.open(
-            {
-                "driver": "zarr",
-                "kvstore": {"driver": "file", "path": str(zarr_path)},
-            },
+            _zarr_spec(zarr_path, remote=self.remote),
             context=self._context,
             open=True,
             read=True,

@@ -488,12 +488,36 @@ TEST_CASE("LineOptimizer resamples fractional control insertion spans evenly")
     CHECK(update.controlPoints[1].linePosition == doctest::Approx(2.0));
     CHECK(update.linePoints[2][0] == doctest::Approx(2.25));
     CHECK(update.linePoints[2][2] == doctest::Approx(1.0));
-    CHECK(update.linePoints[1][0] == doctest::Approx(1.125));
-    CHECK(update.linePoints[1][2] == doctest::Approx(0.5));
-    CHECK(update.linePoints[3][0] - update.linePoints[2][0] == doctest::Approx((5.0 - 2.25) / 3.0));
+    // Spacing follows the displaced curve, no longer a straight triangular warp.
+    CHECK(update.linePoints[1][0] > 0);
+    CHECK(update.linePoints[1][0] < 2.25);
+    CHECK(update.linePoints[1][2] > 0);
+    CHECK(update.linePoints[1][2] < 1);
+    CHECK(std::abs(cv::norm(update.linePoints[1]-update.linePoints[0]) -
+                   cv::norm(update.linePoints[2]-update.linePoints[1])) < 0.1);
     for (size_t i = 5; i < linePoints.size(); ++i) {
         CHECK(norm(update.linePoints[i] - linePoints[i]) == doctest::Approx(0.0));
     }
+}
+
+TEST_CASE("LineOptimizer local displacement tapers smoothly and leaves outer spans unchanged")
+{
+    std::vector<cv::Vec3d> points;
+    for (int i=0; i<=400; ++i) points.push_back({i*0.1,0,0});
+    std::vector<vc::lasagna::LineControlPoint> controls;
+    for (int i=0;i<=4;++i) controls.push_back({double(i*100),points[i*100],i==0,i*100});
+    controls[2].volumePoint[1]=2;
+    const auto moved=vc::lasagna::updateExistingLineControlPoint(points,controls,2,0.1);
+    for (int i=0;i<100;++i) CHECK(moved.linePoints[i] == points[i]);
+    REQUIRE(moved.controlPoints.size()==controls.size());
+    for (size_t i=0;i<controls.size();++i)
+        CHECK(cv::norm(moved.controlPoints[i].volumePoint-controls[i].volumePoint)<1e-9);
+    const int left=moved.controlPoints[1].optimizedIndex;
+    const int right=moved.controlPoints[3].optimizedIndex;
+    CHECK(std::abs(moved.linePoints[left+1][1]/(moved.linePoints[left+1][0]-10)) < 0.01);
+    CHECK(std::abs(moved.linePoints[right-1][1]/(30-moved.linePoints[right-1][0])) < 0.01);
+    for (size_t i=right;i<moved.linePoints.size();++i)
+        CHECK(moved.linePoints[i] == points[300+i-right]);
 }
 
 TEST_CASE("LineOptimizer cancellation throws at solve entry points")

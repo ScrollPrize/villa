@@ -10,6 +10,7 @@
 #include <QEvent>
 #include <QFile>
 #include <QFileInfo>
+#include <QDir>
 #include <QHBoxLayout>
 #include <QInputDialog>
 #include <QGridLayout>
@@ -138,7 +139,6 @@ QString groupTitle(const QString& prefix)
         {QStringLiteral("dt"), QObject::tr("DT")},
         {QStringLiteral("output"), QObject::tr("Output")},
         {QStringLiteral("shell"), QObject::tr("Shell")},
-        {QStringLiteral("influence"), QObject::tr("Influence")},
     };
     const auto title = titles.constFind(prefix);
     if (title != titles.cend()) return *title;
@@ -149,14 +149,13 @@ QString groupTitle(const QString& prefix)
 
 int groupOrder(const QString& prefix)
 {
-    static const std::array<QString, 13> order{
+    static const std::array<QString, 12> order{
         QStringLiteral("sample"), QStringLiteral("loss"),
         QStringLiteral("patch"), QStringLiteral("tracks"),
         QStringLiteral("optimizer"), QStringLiteral("model"),
         QStringLiteral("input"), QStringLiteral("pcl"),
         QStringLiteral("dense"), QStringLiteral("dt"),
         QStringLiteral("output"), QStringLiteral("shell"),
-        QStringLiteral("influence"),
     };
     const auto found = std::find(order.cbegin(), order.cend(), prefix);
     return found == order.cend()

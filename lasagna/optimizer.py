@@ -2588,7 +2588,10 @@ def optimize(
 					for pi, p in enumerate(group):
 						if pi < k0:
 							continue
-						param_group = {"params": [p], "lr": _lr_scalespace(lr=settings.lr, scale_i=pi)}
+						param_group = {
+							"params": [p],
+							"lr": _lr_scalespace(lr=settings.lr, scale_i=pi),
+						}
 						if name == "map_flatten_ms":
 							param_group["_flatten_scale_i"] = pi
 						param_groups_.append(param_group)
@@ -4412,6 +4415,12 @@ def optimize(
 			_OptTimingWindow(interval=opt_timing_interval, sync_cuda=opt_timing_sync)
 			if opt_timing_enabled else None
 		)
+		if max_steps > 0:
+			# The first iteration immediately recomputes both values. Keeping the
+			# no-grad initial FitResult alive retains its full integrated UV grid.
+			loss = None
+			res = None
+			del loss0, res0
 
 		for step in range(max_steps):
 			_t_iter = time.perf_counter()

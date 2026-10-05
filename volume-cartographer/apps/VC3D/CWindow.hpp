@@ -171,9 +171,9 @@ public slots:
                                    int steps,
                                    bool inpaintOnly);
     void onFocusPOIChanged(std::string name, POI* poi);
-    void onPointDoubleClicked(uint64_t pointId);
+    void onPointDoubleClicked(vc::PointRef point);
     void onCopyWithNtRequested();
-    void onFocusViewsRequested(uint64_t collectionId, uint64_t pointId);
+    void onFocusViewsRequested(uint64_t collectionId, std::optional<vc::PointRef> point);
 
 public:
     enum class VolumeOpenError {
@@ -206,6 +206,7 @@ private:
     QMainWindow* segmentWorkspaceWindow() const { return _segmentWorkspaceWindow; }
     ViewerManager* activeWorkspaceViewerManager() const;
     void updateActiveWorkspaceViewerControls();
+    void updateProjectNameLabel();
     void populateDockToggleMenu(QMenu* menu) const;
     void createAtlasWorkspace();
     void displayAtlasFromDirectory(const std::filesystem::path& atlasDir);
@@ -291,7 +292,6 @@ private:
         const std::shared_ptr<Volume>& volume,
         const QString& location,
         std::vector<std::string> tags = {},
-        const QString& remoteCacheRoot = {},
         const QString& preferredVolumeId = {});
     void refreshCurrentVolumePackageUi(const QString& preferredVolumeId = QString(),
                                        bool reloadSurfaces = true);
@@ -362,7 +362,7 @@ private slots:
     void onZScrollSensitivityChanged(double sensitivity);
     void onSharedCacheStatsChanged(const QStringList& items);
     void onSurfaceWillBeDeleted(std::string name, std::shared_ptr<Surface> surf);
-    void onConvertPointToAnchor(uint64_t pointId, uint64_t collectionId);
+    void onConvertPointToAnchor(vc::PointRef point);
     void onNewFiberRequested();
     void onFiberCrosshairModeChanged(bool active);
     void onFiberViewersRequested();
@@ -423,6 +423,7 @@ private:
     bool _destroyingWindow{false};
     bool _spiralCloseGuardBypass{false};
     QTabWidget* _workspaceTabs{nullptr};
+    QLabel* _projectNameLabel{nullptr};
     QMainWindow* _segmentWorkspaceWindow{nullptr};
     StatusDockPanelHost* _statusDockPanelHost{nullptr};
     QMainWindow* _lasagnaWorkspaceWindow{nullptr};

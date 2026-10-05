@@ -13,7 +13,9 @@ invariants, from LineAnnotationController.cpp / Atlas.cpp:
   1e-8 (validateFiberInputControlPoints); violating this makes the whole
   file unloadable. Consequence: control_points and line_points must always
   be written as a consistent pair from the same source.
-- C2: cross-fiber link reciprocity is index-exact across files, plus
+- C2: cross-fiber link reciprocity is index-exact across files (and both
+  refs of a pair agree on `pending` and live in the same array,
+  `branches` or `adjacent_branches`), plus
   positions (1e-6) and directions.
 - C3: stored link directions must match tangents recomputed from
   line_points within ~0.26 deg (branchDirectionsCompatible, 1e-5 on
@@ -113,12 +115,20 @@ _CONFIG_KEYS_COMMON = {
 _CONFIG_KEYS_V3 = _CONFIG_KEYS_COMMON | {'meeting_accept_max_error_ratio'}
 
 
-def _valid_segment(segment):
+def _valid_segment(segment, version=3):
+    """version: the document's vc3d_fiber version; version 4 allows an
+    optional span `tags` list of strings (e.g. 'gap')."""
     if not isinstance(segment, dict):
         return False
     if (segment.get('metadata_version'), segment.get('tracer_version')) != (3, 2):
         return False
-    if (set(segment) != _SEGMENT_KEYS_V3 or
+    keys = set(segment)
+    if version >= 4 and 'tags' in keys:
+        if not (isinstance(segment['tags'], list) and
+                all(isinstance(t, str) for t in segment['tags'])):
+            return False
+        keys.discard('tags')
+    if (keys != _SEGMENT_KEYS_V3 or
             segment.get('optimizer') != 'native_fiber_trace3d' or
             not isinstance(segment.get('normal_manifest'), str) or
             not isinstance(segment.get('fiber_manifest'), str)):
@@ -190,9 +200,15 @@ def is_fiber_doc(doc):
     if not (isinstance(doc, dict) and doc.get('type') == 'vc3d_fiber'):
         return False
     version = doc.get('version', 1)
-    if version not in (1, 3):
+    width = doc.get('width', 0)
+    if isinstance(width, bool) or not isinstance(width, (int, float)) or not math.isfinite(width) or width < 0:
         return False
-    if version == 3 and 'optimization_mode' not in doc:
+    gap = doc.get('width_gap_fraction', 0.2)
+    if isinstance(gap, bool) or not isinstance(gap, (int, float)) or not math.isfinite(gap) or not 0 <= gap <= 1:
+        return False
+    if version not in (1, 3, 4):
+        return False
+    if version >= 3 and 'optimization_mode' not in doc:
         return False
     if 'optimization_mode' in doc:
         mode = doc['optimization_mode']
@@ -212,14 +228,28 @@ def is_fiber_doc(doc):
     else:
         for index, cp in enumerate(control_points):
             if (not isinstance(cp, dict) or
-                    not set(cp) <= {'position', 'segment_to_next'} or
+                    not set(cp) <= {'position', 'segment_to_next', 'tags', 'display_normal', 'display_normal_source', 'direction'} or
                     not _finite_point(cp.get('position'))):
+                return False
+            if 'display_normal' in cp and _normalized(cp['display_normal']) is None:
+                return False
+            if 'direction' in cp and _normalized(cp['direction']) is None:
+                return False
+            if 'display_normal_source' in cp and (
+                    'display_normal' not in cp or cp['display_normal_source'] not in
+                    ('manual', 'interpolated', 'unknown')):
+                return False
+            # Optional per-CP tags (e.g. 'kollesis_termination'): the loader
+            # takes an array of strings and nothing else.
+            if 'tags' in cp and not (isinstance(cp['tags'], list) and
+                                     all(isinstance(t, str) for t in cp['tags'])):
                 return False
             segment = cp.get('segment_to_next')
             if index + 1 == len(control_points):
                 if 'segment_to_next' in cp:
                     return False
-            elif 'segment_to_next' not in cp or not _valid_segment(segment):
+            elif ('segment_to_next' not in cp or
+                  not _valid_segment(segment, version)):
                 return False
     tags = doc.get('tags', [])
     if not (isinstance(tags, list) and
@@ -227,7 +257,7 @@ def is_fiber_doc(doc):
         return False  # tags: null is unloadable ("tags must be an array")
     generation = doc.get('generation', 1)
     if generation is not None:
-        if version == 3:
+        if version >= 3:
             if (isinstance(generation, bool) or
                     not isinstance(generation, int) or generation < 0):
                 return False
@@ -510,14 +540,23 @@ def _v3_chunks(doc, anchor_indices):
             'start_controls': copy.deepcopy(controls[first_control:final_control]),
             'end_control': copy.deepcopy(controls[final_control]),
             'end_position': copy.deepcopy(_cp_position(controls[final_control])),
+            # The terminal CP's own tags: its descriptor belongs to the next
+            # chunk, but its tags belong to the point, and for the fiber's
+            # final CP no later chunk would otherwise see them change.
+            'end_tags': copy.deepcopy(_cp_tags(controls[final_control])),
             'line_points': copy.deepcopy(doc['line_points'][line_start:line_end + 1]),
         })
     return chunks, None
 
 
+def _cp_tags(value):
+    return value.get('tags', []) if isinstance(value, dict) else []
+
+
 def _v3_chunk_equal(a, b):
     return (a['start_controls'] == b['start_controls'] and
             a['end_position'] == b['end_position'] and
+            a['end_tags'] == b['end_tags'] and
             a['line_points'] == b['line_points'])
 
 
@@ -644,8 +683,11 @@ def merge_v3_optimization_mode(base, local, remote):
                   f"({local_mode!r} vs {remote_mode!r})")
 
 
-def _branches_of(doc):
-    branches = doc.get('branches', [])
+BRANCH_ARRAYS = ('branches', 'adjacent_branches')
+
+
+def _branches_of(doc, kind='branches'):
+    branches = doc.get(kind, [])
     return branches if isinstance(branches, list) else []
 
 
@@ -674,7 +716,7 @@ def _structured_branch(branch):
             _finite_point(branch.get('branch_control_point_position')))
 
 
-def split_branches(doc):
+def split_branches(doc, kind='branches'):
     """(structured, opaque) partition of a document's branch entries.
 
     Opaque entries (non-objects, missing or malformed fields) are data
@@ -682,21 +724,23 @@ def split_branches(doc):
     only by whole-value comparison — never silently dropped."""
     structured = []
     opaque = []
-    for branch in _branches_of(doc):
+    for branch in _branches_of(doc, kind):
         (structured if _structured_branch(branch) else opaque).append(branch)
     return structured, opaque
 
 
-def links_to(doc, peer_name):
+def links_to(doc, peer_name, kind=None):
     """Structured branch entries of `doc` that point at `peer_name`
     (compared as basenames, like the loader)."""
-    return [entry for entry in _branches_of(doc)
+    return [entry for array in ((kind,) if kind else BRANCH_ARRAYS)
+            for entry in _branches_of(doc, array)
             if _structured_branch(entry) and _branch_target(entry) == peer_name]
 
 
 def links_to_any(doc):
     """All structured branch entries of a document."""
-    return [entry for entry in _branches_of(doc) if _structured_branch(entry)]
+    return [entry for kind in BRANCH_ARRAYS for entry in _branches_of(doc, kind)
+            if _structured_branch(entry)]
 
 
 def _canon_opaque(entries):
@@ -742,22 +786,69 @@ def _find_link(entries, branch, used):
     return None
 
 
-def _link_modified(entry, base_entry):
-    """The review state is the meaningful mutable field on a link; indices
-    and directions are derived and re-resolved elsewhere."""
-    return (bool(entry.get('pending', False)) !=
-            bool(base_entry.get('pending', False)))
+def _span_tags_of(doc):
+    """The span tags of a document, per non-final control (empty when the
+    version predates span tags)."""
+    if doc.get('version', 1) < 4:
+        return []
+    tags = []
+    for cp in (doc.get('control_points') or [])[:-1]:
+        segment = cp.get('segment_to_next') if isinstance(cp, dict) else None
+        tags.append(list(segment.get('tags') or [])
+                    if isinstance(segment, dict) else [])
+    return tags
 
 
-def merge_branches(base_doc, local_doc, remote_doc, prefer_local):
+def base_carries_regressable_metadata(base_doc):
+    """Whether a last-synced copy holds anything an older writer's re-save
+    could silently drop (adjacent links, span tags), i.e. whether
+    legacy_regression could ever report against it. vc_sync uses this to skip
+    fetching a changed remote fiber when nothing could have been lost."""
+    return (is_fiber_doc(base_doc) and
+            (bool(_branches_of(base_doc, 'adjacent_branches')) or
+             any(_span_tags_of(base_doc))))
+
+
+def legacy_regression(doc, base_doc):
+    """An older writer dropped something a newer one had written: an array
+    that contained adjacent links (an explicitly empty array is a deliberate
+    deletion, not a regression), or, for a version-3 save over a version-4
+    base, the span tags (`gap`, `damaged`) that a version-3 writer cannot
+    carry. Either is a conflict for manual resolution, not a silent loss."""
+    if not (is_fiber_doc(doc) and is_fiber_doc(base_doc)):
+        return None
+    if (_branches_of(base_doc, 'adjacent_branches') and
+            'adjacent_branches' not in doc):
+        return ("adjacent_branches is missing (saved by an older VC3D?) "
+                "where the last-synced copy had adjacent links")
+    if (base_doc.get('version', 1) >= 4 and doc.get('version', 1) < 4 and
+            any(_span_tags_of(base_doc))):
+        return ("saved as version 3 (by an older VC3D?) where the last-synced "
+                "copy was version 4 with span tags (gap/damaged); the tags "
+                "would be lost")
+    return None
+
+
+def _stripped_array_conflicts(base_doc, local_doc, remote_doc):
+    # Before whole-document shortcuts: even identical legacy saves conflict.
+    return [f"{side}: {message}"
+            for side, doc in (('local', local_doc), ('remote', remote_doc))
+            if (message := legacy_regression(doc, base_doc))]
+
+
+def merge_branches(base_doc, local_doc, remote_doc, prefer_local, kind='branches'):
     """Base-aware set merge of structured link entries. Additions from
     either side survive; untouched-here-but-gone-there means deletion;
     approving a link beats deleting it; pending=False wins over
     pending=True for the same link. Local anchor indices are NOT touched
-    here — the caller re-anchors entries against the merged geometry."""
-    base_entries, _ = split_branches(base_doc)
-    local_entries, _ = split_branches(local_doc)
-    remote_entries, _ = split_branches(remote_doc)
+    here — the caller re-anchors entries against the merged geometry.
+
+    Each array is merged independently: moving a link between arrays is a
+    deletion of the old kind and an addition of the new kind.
+    Returns (merged, notes, stats)."""
+    base_entries, _ = split_branches(base_doc, kind)
+    local_entries, _ = split_branches(local_doc, kind)
+    remote_entries, _ = split_branches(remote_doc, kind)
 
     merged = []
     notes = []
@@ -784,9 +875,14 @@ def merge_branches(base_doc, local_doc, remote_doc, prefer_local):
             merged.append(copy.deepcopy(entry))
             stats['links_added_%s' % side_name] += 1
             return
-        # Present in base, gone from the other side: deletion unless this
-        # side meaningfully modified it (approving a link beats deleting it).
-        if not _link_modified(entry, base_entry):
+        # A re-link in the other array replaces the original, including its
+        # review state. Otherwise, an approval beats deletion.
+        other = remote_doc if side_name == 'local' else local_doc
+        other_kind = BRANCH_ARRAYS[1] if kind == BRANCH_ARRAYS[0] else BRANCH_ARRAYS[0]
+        relinked = any(_same_link(entry, candidate)
+                       for candidate in split_branches(other, other_kind)[0])
+        if (relinked or bool(entry.get('pending', False)) ==
+                bool(base_entry.get('pending', False))):
             stats['links_deleted'] += 1
             notes.append(f"link to {entry.get('branch_file', '?')} deleted on "
                          f"{'remote' if side_name == 'local' else 'local'}")
@@ -817,13 +913,14 @@ def merge_branches(base_doc, local_doc, remote_doc, prefer_local):
             else:
                 # No base entry to arbitrate: prefer the approved state.
                 chosen = remote_entry if local_pending else local_entry
+        else:
+            chosen = local_entry if prefer_local else remote_entry
+        if local_pending != remote_pending:
             if bool(chosen.get('pending', False)):
                 notes.append(f"link to {_branch_target(chosen) or '?'} "
                              "re-flagged as pending")
             else:
                 stats['links_approved'] += 1
-        else:
-            chosen = local_entry if prefer_local else remote_entry
         merged.append(copy.deepcopy(chosen))
         stats['links_kept'] += 1
 
@@ -838,7 +935,7 @@ def _has_trace_span(doc):
     """True when any span's stored geometry was produced by the prediction
     tracer (v3 interp_mode == 'trace'). Consumed by
     fiber_strip_stale_review_tags.py."""
-    if doc.get('version', 1) != 3:
+    if doc.get('version', 1) not in (3, 4):
         return False
     control_points = doc.get('control_points') or []
     for cp in control_points[:-1]:
@@ -962,6 +1059,81 @@ def _merge_manual_hv_tag(base, local, remote, merged, notes):
     return None
 
 
+def _merge_display_annotations(base, local, remote, merged):
+    def choose(b, l, r, label):
+        if l == r or r == b:
+            return l
+        if l == b:
+            return r
+        raise ValueError(f"conflicting {label}")
+
+    width = choose(base.get('width', 0), local.get('width', 0), remote.get('width', 0), 'fiber widths')
+    merged['width_gap_fraction'] = choose(
+        *(doc.get('width_gap_fraction', 0.2) for doc in (base, local, remote)),
+        'fiber width gaps')
+    if width:
+        merged['width'] = width
+    else:
+        merged.pop('width', None)
+
+    def normal_at(doc, cp):
+        for p in doc['control_points']:
+            if pos_eq(_cp_position(p), _cp_position(cp)):
+                if isinstance(p, dict) and 'display_normal' in p:
+                    return (p['display_normal'], p.get('display_normal_source', 'unknown'))
+                return None
+        return None
+
+    for cp in merged['control_points']:
+        if not isinstance(cp, dict):
+            continue
+        normal = choose(*(normal_at(doc, cp) for doc in (base, local, remote)), 'CP display normals')
+        if normal is None:
+            cp.pop('display_normal', None)
+            cp.pop('display_normal_source', None)
+        else:
+            cp['display_normal'] = copy.deepcopy(normal[0])
+            cp['display_normal_source'] = normal[1]
+    for doc in (local, remote):
+        for cp in doc['control_points']:
+            if normal_at(doc, cp) != normal_at(base, cp) and not any(
+                    pos_eq(_cp_position(p), _cp_position(cp)) for p in merged['control_points']):
+                raise ValueError('display normal edited on a removed or moved CP')
+
+    def direction_at(doc, cp):
+        for p in doc['control_points']:
+            if pos_eq(_cp_position(p), _cp_position(cp)) and isinstance(p, dict):
+                v = _normalized(p.get('direction'))
+                if v is not None:
+                    return v
+        return None
+
+    for cp in merged['control_points']:
+        if not isinstance(cp, dict):
+            continue
+        direction = choose(*(direction_at(doc, cp) for doc in (base, local, remote)),
+                           'CP directions')
+        if direction is None:
+            cp.pop('direction', None)
+        else:
+            cp['direction'] = direction
+    for doc in (local, remote):
+        for cp in doc['control_points']:
+            if direction_at(doc, cp) != direction_at(base, cp) and not any(
+                    pos_eq(_cp_position(p), _cp_position(cp)) for p in merged['control_points']):
+                raise ValueError('direction edited on a removed or moved CP')
+
+
+def _without_display_normals(doc):
+    doc = copy.deepcopy(doc)
+    for cp in doc['control_points']:
+        if isinstance(cp, dict):
+            cp.pop('display_normal', None)
+            cp.pop('display_normal_source', None)
+            cp.pop('direction', None)
+    return doc
+
+
 def merge_fibers(base, local, remote):
     """Three-way merge. Returns
     {'ok': bool, 'merged': dict|None, 'conflicts': [str], 'notes': [str],
@@ -979,6 +1151,11 @@ def merge_fibers(base, local, remote):
             return result
     for field in ('type', 'version', 'filename'):
         values = {str(doc.get(field)) for doc in (base, local, remote)}
+        if field == 'version' and values <= {'3', '4'}:
+            # Versions 3 and 4 share the span structure (4 adds optional
+            # span tags): a v3 base with a v4 side is the normal state right
+            # after a VC3D upgrade, not a conflict. The merge writes 4.
+            continue
         if len(values) > 1:
             result['conflicts'].append(
                 f"'{field}' differs between versions: {sorted(values)}")
@@ -994,8 +1171,29 @@ def merge_fibers(base, local, remote):
         return sorted({_branch_target(entry) for entry in links_to_any(doc)} |
                       {_branch_target(entry) for entry in links_to_any(base)})
 
+    def normal_defaults(doc):
+        for cp in doc['control_points']:
+            if isinstance(cp, dict) and 'display_normal' in cp:
+                cp.setdefault('display_normal_source', 'unknown')
+
+    stripped = _stripped_array_conflicts(base, local, remote)
+    if stripped:
+        result['conflicts'] = stripped
+        return result
+
+    def lineage_version(doc):
+        # Any version-4 input makes the output version 4, on the shortcuts
+        # too: a side an older build re-saved as version 3 must not pull the
+        # file back below what the base and the other side already are.
+        version = max(int(d.get('version', 1)) for d in (base, local, remote))
+        if version >= 3 and int(doc.get('version', 1)) >= 3:
+            doc['version'] = version
+        return doc
+
     if local == remote or remote == base:
-        merged = copy.deepcopy(local)
+        merged = lineage_version(copy.deepcopy(local))
+        merged.setdefault('width_gap_fraction', 0.2)
+        normal_defaults(merged)
         result.update(ok=True, merged=merged,
                       peer_files=short_circuit_peers(local),
                       notes=(["remote side unchanged; kept local"]
@@ -1003,21 +1201,12 @@ def merge_fibers(base, local, remote):
                              ["both sides identical"]))
         return result
     if local == base:
-        merged = copy.deepcopy(remote)
+        merged = lineage_version(copy.deepcopy(remote))
+        merged.setdefault('width_gap_fraction', 0.2)
+        normal_defaults(merged)
         result.update(ok=True, merged=merged,
                       peer_files=short_circuit_peers(remote),
                       notes=["local side unchanged; took remote"])
-        return result
-
-    # Branch entries this module cannot interpret are preserved by
-    # whole-value comparison; a clean merge must never discard input.
-    _, base_opaque = split_branches(base)
-    _, local_opaque = split_branches(local)
-    _, remote_opaque = split_branches(remote)
-    opaque_branches, opaque_conflict = merge_opaque_branches(
-        base_opaque, local_opaque, remote_opaque)
-    if opaque_conflict:
-        result['conflicts'] = [opaque_conflict]
         return result
 
     generation_local = int(local.get('generation', 1) or 1)
@@ -1025,19 +1214,49 @@ def merge_fibers(base, local, remote):
     prefer_local = generation_local >= generation_remote
     newer = local if prefer_local else remote
 
-    merged_branches, branch_notes, branch_stats = merge_branches(
-        base, local, remote, prefer_local)
+    merged_branches = {}
+    opaque_branches = {}
+    notes = []
+    stats = {}
+    for kind in BRANCH_ARRAYS:
+        # Preserve uninterpretable entries by whole-value comparison.
+        opaque_branches[kind], conflict = merge_opaque_branches(
+            *(split_branches(doc, kind)[1] for doc in (base, local, remote)))
+        if conflict:
+            result['conflicts'] = [f"{kind}: {conflict}"]
+            return result
+        entries, branch_notes, branch_stats = merge_branches(
+            base, local, remote, prefer_local, kind)
+        merged_branches[kind] = entries
+        notes.extend(branch_notes)
+        for key, value in branch_stats.items():
+            stats[key] = stats.get(key, 0) + value
+
+    # Concurrent additions at the same anchors with different kinds are
+    # ambiguous. Never pair them or quietly retain two different decisions.
+    for entry in merged_branches['branches']:
+        if any(_same_link(entry, candidate)
+               for candidate in merged_branches['adjacent_branches']):
+            result['conflicts'] = [
+                f"link to {_branch_target(entry)} is both ordinary and adjacent"]
+            return result
+
+    def rebind_branches(carrier):
+        for kind in BRANCH_ARRAYS:
+            merged_branches[kind], conflict = _rebind_local_anchors(
+                merged_branches[kind], carrier['control_points'], carrier['line_points'])
+            if conflict:
+                return conflict
+        return None
 
     geometry_same = (_seq_eq(local['control_points'], remote['control_points'])
                      and _seq_eq(local['line_points'], remote['line_points']))
-    notes = list(branch_notes)
-    stats = dict(branch_stats)
     reoptimize = False
     span_owners = None
 
-    if base.get('version', 1) == 3:
+    if base.get('version', 1) >= 3:
         span_geometry, span_conflicts = merge_v3_span_geometry(
-            base, local, remote)
+            *(_without_display_normals(doc) for doc in (base, local, remote)))
         if span_conflicts:
             result['conflicts'] = span_conflicts
             return result
@@ -1059,8 +1278,7 @@ def merge_fibers(base, local, remote):
                          "reoptimizing or replacing their descriptors")
         if not (_seq_eq(carrier['control_points'], newer['control_points']) and
                 _seq_eq(carrier['line_points'], newer['line_points'])):
-            merged_branches, anchor_conflict = _rebind_local_anchors(
-                merged_branches, carrier['control_points'], carrier['line_points'])
+            anchor_conflict = rebind_branches(carrier)
             if anchor_conflict:
                 result['conflicts'] = [anchor_conflict]
                 return result
@@ -1132,8 +1350,7 @@ def merge_fibers(base, local, remote):
                          "control-point polyline pending reoptimization in "
                          "VC3D")
 
-        merged_branches, anchor_conflict = _rebind_local_anchors(
-            merged_branches, carrier['control_points'], carrier['line_points'])
+        anchor_conflict = rebind_branches(carrier)
         if anchor_conflict:
             result['conflicts'] = [anchor_conflict]
             return result
@@ -1145,8 +1362,36 @@ def merge_fibers(base, local, remote):
     merged = copy.deepcopy(newer)
     merged['control_points'] = copy.deepcopy(carrier['control_points'])
     merged['line_points'] = copy.deepcopy(carrier['line_points'])
-    if base.get('version', 1) == 3:
+    try:
+        _merge_display_annotations(base, local, remote, merged)
+        def same_direction(a, b):
+            if a is None or b is None:
+                return a is b
+            a, b = _normalized(a), _normalized(b)
+            return a is not None and b is not None and sum(x*y for x, y in zip(a, b)) > 1-1e-12
+
+        def directions_match(doc):
+            for cp in merged['control_points']:
+                if not isinstance(cp, dict):
+                    continue
+                match = next((p for p in doc['control_points']
+                              if pos_eq(_cp_position(p), _cp_position(cp))), None)
+                if not same_direction(cp.get('direction'),
+                                      match.get('direction') if isinstance(match, dict) else None):
+                    return False
+            return True
+
+        if not (directions_match(local) and directions_match(remote)):
+            reoptimize = True
+    except ValueError as exc:
+        result['conflicts'] = [str(exc)]
+        return result
+    if base.get('version', 1) >= 3:
         merged['optimization_mode'] = mode
+        # Any version-4 side makes the merge version 4 (a v4 side may carry
+        # span tags the loader only accepts under version 4).
+        merged['version'] = max(int(doc.get('version', 1))
+                                for doc in (base, local, remote))
     if 'hv_classification' in carrier:
         merged['hv_classification'] = copy.deepcopy(carrier['hv_classification'])
     elif not geometry_same and 'hv_classification' in merged:
@@ -1155,11 +1400,23 @@ def merge_fibers(base, local, remote):
         # on load, corrected permanently by the reoptimization save).
         notes.append("hv_classification is stale for the merged geometry; "
                      "VC3D recomputes it on load")
-    merged['branches'] = merged_branches + opaque_branches
-    if opaque_branches:
-        noun = 'entry' if len(opaque_branches) == 1 else 'entries'
-        notes.append(f"{len(opaque_branches)} unparseable branch "
-                     f"{noun} carried through unchanged")
+    for kind in BRANCH_ARRAYS:
+        entries = merged_branches[kind] + opaque_branches[kind]
+        if not entries and all(kind not in doc for doc in (local, remote)):
+            # Neither content side carried the array and the merge produced
+            # nothing for it: writing one would turn "a legacy writer saved
+            # this, the kind is unknown" into "deliberately none", which
+            # hides a peer's missing reciprocal from the sync check and
+            # stops the loader restoring it. The base is deliberately not
+            # consulted: it only arbitrates deletions and contributes no
+            # entries, so its own array says nothing about what the two
+            # saved files know - and a base with real adjacent entries
+            # facing a stripped side is already a hard conflict above.
+            continue
+        merged[kind] = entries
+        if opaque_branches[kind]:
+            notes.append(f"{len(opaque_branches[kind])} unparseable {kind} "
+                         "entries carried through unchanged")
     merged['tags'] = merge_tags(base, local, remote)
     if reoptimize and REOPTIMIZE_TAG not in merged['tags']:
         merged['tags'].append(REOPTIMIZE_TAG)
@@ -1180,6 +1437,53 @@ def merge_fibers(base, local, remote):
 
 
 def refresh_pair_links(a_doc, b_doc, a_name, b_name, base_doc=None):
+    """Refresh both kinds independently, atomically, with A's merge deciding
+    additions, review state and base-aware deletions. A missing array must
+    never authorize erasing a peer's adjacent links."""
+    original = {'ok': False, 'a_doc': copy.deepcopy(a_doc),
+                'b_doc': copy.deepcopy(b_doc), 'a_changed': False,
+                'b_changed': False, 'notes': [], 'conflicts': []}
+    if not is_fiber_doc(a_doc) or not is_fiber_doc(b_doc):
+        original['conflicts'] = [f"{a_name} or {b_name} is not a vc3d_fiber document"]
+        return original
+    regression = legacy_regression(a_doc, base_doc)
+    if (regression or ('adjacent_branches' not in a_doc and
+                       links_to(b_doc, a_name, 'adjacent_branches'))):
+        original['conflicts'] = [
+            f"link {a_name} -> {b_name}: " + (regression or
+            f"{a_name} lacks adjacent_branches (saved by an older VC3D?) "
+            f"while {b_name} has an adjacent reciprocal")]
+        return original
+
+    out = copy.deepcopy(original)
+    for kind in BRANCH_ARRAYS:
+        part = _refresh_pair_links_kind(
+            out['a_doc'], out['b_doc'], a_name, b_name, base_doc, kind)
+        if not part['ok']:
+            original['conflicts'] = part['conflicts']
+            return original
+        out['a_doc'], out['b_doc'] = part['a_doc'], part['b_doc']
+        for flag in ('a_changed', 'b_changed'):
+            out[flag] |= part[flag]
+        out['notes'].extend(part['notes'])
+
+    # Only the base authorizes deleting old-kind reciprocals. With no base
+    # a different-kind ref cannot be paired or overwritten.
+    for doc, peer in ((out['a_doc'], b_name), (out['b_doc'], a_name)):
+        if any(_same_link(entry, other)
+               for entry in links_to(doc, peer, 'branches')
+               for other in links_to(doc, peer, 'adjacent_branches')):
+            original['conflicts'] = [
+                f"link {a_name} -> {b_name}: ordinary and adjacent kinds disagree"]
+            return original
+
+    if out['b_changed']:
+        out['b_doc']['generation'] = int(b_doc.get('generation', 1) or 1) + 1
+    out['ok'] = True
+    return out
+
+
+def _refresh_pair_links_kind(a_doc, b_doc, a_name, b_name, base_doc, kind):
     """Make the A<->B cross-fiber link pair consistent, treating A's
     entries as the decided truth (A was just auto-merged).
 
@@ -1203,7 +1507,7 @@ def refresh_pair_links(a_doc, b_doc, a_name, b_name, base_doc=None):
         return out
     a_cps, a_line = a['control_points'], a['line_points']
     b_cps, b_line = b['control_points'], b['line_points']
-    a_entries = links_to(a, b_name)
+    a_entries = links_to(a, b_name, kind)
     if a_entries and (len(a_line) < 2 or len(b_line) < 2):
         out['conflicts'].append(
             f"cannot derive endpoint directions between {a_name} and {b_name}")
@@ -1227,14 +1531,18 @@ def refresh_pair_links(a_doc, b_doc, a_name, b_name, base_doc=None):
         set_field(entry, key, _snapped_direction(entry.get(key), tangent),
                   doc_flag)
 
-    def snap_pending(entry, desired, doc_flag):
-        if bool(entry.get('pending', False)) == desired:
+    def snap_flag(entry, key, desired, doc_flag):
+        """A boolean written as true or absent, never false."""
+        if bool(entry.get(key, False)) == desired:
             return
         if desired:
-            entry['pending'] = True
+            entry[key] = True
         else:
-            entry.pop('pending', None)
+            entry.pop(key, None)
         out[doc_flag] = True
+
+    def snap_pending(entry, desired, doc_flag):
+        snap_flag(entry, 'pending', desired, doc_flag)
 
     used_reciprocals = []
     for entry in a_entries:
@@ -1263,7 +1571,7 @@ def refresh_pair_links(a_doc, b_doc, a_name, b_name, base_doc=None):
         # One reciprocal per entry: two pos_eq-identical A entries must not
         # both claim the same B entry (leaving B one reciprocal short).
         reciprocal = next(
-            (r for r in links_to(b, a_name)
+            (r for r in links_to(b, a_name, kind)
              if not any(r is used for used in used_reciprocals) and
              pos_eq(r.get('control_point_position'), pb) and
              pos_eq(r.get('branch_control_point_position'), pa)),
@@ -1284,7 +1592,7 @@ def refresh_pair_links(a_doc, b_doc, a_name, b_name, base_doc=None):
             }
             if entry.get('pending', False):
                 reciprocal['pending'] = True
-            b['branches'] = _branches_of(b) + [reciprocal]
+            b[kind] = _branches_of(b, kind) + [reciprocal]
             out['b_changed'] = True
             out['notes'].append(f"restored reciprocal link {b_name} -> {a_name}")
         else:
@@ -1305,12 +1613,12 @@ def refresh_pair_links(a_doc, b_doc, a_name, b_name, base_doc=None):
     # the merge: mirror the deletion. Unrelated B->A entries (pairs A never
     # tracked) are left untouched.
     if base_doc is not None and is_fiber_doc(base_doc):
-        for base_entry in links_to(base_doc, b_name):
+        for base_entry in links_to(base_doc, b_name, kind):
             if any(_same_link(base_entry, entry) for entry in a_entries):
                 continue
             survivors = []
             removed = 0
-            for candidate in _branches_of(b):
+            for candidate in _branches_of(b, kind):
                 if (_structured_branch(candidate) and
                         _branch_target(candidate) == a_name and
                         pos_eq(candidate.get('control_point_position'),
@@ -1321,16 +1629,10 @@ def refresh_pair_links(a_doc, b_doc, a_name, b_name, base_doc=None):
                     continue
                 survivors.append(candidate)
             if removed:
-                b['branches'] = survivors
+                b[kind] = survivors
                 out['b_changed'] = True
                 out['notes'].append(
                     f"removed reciprocal of deleted link in {b_name}")
-
-    if out['b_changed']:
-        # A rewritten peer is a newer version; keep the generation
-        # monotonic so later 3-way merges pick the right "newer" side
-        # (VC3D bumps on every save too).
-        b['generation'] = int(b.get('generation', 1) or 1) + 1
 
     out['ok'] = not out['conflicts']
     return out
