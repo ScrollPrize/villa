@@ -1821,23 +1821,65 @@ inline bool generatedLineOrderNeighbourIsKollesisTermination(
     return false;
 }
 
-// Strip span selection depends only on longitudinal position, never click height.
-// At a CP use its outgoing span; the final CP uses its incoming span.
-inline std::optional<size_t> generatedControlSpanOwnerRank(
-    const std::vector<const GeneratedOverlay::ControlPointMarker*>& sortedControls,
-    double linePosition)
+// What a strip click (or hover) addresses, decided by its scene x alone so
+// the height of the mouse over the strip never matters. `rank` indexes the
+// line-ordered control points; a span runs from `rank` to `rank + 1`.
+struct GeneratedStripContextTarget {
+    enum class Kind { ControlPoint, Span };
+    Kind kind = Kind::ControlPoint;
+    size_t rank = 0;
+
+    bool operator==(const GeneratedStripContextTarget& other) const
+    {
+        return kind == other.kind && rank == other.rank;
+    }
+};
+
+// Each span is divided along its drawn length: the quarter next to either
+// control point belongs to that point, the middle half is the span.
+constexpr double kGeneratedStripContextControlFraction = 0.25;
+
+// `sortedSceneX` holds, in line order, the scene x of each control's LINE
+// POSITION on the strip's centre line (generatedStripLinePositionToScene),
+// not of its drawn marker: a marker edited off the centre line can project
+// out of order, the centre line cannot, so this input is monotonic (either
+// direction: the strip may run against scene x) by construction and the
+// quarter rule needs no other case. Equal x (two controls on one strip
+// column) make a zero-length span, which claims nothing but its first
+// point. Outside the control range the nearest end point is the target.
+// Empty input or a non-finite x yields no target.
+inline std::optional<GeneratedStripContextTarget> generatedStripContextTarget(
+    const std::vector<double>& sortedSceneX,
+    double sceneX)
 {
-    if (sortedControls.size() < 2 || !std::isfinite(linePosition) ||
-        linePosition < sortedControls.front()->linePosition ||
-        linePosition > sortedControls.back()->linePosition) {
+    if (sortedSceneX.empty() || !std::isfinite(sceneX)) {
         return std::nullopt;
     }
-    for (size_t rank = 1; rank < sortedControls.size(); ++rank) {
-        if (linePosition < sortedControls[rank]->linePosition) {
-            return rank - 1;
+    using Kind = GeneratedStripContextTarget::Kind;
+    for (size_t rank = 1; rank < sortedSceneX.size(); ++rank) {
+        const double a = sortedSceneX[rank - 1];
+        const double b = sortedSceneX[rank];
+        if ((sceneX - a) * (sceneX - b) > 0.0) {
+            continue;
         }
+        const double length = std::abs(b - a);
+        if (length <= 0.0) {
+            return GeneratedStripContextTarget{Kind::ControlPoint, rank - 1};
+        }
+        const double t = std::abs(sceneX - a) / length;
+        if (t < kGeneratedStripContextControlFraction) {
+            return GeneratedStripContextTarget{Kind::ControlPoint, rank - 1};
+        }
+        if (t > 1.0 - kGeneratedStripContextControlFraction) {
+            return GeneratedStripContextTarget{Kind::ControlPoint, rank};
+        }
+        return GeneratedStripContextTarget{Kind::Span, rank - 1};
     }
-    return sortedControls.size() - 2;
+    // Off the ends: nearest end point. A single point is always it.
+    const size_t last = sortedSceneX.size() - 1;
+    const bool nearFront =
+        std::abs(sceneX - sortedSceneX.front()) <= std::abs(sceneX - sortedSceneX[last]);
+    return GeneratedStripContextTarget{Kind::ControlPoint, nearFront ? 0 : last};
 }
 
 struct GeneratedControlPointContextMenuOptions {
@@ -1851,6 +1893,11 @@ struct GeneratedControlPointContextMenuOptions {
     size_t linePointCount = 0;
     double linePosition = std::numeric_limits<double>::quiet_NaN();
     bool stripViewer = false;
+    // Set when the request names a control point explicitly (the overview
+    // bar's dot, forwarded as a synthetic strip click): on a strip the target
+    // is the control nearest this line position, never a span, whatever the
+    // click's scene x resolves to against the markers on screen.
+    std::optional<double> pinnedControlLinePosition;
     vc::lasagna::LineStripPositionMap stripPositionMap;
     bool linkWithCandidateEnabled = false;
     QString linkWithCandidateLabel;
@@ -1942,6 +1989,18 @@ std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
                                   const GeneratedOverlay& overlay);
 void clearGeneratedControlPointContextPreview(CChunkedVolumeViewer* viewer,
                                               const std::string& surfaceName);
+// The hover highlight on a strip: the control point ring or span segment a
+// Ctrl+right-click at `scenePoint` would open the menu for, drawn under its
+// own overlay key so the menu preview and the generated overlays are left
+// alone. No target under the mouse clears it.
+void updateGeneratedStripContextHover(CChunkedVolumeViewer* viewer,
+                                      const std::string& surfaceName,
+                                      const std::vector<GeneratedOverlay::ControlPointMarker>& controlPoints,
+                                      size_t linePointCount,
+                                      const vc::lasagna::LineStripPositionMap& positionMap,
+                                      const QPointF& scenePoint);
+void clearGeneratedStripContextHover(CChunkedVolumeViewer* viewer,
+                                     const std::string& surfaceName);
 GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
     const GeneratedControlPointContextMenuOptions& options);
 

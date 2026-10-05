@@ -44,6 +44,7 @@
 #include <QProgressBar>
 #include <QRect>
 #include <QResizeEvent>
+#include <QScopeGuard>
 #include <QSignalBlocker>
 #include <QSettings>
 #include <QShortcut>
@@ -1736,6 +1737,7 @@ bool LineAnnotationDialog::setGeneratedRows(
     // half-destroyed viewer (QPointers only clear once ~QObject runs).
     _panes.clear();
     _stripViewers.clear();
+    _stripHoverLocalPos.clear();
     _overviewBar = nullptr;
     _currentCutOverlaySwapPending = false;
     _sideCutOverlaySwapPending = false;
@@ -2169,6 +2171,10 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         _currentCutOverlaySwapPending = true;
         _sideCutOverlaySwapPending = true;
         _stripOverlaySwapPending.assign(_stripViewers.size(), true);
+        // The glow was drawn on the frame about to be replaced.
+        for (size_t i = 0; i < _stripViewers.size(); ++i) {
+            clearStripContextHover(i);
+        }
         _currentCutNormalOffsetVx = 0.0;
         _currentCutStraightAheadActive = false;
         _sideCutNormalOffsetVx = 0.0;
@@ -2327,6 +2333,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     // _stripViewers/cut viewers (QPointers only clear once ~QObject runs).
     _panes.clear();
     _stripViewers.clear();
+    _stripHoverLocalPos.clear();
     _overviewBar = nullptr;
     _currentCutOverlaySwapPending = false;
     _sideCutOverlaySwapPending = false;
@@ -2591,7 +2598,18 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         connect(viewer,
                 &CChunkedVolumeViewer::sendMouseMoveVolume,
                 this,
-                [this, viewer](cv::Vec3f, Qt::MouseButtons, Qt::KeyboardModifiers, QPointF scenePoint) {
+                [this, viewer, stripIndex](cv::Vec3f, Qt::MouseButtons, Qt::KeyboardModifiers, QPointF scenePoint) {
+                    if (stripIndex < _stripHoverLocalPos.size()) {
+                        _stripHoverLocalPos[stripIndex] = viewer->graphicsView()->mapFromScene(scenePoint);
+                    }
+                    // A mouse-drag pan moves the camera in this same event,
+                    // before this signal; the markers follow only with the
+                    // coalesced rebuild, which refreshes the glow itself.
+                    // Drawing now would put the glow where the markers are
+                    // not yet, so it waits while the placement is stale.
+                    if (stripStaticPlacementCurrent(stripIndex)) {
+                        updateStripContextHover(stripIndex, scenePoint);
+                    }
                     if (!_currentCutFollowsStripMouse) {
                         return;
                     }
@@ -2600,6 +2618,17 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                         requestCurrentLinePosition(position);
                     }
                 });
+        connect(viewer->graphicsView(),
+                &CVolumeViewerView::sendMouseLeftView,
+                this,
+                [this, stripIndex]() {
+                    if (stripIndex < _stripHoverLocalPos.size()) {
+                        _stripHoverLocalPos[stripIndex].reset();
+                    }
+                    clearStripContextHover(stripIndex);
+                });
+        // For the move positions a drag handler consumes (eventFilter).
+        viewer->graphicsView()->viewport()->installEventFilter(this);
         connect(viewer,
                 &CChunkedVolumeViewer::sendMousePressVolume,
                 this,
@@ -2631,6 +2660,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                 });
         stripSplitter->addWidget(viewer);
         _stripViewers.push_back(viewer);
+        _stripHoverLocalPos.push_back(std::nullopt);
         _panes.push_back(Pane{surfaceName, viewer, {}});
         connectGeneratedOverlayRefresh(viewer);
         // Strips share their along-line position and zoom; overlaysUpdated is
@@ -2639,6 +2669,10 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         _generatedOverlayRefreshConnections.push_back(
             viewer->connectOverlaysUpdated(this, [this, viewer]() {
                 syncLinkedStripCamera(viewer);
+                // The hover glow is NOT re-resolved here: the markers it sits
+                // on move only with the coalesced static rebuild (16 ms) or
+                // the pan tick's translation, and both refresh it themselves,
+                // so glow and marker move in the same paint.
             }));
     }
     if (!_stripViewers.empty()) {
@@ -2723,12 +2757,29 @@ LineAnnotationDialog::showGeneratedControlPointContextMenu(
         return GeneratedControlPointContextResult::None;
     }
 
-    const bool stripViewer =
-        std::any_of(_stripViewers.begin(),
-                    _stripViewers.end(),
-                    [viewer](const QPointer<CChunkedVolumeViewer>& candidate) {
-                        return candidate == viewer;
-                    });
+    size_t stripIndex = _stripViewers.size();
+    for (size_t i = 0; i < _stripViewers.size(); ++i) {
+        if (_stripViewers[i] == viewer) {
+            stripIndex = i;
+            break;
+        }
+    }
+    const bool stripViewer = stripIndex < _stripViewers.size();
+    // The menu preview takes the highlight over; an overlay rebuild landing
+    // while the menu is open (async intersections) must not redraw the hover
+    // under it or move it to another target.
+    _stripContextMenuOpen = true;
+    // Reset on every exit, a throwing handler included; the dialog may be
+    // gone by then (nested event loop), hence the QPointer.
+    const QPointer<LineAnnotationDialog> self(this);
+    const auto resetMenuOpen = qScopeGuard([self]() {
+        if (self) {
+            self->_stripContextMenuOpen = false;
+        }
+    });
+    if (stripViewer) {
+        clearStripContextHover(stripIndex);
+    }
 
     vc3d::line_annotation::GeneratedControlPointContextMenuOptions options;
     options.parent = this;
@@ -2767,6 +2818,7 @@ LineAnnotationDialog::showGeneratedControlPointContextMenu(
     options.linePointCount = _generatedViews.linePoints.size();
     options.linePosition = linePosition;
     options.stripViewer = stripViewer;
+    options.pinnedControlLinePosition = _overviewContextControlLinePosition;
     options.stripPositionMap = _generatedViews.stripPositionMap;
     options.linkWithCandidateEnabled = linkCandidateState.enabled;
     options.linkWithCandidateLabel = linkCandidateState.label;
@@ -2862,7 +2914,96 @@ LineAnnotationDialog::showGeneratedControlPointContextMenu(
     options.setBreak = [this, surfaceName](size_t controlPointIndex, bool enabled) {
         emit generatedControlPointBreakChangeRequested(surfaceName, controlPointIndex, enabled);
     };
-    return vc3d::line_annotation::showGeneratedControlPointContextMenu(options);
+    const auto result = vc3d::line_annotation::showGeneratedControlPointContextMenu(options);
+    if (!self) {
+        return result;
+    }
+    _stripContextMenuOpen = false;
+    if (stripViewer) {
+        refreshStripContextHover(stripIndex);
+    }
+    return result;
+}
+
+void LineAnnotationDialog::updateStripContextHover(size_t stripIndex, const QPointF& scenePoint)
+{
+    if (_closing || stripIndex >= _stripViewers.size()) {
+        return;
+    }
+    auto* viewer = _stripViewers[stripIndex].data();
+    if (!viewer) {
+        return;
+    }
+    // While the strip still shows a held frame the markers on screen are not
+    // where the current geometry puts them: no highlight until the swap lands
+    // (the menu refuses the click for the same reason).
+    const bool swapPending =
+        stripIndex < _stripOverlaySwapPending.size() && _stripOverlaySwapPending[stripIndex];
+    if (!kGeneratedLineAnnotationOverlaysEnabled || !_hasGeneratedViews || swapPending ||
+        _crossSectionDrag || _stripContextMenuOpen) {
+        vc3d::line_annotation::clearGeneratedStripContextHover(viewer, viewer->surfName());
+        return;
+    }
+    vc3d::line_annotation::updateGeneratedStripContextHover(viewer,
+                                                            viewer->surfName(),
+                                                            _generatedViews.controlPoints,
+                                                            _generatedViews.linePoints.size(),
+                                                            _generatedViews.stripPositionMap,
+                                                            scenePoint);
+}
+
+bool LineAnnotationDialog::stripStaticPlacementCurrent(size_t stripIndex) const
+{
+    if (stripIndex >= _stripViewers.size() ||
+        stripIndex >= _staticStripOverlayPlacements.size()) {
+        return false;
+    }
+    auto* viewer = _stripViewers[stripIndex].data();
+    if (!viewer) {
+        return false;
+    }
+    const auto& placement = _staticStripOverlayPlacements[stripIndex];
+    if (placement.groupKey.empty()) {
+        return false;
+    }
+    const auto delta = vc3d::line_annotation::generatedOverlayPanTranslation(
+        placement.camera,
+        viewer->surfaceCoordsToScene(0.0f, 0.0f),
+        static_cast<double>(viewer->cameraState().scale));
+    return delta && *delta == QPointF();
+}
+
+void LineAnnotationDialog::refreshStripContextHover(size_t stripIndex)
+{
+    if (_closing || stripIndex >= _stripViewers.size()) {
+        return;
+    }
+    auto* viewer = _stripViewers[stripIndex].data();
+    auto* view = viewer ? viewer->graphicsView() : nullptr;
+    auto* viewport = view ? view->viewport() : nullptr;
+    if (!viewport) {
+        return;
+    }
+    // Only the strip's own move and leave events say where the pointer is; a
+    // position remembered from them survives zooms and pans (the pointer did
+    // not move) and is gone once the pointer left.
+    const std::optional<QPoint> local =
+        stripIndex < _stripHoverLocalPos.size() ? _stripHoverLocalPos[stripIndex] : std::nullopt;
+    if (!local || !viewport->rect().contains(*local)) {
+        clearStripContextHover(stripIndex);
+        return;
+    }
+    updateStripContextHover(stripIndex, view->mapToScene(*local));
+}
+
+void LineAnnotationDialog::clearStripContextHover(size_t stripIndex)
+{
+    if (stripIndex >= _stripViewers.size()) {
+        return;
+    }
+    if (auto* viewer = _stripViewers[stripIndex].data()) {
+        vc3d::line_annotation::clearGeneratedStripContextHover(viewer, viewer->surfName());
+    }
 }
 
 void LineAnnotationDialog::applyGeneratedOverlay(const std::string& surfaceName,
@@ -4175,7 +4316,11 @@ void LineAnnotationDialog::rebuildGeneratedStaticStripOverlays()
         placement.camera.referenceScene = viewer->surfaceCoordsToScene(0.0f, 0.0f);
         placement.camera.scale = static_cast<double>(viewer->cameraState().scale);
     }
-
+    // The markers may have moved (a placed, deleted or re-optimized point):
+    // re-resolve the highlight under the mouse against the new positions.
+    for (size_t i = 0; i < _stripViewers.size(); ++i) {
+        refreshStripContextHover(i);
+    }
 }
 
 void LineAnnotationDialog::updateStaticStripOverlaysForPan()
@@ -4222,6 +4367,10 @@ void LineAnnotationDialog::updateStaticStripOverlaysForPan()
             return;
         }
         placement.camera.referenceScene = reference;
+    }
+    // The glow follows the shifted markers in the same tick.
+    for (size_t i = 0; i < _stripViewers.size(); ++i) {
+        refreshStripContextHover(i);
     }
 }
 
@@ -5792,6 +5941,22 @@ void LineAnnotationDialog::drawCrossSectionDragPreview(const vc::fiber_tracer::F
 
 bool LineAnnotationDialog::eventFilter(QObject* watched, QEvent* event)
 {
+    if (event->type() == QEvent::MouseMove) {
+        // Recorded before the drag handlers below, which consume the moves
+        // of a direction or cross-section drag; the hover's own update comes
+        // from the viewer's move signal, this only keeps the position fresh
+        // for the refresh after a rebuild. Enter events are deliberately not
+        // used: a popup's close synthesizes one from a cached position on
+        // Wayland, so only a real move brings the glow back after a menu.
+        for (size_t i = 0; i < _stripViewers.size() && i < _stripHoverLocalPos.size(); ++i) {
+            auto* viewer = _stripViewers[i].data();
+            auto* view = viewer ? viewer->graphicsView() : nullptr;
+            if (view && watched == view->viewport()) {
+                _stripHoverLocalPos[i] = static_cast<QMouseEvent*>(event)->position().toPoint();
+                break;
+            }
+        }
+    }
     if (handleDirectionDragEvent(watched,event)) return true;
     if (handleCrossSectionDragEvent(watched, event)) return true;
     if (watched == _fiberNameLabel && event->type() == QEvent::Resize) {
@@ -5917,7 +6082,18 @@ void LineAnnotationDialog::forwardOverviewControlContextMenu(double linePosition
     // the controller, which supplies link-candidate state and shows the same
     // menu an in-viewer Ctrl+right-click would. The synthesized scene point
     // round-trips to the clicked control point's line position, and the menu
-    // pops at the overview-bar cursor via globalPos.
+    // pops at the overview-bar cursor via globalPos. The dot names a control
+    // point, so the request pins that point as the target: the strip's
+    // click zones must not read the synthetic click as a span when the
+    // markers on screen lag the published controls (asynchronous
+    // optimization renumbering).
+    _overviewContextControlLinePosition = linePosition;
+    const QPointer<LineAnnotationDialog> self(this);
+    const auto unpin = qScopeGuard([self]() {
+        if (self) {
+            self->_overviewContextControlLinePosition.reset();
+        }
+    });
     QMetaObject::invokeMethod(
         view,
         "sendAnnotationContextMenuRequested",

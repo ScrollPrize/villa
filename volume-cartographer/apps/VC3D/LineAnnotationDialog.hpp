@@ -435,6 +435,17 @@ private:
                                const GeneratedOverlay& overlay);
     void clearControlPointContextPreview(const std::string& surfaceName,
                                          CChunkedVolumeViewer* viewer);
+    // Hover highlight of the strip target (control point or span) that a
+    // Ctrl+right-click at the mouse would open the menu for.
+    void updateStripContextHover(size_t stripIndex, const QPointF& scenePoint);
+    // Re-reads the mouse position from the strip's viewport (after a pan,
+    // zoom or overlay rebuild) and updates or clears the highlight.
+    void refreshStripContextHover(size_t stripIndex);
+    // True when the strip's static overlays (the control markers) were placed
+    // or translated for the camera the viewer has now; while false the
+    // markers lag the camera until the coalesced rebuild or the pan tick.
+    bool stripStaticPlacementCurrent(size_t stripIndex) const;
+    void clearStripContextHover(size_t stripIndex);
     GeneratedOverlay staticStripOverlay() const;
     GeneratedOverlay zSliceOverlay(const GeneratedViews& views,
                                    const vc3d::line_annotation::GeneratedControlPointLinePositionIndex& controlIndex,
@@ -626,6 +637,17 @@ private:
     bool _currentCutOverlaySwapPending = false;
     bool _sideCutOverlaySwapPending = false;
     std::vector<bool> _stripOverlaySwapPending;
+    // True while a strip or cut context menu is open: the hover highlight
+    // stays off so the menu preview is the only highlight on screen.
+    bool _stripContextMenuOpen = false;
+    // Per strip, the pointer's last known viewport position, from the strip's
+    // own move events, forgotten on leave. The hover refresh after a pan, zoom
+    // or rebuild re-resolves from here and never asks the platform where the
+    // cursor is (stale or unavailable on Wayland).
+    std::vector<std::optional<QPoint>> _stripHoverLocalPos;
+    // The control point an overview-bar dot click names, for the duration of
+    // the forwarded (synchronous) menu request; see forwardOverviewControlContextMenu.
+    std::optional<double> _overviewContextControlLinePosition;
     std::vector<QPointer<CChunkedVolumeViewer>> _stripViewers;
     // Schematic fixed-height bar above the cut views: a straight line with the
     // control points (LineAnnotationOverviewBar, file-local in the .cpp).

@@ -218,16 +218,24 @@ unchanged), in place of the traced or interpolated style, and marks every
 break point with the dotted amber rim. The flag is display-only in the map:
 it does not change heat-map seeding, winding evidence or publishing.
 
-## Combined span and control-point menu (strips)
+## Span and control-point menus (strips)
 
-In either strip view, Ctrl+right-click anywhere across its height opens one
-menu with actions for the containing span and the nearest control point.
-Span selection uses only the click's longitudinal line position, not its
-distance from the centre line or a CP marker. At an exact CP position the
-outgoing span is selected; the final CP uses its incoming span. Extrapolated
-tails outside the control-point range have CP actions only.
-The menu identifies both targets and shows the span's state (mode marker,
-goal, gap or damaged). The span section contains:
+In either strip view a Ctrl+right-click opens either the **span menu** or the
+**control-point menu**, decided by the click's horizontal position alone;
+where the mouse sits across the strip's height does not matter. Each span is
+divided along its drawn length: the quarter next to either control point
+belongs to that point, the middle half to the span. Off the ends of the
+control-point range (the extrapolated tails) the nearest end point's menu
+opens. The zones follow each control's line position along the strip's
+centre line; a marker edited off the centre line is drawn where it is, but
+its zone stays at its line position. While the mouse moves over a strip, the target a click there would
+act on is highlighted with a soft translucent orange glow: a disc behind
+the control marker, or a band along the span between its two markers; the
+same glow stays up while the menu is open. The cut views offer the
+control-point menu only, for the control point nearest the click.
+
+The span menu shows the span's state (mode marker, goal, gap or damaged) and
+contains:
 
 - **Interpolation goal** (Global / Cubic spline / Lasagna / Fiber trace):
   lives here and nowhere else now.
@@ -249,6 +257,18 @@ goal, gap or damaged). The span section contains:
   needs at least two control points. The split-candidate tooling (red
   candidate marker, "Designate as split candidate", "Split from candidate",
   "Split from candidate and link") is gone.
+
+Below a separator the span menu also carries the actions that act on the
+clicked location rather than on the span: "Go to nearby annotation" (when a
+fiber marker is under the click), "New line annotation" and, while a link
+candidate is designated, the new-linked-annotation entry. The control-point
+menu offers the same three.
+
+The control-point menu is ordered by use in four sections: navigation and
+linking (go to linked annotation, go to nearby annotation, delete, link or
+merge with the candidate, designate as link or adjacent link candidate,
+unlink, approve or mark pending); the point tags (kollesis termination,
+break); new annotations at the click; and the corrections reset.
 
 The top-level `optimization_mode` is either `lasagna` or
 `native_fiber_trace3d`. It is required in version 3; only legacy version-1
