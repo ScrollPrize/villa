@@ -78,12 +78,15 @@ class PatchEncoder(nn.Module):
         self.norm = nn.LayerNorm(cfg.hidden)
         self.register_buffer('token_xyz', token_coordinates(cfg).reshape(-1,3), persistent=False)
 
-    def encode(self, image, references, mask):
+    def encode(self, image, references, mask, return_stem=False):
+        """Fine and deep token lattices; with ``return_stem`` also the image-only stem tokens (B, C, D, H, W),
+        before the position embedding and observed-path conditioning."""
         tokens = self.patch_projection(image)
         if self.cfg.activation_checkpointing and self.training and torch.is_grad_enabled():
             tokens = tokens+checkpoint(self.stem, image, use_reentrant=False)
         else:
             tokens = tokens+self.stem(image)
+        stem = tokens
         tokens = tokens.permute(0,2,3,4,1)
         tokens = tokens+self.position(self.token_xyz/16).reshape(*self.cfg.token_shape,self.cfg.hidden).to(tokens.dtype)
         tokens = tokens+self.condition(self.conditioning(references,mask)).to(tokens.dtype)
@@ -94,7 +97,7 @@ class PatchEncoder(nn.Module):
                 tokens = block(tokens)
         deep = self.norm(tokens).permute(0,4,1,2,3)
         # Both path queries and scoring sample the same contextual token lattice.
-        return deep, deep
+        return (deep, deep, stem) if return_stem else (deep, deep)
 
     def forward(self, image, references, mask):
         fine, deep = self.encode(image, references, mask)

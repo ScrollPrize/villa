@@ -60,9 +60,36 @@ def directed_seed(fiber: TracedFiber, vol, rng, sign: float, margin: float = 32.
                 seed_heading_policy=SEED_HEADING_POLICY)
 
 
-def trace_events(path, fiber, t0, sign, tol=3.0, patience=3, tree=None):
+# Evaluation departure: farther than the tolerance from the GT fiber over at least this much path length (voxels).
+# Measured along the path, so it does not depend on how densely a tracer samples its committed polyline.
+DEPARTURE_PATIENCE_LENGTH = 3.0
+
+
+def sustained_onsets(lengths, bad, patience=DEPARTURE_PATIENCE_LENGTH):
+    """Start indices of runs of consecutive True values spanning at least ``patience`` voxels of path.
+
+    ``lengths`` are cumulative path lengths of the same points; a run from point a to point b spans
+    lengths[b]-lengths[a]. A zero patience makes every bad point an onset of its run.
+    """
+    lengths, bad = np.asarray(lengths, np.float64), np.asarray(bad, bool)
+    onsets, start = [], None
+    for index, value in enumerate(bad):
+        if not value:
+            start = None
+            continue
+        if start is None:
+            start, counted = index, False
+        if not counted and lengths[index]-lengths[start] >= patience:
+            onsets.append(start)
+            counted = True
+    return onsets
+
+
+def trace_events(path, fiber, t0, sign, tol=3.0, patience=DEPARTURE_PATIENCE_LENGTH, tree=None):
     """First sustained departure and first supported endpoint-plane crossing.
 
+    A departure is the first run of path points farther than ``tol`` from the GT fiber that spans
+    at least ``patience`` voxels of path length; it is dated at the run's first point.
     Endpoint crossing is checked on segments, not just nearest-point indices,
     so the crossing segment can be partitioned exactly. Returns cumulative
     path lengths, GT distances/arcs, departure index, and endpoint path length.
@@ -72,10 +99,8 @@ def trace_events(path, fiber, t0, sign, tol=3.0, patience=3, tree=None):
     d, j = tree.query(path)
     arc = fiber.s[j]
     lengths = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(path, axis=0), axis=1))] if len(path) else np.zeros(0)
-    bad = d > tol
-    run = np.convolve(bad.astype(int), np.ones(patience, int), mode="full")[:len(bad)] if len(bad) else np.zeros(0)
-    fail = np.flatnonzero(run >= patience)
-    end = max(int(fail[0]) - patience + 1, 0) if len(fail) else len(path)
+    onsets = sustained_onsets(lengths, d > tol, patience)
+    end = onsets[0] if onsets else len(path)
     endpoint = fiber.points[-1 if sign > 0 else 0]
     tangent = tangent_at(fiber.points, fiber.s, fiber.length if sign > 0 else 0.0) * sign
     forward = (path - endpoint) @ tangent
@@ -100,7 +125,7 @@ def trace_events(path, fiber, t0, sign, tol=3.0, patience=3, tree=None):
 
 
 def score_trace(path: np.ndarray, fiber: TracedFiber, t0: float, sign: float, tol: float = 3.0,
-                patience: int = 3, tree: cKDTree | None = None):
+                patience: float = DEPARTURE_PATIENCE_LENGTH, tree: cKDTree | None = None):
     """Partition every segment into supported, wrong, or unknown length.
 
     An untagged annotation endpoint censors subsequent continuation. A tagged
@@ -243,16 +268,6 @@ def distance_profile(path, fiber, t0, sign, chunk=8):
     return arc, np.asarray(distances)
 
 
-def sustained_onsets(bad, patience=3):
-    """Start indices of runs of at least ``patience`` consecutive True values."""
-    onsets, run = [], 0
-    for index, value in enumerate(bad):
-        run = run+1 if value else 0
-        if run == patience:
-            onsets.append(index-patience+1)
-    return onsets
-
-
 def returned_after(arc, distance, start):
     """Travel at which the trace stays within RETURN_DISTANCE for RETURN_LENGTH voxels, or None."""
     begin = None
@@ -282,7 +297,7 @@ def geometric_outcomes(path, fiber, t0, sign, *, tolerance=3.0):
         bad = ~(distance <= threshold)
         cursor = 0
         while True:
-            onsets = [o for o in sustained_onsets(bad[cursor:]) if o >= 0]
+            onsets = [o for o in sustained_onsets(arc[cursor:], bad[cursor:]) if o >= 0]
             if not onsets:
                 break
             onset = cursor+onsets[0]

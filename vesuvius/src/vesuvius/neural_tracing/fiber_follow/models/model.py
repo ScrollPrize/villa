@@ -35,13 +35,16 @@ class CoordinateRegressionConfig:
     stem_channels: int = 32
     stem_blocks: int = 2
     stem: str = 'residual'  # 'residual' full-resolution stem, or 'stride2' light stem
-    memory: str = 'slabs'  # 'slabs' separate historical-slab CNN, or 'decisions' encoder features of past decisions
+    # 'slabs' separate historical-slab CNN, 'decisions' encoder features of past decisions, or 'none' (no memory:
+    # no memory tokens, memory attention or memory inputs; the current crop and observed path only)
+    memory: str = 'slabs'
     identity_dim: int = 0  # >0 (decision memory): linear projection for the memory-identity InfoNCE loss
     identity_temperature: float = .1
-    # 'infonce' (with identity_dim) or 'verify': a memory-conditioned on-fiber verifier (identity_verifier.py).
+    # 'infonce' (with identity_dim), 'verify': a memory-conditioned on-fiber verifier (identity_verifier.py),
+    # or 'readout': path-blind appearance-key memory read out per location (identity_readout.py).
     identity_objective: str = 'infonce'
-    identity_map: bool = False  # verify: the dense identity field enters the decoder/scorer image tokens
-    identity_feedback: bool = False  # verify: field samples enter scorer segment queries and retry fusion
+    identity_map: bool = False  # verify/readout: the dense identity field enters the decoder/scorer image tokens
+    identity_feedback: bool = False  # verify/readout: field samples enter scorer segment queries and retry fusion
     frame_checkpoint: str | None = None  # frozen heading/normal model used by crop builders
     frame_checkpoint_sha256: str | None = None
 
@@ -53,14 +56,14 @@ class CoordinateRegressionConfig:
             raise ValueError('Identity projection width must be a nonnegative integer and its temperature positive')
         if self.identity_dim and self.memory != 'decisions':
             raise ValueError('The memory-identity loss requires decision memory')
-        if self.identity_objective not in ('infonce', 'verify'):
-            raise ValueError("Identity objective must be 'infonce' or 'verify'")
-        if self.identity_objective == 'verify' and (self.memory != 'decisions' or self.identity_dim):
+        if self.identity_objective not in ('infonce', 'verify', 'readout'):
+            raise ValueError("Identity objective must be 'infonce', 'verify' or 'readout'")
+        if self.identity_objective in ('verify', 'readout') and (self.memory != 'decisions' or self.identity_dim):
             raise ValueError('Identity verification requires decision memory and no InfoNCE projection')
-        if (self.identity_map or self.identity_feedback) and self.identity_objective != 'verify':
-            raise ValueError('The identity field requires the verification objective')
-        if self.stem not in ('residual', 'stride2') or self.memory not in ('slabs', 'decisions'):
-            raise ValueError("Stem must be 'residual' or 'stride2'; memory must be 'slabs' or 'decisions'")
+        if (self.identity_map or self.identity_feedback) and self.identity_objective not in ('verify', 'readout'):
+            raise ValueError('The identity field requires the verification or readout objective')
+        if self.stem not in ('residual', 'stride2') or self.memory not in ('slabs', 'decisions', 'none'):
+            raise ValueError("Stem must be 'residual' or 'stride2'; memory must be 'slabs', 'decisions' or 'none'")
         if type(self.stem_channels) is not int or self.stem_channels < 1 or type(self.stem_blocks) is not int or self.stem_blocks < 1:
             raise ValueError('Stem channels must be a positive integer and stem blocks a positive integer')
         if isinstance(self.fine, dict):
@@ -114,13 +117,27 @@ class CoordinateRegressionConfig:
 
     @property
     def identity_mode(self):
-        """Which memory-identity training targets this model consumes, if any."""
-        if self.identity_objective == 'verify':
+        """Which memory-identity training targets this model consumes, if any (readout uses the verifier's)."""
+        if self.identity_objective in ('verify', 'readout'):
             return 'verify'
         return 'infonce' if self.identity_dim else None
 
+    @property
+    def memory_entry_shape(self):
+        """(rows, width) of one decision-memory entry: encoder samples, then packed readout keys."""
+        from .decision_memory import ENTRY_FEATURES
+        rows = ENTRY_FEATURES
+        if self.identity_objective == 'readout':
+            from .identity_readout import key_rows
+            rows += key_rows(self.hidden)
+        return rows, self.hidden
+
     def to_dict(self):
         return asdict(self)
+
+
+# Readout identity memory passed alongside precomputed history tokens (training, see train.training_prediction).
+READOUT_MEMORY = ('identity_memory_keys', 'identity_memory_padding', 'identity_memory_role')
 
 
 def build_model(cfg):
@@ -132,12 +149,14 @@ def build_model(cfg):
     return CoordinateRegressionFollower(cfg)
 
 
-def select_refinement(output, cfg, confidence_threshold=DEFAULT_CONFIDENCE, n_commit=None):
+def select_refinement(output, cfg, confidence_threshold=DEFAULT_CONFIDENCE, n_commit=None, *, retry=True):
     """Longest acceptable prefix, then confidence at its end, then earlier pass.
 
     If every proposal stops, select the best first-point confidence among valid
     connections; the unchanged commit gate still stops. Selection never splices
     paths or transfers one proposal's confidence to another proposal.
+    With ``retry`` (default) proposals after the first accepted one are ignored, so later
+    proposals act only as retries; without it the same ranking runs over all proposals.
     """
     if not 0 <= confidence_threshold <= 1:
         raise ValueError('Confidence threshold must lie in [0, 1]')
@@ -146,7 +165,7 @@ def select_refinement(output, cfg, confidence_threshold=DEFAULT_CONFIDENCE, n_co
     counts, allowed = commit_prefix(curves, confidence, confidence_threshold, window, cfg.max_recovery_distance)
     accepted = (confidence[..., -1] >= confidence_threshold) & allowed & output['refinement_mask']
     prior_accept = torch.cat((torch.zeros_like(accepted[:, :1]), accepted[:, :-1]), 1).long().cumsum(1) > 0
-    valid = output['refinement_mask'] & ~prior_accept
+    valid = output['refinement_mask'] & ~prior_accept if retry else output['refinement_mask'].bool()
     longest = counts.masked_fill(~valid, -1).max(-1, keepdim=True).values
     score = confidence.gather(-1, (counts-1).clamp_min(0)[..., None]).squeeze(-1)
     score = score.nan_to_num(nan=-torch.inf).masked_fill((counts != longest) | ~allowed | ~valid, -torch.inf)
@@ -156,6 +175,11 @@ def select_refinement(output, cfg, confidence_threshold=DEFAULT_CONFIDENCE, n_co
     for name in ('points', 'hazard_logits', 'confidence_logits', 'confidence'):
         result[name] = output['refinement_'+name][index, selected]
     return result
+
+
+def select_history(projected, keep):
+    """Active rows of projected memory K/V (None without memory)."""
+    return None if projected is None else tuple(v[keep] for v in projected)
 
 
 def device_vector(like, values):
@@ -295,7 +319,8 @@ class PathDecoderLayer(nn.TransformerDecoderLayer):
             x = x+self._sa_block(self.norm1(x), None, self_padding, is_causal=False)
             x = x.reshape(b, draws*planes, width)
             x = self.cross_attention(x, kv, padding)
-            x = history_attention.forward_cached(x, *history)
+            if history is not None:
+                x = history_attention.forward_cached(x, *history)
             x = x+self._ff_block(self.norm3(x))
             return x.reshape(b, draws, planes, width)
         shift, scale, gate = modulation[:, :, None].unbind(-2)  # each (B, D, 1, 4, H)
@@ -306,8 +331,9 @@ class PathDecoderLayer(nn.TransformerDecoderLayer):
                                        None, self_padding, is_causal=False), 0)
         x = residual(x, self.dropout2(self.cross_attention_value(
             branch_input(x, self.norm2, 1).reshape(b, draws*planes, width), kv, padding)), 1)
-        x = residual(x, history_attention.attend(
-            branch_input(x, history_attention.norm, 2).reshape(b, draws*planes, width), *history), 2)
+        if history is not None:
+            x = residual(x, history_attention.attend(
+                branch_input(x, history_attention.norm, 2).reshape(b, draws*planes, width), *history), 2)
         return residual(x, self._ff_block(branch_input(x, self.norm3, 3)), 3)
 
 
@@ -360,15 +386,25 @@ class ObservationFollower(nn.Module):
             if cfg.identity_objective == 'verify':
                 from .identity_verifier import IdentityVerifier
                 self.identity_verifier = IdentityVerifier(cfg)
-            if cfg.identity_map:
+            if cfg.identity_objective == 'readout':
+                from .identity_readout import IdentityReadout, FEATURE_DIM
+                self.identity_readout = IdentityReadout(cfg)
+                if cfg.identity_map:
+                    # Readout features and logit per token; zero output keeps a warm start exact.
+                    self.identity_readout_embedding = nn.Sequential(nn.LayerNorm(FEATURE_DIM+1),
+                                                                    nn.Linear(FEATURE_DIM+1, cfg.hidden))
+                    nn.init.zeros_(self.identity_readout_embedding[-1].weight)
+                    nn.init.zeros_(self.identity_readout_embedding[-1].bias)
+            elif cfg.identity_map:
                 # Zero output: a warm-started model initially computes what it did without the field.
                 self.identity_embedding = nn.Sequential(nn.Linear(1, cfg.hidden), nn.SiLU(),
                                                         nn.Linear(cfg.hidden, cfg.hidden))
                 nn.init.zeros_(self.identity_embedding[-1].weight)
                 nn.init.zeros_(self.identity_embedding[-1].bias)
-        else:
+        elif cfg.memory == 'slabs':
             self.history_encoder = HistoryEncoder(cfg)
-        self.history_attention = HistoryAttention(cfg.hidden, cfg.heads)
+        if cfg.memory != 'none':
+            self.history_attention = HistoryAttention(cfg.hidden, cfg.heads)
         self.confidence_scorer = SegmentSurvivalScorer(cfg)
         self.path_geometry = PathGeometryTokens(cfg)
         self.register_buffer('planes', torch.arange(1,cfg.n_future+1).float()*cfg.future_step, persistent=False)
@@ -382,10 +418,12 @@ class ObservationFollower(nn.Module):
         references = torch.where(mask[...,None],references.float(),0.)
         return references, mask
 
-    def context_from_features(self, x, hist, references, mask, dense, deep, identity=None):
+    def context_from_features(self, x, hist, references, mask, dense, deep, identity=None, identity_tokens=None):
         cfg = self.cfg
         image_tokens = deep.flatten(2).transpose(1,2)
-        if identity is not None and cfg.identity_map:
+        if identity_tokens is not None:
+            image_tokens = image_tokens+identity_tokens.to(image_tokens.dtype)
+        elif identity is not None and cfg.identity_map:
             embedding = self.identity_embedding(identity.flatten(2).transpose(1, 2).to(image_tokens.dtype))
             image_tokens = image_tokens+embedding.to(image_tokens.dtype)
         sampling_dense = dense.float() if cfg.recurrent_refinement_steps else dense
@@ -434,34 +472,62 @@ class ObservationFollower(nn.Module):
         values, support = self.sample_local(ctx.get('deep_fp32', ctx['deep']), points)
         return torch.cat((values.to(ctx['deep'].dtype), support[..., None]), -1)
 
-    def encode_history(self, x, return_anchors=False):
-        """Memory tokens and padding; with ``return_anchors`` also each entry's feature at its own head."""
+    def encode_history(self, x, return_anchors=False, return_identity=False):
+        """Memory tokens and padding; with ``return_anchors`` also each entry's feature at its own head,
+        with ``return_identity`` also the readout identity memory (a dict, empty for other objectives)."""
+        if self.cfg.memory == 'none':
+            out = (None, None, None) if return_anchors else (None, None)
+            return (*out, {}) if return_identity else out
         extra = {key: x['history_'+key] for key in ('path_points', 'path_tangents', 'path_valid')}
         if self.cfg.memory == 'slabs':
-            return self.history_encoder(x['history_slabs'], x['history_valid'], x['history_pose'], **extra)
-        from .decision_memory import ANCHOR_FEATURE
+            out = self.history_encoder(x['history_slabs'], x['history_valid'], x['history_pose'], **extra)
+            return (*out, {}) if return_identity else out
+        from .decision_memory import ANCHOR_FEATURE, ENTRY_FEATURES
         features = self.memory_features(x)
-        tokens, padding = self.history_encoder(features, x['history_valid'], x['history_pose'], **extra)
-        return (tokens, padding, features[:, :, ANCHOR_FEATURE]) if return_anchors else (tokens, padding)
+        tokens, padding = self.history_encoder(features[:, :, :ENTRY_FEATURES], x['history_valid'], x['history_pose'], **extra)
+        out = (tokens, padding, features[:, :, ANCHOR_FEATURE]) if return_anchors else (tokens, padding)
+        if return_identity:
+            out = (*out, self.identity_memory(features, x['history_valid'], x['history_pose']))
+        return out
+
+    def identity_memory(self, features, valid, pose):
+        """Readout memory (keys, padding, slot roles) from entry rows past the encoder samples."""
+        if self.cfg.identity_objective != 'readout':
+            return {}
+        from .decision_memory import ENTRY_FEATURES
+        from .identity_readout import unpack_keys
+        return self.identity_readout.memory(unpack_keys(features[:, :, ENTRY_FEATURES:]), valid.bool(), pose)
 
     def verification_terms(self, ctx, x, predicted=None):
         """Verifier logits at every identity query, with gradient into the current crop, the memory
         tokens and the verifier: the crossing candidates (flattened), the dense samples and this
         decision's own (detached) predicted path. Two gradient-free controls re-score the same queries
         with the previous row's memory (another state) and with no memory at all."""
-        if getattr(self, 'identity_verifier', None) is None or 'identity_candidates' not in x:
+        readout = getattr(self, 'identity_readout', None)
+        if (getattr(self, 'identity_verifier', None) is None and readout is None) or 'identity_candidates' not in x:
             return {}
-        verifier = self.identity_verifier
         b = len(x['identity_candidates'])
         predicted = (x['identity_candidates'].new_zeros(b, 0, 3) if predicted is None
                      else predicted.detach().to(x['identity_candidates'].dtype))
         points = torch.cat((x['identity_candidates'].reshape(b, -1, 3), x['identity_samples'], predicted), 1)
-        values, support = self.sample_local(ctx.get('deep_fp32', ctx['deep']).float(), points)
-        tokens, padding = ctx['history_tokens'], ctx['history_padding']
-        logits = verifier(values, points, verifier.project(tokens, padding))
-        with torch.no_grad():
-            shuffled = verifier(values, points, verifier.project(tokens.roll(1, 0), padding.roll(1, 0)))
-            empty = verifier(values, points, verifier.project(tokens, torch.ones_like(padding)))
+        if readout is not None:
+            # Current keys at the query points; no position of the point enters.
+            values, support = self.sample_local(ctx['identity_keys'].float(), points)
+            memory = ctx['identity_memory']
+            logits = readout(values, readout.project(memory))[1]
+            with torch.no_grad():
+                rolled = {key: value.roll(1, 0) for key, value in memory.items()}
+                shuffled = readout(values, readout.project(rolled))[1]
+                blank = dict(memory, identity_memory_padding=torch.ones_like(memory['identity_memory_padding']))
+                empty = readout(values, readout.project(blank))[1]
+        else:
+            verifier = self.identity_verifier
+            values, support = self.sample_local(ctx.get('deep_fp32', ctx['deep']).float(), points)
+            tokens, padding = ctx['history_tokens'], ctx['history_padding']
+            logits = verifier(values, points, verifier.project(tokens, padding))
+            with torch.no_grad():
+                shuffled = verifier(values, points, verifier.project(tokens.roll(1, 0), padding.roll(1, 0)))
+                empty = verifier(values, points, verifier.project(tokens, torch.ones_like(padding)))
         # The shuffled control is meaningful only with a real row of another fiber (padding repeats row 0).
         rows = x.get('identity_row', torch.ones(b, dtype=torch.bool, device=points.device)).bool()
         fiber = x.get('identity_fiber', torch.arange(b, device=points.device))
@@ -522,17 +588,16 @@ class ObservationFollower(nn.Module):
                     identity_control_pairs=control_valid, identity_control_correct=control_correct)
 
     def memory_features(self, x):
-        """(B, SLOTS, ENTRY_FEATURES, C): recorded entries, plus entries encoded here from crops.
+        """(B, SLOTS, *cfg.memory_entry_shape): recorded entries, plus entries encoded here from crops.
 
         ``history_features`` holds entries recorded at earlier decisions (zeros elsewhere).
         Slots flagged in ``history_encode`` have no recorded decision; their crops are encoded
         by this model's own encoder without gradient, exactly as at a decision.
         """
-        from .decision_memory import ENTRY_FEATURES
         valid = x['history_valid']
         features = x.get('history_features')
         if features is None:
-            features = valid.new_zeros((*valid.shape, ENTRY_FEATURES, self.cfg.hidden), dtype=torch.bfloat16)
+            features = valid.new_zeros((*valid.shape, *self.cfg.memory_entry_shape), dtype=torch.bfloat16)
         encode = x.get('history_encode')
         if encode is not None and encode.any():
             rows = encode.flatten().nonzero().flatten()
@@ -552,33 +617,71 @@ class ObservationFollower(nn.Module):
         with torch.no_grad():
             for start in range(0, len(crops), MEMORY_CHUNK):
                 part = slice(start, start+MEMORY_CHUNK)
-                _, deep, _ = self.encoder(crops[part], references[part], mask[part])
-                out.append(self.history_encoder.entry_features(deep, points[part], valid[part]))
+                if self.cfg.identity_objective == 'readout':
+                    _, deep, stem = self.encoder.encode(crops[part], references[part], mask[part], return_stem=True)
+                    keys = self.identity_readout.key_head(stem)
+                else:
+                    _, deep, _ = self.encoder(crops[part], references[part], mask[part])
+                    keys = None
+                out.append(self.memory_entry(deep, keys, points[part], valid[part]))
         return torch.cat(out)
 
-    def current_memory_entry(self, deep, hist, hmask):
+    def memory_entry(self, deep, keys, path_points, path_valid):
+        """One decision's entry rows: encoder samples, then (readout) its packed keys around its head."""
+        entry = self.history_encoder.entry_features(deep, path_points, path_valid)
+        if keys is None:
+            return entry
+        from .identity_readout import pack_keys
+        sampled = self.identity_readout.entry_keys(keys.detach(), self.sample_local)
+        return torch.cat((entry, pack_keys(sampled, self.cfg.hidden).to(entry.dtype)), 1)
+
+    def current_memory_entry(self, deep, hist, hmask, keys=None):
         """This decision's own entry, as later decisions of the same trace will read it."""
         path = torch.stack((hist[:, 1], hist[:, 0], torch.zeros_like(hist[:, 0])), 1)
         valid = torch.stack((hmask[:, 1] > 0, hmask[:, 0] > 0, torch.ones_like(hmask[:, 0], dtype=torch.bool)), 1)
-        return self.history_encoder.entry_features(deep.detach(), path, valid)
+        return self.memory_entry(deep.detach(), keys, path, valid)
+
+    def readout_field(self, keys, memory):
+        """Readout at every token: (B, N, FEATURE_DIM+1) features and logit, and the detached probability field."""
+        readout = self.identity_readout
+        features, logits = readout(keys.flatten(2).transpose(1, 2), readout.project(memory))
+        field = torch.sigmoid(logits.detach()).reshape(len(keys), 1, *keys.shape[-3:])
+        return torch.cat((features, logits[..., None]), -1), field
 
     def context(self, x, hist, hmask):
+        cfg = self.cfg
         references, mask = self.references(x, hist, hmask)
-        dense, deep, _ = self.encoder(x['fine'], references, mask)
+        readout = cfg.identity_objective == 'readout'
+        if readout:
+            dense, deep, stem = self.encoder.encode(x['fine'], references, mask, return_stem=True)
+        else:
+            dense, deep, _ = self.encoder(x['fine'], references, mask)
         if 'history_tokens' in x:
             tokens, padding = x['history_tokens'], x['history_padding']
+            memory = {key: x[key] for key in READOUT_MEMORY if key in x}
         else:
-            tokens, padding = self.encode_history(x)
-        identity = None
-        if self.cfg.identity_map or self.cfg.identity_feedback:
+            tokens, padding, memory = self.encode_history(x, return_identity=True)
+        identity = identity_tokens = keys = None
+        if readout:
+            keys = self.identity_readout.key_head(stem)
+            if cfg.identity_map or cfg.identity_feedback:
+                features, identity = self.readout_field(keys, memory)
+                if cfg.identity_map:
+                    identity_tokens = self.identity_readout_embedding(features)
+        elif cfg.identity_map or cfg.identity_feedback:
             from .identity_verifier import identity_field
             identity = identity_field(self, deep, tokens, padding)
-        ctx = self.context_from_features(x, hist, references, mask, dense, deep, identity)
+        ctx = self.context_from_features(x, hist, references, mask, dense, deep, identity, identity_tokens)
+        if readout:
+            ctx.update(identity_keys=keys, identity_memory=memory)
+        if tokens is None:  # memory 'none': decoder and scorer read only the current observations
+            ctx['history_projected'] = ctx['confidence_history_projected'] = None
+            return ctx
         ctx['history_tokens'], ctx['history_padding'] = tokens, padding
         history = (ctx['history_tokens'], ctx['history_padding'])
         ctx['history_projected'] = self.history_attention.project_memory(*history)
         if self.cfg.memory == 'decisions':
-            ctx['memory_entry'] = self.current_memory_entry(deep, hist, hmask)
+            ctx['memory_entry'] = self.current_memory_entry(deep, hist, hmask, keys)
         ctx['confidence_history_projected'] = self.confidence_scorer.history_attention.project_memory(*history)
         return ctx
 
@@ -705,8 +808,8 @@ class CoordinateRegressionFollower(ObservationFollower):
                               ('fine', 'deep', 'fine_fp32', 'deep_fp32', 'confidence_padding',
                                'history_tokens', 'history_padding', 'identity_field') if key in active_ctx} | dict(
                     confidence_projected=PathDecoderLayer.select_memory(active_ctx['confidence_projected'], keep),
-                    history_projected=tuple(v[keep] for v in active_ctx['history_projected']),
-                    confidence_history_projected=tuple(v[keep] for v in active_ctx['confidence_history_projected']))
+                    history_projected=select_history(active_ctx['history_projected'], keep),
+                    confidence_history_projected=select_history(active_ctx['confidence_history_projected'], keep))
             decoded, points = self.refine_prediction(active_ctx, points, decoded, hazards, confidence,
                 projected, padding, self.refinement_stage.weight[stage])
             refinements.append(refinements[-1].index_copy(0, indices, points))
@@ -770,5 +873,5 @@ class CoordinateRegressionFollower(ObservationFollower):
     def decode_cached(self, query, projected, padding, ctx):
         for layer, kv in zip(self.decoder.layers, projected):
             query = layer.forward_cached(query, kv, padding,
-                history=ctx['history_projected'], history_attention=self.history_attention)
+                history=ctx['history_projected'], history_attention=getattr(self, 'history_attention', None))
         return self.decoder.norm(query)

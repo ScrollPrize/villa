@@ -115,12 +115,14 @@ def training_inputs(x, hist, hmask, size):
     b = len(hist)
     defaults = dict(seed=hist.new_zeros(b, 1, 3), seed_mask=hist.new_zeros(b, 1),
                     seed_tangent=hist.new_zeros(b, 3), seed_age=hist.new_zeros(b))
-    names = ('fine', 'seed', 'seed_mask', 'seed_tangent', 'seed_age',
-             'history_tokens', 'history_padding')
+    names = ('fine', 'seed', 'seed_mask', 'seed_tangent', 'seed_age')
+    if 'history_tokens' in x:  # absent without memory
+        names += ('history_tokens', 'history_padding')
     # Optional observed-path geometry exists only for models that consume it; identity
     # points/anchors only for the memory-identity loss.
-    names += tuple(name for name in ('path_geometry', 'path_geometry_valid', *IDENTITY_INPUTS, *VERIFY_INPUTS)
-                   if name in x)
+    from vesuvius.neural_tracing.fiber_follow.models.model import READOUT_MEMORY
+    names += tuple(name for name in ('path_geometry', 'path_geometry_valid', *IDENTITY_INPUTS, *VERIFY_INPUTS,
+                                     *READOUT_MEMORY) if name in x)
     image = {name: fixed_rows(x[name] if name in x else defaults[name], size) for name in names}
     return image, fixed_rows(hist, size), fixed_rows(hmask, size)
 
@@ -154,16 +156,18 @@ def training_prediction(model, x, hist, hmask, confidence_threshold=.5, n_commit
         identity = {key: targets[key] for key in IDENTITY_INPUTS[:3]}
         identity['identity_anchor_features'] = anchors.detach()
     else:
-        tokens, padding = model.encode_history(x)
+        # Readout identity memory travels with the history tokens (empty for other objectives).
+        tokens, padding, readout = model.encode_history(x, return_identity=True)
+        identity = dict(readout)
         if model.cfg.identity_mode == 'verify' and targets is not None and 'identity_candidates' in targets:
-            identity = {key: targets[key] for key in VERIFY_INPUTS}
+            identity.update({key: targets[key] for key in VERIFY_INPUTS})
     if hist.is_cuda:
         timing[1].record()
-    if hasattr(model, '_history_timings'):
+    if hasattr(model, '_history_timings') and tokens is not None:
         model._history_timings.append(timing if hist.is_cuda else time.perf_counter()-timing)
-    image, history, mask = training_inputs(dict(x, history_tokens=tokens, history_padding=padding, **identity),
-                                           hist, hmask, size)
-    if identity:
+    memory = {} if tokens is None else dict(history_tokens=tokens, history_padding=padding)
+    image, history, mask = training_inputs(dict(x, **memory, **identity), hist, hmask, size)
+    if any(key in identity for key in (*IDENTITY_INPUTS, *VERIFY_INPUTS)):
         # Padding repeats row 0; the identity loss must see which rows are real and their fibers.
         image['identity_row'] = torch.arange(size, device=hist.device) < actual
         image['identity_fiber'] = fixed_rows(targets['fiber_id'], size)
@@ -245,15 +249,18 @@ def model_config_from_args(args, checkpoint=None):
     return cls(**options)
 
 
-def load_matching_weights(model, state):
+def load_matching_weights(model, state, exclude=()):
     """Load tensors whose names and shapes match; new residual branches start at zero.
+
+    Tensors whose names start with an ``exclude`` prefix keep their initialization.
 
     Returns the parameter/buffer names left at initialization. An encoder axial block or
     image stem without loaded weights gets zero residual outputs, so the warm-started
     network initially computes what the loaded tensors compute without them.
     """
     own = model.state_dict()
-    matched = {k: v for k, v in state.items() if k in own and own[k].shape == v.shape}
+    matched = {k: v for k, v in state.items() if k in own and own[k].shape == v.shape
+               and not any(k.startswith(prefix) for prefix in exclude)}
     model.load_state_dict(matched, strict=False)
     fresh = sorted(set(own)-set(matched))
     with torch.no_grad():
@@ -268,19 +275,19 @@ def load_matching_weights(model, state):
     return fresh
 
 
-def initialize_model_weights(cfg, device, initial=None, partial=False):
+def initialize_model_weights(cfg, device, initial=None, partial=False, exclude=()):
     """Weight-only initialization never inherits optimizer, replay or run settings."""
     model = build_model(cfg).to(device, memory_format=conv_memory_format(device))
     fresh = []
     if initial is not None:
         if partial:
-            fresh = load_matching_weights(model, initial['model'])
+            fresh = load_matching_weights(model, initial['model'], exclude)
         else:
             model.load_state_dict(initial['model'], strict=True)
     ema = copy.deepcopy(model).requires_grad_(False).eval()
     if initial is not None:
         if partial:
-            load_matching_weights(ema, initial['ema'])
+            load_matching_weights(ema, initial['ema'], exclude)
         else:
             ema.load_state_dict(initial['ema'], strict=True)
     model.reinitialized_tensors = fresh
@@ -290,7 +297,8 @@ def initialize_model_weights(cfg, device, initial=None, partial=False):
 def load_checkpoint(path,device='cuda'):
     # Collection shares a GPU with training. Keep duplicate weights and any
     # optimizer state on the CPU; only the EMA inference model needs VRAM.
-    ck = read_checkpoint(path,MODEL_TYPES,'cpu')
+    from vesuvius.neural_tracing.fiber_follow.shared.paths import relocate_checkpoint
+    ck = relocate_checkpoint(read_checkpoint(path,MODEL_TYPES,'cpu'))
     cfg = checkpoint_config(ck)
     model = build_model(cfg).to(device,memory_format=conv_memory_format(device))
     model.load_state_dict(ck['ema'])
@@ -425,6 +433,8 @@ def clip_training_gradients(model, history_max_norm=HISTORY_GRAD_CLIP, rest_max_
     memory_ids = {id(p) for p in memory.parameters()} if memory is not None else set()
     groups = dict(history=[p for p in parameters if id(p) in memory_ids],
                   rest=[p for p in parameters if id(p) not in memory_ids])
+    if memory is None:  # no memory encoder: a single clipping group
+        del groups['history']
     norms = {name: torch.nn.utils.get_total_norm(
         [p.grad for p in params if p.grad is not None], error_if_nonfinite=True)
         for name, params in groups.items()}
@@ -486,19 +496,20 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
             if bool(recorded.any()):
                 if live_continuation is None:
                     raise ValueError('Recorded decision memory requires the live continuation store')
-                features, found = live_continuation.attach_memory(batch['x'], model.cfg.hidden)
+                features, found = live_continuation.attach_memory(batch['x'], model.cfg.memory_entry_shape)
                 missing = recorded & ~found
                 batch['x']['history_features'] = features
                 batch['x']['history_valid'] = batch['x']['history_valid'] & ~missing
                 sums['memory_recorded'] = sums.get('memory_recorded', 0)+int(found.sum())
                 sums['memory_missing'] = sums.get('memory_missing', 0)+int(missing.sum())
             sums['memory_encoded'] = sums.get('memory_encoded', 0)+int(cpu['x']['history_encode'].sum())
-        valid = cpu['x']['history_valid']
-        for name, value in dict(history_valid_slabs=valid.sum(),
-                history_age_sum=cpu['x']['history_ages'][valid].sum(),
-                history_overlap_sum=cpu['x']['history_overlap'][valid].sum(),
-                history_load_seconds=cpu['x']['history_load_seconds'].sum()).items():
-            sums[name] = sums.get(name, 0.)+float(value)
+        if 'history_valid' in cpu['x']:  # memory inputs (absent without memory)
+            valid = cpu['x']['history_valid']
+            for name, value in dict(history_valid_slabs=valid.sum(),
+                    history_age_sum=cpu['x']['history_ages'][valid].sum(),
+                    history_overlap_sum=cpu['x']['history_overlap'][valid].sum(),
+                    history_load_seconds=cpu['x']['history_load_seconds'].sum()).items():
+                sums[name] = sums.get(name, 0.)+float(value)
         if diagnostic is not None:
             diagnostic.update(cpu_batch=cpu)
         with torch.autocast('cuda', dtype=torch.bfloat16, enabled=torch.device(device).type == 'cuda'):
@@ -591,8 +602,9 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
             rows = per_state[offset:offset+len(cpu['hist'])]
             offset += len(cpu['hist'])
             ledger.add(cpu, step, rows.T.tolist())
-    sums['history_encode_seconds'] = sum(t[0].elapsed_time(t[1])/1000 if isinstance(t, tuple) else t
-                                         for t in model._history_timings)
+    if model._history_timings:
+        sums['history_encode_seconds'] = sum(t[0].elapsed_time(t[1])/1000 if isinstance(t, tuple) else t
+                                             for t in model._history_timings)
     # The summed loss is finite only if every batch loss was; checked before any update.
     if not math.isfinite(sums['loss']):
         raise FloatingPointError(f'Nonfinite loss at step {step}')
@@ -605,10 +617,11 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
                 observation_only_states=observed-total, optimizer_applied=bool(total),
                 positive_confidence_targets=float(per_state[:, 0].sum()),
                 negative_confidence_targets=float(per_state[:, 1].sum()))
-    slab_count = max(1., sums['history_valid_slabs'])
-    sums.update(history_age_mean=sums['history_age_sum']/slab_count,
-                history_overlap_mean=sums['history_overlap_sum']/slab_count,
-                history_valid_slabs_mean=sums['history_valid_slabs']/denominator)
+    if 'history_valid_slabs' in sums:
+        slab_count = max(1., sums['history_valid_slabs'])
+        sums.update(history_age_mean=sums['history_age_sum']/slab_count,
+                    history_overlap_mean=sums['history_overlap_sum']/slab_count,
+                    history_valid_slabs_mean=sums['history_valid_slabs']/denominator)
     sums['refinement_attempts_mean'] = sums.get('refinement_attempts_sum', 0.)/denominator
     sums.update(error_mean=sums['error_sum']/max(1., sums['geometry_count']) if sums['geometry_count'] else None,
                 prefix_correct_fraction=sums['correct_count']/max(1., sums['confidence_count']))
@@ -693,9 +706,10 @@ def build_parser():
     ap.add_argument('--axial-layers', type=int, default=CoordinateRegressionConfig.layers)
     ap.add_argument('--stem', choices=('residual', 'stride2'), default=CoordinateRegressionConfig.stem,
                     help="Image stem: 'residual' full-resolution stem, or 'stride2' light stem")
-    ap.add_argument('--memory', choices=('slabs', 'decisions'), default=CoordinateRegressionConfig.memory,
-                    help="History memory: 'slabs' separate slab CNN, or 'decisions' main-encoder entries "
-                         "of earlier decisions (live chains start at seeds and reuse recorded entries)")
+    ap.add_argument('--memory', choices=('slabs', 'decisions', 'none'), default=CoordinateRegressionConfig.memory,
+                    help="History memory: 'slabs' separate slab CNN, 'decisions' main-encoder entries "
+                         "of earlier decisions (live chains start at seeds and reuse recorded entries), or 'none' "
+                         "(no memory inputs, tokens or attention; incompatible with the identity objectives)")
     ap.add_argument('--chain-seed-fraction', type=float, default=0.,
                     help='With --memory decisions: start live chains at a seed within this leading fraction '
                          'of the traversal (0 keeps the ordinary fresh location)')
@@ -705,16 +719,18 @@ def build_parser():
     ap.add_argument('--identity-temperature', type=float, default=CoordinateRegressionConfig.identity_temperature)
     ap.add_argument('--identity-weight', type=float, default=.1,
                     help='Memory-identity loss coefficient (InfoNCE or verification)')
-    ap.add_argument('--identity-objective', choices=('infonce', 'verify'),
+    ap.add_argument('--identity-objective', choices=('infonce', 'verify', 'readout'),
                     default=CoordinateRegressionConfig.identity_objective,
-                    help="With --memory decisions: 'infonce' (needs --identity-dim) or 'verify', a verifier that "
-                         "reads decision-memory tokens and labels current-crop locations on/off the original fiber")
+                    help="With --memory decisions: 'infonce' (needs --identity-dim); 'verify', a verifier that "
+                         "reads decision-memory tokens and labels current-crop locations on/off the original fiber; "
+                         "or 'readout', path-blind appearance keys stored per decision and read out per location "
+                         "(same labels and loss as verify)")
     ap.add_argument('--identity-map', action=argparse.BooleanOptionalAction,
                     default=CoordinateRegressionConfig.identity_map,
-                    help='With --identity-objective verify: add the dense identity field to decoder/scorer image tokens')
+                    help='With --identity-objective verify/readout: add the dense identity field to decoder/scorer image tokens')
     ap.add_argument('--identity-feedback', action=argparse.BooleanOptionalAction,
                     default=CoordinateRegressionConfig.identity_feedback,
-                    help='With --identity-objective verify: feed identity-field samples to scorer segments and retries')
+                    help='With --identity-objective verify/readout: feed identity-field samples to scorer segments and retries')
     ap.add_argument('--identity-exclude-synthetic', action=argparse.BooleanOptionalAction, default=False,
                     help='With --identity-objective verify: synthetic switch states (synthetic_terminal/'
                          'synthetic_identity) only evaluate the verifier; its loss uses real states')
@@ -729,6 +745,9 @@ def build_parser():
     ap.add_argument('--init-partial', action='store_true',
                     help='With --init-weights: build the model from these options and load only tensors whose '
                          'names and shapes match; new axial blocks and the new stem start as identity residuals')
+    ap.add_argument('--init-exclude', action='append', default=[], metavar='PREFIX',
+                    help='With --init-partial: keep the initialization of tensors whose names start with PREFIX '
+                         '(repeatable), e.g. zero-initialized heads whose input changed meaning')
     ap.add_argument('--hidden', type=int, default=CoordinateRegressionConfig.hidden)
     ap.add_argument('--encoder-ffn', type=int, default=CoordinateRegressionConfig.encoder_ffn,
                     help='Axial image encoder feed-forward width')
@@ -840,7 +859,7 @@ def validate_resume_options(args, recorded_options):
     # an omitted CLI flag must not prevent resuming that recorded selection.
     # Initialization is historical provenance, not a resume-time input.
     # Operational settings may change on resume; sampling and label semantics may not.
-    ignored = {'resume','init_weights','init_partial','reset_optimizer','lr','steps','frame_checkpoint','out_root','device','batch','grad_steps','workers','threads','dagger_threads','worker_cache_gb','dataset_config',
+    ignored = {'resume','init_weights','init_partial','init_exclude','reset_optimizer','lr','steps','frame_checkpoint','out_root','device','batch','grad_steps','workers','threads','dagger_threads','worker_cache_gb','dataset_config',
                'remote_prefetch_connections','remote_prefetch_queue_size','remote_prefetch_timeout','remote_prefetch_lookahead',
                'log_every','ckpt_every','diag_every','batch_diag_every','dagger_device','dagger_batch','dagger_forward_chunk',
                'negative_bank_refresh_seconds','negative_bank_cache_mb','activation_checkpointing',
@@ -905,6 +924,8 @@ def main(argv=None):
     if resume is not None and resume.get('kind') == 'weights':
         raise ValueError('Weight-only files require --init-weights, not --resume')
     initial = read_checkpoint(args.init_weights,MODEL_TYPES,'cpu') if args.init_weights else None
+    if args.init_exclude and not args.init_partial:
+        raise ValueError('--init-exclude requires --init-partial')
     if args.init_partial and not args.init_weights:
         raise ValueError('--init-partial requires --init-weights')
     if not 0 <= args.chain_seed_fraction <= 1:
@@ -1033,7 +1054,8 @@ def main(argv=None):
     fit_flow_scales = isinstance(cfg, FlowConfig) and not cfg.flow_sigma
     if fit_flow_scales:
         cfg.flow_sigma = tuple((cfg.flow_sigma_floor,)*2 for _ in range(cfg.n_future))
-    model, ema = initialize_model_weights(cfg, args.device, initial, partial=args.init_partial)
+    model, ema = initialize_model_weights(cfg, args.device, initial, partial=args.init_partial,
+                                          exclude=tuple(args.init_exclude))
     if args.init_partial:
         progress(f'Partial warm start: {len(model.reinitialized_tensors)} tensors left at initialization')
     opt, done, lr_restart_step = initialize_training_optimizer(model, ema, args, resume)
@@ -1122,7 +1144,7 @@ def main(argv=None):
             task_budget=budget.to_dict(), operating_policy=policy.to_dict(),
             collection=collector_settings(collector),
             initialization=dict(checkpoint=str(Path(args.init_weights).resolve()), optimizer='fresh AdamW',
-                                warmup=args.warmup, partial=args.init_partial,
+                                warmup=args.warmup, partial=args.init_partial, excluded=list(args.init_exclude),
                                 reinitialized=model.reinitialized_tensors) if args.init_weights else None,
             data_policy=DATA_POLICY, frame_policy=configured_frame_policy(cfg),
             monitor_recovery_sha256=recovery_hash,

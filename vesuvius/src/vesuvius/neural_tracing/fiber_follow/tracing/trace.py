@@ -163,11 +163,10 @@ class ModelTracer:
         return memory
 
     def memory_attach(self, x, idx, memory):
-        """Replace memory crops by recorded features: (B, SLOTS, ENTRY_FEATURES, C)."""
-        from vesuvius.neural_tracing.fiber_follow.models.decision_memory import ENTRY_FEATURES
+        """Replace memory crops by recorded features: (B, SLOTS, *cfg.memory_entry_shape)."""
         encode, keys, valid = x['history_encode'], x['history_keys'].cpu().numpy(), x['history_valid'].cpu().numpy()
         entries = self._memory_entries
-        features = torch.zeros((*encode.shape, ENTRY_FEATURES, self.model.cfg.hidden), device=encode.device,
+        features = torch.zeros((*encode.shape, *self.model.cfg.memory_entry_shape), device=encode.device,
                                dtype=torch.bfloat16)
         flat = encode.flatten().nonzero().flatten()
         if len(flat):

@@ -38,38 +38,40 @@ def display_example(batch, output, details, layers, cfg, label, metrics):
     sections = [image[:, indices, :].mean(1), image[:, :, indices].mean(2), image[int(crop.behind)]]
     history = masked_line(array(batch['hist'][0]), array(batch['hmask'][0]) > 0)
     annotation = annotation_points(batch, cfg)
-    valid = array(batch['x']['history_valid'][0]).astype(bool)
-    tokens = array(layers['history']['tokens'])
-    if 'history_slabs' in batch['x']:
-        slabs = array(batch['x']['history_slabs'][0])
-        # Central slab CT section and observed path heatmap; no target-based slicing.
-        middle = (slabs.shape[2]-1)/2
-        indices = [int(np.floor(middle)), int(np.ceil(middle))]
-        ct = slabs[:, 0, indices].mean(1)
-        heat = slabs[:, 1, indices].mean(1).clip(0, 1)[..., None]
-        gray = ((ct+4)/8).clip(0, 1)[..., None]
-        rgb = gray*(1-.7*heat)+np.array([1., .15, .15])*.7*heat
-    else:
-        # Decision memory has no separate memory CT; valid slots are shown blank.
-        rgb = np.full((*tokens.shape, 3), .6)
-    rgb[~valid] = .15
     selected = int(output['selected_refinement'][0])
     flow = 'solver_points' in output
     decoder = {key: array(values[-1 if flow else selected]) for key, values in layers['decoder'].items()}
-    attentions = {}
-    for name, depth in layers['history_depths'].items():
-        values = layers['history'].get(name+'_attention', [])
-        chosen = values[-depth:] if flow and name == 'generator' else values[selected*depth:(selected+1)*depth]
-        attentions[name] = np.mean([array(a) for a in chosen], axis=0) if chosen else np.zeros((cfg.n_future, len(valid)))
-    convolution = np.zeros_like(tokens)
-    if layers['history']['convolution'] is not None:
-        convolution[valid] = array(layers['history']['convolution'])
+    memory = {}
+    if 'history_valid' in batch['x']:  # memory models only (the history sheet)
+        valid = array(batch['x']['history_valid'][0]).astype(bool)
+        tokens = array(layers['history']['tokens'])
+        if 'history_slabs' in batch['x']:
+            slabs = array(batch['x']['history_slabs'][0])
+            # Central slab CT section and observed path heatmap; no target-based slicing.
+            middle = (slabs.shape[2]-1)/2
+            indices = [int(np.floor(middle)), int(np.ceil(middle))]
+            ct = slabs[:, 0, indices].mean(1)
+            heat = slabs[:, 1, indices].mean(1).clip(0, 1)[..., None]
+            gray = ((ct+4)/8).clip(0, 1)[..., None]
+            rgb = gray*(1-.7*heat)+np.array([1., .15, .15])*.7*heat
+        else:
+            # Decision memory has no separate memory CT; valid slots are shown blank.
+            rgb = np.full((*tokens.shape, 3), .6)
+        rgb[~valid] = .15
+        attentions = {}
+        for name, depth in layers['history_depths'].items():
+            values = layers['history'].get(name+'_attention', [])
+            chosen = values[-depth:] if flow and name == 'generator' else values[selected*depth:(selected+1)*depth]
+            attentions[name] = np.mean([array(a) for a in chosen], axis=0) if chosen else np.zeros((cfg.n_future, len(valid)))
+        convolution = np.zeros_like(tokens)
+        if layers['history']['convolution'] is not None:
+            convolution[valid] = array(layers['history']['convolution'])
+        memory = dict(history_ct=rgb, history_conv=convolution, history_tokens=tokens, history_valid=valid,
+                      attention=attentions)
     return dict(label=label, sections=sections, annotation=annotation, history=history,
         points=array(output['points'][0]), initial=array(output['initial_points'][0]),
         confidence=array(output['confidence'][0]), details=details, selected=selected,
-        encoder={k: array(v) for k, v in layers['encoder'].items()}, decoder=decoder,
-        history_ct=rgb, history_conv=convolution, history_tokens=tokens,
-        history_valid=valid, attention=attentions, metrics=metrics)
+        encoder={k: array(v) for k, v in layers['encoder'].items()}, decoder=decoder, metrics=metrics, **memory)
 
 
 def bounds(crop):
@@ -306,7 +308,7 @@ def plot_sheets(examples, cfg, folder, step):
     sheets = dict(predictions=predictions_sheet(examples, cfg, step),
         crop_orientation=orientation_sheet(examples, cfg, step),
         encoder=activation_sheet(examples, step, 'encoder'), decoder=activation_sheet(examples, step, 'decoder'),
-        history=history_sheet(examples, cfg, step))
+        **({'history': history_sheet(examples, cfg, step)} if 'history_valid' in examples[0] else {}))
     # Independent PNG compression/writes run together; keep compression cheap.
     from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=5) as pool:

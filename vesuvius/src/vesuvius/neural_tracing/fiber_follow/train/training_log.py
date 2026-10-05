@@ -168,6 +168,8 @@ class TrainingInterval:
         for key in self.means + self.counts:
             self.values[key] = self.values.get(key, 0.)+row.get(key, 0.)*(decisions if key in self.means else 1)
         for group in ('history', 'rest'):
+            if group+'_grad_norm' not in row:  # no memory encoder: no history clipping group
+                continue
             key = group+'_grad_norm'
             self.values[key+'_max'] = max(self.values.get(key+'_max', 0.), row.get(key, 0.))
             key = group+'_clipped_updates'
@@ -197,12 +199,13 @@ def _interval_training_lines(row):
              f" | {m['refinement_attempts_mean']:.2f} attempts/decision"]
     if row.get('cuda_peak_allocated_gib') is not None:
         lines[-1] += f" | peak allocated VRAM {row['cuda_peak_allocated_gib']:.2f} GiB (session)"
-    slabs = max(1., m.get('history_valid_slabs', 0.))
-    lines.append(f"  historical slabs: {m.get('history_valid_slabs', 0.)/max(1, m['decisions']):.2f}/decision"
-                 f" | age {m.get('history_age_sum', 0.)/slabs:.1f} voxels"
-                 f" | current-crop overlap {m.get('history_overlap_sum', 0.)/slabs:.1%}"
-                 f" | load {m.get('history_load_seconds', 0.):.3f}s"
-                 f" | encode {m.get('history_encode_seconds', 0.):.3f}s")
+    if m.get('history_valid_slabs') or m.get('history_encode_seconds'):  # memory models only
+        slabs = max(1., m.get('history_valid_slabs', 0.))
+        lines.append(f"  historical slabs: {m.get('history_valid_slabs', 0.)/max(1, m['decisions']):.2f}/decision"
+                     f" | age {m.get('history_age_sum', 0.)/slabs:.1f} voxels"
+                     f" | current-crop overlap {m.get('history_overlap_sum', 0.)/slabs:.1%}"
+                     f" | load {m.get('history_load_seconds', 0.):.3f}s"
+                     f" | encode {m.get('history_encode_seconds', 0.):.3f}s")
     if any(m.get(key) for key in ('memory_recorded', 'memory_missing', 'memory_encoded')):
         lines.append(f"  decision memory: recorded {int(m.get('memory_recorded', 0))}"
                      f" | encoded from crops {int(m.get('memory_encoded', 0))}"
@@ -263,7 +266,7 @@ def _interval_training_lines(row):
                      f" | replay travel {entry['replay_travel']} | {entry['counters']}")
     lines.append('  gradients: '+' | '.join(
         f"{name} max {m[name+'_grad_norm_max']:.2g}, clipped {m[name+'_clipped_updates']}/{updates} updates"
-        for name in ('history', 'rest')))
+        for name in ('history', 'rest') if name+'_grad_norm_max' in m))
     return lines
 
 

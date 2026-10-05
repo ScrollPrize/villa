@@ -440,6 +440,23 @@ def test_geometric_outcomes_count_returns_without_erasing_the_first_departure():
     assert first['diverged'] and first['correct'] < 60  # the strict first-departure metric stands
 
 
+def test_departure_patience_is_path_length_not_point_count():
+    from vesuvius.neural_tracing.fiber_follow.evaluation.seeds import score_trace
+    fiber = line_fiber(600)
+
+    def path(step, excursion):
+        z = np.arange(100., 400.+1e-9, step)
+        lateral = np.where((z >= 200) & (z < 200+excursion), 4., 0.)
+        return np.c_[lateral, np.zeros(len(z)), z]
+    for step in (1., .25):
+        # 2 voxels beyond the tolerance is a brief excursion (8 points at 0.25-voxel spacing), not a departure.
+        assert not score_trace(path(step, 2.), fiber, 100., 1.)['diverged']
+        # 5 voxels is a departure at either sampling density, dated at the excursion's first point.
+        long = score_trace(path(step, 5.), fiber, 100., 1.)
+        assert long['diverged'] and long['correct'] == pytest.approx(100., abs=1.)
+    assert score_trace(path(1., 5.), fiber, 100., 1., patience=10.)['diverged'] is False
+
+
 def protocol_sources():
     return [dict(name='src', fibers=[line_fiber()], volume=None, detector=None,
                  manifest=dict(calibration=[dict(fiber=0, t=50., sign=1., pos=np.array([0., 0., 50.]),

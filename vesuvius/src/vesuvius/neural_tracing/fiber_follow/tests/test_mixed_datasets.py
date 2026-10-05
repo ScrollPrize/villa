@@ -308,3 +308,22 @@ def test_initialization_sources_match_after_explicit_relocation_only(monkeypatch
     assert same_sources(recorded, here)
     here['sources'][0]['validation'] = dict(strategy='fiber_hash', seed=2)
     assert not same_sources(recorded, here)  # holdouts never relocate
+
+
+def test_checkpoint_volume_paths_and_normalization_keys_relocate_together(monkeypatch):
+    from vesuvius.neural_tracing.fiber_follow.shared.paths import relocate_checkpoint
+    from vesuvius.neural_tracing.fiber_follow.data.ct_normalization import volume_key
+    remote = 's3://bucket/ct.zarr::0'
+    make = lambda: dict(vol_spec=dict(fiber_zarr_dir='/mnt/a/preds', ct_zarr='/mnt/a/ct.zarr', ct_level=0,
+                                      ct_normalization=dict(volume='/mnt/a/ct.zarr::0')),
+                        ct_normalization=dict(method='m', volumes={'/mnt/a/ct.zarr::0': dict(volume='/mnt/a/ct.zarr::0'),
+                                                                    remote: dict(volume=remote)}))
+    assert relocate_checkpoint(make()) == make()  # no map: unchanged
+    monkeypatch.setenv('FIBER_FOLLOW_PATH_MAP', '/mnt/a=/copy')
+    ck = relocate_checkpoint(make())
+    assert ck['vol_spec']['fiber_zarr_dir'] == '/copy/preds' and ck['vol_spec']['ct_zarr'] == '/copy/ct.zarr'
+    spec = type('Spec', (), dict(ct_zarr=ck['vol_spec']['ct_zarr'], ct_level=0))
+    # The relocated spec finds its normalization under its own key; remote stores keep theirs.
+    assert ck['ct_normalization']['volumes'][volume_key(spec)]['volume'] == volume_key(spec)
+    assert ck['vol_spec']['ct_normalization']['volume'] == volume_key(spec)
+    assert ck['ct_normalization']['volumes'][remote]['volume'] == remote

@@ -43,6 +43,8 @@ class ObservationBuilder:
             from vesuvius.neural_tracing.fiber_follow.data.decision_memory import memory_bounds
             yield from memory_bounds(item,self.cfg,vol,predictor)
             return
+        if self.cfg.memory == 'none':
+            return
         for slab in slab_layout(item):
             yield from crop_frame_bounds(slab,SLAB,vol,predictor)
 
@@ -63,7 +65,7 @@ class ObservationBuilder:
         if self.cfg.memory == 'decisions':
             from vesuvius.neural_tracing.fiber_follow.data.decision_memory import memory_inputs
             x.update(memory_inputs(items, vol, self.cfg, pool))
-        else:
+        elif self.cfg.memory == 'slabs':
             from vesuvius.neural_tracing.fiber_follow.data.history_slabs import load_slabs
             x.update(load_slabs(items, vol, self.cfg, pool))
         from vesuvius.neural_tracing.fiber_follow.models.path_geometry import path_geometry_inputs
@@ -361,6 +363,8 @@ class IdentityObservationBuilder(ObservationBuilder):
             if cfg.memory == 'decisions':
                 from vesuvius.neural_tracing.fiber_follow.data.decision_memory import memory_layout
                 positions = [e['pos'] for e in memory_layout(item)[0]]
+            elif cfg.memory == 'none':
+                positions = []  # nothing beyond the current crop is observed
             else:
                 from vesuvius.neural_tracing.fiber_follow.data.history_slabs import slab_layout
                 positions = [o['pos'] for o in slab_layout(item)]
@@ -384,7 +388,7 @@ class IdentityObservationBuilder(ObservationBuilder):
             from vesuvius.neural_tracing.fiber_follow.data.decision_memory import memory_allowed
             if not memory_allowed(item, self.cfg, band):
                 return False
-        else:
+        elif self.cfg.memory == 'slabs':
             from vesuvius.neural_tracing.fiber_follow.data.history_slabs import slabs_allowed
             if not slabs_allowed(item, band):
                 return False
@@ -638,6 +642,8 @@ class IdentityObservationBuilder(ObservationBuilder):
                 augment_image_pair(batch['x']['fine'][j], item['photometric'], rng, **augmentation)
                 if 'history_crops' in batch['x']:
                     self.augment_memory_crops(batch['x'], j, item, rng)
+                    continue
+                if 'history_slabs' not in batch['x']:  # no memory
                     continue
                 for slot in batch['x']['history_valid'][j].nonzero().flatten().tolist():
                     ct = batch['x']['history_slabs'][j, slot, 0].numpy()

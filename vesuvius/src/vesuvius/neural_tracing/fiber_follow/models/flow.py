@@ -31,6 +31,16 @@ class FlowConfig(CoordinateRegressionConfig):
     # Planes without a target in training: 'padded' leaves them out of self-attention; 'own_path' keeps
     # them, as tracing does, travelling from noise to this model's own zero-start path (no loss).
     flow_unknown_planes: str = 'padded'
+    # Tracing-time choice among the proposals: 'retry' (later proposals only when no earlier one is
+    # accepted) or 'best' (one ranking over all). flow_zero_start=False drops the zero-start path,
+    # leaving only the Gaussian starts (needs flow_samples > 0).
+    flow_selection: str = 'retry'
+    flow_zero_start: bool = True
+    # Tracing-time bar for Gaussian-start proposals (0: the gate's own threshold). A higher bar offsets the
+    # optimism of taking the best of many noisy candidates; their confidences are shifted down by the
+    # difference, so the gate (and the tracer's commit check) sees them clear the threshold only above it,
+    # and in the ranking a sample must beat the zero start by that margin.
+    flow_sample_threshold: float = 0.
 
     def __post_init__(self):
         super().__post_init__()
@@ -44,6 +54,10 @@ class FlowConfig(CoordinateRegressionConfig):
             raise ValueError('Flow samples must be a nonnegative integer with a finite positive scale')
         if self.flow_time_conditioning not in ('input', 'adaln') or self.flow_unknown_planes not in ('padded', 'own_path'):
             raise ValueError("Flow time conditioning is 'input' or 'adaln'; unknown planes 'padded' or 'own_path'")
+        if self.flow_selection not in ('retry', 'best') or (not self.flow_zero_start and not self.flow_samples):
+            raise ValueError("Flow selection is 'retry' or 'best'; dropping the zero start needs flow samples")
+        if not 0 <= self.flow_sample_threshold <= 1:
+            raise ValueError('The flow sample threshold lies in [0, 1]')
         if not (math.isfinite(self.flow_sigma_floor) and self.flow_sigma_floor >= 1):
             raise ValueError('The flow scale floor must be finite and at least one voxel')
         if self.flow_sigma and (len(self.flow_sigma) != self.n_future or any(
@@ -145,7 +159,7 @@ class FlowFollower(ObservationFollower):
         for index, (layer, kv) in enumerate(zip(self.decoder.layers, ctx['generator_projected'])):
             modulation = self.time_modulation[index](condition).unflatten(-1, (4, 3, self.cfg.hidden)) if adaln else None
             query = layer.forward_draws(query, kv, ctx['padding'], padding, history=ctx['history_projected'],
-                                        history_attention=self.history_attention, modulation=modulation)
+                                        history_attention=getattr(self, 'history_attention', None), modulation=modulation)
         output = self.decoder.norm(query)
         if adaln:
             shift, scale = self.output_modulation(condition)[:, :, None].chunk(2, -1)
@@ -167,12 +181,13 @@ class FlowFollower(ObservationFollower):
         return curves
 
     def proposal_starts(self, hist):
-        """(B, 1+flow_samples, P, 2): the zero path, then scaled Gaussian starts."""
+        """(B, D, P, 2): the zero path (unless flow_zero_start is off), then scaled Gaussian starts."""
         zero = hist.new_zeros(len(hist), 1, self.cfg.n_future, 2)
         if not self.cfg.flow_samples:
             return zero
-        noise = torch.randn(len(hist), self.cfg.flow_samples, self.cfg.n_future, 2, device=hist.device)
-        return torch.cat((zero, self.cfg.flow_sample_scale*noise.to(zero.dtype)), 1)
+        noise = self.cfg.flow_sample_scale*torch.randn(len(hist), self.cfg.flow_samples, self.cfg.n_future, 2,
+                                                         device=hist.device).to(zero.dtype)
+        return torch.cat((zero, noise), 1) if self.cfg.flow_zero_start else noise
 
     def training_forward(self, x, hist, hmask, threshold, targets=None):
         ctx = self.context(x, hist, hmask)
@@ -215,6 +230,17 @@ class FlowFollower(ObservationFollower):
             mask = known[:, None, :, None].expand_as(error)
             result['flow_per_state'] = torch.where(mask, error, 0.).sum((1, 2, 3))/mask.sum((1, 2, 3)).clamp_min(1)
         return result
+
+    def select_prediction(self, output, confidence_threshold=.5, n_commit=None):
+        from .model import select_refinement
+        margin = self.cfg.flow_sample_threshold-confidence_threshold
+        if self.cfg.flow_samples and margin > 0:
+            first = 1 if self.cfg.flow_zero_start else 0
+            confidence = output['refinement_confidence']
+            shifted = torch.cat((confidence[:, :first], (confidence[:, first:]-margin).clamp_min(0)), 1)
+            output = dict(output, refinement_confidence=shifted)
+        return select_refinement(output, self.cfg, confidence_threshold, n_commit,
+                                 retry=self.cfg.flow_selection == 'retry')
 
     def forward(self, x, hist, hmask, confidence_threshold=.5, n_commit=None):
         return self.select_prediction(self.training_forward(x, hist, hmask, confidence_threshold),

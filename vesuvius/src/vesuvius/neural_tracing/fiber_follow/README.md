@@ -27,6 +27,12 @@ Flow options (defaults keep the original model and old checkpoints load unchange
 - `--flow-sigma-floor V`: lower bound in voxels for the fitted residual scales, which set the noise prior's width (default 1).
 - `--flow-unknown-planes own_path`: target-less planes stay in self-attention, as in tracing, and move from noise to the model's own zero-start path. They get no loss.
 
+Identity options with `--memory decisions` (defaults keep the original model):
+- `--identity-objective verify`: a verifier reads the decision-memory tokens and labels current-crop locations on/off the original fiber (`models/identity_verifier.py`).
+- `--identity-objective readout`: path-blind identity memory (`models/identity_readout.py`). Appearance keys come from the image stem, taken before the position embedding and the rendered observed path are added, through a small convolutional head with no position input. Each decision stores its keys around its head as extra entry rows; a memory value adds that point's radius from its decision's trace axis and the entry's age and seed role. Every current location is read out against all memory keys and trained with the verifier's labels and loss. Memory keys carry no gradient; the current keys, stem and readout train through the identity loss.
+- `--identity-map` / `--identity-feedback`: the identity field enters decoder/scorer image tokens / scorer segments and retries (zero-initialized).
+- `--init-exclude PREFIX` (with `--init-partial`, repeatable): keep the initialization of matching tensors, e.g. zero-initialized heads whose input changed meaning.
+
 `FIBER_FOLLOW_PATH_MAP='OLD=NEW;...'` relocates absolute paths recorded on another machine (seed manifest volume, negative-bank run, initialization dataset sources) before the exact startup checks.
 
 `--resume output/RUN/last.pt --name RUN` restores a new-format run. `--init-weights CHECKPOINT` strictly loads model and EMA weights into a fresh run, without optimizer, replay, scheduling, or normalization state. Runtime checkpoints use unversioned model types. Legacy checkpoints must be converted explicitly; old flow checkpoints are unsupported. The model type is inferred from checkpoints unless explicitly specified.

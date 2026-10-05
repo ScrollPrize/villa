@@ -254,3 +254,45 @@ def test_unknown_planes_are_attended_only_with_own_path_and_the_scale_floor_boun
     assert fit_flow_sigma(iter([data]), cfg, 2) == ((3., 3.),)*cfg.n_future
     with pytest.raises(ValueError, match='scale floor'):
         config(flow_sigma_floor=3.)  # the fixture's unit scales lie below the floor
+
+
+def test_best_selection_ranks_all_proposals_and_noise_only_drops_the_zero_start():
+    from vesuvius.neural_tracing.fiber_follow.models.model import select_refinement
+    cfg = config()
+    points = torch.zeros(1, 3, cfg.n_future, 3)
+    points[..., 2] = torch.arange(1., cfg.n_future+1)
+    confidence = torch.tensor([[[.6]*cfg.n_future, [.9]*cfg.n_future, [.95]*cfg.n_future]])
+    output = dict(refinement_points=points, refinement_confidence=confidence,
+                  refinement_mask=torch.ones(1, 3, dtype=torch.bool),
+                  **{f'refinement_{k}': confidence for k in ('hazard_logits', 'confidence_logits')})
+    # Proposal 0 is accepted, so a retry keeps it; one ranking over all takes the most confident.
+    assert int(select_refinement(output, cfg, .5)['selected_refinement']) == 0
+    assert int(select_refinement(output, cfg, .5, retry=False)['selected_refinement']) == 2
+    torch.manual_seed(37)
+    model = build_model(config(flow_samples=3, flow_zero_start=False, flow_selection='best')).eval()
+    b = coordinate_batch(model.cfg)
+    with torch.no_grad():
+        out = model(b['x'], b['hist'], b['hmask'])
+    assert out['refinement_points'].shape[1] == 3 and out['refinement_points'][:, :, :, :2].abs().sum() > 0
+    with pytest.raises(ValueError, match='zero start'):
+        config(flow_zero_start=False)
+
+
+def test_sample_threshold_holds_samples_to_a_higher_bar_than_the_zero_start():
+    torch.manual_seed(41)
+    cfg = config(flow_samples=2, flow_selection='best', flow_sample_threshold=.8)
+    model = build_model(cfg)
+    points = torch.zeros(1, 3, cfg.n_future, 3)
+    points[..., 2] = torch.arange(1., cfg.n_future+1)
+    confidence = torch.tensor([[[.52]*cfg.n_future, [.75]*cfg.n_future, [.85]*cfg.n_future]])
+    output = dict(refinement_points=points, refinement_confidence=confidence,
+                  refinement_mask=torch.ones(1, 3, dtype=torch.bool),
+                  **{f'refinement_{k}': confidence for k in ('hazard_logits', 'confidence_logits')})
+    out = model.select_prediction(output, .5)
+    # Sample 1 (0.75) falls below the 0.8 bar; sample 2 (0.85) clears it and, after the 0.3 margin,
+    # still outranks the zero start (0.55 > 0.52).
+    assert int(out['selected_refinement']) == 2
+    torch.testing.assert_close(out['confidence'], torch.full((1, cfg.n_future), .55))
+    # A sample must beat the zero start by the margin: 0.85-0.3 < 0.6 keeps the zero start.
+    output['refinement_confidence'] = torch.tensor([[[.6]*cfg.n_future, [.75]*cfg.n_future, [.85]*cfg.n_future]])
+    assert int(model.select_prediction(output, .5)['selected_refinement']) == 0

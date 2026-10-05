@@ -101,6 +101,10 @@ def layer_capture(model):
         handles.append(model.decoder.norm.register_forward_hook(
             lambda m, a, y: record['decoder'].setdefault('output', []).append(y.detach().float().reshape(-1, model.cfg.n_future, model.cfg.hidden)[0].cpu())))
 
+        if getattr(model, 'history_encoder', None) is None:  # no memory: nothing to capture below
+            yield record
+            return
+
         def history_conv(m, a, y):
             record['statistics']['history convolution'] = tensor_stats(y)
             record['history']['convolution'] = y.detach().float().square().mean((1, 2)).sqrt().cpu()
@@ -219,7 +223,7 @@ def decision_memory_rows(model, cpu_batch, device, memory=None):
     x = batch['x']
     recorded = x['history_keys'] >= 0
     if memory is not None and bool(recorded.any()):
-        x['history_features'], found = memory.attach_memory(x, model.cfg.hidden)
+        x['history_features'], found = memory.attach_memory(x, model.cfg.memory_entry_shape)
     else:
         found = torch.zeros_like(recorded)
     x['history_valid'] = x['history_valid'] & ~(recorded & ~found)
@@ -280,10 +284,12 @@ def render_microbatch(model, cpu_batch, out, step, *, device, n_commit, toleranc
                 max_error=float(errors.max()) if len(errors) else None,
                 known_prefixes=int(known.sum()),
                 prefix_brier=float((confidence[known]-details['labels'][known]).square().mean()) if known.any() else None,
-                history_valid=batch['x']['history_valid'][0], history_ages=batch['x']['history_ages'][0],
+                **({} if 'history_valid' not in batch['x'] else dict(
+                    history_valid=batch['x']['history_valid'][0], history_ages=batch['x']['history_ages'][0])),
                 ct_statistics=tensor_stats(batch['x']['fine'][:, 0]), activation_statistics=stats)
             for key in ('generator_attention', 'scorer_attention'):
-                row[key] = layers['history'].get(key, [])
+                if key in layers['history']:
+                    row[key] = layers['history'][key]
             rows.append(row)
             # Retain only display-sized CT sections and reduced features on CPU.
             from vesuvius.neural_tracing.fiber_follow.evaluation.diagnostic_plots import display_example
@@ -292,9 +298,10 @@ def render_microbatch(model, cpu_batch, out, step, *, device, n_commit, toleranc
         errors = [r['mean_error'] for r in rows if r['mean_error'] is not None]
         report = dict(step=step, split='current_training_microbatch', model='EMA', model_type=model.model_type, examples=len(rows),
             n_commit=n_commit, tolerance=tolerance,
-            history_encoder=dict(variant='fine', token_shape=model.history_encoder.token_shape,
+            **({} if getattr(model, 'history_encoder', None) is None else dict(history_encoder=dict(
+                variant='fine', token_shape=model.history_encoder.token_shape,
                 tokens_per_slab=model.history_encoder.tokens_per_slab,
-                feature_channels=model.history_encoder.projection.in_features),
+                feature_channels=model.history_encoder.projection.in_features))),
             summary=dict(committed_points=sum(r['commit'] for r in rows),
                 stopped=sum(r['commit'] == 0 for r in rows),
                 mean_example_error=sum(errors)/len(errors) if errors else None,

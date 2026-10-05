@@ -302,12 +302,12 @@ class LiveContinuation:
         if entries is not None:
             self.memory.evict(step)
 
-    def attach_memory(self, x, width):
-        """Recorded chain entries (B, SLOTS, ENTRY_FEATURES, width) and which slots were found."""
-        from vesuvius.neural_tracing.fiber_follow.models.decision_memory import ENTRY_FEATURES
+    def attach_memory(self, x, shape):
+        """Recorded chain entries (B, SLOTS, *shape) and which slots were found; ``shape`` is the
+        model's ``cfg.memory_entry_shape``."""
         device = x['history_keys'].device
         features, found = self.memory.gather(x['history_chain'].cpu(), x['history_keys'].cpu(),
-                                             (ENTRY_FEATURES, width), device)
+                                             tuple(shape), device)
         return features, found.to(device)
 
     def close(self):

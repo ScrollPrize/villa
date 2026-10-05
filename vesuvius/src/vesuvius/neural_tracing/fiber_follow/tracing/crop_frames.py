@@ -43,8 +43,12 @@ def _load_predictor(path, digest):
 
 
 def frame_predictor(cfg):
+    from vesuvius.neural_tracing.fiber_follow.shared.paths import recorded_path
     path = getattr(cfg, 'frame_checkpoint', None)
-    return _load_predictor(str(Path(path).expanduser().resolve()), getattr(cfg, 'frame_checkpoint_sha256', None)) if path else None
+    if not path:
+        return None
+    # A checkpoint trained elsewhere records that machine's path; the sha256 check still pins the file.
+    return _load_predictor(str(Path(recorded_path(path)).expanduser().resolve()), getattr(cfg, 'frame_checkpoint_sha256', None))
 
 
 def trace_family_kwargs(tracer, families):

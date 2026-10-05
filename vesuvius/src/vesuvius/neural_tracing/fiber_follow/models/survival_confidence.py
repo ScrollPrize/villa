@@ -21,7 +21,8 @@ class SegmentSurvivalScorer(nn.Module):
         self.layers = nn.ModuleList(PathDecoderLayer(h, cfg.heads, 1024, dropout=0.,
             activation='gelu', batch_first=True, norm_first=True) for _ in range(cfg.scorer_layers))
         from vesuvius.neural_tracing.fiber_follow.models.history_slabs import HistoryAttention
-        self.history_attention = HistoryAttention(h, cfg.heads)
+        # Without memory (cfg.memory 'none') the scorer has no memory attention.
+        self.history_attention = HistoryAttention(h, cfg.heads) if getattr(cfg, 'memory', 'slabs') != 'none' else None
         self.norm = nn.LayerNorm(h)
         self.failure = nn.Linear(h, 1)
         if getattr(cfg, 'identity_feedback', False):
@@ -41,7 +42,7 @@ class SegmentSurvivalScorer(nn.Module):
         return [layer.project_memory(memory) for layer in self.layers]
 
     def forward(self, spatial, points, projected, padding, history, identity=None):
-        if len(history) == 2:
+        if history is not None and len(history) == 2:
             history = self.history_attention.project_memory(*history)
         start = torch.cat((torch.zeros_like(points[:, :1]), points[:, :-1]), 1)
         delta = points-start
