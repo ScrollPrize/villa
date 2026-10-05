@@ -52,6 +52,7 @@ set(srcs
     LineAnnotationController.cpp
     LineAnnotationController.hpp
     LineAnnotationFiberSegments.cpp
+    LineAnnotationStructuralEdits.cpp
     LineAnnotationFiberSegments.hpp
     LineAnnotationDialog.cpp
     LineAnnotationDialog.hpp

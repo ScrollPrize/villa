@@ -23,7 +23,7 @@ import { checkRateLimit, getIp } from './rateLimit.mjs';
 
 const require = createRequire(import.meta.url);
 
-const DEFAULT_MODEL = 'openai/gpt-5-mini';
+const DEFAULT_MODEL = 'openai/gpt-6-luna';
 const PRIMARY_ORIGIN = 'https://scrollprize.org';
 const REQUEST_TIMEOUT_MS = 60_000;
 const MAX_MESSAGES = 8;
@@ -59,8 +59,8 @@ const INSTRUCTIONS = [
   '',
   'VOICE',
   '- Plain, warm, and precise — like a knowledgeable community member, not a marketing bot.',
-  '- Lead with the answer in the first sentence. Typical answer: 2-5 sentences or up to 5 short',
-  '  bullets. Go longer only when the question genuinely needs it.',
+  '- Lead with the answer in the first sentence. Typical answer: 2-4 sentences or up to 4 short',
+  '  bullets. Go longer only when the question genuinely needs it. Be concise.',
   '- Match the reader\'s level. For technical questions go deep: name the actual methods, tools,',
   '  model architectures, scan resolutions, and data formats from the content — researchers and',
   '  engineers are a core audience. Explain gently when the question signals a newcomer.',

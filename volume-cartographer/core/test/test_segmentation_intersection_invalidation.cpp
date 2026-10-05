@@ -35,7 +35,7 @@ public:
     {
     }
 
-    std::optional<SurfaceProjection> projectVolumePoint(const cv::Vec3f&) const override
+    std::optional<SurfaceProjection> projectVolumePoint(const cv::Vec3f&, float) const override
     {
         return std::nullopt;
     }

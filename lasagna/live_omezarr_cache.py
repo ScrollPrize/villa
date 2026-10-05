@@ -3,14 +3,82 @@ from __future__ import annotations
 from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-import fcntl
 import json
 import math
 import os
 from pathlib import Path
+import sys
 import threading
 import time
 from typing import Any, Iterator
+
+# flock() is POSIX. Windows has no fcntl, so take the same non-blocking
+# shared/exclusive advisory lock through LockFileEx, which is the Win32 call
+# with matching semantics (msvcrt.locking can only do exclusive locks, and the
+# cache relies on several readers holding a shared lock at once).
+if sys.platform == "win32":
+    import ctypes
+    from ctypes import wintypes
+    import msvcrt
+
+    _LOCKFILE_FAIL_IMMEDIATELY = 0x00000001
+    _LOCKFILE_EXCLUSIVE_LOCK = 0x00000002
+    _ERROR_LOCK_VIOLATION = 33
+    _WHOLE_FILE_LOW = 0xFFFFFFFF
+    _WHOLE_FILE_HIGH = 0xFFFFFFFF
+
+    class _Overlapped(ctypes.Structure):
+        _fields_ = [
+            ("Internal", ctypes.c_void_p),
+            ("InternalHigh", ctypes.c_void_p),
+            ("Offset", wintypes.DWORD),
+            ("OffsetHigh", wintypes.DWORD),
+            ("hEvent", wintypes.HANDLE),
+        ]
+
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _kernel32.LockFileEx.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD,
+        wintypes.DWORD, wintypes.DWORD, ctypes.POINTER(_Overlapped),
+    ]
+    _kernel32.LockFileEx.restype = wintypes.BOOL
+    _kernel32.UnlockFileEx.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD,
+        wintypes.DWORD, wintypes.DWORD, ctypes.POINTER(_Overlapped),
+    ]
+    _kernel32.UnlockFileEx.restype = wintypes.BOOL
+
+    def _lock_file(handle, *, exclusive: bool) -> None:
+        flags = _LOCKFILE_FAIL_IMMEDIATELY
+        if exclusive:
+            flags |= _LOCKFILE_EXCLUSIVE_LOCK
+        overlapped = _Overlapped()
+        win_handle = msvcrt.get_osfhandle(handle.fileno())
+        if not _kernel32.LockFileEx(
+            win_handle, flags, 0, _WHOLE_FILE_LOW, _WHOLE_FILE_HIGH,
+            ctypes.byref(overlapped),
+        ):
+            code = ctypes.get_last_error()
+            if code == _ERROR_LOCK_VIOLATION:
+                raise BlockingIOError(code, "file is locked by another process")
+            raise ctypes.WinError(code)
+
+    def _unlock_file(handle) -> None:
+        overlapped = _Overlapped()
+        win_handle = msvcrt.get_osfhandle(handle.fileno())
+        _kernel32.UnlockFileEx(
+            win_handle, 0, _WHOLE_FILE_LOW, _WHOLE_FILE_HIGH,
+            ctypes.byref(overlapped),
+        )
+else:
+    import fcntl
+
+    def _lock_file(handle, *, exclusive: bool) -> None:
+        mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        fcntl.flock(handle.fileno(), mode | fcntl.LOCK_NB)
+
+    def _unlock_file(handle) -> None:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 DEFAULT_LIVE_CACHE_GIB = 10 * 1024
@@ -54,9 +122,8 @@ class SelectedLevelLock:
     def __enter__(self) -> "SelectedLevelLock":
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._handle = self.path.open("a+b")
-        mode = fcntl.LOCK_EX if self.exclusive else fcntl.LOCK_SH
         try:
-            fcntl.flock(self._handle.fileno(), mode | fcntl.LOCK_NB)
+            _lock_file(self._handle, exclusive=self.exclusive)
         except BlockingIOError as error:
             self._handle.close()
             self._handle = None
@@ -71,7 +138,7 @@ class SelectedLevelLock:
         if self._handle is None:
             return
         try:
-            fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
+            _unlock_file(self._handle)
         finally:
             self._handle.close()
             self._handle = None

@@ -151,7 +151,8 @@ private:
                             bool interactive = true,
                             const vc3d::opendata::OpenDataResourceSelection* selection = nullptr,
                             QString* errorMessage = nullptr,
-                            vc3d::opendata::OpenDataSampleProjectResult* resultOut = nullptr);
+                            vc3d::opendata::OpenDataSampleProjectResult* resultOut = nullptr,
+                            const vc3d::opendata::OpenDataNewProject* newProject = nullptr);
     // .cpp-local payload keeps the QtConcurrent result type out of this header.
     struct OpenDataOpenTaskResult;
     // Launches the QtConcurrent task without a nested event loop. Its watcher is
@@ -161,7 +162,8 @@ private:
         bool interactive,
         const vc3d::opendata::OpenDataResourceSelection* selection,
         std::function<void(const OpenDataSampleOpenOutcome&)> onFinished,
-        std::function<void(const vc3d::opendata::OpenDataSampleDownloadProgress&)> onProgress);
+        std::function<void(const vc3d::opendata::OpenDataSampleDownloadProgress&)> onProgress,
+        const vc3d::opendata::OpenDataNewProject* newProject = nullptr);
     // Epilogue run on the GUI thread once the open task finishes: setVpkg, UI
     // refresh, prefill, status message, and (interactive-only) message boxes.
     void finishOpenDataSampleOpen(OpenDataOpenTaskResult task,

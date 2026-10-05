@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-09-29
+
+- Add selective catalog project creation with initially unchecked resources,
+  project name/destination, individual segment attachment and immediate opening.
+
 ## 2026-09-27
 
 - The workspace tab bar now shows the project name rather than the current

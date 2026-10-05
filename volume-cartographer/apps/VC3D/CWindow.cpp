@@ -1,4 +1,5 @@
 #include "CWindow.hpp"
+#include "VolumeDisplayNames.hpp"
 #include "OpenDataCoordinateIdentity.hpp"
 #include "OpenDataLasagna.hpp"
 
@@ -9401,13 +9402,14 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
     QString bestGrowthVolumeId;
     bool preferredVolumeFound = false;
     const bool hasOpenDataSegments = packageHasOpenDataSegments(*_state->vpkg());
-    const auto volumeIds = _state->vpkg()->volumeIDs();
+    const auto volumeIds = vc3d::orderedDisplayVolumeIds(*_state->vpkg());
     for (const auto& id : volumeIds) {
         try {
             auto vol = _state->vpkg()->volume(id);
             const QString idStr = QString::fromStdString(id);
             const QString nameStr = QString::fromStdString(vol->name());
-            const QString label = nameStr.isEmpty() ? idStr : QStringLiteral("%1 (%2)").arg(nameStr, idStr);
+            const QString label = vc3d::volumeDisplayLabel(*_state->vpkg(), id,
+                nameStr.isEmpty() ? idStr : QStringLiteral("%1 (%2)").arg(nameStr, idStr));
 
             orderedIds.push_back(idStr);
             volumeEntries.append({idStr, label});
