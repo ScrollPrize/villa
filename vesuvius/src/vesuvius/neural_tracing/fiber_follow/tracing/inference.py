@@ -182,6 +182,7 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer):
     ap.add_argument("--max-len", type=float, default=6000.0, help="per-direction limit, trace-grid voxels")
     ap.add_argument("--confidence", type=float, help="default: the checkpoint operating policy")
     ap.add_argument("--n-commit", type=int, help="max points committed per decision (default: checkpoint operating policy)")
+    ap.add_argument("--gate", choices=('full', 'prefix'), help="commit gate (default: checkpoint operating policy)")
     ap.add_argument("--policy", help="calibration selection.json with the operating policy to deploy")
     ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--out", required=True)
@@ -194,12 +195,13 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer):
     if args.frame_checkpoint:
         from vesuvius.neural_tracing.fiber_follow.tracing.crop_frames import bind_frame_checkpoint
         bind_frame_checkpoint(model.cfg, args.frame_checkpoint)
-    confidence, n_commit = args.confidence, args.n_commit
+    confidence, n_commit, gate = args.confidence, args.n_commit, args.gate
     if args.policy:
         selected = json.load(open(args.policy))['operating_policy']
         confidence = selected['confidence'] if confidence is None else confidence
         n_commit = selected['n_commit'] if n_commit is None else n_commit
-    policy = checkpoint_policy(ck, model.cfg, confidence=confidence, n_commit=n_commit)
+        gate = selected.get('gate') if gate is None else gate
+    policy = checkpoint_policy(ck, model.cfg, confidence=confidence, n_commit=n_commit, gate=gate)
     if args.fiber_zarrs:
         spec.fiber_zarr_dir = args.fiber_zarrs
     if args.ct:
