@@ -1211,7 +1211,8 @@ float FiberletStoredReplayGraphSource::maximumJoinAngleDegrees() const noexcept
 std::vector<FiberletStoredAnchor>
 FiberletStoredReplayGraphSource::anchorsInBaseBox(
     const cv::Vec3d& minimumBaseXYZ,
-    const cv::Vec3d& maximumBaseXYZ) const
+    const cv::Vec3d& maximumBaseXYZ,
+    std::size_t prefetchWindow) const
 {
     for (int axis = 0; axis < 3; ++axis) {
         if (!std::isfinite(minimumBaseXYZ[axis]) ||
@@ -1248,6 +1249,13 @@ FiberletStoredReplayGraphSource::anchorsInBaseBox(
     if (begin[0] > end[0] || begin[1] > end[1] || begin[2] > end[2])
         return result;
     const float scale = predictionToBaseScale();
+    std::vector<vc::render::ChunkKey> ownerKeys;
+    if(prefetchWindow){
+        for(int z=begin[0];z<=end[0];++z)for(int y=begin[1];y<=end[1];++y)for(int x=begin[2];x<=end[2];++x)
+            ownerKeys.push_back({0,z,y,x});
+        chunks_.prefetchAnchorChunks(std::span(ownerKeys).first(std::min(prefetchWindow,ownerKeys.size())),false);
+    }
+    std::size_t ownerIndex=0;
     for (int z = begin[0]; z <= end[0]; ++z) {
         for (int y = begin[1]; y <= end[1]; ++y) {
             for (int x = begin[2]; x <= end[2]; ++x) {
@@ -1256,6 +1264,9 @@ FiberletStoredReplayGraphSource::anchorsInBaseBox(
                     throw std::runtime_error(
                         "stored Fiberlet anchor chunk failed: " + loaded.error);
                 }
+                if(prefetchWindow && ownerIndex+prefetchWindow<ownerKeys.size())
+                    chunks_.prefetchAnchorChunks(std::span(ownerKeys).subspan(ownerIndex+prefetchWindow,1),false);
+                ++ownerIndex;
                 for (const auto& anchor : *loaded.value.anchors) {
                     const cv::Vec3d point(anchor.positionPredictionXYZ * scale);
                     bool inside = true;

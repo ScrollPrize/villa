@@ -1,3 +1,281 @@
+## 2026-10-05 — Tiled tracing checkpoint for integration
+
+- Completed eight-tile 2048 tracing/local deduplication: 7,322 retained tile
+  lines, 3,722 clipped fragments, 739 seam candidates (715 unique, 24 ambiguous).
+  Internal cut endpoints: 2,439, including 985 unmatched. Full run 4,775.68s,
+  anchor preparation 2,347.49s, assembly 9.40s. See tiled-tracing.md for artifacts.
+- Persist implementation, experimental runners, benchmark tables/plots and
+  planning for integration. Prior validation: 497 native cases, 4 queue Python
+  tests and 9 focused tiled Python tests passed; no new benchmark run for commit.
+- Seam admission relaxation and alternative-aware BP consumption are NOT yet
+  implemented. Existing 80%/32-voxel gates and downstream rejection remain.
+  Preserve candidates rather than incorrectly forcing all alternatives equal.
+
+## 2026-10-04 — Promote tuned overlap-filtered crop baseline
+
+- User selected presence-ranked ellipse10/20, any-positive-overlap whole-piece
+  deduplication with near/far .2/.2, P1 .0375, disabling100/128 and boundary10.
+  Current1024 baseline:65.3846% non-oracle,91.6667% observed shift,
+  −55.1216% removal,88.4615% oracle accuracy. Production and91-fiber defaults unchanged.
+- Added matched2048 runner reusing validated historical dense tracing and shared
+  filtering/BP/reporting helpers. Nine focused tests pass. Global deduplication
+  stopped at user request after3169.7s; no2048 BP score produced. Replaced by
+  experimental1024core/64halo local tracing and deduplication (see tiled-tracing.md).
+
+## 2026-10-03 — Independent BP cost tuning for twelve zero-overlap selections
+
+- Added reusable cost-only sweep through approved runner, shared native BP stage
+  and strict resume provenance. Frozen geometry, min256/median64/500messages.
+- Completed576configurations,91removal solves and12paired exact repeats, no
+  failures.14Python tests passed. Full before/after and weights in
+  volume-cartographer/docs/fiber_benchmark_runs/2026-10-03-overlap-costs.md/json.
+- Best presence-ranked10/20:65.3846%non-oracle/91.6667%shift/−55.1216%removal
+  versus no-dedup61.5385%/87.5%/−28.9207%. Near/far magnitude.2,disable100,
+  boundary10,parallel-one.0375,hard signs. Gains primary metrics, not removal.
+  Bounded two-round tuning on same crop; no automatic default promotion.
+
+## 2026-10-03 — Zero/low-overlap and isotropic post-filter sweep
+
+- Added0%threshold: any positive sampled match, never disjoint pairs. Native
+  measured overlap graphs are reusable across ranks/thresholds, with strict
+  exact-geometry/config/normal identity keys and atomic cache publication.
+- Tested36newsettings:0/10/20% x length/cost/presence x ellipses10/20,20/40,
+  then isotropic10/10,20/20. Same frozen1024 raw40500 pieces and BP parameters.
+  Fresh and cached80%control reproduce previous survivor IDs exactly; baseline
+  scores reproduce61.5385%non-oracle,87.5%shift,-28.9207%removal.
+- Best new: length20/40,f0 gives50%non-oracle,79.1667%shift,-82.9448%removal,
+  435pieces (31.5782% summed length). Isotropic maximum34.6154%. No promotion.
+  Oracle reference accuracy does reach88.4615% versus80.7692%baseline; keep it
+  distinct from the non-oracle metric. All non-oracle runs still observe24/26refs.
+- One audit filter:63.94s fresh measurement vs0.397s cached, identical selection.
+  Native tests90crop cases plus other suites and5Python config tests passed.
+  Report2026-10-03-post-overlap-low.md/json includes all36plus historical12.
+  Approved runner action iso20_post_overlap with low:true, report_only:true.
+
+## 2026-10-03 — Post-fw/bw whole-piece overlap pilot
+
+- Added opt-in native saved-artifact `deduplicate` mode using shared indexed
+  ellipse/angle matching. Every reverse-filtered piece is independent; deterministic
+  global best-first selection by length, sampled mean presence or cost density.
+  Preserve survivor geometry/costs/settings and source/suppressor indices.
+- Matched1024 matrix:10/20 or20/40 ellipse,50% or80% coverage of shorter piece,
+  three quality rankings;12 trials plus freshly verified baseline. No retracing,
+  GPU inference, BP-iteration increase or2048 run.
+- No improvement. Baseline61.5385% non-oracle/87.5%shift/-28.9207%removal.
+  Best filtered accuracy: cost20/40,f80 gives53.8462%/79.1667%/-158.1425%,
+ 501pieces vs1879 and25.1278% of original summed geometry. Other filtered
+  accuracies26.9231–50%. All retain24/26 observed references, so degradation is
+  not merely additional missing references. Keep disabled.
+- Full table/configs/provenance: volume-cartographer/docs/fiber_benchmark_runs/
+  2026-10-03-post-overlap.md/json. Approved action `iso20_post_overlap`.
+  Whole-piece deletion can lose unique tails; offline frozen-pool selection is
+  not online replacement/reseeding. Artifact replay not measured in this pilot.
+
+## 2026-10-03 — Indexed dense coverage-stop pilot
+
+- Added optional accepted-segment spatial-index stopping with worker watermarks,
+  ordered raw-prefix revalidation and terminal reverse checks. Separate stopping
+  radii preserve seed suppression for tuning; default remains off.
+- 1024 control reproduced prior geometry and61.5385% accuracy/87.5%shift exactly.
+  Stop40/80,20/40,10/20,5/10,2/4 trials: best stopping accuracy38.4615% (5/10);
+  none beats control. Tracing41.4–47.4s versus56.9s; geometry greatly reduced.
+  Full report: volume-cartographer/docs/fiber_benchmark_runs/2026-10-03-coverage-stop.md.
+  No2048 rerun/promotion. Artifact replay not measured; historical direct replay
+  does not exercise inter-trace coverage and is not reused as a new score.
+- Earlier2048 matched solve failed534.1M winding states vs4M guard. Same-box
+  audit found5.86x traced length, dominated by recovered distant-seed pieces;
+  report2026-10-03-2048-trace-density-audit.md preserves evidence.
+
+## 2026-10-03 — Accuracy-first iterative BP sweep
+
+- User subsequently selected this winner as the current best/future BP benchmark
+  baseline; documented in specs/current_tracing_baseline.md. Runtime defaults
+  unchanged. Saved full91 raw40500 comparison:16 unfiltered errors versus5 errors
+  plus66 filtered stops (ellipse20/40 full-prefix512), distinct from crop iso20.
+
+- Four coordinate rounds, 125 unique configurations, 55 removal solves plus
+  independent/oracle winner repeats. Strict ranking: non-oracle accuracy,
+  observed shift, then constraint-disable score. Fixed 500 iterations.
+- Winner: min256, median±64/blend1, scale.822, boundary10, P1=.0375,
+  disabling100 per128. Accuracy61.5385% and shift87.5% unchanged; removal
+  −29.5030%→−28.9207%, problematic55515→54665 of243682.
+- Final neighborhood had no improvement. Exact repeat of state/factors/ladder
+  and removal counts. Production defaults unchanged; tuning-crop result only.
+- Reusable approved runner action `iso20_iterative`, checkpoints and full table
+  in `volume-cartographer/docs/fiber_benchmark_runs/2026-10-03-iterative-accuracy.md`.
+
+## 2026-10-03 — Median64 selected baseline and cost sweep
+
+- Recorded median64/min256/P1=.05/disable150/boundary0 as user-selected baseline.
+  Ran18 cost cases +2 bounded combinations using established oracle-removal and
+  independent metrics. Lower P1=.01 only marginally helps removal; zero collapses.
+- Far-perpendicular magnitude.05 + disabling75 gives−17.5073% removal with
+ 61.5385% independent accuracy/83.3333% shift. Far-perpendicular.05 + no parallel
+  sign gives best removal−13.1589% but46.1538%/79.1667% independent/shift.
+  These are tradeoffs, not automatic baseline/default replacements. No-perp-sign
+  unavailable due incompatible gauges.19 valid paired state/factor parity checks;
+ 10 tests pass. Full20-case report2026-10-03-median-costs.md/json; native unchanged.
+
+## 2026-10-03 — Established reference-conditioned removal comparison
+
+- Ran no-probe weight0.05 winner,median64,consensus32 with historical oracle-inliers
+  benchmark. Problematic counts56027/55515/55816 of243682; constraint scores
+  −29.8564%/−29.5030%/−29.7105%. Both probes improve slightly,median best.
+  Oracle76.9231% all; initial states/factors exactly match prior independent runs.
+  Full breakdown in2026-10-03-probe-removal.md/json. Eight tests pass; defaults
+  unchanged. Supersedes geometric audit as answer to requested removal metric.
+
+## 2026-10-03 — Cached probe correctness audit
+
+- Strict reference geometry/contact audit on no-probe, median64 and consensus32
+  winner outputs:468 orthogonal/133 parallel assessable signs, none wrong in
+  each variant. Only0.75% of hard orthogonal factors covered, remainder unknown.
+  Median64 raw magnitude MAE improves about3%, but its magnitude has zero weight;
+  final scores remain61.54%/87.50%. Added reusable audit and seven passing checks.
+  See2026-10-03-probe-correctness.md; no defaults or native behavior changed.
+
+## 2026-10-02 — Orthogonal probes and objective adaptation (opt-in)
+
+- Added conservative +/-source-arc orthogonal probes, median/consensus/half-blend
+  options; preserve original acceptance, owners, soft scores and parallel fields.
+  Eight probe variants keep50% accuracy/87.5% shift despite changing targets.
+- Soft parallel magnitude weight0.05 (from0.1) improves legacy-fine256 to61.54%
+  accuracy/87.5% shift, exact repeat.16/26 correct, no ties. Probes combined with
+  winner add no benefit; prefer simpler no-probe objective. Zero weight collapses
+  to3.85/20.83; weight0.2 and cosine confidence50/83.33.
+-16 valid runs;447 native +48 Python checks. Current leading tested candidate,
+  not production default. Objective also affects reference ranking; no new
+  oracle/removal scores. Full report/JSON in volume-cartographer/docs/fiber_benchmark_runs/
+  2026-10-02-iso20-orthogonal-probes.md. No extra iteration budgets or repair.
+
+## 2026-10-02 — Legacy constraints ported to fine pieces (opt-in)
+
+- Added --legacy-fine-pieces using shared subdivision/remapping: old512/128
+  observations preserved as a multiset, no remeasurement/normalization, fresh
+  fine continuity.16 runs preserve242762 ordinary measurements and mass.
+- Minimum256 + length75/150 per128 voxels, no boundary penalty:50% exact
+  accuracy/87.5% observed shift vs old50%/83.33%; shift count4->3, no ties.
+  Disabled length6.04% vs10.49%. Minimum64 still below baseline; old tuned
+  overlap53.85%/79.17% remains a different tradeoff. No defaults promoted.
+-446 native and46 Python tests pass. Dated full report:
+  volume-cartographer/docs/fiber_benchmark_runs/2026-10-02-iso20-legacy-fine.md
+  and JSON. Only independent readout tested; no new oracle/removal scores.
+
+## 2026-10-02 — Constraint isolation on old overlap (not promoted)
+
+- Added opt-in measurement/readout/ownership ablations, exact frozen class/cost
+  priors and overlap-partitioned length costs. Defaults unchanged.34 native runs
+  on raw40500 iso20,500 iterations,128workers, no inference/retracing.
+- Baseline50% accuracy/83.33% observed shift reproduced exactly. New local
+  scorer alone19.23%/16.67%, losing70.08% of original pair links; consistency
+  rejection26.92%/62.5%, removing28.02%. Reference-only46.15%/83.33%.
+- Binary scores or old graph length+boundary costs each53.85%/79.17%: one
+  accuracy gain but worse shift, not a dominant replacement. New source events
+ 34.62%/29.17%; frozen old mass38.46%/58.33%. No defaults promoted.
+-445 native cases +45 Python checks passed. Full table, link inventory and
+  explicit limitations in docs/fiber_benchmark_runs/2026-10-02-iso20-constraint-isolation.md
+  under volume-cartographer. No new oracle/removal solves; two multi-gauge rows
+  explicitly unavailable. Local geometric subtests remain bundled.
+
+## 2026-10-02 — Coarse/fine source-memory trials (not promoted)
+
+- Added opt-in native deterministic-memory sequence factors: hard512 windows,
+  overlapping512/128 windows, and finite-break chains with disabled-run costs.
+  Fine evidence/length ownership retained once; prepass unchanged; gauges and
+  geometry gaps respected. Conditional DP replaces neither the global solver
+  nor its500-iteration budget. No rejected interval repair used.
+- Seven matched runs: control42.31% accuracy/62.50% shift reproduced exactly;
+  all six memory variants worse (15.38–26.92% accuracy,17.39–30.43% shift).
+  Old overlap baseline50.00%/83.33% remains best. No production default change.
+  Full results: volume-cartographer/docs/fiber_benchmark_runs/2026-10-02-iso20-source-memory.md
+  and adjacent JSON; approved runner action iso20_source_memory.
+- Validation:442 native cases and40 Python checks; exhaustive tiny-factor
+  comparisons, neutral equivalence, deterministic windows and gauge isolation.
+
+## 2026-10-02 — Gap-aware BP follow-ups (no default promotion)
+
+- Tested blended incidence/length costs and winding-only damping; best remains
+  pure length42.31%accuracy/62.50%shift. Added opt-in native checkpoint retention,
+  directed disabled-run opening factors (including fixed prepass Defects), and
+  bounded interval repair using shared normalized BP potentials. Checkpoint
+  selection/cost grid gave no score gain; positive run-opening penalties worse.
+  Repair reduced boundaries61→52 and objective118989→114651 but not winding
+  errors. Overlap50.00%/83.33% remains the relevant baseline. Defaults unchanged.
+- After explicit user correction, remaining benchmark runs capped at500BP
+  iterations; removed higher-budget sweeps from the new runners.440native and
+  40Python checks passed. Full results/commands in2026-10-02-iso20-stable-gap.md
+  and2026-10-02-iso20-stable-followups.md (+JSON); historical table updated.
+
+## 2026-10-02 — Local-event BP gap and length-cost tuning
+
+- Added opt-in hard-continuity active/Defect boundary cost (active-active equality
+  remains hard) and local-event physical-length unary via the existing shared
+  native measure. Defaults unchanged. Completed38 frozen-iso20 trials over
+  minima64/256, boundary/disable costs and500/1000/5000message budgets. Best500
+  setting (min64,gap1000,length300/128vx)42.31%accuracy/62.50%shift versus untuned
+  15.38%/12.50%; it falls to30.77%/58.33% at1000/5000. Overlap50%/83.33% remains
+  better. No promotion. All solves hit message limit; event oracle limitation
+  remains explicit. Full matrix/JSON and historical table updated;437native and
+  18Python checks passed. See2026-10-02-iso20-gap-tuning.md.
+
+## 2026-10-02 — Orthogonal-only cuts and minimum-length sweep
+
+- Removed parallel-transition cuts from local event mode; added --local-min-piece-length with deterministic orthogonal-midpoint spacing/tail checks and intactshortsource handling. Certification/evidence/weights/solver unchanged. Tested8/16/32/64/128/256basevoxels on frozeniso20traces. At64/128/256, independentaccuracy15.3846/15.3846/34.6154%,observedshift12.5/20.8333/16.6667%,pieces8273/4842/2730. Overlapbaseline50%/83.3333%/2732pieces remains stronger. All238464certified measurements retained; no missing referenceevent owners. Oracle scores unavailable due to existingcalibration error at everyminimum. All500message solves hitlimit.436native+4queue+18Python tests passed. Report2026-10-02-iso20-orthogonal-minimum.md and full table updated; no promotion of an experimental minimum.
+
+## 2026-10-02 — Isotropic20 local-event BP trial (partial)
+
+- Reused exact iso20 traces with existing local-constraint-events mode;1879traces become118010clean pieces vs2732overlapping pieces. Independent accuracy11.5385% vs50%; observed shift4.1667% vs83.3333%, with2ambiguous/unbounded readouts. Oracle attempt failed at missing reference-connected gauge calibration; constraint/oracle metrics explicitly unavailable. Reference event mapping4754/4754,missing_owner0. Safe parser support for empty satellite-gauge summaries, no solver edits; earlier five readouts unchanged. See volume-cartographer/docs/fiber_benchmark_runs/2026-10-02-iso20-event-bp.md. No default change.
+
+## 2026-10-02 — Stricter FW/BW consistency crop sweep
+
+- Added optional reverse-only replay radii (defaults20/40 unchanged); tested10/20,5/10 ellipses and20,10,5 isotropic radii with raw40500/full-prefix512/no-history. All five1024³crop variants complete with replay, constraint, oracle/non-oracle and shift metrics. Isotropic20: constraint−25.2365% vs−82.2666%baseline, non-oracle50% vs42.3077%, observed shift83.3333% vs70.8333%; six filtered stops and93.7463%reference retention. No default promotion. Isotropic5 severely over-filters and has an ambiguous reference8 readout. Full table/report/plots updated; default replay exactly reproduced;312native+4queue+42Python tests. See volume-cartographer/docs/fiber_benchmark_runs/2026-10-02-strict-reverse-crop.md.
+
+## 2026-10-02 — Fast historical independent BP metrics
+
+- Filled1024³ u22000/Qual non-oracle and observed24-reference shift columns. Original BP57.6923%/70.8333%; hard-perp34.6154%/70.8333%; hard-both30.7692%/75%; Qual69.2308%/66.6667%. Three CPU solves35.41s total, reused fourth log, no inference. Original BP differs in4/1204initial states, disclosed as current-binary rerun; hard-both/Qual match exactly. Safe missing-gauge parser handling and shared helpers tested. Full table and detailed ladders in volume-cartographer/docs/fiber_benchmark_runs/2026-10-02-{prefix512,fast-historical-independent}.md.
+
+## 2026-10-02 — Raw40500 historical crop replay
+
+- Completed matched1024³ crop replay on cached raw40500 predictions: unfiltered2errors/33.3333%, prefix512 zero errors/100%, with6filtered stops and94.8385%reference distance retained.48directional cases/101.035764mm, cohort identities/lengths and reference hashes checked. CPU1.71/4.11s; no GPU/inference/native changes.42runner/replay tests passed. Updated historical plots, replay date override, and full-metric comparison. Results: volume-cartographer/docs/fiber_benchmark_runs/2026-10-02-prefix512-replay.*.
+
+## 2026-10-02 — Independent raw40500 crop BP readout
+
+- Reused both1024³ traced artifacts/objectives with reference-independent readout, no oracle/pruning: unfiltered9/26=34.6154%, prefix51211/26=42.3077%. Both lack admitted evidence at reference4and12; observed24-reference ladder has7offset changes/70.8333%shift score in both. Full26shift unavailable. No ties/unbounded best candidates. Initial states exactly match previous1212/2394piece solves; no inference or tracing rerun. CPU13.77/34.13s.39CLI/helper tests passed. Details/ladders: volume-cartographer/docs/fiber_benchmark_runs/2026-10-02-prefix512-independent.*.
+
+## 2026-10-02 — Preferred reviewed-tracing baseline
+
+- Promoted full-prefix512/no-history on frozen raw best40500, all91pieces/182directions (no short-sample exclusion):5ordinary errors,66filtered stops,94.7436%retained. Exact snapshot and flags in docs/benchmarks/current_tracing_baseline.md. Selection is cohort-tuned and reference-replay reseeding is GT-assisted.
+- Opt-in GT-free dense-crop periodic-prefix filter reuses the native reverse verifier; preserves old endpoint/backoff behavior. Discards rejected checkpoint intervals and resumes at the next generated vertex, without bridging gaps. Matched1024³ raw40500: constraint benchmark−291.6299→−82.2666%; oracle-reference80.7692→84.6154%. Morepieces546→1661; candidate tracing28.53→45.56s, BP48.28→138.84s. Existing GT-assisted metric definitions preserved; not independentBP accuracy. Report and plots under volume-cartographer/docs/fiber_benchmark_runs/2026-10-02-prefix512.*.
+- Dense crop's serial-owner anchor preparation now uses existing memory-admitted per-cell parallel fitter with CLI thread budget, without changing other schedulers.311native+4Python tests passed including1vs128fixture equivalence. No model/inference/solver numerical settings changed.
+
+## 2026-10-02 — Reverse directional-history seed experiment
+
+- Added optional initial step-direction prior to shared native one-way/extrapolation path. Separate rolling-history sample count preserves actual beam depth/budget/path. Reverse verifier can seed negative local forward edges oldest-to-newest, using actual next vertex; all steps freely inferred and checked. Not exact reversed curvature history and no forced warmup. Defaults unchanged.
+- Frozen40500,91fibers/182directions: cold256 exactly reproduces all previous replay geometry/results (5ordinary/75filtered). At256 H1:7/69, H4:6/70, H8:6/69, so none meets5ordinary cap. H8at128:5/72/98.3165%retained vs old128:5/78/98.1783%; H8at512:6/62/95.0853%, missing cap. Modest improvement at128; old512 still fewest qualifying stops66 with94.7436%retained. No default adoption.
+- Approved runner action reviewed_reverse_history, unchanged cache/inference/192worker pipeline and GPUs0–5. Native23+90+26+86cases and4integration tests,15Pythonconfig tests; strict182case baseline identity audit. Full report: docs/benchmarks/reviewed_reverse_history_40500_20261002.md/.json. Selection tuned on same cohort, not independent validation.
+
+## 2026-10-02 — Full-prefix reverse consistency matrix
+
+- Added opt-in reverse-to-segment-start and all-terminal-endpoint checks to the shared native policy, retaining defaults, matcher,20/40ellipse and inference pipeline. Terminal distance failures converted to filtered stops retain original xyz/reference arc in trace artifacts. No GT in reverse acceptance, but GT-conditioned terminal timing/reseeding remains an explicit diagnostic caveat.
+- Frozen rawu40500,91reviewedfibers/182directions: originalwindow25613ordinary/36filtered/98.4381%retained; window256+terminal8/41/98.3309%. Prefix128:5/78/98.1783%; prefix256:5/75/96.8330%; prefix512:5/66/94.7436%. Plainbaseline16/0/100%. More filtering is not necessarily greater continuity or proven error precision. All complete; no production defaults changed.
+- Approved runner control action reviewed_reverse_prefix. Native suites23+88+26+86cases and4integration tests passed;14Pythonconfiguration tests passed. Exact paths, per-scroll metrics, timings/inference counts in docs/benchmarks/reviewed_reverse_prefix_40500_20261002.md/.json. Convergence shortcut deferred.
+
+## 2026-10-02 — u40500 periodic reverse and GT reverse diagnostics
+
+- Same91/182baseline16ordinaryfailures →13ordinary+36filteredstops,98.438%retained,21.650mmskipped with unchanged256baseperiodic/20x40check/10x20GTreseed. More totalinterruptions49, not an unconditional continuity improvement. Reused checkpoint/cache and parallel pipeline;17tests pass.
+-52probes on13remainingepisodes: tightwrong-routecontrol7/13;GT0tight11/13(regular13/13),GT128/256tight9/13each.6failcontrol;7passcontrolbutalsohaveatleastonetightGTalternative;0diagnosticremainder. GT-assisted/first-segment diagnostic, not deployment detection rate;0/36sustainedconvergence,clippedoffsetsdocumented. Report: docs/benchmarks/reviewed_reference_reverse_halfsigma_sideband_best_raw_20261002.md/.json. No production defaults changed.
+
+## 2026-10-02 — Best raw/EMA sideband comparison
+
+- Froze best rawu40500 and bestEMA99/999u40800 from203634run before evaluation. Same reviewed91fibers/182directions, standard bf16 inference/beam tracing, GPUs0–5, noTTA/filter. Restarts16/22/21; means81.540/60.269/63.008mm. Previousrawu37000:17/77.010mm. Zero infrastructure failures; coordinator269.26/244.02/247.76s. Raw wins this comparison, no defaults changed.
+- Shared freeze helper records per-checkpoint source/hash/time; exact EMA selection guards and12tests. Approved runner reused, no scheduling changes. Reports: docs/benchmarks/reviewed_halfsigma_sideband_best_*_20261002_20261002.md/.json, finalEMA999report includes all results and history. Reviewed32 is validation data, not training inputs; not a blind final-test comparison.
+
+## 2026-10-01 — Latest sideband raw u37000 evaluation
+
+- Frozen current raw from 20261001_203634 (4.736M samples), same reviewed91/182 standard beam evaluation on GPUs0–5.17restarts versus24previousrawu31500; mean77.010mm versus55.447mm. Scroll failures6/0/3/0/8; zero infrastructure failures,254.93s coordinator. Named selection reuses unchanged pipeline;11tests pass. Full comparison: docs/benchmarks/reviewed_halfsigma_current_raw_sideband_reviewed32_v1_20261001.md/.json.
+- Launch config places reviewed32 in test_datasets, not training inputs; original training split remains. This subset is used for validation during training.
+
+## 2026-10-01 — Checkpoint reviewed evaluation work
 ## 2026-10-03 — Resident training trace evaluation
 
 - Replaced per-test Python benchmark launch and training-model evacuation with

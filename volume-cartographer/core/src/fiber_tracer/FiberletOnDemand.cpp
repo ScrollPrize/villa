@@ -530,8 +530,16 @@ void FiberletOnDemandPreprocessor::initialize()
         }
         state_->selectedCellsByChunk[owner].push_back(cell);
     }
-    state_->anchorDataset = FiberletChunkDataset::createOrOpen(config.anchorRoot, config.anchorMetadata);
-    state_->fiberletDataset = FiberletChunkDataset::createOrOpen(config.fiberletRoot, config.fiberletMetadata);
+    if(config.cachedOnly){
+        state_->anchorDataset=FiberletChunkDataset::openExisting(config.anchorRoot);
+        state_->fiberletDataset=FiberletChunkDataset::openExisting(config.fiberletRoot);
+        if(state_->anchorDataset->metadata().datasetFingerprint!=config.anchorMetadata.datasetFingerprint ||
+           state_->fiberletDataset->metadata().datasetFingerprint!=config.fiberletMetadata.datasetFingerprint)
+            throw std::invalid_argument("cached-only Fiberlet metadata mismatch");
+    }else{
+        state_->anchorDataset = FiberletChunkDataset::createOrOpen(config.anchorRoot, config.anchorMetadata);
+        state_->fiberletDataset = FiberletChunkDataset::createOrOpen(config.fiberletRoot, config.fiberletMetadata);
+    }
     const std::weak_ptr<FiberletOnDemandPreprocessor> weak = shared_from_this();
     const auto resolved = [weak](FiberletStorageChunkKind kind, const vc::render::ChunkKey& key, vc::render::ChunkFetchStatus status) {
             const auto self = weak.lock();
@@ -544,6 +552,13 @@ void FiberletOnDemandPreprocessor::initialize()
             const auto self = weak.lock();
             if (!self)
                 throw std::runtime_error("on-demand fiberlet preprocessor was destroyed");
+            if(self->state_->config.cachedOnly){
+                const auto& c=self->state_->config;
+                if(ownedCellCount(codec,c.anchorMetadata,c.grid,c.anchorConfig.cellSizePredictionVoxels)!=0)
+                    throw std::runtime_error("cached-only anchor chunk missing; prepare anchors before tracing");
+                // Canonically outside the cell grid: generation returns an empty
+                // payload without sampling or publishing any file.
+            }
             return self->generateAnchorChunk(key, codec);
         },
         config.anchorCacheOptions,
@@ -554,6 +569,7 @@ void FiberletOnDemandPreprocessor::initialize()
             const auto self = weak.lock();
             if (!self)
                 throw std::runtime_error("on-demand fiberlet preprocessor was destroyed");
+            if(self->state_->config.cachedOnly)throw std::runtime_error("cached-only fiberlet chunk missing");
             return self->generateFiberletChunk(kind, key, codec);
         },
         config.fiberletCacheOptions,

@@ -5,6 +5,7 @@
 #include "vc/core/util/AtomicFile.hpp"
 #include "vc/fiber_tracer/FiberletCropTrace.hpp"
 #include "vc/fiber_tracer/FiberletCropTraceArtifact.hpp"
+#include "vc/fiber_tracer/FiberTiledTrace.hpp"
 #include "vc/fiber_tracer/FiberletDataset.hpp"
 #include "vc/fiber_tracer/FiberTraceBeliefPropagation.hpp"
 #include "vc/fiber_tracer/FiberTraceConstraints.hpp"
@@ -57,6 +58,166 @@ public:
         return {{0, 0, 1}, true, {}};
     }
 };
+
+TEST_CASE("tiled tracing clips cores and retains unique or ambiguous seam candidates")
+{
+    const ZNormalSampler normals;
+    auto line=[](double a,double b,double y){FiberletCropTraceLine l;
+        l.pointsBaseXYZ={{a,y,50},{b,y,50}};l.seedBaseXYZ=l.pointsBaseXYZ.front();
+        l.pathLengthPredictionVoxels=std::abs(b-a);l.totalMetricCost=2*std::abs(b-a);
+        l.segmentMetricCosts={l.totalMetricCost};return l;};
+    FiberTraceTile a,b;
+    a.indexXYZ={0,0,0};b.indexXYZ={1,0,0};
+    a.coreMin={0,0,0};a.coreMax={1024,100,100};a.haloMin={0,0,0};a.haloMax={1088,100,100};
+    b.coreMin={1024,0,0};b.coreMax={2048,100,100};b.haloMin={960,0,0};b.haloMax={2048,100,100};
+    a.lines={line(900,1088,50)};b.lines={line(1150,960,50)}; // opposite stored direction
+    FiberSeamConfig config;config.overlap.threads=2;
+    auto r=assembleFiberTraceTiles({b,a},normals,config);
+    REQUIRE(r.lines.size()==2);REQUIRE(r.topology["candidates"].size()==1);
+    CHECK(r.topology["candidates"][0]["unique"]==true);
+    CHECK(r.lines[0].totalMetricCost==doctest::Approx(248));
+    CHECK(r.lines[0].pointsBaseXYZ[1]==r.lines[0].seedBaseXYZ);
+    CHECK(r.lines[0].segmentMetricCosts.size()+1==r.lines[0].pointsBaseXYZ.size());
+    CHECK(r.lines[1].totalMetricCost==doctest::Approx(252));
+    CHECK(r.lines[0].positiveTermination=="tile_core_cut");
+    CHECK(r.lines[1].positiveTermination=="tile_core_cut");
+    CHECK(r.topology==assembleFiberTraceTiles({a,b},normals,config).topology);
+    CHECK_NOTHROW(requireUnambiguousFiberTiledTopology(r.topology));
+    FiberTraceConstraintReport report;
+    for(std::size_t i=0;i<2;++i){FiberTraceConstraintPiece p;p.traceIndex=i;
+        p.endArcBaseVoxels=r.lines[i].pathLengthPredictionVoxels;p.samplePointsBaseXYZ=r.lines[i].pointsBaseXYZ;report.pieces.push_back(p);}
+    addFiberTileContinuities(report,r.topology,std::array<std::size_t,2>{0,1});
+    REQUIRE(report.constraints.size()==1);CHECK(report.constraints[0].artificialTileSeam);
+    b.lines.push_back(line(1150,960,51));
+    r=assembleFiberTraceTiles({a,b},normals,config);
+    REQUIRE(r.topology["candidates"].size()==2);
+    CHECK_FALSE(r.topology["candidates"][0]["unique"].get<bool>());
+    CHECK_THROWS_AS(requireUnambiguousFiberTiledTopology(r.topology),std::invalid_argument);
+    b.lines={line(1150,960,90)};
+    CHECK(assembleFiberTraceTiles({a,b},normals,config).topology["candidates"].empty());
+    a.lines={line(900,1024,50)};b.lines={line(1150,960,50)};
+    CHECK(assembleFiberTraceTiles({a,b},normals,config).topology["candidates"].empty()); // real terminal, not seam
+    a.lines[0].segmentMetricCosts.clear();
+    CHECK_THROWS_AS(assembleFiberTraceTiles({a,b},normals,config),std::invalid_argument);
+}
+
+TEST_CASE("tiled clipping preserves independent reentries and source arcs")
+{
+    const ZNormalSampler normals;FiberTraceTile t;
+    t.coreMin={0,0,0};t.coreMax={10,10,10};t.haloMin={-2,-2,-2};t.haloMax={12,12,12};
+    FiberletCropTraceLine l;l.pointsBaseXYZ={{1,1,5},{11,1,5},{11,8,5},{1,8,5}};
+    l.segmentMetricCosts={10,7,10};l.totalMetricCost=27;l.pathLengthPredictionVoxels=27;t.lines={l};
+    auto r=assembleFiberTraceTiles({t},normals,FiberSeamConfig{});
+    REQUIRE(r.lines.size()==2);
+    CHECK(r.lines[0].totalMetricCost==doctest::Approx(9));
+    CHECK(r.lines[1].totalMetricCost==doctest::Approx(9));
+    CHECK(r.topology["fragments"][1]["begin_arc"].get<double>()==doctest::Approx(18));
+    CHECK(r.topology["candidates"].empty());
+}
+
+TEST_CASE("tiled tracing matches diagonal corner continuations")
+{
+    const ZNormalSampler normals;
+    std::vector<FiberTraceTile> tiles;
+    for(int x=0;x<2;++x)for(int y=0;y<2;++y)for(int z=0;z<2;++z){
+        FiberTraceTile t;t.indexXYZ={x,y,z};
+        t.coreMin={1024.*x,1024.*y,1024.*z};t.coreMax=t.coreMin+cv::Vec3d(1024,1024,1024);
+        t.haloMin=t.coreMin-cv::Vec3d(64,64,64);t.haloMax=t.coreMax+cv::Vec3d(64,64,64);
+        if(x==y && y==z){
+            FiberletCropTraceLine l;
+            l.pointsBaseXYZ=x?std::vector<cv::Vec3d>{{960,960,960},{1150,1150,1150}}:
+                std::vector<cv::Vec3d>{{900,900,900},{1088,1088,1088}};
+            l.pathLengthPredictionVoxels=cv::norm(l.pointsBaseXYZ.back()-l.pointsBaseXYZ.front());
+            l.totalMetricCost=l.pathLengthPredictionVoxels;l.segmentMetricCosts={l.totalMetricCost};t.lines={l};
+        }
+        tiles.push_back(t);
+    }
+    auto r=assembleFiberTraceTiles(tiles,normals,FiberSeamConfig{});
+    REQUIRE(r.lines.size()==2);REQUIRE(r.topology["candidates"].size()==1);
+    CHECK(r.topology["endpoint_counts"]["unique"]==2);
+    CHECK(r.topology["endpoint_counts"]["unmatched_internal"]==0);
+    CHECK_NOTHROW(requireUnambiguousFiberTiledTopology(r.topology));
+}
+
+TEST_CASE("post reverse piece suppression ranks independent pieces and shorter overlap")
+{
+    const ZNormalSampler normals;
+    const auto line=[](double start,double finish,double y){
+        FiberletCropTraceLine value;
+        value.pointsBaseXYZ={{start,y,0},{finish,y,0}};
+        value.pathLengthPredictionVoxels=finish-start;
+        return value;
+    };
+    FiberPieceOverlapConfig config;config.normalRadiusBase=1;config.tangentialRadiusBase=1;
+    config.fraction=.8;config.threads=4;
+    // The high-quality SHORT piece must suppress the long piece: use its coverage,
+    // not long-piece coverage divided by the short length.
+    std::vector<FiberletCropTraceLine> lines={line(0,100,0),line(40,60,.5),line(120,160,0)};
+    auto result=selectFiberPieceOverlap(lines,{1,2,1},normals,1,config);
+    CHECK(result.retained==std::vector<std::size_t>{1,2});
+    CHECK(result.suppressedBy[0]==1);
+    CHECK(result.overlapFraction[0]==doctest::Approx(1));
+    // Same seed on all three lines intentionally: siblings remain independent.
+    result=selectFiberPieceOverlap(lines,{2,1,1},normals,1,config);
+    CHECK(result.retained==std::vector<std::size_t>{0,2});
+    config.threads=1;
+    CHECK(selectFiberPieceOverlap(lines,{2,1,1},normals,1,config).retained==result.retained);
+    // A-B-C: rejected B cannot suppress C, which does not collide with A.
+    lines={line(0,100,0),line(0,100,.75),line(0,100,1.5)};
+    result=selectFiberPieceOverlap(lines,{3,2,1},normals,1,config);
+    CHECK(result.retained==std::vector<std::size_t>{0,2});
+    CHECK(result.suppressedBy[1]==0);
+    // A perpendicular crossing is not a duplicate, even under a broad radius.
+    lines[1].pointsBaseXYZ={{50,-50,0},{50,50,0}};
+    result=selectFiberPieceOverlap(lines,{3,2,1},normals,1,config);
+    CHECK(result.retained.size()==3);
+    // Partial coverage:40/100 base voxels, not a count of matching vertices.
+    lines={line(0,100,0),line(60,160,0)};
+    config.fraction=.5;
+    CHECK(selectFiberPieceOverlap(lines,{1,1},normals,1,config).retained.size()==2);
+    config.fraction=.4;
+    result=selectFiberPieceOverlap(lines,{1,1},normals,1,config);
+    CHECK(result.retained==std::vector<std::size_t>{0});
+    CHECK(result.overlapFraction[1]==doctest::Approx(.4));
+    // Nonintegral final interval and antiparallel orientation retain full coverage.
+    lines={line(0,3.1,0),line(0,3.1,.5)};
+    std::reverse(lines[1].pointsBaseXYZ.begin(),lines[1].pointsBaseXYZ.end());
+    config.fraction=1;
+    result=selectFiberPieceOverlap(lines,{1,1},normals,1,config);
+    CHECK(result.overlapFraction[1]==doctest::Approx(1));
+    config.fraction=-.1;
+    CHECK_THROWS_AS(selectFiberPieceOverlap(lines,{3,2,1},normals,1,config),std::invalid_argument);
+}
+
+TEST_CASE("zero overlap requires a positive match and measured graph is reusable")
+{
+    const ZNormalSampler normals;
+    FiberPieceOverlapConfig config;config.normalRadiusBase=1;config.tangentialRadiusBase=1;
+    config.sampleStepBase=.25;config.fraction=0;
+    std::vector<FiberletCropTraceLine> lines(3);
+    lines[0].pointsBaseXYZ={{0,0,0},{100,0,0}};
+    lines[1].pointsBaseXYZ={{99,0,0},{199,0,0}}; // very small positive encounter
+    lines[2].pointsBaseXYZ={{300,0,0},{400,0,0}}; // truly disjoint
+    const auto graph=measureFiberPieceOverlap(lines,normals,1,config);
+    const std::vector<double> quality={3,2,1};
+    auto selected=selectFiberPieceOverlap(graph,quality,0);
+    CHECK(selected.retained==std::vector<std::size_t>{0,2});
+    CHECK(selected.overlapFraction[1]>0);
+    CHECK(selected.overlapFraction[1]<.1);
+    for(double fraction:{0.,.1,.2,.8}) {
+        config.fraction=fraction;
+        const auto reused=selectFiberPieceOverlap(graph,quality,fraction);
+        const auto direct=selectFiberPieceOverlap(lines,quality,normals,1,config);
+        CHECK(reused.retained==direct.retained);
+        CHECK(reused.suppressedBy==direct.suppressedBy);
+        CHECK(reused.overlapFraction==direct.overlapFraction);
+        if(fraction>0)CHECK(reused.retained.size()==3);
+    }
+    auto invalid=graph;invalid.shorterPairs[0][0].second=0;
+    CHECK_THROWS_AS(selectFiberPieceOverlap(invalid,quality,0),std::invalid_argument);
+    invalid=graph;invalid.shorterPairs[0].push_back(invalid.shorterPairs[0][0]);
+    CHECK_THROWS_AS(selectFiberPieceOverlap(invalid,quality,0),std::invalid_argument);
+}
 
 class TestGraph final : public FiberletReplayGraphSource
 {
@@ -347,6 +508,16 @@ TEST_CASE("Dense beam crop shares deterministic coverage and roundtrips the BP a
     REQUIRE(artifact.lines.size() == 1);
     CHECK(artifact.lines[0].totalMetricCost == serial.lines[0].totalMetricCost);
     CHECK(artifact.lines[0].pathLengthPredictionVoxels == serial.lines[0].pathLengthPredictionVoxels);
+    auto stopMetadata=config;
+    stopMetadata.stopAtCoveredTraces=true;
+    stopMetadata.coveredTraceNormalRadiusBaseVoxels=2.;
+    stopMetadata.coveredTraceTangentialRadiusBaseVoxels=4.;
+    writeFiberletCropTraceArtifact(directory.path / "stopped.zarr",source,
+        nlohmann::json{{"version",2}},stopMetadata,serial.lines);
+    const auto stoppedArtifact=readFiberletCropTraceArtifact(directory.path / "stopped.zarr");
+    CHECK(stoppedArtifact.metadata.processing["trace"]["stop_at_covered_traces"]==true);
+    CHECK(stoppedArtifact.metadata.processing["trace"]["covered_trace_normal_radius_base"]==2.);
+    CHECK(stoppedArtifact.metadata.processing["trace"]["covered_trace_tangential_radius_base"]==4.);
     FiberTraceConstraintConfig constraintConfig;
     constraintConfig.preserveInputLinesAsPieces = true;
     const auto constraints = extractFiberTraceConstraints(artifact.lines, constraintConfig,
@@ -363,6 +534,79 @@ TEST_CASE("Dense beam crop shares deterministic coverage and roundtrips the BP a
     config.ambiguityRelativeCostMargin.reset();
     config.maximumAcceptedCostDensity = 0.21;
     CHECK_THROWS_AS(traceDenseBeamCrop(field, anchors, 1.0, normals, dense, config), std::invalid_argument);
+}
+
+TEST_CASE("Dense indexed coverage stops converging traces with ordered parallel revalidation")
+{
+    class ConvergingField final : public FiberPredictionSource {
+    public:
+        bool supportsConcurrentSampling() const noexcept override { return true; }
+        FiberPredictionSample sample(const cv::Vec3d&, const cv::Vec3d& hint) const override {
+            FiberPredictionSample s;
+            cv::Vec3d d{1.,std::abs(hint[1])>.1 ? -.25 : 0.,0.}; d/=cv::norm(d);
+            s.options.push_back({d,1.F,true}); return s;
+        }
+    } field;
+    ZNormalSampler normals;
+    FiberletCropTraceConfig c;
+    c.minimumBaseXYZ={0,0,0}; c.maximumBaseXYZ={128,64,64};
+    c.coverageNormalRadiusBaseVoxels=2.; c.coverageTangentialRadiusBaseVoxels=3.;
+    c.coverageDirectionDegrees=45.;
+    FiberTraceConfig dense; dense.coneGridSize=5; dense.stepVoxels=2.;
+    std::vector<FiberletStoredAnchor> anchors{
+        anchor(key(1),{64,32,32},{1,0,0},1.F),
+        anchor(key(2),{8,50,32},{1,-.25,0},.9F)};
+    c.parallelThreads=1;
+    const auto unrestricted=traceDenseBeamCrop(field,anchors,1.,normals,dense,c);
+    c.stopAtCoveredTraces=true;
+    c.captureStepCosts=true;
+    for(bool reverse:{false,true}) {
+        c.reverseConsistency=reverse; c.reversePrefixIntervalBaseVoxels=reverse ? 16. : 0.;
+        c.parallelThreads=1;
+        const auto serial=traceDenseBeamCrop(field,anchors,1.,normals,dense,c);
+        c.parallelThreads=4;
+        const auto parallel=traceDenseBeamCrop(field,anchors,1.,normals,dense,c);
+        CHECK(serial.coveredTraceStops>0);
+        CHECK(parallel.coverageCommitRechecks>0);
+        REQUIRE(serial.lines.size()==parallel.lines.size());
+        for(std::size_t i=0;i<serial.lines.size();++i) {
+            CHECK(serial.lines[i].pointsBaseXYZ==parallel.lines[i].pointsBaseXYZ);
+            CHECK(serial.lines[i].totalMetricCost==parallel.lines[i].totalMetricCost);
+            CHECK(serial.lines[i].pathLengthPredictionVoxels==parallel.lines[i].pathLengthPredictionVoxels);
+            CHECK(serial.lines[i].segmentMetricCosts==parallel.lines[i].segmentMetricCosts);
+            REQUIRE(serial.lines[i].segmentMetricCosts.size()+1==serial.lines[i].pointsBaseXYZ.size());
+        }
+        if(!reverse) {
+            REQUIRE(serial.lines.size()==unrestricted.lines.size());
+            CHECK(serial.lines.back().pathLengthPredictionVoxels<unrestricted.lines.back().pathLengthPredictionVoxels);
+        }
+    }
+}
+
+TEST_CASE("Dense indexed coverage preserves separated parallel and orthogonal traces")
+{
+    class AxisField final : public FiberPredictionSource {
+    public:
+        bool supportsConcurrentSampling() const noexcept override { return true; }
+        FiberPredictionSample sample(const cv::Vec3d&,const cv::Vec3d& hint) const override {
+            FiberPredictionSample s;
+            s.options.push_back({std::abs(hint[0])>std::abs(hint[1]) ? cv::Vec3d{1,0,0} : cv::Vec3d{0,1,0},1.F,true});return s;
+        }
+    } field;
+    ZNormalSampler normals; FiberTraceConfig dense; dense.coneGridSize=5;
+    FiberletCropTraceConfig c; c.minimumBaseXYZ={0,0,0};c.maximumBaseXYZ={64,64,64};
+    c.coverageNormalRadiusBaseVoxels=2;c.coverageTangentialRadiusBaseVoxels=3;c.coverageDirectionDegrees=45;
+    c.parallelThreads=1;
+    const std::vector<FiberletStoredAnchor> anchors{
+        anchor(key(1),{32,32,32},{1,0,0},1.F),
+        anchor(key(2),{32,40,32},{-1,0,0},.9F),
+        anchor(key(3),{32,8,32},{0,1,0},.8F)};
+    const auto baseline=traceDenseBeamCrop(field,anchors,1.,normals,dense,c);
+    c.stopAtCoveredTraces=true;c.parallelThreads=4;
+    const auto stopped=traceDenseBeamCrop(field,anchors,1.,normals,dense,c);
+    REQUIRE(baseline.lines.size()==3);REQUIRE(stopped.lines.size()==3);
+    for(std::size_t i=0;i<3;++i)CHECK(baseline.lines[i].pointsBaseXYZ==stopped.lines[i].pointsBaseXYZ);
+    CHECK(stopped.coveredTraceStops==0);
 }
 
 TEST_CASE("Dense beam crop keeps trace prediction and base coordinate units distinct")
@@ -483,6 +727,15 @@ TEST_CASE("Dense reverse consistency preserves a reversible route and its cost")
     CHECK_FALSE(checked.lines.front().originalSeedBaseXYZ);
     config.parallelThreads = 4;
     CHECK(traceDenseBeamCrop(field, anchors, 8, normals, dense, config).lines.front().pointsBaseXYZ == checked.lines.front().pointsBaseXYZ);
+    config.reversePrefixIntervalBaseVoxels = 32;
+    const auto periodic = traceDenseBeamCrop(field, anchors, 8, normals, dense, config);
+    REQUIRE(periodic.lines.size() == 1);
+    CHECK(periodic.reverseAttempts > checked.reverseAttempts);
+    CHECK(periodic.reverseFailures == 0);
+    CHECK(periodic.reverseSkippedLengthBaseVoxels == 0);
+    CHECK(periodic.lines.front().pointsBaseXYZ == original.lines.front().pointsBaseXYZ);
+    checkCosts(periodic.lines.front());
+    config.reversePrefixIntervalBaseVoxels = 0;
     for (double invalid : {0.0, -1.0, std::numeric_limits<double>::infinity(), std::numeric_limits<double>::quiet_NaN()}) {
         auto bad = config;
         bad.reverseBackoffBaseVoxels = invalid;
@@ -614,6 +867,25 @@ TEST_CASE("Dense reverse consistency detects lateral disagreement and bounds imm
     loose.reverseTangentialRadiusBaseVoxels = 200;
     const auto wide = traceDenseBeamCrop(field, anchors, 1, normals, dense, loose);
     CHECK(wide.reverseSkippedLengthBaseVoxels < tight.reverseSkippedLengthBaseVoxels);
+    auto prefixConfig = config;
+    prefixConfig.reversePrefixIntervalBaseVoxels = 64;
+    const auto prefix = traceDenseBeamCrop(field, anchors, 1, normals, dense, prefixConfig);
+    CHECK(prefix.reverseFailures > 0);
+    CHECK(prefix.reverseSkippedLengthBaseVoxels > 0);
+    double retained = 0;
+    for (const auto& line : prefix.lines)
+        retained += line.pathLengthPredictionVoxels;
+    CHECK(retained + prefix.reverseSkippedLengthBaseVoxels == doctest::Approx(512));
+    prefixConfig.parallelThreads = 4;
+    const auto prefixParallel = traceDenseBeamCrop(field, anchors, 1, normals, dense, prefixConfig);
+    REQUIRE(prefixParallel.lines.size() == prefix.lines.size());
+    for (std::size_t i = 0; i < prefix.lines.size(); ++i)
+        CHECK(prefixParallel.lines[i].pointsBaseXYZ == prefix.lines[i].pointsBaseXYZ);
+    // A terminal check is mandatory even before the first interval.
+    prefixConfig.reversePrefixIntervalBaseVoxels = 512;
+    const auto terminal = traceDenseBeamCrop(field, anchors, 1, normals, dense, prefixConfig);
+    CHECK(terminal.reverseAttempts == 4);
+    CHECK(terminal.reverseFailures > 0);
     field.missing = true;
     const auto stopped = traceDenseBeamCrop(field, anchors, 1, normals, dense, config);
     CHECK(stopped.reverseFailures > 0);
@@ -1913,6 +2185,12 @@ TEST_CASE("Crop trace artifact publishes sparse chunks and restores ordinal orde
         };
     }
     const auto output = directory.path / "crop-traces.zarr";
+    auto captured=lines;
+    for(auto& line:captured)line.segmentMetricCosts={line.totalMetricCost*.4,line.totalMetricCost*.6};
+    const auto capturedPath=directory.path/"captured.zarr";
+    writeFiberletCropTraceArtifact(capturedPath,source,nlohmann::json{{"version",2}},config,captured);
+    const auto restored=readFiberletCropTraceArtifact(capturedPath);
+    for(std::size_t i=0;i<captured.size();++i)CHECK(restored.lines[i].segmentMetricCosts==captured[i].segmentMetricCosts);
     const nlohmann::json preprocessing{
         {"contract", "transient_crop_filter_v1"},
         {"stages", nlohmann::json::array({{{"side_base_voxels", 256}}})},

@@ -653,6 +653,7 @@ struct BeamState {
     float loss = 0.0f;
     float tracedLength = 0.0f;
     int depth = 0;
+    int historySamples = 0;
     bool valid = false;
     bool reached = false;
     uint8_t crossedTargetPlaneMask = 0;
@@ -1583,7 +1584,8 @@ void updateTargetPlaneCrossings(
     out.path = appendBeamPathPoint(parent.path, candidate.point, candidate.loss);
     out.previousStepDirection = task.direction;
     out.currentSampleDirection = score.selectedCurrentDirection;
-    out.historyDirection = updateHistoryDirection(parent.historyDirection, task.direction, parent.depth, config.cumulativeSmoothnessSteps);
+    out.historyDirection = updateHistoryDirection(parent.historyDirection, task.direction, parent.historySamples, config.cumulativeSmoothnessSteps);
+    out.historySamples = std::min(parent.historySamples + 1, std::max(1, config.cumulativeSmoothnessSteps));
     out.loss = candidate.loss;
     out.tracedLength = parent.tracedLength + traceLength(candidate.point - beamEndpoint(parent));
     if (config.embeddingWeight > 0 && config.embeddingIntegration.active())
@@ -1962,6 +1964,16 @@ template <typename LossAt>
     initial.previousStepDirection = startDirection;
     initial.currentSampleDirection = startDirection;
     initial.historyDirection = startDirection;
+    for (const auto& direction : request.initialStepDirections) {
+        if (!finitePoint(direction) || length(direction) <= kEpsilon)
+            throw std::invalid_argument("initial step history must contain finite nonzero directions");
+        const auto prior = toTraceVec(normalizedOrZero(direction));
+        initial.historyDirection = updateHistoryDirection(initial.historyDirection, prior,
+            initial.historySamples, request.config.cumulativeSmoothnessSteps);
+        initial.historySamples = std::min(initial.historySamples + 1,
+            std::max(1, request.config.cumulativeSmoothnessSteps));
+        initial.previousStepDirection = prior;
+    }
     if (request.config.embeddingWeight > 0) {
         std::vector<std::vector<float>> seed;
         predictions.sampleEmbeddings({start}, seed);
@@ -4273,7 +4285,8 @@ FiberTraceOneWayResult traceFiberExtrapolation(
     const FiberTraceConfig& config,
     const vc::lasagna::NormalSampler* normalSampler,
     const FiberTraceProgressCallback& progress,
-    const std::function<bool(const cv::Vec3d&, double, int)>& committedStep)
+    const std::function<bool(const cv::Vec3d&, double, int)>& committedStep,
+    const std::vector<cv::Vec3d>& initialStepDirections)
 {
     if (!finitePoint(startPoint) || !finitePoint(outwardDirection)) {
         throw std::invalid_argument("fiber extrapolation request contains a non-finite point or direction");
@@ -4290,6 +4303,7 @@ FiberTraceOneWayResult traceFiberExtrapolation(
     request.startPoint = startPoint;
     request.targetPoint = startPoint + direction * distanceVoxels;
     request.initialDirection = direction;
+    request.initialStepDirections = initialStepDirections;
     request.budgetSpanVoxels = distanceVoxels;
     // No target planes and no endpoint acceptance here: an open-tail
     // extrapolation has a synthetic target at the requested distance, nothing
@@ -4571,13 +4585,33 @@ double verifyFiberReverseSpan(const FiberPredictionSource& predictions,
     const PolylineArcGeometry& geometry, double startArc,
     double normalRadiusBase, double tangentialRadiusBase)
 {
-    const auto start = samplePolylineArc(geometry, startArc);
-    double verifiedArc = startArc;
+    if (!std::isfinite(normalRadiusBase) || !(normalRadiusBase > 0.0) ||
+        !std::isfinite(tangentialRadiusBase) || !(tangentialRadiusBase > 0.0))
+        throw std::invalid_argument("reverse radii must be finite and positive");
+    auto start = samplePolylineArc(geometry, startArc);
+    std::vector<cv::Vec3d> prior;
+    if (config.replayReverseHistorySteps < 0 || config.replayReverseHistorySteps > 64)
+        throw std::invalid_argument("reverse history steps must be in [0,64]");
+    if (config.replayReverseHistorySteps > 0) {
+        // Snap to the next actual forward vertex. Replay checkpoints already
+        // end exactly on a vertex, so this mainly guards other callers.
+        const auto it = std::lower_bound(geometry.vertexArcs.begin(), geometry.vertexArcs.end(), startArc);
+        const size_t end = std::min(static_cast<size_t>(it - geometry.vertexArcs.begin()), geometry.points.size() - 1);
+        start.point = geometry.points[end];
+        start.arc = geometry.vertexArcs[end];
+        const size_t begin = end - std::min(end, static_cast<size_t>(config.replayReverseHistorySteps));
+        for (size_t i = begin; i < end; ++i) {
+            const auto direction = geometry.points[i] - geometry.points[i + 1];
+            if (length(direction) > kEpsilon) prior.push_back(normalizedOrZero(direction));
+        }
+        if (!prior.empty()) start.tangent = -prior.back();
+    }
+    double verifiedArc = config.replayReverseHistorySteps > 0 ? start.arc : startArc;
     cv::Vec3d previous = start.point;
     const double scale = config.traceToBaseScale;
     try {
         (void)traceFiberExtrapolation(predictions, start.point / scale,
-            -start.tangent, std::max(3.0 * startArc / scale,
+            -start.tangent, std::max(3.0 * verifiedArc / scale,
                 2.0 * config.stepVoxels), config, &normals, {},
             [&](const cv::Vec3d& tracePoint, double, int) {
                 const cv::Vec3d point = tracePoint * scale;
@@ -4600,7 +4634,7 @@ double verifyFiberReverseSpan(const FiberPredictionSource& predictions,
                     return false;
                 verifiedArc = projection.arc;
                 return verifiedArc > kEpsilon;
-            });
+            }, prior);
     } catch (const std::invalid_argument& error) {
         // Same missing-start policy as reference replay. A reverse
         // seed in a prediction hole is an immediate failed check;
@@ -4775,13 +4809,16 @@ static FiberReplayTraceResult traceFiberReplayImpl(
         };
     ReplayConsistencyPolicy consistency;
     consistency.intervalBase = request.config.replayReverseIntervalBase;
+    consistency.toStart = request.config.replayReverseToStart;
+    consistency.allEndpoints = request.config.replayReverseAllEndpoints;
     if (consistency.intervalBase > 0) {
         consistency.verify = [&](const std::vector<cv::Vec3d>& points) {
             const auto geometry = makePolylineArcGeometry(points);
             auto config = request.config;
             config.traceToBaseScale = request.traceToBaseScale;
             return verifyFiberReverseSpan(predictions, normalSampler, config,
-                geometry, geometry.length(), 20.0, 40.0) <= kEpsilon;
+                geometry, geometry.length(), config.replayReverseNormalRadiusBase,
+                config.replayReverseTangentialRadiusBase) <= kEpsilon;
         };
         consistency.nextSeed = [&](double fromArc) -> std::optional<PolylineArcSample> {
             return findFiberReplayRestartSeed(predictions, request, normalSampler,

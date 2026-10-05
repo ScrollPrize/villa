@@ -163,7 +163,8 @@ std::optional<BoxClippedLineSegment> clipLineSegmentToHalfOpenBox(
 std::vector<std::vector<cv::Vec3d>> clipPolylineToHalfOpenBox(
     const std::vector<cv::Vec3d>& points,
     const cv::Vec3d& minimum,
-    const cv::Vec3d& maximum)
+    const cv::Vec3d& maximum,
+    std::vector<std::pair<double, double>>* sourceArcs)
 {
     validateBox(minimum, maximum);
     for (const auto& point : points) {
@@ -171,13 +172,19 @@ std::vector<std::vector<cv::Vec3d>> clipPolylineToHalfOpenBox(
             throw std::invalid_argument("polyline clipping input must be finite");
     }
     std::vector<std::vector<cv::Vec3d>> runs;
+    if (sourceArcs) sourceArcs->clear();
+    double arc=0, beginArc=0, endArc=0;
     std::vector<cv::Vec3d> current;
     const auto finishCurrent = [&] {
-        if (current.size() >= 2)
+        if (current.size() >= 2) {
             runs.push_back(std::move(current));
+            if (sourceArcs) sourceArcs->emplace_back(beginArc,endArc);
+        }
         current.clear();
     };
     for (std::size_t index = 1; index < points.size(); ++index) {
+        const double length=vectorLength(points[index]-points[index-1]);
+        const double startArc=arc;arc+=length;
         const auto clipped = clipLineSegmentToHalfOpenBox(
             points[index - 1], points[index], minimum, maximum);
         if (!clipped) {
@@ -188,9 +195,11 @@ std::vector<std::vector<cv::Vec3d>> clipPolylineToHalfOpenBox(
             vectorLength(current.back() - clipped->start) > kEpsilon) {
             finishCurrent();
             current.push_back(clipped->start);
+            beginArc=startArc+length*clipped->beginFraction;
         }
         if (vectorLength(current.back() - clipped->finish) > kEpsilon)
             current.push_back(clipped->finish);
+        endArc=startArc+length*clipped->endFraction;
         if (!pointInHalfOpenBox(points[index], minimum, maximum))
             finishCurrent();
     }

@@ -1531,6 +1531,8 @@ nlohmann::json greedyReplayJson(
             {"trace_cumulative_losses", segment.cumulativeLosses},
             {"matches", std::move(matches)},
         });
+        if (segment.filteredDistanceFailure)
+            root["segments"].back()["filtered_distance_failure_xyz_arc"] = *segment.filteredDistanceFailure;
     }
     for (const auto& failure : replay.failures)
         root["failures"].push_back(failureJson(
@@ -2953,6 +2955,8 @@ FiberReplayTraceResult fiberReplayTraceFromJson(const nlohmann::json& document)
         segment.startReferenceArcBase = value.at("start_reference_arc_base");
         segment.endReferenceArcBase = value.at("end_reference_arc_base");
         segment.terminationReason = value.at("termination_reason").get<std::string>();
+        if (value.contains("filtered_distance_failure_xyz_arc"))
+            segment.filteredDistanceFailure = value.at("filtered_distance_failure_xyz_arc").get<std::array<double, 4>>();
         for (const auto& p : value.at("trace_points_base_xyz")) segment.tracePointsBase.push_back(point(p));
         segment.cumulativeLosses = value.at("trace_cumulative_losses").get<std::vector<double>>();
         for (const auto& m : value.at("matches")) {

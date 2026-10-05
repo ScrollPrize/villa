@@ -1,0 +1,59 @@
+{
+  "anchor_preparation": {
+    "mean_seconds": 27.33355,
+    "owner_chunks": 8,
+    "p50_seconds": 27.22975,
+    "p95_seconds": 29.111075
+  },
+  "output": "/ephemeral/hendrik/fiber_crop_bench/20261002_raw40500_prefix512_v1",
+  "rows": [
+    {
+      "constraint_score_percent": -402.06112295664536,
+      "exact_references": 22,
+      "missing_references": 1,
+      "policy": "Historical u22000, hard-sign BP (different trace coverage)",
+      "problematic_unique_constraints": 33942,
+      "reference_score_percent": 84.61538461538461,
+      "retained_fulfilled_unique_constraints": 8442,
+      "wrong_references": 3
+    },
+    {
+      "bp_seconds": 48.275929258030374,
+      "candidate_batch_seconds": 28.53137531,
+      "constraint_score_percent": -291.62990855298546,
+      "discarded_length_base": 0.0,
+      "exact_references": 21,
+      "missing_references": 1,
+      "policy": "unfiltered",
+      "problematic_unique_constraints": 27107,
+      "reference_score_percent": 80.76923076923077,
+      "retained_fulfilled_unique_constraints": 9295,
+      "retained_length_base": 411843.91120705614,
+      "retained_of_own_candidates_percent": 100.0,
+      "reverse_attempts": 0,
+      "reverse_failures": 0,
+      "trace_count": 546,
+      "tracing_seconds": 255.84382140199887,
+      "wrong_references": 4
+    },
+    {
+      "bp_seconds": 138.8416664340184,
+      "candidate_batch_seconds": 45.556849752,
+      "constraint_score_percent": -82.26659180761223,
+      "discarded_length_base": 910925.1307763003,
+      "exact_references": 22,
+      "missing_references": 1,
+      "policy": "prefix512",
+      "problematic_unique_constraints": 70333,
+      "reference_score_percent": 84.61538461538461,
+      "retained_fulfilled_unique_constraints": 85494,
+      "retained_length_base": 660671.0858685707,
+      "retained_of_own_candidates_percent": 42.03822068743632,
+      "reverse_attempts": 4844,
+      "reverse_failures": 2263,
+      "trace_count": 1661,
+      "tracing_seconds": 54.8693575799698,
+      "wrong_references": 3
+    }
+  ]
+}

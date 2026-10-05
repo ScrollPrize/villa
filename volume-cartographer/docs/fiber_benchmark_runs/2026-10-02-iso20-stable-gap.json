@@ -1,0 +1,3468 @@
+{
+  "a0-damp0p1-i500": {
+    "active_components": 36,
+    "alpha": 0,
+    "boundaries": 500,
+    "boundary_cost": 1000,
+    "control": false,
+    "converged": false,
+    "correct_references": 5,
+    "damping": 0.1,
+    "diagnostics": [
+      "local constraint events: pieces=8273 constraints=244858 continuity=6394 consistency_rejected=1531057 support_rejected=0 certified=238464 retained_certified=238464 refined=96283 midpoint_cuts=6394 transition_cuts=0 parallel_omitted=0",
+      "reference cross source events: certified=4754 retained=4754 missing_owner=0",
+      "message_limit  8273  8273  30395  389  0.003456  0.008759  0.250000  1  500  67.319669  128  376778  -5  4  0  9  0.914890  18.111438"
+    ],
+    "disabled_length": 130536.39879636513,
+    "disabled_percent": 17.243067266563656,
+    "endpoint_gaps": 206,
+    "gap_runs": 811,
+    "independent_missing": 2,
+    "independent_percent": 19.23076923076923,
+    "interior_gaps": 147,
+    "ladder": [
+      {
+        "hard_sign_errors": "55",
+        "reference": "0",
+        "winding": "0"
+      },
+      {
+        "hard_sign_errors": "12",
+        "reference": "0.5",
+        "winding": "1.5"
+      },
+      {
+        "hard_sign_errors": "39",
+        "reference": "1",
+        "winding": "1"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "1.5",
+        "winding": "1.5"
+      },
+      {
+        "hard_sign_errors": "26",
+        "reference": "2",
+        "winding": "4"
+      },
+      {
+        "hard_sign_errors": "59",
+        "reference": "2.5",
+        "winding": "2.5"
+      },
+      {
+        "hard_sign_errors": "10",
+        "reference": "3",
+        "winding": "2"
+      },
+      {
+        "hard_sign_errors": "54",
+        "reference": "3.5",
+        "winding": "3.5"
+      },
+      {
+        "hard_sign_errors": "20",
+        "reference": "4.5",
+        "winding": "3.5"
+      },
+      {
+        "hard_sign_errors": "22",
+        "reference": "5",
+        "winding": "2.5"
+      },
+      {
+        "hard_sign_errors": "7",
+        "reference": "5.5",
+        "winding": "3.5"
+      },
+      {
+        "hard_sign_errors": "33",
+        "reference": "6",
+        "winding": "1"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "6.5",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "17",
+        "reference": "7",
+        "winding": "-0.5"
+      },
+      {
+        "hard_sign_errors": "10",
+        "reference": "7.5",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "8",
+        "winding": "3"
+      },
+      {
+        "hard_sign_errors": "32",
+        "reference": "8.5",
+        "winding": "-1.5"
+      },
+      {
+        "hard_sign_errors": "33",
+        "reference": "9",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "28",
+        "reference": "9.5",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "7",
+        "reference": "10",
+        "winding": "1"
+      },
+      {
+        "hard_sign_errors": "13",
+        "reference": "10.5",
+        "winding": "1.5"
+      },
+      {
+        "hard_sign_errors": "2",
+        "reference": "11",
+        "winding": "2"
+      },
+      {
+        "hard_sign_errors": "6",
+        "reference": "11.5",
+        "winding": "2.5"
+      },
+      {
+        "hard_sign_errors": "7",
+        "reference": "12.5",
+        "winding": "2.5"
+      }
+    ],
+    "ladder_shift_percent": null,
+    "ladder_shifts": null,
+    "length_cost": 300,
+    "messages": 500,
+    "minimum": 64,
+    "missing_references": [
+      "4",
+      "12"
+    ],
+    "observed_ladder_shift": {
+      "ladder_shift_percent": 20.833333333333336,
+      "ladder_shifts": 19,
+      "note": "missing references omitted; bridges across gaps, not the full26-reference metric",
+      "references": 24
+    },
+    "prepass_identical": true,
+    "projected_defects": 2,
+    "references": 26,
+    "seconds": 36.138174056017306,
+    "shift_unavailable": "incomplete reference ladder",
+    "solver_fields": {
+      "calibration_mode": "fixed",
+      "continuous_coordinate_energy": "0.000000",
+      "converged": "false",
+      "data_energy": "1400844.055166",
+      "decoded_energy": "1400844.055166",
+      "defect_cost_per_constraint": "100.000000",
+      "entropy": "0.000000",
+      "grid_cells": "1",
+      "grid_shifts": "0",
+      "hard_sign_projected_defects": "2",
+      "hard_sign_slack_energy": "0.000000",
+      "local_span_energy": "0.000000",
+      "lower_boundary": "0.000000",
+      "max_gain": "1.216545",
+      "min_gain": "1.216545",
+      "orientation_mode": "fixed-prepass",
+      "phase_map": "0.500000",
+      "phase_mean": "0.500000",
+      "piece_break_cost": "1000.000000",
+      "scale_map": "0.822000",
+      "scale_mean": "0.822000",
+      "solver": "joint_grid",
+      "upper_boundary": "0.000000"
+    },
+    "tied_rows": 3,
+    "total_length": 757036.9979910165,
+    "unbounded_rows": 3,
+    "whole_disabled_traces": 458
+  },
+  "a0-damp0p25-i500": {
+    "active_components": 35,
+    "alpha": 0,
+    "boundaries": 440,
+    "boundary_cost": 1000,
+    "control": false,
+    "converged": false,
+    "correct_references": 5,
+    "damping": 0.25,
+    "diagnostics": [
+      "local constraint events: pieces=8273 constraints=244858 continuity=6394 consistency_rejected=1531057 support_rejected=0 certified=238464 retained_certified=238464 refined=96283 midpoint_cuts=6394 transition_cuts=0 parallel_omitted=0",
+      "reference cross source events: certified=4754 retained=4754 missing_owner=0",
+      "message_limit  8273  8273  30395  389  0.003456  0.009119  0.250000  1  500  0.833333  128  376778  -5  3  0  8  0.939998  19.668999"
+    ],
+    "disabled_length": 128336.16829203551,
+    "disabled_percent": 16.952430149729413,
+    "endpoint_gaps": 200,
+    "gap_runs": 783,
+    "independent_missing": 2,
+    "independent_percent": 19.23076923076923,
+    "interior_gaps": 120,
+    "ladder": [
+      {
+        "hard_sign_errors": "37",
+        "reference": "0",
+        "winding": "3"
+      },
+      {
+        "hard_sign_errors": "24",
+        "reference": "0.5",
+        "winding": "8.5"
+      },
+      {
+        "hard_sign_errors": "28",
+        "reference": "1",
+        "winding": "7"
+      },
+      {
+        "hard_sign_errors": "3",
+        "reference": "1.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "26",
+        "reference": "2",
+        "winding": "5"
+      },
+      {
+        "hard_sign_errors": "63",
+        "reference": "2.5",
+        "winding": "5.5"
+      },
+      {
+        "hard_sign_errors": "7",
+        "reference": "3",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "45",
+        "reference": "3.5",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "22",
+        "reference": "4.5",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "18",
+        "reference": "5",
+        "winding": "5"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "5.5",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "31",
+        "reference": "6",
+        "winding": "7"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "6.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "18",
+        "reference": "7",
+        "winding": "7"
+      },
+      {
+        "hard_sign_errors": "12",
+        "reference": "7.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "8",
+        "winding": "3.5"
+      },
+      {
+        "hard_sign_errors": "26",
+        "reference": "8.5",
+        "winding": "8.5"
+      },
+      {
+        "hard_sign_errors": "27",
+        "reference": "9",
+        "winding": "4"
+      },
+      {
+        "hard_sign_errors": "18",
+        "reference": "9.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "9",
+        "reference": "10",
+        "winding": "7"
+      },
+      {
+        "hard_sign_errors": "9",
+        "reference": "10.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "4",
+        "reference": "11",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "5",
+        "reference": "11.5",
+        "winding": "5.5"
+      },
+      {
+        "hard_sign_errors": "7",
+        "reference": "12.5",
+        "winding": "5.5"
+      }
+    ],
+    "ladder_shift_percent": null,
+    "ladder_shifts": null,
+    "length_cost": 300,
+    "messages": 500,
+    "minimum": 64,
+    "missing_references": [
+      "4",
+      "12"
+    ],
+    "observed_ladder_shift": {
+      "ladder_shift_percent": 25.0,
+      "ladder_shifts": 18,
+      "note": "missing references omitted; bridges across gaps, not the full26-reference metric",
+      "references": 24
+    },
+    "prepass_identical": true,
+    "projected_defects": 0,
+    "references": 26,
+    "seconds": 37.32289667002624,
+    "shift_unavailable": "incomplete reference ladder",
+    "solver_fields": {
+      "calibration_mode": "fixed",
+      "continuous_coordinate_energy": "0.000000",
+      "converged": "false",
+      "data_energy": "1300367.515888",
+      "decoded_energy": "1300367.515888",
+      "defect_cost_per_constraint": "100.000000",
+      "entropy": "0.000000",
+      "grid_cells": "1",
+      "grid_shifts": "0",
+      "hard_sign_projected_defects": "0",
+      "hard_sign_slack_energy": "0.000000",
+      "local_span_energy": "0.000000",
+      "lower_boundary": "0.000000",
+      "max_gain": "1.216545",
+      "min_gain": "1.216545",
+      "orientation_mode": "fixed-prepass",
+      "phase_map": "0.500000",
+      "phase_mean": "0.500000",
+      "piece_break_cost": "1000.000000",
+      "scale_map": "0.822000",
+      "scale_mean": "0.822000",
+      "solver": "joint_grid",
+      "upper_boundary": "0.000000"
+    },
+    "tied_rows": 4,
+    "total_length": 757036.9979910165,
+    "unbounded_rows": 4,
+    "whole_disabled_traces": 463
+  },
+  "a0-damp0p5-i500": {
+    "active_components": 25,
+    "alpha": 0,
+    "boundaries": 223,
+    "boundary_cost": 1000,
+    "control": false,
+    "converged": false,
+    "correct_references": 8,
+    "damping": 0.5,
+    "diagnostics": [
+      "local constraint events: pieces=8273 constraints=244858 continuity=6394 consistency_rejected=1531057 support_rejected=0 certified=238464 retained_certified=238464 refined=96283 midpoint_cuts=6394 transition_cuts=0 parallel_omitted=0",
+      "reference cross source events: certified=4754 retained=4754 missing_owner=0",
+      "message_limit  8273  8273  30395  389  0.003456  0.009183  0.250000  3  500  647.523696  128  428930  -6  5  0  11  0.873660  20.958990"
+    ],
+    "disabled_length": 90097.43278863825,
+    "disabled_percent": 11.901324905880942,
+    "endpoint_gaps": 111,
+    "gap_runs": 608,
+    "independent_missing": 2,
+    "independent_percent": 30.76923076923077,
+    "interior_gaps": 56,
+    "ladder": [
+      {
+        "hard_sign_errors": "31",
+        "reference": "0",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "45",
+        "reference": "0.5",
+        "winding": "0.5"
+      },
+      {
+        "hard_sign_errors": "30",
+        "reference": "1",
+        "winding": "0"
+      },
+      {
+        "hard_sign_errors": "6",
+        "reference": "1.5",
+        "winding": "1.5"
+      },
+      {
+        "hard_sign_errors": "15",
+        "reference": "2",
+        "winding": "2"
+      },
+      {
+        "hard_sign_errors": "13",
+        "reference": "2.5",
+        "winding": "2.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "3",
+        "winding": "3"
+      },
+      {
+        "hard_sign_errors": "17",
+        "reference": "3.5",
+        "winding": "3.5"
+      },
+      {
+        "hard_sign_errors": "2",
+        "reference": "4.5",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "2",
+        "reference": "5",
+        "winding": "5"
+      },
+      {
+        "hard_sign_errors": "7",
+        "reference": "5.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "29",
+        "reference": "6",
+        "winding": "5"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "6.5",
+        "winding": "5.5"
+      },
+      {
+        "hard_sign_errors": "19",
+        "reference": "7",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "9",
+        "reference": "7.5",
+        "winding": "5.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "8",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "28",
+        "reference": "8.5",
+        "winding": "-0.5"
+      },
+      {
+        "hard_sign_errors": "35",
+        "reference": "9",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "11",
+        "reference": "9.5",
+        "winding": "0.5"
+      },
+      {
+        "hard_sign_errors": "8",
+        "reference": "10",
+        "winding": "1"
+      },
+      {
+        "hard_sign_errors": "18",
+        "reference": "10.5",
+        "winding": "-1"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "11",
+        "winding": "3"
+      },
+      {
+        "hard_sign_errors": "4",
+        "reference": "11.5",
+        "winding": "3.5"
+      },
+      {
+        "hard_sign_errors": "7",
+        "reference": "12.5",
+        "winding": "4.5"
+      }
+    ],
+    "ladder_shift_percent": null,
+    "ladder_shifts": null,
+    "length_cost": 300,
+    "messages": 500,
+    "minimum": 64,
+    "missing_references": [
+      "4",
+      "12"
+    ],
+    "observed_ladder_shift": {
+      "ladder_shift_percent": 54.16666666666667,
+      "ladder_shifts": 11,
+      "note": "missing references omitted; bridges across gaps, not the full26-reference metric",
+      "references": 24
+    },
+    "prepass_identical": true,
+    "projected_defects": 2,
+    "references": 26,
+    "seconds": 39.253257787029725,
+    "shift_unavailable": "incomplete reference ladder",
+    "solver_fields": {
+      "calibration_mode": "fixed",
+      "continuous_coordinate_energy": "0.000000",
+      "converged": "false",
+      "data_energy": "800895.605272",
+      "decoded_energy": "800895.605272",
+      "defect_cost_per_constraint": "100.000000",
+      "entropy": "0.000000",
+      "grid_cells": "1",
+      "grid_shifts": "0",
+      "hard_sign_projected_defects": "2",
+      "hard_sign_slack_energy": "0.000000",
+      "local_span_energy": "0.000000",
+      "lower_boundary": "0.000000",
+      "max_gain": "1.216545",
+      "min_gain": "1.216545",
+      "orientation_mode": "fixed-prepass",
+      "phase_map": "0.500000",
+      "phase_mean": "0.500000",
+      "piece_break_cost": "1000.000000",
+      "scale_map": "0.822000",
+      "scale_mean": "0.822000",
+      "solver": "joint_grid",
+      "upper_boundary": "0.000000"
+    },
+    "tied_rows": 2,
+    "total_length": 757036.9979910165,
+    "unbounded_rows": 2,
+    "whole_disabled_traces": 441
+  },
+  "a0p25-damp0p1-i500": {
+    "active_components": 49,
+    "alpha": 0.25,
+    "boundaries": 316,
+    "boundary_cost": 1000,
+    "control": false,
+    "converged": false,
+    "correct_references": 5,
+    "damping": 0.1,
+    "diagnostics": [
+      "local constraint events: pieces=8273 constraints=244858 continuity=6394 consistency_rejected=1531057 support_rejected=0 certified=238464 retained_certified=238464 refined=96283 midpoint_cuts=6394 transition_cuts=0 parallel_omitted=0",
+      "reference cross source events: certified=4754 retained=4754 missing_owner=0",
+      "message_limit  8273  8273  30395  389  0.003456  0.008079  0.250000  1  500  67.719846  128  376778  -5  3  0  8  0.929996  15.902268"
+    ],
+    "disabled_length": 129219.11415916817,
+    "disabled_percent": 17.069061948370134,
+    "endpoint_gaps": 178,
+    "gap_runs": 712,
+    "independent_missing": 2,
+    "independent_percent": 19.23076923076923,
+    "interior_gaps": 69,
+    "ladder": [
+      {
+        "hard_sign_errors": "54",
+        "reference": "0",
+        "winding": "9"
+      },
+      {
+        "hard_sign_errors": "13",
+        "reference": "0.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "41",
+        "reference": "1",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "3",
+        "reference": "1.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "23",
+        "reference": "2",
+        "winding": "9"
+      },
+      {
+        "hard_sign_errors": "62",
+        "reference": "2.5",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "8",
+        "reference": "3",
+        "winding": "7"
+      },
+      {
+        "hard_sign_errors": "48",
+        "reference": "3.5",
+        "winding": "8.5"
+      },
+      {
+        "hard_sign_errors": "20",
+        "reference": "4.5",
+        "winding": "9.5"
+      },
+      {
+        "hard_sign_errors": "21",
+        "reference": "5",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "8",
+        "reference": "5.5",
+        "winding": "9.5"
+      },
+      {
+        "hard_sign_errors": "33",
+        "reference": "6",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "6.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "15",
+        "reference": "7",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "11",
+        "reference": "7.5",
+        "winding": "5.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "8",
+        "winding": "8"
+      },
+      {
+        "hard_sign_errors": "34",
+        "reference": "8.5",
+        "winding": "3.5"
+      },
+      {
+        "hard_sign_errors": "30",
+        "reference": "9",
+        "winding": "9"
+      },
+      {
+        "hard_sign_errors": "28",
+        "reference": "9.5",
+        "winding": "9.5"
+      },
+      {
+        "hard_sign_errors": "7",
+        "reference": "10",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "12",
+        "reference": "10.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "4",
+        "reference": "11",
+        "winding": "7"
+      },
+      {
+        "hard_sign_errors": "7",
+        "reference": "11.5",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "8",
+        "reference": "12.5",
+        "winding": "7.5"
+      }
+    ],
+    "ladder_shift_percent": null,
+    "ladder_shifts": null,
+    "length_cost": 300,
+    "messages": 500,
+    "minimum": 64,
+    "missing_references": [
+      "4",
+      "12"
+    ],
+    "observed_ladder_shift": {
+      "ladder_shift_percent": 33.333333333333336,
+      "ladder_shifts": 16,
+      "note": "missing references omitted; bridges across gaps, not the full26-reference metric",
+      "references": 24
+    },
+    "prepass_identical": true,
+    "projected_defects": 0,
+    "references": 26,
+    "seconds": 35.16367995302426,
+    "shift_unavailable": "incomplete reference ladder",
+    "solver_fields": {
+      "calibration_mode": "fixed",
+      "continuous_coordinate_energy": "0.000000",
+      "converged": "false",
+      "data_energy": "1080582.050816",
+      "decoded_energy": "1080582.050816",
+      "defect_cost_per_constraint": "100.000000",
+      "entropy": "0.000000",
+      "grid_cells": "1",
+      "grid_shifts": "0",
+      "hard_sign_projected_defects": "0",
+      "hard_sign_slack_energy": "0.000000",
+      "local_span_energy": "0.000000",
+      "lower_boundary": "0.000000",
+      "max_gain": "1.216545",
+      "min_gain": "1.216545",
+      "orientation_mode": "fixed-prepass",
+      "phase_map": "0.500000",
+      "phase_mean": "0.500000",
+      "piece_break_cost": "1000.000000",
+      "scale_map": "0.822000",
+      "scale_mean": "0.822000",
+      "solver": "joint_grid",
+      "upper_boundary": "0.000000"
+    },
+    "tied_rows": 4,
+    "total_length": 757036.9979910165,
+    "unbounded_rows": 4,
+    "whole_disabled_traces": 465
+  },
+  "a0p25-damp0p25-i500": {
+    "active_components": 35,
+    "alpha": 0.25,
+    "boundaries": 288,
+    "boundary_cost": 1000,
+    "control": false,
+    "converged": false,
+    "correct_references": 5,
+    "damping": 0.25,
+    "diagnostics": [
+      "local constraint events: pieces=8273 constraints=244858 continuity=6394 consistency_rejected=1531057 support_rejected=0 certified=238464 retained_certified=238464 refined=96283 midpoint_cuts=6394 transition_cuts=0 parallel_omitted=0",
+      "reference cross source events: certified=4754 retained=4754 missing_owner=0",
+      "message_limit  8273  8273  30395  389  0.003456  0.008355  0.250000  2  500  134.391575  128  403579  -5  4  0  9  0.897111  17.168180"
+    ],
+    "disabled_length": 106505.31122252486,
+    "disabled_percent": 14.068706219796768,
+    "endpoint_gaps": 140,
+    "gap_runs": 658,
+    "independent_missing": 2,
+    "independent_percent": 19.23076923076923,
+    "interior_gaps": 74,
+    "ladder": [
+      {
+        "hard_sign_errors": "39",
+        "reference": "0",
+        "winding": "7"
+      },
+      {
+        "hard_sign_errors": "26",
+        "reference": "0.5",
+        "winding": "2.5"
+      },
+      {
+        "hard_sign_errors": "28",
+        "reference": "1",
+        "winding": "1"
+      },
+      {
+        "hard_sign_errors": "5",
+        "reference": "1.5",
+        "winding": "1.5"
+      },
+      {
+        "hard_sign_errors": "20",
+        "reference": "2",
+        "winding": "2"
+      },
+      {
+        "hard_sign_errors": "59",
+        "reference": "2.5",
+        "winding": "3.5"
+      },
+      {
+        "hard_sign_errors": "7",
+        "reference": "3",
+        "winding": "3"
+      },
+      {
+        "hard_sign_errors": "57",
+        "reference": "3.5",
+        "winding": "5.5"
+      },
+      {
+        "hard_sign_errors": "20",
+        "reference": "4.5",
+        "winding": "5.5"
+      },
+      {
+        "hard_sign_errors": "7",
+        "reference": "5",
+        "winding": "4"
+      },
+      {
+        "hard_sign_errors": "6",
+        "reference": "5.5",
+        "winding": "5.5"
+      },
+      {
+        "hard_sign_errors": "34",
+        "reference": "6",
+        "winding": "1"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "6.5",
+        "winding": "3.5"
+      },
+      {
+        "hard_sign_errors": "18",
+        "reference": "7",
+        "winding": "1"
+      },
+      {
+        "hard_sign_errors": "8",
+        "reference": "7.5",
+        "winding": "2.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "8",
+        "winding": "5"
+      },
+      {
+        "hard_sign_errors": "29",
+        "reference": "8.5",
+        "winding": "-0.5"
+      },
+      {
+        "hard_sign_errors": "32",
+        "reference": "9",
+        "winding": "4"
+      },
+      {
+        "hard_sign_errors": "18",
+        "reference": "9.5",
+        "winding": "0"
+      },
+      {
+        "hard_sign_errors": "9",
+        "reference": "10",
+        "winding": "1"
+      },
+      {
+        "hard_sign_errors": "6",
+        "reference": "10.5",
+        "winding": "1.5"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "11",
+        "winding": "3"
+      },
+      {
+        "hard_sign_errors": "4",
+        "reference": "11.5",
+        "winding": "3.5"
+      },
+      {
+        "hard_sign_errors": "8",
+        "reference": "12.5",
+        "winding": "3.5"
+      }
+    ],
+    "ladder_shift_percent": null,
+    "ladder_shifts": null,
+    "length_cost": 300,
+    "messages": 500,
+    "minimum": 64,
+    "missing_references": [
+      "4",
+      "12"
+    ],
+    "observed_ladder_shift": {
+      "ladder_shift_percent": 20.833333333333336,
+      "ladder_shifts": 19,
+      "note": "missing references omitted; bridges across gaps, not the full26-reference metric",
+      "references": 24
+    },
+    "prepass_identical": true,
+    "projected_defects": 2,
+    "references": 26,
+    "seconds": 35.60827245400287,
+    "shift_unavailable": "incomplete reference ladder",
+    "solver_fields": {
+      "calibration_mode": "fixed",
+      "continuous_coordinate_energy": "0.000000",
+      "converged": "false",
+      "data_energy": "903113.920467",
+      "decoded_energy": "903113.920467",
+      "defect_cost_per_constraint": "100.000000",
+      "entropy": "0.000000",
+      "grid_cells": "1",
+      "grid_shifts": "0",
+      "hard_sign_projected_defects": "2",
+      "hard_sign_slack_energy": "0.000000",
+      "local_span_energy": "0.000000",
+      "lower_boundary": "0.000000",
+      "max_gain": "1.216545",
+      "min_gain": "1.216545",
+      "orientation_mode": "fixed-prepass",
+      "phase_map": "0.500000",
+      "phase_mean": "0.500000",
+      "piece_break_cost": "1000.000000",
+      "scale_map": "0.822000",
+      "scale_mean": "0.822000",
+      "solver": "joint_grid",
+      "upper_boundary": "0.000000"
+    },
+    "tied_rows": 3,
+    "total_length": 757036.9979910165,
+    "unbounded_rows": 3,
+    "whole_disabled_traces": 444
+  },
+  "a0p25-damp0p5-i500": {
+    "active_components": 36,
+    "alpha": 0.25,
+    "boundaries": 444,
+    "boundary_cost": 1000,
+    "control": false,
+    "converged": false,
+    "correct_references": 8,
+    "damping": 0.5,
+    "diagnostics": [
+      "local constraint events: pieces=8273 constraints=244858 continuity=6394 consistency_rejected=1531057 support_rejected=0 certified=238464 retained_certified=238464 refined=96283 midpoint_cuts=6394 transition_cuts=0 parallel_omitted=0",
+      "reference cross source events: certified=4754 retained=4754 missing_owner=0",
+      "message_limit  8273  8273  30395  389  0.003456  0.008237  0.250000  2  500  38.671927  128  403874  -5  4  0  9  0.870719  17.508454"
+    ],
+    "disabled_length": 122478.86160424125,
+    "disabled_percent": 16.17871542992865,
+    "endpoint_gaps": 162,
+    "gap_runs": 772,
+    "independent_missing": 2,
+    "independent_percent": 30.76923076923077,
+    "interior_gaps": 141,
+    "ladder": [
+      {
+        "hard_sign_errors": "22",
+        "reference": "0",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "25",
+        "reference": "0.5",
+        "winding": "0.5"
+      },
+      {
+        "hard_sign_errors": "30",
+        "reference": "1",
+        "winding": "0"
+      },
+      {
+        "hard_sign_errors": "5",
+        "reference": "1.5",
+        "winding": "1.5"
+      },
+      {
+        "hard_sign_errors": "21",
+        "reference": "2",
+        "winding": "2"
+      },
+      {
+        "hard_sign_errors": "23",
+        "reference": "2.5",
+        "winding": "2.5"
+      },
+      {
+        "hard_sign_errors": "6",
+        "reference": "3",
+        "winding": "3"
+      },
+      {
+        "hard_sign_errors": "33",
+        "reference": "3.5",
+        "winding": "3.5"
+      },
+      {
+        "hard_sign_errors": "19",
+        "reference": "4.5",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "3",
+        "reference": "5",
+        "winding": "4"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "5.5",
+        "winding": "5.5"
+      },
+      {
+        "hard_sign_errors": "34",
+        "reference": "6",
+        "winding": "4"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "6.5",
+        "winding": "5.5"
+      },
+      {
+        "hard_sign_errors": "23",
+        "reference": "7",
+        "winding": "-1"
+      },
+      {
+        "hard_sign_errors": "17",
+        "reference": "7.5",
+        "winding": "1.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "8",
+        "winding": "5"
+      },
+      {
+        "hard_sign_errors": "37",
+        "reference": "8.5",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "28",
+        "reference": "9",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "25",
+        "reference": "9.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "8",
+        "reference": "10",
+        "winding": "1"
+      },
+      {
+        "hard_sign_errors": "5",
+        "reference": "10.5",
+        "winding": "-1"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "11",
+        "winding": "3"
+      },
+      {
+        "hard_sign_errors": "6",
+        "reference": "11.5",
+        "winding": "3.5"
+      },
+      {
+        "hard_sign_errors": "10",
+        "reference": "12.5",
+        "winding": "3.5"
+      }
+    ],
+    "ladder_shift_percent": null,
+    "ladder_shifts": null,
+    "length_cost": 300,
+    "messages": 500,
+    "minimum": 64,
+    "missing_references": [
+      "4",
+      "12"
+    ],
+    "observed_ladder_shift": {
+      "ladder_shift_percent": 33.333333333333336,
+      "ladder_shifts": 16,
+      "note": "missing references omitted; bridges across gaps, not the full26-reference metric",
+      "references": 24
+    },
+    "prepass_identical": true,
+    "projected_defects": 1,
+    "references": 26,
+    "seconds": 34.014142198022455,
+    "shift_unavailable": "incomplete reference ladder",
+    "solver_fields": {
+      "calibration_mode": "fixed",
+      "continuous_coordinate_energy": "0.000000",
+      "converged": "false",
+      "data_energy": "1116824.867958",
+      "decoded_energy": "1116824.867958",
+      "defect_cost_per_constraint": "100.000000",
+      "entropy": "0.000000",
+      "grid_cells": "1",
+      "grid_shifts": "0",
+      "hard_sign_projected_defects": "1",
+      "hard_sign_slack_energy": "0.000000",
+      "local_span_energy": "0.000000",
+      "lower_boundary": "0.000000",
+      "max_gain": "1.216545",
+      "min_gain": "1.216545",
+      "orientation_mode": "fixed-prepass",
+      "phase_map": "0.500000",
+      "phase_mean": "0.500000",
+      "piece_break_cost": "1000.000000",
+      "scale_map": "0.822000",
+      "scale_mean": "0.822000",
+      "solver": "joint_grid",
+      "upper_boundary": "0.000000"
+    },
+    "tied_rows": 4,
+    "total_length": 757036.9979910165,
+    "unbounded_rows": 4,
+    "whole_disabled_traces": 469
+  },
+  "a0p5-damp0p1-i500": {
+    "active_components": 67,
+    "alpha": 0.5,
+    "boundaries": 281,
+    "boundary_cost": 1000,
+    "control": false,
+    "converged": false,
+    "correct_references": 5,
+    "damping": 0.1,
+    "diagnostics": [
+      "local constraint events: pieces=8273 constraints=244858 continuity=6394 consistency_rejected=1531057 support_rejected=0 certified=238464 retained_certified=238464 refined=96283 midpoint_cuts=6394 transition_cuts=0 parallel_omitted=0",
+      "reference cross source events: certified=4754 retained=4754 missing_owner=0",
+      "message_limit  8273  8273  30395  389  0.003456  0.010744  0.250000  1  500  23.599575  128  376778  -5  3  0  8  0.926686  23.779215"
+    ],
+    "disabled_length": 132363.9027568797,
+    "disabled_percent": 17.484469465579593,
+    "endpoint_gaps": 169,
+    "gap_runs": 701,
+    "independent_missing": 2,
+    "independent_percent": 19.23076923076923,
+    "interior_gaps": 56,
+    "ladder": [
+      {
+        "hard_sign_errors": "54",
+        "reference": "0",
+        "winding": "9"
+      },
+      {
+        "hard_sign_errors": "20",
+        "reference": "0.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "41",
+        "reference": "1",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "3",
+        "reference": "1.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "20",
+        "reference": "2",
+        "winding": "9"
+      },
+      {
+        "hard_sign_errors": "59",
+        "reference": "2.5",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "8",
+        "reference": "3",
+        "winding": "7"
+      },
+      {
+        "hard_sign_errors": "50",
+        "reference": "3.5",
+        "winding": "8.5"
+      },
+      {
+        "hard_sign_errors": "21",
+        "reference": "4.5",
+        "winding": "8.5"
+      },
+      {
+        "hard_sign_errors": "22",
+        "reference": "5",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "6",
+        "reference": "5.5",
+        "winding": "8.5"
+      },
+      {
+        "hard_sign_errors": "33",
+        "reference": "6",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "6.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "17",
+        "reference": "7",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "7",
+        "reference": "7.5",
+        "winding": "5.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "8",
+        "winding": "8"
+      },
+      {
+        "hard_sign_errors": "35",
+        "reference": "8.5",
+        "winding": "3.5"
+      },
+      {
+        "hard_sign_errors": "28",
+        "reference": "9",
+        "winding": "9"
+      },
+      {
+        "hard_sign_errors": "25",
+        "reference": "9.5",
+        "winding": "9.5"
+      },
+      {
+        "hard_sign_errors": "5",
+        "reference": "10",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "15",
+        "reference": "10.5",
+        "winding": "4"
+      },
+      {
+        "hard_sign_errors": "3",
+        "reference": "11",
+        "winding": "7"
+      },
+      {
+        "hard_sign_errors": "5",
+        "reference": "11.5",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "8",
+        "reference": "12.5",
+        "winding": "7.5"
+      }
+    ],
+    "ladder_shift_percent": null,
+    "ladder_shifts": null,
+    "length_cost": 300,
+    "messages": 500,
+    "minimum": 64,
+    "missing_references": [
+      "4",
+      "12"
+    ],
+    "observed_ladder_shift": {
+      "ladder_shift_percent": 20.833333333333336,
+      "ladder_shifts": 19,
+      "note": "missing references omitted; bridges across gaps, not the full26-reference metric",
+      "references": 24
+    },
+    "prepass_identical": true,
+    "projected_defects": 0,
+    "references": 26,
+    "seconds": 45.94680450501619,
+    "shift_unavailable": "incomplete reference ladder",
+    "solver_fields": {
+      "calibration_mode": "fixed",
+      "continuous_coordinate_energy": "0.000000",
+      "converged": "false",
+      "data_energy": "898242.331777",
+      "decoded_energy": "898242.331777",
+      "defect_cost_per_constraint": "100.000000",
+      "entropy": "0.000000",
+      "grid_cells": "1",
+      "grid_shifts": "0",
+      "hard_sign_projected_defects": "0",
+      "hard_sign_slack_energy": "0.000000",
+      "local_span_energy": "0.000000",
+      "lower_boundary": "0.000000",
+      "max_gain": "1.216545",
+      "min_gain": "1.216545",
+      "orientation_mode": "fixed-prepass",
+      "phase_map": "0.500000",
+      "phase_mean": "0.500000",
+      "piece_break_cost": "1000.000000",
+      "scale_map": "0.822000",
+      "scale_mean": "0.822000",
+      "solver": "joint_grid",
+      "upper_boundary": "0.000000"
+    },
+    "tied_rows": 5,
+    "total_length": 757036.9979910165,
+    "unbounded_rows": 5,
+    "whole_disabled_traces": 476
+  },
+  "a0p5-damp0p25-i500": {
+    "active_components": 68,
+    "alpha": 0.5,
+    "boundaries": 397,
+    "boundary_cost": 1000,
+    "control": false,
+    "converged": false,
+    "correct_references": 5,
+    "damping": 0.25,
+    "diagnostics": [
+      "local constraint events: pieces=8273 constraints=244858 continuity=6394 consistency_rejected=1531057 support_rejected=0 certified=238464 retained_certified=238464 refined=96283 midpoint_cuts=6394 transition_cuts=0 parallel_omitted=0",
+      "reference cross source events: certified=4754 retained=4754 missing_owner=0",
+      "message_limit  8273  8273  30395  389  0.003456  0.008407  0.250000  1  500  0.000101  128  376778  -5  3  0  8  0.926031  21.919070"
+    ],
+    "disabled_length": 136999.48969025482,
+    "disabled_percent": 18.09680240910505,
+    "endpoint_gaps": 201,
+    "gap_runs": 776,
+    "independent_missing": 2,
+    "independent_percent": 19.23076923076923,
+    "interior_gaps": 98,
+    "ladder": [
+      {
+        "hard_sign_errors": "37",
+        "reference": "0",
+        "winding": "10"
+      },
+      {
+        "hard_sign_errors": "18",
+        "reference": "0.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "29",
+        "reference": "1",
+        "winding": "4"
+      },
+      {
+        "hard_sign_errors": "3",
+        "reference": "1.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "21",
+        "reference": "2",
+        "winding": "8"
+      },
+      {
+        "hard_sign_errors": "63",
+        "reference": "2.5",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "6",
+        "reference": "3",
+        "winding": "7"
+      },
+      {
+        "hard_sign_errors": "50",
+        "reference": "3.5",
+        "winding": "8.5"
+      },
+      {
+        "hard_sign_errors": "25",
+        "reference": "4.5",
+        "winding": "8.5"
+      },
+      {
+        "hard_sign_errors": "21",
+        "reference": "5",
+        "winding": "8"
+      },
+      {
+        "hard_sign_errors": "7",
+        "reference": "5.5",
+        "winding": "8.5"
+      },
+      {
+        "hard_sign_errors": "31",
+        "reference": "6",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "6.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "19",
+        "reference": "7",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "8",
+        "reference": "7.5",
+        "winding": "5.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "8",
+        "winding": "8"
+      },
+      {
+        "hard_sign_errors": "36",
+        "reference": "8.5",
+        "winding": "2.5"
+      },
+      {
+        "hard_sign_errors": "24",
+        "reference": "9",
+        "winding": "9"
+      },
+      {
+        "hard_sign_errors": "23",
+        "reference": "9.5",
+        "winding": "9.5"
+      },
+      {
+        "hard_sign_errors": "5",
+        "reference": "10",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "15",
+        "reference": "10.5",
+        "winding": "3.5"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "11",
+        "winding": "7"
+      },
+      {
+        "hard_sign_errors": "5",
+        "reference": "11.5",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "8",
+        "reference": "12.5",
+        "winding": "7.5"
+      }
+    ],
+    "ladder_shift_percent": null,
+    "ladder_shifts": null,
+    "length_cost": 300,
+    "messages": 500,
+    "minimum": 64,
+    "missing_references": [
+      "4",
+      "12"
+    ],
+    "observed_ladder_shift": {
+      "ladder_shift_percent": 20.833333333333336,
+      "ladder_shifts": 19,
+      "note": "missing references omitted; bridges across gaps, not the full26-reference metric",
+      "references": 24
+    },
+    "prepass_identical": true,
+    "projected_defects": 0,
+    "references": 26,
+    "seconds": 40.14761328097666,
+    "shift_unavailable": "incomplete reference ladder",
+    "solver_fields": {
+      "calibration_mode": "fixed",
+      "continuous_coordinate_energy": "0.000000",
+      "converged": "false",
+      "data_energy": "1022671.663675",
+      "decoded_energy": "1022671.663675",
+      "defect_cost_per_constraint": "100.000000",
+      "entropy": "0.000000",
+      "grid_cells": "1",
+      "grid_shifts": "0",
+      "hard_sign_projected_defects": "0",
+      "hard_sign_slack_energy": "0.000000",
+      "local_span_energy": "0.000000",
+      "lower_boundary": "0.000000",
+      "max_gain": "1.216545",
+      "min_gain": "1.216545",
+      "orientation_mode": "fixed-prepass",
+      "phase_map": "0.500000",
+      "phase_mean": "0.500000",
+      "piece_break_cost": "1000.000000",
+      "scale_map": "0.822000",
+      "scale_mean": "0.822000",
+      "solver": "joint_grid",
+      "upper_boundary": "0.000000"
+    },
+    "tied_rows": 4,
+    "total_length": 757036.9979910165,
+    "unbounded_rows": 3,
+    "whole_disabled_traces": 477
+  },
+  "a0p5-damp0p5-i500": {
+    "active_components": 48,
+    "alpha": 0.5,
+    "boundaries": 220,
+    "boundary_cost": 1000,
+    "control": false,
+    "converged": false,
+    "correct_references": 7,
+    "damping": 0.5,
+    "diagnostics": [
+      "local constraint events: pieces=8273 constraints=244858 continuity=6394 consistency_rejected=1531057 support_rejected=0 certified=238464 retained_certified=238464 refined=96283 midpoint_cuts=6394 transition_cuts=0 parallel_omitted=0",
+      "reference cross source events: certified=4754 retained=4754 missing_owner=0",
+      "message_limit  8273  8273  30395  389  0.003456  0.008002  0.250000  2  500  27.946278  128  404965  -5  4  0  9  0.880634  18.733913"
+    ],
+    "disabled_length": 110585.51116188522,
+    "disabled_percent": 14.607675906904289,
+    "endpoint_gaps": 112,
+    "gap_runs": 633,
+    "independent_missing": 2,
+    "independent_percent": 26.923076923076923,
+    "interior_gaps": 54,
+    "ladder": [
+      {
+        "hard_sign_errors": "24",
+        "reference": "0",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "43",
+        "reference": "0.5",
+        "winding": "1.5"
+      },
+      {
+        "hard_sign_errors": "34",
+        "reference": "1",
+        "winding": "0"
+      },
+      {
+        "hard_sign_errors": "5",
+        "reference": "1.5",
+        "winding": "1.5"
+      },
+      {
+        "hard_sign_errors": "19",
+        "reference": "2",
+        "winding": "2"
+      },
+      {
+        "hard_sign_errors": "22",
+        "reference": "2.5",
+        "winding": "2.5"
+      },
+      {
+        "hard_sign_errors": "6",
+        "reference": "3",
+        "winding": "3"
+      },
+      {
+        "hard_sign_errors": "31",
+        "reference": "3.5",
+        "winding": "3.5"
+      },
+      {
+        "hard_sign_errors": "10",
+        "reference": "4.5",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "8",
+        "reference": "5",
+        "winding": "4"
+      },
+      {
+        "hard_sign_errors": "6",
+        "reference": "5.5",
+        "winding": "5.5"
+      },
+      {
+        "hard_sign_errors": "24",
+        "reference": "6",
+        "winding": "3"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "6.5",
+        "winding": "1.5"
+      },
+      {
+        "hard_sign_errors": "24",
+        "reference": "7",
+        "winding": "1"
+      },
+      {
+        "hard_sign_errors": "10",
+        "reference": "7.5",
+        "winding": "1.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "8",
+        "winding": "5"
+      },
+      {
+        "hard_sign_errors": "37",
+        "reference": "8.5",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "28",
+        "reference": "9",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "28",
+        "reference": "9.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "5",
+        "reference": "10",
+        "winding": "1"
+      },
+      {
+        "hard_sign_errors": "14",
+        "reference": "10.5",
+        "winding": "-1"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "11",
+        "winding": "3"
+      },
+      {
+        "hard_sign_errors": "5",
+        "reference": "11.5",
+        "winding": "3.5"
+      },
+      {
+        "hard_sign_errors": "8",
+        "reference": "12.5",
+        "winding": "3.5"
+      }
+    ],
+    "ladder_shift_percent": null,
+    "ladder_shifts": null,
+    "length_cost": 300,
+    "messages": 500,
+    "minimum": 64,
+    "missing_references": [
+      "4",
+      "12"
+    ],
+    "observed_ladder_shift": {
+      "ladder_shift_percent": 37.5,
+      "ladder_shifts": 15,
+      "note": "missing references omitted; bridges across gaps, not the full26-reference metric",
+      "references": 24
+    },
+    "prepass_identical": true,
+    "projected_defects": 0,
+    "references": 26,
+    "seconds": 34.771227004996035,
+    "shift_unavailable": "incomplete reference ladder",
+    "solver_fields": {
+      "calibration_mode": "fixed",
+      "continuous_coordinate_energy": "0.000000",
+      "converged": "false",
+      "data_energy": "737425.800973",
+      "decoded_energy": "737425.800973",
+      "defect_cost_per_constraint": "100.000000",
+      "entropy": "0.000000",
+      "grid_cells": "1",
+      "grid_shifts": "0",
+      "hard_sign_projected_defects": "0",
+      "hard_sign_slack_energy": "0.000000",
+      "local_span_energy": "0.000000",
+      "lower_boundary": "0.000000",
+      "max_gain": "1.216545",
+      "min_gain": "1.216545",
+      "orientation_mode": "fixed-prepass",
+      "phase_map": "0.500000",
+      "phase_mean": "0.500000",
+      "piece_break_cost": "1000.000000",
+      "scale_map": "0.822000",
+      "scale_mean": "0.822000",
+      "solver": "joint_grid",
+      "upper_boundary": "0.000000"
+    },
+    "tied_rows": 3,
+    "total_length": 757036.9979910165,
+    "unbounded_rows": 3,
+    "whole_disabled_traces": 467
+  },
+  "a0p75-damp0p1-i500": {
+    "active_components": 68,
+    "alpha": 0.75,
+    "boundaries": 219,
+    "boundary_cost": 1000,
+    "control": false,
+    "converged": false,
+    "correct_references": 3,
+    "damping": 0.1,
+    "diagnostics": [
+      "local constraint events: pieces=8273 constraints=244858 continuity=6394 consistency_rejected=1531057 support_rejected=0 certified=238464 retained_certified=238464 refined=96283 midpoint_cuts=6394 transition_cuts=0 parallel_omitted=0",
+      "reference cross source events: certified=4754 retained=4754 missing_owner=0",
+      "message_limit  8273  8273  30395  389  0.003456  0.008045  0.250000  1  500  18.428396  128  376778  -5  3  0  8  0.928420  18.621167"
+    ],
+    "disabled_length": 139054.564161884,
+    "disabled_percent": 18.368265293624937,
+    "endpoint_gaps": 145,
+    "gap_runs": 678,
+    "independent_missing": 2,
+    "independent_percent": 11.538461538461538,
+    "interior_gaps": 37,
+    "ladder": [
+      {
+        "hard_sign_errors": "47",
+        "reference": "0",
+        "winding": "7"
+      },
+      {
+        "hard_sign_errors": "18",
+        "reference": "0.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "39",
+        "reference": "1",
+        "winding": "7"
+      },
+      {
+        "hard_sign_errors": "3",
+        "reference": "1.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "19",
+        "reference": "2",
+        "winding": "4"
+      },
+      {
+        "hard_sign_errors": "68",
+        "reference": "2.5",
+        "winding": "5.5"
+      },
+      {
+        "hard_sign_errors": "8",
+        "reference": "3",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "44",
+        "reference": "3.5",
+        "winding": "2"
+      },
+      {
+        "hard_sign_errors": "19",
+        "reference": "4.5",
+        "winding": "2"
+      },
+      {
+        "hard_sign_errors": "17",
+        "reference": "5",
+        "winding": "5.5"
+      },
+      {
+        "hard_sign_errors": "6",
+        "reference": "5.5",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "34",
+        "reference": "6",
+        "winding": "7"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "6.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "18",
+        "reference": "7",
+        "winding": "7"
+      },
+      {
+        "hard_sign_errors": "5",
+        "reference": "7.5",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "8",
+        "winding": "3.5"
+      },
+      {
+        "hard_sign_errors": "35",
+        "reference": "8.5",
+        "winding": "9.5"
+      },
+      {
+        "hard_sign_errors": "25",
+        "reference": "9",
+        "winding": "4"
+      },
+      {
+        "hard_sign_errors": "26",
+        "reference": "9.5",
+        "winding": "2"
+      },
+      {
+        "hard_sign_errors": "5",
+        "reference": "10",
+        "winding": "7"
+      },
+      {
+        "hard_sign_errors": "15",
+        "reference": "10.5",
+        "winding": "8.5"
+      },
+      {
+        "hard_sign_errors": "3",
+        "reference": "11",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "6",
+        "reference": "11.5",
+        "winding": "5.5"
+      },
+      {
+        "hard_sign_errors": "7",
+        "reference": "12.5",
+        "winding": "5.5"
+      }
+    ],
+    "ladder_shift_percent": null,
+    "ladder_shifts": null,
+    "length_cost": 300,
+    "messages": 500,
+    "minimum": 64,
+    "missing_references": [
+      "4",
+      "12"
+    ],
+    "observed_ladder_shift": {
+      "ladder_shift_percent": 20.833333333333336,
+      "ladder_shifts": 19,
+      "note": "missing references omitted; bridges across gaps, not the full26-reference metric",
+      "references": 24
+    },
+    "prepass_identical": true,
+    "projected_defects": 0,
+    "references": 26,
+    "seconds": 35.14312503201654,
+    "shift_unavailable": "incomplete reference ladder",
+    "solver_fields": {
+      "calibration_mode": "fixed",
+      "continuous_coordinate_energy": "0.000000",
+      "converged": "false",
+      "data_energy": "704411.171836",
+      "decoded_energy": "704411.171836",
+      "defect_cost_per_constraint": "100.000000",
+      "entropy": "0.000000",
+      "grid_cells": "1",
+      "grid_shifts": "0",
+      "hard_sign_projected_defects": "0",
+      "hard_sign_slack_energy": "0.000000",
+      "local_span_energy": "0.000000",
+      "lower_boundary": "0.000000",
+      "max_gain": "1.216545",
+      "min_gain": "1.216545",
+      "orientation_mode": "fixed-prepass",
+      "phase_map": "0.500000",
+      "phase_mean": "0.500000",
+      "piece_break_cost": "1000.000000",
+      "scale_map": "0.822000",
+      "scale_mean": "0.822000",
+      "solver": "joint_grid",
+      "upper_boundary": "0.000000"
+    },
+    "tied_rows": 5,
+    "total_length": 757036.9979910165,
+    "unbounded_rows": 5,
+    "whole_disabled_traces": 496
+  },
+  "a0p75-damp0p25-i500": {
+    "active_components": 77,
+    "alpha": 0.75,
+    "boundaries": 427,
+    "boundary_cost": 1000,
+    "control": false,
+    "converged": false,
+    "correct_references": 5,
+    "damping": 0.25,
+    "diagnostics": [
+      "local constraint events: pieces=8273 constraints=244858 continuity=6394 consistency_rejected=1531057 support_rejected=0 certified=238464 retained_certified=238464 refined=96283 midpoint_cuts=6394 transition_cuts=0 parallel_omitted=0",
+      "reference cross source events: certified=4754 retained=4754 missing_owner=0",
+      "message_limit  8273  8273  30395  389  0.003456  0.008654  0.250000  1  500  40.823378  128  376778  -5  3  0  8  0.919253  16.712000"
+    ],
+    "disabled_length": 166442.9703868224,
+    "disabled_percent": 21.986107789780377,
+    "endpoint_gaps": 225,
+    "gap_runs": 831,
+    "independent_missing": 2,
+    "independent_percent": 19.23076923076923,
+    "interior_gaps": 101,
+    "ladder": [
+      {
+        "hard_sign_errors": "35",
+        "reference": "0",
+        "winding": "10"
+      },
+      {
+        "hard_sign_errors": "12",
+        "reference": "0.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "38",
+        "reference": "1",
+        "winding": "4"
+      },
+      {
+        "hard_sign_errors": "3",
+        "reference": "1.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "21",
+        "reference": "2",
+        "winding": "9"
+      },
+      {
+        "hard_sign_errors": "58",
+        "reference": "2.5",
+        "winding": "5.5"
+      },
+      {
+        "hard_sign_errors": "8",
+        "reference": "3",
+        "winding": "7"
+      },
+      {
+        "hard_sign_errors": "46",
+        "reference": "3.5",
+        "winding": "9.5"
+      },
+      {
+        "hard_sign_errors": "18",
+        "reference": "4.5",
+        "winding": "8.5"
+      },
+      {
+        "hard_sign_errors": "18",
+        "reference": "5",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "6",
+        "reference": "5.5",
+        "winding": "8.5"
+      },
+      {
+        "hard_sign_errors": "34",
+        "reference": "6",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "6.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "21",
+        "reference": "7",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "7",
+        "reference": "7.5",
+        "winding": "5.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "8",
+        "winding": "8"
+      },
+      {
+        "hard_sign_errors": "35",
+        "reference": "8.5",
+        "winding": "2.5"
+      },
+      {
+        "hard_sign_errors": "21",
+        "reference": "9",
+        "winding": "9"
+      },
+      {
+        "hard_sign_errors": "24",
+        "reference": "9.5",
+        "winding": "9.5"
+      },
+      {
+        "hard_sign_errors": "5",
+        "reference": "10",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "15",
+        "reference": "10.5",
+        "winding": "3.5"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "11",
+        "winding": "7"
+      },
+      {
+        "hard_sign_errors": "6",
+        "reference": "11.5",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "7",
+        "reference": "12.5",
+        "winding": "7.5"
+      }
+    ],
+    "ladder_shift_percent": null,
+    "ladder_shifts": null,
+    "length_cost": 300,
+    "messages": 500,
+    "minimum": 64,
+    "missing_references": [
+      "4",
+      "12"
+    ],
+    "observed_ladder_shift": {
+      "ladder_shift_percent": 16.666666666666664,
+      "ladder_shifts": 20,
+      "note": "missing references omitted; bridges across gaps, not the full26-reference metric",
+      "references": 24
+    },
+    "prepass_identical": true,
+    "projected_defects": 0,
+    "references": 26,
+    "seconds": 33.56513924396131,
+    "shift_unavailable": "incomplete reference ladder",
+    "solver_fields": {
+      "calibration_mode": "fixed",
+      "continuous_coordinate_energy": "0.000000",
+      "converged": "false",
+      "data_energy": "1059872.320469",
+      "decoded_energy": "1059872.320469",
+      "defect_cost_per_constraint": "100.000000",
+      "entropy": "0.000000",
+      "grid_cells": "1",
+      "grid_shifts": "0",
+      "hard_sign_projected_defects": "0",
+      "hard_sign_slack_energy": "0.000000",
+      "local_span_energy": "0.000000",
+      "lower_boundary": "0.000000",
+      "max_gain": "1.216545",
+      "min_gain": "1.216545",
+      "orientation_mode": "fixed-prepass",
+      "phase_map": "0.500000",
+      "phase_mean": "0.500000",
+      "piece_break_cost": "1000.000000",
+      "scale_map": "0.822000",
+      "scale_mean": "0.822000",
+      "solver": "joint_grid",
+      "upper_boundary": "0.000000"
+    },
+    "tied_rows": 6,
+    "total_length": 757036.9979910165,
+    "unbounded_rows": 5,
+    "whole_disabled_traces": 505
+  },
+  "a0p75-damp0p5-i500": {
+    "active_components": 49,
+    "alpha": 0.75,
+    "boundaries": 176,
+    "boundary_cost": 1000,
+    "control": false,
+    "converged": false,
+    "correct_references": 7,
+    "damping": 0.5,
+    "diagnostics": [
+      "local constraint events: pieces=8273 constraints=244858 continuity=6394 consistency_rejected=1531057 support_rejected=0 certified=238464 retained_certified=238464 refined=96283 midpoint_cuts=6394 transition_cuts=0 parallel_omitted=0",
+      "reference cross source events: certified=4754 retained=4754 missing_owner=0",
+      "message_limit  8273  8273  30395  389  0.003456  0.027237  0.250000  2  500  0.003853  128  401219  -5  4  0  9  0.839324  20.138809"
+    ],
+    "disabled_length": 114173.41540524266,
+    "disabled_percent": 15.081616315745446,
+    "endpoint_gaps": 106,
+    "gap_runs": 616,
+    "independent_missing": 2,
+    "independent_percent": 26.923076923076923,
+    "interior_gaps": 35,
+    "ladder": [
+      {
+        "hard_sign_errors": "32",
+        "reference": "0",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "34",
+        "reference": "0.5",
+        "winding": "1.5"
+      },
+      {
+        "hard_sign_errors": "36",
+        "reference": "1",
+        "winding": "-1"
+      },
+      {
+        "hard_sign_errors": "5",
+        "reference": "1.5",
+        "winding": "1.5"
+      },
+      {
+        "hard_sign_errors": "21",
+        "reference": "2",
+        "winding": "2"
+      },
+      {
+        "hard_sign_errors": "50",
+        "reference": "2.5",
+        "winding": "2.5"
+      },
+      {
+        "hard_sign_errors": "8",
+        "reference": "3",
+        "winding": "3"
+      },
+      {
+        "hard_sign_errors": "44",
+        "reference": "3.5",
+        "winding": "3.5"
+      },
+      {
+        "hard_sign_errors": "27",
+        "reference": "4.5",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "7",
+        "reference": "5",
+        "winding": "4"
+      },
+      {
+        "hard_sign_errors": "8",
+        "reference": "5.5",
+        "winding": "5.5"
+      },
+      {
+        "hard_sign_errors": "31",
+        "reference": "6",
+        "winding": "4"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "6.5",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "20",
+        "reference": "7",
+        "winding": "4"
+      },
+      {
+        "hard_sign_errors": "8",
+        "reference": "7.5",
+        "winding": "3.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "8",
+        "winding": "5"
+      },
+      {
+        "hard_sign_errors": "36",
+        "reference": "8.5",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "25",
+        "reference": "9",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "28",
+        "reference": "9.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "5",
+        "reference": "10",
+        "winding": "1"
+      },
+      {
+        "hard_sign_errors": "15",
+        "reference": "10.5",
+        "winding": "-1"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "11",
+        "winding": "3"
+      },
+      {
+        "hard_sign_errors": "5",
+        "reference": "11.5",
+        "winding": "3.5"
+      },
+      {
+        "hard_sign_errors": "8",
+        "reference": "12.5",
+        "winding": "3.5"
+      }
+    ],
+    "ladder_shift_percent": null,
+    "ladder_shifts": null,
+    "length_cost": 300,
+    "messages": 500,
+    "minimum": 64,
+    "missing_references": [
+      "4",
+      "12"
+    ],
+    "observed_ladder_shift": {
+      "ladder_shift_percent": 37.5,
+      "ladder_shifts": 15,
+      "note": "missing references omitted; bridges across gaps, not the full26-reference metric",
+      "references": 24
+    },
+    "prepass_identical": true,
+    "projected_defects": 0,
+    "references": 26,
+    "seconds": 39.038912812946364,
+    "shift_unavailable": "incomplete reference ladder",
+    "solver_fields": {
+      "calibration_mode": "fixed",
+      "continuous_coordinate_energy": "0.000000",
+      "converged": "false",
+      "data_energy": "572981.668109",
+      "decoded_energy": "572981.668109",
+      "defect_cost_per_constraint": "100.000000",
+      "entropy": "0.000000",
+      "grid_cells": "1",
+      "grid_shifts": "0",
+      "hard_sign_projected_defects": "0",
+      "hard_sign_slack_energy": "0.000000",
+      "local_span_energy": "0.000000",
+      "lower_boundary": "0.000000",
+      "max_gain": "1.216545",
+      "min_gain": "1.216545",
+      "orientation_mode": "fixed-prepass",
+      "phase_map": "0.500000",
+      "phase_mean": "0.500000",
+      "piece_break_cost": "1000.000000",
+      "scale_map": "0.822000",
+      "scale_mean": "0.822000",
+      "solver": "joint_grid",
+      "upper_boundary": "0.000000"
+    },
+    "tied_rows": 3,
+    "total_length": 757036.9979910165,
+    "unbounded_rows": 3,
+    "whole_disabled_traces": 475
+  },
+  "a1-damp0p1-i500": {
+    "active_components": 220,
+    "alpha": 1,
+    "boundaries": 226,
+    "boundary_cost": 1000,
+    "control": false,
+    "converged": false,
+    "correct_references": 7,
+    "damping": 0.1,
+    "diagnostics": [
+      "local constraint events: pieces=8273 constraints=244858 continuity=6394 consistency_rejected=1531057 support_rejected=0 certified=238464 retained_certified=238464 refined=96283 midpoint_cuts=6394 transition_cuts=0 parallel_omitted=0",
+      "reference cross source events: certified=4754 retained=4754 missing_owner=0",
+      "message_limit  8273  8273  30395  389  0.003456  0.008287  0.250000  1  500  17.201959  128  376778  -5  4  0  9  0.816210  19.446433"
+    ],
+    "disabled_length": 157908.12602931887,
+    "disabled_percent": 20.858706568947998,
+    "endpoint_gaps": 124,
+    "gap_runs": 718,
+    "independent_missing": 3,
+    "independent_percent": 26.923076923076923,
+    "interior_gaps": 51,
+    "ladder": [
+      {
+        "hard_sign_errors": "30",
+        "reference": "0",
+        "winding": "1"
+      },
+      {
+        "hard_sign_errors": "39",
+        "reference": "0.5",
+        "winding": "0.5"
+      },
+      {
+        "hard_sign_errors": "16",
+        "reference": "1",
+        "winding": "1"
+      },
+      {
+        "hard_sign_errors": "14",
+        "reference": "1.5",
+        "winding": "1.5"
+      },
+      {
+        "hard_sign_errors": "14",
+        "reference": "2",
+        "winding": "2"
+      },
+      {
+        "hard_sign_errors": "74",
+        "reference": "2.5",
+        "winding": "2.5"
+      },
+      {
+        "hard_sign_errors": "6",
+        "reference": "3",
+        "winding": "2"
+      },
+      {
+        "hard_sign_errors": "57",
+        "reference": "3.5",
+        "winding": "3.5"
+      },
+      {
+        "hard_sign_errors": "36",
+        "reference": "4.5",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "12",
+        "reference": "5",
+        "winding": "2.5"
+      },
+      {
+        "hard_sign_errors": "23",
+        "reference": "5.5",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "21",
+        "reference": "6",
+        "winding": "1"
+      },
+      {
+        "hard_sign_errors": "2",
+        "reference": "6.5",
+        "winding": "0.5"
+      },
+      {
+        "hard_sign_errors": "3",
+        "reference": "7",
+        "winding": "1"
+      },
+      {
+        "hard_sign_errors": "12",
+        "reference": "7.5",
+        "winding": "2.5"
+      },
+      {
+        "hard_sign_errors": "38",
+        "reference": "8.5",
+        "winding": "5.5"
+      },
+      {
+        "hard_sign_errors": "24",
+        "reference": "9",
+        "winding": "3"
+      },
+      {
+        "hard_sign_errors": "28",
+        "reference": "9.5",
+        "winding": "3.5"
+      },
+      {
+        "hard_sign_errors": "5",
+        "reference": "10",
+        "winding": "1"
+      },
+      {
+        "hard_sign_errors": "17",
+        "reference": "10.5",
+        "winding": "-1.5"
+      },
+      {
+        "hard_sign_errors": "3",
+        "reference": "11",
+        "winding": "2"
+      },
+      {
+        "hard_sign_errors": "6",
+        "reference": "11.5",
+        "winding": "2.5"
+      },
+      {
+        "hard_sign_errors": "10",
+        "reference": "12.5",
+        "winding": "2.5"
+      }
+    ],
+    "ladder_shift_percent": null,
+    "ladder_shifts": null,
+    "length_cost": 300,
+    "messages": 500,
+    "minimum": 64,
+    "missing_references": [
+      "4",
+      "8",
+      "12"
+    ],
+    "observed_ladder_shift": {
+      "ladder_shift_percent": 39.13043478260869,
+      "ladder_shifts": 14,
+      "note": "missing references omitted; bridges across gaps, not the full26-reference metric",
+      "references": 23
+    },
+    "prepass_identical": true,
+    "projected_defects": 0,
+    "references": 26,
+    "seconds": 37.220220204035286,
+    "shift_unavailable": "incomplete reference ladder",
+    "solver_fields": {
+      "calibration_mode": "fixed",
+      "continuous_coordinate_energy": "0.000000",
+      "converged": "false",
+      "data_energy": "547699.269978",
+      "decoded_energy": "547699.269978",
+      "defect_cost_per_constraint": "100.000000",
+      "entropy": "0.000000",
+      "grid_cells": "1",
+      "grid_shifts": "0",
+      "hard_sign_projected_defects": "0",
+      "hard_sign_slack_energy": "0.000000",
+      "local_span_energy": "0.000000",
+      "lower_boundary": "0.000000",
+      "max_gain": "1.216545",
+      "min_gain": "1.216545",
+      "orientation_mode": "fixed-prepass",
+      "phase_map": "0.500000",
+      "phase_mean": "0.500000",
+      "piece_break_cost": "1000.000000",
+      "scale_map": "0.822000",
+      "scale_mean": "0.822000",
+      "solver": "joint_grid",
+      "upper_boundary": "0.000000"
+    },
+    "tied_rows": 3,
+    "total_length": 757036.9979910165,
+    "unbounded_rows": 2,
+    "whole_disabled_traces": 543
+  },
+  "a1-damp0p25-i500": {
+    "active_components": 312,
+    "alpha": 1,
+    "boundaries": 430,
+    "boundary_cost": 1000,
+    "control": false,
+    "converged": false,
+    "correct_references": 7,
+    "damping": 0.25,
+    "diagnostics": [
+      "local constraint events: pieces=8273 constraints=244858 continuity=6394 consistency_rejected=1531057 support_rejected=0 certified=238464 retained_certified=238464 refined=96283 midpoint_cuts=6394 transition_cuts=0 parallel_omitted=0",
+      "reference cross source events: certified=4754 retained=4754 missing_owner=0",
+      "message_limit  8273  8273  30395  389  0.003456  0.009256  0.250000  1  500  2.012496  128  376778  -5  4  0  9  0.800923  20.029865"
+    ],
+    "disabled_length": 169240.58525431762,
+    "disabled_percent": 22.35565576100495,
+    "endpoint_gaps": 148,
+    "gap_runs": 833,
+    "independent_missing": 3,
+    "independent_percent": 26.923076923076923,
+    "interior_gaps": 141,
+    "ladder": [
+      {
+        "hard_sign_errors": "11",
+        "reference": "0",
+        "winding": "0.5"
+      },
+      {
+        "hard_sign_errors": "41",
+        "reference": "0.5",
+        "winding": "0.5"
+      },
+      {
+        "hard_sign_errors": "14",
+        "reference": "1",
+        "winding": "1"
+      },
+      {
+        "hard_sign_errors": "17",
+        "reference": "1.5",
+        "winding": "1.5"
+      },
+      {
+        "hard_sign_errors": "13",
+        "reference": "2",
+        "winding": "2"
+      },
+      {
+        "hard_sign_errors": "56",
+        "reference": "2.5",
+        "winding": "2.5"
+      },
+      {
+        "hard_sign_errors": "7",
+        "reference": "3",
+        "winding": "2"
+      },
+      {
+        "hard_sign_errors": "57",
+        "reference": "3.5",
+        "winding": "3.5"
+      },
+      {
+        "hard_sign_errors": "33",
+        "reference": "4.5",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "10",
+        "reference": "5",
+        "winding": "2.5"
+      },
+      {
+        "hard_sign_errors": "23",
+        "reference": "5.5",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "22",
+        "reference": "6",
+        "winding": "1"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "6.5",
+        "winding": "1.5"
+      },
+      {
+        "hard_sign_errors": "3",
+        "reference": "7",
+        "winding": "1"
+      },
+      {
+        "hard_sign_errors": "10",
+        "reference": "7.5",
+        "winding": "2.5"
+      },
+      {
+        "hard_sign_errors": "36",
+        "reference": "8.5",
+        "winding": "5.5"
+      },
+      {
+        "hard_sign_errors": "21",
+        "reference": "9",
+        "winding": "3"
+      },
+      {
+        "hard_sign_errors": "24",
+        "reference": "9.5",
+        "winding": "3.5"
+      },
+      {
+        "hard_sign_errors": "5",
+        "reference": "10",
+        "winding": "1"
+      },
+      {
+        "hard_sign_errors": "18",
+        "reference": "10.5",
+        "winding": "-1.5"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "11",
+        "winding": "2"
+      },
+      {
+        "hard_sign_errors": "4",
+        "reference": "11.5",
+        "winding": "2.5"
+      },
+      {
+        "hard_sign_errors": "8",
+        "reference": "12.5",
+        "winding": "2.5"
+      }
+    ],
+    "ladder_shift_percent": null,
+    "ladder_shifts": null,
+    "length_cost": 300,
+    "messages": 500,
+    "minimum": 64,
+    "missing_references": [
+      "4",
+      "8",
+      "12"
+    ],
+    "observed_ladder_shift": {
+      "ladder_shift_percent": 39.13043478260869,
+      "ladder_shifts": 14,
+      "note": "missing references omitted; bridges across gaps, not the full26-reference metric",
+      "references": 23
+    },
+    "prepass_identical": true,
+    "projected_defects": 0,
+    "references": 26,
+    "seconds": 38.066054710012395,
+    "shift_unavailable": "incomplete reference ladder",
+    "solver_fields": {
+      "calibration_mode": "fixed",
+      "continuous_coordinate_energy": "0.000000",
+      "converged": "false",
+      "data_energy": "778260.347333",
+      "decoded_energy": "778260.347333",
+      "defect_cost_per_constraint": "100.000000",
+      "entropy": "0.000000",
+      "grid_cells": "1",
+      "grid_shifts": "0",
+      "hard_sign_projected_defects": "0",
+      "hard_sign_slack_energy": "0.000000",
+      "local_span_energy": "0.000000",
+      "lower_boundary": "0.000000",
+      "max_gain": "1.216545",
+      "min_gain": "1.216545",
+      "orientation_mode": "fixed-prepass",
+      "phase_map": "0.500000",
+      "phase_mean": "0.500000",
+      "piece_break_cost": "1000.000000",
+      "scale_map": "0.822000",
+      "scale_mean": "0.822000",
+      "solver": "joint_grid",
+      "upper_boundary": "0.000000"
+    },
+    "tied_rows": 3,
+    "total_length": 757036.9979910165,
+    "unbounded_rows": 2,
+    "whole_disabled_traces": 544
+  },
+  "a1-damp0p5-i1000": {
+    "active_components": 112,
+    "alpha": 1,
+    "boundaries": 84,
+    "boundary_cost": 1000,
+    "control": false,
+    "converged": false,
+    "correct_references": 8,
+    "damping": 0.5,
+    "diagnostics": [
+      "local constraint events: pieces=8273 constraints=244858 continuity=6394 consistency_rejected=1531057 support_rejected=0 certified=238464 retained_certified=238464 refined=96283 midpoint_cuts=6394 transition_cuts=0 parallel_omitted=0",
+      "reference cross source events: certified=4754 retained=4754 missing_owner=0",
+      "message_limit  8273  8273  30395  389  0.003456  0.010224  0.250000  3  1000  242.397597  128  421404  -6  4  0  10  0.760599  42.461051"
+    ],
+    "disabled_length": 110483.4707559074,
+    "disabled_percent": 14.594196987611229,
+    "endpoint_gaps": 58,
+    "gap_runs": 565,
+    "independent_missing": 2,
+    "independent_percent": 30.76923076923077,
+    "interior_gaps": 13,
+    "ladder": [
+      {
+        "hard_sign_errors": "14",
+        "reference": "0",
+        "winding": "-1"
+      },
+      {
+        "hard_sign_errors": "43",
+        "reference": "0.5",
+        "winding": "-0.5"
+      },
+      {
+        "hard_sign_errors": "13",
+        "reference": "1",
+        "winding": "1"
+      },
+      {
+        "hard_sign_errors": "2",
+        "reference": "1.5",
+        "winding": "1.5"
+      },
+      {
+        "hard_sign_errors": "2",
+        "reference": "2",
+        "winding": "2"
+      },
+      {
+        "hard_sign_errors": "9",
+        "reference": "2.5",
+        "winding": "2.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "3",
+        "winding": "3"
+      },
+      {
+        "hard_sign_errors": "14",
+        "reference": "3.5",
+        "winding": "3.5"
+      },
+      {
+        "hard_sign_errors": "14",
+        "reference": "4.5",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "12",
+        "reference": "5",
+        "winding": "5"
+      },
+      {
+        "hard_sign_errors": "22",
+        "reference": "5.5",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "18",
+        "reference": "6",
+        "winding": "5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "6.5",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "4",
+        "reference": "7",
+        "winding": "1"
+      },
+      {
+        "hard_sign_errors": "3",
+        "reference": "7.5",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "8",
+        "winding": "5"
+      },
+      {
+        "hard_sign_errors": "37",
+        "reference": "8.5",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "26",
+        "reference": "9",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "26",
+        "reference": "9.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "5",
+        "reference": "10",
+        "winding": "0"
+      },
+      {
+        "hard_sign_errors": "17",
+        "reference": "10.5",
+        "winding": "-1.5"
+      },
+      {
+        "hard_sign_errors": "3",
+        "reference": "11",
+        "winding": "1"
+      },
+      {
+        "hard_sign_errors": "6",
+        "reference": "11.5",
+        "winding": "1.5"
+      },
+      {
+        "hard_sign_errors": "7",
+        "reference": "12.5",
+        "winding": "2.5"
+      }
+    ],
+    "ladder_shift_percent": null,
+    "ladder_shifts": null,
+    "length_cost": 300,
+    "messages": 1000,
+    "minimum": 64,
+    "missing_references": [
+      "4",
+      "12"
+    ],
+    "observed_ladder_shift": {
+      "ladder_shift_percent": 58.33333333333333,
+      "ladder_shifts": 10,
+      "note": "missing references omitted; bridges across gaps, not the full26-reference metric",
+      "references": 24
+    },
+    "prepass_identical": true,
+    "projected_defects": 1,
+    "references": 26,
+    "seconds": 60.83712058799574,
+    "shift_unavailable": "incomplete reference ladder",
+    "solver_fields": {
+      "calibration_mode": "fixed",
+      "continuous_coordinate_energy": "0.000000",
+      "converged": "false",
+      "data_energy": "294547.908393",
+      "decoded_energy": "294547.908393",
+      "defect_cost_per_constraint": "100.000000",
+      "entropy": "0.000000",
+      "grid_cells": "1",
+      "grid_shifts": "0",
+      "hard_sign_projected_defects": "1",
+      "hard_sign_slack_energy": "0.000000",
+      "local_span_energy": "0.000000",
+      "lower_boundary": "0.000000",
+      "max_gain": "1.216545",
+      "min_gain": "1.216545",
+      "orientation_mode": "fixed-prepass",
+      "phase_map": "0.500000",
+      "phase_mean": "0.500000",
+      "piece_break_cost": "1000.000000",
+      "scale_map": "0.822000",
+      "scale_mean": "0.822000",
+      "solver": "joint_grid",
+      "upper_boundary": "0.000000"
+    },
+    "tied_rows": 3,
+    "total_length": 757036.9979910165,
+    "unbounded_rows": 2,
+    "whole_disabled_traces": 494
+  },
+  "a1-damp0p5-i500": {
+    "active_components": 113,
+    "alpha": 1,
+    "boundaries": 66,
+    "boundary_cost": 1000,
+    "control": false,
+    "converged": false,
+    "correct_references": 11,
+    "damping": 0.5,
+    "diagnostics": [
+      "local constraint events: pieces=8273 constraints=244858 continuity=6394 consistency_rejected=1531057 support_rejected=0 certified=238464 retained_certified=238464 refined=96283 midpoint_cuts=6394 transition_cuts=0 parallel_omitted=0",
+      "reference cross source events: certified=4754 retained=4754 missing_owner=0",
+      "message_limit  8273  8273  30395  389  0.003456  0.008390  0.250000  2  500  87.470876  128  399689  -5  4  0  9  0.814578  19.295530"
+    ],
+    "disabled_length": 119420.4137433982,
+    "disabled_percent": 15.774713000858554,
+    "endpoint_gaps": 56,
+    "gap_runs": 568,
+    "independent_missing": 2,
+    "independent_percent": 42.30769230769231,
+    "interior_gaps": 5,
+    "ladder": [
+      {
+        "hard_sign_errors": "13",
+        "reference": "0",
+        "winding": "0"
+      },
+      {
+        "hard_sign_errors": "43",
+        "reference": "0.5",
+        "winding": "0.5"
+      },
+      {
+        "hard_sign_errors": "14",
+        "reference": "1",
+        "winding": "1"
+      },
+      {
+        "hard_sign_errors": "3",
+        "reference": "1.5",
+        "winding": "1.5"
+      },
+      {
+        "hard_sign_errors": "2",
+        "reference": "2",
+        "winding": "2"
+      },
+      {
+        "hard_sign_errors": "9",
+        "reference": "2.5",
+        "winding": "2.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "3",
+        "winding": "3"
+      },
+      {
+        "hard_sign_errors": "29",
+        "reference": "3.5",
+        "winding": "3.5"
+      },
+      {
+        "hard_sign_errors": "23",
+        "reference": "4.5",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "16",
+        "reference": "5",
+        "winding": "5"
+      },
+      {
+        "hard_sign_errors": "21",
+        "reference": "5.5",
+        "winding": "5.5"
+      },
+      {
+        "hard_sign_errors": "19",
+        "reference": "6",
+        "winding": "4"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "6.5",
+        "winding": "3.5"
+      },
+      {
+        "hard_sign_errors": "3",
+        "reference": "7",
+        "winding": "1"
+      },
+      {
+        "hard_sign_errors": "4",
+        "reference": "7.5",
+        "winding": "3.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "8",
+        "winding": "4"
+      },
+      {
+        "hard_sign_errors": "37",
+        "reference": "8.5",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "26",
+        "reference": "9",
+        "winding": "5"
+      },
+      {
+        "hard_sign_errors": "26",
+        "reference": "9.5",
+        "winding": "5.5"
+      },
+      {
+        "hard_sign_errors": "5",
+        "reference": "10",
+        "winding": "1"
+      },
+      {
+        "hard_sign_errors": "17",
+        "reference": "10.5",
+        "winding": "-0.5"
+      },
+      {
+        "hard_sign_errors": "3",
+        "reference": "11",
+        "winding": "2"
+      },
+      {
+        "hard_sign_errors": "5",
+        "reference": "11.5",
+        "winding": "2.5"
+      },
+      {
+        "hard_sign_errors": "7",
+        "reference": "12.5",
+        "winding": "3.5"
+      }
+    ],
+    "ladder_shift_percent": null,
+    "ladder_shifts": null,
+    "length_cost": 300,
+    "messages": 500,
+    "minimum": 64,
+    "missing_references": [
+      "4",
+      "12"
+    ],
+    "observed_ladder_shift": {
+      "ladder_shift_percent": 62.5,
+      "ladder_shifts": 9,
+      "note": "missing references omitted; bridges across gaps, not the full26-reference metric",
+      "references": 24
+    },
+    "prepass_identical": true,
+    "projected_defects": 0,
+    "references": 26,
+    "seconds": 37.13552612403873,
+    "shift_unavailable": "incomplete reference ladder",
+    "solver_fields": {
+      "calibration_mode": "fixed",
+      "continuous_coordinate_energy": "0.000000",
+      "converged": "false",
+      "data_energy": "297493.981850",
+      "decoded_energy": "297493.981850",
+      "defect_cost_per_constraint": "100.000000",
+      "entropy": "0.000000",
+      "grid_cells": "1",
+      "grid_shifts": "0",
+      "hard_sign_projected_defects": "0",
+      "hard_sign_slack_energy": "0.000000",
+      "local_span_energy": "0.000000",
+      "lower_boundary": "0.000000",
+      "max_gain": "1.216545",
+      "min_gain": "1.216545",
+      "orientation_mode": "fixed-prepass",
+      "phase_map": "0.500000",
+      "phase_mean": "0.500000",
+      "piece_break_cost": "1000.000000",
+      "scale_map": "0.822000",
+      "scale_mean": "0.822000",
+      "solver": "joint_grid",
+      "upper_boundary": "0.000000"
+    },
+    "tied_rows": 4,
+    "total_length": 757036.9979910165,
+    "unbounded_rows": 3,
+    "whole_disabled_traces": 507
+  },
+  "a1-damp0p5-i5000": {
+    "active_components": 113,
+    "alpha": 1,
+    "boundaries": 88,
+    "boundary_cost": 1000,
+    "control": false,
+    "converged": false,
+    "correct_references": 8,
+    "damping": 0.5,
+    "diagnostics": [
+      "local constraint events: pieces=8273 constraints=244858 continuity=6394 consistency_rejected=1531057 support_rejected=0 certified=238464 retained_certified=238464 refined=96283 midpoint_cuts=6394 transition_cuts=0 parallel_omitted=0",
+      "reference cross source events: certified=4754 retained=4754 missing_owner=0",
+      "message_limit  8273  8273  30395  389  0.003456  0.010191  0.250000  3  5000  171.001326  128  421404  -6  4  0  10  0.760891  217.046295"
+    ],
+    "disabled_length": 110855.22902065063,
+    "disabled_percent": 14.64330400163165,
+    "endpoint_gaps": 60,
+    "gap_runs": 568,
+    "independent_missing": 2,
+    "independent_percent": 30.76923076923077,
+    "interior_gaps": 14,
+    "ladder": [
+      {
+        "hard_sign_errors": "14",
+        "reference": "0",
+        "winding": "-1"
+      },
+      {
+        "hard_sign_errors": "42",
+        "reference": "0.5",
+        "winding": "-0.5"
+      },
+      {
+        "hard_sign_errors": "13",
+        "reference": "1",
+        "winding": "1"
+      },
+      {
+        "hard_sign_errors": "2",
+        "reference": "1.5",
+        "winding": "1.5"
+      },
+      {
+        "hard_sign_errors": "2",
+        "reference": "2",
+        "winding": "2"
+      },
+      {
+        "hard_sign_errors": "9",
+        "reference": "2.5",
+        "winding": "2.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "3",
+        "winding": "3"
+      },
+      {
+        "hard_sign_errors": "14",
+        "reference": "3.5",
+        "winding": "3.5"
+      },
+      {
+        "hard_sign_errors": "14",
+        "reference": "4.5",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "12",
+        "reference": "5",
+        "winding": "5"
+      },
+      {
+        "hard_sign_errors": "22",
+        "reference": "5.5",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "18",
+        "reference": "6",
+        "winding": "5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "6.5",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "4",
+        "reference": "7",
+        "winding": "1"
+      },
+      {
+        "hard_sign_errors": "3",
+        "reference": "7.5",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "8",
+        "winding": "5"
+      },
+      {
+        "hard_sign_errors": "37",
+        "reference": "8.5",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "26",
+        "reference": "9",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "26",
+        "reference": "9.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "5",
+        "reference": "10",
+        "winding": "0"
+      },
+      {
+        "hard_sign_errors": "17",
+        "reference": "10.5",
+        "winding": "-1.5"
+      },
+      {
+        "hard_sign_errors": "3",
+        "reference": "11",
+        "winding": "1"
+      },
+      {
+        "hard_sign_errors": "6",
+        "reference": "11.5",
+        "winding": "1.5"
+      },
+      {
+        "hard_sign_errors": "7",
+        "reference": "12.5",
+        "winding": "2.5"
+      }
+    ],
+    "ladder_shift_percent": null,
+    "ladder_shifts": null,
+    "length_cost": 300,
+    "messages": 5000,
+    "minimum": 64,
+    "missing_references": [
+      "4",
+      "12"
+    ],
+    "observed_ladder_shift": {
+      "ladder_shift_percent": 58.33333333333333,
+      "ladder_shifts": 10,
+      "note": "missing references omitted; bridges across gaps, not the full26-reference metric",
+      "references": 24
+    },
+    "prepass_identical": true,
+    "projected_defects": 0,
+    "references": 26,
+    "seconds": 234.56203628197545,
+    "shift_unavailable": "incomplete reference ladder",
+    "solver_fields": {
+      "calibration_mode": "fixed",
+      "continuous_coordinate_energy": "0.000000",
+      "converged": "false",
+      "data_energy": "299419.216826",
+      "decoded_energy": "299419.216826",
+      "defect_cost_per_constraint": "100.000000",
+      "entropy": "0.000000",
+      "grid_cells": "1",
+      "grid_shifts": "0",
+      "hard_sign_projected_defects": "0",
+      "hard_sign_slack_energy": "0.000000",
+      "local_span_energy": "0.000000",
+      "lower_boundary": "0.000000",
+      "max_gain": "1.216545",
+      "min_gain": "1.216545",
+      "orientation_mode": "fixed-prepass",
+      "phase_map": "0.500000",
+      "phase_mean": "0.500000",
+      "piece_break_cost": "1000.000000",
+      "scale_map": "0.822000",
+      "scale_mean": "0.822000",
+      "solver": "joint_grid",
+      "upper_boundary": "0.000000"
+    },
+    "tied_rows": 3,
+    "total_length": 757036.9979910165,
+    "unbounded_rows": 2,
+    "whole_disabled_traces": 494
+  },
+  "default-control": {
+    "active_components": 25,
+    "alpha": 0,
+    "boundaries": 223,
+    "boundary_cost": 1000,
+    "control": true,
+    "converged": false,
+    "correct_references": 8,
+    "damping": 0.5,
+    "diagnostics": [
+      "local constraint events: pieces=8273 constraints=244858 continuity=6394 consistency_rejected=1531057 support_rejected=0 certified=238464 retained_certified=238464 refined=96283 midpoint_cuts=6394 transition_cuts=0 parallel_omitted=0",
+      "reference cross source events: certified=4754 retained=4754 missing_owner=0",
+      "message_limit  8273  8273  30395  389  0.003456  0.015594  0.250000  3  500  647.523696  128  428930  -6  5  0  11  0.873660  20.158142"
+    ],
+    "disabled_length": 90097.43278863825,
+    "disabled_percent": 11.901324905880942,
+    "endpoint_gaps": 111,
+    "gap_runs": 608,
+    "independent_missing": 2,
+    "independent_percent": 30.76923076923077,
+    "interior_gaps": 56,
+    "ladder": [
+      {
+        "hard_sign_errors": "31",
+        "reference": "0",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "45",
+        "reference": "0.5",
+        "winding": "0.5"
+      },
+      {
+        "hard_sign_errors": "30",
+        "reference": "1",
+        "winding": "0"
+      },
+      {
+        "hard_sign_errors": "6",
+        "reference": "1.5",
+        "winding": "1.5"
+      },
+      {
+        "hard_sign_errors": "15",
+        "reference": "2",
+        "winding": "2"
+      },
+      {
+        "hard_sign_errors": "13",
+        "reference": "2.5",
+        "winding": "2.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "3",
+        "winding": "3"
+      },
+      {
+        "hard_sign_errors": "17",
+        "reference": "3.5",
+        "winding": "3.5"
+      },
+      {
+        "hard_sign_errors": "2",
+        "reference": "4.5",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "2",
+        "reference": "5",
+        "winding": "5"
+      },
+      {
+        "hard_sign_errors": "7",
+        "reference": "5.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "29",
+        "reference": "6",
+        "winding": "5"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "6.5",
+        "winding": "5.5"
+      },
+      {
+        "hard_sign_errors": "19",
+        "reference": "7",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "9",
+        "reference": "7.5",
+        "winding": "5.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "8",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "28",
+        "reference": "8.5",
+        "winding": "-0.5"
+      },
+      {
+        "hard_sign_errors": "35",
+        "reference": "9",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "11",
+        "reference": "9.5",
+        "winding": "0.5"
+      },
+      {
+        "hard_sign_errors": "8",
+        "reference": "10",
+        "winding": "1"
+      },
+      {
+        "hard_sign_errors": "18",
+        "reference": "10.5",
+        "winding": "-1"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "11",
+        "winding": "3"
+      },
+      {
+        "hard_sign_errors": "4",
+        "reference": "11.5",
+        "winding": "3.5"
+      },
+      {
+        "hard_sign_errors": "7",
+        "reference": "12.5",
+        "winding": "4.5"
+      }
+    ],
+    "ladder_shift_percent": null,
+    "ladder_shifts": null,
+    "length_cost": 300,
+    "messages": 500,
+    "minimum": 64,
+    "missing_references": [
+      "4",
+      "12"
+    ],
+    "observed_ladder_shift": {
+      "ladder_shift_percent": 54.16666666666667,
+      "ladder_shifts": 11,
+      "note": "missing references omitted; bridges across gaps, not the full26-reference metric",
+      "references": 24
+    },
+    "prepass_identical": true,
+    "projected_defects": 2,
+    "references": 26,
+    "seconds": 37.84643558994867,
+    "shift_unavailable": "incomplete reference ladder",
+    "solver_fields": {
+      "calibration_mode": "fixed",
+      "continuous_coordinate_energy": "0.000000",
+      "converged": "false",
+      "data_energy": "800895.605272",
+      "decoded_energy": "800895.605272",
+      "defect_cost_per_constraint": "100.000000",
+      "entropy": "0.000000",
+      "grid_cells": "1",
+      "grid_shifts": "0",
+      "hard_sign_projected_defects": "2",
+      "hard_sign_slack_energy": "0.000000",
+      "local_span_energy": "0.000000",
+      "lower_boundary": "0.000000",
+      "max_gain": "1.216545",
+      "min_gain": "1.216545",
+      "orientation_mode": "fixed-prepass",
+      "phase_map": "0.500000",
+      "phase_mean": "0.500000",
+      "piece_break_cost": "1000.000000",
+      "scale_map": "0.822000",
+      "scale_mean": "0.822000",
+      "solver": "joint_grid",
+      "upper_boundary": "0.000000"
+    },
+    "tied_rows": 2,
+    "total_length": 757036.9979910165,
+    "unbounded_rows": 2,
+    "whole_disabled_traces": 441
+  }
+}

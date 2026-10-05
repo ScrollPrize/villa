@@ -1,0 +1,65 @@
+{
+  "winner-repeat": {
+    "problematic_unique_constraints": 56027,
+    "retained_fulfilled_unique_constraints": 187655,
+    "exact_references": 20,
+    "wrong_references": 5,
+    "missing_references": 1,
+    "constraint_score_percent": -29.85638538807919,
+    "reference_score_percent": 76.92307692307692,
+    "counts": {
+      "initial": 243682,
+      "removed_incident": 32326,
+      "retained_infringed": 23701,
+      "retained_defect": 0,
+      "problematic": 56027,
+      "retained_fulfilled": 187655,
+      "problematic_percent_initial": 22.991850034060786
+    },
+    "initial_states_identical": true,
+    "initial_factors_identical": true,
+    "seconds": 239.5732258100179
+  },
+  "winner-median64": {
+    "problematic_unique_constraints": 55515,
+    "retained_fulfilled_unique_constraints": 188167,
+    "exact_references": 20,
+    "wrong_references": 5,
+    "missing_references": 1,
+    "constraint_score_percent": -29.50304782453884,
+    "reference_score_percent": 76.92307692307692,
+    "counts": {
+      "initial": 243682,
+      "removed_incident": 32137,
+      "retained_infringed": 23378,
+      "retained_defect": 0,
+      "problematic": 55515,
+      "retained_fulfilled": 188167,
+      "problematic_percent_initial": 22.781740136735582
+    },
+    "initial_states_identical": true,
+    "initial_factors_identical": true,
+    "seconds": 238.3500624219887
+  },
+  "winner-consensus32": {
+    "problematic_unique_constraints": 55816,
+    "retained_fulfilled_unique_constraints": 187866,
+    "exact_references": 20,
+    "wrong_references": 5,
+    "missing_references": 1,
+    "constraint_score_percent": -29.71053836244983,
+    "reference_score_percent": 76.92307692307692,
+    "counts": {
+      "initial": 243682,
+      "removed_incident": 32280,
+      "retained_infringed": 23536,
+      "retained_defect": 0,
+      "problematic": 55816,
+      "retained_fulfilled": 187866,
+      "problematic_percent_initial": 22.90526177559278
+    },
+    "initial_states_identical": true,
+    "initial_factors_identical": true,
+    "seconds": 238.72349719400518
+  }
+}

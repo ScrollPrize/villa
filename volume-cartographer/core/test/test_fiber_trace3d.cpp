@@ -1799,6 +1799,60 @@ TEST_CASE("native fiber extrapolation stops at the requested trace length")
     CHECK_THROWS_AS(vc::fiber_tracer::traceFiberExtrapolation(predictions, {0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, 0.0, config), std::invalid_argument);
 }
 
+TEST_CASE("extrapolation history does not fabricate points or consume its budget")
+{
+    StraightPrediction predictions;
+    ConstantNormalSampler normals;
+    vc::fiber_tracer::FiberTraceConfig config;
+    config.stepVoxels = 4;
+    config.coneAngleDegrees = 0;
+    config.beamWidth = 1;
+    config.smoothnessNormalWeight = 0;
+    config.smoothnessTangentWeight = 0;
+    config.cumulativeSmoothnessTangentWeight = 0;
+    const auto cold = vc::fiber_tracer::traceFiberExtrapolation(predictions,
+        {3,2,1}, {1,0,0}, 10, config, &normals);
+    const std::vector<cv::Vec3d> prior(8, cv::Vec3d(1,0,0));
+    size_t observed = 0;
+    const auto warm = vc::fiber_tracer::traceFiberExtrapolation(predictions,
+        {3,2,1}, {1,0,0}, 10, config, &normals, {},
+        [&](const cv::Vec3d&, double, int) { ++observed; return true; }, prior);
+    CHECK(warm.points == cold.points);
+    CHECK(warm.steps == cold.steps);
+    CHECK(warm.reachedTraceLength);
+    CHECK(observed == warm.points.size() - 1);
+    CHECK_THROWS_AS(vc::fiber_tracer::traceFiberExtrapolation(predictions,
+        {3,2,1}, {1,0,0}, 10, config, &normals, {}, {}, {{0,0,0}}), std::invalid_argument);
+}
+
+TEST_CASE("direction history influences freely inferred first reverse step")
+{
+    StraightPrediction predictions;
+    ConstantNormalSampler normals({0,0,1});
+    vc::fiber_tracer::FiberTraceConfig config;
+    config.stepVoxels = 4;
+    config.coneAngleDegrees = 25;
+    config.coneAngleStepDegrees = 5;
+    config.beamWidth = 8;
+    config.smoothnessNormalWeight = 0;
+    config.smoothnessTangentWeight = 100;
+    config.cumulativeSmoothnessTangentWeight = 100;
+    const auto cold = vc::fiber_tracer::traceFiberExtrapolation(predictions,
+        {3,2,1}, {1,0,0}, 4, config, &normals);
+    const auto warm = vc::fiber_tracer::traceFiberExtrapolation(predictions,
+        {3,2,1}, {1,0,0}, 4, config, &normals, {}, {}, {{1,.2,0}, {1,.3,0}});
+    REQUIRE(warm.points.size() == cold.points.size());
+    CHECK(warm.points.front() == cold.points.front());
+    CHECK(cv::norm(warm.points.back() - cold.points.back()) > 0.01);
+    CHECK(warm.steps == cold.steps);
+    const auto history = vc::fiber_tracer::traceFiberExtrapolation(predictions,
+        {3,2,1}, {1,0,0}, 4, config, &normals, {}, {},
+        {{1,.3,0}, {1,.3,0}, {1,.3,0}, {1,0,0}});
+    const auto edgeOnly = vc::fiber_tracer::traceFiberExtrapolation(predictions,
+        {3,2,1}, {1,0,0}, 4, config, &normals, {}, {}, {{1,0,0}});
+    CHECK(cv::norm(history.points.back() - edgeOnly.points.back()) > 0.01);
+}
+
 TEST_CASE("native fiber extrapolation ignores target planes and max step factor")
 {
     SlantedPrediction predictions;
@@ -2694,4 +2748,42 @@ TEST_CASE("Periodic native reverse verifier accepts straight paths without chang
     config.stepVoxels = 4;
     const auto geometry = makePolylineArcGeometry({{0,0,0},{100,0,0}});
     CHECK(verifyFiberReverseSpan(predictions, normals, config, geometry, 100, 20, 40) == doctest::Approx(0));
+    class RecordingPrediction final : public FiberPredictionSource {
+    public:
+        mutable std::optional<cv::Vec3d> first;
+        FiberPredictionSample sample(const cv::Vec3d& p, const cv::Vec3d& d) const override {
+            if (!first) first = p;
+            return StraightPrediction{}.sample(p, d);
+        }
+    } recorded;
+    const auto vertices = makePolylineArcGeometry({{0,0,0},{40,0,0},{80,0,0},{100,0,0}});
+    config.replayReverseHistorySteps = 4;
+    CHECK(verifyFiberReverseSpan(recorded, normals, config, vertices, 50, 20, 40) == doctest::Approx(0));
+    REQUIRE(recorded.first.has_value());
+    CHECK((*recorded.first)[0] == doctest::Approx(80));
+    CHECK(vertices.points.size() == 4);
+}
+
+TEST_CASE("Reverse acceptance radii preserve defaults and isotropic distance")
+{
+    using namespace vc::fiber_tracer;
+    FiberTraceConfig config;
+    CHECK(config.replayReverseNormalRadiusBase == 20);
+    CHECK(config.replayReverseTangentialRadiusBase == 40);
+    const cv::Vec3d origin{0,0,0}, point{6,8,0};
+    for (const auto direction : {cv::Vec3d{1,0,0}, cv::Vec3d{0,1,0}, cv::Vec3d{0,0,1}}) {
+        ReplayNormalSampler normals(direction);
+        for (double radius : {20.0,10.0,5.0}) {
+            auto measured = measureFiberReplayThreshold(point, origin, normals, 1, radius, 1);
+            CHECK(measured.thresholdErrorRatio == doctest::Approx(10/radius));
+            CHECK(fiberReplayThresholdExceeded(measured, radius) == (radius < 10));
+        }
+    }
+    ReplayNormalSampler normals({0,0,1});
+    const cv::Vec3d offset{12,0,6};
+    CHECK_FALSE(fiberReplayThresholdExceeded(measureFiberReplayThreshold(offset, origin, normals, 1, 10, 2), 10));
+    CHECK(fiberReplayThresholdExceeded(measureFiberReplayThreshold(offset, origin, normals, 1, 5, 2), 5));
+    StraightPrediction predictions;
+    const auto line = makePolylineArcGeometry({{0,0,0},{100,0,0}});
+    CHECK_THROWS_AS(verifyFiberReverseSpan(predictions, normals, config, line, 100, 0, 40), std::invalid_argument);
 }

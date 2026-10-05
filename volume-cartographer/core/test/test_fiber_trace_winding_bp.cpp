@@ -3,6 +3,7 @@
 
 #include "vc/fiber_tracer/FiberTraceBeliefPropagation.hpp"
 #include "vc/fiber_tracer/FiberTraceWindingBeliefPropagation.hpp"
+#include "vc/fiber_tracer/FiberWindingSequence.hpp"
 #include "vc/fiber_tracer/FiberTraceWindingLeastSquares.hpp"
 #include "vc/fiber_tracer/FiberTraceWindingOrderedCuts.hpp"
 #include "vc/fiber_tracer/LasagnaNormalAlignment.hpp"
@@ -14,6 +15,192 @@
 #include <numeric>
 #include <string>
 #include <vector>
+
+TEST_CASE("Source memory messages exactly enumerate unique visible assignments")
+{
+    using namespace vc::fiber_tracer::detail;
+    for(double change:{0.,3.,std::numeric_limits<double>::infinity()})
+    for(double opening:{0.,2.}) {
+        const std::vector<std::vector<int>> labels{{-1,0,1},{-1},{-1,0,1},{0,1}};
+        const std::vector<std::vector<double>> cavity{{-.2,-.8,-1.},{0.},{-.9,-.3,-.4},{-.5,-.7}};
+        const auto actual=windingSequenceMessages(labels,cavity,2,change,opening);
+        for(std::size_t target=0;target<labels.size();++target)
+        for(std::size_t state=0;state<labels[target].size();++state) {
+            double expected=-std::numeric_limits<double>::infinity();
+            for(std::size_t a=0;a<3;++a)for(std::size_t c=0;c<3;++c)for(std::size_t d=0;d<2;++d) {
+                const std::vector<std::size_t> choices{a,0,c,d};
+                if(choices[target]!=state)continue;
+                std::vector<int> path;double weight=0.;
+                for(std::size_t i=0;i<labels.size();++i) {
+                    path.push_back(labels[i][choices[i]]);
+                    if(i!=target)weight+=cavity[i][choices[i]];
+                }
+                weight-=windingSequenceCost(path,change,opening);
+                expected=sequenceLogAdd(expected,weight);
+            }
+            if(std::isfinite(expected))CHECK(actual[target][state]==doctest::Approx(expected));
+            else CHECK(actual[target][state]==expected);
+        }
+    }
+    CHECK(windingSequenceCost({-1,-1,-1},3.,2.)==2.);
+    CHECK(windingSequenceCost({0,-1,0},3.,2.)==2.);
+    CHECK(windingSequenceCost({0,-1,1},3.,2.)==5.);
+    CHECK(windingSequenceCost({-1,1},3.,2.)==2.);
+}
+
+TEST_CASE("Event measurements can retain exact overlapping layout and conserve evidence")
+{
+    using namespace vc::fiber_tracer;
+    std::vector<FiberletCropTraceLine> source(2);
+    source[0].pointsBaseXYZ={{0,0,0},{2048,0,0}};
+    source[1].pointsBaseXYZ={{0,0,20},{2048,0,20}};
+    FiberTraceConstraintConfig cfg;cfg.parallelThreads=2;
+    auto sampler=[](const cv::Vec3d&,const cv::Vec3d&,double){return .7;};
+    const auto old=extractFiberTraceConstraints(source,cfg,sampler);
+    cfg.localEvents=true;cfg.localOverlapPieces=true;
+    const auto events=extractFiberTraceConstraints(source,cfg,sampler);
+    REQUIRE(events.pieces.size()==old.pieces.size());
+    for(std::size_t i=0;i<old.pieces.size();++i) {
+        CHECK(events.pieces[i].traceIndex==old.pieces[i].traceIndex);
+        CHECK(events.pieces[i].beginArcBaseVoxels==old.pieces[i].beginArcBaseVoxels);
+        CHECK(events.pieces[i].endArcBaseVoxels==old.pieces[i].endArcBaseVoxels);
+    }
+    auto mass=[](const auto& r){double m=0;for(const auto& c:r.constraints)if(!c.hardContinuity)m+=c.evidenceWeight;return m;};
+    cfg.localReplicateOverlap=true;
+    const auto replicated=extractFiberTraceConstraints(source,cfg,sampler);
+    CHECK(replicated.constraints.size()>events.constraints.size());
+    CHECK(mass(replicated)==doctest::Approx(mass(events)));
+    cfg.localReplicateOverlap=false;cfg.localOnePerPair=true;
+    const auto one=extractFiberTraceConstraints(source,cfg,sampler);
+    CHECK(one.constraints.size()<events.constraints.size());
+    const auto lengths=partitionFiberTracePieceLengths(old.pieces);
+    CHECK(std::accumulate(lengths.begin(),lengths.end(),0.)==doctest::Approx(4096.));
+    std::vector<FiberTraceConstraintPiece> simple{{0,0,0,10},{0,1,5,15},{1,0,0,5}};
+    const auto owned=partitionFiberTracePieceLengths(simple);
+    CHECK(owned==std::vector<double>{7.5,7.5,5.});
+}
+
+TEST_CASE("Closest distance override and winding certification are independent")
+{
+    using namespace vc::fiber_tracer;
+    std::vector<FiberletCropTraceLine> source(2);
+    source[0].pointsBaseXYZ={{0,0,0},{512,0,0}};
+    source[1].pointsBaseXYZ={{0,0,20},{512,0,20}};
+    FiberTraceConstraintConfig cfg;cfg.parallelThreads=2;cfg.maximumWindingDistance=4.;
+    auto sampler=[](const cv::Vec3d& a,const cv::Vec3d&,double){return .1+a[0]/512.;};
+    const auto median=extractFiberTraceConstraints(source,cfg,sampler);
+    cfg.closestParallelEstimator=true;
+    const auto closest=extractFiberTraceConstraints(source,cfg,sampler);
+    REQUIRE(median.constraints.size()==1);REQUIRE(closest.constraints.size()==1);
+    CHECK(median.constraints[0].parallelWindingDistance!=closest.constraints[0].parallelWindingDistance);
+    CHECK(median.constraints[0].parallelScore==closest.constraints[0].parallelScore);
+    cfg.closestParallelEstimator=false;cfg.certifyWinding=true;
+    const auto filtered=extractFiberTraceConstraints(source,cfg,sampler);
+    CHECK(filtered.constraints.empty());CHECK(filtered.localRejectedConsistency==1);
+}
+
+TEST_CASE("Legacy measurements survive fine ownership as an unchanged multiset")
+{
+    using namespace vc::fiber_tracer;
+    std::vector<FiberletCropTraceLine> source(4);
+    source[0].pointsBaseXYZ={{0,0,0},{1024,0,0}};
+    source[1].pointsBaseXYZ={{0,0,20},{1024,0,20}};
+    source[2].pointsBaseXYZ={{256,-256,10},{256,256,10}};
+    source[3].pointsBaseXYZ={{768,-256,10},{768,256,10}};
+    FiberTraceConstraintConfig cfg;cfg.parallelThreads=2;
+    auto sampler=[](const cv::Vec3d&,const cv::Vec3d&,double){return .7;};
+    const auto old=extractFiberTraceConstraints(source,cfg,sampler);
+    cfg.legacyFinePieces=true;cfg.localMinimumPieceLengthBaseVoxels=64;
+    const auto fine=extractFiberTraceConstraints(source,cfg,sampler);
+    const auto signatures=[](const auto& report) {
+        std::vector<std::vector<double>> result;
+        for(const auto& c:report.constraints)if(!c.hardContinuity) {
+            result.push_back({double(report.pieces[c.pieceA].traceIndex),double(report.pieces[c.pieceB].traceIndex),
+                c.arcABaseVoxels,c.arcBBaseVoxels,c.pointABaseXYZ[0],c.pointABaseXYZ[1],c.pointABaseXYZ[2],
+                c.pointBBaseXYZ[0],c.pointBBaseXYZ[1],c.pointBBaseXYZ[2],c.closestDistanceBaseVoxels,
+                c.parallelScore,c.perpendicularScore,c.windingDistance,double(c.allowMeasurementDisable),
+                c.evidenceWeight,double(c.localEvent),double(c.localOrientation),c.supportABegin,c.supportAEnd,
+                c.supportBBegin,c.supportBEnd,c.signedWindingDelta.value_or(-999),c.perpendicularNormalAlignment.value_or(-999),
+                double(c.windingNormalComponent.value_or(999)),c.parallelWindingDistance,
+                c.signedParallelWindingDelta.value_or(-999),c.parallelNormalAlignment.value_or(-999),
+                double(c.parallelCorrespondenceSamples),c.parallelMeanAdvanceResidualFraction,
+                c.parallelMeanConnectorTangentAbsDot,c.parallelMeanConnectorLengthChangeFraction,
+                c.parallelMeanConnectorDirectionChange,c.parallelLimitHitFraction});
+        }
+        std::sort(result.begin(),result.end());return result;
+    };
+    CHECK(signatures(old)==signatures(fine));
+    REQUIRE(fine.localMidpointCuts>0);
+    CHECK(fine.hardConstraints==fine.pieces.size()-source.size());
+    for(const auto& c:fine.constraints)if(!c.hardContinuity) {
+        CHECK(c.arcABaseVoxels>=fine.pieces[c.pieceA].beginArcBaseVoxels);
+        CHECK(c.arcABaseVoxels<=fine.pieces[c.pieceA].endArcBaseVoxels);
+        CHECK(c.arcBBaseVoxels>=fine.pieces[c.pieceB].beginArcBaseVoxels);
+        CHECK(c.arcBBaseVoxels<=fine.pieces[c.pieceB].endArcBaseVoxels);
+    }
+    for(const auto& p:fine.pieces)CHECK(p.endArcBaseVoxels-p.beginArcBaseVoxels>=64.);
+    cfg.localEvents=true;CHECK_THROWS(extractFiberTraceConstraints(source,cfg,sampler));
+}
+
+TEST_CASE("Two sided orthogonal targets preserve acceptance parallel estimates and owners")
+{
+    using namespace vc::fiber_tracer;
+    std::vector<FiberletCropTraceLine> source(2);
+    source[0].pointsBaseXYZ={{0,0,0},{512,0,0}};
+    source[1].pointsBaseXYZ={{256,-256,20},{256,256,20}};
+    LasagnaNormalAlignmentField field;
+    field.lattice=makeLasagnaNormalLattice({-32,-288,-32},{544,288,64},16.);
+    field.positionsBaseXYZ=field.lattice.positionsBaseXYZ;
+    field.nodeByLatticeSample.resize(field.positionsBaseXYZ.size());
+    std::iota(field.nodeByLatticeSample.begin(),field.nodeByLatticeSample.end(),0);
+    field.alignment.componentByNode.assign(field.positionsBaseXYZ.size(),0);
+    field.alignment.alignedNormals.assign(field.positionsBaseXYZ.size(),{0,0,1});
+    FiberTraceConstraintConfig cfg;cfg.parallelThreads=2;cfg.legacyFinePieces=true;
+    auto sampler=[](const cv::Vec3d& a,const cv::Vec3d& b,double){return a[0]==256. && b[1]==0.? .7:.2;};
+    const auto original=extractFiberTraceConstraints(source,cfg,sampler,{},{},&field);
+    REQUIRE(original.constraints.size()==1);
+    cfg.orthogonalProbeSpan=16.;
+    const auto probed=extractFiberTraceConstraints(source,cfg,sampler,{},{},&field);
+    REQUIRE(probed.constraints.size()==1);
+    const auto& a=original.constraints[0];const auto& b=probed.constraints[0];
+    REQUIRE(a.signedWindingDelta.has_value());REQUIRE(b.signedWindingDelta.has_value());
+    CHECK(std::abs(*a.signedWindingDelta)==doctest::Approx(.7));
+    CHECK(std::abs(*b.signedWindingDelta)==doctest::Approx(.2));
+    CHECK(a.parallelWindingDistance==b.parallelWindingDistance);
+    CHECK(a.signedParallelWindingDelta==b.signedParallelWindingDelta);
+    CHECK(a.parallelNormalAlignment==b.parallelNormalAlignment);
+    CHECK(a.perpendicularNormalAlignment==b.perpendicularNormalAlignment);
+    CHECK(a.parallelScore==b.parallelScore);CHECK(a.perpendicularScore==b.perpendicularScore);
+    CHECK(a.pieceA==b.pieceA);CHECK(a.pieceB==b.pieceB);CHECK(a.arcABaseVoxels==b.arcABaseVoxels);
+    CHECK(a.arcBBaseVoxels==b.arcBBaseVoxels);CHECK(a.evidenceWeight==b.evidenceWeight);
+    CHECK(original.pieces.size()==probed.pieces.size());
+    cfg.orthogonalProbeConsensus=true;
+    const auto conservative=extractFiberTraceConstraints(source,cfg,sampler,{},{},&field);
+    CHECK(conservative.constraints[0].signedWindingDelta==a.signedWindingDelta);
+    cfg.orthogonalProbeConsensus=false;cfg.orthogonalProbeSpan=1000.;
+    const auto boundary=extractFiberTraceConstraints(source,cfg,sampler,{},{},&field);
+    CHECK(boundary.constraints[0].signedWindingDelta==a.signedWindingDelta);
+}
+
+TEST_CASE("Binary orientation score changes no geometry or distance measurements")
+{
+    using namespace vc::fiber_tracer;
+    std::vector<FiberletCropTraceLine> source(2);
+    source[0].pointsBaseXYZ={{0,0,0},{512,0,0}};
+    source[1].pointsBaseXYZ={{0,0,20},{512,80,20}};
+    FiberTraceConstraintConfig cfg;cfg.parallelThreads=2;
+    cfg.preserveInputLinesAsPieces=true;
+    auto sampler=[](const cv::Vec3d&,const cv::Vec3d&,double){return .7;};
+    const auto soft=extractFiberTraceConstraints(source,cfg,sampler);
+    cfg.binaryOrientationScore=true;
+    const auto hard=extractFiberTraceConstraints(source,cfg,sampler);
+    REQUIRE(soft.constraints.size()==1);REQUIRE(hard.constraints.size()==1);
+    CHECK(soft.constraints[0].parallelScore<1.);
+    CHECK(hard.constraints[0].parallelScore==1.);
+    CHECK(hard.constraints[0].parallelWindingDistance==soft.constraints[0].parallelWindingDistance);
+    CHECK(hard.constraints[0].arcABaseVoxels==soft.constraints[0].arcABaseVoxels);
+    CHECK(hard.constraints[0].arcBBaseVoxels==soft.constraints[0].arcBBaseVoxels);
+}
 
 TEST_CASE("Local events split cleanly between orthogonal crossings before parallel ablation")
 {
@@ -63,6 +250,62 @@ TEST_CASE("Local events split cleanly between orthogonal crossings before parall
     cfg.preserveInputLinesAsPieces=true;
     const auto cross=extractFiberTraceConstraints(source,cfg,sampler);
     CHECK(cross.pieces.size()==source.size());
+}
+
+TEST_CASE("Orthogonal midpoint minimum preserves evidence and complete source geometry")
+{
+    using namespace vc::fiber_tracer;
+    std::vector<FiberletCropTraceLine> source(2);
+    source[0].pointsBaseXYZ={{0,0,0},{1024,0,0}};
+    source[1].pointsBaseXYZ={{0,0,20},{1024,0,20}};
+    for(double x:{256.,272.,288.,960.,976.,992.}) {
+        FiberletCropTraceLine cross;
+        cross.pointsBaseXYZ={{x,-256,10},{x,256,10}};
+        source.push_back(cross);
+    }
+    FiberTraceConstraintConfig cfg; cfg.localEvents=true;cfg.parallelThreads=2;
+    auto sampler=[](const cv::Vec3d& a,const cv::Vec3d& b,double){return std::abs(a[2]-b[2])/20.;};
+    const auto baseline=extractFiberTraceConstraints(source,cfg,sampler);
+    auto mass=[](const auto& r){double v=0.;for(const auto& c:r.constraints)if(!c.hardContinuity)v+=c.evidenceWeight;return v;};
+    for(double minimum:{8.,16.,32.,64.,512.,2048.}) {
+        cfg.localMinimumPieceLengthBaseVoxels=minimum;
+        const auto r=extractFiberTraceConstraints(source,cfg,sampler);
+        CHECK(r.localTransitionCuts==0);
+        CHECK(r.localCertifiedEvents==baseline.localCertifiedEvents);
+        CHECK(r.localRetainedCertifiedEvents==baseline.localRetainedCertifiedEvents);
+        CHECK(mass(r)==doctest::Approx(mass(baseline)));
+        CHECK(r.localMidpointCuts==r.pieces.size()-source.size());
+        for(std::size_t t=0;t<source.size();++t) {
+            const double total=t<2?1024.:512.;
+            double end=0.;
+            for(const auto& p:r.pieces)if(p.traceIndex==t) {
+                CHECK(p.beginArcBaseVoxels==doctest::Approx(end));
+                CHECK(p.endArcBaseVoxels-p.beginArcBaseVoxels>=std::min(total,minimum));
+                if(p.endArcBaseVoxels<total) {
+                    CHECK(std::any_of(baseline.pieces.begin(),baseline.pieces.end(),[&](const auto& b){
+                        return b.traceIndex==t && std::abs(b.endArcBaseVoxels-p.endArcBaseVoxels)<1e-8;}));
+                }
+                end=p.endArcBaseVoxels;
+            }
+            CHECK(end==doctest::Approx(total));
+        }
+        for(const auto& c:r.constraints)if(!c.hardContinuity) {
+            CHECK(c.arcABaseVoxels>=r.pieces[c.pieceA].beginArcBaseVoxels);
+            CHECK(c.arcABaseVoxels<=r.pieces[c.pieceA].endArcBaseVoxels);
+            CHECK(c.arcBBaseVoxels>=r.pieces[c.pieceB].beginArcBaseVoxels);
+            CHECK(c.arcBBaseVoxels<=r.pieces[c.pieceB].endArcBaseVoxels);
+        }
+    }
+    cfg.localMinimumPieceLengthBaseVoxels=16.;
+    const auto exact=extractFiberTraceConstraints(source,cfg,sampler);
+    CHECK(std::any_of(exact.pieces.begin(),exact.pieces.end(),[](const auto& p){
+        return std::abs(p.endArcBaseVoxels-p.beginArcBaseVoxels-16.)<1e-8;}));
+    cfg.preserveInputLinesAsPieces=true;
+    CHECK(extractFiberTraceConstraints(source,cfg,sampler).pieces.size()==source.size());
+    for(double invalid:{-1.,std::numeric_limits<double>::infinity(),std::numeric_limits<double>::quiet_NaN()}) {
+        cfg.localMinimumPieceLengthBaseVoxels=invalid;
+        CHECK_THROWS_AS(extractFiberTraceConstraints(source,cfg,sampler),std::invalid_argument);
+    }
 }
 
 TEST_CASE("Certified event support and parallel evidence survive dense crossing splits")
@@ -176,8 +419,8 @@ TEST_CASE("Local parallel measurements reject side disagreement and normalize re
     for(const auto& c:disagree.constraints)if(!c.hardContinuity)
         CHECK((c.arcABaseVoxels<=448. || c.arcABaseVoxels>=576.));
     CHECK(disagree.localRejectedConsistency>0);
-    CHECK(disagree.localTransitionCuts==2);
-    CHECK(disagree.pieces.size()==4);
+    CHECK(disagree.localTransitionCuts==0);
+    CHECK(disagree.pieces.size()==2);
     // An H-to-V turn may not be classified by averaging away its two sides.
     source[1].pointsBaseXYZ={{0,0,20},{512,0,20},{512,512,20}};
     const auto turn=extractFiberTraceConstraints(source,cfg,constant);
@@ -4811,6 +5054,63 @@ TEST_CASE("Joint-grid piece break cost applies once to continuity boundaries")
     CHECK(penalized.mixedProbability[1] < baseline.mixedProbability[1]);
 }
 
+TEST_CASE("Opt-in gap boundary cost preserves hard active continuity and charges only gap boundaries")
+{
+    auto source=lines(1);
+    source[0].pointsBaseXYZ={{0.,0.,0.},{12.,0.,0.}};
+    for(std::size_t count:{3,4}) {
+        FiberTraceConstraintReport report;report.inputTraces=1;
+        for(std::size_t i=0;i<count;++i)report.pieces.push_back({0,i,double(i)*3.,double(i+1)*3.});
+        for(std::size_t i=1;i<count;++i) {
+            FiberTraceConstraint c;c.pieceA=i-1;c.pieceB=i;c.hardContinuity=true;
+            c.parallelScore=1.;c.signedWindingDelta=0.;c.signedParallelWindingDelta=0.;
+            c.arcABaseVoxels=c.arcBBaseVoxels=double(i)*3.;
+            c.pointABaseXYZ=c.pointBBaseXYZ={double(i)*3.,0.,0.};
+            report.constraints.push_back(c);
+        }
+        auto joint=FiberTraceJointGridWindingConfig{};
+        joint.fixedPhaseMagnitude=.5;joint.fixedMeasurementScale=1.;joint.mixedUnaryCost=0.;
+        joint.messageDamping=1.;joint.maximumMessageIterations=1000;
+        joint.penalizeHardSplitDefectBoundaries=true;joint.pieceBreakCost=3.;
+        std::vector<FiberTraceFixedOrientation> orientations(count,FiberTraceFixedOrientation::Mixed);
+        orientations.front()=orientations.back()=FiberTraceFixedOrientation::Horizontal;
+        std::vector<FiberTraceFixedWindingState> fixed(count);
+        fixed.front()={true,FiberTraceFixedOrientation::Horizontal,0,1};
+        fixed.back()=fixed.front();
+        const auto solved=solveFiberTraceJointGridWindingBeliefPropagation(report,topology(source,report),joint,{},orientations,fixed);
+        CHECK(solved.decodedEnergy==doctest::Approx(6.));
+        for(auto& constraint:report.constraints)constraint.artificialTileSeam=true;
+        CHECK(solveFiberTraceJointGridWindingBeliefPropagation(report,topology(source,report),joint,{},orientations,fixed).decodedEnergy==doctest::Approx(0.));
+        for(auto& constraint:report.constraints)constraint.artificialTileSeam=false;
+        fixed.back().fixed=false;
+        orientations.back()=FiberTraceFixedOrientation::Mixed;
+        CHECK(solveFiberTraceJointGridWindingBeliefPropagation(report,topology(source,report),joint,{},orientations,fixed).decodedEnergy==doctest::Approx(3.));
+        fixed.front()=fixed.back();
+        orientations.front()=FiberTraceFixedOrientation::Mixed;
+        CHECK(solveFiberTraceJointGridWindingBeliefPropagation(report,topology(source,report),joint,{},orientations,fixed).decodedEnergy==doctest::Approx(0.));
+        for(auto& f:fixed)f={true,FiberTraceFixedOrientation::Horizontal,0,1};
+        fixed.back().winding=1;
+        CHECK_THROWS(solveFiberTraceJointGridWindingBeliefPropagation(report,topology(source,report),joint,{}, {},fixed));
+    }
+    FiberTraceConstraintReport report;
+    report.inputTraces=1;
+    report.pieces={{0,0,0.,6.},{0,1,6.,12.}};
+    FiberTraceConstraint c;c.pieceA=0;c.pieceB=1;c.parallelScore=1.;c.hardContinuity=true;
+    c.arcABaseVoxels=c.arcBBaseVoxels=6.;
+    c.pointABaseXYZ=c.pointBBaseXYZ={6.,0.,0.};
+    c.signedWindingDelta=0.;report.constraints.push_back(c);
+    FiberTraceJointGridWindingConfig joint;joint.fixedPhaseMagnitude=.5;joint.fixedMeasurementScale=1.;
+    joint.mixedUnaryCost=0.;joint.messageDamping=1.;joint.maximumMessageIterations=1000;
+    auto graph=topology(source,report);
+    const auto baseline=solveFiberTraceJointGridWindingBeliefPropagation(report,graph,joint);
+    joint.penalizeHardSplitDefectBoundaries=true;
+    const auto zero=solveFiberTraceJointGridWindingBeliefPropagation(report,graph,joint);
+    CHECK(zero.mixedProbability==baseline.mixedProbability);
+    joint.pieceBreakCost=3.;
+    const auto penalized=solveFiberTraceJointGridWindingBeliefPropagation(report,graph,joint);
+    CHECK(penalized.mixedProbability!=zero.mixedProbability);
+}
+
 TEST_CASE("Hard split continuity is local and Defect splits source-piece chains")
 {
     std::vector<FiberletCropTraceLine> source(1);
@@ -5934,6 +6234,185 @@ TEST_CASE("Decode repair restores projected pieces through valid winding changes
     for(const auto& edge:report.constraints)
         if(result.windingValid[edge.pieceA] && result.windingValid[edge.pieceB])
             CHECK(result.mapWinding[edge.pieceB]>result.mapWinding[edge.pieceA]);
+    joint.decodeRepairSweeps=0;
+    joint.gapRepairSweeps=3;
+    const auto gaps=solveFiberTraceJointGridWindingBeliefPropagation(report,graph,joint,{},orientations,{},initial);
+    CHECK(gaps.gapRepairAccepted>0);
+    CHECK(gaps.gapRepairRestoredLength>0.);
+    CHECK(gaps.gapRepairObjectiveAfter<gaps.gapRepairObjectiveBefore);
+    for(const auto& edge:report.constraints)
+        if(gaps.windingValid[edge.pieceA] && gaps.windingValid[edge.pieceB])
+            CHECK(gaps.mapWinding[edge.pieceB]>gaps.mapWinding[edge.pieceA]);
+}
+
+TEST_CASE("Best feasible checkpoints include terminal decode and preserve physical hard-sign states")
+{
+    auto report=pieces(3);
+    addMeasured(report,0,1,1.,1.);
+    addMeasured(report,1,2,1.,1.);
+    addMeasured(report,0,2,1.,1.);
+    const auto graph=topology(lines(3),report);
+    FiberTraceJointGridWindingConfig cfg;
+    static_cast<FiberTraceWindingBeliefPropagationConfig&>(cfg)=config();
+    cfg.fixedPhaseMagnitude=.5;cfg.fixedMeasurementScale=1.;
+    cfg.enforceParallelWindingSign=true;cfg.hardSignMinimumNormalAlignment.reset();
+    cfg.stableIterations=1000;
+    const std::vector<FiberTraceFixedOrientation> orientations(3,FiberTraceFixedOrientation::Horizontal);
+    for (const bool fixedCalibration : {true,false}) {
+    if(fixedCalibration) {cfg.fixedPhaseMagnitude=.5;cfg.fixedMeasurementScale=1.;}
+    else {cfg.fixedPhaseMagnitude.reset();cfg.fixedMeasurementScale.reset();}
+    for (std::size_t budget : {1,53,101}) {
+        cfg.maximumMessageIterations=budget;cfg.retainBestFeasible=false;
+        const auto last=solveFiberTraceJointGridWindingBeliefPropagation(report,graph,cfg,{},orientations);
+        cfg.retainBestFeasible=true;
+        const auto best=solveFiberTraceJointGridWindingBeliefPropagation(report,graph,cfg,{},orientations);
+        const auto repeat=solveFiberTraceJointGridWindingBeliefPropagation(report,graph,cfg,{},orientations);
+        CHECK(std::isfinite(best.normalizedDecodedObjective));
+        CHECK(best.normalizedDecodedObjective<=last.normalizedDecodedObjective);
+        CHECK(best.finalNormalizedDecodedObjective==last.normalizedDecodedObjective);
+        CHECK(best.messageIterations==last.messageIterations);
+        CHECK(best.selectedDecodeIteration<=budget);
+        CHECK(best.mapWinding==repeat.mapWinding);
+        CHECK(best.windingValid==repeat.windingValid);
+        if(budget==1)CHECK(best.selectedDecodeIteration==1);
+        for(const auto& edge:report.constraints)
+            if(best.windingValid[edge.pieceA] && best.windingValid[edge.pieceB])
+                CHECK(best.mapWinding[edge.pieceB]>best.mapWinding[edge.pieceA]);
+    }
+    }
+}
+
+TEST_CASE("Run opening charges fixed defects once across subdivisions and gaps")
+{
+    for(std::size_t count:{3,4}) {
+        FiberTraceConstraintReport report;
+        report.inputTraces=1;
+        for(std::size_t i=0;i<count;++i)report.pieces.push_back({0,i,double(i)*3.,double(i+1)*3.});
+        auto source=lines(1);source[0].pointsBaseXYZ={{0.,0.,0.},{12.,0.,0.}};
+        auto cfg=FiberTraceJointGridWindingConfig{};
+        cfg.fixedPhaseMagnitude=.5;cfg.fixedMeasurementScale=1.;cfg.mixedUnaryCost=0.;
+        cfg.disabledRunOpeningCost=7.;cfg.orientationTemperature=2.;
+        std::vector<FiberTraceFixedOrientation> orientations(count,FiberTraceFixedOrientation::Mixed);
+        auto solve=[&] {
+            report.constraints.clear();
+            for(std::size_t i=1;i<count;++i) {
+                if(report.pieces[i].traceIndex!=report.pieces[i-1].traceIndex ||
+                    report.pieces[i].beginArcBaseVoxels!=report.pieces[i-1].endArcBaseVoxels)continue;
+                FiberTraceConstraint c;c.pieceA=i-1;c.pieceB=i;c.hardContinuity=true;
+                c.parallelScore=1.;c.signedWindingDelta=0.;
+                c.arcABaseVoxels=c.arcBBaseVoxels=report.pieces[i].beginArcBaseVoxels;
+                c.pointABaseXYZ=c.pointBBaseXYZ={c.arcABaseVoxels,0.,0.};
+                report.constraints.push_back(c);
+            }
+            return solveFiberTraceJointGridWindingBeliefPropagation(report,topology(source,report),cfg,{},orientations);
+        };
+        CHECK(solve().normalizedDecodedObjective==doctest::Approx(3.5));
+        orientations.front()=FiberTraceFixedOrientation::Horizontal;
+        CHECK(solve().normalizedDecodedObjective==doctest::Approx(3.5));
+        orientations.back()=FiberTraceFixedOrientation::Horizontal;
+        CHECK(solve().normalizedDecodedObjective==doctest::Approx(3.5));
+        orientations.assign(count,FiberTraceFixedOrientation::Mixed);
+        const auto contiguousTopology=topology(source,report);
+        report.pieces.back().beginArcBaseVoxels+=1.;
+        // Topology builder currently rejects gaps within a source. Exercise the
+        // solver's chain guard directly on a supplied topology: the prior must
+        // not bridge geometry gaps even if a legacy continuity edge is present.
+        CHECK(solveFiberTraceJointGridWindingBeliefPropagation(report,contiguousTopology,cfg,{},orientations).normalizedDecodedObjective==doctest::Approx(7.));
+        report.pieces.back().traceIndex=1;report.pieces.back().pieceIndex=0;
+        source.push_back(source.front());report.inputTraces=2;
+        CHECK(solve().normalizedDecodedObjective==doctest::Approx(7.));
+    }
+}
+
+TEST_CASE("Source memory integrates with fixed defects supports windows and gauge boundaries")
+{
+    auto source=lines(2);source[0].pointsBaseXYZ={{0.,0.,0.},{100.,0.,0.}};
+    source[1].pointsBaseXYZ={{0.,1.,0.},{100.,1.,0.}};
+    FiberTraceConstraintReport report;report.inputTraces=2;
+    for(std::size_t i=0;i<5;++i)report.pieces.push_back({0,i,20.*i,20.*(i+1)});
+    report.pieces.push_back({1,0,0.,100.});
+    for(std::size_t i=0;i<5;++i)addMeasured(report,i,5,1.,1.);
+    for(std::size_t i=1;i<5;++i) {
+        FiberTraceConstraint c;c.pieceA=i-1;c.pieceB=i;c.hardContinuity=true;
+        c.parallelScore=1.;c.signedWindingDelta=0.;
+        c.arcABaseVoxels=c.arcBBaseVoxels=20.*i;
+        c.pointABaseXYZ=c.pointBBaseXYZ={20.*i,0.,0.};report.constraints.push_back(c);
+    }
+    auto cfg=FiberTraceJointGridWindingConfig{};
+    cfg.fixedPhaseMagnitude=.5;cfg.fixedMeasurementScale=1.;cfg.maximumMessageIterations=55;
+    std::vector<FiberTraceFixedOrientation> orientations(6,FiberTraceFixedOrientation::Horizontal);
+    orientations[2]=FiberTraceFixedOrientation::Mixed;
+    auto solve=[&] {return solveFiberTraceJointGridWindingBeliefPropagation(report,topology(source,report),cfg,{},orientations);};
+    const auto control=solve();CHECK(control.sourceMemoryFactors==0);
+    cfg.sourceMemoryWindow=-1.;cfg.sourceMemoryBreakCost=0.;
+    const auto neutral=solve();
+    CHECK(neutral.mapWinding==control.mapWinding);
+    CHECK(neutral.windingValid==control.windingValid);
+    CHECK(neutral.normalizedDecodedObjective==doctest::Approx(control.normalizedDecodedObjective));
+    cfg.sourceMemoryBreakCost=std::numeric_limits<double>::infinity();
+    cfg.sourceMemoryWindow=60.;cfg.sourceMemoryOverlap=20.;
+    const auto a=solve(),b=solve();
+    CHECK(a.sourceMemoryFactors>0);
+    CHECK(a.mapWinding==b.mapWinding);CHECK(a.windingValid==b.windingValid);
+    CHECK(a.windingValid[2]==0);
+    CHECK(std::isfinite(a.normalizedDecodedObjective));
+    for(std::size_t start:{0,2}) {
+        std::optional<int> last;
+        for(std::size_t i=start;i<std::min(start+3,std::size_t(5));++i)if(a.windingValid[i]) {
+            if(last)CHECK(a.mapWinding[i]==*last);
+            last=a.mapWinding[i];
+        }
+    }
+    cfg.sourceMemoryWindow=-1.;cfg.sourceMemoryOverlap=0.;
+    cfg.sourceMemoryBreakCost=3.;cfg.sourceMemoryOpeningCost=2.;
+    const auto chain=solve();CHECK(chain.sourceMemoryFactors==1);
+    CHECK(std::isfinite(chain.normalizedDecodedObjective));CHECK(chain.windingValid[2]==0);
+    // Remove cross-source measurements AND continuation through the fixed
+    // Defect: this explicitly creates independent gauges on the two sides.
+    // Legacy preparation retains continuity edges even at fixed Defects.
+    auto pruned=topology(source,report);
+    pruned.softConstraintIndices.clear();
+    pruned.hardConstraintIndices.erase(std::remove_if(pruned.hardConstraintIndices.begin(),
+        pruned.hardConstraintIndices.end(),[&](auto index){const auto& c=report.constraints[index];
+            return c.pieceA==2 || c.pieceB==2;}),pruned.hardConstraintIndices.end());
+    const auto split=solveFiberTraceJointGridWindingBeliefPropagation(report,pruned,cfg,{},orientations);
+    CHECK(split.sourceMemoryFactors==2);
+    cfg.sourceMemoryOverlap=1.;CHECK_THROWS(solve());
+}
+
+TEST_CASE("Interval repair preserves fixed defects and is deterministic energy descent")
+{
+    auto source=lines(1);source[0].pointsBaseXYZ={{0.,0.,0.},{100.,0.,0.}};
+    FiberTraceConstraintReport report;report.inputTraces=1;
+    for(std::size_t i=0;i<5;++i)report.pieces.push_back({0,i,20.*i,20.*(i+1)});
+    source.push_back(source.front());report.inputTraces=2;
+    report.pieces.push_back({1,0,0.,100.});
+    for(std::size_t i=0;i<5;++i)addMeasured(report,i,5,1.,1.);
+    for(std::size_t i=1;i<5;++i) {
+        FiberTraceConstraint c;c.pieceA=i-1;c.pieceB=i;c.hardContinuity=true;
+        c.parallelScore=1.;c.signedWindingDelta=0.;
+        c.arcABaseVoxels=c.arcBBaseVoxels=20.*i;
+        c.pointABaseXYZ=c.pointBBaseXYZ={20.*i,0.,0.};report.constraints.push_back(c);
+    }
+    auto cfg=FiberTraceJointGridWindingConfig{};
+    cfg.fixedPhaseMagnitude=.5;cfg.fixedMeasurementScale=1.;cfg.maximumMessageIterations=1;
+    cfg.enforceParallelWindingSign=true;cfg.hardSignMinimumNormalAlignment.reset();
+    cfg.disabledRunOpeningCost=3.;cfg.gapRepairSweeps=3;
+    std::vector<FiberTraceFixedOrientation> orientations(6,FiberTraceFixedOrientation::Horizontal);
+    orientations[2]=FiberTraceFixedOrientation::Mixed;
+    auto solve=[&] {return solveFiberTraceJointGridWindingBeliefPropagation(report,topology(source,report),cfg,{},orientations);};
+    auto a=solve(),b=solve();
+    CHECK(a.windingValid[2]==0);
+    CHECK(a.mapWinding==b.mapWinding);
+    CHECK(a.windingValid==b.windingValid);
+    CHECK(a.gapRepairObjectiveAfter<=a.gapRepairObjectiveBefore);
+    CHECK(std::isfinite(a.gapRepairObjectiveAfter));
+    cfg.disabledRunOpeningCost=0.;cfg.gapRepairSweeps=0;
+    const auto zero=solve();
+    cfg.retainBestFeasible=true;
+    const auto one=solve();
+    CHECK(zero.mapWinding==one.mapWinding);
+    CHECK(zero.windingValid==one.windingValid);
 }
 
 TEST_CASE("Synthetic continuation can be excluded from defect mass without losing pair factors")
@@ -6111,7 +6590,7 @@ TEST_CASE("Local parallel certification rejects opposite signed side measurement
     const auto r=extractFiberTraceConstraints(source,cfg,
         [](const cv::Vec3d&,const cv::Vec3d&,double){return 1.;},{},{},&field);
     CHECK(r.localRejectedConsistency>0);
-    CHECK(r.localTransitionCuts==2);
+    CHECK(r.localTransitionCuts==0);
     CHECK(r.signedWindingConstraints==r.constraints.size());
     std::size_t ordinary=0;
     for(const auto& c:r.constraints)if(!c.hardContinuity) {

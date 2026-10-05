@@ -1,0 +1,210 @@
+{
+  "method": "unique >=90% arc samples within spherical radius, tangent <=25 degrees; midpoint spacing <=4vx; strict subset, NOT acceptance ellipse",
+  "polarity": "majority sign per normal component on baseline matched subset; frozen for probes; label uncertainty and calibration can bias absolute error rates",
+  "input_root": "/ephemeral/hendrik/fiber_crop_bench/20261002_iso20_orthogonal_probes_v1",
+  "pieces": 2799,
+  "radii": {
+    "4": {
+      "matched_pieces": 25,
+      "variants": {
+        "winner-repeat": {
+          "assessable": 8,
+          "wrong": 0,
+          "wrong_percent": 0.0,
+          "same_winding_pairs": 0,
+          "raw_magnitude_mae": 0.27959715487845105,
+          "corrected": 0,
+          "damaged": 0,
+          "common": 8,
+          "total_hard_orthogonal": 62517,
+          "changed_targets_assessable": 0,
+          "parallel": {
+            "assessable": 0,
+            "wrong": 0,
+            "wrong_percent": null,
+            "same_winding_pairs": 0,
+            "raw_magnitude_mae": null
+          }
+        },
+        "winner-median64": {
+          "assessable": 8,
+          "wrong": 0,
+          "wrong_percent": 0.0,
+          "same_winding_pairs": 0,
+          "raw_magnitude_mae": 0.26930584609130115,
+          "corrected": 0,
+          "damaged": 0,
+          "common": 8,
+          "total_hard_orthogonal": 62517,
+          "changed_targets_assessable": 6,
+          "parallel": {
+            "assessable": 0,
+            "wrong": 0,
+            "wrong_percent": null,
+            "same_winding_pairs": 0,
+            "raw_magnitude_mae": null
+          }
+        },
+        "winner-consensus32": {
+          "assessable": 8,
+          "wrong": 0,
+          "wrong_percent": 0.0,
+          "same_winding_pairs": 0,
+          "raw_magnitude_mae": 0.27959715487845105,
+          "corrected": 0,
+          "damaged": 0,
+          "common": 8,
+          "total_hard_orthogonal": 62517,
+          "changed_targets_assessable": 0,
+          "parallel": {
+            "assessable": 0,
+            "wrong": 0,
+            "wrong_percent": null,
+            "same_winding_pairs": 0,
+            "raw_magnitude_mae": null
+          }
+        }
+      },
+      "polarity": {
+        "0": 1
+      },
+      "parallel_polarity": {}
+    },
+    "8": {
+      "matched_pieces": 96,
+      "variants": {
+        "winner-repeat": {
+          "assessable": 198,
+          "wrong": 0,
+          "wrong_percent": 0.0,
+          "same_winding_pairs": 0,
+          "raw_magnitude_mae": 0.5410568589644931,
+          "corrected": 0,
+          "damaged": 0,
+          "common": 198,
+          "total_hard_orthogonal": 62517,
+          "changed_targets_assessable": 0,
+          "parallel": {
+            "assessable": 88,
+            "wrong": 0,
+            "wrong_percent": 0.0,
+            "same_winding_pairs": 0,
+            "raw_magnitude_mae": 0.4222621615460879
+          }
+        },
+        "winner-median64": {
+          "assessable": 198,
+          "wrong": 0,
+          "wrong_percent": 0.0,
+          "same_winding_pairs": 0,
+          "raw_magnitude_mae": 0.5232578729128288,
+          "corrected": 0,
+          "damaged": 0,
+          "common": 198,
+          "total_hard_orthogonal": 62517,
+          "changed_targets_assessable": 105,
+          "parallel": {
+            "assessable": 88,
+            "wrong": 0,
+            "wrong_percent": 0.0,
+            "same_winding_pairs": 0,
+            "raw_magnitude_mae": 0.4222621615460879
+          }
+        },
+        "winner-consensus32": {
+          "assessable": 198,
+          "wrong": 0,
+          "wrong_percent": 0.0,
+          "same_winding_pairs": 0,
+          "raw_magnitude_mae": 0.5426817744115756,
+          "corrected": 0,
+          "damaged": 0,
+          "common": 198,
+          "total_hard_orthogonal": 62517,
+          "changed_targets_assessable": 49,
+          "parallel": {
+            "assessable": 88,
+            "wrong": 0,
+            "wrong_percent": 0.0,
+            "same_winding_pairs": 0,
+            "raw_magnitude_mae": 0.4222621615460879
+          }
+        }
+      },
+      "polarity": {
+        "0": 1
+      },
+      "parallel_polarity": {
+        "0": 1
+      }
+    },
+    "16": {
+      "matched_pieces": 129,
+      "variants": {
+        "winner-repeat": {
+          "assessable": 468,
+          "wrong": 0,
+          "wrong_percent": 0.0,
+          "same_winding_pairs": 0,
+          "raw_magnitude_mae": 0.42387950827714205,
+          "corrected": 0,
+          "damaged": 0,
+          "common": 468,
+          "total_hard_orthogonal": 62517,
+          "changed_targets_assessable": 0,
+          "parallel": {
+            "assessable": 133,
+            "wrong": 0,
+            "wrong_percent": 0.0,
+            "same_winding_pairs": 0,
+            "raw_magnitude_mae": 0.3716564895447384
+          }
+        },
+        "winner-median64": {
+          "assessable": 468,
+          "wrong": 0,
+          "wrong_percent": 0.0,
+          "same_winding_pairs": 0,
+          "raw_magnitude_mae": 0.411103025178383,
+          "corrected": 0,
+          "damaged": 0,
+          "common": 468,
+          "total_hard_orthogonal": 62517,
+          "changed_targets_assessable": 228,
+          "parallel": {
+            "assessable": 133,
+            "wrong": 0,
+            "wrong_percent": 0.0,
+            "same_winding_pairs": 0,
+            "raw_magnitude_mae": 0.3716564895447384
+          }
+        },
+        "winner-consensus32": {
+          "assessable": 468,
+          "wrong": 0,
+          "wrong_percent": 0.0,
+          "same_winding_pairs": 0,
+          "raw_magnitude_mae": 0.42218486025704766,
+          "corrected": 0,
+          "damaged": 0,
+          "common": 468,
+          "total_hard_orthogonal": 62517,
+          "changed_targets_assessable": 91,
+          "parallel": {
+            "assessable": 133,
+            "wrong": 0,
+            "wrong_percent": 0.0,
+            "same_winding_pairs": 0,
+            "raw_magnitude_mae": 0.3716564895447384
+          }
+        }
+      },
+      "polarity": {
+        "0": 1
+      },
+      "parallel_polarity": {
+        "0": 1
+      }
+    }
+  }
+}

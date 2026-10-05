@@ -14,6 +14,7 @@
 #include <limits>
 #include <map>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <thread>
 #include <tuple>
@@ -73,6 +74,7 @@ struct ScoredCandidate {
     std::vector<std::pair<cv::Vec3d, cv::Vec3d>> parallelConnectors;
     RejectReason rejection = RejectReason::None;
     PairCandidate candidate;
+    std::size_t legacyConnectorCount = 0;
 };
 
 struct SignedWindingSample {
@@ -197,8 +199,22 @@ void validateConfig(const FiberTraceConstraintConfig& config)
         config.maximumWindingDistance > 0.0;
     if (!valid)
         throw std::invalid_argument("Fiber trace constraint configuration is invalid");
-    if (config.localEvents &&
-        (!(config.localSpacingBaseVoxels > 0.) || !std::isfinite(config.localSpacingBaseVoxels) ||
+    if(!std::isfinite(config.orthogonalProbeSpan) || config.orthogonalProbeSpan<0. ||
+       !std::isfinite(config.orthogonalProbeBlend) || config.orthogonalProbeBlend<0. || config.orthogonalProbeBlend>1. ||
+       (config.orthogonalProbeSpan>0. && (config.localEvents || config.localScorerOnly)))
+        throw std::invalid_argument("Invalid orthogonal probe adaptation");
+    if(config.legacyFinePieces && (config.localEvents || config.localScorerOnly ||
+        config.preserveInputLinesAsPieces || !config.extraPieceCutsBaseVoxels.empty() ||
+        !config.localIncludeParallel || !std::isfinite(config.localMinimumPieceLengthBaseVoxels) ||
+        config.localMinimumPieceLengthBaseVoxels<0.))
+        throw std::invalid_argument("Legacy fine port requires ordinary extraction and valid minimum length");
+    if((config.localOverlapPieces || config.localOnePerPair || config.localReplicateOverlap) && !config.localEvents)
+        throw std::invalid_argument("Local ownership options require local events");
+    if(config.localReplicateOverlap && (!config.localOverlapPieces || config.localOnePerPair))
+        throw std::invalid_argument("Overlap replication requires overlapping layout and all events");
+    if ((config.localEvents || config.localScorerOnly) &&
+        (!(config.localMinimumPieceLengthBaseVoxels >= 0.) || !std::isfinite(config.localMinimumPieceLengthBaseVoxels) ||
+         !(config.localSpacingBaseVoxels > 0.) || !std::isfinite(config.localSpacingBaseVoxels) ||
          !(config.localTangentSpanBaseVoxels > 0.) || !std::isfinite(config.localTangentSpanBaseVoxels) ||
          !(config.localParallelSpanBaseVoxels >= 2.*config.localTangentSpanBaseVoxels) || !std::isfinite(config.localParallelSpanBaseVoxels) ||
          !(config.localReciprocalToleranceBaseVoxels > 0.) || !std::isfinite(config.localReciprocalToleranceBaseVoxels) ||
@@ -481,6 +497,13 @@ std::optional<RefinedCorrespondence> refinedCorrespondence(
     return best;
 }
 
+std::pair<cv::Vec3d,cv::Vec3d> orthogonalProbeConnector(
+    const PolylineArcGeometry& a,const PolylineArcGeometry& b,
+    double arcA,double arcB)
+{
+    return {samplePolylineArc(a,arcA).point,samplePolylineArc(b,arcB).point};
+}
+
 ScoredCandidate scoreLocalCandidate(
     PairCandidate candidate,
     const std::vector<FiberTraceConstraintPiece>& pieces,
@@ -541,6 +564,8 @@ ScoredCandidate scoreLocalCandidate(
                 std::max(0.,seedA-reach), std::min(ga.length(),seedA+reach)).arc;
     }
     if (relation(a,b) != kind) return failure();
+    if(config.localScorerOnly && (a<pa.beginArcBaseVoxels || a>pa.endArcBaseVoxels ||
+                                 b<pb.beginArcBaseVoxels || b>pb.endArcBaseVoxels))return failure();
     const auto pointA=samplePolylineArc(ga,a).point, pointB=samplePolylineArc(gb,b).point;
     if (length(pointB-pointA) > config.maximumDistanceBaseVoxels) return failure();
     const auto reciprocal = projectPointToPolylineArc(ga, pointB,
@@ -598,8 +623,9 @@ ScoredCandidate scoreLocalCandidate(
                 c.supportBBegin=std::min(c.supportBBegin,std::max(0.,bb-h)); c.supportBEnd=std::max(c.supportBEnd,std::min(gb.length(),bb+h));
             }
             if(kind==2 && fitsB) {
-                if(length(samplePolylineArc(gb,nominalB).point-pointA)>config.maximumDistanceBaseVoxels) return failure();
-                result.parallelConnectors.emplace_back(pointA,samplePolylineArc(gb,nominalB).point);
+                const auto probe=orthogonalProbeConnector(ga,gb,a,nominalB);
+                if(length(probe.second-probe.first)>config.maximumDistanceBaseVoxels) return failure();
+                result.parallelConnectors.push_back(probe);
                 c.supportBBegin=std::min(c.supportBBegin,nominalB-h); c.supportBEnd=std::max(c.supportBEnd,nominalB+h);
             }
         }
@@ -618,7 +644,7 @@ ScoredCandidate scoreCandidate(
     const std::vector<std::optional<PolylineArcGeometry>>& geometries,
     const FiberTraceConstraintConfig& config)
 {
-    if (config.localEvents)
+    if (config.localEvents || config.localScorerOnly)
         return scoreLocalCandidate(candidate,pieces,geometries,config);
     const auto& pieceA = pieces[candidate.pieces.a];
     const auto& pieceB = pieces[candidate.pieces.b];
@@ -1000,7 +1026,8 @@ void measureCandidates(
     for (std::size_t index = 0; index < acceptedIndices.size(); ++index) {
         auto& result = scored[acceptedIndices[index]];
         const std::size_t begin = connectorOffsets[index];
-        const std::size_t end = connectorOffsets[index + 1];
+        const std::size_t allEnd = connectorOffsets[index + 1];
+        const std::size_t end = result.legacyConnectorCount ? begin+result.legacyConnectorCount : allEnd;
         const double closestWinding = windings[begin];
         if (!std::isfinite(closestWinding)) {
             result.constraint.reset();
@@ -1056,7 +1083,7 @@ void measureCandidates(
             }
         }
 
-        if (config.localEvents) {
+        if (config.certifyWinding.value_or(config.localEvents || config.localScorerOnly)) {
             const auto& c = *result.constraint;
             const double step = c.parallelScore > c.perpendicularScore ? 1.0 : 0.5;
             bool consistent = true;
@@ -1080,7 +1107,10 @@ void measureCandidates(
                 result.rejection = RejectReason::Consistency;
                 continue;
             }
-            // Off-base samples certify the measurement; they do not move or average it.
+        }
+        if (config.closestParallelEstimator.value_or(config.localEvents || config.localScorerOnly)) {
+            const auto& c=*result.constraint;
+            // Optional ablation: probes certify, closest connector sets distance.
             result.constraint->parallelWindingDistance = closestWinding;
             result.constraint->signedParallelWindingDelta = c.signedWindingDelta;
             result.constraint->parallelNormalAlignment = c.perpendicularNormalAlignment;
@@ -1091,6 +1121,24 @@ void measureCandidates(
                config.maximumWindingDistance))) {
             result.constraint.reset();
             result.rejection = RejectReason::WindingCutoff;
+        }
+        // Adapt only after old acceptance and all old parallel estimators.
+        // Complete two-sided support is required; missing/invalid probes keep
+        // the original, never discard an otherwise accepted observation.
+        if(result.constraint && allEnd-end==4 && result.constraint->signedWindingDelta) {
+            auto& c=*result.constraint;
+            std::vector<double> values{*c.signedWindingDelta};
+            for(std::size_t j=end;j<allEnd;++j) {
+                if(!std::isfinite(windings[j]))break;
+                const auto s=signedWindingSample(connectors[j],windings[j],*alignedNormals);
+                if(!s || s->component!=c.windingNormalComponent)break;
+                values.push_back(s->value);
+            }
+            const bool consensus=std::all_of(values.begin(),values.end(),[&](double x){return std::llround(2*x)==std::llround(2*values.front());});
+            if(values.size()==5 && (!config.orthogonalProbeConsensus || consensus)) {
+                const double target=(1.-config.orthogonalProbeBlend)*values.front()+config.orthogonalProbeBlend*median(values);
+                c.signedWindingDelta=target;c.windingDistance=std::abs(target);
+            }
         }
     }
 }
@@ -1139,14 +1187,12 @@ void splitLocalEvents(FiberTraceConstraintReport& report,
     const std::vector<std::optional<PolylineArcGeometry>>& geometries,
     const FiberTraceConstraintConfig& config)
 {
-    normalizeLocalParallelEvidence(report,geometries,config);
+    if(config.localNormalizeEvidence)normalizeLocalParallelEvidence(report,geometries,config);
     report.localCertifiedEvents=report.constraints.size();
     const auto originalPieces=report.pieces;
     std::vector<std::vector<double>> orthogonal(geometries.size()), cuts(geometries.size());
-    std::map<PiecePair,std::vector<std::size_t>> pairs;
     for(std::size_t i=0;i<report.constraints.size();++i) {
         const auto& c=report.constraints[i];
-        pairs[{c.pieceA,c.pieceB}].push_back(i);
         if(c.perpendicularScore>c.parallelScore) {
             orthogonal[originalPieces[c.pieceA].traceIndex].push_back(c.arcABaseVoxels);
             orthogonal[originalPieces[c.pieceB].traceIndex].push_back(c.arcBBaseVoxels);
@@ -1160,33 +1206,6 @@ void splitLocalEvents(FiberTraceConstraintReport& report,
         auto& arcs=orthogonal[t]; sortUnique(arcs);
         for(std::size_t i=1;i<arcs.size();++i) {
             cuts[t].push_back(.5*(arcs[i-1]+arcs[i]));
-            ++report.localMidpointCuts;
-        }
-    }
-    for(auto& [pair,indices]:pairs) {
-        std::sort(indices.begin(),indices.end(),[&](auto i,auto j) {
-            const auto& a=report.constraints[i]; const auto& b=report.constraints[j];
-            return std::tie(a.arcABaseVoxels,a.arcBBaseVoxels)<std::tie(b.arcABaseVoxels,b.arcBBaseVoxels);
-        });
-        for(std::size_t k=1;k<indices.size();++k) {
-            const auto& a=report.constraints[indices[k-1]];
-            const auto& b=report.constraints[indices[k]];
-            // Two-sided certification leaves an ambiguous band around a real
-            // transition. Bridge that bounded band, not only adjacent samples.
-            const double bracket=2*(config.localSpacingBaseVoxels+
-                config.localParallelSpanBaseVoxels+config.localTangentSpanBaseVoxels);
-            if(std::abs(a.arcABaseVoxels-b.arcABaseVoxels)>bracket ||
-               std::abs(a.arcBBaseVoxels-b.arcBBaseVoxels)>bracket) continue;
-            const auto category=[](const auto& c) {
-                return std::tuple{c.parallelScore>c.perpendicularScore,
-                    std::llround(c.windingDistance/(c.parallelScore>.5?1.:.5)),
-                    c.signedWindingDelta ? (*c.signedWindingDelta<0.?-1:1):0};
-            };
-            if(category(a)!=category(b) && (a.parallelScore>.5 || b.parallelScore>.5)) {
-                cuts[originalPieces[pair.a].traceIndex].push_back(.5*(a.arcABaseVoxels+b.arcABaseVoxels));
-                cuts[originalPieces[pair.b].traceIndex].push_back(.5*(a.arcBBaseVoxels+b.arcBBaseVoxels));
-                report.localTransitionCuts+=2;
-            }
         }
     }
     std::vector<std::vector<std::size_t>> piecesByTrace(geometries.size());
@@ -1194,8 +1213,27 @@ void splitLocalEvents(FiberTraceConstraintReport& report,
         report.pieces.clear(); report.resampledPoints=0;
         for(std::size_t t=0;t<geometries.size();++t) {
             if(!geometries[t]) continue;
+            if(config.localOverlapPieces) {
+                for(const auto& [begin,end]:pieceIntervals(geometries[t]->length(),config)) {
+                    piecesByTrace[t].push_back(report.pieces.size());
+                    report.pieces.push_back(makePiece(t,piecesByTrace[t].size()-1,*geometries[t],begin,end,config.resampleSpacingBaseVoxels));
+                    report.resampledPoints+=report.pieces.back().samplePointsBaseXYZ.size();
+                }
+                continue;
+            }
             auto& c=cuts[t]; sortUnique(c);
             c.erase(std::remove_if(c.begin(),c.end(),[&](double x){return x<=1e-4 || x>=geometries[t]->length()-1e-4;}),c.end());
+            // Keep only orthogonal-event midpoint candidates with sufficient
+            // room on both sides. Short whole source lines remain intact.
+            double previous=0.;
+            std::erase_if(c,[&](double x) {
+                if(x-previous < config.localMinimumPieceLengthBaseVoxels ||
+                   geometries[t]->length()-x < config.localMinimumPieceLengthBaseVoxels)
+                    return true;
+                previous=x;
+                return false;
+            });
+            report.localMidpointCuts+=c.size();
             c.push_back(geometries[t]->length());
             double begin=0.;
             for(double end:c) {
@@ -1211,9 +1249,20 @@ void splitLocalEvents(FiberTraceConstraintReport& report,
         report.localMidpointCuts=report.localTransitionCuts=0;
     }
     std::size_t missingOwners=0;
-    report.constraints=remapCertifiedFiberTraceEvents(report.constraints,originalPieces,report.pieces,missingOwners);
+    report.constraints=remapCertifiedFiberTraceEvents(report.constraints,originalPieces,report.pieces,missingOwners,
+        config.localReplicateOverlap);
     if(missingOwners)
         throw std::logic_error("Full subdivision lost certified event owners");
+    if(config.localOnePerPair) {
+        std::map<PiecePair,FiberTraceConstraint> closest;
+        for(const auto& c:report.constraints) {
+            auto [it,inserted]=closest.try_emplace({c.pieceA,c.pieceB},c);
+            if(!inserted && std::tie(c.closestDistanceBaseVoxels,c.arcABaseVoxels,c.arcBBaseVoxels)<
+                std::tie(it->second.closestDistanceBaseVoxels,it->second.arcABaseVoxels,it->second.arcBBaseVoxels))it->second=c;
+        }
+        report.constraints.clear();
+        for(auto& [key,c]:closest)report.constraints.push_back(std::move(c));
+    }
     std::erase_if(report.constraints,[&](const auto& c) {
         if(config.localIncludeParallel || c.parallelScore<=.5)return false;
         ++report.localParallelOmitted; return true;
@@ -1228,7 +1277,7 @@ std::vector<FiberTraceConstraint> remapCertifiedFiberTraceEvents(
     std::span<const FiberTraceConstraint> events,
     std::span<const FiberTraceConstraintPiece> sourcePieces,
     std::span<const FiberTraceConstraintPiece> targetPieces,
-    std::size_t& missingOwners)
+    std::size_t& missingOwners, bool replicateOverlap)
 {
     std::map<std::size_t,std::vector<std::size_t>> byTrace;
     for(std::size_t i=0;i<targetPieces.size();++i)byTrace[targetPieces[i].traceIndex].push_back(i);
@@ -1261,9 +1310,44 @@ std::vector<FiberTraceConstraint> remapCertifiedFiberTraceEvents(
         const auto a=owner(c.pieceA,c.arcABaseVoxels),b=owner(c.pieceB,c.arcBBaseVoxels);
         if(!a||!b){++missingOwners;continue;}
         c.pieceA=*a; c.pieceB=*b;
-        result.push_back(std::move(c));
+        if(!replicateOverlap)result.push_back(std::move(c));
+        else {
+            std::vector<std::size_t> as,bs;
+            for(auto id:byTrace.at(targetPieces[*a].traceIndex))
+                if(targetPieces[id].beginArcBaseVoxels<=c.arcABaseVoxels &&
+                   targetPieces[id].endArcBaseVoxels>=c.arcABaseVoxels)as.push_back(id);
+            for(auto id:byTrace.at(targetPieces[*b].traceIndex))
+                if(targetPieces[id].beginArcBaseVoxels<=c.arcBBaseVoxels &&
+                   targetPieces[id].endArcBaseVoxels>=c.arcBBaseVoxels)bs.push_back(id);
+            c.evidenceWeight/=double(as.size()*bs.size());
+            for(auto aa:as)for(auto bb:bs) {c.pieceA=aa;c.pieceB=bb;result.push_back(c);}
+        }
     }
     return result;
+}
+
+std::vector<double> partitionFiberTracePieceLengths(std::span<const FiberTraceConstraintPiece> pieces)
+{
+    std::vector<double> lengths(pieces.size(),0.);
+    std::map<std::size_t,std::map<double,std::vector<std::pair<std::size_t,bool>>>> events;
+    for(std::size_t i=0;i<pieces.size();++i) {
+        const auto& p=pieces[i];
+        if(!std::isfinite(p.beginArcBaseVoxels) || !std::isfinite(p.endArcBaseVoxels) || p.endArcBaseVoxels<p.beginArcBaseVoxels)
+            throw std::invalid_argument("Invalid piece interval");
+        if(p.endArcBaseVoxels==p.beginArcBaseVoxels)continue;
+        events[p.traceIndex][p.beginArcBaseVoxels].push_back({i,true});
+        events[p.traceIndex][p.endArcBaseVoxels].push_back({i,false});
+    }
+    for(const auto& [source,positions]:events) {
+        std::set<std::size_t> active;
+        double previous=positions.begin()->first;
+        for(const auto& [arc,changes]:positions) {
+            if(!active.empty())for(auto i:active)lengths[i]+=(arc-previous)/active.size();
+            for(auto [i,add]:changes) {if(add)active.insert(i);else active.erase(i);}
+            previous=arc;
+        }
+    }
+    return lengths;
 }
 
 FiberTraceConstraintReport extractFiberTraceConstraints(
@@ -1455,6 +1539,23 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
         if (failure)
             std::rethrow_exception(failure);
     }
+    if(config.binaryOrientationScore)for(auto& s:scored)if(s.constraint) {
+        const bool parallel=s.constraint->parallelScore>s.constraint->perpendicularScore;
+        s.constraint->parallelScore=parallel?1.:0.;
+        s.constraint->perpendicularScore=parallel?0.:1.;
+    }
+    if(config.orthogonalProbeSpan>0. && alignedNormals)for(auto& s:scored)if(s.constraint) {
+        const auto& c=*s.constraint;
+        if(c.parallelScore>=c.perpendicularScore)continue;
+        const auto& a=*geometries[report.pieces[c.pieceA].traceIndex];
+        const auto& b=*geometries[report.pieces[c.pieceB].traceIndex];
+        const double h=config.orthogonalProbeSpan;
+        if(c.arcABaseVoxels<h || c.arcABaseVoxels+h>a.length() ||
+           c.arcBBaseVoxels<h || c.arcBBaseVoxels+h>b.length())continue;
+        s.legacyConnectorCount=s.parallelConnectors.size();
+        for(bool moveA:{true,false})for(double offset:{-h,h})
+            s.parallelConnectors.push_back(orthogonalProbeConnector(a,b,c.arcABaseVoxels+(moveA?offset:0.),c.arcBBaseVoxels+(moveA?0.:offset)));
+    }
     report.orientationScoreSeconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - scoreStarted).count();
 
@@ -1530,8 +1631,14 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
         else if (result.rejection == RejectReason::Consistency)
             ++report.localRejectedConsistency;
     }
-    if(config.localEvents) {
-        splitLocalEvents(report,geometries,config);
+    if(config.localEvents || config.legacyFinePieces) {
+        auto splitConfig=config;
+        if(config.legacyFinePieces) {
+            std::erase_if(report.constraints,[](const auto& c){return c.hardContinuity;});
+            report.hardConstraints=0;
+            splitConfig.localNormalizeEvidence=false;
+        }
+        splitLocalEvents(report,geometries,splitConfig);
         report.signedWindingConstraints=report.skippedSignedWindingConstraints=0;
         if(alignedNormals != nullptr) {
             for(const auto& c:report.constraints) {
@@ -1542,14 +1649,17 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
             }
         }
     }
-    std::sort(report.constraints.begin(), report.constraints.end(),
-        [&](const auto& left, const auto& right) {
-            if(!config.localEvents)
+    const auto constraintOrder=[&](const auto& left, const auto& right) {
+            if(!config.localEvents && !config.legacyFinePieces)
                 return std::tie(left.pieceA,left.pieceB,left.hardContinuity) <
                     std::tie(right.pieceA,right.pieceB,right.hardContinuity);
             return std::tie(left.pieceA, left.pieceB, left.hardContinuity,left.arcABaseVoxels,left.arcBBaseVoxels) <
                 std::tie(right.pieceA, right.pieceB, right.hardContinuity,right.arcABaseVoxels,right.arcBBaseVoxels);
-        });
+        };
+    if(config.legacyFinePieces)
+        std::stable_sort(report.constraints.begin(),report.constraints.end(),constraintOrder);
+    else
+        std::sort(report.constraints.begin(),report.constraints.end(),constraintOrder);
     report.scoreSeconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - scoreStarted).count();
     if (alignedNormals != nullptr) {

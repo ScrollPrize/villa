@@ -1,4 +1,5 @@
 #include "vc/fiber_tracer/FiberTraceWindingBeliefPropagation.hpp"
+#include "vc/fiber_tracer/FiberWindingSequence.hpp"
 
 #include <Eigen/Sparse>
 #include <Eigen/SparseCholesky>
@@ -630,6 +631,8 @@ PreparedWinding prepareWinding(
         auto& edge = result.edges[found->second];
         edge.containsHardContinuity =
             edge.containsHardContinuity || continuity;
+        edge.containsArtificialTileSeam = edge.containsArtificialTileSeam ||
+            constraints.constraints.at(index).artificialTileSeam;
         edge.measurements.push_back(std::move(measurement));
     };
     for (const std::size_t index : topology.hardConstraintIndices)
@@ -1685,7 +1688,7 @@ double pieceBreakLogPotential(
 {
     const bool defectA = a.orientation == JointClass::Mixed;
     const bool defectB = b.orientation == JointClass::Mixed;
-    return edge.containsHardContinuity && defectA != defectB
+    return edge.containsHardContinuity && !edge.containsArtificialTileSeam && defectA != defectB
         ? -pieceBreakCost / orientationTemperature
         : 0.0;
 }
@@ -1724,7 +1727,8 @@ double jointLogPotential(
     }
     if (a.orientation == JointClass::Mixed ||
         b.orientation == JointClass::Mixed) {
-        if (enforceHardSplitContinuity && edge.containsHardContinuity)
+        if (enforceHardSplitContinuity && edge.containsHardContinuity &&
+            !config.penalizeHardSplitDefectBoundaries)
             return 0.0;
         return pieceBreakLogPotential(
             edge,
@@ -2494,6 +2498,19 @@ struct GridMessages {
 };
 
 struct GridRound {
+    struct Sequence {
+        std::vector<std::size_t> nodes;
+        std::vector<std::vector<double>> messages;
+    };
+    std::vector<Sequence> sequences;
+    struct RunEdge {
+        std::size_t a, b;
+        std::array<double,2> toA{0.,0.}, toB{0.,0.};
+    };
+    std::vector<std::vector<std::size_t>> sourceChains;
+    std::vector<double> sourceLengths;
+    std::vector<unsigned char> chainStart;
+    std::vector<RunEdge> runEdges;
     std::vector<GridMessages> messages;
     std::vector<std::vector<double>> pieceProbabilities;
     std::vector<double> calibrationProbabilities;
@@ -2777,7 +2794,7 @@ double gridDecodedEnergy(
             const bool exactlyOneDefect =
                 (a.orientation == JointClass::Mixed) !=
                 (b.orientation == JointClass::Mixed);
-            if (edge.containsHardContinuity && exactlyOneDefect && !config.continuityCutCost)
+            if (edge.containsHardContinuity && !edge.containsArtificialTileSeam && exactlyOneDefect && !config.continuityCutCost)
                 result += config.pieceBreakCost;
             continue;
         }
@@ -2814,7 +2831,8 @@ double gridLogPotential(
         b.orientation == JointClass::Mixed) {
         if (config.continuityCutCost)
             return 0.0;
-        if (config.enforceHardSplitContinuity && edge.containsHardContinuity)
+        if (config.enforceHardSplitContinuity && edge.containsHardContinuity &&
+            !config.penalizeHardSplitDefectBoundaries)
             return 0.0;
         return pieceBreakLogPotential(
             edge,
@@ -2883,6 +2901,16 @@ struct GridLogTotals {
 void validateJointGridConfig(const FiberTraceJointGridWindingConfig& config)
 {
     validateConfig(config);
+    if (!std::isfinite(config.sourceMemoryWindow) || !std::isfinite(config.sourceMemoryOverlap) ||
+        config.sourceMemoryOverlap<0. || (config.sourceMemoryOverlap>0. &&
+        config.sourceMemoryOverlap>=config.sourceMemoryWindow) ||
+        std::isnan(config.sourceMemoryBreakCost) || config.sourceMemoryBreakCost<0. ||
+        !std::isfinite(config.sourceMemoryOpeningCost) || config.sourceMemoryOpeningCost<0. ||
+        (config.sourceMemoryWindow!=0. && (config.decodeRepairSweeps || config.gapRepairSweeps ||
+                                         config.disabledRunOpeningCost>0.)))
+        throw std::invalid_argument("Invalid source memory config (cannot combine with repair/run-edge prior)");
+    if (!std::isfinite(config.disabledRunOpeningCost) || config.disabledRunOpeningCost < 0.)
+        throw std::invalid_argument("Run opening cost must be finite and nonnegative");
     const bool hasFixedPhase = config.fixedPhaseMagnitude.has_value();
     const bool hasFixedScale = config.fixedMeasurementScale.has_value();
     const bool fixedInvalid = hasFixedPhase != hasFixedScale ||
@@ -2969,6 +2997,12 @@ void initializeGridMessages(
     const PreparedWinding& problem,
     GridRound& round)
 {
+    for(auto& sequence:round.sequences) {
+        sequence.messages.resize(sequence.nodes.size());
+        for(std::size_t i=0;i<sequence.nodes.size();++i)
+            sequence.messages[i].assign(gridPieceStateCount(sequence.nodes[i],round.lower,
+                round.upper,round.gauge,round.fixedOrientations,round.fixedStates),0.);
+    }
     round.messages.resize(problem.edges.size());
     for (std::size_t edgeIndex = 0;
          edgeIndex < problem.edges.size();
@@ -3076,19 +3110,53 @@ double gridUnaryLogPotential(
     const PreparedWinding& problem, const GridRound& round, std::size_t node,
     const JointState& decoded, const FiberTraceJointGridWindingConfig& config)
 {
+    const double runStart = decoded.orientation == JointClass::Mixed &&
+        !round.chainStart.empty() && round.chainStart[node]
+        ? config.disabledRunOpeningCost / config.orientationTemperature : 0.;
     const bool chargeDefect = decoded.orientation == JointClass::Mixed &&
         (round.fixedOrientations.empty() || round.fixedOrientations[node] != JointClass::Mixed);
     if (chargeDefect) {
         const auto& incident = round.fixedOrientations.empty()
             ? problem.incidentMeasurements : problem.incidentWindingMeasurements;
         return -scaledDefectCost(problem, node, config.mixedUnaryCost) *
-            defectMeasure(problem, node, incident[node]) / config.orientationTemperature;
+            defectMeasure(problem, node, incident[node]) / config.orientationTemperature - runStart;
     }
     if (decoded.orientation != JointClass::Mixed && config.continuousCoordinateCost > 0.0)
         return -config.continuousCoordinateCost * std::abs(
             static_cast<double>(decoded.winding) - std::round(round.continuousNodes.at(node))) /
             config.temperature;
-    return 0.0;
+    return -runStart;
+}
+
+double gridObjective(
+    const PreparedWinding& problem, const GridRound& round,
+    const GridCalibrationCell& calibration, std::span<const int> phaseSigns,
+    const FiberTraceJointGridWindingConfig& config, std::span<const JointState> decoded)
+{
+    double energy = 0.;
+    for (std::size_t node = 0; node < decoded.size(); ++node)
+        energy -= gridUnaryLogPotential(problem, round, node, decoded[node], config);
+    for (const auto& edge : problem.edges)
+        energy -= gridLogPotential(edge, decoded[edge.a], decoded[edge.b],
+            phaseSigns[problem.componentByNode[edge.a]], calibration, config,
+            round.fixedOrientations.empty());
+    for (const auto& edge : round.runEdges)
+        if (decoded[edge.a].orientation != JointClass::Mixed &&
+            decoded[edge.b].orientation == JointClass::Mixed)
+            energy += config.disabledRunOpeningCost / config.orientationTemperature;
+    for(const auto& sequence:round.sequences) {
+        std::map<std::pair<JointClass,int>,int> alphabet;
+        std::vector<int> labels;
+        for(auto node:sequence.nodes) {
+            const auto s=decoded[node];
+            if(s.orientation==JointClass::Mixed)labels.push_back(-1);
+            else labels.push_back(alphabet.try_emplace({s.orientation,s.winding},alphabet.size()).first->second);
+        }
+        energy+=detail::windingSequenceCost(labels,
+            config.sourceMemoryBreakCost/config.orientationTemperature,
+            config.sourceMemoryOpeningCost/config.orientationTemperature);
+    }
+    return energy;
 }
 
 // Optimize exactly the BP log potentials, not the differently scaled raw-energy
@@ -3112,12 +3180,7 @@ void repairGridDecode(
             calibration, config, round.fixedOrientations.empty());
     };
     const auto objective = [&] {
-        double energy=0.0;
-        for (std::size_t n=0; n<decoded.size(); ++n)
-            energy -= gridUnaryLogPotential(problem, round, n, decoded[n], config);
-        for (const auto& edge : problem.edges)
-            energy += edgeEnergy(edge, decoded[edge.a], decoded[edge.b]);
-        return energy;
+        return gridObjective(problem, round, calibration, phaseSigns, config, decoded);
     };
     report.decodeRepairObjectiveBefore=objective();
     if (!std::isfinite(report.decodeRepairObjectiveBefore))
@@ -3135,6 +3198,13 @@ void repairGridDecode(
                     energy += edgeEnergy(edge, edge.a==node ? state : decoded[edge.a],
                         edge.b==node ? state : decoded[edge.b]);
                     if (!std::isfinite(energy)) break;
+                }
+                for (const auto& edge:round.runEdges) {
+                    if (edge.a!=node && edge.b!=node) continue;
+                    const auto& a=edge.a==node?state:decoded[edge.a];
+                    const auto& b=edge.b==node?state:decoded[edge.b];
+                    if (a.orientation!=JointClass::Mixed && b.orientation==JointClass::Mixed)
+                        energy+=config.disabledRunOpeningCost/config.orientationTemperature;
                 }
                 return energy;
             };
@@ -3165,6 +3235,132 @@ void repairGridDecode(
         report.decodeRepairObjectiveAfter > report.decodeRepairObjectiveBefore+roundoff)
         throw std::logic_error("Decode repair increased normalized objective");
     report.decodeRepairSeconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count();
+}
+
+// Bounded deterministic interval moves. Only affected factors are rescored,
+// including all measurements to nodes outside the proposed interval.
+void repairGridGaps(const PreparedWinding& problem, const GridRound& round,
+    const GridCalibrationCell& calibration, std::span<const int> signs,
+    const FiberTraceJointGridWindingConfig& config, std::vector<JointState>& decoded,
+    FiberTraceInterleavedWindingReport& report)
+{
+    if (config.gapRepairSweeps==0) return;
+    if (round.fixedOrientations.empty())
+        throw std::invalid_argument("Gap repair requires fixed prepass orientations");
+    const auto started=std::chrono::steady_clock::now();
+    report.gapRepairObjectiveBefore=gridObjective(problem,round,calibration,signs,config,decoded);
+    std::vector<std::vector<std::size_t>> incident(decoded.size()),runIncident(decoded.size());
+    for(std::size_t i=0;i<problem.edges.size();++i) {
+        incident[problem.edges[i].a].push_back(i);incident[problem.edges[i].b].push_back(i);
+    }
+    for(std::size_t i=0;i<round.runEdges.size();++i) {
+        runIncident[round.runEdges[i].a].push_back(i);runIncident[round.runEdges[i].b].push_back(i);
+    }
+    for(std::size_t sweep=0;sweep<config.gapRepairSweeps;++sweep) {
+        std::size_t proposals=0,accepted=0,visited=0;
+        for(const auto& chain:round.sourceChains) {
+            for(std::size_t begin=0;begin<chain.size() && proposals<50000;) {
+                const bool dead=decoded[chain[begin]].orientation==JointClass::Mixed;
+                std::size_t end=begin+1;
+                while(end<chain.size() && (decoded[chain[end]].orientation==JointClass::Mixed)==dead)++end;
+                std::vector<std::pair<std::size_t,std::size_t>> intervals;
+                if(dead) {
+                    intervals.emplace_back(begin,end);
+                    if(begin>0 && end-begin>1)intervals.emplace_back(begin,begin+1);
+                    if(end<chain.size() && end-begin>1)intervals.emplace_back(end-1,end);
+                } else if(begin>0 && end<chain.size()) {
+                    double length=0.;for(auto k=begin;k<end;++k)length+=round.sourceLengths[chain[k]];
+                    if(length<=256.)intervals.emplace_back(begin,end);
+                }
+                for(const auto& [lo,hi]:intervals) {
+                    bool eligible=true;
+                    std::vector<JointState> old;
+                    std::set<std::size_t> edges,runEdges;
+                    for(auto k=lo;k<hi;++k) {
+                        const auto n=chain[k];old.push_back(decoded[n]);
+                        if(round.gauge[n] || (!round.fixedStates.empty() && round.fixedStates[n]) ||
+                            round.fixedOrientations[n]==JointClass::Mixed)eligible=false;
+                        edges.insert(incident[n].begin(),incident[n].end());
+                        runEdges.insert(runIncident[n].begin(),runIncident[n].end());
+                    }
+                    if(!eligible)continue;
+                    const auto local=[&] {
+                        double energy=0.;
+                        for(auto k=lo;k<hi;++k) {
+                            auto n=chain[k];energy-=gridUnaryLogPotential(problem,round,n,decoded[n],config);
+                        }
+                        for(auto i:edges) {
+                            const auto& e=problem.edges[i];
+                            energy-=gridLogPotential(e,decoded[e.a],decoded[e.b],
+                                signs[problem.componentByNode[e.a]],calibration,config,false);
+                        }
+                        for(auto i:runEdges) {
+                            const auto& e=round.runEdges[i];
+                            if(decoded[e.a].orientation!=JointClass::Mixed && decoded[e.b].orientation==JointClass::Mixed)
+                                energy+=config.disabledRunOpeningCost/config.orientationTemperature;
+                        }
+                        return energy;
+                    };
+                    const double before=local();
+                    double best=before;
+                    std::optional<int> chosen;
+                    std::vector<int> labels;
+                    if(dead) {
+                        for(auto neighbor:{lo>0?chain[lo-1]:chain[lo],hi<chain.size()?chain[hi]:chain[hi-1]})
+                            if(decoded[neighbor].orientation!=JointClass::Mixed &&
+                                std::find(labels.begin(),labels.end(),decoded[neighbor].winding)==labels.end())
+                                labels.push_back(decoded[neighbor].winding);
+                        std::set<int> supported;
+                        for(auto k=lo;k<hi;++k)for(int w=round.lower[chain[k]];w<=round.upper[chain[k]];++w)supported.insert(w);
+                        std::vector<std::pair<double,int>> ranked;
+                        for(int w:supported) {
+                            double cost=0.;
+                            for(auto k=lo;k<hi;++k)cost-=gridUnaryLogPotential(problem,round,chain[k],
+                                {round.fixedOrientations[chain[k]],w},config);
+                            ranked.emplace_back(cost,w);
+                        }
+                        std::sort(ranked.begin(),ranked.end());
+                        for(auto [cost,w]:ranked)if(labels.size()<8 && std::find(labels.begin(),labels.end(),w)==labels.end())labels.push_back(w);
+                    } else labels.push_back(0);
+                    for(int w:labels) {
+                        if(proposals>=50000)break;
+                        bool admissible=true;
+                        for(auto k=lo;k<hi;++k) {
+                            const auto n=chain[k];
+                            if(dead && (w<round.lower[n] || w>round.upper[n]))admissible=false;
+                        }
+                        if(!admissible)continue;
+                        ++proposals;
+                        for(auto k=lo;k<hi;++k)decoded[chain[k]]={dead?round.fixedOrientations[chain[k]]:JointClass::Mixed,w};
+                        const double value=local();
+                        if(std::isfinite(value) && value<best){best=value;chosen=w;}
+                    }
+                    for(auto k=lo;k<hi;++k)decoded[chain[k]]=old[k-lo];
+                    if(chosen) {
+                        for(auto k=lo;k<hi;++k) {
+                            const auto n=chain[k];decoded[n]={dead?round.fixedOrientations[n]:JointClass::Mixed,*chosen};
+                            (dead?report.gapRepairRestoredLength:report.gapRepairDisabledLength)+=round.sourceLengths[n];
+                        }
+                        ++accepted;
+                        // Recompute the chain's intervals after an accepted move on the next sweep.
+                        break;
+                    }
+                }
+                visited+=end-begin;
+                begin=end;
+            }
+            if(proposals>=50000)break;
+        }
+        report.gapRepairProposals+=proposals;report.gapRepairAccepted+=accepted;
+        report.gapRepairCapHits+=proposals>=50000;
+        if(proposals>=50000)report.gapRepairUnvisitedPieces+=decoded.size()-visited;
+        if(accepted==0)break;
+    }
+    report.gapRepairObjectiveAfter=gridObjective(problem,round,calibration,signs,config,decoded);
+    if(!std::isfinite(report.gapRepairObjectiveAfter) || report.gapRepairObjectiveAfter>
+        report.gapRepairObjectiveBefore+1e-9*std::max(1.,std::abs(report.gapRepairObjectiveBefore)))
+        throw std::logic_error("Gap repair increased objective or violated hard feasibility");
+    report.gapRepairSeconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count();
 }
 
 GridLogTotals buildGridTotals(
@@ -3203,6 +3399,21 @@ GridLogTotals buildGridTotals(
     }
     totals.signAccumulators.resize(problem.gaugeNodeByComponent.size());
     totals.signValues.resize(problem.gaugeNodeByComponent.size());
+    for(const auto& sequence:round.sequences)
+        for(std::size_t i=0;i<sequence.nodes.size();++i)
+            for(std::size_t s=0;s<sequence.messages[i].size();++s)
+                addLogFactor(totals.pieceAccumulators[sequence.nodes[i]][s],sequence.messages[i][s]);
+    for (const auto& edge : round.runEdges) {
+        for (const auto node : {edge.a,edge.b}) {
+            const auto& message = node == edge.a ? edge.toA : edge.toB;
+            for (std::size_t state=0;state<totals.pieceAccumulators[node].size();++state) {
+                const auto value=gridPieceState(node,state,round.lower,round.gauge,
+                    round.fixedOrientations,round.fixedStates);
+                addLogFactor(totals.pieceAccumulators[node][state],
+                    message[value.orientation == JointClass::Mixed]);
+            }
+        }
+    }
     for (std::size_t edgeIndex = 0;
          edgeIndex < problem.edges.size();
          ++edgeIndex) {
@@ -3437,6 +3648,10 @@ void remapPieceMessages(
     const int newUpper = round.upper[node];
     if (oldLower == newLower && oldUpper == newUpper)
         return;
+    for(auto& sequence:round.sequences)
+        for(std::size_t i=0;i<sequence.nodes.size();++i)if(sequence.nodes[i]==node)
+            sequence.messages[i]=expandFiberTraceWindingLogMessage(sequence.messages[i],
+                oldLower,oldUpper,newLower,newUpper,jointActiveOrientationCount(node,round.fixedOrientations));
     for (const std::size_t edgeIndex : problem.adjacency[node]) {
         const auto& edge = problem.edges[edgeIndex];
         auto& message = edge.a == node
@@ -3736,6 +3951,7 @@ FiberTraceJointGridProgress gridProgress(
 
 GridRound solveJointGridRound(
     const PreparedWinding& problem,
+    const FiberTraceConstraintReport& constraints,
     std::span<const double> continuousNodes,
     std::span<const JointClass> fixedOrientations,
     const FixedJointStates& fixedStates,
@@ -3743,9 +3959,92 @@ GridRound solveJointGridRound(
     FiberTraceJointGridInitializationMode initializationMode,
     const FiberTraceJointGridWindingConfig& config,
     const FiberTraceJointGridProgressCallback& progress,
-    const std::chrono::steady_clock::time_point& started)
+    const std::chrono::steady_clock::time_point& started,
+    const std::function<void(const GridRound&)>& checkpoint)
 {
     GridRound round;
+    if(config.sourceMemoryWindow!=0.) {
+        if(fixedOrientations.empty())throw std::invalid_argument("Source memory requires fixed prepass");
+        std::map<std::size_t,std::vector<std::size_t>> sources;
+        for(std::size_t p=0;p<constraints.pieces.size();++p)
+            sources[constraints.pieces[p].traceIndex].push_back(p);
+        auto emit=[&](const std::vector<std::size_t>& pieces) {
+            if(pieces.empty())return;
+            auto add=[&](const std::vector<std::size_t>& ps) {
+                if(ps.size()<2)return;
+                GridRound::Sequence sequence;
+                for(auto p:ps)sequence.nodes.push_back(problem.pieceToNode.at(p));
+                round.sequences.push_back(std::move(sequence));
+            };
+            if(config.sourceMemoryWindow<0.) {add(pieces);return;}
+            const double stride=config.sourceMemoryWindow-config.sourceMemoryOverlap;
+            const auto origin=constraints.pieces[pieces.front()].beginArcBaseVoxels;
+            const auto end=constraints.pieces[pieces.back()].endArcBaseVoxels;
+            for(double start=origin;start<end;start+=stride) {
+                std::vector<std::size_t> selected;
+                for(auto p:pieces) {
+                    const auto& piece=constraints.pieces[p];
+                    const double mid=.5*(piece.beginArcBaseVoxels+piece.endArcBaseVoxels);
+                    if(mid>=start && mid<start+config.sourceMemoryWindow)selected.push_back(p);
+                }
+                add(selected);
+            }
+        };
+        for(auto& [source,pieces]:sources) {
+            std::sort(pieces.begin(),pieces.end(),[&](auto a,auto b) {
+                return constraints.pieces[a].beginArcBaseVoxels<constraints.pieces[b].beginArcBaseVoxels;
+            });
+            std::vector<std::size_t> chain;
+            std::optional<std::size_t> gauge;
+            for(auto p:pieces) {
+                const auto node=problem.pieceToNode.at(p);
+                const bool active=fixedOrientations[node]!=JointClass::Mixed;
+                const auto g=problem.integerGaugeByNode[node];
+                if(!chain.empty()) {
+                    const auto end=constraints.pieces[chain.back()].endArcBaseVoxels;
+                    if(constraints.pieces[p].beginArcBaseVoxels<end)
+                        throw std::invalid_argument("Source memory requires nonoverlapping pieces");
+                    if(constraints.pieces[p].beginArcBaseVoxels!=end || (active && gauge && *gauge!=g)) {
+                        emit(chain);chain.clear();gauge.reset();
+                    }
+                }
+                if(active)gauge=g;
+                chain.push_back(p);
+            }
+            emit(chain);
+        }
+    }
+    if (config.disabledRunOpeningCost > 0. || config.gapRepairSweeps > 0) {
+        std::map<std::size_t,std::vector<std::size_t>> bySource;
+        round.sourceLengths.resize(constraints.pieces.size());
+        round.chainStart.assign(constraints.pieces.size(),0);
+        for (std::size_t p=0;p<constraints.pieces.size();++p) {
+            const auto& piece=constraints.pieces[p];
+            bySource[piece.traceIndex].push_back(p);
+            round.sourceLengths[p]=piece.endArcBaseVoxels-piece.beginArcBaseVoxels;
+        }
+        for (auto& [source,indices]:bySource) {
+            std::sort(indices.begin(),indices.end(),[&](auto a,auto b) {
+                return std::pair{constraints.pieces[a].beginArcBaseVoxels,a}<
+                       std::pair{constraints.pieces[b].beginArcBaseVoxels,b};
+            });
+            std::optional<std::size_t> previous;
+            for (const auto p:indices) {
+                if (previous && constraints.pieces[p].beginArcBaseVoxels <
+                    constraints.pieces[*previous].endArcBaseVoxels)
+                    throw std::invalid_argument("Run prior/repair requires nonoverlapping source pieces");
+                const bool connected=previous && constraints.pieces[p].beginArcBaseVoxels ==
+                    constraints.pieces[*previous].endArcBaseVoxels;
+                if (!connected) {
+                    round.sourceChains.emplace_back();
+                    round.chainStart[p]=1;
+                } else if (config.disabledRunOpeningCost > 0.)
+                    round.runEdges.push_back({*previous,p});
+                round.sourceChains.back().push_back(p);
+                previous=p;
+            }
+        }
+    }
     round.fixedOrientations.assign(
         fixedOrientations.begin(), fixedOrientations.end());
     round.fixedStates = fixedStates.byNode;
@@ -3891,9 +4190,69 @@ GridRound solveJointGridRound(
                     config));
         }
         round.messages = std::move(next);
+        if(!round.sequences.empty()) {
+            auto nextSequences=round.sequences;
+            #pragma omp parallel for schedule(dynamic, 4) num_threads(workers) if(useParallel) reduction(max : residual)
+            for(std::size_t f=0;f<round.sequences.size();++f) {
+                const auto& sequence=round.sequences[f];
+                std::map<std::pair<JointClass,int>,int> alphabet;
+                std::vector<std::vector<int>> labels(sequence.nodes.size());
+                std::vector<std::vector<double>> cavity(sequence.nodes.size());
+                for(std::size_t i=0;i<sequence.nodes.size();++i) {
+                    auto node=sequence.nodes[i];
+                    for(std::size_t s=0;s<sequence.messages[i].size();++s) {
+                        auto value=gridPieceState(node,s,round.lower,round.gauge,round.fixedOrientations,round.fixedStates);
+                        labels[i].push_back(value.orientation==JointClass::Mixed ? -1 :
+                            alphabet.try_emplace({value.orientation,value.winding},alphabet.size()).first->second);
+                        cavity[i].push_back(logCavityValue(totals.pieceAccumulators[node][s],sequence.messages[i][s]));
+                    }
+                }
+                auto messages=detail::windingSequenceMessages(labels,cavity,alphabet.size(),
+                    config.sourceMemoryBreakCost/config.orientationTemperature,
+                    config.sourceMemoryOpeningCost/config.orientationTemperature);
+                for(std::size_t i=0;i<messages.size();++i)
+                    residual=std::max(residual,dampMessage(messages[i],sequence.messages[i],config.messageDamping));
+                nextSequences[f].messages=std::move(messages);
+            }
+            round.sequences=std::move(nextSequences);
+        }
+        if (!round.runEdges.empty()) {
+            auto nextRun=round.runEdges;
+            #pragma omp parallel for schedule(static) num_threads(workers) if(useParallel) reduction(max : residual)
+            for (std::size_t index=0;index<round.runEdges.size();++index) {
+                const auto& edge=round.runEdges[index];
+                std::array<std::array<double,2>,2> cavity;
+                for(std::size_t side=0;side<2;++side) {
+                    cavity[side].fill(-std::numeric_limits<double>::infinity());
+                    const auto node=side==0?edge.a:edge.b;
+                    const auto& old=side==0?edge.toA:edge.toB;
+                    for(std::size_t state=0;state<totals.pieceAccumulators[node].size();++state) {
+                        const auto value=gridPieceState(node,state,round.lower,round.gauge,
+                            round.fixedOrientations,round.fixedStates);
+                        const auto d=value.orientation==JointClass::Mixed;
+                        cavity[side][d]=logAddExp(cavity[side][d],
+                            logCavityValue(totals.pieceAccumulators[node][state],old[d]));
+                    }
+                }
+                auto& target=nextRun[index];
+                for(std::size_t d=0;d<2;++d) {
+                    target.toA[d]=logAddExp(cavity[1][0],cavity[1][1]-
+                        (d==0?config.disabledRunOpeningCost/config.orientationTemperature:0.));
+                    target.toB[d]=logAddExp(cavity[0][0]-
+                        (d==1?config.disabledRunOpeningCost/config.orientationTemperature:0.),cavity[0][1]);
+                }
+                residual=std::max(residual,dampMessage(target.toA,edge.toA,config.messageDamping));
+                residual=std::max(residual,dampMessage(target.toB,edge.toB,config.messageDamping));
+            }
+            round.runEdges=std::move(nextRun);
+        }
         round.iterations = iteration + 1;
         round.residual = residual;
         updateGridMarginals(problem, round, config);
+        if (checkpoint && (round.iterations == 50 || round.iterations == 100 ||
+            round.iterations == 250 || round.iterations == 500 ||
+            round.iterations == 1000 || round.iterations == 5000))
+            checkpoint(round);
         round.calibrationResidual = round.fixedCalibration
             ? 0.0
             : (previousCalibration.empty()
@@ -4246,10 +4605,45 @@ FiberTraceInterleavedWindingReport makeJointGridReport(
         projectDecodedHardContinuity(
             prepared, decoded, activeConfidence, round.fixedStates);
     }
+    report.sourceMemoryFactors=round.sequences.size();
+    if(!std::isfinite(config.sourceMemoryBreakCost)) {
+        // Only remove active states: previously satisfied external signs and
+        // overlapping windows cannot become violated by subsequent removals.
+        for(const auto& sequence:round.sequences) {
+            using Key=std::pair<JointClass,int>;
+            std::map<Key,double> score;
+            std::optional<Key> forced;
+            for(auto node:sequence.nodes)if(decoded[node].orientation!=JointClass::Mixed) {
+                const Key key{decoded[node].orientation,decoded[node].winding};
+                score[key]+=activeConfidence[node];
+                if(round.gauge[node] || (!round.fixedStates.empty() && round.fixedStates[node])) {
+                    if(forced && *forced!=key)throw std::runtime_error("Incompatible fixed states in source window");
+                    forced=key;
+                }
+            }
+            if(score.empty())continue;
+            const Key chosen=forced ? *forced : std::max_element(score.begin(),score.end(),
+                [](const auto& a,const auto& b){return a.second<b.second;})->first;
+            for(auto node:sequence.nodes)if(decoded[node].orientation!=JointClass::Mixed &&
+                Key{decoded[node].orientation,decoded[node].winding}!=chosen) {
+                decoded[node].orientation=JointClass::Mixed;
+                ++report.sourceMemoryProjectedDefects;
+            }
+        }
+    }
     repairGridDecode(prepared, round, selectedCalibration, report.componentPhaseSign,
         config, decoded, report);
+    repairGridGaps(prepared, round, selectedCalibration, report.componentPhaseSign,
+        config, decoded, report);
+    report.normalizedDecodedObjective = gridObjective(prepared, round, selectedCalibration,
+        report.componentPhaseSign, config, decoded);
+    report.finalNormalizedDecodedObjective = report.normalizedDecodedObjective;
+    report.selectedDecodeIteration = round.iterations;
+    report.disablingMeasureByPiece.resize(pieceCount);
     for (std::size_t piece = 0; piece < pieceCount; ++piece) {
         const std::size_t node = prepared.pieceToNode[piece];
+        report.disablingMeasureByPiece[piece]=defectMeasure(prepared,node,
+            round.fixedOrientations.empty()?prepared.incidentMeasurements[node]:prepared.incidentWindingMeasurements[node]);
         const auto& state = decoded[node];
         const bool active = state.orientation != JointClass::Mixed;
         report.windingValid[piece] = active ? 1 : 0;
@@ -4264,7 +4658,7 @@ FiberTraceInterleavedWindingReport makeJointGridReport(
                    : std::numeric_limits<double>::quiet_NaN();
         if (!active)
             report.mapProbability[piece] = report.mixedProbability[piece];
-        else if (config.decodeRepairSweeps != 0) {
+        else if (config.decodeRepairSweeps != 0 || config.gapRepairSweeps != 0) {
             const auto& probabilities=round.pieceProbabilities[node];
             for (std::size_t i=0; i<probabilities.size(); ++i) {
                 const auto candidate=gridPieceState(node, i, round.lower, round.gauge,
@@ -4353,7 +4747,7 @@ FiberTraceInterleavedWindingReport makeJointGridReport(
             const bool exactlyOneDefect =
                 (a.orientation == JointClass::Mixed) !=
                 (b.orientation == JointClass::Mixed);
-            if (edge.containsHardContinuity && exactlyOneDefect && !config.continuityCutCost)
+            if (edge.containsHardContinuity && !edge.containsArtificialTileSeam && exactlyOneDefect && !config.continuityCutCost)
                 report.decodedEnergy += config.pieceBreakCost;
         } else {
             if (round.fixedOrientations.empty()) {
@@ -4422,6 +4816,14 @@ FiberTraceInterleavedWindingReport makeJointGridReport(
                         std::max(0.0, targetSign * latentDelta - minimum);
                 }
             }
+        }
+    }
+    for (const auto& chain:round.sourceChains) {
+        bool previousDefect=false;
+        for (const auto node:chain) {
+            const bool defect=decoded[node].orientation==JointClass::Mixed;
+            if(defect && !previousDefect)report.decodedEnergy+=config.disabledRunOpeningCost;
+            previousDefect=defect;
         }
     }
     report.decodedDataEnergy = report.decodedEnergy -
@@ -8709,8 +9111,24 @@ solveFiberTraceJointGridWindingBeliefPropagation(
         };
     }
     const auto discreteStarted = std::chrono::steady_clock::now();
+    std::optional<FiberTraceInterleavedWindingReport> bestDecode;
+    double checkpointSeconds = 0.;
+    std::function<void(const GridRound&)> checkpoint;
+    if (config.retainBestFeasible) {
+        checkpoint = [&](const GridRound& candidate) {
+            const auto begin = std::chrono::steady_clock::now();
+            auto decoded = makeJointGridReport(prepared, constraints, continuousNodes,
+                continuousResidual, continuousSeconds, 0., candidate, config);
+            if (std::isfinite(decoded.normalizedDecodedObjective) &&
+                (!bestDecode || decoded.normalizedDecodedObjective < bestDecode->normalizedDecodedObjective))
+                bestDecode = std::move(decoded);
+            checkpointSeconds += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - begin).count();
+        };
+    }
     const auto round = solveJointGridRound(
         prepared,
+        constraints,
         continuousNodes,
         fixedClasses,
         exactStates,
@@ -8718,7 +9136,8 @@ solveFiberTraceJointGridWindingBeliefPropagation(
         initializationMode,
         config,
         compactProgress,
-        started);
+        started,
+        checkpoint);
     const double discreteSeconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - discreteStarted).count();
     auto report = makeJointGridReport(
@@ -8730,6 +9149,23 @@ solveFiberTraceJointGridWindingBeliefPropagation(
         discreteSeconds,
         round,
         config);
+    if (config.retainBestFeasible) {
+        const double finalObjective = report.normalizedDecodedObjective;
+        if (bestDecode && bestDecode->normalizedDecodedObjective < finalObjective) {
+            // Reports contain physical labels, calibration and phase signs, not
+            // indices into mutable supports. Retain terminal convergence metadata.
+            bestDecode->messageIterations = report.messageIterations;
+            bestDecode->messageResidual = report.messageResidual;
+            bestDecode->messageConverged = report.messageConverged;
+            bestDecode->status = report.status;
+            bestDecode->discreteSolveSeconds = report.discreteSolveSeconds;
+            report = std::move(*bestDecode);
+        }
+        if (!std::isfinite(report.normalizedDecodedObjective))
+            throw std::runtime_error("No hard-feasible decoded checkpoint");
+        report.finalNormalizedDecodedObjective = finalObjective;
+        report.checkpointDecodeSeconds = checkpointSeconds;
+    }
     report.inputFactors = inputFactors;
     report.retainedFactors = retainedFactors;
     report.inputMeasurements = inputMeasurements;

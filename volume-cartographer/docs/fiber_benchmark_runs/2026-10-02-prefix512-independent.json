@@ -1,0 +1,294 @@
+{
+  "prefix512": {
+    "correct_references": 11,
+    "independent_missing": 2,
+    "independent_percent": 42.30769230769231,
+    "initial_pieces": 2394,
+    "initial_states_identical": true,
+    "ladder": [
+      {
+        "hard_sign_errors": "7",
+        "reference": "0",
+        "winding": "0"
+      },
+      {
+        "hard_sign_errors": "7",
+        "reference": "0.5",
+        "winding": "0.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "1",
+        "winding": "1"
+      },
+      {
+        "hard_sign_errors": "4",
+        "reference": "1.5",
+        "winding": "1.5"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "2",
+        "winding": "2"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "2.5",
+        "winding": "2.5"
+      },
+      {
+        "hard_sign_errors": "13",
+        "reference": "3",
+        "winding": "3"
+      },
+      {
+        "hard_sign_errors": "72",
+        "reference": "3.5",
+        "winding": "3.5"
+      },
+      {
+        "hard_sign_errors": "15",
+        "reference": "4.5",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "15",
+        "reference": "5",
+        "winding": "5"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "5.5",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "6",
+        "winding": "5"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "6.5",
+        "winding": "5.5"
+      },
+      {
+        "hard_sign_errors": "9",
+        "reference": "7",
+        "winding": "5"
+      },
+      {
+        "hard_sign_errors": "4",
+        "reference": "7.5",
+        "winding": "5.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "8",
+        "winding": "8"
+      },
+      {
+        "hard_sign_errors": "12",
+        "reference": "8.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "16",
+        "reference": "9",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "20",
+        "reference": "9.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "10",
+        "winding": "7"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "10.5",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "11",
+        "winding": "9"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "11.5",
+        "winding": "9.5"
+      },
+      {
+        "hard_sign_errors": "7",
+        "reference": "12.5",
+        "winding": "9.5"
+      }
+    ],
+    "ladder_shift_percent": null,
+    "ladder_shifts": null,
+    "missing_references": [
+      "4",
+      "12"
+    ],
+    "observed_ladder_shift": {
+      "ladder_shift_percent": 70.83333333333333,
+      "ladder_shifts": 7,
+      "note": "missing references omitted; bridges across gaps, not the full26-reference metric",
+      "references": 24
+    },
+    "references": 26,
+    "shift_unavailable": "incomplete reference ladder",
+    "tied_rows": 0,
+    "unbounded_rows": 0,
+    "wall_seconds": 34.125502184964716
+  },
+  "unfiltered": {
+    "correct_references": 9,
+    "independent_missing": 2,
+    "independent_percent": 34.61538461538461,
+    "initial_pieces": 1212,
+    "initial_states_identical": true,
+    "ladder": [
+      {
+        "hard_sign_errors": "10",
+        "reference": "0",
+        "winding": "3"
+      },
+      {
+        "hard_sign_errors": "4",
+        "reference": "0.5",
+        "winding": "3.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "1",
+        "winding": "4"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "1.5",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "15",
+        "reference": "2",
+        "winding": "5"
+      },
+      {
+        "hard_sign_errors": "20",
+        "reference": "2.5",
+        "winding": "5"
+      },
+      {
+        "hard_sign_errors": "10",
+        "reference": "3",
+        "winding": "5"
+      },
+      {
+        "hard_sign_errors": "2",
+        "reference": "3.5",
+        "winding": "5.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "4.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "6",
+        "reference": "5",
+        "winding": "7"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "5.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "14",
+        "reference": "6",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "6.5",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "7",
+        "winding": "8"
+      },
+      {
+        "hard_sign_errors": "14",
+        "reference": "7.5",
+        "winding": "8"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "8",
+        "winding": "8"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "8.5",
+        "winding": "8.5"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "9",
+        "winding": "9"
+      },
+      {
+        "hard_sign_errors": "15",
+        "reference": "9.5",
+        "winding": "9.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "10",
+        "winding": "10"
+      },
+      {
+        "hard_sign_errors": "10",
+        "reference": "10.5",
+        "winding": "10.5"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "11",
+        "winding": "11"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "11.5",
+        "winding": "11.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "12.5",
+        "winding": "12.5"
+      }
+    ],
+    "ladder_shift_percent": null,
+    "ladder_shifts": null,
+    "missing_references": [
+      "4",
+      "12"
+    ],
+    "observed_ladder_shift": {
+      "ladder_shift_percent": 70.83333333333333,
+      "ladder_shifts": 7,
+      "note": "missing references omitted; bridges across gaps, not the full26-reference metric",
+      "references": 24
+    },
+    "references": 26,
+    "shift_unavailable": "incomplete reference ladder",
+    "tied_rows": 0,
+    "unbounded_rows": 0,
+    "wall_seconds": 13.765426216996275
+  }
+}

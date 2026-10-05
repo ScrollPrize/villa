@@ -31,7 +31,8 @@ void writeFiberletCropTraceArtifact(
     const FiberletCropTraceConfig& config,
     const std::vector<FiberletCropTraceLine>& lines,
     const nlohmann::json& preprocessing = nlohmann::json::object(),
-    const nlohmann::json& traceSummary = nlohmann::json::object());
+    const nlohmann::json& traceSummary = nlohmann::json::object(),
+    const nlohmann::json& inheritedTraceSettings = nlohmann::json::object());
 
 [[nodiscard]] FiberletCropTraceArtifact readFiberletCropTraceArtifact(const std::filesystem::path& input);
 

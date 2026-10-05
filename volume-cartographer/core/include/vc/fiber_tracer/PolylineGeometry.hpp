@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <optional>
+#include <utility>
 #include <vector>
 
 #include <opencv2/core/types.hpp>
@@ -73,7 +74,8 @@ clipLineSegmentToHalfOpenBox(
 clipPolylineToHalfOpenBox(
     const std::vector<cv::Vec3d>& points,
     const cv::Vec3d& minimum,
-    const cv::Vec3d& maximum);
+    const cv::Vec3d& maximum,
+    std::vector<std::pair<double, double>>* sourceArcs = nullptr);
 
 [[nodiscard]] double segmentAabbDistanceSquared(
     const cv::Vec3d& start,

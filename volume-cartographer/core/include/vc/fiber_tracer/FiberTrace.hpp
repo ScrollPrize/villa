@@ -93,6 +93,11 @@ struct FiberTraceProfile {
 struct FiberTraceConfig {
     // Reference-replay experiment only; zero preserves the ordinary protocol.
     double replayReverseIntervalBase = 0.0;
+    double replayReverseNormalRadiusBase = 20.0;
+    double replayReverseTangentialRadiusBase = 40.0;
+    bool replayReverseToStart = false;
+    bool replayReverseAllEndpoints = false;
+    int replayReverseHistorySteps = 0;
     double embeddingWeight = 0.0;
     // Opt-in calibrated mapping. Zero temperature preserves the linear cost.
     double embeddingDistanceThreshold = 0.0;
@@ -447,6 +452,9 @@ struct FiberTraceOneWayRequest {
     bool snapTraceToSelectedCrossing = true;
     double budgetSpanVoxels = 0.0;
     FiberTraceConfig config;
+    // Directional prior only, oldest to newest. Does not append path points or
+    // consume search steps. Empty preserves the cold model-direction seed.
+    std::vector<cv::Vec3d> initialStepDirections;
 };
 
 struct FiberTraceOneWayResult {
@@ -569,6 +577,9 @@ struct FiberReplayTraceSegment {
     std::vector<cv::Vec3d> tracePointsBase;
     std::vector<double> cumulativeLosses;
     std::vector<FiberReplayMatch> matches;
+    // Audit a terminal GT-distance failure rejected by the optional reverse check.
+    // x,y,z,reference arc before rollback; not an input to reverse acceptance.
+    std::optional<std::array<double, 4>> filteredDistanceFailure;
 };
 
 struct FiberReplayTraceResult {
@@ -693,7 +704,8 @@ struct CandidateScoreDebug {
     const FiberTraceConfig& config,
     const vc::lasagna::NormalSampler* normalSampler = nullptr,
     const FiberTraceProgressCallback& progress = {},
-    const std::function<bool(const cv::Vec3d&, double, int)>& committedStep = {});
+    const std::function<bool(const cv::Vec3d&, double, int)>& committedStep = {},
+    const std::vector<cv::Vec3d>& initialStepDirections = {});
 
 // Fraction of a segment's start-to-target distance that bounds the endpoint
 // acceptance threshold for that segment. The fixed threshold

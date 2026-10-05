@@ -69,7 +69,7 @@ FiberReplayTraceResult traceReferenceReplayCore(
             if (consistency.intervalBase <= 0 || segment.tracePointsBase.size() <= checkedPoint + 1)
                 return true;
             ++result.reverseChecks;
-            const std::vector<cv::Vec3d> span(segment.tracePointsBase.begin() + checkedPoint,
+            const std::vector<cv::Vec3d> span(segment.tracePointsBase.begin() + (consistency.toStart ? 0 : checkedPoint),
                                              segment.tracePointsBase.end());
             if (!consistency.verify(span)) { filtered = true; return false; }
             checkedPoint = segment.tracePointsBase.size() - 1;
@@ -117,7 +117,8 @@ FiberReplayTraceResult traceReferenceReplayCore(
                     referenceExhausted = true;
                 if (referenceExhausted && excursion.outsideTravel) distanceFailed = true;
                 uncheckedTravel += stepTravel;
-                // Earlier GT failure wins. A consistency rejection never hides it.
+                // Default policy preserves earlier GT failures. The opt-in terminal
+                // check below audits any failure subsequently rejected by reverse tracing.
                 if (!distanceFailed && consistency.intervalBase > 0 &&
                     (uncheckedTravel >= consistency.intervalBase || referenceExhausted))
                     if (!checkSpan()) return false;
@@ -148,9 +149,15 @@ FiberReplayTraceResult traceReferenceReplayCore(
 
         if (excursion.outsideTravel) distanceFailed = true;
 
-        if (!filtered && !distanceFailed) (void)checkSpan();
+        // Optional terminal check includes ordinary GT-failure endpoints.
+        // Its acceptance still depends only on the saved forward geometry.
+        if (!filtered && (!distanceFailed || consistency.allEndpoints)) (void)checkSpan();
         if (filtered) {
             const double detectedArc = previousArcBase;
+            if (distanceFailed) {
+                const auto& p = segment.tracePointsBase.back();
+                segment.filteredDistanceFailure = {p[0], p[1], p[2], detectedArc};
+            }
             segment.tracePointsBase.resize(checkedPoint + 1);
             segment.cumulativeLosses.resize(checkedPoint + 1);
             segment.matches.resize(checkedMatches);

@@ -128,8 +128,8 @@ def run(config):
             points.append(dict(
                 measurement_id=entry['id'], algorithm=entry['label'],
                 method_id=entry['id'], method_label=entry['label'],
-                algorithm_date='2026-09-23', algorithm_revision=revision,
-                measurement_status='measured', measurement_date='2026-09-23',
+                algorithm_date=config.get('measurement_date', '2026-09-23'), algorithm_revision=revision,
+                measurement_status='measured', measurement_date=config.get('measurement_date', '2026-09-23'),
                 measurement_revision=revision,
                 tested_length_mm=summary['directed_reference_length_base_voxels'] * summary['base_voxel_size_um'] / 1000,
                 failures=summary['total_failures'],
@@ -142,8 +142,8 @@ def run(config):
             atomic_write(source.with_suffix('.metrics.json'), metrics, durable=False)
             common = dict(measurement_id=entry['id'], algorithm=entry['label'],
                           method_id=entry['id'], method_label=entry['label'],
-                          algorithm_date='2026-09-23', algorithm_revision=revision,
-                          measurement_status='measured', measurement_date='2026-09-23',
+                          algorithm_date=config.get('measurement_date', '2026-09-23'), algorithm_revision=revision,
+                          measurement_status='measured', measurement_date=config.get('measurement_date', '2026-09-23'),
                           measurement_revision=revision, input_artifact=str(source),
                           input_sha256=sha256_file(source),
                           run_record=entry.get('run_record', 'docs/fiber_benchmark_runs/2026-09-23-dense-beam-bp.md'))

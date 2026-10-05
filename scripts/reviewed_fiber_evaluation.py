@@ -3,6 +3,7 @@ import json
 import shutil
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -12,9 +13,52 @@ ROOT = Path('/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260
 REFERENCES = Path('/home/hendrik/data/2026-09-30_fibers_approved_refined')
 GAUSSIAN = Path('/ephemeral/hendrik/fiber3d_train2/evaluations/reviewed_fibers_20260930_v2/gaussian/frozen/live_inference/_models/274acb0c686bfb030646d039f2740f7ad6349cd507a4de0843cf26e4f638ccec/snapshot.pt')
 HALFSIGMA_RAW = Path('/ephemeral/hendrik/fiber3d_train2/runs/5scroll_json_eligible_fullres_refinement_gaussian_halfsigma_128_sd1_16x8_ema_20260930_155818/snapshots/best.pt')
+SIDEBAND_MODEL = 'halfsigma_current_raw_sideband_reviewed32_v1'
+SIDEBAND_CURRENT = Path('/ephemeral/hendrik/fiber3d_train2/runs/5scroll_json_eligible_fullres_refinement_gaussian_halfsigma_sideband_reviewed32_128_sd1_16x8_ema_20261001_203634/snapshots/current.pt')
+BEST_MODELS = {
+    'halfsigma_sideband_best_raw_20261002': ('best.pt', None),
+    'halfsigma_sideband_best_ema99_20261002': ('best_ema_0p99.pt', .99),
+    'halfsigma_sideband_best_ema999_20261002': ('best_ema_0p999.pt', .999),
+}
+
+
+def freeze_selection(model, source):
+    from lasagna.inference_provenance import atomic_write, sha256_file
+    from vesuvius.neural_tracing.fiber_trace_3d.live_evaluate import freeze_checkpoint
+    selection = ROOT/model/'snapshot_selection.json'
+    if selection.exists():
+        pinned = json.loads(selection.read_text())
+        result = Path(pinned['path']), pinned['sha256']
+        if pinned.get('source', str(source)) != str(source) or sha256_file(result[0]) != result[1]:
+            raise ValueError('corrupt or mismatched selected snapshot')
+    else:
+        result = freeze_checkpoint(source, ROOT/model/'frozen')
+        atomic_write(selection, dict(path=str(result[0]), sha256=result[1], source=str(source),
+                     captured_at=datetime.now(timezone.utc).isoformat()), durable=False)
+    print(f'Frozen {model}: {result}', flush=True)
+    return result
+
+
+def validate_best_model(model, saved, evaluation):
+    decay = BEST_MODELS[model][1]
+    if decay is None:
+        validate_raw_unfiltered(saved, evaluation)
+    else:
+        metric = f'test_ema_{str(decay).replace(".", "p")}/loss_total'
+        if (saved.get('snapshot_kind') != 'ema' or saved.get('metric_name') != metric
+                or saved.get('ema_metadata', {}).get('decay') != decay):
+            raise ValueError('best EMA checkpoint kind/metric/decay mismatch')
+
+
+def current_raw_source(model):
+    return SIDEBAND_CURRENT if model == SIDEBAND_MODEL else HALFSIGMA_RAW.with_name('current.pt')
 
 
 def halfsigma_namespace(model):
+    if model in BEST_MODELS:
+        return model
+    if model == SIDEBAND_MODEL:
+        return 'sideband_reviewed32_203634_current_raw_v1'
     suffix = model.removeprefix('halfsigma_')
     return (f'halfsigma_155818_current_raw_reviewed_{suffix.rsplit("_",1)[1]}' if suffix.startswith('current_raw_')
             else f'fullres_halfsigma_155818_best_{suffix}_reviewed_20260930_v1')
@@ -85,22 +129,14 @@ def validate_workload(config, cohort, output, manifest):
 
 
 def run(model):
-    if model not in ('lowres', 'fullres', 'gaussian', 'halfsigma_raw', 'halfsigma_ema99', 'halfsigma_current_raw_v1', 'halfsigma_current_raw_v2', 'halfsigma_current_raw_v3'):
+    if model not in ('lowres', 'fullres', 'gaussian', 'halfsigma_raw', 'halfsigma_ema99', 'halfsigma_current_raw_v1', 'halfsigma_current_raw_v2', 'halfsigma_current_raw_v3', SIDEBAND_MODEL) and model not in BEST_MODELS:
         raise ValueError('unknown reviewed evaluation model')
     from lasagna.inference_provenance import atomic_write, sha256_file
     from vesuvius.neural_tracing.fiber_trace_3d.live_evaluate import freeze_checkpoint
     early_snapshot = None
-    if model.startswith('halfsigma_current_raw_') and not (ROOT/model/'workload.json').exists():
-        selection = ROOT/model/'snapshot_selection.json'
-        if selection.exists():
-            pinned = json.loads(selection.read_text())
-            early_snapshot = (Path(pinned['path']), pinned['sha256'])
-            if sha256_file(early_snapshot[0]) != early_snapshot[1]:
-                raise ValueError('corrupt selected snapshot')
-        else:
-            early_snapshot = freeze_checkpoint(HALFSIGMA_RAW.with_name('current.pt'), ROOT/model/'frozen')
-            atomic_write(selection, dict(path=str(early_snapshot[0]),sha256=early_snapshot[1]),durable=False)
-        print(f'Frozen current raw: {early_snapshot}', flush=True)
+    if (model.startswith('halfsigma_current_raw_') or model in BEST_MODELS) and not (ROOT/model/'workload.json').exists():
+        source = SIDEBAND_CURRENT.with_name(BEST_MODELS[model][0]) if model in BEST_MODELS else current_raw_source(model)
+        early_snapshot = freeze_selection(model, source)
     cohort = ROOT / 'cohort'
     manifest = capture_cohort(REFERENCES, cohort)
     output = ROOT / model
@@ -134,10 +170,14 @@ def run(model):
             if model == 'halfsigma_ema99':
                 selected = HALFSIGMA_RAW.with_name('best_ema_0p99.pt')
             elif model.startswith('halfsigma_current_raw_'):
-                selected = HALFSIGMA_RAW.with_name('current.pt')
+                selected = current_raw_source(model)
+            elif model in BEST_MODELS:
+                selected = SIDEBAND_CURRENT.with_name(BEST_MODELS[model][0])
             snapshot, digest = early_snapshot or freeze_checkpoint(selected, output / 'frozen')
             saved = torch.load(snapshot, map_location='cpu', weights_only=False)
-            if model == 'halfsigma_raw' or model.startswith('halfsigma_current_raw_'):
+            if model in BEST_MODELS:
+                validate_best_model(model, saved, evaluation)
+            elif model == 'halfsigma_raw' or model.startswith('halfsigma_current_raw_'):
                 validate_raw_unfiltered(saved, evaluation)
             elif model == 'halfsigma_ema99':
                 validate_ema99(saved)
@@ -180,10 +220,19 @@ def report_halfsigma(selected_model='halfsigma_raw'):
     models = ('lowres','fullres','gaussian','halfsigma_raw')
     if selected_model.startswith('halfsigma_current_raw_'):
         models += ('halfsigma_ema99',)
-    if selected_model in ('halfsigma_current_raw_v2','halfsigma_current_raw_v3'):
+    if selected_model in ('halfsigma_current_raw_v2','halfsigma_current_raw_v3', SIDEBAND_MODEL):
         models += ('halfsigma_current_raw_v1',)
-    if selected_model == 'halfsigma_current_raw_v3':
+    if selected_model in ('halfsigma_current_raw_v3', SIDEBAND_MODEL):
         models += ('halfsigma_current_raw_v2',)
+    if selected_model == SIDEBAND_MODEL:
+        models += ('halfsigma_current_raw_v3',)
+    if selected_model in BEST_MODELS:
+        models += ('halfsigma_current_raw_v3', SIDEBAND_MODEL)
+        for earlier in BEST_MODELS:
+            if earlier == selected_model:
+                break
+            if (ROOT/earlier/'full/summary.json').exists():
+                models += (earlier,)
     if selected_model != 'halfsigma_raw':
         models += (selected_model,)
     results = {}
@@ -209,7 +258,9 @@ def report_halfsigma(selected_model='halfsigma_raw'):
         results[model] = dict(summary_path=str(folder/'full/summary.json'),
             checkpoint_sha256=workload['checkpoint_sha256'],
             coordinator_seconds=inference['wall_seconds'], **stats)
-    date = '20261001' if selected_model in ('halfsigma_current_raw_v2','halfsigma_current_raw_v3') else '20260930'
+    date = '20261001' if selected_model in ('halfsigma_current_raw_v2','halfsigma_current_raw_v3', SIDEBAND_MODEL) else '20260930'
+    if selected_model in BEST_MODELS:
+        date = '20261002'
     target = REPO/f'vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/docs/benchmarks/reviewed_{selected_model}_{date}'
     metadata = json.loads((ROOT/selected_model/'snapshot_metadata.json').read_text())
     atomic_write(target.with_suffix('.json'),dict(snapshot=metadata,results=results),durable=False)
@@ -256,13 +307,15 @@ def execute_evaluation(config_path, config, model):
 
 
 def run_reverse(model):
-    if model not in ('gaussian', 'lowres'):
-        raise ValueError('reverse experiment supports Gaussian and lowres')
+    if model not in ('gaussian', 'lowres', 'halfsigma_sideband_best_raw_20261002'):
+        raise ValueError('unsupported reverse experiment model')
     from lasagna.inference_provenance import atomic_write, sha256_file
     original = json.loads((ROOT/model/'workload.json').read_text())
     output = ROOT/'reverse256_v1'/model
     config = json.loads(json.dumps(original))
     config['output_root'] = str(output)
+    if any('reverse' in arg or 'consistency' in arg for arg in config['evaluation']['trace_args']):
+        raise ValueError('reverse experiment requires an unfiltered baseline')
     config['evaluation']['trace_args'] += ['--replay-reverse-interval-base', '256']
     config['evaluation']['gpu_manager']['label'] = f'reviewed-reverse-{model}'
     path = output/'workload.json'
@@ -278,5 +331,13 @@ if __name__ == '__main__':
     control = json.loads((REPO / 'scripts/training_failure_mining_control.json').read_text())
     if control['action'] == 'reviewed_reverse':
         run_reverse(control['reviewed_model'])
+        if control.get('reference_reverse_after'):
+            from reviewed_reference_reverse import run as run_reference_reverse
+            run_reference_reverse(control['reviewed_model'])
     else:
-        run(control['reviewed_model'])
+        models = control.get('reviewed_models', [control.get('reviewed_model')])
+        for model in models:
+            if model in BEST_MODELS:
+                freeze_selection(model, SIDEBAND_CURRENT.with_name(BEST_MODELS[model][0]))
+        for model in models:
+            run(model)

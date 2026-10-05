@@ -163,6 +163,15 @@ struct FiberTraceWindingBeliefPropagationConfig {
     bool includeContinuityInDefectMass = true;
     // Opt-in deterministic coordinate descent of the decoded BP objective.
     std::size_t decodeRepairSweeps = 0;
+    bool retainBestFeasible = false;
+    double disabledRunOpeningCost = 0.0;
+    std::size_t gapRepairSweeps = 0;
+    // Experimental source-memory factors: 0 off, positive coarse window,
+    // negative full source chain. Overlap is in base voxels.
+    double sourceMemoryWindow = 0.;
+    double sourceMemoryOverlap = 0.;
+    double sourceMemoryBreakCost = std::numeric_limits<double>::infinity();
+    double sourceMemoryOpeningCost = 0.;
     double temperature = 0.25;
     double messageDamping = 0.5;
     double messageResidualTolerance = 1.0e-8;
@@ -174,6 +183,9 @@ struct FiberTraceWindingBeliefPropagationConfig {
     bool enforcePerpendicularWindingSign = true;
     bool enforceParallelWindingSign = true;
     bool enforceHardSplitContinuity = true;
+    // Opt-in boundary prior: charge pieceBreakCost at active/Defect boundaries
+    // even when active/active split continuity remains hard.
+    bool penalizeHardSplitDefectBoundaries = false;
     std::optional<double> hardSignMinimumNormalAlignment =
         0.8660254037844386;
     FiberTraceWindingDecisionConfidence decisionConfidence =
@@ -398,6 +410,7 @@ struct FiberTracePreparedWindingEdge {
     std::size_t b = 0;
     std::vector<FiberTracePreparedWindingMeasurement> measurements;
     bool containsHardContinuity = false;
+    bool containsArtificialTileSeam = false;
 };
 
 struct FiberTracePreparedWindingModel {
@@ -626,6 +639,22 @@ struct FiberTraceInterleavedWindingReport : FiberTraceWindingBeliefPropagationRe
     double decodeRepairObjectiveBefore = 0.0;
     double decodeRepairObjectiveAfter = 0.0;
     double decodeRepairSeconds = 0.0;
+    double normalizedDecodedObjective = 0.0;
+    double finalNormalizedDecodedObjective = 0.0;
+    std::size_t selectedDecodeIteration = 0;
+    double checkpointDecodeSeconds = 0.0;
+    std::size_t gapRepairProposals = 0;
+    std::size_t sourceMemoryFactors = 0;
+    std::vector<double> disablingMeasureByPiece;
+    std::size_t sourceMemoryProjectedDefects = 0;
+    std::size_t gapRepairAccepted = 0;
+    std::size_t gapRepairCapHits = 0;
+    std::size_t gapRepairUnvisitedPieces = 0;
+    double gapRepairRestoredLength = 0.;
+    double gapRepairDisabledLength = 0.;
+    double gapRepairObjectiveBefore = 0.;
+    double gapRepairObjectiveAfter = 0.;
+    double gapRepairSeconds = 0.;
     std::size_t measurementDisableMapOff = 0;
     double measurementDisableConditionalPosteriorSum = 0.0;
     std::size_t initialDefectGaugeComponents = 0;

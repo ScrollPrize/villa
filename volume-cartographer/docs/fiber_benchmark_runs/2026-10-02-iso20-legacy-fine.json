@@ -1,0 +1,2780 @@
+{
+  "baseline": {
+    "common_pieces": 2732,
+    "correct_references": 13,
+    "disabled_percent": 10.486833149547781,
+    "flags": [],
+    "independent_missing": 2,
+    "independent_percent": 50.0,
+    "ladder": [
+      {
+        "hard_sign_errors": "25",
+        "reference": "0",
+        "winding": "0"
+      },
+      {
+        "hard_sign_errors": "34",
+        "reference": "0.5",
+        "winding": "0.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "1",
+        "winding": "1"
+      },
+      {
+        "hard_sign_errors": "8",
+        "reference": "1.5",
+        "winding": "1.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "2",
+        "winding": "2"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "2.5",
+        "winding": "2.5"
+      },
+      {
+        "hard_sign_errors": "2",
+        "reference": "3",
+        "winding": "3"
+      },
+      {
+        "hard_sign_errors": "2",
+        "reference": "3.5",
+        "winding": "3.5"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "4.5",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "5",
+        "winding": "5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "5.5",
+        "winding": "5.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "6",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "6.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "2",
+        "reference": "7",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "21",
+        "reference": "7.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "8",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "8.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "9",
+        "winding": "7"
+      },
+      {
+        "hard_sign_errors": "16",
+        "reference": "9.5",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "5",
+        "reference": "10",
+        "winding": "7"
+      },
+      {
+        "hard_sign_errors": "16",
+        "reference": "10.5",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "11",
+        "winding": "9"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "11.5",
+        "winding": "9.5"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "12.5",
+        "winding": "10.5"
+      }
+    ],
+    "ladder_shift_percent": null,
+    "ladder_shifts": null,
+    "measurement_inventory": {
+      "contradictory_hard_sign_pairs": 0,
+      "evidence_mass": 242762.0,
+      "measurements": 242762,
+      "pairs": 242762
+    },
+    "missing_references": [
+      "4",
+      "12"
+    ],
+    "observed_ladder_shift": {
+      "ladder_shift_percent": 83.33333333333334,
+      "ladder_shifts": 4,
+      "note": "missing references omitted; bridges across gaps, not the full26-reference metric",
+      "references": 24
+    },
+    "ordinary_graph": [
+      "fiber BP component selection policy=all rounds=0 traces=1879->1879 pieces=2732->2732 constraints=243615->243615"
+    ],
+    "parameters": {},
+    "pieces": 2732,
+    "prepass_changes": 0,
+    "prepass_counts": {
+      "h": 1165,
+      "v": 1567
+    },
+    "prior_mass": 223048.0,
+    "readout_diagnostics": [],
+    "references": 26,
+    "same_piece_identities": true,
+    "seconds": 49.646357741963584,
+    "shift_unavailable": "incomplete reference ladder",
+    "state_sha256": "d8600b77317059156e8f89686bb8a921f95d2586644a799695d7c33246e91fea",
+    "tied_rows": 0,
+    "unbounded_rows": 0
+  },
+  "m128-incident": {
+    "common_pieces": 763,
+    "correct_references": 12,
+    "disabled_percent": 7.401300122793556,
+    "flags": [
+      "--legacy-fine-pieces"
+    ],
+    "independent_missing": 2,
+    "independent_percent": 46.15384615384615,
+    "ladder": [
+      {
+        "hard_sign_errors": "13",
+        "reference": "0",
+        "winding": "0"
+      },
+      {
+        "hard_sign_errors": "20",
+        "reference": "0.5",
+        "winding": "0.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "1",
+        "winding": "1"
+      },
+      {
+        "hard_sign_errors": "13",
+        "reference": "1.5",
+        "winding": "1.5"
+      },
+      {
+        "hard_sign_errors": "11",
+        "reference": "2",
+        "winding": "2"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "2.5",
+        "winding": "2.5"
+      },
+      {
+        "hard_sign_errors": "11",
+        "reference": "3",
+        "winding": "3"
+      },
+      {
+        "hard_sign_errors": "27",
+        "reference": "3.5",
+        "winding": "3.5"
+      },
+      {
+        "hard_sign_errors": "9",
+        "reference": "4.5",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "42",
+        "reference": "5",
+        "winding": "4"
+      },
+      {
+        "hard_sign_errors": "6",
+        "reference": "5.5",
+        "winding": "5.5"
+      },
+      {
+        "hard_sign_errors": "16",
+        "reference": "6",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "8",
+        "reference": "6.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "4",
+        "reference": "7",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "39",
+        "reference": "7.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "8",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "2",
+        "reference": "8.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "5",
+        "reference": "9",
+        "winding": "7"
+      },
+      {
+        "hard_sign_errors": "25",
+        "reference": "9.5",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "2",
+        "reference": "10",
+        "winding": "7"
+      },
+      {
+        "hard_sign_errors": "26",
+        "reference": "10.5",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "11",
+        "winding": "9"
+      },
+      {
+        "hard_sign_errors": "2",
+        "reference": "11.5",
+        "winding": "9.5"
+      },
+      {
+        "hard_sign_errors": "13",
+        "reference": "12.5",
+        "winding": "9.5"
+      }
+    ],
+    "ladder_shift_percent": null,
+    "ladder_shifts": null,
+    "measurement_inventory": {
+      "contradictory_hard_sign_pairs": 22,
+      "evidence_mass": 242762.0,
+      "measurements": 242762,
+      "pairs": 180914
+    },
+    "missing_references": [
+      "4",
+      "12"
+    ],
+    "observed_ladder_shift": {
+      "ladder_shift_percent": 70.83333333333333,
+      "ladder_shifts": 7,
+      "note": "missing references omitted; bridges across gaps, not the full26-reference metric",
+      "references": 24
+    },
+    "ordinary_graph": [
+      "fiber BP component selection policy=all rounds=0 traces=1879->1879 pieces=4912->4912 constraints=245795->245795"
+    ],
+    "parameters": {
+      "--local-min-piece-length": 128
+    },
+    "pieces": 4912,
+    "prepass_changes": 0,
+    "prepass_counts": {
+      "h": 2002,
+      "v": 2910
+    },
+    "prior_mass": 227408.0,
+    "readout_diagnostics": [],
+    "references": 26,
+    "same_piece_identities": false,
+    "seconds": 47.18170470301993,
+    "shift_unavailable": "incomplete reference ladder",
+    "state_sha256": "e4c2302726eccee72c4b1e9b584564099d008fe62aa2c01d1b3051b33703ed44",
+    "tied_rows": 0,
+    "unbounded_rows": 0
+  },
+  "m128-length": {
+    "common_pieces": 763,
+    "correct_references": 13,
+    "disabled_percent": 6.028606994671045,
+    "flags": [
+      "--legacy-fine-pieces",
+      "--partition-length-cost"
+    ],
+    "independent_missing": 2,
+    "independent_percent": 50.0,
+    "ladder": [
+      {
+        "hard_sign_errors": "1",
+        "reference": "0",
+        "winding": "0"
+      },
+      {
+        "hard_sign_errors": "3",
+        "reference": "0.5",
+        "winding": "0.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "1",
+        "winding": "1"
+      },
+      {
+        "hard_sign_errors": "8",
+        "reference": "1.5",
+        "winding": "1.5"
+      },
+      {
+        "hard_sign_errors": "12",
+        "reference": "2",
+        "winding": "2"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "2.5",
+        "winding": "2.5"
+      },
+      {
+        "hard_sign_errors": "8",
+        "reference": "3",
+        "winding": "3"
+      },
+      {
+        "hard_sign_errors": "4",
+        "reference": "3.5",
+        "winding": "3.5"
+      },
+      {
+        "hard_sign_errors": "11",
+        "reference": "4.5",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "29",
+        "reference": "5",
+        "winding": "5"
+      },
+      {
+        "hard_sign_errors": "10",
+        "reference": "5.5",
+        "winding": "5.5"
+      },
+      {
+        "hard_sign_errors": "18",
+        "reference": "6",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "8",
+        "reference": "6.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "5",
+        "reference": "7",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "41",
+        "reference": "7.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "8",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "4",
+        "reference": "8.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "9",
+        "winding": "7"
+      },
+      {
+        "hard_sign_errors": "32",
+        "reference": "9.5",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "10",
+        "winding": "7"
+      },
+      {
+        "hard_sign_errors": "24",
+        "reference": "10.5",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "11",
+        "winding": "9"
+      },
+      {
+        "hard_sign_errors": "2",
+        "reference": "11.5",
+        "winding": "9.5"
+      },
+      {
+        "hard_sign_errors": "13",
+        "reference": "12.5",
+        "winding": "9.5"
+      }
+    ],
+    "ladder_shift_percent": null,
+    "ladder_shifts": null,
+    "measurement_inventory": {
+      "contradictory_hard_sign_pairs": 22,
+      "evidence_mass": 242762.0,
+      "measurements": 242762,
+      "pairs": 180914
+    },
+    "missing_references": [
+      "4",
+      "12"
+    ],
+    "observed_ladder_shift": {
+      "ladder_shift_percent": 79.16666666666666,
+      "ladder_shifts": 5,
+      "note": "missing references omitted; bridges across gaps, not the full26-reference metric",
+      "references": 24
+    },
+    "ordinary_graph": [
+      "fiber BP component selection policy=all rounds=0 traces=1879->1879 pieces=4912->4912 constraints=245795->245795"
+    ],
+    "parameters": {
+      "--local-min-piece-length": 128,
+      "--winding-defect-cost": 150,
+      "--winding-defect-length-unit": 128,
+      "--winding-gap-boundary-cost": 0
+    },
+    "pieces": 4912,
+    "prepass_changes": 0,
+    "prepass_counts": {
+      "h": 2002,
+      "v": 2910
+    },
+    "prior_mass": 5914.35154680482,
+    "readout_diagnostics": [],
+    "references": 26,
+    "same_piece_identities": false,
+    "seconds": 43.782053746981546,
+    "shift_unavailable": "incomplete reference ladder",
+    "state_sha256": "e59954f7402abff08e7841d84447be679ae7901895b5e4a722154d734eca8e22",
+    "tied_rows": 0,
+    "unbounded_rows": 0
+  },
+  "m128-length-boundary": {
+    "common_pieces": 763,
+    "correct_references": 13,
+    "disabled_percent": 8.022258094861607,
+    "flags": [
+      "--legacy-fine-pieces",
+      "--partition-length-cost"
+    ],
+    "independent_missing": 2,
+    "independent_percent": 50.0,
+    "ladder": [
+      {
+        "hard_sign_errors": "1",
+        "reference": "0",
+        "winding": "0"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "0.5",
+        "winding": "0.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "1",
+        "winding": "1"
+      },
+      {
+        "hard_sign_errors": "5",
+        "reference": "1.5",
+        "winding": "1.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "2",
+        "winding": "2"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "2.5",
+        "winding": "2.5"
+      },
+      {
+        "hard_sign_errors": "6",
+        "reference": "3",
+        "winding": "3"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "3.5",
+        "winding": "3.5"
+      },
+      {
+        "hard_sign_errors": "4",
+        "reference": "4.5",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "10",
+        "reference": "5",
+        "winding": "5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "5.5",
+        "winding": "5.5"
+      },
+      {
+        "hard_sign_errors": "9",
+        "reference": "6",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "6.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "3",
+        "reference": "7",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "27",
+        "reference": "7.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "8",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "8.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "9",
+        "winding": "7"
+      },
+      {
+        "hard_sign_errors": "34",
+        "reference": "9.5",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "10",
+        "winding": "7"
+      },
+      {
+        "hard_sign_errors": "23",
+        "reference": "10.5",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "11",
+        "winding": "9"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "11.5",
+        "winding": "9.5"
+      },
+      {
+        "hard_sign_errors": "2",
+        "reference": "12.5",
+        "winding": "10.5"
+      }
+    ],
+    "ladder_shift_percent": null,
+    "ladder_shifts": null,
+    "measurement_inventory": {
+      "contradictory_hard_sign_pairs": 22,
+      "evidence_mass": 242762.0,
+      "measurements": 242762,
+      "pairs": 180914
+    },
+    "missing_references": [
+      "4",
+      "12"
+    ],
+    "observed_ladder_shift": {
+      "ladder_shift_percent": 83.33333333333334,
+      "ladder_shifts": 4,
+      "note": "missing references omitted; bridges across gaps, not the full26-reference metric",
+      "references": 24
+    },
+    "ordinary_graph": [
+      "fiber BP component selection policy=all rounds=0 traces=1879->1879 pieces=4912->4912 constraints=245795->245795"
+    ],
+    "parameters": {
+      "--local-min-piece-length": 128,
+      "--winding-defect-cost": 150,
+      "--winding-defect-length-unit": 128,
+      "--winding-gap-boundary-cost": 500
+    },
+    "pieces": 4912,
+    "prepass_changes": 0,
+    "prepass_counts": {
+      "h": 2002,
+      "v": 2910
+    },
+    "prior_mass": 5914.35154680482,
+    "readout_diagnostics": [],
+    "references": 26,
+    "same_piece_identities": false,
+    "seconds": 46.49223570199683,
+    "shift_unavailable": "incomplete reference ladder",
+    "state_sha256": "812d93d62f860a09c94ed37e0bbef2cf917712da3226a6c83bb71f152e7d48dc",
+    "tied_rows": 0,
+    "unbounded_rows": 0
+  },
+  "m256-d300-b0": {
+    "common_pieces": 1173,
+    "correct_references": 13,
+    "disabled_percent": 7.212111496727227,
+    "flags": [
+      "--legacy-fine-pieces",
+      "--partition-length-cost"
+    ],
+    "independent_missing": 2,
+    "independent_percent": 50.0,
+    "ladder": [
+      {
+        "hard_sign_errors": "10",
+        "reference": "0",
+        "winding": "0"
+      },
+      {
+        "hard_sign_errors": "15",
+        "reference": "0.5",
+        "winding": "0.5"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "1",
+        "winding": "1"
+      },
+      {
+        "hard_sign_errors": "8",
+        "reference": "1.5",
+        "winding": "1.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "2",
+        "winding": "2"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "2.5",
+        "winding": "2.5"
+      },
+      {
+        "hard_sign_errors": "3",
+        "reference": "3",
+        "winding": "3"
+      },
+      {
+        "hard_sign_errors": "21",
+        "reference": "3.5",
+        "winding": "3.5"
+      },
+      {
+        "hard_sign_errors": "5",
+        "reference": "4.5",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "8",
+        "reference": "5",
+        "winding": "5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "5.5",
+        "winding": "5.5"
+      },
+      {
+        "hard_sign_errors": "6",
+        "reference": "6",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "6.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "2",
+        "reference": "7",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "19",
+        "reference": "7.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "8",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "2",
+        "reference": "8.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "9",
+        "winding": "7"
+      },
+      {
+        "hard_sign_errors": "18",
+        "reference": "9.5",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "10",
+        "winding": "7"
+      },
+      {
+        "hard_sign_errors": "4",
+        "reference": "10.5",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "11",
+        "winding": "10"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "11.5",
+        "winding": "10.5"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "12.5",
+        "winding": "11.5"
+      }
+    ],
+    "ladder_shift_percent": null,
+    "ladder_shifts": null,
+    "measurement_inventory": {
+      "contradictory_hard_sign_pairs": 29,
+      "evidence_mass": 242762.0,
+      "measurements": 242762,
+      "pairs": 148919
+    },
+    "missing_references": [
+      "4",
+      "12"
+    ],
+    "observed_ladder_shift": {
+      "ladder_shift_percent": 83.33333333333334,
+      "ladder_shifts": 4,
+      "note": "missing references omitted; bridges across gaps, not the full26-reference metric",
+      "references": 24
+    },
+    "ordinary_graph": [
+      "fiber BP component selection policy=all rounds=0 traces=1879->1879 pieces=2799->2799 constraints=243682->243682"
+    ],
+    "parameters": {
+      "--local-min-piece-length": 256,
+      "--winding-defect-cost": 300,
+      "--winding-defect-length-unit": 128,
+      "--winding-gap-boundary-cost": 0
+    },
+    "pieces": 2799,
+    "prepass_changes": 0,
+    "prepass_counts": {
+      "h": 1184,
+      "v": 1615
+    },
+    "prior_mass": 5914.35154680482,
+    "readout_diagnostics": [],
+    "references": 26,
+    "same_piece_identities": false,
+    "seconds": 38.90398958697915,
+    "shift_unavailable": "incomplete reference ladder",
+    "state_sha256": "f945da19c5d40f0b6307e76d983ea51281ec9c7c9e96635306b8ebf6294a7b08",
+    "tied_rows": 0,
+    "unbounded_rows": 0
+  },
+  "m256-d300-b500": {
+    "common_pieces": 1173,
+    "correct_references": 13,
+    "disabled_percent": 7.784571044168731,
+    "flags": [
+      "--legacy-fine-pieces",
+      "--partition-length-cost"
+    ],
+    "independent_missing": 2,
+    "independent_percent": 50.0,
+    "ladder": [
+      {
+        "hard_sign_errors": "0",
+        "reference": "0",
+        "winding": "0"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "0.5",
+        "winding": "0.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "1",
+        "winding": "1"
+      },
+      {
+        "hard_sign_errors": "8",
+        "reference": "1.5",
+        "winding": "1.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "2",
+        "winding": "2"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "2.5",
+        "winding": "2.5"
+      },
+      {
+        "hard_sign_errors": "3",
+        "reference": "3",
+        "winding": "3"
+      },
+      {
+        "hard_sign_errors": "2",
+        "reference": "3.5",
+        "winding": "3.5"
+      },
+      {
+        "hard_sign_errors": "3",
+        "reference": "4.5",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "10",
+        "reference": "5",
+        "winding": "5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "5.5",
+        "winding": "5.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "6",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "6.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "2",
+        "reference": "7",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "17",
+        "reference": "7.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "8",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "8.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "9",
+        "winding": "7"
+      },
+      {
+        "hard_sign_errors": "20",
+        "reference": "9.5",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "10",
+        "winding": "7"
+      },
+      {
+        "hard_sign_errors": "2",
+        "reference": "10.5",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "11",
+        "winding": "9"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "11.5",
+        "winding": "9.5"
+      },
+      {
+        "hard_sign_errors": "9",
+        "reference": "12.5",
+        "winding": "9.5"
+      }
+    ],
+    "ladder_shift_percent": null,
+    "ladder_shifts": null,
+    "measurement_inventory": {
+      "contradictory_hard_sign_pairs": 29,
+      "evidence_mass": 242762.0,
+      "measurements": 242762,
+      "pairs": 148919
+    },
+    "missing_references": [
+      "4",
+      "12"
+    ],
+    "observed_ladder_shift": {
+      "ladder_shift_percent": 79.16666666666666,
+      "ladder_shifts": 5,
+      "note": "missing references omitted; bridges across gaps, not the full26-reference metric",
+      "references": 24
+    },
+    "ordinary_graph": [
+      "fiber BP component selection policy=all rounds=0 traces=1879->1879 pieces=2799->2799 constraints=243682->243682"
+    ],
+    "parameters": {
+      "--local-min-piece-length": 256,
+      "--winding-defect-cost": 300,
+      "--winding-defect-length-unit": 128,
+      "--winding-gap-boundary-cost": 500
+    },
+    "pieces": 2799,
+    "prepass_changes": 0,
+    "prepass_counts": {
+      "h": 1184,
+      "v": 1615
+    },
+    "prior_mass": 5914.35154680482,
+    "readout_diagnostics": [],
+    "references": 26,
+    "same_piece_identities": false,
+    "seconds": 38.29149380599847,
+    "shift_unavailable": "incomplete reference ladder",
+    "state_sha256": "7c955329982348af89107a1ab7ea3c2cd013a1231d067a8ae327775227c6b158",
+    "tied_rows": 0,
+    "unbounded_rows": 0
+  },
+  "m256-d75-b0": {
+    "common_pieces": 1173,
+    "correct_references": 13,
+    "disabled_percent": 6.074720198520462,
+    "flags": [
+      "--legacy-fine-pieces",
+      "--partition-length-cost"
+    ],
+    "independent_missing": 2,
+    "independent_percent": 50.0,
+    "ladder": [
+      {
+        "hard_sign_errors": "0",
+        "reference": "0",
+        "winding": "0"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "0.5",
+        "winding": "0.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "1",
+        "winding": "1"
+      },
+      {
+        "hard_sign_errors": "8",
+        "reference": "1.5",
+        "winding": "1.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "2",
+        "winding": "2"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "2.5",
+        "winding": "2.5"
+      },
+      {
+        "hard_sign_errors": "3",
+        "reference": "3",
+        "winding": "3"
+      },
+      {
+        "hard_sign_errors": "21",
+        "reference": "3.5",
+        "winding": "3.5"
+      },
+      {
+        "hard_sign_errors": "5",
+        "reference": "4.5",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "8",
+        "reference": "5",
+        "winding": "5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "5.5",
+        "winding": "5.5"
+      },
+      {
+        "hard_sign_errors": "6",
+        "reference": "6",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "6.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "7",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "19",
+        "reference": "7.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "8",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "2",
+        "reference": "8.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "9",
+        "winding": "7"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "9.5",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "10",
+        "winding": "8"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "10.5",
+        "winding": "8.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "11",
+        "winding": "12"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "11.5",
+        "winding": "12.5"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "12.5",
+        "winding": "13.5"
+      }
+    ],
+    "ladder_shift_percent": null,
+    "ladder_shifts": null,
+    "measurement_inventory": {
+      "contradictory_hard_sign_pairs": 29,
+      "evidence_mass": 242762.0,
+      "measurements": 242762,
+      "pairs": 148919
+    },
+    "missing_references": [
+      "4",
+      "12"
+    ],
+    "observed_ladder_shift": {
+      "ladder_shift_percent": 87.5,
+      "ladder_shifts": 3,
+      "note": "missing references omitted; bridges across gaps, not the full26-reference metric",
+      "references": 24
+    },
+    "ordinary_graph": [
+      "fiber BP component selection policy=all rounds=0 traces=1879->1879 pieces=2799->2799 constraints=243682->243682"
+    ],
+    "parameters": {
+      "--local-min-piece-length": 256,
+      "--winding-defect-cost": 75,
+      "--winding-defect-length-unit": 128,
+      "--winding-gap-boundary-cost": 0
+    },
+    "pieces": 2799,
+    "prepass_changes": 0,
+    "prepass_counts": {
+      "h": 1184,
+      "v": 1615
+    },
+    "prior_mass": 5914.35154680482,
+    "readout_diagnostics": [],
+    "references": 26,
+    "same_piece_identities": false,
+    "seconds": 40.00312912801746,
+    "shift_unavailable": "incomplete reference ladder",
+    "state_sha256": "262873cde0647ff99a871e6b957f153a9836397355f6327f08676ff3d3e2fe76",
+    "tied_rows": 0,
+    "unbounded_rows": 0
+  },
+  "m256-d75-b500": {
+    "common_pieces": 1173,
+    "correct_references": 13,
+    "disabled_percent": 9.006614296504925,
+    "flags": [
+      "--legacy-fine-pieces",
+      "--partition-length-cost"
+    ],
+    "independent_missing": 2,
+    "independent_percent": 50.0,
+    "ladder": [
+      {
+        "hard_sign_errors": "0",
+        "reference": "0",
+        "winding": "0"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "0.5",
+        "winding": "0.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "1",
+        "winding": "1"
+      },
+      {
+        "hard_sign_errors": "8",
+        "reference": "1.5",
+        "winding": "1.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "2",
+        "winding": "2"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "2.5",
+        "winding": "2.5"
+      },
+      {
+        "hard_sign_errors": "3",
+        "reference": "3",
+        "winding": "3"
+      },
+      {
+        "hard_sign_errors": "19",
+        "reference": "3.5",
+        "winding": "3.5"
+      },
+      {
+        "hard_sign_errors": "3",
+        "reference": "4.5",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "2",
+        "reference": "5",
+        "winding": "5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "5.5",
+        "winding": "5.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "6",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "6.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "2",
+        "reference": "7",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "12",
+        "reference": "7.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "8",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "8.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "9",
+        "winding": "7"
+      },
+      {
+        "hard_sign_errors": "22",
+        "reference": "9.5",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "10",
+        "winding": "7"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "10.5",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "11",
+        "winding": "9"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "11.5",
+        "winding": "9.5"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "12.5",
+        "winding": "10.5"
+      }
+    ],
+    "ladder_shift_percent": null,
+    "ladder_shifts": null,
+    "measurement_inventory": {
+      "contradictory_hard_sign_pairs": 29,
+      "evidence_mass": 242762.0,
+      "measurements": 242762,
+      "pairs": 148919
+    },
+    "missing_references": [
+      "4",
+      "12"
+    ],
+    "observed_ladder_shift": {
+      "ladder_shift_percent": 83.33333333333334,
+      "ladder_shifts": 4,
+      "note": "missing references omitted; bridges across gaps, not the full26-reference metric",
+      "references": 24
+    },
+    "ordinary_graph": [
+      "fiber BP component selection policy=all rounds=0 traces=1879->1879 pieces=2799->2799 constraints=243682->243682"
+    ],
+    "parameters": {
+      "--local-min-piece-length": 256,
+      "--winding-defect-cost": 75,
+      "--winding-defect-length-unit": 128,
+      "--winding-gap-boundary-cost": 500
+    },
+    "pieces": 2799,
+    "prepass_changes": 0,
+    "prepass_counts": {
+      "h": 1184,
+      "v": 1615
+    },
+    "prior_mass": 5914.35154680482,
+    "readout_diagnostics": [],
+    "references": 26,
+    "same_piece_identities": false,
+    "seconds": 38.238884342019446,
+    "shift_unavailable": "incomplete reference ladder",
+    "state_sha256": "938d7581d40b2df8452b4f259f4fe84fbd64df04a9a6d39ebac4f675f0899b6e",
+    "tied_rows": 0,
+    "unbounded_rows": 0
+  },
+  "m256-incident": {
+    "common_pieces": 1173,
+    "correct_references": 13,
+    "disabled_percent": 9.886324929191657,
+    "flags": [
+      "--legacy-fine-pieces"
+    ],
+    "independent_missing": 2,
+    "independent_percent": 50.0,
+    "ladder": [
+      {
+        "hard_sign_errors": "0",
+        "reference": "0",
+        "winding": "0"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "0.5",
+        "winding": "0.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "1",
+        "winding": "1"
+      },
+      {
+        "hard_sign_errors": "8",
+        "reference": "1.5",
+        "winding": "1.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "2",
+        "winding": "2"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "2.5",
+        "winding": "2.5"
+      },
+      {
+        "hard_sign_errors": "3",
+        "reference": "3",
+        "winding": "3"
+      },
+      {
+        "hard_sign_errors": "2",
+        "reference": "3.5",
+        "winding": "3.5"
+      },
+      {
+        "hard_sign_errors": "3",
+        "reference": "4.5",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "16",
+        "reference": "5",
+        "winding": "5"
+      },
+      {
+        "hard_sign_errors": "4",
+        "reference": "5.5",
+        "winding": "5.5"
+      },
+      {
+        "hard_sign_errors": "32",
+        "reference": "6",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "8",
+        "reference": "6.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "32",
+        "reference": "7",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "14",
+        "reference": "7.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "8",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "8.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "22",
+        "reference": "9",
+        "winding": "7"
+      },
+      {
+        "hard_sign_errors": "19",
+        "reference": "9.5",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "10",
+        "winding": "7"
+      },
+      {
+        "hard_sign_errors": "2",
+        "reference": "10.5",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "11",
+        "winding": "10"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "11.5",
+        "winding": "10.5"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "12.5",
+        "winding": "11.5"
+      }
+    ],
+    "ladder_shift_percent": null,
+    "ladder_shifts": null,
+    "measurement_inventory": {
+      "contradictory_hard_sign_pairs": 29,
+      "evidence_mass": 242762.0,
+      "measurements": 242762,
+      "pairs": 148919
+    },
+    "missing_references": [
+      "4",
+      "12"
+    ],
+    "observed_ladder_shift": {
+      "ladder_shift_percent": 83.33333333333334,
+      "ladder_shifts": 4,
+      "note": "missing references omitted; bridges across gaps, not the full26-reference metric",
+      "references": 24
+    },
+    "ordinary_graph": [
+      "fiber BP component selection policy=all rounds=0 traces=1879->1879 pieces=2799->2799 constraints=243682->243682"
+    ],
+    "parameters": {
+      "--local-min-piece-length": 256
+    },
+    "pieces": 2799,
+    "prepass_changes": 0,
+    "prepass_counts": {
+      "h": 1184,
+      "v": 1615
+    },
+    "prior_mass": 223182.0,
+    "readout_diagnostics": [],
+    "references": 26,
+    "same_piece_identities": false,
+    "seconds": 41.204291607951745,
+    "shift_unavailable": "incomplete reference ladder",
+    "state_sha256": "b575bae5862484b443bbf640ecd442909faf1feb41ac620c83d89b62dddd817e",
+    "tied_rows": 0,
+    "unbounded_rows": 0
+  },
+  "m256-incident-boundary": {
+    "common_pieces": 1173,
+    "correct_references": 13,
+    "disabled_percent": 8.819787145363234,
+    "flags": [
+      "--legacy-fine-pieces"
+    ],
+    "independent_missing": 2,
+    "independent_percent": 50.0,
+    "ladder": [
+      {
+        "hard_sign_errors": "0",
+        "reference": "0",
+        "winding": "0"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "0.5",
+        "winding": "0.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "1",
+        "winding": "1"
+      },
+      {
+        "hard_sign_errors": "8",
+        "reference": "1.5",
+        "winding": "1.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "2",
+        "winding": "2"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "2.5",
+        "winding": "2.5"
+      },
+      {
+        "hard_sign_errors": "3",
+        "reference": "3",
+        "winding": "3"
+      },
+      {
+        "hard_sign_errors": "2",
+        "reference": "3.5",
+        "winding": "3.5"
+      },
+      {
+        "hard_sign_errors": "3",
+        "reference": "4.5",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "10",
+        "reference": "5",
+        "winding": "5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "5.5",
+        "winding": "5.5"
+      },
+      {
+        "hard_sign_errors": "32",
+        "reference": "6",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "8",
+        "reference": "6.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "28",
+        "reference": "7",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "20",
+        "reference": "7.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "8",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "8.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "22",
+        "reference": "9",
+        "winding": "7"
+      },
+      {
+        "hard_sign_errors": "19",
+        "reference": "9.5",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "10",
+        "winding": "7"
+      },
+      {
+        "hard_sign_errors": "2",
+        "reference": "10.5",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "11",
+        "winding": "10"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "11.5",
+        "winding": "10.5"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "12.5",
+        "winding": "11.5"
+      }
+    ],
+    "ladder_shift_percent": null,
+    "ladder_shifts": null,
+    "measurement_inventory": {
+      "contradictory_hard_sign_pairs": 29,
+      "evidence_mass": 242762.0,
+      "measurements": 242762,
+      "pairs": 148919
+    },
+    "missing_references": [
+      "4",
+      "12"
+    ],
+    "observed_ladder_shift": {
+      "ladder_shift_percent": 83.33333333333334,
+      "ladder_shifts": 4,
+      "note": "missing references omitted; bridges across gaps, not the full26-reference metric",
+      "references": 24
+    },
+    "ordinary_graph": [
+      "fiber BP component selection policy=all rounds=0 traces=1879->1879 pieces=2799->2799 constraints=243682->243682"
+    ],
+    "parameters": {
+      "--local-min-piece-length": 256,
+      "--winding-gap-boundary-cost": 500
+    },
+    "pieces": 2799,
+    "prepass_changes": 0,
+    "prepass_counts": {
+      "h": 1184,
+      "v": 1615
+    },
+    "prior_mass": 223182.0,
+    "readout_diagnostics": [],
+    "references": 26,
+    "same_piece_identities": false,
+    "seconds": 36.4464467720245,
+    "shift_unavailable": "incomplete reference ladder",
+    "state_sha256": "b3e4fb47704521184afa9baf0ae73a928492d9ee5c87a1e7ed4f01e6193dd424",
+    "tied_rows": 0,
+    "unbounded_rows": 0
+  },
+  "m256-length": {
+    "common_pieces": 1173,
+    "correct_references": 13,
+    "disabled_percent": 6.035890484317225,
+    "flags": [
+      "--legacy-fine-pieces",
+      "--partition-length-cost"
+    ],
+    "independent_missing": 2,
+    "independent_percent": 50.0,
+    "ladder": [
+      {
+        "hard_sign_errors": "0",
+        "reference": "0",
+        "winding": "0"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "0.5",
+        "winding": "0.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "1",
+        "winding": "1"
+      },
+      {
+        "hard_sign_errors": "8",
+        "reference": "1.5",
+        "winding": "1.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "2",
+        "winding": "2"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "2.5",
+        "winding": "2.5"
+      },
+      {
+        "hard_sign_errors": "3",
+        "reference": "3",
+        "winding": "3"
+      },
+      {
+        "hard_sign_errors": "21",
+        "reference": "3.5",
+        "winding": "3.5"
+      },
+      {
+        "hard_sign_errors": "5",
+        "reference": "4.5",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "8",
+        "reference": "5",
+        "winding": "5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "5.5",
+        "winding": "5.5"
+      },
+      {
+        "hard_sign_errors": "6",
+        "reference": "6",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "6.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "7",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "19",
+        "reference": "7.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "8",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "2",
+        "reference": "8.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "9",
+        "winding": "7"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "9.5",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "10",
+        "winding": "8"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "10.5",
+        "winding": "8.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "11",
+        "winding": "12"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "11.5",
+        "winding": "12.5"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "12.5",
+        "winding": "13.5"
+      }
+    ],
+    "ladder_shift_percent": null,
+    "ladder_shifts": null,
+    "measurement_inventory": {
+      "contradictory_hard_sign_pairs": 29,
+      "evidence_mass": 242762.0,
+      "measurements": 242762,
+      "pairs": 148919
+    },
+    "missing_references": [
+      "4",
+      "12"
+    ],
+    "observed_ladder_shift": {
+      "ladder_shift_percent": 87.5,
+      "ladder_shifts": 3,
+      "note": "missing references omitted; bridges across gaps, not the full26-reference metric",
+      "references": 24
+    },
+    "ordinary_graph": [
+      "fiber BP component selection policy=all rounds=0 traces=1879->1879 pieces=2799->2799 constraints=243682->243682"
+    ],
+    "parameters": {
+      "--local-min-piece-length": 256,
+      "--winding-defect-cost": 150,
+      "--winding-defect-length-unit": 128,
+      "--winding-gap-boundary-cost": 0
+    },
+    "pieces": 2799,
+    "prepass_changes": 0,
+    "prepass_counts": {
+      "h": 1184,
+      "v": 1615
+    },
+    "prior_mass": 5914.35154680482,
+    "readout_diagnostics": [],
+    "references": 26,
+    "same_piece_identities": false,
+    "seconds": 39.05148464994272,
+    "shift_unavailable": "incomplete reference ladder",
+    "state_sha256": "e5d58fe4a34d0159dd5acdbe8b6b9a8948ddcdf6eecb3a814df99d5fdb13ec5c",
+    "tied_rows": 0,
+    "unbounded_rows": 0
+  },
+  "m256-length-binary": {
+    "common_pieces": 1173,
+    "correct_references": 13,
+    "disabled_percent": 7.232779903192017,
+    "flags": [
+      "--legacy-fine-pieces",
+      "--partition-length-cost",
+      "--constraint-binary-score"
+    ],
+    "independent_missing": 2,
+    "independent_percent": 50.0,
+    "ladder": [
+      {
+        "hard_sign_errors": "10",
+        "reference": "0",
+        "winding": "0"
+      },
+      {
+        "hard_sign_errors": "15",
+        "reference": "0.5",
+        "winding": "0.5"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "1",
+        "winding": "1"
+      },
+      {
+        "hard_sign_errors": "8",
+        "reference": "1.5",
+        "winding": "1.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "2",
+        "winding": "2"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "2.5",
+        "winding": "2.5"
+      },
+      {
+        "hard_sign_errors": "3",
+        "reference": "3",
+        "winding": "3"
+      },
+      {
+        "hard_sign_errors": "21",
+        "reference": "3.5",
+        "winding": "3.5"
+      },
+      {
+        "hard_sign_errors": "5",
+        "reference": "4.5",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "8",
+        "reference": "5",
+        "winding": "5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "5.5",
+        "winding": "5.5"
+      },
+      {
+        "hard_sign_errors": "6",
+        "reference": "6",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "6.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "7",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "17",
+        "reference": "7.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "8",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "2",
+        "reference": "8.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "9",
+        "winding": "7"
+      },
+      {
+        "hard_sign_errors": "19",
+        "reference": "9.5",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "10",
+        "winding": "7"
+      },
+      {
+        "hard_sign_errors": "16",
+        "reference": "10.5",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "11",
+        "winding": "9"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "11.5",
+        "winding": "9.5"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "12.5",
+        "winding": "10.5"
+      }
+    ],
+    "ladder_shift_percent": null,
+    "ladder_shifts": null,
+    "measurement_inventory": {
+      "contradictory_hard_sign_pairs": 29,
+      "evidence_mass": 242762.0,
+      "measurements": 242762,
+      "pairs": 148919
+    },
+    "missing_references": [
+      "4",
+      "12"
+    ],
+    "observed_ladder_shift": {
+      "ladder_shift_percent": 83.33333333333334,
+      "ladder_shifts": 4,
+      "note": "missing references omitted; bridges across gaps, not the full26-reference metric",
+      "references": 24
+    },
+    "ordinary_graph": [
+      "fiber BP component selection policy=all rounds=0 traces=1879->1879 pieces=2799->2799 constraints=243682->243682"
+    ],
+    "parameters": {
+      "--local-min-piece-length": 256,
+      "--winding-defect-cost": 150,
+      "--winding-defect-length-unit": 128,
+      "--winding-gap-boundary-cost": 0
+    },
+    "pieces": 2799,
+    "prepass_changes": 0,
+    "prepass_counts": {
+      "h": 1184,
+      "v": 1615
+    },
+    "prior_mass": 5914.35154680482,
+    "readout_diagnostics": [],
+    "references": 26,
+    "same_piece_identities": false,
+    "seconds": 39.22924240800785,
+    "shift_unavailable": "incomplete reference ladder",
+    "state_sha256": "f260f8b7373c43db7fc1340ea1dacd43d4f1cb572861b5f5e97d9d9327305c39",
+    "tied_rows": 0,
+    "unbounded_rows": 0
+  },
+  "m256-length-boundary": {
+    "common_pieces": 1173,
+    "correct_references": 13,
+    "disabled_percent": 7.542374368794598,
+    "flags": [
+      "--legacy-fine-pieces",
+      "--partition-length-cost"
+    ],
+    "independent_missing": 2,
+    "independent_percent": 50.0,
+    "ladder": [
+      {
+        "hard_sign_errors": "0",
+        "reference": "0",
+        "winding": "0"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "0.5",
+        "winding": "0.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "1",
+        "winding": "1"
+      },
+      {
+        "hard_sign_errors": "8",
+        "reference": "1.5",
+        "winding": "1.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "2",
+        "winding": "2"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "2.5",
+        "winding": "2.5"
+      },
+      {
+        "hard_sign_errors": "3",
+        "reference": "3",
+        "winding": "3"
+      },
+      {
+        "hard_sign_errors": "2",
+        "reference": "3.5",
+        "winding": "3.5"
+      },
+      {
+        "hard_sign_errors": "3",
+        "reference": "4.5",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "2",
+        "reference": "5",
+        "winding": "5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "5.5",
+        "winding": "5.5"
+      },
+      {
+        "hard_sign_errors": "5",
+        "reference": "6",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "6.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "2",
+        "reference": "7",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "17",
+        "reference": "7.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "8",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "8.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "9",
+        "winding": "7"
+      },
+      {
+        "hard_sign_errors": "22",
+        "reference": "9.5",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "10",
+        "winding": "7"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "10.5",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "11",
+        "winding": "10"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "11.5",
+        "winding": "10.5"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "12.5",
+        "winding": "11.5"
+      }
+    ],
+    "ladder_shift_percent": null,
+    "ladder_shifts": null,
+    "measurement_inventory": {
+      "contradictory_hard_sign_pairs": 29,
+      "evidence_mass": 242762.0,
+      "measurements": 242762,
+      "pairs": 148919
+    },
+    "missing_references": [
+      "4",
+      "12"
+    ],
+    "observed_ladder_shift": {
+      "ladder_shift_percent": 83.33333333333334,
+      "ladder_shifts": 4,
+      "note": "missing references omitted; bridges across gaps, not the full26-reference metric",
+      "references": 24
+    },
+    "ordinary_graph": [
+      "fiber BP component selection policy=all rounds=0 traces=1879->1879 pieces=2799->2799 constraints=243682->243682"
+    ],
+    "parameters": {
+      "--local-min-piece-length": 256,
+      "--winding-defect-cost": 150,
+      "--winding-defect-length-unit": 128,
+      "--winding-gap-boundary-cost": 500
+    },
+    "pieces": 2799,
+    "prepass_changes": 0,
+    "prepass_counts": {
+      "h": 1184,
+      "v": 1615
+    },
+    "prior_mass": 5914.35154680482,
+    "readout_diagnostics": [],
+    "references": 26,
+    "same_piece_identities": false,
+    "seconds": 39.59273699199548,
+    "shift_unavailable": "incomplete reference ladder",
+    "state_sha256": "dbfcfffe37f99f2b5e0890e72f8202c3aff029f3739f28ca33902a1e0b32601e",
+    "tied_rows": 0,
+    "unbounded_rows": 0
+  },
+  "m64-incident": {
+    "common_pieces": 551,
+    "correct_references": 10,
+    "disabled_percent": 5.530390253498509,
+    "flags": [
+      "--legacy-fine-pieces"
+    ],
+    "independent_missing": 2,
+    "independent_percent": 38.46153846153846,
+    "ladder": [
+      {
+        "hard_sign_errors": "32",
+        "reference": "0",
+        "winding": "0"
+      },
+      {
+        "hard_sign_errors": "50",
+        "reference": "0.5",
+        "winding": "0.5"
+      },
+      {
+        "hard_sign_errors": "6",
+        "reference": "1",
+        "winding": "1"
+      },
+      {
+        "hard_sign_errors": "32",
+        "reference": "1.5",
+        "winding": "1.5"
+      },
+      {
+        "hard_sign_errors": "20",
+        "reference": "2",
+        "winding": "2"
+      },
+      {
+        "hard_sign_errors": "4",
+        "reference": "2.5",
+        "winding": "2.5"
+      },
+      {
+        "hard_sign_errors": "33",
+        "reference": "3",
+        "winding": "3"
+      },
+      {
+        "hard_sign_errors": "88",
+        "reference": "3.5",
+        "winding": "3.5"
+      },
+      {
+        "hard_sign_errors": "26",
+        "reference": "4.5",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "70",
+        "reference": "5",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "13",
+        "reference": "5.5",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "31",
+        "reference": "6",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "6.5",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "18",
+        "reference": "7",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "39",
+        "reference": "7.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "8",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "21",
+        "reference": "8.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "53",
+        "reference": "9",
+        "winding": "7"
+      },
+      {
+        "hard_sign_errors": "60",
+        "reference": "9.5",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "10",
+        "winding": "7"
+      },
+      {
+        "hard_sign_errors": "51",
+        "reference": "10.5",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "11",
+        "winding": "9"
+      },
+      {
+        "hard_sign_errors": "7",
+        "reference": "11.5",
+        "winding": "9.5"
+      },
+      {
+        "hard_sign_errors": "15",
+        "reference": "12.5",
+        "winding": "9.5"
+      }
+    ],
+    "ladder_shift_percent": null,
+    "ladder_shifts": null,
+    "measurement_inventory": {
+      "contradictory_hard_sign_pairs": 2,
+      "evidence_mass": 242762.0,
+      "measurements": 242762,
+      "pairs": 198714
+    },
+    "missing_references": [
+      "4",
+      "12"
+    ],
+    "observed_ladder_shift": {
+      "ladder_shift_percent": 62.5,
+      "ladder_shifts": 9,
+      "note": "missing references omitted; bridges across gaps, not the full26-reference metric",
+      "references": 24
+    },
+    "ordinary_graph": [
+      "fiber BP component selection policy=all rounds=0 traces=1879->1879 pieces=9265->9265 constraints=250148->250148"
+    ],
+    "parameters": {
+      "--local-min-piece-length": 64
+    },
+    "pieces": 9265,
+    "prepass_changes": 0,
+    "prepass_counts": {
+      "h": 3693,
+      "v": 5572
+    },
+    "prior_mass": 236114.0,
+    "readout_diagnostics": [],
+    "references": 26,
+    "same_piece_identities": false,
+    "seconds": 52.70166096900357,
+    "shift_unavailable": "incomplete reference ladder",
+    "state_sha256": "33d8104c3dbb5720f92df28113cf9c9c7487f792af36bac56dde2eb35caea2b0",
+    "tied_rows": 0,
+    "unbounded_rows": 0
+  },
+  "m64-length": {
+    "common_pieces": 551,
+    "correct_references": 11,
+    "disabled_percent": 3.939680616128593,
+    "flags": [
+      "--legacy-fine-pieces",
+      "--partition-length-cost"
+    ],
+    "independent_missing": 2,
+    "independent_percent": 42.30769230769231,
+    "ladder": [
+      {
+        "hard_sign_errors": "21",
+        "reference": "0",
+        "winding": "0"
+      },
+      {
+        "hard_sign_errors": "55",
+        "reference": "0.5",
+        "winding": "0.5"
+      },
+      {
+        "hard_sign_errors": "4",
+        "reference": "1",
+        "winding": "1"
+      },
+      {
+        "hard_sign_errors": "29",
+        "reference": "1.5",
+        "winding": "1.5"
+      },
+      {
+        "hard_sign_errors": "17",
+        "reference": "2",
+        "winding": "2"
+      },
+      {
+        "hard_sign_errors": "2",
+        "reference": "2.5",
+        "winding": "2.5"
+      },
+      {
+        "hard_sign_errors": "16",
+        "reference": "3",
+        "winding": "3"
+      },
+      {
+        "hard_sign_errors": "10",
+        "reference": "3.5",
+        "winding": "3.5"
+      },
+      {
+        "hard_sign_errors": "20",
+        "reference": "4.5",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "76",
+        "reference": "5",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "27",
+        "reference": "5.5",
+        "winding": "5.5"
+      },
+      {
+        "hard_sign_errors": "39",
+        "reference": "6",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "15",
+        "reference": "6.5",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "8",
+        "reference": "7",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "69",
+        "reference": "7.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "8",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "21",
+        "reference": "8.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "40",
+        "reference": "9",
+        "winding": "7"
+      },
+      {
+        "hard_sign_errors": "66",
+        "reference": "9.5",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "10",
+        "winding": "7"
+      },
+      {
+        "hard_sign_errors": "52",
+        "reference": "10.5",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "11",
+        "winding": "9"
+      },
+      {
+        "hard_sign_errors": "3",
+        "reference": "11.5",
+        "winding": "9.5"
+      },
+      {
+        "hard_sign_errors": "19",
+        "reference": "12.5",
+        "winding": "9.5"
+      }
+    ],
+    "ladder_shift_percent": null,
+    "ladder_shifts": null,
+    "measurement_inventory": {
+      "contradictory_hard_sign_pairs": 2,
+      "evidence_mass": 242762.0,
+      "measurements": 242762,
+      "pairs": 198714
+    },
+    "missing_references": [
+      "4",
+      "12"
+    ],
+    "observed_ladder_shift": {
+      "ladder_shift_percent": 66.66666666666667,
+      "ladder_shifts": 8,
+      "note": "missing references omitted; bridges across gaps, not the full26-reference metric",
+      "references": 24
+    },
+    "ordinary_graph": [
+      "fiber BP component selection policy=all rounds=0 traces=1879->1879 pieces=9265->9265 constraints=250148->250148"
+    ],
+    "parameters": {
+      "--local-min-piece-length": 64,
+      "--winding-defect-cost": 150,
+      "--winding-defect-length-unit": 128,
+      "--winding-gap-boundary-cost": 0
+    },
+    "pieces": 9265,
+    "prepass_changes": 0,
+    "prepass_counts": {
+      "h": 3693,
+      "v": 5572
+    },
+    "prior_mass": 5914.35154680482,
+    "readout_diagnostics": [],
+    "references": 26,
+    "same_piece_identities": false,
+    "seconds": 54.969528271991294,
+    "shift_unavailable": "incomplete reference ladder",
+    "state_sha256": "9b2bf58498fc489ea374b48f898125e68383ee6fbd273c52eb699150af782bd6",
+    "tied_rows": 0,
+    "unbounded_rows": 0
+  },
+  "m64-length-boundary": {
+    "common_pieces": 551,
+    "correct_references": 12,
+    "disabled_percent": 7.832579081266355,
+    "flags": [
+      "--legacy-fine-pieces",
+      "--partition-length-cost"
+    ],
+    "independent_missing": 2,
+    "independent_percent": 46.15384615384615,
+    "ladder": [
+      {
+        "hard_sign_errors": "3",
+        "reference": "0",
+        "winding": "0"
+      },
+      {
+        "hard_sign_errors": "1",
+        "reference": "0.5",
+        "winding": "0.5"
+      },
+      {
+        "hard_sign_errors": "2",
+        "reference": "1",
+        "winding": "1"
+      },
+      {
+        "hard_sign_errors": "13",
+        "reference": "1.5",
+        "winding": "1.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "2",
+        "winding": "2"
+      },
+      {
+        "hard_sign_errors": "2",
+        "reference": "2.5",
+        "winding": "2.5"
+      },
+      {
+        "hard_sign_errors": "13",
+        "reference": "3",
+        "winding": "3"
+      },
+      {
+        "hard_sign_errors": "8",
+        "reference": "3.5",
+        "winding": "3.5"
+      },
+      {
+        "hard_sign_errors": "7",
+        "reference": "4.5",
+        "winding": "4.5"
+      },
+      {
+        "hard_sign_errors": "28",
+        "reference": "5",
+        "winding": "5"
+      },
+      {
+        "hard_sign_errors": "4",
+        "reference": "5.5",
+        "winding": "5.5"
+      },
+      {
+        "hard_sign_errors": "17",
+        "reference": "6",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "6.5",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "3",
+        "reference": "7",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "47",
+        "reference": "7.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "8",
+        "winding": "6"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "8.5",
+        "winding": "6.5"
+      },
+      {
+        "hard_sign_errors": "4",
+        "reference": "9",
+        "winding": "7"
+      },
+      {
+        "hard_sign_errors": "61",
+        "reference": "9.5",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "10",
+        "winding": "7"
+      },
+      {
+        "hard_sign_errors": "30",
+        "reference": "10.5",
+        "winding": "7.5"
+      },
+      {
+        "hard_sign_errors": "0",
+        "reference": "11",
+        "winding": "9"
+      },
+      {
+        "hard_sign_errors": "2",
+        "reference": "11.5",
+        "winding": "9.5"
+      },
+      {
+        "hard_sign_errors": "23",
+        "reference": "12.5",
+        "winding": "9.5"
+      }
+    ],
+    "ladder_shift_percent": null,
+    "ladder_shifts": null,
+    "measurement_inventory": {
+      "contradictory_hard_sign_pairs": 2,
+      "evidence_mass": 242762.0,
+      "measurements": 242762,
+      "pairs": 198714
+    },
+    "missing_references": [
+      "4",
+      "12"
+    ],
+    "observed_ladder_shift": {
+      "ladder_shift_percent": 75.0,
+      "ladder_shifts": 6,
+      "note": "missing references omitted; bridges across gaps, not the full26-reference metric",
+      "references": 24
+    },
+    "ordinary_graph": [
+      "fiber BP component selection policy=all rounds=0 traces=1879->1879 pieces=9265->9265 constraints=250148->250148"
+    ],
+    "parameters": {
+      "--local-min-piece-length": 64,
+      "--winding-defect-cost": 150,
+      "--winding-defect-length-unit": 128,
+      "--winding-gap-boundary-cost": 500
+    },
+    "pieces": 9265,
+    "prepass_changes": 0,
+    "prepass_counts": {
+      "h": 3693,
+      "v": 5572
+    },
+    "prior_mass": 5914.35154680482,
+    "readout_diagnostics": [],
+    "references": 26,
+    "same_piece_identities": false,
+    "seconds": 60.92317997501232,
+    "shift_unavailable": "incomplete reference ladder",
+    "state_sha256": "a401f301e5b3d3c8be935cebebd846232c7d64a40809c05e416ad817fab49314",
+    "tied_rows": 0,
+    "unbounded_rows": 0
+  }
+}

@@ -9,6 +9,7 @@
 #include "utils/thread_pool.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -22,6 +23,7 @@
 #include <numeric>
 #include <optional>
 #include <set>
+#include <shared_mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
@@ -782,6 +784,9 @@ struct TraceCandidate {
     std::size_t reverseAttempts = 0;
     std::size_t reverseFailures = 0;
     double reverseSkippedLengthBaseVoxels = 0.0;
+    std::size_t coverageEpoch = 0;
+    bool coverageRechecked = false;
+    cv::Vec3d seedAxis{};
 };
 
 // Retain the original geometry, not the independently reconstructed reverse
@@ -804,6 +809,39 @@ void verifyDenseCandidate(
         if (!(geometry.length() > kEpsilon))
             continue;
         std::vector<Interval> intervals;
+        if (config.reversePrefixIntervalBaseVoxels > 0) {
+            std::size_t begin = 0, accepted = 0, checked = 0;
+            for (std::size_t end = 1; end < side.points.size(); ++end) {
+                if (end <= begin || (end + 1 < side.points.size() &&
+                    geometry.vertexArcs[end] - geometry.vertexArcs[checked] <
+                        config.reversePrefixIntervalBaseVoxels))
+                    continue;
+                const auto prefix = makePolylineArcGeometry(std::vector<cv::Vec3d>(
+                    side.points.begin() + begin, side.points.begin() + end + 1));
+                ++candidate.reverseAttempts;
+                const double remaining = verifyFiberReverseSpan(predictions, normals,
+                    denseConfig, prefix, prefix.length(), config.reverseNormalRadiusBaseVoxels,
+                    config.reverseTangentialRadiusBaseVoxels);
+                checked = end;
+                if (remaining <= kEpsilon) {
+                    accepted = end;
+                } else {
+                    ++candidate.reverseFailures;
+                    if (accepted > begin)
+                        intervals.push_back({geometry.vertexArcs[begin], geometry.vertexArcs[accepted]});
+                    // Start a new independent prefix at the next existing vertex.
+                    // Include this one-edge handoff gap in discarded-length accounting.
+                    const auto next = std::min(end + 1, side.points.size() - 1);
+                    candidate.reverseSkippedLengthBaseVoxels +=
+                        geometry.vertexArcs[next] - geometry.vertexArcs[accepted];
+                    begin = accepted = checked = next;
+                }
+            }
+            if (accepted > begin)
+                intervals.push_back({geometry.vertexArcs[begin], geometry.vertexArcs[accepted]});
+            // The shared materializer below expects end-to-seed interval order.
+            std::reverse(intervals.begin(), intervals.end());
+        } else {
         double startArc = geometry.length();
         while (startArc > kEpsilon) {
             ++candidate.reverseAttempts;
@@ -819,6 +857,7 @@ void verifyDenseCandidate(
                 verifiedArc - config.reverseBackoffBaseVoxels);
             candidate.reverseSkippedLengthBaseVoxels += verifiedArc - next;
             startArc = next;
+        }
         }
         const auto costAt = [&](double arc) {
             const auto sample = samplePolylineArc(geometry, arc);
@@ -1066,6 +1105,79 @@ Bucket bucketFor(const cv::Vec3d& point, double side)
     return {static_cast<std::int64_t>(std::floor(point[0] / side)), static_cast<std::int64_t>(std::floor(point[1] / side)), static_cast<std::int64_t>(std::floor(point[2] / side))};
 }
 
+// Append-only index. Workers see only their submission watermark; publication
+// cannot change the geometry of their speculative coverage snapshot.
+class AcceptedTraceCoverage {
+    struct Segment { cv::Vec3d a, delta, tangent; double squared; std::size_t owner; };
+    double radius_;
+    mutable std::shared_mutex mutex_;
+    std::vector<Segment> segments_;
+    std::map<Bucket, std::vector<std::size_t>> buckets_;
+public:
+    mutable std::atomic<std::size_t> queries{0}, tests{0};
+    explicit AcceptedTraceCoverage(double radius) : radius_(radius) {}
+    std::size_t epoch() const {
+        std::shared_lock lock(mutex_);
+        return segments_.size();
+    }
+    void insert(const FiberletCropTraceLine& line, std::size_t owner=0) {
+        std::unique_lock lock(mutex_);
+        for (std::size_t i=1; i<line.pointsBaseXYZ.size(); ++i) {
+            const auto a=line.pointsBaseXYZ[i-1], b=line.pointsBaseXYZ[i];
+            const auto d=b-a;
+            const double squared=d.dot(d);
+            if (squared<=kEpsilon) continue;
+            const auto id=segments_.size();
+            segments_.push_back({a,d,d/std::sqrt(squared),squared,owner});
+            cv::Vec3d lo,hi;
+            for(int j=0;j<3;++j) { lo[j]=std::min(a[j],b[j])-radius_; hi[j]=std::max(a[j],b[j])+radius_; }
+            const auto low=bucketFor(lo,radius_), high=bucketFor(hi,radius_);
+            for(auto x=low[0];x<=high[0];++x)
+                for(auto y=low[1];y<=high[1];++y)
+                    for(auto z=low[2];z<=high[2];++z)
+                        buckets_[{x,y,z}].push_back(id);
+        }
+    }
+    template<class Accept, class Visit>
+    bool visitMatches(const cv::Vec3d& point, const cv::Vec3d& tangent, std::size_t epoch,
+        const vc::lasagna::NormalSampler& normals, double normalScale,
+        const FiberletCropTraceConfig& config, Accept accept, Visit visit) const {
+        ++queries;
+        std::vector<Segment> local;
+        {
+            std::shared_lock lock(mutex_);
+            const auto found=buckets_.find(bucketFor(point,radius_));
+            if(found==buckets_.end()) return false;
+            for(const auto id:found->second) {
+                if(id>=epoch) break;
+                if(accept(segments_[id].owner)) local.push_back(segments_[id]);
+            }
+        }
+        // No index lock during normal sampling. Broad sphere and direction
+        // rejection precede the more expensive shared ellipse measurement.
+        const double cosine=std::cos(config.coverageDirectionDegrees*kPi/180.);
+        const auto axis=normalized(tangent);
+        tests.fetch_add(local.size(), std::memory_order_relaxed);
+        for(const auto& s:local) {
+            if(std::abs(axis.dot(s.tangent))+kEpsilon<cosine) continue;
+            const auto projection=s.a+s.delta*std::clamp((point-s.a).dot(s.delta)/s.squared,0.,1.);
+            const auto delta=point-projection;
+            if(delta.dot(delta)>radius_*radius_+kEpsilon) continue;
+            const auto measured=measureFiberReplayThreshold(point,projection,normals,normalScale,
+                config.coverageNormalRadiusBaseVoxels,
+                fiberletCropCoverageTangentialRadius(config)/config.coverageNormalRadiusBaseVoxels);
+            if(!fiberReplayThresholdExceeded(measured,config.coverageNormalRadiusBaseVoxels) && visit(s.owner)) return true;
+        }
+        return false;
+    }
+    bool covers(const cv::Vec3d& point, const cv::Vec3d& tangent, std::size_t epoch,
+        const vc::lasagna::NormalSampler& normals, double normalScale,
+        const FiberletCropTraceConfig& config) const {
+        return visitMatches(point,tangent,epoch,normals,normalScale,config,
+            [](std::size_t){return true;},[](std::size_t){return true;});
+    }
+};
+
 std::size_t suppressCoveredAnchors(
     const std::vector<cv::Vec3d>& line,
     const std::vector<FiberletStoredAnchor>& anchors,
@@ -1149,6 +1261,128 @@ std::size_t suppressCoveredAnchors(
 
 }  // namespace
 
+FiberPieceOverlapGraph measureFiberPieceOverlap(
+    const std::vector<FiberletCropTraceLine>& lines,
+    const vc::lasagna::NormalSampler& normals, double normalScale,
+    const FiberPieceOverlapConfig& config, std::span<const std::size_t> groups, bool bothDirections)
+{
+    if(!std::isfinite(config.normalRadiusBase) ||
+       !std::isfinite(config.tangentialRadiusBase) || !std::isfinite(config.sampleStepBase) ||
+       !(config.normalRadiusBase>0) || !(config.tangentialRadiusBase>0) ||
+       !(config.sampleStepBase>0) || !(config.fraction>=0 && config.fraction<=1) ||
+       !(config.directionDegrees>=0 && config.directionDegrees<=90) ||
+       !(normalScale>0) || !std::isfinite(normalScale) || config.threads<1)
+        throw std::invalid_argument("invalid piece overlap configuration");
+    FiberPieceOverlapGraph result;
+    const auto n=lines.size();
+    if (!groups.empty() && groups.size()!=n) throw std::invalid_argument("overlap group count mismatch");
+    result.lengthBase.assign(n,0);
+    AcceptedTraceCoverage index(std::max(config.normalRadiusBase,config.tangentialRadiusBase));
+    for(std::size_t i=0;i<n;++i) {
+        for(std::size_t j=1;j<lines[i].pointsBaseXYZ.size();++j) {
+            const double length=cv::norm(lines[i].pointsBaseXYZ[j]-lines[i].pointsBaseXYZ[j-1]);
+            if(!std::isfinite(length)) throw std::invalid_argument("nonfinite piece geometry");
+            result.lengthBase[i]+=length;
+        }
+        if(!(result.lengthBase[i]>0)) throw std::invalid_argument("empty piece geometry");
+        index.insert(lines[i],i);
+    }
+    FiberletCropTraceConfig gate;
+    gate.coverageNormalRadiusBaseVoxels=config.normalRadiusBase;
+    gate.coverageTangentialRadiusBaseVoxels=config.tangentialRadiusBase;
+    gate.coverageDirectionDegrees=config.directionDegrees;
+    result.shorterPairs.resize(n);
+    auto& shorterPairs=result.shorterPairs;
+    std::atomic<std::size_t> next{0};
+    std::exception_ptr error; std::mutex errorMutex;
+    const auto worker=[&] {
+        try {
+            for(auto i=next.fetch_add(1);i<n;i=next.fetch_add(1)) {
+                std::map<std::size_t,double> covered;
+                const auto& points=lines[i].pointsBaseXYZ;
+                for(std::size_t j=1;j<points.size();++j) {
+                    const auto delta=points[j]-points[j-1]; const double length=cv::norm(delta);
+                    if(length<=kEpsilon) continue;
+                    const auto count=static_cast<std::size_t>(std::ceil(length/config.sampleStepBase));
+                    const double weight=length/count;
+                    for(std::size_t s=0;s<count;++s) {
+                        std::set<std::size_t> matched;
+                        index.visitMatches(points[j-1]+delta*((s+.5)/count),delta,index.epoch(),
+                            normals,normalScale,gate,
+                            [&](std::size_t other){return other!=i && (groups.empty() || groups[i]!=groups[other]) &&
+                                (bothDirections || result.lengthBase[other]>result.lengthBase[i] ||
+                                (result.lengthBase[other]==result.lengthBase[i] && other>i));},
+                            [&](std::size_t other){matched.insert(other);return false;});
+                        for(auto other:matched) covered[other]+=weight;
+                    }
+                }
+                for(const auto& [other,length]:covered) {
+                    const double fraction=std::min(1.,length/result.lengthBase[i]);
+                    if(fraction>0) shorterPairs[i].emplace_back(other,fraction);
+                }
+            }
+        } catch(...) {std::lock_guard lock(errorMutex);if(!error)error=std::current_exception();next.store(n);}
+    };
+    std::vector<std::thread> workers;
+    const auto threads=normals.supportsConcurrentSampling()?std::min<std::size_t>(config.threads,n):1;
+    for(std::size_t i=1;i<threads;++i) workers.emplace_back(worker);
+    worker(); for(auto& thread:workers)thread.join(); if(error)std::rethrow_exception(error);
+    return result;
+}
+
+FiberPieceOverlapSelection selectFiberPieceOverlap(
+    const FiberPieceOverlapGraph& graph, const std::vector<double>& quality, double threshold)
+{
+    const auto n=graph.lengthBase.size();
+    if(quality.size()!=n || graph.shorterPairs.size()!=n || !(threshold>=0 && threshold<=1))
+        throw std::invalid_argument("invalid overlap graph/selection threshold");
+    FiberPieceOverlapSelection result;
+    result.lengthBase=graph.lengthBase;
+    result.suppressedBy.assign(n,-1);result.overlapFraction.assign(n,0);
+    for(std::size_t i=0;i<n;++i)
+        if(!std::isfinite(quality[i]) || !std::isfinite(result.lengthBase[i]) || !(result.lengthBase[i]>0))
+            throw std::invalid_argument("invalid overlap graph length/quality");
+    std::vector<std::vector<std::pair<std::size_t,double>>> neighbors(n);
+    for(std::size_t i=0;i<n;++i) {
+        std::optional<std::size_t> previous;
+        for(auto [other,fraction]:graph.shorterPairs[i]) {
+            if(other>=n || other==i || !(fraction>0 && fraction<=1) ||
+               (previous && other<=*previous) ||
+               !(result.lengthBase[other]>result.lengthBase[i] ||
+                 (result.lengthBase[other]==result.lengthBase[i] && other>i)))
+                throw std::invalid_argument("invalid or duplicate overlap graph pair");
+            previous=other;
+            if(fraction+1e-12>=threshold) {
+                neighbors[i].emplace_back(other,fraction);
+                neighbors[other].emplace_back(i,fraction);
+            }
+        }
+    }
+    std::vector<std::size_t> order(n);std::iota(order.begin(),order.end(),0);
+    std::sort(order.begin(),order.end(),[&](auto a,auto b){
+        if(quality[a]!=quality[b])return quality[a]>quality[b];
+        if(result.lengthBase[a]!=result.lengthBase[b])return result.lengthBase[a]>result.lengthBase[b];
+        return a<b;
+    });
+    for(auto i:order) {
+        if(result.suppressedBy[i]>=0)continue;
+        for(auto [other,fraction]:neighbors[i])if(result.suppressedBy[other]<0) {
+            result.suppressedBy[other]=static_cast<std::int64_t>(i);
+            result.overlapFraction[other]=fraction;
+        }
+    }
+    for(std::size_t i=0;i<n;++i)if(result.suppressedBy[i]<0)result.retained.push_back(i);
+    return result;
+}
+
+FiberPieceOverlapSelection selectFiberPieceOverlap(
+    const std::vector<FiberletCropTraceLine>& lines, const std::vector<double>& quality,
+    const vc::lasagna::NormalSampler& normals, double normalScale,
+    const FiberPieceOverlapConfig& config)
+{
+    return selectFiberPieceOverlap(measureFiberPieceOverlap(lines,normals,normalScale,config),quality,config.fraction);
+}
+
 FiberletCropTraceSearchBox fiberletCropTraceSearchBox(
     const FiberletCropTraceConfig& config)
 {
@@ -1192,12 +1426,14 @@ double fiberletCropCoverageTangentialRadius(const FiberletCropTraceConfig& confi
 static FiberletCropTraceResult traceCropCandidates(
     double predictionToBaseScale,
     bool concurrentQueries,
-    const std::function<TraceCandidate(const FiberletStoredAnchor&)>& traceCandidateAt,
+    const std::function<TraceCandidate(const FiberletStoredAnchor&, std::size_t)>& traceCandidateAt,
     std::vector<FiberletStoredAnchor> anchors,
     const vc::lasagna::NormalSampler& normalSampler,
     double normalWorkingToBaseScale,
     const FiberletCropTraceConfig& config,
-    const FiberletCropTraceProgress& progress)
+    const FiberletCropTraceProgress& progress,
+    AcceptedTraceCoverage* coverage = nullptr,
+    const std::function<void(TraceCandidate&)>& recheck = {})
 {
     (void)fiberletCropTraceSearchBox(config);
     if (config.beamWidth == 0 || config.maximumGeneratedStatesPerStep == 0 ||
@@ -1286,12 +1522,13 @@ static FiberletCropTraceResult traceCropCandidates(
              result.lines.size() >= config.maximumFibers);
     };
     const auto submit = [&](std::size_t ticket, std::size_t anchorIndex) {
-        const auto compute = [&, ticket, anchorIndex] {
+        const auto epoch=coverage ? coverage->epoch() : 0;
+        const auto compute = [&, ticket, anchorIndex, epoch] {
             Completion completion;
             completion.anchorIndex = anchorIndex;
             const auto started = std::chrono::steady_clock::now();
             try {
-                completion.candidate = traceCandidateAt(anchors[anchorIndex]);
+                completion.candidate = traceCandidateAt(anchors[anchorIndex], epoch);
             } catch (...) {
                 completion.failure = std::current_exception();
             }
@@ -1387,6 +1624,10 @@ static FiberletCropTraceResult traceCropCandidates(
             --activeAnchors;
             ++result.attemptedAnchors;
             auto& candidate = completion.candidate;
+            if(recheck) recheck(candidate);
+            result.coverageCommitRechecks += candidate.coverageRechecked;
+            result.coveredTraceStops += candidate.negative.termination == "covered_trace";
+            result.coveredTraceStops += candidate.positive.termination == "covered_trace";
             if (!candidate.hasUsableEdge) {
                 ++result.noEdgeAnchors;
             } else {
@@ -1439,6 +1680,7 @@ static FiberletCropTraceResult traceCropCandidates(
                         result.coveredAnchors += suppressed;
                         activeAnchors -= suppressed;
                         result.lines.push_back(std::move(line));
+                        if(coverage) coverage->insert(result.lines.back());
                     }
                 }
             }
@@ -1518,11 +1760,13 @@ FiberletCropTraceResult traceFiberletCrop(
     const FiberletCropTraceConfig& config,
     const FiberletCropTraceProgress& progress)
 {
+    if (config.stopAtCoveredTraces)
+        throw std::invalid_argument("Accepted-trace stopping requires dense beam tracing");
     if (config.reverseConsistency)
         throw std::invalid_argument("Reverse consistency requires dense beam tracing");
     const auto searchBox = fiberletCropTraceSearchBox(config);
     return traceCropCandidates(graph.predictionToBaseScale(), graph.supportsConcurrentQueries(),
-        [&](const auto& seed) {
+        [&](const auto& seed, std::size_t) {
             return traceCandidate(graph, seed, normalSampler, normalWorkingToBaseScale, config, searchBox);
         }, std::move(anchors), normalSampler, normalWorkingToBaseScale, config, progress);
 }
@@ -1550,19 +1794,73 @@ FiberletCropTraceResult traceDenseBeamCrop(
     const double traceScale = denseConfig.traceToBaseScale;
     if (!(traceScale > 0.0) || !std::isfinite(traceScale))
         throw std::invalid_argument("Dense crop trace scale must be positive and finite");
+    if (!std::isfinite(config.reversePrefixIntervalBaseVoxels) ||
+        config.reversePrefixIntervalBaseVoxels < 0 ||
+        (config.reversePrefixIntervalBaseVoxels > 0 && !config.reverseConsistency))
+        throw std::invalid_argument("Reverse prefix interval requires reverse consistency and a finite nonnegative spacing");
     auto traceConfig = denseConfig;
     traceConfig.parallelThreads = 1;
+    auto stopConfig=config;
+    stopConfig.coverageNormalRadiusBaseVoxels=config.coveredTraceNormalRadiusBaseVoxels.value_or(config.coverageNormalRadiusBaseVoxels);
+    stopConfig.coverageTangentialRadiusBaseVoxels=config.coveredTraceTangentialRadiusBaseVoxels.value_or(fiberletCropCoverageTangentialRadius(config));
+    if(!std::isfinite(stopConfig.coverageNormalRadiusBaseVoxels) || stopConfig.coverageNormalRadiusBaseVoxels<=0.)
+        throw std::invalid_argument("Covered-trace normal radius must be finite and positive");
+    AcceptedTraceCoverage coverage(std::max(fiberletCropCoverageTangentialRadius(stopConfig),
+        stopConfig.coverageNormalRadiusBaseVoxels));
+    const auto covered = [&](const cv::Vec3d& p, const cv::Vec3d& axis, std::size_t epoch) {
+        return config.stopAtCoveredTraces && epoch>0 &&
+            coverage.covers(p,axis,epoch,normalSampler,traceScale,stopConfig);
+    };
+    const auto recheck = [&](TraceCandidate& candidate) {
+        if(!config.stopAtCoveredTraces || !candidate.hasUsableEdge) return;
+        const auto epoch=coverage.epoch();
+        if(epoch==candidate.coverageEpoch) return;
+        bool changed=false;
+        for(auto* side:{&candidate.negative,&candidate.positive}) {
+            for(std::size_t i=0;i<side->points.size();++i) {
+                const auto axis=i==0 ? candidate.seedAxis : side->points[i]-side->points[i-1];
+                if(!covered(side->points[i],axis,epoch)) continue;
+                if(i+1<side->points.size()) {
+                    side->points.resize(i+1);
+                    side->cumulativeCosts.resize(i+1);
+                    if(config.captureStepCosts) side->originalStepCosts.resize(i);
+                    side->totalMetricCost=side->cumulativeCosts.back();
+                    // Match worker per-edge arithmetic for non-power-of-two scales too.
+                    side->pathLengthPredictionVoxels=0.;
+                    for(std::size_t j=1;j<side->points.size();++j)
+                        side->pathLengthPredictionVoxels+=length(side->points[j]-side->points[j-1])/predictionToBaseScale;
+                    side->fiberlets=i;
+                    changed=true;
+                }
+                changed=changed || side->termination!="covered_trace";
+                side->termination="covered_trace";
+                break;
+            }
+        }
+        if(changed) {
+            candidate.coverageRechecked=true;
+            candidate.verifiedLines.clear();
+            candidate.reverseAttempts=candidate.reverseFailures=0;
+            candidate.reverseSkippedLengthBaseVoxels=0.;
+            candidate.hasUsableEdge=candidate.negative.fiberlets+candidate.positive.fiberlets>0;
+            if(config.reverseConsistency && candidate.hasUsableEdge)
+                verifyDenseCandidate(candidate,predictions,normalSampler,traceConfig,predictionToBaseScale,config);
+        }
+    };
     const double distance = length(config.maximumBaseXYZ - config.minimumBaseXYZ) * 3.0 / traceScale;
-    return traceCropCandidates(predictionToBaseScale,
+    auto result=traceCropCandidates(predictionToBaseScale,
         predictions.supportsConcurrentSampling() && normalSampler.supportsConcurrentSampling(),
-        [&](const FiberletStoredAnchor& seed) {
+        [&](const FiberletStoredAnchor& seed, std::size_t epoch) {
             TraceCandidate candidate;
+            candidate.coverageEpoch=epoch;
             candidate.line.seed = seed.key;
             candidate.line.seedBaseXYZ = cv::Vec3d(seed.positionPredictionXYZ) * predictionToBaseScale;
             candidate.line.seedPresence = seed.predictionPresence;
             const auto axis = normalized(seed.fittedAxisXYZ);
+            candidate.seedAxis=axis;
             if (length(axis) <= kEpsilon)
                 return candidate;
+            if(covered(candidate.line.seedBaseXYZ,axis,epoch)) return candidate;
             // Canonical stored-grid anchors may fall in a hole in the trace
             // binding; treat these as unusable seeds, not a whole-crop failure.
             const cv::Vec3d traceStart(cv::Vec3f(candidate.line.seedBaseXYZ / traceScale));
@@ -1573,10 +1871,11 @@ FiberletCropTraceResult traceDenseBeamCrop(
             for (int sign : {-1, 1}) {
                 auto& side = sign < 0 ? candidate.negative : candidate.positive;
                 side.points.push_back(candidate.line.seedBaseXYZ);
-                if (config.reverseConsistency || config.captureStepCosts)
+                if (config.reverseConsistency || config.captureStepCosts || config.stopAtCoveredTraces)
                     side.cumulativeCosts.push_back(0.0);
                 double previousLoss = 0.0;
                 bool exited = false;
+                bool coverageStop = false;
                 const auto traced = traceFiberExtrapolation(predictions,
                     candidate.line.seedBaseXYZ / traceScale, axis * sign, distance,
                     traceConfig, &normalSampler, {},
@@ -1604,19 +1903,24 @@ FiberletCropTraceResult traceDenseBeamCrop(
                         previousLoss = cumulativeLoss;
                         side.pathLengthPredictionVoxels += length(retained - previous) / predictionToBaseScale;
                         side.points.push_back(retained);
-                        if (config.reverseConsistency || config.captureStepCosts)
+                        if (config.reverseConsistency || config.captureStepCosts || config.stopAtCoveredTraces)
                             side.cumulativeCosts.push_back(side.totalMetricCost);
                         ++side.fiberlets;
-                        return !exited;
+                        coverageStop=covered(retained,retained-previous,epoch);
+                        return !exited && !coverageStop;
                     });
-                side.termination = exited ? "crop_exit" : traced.reason;
+                side.termination = coverageStop ? "covered_trace" : (exited ? "crop_exit" : traced.reason);
             }
             candidate.hasUsableEdge = candidate.negative.fiberlets + candidate.positive.fiberlets > 0;
             if (config.reverseConsistency && candidate.hasUsableEdge)
                 verifyDenseCandidate(candidate, predictions, normalSampler,
                     traceConfig, predictionToBaseScale, config);
             return candidate;
-        }, std::move(anchors), normalSampler, traceScale, config, progress);
+        }, std::move(anchors), normalSampler, traceScale, config, progress,
+        config.stopAtCoveredTraces ? &coverage : nullptr,recheck);
+    result.coverageQueries=coverage.queries.load();
+    result.coverageSegmentTests=coverage.tests.load();
+    return result;
 }
 
 FiberDirectionClassification classifyFiberletCropDirections(

@@ -2917,6 +2917,23 @@ TEST_CASE("interior anchor cells reuse the canonical support stencil")
     CHECK(serial.profile.retainedObservations ==
           parallel.profile.retainedObservations);
     CHECK(serial.profile.validGradients == parallel.profile.validGradients);
+    auto manyConfig = serialConfig;
+    manyConfig.parallelThreads = 128;
+    const auto many = vc::fiber_tracer::extractRefinedFiberAnchorsForCells(
+        grid, manyConfig, sampler, cells);
+    REQUIRE(many.nonEmptyCells.size() == serial.nonEmptyCells.size());
+    for (size_t i = 0; i < serial.nonEmptyCells.size(); ++i) {
+        const auto& a = serial.nonEmptyCells[i];
+        const auto& b = many.nonEmptyCells[i];
+        CHECK(a.cellZYX == b.cellZYX);
+        REQUIRE(a.components.size() == b.components.size());
+        for (size_t j = 0; j < a.components.size(); ++j) {
+            CHECK(a.components[j].retained == b.components[j].retained);
+            CHECK(a.components[j].anchor.positionPredictionXYZ == b.components[j].anchor.positionPredictionXYZ);
+            CHECK(a.components[j].anchor.axisXYZ == b.components[j].anchor.axisXYZ);
+            CHECK(a.components[j].anchor.alignedSupport == b.components[j].anchor.alignedSupport);
+        }
+    }
     CHECK(serial.nonEmptyCells.size() == parallel.nonEmptyCells.size());
     for (size_t index = 0; index < serial.nonEmptyCells.size(); ++index) {
         CHECK(serial.nonEmptyCells[index].cellZYX ==
