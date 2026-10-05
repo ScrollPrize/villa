@@ -218,6 +218,22 @@ unchanged), in place of the traced or interpolated style, and marks every
 break point with the dotted amber rim. The flag is display-only in the map:
 it does not change heat-map seeding, winding evidence or publishing.
 
+## Overview bar during re-optimization
+
+The overview bar above the cut views places each control point at a
+fraction of its width. While a solve is running, or edits are queued for
+one in auto-reoptimize mode, the line on screen is provisional and its
+sampling changes with every landing, so the bar keeps the dot layout of the
+last settled geometry: existing control points stay where they were, a new
+control point appears at its distance along the line from its neighbour,
+measured against the settled layout (so it lands where the current-position
+marker stood when it was placed, whatever the provisional line's sampling),
+and only once nothing is running or queued do the dots move to their
+settled positions, in one step. The current-position marker, the gap
+and damaged spans and clicks on the bar all map through the same layout, so
+they stay consistent with the dots. In manual mode the spliced line is the
+geometry and the bar follows it at once.
+
 ## Span and control-point menus (strips)
 
 In either strip view a Ctrl+right-click opens either the **span menu** or the
