@@ -903,24 +903,6 @@
   color: var(--vc-text);
   margin: 0 0 12px;
 }
-/* Paired collapsible tiers (Senators | Citizens): two columns on desktop,
-   independently expandable (align-items: start), stacked under 768px. */
-.vc-landing .vc-tier-row {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 0 48px;
-  align-items: start;
-}
-@media (max-width: 768px) {
-  .vc-landing .vc-tier-row {
-    grid-template-columns: minmax(0, 1fr);
-  }
-}
-/* Inside a half-width column the roster tightens to two columns. */
-.vc-landing .vc-tier-row .vc-tier__grid {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-}
-
 .vc-landing .vc-tier__grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));

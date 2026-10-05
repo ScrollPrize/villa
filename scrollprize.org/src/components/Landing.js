@@ -1061,33 +1061,21 @@ export function Landing() {
               </a>
             </div>
             <SponsorTier
-              label="$200,000 and above"
-              title="Caesars"
+              label="$50,000 and above"
+              title="Senators"
               list={sponsors
-                .filter((s) => s.amount >= 200000)
+                .filter((s) => s.amount >= 50000)
                 .sort(sponsorOrder)}
             />
-            {/* Senators + Citizens expanders sit side by side on desktop
-                (vertical-space save); they stack on phones. */}
-            <div className="vc-tier-row">
-              <SponsorTier
-                label="$50,000 – $200,000"
-                title="Senators"
-                list={sponsors
-                  .filter((s) => s.amount >= 50000 && s.amount < 200000)
-                  .sort(sponsorOrder)}
-                collapsible
-              />
-              <SponsorTier
-                label="Up to $50,000"
-                title="Citizens"
-                list={sponsors
-                  .filter((s) => s.amount < 50000)
-                  .sort(sponsorOrder)}
-                dense
-                collapsible
-              />
-            </div>
+            <SponsorTier
+              label="Up to $50,000"
+              title="Citizens"
+              list={sponsors
+                .filter((s) => s.amount < 50000)
+                .sort(sponsorOrder)}
+              dense
+              collapsible
+            />
           </div>
         </section>
 
