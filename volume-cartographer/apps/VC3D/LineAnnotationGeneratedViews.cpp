@@ -47,9 +47,33 @@ QPointF generatedStripControlPointToScene(
     if (viewer && surface && std::isfinite(control.linePosition)) {
         const auto* points = surface->rawPointsPtr();
         const cv::Vec2f scale = surface->scale();
+        // A control known to lie on the line is placed at its arc length
+        // along the strip's centre line. Line positions index the session's
+        // live line, which the displayed strip may lag (a placement
+        // publishes its spliced controls before any landing, with the splice
+        // sampled at its own density), so an index would land the marker
+        // anywhere; arc length from the line start agrees between the two up
+        // to the edited span and drifts only by the span's length change.
+        if (control.onLine && std::isfinite(control.arcLength) && controlPositionMap.valid() &&
+            control.lineRevision != 0 && control.lineRevision == controlPositionMap.lineRevision &&
+            points && !points->empty()) {
+            const double arcColumn =
+                generatedStripGridColumnForArcLength(controlPositionMap, control.arcLength);
+            if (std::isfinite(arcColumn)) {
+                const cv::Vec2d surfacePoint = surface->gridToSurface(
+                    {arcColumn, static_cast<double>(points->rows / 2)});
+                const QPointF positionScene = viewer->surfaceCoordsToScene(
+                    static_cast<float>(surfacePoint[0]), static_cast<float>(surfacePoint[1]));
+                if (finiteScenePoint(positionScene)) {
+                    return positionScene;
+                }
+            }
+        }
+        // Every centre-line fallback below is on the displayed line.
+        const double shownPosition = generatedShownLinePosition(control);
         const double gridColumn = controlPositionMap.valid()
-            ? controlPositionMap.originalPositionToStripGridColumn(control.linePosition)
-            : control.linePosition;
+            ? controlPositionMap.originalPositionToStripGridColumn(shownPosition)
+            : shownPosition;
         const int column = static_cast<int>(std::lround(gridColumn));
         if (points && !points->empty() && scale[0] != 0.0f && scale[1] != 0.0f &&
             column >= 0 && column < points->cols) {
@@ -60,7 +84,7 @@ QPointF generatedStripControlPointToScene(
                  cv::norm(control.point - centerlinePoint) <= kOnCenterlineToleranceVx);
             if (onCenterline) {
                 const QPointF positionScene = generatedStripLinePositionToScene(
-                    viewer, surface, control.linePosition, &controlPositionMap);
+                    viewer, surface, shownPosition, &controlPositionMap);
                 if (finiteScenePoint(positionScene)) {
                     return positionScene;
                 }
@@ -73,7 +97,7 @@ QPointF generatedStripControlPointToScene(
             return pointScene;
         }
     }
-    return generatedStripLinePositionToScene(viewer, surface, control.linePosition,
+    return generatedStripLinePositionToScene(viewer, surface, generatedShownLinePosition(control),
                                              &controlPositionMap);
 }
 
@@ -568,7 +592,10 @@ std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
     bool hasSeedScene = false;
 
     if (overlay.useSurfaceCenterLine) {
-        auto* quad = dynamic_cast<QuadSurface*>(viewer->currentSurface());
+        // Through the held surface while the strip still shows its frame.
+        auto* quad = overlay.projectionSurface
+            ? overlay.projectionSurface.get()
+            : dynamic_cast<QuadSurface*>(viewer->currentSurface());
         const auto* points = quad ? quad->rawPointsPtr() : nullptr;
         if (points && !points->empty()) {
             const double maximumLinePosition = overlay.stripPositionMap.valid()
@@ -667,9 +694,12 @@ std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
                 }
             }
             for (const auto& control : overlay.controlPoints) {
-                if (!std::isfinite(control.linePosition) ||
-                    control.linePosition < 0.0 ||
-                    control.linePosition > maximumLinePosition) {
+                // Range-checked on the displayed line: a provisional
+                // control's own index may lie beyond this strip.
+                const double shownPosition = generatedShownLinePosition(control);
+                if (!std::isfinite(shownPosition) ||
+                    shownPosition < 0.0 ||
+                    shownPosition > maximumLinePosition) {
                     continue;
                 }
                 const QPointF controlScene =

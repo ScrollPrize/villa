@@ -871,6 +871,11 @@ private:
     void setSessionOptimizationState(LineAnnotationSession& session,
                                      SessionOptimizationState state);
     void refreshSessionOptimizationStatus(const LineAnnotationSession& session);
+    // Tells the pane's dialog whether a solve is running and whether edits
+    // are queued (the overview bar's settled-layout gate).
+    void syncDialogLineSolveActivity(const LineAnnotationSession& session);
+    // Source of LineControlPoint::identity (see controlMarkersForSession).
+    mutable uint64_t _nextControlIdentity = 1;
     bool placementAllowedByFocusBounds(const cv::Vec3d& point,
                                        bool suppressErrorDialogs) const;
     bool applyOptimizationTaskResult(LineAnnotationSession& session,

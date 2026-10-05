@@ -219,6 +219,10 @@ struct LineAnnotationController::LineAnnotationSession {
     // query fingerprint so a landed solve (or rollback) that happens to
     // reuse the previous vector's allocation is still seen as a change.
     uint64_t lineRevision = 0;
+    // A landing's epilogue holds the queue's pending request in a local
+    // while it publishes and then re-dispatches it: in that window the
+    // queue reads empty although work is still owed. Reported as pending.
+    bool detachedPendingWork = false;
     bool deferShowUntilGenerated = false;
     uint64_t fiberId = 0;
     std::string fiberUsername;
@@ -1374,6 +1378,7 @@ generatedControlMarkers(
         marker.point = toVec3f(control.volumePoint);
         marker.linePosition = control.linePosition;
         marker.controlIndex = i;
+        marker.identity = control.identity;
         marker.direction = control.direction;
         marker.isSeed = control.isSeed;
         marker.isKollesisTermination = vc3d::line_annotation::hasControlPointTag(
@@ -5938,6 +5943,13 @@ void LineAnnotationController::closeFiberWindowForSurface(const std::string& sur
 std::vector<vc3d::line_annotation::GeneratedOverlay::ControlPointMarker>
 LineAnnotationController::controlMarkersForSession(const LineAnnotationSession& session) const
 {
+    // Every control gets its session-lifetime identity before it is first
+    // published; the struct carries it through later edits.
+    for (const auto& control : session.controlPoints) {
+        if (control.identity == 0) {
+            control.identity = _nextControlIdentity++;
+        }
+    }
     auto markers = generatedControlMarkers(session.controlPoints, session.branches);
     // Same-orientation links (H-H / V-V) get the orange warning palette; an
     // unclassified fiber on either side keeps the default H-V colors.
@@ -5974,6 +5986,52 @@ LineAnnotationController::controlMarkersForSession(const LineAnnotationSession& 
         const float scale = static_cast<float>(session.fiberBaseToVolumeScale);
         for (auto& marker : markers) {
             marker.point *= scale;
+        }
+    }
+    // Arc lengths on the session's live line, the line the markers' positions
+    // index, in DISPLAY units (the strip map and the dialog's line are built
+    // from the display-scaled line, like marker.point above). The dialog may
+    // still hold the previous line (a placement publishes its spliced
+    // controls before any landing), so the overview bar takes distances from
+    // here, never from the positions.
+    {
+        const double displayScale = session.fiberBaseToVolumeScale;
+        const auto& points = session.optimizedLine.points;
+        std::vector<double> cumulative(points.size(), 0.0);
+        for (size_t i = 1; i < points.size(); ++i) {
+            const auto& a = points[i - 1].position;
+            const auto& b = points[i].position;
+            const bool finite = std::isfinite(a[0]) && std::isfinite(a[1]) && std::isfinite(a[2]) &&
+                                std::isfinite(b[0]) && std::isfinite(b[1]) && std::isfinite(b[2]);
+            cumulative[i] = cumulative[i - 1] + (finite ? cv::norm(b - a) : 0.0);
+        }
+        const double total = cumulative.empty() ? 0.0 : cumulative.back();
+        for (size_t index = 0; index < markers.size(); ++index) {
+            auto& marker = markers[index];
+            if (cumulative.empty() || !std::isfinite(marker.linePosition)) {
+                continue;
+            }
+            const double last = static_cast<double>(cumulative.size() - 1);
+            const double p = std::clamp(marker.linePosition, 0.0, last);
+            const size_t lower = static_cast<size_t>(std::floor(p));
+            const size_t upper = std::min(lower + 1, cumulative.size() - 1);
+            const double t = p - static_cast<double>(lower);
+            marker.arcLength = (cumulative[lower] * (1.0 - t) + cumulative[upper] * t) * displayScale;
+            marker.lineArcLength = total * displayScale;
+            marker.lineRevision = session.lineRevision;
+            // On the line: the control's own point (session space, before the
+            // display scaling above) is where the line is at its position.
+            if (index < session.controlPoints.size()) {
+                const cv::Vec3d linePoint =
+                    points[lower].position * (1.0 - t) + points[upper].position * t;
+                const cv::Vec3d delta = session.controlPoints[index].volumePoint - linePoint;
+                // The line passes through its controls as vertices; this
+                // only has to absorb float rounding of the stored points.
+                constexpr double kOnLineToleranceVx = 1.0e-2;
+                marker.onLine = std::isfinite(delta[0]) && std::isfinite(delta[1]) &&
+                                std::isfinite(delta[2]) &&
+                                delta.dot(delta) <= kOnLineToleranceVx * kOnLineToleranceVx;
+            }
         }
     }
     return markers;
@@ -8121,6 +8179,7 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
         // running, its landing refreshes the views instead.)
         (void)materializeGeneratedViews(session);
     }
+    syncDialogLineSolveActivity(session);
 }
 
 std::optional<uint64_t> LineAnnotationController::createLinkedSeedFiber(
@@ -11499,6 +11558,16 @@ void LineAnnotationController::setSessionOptimizationState(
     refreshSessionOptimizationStatus(session);
 }
 
+void LineAnnotationController::syncDialogLineSolveActivity(const LineAnnotationSession& session)
+{
+    auto* pane = paneForSurface(session.surfaceName);
+    if (pane && pane->dialog) {
+        pane->dialog->setLineSolveActivity(
+            session.taskState == LineAnnotationSession::TaskState::Running,
+            session.solveQueue.hasPending() || session.detachedPendingWork);
+    }
+}
+
 bool LineAnnotationController::applyOptimizationTaskResult(LineAnnotationSession& session,
                                                            OptimizationTaskResult task,
                                                            bool updateGeneratedViews,
@@ -11959,6 +12028,7 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session,
         if (pane->dialog) {
             pane->dialog->setOptimizationBusy(true);
         }
+        syncDialogLineSolveActivity(session);
     }
     const bool localOptimization = !forceFullOptimization &&
         activeStart >= 0 &&
@@ -12135,6 +12205,7 @@ LineAnnotationController::makeFiberModeOptimizationRequest(
 void LineAnnotationController::scheduleSolveDispatch(LineAnnotationSession& session)
 {
     using Queue = vc3d::line_annotation::OptimizationCoalescingQueue;
+    syncDialogLineSolveActivity(session);
     if (session.solveQueue.state() != Queue::State::Idle) {
         // A solve is in flight (or shutdown): finishOptimization's epilogue
         // dispatches the pending request.
@@ -12298,6 +12369,7 @@ void LineAnnotationController::startFiberModeOptimization(
         // can keep being placed while this solve runs; edits coalesce.
         pane->dialog->setOptimizationBusy(true, false);
     }
+    syncDialogLineSolveActivity(session);
     std::weak_ptr<LineAnnotationSession> weakSession;
     if (pane) {
         weakSession = pane->session;
@@ -12421,6 +12493,7 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
             if (pane->dialog) {
                 pane->dialog->setOptimizationBusy(false, false);
             }
+            syncDialogLineSolveActivity(session);
             return;
         }
         // Render-job model: before falling back to a wholesale discard, try
@@ -12558,6 +12631,7 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
             session.taskState = LineAnnotationSession::TaskState::Idle;
         }
         auto pending = session.solveQueue.finishSolve();
+        session.detachedPendingWork = pending.requested;
         const bool autoReoptimize = !pane->dialog ||
             pane->dialog->reoptimizationMode() ==
                 LineAnnotationDialog::ReoptimizationMode::AutoReoptimize;
@@ -12584,11 +12658,13 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
                                               pending.fullLine);
             }
         }
+        session.detachedPendingWork = false;
         if (pane->dialog) {
             pane->dialog->setOptimizationBusy(
                 session.taskState == LineAnnotationSession::TaskState::Running,
                 false);
         }
+        syncDialogLineSolveActivity(session);
         return;
     }
     // Publishable: return the queue to Idle before applying, so an apply
@@ -12596,6 +12672,7 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
     // pending request from a caller that coalesced without mutating) can
     // begin a new solve cleanly.
     auto pendingAfterPublish = session.solveQueue.finishSolve();
+    session.detachedPendingWork = pendingAfterPublish.requested;
     session.runningSolveDirtySegments.clear();
     session.runningSolveControlMap.reset();
     session.runningSolveEditedSpans.clear();
@@ -12716,11 +12793,13 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
                                           pendingAfterPublish.fullLine);
         }
     }
+    session.detachedPendingWork = false;
     if (pane->dialog) {
         pane->dialog->setOptimizationBusy(
             session.taskState == LineAnnotationSession::TaskState::Running,
             false);
     }
+    syncDialogLineSolveActivity(session);
 }
 
 void LineAnnotationController::finishFiberAlignmentMetrics(
@@ -13727,6 +13806,7 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
     generatedViews.linePoints = std::move(linePoints);
     generatedViews.lineUpVectors = views.lineUpVectors;
     generatedViews.stripPositionMap = views.stripPositionMap;
+    generatedViews.stripPositionMap.lineRevision = session.lineRevision;
     generatedViews.lineNormals = std::move(orientedNormals);
     if (hasManualNormals) generatedViews.displayLineNormals = session.displayField.normals;
     {
@@ -13771,6 +13851,7 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
         session.branches, session.fiberBaseToVolumeScale);
     generatedViews.seedPoint = seedPoint;
     generatedViews.focusPoint = focusPoint;
+    generatedViews.lineRevision = session.lineRevision;
     generatedViews.seedLineIndex = static_cast<int>(session.optimizedLine.points.size() / 2);
     generatedViews.initialCurrentCutFollowsStripMouse =
         !session.disableInitialGeneratedHoverFollow;
@@ -13885,6 +13966,10 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
         !isAlignmentPendingForFiber(session.fiberId)) {
         requestFiberAlignmentMetrics(session.fiberId);
     }
+    // Every line publish is followed by a solve-activity report, so the
+    // dialog's overview bar can confirm the geometry whatever path published
+    // it (the synchronous finalizations included).
+    syncDialogLineSolveActivity(session);
     // See the note at the other success return: only a completed build may claim an
     // orientation.
     session.orientationEpoch = _orientationEpoch;
