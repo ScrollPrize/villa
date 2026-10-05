@@ -37,9 +37,9 @@ class FlowConfig(CoordinateRegressionConfig):
     flow_selection: str = 'retry'
     flow_zero_start: bool = True
     # Tracing-time bar for Gaussian-start proposals (0: the gate's own threshold). A higher bar offsets the
-    # optimism of taking the best of many noisy candidates; their confidences are shifted down by the
-    # difference, so the gate (and the tracer's commit check) sees them clear the threshold only above it,
-    # and in the ranking a sample must beat the zero start by that margin.
+    # optimism of taking the best of many noisy candidates: a sample plane counts as confident only above
+    # it. Planes below the bar are pushed below the gate (so the tracer's commit check agrees); planes
+    # above it keep their confidence, so eligible samples are ranked against the zero start as they are.
     flow_sample_threshold: float = 0.
 
     def __post_init__(self):
@@ -237,8 +237,9 @@ class FlowFollower(ObservationFollower):
         if self.cfg.flow_samples and margin > 0:
             first = 1 if self.cfg.flow_zero_start else 0
             confidence = output['refinement_confidence']
-            shifted = torch.cat((confidence[:, :first], (confidence[:, first:]-margin).clamp_min(0)), 1)
-            output = dict(output, refinement_confidence=shifted)
+            samples = confidence[:, first:]
+            barred = torch.where(samples >= self.cfg.flow_sample_threshold, samples, (samples-margin).clamp_min(0))
+            output = dict(output, refinement_confidence=torch.cat((confidence[:, :first], barred), 1))
         return select_refinement(output, self.cfg, confidence_threshold, n_commit,
                                  retry=self.cfg.flow_selection == 'retry')
 

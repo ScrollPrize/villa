@@ -289,10 +289,14 @@ def test_sample_threshold_holds_samples_to_a_higher_bar_than_the_zero_start():
                   refinement_mask=torch.ones(1, 3, dtype=torch.bool),
                   **{f'refinement_{k}': confidence for k in ('hazard_logits', 'confidence_logits')})
     out = model.select_prediction(output, .5)
-    # Sample 1 (0.75) falls below the 0.8 bar; sample 2 (0.85) clears it and, after the 0.3 margin,
-    # still outranks the zero start (0.55 > 0.52).
+    # Sample 1 (0.75) falls below the 0.8 bar and cannot commit; sample 2 (0.85) clears it and is ranked
+    # on its own confidence, above the zero start.
     assert int(out['selected_refinement']) == 2
-    torch.testing.assert_close(out['confidence'], torch.full((1, cfg.n_future), .55))
-    # A sample must beat the zero start by the margin: 0.85-0.3 < 0.6 keeps the zero start.
-    output['refinement_confidence'] = torch.tensor([[[.6]*cfg.n_future, [.75]*cfg.n_future, [.85]*cfg.n_future]])
-    assert int(model.select_prediction(output, .5)['selected_refinement']) == 0
+    torch.testing.assert_close(out['confidence'], torch.full((1, cfg.n_future), .85))
+    # Below the bar a sample is out of the running, however it compares with the zero start.
+    output['refinement_confidence'] = torch.tensor([[[.52]*cfg.n_future, [.75]*cfg.n_future, [.78]*cfg.n_future]])
+    out = model.select_prediction(output, .5)
+    assert int(out['selected_refinement']) == 0
+    from vesuvius.neural_tracing.fiber_follow.tracing.policy import commit_prefix
+    barred = model.select_prediction(dict(output, refinement_mask=torch.tensor([[False, False, True]])), .5)
+    assert int(commit_prefix(barred['points'], barred['confidence'], .5, cfg.n_future)[0]) == 0

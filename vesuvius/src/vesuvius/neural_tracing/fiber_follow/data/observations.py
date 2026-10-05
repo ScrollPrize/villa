@@ -21,8 +21,9 @@ from vesuvius.neural_tracing.fiber_follow.models.model import CoordinateRegressi
 
 def image_crop(items, vol, crop, pool=None):
     """CT-only crops, normalized identically for training and tracing."""
+    from vesuvius.neural_tracing.fiber_follow.data.volume import model_crop_volume
     tensor = empty_image_batch((len(items), 1, crop.depth, crop.width, crop.width))
-    scalar_crops(items, vol, crop, pool, presence=False, out=tensor.numpy())
+    scalar_crops(items, model_crop_volume(vol), crop, pool, presence=False, out=tensor.numpy())
     return tensor
 
 
@@ -38,7 +39,7 @@ class ObservationBuilder:
             # A trace start takes its CT seed heading only once the image is built.
             yield heading_free_bounds(item['pos'],self.cfg.fine,vol.input_scale)
         predictor = frame_predictor(self.cfg)
-        yield from crop_frame_bounds(item,self.cfg.fine,vol,predictor)
+        yield from crop_frame_bounds(item,self.cfg.fine,vol,predictor,include_crop=getattr(vol,'crop_view',None) is None)
         if self.cfg.memory == 'decisions':
             from vesuvius.neural_tracing.fiber_follow.data.decision_memory import memory_bounds
             yield from memory_bounds(item,self.cfg,vol,predictor)

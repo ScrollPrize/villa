@@ -87,19 +87,21 @@ def layer_capture(model):
                     lambda m, a, y, index=index: spatial(f'encoder block {index+1}', y, True)))
         handles.append(encoder.norm.register_forward_hook(lambda m, a, y: spatial('encoder output', y, True)))
 
+        # The decoder has one query per path plane (all crop planes for whole-crop models); the scorer one per proposal plane.
+        queries = dict(decoder=len(getattr(model.cfg, 'path_plane_values', range(model.cfg.n_future))), scorer=model.cfg.n_future)
         for head, modules in (('decoder', model.decoder.layers), ('scorer', model.confidence_scorer.layers)):
             for index, module in enumerate(modules):
                 def wrap(original, head=head, index=index):
                     def forward(*args, **kwargs):
                         if index == 0:
-                            record[head].setdefault('input', []).append(args[0].detach().float().reshape(-1, model.cfg.n_future, model.cfg.hidden)[0].cpu())
+                            record[head].setdefault('input', []).append(args[0].detach().float().reshape(-1, queries[head], model.cfg.hidden)[0].cpu())
                         result = original(*args, **kwargs)
-                        record[head].setdefault(f'block {index+1}', []).append(result.detach().float().reshape(-1, model.cfg.n_future, model.cfg.hidden)[0].cpu())
+                        record[head].setdefault(f'block {index+1}', []).append(result.detach().float().reshape(-1, queries[head], model.cfg.hidden)[0].cpu())
                         return result
                     return forward
                 patch(head, module, 'forward_draws' if head == 'decoder' and hasattr(model, 'velocity_field') else 'forward_cached', wrap)
         handles.append(model.decoder.norm.register_forward_hook(
-            lambda m, a, y: record['decoder'].setdefault('output', []).append(y.detach().float().reshape(-1, model.cfg.n_future, model.cfg.hidden)[0].cpu())))
+            lambda m, a, y: record['decoder'].setdefault('output', []).append(y.detach().float().reshape(-1, queries['decoder'], model.cfg.hidden)[0].cpu())))
 
         if getattr(model, 'history_encoder', None) is None:  # no memory: nothing to capture below
             yield record

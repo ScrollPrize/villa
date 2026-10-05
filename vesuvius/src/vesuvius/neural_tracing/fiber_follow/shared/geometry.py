@@ -15,6 +15,14 @@ import torch
 import torch.nn.functional as F
 
 
+def crop_path_planes(crop, step=1.0):
+    """Forward coordinates (trace voxels, multiples of ``step``) of every path plane inside ``crop``, behind and ahead
+    of the head; the whole-crop path head predicts one lateral point per plane."""
+    lo = int(np.ceil(-crop.behind*crop.spacing/step-1e-9))
+    hi = int(np.floor((crop.depth-1-crop.behind)*crop.spacing/step+1e-9))
+    return np.arange(lo, hi+1, dtype=np.float64)*step
+
+
 @dataclass(frozen=True)
 class CropSpec:
     depth: int = 64  # samples along f

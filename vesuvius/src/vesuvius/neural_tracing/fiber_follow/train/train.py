@@ -13,6 +13,7 @@ import torch
 
 from vesuvius.neural_tracing.fiber_follow.data.data import DATA_POLICY, FollowDataset, OnPolicyStates, SampleConfig, TaskBudget, ZBand, fiber_identities, fiber_manifest, load_fibers, split_fibers
 from vesuvius.neural_tracing.fiber_follow.shared.experiment import read_manifest
+from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
 from vesuvius.neural_tracing.fiber_follow.train.online import OnlineCollector
 from vesuvius.neural_tracing.fiber_follow.tracing.policy import OperatingPolicy
 from vesuvius.neural_tracing.fiber_follow.train.runloop import RunLog, lr_at, prepare_run_dir, read_checkpoint, save_checkpoint as write_checkpoint, update_ema, training_rng_state, resume_training, raise_open_file_limit
@@ -236,10 +237,12 @@ def model_config_from_args(args, checkpoint=None):
             raise ValueError('Model type must match checkpoint')
         return cfg
     cls = FlowConfig if args.model == 'flow_matching' else CoordinateRegressionConfig
-    options = {key: getattr(args, key) for key in ('stem_channels', 'stem_blocks', 'stem', 'memory',
+    options = {key: getattr(args, key) for key in ('stem_channels', 'stem_blocks', 'stem', 'memory', 'path_planes', 'tube_head',
         'identity_dim', 'identity_temperature', 'identity_objective', 'identity_map', 'identity_feedback', 'hidden',
         'encoder_ffn', 'decoder_layers', 'decoder_ffn', 'scorer_layers', 'activation_checkpointing')}
     options['layers'] = args.axial_layers
+    options['fine'] = CropSpec(depth=args.crop_depth, width=args.crop_width, behind=args.crop_behind,
+                               spacing=args.crop_spacing)
     if cls is FlowConfig:
         options.update({key: getattr(args, key) for key in (
             'flow_steps', 'flow_draws', 'flow_samples', 'flow_sample_scale', 'flow_time_conditioning',
@@ -453,7 +456,7 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
                      confidence_weight=.5, ema_decay=.999, ema_ramp=True, n_commit=None, compute_metrics=True,
                      history_grad_clip=HISTORY_GRAD_CLIP, rest_grad_clip=REST_GRAD_CLIP,
                      diagnostic=None, live_continuation=None, ledger=None, identity_weight=0.,
-                     identity_exclude_synthetic=False):
+                     identity_exclude_synthetic=False, tube_weight=1., tube_sigma=1.5):
     """One equally weighted task loss per independent supervised decision."""
     prepare_training(model, getattr(model, 'training_batch_size', 2))
     total = observed = sum(len(batch['hist']) for batch in batches)
@@ -519,6 +522,12 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
             geometry = terms['geometry_per_state'].sum()/denominator
             confidence = terms['confidence_per_state'].sum()/denominator
             loss = geometry + confidence_weight*confidence
+            if 'tube_logits' in output:
+                from vesuvius.neural_tracing.fiber_follow.models.whole_crop import tube_loss
+                tube, tube_counts = tube_loss(output['tube_logits'], batch, model.cfg.fine, tube_sigma)
+                loss = loss + tube_weight*tube.sum()/denominator
+                accumulate(sums, 'tube_loss_sum', tube.detach().sum())
+                accumulate(sums, 'tube_states', torch.ones_like(tube).sum())
             if 'identity_loss_per_state' in output:
                 loss = loss + identity_weight*output['identity_loss_per_state'].sum()/denominator
             if 'identity_logits' in output:
@@ -633,7 +642,10 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
         sums['identity'] = identity
     if compute_metrics:
         sums['decisions'] = summarize_decisions(decisions, commit_window(model.cfg, n_commit))
-    sums['prediction_loss_type'] = 'flow' if model.cfg.model_type == 'flow_matching' else 'geometry'
+    sums['prediction_loss_type'] = ('flow' if model.cfg.model_type == 'flow_matching' else
+                                    'whole-crop geometry' if model.cfg.path_planes == 'crop' else 'geometry')
+    if 'tube_states' in sums:
+        sums['tube_loss'] = sums['tube_loss_sum']/max(1., sums['tube_states'])
     sums['prediction_loss'] = sums['geometry']
     if model.cfg.model_type == 'flow_matching':
         sums['flow'] = sums['geometry']
@@ -704,6 +716,16 @@ def build_parser():
     ap.add_argument('--scorer-layers', type=int, default=CoordinateRegressionConfig.scorer_layers,
                     help='Causal segment survival decoder depth')
     ap.add_argument('--axial-layers', type=int, default=CoordinateRegressionConfig.layers)
+    crop = CoordinateRegressionConfig.__dataclass_fields__['fine'].default_factory()
+    ap.add_argument('--crop-depth', type=int, default=crop.depth,
+                    help='Model crop samples along the heading (multiple of four)')
+    ap.add_argument('--crop-width', type=int, default=crop.width,
+                    help='Model crop samples across the heading, both lateral axes (multiple of four)')
+    ap.add_argument('--crop-behind', type=int, default=crop.behind,
+                    help='Model crop samples behind the head along the heading')
+    ap.add_argument('--crop-spacing', type=float, default=crop.spacing,
+                    help='Trace voxels per crop sample. The CT level read is set per source in the dataset config; '
+                         'with the current sources 0.5 is one sample per level-0 CT voxel')
     ap.add_argument('--stem', choices=('residual', 'stride2'), default=CoordinateRegressionConfig.stem,
                     help="Image stem: 'residual' full-resolution stem, or 'stride2' light stem")
     ap.add_argument('--memory', choices=('slabs', 'decisions', 'none'), default=CoordinateRegressionConfig.memory,
@@ -717,6 +739,14 @@ def build_parser():
                     help='With --memory decisions: width of the linear projection for the memory-identity '
                          'InfoNCE loss (0 disables it)')
     ap.add_argument('--identity-temperature', type=float, default=CoordinateRegressionConfig.identity_temperature)
+    ap.add_argument('--path-planes', choices=('future', 'crop'), default=CoordinateRegressionConfig.path_planes,
+                    help="Path head: 'future' planes 1..n_future, or 'crop' one point per crop plane behind and ahead "
+                         "of the head, trained toward the original fiber wherever it is (planes 1..n_future stay the "
+                         "committed, scored and measured proposal)")
+    ap.add_argument('--tube-head', action=argparse.BooleanOptionalAction, default=CoordinateRegressionConfig.tube_head,
+                    help='Dense Gaussian-tube head around the original fiber over the whole crop (auxiliary loss)')
+    ap.add_argument('--tube-sigma', type=float, default=1.5, help='Tube target width (trace voxels)')
+    ap.add_argument('--tube-weight', type=float, default=1., help='Tube loss coefficient')
     ap.add_argument('--identity-weight', type=float, default=.1,
                     help='Memory-identity loss coefficient (InfoNCE or verification)')
     ap.add_argument('--identity-objective', choices=('infonce', 'verify', 'readout'),
@@ -964,7 +994,8 @@ def main(argv=None):
                           future_step=cfg.future_step, recent_history_points=cfg.n_history,
                           startup_shares=tuple(args.startup_shares), excursion_probability=args.excursion_probability,
                           excursion_amplitude=tuple(args.excursion_amplitude), excursion_rise=tuple(args.excursion_rise),
-                          label_tolerance=args.tolerance, max_recovery_distance=cfg.max_recovery_distance)
+                          label_tolerance=args.tolerance, max_recovery_distance=cfg.max_recovery_distance,
+                          crop_targets=getattr(cfg, 'path_planes', 'future') == 'crop' or getattr(cfg, 'tube_head', False))
     policy = training_policy(cfg, args.n_commit)
     progress('Loading manifest and fiber annotations')
     bank_band = ZBand(*(v/spec.grid_scale for v in args.val_z))
@@ -1236,6 +1267,7 @@ def main(argv=None):
                 n_commit=args.n_commit, compute_metrics=step % args.log_every == 0 or step == args.steps,
                 history_grad_clip=args.history_grad_clip, rest_grad_clip=args.rest_grad_clip,
                 identity_weight=args.identity_weight, identity_exclude_synthetic=args.identity_exclude_synthetic,
+                tube_weight=args.tube_weight, tube_sigma=args.tube_sigma,
                 diagnostic=diagnostic, live_continuation=live_continuation, ledger=ledger)
             observed_states += metrics['observed_states']
             interval_states += metrics['observed_states']

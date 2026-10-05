@@ -200,6 +200,9 @@ class SampleConfig:
     label_tolerance: float = 1.5  # confidence-label tolerance; separate from the departure threshold
     max_recovery_distance: float = 6.0
     dense_substeps: int = 4
+    # Whole-crop targets (path_planes='crop' models): the original fiber's crossing of every crop plane and its
+    # curve through the crop (Gaussian tube), wherever the head is.
+    crop_targets: bool = False
 
     def __post_init__(self):
         shares = np.asarray(self.startup_shares, np.float64)
@@ -295,6 +298,56 @@ def plane_targets(p, s, t, t_end, pos, frame, planes):
             ab[k] = (1 - w) * loc[i, :2] + w * loc[i + 1, :2]
             m[k] = 1.0
     return ab, m
+
+
+CROP_CURVE_POINTS = 512  # original-fiber curve samples (1 vox apart) kept for the whole-crop tube target
+
+
+def crop_plane_targets(p, s, t, pos, frame, planes, half_width):
+    """Original-fiber crossing of every crop plane, searched along the fiber from arc ``t`` (forward for planes ahead
+    of the matched point, backward for planes behind it); the crossing nearest ``t`` along the fiber wins. Planes
+    without a crossing inside the crop's lateral extent are unknown. Returns (P, 2) lateral points and a (P,) mask."""
+    ab = np.zeros((len(planes), 2), np.float32)
+    mask = np.zeros(len(planes), np.float32)
+    c_t = float(((interp_at(p, s, np.array([t]))[0]-pos) @ frame)[2])
+    for direction, select in ((1., planes > c_t), (-1., planes <= c_t)):
+        if not select.any():
+            continue
+        span = 2.5*float(np.abs(planes[select]-c_t).max())+8.
+        end = float(np.clip(t+direction*span, 0., s[-1]))
+        inner = s[(s > min(t, end)) & (s < max(t, end))]
+        arc = np.r_[t, inner if direction > 0 else inner[::-1], end]
+        loc = (interp_at(p, s, arc)-pos) @ frame
+        c = loc[:, 2]
+        for k in np.flatnonzero(select):
+            ck = planes[k]
+            hit = np.flatnonzero((c[:-1] < ck) & (c[1:] >= ck) if direction > 0 else (c[:-1] >= ck) & (c[1:] < ck))
+            if not len(hit):
+                continue
+            i = hit[0]
+            w = (ck-c[i])/(c[i+1]-c[i]) if c[i+1] != c[i] else 0.
+            point = (1-w)*loc[i, :2]+w*loc[i+1, :2]
+            if np.abs(point).max() <= half_width:
+                ab[k], mask[k] = point, 1.
+    return ab, mask
+
+
+def crop_curve_targets(fiber, p, s, t, reverse, pos, frame, crop):
+    """Original-fiber curve through the crop for the tube target: CROP_CURVE_POINTS samples 1 vox apart around
+    traversal arc ``t`` in crop-local coordinates, a validity mask, and whether each window end is an untagged
+    annotation end (the fiber may continue unannotated there)."""
+    lateral = (crop.width-1)*crop.spacing/2
+    back = 2*crop.behind*crop.spacing+lateral
+    ahead = 2*(crop.depth-1-crop.behind)*crop.spacing+lateral
+    scale = min(1., (CROP_CURVE_POINTS-1)/(back+ahead))
+    lo, hi = t-back*scale, t+ahead*scale
+    arcs = lo+np.arange(CROP_CURVE_POINTS, dtype=np.float64)
+    valid = (arcs >= 0) & (arcs <= s[-1]) & (arcs <= hi)
+    curve = np.zeros((CROP_CURVE_POINTS, 3), np.float32)
+    curve[valid] = (interp_at(p, s, arcs[valid])-pos) @ frame
+    tags = fiber.endpoint_stop[::-1] if reverse else fiber.endpoint_stop
+    open_ends = np.array([lo < 0 and not tags[0], hi > s[-1] and not tags[1]])
+    return curve, valid, open_ends
 
 
 def traversal_curve(fiber, reverse):
@@ -507,11 +560,19 @@ def continuation_targets(fiber, t, reverse, pos, frame, cfg):
     end = (p[-1]-pos) @ frame
     # Only expose endpoint labels when it is within the local traversal window.
     known = fiber.endpoint_stop[0 if reverse else 1] and s[-1]-t <= 2.5*cfg.future_s[-1]
-    return dict(gt_history=gt_history.astype(np.float32), gt_history_mask=gt_history_mask,
-                fut_local=(fut-pos) @ frame, fmask=fmask,
-                plane_ab=ab, plane_mask=mask, planes=cfg.future_s,
-                dense_ab=dense_ab, dense_mask=dense_mask, dense_planes=dense_planes,
-                end_local=end, endpoint_known=float(known))
+    out = dict(gt_history=gt_history.astype(np.float32), gt_history_mask=gt_history_mask,
+               fut_local=(fut-pos) @ frame, fmask=fmask,
+               plane_ab=ab, plane_mask=mask, planes=cfg.future_s,
+               dense_ab=dense_ab, dense_mask=dense_mask, dense_planes=dense_planes,
+               end_local=end, endpoint_known=float(known))
+    if getattr(cfg, 'crop_targets', False):
+        from vesuvius.neural_tracing.fiber_follow.shared.geometry import crop_path_planes
+        planes = crop_path_planes(cfg.crop, cfg.future_step)
+        out['crop_ab'], out['crop_mask'] = crop_plane_targets(p, s, t, pos, frame, planes,
+                                                              (cfg.crop.width-1)*cfg.crop.spacing/2)
+        out['crop_curve'], out['crop_curve_mask'], out['crop_curve_open_ends'] = crop_curve_targets(
+            fiber, p, s, t, reverse, pos, frame, cfg.crop)
+    return out
 
 
 def refresh_frame_targets(item):
@@ -904,6 +965,12 @@ class FollowDataset(torch.utils.data.IterableDataset):
         from vesuvius.neural_tracing.fiber_follow.tracing.heading import frame_prefetch_bounds
         return [bound for item in items for bound in frame_prefetch_bounds(item,self.cfg.crop,vol.input_scale)]
 
+    def crop_prefetch_bounds(self, items, vol):
+        """Model-crop footprints in the crop-level array (any orientation), when crops read another CT level."""
+        from vesuvius.neural_tracing.fiber_follow.tracing.heading import heading_free_bounds
+        view = getattr(vol, 'crop_view', None)
+        return None if view is None else [heading_free_bounds(item['pos'], self.cfg.crop, view.input_scale) for item in items]
+
     def prefetch_items(self, items, vol, *, required=False):
         if self.remote_prefetch is None or not items:
             return
@@ -912,10 +979,14 @@ class FollowDataset(torch.utils.data.IterableDataset):
         if not required and self.remote_prefetch_lookahead:
             return
         bounds = self.prefetch_bounds(items,vol)
-        if required:
-            self.remote_prefetch.ensure(vol.ct,bounds)
-        else:
-            self.remote_prefetch.submit(vol.ct,bounds)
+        crop_bounds = self.crop_prefetch_bounds(items, vol)
+        for reader, reads in ((vol.ct, bounds), (getattr(getattr(vol, 'crop_view', None), 'ct', None), crop_bounds)):
+            if reads is None:
+                continue
+            if required:
+                self.remote_prefetch.ensure(reader,reads)
+            else:
+                self.remote_prefetch.submit(reader,reads)
 
     def resolve_seeds(self, items, vol, rng, windows):
         """CT seed headings; a seed without CT orientation is rejected and its task redrawn."""
@@ -964,6 +1035,9 @@ class FollowDataset(torch.utils.data.IterableDataset):
             if lookahead:
                 self.remote_prefetch.lookahead(vol.ct,
                     [bounds for _,bounds in pending],scope=id(self))
+                if getattr(vol, 'crop_view', None) is not None:
+                    self.remote_prefetch.lookahead(vol.crop_view.ct,
+                        [self.crop_prefetch_bounds(plan, vol) for plan,_ in pending],scope=id(self))
             items, bounds = pending.popleft()
             live_outcomes = None
             if self.live_continuation is not None:
@@ -974,6 +1048,8 @@ class FollowDataset(torch.utils.data.IterableDataset):
                 bounds = self.prefetch_bounds(items, vol) if lookahead else None
             if lookahead:
                 self.remote_prefetch.ensure(vol.ct,bounds)
+                if getattr(vol, 'crop_view', None) is not None:
+                    self.remote_prefetch.ensure(vol.crop_view.ct, self.crop_prefetch_bounds(items, vol))
             else:
                 self.prefetch_items(items,vol,required=True)
             seed_rejections += self.resolve_seeds(items, vol, live_rng, windows)
@@ -1109,6 +1185,15 @@ def collate_targets(items):
             out[key] = st(key)
         for key in ('geometry_valid', 'confidence_valid'):
             out[key] = torch.tensor([bool(it[key]) for it in items], dtype=torch.bool)
+        if 'crop_ab' in items[0]:
+            # Whole-crop targets need a usable original-fiber correspondence, at any distance from the head.
+            usable = torch.tensor([bool(it.get('trace_facts', {}).get('match_valid', True))
+                                   and not bool(it.get('trace_facts', {}).get('match_ambiguous', False)) for it in items])
+            out['crop_ab'] = st('crop_ab')
+            out['crop_mask'] = st('crop_mask')*usable[:, None]
+            out['crop_curve'] = st('crop_curve')
+            out['crop_curve_mask'] = torch.from_numpy(np.stack([it['crop_curve_mask'] for it in items]))&usable[:, None]
+            out['crop_curve_open_ends'] = torch.from_numpy(np.stack([it['crop_curve_open_ends'] for it in items]))
         for key in ('supervision', 'supervision_reason'):
             out[key] = torch.tensor([int(it[key]) for it in items], dtype=torch.long)
     if 'source' in items[0]:

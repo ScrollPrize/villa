@@ -316,6 +316,10 @@ class FiberVolumeSpec:
     load_presence: bool = True  # False: CT metadata alone defines tracing bounds.
     cache_dir: str | None = None  # Persistent uncompressed remote CT chunks.
     ct_normalization: dict | None = None  # Bound at startup, persisted in run JSON/checkpoints.
+    # Model crops from another level of the same CT store (e.g. level 1); seed headings, CT frames and the learned
+    # frame predictor keep reading ``ct_level``. None: model crops read ``ct_level`` too.
+    crop_ct_level: int | None = None
+    crop_ct_grid_scale: float | None = None  # base voxels per crop-level CT voxel
 
     @property
     def mode(self) -> str:
@@ -326,6 +330,9 @@ class FiberVolumeSpec:
         # Omit an unspecified cache location from portable volume metadata.
         if self.cache_dir is None:
             result.pop('cache_dir')
+        for key in ('crop_ct_level', 'crop_ct_grid_scale'):  # unchanged metadata for single-level volumes
+            if result[key] is None:
+                result.pop(key)
         return result
 
 
@@ -354,6 +361,28 @@ def _grid_metadata(array_path: Path):
     return axes, scale.get('coordinateTransformations'), dataset.get('coordinateTransformations')
 
 
+class CropView:
+    """The reader of model crops when they come from another CT level (``FiberVolumeSpec.crop_ct_level``):
+    the same trace-grid geometry and normalization record, its own array and source voxels per trace voxel."""
+    def __init__(self, volume, ct, input_scale):
+        if not float(input_scale).is_integer():
+            raise ValueError('Crop CT sampling requires an integer number of CT voxels per trace voxel')
+        if ct.dtype != np.dtype('uint8'):
+            raise ValueError('CT intensity normalization currently requires uint8 data')
+        expected = np.asarray(volume.ct.shape)*input_scale/volume.input_scale
+        if np.any(np.abs(np.asarray(ct.shape)-expected) > 1):
+            raise ValueError(f'Crop CT shape {ct.shape} does not align with the main CT level')
+        self.ct, self.input_scale, self.spec, self.shape, self.presence = ct, float(input_scale), volume.spec, volume.shape, volume.presence
+
+    def raw_block(self, start, size):
+        return self.ct.read(start, size)[None]
+
+
+def model_crop_volume(vol):
+    """The reader of model (and memory) crops: the crop-level view when configured, else the volume itself."""
+    return getattr(vol, 'crop_view', None) or vol
+
+
 class FiberVolume:
     """Model-image readers plus presence for seed initialization.
 
@@ -378,9 +407,11 @@ class FiberVolume:
         if not spec.ct_zarr:
             raise ValueError("CT input mode needs ct_zarr")
         # Native CT is the larger field; presence keeps its own cache.
-        ct = (RemoteChunkedArray(spec.ct_zarr, spec.ct_level, spec.cache_dir, int(cache_bytes * .75),cache_only=cache_only)
-              if spec.ct_zarr.startswith(('s3://','http://','https://')) else
-              ChunkedArray(os.path.join(spec.ct_zarr, str(spec.ct_level)), int(cache_bytes * 0.75)))
+        open_level = lambda level, size: (RemoteChunkedArray(spec.ct_zarr, level, spec.cache_dir, size, cache_only=cache_only)
+            if spec.ct_zarr.startswith(('s3://','http://','https://')) else
+            ChunkedArray(os.path.join(spec.ct_zarr, str(level)), size))
+        split = spec.crop_ct_level is not None
+        ct = open_level(spec.ct_level, int(cache_bytes*(.25 if split else .75)))
         expected = np.asarray(self.presence.shape)*spec.grid_scale/spec.ct_grid_scale if self.presence is not None else np.asarray(ct.shape)
         if np.any(np.abs(np.asarray(ct.shape)-expected) > 1):
             raise ValueError(
@@ -395,6 +426,12 @@ class FiberVolume:
             validate_record(spec.ct_normalization, spec)
         self.shape = (self.presence.shape if self.presence is not None else
                       tuple(np.ceil(np.asarray(self.ct.shape)/self.input_scale).astype(int)))
+        self.crop_view = None
+        if split:
+            if not spec.crop_ct_grid_scale or spec.crop_ct_grid_scale <= 0:
+                raise ValueError('A crop CT level needs its positive grid scale')
+            array = open_level(spec.crop_ct_level, int(cache_bytes*.5))
+            self.crop_view = CropView(self, array, spec.grid_scale/spec.crop_ct_grid_scale)
 
     def presence_for_seeding(self):
         """Explicit seed-selection dependency, never opened for CT-only model crops."""

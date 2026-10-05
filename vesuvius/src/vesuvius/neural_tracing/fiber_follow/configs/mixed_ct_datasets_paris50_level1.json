@@ -1,0 +1,71 @@
+{
+  "version": 1,
+  "cache_dir": "/mnt/raid_nvme/volume_cache",
+  "sources": [
+    {
+      "name": "paris4",
+      "kind": "paris4",
+      "weight": 0.5,
+      "fibers": "/mnt/raid_nvme/spiral_dataset_working/fibers",
+      "fiber_zarrs": "/mnt/raid_nvme/spiral_dataset_working/fiber_zarrs",
+      "ct": "/mnt/raid_nvme/volpkgs/s1_2um_ds2.volpkg/volumes/s1_ds2.zarr",
+      "manifest": "/home/sean/Documents/villa4/vesuvius/src/vesuvius/neural_tracing/fiber_follow/output/single_path_v11_preparation/seeds.json",
+      "val_z": [
+        45000.0,
+        48500.0
+      ],
+      "negative_bank": "/home/sean/Documents/villa4/vesuvius/src/vesuvius/neural_tracing/fiber_follow/output/neighbor_samples_r0_32_l80_160_v2",
+      "grid_scale": 8.0,
+      "ct_grid_scale": 4.0,
+      "ct_level": 0,
+      "validation": {
+        "strategy": "fiber_hash",
+        "fraction": 0.1,
+        "seed": 7349
+      },
+      "crop_ct_level": 1,
+      "crop_ct_grid_scale": 8.0
+    },
+    {
+      "name": "0175A_5mm_v1",
+      "kind": "afv",
+      "weight": 0.25,
+      "path": "../datasets/automated_fiber_volumes/0175A_5mm_v1.afv",
+      "sha256": "d4374c646e4fb9020ea0b76b8254bc1586cdedbdaa170278ce97fceea41ffe4e",
+      "coordinate_space": "PHerc0175A/20250521115057",
+      "ct": "s3://vesuvius-challenge-open-data/PHerc0175A/volumes/20250521115057-8.640um-1.2m-116keV-masked.zarr",
+      "ct_level": 0,
+      "ct_grid_scale": 1.0,
+      "grid_scale": 2.0,
+      "native_voxel_size_um": 8.64,
+      "validation": {
+        "strategy": "fiber_hash",
+        "seed": 7349,
+        "count": 406
+      },
+      "crop_ct_level": 1,
+      "crop_ct_grid_scale": 2.0
+    },
+    {
+      "name": "1447_5mm_v1",
+      "kind": "afv",
+      "weight": 0.25,
+      "path": "../datasets/automated_fiber_volumes/1447_5mm_v1.afv",
+      "sha256": "e235b5235b3dfef879037a0267e7a50f5a2ba791ffdcc16c2fade3a306705fa2",
+      "coordinate_space": "PHerc1447/20250521151220",
+      "ct": "s3://vesuvius-challenge-open-data/PHerc1447/volumes/20250521151220-8.640um-1.2m-116keV-masked.zarr",
+      "ct_level": 0,
+      "ct_grid_scale": 1.0,
+      "grid_scale": 2.0,
+      "native_voxel_size_um": 8.64,
+      "validation": {
+        "strategy": "fiber_hash",
+        "seed": 7349,
+        "count": 406
+      },
+      "crop_ct_level": 1,
+      "crop_ct_grid_scale": 2.0
+    }
+  ],
+  "description": "level-1 model crops: crop_ct_level/crop_ct_grid_scale per source; seed headings, CT frames and the learned frame predictor keep ct_level"
+}

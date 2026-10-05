@@ -179,7 +179,8 @@ def memory_inputs(items, vol, cfg, pool=None):
     shape = (len(observations), 1, cfg.fine.depth, cfg.fine.width, cfg.fine.width)
     if observations:
         crops = empty_image_batch(shape)
-        scalar_crops(observations, vol, cfg.fine, pool, presence=False, out=crops.numpy())
+        from vesuvius.neural_tracing.fiber_follow.data.volume import model_crop_volume
+        scalar_crops(observations, model_crop_volume(vol), cfg.fine, pool, presence=False, out=crops.numpy())
     else:
         crops = torch.zeros(shape)
     references = torch.from_numpy(np.stack([o['reference_points'] for o in observations]).astype(np.float32)

@@ -21,10 +21,18 @@ PRIMARY_OPTIONS = ('fibers', 'fiber_zarrs', 'ct', 'manifest', 'val_z', 'negative
 DATASET_PATH_KEYS = tuple(k for k in PRIMARY_OPTIONS if k != 'val_z')+('path',)
 
 
+def crop_level_options(source):
+    """Optional model-crop CT level of a dataset-config source (``crop_ct_level``, ``crop_ct_grid_scale``)."""
+    if source.get('crop_ct_level') is None:
+        return {}
+    return dict(crop_ct_level=int(source['crop_ct_level']), crop_ct_grid_scale=float(source['crop_ct_grid_scale']))
+
+
 def ct_source_spec(source, cache_dir):
     return FiberVolumeSpec(source.get('fiber_zarrs', ''), ct_zarr=source['ct'],
         ct_level=int(source.get('ct_level', 0)), ct_grid_scale=float(source.get('ct_grid_scale', 1.)),
-        grid_scale=float(source['grid_scale']), inputs='ct', load_presence=False, cache_dir=cache_dir)
+        grid_scale=float(source['grid_scale']), inputs='ct', load_presence=False, cache_dir=cache_dir,
+        **crop_level_options(source))
 
 
 def primary_source_spec(document, *, fiber_zarrs=None, ct=None):
@@ -34,7 +42,7 @@ def primary_source_spec(document, *, fiber_zarrs=None, ct=None):
         ct_zarr=ct if ct is not None else source.get('ct'),
         ct_level=source.get('ct_level', 0), ct_grid_scale=source.get('ct_grid_scale', 4.),
         grid_scale=source.get('grid_scale', 8.), inputs='ct',
-        load_presence=False, cache_dir=document['cache_dir'] if document else None)
+        load_presence=False, cache_dir=document['cache_dir'] if document else None, **crop_level_options(source))
 
 
 def read_dataset_config(path):
@@ -86,7 +94,9 @@ def same_sources(recorded, document):
         if relocate and key in DATASET_PATH_KEYS and isinstance(value, str) and '://' not in value:
             return recorded_path(value)
         return value
-    splits = lambda value, relocate: [{k: place(k, v, relocate) for k, v in s.items() if k != 'weight'}
+    # Weights and the model-crop CT level change sampling/reading, not which fibers are held out.
+    ignored = ('weight', 'crop_ct_level', 'crop_ct_grid_scale')
+    splits = lambda value, relocate: [{k: place(k, v, relocate) for k, v in s.items() if k not in ignored}
                                       for s in (value or {}).get('sources', [])]
     return splits(recorded, True) == splits(document, False)
 

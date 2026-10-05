@@ -45,6 +45,10 @@ class CoordinateRegressionConfig:
     identity_objective: str = 'infonce'
     identity_map: bool = False  # verify/readout: the dense identity field enters the decoder/scorer image tokens
     identity_feedback: bool = False  # verify/readout: field samples enter scorer segment queries and retry fusion
+    # 'future': the path is planes 1..n_future; 'crop': one point per crop plane behind and ahead of the head
+    # (whole_crop.py), supervised on the original fiber; planes 1..n_future remain the committed proposal.
+    path_planes: str = 'future'
+    tube_head: bool = False  # dense Gaussian-tube head around the original fiber (whole_crop.py)
     frame_checkpoint: str | None = None  # frozen heading/normal model used by crop builders
     frame_checkpoint_sha256: str | None = None
 
@@ -86,6 +90,25 @@ class CoordinateRegressionConfig:
             raise ValueError('Future horizon exceeds fine image')
         if not isinstance(self.recurrent_refinement_steps, int) or self.recurrent_refinement_steps < 0:
             raise ValueError('Recurrent refinement steps must be a nonnegative integer')
+        if self.path_planes not in ('future', 'crop'):
+            raise ValueError("Path planes must be 'future' or 'crop'")
+        if (self.path_planes == 'crop' or self.tube_head) and self.model_type != 'coordinate_regression':
+            raise ValueError('Whole-crop path and tube heads are implemented for coordinate regression only')
+
+    @property
+    def path_plane_values(self):
+        """Forward coordinates of the decoder's path planes."""
+        import numpy as np
+        if self.path_planes == 'future':
+            return self.future_step*np.arange(1, self.n_future+1, dtype=np.float64)
+        from vesuvius.neural_tracing.fiber_follow.shared.geometry import crop_path_planes
+        return crop_path_planes(self.fine, self.future_step)
+
+    @property
+    def proposal_slice(self):
+        """Path-plane indices of the committed proposal (planes 1..n_future)."""
+        start = int(round(float(-self.path_plane_values[0])/self.future_step))+1 if self.path_planes == 'crop' else 0
+        return slice(start, start+self.n_future)
 
     @property
     def input_channels(self):
@@ -174,6 +197,8 @@ def select_refinement(output, cfg, confidence_threshold=DEFAULT_CONFIDENCE, n_co
     result = dict(output, selected_refinement=selected)
     for name in ('points', 'hazard_logits', 'confidence_logits', 'confidence'):
         result[name] = output['refinement_'+name][index, selected]
+    if 'refinement_crop_points' in output:
+        result['crop_points'] = output['refinement_crop_points'][index, selected]
     return result
 
 
@@ -466,7 +491,8 @@ class ObservationFollower(nn.Module):
 
     def query_features(self, ctx, initial):
         patches = self.patches(ctx.get('fine_fp32', ctx['fine']),initial).to(ctx['fine'].dtype)
-        return torch.cat((patches,initial[...,2:]/(self.cfg.n_future*self.cfg.future_step)),-1)
+        scale = getattr(self, 'query_scale', self.cfg.n_future*self.cfg.future_step)
+        return torch.cat((patches,initial[...,2:]/scale),-1)
 
     def evidence(self, ctx, points):
         values, support = self.sample_local(ctx.get('deep_fp32', ctx['deep']), points)
@@ -726,6 +752,16 @@ class CoordinateRegressionFollower(ObservationFollower):
         self.coordinates = nn.Linear(h,2)
         nn.init.normal_(self.coordinates.weight,std=.005)
         nn.init.zeros_(self.coordinates.bias)
+        if cfg.path_planes == 'crop':
+            values = cfg.path_plane_values
+            self.register_buffer('path_planes', torch.tensor(values, dtype=torch.float32), persistent=False)
+        # Plain Python values (compiled graphs must not trace the numpy that defines them).
+        self.proposal = cfg.proposal_slice
+        self.query_scale = (cfg.n_future*cfg.future_step if cfg.path_planes == 'future'
+                            else float(abs(cfg.path_plane_values).max()))
+        if cfg.tube_head:
+            from .whole_crop import TubeHead
+            self.tube = TubeHead(cfg)
         if cfg.recurrent_refinement_steps:
             # Spatial evidence, previous coordinates, detached failure/survival.
             width = cfg.path_evidence_width+3+2
@@ -759,8 +795,9 @@ class CoordinateRegressionFollower(ObservationFollower):
         # These locations initialize feature queries, not output constraints.
         # Forward distance distinguishes the queries; self-attention couples
         # them and cross-attention can retrieve evidence anywhere in the crop.
-        reference = hist.new_zeros(len(hist), cfg.n_future, 3)
-        reference[..., 2] = self.planes
+        planes = self.path_planes if cfg.path_planes == 'crop' else self.planes
+        reference = hist.new_zeros(len(hist), len(planes), 3)
+        reference[..., 2] = planes
         query = self.query(self.query_features(ctx, reference))
         # Attached features and image projections are reused for this decision.
         projected = [layer.project_memory(memory)
@@ -769,9 +806,17 @@ class CoordinateRegressionFollower(ObservationFollower):
         points = self.decode_coordinates(decoded)
         return decoded, points, projected, padding
 
+    def crop_points(self, decoded):
+        """Whole-crop path (B, P, 3): one lateral point per crop plane; no first-connection bound (the commit's
+        recovery limit decides whether a far proposal may be committed)."""
+        lateral = self.cfg.lateral_limit*torch.tanh(self.coordinates(decoded).float())
+        return torch.cat((lateral, self.path_planes[None, :, None].expand(len(decoded), -1, -1)), -1)
+
     def decode_coordinates(self, decoded):
         """The same absolute-coordinate readout and bounds for every proposal."""
         cfg = self.cfg
+        if cfg.path_planes == 'crop':
+            return self.crop_points(decoded)[:, self.proposal]
         lateral = cfg.lateral_limit*torch.tanh(self.coordinates(decoded).float())
         first_limit = math.sqrt(max(0., cfg.max_recovery_distance**2-cfg.future_step**2))
         first = lateral[:, :1]
@@ -821,9 +866,15 @@ class CoordinateRegressionFollower(ObservationFollower):
         return self.proposal_output(initial, refinements, scores, valid)
 
     def refine_prediction(self, ctx, points, decoded, hazards, confidence, projected, padding, stage_embedding):
-        evidence = self.evidence(ctx, points)
         # Geometry cannot teach the scorer to manufacture convenient feedback.
         feedback = torch.stack((hazards.sigmoid(), confidence), -1).detach()
+        if self.cfg.path_planes == 'crop':
+            # Every crop plane is refined; scorer feedback exists for the proposal planes only.
+            points = self.crop_points(decoded)
+            full = feedback.new_zeros(*points.shape[:2], 2)
+            full[:, self.proposal] = feedback
+            feedback = full
+        evidence = self.evidence(ctx, points)
         refreshed = self.refinement_fusion(torch.cat((evidence, points/16., feedback), -1))
         if self.cfg.identity_feedback:
             # The field carries no gradient, so geometry cannot shape the verifier's answer.
@@ -842,6 +893,8 @@ class CoordinateRegressionFollower(ObservationFollower):
         from vesuvius.neural_tracing.fiber_follow.models.survival_confidence import survival_predictions
         ctx = self.context(x, hist, hmask)
         decoded, points, projected, padding = self.prepare_prediction(ctx, hist)
+        crop = self.cfg.path_planes == 'crop'
+        crop_paths = [self.crop_points(decoded)] if crop else None
         initial = points
         hazards = self.hazard_logits(ctx, points)
         logits, confidence = survival_predictions(hazards)
@@ -856,6 +909,8 @@ class CoordinateRegressionFollower(ObservationFollower):
                 projected, padding, self.refinement_stage.weight[stage])
             decoded = torch.where(active[:, None, None], next_decoded, decoded)
             points = torch.where(active[:, None, None], next_points, points)
+            if crop:
+                crop_paths.append(self.crop_points(decoded))
             next_hazards = self.hazard_logits(ctx, points)
             next_logits, next_confidence = survival_predictions(next_hazards)
             hazards, logits, confidence = (torch.where(active[:, None], new, old) for new, old in
@@ -864,6 +919,10 @@ class CoordinateRegressionFollower(ObservationFollower):
             scores.append((hazards, logits, confidence))
             valid.append(active)
         out = self.proposal_output(initial, refinements, scores, valid)
+        if crop:
+            out['refinement_crop_points'] = torch.stack(crop_paths, 1)
+        if self.cfg.tube_head:
+            out['tube_logits'] = self.tube(ctx['deep'])
         if 'memory_entry' in ctx:
             out['memory_entry'] = ctx['memory_entry']
         out.update(self.identity_terms(ctx, x))

@@ -139,12 +139,18 @@ def loss_terms(output, batch, cfg, tolerance=1.5, *, n_commit=None):
     # The last attempted pass gets 75%; earlier passes share 25%. Survival averages attempts
     # so adding feedback iterations does not multiply the confidence loss weight.
     geometry_losses, confidence_losses = [], []
-    for curve, hazards in zip(output['refinement_points'].unbind(1),
-                              output['refinement_hazard_logits'].unbind(1)):
-        dense = F.interpolate(curve[..., :2].transpose(1, 2), size=mask.shape[1],
-                              mode='linear', align_corners=True).transpose(1, 2)
-        error = F.smooth_l1_loss(dense, target, beta=1., reduction='none').mean(-1)
-        geometry_losses.append(window_mean(error, mask, near))
+    crop_paths = output.get('refinement_crop_points')
+    for attempt, (curve, hazards) in enumerate(zip(output['refinement_points'].unbind(1),
+                                                   output['refinement_hazard_logits'].unbind(1))):
+        if crop_paths is not None:
+            # Whole-crop path: every crop plane, toward the original fiber wherever it is (whole_crop.py).
+            from vesuvius.neural_tracing.fiber_follow.models.whole_crop import crop_path_loss
+            geometry_losses.append(crop_path_loss(crop_paths[:, attempt], batch))
+        else:
+            dense = F.interpolate(curve[..., :2].transpose(1, 2), size=mask.shape[1],
+                                  mode='linear', align_corners=True).transpose(1, 2)
+            error = F.smooth_l1_loss(dense, target, beta=1., reduction='none').mean(-1)
+            geometry_losses.append(window_mean(error, mask, near))
         labels, known, _, _ = proposal_labels(curve, batch, cfg, tolerance)
         confidence_losses.append(survival_loss(hazards, labels, known)[0])
     attempts = output['refinement_mask'].bool()
@@ -172,7 +178,7 @@ def loss_terms(output, batch, cfg, tolerance=1.5, *, n_commit=None):
                  confidence_terminal_states=(labeled & (batch['supervision'] == TERMINAL)).sum(),
                  confidence_recoverable_states=(labeled & (batch['supervision'] == RECOVERABLE)).sum(),
                  positive_targets_per_state=positive, negative_targets_per_state=negative,
-                 geometry_states_per_state=mask.any(-1),
+                 geometry_states_per_state=mask.any(-1) if crop_paths is None else batch['crop_mask'].bool().any(-1),
                  geometry_count=mask.sum(), confidence_count=supervised_known.sum(),
                  error_sum=torch.where(mask, (predicted-target).norm(dim=-1), 0.).sum(),
                  correct_count=(labels*known).sum())
