@@ -239,7 +239,7 @@ def decision_memory_rows(model, cpu_batch, device, memory=None):
 
 @torch.no_grad()
 def render_microbatch(model, cpu_batch, out, step, *, device, n_commit, tolerance,
-                      dataset_names=(), training_metrics=None, memory=None):
+                      dataset_names=(), training_metrics=None, memory=None, tube_sigma=1.5):
     """One sheet per image type; every current-microbatch row, in loader order."""
     from vesuvius.neural_tracing.fiber_follow.train.train import move_batch
     from vesuvius.neural_tracing.fiber_follow.evaluation.diagnostic_plots import plot_sheets
@@ -248,7 +248,8 @@ def render_microbatch(model, cpu_batch, out, step, *, device, n_commit, toleranc
     started = time.perf_counter()
     was_training = model.training
     model.eval()
-    examples, rows = [], []
+    examples, rows, whole = [], [], []
+    whole_crop = getattr(model.cfg, 'path_planes', 'future') == 'crop' or getattr(model.cfg, 'tube_head', False)
     inference_seconds = 0.
     try:
         if getattr(model.cfg, 'memory', 'slabs') == 'decisions':
@@ -262,6 +263,15 @@ def render_microbatch(model, cpu_batch, out, step, *, device, n_commit, toleranc
                 with layer_capture(model) as layers:
                     output = model(batch['x'], batch['hist'], batch['hmask'], n_commit=n_commit)
             details = decision_details(output, batch, model.cfg, n_commit, tolerance)
+            whole_metrics = {}
+            if whole_crop:
+                # Whole-crop path and tube exist in the training forward only (same EMA weights, eval mode).
+                from vesuvius.neural_tracing.fiber_follow.evaluation.diagnostic_plots import whole_crop_example
+                with torch.autocast('cuda', dtype=torch.bfloat16, enabled=torch.device(device).type == 'cuda'):
+                    full = model.select_prediction(model.training_forward(
+                        batch['x'], batch['hist'], batch['hmask'], batch['hist'].new_full((), .5)), .5, n_commit)
+                view, whole_metrics = whole_crop_example(batch, full, model.cfg, f'{i:02d}', tube_sigma)
+                whole.append(view)
             output, batch = cpu_values(output), cpu_values(batch)
             inference_seconds += time.perf_counter()-begin  # CPU transfer above synchronizes CUDA.
             dataset_id = int(batch['dataset_id'][0]) if 'dataset_id' in batch else 0
@@ -288,7 +298,7 @@ def render_microbatch(model, cpu_batch, out, step, *, device, n_commit, toleranc
                 prefix_brier=float((confidence[known]-details['labels'][known]).square().mean()) if known.any() else None,
                 **({} if 'history_valid' not in batch['x'] else dict(
                     history_valid=batch['x']['history_valid'][0], history_ages=batch['x']['history_ages'][0])),
-                ct_statistics=tensor_stats(batch['x']['fine'][:, 0]), activation_statistics=stats)
+                ct_statistics=tensor_stats(batch['x']['fine'][:, 0]), activation_statistics=stats, **whole_metrics)
             for key in ('generator_attention', 'scorer_attention'):
                 if key in layers['history']:
                     row[key] = layers['history'][key]
@@ -297,6 +307,9 @@ def render_microbatch(model, cpu_batch, out, step, *, device, n_commit, toleranc
             from vesuvius.neural_tracing.fiber_follow.evaluation.diagnostic_plots import display_example
             examples.append(display_example(batch, output, details, layers, model.cfg, label, row))
         plot_sheets(examples, model.cfg, folder, step)
+        if whole:
+            from vesuvius.neural_tracing.fiber_follow.evaluation.diagnostic_plots import plot_whole_crop
+            plot_whole_crop(whole, model.cfg, folder/'whole_crop.png', step)
         errors = [r['mean_error'] for r in rows if r['mean_error'] is not None]
         report = dict(step=step, split='current_training_microbatch', model='EMA', model_type=model.model_type, examples=len(rows),
             n_commit=n_commit, tolerance=tolerance,

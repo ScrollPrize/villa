@@ -32,10 +32,15 @@ class TraceParams:
     # Rows per model forward call; 0 runs every active trace in one call. Chunking
     # bounds memory only: each row's inputs and outputs are unchanged.
     forward_chunk: int = 0
+    # Model arithmetic on CUDA: 'bf16' autocast, or 'fp32' (no autocast; TF32 follows torch.backends flags).
+    # fp32 keeps batch-composition rounding differences from growing into flipped decisions.
+    precision: str = 'bf16'
 
     def __post_init__(self):
         if self.n_commit < 1 or self.max_len <= 0 or not 0 <= self.confidence <= 1 or self.forward_chunk < 0:
             raise ValueError('Invalid rollout parameters')
+        if self.precision not in ('bf16', 'fp32'):
+            raise ValueError("Rollout precision is 'bf16' or 'fp32'")
 
     @classmethod
     def from_policy(cls, policy, **kwargs):
@@ -122,6 +127,10 @@ class ModelTracer:
     def close(self):
         self.pool.shutdown(wait=True)
 
+    def autocast(self):
+        return torch.autocast('cuda', dtype=torch.bfloat16,
+                              enabled=self.device.startswith('cuda') and self.p.precision == 'bf16')
+
     def forward(self, x, hist, hmask, sampling):
         """Model outputs for the active rows, in ``forward_chunk`` row chunks when set."""
         chunk = self.p.forward_chunk or len(hist)
@@ -132,7 +141,7 @@ class ModelTracer:
         outputs = []
         for start in range(0, len(hist), chunk):
             part = slice(start, start+chunk)
-            with torch.autocast('cuda', dtype=torch.bfloat16, enabled=self.device.startswith('cuda')):
+            with self.autocast():
                 outputs.append(self.model(rows(x, part), hist[part], hmask[part], **rows(sampling, part)))
         if len(outputs) == 1:
             return outputs[0]
@@ -170,7 +179,7 @@ class ModelTracer:
                                dtype=torch.bfloat16)
         flat = encode.flatten().nonzero().flatten()
         if len(flat):
-            with torch.autocast('cuda', dtype=torch.bfloat16, enabled=self.device.startswith('cuda')):
+            with self.autocast():
                 fresh = self.model.encode_memory_crops(x, flat)
             for value, cell in zip(fresh, flat.tolist()):
                 j, slot = divmod(cell, encode.shape[1])

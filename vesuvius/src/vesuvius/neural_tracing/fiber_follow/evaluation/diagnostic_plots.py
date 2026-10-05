@@ -317,3 +317,82 @@ def plot_sheets(examples, cfg, folder, step):
             future.result()
     for image in sheets.values():
         image.close()
+
+
+def whole_crop_example(batch, output, cfg, label, sigma):
+    """Display arrays and metrics of one example's whole-crop path and tube (``path_planes='crop'`` / ``tube_head``).
+
+    ``output`` is the selected training-forward output (``crop_points``, ``tube_logits``); CT is a central lateral
+    slab (5 samples) per view, tubes are maximum projections across the other lateral axis."""
+    import torch
+    import torch.nn.functional as F
+    crop = cfg.fine
+    centre = int(round((crop.width-1)/2))
+    slab = slice(max(0, centre-2), centre+3)
+    ct = batch['x']['fine'][0, 0].float()
+    view = dict(label=label, ct_x=ct[:, slab, :].mean(1), ct_y=ct[:, :, slab].mean(2))
+    metrics = {}
+    if 'crop_points' in output:
+        path, target, mask = output['crop_points'][0].float(), batch['crop_ab'][0].float(), batch['crop_mask'][0].bool()
+        view.update(path=path, target=target, mask=mask)
+        error = (path[:, :2]-target).norm(dim=-1)
+        metrics['crop_path_error'] = float(error[mask].mean()) if mask.any() else None
+        commit = torch.zeros_like(mask)
+        commit[cfg.proposal_slice] = True
+        metrics['commit_path_error'] = float(error[mask & commit].mean()) if (mask & commit).any() else None
+    if 'tube_logits' in output:
+        from vesuvius.neural_tracing.fiber_follow.models.whole_crop import tube_targets
+        logits = output['tube_logits'][0:1].float()
+        probability = logits.sigmoid()[0]
+        view.update(tube_x=probability.amax(1), tube_y=probability.amax(2))
+        if 'crop_curve' in batch:
+            target, known = tube_targets(batch['crop_curve'][:1].float(), batch['crop_curve_mask'][:1].bool(),
+                                         batch['crop_curve_open_ends'][:1].bool(), crop, sigma)
+            view.update(target_x=target[0].amax(1), target_y=target[0].amax(2))
+            bce = F.binary_cross_entropy_with_logits(logits, target, reduction='none')
+            metrics['tube_bce'] = float(bce[known].mean()) if known.any() else None
+            inside = known & (target > .05)
+            metrics['tube_bce_inside'] = float(bce[inside].mean()) if inside.any() else None
+    hist = batch['hist'][0][batch['hmask'][0] > 0].float()
+    view['history'] = hist
+    view = {k: (v.detach().cpu().numpy() if torch.is_tensor(v) else v) for k, v in view.items()}
+    return view, metrics
+
+
+def plot_whole_crop(examples, cfg, path, step):
+    """One row per example: CT + paths and predicted tube (target contour), forward-vs-x then forward-vs-y."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    crop = cfg.fine
+    half = (crop.width-1)*crop.spacing/2
+    extent = ((-crop.behind-.5)*crop.spacing, (crop.depth-crop.behind-.5)*crop.spacing, -half-.5*crop.spacing, half+.5*crop.spacing)
+    forward = (np.arange(crop.depth)-crop.behind)*crop.spacing
+    lateral = (np.arange(crop.width)-(crop.width-1)/2)*crop.spacing
+    commit = (cfg.future_step*.5, cfg.future_step*(cfg.n_future+.5))
+    fig, axes = plt.subplots(len(examples), 4, figsize=(20, 3.6*len(examples)), squeeze=False)
+    for row, e in zip(axes, examples):
+        for column, (axis, name) in enumerate(((0, 'x'), (1, 'y'))):
+            a, b = row[2*column], row[2*column+1]
+            a.imshow(e['ct_'+name].T, cmap='gray', origin='lower', extent=extent, aspect='auto')
+            if 'path' in e:
+                m = e['mask']
+                a.plot(e['path'][m, 2], e['target'][m, axis], '.', ms=2, color='#ff3355', label='true fiber (target)')
+                a.plot(e['path'][:, 2], e['path'][:, axis], '-', lw=1, color='#00e5ff', label='predicted whole-crop path')
+            if len(e['history']):
+                a.plot(e['history'][:, 2], e['history'][:, axis], '-', lw=1, color='#3377ff', label='committed history')
+            a.axvspan(*commit, color='y', alpha=.15, label='commit planes')
+            a.set_xlim(extent[:2]); a.set_ylim(extent[2:])
+            a.set_title(f"{e['label']} | CT slab, forward vs {name}", fontsize=8)
+            if 'tube_'+name in e:
+                b.imshow(e['tube_'+name].T, cmap='magma', origin='lower', extent=extent, aspect='auto', vmin=0, vmax=1)
+                if 'target_'+name in e:
+                    b.contour(forward, lateral, e['target_'+name].T, levels=[.5], colors=['#00ff88'], linewidths=.8)
+                b.set_title(f"{e['label']} | predicted tube (max proj.), green = target 0.5, forward vs {name}", fontsize=8)
+            else:
+                b.axis('off')
+    axes[0, 0].legend(fontsize=6, loc='lower left')
+    fig.suptitle(f'Step {step} | whole-crop path and Gaussian tube (current training microbatch, EMA)')
+    fig.tight_layout()
+    fig.savefig(path, dpi=80)
+    plt.close(fig)

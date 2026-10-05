@@ -1337,7 +1337,7 @@ def main(argv=None):
                 names = dataset.names if dataset_document else [primary_source.get('name', 'paris4')]
                 report = render_microbatch(ema, batches[-1], out, step, device=args.device,
                     n_commit=args.n_commit, tolerance=args.tolerance, dataset_names=names,
-                    memory=live_continuation,
+                    memory=live_continuation, tube_sigma=args.tube_sigma,
                     training_metrics=dict(metrics, lr=lr, data_seconds=data_seconds,
                         update_seconds=update_seconds,
                         cuda_peak_allocated_gib=torch.cuda.max_memory_allocated(args.device)/2**30

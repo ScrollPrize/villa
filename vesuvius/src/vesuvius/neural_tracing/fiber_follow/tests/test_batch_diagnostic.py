@@ -182,3 +182,23 @@ def test_render_resolves_decision_memory_before_slicing_rows(tmp_path):
                              dataset_names=['ordinary'])
     report = json.loads((tmp_path/'none'/'diagnostic_images'/'1000'/'metrics.json').read_text())
     assert [sum(r['history_valid']) for r in report['rows']] == [0, 1, 0]
+
+
+def test_whole_crop_models_render_the_path_and_tube_sheet(tmp_path):
+    from test_whole_crop import crop_batch
+    from vesuvius.neural_tracing.fiber_follow.models.model import build_model
+    from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
+    torch.manual_seed(7)
+    cfg = coordinate_config(fine=CropSpec(depth=24, width=20, behind=12, spacing=1.), n_future=4,
+                            path_planes='crop', tube_head=True, memory='none')
+    model = build_model(cfg)
+    data = crop_batch(cfg, 2)
+    data['dataset_id'] = torch.tensor([0, 0])
+    summary = render_microbatch(model, data, tmp_path, 1000, device='cpu', n_commit=4, tolerance=1.5)
+    folder = tmp_path/'diagnostic_images'/'1000'
+    assert summary['examples'] == 2 and (folder/'whole_crop.png').stat().st_size > 0
+    assert not (folder/'history.png').exists()
+    report = json.loads((folder/'metrics.json').read_text())
+    for row in report['rows']:
+        assert row['crop_path_error'] >= 0 and row['commit_path_error'] >= 0 and row['tube_bce'] > 0
+        assert 'history_valid' not in row
