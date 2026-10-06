@@ -12,6 +12,7 @@ TRACE_HEADING_POLICY = 'linear12_trusted_v1'
 FRAME_POLICY = 'ct_transverse_uv_sigma2_8_v3'
 LEARNED_FRAME_POLICY = 'learned_heading_normal_v1'
 FRAME_POLICIES = (FRAME_POLICY, LEARNED_FRAME_POLICY, 'ct_transverse_uv_v2')
+CT_DERIVATIVE_SIGMA, CT_INTEGRATION_SIGMA = 2., 8.  # CT voxels; the structure tensor of the seed and frame policies
 CT_CONTEXT_RADIUS = 38  # four integration sigmas + three derivative sigmas
 # CT is scaled to [0, 1]. Require both directional evidence and enough
 # transverse energy to avoid orienting a crop from numerical residue.
@@ -66,7 +67,7 @@ def ct_sheet_normal(cube, center_zyx):
     """Unrestricted sheet normal for selecting an initial H/V heading."""
     # Solve in array-axis order for the seed-heading sign convention.
     values, vectors = np.linalg.eigh(ct_structure_tensor(cube, center_zyx,
-        derivative_sigma=2., integration_sigma=8.)[::-1, ::-1])
+        derivative_sigma=CT_DERIVATIVE_SIGMA, integration_sigma=CT_INTEGRATION_SIGMA)[::-1, ::-1])
     if values[-1] <= 1e-12 or values[-1]-values[-2] <= 1e-6*values[-1]:
         raise SeedHeadingError('CT seed context has no identifiable sheet normal')
     return vectors[::-1, -1]  # zyx array axes -> world xyz
@@ -105,7 +106,8 @@ def ct_normal(vol, pos_xyz):
 
 
 def ct_tensor(vol, pos_xyz):
-    return ct_structure_tensor(*_ct_context(vol, pos_xyz), derivative_sigma=2., integration_sigma=8.)
+    return ct_structure_tensor(*_ct_context(vol, pos_xyz), derivative_sigma=CT_DERIVATIVE_SIGMA,
+                               integration_sigma=CT_INTEGRATION_SIGMA)
 
 
 def ct_seed_heading(vol, pos_xyz, family):

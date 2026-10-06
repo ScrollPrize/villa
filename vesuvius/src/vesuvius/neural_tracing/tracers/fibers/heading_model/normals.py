@@ -11,10 +11,12 @@ import torch
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.crops import scalar_crops
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.normalization import normalize_ct
 from vesuvius.neural_tracing.tracers.shared.geometry import CropSpec
-from vesuvius.neural_tracing.tracers.fibers.frames.ct import ct_structure_tensor
+from vesuvius.neural_tracing.tracers.fibers.frames.ct import (CT_CONTEXT_RADIUS, CT_DERIVATIVE_SIGMA, CT_INTEGRATION_SIGMA, MIN_FRAME_GAP,
+    ct_structure_tensor)
 
-NORMAL_TARGET_POLICY = dict(method='shared_crop_structure_tensor_v1', derivative_sigma_ct=2., integration_sigma_ct=8.,
-                            context_radius_ct=38., min_eigengap=.05, intensity_threshold=None, loss='1-dot_squared')
+NORMAL_TARGET_POLICY = dict(method='shared_crop_structure_tensor_v1', derivative_sigma_ct=CT_DERIVATIVE_SIGMA,
+                            integration_sigma_ct=CT_INTEGRATION_SIGMA, context_radius_ct=float(CT_CONTEXT_RADIUS),
+                            min_eigengap=MIN_FRAME_GAP, intensity_threshold=None, loss='1-dot_squared')
 
 
 def normal_target_policy(cfg):

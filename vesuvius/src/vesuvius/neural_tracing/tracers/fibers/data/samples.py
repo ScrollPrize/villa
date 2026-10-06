@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from vesuvius.neural_tracing.tracers.shared.geometry import CropSpec, arclength, frame_from_heading, interp_at, tangent_at, traversal_curve
+from vesuvius.neural_tracing.tracers.shared.policy import DEFAULT_MAX_RECOVERY_DISTANCE
 from vesuvius.neural_tracing.tracers.shared.reference import trace_history
 from vesuvius.neural_tracing.tracers.fibers.data.fibers import TracedFiber
 from vesuvius.neural_tracing.tracers.fibers.data.targets import continuation_targets
@@ -39,7 +40,7 @@ class SampleConfig:
     excursion_amplitude: tuple = (3., 6.)
     excursion_rise: tuple = (16., 128.)
     label_tolerance: float = 1.5  # confidence-label tolerance; separate from the departure threshold
-    max_recovery_distance: float = 6.0
+    max_recovery_distance: float = DEFAULT_MAX_RECOVERY_DISTANCE
     dense_substeps: int = 4
 
     def __post_init__(self):

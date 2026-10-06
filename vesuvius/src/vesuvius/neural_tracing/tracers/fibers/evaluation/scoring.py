@@ -6,6 +6,7 @@ import numpy as np
 
 from vesuvius.neural_tracing.tracers.fibers.data.fibers import DATA_VERSION, TracedFiber
 from vesuvius.neural_tracing.tracers.shared.geometry import tangent_at
+from vesuvius.neural_tracing.tracers.shared.policy import DEFAULT_MAX_RECOVERY_DISTANCE
 from vesuvius.neural_tracing.tracers.fibers.frames.learned import trace_family_kwargs
 
 
@@ -87,7 +88,7 @@ def matched_profile(path, lengths, fiber: TracedFiber, t0: float, sign: float, t
     from vesuvius.neural_tracing.tracers.fibers.data.state_labels import TraceLabeler
     if not len(path):
         return np.zeros(0), np.zeros(0)
-    labeler = TraceLabeler(fiber, t0, sign, tolerance=tol, max_recovery_distance=max(tol, 6.0))
+    labeler = TraceLabeler(fiber, t0, sign, tolerance=tol, max_recovery_distance=max(tol, DEFAULT_MAX_RECOVERY_DISTANCE))
     labeler.observe(path[:1], 0.0)
     d, arc = [labeler.vertex_distances], [labeler.vertex_arcs]
     heads = np.unique(np.r_[np.searchsorted(lengths, np.arange(MATCH_CHUNK, lengths[-1], MATCH_CHUNK)), len(path)-1])

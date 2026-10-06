@@ -8,7 +8,7 @@ import torch.nn.functional as F
 
 from vesuvius.neural_tracing.tracers.models.survival_confidence import survival_predictions
 from vesuvius.neural_tracing.tracers.shared.geometry import CropSpec
-from vesuvius.neural_tracing.tracers.shared.policy import DEFAULT_CONFIDENCE, commit_prefix
+from vesuvius.neural_tracing.tracers.shared.policy import DEFAULT_CONFIDENCE, DEFAULT_MAX_RECOVERY_DISTANCE, commit_prefix
 
 
 @dataclass
@@ -21,7 +21,7 @@ class FollowerConfig:
     future_step: float = 1.
     gate_plane: int | None = None  # plane whose confidence accepts a proposal (full gate, retries); None: the last plane
     n_history: int = 128
-    max_recovery_distance: float = 6.
+    max_recovery_distance: float = DEFAULT_MAX_RECOVERY_DISTANCE
     patch_radius: float = 1.
     recurrent_refinement_steps: int = 0
     frame_checkpoint: str | None = None  # frozen heading/normal model used by crop builders
