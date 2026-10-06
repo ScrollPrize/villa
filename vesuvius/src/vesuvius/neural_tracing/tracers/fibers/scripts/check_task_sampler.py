@@ -83,7 +83,7 @@ def main(argv=None):
     from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolumeSpec
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--checkpoint', required=True, help='Supplies the model crop/horizon and label tolerance')
-    ap.add_argument('--dataset-config', default=str(Path(__file__).parents[1]/'configs'/'mixed_ct_datasets_paris50.json'))
+    ap.add_argument('--dataset-config', default=str(Path(__file__).parents[1]/'configs'/'datasets'/'paris50.json'))
     ap.add_argument('--replay', action='append', default=[], metavar='SOURCE=CACHE', help='Replay cache per source')
     ap.add_argument('--sources', nargs='+')
     ap.add_argument('--task-share', action='append', default=[])

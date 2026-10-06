@@ -12,7 +12,7 @@ from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume
 from vesuvius.neural_tracing.tracers.fibers.data.observations import FiberTracer
 from vesuvius.neural_tracing.tracers.fibers.train.train import load_checkpoint
 
-DATASET_CONFIG = Path(__file__).parents[1]/'configs'/'mixed_ct_datasets_paris50.json'
+DATASET_CONFIG = Path(__file__).parents[1]/'configs'/'datasets'/'paris50.json'
 
 
 def dataset_sources(args, config=DATASET_CONFIG):

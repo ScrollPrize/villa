@@ -120,7 +120,7 @@ def main():
     from vesuvius.neural_tracing.tracers.fibers.heading_model.train import DEFAULT_CONFIG, read_config
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--config', default=str(DEFAULT_CONFIG),
-                    help='config JSON (default: configs/heading_model_l0_w16_centered_frame.json)')
+                    help='config JSON (default: configs/heading/heading_model_l0_w16_centered_frame.json)')
     ap.add_argument('--checkpoint', required=True)
     ap.add_argument('--states', type=int, help='held-out states per source (default: config val_states_per_source)')
     ap.add_argument('--device', default='cpu')

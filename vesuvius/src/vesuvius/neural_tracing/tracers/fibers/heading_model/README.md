@@ -73,14 +73,14 @@ source volume, chosen by its dataset-config weight.
 
 ```bash
 cd vesuvius/src/vesuvius/neural_tracing/tracers/fibers
-python heading_model/train.py            # uses configs/heading_model_l0_w16_centered_frame.json
-# --config PATH (relative to cwd, tracers/fibers/, vesuvius/src/ or configs/), --resume continues last.pt,
+python heading_model/train.py            # uses configs/heading/heading_model_l0_w16_centered_frame.json
+# --config PATH (relative to cwd, tracers/fibers/, vesuvius/src/ or configs/heading/), --resume continues last.pt,
 # --name/--steps/--workers/--device override the config. Also runnable as
 # python -m vesuvius.neural_tracing.tracers.fibers.heading_model.train from anywhere.
 ```
 
-`configs/heading_model_l0_w16_centered_frame.json` is the frame run's configuration: width 16, the sources of
-`configs/mixed_ct_datasets_paris50.json` (Paris 4, `0175A_5mm_v1.afv` and `1447_5mm_v1.afv` at 0.5/0.25/0.25), batch
+`configs/heading/heading_model_l0_w16_centered_frame.json` is the frame run's configuration: width 16, the sources of
+`configs/datasets/paris50.json` (Paris 4, `0175A_5mm_v1.afv` and `1447_5mm_v1.afv` at 0.5/0.25/0.25), batch
 128, `lr: 0.00015` with a cosine decay from step 40,000 (`lr_decay_start`) to zero at 70,000. `init_checkpoint`
 starts a new run from another checkpoint's weights (same architecture and model config; fresh optimizer; `--resume`
 ignores it); `lr_schedule: "constant"` holds `lr` after the warmup. A resume requires the same model config, normal

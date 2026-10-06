@@ -1,12 +1,12 @@
-"""Train the crop-heading model on the follower's Paris 4 + AFV sources (see configs/heading_model_l0_w16_centered_frame.json).
+"""Train the crop-heading model on the follower's Paris 4 + AFV sources (see configs/heading/heading_model_l0_w16_centered_frame.json).
 
 Batches are generated online in loader workers from the follower's own sampling code (heading_model.data). The
 run directory holds config.json, ct_normalization.json, log.jsonl, last.pt (resumable), ckpt_STEP.pt and best.pt
 (lowest held-out p90 off-axis distance of the fiber over the follower crop's forward extent).
 
 Usage (from tracers/fibers/, or with -m from anywhere):
-  python heading_model/train.py                      # configs/heading_model_l0_w16_centered_frame.json
-  python heading_model/train.py --config configs/heading_model_l0_w16_centered_frame.json --name heading_model_frame2
+  python heading_model/train.py                      # configs/heading/heading_model_l0_w16_centered_frame.json
+  python heading_model/train.py --config configs/heading/heading_model_l0_w16_centered_frame.json --name heading_model_frame2
   python -m vesuvius.neural_tracing.tracers.fibers.heading_model.train --resume
 """
 import argparse
@@ -43,14 +43,14 @@ DEFAULTS = dict(name='heading_model', steps=30000, batch=128, workers=8, lr=3e-3
 
 
 PACKAGE = Path(__file__).resolve().parents[1]  # tracers/fibers/
-DEFAULT_CONFIG = PACKAGE/'configs'/'heading_model_l0_w16_centered_frame.json'
+DEFAULT_CONFIG = PACKAGE/'configs'/'heading'/'heading_model_l0_w16_centered_frame.json'
 
 
 def config_path(path):
-    """A config path given relative to the working directory, tracers/fibers/, vesuvius/src/ or configs/."""
+    """A config path given relative to the working directory, tracers/fibers/, vesuvius/src/ or configs/heading/."""
     path = Path(path).expanduser()
     candidates = [path] if path.is_absolute() else [Path.cwd()/path, PACKAGE/path, PACKAGE.parents[3]/path,
-                                                    PACKAGE/'configs'/path]
+                                                    PACKAGE/'configs'/'heading'/path]
     for candidate in candidates:
         if candidate.is_file():
             return candidate.resolve()
@@ -127,8 +127,8 @@ def validate(model, held_out, device):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--config', default=str(DEFAULT_CONFIG),
-                    help='config JSON (default: configs/heading_model_l0_w16_centered_frame.json); relative to cwd, '
-                         'tracers/fibers/ or configs/')
+                    help='config JSON (default: configs/heading/heading_model_l0_w16_centered_frame.json); relative to cwd, '
+                         'tracers/fibers/ or configs/heading/')
     ap.add_argument('--name')
     ap.add_argument('--steps', type=int)
     ap.add_argument('--workers', type=int)

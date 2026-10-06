@@ -1,7 +1,7 @@
 {
   "name": "heading_model_l0_w16_centered_frame",
-  "dataset_config": "mixed_ct_datasets_paris50.json",
-  "ct_normalization": "../output/heading_model_l0_w16_centered_normals/ct_normalization.json",
+  "dataset_config": "../datasets/paris50.json",
+  "ct_normalization": "../../output/heading_model_l0_w16_centered_normals/ct_normalization.json",
   "init_checkpoint": null,
   "device": "cuda",
   "steps": 70000,
