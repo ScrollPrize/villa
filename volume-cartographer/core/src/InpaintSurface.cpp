@@ -53,6 +53,61 @@ void diffuseFill(cv::Mat_<cv::Vec3d>& pts, cv::Mat_<uchar>& unknown)
     }
 }
 
+// Harmonic fill: every unknown cell becomes the mean of its 4 neighbours in
+// the ROI, known or unknown, solved by SOR from the diffuseFill seed.
+// diffuseFill alone puts a cell with a single known neighbour exactly on that
+// neighbour, and the next ring copies those copies, so a hole wider than two
+// cells starts with coincident points. At coincidence DistLoss has a zero
+// gradient and StraightLoss returns zero, so Ceres never separates them. The
+// harmonic solution has no coincident points and is exact wherever the
+// surface is linear in (row, col).
+void harmonicFill(cv::Mat_<cv::Vec3d>& pts, const cv::Mat_<uchar>& unknown, double tol)
+{
+    const int rows = pts.rows;
+    const int cols = pts.cols;
+    const int n = std::max(rows, cols);
+    const double omega = 2.0 / (1.0 + std::sin(3.14159265358979323846 / std::max(n, 2)));
+    const int max_sweeps = 100 * n + 100;
+    for (int sweep = 0; sweep < max_sweeps; ++sweep) {
+        double max_step = 0.0;
+        for (int r = 0; r < rows; ++r) {
+            for (int c = 0; c < cols; ++c) {
+                if (!unknown(r, c)) continue;
+                cv::Vec3d sum(0, 0, 0);
+                int k = 0;
+                if (r > 0) { sum += pts(r - 1, c); ++k; }
+                if (r + 1 < rows) { sum += pts(r + 1, c); ++k; }
+                if (c > 0) { sum += pts(r, c - 1); ++k; }
+                if (c + 1 < cols) { sum += pts(r, c + 1); ++k; }
+                if (k == 0) continue;
+                const cv::Vec3d step = omega * (sum * (1.0 / k) - pts(r, c));
+                pts(r, c) += step;
+                max_step = std::max(max_step, cv::norm(step));
+            }
+        }
+        if (max_step < tol) break;
+    }
+}
+
+// Median 4-neighbour spacing between known cells of the ROI: the grid step in
+// voxels (1 / scale for a tifxyz), used as the DistLoss target when the
+// caller does not give one.
+double medianKnownSpacing(const cv::Mat_<cv::Vec3d>& pts, const cv::Mat_<uchar>& unknown)
+{
+    std::vector<double> d;
+    for (int r = 0; r < pts.rows; ++r) {
+        for (int c = 0; c < pts.cols; ++c) {
+            if (unknown(r, c)) continue;
+            if (c + 1 < pts.cols && !unknown(r, c + 1)) d.push_back(cv::norm(pts(r, c) - pts(r, c + 1)));
+            if (r + 1 < pts.rows && !unknown(r + 1, c)) d.push_back(cv::norm(pts(r, c) - pts(r + 1, c)));
+        }
+    }
+    if (d.empty()) return 1.0;
+    std::nth_element(d.begin(), d.begin() + d.size() / 2, d.end());
+    const double m = d[d.size() / 2];
+    return m > 0.0 ? m : 1.0;
+}
+
 // 4-neighbor edge-length preservation: ||a - b|| should equal _d.
 struct DistLoss {
     DistLoss(double d, double w) : _d(d), _w(w) {}
@@ -223,21 +278,15 @@ int inpaintSurfaceHoles(cv::Mat_<cv::Vec3f>& points, double unit, int max_iters)
         }
         if (n_unknown == 0) continue;
 
-        // 5. Seed unknowns with diffusion, then refine with Ceres.
+        // 5. Seed unknowns with diffusion, relax the seed to the harmonic
+        //    fill, then refine with Ceres. The DistLoss target is the grid
+        //    step measured on the known cells unless the caller gives one.
+        const double roi_unit = unit > 0.0 ? unit : medianKnownSpacing(roi, unknown);
         cv::Mat_<uchar> diffuse_unknown = unknown.clone();
         diffuseFill(roi, diffuse_unknown);
-        // If diffuse left any unfilled (no valid neighbor reached) skip; means
-        // the component is fully detached from the ROI ring after dilation,
-        // which shouldn't happen for interior holes.
-        for (int r = 0; r < H; ++r) {
-            for (int c = 0; c < W; ++c) {
-                if (diffuse_unknown(r, c)) {
-                    // fallback: leave as zero; solver will pull it via DistLoss
-                }
-            }
-        }
+        harmonicFill(roi, unknown, 1e-9 * roi_unit);
 
-        solveRoi(roi, unknown, unit, max_iters);
+        solveRoi(roi, unknown, roi_unit, max_iters);
 
         // 6. Write back the inpainted cells.
         for (int r = 0; r < H; ++r) {
