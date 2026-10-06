@@ -79,3 +79,32 @@ def test_segmented_median_on_mps(monkeypatch):
     monkeypatch.delenv('FIT_SPIRAL_MAX_PRECISION_FLOAT', raising=False)
     ctx = _strip_context('mps')
     assert torch.equal(_segmented_median_per_strip(ctx).cpu(), _reference_medians(ctx))
+
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason='needs MPS')
+def test_patch_atlas_upload_on_mps_survives_freed_staging(monkeypatch):
+    # An atlas larger than the staging bound is uploaded in several flushes,
+    # each from a host tensor that is freed while the next one is built. With
+    # torch 2.11 and 2.12 a non_blocking host-to-MPS copy can read its source
+    # after that (pytorch/pytorch#189690), so earlier flushes arrive corrupted.
+    import types
+
+    import numpy as np
+
+    import fit_spiral
+
+    monkeypatch.setattr(fit_spiral, 'PATCH_ATLAS_STAGING_BYTES', 1 << 20)
+    generator = torch.Generator().manual_seed(0)
+    patches = {
+        key: types.SimpleNamespace(
+            zyxs=torch.rand(256, 128, 3, generator=generator) * 100.,
+            _sampling_valid_quad_mask_np=np.ones((255, 127), dtype=bool),
+            _sampling_2d_path=None)
+        for key in range(24)
+    }
+    expected = torch.cat([p.zyxs.reshape(-1, 3) for p in patches.values()])
+    for _ in range(3):
+        atlas = fit_spiral.PatchAtlas(patches, device='mps').materialize()
+        torch.mps.synchronize()
+        assert torch.equal(atlas.zyxs_flat.cpu(), expected)

@@ -362,6 +362,10 @@ def _make_patch_sampling_atlas(masks):
     return atlas
 
 
+# Host staging bound for one PatchAtlas geometry upload, in bytes.
+PATCH_ATLAS_STAGING_BYTES = 256 * (1 << 20)
+
+
 class PatchAtlas:
     """Patch (H, W, 3) zyx grids packed for batched lookup.
 
@@ -437,7 +441,7 @@ class PatchAtlas:
         # Amortise transfers without ever concatenating the whole atlas on
         # the host.  256 MiB bounds the temporary independently of dataset
         # size while preserving the exact float32 bytes and patch order.
-        staging_limit = 256 * (1 << 20) // (3 * 4)
+        staging_limit = PATCH_ATLAS_STAGING_BYTES // (3 * 4)
         pieces = []
         staged = 0
         offset = 0
@@ -448,7 +452,7 @@ class PatchAtlas:
                 return
             staging = torch.cat(pieces, dim=0)
             resident[offset:offset + staged].copy_(
-                staging, non_blocking=True)
+                staging, non_blocking=device.type == 'cuda')
             offset += staged
             pieces = []
             staged = 0
@@ -461,7 +465,7 @@ class PatchAtlas:
             # advertised staging bound is not exceeded.
             if len(piece) > staging_limit:
                 resident[offset:offset + len(piece)].copy_(
-                    piece, non_blocking=True)
+                    piece, non_blocking=device.type == 'cuda')
                 offset += len(piece)
             else:
                 pieces.append(piece)
@@ -631,9 +635,13 @@ class PatchAtlas:
                 bottom = bl + (br - bl) * dj
                 output[selected] = top + (bottom - top) * di
             return output.reshape(*shape, 3).to(self.device)
+        # MPS reads a pageable host source after a non_blocking copy returns,
+        # and these sources are often freed temporaries; CUDA stages them first.
+        non_blocking = self.zyxs_flat.device.type == 'cuda'
         patch_idx_per_sample = patch_idx_per_sample.to(
-            device=self.zyxs_flat.device, dtype=torch.int64, non_blocking=True)
-        ijs = ijs.to(device=self.zyxs_flat.device, non_blocking=True)
+            device=self.zyxs_flat.device, dtype=torch.int64,
+            non_blocking=non_blocking)
+        ijs = ijs.to(device=self.zyxs_flat.device, non_blocking=non_blocking)
         if len(self._geometry_chunks) == 1:
             chunk = self._geometry_chunks[0]
             return bilinear_atlas_lookup(
