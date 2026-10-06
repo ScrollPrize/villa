@@ -167,17 +167,25 @@ def initialize_training_optimizer(model, ema, args, resume=None):
     reset = args.reset_optimizer
     if reset and resume is None:
         raise ValueError('--reset-optimizer requires --resume')
-    parameters = model.parameters()
     if reset:
         model.requires_grad_(True)
-    opt = torch.optim.AdamW(parameters, lr=args.lr, weight_decay=1e-4)
+    scales = [p for name, p in model.named_parameters() if name.endswith('.logit_scale')]
+    opt = torch.optim.AdamW([p for name, p in model.named_parameters() if not name.endswith('.logit_scale')],
+                            lr=args.lr, weight_decay=1e-4)
+    # Attention logit scales (log multipliers) train in their own group: no decay toward zero, a faster LR.
+    scale_group = dict(params=scales, weight_decay=0., lr_scale=LOGIT_SCALE_LR_SCALE)
+    if scales and not (resume and not reset and len(resume['optimizer']['param_groups']) == 1):
+        opt.add_param_group(scale_group)
     done = resume_training(resume, model, ema, opt, reset_optimizer=reset) if resume else 0
+    if scales and len(opt.param_groups) == 1:  # resumed from a checkpoint trained without them: they start fresh
+        opt.add_param_group(scale_group)
     origin = done if reset else int((resume or {}).get('lr_restart_step', 0))
     match_optimizer_layout(opt)
     return opt, done, origin
 
 
 GRAD_CLIP = 60.
+LOGIT_SCALE_LR_SCALE = 10.  # LR multiple of the attention logit scales' group
 
 
 def load_matching_weights(model, state, exclude=()):
@@ -362,7 +370,7 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
         raise ValueError('An update needs at least one supervised decision')
     denominator = max(1, total)
     for group in opt.param_groups:
-        group['lr'] = lr
+        group['lr'] = lr*group.get('lr_scale', 1.)
     opt.zero_grad(set_to_none=True)
     begin_training_update(model)
     sums = dict(loss=0., geometry=0., confidence_loss=0., error_sum=0., geometry_count=0.,
@@ -610,7 +618,7 @@ def main(argv=None):
                 progress(f'  {name}: {", ".join(report[name][:20])}{" ..." if len(report[name]) > 20 else ""}')
     opt, done, lr_restart_step = initialize_training_optimizer(model, ema, args, resume)
     if args.reset_optimizer:
-        progress(f'Fresh AdamW: one parameter group, all parameters trainable; LR restarts at update {done+1} '
+        progress(f'Fresh AdamW: all parameters trainable; LR restarts at update {done+1} '
                  f'with {args.warmup} warmup updates to {args.lr:g}')
     # Episode batches present their supervised decisions to the compiled decision graph.
     prepare_training(model, args.batch*args.episode_supervised if cfg.model_type == 'sequence' else args.batch)

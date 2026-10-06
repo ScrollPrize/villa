@@ -1,5 +1,6 @@
 """Flow matching (models/flow.py) on the crop transformer: the common trainer, proposals, selection and losses."""
 import copy
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -11,7 +12,7 @@ from vesuvius.neural_tracing.fiber_follow.models.flow import fit_flow_sigma, flo
 from vesuvius.neural_tracing.fiber_follow.train.supervision import loss_terms
 from vesuvius.neural_tracing.fiber_follow.train.train import (
     prepare_training, optimizer_update, save_checkpoint, load_checkpoint,
-    initialize_training_optimizer, initialize_model_weights,
+    initialize_training_optimizer, initialize_model_weights, LOGIT_SCALE_LR_SCALE,
 )
 from vesuvius.neural_tracing.fiber_follow.train.runloop import training_rng_state
 from vesuvius.neural_tracing.fiber_follow.data.data import SampleConfig
@@ -213,11 +214,60 @@ def test_qk_norm_and_modulation_bound_hold_path_attention_under_runaway_time_mod
     head = bounded.cfg.hidden//bounded.cfg.heads
     logit, (shift, scale, gate) = runaway(bounded)
     assert logit <= head**.5+1e-3 and max(shift, scale) <= 4. and gate <= 1.  # |q|=|k|=sqrt(head) at unit gain
-    plain = build_model(config(qk_norm=False, flow_modulation_bound=0.)).eval()
+    plain = build_model(config(qk_norm=False, qk_logit_scale=False, flow_modulation_bound=0.)).eval()
     logit, (shift, scale, gate) = runaway(plain)
     assert logit > 20*head**.5 and min(shift, scale, gate) > 10.
     # A flow checkpoint recorded before these fields existed was trained without them and loads as such.
-    recorded = {k: v for k, v in plain.cfg.to_dict().items() if k not in ('qk_norm', 'flow_modulation_bound')}
+    recorded = {k: v for k, v in plain.cfg.to_dict().items() if k not in ('qk_norm', 'flow_modulation_bound', 'qk_logit_scale')}
     cfg = config_from_checkpoint(dict(model_type='flow', model_cfg=recorded))
-    assert not cfg.qk_norm and not cfg.flow_modulation_bound
+    assert not cfg.qk_norm and not cfg.flow_modulation_bound and not cfg.qk_logit_scale
     build_model(cfg).load_state_dict(plain.state_dict())
+
+
+def test_learned_logit_scale_starts_at_the_standard_scale_sharpens_attention_and_trains_in_its_own_group(tmp_path):
+    torch.manual_seed(47)
+    cfg = config(flow_time_conditioning='adaln_zero')
+    assert cfg.qk_logit_scale
+    model, ema = initialize_model_weights(cfg, 'cpu')
+    plain = build_model(config(flow_time_conditioning='adaln_zero', qk_logit_scale=False))
+    plain.load_state_dict({k: v for k, v in model.state_dict().items() if not k.endswith('logit_scale')})
+    b = coordinate_batch(cfg); y, t = torch.randn(2, 2, 4, 2), torch.rand(2, 2)
+    with torch.no_grad():
+        velocity = lambda m: m.velocity_field(m.context(b['x'], b['hist'], b['hmask']), y, t)
+        torch.testing.assert_close(velocity(model), velocity(plain), atol=0, rtol=0)  # zero log scale: unchanged
+        x = torch.randn(1, 5, cfg.hidden)
+        q, k, _ = model.layers[0].split(x)
+        assert (q@k.transpose(-1, -2)).abs().max() <= cfg.hidden//cfg.heads+1e-3  # |q|=|k|=sqrt(d): logits <= sqrt(d)
+        for layer in model.layers:
+            layer.logit_scale.fill_(math.log(4.))
+        sharp, same, _ = model.layers[0].split(x)  # logits x4: the cap sqrt(d) no longer binds
+        torch.testing.assert_close(sharp, 4*q)
+        torch.testing.assert_close(same, k, atol=0, rtol=0)
+        for layer in model.layers:
+            layer.logit_scale.zero_()
+    # Fresh optimizer: the scales form a second group without decay at LOGIT_SCALE_LR_SCALE times the LR.
+    args = SimpleNamespace(lr=.001, reset_optimizer=False)
+    opt, _, _ = initialize_training_optimizer(model, ema, args)
+    assert [len(g['params']) for g in opt.param_groups] == [len(list(model.parameters()))-cfg.layers, cfg.layers]
+    prepare_training(model, backend='eager')
+    optimizer_update(model, ema, opt, [b], 1, .001, compute_metrics=False)
+    assert opt.param_groups[1]['weight_decay'] == 0 and opt.param_groups[1]['lr'] == pytest.approx(.001*LOGIT_SCALE_LR_SCALE)
+    assert opt.param_groups[0]['lr'] == pytest.approx(.001) and any(layer.logit_scale.abs().sum() > 0 for layer in model.layers)
+    # A run trained without scales resumes with them added at zero: its moments are kept, the scales start fresh.
+    old_cfg = config(flow_time_conditioning='adaln_zero', qk_logit_scale=False)
+    old, old_ema = initialize_model_weights(old_cfg, 'cpu')
+    old_opt, _, _ = initialize_training_optimizer(old, old_ema, args)
+    prepare_training(old, backend='eager')
+    optimizer_update(old, old_ema, old_opt, [b], 1, .001, compute_metrics=False)
+    sample = SampleConfig(crop=old_cfg.fine, n_history=old_cfg.n_history, n_future=old_cfg.n_future)
+    save_checkpoint(tmp_path/'old.pt', old, old_ema, FiberVolumeSpec('unused', inputs='ct'), sample,
+                    dict(step=1, optimizer=old_opt.state_dict(), rng=training_rng_state()))
+    ck = torch.load(tmp_path/'old.pt', weights_only=False)
+    ck['model_cfg']['qk_logit_scale'] = True
+    for state in (ck['model'], ck['ema']):
+        state.update({f'layers.{i}.logit_scale': torch.zeros(old_cfg.heads) for i in range(old_cfg.layers)})
+    resumed, resumed_ema = initialize_model_weights(config_from_checkpoint(ck), 'cpu')
+    resumed_opt, done, _ = initialize_training_optimizer(resumed, resumed_ema, args, ck)
+    assert done == 1 and len(resumed_opt.param_groups) == 2 and not any(p in resumed_opt.state for p in resumed_opt.param_groups[1]['params'])
+    for p, q in zip(resumed_opt.param_groups[0]['params'], old_opt.param_groups[0]['params']):
+        torch.testing.assert_close(resumed_opt.state[p]['exp_avg'], old_opt.state[q]['exp_avg'], atol=0, rtol=0)

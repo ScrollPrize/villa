@@ -56,9 +56,14 @@ class CropTransformerArchitecture:
     # Per-head RMS normalization of attention queries and keys (models/blocks.py). Unbounded, the flow model's adaLN
     # time modulation of the path tokens grew their q/k norms until path attention saturated and training diverged.
     qk_norm: bool = False
+    # Learned per-head scale of the attention logits (models/blocks.py; needs qk_norm), which otherwise stay below
+    # sqrt(head width) while the q/k gains are near one. Starts at the standard scale; trained in its own optimizer group.
+    qk_logit_scale: bool = False
 
     def __post_init__(self):
         super().__post_init__()
+        if self.qk_logit_scale and not self.qk_norm:
+            raise ValueError('A learned attention logit scale needs qk_norm')
         self.cnn_channels = tuple(int(c) for c in self.cnn_channels)
         self.cnn_blocks = tuple(int(b) for b in self.cnn_blocks)
         if (not self.cnn_channels or len(self.cnn_blocks) != len(self.cnn_channels)
@@ -94,6 +99,7 @@ class FlowConfig(FlowOptions, CropTransformerArchitecture, FollowerConfig):
     n_future: int = 16
     gate_plane: int | None = None
     qk_norm: bool = True
+    qk_logit_scale: bool = True
 
 
 class CropTransformerLayer(TransformerLayer):
@@ -141,7 +147,7 @@ class CropTransformer(nn.Module):
         self.path_geometry = PathGeometryTokens(cfg)
         self.kind = nn.Parameter(torch.zeros(5, h))  # CELL, REFERENCE, GEOMETRY, PATH, SCORED
         nn.init.normal_(self.kind, std=.02)
-        self.layers = nn.ModuleList(CropTransformerLayer(h, cfg.heads, cfg.ffn, cfg.qk_norm) for _ in range(cfg.layers))
+        self.layers = nn.ModuleList(CropTransformerLayer(h, cfg.heads, cfg.ffn, cfg.qk_norm, cfg.qk_logit_scale) for _ in range(cfg.layers))
         self.norm = nn.LayerNorm(h)
         self.register_buffer('planes', plane_coordinates(cfg), persistent=False)
         self.plane_scale = cfg.n_future*cfg.future_step  # forward-distance normalization of path tokens

@@ -102,7 +102,7 @@ RETIRED_FIELDS = dict(activation_checkpointing=False, query_scale=None, flow_tim
                       flow_unknown_planes='own_path', flow_selection='retry', flow_zero_start=True,
                       flow_sample_threshold=0., flow_loss='pseudo_huber', flow_geometry_weight=0.)
 # Model fields added after checkpoints were recorded without them, with the value those checkpoints were trained with.
-RECORDED_DEFAULTS = dict(qk_norm=False, flow_modulation_bound=0.)
+RECORDED_DEFAULTS = dict(qk_norm=False, flow_modulation_bound=0., qk_logit_scale=False)
 
 
 def recorded_config(model_type, recorded):
