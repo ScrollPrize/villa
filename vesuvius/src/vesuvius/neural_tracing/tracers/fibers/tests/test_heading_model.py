@@ -4,7 +4,7 @@ import json
 import numpy as np
 import torch
 
-from vesuvius.neural_tracing.tracers.fibers.data.data import TracedFiber
+from vesuvius.neural_tracing.tracers.fibers.data.fibers import TracedFiber
 from vesuvius.neural_tracing.tracers.fibers.heading_model.model import HeadingConfig, HeadingNet, load_heading_model
 from vesuvius.neural_tracing.tracers.fibers.heading_model.normals import normal_loss, normal_target
 from vesuvius.neural_tracing.tracers.fibers.heading_model.targets import in_crop_heading, lateral_extent

@@ -24,7 +24,8 @@ class SamplingLedger:
     def add(self, cpu, step, targets=None):
         import numpy as np
         import torch
-        from vesuvius.neural_tracing.tracers.fibers.data.data import FALLBACKS, SEED_AGE_STRATA, SOURCES, STARTUP_CATEGORIES, TASKS, TRAVEL_STRATA, seed_age_stratum
+        from vesuvius.neural_tracing.tracers.fibers.data.samples import SEED_AGE_STRATA, STARTUP_CATEGORIES, seed_age_stratum
+        from vesuvius.neural_tracing.tracers.fibers.data.tasks import FALLBACKS, SOURCES, TASKS, TRAVEL_STRATA
         from vesuvius.neural_tracing.tracers.fibers.data.state_labels import REASONS, REPLAY_CLASSES, SUPERVISION
         n = len(cpu['hist'])
         ids = cpu.get('dataset_id', torch.zeros(n, dtype=torch.long)).tolist()

@@ -13,7 +13,8 @@ from queue import Empty, Full
 import numpy as np
 import torch
 
-from vesuvius.neural_tracing.tracers.fibers.data.data import SOURCE, label_state
+from vesuvius.neural_tracing.tracers.fibers.data.targets import label_state
+from vesuvius.neural_tracing.tracers.fibers.data.tasks import SOURCE
 from vesuvius.neural_tracing.tracers.shared.geometry import frame_from_heading
 from vesuvius.neural_tracing.tracers.fibers.frames.ct import FRAME_POLICY, SeedHeadingError, ct_frame, reframe_item
 from vesuvius.neural_tracing.tracers.shared.policy import commit_count

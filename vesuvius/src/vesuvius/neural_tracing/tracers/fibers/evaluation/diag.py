@@ -108,7 +108,7 @@ def plot_batch(x, pred, fut, fmask, crop, path, observed, hmask, history_gt, his
         if terminal is not None and terminal[i]:
             title = 'TERMINAL: reject continuation'
         if source is not None:
-            from vesuvius.neural_tracing.tracers.fibers.data.data import SOURCES
+            from vesuvius.neural_tracing.tracers.fibers.data.tasks import SOURCES
             index = int(source[i])
             title = (SOURCES[index] if 0 <= index < len(SOURCES) else f'source {index}') + '\n' + title
         if confidence is not None:

@@ -7,7 +7,8 @@ import numpy as np
 import torch
 
 from vesuvius.neural_tracing.tracers.fibers.data.afv import AFVFibers, file_sha256
-from vesuvius.neural_tracing.tracers.fibers.data.data import FollowDataset, fiber_manifest, load_fibers
+from vesuvius.neural_tracing.tracers.fibers.data.fibers import fiber_manifest, load_fibers
+from vesuvius.neural_tracing.tracers.fibers.data.follow_dataset import FollowDataset
 from vesuvius.neural_tracing.tracers.shared.paths import moved_path
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolumeSpec
 from vesuvius.neural_tracing.tracers.fibers.data.observations import IdentityObservationBuilder
@@ -52,7 +53,7 @@ def parse_dataset_config(document, base):
         if not np.isfinite(weight) or weight <= 0:
             raise ValueError('Every dataset weight must be finite and positive')
         source['weight'] = weight
-        from vesuvius.neural_tracing.tracers.fibers.data.dataset_split import validate_split_policy
+        from vesuvius.neural_tracing.tracers.fibers.data.fibers import validate_split_policy
         validate_split_policy(source['validation'])  # Validate policy before dataset I/O.
         if source['kind'] == 'paris4':
             for key in PRIMARY_OPTIONS:
@@ -111,7 +112,7 @@ def load_primary_dataset(document, spec):
     Fibers whose annotation doubles back are kept out of training; the held-out
     split is decided before that and does not change.
     """
-    from vesuvius.neural_tracing.tracers.fibers.data.dataset_split import heldout_ids
+    from vesuvius.neural_tracing.tracers.fibers.data.fibers import heldout_ids
     from vesuvius.neural_tracing.tracers.fibers.data.seeds import read_manifest
     source = next(s for s in document['sources'] if s['kind']=='paris4')
     fibers = load_fibers(source['fibers'],grid_scale=spec.grid_scale)
@@ -199,10 +200,10 @@ def build_mixed_dataset(primary, document, cfg, sample, sampling, args, *, seed,
             scale = float(source['grid_scale'])
             builder = IdentityObservationBuilder(cfg, fibers, sampling, augment=True, neighbors=AFVBank(fibers))
             replay_index = Path(out)/'dagger'/source['name']/'replay.json' if out else None
-            from vesuvius.neural_tracing.tracers.fibers.data.data import load_replay, usable_replay
+            from vesuvius.neural_tracing.tracers.fibers.data.replay import load_replay, usable_replay
             replay_paths = json.loads(replay_index.read_text()) if resume and replay_index and replay_index.exists() else []
             replay = usable_replay(load_replay(replay_paths), fibers, sample.n_history, spec.grid_scale)
-            from vesuvius.neural_tracing.tracers.fibers.data.data import loader_chunk
+            from vesuvius.neural_tracing.tracers.fibers.data.episodes import loader_chunk
             dataset = FollowDataset(fibers, spec, sample, chunk=loader_chunk(cfg, args.batch),
                 seed=seed+100003*(index+1), cache_bytes=int(args.worker_cache_gb*(1<<30)),
                 batch_builder=builder, budget=budget, length_power=args.afv_length_power,

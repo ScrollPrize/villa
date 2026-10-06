@@ -4,18 +4,21 @@ import json
 import numpy as np
 import pytest
 
-from vesuvius.neural_tracing.tracers.fibers.data import data as D
+from vesuvius.neural_tracing.tracers.fibers.data.fibers import TracedFiber
+from vesuvius.neural_tracing.tracers.fibers.data.follow_dataset import FollowDataset
+from vesuvius.neural_tracing.tracers.fibers.data.samples import SampleConfig
+from vesuvius.neural_tracing.tracers.fibers.data.tasks import SOURCE
 from vesuvius.neural_tracing.tracers.fibers.train.dagger.collect import DecisionCollector
 from vesuvius.neural_tracing.tracers.shared.geometry import CropSpec, arclength, frame_from_heading
 
 
 def fiber(length=100, z=0, endpoints=(False, False)):
     p = np.c_[np.arange(length + 1), np.zeros(length + 1), np.full(length + 1, z)].astype(float)
-    return D.TracedFiber('test.json', p, arclength(p), 'H', endpoint_stop=endpoints)
+    return TracedFiber('test.json', p, arclength(p), 'H', endpoint_stop=endpoints)
 
 
 def sample_config():
-    return D.SampleConfig(crop=CropSpec(depth=12, width=9, behind=2), n_history=4, n_future=4)
+    return SampleConfig(crop=CropSpec(depth=12, width=9, behind=2), n_history=4, n_future=4)
 
 
 def test_replay_uses_committed_prefix_and_supervises_only_beyond_tip():
@@ -29,11 +32,11 @@ def test_replay_uses_committed_prefix_and_supervises_only_beyond_tip():
                                   seed_pos=prefix[0], seed_valid=True, seq_start=0, seq_end=5)],
                        # The archive can contain later points, but the row must never expose them.
                        track=np.concatenate((prefix, [[99., 7., 0.]])))
-    ds = D.FollowDataset([f], None, cfg)
+    ds = FollowDataset([f], None, cfg)
     item = ds.replay_item(op, 0, np.random.default_rng(1))
     np.testing.assert_array_equal(item['observed_path'], prefix)
     np.testing.assert_array_equal(item['seed_pos'], prefix[0])
-    assert item['seed_valid'] and item['source'] == D.SOURCE['replay'] and item['source_step'] == 1000
+    assert item['seed_valid'] and item['source'] == SOURCE['replay'] and item['source_step'] == 1000
     np.testing.assert_allclose(item['hist_local'] @ frame.T+item['pos'], prefix[-2::-1])
     target = item['fut_local'] @ frame.T+item['pos']
     np.testing.assert_allclose(target[:, 0], 50+sign*cfg.future_s)

@@ -82,7 +82,7 @@ def orient_items(items, vol, predictor=None, *, previous=None, pool=None):
         previous=[None if previous is None else previous[i] for i in pending], pool=pool)
     for item, frame in zip(selected, frames):
         reframe_item(item, frame)
-        from vesuvius.neural_tracing.tracers.fibers.data.data import refresh_frame_targets
+        from vesuvius.neural_tracing.tracers.fibers.data.targets import refresh_frame_targets
         refresh_frame_targets(item)
         item.update(frame_policy=LEARNED_FRAME_POLICY, ct_frame_diagnostics=dict(source=3, energy=0., gap=0.))
 

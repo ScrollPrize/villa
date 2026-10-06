@@ -1,7 +1,8 @@
 """Small replay caches in the sole schema; tests state only the fields they exercise."""
 import numpy as np
 
-from vesuvius.neural_tracing.tracers.fibers.data.data import OnPolicyStates, fiber_manifest
+from vesuvius.neural_tracing.tracers.fibers.data.fibers import fiber_manifest
+from vesuvius.neural_tracing.tracers.fibers.data.replay import OnPolicyStates
 from vesuvius.neural_tracing.tracers.fibers.data.state_labels import FOLLOWING, REPLAY_CLASS
 
 

@@ -6,7 +6,7 @@ from scipy.spatial import cKDTree
 from vesuvius.neural_tracing.tracers.fibers.evaluation.scoring import matched_profile
 from vesuvius.neural_tracing.tracers.fibers.evaluation.summarize_long_audit import load_rows
 from vesuvius.neural_tracing.tracers.shared.io import write_json as write
-from vesuvius.neural_tracing.tracers.fibers.data.data import load_fibers
+from vesuvius.neural_tracing.tracers.fibers.data.fibers import load_fibers
 from vesuvius.neural_tracing.tracers.shared.geometry import arclength
 
 

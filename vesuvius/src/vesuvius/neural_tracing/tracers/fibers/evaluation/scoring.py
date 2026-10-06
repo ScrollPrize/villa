@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from vesuvius.neural_tracing.tracers.fibers.data.data import DATA_VERSION, TracedFiber
+from vesuvius.neural_tracing.tracers.fibers.data.fibers import DATA_VERSION, TracedFiber
 from vesuvius.neural_tracing.tracers.shared.geometry import tangent_at
 from vesuvius.neural_tracing.tracers.fibers.frames.learned import trace_family_kwargs
 
@@ -299,7 +299,7 @@ class EvaluationAudit:
     that no foreign fiber exists.
     """
     def __init__(self, tracer, tolerance=1.5, detector=None):
-        from vesuvius.neural_tracing.tracers.fibers.data.data import SampleConfig
+        from vesuvius.neural_tracing.tracers.fibers.data.samples import SampleConfig
         cfg = tracer.model.cfg
         self.cfg = SampleConfig(crop=tracer.crop, n_history=tracer.n_history, recent_history_points=cfg.recent_history_points,
                                 n_future=cfg.n_future, future_step=cfg.future_step, label_tolerance=tolerance,
@@ -318,7 +318,7 @@ class EvaluationAudit:
 
     def __call__(self, index, state):
         import torch
-        from vesuvius.neural_tracing.tracers.fibers.data.data import label_state
+        from vesuvius.neural_tracing.tracers.fibers.data.targets import label_state
         from vesuvius.neural_tracing.tracers.fibers.data.labels import prefix_labels
         from vesuvius.neural_tracing.tracers.fibers.data.state_labels import FOLLOWING, RECOVERABLE, TERMINAL
         labeler, record = self.labelers[index], self.records[index]

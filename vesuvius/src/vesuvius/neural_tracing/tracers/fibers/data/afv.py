@@ -10,7 +10,7 @@ import sqlite3
 import numpy as np
 
 from vesuvius.neural_tracing.tracers.fibers.data.annotation_repair import ANNOTATION_REPAIR, repair_kinks
-from vesuvius.neural_tracing.tracers.fibers.data.data import TracedFiber
+from vesuvius.neural_tracing.tracers.fibers.data.fibers import TracedFiber
 from vesuvius.neural_tracing.tracers.shared.geometry import arclength, interp_at
 
 
@@ -54,7 +54,7 @@ class AFVFibers(Sequence):
         if len(self.catalog) != self.metadata['fiber_count']:
             raise ValueError('AFV fiber count mismatch')
         if validation is not None:
-            from vesuvius.neural_tracing.tracers.fibers.data.dataset_split import heldout_ids
+            from vesuvius.neural_tracing.tracers.fibers.data.fibers import heldout_ids
             heldout = heldout_ids([r[0] for r in self.catalog],validation)
             if split != 'all':
                 self.catalog = [r for r in self.catalog if ((r[0] in heldout) == (split == 'validation'))]

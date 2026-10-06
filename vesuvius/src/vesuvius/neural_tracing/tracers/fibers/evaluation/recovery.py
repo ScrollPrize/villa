@@ -4,7 +4,7 @@ import hashlib
 import json
 from pathlib import Path
 
-from vesuvius.neural_tracing.tracers.fibers.data.data import OnPolicyStates
+from vesuvius.neural_tracing.tracers.fibers.data.replay import OnPolicyStates
 from vesuvius.neural_tracing.tracers.fibers.frames.ct import FRAME_POLICY
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume
 from vesuvius.neural_tracing.tracers.fibers.evaluation.recovery_fixtures import FIXTURE_STRATA, make_recovery_states, evaluate_recovery_states, recovery_counts

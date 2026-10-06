@@ -18,7 +18,11 @@ import sys
 
 import numpy as np
 
-from vesuvius.neural_tracing.tracers.fibers.data.data import FALLBACKS, SEED_AGE_STRATA, SOURCE, STARTUP_CATEGORIES, TASKS, FollowDataset, OnPolicyStates, SampleConfig, TaskBudget, seed_age_stratum, traversal_curve
+from vesuvius.neural_tracing.tracers.fibers.data.follow_dataset import FollowDataset
+from vesuvius.neural_tracing.tracers.fibers.data.replay import OnPolicyStates
+from vesuvius.neural_tracing.tracers.fibers.data.samples import SEED_AGE_STRATA, STARTUP_CATEGORIES, SampleConfig, seed_age_stratum
+from vesuvius.neural_tracing.tracers.fibers.data.tasks import FALLBACKS, SOURCE, TASKS, TaskBudget
+from vesuvius.neural_tracing.tracers.shared.geometry import traversal_curve
 from vesuvius.neural_tracing.tracers.shared.geometry import tangent_at
 from vesuvius.neural_tracing.tracers.fibers.data.state_labels import REPLAY_CLASSES, SUPERVISION
 

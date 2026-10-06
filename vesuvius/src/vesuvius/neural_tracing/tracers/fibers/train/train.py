@@ -16,8 +16,11 @@ import time
 import numpy as np
 import torch
 
-from vesuvius.neural_tracing.tracers.fibers.data.data import (
-    TASKS, FollowDataset, SampleConfig, TaskBudget, fiber_manifest, load_replay, usable_replay)
+from vesuvius.neural_tracing.tracers.fibers.data.fibers import fiber_manifest
+from vesuvius.neural_tracing.tracers.fibers.data.follow_dataset import FollowDataset
+from vesuvius.neural_tracing.tracers.fibers.data.replay import load_replay, usable_replay
+from vesuvius.neural_tracing.tracers.fibers.data.samples import SampleConfig
+from vesuvius.neural_tracing.tracers.fibers.data.tasks import TASKS, TaskBudget
 from vesuvius.neural_tracing.tracers.fibers.train.dagger.online import OnlineCollector
 from vesuvius.neural_tracing.tracers.shared.policy import (DEFAULT_CONFIDENCE, DEFAULT_GATE, gate_horizon,
     OperatingPolicy, selection_window)
@@ -571,7 +574,7 @@ def main(argv=None):
     progress(f'{args.batch} independent decisions per batch')
     # Paris 4 has no neighbor paths: no foreign masks, bank-covered locations or synthetic wrong continuations.
     builder = IdentityObservationBuilder(cfg,train_f,identity_sampling,augment=True)
-    from vesuvius.neural_tracing.tracers.fibers.data.data import loader_chunk
+    from vesuvius.neural_tracing.tracers.fibers.data.episodes import loader_chunk
     dataset = FollowDataset(train_f, spec, sample, chunk=loader_chunk(cfg, args.batch), seed=args.seed+done,
         cache_bytes=int(args.worker_cache_gb*(1 << 30)), onpolicy=caches,
         replay_index=str(collector.index), batch_builder=builder, budget=budget)
@@ -603,7 +606,7 @@ def main(argv=None):
     for source_dataset in dataset.datasets:
         source_dataset.set_step(done)
         if cfg.model_type == 'sequence':
-            from vesuvius.neural_tracing.tracers.fibers.data.data import EpisodeSpec
+            from vesuvius.neural_tracing.tracers.fibers.data.episodes import EpisodeSpec
             source_dataset.episodes = EpisodeSpec(steps=args.episode_steps, supervised=args.episode_supervised,
                                                   commit=args.episode_commit or args.n_commit)
     from vesuvius.neural_tracing.tracers.fibers.train.live_continuation import LiveContinuation, preserve_live_metadata

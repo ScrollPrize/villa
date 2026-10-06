@@ -58,7 +58,7 @@ inference uses the previous frame for sign continuity and a reproducible sign at
   `data.datasets.load_primary_dataset`, `open_afv_source` and `primary_source_spec`;
 - CT normalization comes from `tracers.shared.crop_sampling.normalization.prepare_normalization`. Pass a follower run's
   `ct_normalization.json` to reuse its exact records;
-- the simulated tracer states come from `data.data.make_sample`: the startup mix, the calibrated tracing
+- the simulated tracer states come from `data.samples.make_sample`: the startup mix, the calibrated tracing
   error and the head offset;
 - the prior is the tracer's own heading rule, `frames.ct.linear12_heading`.
 

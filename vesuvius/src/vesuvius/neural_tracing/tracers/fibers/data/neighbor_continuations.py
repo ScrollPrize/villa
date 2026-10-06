@@ -1,7 +1,9 @@
 """Synthetic wrong-fiber history: noised original prefix (trace_noise), smooth bridge, traced tail."""
 import numpy as np
 
-from vesuvius.neural_tracing.tracers.fibers.data.data import SOURCE, label_state, trace_noise
+from vesuvius.neural_tracing.tracers.fibers.data.samples import trace_noise
+from vesuvius.neural_tracing.tracers.fibers.data.targets import label_state
+from vesuvius.neural_tracing.tracers.fibers.data.tasks import SOURCE
 from vesuvius.neural_tracing.tracers.shared.geometry import (
     arclength, exact_nearest, interp_at, frame_from_heading, normalize, traversal_curve,
 )

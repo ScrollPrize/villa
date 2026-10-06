@@ -7,7 +7,8 @@ import torch
 from scipy.ndimage import gaussian_filter
 
 from vesuvius.neural_tracing.tracers.fibers.data.components import ComponentRule
-from vesuvius.neural_tracing.tracers.fibers.data.data import SOURCE, collate_targets, resolve_trace_seed
+from vesuvius.neural_tracing.tracers.fibers.data.targets import collate_targets, resolve_trace_seed
+from vesuvius.neural_tracing.tracers.fibers.data.tasks import SOURCE
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.crops import scalar_crops, empty_image_batch
 from vesuvius.neural_tracing.tracers.shared.geometry import interp_at, traversal_curve
 from vesuvius.neural_tracing.tracers.shared.reference import observed_seed
@@ -261,7 +262,7 @@ class IdentityObservationBuilder(ObservationBuilder):
         s = self.sampling
         if self.neighbors is None or not s.bank_coverage_probability or rng.random() >= s.bank_coverage_probability:
             return None
-        from vesuvius.neural_tracing.tracers.fibers.data.data import make_sample
+        from vesuvius.neural_tracing.tracers.fibers.data.samples import make_sample
         bank = self.neighbors
         for _ in range(3):
             draw = bank.draw_path(rng,hard_fraction=s.bank_hard_fraction)

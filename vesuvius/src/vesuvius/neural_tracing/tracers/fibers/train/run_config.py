@@ -121,7 +121,7 @@ def unknown(section, given, allowed):
 def resolve(document, base='.'):
     """The complete run configuration: ``document`` with every default filled in and paths made absolute."""
     from vesuvius.neural_tracing.tracers.fibers.data.datasets import parse_dataset_config
-    from vesuvius.neural_tracing.tracers.fibers.data.data import TASKS
+    from vesuvius.neural_tracing.tracers.fibers.data.tasks import TASKS
     base = Path(base).resolve()
     document = json.loads(json.dumps(document))
     unknown('top-level', document, (*TOP_LEVEL, *SECTIONS))
@@ -181,7 +181,7 @@ def model_config(run):
 
 
 def validate(run):
-    from vesuvius.neural_tracing.tracers.fibers.data.data import TASKS, TaskBudget
+    from vesuvius.neural_tracing.tracers.fibers.data.tasks import TASKS, TaskBudget
     t, r = run['training'], run['runtime']
     TaskBudget(tuple(t['task_shares'][name] for name in TASKS), terminal_fallback_cap=t['terminal_fallback_cap'],
                replay_max_age=t['replay_max_age'], replay_event_cap=t['replay_event_cap'])

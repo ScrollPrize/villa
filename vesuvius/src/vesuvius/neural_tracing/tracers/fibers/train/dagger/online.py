@@ -7,7 +7,7 @@ import sys
 
 import numpy as np
 
-from vesuvius.neural_tracing.tracers.fibers.data.data import OnPolicyStates
+from vesuvius.neural_tracing.tracers.fibers.data.replay import OnPolicyStates
 
 
 def publish_replay(index, paths):

@@ -8,7 +8,7 @@ import warnings
 
 import numpy as np
 
-from vesuvius.neural_tracing.tracers.fibers.data.data import TracedFiber
+from vesuvius.neural_tracing.tracers.fibers.data.fibers import TracedFiber
 from vesuvius.neural_tracing.tracers.fibers.frames.ct import oriented_seed_heading, SeedHeadingError, SEED_HEADING_POLICY
 from vesuvius.neural_tracing.tracers.shared.geometry import interp_at, tangent_at
 from vesuvius.neural_tracing.tracers.shared.io import jsonable
