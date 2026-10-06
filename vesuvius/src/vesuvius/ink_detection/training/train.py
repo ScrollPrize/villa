@@ -406,8 +406,11 @@ def _run_training(request: TrainingRequest) -> int:
 
     config = request.config
     canonical = config.to_mapping()
+    # Only CUDA gets non_blocking, and Accelerate places batches on CUDA only
+    # when torch.cuda.is_available(). On torch 2.11/2.12 an MPS copy can read a
+    # host batch after the loader frees it (pytorch/pytorch#189690).
     data_loader_configuration = accelerate.DataLoaderConfiguration(
-        non_blocking=True
+        non_blocking=torch.cuda.is_available()
     )
     ddp_kwargs = DistributedDataParallelKwargs(
         find_unused_parameters=config.ddp_find_unused_parameters,
