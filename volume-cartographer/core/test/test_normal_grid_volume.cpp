@@ -11,6 +11,7 @@
 
 #include <opencv2/core.hpp>
 
+#include <atomic>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -18,6 +19,8 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <vector>
 
 namespace fs = std::filesystem;
 using vc::core::util::NormalGridVolume;
@@ -263,14 +266,28 @@ struct ScopedEnv {
     ~ScopedEnv() { unsetenv(name.c_str()); }
 };
 
-TEST_CASE("Default mode (no env): the cache holds 512 entries, as it always has")
+TEST_CASE("Default mode (no env): the byte budget is on and lifts the 512-entry cap")
 {
-    // The byte budget is OPT-IN. With neither variable set the behaviour must be
-    // the historical one: an entry cap of exactly 512.
     unsetenv("VC_GRID_CACHE_BYTES");
     unsetenv("VC_GRID_CACHE_ENTRIES");
     const int kSlices = 700;
     auto d = makeSlices("default_mode", kSlices);
+    NormalGridVolume v(d.string());
+    for (int i = 0; i < kSlices; ++i) REQUIRE(v.get_grid(0, i) != nullptr);
+    CHECK(v.cacheStats().liveGridEntries == kSlices);   // 700 > 512: all resident
+    v.resetCacheStats();
+    for (int i = 0; i < kSlices; ++i) REQUIRE(v.get_grid(0, i) != nullptr);
+    CHECK(v.cacheStats().gridMisses == 0);
+    fs::remove_all(d);
+}
+
+TEST_CASE("VC_GRID_CACHE_BYTES=0: the budget is off and the cache holds 512 entries, as before")
+{
+    // 0 must restore the historical behaviour: an entry cap of exactly 512.
+    unsetenv("VC_GRID_CACHE_ENTRIES");
+    ScopedEnv off("VC_GRID_CACHE_BYTES", "0");
+    const int kSlices = 700;
+    auto d = makeSlices("budget_off", kSlices);
     NormalGridVolume v(d.string());
     for (int i = 0; i < kSlices; ++i) {
         auto g = v.get_grid(0, i);
@@ -278,17 +295,60 @@ TEST_CASE("Default mode (no env): the cache holds 512 entries, as it always has"
         CHECK(g->numSegments() >= 1);
     }
     CHECK(v.cacheStats().liveGridEntries == 512);
-    // The first slice is long evicted: reading it is a miss, and still valid.
+    // 188 of the 700 slices are no longer cached. Which ones is up to the
+    // randomised eviction (the oldest entry survives 188 evictions about once
+    // in 40 runs), so read every slice again: at least those 188 miss, every
+    // read is still valid, and the cap holds.
     v.resetCacheStats();
-    auto again = v.get_grid(0, 0);
-    REQUIRE(again != nullptr);
-    CHECK(again->numSegments() >= 1);
-    CHECK(v.cacheStats().gridMisses == 1);
+    for (int i = 0; i < kSlices; ++i) {
+        auto g = v.get_grid(0, i);
+        REQUIRE(g != nullptr);
+        CHECK(g->numSegments() >= 1);
+    }
+    CHECK(v.cacheStats().gridMisses >= static_cast<uint64_t>(kSlices - 512));
     CHECK(v.cacheStats().liveGridEntries == 512);
     fs::remove_all(d);
 }
 
-TEST_CASE("Opt-in byte budget: a large budget lifts the 512-entry cap")
+TEST_CASE("Default mode: the built-in budget never holds fewer slices than the old cap did")
+{
+    // 300 slices padded to 8 MiB each are charged 2.4 GiB, more than the 2 GiB
+    // default. With the built-in budget all of them must stay resident, since
+    // 300 is within the 512 entries the cache always kept. The same budget
+    // given explicitly is taken at its word and evicts. (The padding is a
+    // hole at the end of each file: it takes no disk space and is never read.)
+    unsetenv("VC_GRID_CACHE_BYTES");
+    unsetenv("VC_GRID_CACHE_ENTRIES");
+    const int kSlices = 300;
+    auto d = makeSlices("budget_floor", kSlices);
+    for (int i = 0; i < kSlices; ++i) {
+        char name[64];
+        snprintf(name, sizeof(name), "%06d.grid", i);
+        fs::resize_file(d / "xy" / name, 8ull << 20);
+    }
+
+    {
+        NormalGridVolume v(d.string());
+        for (int i = 0; i < kSlices; ++i) REQUIRE(v.get_grid(0, i) != nullptr);
+        CHECK(v.cacheStats().liveGridEntries == kSlices);
+        v.resetCacheStats();
+        for (int i = 0; i < kSlices; ++i) {
+            auto g = v.get_grid(0, i);
+            REQUIRE(g != nullptr);
+            CHECK(g->numSegments() >= 1);       // a padded file still reads
+        }
+        CHECK(v.cacheStats().gridMisses == 0);
+    }
+    {
+        ScopedEnv b("VC_GRID_CACHE_BYTES", std::to_string(2ull << 30));
+        NormalGridVolume v(d.string());
+        for (int i = 0; i < kSlices; ++i) REQUIRE(v.get_grid(0, i) != nullptr);
+        CHECK(v.cacheStats().liveGridEntries < kSlices);
+    }
+    fs::remove_all(d);
+}
+
+TEST_CASE("Byte budget: a large budget lifts the 512-entry cap")
 {
     const int kSlices = 700;
     auto d = makeSlices("bytes_lifts_cap", kSlices);
@@ -330,7 +390,7 @@ TEST_CASE("Explicit VC_GRID_CACHE_ENTRIES: the cap holds, and an evicted slice r
     fs::remove_all(d);
 }
 
-TEST_CASE("Opt-in byte budget: bytes, not entries, bound the cache")
+TEST_CASE("Byte budget: bytes, not entries, bound the cache")
 {
     const int kSlices = 300;
     auto d = makeSlices("bytes", kSlices);
@@ -363,7 +423,7 @@ TEST_CASE("Opt-in byte budget: bytes, not entries, bound the cache")
     fs::remove_all(d);
 }
 
-TEST_CASE("Opt-in byte budget: growth of a store's decoded cache after insertion is "
+TEST_CASE("Byte budget: growth of a store's decoded cache after insertion is "
           "re-counted even when nothing new is inserted")
 {
     // A store's decoded-polyline cache grows on use, after it was charged. If
@@ -408,5 +468,62 @@ TEST_CASE("Opt-in byte budget: growth of a store's decoded cache after insertion
     // read hits. With it re-counted, the budget evicts, and evicted slices are
     // re-read from disk.
     CHECK(v.cacheStats().gridMisses > 0);
+    fs::remove_all(d);
+}
+
+TEST_CASE("Byte budget: concurrent readers get the slice they asked for while the budget evicts")
+{
+    // The budget is on by default, so it has to hold up under the tracer's
+    // threads: readers decode slices while a budget smaller than the working
+    // set keeps evicting, and the hit-path re-count takes the exclusive lock
+    // in between. Run under ThreadSanitizer this is also the race check.
+    const int kSlices = 300;
+    const int kThreads = 8;
+    const int kReadsPerThread = 20000;   // 160,000 reads, mostly hits: the re-count fires at least twice
+    auto d = makeSlices("concurrent", kSlices);
+    const uint64_t one_file = fs::file_size(d / "xy" / "000000.grid");
+
+    // What each slice holds, read once on one thread.
+    std::vector<std::vector<cv::Point>> expected(kSlices);
+    {
+        ScopedEnv off("VC_GRID_CACHE_BYTES", "0");
+        NormalGridVolume ref(d.string());
+        for (int i = 0; i < kSlices; ++i) {
+            auto g = ref.get_grid(0, i);
+            REQUIRE(g != nullptr);
+            auto paths = g->get_all();
+            REQUIRE(paths.size() == 1);
+            expected[i] = *paths[0];
+        }
+    }
+
+    ScopedEnv b("VC_GRID_CACHE_BYTES", std::to_string(250 * one_file));
+    NormalGridVolume v(d.string());
+    std::atomic<int> wrong{0};
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&, t] {
+            std::mt19937 rng(1234 + t);
+            std::uniform_int_distribution<int> pick(0, kSlices - 1);
+            for (int n = 0; n < kReadsPerThread; ++n) {
+                const int i = pick(rng);
+                auto g = v.get_grid(0, i);
+                if (!g) {
+                    ++wrong;
+                    continue;
+                }
+                auto paths = g->get_all();
+                if (paths.size() != 1 || *paths[0] != expected[i]) {
+                    ++wrong;
+                }
+            }
+        });
+    }
+    for (auto& th : threads) th.join();
+
+    CHECK(wrong.load() == 0);
+    const auto st = v.cacheStats();
+    CHECK(st.gridMisses > static_cast<uint64_t>(kSlices));   // the budget did evict
+    CHECK(st.liveGridEntries <= 250);
     fs::remove_all(d);
 }

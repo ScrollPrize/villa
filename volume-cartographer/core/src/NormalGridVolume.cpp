@@ -50,6 +50,23 @@
         return fallback;
     }
 
+    // A byte count from the environment, or nullopt when the variable is unset
+    // or not a number. Unlike env_size, 0 is a value here: it is how the byte
+    // budget is switched off.
+    static std::optional<size_t> env_bytes(const char* name)
+    {
+        const char* e = std::getenv(name);
+        if (!e || !*e) {
+            return std::nullopt;
+        }
+        char* end = nullptr;
+        const long long v = std::strtoll(e, &end, 10);
+        if (end == e || v < 0) {
+            return std::nullopt;
+        }
+        return static_cast<size_t>(v);
+    }
+
      struct NormalGridVolume::pimpl {
          std::string base_path;
          int sparse_volume;
@@ -66,13 +83,15 @@
          // own slot.
          mutable std::vector<cv::Vec2i> cache_keys;
          mutable uint64_t generation_counter = 0;
-         // Optional budget in BYTES (opt-in) instead of the entry cap.
+         // Budget in BYTES instead of the entry cap, on by default.
          //
-         // DEFAULT BEHAVIOUR IS UNCHANGED: with VC_GRID_CACHE_BYTES unset the
-         // cache holds at most 512 entries, as it always has, and none of the
-         // byte accounting below runs. Set VC_GRID_CACHE_BYTES=<bytes> to bound
-         // the cache by size instead (the entry cap then relaxes to a 65,536
-         // backstop unless VC_GRID_CACHE_ENTRIES says otherwise).
+         // With VC_GRID_CACHE_BYTES unset the cache is bounded by
+         // kDefaultCacheBytes of accounted bytes (but see budget_floor_entries),
+         // and the entry cap relaxes to a 65,536 backstop unless
+         // VC_GRID_CACHE_ENTRIES says otherwise. VC_GRID_CACHE_BYTES=<bytes>
+         // sets another budget. VC_GRID_CACHE_BYTES=0 switches the budget off:
+         // the cache then holds at most 512 entries, as it did before, and none
+         // of the byte accounting below runs.
          //
          // An entry count is the wrong unit here. A cached GridStore costs the
          // .grid file it maps -- whose size varies by an order of magnitude
@@ -111,13 +130,35 @@
          // The budget over-charges rather than under-charges, which is the
          // safe direction. Mappings are file-backed, so concurrent tracers
          // working the same grids share those pages through the page cache.
-         // 0 = byte budget off (default).
-         size_t max_cache_bytes = env_size("VC_GRID_CACHE_BYTES", 0);
+         //
+         // The default of 2 GiB keeps the resident cost near the ~1 GiB the
+         // 512-entry cap was sized for (the accounting over-charges about 2x,
+         // see above) and holds the working set of a seeded trace of up to
+         // about 1 cm^2 on an 8.64 um store; larger traces evict, as before
+         // (a 200-generation patch, VC3D's default, stops gaining at about
+         // 8 GiB at eight threads).
+         // It is kept small and fixed because batch runs start one tracer per
+         // core. On a store of large slices the accounting over-charges far
+         // more (about 9x on PHercParis4 at 2.4 um, where a trace reads a
+         // small window of slices of up to 5 MiB), so such a store wants a
+         // larger VC_GRID_CACHE_BYTES.
+         static constexpr size_t kDefaultCacheBytes = size_t{2} << 30;
+         // The entry cap the cache had before the byte budget.
+         static constexpr size_t kLegacyCacheEntries = 512;
+         std::optional<size_t> env_cache_bytes = env_bytes("VC_GRID_CACHE_BYTES");
+         // 0 = byte budget off.
+         size_t max_cache_bytes = env_cache_bytes.value_or(kDefaultCacheBytes);
          bool byte_budget = max_cache_bytes > 0;
-         // Entry cap. 512 by default. With a byte budget it becomes a backstop so
+         // The built-in budget never evicts below the old cap. Slices of a
+         // large volume can be big enough (PHercParis4's 2.4 um grids run to
+         // about 5 MiB each) that fewer than 512 of them fit in the default,
+         // and the default must not hold less than the cache used to. An
+         // explicit VC_GRID_CACHE_BYTES is taken at its word.
+         size_t budget_floor_entries = env_cache_bytes ? 0 : kLegacyCacheEntries;
+         // Entry cap. 512 without a byte budget. With one it becomes a backstop so
          // a volume of unusually tiny slices cannot grow the map without bound.
          size_t max_cache_entries =
-             env_size("VC_GRID_CACHE_ENTRIES", byte_budget ? 65536 : 512);
+             env_size("VC_GRID_CACHE_ENTRIES", byte_budget ? 65536 : kLegacyCacheEntries);
          mutable size_t cache_bytes = 0;
          // A store's decoded-polyline cache keeps growing AFTER it is inserted
          // (on hits), so the running total drifts low. It is therefore
@@ -522,7 +563,7 @@
         void insert_locked(const cv::Vec2i& key, std::shared_ptr<GridStore> store) const
         {
             // Only measured when a byte budget is on: residentBytes() walks the
-            // store's cells, and the default (entry-cap) mode does not need it.
+            // store's cells, and the entry-cap mode does not need it.
             const size_t entry_bytes = (byte_budget && store) ? store->residentBytes() : 0;
             auto it = grid_cache.find(key);
             if (it != grid_cache.end()) {
@@ -601,10 +642,12 @@
         }
 
         // Caller must hold the exclusive lock. Evict until both the byte
-        // budget and the entry backstop hold. Always keeps at least one entry.
+        // budget and the entry backstop hold. Always keeps at least one entry,
+        // and the byte budget alone never goes below budget_floor_entries.
         void evict_to_budget_locked() const
         {
-            while (((byte_budget && cache_bytes > max_cache_bytes)
+            while (((byte_budget && cache_bytes > max_cache_bytes
+                     && grid_cache.size() > budget_floor_entries)
                     || grid_cache.size() > max_cache_entries)
                    && grid_cache.size() > 1) {
                 if (!evict_one_locked()) {
