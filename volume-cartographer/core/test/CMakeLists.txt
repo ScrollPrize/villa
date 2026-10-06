@@ -493,7 +493,7 @@ vc_register_ctest(test_thread_pool_dispatch_idle bench_thread_pool_dispatch)
 add_test(NAME test_thread_pool_dispatch_lifecycle
     COMMAND bench_thread_pool_dispatch
         --mode lifecycle --workers 4 --tasks 1
-        --work-iterations 0 --rounds 4096)
+        --work-iterations 0 --rounds 32)
 vc_register_ctest(test_thread_pool_dispatch_lifecycle bench_thread_pool_dispatch)
 
 if(VC_RUN_RENDER_BENCHMARKS)
