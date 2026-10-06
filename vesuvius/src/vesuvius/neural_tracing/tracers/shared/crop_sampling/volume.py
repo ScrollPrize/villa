@@ -10,7 +10,6 @@ from __future__ import annotations
 import json
 import mmap
 import os
-import tempfile
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -20,6 +19,7 @@ from urllib.parse import urlsplit
 import numcodecs
 import numpy as np
 
+from vesuvius.neural_tracing.tracers.shared.io import atomic_write
 from vesuvius.neural_tracing.tracers.shared.retired import ANY, retire
 
 _VCZ1_REGISTERED = False
@@ -196,6 +196,25 @@ class ChunkedArray:
         return out
 
 
+def chunk_slices(key, chunks, shape):
+    """Source-array slices of chunk ``key`` (the last chunk along an axis may be partial)."""
+    start = np.asarray(key)*np.asarray(chunks)
+    stop = np.minimum(start+np.asarray(chunks), shape)
+    return tuple(slice(int(a), int(b)) for a,b in zip(start,stop))
+
+
+def padded_chunk(values, chunks, fill, dtype):
+    """A full ``chunks``-shaped chunk holding ``values``, filled with ``fill`` beyond a partial edge."""
+    result = np.full(chunks, fill, dtype)
+    result[tuple(slice(0,n) for n in values.shape)] = values
+    return result
+
+
+def chunk_lock_path(root, key):
+    """The advisory lock file serializing fetches of chunk ``key`` into the cache at ``root``."""
+    return Path(root)/'.locks'/'.'.join(map(str,key))
+
+
 class RemoteChunkedArray(ChunkedArray):
     """Fetch on demand into an uncompressed, memory-mapped local Zarr v2.
 
@@ -230,22 +249,8 @@ class RemoteChunkedArray(ChunkedArray):
             dtype=np.dtype(array.dtype).str,fill_value=np.asarray(getattr(array,'metadata',array).fill_value or 0).item(),
             compressor=None,filters=None,order='C',
             dimension_separator=getattr(getattr(array,'metadata',array),'dimension_separator','.'))
-        cls._atomic_write(local/'.zattrs',json.dumps(dict(remote_url=url,level=level)).encode())
-        cls._atomic_write(local/'.zarray',json.dumps(metadata).encode())
-
-    @staticmethod
-    def _atomic_write(path, data):
-        path = Path(path)
-        path.parent.mkdir(parents=True,exist_ok=True)
-        temporary = None
-        try:
-            with tempfile.NamedTemporaryFile(dir=path.parent,prefix='.partial-',delete=False) as stream:
-                temporary = Path(stream.name)
-                stream.write(data)
-            os.replace(temporary,path)
-        finally:
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
+        atomic_write(local/'.zattrs',json.dumps(dict(remote_url=url,level=level)).encode())
+        atomic_write(local/'.zarray',json.dumps(metadata).encode())
 
     def _open(self):
         import zarr
@@ -265,7 +270,7 @@ class RemoteChunkedArray(ChunkedArray):
         # Cached reads avoid the lock. A reader waits for a chunk another reader is
         # fetching, without downloading it twice.
         import fcntl
-        lock_path = Path(self.path)/'.locks'/'.'.join(map(str,key))
+        lock_path = chunk_lock_path(self.path, key)
         lock_path.parent.mkdir(exist_ok=True)
         with lock_path.open('a+b') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
@@ -275,12 +280,9 @@ class RemoteChunkedArray(ChunkedArray):
             with self._lock:
                 if self._array is None:
                     self._array = self._open()
-            start = np.asarray(key)*self.chunks
-            stop = np.minimum(start+self.chunks, self.shape)
-            values = np.asarray(self._array[tuple(slice(int(a), int(b)) for a,b in zip(start,stop))])
-            result = np.full(self.chunks, self.fill, self.dtype)
-            result[tuple(slice(0,n) for n in values.shape)] = values
-            self._atomic_write(Path(self.path)/self.sep.join(map(str,key)),result.tobytes(order='C'))
+            values = np.asarray(self._array[chunk_slices(key, self.chunks, self.shape)])
+            result = padded_chunk(values, self.chunks, self.fill, self.dtype)
+            atomic_write(Path(self.path)/self.sep.join(map(str,key)),result.tobytes(order='C'))
             return super()._load(key)
 
 

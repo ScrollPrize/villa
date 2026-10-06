@@ -3,6 +3,8 @@ import json
 from pathlib import Path
 import numpy as np
 
+from vesuvius.neural_tracing.tracers.shared.io import atomic_write
+
 ZSCORE_METHOD = 'crop_zscore_v1'
 ZSCORE_EPSILON = 1e-6
 
@@ -70,7 +72,7 @@ def prepare_normalization(out, specs, *, known=None):
         spec.ct_normalization = dict(record)
         print(f'CT per-crop z-score, epsilon {ZSCORE_EPSILON:g}: {key}', flush=True)
     if not path.exists() or json.loads(path.read_text()) != document:
-        RemoteChunkedArray._atomic_write(path, (json.dumps(document, indent=2)+'\n').encode())
+        atomic_write(path, (json.dumps(document, indent=2)+'\n').encode())
     return document
 
 

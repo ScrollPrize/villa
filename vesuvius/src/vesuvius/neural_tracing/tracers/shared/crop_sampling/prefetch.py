@@ -17,7 +17,8 @@ import uuid
 
 import numpy as np
 
-from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import RemoteChunkedArray, open_remote_array
+from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import RemoteChunkedArray, chunk_lock_path, chunk_slices, open_remote_array, padded_chunk
+from vesuvius.neural_tracing.tracers.shared.io import atomic_write
 
 DEMAND, AHEAD = 0, 10
 COUNTERS = ('submitted', 'deferred', 'cached', 'completed', 'completed_bytes',
@@ -175,7 +176,7 @@ class AsyncFetcher:
             array = await self.array(descriptor)
             await asyncio.to_thread(RemoteChunkedArray.publish_metadata,path.parent,array,*descriptor[:2])
             return 'completed',0
-        lock_path = RemoteChunkedArray.cache_path(*descriptor)/'.locks'/'.'.join(map(str,key))
+        lock_path = chunk_lock_path(RemoteChunkedArray.cache_path(*descriptor), key)
         lock_path.parent.mkdir(parents=True,exist_ok=True)
         with lock_path.open('a+b') as lock:
             while True:
@@ -188,14 +189,11 @@ class AsyncFetcher:
             if path.is_file():
                 return 'cached',0
             array = await self.array(descriptor)
-            start = np.asarray(key)*array.chunks
-            stop = np.minimum(start+array.chunks,array.shape)
-            values = await array.getitem(tuple(slice(int(a),int(b)) for a,b in zip(start,stop)))
-            result = np.full(array.chunks,getattr(array,'metadata',array).fill_value or 0,array.dtype)
-            result[tuple(slice(0,n) for n in values.shape)] = values
+            values = await array.getitem(chunk_slices(key, array.chunks, array.shape))
+            result = padded_chunk(values, array.chunks, getattr(array,'metadata',array).fill_value or 0, array.dtype)
             # Disk writes run off the network event loop. Finish an atomic write
             # before releasing its chunk lock, even when the request is preempted.
-            write = asyncio.create_task(asyncio.to_thread(RemoteChunkedArray._atomic_write,path,result.tobytes(order='C')))
+            write = asyncio.create_task(asyncio.to_thread(atomic_write,path,result.tobytes(order='C')))
             try:
                 await asyncio.shield(write)
             except asyncio.CancelledError:
@@ -212,7 +210,7 @@ class AsyncFetcher:
                     await asyncio.sleep(.25*2**attempt)
                     continue
                 _,error_path = _paths(descriptor,key,self.session)
-                await asyncio.to_thread(RemoteChunkedArray._atomic_write,error_path,
+                await asyncio.to_thread(atomic_write,error_path,
                     json.dumps(dict(source=descriptor[0],chunk=key,error=str(error))).encode())
                 return 'errors',0
 
