@@ -138,3 +138,30 @@ def crop_batch(cfg, b=2):
     batch['crop_curve_mask'] = torch.ones(b, len(z), dtype=torch.bool)
     batch['crop_curve_open_ends'] = torch.zeros(b, 2, dtype=torch.bool)
     return batch
+
+
+def test_flow_generates_the_whole_crop_curve_and_commits_its_proposal_planes():
+    from vesuvius.neural_tracing.fiber_follow.models.flow import FlowConfig, fit_flow_sigma, flow_targets
+    torch.manual_seed(3)
+    crop = CropSpec(depth=24, width=20, behind=12, spacing=1.)
+    base = coordinate_config(fine=crop, n_future=4, future_step=2., path_planes='crop', memory='none')
+    planes = len(base.path_plane_values)
+    cfg = FlowConfig(**(base.to_dict() | dict(model_type='flow_matching', recurrent_refinement_steps=0, flow_steps=2,
+                                              flow_draws=2, flow_samples=2, flow_unknown_planes='own_path',
+                                              flow_sigma=((1., 1.),)*planes)))
+    model = build_model(cfg).train()
+    batch = crop_batch(cfg)
+    batch['crop_ab'][0, :, 0] = 3.  # the original fiber 3 voxels to the side of the head, behind and ahead
+    assert fit_flow_sigma(iter([batch]), cfg, 2)[cfg.proposal_slice.start] == (1.5, 1.)
+    batch['crop_mask'][1, :planes//2] = 0  # unknown planes behind the head for the second state
+    target, known = flow_targets(batch, cfg)
+    torch.testing.assert_close(target, torch.where(known[..., None], batch['crop_ab'], 0.))
+    out = model.training_forward(batch['x'], batch['hist'], batch['hmask'], batch['hist'].new_full((), .5), batch)
+    assert out['refinement_points'].shape == (2, 3, cfg.n_future, 3) and out['crop_points'].shape == (2, planes, 3)
+    torch.testing.assert_close(out['crop_points'][:, cfg.proposal_slice], out['refinement_points'][:, 0])
+    torch.testing.assert_close(out['refinement_points'][0, 0, :, 2], torch.tensor([2., 4., 6., 8.]))
+    out['flow_per_state'].sum().backward()
+    assert torch.isfinite(out['flow_per_state']).all() and model.velocity.weight.grad.abs().sum() > 0
+    model.eval()
+    with torch.no_grad():
+        assert model(batch['x'], batch['hist'], batch['hmask'])['points'].shape == (2, cfg.n_future, 3)

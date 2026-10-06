@@ -60,10 +60,10 @@ class FlowConfig(CoordinateRegressionConfig):
             raise ValueError('The flow sample threshold lies in [0, 1]')
         if not (math.isfinite(self.flow_sigma_floor) and self.flow_sigma_floor >= 1):
             raise ValueError('The flow scale floor must be finite and at least one voxel')
-        if self.flow_sigma and (len(self.flow_sigma) != self.n_future or any(
+        if self.flow_sigma and (len(self.flow_sigma) != len(self.path_plane_values) or any(
                 len(row) != 2 or any(not math.isfinite(v) or v < self.flow_sigma_floor for v in row)
                 for row in self.flow_sigma)):
-            raise ValueError('Flow scales must contain two finite values >= the scale floor per future plane')
+            raise ValueError('Flow scales must contain two finite values >= the scale floor per path plane')
 
 
 def time_embedding(t, width=64):
@@ -73,7 +73,11 @@ def time_embedding(t, width=64):
 
 
 def flow_targets(batch, cfg):
-    """Use the common geometry contract, sampled at the output planes."""
+    """Use the common geometry contract, sampled at the output planes. With whole-crop path planes the target is
+    the original fiber's crossing of every crop plane, wherever the head is (models/whole_crop.py)."""
+    if cfg.path_planes == 'crop':
+        mask = batch['crop_mask'].bool()
+        return torch.where(mask[..., None], batch['crop_ab'].float(), 0.), mask
     from ..train.supervision import geometry_mask
     indices = torch.linspace(0, batch['dense_ab'].shape[1]-1, cfg.n_future,
                              device=batch['dense_ab'].device).round().long()
@@ -84,8 +88,8 @@ def flow_targets(batch, cfg):
 
 def fit_flow_sigma(batches, cfg, states=2048):
     """Fit physical residual scales from training targets only, bounded below by the scale floor."""
-    count = torch.zeros(cfg.n_future, dtype=torch.float64)
-    total = torch.zeros(cfg.n_future, 2, dtype=torch.float64)
+    count = torch.zeros(len(cfg.path_plane_values), dtype=torch.float64)
+    total = torch.zeros(len(cfg.path_plane_values), 2, dtype=torch.float64)
     square = torch.zeros_like(total)
     seen = 0
     while seen < states:
@@ -128,9 +132,15 @@ class FlowFollower(ObservationFollower):
                 nn.init.zeros_(linear.weight)
                 nn.init.zeros_(linear.bias)
         self.register_buffer('sigma', torch.tensor(cfg.flow_sigma, dtype=torch.float32), persistent=False)
+        # Flow planes: planes 1..n_future, or every whole-crop plane; the proposal (scorer, gate, tracer, labels) is
+        # always planes 1..n_future. Plain Python values, so compiled graphs do not trace the numpy behind them.
+        self.register_buffer('flow_planes', torch.tensor(cfg.path_plane_values, dtype=torch.float32), persistent=False)
+        self.proposal = cfg.proposal_slice
+        self.plane_scale = (cfg.n_future*cfg.future_step if cfg.path_planes == 'future'
+                            else float(abs(cfg.path_plane_values).max()))
 
     def to_points(self, y):
-        z = self.planes.reshape(*([1]*(y.ndim-2)), -1, 1).expand(*y.shape[:-1], 1)
+        z = self.flow_planes.reshape(*([1]*(y.ndim-2)), -1, 1).expand(*y.shape[:-1], 1)
         return torch.cat((y*self.sigma, z), -1)
 
     def prepare_prediction(self, ctx, hist):
@@ -147,7 +157,7 @@ class FlowFollower(ObservationFollower):
         points = self.to_points(y)
         evidence, support = self.sample_local(ctx['deep'].float(), points.reshape(b, draws*planes, 3))
         evidence = evidence.reshape(b, draws, planes, -1)
-        forward = points[..., 2:]/(self.cfg.n_future*self.cfg.future_step)
+        forward = points[..., 2:]/self.plane_scale
         query = self.query(torch.cat((evidence.to(ctx['deep'].dtype), y, forward,
                                       support.reshape(b, draws, planes, 1)), -1))
         time = self.time(time_embedding(t))
@@ -169,7 +179,7 @@ class FlowFollower(ObservationFollower):
     def generate(self, ctx, hist, start=None):
         """Midpoint integration from ``start`` (B, D, P, 2), by default the zero path (D=1).
         Returns the (B, D, P, 3) points at every solver step."""
-        y = hist.new_zeros(len(hist), 1, self.cfg.n_future, 2) if start is None else start
+        y = hist.new_zeros(len(hist), 1, len(self.flow_planes), 2) if start is None else start
         curves = [self.to_points(y)]
         with torch.no_grad():
             for step in range(self.cfg.flow_steps):
@@ -187,10 +197,10 @@ class FlowFollower(ObservationFollower):
         decision's noise depends on its key only (not on batch neighbours, batch size or precision).
         Without keys (training) the global RNG draws them.
         """
-        zero = hist.new_zeros(len(hist), 1, self.cfg.n_future, 2)
+        zero = hist.new_zeros(len(hist), 1, len(self.flow_planes), 2)
         if not self.cfg.flow_samples:
             return zero
-        shape = (self.cfg.flow_samples, self.cfg.n_future, 2)
+        shape = (self.cfg.flow_samples, len(self.flow_planes), 2)
         if keys is None:
             noise = torch.randn(len(hist), *shape, device=hist.device)
         else:
@@ -204,10 +214,11 @@ class FlowFollower(ObservationFollower):
         ctx = self.context(x, hist, hmask)
         self.prepare_prediction(ctx, hist)
         generated = self.generate(ctx, hist, self.proposal_starts(hist, x.get('flow_noise_keys')))
-        curves = [curve[:, 0] for curve in generated]
+        full = generated[-1][:, 0]  # the first proposal's integrated path on every flow plane
+        curves = [curve[:, 0, self.proposal] for curve in generated]
         points = curves[-1]
         # Every proposal is scored, so the confidence loss trains the scorer on sampled paths too.
-        proposals = list(generated[-1].unbind(1))
+        proposals = list(generated[-1][:, :, self.proposal].unbind(1))
         scores = []
         for proposal in proposals:
             hazards = self.hazard_logits(ctx, proposal)
@@ -215,6 +226,8 @@ class FlowFollower(ObservationFollower):
         valid = [torch.ones(len(hist), device=hist.device, dtype=torch.bool)]*len(proposals)
         result = self.proposal_output(curves[0], proposals, scores, valid)
         result['solver_points'] = torch.stack(curves, 1)
+        if self.cfg.path_planes == 'crop':
+            result['crop_points'] = full
         # Same memory record and identity heads as coordinate regression, at the integrated path.
         if 'memory_entry' in ctx:
             result['memory_entry'] = ctx['memory_entry']
@@ -225,13 +238,13 @@ class FlowFollower(ObservationFollower):
             b, draws = len(hist), self.cfg.flow_draws
             noise = targets.get('flow_noise')
             if noise is None:
-                noise = torch.randn(b, draws, self.cfg.n_future, 2, device=hist.device)
+                noise = torch.randn(b, draws, len(self.flow_planes), 2, device=hist.device)
             times = targets.get('flow_times')
             if times is None:
                 times = (torch.arange(draws, device=hist.device)[None]+torch.rand(b, draws, device=hist.device))/draws
             if self.cfg.flow_unknown_planes == 'own_path':
                 # Unknown planes stay in self-attention as at tracing, heading for the zero-start path.
-                fill, attended = (points[..., :2]/self.sigma)[:, None].to(noise.dtype), None
+                fill, attended = (full[..., :2]/self.sigma)[:, None].to(noise.dtype), None
             else:
                 fill, attended = noise, known
             end = torch.where(known[:, None, :, None], (target/self.sigma)[:, None], fill)

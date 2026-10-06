@@ -8,6 +8,7 @@ from vesuvius.neural_tracing.fiber_follow.data.labels import prefix_labels
 from vesuvius.neural_tracing.fiber_follow.data.state_labels import RECOVERABLE, TERMINAL
 from vesuvius.neural_tracing.fiber_follow.models.model import feature_grid
 from vesuvius.neural_tracing.fiber_follow.models.survival_confidence import survival_loss
+from vesuvius.neural_tracing.fiber_follow.tracing.policy import commit_prefix, gate_horizon
 
 CONNECTOR_SPACING = .25  # same dense spatial resolution as the supervised path
 
@@ -121,13 +122,20 @@ def point_correctness(points, batch, cfg, tolerance, foreign=None):
                 point_unknown_count=(~known).sum())
 
 
-def loss_terms(output, batch, cfg, tolerance=1.5, *, n_commit=None):
+def loss_terms(output, batch, cfg, tolerance=1.5, *, n_commit=None, refinement_loss='policy', refinement_weight=1.,
+               policy_threshold=None):
     """Return numerators/counts so effective-batch means are independent of microbatch.
 
     Unknown/crop-censored targets and uncertified connections do not teach
     localization. Terminal states still teach rejection. Every generated proposal,
     including refinement attempts, receives confidence supervision under the same
     annotation, connection and neighbor semantics as the established evaluation.
+
+    ``refinement_loss='policy'``: attempts are those the retry threshold ran; the last gets 75% of the geometry
+    weight, earlier ones share 25%, and confidence averages the attempts. ``'all'`` (every refinement pass ran for
+    every decision): the initial proposal keeps full geometry and confidence weight and the refinement passes add
+    ``refinement_weight`` x their mean, so no attempt's weight depends on another's acceptance; the attempt count
+    then reports what the operating policy (``policy_threshold``) would run.
     """
     mask = geometry_mask(batch, cfg)
     window = commit_window(cfg, n_commit)
@@ -155,13 +163,26 @@ def loss_terms(output, batch, cfg, tolerance=1.5, *, n_commit=None):
         confidence_losses.append(survival_loss(hazards, labels, known)[0])
     attempts = output['refinement_mask'].bool()
     count = attempts.sum(1)
-    last = count-1
     geometry_losses = torch.stack(geometry_losses, 1)
-    final = geometry_losses.gather(1, last[:, None]).squeeze(1)
-    earlier = attempts & (torch.arange(attempts.shape[1], device=mask.device)[None] < last[:, None])
-    auxiliary = torch.where(earlier, geometry_losses, 0.).sum(1)/(count-1).clamp_min(1)
-    geometry = torch.where(count > 1, .75*final+.25*auxiliary, final)
-    confidence = torch.where(attempts, torch.stack(confidence_losses, 1), 0.).sum(1)/count
+    confidence_losses = torch.stack(confidence_losses, 1)
+    if refinement_loss == 'all':
+        refined = geometry_losses.shape[1] > 1
+        geometry = geometry_losses[:, 0]+(refinement_weight*geometry_losses[:, 1:].mean(1) if refined else 0.)
+        confidence = confidence_losses[:, 0]+(refinement_weight*confidence_losses[:, 1:].mean(1) if refined else 0.)
+        # Attempts the operating policy would run: up to and including the first full-horizon acceptance.
+        gate = gate_horizon(cfg)
+        accepted = torch.stack([commit_prefix(curve, value[..., :gate].detach(), policy_threshold, gate,
+                                              cfg.max_recovery_distance)[0] >= gate
+                                for curve, value in zip(output['refinement_points'].unbind(1),
+                                                        output['refinement_confidence'].unbind(1))], 1)
+        count = 1+(~accepted[:, :-1]).long().cumprod(1).sum(1)
+    else:
+        last = count-1
+        final = geometry_losses.gather(1, last[:, None]).squeeze(1)
+        earlier = attempts & (torch.arange(attempts.shape[1], device=mask.device)[None] < last[:, None])
+        auxiliary = torch.where(earlier, geometry_losses, 0.).sum(1)/(count-1).clamp_min(1)
+        geometry = torch.where(count > 1, .75*final+.25*auxiliary, final)
+        confidence = torch.where(attempts, confidence_losses, 0.).sum(1)/count
     if cfg.model_type == 'flow_matching':
         geometry = output['flow_per_state']
     # Distance-only labels keep their names; identity-aware labels add the neighbor raster.

@@ -28,6 +28,8 @@ class CoordinateRegressionConfig:
     activation_checkpointing: bool = False
     n_future: int = 16
     future_step: float = 1.
+    gate_plane: int | None = None  # plane whose confidence accepts a proposal (full gate, retries); None: the last plane
+    query_scale: float | None = None  # forward-distance normalization of decoder queries; None: n_future*future_step
     n_history: int = 128
     max_recovery_distance: float = 6.
     patch_radius: float = 1.
@@ -88,12 +90,21 @@ class CoordinateRegressionConfig:
             raise ValueError('Local observation patch must fit fine crop')
         if self.n_future*self.future_step > (c.depth-c.behind-1)*c.spacing:
             raise ValueError('Future horizon exceeds fine image')
+        if self.gate_plane is not None and (type(self.gate_plane) is not int or not 1 <= self.gate_plane <= self.n_future):
+            raise ValueError('Gate plane must be an integer in [1, n_future]')
+        if self.query_scale is not None and not (math.isfinite(self.query_scale) and self.query_scale > 0):
+            raise ValueError('Query scale must be finite and positive')
         if not isinstance(self.recurrent_refinement_steps, int) or self.recurrent_refinement_steps < 0:
             raise ValueError('Recurrent refinement steps must be a nonnegative integer')
         if self.path_planes not in ('future', 'crop'):
             raise ValueError("Path planes must be 'future' or 'crop'")
-        if (self.path_planes == 'crop' or self.tube_head) and self.model_type != 'coordinate_regression':
-            raise ValueError('Whole-crop path and tube heads are implemented for coordinate regression only')
+        if self.tube_head and self.model_type != 'coordinate_regression':
+            raise ValueError('The tube head is implemented for coordinate regression only')
+
+    @property
+    def gate_horizon(self):
+        """Planes whose confidence decides acceptance (full gate) and retries; the rest are predicted and supervised."""
+        return self.n_future if self.gate_plane is None else self.gate_plane
 
     @property
     def path_plane_values(self):
@@ -186,7 +197,8 @@ def select_refinement(output, cfg, confidence_threshold=DEFAULT_CONFIDENCE, n_co
     window = cfg.n_future if n_commit is None else n_commit
     curves, confidence = output['refinement_points'], output['refinement_confidence'].detach()
     counts, allowed = commit_prefix(curves, confidence, confidence_threshold, window, cfg.max_recovery_distance)
-    accepted = (confidence[..., -1] >= confidence_threshold) & allowed & output['refinement_mask']
+    gate = getattr(cfg, 'gate_horizon', confidence.shape[-1])  # acceptance through the gate plane, as in tracing
+    accepted = (confidence[..., gate-1] >= confidence_threshold) & allowed & output['refinement_mask']
     prior_accept = torch.cat((torch.zeros_like(accepted[:, :1]), accepted[:, :-1]), 1).long().cumsum(1) > 0
     valid = output['refinement_mask'] & ~prior_accept if retry else output['refinement_mask'].bool()
     longest = counts.masked_fill(~valid, -1).max(-1, keepdim=True).values
@@ -757,7 +769,7 @@ class CoordinateRegressionFollower(ObservationFollower):
             self.register_buffer('path_planes', torch.tensor(values, dtype=torch.float32), persistent=False)
         # Plain Python values (compiled graphs must not trace the numpy that defines them).
         self.proposal = cfg.proposal_slice
-        self.query_scale = (cfg.n_future*cfg.future_step if cfg.path_planes == 'future'
+        self.query_scale = ((cfg.query_scale or cfg.n_future*cfg.future_step) if cfg.path_planes == 'future'
                             else float(abs(cfg.path_plane_values).max()))
         if cfg.tube_head:
             from .whole_crop import TubeHead
@@ -837,11 +849,12 @@ class CoordinateRegressionFollower(ObservationFollower):
         indices = torch.arange(len(points), device=points.device)
         active_ctx = ctx
         for stage in range(cfg.recurrent_refinement_steps):
-            # A full-horizon acceptance ends this row's retries. Dynamic batch
+            # An acceptance through the gate plane ends this row's retries. Dynamic batch
             # compaction skips both generator and scorer work for accepted rows.
-            counts, _ = commit_prefix(points, confidence.detach(), confidence_threshold,
-                                      cfg.n_future, cfg.max_recovery_distance)
-            keep = torch.nonzero(counts < cfg.n_future).flatten()
+            gate = cfg.gate_horizon
+            counts, _ = commit_prefix(points, confidence[..., :gate].detach(), confidence_threshold,
+                                      gate, cfg.max_recovery_distance)
+            keep = torch.nonzero(counts < gate).flatten()
             if not len(keep):
                 break
             if len(keep) != len(points):
@@ -902,9 +915,10 @@ class CoordinateRegressionFollower(ObservationFollower):
         active = torch.ones(len(hist), device=hist.device, dtype=torch.bool)
         valid = [active]
         for stage in range(self.cfg.recurrent_refinement_steps):
-            counts, _ = commit_prefix(points, confidence.detach(), threshold,
-                                      self.cfg.n_future, self.cfg.max_recovery_distance)
-            active = active & (counts < self.cfg.n_future)
+            gate = self.cfg.gate_horizon
+            counts, _ = commit_prefix(points, confidence[..., :gate].detach(), threshold,
+                                      gate, self.cfg.max_recovery_distance)
+            active = active & (counts < gate)
             next_decoded, next_points = self.refine_prediction(ctx, points, decoded, hazards, confidence,
                 projected, padding, self.refinement_stage.weight[stage])
             decoded = torch.where(active[:, None, None], next_decoded, decoded)

@@ -49,3 +49,12 @@ def test_resuming_a_run_from_before_gates_requires_its_prefix_policy():
     with pytest.raises(ValueError, match='gate|trace_confidence'):
         validate_resume_options(build_parser().parse_args(REQUIRED), recorded)
     validate_resume_options(build_parser().parse_args(REQUIRED+['--gate', 'prefix', '--trace-confidence', '.5']), recorded)
+
+
+def test_trace_confidence_changes_on_resume_only_when_asked():
+    from model_fixtures import REQUIRED
+    from vesuvius.neural_tracing.fiber_follow.train.train import build_parser, validate_resume_options
+    recorded = vars(build_parser().parse_args(REQUIRED))
+    with pytest.raises(ValueError, match='trace_confidence'):
+        validate_resume_options(build_parser().parse_args(REQUIRED+['--trace-confidence', '.65']), recorded)
+    validate_resume_options(build_parser().parse_args(REQUIRED+['--trace-confidence', '.65', '--change-trace-confidence']), recorded)

@@ -11,7 +11,7 @@ import numpy as np
 import torch
 
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, crop_local_grid, normalize
-from vesuvius.neural_tracing.fiber_follow.tracing.policy import (DEFAULT_CONFIDENCE, DEFAULT_GATE, DEFAULT_N_COMMIT, GATES,
+from vesuvius.neural_tracing.fiber_follow.tracing.policy import (DEFAULT_CONFIDENCE, DEFAULT_GATE, DEFAULT_N_COMMIT, GATES, gate_horizon,
     commit_count, selection_window)
 from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolume
 from vesuvius.neural_tracing.fiber_follow.shared.reference import SEED_FIELDS, observed_path
@@ -159,8 +159,16 @@ class ModelTracer:
                 outputs.append(self.model(rows(x, part), hist[part], hmask[part], **rows(sampling, part)))
         if len(outputs) == 1:
             return outputs[0]
-        return {k: torch.cat([o[k] for o in outputs]) for k in outputs[0]
-                if torch.is_tensor(outputs[0][k]) and outputs[0][k].ndim}
+        def attempts(values):
+            # Adaptive refinement stops once every row of a chunk is accepted, so chunks can return fewer
+            # attempts. Extend them as the unchunked forward does: accepted rows repeat their last attempt, masked out.
+            width = max(v.shape[1] for v in values)
+            def pad(v):
+                tail = v[:, -1:].expand(-1, width-v.shape[1], *v.shape[2:])
+                return torch.cat((v, torch.zeros_like(tail) if v.dtype == torch.bool else tail), 1)
+            return [pad(v) if v.shape[1] < width else v for v in values]
+        return {k: torch.cat(attempts([o[k] for o in outputs]) if k.startswith('refinement_') else [o[k] for o in outputs])
+                for k in outputs[0] if torch.is_tensor(outputs[0][k]) and outputs[0][k].ndim}
 
     def map(self, fn, values):
         """Per-trace CPU work in the tracer's pool; results keep input order."""
@@ -331,14 +339,14 @@ class ModelTracer:
             if (hasattr(self.model, 'select_prediction')
                     or getattr(self.model.cfg, 'candidate_selection', 'prefix') == 'stop_fallback'):
                 sampling.update(confidence_threshold=pp.confidence,
-                                n_commit=selection_window(pp.n_commit, self.model.cfg.n_future, pp.gate))
+                                n_commit=selection_window(pp.n_commit, gate_horizon(self.model.cfg), pp.gate))
             if getattr(self.model.cfg, 'flow_samples', 0):
                 x['flow_noise_keys'] = tensor(np.asarray([decision_noise_key(pp.seed, seeds_xyz[i], decisions[i])
                                                           for i in idx], np.int64))
             out = self.forward(x, tensor(hist).float(), tensor(hm), sampling)
             decisions[idx] += 1
             commits, allowed = commit_count(out['points'], out['confidence'], pp.confidence, pp.n_commit,
-                                            self.model.cfg.max_recovery_distance, pp.gate)
+                                            self.model.cfg.max_recovery_distance, pp.gate, gate_horizon(self.model.cfg))
             commits, allowed = [v.cpu().numpy() for v in (commits, allowed)]
             if memory is not None:
                 self.memory_record(out['memory_entry'], idx, pos, fr, paths, memory)

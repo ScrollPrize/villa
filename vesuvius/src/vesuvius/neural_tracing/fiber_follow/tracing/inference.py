@@ -189,12 +189,26 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer):
     ap.add_argument("--device", default="cuda")
     ap.add_argument('--frame-checkpoint', help='Override the learned frame checkpoint recorded by the follower')
     ap.add_argument("--sampling-seed", type=int, default=0, help="Reproducible per-trace sampling noise")
+    ap.add_argument("--flow-samples", type=int, help="flow: Gaussian-start proposals per decision (default: checkpoint)")
+    ap.add_argument("--flow-sample-scale", type=float, help="flow: their standard deviation in residual-scale units")
+    ap.add_argument("--flow-selection", choices=('retry', 'best'),
+                    help="flow: 'retry' (samples only when the zero start is rejected) or 'best' (one ranking over all)")
+    ap.add_argument("--precision", choices=('bf16', 'fp32'), default='bf16',
+                    help="model arithmetic; fp32 (TF32 off) makes traces independent of batch composition")
     args = ap.parse_args(argv)
 
     model, crop, n_hist, spec, ck = checkpoint_loader(args.checkpoint, args.device)
     if args.frame_checkpoint:
         from vesuvius.neural_tracing.fiber_follow.tracing.crop_frames import bind_frame_checkpoint
         bind_frame_checkpoint(model.cfg, args.frame_checkpoint)
+    for key in ('flow_samples', 'flow_sample_scale', 'flow_selection'):
+        if getattr(args, key) is not None:
+            if model.cfg.model_type != 'flow_matching':
+                raise ValueError(f'--{key.replace("_", "-")} needs a flow checkpoint')
+            setattr(model.cfg, key, getattr(args, key))
+    if args.precision == 'fp32':
+        import torch
+        torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = False
     confidence, n_commit, gate = args.confidence, args.n_commit, args.gate
     if args.policy:
         selected = json.load(open(args.policy))['operating_policy']
@@ -212,7 +226,7 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer):
     prepare_normalization(args.out, [spec], known=ck['ct_normalization'])
     vol = FiberVolume(spec, cache_bytes=8 << 30)
     tracer = tracer_class(model, vol, crop, n_hist, TraceParams.from_policy(policy, max_len=args.max_len,
-        seed=args.sampling_seed), device=args.device)
+        seed=args.sampling_seed, precision=args.precision), device=args.device)
     g = spec.grid_scale
 
     seeds = [np.array([float(v) for v in s.split(",")]) for s in args.seed]

@@ -106,9 +106,18 @@ def commit_prefix(points, confidence, threshold=DEFAULT_CONFIDENCE, n_commit=DEF
     return torch.where(allowed,count,0),allowed
 
 
+def gate_horizon(cfg):
+    """Planes whose confidence decides acceptance (``gate_plane``; the last plane for models without one)."""
+    return getattr(cfg, 'gate_horizon', cfg.n_future)
+
+
 def commit_count(points, confidence, threshold=DEFAULT_CONFIDENCE, n_commit=DEFAULT_N_COMMIT,
-                 max_distance=DEFAULT_MAX_RECOVERY_DISTANCE, gate=DEFAULT_GATE):
-    """Points to commit per proposal under ``gate`` (module docstring) and whether its first connection is allowed."""
+                 max_distance=DEFAULT_MAX_RECOVERY_DISTANCE, gate=DEFAULT_GATE, horizon=None):
+    """Points to commit per proposal under ``gate`` (module docstring) and whether its first connection is allowed.
+
+    ``horizon`` (a model's gate plane) limits the planes whose confidence decides; later planes are only predicted."""
+    if horizon is not None:
+        confidence = confidence[..., :horizon]
     if gate == 'prefix':
         return commit_prefix(points, confidence, threshold, n_commit, max_distance)
     if gate != 'full':

@@ -15,7 +15,7 @@ from vesuvius.neural_tracing.fiber_follow.data.data import DATA_POLICY, FollowDa
 from vesuvius.neural_tracing.fiber_follow.shared.experiment import read_manifest
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
 from vesuvius.neural_tracing.fiber_follow.train.online import OnlineCollector
-from vesuvius.neural_tracing.fiber_follow.tracing.policy import (DEFAULT_CONFIDENCE, DEFAULT_GATE, DEFAULT_N_COMMIT, GATES,
+from vesuvius.neural_tracing.fiber_follow.tracing.policy import (DEFAULT_CONFIDENCE, DEFAULT_GATE, DEFAULT_N_COMMIT, GATES, gate_horizon,
     OperatingPolicy, selection_window)
 from vesuvius.neural_tracing.fiber_follow.train.runloop import RunLog, lr_at, prepare_run_dir, read_checkpoint, save_checkpoint as write_checkpoint, update_ema, training_rng_state, resume_training, raise_open_file_limit
 from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolume, FiberVolumeSpec
@@ -142,7 +142,12 @@ def finish_training_update(model):
                 parameter.grad = None
 
 
-def training_prediction(model, x, hist, hmask, confidence_threshold=.5, n_commit=None, targets=None):
+REFINE_ALL = 2.  # retry threshold above any confidence: every refinement pass runs (--refinement-loss all)
+
+
+def training_prediction(model, x, hist, hmask, confidence_threshold=.5, n_commit=None, targets=None, retry_threshold=None):
+    """Training forward and proposal selection. Selection follows the operating ``confidence_threshold``; refinement
+    passes run while a proposal's confidence is below ``retry_threshold`` (default: the same threshold)."""
     actual = len(hist)
     # A single decision needs no duplicate encoder, proposal or scoring work.
     # Keep only two batch specializations: one row or the configured batch.
@@ -173,7 +178,7 @@ def training_prediction(model, x, hist, hmask, confidence_threshold=.5, n_commit
         # Padding repeats row 0; the identity loss must see which rows are real and their fibers.
         image['identity_row'] = torch.arange(size, device=hist.device) < actual
         image['identity_fiber'] = fixed_rows(targets['fiber_id'], size)
-    threshold = hist.new_full((), confidence_threshold)
+    threshold = hist.new_full((), confidence_threshold if retry_threshold is None else retry_threshold)
     padded_targets = None if targets is None else {
         key: fixed_rows(value, size) for key, value in targets.items()
         if isinstance(value, torch.Tensor) and value.ndim and len(value) == actual}
@@ -242,6 +247,8 @@ def model_config_from_args(args, checkpoint=None):
         'identity_dim', 'identity_temperature', 'identity_objective', 'identity_map', 'identity_feedback', 'hidden',
         'encoder_ffn', 'decoder_layers', 'decoder_ffn', 'scorer_layers', 'activation_checkpointing')}
     options['layers'] = args.axial_layers
+    options['n_future'], options['future_step'] = args.n_future, args.future_step
+    options['gate_plane'], options['query_scale'] = args.gate_plane, args.query_scale
     options['fine'] = CropSpec(depth=args.crop_depth, width=args.crop_width, behind=args.crop_behind,
                                spacing=args.crop_spacing)
     if cls is FlowConfig:
@@ -458,7 +465,8 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
                      history_grad_clip=HISTORY_GRAD_CLIP, rest_grad_clip=REST_GRAD_CLIP,
                      diagnostic=None, live_continuation=None, ledger=None, identity_weight=0.,
                      identity_exclude_synthetic=False, tube_weight=1., tube_sigma=1.5,
-                     confidence_threshold=.5, gate='prefix'):
+                     confidence_threshold=.5, gate='prefix', retry_threshold=None, refinement_loss='policy',
+                     refinement_weight=1.):
     """One equally weighted task loss per independent supervised decision."""
     prepare_training(model, getattr(model, 'training_batch_size', 2))
     total = observed = sum(len(batch['hist']) for batch in batches)
@@ -518,11 +526,14 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
         if diagnostic is not None:
             diagnostic.update(cpu_batch=cpu)
         with torch.autocast('cuda', dtype=torch.bfloat16, enabled=torch.device(device).type == 'cuda'):
-            # Retries and proposal selection follow the operating policy, exactly as in tracing.
+            # Proposal selection follows the operating policy, exactly as in tracing; retries follow it too unless a
+            # separate retry threshold trains refinement on more decisions (--retry-threshold).
             output = training_prediction(model, batch['x'], batch['hist'], batch['hmask'], confidence_threshold,
-                                         n_commit=selection_window(commit_window(model.cfg, n_commit), model.cfg.n_future, gate),
-                                         targets=batch)
-            terms = model.training_loss(output, batch, model.cfg, tolerance, n_commit=n_commit)
+                                         n_commit=selection_window(commit_window(model.cfg, n_commit), gate_horizon(model.cfg), gate),
+                                         targets=batch,
+                                         retry_threshold=REFINE_ALL if refinement_loss == 'all' else retry_threshold)
+            terms = model.training_loss(output, batch, model.cfg, tolerance, n_commit=n_commit, refinement_loss=refinement_loss,
+                                        refinement_weight=refinement_weight, policy_threshold=confidence_threshold)
             geometry = terms['geometry_per_state'].sum()/denominator
             confidence = terms['confidence_per_state'].sum()/denominator
             loss = geometry + confidence_weight*confidence
@@ -713,6 +724,17 @@ def build_parser():
                     help='Points per committed decision (tracing, live chains, DAgger collection)')
     ap.add_argument('--trace-confidence', type=float, default=DEFAULT_CONFIDENCE,
                     help='Commit-gate confidence threshold for tracing, live chains, collection and training retries')
+    ap.add_argument('--change-trace-confidence', action='store_true',
+                    help='On resume, allow --trace-confidence to differ from the recorded run (e.g. after recalibration)')
+    ap.add_argument('--retry-threshold', type=float, default=None,
+                    help='Training only: refinement passes run while a proposal\'s confidence is below this threshold '
+                         '(default: --trace-confidence); selection, live chains and collection keep --trace-confidence')
+    ap.add_argument('--refinement-loss', choices=('policy', 'all'), default='policy',
+                    help="'policy': refinement passes run below the retry threshold and share the decision's loss with the "
+                         "initial proposal (75%% last attempt); 'all': every pass runs for every decision, the initial proposal "
+                         "keeps full weight and the passes add --refinement-weight x their mean (train/supervision.py)")
+    ap.add_argument('--refinement-weight', type=float, default=1.,
+                    help='With --refinement-loss all: weight of the mean refinement-pass geometry and confidence loss')
     ap.add_argument('--gate', choices=GATES, default=DEFAULT_GATE,
                     help="Commit gate: 'full' commits n_commit points only when the last-plane confidence passes; "
                          "'prefix' commits the confident prefix")
@@ -736,6 +758,16 @@ def build_parser():
     ap.add_argument('--crop-spacing', type=float, default=crop.spacing,
                     help='Trace voxels per crop sample. The CT level read is set per source in the dataset config; '
                          'with the current sources 0.5 is one sample per level-0 CT voxel')
+    ap.add_argument('--n-future', type=int, default=CoordinateRegressionConfig.n_future,
+                    help='Proposal planes ahead of the head (predicted, scored and labelled; gated through --gate-plane)')
+    ap.add_argument('--future-step', type=float, default=CoordinateRegressionConfig.future_step,
+                    help='Trace voxels between path planes (also the whole-crop plane spacing)')
+    ap.add_argument('--gate-plane', type=int, default=CoordinateRegressionConfig.gate_plane,
+                    help='Plane whose confidence accepts a proposal (full gate) and ends retries; planes beyond it are '
+                         'predicted and supervised only (default: the last plane, --n-future)')
+    ap.add_argument('--query-scale', type=float, default=CoordinateRegressionConfig.query_scale,
+                    help='Forward-distance normalization of decoder queries (default: n_future*future_step); keep the '
+                         'initializing model\'s value to warm-start a longer horizon')
     ap.add_argument('--stem', choices=('residual', 'stride2'), default=CoordinateRegressionConfig.stem,
                     help="Image stem: 'residual' full-resolution stem, or 'stride2' light stem")
     ap.add_argument('--memory', choices=('slabs', 'decisions', 'none'), default=CoordinateRegressionConfig.memory,
@@ -906,8 +938,10 @@ def validate_resume_options(args, recorded_options):
                'remote_prefetch_connections','remote_prefetch_queue_size','remote_prefetch_timeout','remote_prefetch_lookahead',
                'log_every','ckpt_every','diag_every','batch_diag_every','dagger_device','dagger_batch','dagger_forward_chunk',
                'negative_bank_refresh_seconds','negative_bank_cache_mb','activation_checkpointing',
-               'history_grad_clip','rest_grad_clip','blur_probability','blur_sigma',
-               'tolerance'}  # confidence-label tolerance; the departure threshold is a separate constant
+               'history_grad_clip','rest_grad_clip','blur_probability','blur_sigma','retry_threshold','refinement_loss','refinement_weight',
+               'tolerance','change_trace_confidence'}  # confidence-label tolerance; the departure threshold is a separate constant
+    if args.change_trace_confidence:
+        ignored = ignored | {'trace_confidence'}  # explicit: live chains, collection and selection move to the new threshold
     defaults = build_parser()
     # Options whose default changed when they were introduced: a run started earlier used the old behaviour.
     from vesuvius.neural_tracing.fiber_follow.tracing.policy import LEGACY_CONFIDENCE, LEGACY_GATE
@@ -938,6 +972,12 @@ def main(argv=None):
         raise ValueError('--reset-optimizer requires --resume')
     if args.init_weights and args.resume:
         raise ValueError('--init-weights starts a new run; it cannot be combined with --resume')
+    if args.retry_threshold is not None and not 0 <= args.retry_threshold <= 1:
+        raise ValueError('--retry-threshold must lie in [0, 1]')
+    if args.refinement_loss == 'all' and args.retry_threshold is not None:
+        raise ValueError('--refinement-loss all runs every refinement pass; drop --retry-threshold')
+    if not math.isfinite(args.refinement_weight) or args.refinement_weight < 0:
+        raise ValueError('--refinement-weight must be finite and nonnegative')
     if any(not math.isfinite(v) or v < 0 for v in (args.history_grad_clip, args.rest_grad_clip)):
         raise ValueError('Gradient clipping limits must be finite and nonnegative (0 disables clipping)')
     budget = TaskBudget.parse(args.task_share, terminal_fallback_cap=args.terminal_fallback_cap,
@@ -1068,8 +1108,13 @@ def main(argv=None):
         if fiber_identities(initial['fiber_manifest']) != fiber_identities(fiber_manifest(fibers)):
             raise ValueError('Initialization checkpoint used different fibers or evaluation splits')
         from vesuvius.neural_tracing.fiber_follow.data.datasets import same_sources
-        if not same_sources(initial.get('dataset_config'), dataset_document):
+        # A warm start may add sources; every source it was trained on must keep its fibers and holdouts.
+        if not same_sources(initial.get('dataset_config'), dataset_document, allow_added=True):
             raise ValueError('Initialization checkpoint used different dataset sources or holdouts')
+        known = {s['name'] for s in (initial.get('dataset_config') or {}).get('sources', [])}
+        added = [s['name'] for s in (dataset_document or {}).get('sources', []) if s['name'] not in known]
+        if added:
+            progress(f'Warm start adds dataset sources the initialization never saw: {", ".join(added)}')
     out = prepare_run_dir(args.out_root, args.name, resume is not None)
     if dataset_document:
         (out/'validation_paris4.json').write_text(json.dumps(manifest,indent=2)+'\n')
@@ -1095,12 +1140,17 @@ def main(argv=None):
             raise ValueError('Monitor recovery fixture changed since checkpoint')
     progress('Initializing models and optimizer')
     progress(f'Independent gradient clipping: history={args.history_grad_clip:g}, rest={args.rest_grad_clip:g} (0 disables clipping)')
+    if args.retry_threshold is not None:
+        progress(f'Training retries below confidence {args.retry_threshold:g}; selection, live chains and collection use {args.trace_confidence:g}')
+    if args.refinement_loss == 'all':
+        progress(f'Refinement loss: every pass for every decision; initial proposal full weight, passes x{args.refinement_weight:g} '
+                 f'of their mean; selection and the attempt metric follow confidence {args.trace_confidence:g}')
     # Flow scales are fitted after constructing the common training dataset below, unless the
     # configuration came with them (resume or a full flow warm start). A partial warm start builds
     # the configuration from arguments and therefore fits them, even from a flow checkpoint.
     fit_flow_scales = isinstance(cfg, FlowConfig) and not cfg.flow_sigma
     if fit_flow_scales:
-        cfg.flow_sigma = tuple((cfg.flow_sigma_floor,)*2 for _ in range(cfg.n_future))
+        cfg.flow_sigma = tuple((cfg.flow_sigma_floor,)*2 for _ in range(len(cfg.path_plane_values)))
     model, ema = initialize_model_weights(cfg, args.device, initial, partial=args.init_partial,
                                           exclude=tuple(args.init_exclude))
     if args.init_partial:
@@ -1166,7 +1216,7 @@ def main(argv=None):
         source_dataset.chain_seed_fraction = args.chain_seed_fraction if cfg.memory == 'decisions' else 0.
     from vesuvius.neural_tracing.fiber_follow.train.live_continuation import LiveContinuation, preserve_live_metadata
     live_continuation = LiveContinuation(dataset, policy=policy, steps=args.live_continuation_steps,
-        switch_tolerance=args.bank_switch_tolerance, own_tolerance=args.bank_own_tolerance)
+        switch_tolerance=args.bank_switch_tolerance, own_tolerance=args.bank_own_tolerance, horizon=gate_horizon(cfg))
     loader_args = dict(batch_size=None, num_workers=args.workers,
                        pin_memory=torch.device(args.device).type == 'cuda', collate_fn=preserve_live_metadata)
     if args.workers:
@@ -1284,7 +1334,8 @@ def main(argv=None):
                 history_grad_clip=args.history_grad_clip, rest_grad_clip=args.rest_grad_clip,
                 identity_weight=args.identity_weight, identity_exclude_synthetic=args.identity_exclude_synthetic,
                 tube_weight=args.tube_weight, tube_sigma=args.tube_sigma,
-                confidence_threshold=policy.confidence, gate=policy.gate,
+                confidence_threshold=policy.confidence, gate=policy.gate, retry_threshold=args.retry_threshold,
+                refinement_loss=args.refinement_loss, refinement_weight=args.refinement_weight,
                 diagnostic=diagnostic, live_continuation=live_continuation, ledger=ledger)
             observed_states += metrics['observed_states']
             interval_states += metrics['observed_states']

@@ -1,0 +1,84 @@
+{
+  "version": 1,
+  "cache_dir": "/mnt/raid_nvme/volume_cache",
+  "sources": [
+    {
+      "name": "paris4",
+      "kind": "paris4",
+      "weight": 0.25,
+      "fibers": "/mnt/raid_nvme/spiral_dataset_working/fibers",
+      "fiber_zarrs": "/mnt/raid_nvme/spiral_dataset_working/fiber_zarrs",
+      "ct": "/mnt/raid_nvme/volpkgs/s1_2um_ds2.volpkg/volumes/s1_ds2.zarr",
+      "manifest": "/home/sean/Documents/villa4/vesuvius/src/vesuvius/neural_tracing/fiber_follow/output/single_path_v11_preparation/seeds.json",
+      "val_z": [
+        45000.0,
+        48500.0
+      ],
+      "negative_bank": "/home/sean/Documents/villa4/vesuvius/src/vesuvius/neural_tracing/fiber_follow/output/neighbor_samples_r0_32_l80_160_v2",
+      "grid_scale": 8.0,
+      "ct_grid_scale": 4.0,
+      "ct_level": 0,
+      "validation": {
+        "strategy": "fiber_hash",
+        "fraction": 0.1,
+        "seed": 7349
+      }
+    },
+    {
+      "name": "0175A_5mm_v1",
+      "kind": "afv",
+      "weight": 0.25,
+      "path": "../datasets/automated_fiber_volumes/0175A_5mm_v1.afv",
+      "sha256": "d4374c646e4fb9020ea0b76b8254bc1586cdedbdaa170278ce97fceea41ffe4e",
+      "coordinate_space": "PHerc0175A/20250521115057",
+      "ct": "s3://vesuvius-challenge-open-data/PHerc0175A/volumes/20250521115057-8.640um-1.2m-116keV-masked.zarr",
+      "ct_level": 0,
+      "ct_grid_scale": 1.0,
+      "grid_scale": 2.0,
+      "native_voxel_size_um": 8.64,
+      "validation": {
+        "strategy": "fiber_hash",
+        "seed": 7349,
+        "count": 406
+      }
+    },
+    {
+      "name": "1447_5mm_v1",
+      "kind": "afv",
+      "weight": 0.25,
+      "path": "../datasets/automated_fiber_volumes/1447_5mm_v1.afv",
+      "sha256": "e235b5235b3dfef879037a0267e7a50f5a2ba791ffdcc16c2fade3a306705fa2",
+      "coordinate_space": "PHerc1447/20250521151220",
+      "ct": "s3://vesuvius-challenge-open-data/PHerc1447/volumes/20250521151220-8.640um-1.2m-116keV-masked.zarr",
+      "ct_level": 0,
+      "ct_grid_scale": 1.0,
+      "grid_scale": 2.0,
+      "native_voxel_size_um": 8.64,
+      "validation": {
+        "strategy": "fiber_hash",
+        "seed": 7349,
+        "count": 406
+      }
+    },
+    {
+      "name": "paris4_afv_central",
+      "kind": "afv",
+      "weight": 0.25,
+      "path": "../datasets/automated_fiber_volumes/Paris4-central-5mm-hv-dedup-20261005.afv",
+      "sha256": "b22afbf0907ceaab67105f742c32928316f16b8377f739342bae654eb0b97c50",
+      "coordinate_space": "PHercParis4/20260411134726",
+      "ct": "/mnt/raid_nvme/volpkgs/s1_2um_ds2.volpkg/volumes/s1_ds2.zarr",
+      "ct_mirror_of": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+      "ct_level": 0,
+      "ct_grid_scale": 4.0,
+      "grid_scale": 8.0,
+      "native_voxel_size_um": 2.4,
+      "validation": {
+        "strategy": "fiber_hash",
+        "seed": 7349,
+        "count": 406
+      }
+    }
+  ],
+  "description": "mixed_ct_datasets_paris50 sources (level-0 crops) plus paris4_afv_central: automated Paris4 streamlines >= 5 mm, H/V by geometry, held-out contacts and duplicates removed (output/paris4_afv_20261005/build_derived_afv.py); local Paris4 CT mirror; all four sources weighted 0.25"
+}

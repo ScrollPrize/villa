@@ -86,9 +86,11 @@ def read_dataset_config(path):
     return document, digest
 
 
-def same_sources(recorded, document):
+def same_sources(recorded, document, *, allow_added=False):
     """Same dataset sources and holdouts (weights may differ). Paths in ``recorded`` that were
-    written on another machine are relocated (shared.paths) before the exact comparison."""
+    written on another machine are relocated (shared.paths) before the exact comparison.
+    With ``allow_added`` every recorded source must still be present unchanged, and the document may
+    add sources the recorded run never saw (their holdouts cannot have leaked into it)."""
     from vesuvius.neural_tracing.fiber_follow.shared.paths import recorded_path
     def place(key, value, relocate):
         if relocate and key in DATASET_PATH_KEYS and isinstance(value, str) and '://' not in value:
@@ -98,7 +100,8 @@ def same_sources(recorded, document):
     ignored = ('weight', 'crop_ct_level', 'crop_ct_grid_scale')
     splits = lambda value, relocate: [{k: place(k, v, relocate) for k, v in s.items() if k not in ignored}
                                       for s in (value or {}).get('sources', [])]
-    return splits(recorded, True) == splits(document, False)
+    old, new = splits(recorded, True), splits(document, False)
+    return all(source in new for source in old) if allow_added else old == new
 
 
 def validate_dataset_resume(checkpoint, document, digest, *, allow_added=False):

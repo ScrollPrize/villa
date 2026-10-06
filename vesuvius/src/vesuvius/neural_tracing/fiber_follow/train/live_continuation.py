@@ -259,10 +259,11 @@ class LiveContinuationSource:
 
 
 class LiveContinuation:
-    def __init__(self, dataset, *, policy, steps, switch_tolerance, own_tolerance):
+    def __init__(self, dataset, *, policy, steps, switch_tolerance, own_tolerance, horizon=None):
         datasets = getattr(dataset, 'datasets', [dataset])
         self.sources = []
         self.policy = policy
+        self.horizon = horizon  # the model's gate plane (tracing.policy.gate_horizon)
         for source in datasets:
             live = LiveContinuationSource(policy=policy, steps=steps, capacity=max(32, source.chunk*4),
                 switch_tolerance=switch_tolerance, own_tolerance=own_tolerance, step=source.step)
@@ -289,7 +290,7 @@ class LiveContinuation:
         points = output['points'][indices].detach().float()
         confidence = output['confidence'][indices].detach().float()
         counts, _ = commit_count(points, confidence, self.policy.confidence, self.policy.n_commit,
-                                 self.policy.max_recovery_distance, self.policy.gate)
+                                 self.policy.max_recovery_distance, self.policy.gate, self.horizon)
         points, counts = points.cpu().numpy(), counts.cpu().numpy()
         entries = output.get('memory_entry')
         for i, proposal, count in zip(indices, points, counts):

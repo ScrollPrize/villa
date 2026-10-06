@@ -308,6 +308,11 @@ def test_initialization_sources_match_after_explicit_relocation_only(monkeypatch
     assert same_sources(recorded, here)
     here['sources'][0]['validation'] = dict(strategy='fiber_hash', seed=2)
     assert not same_sources(recorded, here)  # holdouts never relocate
+    # A warm start may add a source, but every recorded one must stay unchanged.
+    extra = dict(source('/new'), name='new_afv')
+    assert same_sources(recorded, dict(sources=[source('/copy', weight=.1), extra]), allow_added=True)
+    assert not same_sources(recorded, dict(sources=[source('/copy', weight=.1), extra]))
+    assert not same_sources(recorded, dict(sources=[extra]), allow_added=True)
 
 
 def test_checkpoint_volume_paths_and_normalization_keys_relocate_together(monkeypatch):
