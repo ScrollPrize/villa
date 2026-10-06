@@ -683,6 +683,10 @@ def run_prepare_step(inputs: Inputs, profiler: Optional[WorkflowProfiler] = None
         profiler=profiler,
     )
 
+    # Record the layer window so the inference step does not re-apply it to the cropped stack
+    from processing import record_layer_window
+    record_layer_window(created_zarr_path, inputs.start_layer, inputs.end_layer)
+
     # Write output path to file for next step
     output_file = "/tmp/surface_volume_zarr_path.txt"
     with open(output_file, "w", encoding="utf-8") as f:
@@ -831,19 +835,23 @@ def run_inference_step(inputs: Inputs, profiler: Optional[WorkflowProfiler] = No
     else:
         is_reverse_segment = False
 
-    # Run inference from zarr
-    # Note: When using a predefined surface volume zarr (not created by the prepare step),
-    # it may contain more layers than requested. We use start_layer and end_layer to crop
-    # to the desired range within the zarr.
-    logger.info(f"Running inference from surface volume zarr with layer range [{inputs.start_layer}, {inputs.end_layer})...")
+    # Run inference from zarr. A zarr written by the prepare step holds only the requested
+    # layers and records that window in its attrs, so the window is rebased onto its channels;
+    # a predefined full-depth zarr (no attrs) is cropped with the absolute layer indices.
+    from processing import resolve_zarr_layer_window
+    start_z, end_z = resolve_zarr_layer_window(inputs.surface_volume_zarr, inputs.start_layer, inputs.end_layer)
+    logger.info(
+        f"Running inference from surface volume zarr with layer range [{inputs.start_layer}, {inputs.end_layer})"
+        f" -> zarr channels [{start_z}, {end_z})..."
+    )
     start_infer_time = time.time()
     result = run_inference(
         inputs.surface_volume_zarr,
         model,
         device,
         is_reverse_segment=is_reverse_segment,
-        start_z=inputs.start_layer,
-        end_z=inputs.end_layer,
+        start_z=start_z,
+        end_z=end_z,
         profiler=profiler,
     )
     infer_elapsed = time.time() - start_infer_time
