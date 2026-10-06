@@ -141,7 +141,9 @@ public:
         QuadSurface* newLineSurface,
         QuadSurface* newLineSideSlice,
         const vc::lasagna::LineStripPositionMap& newPositionMap,
-        const std::vector<cv::Vec3f>& newLinePoints) const;
+        const std::vector<cv::Vec3f>& newLinePoints,
+        const std::vector<GeneratedOverlay::ControlPointMarker>& newControls,
+        uint64_t newLineRevision) const;
     GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
         const std::string& surfaceName,
         CChunkedVolumeViewer* viewer,
@@ -468,6 +470,20 @@ private:
     void rebaseProvisionalControlArcLengths();
     bool publishedControlsIndexDisplayedLine() const;
     void noteDisplayedLineControls();
+    // Carry a position on the displayed line (its line-space controls, plus
+    // the controls placed since it was published, from the resolved
+    // placement entries recorded for its revision) to a newly published
+    // line: see carriedGeneratedLinePosition. Controls whose revision does
+    // not name their line are not used as anchors.
+    double carriedLinePosition(
+        const std::vector<cv::Vec3f>& oldLinePoints,
+        const std::vector<GeneratedOverlay::ControlPointMarker>& oldControls,
+        const std::vector<vc3d::line_annotation::GeneratedPendingPlacement>& oldResolvedPlacements,
+        uint64_t oldLineRevision,
+        const std::vector<cv::Vec3f>& newLinePoints,
+        const std::vector<GeneratedOverlay::ControlPointMarker>& newControls,
+        uint64_t newLineRevision,
+        double oldPosition) const;
     GeneratedOverlay staticStripOverlay() const;
     GeneratedOverlay zSliceOverlay(const GeneratedViews& views,
                                    const vc3d::line_annotation::GeneratedControlPointLinePositionIndex& controlIndex,

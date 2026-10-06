@@ -2234,11 +2234,54 @@ void LineAnnotationDialog::setGeneratedOverlay(const std::string& surfaceName,
     viewer->connectOverlaysUpdated(this, apply);
 }
 
+double LineAnnotationDialog::carriedLinePosition(
+    const std::vector<cv::Vec3f>& oldLinePoints,
+    const std::vector<GeneratedOverlay::ControlPointMarker>& oldControls,
+    const std::vector<vc3d::line_annotation::GeneratedPendingPlacement>& oldResolvedPlacements,
+    uint64_t oldLineRevision,
+    const std::vector<cv::Vec3f>& newLinePoints,
+    const std::vector<GeneratedOverlay::ControlPointMarker>& newControls,
+    uint64_t newLineRevision,
+    double oldPosition) const
+{
+    // A control set indexes its line when every marker's revision names it;
+    // revision 0 on either side is "unknown" and trusted. A set that indexes
+    // another line (a provisional publish) anchors nothing: without anchors
+    // the carry degrades to the plain remap.
+    const auto indexesLine = [](const std::vector<GeneratedOverlay::ControlPointMarker>& controls,
+                                uint64_t lineRevision) {
+        if (lineRevision == 0) {
+            return true;
+        }
+        return std::all_of(controls.begin(), controls.end(), [lineRevision](const auto& control) {
+            return control.lineRevision == 0 || control.lineRevision == lineRevision;
+        });
+    };
+    std::vector<vc3d::line_annotation::GeneratedLineCarryControl> oldCarry =
+        indexesLine(oldControls, oldLineRevision)
+            ? vc3d::line_annotation::generatedLineCarryControls(oldControls)
+            : std::vector<vc3d::line_annotation::GeneratedLineCarryControl>{};
+    // A control placed since the displayed line was published (its publish
+    // indexes the controller's line) is anchored where this dialog placed
+    // it on the displayed line: a cursor working past that control is
+    // carried relative to it, not to the control before it.
+    vc3d::line_annotation::appendGeneratedLineCarryControls(
+        oldCarry, oldResolvedPlacements, oldLineRevision);
+    const std::vector<vc3d::line_annotation::GeneratedLineCarryControl> newCarry =
+        indexesLine(newControls, newLineRevision)
+            ? vc3d::line_annotation::generatedLineCarryControls(newControls)
+            : std::vector<vc3d::line_annotation::GeneratedLineCarryControl>{};
+    return vc3d::line_annotation::carriedGeneratedLinePosition(
+        oldLinePoints, oldCarry, newLinePoints, newCarry, oldPosition);
+}
+
 void LineAnnotationDialog::anchorGeneratedStripSurfacesForUpdate(
     QuadSurface* newLineSurface,
     QuadSurface* newLineSideSlice,
     const vc::lasagna::LineStripPositionMap& newPositionMap,
-    const std::vector<cv::Vec3f>& newLinePoints) const
+    const std::vector<cv::Vec3f>& newLinePoints,
+    const std::vector<GeneratedOverlay::ControlPointMarker>& newControls,
+    uint64_t newLineRevision) const
 {
     if (!_hasGeneratedViews || _stripViewers.size() != 2 || newLinePoints.empty()) {
         return;
@@ -2268,11 +2311,18 @@ void LineAnnotationDialog::anchorGeneratedStripSurfacesForUpdate(
         if (!std::isfinite(oldPosition)) {
             continue;
         }
-        // The same fiber spot's position on the new line, and its surface X
-        // under the new strip's (un-shifted) parameterization.
-        const double newPosition =
-            vc3d::line_annotation::remappedGeneratedLinePosition(
-                _generatedViews.linePoints, newLinePoints, oldPosition);
+        // The same fiber spot's position on the new line (carried relative
+        // to the controls around it, like the current position), and its
+        // surface X under the new strip's (un-shifted) parameterization.
+        const double newPosition = carriedLinePosition(
+            _generatedViews.linePoints,
+            _overviewLineSpaceControls,
+            _overviewResolvedArcs,
+            _generatedViews.lineRevision,
+            newLinePoints,
+            newControls,
+            newLineRevision,
+            oldPosition);
         const auto* points = newQuad->rawPointsPtr();
         if (!points || points->empty()) {
             continue;
@@ -2364,16 +2414,43 @@ bool LineAnnotationDialog::setGeneratedLineViews(
             static_cast<double>(_generatedViews.linePoints.size() - 1);
         // Land the current position on the same fiber spot: positions renumber
         // when the line is re-optimized, so the old numeric position is
-        // remapped through its 3D point instead of reused. Deliberately never
-        // recentered on a just-placed control point -- an update must not move
-        // the view (the cameras belong to the user, who may be mid-pan).
-        const double targetLinePosition =
-            vc3d::line_annotation::remappedGeneratedLinePosition(
+        // carried relative to the controls around it (the same spot within
+        // its span; the same distance past the last control in a re-traced
+        // tail) instead of reused. Deliberately never recentered on a
+        // just-placed control point -- an update must not move the view (the
+        // cameras belong to the user, who may be mid-pan).
+        const double targetLinePosition = carriedLinePosition(
+            _heldGeneratedViews.linePoints,
+            _heldOverviewLineSpaceControls,
+            _overviewResolvedArcs,
+            _heldGeneratedViews.lineRevision,
+            _generatedViews.linePoints,
+            _generatedViews.controlPoints,
+            _generatedViews.lineRevision,
+            previousLinePosition);
+        _currentLinePosition =
+            std::clamp(targetLinePosition, 0.0, maxLinePosition);
+        {
+            // Diagnostic for the position jump this carry replaces: the plain
+            // nearest-vertex remap would have landed far from the carried
+            // position (another wrap of the fiber, typically).
+            constexpr double kDivergenceSamples = 50.0;
+            const double plainRemap = vc3d::line_annotation::remappedGeneratedLinePosition(
                 _heldGeneratedViews.linePoints,
                 _generatedViews.linePoints,
                 previousLinePosition);
-        _currentLinePosition =
-            std::clamp(targetLinePosition, 0.0, maxLinePosition);
+            if (std::isfinite(plainRemap) &&
+                std::abs(plainRemap - _currentLinePosition) > kDivergenceSamples) {
+                Logger()->info(
+                    "line annotation: current position {:.1f} carried to {:.1f} "
+                    "(plain remap {:.1f}; old line {} points, new line {} points)",
+                    previousLinePosition,
+                    _currentLinePosition,
+                    plainRemap,
+                    _heldGeneratedViews.linePoints.size(),
+                    _generatedViews.linePoints.size());
+            }
+        }
         // The one step of the in-place update that can fail, validated before
         // the overlay-swap flags, offsets and viewer properties are touched:
         // set earlier, those would describe an update that never happened, for

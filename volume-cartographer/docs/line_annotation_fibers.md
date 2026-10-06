@@ -234,6 +234,30 @@ and damaged spans and clicks on the bar all map through the same layout, so
 they stay consistent with the dots. In manual mode the spliced line is the
 geometry and the bar follows it at once.
 
+## Current position across a landing
+
+Every landing renumbers the line, so the current position (the green
+marker, the cut views, and the spot the strip cameras are anchored on) has
+to be carried from the line that was on screen to the one that replaces it.
+It is carried relative to the control points around it, matched across the
+two lines by identity: inside a span, the nearest point of that span on the
+new line to the old spot, preferring the candidate nearest the spot's
+expected place in the span where another pass of the fiber runs through
+it at a comparable distance; past the last control (or before the first),
+the old spot if the new tail still runs through it, else the same
+arc-length distance from that control, clamped to the new line's end. A
+control point placed since the line on screen was published counts as one
+of its controls, at the spot it was placed at, so a cursor working past a
+new point is carried relative to that point. A nearest-point search over
+the whole line is used only when no control can be matched.
+This matters most while extending a fiber: the extrapolated tail is
+re-traced from the new last control on every landing and can come back
+shorter or routed differently, and the nearest vertex of the whole line to
+a spot deep in the old tail is usually on the neighbouring wrap, which
+used to drop the current position into the middle of the annotation.
+The log reports a landing where the whole-line search would have moved
+the position more than fifty samples away from the carried one.
+
 ## Span and control-point menus (strips)
 
 In either strip view a Ctrl+right-click opens either the **span menu** or the

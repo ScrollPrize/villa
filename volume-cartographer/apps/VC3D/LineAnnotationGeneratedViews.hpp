@@ -21,6 +21,8 @@ class QPainterPath;
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -711,15 +713,280 @@ inline std::pair<size_t, size_t> generatedLineIndexRangeWithinWinding(
 // through the clicked point: a click is meant to be off the line, and where
 // another pass of the same fiber runs through the cut plane the clicked point
 // can be nearer to that pass than to the local one.
+// A remapped position with the squared distance of the chosen line point
+// from the anchor.
+struct RemappedGeneratedLinePosition {
+    double position = 0.0;
+    double distanceSq = 0.0;
+};
+
+namespace remap_detail {
+
+template <typename Point>
+inline bool finiteLinePoint(const Point& p)
+{
+    return std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]);
+}
+
+// The point at a fractional position; nullopt when a vertex it needs is not
+// finite.
+template <typename Point>
+inline std::optional<Point> linePointAt(const std::vector<Point>& linePoints, double position)
+{
+    using Scalar = typename Point::value_type;
+    if (linePoints.empty() || !std::isfinite(position)) {
+        return std::nullopt;
+    }
+    const double maxPosition = static_cast<double>(linePoints.size() - 1);
+    const double p = std::clamp(position, 0.0, maxPosition);
+    const size_t a = static_cast<size_t>(std::floor(p));
+    const size_t b = std::min(a + 1, linePoints.size() - 1);
+    const double t = p - static_cast<double>(a);
+    if (!finiteLinePoint(linePoints[a])) {
+        return std::nullopt;
+    }
+    if (t <= 0.0 || a == b) {
+        return linePoints[a];
+    }
+    if (!finiteLinePoint(linePoints[b])) {
+        return std::nullopt;
+    }
+    return linePoints[a] + (linePoints[b] - linePoints[a]) * static_cast<Scalar>(t);
+}
+
+// Calls fn(position) for every candidate position of the bounded search:
+// the bounds themselves and every vertex strictly inside them.
+template <typename Fn>
+inline void forEachBoundedCandidate(double lo, double hi, Fn&& fn)
+{
+    fn(lo);
+    for (double i = std::floor(lo) + 1.0; i < hi; i += 1.0) {
+        fn(i);
+    }
+    if (hi > lo) {
+        fn(hi);
+    }
+}
+
+// The anchor projected onto segment `s` (vertices s and s+1), with the
+// parameter clamped so the position stays inside [lo, hi]; nullopt when the
+// segment lies outside the bounds or is not usable.
+template <typename Point>
+inline std::optional<RemappedGeneratedLinePosition> projectedOntoSegment(
+    const std::vector<Point>& linePoints,
+    const Point& anchor,
+    size_t s,
+    double lo,
+    double hi)
+{
+    using Scalar = typename Point::value_type;
+    if (s + 1 >= linePoints.size()) {
+        return std::nullopt;
+    }
+    const double tLo = std::max(0.0, lo - static_cast<double>(s));
+    const double tHi = std::min(1.0, hi - static_cast<double>(s));
+    if (tLo > tHi) {
+        return std::nullopt;
+    }
+    const Point& a = linePoints[s];
+    const Point& b = linePoints[s + 1];
+    if (!finiteLinePoint(a) || !finiteLinePoint(b)) {
+        return std::nullopt;
+    }
+    const Point segment = b - a;
+    const double lengthSq = static_cast<double>(segment.dot(segment));
+    double t = tLo;
+    if (lengthSq > 0.0) {
+        t = std::clamp(static_cast<double>((anchor - a).dot(segment)) / lengthSq, tLo, tHi);
+    }
+    const Point projected = a + segment * static_cast<Scalar>(t);
+    const Point delta = projected - anchor;
+    return RemappedGeneratedLinePosition{static_cast<double>(s) + t,
+                                         static_cast<double>(delta.dot(delta))};
+}
+
+}  // namespace remap_detail
+
+// The bounded core: nearest point of newLinePoints[lo..hi] (fractional
+// bounds, clamped to the line) to the anchor, with the continuity tiebreak
+// measured against `continuityPosition` (a position in the NEW line's
+// numbering where the spot is expected). Candidates are the bounds and the
+// vertices inside them, refined along the adjacent segments within the
+// bounds, so the distance returned is that of the position returned.
+// Nullopt without a finite candidate in the bounds.
+// remappedGeneratedLinePositionFromAnchor is this over the whole line with
+// the old position as the expectation.
+template <typename Point>
+inline std::optional<RemappedGeneratedLinePosition> remappedGeneratedLinePositionWithin(
+    const std::vector<Point>& newLinePoints,
+    const Point& anchor,
+    double continuityPosition,
+    double lo,
+    double hi)
+{
+    using namespace remap_detail;
+    if (newLinePoints.empty() || !finiteLinePoint(anchor) || !std::isfinite(lo) || !std::isfinite(hi)) {
+        return std::nullopt;
+    }
+    const double maxNewPosition = static_cast<double>(newLinePoints.size() - 1);
+    lo = std::clamp(lo, 0.0, maxNewPosition);
+    hi = std::clamp(hi, 0.0, maxNewPosition);
+    if (lo > hi) {
+        std::swap(lo, hi);
+    }
+    const double expected = std::isfinite(continuityPosition) ? continuityPosition : lo;
+    const auto distanceSqAt = [&](double position) -> std::optional<double> {
+        const auto point = linePointAt(newLinePoints, position);
+        if (!point) {
+            return std::nullopt;
+        }
+        const Point delta = *point - anchor;
+        return static_cast<double>(delta.dot(delta));
+    };
+    std::optional<double> nearestPosition;
+    double nearestDistanceSq = std::numeric_limits<double>::max();
+    forEachBoundedCandidate(lo, hi, [&](double position) {
+        if (const auto distanceSq = distanceSqAt(position);
+            distanceSq && *distanceSq < nearestDistanceSq) {
+            nearestDistanceSq = *distanceSq;
+            nearestPosition = position;
+        }
+    });
+    if (!nearestPosition) {
+        return std::nullopt;
+    }
+    // Continuity tiebreak (see above): among candidates within twice the
+    // nearest distance, prefer the one whose position is closest to the
+    // expected one. Outside edited regions the true match is at distance
+    // ~0, so the band is empty of impostors and this is a no-op.
+    {
+        constexpr double kTieDistanceSqFactor = 4.0;  // (2x distance)^2
+        const double tieThresholdSq = nearestDistanceSq * kTieDistanceSqFactor + 1.0e-12;
+        double chosenDelta = std::abs(*nearestPosition - expected);
+        forEachBoundedCandidate(lo, hi, [&](double position) {
+            const auto distanceSq = distanceSqAt(position);
+            if (!distanceSq || *distanceSq > tieThresholdSq) {
+                return;
+            }
+            const double delta = std::abs(position - expected);
+            if (delta < chosenDelta) {
+                chosenDelta = delta;
+                nearestPosition = position;
+                nearestDistanceSq = *distanceSq;
+            }
+        });
+    }
+    RemappedGeneratedLinePosition best{*nearestPosition, nearestDistanceSq};
+    // Fractional refinement along the two segments adjacent to the chosen
+    // candidate, within the bounds.
+    const size_t chosenVertex = static_cast<size_t>(std::floor(*nearestPosition));
+    for (const size_t s : {chosenVertex > 0 ? chosenVertex - 1 : chosenVertex, chosenVertex}) {
+        if (const auto projected = projectedOntoSegment(newLinePoints, anchor, s, lo, hi);
+            projected && projected->distanceSq < best.distanceSq) {
+            best = *projected;
+        }
+    }
+    return best;
+}
+
+// The position within [lo, hi] of the new line that passes within
+// `toleranceSq` of the anchor and is nearest to `expected`, considering
+// every segment overlapping the bounds (the anchor projected onto it,
+// clamped to the bounds); nullopt when no point of the bounded line is
+// within tolerance. Unlike the remap above this never trades a candidate
+// within tolerance for a nearer one: it answers "is the old spot still on
+// this stretch of the line, and if so where", for a stretch whose geometry
+// may have been re-traced past the spot.
+template <typename Point>
+inline std::optional<double> generatedLinePositionNearSpot(
+    const std::vector<Point>& newLinePoints,
+    const Point& anchor,
+    double expected,
+    double lo,
+    double hi,
+    double toleranceSq)
+{
+    using namespace remap_detail;
+    if (newLinePoints.empty() || !finiteLinePoint(anchor) || !std::isfinite(lo) || !std::isfinite(hi) ||
+        !(toleranceSq >= 0.0)) {
+        return std::nullopt;
+    }
+    const double maxNewPosition = static_cast<double>(newLinePoints.size() - 1);
+    lo = std::clamp(lo, 0.0, maxNewPosition);
+    hi = std::clamp(hi, 0.0, maxNewPosition);
+    if (lo > hi) {
+        std::swap(lo, hi);
+    }
+    const double reference = std::isfinite(expected) ? expected : lo;
+    // A passage is a maximal run of consecutive segments whose projections
+    // are within tolerance; it is represented by its closest point (ties:
+    // nearest the expectation). At a sampling as fine as the tolerance the
+    // neighbours of the closest point are within tolerance too, and must
+    // not be preferred for being nearer the expectation.
+    std::optional<double> bestPosition;
+    double bestDelta = std::numeric_limits<double>::max();
+    std::optional<RemappedGeneratedLinePosition> passage;
+    const auto closePassage = [&]() {
+        if (!passage) {
+            return;
+        }
+        const double delta = std::abs(passage->position - reference);
+        if (delta < bestDelta) {
+            bestDelta = delta;
+            bestPosition = passage->position;
+        }
+        passage.reset();
+    };
+    const auto consider = [&](const RemappedGeneratedLinePosition& candidate) {
+        if (candidate.distanceSq > toleranceSq) {
+            closePassage();
+            return;
+        }
+        if (!passage || candidate.distanceSq < passage->distanceSq ||
+            (candidate.distanceSq == passage->distanceSq &&
+             std::abs(candidate.position - reference) < std::abs(passage->position - reference))) {
+            passage = candidate;
+        }
+    };
+    // Two consecutive segments both within tolerance are one passage only
+    // if the line stays within tolerance through their shared vertex (a
+    // sharp turn around the spot is two passages).
+    const auto vertexOutsideTolerance = [&](size_t v) {
+        if (v >= newLinePoints.size() || !finiteLinePoint(newLinePoints[v])) {
+            return true;
+        }
+        const Point delta = newLinePoints[v] - anchor;
+        return static_cast<double>(delta.dot(delta)) > toleranceSq;
+    };
+    bool anySegment = false;
+    for (size_t s = static_cast<size_t>(std::floor(lo)); s + 1 < newLinePoints.size() &&
+                                                         static_cast<double>(s) < hi; ++s) {
+        if (anySegment && static_cast<double>(s) >= lo && vertexOutsideTolerance(s)) {
+            closePassage();
+        }
+        anySegment = true;
+        if (const auto projected = projectedOntoSegment(newLinePoints, anchor, s, lo, hi)) {
+            consider(*projected);
+        } else {
+            closePassage();
+        }
+    }
+    if (!anySegment) {
+        // A single position (lo == hi on a vertex, or a one-point line).
+        if (const auto point = linePointAt(newLinePoints, lo)) {
+            const Point delta = *point - anchor;
+            consider({lo, static_cast<double>(delta.dot(delta))});
+        }
+    }
+    closePassage();
+    return bestPosition;
+}
+
 template <typename Point>
 inline double remappedGeneratedLinePositionFromAnchor(const std::vector<Point>& newLinePoints,
                                                       const Point& anchor,
                                                       double oldPosition)
 {
-    using Scalar = typename Point::value_type;
-    const auto finite = [](const Point& p) {
-        return std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]);
-    };
     if (newLinePoints.empty()) {
         return 0.0;
     }
@@ -728,86 +995,9 @@ inline double remappedGeneratedLinePositionFromAnchor(const std::vector<Point>& 
         return 0.0;
     }
     const double fallback = std::clamp(oldPosition, 0.0, maxNewPosition);
-    if (!finite(anchor)) {
-        return fallback;
-    }
-    std::optional<size_t> nearestIndex;
-    double nearestDistanceSq = std::numeric_limits<double>::max();
-    for (size_t i = 0; i < newLinePoints.size(); ++i) {
-        const Point& point = newLinePoints[i];
-        if (!finite(point)) {
-            continue;
-        }
-        const Point delta = point - anchor;
-        const double distanceSq = static_cast<double>(delta.dot(delta));
-        if (distanceSq < nearestDistanceSq) {
-            nearestDistanceSq = distanceSq;
-            nearestIndex = i;
-        }
-    }
-    if (!nearestIndex) {
-        return fallback;
-    }
-    // Continuity tiebreak (see above): among vertices within twice the
-    // nearest distance, prefer the one whose index is closest to the old
-    // position. Outside edited regions the true match is at distance ~0, so
-    // the band is empty of impostors and this is a no-op.
-    {
-        constexpr double kTieDistanceSqFactor = 4.0;  // (2x distance)^2
-        const double tieThresholdSq =
-            nearestDistanceSq * kTieDistanceSqFactor + 1.0e-12;
-        double chosenIndexDelta = std::abs(
-            static_cast<double>(*nearestIndex) - oldPosition);
-        for (size_t i = 0; i < newLinePoints.size(); ++i) {
-            const Point& point = newLinePoints[i];
-            if (!finite(point)) {
-                continue;
-            }
-            const Point delta = point - anchor;
-            const double distanceSq = static_cast<double>(delta.dot(delta));
-            if (distanceSq > tieThresholdSq) {
-                continue;
-            }
-            const double indexDelta =
-                std::abs(static_cast<double>(i) - oldPosition);
-            if (indexDelta < chosenIndexDelta) {
-                chosenIndexDelta = indexDelta;
-                nearestIndex = i;
-                nearestDistanceSq = distanceSq;
-            }
-        }
-    }
-    double bestPosition = static_cast<double>(*nearestIndex);
-    double bestDistanceSq = nearestDistanceSq;
-    // Fractional refinement: project the anchor onto the two segments adjacent
-    // to the nearest vertex; each candidate segment must have both endpoints
-    // finite (the nearest vertex already is).
-    for (const size_t segmentStart :
-         {*nearestIndex > 0 ? *nearestIndex - 1 : *nearestIndex, *nearestIndex}) {
-        if (segmentStart + 1 >= newLinePoints.size()) {
-            continue;
-        }
-        const Point& a = newLinePoints[segmentStart];
-        const Point& b = newLinePoints[segmentStart + 1];
-        if (!finite(a) || !finite(b)) {
-            continue;
-        }
-        const Point segment = b - a;
-        const double lengthSq = static_cast<double>(segment.dot(segment));
-        if (!(lengthSq > 0.0)) {
-            continue;
-        }
-        const double t = std::clamp(
-            static_cast<double>((anchor - a).dot(segment)) / lengthSq, 0.0, 1.0);
-        const Point projected = a + segment * static_cast<Scalar>(t);
-        const Point delta = projected - anchor;
-        const double distanceSq = static_cast<double>(delta.dot(delta));
-        if (distanceSq < bestDistanceSq) {
-            bestDistanceSq = distanceSq;
-            bestPosition = static_cast<double>(segmentStart) + t;
-        }
-    }
-    return std::clamp(bestPosition, 0.0, maxNewPosition);
+    const auto remapped = remappedGeneratedLinePositionWithin(
+        newLinePoints, anchor, oldPosition, 0.0, maxNewPosition);
+    return remapped ? remapped->position : fallback;
 }
 
 inline double remappedGeneratedLinePosition(const std::vector<cv::Vec3f>& oldLinePoints,
@@ -2147,6 +2337,225 @@ inline double generatedLinePositionAtArcLength(const std::vector<double>& cumula
     const size_t a = b - 1;
     const double span = cumulative[b] - cumulative[a];
     return static_cast<double>(a) + (span > 0.0 ? (arcLength - cumulative[a]) / span : 0.0);
+}
+
+// ---------------------------------------------------------------------------
+// Carrying a line position across a line publish.
+//
+// remappedGeneratedLinePosition finds the old position's 3D point on the
+// NEW line by nearest vertex, anywhere on it. That is right where the new
+// line still passes through the old spot, and wrong where it does not: a
+// landing re-traces the extrapolated tails from the outer controls, and the
+// new tail can be shorter (the trace stops where it finds no candidates) or
+// routed differently. A position hundreds of voxels into the old tail then
+// has no near match on the new tail, and the nearest vertex of the whole
+// line is on the neighbouring wrap of the same fiber: the current position
+// jumps from the end being extended into the middle of the annotation.
+//
+// carriedGeneratedLinePosition keeps the position RELATIVE to the controls
+// around it instead, matched across the two lines by control identity:
+//  - between two matched controls, the nearest point on the new line to the
+//    old spot is searched within that span only, with the remap's continuity
+//    tiebreak against the position's share of the span (an unchanged span
+//    still resolves exactly; an edited one stays inside its span and on its
+//    own pass of the fiber);
+//  - beyond the last matched control (or before the first), the old spot is
+//    used where the new line still passes through it (within
+//    exactSpotTolerance, in the lines' units) past that control, the
+//    passage nearest the arc-length expectation below if there are several,
+//    else the position keeps its arc-length distance from the control on
+//    the new line, clamped to the new line's end: "300 voxels past the
+//    last control" stays that, however the tail was re-traced;
+//  - with no matched control to anchor on, the plain remap decides.
+// The controls of each line must index THAT line (the dialog's line-space
+// controls for the displayed line, the publish's own controls for the new
+// one); identity 0 and non-finite positions never match.
+struct GeneratedLineCarryControl {
+    uint64_t identity = 0;
+    double linePosition = std::numeric_limits<double>::quiet_NaN();
+};
+
+inline std::vector<GeneratedLineCarryControl> generatedLineCarryControls(
+    const std::vector<GeneratedOverlay::ControlPointMarker>& controls)
+{
+    std::vector<GeneratedLineCarryControl> carry;
+    carry.reserve(controls.size());
+    for (const auto& control : controls) {
+        carry.push_back({control.identity, control.linePosition});
+    }
+    return carry;
+}
+
+// Adds, to the anchors of the line with revision `lineRevision`, the
+// controls published since that line was last published with its own
+// controls: the resolved placement entries record, by identity, where on
+// that displayed line a control published for a later line was placed (or
+// estimated to be). An identity already among the anchors keeps its anchor.
+template <typename ResolvedPlacement>
+inline void appendGeneratedLineCarryControls(
+    std::vector<GeneratedLineCarryControl>& carry,
+    const std::vector<ResolvedPlacement>& resolvedPlacements,
+    uint64_t lineRevision)
+{
+    for (const auto& entry : resolvedPlacements) {
+        if (entry.identity == 0 || !std::isfinite(entry.linePosition) ||
+            entry.lineRevision != lineRevision) {
+            continue;
+        }
+        const bool known = std::any_of(carry.begin(), carry.end(), [&entry](const auto& control) {
+            return control.identity == entry.identity;
+        });
+        if (!known) {
+            carry.push_back({entry.identity, entry.linePosition});
+        }
+    }
+}
+
+inline double carriedGeneratedLinePosition(
+    const std::vector<cv::Vec3f>& oldLinePoints,
+    const std::vector<GeneratedLineCarryControl>& oldControls,
+    const std::vector<cv::Vec3f>& newLinePoints,
+    const std::vector<GeneratedLineCarryControl>& newControls,
+    double oldPosition,
+    double exactSpotTolerance = 1.0)
+{
+    if (newLinePoints.empty() || !std::isfinite(oldPosition)) {
+        return 0.0;
+    }
+    const double fallback =
+        remappedGeneratedLinePosition(oldLinePoints, newLinePoints, oldPosition);
+    if (oldLinePoints.empty()) {
+        return fallback;
+    }
+    const double maxOldPosition = static_cast<double>(oldLinePoints.size() - 1);
+    const double maxNewPosition = static_cast<double>(newLinePoints.size() - 1);
+    const double position = std::clamp(oldPosition, 0.0, maxOldPosition);
+
+    // An identity listed twice on either side (whatever its positions) is
+    // ambiguous and matches nothing.
+    std::unordered_set<uint64_t> ambiguous;
+    for (const auto* controls : {&oldControls, &newControls}) {
+        std::unordered_set<uint64_t> seen;
+        for (const auto& control : *controls) {
+            if (control.identity != 0 && !seen.insert(control.identity).second) {
+                ambiguous.insert(control.identity);
+            }
+        }
+    }
+    // New controls by identity.
+    std::unordered_map<uint64_t, double> newPositions;
+    for (const auto& control : newControls) {
+        if (control.identity == 0 || !std::isfinite(control.linePosition) ||
+            ambiguous.count(control.identity) != 0) {
+            continue;
+        }
+        newPositions.emplace(control.identity, control.linePosition);
+    }
+    const auto matched = [&](const GeneratedLineCarryControl& control) {
+        return control.identity != 0 && std::isfinite(control.linePosition) &&
+               newPositions.find(control.identity) != newPositions.end();
+    };
+
+    // The nearest matched old control at or before the position, and at or
+    // after it (the same control when the position sits exactly on one).
+    std::optional<GeneratedLineCarryControl> before;
+    std::optional<GeneratedLineCarryControl> after;
+    for (const auto& control : oldControls) {
+        if (!matched(control)) {
+            continue;
+        }
+        if (control.linePosition <= position &&
+            (!before || control.linePosition > before->linePosition)) {
+            before = control;
+        }
+        if (control.linePosition >= position &&
+            (!after || control.linePosition < after->linePosition)) {
+            after = control;
+        }
+    }
+    if (!before && !after) {
+        return fallback;
+    }
+    // Orientation of the new line relative to the old one, from the matched
+    // controls: reversed when the first and last matched controls (in old
+    // order) swapped order. With one matched control the order is assumed
+    // kept: a line is only ever reversed by a merge, which keeps every
+    // control of both fibers, so a reversal always matches two or more. (A
+    // guess from the line's direction at the one control was tried and
+    // rejected: a sharp local bend from a re-solve, a repeated point or a
+    // non-finite neighbour there would turn a kept line into a "reversed"
+    // one, which is worse than missing the reversal that cannot happen.)
+    bool reversed = false;
+    {
+        std::optional<GeneratedLineCarryControl> firstOld;
+        std::optional<GeneratedLineCarryControl> lastOld;
+        for (const auto& control : oldControls) {
+            if (!matched(control)) {
+                continue;
+            }
+            if (!firstOld || control.linePosition < firstOld->linePosition) {
+                firstOld = control;
+            }
+            if (!lastOld || control.linePosition > lastOld->linePosition) {
+                lastOld = control;
+            }
+        }
+        if (firstOld && lastOld && firstOld->identity != lastOld->identity) {
+            reversed = newPositions.at(lastOld->identity) < newPositions.at(firstOld->identity);
+        }
+    }
+    const cv::Vec3f anchor = interpolatedGeneratedLinePoint(oldLinePoints, position);
+    const double exactToleranceSq = std::isfinite(exactSpotTolerance) && exactSpotTolerance >= 0.0
+        ? exactSpotTolerance * exactSpotTolerance
+        : 0.0;
+
+    if (before && after) {
+        const double newBefore = newPositions.at(before->identity);
+        const double newAfter = newPositions.at(after->identity);
+        const double lo = std::clamp(std::min(newBefore, newAfter), 0.0, maxNewPosition);
+        const double hi = std::clamp(std::max(newBefore, newAfter), 0.0, maxNewPosition);
+        // Where the spot is expected in the new span: its share of the old
+        // one. The tiebreak keeps the search on this pass of the fiber where
+        // another pass runs through the span at a comparable distance.
+        const double oldSpan = after->linePosition - before->linePosition;
+        const double share = oldSpan > 0.0
+            ? std::clamp((position - before->linePosition) / oldSpan, 0.0, 1.0)
+            : 0.0;
+        const double expected =
+            newBefore <= newAfter ? lo + share * (hi - lo) : hi - share * (hi - lo);
+        if (const auto within = remappedGeneratedLinePositionWithin(
+                newLinePoints, anchor, expected, lo, hi)) {
+            return within->position;
+        }
+        // No finite geometry in the span: keep the position's share of it.
+        return expected;
+    }
+
+    // A tail: the old spot where the new line still passes through it past
+    // the one matched control (a kept tail, or a re-trace along the same
+    // path), else the arc-length distance from that control.
+    const std::vector<double> oldArcs = generatedCumulativeArcLength(oldLinePoints);
+    const std::vector<double> newArcs = generatedCumulativeArcLength(newLinePoints);
+    // The one matched control, the old arc distance from it to the
+    // position, and the side of the control the position is on in the
+    // new numbering (past the control along the new line's direction, or
+    // before it).
+    const GeneratedLineCarryControl& control = before ? *before : *after;
+    const double newControl = std::clamp(newPositions.at(control.identity), 0.0, maxNewPosition);
+    const double distance = std::abs(generatedArcLengthAt(oldArcs, position) -
+                                     generatedArcLengthAt(oldArcs, control.linePosition));
+    const bool pastControl = before.has_value() != reversed;
+    const double lo = pastControl ? newControl : 0.0;
+    const double hi = pastControl ? maxNewPosition : newControl;
+    const double carried = std::clamp(
+        generatedLinePositionAtArcLength(
+            newArcs, generatedArcLengthAt(newArcs, newControl) + (pastControl ? distance : -distance)),
+        lo, hi);
+    if (const auto spot = generatedLinePositionNearSpot(
+            newLinePoints, anchor, carried, lo, hi, exactToleranceSq)) {
+        return *spot;
+    }
+    return carried;
 }
 
 namespace overview_detail {
