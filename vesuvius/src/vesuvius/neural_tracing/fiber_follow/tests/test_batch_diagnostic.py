@@ -94,11 +94,14 @@ def test_render_emits_readable_images_strict_json_and_preserves_rng(tmp_path, ki
     assert all(report['rows'][2]['known']) and not any(report['rows'][2]['labels'])
     assert report['examples'] == rows['examples'] == 3
     assert report['training_update']['loss'] == .2
-    assert report['history_encoder'] == dict(variant='fine', token_shape=[2, 17, 17],
-        tokens_per_slab=2*17*17+3, feature_channels=128)
     assert [r['dataset'] for r in report['rows']] == ['ordinary', 'unknown', 'ordinary']
-    assert {p.name for p in folder.iterdir()} == {
-        'predictions.png', 'crop_orientation.png', 'encoder.png', 'decoder.png', 'history.png', 'metrics.json'}
+    if kind == 'unified':  # no memory, patch encoder or decoder: prediction sheets only
+        assert {p.name for p in folder.iterdir()} == {'predictions.png', 'crop_orientation.png', 'metrics.json'}
+    else:
+        assert report['history_encoder'] == dict(variant='fine', token_shape=[2, 17, 17],
+            tokens_per_slab=2*17*17+3, feature_channels=128)
+        assert {p.name for p in folder.iterdir()} == {
+            'predictions.png', 'crop_orientation.png', 'encoder.png', 'decoder.png', 'history.png', 'metrics.json'}
     assert not any(p.suffix in ('.npz', '.npy', '.pt') for p in tmp_path.rglob('*'))
     for path in folder.glob('*.png'):
         with Image.open(path) as image:
