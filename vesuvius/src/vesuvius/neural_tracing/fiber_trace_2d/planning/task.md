@@ -1,3 +1,3 @@
-# Width-aware views and sideband supervision
+# Consistent raw loss reporting
 
-Display base width directly as grayscale0–255. Modulate direction-weighted presence panels by linear predicted-width similarity to the center-point prediction, zero at20% deviation. Apply the same detached gate to extra sideband negative loss using GT reference width; ordinary presence loss stays unchanged. Extend width regression across Gaussian tube with falloff. Resume current managed training with H/V0.01.
+Log individual losses before their configured weights. Combined losses retain weighted inputs, but are logged before any outer weight. Preserve optimization, normalization and sampling. Do not stop or restart training. Commit outstanding source/docs/tests in logical commits; exclude generated datasets/profiler artifacts.

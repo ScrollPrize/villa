@@ -21,7 +21,7 @@ REFINEMENT_LOSS_NAMES = ("presence", "smoothing_normal", "smoothing_tangent", "l
 
 
 def empty_refinement_statistics():
-    return [0.] * (1+len(REFINEMENT_LOSS_NAMES))
+    return [0.] * (1+2*len(REFINEMENT_LOSS_NAMES))
 
 
 @dataclass(frozen=True)
@@ -963,7 +963,7 @@ def refine_observations(observations, maps, directions=None, *, return_orientati
     return (curves, orientations) if return_orientation else curves
 
 
-def refinement_losses(observations, curves, maps, directions=None):
+def refinement_losses(observations, curves, maps, directions=None, *, include_raw=False):
     """Post-solve weighted losses per patch, each normalized by material length.
 
     Presence is 1-mean(probability), normal/tangent bending are weighted curvature
@@ -996,28 +996,66 @@ def refinement_losses(observations, curves, maps, directions=None):
         baseline = interpolate(o.baseline[:,:3],o.baseline[:,3],c[:,3])
         metric = interpolate(ellipse_metric(o.normals,o.config).reshape(-1,9),o.current[:,3],c[:,3]).reshape(-1,3,3)
         delta = c[:,:3]-baseline
-        localization = o.config.gt_weight*float(np.sum(mass*np.einsum("ni,nij,nj->n",delta,metric,delta))/length)
+        raw_localization = float(np.sum(mass*np.einsum("ni,nij,nj->n",delta,metric,delta))/length)
+        localization = o.config.gt_weight*raw_localization
         projector = interpolate(normal_projectors(o.normals).reshape(-1,9),o.current[:,3],c[:,3]).reshape(-1,3,3)
         normal_weight = o.config.shape_weight if o.config.shape_normal_weight is None else o.config.shape_normal_weight
         tangent_weight = o.config.shape_weight if o.config.shape_tangent_weight is None else o.config.shape_tangent_weight
-        normal_loss = normal_weight*bending_terms(c[:,:3],metric=projector)[-1]/length
-        tangent_loss = tangent_weight*bending_terms(c[:,:3],metric=np.eye(3)-projector)[-1]/length
+        normal_energy = bending_terms(c[:,:3],metric=projector)[-1]
+        tangent_energy = bending_terms(c[:,:3],metric=np.eye(3)-projector)[-1]
+        normal_loss = normal_weight*normal_energy/length
+        tangent_loss = tangent_weight*tangent_energy/length
         direction_loss = 0.
+        raw_direction = float('nan')  # No direction maps when the term is disabled.
         if o.config.direction_weight:
             _, edge_losses = direction_feedback(c[:,:3],np.arange(len(c)-1),lengths,transform,
                 np.full(len(c),len(losses),dtype=int),directions,o.output_stride,o.config)
             direction_loss = float(np.sum(lengths*edge_losses)/length)
-        losses.append((presence,normal_loss,tangent_loss,localization,direction_loss))
+            raw_direction = direction_loss/o.config.direction_weight
+        row = (presence,normal_loss,tangent_loss,localization,direction_loss)
+        if include_raw:
+            row += (presence, normal_energy/length, tangent_energy/length,
+                    raw_localization, raw_direction)
+        losses.append(row)
     return losses
 
 
-def log_refinement_scalars(writer, phase, statistics, step):
-    count, *sums = statistics
-    if writer is None or count == 0:
+def upgrade_refinement_statistics(statistics, config):
+    """Keep old weighted prefix; append raw sums for resumed pending tests."""
+    if len(statistics) == 1+2*len(REFINEMENT_LOSS_NAMES):
+        return list(statistics)
+    if len(statistics) != 1+len(REFINEMENT_LOSS_NAMES):
+        raise ValueError('invalid refinement statistics size')
+    weights = {
+        "presence": 1.,
+        "localization": config.gt_weight,
+        "direction": config.direction_weight,
+        "smoothing_normal": config.shape_weight if config.shape_normal_weight is None else config.shape_normal_weight,
+        "smoothing_tangent": config.shape_weight if config.shape_tangent_weight is None else config.shape_tangent_weight,
+    }
+    raw = [value/weights[name] if weights[name] else (float('nan') if statistics[0] else 0.)
+           for name,value in zip(REFINEMENT_LOSS_NAMES,statistics[1:])]
+    return [*statistics, *raw]
+
+
+def refinement_report(statistics, config):
+    """Raw leaves and weighted combinations; omit unavailable legacy leaves."""
+    count, *sums = upgrade_refinement_statistics(statistics, config)
+    if count == 0:
+        return {}
+    n = len(REFINEMENT_LOSS_NAMES)
+    weighted = dict(zip(REFINEMENT_LOSS_NAMES, np.asarray(sums[:n])/count))
+    means = {name: value/count for name,value in zip(REFINEMENT_LOSS_NAMES,sums[n:])
+             if np.isfinite(value)}
+    means['total'] = sum(weighted.values())
+    means['smoothing'] = weighted['smoothing_normal'] + weighted['smoothing_tangent']
+    return means
+
+
+def log_refinement_scalars(writer, phase, statistics, step, config):
+    if writer is None:
         return
-    means = dict(zip(REFINEMENT_LOSS_NAMES, np.asarray(sums)/count))
-    means["total"] = sum(means.values())
-    means["smoothing"] = means["smoothing_normal"]+means["smoothing_tangent"]
+    means = refinement_report(statistics, config)
     for key, value in means.items():
         writer.add_scalar(f"refinement_{phase}/loss_{key}", float(value), step)
 
@@ -1073,7 +1111,7 @@ class RefinementObserver:
         direction_maps = np.stack(directions) if directions and self.config.direction_weight else None
         afters, after_orientations = refine_observations(
             [o for _,o in todo], images, direction_maps, return_orientation=True)
-        losses = refinement_losses([o for _,o in todo], afters, images, direction_maps)
+        losses = refinement_losses([o for _,o in todo], afters, images, direction_maps, include_raw=True)
         for (index, observation), after, after_orientation, loss in zip(
                 todo, afters, after_orientations, losses, strict=True):
             before_orientation = (zero_orientation(len(observation.current))
@@ -1101,14 +1139,13 @@ class RefinementObserver:
                 statistics = [float(len(applied_losses)), *np.sum(applied_losses,axis=0).tolist()]
             if phase is not None:
                 if applied_losses:
-                    averages = dict(zip(REFINEMENT_LOSS_NAMES,np.mean(applied_losses,axis=0)))
-                    averages["total"] = sum(averages.values())
+                    averages = refinement_report(statistics, self.config)
                     details = " ".join(f"loss_{k}={v:.7g}" for k,v in averages.items())
                 else:
                     details = "losses=unavailable (no committed refinement proposals)"
                 print(f"refinement_{phase} update={step} batch={batch if batch is not None else step} "
                       f"patches={len(applied_losses)} {details}",flush=True)
-                log_refinement_scalars(writer,phase,statistics,step)
+                log_refinement_scalars(writer,phase,statistics,step,self.config)
         # Do not let another rank start preparing a new test phase before all
         # proposals have been committed. Queue lookahead stays immutable.
         if distributed.enabled:

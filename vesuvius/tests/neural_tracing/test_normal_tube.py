@@ -184,7 +184,7 @@ def check_loss_and_gradients(device, sideband=False):
     losses = _finalize_loss_statistics(full, direction_weight=10., presence_weight=1., sideband_weight=cfg.presence_sideband_weight)
     torch.testing.assert_close(losses['normal'], full.normal_sum/full.normal_count/10)
     torch.testing.assert_close(losses['total'], 10*losses['direction']+losses['presence']+
-                              10*losses['normal']+losses['width']+losses['hv'])
+                              10*losses['normal']+.01*losses['width']+losses['hv'])
     losses['total'].backward()
     accumulator = NormalizedGradientAccumulator(actual, counts, direction_weight=10., presence_weight=1., gaussian_presence=True,
                                                sideband_presence=sideband,

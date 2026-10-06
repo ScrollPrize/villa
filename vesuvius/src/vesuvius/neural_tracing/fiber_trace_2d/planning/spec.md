@@ -1,5 +1,14 @@
 # Training trace execution contract
 
+## Loss reporting
+
+- Individual loss metrics exclude their configured outer weights. Intrinsic
+  projection and spatial falloff weights remain part of the loss definition.
+- Combined losses use weighted constituents internally and are logged before
+  any weight on the combination itself. Total reports the optimization objective.
+- Reporting changes must not change gradients, target counts, or sampling.
+  Disabled terms remain disabled; historical logs are not rewritten.
+
 ## Optional reviewed-fiber annotation heads
 
 - Unconditioned fiber U-Net optionally adds six sign-ambiguous normal channels,

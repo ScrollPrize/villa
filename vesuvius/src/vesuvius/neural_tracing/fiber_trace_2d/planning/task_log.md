@@ -1,10 +1,24 @@
-# Width-aware supervision — 2026-10-06
+# Raw loss reporting — 2026-10-06
 
-- Stop requested through approved runner; scope preserves regular presence, H/V0.01 and GPUs0–5.
-- Independent review approved plan, then identified an implementation mapping flaw before restart: nearest in-crop width rows lose crop-halo/segment provenance. Replaced this with explicit source segment indices and clipping fractions; shared geometry transformation now serves both point and segment labels. Added halo/nearby-return/missing-label regression.
-- Gaussian rasterizer owns both normal and width targets; width uses winning segment/falloff, sideband reference uses nearest contributing segment with strict first-win ties. Detached triangular20% gate changes only extra sideband numerator; GT counts and ordinary presence unchanged.
-- Tests after corrected mapping:322 CPU passed,1 optional GPU skipped,2 existing xfails; approved manager-exclusive GPU0 suite11 passed in3.97s, including tube/sideband single-backward gradient parity and gate isolation. Earlier full CPU run including accumulation suite334 passed before mapping correction; rechecking relevant extended coverage.
-- Follow-up accumulation/refinement suite51 passed,14 optional skips; added deterministic Gaussian-winner/sideband-nearest/tie regression and reran tube suite11 passed,1 optional skip. Independent implementation re-review cleared mapping and queue propagation.
-- No current.pt in stopped054308 run either: latest saved raw is best_reviewed_trace.pt from startup8200, not unsaved8300. Used that full raw checkpoint for approved production-start; controller682562, launch060410. This resumes latest persisted raw, not unsaved RAM state; stop-time persistence remains a separate pre-existing limitation.
-- New run reviewed_normal_width_hv_fullres_128_sd1_bs128_ema_20261006_060413: initial raw/EMA tests passed73.454s, raw total1.267509, width0.050161, angle8.79deg. Resident reviewed trace completed64 restarts in138.347s.
-- Verified70 optimizer updates via manager handoff: restored step8270 /1,058,560 samples after another task's temporary exclusive grant. No errors. Subsequently released GPUs again for nonpausable task cdf2a92a-4a3e-41da-a9ad-433fccbde445; training remains alive/queued for automatic continuation. Did not interfere with other tasks.
+- Existing work committed as345952e32(native baking/preparation) and82d78104e(annotation heads, supervision, views/tests/docs).
+- Production training must not be stopped or restarted. This change affects subsequent launches only.
+- Generated workdirs datasets and perf.data excluded from code commits.
+- Independent plan review approved. Implementation review caught zero-weight refinement reporting: retained raw geometric numerators instead of dividing zero; pending vectors keep weighted prefix and explicitly upgrade. Disabled direction has no sampled map, and old zero-weight pending terms are unrecoverable: omit these unavailable metrics, not a fabricated zero.
+- Initial regressions caught raw embedding zero retaining an unnecessary graph (fixed with detach), and the mocked collective's hardcoded layout (updated for raw statistics). Optimization sums and gradient path unchanged.
+- Independent implementation re-review cleared zero-weight reporting and pending-state upgrades. The empty-refinement test was updated for the appended raw reporting suffix.
+
+## Validation command (CPU only, approved runner)
+
+```bash
+/home/hendrik/.venv_las/bin/python -m pytest -q vesuvius/tests/neural_tracing/test_loss_reporting.py vesuvius/tests/neural_tracing/test_normal_tube.py vesuvius/tests/neural_tracing/test_fiber_annotations.py vesuvius/tests/neural_tracing/test_refinement.py vesuvius/tests/neural_tracing/test_fiber_embeddings.py vesuvius/tests/neural_tracing/test_local_competition.py vesuvius/tests/neural_tracing/test_paired_embeddings.py vesuvius/tests/neural_tracing/test_gradient_accumulation.py vesuvius/tests/neural_tracing/test_forward_visualization.py vesuvius/tests/neural_tracing/test_fiber_trace_3d.py vesuvius/tests/scripts/test_collect_reviewed_fibers.py
+```
+
+Synthetic annotated tubes, sidebands, paired/split embeddings, refined curves,
+mocked distributed reductions, accumulation parity, loader/views and reviewed-data
+preparation. No new GPU run for scalar-only logging; existing optional GPU tests
+remain opt-in. Production was neither stopped nor restarted.
+
+Final result:442 passed,28 optional skips,2 existing xfails in39.44s; two existing
+Pillow deprecation warnings. Weighted objectives and gradient parity verified;
+raw reporting tested at zero/non-unit weights and across microbatch aggregation.
+git diff --check passed. No performance claim or training parameter change.

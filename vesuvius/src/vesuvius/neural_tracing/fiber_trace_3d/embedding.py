@@ -311,9 +311,15 @@ def _presence_weighted_negatives(embeddings, presence, geometries, banks, channe
     return sampled.reshape(anchors, count // anchors, -1)
 
 
-def embedding_statistics(embeddings, presence, batch, diagnostics=None):
+def embedding_statistics(embeddings, presence, batch, diagnostics=None, *, raw_sums=None):
     """Separate component sums/counts; sampling never backpropagates to presence."""
     zero = embeddings.reshape(-1)[0].float() * 0
+    def weighted(name, value, weight):
+        if raw_sums is not None:
+            key = name + "_embedding_unweighted_sum"
+            raw_sums[key] = raw_sums.get(key, zero.detach()) + value.detach()
+        return value * weight
+
     pos_sum, neg_sum = zero, zero
     if batch.embedding_geometry is None or len(batch.embedding_geometry) != len(embeddings):
         raise ValueError("embedding-enabled model requires loader embedding geometry/normals")
@@ -351,8 +357,8 @@ def embedding_statistics(embeddings, presence, batch, diagnostics=None):
                 short_negative = ((short_anchor[:, None] * short_negative_vectors).sum(-1).clamp(-1, 1)
                                   if short_negative_vectors.numel() else short_positive.new_empty((anchors, 0)))
                 if short_negative.numel():
-                    short_competition = short_competition + local_competition(
-                        short_positive, short_negative, geometry.temperature, geometry.margin).sum() * geometry.weight
+                    short_competition = short_competition + weighted("short", local_competition(
+                        short_positive, short_negative, geometry.temperature, geometry.margin).sum(), geometry.weight)
 
                 partner = i ^ 1
                 other = batch.embedding_geometry[partner]
@@ -370,8 +376,8 @@ def embedding_statistics(embeddings, presence, batch, diagnostics=None):
                 long_negative = ((long_anchor[:, None] * long_negative_vectors).sum(-1).clamp(-1, 1)
                                  if long_negative_vectors.numel() else long_positive.new_empty((anchors, 0)))
                 if long_negative.numel():
-                    long_competition = long_competition + local_competition(
-                        long_positive, long_negative, geometry.temperature, geometry.margin).sum() * geometry.weight
+                    long_competition = long_competition + weighted("long", local_competition(
+                        long_positive, long_negative, geometry.temperature, geometry.margin).sum(), geometry.weight)
                 if diagnostics is not None:
                     values = {}
                     for prefix, positive, negative in (("short", short_positive, short_negative),
@@ -412,7 +418,7 @@ def embedding_statistics(embeddings, presence, batch, diagnostics=None):
                 vectors = torch.cat([embeddings[j].reshape(embeddings.shape[1], -1) for j in banks], dim=1)
                 n = F.normalize(vectors[:, chosen].T.float(), dim=1, eps=1e-8)
                 negative = (a[:, None, :] * n.reshape(anchors, geometry.negatives_per_anchor, -1)).sum(-1).clamp(-1, 1)
-                competition = competition + local_competition(positive, negative, geometry.temperature, geometry.margin).sum()*geometry.weight
+                competition = competition + weighted("contrastive", local_competition(positive, negative, geometry.temperature, geometry.margin).sum(), geometry.weight)
             if diagnostics is not None:
                 diagnostics.append(similarity_diagnostics(positive.detach(), negative.detach()))
             continue
@@ -423,7 +429,7 @@ def embedding_statistics(embeddings, presence, batch, diagnostics=None):
         points = sample_trace_points(starts, ends, half * 3, rng, embeddings.shape[-3:])
         on_trace = sample_embeddings(embeddings[i], points)
         positive = 1 - (on_trace[:half] * on_trace[half:2 * half]).sum(dim=1).clamp(-1, 1)
-        pos_sum = pos_sum + positive.sum() * geometry.weight
+        pos_sum = pos_sum + weighted("positive", positive.sum(), geometry.weight)
         weights = presence[i].detach().float().reshape(-1)
         if not bool(torch.isfinite(weights).all()) or bool(((weights < 0) | (weights > 1)).any()):
             raise ValueError("embedding sampling requires finite presence probabilities in [0,1]")
@@ -434,7 +440,7 @@ def embedding_statistics(embeddings, presence, batch, diagnostics=None):
         # Integer output-grid negatives need no interpolation.
         negatives = F.normalize(embeddings[i].reshape(embeddings.shape[1], -1)[:, chosen].T.float(), dim=1, eps=1e-8)
         negative = (on_trace[2 * half:] * negatives).sum(dim=1).clamp_min(0)
-        neg_sum = neg_sum + negative.sum() * geometry.weight
+        neg_sum = neg_sum + weighted("negative", negative.sum(), geometry.weight)
     if contrastive:
         if len(counts) == 5:
             return pos_sum, pos_count, neg_sum, neg_count, competition, counts[2], \

@@ -46,8 +46,20 @@ class LossStatistics:
     hv_sum: torch.Tensor | None = None
     hv_count: torch.Tensor | None = None
 
+    # Reporting-only numerators; optimization still consumes the weighted sums.
+    width_unweighted_sum: torch.Tensor | None = None
+    hv_unweighted_sum: torch.Tensor | None = None
+    positive_embedding_unweighted_sum: torch.Tensor | None = None
+    negative_embedding_unweighted_sum: torch.Tensor | None = None
+    contrastive_embedding_unweighted_sum: torch.Tensor | None = None
+    short_embedding_unweighted_sum: torch.Tensor | None = None
+    long_embedding_unweighted_sum: torch.Tensor | None = None
+
     def __post_init__(self):
-        for name in ("normal_sum", "normal_count", "normal_unweighted_sum", "width_sum", "width_count", "hv_sum", "hv_count",
+        for name in ("width_unweighted_sum", "hv_unweighted_sum",
+                     "positive_embedding_unweighted_sum", "negative_embedding_unweighted_sum",
+                     "contrastive_embedding_unweighted_sum", "short_embedding_unweighted_sum", "long_embedding_unweighted_sum",
+                     "normal_sum", "normal_count", "normal_unweighted_sum", "width_sum", "width_count", "hv_sum", "hv_count",
                      "positive_embedding_sum", "positive_embedding_count",
                      "negative_embedding_sum", "negative_embedding_count",
                      "contrastive_embedding_sum", "contrastive_embedding_count",

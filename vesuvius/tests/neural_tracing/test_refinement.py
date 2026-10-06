@@ -226,8 +226,14 @@ def test_refinement_loss_components_and_logging(monkeypatch,tmp_path,capsys):
     observer.flush(SimpleNamespace(enabled=False,is_main=True),phase="test",step=100,batch=2,
                    writer=SimpleNamespace(add_scalar=lambda *args:calls.append(args)))
     assert "refinement_test update=100 batch=2 patches=1" in capsys.readouterr().out
-    assert {t for t,_,_ in calls} == {f"refinement_test/loss_{k}" for k in (*REFINEMENT_LOSS_NAMES,"total","smoothing")}
-    np.testing.assert_allclose([v for _,v,_ in calls],[.25,0,0,0,0,.25,0],atol=1e-12)
+    assert {t for t,_,_ in calls} == {f"refinement_test/loss_{k}" for k in (*REFINEMENT_LOSS_NAMES[:-1],"total","smoothing")}
+    np.testing.assert_allclose([v for _,v,_ in calls],[.25,0,0,0,.25,0],atol=1e-12)
+    # Zero weights do not erase the underlying geometric diagnostic.
+    zero_cfg = replace(cfg, gt_weight=0., shape_normal_weight=0., shape_tangent_weight=0.)
+    zero_loss = refinement_losses([replace(o,config=zero_cfg)],[moved],
+                                 [np.full((16,)*3,.75)], include_raw=True)[0]
+    assert zero_loss[3] == 0.
+    assert zero_loss[8] > 0.
 
 
 def test_raw_and_both_emas_use_same_refined_test_line(monkeypatch,tmp_path):
@@ -263,7 +269,7 @@ def test_raw_and_both_emas_use_same_refined_test_line(monkeypatch,tmp_path):
 
 def test_empty_refinement_flush_rejects_retained_observations():
     observer = RefinementObserver(RefinementConfig(enabled=True, update_enabled=True))
-    assert observer.flush_empty(SimpleNamespace(enabled=False), phase="test") == [0.0] * 6
+    assert observer.flush_empty(SimpleNamespace(enabled=False), phase="test") == [0.0] * (1 + 2*len(REFINEMENT_LOSS_NAMES))
     observer.pending.append(object())
     with pytest.raises(RuntimeError, match="retained observations"):
         observer.flush_empty(SimpleNamespace(enabled=False), phase="test")

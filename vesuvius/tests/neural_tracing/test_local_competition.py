@@ -77,7 +77,7 @@ def test_test_metrics_independent_of_microbatch_and_weighted_across_rows():
     config['embedding']['objective'] = 'local_contrastive'
     model = build_fiber_trace_3d_model(config).eval()
     b = training_batch()
-    b = replace(b, embedding_geometry=tuple(replace(g, objective='local_contrastive') for g in b.embedding_geometry))
+    b = replace(b, embedding_geometry=tuple(replace(g, objective='local_contrastive', weight=.03) for g in b.embedding_geometry))
     loader = _loader_with_mapping({'augment_enabled':False, 'batch_size':2})
     options = dict(device=torch.device('cpu'), direction_weight=1., presence_weight=1., mixed_precision=None)
     a = _evaluate_loaded_batch(model, b, loader.config, microbatch_size=2, **options)

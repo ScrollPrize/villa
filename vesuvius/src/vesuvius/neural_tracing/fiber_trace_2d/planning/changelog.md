@@ -1,3 +1,11 @@
+## 2026-10-06 — Raw component loss reporting
+
+- Width, H/V, embedding and refinement leaf metrics now exclude configured
+  weights. Combined presence/embedding/refinement retain internal balance;
+  total objective and optimizer gradients are unchanged. Raw refinement values
+  survive zero geometric weights; legacy pending statistics are upgraded.
+- No production training stop/restart for this logging-only update.
+
 ## 2026-10-06 — Width sample visualization
 
 - Optional predicted-width column in train/test sample overviews, all five planes;

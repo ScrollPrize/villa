@@ -59,7 +59,18 @@ prepass and **one backward per microbatch**, including gradient accumulation.
 
 `train/loss_normal` and corresponding raw/EMA test metrics report **unweighted**
 MSE, like `loss_direction`; both receive weight10 in total loss. Width/HV metrics
-still report weighted contributions. Sample step units
+also report unweighted SmoothL1/BCE (their configured weights only affect total).
+Embedding leaves likewise exclude the configured embedding weight; combined
+embedding retains its internal short/long or positive/negative balance.
+Combined presence includes its region weights, but not its outer presence weight.
+Refinement leaves exclude configured weights; combined smoothing and total keep
+their weighted inputs. Raw geometric refinement terms remain measurable at zero
+weight. Disabled direction refinement has no sampled prediction and is omitted;
+legacy pending tests cannot recover zero-weight raw terms, so omit those too.
+Optimizer gradients,
+normalization counts, and sampling are unchanged. Existing TensorBoard history
+is not rewritten; already-running training retains its loaded logging code.
+Sample step units
 and existing tests/snapshots remain unchanged. Width magnitude can initially
 dominate the total; these smoke-test weights are not convergence-tuned.
 

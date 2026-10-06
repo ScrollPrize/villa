@@ -268,7 +268,8 @@ def annotation_statistics(output, batch, cfg):
             indices, widths, falloff = width_tube_targets(batch)
             pred = predicted_width(output, cfg)[:, 0][tuple(indices.T)]
             total = (F.smooth_l1_loss(pred, widths, reduction='none') * falloff).sum()
-            result.update(width_sum=total * cfg.width_weight, width_count=falloff.sum())
+            result.update(width_sum=total * cfg.width_weight, width_count=falloff.sum(),
+                          width_unweighted_sum=total)
             channel += size
             continue
         if name == 'normal' and batch.presence_target_mode == 'anisotropic_gaussian':
@@ -309,7 +310,6 @@ def annotation_statistics(output, batch, cfg):
             total = total + loss
             count = count + target.shape[0] * size
         result[name + "_sum"], result[name + "_count"] = total * getattr(cfg, name + "_weight"), count
-        if name == 'normal':
-            result['normal_unweighted_sum'] = total
+        result[name + '_unweighted_sum'] = total
         channel += size
     return result

@@ -82,6 +82,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.direction import (
     encode_lasagna_direction_3x2,
 )
 from .refinement import RefinementConfig, RefinementObserver, refinement_session, active_store, log_refinement_scalars, empty_refinement_statistics
+from .refinement import upgrade_refinement_statistics
 from vesuvius.neural_tracing.fiber_trace_3d.model import (
     build_fiber_trace_3d_model,
     direction_output,
@@ -1024,6 +1025,9 @@ def _finalize_loss_statistics(
 ) -> dict[str, torch.Tensor]:
     names = (
         "normal", "normal_unweighted", "width", "hv",
+        "width_unweighted", "hv_unweighted",
+        "positive_embedding_unweighted", "negative_embedding_unweighted",
+        "contrastive_embedding_unweighted", "short_embedding_unweighted", "long_embedding_unweighted",
         "direction",
         "positive_presence",
         "negative_presence",
@@ -1041,6 +1045,10 @@ def _finalize_loss_statistics(
         "long_embedding",
     )
     local_pairs = {
+        **{k + "_unweighted": (getattr(statistics, k + "_unweighted_sum"),
+                               getattr(statistics, k + "_count"))
+           for k in ("width", "hv", "positive_embedding", "negative_embedding",
+                     "contrastive_embedding", "short_embedding", "long_embedding")},
         "normal_unweighted": (statistics.normal_unweighted_sum, statistics.normal_count),
         **{k: (getattr(statistics, k + "_sum"), getattr(statistics, k + "_count"))
            for k in ("normal", "width", "hv")},
@@ -1161,10 +1169,16 @@ def _finalize_loss_statistics(
         0.5 * (ratio("short_embedding") + ratio("long_embedding")),
         0.5 * (ratio("positive_embedding") + ratio("negative_embedding")) + ratio("contrastive_embedding"),
     )
+    raw_embedding_loss = torch.where(
+        split_embedding,
+        0.5 * (ratio("short_embedding_unweighted") + ratio("long_embedding_unweighted")),
+        0.5 * (ratio("positive_embedding_unweighted") + ratio("negative_embedding_unweighted"))
+        + ratio("contrastive_embedding_unweighted"),
+    )
     total = float(direction_weight) * direction_loss + float(presence_weight) * presence_loss + embedding_loss
     total = total + ratio("normal") + ratio("width") + ratio("hv")
     return {
-        "normal": ratio("normal_unweighted"), "width": ratio("width"), "hv": ratio("hv"),
+        "normal": ratio("normal_unweighted"), "width": ratio("width_unweighted"), "hv": ratio("hv_unweighted"),
         "total": total,
         "direction": direction_loss,
         "presence": presence_loss,
@@ -1173,15 +1187,15 @@ def _finalize_loss_statistics(
         "presence_background": negative_presence_loss,
         "presence_sideband_left": sideband_left_presence_loss,
         "presence_sideband_right": sideband_right_presence_loss,
-        "embedding": embedding_loss,
-        "embedding_contrastive": ratio("contrastive_embedding"),
+        "embedding": raw_embedding_loss,
+        "embedding_contrastive": ratio("contrastive_embedding_unweighted"),
         "embedding_anchors": global_values["contrastive_embedding"][1] if global_values else statistics.contrastive_embedding_count,
-        "embedding_short": ratio("short_embedding"),
+        "embedding_short": ratio("short_embedding_unweighted"),
         "embedding_short_anchors": global_values["short_embedding"][1] if global_values else statistics.short_embedding_count,
-        "embedding_long": ratio("long_embedding"),
+        "embedding_long": ratio("long_embedding_unweighted"),
         "embedding_long_anchors": global_values["long_embedding"][1] if global_values else statistics.long_embedding_count,
-        "embedding_positive": ratio("positive_embedding"),
-        "embedding_negative": ratio("negative_embedding"),
+        "embedding_positive": ratio("positive_embedding_unweighted"),
+        "embedding_negative": ratio("negative_embedding_unweighted"),
         "embedding_negative_pairs": global_values["negative_embedding"][1] if global_values else statistics.negative_embedding_count,
         "angle_mean_deg": ratio("angle"),
         "angle_count": global_values["angle"][1] if global_values else statistics.angle_count,
@@ -1733,7 +1747,10 @@ def compute_losses(
         from .annotations import annotation_statistics
         statistics = replace(statistics, **annotation_statistics(annotation_output, batch, annotation_config))
     if embeddings is not None:
-        embedding_values = embedding_statistics(embeddings, pred_presences.amax(dim=1), batch, embedding_diagnostics)
+        raw_embedding_sums = {}
+        embedding_values = embedding_statistics(embeddings, pred_presences.amax(dim=1), batch,
+                                                embedding_diagnostics, raw_sums=raw_embedding_sums)
+        statistics = replace(statistics, **raw_embedding_sums)
         pos, pc, neg, nc = embedding_values[:4]
         statistics = replace(statistics, positive_embedding_sum=pos, positive_embedding_count=pc,
                              negative_embedding_sum=neg, negative_embedding_count=nc)
@@ -4007,6 +4024,7 @@ def training_units(
         diagnostics.marker("test-routine-begin", step=step)
         test_refinement_totals = (pending_test.setdefault("refinement_loss_totals", empty_refinement_statistics())
                                   if pending_test is not None else empty_refinement_statistics())
+        test_refinement_totals[:] = upgrade_refinement_statistics(test_refinement_totals, refinement.config)
         def collect_evaluation(evaluation_loader, options, *, source, rows_key, visualization=None):
             nonlocal test_started
             count, offset = options["sample_count"], options["start_sample_index"]
@@ -4166,7 +4184,7 @@ def training_units(
                     if writer is not None and (pending_test is None or not pending_test["dense_logged"]):
                         diagnostics.marker("test-tensorboard-scalars-begin", step=step)
                         _log_test_scalars(writer, "test", test_losses, raw_model, step)
-                        log_refinement_scalars(writer,"test",test_refinement_totals,step)
+                        log_refinement_scalars(writer,"test",test_refinement_totals,step,refinement.config)
                         diagnostics.marker("test-tensorboard-scalars-end", step=step)
                     if cross_section is not None and (
                         pending_test is None or not pending_test["dense_logged"]
