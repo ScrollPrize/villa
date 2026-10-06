@@ -143,7 +143,9 @@ def test_resume_allows_cache_relocation_but_not_dataset_changes():
     validate_dataset_resume(checkpoint,document,digest)
     validate_dataset_resume(dict(dataset_config_sha256=digest),document,digest)
     validate_dataset_resume({},None,None)  # Legacy single-source checkpoints.
-    for key,value in [('ct','s3://different/volume'),('weight',.2),
+    relocated=deepcopy(document);relocated['sources'][1]['ct']='s3://different/volume'
+    validate_dataset_resume(checkpoint,relocated,'changed-digest')  # CT location is not part of the data identity
+    for key,value in [('weight',.2),
                       ('validation',dict(strategy='fiber_hash',count=405,seed=7349))]:
         changed=deepcopy(document);changed['sources'][1][key]=value
         with pytest.raises(ValueError,match='dataset configuration changed'):

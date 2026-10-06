@@ -181,14 +181,13 @@ def test_bank_integrity_fails_closed_and_only_annotation_identity_must_match(tmp
     publish(root,[second])
     with pytest.raises(ValueError,match='removed or modified'):
         bank.refresh(force=True)
-    # Prediction and CT sources must match training.
+    # Prediction sources must match training; the CT location may change (same volume, another copy).
     bank,_ = make_bank(tmp_path/'run')
     root = bank.root
     spec = SimpleNamespace(fiber_zarr_dir='/data/preds',fiber_level=3,ct_zarr='/data/ct.zarr')
     bank.validate_volume(spec)
     spec.ct_zarr = '/data/other.zarr'
-    with pytest.raises(ValueError,match='CT source'):
-        bank.validate_volume(spec)
+    bank.validate_volume(spec)
     spec.ct_zarr = '/data/ct.zarr'
     spec.fiber_level = 4
     with pytest.raises(ValueError,match='prediction volume'):
@@ -202,8 +201,7 @@ def test_bank_integrity_fails_closed_and_only_annotation_identity_must_match(tmp
     bank.validate_volume(moved)
     assert recorded_path('/data/predsx/3') == '/other/predsx/3'  # whole components only
     moved.ct_zarr = '/copy/ct.zarr'
-    with pytest.raises(ValueError,match='CT source'):
-        bank.validate_volume(moved)
+    bank.validate_volume(moved)  # the CT location is not compared
     with pytest.raises(ValueError,match='OLD=NEW'):
         path_map('/data')
     # A worker rejects a replaced run instead of silently relabeling.
