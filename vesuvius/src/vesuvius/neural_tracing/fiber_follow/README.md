@@ -26,6 +26,8 @@ Flow options (defaults keep the original model and old checkpoints load unchange
 - `--flow-samples K --flow-sample-scale S`: K proposals from Gaussian starts (standard deviation S in residual-scale units) after the zero-start path. Training integrates and scores all of them, so the scorer learns sampled paths; tracing uses a later proposal only when no earlier one is accepted.
 - `--flow-sigma-floor V`: lower bound in voxels for the fitted residual scales, which set the noise prior's width (default 1).
 - `--flow-unknown-planes own_path`: target-less planes stay in self-attention, as in tracing, and move from noise to the model's own zero-start path. They get no loss.
+- `--flow-loss pseudo_huber --flow-huber-c C`: velocity-residual loss per path point, `c²(√(1+d²/c²)−1)` with `d` in residual-scale units. It matches the default `mse` for small residuals and is linear beyond about C, so outlying targets pull less. `mse` is the exact flow-matching objective (the conditional mean velocity).
+- `--flow-geometry-weight W` (default 0, off): adds W × the regression smooth-L1 geometry loss on the zero-start path, integrated with gradients through the solver. Scoring, selection and the samples see that path detached. The log then reports `flow` and `flow_path_geometry` separately.
 
 Identity options with `--memory decisions` (defaults keep the original model):
 - `--identity-objective verify`: a verifier reads the decision-memory tokens and labels current-crop locations on/off the original fiber (`models/identity_verifier.py`).
