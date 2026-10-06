@@ -23,7 +23,7 @@ import torch
 from vesuvius.neural_tracing.tracers.fibers.data.data import OnPolicyStates, SampleConfig, ZBand, load_fibers, split_fibers, fiber_manifest, label_state, training_state_allowed
 from vesuvius.neural_tracing.tracers.fibers.evaluation.seeds import directed_seed
 from vesuvius.neural_tracing.tracers.shared.geometry import arclength
-from vesuvius.neural_tracing.tracers.fibers.tracing.heading import SeedHeadingError, SEED_HEADING_POLICY, TRACE_HEADING_POLICY, FRAME_POLICY
+from vesuvius.neural_tracing.tracers.fibers.frames.ct import SeedHeadingError, SEED_HEADING_POLICY, TRACE_HEADING_POLICY, FRAME_POLICY
 from vesuvius.neural_tracing.tracers.shared.policy import checkpoint_policy
 from vesuvius.neural_tracing.tracers.shared.reference import SEED_FIELDS
 from vesuvius.neural_tracing.tracers.fibers.data.state_labels import DEPARTURE_DISTANCE, DEPARTURE_PATIENCE, REASON, RECOVERABLE, REPLAY_CLASSES, SUPERVISION, TERMINAL, TraceLabeler, replay_class
@@ -329,7 +329,7 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer, bank_loader=
     print(f'Collector PyTorch threads: {torch.get_num_threads()}', flush=True)
     model, crop, n_hist, spec, ck = checkpoint_loader(args.checkpoint, args.device)
     if args.frame_checkpoint:
-        from vesuvius.neural_tracing.tracers.fibers.tracing.crop_frames import bind_frame_checkpoint
+        from vesuvius.neural_tracing.tracers.fibers.frames.learned import bind_frame_checkpoint
         bind_frame_checkpoint(model.cfg, args.frame_checkpoint)
     policy = checkpoint_policy(ck, model.cfg, confidence=args.confidence, n_commit=args.n_commit, gate=args.gate)
     cfg = SampleConfig(crop=crop, n_history=n_hist, recent_history_points=model.cfg.recent_history_points,
@@ -361,7 +361,7 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer, bank_loader=
             collectors = [DecisionCollector(train_f[s['fiber']], s['fiber'], s['t'], s['sign'], cfg, band,
                                             before=args.before, after=args.after, stride=args.stride,
                                             max_states=args.max_states, bank_detector=bank_detector) for s in chunk]
-            from vesuvius.neural_tracing.tracers.fibers.tracing.crop_frames import trace_family_kwargs
+            from vesuvius.neural_tracing.tracers.fibers.frames.learned import trace_family_kwargs
             paths, chunk_reasons = tracer.trace(np.stack([s['pos'] for s in chunk]), np.stack([s['heading'] for s in chunk]),
                                                 on_decision=lambda i, state: collectors[i](state),
                                                 **trace_family_kwargs(tracer, [train_f[s['fiber']].tag for s in chunk]))

@@ -7,7 +7,7 @@ from functools import lru_cache
 import hashlib
 from pathlib import Path
 
-from vesuvius.neural_tracing.tracers.fibers.tracing.heading import (
+from vesuvius.neural_tracing.tracers.fibers.frames.ct import (
     FRAME_POLICY, LEARNED_FRAME_POLICY, FRAME_POLICIES, fiber_family, orient_item, reframe_item,
     frame_prefetch_bounds, heading_free_bounds, normal_context,
 )

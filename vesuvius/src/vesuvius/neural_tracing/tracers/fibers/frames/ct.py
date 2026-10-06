@@ -4,6 +4,7 @@ from __future__ import annotations
 import numpy as np
 from scipy.ndimage import gaussian_filter
 
+from vesuvius.neural_tracing.tracers.shared.crop_sampling.crops import tight_block
 from vesuvius.neural_tracing.tracers.shared.geometry import arclength, interp_at, frame_from_heading, normalize, block_start
 
 SEED_HEADING_POLICY = 'ct_sheet_hv_sigma2_8_v2'
@@ -206,7 +207,6 @@ def orient_item(item, vol):
 
 def frame_prefetch_bounds(item, crop, input_scale):
     """Cover every roll until CT is available, plus the normal's CT context."""
-    from vesuvius.neural_tracing.tracers.shared.crop_sampling.crops import tight_block
     if item.get('frame_policy') in FRAME_POLICIES:
         yield tight_block(item['pos'], item['frame'], crop, input_scale)
     else:

@@ -23,7 +23,7 @@ from vesuvius.neural_tracing.tracers.fibers.data.datasets import WeightedDataset
 from vesuvius.neural_tracing.tracers.fibers.data.data import FollowDataset, SampleConfig, simulated_trace, traversal_curve
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.crops import tight_block
 from vesuvius.neural_tracing.tracers.shared.geometry import arclength, interp_at, normalize
-from vesuvius.neural_tracing.tracers.fibers.tracing.heading import linear12_heading
+from vesuvius.neural_tracing.tracers.fibers.frames.ct import linear12_heading
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume
 
 HISTORY_BINS = (('seed', 0., 1e-9), ('1-11', 1e-9, 12.), ('12-31', 12., 32.), ('32+', 32., float('inf')))

@@ -98,7 +98,7 @@ def training_defaults(model_type):
 
 def model_defaults(model_type):
     """The model section's defaults: the model configuration class's fields, plus the default frame checkpoint."""
-    from vesuvius.neural_tracing.tracers.fibers.tracing.crop_frames import DEFAULT_FRAME_CHECKPOINT
+    from vesuvius.neural_tracing.tracers.fibers.frames.learned import DEFAULT_FRAME_CHECKPOINT
     values = {}
     for f in fields(config_class(model_type)):
         if f.name not in DERIVED_MODEL_FIELDS:

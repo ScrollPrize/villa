@@ -22,8 +22,8 @@ OVERLAY_PLANE = 3.  # reference points within this distance of a strip's plane a
 def learned_decision_frames(predictor, vol, path, family, held, every=8.):
     """(direction, travelled, frame) every ``every`` voxels of a saved forward path from the learned frame model,
     with the tracer's heading rule (trace_heading after each commit) and the observed path so far."""
-    from vesuvius.neural_tracing.tracers.fibers.tracing.crop_frames import predict_frames
-    from vesuvius.neural_tracing.tracers.fibers.tracing.heading import fiber_family, trace_heading
+    from vesuvius.neural_tracing.tracers.fibers.frames.learned import predict_frames
+    from vesuvius.neural_tracing.tracers.fibers.frames.ct import fiber_family, trace_heading
     path = np.asarray(path, float)
     s = arclength(path)
     index = np.unique(np.searchsorted(s, np.arange(0., s[-1]+1e-9, every)).clip(0, len(path)-1))

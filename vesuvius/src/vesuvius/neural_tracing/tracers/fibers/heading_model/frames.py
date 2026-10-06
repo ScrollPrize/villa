@@ -4,7 +4,7 @@ import torch
 import torch.nn.functional as F
 
 from vesuvius.neural_tracing.tracers.shared.geometry import interp_at
-from vesuvius.neural_tracing.tracers.fibers.tracing.heading import fiber_family
+from vesuvius.neural_tracing.tracers.fibers.frames.ct import fiber_family
 
 TANGENT_HALF_SPAN = 6.  # trace voxels; centered 12-voxel fit, clipped at annotation ends
 MIN_PROJECTION = .1

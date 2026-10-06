@@ -15,8 +15,8 @@ from vesuvius.neural_tracing.tracers.shared.policy import (DEFAULT_CONFIDENCE, D
     commit_count, selection_window)
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume
 from vesuvius.neural_tracing.tracers.shared.reference import SEED_FIELDS, observed_path
-from vesuvius.neural_tracing.tracers.fibers.tracing.heading import trace_heading, TRACE_HEADING_POLICY, FRAME_POLICY, FRAME_POLICIES, ct_frame, fiber_family
-from vesuvius.neural_tracing.tracers.fibers.tracing.crop_frames import frame_predictor, configured_frame_policy, predict_frames
+from vesuvius.neural_tracing.tracers.fibers.frames.ct import trace_heading, TRACE_HEADING_POLICY, FRAME_POLICY, FRAME_POLICIES, ct_frame, fiber_family
+from vesuvius.neural_tracing.tracers.fibers.frames.learned import frame_predictor, configured_frame_policy, predict_frames
 
 if TYPE_CHECKING:
     from torch.nn import Module as FollowNet

@@ -13,8 +13,8 @@ import warnings
 from vesuvius.neural_tracing.tracers.fibers.data.data import DATA_VERSION, TracedFiber
 from vesuvius.neural_tracing.tracers.shared.io import jsonable
 from vesuvius.neural_tracing.tracers.shared.geometry import interp_at, tangent_at
-from vesuvius.neural_tracing.tracers.fibers.tracing.heading import oriented_seed_heading, SeedHeadingError, SEED_HEADING_POLICY
-from vesuvius.neural_tracing.tracers.fibers.tracing.crop_frames import trace_family_kwargs
+from vesuvius.neural_tracing.tracers.fibers.frames.ct import oriented_seed_heading, SeedHeadingError, SEED_HEADING_POLICY
+from vesuvius.neural_tracing.tracers.fibers.frames.learned import trace_family_kwargs
 
 
 def make_seeds(fibers: list[TracedFiber], vol, per_fiber: int = 3,

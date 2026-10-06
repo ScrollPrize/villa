@@ -8,7 +8,7 @@ from vesuvius.neural_tracing.tracers.fibers.data.labels import prefix_labels
 from vesuvius.neural_tracing.tracers.fibers.tracing.trace import ModelTracer, TraceParams
 from vesuvius.neural_tracing.tracers.shared.policy import DIAGNOSTIC_THRESHOLDS
 from vesuvius.neural_tracing.tracers.shared.reference import SEED_FIELDS
-from vesuvius.neural_tracing.tracers.fibers.tracing.heading import FRAME_POLICY, orient_item
+from vesuvius.neural_tracing.tracers.fibers.frames.ct import FRAME_POLICY, orient_item
 from vesuvius.neural_tracing.tracers.fibers.data.state_labels import SUPERVISION, replay_class
 
 # Fixture displacement strata (head distance to the original fiber, trace voxels).
@@ -96,8 +96,8 @@ def evaluate_recovery_states(model, vol, states, fibers, sample, *, device='cpu'
     ``learned_frames`` (default: whenever the model has a learned frame predictor) orients
     each state's first crop like training and tracing do, instead of the fixture's CT frame.
     """
-    from vesuvius.neural_tracing.tracers.fibers.tracing.crop_frames import frame_predictor
-    from vesuvius.neural_tracing.tracers.fibers.tracing.heading import LEARNED_FRAME_POLICY
+    from vesuvius.neural_tracing.tracers.fibers.frames.learned import frame_predictor
+    from vesuvius.neural_tracing.tracers.fibers.frames.ct import LEARNED_FRAME_POLICY
     if learned_frames is None:
         learned_frames = frame_predictor(model.cfg) is not None
     states.validate_fibers(fibers)
@@ -153,7 +153,7 @@ def evaluate_recovery_states(model, vol, states, fibers, sample, *, device='cpu'
                 state['frame_policy'] = LEARNED_FRAME_POLICY
             state.update({k: getattr(states, k)[j] for k in SEED_FIELDS if hasattr(states, k)})
             try:
-                from vesuvius.neural_tracing.tracers.fibers.tracing.crop_frames import trace_family_kwargs
+                from vesuvius.neural_tracing.tracers.fibers.frames.learned import trace_family_kwargs
                 paths,reasons=tracer.trace(states.pos[j:j+1],np.asarray(state["frame"])[None,:,2],initial_states=[state],
                                            **trace_family_kwargs(tracer, [f.tag]))
             finally:tracer.close()

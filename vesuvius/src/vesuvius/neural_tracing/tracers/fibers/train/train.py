@@ -30,7 +30,7 @@ from vesuvius.neural_tracing.tracers.fibers.train import run_config
 from vesuvius.neural_tracing.tracers.fibers.train.supervision import commit_window, loss_terms
 from vesuvius.neural_tracing.tracers.fibers.evaluation.diagnostics import decision_rows, summarize_decisions
 from vesuvius.neural_tracing.tracers.fibers.evaluation.recovery import monitor_fixture, evaluate_monitor
-from vesuvius.neural_tracing.tracers.fibers.tracing.crop_frames import configured_frame_policy, frame_predictor, bind_frame_checkpoint
+from vesuvius.neural_tracing.tracers.fibers.frames.learned import configured_frame_policy, frame_predictor, bind_frame_checkpoint
 from vesuvius.neural_tracing.tracers.fibers.train.training_log import format_training_log, TrainingInterval, SamplingLedger
 
 

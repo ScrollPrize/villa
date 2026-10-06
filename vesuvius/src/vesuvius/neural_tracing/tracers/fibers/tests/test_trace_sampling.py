@@ -6,7 +6,7 @@ import pytest
 
 from vesuvius.neural_tracing.tracers.fibers.data import data as D
 from vesuvius.neural_tracing.tracers.shared.geometry import CropSpec, arclength, interp_at
-from vesuvius.neural_tracing.tracers.fibers.tracing.heading import trace_heading
+from vesuvius.neural_tracing.tracers.fibers.frames.ct import trace_heading
 from vesuvius.neural_tracing.tracers.fibers.tracing.trace import trace_history
 
 

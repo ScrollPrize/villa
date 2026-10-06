@@ -13,8 +13,8 @@ from vesuvius.neural_tracing.tracers.shared.geometry import interp_at, traversal
 from vesuvius.neural_tracing.tracers.fibers.tracing.trace import ModelTracer
 from vesuvius.neural_tracing.tracers.shared.reference import SEED_FIELDS, observed_seed
 from vesuvius.neural_tracing.tracers.fibers.data.state_labels import DEPARTURE_DISTANCE, supervise
-from vesuvius.neural_tracing.tracers.fibers.tracing.heading import heading_free_bounds, reframe_item, FRAME_POLICY, FRAME_POLICIES
-from vesuvius.neural_tracing.tracers.fibers.tracing.crop_frames import frame_predictor, orient_items, crop_frame_bounds
+from vesuvius.neural_tracing.tracers.fibers.frames.ct import heading_free_bounds, reframe_item, FRAME_POLICY, FRAME_POLICIES
+from vesuvius.neural_tracing.tracers.fibers.frames.learned import frame_predictor, orient_items, crop_frame_bounds
 from vesuvius.neural_tracing.tracers.models.model import FollowerConfig
 
 

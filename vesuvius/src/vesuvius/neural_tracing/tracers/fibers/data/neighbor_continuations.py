@@ -5,7 +5,7 @@ from vesuvius.neural_tracing.tracers.fibers.data.data import SOURCE, label_state
 from vesuvius.neural_tracing.tracers.shared.geometry import (
     arclength, exact_nearest, interp_at, frame_from_heading, normalize, traversal_curve,
 )
-from vesuvius.neural_tracing.tracers.fibers.tracing.heading import trace_heading
+from vesuvius.neural_tracing.tracers.fibers.frames.ct import trace_heading
 from vesuvius.neural_tracing.tracers.fibers.data.state_labels import constructed_facts
 
 

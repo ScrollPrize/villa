@@ -79,7 +79,7 @@ def validation_manifest(fibers, spec, seed=0, monitor_count=32):
     """Freeze distinct monitor/calibration/final fiber IDs and CT-only seeds."""
     from vesuvius.neural_tracing.tracers.fibers.evaluation.seeds import make_seeds
     from vesuvius.neural_tracing.tracers.shared.io import jsonable
-    from vesuvius.neural_tracing.tracers.fibers.tracing.heading import SEED_HEADING_POLICY, TRACE_HEADING_POLICY, FRAME_POLICY
+    from vesuvius.neural_tracing.tracers.fibers.frames.ct import SEED_HEADING_POLICY, TRACE_HEADING_POLICY, FRAME_POLICY
     from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume
     seed_volume = CTVolume(spec, cache_bytes=256 << 20)
     rng = np.random.default_rng(seed)

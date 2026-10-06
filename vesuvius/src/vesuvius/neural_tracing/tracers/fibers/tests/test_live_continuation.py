@@ -9,7 +9,7 @@ import torch
 from vesuvius.neural_tracing.tracers.fibers.train.live_continuation import LiveContinuation, LiveContinuationSource
 from vesuvius.neural_tracing.tracers.fibers.data.data import SOURCE, FollowDataset, SampleConfig, TracedFiber, make_sample
 from vesuvius.neural_tracing.tracers.shared.geometry import CropSpec, arclength
-from vesuvius.neural_tracing.tracers.fibers.tracing.heading import orient_item
+from vesuvius.neural_tracing.tracers.fibers.frames.ct import orient_item
 from vesuvius.neural_tracing.tracers.shared.policy import OperatingPolicy
 from vesuvius.neural_tracing.tracers.fibers.data.state_labels import FOLLOWING
 from vesuvius.neural_tracing.tracers.fibers.tracing.trace import ModelTracer, TraceParams
@@ -33,7 +33,7 @@ def setup(monkeypatch):
     import vesuvius.neural_tracing.tracers.fibers.train.live_continuation as module
     # Deterministic in-process queues.
     monkeypatch.setattr(module.mp, 'get_context', lambda: SimpleNamespace(Queue=Queue, Value=Values))
-    monkeypatch.setattr('vesuvius.neural_tracing.tracers.fibers.tracing.heading.ct_tensor',
+    monkeypatch.setattr('vesuvius.neural_tracing.tracers.fibers.frames.ct.ct_tensor',
                         lambda vol, pos: np.diag([3., 1., .1]))
     z = np.arange(500.)
     p = np.c_[100.+.4*np.sin(z/20), np.full(len(z), 100.), z+100.]

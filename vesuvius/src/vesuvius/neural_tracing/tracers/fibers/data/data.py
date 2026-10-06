@@ -426,7 +426,7 @@ def make_sample(fiber: TracedFiber, t: float, reverse: bool, cfg: SampleConfig, 
 def decision_on_path(fiber, t, reverse, cfg, path, arcs, category, sigma, details):
     """The tracer decision whose head ends an observed path (``path``, sampled at traversal arclengths ``arcs``
     ending at ``t``): crop heading, history, seed reference and labels exactly as ``make_sample`` builds them."""
-    from vesuvius.neural_tracing.tracers.fibers.tracing.heading import linear12_heading, trace_heading
+    from vesuvius.neural_tracing.tracers.fibers.frames.ct import linear12_heading, trace_heading
     from vesuvius.neural_tracing.tracers.fibers.data.state_labels import constructed_facts, supervise
     from vesuvius.neural_tracing.tracers.fibers.tracing.trace import trace_history
     p, s = traversal_curve(fiber, reverse)
@@ -545,7 +545,7 @@ def resolve_trace_seed(item, vol):
     if family is None:
         return item
     item['fiber_family'] = family
-    from vesuvius.neural_tracing.tracers.fibers.tracing.heading import oriented_seed_heading, reframe_item
+    from vesuvius.neural_tracing.tracers.fibers.frames.ct import oriented_seed_heading, reframe_item
     from vesuvius.neural_tracing.tracers.fibers.data.state_labels import supervise
     heading = oriented_seed_heading(vol, item['seed_pos'], family, item['seed_tangent'])
     item['seed_tangent'] = heading
@@ -877,7 +877,7 @@ class FollowDataset(torch.utils.data.IterableDataset):
         return None
 
     def replay_item(self, op, j, rng):
-        from vesuvius.neural_tracing.tracers.fibers.tracing.heading import FRAME_POLICY
+        from vesuvius.neural_tracing.tracers.fibers.frames.ct import FRAME_POLICY
         fi, t, reverse = int(op.fiber_idx[j]), float(op.t[j]), bool(op.reverse[j])
         item = label_state(self.fibers[fi], op.pos[j], op.frame[j], op.hist[j], op.hmask[j], self.cfg,
                            t=t, reverse=reverse, trace=replay_facts(op, j, self.cfg))
@@ -1018,7 +1018,7 @@ class FollowDataset(torch.utils.data.IterableDataset):
     def prefetch_bounds(self, items, vol):
         if hasattr(self.batch_builder, 'prefetch_bounds'):
             return [bound for item in items for bound in self.batch_builder.prefetch_bounds(item,vol)]
-        from vesuvius.neural_tracing.tracers.fibers.tracing.heading import frame_prefetch_bounds
+        from vesuvius.neural_tracing.tracers.fibers.frames.ct import frame_prefetch_bounds
         return [bound for item in items for bound in frame_prefetch_bounds(item,self.cfg.crop,vol.input_scale)]
 
     def prefetch_items(self, items, vol, *, required=False):
@@ -1036,7 +1036,7 @@ class FollowDataset(torch.utils.data.IterableDataset):
 
     def resolve_seeds(self, items, vol, rng, windows):
         """CT seed headings; a seed without CT orientation is rejected and its task redrawn."""
-        from vesuvius.neural_tracing.tracers.fibers.tracing.heading import SeedHeadingError
+        from vesuvius.neural_tracing.tracers.fibers.frames.ct import SeedHeadingError
         rejected = 0
         if self.episodes is not None:
             # A rejected seed redraws its whole episode: every decision of a trace shares the seed.
@@ -1074,7 +1074,7 @@ class FollowDataset(torch.utils.data.IterableDataset):
         return rejected
 
     def __iter__(self):
-        from vesuvius.neural_tracing.tracers.fibers.tracing.heading import SeedHeadingError
+        from vesuvius.neural_tracing.tracers.fibers.frames.ct import SeedHeadingError
         torch.set_num_threads(1)
         if self.remote_prefetch is not None:
             self.remote_prefetch.ensure_metadata(self.vol_spec)

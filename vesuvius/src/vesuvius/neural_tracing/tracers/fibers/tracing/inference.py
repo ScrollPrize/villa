@@ -26,8 +26,8 @@ from vesuvius.neural_tracing.tracers.shared.geometry import arclength, resample_
 from vesuvius.neural_tracing.tracers.shared.policy import checkpoint_policy
 from vesuvius.neural_tracing.tracers.fibers.tracing.trace import ModelTracer, TraceParams
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume
-from vesuvius.neural_tracing.tracers.fibers.tracing.heading import SeedHeadingError, ct_seed_heading, SEED_HEADING_POLICY, TRACE_HEADING_POLICY, FRAME_POLICY
-from vesuvius.neural_tracing.tracers.fibers.tracing.crop_frames import trace_family_kwargs
+from vesuvius.neural_tracing.tracers.fibers.frames.ct import SeedHeadingError, ct_seed_heading, SEED_HEADING_POLICY, TRACE_HEADING_POLICY, FRAME_POLICY
+from vesuvius.neural_tracing.tracers.fibers.frames.learned import trace_family_kwargs
 
 
 def make_fiber_json(points_base_xyz: np.ndarray, cp_every: float, meta: dict) -> dict:
@@ -196,7 +196,7 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer):
 
     model, crop, n_hist, spec, ck = checkpoint_loader(args.checkpoint, args.device)
     if args.frame_checkpoint:
-        from vesuvius.neural_tracing.tracers.fibers.tracing.crop_frames import bind_frame_checkpoint
+        from vesuvius.neural_tracing.tracers.fibers.frames.learned import bind_frame_checkpoint
         bind_frame_checkpoint(model.cfg, args.frame_checkpoint)
     for key in ('flow_samples', 'flow_sample_scale'):
         if getattr(args, key) is not None:

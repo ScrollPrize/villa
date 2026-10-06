@@ -2,7 +2,7 @@
 
 A small network that predicts the follower's crop frame from what the tracer has at each decision: the current CT
 around the head, the observed path (none at a seed) and the fiber's H/V family. The follower uses it for every crop
-it builds in training, collection and tracing (`tracing/crop_frames.py`); new runs use the frozen
+it builds in training, collection and tracing (`frames/learned.py`); new runs use the frozen
 `output/heading_model_l0_w16_centered_frame/ckpt_064000.pt` (`DEFAULT_FRAME_CHECKPOINT`).
 
 ## What it predicts
@@ -60,7 +60,7 @@ inference uses the previous frame for sign continuity and a reproducible sign at
   `ct_normalization.json` to reuse its exact records;
 - the simulated tracer states come from `data.data.make_sample`: the startup mix, the calibrated tracing
   error and the head offset;
-- the prior is the tracer's own heading rule, `tracing.heading.linear12_heading`.
+- the prior is the tracer's own heading rule, `frames.ct.linear12_heading`.
 
 A `seed_probability` share of states are seeds: an annotated point with no path. Seeds and paths shorter than
 12 voxels hold a seed heading that the model must not depend on, so their prior is the true continuation

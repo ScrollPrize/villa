@@ -21,7 +21,7 @@ from vesuvius.neural_tracing.tracers.fibers.evaluation.recovery_scoring import r
 from vesuvius.neural_tracing.tracers.fibers.data.observations import FiberTracer
 from vesuvius.neural_tracing.tracers.shared.io import jsonable, write_json as write
 from vesuvius.neural_tracing.tracers.shared.geometry import arclength, interp_at, tangent_at
-from vesuvius.neural_tracing.tracers.fibers.tracing.heading import oriented_seed_heading, SeedHeadingError, SEED_HEADING_POLICY
+from vesuvius.neural_tracing.tracers.fibers.frames.ct import oriented_seed_heading, SeedHeadingError, SEED_HEADING_POLICY
 from vesuvius.neural_tracing.tracers.shared.policy import checkpoint_policy
 from vesuvius.neural_tracing.tracers.fibers.tracing.trace import TraceParams
 from vesuvius.neural_tracing.tracers.fibers.train.train import load_checkpoint
