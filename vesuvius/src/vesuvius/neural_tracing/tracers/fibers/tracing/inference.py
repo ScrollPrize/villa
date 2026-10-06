@@ -22,8 +22,8 @@ from datetime import datetime, timezone
 import numpy as np
 from scipy.spatial import cKDTree
 
-from vesuvius.neural_tracing.tracers.fibers.shared.geometry import arclength, resample_polyline
-from vesuvius.neural_tracing.tracers.fibers.tracing.policy import checkpoint_policy
+from vesuvius.neural_tracing.tracers.shared.geometry import arclength, resample_polyline
+from vesuvius.neural_tracing.tracers.shared.policy import checkpoint_policy
 from vesuvius.neural_tracing.tracers.fibers.tracing.trace import ModelTracer, TraceParams
 from vesuvius.neural_tracing.tracers.fibers.data.volume import FiberVolume
 from vesuvius.neural_tracing.tracers.fibers.tracing.heading import SeedHeadingError, ct_seed_heading, SEED_HEADING_POLICY, TRACE_HEADING_POLICY, FRAME_POLICY

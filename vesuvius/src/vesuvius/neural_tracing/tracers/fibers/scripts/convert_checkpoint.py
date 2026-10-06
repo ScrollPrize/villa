@@ -31,7 +31,7 @@ SEQUENCE_UNSUPPORTED_TASKS = ('live', 'synthetic_terminal')
 
 
 def convert_model_config(model_type, recorded):
-    from vesuvius.neural_tracing.tracers.fibers.models.model import RETIRED_FIELDS, config_class, recorded_config
+    from vesuvius.neural_tracing.tracers.models.model import RETIRED_FIELDS, config_class, recorded_config
     for key, inert in {**INERT_MODEL_FIELDS, **RETIRED_FIELDS}.items():
         if recorded.get(key, inert) != inert:
             raise ValueError(f'Model field {key}={recorded[key]!r} has no counterpart in the current model')
@@ -107,7 +107,7 @@ def convert(ck):
 
 def verify(out):
     """Load the converted model, EMA and optimizer state into the current model."""
-    from vesuvius.neural_tracing.tracers.fibers.models.model import build_model, config_from_checkpoint
+    from vesuvius.neural_tracing.tracers.models.model import build_model, config_from_checkpoint
     model = build_model(config_from_checkpoint(out))
     model.load_state_dict(out['model'])
     ema = build_model(config_from_checkpoint(out))

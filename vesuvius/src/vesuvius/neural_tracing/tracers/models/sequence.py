@@ -23,12 +23,12 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from vesuvius.neural_tracing.tracers.fibers.models.blocks import CropCNN, TransformerLayer
-from vesuvius.neural_tracing.tracers.fibers.models.model import (
+from vesuvius.neural_tracing.tracers.models.blocks import CropCNN, TransformerLayer
+from vesuvius.neural_tracing.tracers.models.model import (
     FollowerConfig, path_readout, plane_coordinates, proposal_output, read_path, sample_features, select_refinement,
     token_coordinates)
-from vesuvius.neural_tracing.tracers.fibers.shared.geometry import CropSpec
-from vesuvius.neural_tracing.tracers.fibers.tracing.policy import DEFAULT_CONFIDENCE
+from vesuvius.neural_tracing.tracers.shared.geometry import CropSpec
+from vesuvius.neural_tracing.tracers.shared.policy import DEFAULT_CONFIDENCE
 
 POSITION_FREQUENCIES = 8  # sinusoidal arc length, periods 16 .. 2048 trace voxels
 

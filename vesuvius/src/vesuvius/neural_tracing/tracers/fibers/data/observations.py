@@ -9,13 +9,13 @@ from scipy.ndimage import gaussian_filter
 from vesuvius.neural_tracing.tracers.fibers.data.components import ComponentRule
 from vesuvius.neural_tracing.tracers.fibers.data.data import SOURCE, collate_targets, resolve_trace_seed
 from vesuvius.neural_tracing.tracers.fibers.data.crop_sampling import scalar_crops, empty_image_batch
-from vesuvius.neural_tracing.tracers.fibers.shared.geometry import interp_at, traversal_curve
+from vesuvius.neural_tracing.tracers.shared.geometry import interp_at, traversal_curve
 from vesuvius.neural_tracing.tracers.fibers.tracing.trace import ModelTracer
-from vesuvius.neural_tracing.tracers.fibers.shared.reference import SEED_FIELDS, observed_seed
+from vesuvius.neural_tracing.tracers.shared.reference import SEED_FIELDS, observed_seed
 from vesuvius.neural_tracing.tracers.fibers.data.state_labels import DEPARTURE_DISTANCE, supervise
 from vesuvius.neural_tracing.tracers.fibers.tracing.heading import heading_free_bounds, reframe_item, FRAME_POLICY, FRAME_POLICIES
 from vesuvius.neural_tracing.tracers.fibers.tracing.crop_frames import frame_predictor, orient_items, crop_frame_bounds
-from vesuvius.neural_tracing.tracers.fibers.models.model import FollowerConfig
+from vesuvius.neural_tracing.tracers.models.model import FollowerConfig
 
 
 def image_crop(items, vol, crop, pool=None):
@@ -52,7 +52,7 @@ class ObservationBuilder:
         x = dict(fine=crop_images(items,vol,self.cfg.fine,pool),seed=stack('visible_seed'),
                  seed_mask=stack('visible_seed_mask'),seed_age=stack('visible_seed_age'),
                  seed_tangent=stack('visible_seed_tangent'))
-        from vesuvius.neural_tracing.tracers.fibers.models.path_geometry import path_geometry_inputs
+        from vesuvius.neural_tracing.tracers.models.path_geometry import path_geometry_inputs
         x.update(path_geometry_inputs(items))
         # Recorded replay frames have unknown quality unless it was supplied;
         # do not count them as newly successful CT estimates.

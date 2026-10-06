@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 
+import hashlib
+import json
+from pathlib import Path
+
 import numpy as np
 import warnings
 
 from vesuvius.neural_tracing.tracers.fibers.data.data import DATA_VERSION, TracedFiber
-from vesuvius.neural_tracing.tracers.fibers.shared.geometry import interp_at, tangent_at
+from vesuvius.neural_tracing.tracers.shared.io import jsonable
+from vesuvius.neural_tracing.tracers.shared.geometry import interp_at, tangent_at
 from vesuvius.neural_tracing.tracers.fibers.tracing.heading import oriented_seed_heading, SeedHeadingError, SEED_HEADING_POLICY
 from vesuvius.neural_tracing.tracers.fibers.tracing.crop_frames import trace_family_kwargs
 
@@ -279,7 +284,7 @@ DISTANCE_EVENT = 6.0
 
 def distance_profile(path, fiber, t0, sign, chunk=8):
     """Per-vertex distance to the original fiber under the shared bounded correspondence."""
-    from vesuvius.neural_tracing.tracers.fibers.shared.geometry import arclength
+    from vesuvius.neural_tracing.tracers.shared.geometry import arclength
     from vesuvius.neural_tracing.tracers.fibers.data.state_labels import TraceLabeler
     path = np.asarray(path, np.float64).reshape(-1, 3)
     labeler = TraceLabeler(fiber, t0, sign, tolerance=1., max_recovery_distance=1.)
@@ -405,7 +410,7 @@ class EvaluationAudit:
         record['displaced_previous'] = displaced and not state['would_stop']
 
     def outcomes(self, index, path, reason):
-        from vesuvius.neural_tracing.tracers.fibers.shared.geometry import arclength
+        from vesuvius.neural_tracing.tracers.shared.geometry import arclength
         labeler, record = self.labelers[index], dict(self.records[index])
         record.pop('displaced_previous')
         path = np.asarray(path, np.float64).reshape(-1, 3)
@@ -435,9 +440,33 @@ OUTCOME_LENGTHS = ('length_after_switch', 'geometric_agreement')
 
 def summarize_outcomes(rows):
     """Totals of the decision and geometric outcomes, next to the first-failure summary."""
-    from vesuvius.neural_tracing.tracers.fibers.shared.experiment import rollout_summary
     result = rollout_summary(rows)
     for key in OUTCOME_COUNTS+OUTCOME_LENGTHS:
         if rows and key in rows[0]:
             result[key] = float(sum(float(r[key]) for r in rows))
     return result
+
+
+def rollout_summary(rows):
+    result=summarize(rows)
+    wrong=[float(r['offtrack']) for r in rows if r['offtrack']>0]
+    result.update(divergence_count=sum(r['diverged'] for r in rows),
+                  wrong_continuation_lengths=wrong,
+                  wrong_continuation_quantiles=dict(zip(('p50','p90','p95','max'),np.quantile(wrong,[.5,.9,.95,1]).tolist())) if wrong else None)
+    return result
+
+
+def read_manifest(path):
+    """Check the frozen payload hash, split membership and seed identities."""
+    saved=json.loads(Path(path).read_text())
+    payload={k:v for k,v in saved.items() if k!='sha256'}
+    digest=hashlib.sha256(json.dumps(payload,sort_keys=True,default=jsonable).encode()).hexdigest()
+    if digest!=saved['sha256']:
+        raise ValueError('Frozen seed manifest was modified')
+    sets=[set(saved[name+'_fibers']) for name in ('monitor','calibration','final')]
+    if any(sets[i]&sets[j] for i in range(3) for j in range(i)):
+        raise ValueError('Evaluation splits overlap')
+    for name,ids in zip(('monitor','calibration','final'),sets):
+        if any(s['fiber'] not in ids for s in saved[name]):
+            raise ValueError('Seed appears outside its frozen split')
+    return saved

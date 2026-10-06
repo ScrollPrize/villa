@@ -19,7 +19,7 @@ import sys
 import numpy as np
 
 from vesuvius.neural_tracing.tracers.fibers.data.data import FALLBACKS, SEED_AGE_STRATA, SOURCE, STARTUP_CATEGORIES, TASKS, FollowDataset, OnPolicyStates, SampleConfig, TaskBudget, seed_age_stratum, traversal_curve
-from vesuvius.neural_tracing.tracers.fibers.shared.geometry import tangent_at
+from vesuvius.neural_tracing.tracers.shared.geometry import tangent_at
 from vesuvius.neural_tracing.tracers.fibers.data.state_labels import REPLAY_CLASSES, SUPERVISION
 
 CORRECT_REPLAY = ('dagger_pre_excursion', 'dagger_recoverable', 'dagger_premature_stop', 'dagger_ordinary')
@@ -78,7 +78,7 @@ def main(argv=None):
     from vesuvius.neural_tracing.tracers.fibers.data.observations import IdentityObservationBuilder, IdentitySampling
     from vesuvius.neural_tracing.tracers.fibers.data.afv_neighbors import AFVBank
     from vesuvius.neural_tracing.tracers.fibers.data.datasets import load_primary_dataset, open_afv_source, read_dataset_config
-    from vesuvius.neural_tracing.tracers.fibers.models.model import config_from_checkpoint
+    from vesuvius.neural_tracing.tracers.models.model import config_from_checkpoint
     from vesuvius.neural_tracing.tracers.fibers.train.runloop import read_checkpoint
     from vesuvius.neural_tracing.tracers.fibers.data.volume import FiberVolumeSpec
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)

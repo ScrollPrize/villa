@@ -11,7 +11,7 @@ from vesuvius.neural_tracing.tracers.fibers.tracing.heading import (
     FRAME_POLICY, LEARNED_FRAME_POLICY, FRAME_POLICIES, fiber_family, orient_item, reframe_item,
     frame_prefetch_bounds, heading_free_bounds, normal_context,
 )
-from vesuvius.neural_tracing.tracers.fibers.shared.reference import observed_path
+from vesuvius.neural_tracing.tracers.shared.reference import observed_path
 
 DEFAULT_FRAME_CHECKPOINT = str(Path(__file__).resolve().parents[1]/'output'/'heading_model_l0_w16_centered_frame'/'ckpt_064000.pt')
 
@@ -40,7 +40,7 @@ def _load_predictor(path, digest):
 
 
 def frame_predictor(cfg):
-    from vesuvius.neural_tracing.tracers.fibers.shared.paths import recorded_path
+    from vesuvius.neural_tracing.tracers.shared.paths import recorded_path
     path = getattr(cfg, 'frame_checkpoint', None)
     if not path:
         return None

@@ -23,9 +23,9 @@ import json
 import math
 from pathlib import Path
 
-from vesuvius.neural_tracing.tracers.fibers.models.model import MODEL_TYPES, RETIRED_FIELDS, config_class
-from vesuvius.neural_tracing.tracers.fibers.shared.retired import ANY, retire as retire_settings
-from vesuvius.neural_tracing.tracers.fibers.shared.paths import moved_path
+from vesuvius.neural_tracing.tracers.models.model import MODEL_TYPES, RETIRED_FIELDS, config_class
+from vesuvius.neural_tracing.tracers.shared.retired import ANY, retire as retire_settings
+from vesuvius.neural_tracing.tracers.shared.paths import moved_path
 
 OUT_ROOT = Path(__file__).resolve().parents[1]/'output'
 TOP_LEVEL = dict(name=None, out_root=None, init_weights=None, init_exclude=[], reset_optimizer=False)
@@ -171,7 +171,7 @@ def load(path):
 
 def model_config(run):
     """The model configuration of a resolved run (``frame_checkpoint_sha256`` is bound by the trainer)."""
-    from vesuvius.neural_tracing.tracers.fibers.shared.geometry import CropSpec
+    from vesuvius.neural_tracing.tracers.shared.geometry import CropSpec
     values = {k: v for k, v in run['model'].items() if k != 'type'}
     values['fine'] = CropSpec(**values['fine'])
     for key in ('cnn_channels', 'cnn_blocks', 'flow_sigma'):

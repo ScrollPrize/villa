@@ -2,7 +2,7 @@
 import numpy as np
 
 from vesuvius.neural_tracing.tracers.fibers.data.data import SOURCE, label_state, trace_noise
-from vesuvius.neural_tracing.tracers.fibers.shared.geometry import (
+from vesuvius.neural_tracing.tracers.shared.geometry import (
     arclength, exact_nearest, interp_at, frame_from_heading, normalize, traversal_curve,
 )
 from vesuvius.neural_tracing.tracers.fibers.tracing.heading import trace_heading

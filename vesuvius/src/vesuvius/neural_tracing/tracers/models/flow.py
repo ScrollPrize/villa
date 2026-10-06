@@ -6,6 +6,7 @@ import torch
 
 from .model import select_refinement
 from .survival_confidence import survival_predictions
+from .targets import geometry_mask
 
 
 @dataclass
@@ -58,7 +59,6 @@ def time_embedding(t, width=64):
 
 def flow_targets(batch, cfg):
     """Use the common geometry contract, sampled at the output planes."""
-    from ..train.supervision import geometry_mask
     indices = torch.linspace(0, batch['dense_ab'].shape[1]-1, cfg.n_future,
                              device=batch['dense_ab'].device).round().long()
     mask = geometry_mask(batch, cfg)[:, indices]

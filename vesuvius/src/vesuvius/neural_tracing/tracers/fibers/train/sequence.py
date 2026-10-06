@@ -9,7 +9,7 @@ contract) and their rows of the batch for the shared losses and metrics.
 """
 import torch
 
-from vesuvius.neural_tracing.tracers.fibers.models.sequence import relative_pose
+from vesuvius.neural_tracing.tracers.models.sequence import relative_pose
 
 ENCODE_CHUNK = 16  # crops per CNN call: one fixed shape for the compiled CNN (train.prepare_training)
 

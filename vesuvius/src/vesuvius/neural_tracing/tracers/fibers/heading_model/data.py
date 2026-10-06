@@ -21,7 +21,7 @@ from vesuvius.neural_tracing.tracers.fibers.heading_model.targets import in_crop
 from vesuvius.neural_tracing.tracers.fibers.heading_model.frames import family_ids, smoothed_tangent, fiber_corrected_normal
 from vesuvius.neural_tracing.tracers.fibers.data.datasets import WeightedDatasets, load_primary_dataset, open_afv_source, primary_source_spec, read_dataset_config
 from vesuvius.neural_tracing.tracers.fibers.data.data import FollowDataset, SampleConfig, simulated_trace, tight_block, traversal_curve
-from vesuvius.neural_tracing.tracers.fibers.shared.geometry import arclength, interp_at, normalize
+from vesuvius.neural_tracing.tracers.shared.geometry import arclength, interp_at, normalize
 from vesuvius.neural_tracing.tracers.fibers.tracing.heading import linear12_heading
 from vesuvius.neural_tracing.tracers.fibers.data.volume import FiberVolume
 

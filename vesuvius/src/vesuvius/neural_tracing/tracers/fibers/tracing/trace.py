@@ -10,11 +10,11 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
-from vesuvius.neural_tracing.tracers.fibers.shared.geometry import CropSpec, normalize
-from vesuvius.neural_tracing.tracers.fibers.tracing.policy import (DEFAULT_CONFIDENCE, DEFAULT_GATE, DEFAULT_N_COMMIT, GATES, gate_horizon,
+from vesuvius.neural_tracing.tracers.shared.geometry import CropSpec, normalize
+from vesuvius.neural_tracing.tracers.shared.policy import (DEFAULT_CONFIDENCE, DEFAULT_GATE, DEFAULT_N_COMMIT, GATES, gate_horizon,
     commit_count, selection_window)
 from vesuvius.neural_tracing.tracers.fibers.data.volume import FiberVolume
-from vesuvius.neural_tracing.tracers.fibers.shared.reference import SEED_FIELDS, observed_path
+from vesuvius.neural_tracing.tracers.shared.reference import SEED_FIELDS, observed_path
 from vesuvius.neural_tracing.tracers.fibers.tracing.heading import trace_heading, TRACE_HEADING_POLICY, FRAME_POLICY, FRAME_POLICIES, ct_frame, fiber_family
 from vesuvius.neural_tracing.tracers.fibers.tracing.crop_frames import frame_predictor, configured_frame_policy, predict_frames
 
@@ -64,7 +64,7 @@ def decision_noise_key(seed, start, decision):
 
 def trace_history(path, size):
     """Inference history at unit arclength spacing, newest first, excluding head."""
-    from vesuvius.neural_tracing.tracers.fibers.shared.geometry import arclength, interp_at
+    from vesuvius.neural_tracing.tracers.shared.geometry import arclength, interp_at
     past = np.asarray(path[-2*size-2:])
     arc = arclength(past)
     target = arc[-1]-np.arange(1, size+1)
@@ -78,7 +78,7 @@ def advance_trace_path(path, frame, points, commit, heading_start, shape, params
     The caller applies commit_prefix first and resolves the returned heading's
     CT frame only after checking the new state's data split and read footprint.
     """
-    from vesuvius.neural_tracing.tracers.fibers.shared.geometry import arclength
+    from vesuvius.neural_tracing.tracers.shared.geometry import arclength
     path = np.asarray(path, dtype=np.float64)
     if commit < 1:
         return None, 'confidence'
@@ -179,7 +179,7 @@ class ModelTracer:
     def sequence_attach(self, x, idx, sequence, pos, frames, length):
         """Sequence follower (models/sequence.py): each row reads its trace's earlier history tokens (per-layer
         states, at most ``history_limit`` most recent) with their pose in this decision's frame."""
-        from vesuvius.neural_tracing.tracers.fibers.models.sequence import relative_pose
+        from vesuvius.neural_tracing.tracers.models.sequence import relative_pose
         cfg = self.model.cfg
         limit = cfg.history_limit
         count = max(1, max(min(len(sequence[i]['heads']), limit) for i in idx))

@@ -6,7 +6,7 @@ import pytest
 
 from vesuvius.neural_tracing.tracers.fibers.data import data as D
 from vesuvius.neural_tracing.tracers.fibers.tracing.collection import DecisionCollector
-from vesuvius.neural_tracing.tracers.fibers.shared.geometry import CropSpec, arclength, frame_from_heading
+from vesuvius.neural_tracing.tracers.shared.geometry import CropSpec, arclength, frame_from_heading
 
 
 def fiber(length=100, z=0, endpoints=(False, False)):

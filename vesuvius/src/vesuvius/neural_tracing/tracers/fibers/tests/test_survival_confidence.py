@@ -8,7 +8,7 @@ from model_fixtures import coordinate_batch as memory_batch
 from model_fixtures import proposal_output
 from label_fixtures import set_terminal, set_unknown
 from vesuvius.neural_tracing.tracers.fibers.train.supervision import loss_terms
-from vesuvius.neural_tracing.tracers.fibers.models.survival_confidence import survival_loss, survival_predictions
+from vesuvius.neural_tracing.tracers.models.survival_confidence import survival_loss, survival_predictions
 
 
 def test_survival_probabilities_are_conditional_products_and_numerically_stable():

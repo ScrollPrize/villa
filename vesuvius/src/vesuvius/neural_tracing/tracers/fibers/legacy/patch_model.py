@@ -17,9 +17,9 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from vesuvius.models.build.pretrained_backbones.rope import RopePositionEmbedding, apply_rotary_embedding
 from vesuvius.models.build.resblocks import BasicBlockD, StackedResidualBlocks
-from vesuvius.neural_tracing.tracers.fibers.models.path_geometry import PathGeometryTokens
-from vesuvius.neural_tracing.tracers.fibers.shared.geometry import CropSpec
-from vesuvius.neural_tracing.tracers.fibers.tracing.policy import commit_prefix
+from vesuvius.neural_tracing.tracers.models.path_geometry import PathGeometryTokens
+from vesuvius.neural_tracing.tracers.shared.geometry import CropSpec
+from vesuvius.neural_tracing.tracers.shared.policy import commit_prefix
 
 # Pre-cleanup model fields every supported checkpoint holds at these values (the code implements no other).
 REQUIRED = dict(memory='none', identity_dim=0, identity_objective='infonce', identity_map=False, identity_feedback=False,
@@ -86,7 +86,7 @@ def load_legacy(path, device, build):
     """(EMA model in eval mode, crop, n_history, volume spec, checkpoint) from ``build(checkpoint)``: the tracing CLI's
     checkpoint loader contract."""
     from vesuvius.neural_tracing.tracers.fibers.data.volume import FiberVolumeSpec
-    from vesuvius.neural_tracing.tracers.fibers.shared.paths import relocate_checkpoint
+    from vesuvius.neural_tracing.tracers.shared.paths import relocate_checkpoint
     ck = relocate_checkpoint(torch.load(path, map_location='cpu', weights_only=False))
     model = build(ck)
     model.load_state_dict(ck['ema'])

@@ -12,7 +12,7 @@ from PIL import Image, ImageDraw
 from scipy.ndimage import gaussian_filter1d, map_coordinates
 from scipy.spatial import cKDTree
 
-from vesuvius.neural_tracing.tracers.fibers.shared.geometry import arclength, interp_at
+from vesuvius.neural_tracing.tracers.shared.geometry import arclength, interp_at
 
 STEP, HALF_WIDTH, PANEL = .5, 32., 512.  # image sampling (trace voxels)
 ANCHOR_OFFSET, NORMAL_SIGMA, TANGENT_SIGMA = 4., 4., 2.  # frame anchors / smoothing (trace voxels)

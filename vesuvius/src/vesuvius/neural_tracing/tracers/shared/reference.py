@@ -1,7 +1,7 @@
 """Observed original-fiber references, independent of annotation labels."""
 import numpy as np
 
-from vesuvius.neural_tracing.tracers.fibers.shared.geometry import arclength, normalize
+from vesuvius.neural_tracing.tracers.shared.geometry import arclength, normalize
 
 
 SEED_FIELDS = ('seed_pos', 'seed_tangent', 'seed_age', 'seed_valid')

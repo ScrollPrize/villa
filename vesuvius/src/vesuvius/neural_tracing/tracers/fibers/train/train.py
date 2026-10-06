@@ -20,11 +20,11 @@ import torch
 from vesuvius.neural_tracing.tracers.fibers.data.data import (
     TASKS, FollowDataset, SampleConfig, TaskBudget, fiber_manifest, load_replay, usable_replay)
 from vesuvius.neural_tracing.tracers.fibers.train.online import OnlineCollector
-from vesuvius.neural_tracing.tracers.fibers.tracing.policy import (DEFAULT_CONFIDENCE, DEFAULT_GATE, gate_horizon,
+from vesuvius.neural_tracing.tracers.shared.policy import (DEFAULT_CONFIDENCE, DEFAULT_GATE, gate_horizon,
     OperatingPolicy, selection_window)
 from vesuvius.neural_tracing.tracers.fibers.train.runloop import RunLog, lr_at, prepare_run_dir, read_checkpoint, save_checkpoint as write_checkpoint, update_ema, training_rng_state, resume_training, raise_open_file_limit
 from vesuvius.neural_tracing.tracers.fibers.data.volume import FiberVolume, FiberVolumeSpec
-from vesuvius.neural_tracing.tracers.fibers.models.model import build_model, config_from_checkpoint
+from vesuvius.neural_tracing.tracers.models.model import build_model, config_from_checkpoint
 from vesuvius.neural_tracing.tracers.fibers.data.observations import IdentityObservationBuilder, IdentitySampling, FiberTracer, LOCATION_SOURCES
 from vesuvius.neural_tracing.tracers.fibers.train import run_config
 from vesuvius.neural_tracing.tracers.fibers.train.supervision import commit_window, loss_terms
@@ -210,7 +210,7 @@ def initialize_model_weights(cfg, device, initial=None, exclude=()):
 def load_checkpoint(path,device='cuda'):
     # Collection shares a GPU with training. Keep duplicate weights and any
     # optimizer state on the CPU; only the EMA inference model needs VRAM.
-    from vesuvius.neural_tracing.tracers.fibers.shared.paths import relocate_checkpoint
+    from vesuvius.neural_tracing.tracers.shared.paths import relocate_checkpoint
     ck = relocate_checkpoint(read_checkpoint(path,'cpu'))
     cfg = config_from_checkpoint(ck)
     model = build_model(cfg).to(device,memory_format=conv_memory_format(device))
@@ -270,7 +270,7 @@ def training_diagnostics(model, cpu_batch, tracer, fibers, seeds, out, step, log
     """Plot EMA proposals and the same monitor rollouts used for logged metrics."""
     from vesuvius.neural_tracing.tracers.fibers.evaluation.diag import plot_batch, plot_curves, plot_refinement, plot_rollouts
     from vesuvius.neural_tracing.tracers.fibers.evaluation.seeds import evaluate
-    from vesuvius.neural_tracing.tracers.fibers.shared.experiment import rollout_summary
+    from vesuvius.neural_tracing.tracers.shared.io import rollout_summary
 
     images = Path(out)/'images'
     images.mkdir(exist_ok=True)
@@ -679,7 +679,7 @@ def main(argv=None):
         loader_args.update(prefetch_factor=2, persistent_workers=True)
     loader = torch.utils.data.DataLoader(dataset, **loader_args)
     if fit_flow_scales:
-        from vesuvius.neural_tracing.tracers.fibers.models.flow import fit_flow_sigma
+        from vesuvius.neural_tracing.tracers.models.flow import fit_flow_sigma
         progress('Fitting flow residual scales from training states')
         cfg.flow_sigma = fit_flow_sigma(iter(loader), cfg, args.flow_calibration_states)
         for follower in (model, ema):
@@ -858,7 +858,7 @@ def main(argv=None):
                 training_diagnostics(ema, diagnostic['cpu_batch'], tracer, val_f, manifest['monitor'], out, step, log,
                                      device=args.device,dataset_name=primary_source['name'])
                 from vesuvius.neural_tracing.tracers.fibers.evaluation.seeds import evaluate
-                from vesuvius.neural_tracing.tracers.fibers.shared.experiment import rollout_summary
+                from vesuvius.neural_tracing.tracers.shared.io import rollout_summary
                 from vesuvius.neural_tracing.tracers.fibers.tracing.trace import TraceParams
                 for source, source_dataset in zip(dataset_document['sources'],dataset.datasets):
                     if source['kind'] != 'afv':

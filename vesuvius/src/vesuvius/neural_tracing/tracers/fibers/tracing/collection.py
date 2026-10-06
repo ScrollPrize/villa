@@ -22,10 +22,10 @@ import torch
 
 from vesuvius.neural_tracing.tracers.fibers.data.data import OnPolicyStates, SampleConfig, ZBand, load_fibers, split_fibers, fiber_manifest, label_state, training_state_allowed
 from vesuvius.neural_tracing.tracers.fibers.evaluation.seeds import directed_seed
-from vesuvius.neural_tracing.tracers.fibers.shared.geometry import arclength
+from vesuvius.neural_tracing.tracers.shared.geometry import arclength
 from vesuvius.neural_tracing.tracers.fibers.tracing.heading import SeedHeadingError, SEED_HEADING_POLICY, TRACE_HEADING_POLICY, FRAME_POLICY
-from vesuvius.neural_tracing.tracers.fibers.tracing.policy import checkpoint_policy
-from vesuvius.neural_tracing.tracers.fibers.shared.reference import SEED_FIELDS
+from vesuvius.neural_tracing.tracers.shared.policy import checkpoint_policy
+from vesuvius.neural_tracing.tracers.shared.reference import SEED_FIELDS
 from vesuvius.neural_tracing.tracers.fibers.data.state_labels import DEPARTURE_DISTANCE, DEPARTURE_PATIENCE, REASON, RECOVERABLE, REPLAY_CLASSES, SUPERVISION, TERMINAL, TraceLabeler, replay_class
 from vesuvius.neural_tracing.tracers.fibers.tracing.trace import ModelTracer, TraceParams
 from vesuvius.neural_tracing.tracers.fibers.data.volume import FiberVolume

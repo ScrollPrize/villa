@@ -32,13 +32,13 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from vesuvius.neural_tracing.tracers.fibers.models.blocks import CropCNN, TransformerLayer
-from vesuvius.neural_tracing.tracers.fibers.models.flow import FlowMatching, FlowOptions, time_embedding
-from vesuvius.neural_tracing.tracers.fibers.models.model import (
+from vesuvius.neural_tracing.tracers.models.blocks import CropCNN, TransformerLayer
+from vesuvius.neural_tracing.tracers.models.flow import FlowMatching, FlowOptions, time_embedding
+from vesuvius.neural_tracing.tracers.models.model import (
     REFERENCE_METADATA, FollowerConfig, path_readout, plane_coordinates, proposal_output, read_path,
     reference_metadata, reference_points, sample_features, select_refinement, token_coordinates)
-from vesuvius.neural_tracing.tracers.fibers.models.path_geometry import PathGeometryTokens
-from vesuvius.neural_tracing.tracers.fibers.tracing.policy import DEFAULT_CONFIDENCE, commit_prefix
+from vesuvius.neural_tracing.tracers.models.path_geometry import PathGeometryTokens
+from vesuvius.neural_tracing.tracers.shared.policy import DEFAULT_CONFIDENCE, commit_prefix
 
 CELL, REFERENCE, GEOMETRY, PATH, SCORED = range(5)  # token kinds
 

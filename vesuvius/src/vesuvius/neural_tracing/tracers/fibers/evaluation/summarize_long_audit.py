@@ -11,12 +11,12 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
 
-from ..shared.experiment import write_json as write
-from .long_trace_audit import summary
-from .evaluation import paired_report
-from .evaluate import dataset_sources
-from .seeds import matched_profile
-from ..shared.geometry import tangent_at, arclength
+from vesuvius.neural_tracing.tracers.shared.io import write_json as write
+from vesuvius.neural_tracing.tracers.fibers.evaluation.long_trace_audit import summary
+from vesuvius.neural_tracing.tracers.fibers.evaluation.evaluation import paired_report
+from vesuvius.neural_tracing.tracers.fibers.evaluation.evaluate import dataset_sources
+from vesuvius.neural_tracing.tracers.fibers.evaluation.seeds import matched_profile
+from vesuvius.neural_tracing.tracers.shared.geometry import tangent_at, arclength
 
 
 def load_rows(directory):

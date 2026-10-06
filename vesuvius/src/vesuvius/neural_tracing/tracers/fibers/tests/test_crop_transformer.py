@@ -5,9 +5,9 @@ import pytest
 import torch
 
 from model_fixtures import coordinate_batch, ct_volume
-from vesuvius.neural_tracing.tracers.fibers.models.model import build_model
-from vesuvius.neural_tracing.tracers.fibers.models.crop_transformer import FlowConfig, RegressionConfig
-from vesuvius.neural_tracing.tracers.fibers.shared.geometry import CropSpec
+from vesuvius.neural_tracing.tracers.models.model import build_model
+from vesuvius.neural_tracing.tracers.models.crop_transformer import FlowConfig, RegressionConfig
+from vesuvius.neural_tracing.tracers.shared.geometry import CropSpec
 from vesuvius.neural_tracing.tracers.fibers.train.supervision import loss_terms
 from vesuvius.neural_tracing.tracers.fibers.train.train import prepare_training, training_prediction
 

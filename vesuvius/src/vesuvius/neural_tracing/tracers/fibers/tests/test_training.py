@@ -3,7 +3,7 @@ refinement_loss 'all' trains every pass."""
 import torch
 
 from model_fixtures import coordinate_batch, coordinate_config
-from vesuvius.neural_tracing.tracers.fibers.models.model import build_model
+from vesuvius.neural_tracing.tracers.models.model import build_model
 from vesuvius.neural_tracing.tracers.fibers.train.train import prepare_training, optimizer_update, training_prediction
 from vesuvius.neural_tracing.tracers.fibers.train.supervision import loss_terms
 

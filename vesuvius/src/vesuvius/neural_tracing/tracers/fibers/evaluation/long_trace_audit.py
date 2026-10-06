@@ -15,17 +15,17 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from .evaluate import dataset_sources
-from .seeds import EvaluationAudit, evaluate, monitor_coverage, score_trace, summarize_outcomes
-from .recovery_scoring import recovery_score
-from ..data.observations import FiberTracer
-from ..shared.experiment import jsonable, write_json as write
-from ..shared.geometry import arclength, interp_at, tangent_at
-from ..tracing.heading import oriented_seed_heading, SeedHeadingError, SEED_HEADING_POLICY
-from ..tracing.policy import checkpoint_policy
-from ..tracing.trace import TraceParams
-from ..train.train import load_checkpoint
-from ..train.runloop import raise_open_file_limit
+from vesuvius.neural_tracing.tracers.fibers.evaluation.evaluate import dataset_sources
+from vesuvius.neural_tracing.tracers.fibers.evaluation.seeds import EvaluationAudit, evaluate, monitor_coverage, score_trace, summarize_outcomes
+from vesuvius.neural_tracing.tracers.fibers.evaluation.recovery_scoring import recovery_score
+from vesuvius.neural_tracing.tracers.fibers.data.observations import FiberTracer
+from vesuvius.neural_tracing.tracers.shared.io import jsonable, write_json as write
+from vesuvius.neural_tracing.tracers.shared.geometry import arclength, interp_at, tangent_at
+from vesuvius.neural_tracing.tracers.fibers.tracing.heading import oriented_seed_heading, SeedHeadingError, SEED_HEADING_POLICY
+from vesuvius.neural_tracing.tracers.shared.policy import checkpoint_policy
+from vesuvius.neural_tracing.tracers.fibers.tracing.trace import TraceParams
+from vesuvius.neural_tracing.tracers.fibers.train.train import load_checkpoint
+from vesuvius.neural_tracing.tracers.fibers.train.runloop import raise_open_file_limit
 
 
 def length_weighted_order(lengths, count, rng):
@@ -130,7 +130,7 @@ def main():
     ap.add_argument('--limit', type=int, help='Use only the first N frozen seeds per cohort for paired controls')
     ap.add_argument('--sources', nargs='+')
     ap.add_argument('--cohorts', nargs='+', default=['monitor','length_weighted'])
-    from ..tracing.policy import DEFAULT_CONFIDENCE, DEFAULT_GATE, DEFAULT_N_COMMIT, GATES
+    from vesuvius.neural_tracing.tracers.shared.policy import DEFAULT_CONFIDENCE, DEFAULT_GATE, DEFAULT_N_COMMIT, GATES
     ap.add_argument('--confidence', type=float, default=DEFAULT_CONFIDENCE)
     ap.add_argument('--n-commit', type=int, default=DEFAULT_N_COMMIT)
     ap.add_argument('--gate', choices=GATES, default=DEFAULT_GATE)

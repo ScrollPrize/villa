@@ -8,9 +8,9 @@ import torch
 
 from vesuvius.neural_tracing.tracers.fibers.train.live_continuation import LiveContinuation, LiveContinuationSource
 from vesuvius.neural_tracing.tracers.fibers.data.data import SOURCE, FollowDataset, SampleConfig, TracedFiber, make_sample
-from vesuvius.neural_tracing.tracers.fibers.shared.geometry import CropSpec, arclength
+from vesuvius.neural_tracing.tracers.shared.geometry import CropSpec, arclength
 from vesuvius.neural_tracing.tracers.fibers.tracing.heading import orient_item
-from vesuvius.neural_tracing.tracers.fibers.tracing.policy import OperatingPolicy
+from vesuvius.neural_tracing.tracers.shared.policy import OperatingPolicy
 from vesuvius.neural_tracing.tracers.fibers.data.state_labels import FOLLOWING
 from vesuvius.neural_tracing.tracers.fibers.tracing.trace import ModelTracer, TraceParams
 from vesuvius.neural_tracing.tracers.fibers.data.volume import FiberVolumeSpec

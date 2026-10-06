@@ -7,8 +7,8 @@ import torch
 import torch.nn.functional as F
 
 from vesuvius.neural_tracing.tracers.fibers.data.labels import prefix_labels
-from vesuvius.neural_tracing.tracers.fibers.tracing.policy import commit_prefix
-from vesuvius.neural_tracing.tracers.fibers.train.supervision import geometry_mask, foreign_failures
+from vesuvius.neural_tracing.tracers.shared.policy import commit_prefix
+from vesuvius.neural_tracing.tracers.models.targets import geometry_mask, foreign_failures
 
 
 def slice_batch(batch, selection):
@@ -117,7 +117,7 @@ def sequence_rows(model, cpu_batch, device, n_commit):
     crop with its episode's earlier steps as history, train/sequence.py). Returns those rows and their outputs."""
     from vesuvius.neural_tracing.tracers.fibers.train.sequence import episode_forward, select_rows
     from vesuvius.neural_tracing.tracers.fibers.train.train import move_batch
-    from vesuvius.neural_tracing.tracers.fibers.tracing.policy import DEFAULT_CONFIDENCE
+    from vesuvius.neural_tracing.tracers.shared.policy import DEFAULT_CONFIDENCE
     with torch.autocast('cuda', dtype=torch.bfloat16, enabled=torch.device(device).type == 'cuda'):
         output, _ = episode_forward(model, move_batch(cpu_batch, device), DEFAULT_CONFIDENCE, n_commit)
     supervised = cpu_batch['episode_supervised'].bool().nonzero().flatten()

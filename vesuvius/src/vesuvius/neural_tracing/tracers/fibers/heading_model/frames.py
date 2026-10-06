@@ -3,7 +3,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from vesuvius.neural_tracing.tracers.fibers.shared.geometry import interp_at
+from vesuvius.neural_tracing.tracers.shared.geometry import interp_at
 from vesuvius.neural_tracing.tracers.fibers.tracing.heading import fiber_family
 
 TANGENT_HALF_SPAN = 6.  # trace voxels; centered 12-voxel fit, clipped at annotation ends

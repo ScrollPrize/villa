@@ -13,8 +13,8 @@ import numpy as np
 import torch
 from torch import nn
 
-from vesuvius.neural_tracing.tracers.fibers.shared.geometry import arclength, interp_at
-from vesuvius.neural_tracing.tracers.fibers.shared.reference import observed_path
+from vesuvius.neural_tracing.tracers.shared.geometry import arclength, interp_at
+from vesuvius.neural_tracing.tracers.shared.reference import observed_path
 
 # Arclength behind the head, then the observed path's first point (the seed).
 OFFSETS = (1., 2., 3., 4., 6., 8., 12., 16., 20., 24., 28., 32., 40., 48., 56., 64.,

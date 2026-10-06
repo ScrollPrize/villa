@@ -11,7 +11,7 @@ import numpy as np
 
 from vesuvius.neural_tracing.tracers.fibers.data.annotation_repair import ANNOTATION_REPAIR, repair_kinks
 from vesuvius.neural_tracing.tracers.fibers.data.data import TracedFiber
-from vesuvius.neural_tracing.tracers.fibers.shared.geometry import arclength, interp_at
+from vesuvius.neural_tracing.tracers.shared.geometry import arclength, interp_at
 
 
 def file_sha256(path):
@@ -112,7 +112,7 @@ class AFVFibers(Sequence):
                 next_segment += len(xyz)-1
             points = np.concatenate(pieces)/self.grid_scale
             # Preserve corners while bounding nearest-vertex clearance error.
-            from vesuvius.neural_tracing.tracers.fibers.shared.geometry import dense_line
+            from vesuvius.neural_tracing.tracers.shared.geometry import dense_line
             points = dense_line(points, 1.)
             points, repairs = repair_kinks(points, arclength(points))
             self._cache[index] = TracedFiber(name, points, arclength(points), family,

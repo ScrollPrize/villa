@@ -16,7 +16,7 @@ from scipy.spatial import cKDTree
 import json
 
 from vc3d_fiber_format import parse_vc3d_fiber_format, FiberTraceSegmentMetadata
-from vesuvius.neural_tracing.tracers.fibers.shared.geometry import (
+from vesuvius.neural_tracing.tracers.shared.geometry import (
     CropSpec,
     arclength,
     block_start,
@@ -28,7 +28,7 @@ from vesuvius.neural_tracing.tracers.fibers.shared.geometry import (
 )
 from vesuvius.neural_tracing.tracers.fibers.data.annotation_repair import foldbacks, repair_kinks
 from vesuvius.neural_tracing.tracers.fibers.data.volume import FiberVolume
-from vesuvius.neural_tracing.tracers.fibers.shared.reference import SEED_FIELDS
+from vesuvius.neural_tracing.tracers.shared.reference import SEED_FIELDS
 
 
 DATA_VERSION = 2

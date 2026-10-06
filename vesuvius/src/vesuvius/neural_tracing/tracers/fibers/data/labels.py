@@ -1,7 +1,7 @@
 """Prefix correctness labels for a generated curve, shared by every tracer model."""
 import torch
 import torch.nn.functional as F
-from vesuvius.neural_tracing.tracers.fibers.tracing.policy import DEFAULT_MAX_RECOVERY_DISTANCE, recovery_allowed
+from vesuvius.neural_tracing.tracers.shared.policy import DEFAULT_MAX_RECOVERY_DISTANCE, recovery_allowed
 
 
 @torch.no_grad()

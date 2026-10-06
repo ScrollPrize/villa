@@ -14,7 +14,7 @@ import numpy as np
 from scipy.spatial import cKDTree
 
 from vesuvius.neural_tracing.tracers.fibers.evaluation.seeds import monitor_coverage, score_trace, summarize
-from vesuvius.neural_tracing.tracers.fibers.shared.geometry import frame_from_heading, interp_at
+from vesuvius.neural_tracing.tracers.shared.geometry import frame_from_heading, interp_at
 
 
 def _to_index(pts, crop):

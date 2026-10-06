@@ -3,8 +3,8 @@ import torch
 
 from model_fixtures import coordinate_batch, coordinate_config, proposal_output
 from vesuvius.neural_tracing.tracers.fibers.evaluation.diagnostics import decision_rows
-from vesuvius.neural_tracing.tracers.fibers.models.model import build_model, select_refinement
-from vesuvius.neural_tracing.tracers.fibers.tracing.policy import commit_count, commit_prefix, selection_window
+from vesuvius.neural_tracing.tracers.models.model import build_model, select_refinement
+from vesuvius.neural_tracing.tracers.shared.policy import commit_count, commit_prefix, selection_window
 
 
 def proposal(first=(0., 0., 1.)):

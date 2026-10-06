@@ -4,7 +4,7 @@ from __future__ import annotations
 import numpy as np
 from scipy.ndimage import gaussian_filter
 
-from vesuvius.neural_tracing.tracers.fibers.shared.geometry import arclength, interp_at, frame_from_heading, normalize, block_start
+from vesuvius.neural_tracing.tracers.shared.geometry import arclength, interp_at, frame_from_heading, normalize, block_start
 
 SEED_HEADING_POLICY = 'ct_sheet_hv_sigma2_8_v2'
 TRACE_HEADING_POLICY = 'linear12_trusted_v1'

@@ -20,7 +20,7 @@ from urllib.parse import urlsplit
 import numcodecs
 import numpy as np
 
-from vesuvius.neural_tracing.tracers.fibers.shared.retired import ANY, retire
+from vesuvius.neural_tracing.tracers.shared.retired import ANY, retire
 
 _VCZ1_REGISTERED = False
 _MISSING = object()

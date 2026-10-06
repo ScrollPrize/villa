@@ -19,8 +19,8 @@ import torch
 from torch import nn
 
 from vesuvius.neural_tracing.tracers.fibers.data.crop_sampling import scalar_crops
-from vesuvius.neural_tracing.tracers.fibers.shared.geometry import CropSpec, arclength, frame_from_heading, interp_at
-from vesuvius.neural_tracing.tracers.fibers.shared.retired import retire
+from vesuvius.neural_tracing.tracers.shared.geometry import CropSpec, arclength, frame_from_heading, interp_at
+from vesuvius.neural_tracing.tracers.shared.retired import retire
 
 ARCHITECTURE = 'crop_heading_ct_path_v2'
 NORMAL_ARCHITECTURE = 'crop_heading_normal_ct_path_v3'

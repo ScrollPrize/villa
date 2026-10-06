@@ -19,9 +19,9 @@ import torch.nn.functional as F
 from vesuvius.neural_tracing.tracers.fibers.legacy.patch_model import (
     REQUIRED as PATCH_REQUIRED, LegacyPatchConfig, LegacyPatchFollower, check_recorded, decoder_layer, load_legacy,
     select_refinement)
-from vesuvius.neural_tracing.tracers.fibers.models.flow import time_embedding
-from vesuvius.neural_tracing.tracers.fibers.models.survival_confidence import survival_predictions
-from vesuvius.neural_tracing.tracers.fibers.tracing.policy import DEFAULT_CONFIDENCE
+from vesuvius.neural_tracing.tracers.models.flow import time_embedding
+from vesuvius.neural_tracing.tracers.models.survival_confidence import survival_predictions
+from vesuvius.neural_tracing.tracers.shared.policy import DEFAULT_CONFIDENCE
 
 # Pre-cleanup model fields these checkpoints may hold only at these values (the code below implements no other).
 REQUIRED = dict(PATCH_REQUIRED, model_type='flow_matching', recurrent_refinement_steps=0, query_scale=None)

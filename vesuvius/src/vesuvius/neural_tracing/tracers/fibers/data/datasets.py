@@ -8,7 +8,7 @@ import torch
 
 from vesuvius.neural_tracing.tracers.fibers.data.afv import AFVFibers, file_sha256
 from vesuvius.neural_tracing.tracers.fibers.data.data import FollowDataset, fiber_manifest, load_fibers
-from vesuvius.neural_tracing.tracers.fibers.shared.paths import moved_path
+from vesuvius.neural_tracing.tracers.shared.paths import moved_path
 from vesuvius.neural_tracing.tracers.fibers.data.volume import FiberVolumeSpec
 from vesuvius.neural_tracing.tracers.fibers.data.observations import IdentityObservationBuilder
 from vesuvius.neural_tracing.tracers.fibers.data.afv_neighbors import AFVBank
@@ -78,7 +78,7 @@ def parse_dataset_config(document, base):
 def validation_manifest(fibers, spec, seed=0, monitor_count=32):
     """Freeze distinct monitor/calibration/final fiber IDs and CT-only seeds."""
     from vesuvius.neural_tracing.tracers.fibers.evaluation.seeds import make_seeds
-    from vesuvius.neural_tracing.tracers.fibers.shared.experiment import jsonable
+    from vesuvius.neural_tracing.tracers.shared.io import jsonable
     from vesuvius.neural_tracing.tracers.fibers.tracing.heading import SEED_HEADING_POLICY, TRACE_HEADING_POLICY, FRAME_POLICY
     from vesuvius.neural_tracing.tracers.fibers.data.volume import FiberVolume
     seed_volume = FiberVolume(spec, cache_bytes=256 << 20)
@@ -112,7 +112,7 @@ def load_primary_dataset(document, spec):
     split is decided before that and does not change.
     """
     from vesuvius.neural_tracing.tracers.fibers.data.dataset_split import heldout_ids
-    from vesuvius.neural_tracing.tracers.fibers.shared.experiment import read_manifest
+    from vesuvius.neural_tracing.tracers.shared.io import read_manifest
     source = next(s for s in document['sources'] if s['kind']=='paris4')
     fibers = load_fibers(source['fibers'],grid_scale=spec.grid_scale)
     legacy = read_manifest(source['manifest'])

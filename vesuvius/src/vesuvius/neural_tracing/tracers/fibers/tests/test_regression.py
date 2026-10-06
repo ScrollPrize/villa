@@ -6,8 +6,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vesuvius.neural_tracing.tracers.fibers.models.model import build_model, config_from_checkpoint
-from vesuvius.neural_tracing.tracers.fibers.train.supervision import geometry_mask, loss_terms
+from vesuvius.neural_tracing.tracers.models.model import build_model, config_from_checkpoint
+from vesuvius.neural_tracing.tracers.fibers.train.supervision import loss_terms
+from vesuvius.neural_tracing.tracers.models.targets import geometry_mask
 from vesuvius.neural_tracing.tracers.fibers.train import train
 from vesuvius.neural_tracing.tracers.fibers.train.train import clip_training_gradients, initialize_training_optimizer, load_checkpoint, optimizer_update, prepare_training, save_checkpoint
 from vesuvius.neural_tracing.tracers.fibers.data.data import SampleConfig

@@ -2,12 +2,12 @@
 
 Three model types share one trainer, data pipeline, labels, replay, live continuation, tracer and commit policy:
 
-- `regression` (models/crop_transformer.py): a residual CNN tokenizes the crop and one transformer (the crop
+- `regression` (../models/crop_transformer.py): a residual CNN tokenizes the crop and one transformer (the crop
   transformer) reads the crop cells, observed-path references and path-geometry tokens; path tokens read out each
   plane's lateral position and hazard logit, with recurrent refinement passes.
-- `flow` (models/crop_transformer.py, models/flow.py): flow matching on the same backbone; path tokens carry a
+- `flow` (../models/crop_transformer.py, ../models/flow.py): flow matching on the same backbone; path tokens carry a
   noisy path and the flow time (adaLN-Zero) and read out the velocity; a scoring set reads out the hazards.
-- `sequence` (models/sequence.py, train/sequence.py): one transformer reads the whole trace, one history token per
+- `sequence` (../models/sequence.py, train/sequence.py): one transformer reads the whole trace, one history token per
   committed step, and predicts the path and its confidence; training runs whole episodes.
 
 Each type's defaults are the settings of the run it was established with (`mixed_ct_afv_unified_v1`,
@@ -111,7 +111,7 @@ DAgger subprocesses receive `runtime.dagger_threads` (default 4), independently 
 
 The `flow_matching` checkpoints of the v4-extension and v5 runs and the `coordinate_regression` checkpoints of
 `mixed_ct_afv_forward35_v1` and `mixed_ct_afv_v3init_nomem_b8` (patch encoder, decoder, segment scorer; no memory or
-identity heads) trace through `legacy/`, a frozen copy of those models kept apart from `models/`. It takes the same
+identity heads) trace through `legacy/`, a frozen copy of those models kept apart from `tracers/models/`. It takes the same
 arguments as `tracing.infer` and refuses checkpoints with features it does not implement (decision memory, identity
 heads, whole-crop planes); there is no training support.
 
@@ -137,15 +137,17 @@ batched on the GPU. On Paris4 AFV it brought labels from a median 1.46 to 0.68 t
 
 ## Organization
 
+The fiber tracer lives in `tracers/fibers/`; the parts other tracers can reuse sit beside it in `tracers/`:
+
 | Package | Responsibility |
 | --- | --- |
-| `models` | The follower contract (`model.py`), the crop transformer (`regression`, `flow`), flow matching, the sequence model |
+| `tracers/models` | The follower contract (`model.py`), the crop transformer (`regression`, `flow`), flow matching, the sequence model, the supervised-path contract (`targets.py`) |
+| `tracers/shared` | Geometry, reference handling, the commit policy, recorded-path relocation, retired settings, JSON output, sampling kernels |
 | `train` | Entry point and run configuration, objectives, checkpoints, logging, online collection, live continuation |
 | `data` | Volumes, normalization, observation construction, labels, sampling, replay, AFV neighbors |
-| `tracing` | Inference, collection, heading/frame resolution, commit policy, rollout |
+| `tracing` | Inference, collection, heading/frame resolution, rollout |
 | `evaluation` | Frozen-seed evaluation, recovery, diagnostics, long-trace audits |
 | `heading_model` | Heading/normal trainer and frozen frame predictor used by follower crop generation |
-| `shared` | Geometry, reference handling, sampling kernels, experiment utilities |
 
 Datasets and existing run artifacts retain their locations.
 

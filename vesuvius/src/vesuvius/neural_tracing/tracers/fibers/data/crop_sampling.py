@@ -7,7 +7,7 @@ import numpy as np
 import torch
 
 from vesuvius.neural_tracing.tracers.fibers.data.data import _grid_flat, read_tight_blocks
-from vesuvius.neural_tracing.tracers.fibers.shared.fast_sample import sample_scalar_crop
+from vesuvius.neural_tracing.tracers.shared.fast_sample import sample_scalar_crop
 from vesuvius.neural_tracing.tracers.fibers.data.ct_normalization import normalize_ct
 
 

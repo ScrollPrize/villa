@@ -3,11 +3,11 @@ import argparse
 from pathlib import Path
 import numpy as np
 from scipy.spatial import cKDTree
-from .seeds import matched_profile
-from .summarize_long_audit import load_rows
-from ..shared.experiment import write_json as write
-from ..data.data import load_fibers
-from ..shared.geometry import arclength
+from vesuvius.neural_tracing.tracers.fibers.evaluation.seeds import matched_profile
+from vesuvius.neural_tracing.tracers.fibers.evaluation.summarize_long_audit import load_rows
+from vesuvius.neural_tracing.tracers.shared.io import write_json as write
+from vesuvius.neural_tracing.tracers.fibers.data.data import load_fibers
+from vesuvius.neural_tracing.tracers.shared.geometry import arclength
 
 
 OTHER_WINDING = -1  # owner id of the original annotation's other windings

@@ -5,9 +5,9 @@ import numpy as np
 import torch
 
 from model_fixtures import coordinate_batch, ct_volume
-from vesuvius.neural_tracing.tracers.fibers.models.model import build_model
-from vesuvius.neural_tracing.tracers.fibers.models.sequence import SequenceConfig
-from vesuvius.neural_tracing.tracers.fibers.shared.geometry import CropSpec
+from vesuvius.neural_tracing.tracers.models.model import build_model
+from vesuvius.neural_tracing.tracers.models.sequence import SequenceConfig
+from vesuvius.neural_tracing.tracers.shared.geometry import CropSpec
 from vesuvius.neural_tracing.tracers.fibers.train.sequence import episode_forward
 
 

@@ -9,10 +9,10 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from vesuvius.neural_tracing.tracers.fibers.models.survival_confidence import survival_predictions
-from vesuvius.neural_tracing.tracers.fibers.shared.geometry import CropSpec
-from vesuvius.neural_tracing.tracers.fibers.shared.retired import retire
-from vesuvius.neural_tracing.tracers.fibers.tracing.policy import DEFAULT_CONFIDENCE, commit_prefix
+from vesuvius.neural_tracing.tracers.models.survival_confidence import survival_predictions
+from vesuvius.neural_tracing.tracers.shared.geometry import CropSpec
+from vesuvius.neural_tracing.tracers.shared.retired import retire
+from vesuvius.neural_tracing.tracers.shared.policy import DEFAULT_CONFIDENCE, commit_prefix
 
 MODEL_TYPES = ('regression', 'flow', 'sequence')
 

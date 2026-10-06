@@ -1,7 +1,7 @@
 """Geometry-only difficulty scores and continuous contact with neighboring annotated paths."""
 import numpy as np
 
-from vesuvius.neural_tracing.tracers.fibers.shared.geometry import arclength, exact_nearest, interp_at, normalize
+from vesuvius.neural_tracing.tracers.shared.geometry import arclength, exact_nearest, interp_at, normalize
 
 
 DIFFICULTY_KINDS = ('near_similar', 'curved', 'converging')

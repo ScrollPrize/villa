@@ -82,7 +82,7 @@ def save_checkpoint(path, model, vol_spec, crop, n_history, model_type, extra=No
 
 def read_checkpoint(path, device='cuda'):
     from dataclasses import fields
-    from vesuvius.neural_tracing.tracers.fibers.models.model import MODEL_TYPES, RETIRED_FIELDS, config_class
+    from vesuvius.neural_tracing.tracers.models.model import MODEL_TYPES, RETIRED_FIELDS, config_class
     ck = torch.load(path, map_location=device, weights_only=False)
     model_type = ck.get('model_type')
     # A pre-cleanup 'sequence' checkpoint keeps its type name but records model fields that no longer exist.

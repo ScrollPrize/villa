@@ -3,11 +3,11 @@ import numpy as np
 import torch
 
 from vesuvius.neural_tracing.tracers.fibers.data.data import OnPolicyStates, STARTUP_CATEGORIES, fiber_manifest, make_sample, label_state, replay_facts, resolve_trace_seed
-from vesuvius.neural_tracing.tracers.fibers.shared.geometry import crop_local_grid
+from vesuvius.neural_tracing.tracers.shared.geometry import crop_local_grid
 from vesuvius.neural_tracing.tracers.fibers.data.labels import prefix_labels
 from vesuvius.neural_tracing.tracers.fibers.tracing.trace import ModelTracer, TraceParams
-from vesuvius.neural_tracing.tracers.fibers.tracing.policy import DIAGNOSTIC_THRESHOLDS
-from vesuvius.neural_tracing.tracers.fibers.shared.reference import SEED_FIELDS
+from vesuvius.neural_tracing.tracers.shared.policy import DIAGNOSTIC_THRESHOLDS
+from vesuvius.neural_tracing.tracers.shared.reference import SEED_FIELDS
 from vesuvius.neural_tracing.tracers.fibers.tracing.heading import FRAME_POLICY, orient_item
 from vesuvius.neural_tracing.tracers.fibers.data.state_labels import SUPERVISION, replay_class
 

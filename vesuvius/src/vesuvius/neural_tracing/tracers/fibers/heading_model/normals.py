@@ -10,7 +10,7 @@ import torch
 
 from vesuvius.neural_tracing.tracers.fibers.data.crop_sampling import scalar_crops
 from vesuvius.neural_tracing.tracers.fibers.data.ct_normalization import normalize_ct
-from vesuvius.neural_tracing.tracers.fibers.shared.geometry import CropSpec
+from vesuvius.neural_tracing.tracers.shared.geometry import CropSpec
 from vesuvius.neural_tracing.tracers.fibers.tracing.heading import ct_structure_tensor
 
 NORMAL_TARGET_POLICY = dict(method='shared_crop_structure_tensor_v1', derivative_sigma_ct=2., integration_sigma_ct=8.,

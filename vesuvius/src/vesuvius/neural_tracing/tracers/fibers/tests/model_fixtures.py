@@ -11,8 +11,8 @@ from dataclasses import replace
 import numpy as np
 import torch
 
-from vesuvius.neural_tracing.tracers.fibers.models.crop_transformer import FlowConfig, RegressionConfig
-from vesuvius.neural_tracing.tracers.fibers.shared.geometry import CropSpec, arclength
+from vesuvius.neural_tracing.tracers.models.crop_transformer import FlowConfig, RegressionConfig
+from vesuvius.neural_tracing.tracers.shared.geometry import CropSpec, arclength
 from label_fixtures import state_labels
 
 SMALL = dict(hidden=16, heads=2, layers=1, ffn=32, cnn_channels=(4, 8), cnn_blocks=(1, 1), n_future=4, n_history=32,
@@ -69,7 +69,7 @@ def raw_batch(cfg, b=2):
 
 
 def geometry_batch(c, count=2, length=100.):
-    from vesuvius.neural_tracing.tracers.fibers.models.path_geometry import path_geometry_inputs
+    from vesuvius.neural_tracing.tracers.models.path_geometry import path_geometry_inputs
     out = raw_batch(c, count)
     path = np.c_[np.zeros(int(length)+1), np.zeros(int(length)+1), np.arange(int(length)+1.)]
     out['x'].update(path_geometry_inputs([observation(path) for _ in range(count)]))
@@ -89,7 +89,7 @@ def forward(m, b):
 
 def proposal_output(curves, hazards, selected=-1):
     """Build the current all-proposal output contract for loss/policy fixtures."""
-    from vesuvius.neural_tracing.tracers.fibers.models.survival_confidence import survival_predictions
+    from vesuvius.neural_tracing.tracers.models.survival_confidence import survival_predictions
     logits, confidence = survival_predictions(hazards)
     return dict(points=curves[:, selected], initial_points=curves[:, 0],
                 hazard_logits=hazards[:, selected], confidence_logits=logits[:, selected],

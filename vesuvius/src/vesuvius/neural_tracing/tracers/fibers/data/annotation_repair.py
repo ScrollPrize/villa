@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from vesuvius.neural_tracing.tracers.fibers.shared.geometry import arclength, interp_at
+from vesuvius.neural_tracing.tracers.shared.geometry import arclength, interp_at
 
 ANNOTATION_REPAIR = 'kinks_v1'
 SHARP_TURN = 30.        # degrees within one voxel that mark a kink

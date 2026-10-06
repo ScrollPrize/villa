@@ -14,10 +14,10 @@ import numpy as np
 import torch
 
 from vesuvius.neural_tracing.tracers.fibers.data.data import SOURCE, label_state
-from vesuvius.neural_tracing.tracers.fibers.shared.geometry import frame_from_heading
+from vesuvius.neural_tracing.tracers.shared.geometry import frame_from_heading
 from vesuvius.neural_tracing.tracers.fibers.tracing.heading import FRAME_POLICY, SeedHeadingError, ct_frame, reframe_item
-from vesuvius.neural_tracing.tracers.fibers.tracing.policy import commit_count
-from vesuvius.neural_tracing.tracers.fibers.shared.reference import SEED_FIELDS, observed_path
+from vesuvius.neural_tracing.tracers.shared.policy import commit_count
+from vesuvius.neural_tracing.tracers.shared.reference import SEED_FIELDS, observed_path
 from vesuvius.neural_tracing.tracers.fibers.data.state_labels import FOLLOWING, RECOVERABLE, TERMINAL, TraceLabeler
 from vesuvius.neural_tracing.tracers.fibers.tracing.trace import TraceParams, advance_trace_path, trace_history
 
@@ -191,7 +191,7 @@ class LiveContinuation:
         datasets = getattr(dataset, 'datasets', [dataset])
         self.sources = []
         self.policy = policy
-        self.horizon = horizon  # the model's gate plane (tracing.policy.gate_horizon)
+        self.horizon = horizon  # the model's gate plane (shared.policy.gate_horizon)
         for source in datasets:
             live = LiveContinuationSource(policy=policy, steps=steps, capacity=max(32, source.chunk*4),
                 switch_tolerance=switch_tolerance, own_tolerance=own_tolerance, step=source.step)
