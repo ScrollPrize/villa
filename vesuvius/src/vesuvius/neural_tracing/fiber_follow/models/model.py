@@ -20,7 +20,6 @@ class FollowerConfig:
     model_type: str = ''
     fine: CropSpec = field(default_factory=lambda: CropSpec(depth=144, width=104, behind=72, spacing=.5))
     hidden: int = 256
-    activation_checkpointing: bool = False
     n_future: int = 16
     future_step: float = 1.
     gate_plane: int | None = None  # plane whose confidence accepts a proposal (full gate, retries); None: the last plane
@@ -94,9 +93,25 @@ def config_class(model_type):
     raise ValueError(f'Unsupported model type: {model_type!r} (supported: {", ".join(MODEL_TYPES)})')
 
 
+# Removed configuration fields and their only supported value: configurations recorded before the removal (checkpoints,
+# run files) still hold them and load when they hold that value.
+RETIRED_FIELDS = dict(activation_checkpointing=False, query_scale=None, flow_time_conditioning='adaln_zero',
+                      flow_unknown_planes='own_path', flow_selection='retry', flow_zero_start=True,
+                      flow_sample_threshold=0., flow_loss='pseudo_huber', flow_geometry_weight=0.)
+ANY = object()  # a retired setting every value of which is supported
+
+
+def retire(values, retired, what='model'):
+    """``values`` without the ``retired`` settings ({name: supported value or ANY}); refuses any other value."""
+    for key, kept in retired.items():
+        if key in values and kept is not ANY and values[key] != kept:
+            raise ValueError(f'The {what} setting {key}={values[key]!r} no longer exists (only {kept!r} is supported)')
+    return {k: v for k, v in values.items() if k not in retired}
+
+
 def config_from_checkpoint(ck):
     """The model configuration recorded in a checkpoint."""
-    return config_class(ck.get('model_type'))(**ck['model_cfg'])
+    return config_class(ck.get('model_type'))(**retire(ck['model_cfg'], RETIRED_FIELDS))
 
 
 def build_model(cfg):
@@ -112,24 +127,23 @@ def build_model(cfg):
     raise ValueError(f'Unsupported model type: {cfg.model_type!r}')
 
 
-def select_refinement(output, cfg, confidence_threshold=DEFAULT_CONFIDENCE, n_commit=None, *, retry=True):
+def select_refinement(output, cfg, confidence_threshold=DEFAULT_CONFIDENCE, n_commit=None):
     """Longest acceptable prefix, then confidence at its end, then earlier pass.
 
     If every proposal stops, select the best first-point confidence among valid
     connections; the unchanged commit gate still stops. Selection never splices
     paths or transfers one proposal's confidence to another proposal.
-    With ``retry`` (default) proposals after the first accepted one are ignored, so later
-    proposals act only as retries; without it the same ranking runs over all proposals.
+    Proposals after the first accepted one are ignored, so later proposals act only as retries.
     """
     if not 0 <= confidence_threshold <= 1:
         raise ValueError('Confidence threshold must lie in [0, 1]')
     window = cfg.n_future if n_commit is None else n_commit
     curves, confidence = output['refinement_points'], output['refinement_confidence'].detach()
     counts, allowed = commit_prefix(curves, confidence, confidence_threshold, window, cfg.max_recovery_distance)
-    gate = getattr(cfg, 'gate_horizon', confidence.shape[-1])  # acceptance through the gate plane, as in tracing
+    gate = cfg.gate_horizon  # acceptance through the gate plane, as in tracing
     accepted = (confidence[..., gate-1] >= confidence_threshold) & allowed & output['refinement_mask']
     prior_accept = torch.cat((torch.zeros_like(accepted[:, :1]), accepted[:, :-1]), 1).long().cumsum(1) > 0
-    valid = output['refinement_mask'] & ~prior_accept if retry else output['refinement_mask'].bool()
+    valid = output['refinement_mask'] & ~prior_accept
     longest = counts.masked_fill(~valid, -1).max(-1, keepdim=True).values
     score = confidence.gather(-1, (counts-1).clamp_min(0)[..., None]).squeeze(-1)
     score = score.nan_to_num(nan=-torch.inf).masked_fill((counts != longest) | ~allowed | ~valid, -torch.inf)
@@ -147,15 +161,14 @@ def device_vector(like, values):
     return torch.stack([like.new_full((), v) for v in values])
 
 
-def feature_grid(points, crop, shape, stride=1, offset=(0,0,0)):
-    """Exact physical coordinates for a feature lattice (stride/offset in zyx)."""
+def feature_grid(points, crop, shape, stride=1):
+    """Exact physical coordinates for a feature lattice (stride in zyx); cell i is centred on input sample stride*i."""
     if isinstance(stride, (int, float)):
         stride = (stride,)*3
     size = device_vector(points, tuple(reversed(shape)))
     scale = device_vector(points, tuple(reversed(stride)))*crop.spacing
     origin = device_vector(points, (-(crop.width-1)*crop.spacing/2,
                                     -(crop.width-1)*crop.spacing/2, -crop.behind*crop.spacing))
-    origin = origin+device_vector(points, tuple(reversed(offset)))*crop.spacing
     return 2*(points-origin)/(scale*(size-1).clamp_min(1))-1
 
 
@@ -166,10 +179,10 @@ def crop_support(points, crop):
     return torch.isfinite(points).all(-1) & (points >= lo).all(-1) & (points <= hi).all(-1)
 
 
-def sample_features(features, points, crop, stride=1, offset=(0,0,0)):
+def sample_features(features, points, crop, stride=1):
     supported = crop_support(points, crop)
     points = torch.where(supported[...,None], points.float(), 0.)
-    grid = feature_grid(points, crop, features.shape[-3:], stride, offset)
+    grid = feature_grid(points, crop, features.shape[-3:], stride)
     # Border extrapolation covers the half-token margins of the input crop.
     values = F.grid_sample(features.float(), grid[:,:,None,None], padding_mode='border', align_corners=True)
     values = values[:,:,:,0,0].transpose(1,2)
@@ -225,6 +238,5 @@ def token_coordinates(cfg):
     """Token centers in crop-local XYZ."""
     d,y,x = torch.meshgrid(*(torch.arange(n).float() for n in cfg.token_shape),indexing='ij')
     xyz = torch.stack((x,y,d),-1)
-    xyz = (xyz*xyz.new_tensor(tuple(reversed(cfg.token_stride)))
-           +xyz.new_tensor(tuple(reversed(cfg.token_offset))))*cfg.fine.spacing
+    xyz = xyz*xyz.new_tensor(tuple(reversed(cfg.token_stride)))*cfg.fine.spacing
     return xyz-xyz.new_tensor(((cfg.fine.width-1)*cfg.fine.spacing/2,)*2+(cfg.fine.behind*cfg.fine.spacing,))

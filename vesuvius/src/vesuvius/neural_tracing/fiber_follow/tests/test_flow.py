@@ -34,7 +34,7 @@ def test_flow_draws_and_trace_rows_are_independent_and_unknown_targets_are_censo
             one = take(b, slice(row, row+1))
             result = model(one['x'], one['hist'], one['hmask'])
             torch.testing.assert_close(result['points'], out['points'][row:row+1], atol=2e-5, rtol=2e-5)
-        ctx = model.context(b['x'], b['hist'], b['hmask']); model.prepare_prediction(ctx, b['hist'])
+        ctx = model.context(b['x'], b['hist'], b['hmask'])
         y, t = torch.randn(2, 2, 4, 2), torch.rand(2, 2)
         both = model.velocity_field(ctx, y, t)
         solo = model.velocity_field(ctx, y[:, :1], t[:, :1])
@@ -134,26 +134,28 @@ def test_sampled_proposals_are_scored_in_training_and_the_zero_start_path_is_unc
     assert all(float(m.weight.grad.abs().sum()) > 0 for m in (sampled.score[0], sampled.hazard))
 
 
-def test_unknown_planes_are_attended_only_with_own_path_and_the_scale_floor_bounds_the_prior():
+def test_unknown_planes_stay_attended_and_the_scale_floor_bounds_the_prior():
     torch.manual_seed(29)
     b = coordinate_batch(config())
     b['dense_mask'][:, b['dense_mask'].shape[1]//2:] = 0  # the trailing planes have no target
-    for mode, attended in (('padded', False), ('own_path', True)):
-        model = build_model(config(flow_unknown_planes=mode)).eval()
-        _, known = flow_targets(b, model.cfg)
-        assert known.any() and not known.all()
-        losses = []
-        for seed in (0, 1):
-            noise = torch.randn(2, model.cfg.flow_draws, model.cfg.n_future, 2, generator=torch.Generator().manual_seed(7))
-            # Change the Gaussian draw at target-less planes only.
-            noise[~known[:, None].expand(-1, model.cfg.flow_draws, -1)] = torch.randn(
-                int((~known).sum())*model.cfg.flow_draws, 2, generator=torch.Generator().manual_seed(seed))
-            with torch.no_grad():
-                out = model.training_forward(b['x'], b['hist'], b['hmask'], .5,
-                                             dict(b, flow_noise=noise, flow_times=torch.tensor([[.3, .8]]*2)))
-            losses.append(out['flow_per_state'])
-        assert torch.isfinite(losses[0]).all()
-        assert (not torch.allclose(losses[0], losses[1])) == attended
+    model = build_model(config()).eval()
+    with torch.no_grad():  # open the adaLN-Zero gates, so path tokens read each other
+        for linear in (*model.time_modulation, model.output_modulation):
+            linear.weight.normal_(std=1.)
+    _, known = flow_targets(b, model.cfg)
+    assert known.any() and not known.all()
+    losses = []
+    for seed in (0, 1):
+        noise = torch.randn(2, model.cfg.flow_draws, model.cfg.n_future, 2, generator=torch.Generator().manual_seed(7))
+        # Change the Gaussian draw at target-less planes only: they stay in attention, heading for the own path.
+        noise[~known[:, None].expand(-1, model.cfg.flow_draws, -1)] = torch.randn(
+            int((~known).sum())*model.cfg.flow_draws, 2, generator=torch.Generator().manual_seed(seed))
+        with torch.no_grad():
+            out = model.training_forward(b['x'], b['hist'], b['hmask'], .5,
+                                         dict(b, flow_noise=noise, flow_times=torch.tensor([[.3, .8]]*2)))
+        losses.append(out['flow_per_state'])
+    assert torch.isfinite(losses[0]).all()
+    assert not torch.allclose(losses[0], losses[1])
     cfg = config(flow_sigma_floor=3., flow_sigma=((3., 3.),)*4)
     data = coordinate_batch(cfg)
     data['dense_ab'][0, :, 0] = -2.; data['dense_ab'][1, :, 0] = 2.
@@ -169,43 +171,12 @@ def test_pseudo_huber_flow_loss_is_half_the_squared_distance_for_small_residuals
     target, known = flow_targets(b, config())
     # A zero velocity makes the residual (noise - target) per known path point (unit scales).
     distance = (noise-target[:, None]).norm(dim=-1)[known[:, None].expand(-1, 2, -1)].reshape(2, -1)
-    for loss, c, expected in (('mse', 1., .5*distance.square()),
-                              ('pseudo_huber', 1., ((1+distance.square()).sqrt()-1)),
-                              ('pseudo_huber', .5, .25*((1+(distance/.5).square()).sqrt()-1))):
-        model = build_model(config(flow_loss=loss, flow_huber_c=c))
-        model.velocity_field = lambda ctx, y, t, known=None: torch.zeros_like(y)
+    for c, expected in ((1., ((1+distance.square()).sqrt()-1)), (.5, .25*((1+(distance/.5).square()).sqrt()-1))):
+        model = build_model(config(flow_huber_c=c))
+        model.velocity_field = lambda ctx, y, t: torch.zeros_like(y)
         out = model.training_forward(b['x'], b['hist'], b['hmask'], .5, dict(b, flow_noise=noise))
         torch.testing.assert_close(out['flow_per_state'], expected.mean(-1).float(), rtol=1e-5, atol=1e-6)
     huber = ((1+distance.square()).sqrt()-1)
     assert (huber <= .5*distance.square()+1e-6).all()  # never above the squared loss; linear for large residuals
-    with pytest.raises(ValueError, match='Flow loss'):
-        config(flow_loss='l1')
-
-
-def test_flow_geometry_weight_trains_the_integrated_zero_start_path_and_nothing_else_sees_its_gradient():
-    torch.manual_seed(41)
-    plain = build_model(config(flow_samples=2))
-    model = build_model(config(flow_samples=2, flow_geometry_weight=.5))
-    model.load_state_dict(plain.state_dict())
-    b = coordinate_batch(model.cfg)
-    b['flow_noise'] = torch.randn(2, 2, 4, 2)
-    torch.manual_seed(5); base = plain.training_forward(b['x'], b['hist'], b['hmask'], .5, b)
-    torch.manual_seed(5); out = model.training_forward(b['x'], b['hist'], b['hmask'], .5, b)
-    assert 'flow_geometry_points' not in base and out['flow_geometry_points'].requires_grad
-    # Same proposals, scores and flow loss; the proposals reach the scorer detached.
-    for key in ('refinement_points', 'refinement_confidence', 'flow_per_state'):
-        torch.testing.assert_close(out[key], base[key], atol=2e-5, rtol=1e-5)
-    assert not out['refinement_points'].requires_grad
-    torch.testing.assert_close(out['flow_geometry_points'], out['refinement_points'][:, 0], atol=2e-5, rtol=1e-5)
-    terms = loss_terms(model.select_prediction(out), b, model.cfg)
-    torch.testing.assert_close(terms['geometry_per_state'],
-                               out['flow_per_state']+.5*terms['flow_path_geometry_per_state'])
-    assert 'flow_path_geometry_per_state' not in loss_terms(plain.select_prediction(base), b, plain.cfg)
-    terms['flow_path_geometry_per_state'].sum().backward()
-    assert model.velocity.weight.grad.abs().sum() > 0
-    assert all(p.grad is None or not p.grad.any() for m in (model.score, model.hazard) for p in m.parameters())
-    model.eval()
-    with torch.no_grad():
-        assert 'flow_geometry_points' not in model.training_forward(b['x'], b['hist'], b['hmask'], .5)
-    with pytest.raises(ValueError, match='zero-start path'):
-        config(flow_samples=2, flow_zero_start=False, flow_geometry_weight=.5)
+    with pytest.raises(ValueError, match='pseudo-Huber scale'):
+        config(flow_huber_c=0.)

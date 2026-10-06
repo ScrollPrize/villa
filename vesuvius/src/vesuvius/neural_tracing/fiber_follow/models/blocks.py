@@ -1,9 +1,7 @@
 """Building blocks shared by the crop transformer (models/crop_transformer.py) and the sequence follower
 (models/sequence.py): the residual crop CNN and the pre-norm transformer layer's weights and head split/merge. Each
 model's layer subclass defines which tokens attend to which."""
-import torch
 from torch import nn
-from torch.utils.checkpoint import checkpoint
 
 from vesuvius.models.build.resblocks import BasicBlockD, StackedResidualBlocks
 
@@ -11,7 +9,7 @@ from vesuvius.models.build.resblocks import BasicBlockD, StackedResidualBlocks
 class CropCNN(nn.Module):
     """Residual CNN stages (channels, initial stride, blocks per stage) over a one-channel crop; the first stage's
     convolutions carry biases."""
-    def __init__(self, channels, strides, blocks, checkpointing=False):
+    def __init__(self, channels, strides, blocks):
         super().__init__()
         options = dict(conv_op=nn.Conv3d, kernel_size=3, norm_op=nn.InstanceNorm3d,
                        norm_op_kwargs=dict(eps=1e-5, affine=True), nonlin=nn.ReLU, nonlin_kwargs=dict(inplace=True),
@@ -21,12 +19,11 @@ class CropCNN(nn.Module):
             StackedResidualBlocks(n_blocks=n, input_channels=i, output_channels=c, initial_stride=s, conv_bias=not index,
                                   **options)
             for index, (i, c, s, n) in enumerate(zip(inputs, channels, strides, blocks)))
-        self.checkpointing = checkpointing
 
     def forward(self, image):
         x = image
         for stage in self.stages:
-            x = checkpoint(stage, x, use_reentrant=False) if self.checkpointing and torch.is_grad_enabled() else stage(x)
+            x = stage(x)
         return x
 
 

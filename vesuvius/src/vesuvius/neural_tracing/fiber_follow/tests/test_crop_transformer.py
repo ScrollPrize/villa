@@ -13,9 +13,8 @@ from vesuvius.neural_tracing.fiber_follow.train.train import prepare_training, t
 
 SMALL = dict(fine=CropSpec(depth=32, width=16, behind=8, spacing=.5), n_future=8, gate_plane=4, hidden=32, layers=2,
              heads=2, ffn=64, cnn_channels=(4, 8, 16), cnn_blocks=(1, 1, 1), n_history=32)
-# The plain flow model: time added to the path tokens once, padded unknown planes, squared error, one path.
-PLAIN_FLOW = dict(flow_steps=2, flow_draws=3, flow_sigma=((1., 1.),)*8, flow_samples=0, flow_time_conditioning='input',
-                  flow_sigma_floor=1., flow_unknown_planes='padded', flow_loss='mse')
+# A small flow model with one path.
+PLAIN_FLOW = dict(flow_steps=2, flow_draws=3, flow_sigma=((1., 1.),)*8, flow_samples=0, flow_sigma_floor=1.)
 
 
 def small(flow=False, **options):
@@ -37,12 +36,6 @@ def test_path_token_sets_and_absent_references_are_independent():
         changed = tokens.clone()
         changed[:, 1] += 1.
         torch.testing.assert_close(model.run_paths(ctx, changed)[:, 0], both[:, 0])  # sets never read each other
-        padding = torch.zeros(2, 2, 8, dtype=torch.bool)
-        padding[:, 0, 5:] = True
-        padded = model.run_paths(ctx, tokens, padding)
-        changed = tokens.clone()
-        changed[:, 0, 5:] += 1.
-        torch.testing.assert_close(model.run_paths(ctx, changed, padding)[:, 0, :5], padded[:, 0, :5])
         # Context tokens never read path tokens; absent references are not read at all.
         hmask = b['hmask'].clone()
         hmask[:, 10:] = 0
@@ -56,9 +49,9 @@ def test_path_token_sets_and_absent_references_are_independent():
             torch.testing.assert_close(v1[:, :, visible[0]], v0[:, :, visible[0]])
 
 
-@pytest.mark.parametrize('flow, options', [(False, {}), (True, dict(flow_time_conditioning='adaln_zero'))])
-def test_compiled_training_matches_eager_with_finite_gradients(flow, options):
-    model = small(flow=flow, **options)
+@pytest.mark.parametrize('flow', [False, True])
+def test_compiled_training_matches_eager_with_finite_gradients(flow):
+    model = small(flow=flow)
     b = coordinate_batch(model.cfg, 2)
     if flow:
         b['flow_noise'] = torch.randn(2, model.cfg.flow_draws, 8, 2)
@@ -94,7 +87,7 @@ def test_tracing_runs_the_regression_model(tmp_path):
 
 
 def test_adaln_zero_velocity_blocks_start_as_the_identity_and_open_with_training():
-    model = small(flow=True, flow_time_conditioning='adaln_zero')
+    model = small(flow=True)
     b = coordinate_batch(model.cfg, 2)
     y, t = torch.randn(2, 3, 8, 2), torch.rand(2, 3)
     moved = y.clone()
@@ -109,7 +102,7 @@ def test_adaln_zero_velocity_blocks_start_as_the_identity_and_open_with_training
             linear.weight.normal_(std=.05)
         assert not torch.allclose(model.velocity_field(ctx, moved, t)[:, :, others],
                                   model.velocity_field(ctx, y, t)[:, :, others])
-    fresh = small(flow=True, flow_time_conditioning='adaln_zero')
+    fresh = small(flow=True)
     b['flow_noise'], b['flow_times'] = torch.randn(2, fresh.cfg.flow_draws, 8, 2), torch.rand(2, fresh.cfg.flow_draws)
     fresh.training_forward(b['x'], b['hist'], b['hmask'], torch.tensor(.5), b)['flow_per_state'].sum().backward()
     assert all(m.weight.grad.abs().sum() > 0 for m in fresh.time_modulation)  # the gates learn from the first step

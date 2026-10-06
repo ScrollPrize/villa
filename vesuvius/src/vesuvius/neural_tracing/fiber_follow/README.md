@@ -6,7 +6,7 @@ Three model types share one trainer, data pipeline, labels, replay, live continu
   transformer) reads the crop cells, observed-path references and path-geometry tokens; path tokens read out each
   plane's lateral position and hazard logit, with recurrent refinement passes.
 - `flow` (models/crop_transformer.py, models/flow.py): flow matching on the same backbone; path tokens carry a
-  noisy path and the flow time (adaLN-Zero by default) and read out the velocity; a scoring set reads out the hazards.
+  noisy path and the flow time (adaLN-Zero) and read out the velocity; a scoring set reads out the hazards.
 - `sequence` (models/sequence.py, train/sequence.py): one transformer reads the whole trace, one history token per
   committed step, and predicts the path and its confidence; training runs whole episodes.
 

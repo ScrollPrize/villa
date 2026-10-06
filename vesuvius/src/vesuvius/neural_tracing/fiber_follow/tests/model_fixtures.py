@@ -40,8 +40,7 @@ def coordinate_config(**kwargs):
 def flow_config(**kwargs):
     """A small flow model with fixed residual scales."""
     options = dict(SMALL, fine=CropSpec(depth=16, width=12, behind=7), layers=2, flow_steps=2, flow_draws=3,
-                   flow_samples=0, flow_time_conditioning='input', flow_sigma_floor=1., flow_unknown_planes='padded',
-                   flow_loss='mse')
+                   flow_samples=0, flow_sigma_floor=1.)
     options.update(kwargs)
     options.pop('recurrent_refinement_steps', None)
     options['fine'] = small_crop(options['fine'])

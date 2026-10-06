@@ -19,16 +19,14 @@ two model types share this backbone and differ only in what their path tokens ca
     logit (survival confidence) together; optional refinement passes feed the proposal, its evidence and its detached
     confidence back as new path tokens;
   * 'flow' (flow matching, models/flow.py): path tokens carry a noisy path and the flow time and read out the
-    velocity; a scoring set of path tokens carries a finished proposal and reads out its hazard logits. With
-    flow_time_conditioning 'adaln' the time also modulates every layer's two branches and the final norm of the
-    velocity path tokens (zero-initialized, so the model starts as the 'input' one); 'adaln_zero' gates each branch by
-    a zero-initialized alpha instead (alpha*branch, DiT's adaLN-Zero), so every velocity-token block starts as the
-    identity. Context and scoring tokens have no time and are never modulated.
+    velocity; a scoring set of path tokens carries a finished proposal and reads out its hazard logits. The time also
+    modulates every layer's two branches and the final norm of the velocity path tokens (DiT's adaLN-Zero: each
+    branch is gated by a zero-initialized alpha, so every velocity-token block starts as the identity). Context and
+    scoring tokens have no time and are never modulated.
 
 Both keep the shared output contract, losses, acceptance (gate plane), commits and trainer (train/train.py).
 """
 from dataclasses import dataclass
-import math
 
 import torch
 from torch import nn
@@ -74,10 +72,6 @@ class CropTransformerArchitecture:
         stride = 2**len(self.cnn_channels)
         return (stride,)*3
 
-    @property
-    def token_offset(self):
-        return (0., 0., 0.)  # stride-2 3x3x3 convolutions with padding 1 centre cell i on input sample stride*i
-
 
 @dataclass
 class RegressionConfig(CropTransformerArchitecture, FollowerConfig):
@@ -85,12 +79,6 @@ class RegressionConfig(CropTransformerArchitecture, FollowerConfig):
     n_future: int = 35
     gate_plane: int | None = 16
     recurrent_refinement_steps: int = 3
-    query_scale: float | None = None  # forward-distance normalization of path queries; None: n_future*future_step
-
-    def __post_init__(self):
-        super().__post_init__()
-        if self.query_scale is not None and not (math.isfinite(self.query_scale) and self.query_scale > 0):
-            raise ValueError('Query scale must be finite and positive')
 
 
 @dataclass
@@ -113,19 +101,18 @@ class CropTransformerLayer(TransformerLayer):
         x = x+self.merge(F.scaled_dot_product_attention(q, k, v, attn_mask=~padding[:, None, None, :]))
         return x+self.ffn(self.norm2(x)), (k, v)
 
-    def queries(self, x, context, mask, modulation=None, zero_gate=False):
+    def queries(self, x, context, mask, modulation=None):
         """Path tokens (B, M, W) after this layer; ``context`` its context keys/values, ``mask`` (B, M, N+M) the
         context and path keys each path token reads. ``modulation`` (B, M, 2, 3, W) conditions the attention and
-        FFN branches per token: normalized input * (1+scale) + shift, branch output * (1+gate); zero is unmodulated.
-        ``zero_gate``: branch output * gate instead (adaLN-Zero), so zero modulation is the identity."""
+        FFN branches per token (adaLN-Zero): normalized input * (1+scale) + shift, branch output * gate, so zero
+        modulation is the identity."""
         if modulation is None:
             branch_input = lambda value, norm, i: norm(value)
             residual = lambda value, branch, i: value+branch
         else:
             shift, scale, gate = modulation.unbind(-2)  # each (B, M, 2, W)
             branch_input = lambda value, norm, i: norm(value)*(1+scale[..., i, :])+shift[..., i, :]
-            gain = gate if zero_gate else 1+gate
-            residual = lambda value, branch, i: value+gain[..., i, :]*branch
+            residual = lambda value, branch, i: value+gate[..., i, :]*branch
         q, k, v = self.split(branch_input(x, self.norm1, 0))
         k, v = torch.cat((context[0], k), 2), torch.cat((context[1], v), 2)
         x = residual(x, self.merge(F.scaled_dot_product_attention(q, k, v, attn_mask=mask[:, None])), 0)
@@ -139,7 +126,7 @@ class CropTransformer(nn.Module):
         super().__init__()
         self.cfg, self.model_type = cfg, cfg.model_type
         h, cells = cfg.hidden, cfg.cnn_channels[-1]
-        self.cnn = CropCNN(cfg.cnn_channels, (2,)*len(cfg.cnn_channels), cfg.cnn_blocks, cfg.activation_checkpointing)
+        self.cnn = CropCNN(cfg.cnn_channels, (2,)*len(cfg.cnn_channels), cfg.cnn_blocks)
         self.cell_token = nn.Linear(cells, h)
         self.cell_position = nn.Sequential(nn.Linear(3, h), nn.SiLU(), nn.Linear(h, h))
         self.reference_token = nn.Sequential(nn.Linear(cells+REFERENCE_METADATA, h), nn.SiLU(), nn.Linear(h, h))
@@ -153,8 +140,7 @@ class CropTransformer(nn.Module):
 
     def sample_cells(self, ctx, points):
         """CNN cell features (B, M, C) and crop support (B, M) at crop-local points (B, M, 3)."""
-        return sample_features(ctx['cells'].float(), points.float(), self.cfg.fine, self.cfg.token_stride,
-                               self.cfg.token_offset)
+        return sample_features(ctx['cells'].float(), points.float(), self.cfg.fine, self.cfg.token_stride)
 
     def evidence(self, ctx, points):
         values, support = self.sample_cells(ctx, points)
@@ -183,22 +169,19 @@ class CropTransformer(nn.Module):
         ctx.update(context=pairs, padding=padding)
         return ctx
 
-    def run_paths(self, ctx, tokens, padding=None, modulation=None):
-        """Final states (B, G, P, W) of G independent sets of path tokens (B, G, P, W) over one decision's context;
-        ``padding`` (B, G, P) True: a path token the others of its set do not read. ``modulation`` (per-layer list of
-        (B, G, 2, 3, W), final-norm (B, G, 2, W) shift/scale, zero_gate) conditions each set's tokens (adaLN)."""
+    def run_paths(self, ctx, tokens, modulation=None):
+        """Final states (B, G, P, W) of G independent sets of path tokens (B, G, P, W) over one decision's context.
+        ``modulation`` (per-layer list of (B, G, 2, 3, W), final-norm (B, G, 2, W) shift/scale) conditions each set's
+        tokens (adaLN-Zero)."""
         b, g, p, w = tokens.shape
         group = torch.arange(g, device=tokens.device).repeat_interleave(p)
         own = (group[:, None] == group[None, :])[None]
-        if padding is not None:
-            own = own & ~padding.reshape(b, 1, g*p)
         mask = torch.cat(((~ctx['padding'])[:, None].expand(b, g*p, -1), own.expand(b, g*p, g*p)), -1)
         x = tokens.reshape(b, g*p, w)
         per_token = lambda m: m[:, :, None].expand(b, g, p, *m.shape[2:]).reshape(b, g*p, *m.shape[2:]).to(x.dtype)
         layers = [None]*len(self.layers) if modulation is None else modulation[0]
         for layer, pair, condition in zip(self.layers, ctx['context'], layers):
-            x = layer.queries(x, pair, mask, None if condition is None else per_token(condition),
-                              zero_gate=modulation is not None and modulation[2])
+            x = layer.queries(x, pair, mask, None if condition is None else per_token(condition))
         x = self.norm(x).reshape(b, g, p, w)
         if modulation is not None:
             shift, scale = modulation[1][:, :, None].to(x.dtype).unbind(-2)
@@ -221,7 +204,7 @@ class RegressionFollower(CropTransformer):
     def __init__(self, cfg):
         super().__init__(cfg)
         h, cells = cfg.hidden, cfg.cnn_channels[-1]
-        self.query_scale = cfg.query_scale or cfg.n_future*cfg.future_step
+        self.query_scale = cfg.n_future*cfg.future_step
         # CNN evidence and support at the centerline, forward distance.
         self.query = nn.Sequential(nn.Linear(cells+2, h), nn.SiLU(), nn.Linear(h, h))
         self.coordinates = nn.Linear(h, 2)
@@ -288,13 +271,12 @@ class FlowFollower(FlowMatching, CropTransformer):
         # CNN evidence and support at the noisy path, its residual-scale coordinates, forward distance.
         self.query = nn.Sequential(nn.Linear(cells+1+2+1, h), nn.SiLU(), nn.Linear(h, h))
         self.time = nn.Sequential(nn.Linear(64, h), nn.SiLU(), nn.Linear(h, h))
-        if cfg.flow_time_conditioning in ('adaln', 'adaln_zero'):
-            # Per layer: shift/scale/gate of the attention and FFN branches; then the final norm's shift/scale.
-            self.time_modulation = nn.ModuleList(nn.Linear(h, 6*h) for _ in range(cfg.layers))
-            self.output_modulation = nn.Linear(h, 2*h)
-            for linear in (*self.time_modulation, self.output_modulation):
-                nn.init.zeros_(linear.weight)
-                nn.init.zeros_(linear.bias)
+        # Per layer: shift/scale/gate of the attention and FFN branches; then the final norm's shift/scale.
+        self.time_modulation = nn.ModuleList(nn.Linear(h, 6*h) for _ in range(cfg.layers))
+        self.output_modulation = nn.Linear(h, 2*h)
+        for linear in (*self.time_modulation, self.output_modulation):
+            nn.init.zeros_(linear.weight)
+            nn.init.zeros_(linear.bias)
         self.velocity = nn.Linear(h, 2)
         nn.init.normal_(self.velocity.weight, std=.01)
         nn.init.zeros_(self.velocity.bias)
@@ -302,27 +284,18 @@ class FlowFollower(FlowMatching, CropTransformer):
         self.score = nn.Sequential(nn.Linear(cells+1+3, h), nn.SiLU(), nn.Linear(h, h))
         self.hazard = nn.Linear(h, 1)
 
-    def prepare_prediction(self, ctx, hist):
-        return None  # the context keys/values were computed with the context
-
-    def velocity_field(self, ctx, y, t, known=None):
-        """Velocity (B, D, P, 2) of D draws per decision; ``known`` (B, P) False: a plane left out of attention."""
+    def velocity_field(self, ctx, y, t):
+        """Velocity (B, D, P, 2) of D draws per decision."""
         b, draws, planes, _ = y.shape
-        if known is not None:
-            y = torch.where(known[:, None, :, None], y, 0.)
         points = self.to_points(y)
         evidence = self.evidence(ctx, points.reshape(b, draws*planes, 3)).reshape(b, draws, planes, -1)
         tokens = self.query(torch.cat((evidence, y.to(evidence.dtype), points[..., 2:]/self.plane_scale), -1))
         time = self.time(time_embedding(t))
         tokens = tokens+time[:, :, None].to(tokens.dtype)+self.kind[PATH].to(tokens.dtype)
-        padding = None if known is None else (~known)[:, None].expand(-1, draws, -1)
-        modulation = None
-        if self.cfg.flow_time_conditioning in ('adaln', 'adaln_zero'):
-            condition = F.silu(time)  # (B, D, W): one modulation per draw, shared by its planes
-            modulation = ([m(condition).unflatten(-1, (2, 3, self.cfg.hidden)) for m in self.time_modulation],
-                          self.output_modulation(condition).unflatten(-1, (2, self.cfg.hidden)),
-                          self.cfg.flow_time_conditioning == 'adaln_zero')
-        return self.velocity(self.run_paths(ctx, tokens, padding, modulation)).float()
+        condition = F.silu(time)  # (B, D, W): one modulation per draw, shared by its planes
+        modulation = ([m(condition).unflatten(-1, (2, 3, self.cfg.hidden)) for m in self.time_modulation],
+                      self.output_modulation(condition).unflatten(-1, (2, self.cfg.hidden)))
+        return self.velocity(self.run_paths(ctx, tokens, modulation)).float()
 
     def hazard_logits(self, ctx, points):
         # No generator state enters a proposal's score.

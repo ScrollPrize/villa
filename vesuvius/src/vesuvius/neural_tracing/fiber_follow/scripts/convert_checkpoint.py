@@ -31,8 +31,8 @@ SEQUENCE_UNSUPPORTED_TASKS = ('live', 'synthetic_terminal')
 
 
 def convert_model_config(model_type, recorded):
-    from vesuvius.neural_tracing.fiber_follow.models.model import config_class
-    for key, inert in INERT_MODEL_FIELDS.items():
+    from vesuvius.neural_tracing.fiber_follow.models.model import RETIRED_FIELDS, config_class
+    for key, inert in {**INERT_MODEL_FIELDS, **RETIRED_FIELDS}.items():
         if recorded.get(key, inert) != inert:
             raise ValueError(f'Model field {key}={recorded[key]!r} has no counterpart in the current model')
     kept = {f.name for f in fields(config_class(model_type))}
@@ -65,12 +65,14 @@ def run_document(ck, cfg, notes):
             options[new] = options.pop(old)
     model = {k: v for k, v in json.loads(json.dumps(cfg.to_dict())).items()
              if k not in run_config.DERIVED_MODEL_FIELDS and k != 'flow_sigma'}
-    training = {k: options[k] for k in run_config.training_defaults(cfg.model_type) if k in options}
+    # Retired settings pass through, so resolving refuses one that held an unsupported value.
+    training = {k: options[k] for k in (*run_config.training_defaults(cfg.model_type), *run_config.RETIRED['training'])
+                if k in options}
     training['task_shares'] = task_shares(ck['task_budget'], cfg.model_type, notes)
     training['terminal_fallback_cap'] = ck['task_budget']['terminal_fallback_cap']
     training['replay_max_age'] = ck['task_budget']['replay_max_age']
     training['replay_event_cap'] = ck['task_budget']['replay_event_cap']
-    runtime = {k: options[k] for k in run_config.RUNTIME if k in options}
+    runtime = {k: options[k] for k in (*run_config.RUNTIME, *run_config.RETIRED['runtime']) if k in options}
     return dict(name=options['name'], out_root=options['out_root'], init_weights=options.get('init_weights'),
                 init_exclude=[], reset_optimizer=False, dataset=ck['dataset_config'],
                 model=dict(type=cfg.model_type, **model), training=training, runtime=runtime)

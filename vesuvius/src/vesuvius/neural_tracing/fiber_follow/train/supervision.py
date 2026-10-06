@@ -181,14 +181,8 @@ def loss_terms(output, batch, cfg, tolerance=1.5, *, n_commit=None, refinement_l
         auxiliary = torch.where(earlier, geometry_losses, 0.).sum(1)/(count-1).clamp_min(1)
         geometry = torch.where(count > 1, .75*final+.25*auxiliary, final)
         confidence = torch.where(attempts, confidence_losses, 0.).sum(1)/count
-    flow_terms = {}
     if cfg.model_type == 'flow':
         geometry = output['flow_per_state']
-        if 'flow_geometry_points' in output:
-            # The integrated zero-start path, supervised as a regression path (flow_geometry_weight).
-            path = path_geometry_loss(output['flow_geometry_points'], target, mask, near)
-            geometry = geometry+cfg.flow_geometry_weight*path
-            flow_terms = dict(flow_per_state=output['flow_per_state'], flow_path_geometry_per_state=path)
     # Distance-only labels keep their names; identity-aware labels add the neighbor raster.
     labels, known, _ = prefix_labels(output['points'], batch, tolerance, cfg.max_recovery_distance)
     supervised, supervised_known, _, extra = proposal_labels(output['points'], batch, cfg, tolerance)
@@ -206,7 +200,7 @@ def loss_terms(output, batch, cfg, tolerance=1.5, *, n_commit=None, refinement_l
                  geometry_states_per_state=mask.any(-1),
                  geometry_count=mask.sum(), confidence_count=supervised_known.sum(),
                  error_sum=torch.where(mask, (predicted-target).norm(dim=-1), 0.).sum(),
-                 correct_count=(labels*known).sum(), **flow_terms)
+                 correct_count=(labels*known).sum())
     if 'foreign' in batch:
         terms.update(identity_correct_count=(supervised*supervised_known).sum(),
                      identity_flipped_count=(labels*known*(1-supervised)).sum(),

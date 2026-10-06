@@ -67,10 +67,6 @@ class SequenceConfig(FollowerConfig):
     def token_stride(self):
         return (8, 8, 8)
 
-    @property
-    def token_offset(self):
-        return (0., 0., 0.)  # stride-2 3x3x3 convolutions with padding 1 centre cell i on input sample 2i
-
 
 def arc_position(travelled):
     periods = 16.*2.**torch.arange(POSITION_FREQUENCIES, device=travelled.device, dtype=torch.float32)
@@ -115,7 +111,7 @@ class SequenceFollower(nn.Module):
         self.cfg, self.model_type = cfg, cfg.model_type
         h, cells = cfg.hidden, cfg.cnn_channels[-1]
         # A full-resolution block, then stages at strides 2, 4, 8.
-        self.cnn = CropCNN(cfg.cnn_channels, (1, 2, 2, 2), (1,)+(cfg.cnn_blocks,)*3, cfg.activation_checkpointing)
+        self.cnn = CropCNN(cfg.cnn_channels, (1, 2, 2, 2), (1,)+(cfg.cnn_blocks,)*3)
         self.cell_token = nn.Linear(cells, h)
         self.cell_position = nn.Sequential(nn.Linear(3, h), nn.SiLU(), nn.Linear(h, h))
         width = 2*cells+4+2*POSITION_FREQUENCIES
@@ -156,8 +152,7 @@ class SequenceFollower(nn.Module):
 
     def step_features(self, cells, points, valid):
         """(B, 2C) CNN cells pooled (mean, max) at a step's committed crop-local points (B, P, 3)."""
-        values, support = sample_features(cells.float(), points.float(), self.cfg.fine, self.cfg.token_stride,
-                                          self.cfg.token_offset)
+        values, support = sample_features(cells.float(), points.float(), self.cfg.fine, self.cfg.token_stride)
         valid = valid.bool() & support
         count = valid.sum(1, keepdim=True)
         mean = torch.where(valid[..., None], values, 0.).sum(1)/count.clamp_min(1)

@@ -23,7 +23,7 @@ import json
 import math
 from pathlib import Path
 
-from vesuvius.neural_tracing.fiber_follow.models.model import MODEL_TYPES, config_class
+from vesuvius.neural_tracing.fiber_follow.models.model import ANY, MODEL_TYPES, RETIRED_FIELDS, config_class, retire as retire_settings
 
 OUT_ROOT = Path(__file__).resolve().parents[1]/'output'
 TOP_LEVEL = dict(name=None, out_root=None, init_weights=None, init_exclude=[], reset_optimizer=False)
@@ -31,8 +31,8 @@ SECTIONS = ('dataset', 'model', 'training', 'runtime')
 
 # Training settings shared by every model type.
 TRAINING = dict(
-    steps=30000, batch=16, grad_steps=1, lr=1e-4, warmup=2000, ema_decay=.999, grad_clip=60., lr_step_offset=0, seed=0,
-    confidence_weight=.5, tolerance=2., retry_threshold=None, refinement_loss='policy', refinement_weight=1.,
+    steps=30000, batch=16, grad_steps=1, lr=1e-4, warmup=2000, ema_decay=.999, grad_clip=60., seed=0,
+    confidence_weight=.5, tolerance=2., refinement_loss='policy', refinement_weight=1.,
     flow_calibration_states=2048,
     # Operating policy: live chains, DAgger collection, monitor rollouts and proposal selection.
     n_commit=8, trace_confidence=.5, gate='full',
@@ -49,11 +49,11 @@ TRAINING = dict(
     bank_coverage_probability=.2, bank_hard_fraction=.5, bank_switch_tolerance=.75, bank_own_tolerance=1.5,
     blur_probability=.25, blur_sigma=[.5, 1.25], lateral_fraction=.1, afv_length_power=3.,
     # On-policy collection (DAgger) and replay.
-    onpolicy=[], dagger_every=1000, dagger_fibers=128, afv_dagger_fibers=384, dagger_batch=24, dagger_forward_chunk=0,
+    dagger_every=1000, dagger_fibers=128, afv_dagger_fibers=384, dagger_batch=24, dagger_forward_chunk=0,
     dagger_trace_len=6000., dagger_before=48., dagger_after=64., dagger_stride=16., replay_keep=4,
     # Logging, checkpoints and diagnostics.
-    log_every=50, ckpt_every=1000, diag_every=5000, batch_diag_every=1000, diag_max_len=400., long_diag_every=0,
-    long_diag_max_len=1200., recovery_every=1000, recovery_seeds=8, recovery_length=32.)
+    log_every=50, ckpt_every=1000, diag_every=5000, batch_diag_every=1000, diag_max_len=400., recovery_every=1000,
+    recovery_seeds=8, recovery_length=32.)
 
 # Per model type: the settings of mixed_ct_afv_unified_v1 (regression), unified_flow_v6_adalnzero (flow) and
 # sequence_v1 (sequence) where they differ from TRAINING. The sequence run's live and synthetic shares (which sequence
@@ -71,7 +71,7 @@ DEFAULTS = dict(
                                    dagger_terminal=.08, dagger_premature_stop=.03, dagger_ordinary=.05,
                                    synthetic_terminal=0.)))
 
-RUNTIME = dict(device='cuda', workers=10, worker_cache_gb=.5, threads=4, dagger_threads=4, dagger_device=None,
+RUNTIME = dict(device='cuda', workers=10, worker_cache_gb=.5, threads=4, dagger_threads=4,
                remote_prefetch_connections=48, remote_prefetch_queue_size=512, remote_prefetch_lookahead=16,
                remote_prefetch_timeout=120.)
 
@@ -80,8 +80,10 @@ DERIVED_MODEL_FIELDS = ('model_type', 'frame_checkpoint_sha256')
 
 # Removed settings, which run files written before their removal still hold: the listed value (ANY: every value) had
 # the effect of the current code, so the setting is dropped on load; any other value is refused.
-ANY = object()
-RETIRED = dict(training=dict(negative_bank_refresh_seconds=ANY, negative_bank_cache_mb=ANY))
+RETIRED = dict(model=RETIRED_FIELDS,
+               training=dict(negative_bank_refresh_seconds=ANY, negative_bank_cache_mb=ANY, retry_threshold=None,
+                             lr_step_offset=0, onpolicy=[], long_diag_every=0, long_diag_max_len=ANY),
+               runtime=dict(dagger_device=None))
 
 
 def model_fields(model_type):
@@ -105,11 +107,7 @@ def model_defaults(model_type):
 
 
 def retire(section, values):
-    for key, inert in RETIRED.get(section, {}).items():
-        if key in values and inert is not ANY and values[key] != inert:
-            raise ValueError(f'The {section} setting {key}={values[key]!r} no longer exists (only {inert!r} is supported)')
-        values.pop(key, None)
-    return values
+    return retire_settings(values, RETIRED[section], section)
 
 
 def unknown(section, given, allowed):
@@ -135,7 +133,7 @@ def resolve(document, base='.'):
     run['init_weights'] = path(run['init_weights'])
     run['dataset'] = parse_dataset_config(document['dataset'], base)[0]
 
-    model = dict(document.get('model') or {})
+    model = retire('model', dict(document.get('model') or {}))
     model_type = model.pop('type', 'regression')
     if model_type not in MODEL_TYPES:
         raise ValueError(f'Unknown model type {model_type!r} (supported: {", ".join(MODEL_TYPES)})')
@@ -155,10 +153,9 @@ def resolve(document, base='.'):
     else:
         defaults['task_shares'] = {task: float(defaults['task_shares'].get(task, 0.)) for task in TASKS}
     defaults.update(training)
-    defaults['onpolicy'] = [path(p) for p in defaults['onpolicy']]
     run['training'] = defaults
 
-    runtime = dict(document.get('runtime') or {})
+    runtime = retire('runtime', dict(document.get('runtime') or {}))
     unknown('runtime', runtime, RUNTIME)
     run['runtime'] = dict(RUNTIME, **runtime)
     validate(run)
@@ -186,12 +183,8 @@ def validate(run):
     t, r = run['training'], run['runtime']
     TaskBudget(tuple(t['task_shares'][name] for name in TASKS), terminal_fallback_cap=t['terminal_fallback_cap'],
                replay_max_age=t['replay_max_age'], replay_event_cap=t['replay_event_cap'])
-    if t['retry_threshold'] is not None and not 0 <= t['retry_threshold'] <= 1:
-        raise ValueError('retry_threshold must lie in [0, 1]')
     if t['refinement_loss'] not in ('policy', 'all'):
         raise ValueError("refinement_loss is 'policy' or 'all'")
-    if t['refinement_loss'] == 'all' and t['retry_threshold'] is not None:
-        raise ValueError("refinement_loss 'all' runs every refinement pass; drop retry_threshold")
     if not math.isfinite(t['refinement_weight']) or t['refinement_weight'] < 0:
         raise ValueError('refinement_weight must be finite and nonnegative')
     if not math.isfinite(t['grad_clip']) or t['grad_clip'] < 0:
@@ -204,11 +197,11 @@ def validate(run):
         raise ValueError('Positive counts required, including batch and grad steps')
     if t['afv_dagger_fibers'] is not None and t['afv_dagger_fibers'] < 1:
         raise ValueError('AFV collection fiber count must be positive')
-    if min(r['workers'], t['warmup'], t['diag_every'], t['batch_diag_every'], t['long_diag_every'], t['dagger_every'],
+    if min(r['workers'], t['warmup'], t['diag_every'], t['batch_diag_every'], t['dagger_every'],
            t['recovery_every'], t['confidence_weight']) < 0:
         raise ValueError('Invalid training settings')
     if not 0 <= t['ema_decay'] < 1 or min(t['lr'], t['tolerance'], r['worker_cache_gb'], t['dagger_after'],
-                                          t['diag_max_len'], t['long_diag_max_len'], t['dagger_trace_len'],
+                                          t['diag_max_len'], t['dagger_trace_len'],
                                           t['recovery_length']) <= 0:
         raise ValueError('Invalid loss, learning rate, cache, or rollout settings')
     if not math.isfinite(t['afv_length_power']) or t['afv_length_power'] < 0:

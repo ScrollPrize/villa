@@ -45,8 +45,7 @@ def save_checkpoint(path, model, ema, spec, sample, extra=None):
 
 
 def collector_settings(collector):
-    members = getattr(collector, 'collectors', [(None, collector)])
-    return {name or 'primary': member.settings() for name, member in members}
+    return {name: member.settings() for name, member in collector.collectors}
 
 
 def training_policy(cfg, n_commit, confidence=DEFAULT_CONFIDENCE, gate=DEFAULT_GATE):
@@ -133,7 +132,8 @@ REFINE_ALL = 2.  # retry threshold above any confidence: every refinement pass r
 
 def training_prediction(model, x, hist, hmask, confidence_threshold=.5, n_commit=None, targets=None, retry_threshold=None):
     """Training forward and proposal selection. Selection follows the operating ``confidence_threshold``; refinement
-    passes run while a proposal's confidence is below ``retry_threshold`` (default: the same threshold)."""
+    passes run while a proposal's confidence is below ``retry_threshold`` (default: the same threshold; REFINE_ALL:
+    every pass)."""
     actual = len(hist)
     # A single decision needs no duplicate encoder, proposal or scoring work.
     # Keep only two batch specializations: one row or the configured batch.
@@ -342,7 +342,7 @@ def clip_training_gradients(model, max_norm=GRAD_CLIP):
 def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolerance=1.5,
                      confidence_weight=.5, ema_decay=.999, ema_ramp=True, n_commit=None, compute_metrics=True,
                      grad_clip=GRAD_CLIP, diagnostic=None, live_continuation=None, ledger=None,
-                     confidence_threshold=.5, gate='prefix', retry_threshold=None, refinement_loss='policy',
+                     confidence_threshold=.5, gate='prefix', refinement_loss='policy',
                      refinement_weight=1.):
     """One equally weighted task loss per independent supervised decision."""
     prepare_training(model, getattr(model, 'training_batch_size', 2))
@@ -394,11 +394,11 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
                 ledger_batches.append(select_rows(cpu, cpu['episode_supervised'].nonzero().flatten(), len(cpu['hist'])))
             else:
                 ledger_batches.append(cpu)
-                # Proposal selection follows the operating policy, exactly as in tracing; retries follow it too unless a
-                # separate retry threshold trains refinement on more decisions (--retry-threshold).
+                # Proposal selection follows the operating policy, exactly as in tracing; so do retries, unless every
+                # refinement pass is trained (refinement_loss 'all').
                 output = training_prediction(model, batch['x'], batch['hist'], batch['hmask'], confidence_threshold,
                                              n_commit=window, targets=batch,
-                                             retry_threshold=REFINE_ALL if refinement_loss == 'all' else retry_threshold)
+                                             retry_threshold=REFINE_ALL if refinement_loss == 'all' else None)
             terms = model.training_loss(output, batch, model.cfg, tolerance, n_commit=n_commit, refinement_loss=refinement_loss,
                                         refinement_weight=refinement_weight, policy_threshold=confidence_threshold)
             geometry = terms['geometry_per_state'].sum()/denominator
@@ -438,9 +438,6 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
                 identity[key] = identity.get(key, 0.)+float((cpu['location_source'] == index).sum())
         for key, value in (('loss', loss), ('geometry', geometry), ('confidence_loss', confidence)):
             accumulate(sums, key, value)
-        if 'flow_path_geometry_per_state' in terms:  # the geometry term then holds flow + weighted path geometry
-            accumulate(sums, 'flow', terms['flow_per_state'].sum()/denominator)
-            accumulate(sums, 'flow_path_geometry', terms['flow_path_geometry_per_state'].sum()/denominator)
         for key in ('error_sum', 'geometry_count', 'correct_count', 'confidence_count',
                     'point_correct_count', 'point_wrong_count', 'point_unknown_count',
                     'confidence_labeled_states', 'confidence_terminal_states', 'confidence_recoverable_states',
@@ -587,8 +584,6 @@ def main(argv=None):
                                                          sample, spec, args.recovery_seeds)
     progress('Initializing models and optimizer')
     progress(f'Gradient clipping at global norm {args.grad_clip:g} (0 disables clipping)')
-    if args.retry_threshold is not None:
-        progress(f'Training retries below confidence {args.retry_threshold:g}; selection, live chains and collection use {args.trace_confidence:g}')
     if args.refinement_loss == 'all':
         progress(f'Refinement loss: every pass for every decision; initial proposal full weight, passes x{args.refinement_weight:g} '
                  f'of their mean; selection and the attempt metric follow confidence {args.trace_confidence:g}')
@@ -615,7 +610,7 @@ def main(argv=None):
     if done >= args.steps:
         raise ValueError('Run has already reached its requested update count')
     replay_index = out/'dagger'/'replay.json'
-    replay_paths = json.loads(replay_index.read_text()) if resume and replay_index.exists() else args.onpolicy
+    replay_paths = json.loads(replay_index.read_text()) if resume and replay_index.exists() else []
     progress('Loading replay banks and preparing data loader')
     caches = usable_replay(load_replay(replay_paths), train_f, cfg.n_history, spec.grid_scale)
     collection = dict(every=args.dagger_every, fibers_per_collection=args.dagger_fibers, batch=args.dagger_batch,
@@ -627,7 +622,7 @@ def main(argv=None):
                       confidence=policy.confidence, n_commit=policy.n_commit, gate=policy.gate,
                       collector_module='vesuvius.neural_tracing.fiber_follow.tracing.collect', threads=args.dagger_threads)
     bank_args = ('--bank-switch-tolerance', args.bank_switch_tolerance, '--bank-own-tolerance', args.bank_own_tolerance)
-    collector = OnlineCollector(out/'dagger', args.fibers, args.val_z, args.dagger_device or args.device,
+    collector = OnlineCollector(out/'dagger', args.fibers, args.val_z, args.device,
         initial=[c._dir for c in caches], **collection, extra_args=bank_args)
     progress(f'{args.batch} independent decisions per batch')
     # Paris 4 has no neighbor paths: no foreign masks, bank-covered locations or synthetic wrong continuations.
@@ -635,35 +630,32 @@ def main(argv=None):
     dataset = FollowDataset(train_f, spec, sample, chunk=args.batch, seed=args.seed+done,
         cache_bytes=int(args.worker_cache_gb*(1 << 30)), onpolicy=caches,
         replay_index=str(collector.index), batch_builder=builder, budget=budget)
-    dataset_provenance = None
-    if dataset_document:
-        from vesuvius.neural_tracing.fiber_follow.data.datasets import build_mixed_dataset
-        progress('Checking mixed-source datasets and AFV checksums')
-        dataset, dataset_provenance = build_mixed_dataset(dataset, dataset_document, cfg, sample,
-            identity_sampling, args, seed=args.seed+done, out=out, resume=resume is not None,
-            normalization=ct_normalization, budget=budget)
-        from vesuvius.neural_tracing.fiber_follow.train.online import MultiSourceCollector
-        collectors = []
-        for source, source_dataset in zip(dataset_document['sources'], dataset.datasets):
-            if source['kind'] == 'paris4':
-                collector.extra_args += ['--dataset-name',source['name']]
-                collectors.append((source['name'],collector))
-                continue
-            (out/f'validation_{source["name"]}.json').write_text(json.dumps(source_dataset.validation_manifest,indent=2)+'\n')
-            afv_collection = dict(collection, length_power=args.afv_length_power,
-                                  fibers_per_collection=args.afv_dagger_fibers or args.dagger_fibers)
-            collectors.append((source['name'],OnlineCollector(out/'dagger'/source['name'],
-                source['path'], (0,1), args.dagger_device or args.device,
-                initial=[c._dir for c in source_dataset.onpolicy], **afv_collection,
-                extra_args=('--dataset-name',source['name'],*bank_args))))
-        collector = MultiSourceCollector(collectors)
-        progress('Dataset sampling: '+', '.join(f'{name}={weight:.1%}' for name,weight in zip(dataset.names,dataset.weights))
-                 +f'; AFV training draws and AFV collection order proportional to length**{args.afv_length_power:g}')
+    from vesuvius.neural_tracing.fiber_follow.data.datasets import build_mixed_dataset
+    progress('Checking mixed-source datasets and AFV checksums')
+    dataset, dataset_provenance = build_mixed_dataset(dataset, dataset_document, cfg, sample,
+        identity_sampling, args, seed=args.seed+done, out=out, resume=resume is not None,
+        normalization=ct_normalization, budget=budget)
+    from vesuvius.neural_tracing.fiber_follow.train.online import MultiSourceCollector
+    collectors = []
+    for source, source_dataset in zip(dataset_document['sources'], dataset.datasets):
+        if source['kind'] == 'paris4':
+            collector.extra_args += ['--dataset-name',source['name']]
+            collectors.append((source['name'],collector))
+            continue
+        (out/f'validation_{source["name"]}.json').write_text(json.dumps(source_dataset.validation_manifest,indent=2)+'\n')
+        afv_collection = dict(collection, length_power=args.afv_length_power,
+                              fibers_per_collection=args.afv_dagger_fibers or args.dagger_fibers)
+        collectors.append((source['name'],OnlineCollector(out/'dagger'/source['name'],
+            source['path'], (0,1), args.device,
+            initial=[c._dir for c in source_dataset.onpolicy], **afv_collection,
+            extra_args=('--dataset-name',source['name'],*bank_args))))
+    collector = MultiSourceCollector(collectors)
+    progress('Dataset sampling: '+', '.join(f'{name}={weight:.1%}' for name,weight in zip(dataset.names,dataset.weights))
+             +f'; AFV training draws and AFV collection order proportional to length**{args.afv_length_power:g}')
     progress('Task budget per source: '+', '.join(f'{k} {v:.0%}' for k, v in budget.to_dict()['shares'].items())
              +f'; replay age ceiling {budget.replay_max_age}, event cap {budget.replay_event_cap}, '
              f'synthetic terminal fallback cap {budget.terminal_fallback_cap:.0%}')
-    sources = getattr(dataset, 'datasets', [dataset])
-    for source_dataset in sources:
+    for source_dataset in dataset.datasets:
         source_dataset.set_step(done)
         if cfg.model_type == 'sequence':
             from vesuvius.neural_tracing.fiber_follow.data.data import EpisodeSpec
@@ -700,11 +692,10 @@ def main(argv=None):
             parameter_count=sum(p.numel() for p in model.parameters())), indent=2))
     log = RunLog(out/'log.jsonl', formatter=format_training_log)
     log.record(dict(step=done, event='ct_normalization', calibration=ct_normalization))
-    if dataset_document:
-        log.record(dict(step=done, event='dataset_configuration', datasets=dataset_provenance,
-                        names=dataset.names, probabilities=dataset.weights.tolist(),
-                        dataset_config_sha256=dataset_digest, input_mode='ct',
-                        evaluation_scope='Source-specific held-out fibers; Paris 4 recovery fixture'))
+    log.record(dict(step=done, event='dataset_configuration', datasets=dataset_provenance,
+                    names=dataset.names, probabilities=dataset.weights.tolist(),
+                    dataset_config_sha256=dataset_digest, input_mode='ct',
+                    evaluation_scope='Source-specific held-out fibers; Paris 4 recovery fixture'))
     if resume:
         log.record(dict(step=done, event='resume_configuration', checkpoint=str(args.resume),
                         run_config=run, model_cfg=cfg.to_dict()))
@@ -736,7 +727,7 @@ def main(argv=None):
     try:
         if args.remote_prefetch_connections:
             from vesuvius.neural_tracing.fiber_follow.data.remote_prefetch import attach_remote_prefetch
-            remote_prefetch, remote_sources = attach_remote_prefetch(getattr(dataset,'datasets',[dataset]),
+            remote_prefetch, remote_sources = attach_remote_prefetch(dataset.datasets,
                 args.remote_prefetch_connections, args.remote_prefetch_queue_size, args.remote_prefetch_timeout,
                 args.remote_prefetch_lookahead, args.workers)
             if remote_prefetch is not None:
@@ -747,7 +738,7 @@ def main(argv=None):
                 enabled=remote_prefetch is not None,connections=args.remote_prefetch_connections,
                 queue_size=args.remote_prefetch_queue_size,lookahead=args.remote_prefetch_lookahead,
                 timeout=args.remote_prefetch_timeout,sources=len(remote_sources)))
-        if args.diag_every or args.long_diag_every:
+        if args.diag_every:
             from vesuvius.neural_tracing.fiber_follow.tracing.trace import TraceParams
             tracer = FiberTracer(ema, FiberVolume(spec), cfg.fine, cfg.n_history,
                 TraceParams.from_policy(policy, max_len=args.diag_max_len), device=args.device)
@@ -759,7 +750,7 @@ def main(argv=None):
         prior_samples = int(resume.get('samples_seen', 0)) if resume else 0
         ledger = SamplingLedger()
         for step in range(done+1, args.steps+1):
-            for source_dataset in sources:
+            for source_dataset in dataset.datasets:
                 source_dataset.set_step(step)
             event = collector.poll(step)
             if event:
@@ -773,13 +764,13 @@ def main(argv=None):
             update_started = time.monotonic()
             if early:
                 progress(f'Update {step}: data ready in {data_seconds:.1f}s; running forward/backward and optimizer')
-            lr = lr_at(step-lr_restart_step, args.lr, args.warmup, args.steps-lr_restart_step, args.lr_step_offset)
+            lr = lr_at(step-lr_restart_step, args.lr, args.warmup, args.steps-lr_restart_step)
             diagnostic = {} if tracer is not None and args.diag_every and step % args.diag_every == 0 else None
             metrics = optimizer_update(model, ema, opt, batches, step, lr, device=args.device,
                 tolerance=args.tolerance, confidence_weight=args.confidence_weight, ema_decay=args.ema_decay,
                 ema_ramp=not initialization,
                 n_commit=args.n_commit, compute_metrics=step % args.log_every == 0 or step == args.steps,
-                grad_clip=args.grad_clip, confidence_threshold=policy.confidence, gate=policy.gate, retry_threshold=args.retry_threshold,
+                grad_clip=args.grad_clip, confidence_threshold=policy.confidence, gate=policy.gate,
                 refinement_loss=args.refinement_loss, refinement_weight=args.refinement_weight,
                 diagnostic=diagnostic, live_continuation=live_continuation, ledger=ledger)
             observed_states += metrics['observed_states']
@@ -841,9 +832,8 @@ def main(argv=None):
                                          or (resume is not None and step == done+1)):
                 from vesuvius.neural_tracing.fiber_follow.evaluation.batch_diagnostic import render_microbatch
                 began = time.monotonic()
-                names = dataset.names if dataset_document else [primary_source.get('name', 'paris4')]
                 report = render_microbatch(ema, batches[-1], out, step, device=args.device,
-                    n_commit=args.n_commit, tolerance=args.tolerance, dataset_names=names,
+                    n_commit=args.n_commit, tolerance=args.tolerance, dataset_names=dataset.names,
                     training_metrics=dict(metrics, lr=lr, data_seconds=data_seconds,
                         update_seconds=update_seconds,
                         cuda_peak_allocated_gib=torch.cuda.max_memory_allocated(args.device)/2**30
@@ -853,49 +843,25 @@ def main(argv=None):
             if tracer is not None and args.diag_every and step % args.diag_every == 0:
                 began = time.monotonic()
                 training_diagnostics(ema, diagnostic['cpu_batch'], tracer, val_f, manifest['monitor'], out, step, log,
-                                     device=args.device,dataset_name=next((s['name'] for s in dataset_document['sources']
-                                         if s['kind']=='paris4'),None) if dataset_document else None)
-                if dataset_document:
-                    from vesuvius.neural_tracing.fiber_follow.evaluation.seeds import evaluate
-                    from vesuvius.neural_tracing.fiber_follow.shared.experiment import rollout_summary
-                    from vesuvius.neural_tracing.fiber_follow.tracing.trace import TraceParams
-                    for source, source_dataset in zip(dataset_document['sources'],dataset.datasets):
-                        if source['kind'] != 'afv':
-                            continue
-                        source_tracer = FiberTracer(ema,FiberVolume(source_dataset.vol_spec),cfg.fine,cfg.n_history,
-                            TraceParams.from_policy(policy,max_len=args.diag_max_len),device=args.device)
-                        try:
-                            rows,_ = evaluate(source_tracer,source_dataset.validation_fibers,
-                                source_dataset.validation_manifest['monitor'],batch=1,coverage_max_len=args.diag_max_len)
-                            log.record(dict(step=step,split='monitor',dataset=source['name'],
-                                threshold=.5,coverage_max_len=args.diag_max_len,**rollout_summary(rows)))
-                        finally:
-                            source_tracer.close()
-                    from vesuvius.neural_tracing.fiber_follow.evaluation.diag import plot_curves
-                    plot_curves(out/'log.jsonl',out/'curves.png',loss_key='flow' if model.cfg.model_type == 'flow' else 'geometry')
-                periodic['diagnostics_seconds'] = time.monotonic()-began
-            if tracer is not None and args.long_diag_every and step % args.long_diag_every == 0:
+                                     device=args.device,dataset_name=primary_source['name'])
                 from vesuvius.neural_tracing.fiber_follow.evaluation.seeds import evaluate
                 from vesuvius.neural_tracing.fiber_follow.shared.experiment import rollout_summary
-                from vesuvius.neural_tracing.fiber_follow.evaluation.diag import plot_rollouts
-                began = time.monotonic()
-                original_length, original_threshold = tracer.p.max_len, tracer.p.confidence
-                tracer.p.max_len, tracer.p.confidence = args.long_diag_max_len, .5
-                traces = []
-                try:
-                    rows, _ = evaluate(tracer, val_f, manifest['monitor'], batch=1,
-                        coverage_max_len=args.long_diag_max_len,
-                        on_trace=lambda seed, path, reason: traces.append((path, reason)))
-                    log.record(dict(step=step, split='monitor_long', threshold=.5,
-                                    coverage_max_len=args.long_diag_max_len, **rollout_summary(rows)))
-                    if traces:
-                        paths, reasons = zip(*traces)
-                        (out/'images').mkdir(exist_ok=True)
-                        plot_rollouts(tracer.vol, val_f, manifest['monitor'], paths, reasons,
-                            out/'images'/f'rollout_long_{step:06d}_c0.5.png', args.long_diag_max_len, rows=rows)
-                finally:
-                    tracer.p.max_len, tracer.p.confidence = original_length, original_threshold
-                periodic['long_diagnostics_seconds'] = time.monotonic()-began
+                from vesuvius.neural_tracing.fiber_follow.tracing.trace import TraceParams
+                for source, source_dataset in zip(dataset_document['sources'],dataset.datasets):
+                    if source['kind'] != 'afv':
+                        continue
+                    source_tracer = FiberTracer(ema,FiberVolume(source_dataset.vol_spec),cfg.fine,cfg.n_history,
+                        TraceParams.from_policy(policy,max_len=args.diag_max_len),device=args.device)
+                    try:
+                        rows,_ = evaluate(source_tracer,source_dataset.validation_fibers,
+                            source_dataset.validation_manifest['monitor'],batch=1,coverage_max_len=args.diag_max_len)
+                        log.record(dict(step=step,split='monitor',dataset=source['name'],
+                            threshold=.5,coverage_max_len=args.diag_max_len,**rollout_summary(rows)))
+                    finally:
+                        source_tracer.close()
+                from vesuvius.neural_tracing.fiber_follow.evaluation.diag import plot_curves
+                plot_curves(out/'log.jsonl',out/'curves.png',loss_key='flow' if model.cfg.model_type == 'flow' else 'geometry')
+                periodic['diagnostics_seconds'] = time.monotonic()-began
             if recovery_states is not None and step % args.recovery_every == 0:
                 began = time.monotonic()
                 report = evaluate_monitor(ema, recovery_vol, recovery_states, val_f, sample, device=args.device,

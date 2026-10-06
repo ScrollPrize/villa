@@ -191,8 +191,6 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer):
     ap.add_argument("--sampling-seed", type=int, default=0, help="Reproducible per-trace sampling noise")
     ap.add_argument("--flow-samples", type=int, help="flow: Gaussian-start proposals per decision (default: checkpoint)")
     ap.add_argument("--flow-sample-scale", type=float, help="flow: their standard deviation in residual-scale units")
-    ap.add_argument("--flow-selection", choices=('retry', 'best'),
-                    help="flow: 'retry' (samples only when the zero start is rejected) or 'best' (one ranking over all)")
     ap.add_argument("--precision", choices=('bf16', 'fp32'), default='bf16',
                     help="model arithmetic; fp32 (TF32 off) makes traces independent of batch composition")
     args = ap.parse_args(argv)
@@ -201,7 +199,7 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer):
     if args.frame_checkpoint:
         from vesuvius.neural_tracing.fiber_follow.tracing.crop_frames import bind_frame_checkpoint
         bind_frame_checkpoint(model.cfg, args.frame_checkpoint)
-    for key in ('flow_samples', 'flow_sample_scale', 'flow_selection'):
+    for key in ('flow_samples', 'flow_sample_scale'):
         if getattr(args, key) is not None:
             if model.cfg.model_type != 'flow':
                 raise ValueError(f'--{key.replace("_", "-")} needs a flow checkpoint')
