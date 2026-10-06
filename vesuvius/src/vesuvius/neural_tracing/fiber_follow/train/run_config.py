@@ -46,6 +46,7 @@ TRAINING = dict(
     # Simulated traces and labels.
     startup_shares=[.15, .17, .17, .51], excursion_probability=.2, excursion_amplitude=[3., 6.],
     excursion_rise=[16., 128.], synthetic_tail=[4., 16.], live_continuation_steps=[32, 256],
+    seed_offset=[0., 0.], seed_offset_ramp=16., live_seed_start=.5,
     # Neighbour banks, augmentation and AFV sampling.
     bank_coverage_probability=.2, bank_hard_fraction=.5, bank_switch_tolerance=.75, bank_own_tolerance=1.5,
     blur_probability=.25, blur_sigma=[.5, 1.25], lateral_fraction=.1, afv_length_power=3.,

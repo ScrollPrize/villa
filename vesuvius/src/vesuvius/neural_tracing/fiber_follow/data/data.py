@@ -189,6 +189,12 @@ class SampleConfig:
     excursion_probability: float = .2
     excursion_amplitude: tuple = (3., 6.)
     excursion_rise: tuple = (16., 128.)
+    # A seed clicked a little off the centerline (``seed_offsets``): lateral offset magnitude range at the seed,
+    # voxels, fading out over ``seed_offset_ramp`` voxels of trace. (0, 0) keeps seeds on the annotation.
+    seed_offset: tuple = (0., 0.)
+    seed_offset_ramp: float = 16.
+    # Share of live-continuation chains that start at a fresh seed (the rest from replayed DAgger prefixes).
+    live_seed_start: float = .5
     label_tolerance: float = 1.5  # confidence-label tolerance; separate from the departure threshold
     max_recovery_distance: float = 6.0
     dense_substeps: int = 4
@@ -199,11 +205,13 @@ class SampleConfig:
                 or abs(shares.sum()-1) > 1e-6:
             raise ValueError('Startup shares need four nonnegative values summing to one')
         self.startup_shares = tuple(float(v) for v in shares)
-        for name in ('excursion_amplitude', 'excursion_rise', 'trace_noise_sigma'):
+        for name in ('excursion_amplitude', 'excursion_rise', 'trace_noise_sigma', 'seed_offset'):
             lo, hi = getattr(self, name)
             if not (np.isfinite(lo) and np.isfinite(hi) and 0 <= lo <= hi):
                 raise ValueError(f'{name} must be an ordered nonnegative range')
             setattr(self, name, (float(lo), float(hi)))
+        if not (self.seed_offset_ramp > 0 and 0 <= self.live_seed_start <= 1):
+            raise ValueError('Seed offset ramp must be positive and the live seed-start share in [0, 1]')
         if not 0 <= self.excursion_probability <= 1 or self.excursion_rise[0] <= 0:
             raise ValueError('Excursion probability must lie in [0, 1] with positive rise lengths')
         if not (self.trace_noise_length > 0 and min(self.trace_noise_bulge, self.trace_noise_bias,
@@ -386,6 +394,20 @@ def excursion_offsets(arcs, p, s, cfg: SampleConfig, rng):
                                             excursion_phase=head/rise, excursion_head_offset=float(profile[-1]))
 
 
+def seed_offsets(arcs, p, s, cfg: SampleConfig, rng):
+    """Lateral offsets of a trace whose seed was placed slightly off the centerline: a random direction normal to the
+    fiber at the seed, magnitude uniform in ``cfg.seed_offset``, fading linearly to zero over ``cfg.seed_offset_ramp``
+    voxels of trace (the tracer's first commits return to the fiber). No draws when disabled."""
+    lo, hi = cfg.seed_offset
+    if hi <= 0:
+        return np.zeros((len(arcs), 3))
+    tangent = tangent_at(p, s, arcs[0])
+    normal = np.cross(tangent, rng.normal(size=3))
+    normal /= max(np.linalg.norm(normal), 1e-9)
+    weight = np.clip(1-(arcs-arcs[0])/cfg.seed_offset_ramp, 0., 1.)
+    return weight[:, None]*normal*float(rng.uniform(lo, hi))
+
+
 def simulated_trace(p, s, t, cfg: SampleConfig, rng: np.random.Generator, *, startup=None, excursion=None):
     """The observed path of a simulated trace whose head is at traversal arclength ``t`` of curve (p, s).
 
@@ -402,7 +424,7 @@ def simulated_trace(p, s, t, cfg: SampleConfig, rng: np.random.Generator, *, sta
     if established and (excursion if excursion is not None else rng.random() < cfg.excursion_probability):
         offsets, details = excursion_offsets(arcs, p, s, cfg, rng)
         path = path+offsets
-    return path, arcs, category, sigma, details
+    return path+seed_offsets(arcs, p, s, cfg, rng), arcs, category, sigma, details
 
 
 def make_sample(fiber: TracedFiber, t: float, reverse: bool, cfg: SampleConfig, rng: np.random.Generator,
@@ -488,6 +510,7 @@ def episode_decisions(fiber, t0, reverse, steps, commit, cfg: SampleConfig, rng:
             and rng.random() < cfg.excursion_probability):
         offsets, details = excursion_offsets(arcs, p, s, cfg, rng)
         path = path+offsets
+    path = path+seed_offsets(arcs, p, s, cfg, rng)
     out = []
     for j in range(steps):
         i = int(round(prefix/step))+j*per_commit
@@ -973,9 +996,10 @@ class FollowDataset(torch.utils.data.IterableDataset):
         return items
 
     def live_start(self, rng, windows):
-        """Chain starts: half recorded valid pre-excursion/recoverable prefixes, half seed-only."""
+        """Chain starts: seed-only (share ``cfg.live_seed_start``), else a recorded valid pre-excursion/recoverable
+        prefix."""
         from vesuvius.neural_tracing.fiber_follow.data.state_labels import FOLLOWING, RECOVERABLE
-        if rng.random() < .5:
+        if rng.random() >= self.cfg.live_seed_start:
             for name in ('pre_excursion', 'recoverable') if rng.random() < .5 else ('recoverable', 'pre_excursion'):
                 item = self.replay_draw(name, rng)
                 if item is not None and item['geometry_valid'] and item['supervision'] in (FOLLOWING, RECOVERABLE):

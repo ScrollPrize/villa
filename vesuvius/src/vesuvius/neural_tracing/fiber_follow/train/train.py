@@ -570,6 +570,8 @@ def main(argv=None):
                           future_step=cfg.future_step, recent_history_points=cfg.n_history,
                           startup_shares=tuple(args.startup_shares), excursion_probability=args.excursion_probability,
                           excursion_amplitude=tuple(args.excursion_amplitude), excursion_rise=tuple(args.excursion_rise),
+                          seed_offset=tuple(args.seed_offset), seed_offset_ramp=args.seed_offset_ramp,
+                          live_seed_start=args.live_seed_start,
                           label_tolerance=args.tolerance, max_recovery_distance=cfg.max_recovery_distance)
     policy = training_policy(cfg, args.n_commit, args.trace_confidence, args.gate)
     progress('Loading manifest and fiber annotations')
@@ -729,7 +731,9 @@ def main(argv=None):
                               trace_noise_bias=sample.trace_noise_bias, trace_noise_smoothing=sample.trace_noise_smoothing,
                               excursion_rise_distribution='log-uniform',
                               startup_shares=sample.startup_shares, excursion_probability=sample.excursion_probability,
-                              excursion_amplitude=sample.excursion_amplitude, excursion_rise=sample.excursion_rise),
+                              excursion_amplitude=sample.excursion_amplitude, excursion_rise=sample.excursion_rise,
+                              seed_offset=sample.seed_offset, seed_offset_ramp=sample.seed_offset_ramp,
+                              live_seed_start=sample.live_seed_start),
         label_contract=dict(tolerance=sample.label_tolerance, max_recovery_distance=sample.max_recovery_distance),
         live_continuation_steps=args.live_continuation_steps,
         frame_policy=configured_frame_policy(cfg), sampling=asdict(identity_sampling)))

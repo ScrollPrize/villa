@@ -51,3 +51,23 @@ def test_simulated_trace_is_the_tracer_state_of_its_observed_path():
         # Labels remain the GT continuation, now from the offset head.
         future = interp_at(p, s, np.clip(t+cfg.future_s, 0, s[-1]))
         np.testing.assert_allclose(item['fut_local'] @ item['frame'].T+item['pos'], future, atol=1e-9)
+
+
+def test_seed_offset_starts_off_the_centerline_and_fades_into_the_same_trace():
+    f = curved_fiber()
+    on, off = sample_config(excursion_probability=0.), sample_config(excursion_probability=0., seed_offset=(.5, 1.5))
+    for t, startup, seed in ((t, c, k) for t in (0., 30.) for c in (0, 1, 2, 3) for k in range(6)):
+        p, s = D.traversal_curve(f, False)
+        base = D.make_sample(f, t, False, on, np.random.default_rng(seed), startup=startup)
+        moved = D.make_sample(f, t, False, off, np.random.default_rng(seed), startup=startup)
+        path, shift = moved['observed_path'], moved['observed_path']-base['observed_path']
+        arcs = t-np.arange(len(path)-1, -1, -1)*on.history_step
+        # The seed lies .5-1.5 voxels off the annotation, normal to the fiber; the offset fades over 16 voxels and
+        # leaves every other draw of the trace unchanged.
+        assert .5-1e-9 <= np.linalg.norm(shift[0]) <= 1.5+1e-9
+        assert abs(shift[0] @ lateral_tangents(p, s, arcs[:1])[0]) < .05*np.linalg.norm(shift[0])
+        np.testing.assert_allclose(shift, shift[0]*np.clip(1-(arcs-arcs[0])/16., 0, 1)[:, None], atol=1e-12)
+        np.testing.assert_array_equal(moved['seed_pos'], path[0])
+        # Labels are still the GT continuation from the (possibly offset) head.
+        future = interp_at(p, s, np.clip(t+on.future_s, 0, s[-1]))
+        np.testing.assert_allclose(moved['fut_local'] @ moved['frame'].T+moved['pos'], future, atol=1e-9)
