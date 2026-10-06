@@ -141,7 +141,7 @@ The fiber tracer lives in `tracers/fibers/`; the parts other tracers can reuse s
 
 | Package | Responsibility |
 | --- | --- |
-| `tracers/models` | The follower contract (`model.py`), the crop transformer (`regression`, `flow`), flow matching, the sequence model, the supervised-path contract (`targets.py`) |
+| `tracers/models` | The follower contract (`follower.py`), the model registry (`model.py`), checkpoints (`checkpoint.py`), the crop transformer (`regression`, `flow`), flow matching, the sequence model, the supervised-path contract (`targets.py`) |
 | `tracers/shared` | Geometry, reference handling, the commit policy, recorded-path relocation, retired settings, JSON output |
 | `tracers/shared/crop_sampling` | CT crop loading: volumes (local and remote chunked readers, chunk-store decoding), intensity normalization, oriented crop sampling, remote prefetch |
 | `train` | Entry point and run configuration, objectives, checkpoints, logging, online collection, live continuation |

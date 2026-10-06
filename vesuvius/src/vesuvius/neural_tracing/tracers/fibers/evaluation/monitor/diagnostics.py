@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 from vesuvius.neural_tracing.tracers.shared.policy import DIAGNOSTIC_THRESHOLDS, commit_prefix, recovery_allowed
 from vesuvius.neural_tracing.tracers.fibers.data.labels import prefix_labels
-from vesuvius.neural_tracing.tracers.models.model import select_refinement
+from vesuvius.neural_tracing.tracers.models.follower import select_refinement
 from vesuvius.neural_tracing.tracers.fibers.data.state_labels import DISPLACEMENT_STRATA, SUPERVISION, TERMINAL, displacement_stratum
 from vesuvius.neural_tracing.tracers.fibers.train.supervision import commit_window, dense_commit_mask
 from vesuvius.neural_tracing.tracers.models.targets import geometry_mask

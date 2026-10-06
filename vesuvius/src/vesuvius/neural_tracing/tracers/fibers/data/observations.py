@@ -15,7 +15,7 @@ from vesuvius.neural_tracing.tracers.shared.reference import observed_seed
 from vesuvius.neural_tracing.tracers.fibers.data.state_labels import DEPARTURE_DISTANCE, supervise
 from vesuvius.neural_tracing.tracers.fibers.frames.ct import heading_free_bounds, reframe_item, FRAME_POLICIES
 from vesuvius.neural_tracing.tracers.fibers.frames.learned import frame_predictor, orient_items, crop_frame_bounds
-from vesuvius.neural_tracing.tracers.models.model import FollowerConfig
+from vesuvius.neural_tracing.tracers.models.follower import FollowerConfig
 
 
 def image_crop(items, vol, crop, pool=None):

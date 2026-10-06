@@ -24,9 +24,7 @@ from torch import nn
 import torch.nn.functional as F
 
 from vesuvius.neural_tracing.tracers.models.blocks import CropCNN, TransformerLayer
-from vesuvius.neural_tracing.tracers.models.model import (
-    FollowerConfig, path_readout, plane_coordinates, proposal_output, read_path, sample_features, select_refinement,
-    token_coordinates)
+from vesuvius.neural_tracing.tracers.models.follower import FollowerConfig, path_readout, plane_coordinates, proposal_output, read_path, sample_features, select_refinement, token_coordinates
 from vesuvius.neural_tracing.tracers.shared.geometry import CropSpec
 from vesuvius.neural_tracing.tracers.shared.policy import DEFAULT_CONFIDENCE
 

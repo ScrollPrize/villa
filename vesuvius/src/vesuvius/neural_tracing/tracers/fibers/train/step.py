@@ -1,6 +1,5 @@
-"""One training update: the compiled training forward, proposal selection, loss accumulation over microbatches, gradient clipping and the guarded AdamW step."""
-from __future__ import annotations
-
+"""One training update: the compiled training forward, proposal selection, loss accumulation over microbatches,
+gradient clipping and the guarded AdamW step."""
 import math
 
 import torch

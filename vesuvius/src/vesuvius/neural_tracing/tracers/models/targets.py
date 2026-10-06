@@ -4,7 +4,7 @@ import math
 import torch
 import torch.nn.functional as F
 
-from vesuvius.neural_tracing.tracers.models.model import feature_grid
+from vesuvius.neural_tracing.tracers.models.follower import feature_grid
 
 
 CONNECTOR_SPACING = .25  # same dense spatial resolution as the supervised path

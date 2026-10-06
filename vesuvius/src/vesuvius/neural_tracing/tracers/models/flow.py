@@ -4,7 +4,7 @@ import math
 
 import torch
 
-from .model import select_refinement
+from .follower import select_refinement
 from .survival_confidence import survival_predictions
 from .targets import geometry_mask
 
