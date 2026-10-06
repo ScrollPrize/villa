@@ -16,6 +16,8 @@ from vesuvius.neural_tracing.tracers.fibers.data.replay import EVENT_TABLE_SIZE,
 from vesuvius.neural_tracing.tracers.fibers.data.samples import STARTUP_CATEGORIES, make_sample
 from vesuvius.neural_tracing.tracers.fibers.data.targets import label_state, resolve_trace_seed
 from vesuvius.neural_tracing.tracers.fibers.data.tasks import FALLBACKS, SOURCE, TASK, TASKS, TaskBudget, stable_key
+from vesuvius.neural_tracing.tracers.fibers.data.state_labels import RECOVERABLE, FOLLOWING
+from vesuvius.neural_tracing.tracers.fibers.frames.ct import FRAME_POLICY, frame_prefetch_bounds, SeedHeadingError
 
 
 MAX_CT_FRAME_REJECTIONS = 64
@@ -147,7 +149,6 @@ class FollowDataset(torch.utils.data.IterableDataset):
 
     def recovery_item(self, rng, windows):
         """Fresh substitute for missing recoverable replay: a displaced excursion head."""
-        from vesuvius.neural_tracing.tracers.fibers.data.state_labels import RECOVERABLE
         for _ in range(8):
             item = self.fresh_item(rng, windows, startup=STARTUP_CATEGORIES.index('established'), excursion=True)
             if item['supervision'] == RECOVERABLE:
@@ -183,7 +184,6 @@ class FollowDataset(torch.utils.data.IterableDataset):
         return None
 
     def replay_item(self, op, j, rng):
-        from vesuvius.neural_tracing.tracers.fibers.frames.ct import FRAME_POLICY
         fi, t, reverse = int(op.fiber_idx[j]), float(op.t[j]), bool(op.reverse[j])
         item = label_state(self.fibers[fi], op.pos[j], op.frame[j], op.hist[j], op.hmask[j], self.cfg,
                            t=t, reverse=reverse, trace=replay_facts(op, j, self.cfg))
@@ -280,7 +280,6 @@ class FollowDataset(torch.utils.data.IterableDataset):
 
     def live_start(self, rng, windows):
         """Chain starts: half recorded valid pre-excursion/recoverable prefixes, half seed-only."""
-        from vesuvius.neural_tracing.tracers.fibers.data.state_labels import FOLLOWING, RECOVERABLE
         if rng.random() < .5:
             for name in ('pre_excursion', 'recoverable') if rng.random() < .5 else ('recoverable', 'pre_excursion'):
                 item = self.replay_draw(name, rng)
@@ -324,7 +323,6 @@ class FollowDataset(torch.utils.data.IterableDataset):
     def prefetch_bounds(self, items, vol):
         if hasattr(self.batch_builder, 'prefetch_bounds'):
             return [bound for item in items for bound in self.batch_builder.prefetch_bounds(item,vol)]
-        from vesuvius.neural_tracing.tracers.fibers.frames.ct import frame_prefetch_bounds
         return [bound for item in items for bound in frame_prefetch_bounds(item,self.cfg.crop,vol.input_scale)]
 
     def prefetch_items(self, items, vol, *, required=False):
@@ -342,7 +340,6 @@ class FollowDataset(torch.utils.data.IterableDataset):
 
     def resolve_seeds(self, items, vol, rng, windows):
         """CT seed headings; a seed without CT orientation is rejected and its task redrawn."""
-        from vesuvius.neural_tracing.tracers.fibers.frames.ct import SeedHeadingError
         rejected = 0
         if self.episodes is not None:
             # A rejected seed redraws its whole episode: every decision of a trace shares the seed.
@@ -380,7 +377,6 @@ class FollowDataset(torch.utils.data.IterableDataset):
         return rejected
 
     def __iter__(self):
-        from vesuvius.neural_tracing.tracers.fibers.frames.ct import SeedHeadingError
         torch.set_num_threads(1)
         if self.remote_prefetch is not None:
             self.remote_prefetch.ensure_metadata(self.vol_spec)

@@ -10,8 +10,8 @@ import sqlite3
 import numpy as np
 
 from vesuvius.neural_tracing.tracers.fibers.data.annotation_repair import ANNOTATION_REPAIR, repair_kinks
-from vesuvius.neural_tracing.tracers.fibers.data.fibers import TracedFiber
-from vesuvius.neural_tracing.tracers.shared.geometry import arclength, interp_at
+from vesuvius.neural_tracing.tracers.fibers.data.fibers import TracedFiber, heldout_ids
+from vesuvius.neural_tracing.tracers.shared.geometry import arclength, interp_at, dense_line
 
 
 def file_sha256(path):
@@ -54,7 +54,6 @@ class AFVFibers(Sequence):
         if len(self.catalog) != self.metadata['fiber_count']:
             raise ValueError('AFV fiber count mismatch')
         if validation is not None:
-            from vesuvius.neural_tracing.tracers.fibers.data.fibers import heldout_ids
             heldout = heldout_ids([r[0] for r in self.catalog],validation)
             if split != 'all':
                 self.catalog = [r for r in self.catalog if ((r[0] in heldout) == (split == 'validation'))]
@@ -112,7 +111,6 @@ class AFVFibers(Sequence):
                 next_segment += len(xyz)-1
             points = np.concatenate(pieces)/self.grid_scale
             # Preserve corners while bounding nearest-vertex clearance error.
-            from vesuvius.neural_tracing.tracers.shared.geometry import dense_line
             points = dense_line(points, 1.)
             points, repairs = repair_kinks(points, arclength(points))
             self._cache[index] = TracedFiber(name, points, arclength(points), family,

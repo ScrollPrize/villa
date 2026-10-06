@@ -8,6 +8,7 @@ import torch
 
 from vesuvius.neural_tracing.tracers.shared.geometry import interp_at, traversal_curve
 from vesuvius.neural_tracing.tracers.fibers.data.samples import STARTUP_CATEGORIES, SampleConfig, decision_on_path, excursion_offsets, trace_noise, trace_prefix_length
+from vesuvius.neural_tracing.tracers.fibers.data.state_labels import DEPARTURE_DISTANCE
 
 
 @dataclass(frozen=True)
@@ -67,7 +68,6 @@ def loader_chunk(cfg, batch):
 def mark_episode_identity(items):
     """Episode steps in step order: a step whose episode has an earlier step on the original fiber reads that fiber
     through its history tokens, so its identity is observable (observations.identity_evidence)."""
-    from vesuvius.neural_tracing.tracers.fibers.data.state_labels import DEPARTURE_DISTANCE
     seen = False
     for item in items:
         item['history_identity_evidence'] = seen

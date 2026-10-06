@@ -8,6 +8,7 @@ import numpy as np
 
 from vesuvius.neural_tracing.tracers.fibers.data.fibers import fiber_manifest
 from vesuvius.neural_tracing.tracers.fibers.data.tasks import TRAVEL_STRATA, stable_key
+from vesuvius.neural_tracing.tracers.fibers.data.state_labels import DEPARTURE_PATIENCE, facts, REPLAY_CLASS, REPLAY_CLASSES
 
 
 EVENT_TABLE_SIZE = 1 << 18
@@ -22,7 +23,6 @@ class ReplayIndex:
     shared reuse counter.
     """
     def __init__(self, caches):
-        from vesuvius.neural_tracing.tracers.fibers.data.state_labels import REPLAY_CLASS, REPLAY_CLASSES
         self.caches = list(caches)
         self.groups = {name: {} for name in REPLAY_CLASSES}
         self.ordinary = [dict() for _ in range(len(TRAVEL_STRATA)-1)]
@@ -75,7 +75,6 @@ class ReplayIndex:
 
 def replay_facts(op, j, cfg):
     """Stored trace facts of one replay row, relabeled under this run's label contract."""
-    from vesuvius.neural_tracing.tracers.fibers.data.state_labels import DEPARTURE_PATIENCE, facts
     return facts(match_distance=float(op.match_distance[j]), window_distance=float(op.window_distance[j]),
                  match_valid=bool(op.match_valid[j]), match_ambiguous=bool(op.match_ambiguous[j]),
                  switched=bool(op.switched[j]), beyond_end=bool(op.beyond_end[j]),

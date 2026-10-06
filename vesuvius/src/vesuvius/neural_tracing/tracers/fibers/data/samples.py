@@ -11,6 +11,8 @@ from vesuvius.neural_tracing.tracers.shared.policy import DEFAULT_MAX_RECOVERY_D
 from vesuvius.neural_tracing.tracers.shared.reference import trace_history
 from vesuvius.neural_tracing.tracers.fibers.data.fibers import TracedFiber
 from vesuvius.neural_tracing.tracers.fibers.data.targets import continuation_targets
+from vesuvius.neural_tracing.tracers.fibers.frames.ct import linear12_heading, trace_heading
+from vesuvius.neural_tracing.tracers.fibers.data.state_labels import constructed_facts, supervise
 
 
 @dataclass
@@ -217,8 +219,6 @@ def make_sample(fiber: TracedFiber, t: float, reverse: bool, cfg: SampleConfig, 
 def decision_on_path(fiber, t, reverse, cfg, path, arcs, category, sigma, details):
     """The tracer decision whose head ends an observed path (``path``, sampled at traversal arclengths ``arcs``
     ending at ``t``): crop heading, history, seed reference and labels exactly as ``make_sample`` builds them."""
-    from vesuvius.neural_tracing.tracers.fibers.frames.ct import linear12_heading, trace_heading
-    from vesuvius.neural_tracing.tracers.fibers.data.state_labels import constructed_facts, supervise
     p, s = traversal_curve(fiber, reverse)
     pos = path[-1]
     # Only the CT seed axis's sign comes from the direction of travel.

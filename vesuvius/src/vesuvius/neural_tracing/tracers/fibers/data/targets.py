@@ -5,6 +5,8 @@ import numpy as np
 import torch
 
 from vesuvius.neural_tracing.tracers.shared.geometry import frame_from_heading, interp_at, traversal_curve
+from vesuvius.neural_tracing.tracers.fibers.frames.ct import oriented_seed_heading, reframe_item
+from vesuvius.neural_tracing.tracers.fibers.data.state_labels import supervise
 
 
 def plane_targets(p, s, t, t_end, pos, frame, planes):
@@ -44,8 +46,6 @@ def resolve_trace_seed(item, vol):
     if family is None:
         return item
     item['fiber_family'] = family
-    from vesuvius.neural_tracing.tracers.fibers.frames.ct import oriented_seed_heading, reframe_item
-    from vesuvius.neural_tracing.tracers.fibers.data.state_labels import supervise
     heading = oriented_seed_heading(vol, item['seed_pos'], family, item['seed_tangent'])
     item['seed_tangent'] = heading
     if pending is not None:
@@ -93,10 +93,7 @@ def refresh_frame_targets(item):
         return
     fiber, t, reverse, cfg = context
     item.update(continuation_targets(fiber, t, reverse, item['pos'], item['frame'], cfg))
-    from vesuvius.neural_tracing.tracers.fibers.data.state_labels import supervise
-    if not (item['trace_facts']['match_valid'] and not item['trace_facts']['match_ambiguous']):
-        item['gt_history_mask'] = np.zeros_like(item['gt_history_mask'])
-    supervise(item)
+    supervise_matched(item)
 
 
 def collate_targets(items):
@@ -135,7 +132,6 @@ def label_state(fiber, pos, frame, hist_world, hmask, cfg, *, t, reverse, trace)
     state's trace facts (``state_labels.facts``). This is the one labeling call used by
     the collector, replay, live continuation and synthetic sources.
     """
-    from vesuvius.neural_tracing.tracers.fibers.data.state_labels import supervise
     if len(hist_world) != cfg.n_history or len(hmask) != cfg.n_history:
         raise ValueError('Replay history must equal n_history')
     traversal_t = fiber.length-t if reverse else t
@@ -143,6 +139,12 @@ def label_state(fiber, pos, frame, hist_world, hmask, cfg, *, t, reverse, trace)
                 _frame_label_context=(fiber, traversal_t, reverse, cfg), fiber_family=fiber.tag,
                 hmask=np.asarray(hmask, np.float32), trace_facts=dict(trace),
                 **continuation_targets(fiber, traversal_t, reverse, pos, frame, cfg))
-    if not (trace['match_valid'] and not trace['match_ambiguous']):
+    return supervise_matched(item)
+
+
+def supervise_matched(item):
+    """Supervise ``item``; its ground-truth history counts only when the trace matches the fiber unambiguously."""
+    facts = item['trace_facts']
+    if not (facts['match_valid'] and not facts['match_ambiguous']):
         item['gt_history_mask'] = np.zeros_like(item['gt_history_mask'])
     return supervise(item)

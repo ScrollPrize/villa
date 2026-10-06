@@ -15,6 +15,8 @@ from vesuvius.neural_tracing.tracers.fibers.data.state_labels import DEPARTURE_D
 from vesuvius.neural_tracing.tracers.fibers.frames.ct import heading_free_bounds, reframe_item, FRAME_POLICIES
 from vesuvius.neural_tracing.tracers.fibers.frames.learned import frame_predictor, orient_items, crop_frame_bounds
 from vesuvius.neural_tracing.tracers.models.follower import FollowerConfig
+from vesuvius.neural_tracing.tracers.models.path_geometry import path_geometry_inputs
+from vesuvius.neural_tracing.tracers.fibers.data.samples import make_sample
 
 
 def image_crop(items, vol, crop, pool=None):
@@ -51,7 +53,6 @@ class ObservationBuilder:
         x = dict(fine=crop_images(items,vol,self.cfg.fine,pool),seed=stack('visible_seed'),
                  seed_mask=stack('visible_seed_mask'),seed_age=stack('visible_seed_age'),
                  seed_tangent=stack('visible_seed_tangent'))
-        from vesuvius.neural_tracing.tracers.models.path_geometry import path_geometry_inputs
         x.update(path_geometry_inputs(items))
         # Recorded replay frames have unknown quality unless it was supplied;
         # do not count them as newly successful CT estimates.
@@ -269,7 +270,6 @@ class IdentityObservationBuilder(ObservationBuilder):
         s = self.sampling
         if self.neighbors is None or not s.bank_coverage_probability or rng.random() >= s.bank_coverage_probability:
             return None
-        from vesuvius.neural_tracing.tracers.fibers.data.samples import make_sample
         bank = self.neighbors
         for _ in range(3):
             draw = bank.draw_path(rng,hard_fraction=s.bank_hard_fraction)
