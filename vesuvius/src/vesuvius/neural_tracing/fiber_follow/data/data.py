@@ -511,6 +511,17 @@ def episode_decisions(fiber, t0, reverse, steps, commit, cfg: SampleConfig, rng:
     return out
 
 
+def mark_episode_identity(items):
+    """Episode steps in step order: a step whose episode has an earlier step on the original fiber reads that fiber
+    through its history tokens, so its identity is observable (observations.identity_evidence)."""
+    from vesuvius.neural_tracing.fiber_follow.data.state_labels import DEPARTURE_DISTANCE
+    seen = False
+    for item in items:
+        item['history_identity_evidence'] = seen
+        seen = seen or float(item['match_distance']) <= DEPARTURE_DISTANCE
+    return items
+
+
 def episode_tensors(items, commit):
     """Row-aligned episode layout of a batch of episode decisions: episode and step indices, which rows are
     supervised, and each step's committed segment (world xyz, padded to the longest, at least commit+1 points) with
@@ -931,7 +942,7 @@ class FollowDataset(torch.utils.data.IterableDataset):
                     break
                 items.append(item)
             else:
-                return items
+                return mark_episode_identity(items)
         raise ValueError('Could not draw a training episode outside the held-out band')
 
     def replay_episode_items(self, kind, rng, index):
@@ -977,7 +988,7 @@ class FollowDataset(torch.utils.data.IterableDataset):
                             episode_segment=np.asarray(segment, np.float64))
                 items.append(item)
             else:
-                return items
+                return mark_episode_identity(items)
         return None
 
     def episode_plan(self, rng, windows, index):

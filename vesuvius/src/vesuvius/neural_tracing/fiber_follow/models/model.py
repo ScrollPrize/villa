@@ -2,7 +2,7 @@
 
 Model types: 'regression' and 'flow' (models/crop_transformer.py) and 'sequence' (models/sequence.py).
 """
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 import math
 
 import torch
@@ -94,9 +94,20 @@ def config_class(model_type):
     raise ValueError(f'Unsupported model type: {model_type!r} (supported: {", ".join(MODEL_TYPES)})')
 
 
+# Model fields added after checkpoints were recorded without them, with the value those checkpoints were trained with.
+RECORDED_DEFAULTS = dict(qk_norm=False, flow_modulation_bound=0.)
+
+
+def recorded_config(model_type, recorded):
+    """A configuration recorded without newer fields (RECORDED_DEFAULTS), as it was trained."""
+    cls = config_class(model_type)
+    names = {f.name for f in fields(cls)}
+    return cls(**{**{k: v for k, v in RECORDED_DEFAULTS.items() if k in names}, **recorded})
+
+
 def config_from_checkpoint(ck):
     """The model configuration recorded in a checkpoint."""
-    return config_class(ck.get('model_type'))(**ck['model_cfg'])
+    return recorded_config(ck.get('model_type'), ck['model_cfg'])
 
 
 def build_model(cfg):

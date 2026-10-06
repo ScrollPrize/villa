@@ -237,7 +237,9 @@ class IdentityObservationBuilder(ObservationBuilder):
         return item
 
     def identity_evidence(self, item, curve):
-        """Visible original-fiber evidence; it gates every displaced state's supervision."""
+        """Visible original-fiber evidence; it gates every displaced state's supervision. A sequence episode's decision
+        also reads its earlier steps as history tokens: an earlier step on the original fiber
+        (``history_identity_evidence``, data.mark_episode_identity) is evidence too."""
         from scipy.spatial import cKDTree
         reference_layout(item,self.cfg)
         distance = (cKDTree(curve).query(item['reference_points'])[0] if len(curve)
@@ -245,7 +247,7 @@ class IdentityObservationBuilder(ObservationBuilder):
         on = (distance <= self.sampling.on_fiber_tolerance) & item['reference_mask'].astype(bool)
         item['reference_on_fiber'] = on.astype(np.float32)
         item['identity_reference_valid'] = bool(on[:-1].sum() >= 2 or on[-1])
-        item['identity_evidence'] = bool(item['identity_reference_valid'])
+        item['identity_evidence'] = bool(item['identity_reference_valid'] or item.get('history_identity_evidence', False))
         item['identity_observable'] = bool(item['match_distance'] <= DEPARTURE_DISTANCE or item['identity_evidence'])
         if 'trace_facts' in item:
             item['trace_facts']['identity_observable'] = item['identity_evidence']

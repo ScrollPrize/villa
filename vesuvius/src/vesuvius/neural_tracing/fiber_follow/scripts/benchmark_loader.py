@@ -17,7 +17,7 @@ import torch
 from vesuvius.neural_tracing.fiber_follow.data.data import FollowDataset, SampleConfig, TaskBudget, ZBand, load_fibers, split_fibers, OnPolicyStates
 from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolumeSpec
 from vesuvius.neural_tracing.fiber_follow.train.runloop import raise_open_file_limit
-from vesuvius.neural_tracing.fiber_follow.models.model import config_class
+from vesuvius.neural_tracing.fiber_follow.models.model import config_from_checkpoint
 from vesuvius.neural_tracing.fiber_follow.train import run_config
 from vesuvius.neural_tracing.fiber_follow.data.observations import IdentityObservationBuilder, IdentitySampling
 from vesuvius.neural_tracing.fiber_follow.data.neighbor_bank import NeighborBank
@@ -50,7 +50,7 @@ def main():
     raise_open_file_limit()
     torch.set_num_threads(1)
     saved = json.loads(args.config.read_text())
-    cfg = config_class(saved['model_type'])(**saved['model_cfg'])
+    cfg = config_from_checkpoint(saved)
     sample = SampleConfig(**dict(saved['sample_cfg'], crop=cfg.fine))
     c = vars(run_config.namespace(saved['run_config']))
     spec = FiberVolumeSpec(**saved['vol_spec'])

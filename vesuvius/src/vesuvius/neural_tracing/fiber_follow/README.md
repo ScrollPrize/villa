@@ -115,6 +115,21 @@ identity heads, whole-crop planes); there is no training support.
   --seed X,Y,Z --family H --out traced/
 ```
 
+## Snapping fiber labels to the presence prediction
+
+`scripts/snap_fibers.py` (`data/fiber_snapping.py`) moves fiber labels onto the centre of a fiber presence prediction:
+at every point, the centroid of the upper half of the presence on a perpendicular disk (radius 2.5 voxels, averaged over
++-1 voxel along the fiber), smoothed along the fiber (sigma 2), two passes. It reads an AFV (writing a new AFV with the
+same ids, names, families and annotations and a `snapping` metadata record) or VC3D fiber JSONs (writing snapped
+`line_points`, controls moved onto the line, and `snapping.json`). The work is tiled over the presence volume and
+batched on the GPU. On Paris4 AFV it brought labels from a median 1.46 to 0.68 trace voxels from the manual annotations
+(`output/paris4_annotation_audit_20261006/`).
+
+```bash
+../../../../.venv/bin/python scripts/snap_fibers.py datasets/automated_fiber_volumes/IN.afv OUT.afv \
+  --presence /path/PHercParis4-..._presence.ome.zarr/3 --native-per-voxel 8   # level 3 = 8 native voxels per voxel
+```
+
 ## Organization
 
 | Package | Responsibility |

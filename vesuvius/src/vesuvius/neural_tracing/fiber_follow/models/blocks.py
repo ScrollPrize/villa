@@ -31,13 +31,16 @@ class CropCNN(nn.Module):
 
 
 class TransformerLayer(nn.Module):
-    """One pre-norm transformer layer's weights (attention and FFN branches) and its head split/merge."""
-    def __init__(self, width, heads, ffn):
+    """One pre-norm transformer layer's weights (attention and FFN branches) and its head split/merge. ``qk_norm``:
+    queries and keys are RMS-normalized per head (learned gain) before attention, which bounds the attention logits."""
+    def __init__(self, width, heads, ffn, qk_norm=False):
         super().__init__()
         if width % heads:
             raise ValueError('Transformer width must divide by its heads')
         self.heads = heads
         self.norm1, self.norm2 = nn.LayerNorm(width), nn.LayerNorm(width)
+        if qk_norm:
+            self.q_norm, self.k_norm = nn.RMSNorm(width//heads, eps=1e-6), nn.RMSNorm(width//heads, eps=1e-6)
         self.qkv = nn.Linear(width, 3*width)
         self.out = nn.Linear(width, width)
         self.ffn = nn.Sequential(nn.Linear(width, ffn), nn.GELU(), nn.Linear(ffn, width))
@@ -45,7 +48,10 @@ class TransformerLayer(nn.Module):
     def split(self, x):
         b, n, width = x.shape
         shape = lambda t: t.reshape(b, n, self.heads, width//self.heads).transpose(1, 2)
-        return tuple(map(shape, self.qkv(x).chunk(3, -1)))
+        q, k, v = map(shape, self.qkv(x).chunk(3, -1))
+        if hasattr(self, 'q_norm'):
+            q, k = self.q_norm(q), self.k_norm(k)
+        return q, k, v
 
     def merge(self, value):
         b, heads, n, d = value.shape

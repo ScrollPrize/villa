@@ -24,6 +24,9 @@ class FlowOptions:
     # as 'adaln' with branch gates alpha*branch instead of (1+gate)*branch, so every modulated block starts as
     # the identity (DiT's adaLN-Zero, for training from scratch).
     flow_time_conditioning: str = 'adaln_zero'
+    # Soft bound of the adaLN modulation: shift and scale M*tanh(x/M), branch gates tanh (Lumina-Next); 0 unbounded.
+    # Unbounded, the time modulation drifted to scales of ~70 and training diverged; 4 lies above the healthy range.
+    flow_modulation_bound: float = 4.
     # Lower bound of the fitted residual scales (voxels), i.e. of the noise prior's width.
     flow_sigma_floor: float = 3.
     # Planes without a target in training: 'padded' leaves them out of self-attention; 'own_path' keeps
@@ -60,6 +63,8 @@ class FlowOptions:
             raise ValueError('Flow samples must be a nonnegative integer with a finite positive scale')
         if self.flow_time_conditioning not in ('input', 'adaln', 'adaln_zero') or self.flow_unknown_planes not in ('padded', 'own_path'):
             raise ValueError("Flow time conditioning is 'input', 'adaln' or 'adaln_zero'; unknown planes 'padded' or 'own_path'")
+        if not (math.isfinite(self.flow_modulation_bound) and self.flow_modulation_bound >= 0):
+            raise ValueError('The flow modulation bound must be finite and nonnegative (0: unbounded)')
         if self.flow_selection not in ('retry', 'best') or (not self.flow_zero_start and not self.flow_samples):
             raise ValueError("Flow selection is 'retry' or 'best'; dropping the zero start needs flow samples")
         if not 0 <= self.flow_sample_threshold <= 1:

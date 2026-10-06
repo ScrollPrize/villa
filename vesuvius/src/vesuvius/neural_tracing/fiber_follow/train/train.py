@@ -72,15 +72,18 @@ def prepare_training(model, batch_size=2, *, backend=None):
         return model
     if batch_size < 1:
         raise ValueError('Positive training batch size required')
-    if model.model_type == 'sequence':  # episode batches (train/sequence.py); eager
-        model.training_batch_size, model._training_refined, model.training_loss = batch_size, None, loss_terms
-        return model
     options = dict(dynamic=False, fullgraph=True)
     # Keep eager BF16 rounding without changing global compiler configuration.
     if backend is None or backend == 'inductor':
         options['options'] = dict(emulate_precision_casts=True)
     if backend is not None:
         options['backend'] = backend
+    if model.model_type == 'sequence':
+        # Episode batches (train/sequence.py) run eagerly; their CNN, which encodes every step's crop, is compiled
+        # and fed fixed-size chunks. Compiling forward (not the module) keeps the parameter names.
+        model.training_batch_size, model._training_refined, model.training_loss = batch_size, None, loss_terms
+        model.cnn.forward = torch.compile(model.cnn.forward, **options)
+        return model
     model.training_batch_size = batch_size
     model._training_refined = None
     model.training_forward = torch.compile(model.training_forward, **options)

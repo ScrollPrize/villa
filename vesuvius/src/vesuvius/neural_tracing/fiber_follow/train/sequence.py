@@ -11,7 +11,7 @@ import torch
 
 from vesuvius.neural_tracing.fiber_follow.models.sequence import relative_pose
 
-ENCODE_CHUNK = 16  # history-only crops encoded together without gradient
+ENCODE_CHUNK = 16  # crops per CNN call: one fixed shape for the compiled CNN (train.prepare_training)
 
 
 def select_rows(batch, rows, count):
@@ -35,6 +35,17 @@ def episode_rows(batch):
     return table, order, step
 
 
+def encode_rows(model, image, rows):
+    """CNN cells of ``image[rows]`` in ``ENCODE_CHUNK``-row calls, the last padded with copies of its first row (instance
+    normalization is per crop, so padding never changes a real row)."""
+    from vesuvius.neural_tracing.fiber_follow.train.train import fixed_rows
+    parts = []
+    for start in range(0, len(rows), ENCODE_CHUNK):
+        part = rows[start:start+ENCODE_CHUNK]
+        parts.append(model.encode(fixed_rows(image[part], ENCODE_CHUNK))[:len(part)])
+    return torch.cat(parts)
+
+
 def committed_local(batch):
     """Each step's committed segment in its own crop frame (N, P, 3) and its mask (N, P)."""
     offset = batch['episode_segment'].double()-batch['crop_pos'][:, None].double()
@@ -50,13 +61,13 @@ def episode_forward(model, batch, confidence_threshold, n_commit):
     rows, others = supervised.nonzero().flatten(), (~supervised).nonzero().flatten()
     image = batch['x']['fine']
     local, valid = committed_local(batch)
-    cells = model.encode(image[rows])
+    cells = encode_rows(model, image, rows)
     features = torch.zeros(count, 2*cells.shape[1], device=device)
     features = features.index_copy(0, rows, model.step_features(cells, local[rows], valid[rows]).float())
     with torch.no_grad():
         for start in range(0, len(others), ENCODE_CHUNK):
             part = others[start:start+ENCODE_CHUNK]
-            features[part] = model.step_features(model.encode(image[part]), local[part], valid[part]).float()
+            features[part] = model.step_features(encode_rows(model, image, part), local[part], valid[part]).float()
     last = valid.sum(1).clamp_min(1)-1
     displacement = local[torch.arange(count, device=device), last]-local[:, 0]
     safe = table.clamp_min(0)
