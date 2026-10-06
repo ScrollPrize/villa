@@ -27,7 +27,7 @@ from vesuvius.neural_tracing.tracers.shared.geometry import (
     traversal_curve,
 )
 from vesuvius.neural_tracing.tracers.fibers.data.annotation_repair import foldbacks, repair_kinks
-from vesuvius.neural_tracing.tracers.ct.volume import FiberVolume
+from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import FiberVolume
 from vesuvius.neural_tracing.tracers.shared.reference import SEED_FIELDS
 
 

@@ -13,7 +13,7 @@ from vesuvius.neural_tracing.tracers.fibers.tracing.heading import orient_item
 from vesuvius.neural_tracing.tracers.shared.policy import OperatingPolicy
 from vesuvius.neural_tracing.tracers.fibers.data.state_labels import FOLLOWING
 from vesuvius.neural_tracing.tracers.fibers.tracing.trace import ModelTracer, TraceParams
-from vesuvius.neural_tracing.tracers.ct.volume import FiberVolumeSpec
+from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import FiberVolumeSpec
 
 POLICY = OperatingPolicy(n_commit=16, gate='prefix')  # these tests exercise prefix-length commits
 

@@ -17,7 +17,7 @@ import uuid
 
 import numpy as np
 
-from vesuvius.neural_tracing.tracers.ct.volume import RemoteChunkedArray, open_remote_array
+from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import RemoteChunkedArray, open_remote_array
 
 DEMAND, AHEAD = 0, 10
 COUNTERS = ('submitted', 'deferred', 'cached', 'completed', 'completed_bytes',

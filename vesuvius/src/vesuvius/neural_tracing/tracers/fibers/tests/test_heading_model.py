@@ -13,8 +13,8 @@ from vesuvius.neural_tracing.tracers.shared.geometry import arclength, normalize
 
 def volume(root):
     """Tiny CT-only volume (80^3 native CT, trace grid at half resolution) with per-crop z-score records."""
-    from vesuvius.neural_tracing.tracers.ct.normalization import ZSCORE_EPSILON, ZSCORE_METHOD, volume_key
-    from vesuvius.neural_tracing.tracers.ct.volume import FiberVolume, FiberVolumeSpec
+    from vesuvius.neural_tracing.tracers.shared.crop_sampling.normalization import ZSCORE_EPSILON, ZSCORE_METHOD, volume_key
+    from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import FiberVolume, FiberVolumeSpec
     path = root/'ct/0'
     path.mkdir(parents=True)
     (path/'.zarray').write_text(json.dumps(dict(shape=[80, 80, 80], chunks=[80, 80, 80], dtype='|u1', fill_value=0,

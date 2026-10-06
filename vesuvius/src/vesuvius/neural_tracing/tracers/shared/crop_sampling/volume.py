@@ -353,7 +353,7 @@ class FiberVolume:
             raise ValueError('CT intensity normalization currently requires uint8 data')
         self.ct = ct
         if spec.ct_normalization is not None:
-            from vesuvius.neural_tracing.tracers.ct.normalization import validate_record
+            from vesuvius.neural_tracing.tracers.shared.crop_sampling.normalization import validate_record
             validate_record(spec.ct_normalization, spec)
         self.shape = tuple(np.ceil(np.asarray(self.ct.shape)/self.input_scale).astype(int))
 

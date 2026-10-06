@@ -28,7 +28,7 @@ from vesuvius.neural_tracing.tracers.shared.policy import checkpoint_policy
 from vesuvius.neural_tracing.tracers.shared.reference import SEED_FIELDS
 from vesuvius.neural_tracing.tracers.fibers.data.state_labels import DEPARTURE_DISTANCE, DEPARTURE_PATIENCE, REASON, RECOVERABLE, REPLAY_CLASSES, SUPERVISION, TERMINAL, TraceLabeler, replay_class
 from vesuvius.neural_tracing.tracers.fibers.tracing.trace import ModelTracer, TraceParams
-from vesuvius.neural_tracing.tracers.ct.volume import FiberVolume
+from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import FiberVolume
 
 
 class DecisionCollector:

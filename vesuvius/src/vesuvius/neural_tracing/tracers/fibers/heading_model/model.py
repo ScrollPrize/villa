@@ -18,7 +18,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from vesuvius.neural_tracing.tracers.ct.crops import scalar_crops
+from vesuvius.neural_tracing.tracers.shared.crop_sampling.crops import scalar_crops
 from vesuvius.neural_tracing.tracers.shared.geometry import CropSpec, arclength, frame_from_heading, interp_at
 from vesuvius.neural_tracing.tracers.shared.retired import retire
 

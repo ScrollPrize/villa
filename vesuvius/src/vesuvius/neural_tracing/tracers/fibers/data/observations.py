@@ -8,7 +8,7 @@ from scipy.ndimage import gaussian_filter
 
 from vesuvius.neural_tracing.tracers.fibers.data.components import ComponentRule
 from vesuvius.neural_tracing.tracers.fibers.data.data import SOURCE, collate_targets, resolve_trace_seed
-from vesuvius.neural_tracing.tracers.ct.crops import scalar_crops, empty_image_batch
+from vesuvius.neural_tracing.tracers.shared.crop_sampling.crops import scalar_crops, empty_image_batch
 from vesuvius.neural_tracing.tracers.shared.geometry import interp_at, traversal_curve
 from vesuvius.neural_tracing.tracers.fibers.tracing.trace import ModelTracer
 from vesuvius.neural_tracing.tracers.shared.reference import SEED_FIELDS, observed_seed

@@ -6,10 +6,10 @@ uncompressed Zarr chunks; the fused Numba kernel interpolates them.
 import numpy as np
 import torch
 
-from vesuvius.neural_tracing.tracers.ct.volume import FiberVolume
+from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import FiberVolume
 from vesuvius.neural_tracing.tracers.shared.geometry import CropSpec, crop_local_grid
-from vesuvius.neural_tracing.tracers.ct.fast_sample import sample_scalar_crop
-from vesuvius.neural_tracing.tracers.ct.normalization import normalize_ct
+from vesuvius.neural_tracing.tracers.shared.crop_sampling.fast_sample import sample_scalar_crop
+from vesuvius.neural_tracing.tracers.shared.crop_sampling.normalization import normalize_ct
 
 
 def empty_image_batch(shape):

@@ -8,8 +8,8 @@ import math
 import numpy as np
 import torch
 
-from vesuvius.neural_tracing.tracers.ct.crops import scalar_crops
-from vesuvius.neural_tracing.tracers.ct.normalization import normalize_ct
+from vesuvius.neural_tracing.tracers.shared.crop_sampling.crops import scalar_crops
+from vesuvius.neural_tracing.tracers.shared.crop_sampling.normalization import normalize_ct
 from vesuvius.neural_tracing.tracers.shared.geometry import CropSpec
 from vesuvius.neural_tracing.tracers.fibers.tracing.heading import ct_structure_tensor
 

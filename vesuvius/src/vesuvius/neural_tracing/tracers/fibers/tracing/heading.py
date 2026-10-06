@@ -206,7 +206,7 @@ def orient_item(item, vol):
 
 def frame_prefetch_bounds(item, crop, input_scale):
     """Cover every roll until CT is available, plus the normal's CT context."""
-    from vesuvius.neural_tracing.tracers.ct.crops import tight_block
+    from vesuvius.neural_tracing.tracers.shared.crop_sampling.crops import tight_block
     if item.get('frame_policy') in FRAME_POLICIES:
         yield tight_block(item['pos'], item['frame'], crop, input_scale)
     else:

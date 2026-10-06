@@ -9,7 +9,7 @@ page cache. Values are exactly the decoded source values; ``--verify``
 re-decodes a random sample of chunks and compares bytes before anything is
 replaced.
 
-    python -m vesuvius.neural_tracing.tracers.ct.decode_store /path/to/volume.zarr/0 /path/to/volume.zarr/1
+    python -m vesuvius.neural_tracing.tracers.shared.crop_sampling.decode_store /path/to/volume.zarr/0 /path/to/volume.zarr/1
 
 Each chunk is first decoded to a ``<chunk>.raw`` sibling; only when every
 chunk has one are the originals replaced and ``.zarray`` rewritten, so an
@@ -67,7 +67,7 @@ _WORK: dict = {}
 
 def _init_worker(source, meta):
     import numcodecs
-    from vesuvius.neural_tracing.tracers.ct.volume import _register_vcz1
+    from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import _register_vcz1
     _register_vcz1()
     _WORK.update(source=source, sep=meta.get('dimension_separator', '.'),
                  codec=None if meta.get('compressor') is None else numcodecs.get_codec(meta['compressor']),
