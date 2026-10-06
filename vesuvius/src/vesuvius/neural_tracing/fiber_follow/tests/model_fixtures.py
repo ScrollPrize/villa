@@ -1,9 +1,9 @@
-"""Shared model, batch and run-configuration fixtures.
+"""Shared model, batch and volume fixtures.
 
 ``config`` is a small regression model (models/crop_transformer.py), the crop/horizon/label contract most tests use;
-``coordinate_config`` adds recurrent refinement. ``coordinate_batch``/``batch`` hold every input the crop transformer
-reads (CT crop, seed, observed path and path-geometry tokens) with label targets. ``run_document``/``run_args`` give a
-run configuration (train/run_config.py) and the trainer settings resolved from it.
+``coordinate_config`` adds recurrent refinement and ``flow_config`` is a small flow model. ``coordinate_batch``/``batch``
+hold every input the crop transformer reads (CT crop, seed, observed path and path-geometry tokens) with label targets;
+``ct_volume`` is a synthetic CT volume with its normalization record.
 """
 import json
 from dataclasses import replace

@@ -146,10 +146,6 @@ class LegacyFlowFollower(LegacyPatchFollower):
         return output
 
     def select_prediction(self, output, confidence_threshold=DEFAULT_CONFIDENCE, n_commit=None):
-        """The tracer passes its threshold and commit window to models that define this (tracing/trace.py)."""
-        return self.select_prediction(output, confidence_threshold, n_commit)
-
-    def select_prediction(self, output, confidence_threshold=DEFAULT_CONFIDENCE, n_commit=None):
         """Proposal selection (sample bar, then retry or best). Its presence tells the tracer to pass the operating
         threshold and commit window."""
         margin = self.cfg.flow_sample_threshold-confidence_threshold

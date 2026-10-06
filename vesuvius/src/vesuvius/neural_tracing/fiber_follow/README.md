@@ -106,12 +106,13 @@ paths recorded on another machine when a checkpoint is loaded for inference.
 
 DAgger subprocesses receive `runtime.dagger_threads` (default 4), independently of the trainer's `runtime.threads`.
 
-### Pre-cleanup flow checkpoints (inference only)
+### Pre-cleanup checkpoints (inference only)
 
-The `flow_matching` checkpoints of the v4-extension and v5 runs (patch encoder, flow decoder, segment scorer; no
-memory or identity heads) trace through `legacy/`, a frozen copy of that model kept apart from `models/`. It takes the
-same arguments as `tracing.infer` and refuses checkpoints with features it does not implement (decision memory,
-identity heads, whole-crop planes); there is no training support.
+The `flow_matching` checkpoints of the v4-extension and v5 runs and the `coordinate_regression` checkpoints of
+`mixed_ct_afv_forward35_v1` and `mixed_ct_afv_v3init_nomem_b8` (patch encoder, decoder, segment scorer; no memory or
+identity heads) trace through `legacy/`, a frozen copy of those models kept apart from `models/`. It takes the same
+arguments as `tracing.infer` and refuses checkpoints with features it does not implement (decision memory, identity
+heads, whole-crop planes); there is no training support.
 
 ```bash
 ../../../../.venv/bin/python -m vesuvius.neural_tracing.fiber_follow.legacy.infer --checkpoint CKPT.pt \
@@ -126,7 +127,7 @@ identity heads, whole-crop planes); there is no training support.
 | `train` | Entry point and run configuration, objectives, checkpoints, logging, online collection, live continuation |
 | `data` | Volumes, normalization, observation construction, labels, sampling, replay, AFV neighbors |
 | `tracing` | Inference, collection, heading/frame resolution, commit policy, rollout |
-| `evaluation` | Frozen-seed evaluation, recovery, diagnostics, benchmarks |
+| `evaluation` | Frozen-seed evaluation, recovery, diagnostics, long-trace audits |
 | `heading_model` | Heading/normal trainer and frozen frame predictor used by follower crop generation |
 | `shared` | Geometry, reference handling, sampling kernels, experiment utilities |
 
@@ -139,9 +140,8 @@ OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 MPLCONFIGDIR=/tmp/fiber-mpl \
   ../../../../.venv/bin/python -m pytest tests -q -o cache_dir=/tmp/fiber-pytest
 ```
 
-Tests cover the three model types, compiled graph capture, run configuration, checkpoint conversion, weight
-initialization/resume, gradient paths, supervision masks, deterministic flow tracing, observation parity, collection,
-normalization and the standalone heading model. CUDA tests skip when CUDA is unavailable. Small-fixture checks
+Tests cover the three model types, compiled graph capture, weight initialization/resume, gradient paths, supervision
+masks, deterministic flow tracing, observation parity, collection and the standalone heading model. CUDA tests skip when CUDA is unavailable. Small-fixture checks
 establish implementation correctness; they do not establish trained tracing accuracy or production GPU throughput.
 
 Long held-out failure audits can reuse the shared tracer and scorers while recording every

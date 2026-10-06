@@ -81,11 +81,17 @@ def save_checkpoint(path, model, vol_spec, crop, n_history, model_type, extra=No
 
 
 def read_checkpoint(path, device='cuda'):
-    from vesuvius.neural_tracing.fiber_follow.models.model import MODEL_TYPES
+    from dataclasses import fields
+    from vesuvius.neural_tracing.fiber_follow.models.model import MODEL_TYPES, RETIRED_FIELDS, config_class
     ck = torch.load(path, map_location=device, weights_only=False)
-    if ck.get('model_type') not in MODEL_TYPES:
-        raise ValueError(f'Unsupported checkpoint model type {ck.get("model_type")!r} in {path}; checkpoints from '
-                         'before the model cleanup need scripts/convert_checkpoint.py')
+    model_type = ck.get('model_type')
+    # A pre-cleanup 'sequence' checkpoint keeps its type name but records model fields that no longer exist.
+    unknown = (sorted(set(ck.get('model_cfg', {}))-{f.name for f in fields(config_class(model_type))}-set(RETIRED_FIELDS))
+               if model_type in MODEL_TYPES else None)
+    if model_type not in MODEL_TYPES or unknown:
+        detail = f'model fields {", ".join(unknown)}' if unknown else f'model type {model_type!r}'
+        raise ValueError(f'Unsupported checkpoint {path} ({detail}); checkpoints from before the model cleanup need '
+                         'scripts/convert_checkpoint.py')
     return ck
 
 
