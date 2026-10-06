@@ -347,8 +347,13 @@ class DinoGuidedLabelGenerator:
     ) -> torch.Tensor:
         _validate_image(image_b1zyx, chunk_size=self.grid.chunk_size)
         _validate_mask(mask_b1zyx, image_b1zyx)
+        # Only CUDA gets non_blocking: on torch 2.11/2.12 an MPS copy can read
+        # the host temporary of a dtype conversion after it is freed
+        # (pytorch/pytorch#189690).
         image = image_b1zyx.to(
-            device=self.device, dtype=self.dtype, non_blocking=True
+            device=self.device,
+            dtype=self.dtype,
+            non_blocking=self.device.type == "cuda",
         )
         logits = self.unet(image)
         if logits.ndim != 5 or int(logits.shape[1]) != 1:
@@ -359,7 +364,9 @@ class DinoGuidedLabelGenerator:
         probability = logits.float().sigmoid()
         if mask_b1zyx is not None:
             probability *= mask_b1zyx.to(
-                device=self.device, dtype=probability.dtype, non_blocking=True
+                device=self.device,
+                dtype=probability.dtype,
+                non_blocking=self.device.type == "cuda",
             )
         similarity = self._dino_similarity(image)
         return (probability * similarity > self.threshold).float()
@@ -568,8 +575,13 @@ class SelfDistillLabelGenerator:
                 f"B={image_b1zyx.shape[0]}"
             )
 
+        # Only CUDA gets non_blocking: on torch 2.11/2.12 an MPS copy can read
+        # the host temporary of a dtype conversion after it is freed
+        # (pytorch/pytorch#189690).
         image = image_b1zyx.to(
-            device=self.device, dtype=self.dtype, non_blocking=True
+            device=self.device,
+            dtype=self.dtype,
+            non_blocking=self.device.type == "cuda",
         )
         output = torch.empty_like(image, dtype=torch.float32, device=self.device)
         for batch_index in range(int(image.shape[0])):
@@ -604,7 +616,7 @@ class SelfDistillLabelGenerator:
                 probability *= mask_b1zyx[batch_index : batch_index + 1].to(
                     device=self.device,
                     dtype=probability.dtype,
-                    non_blocking=True,
+                    non_blocking=self.device.type == "cuda",
                 )
             output[batch_index : batch_index + 1] = (
                 probability > threshold
