@@ -6,8 +6,9 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from vesuvius.neural_tracing.tracers.shared.geometry import interp_at, traversal_curve
-from vesuvius.neural_tracing.tracers.fibers.data.samples import STARTUP_CATEGORIES, SampleConfig, decision_on_path, excursion_offsets, trace_noise, trace_prefix_length
+from vesuvius.neural_tracing.tracers.shared.geometry import traversal_curve
+from vesuvius.neural_tracing.tracers.fibers.data.samples import (
+    STARTUP_CATEGORIES, SampleConfig, decision_on_path, noisy_trace, trace_prefix_length)
 from vesuvius.neural_tracing.tracers.fibers.data.state_labels import DEPARTURE_DISTANCE
 
 
@@ -42,13 +43,7 @@ def episode_decisions(fiber, t0, reverse, steps, commit, cfg: SampleConfig, rng:
     arcs = t0-prefix+step*np.arange(count+1, dtype=np.float64)
     if arcs[-1] > s[-1]+1e-6:
         raise ValueError('Episode runs past the end of its fiber')
-    noise, sigma = trace_noise(arcs, p, s, cfg, rng)
-    path = interp_at(p, s, arcs)+noise
-    details, offsets = {}, np.zeros_like(path)
-    if (category == STARTUP_CATEGORIES.index('established') and arcs[-1]-arcs[0] >= 8.
-            and rng.random() < cfg.excursion_probability):
-        offsets, details = excursion_offsets(arcs, p, s, cfg, rng)
-        path = path+offsets
+    path, sigma, offsets, details = noisy_trace(arcs, p, s, category, cfg, rng)
     out = []
     for j in range(steps):
         i = int(round(prefix/step))+j*per_commit

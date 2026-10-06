@@ -188,14 +188,22 @@ def simulated_trace(p, s, t, cfg: SampleConfig, rng: np.random.Generator, *, sta
     category = int(rng.choice(len(STARTUP_CATEGORIES), p=cfg.startup_shares)) if startup is None else int(startup)
     count = int(trace_prefix_length(t, category, rng)//cfg.history_step)
     arcs = t-np.arange(count, -1, -1)*cfg.history_step
+    path, sigma, _, details = noisy_trace(arcs, p, s, category, cfg, rng, excursion=excursion)
+    return path, arcs, category, sigma, details
+
+
+def noisy_trace(arcs, p, s, category, cfg: SampleConfig, rng: np.random.Generator, *, excursion=None):
+    """The observed path at traversal arclengths ``arcs`` of curve (p, s): trace noise, then (established traces of at
+    least 8 voxels, with probability ``excursion_probability`` unless ``excursion`` decides) one excursion ending at the
+    path's end. Returns (path, noise sigma, excursion offsets, excursion details)."""
     noise, sigma = trace_noise(arcs, p, s, cfg, rng)
     path = interp_at(p, s, arcs)+noise
-    details = {}
+    offsets, details = np.zeros_like(path), {}
     established = category == STARTUP_CATEGORIES.index('established') and arcs[-1]-arcs[0] >= 8.
     if established and (excursion if excursion is not None else rng.random() < cfg.excursion_probability):
         offsets, details = excursion_offsets(arcs, p, s, cfg, rng)
         path = path+offsets
-    return path, arcs, category, sigma, details
+    return path, sigma, offsets, details
 
 
 def make_sample(fiber: TracedFiber, t: float, reverse: bool, cfg: SampleConfig, rng: np.random.Generator,
