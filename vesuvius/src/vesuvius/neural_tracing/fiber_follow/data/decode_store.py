@@ -9,7 +9,7 @@ page cache. Values are exactly the decoded source values; ``--verify``
 re-decodes a random sample of chunks and compares bytes before anything is
 replaced.
 
-    python scripts/decode_store.py /path/to/volume.zarr/0 /path/to/volume.zarr/1
+    python -m vesuvius.neural_tracing.fiber_follow.data.decode_store /path/to/volume.zarr/0 /path/to/volume.zarr/1
 
 Each chunk is first decoded to a ``<chunk>.raw`` sibling; only when every
 chunk has one are the originals replaced and ``.zarray`` rewritten, so an

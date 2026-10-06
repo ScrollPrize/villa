@@ -258,66 +258,6 @@ Inference still uses only the original patch and path. `HeadingPredictor.predict
 `(world_headings, world_normal_axes)`; `predict(...)` retains the existing heading-only API. No tensor or extra
 context is computed at inference. Adopting predicted normals for the follower's frame remains a separate change.
 
-Verify the sampler and benchmark the cached 64-state-per-source experiment:
-
-```bash
-OMP_NUM_THREADS=1 python -m pytest -q tests/test_heading_normals.py tests/test_heading_model.py tests/test_ct_crops.py
-OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 python evaluation/benchmark_heading_normal_sampling.py
-```
-
-The benchmark requires the artifacts from `evaluation/compare_heading_patch_normals.py`. Add `--fetch` to
-download any missing public CT chunks into that experiment's cache. It checks exact input equality, compares
-normals to the saved native 65-cube reference, and times five repetitions of 64 samples per source on one CPU
-thread after warmup. `output/heading_normal_sampling_benchmark.json` records mean/median/min/max latency.
-These timings exclude heading-target optimization, initial downloads, and GPU training.
-For the original 1/4-sigma policy, on the saved October 2 samples, mean heading-only/shared/two-pass times were 1.61/2.06/3.67 ms per sample
-for Paris 4, 0.91/1.25/2.15 for 0175A, and 0.88/1.22/2.09 for 1447. All 192 heading inputs were bit-identical;
-normal/reference median angles were 7.39, 5.64 and 6.14 degrees respectively. CPU train/save/resume was tested;
-GPU throughput has not been measured for the joint trainer.
-
-For a small model-versus-Lasagna check on the cached Paris 4 and AFV 1447 regions, run:
-
-```bash
-OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 python evaluation/check_heading_normals_lasagna.py \
-  --checkpoints output/heading_model_l0_w16_centered_normals/ckpt_010000.pt \
-                output/heading_model_l0_w16_centered_normals/ckpt_012000.pt \
-  --out output/heading_model_lasagna_step012000
-```
-
-This uses empty path features and noisy H/V seed priors in both directions, with the exact model input sampler.
-It runs on CPU, downloads nothing, and reports any missing cached CT samples. Results include model/Lasagna,
-tensor/Lasagna and model/tensor unsigned angles, per-point arrays and a comparison plot. These cached regions
-are not guaranteed excluded from model training, so this is a diagnostic seed test, not a strict held-out score.
-
-`OMP_NUM_THREADS=1 python evaluation/check_heading_frame_meshes.py` runs a brief Paris 4 check using the
-frame run's `last.pt`: two interior locations each on the low, middle and top meshes in
-`/mnt/raid_nvme/spiral_dataset_working/verified_patches`, H/V CT-initialized seed priors, and no path history.
-It reports raw normal and projected roll errors against local mesh plane fits and saves a step-named JSON report.
-
-To compare how well frames contain annotated future fibers without running the follower:
-
-```bash
-OMP_NUM_THREADS=1 python evaluation/compare_future_crop_frames.py \
-  --checkpoint output/heading_model_l0_w16_centered_frame/ckpt_064000.pt \
-  --out output/future_crop_frames_step064000
-```
-
-This uses 512 deterministic held-out states per source (Paris 4 and both AFVs), the trainer's simulated observed
-paths and seed priors, and cached CT. It compares the 2/8 normal with the existing H/V heading rule, the input
-prior with tensor roll, model heading with tensor roll, and the full model frame. The raw tensor normal is not
-corrected using an annotated tangent. Missing CT cache entries stop evaluation rather than changing the sample.
-The current follower fine crop is scored at 16 and 35 voxels of future annotated arclength, including all points
-outside its axial bounds. The report contains full-containment rates, point coverage, lateral displacement,
-half-width sweeps, source/history/family breakdowns, and saved future geometry and frames. Narrow-width sweeps
-retain the same axial bounds. These are single-state geometry measurements, not rollout results.
-
-`OMP_NUM_THREADS=1 python evaluation/visualize_future_frames.py` reads that report and generates paired real CT
-crops with the same model heading and tensor versus learned roll. It selects median- and maximum-disagreement
-H/V seed states in each source, aligns unsigned normal signs, and uses matching contrast. The gallery in
-`output/future_crop_frames_step064000/visuals/index.html` shows head-centered face-on, side, and end-on planes;
-NPZ files preserve both full crops. The two central lateral samples are averaged to center the displayed planes.
-Gold crosses mark the seed; cyan points show future annotations lying within one CT voxel of the plane.
-
 ## Earlier prototype (Paris 4, one model, `output/trace_sampling_20261002/`)
 
 On held-out Paris 4, the angle to the target (p50/p90) went from 11.3/26.8° to 4.7/9.5° with 32+ voxels of
