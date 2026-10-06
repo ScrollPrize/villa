@@ -582,3 +582,75 @@ def test_main_surface_only_returns_fail_exit_code_and_prints_gate_summary(
 
     assert returncode == 2
     assert "valid_surface_vertices" in capsys.readouterr().err
+
+
+def _cylinder_surface(root: Path, *, counter_clockwise: bool) -> Path:
+    # Half a turn of radius 500 voxels around the z axis, one cell per 20 voxels.
+    theta = np.arange(78) * 20.0 / 500.0
+    if not counter_clockwise:
+        theta = theta[::-1]
+    rows = np.arange(60, dtype=np.float64)[:, None]
+    x = (2000.0 + 500.0 * np.cos(theta))[None] + 0 * rows
+    y = (2000.0 + 500.0 * np.sin(theta))[None] + 0 * rows
+    z = 1000.0 + 20.0 * rows + 0 * theta[None]
+    return write_surface(root, x=x, y=y, z=z, scale=[0.05, 0.05])
+
+
+@pytest.mark.parametrize("counter_clockwise, flip", [(True, True), (False, False)])
+def test_depth_orientation_reports_flip_normals(
+    tmp_path, capsys, counter_clockwise: bool, flip: bool
+) -> None:
+    surface = _cylinder_surface(
+        tmp_path / "20260101000000-on-20250101000000-10.0um.tifxyz",
+        counter_clockwise=counter_clockwise,
+    )
+
+    returncode = surface_preflight.main(["--surface", str(surface)])
+
+    captured = capsys.readouterr()
+    orientation = json.loads(captured.out)["surface"]["depth_orientation"]
+    assert returncode == 0
+    assert orientation["status"] == "determined"
+    assert orientation["voxel_size_um"] == 10.0
+    assert orientation["vc_render_flip_normals"] is flip
+    assert f"render with{'' if flip else 'out'} --flip-normals" in captured.err
+
+
+def test_depth_orientation_is_skipped_without_voxel_size(tmp_path) -> None:
+    surface = _cylinder_surface(tmp_path / "surface", counter_clockwise=True)
+
+    report = surface_preflight.inspect_pair(surface)
+
+    assert report["status"] == "PASS"
+    assert report["surface"]["depth_orientation"]["status"] == "skipped"
+    explicit = surface_preflight.inspect_pair(surface, voxel_size_um=10.0)
+    assert explicit["surface"]["depth_orientation"]["vc_render_flip_normals"] is True
+
+
+def test_depth_orientation_error_does_not_fail_the_gates(tmp_path) -> None:
+    surface = _cylinder_surface(tmp_path / "surface", counter_clockwise=True)
+
+    report = surface_preflight.inspect_pair(surface, voxel_size_um=float("nan"))
+
+    assert report["status"] == "PASS"
+    assert report["surface"]["depth_orientation"]["status"] == "error"
+
+
+def test_main_rejects_non_positive_voxel_size(tmp_path) -> None:
+    surface = _cylinder_surface(tmp_path / "surface", counter_clockwise=True)
+
+    with pytest.raises(SystemExit):
+        surface_preflight.main(["--surface", str(surface), "--voxel-size-um", "0"])
+
+
+def test_preflight_passes_without_tifxyz_dependencies(tmp_path, monkeypatch) -> None:
+    # The preflight's install (vesuvius[label-transfer]) has no OpenCV; the
+    # orientation section must not import vesuvius.tifxyz.
+    monkeypatch.setitem(sys.modules, "cv2", None)
+    monkeypatch.delitem(sys.modules, "vesuvius.surface_orientation", raising=False)
+    surface = _cylinder_surface(tmp_path / "surface", counter_clockwise=True)
+
+    report = surface_preflight.inspect_pair(surface, voxel_size_um=10.0)
+
+    assert report["status"] == "PASS"
+    assert report["surface"]["depth_orientation"]["status"] == "determined"

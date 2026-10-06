@@ -76,6 +76,78 @@ This is an input-pairing preflight, not a proof of surface correctness. It does
 not replace geometric diagnostics such as self-intersection or local
 orientation analysis.
 
+## Depth orientation (advisory)
+
+The report also carries `surface.depth_orientation`, a geometric hint for
+whether `vc_render_tifxyz` needs `--flip-normals`.
+
+The renderer stacks layers along the grid normal `dP/dU x dP/dV`.
+`--flip-normals` makes the layer index grow toward the scroll centre, which
+is the order of the published surface volumes and the training labels.
+Which flag gives that order depends on the grid's handedness, and any
+single mirror of the grid (VC3D's *Flip Surface* actions, for example)
+reverses it. With the wrong order the model can return a plausible map at
+chance level: in villa#1648, `ink_9um` on PHerc. 0139 w035 dropped from
+AUC 0.95 to 0.51-0.56.
+
+The hint needs no CT and no labels. Over a 4 mm stencil a wrapped scroll
+sheet usually curves around the scroll axis, so its curvature vector points
+inward. The report gives `inward_fraction`, the `|kappa . N|`-weighted share
+of vertices whose grid normal points that way.
+
+Stencils are left out when any vertex along them is invalid (including
+vertices skipped by decimation), when any grid
+edge is longer than 3 times the nominal spacing, or when a half-chord is
+longer than 1.5 times the grid run. Single weights are capped at 3 times the
+90th percentile.
+
+`status` is one of:
+
+- `determined`: `|2 * inward_fraction - 1|` is at least 0.5, and
+  `vc_render_flip_normals` is `true` or `false`;
+- `undetermined`: the vote is closer than that;
+- `too_small`: fewer than 100 vertices with a clean stencil. The surface is
+  shorter than about 8 mm, its grid spacing disagrees with the metadata
+  scale (see `tifxyz_scale_consistency`), or the stencils cross holes and
+  defects;
+- `skipped`: the voxel size is unknown. Pass `--voxel-size-um`, or keep the
+  published mesh name (`...-on-<volume>-9.362um.tifxyz`);
+- `error`: the computation failed. This never changes the gates or the exit
+  code.
+
+Grids above 4 million vertices are decimated first, keeping the same
+physical stencil length.
+
+It is a heuristic, and the sheet's local curvature is not always the scroll's
+curvature. Treat a `determined` result as a hint. When it disagrees with how
+the segment was made, or when the result matters, run inference with
+`--direction both`.
+
+```text
+depth orientation: the grid normal points outward (inward_fraction=0.13); render with --flip-normals so the layer index grows toward the scroll centre (assumes a wrapped scroll sheet, not a flat fragment)
+```
+
+Measured on the open-data catalogue (6 October 2026; details in villa#1648):
+
+- **Scroll segments with a reference.** For 77 published scroll segments on
+  8 scrolls, the published surface volume runs along `-N` (the
+  `--flip-normals` order). The hint is `determined` on 55 of them and agrees
+  on all 55. Because every one of these grids has the same handedness,
+  "always pass `--flip-normals`" scores the same. What this shows is that no
+  determined hint was wrong on these scroll meshes.
+- **Mirrored grids.** For an undecimated grid, mirroring flips
+  `inward_fraction` to `1 - inward_fraction` exactly.
+- **Fragments.** On the PHerc. 0500P2 fragment the hint was `determined` on
+  4 of 7 segments with a reference and disagreed with the published order on
+  all 4; the other 3 were `too_small`. One of those, `0500P2-wrap11_0919`,
+  shows why. It reaches `inward_fraction` 0.94, below the vertex floor. Its
+  grid has the same handedness as the neighbouring wraps 10 and 12, but
+  that part of the sheet curves the other way. Do not use the hint on
+  fragments.
+- **All scroll segments.** Of 238 published scroll segments, 147 are
+  `determined`, all with the standard handedness; 81 are `undetermined`
+  (mostly multi-wrap PHerc. Paris 4); 7 are `too_small`; 3 are `skipped`.
+
 ## Example: catching an empty `vc_obj2tifxyz` export
 
 Round-tripping the public Scroll 1 segment
