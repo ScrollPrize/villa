@@ -103,6 +103,18 @@ paths recorded on another machine when a checkpoint is loaded for inference.
 
 DAgger subprocesses receive `runtime.dagger_threads` (default 4), independently of the trainer's `runtime.threads`.
 
+### Pre-cleanup flow checkpoints (inference only)
+
+The `flow_matching` checkpoints of the v4-extension and v5 runs (patch encoder, flow decoder, segment scorer; no
+memory or identity heads) trace through `legacy/`, a frozen copy of that model kept apart from `models/`. It takes the
+same arguments as `tracing.infer` and refuses checkpoints with features it does not implement (decision memory,
+identity heads, whole-crop planes); there is no training support.
+
+```bash
+../../../../.venv/bin/python -m vesuvius.neural_tracing.fiber_follow.legacy.infer --checkpoint CKPT.pt \
+  --seed X,Y,Z --family H --out traced/
+```
+
 ## Organization
 
 | Package | Responsibility |

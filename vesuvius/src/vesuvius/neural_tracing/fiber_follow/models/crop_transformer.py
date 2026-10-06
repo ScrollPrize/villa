@@ -34,12 +34,12 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+from vesuvius.neural_tracing.fiber_follow.models.blocks import CropCNN, TransformerLayer
 from vesuvius.neural_tracing.fiber_follow.models.flow import FlowMatching, FlowOptions, time_embedding
 from vesuvius.neural_tracing.fiber_follow.models.model import (
     REFERENCE_METADATA, FollowerConfig, future_points, proposal_output, reference_metadata, reference_points,
     sample_features, select_refinement, token_coordinates)
 from vesuvius.neural_tracing.fiber_follow.models.path_geometry import PathGeometryTokens
-from vesuvius.neural_tracing.fiber_follow.models.sequence import CropCNN, SequenceLayer
 from vesuvius.neural_tracing.fiber_follow.models.survival_confidence import survival_predictions
 from vesuvius.neural_tracing.fiber_follow.tracing.policy import DEFAULT_CONFIDENCE, commit_prefix
 
@@ -100,7 +100,7 @@ class FlowConfig(FlowOptions, CropTransformerArchitecture, FollowerConfig):
     gate_plane: int | None = None
 
 
-class CropTransformerLayer(SequenceLayer):
+class CropTransformerLayer(TransformerLayer):
     """One pre-norm transformer layer: context tokens attend to each other; path tokens attend to the context and
     to the path tokens their mask allows."""
 

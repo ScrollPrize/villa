@@ -22,10 +22,8 @@ import math
 import torch
 from torch import nn
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint
 
-from vesuvius.models.build.resblocks import BasicBlockD, StackedResidualBlocks
-
+from vesuvius.neural_tracing.fiber_follow.models.blocks import CropCNN, TransformerLayer
 from vesuvius.neural_tracing.fiber_follow.models.model import (
     FollowerConfig, future_points, proposal_output, sample_features, select_refinement)
 from vesuvius.neural_tracing.fiber_follow.models.survival_confidence import survival_predictions
@@ -86,48 +84,8 @@ def relative_pose(past_pos, past_travelled, pos, frame, travelled):
     return local.float(), (travelled[..., None]-past_travelled).float()
 
 
-class CropCNN(nn.Module):
-    """Residual CNN stages (channels, initial stride, blocks per stage) over a one-channel crop; the first stage's
-    convolutions carry biases."""
-    def __init__(self, channels, strides, blocks, checkpointing=False):
-        super().__init__()
-        options = dict(conv_op=nn.Conv3d, kernel_size=3, norm_op=nn.InstanceNorm3d,
-                       norm_op_kwargs=dict(eps=1e-5, affine=True), nonlin=nn.ReLU, nonlin_kwargs=dict(inplace=True),
-                       block=BasicBlockD)
-        inputs = (1, *channels[:-1])
-        self.stages = nn.ModuleList(
-            StackedResidualBlocks(n_blocks=n, input_channels=i, output_channels=c, initial_stride=s, conv_bias=not index,
-                                  **options)
-            for index, (i, c, s, n) in enumerate(zip(inputs, channels, strides, blocks)))
-        self.checkpointing = checkpointing
-
-    def forward(self, image):
-        x = image
-        for stage in self.stages:
-            x = checkpoint(stage, x, use_reentrant=False) if self.checkpointing and torch.is_grad_enabled() else stage(x)
-        return x
-
-
-class SequenceLayer(nn.Module):
+class SequenceLayer(TransformerLayer):
     """One pre-norm transformer layer shared by the history stream and the decision tokens."""
-    def __init__(self, width, heads, ffn):
-        super().__init__()
-        if width % heads:
-            raise ValueError('Transformer width must divide by its heads')
-        self.heads = heads
-        self.norm1, self.norm2 = nn.LayerNorm(width), nn.LayerNorm(width)
-        self.qkv = nn.Linear(width, 3*width)
-        self.out = nn.Linear(width, width)
-        self.ffn = nn.Sequential(nn.Linear(width, ffn), nn.GELU(), nn.Linear(ffn, width))
-
-    def split(self, x):
-        b, n, width = x.shape
-        shape = lambda t: t.reshape(b, n, self.heads, width//self.heads).transpose(1, 2)
-        return tuple(map(shape, self.qkv(x).chunk(3, -1)))
-
-    def merge(self, value):
-        b, heads, n, d = value.shape
-        return self.out(value.transpose(1, 2).reshape(b, n, heads*d))
 
     def history(self, s):
         """Causal history stream: (B, T, W) -> (B, T, W)."""
