@@ -189,6 +189,11 @@ def plot_rollouts(vol, fibers, seeds, paths, reasons, path, max_len=400., half=1
     return summ
 
 
+def plot_run_curves(out, model_type):
+    """The run's loss and monitor curves (``out/curves.png`` from ``out/log.jsonl``)."""
+    plot_curves(Path(out)/'log.jsonl', Path(out)/'curves.png', loss_key='flow' if model_type == 'flow' else 'geometry')
+
+
 def plot_curves(log_path, path, *, loss_key='flow'):
     recs = []
     for line in Path(log_path).read_text().splitlines():

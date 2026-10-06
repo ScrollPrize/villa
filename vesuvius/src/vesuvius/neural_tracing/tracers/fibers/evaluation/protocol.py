@@ -7,10 +7,15 @@ selection. Runs report the strict first-departure metrics together with decision
 geometric outcomes, by source and split. Comparisons pair identical seeds and resample
 fibers. The final group never enters operating-point selection.
 
-  python -m vesuvius.neural_tracing.tracers.fibers.evaluation.evaluate calibrate --checkpoint CK --out DIR
-  python -m vesuvius.neural_tracing.tracers.fibers.evaluation.evaluate run --checkpoint CK --out FILE.json \\
+Paris 4 uses its frozen monitor/calibration/final seeds; each AFV source uses its own
+seeded validation manifest (the same seeds the trainer writes as ``validation_<name>.json``).
+AFV holdouts carry a neighbor detector over their own catalog; Paris 4 has no neighbor paths,
+so its held-out identity coverage is reported as absent.
+
+  python -m vesuvius.neural_tracing.tracers.fibers.evaluation.protocol calibrate --checkpoint CK --out DIR
+  python -m vesuvius.neural_tracing.tracers.fibers.evaluation.protocol run --checkpoint CK --out FILE.json \\
       [--confidence .5 | --policy DIR/selection.json] [--splits final] [--max-len 2000]
-  python -m vesuvius.neural_tracing.tracers.fibers.evaluation.evaluate compare BASE.json NEW.json
+  python -m vesuvius.neural_tracing.tracers.fibers.evaluation.protocol compare BASE.json NEW.json
 """
 from __future__ import annotations
 
@@ -25,7 +30,9 @@ import numpy as np
 from vesuvius.neural_tracing.tracers.fibers.evaluation.scoring import EvaluationAudit, evaluate, monitor_coverage, summarize_outcomes
 from vesuvius.neural_tracing.tracers.shared.io import jsonable, write_json as write
 from vesuvius.neural_tracing.tracers.shared.policy import checkpoint_policy
-from vesuvius.neural_tracing.tracers.fibers.tracing.trace import TraceParams
+from vesuvius.neural_tracing.tracers.fibers.tracing.trace import FiberTracer, TraceParams
+from vesuvius.neural_tracing.tracers.models.checkpoint import load_checkpoint
+from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume
 
 SPLITS = ('monitor', 'calibration', 'final')
 THRESHOLDS = (.5, .6, .7, .8, .85, .9, .95)
@@ -48,14 +55,13 @@ def trace_rows(tracer, source, split, *, max_len, tolerance, batch):
     return result
 
 
-def run_policy(checkpoint, sources, splits, policy, *, checkpoint_loader, tracer_class, device, max_len, batch,
-               forward_chunk=0):
-    model, crop, n_history, _, ck = checkpoint_loader(checkpoint, device)
+def run_policy(checkpoint, sources, splits, policy, *, device, max_len, batch, forward_chunk=0):
+    model, crop, n_history, _, ck = load_checkpoint(checkpoint, device)
     tolerance = float(ck.get('tolerance', 1.5))
     rows = []
     for source in sources:
-        tracer = tracer_class(model, source['volume'], crop, n_history,
-                              TraceParams.from_policy(policy, max_len=max_len, forward_chunk=forward_chunk), device=device)
+        tracer = FiberTracer(model, source['volume'], crop, n_history,
+                             TraceParams.from_policy(policy, max_len=max_len, forward_chunk=forward_chunk), device=device)
         try:
             for split in splits:
                 rows.extend(trace_rows(tracer, source, split, max_len=max_len, tolerance=tolerance, batch=batch))
@@ -77,18 +83,17 @@ def manifest_digest(sources, splits):
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=jsonable).encode()).hexdigest()
 
 
-def calibrate(args, sources, *, checkpoint_loader, tracer_class):
+def calibrate(args, sources):
     """Threshold sweep on calibration seeds only; select coverage at >= 95% scored precision."""
     out = Path(args.out)
     if (out/'selection.json').exists():
         raise FileExistsError('Selection already locked; use a new output directory')
-    model, _, _, _, ck = checkpoint_loader(args.checkpoint, 'cpu')
+    model, _, _, _, ck = load_checkpoint(args.checkpoint, 'cpu')
     reports = []
     for threshold in args.thresholds:
         policy = checkpoint_policy(ck, model.cfg, confidence=threshold, n_commit=args.n_commit, gate=args.gate)
-        rows, _ = run_policy(args.checkpoint, sources, ['calibration'], policy, checkpoint_loader=checkpoint_loader,
-                             tracer_class=tracer_class, device=args.device, max_len=args.max_len, batch=args.batch,
-                             forward_chunk=args.forward_chunk)
+        rows, _ = run_policy(args.checkpoint, sources, ['calibration'], policy, device=args.device,
+                             max_len=args.max_len, batch=args.batch, forward_chunk=args.forward_chunk)
         summary = grouped_summary(rows)
         report = dict(threshold=threshold, operating_policy=policy.to_dict(), summary=summary)
         write(out/f'calibration_c{threshold:.3f}.json', dict(report, rows=rows))
@@ -117,10 +122,10 @@ def calibrate(args, sources, *, checkpoint_loader, tracer_class):
     return outcome
 
 
-def run(args, sources, *, checkpoint_loader, tracer_class):
+def run(args, sources):
     if 'final' in args.splits and args.policy is None and args.confidence is None:
         raise ValueError('Final evaluation needs an explicit --confidence or a calibration --policy')
-    model, _, _, _, ck = checkpoint_loader(args.checkpoint, 'cpu')
+    model, _, _, _, ck = load_checkpoint(args.checkpoint, 'cpu')
     if args.policy is not None:
         selection = json.loads(Path(args.policy).read_text())
         if selection.get('split') != 'calibration' or selection.get('selected') is None:
@@ -131,9 +136,8 @@ def run(args, sources, *, checkpoint_loader, tracer_class):
     else:
         policy = checkpoint_policy(ck, model.cfg, confidence=args.confidence, n_commit=args.n_commit, gate=args.gate)
     started = time.monotonic()
-    rows, ck = run_policy(args.checkpoint, sources, args.splits, policy, checkpoint_loader=checkpoint_loader,
-                          tracer_class=tracer_class, device=args.device, max_len=args.max_len, batch=args.batch,
-                          forward_chunk=args.forward_chunk)
+    rows, ck = run_policy(args.checkpoint, sources, args.splits, policy, device=args.device, max_len=args.max_len,
+                          batch=args.batch, forward_chunk=args.forward_chunk)
     result = dict(checkpoint=str(Path(args.checkpoint).resolve()), step=ck.get('step'), operating_policy=policy.to_dict(),
                   policy_source=args.policy or 'explicit', max_len=args.max_len, splits=list(args.splits),
                   sources=[s['name'] for s in sources], manifest_sha256=manifest_digest(sources, args.splits),
@@ -220,11 +224,44 @@ def parser(description=__doc__):
     return ap
 
 
-def main(argv=None, *, checkpoint_loader, tracer_class, source_loader):
+DATASET_CONFIG = Path(__file__).parents[1]/'configs'/'datasets'/'paris50.json'
+
+
+def dataset_sources(args, config=DATASET_CONFIG):
+    from vesuvius.neural_tracing.tracers.fibers.data.afv_neighbors import AFVBank
+    from vesuvius.neural_tracing.tracers.fibers.data.datasets import load_primary_dataset, open_afv_source, read_dataset_config, validation_manifest
+    from vesuvius.neural_tracing.tracers.fibers.data.bank_geometry import BankSwitchDetector
+    _, _, _, paris_spec, checkpoint = load_checkpoint(args.checkpoint, 'cpu')
+    document, _ = read_dataset_config(config)
+    normalization = checkpoint['ct_normalization']
+    sources = []
+    for source in document['sources']:
+        if args.sources and source['name'] not in args.sources:
+            continue
+        if source['kind'] == 'paris4':
+            from vesuvius.neural_tracing.tracers.shared.crop_sampling.normalization import prepare_normalization
+            spec = paris_spec  # the checkpoint's own volume, bound to its recorded CT normalization
+            prepare_normalization(Path(args.out).parent if args.command == 'run' else args.out, [spec], known=normalization)
+            _, _, validation, manifest = load_primary_dataset(document, spec)
+            detector = None
+        else:
+            _, validation, spec, _ = open_afv_source(source, document['cache_dir'], normalization)
+            manifest = validation_manifest(validation, spec, source['validation']['seed'])
+            detector = BankSwitchDetector([AFVBank(validation)])
+        sources.append(dict(name=source['name'], fibers=validation, manifest=manifest, detector=detector,
+                            volume=CTVolume(spec)))
+    return sources
+
+
+def main(argv=None):
     args = parser().parse_args(argv)
     if args.command == 'compare':
         return compare(args)
-    sources = source_loader(args)
+    sources = dataset_sources(args)
     if args.command == 'calibrate':
-        return calibrate(args, sources, checkpoint_loader=checkpoint_loader, tracer_class=tracer_class)
-    return run(args, sources, checkpoint_loader=checkpoint_loader, tracer_class=tracer_class)
+        return calibrate(args, sources)
+    return run(args, sources)
+
+
+if __name__ == '__main__':
+    main()

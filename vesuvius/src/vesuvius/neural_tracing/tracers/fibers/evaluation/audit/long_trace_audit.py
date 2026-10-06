@@ -15,9 +15,9 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from vesuvius.neural_tracing.tracers.fibers.evaluation.evaluate import dataset_sources
+from vesuvius.neural_tracing.tracers.fibers.evaluation.protocol import dataset_sources
 from vesuvius.neural_tracing.tracers.fibers.evaluation.scoring import EvaluationAudit, evaluate, monitor_coverage, score_trace, summarize_outcomes
-from vesuvius.neural_tracing.tracers.fibers.evaluation.recovery_scoring import recovery_score
+from vesuvius.neural_tracing.tracers.fibers.evaluation.audit.recovery_scoring import recovery_score
 from vesuvius.neural_tracing.tracers.fibers.tracing.trace import FiberTracer
 from vesuvius.neural_tracing.tracers.shared.io import jsonable, write_json as write
 from vesuvius.neural_tracing.tracers.shared.geometry import arclength, interp_at, tangent_at

@@ -25,7 +25,6 @@ from vesuvius.neural_tracing.tracers.shared.policy import (
     DEFAULT_CONFIDENCE, DEFAULT_GATE, gate_horizon, OperatingPolicy)
 from vesuvius.neural_tracing.tracers.fibers.train.runloop import RunLog, lr_at, prepare_run_dir, training_rng_state
 from vesuvius.neural_tracing.tracers.shared.system import raise_open_file_limit
-from vesuvius.neural_tracing.tracers.shared.tensors import move_batch
 from vesuvius.neural_tracing.tracers.models.checkpoint import initialize_model_weights, read_checkpoint, write_checkpoint
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume
 from vesuvius.neural_tracing.tracers.models.model import config_from_checkpoint
@@ -34,7 +33,9 @@ from vesuvius.neural_tracing.tracers.fibers.tracing.trace import FiberTracer
 from vesuvius.neural_tracing.tracers.fibers.train import run_config
 from vesuvius.neural_tracing.tracers.fibers.train.supervision import commit_window
 from vesuvius.neural_tracing.tracers.fibers.train.step import initialize_training_optimizer, optimizer_update, prepare_training
-from vesuvius.neural_tracing.tracers.fibers.evaluation.recovery import monitor_fixture, evaluate_monitor
+from vesuvius.neural_tracing.tracers.fibers.evaluation.monitor.plots import plot_run_curves
+from vesuvius.neural_tracing.tracers.fibers.evaluation.monitor.recovery import monitor_fixture, evaluate_monitor
+from vesuvius.neural_tracing.tracers.fibers.evaluation.monitor.rollouts import monitor_afv_sources, training_diagnostics
 from vesuvius.neural_tracing.tracers.fibers.frames.learned import configured_frame_policy, frame_predictor, bind_frame_checkpoint
 from vesuvius.neural_tracing.tracers.fibers.train.training_log import format_training_log, TrainingInterval, SamplingLedger
 
@@ -97,60 +98,6 @@ class DecisionBatchPrefetch:
             self.closed = True
             self.pending.cancel()
             self.executor.shutdown(wait=True, cancel_futures=True)
-
-
-@torch.no_grad()
-def training_diagnostics(model, cpu_batch, tracer, fibers, seeds, out, step, log, *, device, dataset_name=None):
-    """Plot EMA proposals and the same monitor rollouts used for logged metrics."""
-    from vesuvius.neural_tracing.tracers.fibers.evaluation.diag import plot_batch, plot_curves, plot_refinement, plot_rollouts
-    from vesuvius.neural_tracing.tracers.fibers.evaluation.scoring import evaluate
-    from vesuvius.neural_tracing.tracers.fibers.evaluation.scoring import rollout_summary
-
-    images = Path(out)/'images'
-    images.mkdir(exist_ok=True)
-    # Bound image size even when training with larger batches.
-    def take(value):
-        return {k: take(v) for k, v in value.items()} if isinstance(value, dict) else value[:6]
-    batch = move_batch(take(cpu_batch), device)
-    was_training = model.training
-    threshold_before = tracer.p.confidence
-    model.eval()
-    try:
-        with torch.autocast('cuda', dtype=torch.bfloat16, enabled=torch.device(device).type == 'cuda'):
-            prediction = model(batch['x'], batch['hist'], batch['hmask'],
-                               n_commit=tracer.p.n_commit)
-        points = prediction['points']
-        target = torch.cat((batch['plane_ab'], points[..., 2:]), -1)
-        for scale, crop in (('fine', model.cfg.fine),):
-            filename = f'batch_{step:06d}.png'
-            plot_batch(batch['x'][scale], points, target, batch['plane_mask'], crop, images/filename,
-                       batch['hist'], batch['hmask'], batch['gt_history'], batch['gt_history_mask'],
-                       source=batch['source'], terminal=batch['terminal'], confidence=prediction['confidence'])
-        curves = prediction.get('solver_points', prediction['refinement_points'])
-        labels = ([f'integration stage {i}' for i in range(curves.shape[1])] if 'solver_points' in prediction
-                  else ['initial proposal']+[f'feedback proposal {i}' for i in range(1, curves.shape[1])])
-        plot_refinement(curves, batch['hist'], batch['hmask'],
-                        images/f'correction_{step:06d}.png',
-                        labels=labels,
-                        target=target, target_mask=batch['plane_mask'])
-        for threshold in (.5,):
-            if not seeds:
-                break
-            tracer.p.confidence = threshold
-            traces = []
-            rows, _ = evaluate(tracer, fibers, seeds, batch=1,
-                               coverage_max_len=tracer.p.max_len,
-                               on_trace=lambda seed, path, reason: traces.append((path, reason)))
-            paths, reasons = zip(*traces)
-            plot_rollouts(tracer.vol, fibers, seeds, paths, reasons,
-                          images/f'rollout_{step:06d}_c{threshold}.png', tracer.p.max_len, rows=rows)
-            log.record(dict(step=step, split='monitor', threshold=threshold,
-                            **({'dataset':dataset_name} if dataset_name else {}),
-                            coverage_max_len=tracer.p.max_len, **rollout_summary(rows)))
-        plot_curves(Path(out)/'log.jsonl', Path(out)/'curves.png', loss_key='flow' if model.cfg.model_type == 'flow' else 'geometry')
-    finally:
-        model.train(was_training)
-        tracer.p.confidence = threshold_before
 
 
 def build_parser():
@@ -473,8 +420,7 @@ def main(argv=None):
                     interval_updates=step-interval_step,
                     cuda_peak_allocated_gib=torch.cuda.max_memory_allocated(args.device)/2**30
                         if torch.device(args.device).type == 'cuda' else None))
-                from vesuvius.neural_tracing.tracers.fibers.evaluation.diag import plot_curves
-                plot_curves(out/'log.jsonl', out/'curves.png', loss_key='flow' if model.cfg.model_type == 'flow' else 'geometry')
+                plot_run_curves(out, model.cfg.model_type)
                 interval_metrics = TrainingInterval()
                 ledger = SamplingLedger()
                 interval_started, interval_step = now, step
@@ -507,7 +453,7 @@ def main(argv=None):
             # The batch renderer reads the patch-token models' internals; sequence models use the monitor rollouts.
             if args.batch_diag_every and (step % args.batch_diag_every == 0
                                          or (resume is not None and step == done+1)):
-                from vesuvius.neural_tracing.tracers.fibers.evaluation.batch_diagnostic import render_microbatch
+                from vesuvius.neural_tracing.tracers.fibers.evaluation.monitor.microbatch import render_microbatch
                 began = time.monotonic()
                 report = render_microbatch(ema, batches[-1], out, step, device=args.device,
                     n_commit=args.n_commit, tolerance=args.tolerance, dataset_names=dataset.names,
@@ -521,23 +467,9 @@ def main(argv=None):
                 began = time.monotonic()
                 training_diagnostics(ema, diagnostic['cpu_batch'], tracer, val_f, manifest['monitor'], out, step, log,
                                      device=args.device,dataset_name=primary_source['name'])
-                from vesuvius.neural_tracing.tracers.fibers.evaluation.scoring import evaluate
-                from vesuvius.neural_tracing.tracers.fibers.evaluation.scoring import rollout_summary
-                from vesuvius.neural_tracing.tracers.fibers.tracing.trace import TraceParams
-                for source, source_dataset in zip(dataset_document['sources'],dataset.datasets):
-                    if source['kind'] != 'afv':
-                        continue
-                    source_tracer = FiberTracer(ema,CTVolume(source_dataset.vol_spec),cfg.fine,cfg.n_history,
-                        TraceParams.from_policy(policy,max_len=args.diag_max_len),device=args.device)
-                    try:
-                        rows,_ = evaluate(source_tracer,source_dataset.validation_fibers,
-                            source_dataset.validation_manifest['monitor'],batch=1,coverage_max_len=args.diag_max_len)
-                        log.record(dict(step=step,split='monitor',dataset=source['name'],
-                            threshold=.5,coverage_max_len=args.diag_max_len,**rollout_summary(rows)))
-                    finally:
-                        source_tracer.close()
-                from vesuvius.neural_tracing.tracers.fibers.evaluation.diag import plot_curves
-                plot_curves(out/'log.jsonl',out/'curves.png',loss_key='flow' if model.cfg.model_type == 'flow' else 'geometry')
+                monitor_afv_sources(ema, dataset_document['sources'], dataset.datasets, cfg, policy, step, log,
+                                    max_len=args.diag_max_len, device=args.device)
+                plot_run_curves(out, model.cfg.model_type)
                 periodic['diagnostics_seconds'] = time.monotonic()-began
             if recovery_states is not None and step % args.recovery_every == 0:
                 began = time.monotonic()

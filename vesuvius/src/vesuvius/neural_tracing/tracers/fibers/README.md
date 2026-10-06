@@ -95,7 +95,7 @@ live and synthetic task shares (which sequence training does not support) move t
 ```bash
 ../../../../../.venv/bin/python -m vesuvius.neural_tracing.tracers.fibers.tracing.inference --help
 ../../../../../.venv/bin/python -m vesuvius.neural_tracing.tracers.fibers.train.dagger.collect --help
-../../../../../.venv/bin/python -m vesuvius.neural_tracing.tracers.fibers.evaluation.evaluate --help
+../../../../../.venv/bin/python -m vesuvius.neural_tracing.tracers.fibers.evaluation.protocol --help
 ```
 
 New runs use the frozen `heading_model_l0_w16_centered_frame/ckpt_064000.pt` for current-crop heading and roll. CT
@@ -167,7 +167,7 @@ Long held-out failure audits can reuse the shared tracer and scorers while recor
 policy decision and scoring the same path at 400, 1,000, and 2,000 voxels:
 
 ```bash
-../../../../../.venv/bin/python -m vesuvius.neural_tracing.tracers.fibers.evaluation.long_trace_audit \
+../../../../../.venv/bin/python -m vesuvius.neural_tracing.tracers.fibers.evaluation.audit.long_trace_audit \
   --checkpoint output/RUN/ckpt_079000.pt --out output/RUN/long_audit/primary --count 64 --batch 8
 ```
 
@@ -185,9 +185,9 @@ Local agreement is not independent confirmation of fiber identity.
 Render CT sections around selected departures and stops, plus aggregate diagnostics:
 
 ```bash
-../../../../../.venv/bin/python -m vesuvius.neural_tracing.tracers.fibers.evaluation.summarize_long_audit \
+../../../../../.venv/bin/python -m vesuvius.neural_tracing.tracers.fibers.evaluation.audit.summarize_long_audit \
   output/RUN/long_audit --render
-../../../../../.venv/bin/python -m vesuvius.neural_tracing.tracers.fibers.evaluation.annotation_audit \
+../../../../../.venv/bin/python -m vesuvius.neural_tracing.tracers.fibers.evaluation.audit.annotation_audit \
   output/RUN/long_audit
 ```
 

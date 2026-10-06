@@ -7,10 +7,10 @@ from pathlib import Path
 from vesuvius.neural_tracing.tracers.fibers.data.replay import OnPolicyStates
 from vesuvius.neural_tracing.tracers.fibers.frames.ct import FRAME_POLICY
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume
-from vesuvius.neural_tracing.tracers.fibers.evaluation.recovery_fixtures import FIXTURE_STRATA, make_recovery_states, evaluate_recovery_states, recovery_counts
+from vesuvius.neural_tracing.tracers.fibers.evaluation.monitor.recovery_fixtures import FIXTURE_STRATA, make_recovery_states, evaluate_recovery_states, recovery_counts
 from vesuvius.neural_tracing.tracers.fibers.data.observations import observation_builder
 from vesuvius.neural_tracing.tracers.fibers.tracing.trace import FiberTracer
-from vesuvius.neural_tracing.tracers.fibers.evaluation.diagnostics import decision_rows, summarize_decisions
+from vesuvius.neural_tracing.tracers.fibers.evaluation.monitor.diagnostics import decision_rows, summarize_decisions
 
 
 def monitor_fixture(path, fibers, manifest, sample, spec, seed_count=8):

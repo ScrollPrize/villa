@@ -10,7 +10,7 @@ from vesuvius.neural_tracing.tracers.fibers.train.runloop import update_ema, res
 from vesuvius.neural_tracing.tracers.shared.tensors import fixed_rows, move_batch
 from vesuvius.neural_tracing.tracers.fibers.data.observations import LOCATION_SOURCES
 from vesuvius.neural_tracing.tracers.fibers.train.supervision import commit_window, loss_terms
-from vesuvius.neural_tracing.tracers.fibers.evaluation.diagnostics import decision_rows, summarize_decisions
+from vesuvius.neural_tracing.tracers.fibers.evaluation.monitor.diagnostics import decision_rows, summarize_decisions
 
 
 def prepare_training(model, batch_size=2, *, backend=None):
