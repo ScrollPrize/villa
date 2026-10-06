@@ -40,7 +40,9 @@ bash scripts/stop.sh NAME                                      # the trainer and
 ```
 
 - `dataset` is the dataset configuration (data/datasets.py): exactly one `paris4` source (fibers, fiber zarrs, CT,
-  seed manifest, `val_z`, negative bank) and any number of `afv` sources, each with a weight and validation split.
+  seed manifest, `val_z`) and any number of `afv` sources, each with a weight and validation split. Neighboring
+  annotations of AFV sources supply foreign-path masks, synthetic wrong continuations and switch detection; Paris 4
+  has no neighbor paths.
 - `model` takes `type` plus any field of that type's configuration class (`RegressionConfig`, `FlowConfig`,
   `SequenceConfig`), including `fine` (the crop) and `frame_checkpoint` (the frozen heading/normal model; its path
   and SHA-256 are recorded with the model).
@@ -48,7 +50,8 @@ bash scripts/stop.sh NAME                                      # the trainer and
   `trace_confidence`, `gate`), sampling, task shares (`task_shares`: a full `{task: share}` dict; absent tasks get 0),
   DAgger collection and diagnostics; `runtime` the machine settings (device, workers, threads, CT prefetch).
 - Omitted fields take the model type's defaults (`run_config.DEFAULTS` and the configuration classes); unknown keys
-  are errors; relative paths resolve against the configuration file's folder.
+  are errors, except removed settings (`run_config.RETIRED`), which are dropped when they hold a value that matches
+  the current code and refused otherwise; relative paths resolve against the configuration file's folder.
 - The trainer writes the complete resolved configuration to `output/RUN/run.json` and into every checkpoint
   (`run_config`); `configs/runs/{regression,flow,sequence}.json` reproduce the three runs on this machine.
 
@@ -121,7 +124,7 @@ identity heads, whole-crop planes); there is no training support.
 | --- | --- |
 | `models` | The follower contract (`model.py`), the crop transformer (`regression`, `flow`), flow matching, the sequence model |
 | `train` | Entry point and run configuration, objectives, checkpoints, logging, online collection, live continuation |
-| `data` | Volumes, normalization, observation construction, labels, sampling, replay, neighbor banks |
+| `data` | Volumes, normalization, observation construction, labels, sampling, replay, AFV neighbors |
 | `tracing` | Inference, collection, heading/frame resolution, commit policy, rollout |
 | `evaluation` | Frozen-seed evaluation, recovery, diagnostics, benchmarks |
 | `heading_model` | Heading/normal trainer and frozen frame predictor used by follower crop generation |

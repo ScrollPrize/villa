@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
+from scipy.spatial import cKDTree
 import torch
 import torch.nn.functional as F
 
@@ -116,3 +117,73 @@ def sample_oriented_fast(
     idx = world - starts_zyx.flip(-1)[:, None, None, None, :].to(world.dtype)
     grid = idx * (2.0 / (S - 1)) - 1.0
     return F.grid_sample(raw.float(), grid, mode="bilinear", padding_mode="zeros", align_corners=True) * (1.0 / 255.0)
+
+
+def dense_line(points, step):
+    """Densify every original segment, preserving corners and both endpoints."""
+    points = np.asarray(points, dtype=np.float64)
+    if points.ndim != 2 or points.shape[1] != 3 or len(points) < 2 or not np.isfinite(points).all():
+        raise ValueError('Expected a finite polyline with at least two xyz points')
+    if not np.isfinite(step) or step <= 0:
+        raise ValueError('Sampling step must be positive')
+    # Vectorized, bit-identical to the per-segment loop ``a + arange(n)/n*(b-a)`` with
+    # n = ceil(norm(b-a)/step). Only n and the zero-length test depend on the length;
+    # where the vectorized length could round across either threshold, the segment
+    # takes the loop's exact np.linalg.norm.
+    delta = points[1:]-points[:-1]
+    length = np.sqrt(np.einsum('ij,ij->i', delta, delta))
+    ratio = length/step
+    close = (np.abs(ratio-np.rint(ratio)) <= 1e-9*np.maximum(ratio, 1.)) | (np.abs(length-1e-9) <= 1e-12)
+    for i in np.flatnonzero(close):
+        length[i] = np.linalg.norm(delta[i])
+    keep = length > 1e-9
+    if not keep.any():
+        raise ValueError('Polyline has zero length')
+    counts = np.maximum(1, np.ceil(length[keep]/step).astype(np.int64))
+    segment = np.repeat(np.arange(len(counts)), counts)
+    k = np.arange(len(segment))-np.repeat(np.cumsum(counts)-counts, counts)
+    t = (k/counts[segment])[:, None]
+    return np.concatenate([points[:-1][keep][segment]+t*delta[keep][segment], points[-1:]])
+
+
+class PolylineIndex:
+    """Reusable exact-distance index of a polyline's segments."""
+    def __init__(self, target):
+        self.target = np.asarray(target, float)
+        self.a = self.target[:-1]
+        self.delta = np.diff(self.target, axis=0)
+        self.length2 = np.einsum('ij,ij->i', self.delta, self.delta)
+        self.tree = cKDTree(self.a+self.delta/2)
+        self.half = np.sqrt(self.length2.max())/2
+
+
+def exact_nearest(points, target, index=None):
+    """Exact nearest points on a polyline, including interiors of long segments."""
+    p = np.asarray(points, float)
+    index = index or PolylineIndex(target)
+    # Bound temporary candidate arrays for large queries.
+    if len(p) > 256:
+        chunks = [exact_nearest(p[i:i+256], target, index) for i in range(0, len(p), 256)]
+        return tuple(np.concatenate(values) for values in zip(*chunks))
+    a, delta, length2 = index.a, index.delta, index.length2
+    # Midpoint broad phase: the nearest segment must be within current best
+    # distance + half the longest segment of the query point.
+    tree = index.tree
+    _, first = tree.query(p)
+    def project(points, ids):
+        u = np.clip(((points-a[ids])*delta[ids]).sum(-1)/np.maximum(length2[ids], 1e-20), 0, 1)
+        q = a[ids]+u[:, None]*delta[ids]
+        return np.linalg.norm(points-q, axis=-1), q, u
+    best = project(p, first)[0]
+    # Preserve the traversal order of the former single-point queries, including
+    # first-candidate tie breaking. SciPy otherwise sorts batched query results.
+    groups = tree.query_ball_point(p, best+index.half+1e-8, return_sorted=False)
+    counts = np.fromiter(map(len, groups), dtype=np.int64, count=len(p))
+    offsets = np.r_[0, np.cumsum(counts)[:-1]]
+    ids = np.concatenate(groups).astype(np.int64, copy=False)
+    distance, nearest, u = project(np.repeat(p, counts, axis=0), ids)
+    minima = np.minimum.reduceat(distance, offsets)
+    positions = np.arange(len(ids))
+    chosen = np.minimum.reduceat(np.where(distance == np.repeat(minima, counts),
+                                         positions, len(ids)), offsets)
+    return distance[chosen], nearest[chosen], ids[chosen], u[chosen]

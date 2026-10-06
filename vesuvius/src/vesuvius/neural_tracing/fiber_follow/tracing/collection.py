@@ -326,7 +326,6 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer, bank_loader=
     ap.add_argument('--threads', type=int, default=4)
     ap.add_argument('--out', required=True)
     ap.add_argument('--seed', type=int, default=1)
-    ap.add_argument('--failure-bank', action='append', default=[], help='Trusted bank for switch labeling; repeat for multiple banks')
     ap.add_argument('--bank-switch-tolerance', type=float, default=.75)
     ap.add_argument('--bank-own-tolerance', type=float, default=1.5)
     args = ap.parse_args(argv)

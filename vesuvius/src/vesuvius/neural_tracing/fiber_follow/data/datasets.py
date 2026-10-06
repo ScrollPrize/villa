@@ -1,5 +1,4 @@
 """Explicit dataset provenance and weighted, source-local training batches."""
-from collections import OrderedDict
 from dataclasses import replace
 import hashlib
 import json
@@ -12,11 +11,10 @@ from vesuvius.neural_tracing.fiber_follow.data.afv import AFVFibers
 from vesuvius.neural_tracing.fiber_follow.data.data import FollowDataset, ZBand, fiber_manifest, load_fibers
 from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolumeSpec
 from vesuvius.neural_tracing.fiber_follow.data.observations import IdentityObservationBuilder
-from vesuvius.neural_tracing.fiber_follow.data.neighbor_bank import NeighborBank
+from vesuvius.neural_tracing.fiber_follow.data.afv_neighbors import AFVBank
 
 
-PRIMARY_OPTIONS = ('fibers', 'fiber_zarrs', 'ct', 'manifest', 'val_z', 'negative_bank',
-                   'near_negative_bank', 'following_bank', 'continuation_bank')
+PRIMARY_OPTIONS = ('fibers', 'fiber_zarrs', 'ct', 'manifest', 'val_z')
 
 
 def crop_level_options(source):
@@ -82,7 +80,7 @@ def parse_dataset_config(document, base):
     if len(set(names)) != len(names) or sum(s['kind'] == 'paris4' for s in document['sources']) != 1:
         raise ValueError('Require unique source names and exactly one Paris 4 source')
     primary = next(s for s in document['sources'] if s['kind'] == 'paris4')
-    for key in ('fibers', 'fiber_zarrs', 'ct', 'manifest', 'negative_bank', 'val_z'):
+    for key in ('fibers', 'fiber_zarrs', 'ct', 'manifest', 'val_z'):
         if key not in primary:
             raise ValueError(f'Paris 4 source is missing {key}')
     digest = hashlib.sha256(json.dumps(document, sort_keys=True).encode()).hexdigest()
@@ -140,137 +138,6 @@ def load_primary_dataset(document, spec):
     train = [f for f in fibers if f.name not in reserved|extra and not f.foldbacks]
     manifest = validation_manifest(val,spec,source['validation']['seed'])
     return fibers,train,val,manifest
-
-
-class HoldoutFilteredBank(NeighborBank):
-    """Prevent mined neighbors from reintroducing a reserved Paris 4 fiber."""
-    def __init__(self,*args,heldout=(),**kwargs):
-        super().__init__(*args,**kwargs)
-        from scipy.spatial import cKDTree
-        self._heldout_tree = cKDTree(np.concatenate([f.points for f in heldout])) if heldout else None
-        self._heldout_cache = OrderedDict()
-
-    def allowed_path(self,points):
-        if self._heldout_tree is None:
-            return True
-        key = hashlib.sha256(np.asarray(points).tobytes()).digest()
-        if key not in self._heldout_cache:
-            # Quarter-voxel neighbor samples and <=1 voxel heldout vertices:
-            # a 2-voxel guard conservatively covers their interpolation gaps.
-            self._heldout_cache[key] = bool((self._heldout_tree.query(points)[0] > 2.).all())
-            if len(self._heldout_cache)>256:
-                self._heldout_cache.popitem(last=False)
-        return self._heldout_cache[key]
-
-    def draw_path(self,*args,**kwargs):
-        for _ in range(8):
-            result = super().draw_path(*args,**kwargs)
-            if result is not None and self.allowed_path(result[1]):
-                return result
-        return None
-
-    def spatial_records(self,*args,**kwargs):
-        return [r for r in super().spatial_records(*args,**kwargs) if self.allowed_path(r['samples'])]
-
-
-def apply_primary_source(args, document):
-    primary = next(s for s in document['sources'] if s['kind'] == 'paris4')
-    for key in PRIMARY_OPTIONS:
-        setattr(args, key, primary.get(key))
-
-
-class AFVBank(NeighborBank):
-    """Reuse existing foreign-mask clearance rules on AFV spatial queries.
-
-    These are supervision-only paths, never image inputs. Nearby paths also
-    supply foreign masks and certified synthetic failures.
-    """
-    def __init__(self, fibers):
-        self.fibers = fibers
-        self.exclusion = 1.5
-        self._trees = OrderedDict()
-        self.root = Path(fibers.path)
-        self.run = {'mining': {'min_distance': self.exclusion}, 'digest': fibers.metadata['uuid']}
-        self._cdf = np.cumsum(fibers.lengths)/fibers.lengths.sum()
-
-    @property
-    def shard_count(self):
-        return 1
-
-    def draw_path(self, rng, *, unique=True, min_length=0., hard_fraction=0.):
-        """Draw a nearby, target-clear continuous path with arc correspondence.
-
-        Parent locations are length weighted; neighbor IDs are sampled without
-        duplicate RTree blocks. Whole-target clearance rejects overlapping
-        duplicates. Unknown/short/nonmatching geometry is retried or skipped.
-        """
-        if not 0 <= hard_fraction <= 1 or min_length < 0:
-            raise ValueError('Invalid AFV neighbor sampling options')
-        from scipy.spatial import cKDTree
-        from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength, interp_at
-        from vesuvius.neural_tracing.fiber_follow.data.neighbor_mining import exact_nearest
-        from vesuvius.neural_tracing.fiber_follow.data.bank_geometry import difficulty_scores, DIFFICULTY_KINDS
-        proposals = []
-        hard = rng.random() < hard_fraction
-        for _ in range(16):
-            fi = int(np.searchsorted(self._cdf, rng.random(), side='right'))
-            parent = self.fibers[fi]
-            at = float(rng.uniform(0., parent.length))
-            anchor = interp_at(parent.points, parent.s, [at])[0]
-            radius = 6. if rng.random() < .5 else 32.
-            ids = self.fibers.nearby_fiber_ids(anchor, radius, self.fibers.catalog[fi][0])
-            if not ids:
-                continue
-            tree, gap = self._target_tree(fi)
-            for neighbor_id in rng.permutation(ids)[:8]:
-                neighbor = self.fibers[self.fibers.id_to_index[int(neighbor_id)]]
-                j = int(np.argmin(np.linalg.norm(neighbor.points-anchor, axis=1)))
-                span = max(160., min_length+32.)
-                a, b = max(0., neighbor.s[j]-span), min(neighbor.length, neighbor.s[j]+span)
-                line = interp_at(neighbor.points, neighbor.s, np.arange(a,b+1e-9,.25))
-                if len(line) < 2:
-                    continue
-                distance, nearest = tree.query(line)
-                supported = ((distance-gap > self.exclusion) & (distance <= 32.)
-                             & (np.abs(parent.s[nearest]-at) <= span))
-                edges = np.diff(np.r_[False,supported,False].astype(np.int8))
-                starts, stops = np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)
-                choices = [(a,b) for a,b in zip(starts,stops) if (b-a-1)*.25 >= max(32.,min_length)]
-                if not choices:
-                    continue
-                begin,end = choices[int(rng.integers(len(choices)))]
-                curve = line[begin:end]
-                if arclength(curve)[-1] < min_length:
-                    continue
-                # Match against the local parent window, then leave stricter
-                # monotonicity/seed observability checks to the existing tasks.
-                near = nearest[begin:end]
-                lo,hi = max(0,int(near.min())-2),min(len(parent.s),int(near.max())+3)
-                _,_,segment,u = exact_nearest(curve,parent.points[lo:hi])
-                matched = parent.s[lo+segment]+u*np.diff(parent.s[lo:hi])[segment]
-                if matched[-1] < matched[0]:
-                    curve,matched = curve[::-1].copy(),matched[::-1]
-                if np.any(np.diff(matched) < -1e-5):
-                    continue
-                proposals.append((fi,curve,(float(matched.min()),float(matched.max()))))
-                break
-            if proposals and (not hard or len(proposals) >= 4):
-                break
-        if not proposals:
-            return None
-        if not hard:
-            return proposals[0]
-        kind = int(rng.integers(len(DIFFICULTY_KINDS)))
-        scores = [difficulty_scores(line,self.fibers[fi])[kind] for fi,line,_ in proposals]
-        return proposals[int(np.argmax(scores))]
-
-    def provenance(self):
-        return dict(kind='afv', path=self.fibers.path, manifest=self.fibers.manifest_entries())
-
-    def spatial_records(self, fi, world, radius=0.):
-        bounds = np.stack((np.min(world, axis=0)-radius, np.max(world, axis=0)+radius))
-        own = self.fibers.catalog[fi][0]
-        return list(self.fibers.nearby_blocks(bounds, own, records=True))
 
 
 class WeightedDatasets(torch.utils.data.IterableDataset):
@@ -349,8 +216,7 @@ def build_mixed_dataset(primary, document, cfg, sample, sampling, args, *, seed,
         else:
             fibers, validation_fibers, spec, sha256 = open_afv_source(source, document['cache_dir'], normalization)
             scale = float(source['grid_scale'])
-            builder = IdentityObservationBuilder(cfg, fibers, sampling, augment=True,
-                                                  negative_bank=AFVBank(fibers))
+            builder = IdentityObservationBuilder(cfg, fibers, sampling, augment=True, neighbors=AFVBank(fibers))
             band = None
             replay_index = Path(out)/'dagger'/source['name']/'replay.json' if out else None
             from vesuvius.neural_tracing.fiber_follow.data.data import load_replay, usable_replay

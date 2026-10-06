@@ -285,11 +285,7 @@ def format_training_log(row):
                 f" | batch {options.get('batch', '?')} / grad steps {options.get('grad_steps', '?')}"
                 f" | causal survival confidence")
     if row.get('event') == 'identity_sampling':
-        bank = row.get('negative_bank_provenance') or {}
-        return (f"{step} | identity sampling"
-                f" | bank {row.get('negative_bank_path', '(see run configuration)')}"
-                f" | {len(bank.get('shard_hashes', {})):,} published shards"
-                f" | run {bank.get('run_digest', 'unknown')[:12]}")
+        return f"{step} | identity sampling (settings in the run configuration)"
     if 'recovery' in row:
         report = row['recovery']
         lines = [f"\n{step} | monitor recovery | {report['states']} states"]

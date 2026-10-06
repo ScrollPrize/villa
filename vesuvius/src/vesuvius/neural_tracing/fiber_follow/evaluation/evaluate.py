@@ -2,8 +2,8 @@
 
 Paris 4 uses its frozen monitor/calibration/final seeds; each AFV source uses its own
 seeded validation manifest (the same seeds the trainer writes as ``validation_<name>.json``).
-AFV holdouts carry a neighbor detector over their own catalog; Paris 4 bank shards cover
-training parents only, so their held-out identity coverage is reported as absent.
+AFV holdouts carry a neighbor detector over their own catalog; Paris 4 has no neighbor paths,
+so its held-out identity coverage is reported as absent.
 """
 from pathlib import Path
 
@@ -16,7 +16,8 @@ DATASET_CONFIG = Path(__file__).parents[1]/'configs'/'mixed_ct_datasets_paris50.
 
 
 def dataset_sources(args, config=DATASET_CONFIG):
-    from vesuvius.neural_tracing.fiber_follow.data.datasets import AFVBank, load_primary_dataset, open_afv_source, read_dataset_config, validation_manifest
+    from vesuvius.neural_tracing.fiber_follow.data.afv_neighbors import AFVBank
+    from vesuvius.neural_tracing.fiber_follow.data.datasets import load_primary_dataset, open_afv_source, read_dataset_config, validation_manifest
     from vesuvius.neural_tracing.fiber_follow.data.bank_geometry import BankSwitchDetector
     _, _, _, paris_spec, checkpoint = load_checkpoint(args.checkpoint, 'cpu')
     document, _ = read_dataset_config(config)

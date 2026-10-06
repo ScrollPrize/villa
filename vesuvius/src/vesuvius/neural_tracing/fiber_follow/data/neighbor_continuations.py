@@ -1,10 +1,9 @@
 """Synthetic wrong-fiber history: noised original prefix (trace_noise), smooth bridge, traced tail."""
 import numpy as np
 
-from vesuvius.neural_tracing.fiber_follow.data.neighbor_mining import exact_nearest
 from vesuvius.neural_tracing.fiber_follow.data.data import SOURCE, label_state, trace_noise
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import (
-    arclength, interp_at, frame_from_heading, normalize,
+    arclength, exact_nearest, interp_at, frame_from_heading, normalize,
 )
 from vesuvius.neural_tracing.fiber_follow.tracing.heading import trace_heading
 from vesuvius.neural_tracing.fiber_follow.data.state_labels import constructed_facts
@@ -30,7 +29,7 @@ def wrong_continuation(bank, cfg, rng, *, tail_length_range=(4., 16.), prefix_le
     tail_length_range = validate_tail_range(tail_length_range)
     requested_tail = float(rng.uniform(*tail_length_range))
     minimum = requested_tail+max(16.,2*bank.run['mining'].get('min_distance',0.))+4
-    draw = bank.draw_path(rng,min_length=minimum,unique=False)
+    draw = bank.draw_path(rng,min_length=minimum)
     if draw is None:
         return None
     fi,line,arc_range = draw

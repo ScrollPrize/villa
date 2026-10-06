@@ -1,6 +1,6 @@
 """Pre-launch sampler check: delivered task shares, replay supply and fresh-trace geometry.
 
-Builds each dataset source exactly as the trainer does (fibers, banks, replay caches,
+Builds each dataset source exactly as the trainer does (fibers, AFV neighbors, replay caches,
 task budget) and draws batch plans without reading CT. Reports requested and delivered
 shares, fallbacks, replay classes, distinct fibers/episodes/events, startup draws and
 realized seed ages, and excursion head offsets, heading error and path curvature. Exits
@@ -76,9 +76,9 @@ def summarize(items, fibers):
 
 def main(argv=None):
     from vesuvius.neural_tracing.fiber_follow.data.observations import IdentityObservationBuilder, IdentitySampling
-    from vesuvius.neural_tracing.fiber_follow.data.datasets import AFVBank, HoldoutFilteredBank, load_primary_dataset, open_afv_source, read_dataset_config
+    from vesuvius.neural_tracing.fiber_follow.data.afv_neighbors import AFVBank
+    from vesuvius.neural_tracing.fiber_follow.data.datasets import load_primary_dataset, open_afv_source, read_dataset_config
     from vesuvius.neural_tracing.fiber_follow.models.model import config_from_checkpoint
-    from vesuvius.neural_tracing.fiber_follow.data.data import ZBand
     from vesuvius.neural_tracing.fiber_follow.train.runloop import read_checkpoint
     from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolumeSpec
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -108,14 +108,13 @@ def main(argv=None):
             continue
         if source['kind'] == 'paris4':
             spec = FiberVolumeSpec(**ck['vol_spec'])
-            _, fibers, heldout, _ = load_primary_dataset(document, spec)
-            band = ZBand(*(v/spec.grid_scale for v in source['val_z']))
-            bank = HoldoutFilteredBank(source['negative_bank'], fibers, band, grid_scale=spec.grid_scale, heldout=heldout)
+            _, fibers, _, _ = load_primary_dataset(document, spec)
+            neighbors = None
         else:
             fibers, _, spec, _ = open_afv_source(source, document['cache_dir'])
-            bank = AFVBank(fibers)
+            neighbors = AFVBank(fibers)
         caches = [OnPolicyStates.load(replay[source['name']])] if source['name'] in replay else []
-        builder = IdentityObservationBuilder(cfg, fibers, sampling, augment=True, negative_bank=bank)
+        builder = IdentityObservationBuilder(cfg, fibers, sampling, augment=True, neighbors=neighbors)
         dataset = FollowDataset(fibers, spec, sample, None, chunk=args.batch, seed=11, budget=budget,
                                 batch_builder=builder, onpolicy=caches)
         if caches:

@@ -47,8 +47,7 @@ TRAINING = dict(
     excursion_rise=[16., 128.], synthetic_tail=[4., 16.], live_continuation_steps=[32, 256],
     # Neighbour banks, augmentation and AFV sampling.
     bank_coverage_probability=.2, bank_hard_fraction=.5, bank_switch_tolerance=.75, bank_own_tolerance=1.5,
-    negative_bank_refresh_seconds=30., negative_bank_cache_mb=64., blur_probability=.25, blur_sigma=[.5, 1.25],
-    lateral_fraction=.1, afv_length_power=3.,
+    blur_probability=.25, blur_sigma=[.5, 1.25], lateral_fraction=.1, afv_length_power=3.,
     # On-policy collection (DAgger) and replay.
     onpolicy=[], dagger_every=1000, dagger_fibers=128, afv_dagger_fibers=384, dagger_batch=24, dagger_forward_chunk=0,
     dagger_trace_len=6000., dagger_before=48., dagger_after=64., dagger_stride=16., replay_keep=4,
@@ -79,6 +78,11 @@ RUNTIME = dict(device='cuda', workers=10, worker_cache_gb=.5, threads=4, dagger_
 # Model fields set by the trainer, not by a configuration.
 DERIVED_MODEL_FIELDS = ('model_type', 'frame_checkpoint_sha256')
 
+# Removed settings, which run files written before their removal still hold: the listed value (ANY: every value) had
+# the effect of the current code, so the setting is dropped on load; any other value is refused.
+ANY = object()
+RETIRED = dict(training=dict(negative_bank_refresh_seconds=ANY, negative_bank_cache_mb=ANY))
+
 
 def model_fields(model_type):
     return {f.name for f in fields(config_class(model_type))}-set(DERIVED_MODEL_FIELDS)
@@ -98,6 +102,14 @@ def model_defaults(model_type):
     values['fine'] = asdict(values['fine'])
     values['frame_checkpoint'] = values.get('frame_checkpoint') or str(DEFAULT_FRAME_CHECKPOINT)
     return json.loads(json.dumps(values))
+
+
+def retire(section, values):
+    for key, inert in RETIRED.get(section, {}).items():
+        if key in values and inert is not ANY and values[key] != inert:
+            raise ValueError(f'The {section} setting {key}={values[key]!r} no longer exists (only {inert!r} is supported)')
+        values.pop(key, None)
+    return values
 
 
 def unknown(section, given, allowed):
@@ -134,7 +146,7 @@ def resolve(document, base='.'):
     run['model'] = dict(type=model_type, **values)
     model_config(run)  # validate the model section now
 
-    training = dict(document.get('training') or {})
+    training = retire('training', dict(document.get('training') or {}))
     defaults = training_defaults(model_type)
     unknown('training', training, defaults)
     if 'task_shares' in training:

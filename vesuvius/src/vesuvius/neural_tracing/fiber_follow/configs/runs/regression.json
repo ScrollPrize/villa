@@ -16,7 +16,6 @@
           45000.0,
           48500.0
         ],
-        "negative_bank": "../../output/neighbor_samples_r0_32_l80_160_v2",
         "grid_scale": 8.0,
         "ct_grid_scale": 4.0,
         "ct_level": 2,

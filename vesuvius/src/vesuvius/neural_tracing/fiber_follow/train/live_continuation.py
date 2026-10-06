@@ -142,11 +142,9 @@ class LiveContinuationSource:
         fiber = dataset.fibers[fi]
         if self.detector is None:
             from vesuvius.neural_tracing.fiber_follow.data.bank_geometry import BankSwitchDetector
-            builder = dataset.batch_builder
-            banks = list({id(b): b for b in (getattr(builder, 'negative_bank', None),
-                getattr(builder, 'near_negative_bank', None), getattr(builder, 'continuation_bank', None))
-                if b is not None}.values())
-            self.detector = BankSwitchDetector(banks, self.switch_tolerance, self.own_tolerance)
+            neighbors = getattr(dataset.batch_builder, 'neighbors', None)
+            self.detector = BankSwitchDetector([neighbors] if neighbors is not None else [],
+                                               self.switch_tolerance, self.own_tolerance)
         labeler = TraceLabeler(fiber, state['labeler']['t'], -1 if reverse else 1,
                                tolerance=dataset.cfg.label_tolerance,
                                max_recovery_distance=dataset.cfg.max_recovery_distance,

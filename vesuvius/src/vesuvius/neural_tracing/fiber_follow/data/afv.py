@@ -117,7 +117,7 @@ class AFVFibers(Sequence):
                 next_segment += len(xyz)-1
             points = np.concatenate(pieces)/self.grid_scale
             # Preserve corners while bounding nearest-vertex clearance error.
-            from vesuvius.neural_tracing.fiber_follow.data.neighbor_mining import dense_line
+            from vesuvius.neural_tracing.fiber_follow.shared.geometry import dense_line
             points = dense_line(points, 1.)
             points, repairs = repair_kinks(points, arclength(points))
             self._cache[index] = TracedFiber(name, points, arclength(points), family,

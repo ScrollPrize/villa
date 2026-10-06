@@ -345,7 +345,7 @@ class EvaluationAudit:
 
     Counts rejected unsafe proposals, stops with a supported continuation, recovery commits
     that cross a certified foreign fiber, and confirmed switches with the length accepted
-    after them. Neighbor-bank coverage is reported because absent contact is not proof
+    after them. Neighbor coverage is reported because absent contact is not proof
     that no foreign fiber exists.
     """
     def __init__(self, tracer, tolerance=1.5, detector=None):

@@ -1,4 +1,4 @@
-"""Paths recorded in frozen artifacts (seed manifests, negative-bank runs) on another machine.
+"""Paths recorded in frozen artifacts (seed manifests, checkpoints) on another machine.
 
 ``FIBER_FOLLOW_PATH_MAP='OLD=NEW;OLD2=NEW2'`` relocates a recorded path whose prefix is OLD to NEW
 (longest prefix first) before it is compared with the paths of this run; the comparison itself stays

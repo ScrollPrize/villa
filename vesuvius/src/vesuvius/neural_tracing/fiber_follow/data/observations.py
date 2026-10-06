@@ -214,11 +214,10 @@ class IdentityObservationBuilder(ObservationBuilder):
     """Foreign masks, identity evidence and augmentation on top of the shared observation."""
 
     def __init__(self,cfg: FollowerConfig,fibers=None,sampling=IdentitySampling(),*,
-                 augment=False,negative_bank=None,near_negative_bank=None,continuation_bank=None):
+                 augment=False,neighbors=None):
         super().__init__(cfg)
         self.fibers,self.sampling,self.augment = fibers,sampling,augment
-        self.negative_bank,self.near_negative_bank = negative_bank,near_negative_bank
-        self.continuation_bank = continuation_bank
+        self.neighbors = neighbors  # neighboring annotations (AFV sources); None: no known neighbors
         self.lateral = deque(maxlen=sampling.lateral_memory)
 
     def apply_roll(self, item):
@@ -267,14 +266,12 @@ class IdentityObservationBuilder(ObservationBuilder):
     def replace_fresh(self, sample_cfg, rng, **options):
         """Oversample covered annotations with annotated targets."""
         s = self.sampling
-        if self.negative_bank is None or not s.bank_coverage_probability or rng.random() >= s.bank_coverage_probability:
+        if self.neighbors is None or not s.bank_coverage_probability or rng.random() >= s.bank_coverage_probability:
             return None
         from vesuvius.neural_tracing.fiber_follow.data.data import make_sample
-        banks = [self.negative_bank]+([self.near_negative_bank]
-            if self.near_negative_bank is not None and self.near_negative_bank is not self.negative_bank else [])
+        bank = self.neighbors
         for _ in range(3):
-            bank = banks[int(rng.integers(len(banks)))]
-            draw = bank.draw_path(rng,unique=False,hard_fraction=s.bank_hard_fraction)
+            draw = bank.draw_path(rng,hard_fraction=s.bank_hard_fraction)
             if draw is None:
                 continue
             fi,_,(a,b) = draw
@@ -295,12 +292,11 @@ class IdentityObservationBuilder(ObservationBuilder):
     def synthetic_terminal(self, sample_cfg, rng):
         """Certified wrong continuation after an OU-noised original prefix; labeled terminal."""
         from vesuvius.neural_tracing.fiber_follow.data.neighbor_continuations import wrong_continuation
-        bank = self.continuation_bank or self.negative_bank
-        if bank is None:
+        if self.neighbors is None:
             return None
         tail = self.sampling.synthetic_tail
         for _ in range(3):
-            item = wrong_continuation(bank,sample_cfg,rng,tail_length_range=tail,
+            item = wrong_continuation(self.neighbors,sample_cfg,rng,tail_length_range=tail,
                                       prefix_length=float(rng.uniform(*self.sampling.synthetic_prefix)))
             if item is not None:
                 return item
@@ -358,33 +354,29 @@ class IdentityObservationBuilder(ObservationBuilder):
             item['_sampling_feedback_prepared'] = True
 
     def bank_targets(self, items, decision_mask=None):
-        """Foreign-path masks and coverage feedback; no contrastive point queries."""
-        if self.negative_bank is None:
-            raise ValueError('Bank supervision requires a negative bank')
-        cfg, bank = self.cfg, self.negative_bank
+        """Foreign-path masks and coverage feedback; no contrastive point queries.
+
+        Without neighbors (Paris 4) every foreign mask is empty: no known neighbor, as at an isolated AFV location.
+        """
+        cfg, bank = self.cfg, self.neighbors
         selected = np.ones(len(items), bool) if decision_mask is None else np.asarray(decision_mask, dtype=bool)
         shape = (cfg.fine.depth, cfg.fine.width, cfg.fine.width)
         out = dict(location_source=np.zeros(len(items), np.float32),
-                   foreign_components=np.zeros(len(items), np.float32),
-                   negative_bank_shards=np.zeros(len(items), np.int64))
+                   foreign_components=np.zeros(len(items), np.float32))
         if selected.any() or not len(items):
             out['foreign'] = np.zeros((len(items), *shape), np.uint8)
         for j, item in enumerate(items):
             out['location_source'][j] = item.get('location_source', 0)
-            if 'identity_curve' not in item:
+            if bank is None or 'identity_curve' not in item:
                 continue
             feedback = (self.fibers is not None and item.get('source') == SOURCE['fresh']
                         and not item.get('_sampling_feedback_prepared',False))
             if not selected[j] and not feedback:
                 continue
-            found = bank.candidates(item, cfg.fine, self.sampling.rule, mask_crop=cfg.fine,
-                additional_banks=([self.near_negative_bank] if self.near_negative_bank is not None
-                                  and self.near_negative_bank is not bank else ()), rasterize=bool(selected[j]))
+            found = bank.candidates(item, cfg.fine, self.sampling.rule, mask_crop=cfg.fine, rasterize=bool(selected[j]))
             if selected[j]:
                 out['foreign'][j] = found['foreign']
             out['foreign_components'][j] = found['counts']['foreign_components']
-            out['negative_bank_shards'][j] = bank.shard_count+(self.near_negative_bank.shard_count
-                if self.near_negative_bank is not None and self.near_negative_bank is not bank else 0)
             # Remember covered locations directly, independent of randomly selected
             # contrastive queries. Missing coverage remains unknown.
             ahead = found['local']

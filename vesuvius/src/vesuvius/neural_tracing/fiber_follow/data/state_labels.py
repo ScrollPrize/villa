@@ -15,7 +15,7 @@ Three concepts stay separate:
 
 A geometric departure can become following again. A confirmed committed switch stays
 terminal for the rest of its episode. Missing evidence censors supervision; it never
-creates a positive continuation or a negative stop target. Annotation and neighbor-bank
+creates a positive continuation or a negative stop target. Annotation and neighbor-path
 geometry are supervision/evaluation oracles only; deployment relies on learned confidence.
 """
 from __future__ import annotations

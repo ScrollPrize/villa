@@ -18,7 +18,7 @@ import numpy as np
 import torch
 
 from vesuvius.neural_tracing.fiber_follow.data.data import (
-    TASKS, FollowDataset, SampleConfig, TaskBudget, ZBand, fiber_manifest, load_replay, usable_replay)
+    TASKS, FollowDataset, SampleConfig, TaskBudget, fiber_manifest, load_replay, usable_replay)
 from vesuvius.neural_tracing.fiber_follow.train.online import OnlineCollector
 from vesuvius.neural_tracing.fiber_follow.tracing.policy import (DEFAULT_CONFIDENCE, DEFAULT_GATE, gate_horizon,
     OperatingPolicy, selection_window)
@@ -549,8 +549,6 @@ def main(argv=None):
         blur_probability=args.blur_probability,blur_sigma=tuple(args.blur_sigma),
         lateral_fraction=args.lateral_fraction,bank_hard_fraction=args.bank_hard_fraction,
         bank_coverage_probability=args.bank_coverage_probability,synthetic_tail=tuple(args.synthetic_tail))
-    if not args.negative_bank:
-        raise ValueError('Training requires a negative_bank in the Paris 4 dataset source')
     if not 1 <= args.n_commit <= cfg.n_future:
         raise ValueError('Commit window must fit forecast')
     primary_source = next(s for s in dataset_document['sources'] if s['kind'] == 'paris4')
@@ -563,31 +561,12 @@ def main(argv=None):
                           label_tolerance=args.tolerance, max_recovery_distance=cfg.max_recovery_distance)
     policy = training_policy(cfg, args.n_commit, args.trace_confidence, args.gate)
     progress('Loading manifest and fiber annotations')
-    bank_band = ZBand(*(v/spec.grid_scale for v in args.val_z))
-    from vesuvius.neural_tracing.fiber_follow.data.datasets import load_primary_dataset, HoldoutFilteredBank
+    from vesuvius.neural_tracing.fiber_follow.data.datasets import load_primary_dataset
     fibers,train_f,val_f,manifest = load_primary_dataset(dataset_document,spec)
     band = None
     progress(f'Loaded {len(train_f)} training fibers and {len(val_f)} validation fibers')
     if fiber_manifest(val_f) != manifest['fibers']:
         raise ValueError('Frozen validation geometry differs from dataset/holdout')
-    role_banks = {}
-    bank_options = dict(heldout=val_f, refresh_seconds=args.negative_bank_refresh_seconds,
-                        cache_bytes=int(args.negative_bank_cache_mb*(1 << 20)))
-    negative_bank = HoldoutFilteredBank(args.negative_bank,train_f,bank_band,grid_scale=spec.grid_scale,**bank_options)
-    negative_bank.validate_volume(spec)
-    progress(f'Live negative bank: {negative_bank.shard_count} published shards, refresh every {args.negative_bank_refresh_seconds:g}s per worker')
-    by_path = {negative_bank.root:negative_bank}
-    for role in ('near_negative_bank','continuation_bank'):
-        path = getattr(args,role)
-        if path is None:
-            continue
-        root = Path(path).resolve()
-        if root.name == 'bank.json':
-            root = root.parent
-        if root not in by_path:
-            by_path[root] = HoldoutFilteredBank(root,train_f,bank_band,grid_scale=spec.grid_scale,**bank_options)
-            by_path[root].validate_volume(spec)
-        role_banks[role] = by_path[root]
     if initial and initial.get('dataset_config'):
         known = {s['name'] for s in initial['dataset_config'].get('sources', [])}
         added = [s['name'] for s in dataset_document['sources'] if s['name'] not in known]
@@ -651,11 +630,10 @@ def main(argv=None):
                       collector_module='vesuvius.neural_tracing.fiber_follow.tracing.collect', threads=args.dagger_threads)
     bank_args = ('--bank-switch-tolerance', args.bank_switch_tolerance, '--bank-own-tolerance', args.bank_own_tolerance)
     collector = OnlineCollector(out/'dagger', args.fibers, args.val_z, args.dagger_device or args.device,
-        initial=[c._dir for c in caches], **collection,
-        extra_args=(*bank_args, *[v for path in (args.negative_bank, args.near_negative_bank) if path for v in ('--failure-bank', path)]))
+        initial=[c._dir for c in caches], **collection, extra_args=bank_args)
     progress(f'{args.batch} independent decisions per batch')
-    builder = IdentityObservationBuilder(cfg,train_f,identity_sampling,
-        augment=True,negative_bank=negative_bank,**role_banks)
+    # Paris 4 has no neighbor paths: no foreign masks, bank-covered locations or synthetic wrong continuations.
+    builder = IdentityObservationBuilder(cfg,train_f,identity_sampling,augment=True)
     dataset = FollowDataset(train_f, spec, sample, band, chunk=args.batch, seed=args.seed+done,
         cache_bytes=int(args.worker_cache_gb*(1 << 30)), onpolicy=caches,
         replay_index=str(collector.index), batch_builder=builder, additional_crops=(), budget=budget)
@@ -748,8 +726,7 @@ def main(argv=None):
                               excursion_amplitude=sample.excursion_amplitude, excursion_rise=sample.excursion_rise),
         label_contract=dict(tolerance=sample.label_tolerance, max_recovery_distance=sample.max_recovery_distance),
         live_continuation_steps=args.live_continuation_steps,
-        frame_policy=configured_frame_policy(cfg), sampling=asdict(identity_sampling),
-        negative_bank_path=str(negative_bank.root),negative_bank_provenance=negative_bank.provenance()))
+        frame_policy=configured_frame_policy(cfg), sampling=asdict(identity_sampling)))
     tracer = None
     recovery_vol = FiberVolume(spec) if recovery_states is not None else None
     started = time.monotonic()
