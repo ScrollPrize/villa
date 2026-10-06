@@ -10,9 +10,9 @@ from vesuvius.neural_tracing.tracers.models.model import build_model, config_fro
 from vesuvius.neural_tracing.tracers.models.flow import fit_flow_sigma, flow_targets
 from vesuvius.neural_tracing.tracers.fibers.train.supervision import loss_terms
 from vesuvius.neural_tracing.tracers.fibers.train.train import (
-    prepare_training, optimizer_update, save_checkpoint, load_checkpoint,
-    initialize_training_optimizer, initialize_model_weights,
+    prepare_training, optimizer_update, save_checkpoint, initialize_training_optimizer,
 )
+from vesuvius.neural_tracing.tracers.models.checkpoint import initialize_model_weights, load_checkpoint
 from vesuvius.neural_tracing.tracers.fibers.train.runloop import training_rng_state
 from vesuvius.neural_tracing.tracers.fibers.data.data import SampleConfig
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolumeSpec

@@ -10,7 +10,7 @@ from pathlib import Path
 from vesuvius.neural_tracing.tracers.fibers.evaluation.evaluation import main as protocol
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume
 from vesuvius.neural_tracing.tracers.fibers.tracing.trace import FiberTracer
-from vesuvius.neural_tracing.tracers.fibers.train.train import load_checkpoint
+from vesuvius.neural_tracing.tracers.models.checkpoint import load_checkpoint
 
 DATASET_CONFIG = Path(__file__).parents[1]/'configs'/'datasets'/'paris50.json'
 

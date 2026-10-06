@@ -79,7 +79,7 @@ def main(argv=None):
     from vesuvius.neural_tracing.tracers.fibers.data.afv_neighbors import AFVBank
     from vesuvius.neural_tracing.tracers.fibers.data.datasets import load_primary_dataset, open_afv_source, read_dataset_config
     from vesuvius.neural_tracing.tracers.models.model import config_from_checkpoint
-    from vesuvius.neural_tracing.tracers.fibers.train.runloop import read_checkpoint
+    from vesuvius.neural_tracing.tracers.models.checkpoint import read_checkpoint
     from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolumeSpec
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--checkpoint', required=True, help='Supplies the model crop/horizon and label tolerance')

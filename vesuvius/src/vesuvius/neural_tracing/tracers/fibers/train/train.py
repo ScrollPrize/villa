@@ -4,7 +4,6 @@
 
 The run configuration (train/run_config.py) holds the dataset, model, training and runtime settings."""
 import argparse
-import copy
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 import hashlib
@@ -22,9 +21,10 @@ from vesuvius.neural_tracing.tracers.fibers.data.data import (
 from vesuvius.neural_tracing.tracers.fibers.train.online import OnlineCollector
 from vesuvius.neural_tracing.tracers.shared.policy import (DEFAULT_CONFIDENCE, DEFAULT_GATE, gate_horizon,
     OperatingPolicy, selection_window)
-from vesuvius.neural_tracing.tracers.fibers.train.runloop import RunLog, lr_at, prepare_run_dir, read_checkpoint, save_checkpoint as write_checkpoint, update_ema, training_rng_state, resume_training, raise_open_file_limit
-from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume, CTVolumeSpec
-from vesuvius.neural_tracing.tracers.models.model import build_model, config_from_checkpoint
+from vesuvius.neural_tracing.tracers.fibers.train.runloop import RunLog, lr_at, prepare_run_dir, update_ema, training_rng_state, resume_training, raise_open_file_limit
+from vesuvius.neural_tracing.tracers.models.checkpoint import initialize_model_weights, read_checkpoint, write_checkpoint
+from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume
+from vesuvius.neural_tracing.tracers.models.model import config_from_checkpoint
 from vesuvius.neural_tracing.tracers.fibers.data.observations import IdentityObservationBuilder, IdentitySampling, LOCATION_SOURCES
 from vesuvius.neural_tracing.tracers.fibers.tracing.trace import FiberTracer
 from vesuvius.neural_tracing.tracers.fibers.train import run_config
@@ -53,11 +53,6 @@ def training_policy(cfg, n_commit, confidence=DEFAULT_CONFIDENCE, gate=DEFAULT_G
     """The operating policy used for live feedback and recorded with every checkpoint."""
     return OperatingPolicy(confidence=confidence, n_commit=n_commit, max_recovery_distance=cfg.max_recovery_distance,
                            refinement_steps=cfg.recurrent_refinement_steps, gate=gate)
-
-
-def conv_memory_format(device):
-    """Use the shared encoder convolution layout on CUDA."""
-    return torch.channels_last_3d if torch.device(device).type == 'cuda' else torch.contiguous_format
 
 
 def prepare_training(model, batch_size=2, *, backend=None):
@@ -179,45 +174,6 @@ def initialize_training_optimizer(model, ema, args, resume=None):
 
 
 GRAD_CLIP = 60.
-
-
-def load_matching_weights(model, state, exclude=()):
-    """Load tensors whose names and shapes match, except names starting with an ``exclude`` prefix.
-
-    Returns a report: tensors left at initialization (``fresh``), checkpoint tensors with no counterpart
-    (``unexpected``) and same-name tensors of another shape (``mismatched``)."""
-    own = model.state_dict()
-    matched = {k: v for k, v in state.items() if k in own and own[k].shape == v.shape
-               and not any(k.startswith(prefix) for prefix in exclude)}
-    model.load_state_dict(matched, strict=False)
-    return dict(fresh=sorted(set(own)-set(matched)), unexpected=sorted(set(state)-set(own)),
-                mismatched=sorted(k for k, v in state.items() if k in own and own[k].shape != v.shape))
-
-
-def initialize_model_weights(cfg, device, initial=None, exclude=()):
-    """Weight-only initialization (model and EMA tensors matched by name and shape); never inherits optimizer,
-    replay or run settings."""
-    model = build_model(cfg).to(device, memory_format=conv_memory_format(device))
-    report = None
-    if initial is not None:
-        report = load_matching_weights(model, initial['model'], exclude)
-    ema = copy.deepcopy(model).requires_grad_(False).eval()
-    if initial is not None:
-        load_matching_weights(ema, initial.get('ema', initial['model']), exclude)
-    model.initialization_report = report
-    return model, ema
-
-
-def load_checkpoint(path,device='cuda'):
-    # Collection shares a GPU with training. Keep duplicate weights and any
-    # optimizer state on the CPU; only the EMA inference model needs VRAM.
-    from vesuvius.neural_tracing.tracers.shared.paths import relocate_checkpoint
-    ck = relocate_checkpoint(read_checkpoint(path,'cpu'))
-    cfg = config_from_checkpoint(ck)
-    model = build_model(cfg).to(device,memory_format=conv_memory_format(device))
-    model.load_state_dict(ck['ema'])
-    model.eval()
-    return model,cfg.fine,cfg.n_history,CTVolumeSpec.from_dict(ck['vol_spec']),ck
 
 
 def move_batch(batch, device):

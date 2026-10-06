@@ -24,7 +24,7 @@ from vesuvius.neural_tracing.tracers.shared.geometry import arclength, interp_at
 from vesuvius.neural_tracing.tracers.fibers.frames.ct import oriented_seed_heading, SeedHeadingError, SEED_HEADING_POLICY
 from vesuvius.neural_tracing.tracers.shared.policy import checkpoint_policy
 from vesuvius.neural_tracing.tracers.fibers.tracing.trace import TraceParams
-from vesuvius.neural_tracing.tracers.fibers.train.train import load_checkpoint
+from vesuvius.neural_tracing.tracers.models.checkpoint import load_checkpoint
 from vesuvius.neural_tracing.tracers.fibers.train.runloop import raise_open_file_limit
 
 

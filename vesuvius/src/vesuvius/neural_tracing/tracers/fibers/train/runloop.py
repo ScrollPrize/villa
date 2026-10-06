@@ -1,12 +1,10 @@
 """Method-agnostic pieces of a fiber-following training run.
 
 Shared by every model type: run directory creation, the JSON-lines log, the
-warmup-cosine schedule, one guarded optimizer step, and checkpoint I/O that
-records which model type produced the weights.
+warmup-cosine schedule, EMA, RNG state and resuming (checkpoint I/O is models/checkpoint.py).
 """
 from __future__ import annotations
 
-import dataclasses
 import json
 import math
 from pathlib import Path
@@ -14,7 +12,6 @@ import sys
 
 import numpy as np
 import torch
-
 
 
 def raise_open_file_limit():
@@ -72,27 +69,6 @@ def lr_at(step: int, base_lr: float, warmup: int, total_steps: int) -> float:
     """Linear warmup multiplied by a cosine decay over ``total_steps``."""
     return (base_lr * min(1., step / max(1, warmup))
             * .5 * (1 + math.cos(math.pi * (step - 1) / total_steps)))
-
-
-def save_checkpoint(path, model, vol_spec, crop, n_history, model_type, extra=None):
-    torch.save(dict(model_type=model_type, model=model.state_dict(),
-                    model_cfg=model.cfg.to_dict(), crop=dataclasses.asdict(crop),
-                    n_history=n_history, vol_spec=vol_spec.to_dict(), **(extra or {})), path)
-
-
-def read_checkpoint(path, device='cuda'):
-    from dataclasses import fields
-    from vesuvius.neural_tracing.tracers.models.model import MODEL_TYPES, RETIRED_FIELDS, config_class
-    ck = torch.load(path, map_location=device, weights_only=False)
-    model_type = ck.get('model_type')
-    # A pre-cleanup 'sequence' checkpoint keeps its type name but records model fields that no longer exist.
-    unknown = (sorted(set(ck.get('model_cfg', {}))-{f.name for f in fields(config_class(model_type))}-set(RETIRED_FIELDS))
-               if model_type in MODEL_TYPES else None)
-    if model_type not in MODEL_TYPES or unknown:
-        detail = f'model fields {", ".join(unknown)}' if unknown else f'model type {model_type!r}'
-        raise ValueError(f'Unsupported checkpoint {path} ({detail}); checkpoints from before the model cleanup need '
-                         'scripts/convert_checkpoint.py')
-    return ck
 
 
 @torch.no_grad()

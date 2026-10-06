@@ -72,8 +72,8 @@ def test_a_decision_reads_only_earlier_steps_of_its_own_episode():
 
 
 def test_training_step_on_an_episode_batch():
-    from vesuvius.neural_tracing.tracers.fibers.train.train import (
-        initialize_model_weights, initialize_training_optimizer, optimizer_update, prepare_training)
+    from vesuvius.neural_tracing.tracers.fibers.train.train import initialize_training_optimizer, optimizer_update, prepare_training
+    from vesuvius.neural_tracing.tracers.models.checkpoint import initialize_model_weights
     torch.manual_seed(1)
     model, ema = initialize_model_weights(small_config(), 'cpu')
     opt, _, _ = initialize_training_optimizer(model, ema, SimpleNamespace(lr=.001, reset_optimizer=False))
