@@ -129,6 +129,7 @@ def main():
     ap.add_argument('--count', type=int, default=64)
     ap.add_argument('--limit', type=int, help='Use only the first N frozen seeds per cohort for paired controls')
     ap.add_argument('--sources', nargs='+')
+    ap.add_argument('--dataset-config', help="Dataset configuration JSON (default: the checkpoint's)")
     ap.add_argument('--cohorts', nargs='+', default=['monitor','length_weighted'])
     from vesuvius.neural_tracing.tracers.shared.policy import DEFAULT_CONFIDENCE, DEFAULT_GATE, DEFAULT_N_COMMIT, GATES
     ap.add_argument('--confidence', type=float, default=DEFAULT_CONFIDENCE)
@@ -152,7 +153,8 @@ def main():
     if (out/'summary.json').exists():
         raise FileExistsError('Completed evaluation already exists')
     print('Loading checked held-out sources', flush=True)
-    sources = dataset_sources(SimpleNamespace(checkpoint=args.checkpoint, out=str(out/'results.json'), command='run', sources=args.sources))
+    sources = dataset_sources(SimpleNamespace(checkpoint=args.checkpoint, out=str(out/'results.json'), command='run',
+                                              sources=args.sources, dataset_config=args.dataset_config))
     frozen = json.loads(Path(args.seed_manifest).read_text()) if args.seed_manifest else dict(
         protocol='length-proportional sampling without replacement; calibration fibers only; random direction; seed 32 to 20% of length from starting end',
         seed=args.seed, count=args.count, sources={})

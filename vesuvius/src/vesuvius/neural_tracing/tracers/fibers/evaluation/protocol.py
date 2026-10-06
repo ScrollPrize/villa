@@ -7,6 +7,7 @@ selection. Runs report the strict first-departure metrics together with decision
 geometric outcomes, by source and split. Comparisons pair identical seeds and resample
 fibers. The final group never enters operating-point selection.
 
+Sources come from the checkpoint's dataset configuration (``--dataset-config`` overrides it).
 Paris 4 uses its frozen monitor/calibration/final seeds; each AFV source uses its own
 seeded validation manifest (the same seeds the trainer writes as ``validation_<name>.json``).
 AFV holdouts carry a neighbor detector over their own catalog; Paris 4 has no neighbor paths,
@@ -211,6 +212,7 @@ def parser(description=__doc__):
         p.add_argument('--n-commit', type=int, help='Default: the checkpoint operating policy')
         p.add_argument('--gate', choices=('full', 'prefix'), help='Commit gate. Default: the checkpoint operating policy')
         p.add_argument('--sources', nargs='+', help='Dataset sources (default: all)')
+        p.add_argument('--dataset-config', help="Dataset configuration JSON (default: the checkpoint's)")
         if name == 'calibrate':
             p.add_argument('--thresholds', type=float, nargs='+', default=THRESHOLDS)
         else:
@@ -224,15 +226,23 @@ def parser(description=__doc__):
     return ap
 
 
+# For checkpoints that record no dataset configuration.
 DATASET_CONFIG = Path(__file__).parents[1]/'configs'/'datasets'/'paris50.json'
 
 
-def dataset_sources(args, config=DATASET_CONFIG):
+def dataset_sources(args, config=None):
+    """The held-out sources of the checkpoint's own dataset configuration, or of ``config`` /
+    ``args.dataset_config`` when given."""
     from vesuvius.neural_tracing.tracers.fibers.data.afv_neighbors import AFVBank
-    from vesuvius.neural_tracing.tracers.fibers.data.datasets import load_primary_dataset, open_afv_source, read_dataset_config, validation_manifest
+    from vesuvius.neural_tracing.tracers.fibers.data.datasets import (
+        load_primary_dataset, open_afv_source, parse_dataset_config, read_dataset_config, validation_manifest)
     from vesuvius.neural_tracing.tracers.fibers.data.bank_geometry import BankSwitchDetector
     _, _, _, paris_spec, checkpoint = load_checkpoint(args.checkpoint, 'cpu')
-    document, _ = read_dataset_config(config)
+    config = config or getattr(args, 'dataset_config', None)
+    if config is None and checkpoint.get('dataset_config'):
+        document, _ = parse_dataset_config(checkpoint['dataset_config'], '.')
+    else:
+        document, _ = read_dataset_config(config or DATASET_CONFIG)
     normalization = checkpoint['ct_normalization']
     sources = []
     for source in document['sources']:
