@@ -306,6 +306,8 @@ def load_dataset(args, checkpoint):
     document = checkpoint.get('dataset_config')
     if not document:
         raise ValueError('Checkpoint has no mixed dataset configuration')
+    from vesuvius.neural_tracing.tracers.fibers.data.datasets import parse_dataset_config
+    document = parse_dataset_config(document, '.')[0]  # paths recorded under the package's former location
     source = next((s for s in document['sources'] if s['name'] == args.dataset_name), None)
     if source is None:
         raise ValueError('Unknown dataset source')
