@@ -22,7 +22,7 @@ import time
 
 import numpy as np
 
-from vesuvius.neural_tracing.tracers.fibers.evaluation.seeds import EvaluationAudit, evaluate, monitor_coverage, summarize_outcomes
+from vesuvius.neural_tracing.tracers.fibers.evaluation.scoring import EvaluationAudit, evaluate, monitor_coverage, summarize_outcomes
 from vesuvius.neural_tracing.tracers.shared.io import jsonable, write_json as write
 from vesuvius.neural_tracing.tracers.shared.policy import checkpoint_policy
 from vesuvius.neural_tracing.tracers.fibers.tracing.trace import TraceParams

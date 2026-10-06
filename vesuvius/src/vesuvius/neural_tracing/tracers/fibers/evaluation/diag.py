@@ -13,7 +13,7 @@ import matplotlib.patheffects as pe
 import numpy as np
 from scipy.spatial import cKDTree
 
-from vesuvius.neural_tracing.tracers.fibers.evaluation.seeds import monitor_coverage, score_trace, summarize
+from vesuvius.neural_tracing.tracers.fibers.evaluation.scoring import monitor_coverage, score_trace, summarize
 from vesuvius.neural_tracing.tracers.shared.geometry import frame_from_heading, interp_at
 
 

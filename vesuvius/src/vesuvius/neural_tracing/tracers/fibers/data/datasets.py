@@ -77,7 +77,7 @@ def parse_dataset_config(document, base):
 
 def validation_manifest(fibers, spec, seed=0, monitor_count=32):
     """Freeze distinct monitor/calibration/final fiber IDs and CT-only seeds."""
-    from vesuvius.neural_tracing.tracers.fibers.evaluation.seeds import make_seeds
+    from vesuvius.neural_tracing.tracers.fibers.data.seeds import make_seeds
     from vesuvius.neural_tracing.tracers.shared.io import jsonable
     from vesuvius.neural_tracing.tracers.fibers.frames.ct import SEED_HEADING_POLICY, TRACE_HEADING_POLICY, FRAME_POLICY
     from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume
@@ -112,7 +112,7 @@ def load_primary_dataset(document, spec):
     split is decided before that and does not change.
     """
     from vesuvius.neural_tracing.tracers.fibers.data.dataset_split import heldout_ids
-    from vesuvius.neural_tracing.tracers.shared.io import read_manifest
+    from vesuvius.neural_tracing.tracers.fibers.data.seeds import read_manifest
     source = next(s for s in document['sources'] if s['kind']=='paris4')
     fibers = load_fibers(source['fibers'],grid_scale=spec.grid_scale)
     legacy = read_manifest(source['manifest'])

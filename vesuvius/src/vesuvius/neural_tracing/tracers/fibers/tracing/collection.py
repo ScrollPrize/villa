@@ -21,7 +21,7 @@ import numpy as np
 import torch
 
 from vesuvius.neural_tracing.tracers.fibers.data.data import OnPolicyStates, SampleConfig, ZBand, load_fibers, split_fibers, fiber_manifest, label_state, training_state_allowed
-from vesuvius.neural_tracing.tracers.fibers.evaluation.seeds import directed_seed
+from vesuvius.neural_tracing.tracers.fibers.data.seeds import directed_seed
 from vesuvius.neural_tracing.tracers.shared.geometry import arclength
 from vesuvius.neural_tracing.tracers.fibers.frames.ct import SeedHeadingError, SEED_HEADING_POLICY, TRACE_HEADING_POLICY, FRAME_POLICY
 from vesuvius.neural_tracing.tracers.shared.policy import checkpoint_policy

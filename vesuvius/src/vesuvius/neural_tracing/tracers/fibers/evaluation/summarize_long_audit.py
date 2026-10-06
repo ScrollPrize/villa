@@ -15,7 +15,7 @@ from vesuvius.neural_tracing.tracers.shared.io import write_json as write
 from vesuvius.neural_tracing.tracers.fibers.evaluation.long_trace_audit import summary
 from vesuvius.neural_tracing.tracers.fibers.evaluation.evaluation import paired_report
 from vesuvius.neural_tracing.tracers.fibers.evaluation.evaluate import dataset_sources
-from vesuvius.neural_tracing.tracers.fibers.evaluation.seeds import matched_profile
+from vesuvius.neural_tracing.tracers.fibers.evaluation.scoring import matched_profile
 from vesuvius.neural_tracing.tracers.shared.geometry import tangent_at, arclength
 
 

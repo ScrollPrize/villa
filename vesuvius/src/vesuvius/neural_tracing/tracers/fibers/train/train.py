@@ -270,8 +270,8 @@ class DecisionBatchPrefetch:
 def training_diagnostics(model, cpu_batch, tracer, fibers, seeds, out, step, log, *, device, dataset_name=None):
     """Plot EMA proposals and the same monitor rollouts used for logged metrics."""
     from vesuvius.neural_tracing.tracers.fibers.evaluation.diag import plot_batch, plot_curves, plot_refinement, plot_rollouts
-    from vesuvius.neural_tracing.tracers.fibers.evaluation.seeds import evaluate
-    from vesuvius.neural_tracing.tracers.shared.io import rollout_summary
+    from vesuvius.neural_tracing.tracers.fibers.evaluation.scoring import evaluate
+    from vesuvius.neural_tracing.tracers.fibers.evaluation.scoring import rollout_summary
 
     images = Path(out)/'images'
     images.mkdir(exist_ok=True)
@@ -858,8 +858,8 @@ def main(argv=None):
                 began = time.monotonic()
                 training_diagnostics(ema, diagnostic['cpu_batch'], tracer, val_f, manifest['monitor'], out, step, log,
                                      device=args.device,dataset_name=primary_source['name'])
-                from vesuvius.neural_tracing.tracers.fibers.evaluation.seeds import evaluate
-                from vesuvius.neural_tracing.tracers.shared.io import rollout_summary
+                from vesuvius.neural_tracing.tracers.fibers.evaluation.scoring import evaluate
+                from vesuvius.neural_tracing.tracers.fibers.evaluation.scoring import rollout_summary
                 from vesuvius.neural_tracing.tracers.fibers.tracing.trace import TraceParams
                 for source, source_dataset in zip(dataset_document['sources'],dataset.datasets):
                     if source['kind'] != 'afv':
