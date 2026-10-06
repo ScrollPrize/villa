@@ -71,10 +71,20 @@ def test_resume_may_append_sources_only_when_asked():
     added = dict(version=1, cache_dir='elsewhere', sources=[dict(source, weight=.25), dict(source, name='b', weight=.25)])
     validate_dataset_resume(checkpoint, added, 'new', allow_added=True)
     for bad in (dict(added, sources=added['sources'][::-1]),                                  # reordered
-                dict(added, sources=[dict(source, ct='y'), added['sources'][1]]),             # changed source
+                dict(added, sources=[dict(source, validation={'seed': 1}), added['sources'][1]]),  # changed source split
                 dict(added, version=2),                                                       # changed document
                 dict(added, sources=[dict(source, weight=.25)])):                             # nothing appended
         with pytest.raises(ValueError):
             validate_dataset_resume(checkpoint, bad, 'new', allow_added=True)
     with pytest.raises(ValueError):
         validate_dataset_resume(checkpoint, added, 'new')
+
+
+def test_resume_allows_a_relocated_ct_but_no_other_source_change():
+    from vesuvius.neural_tracing.fiber_follow.data.datasets import validate_dataset_resume
+    source = dict(name='paris4', kind='paris4', weight=.5, ct='/local/s1_ds2.zarr', ct_level=0, ct_grid_scale=4., validation={})
+    checkpoint = dict(dataset_config=dict(version=1, cache_dir='c', sources=[source]), dataset_config_sha256='old')
+    moved = dict(source, ct='s3://bucket/paris4.zarr', ct_level=2, ct_mirror_of='https://bucket/paris4.zarr')
+    validate_dataset_resume(checkpoint, dict(version=1, cache_dir='elsewhere', sources=[moved]), 'new')
+    with pytest.raises(ValueError):
+        validate_dataset_resume(checkpoint, dict(version=1, cache_dir='c', sources=[dict(moved, ct_grid_scale=2.)]), 'new')

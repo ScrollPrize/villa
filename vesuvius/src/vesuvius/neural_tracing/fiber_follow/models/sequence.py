@@ -27,7 +27,7 @@ from torch.utils.checkpoint import checkpoint
 from vesuvius.models.build.resblocks import BasicBlockD, StackedResidualBlocks
 
 from vesuvius.neural_tracing.fiber_follow.models.model import (
-    CoordinateRegressionConfig, device_vector, sample_features, select_refinement)
+    CoordinateRegressionConfig, device_vector, future_points, proposal_output, sample_features, select_refinement)
 from vesuvius.neural_tracing.fiber_follow.models.survival_confidence import survival_predictions
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
 from vesuvius.neural_tracing.fiber_follow.tracing.policy import DEFAULT_CONFIDENCE
@@ -87,21 +87,19 @@ def relative_pose(past_pos, past_travelled, pos, frame, travelled):
 
 
 class CropCNN(nn.Module):
-    def __init__(self, cfg):
+    """Residual CNN stages (channels, initial stride, blocks per stage) over a one-channel crop; the first stage's
+    convolutions carry biases."""
+    def __init__(self, channels, strides, blocks, checkpointing=False):
         super().__init__()
-        c0, c1, c2, c3 = cfg.cnn_channels
         options = dict(conv_op=nn.Conv3d, kernel_size=3, norm_op=nn.InstanceNorm3d,
                        norm_op_kwargs=dict(eps=1e-5, affine=True), nonlin=nn.ReLU, nonlin_kwargs=dict(inplace=True),
                        block=BasicBlockD)
-        self.stages = nn.ModuleList((
-            StackedResidualBlocks(n_blocks=1, input_channels=1, output_channels=c0, initial_stride=1, conv_bias=True, **options),
-            StackedResidualBlocks(n_blocks=cfg.cnn_blocks, input_channels=c0, output_channels=c1, initial_stride=2,
-                                  conv_bias=False, **options),
-            StackedResidualBlocks(n_blocks=cfg.cnn_blocks, input_channels=c1, output_channels=c2, initial_stride=2,
-                                  conv_bias=False, **options),
-            StackedResidualBlocks(n_blocks=cfg.cnn_blocks, input_channels=c2, output_channels=c3, initial_stride=2,
-                                  conv_bias=False, **options)))
-        self.checkpointing = cfg.activation_checkpointing
+        inputs = (1, *channels[:-1])
+        self.stages = nn.ModuleList(
+            StackedResidualBlocks(n_blocks=n, input_channels=i, output_channels=c, initial_stride=s, conv_bias=not index,
+                                  **options)
+            for index, (i, c, s, n) in enumerate(zip(inputs, channels, strides, blocks)))
+        self.checkpointing = checkpointing
 
     def forward(self, image):
         x = image
@@ -158,7 +156,8 @@ class SequenceFollower(nn.Module):
         super().__init__()
         self.cfg, self.model_type = cfg, cfg.model_type
         h, cells = cfg.hidden, cfg.cnn_channels[-1]
-        self.cnn = CropCNN(cfg)
+        # A full-resolution block, then stages at strides 2, 4, 8.
+        self.cnn = CropCNN(cfg.cnn_channels, (1, 2, 2, 2), (1,)+(cfg.cnn_blocks,)*3, cfg.activation_checkpointing)
         self.cell_token = nn.Linear(cells, h)
         self.cell_position = nn.Sequential(nn.Linear(3, h), nn.SiLU(), nn.Linear(h, h))
         width = 2*cells+4+2*POSITION_FREQUENCIES
@@ -222,17 +221,10 @@ class SequenceFollower(nn.Module):
         """Plane points and survival confidence from the final query states, in the shared output contract."""
         cfg = self.cfg
         decoded = self.norm(queries)
-        lateral = cfg.lateral_limit*torch.tanh(self.coordinates(decoded).float())
-        first_limit = math.sqrt(max(0., cfg.max_recovery_distance**2-cfg.future_step**2))
-        first = lateral[:, :1]
-        first = first*(first_limit/first.norm(dim=-1, keepdim=True).clamp_min(1e-8)).clamp(max=1.)
-        points = torch.cat((torch.cat((first, lateral[:, 1:]), 1), self.planes[None, :, None].expand(len(lateral), -1, -1)), -1)
+        points = future_points(self.coordinates(decoded), self.planes, cfg)
         hazards = self.hazard(decoded).squeeze(-1).float()
-        logits, confidence = survival_predictions(hazards)
-        out = dict(initial_points=points, refinement_points=points[:, None],
-                   refinement_mask=torch.ones(len(points), 1, dtype=torch.bool, device=points.device),
-                   refinement_hazard_logits=hazards[:, None], refinement_confidence_logits=logits[:, None],
-                   refinement_confidence=confidence[:, None])
+        out = proposal_output(points, [points], [(hazards, *survival_predictions(hazards))],
+                              [torch.ones(len(points), dtype=torch.bool, device=points.device)])
         return select_refinement(out, cfg, confidence_threshold, n_commit)
 
     def decide(self, cells, history, pose, padding, confidence_threshold=DEFAULT_CONFIDENCE, n_commit=None):

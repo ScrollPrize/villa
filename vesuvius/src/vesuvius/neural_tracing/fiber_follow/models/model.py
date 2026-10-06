@@ -181,6 +181,12 @@ def build_model(cfg):
     if cfg.model_type == 'sequence':
         from .sequence import SequenceFollower
         return SequenceFollower(cfg)
+    if cfg.model_type == 'unified':
+        from .unified import UnifiedFollower
+        return UnifiedFollower(cfg)
+    if cfg.model_type == 'unified_flow':
+        from .unified import UnifiedFlowFollower
+        return UnifiedFlowFollower(cfg)
     if cfg.model_type != 'coordinate_regression':
         raise ValueError(f'Unsupported model type: {cfg.model_type}')
     return CoordinateRegressionFollower(cfg)
@@ -392,6 +398,51 @@ class AxialBlock(nn.Module):
         return x
 
 
+def reference_points(x, hist, hmask, crop):
+    """Recent observed-path points and the seed (B, n_history+1, 3), zeroed and masked outside the crop."""
+    seed = x.get('seed',hist.new_zeros(len(hist),1,3))
+    seed_mask = x.get('seed_mask',hmask.new_zeros(len(hist),1)).bool()
+    references = torch.cat((hist,seed),1)
+    mask = torch.cat((hmask.bool(),seed_mask),1) & crop_support(references,crop)
+    references = torch.where(mask[...,None],references.float(),0.)
+    return references, mask
+
+
+REFERENCE_METADATA = 8  # position (3), tangent (3), log age, seed role
+
+
+def reference_metadata(x, hist, references, mask):
+    """Per-reference metadata (B, n_history+1, REFERENCE_METADATA): position, seed tangent, age and seed role."""
+    ages = torch.arange(1,references.shape[1]+1,device=hist.device).float()[None].expand(len(hist),-1).clone()
+    ages[:,-1] = x.get('seed_age',hist.new_zeros(len(hist))).reshape(-1)
+    anchor = torch.zeros_like(ages)
+    anchor[:,-1] = 1.
+    tangent = torch.zeros_like(references)
+    tangent[:,-1] = x.get('seed_tangent',hist.new_zeros(len(hist),3))
+    metadata = torch.cat((references/16,tangent,torch.log1p(ages.clamp(0,2048))[...,None]/math.log(2049),anchor[...,None]),-1)
+    return torch.where(mask[...,None],metadata,0.)
+
+
+def future_points(raw, planes, cfg):
+    """Plane points (B, P, 3) from raw lateral outputs (B, P, 2): bounded to the crop, the first connection to the
+    recovery distance, at forward coordinates ``planes`` (P,)."""
+    lateral = cfg.lateral_limit*torch.tanh(raw.float())
+    first_limit = math.sqrt(max(0., cfg.max_recovery_distance**2-cfg.future_step**2))
+    first = lateral[:, :1]
+    first = first*(first_limit/first.norm(dim=-1, keepdim=True).clamp_min(1e-8)).clamp(max=1.)
+    lateral = torch.cat((first, lateral[:, 1:]), 1)
+    return torch.cat((lateral, planes[None, :, None].expand(len(raw), -1, -1)), -1)
+
+
+def proposal_output(initial, refinements, scores, valid):
+    """The shared all-proposal output contract: (B, A, ...) attempts, their survival scores and validity."""
+    out = dict(initial_points=initial, refinement_points=torch.stack(refinements, 1),
+               refinement_mask=torch.stack(valid, 1))
+    out.update({'refinement_'+name: torch.stack([score[i] for score in scores], 1)
+                for i, name in enumerate(('hazard_logits', 'confidence_logits', 'confidence'))})
+    return out
+
+
 def token_coordinates(cfg):
     """Token centers in crop-local XYZ."""
     d,y,x = torch.meshgrid(*(torch.arange(n).float() for n in cfg.token_shape),indexing='ij')
@@ -450,13 +501,7 @@ class ObservationFollower(nn.Module):
         self.register_buffer('planes', torch.arange(1,cfg.n_future+1).float()*cfg.future_step, persistent=False)
 
     def references(self, x, hist, hmask):
-        cfg = self.cfg
-        seed = x.get('seed',hist.new_zeros(len(hist),1,3))
-        seed_mask = x.get('seed_mask',hmask.new_zeros(len(hist),1)).bool()
-        references = torch.cat((hist,seed),1)
-        mask = torch.cat((hmask.bool(),seed_mask),1) & crop_support(references,cfg.fine)
-        references = torch.where(mask[...,None],references.float(),0.)
-        return references, mask
+        return reference_points(x, hist, hmask, self.cfg.fine)
 
     def context_from_features(self, x, hist, references, mask, dense, deep, identity=None, identity_tokens=None):
         cfg = self.cfg
@@ -469,14 +514,7 @@ class ObservationFollower(nn.Module):
         sampling_dense = dense.float() if cfg.recurrent_refinement_steps else dense
         local,_ = self.sample_local(sampling_dense, references)
         local = local.to(dense.dtype)
-        ages = torch.arange(1,cfg.n_history+2,device=hist.device).float()[None].expand(len(hist),-1).clone()
-        ages[:,-1] = x.get('seed_age',hist.new_zeros(len(hist))).reshape(-1)
-        anchor = torch.zeros_like(ages)
-        anchor[:,-1] = 1.
-        tangent = torch.zeros_like(references)
-        tangent[:,-1] = x.get('seed_tangent',hist.new_zeros(len(hist),3))
-        metadata = torch.cat((references/16,tangent,torch.log1p(ages.clamp(0,2048))[...,None]/math.log(2049),anchor[...,None]),-1)
-        metadata = torch.where(mask[...,None],metadata,0.)
+        metadata = reference_metadata(x, hist, references, mask)
         ref_tokens = self.reference_token(torch.cat((local,metadata),-1))
         memory = torch.cat((image_tokens,ref_tokens.to(image_tokens.dtype)),1)
         padding = torch.cat((torch.zeros(image_tokens.shape[:2],device=hist.device,dtype=torch.bool),~mask),1)
@@ -748,11 +786,7 @@ class ObservationFollower(nn.Module):
         return memory, padding
 
     def proposal_output(self, initial, refinements, scores, valid):
-        out = dict(initial_points=initial, refinement_points=torch.stack(refinements, 1),
-                   refinement_mask=torch.stack(valid, 1))
-        out.update({'refinement_'+name: torch.stack([score[i] for score in scores], 1)
-                    for i, name in enumerate(('hazard_logits', 'confidence_logits', 'confidence'))})
-        return out
+        return proposal_output(initial, refinements, scores, valid)
 
 
 class CoordinateRegressionFollower(ObservationFollower):
@@ -832,12 +866,7 @@ class CoordinateRegressionFollower(ObservationFollower):
         cfg = self.cfg
         if cfg.path_planes == 'crop':
             return self.crop_points(decoded)[:, self.proposal]
-        lateral = cfg.lateral_limit*torch.tanh(self.coordinates(decoded).float())
-        first_limit = math.sqrt(max(0., cfg.max_recovery_distance**2-cfg.future_step**2))
-        first = lateral[:, :1]
-        first = first*(first_limit/first.norm(dim=-1, keepdim=True).clamp_min(1e-8)).clamp(max=1.)
-        lateral = torch.cat((first, lateral[:, 1:]), 1)
-        return torch.cat((lateral, self.planes[None, :, None].expand(len(decoded), -1, -1)), -1)
+        return future_points(self.coordinates(decoded), self.planes, cfg)
 
     def finish_prediction(self, ctx, decoded, points, projected, padding,
                           confidence_threshold=DEFAULT_CONFIDENCE):

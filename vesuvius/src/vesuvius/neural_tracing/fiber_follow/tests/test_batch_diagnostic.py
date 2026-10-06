@@ -60,17 +60,24 @@ def test_layer_capture_preserves_predictions_and_cleans_up():
     assert not model.encoder.blocks[0]._forward_pre_hooks
 
 
-@pytest.mark.parametrize('kind', ['coordinate_regression', 'flow_matching'])
+@pytest.mark.parametrize('kind', ['coordinate_regression', 'flow_matching', 'unified'])
 def test_render_emits_readable_images_strict_json_and_preserves_rng(tmp_path, kind):
     from test_flow_model import config as flow_config
+    from test_unified import small
     from vesuvius.neural_tracing.fiber_follow.models.model import build_model
-    cfg = coordinate_config(recurrent_refinement_steps=1) if kind == 'coordinate_regression' else flow_config()
-    model = build_model(cfg).train()
+    if kind == 'unified':
+        model = small().train()
+        cfg = model.cfg
+    else:
+        cfg = coordinate_config(recurrent_refinement_steps=1) if kind == 'coordinate_regression' else flow_config()
+        model = build_model(cfg).train()
     data = batch(cfg, 3)
     data['identity_observable'] = torch.tensor([0., 1., 1.])
     data['dense_mask'][1] = 0
     data['dense_ab'][1] = float('nan')
     data['x']['history_valid'][1] = False
+    if kind == 'unified':  # no memory inputs, as the memory-free data builders emit
+        data['x'] = {key: value for key, value in data['x'].items() if not key.startswith('history_')}
     set_terminal(data, 2)
     rng, numpy_rng = torch.get_rng_state(), np.random.get_state()
     data['dataset_id'] = torch.tensor([0, 1, 0])

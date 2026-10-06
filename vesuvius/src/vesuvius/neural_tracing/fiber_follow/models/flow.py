@@ -11,6 +11,9 @@ from .survival_confidence import survival_predictions
 
 
 
+FLOW_MODEL_TYPES = ('flow_matching', 'unified_flow')
+
+
 @dataclass
 class FlowConfig(CoordinateRegressionConfig):
     model_type: str = 'flow_matching'
@@ -53,7 +56,7 @@ class FlowConfig(CoordinateRegressionConfig):
     def __post_init__(self):
         super().__post_init__()
         self.flow_sigma = tuple(tuple(row) for row in self.flow_sigma)
-        if self.model_type != 'flow_matching' or self.recurrent_refinement_steps != 0:
+        if self.model_type not in FLOW_MODEL_TYPES or self.recurrent_refinement_steps != 0:
             raise ValueError('Flow uses midpoint integration, not regression retries')
         if min(self.flow_steps, self.flow_draws) < 1:
             raise ValueError('Positive flow steps and draws required')
@@ -123,28 +126,15 @@ def fit_flow_sigma(batches, cfg, states=2048):
     return tuple(map(tuple, variance.sqrt().clamp_min(cfg.flow_sigma_floor).tolist()))
 
 
-class FlowFollower(ObservationFollower):
-    """The zero-start path, optionally followed by sampled proposals; Gaussian/time draws train velocity."""
-    def __init__(self, cfg):
-        super().__init__(cfg)
+class FlowMatching:
+    """The flow-matching generator over an observation model: the zero-start path, optionally followed by sampled
+    proposals; Gaussian/time draws train velocity. The model provides ``context``, ``prepare_prediction``,
+    ``velocity_field(ctx, y, t, known)`` -> (B, D, P, 2), ``hazard_logits(ctx, points)``, ``proposal_output`` and
+    the identity heads (``identity_terms``, ``verification_terms``)."""
+
+    def init_flow(self, cfg):
         if not cfg.flow_sigma:
             raise ValueError('Fit flow scales before constructing the flow model')
-        h = cfg.hidden
-        self.query = nn.Sequential(nn.Linear(h+4, h), nn.SiLU(), nn.Linear(h, h))
-        self.time = nn.Sequential(nn.Linear(64, h), nn.SiLU(), nn.Linear(h, h))
-        layer = PathDecoderLayer(h, cfg.heads, cfg.decoder_ffn, dropout=0., activation='gelu',
-                                 batch_first=True, norm_first=True)
-        self.decoder = nn.TransformerDecoder(layer, cfg.decoder_layers, norm=nn.LayerNorm(h))
-        self.velocity = nn.Linear(h, 2)
-        nn.init.normal_(self.velocity.weight, std=.01)
-        nn.init.zeros_(self.velocity.bias)
-        if cfg.flow_time_conditioning == 'adaln':
-            # Per layer: shift/scale/gate for four branches; output norm: shift/scale.
-            self.time_modulation = nn.ModuleList(nn.Linear(h, 12*h) for _ in range(cfg.decoder_layers))
-            self.output_modulation = nn.Linear(h, 2*h)
-            for linear in (*self.time_modulation, self.output_modulation):
-                nn.init.zeros_(linear.weight)
-                nn.init.zeros_(linear.bias)
         self.register_buffer('sigma', torch.tensor(cfg.flow_sigma, dtype=torch.float32), persistent=False)
         # Flow planes: planes 1..n_future, or every whole-crop plane; the proposal (scorer, gate, tracer, labels) is
         # always planes 1..n_future. Plain Python values, so compiled graphs do not trace the numpy behind them.
@@ -156,39 +146,6 @@ class FlowFollower(ObservationFollower):
     def to_points(self, y):
         z = self.flow_planes.reshape(*([1]*(y.ndim-2)), -1, 1).expand(*y.shape[:-1], 1)
         return torch.cat((y*self.sigma, z), -1)
-
-    def prepare_prediction(self, ctx, hist):
-        memory, padding = self.decoder_memory(ctx)
-        ctx['generator_projected'] = [layer.project_memory(memory) for layer in self.decoder.layers]
-        return ctx['generator_projected'], padding
-
-    def velocity_field(self, ctx, y, t, known=None):
-        # Draws have independent self-attention, then share one observation K/V bank per state.
-        b, draws, planes, _ = y.shape
-        if known is None:
-            known = torch.ones(b, planes, device=y.device, dtype=torch.bool)
-        y = torch.where(known[:, None, :, None], y, 0.)
-        points = self.to_points(y)
-        evidence, support = self.sample_local(ctx['deep'].float(), points.reshape(b, draws*planes, 3))
-        evidence = evidence.reshape(b, draws, planes, -1)
-        forward = points[..., 2:]/self.plane_scale
-        query = self.query(torch.cat((evidence.to(ctx['deep'].dtype), y, forward,
-                                      support.reshape(b, draws, planes, 1)), -1))
-        time = self.time(time_embedding(t))
-        query = query+time[:, :, None]
-        padding = (~known)[:, None].expand(-1, draws, -1).reshape(b*draws, planes).clone()
-        padding[:, -1] &= ~padding.all(-1)
-        adaln = self.cfg.flow_time_conditioning == 'adaln'
-        condition = F.silu(time) if adaln else None
-        for index, (layer, kv) in enumerate(zip(self.decoder.layers, ctx['generator_projected'])):
-            modulation = self.time_modulation[index](condition).unflatten(-1, (4, 3, self.cfg.hidden)) if adaln else None
-            query = layer.forward_draws(query, kv, ctx['padding'], padding, history=ctx['history_projected'],
-                                        history_attention=getattr(self, 'history_attention', None), modulation=modulation)
-        output = self.decoder.norm(query)
-        if adaln:
-            shift, scale = self.output_modulation(condition)[:, :, None].chunk(2, -1)
-            output = output*(1+scale)+shift
-        return self.velocity(output).float()
 
     def generate(self, ctx, hist, start=None, grad=False):
         """Midpoint integration from ``start`` (B, D, P, 2), by default the zero path (D=1).
@@ -304,3 +261,59 @@ class FlowFollower(ObservationFollower):
     def forward(self, x, hist, hmask, confidence_threshold=.5, n_commit=None):
         return self.select_prediction(self.training_forward(x, hist, hmask, confidence_threshold),
                                       confidence_threshold, n_commit)
+
+
+class FlowFollower(FlowMatching, ObservationFollower):
+    """Flow matching on the patch encoder, decoder cross-attention and segment survival scorer."""
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        self.init_flow(cfg)
+        h = cfg.hidden
+        self.query = nn.Sequential(nn.Linear(h+4, h), nn.SiLU(), nn.Linear(h, h))
+        self.time = nn.Sequential(nn.Linear(64, h), nn.SiLU(), nn.Linear(h, h))
+        layer = PathDecoderLayer(h, cfg.heads, cfg.decoder_ffn, dropout=0., activation='gelu',
+                                 batch_first=True, norm_first=True)
+        self.decoder = nn.TransformerDecoder(layer, cfg.decoder_layers, norm=nn.LayerNorm(h))
+        self.velocity = nn.Linear(h, 2)
+        nn.init.normal_(self.velocity.weight, std=.01)
+        nn.init.zeros_(self.velocity.bias)
+        if cfg.flow_time_conditioning == 'adaln':
+            # Per layer: shift/scale/gate for four branches; output norm: shift/scale.
+            self.time_modulation = nn.ModuleList(nn.Linear(h, 12*h) for _ in range(cfg.decoder_layers))
+            self.output_modulation = nn.Linear(h, 2*h)
+            for linear in (*self.time_modulation, self.output_modulation):
+                nn.init.zeros_(linear.weight)
+                nn.init.zeros_(linear.bias)
+
+    def prepare_prediction(self, ctx, hist):
+        memory, padding = self.decoder_memory(ctx)
+        ctx['generator_projected'] = [layer.project_memory(memory) for layer in self.decoder.layers]
+        return ctx['generator_projected'], padding
+
+    def velocity_field(self, ctx, y, t, known=None):
+        # Draws have independent self-attention, then share one observation K/V bank per state.
+        b, draws, planes, _ = y.shape
+        if known is None:
+            known = torch.ones(b, planes, device=y.device, dtype=torch.bool)
+        y = torch.where(known[:, None, :, None], y, 0.)
+        points = self.to_points(y)
+        evidence, support = self.sample_local(ctx['deep'].float(), points.reshape(b, draws*planes, 3))
+        evidence = evidence.reshape(b, draws, planes, -1)
+        forward = points[..., 2:]/self.plane_scale
+        query = self.query(torch.cat((evidence.to(ctx['deep'].dtype), y, forward,
+                                      support.reshape(b, draws, planes, 1)), -1))
+        time = self.time(time_embedding(t))
+        query = query+time[:, :, None]
+        padding = (~known)[:, None].expand(-1, draws, -1).reshape(b*draws, planes).clone()
+        padding[:, -1] &= ~padding.all(-1)
+        adaln = self.cfg.flow_time_conditioning == 'adaln'
+        condition = F.silu(time) if adaln else None
+        for index, (layer, kv) in enumerate(zip(self.decoder.layers, ctx['generator_projected'])):
+            modulation = self.time_modulation[index](condition).unflatten(-1, (4, 3, self.cfg.hidden)) if adaln else None
+            query = layer.forward_draws(query, kv, ctx['padding'], padding, history=ctx['history_projected'],
+                                        history_attention=getattr(self, 'history_attention', None), modulation=modulation)
+        output = self.decoder.norm(query)
+        if adaln:
+            shift, scale = self.output_modulation(condition)[:, :, None].chunk(2, -1)
+            output = output*(1+scale)+shift
+        return self.velocity(output).float()

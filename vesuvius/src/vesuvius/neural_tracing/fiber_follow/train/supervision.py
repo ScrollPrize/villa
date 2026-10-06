@@ -6,6 +6,7 @@ import torch.nn.functional as F
 
 from vesuvius.neural_tracing.fiber_follow.data.labels import prefix_labels
 from vesuvius.neural_tracing.fiber_follow.data.state_labels import RECOVERABLE, TERMINAL
+from vesuvius.neural_tracing.fiber_follow.models.flow import FLOW_MODEL_TYPES
 from vesuvius.neural_tracing.fiber_follow.models.model import feature_grid
 from vesuvius.neural_tracing.fiber_follow.models.survival_confidence import survival_loss
 from vesuvius.neural_tracing.fiber_follow.tracing.policy import commit_prefix, gate_horizon
@@ -189,7 +190,7 @@ def loss_terms(output, batch, cfg, tolerance=1.5, *, n_commit=None, refinement_l
         geometry = torch.where(count > 1, .75*final+.25*auxiliary, final)
         confidence = torch.where(attempts, confidence_losses, 0.).sum(1)/count
     flow_terms = {}
-    if cfg.model_type == 'flow_matching':
+    if cfg.model_type in FLOW_MODEL_TYPES:
         geometry = output['flow_per_state']
         if 'flow_geometry_points' in output:
             # The integrated zero-start path, supervised as a regression path (flow_geometry_weight).

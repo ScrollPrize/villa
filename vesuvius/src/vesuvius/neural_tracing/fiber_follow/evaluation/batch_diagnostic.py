@@ -55,6 +55,9 @@ def layer_capture(model):
     Store reduced spatial maps, query activations and per-slot attention, never
     full spatial feature banks. Restore everything even after a failed forward.
     """
+    if not hasattr(model, 'decoder'):  # models without the patch encoder/decoder (unified): predictions only
+        yield dict(encoder={}, decoder={}, scorer={}, history={}, statistics={}, history_depths={})
+        return
     record = dict(encoder={}, decoder={}, scorer={}, history={}, statistics={},
                   history_depths=dict(generator=len(model.decoder.layers), scorer=len(model.confidence_scorer.layers)))
     handles, methods = [], []

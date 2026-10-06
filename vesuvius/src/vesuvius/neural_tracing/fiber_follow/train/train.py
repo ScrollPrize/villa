@@ -216,8 +216,8 @@ def initialize_training_optimizer(model, ema, args, resume=None):
     return opt, done, origin
 
 
-from vesuvius.neural_tracing.fiber_follow.models.flow import FlowConfig
-MODEL_TYPES = ('coordinate_regression', 'flow_matching', 'sequence')
+from vesuvius.neural_tracing.fiber_follow.models.flow import FLOW_MODEL_TYPES, FlowConfig
+MODEL_TYPES = ('coordinate_regression', 'flow_matching', 'sequence', 'unified', 'unified_flow')
 HISTORY_GRAD_CLIP = 5.
 REST_GRAD_CLIP = 100.
 
@@ -234,6 +234,9 @@ def checkpoint_config(ck):
         raise ValueError('Unsupported checkpoint model type')
     if ck.get('model_type') == 'sequence':
         from vesuvius.neural_tracing.fiber_follow.models.sequence import SequenceConfig as cls
+    elif ck.get('model_type') in ('unified', 'unified_flow'):
+        from vesuvius.neural_tracing.fiber_follow.models import unified
+        cls = unified.UnifiedConfig if ck['model_type'] == 'unified' else unified.UnifiedFlowConfig
     else:
         cls = FlowConfig if ck.get('model_type') == 'flow_matching' else CoordinateRegressionConfig
     cfg = cls(**ck['model_cfg'])
@@ -256,6 +259,8 @@ def model_config_from_args(args, checkpoint=None):
                               hidden=args.hidden, layers=args.sequence_layers, heads=args.sequence_heads,
                               ffn=args.sequence_ffn, cnn_channels=tuple(args.cnn_channels), cnn_blocks=args.cnn_blocks,
                               activation_checkpointing=args.activation_checkpointing)
+    if args.model in ('unified', 'unified_flow'):
+        return unified_config_from_args(args)
     cls = FlowConfig if args.model == 'flow_matching' else CoordinateRegressionConfig
     options = {key: getattr(args, key) for key in ('stem_channels', 'stem_blocks', 'stem', 'memory', 'path_planes', 'tube_head',
         'identity_dim', 'identity_temperature', 'identity_objective', 'identity_map', 'identity_feedback', 'hidden',
@@ -266,12 +271,30 @@ def model_config_from_args(args, checkpoint=None):
     options['fine'] = CropSpec(depth=args.crop_depth, width=args.crop_width, behind=args.crop_behind,
                                spacing=args.crop_spacing)
     if cls is FlowConfig:
-        options.update({key: getattr(args, key) for key in (
-            'flow_steps', 'flow_draws', 'flow_samples', 'flow_sample_scale', 'flow_time_conditioning',
-            'flow_sigma_floor', 'flow_unknown_planes', 'flow_loss', 'flow_huber_c', 'flow_geometry_weight')})
+        options.update(flow_options(args))
     else:
         options['recurrent_refinement_steps'] = args.recurrent_refinement_steps
     return cls(**options)
+
+
+def flow_options(args):
+    return {key: getattr(args, key) for key in (
+        'flow_steps', 'flow_draws', 'flow_samples', 'flow_sample_scale', 'flow_time_conditioning',
+        'flow_sigma_floor', 'flow_unknown_planes', 'flow_loss', 'flow_huber_c', 'flow_geometry_weight')}
+
+
+def unified_config_from_args(args):
+    """The unified crop model (models/unified.py), regression ('unified') or flow ('unified_flow')."""
+    from vesuvius.neural_tracing.fiber_follow.models.unified import UnifiedConfig, UnifiedFlowConfig
+    options = dict(fine=CropSpec(depth=args.crop_depth, width=args.crop_width, behind=args.crop_behind,
+                                 spacing=args.crop_spacing),
+                   n_future=args.n_future, future_step=args.future_step, gate_plane=args.gate_plane,
+                   query_scale=args.query_scale, hidden=args.hidden, layers=args.sequence_layers,
+                   heads=args.sequence_heads, ffn=args.sequence_ffn, cnn_channels=tuple(args.unified_cnn_channels),
+                   cnn_blocks=tuple(args.unified_cnn_blocks), activation_checkpointing=args.activation_checkpointing)
+    if args.model == 'unified_flow':
+        return UnifiedFlowConfig(**options, **flow_options(args))
+    return UnifiedConfig(**options, recurrent_refinement_steps=args.recurrent_refinement_steps)
 
 
 def load_matching_weights(model, state, exclude=()):
@@ -289,12 +312,12 @@ def load_matching_weights(model, state, exclude=()):
     model.load_state_dict(matched, strict=False)
     fresh = sorted(set(own)-set(matched))
     with torch.no_grad():
-        for index, block in enumerate(model.encoder.blocks):
+        for index, block in enumerate(getattr(getattr(model, 'encoder', None), 'blocks', ())):
             if f'encoder.blocks.{index}.mlp.2.weight' in fresh:
                 for layer in [axis.projection for axis in block.axes]+[block.mlp[-1]]:
                     layer.weight.zero_()
                     layer.bias.zero_()
-        if 'encoder.stem.projection.weight' in fresh:
+        if 'encoder.stem.projection.weight' in fresh and 'encoder.stem.projection.weight' in own:
             model.encoder.stem.projection.weight.zero_()
             model.encoder.stem.projection.bias.zero_()
     return fresh
@@ -426,7 +449,7 @@ def training_diagnostics(model, cpu_batch, tracer, fibers, seeds, out, step, log
             log.record(dict(step=step, split='monitor', threshold=threshold,
                             **({'dataset':dataset_name} if dataset_name else {}),
                             coverage_max_len=tracer.p.max_len, **rollout_summary(rows)))
-        plot_curves(Path(out)/'log.jsonl', Path(out)/'curves.png', loss_key='flow' if model.cfg.model_type == 'flow_matching' else 'geometry')
+        plot_curves(Path(out)/'log.jsonl', Path(out)/'curves.png', loss_key='flow' if model.cfg.model_type in FLOW_MODEL_TYPES else 'geometry')
     finally:
         model.train(was_training)
         tracer.p.confidence = threshold_before
@@ -684,19 +707,19 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
         sums['identity'] = identity
     if compute_metrics:
         sums['decisions'] = summarize_decisions(decisions, commit_window(model.cfg, n_commit))
-    sums['prediction_loss_type'] = ('flow' if model.cfg.model_type == 'flow_matching' else
+    sums['prediction_loss_type'] = ('flow' if model.cfg.model_type in FLOW_MODEL_TYPES else
                                     'whole-crop geometry' if model.cfg.path_planes == 'crop' else 'geometry')
     if 'tube_states' in sums:
         sums['tube_loss'] = sums['tube_loss_sum']/max(1., sums['tube_states'])
     sums['prediction_loss'] = sums['geometry']
-    if model.cfg.model_type == 'flow_matching':
+    if model.cfg.model_type in FLOW_MODEL_TYPES:
         sums.setdefault('flow', sums['geometry'])
     return sums
 
 
 def build_parser():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument('--model', choices=('coordinate_regression', 'flow_matching', 'sequence'), default=None,
+    ap.add_argument('--model', choices=MODEL_TYPES, default=None,
                     help='Follower type; default coordinate_regression, inferred from checkpoint on resume/init')
     ap.add_argument('--flow-steps', type=int, default=4)
     ap.add_argument('--flow-draws', type=int, default=64)
@@ -810,9 +833,13 @@ def build_parser():
                          "of earlier decisions (live chains start at seeds and reuse recorded entries), 'none' "
                          "(no memory inputs, tokens or attention; incompatible with the identity objectives)")
     # --model sequence (models/sequence.py): one transformer reads the whole trace and predicts the path.
-    ap.add_argument('--sequence-layers', type=int, default=12, help='With --model sequence: transformer layers')
-    ap.add_argument('--sequence-heads', type=int, default=8, help='With --model sequence: attention heads')
-    ap.add_argument('--sequence-ffn', type=int, default=2048, help='With --model sequence: feed-forward width')
+    ap.add_argument('--sequence-layers', type=int, default=12, help='With --model sequence/unified/unified_flow: transformer layers')
+    ap.add_argument('--sequence-heads', type=int, default=8, help='With --model sequence/unified/unified_flow: attention heads')
+    ap.add_argument('--sequence-ffn', type=int, default=2048, help='With --model sequence/unified/unified_flow: feed-forward width')
+    ap.add_argument('--unified-cnn-channels', type=int, nargs='+', default=(32, 64, 128),
+                    help='With --model unified/unified_flow: CNN stage channels, each stage at stride 2 (token stride 2^stages)')
+    ap.add_argument('--unified-cnn-blocks', type=int, nargs='+', default=(1, 2, 2),
+                    help='With --model unified/unified_flow: residual blocks per CNN stage')
     ap.add_argument('--cnn-channels', type=int, nargs=4, default=(16, 32, 64, 128),
                     help='With --model sequence: full-resolution block, then stages at strides 2/4/8')
     ap.add_argument('--cnn-blocks', type=int, default=2, help='With --model sequence: residual blocks per CNN stage')
@@ -982,7 +1009,8 @@ def validate_resume_options(args, recorded_options):
     # an omitted CLI flag must not prevent resuming that recorded selection.
     # Initialization is historical provenance, not a resume-time input.
     # Operational settings may change on resume; sampling and label semantics may not.
-    ignored = {'resume','init_weights','init_partial','init_exclude','reset_optimizer','lr','steps','frame_checkpoint','out_root','device','batch','grad_steps','workers','threads','dagger_threads','worker_cache_gb','dataset_config','add_dataset_sources',
+    # 'ct' is where the CT is read from (it may move, e.g. a local mirror to its S3 store), not what is trained on.
+    ignored = {'resume','init_weights','init_partial','init_exclude','reset_optimizer','lr','steps','frame_checkpoint','out_root','device','batch','grad_steps','workers','threads','dagger_threads','worker_cache_gb','dataset_config','add_dataset_sources','ct',
                'remote_prefetch_connections','remote_prefetch_queue_size','remote_prefetch_timeout','remote_prefetch_lookahead',
                'log_every','ckpt_every','diag_every','batch_diag_every','dagger_device','dagger_batch','dagger_forward_chunk',
                'negative_bank_refresh_seconds','negative_bank_cache_mb','activation_checkpointing',
@@ -1150,7 +1178,8 @@ def main(argv=None):
         return {role:bank.provenance() for role,bank in role_banks.items()}
     if resume:
         validate_resume_options(args, resume['training_options'])
-        if resume['seed_manifest_sha256'] != manifest['sha256'] or resume['fiber_manifest'] != fiber_manifest(fibers):
+        # The held-out fibers must match; the validation manifest's hash also covers the CT location, which may move.
+        if resume['fiber_manifest'] != fiber_manifest(fibers):
             raise ValueError('Resume data/manifest changed')
     if initial:
         # Fiber identities and source holdouts must match the weights' training data, so no
@@ -1179,7 +1208,7 @@ def main(argv=None):
                                  for s in dataset_document['sources'] if s['kind'] != 'paris4')
     progress('Preparing per-crop CT z-score normalization')
     ct_normalization = prepare_normalization(out, calibration_specs,
-        resume=resume['ct_normalization'] if resume is not None else None)
+        known=resume['ct_normalization'] if resume is not None else None)  # a relocated CT adds its own record
     recovery_states = recovery_hash = None
     if args.recovery_every:
         progress('Preparing monitor recovery fixture')
@@ -1417,7 +1446,7 @@ def main(argv=None):
                     cuda_peak_allocated_gib=torch.cuda.max_memory_allocated(args.device)/2**30
                         if torch.device(args.device).type == 'cuda' else None))
                 from vesuvius.neural_tracing.fiber_follow.evaluation.diag import plot_curves
-                plot_curves(out/'log.jsonl', out/'curves.png', loss_key='flow' if model.cfg.model_type == 'flow_matching' else 'geometry')
+                plot_curves(out/'log.jsonl', out/'curves.png', loss_key='flow' if model.cfg.model_type in FLOW_MODEL_TYPES else 'geometry')
                 interval_metrics = TrainingInterval()
                 ledger = SamplingLedger()
                 interval_started, interval_step = now, step
@@ -1492,7 +1521,7 @@ def main(argv=None):
                         finally:
                             source_tracer.close()
                     from vesuvius.neural_tracing.fiber_follow.evaluation.diag import plot_curves
-                    plot_curves(out/'log.jsonl',out/'curves.png',loss_key='flow' if model.cfg.model_type == 'flow_matching' else 'geometry')
+                    plot_curves(out/'log.jsonl',out/'curves.png',loss_key='flow' if model.cfg.model_type in FLOW_MODEL_TYPES else 'geometry')
                 periodic['diagnostics_seconds'] = time.monotonic()-began
             if tracer is not None and args.long_diag_every and step % args.long_diag_every == 0:
                 from vesuvius.neural_tracing.fiber_follow.evaluation.seeds import evaluate

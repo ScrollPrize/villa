@@ -104,17 +104,24 @@ def same_sources(recorded, document, *, allow_added=False):
     return all(source in new for source in old) if allow_added else old == new
 
 
-def validate_dataset_resume(checkpoint, document, digest, *, allow_added=False):
-    """Allow cache relocation while requiring identical resolved training data.
+CT_LOCATION_KEYS = ('ct', 'ct_level', 'ct_mirror_of')  # where a source's CT is read from, not what it is
 
-    With ``allow_added`` the resumed run may append new sources after the recorded ones (dataset ids stay the
-    same); the recorded sources must be unchanged except for their sampling weights."""
+
+def validate_dataset_resume(checkpoint, document, digest, *, allow_added=False):
+    """Allow cache and CT relocation (and a reworded description) while requiring identical resolved training data.
+
+    A source's CT location (``ct``, ``ct_level``, ``ct_mirror_of``) may change, e.g. a local mirror replaced by the
+    S3 store it mirrors. With ``allow_added`` the resumed run may append new sources after the recorded ones (dataset
+    ids stay the same); the recorded sources must be unchanged except for their sampling weights."""
     if checkpoint.get('dataset_config_sha256') == digest:
         return
     recorded = checkpoint.get('dataset_config')
     if isinstance(recorded,dict) and isinstance(document,dict):
-        without_cache = lambda value: {k:v for k,v in value.items() if k != 'cache_dir'}
-        if without_cache(recorded) == without_cache(document):
+        located = lambda source: {k: v for k, v in source.items() if k not in CT_LOCATION_KEYS}
+        without_cache = lambda value: {k: ([located(s) for s in v] if k == 'sources' else v)
+                                       for k, v in value.items() if k not in ('cache_dir', 'description')}
+        recorded, document = without_cache(recorded), without_cache(document)
+        if recorded == document:
             return
         if allow_added:
             old, new = recorded.get('sources', []), document.get('sources', [])
@@ -336,7 +343,8 @@ class WeightedDatasets(torch.utils.data.IterableDataset):
             if streams[index] is None:
                 streams[index] = iter(self.datasets[index])
             batch = next(streams[index])
-            batch['dataset_id'] = torch.full((len(batch['hist']),), index, dtype=torch.int64)  # rows (episodes: chunk*steps)
+            rows = len(batch['hist']) if 'hist' in batch else self.datasets[index].chunk  # episode batches: chunk*steps
+            batch['dataset_id'] = torch.full((rows,), index, dtype=torch.int64)
             yield batch
 
 

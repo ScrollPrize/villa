@@ -203,7 +203,8 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer):
         bind_frame_checkpoint(model.cfg, args.frame_checkpoint)
     for key in ('flow_samples', 'flow_sample_scale', 'flow_selection'):
         if getattr(args, key) is not None:
-            if model.cfg.model_type != 'flow_matching':
+            from vesuvius.neural_tracing.fiber_follow.models.flow import FLOW_MODEL_TYPES
+            if model.cfg.model_type not in FLOW_MODEL_TYPES:
                 raise ValueError(f'--{key.replace("_", "-")} needs a flow checkpoint')
             setattr(model.cfg, key, getattr(args, key))
     if args.precision == 'fp32':

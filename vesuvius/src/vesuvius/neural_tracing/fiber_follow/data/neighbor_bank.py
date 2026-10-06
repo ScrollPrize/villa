@@ -145,8 +145,8 @@ class NeighborBank:
         if any(Path(recorded_path(g['zarr'])).parent.parent.resolve() != Path(spec.fiber_zarr_dir).resolve()
                or Path(g['zarr']).name != str(spec.fiber_level) for g in groups.values()):
             raise ValueError('Negative-bank prediction volume differs from training')
-        if Path(recorded_path(self.run['ct'])).parent.resolve() != Path(spec.ct_zarr).resolve():
-            raise ValueError('Negative-bank CT source differs from training')
+        # The CT location is not compared: training may read the same scan from another copy (e.g. the S3 store a
+        # local mirror was made from); the bank's geometry is in the shared fiber coordinates.
 
     def _archive(self, entry):
         raw = (self.root/entry['path']/'bank.npz').read_bytes()

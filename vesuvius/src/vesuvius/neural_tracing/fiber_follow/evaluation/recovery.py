@@ -30,8 +30,12 @@ def monitor_fixture(path, fibers, manifest, sample, spec, seed_count=8):
         recorded = json.loads(json.dumps(states.provenance))
         # Fixture states do not depend on the confidence-label tolerance: evaluation
         # relabels every state under the current sample configuration.
-        unlabeled = lambda value: dict(value, sample_cfg={k: v for k, v in value.get('sample_cfg', {}).items()
-                                                          if k != 'label_tolerance'})
+        # The CT location (volume spec, the manifest hash covering it, seed headings re-read from it) may move, e.g.
+        # from a local mirror to its S3 store: the states are geometry and evaluation reads the current volume. The
+        # seed fibers and every construction setting must still match.
+        unlabeled = lambda value: dict({k: v for k, v in value.items() if k not in ('volume', 'seed_manifest_sha256', 'seeds')},
+                                       sample_cfg={k: v for k, v in value.get('sample_cfg', {}).items() if k != 'label_tolerance'},
+                                       seed_fibers=[seed['fiber'] for seed in value.get('seeds', [])])
         if unlabeled(recorded) != unlabeled(provenance):
             raise ValueError('Monitor recovery fixture settings changed')
     else:
