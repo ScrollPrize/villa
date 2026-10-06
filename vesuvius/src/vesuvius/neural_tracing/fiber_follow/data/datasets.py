@@ -336,7 +336,7 @@ class WeightedDatasets(torch.utils.data.IterableDataset):
             if streams[index] is None:
                 streams[index] = iter(self.datasets[index])
             batch = next(streams[index])
-            batch['dataset_id'] = torch.full((self.datasets[index].chunk,), index, dtype=torch.int64)
+            batch['dataset_id'] = torch.full((len(batch['hist']),), index, dtype=torch.int64)  # rows (episodes: chunk*steps)
             yield batch
 
 

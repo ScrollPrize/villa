@@ -486,11 +486,18 @@ def make_sample(fiber: TracedFiber, t: float, reverse: bool, cfg: SampleConfig, 
     the GT continuation from the offset head under the shared state contract.
     ``startup`` fixes the draw category; ``excursion`` forces or forbids an excursion.
     """
+    p, s = traversal_curve(fiber, reverse)
+    path, arcs, category, sigma, details = simulated_trace(p, s, t, cfg, rng, startup=startup, excursion=excursion)
+    return decision_on_path(fiber, t, reverse, cfg, path, arcs, category, sigma, details)
+
+
+def decision_on_path(fiber, t, reverse, cfg, path, arcs, category, sigma, details):
+    """The tracer decision whose head ends an observed path (``path``, sampled at traversal arclengths ``arcs``
+    ending at ``t``): crop heading, history, seed reference and labels exactly as ``make_sample`` builds them."""
     from vesuvius.neural_tracing.fiber_follow.tracing.heading import linear12_heading, trace_heading
     from vesuvius.neural_tracing.fiber_follow.data.state_labels import constructed_facts, supervise
     from vesuvius.neural_tracing.fiber_follow.tracing.trace import trace_history
     p, s = traversal_curve(fiber, reverse)
-    path, arcs, category, sigma, details = simulated_trace(p, s, t, cfg, rng, startup=startup, excursion=excursion)
     pos = path[-1]
     # Only the CT seed axis's sign comes from the direction of travel.
     seed_direction = tangent_at(p, s, arcs[0])
@@ -510,6 +517,68 @@ def make_sample(fiber: TracedFiber, t: float, reverse: bool, cfg: SampleConfig, 
     if linear12_heading(path, 0) is None:
         item['_pending_seed_heading'] = (fiber, t, reverse, cfg)
     return item
+
+
+@dataclass(frozen=True)
+class EpisodeSpec:
+    """Consecutive decisions along one simulated trace, for whole-trace history (``memory='sequence'``)."""
+    steps: int = 64  # decisions per episode (fewer on a fiber too short for them, never below min_steps)
+    supervised: int = 16  # trailing decisions with a loss; earlier decisions only build history tokens
+    commit: int = 12  # voxels between consecutive heads (the tracer's commit)
+    min_steps: int = 4
+
+    def __post_init__(self):
+        if not (1 <= self.supervised <= self.steps and 2 <= self.min_steps <= self.steps and self.commit >= 1):
+            raise ValueError('Episodes need 1 <= supervised <= steps, 2 <= min_steps <= steps and a positive commit')
+
+
+def episode_decisions(fiber, t0, reverse, steps, commit, cfg: SampleConfig, rng: np.random.Generator):
+    """``steps`` decisions on one simulated trace of this fiber, heads at traversal arclengths t0, t0+commit, ...
+
+    The trace is drawn as ``simulated_trace`` draws a decision's observed path (startup prefix before t0, trace noise
+    over the whole trace, optionally one excursion ending at the trace's end), then every head ending a prefix of it
+    becomes a decision (``decision_on_path``). Returns (decision, committed segment) pairs; a step's segment is the
+    observed path from its head to the next head (world xyz), the points that step commits. Requires
+    t0 + steps*commit <= the fiber length.
+    """
+    p, s = traversal_curve(fiber, reverse)
+    step = cfg.history_step
+    category = int(rng.choice(len(STARTUP_CATEGORIES), p=cfg.startup_shares))
+    prefix = int(trace_prefix_length(t0, category, rng)//step)*step
+    per_commit = int(round(commit/step))
+    count = int(round(prefix/step))+steps*per_commit
+    arcs = t0-prefix+step*np.arange(count+1, dtype=np.float64)
+    if arcs[-1] > s[-1]+1e-6:
+        raise ValueError('Episode runs past the end of its fiber')
+    noise, sigma = trace_noise(arcs, p, s, cfg, rng)
+    path = interp_at(p, s, arcs)+noise
+    details, offsets = {}, np.zeros_like(path)
+    if (category == STARTUP_CATEGORIES.index('established') and arcs[-1]-arcs[0] >= 8.
+            and rng.random() < cfg.excursion_probability):
+        offsets, details = excursion_offsets(arcs, p, s, cfg, rng)
+        path = path+offsets
+    out = []
+    for j in range(steps):
+        i = int(round(prefix/step))+j*per_commit
+        departed = details if np.abs(offsets[:i+1]).max() > 0 else {}
+        decision = decision_on_path(fiber, float(arcs[i]), reverse, cfg, path[:i+1], arcs[:i+1], category, sigma, departed)
+        out.append((decision, path[i:i+per_commit+1].copy()))
+    return out
+
+
+def episode_tensors(items, commit):
+    """Row-aligned episode layout of a batch of episode decisions: episode and step indices, which rows are
+    supervised, and each step's committed segment (world xyz, padded) with its mask."""
+    length = int(round(commit))+1
+    segment = np.zeros((len(items), length, 3), np.float32)
+    mask = np.zeros((len(items), length), bool)
+    for row, item in enumerate(items):
+        points = np.asarray(item['episode_segment'])[:length]
+        segment[row, :len(points)], mask[row, :len(points)] = points, True
+    return dict(episode_index=torch.tensor([it['episode_index'] for it in items], dtype=torch.long),
+                episode_step=torch.tensor([it['episode_step'] for it in items], dtype=torch.long),
+                episode_supervised=torch.tensor([bool(it['episode_supervised']) for it in items]),
+                episode_segment=torch.from_numpy(segment), episode_segment_mask=torch.from_numpy(mask))
 
 
 def resolve_trace_seed(item, vol):
@@ -731,6 +800,7 @@ class FollowDataset(torch.utils.data.IterableDataset):
         self.chain_seed_only = False
         self.chain_seed_fraction = 0.
         self.remote_prefetch = None  # Optional trainer-owned process queue client.
+        self.episodes = None  # EpisodeSpec: plans of whole episodes (memory='sequence'); chunk then counts episodes
         self.remote_prefetch_lookahead = 0  # Planned microbatches per source/worker.
         self.additional_crops = tuple(additional_crops)
         # Shared by every loader worker: current update and per-event replay draw counts.
@@ -916,6 +986,34 @@ class FollowDataset(torch.utils.data.IterableDataset):
         item = self.prepare(item, rng)
         return item if self.state_allowed(item) else None
 
+    def episode_items(self, rng, windows, index):
+        """One episode (``self.episodes``) on a fresh fiber location: decisions in step order, each prepared like a
+        fresh item; the episode shares one photometric draw (one scan) while frames and rolls stay per step."""
+        spec = self.episodes
+        for _ in range(1000):
+            fi, _, reverse, location = self.fresh_location(rng, windows)
+            length = self.fibers[fi].length
+            steps = min(spec.steps, int(length//spec.commit))
+            if steps < spec.min_steps:
+                continue
+            t0 = float(rng.uniform(0., length-steps*spec.commit))
+            items, shared = [], None
+            for step, (item, segment) in enumerate(episode_decisions(self.fibers[fi], t0, reverse, steps, spec.commit,
+                                                                     self.cfg, rng)):
+                item.update(fiber_ref=(fi, float(t0+step*spec.commit), reverse), location_source=location)
+                item = self.prepare(item, rng)
+                if shared is None:
+                    shared = {key: item[key] for key in ('photometric', 'blur_sigma') if key in item}
+                item.update(shared, source=SOURCE['fresh'], source_step=-1, task_requested=TASK['fresh'],
+                            task_delivered=TASK['fresh'], task_fallback=0, episode_index=index, episode_step=step,
+                            episode_supervised=step >= steps-spec.supervised, episode_segment=segment)
+                if not self.state_allowed(item):
+                    break
+                items.append(item)
+            else:
+                return items
+        raise ValueError('Could not draw a training episode outside the held-out band')
+
     def live_start(self, rng, windows):
         """Chain starts: half recorded valid pre-excursion/recoverable prefixes, half seed-only."""
         from vesuvius.neural_tracing.fiber_follow.data.state_labels import FOLLOWING, RECOVERABLE
@@ -992,6 +1090,27 @@ class FollowDataset(torch.utils.data.IterableDataset):
         """CT seed headings; a seed without CT orientation is rejected and its task redrawn."""
         from vesuvius.neural_tracing.fiber_follow.tracing.heading import SeedHeadingError
         rejected = 0
+        if self.episodes is not None:
+            # A rejected seed redraws its whole episode: every decision of a trace shares the seed.
+            groups = {}
+            for item in items:
+                groups.setdefault(item['episode_index'], []).append(item)
+            resolved = []
+            for index, group in groups.items():
+                for _ in range(MAX_CT_FRAME_REJECTIONS):
+                    try:
+                        for item in group:
+                            resolve_trace_seed(item, vol)
+                        break
+                    except SeedHeadingError:
+                        rejected += 1
+                        group = self.episode_items(rng, windows, index)
+                        self.prefetch_items(group, vol, required=True)
+                else:
+                    raise SeedHeadingError('No CT-oriented replacement episode after repeated rejections')
+                resolved.extend(group)
+            items[:] = resolved
+            return rejected
         for index, item in enumerate(items):
             for _ in range(MAX_CT_FRAME_REJECTIONS):
                 try:
@@ -1068,6 +1187,8 @@ class FollowDataset(torch.utils.data.IterableDataset):
                         f'(source={getattr(self.vol_spec, "ct_zarr", "unknown")}, '
                         f'worker={worker.id if worker else 0}): {exc}') from exc
                 continue
+            if self.episodes is not None:
+                batch.update(episode_tensors(items, self.episodes.commit))
             if self.live_continuation is not None:
                 batch['_live_states'] = [self.live_continuation.metadata(item) for item in items]
                 batch['live_depth'] = torch.tensor([item.get('live_depth', 0) for item in items])
@@ -1081,7 +1202,7 @@ class FollowDataset(torch.utils.data.IterableDataset):
                 counters.update({'live_'+name: value for name, value in live_outcomes.items()})
             for name, value in counters.items():
                 if value:
-                    batch[name] = torch.zeros(self.chunk, dtype=torch.int64)
+                    batch[name] = torch.zeros(len(items), dtype=torch.int64)
                     batch[name][0] = value
             rejected = seed_rejections = 0
             yield batch
@@ -1096,6 +1217,13 @@ class FollowDataset(torch.utils.data.IterableDataset):
                 self.refresh_replay()
             chunks += 1
             items = []
+            if self.episodes is not None:
+                for index in range(self.chunk):
+                    episode = self.episode_items(rng, windows, index)
+                    self.prefetch_items(episode, vol)
+                    items.extend(episode)
+                yield items
+                continue
             for task in rng.choice(len(TASKS), size=self.chunk, p=self.budget.shares):
                 item = self.task_item(int(task), rng, windows)
                 self.prefetch_items([item], vol)

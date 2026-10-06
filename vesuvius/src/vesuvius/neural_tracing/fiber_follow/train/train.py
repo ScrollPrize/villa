@@ -79,6 +79,9 @@ def prepare_training(model, batch_size=2, *, backend=None):
         return model
     if batch_size < 1:
         raise ValueError('Positive training batch size required')
+    if model.model_type == 'sequence':  # episode batches (train/sequence.py); eager
+        model.training_batch_size, model._training_refined, model.training_loss = batch_size, None, loss_terms
+        return model
     options = dict(dynamic=False, fullgraph=True)
     # Keep eager BF16 rounding without changing global compiler configuration.
     if backend is None or backend == 'inductor':
@@ -214,7 +217,7 @@ def initialize_training_optimizer(model, ema, args, resume=None):
 
 
 from vesuvius.neural_tracing.fiber_follow.models.flow import FlowConfig
-MODEL_TYPES = ('coordinate_regression', 'flow_matching')
+MODEL_TYPES = ('coordinate_regression', 'flow_matching', 'sequence')
 HISTORY_GRAD_CLIP = 5.
 REST_GRAD_CLIP = 100.
 
@@ -229,7 +232,10 @@ def sampling_revision(cfg):
 def checkpoint_config(ck):
     if ck.get('model_type') not in MODEL_TYPES:
         raise ValueError('Unsupported checkpoint model type')
-    cls = FlowConfig if ck.get('model_type') == 'flow_matching' else CoordinateRegressionConfig
+    if ck.get('model_type') == 'sequence':
+        from vesuvius.neural_tracing.fiber_follow.models.sequence import SequenceConfig as cls
+    else:
+        cls = FlowConfig if ck.get('model_type') == 'flow_matching' else CoordinateRegressionConfig
     cfg = cls(**ck['model_cfg'])
     if cfg.model_type != ck['model_type']:
         raise ValueError('Checkpoint model type does not match configuration')
@@ -242,6 +248,14 @@ def model_config_from_args(args, checkpoint=None):
         if args.model is not None and args.model != cfg.model_type:
             raise ValueError('Model type must match checkpoint')
         return cfg
+    if args.model == 'sequence':
+        from vesuvius.neural_tracing.fiber_follow.models.sequence import SequenceConfig
+        return SequenceConfig(fine=CropSpec(depth=args.crop_depth, width=args.crop_width, behind=args.crop_behind,
+                                            spacing=args.crop_spacing),
+                              n_future=args.n_future, future_step=args.future_step, gate_plane=args.gate_plane,
+                              hidden=args.hidden, layers=args.sequence_layers, heads=args.sequence_heads,
+                              ffn=args.sequence_ffn, cnn_channels=tuple(args.cnn_channels), cnn_blocks=args.cnn_blocks,
+                              activation_checkpointing=args.activation_checkpointing)
     cls = FlowConfig if args.model == 'flow_matching' else CoordinateRegressionConfig
     options = {key: getattr(args, key) for key in ('stem_channels', 'stem_blocks', 'stem', 'memory', 'path_planes', 'tube_head',
         'identity_dim', 'identity_temperature', 'identity_objective', 'identity_map', 'identity_feedback', 'hidden',
@@ -469,7 +483,10 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
                      refinement_weight=1.):
     """One equally weighted task loss per independent supervised decision."""
     prepare_training(model, getattr(model, 'training_batch_size', 2))
-    total = observed = sum(len(batch['hist']) for batch in batches)
+    # Episode batches (model 'sequence') supervise their trailing decisions; earlier steps only build history.
+    total = sum(int(batch['episode_supervised'].sum()) if 'episode_supervised' in batch else len(batch['hist'])
+                for batch in batches)
+    observed = sum(len(batch['hist']) for batch in batches)
     if total < 1:
         raise ValueError('An update needs at least one supervised decision')
     denominator = max(1, total)
@@ -482,6 +499,7 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
     identity = {}
     decisions = []
     per_state = []
+    ledger_batches = []
     model.train()
     for cpu in batches:
         if 'ct_frame_rejected_batches' in cpu:
@@ -526,12 +544,18 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
         if diagnostic is not None:
             diagnostic.update(cpu_batch=cpu)
         with torch.autocast('cuda', dtype=torch.bfloat16, enabled=torch.device(device).type == 'cuda'):
-            # Proposal selection follows the operating policy, exactly as in tracing; retries follow it too unless a
-            # separate retry threshold trains refinement on more decisions (--retry-threshold).
-            output = training_prediction(model, batch['x'], batch['hist'], batch['hmask'], confidence_threshold,
-                                         n_commit=selection_window(commit_window(model.cfg, n_commit), gate_horizon(model.cfg), gate),
-                                         targets=batch,
-                                         retry_threshold=REFINE_ALL if refinement_loss == 'all' else retry_threshold)
+            window = selection_window(commit_window(model.cfg, n_commit), gate_horizon(model.cfg), gate)
+            if model.model_type == 'sequence':  # an episode batch: outputs and rows of its supervised decisions
+                from vesuvius.neural_tracing.fiber_follow.train.sequence import episode_forward, select_rows
+                output, batch = episode_forward(model, batch, confidence_threshold, window)
+                ledger_batches.append(select_rows(cpu, cpu['episode_supervised'].nonzero().flatten(), len(cpu['hist'])))
+            else:
+                ledger_batches.append(cpu)
+                # Proposal selection follows the operating policy, exactly as in tracing; retries follow it too unless a
+                # separate retry threshold trains refinement on more decisions (--retry-threshold).
+                output = training_prediction(model, batch['x'], batch['hist'], batch['hmask'], confidence_threshold,
+                                             n_commit=window, targets=batch,
+                                             retry_threshold=REFINE_ALL if refinement_loss == 'all' else retry_threshold)
             terms = model.training_loss(output, batch, model.cfg, tolerance, n_commit=n_commit, refinement_loss=refinement_loss,
                                         refinement_weight=refinement_weight, policy_threshold=confidence_threshold)
             geometry = terms['geometry_per_state'].sum()/denominator
@@ -625,7 +649,7 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
     per_state = torch.cat(per_state).cpu()
     if ledger is not None:
         offset = 0
-        for cpu in batches:
+        for cpu in ledger_batches:
             rows = per_state[offset:offset+len(cpu['hist'])]
             offset += len(cpu['hist'])
             ledger.add(cpu, step, rows.T.tolist())
@@ -672,7 +696,7 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
 
 def build_parser():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument('--model', choices=('coordinate_regression', 'flow_matching'), default=None,
+    ap.add_argument('--model', choices=('coordinate_regression', 'flow_matching', 'sequence'), default=None,
                     help='Follower type; default coordinate_regression, inferred from checkpoint on resume/init')
     ap.add_argument('--flow-steps', type=int, default=4)
     ap.add_argument('--flow-draws', type=int, default=64)
@@ -783,8 +807,21 @@ def build_parser():
                     help="Image stem: 'residual' full-resolution stem, or 'stride2' light stem")
     ap.add_argument('--memory', choices=('slabs', 'decisions', 'none'), default=CoordinateRegressionConfig.memory,
                     help="History memory: 'slabs' separate slab CNN, 'decisions' main-encoder entries "
-                         "of earlier decisions (live chains start at seeds and reuse recorded entries), or 'none' "
+                         "of earlier decisions (live chains start at seeds and reuse recorded entries), 'none' "
                          "(no memory inputs, tokens or attention; incompatible with the identity objectives)")
+    # --model sequence (models/sequence.py): one transformer reads the whole trace and predicts the path.
+    ap.add_argument('--sequence-layers', type=int, default=12, help='With --model sequence: transformer layers')
+    ap.add_argument('--sequence-heads', type=int, default=8, help='With --model sequence: attention heads')
+    ap.add_argument('--sequence-ffn', type=int, default=2048, help='With --model sequence: feed-forward width')
+    ap.add_argument('--cnn-channels', type=int, nargs=4, default=(16, 32, 64, 128),
+                    help='With --model sequence: full-resolution block, then stages at strides 2/4/8')
+    ap.add_argument('--cnn-blocks', type=int, default=2, help='With --model sequence: residual blocks per CNN stage')
+    ap.add_argument('--episode-steps', type=int, default=64,
+                    help='With --model sequence: decisions per training episode (one simulated trace)')
+    ap.add_argument('--episode-supervised', type=int, default=16,
+                    help='With --model sequence: trailing decisions of an episode with a loss; --batch counts episodes')
+    ap.add_argument('--episode-commit', type=int, default=None,
+                    help='With --model sequence: voxels between consecutive episode heads (default: --n-commit)')
     ap.add_argument('--chain-seed-fraction', type=float, default=0.,
                     help='With --memory decisions: start live chains at a seed within this leading fraction '
                          'of the traversal (0 keeps the ordinary fresh location)')
@@ -1030,6 +1067,9 @@ def main(argv=None):
     initialization = resume.get('initialization') if resume else args.init_weights
     # A partial warm start builds the requested architecture; a full one copies the source's.
     cfg = model_config_from_args(args, resume or (None if args.init_partial else initial))
+    if cfg.model_type == 'sequence' and args.dagger_every:
+        # Replay rows are single decisions; sequence training reads whole episodes (on-policy episodes: not yet).
+        raise ValueError('--model sequence trains on simulated episodes; use --dagger-every 0')
     inherited_frame = initial['model_cfg'].get('frame_checkpoint') if args.init_partial else None
     if args.frame_checkpoint or not resume:
         bind_frame_checkpoint(cfg, args.frame_checkpoint or cfg.frame_checkpoint or inherited_frame
@@ -1170,7 +1210,8 @@ def main(argv=None):
     if args.reset_optimizer:
         progress(f'Fresh AdamW: one parameter group, all parameters trainable; LR restarts at update {done+1} '
                  f'with {args.warmup} warmup updates to {args.lr:g}')
-    prepare_training(model, args.batch)
+    # Episode batches present their supervised decisions to the compiled decision graph.
+    prepare_training(model, args.batch*args.episode_supervised if cfg.model_type == 'sequence' else args.batch)
     progress('Compiling training operations; first forward/backward passes may take several minutes')
     if done >= args.steps:
         raise ValueError('Run has already reached its requested update count')
@@ -1223,6 +1264,10 @@ def main(argv=None):
     sources = getattr(dataset, 'datasets', [dataset])
     for source_dataset in sources:
         source_dataset.set_step(done)
+        if cfg.model_type == 'sequence':
+            from vesuvius.neural_tracing.fiber_follow.data.data import EpisodeSpec
+            source_dataset.episodes = EpisodeSpec(steps=args.episode_steps, supervised=args.episode_supervised,
+                                                  commit=args.episode_commit or args.n_commit)
         source_dataset.chain_seed_only = cfg.memory == 'decisions'
         source_dataset.chain_seed_fraction = args.chain_seed_fraction if cfg.memory == 'decisions' else 0.
     from vesuvius.neural_tracing.fiber_follow.train.live_continuation import LiveContinuation, preserve_live_metadata
@@ -1409,7 +1454,8 @@ def main(argv=None):
                 elif step % args.dagger_every == 0 if args.dagger_every else False:
                     log.record(dict(step=step, dagger_skipped_busy=True))
             periodic = {}
-            if args.batch_diag_every and (step % args.batch_diag_every == 0
+            # The batch renderer reads the patch-token models' internals; sequence models use the monitor rollouts.
+            if args.batch_diag_every and cfg.model_type != 'sequence' and (step % args.batch_diag_every == 0
                                          or (resume is not None and step == done+1)):
                 from vesuvius.neural_tracing.fiber_follow.evaluation.batch_diagnostic import render_microbatch
                 began = time.monotonic()

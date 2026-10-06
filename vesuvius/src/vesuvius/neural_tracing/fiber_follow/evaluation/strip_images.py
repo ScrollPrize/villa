@@ -62,9 +62,9 @@ def ribbon_frames(path, seed_index, decisions):
     return centre, tangent, normal, side, int(round(s_seed/STEP))
 
 
-def sample_strip(vol, centre, direction, block=256):
-    """(rows, columns) uint8 CT on centre + offset*direction, offsets -HALF_WIDTH..HALF_WIDTH (trace voxels)."""
-    offsets = np.arange(-HALF_WIDTH, HALF_WIDTH+1e-9, STEP)
+def sample_strip(vol, centre, direction, block=256, half_width=HALF_WIDTH):
+    """(rows, columns) uint8 CT on centre + offset*direction, offsets -half_width..half_width (trace voxels)."""
+    offsets = np.arange(-half_width, half_width+1e-9, STEP)
     out = np.zeros((len(offsets), len(centre)), np.uint8)
     shape = np.asarray(vol.ct.shape)
     for a in range(0, len(centre), block):
@@ -82,7 +82,7 @@ def sample_strip(vol, centre, direction, block=256):
     return out
 
 
-def reference_marks(centre, tangent, normal, side, reference):
+def reference_marks(centre, tangent, normal, side, reference, half_width=HALF_WIDTH):
     """Reference polyline points crossing the strips: (column, side offset, normal offset), trace voxels."""
     reference = np.asarray(reference, float)
     if len(reference) > 1:
@@ -91,21 +91,22 @@ def reference_marks(centre, tangent, normal, side, reference):
     _, column = cKDTree(centre).query(reference)
     offset = reference-centre[column]
     along, across, out = ((offset*axis[column]).sum(1) for axis in (tangent, side, normal))
-    keep = (np.abs(along) <= STEP) & (np.abs(across) <= HALF_WIDTH) & (np.abs(out) <= HALF_WIDTH)
+    keep = (np.abs(along) <= STEP) & (np.abs(across) <= half_width) & (np.abs(out) <= half_width)
     return column[keep], across[keep], out[keep]
 
 
-def render(vol, path, seed_index, decisions, title, file, reference=None):
+def render(vol, path, seed_index, decisions, title, file, reference=None, half_width=HALF_WIDTH, marks=()):
+    """``marks``: (path index, RGB) ticks above and below the strips, e.g. a departure point."""
     centre, tangent, normal, side, seed_col = ribbon_frames(path, seed_index, decisions)
-    strips = [sample_strip(vol, centre, side), sample_strip(vol, centre, normal)]
+    strips = [sample_strip(vol, centre, side, half_width=half_width), sample_strip(vol, centre, normal, half_width=half_width)]
     data = np.concatenate([x.ravel() for x in strips])
     lo, hi = np.percentile(data[data > 0], [.5, 99.5]) if (data > 0).any() else (0, 255)
     strips = [np.repeat(((x.astype(np.float32)-lo)/max(hi-lo, 1)*255).clip(0, 255).astype(np.uint8)[..., None], 3, -1)
               for x in strips]
     if reference is not None:
-        column, across, out = reference_marks(centre, tangent, normal, side, reference)
+        column, across, out = reference_marks(centre, tangent, normal, side, reference, half_width)
         for strip, offset, other in ((strips[0], across, out), (strips[1], out, across)):
-            row = np.round((offset+HALF_WIDTH)/STEP).astype(int).clip(0, strip.shape[0]-1)
+            row = np.round((offset+half_width)/STEP).astype(int).clip(0, strip.shape[0]-1)
             near = np.abs(other) <= OVERLAY_PLANE
             strip[row[near], column[near]] = (40, 220, 40)
             strip[row[~near], column[~near]] = (255, 150, 0)
@@ -127,6 +128,13 @@ def render(vol, path, seed_index, decisions, title, file, reference=None):
                 draw.line([(x, yy+rows//2), (x+5, yy+rows//2)], fill=(0, 140, 255))
         start = (a-seed_col)*STEP
         draw.text((48, y), f'{start:+.0f} vox', fill=(90, 90, 90))
+        s_path = arclength(np.asarray(path, float))
+        for index, colour in marks:
+            col = int(round(s_path[index]/STEP))
+            if a <= col < b:
+                x = 48+col-a
+                draw.line([(x, y+label-4), (x, y+label-1)], fill=colour, width=2)
+                draw.line([(x, y+label+2*rows+gap), (x, y+label+2*rows+gap+4)], fill=colour, width=2)
         if a <= seed_col < b:
             x = 48+seed_col-a
             draw.line([(x, y+label-4), (x, y+label-1)], fill=(230, 0, 0), width=2)

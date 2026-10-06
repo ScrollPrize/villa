@@ -182,6 +182,59 @@ class ModelTracer:
     # decisions of the same trace; entries for a pre-existing prefix are encoded once
     # from their crops. Records and features are pruned to what later selections can read.
 
+    def sequence_attach(self, x, idx, sequence, pos, frames, length):
+        """Sequence follower (models/sequence.py): each row reads its trace's earlier history tokens (per-layer
+        states, at most ``history_limit`` most recent) with their pose in this decision's frame."""
+        from vesuvius.neural_tracing.fiber_follow.models.sequence import relative_pose
+        cfg = self.model.cfg
+        limit = cfg.history_limit
+        count = max(1, max(min(len(sequence[i]['heads']), limit) for i in idx))
+        states = torch.zeros(len(idx), cfg.layers, count, cfg.hidden, device=self.device)
+        relative = torch.zeros(len(idx), count, 3, device=self.device)
+        age = torch.zeros(len(idx), count, device=self.device)
+        padding = torch.ones(len(idx), count, dtype=torch.bool, device=self.device)
+        for j, i in enumerate(idx):
+            state = sequence[i]
+            n = min(len(state['heads']), limit)
+            if not n:
+                continue
+            heads = torch.from_numpy(np.stack(state['heads'][-n:])).to(self.device)
+            relative[j, :n], age[j, :n] = relative_pose(
+                heads, torch.tensor(state['travelled'][-n:], device=self.device, dtype=torch.float64),
+                torch.from_numpy(pos[j]).to(self.device), torch.from_numpy(frames[j]).to(self.device),
+                torch.tensor(float(length[i]), device=self.device, dtype=torch.float64))
+            states[j, :, :n] = torch.stack([torch.stack(layer[-n:]) for layer in state['layers']])
+            padding[j, :n] = False
+        x.update(sequence_states=states, sequence_relative=relative, sequence_age=age, sequence_padding=padding)
+
+    def sequence_record(self, cells, committed, sequence):
+        """After commits: each (row, trace, head, frame-local committed points, travelled at the head) becomes its
+        trace's next history token: the head crop's cells pooled at the head and its committed points, as in training."""
+        if not committed:
+            return
+        rows = [c[0] for c in committed]
+        points = [np.concatenate((np.zeros((1, 3)), c[3])) for c in committed]
+        size = max(len(p) for p in points)
+        local = torch.zeros(len(points), size, 3, device=self.device)
+        valid = torch.zeros(len(points), size, dtype=torch.bool, device=self.device)
+        for r, p in enumerate(points):
+            local[r, :len(p)] = torch.from_numpy(p).float().to(self.device)
+            valid[r, :len(p)] = True
+        displacement = torch.stack([local[r, len(p)-1]-local[r, 0] for r, p in enumerate(points)])
+        travelled = torch.tensor([c[4] for c in committed], device=self.device, dtype=torch.float32)
+        model = self.model
+        with self.autocast():
+            tokens = model.history_input(model.step_features(cells[rows], local, valid), displacement, travelled)
+            for r, (_, i, head, _, at) in enumerate(committed):
+                state = sequence[i]
+                limit = model.cfg.history_limit
+                past = [torch.stack(layer[-limit:])[None] if layer else tokens.new_zeros(1, 0, tokens.shape[-1])
+                        for layer in state['layers']]
+                for layer, value in zip(state['layers'], model.extend_history(tokens[r:r+1], past)):
+                    layer.append(value[0].float())
+                state['heads'].append(np.asarray(head, np.float64).copy())
+                state['travelled'].append(float(at))
+
     @staticmethod
     def memory_start(paths):
         from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength
@@ -301,6 +354,8 @@ class ModelTracer:
             for reference, state in zip(references, initial_states):
                 reference.update({k: state[k] for k in SEED_FIELDS if k in state})
         memory = self.memory_start(paths) if getattr(self.model.cfg, 'memory', 'slabs') == 'decisions' else None
+        sequence = ([dict(layers=[[] for _ in range(self.model.cfg.layers)], heads=[], travelled=[]) for _ in range(n)]
+                    if getattr(self.model.cfg, 'model_type', '') == 'sequence' else None)
         active = np.ones(n, bool)
         reasons = ['']*n
         length = np.zeros(n)
@@ -335,6 +390,8 @@ class ModelTracer:
             x = self.build_inputs(pos, fr, hist, hm, **context)
             if memory is not None:
                 self.memory_attach(x, idx, memory)
+            if sequence is not None:
+                self.sequence_attach(x, idx, sequence, pos, fr, length)
             sampling = {}
             if (hasattr(self.model, 'select_prediction')
                     or getattr(self.model.cfg, 'candidate_selection', 'prefix') == 'stop_fallback'):
@@ -354,6 +411,7 @@ class ModelTracer:
             # Next-step CT frames, resolved together after this step's commits.
             # Each depends only on its own trace, so the pool is a pure speedup.
             reframe = {}
+            committed = []  # sequence history: steps that advanced this round
             for j, i in enumerate(idx):
                 conf = np.minimum.accumulate(confidence[j], axis=-1)
                 commit = int(commits[j])
@@ -387,6 +445,8 @@ class ModelTracer:
                 if advanced is None:
                     active[i], reasons[i] = False, reason
                     continue
+                if sequence is not None:
+                    committed.append((j, i, pos[j].copy(), points[j][:commit].copy(), float(length[i])))
                 paths[i] = list(advanced['path'])
                 last_segment[i] = advanced['last_segment']
                 length[i] = advanced['travelled']
@@ -396,6 +456,8 @@ class ModelTracer:
                     active[i], reasons[i] = False, 'abort'
                 elif length[i] >= pp.max_len-1e-6:
                     active[i], reasons[i] = False, 'max_len'
+            if sequence is not None:
+                self.sequence_record(out['sequence_cells'], committed, sequence)
             if predictor is not None:
                 pending = [i for i in reframe if active[i]]
                 updated = predict_frames(predictor, self.vol, [paths[i][-1] for i in pending],

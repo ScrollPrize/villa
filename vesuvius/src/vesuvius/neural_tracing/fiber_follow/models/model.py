@@ -178,6 +178,9 @@ def build_model(cfg):
     if cfg.model_type == 'flow_matching':
         from .flow import FlowFollower
         return FlowFollower(cfg)
+    if cfg.model_type == 'sequence':
+        from .sequence import SequenceFollower
+        return SequenceFollower(cfg)
     if cfg.model_type != 'coordinate_regression':
         raise ValueError(f'Unsupported model type: {cfg.model_type}')
     return CoordinateRegressionFollower(cfg)
