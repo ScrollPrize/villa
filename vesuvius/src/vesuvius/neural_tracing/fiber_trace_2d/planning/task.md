@@ -1,7 +1,3 @@
-# Current seven-snapshot trace evaluation — 2026-10-05
+# Width-aware views and sideband supervision
 
-Repeat the full 91-piece benchmark for current results of training
-`5scroll_json_eligible_fullres_refinement_gaussian_halfsigma_sideband1_reviewed32_128_sd1_16x8_ema_20261003_222625`:
-raw best by loss, raw best by restarts, raw current, best/current EMA99 and EMA999.
-Report sample counts and per-scroll restart counts. Keep training registered;
-use manager GPU0–5 and the approved runners only.
+Display base width directly as grayscale0–255. Modulate direction-weighted presence panels by linear predicted-width similarity to the center-point prediction, zero at20% deviation. Apply the same detached gate to extra sideband negative loss using GT reference width; ordinary presence loss stays unchanged. Extend width regression across Gaussian tube with falloff. Resume current managed training with H/V0.01.

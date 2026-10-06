@@ -609,6 +609,8 @@ _MATERIALIZED_TARGET_TENSOR_FIELDS = frozenset(
         "direction_target_sparse",
         "direction_weight_sparse",
         "direction_tangent_sparse_zyx",
+        "normal_axis_sparse_zyx",
+        "width_target_input",
         "presence_target",
         "presence_mask",
     }
@@ -674,6 +676,13 @@ def _distributed_broadcast_object(value: Any, config: _DistributedConfig, *, src
     objects = [value]
     dist.broadcast_object_list(objects, src=src)
     return objects[0]
+
+
+def _reviewed_trace_unlocked(previous: bool, losses: dict[str, float]) -> bool:
+    """One-way gate on the raw, whole-test-set angle; not EMA or train loss."""
+    angle = float(losses.get("angle_mean_deg", math.inf))
+    return bool(previous or (float(losses.get("angle_count", 0)) > 0
+                             and math.isfinite(angle) and angle < 10.0))
 
 
 def _reviewed_trace_test_config(training: dict[str, Any]) -> dict[str, Any] | None:
@@ -1014,6 +1023,7 @@ def _finalize_loss_statistics(
     distributed: "_DistributedConfig | None" = None,
 ) -> dict[str, torch.Tensor]:
     names = (
+        "normal", "normal_unweighted", "width", "hv",
         "direction",
         "positive_presence",
         "negative_presence",
@@ -1031,6 +1041,9 @@ def _finalize_loss_statistics(
         "long_embedding",
     )
     local_pairs = {
+        "normal_unweighted": (statistics.normal_unweighted_sum, statistics.normal_count),
+        **{k: (getattr(statistics, k + "_sum"), getattr(statistics, k + "_count"))
+           for k in ("normal", "width", "hv")},
         "contrastive_embedding": (statistics.contrastive_embedding_sum, statistics.contrastive_embedding_count),
         "short_embedding": (statistics.short_embedding_sum, statistics.short_embedding_count),
         "long_embedding": (statistics.long_embedding_sum, statistics.long_embedding_count),
@@ -1149,7 +1162,9 @@ def _finalize_loss_statistics(
         0.5 * (ratio("positive_embedding") + ratio("negative_embedding")) + ratio("contrastive_embedding"),
     )
     total = float(direction_weight) * direction_loss + float(presence_weight) * presence_loss + embedding_loss
+    total = total + ratio("normal") + ratio("width") + ratio("hv")
     return {
+        "normal": ratio("normal_unweighted"), "width": ratio("width"), "hv": ratio("hv"),
         "total": total,
         "direction": direction_loss,
         "presence": presence_loss,
@@ -1169,6 +1184,7 @@ def _finalize_loss_statistics(
         "embedding_negative": ratio("negative_embedding"),
         "embedding_negative_pairs": global_values["negative_embedding"][1] if global_values else statistics.negative_embedding_count,
         "angle_mean_deg": ratio("angle"),
+        "angle_count": global_values["angle"][1] if global_values else statistics.angle_count,
         "branch0_fraction": ratio("branch0"),
         "branch1_fraction": ratio("branch1"),
         "selected_score_mean": ratio("selected_score"),
@@ -1461,6 +1477,8 @@ def compute_losses(
     presence_weight: float,
     branch_selection_mode: str = "eval_voxel",
     embeddings: torch.Tensor | None = None,
+    annotation_output: torch.Tensor | None = None,
+    annotation_config: Any | None = None,
     embedding_diagnostics: list | None = None,
     _return_statistics: bool = False,
     presence_loss_mask: torch.Tensor | None = None,
@@ -1669,6 +1687,14 @@ def compute_losses(
         negative_group_count,
     )
     sideband_statistics = []
+    width_gate = None
+    if (batch.presence_sideband_mask is not None and annotation_config is not None
+            and 'width' in annotation_config.names):
+        from .annotations import predicted_width, width_similarity
+        if annotation_output is None or batch.width_target_input is None:
+            raise ValueError('width-gated sidebands require width prediction and reference targets')
+        width_gate = width_similarity(predicted_width(annotation_output.detach(), annotation_config),
+                                      batch.width_target_input).detach().unsqueeze(1)
     for side in range(2):
         if batch.presence_sideband_mask is None:
             sideband_zero = pred_presences.sum() * 0.0
@@ -1676,7 +1702,10 @@ def compute_losses(
             continue
         mask = batch.presence_sideband_mask[:, side].unsqueeze(1).unsqueeze(1)
         mask = mask.expand_as(pred_presences).to(dtype=negative_presence_bce.dtype)
-        group_sum = (negative_presence_bce * mask).sum(dim=(2, 3, 4, 5)).reshape(-1)
+        weighted_mask = mask if width_gate is None else mask * width_gate
+        group_sum = (negative_presence_bce * weighted_mask).sum(dim=(2, 3, 4, 5)).reshape(-1)
+        # Keep GT-only area/counts: rejected lobes reduce the extra penalty,
+        # never renormalize by model-dependent admitted widths.
         group_count = mask.sum(dim=(2, 3, 4, 5)).reshape(-1)
         sideband_statistics.append(_nonempty_group_statistics(group_sum, group_count))
     statistics = _LossStatistics(
@@ -1700,6 +1729,9 @@ def compute_losses(
         selected_score_sum=selected_score_sum,
         selected_score_count=selected_score_count,
     )
+    if annotation_output is not None:
+        from .annotations import annotation_statistics
+        statistics = replace(statistics, **annotation_statistics(annotation_output, batch, annotation_config))
     if embeddings is not None:
         embedding_values = embedding_statistics(embeddings, pred_presences.amax(dim=1), batch, embedding_diagnostics)
         pos, pc, neg, nc = embedding_values[:4]
@@ -2003,6 +2035,7 @@ def _save_snapshot(
     ema: ModelEMA | None = None,
     ema_name: str | None = None,
     refinement_state: dict | None = None,
+    reviewed_trace_unlocked: bool = False,
 ) -> None:
     snapshot_model = _unwrap_model(model)
     payload = {
@@ -2011,6 +2044,7 @@ def _save_snapshot(
         "config": _json_safe(config),
         "metric": metric,
         "metric_name": metric_name,
+        "reviewed_trace_unlocked": bool(reviewed_trace_unlocked),
     }
     if refinement_state is not None:
         payload["refinement_state"] = refinement_state
@@ -2056,7 +2090,7 @@ def _load_snapshot(
     payload = torch.load(path, map_location=map_location)
     if progress_metadata is not None and isinstance(payload, dict):
         progress_metadata.update({
-            key: payload[key] for key in ("samples_seen", "optimizer_global_batch_size", "config", "ema")
+            key: payload[key] for key in ("samples_seen", "optimizer_global_batch_size", "config", "ema", "reviewed_trace_unlocked")
             if key in payload
         })
     restore_model_optimizer(payload, model=model, optimizer=optimizer, grad_scaler=grad_scaler)
@@ -2906,6 +2940,7 @@ def _slice_batch(batch: FiberTrace3DBatch, start: int, stop: int) -> FiberTrace3
     sparse_target = batch.direction_target_sparse
     sparse_weight = batch.direction_weight_sparse
     sparse_tangent = batch.direction_tangent_sparse_zyx
+    sparse_normal = batch.normal_axis_sparse_zyx
     if sparse_indices is not None:
         sparse_mask = (sparse_indices[:, 0] >= int(start)) & (sparse_indices[:, 0] < int(stop))
         sparse_indices = sparse_indices[sparse_mask].clone()
@@ -2916,8 +2951,11 @@ def _slice_batch(batch: FiberTrace3DBatch, start: int, stop: int) -> FiberTrace3
             sparse_weight = sparse_weight[sparse_mask]
         if sparse_tangent is not None:
             sparse_tangent = sparse_tangent[sparse_mask]
+        if sparse_normal is not None:
+            sparse_normal = sparse_normal[sparse_mask]
     return FiberTrace3DBatch(
         presence_target_mode=batch.presence_target_mode,
+        annotation_targets=None if batch.annotation_targets is None else batch.annotation_targets[start:stop],
         presence_sideband_weight=batch.presence_sideband_weight,
         embedding_geometry=None if batch.embedding_geometry is None else batch.embedding_geometry[start:stop],
         refinement_geometry=None if batch.refinement_geometry is None else batch.refinement_geometry[start:stop],
@@ -2934,6 +2972,7 @@ def _slice_batch(batch: FiberTrace3DBatch, start: int, stop: int) -> FiberTrace3
         target_segment_offsets=new_offsets,
         target_segment_counts=segment_counts,
         target_segment_starts_zyx=batch.target_segment_starts_zyx[segment_start:segment_stop],
+        target_segment_widths_input=None if batch.target_segment_widths_input is None else batch.target_segment_widths_input[segment_start:segment_stop],
         target_segment_ends_zyx=batch.target_segment_ends_zyx[segment_start:segment_stop],
         target_segment_bbox_lo_zyx=batch.target_segment_bbox_lo_zyx[segment_start:segment_stop],
         target_segment_bbox_hi_zyx=batch.target_segment_bbox_hi_zyx[segment_start:segment_stop],
@@ -2955,6 +2994,8 @@ def _slice_batch(batch: FiberTrace3DBatch, start: int, stop: int) -> FiberTrace3
         direction_target_sparse=sparse_target,
         direction_weight_sparse=sparse_weight,
         direction_tangent_sparse_zyx=sparse_tangent,
+        normal_axis_sparse_zyx=sparse_normal,
+        width_target_input=None if batch.width_target_input is None else batch.width_target_input[start:stop],
         presence_target=None
         if batch.presence_target is None
         else batch.presence_target[start:stop],
@@ -2973,7 +3014,19 @@ def _combine_prediction_observers(*observers):
     def observe(batch, output):
         for observer in active:
             observer(batch, output)
+    def observe_annotations(batch, output, annotation_output, annotation_config):
+        for observer in active:
+            _notify_prediction_observer(observer, batch, output, annotation_output, annotation_config)
+    observe.observe_annotations = observe_annotations
     return observe
+
+
+def _notify_prediction_observer(observer, batch, output, annotation_output=None, annotation_config=None):
+    annotated = getattr(observer, "observe_annotations", None)
+    if annotated is not None and annotation_output is not None:
+        annotated(batch, output, annotation_output, annotation_config)
+    else:
+        observer(batch, output)
 
 
 def _forward_loss_tensors(
@@ -2997,14 +3050,19 @@ def _forward_loss_tensors(
             **dict(conditioned_loss_options or {}),
         )
     use_embeddings = bool(getattr(_unwrap_model(model), "embedding_channels", 0))
-    result = model(batch.volume, return_embeddings=True) if use_embeddings else model(batch.volume)
-    output = result["prediction"] if use_embeddings else result
+    annotations = getattr(_unwrap_model(model), "annotations", None)
+    use_annotations = bool(annotations and annotations.names)
+    result = model(batch.volume, return_embeddings=True) if use_embeddings or use_annotations else model(batch.volume)
+    output = result["prediction"] if use_embeddings or use_annotations else result
     if prediction_observer is not None:
-        prediction_observer(batch, output)
+        _notify_prediction_observer(prediction_observer, batch, output,
+                                    result["annotations"] if use_annotations else None, annotations)
     return compute_losses(
         output,
         batch,
         embeddings=result["embeddings"] if use_embeddings else None,
+        annotation_output=result["annotations"] if use_annotations else None,
+        annotation_config=annotations,
         presence_loss_mask=batch.presence_mask if historical_presence_mask else None,
         direction_weight=direction_weight,
         presence_weight=presence_weight,
@@ -3036,14 +3094,19 @@ def _forward_loss_statistics(
         )
     else:
         use_embeddings = bool(getattr(_unwrap_model(model), "embedding_channels", 0))
-        prediction = model(batch.volume, return_embeddings=True) if use_embeddings else model(batch.volume)
-        output = prediction["prediction"] if use_embeddings else prediction
+        annotations = getattr(_unwrap_model(model), "annotations", None)
+        use_annotations = bool(annotations and annotations.names)
+        prediction = model(batch.volume, return_embeddings=True) if use_embeddings or use_annotations else model(batch.volume)
+        output = prediction["prediction"] if use_embeddings or use_annotations else prediction
         if prediction_observer is not None:
-            prediction_observer(batch, output)
+            _notify_prediction_observer(prediction_observer, batch, output,
+                                        prediction["annotations"] if use_annotations else None, annotations)
         result = compute_losses(
             output,
             batch,
             embeddings=prediction["embeddings"] if use_embeddings else None,
+            annotation_output=prediction["annotations"] if use_annotations else None,
+            annotation_config=annotations,
             embedding_diagnostics=embedding_diagnostics,
             presence_loss_mask=batch.presence_mask if historical_presence_mask else None,
             direction_weight=1.0,
@@ -3057,8 +3120,11 @@ def _forward_loss_statistics(
 
 
 def _embedding_log(losses, model):
+    annotations = getattr(_unwrap_model(model), "annotations", None)
+    annotation_log = "" if annotations is None else "".join(
+        f"loss_{name}={losses.get(name, 0):.6f} " for name in annotations.names)
     if not getattr(_unwrap_model(model), "embedding_channels", 0):
-        return ""
+        return annotation_log
     extra = ''
     for key in ('positive_mean', 'negative_mean', 'negative_above_0p9', 'hardest_negative_mean', 'positive_hardest_gap',
                 'short_positive_mean', 'short_negative_mean', 'short_positive_hardest_gap',
@@ -3073,10 +3139,14 @@ def _embedding_log(losses, model):
         budget = (f"embedding_anchors={losses.get('embedding_anchors', 0):.0f} "
               if getattr(_unwrap_model(model), 'embedding_objective', 'pairwise') == 'local_contrastive'
               else f"embedding_negative_pairs={losses['embedding_negative_pairs']:.0f} ")
-    return f"loss_embedding={losses['embedding']:.6f} " + budget + extra
+    return annotation_log + f"loss_embedding={losses['embedding']:.6f} " + budget + extra
 
 
 def _log_embedding_scalars(writer, prefix, losses, model, step):
+    annotations = getattr(_unwrap_model(model), "annotations", None)
+    for name in (() if annotations is None else annotations.names):
+        if name in losses:
+            writer.add_scalar(f"{prefix}/loss_{name}", losses[name], step)
     if getattr(_unwrap_model(model), "embedding_channels", 0):
         for key in ("embedding", "embedding_positive", "embedding_negative", "embedding_negative_pairs", "embedding_contrastive", "embedding_anchors",
                     "embedding_short", "embedding_short_anchors", "embedding_long", "embedding_long_anchors"):
@@ -3800,6 +3870,7 @@ def training_units(
             batch_size=evaluation_loader.config.batch_size, sample_count=count,
             start_sample_index=offset)
     best_metric = float((handoff_progress or {}).get("best_metric", math.inf))
+    trace_unlocked = bool(progress_metadata.get("reviewed_trace_unlocked", False))
     pending_test = (handoff_progress or {}).get("pending_test")
     cuda_batch_pipeline: FiberTrace3DCudaBatchPipeline | None = None
     step = int(start_step)
@@ -3819,6 +3890,7 @@ def training_units(
                       "samples_seen": sample_progress.at(step),
                       "optimizer_global_batch_size": optimizer_global_batch_size,
                       "best_metric": best_metric, "run_datestr": str(run_datestr),
+                      "reviewed_trace_unlocked": trace_unlocked,
                       "pending_test": pending_test, "config_fingerprint": source_fingerprint},
         )
 
@@ -3839,7 +3911,8 @@ def training_units(
                         for filename in filenames:
                             _save_snapshot(snapshot_dir / filename, model=raw_model, optimizer=optimizer,
                                 step=test_step, config=raw_config, metric=None, grad_scaler=grad_scaler,
-                                sample_progress=sample_progress, ema=ema, ema_name=name, refinement_state=saved)
+                                sample_progress=sample_progress, ema=ema, ema_name=name, refinement_state=saved,
+                                reviewed_trace_unlocked=trace_unlocked)
                 _distributed_barrier(distributed)
             return
         planned = []
@@ -3872,7 +3945,7 @@ def training_units(
                 _save_snapshot(snapshot_dir / filename, model=raw_model, optimizer=optimizer,
                     step=test_step, config=raw_config, metric=value, metric_name=value_name,
                     grad_scaler=grad_scaler, sample_progress=sample_progress, ema=ema, ema_name=name,
-                    refinement_state=saved_refinement)
+                    refinement_state=saved_refinement, reviewed_trace_unlocked=trace_unlocked)
             _distributed_barrier(distributed)
 
     if distributed.is_main:
@@ -3924,7 +3997,7 @@ def training_units(
             _log_test_scalars(writer, prefix, values, raw_model, step)
 
     def run_configured_tests(step: int, *, initial=False):
-        nonlocal pending_test, ema_test_metrics
+        nonlocal pending_test, ema_test_metrics, trace_unlocked
         assert diagnostics is not None
         test_started = time.monotonic()
         if physical_microbatch_sizes is not None and pending_test is None:
@@ -4069,6 +4142,13 @@ def training_units(
                     )
                 if distributed.is_main:
                     test_losses = _mean_dense_test_rows(gathered_rows)
+                    was_unlocked = trace_unlocked
+                    trace_unlocked = _reviewed_trace_unlocked(trace_unlocked, test_losses)
+                    if reviewed_trace_test is not None and not was_unlocked:
+                        print(f"reviewed trace gate: samples={sample_progress.at(step)} "
+                              f"raw_test_angle={test_losses['angle_mean_deg']:.3f}deg "
+                              f"state={'unlocked' if trace_unlocked else 'waiting_for_angle_below_10'}",
+                              flush=True)
                     metric = float(test_losses["total"])
                     metric_name = "test/loss_total"
                     if pending_test is None or not pending_test["dense_logged"]:
@@ -4275,6 +4355,7 @@ def training_units(
             )
             if batch_source is not None:
                 batch_source.end_test(step)
+            trace_unlocked = _distributed_broadcast_object(trace_unlocked, distributed)
             return metric, metric_name
         finally:
             diagnostics.cancel_test_watchdog(step=step)
@@ -4287,7 +4368,7 @@ def training_units(
             initial_metric = _distributed_broadcast_object(initial_metric, distributed)
             initial_metric_name = _distributed_broadcast_object(initial_metric_name, distributed)
             save_test_snapshots(start_step, initial_metric, initial_metric_name, initial=is_initial)
-            if reviewed_trace_test is not None and enable_reviewed_trace:
+            if reviewed_trace_test is not None and enable_reviewed_trace and trace_unlocked:
                 if physical_microbatch_sizes is not None:
                     # Trace inference borrows these resident raw-model replicas
                     # under the unchanged grant. Optimizer/EMA state stays put.
@@ -4749,7 +4830,7 @@ def training_units(
                 test_metric_name = _distributed_broadcast_object(test_metric_name, distributed)
 
             save_test_snapshots(step, test_metric, test_metric_name)
-            if (reviewed_trace_test is not None and enable_reviewed_trace and test_due
+            if (reviewed_trace_test is not None and enable_reviewed_trace and trace_unlocked and test_due
                     and step % int(reviewed_trace_test["interval"]) == 0):
                 if physical_microbatch_sizes is not None:
                     # The shared dense-test transaction has committed before
@@ -5443,17 +5524,23 @@ def _sample_sheet_presence_views_from_sampled_output(
     *,
     normal_zyx: np.ndarray,
     tangent_zyx: np.ndarray,
+    width_values: torch.Tensor | None = None,
+    center_width: torch.Tensor | None = None,
 ) -> tuple[np.ndarray, ...]:
     if int(sampled_hwc.shape[-1]) == 7:
-        return _single_output_presence_views_from_sampled_output(
+        views = _single_output_presence_views_from_sampled_output(
             sampled_hwc,
             normal_zyx=normal_zyx,
             tangent_zyx=tangent_zyx,
         )
-    return _branch_presence_views_from_sampled_output(
-        sampled_hwc,
-        normal_zyx=normal_zyx,
-    )
+    else:
+        views = _branch_presence_views_from_sampled_output(sampled_hwc, normal_zyx=normal_zyx)
+    if width_values is not None:
+        from .annotations import width_similarity
+        gate = width_similarity(width_values, center_width).detach().cpu().numpy()
+        # First panel is raw presence; only direction-modulated panels are gated.
+        views = (views[0], *(view * gate for view in views[1:]))
+    return views
 
 
 def _pad_panels_to_height(panels: list[np.ndarray]) -> list[np.ndarray]:
@@ -5493,6 +5580,8 @@ def _make_oblique_sample_row(
     height: int,
     width: int,
     gap: int,
+    width_czyx: torch.Tensor | None = None,
+    center_width: torch.Tensor | None = None,
 ) -> np.ndarray:
     coords = _oblique_coords_zyx(
         center_zyx=cp_zyx,
@@ -5524,14 +5613,19 @@ def _make_oblique_sample_row(
     if not bool(np.any(target_p > 0.0)) and target_czyx is not None:
         target_p = _sample_czyx_at_coords(target_czyx, coords)[..., 0].detach().cpu().numpy()
     sampled_output = _sample_czyx_at_coords(output_czyx, coords)
+    width_values = None if width_czyx is None else _sample_czyx_at_coords(width_czyx, coords)[..., 0]
     presence_views = _sample_sheet_presence_views_from_sampled_output(
         sampled_output,
         normal_zyx=normal_zyx,
         tangent_zyx=tangent_zyx,
+        width_values=width_values,
+        center_width=center_width,
     )
     image_rgb = np.repeat(_image_to_u8(image, image_valid)[..., None], 3, axis=2)
     target_rgb = _gray_to_rgb(target_p, mask=image_valid)
     presence_rgbs = [_gray_to_rgb(view, mask=image_valid) for view in presence_views]
+    if width_czyx is not None:
+        presence_rgbs.append(_gray_to_rgb(width_values.detach().cpu().numpy() / 255., mask=image_valid))
     cp_row = int(round(float(height - 1) * 0.5))
     cp_col = int(round(float(width - 1) * 0.5))
     _draw_projected_oblique_gt_line(
@@ -5559,9 +5653,21 @@ def _make_oblique_sample_row(
 def _make_train_sample_3d_sheet(
     batch: FiberTrace3DBatch,
     output: torch.Tensor,
+    *,
+    width_input: torch.Tensor | None = None,
 ) -> np.ndarray:
     assert batch.presence_target is not None
     display_shape = tuple(int(value) for value in batch.volume.shape[-3:])
+    width_display = None
+    if width_input is not None:
+        if batch.volume_spacing_base is None:
+            raise ValueError("width visualization requires volume_spacing_base")
+        # Width is measured in input voxels, irrespective of output lattice stride.
+        width_display = width_input.detach().float() * batch.volume_spacing_base[0]
+        if tuple(width_display.shape[-3:]) != display_shape:
+            width_display = F.interpolate(width_display, size=display_shape,
+                                          mode="trilinear", align_corners=True)
+        width_display = width_display[0]
     if tuple(int(value) for value in output.shape[-3:]) != display_shape:
         output = F.interpolate(
             output.to(dtype=torch.float32),
@@ -5598,6 +5704,10 @@ def _make_train_sample_3d_sheet(
         np.asarray(volume.shape, dtype=np.float32) - np.float32(1.0),
     )
     cp = np.rint(cp_float).astype(np.int64)
+    center_width = None
+    if width_display is not None:
+        cp_coords = torch.as_tensor(cp_float, device=width_display.device).view(1, 1, 3)
+        center_width = _sample_czyx_at_coords(width_display, cp_coords)[0, 0, 0]
     z, y, x = (int(v) for v in cp)
     cp_encoded = direction_output(output)[0, :, z, y, x].view(1, 6)
     cp_pred_xyz = decode_lasagna_direction_3x2_analytic(cp_encoded)[0].detach().cpu().numpy()
@@ -5676,14 +5786,19 @@ def _make_train_sample_3d_sheet(
         cp_row,
         cp_col,
     ) in slice_specs:
+        width_values = None if width_display is None else width_display[0].select(plane_axis, int(plane_coord))
         presence_views = _sample_sheet_presence_views_from_sampled_output(
             sampled_output,
             normal_zyx=normal_zyx,
             tangent_zyx=tangent_zyx,
+            width_values=width_values,
+            center_width=center_width,
         )
         image_rgb = np.repeat(_image_to_u8(image, image_valid)[..., None], 3, axis=2)
         target_rgb = _gray_to_rgb(target_p, mask=image_valid)
         presence_rgbs = [_gray_to_rgb(view, mask=image_valid) for view in presence_views]
+        if width_display is not None:
+            presence_rgbs.append(_gray_to_rgb(width_values.cpu().numpy() / 255., mask=image_valid))
         _draw_projected_gt_line(
             image_rgb,
             segments_start_zyx,
@@ -5742,6 +5857,8 @@ def _make_train_sample_3d_sheet(
             row_axis_zyx=tangent_row_axis,
             col_axis_zyx=tangent_col_axis,
             normal_zyx=tangent_normal,
+            width_czyx=width_display,
+            center_width=center_width,
             tangent_zyx=tangent_zyx,
             height=oblique_height,
             width=oblique_width,
@@ -5764,6 +5881,8 @@ def _make_train_sample_3d_sheet(
             row_axis_zyx=cross_row_axis,
             col_axis_zyx=cross_col_axis,
             normal_zyx=_unit_np(tangent_zyx, fallback=(0.0, 0.0, 1.0)),
+            width_czyx=width_display,
+            center_width=center_width,
             tangent_zyx=tangent_zyx,
             height=oblique_height,
             width=oblique_width,
@@ -5828,13 +5947,25 @@ class _ForwardVisualization:
         self.sheets = [] if sheets is None else sheets
 
     @torch.no_grad()
-    def __call__(self, batch, output):
+    def __call__(self, batch, output, *, width_input=None):
         remaining = self.sample_count - len(self.sheets)
         with torch.autocast(device_type=output.device.type, enabled=False):
             for index in range(min(max(0, remaining), int(batch.volume.shape[0]))):
                 physical = _slice_batch(batch, index, index + 1)
+                width_kwargs = {} if width_input is None else {"width_input": width_input[index:index + 1]}
                 self.sheets.append(torch.from_numpy(_make_train_sample_3d_sheet(
-                    physical, output[index:index + 1].detach().float())))
+                    physical, output[index:index + 1].detach().float(), **width_kwargs)))
+
+    @torch.no_grad()
+    def observe_annotations(self, batch, output, annotation_output, annotation_config):
+        if len(self.sheets) >= self.sample_count:
+            return
+        width_input = None
+        if "width" in annotation_config.names:
+            from .annotations import predicted_width
+            take = min(self.sample_count - len(self.sheets), int(output.shape[0]))
+            width_input = predicted_width(annotation_output[:take].detach(), annotation_config)
+        self(batch, output, width_input=width_input)
 
     def write(self, writer, tag, step):
         if self.sheets:

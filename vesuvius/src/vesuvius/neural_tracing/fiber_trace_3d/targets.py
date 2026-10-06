@@ -205,7 +205,7 @@ def _materialize_anisotropic_gaussian_presence(
     config: FiberTrace3DConfig,
     patch_shape: tuple[int, int, int],
     coordinate_scale: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
     """Rasterize a soft tube in the local fiber/sheet frame.
 
     The local surface normal is the thickness axis. The in-sheet axis
@@ -240,6 +240,18 @@ def _materialize_anisotropic_gaussian_presence(
     tangent_target = torch.zeros(
         (int(batch.volume.shape[0]), *patch_shape, 3), dtype=torch.float32, device=device
     )
+    # Only retain a compact segment owner grid when the normal head needs it.
+    normal_owner = torch.zeros_like(target, dtype=torch.int32) if config.annotations.normal_weight else None
+    width_target = torch.zeros_like(target) if config.annotations.width_weight else None
+    width_distance2 = (torch.full_like(target, float('inf'))
+                       if width_target is not None and config.presence_sideband_weight > 0 else None)
+    if width_target is not None:
+        if batch.target_segment_widths_input is None:
+            raise ValueError('Gaussian width targets require source-aligned segment widths')
+        segment_widths = batch.target_segment_widths_input.to(device=device, dtype=torch.float32)[selected]
+        if segment_widths.shape != (len(starts), 2) or not torch.isfinite(segment_widths).all():
+            raise ValueError('invalid segment endpoint width targets')
+        segment_widths = torch.where((segment_widths > 0).all(1)[:, None], segment_widths, 0.)
     sideband = (
         torch.zeros(
             (int(batch.volume.shape[0]), 2, *patch_shape),
@@ -255,7 +267,7 @@ def _materialize_anisotropic_gaussian_presence(
         empty_indices = torch.zeros((0, 4), dtype=torch.long, device=device)
         empty_tangents = torch.zeros((0, 3), dtype=torch.float32, device=device)
         empty_weights = torch.zeros((0,), dtype=torch.float32, device=device)
-        return target, empty_indices, empty_tangents, empty_weights, sideband
+        return target, empty_indices, empty_tangents, empty_weights, sideband, (empty_tangents if normal_owner is not None else None), width_target
 
     scale = float(coordinate_scale)
     starts = starts / scale
@@ -309,6 +321,12 @@ def _materialize_anisotropic_gaussian_presence(
         tangent_target[sample][slices] = torch.where(
             replace.unsqueeze(-1), tangent.view(1, 1, 1, 3), tangent_view
         )
+        if normal_owner is not None:
+            normal_owner[sample][slices] = torch.where(replace, segment, normal_owner[sample][slices])
+        if width_target is not None:
+            w0, w1 = segment_widths[segment]
+            local_width = w0 + (w1 - w0) * (along / length)
+            width_target[sample][slices] = torch.where(replace, local_width, width_target[sample][slices])
         if sideband is not None:
             spacing_base = float(batch.volume_spacing_base[sample])
             if not math.isfinite(spacing_base) or spacing_base <= 0.0:
@@ -324,11 +342,19 @@ def _materialize_anisotropic_gaussian_presence(
             )
             sideband[sample, 0][slices] |= rectangle & (width_distance < -inner_width)
             sideband[sample, 1][slices] |= rectangle & (width_distance > inner_width)
+            if width_distance2 is not None:
+                distance2 = delta.square().sum(-1)
+                nearest = (rectangle & (width_distance.abs() > inner_width)
+                           & (target[sample][slices] == 0)
+                           & (distance2 < width_distance2[sample][slices]))
+                width_distance2[sample][slices] = torch.where(nearest, distance2, width_distance2[sample][slices])
+                width_target[sample][slices] = torch.where(nearest, local_width, width_target[sample][slices])
     support = target > 0.0
     if sideband is not None:
         sideband &= ~support[:, None]
     indices_bzyx = torch.nonzero(support, as_tuple=False).to(dtype=torch.long)
-    return target, indices_bzyx, tangent_target[support], target[support], sideband
+    normal_axes = None if normal_owner is None else normals[normal_owner[support].long()]
+    return target, indices_bzyx, tangent_target[support], target[support], sideband, normal_axes, width_target
 
 
 def _materialize_coarse_cp_only_sample(
@@ -398,6 +424,10 @@ def materialize_targets(
         and batch.direction_target_sparse is not None
         and batch.direction_weight_sparse is not None
         and batch.presence_target is not None
+        and (not config.annotations.normal_weight or config.presence_target_mode != "anisotropic_gaussian"
+             or batch.normal_axis_sparse_zyx is not None)
+        and (not config.annotations.width_weight or config.presence_target_mode != "anisotropic_gaussian"
+             or batch.width_target_input is not None)
         and (config.presence_sideband_weight <= 0.0 or batch.presence_sideband_mask is not None)
     ):
         return batch
@@ -483,7 +513,7 @@ def materialize_targets(
         timings["target_cp_points"] = float(cp_direction_points)
     scatter_start = time.perf_counter()
     if config.presence_target_mode == "anisotropic_gaussian":
-        presence, gaussian_indices, gaussian_tangents, gaussian_falloff, presence_sideband_mask = _materialize_anisotropic_gaussian_presence(
+        presence, gaussian_indices, gaussian_tangents, gaussian_falloff, presence_sideband_mask, normal_axes, width_target = _materialize_anisotropic_gaussian_presence(
             batch=geometry_batch,
             config=config,
             patch_shape=patch_shape,
@@ -497,6 +527,8 @@ def materialize_targets(
         presence = positive.to(dtype=torch.float32)
         gaussian_falloff = None
         presence_sideband_mask = None
+        normal_axes = None
+        width_target = None
     presence_target = presence.view(
         int(batch.volume.shape[0]),
         1,
@@ -548,6 +580,8 @@ def materialize_targets(
         direction_target_sparse=direction_target_sparse,
         direction_weight_sparse=direction_weight_sparse,
         direction_tangent_sparse_zyx=tangents_zyx,
+        normal_axis_sparse_zyx=normal_axes,
+        width_target_input=None if width_target is None else width_target[:, None],
         presence_target=presence_target,
         presence_sideband_mask=presence_sideband_mask,
         presence_mask=None,

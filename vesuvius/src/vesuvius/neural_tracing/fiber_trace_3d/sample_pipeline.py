@@ -744,6 +744,11 @@ class MacroBatchTargetSource:
                 counts = torch.cat((counts, distribution_groups.reshape(1)))
                 if self.config.presence_sideband_weight > 0.0:
                     counts = torch.cat((counts, sideband_groups))
+            if self.config.annotations.names:
+                from .annotations import annotation_counts
+                counts = torch.cat((counts, torch.stack([
+                    torch.as_tensor(v, device=counts.device, dtype=counts.dtype)
+                    for v in annotation_counts(targets, self.config.annotations)])))
             if self.config.embedding.enabled:
                 from .embedding import embedding_pair_counts
                 counts = torch.cat((counts, counts.new_tensor(embedding_pair_counts(batch))))

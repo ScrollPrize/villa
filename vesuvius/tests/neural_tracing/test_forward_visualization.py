@@ -1,6 +1,7 @@
 """CPU checks for visualization of existing loss forwards, without replay."""
 
 import copy
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -13,6 +14,59 @@ from tests.neural_tracing.test_fiber_trace_3d import (
     _loader_with_mapping,
 )
 from vesuvius.neural_tracing.fiber_trace_3d import train
+from vesuvius.neural_tracing.fiber_trace_3d.annotations import AnnotationConfig
+from vesuvius.neural_tracing.fiber_trace_3d.direction import encode_lasagna_direction_3x2
+
+
+def test_width_modulates_only_direction_presence_views():
+    direction = torch.tensor([[1., 0., 1.]]) / np.sqrt(2)
+    encoded = encode_lasagna_direction_3x2(direction)[0]
+    prediction = torch.cat((encoded, torch.tensor([.8]))).expand(1, 5, 7)
+    kwargs = dict(normal_zyx=np.array([0.,0.,1.]), tangent_zyx=np.array([1.,0.,0.]))
+    original = train._sample_sheet_presence_views_from_sampled_output(prediction, **kwargs)
+    gated = train._sample_sheet_presence_views_from_sampled_output(prediction, **kwargs,
+        width_values=torch.tensor([[80.,90.,100.,110.,120.]]), center_width=torch.tensor(100.))
+    np.testing.assert_array_equal(gated[0], original[0])
+    for actual, before in zip(gated[1:], original[1:]):
+        np.testing.assert_allclose(actual, before * np.array([[0.,.5,1.,.5,0.]]))
+
+
+@pytest.mark.parametrize("stride", [1, 2])
+@pytest.mark.parametrize("width,gray", [(0., 0), (40., 80), (80., 160), (160., 255)])
+def test_width_column_base_scale_fixed_grayscale_all_planes(stride, width, gray):
+    batch = train._slice_batch(_batch(), 0, 1)
+    batch = replace(batch, volume_spacing_base=torch.tensor([2.]))
+    output = torch.zeros((1, 7, 8 // stride, 8 // stride, 8 // stride))
+    widths = torch.full((1, 1, *output.shape[-3:]), width)
+    old = train._make_train_sample_3d_sheet(batch, output)
+    new = train._make_train_sample_3d_sheet(batch, output, width_input=widths)
+    assert new.shape == (old.shape[0], old.shape[1] + 12, 3)
+    np.testing.assert_array_equal(new[:, :old.shape[1]], old)
+    for plane in range(5):
+        panel = new[plane * 12:plane * 12 + 8, -8:]
+        assert np.any(np.all(panel == gray, axis=-1))
+    assert np.all(new[0, -8] == gray)
+
+
+@pytest.mark.parametrize("normal", [0., 10.])
+def test_width_observer_routing_softplus_bounded_and_legacy(monkeypatch, normal):
+    batch = _batch()
+    cfg = AnnotationConfig(normal_weight=normal, width_weight=.01, hv_weight=.01)
+    output = torch.zeros((2, 7, 8, 8, 8), requires_grad=True)
+    aux = torch.zeros((2, cfg.channels, 8, 8, 8), requires_grad=True)
+    rendered, legacy = [], []
+    def render(physical, prediction, *, width_input):
+        assert not width_input.requires_grad
+        torch.testing.assert_close(width_input, torch.full_like(width_input, np.log(2)))
+        rendered.append(physical)
+        return np.zeros((2, 3, 3), dtype=np.uint8)
+    monkeypatch.setattr(train, "_make_train_sample_3d_sheet", render)
+    capture = train._ForwardVisualization(1)
+    observer = train._combine_prediction_observers(lambda b, o: legacy.append(o), capture)
+    for _ in range(2):
+        train._notify_prediction_observer(observer, batch, output, aux, cfg)
+    assert len(rendered) == 1 and len(legacy) == 2
+    assert legacy[0] is output
 
 
 def _batch():
@@ -30,9 +84,9 @@ class _Writer:
 
 
 @pytest.mark.parametrize("statistics", [False, True])
-@pytest.mark.parametrize("conditioned", [False, True])
+@pytest.mark.parametrize("conditioned,annotated", [(False, False), (True, False), (False, True)])
 def test_forward_capture_reuses_predictions_preserves_gradients_and_mode(
-    monkeypatch, statistics, conditioned,
+    monkeypatch, statistics, conditioned, annotated,
 ):
     batch = _batch()
     torch.manual_seed(17)
@@ -41,13 +95,14 @@ def test_forward_capture_reuses_predictions_preserves_gradients_and_mode(
         conditioned_decoder_hidden_channels=8, conditioned_decoder_layers=2,
         features_per_stage=(4, 8), strides=((1, 1, 1), (2, 2, 2)),
         normalization="group",
+        annotations=AnnotationConfig(width_weight=.01 if annotated else 0.),
     ))
     oracle = copy.deepcopy(model)
     forwarded = []
     handle = model.register_forward_hook(lambda _model, _args, output: forwarded.append(output))
     rendered = []
 
-    def render(physical, prediction):
+    def render(physical, prediction, **kwargs):
         assert not torch.is_grad_enabled()
         assert not prediction.requires_grad
         index = len(rendered)
@@ -55,6 +110,9 @@ def test_forward_capture_reuses_predictions_preserves_gradients_and_mode(
         # Slicing the real already-augmented input does not allocate a replay batch.
         assert physical.volume.untyped_storage().data_ptr() == batch.volume.untyped_storage().data_ptr()
         rendered.append(prediction.clone())
+        if annotated:
+            width = torch.nn.functional.softplus(forwarded[0]["annotations"][index:index + 1].detach().float())
+            torch.testing.assert_close(kwargs["width_input"], width)
         return np.zeros((3, 4, 3), dtype=np.uint8)
 
     monkeypatch.setattr(train, "_make_train_sample_3d_sheet", render)
@@ -78,6 +136,8 @@ def test_forward_capture_reuses_predictions_preserves_gradients_and_mode(
     output = forwarded[0]
     if conditioned:
         output = torch.cat((output["zero_output"], output["random_output"]), dim=1)
+    elif annotated:
+        output = output["prediction"]
     for index, image_prediction in enumerate(rendered):
         torch.testing.assert_close(image_prediction, output[index:index + 1].detach().float())
     torch.testing.assert_close(actual, expected)

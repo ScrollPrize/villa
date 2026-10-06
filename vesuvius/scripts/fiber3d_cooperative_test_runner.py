@@ -36,6 +36,7 @@ CPU_TESTS = [
     "tests/neural_tracing/test_cooperative_reference.py",
 ]
 SUITES = {
+    "cuda-resident-normal-tube": ["tests/neural_tracing/test_normal_tube.py"],
     "merge-native-build": [],
     "merge-native-tests": [],
     "merge-annotation-build": [],
@@ -238,7 +239,7 @@ def main():
                 env["FIBER_COOPERATIVE_TEST_GPUS"] = ",".join(peaks)
                 if suite in ("cuda-amp", "cuda-arc", "cuda-ema", "cuda-refinement"):
                     env["CUDA_VISIBLE_DEVICES"] = next(iter(peaks))
-                elif suite == "cuda-embedding":
+                elif suite in ("cuda-embedding", "cuda-resident-normal-tube"):
                     env["CUDA_VISIBLE_DEVICES"] = ",".join(peaks)
                 managed_command = ExclusiveCommand(command, cwd=ROOT / "vesuvius", env=env,
                     stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)

@@ -13,6 +13,7 @@ from dataclasses import dataclass, replace, field
 from .embedding import (EmbeddingConfig, EmbeddingGeometry, build_eligibility,
                         InvalidNormalSampleError)
 from .arc_sampling import FiberLocation, ScrollArcSampler
+from .annotations import AnnotationConfig, line_targets
 from .training_spans import training_fiber_spans
 from .refinement import RefinementConfig, RefinementObservation, active_store, arclength, interpolate, export_metadata, resample
 from pathlib import Path
@@ -60,6 +61,7 @@ _FULL_VALID_MASK_CACHE: dict[tuple[int, ...], np.ndarray] = {}
 @dataclass(frozen=True)
 class FiberTrace3DConfig:
     datasets: tuple[dict[str, Any], ...]
+    annotations: AnnotationConfig = field(default_factory=AnnotationConfig)
     refinement: RefinementConfig = field(default_factory=RefinementConfig)
     refinement_split: str = "train"
     embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
@@ -222,12 +224,14 @@ class FiberTrace3DSample:
     target_segment_bbox_hi_zyx: torch.Tensor
     target_tangent_zyx: torch.Tensor
     target_segment_normals_zyx: torch.Tensor | None = None
+    target_segment_widths_input: torch.Tensor | None = None
     volume_spacing_base: float = 1.0
     presence_target_mode: str = "binary"
     presence_sideband_weight: float = 0.0
     profile_timings_ms: dict[str, float] | None = None
     embedding_geometry: EmbeddingGeometry | None = None
     refinement_geometry: RefinementObservation | None = None
+    annotation_targets: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -327,6 +331,8 @@ class FiberTrace3DSharedTensorSlots:
             tensor_metadata["target_segment_normals_zyx"] = np.asarray(
                 sample.target_segment_normals_zyx.detach().cpu().numpy()
             )
+        if sample.target_segment_widths_input is not None:
+            tensor_metadata["target_segment_widths_input"] = sample.target_segment_widths_input.detach().cpu().numpy()
         metadata_sample = replace(
             sample,
             embedding_geometry=embedding_geometry,
@@ -380,6 +386,8 @@ class FiberTrace3DSharedTensorSlots:
             tensor_metadata["target_segment_normals_zyx"] = torch.from_numpy(
                 np.asarray(sample.target_segment_normals_zyx)
             )
+        if sample.target_segment_widths_input is not None:
+            tensor_metadata["target_segment_widths_input"] = torch.from_numpy(np.asarray(sample.target_segment_widths_input))
         restored = replace(
             sample,
             embedding_geometry=None if sample.embedding_geometry is None else replace(
@@ -438,6 +446,7 @@ class FiberTrace3DBatch:
     target_segment_bbox_hi_zyx: torch.Tensor
     target_tangent_zyx: torch.Tensor
     target_segment_normals_zyx: torch.Tensor | None = None
+    target_segment_widths_input: torch.Tensor | None = None
     volume_spacing_base: torch.Tensor | None = None
     presence_target_mode: str = "binary"
     presence_sideband_weight: float = 0.0
@@ -448,6 +457,8 @@ class FiberTrace3DBatch:
     direction_target_sparse: torch.Tensor | None = None
     direction_weight_sparse: torch.Tensor | None = None
     direction_tangent_sparse_zyx: torch.Tensor | None = None
+    normal_axis_sparse_zyx: torch.Tensor | None = None
+    width_target_input: torch.Tensor | None = None
     presence_target: torch.Tensor | None = None
     presence_sideband_mask: torch.Tensor | None = None
     presence_mask: torch.Tensor | None = None
@@ -456,6 +467,7 @@ class FiberTrace3DBatch:
     profile_timings_ms: dict[str, float] | None = None
     embedding_geometry: tuple[EmbeddingGeometry | None, ...] | None = None
     refinement_geometry: tuple[RefinementObservation | None, ...] | None = None
+    annotation_targets: tuple[np.ndarray | None, ...] | None = None
 
     # Local effective-batch target counts, prepared before model forward.
     normalization_counts: torch.Tensor | None = None
@@ -467,6 +479,9 @@ class FiberTrace3DBatch:
         non_blocking: bool = False,
     ) -> "FiberTrace3DBatch":
         return FiberTrace3DBatch(
+            annotation_targets=self.annotation_targets,
+            normal_axis_sparse_zyx=None if self.normal_axis_sparse_zyx is None else self.normal_axis_sparse_zyx.to(device, non_blocking=non_blocking),
+            width_target_input=None if self.width_target_input is None else self.width_target_input.to(device, non_blocking=non_blocking),
             presence_target_mode=self.presence_target_mode,
             presence_sideband_weight=self.presence_sideband_weight,
             refinement_geometry=self.refinement_geometry,
@@ -504,6 +519,7 @@ class FiberTrace3DBatch:
             target_segment_normals_zyx=None
             if self.target_segment_normals_zyx is None
             else self.target_segment_normals_zyx.to(device, non_blocking=non_blocking),
+            target_segment_widths_input=None if self.target_segment_widths_input is None else self.target_segment_widths_input.to(device, non_blocking=non_blocking),
             volume_spacing_base=None
             if self.volume_spacing_base is None
             else self.volume_spacing_base.to(device, non_blocking=non_blocking),
@@ -570,6 +586,7 @@ class FiberTrace3DBatch:
             target_segment_ends_zyx=pin(self.target_segment_ends_zyx),
             target_tangent_zyx=pin(self.target_tangent_zyx),
             target_segment_normals_zyx=pin(self.target_segment_normals_zyx),
+            target_segment_widths_input=pin(self.target_segment_widths_input),
             volume_spacing_base=pin(self.volume_spacing_base),
             direction_target=pin(self.direction_target),
             direction_weight=pin(self.direction_weight),
@@ -578,6 +595,8 @@ class FiberTrace3DBatch:
             direction_target_sparse=pin(self.direction_target_sparse),
             direction_weight_sparse=pin(self.direction_weight_sparse),
             direction_tangent_sparse_zyx=pin(self.direction_tangent_sparse_zyx),
+            normal_axis_sparse_zyx=pin(self.normal_axis_sparse_zyx),
+            width_target_input=pin(self.width_target_input),
             presence_target=pin(self.presence_target),
             presence_sideband_mask=pin(self.presence_sideband_mask),
             presence_mask=pin(self.presence_mask),
@@ -643,6 +662,8 @@ def collate_fiber_trace_3d_samples(
             if all(sample.target_segment_normals_zyx is not None for sample in samples)
             else None
         )
+        segment_widths = (torch.cat([sample.target_segment_widths_input for sample in samples])
+                          if all(sample.target_segment_widths_input is not None for sample in samples) else None)
     else:
         device = samples[0].volume.device
         segment_starts = torch.zeros((0, 3), dtype=torch.float32, device=device)
@@ -650,6 +671,7 @@ def collate_fiber_trace_3d_samples(
         segment_bbox_lo = torch.zeros((0, 3), dtype=torch.long)
         segment_bbox_hi = torch.zeros((0, 3), dtype=torch.long)
         segment_normals = None
+        segment_widths = None
     if volume_batch is None:
         volume_batch = torch.stack([sample.volume for sample in samples])
     if int(volume_batch.shape[0]) != len(samples):
@@ -660,6 +682,7 @@ def collate_fiber_trace_3d_samples(
         raise ValueError("deferred augmentation-parameter count does not match sample count")
     return FiberTrace3DBatch(
         presence_target_mode=samples[0].presence_target_mode,
+        annotation_targets=tuple(sample.annotation_targets for sample in samples),
         presence_sideband_weight=samples[0].presence_sideband_weight,
         refinement_geometry=tuple(sample.refinement_geometry for sample in samples),
         embedding_geometry=tuple(sample.embedding_geometry for sample in samples),
@@ -697,6 +720,7 @@ def collate_fiber_trace_3d_samples(
         target_segment_bbox_hi_zyx=segment_bbox_hi,
         target_tangent_zyx=torch.stack([sample.target_tangent_zyx for sample in samples]),
         target_segment_normals_zyx=segment_normals,
+        target_segment_widths_input=segment_widths,
         deferred_augmentation_params=deferred_augmentation_params,
         deferred_blur_kernels=deferred_blur_kernels,
         profile_timings_ms={
@@ -834,6 +858,7 @@ def load_config(path: str | Path) -> FiberTrace3DConfig:
                 "3D skew/ringing semantics must be specified explicitly"
             )
     return FiberTrace3DConfig(
+        annotations=AnnotationConfig.from_mapping(raw),
        datasets=tuple(dict(entry) for entry in datasets),
         sampling_strategy=str(raw.get("sampling_strategy", "control_points")),
         embedding=EmbeddingConfig.from_mapping(raw),
@@ -2158,11 +2183,7 @@ class FiberTrace3DLoader:
         if config.augment_anisotropic_blur_orientation not in {"fiber", "random", "axis", "z", "y", "x"}:
             raise ValueError("unsupported augment_anisotropic_blur_orientation")
         self.config = config
-        if config.embedding.enabled and any(not d.get("lasagna_manifest_path") for d in config.datasets):
-            raise ValueError("embedding training requires lasagna_manifest_path for every dataset")
         if config.presence_target_mode == "anisotropic_gaussian":
-            if any(not d.get("lasagna_manifest_path") for d in config.datasets):
-                raise ValueError("anisotropic Gaussian presence targets require lasagna_manifest_path for every dataset")
             if any(not d.get("dense_supervision", False) for d in config.datasets):
                 raise ValueError("anisotropic Gaussian presence targets require dense_supervision for every dataset")
         if config.refinement.orientation_enabled and config.presence_target_mode != "anisotropic_gaussian":
@@ -2173,10 +2194,12 @@ class FiberTrace3DLoader:
         self._missing_normal_samples = 0
         self._replacement_pools = {}
         self.records = self._load_records()
+        if config.embedding.enabled or config.presence_target_mode == 'anisotropic_gaussian' or config.refinement.enabled:
+            for record in self.records:
+                if not record.dataset_config.get('lasagna_manifest_path') and 'baked_annotations' not in record.fiber.metadata:
+                    raise ValueError('normal-dependent training requires lasagna_manifest_path or baked_annotations for every fiber')
         self._refinement_store = None
         if config.refinement.enabled and (config.refinement.update_enabled or config.refinement_split == "train"):
-            if any(not d.get("lasagna_manifest_path") for d in config.datasets):
-                raise ValueError("refinement requires lasagna_manifest_path for every dataset")
             if config.sampling_strategy != "scroll_balanced_arclength":
                 raise ValueError("refinement requires scroll_balanced_arclength and dense supervision")
             self._refinement_store = active_store()
@@ -2189,7 +2212,8 @@ class FiberTrace3DLoader:
                      "scroll_id": record.dataset_config.get("scroll_id"),
                      "base_volume_path": record.volume_path, "base_shape_zyx": record.base_shape_zyx,
                      "source_identity": record.fiber_identity,
-                     "normal_manifest": str(_resolve_path(record.dataset_config["lasagna_manifest_path"], config.config_dir)),
+                     "normal_manifest": (str(_resolve_path(record.dataset_config["lasagna_manifest_path"], config.config_dir))
+                         if record.dataset_config.get('lasagna_manifest_path') else 'baked_annotations'),
                      "control_span": record.fiber.metadata.get("training_control_span"),
                      "export": export_metadata(record.fiber)}, config.refinement,
                     allow_resume_addition=config.refinement_split == "test")
@@ -2252,7 +2276,7 @@ class FiberTrace3DLoader:
                         volume_spacing_base=1.0,
                         base_shape_zyx=tuple(int(v) for v in volume.shape),
                         fiber_identity=_stable_digest("array", index, id(volume)),
-                        dataset_config=record,
+                        dataset_config={**(self.config.datasets[0] if len(self.config.datasets) == 1 else {}), **record},
                     )
                 )
             return records
@@ -3106,7 +3130,7 @@ class FiberTrace3DLoader:
         refinement_orientation: np.ndarray | None = None,
         refinement_material: np.ndarray | None = None,
         refinement_baseline: np.ndarray | None = None,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None]:
         start = time.perf_counter()
         line_points, _local_line_index = self._line_window_for_labels(
             record,
@@ -3156,6 +3180,9 @@ class FiberTrace3DLoader:
                 <= np.asarray(patch_shape, dtype=np.float64) - 1.0 + radius, axis=1,
             )
         segment_start = segment_start[valid_segments]
+        global_line_index = (cp_index.segment_index if isinstance(cp_index, FiberLocation)
+                             else control_point_line_index(record.fiber, int(cp_index)))
+        segment_indices = np.flatnonzero(valid_segments) + global_line_index - _local_line_index
         segment_end = segment_end[valid_segments]
         segment_mid_source = segment_mid_source[valid_segments]
         segment_tangent_source = np.diff(line_points, axis=0)[valid_segments]
@@ -3178,12 +3205,14 @@ class FiberTrace3DLoader:
         normal_sample_midpoints: list[np.ndarray] = []
         source_tangents: list[np.ndarray] = []
         orientations: list[float] = []
+        width_indices: list[int] = []
+        width_fractions: list[np.ndarray] = []
         bbox_voxels = 0
         orientation_values = (np.zeros(len(segment_start)) if segment_orientation is None
                               else segment_orientation)
-        for p0_raw, p1_raw, midpoint_source, normal_midpoint, tangent_source, angle in zip(
+        for p0_raw, p1_raw, midpoint_source, normal_midpoint, tangent_source, angle, segment_index in zip(
             segment_start, segment_end, segment_mid_source, normal_sample_mid_base,
-            segment_tangent_source, orientation_values, strict=True
+            segment_tangent_source, orientation_values, segment_indices, strict=True
         ):
             clipped = _clip_segment_to_aabb(
                 p0_raw,
@@ -3207,6 +3236,11 @@ class FiberTrace3DLoader:
                 continue
             bbox_voxels += int(np.prod(hi - lo))
             starts.append(p0)
+            if self.config.annotations.width_weight:
+                raw_vector = p1_raw.astype(np.float64) - p0_raw
+                fractions = ((np.stack((p0,p1)) - p0_raw) @ raw_vector / np.dot(raw_vector, raw_vector)).clip(0,1)
+                width_indices.append(int(segment_index))
+                width_fractions.append(fractions)
             ends.append(p1)
             bbox_los.append(lo.astype(np.int64))
             bbox_his.append(hi.astype(np.int64))
@@ -3247,12 +3281,17 @@ class FiberTrace3DLoader:
             perpendicular = normals_out - tangents * np.sum(normals_out * tangents, axis=1, keepdims=True)
             if np.any(np.linalg.norm(perpendicular, axis=1) <= 1.0e-6):
                 raise InvalidNormalSampleError("Gaussian target normal is parallel to its fiber segment")
+        widths_out = None
+        if self.config.annotations.width_weight:
+            from .annotations import segment_endpoint_widths
+            widths_out = segment_endpoint_widths(self, record, params, width_indices, width_fractions)
         return (
             np.stack(starts, axis=0).astype(np.float32),
             np.stack(ends, axis=0).astype(np.float32),
             np.stack(bbox_los, axis=0).astype(np.int64),
             np.stack(bbox_his, axis=0).astype(np.int64),
             normals_out,
+            widths_out,
         )
 
     def _build_target_spec(
@@ -3279,7 +3318,7 @@ class FiberTrace3DLoader:
                 float(self.config.presence_sideband_half_width_base)
                 / float(record.volume_spacing_base),
             )
-        segment_starts, segment_ends, segment_bbox_lo, segment_bbox_hi, segment_normals = self._line_segment_spec(
+        segment_starts, segment_ends, segment_bbox_lo, segment_bbox_hi, segment_normals, segment_widths = self._line_segment_spec(
             record,
             cp_index,
             params,
@@ -3300,7 +3339,7 @@ class FiberTrace3DLoader:
                 segment_bbox_lo,
                 segment_bbox_hi,
             )
-            return (*target, None)
+            return (*target, None, segment_widths)
         return (
             _TARGET_MODE_DENSE_LINE,
             segment_starts,
@@ -3309,10 +3348,15 @@ class FiberTrace3DLoader:
             segment_bbox_hi,
             self._target_tangent_output_zyx(record, cp_index, params),
             segment_normals,
+            segment_widths,
         )
 
     def _sample_native_normals(self, record, points, timings=None):
         """Shared native validity/encoding-aware path for embedding and refinement."""
+        from .annotations import sample_baked_normals
+        baked = sample_baked_normals(record.fiber, points)
+        if baked is not None:
+            return baked
         from vc.volume import NormalSampler
         manifest = _resolve_path(record.dataset_config["lasagna_manifest_path"], self.config.config_dir)
         if manifest not in self._embedding_normal_records:
@@ -3334,13 +3378,9 @@ class FiberTrace3DLoader:
                 f"manifest={manifest} invalid={np.count_nonzero(~valid)}/{len(valid)}")
         return normals[:, ::-1]
 
-    def _transform_surface_normals_to_output(self, points_volume_zyx, normals_zyx, params):
-        """Push surface-normal covectors through the exact sparse augmentation map."""
-
+    def _source_to_output_jacobian(self, points_volume_zyx, params):
+        """Local Jacobian shared by surface-normal and annotated-width targets."""
         points = np.asarray(points_volume_zyx, dtype=np.float64)
-        normals = np.asarray(normals_zyx, dtype=np.float64)
-        if points.shape != normals.shape or points.ndim != 2 or points.shape[1] != 3:
-            raise ValueError("segment normal transformation requires matching Nx3 points/normals")
         offsets = np.concatenate((np.eye(3), -np.eye(3)), axis=0) * 0.5
         query = (points[None, :, :] + offsets[:, None, :]).reshape(-1, 3)
         mapped, _ = self._source_points_to_output_np(query, params, array_backend=True)
@@ -3348,6 +3388,14 @@ class FiberTrace3DLoader:
         jacobian = (mapped[:3] - mapped[3:]).transpose(1, 2, 0)
         if not np.isfinite(jacobian).all() or np.any(np.linalg.cond(jacobian) > 1.0e8):
             raise InvalidNormalSampleError("singular augmentation Jacobian for Gaussian target normal")
+        return jacobian
+
+    def _transform_surface_normals_to_output(self, points_volume_zyx, normals_zyx, params):
+        """Push surface-normal covectors through the exact sparse augmentation map."""
+        normals = np.asarray(normals_zyx, dtype=np.float64)
+        if normals.shape != np.shape(points_volume_zyx) or normals.ndim != 2 or normals.shape[1] != 3:
+            raise ValueError("segment normal transformation requires matching Nx3 points/normals")
+        jacobian = self._source_to_output_jacobian(points_volume_zyx, params)
         transformed = np.linalg.solve(jacobian.transpose(0, 2, 1), normals[..., None])[..., 0]
         lengths = np.linalg.norm(transformed, axis=1)
         if not np.isfinite(transformed).all() or np.any(lengths <= 1.0e-10):
@@ -3476,8 +3524,10 @@ class FiberTrace3DLoader:
             else:
                 location = reference_arc[control_point_line_index(record.fiber, cp_index)]
             cp_index = self._refined_location(refinement_current, location)
+            from .annotations import resample_baked_metadata
             record = replace(record, fiber=replace(record.fiber,
-                line_points_xyz=refinement_current[:, :3][:, ::-1].astype(np.float32)))
+                line_points_xyz=refinement_current[:, :3][:, ::-1].astype(np.float32),
+                metadata=resample_baked_metadata(record.fiber, reference_arc, refinement_current[:, 3])))
         if timings is not None:
             timings["descriptor_ms"] = (time.perf_counter() - start) * 1000.0
         start = time.perf_counter()
@@ -3570,6 +3620,7 @@ class FiberTrace3DLoader:
             segment_bbox_hi,
             target_tangent,
             target_segment_normals,
+            target_segment_widths,
         ) = self._build_target_spec(
             record,
             cp_index,
@@ -3591,6 +3642,7 @@ class FiberTrace3DLoader:
             timings["raw_sample_total_ms"] = load_wall_ms
             timings["raw_sample_cpu_ms"] = load_cpu_ms
         sample = FiberTrace3DSample(
+            annotation_targets=line_targets(self, record, params),
             presence_target_mode=self.config.presence_target_mode,
             presence_sideband_weight=self.config.presence_sideband_weight,
             volume_spacing_base=float(record.volume_spacing_base),
@@ -3640,6 +3692,8 @@ class FiberTrace3DLoader:
                 dtype=torch.float32,
                 device=resolved_device,
             ),
+            target_segment_widths_input=None if target_segment_widths is None else torch.as_tensor(
+                target_segment_widths, dtype=torch.float32, device=resolved_device),
             profile_timings_ms=timings,
         )
         return FiberTrace3DRawSample(
@@ -4099,6 +4153,7 @@ def config_from_mapping(raw: dict[str, Any], *, config_dir: Path | None = None) 
     if raw.get("_array_records") is not None and datasets is None:
         datasets = [{"array_records": True}]
     cfg = FiberTrace3DConfig(
+        annotations=AnnotationConfig.from_mapping(raw),
        datasets=tuple(dict(entry) for entry in datasets),
         sampling_strategy=str(raw.get("sampling_strategy", "control_points")),
         embedding=EmbeddingConfig.from_mapping(raw),

@@ -84,7 +84,7 @@ class InvalidNormalSampleError(ValueError):
     """Native sampler reports no valid normal; replace the whole sample."""
 
 
-def _nearest_by_scan(points, line):
+def _nearest_by_scan(points, line, *, with_location=False):
     """Exact Euclidean segment projection, O(points) temporary space.
 
     Caller bounds points per block. Ties select the earliest segment, matching
@@ -97,11 +97,14 @@ def _nearest_by_scan(points, line):
         raise ValueError("embedding GT must be a finite polyline with >=2 points")
     best = np.full(len(points), np.inf)
     nearest = np.zeros_like(points)
+    segments = np.zeros(len(points), dtype=np.int64)
+    fractions = np.zeros(len(points))
     lower, upper = points.min(axis=0) - 80, points.max(axis=0) + 80
     starts, ends = line[:-1], line[1:]
     intersects = np.all(np.maximum(starts, ends) >= lower, axis=1)
     intersects &= np.all(np.minimum(starts, ends) <= upper, axis=1)
-    for start, end in zip(starts[intersects], ends[intersects]):
+    for index in np.flatnonzero(intersects):
+        start, end = starts[index], ends[index]
         delta = end - start
         length2 = float(delta @ delta)
         if length2 == 0:
@@ -111,7 +114,10 @@ def _nearest_by_scan(points, line):
         distance2 = np.sum((points - matched) ** 2, axis=1)
         use = distance2 < best
         nearest[use] = matched[use]
+        segments[use], fractions[use] = index, t[use]
         best[use] = distance2[use]
+    if with_location:
+        return nearest, best, segments, fractions
     return nearest, best
 
 
@@ -131,16 +137,19 @@ class _PolylineIndex:
         self.delta = np.diff(self.line, axis=0)
         self.length2 = np.sum(self.delta ** 2, axis=1)
         valid = self.length2 > 0
+        self.source_indices = np.flatnonzero(valid)
         self.starts, self.delta, self.length2 = self.starts[valid], self.delta[valid], self.length2[valid]
         if not len(self.starts):
             raise ValueError("embedding GT has no nonzero segment")
         self.half_length = np.sqrt(self.length2.max()) / 2
         self.tree = cKDTree(self.starts + self.delta / 2)
 
-    def nearest(self, points):
+    def nearest(self, points, *, with_location=False):
         points = np.asarray(points, dtype=np.float64)
         result = np.zeros_like(points)
         best = np.full(len(points), np.inf)
+        segments = np.zeros(len(points), dtype=np.int64)
+        fractions = np.zeros(len(points))
         pending = np.arange(len(points))
         k = min(8, len(self.starts))
         while len(pending):
@@ -156,15 +165,20 @@ class _PolylineIndex:
             choice = (indices == first[:, None]).argmax(axis=1)
             result[pending] = matched[np.arange(len(pending)), choice]
             best[pending] = minimum
+            segments[pending] = self.source_indices[first]
+            fractions[pending] = t[np.arange(len(pending)), choice]
             if k == len(self.starts):
                 break
             resolved = distances[:, -1] - self.half_length > np.sqrt(minimum) + 1e-10
             pending = pending[~resolved]
             if k >= 64:
                 if len(pending):
-                    result[pending], best[pending] = _nearest_by_scan(points[pending], self.line)
+                    result[pending], best[pending], segments[pending], fractions[pending] = _nearest_by_scan(
+                        points[pending], self.line, with_location=True)
                 break
             k = min(k * 2, len(self.starts))
+        if with_location:
+            return result, best, segments, fractions
         return result, best
 
 

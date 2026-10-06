@@ -33,12 +33,23 @@ def training_fiber_spans(fiber: Vc3dFiber) -> list[Vc3dFiber]:
         if not accepted and start is not None:
             points = fiber.line_points_xyz[indices[start]:indices[i] + 1].copy()
             if np.any(np.linalg.norm(np.diff(points, axis=0), axis=1) > 0):
+                metadata = {**fiber.metadata, "training_control_span": (start, i)}
+                if "baked_annotations" in metadata:
+                    from .annotations import baked_normals
+                    baked_normals(fiber)  # Validate before slicing, never truncate silently.
+                    metadata["baked_annotations"] = {
+                        **metadata["baked_annotations"],
+                        "normals_xyz": metadata["baked_annotations"]["normals_xyz"][indices[start]:indices[i]+1],
+                    }
+                    for key in ('valid', 'widths_base'):
+                        if key in metadata['baked_annotations']:
+                            metadata['baked_annotations'][key] = metadata['baked_annotations'][key][indices[start]:indices[i]+1]
                 runs.append(replace(
                     fiber,
                     line_points_xyz=points,
                     control_points_xyz=fiber.control_points_xyz[start:i + 1].copy(),
                     control_point_segments=tuple(fiber.control_point_segments[start:i]) + (None,),
-                    metadata={**fiber.metadata, "training_control_span": (start, i)},
+                    metadata=metadata,
                 ))
             start = None
     return runs

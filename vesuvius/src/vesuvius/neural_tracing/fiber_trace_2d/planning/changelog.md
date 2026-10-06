@@ -1,3 +1,30 @@
+## 2026-10-06 — Width sample visualization
+
+- Optional predicted-width column in train/test sample overviews, all five planes;
+  one base voxel per grayscale unit, reusing existing forwards. Production H/V weight0.01.
+- Gaussian tube width supervision and detached20%-width gate on extra sideband
+  loss; regular presence/GT-only counts unchanged. Direction-modulated overview
+  views also gated against center predicted width.
+
+## 2026-10-05 — Correct annotated-training evaluation protocol
+
+- Removed the unrequested derived holdout and its code/data. Both annotation
+  configs use all92 reviewed training pieces and restore the original32-piece
+  test set, resident tracing and cross-section evaluation. Historical smoke/long
+  runs below used the rejected protocol and are not comparison baselines.
+- Added persistent first-raw-test-angle-below10deg trace gate. Training remains
+  stopped pending review; original test data lack baked auxiliary normal labels.
+
+## 2026-10-05 — Reviewed normal, width and H/V training
+
+- Added native reviewed-data normal baking using shared VC3D sampling/corrections,
+  inherited parent H/V, and explicit validity/provenance. Added optional normal,
+  input-voxel width and binary H/V heads with augmentation-aware targets,
+  target-only single-backward normalization, raw/EMA losses and checkpoints.
+- Short fresh managed two-GPU run completed eight updates, with refinement off,
+  76 train/16 parent-disjoint test pieces and no runtime Lasagna manifests.
+  See docs/annotated_training_heads.md and planning/task_log.md for validation.
+
 ## 2026-10-05 — Tiled tracing checkpoint for integration
 
 - Completed eight-tile 2048 tracing/local deduplication: 7,322 retained tile
@@ -3746,3 +3773,13 @@ identity remains unconfirmed. Global-assignment experiments not yet implemented.
   release/replacement. Attempts are tied to exact manager ownership, use exact
   granted GPU UUIDs, stage output atomically, and are reaped/retried when a
   manager allocation changes instead of crashing training or retaining GPUs.
+# 2026-10-05: baked held-out test copy
+
+- Preserved the existing32 reviewed test pieces and geometry; baked71,165 native
+  VC3D corrected normal labels and inherited full-parent H/V (one correction).
+  Annotated training configs use the new copy; original data remains unchanged.
+# 2026-10-05: correct normal supervision
+
+- Normal head now shares direction's Gaussian tube/segment assignment and
+  falloff normalization, including axis projection weighting. Log unweighted
+  normal MSE for comparison with direction; total still applies configured weight.

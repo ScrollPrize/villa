@@ -26,6 +26,8 @@ def loss_components(model, *, gaussian_presence=False, sideband_presence=False):
         if not gaussian_presence:
             raise ValueError("sideband presence requires Gaussian presence")
         components += SIDEBAND_COMPONENTS
+    if getattr(model, "annotations", None):
+        components += model.annotations.names
     if not getattr(model, "embedding_channels", 0):
         return components
     if getattr(model, "embedding_short_range_channels", 0):
@@ -69,6 +71,7 @@ class NormalizedGradientAccumulator:
         self.counts = counts.detach().to(device=self.parameters[0].device, dtype=torch.float32).clone()
         if self.counts.shape != (len(self.components),):
             raise ValueError(f"expected {len(self.components)} target-derived normalization counts")
+        self.local_counts = self.counts.clone()
         if distributed:
             dist.all_reduce(self.counts, group=process_group)
         distribution_active = bool(
@@ -76,6 +79,7 @@ class NormalizedGradientAccumulator:
             and self.counts[self.components.index("distribution_presence")] > 0
         )
         component_weights = {
+            "normal": 1.0, "width": 1.0, "hv": 1.0,
             "direction": direction_weight,
             "positive_presence": presence_weight * positive_query_weight,
             "negative_presence": (
@@ -115,13 +119,22 @@ class NormalizedGradientAccumulator:
         if self.finished:
             raise RuntimeError("accumulator already finalized")
         self.finished = True
-        if self.distributed:
-            dist.all_reduce(self.statistics, group=self.process_group)
         statistics = LossStatistics.unpack(self.statistics)
         actual = torch.stack([getattr(statistics, f"{name}_count") for name in self.components])
-        # Refuse an update if prepared geometry and actual forward targets differ.
-        if not torch.equal(actual, self.counts):
-            raise RuntimeError(f"target normalization counts changed: prepared={self.counts.tolist()} actual={actual.tolist()}")
+        # Compare locally in identical microbatch order, before collectives.
+        # Fractional Gaussian masses can round differently when NCCL reduces
+        # the short count vector versus the longer reporting-stat vector.
+        mismatch = (actual != self.local_counts).any().float().reshape(1)
+        if self.distributed:
+            # Piggyback failure consensus on the existing reporting collective:
+            # every rank fails together, without weakening the exact check.
+            packed = torch.cat((self.statistics, mismatch))
+            dist.all_reduce(packed, group=self.process_group)
+            self.statistics = packed[:-1]
+            mismatch = packed[-1:]
+            statistics = LossStatistics.unpack(self.statistics)
+        if bool(mismatch.item()):
+            raise RuntimeError(f"target normalization counts changed on one or more ranks: local prepared={self.local_counts.tolist()} actual={actual.tolist()}")
         if self.distributed:
             used = torch.tensor([p.grad is not None for p in self.parameters],
                                 dtype=torch.int32, device=self.counts.device)

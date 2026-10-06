@@ -572,6 +572,7 @@ def test_global_loss_statistics_match_single_batch_value_and_ddp_gradient(monkey
         [
             item.detach().to(dtype=torch.float32).reshape(())
             for name in (
+                "normal", "normal_unweighted", "width", "hv",
                 "direction",
                 "positive_presence",
                 "negative_presence",
@@ -590,6 +591,10 @@ def test_global_loss_statistics_match_single_batch_value_and_ddp_gradient(monkey
             )
             for item in (
                 {
+                    "normal": (torch.tensor(0.0), torch.tensor(0.0)),
+                    "normal_unweighted": (torch.tensor(0.0), torch.tensor(0.0)),
+                    "width": (torch.tensor(0.0), torch.tensor(0.0)),
+                    "hv": (torch.tensor(0.0), torch.tensor(0.0)),
                     "direction": (sum(s.direction_sum for s in statistics), torch.tensor(3.0)),
                     "positive_presence": (torch.tensor(0.0), torch.tensor(0.0)),
                     "negative_presence": (torch.tensor(0.0), torch.tensor(0.0)),

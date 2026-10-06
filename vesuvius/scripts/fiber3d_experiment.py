@@ -847,6 +847,31 @@ def inspect():
 
 
 def main():
+    if sys.argv[1:] == ['annotation-report']:
+        # CPU-only inspection of the last short annotation training. No GPU use.
+        import math
+        import torch
+        from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+        from vesuvius.neural_tracing.fiber_trace_3d.model import build_fiber_trace_3d_model
+        torch.set_num_threads(1)
+        config = json.loads((ROOT / json.loads(CONTROL.read_text())['production']['config']).read_text())
+        training = config['training']
+        run = sorted(Path(training['run_path']).glob(training['run_name'] + '_*'))[-1]
+        checkpoint = torch.load(run / 'snapshots/current.pt', map_location='cpu', mmap=True, weights_only=False)
+        model = build_fiber_trace_3d_model(checkpoint['config'])
+        model.load_state_dict(checkpoint['model'], strict=True)
+        assert model.annotations.channels == 8
+        events = EventAccumulator(str(run), size_guidance={'scalars': 0}).Reload()
+        report = {'run': str(run), 'checkpoint_step': checkpoint['step'], 'metrics': {}}
+        assert not checkpoint['config']['refinement']['enabled']
+        for prefix in ('train', 'test', 'test_ema_0p99', 'test_ema_0p999'):
+            for name in ('normal', 'width', 'hv'):
+                tag = prefix + '/loss_' + name
+                values = events.Scalars(tag)
+                assert values and all(math.isfinite(x.value) for x in values), tag
+                report['metrics'][tag] = [{'samples': x.step, 'value': x.value} for x in values]
+        print(json.dumps(report, indent=2), flush=True)
+        return
     if sys.argv[1:] == ['embedding-watch-start']:
         from villa_gpu_manager.processes import process_identity
         control = json.loads(CONTROL.read_text())

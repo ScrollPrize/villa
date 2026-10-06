@@ -38,9 +38,17 @@ class LossStatistics:
     sideband_left_presence_count: torch.Tensor | None = None
     sideband_right_presence_sum: torch.Tensor | None = None
     sideband_right_presence_count: torch.Tensor | None = None
+    normal_sum: torch.Tensor | None = None
+    normal_count: torch.Tensor | None = None
+    normal_unweighted_sum: torch.Tensor | None = None
+    width_sum: torch.Tensor | None = None
+    width_count: torch.Tensor | None = None
+    hv_sum: torch.Tensor | None = None
+    hv_count: torch.Tensor | None = None
 
     def __post_init__(self):
-        for name in ("positive_embedding_sum", "positive_embedding_count",
+        for name in ("normal_sum", "normal_count", "normal_unweighted_sum", "width_sum", "width_count", "hv_sum", "hv_count",
+                     "positive_embedding_sum", "positive_embedding_count",
                      "negative_embedding_sum", "negative_embedding_count",
                      "contrastive_embedding_sum", "contrastive_embedding_count",
                      "short_embedding_sum", "short_embedding_count",

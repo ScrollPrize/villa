@@ -138,10 +138,12 @@ def _checkpoint_provenance(path: str | Path | None, config: dict[str, Any]) -> d
         "metric_value": scalar(top.get("metric")),
         "architecture": model.get("architecture") if isinstance(model, dict) else None,
         "output_schema": {
-            key: model[key] for key in (
+            **({"annotations": config["annotations"], "annotation_products_exported": False}
+               if config.get("annotations") else {}),
+            **{key: model[key] for key in (
                 "output_channels", "direction_branch_count", "conditioned_decoder_enabled",
                 "output_stride",
-            ) if isinstance(model, dict) and key in model
+            ) if isinstance(model, dict) and key in model},
         },
     }
 

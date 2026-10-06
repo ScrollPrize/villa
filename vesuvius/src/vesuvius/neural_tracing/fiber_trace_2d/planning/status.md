@@ -1,7 +1,6 @@
-# Evaluation status
+# Width-aware supervision
 
-- [x] Record task and plan.
+- [x] Plan written.
 - [x] Independent review.
-- [x] Freeze seven snapshots.
-- [x] Run/audit all seven evaluations.
-- [x] Report comparisons and confirm training alive.
+- [x] Implement and validate.
+- [x] Resume and verify: raw/EMA and trace tests completed,70 optimizer updates confirmed; cooperative waiting for another task at handoff.
