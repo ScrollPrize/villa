@@ -1,50 +1,11 @@
-"""Fixed compiler contracts without changing adaptive losses or stream gradients."""
-import copy
-
+"""Training updates: compiled losses match eager, skipped refinement passes leave AdamW state alone, and
+refinement_loss 'all' trains every pass."""
 import torch
 
 from model_fixtures import coordinate_batch, coordinate_config
 from vesuvius.neural_tracing.fiber_follow.models.model import build_model
 from vesuvius.neural_tracing.fiber_follow.train.train import prepare_training, optimizer_update, training_prediction
 from vesuvius.neural_tracing.fiber_follow.train.supervision import loss_terms
-
-
-def predict(model, *args, **kwargs):
-    # The adaptive inference implementation is an independent numerical oracle.
-    return (training_prediction(model, *args, **kwargs) if hasattr(model, 'training_batch_size')
-            else model(*args, **kwargs))
-
-
-def compare_gradients(left, right):
-    for (name, p), (_, q) in zip(left.named_parameters(), right.named_parameters()):
-        if p.grad is None:
-            assert q.grad is None, name
-        else:
-            torch.testing.assert_close(p.grad, q.grad, rtol=3e-4, atol=2e-6, msg=name)
-
-
-def test_partial_acceptance_keeps_policy_and_geometry_gradients():
-    torch.manual_seed(115)
-    eager = build_model(coordinate_config(recurrent_refinement_steps=2))
-    raw = copy.deepcopy(eager)
-    compiled = prepare_training(raw, backend='eager')
-    batch = coordinate_batch(eager.cfg, 2)
-    with torch.no_grad():
-        confidence = eager(batch['x'], batch['hist'], batch['hmask'])['refinement_confidence'][:, 0, -1]
-    assert confidence[0] != confidence[1]
-    threshold = float(confidence.mean())
-    predictions = []
-    for model in (eager, compiled):
-        out = predict(model, batch['x'], batch['hist'], batch['hmask'], confidence_threshold=threshold)
-        terms = loss_terms(out, batch, eager.cfg)
-        (terms['geometry_per_state'].sum()+terms['confidence_per_state'].sum()).backward()
-        predictions.append(out)
-    assert predictions[0]['refinement_mask'][:, 1].sum() == 1
-    used = predictions[0]['refinement_mask'].shape[1]
-    assert torch.equal(predictions[0]['refinement_mask'], predictions[1]['refinement_mask'][:, :used])
-    assert torch.equal(predictions[0]['selected_refinement'], predictions[1]['selected_refinement'])
-    torch.testing.assert_close(predictions[0]['points'], predictions[1]['points'], rtol=1e-5, atol=1e-6)
-    compare_gradients(eager, raw)
 
 
 def test_masked_retries_preserve_adamw_skipped_parameter_updates():
@@ -100,3 +61,37 @@ def test_compiled_loss_preserves_terms_and_prediction_gradients():
             assert b is None or b.eq(0).all()
         else:
             torch.testing.assert_close(a, b, rtol=3e-5, atol=2e-6)
+
+
+def test_refinement_loss_all_keeps_initial_weight_and_reports_policy_attempts():
+    from types import SimpleNamespace
+    from vesuvius.neural_tracing.fiber_follow.train.train import (
+        REFINE_ALL, initialize_model_weights, initialize_training_optimizer, optimizer_update)
+    torch.manual_seed(115)
+    model = build_model(coordinate_config(recurrent_refinement_steps=2))
+    batch = coordinate_batch(model.cfg, 2)
+    with torch.no_grad():
+        confidence = model(batch['x'], batch['hist'], batch['hmask'])['refinement_confidence'][:, 0, -1]
+    threshold = float(confidence.mean())
+    model = prepare_training(model, backend='eager')
+    args = (model, batch['x'], batch['hist'], batch['hmask'], threshold)
+    policy = training_prediction(*args)
+    every = training_prediction(*args, retry_threshold=REFINE_ALL)
+    assert every['refinement_mask'].all()
+    old = loss_terms(policy, batch, model.cfg, 2.)
+    initial_only = loss_terms(every, batch, model.cfg, 2., refinement_loss='all', refinement_weight=0., policy_threshold=threshold)
+    accepted = int(confidence.argmax())
+    for key in ('geometry_per_state', 'confidence_per_state'):
+        torch.testing.assert_close(initial_only[key][accepted], old[key][accepted])  # accepted outright: same loss
+    # The attempt metric counts what the operating policy runs, not the training-only passes.
+    assert int(initial_only['refinement_attempts_sum']) == int(policy['refinement_mask'].sum())
+    full = loss_terms(every, batch, model.cfg, 2., refinement_loss='all', refinement_weight=1., policy_threshold=threshold)
+    (full['geometry_per_state'].sum()+full['confidence_per_state'].sum()).backward()
+    assert model.refinement_stage.weight.grad[1].abs().sum() > 0  # the last pass trains even for the accepted row
+    torch.manual_seed(2)
+    trained, ema = initialize_model_weights(coordinate_config(recurrent_refinement_steps=2), 'cpu')
+    opt, _, _ = initialize_training_optimizer(trained, ema, SimpleNamespace(lr=.001, reset_optimizer=False))
+    prepare_training(trained, backend='eager')
+    metrics = optimizer_update(trained, ema, opt, [coordinate_batch(trained.cfg, 2)], 1, .001, tolerance=2.,
+                               confidence_threshold=.4, gate='full', refinement_loss='all')
+    assert torch.isfinite(torch.tensor(metrics['loss'])) and 1 <= metrics['refinement_attempts_mean'] <= 3

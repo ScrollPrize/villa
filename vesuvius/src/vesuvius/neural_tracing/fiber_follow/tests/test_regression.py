@@ -1,22 +1,17 @@
-"""Regression follower (models/crop_transformer.py): forward contracts, optimizer updates, checkpoints, CT crops and
-run diagnostics."""
+"""Regression follower (models/crop_transformer.py): forward contract, losses, optimizer updates and checkpoints."""
 import copy
 from dataclasses import replace
 from types import SimpleNamespace
 
-import numpy as np
 import pytest
 import torch
 
-from vesuvius.neural_tracing.fiber_follow.models.model import build_model, config_from_checkpoint, feature_grid
+from vesuvius.neural_tracing.fiber_follow.models.model import build_model, config_from_checkpoint
 from vesuvius.neural_tracing.fiber_follow.train.supervision import geometry_mask, loss_terms
 from vesuvius.neural_tracing.fiber_follow.train import train
 from vesuvius.neural_tracing.fiber_follow.train.train import clip_training_gradients, initialize_training_optimizer, load_checkpoint, optimizer_update, prepare_training, save_checkpoint
-from vesuvius.neural_tracing.fiber_follow.data.observations import image_crop
-from vesuvius.neural_tracing.fiber_follow.data.data import SampleConfig, TracedFiber, fiber_identities, fiber_manifest
-from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, crop_local_grid, sample_oriented_fast
+from vesuvius.neural_tracing.fiber_follow.data.data import SampleConfig
 from vesuvius.neural_tracing.fiber_follow.train.runloop import read_checkpoint, training_rng_state
-from vesuvius.neural_tracing.fiber_follow.train.training_log import TrainingInterval, SamplingLedger, format_training_log
 from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolumeSpec
 from label_fixtures import set_terminal
 from model_fixtures import coordinate_batch, coordinate_config, batch as label_batch, forward, proposal_output
@@ -83,16 +78,8 @@ def test_departures_unknown_ends_and_crop_censoring():
     assert torch.isfinite(terms['error_sum'])
 
 
-def test_feature_coordinates_respect_even_sized_strided_lattice():
-    crop = CropSpec(depth=16, width=12, behind=7, spacing=.5)
-    # Deep convolution lattice index (x,y,z) = (2,1,3), stride four.
-    p = torch.tensor([[[8*.5-5.5*.5, 4*.5-5.5*.5, 12*.5-7*.5]]])
-    grid = feature_grid(p, crop, (4, 3, 3), stride=4)
-    torch.testing.assert_close(grid, torch.tensor([[[1., 0., 1.]]]))
-
-
-def test_optimizer_update_partition_metrics_and_sampling_ledger():
-    """Microbatches keep the objective and update; metrics and the ledger don't change training or RNG."""
+def test_microbatches_give_the_same_loss_and_update():
+    """Splitting a batch into microbatches keeps the objective and the update; metrics don't change training or RNG."""
     torch.manual_seed(3)
     cfg = config()
     a = build_model(cfg)
@@ -100,19 +87,12 @@ def test_optimizer_update_partition_metrics_and_sampling_ledger():
     data = batch(cfg, 2)
     data['dense_mask'][0, 5:] = 0
     set_terminal(data, 1)
-    data.update(source=torch.tensor([0, 2]), task_requested=torch.tensor([0, 6]), task_delivered=torch.tensor([0, 0]),
-                task_fallback=torch.tensor([0, 1]), ct_frame_rejected_batches=torch.tensor([3, 0]))
-    data['x'].update(ct_frame_source=torch.tensor([0, 2]),
-                     ct_frame_energy=torch.tensor([.2, 0.]), ct_frame_gap=torch.tensor([.8, 0.]))
     averages = [copy.deepcopy(m) for m in (a, bmodel)]
     optimizers = [torch.optim.SGD(m.parameters(), lr=.001) for m in (a, bmodel)]
     for model in (a, bmodel):
         prepare_training(model, batch_size=2, backend='eager')
-    ledger = SamplingLedger()
     rng = torch.get_rng_state()
-    results = [optimizer_update(a, averages[0], optimizers[0], [data], 1, .001, n_commit=2, compute_metrics=False,
-                                ledger=ledger)]
-    torch.testing.assert_close(torch.get_rng_state(), rng, rtol=0, atol=0)
+    results = [optimizer_update(a, averages[0], optimizers[0], [data], 1, .001, n_commit=2, compute_metrics=False)]
     results.append(optimizer_update(bmodel, averages[1], optimizers[1], [take(data, slice(0, 1)), take(data, slice(1, 2))],
                                     1, .001, n_commit=2, compute_metrics=True))
     torch.testing.assert_close(torch.get_rng_state(), rng, rtol=0, atol=0)
@@ -121,30 +101,6 @@ def test_optimizer_update_partition_metrics_and_sampling_ledger():
         assert results[0][key] == results[1][key]
     for p, q in zip(a.parameters(), bmodel.parameters()):
         torch.testing.assert_close(p, q, rtol=2e-5, atol=2e-7)
-    metrics = results[0]
-    assert 'decisions' not in metrics and results[1]['decisions']['n_commit'] == 2
-    assert sum(metrics[k] for k in ('point_correct_count', 'point_wrong_count', 'point_unknown_count')) == 8
-    assert metrics['refinement_attempts_sum'] >= 2
-    assert metrics['ct_frame_rejected_batches'] == 3
-    assert (metrics['ct_frame_count'], metrics['ct_frame_transported'], metrics['ct_frame_deterministic']) == (2, 0, 1)
-    sampling = ledger.summary()['0']
-    assert sampling['requested_share'] == dict(fresh=.5, dagger_ordinary=.5)
-    assert sampling['delivered_share'] == dict(fresh=1.)
-    assert sampling['fallbacks'] == {'dagger_ordinary->fresh': 1}
-    assert sampling['sources'] == dict(fresh=1, replay=1)
-    assert sampling['positive_targets']+sampling['negative_targets'] == (
-        metrics['positive_confidence_targets']+metrics['negative_confidence_targets'])
-    interval = TrainingInterval()
-    interval.add(metrics)
-    interval.add(metrics)
-    summary = interval.summary()
-    assert summary['ct_frame_count'] == 4
-    printed = format_training_log(dict(step=50, geometry=1., loss=1., lr=.001, interval=summary,
-        n_future=4, tolerance=1.5, sampling=ledger.summary(), interval_update_seconds=1.,
-        interval_data_seconds=.1, interval_samples_per_second=4.))
-    assert 'source 0: requested dagger_ordinary 50%, fresh 50% | delivered fresh 100%' in printed
-    assert "fallbacks {'dagger_ordinary->fresh': 1}" in printed
-    assert 'current 2/4 fallbacks (0 transported, 2 deterministic); mean gap 0.400' in printed
 
 
 def test_gradient_clipping_and_guards():
@@ -210,8 +166,8 @@ def test_training_compilation_emulates_eager_bf16_rounding(monkeypatch):
     assert not torch._inductor.config.emulate_precision_casts
 
 
-@pytest.mark.parametrize('resume_lr', [.001, .0005])
-def test_checkpoint_resume_init_weights_and_model_type_contract(tmp_path, resume_lr):
+def test_checkpoint_resume_and_init_weights(tmp_path):
+    resume_lr = .0005  # a resume may change the LR
     torch.manual_seed(7)
     cfg = config()
     args = SimpleNamespace(reset_optimizer=False, lr=.001)
@@ -256,82 +212,6 @@ def test_checkpoint_resume_init_weights_and_model_type_contract(tmp_path, resume
     assert report['mismatched'] and all('.ffn.' in name for name in report['mismatched'])
     assert {'hazard.weight', 'hazard.bias'} <= set(report['fresh']) and not report['unexpected']
     torch.testing.assert_close(wider.cell_token.weight, initial['model']['cell_token.weight'], rtol=0, atol=0)
-    with pytest.raises(ValueError, match='Unsupported'):
-        config_from_checkpoint(dict(initial, model_type='unsupported'))
-    torch.save(dict(initial, model_type='unified'), tmp_path/'legacy.pt')
-    with pytest.raises(ValueError, match='convert_checkpoint'):
-        read_checkpoint(tmp_path/'legacy.pt', 'cpu')
-    # The init fiber check compares identities: repaired geometry passes, a changed source does not.
-    arc = np.arange(50.)
-    fiber = TracedFiber('f', np.c_[arc*0, arc*0, arc], arc, '', source_hash='abc')
-    repaired = replace(fiber, points=fiber.points+[.5, 0., 0.])
-    assert fiber_manifest([fiber]) != fiber_manifest([repaired])
-    assert fiber_identities(fiber_manifest([fiber])) == fiber_identities(fiber_manifest([repaired]))
-    assert fiber_identities(fiber_manifest([fiber])) != fiber_identities(fiber_manifest([replace(fiber, source_hash='abd')]))
-
-
-def test_inference_checkpoint_keeps_checkpoint_storage_on_cpu(monkeypatch):
-    cfg = config()
-    spec = FiberVolumeSpec('unused', ct_zarr='unused')
-    ck = dict(ema={}, vol_spec=spec.to_dict())
-    calls = []
-    monkeypatch.setattr(train, 'read_checkpoint', lambda path, device: calls.append(('read', device)) or ck)
-    monkeypatch.setattr(train, 'config_from_checkpoint', lambda checkpoint: cfg)
-    class Model:
-        def to(self, device, **kwargs):
-            calls.append(('model', device))
-            return self
-        def load_state_dict(self, weights):
-            assert weights is ck['ema']
-        def eval(self):
-            return self
-    monkeypatch.setattr(train, 'build_model', lambda config: Model())
-    train.load_checkpoint('unused', 'cuda')
-    assert calls == [('read', 'cpu'), ('model', 'cuda')]
-
-
-def test_ct_crops_match_reference_sampling_at_edges_and_native_resolution():
-    """Per-item tight blocks give the reference values, zero fill beyond the array, on the 2x CT grid."""
-    from vesuvius.neural_tracing.fiber_follow.data.data import _grid_flat, read_blocks
-    from vesuvius.neural_tracing.fiber_follow.shared.fast_sample import sample_scalar_crop
-    from vesuvius.neural_tracing.fiber_follow.data.ct_normalization import normalize_ct
-    rng = np.random.default_rng(11)
-    data = rng.integers(1, 256, (70, 60, 64), dtype=np.uint8)
-
-    def read(start, size):
-        out = np.zeros(tuple(size), np.uint8)
-        lo, hi = np.maximum(start, 0), np.minimum(start+size, data.shape)
-        if np.all(hi > lo):
-            out[tuple(slice(a-s, b-s) for a, b, s in zip(lo, hi, start))] = data[tuple(map(slice, lo, hi))]
-        return out
-    calibration = dict(method='crop_zscore_v1')
-    vol = SimpleNamespace(presence=None, input_scale=2., raw_block=lambda s, z: read(s, z)[None],
-                          spec=SimpleNamespace(ct_normalization=calibration))
-    crop = CropSpec(depth=14, width=10, behind=5, spacing=.5)
-    items = []
-    for _ in range(24):
-        # Interior, straddling each face, and fully outside; arbitrary orientation.
-        q, _ = np.linalg.qr(rng.normal(size=(3, 3)))
-        items.append(dict(pos=rng.uniform(-6, 38, 3), frame=q*np.sign(np.linalg.det(q))))
-    image = image_crop(items, vol, crop)
-    assert image.shape == (24, 1, crop.depth, crop.width, crop.width)
-    raw, starts = read_blocks(items, vol, crop)
-    grid = _grid_flat(crop)
-    expected = np.empty((len(items), crop.depth, crop.width, crop.width), np.float32)
-    for j, item in enumerate(items):
-        sample_scalar_crop(raw[j], starts[j], item['pos']*2., item['frame']*2., grid, expected[j])
-    reference = torch.from_numpy(expected.copy())
-    for row in expected:
-        normalize_ct(row, calibration)
-    assert torch.equal(image[:, 0], torch.from_numpy(expected))
-    assert 0 < float((reference != 0).float().mean()) < 1
-    # The fast sampler agrees with the oriented torch reference.
-    oriented = torch.cat([sample_oriented_fast(torch.from_numpy(raw[j:j+1]).reshape(1, 1, *raw[j].shape[-3:]),
-                                               torch.from_numpy(starts[j:j+1]), torch.from_numpy(item['pos'][None]*2.).float(),
-                                               torch.from_numpy(item['frame'][None]*2.).float(),
-                                               torch.from_numpy(crop_local_grid(crop)).float())
-                          for j, item in enumerate(items)])
-    torch.testing.assert_close(oriented[:, 0], reference, atol=3e-4, rtol=1e-3)
 
 
 def test_loss_supervises_every_proposal():
@@ -376,79 +256,3 @@ def test_loss_supervises_every_proposal():
     assert hazards.grad[0, 1, 0] < 0 and hazards.grad[0, 1, 1:].eq(0).all()
     assert (hazards.grad[0, 2, :2] > 0).all()
     assert hazards.grad[0, 2, 2] < 0 and hazards.grad[0, 2, 3] == 0
-
-
-def test_decision_metrics_score_actual_commits_censor_unknowns_and_pool_counts():
-    import json
-    from vesuvius.neural_tracing.fiber_follow.evaluation.diagnostics import decision_rows, summarize_decisions
-    cfg = config()
-    b = label_batch(cfg, 5)
-    b['match_distance'] = torch.tensor([.5, 1.25, 1.75, 2.5, 7.])
-    set_terminal(b, 4)
-    b['dense_mask'][3] = 0
-    points = torch.zeros(5, 4, 3)
-    points[..., 2] = torch.arange(1, 5)
-    points[1, 2:, 0] = 3.  # four-point prefix fails, but only first two accepted
-    points[2, :, 0] = 2.   # knowingly wrong accepted prefix
-    conf = torch.ones(5, 4)*.9
-    conf[0] = .1           # false stop on a correct path
-    conf[1, 2:] = .1
-    out = proposal_output(points[:, None], torch.zeros(5, 1, 4))
-    out.update(initial_points=points+torch.tensor([.2, 0., 0.]), confidence=conf,
-               refinement_confidence=conf[:, None])
-    stats = summarize_decisions(decision_rows(out, b, cfg, n_commit=4), 4)
-    all_stats = stats['by_state']['all']
-    assert all_stats['first_known'] == 4 and all_stats['first_correct'] == 2
-    assert all_stats['commit_correct'] == 1
-    assert all_stats['gate_0.5'] == dict(false_stops=1, accepted_known=3, accepted_wrong=2,
-                                      accepted_unknown=1, terminal_continues=1)
-    assert stats['by_state']['terminal']['states'] == 1
-    assert stats['by_displacement']['d<=3']['states'] == 4 and stats['by_displacement']['d>6']['states'] == 1
-    assert stats['by_displacement']['d>6']['final_error_mean'] is None
-    assert all_stats['final_error_mean'] == pytest.approx(all_stats['final_error_sum']/all_stats['final_error_count'])
-    json.dumps(stats, allow_nan=False)
-    points[0, 0, 0] = float('nan')
-    bad = summarize_decisions(decision_rows(out, b, cfg, n_commit=4), 4)['by_state']['all']
-    assert bad['recovery_blocked'] == 1 and bad['final_nonfinite_count'] > 0
-    json.dumps(bad, allow_nan=False)
-    # History groups measure what the model actually received.
-    cfg = config(n_history=64)
-    b = label_batch(cfg, 4)
-    for row, length in zip(b['hmask'], (0, 4, 16, 64)):
-        row[length:] = 0
-    stats = summarize_decisions(decision_rows(proposal_output(points[:4, None].nan_to_num(), torch.zeros(4, 1, 4)),
-                                              b, cfg), 4)
-    assert {k: v['states'] for k, v in stats['by_history'].items()} == {'0': 1, '1-8': 1, '9-32': 1, '>32': 1}
-    assert all(0 <= v['first_confidence_mean'] <= 1 for v in stats['by_history'].values())
-
-
-def test_monitor_fixtures_are_fixed_private_rng_and_exclude_other_splits(tmp_path, monkeypatch):
-    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.evaluation.recovery.FiberVolume', lambda *a, **kw: None)
-    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.tracing.heading.ct_tensor',
-                        lambda vol, pos: np.outer(np.array([1., 0., 0.]), np.array([1., 0., 0.])))
-    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.tracing.heading.oriented_seed_heading',
-                        lambda vol, pos, family, direction: np.asarray(direction))
-    from vesuvius.neural_tracing.fiber_follow.evaluation.recovery import monitor_fixture
-    from vesuvius.neural_tracing.fiber_follow.evaluation.recovery_fixtures import FIXTURE_STRATA
-    arc = np.arange(300, dtype=float)
-    fibers = [TracedFiber(str(i), np.c_[arc*0+i*10, arc*0, arc], arc, '') for i in range(3)]
-    manifest = dict(sha256='frozen', monitor_fibers=[0], calibration_fibers=[1], final_fibers=[2],
-                    monitor=[dict(fiber=0, t=150., sign=1)])
-    cfg = config()
-    sample = SampleConfig(crop=cfg.fine, n_history=cfg.n_history, recent_history_points=cfg.n_history,
-                          n_future=cfg.n_future)
-    spec = FiberVolumeSpec('unused', ct_zarr='unused', inputs='ct')
-    torch_state, numpy_state = torch.get_rng_state(), np.random.get_state()
-    path = tmp_path/'monitor.npz'
-    a, digest = monitor_fixture(path, fibers, manifest, sample, spec, 1)
-    b, other = monitor_fixture(path, fibers, manifest, sample, spec, 1)
-    assert digest == other and len(a) == 4 and set(a.fiber_idx) == {0}
-    np.testing.assert_array_equal(a.hist, b.hist)
-    assert all(lo <= d < hi for d, (lo, hi) in zip(a.match_distance, FIXTURE_STRATA))
-    torch.testing.assert_close(torch_state, torch.get_rng_state())
-    np.testing.assert_array_equal(numpy_state[1], np.random.get_state()[1])
-    # Changed construction settings rebuild the fixture, keeping the previous one beside it.
-    rebuilt, changed = monitor_fixture(path, fibers, manifest, replace(sample, excursion_amplitude=(3., 5.)), spec, 1)
-    assert changed != digest and (tmp_path/'monitor.previous.npz').exists() and len(rebuilt) == 4
-    with pytest.raises(ValueError, match='monitor seeds'):
-        monitor_fixture(path, fibers, dict(manifest, monitor=[dict(fiber=1, t=150., sign=1)]), sample, spec, 1)

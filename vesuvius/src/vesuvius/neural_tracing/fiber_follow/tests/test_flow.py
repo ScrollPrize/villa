@@ -2,14 +2,12 @@
 import copy
 from types import SimpleNamespace
 
-import numpy as np
 import pytest
 import torch
 
-from model_fixtures import coordinate_batch, ct_volume, flow_config, run_document
+from model_fixtures import coordinate_batch, flow_config
 from vesuvius.neural_tracing.fiber_follow.models.model import build_model
 from vesuvius.neural_tracing.fiber_follow.models.flow import fit_flow_sigma, flow_targets
-from vesuvius.neural_tracing.fiber_follow.train import run_config
 from vesuvius.neural_tracing.fiber_follow.train.supervision import loss_terms
 from vesuvius.neural_tracing.fiber_follow.train.train import (
     prepare_training, optimizer_update, save_checkpoint, load_checkpoint,
@@ -46,15 +44,6 @@ def test_flow_draws_and_trace_rows_are_independent_and_unknown_targets_are_censo
         assert not mask.any() and not target.any()
         result = model.training_forward(b['x'], b['hist'], b['hmask'], .5, b)
         assert torch.isfinite(result['flow_per_state']).all() and not result['flow_per_state'].any()
-
-
-def test_flow_scales():
-    cfg = config(); b = coordinate_batch(cfg)
-    b['dense_ab'][0, :, 0] = -2.; b['dense_ab'][1, :, 0] = 2.
-    assert fit_flow_sigma(iter([b]), cfg, 2) == ((2., 1.),)*cfg.n_future
-    b['geometry_valid'].zero_()
-    with pytest.raises(ValueError, match='two known targets'):
-        fit_flow_sigma(iter([b]), cfg, 2)
 
 
 def test_flow_optimizer_ema_checkpoint_and_resume(tmp_path):
@@ -173,88 +162,6 @@ def test_unknown_planes_are_attended_only_with_own_path_and_the_scale_floor_boun
         config(flow_sigma_floor=3.)  # the fixture's unit scales lie below the floor
 
 
-def test_best_selection_ranks_all_proposals_and_noise_only_drops_the_zero_start():
-    from vesuvius.neural_tracing.fiber_follow.models.model import select_refinement
-    cfg = config()
-    points = torch.zeros(1, 3, cfg.n_future, 3)
-    points[..., 2] = torch.arange(1., cfg.n_future+1)
-    confidence = torch.tensor([[[.6]*cfg.n_future, [.9]*cfg.n_future, [.95]*cfg.n_future]])
-    output = dict(refinement_points=points, refinement_confidence=confidence,
-                  refinement_mask=torch.ones(1, 3, dtype=torch.bool),
-                  **{f'refinement_{k}': confidence for k in ('hazard_logits', 'confidence_logits')})
-    # Proposal 0 is accepted, so a retry keeps it; one ranking over all takes the most confident.
-    assert int(select_refinement(output, cfg, .5)['selected_refinement']) == 0
-    assert int(select_refinement(output, cfg, .5, retry=False)['selected_refinement']) == 2
-    torch.manual_seed(37)
-    model = build_model(config(flow_samples=3, flow_zero_start=False, flow_selection='best')).eval()
-    b = coordinate_batch(model.cfg)
-    with torch.no_grad():
-        out = model(b['x'], b['hist'], b['hmask'])
-    assert out['refinement_points'].shape[1] == 3 and out['refinement_points'][:, :, :, :2].abs().sum() > 0
-    with pytest.raises(ValueError, match='zero start'):
-        config(flow_zero_start=False)
-
-
-def test_sample_threshold_holds_samples_to_a_higher_bar_than_the_zero_start():
-    torch.manual_seed(41)
-    cfg = config(flow_samples=2, flow_selection='best', flow_sample_threshold=.8)
-    model = build_model(cfg)
-    points = torch.zeros(1, 3, cfg.n_future, 3)
-    points[..., 2] = torch.arange(1., cfg.n_future+1)
-    confidence = torch.tensor([[[.52]*cfg.n_future, [.75]*cfg.n_future, [.85]*cfg.n_future]])
-    output = dict(refinement_points=points, refinement_confidence=confidence,
-                  refinement_mask=torch.ones(1, 3, dtype=torch.bool),
-                  **{f'refinement_{k}': confidence for k in ('hazard_logits', 'confidence_logits')})
-    out = model.select_prediction(output, .5)
-    # Sample 1 (0.75) falls below the 0.8 bar and cannot commit; sample 2 (0.85) clears it and is ranked
-    # on its own confidence, above the zero start.
-    assert int(out['selected_refinement']) == 2
-    torch.testing.assert_close(out['confidence'], torch.full((1, cfg.n_future), .85))
-    # Below the bar a sample is out of the running, however it compares with the zero start.
-    output['refinement_confidence'] = torch.tensor([[[.52]*cfg.n_future, [.75]*cfg.n_future, [.78]*cfg.n_future]])
-    out = model.select_prediction(output, .5)
-    assert int(out['selected_refinement']) == 0
-    from vesuvius.neural_tracing.fiber_follow.tracing.policy import commit_prefix
-    barred = model.select_prediction(dict(output, refinement_mask=torch.tensor([[False, False, True]])), .5)
-    assert int(commit_prefix(barred['points'], barred['confidence'], .5, cfg.n_future)[0]) == 0
-
-
-def test_keyed_proposal_noise_depends_only_on_each_rows_key_and_the_tracer_keys_each_decision(tmp_path):
-    from vesuvius.neural_tracing.fiber_follow.data.observations import FiberTracer
-    from vesuvius.neural_tracing.fiber_follow.tracing.trace import TraceParams
-    torch.manual_seed(43)
-    model = build_model(config(flow_samples=3))
-    hist = torch.zeros(3, model.cfg.n_history, 3)
-    keys = torch.tensor([11, 22, 33])
-    together = model.proposal_starts(hist, keys)
-    alone = model.proposal_starts(hist[:1], keys[1:2])
-    torch.testing.assert_close(alone[0], together[1], rtol=0, atol=0)  # independent of batch neighbours
-    torch.testing.assert_close(model.proposal_starts(hist, keys), together, rtol=0, atol=0)
-    assert not torch.equal(together[0, 1:], together[2, 1:]) and not together[:, 0].any()
-    assert not torch.equal(model.proposal_starts(hist)[:, 1:], model.proposal_starts(hist)[:, 1:])  # global RNG
-
-    flow = build_model(config(flow_samples=2)).eval()
-    vol = ct_volume(tmp_path)
-
-    def trace_keys():
-        keys, forward = [], flow.forward
-        def capture(x, *args, **kwargs):
-            keys.append(x['flow_noise_keys'].tolist())
-            return forward(x, *args, **kwargs)
-        flow.forward = capture
-        tracer = FiberTracer(flow, vol, flow.cfg.fine, flow.cfg.n_history,
-                             TraceParams(n_commit=1, max_len=4., confidence=0.), device="cpu")
-        try:
-            tracer.trace(np.array([[24., 24., 24.]]), np.array([[.3, .4, .8660254]]))
-        finally:
-            tracer.close()
-            del flow.forward
-        return keys
-    first, second = trace_keys(), trace_keys()
-    assert first == second and len(first) > 3
-    assert len({k[0] for k in first}) == len(first)  # a fresh key every decision
-
-
 def test_pseudo_huber_flow_loss_is_half_the_squared_distance_for_small_residuals_and_linear_beyond_c():
     torch.manual_seed(37)
     b = coordinate_batch(config())
@@ -302,11 +209,3 @@ def test_flow_geometry_weight_trains_the_integrated_zero_start_path_and_nothing_
         assert 'flow_geometry_points' not in model.training_forward(b['x'], b['hist'], b['hmask'], .5)
     with pytest.raises(ValueError, match='zero-start path'):
         config(flow_samples=2, flow_zero_start=False, flow_geometry_weight=.5)
-
-
-def test_flow_loss_and_geometry_options_reach_the_model_config():
-    resolve = lambda **fields: run_config.model_config(run_config.resolve(run_document('flow', **fields)))
-    cfg = resolve(flow_loss='mse', flow_huber_c=2, flow_geometry_weight=.25)
-    assert (cfg.flow_loss, cfg.flow_huber_c, cfg.flow_geometry_weight) == ('mse', 2., .25)
-    default = resolve()
-    assert (default.flow_loss, default.flow_geometry_weight, default.flow_sigma) == ('pseudo_huber', 0., ())

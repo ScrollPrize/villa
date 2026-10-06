@@ -57,44 +57,6 @@ def observation(path):
                 seed_age=float(arclength(path)[-1]), seed_valid=True)
 
 
-def fake_ct(monkeypatch):
-    """Constant-heading CT frames and crops filled with each item's z/512; returns the items read."""
-    calls = []
-    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.tracing.heading.ct_tensor',
-                        lambda vol,pos: np.outer(np.array([0., 1., 0.]), np.array([0., 1., 0.])))
-    def scalar(items, vol, crop, pool=None, *, presence=False, **kwargs):
-        assert not presence
-        calls.extend(items)
-        return torch.stack([torch.full((1,crop.depth,crop.width,crop.width),float(i['pos'][2])/512)
-                            for i in items])
-    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.data.crop_sampling.scalar_crops',scalar)
-    return calls
-
-
-def dataset_document(root='/data'):
-    """A structurally valid dataset configuration (no files are read)."""
-    return dict(version=1, cache_dir=f'{root}/cache', sources=[dict(
-        name='paris4', kind='paris4', weight=1., fibers=f'{root}/fibers', fiber_zarrs=f'{root}/fiber_zarrs',
-        ct=f'{root}/ct.zarr', manifest=f'{root}/seeds.json', negative_bank=f'{root}/bank', val_z=[45000., 48500.],
-        validation=dict(strategy='fiber_hash', fraction=.1, seed=7349))])
-
-
-def run_document(model='regression', *, training=None, runtime=None, **model_fields):
-    document = dict(name='test', dataset=dataset_document(), model=dict(type=model, **model_fields))
-    if training:
-        document['training'] = training
-    if runtime:
-        document['runtime'] = runtime
-    return document
-
-
-def run_args(model='regression', *, training=None, runtime=None, **model_fields):
-    """Trainer settings (``args``) of a resolved run configuration."""
-    from vesuvius.neural_tracing.fiber_follow.train import run_config
-    return run_config.namespace(run_config.resolve(run_document(model, training=training, runtime=runtime,
-                                                                **model_fields)))
-
-
 def raw_batch(cfg, b=2):
     hist = torch.zeros(b, cfg.n_history, 3)
     hist[..., 2] = -torch.arange(1, cfg.n_history+1)
@@ -166,11 +128,3 @@ def ct_volume(root):
     spec = FiberVolumeSpec('', ct_zarr=str(root/'ct'), ct_level=0, ct_grid_scale=4., inputs='ct', load_presence=False)
     norm.prepare_normalization(root/'run', [spec], known=dict(method=norm.ZSCORE_METHOD, volumes={}))
     return FiberVolume(spec, cache_bytes=1 << 20)
-
-
-def follower_config(**kwargs):
-    """A full-size crop/horizon/label contract (the earlier coordinate model's 120 x 104 crop, 48 behind, 16 planes)
-    for data, label and bank tests; no model is built."""
-    options = dict(fine=CropSpec(depth=120, width=104, behind=48, spacing=.5), n_future=16, gate_plane=None)
-    options.update(kwargs)
-    return RegressionConfig(**options)

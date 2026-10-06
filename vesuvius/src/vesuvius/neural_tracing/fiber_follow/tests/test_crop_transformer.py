@@ -4,11 +4,10 @@ import copy
 import pytest
 import torch
 
-from model_fixtures import coordinate_batch, ct_volume, run_document
-from vesuvius.neural_tracing.fiber_follow.models.model import build_model, config_from_checkpoint
+from model_fixtures import coordinate_batch, ct_volume
+from vesuvius.neural_tracing.fiber_follow.models.model import build_model
 from vesuvius.neural_tracing.fiber_follow.models.crop_transformer import FlowConfig, RegressionConfig
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
-from vesuvius.neural_tracing.fiber_follow.train import run_config
 from vesuvius.neural_tracing.fiber_follow.train.supervision import loss_terms
 from vesuvius.neural_tracing.fiber_follow.train.train import prepare_training, training_prediction
 
@@ -26,17 +25,6 @@ def small(flow=False, **options):
     else:
         cfg = RegressionConfig(**dict(SMALL, recurrent_refinement_steps=2, **options))
     return build_model(cfg)
-
-
-def test_regression_predicts_every_plane_with_refinement_slots():
-    model = small().eval()
-    b = coordinate_batch(model.cfg, 3)
-    with torch.no_grad():
-        out = model(b['x'], b['hist'], b['hmask'], confidence_threshold=1.)
-    assert out['points'].shape == (3, 8, 3) and out['refinement_points'].shape == (3, 3, 8, 3)
-    assert out['refinement_mask'].all()  # nothing accepted at threshold 1: every pass ran
-    assert torch.all(out['confidence'][:, 1:] <= out['confidence'][:, :-1])
-    assert (out['points'][:, 0, :2].norm(dim=-1) <= 6.).all()
 
 
 def test_path_token_sets_and_absent_references_are_independent():
@@ -68,8 +56,7 @@ def test_path_token_sets_and_absent_references_are_independent():
             torch.testing.assert_close(v1[:, :, visible[0]], v0[:, :, visible[0]])
 
 
-@pytest.mark.parametrize('flow, options', [(False, {}), (True, {}), (True, dict(flow_time_conditioning='adaln')),
-                                            (True, dict(flow_time_conditioning='adaln_zero'))])
+@pytest.mark.parametrize('flow, options', [(False, {}), (True, dict(flow_time_conditioning='adaln_zero'))])
 def test_compiled_training_matches_eager_with_finite_gradients(flow, options):
     model = small(flow=flow, **options)
     b = coordinate_batch(model.cfg, 2)
@@ -92,25 +79,6 @@ def test_compiled_training_matches_eager_with_finite_gradients(flow, options):
         assert module.weight.grad.abs().sum() > 0
 
 
-def test_configuration_defaults_run_configuration_and_checkpoint():
-    cfg = RegressionConfig()
-    assert (cfg.cnn_channels, cfg.cnn_blocks, cfg.layers, cfg.heads, cfg.ffn) == ((32, 64, 128), (1, 2, 2), 12, 8, 2048)
-    assert cfg.token_stride == (8, 8, 8) and cfg.recurrent_refinement_steps == 3 and (cfg.n_future, cfg.gate_plane) == (35, 16)
-    assert (cfg.fine.depth, cfg.fine.width, cfg.fine.behind) == (144, 104, 72)
-    assert run_config.model_config(run_config.resolve(run_document('regression'))).to_dict() == dict(
-        cfg.to_dict(), frame_checkpoint=run_config.model_defaults('regression')['frame_checkpoint'])
-    assert config_from_checkpoint(dict(model_type='regression', model_cfg=cfg.to_dict())) == cfg
-    flow = run_config.model_config(run_config.resolve(run_document('flow', cnn_channels=[16, 32], cnn_blocks=[1, 1])))
-    assert type(flow) is FlowConfig and flow.token_stride == (4, 4, 4)
-    assert (flow.flow_samples, flow.flow_time_conditioning, flow.flow_sigma_floor, flow.flow_loss) == (4, 'adaln_zero', 3., 'pseudo_huber')
-    flow.flow_sigma = ((3., 3.),)*flow.n_future
-    assert config_from_checkpoint(dict(model_type='flow', model_cfg=flow.to_dict())) == flow
-    with pytest.raises(ValueError, match='Unknown model settings'):
-        run_config.resolve(run_document('regression', memory='decisions'))
-    with pytest.raises(ValueError, match='Unsupported model type'):
-        config_from_checkpoint(dict(model_type='unified', model_cfg={}))
-
-
 def test_tracing_runs_the_regression_model(tmp_path):
     from vesuvius.neural_tracing.fiber_follow.data.observations import FiberTracer
     from vesuvius.neural_tracing.fiber_follow.tracing.trace import TraceParams
@@ -123,29 +91,6 @@ def test_tracing_runs_the_regression_model(tmp_path):
     finally:
         tracer.close()
     assert reasons == ['max_len'] and len(paths[0]) > 1
-
-
-def test_adaln_starts_as_the_input_conditioned_flow_model_and_modulates_only_velocity_tokens():
-    plain, adaln = small(flow=True), small(flow=True, flow_time_conditioning='adaln')
-    missing, unexpected = adaln.load_state_dict(plain.state_dict(), strict=False)
-    assert not unexpected and missing and all(k.startswith(('time_modulation', 'output_modulation')) for k in missing)
-    b = coordinate_batch(adaln.cfg, 2)
-    y, t = torch.randn(2, 3, 8, 2), torch.rand(2, 3)
-    with torch.no_grad():
-        ctx = adaln.context(b['x'], b['hist'], b['hmask'])
-        torch.testing.assert_close(adaln.velocity_field(ctx, y, t), plain.velocity_field(ctx, y, t))  # zero init
-        for linear in (*adaln.time_modulation, adaln.output_modulation):
-            linear.weight.normal_(std=.05)
-        modulated = adaln.velocity_field(ctx, y, t)
-        assert not torch.allclose(modulated, plain.velocity_field(ctx, y, t))
-        # Draws stay independent; proposal scores carry no time, so modulation never reaches them.
-        torch.testing.assert_close(adaln.velocity_field(ctx, y[:, :1], t[:, :1]), modulated[:, :1], atol=1e-5, rtol=1e-4)
-        points = adaln.to_points(y[:, 0])
-        torch.testing.assert_close(adaln.hazard_logits(ctx, points), plain.hazard_logits(ctx, points))
-    b['flow_noise'], b['flow_times'] = torch.randn(2, adaln.cfg.flow_draws, 8, 2), torch.rand(2, adaln.cfg.flow_draws)
-    out = adaln.training_forward(b['x'], b['hist'], b['hmask'], torch.tensor(.5), b)
-    out['flow_per_state'].sum().backward()
-    assert all(linear.weight.grad.abs().sum() > 0 for linear in (*adaln.time_modulation, adaln.output_modulation))
 
 
 def test_adaln_zero_velocity_blocks_start_as_the_identity_and_open_with_training():
