@@ -927,6 +927,19 @@ def _render_values(
     sampler: RawChunkSampler,
     chunks: set[tuple[int, int, int]],
 ) -> np.ndarray:
+    # Standard geometry builders return float64. The fused CPU path also
+    # supports float32 fields while preserving their NumPy scalar arithmetic.
+    if np.dtype(sampler.info.metadata["dtype"]).kind in "iu" and xyz.dtype in (np.dtype("float32"), np.dtype("float64")) and normals.dtype in (
+        np.dtype("float32"), np.dtype("float64")
+    ):
+        try:
+            from ._fast_depth_projection import render_values
+        except ModuleNotFoundError as exc:
+            if exc.name != "numba":
+                raise
+        else:
+            return render_values(xyz, normals, valid, offsets, sampler, chunks)
+
     output = np.zeros(valid.shape, dtype=np.float32)
     selected = valid.ravel()
     if not np.any(selected):
