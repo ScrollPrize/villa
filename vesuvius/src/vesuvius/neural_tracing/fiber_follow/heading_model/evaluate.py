@@ -119,7 +119,8 @@ def main():
     from vesuvius.neural_tracing.fiber_follow.heading_model.model import load_heading_model
     from vesuvius.neural_tracing.fiber_follow.heading_model.train import DEFAULT_CONFIG, read_config
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument('--config', default=str(DEFAULT_CONFIG), help='config JSON (default: configs/heading_model.json)')
+    ap.add_argument('--config', default=str(DEFAULT_CONFIG),
+                    help='config JSON (default: configs/heading_model_l0_w16_centered_frame.json)')
     ap.add_argument('--checkpoint', required=True)
     ap.add_argument('--states', type=int, help='held-out states per source (default: config val_states_per_source)')
     ap.add_argument('--device', default='cpu')
@@ -131,8 +132,7 @@ def main():
     model, checkpoint = load_heading_model(args.checkpoint, args.device)
     # Bind the same CT records the model was trained with; a scratch directory receives the normalization JSON.
     scratch = Path(args.out).parent if args.out else Path(args.checkpoint).parent/'evaluation'
-    _, _, sources, _ = load_sources(config['dataset_config'], scratch, ct_normalization=config.get('ct_normalization'),
-                                    ct_downsample_levels=model.cfg.ct_downsample_levels)
+    _, _, sources, _ = load_sources(config['dataset_config'], scratch, ct_normalization=config.get('ct_normalization'))
     sampling = sampling_from_dict(checkpoint.get('sampling', config.get('sampling')))
     with ThreadPoolExecutor(16) as pool:
         held_out = validation_states(sources, model.cfg, sampling, args.states or config['val_states_per_source'],

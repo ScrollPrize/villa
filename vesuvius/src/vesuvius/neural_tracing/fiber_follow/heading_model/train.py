@@ -1,12 +1,12 @@
-"""Train the crop-heading model on the follower's Paris 4 + AFV sources (see configs/heading_model.json).
+"""Train the crop-heading model on the follower's Paris 4 + AFV sources (see configs/heading_model_l0_w16_centered_frame.json).
 
 Batches are generated online in loader workers from the follower's own sampling code (heading_model.data). The
 run directory holds config.json, ct_normalization.json, log.jsonl, last.pt (resumable), ckpt_STEP.pt and best.pt
 (lowest held-out p90 off-axis distance of the fiber over the follower crop's forward extent).
 
 Usage (from fiber_follow/, or with -m from anywhere):
-  python heading_model/train.py                      # configs/heading_model.json
-  python heading_model/train.py --config configs/heading_model.json --name heading_model_v2
+  python heading_model/train.py                      # configs/heading_model_l0_w16_centered_frame.json
+  python heading_model/train.py --config configs/heading_model_l0_w16_centered_frame.json --name heading_model_frame2
   python -m vesuvius.neural_tracing.fiber_follow.heading_model.train --resume
 """
 import argparse
@@ -25,8 +25,7 @@ from vesuvius.neural_tracing.fiber_follow.heading_model.data import (
 from vesuvius.neural_tracing.fiber_follow.heading_model.evaluate import (
     evaluate_states, format_report, normal_summary_metric, frame_summary_metric, summary_metric)
 from vesuvius.neural_tracing.fiber_follow.heading_model.model import HeadingConfig, HeadingNet, save_heading_model
-from vesuvius.neural_tracing.fiber_follow.heading_model.normals import (
-    NORMAL_TARGET_POLICY_1_4, NORMAL_TARGET_POLICY, normal_loss, normal_target_policy)
+from vesuvius.neural_tracing.fiber_follow.heading_model.normals import normal_loss, normal_target_policy
 from vesuvius.neural_tracing.fiber_follow.heading_model.frames import roll_supervision
 from vesuvius.neural_tracing.fiber_follow.data.remote_prefetch import attach_remote_prefetch
 from vesuvius.neural_tracing.fiber_follow.train.runloop import raise_open_file_limit
@@ -44,7 +43,7 @@ DEFAULTS = dict(name='heading_model', steps=30000, batch=128, workers=8, lr=3e-3
 
 
 PACKAGE = Path(__file__).resolve().parents[1]  # fiber_follow/
-DEFAULT_CONFIG = PACKAGE/'configs'/'heading_model.json'
+DEFAULT_CONFIG = PACKAGE/'configs'/'heading_model_l0_w16_centered_frame.json'
 
 
 def config_path(path):
@@ -125,39 +124,11 @@ def validate(model, held_out, device):
     return reports, summary_metric(reports)
 
 
-def normal_resume_state(checkpoint, loss_weight, policy=NORMAL_TARGET_POLICY):
-    """Allow the explicit 1/4 -> 2/8 upgrade; unrelated policy/loss changes remain errors."""
-    if checkpoint.get('normal_loss_weight') != loss_weight:
-        raise ValueError('Normal loss weight differs from resumed checkpoint')
-    old = checkpoint.get('normal_target_policy')
-    if old == policy:
-        return checkpoint.get('best_normal', float('inf')), None
-    if old != NORMAL_TARGET_POLICY_1_4 or policy != NORMAL_TARGET_POLICY:
-        raise ValueError('Unsupported normal target policy change in resumed checkpoint')
-    return float('inf'), dict(step=int(checkpoint['step']), old=old, new=dict(NORMAL_TARGET_POLICY))
-
-
-def archive_normal_best(run, change):
-    """Keep the former best checkpoint, with a name that identifies its old supervision."""
-    path = run/'best_normal.pt'
-    if not path.exists():
-        return None
-    checkpoint = torch.load(path, map_location='cpu', weights_only=False)
-    if checkpoint.get('normal_target_policy') != change['old']:
-        return None
-    dest = run/f"best_normal_sigma1_4_before_step_{change['step']:06d}.pt"
-    suffix = 1
-    while dest.exists():
-        dest = run/f"best_normal_sigma1_4_before_step_{change['step']:06d}_{suffix}.pt"
-        suffix += 1
-    path.rename(dest)
-    return dest.name
-
-
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--config', default=str(DEFAULT_CONFIG),
-                    help='config JSON (default: configs/heading_model.json); relative to cwd, fiber_follow/ or configs/')
+                    help='config JSON (default: configs/heading_model_l0_w16_centered_frame.json); relative to cwd, '
+                         'fiber_follow/ or configs/')
     ap.add_argument('--name')
     ap.add_argument('--steps', type=int)
     ap.add_argument('--workers', type=int)
@@ -175,11 +146,10 @@ def main(argv=None):
     run.mkdir(parents=True, exist_ok=True)
     torch.manual_seed(config['seed'])
     torch.backends.cudnn.benchmark = True
-    cfg, sampling = HeadingConfig(**config['model']), sampling_from_dict(config['sampling'])
+    cfg, sampling = HeadingConfig.from_dict(config['model']), sampling_from_dict(config['sampling'])
     print('Loading sources', flush=True)
     _, digest, sources, normalization = load_sources(config['dataset_config'], run,
-                                                     ct_normalization=config['ct_normalization'],
-                                                     ct_downsample_levels=cfg.ct_downsample_levels)
+                                                     ct_normalization=config['ct_normalization'])
     for s in sources:
         print(f'  {s.name} ({s.kind}): {len(s.train)} training / {len(s.validation)} held-out fibers, weight {s.weight:g}', flush=True)
     print(f"Building {config['val_states_per_source']} held-out states per source", flush=True)
@@ -189,13 +159,12 @@ def main(argv=None):
     model = HeadingNet(cfg).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=config['lr'], weight_decay=config['weight_decay'])
     step, best, best_normal, best_frame = 0, float('inf'), float('inf'), float('inf')
-    normal_policy_change = None
     if args.resume:
         checkpoint = torch.load(run/'last.pt', map_location='cpu', weights_only=False)
         if checkpoint.get('architecture') != model.architecture:
             raise ValueError(f"{run}/last.pt is a {checkpoint.get('architecture')} run; resume it only with that code, "
                              f'or start a new --name')
-        if HeadingConfig(**checkpoint['config']).to_dict() != cfg.to_dict():
+        if HeadingConfig.from_dict(checkpoint['config']).to_dict() != cfg.to_dict():
             raise ValueError(f'{run}/last.pt was trained with a different model config (inputs); use another --name')
         model.load_state_dict(checkpoint['state'])
         opt.load_state_dict(checkpoint['optimizer'])
@@ -204,7 +173,7 @@ def main(argv=None):
         init = torch.load(config['init_checkpoint'], map_location='cpu', weights_only=False)
         if init.get('architecture') != model.architecture:
             raise ValueError(f"{config['init_checkpoint']} is a {init.get('architecture')} checkpoint, not {model.architecture}")
-        if HeadingConfig(**init['config']).to_dict() != cfg.to_dict():
+        if HeadingConfig.from_dict(init['config']).to_dict() != cfg.to_dict():
             raise ValueError(f"{config['init_checkpoint']} has a different model config than this run")
         model.load_state_dict(init['state'])
         source_step = init.get('step', init.get('initialized_from', {}).get('step'))
@@ -217,12 +186,11 @@ def main(argv=None):
         provenance.update(normal_target_policy=normal_target_policy(cfg), normal_loss_weight=config['normal_loss_weight'])
         history = list(checkpoint.get('normal_target_history', [])) if args.resume else []
         if args.resume:
-            best_normal, normal_policy_change = normal_resume_state(checkpoint, config['normal_loss_weight'],
-                                                                     provenance['normal_target_policy'])
-            if normal_policy_change is not None:
-                history.append(normal_policy_change)
-                print('Resuming with normal sigmas 2/8 (previously 1/4): rebuilt labels; '
-                      'keeping weights, optimizer and step; resetting normal-best score', flush=True)
+            if checkpoint.get('normal_loss_weight') != config['normal_loss_weight']:
+                raise ValueError('Normal loss weight differs from resumed checkpoint')
+            if checkpoint.get('normal_target_policy') != provenance['normal_target_policy']:
+                raise ValueError('Normal target policy differs from resumed checkpoint')
+            best_normal = checkpoint.get('best_normal', best_normal)
         provenance['normal_target_history'] = history
     if cfg.predict_frames:
         provenance.update(roll_loss_weight=config['roll_loss_weight'], family_encoding=dict(H=0, V=1))
@@ -246,14 +214,14 @@ def main(argv=None):
                                          prefetch_factor=4 if workers else None)
     try:
         train(config, run, model, opt, step, best, loader, held_out, provenance, device,
-              best_normal=best_normal, normal_policy_change=normal_policy_change, best_frame=best_frame)
+              best_normal=best_normal, best_frame=best_frame)
     finally:
         if prefetcher is not None:
             prefetcher.close()
 
 
 def train(config, run, model, opt, step, best, loader, held_out, provenance, device, *,
-          best_normal=float('inf'), normal_policy_change=None, best_frame=float('inf')):
+          best_normal=float('inf'), best_frame=float('inf')):
     batches = iter(loader)
     normal_interval = []
     roll_interval = []
@@ -262,11 +230,6 @@ def train(config, run, model, opt, step, best, loader, held_out, provenance, dev
     reports = {}
     bar = tqdm(total=config['steps'], initial=step, desc=config['name'], unit='step', dynamic_ncols=True, smoothing=.05)
     with open(run/'log.jsonl', 'a') as log:
-        if normal_policy_change is not None and step < config['steps']:
-            archive = archive_normal_best(run, normal_policy_change)
-            log.write(json.dumps(dict(event='normal_target_policy_change', **normal_policy_change,
-                                      archived_best_normal=archive))+'\n')
-            log.flush()
         while step < config['steps']:
             began = time.monotonic()
             batch = next(batches)

@@ -24,7 +24,6 @@
     "width": 16,
     "window": 32,
     "forward": 35.5,
-    "ct_downsample_levels": 0,
     "patch": {
       "depth": 32,
       "width": 32,

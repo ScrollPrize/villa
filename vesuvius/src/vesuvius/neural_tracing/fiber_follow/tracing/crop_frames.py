@@ -33,8 +33,8 @@ def _load_predictor(path, digest):
     if digest and hashlib.sha256(Path(path).read_bytes()).hexdigest() != digest:
         print(f'Warning: frame checkpoint {path} differs from the one recorded in the follower configuration', flush=True)
     predictor = HeadingPredictor.load(path, 'cpu')
-    if not predictor.model.cfg.predict_frames or predictor.model.cfg.ct_downsample_levels:
-        raise ValueError('Crop generation requires a level-0 H/V heading-and-normal model')
+    if not predictor.model.cfg.predict_frames:
+        raise ValueError('Crop generation requires an H/V heading-and-normal model')
     predictor.model.requires_grad_(False)
     return predictor
 

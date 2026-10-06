@@ -16,7 +16,7 @@ import numpy as np
 import torch
 
 from vesuvius.neural_tracing.fiber_follow.heading_model.model import (
-    HeadingConfig, ct_shift, model_inputs, patch_volume_spec, prior_frames)
+    HeadingConfig, model_inputs, prior_frames)
 from vesuvius.neural_tracing.fiber_follow.heading_model.targets import in_crop_heading
 from vesuvius.neural_tracing.fiber_follow.heading_model.frames import family_ids, smoothed_tangent, fiber_corrected_normal
 from vesuvius.neural_tracing.fiber_follow.data.datasets import WeightedDatasets, load_primary_dataset, open_afv_source, primary_source_spec, read_dataset_config
@@ -57,12 +57,11 @@ class Source:
     validation: object
 
 
-def load_sources(dataset_config, out, *, ct_normalization=None, ct_downsample_levels=0):
+def load_sources(dataset_config, out, *, ct_normalization=None):
     """Paris 4 and AFV sources from a follower dataset config, CT normalization bound to each volume.
 
-    Each source's ``spec`` is the CT the heading patches read: the follower's volume, or ``ct_downsample_levels``
-    coarser pyramid levels of it (``model.patch_volume_spec``). ``ct_normalization`` (a follower run's
-    ct_normalization.json) reuses that run's exact records; a coarser level gets its own per-crop z-score record.
+    Each source's ``spec`` is the follower's CT volume. ``ct_normalization`` (a follower run's ct_normalization.json)
+    reuses that run's exact records.
     """
     from vesuvius.neural_tracing.fiber_follow.data.ct_normalization import prepare_normalization
     document, digest = read_dataset_config(dataset_config)
@@ -75,7 +74,7 @@ def load_sources(dataset_config, out, *, ct_normalization=None, ct_downsample_le
         else:
             train, validation, spec, _ = open_afv_source(entry, document['cache_dir'])
         sources.append(Source(entry['name'], entry['kind'], float(entry.get('weight', 1.)),
-                              patch_volume_spec(spec, ct_downsample_levels), train, validation))
+                              spec, train, validation))
     Path(out).mkdir(parents=True, exist_ok=True)
     normalization = prepare_normalization(out, [s.spec for s in sources], known=known)
     return document, digest, sources, normalization
@@ -172,7 +171,7 @@ class HeadingBatchBuilder:
     def prefetch_bounds(self, item, vol):
         from vesuvius.neural_tracing.fiber_follow.heading_model.normals import training_crop
         crop = training_crop(self.cfg, vol)[0] if self.cfg.predict_normals else self.cfg.patch
-        yield tight_block(np.asarray(item['pos'])-ct_shift(self.cfg, vol), item['frame'], crop, vol.input_scale)
+        yield tight_block(np.asarray(item['pos']), item['frame'], crop, vol.input_scale)
 
     def __call__(self, items, vol):
         patch, path, target = finish_states(items, vol, self.cfg)

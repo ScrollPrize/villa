@@ -11,9 +11,8 @@ The encoder halves the patch four times with stride-2 convolutions whose kernels
 covers inputs 2o-1..2o+2, so every grid stays centered on the patch, each input feeds exactly two outputs per axis,
 and the final 2x2x2 cells are mirror-image octants. v1 used 3-wide kernels, which centered outputs on even inputs:
 on each axis the low final cell sat on the patch edge and the high one saw nearly the whole patch.
-(scripts/convert_heading_v1.py converts a v1 checkpoint exactly: a 3-wide kernel is a 4-wide one with a zero tap.)
 """
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field
 
 import numpy as np
 import torch
@@ -21,6 +20,7 @@ from torch import nn
 
 from vesuvius.neural_tracing.fiber_follow.data.crop_sampling import scalar_crops
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, arclength, frame_from_heading, interp_at
+from vesuvius.neural_tracing.fiber_follow.shared.retired import retire
 
 ARCHITECTURE = 'crop_heading_ct_path_v2'
 NORMAL_ARCHITECTURE = 'crop_heading_normal_ct_path_v3'
@@ -42,18 +42,19 @@ class HeadingConfig:
     patch: CropSpec = field(default_factory=lambda: CropSpec(depth=32, width=32, behind=4, spacing=1.25))
     window: int = 32  # observed-path voxels behind the head
     forward: float = field(default_factory=main_crop_forward)  # target span ahead of the head
-    # CT pyramid levels above the follower's CT level for the patch (each a 2x block mean); 0 reads the follower's CT.
-    ct_downsample_levels: int = 0
     predict_normals: bool = False
     predict_frames: bool = False
+
+    @classmethod
+    def from_dict(cls, values):
+        """A recorded configuration; patches are no longer read from coarser CT levels (ct_downsample_levels 0)."""
+        return cls(**retire(values, dict(ct_downsample_levels=0), 'heading model'))
 
     def __post_init__(self):
         if isinstance(self.patch, dict):
             self.patch = CropSpec(**self.patch)
         if self.width < 1 or self.window < 1 or not self.forward > 0:
             raise ValueError('Heading model width, window and forward span must be positive')
-        if not (isinstance(self.ct_downsample_levels, int) and self.ct_downsample_levels >= 0):
-            raise ValueError('ct_downsample_levels must be a nonnegative integer')
         if self.predict_frames and not self.predict_normals:
             raise ValueError('Frame prediction requires predict_normals')
 
@@ -134,42 +135,9 @@ def path_features(path, pos, frame, window):
     return out.ravel()
 
 
-def patch_volume_spec(spec, levels):
-    """The follower's volume spec at ``levels`` coarser CT pyramid levels, for the heading patch.
-
-    Each pyramid level is a 2x block mean, so its voxels are 2x larger in trace units. Per-crop z-score is the
-    only normalization that carries over; a bound record is rebound to the coarser array.
-    """
-    if not levels:
-        return spec
-    from vesuvius.neural_tracing.fiber_follow.data.ct_normalization import ZSCORE_EPSILON, ZSCORE_METHOD, volume_key
-    record = spec.ct_normalization
-    if record is not None and record.get('method') != ZSCORE_METHOD:
-        raise ValueError('Downsampled heading patches need per-crop z-score CT normalization')
-    coarse = replace(spec, ct_level=spec.ct_level+levels, ct_grid_scale=spec.ct_grid_scale*2**levels,
-                     ct_normalization=None)
-    if record is not None:
-        coarse.ct_normalization = dict(method=ZSCORE_METHOD, volume=volume_key(coarse), epsilon=ZSCORE_EPSILON)
-    return coarse
-
-
-def ct_shift(cfg, vol):
-    """Trace-voxel offset of the patch volume's grid from the follower's CT grid.
-
-    A coarser voxel j averages follower voxels [f*j, f*j+f) (f = 2**levels), so its center lies (f-1)/2 follower
-    voxels past f*j. Sampling at position - shift puts the patch exactly where the follower's CT would.
-    """
-    f = 2**cfg.ct_downsample_levels
-    return (f-1)/(2*f*vol.input_scale)
-
-
 def model_inputs(vol, cfg, positions, frames, paths, pool=None, *, normal_targets=False):
-    """CT patches (tracer sampler and normalization) and path features for each head.
-
-    ``vol`` is the patch volume: the follower's, or its ``patch_volume_spec`` level for a downsampled patch.
-    """
-    shift = ct_shift(cfg, vol)
-    items = [dict(pos=np.asarray(p, np.float64)-shift, frame=np.asarray(f, np.float64)) for p, f in zip(positions, frames)]
+    """CT patches (tracer sampler and normalization) and path features for each head."""
+    items = [dict(pos=np.asarray(p, np.float64), frame=np.asarray(f, np.float64)) for p, f in zip(positions, frames)]
     if normal_targets:
         from vesuvius.neural_tracing.fiber_follow.heading_model.normals import sample_training_crops
         patch, normals, weights = sample_training_crops(items, vol, cfg, pool)
@@ -185,11 +153,9 @@ def save_heading_model(path, model, **extra):
 
 def load_heading_model(path, device='cpu'):
     checkpoint = torch.load(path, map_location='cpu', weights_only=False)
-    if checkpoint.get('architecture') == 'crop_heading_ct_path_v1':
-        raise ValueError(f'{path} uses the v1 (off-center) encoder; convert it with scripts/convert_heading_v1.py')
     if checkpoint.get('architecture') not in (ARCHITECTURE, NORMAL_ARCHITECTURE, FRAME_ARCHITECTURE):
         raise ValueError(f'Not a {ARCHITECTURE} checkpoint: {path}')
-    model = HeadingNet(HeadingConfig(**checkpoint['config']))
+    model = HeadingNet(HeadingConfig.from_dict(checkpoint['config']))
     if model.architecture != checkpoint['architecture']:
         raise ValueError('Heading architecture and config disagree')
     model.load_state_dict(checkpoint['state'])
@@ -200,22 +166,10 @@ class HeadingPredictor:
     """Crop headings for tracer heads from (position, prior heading, observed path)."""
     def __init__(self, model, device='cpu'):
         self.model, self.device = model.to(device).eval(), torch.device(device)
-        self._volumes = {}
 
     @classmethod
     def load(cls, path, device='cpu'):
         return cls(load_heading_model(path, device)[0], device)
-
-    def patch_volume(self, vol):
-        """The tracer's volume, or its coarser CT pyramid level for a downsampled-patch model (opened once)."""
-        levels = self.model.cfg.ct_downsample_levels
-        if not levels:
-            return vol
-        key = (vol.spec.ct_zarr, vol.spec.ct_level, vol.spec.cache_dir)
-        if key not in self._volumes:
-            from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolume
-            self._volumes[key] = FiberVolume(patch_volume_spec(vol.spec, levels), cache_bytes=256 << 20)
-        return self._volumes[key]
 
     @torch.no_grad()
     def predict_with_normals(self, vol, positions, priors, paths, pool=None, *, families=None):
@@ -225,7 +179,7 @@ class HeadingPredictor:
         if not len(positions):
             return [], []
         frames = prior_frames(priors)
-        patch, path = model_inputs(self.patch_volume(vol), self.model.cfg, positions, frames, paths, pool)
+        patch, path = model_inputs(vol, self.model.cfg, positions, frames, paths, pool)
         out = self.model.forward_outputs(patch.to(self.device), path.to(self.device), self._families(families))
         heads, normals = (out[k].double().cpu().numpy() for k in ('heading', 'normal'))
         heads = [f @ h for f, h in zip(frames, heads)]
