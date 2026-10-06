@@ -260,7 +260,7 @@ def test_learned_logit_scale_starts_at_the_standard_scale_sharpens_attention_and
     prepare_training(old, backend='eager')
     optimizer_update(old, old_ema, old_opt, [b], 1, .001, compute_metrics=False)
     sample = SampleConfig(crop=old_cfg.fine, n_history=old_cfg.n_history, n_future=old_cfg.n_future)
-    save_checkpoint(tmp_path/'old.pt', old, old_ema, FiberVolumeSpec('unused', inputs='ct'), sample,
+    save_checkpoint(tmp_path/'old.pt', old, old_ema, FiberVolumeSpec('unused'), sample,
                     dict(step=1, optimizer=old_opt.state_dict(), rng=training_rng_state()))
     ck = torch.load(tmp_path/'old.pt', weights_only=False)
     ck['model_cfg']['qk_logit_scale'] = True
