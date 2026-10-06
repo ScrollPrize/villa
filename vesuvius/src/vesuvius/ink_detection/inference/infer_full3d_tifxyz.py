@@ -24,6 +24,7 @@ import vesuvius.tifxyz as tifxyz
 
 from vesuvius.ink_detection.data.geometry import (
     SURFACE_MASK_MAX_DISTANCE_LEVEL0_VOXELS,
+    StoredResolutionIndex,
     native_tifxyz_pyramid_params,
     native_volume_downsample_factor,
     project_surface_distance,
@@ -867,6 +868,7 @@ class NativePatchDataset(Dataset):
         self._tifxyz = None
         self._coarse_positions = None
         self._coarse_valid = None
+        self._coarse_index = None
 
     def __len__(self) -> int:
         return len(self.patches)
@@ -877,6 +879,7 @@ class NativePatchDataset(Dataset):
         state["_tifxyz"] = None
         state["_coarse_positions"] = None
         state["_coarse_valid"] = None
+        state["_coarse_index"] = None
         return state
 
     def _ensure_volume(self):
@@ -911,6 +914,14 @@ class NativePatchDataset(Dataset):
             self._coarse_valid = valid
         return self._coarse_positions, self._coarse_valid
 
+    def _ensure_coarse_index(self):
+        if self._coarse_index is None:
+            positions, valid = self._ensure_coarse_positions()
+            self._coarse_index = StoredResolutionIndex(
+                positions, valid, native_coordinate_scale=self.native_coordinate_scale
+            )
+        return self._coarse_index
+
     def _surface_mask(self, bbox_zyx) -> np.ndarray:
         coarse_positions, coarse_valid = self._ensure_coarse_positions()
         selection = select_flat_pixels_via_stored_resolution(
@@ -922,6 +933,7 @@ class NativePatchDataset(Dataset):
             native_coordinate_scale=self.native_coordinate_scale,
             flat_grid_stride=self.flat_grid_stride,
             required=False,
+            coarse_index=self._ensure_coarse_index(),
         )
         if selection is None:
             return np.zeros(self.patch_size_zyx, dtype=np.float32)
