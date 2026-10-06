@@ -23,7 +23,7 @@ from vesuvius.neural_tracing.tracers.fibers.train.online import OnlineCollector
 from vesuvius.neural_tracing.tracers.shared.policy import (DEFAULT_CONFIDENCE, DEFAULT_GATE, gate_horizon,
     OperatingPolicy, selection_window)
 from vesuvius.neural_tracing.tracers.fibers.train.runloop import RunLog, lr_at, prepare_run_dir, read_checkpoint, save_checkpoint as write_checkpoint, update_ema, training_rng_state, resume_training, raise_open_file_limit
-from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import FiberVolume, FiberVolumeSpec
+from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume, CTVolumeSpec
 from vesuvius.neural_tracing.tracers.models.model import build_model, config_from_checkpoint
 from vesuvius.neural_tracing.tracers.fibers.data.observations import IdentityObservationBuilder, IdentitySampling, FiberTracer, LOCATION_SOURCES
 from vesuvius.neural_tracing.tracers.fibers.train import run_config
@@ -216,7 +216,7 @@ def load_checkpoint(path,device='cuda'):
     model = build_model(cfg).to(device,memory_format=conv_memory_format(device))
     model.load_state_dict(ck['ema'])
     model.eval()
-    return model,cfg.fine,cfg.n_history,FiberVolumeSpec.from_dict(ck['vol_spec']),ck
+    return model,cfg.fine,cfg.n_history,CTVolumeSpec.from_dict(ck['vol_spec']),ck
 
 
 def move_batch(batch, device):
@@ -726,7 +726,7 @@ def main(argv=None):
         live_continuation_steps=args.live_continuation_steps,
         frame_policy=configured_frame_policy(cfg), sampling=asdict(identity_sampling)))
     tracer = None
-    recovery_vol = FiberVolume(spec) if recovery_states is not None else None
+    recovery_vol = CTVolume(spec) if recovery_states is not None else None
     started = time.monotonic()
     interval_started, interval_step = started, done
     interval_data_seconds = interval_update_seconds = 0.
@@ -749,7 +749,7 @@ def main(argv=None):
                 timeout=args.remote_prefetch_timeout,sources=len(remote_sources)))
         if args.diag_every:
             from vesuvius.neural_tracing.tracers.fibers.tracing.trace import TraceParams
-            tracer = FiberTracer(ema, FiberVolume(spec), cfg.fine, cfg.n_history,
+            tracer = FiberTracer(ema, CTVolume(spec), cfg.fine, cfg.n_history,
                 TraceParams.from_policy(policy, max_len=args.diag_max_len), device=args.device)
         progress(f'Starting data loader; batch {args.batch} × grad steps {args.grad_steps} = '
                  f'{args.batch * args.grad_steps} decisions per update; starting update {done+1}')
@@ -863,7 +863,7 @@ def main(argv=None):
                 for source, source_dataset in zip(dataset_document['sources'],dataset.datasets):
                     if source['kind'] != 'afv':
                         continue
-                    source_tracer = FiberTracer(ema,FiberVolume(source_dataset.vol_spec),cfg.fine,cfg.n_history,
+                    source_tracer = FiberTracer(ema,CTVolume(source_dataset.vol_spec),cfg.fine,cfg.n_history,
                         TraceParams.from_policy(policy,max_len=args.diag_max_len),device=args.device)
                     try:
                         rows,_ = evaluate(source_tracer,source_dataset.validation_fibers,

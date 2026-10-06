@@ -28,7 +28,7 @@ from vesuvius.neural_tracing.tracers.shared.policy import checkpoint_policy
 from vesuvius.neural_tracing.tracers.shared.reference import SEED_FIELDS
 from vesuvius.neural_tracing.tracers.fibers.data.state_labels import DEPARTURE_DISTANCE, DEPARTURE_PATIENCE, REASON, RECOVERABLE, REPLAY_CLASSES, SUPERVISION, TERMINAL, TraceLabeler, replay_class
 from vesuvius.neural_tracing.tracers.fibers.tracing.trace import ModelTracer, TraceParams
-from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import FiberVolume
+from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume
 
 
 class DecisionCollector:
@@ -344,7 +344,7 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer, bank_loader=
         fibers = load_fibers(args.fibers, grid_scale=spec.grid_scale)
         band = ZBand(args.val_z[0]/spec.grid_scale, args.val_z[1]/spec.grid_scale)
         train_f, _ = split_fibers(fibers, band)
-    vol = FiberVolume(spec, cache_bytes=2 << 30)
+    vol = CTVolume(spec, cache_bytes=2 << 30)
     bank_detector = bank_loader(args, ck, train_f, band, spec) if bank_loader is not None else None
     rng = np.random.default_rng(args.seed)
     cursor = CoverageCursor.load(train_f, args.coverage_state, args.seed, args.length_power)

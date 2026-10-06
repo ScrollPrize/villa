@@ -14,7 +14,7 @@ def switch_detector(args, checkpoint, fibers, band, spec):
 
 
 def load_dataset(args, checkpoint):
-    from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import FiberVolumeSpec
+    from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolumeSpec
     document = checkpoint.get('dataset_config')
     if not document:
         raise ValueError('Checkpoint has no mixed dataset configuration')
@@ -23,7 +23,7 @@ def load_dataset(args, checkpoint):
         raise ValueError('Unknown dataset source')
     if source['kind'] == 'paris4':
         from vesuvius.neural_tracing.tracers.fibers.data.datasets import load_primary_dataset
-        spec = FiberVolumeSpec.from_dict(checkpoint['vol_spec'])
+        spec = CTVolumeSpec.from_dict(checkpoint['vol_spec'])
         _,fibers,_,_ = load_primary_dataset(document,spec)
         return spec,fibers,None
     from vesuvius.neural_tracing.tracers.fibers.data.datasets import open_afv_source

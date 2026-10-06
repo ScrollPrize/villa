@@ -24,7 +24,7 @@ from vesuvius.neural_tracing.tracers.fibers.data.data import FollowDataset, Samp
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.crops import tight_block
 from vesuvius.neural_tracing.tracers.shared.geometry import arclength, interp_at, normalize
 from vesuvius.neural_tracing.tracers.fibers.tracing.heading import linear12_heading
-from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import FiberVolume
+from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume
 
 HISTORY_BINS = (('seed', 0., 1e-9), ('1-11', 1e-9, 12.), ('12-31', 12., 32.), ('32+', 32., float('inf')))
 
@@ -220,7 +220,7 @@ def validation_states(sources, cfg, sampling, n, seed, pool=None):
     out = {}
     for k, source in enumerate(sources):
         rng = np.random.default_rng(np.random.SeedSequence([seed, 7349, k]))
-        vol = FiberVolume(source.spec)
+        vol = CTVolume(source.spec)
         out[source.name] = build_states(source.validation, fiber_weights(source.validation, cfg.forward+8), vol, n,
                                         rng, cfg, sampling, pool=pool)
     return out

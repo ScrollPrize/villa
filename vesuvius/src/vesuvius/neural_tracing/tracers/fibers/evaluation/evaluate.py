@@ -8,7 +8,7 @@ so its held-out identity coverage is reported as absent.
 from pathlib import Path
 
 from vesuvius.neural_tracing.tracers.fibers.evaluation.evaluation import main as protocol
-from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import FiberVolume
+from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume
 from vesuvius.neural_tracing.tracers.fibers.data.observations import FiberTracer
 from vesuvius.neural_tracing.tracers.fibers.train.train import load_checkpoint
 
@@ -37,7 +37,7 @@ def dataset_sources(args, config=DATASET_CONFIG):
             manifest = validation_manifest(validation, spec, source['validation']['seed'])
             detector = BankSwitchDetector([AFVBank(validation)])
         sources.append(dict(name=source['name'], fibers=validation, manifest=manifest, detector=detector,
-                            volume=FiberVolume(spec)))
+                            volume=CTVolume(spec)))
     return sources
 
 

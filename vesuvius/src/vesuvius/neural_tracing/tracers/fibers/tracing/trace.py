@@ -13,7 +13,7 @@ import torch
 from vesuvius.neural_tracing.tracers.shared.geometry import CropSpec, normalize
 from vesuvius.neural_tracing.tracers.shared.policy import (DEFAULT_CONFIDENCE, DEFAULT_GATE, DEFAULT_N_COMMIT, GATES, gate_horizon,
     commit_count, selection_window)
-from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import FiberVolume
+from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume
 from vesuvius.neural_tracing.tracers.shared.reference import SEED_FIELDS, observed_path
 from vesuvius.neural_tracing.tracers.fibers.tracing.heading import trace_heading, TRACE_HEADING_POLICY, FRAME_POLICY, FRAME_POLICIES, ct_frame, fiber_family
 from vesuvius.neural_tracing.tracers.fibers.tracing.crop_frames import frame_predictor, configured_frame_policy, predict_frames
@@ -125,7 +125,7 @@ class ModelTracer:
     # When set, build_inputs also receives each trace's seed segment and length.
     path_context = False
 
-    def __init__(self, model: FollowNet, vol: FiberVolume, crop: CropSpec, n_history: int = 128,
+    def __init__(self, model: FollowNet, vol: CTVolume, crop: CropSpec, n_history: int = 128,
                  params: TraceParams | None = None, device: str = "cuda"):
         self.model, self.vol, self.crop = model, vol, crop
         self.n_history, self.p, self.device = n_history, params or TraceParams(), str(device)

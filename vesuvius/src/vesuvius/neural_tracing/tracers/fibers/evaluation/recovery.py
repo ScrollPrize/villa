@@ -6,7 +6,7 @@ from pathlib import Path
 
 from vesuvius.neural_tracing.tracers.fibers.data.data import OnPolicyStates
 from vesuvius.neural_tracing.tracers.fibers.tracing.heading import FRAME_POLICY
-from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import FiberVolume
+from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume
 from vesuvius.neural_tracing.tracers.fibers.evaluation.recovery_fixtures import FIXTURE_STRATA, make_recovery_states, evaluate_recovery_states, recovery_counts
 from vesuvius.neural_tracing.tracers.fibers.data.observations import observation_builder, FiberTracer
 from vesuvius.neural_tracing.tracers.fibers.evaluation.diagnostics import decision_rows, summarize_decisions
@@ -46,7 +46,7 @@ def monitor_fixture(path, fibers, manifest, sample, spec, seed_count=8):
             path.replace(previous)
             return monitor_fixture(path, fibers, manifest, sample, spec, seed_count)
     else:
-        states = make_recovery_states(fibers, seeds, sample, provenance, FiberVolume(spec, cache_bytes=256 << 20))
+        states = make_recovery_states(fibers, seeds, sample, provenance, CTVolume(spec, cache_bytes=256 << 20))
         states.save(path)
         # Use the memory-mapped representation on the first run and after resume alike.
         states = OnPolicyStates.load(path)

@@ -115,9 +115,9 @@ def batch(cfg, b=2):
 def ct_volume(root):
     """A 96^3 synthetic CT volume (x+2y+z) with its z-score normalization record under ``root``."""
     from vesuvius.neural_tracing.tracers.shared.crop_sampling import normalization as norm
-    from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import FiberVolume, FiberVolumeSpec
+    from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume, CTVolumeSpec
     z, y, x = np.indices((96, 96, 96))
     array_at(root/'ct'/'0', (x+2*y+z).clip(0, 255))
-    spec = FiberVolumeSpec(str(root/'ct'), ct_level=0, ct_grid_scale=4.)
+    spec = CTVolumeSpec(str(root/'ct'), ct_level=0, ct_grid_scale=4.)
     norm.prepare_normalization(root/'run', [spec], known=dict(method=norm.ZSCORE_METHOD, volumes={}))
-    return FiberVolume(spec, cache_bytes=1 << 20)
+    return CTVolume(spec, cache_bytes=1 << 20)

@@ -9,7 +9,7 @@ import torch
 from vesuvius.neural_tracing.tracers.fibers.data.afv import AFVFibers, file_sha256
 from vesuvius.neural_tracing.tracers.fibers.data.data import FollowDataset, fiber_manifest, load_fibers
 from vesuvius.neural_tracing.tracers.shared.paths import moved_path
-from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import FiberVolumeSpec
+from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolumeSpec
 from vesuvius.neural_tracing.tracers.fibers.data.observations import IdentityObservationBuilder
 from vesuvius.neural_tracing.tracers.fibers.data.afv_neighbors import AFVBank
 
@@ -18,14 +18,14 @@ PRIMARY_OPTIONS = ('fibers', 'ct', 'manifest', 'val_z')
 
 
 def ct_source_spec(source, cache_dir):
-    return FiberVolumeSpec(source['ct'], ct_level=int(source.get('ct_level', 0)),
+    return CTVolumeSpec(source['ct'], ct_level=int(source.get('ct_level', 0)),
         ct_grid_scale=float(source.get('ct_grid_scale', 1.)), grid_scale=float(source['grid_scale']), cache_dir=cache_dir)
 
 
 def primary_source_spec(document):
     """The Paris 4 CT volume spec the trainer builds from a dataset config."""
     source = next(s for s in document['sources'] if s['kind'] == 'paris4')
-    return FiberVolumeSpec(source['ct'], ct_level=source.get('ct_level', 0), ct_grid_scale=source.get('ct_grid_scale', 4.),
+    return CTVolumeSpec(source['ct'], ct_level=source.get('ct_level', 0), ct_grid_scale=source.get('ct_grid_scale', 4.),
         grid_scale=source.get('grid_scale', 8.), cache_dir=document['cache_dir'])
 
 
@@ -80,8 +80,8 @@ def validation_manifest(fibers, spec, seed=0, monitor_count=32):
     from vesuvius.neural_tracing.tracers.fibers.evaluation.seeds import make_seeds
     from vesuvius.neural_tracing.tracers.shared.io import jsonable
     from vesuvius.neural_tracing.tracers.fibers.tracing.heading import SEED_HEADING_POLICY, TRACE_HEADING_POLICY, FRAME_POLICY
-    from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import FiberVolume
-    seed_volume = FiberVolume(spec, cache_bytes=256 << 20)
+    from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume
+    seed_volume = CTVolume(spec, cache_bytes=256 << 20)
     rng = np.random.default_rng(seed)
     ids = rng.permutation(len(fibers)).tolist()
     n = min(monitor_count, max(1,len(ids)//3))

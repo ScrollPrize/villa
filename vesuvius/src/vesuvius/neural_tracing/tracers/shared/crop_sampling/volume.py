@@ -308,7 +308,7 @@ RETIRED_SPEC_FIELDS = dict(fiber_zarr_dir=ANY, fiber_level=ANY, inputs='ct', loa
 
 
 @dataclass
-class FiberVolumeSpec:
+class CTVolumeSpec:
     ct_zarr: str
     ct_level: int = 1
     ct_grid_scale: float = 8.0  # base voxels per selected CT voxel; s1_ds2 level 0 = 4
@@ -329,14 +329,14 @@ class FiberVolumeSpec:
         return result
 
 
-class FiberVolume:
+class CTVolume:
     """The model-image (CT) reader.
 
     CT is read at its native resolution. External positions and ``shape``
     remain in trace units.
     """
 
-    def __init__(self, spec: FiberVolumeSpec, cache_bytes: int = 3 << 30, *, cache_only=False) -> None:
+    def __init__(self, spec: CTVolumeSpec, cache_bytes: int = 3 << 30, *, cache_only=False) -> None:
         self.spec = spec
         self._cache_bytes = int(cache_bytes)
         if min(spec.grid_scale, spec.ct_grid_scale) <= 0:

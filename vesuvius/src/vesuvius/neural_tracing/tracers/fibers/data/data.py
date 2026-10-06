@@ -27,7 +27,7 @@ from vesuvius.neural_tracing.tracers.shared.geometry import (
     traversal_curve,
 )
 from vesuvius.neural_tracing.tracers.fibers.data.annotation_repair import foldbacks, repair_kinks
-from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import FiberVolume
+from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume
 from vesuvius.neural_tracing.tracers.shared.reference import SEED_FIELDS
 
 
@@ -1078,9 +1078,9 @@ class FollowDataset(torch.utils.data.IterableDataset):
         torch.set_num_threads(1)
         if self.remote_prefetch is not None:
             self.remote_prefetch.ensure_metadata(self.vol_spec)
-            vol = FiberVolume(self.vol_spec,cache_bytes=self.cache_bytes,cache_only=True)
+            vol = CTVolume(self.vol_spec,cache_bytes=self.cache_bytes,cache_only=True)
         else:
-            vol = FiberVolume(self.vol_spec,cache_bytes=self.cache_bytes)
+            vol = CTVolume(self.vol_spec,cache_bytes=self.cache_bytes)
         grid = torch.from_numpy(crop_local_grid(self.cfg.crop)).float()
         lookahead = self.remote_prefetch_lookahead if self.remote_prefetch is not None else 0
         if lookahead < 0:

@@ -13,7 +13,7 @@ from vesuvius.neural_tracing.tracers.fibers.train import train
 from vesuvius.neural_tracing.tracers.fibers.train.train import clip_training_gradients, initialize_training_optimizer, load_checkpoint, optimizer_update, prepare_training, save_checkpoint
 from vesuvius.neural_tracing.tracers.fibers.data.data import SampleConfig
 from vesuvius.neural_tracing.tracers.fibers.train.runloop import read_checkpoint, training_rng_state
-from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import FiberVolumeSpec
+from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolumeSpec
 from label_fixtures import set_terminal
 from model_fixtures import coordinate_batch, coordinate_config, batch as label_batch, forward, proposal_output
 
@@ -179,7 +179,7 @@ def test_checkpoint_resume_and_init_weights(tmp_path):
     data = batch(cfg)
     prepare_training(m, backend='eager')
     optimizer_update(m, ema, opt, [data], 1, .001, compute_metrics=False)
-    spec = FiberVolumeSpec('unused', ct_level=0, ct_grid_scale=4.)
+    spec = CTVolumeSpec('unused', ct_level=0, ct_grid_scale=4.)
     sample = SampleConfig(crop=cfg.fine, n_history=cfg.n_history)
     path = tmp_path/'last.pt'
     save_checkpoint(path, m, ema, spec, sample, dict(step=1, lr_restart_step=0, optimizer=opt.state_dict(),

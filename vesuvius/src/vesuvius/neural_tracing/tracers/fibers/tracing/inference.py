@@ -25,7 +25,7 @@ from scipy.spatial import cKDTree
 from vesuvius.neural_tracing.tracers.shared.geometry import arclength, resample_polyline
 from vesuvius.neural_tracing.tracers.shared.policy import checkpoint_policy
 from vesuvius.neural_tracing.tracers.fibers.tracing.trace import ModelTracer, TraceParams
-from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import FiberVolume
+from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume
 from vesuvius.neural_tracing.tracers.fibers.tracing.heading import SeedHeadingError, ct_seed_heading, SEED_HEADING_POLICY, TRACE_HEADING_POLICY, FRAME_POLICY
 from vesuvius.neural_tracing.tracers.fibers.tracing.crop_frames import trace_family_kwargs
 
@@ -73,7 +73,7 @@ def make_fiber_json(points_base_xyz: np.ndarray, cp_every: float, meta: dict) ->
     }
 
 
-def trace_bidirectional(tracer: ModelTracer, vol: FiberVolume, seeds_grid_xyz: np.ndarray, families):
+def trace_bidirectional(tracer: ModelTracer, vol: CTVolume, seeds_grid_xyz: np.ndarray, families):
     """Per-seed full polylines (grid xyz, backward->forward) and stop reasons.
 
     A seed without a usable CT heading yields ``(None, error message)`` and the rest of
@@ -217,7 +217,7 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer):
         spec.ct_zarr = args.ct
     from vesuvius.neural_tracing.tracers.shared.crop_sampling.normalization import prepare_normalization
     prepare_normalization(args.out, [spec], known=ck['ct_normalization'])
-    vol = FiberVolume(spec, cache_bytes=8 << 30)
+    vol = CTVolume(spec, cache_bytes=8 << 30)
     tracer = tracer_class(model, vol, crop, n_hist, TraceParams.from_policy(policy, max_len=args.max_len,
         seed=args.sampling_seed, precision=args.precision), device=args.device)
     g = spec.grid_scale

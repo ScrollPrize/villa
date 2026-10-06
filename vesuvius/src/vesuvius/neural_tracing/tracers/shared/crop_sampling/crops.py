@@ -6,7 +6,7 @@ uncompressed Zarr chunks; the fused Numba kernel interpolates them.
 import numpy as np
 import torch
 
-from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import FiberVolume
+from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume
 from vesuvius.neural_tracing.tracers.shared.geometry import CropSpec, crop_local_grid
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.fast_sample import sample_scalar_crop
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.normalization import normalize_ct
@@ -116,7 +116,7 @@ def tight_block(pos, frame, crop: CropSpec, scale: float = 1.):
     return lo, hi - lo
 
 
-def read_tight_blocks(items, vol: FiberVolume, crop: CropSpec, pool=None):
+def read_tight_blocks(items, vol: CTVolume, crop: CropSpec, pool=None):
     """Per-item minimal blocks for per-sample CPU sampling: (list of raw, list of zyx starts).
 
     Same values as the rotation-invariant ``block_start`` block at every sample point, reading roughly a

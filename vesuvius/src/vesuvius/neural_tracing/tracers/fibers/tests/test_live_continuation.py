@@ -13,7 +13,7 @@ from vesuvius.neural_tracing.tracers.fibers.tracing.heading import orient_item
 from vesuvius.neural_tracing.tracers.shared.policy import OperatingPolicy
 from vesuvius.neural_tracing.tracers.fibers.data.state_labels import FOLLOWING
 from vesuvius.neural_tracing.tracers.fibers.tracing.trace import ModelTracer, TraceParams
-from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import FiberVolumeSpec
+from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolumeSpec
 
 POLICY = OperatingPolicy(n_commit=16, gate='prefix')  # these tests exercise prefix-length commits
 
@@ -42,7 +42,7 @@ def setup(monkeypatch):
     cfg = SampleConfig(crop=CropSpec(depth=24, width=16, behind=8), n_history=32, n_future=16,
                        startup_shares=(0., 0., 0., 1.), excursion_probability=0., trace_noise_sigma=(0., 0.),
                        trace_noise_smoothing=0.)
-    ds = FollowDataset([fiber], FiberVolumeSpec('unused'), cfg, chunk=2)
+    ds = FollowDataset([fiber], CTVolumeSpec('unused'), cfg, chunk=2)
     live = LiveContinuationSource(policy=POLICY, steps=(4, 4), step=ds.step)
     ds.live_continuation = live
     vol = SimpleNamespace(shape=(1000,)*3)
