@@ -137,20 +137,27 @@ batched on the GPU. On Paris4 AFV it brought labels from a median 1.46 to 0.68 t
 
 ## Organization
 
-The fiber tracer lives in `tracers/fibers/`; the parts other tracers can reuse sit beside it in `tracers/`:
+The fiber tracer lives in `tracers/fibers/`; the parts other tracers can reuse sit beside it in `tracers/`
+(`tracers/README.md`). Nothing in `tracers/models` or `tracers/shared` imports `tracers/fibers`.
 
 | Package | Responsibility |
 | --- | --- |
 | `tracers/models` | The follower contract (`follower.py`), the model registry (`model.py`), checkpoints (`checkpoint.py`), the crop transformer (`regression`, `flow`), flow matching, the sequence model, the supervised-path contract (`targets.py`) |
-| `tracers/shared` | Geometry, reference handling, the commit policy, recorded-path relocation, retired settings, JSON output |
+| `tracers/shared` | Geometry, observed-path references, the commit policy, recorded-path relocation, retired settings, JSON/atomic output, batch tensors |
 | `tracers/shared/crop_sampling` | CT crop loading: volumes (local and remote chunked readers, chunk-store decoding), intensity normalization, oriented crop sampling, remote prefetch |
-| `train` | Entry point and run configuration, objectives, checkpoints, logging, online collection, live continuation |
-| `data` | Fibers, observation construction, labels, sampling, replay, AFV neighbors |
-| `tracing` | Inference, collection, heading/frame resolution, rollout |
-| `evaluation` | Frozen-seed evaluation, recovery, diagnostics, long-trace audits |
-| `heading_model` | Heading/normal trainer and frozen frame predictor used by follower crop generation |
+| `data` | Annotated fibers and splits, seeds, simulated traces and episodes, targets and state labels, the task budget, replay, the training dataset, observations, AFV sources and neighbors |
+| `frames` | Crop frames: CT structure-tensor headings and frames (`ct.py`), the frozen learned frame model (`learned.py`) |
+| `tracing` | The tracer and rollout (`trace.py`), the tracing CLI (`inference.py`) |
+| `train` | Entry point and run configuration, the training update (`step.py`), objectives, logging, live continuation, DAgger collection (`dagger/`) |
+| `evaluation` | Trace scoring (`scoring.py`), the offline calibrate/run/compare protocol (`protocol.py`), training-time monitoring (`monitor/`), long-trace audits (`audit/`) |
+| `heading_model` | Heading/normal trainer and the frame predictor network used by `frames/learned.py` |
+| `legacy` | Inference for pre-cleanup checkpoints |
+| `scripts` | Launch/stop, label snapping, checkpoint conversion, the pre-launch sampler check |
+| `configs` | Run (`runs/`), dataset (`datasets/`) and heading-model (`heading/`) configurations |
 
-Datasets and existing run artifacts retain their locations.
+Run artifacts are in `output/` and AFV datasets in `datasets/` (both untracked). Three files in `output/` are inputs of
+current runs: the Paris 4 seed manifest `single_path_v11_preparation/seeds.json`, the frame model
+`heading_model_l0_w16_centered_frame/ckpt_064000.pt` and `heading_model_l0_w16_centered_normals/ct_normalization.json`.
 
 ## Verification
 
