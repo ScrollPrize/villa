@@ -748,6 +748,7 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
         tr("Checked: re-optimize the line after every control-point edit.\n"
            "Unchecked: no optimization until \"Reinit reoptimization\" or close."));
     connect(_autoReoptimizeAction, &QAction::toggled, this, [this](bool checked) {
+        _overviewLayoutDirty = true;  // the gate reads the mode
         updateOverviewBar();
         emit reoptimizationModeChanged(checked ? ReoptimizationMode::AutoReoptimize
                                                : ReoptimizationMode::NoOptimization);
@@ -1619,6 +1620,7 @@ void LineAnnotationDialog::setLineSolveActivity(bool running, bool pending)
     const bool confirms = _overviewGeometryUnconfirmed;
     _overviewGeometryUnconfirmed = false;
     if (changed || confirms) {
+        _overviewLayoutDirty = true;
         updateOverviewBar();
     }
 }
@@ -1650,6 +1652,7 @@ uint64_t LineAnnotationDialog::recordPendingPlacement(const cv::Vec3f& volumePoi
     // the bar must not adopt anything (a confirmation dialog may spin the
     // event loop between this request and its publish).
     _overviewGeometryUnconfirmed = true;
+    _overviewLayoutDirty = true;
     // A placement that never shows up (rejected, superseded) must not linger
     // and claim a later point by coincidence.
     constexpr size_t kMaxPendingPlacements = 16;
@@ -1674,6 +1677,7 @@ void LineAnnotationDialog::retirePendingPlacement(uint64_t token)
     if (removed > 0) {
         // The outstanding request was what held the bar's adoption back; a
         // landing that reported idle meanwhile may now be adopted.
+        _overviewLayoutDirty = true;
         updateOverviewBar();
     }
 }
@@ -1686,6 +1690,7 @@ void LineAnnotationDialog::noteDisplayedLineControls()
     _overviewDisplayedLayout = vc3d::line_annotation::generatedOverviewSettledLayout(
         _generatedViews.controlPoints, _generatedViews.linePoints);
     _controlsRebased = false;
+    _overviewLayoutDirty = true;
     // A placement recorded against an earlier displayed line (its request
     // may be waiting on a confirmation dialog while another solve landed) is
     // re-placed on this one through its 3D point, so its publish still finds
@@ -3271,6 +3276,7 @@ const vc3d::line_annotation::GeneratedStripContextIndex& LineAnnotationDialog::s
 void LineAnnotationDialog::invalidateStripContextIndex()
 {
     _stripContextIndex.reset();
+    _overviewLayoutDirty = true;
     // New geometry or controls whose solve state the controller has not
     // reported yet (see setLineSolveActivity).
     _overviewGeometryUnconfirmed = true;
@@ -6346,13 +6352,12 @@ bool LineAnnotationDialog::eventFilter(QObject* watched, QEvent* event)
     return QMainWindow::eventFilter(watched, event);
 }
 
-void LineAnnotationDialog::updateOverviewBar()
+void LineAnnotationDialog::rebuildOverviewBarLayout()
 {
     auto* bar = static_cast<LineAnnotationOverviewBar*>(_overviewBar.data());
     if (!bar || !_hasGeneratedViews) {
         return;
     }
-
     // Dot fractions. Settled geometry (confirmed by the controller: nothing
     // running or pending, controls of the displayed line, none rebased) is
     // adopted as the layout; otherwise the dots keep the known fractions
@@ -6468,6 +6473,22 @@ void LineAnnotationDialog::updateOverviewBar()
                      positionAnchors,
                      cumulativeArcLength,
                      totalArcLength);
+}
+
+void LineAnnotationDialog::updateOverviewBar()
+{
+    auto* bar = static_cast<LineAnnotationOverviewBar*>(_overviewBar.data());
+    if (!bar || !_hasGeneratedViews) {
+        return;
+    }
+
+    // The layout (dots, pieces, the marker's mapping) only changes with the
+    // geometry, the controls or the gate state; a moving cursor only moves
+    // the marker. Everything heavy sits behind the dirty flag.
+    if (_overviewLayoutDirty) {
+        rebuildOverviewBarLayout();
+        _overviewLayoutDirty = false;
+    }
 
     QColor markerColor(0, 245, 255);
     switch (currentLineMarkerState()) {

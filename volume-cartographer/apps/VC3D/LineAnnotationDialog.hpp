@@ -495,6 +495,9 @@ private:
     // Pushes line length, control dots, and the current-position marker to the
     // schematic overview bar.
     void updateOverviewBar();
+    // The heavy part of updateOverviewBar: layouts, anchors, cumulative arc
+    // lengths, dots and pieces. Runs only while _overviewLayoutDirty.
+    void rebuildOverviewBarLayout();
     // Ctrl+right-click on an overview-bar control point: synthesize the matching
     // bottom-strip scene point and route through its context-menu signal so the
     // controller-supplied menu behaves exactly like an in-viewer click.
@@ -599,6 +602,11 @@ private:
     // next setLineSolveActivity report: the overview bar adopts a layout as
     // settled only from a confirmed, idle state.
     bool _overviewGeometryUnconfirmed = false;
+    // The overview bar's layout (dots, pieces, marker mapping) must be
+    // rebuilt: set by every geometry/controls write, gate change, placement
+    // request and mode toggle; cleared by the rebuild. A cursor move alone
+    // leaves it clear and only moves the marker.
+    bool _overviewLayoutDirty = true;
     // The overview bar's dot layout of the last settled geometry, keyed by
     // control volume point (see GeneratedOverviewLayout); empty until the
     // first publish of a fiber.
