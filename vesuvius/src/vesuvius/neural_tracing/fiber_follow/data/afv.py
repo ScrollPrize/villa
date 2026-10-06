@@ -1,4 +1,4 @@
-"""Read-only, worker-local access to native-L0 Automated Fiber Volumes."""
+"""Worker-local access to native-L0 Automated Fiber Volumes (read), and writing a derived AFV in the same format."""
 from collections import OrderedDict
 from collections.abc import Sequence
 import json
@@ -160,3 +160,67 @@ class _Fiber:
 
     def __getattr__(self, key):
         return getattr(self.collection.geometry(self.index), key)
+
+
+def read_afv_polylines(path):
+    """Every fiber of an AFV as (fibers row dict, native xyz (N, 3) polyline), in id order."""
+    with sqlite3.connect(f'file:{Path(path).resolve()}?mode=ro', uri=True) as c:
+        columns = [r[1] for r in c.execute('PRAGMA table_info(fibers)')]
+        rows = {r[0]: dict(zip(columns, r)) for r in c.execute(f'SELECT {",".join(columns)} FROM fibers ORDER BY id')}
+        pieces = {}
+        for fid, first, blob in c.execute('SELECT fiber_id,first_segment,points FROM blocks ORDER BY fiber_id,first_segment'):
+            xyz = np.frombuffer(blob, dtype='<f8').reshape(-1, 3)
+            pieces.setdefault(fid, []).append(xyz if fid not in pieces else xyz[1:])
+    return [(rows[fid], np.concatenate(pieces[fid])) for fid in rows]
+
+
+def write_afv(source, destination, fibers, metadata_updates, *, block_points=257):
+    """A new AFV with ``source``'s schema, pragmas and metadata (updated by ``metadata_updates``, point and fiber
+    counts recomputed) holding ``fibers``: (fibers row dict, native xyz polyline) pairs. Each polyline is stored in
+    blocks of at most ``block_points`` points sharing their end points, each block with its R-tree bounds; the row's
+    point count, length and bounds are recomputed. ``complete`` is written last."""
+    destination = Path(destination)
+    if destination.exists():
+        raise FileExistsError(f'{destination} exists')
+    with sqlite3.connect(f'file:{Path(source).resolve()}?mode=ro', uri=True) as src:
+        schema = [sql for (sql,) in src.execute("SELECT sql FROM sqlite_master WHERE sql IS NOT NULL AND "
+                                                  "name NOT LIKE 'block_bounds_%' AND type IN ('table','index')")]
+        pragmas = [src.execute(f'PRAGMA {p}').fetchone()[0] for p in ('application_id', 'user_version')]
+        metadata = {k: json.loads(v) for k, v in src.execute('SELECT key,value FROM metadata')}
+        columns = [r[1] for r in src.execute('PRAGMA table_info(fibers)')]
+    partial = destination.with_suffix('.partial.afv')
+    partial.unlink(missing_ok=True)
+    dst = sqlite3.connect(partial)
+    dst.execute('PRAGMA journal_mode=OFF')
+    dst.execute('PRAGMA synchronous=OFF')
+    dst.execute(f'PRAGMA application_id = {int(pragmas[0])}')
+    dst.execute(f'PRAGMA user_version = {int(pragmas[1])}')
+    for sql in schema:
+        dst.execute(sql)
+    fiber_rows, block_rows, bound_rows, points_total, block_id = [], [], [], 0, 0
+    for row, xyz in fibers:
+        xyz = np.ascontiguousarray(xyz, dtype='<f8')
+        if xyz.ndim != 2 or xyz.shape[1] != 3 or len(xyz) < 2 or not np.isfinite(xyz).all():
+            raise ValueError(f'Invalid polyline for fiber {row["id"]}')
+        row = dict(row, point_count=len(xyz), length=float(np.linalg.norm(np.diff(xyz, axis=0), axis=1).sum()),
+                   **{f'{bound}_{axis}': float(f(xyz[:, k])) for k, axis in enumerate('xyz')
+                      for bound, f in (('min', np.min), ('max', np.max))})
+        fiber_rows.append(tuple(row[c] for c in columns))
+        points_total += len(xyz)
+        for first in range(0, len(xyz)-1, block_points-1):
+            block = xyz[first:first+block_points]
+            block_id += 1
+            block_rows.append((block_id, row['id'], first, block.tobytes()))
+            lo, hi = block.min(0), block.max(0)
+            bound_rows.append((block_id, lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]))
+    dst.executemany(f'INSERT INTO fibers ({",".join(columns)}) VALUES ({",".join("?"*len(columns))})', fiber_rows)
+    dst.executemany('INSERT INTO blocks (id,fiber_id,first_segment,points) VALUES (?,?,?,?)', block_rows)
+    dst.executemany('INSERT INTO block_bounds VALUES (?,?,?,?,?,?,?)', bound_rows)
+    metadata.update(metadata_updates, fiber_count=len(fiber_rows), point_count=points_total)
+    metadata.pop('complete', None)
+    dst.executemany('INSERT INTO metadata VALUES (?, ?)', [(k, json.dumps(v)) for k, v in metadata.items()])
+    dst.execute("INSERT INTO metadata VALUES ('complete', 'true')")
+    dst.commit()
+    dst.close()
+    partial.replace(destination)
+    return dict(fibers=len(fiber_rows), points=points_total, blocks=block_id)

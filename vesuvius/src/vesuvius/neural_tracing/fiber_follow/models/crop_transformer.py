@@ -52,6 +52,9 @@ class CropTransformerArchitecture:
     ffn: int = 2048
     cnn_channels: tuple = (32, 64, 128)  # one stage per entry, each at stride 2
     cnn_blocks: tuple = (1, 2, 2)
+    # Per-head RMS normalization of attention queries and keys (models/blocks.py). Unbounded, the flow model's adaLN
+    # time modulation of the path tokens grew their q/k norms until path attention saturated and training diverged.
+    qk_norm: bool = False
 
     def __post_init__(self):
         super().__post_init__()
@@ -85,6 +88,7 @@ class FlowConfig(FlowOptions, CropTransformerArchitecture, FollowerConfig):
     model_type: str = 'flow'
     n_future: int = 16
     gate_plane: int | None = None
+    qk_norm: bool = True
 
 
 class CropTransformerLayer(TransformerLayer):
@@ -132,7 +136,7 @@ class CropTransformer(nn.Module):
         self.path_geometry = PathGeometryTokens(cfg)
         self.kind = nn.Parameter(torch.zeros(5, h))  # CELL, REFERENCE, GEOMETRY, PATH, SCORED
         nn.init.normal_(self.kind, std=.02)
-        self.layers = nn.ModuleList(CropTransformerLayer(h, cfg.heads, cfg.ffn) for _ in range(cfg.layers))
+        self.layers = nn.ModuleList(CropTransformerLayer(h, cfg.heads, cfg.ffn, cfg.qk_norm) for _ in range(cfg.layers))
         self.norm = nn.LayerNorm(h)
         self.register_buffer('planes', plane_coordinates(cfg), persistent=False)
         self.plane_scale = cfg.n_future*cfg.future_step  # forward-distance normalization of path tokens
@@ -287,9 +291,13 @@ class FlowFollower(FlowMatching, CropTransformer):
         time = self.time(time_embedding(t))
         tokens = tokens+time[:, :, None].to(tokens.dtype)+self.kind[PATH].to(tokens.dtype)
         condition = F.silu(time)  # (B, D, W): one modulation per draw, shared by its planes
-        modulation = ([m(condition).unflatten(-1, (2, 3, self.cfg.hidden)) for m in self.time_modulation],
-                      self.output_modulation(condition).unflatten(-1, (2, self.cfg.hidden)))
-        return self.velocity(self.run_paths(ctx, tokens, modulation)).float()
+        layers = [m(condition).unflatten(-1, (2, 3, self.cfg.hidden)) for m in self.time_modulation]
+        output = self.output_modulation(condition).unflatten(-1, (2, self.cfg.hidden))
+        if bound := self.cfg.flow_modulation_bound:  # shift/scale M*tanh(x/M), gates tanh
+            soft = lambda value: bound*torch.tanh(value/bound)
+            layers = [torch.cat((soft(m[..., :2, :]), m[..., 2:, :].tanh()), -2) for m in layers]
+            output = soft(output)
+        return self.velocity(self.run_paths(ctx, tokens, (layers, output))).float()
 
     def hazard_logits(self, ctx, points):
         # No generator state enters a proposal's score.

@@ -11,7 +11,7 @@ import torch
 
 from vesuvius.neural_tracing.fiber_follow.models.sequence import relative_pose
 
-ENCODE_CHUNK = 16  # history-only crops encoded together without gradient
+ENCODE_CHUNK = 16  # crops per CNN call: one fixed shape for the compiled CNN (train.prepare_training)
 
 
 def select_rows(batch, rows, count):
@@ -25,6 +25,37 @@ def select_rows(batch, rows, count):
     return {key: pick(value) for key, value in batch.items()}
 
 
+def merge_episodes(items):
+    """One episode microbatch from loader items (data.loader_chunk): row-aligned tensors concatenated in item order,
+    each item's episodes renumbered after the previous items', wider trailing dimensions (committed segments) zero-padded,
+    and row counters an item omits (they are emitted only when nonzero) zero-filled. Lists concatenate."""
+    rows = [len(item['hist']) for item in items]
+    offset = 0
+    for item in items:
+        item['episode_index'] = item['episode_index']+offset
+        offset = int(item['episode_index'].max())+1
+
+    def merge(values, counts):
+        present = [v for v in values if v is not None]
+        first = present[0]
+        if isinstance(first, dict):
+            keys = list(dict.fromkeys(k for v in present for k in v))
+            return {k: merge([v.get(k) if v is not None else None for v in values], counts) for k in keys}
+        if torch.is_tensor(first) and first.ndim and all(v is None or len(v) == n for v, n in zip(values, counts)):
+            shape = [max(v.shape[d] for v in present) for d in range(1, first.ndim)]
+            parts = []
+            for value, n in zip(values, counts):
+                part = first.new_zeros((n, *shape))
+                if value is not None:
+                    part[(slice(None),)+tuple(slice(0, s) for s in value.shape[1:])] = value
+                parts.append(part)
+            return torch.cat(parts)
+        if isinstance(first, list):
+            return [x for v in present for x in v]
+        return first
+    return merge(items, rows)
+
+
 def episode_rows(batch):
     """(E, T) batch row of each episode step (-1 past an episode's end), and each row's (episode, step)."""
     index, step = batch['episode_index'].cpu(), batch['episode_step'].cpu()
@@ -33,6 +64,17 @@ def episode_rows(batch):
     table = torch.full((len(episodes), int(step.max())+1), -1, dtype=torch.long)
     table[order, step] = torch.arange(len(index))
     return table, order, step
+
+
+def encode_rows(model, image, rows):
+    """CNN cells of ``image[rows]`` in ``ENCODE_CHUNK``-row calls, the last padded with copies of its first row (instance
+    normalization is per crop, so padding never changes a real row)."""
+    from vesuvius.neural_tracing.fiber_follow.train.train import fixed_rows
+    parts = []
+    for start in range(0, len(rows), ENCODE_CHUNK):
+        part = rows[start:start+ENCODE_CHUNK]
+        parts.append(model.encode(fixed_rows(image[part], ENCODE_CHUNK))[:len(part)])
+    return torch.cat(parts)
 
 
 def committed_local(batch):
@@ -50,13 +92,13 @@ def episode_forward(model, batch, confidence_threshold, n_commit):
     rows, others = supervised.nonzero().flatten(), (~supervised).nonzero().flatten()
     image = batch['x']['fine']
     local, valid = committed_local(batch)
-    cells = model.encode(image[rows])
+    cells = encode_rows(model, image, rows)
     features = torch.zeros(count, 2*cells.shape[1], device=device)
     features = features.index_copy(0, rows, model.step_features(cells, local[rows], valid[rows]).float())
     with torch.no_grad():
         for start in range(0, len(others), ENCODE_CHUNK):
             part = others[start:start+ENCODE_CHUNK]
-            features[part] = model.step_features(model.encode(image[part]), local[part], valid[part]).float()
+            features[part] = model.step_features(encode_rows(model, image, part), local[part], valid[part]).float()
     last = valid.sum(1).clamp_min(1)-1
     displacement = local[torch.arange(count, device=device), last]-local[:, 0]
     safe = table.clamp_min(0)

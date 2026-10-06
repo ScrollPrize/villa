@@ -44,13 +44,19 @@ class SequenceConfig(FollowerConfig):
     layers: int = 12
     heads: int = 8
     ffn: int = 2048
-    cnn_channels: tuple = (16, 32, 64, 128)  # full-resolution block, then stages at strides 2, 4, 8
+    cnn_channels: tuple = (16, 32, 64, 128)
+    # Per-stage strides: a full-resolution block, then stages at strides 2, 4, 8; (2, 2, 2, 1) drops the full-resolution
+    # stage (same weight shapes and stride-8 cells, ~6x cheaper).
+    cnn_strides: tuple = (1, 2, 2, 2)
     cnn_blocks: int = 2
     history_limit: int = 512  # most recent history tokens a decision reads
 
     def __post_init__(self):
         super().__post_init__()
         self.cnn_channels = tuple(int(c) for c in self.cnn_channels)
+        self.cnn_strides = tuple(int(s) for s in self.cnn_strides)
+        if len(self.cnn_strides) != 4 or any(s not in (1, 2) for s in self.cnn_strides) or math.prod(self.cnn_strides) != 8:
+            raise ValueError('The CNN needs four stage strides of 1 or 2 whose product is the token stride (8)')
         if len(self.cnn_channels) != 4 or min(self.cnn_channels) < 1 or self.cnn_blocks < 1 or self.ffn < 1:
             raise ValueError('The CNN needs four positive channel widths and positive blocks; the FFN a positive width')
         if self.recurrent_refinement_steps:
@@ -111,7 +117,7 @@ class SequenceFollower(nn.Module):
         self.cfg, self.model_type = cfg, cfg.model_type
         h, cells = cfg.hidden, cfg.cnn_channels[-1]
         # A full-resolution block, then stages at strides 2, 4, 8.
-        self.cnn = CropCNN(cfg.cnn_channels, (1, 2, 2, 2), (1,)+(cfg.cnn_blocks,)*3)
+        self.cnn = CropCNN(cfg.cnn_channels, cfg.cnn_strides, (1,)+(cfg.cnn_blocks,)*3)
         self.cell_token = nn.Linear(cells, h)
         self.cell_position = nn.Sequential(nn.Linear(3, h), nn.SiLU(), nn.Linear(h, h))
         width = 2*cells+4+2*POSITION_FREQUENCIES

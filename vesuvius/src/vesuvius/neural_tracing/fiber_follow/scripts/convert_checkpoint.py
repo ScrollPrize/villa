@@ -31,14 +31,14 @@ SEQUENCE_UNSUPPORTED_TASKS = ('live', 'synthetic_terminal')
 
 
 def convert_model_config(model_type, recorded):
-    from vesuvius.neural_tracing.fiber_follow.models.model import RETIRED_FIELDS, config_class
+    from vesuvius.neural_tracing.fiber_follow.models.model import RETIRED_FIELDS, config_class, recorded_config
     for key, inert in {**INERT_MODEL_FIELDS, **RETIRED_FIELDS}.items():
         if recorded.get(key, inert) != inert:
             raise ValueError(f'Model field {key}={recorded[key]!r} has no counterpart in the current model')
     kept = {f.name for f in fields(config_class(model_type))}
     values = {k: v for k, v in recorded.items() if k in kept}
     values['model_type'] = model_type
-    return config_class(model_type)(**values), sorted(set(recorded)-kept)
+    return recorded_config(model_type, values), sorted(set(recorded)-kept)
 
 
 def task_shares(budget, model_type, notes):

@@ -19,6 +19,9 @@ class FlowOptions:
     # takes a later proposal only when no earlier one is accepted (select_refinement). 0: one path.
     flow_samples: int = 4
     flow_sample_scale: float = 1.
+    # Soft bound of the adaLN modulation: shift and scale M*tanh(x/M), branch gates tanh (Lumina-Next); 0 unbounded.
+    # Unbounded, the time modulation drifted to scales of ~70 and training diverged; 4 lies above the healthy range.
+    flow_modulation_bound: float = 4.
     # Lower bound of the fitted residual scales (voxels), i.e. of the noise prior's width.
     flow_sigma_floor: float = 3.
     # Pseudo-Huber loss on the velocity residual, per path point in residual-scale units: c²(√(1+d²/c²)−1), equal to
@@ -35,6 +38,8 @@ class FlowOptions:
         if type(self.flow_samples) is not int or self.flow_samples < 0 or not (
                 math.isfinite(self.flow_sample_scale) and self.flow_sample_scale > 0):
             raise ValueError('Flow samples must be a nonnegative integer with a finite positive scale')
+        if not (math.isfinite(self.flow_modulation_bound) and self.flow_modulation_bound >= 0):
+            raise ValueError('The flow modulation bound must be finite and nonnegative (0: unbounded)')
         if not (math.isfinite(self.flow_sigma_floor) and self.flow_sigma_floor >= 1):
             raise ValueError('The flow scale floor must be finite and at least one voxel')
         if not (math.isfinite(self.flow_huber_c) and self.flow_huber_c > 0):

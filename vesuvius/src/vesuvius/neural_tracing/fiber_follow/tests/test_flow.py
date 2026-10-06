@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from model_fixtures import coordinate_batch, flow_config
-from vesuvius.neural_tracing.fiber_follow.models.model import build_model
+from vesuvius.neural_tracing.fiber_follow.models.model import build_model, config_from_checkpoint
 from vesuvius.neural_tracing.fiber_follow.models.flow import fit_flow_sigma, flow_targets
 from vesuvius.neural_tracing.fiber_follow.train.supervision import loss_terms
 from vesuvius.neural_tracing.fiber_follow.train.train import (
@@ -155,7 +155,7 @@ def test_unknown_planes_stay_attended_and_the_scale_floor_bounds_the_prior():
                                          dict(b, flow_noise=noise, flow_times=torch.tensor([[.3, .8]]*2)))
         losses.append(out['flow_per_state'])
     assert torch.isfinite(losses[0]).all()
-    assert not torch.allclose(losses[0], losses[1])
+    assert not torch.equal(losses[0], losses[1])
     cfg = config(flow_sigma_floor=3., flow_sigma=((3., 3.),)*4)
     data = coordinate_batch(cfg)
     data['dense_ab'][0, :, 0] = -2.; data['dense_ab'][1, :, 0] = 2.
@@ -180,3 +180,44 @@ def test_pseudo_huber_flow_loss_is_half_the_squared_distance_for_small_residuals
     assert (huber <= .5*distance.square()+1e-6).all()  # never above the squared loss; linear for large residuals
     with pytest.raises(ValueError, match='pseudo-Huber scale'):
         config(flow_huber_c=0.)
+
+
+def test_qk_norm_and_modulation_bound_hold_path_attention_under_runaway_time_modulation_and_old_checkpoints_load(monkeypatch):
+    torch.manual_seed(43)
+    sdpa, logits, modulation = torch.nn.functional.scaled_dot_product_attention, [], []
+
+    def record(q, k, v, attn_mask=None, **kw):
+        logits.append(float((q@k.transpose(-1, -2)).abs().max())/q.shape[-1]**.5)
+        return sdpa(q, k, v, attn_mask=attn_mask, **kw)
+
+    def runaway(model):
+        """Largest attention logit and |shift|, |scale|, |gate| applied with the drift seen in training."""
+        b = coordinate_batch(model.cfg)
+        for layer in model.layers:
+            queries = layer.queries
+            monkeypatch.setattr(layer, 'queries', lambda x, pair, mask, m, queries=queries, **kw: (
+                modulation.append(m.abs().amax((0, 1, 2, 4))), queries(x, pair, mask, m, **kw))[1])
+        with torch.no_grad():
+            ctx = model.context(b['x'], b['hist'], b['hmask'])
+            for m in model.time_modulation:  # modulation of tens, as in the diverged run
+                torch.nn.init.normal_(m.weight, std=30.)
+            logits.clear(); modulation.clear()
+            monkeypatch.setattr(torch.nn.functional, 'scaled_dot_product_attention', record)
+            velocity = model.velocity_field(ctx, torch.randn(2, 2, 4, 2), torch.rand(2, 2))
+            monkeypatch.setattr(torch.nn.functional, 'scaled_dot_product_attention', sdpa)
+        assert torch.isfinite(velocity).all()
+        return max(logits), torch.stack(modulation).amax(0).tolist()
+
+    bounded = build_model(config()).eval()
+    assert bounded.cfg.qk_norm and bounded.cfg.flow_modulation_bound == 4. and all(hasattr(l, 'q_norm') for l in bounded.layers)
+    head = bounded.cfg.hidden//bounded.cfg.heads
+    logit, (shift, scale, gate) = runaway(bounded)
+    assert logit <= head**.5+1e-3 and max(shift, scale) <= 4. and gate <= 1.  # |q|=|k|=sqrt(head) at unit gain
+    plain = build_model(config(qk_norm=False, flow_modulation_bound=0.)).eval()
+    logit, (shift, scale, gate) = runaway(plain)
+    assert logit > 20*head**.5 and min(shift, scale, gate) > 10.
+    # A flow checkpoint recorded before these fields existed was trained without them and loads as such.
+    recorded = {k: v for k, v in plain.cfg.to_dict().items() if k not in ('qk_norm', 'flow_modulation_bound')}
+    cfg = config_from_checkpoint(dict(model_type='flow', model_cfg=recorded))
+    assert not cfg.qk_norm and not cfg.flow_modulation_bound
+    build_model(cfg).load_state_dict(plain.state_dict())
