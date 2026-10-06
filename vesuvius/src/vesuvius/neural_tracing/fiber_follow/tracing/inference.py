@@ -168,7 +168,13 @@ def export_seeds(tracer, vol, seeds, families, out, *, grid_scale, batch, min_le
 def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer):
     ap = argparse.ArgumentParser()
     ap.add_argument("--checkpoint", required=True)
-    ap.add_argument("--ct", default=None, help="override the checkpoint's CT zarr")
+    ap.add_argument("--ct", default=None, help="override the checkpoint's CT zarr (local path or s3://)")
+    ap.add_argument("--ct-level", type=int, default=None, help="override the CT zarr pyramid level read")
+    ap.add_argument("--ct-grid-scale", type=float, default=None,
+                    help="override base voxels per CT voxel at that level (normally 2**level)")
+    ap.add_argument("--grid-scale", type=float, default=None,
+                    help="override base voxels per trace-grid voxel (the model's working resolution)")
+    ap.add_argument("--cache-dir", default=None, help="override the local cache for remote CT chunks")
     ap.add_argument("--seed", action="append", default=[], help="base-voxel x,y,z (repeatable)")
     ap.add_argument("--family", action="append", choices=('H', 'V'), required=True,
                     help="One H/V family for all seeds, or repeat once per seed")
@@ -213,6 +219,9 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer):
         n_commit = selected['n_commit'] if n_commit is None else n_commit
         gate = selected.get('gate') if gate is None else gate
     policy = checkpoint_policy(ck, model.cfg, confidence=confidence, n_commit=n_commit, gate=gate)
+    for key in ('ct_level', 'ct_grid_scale', 'grid_scale', 'cache_dir'):
+        if getattr(args, key) is not None:
+            setattr(spec, key, getattr(args, key))
     if args.ct:
         spec.ct_zarr = args.ct
     from vesuvius.neural_tracing.fiber_follow.data.ct_normalization import prepare_normalization
