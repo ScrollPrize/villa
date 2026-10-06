@@ -158,7 +158,7 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
     observed = sum(len(batch['hist']) for batch in batches)
     if total < 1:
         raise ValueError('An update needs at least one supervised decision')
-    denominator = max(1, total)
+    denominator = total  # >= 1, checked above
     for group in opt.param_groups:
         group['lr'] = lr
     opt.zero_grad(set_to_none=True)
@@ -178,16 +178,14 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
             ids, sizes = torch.unique(cpu['dataset_id'], return_counts=True)
             for source_id, size in zip(ids.tolist(), sizes.tolist()):
                 counts[str(source_id)] = counts.get(str(source_id), 0)+size
-        for prefix in ('ct_frame',):
-            if prefix+'_source' not in cpu['x']:
-                continue
-            source = cpu['x'][prefix+'_source']
+        if 'ct_frame_source' in cpu['x']:
+            source = cpu['x']['ct_frame_source']
             known = source >= 0
             for suffix, value in dict(count=known.sum(), transported=(source == 1).sum(),
                     deterministic=(source == 2).sum(), learned=(source == 3).sum(),
-                    energy_sum=cpu['x'][prefix+'_energy'][known].sum(),
-                    gap_sum=cpu['x'][prefix+'_gap'][known].sum()).items():
-                name = prefix+'_'+suffix
+                    energy_sum=cpu['x']['ct_frame_energy'][known].sum(),
+                    gap_sum=cpu['x']['ct_frame_gap'][known].sum()).items():
+                name = 'ct_frame_'+suffix
                 sums[name] = sums.get(name, 0.)+float(value)
         batch = move_batch(cpu, device)
         if diagnostic is not None:
@@ -260,13 +258,12 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
     # The summed loss is finite only if every batch loss was; checked before any update.
     if not math.isfinite(sums['loss']):
         raise FloatingPointError(f'Nonfinite loss at step {step}')
-    if total:
-        finish_training_update(model)
-        sums.update(clip_training_gradients(model, grad_clip))
-        opt.step()
-        update_ema(ema, model, step, ema_decay, ramp=ema_ramp)
+    finish_training_update(model)
+    sums.update(clip_training_gradients(model, grad_clip))
+    opt.step()
+    update_ema(ema, model, step, ema_decay, ramp=ema_ramp)
     sums.update(observed_states=observed, supervised_states=total,
-                observation_only_states=observed-total, optimizer_applied=bool(total),
+                observation_only_states=observed-total, optimizer_applied=True,
                 positive_confidence_targets=float(per_state[:, 0].sum()),
                 negative_confidence_targets=float(per_state[:, 1].sum()))
     sums['refinement_attempts_mean'] = sums.get('refinement_attempts_sum', 0.)/denominator
