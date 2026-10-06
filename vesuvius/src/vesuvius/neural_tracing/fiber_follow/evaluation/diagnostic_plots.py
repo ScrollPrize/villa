@@ -307,7 +307,8 @@ def plot_sheets(examples, cfg, folder, step):
         raise ValueError('Diagnostic microbatch is empty')
     sheets = dict(predictions=predictions_sheet(examples, cfg, step),
         crop_orientation=orientation_sheet(examples, cfg, step),
-        encoder=activation_sheet(examples, step, 'encoder'), decoder=activation_sheet(examples, step, 'decoder'),
+        # Activation sheets exist for the patch encoder/decoder models only (layer_capture).
+        **{kind: activation_sheet(examples, step, kind) for kind in ('encoder', 'decoder') if examples[0][kind]},
         **({'history': history_sheet(examples, cfg, step)} if 'history_valid' in examples[0] else {}))
     # Independent PNG compression/writes run together; keep compression cheap.
     from concurrent.futures import ThreadPoolExecutor
