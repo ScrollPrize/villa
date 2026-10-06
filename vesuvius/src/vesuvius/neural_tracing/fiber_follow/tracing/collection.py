@@ -102,22 +102,15 @@ class DecisionCollector:
             event = -1
             if state['would_stop']:  # a stop is its own event, without a pre-excursion window
                 event, self.events = self.events, self.events+1
-        switch = self.labeler.switch or {}
         row = dict(fiber_idx=self.fi, t=facts['t'], reverse=self.sign < 0, travelled=travelled,
                    heading_start=int(state['heading_start']), source_row=len(self.rows),
                    **{k: state[k] for k in ('pos', 'frame', 'hist', 'hmask')},
                    **{k: state[k] for k in SEED_FIELDS},
-                   **{k: item[k] for k in ('supervision', 'supervision_reason', 'geometry_valid', 'confidence_valid')},
+                   **{k: item[k] for k in ('supervision', 'geometry_valid', 'confidence_valid')},
                    **{k: facts[k] for k in ('match_distance', 'window_distance', 'match_valid', 'match_ambiguous',
                                             'switched', 'beyond_end', 'departure_distance', 'boundary_distance',
                                             'switch_distance', 'bad_run', 'bad_run_start')},
-                   switch_pos=np.asarray(switch.get('switch_pos', np.full(3, np.nan)), np.float64),
-                   switch_bank_path=str(switch.get('switch_bank_path', '')),
-                   switch_bank_run=str(switch.get('switch_bank_run', '')),
-                   would_stop=bool(state['would_stop']), n_commit=int(state['n_commit']),
-                   proposal_points=np.asarray(state['points'], np.float32),
-                   proposal_confidence=np.asarray(state['confidence'], np.float32),
-                   event_id=event, pre_excursion=False, hard=bool(displaced or state['would_stop']))
+                   would_stop=bool(state['would_stop']), event_id=event, pre_excursion=False, hard=bool(displaced or state['would_stop']))
         # last_segment is the actual committed polyline, including intermediate vertices,
         # so it extends the trace for callers that do not pass the whole observed prefix.
         prefix = np.asarray(state.get('observed_path', list(self.track)+list(segment[1:] if self.track else segment)),

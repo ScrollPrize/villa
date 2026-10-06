@@ -1311,17 +1311,14 @@ class OnPolicyStates:
         heading_start=('i8', ()), travelled=('f8', ()), episode=('i8', ()), source_row=('i8', ()),
         seq_start=('i8', ()), seq_end=('i8', ()),
         # Current supervision (state_labels.classify) and its trace facts.
-        supervision=('i1', ()), supervision_reason=('i1', ()), geometry_valid=('?', ()), confidence_valid=('?', ()),
+        supervision=('i1', ()),
         match_distance=('f4', ()), window_distance=('f4', ()), match_valid=('?', ()), match_ambiguous=('?', ()),
         switched=('?', ()), beyond_end=('?', ()),
         # Historical events (NaN when absent) and resumable departure patience.
         departure_distance=('f8', ()), boundary_distance=('f8', ()), switch_distance=('f8', ()),
-        switch_pos=('f8', (3,)), switch_bank_path=('U', ()), switch_bank_run=('U', ()),
         bad_run=('i4', ()), bad_run_start=('f8', ()),
-        # The policy's own decision at this state.
-        would_stop=('?', ()), n_commit=('i4', ()), proposal_points=('f4', (None, 3)), proposal_confidence=('f4', (None,)),
         # Replay membership.
-        replay_class=('i1', ()), event_id=('i8', ()), hard=('?', ()))
+        replay_class=('i1', ()), event_id=('i8', ()))
     TRACK = dict(track_pos=('f8', (3,)))
 
     def __init__(self, *, manifest, provenance, **arrays):

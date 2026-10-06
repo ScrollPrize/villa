@@ -45,13 +45,11 @@ def make_recovery_states(fibers, seeds, cfg, provenance, vol, seed=20260925, str
                        heading_start=0, travelled=float(item['travelled']), episode=len(rows), source_row=0,
                        seq_start=len(track), seq_end=len(track)+len(item['observed_path']),
                        **{k: item[k] for k in SEED_FIELDS},
-                       **{k: item[k] for k in ('supervision', 'supervision_reason', 'geometry_valid', 'confidence_valid')},
+                       **{k: item[k] for k in ('supervision', 'geometry_valid', 'confidence_valid')},
                        **{k: facts[k] for k in ('match_distance', 'window_distance', 'match_valid', 'match_ambiguous',
                                                 'switched', 'beyond_end')},
-                       departure_distance=nan, boundary_distance=nan, switch_distance=nan, switch_pos=np.full(3, nan),
-                       switch_bank_path='', switch_bank_run='', bad_run=0, bad_run_start=nan,
-                       would_stop=False, n_commit=0, proposal_points=np.zeros((cfg.n_future, 3), np.float32),
-                       proposal_confidence=np.zeros(cfg.n_future, np.float32), event_id=-1, hard=True)
+                       departure_distance=nan, boundary_distance=nan, switch_distance=nan, bad_run=0, bad_run_start=nan,
+                       would_stop=False, event_id=-1)
             row['replay_class'] = replay_class(row)
             rows.append(row)
             track.extend(item['observed_path'])

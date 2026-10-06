@@ -2,22 +2,19 @@
 import numpy as np
 
 from vesuvius.neural_tracing.fiber_follow.data.data import OnPolicyStates, fiber_manifest
-from vesuvius.neural_tracing.fiber_follow.data.state_labels import FOLLOWING, REASON, REPLAY_CLASS
+from vesuvius.neural_tracing.fiber_follow.data.state_labels import FOLLOWING, REPLAY_CLASS
 
 
-def default_row(n_history, n_future=4):
+def default_row(n_history):
     nan = np.nan
     return dict(fiber_idx=0, t=0., reverse=False, pos=np.zeros(3), frame=np.eye(3),
                 hist=np.zeros((n_history, 3)), hmask=np.zeros(n_history, np.float32),
                 seed_pos=np.zeros(3), seed_tangent=np.array([0., 0., 1.]), seed_age=np.float32(0.), seed_valid=False,
                 heading_start=0, travelled=0., episode=0, source_row=0,
-                supervision=FOLLOWING, supervision_reason=REASON['following'], geometry_valid=True, confidence_valid=True,
+                supervision=FOLLOWING,
                 match_distance=np.float32(0.), window_distance=np.float32(0.), match_valid=True, match_ambiguous=False,
                 switched=False, beyond_end=False, departure_distance=nan, boundary_distance=nan, switch_distance=nan,
-                switch_pos=np.full(3, nan), switch_bank_path='', switch_bank_run='', bad_run=0, bad_run_start=nan,
-                would_stop=False, n_commit=4, proposal_points=np.zeros((n_future, 3), np.float32),
-                proposal_confidence=np.ones(n_future, np.float32), replay_class=REPLAY_CLASS['ordinary'],
-                event_id=-1, hard=False)
+                bad_run=0, bad_run_start=nan, replay_class=REPLAY_CLASS['ordinary'], event_id=-1)
 
 
 def replay_states(fibers, rows, *, track=None, provenance=None, n_history=None):
