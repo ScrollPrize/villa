@@ -8,7 +8,7 @@ import psutil
 PREFIX = 'vesuvius.neural_tracing.tracers.fibers.'
 TRAINERS = (PREFIX+'train.train',)
 TRAINER_SCRIPT = 'tracers/fibers/train/train.py'
-COLLECTORS = (PREFIX+'tracing.collect',)
+COLLECTORS = (PREFIX+'train.dagger.collect',)
 
 
 def option(args, key):

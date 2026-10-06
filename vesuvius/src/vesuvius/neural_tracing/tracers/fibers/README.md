@@ -93,8 +93,8 @@ live and synthetic task shares (which sequence training does not support) move t
 ## Tracing and evaluation
 
 ```bash
-../../../../../.venv/bin/python -m vesuvius.neural_tracing.tracers.fibers.tracing.infer --help
-../../../../../.venv/bin/python -m vesuvius.neural_tracing.tracers.fibers.tracing.collect --help
+../../../../../.venv/bin/python -m vesuvius.neural_tracing.tracers.fibers.tracing.inference --help
+../../../../../.venv/bin/python -m vesuvius.neural_tracing.tracers.fibers.train.dagger.collect --help
 ../../../../../.venv/bin/python -m vesuvius.neural_tracing.tracers.fibers.evaluation.evaluate --help
 ```
 
@@ -112,7 +112,7 @@ DAgger subprocesses receive `runtime.dagger_threads` (default 4), independently 
 The `flow_matching` checkpoints of the v4-extension and v5 runs and the `coordinate_regression` checkpoints of
 `mixed_ct_afv_forward35_v1` and `mixed_ct_afv_v3init_nomem_b8` (patch encoder, decoder, segment scorer; no memory or
 identity heads) trace through `legacy/`, a frozen copy of those models kept apart from `tracers/models/`. It takes the same
-arguments as `tracing.infer` and refuses checkpoints with features it does not implement (decision memory, identity
+arguments as `tracing.inference` and refuses checkpoints with features it does not implement (decision memory, identity
 heads, whole-crop planes); there is no training support.
 
 ```bash

@@ -73,7 +73,7 @@ class OnlineCollector:
     def __init__(self, directory, fibers, val_z, device, every=1000, fibers_per_collection=64,
                  batch=8, forward_chunk=0, seed=0, replay_keep=4, initial=(), trace_len=768.,
                  before=48., after=64., stride=16., max_states=192, confidence=None, n_commit=None, gate=None,
-                 collector_module='vesuvius.neural_tracing.tracers.fibers.tracing.collect', extra_args=(), threads=4,
+                 collector_module='vesuvius.neural_tracing.tracers.fibers.train.dagger.collect', extra_args=(), threads=4,
                  length_power=0.):
         self.directory = Path(directory).resolve()
         self.directory.mkdir(parents=True, exist_ok=True)

@@ -27,7 +27,8 @@ from vesuvius.neural_tracing.tracers.fibers.frames.ct import SeedHeadingError, S
 from vesuvius.neural_tracing.tracers.shared.policy import checkpoint_policy
 from vesuvius.neural_tracing.tracers.shared.reference import SEED_FIELDS
 from vesuvius.neural_tracing.tracers.fibers.data.state_labels import DEPARTURE_DISTANCE, DEPARTURE_PATIENCE, REASON, RECOVERABLE, REPLAY_CLASSES, SUPERVISION, TERMINAL, TraceLabeler, replay_class
-from vesuvius.neural_tracing.tracers.fibers.tracing.trace import ModelTracer, TraceParams
+from vesuvius.neural_tracing.tracers.fibers.tracing.trace import FiberTracer, TraceParams
+from vesuvius.neural_tracing.tracers.models.checkpoint import load_checkpoint
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume
 
 
@@ -288,7 +289,34 @@ def supply_summary(rows, reasons, seconds, traced):
                 traced_voxels=float(traced), seconds=float(seconds), voxels_per_second=float(traced/max(seconds, 1e-9)))
 
 
-def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer, bank_loader=None, dataset_loader=None):
+def switch_detector(args, checkpoint, fibers, band, spec):
+    """Switch detection against neighboring annotations; AFV sources only (Paris 4 has no neighbor paths)."""
+    if not (args.dataset_name and hasattr(fibers, 'metadata')):
+        return None
+    from vesuvius.neural_tracing.tracers.fibers.data.afv_neighbors import AFVBank
+    from vesuvius.neural_tracing.tracers.fibers.data.bank_geometry import BankSwitchDetector
+    return BankSwitchDetector([AFVBank(fibers)], args.bank_switch_tolerance, args.bank_own_tolerance)
+
+
+def load_dataset(args, checkpoint):
+    from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolumeSpec
+    document = checkpoint.get('dataset_config')
+    if not document:
+        raise ValueError('Checkpoint has no mixed dataset configuration')
+    source = next((s for s in document['sources'] if s['name'] == args.dataset_name), None)
+    if source is None:
+        raise ValueError('Unknown dataset source')
+    if source['kind'] == 'paris4':
+        from vesuvius.neural_tracing.tracers.fibers.data.datasets import load_primary_dataset
+        spec = CTVolumeSpec.from_dict(checkpoint['vol_spec'])
+        _,fibers,_,_ = load_primary_dataset(document,spec)
+        return spec,fibers,None
+    from vesuvius.neural_tracing.tracers.fibers.data.datasets import open_afv_source
+    fibers, _, spec, _ = open_afv_source(source, document['cache_dir'], checkpoint['ct_normalization'])
+    return spec,fibers,None
+
+
+def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument('--checkpoint', required=True)
     ap.add_argument('--fibers', required=True)
@@ -327,7 +355,7 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer, bank_loader=
         raise ValueError('Positive collector thread count required')
     torch.set_num_threads(args.threads)
     print(f'Collector PyTorch threads: {torch.get_num_threads()}', flush=True)
-    model, crop, n_hist, spec, ck = checkpoint_loader(args.checkpoint, args.device)
+    model, crop, n_hist, spec, ck = load_checkpoint(args.checkpoint, args.device)
     if args.frame_checkpoint:
         from vesuvius.neural_tracing.tracers.fibers.frames.learned import bind_frame_checkpoint
         bind_frame_checkpoint(model.cfg, args.frame_checkpoint)
@@ -337,21 +365,19 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer, bank_loader=
                        label_tolerance=float(ck.get('tolerance', 1.5)),
                        max_recovery_distance=model.cfg.max_recovery_distance)
     if args.dataset_name:
-        if dataset_loader is None:
-            raise ValueError('This collector does not support named datasets')
-        spec, train_f, band = dataset_loader(args, ck)
+        spec, train_f, band = load_dataset(args, ck)
     else:
         fibers = load_fibers(args.fibers, grid_scale=spec.grid_scale)
         band = ZBand(args.val_z[0]/spec.grid_scale, args.val_z[1]/spec.grid_scale)
         train_f, _ = split_fibers(fibers, band)
     vol = CTVolume(spec, cache_bytes=2 << 30)
-    bank_detector = bank_loader(args, ck, train_f, band, spec) if bank_loader is not None else None
+    bank_detector = switch_detector(args, ck, train_f, band, spec)
     rng = np.random.default_rng(args.seed)
     cursor = CoverageCursor.load(train_f, args.coverage_state, args.seed, args.length_power)
     with warnings.catch_warnings():
         warnings.simplefilter('ignore')
         seeds, skipped = select_seeds(train_f, vol, cursor, args.fibers_per_collection, rng, band)
-    tracer = tracer_class(model, vol, crop, n_hist,
+    tracer = FiberTracer(model, vol, crop, n_hist,
                           TraceParams.from_policy(policy, max_len=args.trace_len, seed=args.seed,
                                                   forward_chunk=args.forward_chunk), device=args.device)
     rows, track, reasons, traced = [], [], [], 0.
@@ -408,3 +434,7 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer, bank_loader=
     cursor.save(path.with_suffix('.coverage.json'))
     print(json.dumps(dict(out=str(path), **supply)))
     return str(path)
+
+
+if __name__ == '__main__':
+    main()

@@ -1,5 +1,5 @@
 """Trace with a pre-cleanup checkpoint ('flow_matching': legacy/flow_v5.py, 'coordinate_regression':
-legacy/coordinate_regression.py, chosen by the checkpoint's model type); arguments as tracing/infer.py."""
+legacy/coordinate_regression.py, chosen by the checkpoint's model type); arguments as tracing/inference.py."""
 import torch
 
 from vesuvius.neural_tracing.tracers.fibers.tracing.trace import FiberTracer

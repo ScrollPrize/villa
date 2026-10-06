@@ -18,7 +18,7 @@ import torch
 
 from vesuvius.neural_tracing.tracers.fibers.data.data import (
     TASKS, FollowDataset, SampleConfig, TaskBudget, fiber_manifest, load_replay, usable_replay)
-from vesuvius.neural_tracing.tracers.fibers.train.online import OnlineCollector
+from vesuvius.neural_tracing.tracers.fibers.train.dagger.online import OnlineCollector
 from vesuvius.neural_tracing.tracers.shared.policy import (DEFAULT_CONFIDENCE, DEFAULT_GATE, gate_horizon,
     OperatingPolicy, selection_window)
 from vesuvius.neural_tracing.tracers.fibers.train.runloop import RunLog, lr_at, prepare_run_dir, update_ema, training_rng_state, resume_training
@@ -564,7 +564,7 @@ def main(argv=None):
                       stride=0. if cfg.model_type == 'sequence' else args.dagger_stride,
                       max_states=1 << 20 if cfg.model_type == 'sequence' else 192,
                       confidence=policy.confidence, n_commit=policy.n_commit, gate=policy.gate,
-                      collector_module='vesuvius.neural_tracing.tracers.fibers.tracing.collect', threads=args.dagger_threads)
+                      collector_module='vesuvius.neural_tracing.tracers.fibers.train.dagger.collect', threads=args.dagger_threads)
     bank_args = ('--bank-switch-tolerance', args.bank_switch_tolerance, '--bank-own-tolerance', args.bank_own_tolerance)
     collector = OnlineCollector(out/'dagger', args.fibers, args.val_z, args.device,
         initial=[c._dir for c in caches], **collection, extra_args=bank_args)
@@ -580,7 +580,7 @@ def main(argv=None):
     dataset, dataset_provenance = build_mixed_dataset(dataset, dataset_document, cfg, sample,
         identity_sampling, args, seed=args.seed+done, out=out, resume=resume is not None,
         normalization=ct_normalization, budget=budget)
-    from vesuvius.neural_tracing.tracers.fibers.train.online import MultiSourceCollector
+    from vesuvius.neural_tracing.tracers.fibers.train.dagger.online import MultiSourceCollector
     collectors = []
     for source, source_dataset in zip(dataset_document['sources'], dataset.datasets):
         if source['kind'] == 'paris4':

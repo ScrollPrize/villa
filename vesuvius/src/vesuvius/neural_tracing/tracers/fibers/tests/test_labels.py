@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 from vesuvius.neural_tracing.tracers.fibers.data import data as D
-from vesuvius.neural_tracing.tracers.fibers.tracing.collection import DecisionCollector
+from vesuvius.neural_tracing.tracers.fibers.train.dagger.collect import DecisionCollector
 from vesuvius.neural_tracing.tracers.shared.geometry import CropSpec, arclength, frame_from_heading
 
 

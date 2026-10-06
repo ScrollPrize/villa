@@ -7,7 +7,7 @@ point), CT-unavailable, deduplicated or filtered by an explicit ``--min-length``
 The checkpoint's operating policy is used unless ``--confidence``/``--n-commit``
 or a calibration ``--policy`` overrides it.
 
-  python -m vesuvius.neural_tracing.tracers.fibers.tracing.infer --checkpoint last.pt \
+  python -m vesuvius.neural_tracing.tracers.fibers.tracing.inference --checkpoint last.pt \
       --seed 18529.9,13044.9,51234.1 --family H --out traced/
 """
 
@@ -24,7 +24,8 @@ from scipy.spatial import cKDTree
 
 from vesuvius.neural_tracing.tracers.shared.geometry import arclength, resample_polyline
 from vesuvius.neural_tracing.tracers.shared.policy import checkpoint_policy
-from vesuvius.neural_tracing.tracers.fibers.tracing.trace import ModelTracer, TraceParams
+from vesuvius.neural_tracing.tracers.fibers.tracing.trace import FiberTracer, ModelTracer, TraceParams
+from vesuvius.neural_tracing.tracers.models.checkpoint import load_checkpoint
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume
 from vesuvius.neural_tracing.tracers.fibers.frames.ct import SeedHeadingError, ct_seed_heading, SEED_HEADING_POLICY, TRACE_HEADING_POLICY, FRAME_POLICY
 from vesuvius.neural_tracing.tracers.fibers.frames.learned import trace_family_kwargs
@@ -165,7 +166,7 @@ def export_seeds(tracer, vol, seeds, families, out, *, grid_scale, batch, min_le
     return written, statuses
 
 
-def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer):
+def main(argv=None, *, checkpoint_loader=load_checkpoint, tracer_class=FiberTracer):
     ap = argparse.ArgumentParser()
     ap.add_argument("--checkpoint", required=True)
     ap.add_argument("--ct", default=None, help="override the checkpoint's CT zarr")
@@ -246,3 +247,7 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer):
     dt = time.time() - t0
     print(json.dumps(dict(seeds=len(seeds), written=len(written), skipped=n_skipped, seconds=round(dt, 2),
                           out=os.path.abspath(args.out))))
+
+
+if __name__ == '__main__':
+    main()
