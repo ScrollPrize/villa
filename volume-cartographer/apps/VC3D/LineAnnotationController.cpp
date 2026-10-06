@@ -13734,13 +13734,20 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
     // new surfaces (instead of correcting the cameras afterwards) is the only
     // ordering where no frame — including the adoption-triggered render — is
     // ever rendered with the drifted arc-length mapping.
+    // The markers are built here, before the anchoring, because the anchoring
+    // carries the strip cameras' positions relative to the controls; the
+    // views below adopt this same list.
+    std::vector<LineAnnotationDialog::GeneratedOverlay::ControlPointMarker>
+        controlMarkers = controlMarkersForSession(session);
     if (auto* anchorPane = paneForSurface(session.surfaceName);
         anchorPane && anchorPane->dialog) {
         anchorPane->dialog->anchorGeneratedStripSurfacesForUpdate(
             views.lineSurface.get(),
             views.lineSideSlice.get(),
             views.stripPositionMap,
-            linePoints);
+            linePoints,
+            controlMarkers,
+            session.lineRevision);
     }
 
     // Everything the session currently shows, retained so a failed install can
@@ -13855,7 +13862,7 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
     generatedViews.seedLineIndex = static_cast<int>(session.optimizedLine.points.size() / 2);
     generatedViews.initialCurrentCutFollowsStripMouse =
         !session.disableInitialGeneratedHoverFollow;
-    generatedViews.controlPoints = controlMarkersForSession(session);
+    generatedViews.controlPoints = std::move(controlMarkers);
     for (const auto& marker : generatedViews.controlPoints) {
         if (marker.isSeed && std::isfinite(marker.linePosition)) {
             generatedViews.seedLineIndex = static_cast<int>(std::llround(marker.linePosition));

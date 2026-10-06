@@ -2381,6 +2381,559 @@ TEST_CASE("line annotation anchor remap keeps a pane position on its own fiber p
     }
 }
 
+TEST_CASE("line annotation carried line position stays with its controls across a landing")
+{
+    using vc3d::line_annotation::carriedGeneratedLinePosition;
+    using vc3d::line_annotation::GeneratedLineCarryControl;
+    using vc3d::line_annotation::remappedGeneratedLinePosition;
+
+    // Two wraps of one fiber: an outbound pass along y=0 (indices 0..100,
+    // x = index) and a return pass along y=5 (indices 101..201, x = 100 -
+    // (index - 101)), five voxels apart like adjacent windings. Controls A
+    // (index 20) and B (index 120, the last one); everything past B is the
+    // extrapolated tail.
+    const auto wraps = [](int tailEnd, float outboundY) {
+        std::vector<cv::Vec3f> line;
+        for (int i = 0; i <= 100; ++i) {
+            line.push_back({static_cast<float>(i), outboundY, 0.0f});
+        }
+        for (int i = 101; i <= tailEnd; ++i) {
+            line.push_back({static_cast<float>(100 - (i - 101)), 5.0f, 0.0f});
+        }
+        return line;
+    };
+    const std::vector<cv::Vec3f> oldLine = wraps(201, 0.0f);
+    const std::vector<GeneratedLineCarryControl> oldControls{{1, 20.0}, {2, 120.0}};
+
+    SUBCASE("a re-traced tail that stops short clamps the position to its end")
+    {
+        // The landing's trace from B found no candidates past index 130: the
+        // old spot 60 samples into the tail (x=21, y=5) is 50 voxels from the
+        // new tail's end but only 5 from the outbound pass underneath it.
+        const std::vector<cv::Vec3f> newLine = wraps(130, 0.0f);
+        const std::vector<GeneratedLineCarryControl> newControls{{1, 20.0}, {2, 120.0}};
+        // The regression: nearest-vertex matching lands on the other wrap
+        // (its index tiebreak only chooses among that wrap's vertices).
+        CHECK(remappedGeneratedLinePosition(oldLine, newLine, 180.0) < 100.0);
+        CHECK(carriedGeneratedLinePosition(oldLine, oldControls, newLine, newControls, 180.0) ==
+              doctest::Approx(130.0));
+    }
+
+    SUBCASE("a tail re-traced further keeps the distance past the last control")
+    {
+        const std::vector<cv::Vec3f> newLine = wraps(260, 0.0f);
+        const std::vector<GeneratedLineCarryControl> newControls{{1, 20.0}, {2, 120.0}};
+        CHECK(carriedGeneratedLinePosition(oldLine, oldControls, newLine, newControls, 180.0) ==
+              doctest::Approx(180.0));
+    }
+
+    SUBCASE("a control placed in the tail does not move a position beyond it")
+    {
+        // The placement that extends the fiber: C lands at index 150 and the
+        // tail is re-traced past it; the position stays 60 past B.
+        const std::vector<cv::Vec3f> newLine = wraps(260, 0.0f);
+        const std::vector<GeneratedLineCarryControl> newControls{
+            {1, 20.0}, {2, 120.0}, {3, 150.0}};
+        CHECK(carriedGeneratedLinePosition(oldLine, oldControls, newLine, newControls, 180.0) ==
+              doctest::Approx(180.0));
+    }
+
+    SUBCASE("a renumbered tail carries by arc length, not by sample count")
+    {
+        // The new line samples the tail at half spacing from B on: 60
+        // voxels past B is now 120 samples past it.
+        std::vector<cv::Vec3f> newLine(oldLine.begin(), oldLine.begin() + 121);
+        for (int k = 1; k <= 160; ++k) {
+            newLine.push_back({static_cast<float>(81.0 - 0.5 * k), 5.0f, 0.0f});
+        }
+        const std::vector<GeneratedLineCarryControl> newControls{{1, 20.0}, {2, 120.0}};
+        CHECK(carriedGeneratedLinePosition(oldLine, oldControls, newLine, newControls, 180.0) ==
+              doctest::Approx(240.0));
+    }
+
+    SUBCASE("a kept tail resolves the exact spot even after the span before it changed length")
+    {
+        // Manual mode, or a tail the landing kept: the old tail bulged to
+        // y=8 between indices 125 and 145 (between B and the spot, which
+        // made that stretch longer) and the re-trace straightened it; past
+        // the bulge the tail is the same geometry. Counting arc length from
+        // B would overshoot by the bulge's extra length; the old spot is
+        // right there on the new line.
+        std::vector<cv::Vec3f> bulged = oldLine;
+        for (int i = 125; i <= 145; ++i) {
+            bulged[static_cast<size_t>(i)][1] =
+                5.0f + 3.0f * (1.0f - std::abs(static_cast<float>(i - 135)) / 10.0f);
+        }
+        const std::vector<GeneratedLineCarryControl> newControls{{1, 20.0}, {2, 120.0}};
+        const std::vector<double> bulgedArcs =
+            vc3d::line_annotation::generatedCumulativeArcLength(bulged);
+        const double arcCarried = 120.0 + (bulgedArcs[180] - bulgedArcs[120]);
+        REQUIRE(arcCarried > 180.5);
+        CHECK(carriedGeneratedLinePosition(bulged, oldControls, oldLine, newControls, 180.0) ==
+              doctest::Approx(180.0));
+        // Beyond tolerance the arc-length carry decides: the same tail
+        // shifted two voxels sideways.
+        std::vector<cv::Vec3f> shifted = oldLine;
+        for (size_t i = 121; i < shifted.size(); ++i) {
+            shifted[i][1] = 7.0f;
+        }
+        const std::vector<double> shiftedArcs =
+            vc3d::line_annotation::generatedCumulativeArcLength(shifted);
+        const double expectedShifted = vc3d::line_annotation::generatedLinePositionAtArcLength(
+            shiftedArcs, shiftedArcs[120] + (bulgedArcs[180] - bulgedArcs[120]));
+        CHECK(carriedGeneratedLinePosition(bulged, oldControls, shifted, newControls, 180.0) ==
+              doctest::Approx(expectedShifted));
+        // With the spot gone from the new tail, the arc-length carry takes
+        // over (the new tail is sampled at half spacing: twice the samples).
+        std::vector<cv::Vec3f> resampledTail(oldLine.begin(), oldLine.begin() + 121);
+        for (int k = 1; k <= 160; ++k) {
+            resampledTail.push_back({static_cast<float>(81.0 - 0.5 * k), 5.0f, 0.0f});
+        }
+        // Resampled at half spacing the old spot IS still on the new tail;
+        // shift the tail sideways so it is not.
+        for (size_t i = 121; i < resampledTail.size(); ++i) {
+            resampledTail[i][1] = 7.0f;
+        }
+        // The old arc from B to the spot (60 voxels plus the bulge) past B:
+        // the first step reaches the shifted tail (sqrt(0.5^2 + 2^2)), the
+        // rest are half-voxel samples.
+        const double expected =
+            121.0 + ((bulgedArcs[180] - bulgedArcs[120]) - std::sqrt(0.25 + 4.0)) / 0.5;
+        CHECK(carriedGeneratedLinePosition(bulged, oldControls, resampledTail, newControls, 180.0) ==
+              doctest::Approx(expected).epsilon(1.0e-4));
+    }
+
+    SUBCASE("inside a span the search never leaves the span")
+    {
+        // The span A..B was re-solved twelve voxels off its old path, which
+        // puts the old spot (60, 0) nearer to the return pass (five voxels)
+        // than to its own span, beyond the plain remap's tiebreak band. Plain
+        // matching jumps wraps; the carry stays between A and B and lands on
+        // the nearest point of the span.
+        const std::vector<cv::Vec3f> newLine = wraps(201, -12.0f);
+        const std::vector<GeneratedLineCarryControl> newControls{{1, 20.0}, {2, 120.0}};
+        CHECK(remappedGeneratedLinePosition(oldLine, newLine, 60.0) > 100.0);
+        CHECK(carriedGeneratedLinePosition(oldLine, oldControls, newLine, newControls, 60.0) ==
+              doctest::Approx(60.0));
+    }
+
+    SUBCASE("a tail passing the old spot twice takes the passage nearest the expectation")
+    {
+        // The re-traced tail from B runs out along y=5, turns, and comes
+        // back along y=5.6 (within tolerance of the old spot (21, 5) on
+        // both passages) before leaving sideways. The arc-length
+        // expectation is 60 past B, on the outbound passage: that passage
+        // wins, not the geometrically nearest one.
+        std::vector<cv::Vec3f> newLine(oldLine.begin(), oldLine.begin() + 121);
+        for (int k = 1; k <= 75; ++k) {  // outbound: x 80..6 at y=5
+            newLine.push_back({static_cast<float>(81 - k), 5.0f, 0.0f});
+        }
+        for (int k = 1; k <= 75; ++k) {  // return: x 7..81 at y=5.6
+            newLine.push_back({static_cast<float>(6 + k), 5.6f, 0.0f});
+        }
+        const std::vector<GeneratedLineCarryControl> newControls{{1, 20.0}, {2, 120.0}};
+        const double carried =
+            carriedGeneratedLinePosition(oldLine, oldControls, newLine, newControls, 180.0);
+        CHECK(carried == doctest::Approx(180.0));
+        // With the outbound passage moved just outside tolerance (1.1
+        // away) only the return passage still runs through the spot: it is
+        // taken, at index 210 (x=21 on the return), although the arc-length
+        // expectation (180) and the geometrically nearest candidates are on
+        // the outbound passage. A nearest-with-tiebreak search followed by
+        // a tolerance check settles on the outbound passage and, failing
+        // the tolerance, falls back to the arc carry instead.
+        std::vector<cv::Vec3f> outboundAway = newLine;
+        for (size_t i = 121; i <= 195; ++i) {
+            outboundAway[i][1] = 6.1f;
+        }
+        REQUIRE(outboundAway[210] == cv::Vec3f(21.0f, 5.6f, 0.0f));
+        const double onReturn =
+            carriedGeneratedLinePosition(oldLine, oldControls, outboundAway, newControls, 180.0);
+        CHECK(onReturn == doctest::Approx(210.0));
+        CHECK(onReturn != doctest::Approx(180.0));
+    }
+
+    SUBCASE("a sharp turn around the old spot is two passages")
+    {
+        // The tail from B heads toward the old spot (21, 5), overshoots it
+        // by two voxels, turns sharply and comes back past it: both legs
+        // run within tolerance of the spot, the turning vertex does not.
+        // The leg nearer the arc-length expectation (60 past B: the first)
+        // is taken at its closest point, not the second leg's.
+        std::vector<cv::Vec3f> newLine(oldLine.begin(), oldLine.begin() + 121);
+        for (int k = 1; k <= 62; ++k) {  // first leg: x 80..19 at y=5
+            newLine.push_back({static_cast<float>(81 - k), 5.0f, 0.0f});
+        }
+        newLine.push_back({19.0f, 7.0f, 0.0f});          // the turn, 2.8 away
+        for (int k = 1; k <= 62; ++k) {  // second leg: x 20..81 at y=5.8
+            newLine.push_back({static_cast<float>(19 + k), 5.8f, 0.0f});
+        }
+        const std::vector<GeneratedLineCarryControl> newControls{{1, 20.0}, {2, 120.0}};
+        CHECK(carriedGeneratedLinePosition(oldLine, oldControls, newLine, newControls, 180.0) ==
+              doctest::Approx(180.0));
+    }
+
+    SUBCASE("a reversed line carries the tail on the other side of its control")
+    {
+        // The stored line was reversed between publishes: A and B swap
+        // order, and a position 10 past B (old 130) is 10 BEFORE B on the
+        // new line. Straight line, unit spacing, so arc and index agree.
+        std::vector<cv::Vec3f> straight;
+        for (int i = 0; i <= 200; ++i) {
+            straight.push_back({static_cast<float>(i), 0.0f, 0.0f});
+        }
+        std::vector<cv::Vec3f> reversedLine(straight.rbegin(), straight.rend());
+        const std::vector<GeneratedLineCarryControl> forward{{1, 20.0}, {2, 120.0}};
+        const std::vector<GeneratedLineCarryControl> backward{{1, 180.0}, {2, 80.0}};
+        // The exact spot (130, 0) is at reversed index 70.
+        CHECK(carriedGeneratedLinePosition(straight, forward, reversedLine, backward, 130.0) ==
+              doctest::Approx(70.0));
+        // With the spot gone (the reversed tail shifted sideways) the arc
+        // carry still goes 10 before B: index 70.
+        std::vector<cv::Vec3f> reversedShifted = reversedLine;
+        for (size_t i = 0; i < 80; ++i) {
+            reversedShifted[i][1] = 3.0f;
+        }
+        const std::vector<double> shiftedArcs =
+            vc3d::line_annotation::generatedCumulativeArcLength(reversedShifted);
+        const double tenBeforeB = vc3d::line_annotation::generatedLinePositionAtArcLength(
+            shiftedArcs, shiftedArcs[80] - 10.0);
+        REQUIRE(tenBeforeB < 80.0);
+        CHECK(carriedGeneratedLinePosition(straight, forward, reversedShifted, backward, 130.0) ==
+              doctest::Approx(tenBeforeB));
+        // Before A on the old line (old 10): 10 past A on the reversed one.
+        CHECK(carriedGeneratedLinePosition(straight, forward, reversedLine, backward, 10.0) ==
+              doctest::Approx(190.0));
+        // Inside a span the bounds already follow the order: old 70 is
+        // reversed index 130.
+        CHECK(carriedGeneratedLinePosition(straight, forward, reversedLine, backward, 70.0) ==
+              doctest::Approx(130.0));
+        // With a single matched control the order is assumed kept (a
+        // reversal comes from a merge and matches every control): the
+        // geometry at that control is deliberately not consulted, so a
+        // sharp bend from a re-solve, a repeated point or a non-finite
+        // neighbour at the control cannot turn a kept line into a
+        // "reversed" one.
+        const std::vector<GeneratedLineCarryControl> onlyB{{2, 120.0}};
+        CHECK(carriedGeneratedLinePosition(straight, onlyB, straight, onlyB, 130.0) ==
+              doctest::Approx(130.0));
+        std::vector<cv::Vec3f> bent = straight;
+        for (int i = 121; i <= 125; ++i) {  // the line doubles back right after B
+            bent[static_cast<size_t>(i)] = {static_cast<float>(240 - i), 0.0f, 0.0f};
+        }
+        std::vector<cv::Vec3f> bentShifted = bent;
+        for (size_t i = 121; i < bentShifted.size(); ++i) {
+            bentShifted[i][1] = 3.0f;
+        }
+        // Past B on the bent line; the arc carry goes 10 past B along it.
+        const std::vector<double> bentArcs =
+            vc3d::line_annotation::generatedCumulativeArcLength(bentShifted);
+        CHECK(carriedGeneratedLinePosition(straight, onlyB, bentShifted, onlyB, 130.0) ==
+              doctest::Approx(vc3d::line_annotation::generatedLinePositionAtArcLength(
+                  bentArcs, bentArcs[120] + 10.0)));
+        std::vector<cv::Vec3f> repeated = straight;
+        repeated[121] = repeated[120];
+        CHECK(carriedGeneratedLinePosition(straight, onlyB, repeated, onlyB, 130.0) > 120.0);
+        std::vector<cv::Vec3f> holed = straight;
+        holed[121] = {std::numeric_limits<float>::quiet_NaN(), 0.0f, 0.0f};
+        CHECK(carriedGeneratedLinePosition(straight, onlyB, holed, onlyB, 130.0) > 120.0);
+    }
+
+    SUBCASE("inside a sparse span the continuity tiebreak keeps the pass")
+    {
+        // One long span A(20)..B(190) holds both passes. The re-solve moved
+        // the outbound pass six voxels, the return pass is five away from
+        // the old spot (60, 0): within the remap's tiebreak band, the
+        // candidate nearest the spot's expected place in the span wins.
+        const std::vector<GeneratedLineCarryControl> sparseControls{{1, 20.0}, {2, 190.0}};
+        const std::vector<cv::Vec3f> newLine = wraps(201, -6.0f);
+        CHECK(carriedGeneratedLinePosition(oldLine, sparseControls, newLine, sparseControls, 60.0) ==
+              doctest::Approx(60.0));
+    }
+
+    SUBCASE("a control placed since the displayed line anchors the cursor past it")
+    {
+        // The displayed line's controls are A and B; C was placed at index
+        // 150 and published without a line, so it is only known on the
+        // displayed line through its resolved placement. The cursor is 30
+        // voxels past C. The landing lengthens span B..C (a bulge) and
+        // re-traces the tail sideways (y=7), so the old spot is gone.
+        std::vector<cv::Vec3f> newLine(oldLine.begin(), oldLine.begin() + 151);
+        for (int i = 122; i <= 148; ++i) {
+            newLine[static_cast<size_t>(i)][1] =
+                5.0f + 0.5f * (14.0f - std::abs(static_cast<float>(i - 135)));
+        }
+        for (int k = 1; k <= 50; ++k) {
+            newLine.push_back({static_cast<float>(51 - k), 7.0f, 0.0f});
+        }
+        const std::vector<GeneratedLineCarryControl> newControls{
+            {1, 20.0}, {2, 120.0}, {3, 150.0}};
+        const std::vector<double> newArcs =
+            vc3d::line_annotation::generatedCumulativeArcLength(newLine);
+        const double pastC = vc3d::line_annotation::generatedLinePositionAtArcLength(
+            newArcs, vc3d::line_annotation::generatedArcLengthAt(newArcs, 150.0) + 30.0);
+        const double pastB = vc3d::line_annotation::generatedLinePositionAtArcLength(
+            newArcs, vc3d::line_annotation::generatedArcLengthAt(newArcs, 120.0) + 60.0);
+        REQUIRE(pastC > pastB + 2.0);
+        // With C among the displayed line's anchors: 30 past C.
+        const std::vector<GeneratedLineCarryControl> withPlacement{
+            {1, 20.0}, {2, 120.0}, {3, 150.0}};
+        CHECK(carriedGeneratedLinePosition(oldLine, withPlacement, newLine, newControls, 180.0) ==
+              doctest::Approx(pastC));
+        // Without it the cursor would be measured from B and land before
+        // the spot it had past C.
+        CHECK(carriedGeneratedLinePosition(oldLine, oldControls, newLine, newControls, 180.0) ==
+              doctest::Approx(pastB));
+        // The dialog adds the placement from its resolved entries, by
+        // identity and only for the displayed line's revision.
+        std::vector<GeneratedLineCarryControl> anchors = oldControls;
+        vc3d::line_annotation::GeneratedPendingPlacement placedC;
+        placedC.identity = 3;
+        placedC.linePosition = 150.0;
+        placedC.lineRevision = 7;
+        vc3d::line_annotation::GeneratedPendingPlacement otherRevision = placedC;
+        otherRevision.identity = 4;
+        otherRevision.lineRevision = 8;
+        vc3d::line_annotation::GeneratedPendingPlacement knownB;
+        knownB.identity = 2;
+        knownB.linePosition = 999.0;
+        knownB.lineRevision = 7;
+        vc3d::line_annotation::appendGeneratedLineCarryControls(
+            anchors,
+            std::vector<vc3d::line_annotation::GeneratedPendingPlacement>{
+                placedC, otherRevision, knownB},
+            7);
+        REQUIRE(anchors.size() == 3);
+        CHECK(anchors[1].linePosition == doctest::Approx(120.0));
+        CHECK(anchors[2].identity == 3);
+        CHECK(carriedGeneratedLinePosition(oldLine, anchors, newLine, newControls, 180.0) ==
+              doctest::Approx(pastC));
+    }
+
+    SUBCASE("an unchanged span resolves the exact spot after renumbering")
+    {
+        // The head grew by 30 samples: every index shifts, the spot does not.
+        std::vector<cv::Vec3f> newLine;
+        for (int i = 0; i < 30; ++i) {
+            newLine.push_back({static_cast<float>(i) - 30.0f, 0.0f, 0.0f});
+        }
+        newLine.insert(newLine.end(), oldLine.begin(), oldLine.end());
+        const std::vector<GeneratedLineCarryControl> newControls{{1, 50.0}, {2, 150.0}};
+        CHECK(carriedGeneratedLinePosition(oldLine, oldControls, newLine, newControls, 60.25) ==
+              doctest::Approx(90.25));
+        // Before the first control: the same distance ahead of A.
+        CHECK(carriedGeneratedLinePosition(oldLine, oldControls, newLine, newControls, 10.0) ==
+              doctest::Approx(40.0));
+    }
+
+    SUBCASE("a deleted bracketing control falls back to the next matched one")
+    {
+        // Old controls A, B, C; the position sits between B and C and C is
+        // deleted by the edit: B anchors it as a tail position.
+        const std::vector<GeneratedLineCarryControl> threeControls{
+            {1, 20.0}, {2, 120.0}, {3, 160.0}};
+        const std::vector<GeneratedLineCarryControl> newControls{{1, 20.0}, {2, 120.0}};
+        CHECK(carriedGeneratedLinePosition(oldLine, threeControls, oldLine, newControls, 140.0) ==
+              doctest::Approx(140.0));
+    }
+
+    SUBCASE("without matchable controls the plain remap decides")
+    {
+        const std::vector<cv::Vec3f> newLine = wraps(130, 0.0f);
+        const std::vector<GeneratedLineCarryControl> anonymous{{0, 20.0}, {0, 120.0}};
+        CHECK(carriedGeneratedLinePosition(oldLine, anonymous, newLine, anonymous, 180.0) ==
+              doctest::Approx(remappedGeneratedLinePosition(oldLine, newLine, 180.0)));
+        // An identity published twice is ambiguous and anchors nothing,
+        // on either side.
+        const std::vector<GeneratedLineCarryControl> twice{{2, 20.0}, {2, 120.0}};
+        CHECK(carriedGeneratedLinePosition(oldLine, oldControls, newLine, twice, 180.0) ==
+              doctest::Approx(remappedGeneratedLinePosition(oldLine, newLine, 180.0)));
+        // Old side: {1 at 20, 1 at 120} against {1 at 120} on an identical
+        // line would otherwise bracket position 60 with one control on both
+        // sides and collapse it onto that control.
+        const std::vector<GeneratedLineCarryControl> oldTwice{{1, 20.0}, {1, 120.0}};
+        const std::vector<GeneratedLineCarryControl> oneNew{{1, 120.0}};
+        CHECK(carriedGeneratedLinePosition(oldLine, oldTwice, oldLine, oneNew, 60.0) ==
+              doctest::Approx(60.0));
+        // A duplicate with a non-finite position still counts as one.
+        const double nan = std::numeric_limits<double>::quiet_NaN();
+        const std::vector<GeneratedLineCarryControl> oneOld{{1, 20.0}};
+        const std::vector<GeneratedLineCarryControl> newWithNan{{1, 120.0}, {1, nan}};
+        CHECK(carriedGeneratedLinePosition(oldLine, oneOld, oldLine, newWithNan, 60.0) ==
+              doctest::Approx(60.0));
+        const std::vector<GeneratedLineCarryControl> oldWithInf{
+            {1, 20.0}, {1, std::numeric_limits<double>::infinity()}};
+        CHECK(carriedGeneratedLinePosition(oldLine, oldWithInf, oldLine, oneOld, 60.0) ==
+              doctest::Approx(60.0));
+    }
+
+    SUBCASE("degenerate inputs")
+    {
+        const std::vector<cv::Vec3f> empty;
+        const std::vector<GeneratedLineCarryControl> newControls{{1, 20.0}, {2, 120.0}};
+        CHECK(carriedGeneratedLinePosition(oldLine, oldControls, empty, newControls, 180.0) ==
+              doctest::Approx(0.0));
+        CHECK(carriedGeneratedLinePosition(empty, oldControls, oldLine, newControls, 180.0) ==
+              doctest::Approx(180.0));
+        const double nan = std::numeric_limits<double>::quiet_NaN();
+        CHECK(carriedGeneratedLinePosition(oldLine, oldControls, oldLine, newControls, nan) ==
+              doctest::Approx(0.0));
+        // Past the old line's end: clamped onto it first, then carried.
+        CHECK(carriedGeneratedLinePosition(oldLine, oldControls, oldLine, newControls, 999.0) ==
+              doctest::Approx(201.0));
+    }
+}
+
+TEST_CASE("line annotation bounded remap measures the distance of the position it returns")
+{
+    using vc3d::line_annotation::remappedGeneratedLinePositionWithin;
+    using vc3d::line_annotation::remappedGeneratedLinePositionFromAnchor;
+    const std::vector<cv::Vec3f> line{{0.0f, 0.0f, 0.0f}, {10.0f, 0.0f, 0.0f}, {20.0f, 0.0f, 0.0f}};
+    const cv::Vec3f anchor(0.0f, 0.0f, 0.0f);
+
+    SUBCASE("a fractional lower bound is the nearest reachable position, at its own distance")
+    {
+        const auto within = remappedGeneratedLinePositionWithin(line, anchor, 0.0, 0.5, 2.0);
+        REQUIRE(within);
+        CHECK(within->position == doctest::Approx(0.5));
+        CHECK(within->distanceSq == doctest::Approx(25.0));
+    }
+
+    SUBCASE("a fractional upper bound clamps the segment projection")
+    {
+        const auto within = remappedGeneratedLinePositionWithin(line, cv::Vec3f(20.0f, 0.0f, 0.0f), 0.0, 0.0, 1.25);
+        REQUIRE(within);
+        CHECK(within->position == doctest::Approx(1.25));
+        CHECK(within->distanceSq == doctest::Approx(7.5 * 7.5));
+    }
+
+    SUBCASE("the whole-line remap is unchanged by the bounds")
+    {
+        CHECK(remappedGeneratedLinePositionFromAnchor(line, cv::Vec3f(12.5f, 1.0f, 0.0f), 0.0) ==
+              doctest::Approx(1.25));
+        const auto within = remappedGeneratedLinePositionWithin(line, cv::Vec3f(12.5f, 1.0f, 0.0f), 0.0, 0.0, 2.0);
+        REQUIRE(within);
+        CHECK(within->position == doctest::Approx(1.25));
+        CHECK(within->distanceSq == doctest::Approx(1.0));
+    }
+
+    SUBCASE("the spot search splits passages at a vertex outside tolerance")
+    {
+        using vc3d::line_annotation::generatedLinePositionNearSpot;
+        // A V around the anchor: both legs pass within tolerance, the tip
+        // is 2 away. The passage nearer the expectation (the second leg)
+        // is answered at its own closest point.
+        const std::vector<cv::Vec3f> vee{{-10.0f, 0.0f, 0.0f}, {2.0f, 0.0f, 0.0f}, {-10.0f, 1.0f, 0.0f}};
+        const auto second = generatedLinePositionNearSpot(vee, cv::Vec3f(0.0f, 0.0f, 0.0f), 1.17, 0.0, 2.0, 1.0);
+        REQUIRE(second);
+        CHECK(*second > 1.1);
+        CHECK(*second < 1.2);
+        const auto first = generatedLinePositionNearSpot(vee, cv::Vec3f(0.0f, 0.0f, 0.0f), 0.8, 0.0, 2.0, 1.0);
+        REQUIRE(first);
+        CHECK(*first == doctest::Approx(10.0 / 12.0));
+        // Nothing within tolerance: nullopt.
+        CHECK_FALSE(generatedLinePositionNearSpot(vee, cv::Vec3f(0.0f, 5.0f, 0.0f), 1.0, 0.0, 2.0, 1.0));
+        // A single position.
+        CHECK(generatedLinePositionNearSpot(vee, cv::Vec3f(2.0f, 0.5f, 0.0f), 1.0, 1.0, 1.0, 1.0) ==
+              doctest::Approx(1.0));
+    }
+
+    SUBCASE("non-finite vertices in the bounds are skipped, none at all gives nothing")
+    {
+        std::vector<cv::Vec3f> holed = line;
+        holed[1] = {std::numeric_limits<float>::quiet_NaN(), 0.0f, 0.0f};
+        const auto within = remappedGeneratedLinePositionWithin(holed, anchor, 0.0, 0.0, 2.0);
+        REQUIRE(within);
+        CHECK(within->position == doctest::Approx(0.0));
+        CHECK_FALSE(remappedGeneratedLinePositionWithin(holed, anchor, 0.0, 0.5, 1.5));
+    }
+}
+
+TEST_CASE("line annotation placement resolved by the rebase anchors the carry on the displayed line")
+{
+    using namespace vc3d::line_annotation;
+    // Displayed line (revision 6): the two-wrap fiber of the carry tests,
+    // controls A (identity 1, index 20) and B (identity 2, index 120).
+    std::vector<cv::Vec3f> displayedLine;
+    for (int i = 0; i <= 100; ++i) {
+        displayedLine.push_back({static_cast<float>(i), 0.0f, 0.0f});
+    }
+    for (int i = 101; i <= 201; ++i) {
+        displayedLine.push_back({static_cast<float>(100 - (i - 101)), 5.0f, 0.0f});
+    }
+    const auto marker = [](uint64_t identity, cv::Vec3f point, double linePosition, double arc,
+                           double total, uint64_t revision) {
+        GeneratedOverlay::ControlPointMarker m;
+        m.identity = identity;
+        m.point = point;
+        m.linePosition = linePosition;
+        m.arcLength = arc;
+        m.lineArcLength = total;
+        m.lineRevision = revision;
+        return m;
+    };
+    const std::vector<GeneratedOverlay::ControlPointMarker> displayedControls{
+        marker(1, {20.0f, 0.0f, 0.0f}, 20.0, 20.0, 201.0, 6),
+        marker(2, {81.0f, 5.0f, 0.0f}, 120.0, 120.0, 201.0, 6)};
+    const GeneratedOverviewLayout displayed = generatedOverviewSettledLayout(displayedControls, displayedLine);
+    REQUIRE_FALSE(displayed.empty());
+
+    // The user placed C at displayed index 150 (x=51 on the return pass);
+    // the controller's splice (revision 7) numbers it 4 among coarse
+    // provisional samples, so its published linePosition is NOT a displayed
+    // position.
+    GeneratedPendingPlacement placement;
+    placement.point = {51.0f, 5.0f, 0.0f};
+    placement.anchor = placement.point;
+    placement.token = 11;
+    placement.arcLength = 150.0;
+    placement.linePosition = 150.0;
+    placement.lineRevision = 6;
+    std::vector<GeneratedPendingPlacement> pending{placement};
+    std::vector<GeneratedPendingPlacement> resolved;
+    const std::vector<GeneratedOverlay::ControlPointMarker> published{
+        marker(1, {20.0f, 0.0f, 0.0f}, 1.0, 20.0, 160.0, 7),
+        marker(2, {81.0f, 5.0f, 0.0f}, 3.0, 120.0, 160.0, 7),
+        marker(3, {51.0f, 5.0f, 0.0f}, 4.0, 150.0, 160.0, 7)};
+    (void)generatedDisplaySpaceControlArcLengths(displayed, published, pending, resolved, 6, displayedLine);
+    REQUIRE(resolved.size() == 1);
+    CHECK(resolved[0].identity == 3);
+    CHECK(resolved[0].lineRevision == 6);
+    CHECK(resolved[0].linePosition == doctest::Approx(150.0));  // displayed, not 4
+    CHECK(pending.empty());
+
+    // The landing (revision 8): span B..C re-solved with a bulge (longer),
+    // the tail past C re-traced sideways (the old spot is gone). The cursor
+    // was 30 voxels past C on the displayed line (index 180).
+    std::vector<cv::Vec3f> landed(displayedLine.begin(), displayedLine.begin() + 151);
+    for (int i = 122; i <= 148; ++i) {
+        landed[static_cast<size_t>(i)][1] = 5.0f + 0.5f * (14.0f - std::abs(static_cast<float>(i - 135)));
+    }
+    for (int k = 1; k <= 50; ++k) {
+        landed.push_back({static_cast<float>(51 - k), 7.0f, 0.0f});
+    }
+    const std::vector<GeneratedLineCarryControl> landedControls{{1, 20.0}, {2, 120.0}, {3, 150.0}};
+    const std::vector<double> landedArcs = generatedCumulativeArcLength(landed);
+    const double pastC = generatedLinePositionAtArcLength(landedArcs, landedArcs[150] + 30.0);
+    const double pastB = generatedLinePositionAtArcLength(landedArcs, landedArcs[120] + 60.0);
+    REQUIRE(pastC > pastB + 2.0);
+
+    // The old-side anchors: the displayed line's controls plus the resolved
+    // placement, for the displayed revision only.
+    std::vector<GeneratedLineCarryControl> anchors = generatedLineCarryControls(displayedControls);
+    appendGeneratedLineCarryControls(anchors, resolved, 6);
+    REQUIRE(anchors.size() == 3);
+    CHECK(carriedGeneratedLinePosition(displayedLine, anchors, landed, landedControls, 180.0) ==
+          doctest::Approx(pastC));
+    // For another revision the entry is rejected and the cursor would be
+    // measured from B.
+    std::vector<GeneratedLineCarryControl> wrongRevision = generatedLineCarryControls(displayedControls);
+    appendGeneratedLineCarryControls(wrongRevision, resolved, 5);
+    CHECK(wrongRevision.size() == 2);
+    CHECK(carriedGeneratedLinePosition(displayedLine, wrongRevision, landed, landedControls, 180.0) ==
+          doctest::Approx(pastB));
+}
+
 TEST_CASE("line annotation winding angles unwrap along the line and window half a wrap")
 {
     using vc3d::line_annotation::generatedLineIndexRangeWithinWinding;
