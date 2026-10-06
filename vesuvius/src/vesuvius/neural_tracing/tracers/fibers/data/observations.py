@@ -10,10 +10,9 @@ from vesuvius.neural_tracing.tracers.fibers.data.components import ComponentRule
 from vesuvius.neural_tracing.tracers.fibers.data.data import SOURCE, collate_targets, resolve_trace_seed
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.crops import scalar_crops, empty_image_batch
 from vesuvius.neural_tracing.tracers.shared.geometry import interp_at, traversal_curve
-from vesuvius.neural_tracing.tracers.fibers.tracing.trace import ModelTracer
-from vesuvius.neural_tracing.tracers.shared.reference import SEED_FIELDS, observed_seed
+from vesuvius.neural_tracing.tracers.shared.reference import observed_seed
 from vesuvius.neural_tracing.tracers.fibers.data.state_labels import DEPARTURE_DISTANCE, supervise
-from vesuvius.neural_tracing.tracers.fibers.frames.ct import heading_free_bounds, reframe_item, FRAME_POLICY, FRAME_POLICIES
+from vesuvius.neural_tracing.tracers.fibers.frames.ct import heading_free_bounds, reframe_item, FRAME_POLICIES
 from vesuvius.neural_tracing.tracers.fibers.frames.learned import frame_predictor, orient_items, crop_frame_bounds
 from vesuvius.neural_tracing.tracers.models.model import FollowerConfig
 
@@ -398,22 +397,3 @@ def observation_builder(cfg,**kwargs):
     return IdentityObservationBuilder(cfg,**kwargs)
 
 
-class FiberTracer(ModelTracer):
-    path_context = True
-
-    def __init__(self,model,*args,**kwargs):
-        super().__init__(model,*args,**kwargs)
-        self.observations = observation_builder(model.cfg)
-
-    def build_inputs(self,pos,frames,hist,hmask,paths=None):
-        items = [dict(pos=p,frame=f,hist_local=h,hmask=m,frame_policy=getattr(self, 'frame_policy', FRAME_POLICY))
-                 for p,f,h,m in zip(pos,frames,hist,hmask)]
-        if paths is not None:
-            for item,path in zip(items,paths):
-                item.update({k:path[k] for k in SEED_FIELDS if k in path})
-                item['observed_path'] = path['observed_path']
-                if 'fiber_family' in path:
-                    item['fiber_family'] = path['fiber_family']
-        def move(value):
-            return {k: move(v) for k, v in value.items()} if isinstance(value, dict) else value.to(self.device)
-        return move(self.observations.images(items,self.vol,self.pool))

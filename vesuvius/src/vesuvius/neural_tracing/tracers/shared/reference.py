@@ -1,7 +1,7 @@
 """Observed original-fiber references, independent of annotation labels."""
 import numpy as np
 
-from vesuvius.neural_tracing.tracers.shared.geometry import arclength, normalize
+from vesuvius.neural_tracing.tracers.shared.geometry import arclength, interp_at, normalize
 
 
 SEED_FIELDS = ('seed_pos', 'seed_tangent', 'seed_age', 'seed_valid')
@@ -40,3 +40,10 @@ def observed_path(item):
     # Consecutive stationary points have no arclength. Retain loops/wrong turns.
     return path[np.r_[True, np.linalg.norm(np.diff(path, axis=0), axis=1) > 1e-9]]
 
+
+def trace_history(path, size):
+    """Inference history at unit arclength spacing, newest first, excluding head."""
+    past = np.asarray(path[-2*size-2:])
+    arc = arclength(past)
+    target = arc[-1]-np.arange(1, size+1)
+    return interp_at(past, arc, target.clip(0)), (target >= 0).astype(np.float32)

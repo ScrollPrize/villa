@@ -14,7 +14,8 @@ from vesuvius.neural_tracing.tracers.shared.geometry import CropSpec, normalize
 from vesuvius.neural_tracing.tracers.shared.policy import (DEFAULT_CONFIDENCE, DEFAULT_GATE, DEFAULT_N_COMMIT, GATES, gate_horizon,
     commit_count, selection_window)
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume
-from vesuvius.neural_tracing.tracers.shared.reference import SEED_FIELDS, observed_path
+from vesuvius.neural_tracing.tracers.shared.reference import SEED_FIELDS, observed_path, trace_history
+from vesuvius.neural_tracing.tracers.fibers.data.observations import observation_builder
 from vesuvius.neural_tracing.tracers.fibers.frames.ct import trace_heading, TRACE_HEADING_POLICY, FRAME_POLICY, FRAME_POLICIES, ct_frame, fiber_family
 from vesuvius.neural_tracing.tracers.fibers.frames.learned import frame_predictor, configured_frame_policy, predict_frames
 
@@ -60,15 +61,6 @@ def decision_noise_key(seed, start, decision):
     start = np.round(np.asarray(start, np.float64), 3)+0.  # +0. folds -0. into 0.
     digest = hashlib.blake2b(np.asarray([seed, decision], np.int64).tobytes()+start.tobytes(), digest_size=8).digest()
     return int.from_bytes(digest, 'little') & ((1 << 63)-1)
-
-
-def trace_history(path, size):
-    """Inference history at unit arclength spacing, newest first, excluding head."""
-    from vesuvius.neural_tracing.tracers.shared.geometry import arclength, interp_at
-    past = np.asarray(path[-2*size-2:])
-    arc = arclength(past)
-    target = arc[-1]-np.arange(1, size+1)
-    return interp_at(past, arc, target.clip(0)), (target >= 0).astype(np.float32)
 
 
 def advance_trace_path(path, frame, points, commit, heading_start, shape, params,
@@ -395,3 +387,24 @@ class ModelTracer:
                 for i, frame in zip(reframe, self.map(update, reframe)):
                     frames[i] = frame
         return [np.asarray(p[h:]) for p, h in zip(paths, hist_start)], reasons
+
+
+class FiberTracer(ModelTracer):
+    path_context = True
+
+    def __init__(self,model,*args,**kwargs):
+        super().__init__(model,*args,**kwargs)
+        self.observations = observation_builder(model.cfg)
+
+    def build_inputs(self,pos,frames,hist,hmask,paths=None):
+        items = [dict(pos=p,frame=f,hist_local=h,hmask=m,frame_policy=getattr(self, 'frame_policy', FRAME_POLICY))
+                 for p,f,h,m in zip(pos,frames,hist,hmask)]
+        if paths is not None:
+            for item,path in zip(items,paths):
+                item.update({k:path[k] for k in SEED_FIELDS if k in path})
+                item['observed_path'] = path['observed_path']
+                if 'fiber_family' in path:
+                    item['fiber_family'] = path['fiber_family']
+        def move(value):
+            return {k: move(v) for k, v in value.items()} if isinstance(value, dict) else value.to(self.device)
+        return move(self.observations.images(items,self.vol,self.pool))

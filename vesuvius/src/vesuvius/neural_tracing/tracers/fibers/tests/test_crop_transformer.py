@@ -73,7 +73,7 @@ def test_compiled_training_matches_eager_with_finite_gradients(flow):
 
 
 def test_tracing_runs_the_regression_model(tmp_path):
-    from vesuvius.neural_tracing.tracers.fibers.data.observations import FiberTracer
+    from vesuvius.neural_tracing.tracers.fibers.tracing.trace import FiberTracer
     from vesuvius.neural_tracing.tracers.fibers.tracing.trace import TraceParams
     import numpy as np
     model = small().eval()

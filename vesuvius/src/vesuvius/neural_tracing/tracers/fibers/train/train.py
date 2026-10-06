@@ -25,7 +25,8 @@ from vesuvius.neural_tracing.tracers.shared.policy import (DEFAULT_CONFIDENCE, D
 from vesuvius.neural_tracing.tracers.fibers.train.runloop import RunLog, lr_at, prepare_run_dir, read_checkpoint, save_checkpoint as write_checkpoint, update_ema, training_rng_state, resume_training, raise_open_file_limit
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume, CTVolumeSpec
 from vesuvius.neural_tracing.tracers.models.model import build_model, config_from_checkpoint
-from vesuvius.neural_tracing.tracers.fibers.data.observations import IdentityObservationBuilder, IdentitySampling, FiberTracer, LOCATION_SOURCES
+from vesuvius.neural_tracing.tracers.fibers.data.observations import IdentityObservationBuilder, IdentitySampling, LOCATION_SOURCES
+from vesuvius.neural_tracing.tracers.fibers.tracing.trace import FiberTracer
 from vesuvius.neural_tracing.tracers.fibers.train import run_config
 from vesuvius.neural_tracing.tracers.fibers.train.supervision import commit_window, loss_terms
 from vesuvius.neural_tracing.tracers.fibers.evaluation.diagnostics import decision_rows, summarize_decisions

@@ -28,7 +28,7 @@ from vesuvius.neural_tracing.tracers.shared.geometry import (
 )
 from vesuvius.neural_tracing.tracers.fibers.data.annotation_repair import foldbacks, repair_kinks
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume
-from vesuvius.neural_tracing.tracers.shared.reference import SEED_FIELDS
+from vesuvius.neural_tracing.tracers.shared.reference import SEED_FIELDS, trace_history
 
 
 DATA_VERSION = 2
@@ -428,7 +428,6 @@ def decision_on_path(fiber, t, reverse, cfg, path, arcs, category, sigma, detail
     ending at ``t``): crop heading, history, seed reference and labels exactly as ``make_sample`` builds them."""
     from vesuvius.neural_tracing.tracers.fibers.frames.ct import linear12_heading, trace_heading
     from vesuvius.neural_tracing.tracers.fibers.data.state_labels import constructed_facts, supervise
-    from vesuvius.neural_tracing.tracers.fibers.tracing.trace import trace_history
     p, s = traversal_curve(fiber, reverse)
     pos = path[-1]
     # Only the CT seed axis's sign comes from the direction of travel.

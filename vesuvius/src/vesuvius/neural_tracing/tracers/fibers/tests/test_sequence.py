@@ -86,7 +86,7 @@ def test_training_step_on_an_episode_batch():
 
 
 def test_tracing_builds_whole_trace_history_one_step_per_commit(tmp_path):
-    from vesuvius.neural_tracing.tracers.fibers.data.observations import FiberTracer
+    from vesuvius.neural_tracing.tracers.fibers.tracing.trace import FiberTracer
     from vesuvius.neural_tracing.tracers.fibers.tracing.trace import TraceParams
 
     class Recorder(FiberTracer):

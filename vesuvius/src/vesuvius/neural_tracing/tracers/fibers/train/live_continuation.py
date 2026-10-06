@@ -19,7 +19,8 @@ from vesuvius.neural_tracing.tracers.fibers.frames.ct import FRAME_POLICY, SeedH
 from vesuvius.neural_tracing.tracers.shared.policy import commit_count
 from vesuvius.neural_tracing.tracers.shared.reference import SEED_FIELDS, observed_path
 from vesuvius.neural_tracing.tracers.fibers.data.state_labels import FOLLOWING, RECOVERABLE, TERMINAL, TraceLabeler
-from vesuvius.neural_tracing.tracers.fibers.tracing.trace import TraceParams, advance_trace_path, trace_history
+from vesuvius.neural_tracing.tracers.fibers.tracing.trace import TraceParams, advance_trace_path
+from vesuvius.neural_tracing.tracers.shared.reference import trace_history
 
 OUTCOMES = ('advanced', 'stale', 'censored', 'empty')
 

@@ -2,7 +2,7 @@
 legacy/coordinate_regression.py, chosen by the checkpoint's model type); arguments as tracing/infer.py."""
 import torch
 
-from vesuvius.neural_tracing.tracers.fibers.data.observations import FiberTracer
+from vesuvius.neural_tracing.tracers.fibers.tracing.trace import FiberTracer
 from vesuvius.neural_tracing.tracers.fibers.legacy import coordinate_regression, flow_v5
 from vesuvius.neural_tracing.tracers.fibers.tracing.inference import main as infer
 

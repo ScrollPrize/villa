@@ -1,7 +1,7 @@
 """Collect original-fiber replay with either fiber follower and the enlarged crop exclusion."""
 from vesuvius.neural_tracing.tracers.fibers.tracing.collection import main as collect
 from vesuvius.neural_tracing.tracers.fibers.train.train import load_checkpoint
-from vesuvius.neural_tracing.tracers.fibers.data.observations import FiberTracer
+from vesuvius.neural_tracing.tracers.fibers.tracing.trace import FiberTracer
 
 
 def switch_detector(args, checkpoint, fibers, band, spec):
