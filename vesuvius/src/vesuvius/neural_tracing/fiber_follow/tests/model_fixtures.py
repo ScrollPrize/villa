@@ -12,7 +12,6 @@ import numpy as np
 import torch
 
 from vesuvius.neural_tracing.fiber_follow.models.crop_transformer import FlowConfig, RegressionConfig
-from vesuvius.neural_tracing.fiber_follow.data.data import TracedFiber
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, arclength
 from label_fixtures import state_labels
 
@@ -100,11 +99,6 @@ def proposal_output(curves, hazards, selected=-1):
                 refinement_confidence=confidence,
                 refinement_mask=torch.ones(curves.shape[:2], device=curves.device, dtype=torch.bool),
                 selected_refinement=torch.full((len(curves),), selected % curves.shape[1], device=curves.device))
-
-
-def line_fiber(length=600.):
-    arc = np.arange(length)
-    return TracedFiber('line', np.c_[arc*0+100, arc*0+100, arc+200], arc, '')
 
 
 def array_at(path, values):

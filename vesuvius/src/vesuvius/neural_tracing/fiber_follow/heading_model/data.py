@@ -176,8 +176,7 @@ class HeadingBatchBuilder:
 
     def __call__(self, items, vol):
         patch, path, target = finish_states(items, vol, self.cfg)
-        batch = dict(patch=patch, path=path, target=target,
-                     history=torch.tensor([s['history'] for s in items], dtype=torch.float32))
+        batch = dict(patch=patch, path=path, target=target)
         if self.cfg.predict_normals:
             batch.update(normal_target=torch.from_numpy(np.stack([s['normal_target'] for s in items])),
                          normal_weight=torch.tensor([s['normal_weight'] for s in items], dtype=torch.float32))
@@ -194,7 +193,7 @@ class HeadingStates(FollowDataset):
     """
     def __init__(self, source: Source, cfg: HeadingConfig, sampling: HeadingSampling, batch, seed=0,
                  cache_bytes=512 << 20):
-        super().__init__(source.train, source.spec, sampling.follower_sample_config(), None, chunk=batch, seed=seed,
+        super().__init__(source.train, source.spec, sampling.follower_sample_config(), chunk=batch, seed=seed,
                          cache_bytes=cache_bytes, batch_builder=HeadingBatchBuilder(cfg))
         self.heading_cfg, self.sampling = cfg, sampling
         # Length-weighted like the follower, restricted to fibers long enough for the target span.

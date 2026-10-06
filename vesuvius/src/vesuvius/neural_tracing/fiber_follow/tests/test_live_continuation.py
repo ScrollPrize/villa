@@ -42,7 +42,7 @@ def setup(monkeypatch):
     cfg = SampleConfig(crop=CropSpec(depth=24, width=16, behind=8), n_history=32, n_future=16,
                        startup_shares=(0., 0., 0., 1.), excursion_probability=0., trace_noise_sigma=(0., 0.),
                        trace_noise_smoothing=0.)
-    ds = FollowDataset([fiber], FiberVolumeSpec('unused'), cfg, None, chunk=2)
+    ds = FollowDataset([fiber], FiberVolumeSpec('unused'), cfg, chunk=2)
     live = LiveContinuationSource(policy=POLICY, steps=(4, 4), step=ds.step)
     ds.live_continuation = live
     vol = SimpleNamespace(shape=(1000,)*3)

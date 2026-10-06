@@ -17,7 +17,7 @@ import torch
 
 from .evaluate import dataset_sources
 from .seeds import EvaluationAudit, evaluate, monitor_coverage, score_trace, summarize_outcomes
-from .recovery_scoring import recovery_score, PolylineProjector
+from .recovery_scoring import recovery_score
 from ..data.observations import FiberTracer
 from ..shared.experiment import jsonable
 from ..shared.geometry import arclength, interp_at, tangent_at

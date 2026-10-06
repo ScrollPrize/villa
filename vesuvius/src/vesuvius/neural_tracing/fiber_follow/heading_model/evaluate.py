@@ -28,14 +28,6 @@ def quantiles(values):
 
 
 @torch.no_grad()
-def model_headings(model, patch, path, frames, device='cpu', batch=512, family=None):
-    local = torch.cat([model(patch[i:i+batch].to(device), path[i:i+batch].to(device),
-                            family[i:i+batch].to(device) if family is not None else None).double().cpu()
-                       for i in range(0, len(patch), batch)]).numpy()
-    return [f @ d for f, d in zip(frames, local)]
-
-
-@torch.no_grad()
 def evaluate_states(model, states, patch, path, device='cpu', batch=512):
     family = torch.tensor([s['family'] for s in states], dtype=torch.long, device=device) if model.cfg.predict_frames else None
     outputs = [model.forward_outputs(patch[i:i+batch].to(device), path[i:i+batch].to(device),

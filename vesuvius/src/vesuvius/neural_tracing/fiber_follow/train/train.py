@@ -168,7 +168,7 @@ def initialize_training_optimizer(model, ema, args, resume=None):
     if reset:
         model.requires_grad_(True)
     opt = torch.optim.AdamW(parameters, lr=args.lr, weight_decay=1e-4)
-    done = resume_training(resume, model, ema, opt, reset_optimizer=reset)[0] if resume else 0
+    done = resume_training(resume, model, ema, opt, reset_optimizer=reset) if resume else 0
     origin = done if reset else int((resume or {}).get('lr_restart_step', 0))
     match_optimizer_layout(opt)
     return opt, done, origin
@@ -283,8 +283,7 @@ def training_diagnostics(model, cpu_batch, tracer, fibers, seeds, out, step, log
             filename = f'batch_{step:06d}.png'
             plot_batch(batch['x'][scale], points, target, batch['plane_mask'], crop, images/filename,
                        batch['hist'], batch['hmask'], batch['gt_history'], batch['gt_history_mask'],
-                       source=batch['source'], terminal=batch['terminal'], confidence=prediction['confidence'],
-                       history_channel=None, ct_range=(-4, 4))
+                       source=batch['source'], terminal=batch['terminal'], confidence=prediction['confidence'])
         curves = prediction.get('solver_points', prediction['refinement_points'])
         labels = ([f'integration stage {i}' for i in range(curves.shape[1])] if 'solver_points' in prediction
                   else ['initial proposal']+[f'feedback proposal {i}' for i in range(1, curves.shape[1])])
@@ -563,7 +562,6 @@ def main(argv=None):
     progress('Loading manifest and fiber annotations')
     from vesuvius.neural_tracing.fiber_follow.data.datasets import load_primary_dataset
     fibers,train_f,val_f,manifest = load_primary_dataset(dataset_document,spec)
-    band = None
     progress(f'Loaded {len(train_f)} training fibers and {len(val_f)} validation fibers')
     if fiber_manifest(val_f) != manifest['fibers']:
         raise ValueError('Frozen validation geometry differs from dataset/holdout')
@@ -634,9 +632,9 @@ def main(argv=None):
     progress(f'{args.batch} independent decisions per batch')
     # Paris 4 has no neighbor paths: no foreign masks, bank-covered locations or synthetic wrong continuations.
     builder = IdentityObservationBuilder(cfg,train_f,identity_sampling,augment=True)
-    dataset = FollowDataset(train_f, spec, sample, band, chunk=args.batch, seed=args.seed+done,
+    dataset = FollowDataset(train_f, spec, sample, chunk=args.batch, seed=args.seed+done,
         cache_bytes=int(args.worker_cache_gb*(1 << 30)), onpolicy=caches,
-        replay_index=str(collector.index), batch_builder=builder, additional_crops=(), budget=budget)
+        replay_index=str(collector.index), batch_builder=builder, budget=budget)
     dataset_provenance = None
     if dataset_document:
         from vesuvius.neural_tracing.fiber_follow.data.datasets import build_mixed_dataset

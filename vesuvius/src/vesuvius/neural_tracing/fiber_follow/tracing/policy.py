@@ -133,26 +133,3 @@ def selection_window(n_commit, horizon, gate=DEFAULT_GATE):
     """Prefix length by which a model ranks its proposals: the commit for 'prefix', the full horizon for 'full'
     (where acceptance depends on the last plane)."""
     return horizon if gate == 'full' else n_commit
-
-
-def select_candidate(points, confidence, n_commit, max_distance=DEFAULT_MAX_RECOVERY_DISTANCE,
-                     *, stop_threshold=None):
-    """Rank the commit prefix; optionally rescue a stop with an acceptable alternative.
-
-    Preserve the original winner whenever it can advance. Otherwise choose the
-    longest acceptable prefix, breaking ties by confidence at that prefix and
-    then candidate order. Confidence and recovery limits remain unchanged.
-    """
-    conf = confidence.float().cummin(-1).values
-    allowed = recovery_allowed(points, max_distance)
-    horizon = min(n_commit, conf.shape[-1])
-    selected = conf[..., horizon-1].masked_fill(~allowed, -torch.inf).argmax(-1)
-    if stop_threshold is None:
-        return selected
-    counts, _ = commit_prefix(points, conf, stop_threshold, horizon, max_distance)
-    longest = counts.max(-1, keepdim=True).values
-    last = (counts-1).clamp_min(0)
-    prefix_score = conf.gather(-1, last[..., None]).squeeze(-1)
-    fallback = prefix_score.masked_fill((counts != longest) | (counts == 0), -torch.inf).argmax(-1)
-    stopped = counts.gather(-1, selected[..., None]).squeeze(-1) == 0
-    return torch.where(stopped & (longest.squeeze(-1) > 0), fallback, selected)

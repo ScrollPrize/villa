@@ -118,7 +118,7 @@ class ChunkedArray:
                 raw = fh.read()
         except FileNotFoundError:
             return None
-        buf = raw if self.codec is None else self.codec.decode(raw)
+        buf = self.codec.decode(raw)
         return np.frombuffer(buf, dtype=self.dtype).reshape(self.chunks)
 
     def chunk(self, key: tuple[int, int, int]) -> np.ndarray | None:
@@ -252,7 +252,7 @@ class RemoteChunkedArray(ChunkedArray):
     def __getstate__(self):
         return {**super().__getstate__(), '_array': None}
 
-    def _load(self, key, *, blocking=True):
+    def _load(self, key):
         cached = super()._load(key)
         if cached is not None:
             return cached
@@ -260,16 +260,13 @@ class RemoteChunkedArray(ChunkedArray):
             raise FileNotFoundError(f'Remote CT chunk is not prefetched: {self.path}/{key}')
         # POSIX advisory locks work on both supported platforms (Linux/macOS).
         # Separate file handles serialize threads as well as loader processes.
-        # Cached reads avoid the lock. Prefetch skips chunks already in flight;
-        # a foreground reader waits for that exact chunk, without downloading it twice.
+        # Cached reads avoid the lock. A reader waits for a chunk another reader is
+        # fetching, without downloading it twice.
         import fcntl
         lock_path = Path(self.path)/'.locks'/'.'.join(map(str,key))
         lock_path.parent.mkdir(exist_ok=True)
         with lock_path.open('a+b') as lock:
-            try:
-                fcntl.flock(lock,fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
-            except BlockingIOError:
-                return None
+            fcntl.flock(lock,fcntl.LOCK_EX)
             cached = super()._load(key)
             if cached is not None:
                 return cached
@@ -343,24 +340,6 @@ def _find_channel_zarr(root: str, channel: str) -> str:
     raise FileNotFoundError(f"no *_{channel}.ome.zarr under {root}")
 
 
-def _grid_metadata(array_path: Path):
-    """Comparable OME grid declaration, when present (bare Zarr is also valid)."""
-    attrs = array_path.parent / '.zattrs'
-    if not attrs.exists():
-        return None
-    meta = json.loads(attrs.read_text()).get('multiscales', [])
-    if not meta:
-        return None
-    scale = meta[0]
-    axes = scale.get('axes', [])
-    if [a.get('name') if isinstance(a, dict) else a for a in axes] != ['z', 'y', 'x']:
-        raise ValueError(f'Expected z,y,x direction/presence axes: {array_path}')
-    dataset = next((d for d in scale['datasets'] if d['path'] == array_path.name), None)
-    if dataset is None:
-        raise ValueError(f'OME metadata does not declare level: {array_path}')
-    return axes, scale.get('coordinateTransformations'), dataset.get('coordinateTransformations')
-
-
 class CropView:
     """The reader of model crops when they come from another CT level (``FiberVolumeSpec.crop_ct_level``):
     the same trace-grid geometry and normalization record, its own array and source voxels per trace voxel."""
@@ -400,7 +379,6 @@ class FiberVolume:
             raise ValueError('Presence-free volume reading requires CT-only inputs')
         self.presence = (ChunkedArray(os.path.join(_find_channel_zarr(spec.fiber_zarr_dir, "presence"), lvl), cache_bytes // 4)
                          if spec.load_presence else None)
-        self._seed_presence = None
         self.input_scale = spec.grid_scale/spec.ct_grid_scale
         if not self.input_scale.is_integer():
             raise ValueError('CT sampling currently requires an integer number of CT voxels per trace voxel')
@@ -432,20 +410,6 @@ class FiberVolume:
                 raise ValueError('A crop CT level needs its positive grid scale')
             array = open_level(spec.crop_ct_level, int(cache_bytes*.5))
             self.crop_view = CropView(self, array, spec.grid_scale/spec.crop_ct_grid_scale)
-
-    def presence_for_seeding(self):
-        """Explicit seed-selection dependency, never opened for CT-only model crops."""
-        if self.presence is not None:
-            return self.presence
-        if self._seed_presence is None:
-            self._seed_presence = ChunkedArray(os.path.join(
-                _find_channel_zarr(self.spec.fiber_zarr_dir, 'presence'), str(self.spec.fiber_level)), 64 << 20)
-        return self._seed_presence
-
-
-    def channels(self) -> int:
-        """Image input channels, including independently sampled presence."""
-        return 2 if self.spec.mode == 'ct+presence' else 1
 
     def raw_block(self, start, size) -> np.ndarray:
         """Model-input uint8 (1, ...) native CT block in source-array coordinates."""

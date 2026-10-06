@@ -52,8 +52,6 @@ def normal_target(raw, center, spacing):
     tensor = ct_structure_tensor(raw, center, sample_spacing=spacing,
                                  derivative_sigma=NORMAL_TARGET_POLICY['derivative_sigma_ct'],
                                  integration_sigma=NORMAL_TARGET_POLICY['integration_sigma_ct'])
-    if tensor is None:
-        return np.zeros(3, np.float32), 0.
     values, vectors = np.linalg.eigh(tensor)
     energy = values[-1]
     gap = float((energy-values[-2])/energy) if energy > 1e-12 else 0.

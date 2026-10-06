@@ -40,7 +40,7 @@ class DecisionCollector:
     retained; collection then censors the episode (this never advances a stopped policy).
     """
     def __init__(self, fiber, fiber_idx, t0, sign, cfg, band=None, *, before=48., after=64., stride=16.,
-                 max_states=192, additional_crops=(), bank_detector=None):
+                 max_states=192, bank_detector=None):
         if min(before, after, stride) < 0 or max_states < 1:
             raise ValueError('Retention windows must be nonnegative with a positive state cap')
         self.fiber, self.fi, self.sign = fiber, fiber_idx, sign
@@ -49,7 +49,6 @@ class DecisionCollector:
                                     max_recovery_distance=cfg.max_recovery_distance,
                                     fiber_idx=fiber_idx, bank_detector=bank_detector)
         self.before, self.after, self.stride, self.max_states = before, after, stride, max_states
-        self.additional_crops = tuple(additional_crops)
         self.rows, self.distances = [], []
         # Actual committed vertices, once per trace (before decision thinning).
         self.track = []
@@ -82,7 +81,7 @@ class DecisionCollector:
         if item['supervision_reason'] == REASON['unannotated']:
             self.censored = 'unannotated'  # never call unannotated continuation a failure
             return False
-        if not all(training_state_allowed(item, crop, self.band) for crop in (self.cfg.crop, *self.additional_crops)):
+        if not training_state_allowed(item, self.cfg.crop, self.band):
             self.censored = 'holdout'  # do not trace through held-out space and resume afterwards
             return False
         terminal = item['supervision'] == TERMINAL
@@ -371,8 +370,7 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer, bank_loader=
             chunk = seeds[offset:offset+args.batch]
             collectors = [DecisionCollector(train_f[s['fiber']], s['fiber'], s['t'], s['sign'], cfg, band,
                                             before=args.before, after=args.after, stride=args.stride,
-                                            max_states=args.max_states, additional_crops=getattr(tracer, 'additional_crops', ()),
-                                            bank_detector=bank_detector) for s in chunk]
+                                            max_states=args.max_states, bank_detector=bank_detector) for s in chunk]
             from vesuvius.neural_tracing.fiber_follow.tracing.crop_frames import trace_family_kwargs
             paths, chunk_reasons = tracer.trace(np.stack([s['pos'] for s in chunk]), np.stack([s['heading'] for s in chunk]),
                                                 on_decision=lambda i, state: collectors[i](state),

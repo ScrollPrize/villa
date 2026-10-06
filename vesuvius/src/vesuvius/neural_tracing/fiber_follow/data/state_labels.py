@@ -186,10 +186,6 @@ class TraceLabeler:
     def state_dict(self):
         return {key: getattr(self, key) for key in self.STATE}
 
-    @property
-    def end_tagged(self):
-        return bool(self.fiber.endpoint_stop[0 if self.sign < 0 else 1])
-
     def _crossings(self, segment, nearest_s, advance):
         f, sign = self.fiber, self.sign
         endpoint = f.points[-1 if sign > 0 else 0]

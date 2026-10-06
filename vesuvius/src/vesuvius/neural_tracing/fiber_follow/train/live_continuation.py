@@ -133,9 +133,6 @@ class LiveContinuationSource:
         if advanced is None:
             return None
         path = advanced['path']
-        if dataset.exclude is not None and np.any((advanced['last_segment'][:, 2] >= dataset.exclude.lo-48)
-                                                  & (advanced['last_segment'][:, 2] < dataset.exclude.hi+48)):
-            return None
         hist, mask = trace_history(path, dataset.cfg.n_history)
         frame = frame_from_heading(advanced['heading'], state['frame'][:, 0])
         fi, reverse = state['fiber_idx'], state['reverse']
@@ -167,8 +164,6 @@ class LiveContinuationSource:
             live_travelled=advanced['travelled'], live_loop_start=state['loop_start'],
             live_chain_start=state['start'], labeler_state=labeler.state_dict())
         item = dataset.prepare(item, rng)
-        if not dataset.state_allowed(item):
-            return None
         # The unresolved-frame footprint covers all rolls and the CT tensor.
         dataset.prefetch_items([item], vol, required=True)
         from vesuvius.neural_tracing.fiber_follow.tracing.crop_frames import frame_predictor, orient_items

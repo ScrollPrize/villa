@@ -2,9 +2,6 @@
 import json
 
 
-from vesuvius.neural_tracing.fiber_follow.tracing.policy import DIAGNOSTIC_THRESHOLDS
-
-
 def _rate(n, d):
     n, d = int(n), int(d)
     return f'{n}/{d} ({n/d:.1%})' if d else 'n/a (0 known)'
@@ -249,33 +246,6 @@ def _decision_lines(decisions):
     return lines
 
 
-def _direct_training_lines(row):
-    lines = [f"  {row.get('prediction_loss_type', 'geometry')} {row['geometry']:.4f} | confidence {row['confidence_loss']:.4f}"
-             f" | mean error {_number(row['error_mean'])} voxels | prefix correct {row['prefix_correct_fraction']:.1%}"]
-    if 'interval_samples_per_second' in row:
-        lines.insert(0, f"  recent speed {row['interval_samples_per_second']:.2f} samples/s"
-                        f" | data wait {row['interval_data_seconds']:.2f}s"
-                        f" | optimizer {row['interval_update_seconds']:.2f}s per logging interval")
-    if 'grad_norm' in row:
-        lines.append(f"  gradients before clipping: {row['grad_norm']:.3g} (scale {row['grad_clip_scale']:.3g})")
-    if 'identity' in row:
-        lines.extend(_identity_lines(row['identity']))
-    if 'decisions' in row:
-        lines.extend(_decision_lines(row['decisions']))
-    return lines
-
-
-def _identity_lines(stats):
-    lines = [f"  identity-aware prefix correct {stats.get('identity_prefix_correct_fraction', 0.):.1%}"
-             +f" | labels flipped {int(stats.get('identity_flipped_count', 0))}",
-             f"  identity data: neighbor coverage {stats.get('foreign_components_fraction', 0.):.0%}"
-             +''.join(f" | {key[9:-9]} {value:.0%}" for key, value in stats.items()
-                      if key.startswith('location_') and key.endswith('_fraction'))]
-    if 'blurred_fraction' in stats:
-        lines[-1] += f" | blurred {stats['blurred_fraction']:.0%}"
-    return lines
-
-
 def format_training_log(row):
     step = f"Step {row['step']:,}" if 'step' in row else 'Training'
     if row.get('event') == 'resume_configuration':
@@ -301,65 +271,9 @@ def format_training_log(row):
         return (f"\n{step} | monitor rollout @ {row['threshold']:.2f}\n"
                 f"  coverage {row['length_weighted_coverage']:.1%} | precision {row['length_precision']:.1%}"
                 f" | diverged {row['diverged']:.1%}")
-    if 'roll_coverage' in row:
-        return (f"\n{step} | rollout @ {row['threshold']:.2f}\n"
-                f"  coverage {row['roll_coverage']:.1%} | precision {row['roll_precision']:.1%}"
-                f" | diverged {row['roll_diverged']:.1%}")
     if 'loss' not in row:
         details = ' | '.join(f'{key}: {json.dumps(value)}' for key,value in row.items() if key != 'step')
         return f'{step} | {details}'
-
-    if 'geometry' in row:
-        if 'interval' in row:
-            m = row['interval']
-            return '\n'.join([f"\n{step} | last {m['updates']} updates / {m['crops']:,} crops"
-                              f" | lr {row['lr']:.2e}", *_interval_training_lines(row)])
-        return '\n'.join([f"\n{step} | loss {row['loss']:.4f} | lr {row['lr']:.2e}"
-                          f" | {row['samples_per_second']:.2f} samples/s", *_direct_training_lines(row)])
-
-    lines = [f"\n{step} | loss {row['loss']:.4f} | lr {row['lr']:.2e}"
-             f" | {row['samples_per_second']:.2f} samples/s",
-             f"  flow {row['flow']:.4f} | confidence {row['confidence_loss']:.4f}"
-             f" (weight {row['confidence_coefficient']:.2f})",
-             f"  data: fresh {row['fresh_fraction']:.0%}"
-             f" | recent {row['recent_fraction']:.0%} | replay seen {row['replay_samples_seen']:,}"]
-
-    def rate(numerator, denominator):
-        return _rate(row[numerator], row[denominator])
-
-    lines.append(f"  {int(row.get('commit_window',0)) or 'commit'}-point correctness: "+rate('commit_correct_count','commit_known_count'))
-    if 'candidate_states' in row:
-        lines.append('  candidates: zero '+rate('candidate_zero_correct','candidate_states')
-                     +' | selected '+rate('candidate_selected_correct','candidate_states')
-                     +' | oracle '+rate('candidate_oracle_correct','candidate_states'))
-        lines.append(f"    rescued {int(row['candidate_rescues'])} | spoiled {int(row['candidate_spoiled'])}")
-    for threshold in DIAGNOSTIC_THRESHOLDS:
-        lines.append(f'  gate @ {threshold:.2f}: false stops '
-                     +rate(f'false_stop_count_{threshold}',f'correct_first_count_{threshold}')
-                     +' | departed continues '
-                     +rate(f'departed_continue_count_{threshold}',f'departed_count_{threshold}'))
-        if f'candidate_fallback_count_{threshold}' in row:
-            lines.append(f"    alternative-prefix fallbacks {int(row[f'candidate_fallback_count_{threshold}'])}"
-                         +' | correct first point '+rate(f'candidate_fallback_correct_{threshold}',
-                                                        f'candidate_fallback_known_{threshold}'))
-    if 'refinement' in row:
-        refinement = row['refinement']
-        bands = refinement['by_drift']
-        stages = len(bands['all']['error_mean'])
-        label = 'candidate-zero refinement' if 'candidate_states' in row else 'refinement'
-        lines.append(f"  {label}: first {refinement['first_n']} points, mean lateral error in voxels"
-                     f" ({refinement['departed_count']} departed excluded)")
-        lines.append('    drift      states  GT pts  '+' '.join(f'{name:>7}' for name in
-                     ['initial']+[f'step {i}' for i in range(1,stages)]))
-        for name,stats in bands.items():
-            if name != 'all' and not stats['state_count']:
-                continue
-            values = ' '.join(f'{v:7.3f}' if v is not None else f'{"--":>7}' for v in stats['error_mean'])
-            lines.append(f"    {name:<10} {stats['state_count']:6d} {stats['known_point_count']:7d}  {values}")
-            if any(stats['nonfinite_point_count']):
-                lines.append(f"      nonfinite predictions by step: {stats['nonfinite_point_count']}")
-        stats = bands['all']
-        changes = ' | '.join(f'{i}: {better}/{worse}/{count}' for i,(better,worse,count) in
-                            enumerate(zip(stats['improved_count'],stats['worsened_count'],stats['comparison_count']),1))
-        lines.append('    improved/worsened/compared states by update: '+changes)
-    return '\n'.join(lines)
+    m = row['interval']
+    return '\n'.join([f"\n{step} | last {m['updates']} updates / {m['crops']:,} crops"
+                      f" | lr {row['lr']:.2e}", *_interval_training_lines(row)])

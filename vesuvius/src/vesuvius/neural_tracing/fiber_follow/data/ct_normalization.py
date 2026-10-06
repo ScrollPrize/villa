@@ -33,7 +33,7 @@ def validate_record(record, spec):
     return record
 
 
-def prepare_normalization(out, specs, *, resume=None, known=None):
+def prepare_normalization(out, specs, *, known=None):
     """Persist z-score provenance and bind it to readers.
 
     Checkpoints embed the document too (``known``), allowing a missing JSON to be restored. A record that differs
@@ -41,13 +41,7 @@ def prepare_normalization(out, specs, *, resume=None, known=None):
     """
     from vesuvius.neural_tracing.fiber_follow.data.volume import RemoteChunkedArray
     path = Path(out)/'ct_normalization.json'
-    document = json.loads(path.read_text()) if path.exists() else None
-    if resume is not None:
-        if document is not None and document != resume:
-            raise ValueError('CT normalization JSON differs from the resumed checkpoint')
-        document = resume
-    elif document is None:
-        document = dict(method=ZSCORE_METHOD, volumes={})
+    document = json.loads(path.read_text()) if path.exists() else dict(method=ZSCORE_METHOD, volumes={})
     if document.get('method') != ZSCORE_METHOD:
         raise ValueError('Unsupported CT normalization policy')
     if known is not None and document['method'] != known['method']:
@@ -61,8 +55,6 @@ def prepare_normalization(out, specs, *, resume=None, known=None):
                 and known['volumes'][key] != document['volumes'][key]):
             print(f'Warning: CT normalization record differs from the checkpoint: {key}', flush=True)
         if key not in document['volumes']:
-            if resume is not None:
-                raise ValueError(f'Resumed checkpoint lacks CT normalization: {key}')
             if known is not None and key in known['volumes']:
                 record = known['volumes'][key]
             else:

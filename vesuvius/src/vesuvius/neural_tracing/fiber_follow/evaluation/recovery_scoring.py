@@ -83,7 +83,7 @@ def _weighted_quantiles(values, weights, quantiles):
 
 
 def recovery_score(path, fiber, t0, sign, *, tol=3., sample_step=.5,
-                   persistence=1.5, max_len=6000., projector=None):
+                   persistence=1.5, max_len=6000.):
     """Local arclength precision, unique directed coverage, and recoverable events.
 
     Endpoint distances interpolate linearly within <=sample_step edges when
@@ -98,7 +98,7 @@ def recovery_score(path, fiber, t0, sign, *, tol=3., sample_step=.5,
         raise ValueError('A finite nonempty path and direction +/-1 are required')
     if min(tol, sample_step, persistence, max_len) <= 0:
         raise ValueError('Scoring lengths must be positive')
-    projector = projector or PolylineProjector(fiber)
+    projector = PolylineProjector(fiber)
     p, travelled = _samples(path, sample_step)
     distance, arc = projector.project(p)
     progress = (arc - t0) * sign

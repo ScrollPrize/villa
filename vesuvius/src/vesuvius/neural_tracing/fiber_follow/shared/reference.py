@@ -5,10 +5,6 @@ from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength, norm
 
 
 SEED_FIELDS = ('seed_pos', 'seed_tangent', 'seed_age', 'seed_valid')
-SEED_DEFAULTS = dict(seed_pos=lambda n: np.zeros((n, 3), np.float32),
-                     seed_tangent=lambda n: np.zeros((n, 3), np.float32),
-                     seed_age=lambda n: np.zeros(n, np.float32),
-                     seed_valid=lambda n: np.zeros(n, bool))
 
 
 def observed_seed(pos, frame, hist_local, hmask):

@@ -18,9 +18,8 @@ class AFVFibers(Sequence):
     """Keep only a catalog in memory; decode polylines into a bounded LRU.
 
     Validation holds out entire fiber IDs, including from neighbor queries.
-    A legacy native-coordinate Z-band split is available for old callers.
     """
-    def __init__(self, path, grid_scale=1., *, validation_z=None, validation=None, split='train', cache_size=32, sha256=None):
+    def __init__(self, path, grid_scale=1., *, validation=None, split='train', cache_size=32, sha256=None):
         self.path = str(Path(path).resolve())
         self.grid_scale = float(grid_scale)
         if not np.isfinite(self.grid_scale) or self.grid_scale <= 0:
@@ -45,20 +44,11 @@ class AFVFibers(Sequence):
         self.catalog = c.execute('SELECT id,name,family,length,min_z,max_z FROM fibers ORDER BY id').fetchall()
         if len(self.catalog) != self.metadata['fiber_count']:
             raise ValueError('AFV fiber count mismatch')
-        self.validation_z = validation_z
         if validation is not None:
             from vesuvius.neural_tracing.fiber_follow.data.dataset_split import heldout_ids
-            if validation_z is not None:
-                raise ValueError('Choose whole-fiber validation or a legacy Z band, not both')
             heldout = heldout_ids([r[0] for r in self.catalog],validation)
             if split != 'all':
                 self.catalog = [r for r in self.catalog if ((r[0] in heldout) == (split == 'validation'))]
-        if validation_z is not None:
-            lo, hi = map(float, validation_z)
-            if not np.isfinite([lo, hi]).all() or lo >= hi:
-                raise ValueError('Invalid AFV validation_z')
-            if split != 'all':
-                self.catalog = [r for r in self.catalog if ((r[4] < hi and r[5] >= lo) == (split == 'validation'))]
         if not self.catalog:
             raise ValueError(f'No AFV fibers in {split} split')
         self.ids = {r[0] for r in self.catalog}

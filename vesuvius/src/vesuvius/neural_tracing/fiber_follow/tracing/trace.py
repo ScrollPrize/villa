@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
-from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, crop_local_grid, normalize
+from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, normalize
 from vesuvius.neural_tracing.fiber_follow.tracing.policy import (DEFAULT_CONFIDENCE, DEFAULT_GATE, DEFAULT_N_COMMIT, GATES, gate_horizon,
     commit_count, selection_window)
 from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolume
@@ -134,8 +134,6 @@ class ModelTracer:
         self.heading_policy = 'learned_heading_v1' if self.frame_predictor is not None else TRACE_HEADING_POLICY
         if self.p.n_commit > model.cfg.n_future:
             raise ValueError(f'n_commit={self.p.n_commit} exceeds the model horizon n_future={model.cfg.n_future}')
-        self.grid = torch.from_numpy(crop_local_grid(crop)).float().to(device)
-        self.S = crop.block_size
         self.pool = ThreadPoolExecutor(max(1, min(16, os.cpu_count() or 1)))
 
     def close(self):
@@ -232,23 +230,21 @@ class ModelTracer:
                 state['travelled'].append(float(at))
 
     @torch.no_grad()
-    def trace(self, seeds_xyz, headings, histories=None, abort=None, on_decision=None, initial_states=None, families=None):
+    def trace(self, seeds_xyz, headings, on_decision=None, initial_states=None, families=None):
         """Greedy rollout, checking supervised confidence before committing.
 
         on_decision(i, state) observes the exact inference input and proposals,
-        before any commit; returning False censors the trace. abort(i, path)
-        remains an optional post-commit geometric limit. Histories run oldest
-        to newest and exclude the seed. Returned paths always start at the seed.
+        before any commit; returning False censors the trace. Returned paths
+        always start at the seed.
         """
         was_training = self.model.training
         self.model.eval()
         try:
-            return self._trace(seeds_xyz, headings, histories, abort, on_decision, initial_states, families)
+            return self._trace(seeds_xyz, headings, on_decision, initial_states, families)
         finally:
             self.model.train(was_training)
 
-    def _trace(self, seeds_xyz, headings, histories, abort, on_decision, initial_states=None, families=None):
-        from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength, interp_at
+    def _trace(self, seeds_xyz, headings, on_decision, initial_states=None, families=None):
         n = len(seeds_xyz)
         predictor = getattr(self, 'frame_predictor', None)
         if families is None and initial_states is not None and predictor is not None:
@@ -257,8 +253,6 @@ class ModelTracer:
             raise ValueError('Learned crop frames require one H/V family per trace')
         families = [fiber_family(f) for f in families] if families is not None else [None]*n
         paths = [[np.asarray(s, np.float64)] for s in seeds_xyz]
-        if histories is not None:
-            paths = [list(np.asarray(h, np.float64))+[np.asarray(s, np.float64)] for h, s in zip(histories, seeds_xyz)]
         if initial_states is not None:
             if len(initial_states) != n:
                 raise ValueError('One initial observed state is required per seed')
@@ -282,8 +276,7 @@ class ModelTracer:
         else:
             frames = list(self.map(lambda a: ct_frame(self.vol, a[0], a[1], diagnostics=a[2]),
                                    zip(seeds_xyz, headings, frame_diagnostics)))
-        # Explicit histories supplied for a new trace are trusted. Resumed
-        # states carry the exact acceptance boundary saved at their decision.
+        # Resumed states carry the exact acceptance boundary saved at their decision.
         heading_start = np.zeros(n, dtype=np.int64)
         if initial_states is not None:
             for i, state in enumerate(initial_states):
@@ -292,9 +285,6 @@ class ModelTracer:
                     raise ValueError('Invalid trusted heading history boundary')
         references = [dict(seed_pos=np.asarray(p).copy(), seed_tangent=normalize(np.asarray(h)),
                            seed_age=0., seed_valid=True) for p, h in zip(seeds_xyz, headings)]
-        if histories is not None:
-            for reference, path in zip(references, paths):
-                reference.update(seed_pos=np.asarray(path[0]).copy(), seed_age=float(arclength(np.asarray(path))[-1]))
         if initial_states is not None:
             for reference, state in zip(references, initial_states):
                 reference.update({k: state[k] for k in SEED_FIELDS if k in state})
@@ -357,11 +347,10 @@ class ModelTracer:
                 would_stop = commit == 0
                 state = dict(pos=pos[j].copy(), frame=fr[j].copy(), hist=hist_world[j].copy(), hmask=hm[j].copy(),
                              points=points[j].copy(), confidence=conf.copy(), n_commit=commit, would_stop=would_stop,
-                             recovery_allowed=bool(allowed[j]), recovery_blocked=bool(recovery_blocked),
+                             recovery_blocked=bool(recovery_blocked),
                              travelled=float(length[i]), last_segment=last_segment[i].copy(),
                              observed_path=np.asarray(paths[i]).copy(),
                              heading_start=int(heading_start[i]),
-                             heading_policy='learned_heading_v1' if predictor is not None else TRACE_HEADING_POLICY,
                              frame_policy=(initial_states[i]['frame_policy'] if initial_states is not None and length[i] == 0
                                            else getattr(self, 'frame_policy', FRAME_POLICY)),
                              fiber_family=families[i], ct_frame_diagnostics=frame_diagnostics[i].copy())
@@ -388,9 +377,7 @@ class ModelTracer:
                 length[i] = advanced['travelled']
                 heading_start[i] = advanced['heading_start']
                 reframe[i] = advanced['heading']
-                if abort is not None and abort(int(i), paths[i]):
-                    active[i], reasons[i] = False, 'abort'
-                elif length[i] >= pp.max_len-1e-6:
+                if length[i] >= pp.max_len-1e-6:
                     active[i], reasons[i] = False, 'max_len'
             if sequence is not None:
                 self.sequence_record(out['sequence_cells'], committed, sequence)

@@ -115,7 +115,7 @@ def main(argv=None):
             neighbors = AFVBank(fibers)
         caches = [OnPolicyStates.load(replay[source['name']])] if source['name'] in replay else []
         builder = IdentityObservationBuilder(cfg, fibers, sampling, augment=True, neighbors=neighbors)
-        dataset = FollowDataset(fibers, spec, sample, None, chunk=args.batch, seed=11, budget=budget,
+        dataset = FollowDataset(fibers, spec, sample, chunk=args.batch, seed=11, budget=budget,
                                 batch_builder=builder, onpolicy=caches)
         if caches:
             dataset.set_step(int(caches[0].provenance['step']))

@@ -17,7 +17,6 @@ def load_dataset(args, checkpoint):
     import hashlib
     from pathlib import Path
     from vesuvius.neural_tracing.fiber_follow.data.afv import AFVFibers
-    from vesuvius.neural_tracing.fiber_follow.data.data import ZBand
     from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolumeSpec
     document = checkpoint.get('dataset_config')
     if not document:

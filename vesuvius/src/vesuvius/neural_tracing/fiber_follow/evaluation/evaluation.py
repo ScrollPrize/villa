@@ -22,7 +22,7 @@ import time
 
 import numpy as np
 
-from vesuvius.neural_tracing.fiber_follow.evaluation.seeds import EvaluationAudit, OUTCOME_COUNTS, OUTCOME_LENGTHS, evaluate, monitor_coverage, summarize_outcomes
+from vesuvius.neural_tracing.fiber_follow.evaluation.seeds import EvaluationAudit, evaluate, monitor_coverage, summarize_outcomes
 from vesuvius.neural_tracing.fiber_follow.shared.experiment import jsonable
 from vesuvius.neural_tracing.fiber_follow.tracing.policy import checkpoint_policy
 from vesuvius.neural_tracing.fiber_follow.tracing.trace import TraceParams

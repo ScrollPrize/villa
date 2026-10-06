@@ -23,13 +23,11 @@ from vesuvius.neural_tracing.fiber_follow.shared.geometry import (
     crop_local_grid,
     frame_from_heading,
     interp_at,
-    normalize,
-    sample_oriented_fast,
     tangent_at,
 )
 from vesuvius.neural_tracing.fiber_follow.data.annotation_repair import foldbacks, repair_kinks
 from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolume
-from vesuvius.neural_tracing.fiber_follow.shared.reference import SEED_FIELDS, SEED_DEFAULTS, observed_seed
+from vesuvius.neural_tracing.fiber_follow.shared.reference import SEED_FIELDS
 
 
 DATA_VERSION = 2
@@ -136,11 +134,6 @@ def fiber_manifest(fibers):
     return [dict(name=f.name, source_hash=f.source_hash,
                  geometry_hash=hashlib.sha256(np.asarray(f.points, dtype="<f8").tobytes()).hexdigest(),
                  endpoint_stop=list(f.endpoint_stop)) for f in fibers]
-
-
-def fiber_identities(entries):
-    """Fiber manifest entries without geometry: which annotations, not how they were repaired."""
-    return [{k: v for k, v in e.items() if k not in ('geometry_hash', 'annotation_repair')} for e in entries]
 
 
 @dataclass(frozen=True)
@@ -449,8 +442,7 @@ def decision_on_path(fiber, t, reverse, cfg, path, arcs, category, sigma, detail
     heading = trace_heading(path, 0, seed_direction)
     frame = frame_from_heading(heading)  # provisional basis; CT resolves crop roll before sampling
     hist, hmask = trace_history(list(path), cfg.n_history)
-    item = dict(_generated_original_history=True, _seed_original_certified=True,
-                _frame_label_context=(fiber, t, reverse, cfg),
+    item = dict(_frame_label_context=(fiber, t, reverse, cfg),
                 observed_path=path, seed_pos=path[0].copy(), seed_tangent=seed_direction,
                 seed_age=float(arclength(path)[-1]), seed_valid=True, seed_heading_family=fiber.tag,
                 trace_noise_sigma=sigma, trace_prefix_length=float(arcs[-1]-arcs[0]), startup=category,
@@ -722,13 +714,13 @@ class FollowDataset(torch.utils.data.IterableDataset):
     Fallbacks and deficits are recorded per item. Replay age ceilings and per-event
     draw caps are shared across loader workers through shared memory.
     """
-    def __init__(self, fibers, vol_spec, cfg, exclude_band, chunk=2, seed=0,
+    def __init__(self, fibers, vol_spec, cfg, chunk=2, seed=0,
                  cache_bytes=1 << 30, onpolicy=None,
                  window=256., pool_size=12, window_samples=192, replay_index=None, refresh_chunks=8,
-                 batch_builder=None, additional_crops=(), budget=None, length_power=1.):
+                 batch_builder=None, budget=None, length_power=1.):
         import multiprocessing as mp
         self.budget = budget or TaskBudget()
-        self.fibers, self.vol_spec, self.cfg, self.exclude = fibers, vol_spec, cfg, exclude_band
+        self.fibers, self.vol_spec, self.cfg = fibers, vol_spec, cfg
         self.chunk, self.seed, self.cache_bytes = chunk, seed, cache_bytes
         self.window, self.pool_size, self.window_samples = window, pool_size, window_samples
         self.replay_index, self.refresh_chunks = replay_index, refresh_chunks
@@ -737,7 +729,6 @@ class FollowDataset(torch.utils.data.IterableDataset):
         self.remote_prefetch = None  # Optional trainer-owned process queue client.
         self.episodes = None  # EpisodeSpec: plans of whole episodes (model 'sequence'); chunk then counts episodes
         self.remote_prefetch_lookahead = 0  # Planned microbatches per source/worker.
-        self.additional_crops = tuple(additional_crops)
         # Shared by every loader worker: current update and per-event replay draw counts.
         self.step = mp.Value('q', 0)
         self.event_draws = mp.Array('i', EVENT_TABLE_SIZE)
@@ -800,20 +791,6 @@ class FollowDataset(torch.utils.data.IterableDataset):
             return self.batch_builder.prepare(item, self.fibers[item['fiber_ref'][0]], rng)
         return item
 
-    def state_allowed(self, item):
-        allowed = (all(training_state_allowed(item, crop, self.exclude)
-                    for crop in (self.cfg.crop, *self.additional_crops))
-                and (not hasattr(self.batch_builder, 'footprint_allowed')
-                     or self.batch_builder.footprint_allowed(item, self.exclude)))
-        if allowed and self.exclude is not None:
-            # The actual planned read footprint, in its final (augmented) frame.
-            from types import SimpleNamespace
-            scale = self.vol_spec.grid_scale/self.vol_spec.ct_grid_scale
-            for start, size in self.prefetch_bounds([item], SimpleNamespace(input_scale=scale)):
-                if start[0]/scale < self.exclude.hi and (start[0]+size[0])/scale > self.exclude.lo:
-                    return False
-        return allowed
-
     # ----------------------------------------------------------------- task items
 
     def fresh_location(self, rng, windows):
@@ -840,18 +817,15 @@ class FollowDataset(torch.utils.data.IterableDataset):
 
     def fresh_item(self, rng, windows, **options):
         """A simulated trace; ``options`` fix the startup category or force an excursion."""
-        for _ in range(10000):
-            item = (self.batch_builder.replace_fresh(self.cfg, rng, **options)
-                    if hasattr(self.batch_builder, 'replace_fresh') else None)
-            if item is None:
-                fi, t, rev, location = self.fresh_location(rng, windows)
-                item = make_sample(self.fibers[fi], t, rev, self.cfg, rng, **options)
-                item.update(fiber_ref=(fi, t, rev), location_source=location)
-                item = self.prepare(item, rng)
-            item.update(source=SOURCE['fresh'], source_step=-1)
-            if self.state_allowed(item):
-                return item
-        raise ValueError('Could not draw a fresh training state outside the held-out band')
+        item = (self.batch_builder.replace_fresh(self.cfg, rng, **options)
+                if hasattr(self.batch_builder, 'replace_fresh') else None)
+        if item is None:
+            fi, t, rev, location = self.fresh_location(rng, windows)
+            item = make_sample(self.fibers[fi], t, rev, self.cfg, rng, **options)
+            item.update(fiber_ref=(fi, t, rev), location_source=location)
+            item = self.prepare(item, rng)
+        item.update(source=SOURCE['fresh'], source_step=-1)
+        return item
 
     def recovery_item(self, rng, windows):
         """Fresh substitute for missing recoverable replay: a displaced excursion head."""
@@ -871,7 +845,7 @@ class FollowDataset(torch.utils.data.IterableDataset):
             if item is None:
                 continue
             item = self.prepare(item, rng)
-            if item.get('identity_evidence', False) and self.state_allowed(item):
+            if item.get('identity_evidence', False):
                 return item
         return None
 
@@ -886,9 +860,8 @@ class FollowDataset(torch.utils.data.IterableDataset):
                 continue
             ci, episode, event, rows, key = group
             item = self.replay_item(self.onpolicy[ci], int(rng.choice(rows)), rng)
-            if item is not None:
-                item.update(replay_event=key, replay_episode=stable_key(key, episode))
-                return item
+            item.update(replay_event=key, replay_episode=stable_key(key, episode))
+            return item
         return None
 
     def replay_item(self, op, j, rng):
@@ -903,8 +876,7 @@ class FollowDataset(torch.utils.data.IterableDataset):
                     labeler_state=replay_labeler_state(op, j))
         item.update({k: getattr(op, k)[j] for k in SEED_FIELDS})
         item['observed_path'] = op.observed_prefix(j)
-        item = self.prepare(item, rng)
-        return item if self.state_allowed(item) else None
+        return self.prepare(item, rng)
 
     def episode_items(self, rng, windows, index):
         """One episode (``self.episodes``) on a fresh fiber location: decisions in step order, each prepared like a
@@ -927,12 +899,9 @@ class FollowDataset(torch.utils.data.IterableDataset):
                 item.update(shared, source=SOURCE['fresh'], source_step=-1, task_requested=TASK['fresh'],
                             task_delivered=TASK['fresh'], task_fallback=0, episode_index=index, episode_step=step,
                             episode_supervised=step >= steps-spec.supervised, episode_segment=segment)
-                if not self.state_allowed(item):
-                    break
                 items.append(item)
-            else:
-                return items
-        raise ValueError('Could not draw a training episode outside the held-out band')
+            return items
+        raise ValueError('Could not draw a training episode: no fiber is long enough')
 
     def replay_episode_items(self, kind, rng, index):
         """One on-policy episode (``self.episodes``) from the replay caches: consecutive recorded decisions of one
@@ -964,8 +933,6 @@ class FollowDataset(torch.utils.data.IterableDataset):
             items, shared = [], None
             for step, j in enumerate(rows):
                 item = self.replay_item(op, int(j), rng)
-                if item is None:
-                    break
                 if shared is None:
                     shared = {name: item[name] for name in ('photometric', 'blur_sigma') if name in item}
                 if step+1 < len(rows):
@@ -976,8 +943,7 @@ class FollowDataset(torch.utils.data.IterableDataset):
                             episode_step=step, episode_supervised=step >= len(rows)-spec.supervised,
                             episode_segment=np.asarray(segment, np.float64))
                 items.append(item)
-            else:
-                return items
+            return items
         return None
 
     def episode_plan(self, rng, windows, index):
@@ -1214,7 +1180,6 @@ class FollowDataset(torch.utils.data.IterableDataset):
             yield items
 
 
-FUSED_SAMPLER = os.environ.get("FIBER_FOLLOW_FUSED", "1") != "0"
 _GRID_CACHE: dict = {}
 
 
@@ -1223,15 +1188,6 @@ def _grid_flat(crop: CropSpec) -> np.ndarray:
     if g is None:
         g = _GRID_CACHE[crop] = crop_local_grid(crop).reshape(-1, 3).astype(np.float64)
     return g
-
-
-def read_blocks(items, vol: FiberVolume, crop: CropSpec, pool=None, *, presence=False):
-    scale = 1. if presence else getattr(vol, 'input_scale', 1.)
-    S = int(np.ceil(crop.block_size*scale))
-    starts = np.floor(np.stack([block_start(it["pos"], it["frame"], crop) for it in items])*scale).astype(np.int64)
-    read = lambda st: vol.presence.read(st, (S, S, S))[None] if presence else vol.raw_block(st, (S, S, S))
-    raw = np.stack(list(map(read, starts) if pool is None else pool.map(read, starts)))
-    return raw, starts
 
 
 _CORNER_CACHE: dict = {}
@@ -1268,7 +1224,7 @@ def tight_block(pos, frame, crop: CropSpec, scale: float = 1.):
 def read_tight_blocks(items, vol: FiberVolume, crop: CropSpec, pool=None, *, presence=False):
     """Per-item minimal blocks for per-sample CPU sampling: (list of raw, list of zyx starts).
 
-    Same values as ``read_blocks`` at every sample point, reading roughly a
+    Same values as the rotation-invariant ``block_start`` block at every sample point, reading roughly a
     third of the voxels and touching about half the chunks per item.
     """
     scale = 1. if presence else getattr(vol, 'input_scale', 1.)
@@ -1283,8 +1239,6 @@ def collate_targets(items):
     st = lambda k: torch.from_numpy(np.stack([it[k] for it in items]).astype(np.float32))
     out = {}
     if "fut_local" in items[0]:
-        out["fut"] = st("fut_local")
-        out["fmask"] = st("fmask")
         out["gt_history"] = st("gt_history")
         out["gt_history_mask"] = st("gt_history_mask")
         out["plane_ab"] = st("plane_ab")

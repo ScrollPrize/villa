@@ -218,17 +218,6 @@ class HeadingPredictor:
         return self._volumes[key]
 
     @torch.no_grad()
-    def predict(self, vol, positions, priors, paths, pool=None, *, families=None):
-        """World headings, each signed along its prior. ``vol`` is the tracer's (follower CT) volume."""
-        if not len(positions):
-            return []
-        frames = prior_frames(priors)
-        patch, path = model_inputs(self.patch_volume(vol), self.model.cfg, positions, frames, paths, pool)
-        local = self.model(patch.to(self.device), path.to(self.device), self._families(families)).double().cpu().numpy()
-        headings = [f @ d for f, d in zip(frames, local)]
-        return [h if h @ np.asarray(p) >= 0 else -h for h, p in zip(headings, priors)]
-
-    @torch.no_grad()
     def predict_with_normals(self, vol, positions, priors, paths, pool=None, *, families=None):
         """World headings and unsigned world sheet-normal axes, using only the inference patch."""
         if not self.model.cfg.predict_normals:

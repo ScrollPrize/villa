@@ -81,10 +81,6 @@ def sheet_heading(normal, family):
     return axis/size
 
 
-def ct_sheet_heading(cube, center_zyx, family):
-    return sheet_heading(ct_sheet_normal(cube, center_zyx), family)
-
-
 def normal_context(pos_xyz, input_scale):
     """Native CT bounds for normal estimation, also used by remote prefetch."""
     pos = np.asarray(pos_xyz, dtype=np.float64)

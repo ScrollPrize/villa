@@ -8,7 +8,7 @@ import numpy as np
 import torch
 
 from vesuvius.neural_tracing.fiber_follow.data.afv import AFVFibers
-from vesuvius.neural_tracing.fiber_follow.data.data import FollowDataset, ZBand, fiber_manifest, load_fibers
+from vesuvius.neural_tracing.fiber_follow.data.data import FollowDataset, fiber_manifest, load_fibers
 from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolumeSpec
 from vesuvius.neural_tracing.fiber_follow.data.observations import IdentityObservationBuilder
 from vesuvius.neural_tracing.fiber_follow.data.afv_neighbors import AFVBank
@@ -122,8 +122,6 @@ def validation_manifest(fibers, spec, seed=0, monitor_count=32):
 def load_primary_dataset(document, spec):
     """Keep legacy reserved fibers held out, plus a random split of the rest.
 
-    Existing Paris 4 neighbor shards only support the legacy training parents.
-    Their old mining band remains provenance, not a training sampling filter.
     Fibers whose annotation doubles back are kept out of training; the held-out
     split is decided before that and does not change.
     """
@@ -217,12 +215,11 @@ def build_mixed_dataset(primary, document, cfg, sample, sampling, args, *, seed,
             fibers, validation_fibers, spec, sha256 = open_afv_source(source, document['cache_dir'], normalization)
             scale = float(source['grid_scale'])
             builder = IdentityObservationBuilder(cfg, fibers, sampling, augment=True, neighbors=AFVBank(fibers))
-            band = None
             replay_index = Path(out)/'dagger'/source['name']/'replay.json' if out else None
             from vesuvius.neural_tracing.fiber_follow.data.data import load_replay, usable_replay
             replay_paths = json.loads(replay_index.read_text()) if resume and replay_index and replay_index.exists() else []
             replay = usable_replay(load_replay(replay_paths), fibers, sample.n_history, spec.grid_scale)
-            dataset = FollowDataset(fibers, spec, sample, band, chunk=args.batch,
+            dataset = FollowDataset(fibers, spec, sample, chunk=args.batch,
                 seed=seed+100003*(index+1), cache_bytes=int(args.worker_cache_gb*(1<<30)),
                 batch_builder=builder, budget=budget, length_power=args.afv_length_power,
                 onpolicy=replay, replay_index=str(replay_index) if replay_index else None)

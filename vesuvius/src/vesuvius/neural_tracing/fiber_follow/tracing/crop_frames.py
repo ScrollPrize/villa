@@ -7,9 +7,6 @@ from functools import lru_cache
 import hashlib
 from pathlib import Path
 
-import numpy as np
-import torch
-
 from vesuvius.neural_tracing.fiber_follow.tracing.heading import (
     FRAME_POLICY, LEARNED_FRAME_POLICY, FRAME_POLICIES, fiber_family, orient_item, reframe_item,
     frame_prefetch_bounds, heading_free_bounds, normal_context,
@@ -56,22 +53,13 @@ def trace_family_kwargs(tracer, families):
     return dict(families=families) if getattr(tracer, 'frame_predictor', None) is not None else {}
 
 
-def predict_frames(predictor, vol, positions, priors, paths, families, previous=None, *, keep_heading=False, pool=None):
-    from vesuvius.neural_tracing.fiber_follow.heading_model.frames import orthonormal_frame
+def predict_frames(predictor, vol, positions, priors, paths, families, previous=None, *, pool=None):
     results = []
     previous = previous if previous is not None else [None]*len(positions)
     for start in range(0, len(positions), 64):
         part = slice(start, start+64)
-        if keep_heading:
-            _, normals = predictor.predict_with_normals(vol, positions[part], priors[part], paths[part], pool,
-                                                        families=families[part])
-            anchors = np.stack([np.zeros(3) if f is None else np.asarray(f)[:, 0] for f in previous[part]])
-            frames = orthonormal_frame(torch.from_numpy(np.stack(priors[part])), torch.from_numpy(np.stack(normals)),
-                                       torch.from_numpy(anchors)).numpy()
-        else:
-            frames = predictor.predict_frames(vol, positions[part], priors[part], paths[part], families[part],
-                                               previous=previous[part], pool=pool)
-        results.extend(frames)
+        results.extend(predictor.predict_frames(vol, positions[part], priors[part], paths[part], families[part],
+                                                previous=previous[part], pool=pool))
     return results
 
 

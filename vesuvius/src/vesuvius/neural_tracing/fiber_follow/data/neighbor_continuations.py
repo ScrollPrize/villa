@@ -110,13 +110,8 @@ def wrong_continuation(bank, cfg, rng, *, tail_length_range=(4., 16.), prefix_le
     trace = constructed_facts(fiber,float(own_t[-1]),reverse,pos,cfg,switched=True)
     item = label_state(fiber,pos,frame,history,mask,cfg,t=original_t,reverse=reverse,trace=trace)
     item.update(fiber_ref=(fi,float(own_t[-1]),reverse),source=SOURCE['synthetic'],source_step=-1,
-                bank_transition_length=bridge_length,bank_tail_length=tail_length,trace_noise_sigma=sigma,
-                bank_prefix_end_t=float(own_t[0]), seed_pos=path[0].copy(),
+                trace_noise_sigma=sigma, seed_pos=path[0].copy(),
                 seed_tangent=seed_tangent,seed_age=float(distance[-1]),seed_valid=True,
                 seed_heading_family=fiber.tag,heading_start=0,travelled=float(distance[-1]))
-    # Certification metadata only: never enters the model.
-    item.update(_seed_original_certified=True, _constructed_path=path,
-                _constructed_arc=distance, _leave_arc=distance[len(prefix_t)],
-                _reach_arc=distance[len(prefix_t)+int(np.searchsorted(samples,finish))])
     item['observed_path'] = path
     return item

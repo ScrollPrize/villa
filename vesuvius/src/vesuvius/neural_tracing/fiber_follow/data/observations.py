@@ -1,7 +1,6 @@
 """Shared training/rollout observation builder for both fiber followers."""
 from collections import deque
 from dataclasses import dataclass
-from functools import partial
 
 import numpy as np
 import torch
@@ -232,7 +231,6 @@ class IdentityObservationBuilder(ObservationBuilder):
         angle = item.pop('roll_augmentation')
         if angle:
             reframe_item(item, roll_frame(item['frame'], angle))
-            item['roll_augmented'] = angle
         return item
 
     def identity_evidence(self, item, curve):
@@ -243,8 +241,7 @@ class IdentityObservationBuilder(ObservationBuilder):
                     else np.full(len(item['reference_points']),np.inf))
         on = (distance <= self.sampling.on_fiber_tolerance) & item['reference_mask'].astype(bool)
         item['reference_on_fiber'] = on.astype(np.float32)
-        item['identity_reference_valid'] = bool(on[:-1].sum() >= 2 or on[-1])
-        item['identity_evidence'] = bool(item['identity_reference_valid'])
+        item['identity_evidence'] = bool(on[:-1].sum() >= 2 or on[-1])
         item['identity_observable'] = bool(item['match_distance'] <= DEPARTURE_DISTANCE or item['identity_evidence'])
         if 'trace_facts' in item:
             item['trace_facts']['identity_observable'] = item['identity_evidence']
@@ -330,8 +327,6 @@ class IdentityObservationBuilder(ObservationBuilder):
         curve = local(np.arange(max(0.,t-extent),min(fiber.length,t+extent)+1e-9,.25))
         item['identity_curve'] = curve
         self.identity_evidence(item, curve)
-        visible = visible_points(curve,cfg.fine)
-        item['identity_label_z'] = (curve[visible] @ frame.T+pos)[:,2] if visible.any() else pos[2:3]
         if self.augment:
             item['photometric'], item['blur_sigma'] = photometric_draw(s, rng)
             jitter = float(np.clip(rng.normal(0., s.roll_jitter_deg), -s.roll_jitter_max_deg, s.roll_jitter_max_deg))
@@ -340,12 +335,6 @@ class IdentityObservationBuilder(ObservationBuilder):
         item['identity_seed'] = int(rng.integers(2**63))
         item.setdefault('location_source',0)
         return item
-
-    def footprint_allowed(self,item,band):
-        if band is None:
-            return True
-        z = np.asarray(item.get('identity_label_z',np.asarray(item['pos'])[2:3]))
-        return not (z.min()-2 < band.hi and z.max()+2 >= band.lo)
 
     def prepare_sampling_feedback(self, items):
         """Advance geometry-only sampling feedback before planning another batch."""
@@ -386,31 +375,15 @@ class IdentityObservationBuilder(ObservationBuilder):
                 self.lateral.append(item['fiber_ref'])
         return {k: torch.from_numpy(v) for k, v in out.items()}
 
-    def __call__(self,items,vol, *, decision_mask=None):
-        """Images for every observation; expensive targets only for decisions.
-
-        Mixed batches retain row-aligned tensors with unused rows zero-filled.
-        Observation-only batches omit annotation and dense-mask tensors entirely.
-        Preparation/holdout checks and per-item augmentation RNG are unchanged.
-        """
-        selected = (torch.ones(len(items), dtype=torch.bool) if decision_mask is None
-                    else torch.as_tensor(decision_mask, dtype=torch.bool))
-        if selected.shape != (len(items),):
-            raise ValueError('Decision mask must have one entry per observation')
-        indices = selected.nonzero().flatten()
-        def scatter(values):
-            if len(indices) == len(items):
-                return values
-            return {k: v.new_zeros((len(items), *v.shape[1:])).index_copy_(0, indices, v)
-                    for k, v in values.items()}
+    def __call__(self,items,vol):
+        """Images and targets for every observation; per-item augmentation RNG is unchanged."""
         batch = self.observations(items, vol)
-        if len(indices):
-            batch.update(scatter(collate_targets([items[j] for j in indices.tolist()])))
+        if items:
+            batch.update(collate_targets(items))
         if self.fibers is None and not self.augment and not any('identity_curve' in i for i in items):
             return batch
-        batch.update(self.bank_targets(items, selected))
+        batch.update(self.bank_targets(items))
         batch['identity_observable'] = torch.tensor([i.get('identity_observable',True) for i in items])
-        batch['bank_tail_length'] = torch.tensor([i.get('bank_tail_length',0.) for i in items],dtype=torch.float32)
         batch['seed_present'] = batch['x']['seed_mask'].flatten()
         if self.augment:
             batch['blurred'] = torch.zeros(len(items))
@@ -433,7 +406,6 @@ class FiberTracer(ModelTracer):
 
     def __init__(self,model,*args,**kwargs):
         super().__init__(model,*args,**kwargs)
-        self.additional_crops = ()
         self.observations = observation_builder(model.cfg)
 
     def build_inputs(self,pos,frames,hist,hmask,paths=None):

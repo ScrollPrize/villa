@@ -6,7 +6,7 @@ from vesuvius.neural_tracing.fiber_follow.data.data import OnPolicyStates, START
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import crop_local_grid
 from vesuvius.neural_tracing.fiber_follow.data.labels import prefix_labels
 from vesuvius.neural_tracing.fiber_follow.tracing.trace import ModelTracer, TraceParams
-from vesuvius.neural_tracing.fiber_follow.tracing.policy import DIAGNOSTIC_THRESHOLDS, select_candidate
+from vesuvius.neural_tracing.fiber_follow.tracing.policy import DIAGNOSTIC_THRESHOLDS
 from vesuvius.neural_tracing.fiber_follow.shared.reference import SEED_FIELDS
 from vesuvius.neural_tracing.fiber_follow.tracing.heading import FRAME_POLICY, orient_item
 from vesuvius.neural_tracing.fiber_follow.data.state_labels import SUPERVISION, replay_class
@@ -142,13 +142,6 @@ def evaluate_recovery_states(model, vol, states, fibers, sample, *, device='cpu'
                 chosen = output
                 confidence = chosen['confidence']
                 labels, masks, error = prefix_labels(chosen['points'], b, tolerance, model.cfg.max_recovery_distance)
-            elif getattr(model.cfg,'candidate_selection','prefix')=='stop_fallback' and 'candidate_points' in output:
-                selected=select_candidate(output['candidate_points'],output['candidate_confidence'],n_commit,
-                                          model.cfg.max_recovery_distance,stop_threshold=threshold)
-                index=torch.arange(len(selected),device=selected.device)
-                points=output['candidate_points'][index,selected]
-                confidence=output['candidate_confidence'][index,selected]
-                labels,masks,error=prefix_labels(points,b,tolerance,model.cfg.max_recovery_distance)
             tracer=tracer_class(model,vol,sample.crop,sample.n_history,
                 TraceParams(max_len=recovery_length,confidence=threshold,seed=sampling_seed,
                             n_commit=n_commit),device=device)

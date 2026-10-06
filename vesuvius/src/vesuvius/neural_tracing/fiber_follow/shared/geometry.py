@@ -12,8 +12,6 @@ from dataclasses import dataclass
 
 import numpy as np
 from scipy.spatial import cKDTree
-import torch
-import torch.nn.functional as F
 
 
 @dataclass(frozen=True)
@@ -100,23 +98,6 @@ def tangent_at(p: np.ndarray, s: np.ndarray, t: float, half: float = 3.0) -> np.
     a = interp_at(p, s, np.array([max(t - half, 0.0)]))[0]
     b = interp_at(p, s, np.array([min(t + half, s[-1])]))[0]
     return normalize(b - a)
-
-
-def sample_oriented_fast(
-    raw: torch.Tensor,
-    starts_zyx: torch.Tensor,
-    pos_xyz: torch.Tensor,
-    frames: torch.Tensor,
-    local_grid: torch.Tensor,
-) -> torch.Tensor:
-    """Oriented trilinear crop straight from raw uint8 (B, 1, S, S, S) blocks."""
-    if raw.shape[1] != 1:
-        raise ValueError('Oriented sampling reads one scalar channel')
-    S = raw.shape[-1]
-    world = pos_xyz[:, None, None, None, :] + torch.einsum("bij,dhwj->bdhwi", frames, local_grid)
-    idx = world - starts_zyx.flip(-1)[:, None, None, None, :].to(world.dtype)
-    grid = idx * (2.0 / (S - 1)) - 1.0
-    return F.grid_sample(raw.float(), grid, mode="bilinear", padding_mode="zeros", align_corners=True) * (1.0 / 255.0)
 
 
 def dense_line(points, step):

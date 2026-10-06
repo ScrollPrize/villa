@@ -15,7 +15,6 @@ from scipy.spatial import cKDTree
 
 from vesuvius.neural_tracing.fiber_follow.evaluation.seeds import monitor_coverage, score_trace, summarize
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import frame_from_heading, interp_at
-from vesuvius.neural_tracing.fiber_follow.tracing.policy import DIAGNOSTIC_THRESHOLDS
 
 
 def _to_index(pts, crop):
@@ -39,17 +38,16 @@ def _curved_slab(vol, centers, axis, half=2):
 
 
 def plot_batch(x, pred, fut, fmask, crop, path, observed, hmask, history_gt, history_mask,
-               n=6, source=None, terminal=None, confidence=None, history_channel=-1, ct_range=None):
+               n=6, source=None, terminal=None, confidence=None):
     """Crops exactly as the model sees them (sample-index space, forward = up).
 
     Each panel is a thin curved slab (+-2 samples) that follows the GT fiber
     in the hidden lateral axis, so the fiber being traced stays visible.
-    Gray = first image channel (CT or presence), red = observed history,
+    Gray = z-scored CT over [-4, 4], red = observed history,
     green = GT, orange = proposal. The dotted orange segment is the
     actual tracer's first step from the current point.
     Bounds stay fixed to the actual crop even when GT leaves it. The orange
     path is the complete predicted curve before the confidence-gated commit.
-    Set history_channel=None for inputs without a rendered history channel.
     """
     source = source[:n].detach().cpu().numpy() if source is not None else None
     terminal = terminal[:n].detach().cpu().numpy() if terminal is not None else None
@@ -80,13 +78,8 @@ def plot_batch(x, pred, fut, fmask, crop, path, observed, hmask, history_gt, his
         for r, (axis, comp) in enumerate(((1, 0), (2, 1))):
             other = 1 - comp
             cen = np.interp(rows, rr, np.concatenate([[mid], gi[:, other]]))
-            pres = _curved_slab(x[i, 0], cen, axis)
-            if ct_range is not None:
-                pres = (pres-ct_range[0])/(ct_range[1]-ct_range[0])
-            hist = (_curved_slab(x[i, history_channel], cen, axis)
-                    if history_channel is not None else np.zeros_like(pres))
-            alpha = .8*hist[..., None]
-            rgb = ((1-alpha)*pres[..., None] + alpha*np.array([1., .1, .1])).clip(0, 1)
+            pres = (_curved_slab(x[i, 0], cen, axis)+4.)/8.
+            rgb = np.repeat(pres[..., None], 3, -1).clip(0, 1)
             a = ax[r, i]
             a.imshow(rgb, origin="lower", aspect="auto")
             a.plot(gi[:, comp], gi[:, 2], "o--", color="lime", ms=3, lw=1)
@@ -138,26 +131,6 @@ def _gt_frames(points):
         u = fr[:, 0]
         frames.append(fr)
     return np.stack(frames)
-
-
-def rollout_diag(tracer, fibers, seeds, path, max_len=400.0, half=15, batch=8):
-    """Trace held-out seeds and show each in a straightened view along its GT
-    fiber: arc length up, lateral offset across (u and v panels), presence
-    background, GT = centre line (green), trace = orange."""
-    old = tracer.p.max_len
-    tracer.p.max_len = max_len
-    try:
-        paths, reasons = [], []
-        for start in range(0, len(seeds), batch):
-            chunk = seeds[start:start+batch]
-            from vesuvius.neural_tracing.fiber_follow.tracing.crop_frames import trace_family_kwargs
-            p, r = tracer.trace(np.stack([s["pos"] for s in chunk]), np.stack([s["heading"] for s in chunk]),
-                               **trace_family_kwargs(tracer, [s.get('family', fibers[s['fiber']].tag) for s in chunk]))
-            paths.extend(p)
-            reasons.extend(r)
-    finally:
-        tracer.p.max_len = old
-    return plot_rollouts(tracer.vol, fibers, seeds, paths, reasons, path, max_len, half)
 
 
 def plot_rollouts(vol, fibers, seeds, paths, reasons, path, max_len=400., half=15, *, rows=None):
@@ -268,11 +241,6 @@ def plot_curves(log_path, path, *, loss_key='flow'):
         temporary.replace(path)
     finally:
         plt.close(fig)
-
-
-def plot_denoising(curves, history, hmask, path):
-    """Fixed observed history plus the actual sampled initialization and midpoint updates."""
-    plot_refinement(curves, history, hmask, path)
 
 
 def plot_refinement(curves, history, hmask, path, *, labels=None, target=None, target_mask=None):

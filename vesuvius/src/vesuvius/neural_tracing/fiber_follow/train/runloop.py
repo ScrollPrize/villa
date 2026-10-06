@@ -130,7 +130,7 @@ def resume_training(ck, model, ema, opt, *, reset_optimizer=False):
     the sampled data sequence after a resume differs from an uninterrupted run.
     With reset_optimizer, retain the supplied fresh optimizer instead of the
     saved moments/groups. Model weights, EMA, RNG and update count still resume.
-    Returns the completed update count and replay samples seen so far.
+    Returns the completed update count.
     """
     if 'optimizer' not in ck:
         raise ValueError('Checkpoint holds no optimizer state; resume from ckpt_*.pt or last.pt of a run')
@@ -142,4 +142,4 @@ def resume_training(ck, model, ema, opt, *, reset_optimizer=False):
         opt.load_state_dict(ck['optimizer'])
     if 'rng' in ck:
         restore_training_rng(ck['rng'])
-    return int(ck['step']), int(ck.get('replay_seen', 0))
+    return int(ck['step'])
