@@ -150,6 +150,27 @@ class FastDepthProjectionTest(unittest.TestCase):
                 renderer._render_values(*float_arguments), reference_render_values(*float_arguments)
             )
 
+    def test_nonnative_byte_order_uses_original_path(self):
+        # Zarr v2 allows ">" and "<" dtypes and load_block keeps the stored byte
+        # order; numba only accepts native arrays, so those stay on scipy.
+        from vesuvius.tifxyz_label_transfer import _fast_depth_projection as fast
+
+        xyz = self.rng.uniform(-2, 10, (5, 7, 3))
+        normals = self.rng.normal(size=xyz.shape)
+        valid = self.rng.random((5, 7)) > 0.1
+        values = self.rng.integers(0, 3000, (6, 6, 6))
+        for kind in ("u2", "i2", "u4", "i4", "u8", "i8"):
+            for order in ("<", ">"):
+                dtype = np.dtype(order + kind)
+                with self.subTest(ct=dtype.str):
+                    sampler = BlockSampler(values.astype(dtype), scale=(0.5, 1.7, 2.3))
+                    arguments = (xyz, normals, valid, [-2.0, 0.0, 2.0], sampler, {(0, 0, 0)})
+                    expected = reference_render_values(*arguments)
+                    with mock.patch.object(fast, "render_values", wraps=fast.render_values) as used:
+                        actual = renderer._render_values(*arguments)
+                    self.assertEqual(used.call_count, int(dtype.isnative))
+                    assert_close(actual, expected)
+
     def test_raw_chunk_sampler_sparse_fill_and_cache_sizes(self):
         metadata = {
             "shape": [8, 8, 8],

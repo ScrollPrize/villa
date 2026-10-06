@@ -927,10 +927,14 @@ def _render_values(
     sampler: RawChunkSampler,
     chunks: set[tuple[int, int, int]],
 ) -> np.ndarray:
-    # Standard geometry builders return float64. The fused CPU path also
-    # supports float32 fields while preserving their NumPy scalar arithmetic.
-    if np.dtype(sampler.info.metadata["dtype"]).kind in "iu" and xyz.dtype in (np.dtype("float32"), np.dtype("float64")) and normals.dtype in (
-        np.dtype("float32"), np.dtype("float64")
+    # Numba cannot consume nonnative-byte-order arrays. Keep those on the
+    # original scipy path; native float32/float64 geometry retains fusion.
+    ct_dtype = np.dtype(sampler.info.metadata["dtype"])
+    if (
+        ct_dtype.kind in "iu"
+        and ct_dtype.isnative
+        and xyz.dtype in (np.dtype("float32"), np.dtype("float64"))
+        and normals.dtype in (np.dtype("float32"), np.dtype("float64"))
     ):
         try:
             from ._fast_depth_projection import render_values
