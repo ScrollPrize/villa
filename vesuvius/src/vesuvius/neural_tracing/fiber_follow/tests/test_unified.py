@@ -65,7 +65,8 @@ def test_path_token_sets_and_absent_references_are_independent():
             torch.testing.assert_close(v1[:, :, visible[0]], v0[:, :, visible[0]])
 
 
-@pytest.mark.parametrize('flow, options', [(False, {}), (True, {}), (True, dict(flow_time_conditioning='adaln'))])
+@pytest.mark.parametrize('flow, options', [(False, {}), (True, {}), (True, dict(flow_time_conditioning='adaln')),
+                                            (True, dict(flow_time_conditioning='adaln_zero'))])
 def test_compiled_training_matches_eager_with_finite_gradients(flow, options):
     model = small(flow=flow, **options)
     b = coordinate_batch(model.cfg, 2)
@@ -144,3 +145,30 @@ def test_adaln_starts_as_the_input_conditioned_flow_model_and_modulates_only_vel
     assert all(linear.weight.grad.abs().sum() > 0 for linear in (*adaln.time_modulation, adaln.output_modulation))
     args = build_parser().parse_args(REQUIRED+['--model', 'unified_flow', '--flow-time-conditioning', 'adaln'])
     assert model_config_from_args(args).flow_time_conditioning == 'adaln'
+
+
+def test_adaln_zero_velocity_blocks_start_as_the_identity_and_open_with_training():
+    model = small(flow=True, flow_time_conditioning='adaln_zero')
+    b = coordinate_batch(model.cfg, 2)
+    y, t = torch.randn(2, 3, 8, 2), torch.rand(2, 3)
+    moved = y.clone()
+    moved[:, :, 3] += 2.
+    others = [i for i in range(8) if i != 3]
+    with torch.no_grad():
+        ctx = model.context(b['x'], b['hist'], b['hmask'])
+        # Identity blocks: a plane's velocity reads neither the other planes nor the crop tokens through attention.
+        torch.testing.assert_close(model.velocity_field(ctx, moved, t)[:, :, others],
+                                   model.velocity_field(ctx, y, t)[:, :, others])
+        for linear in (*model.time_modulation, model.output_modulation):
+            linear.weight.normal_(std=.05)
+        assert not torch.allclose(model.velocity_field(ctx, moved, t)[:, :, others],
+                                  model.velocity_field(ctx, y, t)[:, :, others])
+    fresh = small(flow=True, flow_time_conditioning='adaln_zero')
+    b['flow_noise'], b['flow_times'] = torch.randn(2, fresh.cfg.flow_draws, 8, 2), torch.rand(2, fresh.cfg.flow_draws)
+    fresh.training_forward(b['x'], b['hist'], b['hmask'], torch.tensor(.5), b)['flow_per_state'].sum().backward()
+    assert all(m.weight.grad.abs().sum() > 0 for m in fresh.time_modulation)  # the gates learn from the first step
+    args = build_parser().parse_args(REQUIRED+['--model', 'unified_flow', '--flow-time-conditioning', 'adaln_zero'])
+    assert model_config_from_args(args).flow_time_conditioning == 'adaln_zero'
+    from vesuvius.neural_tracing.fiber_follow.models.flow import FlowConfig
+    with pytest.raises(ValueError, match='unified flow model only'):
+        FlowConfig(model_type='flow_matching', recurrent_refinement_steps=0, flow_time_conditioning='adaln_zero')

@@ -21,8 +21,9 @@ model types share this backbone and differ only in what their path tokens carry 
   * 'unified_flow' (flow matching, models/flow.py): path tokens carry a noisy path and the flow time and read out
     the velocity; a scoring set of path tokens carries a finished proposal and reads out its hazard logits. With
     flow_time_conditioning 'adaln' the time also modulates every layer's two branches and the final norm of the
-    velocity path tokens (zero-initialized, so the model starts as the 'input' one); context and scoring tokens have
-    no time and are never modulated.
+    velocity path tokens (zero-initialized, so the model starts as the 'input' one); 'adaln_zero' gates each branch by
+    a zero-initialized alpha instead (alpha*branch, DiT's adaLN-Zero), so every velocity-token block starts as the
+    identity. Context and scoring tokens have no time and are never modulated.
 
 Both keep the shared output contract, losses, acceptance (gate plane), commits and trainer (train/train.py).
 """
@@ -106,17 +107,19 @@ class UnifiedLayer(SequenceLayer):
         x = x+self.merge(F.scaled_dot_product_attention(q, k, v, attn_mask=~padding[:, None, None, :]))
         return x+self.ffn(self.norm2(x)), (k, v)
 
-    def queries(self, x, context, mask, modulation=None):
+    def queries(self, x, context, mask, modulation=None, zero_gate=False):
         """Path tokens (B, M, W) after this layer; ``context`` its context keys/values, ``mask`` (B, M, N+M) the
         context and path keys each path token reads. ``modulation`` (B, M, 2, 3, W) conditions the attention and
-        FFN branches per token: normalized input * (1+scale) + shift, branch output * (1+gate); zero is unmodulated."""
+        FFN branches per token: normalized input * (1+scale) + shift, branch output * (1+gate); zero is unmodulated.
+        ``zero_gate``: branch output * gate instead (adaLN-Zero), so zero modulation is the identity."""
         if modulation is None:
             branch_input = lambda value, norm, i: norm(value)
             residual = lambda value, branch, i: value+branch
         else:
             shift, scale, gate = modulation.unbind(-2)  # each (B, M, 2, W)
             branch_input = lambda value, norm, i: norm(value)*(1+scale[..., i, :])+shift[..., i, :]
-            residual = lambda value, branch, i: value+(1+gate[..., i, :])*branch
+            gain = gate if zero_gate else 1+gate
+            residual = lambda value, branch, i: value+gain[..., i, :]*branch
         q, k, v = self.split(branch_input(x, self.norm1, 0))
         k, v = torch.cat((context[0], k), 2), torch.cat((context[1], v), 2)
         x = residual(x, self.merge(F.scaled_dot_product_attention(q, k, v, attn_mask=mask[:, None])), 0)
@@ -178,7 +181,7 @@ class UnifiedBackbone(nn.Module):
     def run_paths(self, ctx, tokens, padding=None, modulation=None):
         """Final states (B, G, P, W) of G independent sets of path tokens (B, G, P, W) over one decision's context;
         ``padding`` (B, G, P) True: a path token the others of its set do not read. ``modulation`` (per-layer list of
-        (B, G, 2, 3, W), final-norm (B, G, 2, W) shift/scale) conditions each set's tokens (adaLN)."""
+        (B, G, 2, 3, W), final-norm (B, G, 2, W) shift/scale, zero_gate) conditions each set's tokens (adaLN)."""
         b, g, p, w = tokens.shape
         group = torch.arange(g, device=tokens.device).repeat_interleave(p)
         own = (group[:, None] == group[None, :])[None]
@@ -189,7 +192,8 @@ class UnifiedBackbone(nn.Module):
         per_token = lambda m: m[:, :, None].expand(b, g, p, *m.shape[2:]).reshape(b, g*p, *m.shape[2:]).to(x.dtype)
         layers = [None]*len(self.layers) if modulation is None else modulation[0]
         for layer, pair, condition in zip(self.layers, ctx['context'], layers):
-            x = layer.queries(x, pair, mask, None if condition is None else per_token(condition))
+            x = layer.queries(x, pair, mask, None if condition is None else per_token(condition),
+                              zero_gate=modulation is not None and modulation[2])
         x = self.norm(x).reshape(b, g, p, w)
         if modulation is not None:
             shift, scale = modulation[1][:, :, None].to(x.dtype).unbind(-2)
@@ -289,7 +293,7 @@ class UnifiedFlowFollower(FlowMatching, UnifiedBackbone):
         # CNN evidence and support at the noisy path, its residual-scale coordinates, forward distance.
         self.query = nn.Sequential(nn.Linear(cells+1+2+1, h), nn.SiLU(), nn.Linear(h, h))
         self.time = nn.Sequential(nn.Linear(64, h), nn.SiLU(), nn.Linear(h, h))
-        if cfg.flow_time_conditioning == 'adaln':
+        if cfg.flow_time_conditioning in ('adaln', 'adaln_zero'):
             # Per layer: shift/scale/gate of the attention and FFN branches; then the final norm's shift/scale.
             self.time_modulation = nn.ModuleList(nn.Linear(h, 6*h) for _ in range(cfg.layers))
             self.output_modulation = nn.Linear(h, 2*h)
@@ -318,10 +322,11 @@ class UnifiedFlowFollower(FlowMatching, UnifiedBackbone):
         tokens = tokens+time[:, :, None].to(tokens.dtype)+self.kind[PATH].to(tokens.dtype)
         padding = None if known is None else (~known)[:, None].expand(-1, draws, -1)
         modulation = None
-        if self.cfg.flow_time_conditioning == 'adaln':
+        if self.cfg.flow_time_conditioning in ('adaln', 'adaln_zero'):
             condition = F.silu(time)  # (B, D, W): one modulation per draw, shared by its planes
             modulation = ([m(condition).unflatten(-1, (2, 3, self.cfg.hidden)) for m in self.time_modulation],
-                          self.output_modulation(condition).unflatten(-1, (2, self.cfg.hidden)))
+                          self.output_modulation(condition).unflatten(-1, (2, self.cfg.hidden)),
+                          self.cfg.flow_time_conditioning == 'adaln_zero')
         return self.velocity(self.run_paths(ctx, tokens, padding, modulation)).float()
 
     def hazard_logits(self, ctx, points):

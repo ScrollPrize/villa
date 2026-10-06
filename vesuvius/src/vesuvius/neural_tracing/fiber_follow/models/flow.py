@@ -27,7 +27,9 @@ class FlowConfig(CoordinateRegressionConfig):
     flow_samples: int = 0
     flow_sample_scale: float = 1.
     # 'input': the time embedding is added to the decoder queries once. 'adaln': it also modulates every
-    # decoder branch and the output norm per draw (zero-initialized, so a warm start is exact).
+    # decoder branch and the output norm per draw (zero-initialized, so a warm start is exact). 'adaln_zero'
+    # (unified_flow only): as 'adaln' with branch gates alpha*branch instead of (1+gate)*branch, so every modulated
+    # block starts as the identity (DiT's adaLN-Zero, for training from scratch).
     flow_time_conditioning: str = 'input'
     # Lower bound of the fitted residual scales (voxels), i.e. of the noise prior's width.
     flow_sigma_floor: float = 1.
@@ -63,8 +65,10 @@ class FlowConfig(CoordinateRegressionConfig):
         if type(self.flow_samples) is not int or self.flow_samples < 0 or not (
                 math.isfinite(self.flow_sample_scale) and self.flow_sample_scale > 0):
             raise ValueError('Flow samples must be a nonnegative integer with a finite positive scale')
-        if self.flow_time_conditioning not in ('input', 'adaln') or self.flow_unknown_planes not in ('padded', 'own_path'):
-            raise ValueError("Flow time conditioning is 'input' or 'adaln'; unknown planes 'padded' or 'own_path'")
+        if self.flow_time_conditioning not in ('input', 'adaln', 'adaln_zero') or self.flow_unknown_planes not in ('padded', 'own_path'):
+            raise ValueError("Flow time conditioning is 'input', 'adaln' or 'adaln_zero'; unknown planes 'padded' or 'own_path'")
+        if self.flow_time_conditioning == 'adaln_zero' and self.model_type != 'unified_flow':
+            raise ValueError("'adaln_zero' time conditioning is implemented for the unified flow model only")
         if self.flow_selection not in ('retry', 'best') or (not self.flow_zero_start and not self.flow_samples):
             raise ValueError("Flow selection is 'retry' or 'best'; dropping the zero start needs flow samples")
         if not 0 <= self.flow_sample_threshold <= 1:

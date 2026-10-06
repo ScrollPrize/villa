@@ -729,8 +729,9 @@ def build_parser():
                          'used as retries in tracing')
     ap.add_argument('--flow-sample-scale', type=float, default=FlowConfig.flow_sample_scale,
                     help='Flow: standard deviation of those starts, in residual-scale units')
-    ap.add_argument('--flow-time-conditioning', choices=('input', 'adaln'), default=FlowConfig.flow_time_conditioning,
-                    help="Flow: 'adaln' also modulates every decoder branch and the output norm by the time")
+    ap.add_argument('--flow-time-conditioning', choices=('input', 'adaln', 'adaln_zero'), default=FlowConfig.flow_time_conditioning,
+                    help="Flow: 'adaln' also modulates every decoder branch and the output norm by the time; "
+                         "'adaln_zero' (unified_flow) gates each branch by a zero-initialized alpha (identity blocks at init)")
     ap.add_argument('--flow-sigma-floor', type=float, default=FlowConfig.flow_sigma_floor,
                     help='Flow: lower bound (voxels) of the fitted residual scales, the width of the noise prior')
     ap.add_argument('--flow-unknown-planes', choices=('padded', 'own_path'), default=FlowConfig.flow_unknown_planes,
