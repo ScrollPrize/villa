@@ -9,7 +9,7 @@ from vesuvius.neural_tracing.tracers.models.model import build_model
 from vesuvius.neural_tracing.tracers.models.crop_transformer import FlowConfig, RegressionConfig
 from vesuvius.neural_tracing.tracers.shared.geometry import CropSpec
 from vesuvius.neural_tracing.tracers.fibers.train.supervision import loss_terms
-from vesuvius.neural_tracing.tracers.fibers.train.train import prepare_training, training_prediction
+from vesuvius.neural_tracing.tracers.fibers.train.step import prepare_training, training_prediction
 
 SMALL = dict(fine=CropSpec(depth=32, width=16, behind=8, spacing=.5), n_future=8, gate_plane=4, hidden=32, layers=2,
              heads=2, ffn=64, cnn_channels=(4, 8, 16), cnn_blocks=(1, 1, 1), n_history=32)

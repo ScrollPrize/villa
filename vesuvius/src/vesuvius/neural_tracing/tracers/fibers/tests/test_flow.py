@@ -9,9 +9,8 @@ from model_fixtures import coordinate_batch, flow_config
 from vesuvius.neural_tracing.tracers.models.model import build_model, config_from_checkpoint
 from vesuvius.neural_tracing.tracers.models.flow import fit_flow_sigma, flow_targets
 from vesuvius.neural_tracing.tracers.fibers.train.supervision import loss_terms
-from vesuvius.neural_tracing.tracers.fibers.train.train import (
-    prepare_training, optimizer_update, save_checkpoint, initialize_training_optimizer,
-)
+from vesuvius.neural_tracing.tracers.fibers.train.step import prepare_training, optimizer_update, initialize_training_optimizer
+from vesuvius.neural_tracing.tracers.fibers.train.train import save_checkpoint
 from vesuvius.neural_tracing.tracers.models.checkpoint import initialize_model_weights, load_checkpoint
 from vesuvius.neural_tracing.tracers.fibers.train.runloop import training_rng_state
 from vesuvius.neural_tracing.tracers.fibers.data.samples import SampleConfig

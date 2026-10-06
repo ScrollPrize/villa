@@ -4,7 +4,7 @@ import torch
 
 from model_fixtures import coordinate_batch, coordinate_config
 from vesuvius.neural_tracing.tracers.models.model import build_model
-from vesuvius.neural_tracing.tracers.fibers.train.train import prepare_training, optimizer_update, training_prediction
+from vesuvius.neural_tracing.tracers.fibers.train.step import prepare_training, optimizer_update, training_prediction
 from vesuvius.neural_tracing.tracers.fibers.train.supervision import loss_terms
 
 
@@ -65,7 +65,7 @@ def test_compiled_loss_preserves_terms_and_prediction_gradients():
 
 def test_refinement_loss_all_keeps_initial_weight_and_reports_policy_attempts():
     from types import SimpleNamespace
-    from vesuvius.neural_tracing.tracers.fibers.train.train import REFINE_ALL, initialize_training_optimizer, optimizer_update
+    from vesuvius.neural_tracing.tracers.fibers.train.step import REFINE_ALL, initialize_training_optimizer, optimizer_update
     from vesuvius.neural_tracing.tracers.models.checkpoint import initialize_model_weights
     torch.manual_seed(115)
     model = build_model(coordinate_config(recurrent_refinement_steps=2))

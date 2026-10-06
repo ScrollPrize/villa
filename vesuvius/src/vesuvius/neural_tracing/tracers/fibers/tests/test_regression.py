@@ -9,7 +9,8 @@ import torch
 from vesuvius.neural_tracing.tracers.models.model import build_model, config_from_checkpoint
 from vesuvius.neural_tracing.tracers.fibers.train.supervision import loss_terms
 from vesuvius.neural_tracing.tracers.models.targets import geometry_mask
-from vesuvius.neural_tracing.tracers.fibers.train.train import clip_training_gradients, initialize_training_optimizer, optimizer_update, prepare_training, save_checkpoint
+from vesuvius.neural_tracing.tracers.fibers.train.step import clip_training_gradients, initialize_training_optimizer, optimizer_update, prepare_training
+from vesuvius.neural_tracing.tracers.fibers.train.train import save_checkpoint
 from vesuvius.neural_tracing.tracers.models.checkpoint import initialize_model_weights, load_checkpoint, read_checkpoint
 from vesuvius.neural_tracing.tracers.fibers.data.samples import SampleConfig
 from vesuvius.neural_tracing.tracers.fibers.train.runloop import training_rng_state
