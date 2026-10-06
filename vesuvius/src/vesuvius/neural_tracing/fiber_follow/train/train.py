@@ -254,7 +254,7 @@ def model_config_from_args(args, checkpoint=None):
     if cls is FlowConfig:
         options.update({key: getattr(args, key) for key in (
             'flow_steps', 'flow_draws', 'flow_samples', 'flow_sample_scale', 'flow_time_conditioning',
-            'flow_sigma_floor', 'flow_unknown_planes')})
+            'flow_sigma_floor', 'flow_unknown_planes', 'flow_loss', 'flow_huber_c', 'flow_geometry_weight')})
     else:
         options['recurrent_refinement_steps'] = args.recurrent_refinement_steps
     return cls(**options)
@@ -613,6 +613,9 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
                 identity[key] = identity.get(key, 0.)+float((cpu['location_source'] == index).sum())
         for key, value in (('loss', loss), ('geometry', geometry), ('confidence_loss', confidence)):
             accumulate(sums, key, value)
+        if 'flow_path_geometry_per_state' in terms:  # the geometry term then holds flow + weighted path geometry
+            accumulate(sums, 'flow', terms['flow_per_state'].sum()/denominator)
+            accumulate(sums, 'flow_path_geometry', terms['flow_path_geometry_per_state'].sum()/denominator)
         for key in ('error_sum', 'geometry_count', 'correct_count', 'confidence_count',
                     'point_correct_count', 'point_wrong_count', 'point_unknown_count',
                     'confidence_labeled_states', 'confidence_terminal_states', 'confidence_recoverable_states',
@@ -663,7 +666,7 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
         sums['tube_loss'] = sums['tube_loss_sum']/max(1., sums['tube_states'])
     sums['prediction_loss'] = sums['geometry']
     if model.cfg.model_type == 'flow_matching':
-        sums['flow'] = sums['geometry']
+        sums.setdefault('flow', sums['geometry'])
     return sums
 
 
@@ -685,6 +688,14 @@ def build_parser():
                     help='Flow: lower bound (voxels) of the fitted residual scales, the width of the noise prior')
     ap.add_argument('--flow-unknown-planes', choices=('padded', 'own_path'), default=FlowConfig.flow_unknown_planes,
                     help="Flow: 'own_path' keeps target-less planes in self-attention, following the model's own path")
+    ap.add_argument('--flow-loss', choices=('mse', 'pseudo_huber'), default=FlowConfig.flow_loss,
+                    help="Flow: velocity-residual loss per path point; 'pseudo_huber' is quadratic below --flow-huber-c "
+                         "and linear above it")
+    ap.add_argument('--flow-huber-c', type=float, default=FlowConfig.flow_huber_c,
+                    help='Flow: pseudo-Huber scale, in residual-scale (sigma) units per path point')
+    ap.add_argument('--flow-geometry-weight', type=float, default=FlowConfig.flow_geometry_weight,
+                    help='Flow: weight of a smooth-L1 geometry loss on the zero-start path integrated with gradients '
+                         'through the solver (0: off)')
     ap.add_argument('--dagger-threads', type=int, default=4)
     ap.add_argument('--name', required=True)
     ap.add_argument('--fiber-zarrs')

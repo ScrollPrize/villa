@@ -326,3 +326,61 @@ def test_keyed_proposal_noise_depends_only_on_each_rows_key_and_the_tracer_keys_
     run_tracer(second, monkeypatch)
     assert first.keys == second.keys and len(first.keys) > 3
     assert len({k[0] for k in first.keys}) == len(first.keys)  # a fresh key every decision
+
+
+def test_pseudo_huber_flow_loss_is_half_the_squared_distance_for_small_residuals_and_linear_beyond_c():
+    torch.manual_seed(37)
+    b = coordinate_batch(config())
+    noise = torch.randn(2, 2, 4, 2)*3
+    target, known = flow_targets(b, config())
+    # A zero velocity makes the residual (noise - target) per known path point (unit scales).
+    distance = (noise-target[:, None]).norm(dim=-1)[known[:, None].expand(-1, 2, -1)].reshape(2, -1)
+    for loss, c, expected in (('mse', 1., .5*distance.square()),
+                              ('pseudo_huber', 1., ((1+distance.square()).sqrt()-1)),
+                              ('pseudo_huber', .5, .25*((1+(distance/.5).square()).sqrt()-1))):
+        model = build_model(config(flow_loss=loss, flow_huber_c=c))
+        model.velocity_field = lambda ctx, y, t, known=None: torch.zeros_like(y)
+        out = model.training_forward(b['x'], b['hist'], b['hmask'], .5, dict(b, flow_noise=noise))
+        torch.testing.assert_close(out['flow_per_state'], expected.mean(-1).float(), rtol=1e-5, atol=1e-6)
+    huber = ((1+distance.square()).sqrt()-1)
+    assert (huber <= .5*distance.square()+1e-6).all()  # never above the squared loss; linear for large residuals
+    with pytest.raises(ValueError, match='Flow loss'):
+        config(flow_loss='l1')
+
+
+def test_flow_geometry_weight_trains_the_integrated_zero_start_path_and_nothing_else_sees_its_gradient():
+    torch.manual_seed(41)
+    plain = build_model(config(flow_samples=2))
+    model = build_model(config(flow_samples=2, flow_geometry_weight=.5))
+    model.load_state_dict(plain.state_dict())
+    b = coordinate_batch(model.cfg)
+    b['flow_noise'] = torch.randn(2, 2, 4, 2)
+    torch.manual_seed(5); base = plain.training_forward(b['x'], b['hist'], b['hmask'], .5, b)
+    torch.manual_seed(5); out = model.training_forward(b['x'], b['hist'], b['hmask'], .5, b)
+    assert 'flow_geometry_points' not in base and out['flow_geometry_points'].requires_grad
+    # Same proposals, scores and flow loss; the proposals reach the scorer detached.
+    for key in ('refinement_points', 'refinement_confidence', 'flow_per_state'):
+        torch.testing.assert_close(out[key], base[key], atol=2e-5, rtol=1e-5)
+    assert not out['refinement_points'].requires_grad
+    torch.testing.assert_close(out['flow_geometry_points'], out['refinement_points'][:, 0], atol=2e-5, rtol=1e-5)
+    terms = loss_terms(model.select_prediction(out), b, model.cfg)
+    torch.testing.assert_close(terms['geometry_per_state'],
+                               out['flow_per_state']+.5*terms['flow_path_geometry_per_state'])
+    assert 'flow_path_geometry_per_state' not in loss_terms(plain.select_prediction(base), b, plain.cfg)
+    terms['flow_path_geometry_per_state'].sum().backward()
+    assert model.velocity.weight.grad.abs().sum() > 0
+    assert all(p.grad is None or not p.grad.any() for p in model.confidence_scorer.parameters())
+    model.eval()
+    with torch.no_grad():
+        assert 'flow_geometry_points' not in model.training_forward(b['x'], b['hist'], b['hmask'], .5)
+    with pytest.raises(ValueError, match='zero-start path'):
+        config(flow_samples=2, flow_zero_start=False, flow_geometry_weight=.5)
+
+
+def test_flow_loss_and_geometry_options_reach_the_model_config():
+    args = build_parser().parse_args(['--name', 'x', '--model', 'flow_matching', '--flow-loss', 'pseudo_huber',
+                                      '--flow-huber-c', '2', '--flow-geometry-weight', '.25'])
+    cfg = model_config_from_args(args)
+    assert (cfg.flow_loss, cfg.flow_huber_c, cfg.flow_geometry_weight) == ('pseudo_huber', 2., .25)
+    default = model_config_from_args(build_parser().parse_args(['--name', 'x', '--model', 'flow_matching']))
+    assert (default.flow_loss, default.flow_geometry_weight) == ('mse', 0.)

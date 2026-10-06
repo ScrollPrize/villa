@@ -41,6 +41,14 @@ class FlowConfig(CoordinateRegressionConfig):
     # it. Planes below the bar are pushed below the gate (so the tracer's commit check agrees); planes
     # above it keep their confidence, so eligible samples are ranked against the zero start as they are.
     flow_sample_threshold: float = 0.
+    # Loss on the velocity residual, per path point in residual-scale units: 'mse' (squared error; its minimizer is
+    # the conditional mean velocity, the exact flow-matching objective) or 'pseudo_huber': c²(√(1+d²/c²)−1) per
+    # point, equal to the squared error below about flow_huber_c and linear above it, so outlying targets pull less.
+    flow_loss: str = 'mse'
+    flow_huber_c: float = 1.
+    # Weight of a smooth-L1 geometry loss (voxels, as coordinate regression) on the zero-start path, integrated with
+    # gradients through the solver. 0: the integrated path is not supervised directly, only through the flow.
+    flow_geometry_weight: float = 0.
 
     def __post_init__(self):
         super().__post_init__()
@@ -60,6 +68,12 @@ class FlowConfig(CoordinateRegressionConfig):
             raise ValueError('The flow sample threshold lies in [0, 1]')
         if not (math.isfinite(self.flow_sigma_floor) and self.flow_sigma_floor >= 1):
             raise ValueError('The flow scale floor must be finite and at least one voxel')
+        if self.flow_loss not in ('mse', 'pseudo_huber') or not (math.isfinite(self.flow_huber_c) and self.flow_huber_c > 0):
+            raise ValueError("Flow loss is 'mse' or 'pseudo_huber' with a finite positive scale")
+        if not (math.isfinite(self.flow_geometry_weight) and self.flow_geometry_weight >= 0):
+            raise ValueError('The flow geometry weight must be finite and nonnegative')
+        if self.flow_geometry_weight and (not self.flow_zero_start or self.path_planes != 'future'):
+            raise ValueError('Flow geometry supervision trains the zero-start path on the future planes')
         if self.flow_sigma and (len(self.flow_sigma) != len(self.path_plane_values) or any(
                 len(row) != 2 or any(not math.isfinite(v) or v < self.flow_sigma_floor for v in row)
                 for row in self.flow_sigma)):
@@ -176,12 +190,12 @@ class FlowFollower(ObservationFollower):
             output = output*(1+scale)+shift
         return self.velocity(output).float()
 
-    def generate(self, ctx, hist, start=None):
+    def generate(self, ctx, hist, start=None, grad=False):
         """Midpoint integration from ``start`` (B, D, P, 2), by default the zero path (D=1).
-        Returns the (B, D, P, 3) points at every solver step."""
+        Returns the (B, D, P, 3) points at every solver step; ``grad`` keeps gradients through the solver."""
         y = hist.new_zeros(len(hist), 1, len(self.flow_planes), 2) if start is None else start
         curves = [self.to_points(y)]
-        with torch.no_grad():
+        with torch.set_grad_enabled(grad and torch.is_grad_enabled()):
             for step in range(self.cfg.flow_steps):
                 t = y.new_full(y.shape[:2], step/self.cfg.flow_steps)
                 v = self.velocity_field(ctx, y, t)
@@ -213,7 +227,18 @@ class FlowFollower(ObservationFollower):
     def training_forward(self, x, hist, hmask, threshold, targets=None):
         ctx = self.context(x, hist, hmask)
         self.prepare_prediction(ctx, hist)
-        generated = self.generate(ctx, hist, self.proposal_starts(hist, x.get('flow_noise_keys')))
+        starts = self.proposal_starts(hist, x.get('flow_noise_keys'))
+        geometry = bool(self.cfg.flow_geometry_weight) and targets is not None and torch.is_grad_enabled()
+        if geometry:
+            # The zero-start path keeps solver gradients for its geometry loss only: every other use (scoring,
+            # selection, own-path fill) sees it detached, and the samples integrate without gradients.
+            path = self.generate(ctx, hist, starts[:, :1], grad=True)
+            geometry_points = path[-1][:, 0, self.proposal]
+            generated = [curve.detach() for curve in path]
+            if starts.shape[1] > 1:
+                generated = [torch.cat(pair, 1) for pair in zip(generated, self.generate(ctx, hist, starts[:, 1:]))]
+        else:
+            generated = self.generate(ctx, hist, starts)
         full = generated[-1][:, 0]  # the first proposal's integrated path on every flow plane
         curves = [curve[:, 0, self.proposal] for curve in generated]
         points = curves[-1]
@@ -226,6 +251,8 @@ class FlowFollower(ObservationFollower):
         valid = [torch.ones(len(hist), device=hist.device, dtype=torch.bool)]*len(proposals)
         result = self.proposal_output(curves[0], proposals, scores, valid)
         result['solver_points'] = torch.stack(curves, 1)
+        if geometry:
+            result['flow_geometry_points'] = geometry_points
         if self.cfg.path_planes == 'crop':
             result['crop_points'] = full
         # Same memory record and identity heads as coordinate regression, at the integrated path.
@@ -250,7 +277,14 @@ class FlowFollower(ObservationFollower):
             end = torch.where(known[:, None, :, None], (target/self.sigma)[:, None], fill)
             y = (1-times[..., None, None])*noise+times[..., None, None]*end
             predicted = self.velocity_field(ctx, y, times, attended)
-            error = (predicted-(end-noise)).square()
+            residual = predicted-(end-noise)
+            if self.cfg.flow_loss == 'pseudo_huber':
+                # Each coordinate carries its point's c²(√(1+d²/c²)−1) ≈ d²/2, so small residuals give the 'mse'
+                # value and the pull per point is bounded by 2c beyond about c.
+                c = self.cfg.flow_huber_c
+                error = (c*c*((1+residual.square().sum(-1, keepdim=True)/(c*c)).sqrt()-1)).expand_as(residual)
+            else:
+                error = residual.square()
             mask = known[:, None, :, None].expand_as(error)
             result['flow_per_state'] = torch.where(mask, error, 0.).sum((1, 2, 3))/mask.sum((1, 2, 3)).clamp_min(1)
         return result

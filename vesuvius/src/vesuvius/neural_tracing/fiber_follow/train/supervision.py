@@ -32,6 +32,14 @@ def window_mean(values, mask, near):
     return .5*mean(mask & near)+.5*mean(mask)
 
 
+def path_geometry_loss(curve, target, mask, near):
+    """Smooth-L1 (voxels) of a (B, P, 3) path resampled linearly onto the dense target planes (window_mean)."""
+    dense = F.interpolate(curve[..., :2].transpose(1, 2), size=mask.shape[1],
+                          mode='linear', align_corners=True).transpose(1, 2)
+    error = F.smooth_l1_loss(dense, target, beta=1., reduction='none').mean(-1)
+    return window_mean(error, mask, near)
+
+
 def foreign_hits(points, batch, cfg):
     """Which (B, N, 3) crop-local points fall in cells of a validated neighboring path."""
     foreign = batch['foreign']
@@ -155,10 +163,7 @@ def loss_terms(output, batch, cfg, tolerance=1.5, *, n_commit=None, refinement_l
             from vesuvius.neural_tracing.fiber_follow.models.whole_crop import crop_path_loss
             geometry_losses.append(crop_path_loss(crop_paths[:, attempt], batch))
         else:
-            dense = F.interpolate(curve[..., :2].transpose(1, 2), size=mask.shape[1],
-                                  mode='linear', align_corners=True).transpose(1, 2)
-            error = F.smooth_l1_loss(dense, target, beta=1., reduction='none').mean(-1)
-            geometry_losses.append(window_mean(error, mask, near))
+            geometry_losses.append(path_geometry_loss(curve, target, mask, near))
         labels, known, _, _ = proposal_labels(curve, batch, cfg, tolerance)
         confidence_losses.append(survival_loss(hazards, labels, known)[0])
     attempts = output['refinement_mask'].bool()
@@ -183,8 +188,14 @@ def loss_terms(output, batch, cfg, tolerance=1.5, *, n_commit=None, refinement_l
         auxiliary = torch.where(earlier, geometry_losses, 0.).sum(1)/(count-1).clamp_min(1)
         geometry = torch.where(count > 1, .75*final+.25*auxiliary, final)
         confidence = torch.where(attempts, confidence_losses, 0.).sum(1)/count
+    flow_terms = {}
     if cfg.model_type == 'flow_matching':
         geometry = output['flow_per_state']
+        if 'flow_geometry_points' in output:
+            # The integrated zero-start path, supervised as a regression path (flow_geometry_weight).
+            path = path_geometry_loss(output['flow_geometry_points'], target, mask, near)
+            geometry = geometry+cfg.flow_geometry_weight*path
+            flow_terms = dict(flow_per_state=output['flow_per_state'], flow_path_geometry_per_state=path)
     # Distance-only labels keep their names; identity-aware labels add the neighbor raster.
     labels, known, _ = prefix_labels(output['points'], batch, tolerance, cfg.max_recovery_distance)
     supervised, supervised_known, _, extra = proposal_labels(output['points'], batch, cfg, tolerance)
@@ -202,7 +213,7 @@ def loss_terms(output, batch, cfg, tolerance=1.5, *, n_commit=None, refinement_l
                  geometry_states_per_state=mask.any(-1) if crop_paths is None else batch['crop_mask'].bool().any(-1),
                  geometry_count=mask.sum(), confidence_count=supervised_known.sum(),
                  error_sum=torch.where(mask, (predicted-target).norm(dim=-1), 0.).sum(),
-                 correct_count=(labels*known).sum())
+                 correct_count=(labels*known).sum(), **flow_terms)
     if 'foreign' in batch:
         terms.update(identity_correct_count=(supervised*supervised_known).sum(),
                      identity_flipped_count=(labels*known*(1-supervised)).sum(),

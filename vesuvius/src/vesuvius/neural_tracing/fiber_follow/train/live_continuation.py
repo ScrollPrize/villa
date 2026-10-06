@@ -290,7 +290,7 @@ class LiveContinuation:
         points = output['points'][indices].detach().float()
         confidence = output['confidence'][indices].detach().float()
         counts, _ = commit_count(points, confidence, self.policy.confidence, self.policy.n_commit,
-                                 self.policy.max_recovery_distance, self.policy.gate, self.horizon)
+                                 self.policy.max_recovery_distance, self.policy.gate, getattr(self, "horizon", None))
         points, counts = points.cpu().numpy(), counts.cpu().numpy()
         entries = output.get('memory_entry')
         for i, proposal, count in zip(indices, points, counts):
