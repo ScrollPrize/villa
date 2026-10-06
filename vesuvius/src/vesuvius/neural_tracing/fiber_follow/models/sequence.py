@@ -27,7 +27,7 @@ from torch.utils.checkpoint import checkpoint
 from vesuvius.models.build.resblocks import BasicBlockD, StackedResidualBlocks
 
 from vesuvius.neural_tracing.fiber_follow.models.model import (
-    CoordinateRegressionConfig, device_vector, future_points, proposal_output, sample_features, select_refinement)
+    FollowerConfig, future_points, proposal_output, sample_features, select_refinement)
 from vesuvius.neural_tracing.fiber_follow.models.survival_confidence import survival_predictions
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
 from vesuvius.neural_tracing.fiber_follow.tracing.policy import DEFAULT_CONFIDENCE
@@ -36,9 +36,9 @@ POSITION_FREQUENCIES = 8  # sinusoidal arc length, periods 16 .. 2048 trace voxe
 
 
 @dataclass
-class SequenceConfig(CoordinateRegressionConfig):
-    """The shared crop/horizon/label contract (CoordinateRegressionConfig fields read by data, losses and tracing)
-    plus this model's own sizes. ``layers``/``heads`` size the transformer; refinement is not used."""
+class SequenceConfig(FollowerConfig):
+    """The shared crop/horizon/label contract (FollowerConfig fields read by data, losses and tracing) plus this
+    model's own sizes. ``layers``/``heads`` size the transformer; refinement is not used."""
     model_type: str = 'sequence'
     fine: CropSpec = field(default_factory=lambda: CropSpec(depth=80, width=64, behind=16, spacing=.5))
     n_future: int = 31
@@ -49,16 +49,16 @@ class SequenceConfig(CoordinateRegressionConfig):
     cnn_channels: tuple = (16, 32, 64, 128)  # full-resolution block, then stages at strides 2, 4, 8
     cnn_blocks: int = 2
     history_limit: int = 512  # most recent history tokens a decision reads
-    memory: str = 'none'  # no memory inputs for the data builders: the history is the trace's own steps
-    recurrent_refinement_steps: int = 0
 
     def __post_init__(self):
         super().__post_init__()
         self.cnn_channels = tuple(int(c) for c in self.cnn_channels)
         if len(self.cnn_channels) != 4 or min(self.cnn_channels) < 1 or self.cnn_blocks < 1 or self.ffn < 1:
             raise ValueError('The CNN needs four positive channel widths and positive blocks; the FFN a positive width')
-        if self.recurrent_refinement_steps or self.memory != 'none' or self.path_planes != 'future' or self.tube_head:
-            raise ValueError('The sequence follower has no refinement, memory inputs, whole-crop planes or tube head')
+        if self.recurrent_refinement_steps:
+            raise ValueError('The sequence follower has no refinement')
+        if self.layers < 1 or self.heads < 1 or self.hidden % self.heads:
+            raise ValueError('Positive layers and heads required; hidden must divide by heads')
         if self.history_limit < 1:
             raise ValueError('History limit must be positive')
         c = self.fine

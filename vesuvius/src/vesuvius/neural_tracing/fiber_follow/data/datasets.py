@@ -17,8 +17,6 @@ from vesuvius.neural_tracing.fiber_follow.data.neighbor_bank import NeighborBank
 
 PRIMARY_OPTIONS = ('fibers', 'fiber_zarrs', 'ct', 'manifest', 'val_z', 'negative_bank',
                    'near_negative_bank', 'following_bank', 'continuation_bank')
-# Source values that read_dataset_config resolves to filesystem paths.
-DATASET_PATH_KEYS = tuple(k for k in PRIMARY_OPTIONS if k != 'val_z')+('path',)
 
 
 def crop_level_options(source):
@@ -47,14 +45,19 @@ def primary_source_spec(document, *, fiber_zarrs=None, ct=None):
 
 def read_dataset_config(path):
     path = Path(path).resolve()
-    document = json.loads(path.read_text())
+    return parse_dataset_config(json.loads(path.read_text()), path.parent)
+
+
+def parse_dataset_config(document, base):
+    """A dataset configuration (dict) with relative paths resolved against ``base``, and its digest."""
     if document.get('version') != 1 or not document.get('sources'):
         raise ValueError('Dataset config requires version 1 and nonempty sources')
     document = json.loads(json.dumps(document))
+    base = Path(base)
     def resolve(value):
         if value is None or '://' in str(value):
             return value
-        return str((path.parent / value).resolve())
+        return str((base / value).resolve())
     document['cache_dir'] = resolve(document['cache_dir'])
     names = []
     for source in document['sources']:
@@ -84,53 +87,6 @@ def read_dataset_config(path):
             raise ValueError(f'Paris 4 source is missing {key}')
     digest = hashlib.sha256(json.dumps(document, sort_keys=True).encode()).hexdigest()
     return document, digest
-
-
-def same_sources(recorded, document, *, allow_added=False):
-    """Same dataset sources and holdouts (weights may differ). Paths in ``recorded`` that were
-    written on another machine are relocated (shared.paths) before the exact comparison.
-    With ``allow_added`` every recorded source must still be present unchanged, and the document may
-    add sources the recorded run never saw (their holdouts cannot have leaked into it)."""
-    from vesuvius.neural_tracing.fiber_follow.shared.paths import recorded_path
-    def place(key, value, relocate):
-        if relocate and key in DATASET_PATH_KEYS and isinstance(value, str) and '://' not in value:
-            return recorded_path(value)
-        return value
-    # Weights and the model-crop CT level change sampling/reading, not which fibers are held out.
-    ignored = ('weight', 'crop_ct_level', 'crop_ct_grid_scale')
-    splits = lambda value, relocate: [{k: place(k, v, relocate) for k, v in s.items() if k not in ignored}
-                                      for s in (value or {}).get('sources', [])]
-    old, new = splits(recorded, True), splits(document, False)
-    return all(source in new for source in old) if allow_added else old == new
-
-
-CT_LOCATION_KEYS = ('ct', 'ct_level', 'ct_mirror_of')  # where a source's CT is read from, not what it is
-
-
-def validate_dataset_resume(checkpoint, document, digest, *, allow_added=False):
-    """Allow cache and CT relocation (and a reworded description) while requiring identical resolved training data.
-
-    A source's CT location (``ct``, ``ct_level``, ``ct_mirror_of``) may change, e.g. a local mirror replaced by the
-    S3 store it mirrors. With ``allow_added`` the resumed run may append new sources after the recorded ones (dataset
-    ids stay the same); the recorded sources must be unchanged except for their sampling weights."""
-    if checkpoint.get('dataset_config_sha256') == digest:
-        return
-    recorded = checkpoint.get('dataset_config')
-    if isinstance(recorded,dict) and isinstance(document,dict):
-        located = lambda source: {k: v for k, v in source.items() if k not in CT_LOCATION_KEYS}
-        without_cache = lambda value: {k: ([located(s) for s in v] if k == 'sources' else v)
-                                       for k, v in value.items() if k not in ('cache_dir', 'description')}
-        recorded, document = without_cache(recorded), without_cache(document)
-        if recorded == document:
-            return
-        if allow_added:
-            old, new = recorded.get('sources', []), document.get('sources', [])
-            rest = lambda value: {k: v for k, v in value.items() if k not in ('cache_dir', 'description', 'sources')}
-            unweighted = lambda source: {k: v for k, v in source.items() if k != 'weight'}
-            if (rest(recorded) == rest(document) and len(new) > len(old)
-                    and all(unweighted(a) == unweighted(b) for a, b in zip(old, new))):
-                return
-    raise ValueError('Resume dataset configuration changed')
 
 
 def validation_manifest(fibers, spec, seed=0, monitor_count=32):
@@ -397,9 +353,9 @@ def build_mixed_dataset(primary, document, cfg, sample, sampling, args, *, seed,
                                                   negative_bank=AFVBank(fibers))
             band = None
             replay_index = Path(out)/'dagger'/source['name']/'replay.json' if out else None
-            from vesuvius.neural_tracing.fiber_follow.data.data import OnPolicyStates
+            from vesuvius.neural_tracing.fiber_follow.data.data import load_replay, usable_replay
             replay_paths = json.loads(replay_index.read_text()) if resume and replay_index and replay_index.exists() else []
-            replay = [OnPolicyStates.load(p) for p in replay_paths]
+            replay = usable_replay(load_replay(replay_paths), fibers, sample.n_history, spec.grid_scale)
             dataset = FollowDataset(fibers, spec, sample, band, chunk=args.batch,
                 seed=seed+100003*(index+1), cache_bytes=int(args.worker_cache_gb*(1<<30)),
                 batch_builder=builder, budget=budget, length_power=args.afv_length_power,

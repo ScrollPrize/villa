@@ -10,7 +10,6 @@ from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, crop_
 from vesuvius.neural_tracing.fiber_follow.tracing.crop_frames import orient_items, crop_frame_bounds, predict_frames
 from vesuvius.neural_tracing.fiber_follow.tracing.heading import LEARNED_FRAME_POLICY, FRAME_POLICY, ct_seed_heading
 from vesuvius.neural_tracing.fiber_follow.tracing.trace import ModelTracer, TraceParams
-from vesuvius.neural_tracing.fiber_follow.data.history_slabs import load_slabs, slab_layout
 
 
 class Predictor:
@@ -98,23 +97,6 @@ def test_heading_change_recomputes_fixed_forward_plane_crossings(ambiguous):
     for key in ('supervision', 'geometry_valid', 'confidence_valid'):
         assert sample[key] == expected[key]
     assert bool(sample['gt_history_mask'].any()) is not ambiguous
-
-
-def test_historical_roll_keeps_path_heading_and_only_supplies_prefix(monkeypatch):
-    predictor, sample = Predictor(), item(160)
-    sample['frame_policy'] = LEARNED_FRAME_POLICY
-    original = slab_layout(sample)
-    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.data.history_slabs.frame_predictor', lambda cfg: predictor)
-    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.data.crop_sampling.scalar_crops',
-        lambda items, vol, crop, *args, **kwargs: torch.zeros(len(items), 1, crop.depth, crop.width, crop.width))
-    result = load_slabs([sample], None, SimpleNamespace(fine=CropSpec()), pool=None)
-    assert (result['history_frame_source'][result['history_valid']] == 3).all()
-    for old, slab in zip(original, sample['_sampled_slabs']):
-        np.testing.assert_allclose(slab['frame'][:, 2], old['frame'][:, 2], atol=1e-12)
-    for call in predictor.calls:
-        for position, path in zip(call['positions'], call['paths']):
-            np.testing.assert_array_equal(path[-1], position)
-            assert np.all(path[:, 2] <= position[2])
 
 
 def test_tracer_uses_learned_frame_at_seed_and_each_decision(monkeypatch):

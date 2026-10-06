@@ -5,10 +5,9 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
-from model_fixtures import array_at
+from model_fixtures import array_at, config as small_config
 from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolume, FiberVolumeSpec
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, frame_from_heading
-from vesuvius.neural_tracing.fiber_follow.models.model import CoordinateRegressionConfig
 from vesuvius.neural_tracing.fiber_follow.data.observations import image_crop, ObservationBuilder
 
 
@@ -22,10 +21,8 @@ def volume(root):
 
 
 def config(**kwargs):
-    options = dict(fine=CropSpec(depth=16, width=12, behind=7, spacing=.5), hidden=16, heads=2,
-                   layers=1, decoder_layers=1, n_future=4, n_history=8)
-    options.update(kwargs)
-    return CoordinateRegressionConfig(**options)
+    return small_config(**dict(dict(fine=CropSpec(depth=16, width=12, behind=7, spacing=.5), n_future=4, n_history=8),
+                               **kwargs))
 
 
 def item(cfg):
@@ -66,10 +63,8 @@ def test_worker_images_keep_shared_storage_and_identical_values(tmp_path):
     with patch('torch.utils.data.get_worker_info', return_value=object()):
         actual = builder.images([state], vol)
     assert actual['fine'].is_shared()
-    assert actual['history_slabs'].is_shared()
     for key in expected:
-        if key != 'history_load_seconds':
-            torch.testing.assert_close(actual[key], expected[key], rtol=0, atol=0)
+        torch.testing.assert_close(actual[key], expected[key], rtol=0, atol=0)
 
 
 def test_scalar_crop_reuse_preserves_coordinate_dtype_rounding(tmp_path):

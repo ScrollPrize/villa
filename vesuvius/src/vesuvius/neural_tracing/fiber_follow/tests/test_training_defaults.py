@@ -1,79 +1,56 @@
-"""The coordinate_regression launcher's configuration, removed options and fresh-location sampling."""
-from pathlib import Path
-import shlex
+"""The trainer's command line (a run configuration only), removed options and fresh-location sampling."""
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 from vesuvius.neural_tracing.fiber_follow.data.observations import IdentityObservationBuilder, IdentitySampling, LOCATION_SOURCES
-from vesuvius.neural_tracing.fiber_follow.train import train
-from vesuvius.neural_tracing.fiber_follow.models.model import CoordinateRegressionConfig
-from vesuvius.neural_tracing.fiber_follow.train.train import build_parser, main
-from vesuvius.neural_tracing.fiber_follow.data.data import TASKS, TaskBudget
-from model_fixtures import REQUIRED
-
-ROOT = Path(__file__).resolve().parents[1]
+from vesuvius.neural_tracing.fiber_follow.train import run_config
+from vesuvius.neural_tracing.fiber_follow.train.train import build_parser
+from vesuvius.neural_tracing.fiber_follow.data.data import TaskBudget
+from model_fixtures import follower_config, run_document
 
 
-def launcher_argv():
-    text = (ROOT/'scripts'/'train_coordinate_regression.sh').read_text().replace('\\\n', ' ')
-    command = shlex.split(next(line for line in text.splitlines() if line.startswith('exec ')))
-    argv = command[command.index('vesuvius.neural_tracing.fiber_follow.train.train')+1:]
-    substitute = {'$task_root': str(ROOT), '$task_run': 'coordinate_regression', '$source_checkpoint': '/unused/ckpt.pt'}
-    for name, value in substitute.items():
-        argv = [arg.replace(name, value) for arg in argv]
-    return [arg for arg in argv if arg != '$@']
-
-
-def test_coordinate_regression_launcher_parses_to_the_planned_model_and_budget():
-    args = build_parser().parse_args(launcher_argv())
-    assert args.dataset_config == str(ROOT/'configs'/'mixed_ct_datasets_paris50.json')
-    assert args.init_weights == '/unused/ckpt.pt' and args.resume is None
-    assert (args.batch, args.grad_steps, args.n_commit, args.steps) == (4, 3, 16, 40000)
-    cfg = train.model_config_from_args(args)
-    assert cfg.input_channels == 1
-    assert cfg.model_type == 'coordinate_regression'
-    assert cfg.input_channels == 1 and cfg.recurrent_refinement_steps == 3
-    budget = TaskBudget.parse(args.task_share, terminal_fallback_cap=args.terminal_fallback_cap,
-                              replay_max_age=args.replay_max_age, replay_event_cap=args.replay_event_cap)
-    assert dict(zip(TASKS, budget.shares)) == dict(
-        fresh=.40, live=.25, dagger_pre_excursion=.08, dagger_recoverable=.06, dagger_terminal=.08,
-        dagger_premature_stop=.03, dagger_ordinary=.05, synthetic_terminal=.05, synthetic_identity=0.)
-    assert (budget.replay_max_age, budget.replay_event_cap, budget.terminal_fallback_cap) == (12000, 64, .5)
-    for option, value in (('--batch', '0'), ('--grad-steps', '0'), ('--grad-steps', '-1')):
-        with pytest.raises(ValueError, match='Positive counts'):
-            main(REQUIRED+[option, value])
-
-
-def test_removed_options_are_rejected():
-    removed = ['--contacts', '--hard-spans', '--contact-fraction', '--hard-span-fraction', '--fresh-fraction',
-               '--clean-fraction', '--decision-fraction', '--decision-choice-fraction', '--candidate-weight',
-               '--pair-rank-weight', '--gt-perturb-probability', '--replay-continuation-fraction',
-               '--replay-failure-fraction', '--memory-switch-probability', '--bank-following-probability',
-               '--bank-wrong-continuation-probability', '--no-history-prob', '--short-history-prob', '--dagger-seeds',
-               '--following-bank', '--microbatch', '--feature-replay-weight', '--memory-slots', '--memory-steps',
-               '--memory-stride', '--feature-sequence-length', '--memory-version', '--proposal-step',
-               '--proposal-warmup-steps']
-    switches = ['--live-continuation', '--live-continuation-stratified', '--correct-replay-only',
-                '--prefer-real-wrong-turns', '--prefer-replay-for-light-gt', '--compile', '--no-compile',
-                '--history-encoder-checkpointing']
-    parser = build_parser()
-    assert 'compile' not in vars(parser.parse_args(REQUIRED))
-    for argv in [[option, '1'] for option in removed]+[[flag] for flag in switches]:
+def test_the_command_line_takes_a_run_configuration_and_an_optional_resume():
+    args = build_parser().parse_args(['--config', 'run.json'])
+    assert vars(args) == dict(config='run.json', resume=None)
+    assert build_parser().parse_args(['--config', 'run.json', '--resume', 'last.pt']).resume == 'last.pt'
+    for argv in (['--name', 'x'], ['--config', 'run.json', '--batch', '4'], ['--config', 'run.json', '--model', 'flow'], []):
         with pytest.raises(SystemExit) as error:
-            parser.parse_args(REQUIRED+argv)
+            build_parser().parse_args(argv)
         assert error.value.code == 2, argv
 
 
+@pytest.mark.parametrize('section, key', [
+    ('training', 'memory'), ('training', 'identity_weight'), ('training', 'history_grad_clip'),
+    ('training', 'rest_grad_clip'), ('training', 'task_share'), ('training', 'chain_seed_fraction'),
+    ('training', 'tube_weight'), ('training', 'memory_augmentation'), ('training', 'identity_switch_tail'),
+    ('model', 'memory'), ('model', 'identity_dim'), ('model', 'path_planes'), ('model', 'tube_head'),
+    ('model', 'stem_channels'), ('model', 'decoder_layers'), ('model', 'scorer_layers'), ('model', 'encoder_ffn')])
+def test_removed_options_are_rejected(section, key):
+    document = run_document()
+    document.setdefault(section, {})[key] = 1
+    with pytest.raises(ValueError, match=f'Unknown {section} settings: {key}'):
+        run_config.resolve(document)
+
+
+@pytest.mark.parametrize('key', ['batch', 'grad_steps', 'steps'])
+def test_counts_must_be_positive(key):
+    for value in (0, -1):
+        with pytest.raises(ValueError, match='Positive counts'):
+            run_config.resolve(run_document(training={key: value}))
+
+
 def test_task_budget_must_be_a_complete_distribution():
-    for shares in (['fresh=.5'], ['unknown=.1'], ['fresh=-.1', 'live=.75']):
+    for shares in (['fresh=.5'], ['unknown=.1'], ['fresh=-.1', 'live=.75'], ['synthetic_identity=0']):
         with pytest.raises(ValueError):
             TaskBudget.parse(shares)
+    with pytest.raises(ValueError):
+        run_config.resolve(run_document(training=dict(task_shares=dict(fresh=.5))))
 
 
 def test_fresh_location_only_oversamples_available_lateral_history():
-    builder = IdentityObservationBuilder(CoordinateRegressionConfig(), [SimpleNamespace(length=100.)],
+    builder = IdentityObservationBuilder(follower_config(), [SimpleNamespace(length=100.)],
                                          IdentitySampling(lateral_fraction=1.))
     rng = np.random.default_rng(0)
     assert builder.fresh_location(rng) is None
@@ -82,29 +59,6 @@ def test_fresh_location_only_oversamples_available_lateral_history():
     assert location['fiber'] == 0 and 34 <= location['t'] <= 66
     assert LOCATION_SOURCES[location['source']] == 'lateral'
     assert 'contact' not in LOCATION_SOURCES and 'hard_span' not in LOCATION_SOURCES
-
-
-def test_initialized_run_can_resume_with_lower_lr_without_changing_training_contract():
-    original = build_parser().parse_args(launcher_argv())
-    resumed = SimpleNamespace(**vars(original))
-    resumed.init_weights = None
-    resumed.resume = '/unused/run/last.pt'
-    resumed.lr = 5e-5
-    train.validate_resume_options(resumed, vars(original))
-    resumed.steps = original.steps + 50000
-    train.validate_resume_options(resumed, vars(original))
-    # The confidence-label tolerance may change on resume; the departure threshold is a constant.
-    train.validate_resume_options(SimpleNamespace(**dict(vars(resumed), tolerance=original.tolerance+.5)), vars(original))
-    for key, value in [('warmup', 0), ('n_commit', 8)]:
-        changed = SimpleNamespace(**vars(resumed))
-        setattr(changed, key, value)
-        with pytest.raises(ValueError, match=f'Resume option differs: {key}'):
-            train.validate_resume_options(changed, vars(original))
-    # An option added after the run started counts as recorded at its default, and only there.
-    older = {k: v for k, v in vars(original).items() if k != 'flow_sigma_floor'}
-    train.validate_resume_options(resumed, older)
-    with pytest.raises(ValueError, match='Resume option differs: flow_sigma_floor'):
-        train.validate_resume_options(SimpleNamespace(**dict(vars(resumed), flow_sigma_floor=3.)), older)
 
 
 def test_lr_step_offset_continues_the_original_cosine_after_its_warmup():

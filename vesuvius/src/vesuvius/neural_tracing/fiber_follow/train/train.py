@@ -1,44 +1,37 @@
-"""Train coordinate regression or flow-matching fiber followers with shared online replay."""
+"""Train the fiber followers (regression, flow, sequence) with shared online replay.
+
+    python train/train.py --config run.json [--resume CHECKPOINT]
+
+The run configuration (train/run_config.py) holds the dataset, model, training and runtime settings."""
 import argparse
 import copy
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, replace
+from dataclasses import asdict
+import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import time
 
 import numpy as np
 import torch
 
-from vesuvius.neural_tracing.fiber_follow.data.data import DATA_POLICY, FollowDataset, OnPolicyStates, SampleConfig, TaskBudget, ZBand, fiber_identities, fiber_manifest, load_fibers, split_fibers
-from vesuvius.neural_tracing.fiber_follow.shared.experiment import read_manifest
-from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
+from vesuvius.neural_tracing.fiber_follow.data.data import (
+    TASKS, FollowDataset, SampleConfig, TaskBudget, ZBand, fiber_manifest, load_replay, usable_replay)
 from vesuvius.neural_tracing.fiber_follow.train.online import OnlineCollector
-from vesuvius.neural_tracing.fiber_follow.tracing.policy import (DEFAULT_CONFIDENCE, DEFAULT_GATE, DEFAULT_N_COMMIT, GATES, gate_horizon,
+from vesuvius.neural_tracing.fiber_follow.tracing.policy import (DEFAULT_CONFIDENCE, DEFAULT_GATE, gate_horizon,
     OperatingPolicy, selection_window)
 from vesuvius.neural_tracing.fiber_follow.train.runloop import RunLog, lr_at, prepare_run_dir, read_checkpoint, save_checkpoint as write_checkpoint, update_ema, training_rng_state, resume_training, raise_open_file_limit
 from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolume, FiberVolumeSpec
-from vesuvius.neural_tracing.fiber_follow.models.model import CoordinateRegressionConfig, build_model
+from vesuvius.neural_tracing.fiber_follow.models.model import build_model, config_from_checkpoint
 from vesuvius.neural_tracing.fiber_follow.data.observations import IdentityObservationBuilder, IdentitySampling, FiberTracer, LOCATION_SOURCES
+from vesuvius.neural_tracing.fiber_follow.train import run_config
 from vesuvius.neural_tracing.fiber_follow.train.supervision import commit_window, loss_terms
 from vesuvius.neural_tracing.fiber_follow.evaluation.diagnostics import decision_rows, summarize_decisions
 from vesuvius.neural_tracing.fiber_follow.evaluation.recovery import monitor_fixture, evaluate_monitor
-from vesuvius.neural_tracing.fiber_follow.data.history_slabs import SAMPLING_REVISION
-from vesuvius.neural_tracing.fiber_follow.tracing.heading import FRAME_POLICY
-from vesuvius.neural_tracing.fiber_follow.tracing.crop_frames import DEFAULT_FRAME_CHECKPOINT, configured_frame_policy, frame_predictor, bind_frame_checkpoint
+from vesuvius.neural_tracing.fiber_follow.tracing.crop_frames import configured_frame_policy, frame_predictor, bind_frame_checkpoint
 from vesuvius.neural_tracing.fiber_follow.train.training_log import format_training_log, TrainingInterval, SamplingLedger
-
-
-def validate_volume_source(spec, manifest):
-    """Allow a different CT pyramid level, retaining frozen physical data/seeds."""
-    from vesuvius.neural_tracing.fiber_follow.shared.paths import recorded_path
-    for key in ('fiber_zarr_dir', 'ct_zarr', 'fiber_level', 'grid_scale'):
-        recorded = manifest['volume'][key]
-        if key in ('fiber_zarr_dir', 'ct_zarr') and recorded is not None:
-            recorded = recorded_path(recorded)
-        if spec.to_dict()[key] != recorded:
-            raise ValueError(f'Volume source {key} differs from frozen manifest')
 
 
 def save_checkpoint(path, model, ema, spec, sample, extra=None):
@@ -112,29 +105,19 @@ def fixed_rows(value, size):
     return torch.empty_like(value, memory_format=torch.contiguous_format).copy_(value)
 
 
-IDENTITY_INPUTS = ('identity_points', 'identity_point_mask', 'identity_anchor_mask', 'identity_anchor_features')
-VERIFY_INPUTS = ('identity_candidates', 'identity_samples')  # positions only; labels stay with the loss
-
-
 def training_inputs(x, hist, hmask, size):
     b = len(hist)
     defaults = dict(seed=hist.new_zeros(b, 1, 3), seed_mask=hist.new_zeros(b, 1),
                     seed_tangent=hist.new_zeros(b, 3), seed_age=hist.new_zeros(b))
     names = ('fine', 'seed', 'seed_mask', 'seed_tangent', 'seed_age')
-    if 'history_tokens' in x:  # absent without memory
-        names += ('history_tokens', 'history_padding')
-    # Optional observed-path geometry exists only for models that consume it; identity
-    # points/anchors only for the memory-identity loss.
-    from vesuvius.neural_tracing.fiber_follow.models.model import READOUT_MEMORY
-    names += tuple(name for name in ('path_geometry', 'path_geometry_valid', *IDENTITY_INPUTS, *VERIFY_INPUTS,
-                                     *READOUT_MEMORY) if name in x)
+    # Optional observed-path geometry exists only for models that consume it.
+    names += tuple(name for name in ('path_geometry', 'path_geometry_valid') if name in x)
     image = {name: fixed_rows(x[name] if name in x else defaults[name], size) for name in names}
     return image, fixed_rows(hist, size), fixed_rows(hmask, size)
 
 
 def begin_training_update(model):
     model._training_refined = torch.zeros((), device=next(model.parameters()).device, dtype=torch.bool)
-    model._history_timings = []
 
 
 def finish_training_update(model):
@@ -155,32 +138,7 @@ def training_prediction(model, x, hist, hmask, confidence_threshold=.5, n_commit
     # A single decision needs no duplicate encoder, proposal or scoring work.
     # Keep only two batch specializations: one row or the configured batch.
     size = 1 if actual == 1 else model.training_batch_size
-    # Compact live slabs before the fixed-shape compiled decision graph.
-    # Convolutions see valid slots only; gradients remain attached across heads.
-    timing = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)) if hist.is_cuda else time.perf_counter()
-    if hist.is_cuda:
-        timing[0].record()
-    identity = {}
-    if getattr(model, 'identity_projection', None) is not None and targets is not None and 'identity_points' in targets:
-        tokens, padding, anchors = model.encode_history(x, return_anchors=True)
-        identity = {key: targets[key] for key in IDENTITY_INPUTS[:3]}
-        identity['identity_anchor_features'] = anchors.detach()
-    else:
-        # Readout identity memory travels with the history tokens (empty for other objectives).
-        tokens, padding, readout = model.encode_history(x, return_identity=True)
-        identity = dict(readout)
-        if model.cfg.identity_mode == 'verify' and targets is not None and 'identity_candidates' in targets:
-            identity.update({key: targets[key] for key in VERIFY_INPUTS})
-    if hist.is_cuda:
-        timing[1].record()
-    if hasattr(model, '_history_timings') and tokens is not None:
-        model._history_timings.append(timing if hist.is_cuda else time.perf_counter()-timing)
-    memory = {} if tokens is None else dict(history_tokens=tokens, history_padding=padding)
-    image, history, mask = training_inputs(dict(x, **memory, **identity), hist, hmask, size)
-    if any(key in identity for key in (*IDENTITY_INPUTS, *VERIFY_INPUTS)):
-        # Padding repeats row 0; the identity loss must see which rows are real and their fibers.
-        image['identity_row'] = torch.arange(size, device=hist.device) < actual
-        image['identity_fiber'] = fixed_rows(targets['fiber_id'], size)
+    image, history, mask = training_inputs(x, hist, hmask, size)
     threshold = hist.new_full((), confidence_threshold if retry_threshold is None else retry_threshold)
     padded_targets = None if targets is None else {
         key: fixed_rows(value, size) for key, value in targets.items()
@@ -216,129 +174,33 @@ def initialize_training_optimizer(model, ema, args, resume=None):
     return opt, done, origin
 
 
-from vesuvius.neural_tracing.fiber_follow.models.flow import FLOW_MODEL_TYPES, FlowConfig
-MODEL_TYPES = ('coordinate_regression', 'flow_matching', 'sequence', 'unified', 'unified_flow')
-HISTORY_GRAD_CLIP = 5.
-REST_GRAD_CLIP = 100.
-
-
-def sampling_revision(cfg):
-    if cfg.memory == 'decisions':
-        from vesuvius.neural_tracing.fiber_follow.data.decision_memory import SAMPLING_REVISION as DECISIONS
-        return DECISIONS
-    return SAMPLING_REVISION
-
-
-def checkpoint_config(ck):
-    if ck.get('model_type') not in MODEL_TYPES:
-        raise ValueError('Unsupported checkpoint model type')
-    if ck.get('model_type') == 'sequence':
-        from vesuvius.neural_tracing.fiber_follow.models.sequence import SequenceConfig as cls
-    elif ck.get('model_type') in ('unified', 'unified_flow'):
-        from vesuvius.neural_tracing.fiber_follow.models import unified
-        cls = unified.UnifiedConfig if ck['model_type'] == 'unified' else unified.UnifiedFlowConfig
-    else:
-        cls = FlowConfig if ck.get('model_type') == 'flow_matching' else CoordinateRegressionConfig
-    cfg = cls(**ck['model_cfg'])
-    if cfg.model_type != ck['model_type']:
-        raise ValueError('Checkpoint model type does not match configuration')
-    return cfg
-
-
-def model_config_from_args(args, checkpoint=None):
-    if checkpoint is not None:
-        cfg = checkpoint_config(checkpoint)
-        if args.model is not None and args.model != cfg.model_type:
-            raise ValueError('Model type must match checkpoint')
-        return cfg
-    if args.model == 'sequence':
-        from vesuvius.neural_tracing.fiber_follow.models.sequence import SequenceConfig
-        return SequenceConfig(fine=CropSpec(depth=args.crop_depth, width=args.crop_width, behind=args.crop_behind,
-                                            spacing=args.crop_spacing),
-                              n_future=args.n_future, future_step=args.future_step, gate_plane=args.gate_plane,
-                              hidden=args.hidden, layers=args.sequence_layers, heads=args.sequence_heads,
-                              ffn=args.sequence_ffn, cnn_channels=tuple(args.cnn_channels), cnn_blocks=args.cnn_blocks,
-                              activation_checkpointing=args.activation_checkpointing)
-    if args.model in ('unified', 'unified_flow'):
-        return unified_config_from_args(args)
-    cls = FlowConfig if args.model == 'flow_matching' else CoordinateRegressionConfig
-    options = {key: getattr(args, key) for key in ('stem_channels', 'stem_blocks', 'stem', 'memory', 'path_planes', 'tube_head',
-        'identity_dim', 'identity_temperature', 'identity_objective', 'identity_map', 'identity_feedback', 'hidden',
-        'encoder_ffn', 'decoder_layers', 'decoder_ffn', 'scorer_layers', 'activation_checkpointing')}
-    options['layers'] = args.axial_layers
-    options['n_future'], options['future_step'] = args.n_future, args.future_step
-    options['gate_plane'], options['query_scale'] = args.gate_plane, args.query_scale
-    options['fine'] = CropSpec(depth=args.crop_depth, width=args.crop_width, behind=args.crop_behind,
-                               spacing=args.crop_spacing)
-    if cls is FlowConfig:
-        options.update(flow_options(args))
-    else:
-        options['recurrent_refinement_steps'] = args.recurrent_refinement_steps
-    return cls(**options)
-
-
-def flow_options(args):
-    return {key: getattr(args, key) for key in (
-        'flow_steps', 'flow_draws', 'flow_samples', 'flow_sample_scale', 'flow_time_conditioning',
-        'flow_sigma_floor', 'flow_unknown_planes', 'flow_loss', 'flow_huber_c', 'flow_geometry_weight')}
-
-
-def unified_config_from_args(args):
-    """The unified crop model (models/unified.py), regression ('unified') or flow ('unified_flow')."""
-    from vesuvius.neural_tracing.fiber_follow.models.unified import UnifiedConfig, UnifiedFlowConfig
-    options = dict(fine=CropSpec(depth=args.crop_depth, width=args.crop_width, behind=args.crop_behind,
-                                 spacing=args.crop_spacing),
-                   n_future=args.n_future, future_step=args.future_step, gate_plane=args.gate_plane,
-                   query_scale=args.query_scale, hidden=args.hidden, layers=args.sequence_layers,
-                   heads=args.sequence_heads, ffn=args.sequence_ffn, cnn_channels=tuple(args.unified_cnn_channels),
-                   cnn_blocks=tuple(args.unified_cnn_blocks), activation_checkpointing=args.activation_checkpointing)
-    if args.model == 'unified_flow':
-        return UnifiedFlowConfig(**options, **flow_options(args))
-    return UnifiedConfig(**options, recurrent_refinement_steps=args.recurrent_refinement_steps)
+GRAD_CLIP = 60.
 
 
 def load_matching_weights(model, state, exclude=()):
-    """Load tensors whose names and shapes match; new residual branches start at zero.
+    """Load tensors whose names and shapes match, except names starting with an ``exclude`` prefix.
 
-    Tensors whose names start with an ``exclude`` prefix keep their initialization.
-
-    Returns the parameter/buffer names left at initialization. An encoder axial block or
-    image stem without loaded weights gets zero residual outputs, so the warm-started
-    network initially computes what the loaded tensors compute without them.
-    """
+    Returns a report: tensors left at initialization (``fresh``), checkpoint tensors with no counterpart
+    (``unexpected``) and same-name tensors of another shape (``mismatched``)."""
     own = model.state_dict()
     matched = {k: v for k, v in state.items() if k in own and own[k].shape == v.shape
                and not any(k.startswith(prefix) for prefix in exclude)}
     model.load_state_dict(matched, strict=False)
-    fresh = sorted(set(own)-set(matched))
-    with torch.no_grad():
-        for index, block in enumerate(getattr(getattr(model, 'encoder', None), 'blocks', ())):
-            if f'encoder.blocks.{index}.mlp.2.weight' in fresh:
-                for layer in [axis.projection for axis in block.axes]+[block.mlp[-1]]:
-                    layer.weight.zero_()
-                    layer.bias.zero_()
-        if 'encoder.stem.projection.weight' in fresh and 'encoder.stem.projection.weight' in own:
-            model.encoder.stem.projection.weight.zero_()
-            model.encoder.stem.projection.bias.zero_()
-    return fresh
+    return dict(fresh=sorted(set(own)-set(matched)), unexpected=sorted(set(state)-set(own)),
+                mismatched=sorted(k for k, v in state.items() if k in own and own[k].shape != v.shape))
 
 
-def initialize_model_weights(cfg, device, initial=None, partial=False, exclude=()):
-    """Weight-only initialization never inherits optimizer, replay or run settings."""
+def initialize_model_weights(cfg, device, initial=None, exclude=()):
+    """Weight-only initialization (model and EMA tensors matched by name and shape); never inherits optimizer,
+    replay or run settings."""
     model = build_model(cfg).to(device, memory_format=conv_memory_format(device))
-    fresh = []
+    report = None
     if initial is not None:
-        if partial:
-            fresh = load_matching_weights(model, initial['model'], exclude)
-        else:
-            model.load_state_dict(initial['model'], strict=True)
+        report = load_matching_weights(model, initial['model'], exclude)
     ema = copy.deepcopy(model).requires_grad_(False).eval()
     if initial is not None:
-        if partial:
-            load_matching_weights(ema, initial['ema'], exclude)
-        else:
-            ema.load_state_dict(initial['ema'], strict=True)
-    model.reinitialized_tensors = fresh
+        load_matching_weights(ema, initial.get('ema', initial['model']), exclude)
+    model.initialization_report = report
     return model, ema
 
 
@@ -346,8 +208,8 @@ def load_checkpoint(path,device='cuda'):
     # Collection shares a GPU with training. Keep duplicate weights and any
     # optimizer state on the CPU; only the EMA inference model needs VRAM.
     from vesuvius.neural_tracing.fiber_follow.shared.paths import relocate_checkpoint
-    ck = relocate_checkpoint(read_checkpoint(path,MODEL_TYPES,'cpu'))
-    cfg = checkpoint_config(ck)
+    ck = relocate_checkpoint(read_checkpoint(path,'cpu'))
+    cfg = config_from_checkpoint(ck)
     model = build_model(cfg).to(device,memory_format=conv_memory_format(device))
     model.load_state_dict(ck['ema'])
     model.eval()
@@ -396,7 +258,7 @@ class DecisionBatchPrefetch:
 
 
 @torch.no_grad()
-def training_diagnostics(model, cpu_batch, tracer, fibers, seeds, out, step, log, *, device, dataset_name=None, memory=None):
+def training_diagnostics(model, cpu_batch, tracer, fibers, seeds, out, step, log, *, device, dataset_name=None):
     """Plot EMA proposals and the same monitor rollouts used for logged metrics."""
     from vesuvius.neural_tracing.fiber_follow.evaluation.diag import plot_batch, plot_curves, plot_refinement, plot_rollouts
     from vesuvius.neural_tracing.fiber_follow.evaluation.seeds import evaluate
@@ -407,11 +269,6 @@ def training_diagnostics(model, cpu_batch, tracer, fibers, seeds, out, step, log
     # Bound image size even when training with larger batches.
     def take(value):
         return {k: take(v) for k, v in value.items()} if isinstance(value, dict) else value[:6]
-    if getattr(model.cfg, 'memory', 'slabs') == 'decisions':
-        # Memory crops are stacked per batch, not per row: resolve them before taking rows.
-        from vesuvius.neural_tracing.fiber_follow.evaluation.batch_diagnostic import decision_memory_rows
-        with torch.no_grad():
-            cpu_batch = decision_memory_rows(model, cpu_batch, device, memory)
     batch = move_batch(take(cpu_batch), device)
     was_training = model.training
     threshold_before = tracer.p.confidence
@@ -449,7 +306,7 @@ def training_diagnostics(model, cpu_batch, tracer, fibers, seeds, out, step, log
             log.record(dict(step=step, split='monitor', threshold=threshold,
                             **({'dataset':dataset_name} if dataset_name else {}),
                             coverage_max_len=tracer.p.max_len, **rollout_summary(rows)))
-        plot_curves(Path(out)/'log.jsonl', Path(out)/'curves.png', loss_key='flow' if model.cfg.model_type in FLOW_MODEL_TYPES else 'geometry')
+        plot_curves(Path(out)/'log.jsonl', Path(out)/'curves.png', loss_key='flow' if model.cfg.model_type == 'flow' else 'geometry')
     finally:
         model.train(was_training)
         tracer.p.confidence = threshold_before
@@ -471,37 +328,21 @@ def resolve_device_sums(*tables):
 IDENTITY_SUMS = ('identity_correct_count', 'identity_flipped_count')
 
 
-def clip_training_gradients(model, history_max_norm=HISTORY_GRAD_CLIP, rest_max_norm=REST_GRAD_CLIP):
-    """Clip the slab encoder separately; check both groups before modifying gradients."""
-    limits = dict(history=history_max_norm, rest=rest_max_norm)
-    if any(not math.isfinite(v) or v < 0 for v in limits.values()):
-        raise ValueError('Gradient clipping limits must be finite and nonnegative (0 disables clipping)')
-    parameters = list(model.parameters())
-    memory = getattr(model, 'history_encoder', None)
-    memory_ids = {id(p) for p in memory.parameters()} if memory is not None else set()
-    groups = dict(history=[p for p in parameters if id(p) in memory_ids],
-                  rest=[p for p in parameters if id(p) not in memory_ids])
-    if memory is None:  # no memory encoder: a single clipping group
-        del groups['history']
-    norms = {name: torch.nn.utils.get_total_norm(
-        [p.grad for p in params if p.grad is not None], error_if_nonfinite=True)
-        for name, params in groups.items()}
-    for name, params in groups.items():
-        if limits[name] > 0:
-            torch.nn.utils.clip_grads_with_norm_(params, limits[name], norms[name])
-    values = {name: float(norm) for name, norm in norms.items()}
-    metrics = dict(grad_norm=math.hypot(*values.values()))
-    for name, norm in values.items():
-        metrics[name+'_grad_norm'] = norm
-        metrics[name+'_grad_clip_scale'] = min(1., limits[name]/(norm+1e-6)) if limits[name] else 1.
-    return metrics
+def clip_training_gradients(model, max_norm=GRAD_CLIP):
+    """Clip the global gradient norm; checked before modifying gradients."""
+    if not math.isfinite(max_norm) or max_norm < 0:
+        raise ValueError('The gradient clipping limit must be finite and nonnegative (0 disables clipping)')
+    params = list(model.parameters())
+    norm = torch.nn.utils.get_total_norm([p.grad for p in params if p.grad is not None], error_if_nonfinite=True)
+    if max_norm > 0:
+        torch.nn.utils.clip_grads_with_norm_(params, max_norm, norm)
+    norm = float(norm)
+    return dict(grad_norm=norm, grad_clip_scale=min(1., max_norm/(norm+1e-6)) if max_norm else 1.)
 
 
 def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolerance=1.5,
                      confidence_weight=.5, ema_decay=.999, ema_ramp=True, n_commit=None, compute_metrics=True,
-                     history_grad_clip=HISTORY_GRAD_CLIP, rest_grad_clip=REST_GRAD_CLIP,
-                     diagnostic=None, live_continuation=None, ledger=None, identity_weight=0.,
-                     identity_exclude_synthetic=False, tube_weight=1., tube_sigma=1.5,
+                     grad_clip=GRAD_CLIP, diagnostic=None, live_continuation=None, ledger=None,
                      confidence_threshold=.5, gate='prefix', retry_threshold=None, refinement_loss='policy',
                      refinement_weight=1.):
     """One equally weighted task loss per independent supervised decision."""
@@ -532,7 +373,7 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
             ids, sizes = torch.unique(cpu['dataset_id'], return_counts=True)
             for source_id, size in zip(ids.tolist(), sizes.tolist()):
                 counts[str(source_id)] = counts.get(str(source_id), 0)+size
-        for prefix in ('ct_frame', 'history_frame'):
+        for prefix in ('ct_frame',):
             if prefix+'_source' not in cpu['x']:
                 continue
             source = cpu['x'][prefix+'_source']
@@ -544,26 +385,6 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
                 name = prefix+'_'+suffix
                 sums[name] = sums.get(name, 0.)+float(value)
         batch = move_batch(cpu, device)
-        if model.cfg.memory == 'decisions':
-            # Entries recorded by earlier training forwards of the same live chain.
-            recorded = batch['x']['history_keys'] >= 0
-            if bool(recorded.any()):
-                if live_continuation is None:
-                    raise ValueError('Recorded decision memory requires the live continuation store')
-                features, found = live_continuation.attach_memory(batch['x'], model.cfg.memory_entry_shape)
-                missing = recorded & ~found
-                batch['x']['history_features'] = features
-                batch['x']['history_valid'] = batch['x']['history_valid'] & ~missing
-                sums['memory_recorded'] = sums.get('memory_recorded', 0)+int(found.sum())
-                sums['memory_missing'] = sums.get('memory_missing', 0)+int(missing.sum())
-            sums['memory_encoded'] = sums.get('memory_encoded', 0)+int(cpu['x']['history_encode'].sum())
-        if 'history_valid' in cpu['x']:  # memory inputs (absent without memory)
-            valid = cpu['x']['history_valid']
-            for name, value in dict(history_valid_slabs=valid.sum(),
-                    history_age_sum=cpu['x']['history_ages'][valid].sum(),
-                    history_overlap_sum=cpu['x']['history_overlap'][valid].sum(),
-                    history_load_seconds=cpu['x']['history_load_seconds'].sum()).items():
-                sums[name] = sums.get(name, 0.)+float(value)
         if diagnostic is not None:
             diagnostic.update(cpu_batch=cpu)
         with torch.autocast('cuda', dtype=torch.bfloat16, enabled=torch.device(device).type == 'cuda'):
@@ -584,49 +405,7 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
             geometry = terms['geometry_per_state'].sum()/denominator
             confidence = terms['confidence_per_state'].sum()/denominator
             loss = geometry + confidence_weight*confidence
-            if 'tube_logits' in output:
-                from vesuvius.neural_tracing.fiber_follow.models.whole_crop import tube_loss
-                tube, tube_counts = tube_loss(output['tube_logits'], batch, model.cfg.fine, tube_sigma)
-                loss = loss + tube_weight*tube.sum()/denominator
-                accumulate(sums, 'tube_loss_sum', tube.detach().sum())
-                accumulate(sums, 'tube_states', torch.ones_like(tube).sum())
-            if 'identity_loss_per_state' in output:
-                loss = loss + identity_weight*output['identity_loss_per_state'].sum()/denominator
-            if 'identity_logits' in output:
-                from vesuvius.neural_tracing.fiber_follow.models.identity_verifier import verification_loss, verification_targets
-                verify = verification_targets(output, batch, identity_exclude_synthetic)
-                if getattr(model, '_identity_balance', None) is None:
-                    model._identity_balance = torch.ones(2, 2, device=verify['known'].device)
-                verify_loss, verify_planes = verification_loss(output['identity_logits'], verify, model._identity_balance)
-                loss = loss + identity_weight*verify_loss.sum()/denominator
         loss.backward()
-        if 'identity_logits' in output:
-            from vesuvius.neural_tracing.fiber_follow.models.identity_verifier import update_balance, verification_metrics
-            model._identity_balance = update_balance(model._identity_balance, verify['label'],
-                                                     verify['on_path'], verify['train'])
-            for key, value in verification_metrics(output, batch, verify, verify_loss, verify_planes).items():
-                accumulate(sums, key, value)
-        if 'identity_pairs' in output:
-            from vesuvius.neural_tracing.fiber_follow.data.state_labels import DEPARTURE_DISTANCE
-            pairs, correct = output['identity_pairs'], output['identity_correct']
-            departed = batch['match_distance'] > DEPARTURE_DISTANCE
-            age = batch['identity_departure_age']
-            # Departures the crop can still see (<=24 voxels) vs older ones only memory can reveal.
-            groups = dict(departed_recent=departed & (age <= 24), departed_old=departed & (age > 24),
-                          departed_old_afv=departed & (age > 24) & (batch['dataset_id'] != 0 if 'dataset_id' in batch
-                                                                    else torch.zeros_like(departed)))
-            values = [('memory_identity_loss_sum', output['identity_loss_per_state'].detach().sum()),
-                      ('memory_identity_states', (pairs.any(-1) | output['identity_anchor_valid']).sum()),
-                      ('memory_identity_pairs', pairs.sum()), ('memory_identity_correct', correct.sum()),
-                      ('memory_identity_anchor_pairs', output['identity_anchor_valid'].sum()),
-                      ('memory_identity_anchor_correct', output['identity_anchor_correct'].sum()),
-                      ('memory_identity_control_pairs', output['identity_control_pairs'].sum()),
-                      ('memory_identity_control_correct', output['identity_control_correct'].sum())]
-            for name, rows in groups.items():
-                values += [(f'memory_identity_{name}_pairs', (pairs & rows[:, None]).sum()),
-                           (f'memory_identity_{name}_correct', (correct & rows[:, None]).sum())]
-            for key, value in values:
-                accumulate(sums, key, value)
         if live_continuation is not None:
             live_continuation.feedback(cpu, output, step)
         if compute_metrics:
@@ -676,26 +455,18 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
             rows = per_state[offset:offset+len(cpu['hist'])]
             offset += len(cpu['hist'])
             ledger.add(cpu, step, rows.T.tolist())
-    if model._history_timings:
-        sums['history_encode_seconds'] = sum(t[0].elapsed_time(t[1])/1000 if isinstance(t, tuple) else t
-                                             for t in model._history_timings)
     # The summed loss is finite only if every batch loss was; checked before any update.
     if not math.isfinite(sums['loss']):
         raise FloatingPointError(f'Nonfinite loss at step {step}')
     if total:
         finish_training_update(model)
-        sums.update(clip_training_gradients(model, history_grad_clip, rest_grad_clip))
+        sums.update(clip_training_gradients(model, grad_clip))
         opt.step()
         update_ema(ema, model, step, ema_decay, ramp=ema_ramp)
     sums.update(observed_states=observed, supervised_states=total,
                 observation_only_states=observed-total, optimizer_applied=bool(total),
                 positive_confidence_targets=float(per_state[:, 0].sum()),
                 negative_confidence_targets=float(per_state[:, 1].sum()))
-    if 'history_valid_slabs' in sums:
-        slab_count = max(1., sums['history_valid_slabs'])
-        sums.update(history_age_mean=sums['history_age_sum']/slab_count,
-                    history_overlap_mean=sums['history_overlap_sum']/slab_count,
-                    history_valid_slabs_mean=sums['history_valid_slabs']/denominator)
     sums['refinement_attempts_mean'] = sums.get('refinement_attempts_sum', 0.)/denominator
     sums.update(error_mean=sums['error_sum']/max(1., sums['geometry_count']) if sums['geometry_count'] else None,
                 prefix_correct_fraction=sums['correct_count']/max(1., sums['confidence_count']))
@@ -707,544 +478,156 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
         sums['identity'] = identity
     if compute_metrics:
         sums['decisions'] = summarize_decisions(decisions, commit_window(model.cfg, n_commit))
-    sums['prediction_loss_type'] = ('flow' if model.cfg.model_type in FLOW_MODEL_TYPES else
-                                    'whole-crop geometry' if model.cfg.path_planes == 'crop' else 'geometry')
-    if 'tube_states' in sums:
-        sums['tube_loss'] = sums['tube_loss_sum']/max(1., sums['tube_states'])
+    sums['prediction_loss_type'] = 'flow' if model.cfg.model_type == 'flow' else 'geometry'
     sums['prediction_loss'] = sums['geometry']
-    if model.cfg.model_type in FLOW_MODEL_TYPES:
+    if model.cfg.model_type == 'flow':
         sums.setdefault('flow', sums['geometry'])
     return sums
 
 
 def build_parser():
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument('--model', choices=MODEL_TYPES, default=None,
-                    help='Follower type; default coordinate_regression, inferred from checkpoint on resume/init')
-    ap.add_argument('--flow-steps', type=int, default=4)
-    ap.add_argument('--flow-draws', type=int, default=64)
-    ap.add_argument('--flow-calibration-states', type=int, default=2048)
-    ap.add_argument('--flow-samples', type=int, default=FlowConfig.flow_samples,
-                    help='Flow: Gaussian-start proposals after the zero-start path, scored in training and '
-                         'used as retries in tracing')
-    ap.add_argument('--flow-sample-scale', type=float, default=FlowConfig.flow_sample_scale,
-                    help='Flow: standard deviation of those starts, in residual-scale units')
-    ap.add_argument('--flow-time-conditioning', choices=('input', 'adaln', 'adaln_zero'), default=FlowConfig.flow_time_conditioning,
-                    help="Flow: 'adaln' also modulates every decoder branch and the output norm by the time; "
-                         "'adaln_zero' (unified_flow) gates each branch by a zero-initialized alpha (identity blocks at init)")
-    ap.add_argument('--flow-sigma-floor', type=float, default=FlowConfig.flow_sigma_floor,
-                    help='Flow: lower bound (voxels) of the fitted residual scales, the width of the noise prior')
-    ap.add_argument('--flow-unknown-planes', choices=('padded', 'own_path'), default=FlowConfig.flow_unknown_planes,
-                    help="Flow: 'own_path' keeps target-less planes in self-attention, following the model's own path")
-    ap.add_argument('--flow-loss', choices=('mse', 'pseudo_huber'), default=FlowConfig.flow_loss,
-                    help="Flow: velocity-residual loss per path point; 'pseudo_huber' is quadratic below --flow-huber-c "
-                         "and linear above it")
-    ap.add_argument('--flow-huber-c', type=float, default=FlowConfig.flow_huber_c,
-                    help='Flow: pseudo-Huber scale, in residual-scale (sigma) units per path point')
-    ap.add_argument('--flow-geometry-weight', type=float, default=FlowConfig.flow_geometry_weight,
-                    help='Flow: weight of a smooth-L1 geometry loss on the zero-start path integrated with gradients '
-                         'through the solver (0: off)')
-    ap.add_argument('--dagger-threads', type=int, default=4)
-    ap.add_argument('--name', required=True)
-    ap.add_argument('--fiber-zarrs')
-    ap.add_argument('--fibers')
-    ap.add_argument('--ct')
-    ap.add_argument('--manifest', help='Frozen Paris 4 monitor/calibration/test seeds; also configurable in --dataset-config')
-    ap.add_argument('--dataset-config', help='JSON source paths, fiber holdouts, cache directory and sampling weights')
-    ap.add_argument('--onpolicy', nargs='*', default=[])
-    ap.add_argument('--out-root', default=str(Path(__file__).parents[1]/'output'))
-    ap.add_argument('--device', default='cuda')
-    ap.add_argument('--frame-checkpoint', help='Frozen learned heading/normal checkpoint; new runs default to the tested 64k model')
-    ap.add_argument('--steps', type=int, default=100000)
-    ap.add_argument('--batch', type=int, default=4, help='Decisions per forward/backward pass')
-    ap.add_argument('--grad-steps', type=int, default=2,
-                    help='Batches accumulated per optimizer update; effective batch = batch * grad steps')
-    ap.add_argument('--workers', type=int, default=8)
-    ap.add_argument('--worker-cache-gb', type=float, default=.5)
-    ap.add_argument('--remote-prefetch-connections', type=int, default=0,
-                    help='Concurrent async chunk fetches and S3 pool limit per client in a separate process; 0 disables')
-    ap.add_argument('--remote-prefetch-queue-size', type=int, default=512,
-                    help='Bound per priority queue; required batches override speculative fetches')
-    ap.add_argument('--remote-prefetch-lookahead', type=int, default=16,
-                    help='Future batch plans per remote source per worker; 0 disables deeper lookahead')
-    ap.add_argument('--remote-prefetch-timeout', type=float, default=120.,
-                    help='Maximum seconds waiting for batch cache readiness; no foreground network fallback')
-    ap.add_argument('--threads', type=int, default=4)
-    ap.add_argument('--lr', type=float, default=3e-4)
-    ap.add_argument('--warmup', type=int, default=500)
-    ap.add_argument('--ema-decay', type=float, default=.999)
-    ap.add_argument('--history-grad-clip', type=float, default=HISTORY_GRAD_CLIP,
-                    help='Gradient-norm limit for historical slab encoder; 0 disables clipping')
-    ap.add_argument('--rest-grad-clip', type=float, default=REST_GRAD_CLIP,
-                    help='Independent gradient-norm limit for all other parameters; 0 disables clipping')
-    ap.add_argument('--confidence-weight', type=float, default=.5)
-    ap.add_argument('--tolerance', type=float, default=1.5)
-    ap.add_argument('--n-commit', type=int, default=DEFAULT_N_COMMIT,
-                    help='Points per committed decision (tracing, live chains, DAgger collection)')
-    ap.add_argument('--trace-confidence', type=float, default=DEFAULT_CONFIDENCE,
-                    help='Commit-gate confidence threshold for tracing, live chains, collection and training retries')
-    ap.add_argument('--change-trace-confidence', action='store_true',
-                    help='On resume, allow --trace-confidence to differ from the recorded run (e.g. after recalibration)')
-    ap.add_argument('--change-task-mix', action='store_true',
-                    help='On resume, allow the task shares, replay limits and DAgger collection settings to differ from '
-                         'the recorded run (e.g. adding on-policy episodes to a sequence run)')
-    ap.add_argument('--retry-threshold', type=float, default=None,
-                    help='Training only: refinement passes run while a proposal\'s confidence is below this threshold '
-                         '(default: --trace-confidence); selection, live chains and collection keep --trace-confidence')
-    ap.add_argument('--refinement-loss', choices=('policy', 'all'), default='policy',
-                    help="'policy': refinement passes run below the retry threshold and share the decision's loss with the "
-                         "initial proposal (75%% last attempt); 'all': every pass runs for every decision, the initial proposal "
-                         "keeps full weight and the passes add --refinement-weight x their mean (train/supervision.py)")
-    ap.add_argument('--refinement-weight', type=float, default=1.,
-                    help='With --refinement-loss all: weight of the mean refinement-pass geometry and confidence loss')
-    ap.add_argument('--gate', choices=GATES, default=DEFAULT_GATE,
-                    help="Commit gate: 'full' commits n_commit points only when the last-plane confidence passes; "
-                         "'prefix' commits the confident prefix")
-    ap.add_argument('--stem-channels', type=int, default=CoordinateRegressionConfig.stem_channels,
-                    help='Parallel residual patch stem width; 0 disables (token-only patch4 models)')
-    ap.add_argument('--stem-blocks', type=int, default=CoordinateRegressionConfig.stem_blocks,
-                    help='BasicBlockD blocks per downsampling stage in the optional patch stem')
-    ap.add_argument('--decoder-layers', type=int, default=CoordinateRegressionConfig.decoder_layers)
-    ap.add_argument('--decoder-ffn', type=int, default=CoordinateRegressionConfig.decoder_ffn,
-                    help='Path decoder feed-forward width; scorer stays at 1024')
-    ap.add_argument('--scorer-layers', type=int, default=CoordinateRegressionConfig.scorer_layers,
-                    help='Causal segment survival decoder depth')
-    ap.add_argument('--axial-layers', type=int, default=CoordinateRegressionConfig.layers)
-    crop = CoordinateRegressionConfig.__dataclass_fields__['fine'].default_factory()
-    ap.add_argument('--crop-depth', type=int, default=crop.depth,
-                    help='Model crop samples along the heading (multiple of four)')
-    ap.add_argument('--crop-width', type=int, default=crop.width,
-                    help='Model crop samples across the heading, both lateral axes (multiple of four)')
-    ap.add_argument('--crop-behind', type=int, default=crop.behind,
-                    help='Model crop samples behind the head along the heading')
-    ap.add_argument('--crop-spacing', type=float, default=crop.spacing,
-                    help='Trace voxels per crop sample. The CT level read is set per source in the dataset config; '
-                         'with the current sources 0.5 is one sample per level-0 CT voxel')
-    ap.add_argument('--n-future', type=int, default=CoordinateRegressionConfig.n_future,
-                    help='Proposal planes ahead of the head (predicted, scored and labelled; gated through --gate-plane)')
-    ap.add_argument('--future-step', type=float, default=CoordinateRegressionConfig.future_step,
-                    help='Trace voxels between path planes (also the whole-crop plane spacing)')
-    ap.add_argument('--gate-plane', type=int, default=CoordinateRegressionConfig.gate_plane,
-                    help='Plane whose confidence accepts a proposal (full gate) and ends retries; planes beyond it are '
-                         'predicted and supervised only (default: the last plane, --n-future)')
-    ap.add_argument('--query-scale', type=float, default=CoordinateRegressionConfig.query_scale,
-                    help='Forward-distance normalization of decoder queries (default: n_future*future_step); keep the '
-                         'initializing model\'s value to warm-start a longer horizon')
-    ap.add_argument('--stem', choices=('residual', 'stride2'), default=CoordinateRegressionConfig.stem,
-                    help="Image stem: 'residual' full-resolution stem, or 'stride2' light stem")
-    ap.add_argument('--memory', choices=('slabs', 'decisions', 'none'), default=CoordinateRegressionConfig.memory,
-                    help="History memory: 'slabs' separate slab CNN, 'decisions' main-encoder entries "
-                         "of earlier decisions (live chains start at seeds and reuse recorded entries), 'none' "
-                         "(no memory inputs, tokens or attention; incompatible with the identity objectives)")
-    # --model sequence (models/sequence.py): one transformer reads the whole trace and predicts the path.
-    ap.add_argument('--sequence-layers', type=int, default=12, help='With --model sequence/unified/unified_flow: transformer layers')
-    ap.add_argument('--sequence-heads', type=int, default=8, help='With --model sequence/unified/unified_flow: attention heads')
-    ap.add_argument('--sequence-ffn', type=int, default=2048, help='With --model sequence/unified/unified_flow: feed-forward width')
-    ap.add_argument('--unified-cnn-channels', type=int, nargs='+', default=(32, 64, 128),
-                    help='With --model unified/unified_flow: CNN stage channels, each stage at stride 2 (token stride 2^stages)')
-    ap.add_argument('--unified-cnn-blocks', type=int, nargs='+', default=(1, 2, 2),
-                    help='With --model unified/unified_flow: residual blocks per CNN stage')
-    ap.add_argument('--cnn-channels', type=int, nargs=4, default=(16, 32, 64, 128),
-                    help='With --model sequence: full-resolution block, then stages at strides 2/4/8')
-    ap.add_argument('--cnn-blocks', type=int, default=2, help='With --model sequence: residual blocks per CNN stage')
-    ap.add_argument('--episode-steps', type=int, default=64,
-                    help='With --model sequence: decisions per training episode (one simulated trace)')
-    ap.add_argument('--episode-supervised', type=int, default=16,
-                    help='With --model sequence: trailing decisions of an episode with a loss; --batch counts episodes')
-    ap.add_argument('--episode-commit', type=int, default=None,
-                    help='With --model sequence: voxels between consecutive episode heads (default: --n-commit)')
-    ap.add_argument('--chain-seed-fraction', type=float, default=0.,
-                    help='With --memory decisions: start live chains at a seed within this leading fraction '
-                         'of the traversal (0 keeps the ordinary fresh location)')
-    ap.add_argument('--identity-dim', type=int, default=CoordinateRegressionConfig.identity_dim,
-                    help='With --memory decisions: width of the linear projection for the memory-identity '
-                         'InfoNCE loss (0 disables it)')
-    ap.add_argument('--identity-temperature', type=float, default=CoordinateRegressionConfig.identity_temperature)
-    ap.add_argument('--add-dataset-sources', action='store_true',
-                    help='On resume, allow the dataset config to append new sources after the recorded ones '
-                         '(recorded sources unchanged except their weights)')
-    ap.add_argument('--path-planes', choices=('future', 'crop'), default=CoordinateRegressionConfig.path_planes,
-                    help="Path head: 'future' planes 1..n_future, or 'crop' one point per crop plane behind and ahead "
-                         "of the head, trained toward the original fiber wherever it is (planes 1..n_future stay the "
-                         "committed, scored and measured proposal)")
-    ap.add_argument('--tube-head', action=argparse.BooleanOptionalAction, default=CoordinateRegressionConfig.tube_head,
-                    help='Dense Gaussian-tube head around the original fiber over the whole crop (auxiliary loss)')
-    ap.add_argument('--tube-sigma', type=float, default=1.5, help='Tube target width (trace voxels)')
-    ap.add_argument('--tube-weight', type=float, default=1., help='Tube loss coefficient')
-    ap.add_argument('--identity-weight', type=float, default=.1,
-                    help='Memory-identity loss coefficient (InfoNCE or verification)')
-    ap.add_argument('--identity-objective', choices=('infonce', 'verify', 'readout'),
-                    default=CoordinateRegressionConfig.identity_objective,
-                    help="With --memory decisions: 'infonce' (needs --identity-dim); 'verify', a verifier that "
-                         "reads decision-memory tokens and labels current-crop locations on/off the original fiber; "
-                         "or 'readout', path-blind appearance keys stored per decision and read out per location "
-                         "(same labels and loss as verify)")
-    ap.add_argument('--identity-map', action=argparse.BooleanOptionalAction,
-                    default=CoordinateRegressionConfig.identity_map,
-                    help='With --identity-objective verify/readout: add the dense identity field to decoder/scorer image tokens')
-    ap.add_argument('--identity-feedback', action=argparse.BooleanOptionalAction,
-                    default=CoordinateRegressionConfig.identity_feedback,
-                    help='With --identity-objective verify/readout: feed identity-field samples to scorer segments and retries')
-    ap.add_argument('--identity-exclude-synthetic', action=argparse.BooleanOptionalAction, default=False,
-                    help='With --identity-objective verify: synthetic switch states (synthetic_terminal/'
-                         'synthetic_identity) only evaluate the verifier; its loss uses real states')
-    ap.add_argument('--identity-switch-tail', type=float, nargs=2, default=IdentitySampling.identity_switch_tail,
-                    metavar=('MIN', 'MAX'), help='Neighbor tail of the synthetic_identity task, trace voxels')
-    ap.add_argument('--memory-augmentation', choices=('shared', 'independent'),
-                    default=IdentitySampling.memory_augmentation,
-                    help="Photometric/blur draw of memory crops encoded in training: the current crop's, or per crop")
-    ap.add_argument('--lr-step-offset', type=int, default=0,
-                    help='Continue another schedule: the cosine is evaluated at step+offset over steps+offset '
-                         '(warmup still counts this run\'s own updates)')
-    ap.add_argument('--init-partial', action='store_true',
-                    help='With --init-weights: build the model from these options and load only tensors whose '
-                         'names and shapes match; new axial blocks and the new stem start as identity residuals')
-    ap.add_argument('--init-exclude', action='append', default=[], metavar='PREFIX',
-                    help='With --init-partial: keep the initialization of tensors whose names start with PREFIX '
-                         '(repeatable), e.g. zero-initialized heads whose input changed meaning')
-    ap.add_argument('--hidden', type=int, default=CoordinateRegressionConfig.hidden)
-    ap.add_argument('--encoder-ffn', type=int, default=CoordinateRegressionConfig.encoder_ffn,
-                    help='Axial image encoder feed-forward width')
-    ap.add_argument('--activation-checkpointing', action=argparse.BooleanOptionalAction, default=False)
-    ap.add_argument('--task-share', action='append', default=[], metavar='TASK=SHARE',
-                    help='Override one task share (fresh, live, dagger_pre_excursion, dagger_recoverable, '
-                         'dagger_terminal, dagger_premature_stop, dagger_ordinary, synthetic_terminal, '
-                         'synthetic_identity); shares sum to one')
-    ap.add_argument('--terminal-fallback-cap', type=float, default=TaskBudget.terminal_fallback_cap,
-                    help='Largest fraction of terminal replay slots filled by certified synthetic failures')
-    ap.add_argument('--replay-max-age', type=int, default=TaskBudget.replay_max_age,
-                    help='Updates after which a replay cache is no longer drawn')
-    ap.add_argument('--replay-event-cap', type=int, default=TaskBudget.replay_event_cap,
-                    help='Draws per replay event, shared by all loader workers of a source')
-    ap.add_argument('--startup-shares', type=float, nargs=4, default=SampleConfig.startup_shares,
-                    metavar=('SEED_ONLY', 'SHORT', 'EARLY', 'ESTABLISHED'),
-                    help='Fresh trace starts: seed only, 1-8 and 9-32 requested voxels, uniform available history')
-    ap.add_argument('--excursion-probability', type=float, default=SampleConfig.excursion_probability,
-                    help='Established fresh traces given a smooth lateral excursion')
-    ap.add_argument('--excursion-amplitude', type=float, nargs=2, default=SampleConfig.excursion_amplitude)
-    ap.add_argument('--excursion-rise', type=float, nargs=2, default=SampleConfig.excursion_rise)
-    ap.add_argument('--synthetic-tail', type=float, nargs=2, default=(4., 16.), metavar=('MIN', 'MAX'),
-                    help='Neighbor tail of certified synthetic failures, trace voxels')
-    ap.add_argument('--live-continuation-steps', type=int, nargs=2, default=(12, 32), metavar=('MIN', 'MAX'),
-                    help='Live chain decision limits, balanced over three contiguous bands')
-    ap.add_argument('--negative-bank', default=str(Path(__file__).parents[1]/'output'/'neighbor_samples_r0_32_l80_160_v2'), help='Shared live bank for foreign-fiber masks, wrong continuations and following supervision')
-    ap.add_argument('--near-negative-bank', help='Additional bank of validated nearby negative relationships')
-    ap.add_argument('--continuation-bank', help='Synthetic failure path source (default: negative-bank)')
-    ap.add_argument('--bank-coverage-probability', type=float, default=.2, help='Fresh locations on covered parents with usable history')
-    ap.add_argument('--negative-bank-refresh-seconds', type=float, default=30., help='Each loader worker checks for completed new negative shards at this interval')
-    ap.add_argument('--negative-bank-cache-mb', type=float, default=64., help='Maximum cached negative geometry per loader worker')
-    ap.add_argument('--bank-hard-fraction', type=float, default=.5,
-                    help='Fraction of bank draws ranked by nearby similar, curved, or converging geometry')
-    ap.add_argument('--bank-switch-tolerance', type=float, default=.75,
-                    help='Foreign centerline contact radius for DAgger labels, in trace voxels')
-    ap.add_argument('--bank-own-tolerance', type=float, default=1.5,
-                    help='Annotation tube excluded from confirmed foreign contact')
-    ap.add_argument('--blur-probability', type=float, default=.25,
-                    help='Probability of shared CT/presence Gaussian blur; may be changed on resume')
-    ap.add_argument('--blur-sigma', type=float, nargs=2, default=(.5, 1.25), metavar=('MIN', 'MAX'),
-                    help='Gaussian blur sigma range in sampled crop voxels; may be changed on resume')
-    ap.add_argument('--lateral-fraction', type=float, default=.1,
-                    help='Fresh draws near earlier states with bank negatives')
-    ap.add_argument('--seed', type=int, default=0)
-    ap.add_argument('--val-z', type=float, nargs=2, default=(45000., 48500.))
-    ap.add_argument('--log-every', type=int, default=50)
-    ap.add_argument('--ckpt-every', type=int, default=1000)
-    ap.add_argument('--diag-every', type=int, default=5000)
-    ap.add_argument('--batch-diag-every', type=int, default=1000,
-                    help='Current microbatch prediction, orientation and model-layer contact sheets; 0 disables')
-    ap.add_argument('--diag-max-len', type=float, default=400.)
-    ap.add_argument('--long-diag-every', type=int, default=0, help='Additional long monitor rollouts; 0 disables')
-    ap.add_argument('--long-diag-max-len', type=float, default=1200.)
-    ap.add_argument('--recovery-every', type=int, default=1000, help='Fixed monitor recovery diagnostic cadence; 0 disables')
-    ap.add_argument('--recovery-seeds', type=int, default=8, help='First N frozen monitor seeds, four displacement strata each')
-    ap.add_argument('--recovery-length', type=float, default=32.)
-    ap.add_argument('--dagger-every', type=int, default=1000,
-                    help='Global collection cadence; sources take turns and a busy launch is skipped')
-    ap.add_argument('--dagger-fibers', type=int, default=64,
-                    help='Distinct fibers per collection, one directed episode each')
-    ap.add_argument('--afv-dagger-fibers', type=int,
-                    help='Distinct fibers per AFV collection (default: --dagger-fibers); AFV coverage order '
-                         'favors fibers by length**--afv-length-power, like AFV training draws')
-    ap.add_argument('--dagger-batch', type=int, default=8, help='Traces per collector forward batch')
-    ap.add_argument('--dagger-forward-chunk', type=int, default=0, help='Rows per collector model call; 0 = whole batch')
-    ap.add_argument('--afv-length-power', type=float, default=1.,
-                    help='AFV training fiber draws, and AFV collection order, proportional to length**p')
-    ap.add_argument('--dagger-device')
-    ap.add_argument('--dagger-trace-len', type=float, default=768.)
-    ap.add_argument('--dagger-before', type=float, default=48., help='Dense decisions kept before an excursion')
-    ap.add_argument('--dagger-after', type=float, default=64., help='Voxels kept after the first terminal failure')
-    ap.add_argument('--dagger-stride', type=float, default=16., help='Travel between kept ordinary decisions')
-    ap.add_argument('--replay-keep', type=int, default=4)
-    ap.add_argument('--init-weights', help='Start a new run from matching model and EMA tensors of this checkpoint; '
-                                           'fresh optimizer, sampler and options')
-    ap.add_argument('--resume', help='Resume last.pt inside this run with the same training options')
-    ap.add_argument('--reset-optimizer', action='store_true',
-                    help='With --resume: fresh AdamW, one LR for all parameters, no transfer freeze, and restart LR warmup/decay')
-    ap.add_argument('--recurrent-refinement-steps', type=int, default=CoordinateRegressionConfig.recurrent_refinement_steps,
-                    help='Maximum additional absolute-coordinate attempts; stop early when the full path is accepted')
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--config', required=True, help='Run configuration JSON (train/run_config.py)')
+    ap.add_argument('--resume', help='Checkpoint to continue (model, EMA, optimizer, step); its run folder is the '
+                                     "configuration's name under out_root")
     return ap
 
 
-def options_argv(options):
-    """Serialize effective trainer settings for a bounded benchmark run."""
-    argv = []
-    for action in build_parser()._actions:
-        if action.dest == 'help' or action.dest not in options:
-            continue
-        value = options[action.dest]
-        if value is None:
-            continue
-        if isinstance(action, argparse.BooleanOptionalAction):
-            argv.append(action.option_strings[0 if value else 1])
-        elif isinstance(action, argparse._StoreTrueAction):
-            if value:
-                argv.append(action.option_strings[0])
-        else:
-            argv.append(action.option_strings[0])
-            argv.extend(map(str, value if isinstance(value, (list, tuple)) else [value]))
-    return argv
-
-
-def validate_resume_options(args, recorded_options):
-    # Allow a new base LR without resetting AdamW or the schedule origin.
-    # Extending the endpoint also changes the cosine factor; callers preserving
-    # the current effective LR must rescale the base LR for the new endpoint.
-    # The frame selection comes from model_cfg unless explicitly overridden;
-    # an omitted CLI flag must not prevent resuming that recorded selection.
-    # Initialization is historical provenance, not a resume-time input.
-    # Operational settings may change on resume; sampling and label semantics may not.
-    # 'ct' is where the CT is read from (it may move, e.g. a local mirror to its S3 store), not what is trained on.
-    ignored = {'resume','init_weights','init_partial','init_exclude','reset_optimizer','lr','steps','frame_checkpoint','out_root','device','batch','grad_steps','workers','threads','dagger_threads','worker_cache_gb','dataset_config','add_dataset_sources','ct',
-               'remote_prefetch_connections','remote_prefetch_queue_size','remote_prefetch_timeout','remote_prefetch_lookahead',
-               'log_every','ckpt_every','diag_every','batch_diag_every','dagger_device','dagger_batch','dagger_forward_chunk',
-               'negative_bank_refresh_seconds','negative_bank_cache_mb','activation_checkpointing',
-               'history_grad_clip','rest_grad_clip','blur_probability','blur_sigma','retry_threshold','refinement_loss','refinement_weight',
-               'tolerance','change_trace_confidence','change_task_mix'}  # confidence-label tolerance; the departure threshold is a separate constant
-    if args.change_trace_confidence:
-        ignored = ignored | {'trace_confidence'}  # explicit: live chains, collection and selection move to the new threshold
-    if args.change_task_mix:
-        # explicit: which tasks are drawn and how on-policy data is collected change; labels and samples keep their rules
-        ignored = ignored | {'task_share', 'terminal_fallback_cap', 'replay_max_age', 'replay_event_cap', 'replay_keep',
-                             'dagger_every', 'dagger_fibers', 'afv_dagger_fibers', 'dagger_trace_len', 'dagger_before',
-                             'dagger_after', 'dagger_stride', 'live_continuation_steps'}
-    defaults = build_parser()
-    # Options whose default changed when they were introduced: a run started earlier used the old behaviour.
-    from vesuvius.neural_tracing.fiber_follow.tracing.policy import LEGACY_CONFIDENCE, LEGACY_GATE
-    legacy = dict(gate=LEGACY_GATE, trace_confidence=LEGACY_CONFIDENCE)
-    for key,value in vars(args).items():
-        # Options added after a run started were recorded implicitly at their default (or legacy behaviour).
-        recorded = recorded_options[key] if key in recorded_options else legacy.get(key, defaults.get_default(key))
-        if key not in ignored and json.dumps(recorded,sort_keys=True) != json.dumps(value,sort_keys=True):
-            raise ValueError(f'Resume option differs: {key}')
+def configured_model(run, resume, progress):
+    """The model configuration: the checkpoint's when resuming (fitted flow scales included), else the run's."""
+    cfg = run_config.model_config(run)
+    if resume is None:
+        return cfg
+    recorded = config_from_checkpoint(resume)
+    ignored = ('flow_sigma', 'frame_checkpoint', 'frame_checkpoint_sha256')
+    differs = sorted(k for k, v in cfg.to_dict().items() if k not in ignored and recorded.to_dict().get(k) != v)
+    if differs:
+        progress(f'Resuming with the checkpoint model configuration; ignoring configured {", ".join(differs)}')
+    return recorded
 
 
 def main(argv=None):
-    args = build_parser().parse_args(argv)
-    dataset_document = dataset_digest = None
-    if args.dataset_config:
-        from vesuvius.neural_tracing.fiber_follow.data.datasets import read_dataset_config, apply_primary_source
-        dataset_document, dataset_digest = read_dataset_config(args.dataset_config)
-        apply_primary_source(args, dataset_document)
-    if any(not getattr(args, key) for key in ('manifest', 'fiber_zarrs', 'fibers', 'ct')):
-        raise ValueError('Provide source paths and --manifest, or --dataset-config')
+    cli = build_parser().parse_args(argv)
+    run = run_config.load(cli.config)
+    args = run_config.namespace(run, cli.resume)
+    dataset_document = run['dataset']
+    dataset_digest = hashlib.sha256(json.dumps(dataset_document, sort_keys=True).encode()).hexdigest()
     launch_started = time.monotonic()
 
     def progress(message):
         print(f'[{args.name} +{time.monotonic()-launch_started:.1f}s] {message}', flush=True)
 
-    progress(f'Starting training: device={args.device}, workers={args.workers}')
+    progress(f'Starting training ({args.model}): device={args.device}, workers={args.workers}')
     if args.reset_optimizer and not args.resume:
-        raise ValueError('--reset-optimizer requires --resume')
-    if args.init_weights and args.resume:
-        raise ValueError('--init-weights starts a new run; it cannot be combined with --resume')
-    if args.retry_threshold is not None and not 0 <= args.retry_threshold <= 1:
-        raise ValueError('--retry-threshold must lie in [0, 1]')
-    if args.refinement_loss == 'all' and args.retry_threshold is not None:
-        raise ValueError('--refinement-loss all runs every refinement pass; drop --retry-threshold')
-    if not math.isfinite(args.refinement_weight) or args.refinement_weight < 0:
-        raise ValueError('--refinement-weight must be finite and nonnegative')
-    if any(not math.isfinite(v) or v < 0 for v in (args.history_grad_clip, args.rest_grad_clip)):
-        raise ValueError('Gradient clipping limits must be finite and nonnegative (0 disables clipping)')
-    budget = TaskBudget.parse(args.task_share, terminal_fallback_cap=args.terminal_fallback_cap,
-                              replay_max_age=args.replay_max_age, replay_event_cap=args.replay_event_cap)
-    if (args.remote_prefetch_connections < 0 or args.remote_prefetch_queue_size < 1 or args.remote_prefetch_lookahead < 0
-            or not math.isfinite(args.remote_prefetch_timeout) or args.remote_prefetch_timeout <= 0):
-        raise ValueError('Prefetch connections and lookahead must be nonnegative; queue size and timeout must be positive')
-    if min(args.steps, args.batch, args.grad_steps, args.log_every, args.ckpt_every,
-           args.threads, args.dagger_threads, args.flow_calibration_states, args.replay_keep, args.dagger_fibers, args.dagger_batch, args.recovery_seeds) < 1:
-        raise ValueError('Positive counts required, including batch and grad steps')
-    if args.afv_dagger_fibers is not None and args.afv_dagger_fibers < 1:
-        raise ValueError('AFV collection fiber count must be positive')
-    if min(args.workers, args.warmup, args.diag_every, args.batch_diag_every,
-           args.long_diag_every, args.dagger_every, args.recovery_every, args.confidence_weight) < 0:
-        raise ValueError('Invalid training settings')
-    if not 0 <= args.ema_decay < 1 or min(args.lr, args.tolerance, args.worker_cache_gb, args.dagger_after,
-                                       args.diag_max_len, args.long_diag_max_len, args.dagger_trace_len, args.recovery_length) <= 0:
-        raise ValueError('Invalid loss, learning rate, cache, or rollout settings')
-    if args.val_z[0] >= args.val_z[1]:
-        raise ValueError('Holdout interval must be increasing')
-    if not math.isfinite(args.afv_length_power) or args.afv_length_power < 0:
-        raise ValueError('AFV length power must be finite and nonnegative')
+        raise ValueError('reset_optimizer applies to --resume')
+    budget = TaskBudget(tuple(args.task_shares[name] for name in TASKS), terminal_fallback_cap=args.terminal_fallback_cap,
+                        replay_max_age=args.replay_max_age, replay_event_cap=args.replay_event_cap)
     if torch.device(args.device).type == 'cuda' and not torch.cuda.is_available():
         raise RuntimeError('CUDA unavailable')
     raise_open_file_limit()
     torch.set_num_threads(args.threads)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    resume = read_checkpoint(args.resume,MODEL_TYPES,args.device) if args.resume else None
-    if resume is not None and resume.get('kind') == 'weights':
-        raise ValueError('Weight-only files require --init-weights, not --resume')
-    initial = read_checkpoint(args.init_weights,MODEL_TYPES,'cpu') if args.init_weights else None
-    if args.init_exclude and not args.init_partial:
-        raise ValueError('--init-exclude requires --init-partial')
-    if args.init_partial and not args.init_weights:
-        raise ValueError('--init-partial requires --init-weights')
-    if not 0 <= args.chain_seed_fraction <= 1:
-        raise ValueError('Chain seed fraction must lie in [0, 1]')
+    resume = read_checkpoint(args.resume, args.device) if args.resume else None
+    if resume is not None and args.init_weights:
+        progress('Resuming: init_weights only applies to a new run and is ignored')
+    initial = read_checkpoint(args.init_weights, 'cpu') if args.init_weights and resume is None else None
     initialization = resume.get('initialization') if resume else args.init_weights
-    # A partial warm start builds the requested architecture; a full one copies the source's.
-    cfg = model_config_from_args(args, resume or (None if args.init_partial else initial))
-    if cfg.model_type == 'sequence' and any(budget.to_dict()['shares'].get(name, 0.) for name in
-                                            ('live', 'synthetic_terminal', 'synthetic_identity')):
-        # Episodes are simulated traces ('fresh') or windows of collected traces ('dagger_*'), nothing else.
-        raise ValueError('--model sequence trains on fresh and DAgger episodes; set the live and synthetic task shares to 0')
-    inherited_frame = initial['model_cfg'].get('frame_checkpoint') if args.init_partial else None
-    if args.frame_checkpoint or not resume:
-        bind_frame_checkpoint(cfg, args.frame_checkpoint or cfg.frame_checkpoint or inherited_frame
-                              or DEFAULT_FRAME_CHECKPOINT)
+    cfg = configured_model(run, resume, progress)
+    # The configured frame model; a resumed run records the file it now uses.
+    bind_frame_checkpoint(cfg, args.frame_checkpoint)
     frame_predictor(cfg)  # validate once before dataset loading; workers reuse a frozen CPU predictor
-    args.model = cfg.model_type
-    if resume:
-        from vesuvius.neural_tracing.fiber_follow.data.datasets import validate_dataset_resume
-        validate_dataset_resume(resume,dataset_document,dataset_digest,allow_added=args.add_dataset_sources)
-    if not 1 <= args.live_continuation_steps[0] <= args.live_continuation_steps[1]:
-        raise ValueError('Live continuation requires 1 <= minimum steps <= maximum steps')
+    # The recorded configuration holds the model actually trained; fitted flow scales stay with the checkpoint.
+    configured_sigma = run['model'].get('flow_sigma')
+    run['model'] = dict(type=cfg.model_type, **{k: v for k, v in json.loads(json.dumps(cfg.to_dict())).items()
+                                                if k not in run_config.DERIVED_MODEL_FIELDS})
+    if cfg.model_type == 'flow':
+        run['model']['flow_sigma'] = configured_sigma
     from vesuvius.neural_tracing.fiber_follow.data.bank_geometry import BankSwitchDetector
     BankSwitchDetector([], args.bank_switch_tolerance, args.bank_own_tolerance)
     identity_sampling = IdentitySampling(
-        blur_probability=args.blur_probability,blur_sigma=args.blur_sigma,
+        blur_probability=args.blur_probability,blur_sigma=tuple(args.blur_sigma),
         lateral_fraction=args.lateral_fraction,bank_hard_fraction=args.bank_hard_fraction,
-        bank_coverage_probability=args.bank_coverage_probability,synthetic_tail=args.synthetic_tail,
-        identity_switch_tail=args.identity_switch_tail,memory_augmentation=args.memory_augmentation)
+        bank_coverage_probability=args.bank_coverage_probability,synthetic_tail=tuple(args.synthetic_tail))
     if not args.negative_bank:
-        raise ValueError('Training requires --negative-bank')
+        raise ValueError('Training requires a negative_bank in the Paris 4 dataset source')
     if not 1 <= args.n_commit <= cfg.n_future:
         raise ValueError('Commit window must fit forecast')
-    # Finest-level CT in a single enlarged crop.
-    primary_source = (next(s for s in dataset_document['sources'] if s['kind'] == 'paris4')
-                      if dataset_document else {})
+    primary_source = next(s for s in dataset_document['sources'] if s['kind'] == 'paris4')
     from vesuvius.neural_tracing.fiber_follow.data.datasets import primary_source_spec
-    spec = primary_source_spec(dataset_document, fiber_zarrs=args.fiber_zarrs, ct=args.ct)
+    spec = primary_source_spec(dataset_document)
     sample = SampleConfig(crop=cfg.fine, n_history=cfg.n_history, n_future=cfg.n_future,
                           future_step=cfg.future_step, recent_history_points=cfg.n_history,
                           startup_shares=tuple(args.startup_shares), excursion_probability=args.excursion_probability,
                           excursion_amplitude=tuple(args.excursion_amplitude), excursion_rise=tuple(args.excursion_rise),
-                          label_tolerance=args.tolerance, max_recovery_distance=cfg.max_recovery_distance,
-                          crop_targets=getattr(cfg, 'path_planes', 'future') == 'crop' or getattr(cfg, 'tube_head', False))
+                          label_tolerance=args.tolerance, max_recovery_distance=cfg.max_recovery_distance)
     policy = training_policy(cfg, args.n_commit, args.trace_confidence, args.gate)
     progress('Loading manifest and fiber annotations')
     bank_band = ZBand(*(v/spec.grid_scale for v in args.val_z))
-    if dataset_document:
-        from vesuvius.neural_tracing.fiber_follow.data.datasets import load_primary_dataset, HoldoutFilteredBank
-        fibers,train_f,val_f,manifest = load_primary_dataset(dataset_document,spec)
-        band = None
-    else:
-        manifest = read_manifest(args.manifest)
-        validate_volume_source(spec, manifest)
-        fibers = load_fibers(args.fibers, grid_scale=spec.grid_scale)
-        band = bank_band
-        train_f, val_f = split_fibers(fibers, band)
+    from vesuvius.neural_tracing.fiber_follow.data.datasets import load_primary_dataset, HoldoutFilteredBank
+    fibers,train_f,val_f,manifest = load_primary_dataset(dataset_document,spec)
+    band = None
     progress(f'Loaded {len(train_f)} training fibers and {len(val_f)} validation fibers')
     if fiber_manifest(val_f) != manifest['fibers']:
         raise ValueError('Frozen validation geometry differs from dataset/holdout')
-    negative_bank = None
     role_banks = {}
-    if args.negative_bank:
-        from vesuvius.neural_tracing.fiber_follow.data.neighbor_bank import NeighborBank
-        bank_class = HoldoutFilteredBank if dataset_document else NeighborBank
-        bank_kwargs = dict(heldout=val_f) if dataset_document else {}
-        negative_bank = bank_class(args.negative_bank,train_f,bank_band,grid_scale=spec.grid_scale,**bank_kwargs,
-            refresh_seconds=args.negative_bank_refresh_seconds,cache_bytes=int(args.negative_bank_cache_mb*(1 << 20)))
-        negative_bank.validate_volume(spec)
-        if resume and (resume.get('negative_bank_provenance') is not None or resume['training_options'].get('negative_bank')):
-            negative_bank.validate_resume(resume.get('negative_bank_provenance'))
-        progress(f'Live negative bank: {negative_bank.shard_count} published shards, refresh every {args.negative_bank_refresh_seconds:g}s per worker')
-        by_path = {negative_bank.root:negative_bank}
-        for role in ('near_negative_bank','continuation_bank'):
-            path = getattr(args,role)
-            if path is None:
-                continue
-            root = Path(path).resolve()
-            if root.name == 'bank.json':
-                root = root.parent
-            if root not in by_path:
-                by_path[root] = bank_class(root,train_f,bank_band,grid_scale=spec.grid_scale,**bank_kwargs,
-                    refresh_seconds=args.negative_bank_refresh_seconds,cache_bytes=int(args.negative_bank_cache_mb*(1 << 20)))
-                by_path[root].validate_volume(spec)
-            role_banks[role] = by_path[root]
-            if resume:
-                role_banks[role].validate_resume((resume.get('bank_role_provenance') or {}).get(role))
-    def role_provenance():
-        return {role:bank.provenance() for role,bank in role_banks.items()}
-    if resume:
-        validate_resume_options(args, resume['training_options'])
-        # The held-out fibers must match; the validation manifest's hash also covers the CT location, which may move.
-        if resume['fiber_manifest'] != fiber_manifest(fibers):
-            raise ValueError('Resume data/manifest changed')
-    if initial:
-        # Fiber identities and source holdouts must match the weights' training data, so no
-        # held-out fiber was trained on. Geometry (load-time annotation repair) and the seeds
-        # placed on it may differ; the new run evaluates both checkpoints on its own seeds.
-        if fiber_identities(initial['fiber_manifest']) != fiber_identities(fiber_manifest(fibers)):
-            raise ValueError('Initialization checkpoint used different fibers or evaluation splits')
-        from vesuvius.neural_tracing.fiber_follow.data.datasets import same_sources
-        # A warm start may add sources; every source it was trained on must keep its fibers and holdouts.
-        if not same_sources(initial.get('dataset_config'), dataset_document, allow_added=True):
-            raise ValueError('Initialization checkpoint used different dataset sources or holdouts')
-        known = {s['name'] for s in (initial.get('dataset_config') or {}).get('sources', [])}
-        added = [s['name'] for s in (dataset_document or {}).get('sources', []) if s['name'] not in known]
+    bank_options = dict(heldout=val_f, refresh_seconds=args.negative_bank_refresh_seconds,
+                        cache_bytes=int(args.negative_bank_cache_mb*(1 << 20)))
+    negative_bank = HoldoutFilteredBank(args.negative_bank,train_f,bank_band,grid_scale=spec.grid_scale,**bank_options)
+    negative_bank.validate_volume(spec)
+    progress(f'Live negative bank: {negative_bank.shard_count} published shards, refresh every {args.negative_bank_refresh_seconds:g}s per worker')
+    by_path = {negative_bank.root:negative_bank}
+    for role in ('near_negative_bank','continuation_bank'):
+        path = getattr(args,role)
+        if path is None:
+            continue
+        root = Path(path).resolve()
+        if root.name == 'bank.json':
+            root = root.parent
+        if root not in by_path:
+            by_path[root] = HoldoutFilteredBank(root,train_f,bank_band,grid_scale=spec.grid_scale,**bank_options)
+            by_path[root].validate_volume(spec)
+        role_banks[role] = by_path[root]
+    if initial and initial.get('dataset_config'):
+        known = {s['name'] for s in initial['dataset_config'].get('sources', [])}
+        added = [s['name'] for s in dataset_document['sources'] if s['name'] not in known]
         if added:
             progress(f'Warm start adds dataset sources the initialization never saw: {", ".join(added)}')
     out = prepare_run_dir(args.out_root, args.name, resume is not None)
-    if dataset_document:
-        (out/'validation_paris4.json').write_text(json.dumps(manifest,indent=2)+'\n')
-    if resume and Path(args.resume).resolve().parent != out.resolve():
-        raise ValueError('Resume checkpoint must be inside the named run')
+    (out/'trainer.pid').write_text(f'{os.getpid()}\n')
+    (out/'validation_paris4.json').write_text(json.dumps(manifest,indent=2)+'\n')
     from vesuvius.neural_tracing.fiber_follow.data.ct_normalization import prepare_normalization
-    calibration_specs = [spec]
-    if dataset_document:
-        from vesuvius.neural_tracing.fiber_follow.data.datasets import ct_source_spec
-        calibration_specs.extend(ct_source_spec(s, dataset_document['cache_dir'])
-                                 for s in dataset_document['sources'] if s['kind'] != 'paris4')
+    from vesuvius.neural_tracing.fiber_follow.data.datasets import ct_source_spec
+    calibration_specs = [spec, *(ct_source_spec(s, dataset_document['cache_dir'])
+                                 for s in dataset_document['sources'] if s['kind'] != 'paris4')]
     progress('Preparing per-crop CT z-score normalization')
     ct_normalization = prepare_normalization(out, calibration_specs,
         known=resume['ct_normalization'] if resume is not None else None)  # a relocated CT adds its own record
     recovery_states = recovery_hash = None
     if args.recovery_every:
         progress('Preparing monitor recovery fixture')
-        if resume and not (out/'monitor_recovery.npz').exists():
-            raise ValueError('Resume requires the original monitor recovery fixture')
         recovery_states, recovery_hash = monitor_fixture(out/'monitor_recovery.npz', val_f, manifest,
                                                          sample, spec, args.recovery_seeds)
-        if resume and resume.get('monitor_recovery_sha256') != recovery_hash:
-            raise ValueError('Monitor recovery fixture changed since checkpoint')
     progress('Initializing models and optimizer')
-    progress(f'Independent gradient clipping: history={args.history_grad_clip:g}, rest={args.rest_grad_clip:g} (0 disables clipping)')
+    progress(f'Gradient clipping at global norm {args.grad_clip:g} (0 disables clipping)')
     if args.retry_threshold is not None:
         progress(f'Training retries below confidence {args.retry_threshold:g}; selection, live chains and collection use {args.trace_confidence:g}')
     if args.refinement_loss == 'all':
         progress(f'Refinement loss: every pass for every decision; initial proposal full weight, passes x{args.refinement_weight:g} '
                  f'of their mean; selection and the attempt metric follow confidence {args.trace_confidence:g}')
-    # Flow scales are fitted after constructing the common training dataset below, unless the
-    # configuration came with them (resume or a full flow warm start). A partial warm start builds
-    # the configuration from arguments and therefore fits them, even from a flow checkpoint.
-    fit_flow_scales = isinstance(cfg, FlowConfig) and not cfg.flow_sigma
+    # Flow scales are fitted after constructing the common training dataset below, unless the configuration came
+    # with them (a resumed checkpoint, or flow_sigma in the run configuration).
+    fit_flow_scales = cfg.model_type == 'flow' and not cfg.flow_sigma
     if fit_flow_scales:
         cfg.flow_sigma = tuple((cfg.flow_sigma_floor,)*2 for _ in range(len(cfg.path_plane_values)))
-    model, ema = initialize_model_weights(cfg, args.device, initial, partial=args.init_partial,
-                                          exclude=tuple(args.init_exclude))
-    if args.init_partial:
-        progress(f'Partial warm start: {len(model.reinitialized_tensors)} tensors left at initialization')
+    model, ema = initialize_model_weights(cfg, args.device, initial, exclude=tuple(args.init_exclude))
+    if model.initialization_report is not None:
+        report = model.initialization_report
+        progress(f'Initialized from {args.init_weights}: {len(report["fresh"])} tensors left at initialization, '
+                 f'{len(report["unexpected"])} checkpoint tensors unused, {len(report["mismatched"])} of another shape')
+        for name in ('fresh', 'unexpected', 'mismatched'):
+            if report[name]:
+                progress(f'  {name}: {", ".join(report[name][:20])}{" ..." if len(report[name]) > 20 else ""}')
     opt, done, lr_restart_step = initialize_training_optimizer(model, ema, args, resume)
     if args.reset_optimizer:
         progress(f'Fresh AdamW: one parameter group, all parameters trainable; LR restarts at update {done+1} '
@@ -1257,7 +640,7 @@ def main(argv=None):
     replay_index = out/'dagger'/'replay.json'
     replay_paths = json.loads(replay_index.read_text()) if resume and replay_index.exists() else args.onpolicy
     progress('Loading replay banks and preparing data loader')
-    caches = [OnPolicyStates.load(p) for p in replay_paths]
+    caches = usable_replay(load_replay(replay_paths), train_f, cfg.n_history, spec.grid_scale)
     collection = dict(every=args.dagger_every, fibers_per_collection=args.dagger_fibers, batch=args.dagger_batch,
                       forward_chunk=args.dagger_forward_chunk, seed=args.seed, replay_keep=args.replay_keep,
                       trace_len=args.dagger_trace_len, before=args.dagger_before, after=args.dagger_after,
@@ -1270,7 +653,7 @@ def main(argv=None):
     collector = OnlineCollector(out/'dagger', args.fibers, args.val_z, args.dagger_device or args.device,
         initial=[c._dir for c in caches], **collection,
         extra_args=(*bank_args, *[v for path in (args.negative_bank, args.near_negative_bank) if path for v in ('--failure-bank', path)]))
-    progress(f'Live historical slabs: eight slots; {args.batch} independent decisions per batch')
+    progress(f'{args.batch} independent decisions per batch')
     builder = IdentityObservationBuilder(cfg,train_f,identity_sampling,
         augment=True,negative_bank=negative_bank,**role_banks)
     dataset = FollowDataset(train_f, spec, sample, band, chunk=args.batch, seed=args.seed+done,
@@ -1310,8 +693,6 @@ def main(argv=None):
             from vesuvius.neural_tracing.fiber_follow.data.data import EpisodeSpec
             source_dataset.episodes = EpisodeSpec(steps=args.episode_steps, supervised=args.episode_supervised,
                                                   commit=args.episode_commit or args.n_commit)
-        source_dataset.chain_seed_only = cfg.memory == 'decisions'
-        source_dataset.chain_seed_fraction = args.chain_seed_fraction if cfg.memory == 'decisions' else 0.
     from vesuvius.neural_tracing.fiber_follow.train.live_continuation import LiveContinuation, preserve_live_metadata
     live_continuation = LiveContinuation(dataset, policy=policy, steps=args.live_continuation_steps,
         switch_tolerance=args.bank_switch_tolerance, own_tolerance=args.bank_own_tolerance, horizon=gate_horizon(cfg))
@@ -1327,22 +708,18 @@ def main(argv=None):
         for follower in (model, ema):
             follower.sigma.copy_(torch.tensor(cfg.flow_sigma, device=args.device))
             follower.cfg.flow_sigma = cfg.flow_sigma
+    (out/'run.json').write_text(json.dumps(run, indent=2)+'\n')
     if not resume:
-        (out/'config.json').write_text(json.dumps(dict(vars(args), model_type=model.model_type,
-            resolved_dataset_config=dataset_document, dataset_config_sha256=dataset_digest,
-            dataset_provenance=dataset_provenance,
-            ct_normalization=ct_normalization,
-            identity_sampling=asdict(identity_sampling),
-            negative_bank_provenance=negative_bank.provenance() if negative_bank else None,
-            bank_role_provenance=role_provenance(),
+        (out/'config.json').write_text(json.dumps(dict(run_config=run, model_type=model.model_type,
+            dataset_config_sha256=dataset_digest, dataset_provenance=dataset_provenance,
+            ct_normalization=ct_normalization, identity_sampling=asdict(identity_sampling),
             model_cfg=cfg.to_dict(), sample_cfg=asdict(sample), vol_spec=spec.to_dict(),
             task_budget=budget.to_dict(), operating_policy=policy.to_dict(),
             collection=collector_settings(collector),
             initialization=dict(checkpoint=str(Path(args.init_weights).resolve()), optimizer='fresh AdamW',
-                                warmup=args.warmup, partial=args.init_partial, excluded=list(args.init_exclude),
-                                reinitialized=model.reinitialized_tensors) if args.init_weights else None,
-            data_policy=DATA_POLICY, frame_policy=configured_frame_policy(cfg),
-            monitor_recovery_sha256=recovery_hash,
+                                warmup=args.warmup, excluded=list(args.init_exclude),
+                                **model.initialization_report) if args.init_weights else None,
+            frame_policy=configured_frame_policy(cfg), monitor_recovery_sha256=recovery_hash,
             seed_manifest_sha256=manifest['sha256'], fiber_manifest=fiber_manifest(fibers),
             parameter_count=sum(p.numel() for p in model.parameters())), indent=2))
     log = RunLog(out/'log.jsonl', formatter=format_training_log)
@@ -1354,7 +731,7 @@ def main(argv=None):
                         evaluation_scope='Source-specific held-out fibers; Paris 4 recovery fixture'))
     if resume:
         log.record(dict(step=done, event='resume_configuration', checkpoint=str(args.resume),
-                        training_options=vars(args), model_cfg=cfg.to_dict()))
+                        run_config=run, model_cfg=cfg.to_dict()))
     log.record(dict(step=done, event='optimizer_configuration', reset=args.reset_optimizer,
                     lr_restart_step=lr_restart_step, optimizer_state_entries=len(opt.state),
                     groups=[dict(parameters=len(g['params'])) for g in opt.param_groups],
@@ -1371,10 +748,8 @@ def main(argv=None):
                               excursion_amplitude=sample.excursion_amplitude, excursion_rise=sample.excursion_rise),
         label_contract=dict(tolerance=sample.label_tolerance, max_recovery_distance=sample.max_recovery_distance),
         live_continuation_steps=args.live_continuation_steps,
-        history_sampling_revision=sampling_revision(cfg), frame_policy=configured_frame_policy(cfg),
-        history_policy='live_observed_slabs',sampling=asdict(identity_sampling),
-        negative_bank_path=str(negative_bank.root),negative_bank_provenance=negative_bank.provenance(),
-        bank_role_provenance=role_provenance()))
+        frame_policy=configured_frame_policy(cfg), sampling=asdict(identity_sampling),
+        negative_bank_path=str(negative_bank.root),negative_bank_provenance=negative_bank.provenance()))
     tracer = None
     recovery_vol = FiberVolume(spec) if recovery_states is not None else None
     started = time.monotonic()
@@ -1406,7 +781,7 @@ def main(argv=None):
         iterator = iter(loader)
         updates = DecisionBatchPrefetch(iterator, args.grad_steps)
         observed_states = interval_states = 0
-        prior_samples = int(resume['samples_seen']) if resume else 0
+        prior_samples = int(resume.get('samples_seen', 0)) if resume else 0
         ledger = SamplingLedger()
         for step in range(done+1, args.steps+1):
             for source_dataset in sources:
@@ -1429,10 +804,7 @@ def main(argv=None):
                 tolerance=args.tolerance, confidence_weight=args.confidence_weight, ema_decay=args.ema_decay,
                 ema_ramp=not initialization,
                 n_commit=args.n_commit, compute_metrics=step % args.log_every == 0 or step == args.steps,
-                history_grad_clip=args.history_grad_clip, rest_grad_clip=args.rest_grad_clip,
-                identity_weight=args.identity_weight, identity_exclude_synthetic=args.identity_exclude_synthetic,
-                tube_weight=args.tube_weight, tube_sigma=args.tube_sigma,
-                confidence_threshold=policy.confidence, gate=policy.gate, retry_threshold=args.retry_threshold,
+                grad_clip=args.grad_clip, confidence_threshold=policy.confidence, gate=policy.gate, retry_threshold=args.retry_threshold,
                 refinement_loss=args.refinement_loss, refinement_weight=args.refinement_weight,
                 diagnostic=diagnostic, live_continuation=live_continuation, ledger=ledger)
             observed_states += metrics['observed_states']
@@ -1459,7 +831,7 @@ def main(argv=None):
                     cuda_peak_allocated_gib=torch.cuda.max_memory_allocated(args.device)/2**30
                         if torch.device(args.device).type == 'cuda' else None))
                 from vesuvius.neural_tracing.fiber_follow.evaluation.diag import plot_curves
-                plot_curves(out/'log.jsonl', out/'curves.png', loss_key='flow' if model.cfg.model_type in FLOW_MODEL_TYPES else 'geometry')
+                plot_curves(out/'log.jsonl', out/'curves.png', loss_key='flow' if model.cfg.model_type == 'flow' else 'geometry')
                 interval_metrics = TrainingInterval()
                 ledger = SamplingLedger()
                 interval_started, interval_step = now, step
@@ -1468,19 +840,12 @@ def main(argv=None):
 
             def save(path, resumable=False):
                 extra = dict(step=step, lr_restart_step=lr_restart_step, tolerance=args.tolerance, n_commit=args.n_commit,
-                    operating_policy=policy.to_dict(), task_budget=budget.to_dict(), sample_contract=asdict(sample),
+                    operating_policy=policy.to_dict(), task_budget=budget.to_dict(),
                     initialization=str(Path(initialization).resolve()) if initialization else None,
-                    dataset_config=dataset_document, dataset_config_sha256=dataset_digest,
-                    dataset_provenance=dataset_provenance,
-                    ct_normalization=ct_normalization,
-                    history_sampling_revision=sampling_revision(cfg), frame_policy=configured_frame_policy(cfg),
-                    samples_seen=prior_samples+observed_states,
-                    identity_sampling=asdict(identity_sampling),
-                    negative_bank_provenance=negative_bank.provenance() if negative_bank else None,
-                    bank_role_provenance=role_provenance(),
-                    seed_manifest_sha256=manifest['sha256'], training_options=vars(args),
-                    monitor_recovery_sha256=recovery_hash,
-                    fiber_manifest=fiber_manifest(fibers))
+                    dataset_config=dataset_document, dataset_provenance=dataset_provenance,
+                    ct_normalization=ct_normalization, frame_policy=configured_frame_policy(cfg),
+                    samples_seen=prior_samples+observed_states, identity_sampling=asdict(identity_sampling),
+                    run_config=run, training_options=vars(args), fiber_manifest=fiber_manifest(fibers))
                 if resumable:
                     extra.update(optimizer=opt.state_dict(), rng=training_rng_state())
                 save_checkpoint(path, model, ema, spec, sample, extra)
@@ -1504,7 +869,6 @@ def main(argv=None):
                 names = dataset.names if dataset_document else [primary_source.get('name', 'paris4')]
                 report = render_microbatch(ema, batches[-1], out, step, device=args.device,
                     n_commit=args.n_commit, tolerance=args.tolerance, dataset_names=names,
-                    memory=live_continuation, tube_sigma=args.tube_sigma,
                     training_metrics=dict(metrics, lr=lr, data_seconds=data_seconds,
                         update_seconds=update_seconds,
                         cuda_peak_allocated_gib=torch.cuda.max_memory_allocated(args.device)/2**30
@@ -1514,7 +878,6 @@ def main(argv=None):
             if tracer is not None and args.diag_every and step % args.diag_every == 0:
                 began = time.monotonic()
                 training_diagnostics(ema, diagnostic['cpu_batch'], tracer, val_f, manifest['monitor'], out, step, log,
-                    memory=live_continuation,
                                      device=args.device,dataset_name=next((s['name'] for s in dataset_document['sources']
                                          if s['kind']=='paris4'),None) if dataset_document else None)
                 if dataset_document:
@@ -1534,7 +897,7 @@ def main(argv=None):
                         finally:
                             source_tracer.close()
                     from vesuvius.neural_tracing.fiber_follow.evaluation.diag import plot_curves
-                    plot_curves(out/'log.jsonl',out/'curves.png',loss_key='flow' if model.cfg.model_type in FLOW_MODEL_TYPES else 'geometry')
+                    plot_curves(out/'log.jsonl',out/'curves.png',loss_key='flow' if model.cfg.model_type == 'flow' else 'geometry')
                 periodic['diagnostics_seconds'] = time.monotonic()-began
             if tracer is not None and args.long_diag_every and step % args.long_diag_every == 0:
                 from vesuvius.neural_tracing.fiber_follow.evaluation.seeds import evaluate

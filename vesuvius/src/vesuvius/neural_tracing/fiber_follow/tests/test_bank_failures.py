@@ -5,7 +5,7 @@ import pytest
 from test_neighbor_bank import make_bank, add_shard, publish
 from sampling_fixtures import clean_sample
 from vesuvius.neural_tracing.fiber_follow.data.bank_geometry import difficulty_scores, first_foreign_contact, tube_intervals, BankSwitchDetector
-from vesuvius.neural_tracing.fiber_follow.models.model import CoordinateRegressionConfig
+from model_fixtures import follower_config
 from vesuvius.neural_tracing.fiber_follow.tracing.collection import DecisionCollector, append_traces, collected_states
 from vesuvius.neural_tracing.fiber_follow.data.data import OnPolicyStates, TracedFiber
 from vesuvius.neural_tracing.fiber_follow.data.state_labels import FOLLOWING, REASON, REPLAY_CLASS, TERMINAL
@@ -55,7 +55,7 @@ def test_bank_lookup_uses_relationship_arcs_not_mining_anchor(tmp_path):
 def decision(pos, travelled, previous=None, *, stop=False, reverse=False):
     pos = np.asarray(pos, float)
     heading = np.array([0., 0., -1. if reverse else 1.])
-    cfg = CoordinateRegressionConfig()
+    cfg = follower_config()
     return dict(pos=pos, frame=frame_from_heading(heading),
         hist=pos-np.arange(1, cfg.n_history+1)[:, None]*heading,
         hmask=np.ones(cfg.n_history), would_stop=stop, n_commit=0 if stop else 4,
@@ -73,7 +73,7 @@ def test_close_neighbor_switch_is_terminal_before_distance_departure_and_saved(t
     reverse = True
     bank, parent = make_bank(tmp_path/'bank')
     publish(bank.root, [add_shard(bank.root, 0, x=3., z_range=(20., 180.))])
-    cfg = clean_sample(CoordinateRegressionConfig())
+    cfg = clean_sample(follower_config())
     start = 140. if reverse else 50.
     sign = -1 if reverse else 1
     collector = DecisionCollector(parent, 0, start, sign, cfg,
@@ -112,7 +112,7 @@ def test_close_neighbor_switch_is_terminal_before_distance_departure_and_saved(t
 def test_terminal_commit_keeps_event_without_inventing_decision(tmp_path):
     bank, parent = make_bank(tmp_path)
     publish(tmp_path, [add_shard(tmp_path, 0, x=3., z_range=(20.,180.))])
-    collector = DecisionCollector(parent, 0, 50., 1, clean_sample(CoordinateRegressionConfig()),
+    collector = DecisionCollector(parent, 0, 50., 1, clean_sample(follower_config()),
                                   bank_detector=BankSwitchDetector([bank]))
     assert collector(decision([0,0,50], 0.))
     collector.observe_final_path(np.array([[0.,0.,50.], [3.,0.,58.]]))

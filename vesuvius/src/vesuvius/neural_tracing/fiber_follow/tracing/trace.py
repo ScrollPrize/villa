@@ -19,7 +19,7 @@ from vesuvius.neural_tracing.fiber_follow.tracing.heading import trace_heading, 
 from vesuvius.neural_tracing.fiber_follow.tracing.crop_frames import frame_predictor, configured_frame_policy, predict_frames
 
 if TYPE_CHECKING:
-    from vesuvius.neural_tracing.fiber_follow.models.model import ObservationFollower as FollowNet
+    from torch.nn import Module as FollowNet
 
 
 @dataclass
@@ -178,10 +178,6 @@ class ModelTracer:
     def build_inputs(self, pos, frames, hist, hmask):
         raise NotImplementedError('Use the common observation tracer')
 
-    # Decision memory: each decision's encoder entry is recorded once and read by later
-    # decisions of the same trace; entries for a pre-existing prefix are encoded once
-    # from their crops. Records and features are pruned to what later selections can read.
-
     def sequence_attach(self, x, idx, sequence, pos, frames, length):
         """Sequence follower (models/sequence.py): each row reads its trace's earlier history tokens (per-layer
         states, at most ``history_limit`` most recent) with their pose in this decision's frame."""
@@ -234,57 +230,6 @@ class ModelTracer:
                     layer.append(value[0].float())
                 state['heads'].append(np.asarray(head, np.float64).copy())
                 state['travelled'].append(float(at))
-
-    @staticmethod
-    def memory_start(paths):
-        from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength
-        from vesuvius.neural_tracing.fiber_follow.data.decision_memory import simulated_decisions
-        memory = []
-        for path in paths:
-            path = np.asarray(path, np.float64)
-            records = simulated_decisions(path, arclength(path)) if len(path) > 1 else []
-            memory.append(dict(decisions=records, features={}, next_key=0))
-        return memory
-
-    def memory_attach(self, x, idx, memory):
-        """Replace memory crops by recorded features: (B, SLOTS, *cfg.memory_entry_shape)."""
-        encode, keys, valid = x['history_encode'], x['history_keys'].cpu().numpy(), x['history_valid'].cpu().numpy()
-        entries = self._memory_entries
-        features = torch.zeros((*encode.shape, *self.model.cfg.memory_entry_shape), device=encode.device,
-                               dtype=torch.bfloat16)
-        flat = encode.flatten().nonzero().flatten()
-        if len(flat):
-            with self.autocast():
-                fresh = self.model.encode_memory_crops(x, flat)
-            for value, cell in zip(fresh, flat.tolist()):
-                j, slot = divmod(cell, encode.shape[1])
-                state = memory[idx[j]]
-                record = entries[j][slot]['record']
-                record['key'], state['next_key'] = state['next_key'], state['next_key']+1
-                state['features'][record['key']] = value
-                keys[j, slot] = record['key']
-        for j, i in enumerate(idx):
-            for slot in np.flatnonzero(valid[j]):
-                features[j, slot] = memory[i]['features'][int(keys[j, slot])]
-        for key in ('history_crops', 'history_references', 'history_reference_mask'):
-            x.pop(key)
-        x['history_encode'] = torch.zeros_like(encode)
-        x['history_features'] = features
-
-    @staticmethod
-    def memory_record(entries, idx, pos, frames, paths, memory):
-        from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength
-        from vesuvius.neural_tracing.fiber_follow.models.decision_memory import prune_decisions
-        for j, i in enumerate(idx):
-            state = memory[i]
-            length = float(arclength(np.asarray(paths[i], np.float64))[-1])
-            key, state['next_key'] = state['next_key'], state['next_key']+1
-            state['features'][key] = entries[j].detach()
-            records = state['decisions']+[dict(travelled=length, pos=pos[j].copy(), frame=frames[j].copy(), key=key)]
-            records = [records[k] for k in prune_decisions([r['travelled'] for r in records], length)]
-            kept = {r['key'] for r in records}
-            state['features'] = {k: v for k, v in state['features'].items() if k in kept}
-            state['decisions'][:] = records
 
     @torch.no_grad()
     def trace(self, seeds_xyz, headings, histories=None, abort=None, on_decision=None, initial_states=None, families=None):
@@ -353,7 +298,6 @@ class ModelTracer:
         if initial_states is not None:
             for reference, state in zip(references, initial_states):
                 reference.update({k: state[k] for k in SEED_FIELDS if k in state})
-        memory = self.memory_start(paths) if getattr(self.model.cfg, 'memory', 'slabs') == 'decisions' else None
         sequence = ([dict(layers=[[] for _ in range(self.model.cfg.layers)], heads=[], travelled=[]) for _ in range(n)]
                     if getattr(self.model.cfg, 'model_type', '') == 'sequence' else None)
         active = np.ones(n, bool)
@@ -384,17 +328,11 @@ class ModelTracer:
                                          seed_segment=np.asarray(paths[i][hist_start[i]:hist_start[i]+64]),
                                          travelled=float(length[i]),
                                          **{**references[i], 'seed_age': references[i]['seed_age']+float(length[i])}) for i in idx]
-                if memory is not None:
-                    for path, i in zip(context['paths'], idx):
-                        path['memory_decisions'] = memory[i]['decisions']
             x = self.build_inputs(pos, fr, hist, hm, **context)
-            if memory is not None:
-                self.memory_attach(x, idx, memory)
             if sequence is not None:
                 self.sequence_attach(x, idx, sequence, pos, fr, length)
             sampling = {}
-            if (hasattr(self.model, 'select_prediction')
-                    or getattr(self.model.cfg, 'candidate_selection', 'prefix') == 'stop_fallback'):
+            if hasattr(self.model, 'select_prediction'):
                 sampling.update(confidence_threshold=pp.confidence,
                                 n_commit=selection_window(pp.n_commit, gate_horizon(self.model.cfg), pp.gate))
             if getattr(self.model.cfg, 'flow_samples', 0):
@@ -405,8 +343,6 @@ class ModelTracer:
             commits, allowed = commit_count(out['points'], out['confidence'], pp.confidence, pp.n_commit,
                                             self.model.cfg.max_recovery_distance, pp.gate, gate_horizon(self.model.cfg))
             commits, allowed = [v.cpu().numpy() for v in (commits, allowed)]
-            if memory is not None:
-                self.memory_record(out['memory_entry'], idx, pos, fr, paths, memory)
             points, confidence = [out[k].float().cpu().numpy() for k in ('points', 'confidence')]
             # Next-step CT frames, resolved together after this step's commits.
             # Each depends only on its own trace, so the pool is a pure speedup.

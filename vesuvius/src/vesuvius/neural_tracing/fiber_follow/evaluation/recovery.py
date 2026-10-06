@@ -26,18 +26,25 @@ def monitor_fixture(path, fibers, manifest, sample, spec, seed_count=8):
     provenance = json.loads(json.dumps(provenance))
     if path.exists():
         states = OnPolicyStates.load(path)
-        states.validate_fibers(fibers)
         recorded = json.loads(json.dumps(states.provenance))
-        # Fixture states do not depend on the confidence-label tolerance: evaluation
-        # relabels every state under the current sample configuration.
-        # The CT location (volume spec, the manifest hash covering it, seed headings re-read from it) may move, e.g.
-        # from a local mirror to its S3 store: the states are geometry and evaluation reads the current volume. The
-        # seed fibers and every construction setting must still match.
+        # Fixture states do not depend on the confidence-label tolerance: evaluation relabels every state under the
+        # current sample configuration. The CT location (volume spec, the manifest hash covering it, seed headings
+        # re-read from it) may move; the states are geometry and evaluation reads the current volume. Settings this
+        # code no longer has are ignored.
+        sample_keys = set(provenance['sample_cfg'])-{'label_tolerance'}
         unlabeled = lambda value: dict({k: v for k, v in value.items() if k not in ('volume', 'seed_manifest_sha256', 'seeds')},
-                                       sample_cfg={k: v for k, v in value.get('sample_cfg', {}).items() if k != 'label_tolerance'},
+                                       sample_cfg={k: v for k, v in value.get('sample_cfg', {}).items() if k in sample_keys},
                                        seed_fibers=[seed['fiber'] for seed in value.get('seeds', [])])
-        if unlabeled(recorded) != unlabeled(provenance):
-            raise ValueError('Monitor recovery fixture settings changed')
+        try:
+            states.validate_fibers(fibers)
+            if unlabeled(recorded) != unlabeled(provenance):
+                raise ValueError('its settings differ from this run')
+        except ValueError as error:
+            previous = path.with_name(path.stem+'.previous.npz')
+            print(f'Warning: rebuilding the monitor recovery fixture ({error}); the old one is kept as {previous}',
+                  flush=True)
+            path.replace(previous)
+            return monitor_fixture(path, fibers, manifest, sample, spec, seed_count)
     else:
         states = make_recovery_states(fibers, seeds, sample, provenance, FiberVolume(spec, cache_bytes=256 << 20))
         states.save(path)

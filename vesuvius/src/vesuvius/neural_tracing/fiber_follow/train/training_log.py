@@ -3,7 +3,6 @@ import json
 
 
 from vesuvius.neural_tracing.fiber_follow.tracing.policy import DIAGNOSTIC_THRESHOLDS
-from vesuvius.neural_tracing.fiber_follow.models.identity_verifier import VERIFY_METRICS
 
 
 def _rate(n, d):
@@ -106,45 +105,16 @@ class SamplingLedger:
         return result
 
 
-def _verification_lines(m):
-    """Accuracy with memory / shuffled memory / no memory: head-axis groups, decisive pairs, dense samples
-    by path stratum and the model's own predicted points."""
-    def rate(name):
-        count = m.get(f'verify_{name}_count', 0)
-        return f"{m.get(f'verify_{name}_correct', 0)/max(1, count):.1%}" if count else 'n/a'
-
-    lines = [f"  identity verification: loss {m.get('verify_loss_sum', 0.)/max(1, m['verify_states']):.3f}"
-             f" over {int(m['verify_states'])} states | original fiber ranks first in"
-             f" {m.get('verify_listwise_correct', 0)/max(1, m.get('verify_listwise_planes', 0)):.1%}"
-             f" of {int(m.get('verify_listwise_planes', 0))} planes"]
-    for name, label in (('own', 'on original'), ('switched_recent', 'switched <=64 vox'),
-                        ('switched_old', 'switched >64 real'), ('switched_old_synthetic', 'switched >64 synthetic'),
-                        ('pair_old', 'original beats path >64 real'),
-                        ('pair_old_synthetic', 'original beats path >64 synthetic'),
-                        ('dense_path_on', 'dense on path, on original'), ('dense_path_off', 'dense on path, off original'),
-                        ('dense_away_on', 'dense off path, on original'), ('dense_away_off', 'dense off path, off original'),
-                        ('predicted_on', 'own prediction on original'), ('predicted_off', 'own prediction off original')):
-        lines.append(f"    {label} ({int(m.get(f'verify_{name}_count', 0))}): memory {rate(name)}"
-                     f" | shuffled memory {rate('shuffled_'+name)} | no memory {rate('empty_'+name)}")
-    return lines
-
-
 class TrainingInterval:
     """Pool counts and weight decision-normalized means by supervised decisions."""
     means = ('loss', 'geometry', 'confidence_loss', 'refinement_attempts_mean')
-    counts = tuple(p+'_'+s for p in ('ct_frame', 'history_frame')
+    counts = tuple(p+'_'+s for p in ('ct_frame',)
                    for s in ('count', 'transported', 'deterministic', 'learned', 'energy_sum', 'gap_sum')) + (
               'live_depth_sum', 'live_travelled_sum', 'live_rows', 'live_terminal_rows',
               'ct_frame_rejected_batches', 'error_sum', 'geometry_count', 'point_correct_count', 'point_wrong_count',
-              'point_unknown_count', 'supervised_states', 'observation_only_states', 'history_valid_slabs', 'history_age_sum', 'history_overlap_sum', 'history_load_seconds', 'history_encode_seconds',
+              'point_unknown_count', 'supervised_states', 'observation_only_states',
               'confidence_labeled_states', 'confidence_terminal_states', 'confidence_recoverable_states',
-              'connector_rejected_targets', 'refinement_attempts_sum', 'tube_loss_sum', 'tube_states',
-              'memory_recorded', 'memory_missing', 'memory_encoded', 'memory_identity_loss_sum',
-              'memory_identity_states', 'memory_identity_pairs', 'memory_identity_correct',
-              'memory_identity_anchor_pairs', 'memory_identity_anchor_correct',
-              'memory_identity_control_pairs', 'memory_identity_control_correct',
-              *(f'memory_identity_{group}_{kind}' for group in ('departed_recent', 'departed_old', 'departed_old_afv')
-                for kind in ('pairs', 'correct')), *VERIFY_METRICS)
+              'connector_rejected_targets', 'refinement_attempts_sum')
 
     def __init__(self):
         self.values = dict(updates=0, crops=0, decisions=0)
@@ -167,13 +137,9 @@ class TrainingInterval:
         self.values['decisions'] += decisions
         for key in self.means + self.counts:
             self.values[key] = self.values.get(key, 0.)+row.get(key, 0.)*(decisions if key in self.means else 1)
-        for group in ('history', 'rest'):
-            if group+'_grad_norm' not in row:  # no memory encoder: no history clipping group
-                continue
-            key = group+'_grad_norm'
-            self.values[key+'_max'] = max(self.values.get(key+'_max', 0.), row.get(key, 0.))
-            key = group+'_clipped_updates'
-            self.values[key] = self.values.get(key, 0)+int(row.get(group+'_grad_clip_scale', 1.) < 1.)
+        if 'grad_norm' in row:
+            self.values['grad_norm_max'] = max(self.values.get('grad_norm_max', 0.), row['grad_norm'])
+            self.values['clipped_updates'] = self.values.get('clipped_updates', 0)+int(row.get('grad_clip_scale', 1.) < 1.)
 
     def summary(self):
         result = dict(self.values)
@@ -199,31 +165,9 @@ def _interval_training_lines(row):
              f" | {m['refinement_attempts_mean']:.2f} attempts/decision"]
     if row.get('cuda_peak_allocated_gib') is not None:
         lines[-1] += f" | peak allocated VRAM {row['cuda_peak_allocated_gib']:.2f} GiB (session)"
-    if m.get('history_valid_slabs') or m.get('history_encode_seconds'):  # memory models only
-        slabs = max(1., m.get('history_valid_slabs', 0.))
-        lines.append(f"  historical slabs: {m.get('history_valid_slabs', 0.)/max(1, m['decisions']):.2f}/decision"
-                     f" | age {m.get('history_age_sum', 0.)/slabs:.1f} voxels"
-                     f" | current-crop overlap {m.get('history_overlap_sum', 0.)/slabs:.1%}"
-                     f" | load {m.get('history_load_seconds', 0.):.3f}s"
-                     f" | encode {m.get('history_encode_seconds', 0.):.3f}s")
-    if m.get('tube_states'):
-        lines.append(f"  tube loss {m['tube_loss_sum']/m['tube_states']:.4f} ({int(m['tube_states'])} states)")
-    if any(m.get(key) for key in ('memory_recorded', 'memory_missing', 'memory_encoded')):
-        lines.append(f"  decision memory: recorded {int(m.get('memory_recorded', 0))}"
-                     f" | encoded from crops {int(m.get('memory_encoded', 0))}"
-                     f" | missing {int(m.get('memory_missing', 0))}")
-    if m.get('memory_identity_pairs') or m.get('memory_identity_anchor_pairs'):
-        rate = lambda name: (f"{m.get(f'memory_identity_{name}correct', 0)/max(1, m.get(f'memory_identity_{name}pairs', 0)):.1%}"
-                             f" of {int(m.get(f'memory_identity_{name}pairs', 0))}")
-        lines.append(f"  memory identity: InfoNCE {m['memory_identity_loss_sum']/max(1, m['memory_identity_states']):.3f}"
-                     f" | query rank {rate('')} | anchor rank {rate('anchor_')} | shuffled-anchor control {rate('control_')}")
-        lines.append(f"    departed query rank: recent (<=24 vox) {rate('departed_recent_')}"
-                     f" | old (>24) {rate('departed_old_')} | old AFV {rate('departed_old_afv_')}")
-    if m.get('verify_states'):
-        lines.extend(_verification_lines(m))
     lines.append(f"  supervision: {int(m['decisions'])} decisions / {int(m['crops'])} observations")
     frames = []
-    for prefix, label in (('ct_frame', 'current'), ('history_frame', 'history')):
+    for prefix, label in (('ct_frame', 'current'),):
         count = m.get(prefix+'_count', 0)
         if count:
             transported, deterministic = (int(m.get(prefix+'_'+key, 0)) for key in ('transported', 'deterministic'))
@@ -266,9 +210,8 @@ def _interval_training_lines(row):
                      f" | source age mean {_number(entry['source_age_mean'], '.0f')} max {entry['source_age_max']}"
                      f" | startup {entry['startup_requested']} -> seed ages {entry['seed_age']}"
                      f" | replay travel {entry['replay_travel']} | {entry['counters']}")
-    lines.append('  gradients: '+' | '.join(
-        f"{name} max {m[name+'_grad_norm_max']:.2g}, clipped {m[name+'_clipped_updates']}/{updates} updates"
-        for name in ('history', 'rest') if name+'_grad_norm_max' in m))
+    if 'grad_norm_max' in m:
+        lines.append(f"  gradients: max {m['grad_norm_max']:.2g}, clipped {m['clipped_updates']}/{updates} updates")
     return lines
 
 
@@ -313,10 +256,8 @@ def _direct_training_lines(row):
         lines.insert(0, f"  recent speed {row['interval_samples_per_second']:.2f} samples/s"
                         f" | data wait {row['interval_data_seconds']:.2f}s"
                         f" | optimizer {row['interval_update_seconds']:.2f}s per logging interval")
-    if 'history_grad_norm' in row:
-        lines.append(f"  gradients before clipping: history {row['history_grad_norm']:.3g}"
-                     f" (scale {row['history_grad_clip_scale']:.3g})"
-                     f" | rest {row['rest_grad_norm']:.3g} (scale {row['rest_grad_clip_scale']:.3g})")
+    if 'grad_norm' in row:
+        lines.append(f"  gradients before clipping: {row['grad_norm']:.3g} (scale {row['grad_clip_scale']:.3g})")
     if 'identity' in row:
         lines.extend(_identity_lines(row['identity']))
     if 'decisions' in row:
@@ -338,11 +279,11 @@ def _identity_lines(stats):
 def format_training_log(row):
     step = f"Step {row['step']:,}" if 'step' in row else 'Training'
     if row.get('event') == 'resume_configuration':
-        options = row.get('training_options', {})
+        options = row.get('run_config', {}).get('training', {})
         return (f"{step} | resumed {row['checkpoint']}\n"
-                f"  commit {options.get('n_commit', '?')} | historical slabs: 8 slots, minimum spacing 32 vox"
+                f"  commit {options.get('n_commit', '?')}"
                 f" | batch {options.get('batch', '?')} / grad steps {options.get('grad_steps', '?')}"
-                f"\n  live CT/path slabs | causal survival confidence")
+                f" | causal survival confidence")
     if row.get('event') == 'identity_sampling':
         bank = row.get('negative_bank_provenance') or {}
         return (f"{step} | identity sampling"

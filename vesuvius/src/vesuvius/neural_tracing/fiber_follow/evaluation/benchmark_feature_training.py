@@ -14,7 +14,6 @@ import numpy as np
 import torch
 
 from vesuvius.neural_tracing.fiber_follow.train import train
-from vesuvius.neural_tracing.fiber_follow.train.train import options_argv
 from vesuvius.neural_tracing.fiber_follow.train.runloop import training_rng_state
 
 
@@ -34,7 +33,8 @@ def main():
         ap.error('Need a fresh directory, updates > warmup, and nonnegative workers')
     source = args.checkpoint.resolve()
     ck = torch.load(source, map_location='cpu', weights_only=False)
-    options = vars(train.build_parser().parse_args(options_argv(ck['training_options'])))
+    run = json.loads(json.dumps(ck['run_config']))
+    options = run['training']
     if ck['step']+args.updates >= options['steps']:
         ap.error('Source training schedule must extend beyond the requested benchmark')
     for name in ('ckpt_every', 'diag_every', 'long_diag_every', 'dagger_every', 'recovery_every'):
@@ -43,14 +43,13 @@ def main():
             ap.error(f'Bounded benchmark must not cross {name} boundary')
     destination = args.out.resolve()
     cp = destination/source.name
-    options.update(name=destination.name, out_root=str(destination.parent), resume=str(cp),
-                   workers=args.workers, log_every=10)
+    run.update(name=destination.name, out_root=str(destination.parent))
+    run['runtime']['workers'] = args.workers
+    options['log_every'] = 10
     destination.mkdir(parents=True)
-    staged = dict(ck, training_options=options)
+    staged = dict(ck, run_config=run)
     torch.save(staged, cp)
-    config = json.loads((source.parent/'config.json').read_text())
-    config.update(options, model_cfg=ck['model_cfg'])
-    (destination/'config.json').write_text(json.dumps(config, indent=2))
+    (destination/'benchmark_run.json').write_text(json.dumps(run, indent=2))
     if options['recovery_every']:
         shutil.copy2(source.parent/'monitor_recovery.npz', destination/'monitor_recovery.npz')
     (destination/'dagger').mkdir()
@@ -78,7 +77,7 @@ def main():
                    compiled_graphs=counters['stats']['unique_graphs']-graphs_before,
                    peak_allocated_gib=torch.cuda.max_memory_allocated()/2**30,
                    peak_reserved_gib=torch.cuda.max_memory_reserved()/2**30,
-                   **{k: v for k, v in metrics.items() if k in ('loss', 'grad_norm', 'observed_states', 'endpoint_states', 'supervised_states', 'history_valid_slabs', 'history_encode_seconds') or k.startswith('replay_')})
+                   **{k: v for k, v in metrics.items() if k in ('loss', 'grad_norm', 'observed_states', 'endpoint_states', 'supervised_states') or k.startswith('replay_')})
         rows.append(row)
         with (destination/'timings.jsonl').open('a') as f:
             f.write(json.dumps(row)+'\n')
@@ -93,7 +92,7 @@ def main():
 
     train.optimizer_update = measured
     try:
-        train.main(options_argv(options))
+        train.main(['--config', str(destination/'benchmark_run.json'), '--resume', str(cp)])
     except BenchmarkComplete:
         pass
     finally:
@@ -109,8 +108,6 @@ def main():
         peak_allocated_gib=max(r['peak_allocated_gib'] for r in measured_rows),
         peak_reserved_gib=max(r['peak_reserved_gib'] for r in measured_rows),
         supervised_states=sum(r['supervised_states'] for r in measured_rows),
-        history_valid_slabs=sum(r['history_valid_slabs'] for r in measured_rows),
-        history_encode_seconds=sum(r['history_encode_seconds'] for r in measured_rows),
         samples=rows)
     (destination/'benchmark.json').write_text(json.dumps(result, indent=2))
     print(json.dumps({k: v for k, v in result.items() if k not in ('samples', 'options', 'config')}), flush=True)

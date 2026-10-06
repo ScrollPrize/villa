@@ -42,8 +42,8 @@ def test_retries_end_at_the_gate_plane_not_the_last_plane():
         confidence = last(*args)['refinement_confidence'][0, 0]
         assert confidence[1] > confidence[3]
         threshold = float(confidence[1]+confidence[3])/2  # plane 2 passes, plane 4 fails
-        assert last(*args, confidence_threshold=threshold)['refinement_mask'].shape[1] > 1  # retried
-        assert gated(*args, confidence_threshold=threshold)['refinement_mask'].shape[1] == 1  # accepted at plane 2
+        assert last(*args, confidence_threshold=threshold)['refinement_mask'][0, 1:].any()  # retried
+        assert not gated(*args, confidence_threshold=threshold)['refinement_mask'][0, 1:].any()  # accepted at plane 2
         t = torch.tensor(threshold)
         assert last.training_forward(*args, t)['refinement_mask'][0, 1:].any()
         assert not gated.training_forward(*args, t)['refinement_mask'][0, 1:].any()

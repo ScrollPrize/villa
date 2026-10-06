@@ -1,4 +1,5 @@
-"""Aligned direct follower: forward contracts, optimizer updates, checkpoints, CT crops and run diagnostics."""
+"""Regression follower (models/crop_transformer.py): forward contracts, optimizer updates, checkpoints, CT crops and
+run diagnostics."""
 import copy
 from dataclasses import replace
 from types import SimpleNamespace
@@ -7,10 +8,10 @@ import numpy as np
 import pytest
 import torch
 
-from vesuvius.neural_tracing.fiber_follow.models.model import CoordinateRegressionFollower, build_model, feature_grid
+from vesuvius.neural_tracing.fiber_follow.models.model import build_model, config_from_checkpoint, feature_grid
 from vesuvius.neural_tracing.fiber_follow.train.supervision import geometry_mask, loss_terms
 from vesuvius.neural_tracing.fiber_follow.train import train
-from vesuvius.neural_tracing.fiber_follow.train.train import MODEL_TYPES, checkpoint_config, clip_training_gradients, initialize_training_optimizer, load_checkpoint, optimizer_update, prepare_training, save_checkpoint
+from vesuvius.neural_tracing.fiber_follow.train.train import clip_training_gradients, initialize_training_optimizer, load_checkpoint, optimizer_update, prepare_training, save_checkpoint
 from vesuvius.neural_tracing.fiber_follow.data.observations import image_crop
 from vesuvius.neural_tracing.fiber_follow.data.data import SampleConfig, TracedFiber, fiber_identities, fiber_manifest
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, crop_local_grid, sample_oriented_fast
@@ -22,7 +23,7 @@ from model_fixtures import coordinate_batch, coordinate_config, batch as label_b
 
 
 def config(**kwargs):
-    """Small coordinate regression model; one refinement unless refinement is the subject."""
+    """Small regression model; one refinement unless refinement is the subject."""
     return coordinate_config(**{'recurrent_refinement_steps': 1, **kwargs})
 
 
@@ -34,9 +35,9 @@ def take(value, sl):
     return {k: take(v, sl) for k, v in value.items()} if isinstance(value, dict) else value[sl]
 
 
-def test_coordinate_forward_is_deterministic_causal_and_trainable():
+def test_regression_forward_is_deterministic_causal_and_trainable():
     torch.manual_seed(20)
-    m = CoordinateRegressionFollower(config())
+    m = build_model(config())
     b = batch(m.cfg)
     b['hmask'][0] = 0
     b['x']['seed'][:] = torch.tensor([100., 100., 100.])  # outside the crop
@@ -53,18 +54,15 @@ def test_coordinate_forward_is_deterministic_causal_and_trainable():
     hidden['gt_history'] = torch.full_like(hidden['hist'], float('nan'))
     for key in ('seed', 'seed_tangent', 'seed_age'):
         x[key] = torch.full_like(x[key], float('nan'))
-    x['history_slabs'][~x['history_valid']] = float('nan')
-    x['history_path_points'][~x['history_path_valid']] = float('nan')
     x['path_geometry'][~x['path_geometry_valid'].bool()] = float('nan')
     other = forward(m, hidden)
     for key in out:
         assert torch.isfinite(other[key]).all(), key
         torch.testing.assert_close(out[key], other[key], rtol=0, atol=0)
     loss_terms(out, b, m.cfg)['geometry_per_state'].mean().backward()
-    for module in (m.coordinates, m.encoder.patch_projection, m.reference_token[0]):
+    for module in (m.coordinates, m.cnn.stages[0].blocks[0].conv1.conv, m.cell_token, m.reference_token[0]):
         assert module.weight.grad is not None and module.weight.grad.abs().sum() > 0
-    for module in (m.encoder.stem, m.history_encoder):
-        assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in module.parameters())
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in m.path_geometry.parameters())
 
 
 def test_departures_unknown_ends_and_crop_censoring():
@@ -97,7 +95,7 @@ def test_optimizer_update_partition_metrics_and_sampling_ledger():
     """Microbatches keep the objective and update; metrics and the ledger don't change training or RNG."""
     torch.manual_seed(3)
     cfg = config()
-    a = CoordinateRegressionFollower(cfg)
+    a = build_model(cfg)
     bmodel = copy.deepcopy(a)
     data = batch(cfg, 2)
     data['dense_mask'][0, 5:] = 0
@@ -105,10 +103,7 @@ def test_optimizer_update_partition_metrics_and_sampling_ledger():
     data.update(source=torch.tensor([0, 2]), task_requested=torch.tensor([0, 6]), task_delivered=torch.tensor([0, 0]),
                 task_fallback=torch.tensor([0, 1]), ct_frame_rejected_batches=torch.tensor([3, 0]))
     data['x'].update(ct_frame_source=torch.tensor([0, 2]),
-                     ct_frame_energy=torch.tensor([.2, 0.]), ct_frame_gap=torch.tensor([.8, 0.]),
-                     history_frame_source=torch.tensor([[0, 1, -1], [2, -1, -1]]),
-                     history_frame_energy=torch.tensor([[.1, 0., 0.], [0., 0., 0.]]),
-                     history_frame_gap=torch.tensor([[.6, 0., 0.], [0., 0., 0.]]))
+                     ct_frame_energy=torch.tensor([.2, 0.]), ct_frame_gap=torch.tensor([.8, 0.]))
     averages = [copy.deepcopy(m) for m in (a, bmodel)]
     optimizers = [torch.optim.SGD(m.parameters(), lr=.001) for m in (a, bmodel)]
     for model in (a, bmodel):
@@ -132,8 +127,6 @@ def test_optimizer_update_partition_metrics_and_sampling_ledger():
     assert metrics['refinement_attempts_sum'] >= 2
     assert metrics['ct_frame_rejected_batches'] == 3
     assert (metrics['ct_frame_count'], metrics['ct_frame_transported'], metrics['ct_frame_deterministic']) == (2, 0, 1)
-    assert (metrics['history_frame_count'], metrics['history_frame_transported'],
-            metrics['history_frame_deterministic']) == (3, 1, 1)
     sampling = ledger.summary()['0']
     assert sampling['requested_share'] == dict(fresh=.5, dagger_ordinary=.5)
     assert sampling['delivered_share'] == dict(fresh=1.)
@@ -145,54 +138,46 @@ def test_optimizer_update_partition_metrics_and_sampling_ledger():
     interval.add(metrics)
     interval.add(metrics)
     summary = interval.summary()
-    assert summary['ct_frame_count'] == 4 and summary['history_frame_count'] == 6
+    assert summary['ct_frame_count'] == 4
     printed = format_training_log(dict(step=50, geometry=1., loss=1., lr=.001, interval=summary,
         n_future=4, tolerance=1.5, sampling=ledger.summary(), interval_update_seconds=1.,
         interval_data_seconds=.1, interval_samples_per_second=4.))
     assert 'source 0: requested dagger_ordinary 50%, fresh 50% | delivered fresh 100%' in printed
     assert "fallbacks {'dagger_ordinary->fresh': 1}" in printed
     assert 'current 2/4 fallbacks (0 transported, 2 deterministic); mean gap 0.400' in printed
-    assert 'history 4/6 fallbacks (2 transported, 2 deterministic); mean gap 0.200' in printed
 
 
-def test_gradient_clipping_groups_and_guards():
-    def model(history, rest):
+def test_gradient_clipping_and_guards():
+    def model(gradient):
         module = torch.nn.Module()
-        module.history_encoder = torch.nn.Linear(2, 1, bias=False)
-        module.encoder = torch.nn.Linear(2, 1, bias=False)
-        module.history_encoder.weight.grad = torch.tensor([history])
-        module.encoder.weight.grad = torch.tensor([rest])
+        module.a, module.b = torch.nn.Linear(2, 1, bias=False), torch.nn.Linear(2, 1, bias=False)
+        module.a.weight.grad, module.b.weight.grad = torch.tensor([gradient[:2]]), torch.tensor([gradient[2:]])
         return module
-    m = model([3e6, 4e6], [3., 4.])
-    metrics = clip_training_gradients(m, 5., 20.)
-    torch.testing.assert_close(m.history_encoder.weight.grad, torch.tensor([[3., 4.]]))
-    torch.testing.assert_close(m.encoder.weight.grad, torch.tensor([[3., 4.]]), rtol=0, atol=0)
-    assert metrics['history_grad_norm'] == pytest.approx(5e6) and metrics['rest_grad_norm'] == 5.
-    assert metrics['history_grad_clip_scale'] == pytest.approx(1e-6) and metrics['rest_grad_clip_scale'] == 1.
-    for history_cap, rest_cap in [(0., 20.), (5., 0.)]:
-        m = model([30., 40.], [30., 40.])
-        result = clip_training_gradients(m, history_cap, rest_cap)
-        assert m.history_encoder.weight.grad.norm().item() == pytest.approx(history_cap or 50.)
-        assert m.encoder.weight.grad.norm().item() == pytest.approx(rest_cap or 50.)
-        assert result['history_grad_norm'] == result['rest_grad_norm'] == 50.
-    for bad in ('history_encoder', 'encoder'):
-        m = model([100., 100.], [100., 100.])
-        getattr(m, bad).weight.grad.fill_(float('inf'))
-        with pytest.raises(RuntimeError, match='non-finite'):
-            clip_training_gradients(m, 5., 5.)
-        good = 'encoder' if bad == 'history_encoder' else 'history_encoder'
-        assert (getattr(m, good).weight.grad == 100.).all()
+    m = model([30., 0., 0., 40.])
+    metrics = clip_training_gradients(m, 5.)
+    torch.testing.assert_close(m.a.weight.grad, torch.tensor([[3., 0.]]))
+    torch.testing.assert_close(m.b.weight.grad, torch.tensor([[0., 4.]]))
+    assert metrics['grad_norm'] == 50. and metrics['grad_clip_scale'] == pytest.approx(.1)
+    m = model([3., 0., 0., 4.])
+    assert clip_training_gradients(m, 20.)['grad_clip_scale'] == 1.
+    torch.testing.assert_close(m.b.weight.grad, torch.tensor([[0., 4.]]), rtol=0, atol=0)
+    m = model([30., 0., 0., 40.])
+    assert clip_training_gradients(m, 0.)['grad_norm'] == 50. and m.b.weight.grad.norm() == 40.  # 0 disables
+    m = model([100., 100., 100., 100.])
+    m.a.weight.grad.fill_(float('inf'))
+    with pytest.raises(RuntimeError, match='non-finite'):
+        clip_training_gradients(m, 5.)
+    assert (m.b.weight.grad == 100.).all()
     for bad in (-1., float('nan'), float('inf')):
-        for limits in ((bad, 20.), (5., bad)):
-            with pytest.raises(ValueError, match='finite and nonnegative'):
-                clip_training_gradients(torch.nn.Linear(2, 1), *limits)
+        with pytest.raises(ValueError, match='finite and nonnegative'):
+            clip_training_gradients(torch.nn.Linear(2, 1), bad)
 
 
 def test_nonfinite_microbatch_loss_raises_before_any_update():
     """Loss sums are read once per update; a nonfinite microbatch still blocks the step."""
     torch.manual_seed(4)
     cfg = config()
-    model = CoordinateRegressionFollower(cfg)
+    model = build_model(cfg)
     data = batch(cfg, 2)
     poisoned = take(data, slice(1, 2))
     poisoned['x']['fine'] = torch.full_like(poisoned['x']['fine'], float('nan'))
@@ -211,7 +196,7 @@ def test_training_compilation_emulates_eager_bf16_rounding(monkeypatch):
     monkeypatch.setattr(torch._inductor.config, 'emulate_precision_casts', False)
     compiled = []
     monkeypatch.setattr(torch, 'compile', lambda module, **kwargs: compiled.append((module, kwargs)) or module)
-    model = CoordinateRegressionFollower(config())
+    model = build_model(config())
     parameters, keys = list(model.parameters()), list(model.state_dict())
     assert prepare_training(model) is model
     assert not hasattr(model, '_orig_mod')
@@ -230,7 +215,7 @@ def test_checkpoint_resume_init_weights_and_model_type_contract(tmp_path, resume
     torch.manual_seed(7)
     cfg = config()
     args = SimpleNamespace(reset_optimizer=False, lr=.001)
-    m = CoordinateRegressionFollower(cfg)
+    m = build_model(cfg)
     ema = copy.deepcopy(m)
     opt, done, origin = initialize_training_optimizer(m, ema, args)
     assert done == origin == 0
@@ -247,7 +232,7 @@ def test_checkpoint_resume_init_weights_and_model_type_contract(tmp_path, resume
     torch.testing.assert_close(forward(loaded, data)['points'], forward(ema, data)['points'], rtol=0, atol=0)
     assert crop == cfg.fine and nh == cfg.n_history and loaded_spec == spec
     # Resume restores optimizer, RNG stream and schedule origin: the next update is identical.
-    restored = CoordinateRegressionFollower(cfg)
+    restored = build_model(cfg)
     restored_ema = copy.deepcopy(restored)
     args.lr = resume_lr
     restored_opt, done, origin = initialize_training_optimizer(restored, restored_ema, args, ck)
@@ -258,15 +243,24 @@ def test_checkpoint_resume_init_weights_and_model_type_contract(tmp_path, resume
     optimizer_update(restored, restored_ema, restored_opt, [data], 2, resume_lr, compute_metrics=False)
     for p, q in zip(m.parameters(), restored.parameters()):
         torch.testing.assert_close(p, q, rtol=0, atol=0)
-    # --init-weights: the launcher's architecture flags must match; model and EMA load strictly.
-    initial = read_checkpoint(path, MODEL_TYPES, 'cpu')
-    assert checkpoint_config(initial) == cfg
-    fresh, fresh_ema = train.initialize_model_weights(checkpoint_config(initial), 'cpu', initial)
+    # init_weights: model and EMA tensors load by name and shape; the run's own architecture is built.
+    initial = read_checkpoint(path, 'cpu')
+    assert config_from_checkpoint(initial) == cfg
+    fresh, fresh_ema = train.initialize_model_weights(config_from_checkpoint(initial), 'cpu', initial)
+    assert fresh.initialization_report == dict(fresh=[], unexpected=[], mismatched=[])
     for key, module in (('model', fresh), ('ema', fresh_ema)):
         for name, value in module.state_dict().items():
             torch.testing.assert_close(value, initial[key][name], rtol=0, atol=0)
+    wider, _ = train.initialize_model_weights(replace(cfg, ffn=64), 'cpu', initial, exclude=('hazard',))
+    report = wider.initialization_report
+    assert report['mismatched'] and all('.ffn.' in name for name in report['mismatched'])
+    assert {'hazard.weight', 'hazard.bias'} <= set(report['fresh']) and not report['unexpected']
+    torch.testing.assert_close(wider.cell_token.weight, initial['model']['cell_token.weight'], rtol=0, atol=0)
     with pytest.raises(ValueError, match='Unsupported'):
-        checkpoint_config(dict(initial, model_type='unsupported'))
+        config_from_checkpoint(dict(initial, model_type='unsupported'))
+    torch.save(dict(initial, model_type='unified'), tmp_path/'legacy.pt')
+    with pytest.raises(ValueError, match='convert_checkpoint'):
+        read_checkpoint(tmp_path/'legacy.pt', 'cpu')
     # The init fiber check compares identities: repaired geometry passes, a changed source does not.
     arc = np.arange(50.)
     fiber = TracedFiber('f', np.c_[arc*0, arc*0, arc], arc, '', source_hash='abc')
@@ -281,8 +275,8 @@ def test_inference_checkpoint_keeps_checkpoint_storage_on_cpu(monkeypatch):
     spec = FiberVolumeSpec('unused', ct_zarr='unused')
     ck = dict(ema={}, vol_spec=spec.to_dict())
     calls = []
-    monkeypatch.setattr(train, 'read_checkpoint', lambda path, arch, device: calls.append(('read', device)) or ck)
-    monkeypatch.setattr(train, 'checkpoint_config', lambda checkpoint: cfg)
+    monkeypatch.setattr(train, 'read_checkpoint', lambda path, device: calls.append(('read', device)) or ck)
+    monkeypatch.setattr(train, 'config_from_checkpoint', lambda checkpoint: cfg)
     class Model:
         def to(self, device, **kwargs):
             calls.append(('model', device))
@@ -453,7 +447,8 @@ def test_monitor_fixtures_are_fixed_private_rng_and_exclude_other_splits(tmp_pat
     assert all(lo <= d < hi for d, (lo, hi) in zip(a.match_distance, FIXTURE_STRATA))
     torch.testing.assert_close(torch_state, torch.get_rng_state())
     np.testing.assert_array_equal(numpy_state[1], np.random.get_state()[1])
-    with pytest.raises(ValueError, match='settings changed'):
-        monitor_fixture(path, fibers, manifest, replace(sample, excursion_amplitude=(3., 5.)), spec, 1)
+    # Changed construction settings rebuild the fixture, keeping the previous one beside it.
+    rebuilt, changed = monitor_fixture(path, fibers, manifest, replace(sample, excursion_amplitude=(3., 5.)), spec, 1)
+    assert changed != digest and (tmp_path/'monitor.previous.npz').exists() and len(rebuilt) == 4
     with pytest.raises(ValueError, match='monitor seeds'):
         monitor_fixture(path, fibers, dict(manifest, monitor=[dict(fiber=1, t=150., sign=1)]), sample, spec, 1)

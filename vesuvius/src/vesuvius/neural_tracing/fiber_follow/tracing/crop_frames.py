@@ -34,7 +34,7 @@ def configured_frame_policy(cfg):
 def _load_predictor(path, digest):
     from vesuvius.neural_tracing.fiber_follow.heading_model.model import HeadingPredictor
     if digest and hashlib.sha256(Path(path).read_bytes()).hexdigest() != digest:
-        raise ValueError('Frame checkpoint changed since follower configuration was saved')
+        print(f'Warning: frame checkpoint {path} differs from the one recorded in the follower configuration', flush=True)
     predictor = HeadingPredictor.load(path, 'cpu')
     if not predictor.model.cfg.predict_frames or predictor.model.cfg.ct_downsample_levels:
         raise ValueError('Crop generation requires a level-0 H/V heading-and-normal model')

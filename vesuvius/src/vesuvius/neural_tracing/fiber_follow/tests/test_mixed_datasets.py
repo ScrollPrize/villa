@@ -16,7 +16,8 @@ from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolume, FiberV
 from vesuvius.neural_tracing.fiber_follow.data.data import make_sample, SampleConfig
 from vesuvius.neural_tracing.fiber_follow.data.datasets import AFVBank, WeightedDatasets, read_dataset_config
 from vesuvius.neural_tracing.fiber_follow.data.observations import image_crop, IdentityObservationBuilder, IdentitySampling
-from vesuvius.neural_tracing.fiber_follow.models.model import build_model, CoordinateRegressionConfig
+from vesuvius.neural_tracing.fiber_follow.models.model import build_model
+from vesuvius.neural_tracing.fiber_follow.models.crop_transformer import RegressionConfig
 from vesuvius.neural_tracing.fiber_follow.train.supervision import loss_terms
 
 
@@ -88,7 +89,7 @@ def test_ct_only_reads_no_auxiliary_and_requires_auxiliary_when_enabled(tmp_path
     assert x.shape[1]==1
     torch.testing.assert_close(x,torch.zeros_like(x))
     with pytest.raises(TypeError, match='direction_inputs'):
-        CoordinateRegressionConfig(direction_inputs=True)
+        RegressionConfig(direction_inputs=True)
 
 
 def test_ct_only_model_backward_and_config_roundtrip():
@@ -100,7 +101,7 @@ def test_ct_only_model_backward_and_config_roundtrip():
     loss=terms['geometry_per_state'].sum()+terms['confidence_per_state'].sum()
     loss.backward()
     assert torch.isfinite(loss) and any(p.grad is not None and p.grad.abs().sum()>0 for p in m.parameters())
-    assert CoordinateRegressionConfig(**cfg.to_dict()).input_channels==1
+    assert RegressionConfig(**cfg.to_dict()).input_channels==1
 
 
 class FakeDataset:
@@ -131,29 +132,6 @@ def test_real_config_has_requested_sources_and_stable_paths():
     assert 'SMALLMORE' not in json.dumps(d)
     assert d['cache_dir']=='/mnt/raid_nvme/volume_cache'
     assert digest==read_dataset_config(p)[1]
-
-
-def test_resume_allows_cache_relocation_but_not_dataset_changes():
-    from copy import deepcopy
-    from vesuvius.neural_tracing.fiber_follow.data.datasets import validate_dataset_resume
-    p=Path(__file__).resolve().parents[1]/'configs/mixed_ct_datasets_paris50.json'
-    document,digest=read_dataset_config(p)
-    old=deepcopy(document);old['cache_dir']='/old/cache'
-    checkpoint=dict(dataset_config=old,dataset_config_sha256='old-digest')
-    validate_dataset_resume(checkpoint,document,digest)
-    validate_dataset_resume(dict(dataset_config_sha256=digest),document,digest)
-    validate_dataset_resume({},None,None)  # Legacy single-source checkpoints.
-    relocated=deepcopy(document);relocated['sources'][1]['ct']='s3://different/volume'
-    validate_dataset_resume(checkpoint,relocated,'changed-digest')  # CT location is not part of the data identity
-    for key,value in [('weight',.2),
-                      ('validation',dict(strategy='fiber_hash',count=405,seed=7349))]:
-        changed=deepcopy(document);changed['sources'][1][key]=value
-        with pytest.raises(ValueError,match='dataset configuration changed'):
-            validate_dataset_resume(checkpoint,changed,'changed-digest')
-    for missing in ({},dict(dataset_config_sha256='old-digest')):
-        with pytest.raises(ValueError,match='dataset configuration changed'):
-            validate_dataset_resume(missing,document,digest)
-    assert checkpoint['dataset_config']['cache_dir']=='/old/cache'
 
 
 @pytest.mark.parametrize('separator',['.','/'])
@@ -252,7 +230,7 @@ def test_replay_scheduler_cycles_all_sources_without_parallel_collectors():
     assert scheduler.close() is None
 
 
-@pytest.mark.parametrize('kind', ['coordinate_regression', 'flow_matching'])
+@pytest.mark.parametrize('kind', ['regression', 'flow'])
 def test_real_collector_roundtrip_on_afv_with_ct_only_inputs(tmp_path, kind):
     import hashlib
     from vesuvius.neural_tracing.fiber_follow.tracing.collect import main as collect
@@ -272,8 +250,8 @@ def test_real_collector_roundtrip_on_afv_with_ct_only_inputs(tmp_path, kind):
     source=dict(name='fixture',kind='afv',path=str(p),ct=str(tmp_path/'ct'),grid_scale=1.,
                 ct_grid_scale=1.,sha256=hashlib.sha256(p.read_bytes()).hexdigest(),validation=validation)
     document=dict(sources=[source],cache_dir=str(tmp_path/'cache'))
-    from test_flow_model import config as flow_config
-    cfg=config() if kind == 'coordinate_regression' else flow_config()
+    from model_fixtures import flow_config
+    cfg=config() if kind == 'regression' else flow_config()
     model=build_model(cfg)
     spec=FiberVolumeSpec('',ct_zarr=str(tmp_path/'ct'),ct_level=0,grid_scale=1.,ct_grid_scale=1.,inputs='ct',load_presence=False)
     sample=SampleConfig(crop=cfg.fine,n_history=cfg.n_history,n_future=cfg.n_future)
@@ -297,24 +275,6 @@ def test_real_collector_roundtrip_on_afv_with_ct_only_inputs(tmp_path, kind):
     assert len(states)>0 and states.provenance['volume']['ct_zarr']==str(tmp_path/'ct')
     with pytest.raises(ValueError,match='incompatible fibers'):
         states.validate_fibers(AFVFibers(p,validation=validation,split='validation'))
-
-
-def test_initialization_sources_match_after_explicit_relocation_only(monkeypatch):
-    from vesuvius.neural_tracing.fiber_follow.data.datasets import same_sources
-    source = lambda root, weight=.5: dict(name='paris4', kind='paris4', weight=weight, fibers=f'{root}/fibers',
-        manifest=f'{root}/seeds.json', ct='s3://bucket/ct.zarr', validation=dict(strategy='fiber_hash', seed=1))
-    recorded, here = dict(sources=[source('/mnt/a')]), dict(sources=[source('/copy', weight=1.)])
-    assert same_sources(recorded, dict(sources=[source('/mnt/a', weight=1.)]))  # weights may change
-    assert not same_sources(recorded, here)
-    monkeypatch.setenv('FIBER_FOLLOW_PATH_MAP', '/mnt/a=/copy')
-    assert same_sources(recorded, here)
-    here['sources'][0]['validation'] = dict(strategy='fiber_hash', seed=2)
-    assert not same_sources(recorded, here)  # holdouts never relocate
-    # A warm start may add a source, but every recorded one must stay unchanged.
-    extra = dict(source('/new'), name='new_afv')
-    assert same_sources(recorded, dict(sources=[source('/copy', weight=.1), extra]), allow_added=True)
-    assert not same_sources(recorded, dict(sources=[source('/copy', weight=.1), extra]))
-    assert not same_sources(recorded, dict(sources=[extra]), allow_added=True)
 
 
 def test_checkpoint_volume_paths_and_normalization_keys_relocate_together(monkeypatch):

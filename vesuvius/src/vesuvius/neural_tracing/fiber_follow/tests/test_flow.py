@@ -1,18 +1,19 @@
-"""The common trainer operates both generators without a separate flow training path."""
+"""Flow matching (models/flow.py) on the crop transformer: the common trainer, proposals, selection and losses."""
 import copy
-from dataclasses import replace
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
-from model_fixtures import coordinate_config, coordinate_batch
-from vesuvius.neural_tracing.fiber_follow.models.model import CoordinateRegressionFollower, build_model
-from vesuvius.neural_tracing.fiber_follow.models.flow import FlowConfig, fit_flow_sigma, flow_targets
+from model_fixtures import coordinate_batch, ct_volume, flow_config, run_document
+from vesuvius.neural_tracing.fiber_follow.models.model import build_model
+from vesuvius.neural_tracing.fiber_follow.models.flow import fit_flow_sigma, flow_targets
+from vesuvius.neural_tracing.fiber_follow.train import run_config
 from vesuvius.neural_tracing.fiber_follow.train.supervision import loss_terms
 from vesuvius.neural_tracing.fiber_follow.train.train import (
-    prepare_training, training_prediction, optimizer_update, save_checkpoint, load_checkpoint,
-    initialize_training_optimizer, initialize_model_weights, build_parser, model_config_from_args,
+    prepare_training, optimizer_update, save_checkpoint, load_checkpoint,
+    initialize_training_optimizer, initialize_model_weights,
 )
 from vesuvius.neural_tracing.fiber_follow.train.runloop import training_rng_state
 from vesuvius.neural_tracing.fiber_follow.data.data import SampleConfig
@@ -20,37 +21,11 @@ from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolumeSpec
 
 
 def config(**options):
-    return FlowConfig(**(coordinate_config().to_dict() | dict(model_type='flow_matching',
-        recurrent_refinement_steps=0, flow_steps=2, flow_draws=2, flow_sigma=((1., 1.),)*4) | options))
+    return flow_config(**dict(dict(flow_draws=2), **options))
 
 
 def take(value, index):
     return {k: take(v, index) for k, v in value.items()} if isinstance(value, dict) else value[index]
-
-
-def test_flow_shares_components_and_compiles_with_finite_gradients():
-    torch.manual_seed(31)
-    cfg = config()
-    model, coordinate = build_model(cfg), CoordinateRegressionFollower(coordinate_config())
-    for name in ('encoder', 'history_encoder', 'history_attention', 'confidence_scorer', 'path_geometry'):
-        assert type(getattr(model, name)) is type(getattr(coordinate, name))
-    b = coordinate_batch(cfg)
-    b['flow_noise'] = torch.randn(2, cfg.flow_draws, cfg.n_future, 2)
-    b['flow_times'] = torch.tensor([[.1, .7], [.2, .9]])
-    eager = model.select_prediction(model.training_forward(b['x'], b['hist'], b['hmask'], .5, b))
-    compiled = prepare_training(copy.deepcopy(model), backend='eager')
-    out = training_prediction(compiled, b['x'], b['hist'], b['hmask'], targets=b)
-    for key in eager:
-        torch.testing.assert_close(out[key], eager[key], atol=1e-6, rtol=1e-5)
-    terms = loss_terms(out, b, cfg)
-    (terms['geometry_per_state']+.5*terms['confidence_per_state']).mean().backward()
-    for module in (compiled.velocity, compiled.encoder.patch_projection, compiled.history_encoder.convolution[0],
-                   compiled.confidence_scorer.failure, compiled.history_encoder.path_projection[-1]):
-        assert module.weight.grad is not None and torch.isfinite(module.weight.grad).all()
-        assert module.weight.grad.abs().sum() > 0
-    assert out['refinement_points'].shape[1] == 1
-    assert out['solver_points'].shape[1] == cfg.flow_steps+1
-    assert not out['solver_points'][:, 0, :, :2].any()
 
 
 def test_flow_draws_and_trace_rows_are_independent_and_unknown_targets_are_censored():
@@ -73,11 +48,7 @@ def test_flow_draws_and_trace_rows_are_independent_and_unknown_targets_are_censo
         assert torch.isfinite(result['flow_per_state']).all() and not result['flow_per_state'].any()
 
 
-def test_flow_scales_and_default_factory():
-    args = build_parser().parse_args(['--name', 'test'])
-    assert model_config_from_args(args).model_type == 'coordinate_regression'
-    args.model = 'flow_matching'
-    assert isinstance(model_config_from_args(args), FlowConfig)
+def test_flow_scales():
     cfg = config(); b = coordinate_batch(cfg)
     b['dense_ab'][0, :, 0] = -2.; b['dense_ab'][1, :, 0] = 2.
     assert fit_flow_sigma(iter([b]), cfg, 2) == ((2., 1.),)*cfg.n_future
@@ -137,34 +108,6 @@ def test_flow_loss_and_gradients_are_weighted_per_state_across_microbatches():
             torch.testing.assert_close(p.grad, q.grad, atol=2e-6, rtol=2e-4, msg=name)
 
 
-def test_flow_records_decision_memory_in_the_tracer_and_trains_the_identity_verifier(monkeypatch):
-    from test_decision_memory import memory_config, decision_inputs, StraightModel, run_tracer
-    from vesuvius.neural_tracing.fiber_follow.models.identity_verifier import (
-        IDENTITY_PLANES, IDENTITY_CANDIDATES, IDENTITY_SAMPLES)
-    torch.manual_seed(13)
-    memory = memory_config(identity_objective='verify', identity_map=True, identity_feedback=True).to_dict()
-    cfg = config(**{k: memory[k] for k in ('stem', 'stem_blocks', 'memory', 'identity_objective', 'identity_map',
-                                           'identity_feedback')})
-    model = build_model(cfg).eval()
-    # The tracer records this flow model's own decision entries and reads them back.
-    traced = StraightModel(model)
-    run_tracer(traced, monkeypatch)
-    assert len(traced.raw) > 10 and max(int(v.sum()) for _, _, v in traced.raw) >= 3
-    model.train()
-    batch = coordinate_batch(cfg, 2)
-    x = {k: v for k, v in batch['x'].items() if not k.startswith('history_')}
-    x.update(decision_inputs(cfg, 2))
-    x['history_valid'][:, :2] = True
-    x.update(identity_candidates=torch.randn(2, len(IDENTITY_PLANES), IDENTITY_CANDIDATES, 3),
-             identity_samples=torch.randn(2, IDENTITY_SAMPLES, 3))
-    out = model.training_forward(x, batch['hist'], batch['hmask'], .5)
-    torch.testing.assert_close(out['memory_entry'], model.context(x, batch['hist'], batch['hmask'])['memory_entry'])
-    # The verifier scores the integrated flow path, as coordinate regression scores its final refinement.
-    torch.testing.assert_close(out['identity_predicted_points'], out['refinement_points'][:, -1].detach())
-    out['identity_logits'].sum().backward()
-    assert sum(float(p.grad.abs().sum()) for p in model.identity_verifier.parameters() if p.grad is not None) > 0
-
-
 def test_inference_samples_retry_after_the_zero_start_path_only_when_it_is_not_accepted():
     torch.manual_seed(17)
     model = build_model(config()).eval()
@@ -186,32 +129,6 @@ def test_inference_samples_retry_after_the_zero_start_path_only_when_it_is_not_a
                 torch.testing.assert_close(out['points'], plain['points'])
 
 
-def test_adaln_time_conditioning_starts_exactly_as_the_input_only_model_and_then_trains():
-    torch.manual_seed(19)
-    base = build_model(config()).eval()
-    model = build_model(config(flow_time_conditioning='adaln')).eval()
-    missing = model.load_state_dict(base.state_dict(), strict=False).missing_keys
-    assert {k.split('.')[0] for k in missing} == {'time_modulation', 'output_modulation'}
-    b = coordinate_batch(base.cfg)
-    b['flow_noise'] = torch.randn(2, base.cfg.flow_draws, base.cfg.n_future, 2)
-    b['flow_times'] = torch.tensor([[.1, .7], [.2, .9]])
-    with torch.no_grad():
-        before, after = (m.training_forward(b['x'], b['hist'], b['hmask'], .5, b) for m in (base, model))
-    for key in ('refinement_points', 'refinement_confidence', 'flow_per_state'):
-        torch.testing.assert_close(after[key], before[key], rtol=0, atol=0)
-    # The flow loss trains the modulation; once it is nonzero, time changes every layer's output.
-    model.train()
-    model.training_forward(b['x'], b['hist'], b['hmask'], .5, b)['flow_per_state'].sum().backward()
-    assert all(m.weight.grad.abs().sum() > 0 for m in (*model.time_modulation, model.output_modulation))
-    with torch.no_grad():
-        for linear in model.time_modulation:
-            linear.weight.normal_(std=.1)
-        ctx = model.context(b['x'], b['hist'], b['hmask']); model.prepare_prediction(ctx, b['hist'])
-        y = torch.randn(2, 1, base.cfg.n_future, 2)
-        early, late = (model.velocity_field(ctx, y, torch.full((2, 1), t)) for t in (.1, .9))
-        assert not torch.allclose(early, late)
-
-
 def test_sampled_proposals_are_scored_in_training_and_the_zero_start_path_is_unchanged():
     torch.manual_seed(23)
     model = build_model(config())
@@ -225,7 +142,7 @@ def test_sampled_proposals_are_scored_in_training_and_the_zero_start_path_is_unc
     terms = loss_terms(sampled.select_prediction(out), b, sampled.cfg)
     assert int(terms['refinement_attempts_sum']) == 2*3
     terms['confidence_per_state'].sum().backward()
-    assert sum(float(p.grad.abs().sum()) for p in sampled.confidence_scorer.parameters() if p.grad is not None) > 0
+    assert all(float(m.weight.grad.abs().sum()) > 0 for m in (sampled.score[0], sampled.hazard))
 
 
 def test_unknown_planes_are_attended_only_with_own_path_and_the_scale_floor_bounds_the_prior():
@@ -302,8 +219,9 @@ def test_sample_threshold_holds_samples_to_a_higher_bar_than_the_zero_start():
     assert int(commit_prefix(barred['points'], barred['confidence'], .5, cfg.n_future)[0]) == 0
 
 
-def test_keyed_proposal_noise_depends_only_on_each_rows_key_and_the_tracer_keys_each_decision(monkeypatch):
-    from test_decision_memory import memory_config, StraightModel, run_tracer
+def test_keyed_proposal_noise_depends_only_on_each_rows_key_and_the_tracer_keys_each_decision(tmp_path):
+    from vesuvius.neural_tracing.fiber_follow.data.observations import FiberTracer
+    from vesuvius.neural_tracing.fiber_follow.tracing.trace import TraceParams
     torch.manual_seed(43)
     model = build_model(config(flow_samples=3))
     hist = torch.zeros(3, model.cfg.n_history, 3)
@@ -315,17 +233,26 @@ def test_keyed_proposal_noise_depends_only_on_each_rows_key_and_the_tracer_keys_
     assert not torch.equal(together[0, 1:], together[2, 1:]) and not together[:, 0].any()
     assert not torch.equal(model.proposal_starts(hist)[:, 1:], model.proposal_starts(hist)[:, 1:])  # global RNG
 
-    class Capture(StraightModel):
-        def forward(self, x, hist, hmask, **kwargs):
-            self.keys = getattr(self, 'keys', [])+[x['flow_noise_keys'].tolist()]
-            return super().forward(x, hist, hmask, **kwargs)
-    memory = memory_config().to_dict()
-    flow = build_model(config(flow_samples=2, **{k: memory[k] for k in ('stem', 'stem_blocks', 'memory')})).eval()
-    first, second = Capture(flow), Capture(flow)
-    run_tracer(first, monkeypatch)
-    run_tracer(second, monkeypatch)
-    assert first.keys == second.keys and len(first.keys) > 3
-    assert len({k[0] for k in first.keys}) == len(first.keys)  # a fresh key every decision
+    flow = build_model(config(flow_samples=2)).eval()
+    vol = ct_volume(tmp_path)
+
+    def trace_keys():
+        keys, forward = [], flow.forward
+        def capture(x, *args, **kwargs):
+            keys.append(x['flow_noise_keys'].tolist())
+            return forward(x, *args, **kwargs)
+        flow.forward = capture
+        tracer = FiberTracer(flow, vol, flow.cfg.fine, flow.cfg.n_history,
+                             TraceParams(n_commit=1, max_len=4., confidence=0.), device="cpu")
+        try:
+            tracer.trace(np.array([[24., 24., 24.]]), np.array([[.3, .4, .8660254]]))
+        finally:
+            tracer.close()
+            del flow.forward
+        return keys
+    first, second = trace_keys(), trace_keys()
+    assert first == second and len(first) > 3
+    assert len({k[0] for k in first}) == len(first)  # a fresh key every decision
 
 
 def test_pseudo_huber_flow_loss_is_half_the_squared_distance_for_small_residuals_and_linear_beyond_c():
@@ -369,7 +296,7 @@ def test_flow_geometry_weight_trains_the_integrated_zero_start_path_and_nothing_
     assert 'flow_path_geometry_per_state' not in loss_terms(plain.select_prediction(base), b, plain.cfg)
     terms['flow_path_geometry_per_state'].sum().backward()
     assert model.velocity.weight.grad.abs().sum() > 0
-    assert all(p.grad is None or not p.grad.any() for p in model.confidence_scorer.parameters())
+    assert all(p.grad is None or not p.grad.any() for m in (model.score, model.hazard) for p in m.parameters())
     model.eval()
     with torch.no_grad():
         assert 'flow_geometry_points' not in model.training_forward(b['x'], b['hist'], b['hmask'], .5)
@@ -378,9 +305,8 @@ def test_flow_geometry_weight_trains_the_integrated_zero_start_path_and_nothing_
 
 
 def test_flow_loss_and_geometry_options_reach_the_model_config():
-    args = build_parser().parse_args(['--name', 'x', '--model', 'flow_matching', '--flow-loss', 'pseudo_huber',
-                                      '--flow-huber-c', '2', '--flow-geometry-weight', '.25'])
-    cfg = model_config_from_args(args)
-    assert (cfg.flow_loss, cfg.flow_huber_c, cfg.flow_geometry_weight) == ('pseudo_huber', 2., .25)
-    default = model_config_from_args(build_parser().parse_args(['--name', 'x', '--model', 'flow_matching']))
-    assert (default.flow_loss, default.flow_geometry_weight) == ('mse', 0.)
+    resolve = lambda **fields: run_config.model_config(run_config.resolve(run_document('flow', **fields)))
+    cfg = resolve(flow_loss='mse', flow_huber_c=2, flow_geometry_weight=.25)
+    assert (cfg.flow_loss, cfg.flow_huber_c, cfg.flow_geometry_weight) == ('mse', 2., .25)
+    default = resolve()
+    assert (default.flow_loss, default.flow_geometry_weight, default.flow_sigma) == ('pseudo_huber', 0., ())

@@ -10,7 +10,7 @@ from model_fixtures import array_at
 from test_ct_crops import config, item
 from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolume, FiberVolumeSpec, model_crop_volume
 from vesuvius.neural_tracing.fiber_follow.data.observations import image_crop
-from vesuvius.neural_tracing.fiber_follow.data.datasets import ct_source_spec, same_sources
+from vesuvius.neural_tracing.fiber_follow.data.datasets import ct_source_spec
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
 
 
@@ -40,7 +40,7 @@ def test_model_crops_read_the_crop_level_and_frames_keep_the_main_level(tmp_path
     torch.testing.assert_close(image_crop([state], split, cfg.fine), image_crop([state], coarse, cfg.fine), rtol=0, atol=0)
 
 
-def test_crop_level_is_optional_metadata_and_never_changes_holdout_identity(tmp_path):
+def test_crop_level_is_optional_metadata(tmp_path):
     single = FiberVolumeSpec('', ct_zarr='ct', ct_level=0)
     assert 'crop_ct_level' not in single.to_dict()
     split = FiberVolumeSpec('', ct_zarr='ct', ct_level=0, crop_ct_level=1, crop_ct_grid_scale=2.)
@@ -48,8 +48,6 @@ def test_crop_level_is_optional_metadata_and_never_changes_holdout_identity(tmp_
     source = dict(name='a', kind='afv', ct='s3://x', grid_scale=2., ct_level=0, ct_grid_scale=1., validation={})
     assert ct_source_spec(dict(source, crop_ct_level=1, crop_ct_grid_scale=2.), None).crop_ct_level == 1
     assert ct_source_spec(source, None).crop_ct_level is None
-    assert same_sources(dict(sources=[source]), dict(sources=[dict(source, crop_ct_level=1, crop_ct_grid_scale=2.)]))
-    assert not same_sources(dict(sources=[source]), dict(sources=[dict(source, validation={'seed': 1})]))
 
 
 def test_level1_dataset_config_moves_only_model_crops():
@@ -61,30 +59,3 @@ def test_level1_dataset_config_moves_only_model_crops():
         assert {k: v for k, v in b.items() if not k.startswith('crop_ct_')} == a
         assert b['crop_ct_level'] == a.get('ct_level', 0)+1
         assert b['crop_ct_grid_scale'] == 2*a.get('ct_grid_scale', 4. if a['kind'] == 'paris4' else 1.)
-
-
-def test_resume_may_append_sources_only_when_asked():
-    from vesuvius.neural_tracing.fiber_follow.data.datasets import validate_dataset_resume
-    source = dict(name='a', kind='afv', weight=.5, ct='x', validation={})
-    recorded = dict(version=1, cache_dir='c', sources=[source])
-    checkpoint = dict(dataset_config=recorded, dataset_config_sha256='old')
-    added = dict(version=1, cache_dir='elsewhere', sources=[dict(source, weight=.25), dict(source, name='b', weight=.25)])
-    validate_dataset_resume(checkpoint, added, 'new', allow_added=True)
-    for bad in (dict(added, sources=added['sources'][::-1]),                                  # reordered
-                dict(added, sources=[dict(source, validation={'seed': 1}), added['sources'][1]]),  # changed source split
-                dict(added, version=2),                                                       # changed document
-                dict(added, sources=[dict(source, weight=.25)])):                             # nothing appended
-        with pytest.raises(ValueError):
-            validate_dataset_resume(checkpoint, bad, 'new', allow_added=True)
-    with pytest.raises(ValueError):
-        validate_dataset_resume(checkpoint, added, 'new')
-
-
-def test_resume_allows_a_relocated_ct_but_no_other_source_change():
-    from vesuvius.neural_tracing.fiber_follow.data.datasets import validate_dataset_resume
-    source = dict(name='paris4', kind='paris4', weight=.5, ct='/local/s1_ds2.zarr', ct_level=0, ct_grid_scale=4., validation={})
-    checkpoint = dict(dataset_config=dict(version=1, cache_dir='c', sources=[source]), dataset_config_sha256='old')
-    moved = dict(source, ct='s3://bucket/paris4.zarr', ct_level=2, ct_mirror_of='https://bucket/paris4.zarr')
-    validate_dataset_resume(checkpoint, dict(version=1, cache_dir='elsewhere', sources=[moved]), 'new')
-    with pytest.raises(ValueError):
-        validate_dataset_resume(checkpoint, dict(version=1, cache_dir='c', sources=[dict(moved, ct_grid_scale=2.)]), 'new')

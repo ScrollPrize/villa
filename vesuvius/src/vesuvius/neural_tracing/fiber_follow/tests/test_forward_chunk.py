@@ -17,9 +17,9 @@ def test_chunks_with_different_refinement_attempts_match_one_forward():
     with torch.no_grad():
         confidence = model(x, hist, hmask)['refinement_confidence'][:, 0, -1]
         threshold = float(confidence.mean())  # one row accepts its first proposal, the other retries
-        widths = {model({k: v[i:i+1] for k, v in x.items()}, hist[i:i+1], hmask[i:i+1],
-                        confidence_threshold=threshold)['refinement_mask'].shape[1] for i in range(2)}
-        assert len(widths) == 2  # the per-row chunks really return different attempt counts
+        attempts = {int(model({k: v[i:i+1] for k, v in x.items()}, hist[i:i+1], hmask[i:i+1],
+                              confidence_threshold=threshold)['refinement_mask'].sum()) for i in range(2)}
+        assert len(attempts) == 2  # the per-row chunks really run different attempt counts
         tracer = lambda chunk: SimpleNamespace(model=model, p=SimpleNamespace(forward_chunk=chunk),
                                                autocast=contextlib.nullcontext)
         sampling = dict(confidence_threshold=threshold)

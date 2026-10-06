@@ -1,7 +1,7 @@
 """Observed-path geometry samples beyond the crop, in the current frame."""
 import numpy as np
 
-from test_history_slabs import observation
+from model_fixtures import observation
 from vesuvius.neural_tracing.fiber_follow.models.path_geometry import COUNT, OFFSETS, path_geometry_samples
 
 

@@ -1,66 +1,6 @@
-"""Causal proposed-segment scoring with unrestricted access to observations."""
+"""Causal segment survival: hazard logits to prefix confidence, and the first-failure loss."""
 import torch
-from torch import nn
 import torch.nn.functional as F
-
-from vesuvius.neural_tracing.fiber_follow.models.model import PathDecoderLayer
-
-
-class SegmentSurvivalScorer(nn.Module):
-    # Proposals occupy fixed forward planes. Four samples per incoming
-    # segment match the default labels' quarter-forward-voxel resolution.
-    samples_per_segment = 4
-
-    def __init__(self, cfg):
-        super().__init__()
-        h = cfg.hidden
-        evidence_width = cfg.path_evidence_width
-        # Ordered image samples, start/end/displacement/length.
-        width = self.samples_per_segment*evidence_width+10
-        self.query = nn.Sequential(nn.LayerNorm(width), nn.Linear(width, h), nn.SiLU())
-        self.layers = nn.ModuleList(PathDecoderLayer(h, cfg.heads, 1024, dropout=0.,
-            activation='gelu', batch_first=True, norm_first=True) for _ in range(cfg.scorer_layers))
-        from vesuvius.neural_tracing.fiber_follow.models.history_slabs import HistoryAttention
-        # Without memory (cfg.memory 'none') the scorer has no memory attention.
-        self.history_attention = HistoryAttention(h, cfg.heads) if getattr(cfg, 'memory', 'slabs') != 'none' else None
-        self.norm = nn.LayerNorm(h)
-        self.failure = nn.Linear(h, 1)
-        if getattr(cfg, 'identity_feedback', False):
-            # Identity-field samples along each segment; zero-initialized so a warm start is unchanged.
-            self.identity_query = nn.Linear(self.samples_per_segment, h)
-            nn.init.zeros_(self.identity_query.weight)
-            nn.init.zeros_(self.identity_query.bias)
-
-    def segment_samples(self, points):
-        """Every location depends only on this endpoint and its predecessor."""
-        start = torch.cat((torch.zeros_like(points[:, :1]), points[:, :-1]), 1)
-        fraction = torch.arange(1, self.samples_per_segment+1, device=points.device,
-                                dtype=points.dtype)/self.samples_per_segment
-        return start[:, :, None]+fraction[None, None, :, None]*(points-start)[:, :, None]
-
-    def project_memory(self, memory, padding):
-        return [layer.project_memory(memory) for layer in self.layers]
-
-    def forward(self, spatial, points, projected, padding, history, identity=None):
-        if history is not None and len(history) == 2:
-            history = self.history_attention.project_memory(*history)
-        start = torch.cat((torch.zeros_like(points[:, :1]), points[:, :-1]), 1)
-        delta = points-start
-        geometry = torch.cat((start, points, delta, delta.norm(dim=-1, keepdim=True)), -1)/16.
-        query = self.query(torch.cat((spatial.flatten(2), geometry), -1))
-        if identity is not None:
-            query = query+self.identity_query(identity.to(query.dtype))
-        # Only the proposed path is causal. Cross-attention reads all observed
-        # deep/fine-plane/reference/memory tokens; no generator hidden state enters here.
-        k = points.shape[1]
-        causal = torch.ones(k, k, device=points.device, dtype=torch.bool).triu(1)
-        for layer, kv in zip(self.layers, projected):
-            query = layer.forward_cached(query, kv, padding, causal_mask=causal,
-                                         history=history, history_attention=self.history_attention)
-        # Preserve precision before thresholding/ranking proposals. Casting the
-        # logits after a BF16 projection cannot recover its rounding loss.
-        with torch.autocast(query.device.type, enabled=False):
-            return self.failure(self.norm(query.float())).squeeze(-1)
 
 
 def survival_predictions(hazard_logits):

@@ -19,7 +19,7 @@ from vesuvius.neural_tracing.fiber_follow.heading_model.data import (
 from vesuvius.neural_tracing.fiber_follow.heading_model.model import load_heading_model, model_inputs
 from vesuvius.neural_tracing.fiber_follow.heading_model.frames import orthonormal_frame
 from vesuvius.neural_tracing.fiber_follow.heading_model.train import read_config
-from vesuvius.neural_tracing.fiber_follow.models.model import CoordinateRegressionConfig
+from vesuvius.neural_tracing.fiber_follow.heading_model.model import FOLLOWER_CROP
 from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolume
 from vesuvius.neural_tracing.fiber_follow.tracing.heading import sheet_heading, SeedHeadingError
 from vesuvius.neural_tracing.fiber_follow.train.runloop import raise_open_file_limit
@@ -81,7 +81,7 @@ def main():
     _, _, sources, _ = load_sources(config['dataset_config'], args.out,
                                     ct_normalization=config['ct_normalization'])
     sampling = sampling_from_dict(checkpoint['sampling'])
-    crop = CoordinateRegressionConfig().fine
+    crop = FOLLOWER_CROP
     rows, excluded = [], []
     with ThreadPoolExecutor(8) as pool:
         for source_index, source in enumerate(sources):

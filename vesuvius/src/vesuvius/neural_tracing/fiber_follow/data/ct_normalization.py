@@ -34,10 +34,10 @@ def validate_record(record, spec):
 
 
 def prepare_normalization(out, specs, *, resume=None, known=None):
-    """Persist z-score provenance, bind it to readers, and enforce exact resume reuse.
+    """Persist z-score provenance and bind it to readers.
 
-    Checkpoints embed the document too, allowing a missing JSON to be restored
-    without estimating again. A changed JSON on resume is an error.
+    Checkpoints embed the document too (``known``), allowing a missing JSON to be restored. A record that differs
+    from the checkpoint's, or from the current CT array, is reported and replaced by the current one.
     """
     from vesuvius.neural_tracing.fiber_follow.data.volume import RemoteChunkedArray
     path = Path(out)/'ct_normalization.json'
@@ -51,7 +51,7 @@ def prepare_normalization(out, specs, *, resume=None, known=None):
     if document.get('method') != ZSCORE_METHOD:
         raise ValueError('Unsupported CT normalization policy')
     if known is not None and document['method'] != known['method']:
-        raise ValueError('Inference CT normalization differs from the checkpoint')
+        print('Warning: the CT normalization method differs from the checkpoint', flush=True)
     # Do not mutate an embedded checkpoint document while adding an inference volume.
     document = json.loads(json.dumps(document))
     for spec in specs:
@@ -59,7 +59,7 @@ def prepare_normalization(out, specs, *, resume=None, known=None):
         ct = open_ct(spec)
         if (known is not None and key in known['volumes'] and key in document['volumes']
                 and known['volumes'][key] != document['volumes'][key]):
-            raise ValueError(f'Inference CT normalization differs from the checkpoint: {key}')
+            print(f'Warning: CT normalization record differs from the checkpoint: {key}', flush=True)
         if key not in document['volumes']:
             if resume is not None:
                 raise ValueError(f'Resumed checkpoint lacks CT normalization: {key}')
@@ -72,7 +72,9 @@ def prepare_normalization(out, specs, *, resume=None, known=None):
         if record['method'] != document['method']:
             raise ValueError('CT record and document normalization methods differ')
         if any(record[k] != v for k, v in array_identity(ct).items()):
-            raise ValueError(f'CT array metadata changed since calibration: {key}')
+            print(f'Warning: CT array metadata changed since calibration; recording the current array: {key}', flush=True)
+            record = dict(record, **array_identity(ct))
+            document['volumes'][key] = record
         spec.ct_normalization = dict(record)
         print(f'CT per-crop z-score, epsilon {ZSCORE_EPSILON:g}: {key}', flush=True)
     if not path.exists() or json.loads(path.read_text()) != document:

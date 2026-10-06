@@ -24,7 +24,6 @@ from vesuvius.neural_tracing.fiber_follow.shared.geometry import (
     frame_from_heading,
     interp_at,
     normalize,
-    render_history,
     sample_oriented_fast,
     tangent_at,
 )
@@ -34,7 +33,6 @@ from vesuvius.neural_tracing.fiber_follow.shared.reference import SEED_FIELDS, S
 
 
 DATA_VERSION = 2
-DATA_POLICY = "controlled_spans_v3"
 MAX_CT_FRAME_REJECTIONS = 64
 
 
@@ -200,9 +198,6 @@ class SampleConfig:
     label_tolerance: float = 1.5  # confidence-label tolerance; separate from the departure threshold
     max_recovery_distance: float = 6.0
     dense_substeps: int = 4
-    # Whole-crop targets (path_planes='crop' models): the original fiber's crossing of every crop plane and its
-    # curve through the crop (Gaussian tube), wherever the head is.
-    crop_targets: bool = False
 
     def __post_init__(self):
         shares = np.asarray(self.startup_shares, np.float64)
@@ -298,56 +293,6 @@ def plane_targets(p, s, t, t_end, pos, frame, planes):
             ab[k] = (1 - w) * loc[i, :2] + w * loc[i + 1, :2]
             m[k] = 1.0
     return ab, m
-
-
-CROP_CURVE_POINTS = 512  # original-fiber curve samples (1 vox apart) kept for the whole-crop tube target
-
-
-def crop_plane_targets(p, s, t, pos, frame, planes, half_width):
-    """Original-fiber crossing of every crop plane, searched along the fiber from arc ``t`` (forward for planes ahead
-    of the matched point, backward for planes behind it); the crossing nearest ``t`` along the fiber wins. Planes
-    without a crossing inside the crop's lateral extent are unknown. Returns (P, 2) lateral points and a (P,) mask."""
-    ab = np.zeros((len(planes), 2), np.float32)
-    mask = np.zeros(len(planes), np.float32)
-    c_t = float(((interp_at(p, s, np.array([t]))[0]-pos) @ frame)[2])
-    for direction, select in ((1., planes > c_t), (-1., planes <= c_t)):
-        if not select.any():
-            continue
-        span = 2.5*float(np.abs(planes[select]-c_t).max())+8.
-        end = float(np.clip(t+direction*span, 0., s[-1]))
-        inner = s[(s > min(t, end)) & (s < max(t, end))]
-        arc = np.r_[t, inner if direction > 0 else inner[::-1], end]
-        loc = (interp_at(p, s, arc)-pos) @ frame
-        c = loc[:, 2]
-        for k in np.flatnonzero(select):
-            ck = planes[k]
-            hit = np.flatnonzero((c[:-1] < ck) & (c[1:] >= ck) if direction > 0 else (c[:-1] >= ck) & (c[1:] < ck))
-            if not len(hit):
-                continue
-            i = hit[0]
-            w = (ck-c[i])/(c[i+1]-c[i]) if c[i+1] != c[i] else 0.
-            point = (1-w)*loc[i, :2]+w*loc[i+1, :2]
-            if np.abs(point).max() <= half_width:
-                ab[k], mask[k] = point, 1.
-    return ab, mask
-
-
-def crop_curve_targets(fiber, p, s, t, reverse, pos, frame, crop):
-    """Original-fiber curve through the crop for the tube target: CROP_CURVE_POINTS samples 1 vox apart around
-    traversal arc ``t`` in crop-local coordinates, a validity mask, and whether each window end is an untagged
-    annotation end (the fiber may continue unannotated there)."""
-    lateral = (crop.width-1)*crop.spacing/2
-    back = 2*crop.behind*crop.spacing+lateral
-    ahead = 2*(crop.depth-1-crop.behind)*crop.spacing+lateral
-    scale = min(1., (CROP_CURVE_POINTS-1)/(back+ahead))
-    lo, hi = t-back*scale, t+ahead*scale
-    arcs = lo+np.arange(CROP_CURVE_POINTS, dtype=np.float64)
-    valid = (arcs >= 0) & (arcs <= s[-1]) & (arcs <= hi)
-    curve = np.zeros((CROP_CURVE_POINTS, 3), np.float32)
-    curve[valid] = (interp_at(p, s, arcs[valid])-pos) @ frame
-    tags = fiber.endpoint_stop[::-1] if reverse else fiber.endpoint_stop
-    open_ends = np.array([lo < 0 and not tags[0], hi > s[-1] and not tags[1]])
-    return curve, valid, open_ends
 
 
 def traversal_curve(fiber, reverse):
@@ -635,13 +580,6 @@ def continuation_targets(fiber, t, reverse, pos, frame, cfg):
                plane_ab=ab, plane_mask=mask, planes=cfg.future_s,
                dense_ab=dense_ab, dense_mask=dense_mask, dense_planes=dense_planes,
                end_local=end, endpoint_known=float(known))
-    if getattr(cfg, 'crop_targets', False):
-        from vesuvius.neural_tracing.fiber_follow.shared.geometry import crop_path_planes
-        planes = crop_path_planes(cfg.crop, cfg.future_step)
-        out['crop_ab'], out['crop_mask'] = crop_plane_targets(p, s, t, pos, frame, planes,
-                                                              (cfg.crop.width-1)*cfg.crop.spacing/2)
-        out['crop_curve'], out['crop_curve_mask'], out['crop_curve_open_ends'] = crop_curve_targets(
-            fiber, p, s, t, reverse, pos, frame, cfg.crop)
     return out
 
 
@@ -661,11 +599,11 @@ def refresh_frame_targets(item):
 # One task budget, applied within each dataset source. Sampling allocations, not label
 # ratios: every delivered action is labeled by the shared state contract.
 TASKS = ('fresh', 'live', 'dagger_pre_excursion', 'dagger_recoverable', 'dagger_terminal',
-         'dagger_premature_stop', 'dagger_ordinary', 'synthetic_terminal', 'synthetic_identity')
+         'dagger_premature_stop', 'dagger_ordinary', 'synthetic_terminal')
 TASK = {name: index for index, name in enumerate(TASKS)}
 DEFAULT_TASK_SHARES = dict(fresh=.40, live=.25, dagger_pre_excursion=.08, dagger_recoverable=.06,
                            dagger_terminal=.08, dagger_premature_stop=.03, dagger_ordinary=.05,
-                           synthetic_terminal=.05, synthetic_identity=0.)
+                           synthetic_terminal=.05)
 FALLBACKS = ('none', 'fresh', 'synthetic', 'no_live_state')
 SOURCES = ('fresh', 'live', 'replay', 'synthetic')
 SOURCE = {name: index for index, name in enumerate(SOURCES)}
@@ -796,12 +734,8 @@ class FollowDataset(torch.utils.data.IterableDataset):
         self.replay_index, self.refresh_chunks = replay_index, refresh_chunks
         self.batch_builder = batch_builder
         self.live_continuation = None  # Optional trainer-to-worker prediction feedback.
-        # Decision memory reads a chain's own recorded decisions: chains then start at seeds,
-        # optionally within this leading fraction of the traversal (0: ordinary fresh location).
-        self.chain_seed_only = False
-        self.chain_seed_fraction = 0.
         self.remote_prefetch = None  # Optional trainer-owned process queue client.
-        self.episodes = None  # EpisodeSpec: plans of whole episodes (memory='sequence'); chunk then counts episodes
+        self.episodes = None  # EpisodeSpec: plans of whole episodes (model 'sequence'); chunk then counts episodes
         self.remote_prefetch_lookahead = 0  # Planned microbatches per source/worker.
         self.additional_crops = tuple(additional_crops)
         # Shared by every loader worker: current update and per-event replay draw counts.
@@ -825,16 +759,9 @@ class FollowDataset(torch.utils.data.IterableDataset):
     def set_step(self, step):
         self.step.value = int(step)
 
-    def _validate(self, caches):
-        for op in caches:
-            op.validate_fibers(self.fibers)
-            if op.hist.shape[1] != self.cfg.n_history:
-                raise ValueError('Replay history length must equal n_history')
-            if op.provenance['volume']['grid_scale'] != self.vol_spec.grid_scale:
-                raise ValueError('Replay world coordinate scale differs from this run')
-
     def _set_replay(self, caches):
-        self._validate(caches)
+        if caches:
+            caches = usable_replay(caches, self.fibers, self.cfg.n_history, self.vol_spec.grid_scale)
         self.onpolicy = caches
         self.index = ReplayIndex(caches)
         self._eligible = (None, frozenset())
@@ -864,7 +791,7 @@ class FollowDataset(torch.utils.data.IterableDataset):
         with open(self.replay_index) as fh:
             paths = json.load(fh)
         if paths != self._replay_paths:
-            self._set_replay([OnPolicyStates.load(path) for path in paths])
+            self._set_replay(load_replay(paths))
             self._replay_paths = paths
 
     def prepare(self, item, rng):
@@ -911,18 +838,13 @@ class FollowDataset(torch.utils.data.IterableDataset):
             t = f.length-original_t if rev else original_t
         return int(fi), float(t), rev, 0
 
-    def fresh_item(self, rng, windows, chain_start=False, **options):
+    def fresh_item(self, rng, windows, **options):
         """A simulated trace; ``options`` fix the startup category or force an excursion."""
         for _ in range(10000):
-            leading = chain_start and self.chain_seed_fraction > 0
             item = (self.batch_builder.replace_fresh(self.cfg, rng, **options)
-                    if hasattr(self.batch_builder, 'replace_fresh') and not leading else None)
+                    if hasattr(self.batch_builder, 'replace_fresh') else None)
             if item is None:
-                if leading:
-                    fi = int(rng.choice(len(self.fibers), p=self.weights))
-                    t, rev, location = float(rng.uniform(0, self.chain_seed_fraction*self.fibers[fi].length)), bool(rng.integers(2)), 0
-                else:
-                    fi, t, rev, location = self.fresh_location(rng, windows)
+                fi, t, rev, location = self.fresh_location(rng, windows)
                 item = make_sample(self.fibers[fi], t, rev, self.cfg, rng, **options)
                 item.update(fiber_ref=(fi, t, rev), location_source=location)
                 item = self.prepare(item, rng)
@@ -940,15 +862,12 @@ class FollowDataset(torch.utils.data.IterableDataset):
                 return item
         return item
 
-    def synthetic_item(self, rng, long_tail=False):
-        """Certified wrong continuation with visible original-fiber evidence, or None.
-
-        ``long_tail``: an identity switch, whose departure only memory can reveal."""
+    def synthetic_item(self, rng):
+        """Certified wrong continuation with visible original-fiber evidence, or None."""
         if not hasattr(self.batch_builder, 'synthetic_terminal'):
             return None
         for _ in range(3):
-            item = (self.batch_builder.synthetic_terminal(self.cfg, rng, long_tail=True) if long_tail
-                    else self.batch_builder.synthetic_terminal(self.cfg, rng))
+            item = self.batch_builder.synthetic_terminal(self.cfg, rng)
             if item is None:
                 continue
             item = self.prepare(item, rng)
@@ -1078,13 +997,13 @@ class FollowDataset(torch.utils.data.IterableDataset):
     def live_start(self, rng, windows):
         """Chain starts: half recorded valid pre-excursion/recoverable prefixes, half seed-only."""
         from vesuvius.neural_tracing.fiber_follow.data.state_labels import FOLLOWING, RECOVERABLE
-        if not self.chain_seed_only and rng.random() < .5:
+        if rng.random() < .5:
             for name in ('pre_excursion', 'recoverable') if rng.random() < .5 else ('recoverable', 'pre_excursion'):
                 item = self.replay_draw(name, rng)
                 if item is not None and item['geometry_valid'] and item['supervision'] in (FOLLOWING, RECOVERABLE):
                     item.update(live_start='replay', live_loop_start=0)
                     return item
-        item = self.fresh_item(rng, windows, chain_start=True, startup=STARTUP_CATEGORIES.index('seed_only'))
+        item = self.fresh_item(rng, windows, startup=STARTUP_CATEGORIES.index('seed_only'))
         item.update(live_start='seed', live_loop_start=len(item['observed_path'])-1)
         return item
 
@@ -1097,8 +1016,8 @@ class FollowDataset(torch.utils.data.IterableDataset):
                     else None)
             if item is None:
                 item, fallback, delivered = self.fresh_item(rng, windows), 'no_live_state', 'fresh'
-        elif name in ('synthetic_terminal', 'synthetic_identity'):
-            item = self.synthetic_item(rng, long_tail=name == 'synthetic_identity')
+        elif name == 'synthetic_terminal':
+            item = self.synthetic_item(rng)
             if item is None:
                 item, fallback, delivered = self.fresh_item(rng, windows), 'fresh', 'fresh'
         else:
@@ -1374,15 +1293,6 @@ def collate_targets(items):
             out[key] = st(key)
         for key in ('geometry_valid', 'confidence_valid'):
             out[key] = torch.tensor([bool(it[key]) for it in items], dtype=torch.bool)
-        if 'crop_ab' in items[0]:
-            # Whole-crop targets need a usable original-fiber correspondence, at any distance from the head.
-            usable = torch.tensor([bool(it.get('trace_facts', {}).get('match_valid', True))
-                                   and not bool(it.get('trace_facts', {}).get('match_ambiguous', False)) for it in items])
-            out['crop_ab'] = st('crop_ab')
-            out['crop_mask'] = st('crop_mask')*usable[:, None]
-            out['crop_curve'] = st('crop_curve')
-            out['crop_curve_mask'] = torch.from_numpy(np.stack([it['crop_curve_mask'] for it in items]))&usable[:, None]
-            out['crop_curve_open_ends'] = torch.from_numpy(np.stack([it['crop_curve_open_ends'] for it in items]))
         for key in ('supervision', 'supervision_reason'):
             out[key] = torch.tensor([int(it[key]) for it in items], dtype=torch.long)
     if 'source' in items[0]:
@@ -1587,3 +1497,32 @@ class OnPolicyStates:
             self._open(state["_dir"])
         else:
             self.__dict__.update(state)
+
+
+def load_replay(paths):
+    """Replay caches at ``paths``; one that cannot be loaded is skipped with a warning."""
+    caches = []
+    for path in paths:
+        try:
+            caches.append(OnPolicyStates.load(path))
+        except (OSError, ValueError, KeyError) as error:
+            print(f'Warning: skipping replay cache {path}: {error}', flush=True)
+    return caches
+
+
+def usable_replay(caches, fibers, n_history, grid_scale):
+    """The caches whose fibers, history length and coordinate scale match this run; others are skipped with a
+    warning (their states would be labeled against different data)."""
+    usable = []
+    for op in caches:
+        try:
+            op.validate_fibers(fibers)
+            if op.hist.shape[1] != n_history:
+                raise ValueError('replay history length differs from n_history')
+            if op.provenance['volume']['grid_scale'] != grid_scale:
+                raise ValueError('replay world coordinate scale differs from this run')
+        except (ValueError, KeyError) as error:
+            print(f'Warning: skipping replay cache {getattr(op, "_dir", "")}: {error}', flush=True)
+        else:
+            usable.append(op)
+    return usable

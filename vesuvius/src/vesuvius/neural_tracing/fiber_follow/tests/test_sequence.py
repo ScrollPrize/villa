@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from model_fixtures import coordinate_batch, line_fiber
+from model_fixtures import coordinate_batch, ct_volume, line_fiber
 from vesuvius.neural_tracing.fiber_follow.data import data as D
 from vesuvius.neural_tracing.fiber_follow.models.model import build_model
 from vesuvius.neural_tracing.fiber_follow.models.sequence import SequenceConfig, relative_pose
@@ -26,7 +26,6 @@ def small_model(seed=0):
 def episode_batch(model, episodes=2, steps=5, supervised=2):
     n = episodes*steps
     batch = coordinate_batch(model.cfg, n)
-    batch['x'] = {k: v for k, v in batch['x'].items() if not k.startswith('history_')}
     step = torch.arange(steps).repeat(episodes)
     pos = torch.zeros(n, 3, dtype=torch.float64)
     pos[:, 2] = step.double()*4.
@@ -121,7 +120,6 @@ def test_training_step_on_an_episode_batch():
 
 
 def test_tracing_builds_whole_trace_history_one_step_per_commit(tmp_path):
-    from test_rollout_threading import ct_volume
     from vesuvius.neural_tracing.fiber_follow.data.observations import FiberTracer
     from vesuvius.neural_tracing.fiber_follow.tracing.trace import TraceParams
 

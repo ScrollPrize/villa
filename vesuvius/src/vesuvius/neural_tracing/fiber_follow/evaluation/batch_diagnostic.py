@@ -1,5 +1,4 @@
 """Current-microbatch contact sheets and cheap measurements; PNG/JSON only."""
-from contextlib import contextmanager
 import json
 from pathlib import Path
 import time
@@ -47,115 +46,6 @@ def tensor_stats(value):
     return dict(count=value.numel(), **dict(zip(keys, values)))
 
 
-@contextmanager
-def layer_capture(model):
-    """Capture real intermediate activations on singleton eager EMA inference.
-
-    Cached decoder methods bypass module hooks, so wrap those methods directly.
-    Store reduced spatial maps, query activations and per-slot attention, never
-    full spatial feature banks. Restore everything even after a failed forward.
-    """
-    if not hasattr(model, 'decoder'):  # models without the patch encoder/decoder (unified): predictions only
-        yield dict(encoder={}, decoder={}, scorer={}, history={}, statistics={}, history_depths={})
-        return
-    record = dict(encoder={}, decoder={}, scorer={}, history={}, statistics={},
-                  history_depths=dict(generator=len(model.decoder.layers), scorer=len(model.confidence_scorer.layers)))
-    handles, methods = [], []
-
-    def spatial(name, value, channels_last=False):
-        value = value.detach().float()
-        if not channels_last:
-            value = value.movedim(1, -1)
-        record['statistics'][name] = tensor_stats(value)
-        # RMS deviation from each channel's spatial mean survives LayerNorm;
-        # unlike post-LayerNorm RMS it can show spatially varying information.
-        contrast = (value-value.mean((1, 2, 3), keepdim=True)).square().mean(-1).sqrt()[0]
-        record['encoder'][name] = contrast[:, contrast.shape[1]//2, :].cpu()
-
-    def patch(name, module, method_name, wrapper):
-        prior = module.__dict__.get(method_name)
-        methods.append((module, method_name, prior))
-        setattr(module, method_name, wrapper(getattr(module, method_name)))
-
-    encoder = model.encoder
-    try:
-        if hasattr(encoder, 'patch_projection'):
-            handles.append(encoder.patch_projection.register_forward_hook(
-                lambda m, a, y: spatial('patch embedding', y)))
-        if encoder.stem is not None:
-            handles.append(encoder.stem.register_forward_hook(lambda m, a, y: spatial('CT stem', y)))
-        for index in sorted({0, len(encoder.blocks)//2, len(encoder.blocks)-1}):
-            if index >= 0:
-                handles.append(encoder.blocks[index].register_forward_hook(
-                    lambda m, a, y, index=index: spatial(f'encoder block {index+1}', y, True)))
-        handles.append(encoder.norm.register_forward_hook(lambda m, a, y: spatial('encoder output', y, True)))
-
-        # The decoder has one query per path plane (all crop planes for whole-crop models); the scorer one per proposal plane.
-        queries = dict(decoder=len(getattr(model.cfg, 'path_plane_values', range(model.cfg.n_future))), scorer=model.cfg.n_future)
-        for head, modules in (('decoder', model.decoder.layers), ('scorer', model.confidence_scorer.layers)):
-            for index, module in enumerate(modules):
-                def wrap(original, head=head, index=index):
-                    def forward(*args, **kwargs):
-                        if index == 0:
-                            record[head].setdefault('input', []).append(args[0].detach().float().reshape(-1, queries[head], model.cfg.hidden)[0].cpu())
-                        result = original(*args, **kwargs)
-                        record[head].setdefault(f'block {index+1}', []).append(result.detach().float().reshape(-1, queries[head], model.cfg.hidden)[0].cpu())
-                        return result
-                    return forward
-                patch(head, module, 'forward_draws' if head == 'decoder' and hasattr(model, 'velocity_field') else 'forward_cached', wrap)
-        handles.append(model.decoder.norm.register_forward_hook(
-            lambda m, a, y: record['decoder'].setdefault('output', []).append(y.detach().float().reshape(-1, queries['decoder'], model.cfg.hidden)[0].cpu())))
-
-        if getattr(model, 'history_encoder', None) is None:  # no memory: nothing to capture below
-            yield record
-            return
-
-        def history_conv(m, a, y):
-            record['statistics']['history convolution'] = tensor_stats(y)
-            record['history']['convolution'] = y.detach().float().square().mean((1, 2)).sqrt().cpu()
-        if hasattr(model.history_encoder, 'convolution'):
-            handles.append(model.history_encoder.convolution.register_forward_hook(history_conv))
-        else:
-            record['history']['convolution'] = None  # decision memory: entries come from the main encoder
-        def history_tokens(m, a, y):
-            tokens, padding = y
-            slots = a[1].shape[1]
-            record['statistics']['history tokens'] = tensor_stats(tokens[~padding])
-            # Center spatial features within each slot before reducing channels.
-            values = tokens.detach().float().reshape(1, slots, m.tokens_per_slab, -1)
-            values = values[:, :, :m.spatial_tokens_per_slab].reshape(1, slots, *m.token_shape, -1)
-            contrast = (values-values.mean((2, 3, 4), keepdim=True)).square().mean(-1).sqrt().mean(2)
-            record['history']['tokens'] = contrast[0].cpu()
-        handles.append(model.history_encoder.register_forward_hook(history_tokens))
-
-        for name, module in (('generator', model.history_attention),
-                             ('scorer', model.confidence_scorer.history_attention)):
-            def wrap(original, module=module, name=name):
-                def forward(query, k, v, allowed, empty):
-                    attn = module.attention
-                    width, heads = attn.embed_dim, attn.num_heads
-                    q = F.linear(module.norm(query), attn.in_proj_weight[:width], attn.in_proj_bias[:width])
-                    q = q.reshape(len(query), -1, heads, width//heads).transpose(1, 2)
-                    scores = (q.float() @ k.float().transpose(-1, -2))/(width//heads)**.5
-                    probabilities = scores.masked_fill(~allowed, -torch.inf).softmax(-1)
-                    probabilities = probabilities.masked_fill(empty[:, None, None, None], 0.)
-                    per_slab = model.history_encoder.tokens_per_slab
-                    slots = probabilities.shape[-1]//per_slab
-                    weights = probabilities.reshape(*probabilities.shape[:-1], slots, per_slab).sum(-1).mean(1)
-                    record['history'].setdefault(name+'_attention', []).append(weights[0].detach().cpu())
-                    return original(query, k, v, allowed, empty)
-                return forward
-            patch(name, module, 'forward_cached', wrap)
-        yield record
-    finally:
-        for handle in handles:
-            handle.remove()
-        for module, name, prior in reversed(methods):
-            if prior is None:
-                delattr(module, name)
-            else:
-                setattr(module, name, prior)
-@torch.no_grad()
 def decision_details(output, batch, cfg, n_commit, tolerance):
     """Use training's identity-aware labels and the actual deployed commit policy."""
     curve = output['points']
@@ -179,7 +69,7 @@ def decision_details(output, batch, cfg, n_commit, tolerance):
                              error=float(error[valid].mean()) if valid.any() else None,
                              commit=int(count[0])))
     frame_quality = {key: value[0] for key, value in batch['x'].items()
-                     if key.startswith(('ct_frame_', 'history_frame_'))}
+                     if key.startswith('ct_frame_')}
     return cpu_values(dict(labels=labels[0], known=known[0], error=errors(curve)[0],
         initial_error=errors(output['initial_points'])[0], commit=int(counts[0]),
         connection_allowed=bool(allowed[0]), attempts=attempts, frame_quality=frame_quality))
@@ -217,29 +107,6 @@ def measured_geometry(batch):
                 frame_columns_uv_heading_xyz=cpu_values(batch['crop_frame'][0]) if 'crop_frame' in batch else None)
 
 
-def decision_memory_rows(model, cpu_batch, device, memory=None):
-    """Resolve batch-level decision memory into per-row features before rows are sliced.
-
-    Crops of unrecorded entries are stacked per batch, not per row, and recorded entries
-    live in the trainer's store. Without the store, recorded slots are dropped (invalid).
-    """
-    from vesuvius.neural_tracing.fiber_follow.train.train import move_batch
-    batch = move_batch(cpu_batch, device)
-    x = batch['x']
-    recorded = x['history_keys'] >= 0
-    if memory is not None and bool(recorded.any()):
-        x['history_features'], found = memory.attach_memory(x, model.cfg.memory_entry_shape)
-    else:
-        found = torch.zeros_like(recorded)
-    x['history_valid'] = x['history_valid'] & ~(recorded & ~found)
-    with torch.autocast('cuda', dtype=torch.bfloat16, enabled=torch.device(device).type == 'cuda'):
-        x['history_features'] = model.memory_features(x)
-    for key in ('history_crops', 'history_references', 'history_reference_mask'):
-        x.pop(key)
-    x['history_encode'] = torch.zeros_like(x['history_encode'])
-    return batch
-
-
 SEQUENCE_EPISODES, SEQUENCE_DECISIONS = 4, 4  # sequence sheets: the last decisions of the first episodes
 
 
@@ -266,7 +133,7 @@ def sequence_rows(model, cpu_batch, device, n_commit):
 
 @torch.no_grad()
 def render_microbatch(model, cpu_batch, out, step, *, device, n_commit, tolerance,
-                      dataset_names=(), training_metrics=None, memory=None, tube_sigma=1.5):
+                      dataset_names=(), training_metrics=None):
     """One sheet per image type; every current-microbatch row, in loader order."""
     from vesuvius.neural_tracing.fiber_follow.train.train import move_batch
     from vesuvius.neural_tracing.fiber_follow.evaluation.diagnostic_plots import plot_sheets
@@ -275,12 +142,9 @@ def render_microbatch(model, cpu_batch, out, step, *, device, n_commit, toleranc
     started = time.perf_counter()
     was_training = model.training
     model.eval()
-    examples, rows, whole = [], [], []
-    whole_crop = getattr(model.cfg, 'path_planes', 'future') == 'crop' or getattr(model.cfg, 'tube_head', False)
+    examples, rows = [], []
     inference_seconds = 0.
     try:
-        if getattr(model.cfg, 'memory', 'slabs') == 'decisions':
-            cpu_batch = decision_memory_rows(model, cpu_batch, device, memory)
         episode_outputs = None
         if model.model_type == 'sequence':
             cpu_batch, episode_outputs = sequence_rows(model, cpu_batch, device, n_commit)
@@ -290,21 +154,11 @@ def render_microbatch(model, cpu_batch, out, step, *, device, n_commit, toleranc
             # unambiguous, and bounds peak diagnostic GPU memory.
             begin = time.perf_counter()
             with torch.autocast('cuda', dtype=torch.bfloat16, enabled=torch.device(device).type == 'cuda'):
-                with layer_capture(model) as layers:
-                    if episode_outputs is None:
-                        output = model(batch['x'], batch['hist'], batch['hmask'], n_commit=n_commit)
-                    else:  # a sequence decision, predicted with its episode's history (sequence_rows)
-                        output = {key: value[i:i+1] for key, value in episode_outputs.items()}
+                if episode_outputs is None:
+                    output = model(batch['x'], batch['hist'], batch['hmask'], n_commit=n_commit)
+                else:  # a sequence decision, predicted with its episode's history (sequence_rows)
+                    output = {key: value[i:i+1] for key, value in episode_outputs.items()}
             details = decision_details(output, batch, model.cfg, n_commit, tolerance)
-            whole_metrics = {}
-            if whole_crop:
-                # Whole-crop path and tube exist in the training forward only (same EMA weights, eval mode).
-                from vesuvius.neural_tracing.fiber_follow.evaluation.diagnostic_plots import whole_crop_example
-                with torch.autocast('cuda', dtype=torch.bfloat16, enabled=torch.device(device).type == 'cuda'):
-                    full = model.select_prediction(model.training_forward(
-                        batch['x'], batch['hist'], batch['hmask'], batch['hist'].new_full((), .5)), .5, n_commit)
-                view, whole_metrics = whole_crop_example(batch, full, model.cfg, f'{i:02d}', tube_sigma)
-                whole.append(view)
             output, batch = cpu_values(output), cpu_values(batch)
             inference_seconds += time.perf_counter()-begin  # CPU transfer above synchronizes CUDA.
             dataset_id = int(batch['dataset_id'][0]) if 'dataset_id' in batch else 0
@@ -314,10 +168,6 @@ def render_microbatch(model, cpu_batch, out, step, *, device, n_commit, toleranc
             known = details['known'].bool()
             errors = details['error'][torch.isfinite(details['error'])]
             confidence = output['confidence'][0]
-            stats = dict(layers['statistics'])
-            for head in ('decoder', 'scorer'):
-                for stage, attempts in layers[head].items():
-                    stats[f'{head} {stage}'] = [tensor_stats(a) for a in attempts]
             row = dict(example=i, dataset=name, dataset_id=dataset_id,
                 source=int(batch['source'][0]) if 'source' in batch else None,
                 terminal=bool(batch['terminal'][0]), supervision=int(batch['supervision'][0]),
@@ -329,27 +179,15 @@ def render_microbatch(model, cpu_batch, out, step, *, device, n_commit, toleranc
                 max_error=float(errors.max()) if len(errors) else None,
                 known_prefixes=int(known.sum()),
                 prefix_brier=float((confidence[known]-details['labels'][known]).square().mean()) if known.any() else None,
-                **({} if 'history_valid' not in batch['x'] else dict(
-                    history_valid=batch['x']['history_valid'][0], history_ages=batch['x']['history_ages'][0])),
-                ct_statistics=tensor_stats(batch['x']['fine'][:, 0]), activation_statistics=stats, **whole_metrics)
-            for key in ('generator_attention', 'scorer_attention'):
-                if key in layers['history']:
-                    row[key] = layers['history'][key]
+                ct_statistics=tensor_stats(batch['x']['fine'][:, 0]))
             rows.append(row)
             # Retain only display-sized CT sections and reduced features on CPU.
             from vesuvius.neural_tracing.fiber_follow.evaluation.diagnostic_plots import display_example
-            examples.append(display_example(batch, output, details, layers, model.cfg, label, row))
+            examples.append(display_example(batch, output, details, model.cfg, label, row))
         plot_sheets(examples, model.cfg, folder, step)
-        if whole:
-            from vesuvius.neural_tracing.fiber_follow.evaluation.diagnostic_plots import plot_whole_crop
-            plot_whole_crop(whole, model.cfg, folder/'whole_crop.png', step)
         errors = [r['mean_error'] for r in rows if r['mean_error'] is not None]
         report = dict(step=step, split='current_training_microbatch', model='EMA', model_type=model.model_type, examples=len(rows),
             n_commit=n_commit, tolerance=tolerance,
-            **({} if getattr(model, 'history_encoder', None) is None else dict(history_encoder=dict(
-                variant='fine', token_shape=model.history_encoder.token_shape,
-                tokens_per_slab=model.history_encoder.tokens_per_slab,
-                feature_channels=model.history_encoder.projection.in_features))),
             summary=dict(committed_points=sum(r['commit'] for r in rows),
                 stopped=sum(r['commit'] == 0 for r in rows),
                 mean_example_error=sum(errors)/len(errors) if errors else None,
@@ -357,10 +195,7 @@ def render_microbatch(model, cpu_batch, out, step, *, device, n_commit, toleranc
             timing=dict(inference_and_measurement_seconds=inference_seconds,
                         total_diagnostic_seconds=time.perf_counter()-started),
             training_update=training_metrics or {}, rows=rows,
-            interpretation=dict(encoder='Channel RMS deviation from spatial mean, fixed central v token section.',
-                decoder='Actual query activations at the selected proposal (last velocity evaluation for flow); signed values, not spatial images.',
-                history='CT inputs, convolution/token features and attention mass; attention is not attribution.',
-                orientation='Fixed CT sections and annotation in the actual crop frame; no GT-following reslicing.',
+            interpretation=dict(orientation='Fixed CT sections and annotation in the actual crop frame; no GT-following reslicing.',
                 confidence='Prefix survival; unknown labels excluded from error and calibration metrics.',
                 sampling='Current augmented training microbatch; not held-out validation.'))
         (folder/'metrics.json').write_text(json.dumps(json_values(report), indent=2, allow_nan=False)+'\n')

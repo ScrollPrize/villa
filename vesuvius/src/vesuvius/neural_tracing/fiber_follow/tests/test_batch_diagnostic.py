@@ -7,77 +7,20 @@ from PIL import Image
 import pytest
 import torch
 
-from model_fixtures import coordinate_batch as batch, coordinate_config
+from model_fixtures import coordinate_batch as batch, coordinate_config, flow_config
 from label_fixtures import set_terminal
-from vesuvius.neural_tracing.fiber_follow.models.model import CoordinateRegressionFollower
-from vesuvius.neural_tracing.fiber_follow.evaluation.batch_diagnostic import layer_capture, render_microbatch
+from vesuvius.neural_tracing.fiber_follow.models.model import build_model
+from vesuvius.neural_tracing.fiber_follow.evaluation.batch_diagnostic import render_microbatch
 
 
-def test_layer_capture_preserves_predictions_and_cleans_up():
-    cfg = coordinate_config(recurrent_refinement_steps=1)
-    model = CoordinateRegressionFollower(cfg).eval()
-    data = batch(cfg, 1)
-    weights = copy.deepcopy(model.state_dict())
-    rng = torch.get_rng_state()
-    with torch.no_grad():
-        expected = model(data['x'], data['hist'], data['hmask'], confidence_threshold=1.)
-        with layer_capture(model) as layers:
-            actual = model(data['x'], data['hist'], data['hmask'], confidence_threshold=1.)
-    for key in expected:
-        torch.testing.assert_close(actual[key], expected[key], rtol=0, atol=0)
-    torch.testing.assert_close(torch.get_rng_state(), rng, rtol=0, atol=0)
-    for key, value in weights.items():
-        torch.testing.assert_close(model.state_dict()[key], value, rtol=0, atol=0)
-    assert layers['statistics']['CT stem']['rms'] > 0
-    assert layers['statistics']['patch embedding']['rms'] > 0
-    assert set(layers['decoder']) == {'input', 'block 1', 'output'}
-    assert set(layers['scorer']) == {'input', *[f'block {i+1}' for i in range(model.cfg.scorer_layers)]}
-    assert layers['history_depths'] == {'generator': model.cfg.decoder_layers, 'scorer': model.cfg.scorer_layers}
-    assert layers['encoder']['encoder output'].ndim == 2
-    assert layers['history']['tokens'].shape == (8, 17, 17)
-    assert layers['history']['convolution'].shape == (2, 17, 17)
-    for head in ('generator', 'scorer'):
-        for attention in layers['history'][head+'_attention']:
-            assert torch.isfinite(attention).all()
-            torch.testing.assert_close(attention.sum(-1), torch.ones(cfg.n_future))
-            assert not attention[:, 2:].any()
-    # Distinct layer/attempt values catch averaging the wrong retry or layer count.
-    from vesuvius.neural_tracing.fiber_follow.evaluation.diagnostic_plots import display_example
-    assert len(layers['history']['scorer_attention']) == 2*model.cfg.scorer_layers
-    for head, depth in layers['history_depths'].items():
-        layers['history'][head+'_attention'] = [torch.full((cfg.n_future, 8), 100.*attempt+layer)
-            for attempt in range(2) for layer in range(depth)]
-    selected = dict(actual, selected_refinement=torch.ones(1, dtype=torch.long))
-    example = display_example(data, selected, {}, layers, cfg, 'test', {})
-    np.testing.assert_allclose(example['attention']['scorer'], 100.+(model.cfg.scorer_layers-1)/2)
-    np.testing.assert_allclose(example['attention']['generator'], 100.)
-    assert 'forward_cached' not in model.history_attention.__dict__
-    assert not model.encoder.patch_projection._forward_hooks
-    with pytest.raises(RuntimeError):
-        with layer_capture(model):
-            raise RuntimeError('inference failed')
-    assert 'forward_cached' not in model.confidence_scorer.history_attention.__dict__
-    assert not model.encoder.blocks[0]._forward_pre_hooks
-
-
-@pytest.mark.parametrize('kind', ['coordinate_regression', 'flow_matching', 'unified'])
+@pytest.mark.parametrize('kind', ['regression', 'flow'])
 def test_render_emits_readable_images_strict_json_and_preserves_rng(tmp_path, kind):
-    from test_flow_model import config as flow_config
-    from test_unified import small
-    from vesuvius.neural_tracing.fiber_follow.models.model import build_model
-    if kind == 'unified':
-        model = small().train()
-        cfg = model.cfg
-    else:
-        cfg = coordinate_config(recurrent_refinement_steps=1) if kind == 'coordinate_regression' else flow_config()
-        model = build_model(cfg).train()
+    cfg = coordinate_config(recurrent_refinement_steps=1) if kind == 'regression' else flow_config()
+    model = build_model(cfg).train()
     data = batch(cfg, 3)
     data['identity_observable'] = torch.tensor([0., 1., 1.])
     data['dense_mask'][1] = 0
     data['dense_ab'][1] = float('nan')
-    data['x']['history_valid'][1] = False
-    if kind == 'unified':  # no memory inputs, as the memory-free data builders emit
-        data['x'] = {key: value for key, value in data['x'].items() if not key.startswith('history_')}
     set_terminal(data, 2)
     rng, numpy_rng = torch.get_rng_state(), np.random.get_state()
     data['dataset_id'] = torch.tensor([0, 1, 0])
@@ -95,18 +38,26 @@ def test_render_emits_readable_images_strict_json_and_preserves_rng(tmp_path, ki
     assert report['examples'] == rows['examples'] == 3
     assert report['training_update']['loss'] == .2
     assert [r['dataset'] for r in report['rows']] == ['ordinary', 'unknown', 'ordinary']
-    if kind == 'unified':  # no memory, patch encoder or decoder: prediction sheets only
-        assert {p.name for p in folder.iterdir()} == {'predictions.png', 'crop_orientation.png', 'metrics.json'}
-    else:
-        assert report['history_encoder'] == dict(variant='fine', token_shape=[2, 17, 17],
-            tokens_per_slab=2*17*17+3, feature_channels=128)
-        assert {p.name for p in folder.iterdir()} == {
-            'predictions.png', 'crop_orientation.png', 'encoder.png', 'decoder.png', 'history.png', 'metrics.json'}
+    assert {p.name for p in folder.iterdir()} == {'predictions.png', 'crop_orientation.png', 'metrics.json'}
     assert not any(p.suffix in ('.npz', '.npy', '.pt') for p in tmp_path.rglob('*'))
     for path in folder.glob('*.png'):
         with Image.open(path) as image:
             assert image.width > 500 and image.height > 500
             image.verify()
+
+
+def test_render_shows_sequence_decisions_with_their_episode_history(tmp_path):
+    from test_sequence import episode_batch, small_model
+    from vesuvius.neural_tracing.fiber_follow.evaluation.batch_diagnostic import SEQUENCE_DECISIONS
+    model = small_model().train()
+    data = episode_batch(model, episodes=2, steps=5, supervised=2)
+    data['dataset_id'] = torch.zeros(len(data['hist']), dtype=torch.long)
+    rows = render_microbatch(model, data, tmp_path, 1000, device='cpu', n_commit=4, tolerance=1.5,
+                             dataset_names=['ordinary'])
+    assert rows['examples'] == 2*min(2, SEQUENCE_DECISIONS)  # the supervised decisions of each episode
+    assert model.training and all(p.grad is None for p in model.parameters())
+    folder = tmp_path/'diagnostic_images'/'1000'
+    assert {p.name for p in folder.iterdir()} == {'predictions.png', 'crop_orientation.png', 'metrics.json'}
 
 
 def test_diagnostic_annotation_uses_final_crop_frame_without_changing_world_geometry(monkeypatch):
@@ -159,56 +110,3 @@ def test_diagnostic_helpers_report_unknown_values_and_clip_annotation_to_section
     is_green = (pixels[..., 1].astype(int) > pixels[..., 0].astype(int)+30) & (pixels[..., 2] < 100)
     assert is_green[62:, :CELL[0]].any()
     assert not is_green[62:, 2*CELL[0]:3*CELL[0]].any()
-
-
-def test_render_resolves_decision_memory_before_slicing_rows(tmp_path):
-    from test_decision_memory import memory_config, decision_inputs
-    from vesuvius.neural_tracing.fiber_follow.models.model import build_model
-    from vesuvius.neural_tracing.fiber_follow.models.decision_memory import ENTRY_FEATURES
-    from vesuvius.neural_tracing.fiber_follow.train.live_continuation import DecisionStore, LiveContinuation
-    cfg = memory_config(recurrent_refinement_steps=1)
-    model = build_model(cfg).eval()
-    data = batch(cfg, 3)
-    data['x'] = {k: v for k, v in data['x'].items() if not k.startswith('history_')}
-    data['x'].update(decision_inputs(cfg, 3, crops=1))
-    # Row 1 reads one entry encoded from a crop; row 2 one recorded chain entry; row 0 none.
-    data['x']['history_valid'][1, 0] = data['x']['history_encode'][1, 0] = True
-    data['x']['history_crops'][:] = torch.rand_like(data['x']['history_crops'])
-    data['x']['history_valid'][2, 0] = True
-    data['x']['history_keys'][2, 0], data['x']['history_chain'][2] = 4, 77
-    data['x']['history_path_valid'][1:, 0] = True
-    live = LiveContinuation.__new__(LiveContinuation)
-    live.memory = DecisionStore(max_age=10)
-    live.memory.put(77, 4, torch.randn(ENTRY_FEATURES, cfg.hidden).to(torch.bfloat16), {4}, step=0)
-    data['dataset_id'] = torch.tensor([0, 0, 0])
-    rows = render_microbatch(model, data, tmp_path, 1000, device='cpu', n_commit=4, tolerance=1.5,
-                             dataset_names=['ordinary'], memory=live)
-    report = json.loads((tmp_path/'diagnostic_images'/'1000'/'metrics.json').read_text())
-    assert rows['examples'] == 3
-    assert [sum(r['history_valid']) for r in report['rows']] == [0, 1, 1]
-    assert report['history_encoder']['token_shape'] == [3, 11, 11]
-    # Without the store, recorded slots are dropped instead of read as zeros.
-    rows = render_microbatch(model, data, tmp_path/'none', 1000, device='cpu', n_commit=4, tolerance=1.5,
-                             dataset_names=['ordinary'])
-    report = json.loads((tmp_path/'none'/'diagnostic_images'/'1000'/'metrics.json').read_text())
-    assert [sum(r['history_valid']) for r in report['rows']] == [0, 1, 0]
-
-
-def test_whole_crop_models_render_the_path_and_tube_sheet(tmp_path):
-    from test_whole_crop import crop_batch
-    from vesuvius.neural_tracing.fiber_follow.models.model import build_model
-    from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
-    torch.manual_seed(7)
-    cfg = coordinate_config(fine=CropSpec(depth=24, width=20, behind=12, spacing=1.), n_future=4,
-                            path_planes='crop', tube_head=True, memory='none')
-    model = build_model(cfg)
-    data = crop_batch(cfg, 2)
-    data['dataset_id'] = torch.tensor([0, 0])
-    summary = render_microbatch(model, data, tmp_path, 1000, device='cpu', n_commit=4, tolerance=1.5)
-    folder = tmp_path/'diagnostic_images'/'1000'
-    assert summary['examples'] == 2 and (folder/'whole_crop.png').stat().st_size > 0
-    assert not (folder/'history.png').exists()
-    report = json.loads((folder/'metrics.json').read_text())
-    for row in report['rows']:
-        assert row['crop_path_error'] >= 0 and row['commit_path_error'] >= 0 and row['tube_bce'] > 0
-        assert 'history_valid' not in row

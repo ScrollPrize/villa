@@ -1,4 +1,5 @@
 """Stop a named trainer, its descendants, and its orphaned DAgger collectors."""
+import json
 from pathlib import Path
 import sys
 
@@ -6,6 +7,7 @@ import psutil
 
 PREFIX = 'vesuvius.neural_tracing.fiber_follow.'
 TRAINERS = (PREFIX+'train.train',)
+TRAINER_SCRIPT = 'fiber_follow/train/train.py'
 COLLECTORS = (PREFIX+'tracing.collect',)
 
 
@@ -14,6 +16,19 @@ def option(args, key):
         return args[args.index(key)+1]
     except (ValueError, IndexError):
         return None
+
+
+def trainer_matches(args, name, cwd='.'):
+    """A trainer (``train/train.py`` or ``-m ...train.train``) whose run configuration is named ``name``."""
+    if option(args, '-m') not in TRAINERS and not any(str(a).endswith(TRAINER_SCRIPT) for a in args):
+        return False
+    config = option(args, '--config')
+    if config is None:
+        return False
+    try:
+        return json.loads((Path(cwd)/config).read_text()).get('name') == name
+    except (OSError, ValueError):
+        return False
 
 
 def collector_matches(args, run_dir):
@@ -45,19 +60,21 @@ def alive(process):
         return False
 
 
-def stop_run(pid_file, name):
+def stop_run(pid_file, name, run_dir=None):
+    """``pid_file``: the launcher's ``output/logs/NAME.pid`` or the trainer's ``output/NAME/trainer.pid``."""
     if name in ('', '.', '..') or Path(name).name != name:
         raise ValueError('Run name must be a single directory name')
     pid_file = Path(pid_file)
-    run_dir = pid_file.parent.parent/name
+    if run_dir is None:
+        run_dir = pid_file.parent if pid_file.name == 'trainer.pid' else pid_file.parent.parent/name
     roots = []
     try:
         parent = psutil.Process(int(pid_file.read_text().strip()))
-        args = parent.cmdline()
+        args, cwd = parent.cmdline(), parent.cwd()
     except (FileNotFoundError, psutil.NoSuchProcess):
         parent = None
     if parent is not None:
-        if option(args, '-m') not in TRAINERS or option(args, '--name') != name:
+        if not trainer_matches(args, name, cwd):
             raise RuntimeError(f'Refusing to stop PID {parent.pid}: it does not match run {name}')
         parent.suspend()  # No new collectors while we scan for orphans.
         roots.append(parent)

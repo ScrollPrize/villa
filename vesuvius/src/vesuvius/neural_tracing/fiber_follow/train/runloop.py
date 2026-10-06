@@ -1,9 +1,8 @@
 """Method-agnostic pieces of a fiber_follow training run.
 
-Shared by coordinate regression and flow matching:
-run directory creation, the JSON-lines log, the
+Shared by every model type: run directory creation, the JSON-lines log, the
 warmup-cosine schedule, one guarded optimizer step, and checkpoint I/O that
-records which model type and data policy produced the weights.
+records which model type produced the weights.
 """
 from __future__ import annotations
 
@@ -16,7 +15,6 @@ import sys
 import numpy as np
 import torch
 
-from vesuvius.neural_tracing.fiber_follow.data.data import DATA_POLICY
 
 
 def raise_open_file_limit():
@@ -41,15 +39,14 @@ def raise_open_file_limit():
 def prepare_run_dir(out_root, name, resume=False) -> Path:
     """Create ``out_root/name``; refuse to reuse a directory that holds a run.
 
-    With ``resume`` the directory must already hold a run and is reused.
+    With ``resume`` the directory is reused (and created if missing).
     """
     out = Path(out_root) / name
     if resume:
-        if not (out / 'config.json').exists():
-            raise FileNotFoundError(f'{out} holds no run to resume')
+        out.mkdir(parents=True, exist_ok=True)
         return out
     if (out / 'config.json').exists():
-        raise FileExistsError(f'{out} already contains a run; use a new --name or --resume')
+        raise FileExistsError(f'{out} already contains a run; use a new name or --resume')
     out.mkdir(parents=True, exist_ok=True)
     return out
 
@@ -82,18 +79,17 @@ def lr_at(step: int, base_lr: float, warmup: int, total_steps: int, offset: int 
 
 
 def save_checkpoint(path, model, vol_spec, crop, n_history, model_type, extra=None):
-    torch.save(dict(model_type=model_type, data_policy=DATA_POLICY, model=model.state_dict(),
+    torch.save(dict(model_type=model_type, model=model.state_dict(),
                     model_cfg=model.cfg.to_dict(), crop=dataclasses.asdict(crop),
                     n_history=n_history, vol_spec=vol_spec.to_dict(), **(extra or {})), path)
 
 
-def read_checkpoint(path, model_types, device='cuda'):
+def read_checkpoint(path, device='cuda'):
+    from vesuvius.neural_tracing.fiber_follow.models.model import MODEL_TYPES
     ck = torch.load(path, map_location=device, weights_only=False)
-    accepted = (model_types,) if isinstance(model_types, str) else tuple(model_types)
-    if ck.get('model_type') not in accepted:
-        raise ValueError(f'Unsupported checkpoint model type: {ck.get("model_type")}')
-    if ck.get('kind') != 'weights' and ck.get('data_policy') != DATA_POLICY:
-        raise ValueError(f'Checkpoint {path} uses a different training data policy')
+    if ck.get('model_type') not in MODEL_TYPES:
+        raise ValueError(f'Unsupported checkpoint model type {ck.get("model_type")!r} in {path}; checkpoints from '
+                         'before the model cleanup need scripts/convert_checkpoint.py')
     return ck
 
 
@@ -144,5 +140,6 @@ def resume_training(ck, model, ema, opt, *, reset_optimizer=False):
     ema.load_state_dict(ck['ema'])
     if not reset_optimizer:
         opt.load_state_dict(ck['optimizer'])
-    restore_training_rng(ck['rng'])
+    if 'rng' in ck:
+        restore_training_rng(ck['rng'])
     return int(ck['step']), int(ck.get('replay_seen', 0))

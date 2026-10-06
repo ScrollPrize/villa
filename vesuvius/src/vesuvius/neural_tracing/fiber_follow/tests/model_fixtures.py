@@ -1,9 +1,9 @@
-"""Shared model, batch and CLI fixtures.
+"""Shared model, batch and run-configuration fixtures.
 
-``coordinate_config``/``coordinate_batch`` are a small version of the model the coordinate regression run trains
-(scripts/train_coordinate_regression.sh): CT-only input, patch4 token-only encoder with a residual stem, fine
-history encoder with path and path-geometry tokens, recurrent refinement. ``config``/``batch``
-are the small generic model fixtures.
+``config`` is a small regression model (models/crop_transformer.py), the crop/horizon/label contract most tests use;
+``coordinate_config`` adds recurrent refinement. ``coordinate_batch``/``batch`` hold every input the crop transformer
+reads (CT crop, seed, observed path and path-geometry tokens) with label targets. ``run_document``/``run_args`` give a
+run configuration (train/run_config.py) and the trainer settings resolved from it.
 """
 import json
 from dataclasses import replace
@@ -11,37 +11,88 @@ from dataclasses import replace
 import numpy as np
 import torch
 
-from vesuvius.neural_tracing.fiber_follow.models.model import CoordinateRegressionConfig
+from vesuvius.neural_tracing.fiber_follow.models.crop_transformer import FlowConfig, RegressionConfig
 from vesuvius.neural_tracing.fiber_follow.data.data import TracedFiber
-from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
+from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, arclength
 from label_fixtures import state_labels
 
-REQUIRED = ['--name', 'test', '--fiber-zarrs', 'unused', '--fibers', 'unused',
-            '--ct', 'unused', '--manifest', 'unused']
+SMALL = dict(hidden=16, heads=2, layers=1, ffn=32, cnn_channels=(4, 8), cnn_blocks=(1, 1), n_future=4, n_history=32,
+             gate_plane=None, recurrent_refinement_steps=0)
+
+
+def small_crop(crop):
+    """Round a crop up to the small models' token stride (4)."""
+    return replace(crop, depth=4*((crop.depth+3)//4), width=4*((crop.width+3)//4))
 
 
 def config(**kwargs):
-    options = dict(fine=CropSpec(depth=24, width=20, behind=8), hidden=16,
-                   heads=2, layers=1, decoder_layers=1, n_future=4, n_history=32, activation_checkpointing=False,
-                   recurrent_refinement_steps=0, stem_channels=4, encoder_ffn=32, decoder_ffn=32, scorer_layers=1)
+    options = dict(SMALL, fine=CropSpec(depth=24, width=20, behind=8))
     options.update(kwargs)
-    crop = options['fine']
-    options['fine'] = replace(crop, depth=4*((crop.depth+3)//4), width=4*((crop.width+3)//4))
-    return CoordinateRegressionConfig(**options)
+    options['fine'] = small_crop(options['fine'])
+    return RegressionConfig(**options)
 
 
 def coordinate_config(**kwargs):
-    options = dict(fine=CropSpec(depth=16, width=12, behind=7), stem_channels=4, stem_blocks=2, layers=2, recurrent_refinement_steps=3)
+    options = dict(fine=CropSpec(depth=16, width=12, behind=7), layers=2, recurrent_refinement_steps=3)
     options.update(kwargs)
     return config(**options)
 
 
-def slab_inputs(b):
-    valid = torch.zeros(b, 8, dtype=torch.bool)
-    valid[:, :2] = True
-    return dict(history_slabs=torch.rand(b, 8, 2, 8, 65, 65), history_valid=valid,
-                history_pose=torch.zeros(b, 8, 14), history_ages=torch.zeros(b, 8),
-                history_overlap=torch.zeros(b, 8), history_load_seconds=torch.zeros(b))
+def flow_config(**kwargs):
+    """A small flow model with fixed residual scales."""
+    options = dict(SMALL, fine=CropSpec(depth=16, width=12, behind=7), layers=2, flow_steps=2, flow_draws=3,
+                   flow_samples=0, flow_time_conditioning='input', flow_sigma_floor=1., flow_unknown_planes='padded',
+                   flow_loss='mse')
+    options.update(kwargs)
+    options.pop('recurrent_refinement_steps', None)
+    options['fine'] = small_crop(options['fine'])
+    options.setdefault('flow_sigma', ((1., 1.),)*options['n_future'])
+    return FlowConfig(**options)
+
+
+def observation(path):
+    path = np.asarray(path, dtype=float)
+    return dict(pos=path[-1].copy(), frame=np.eye(3), hist_local=np.zeros((32, 3)), hmask=np.zeros(32),
+                observed_path=path, seed_pos=path[0].copy(), seed_tangent=np.array([0., 0., 1.]),
+                seed_age=float(arclength(path)[-1]), seed_valid=True)
+
+
+def fake_ct(monkeypatch):
+    """Constant-heading CT frames and crops filled with each item's z/512; returns the items read."""
+    calls = []
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.tracing.heading.ct_tensor',
+                        lambda vol,pos: np.outer(np.array([0., 1., 0.]), np.array([0., 1., 0.])))
+    def scalar(items, vol, crop, pool=None, *, presence=False, **kwargs):
+        assert not presence
+        calls.extend(items)
+        return torch.stack([torch.full((1,crop.depth,crop.width,crop.width),float(i['pos'][2])/512)
+                            for i in items])
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.data.crop_sampling.scalar_crops',scalar)
+    return calls
+
+
+def dataset_document(root='/data'):
+    """A structurally valid dataset configuration (no files are read)."""
+    return dict(version=1, cache_dir=f'{root}/cache', sources=[dict(
+        name='paris4', kind='paris4', weight=1., fibers=f'{root}/fibers', fiber_zarrs=f'{root}/fiber_zarrs',
+        ct=f'{root}/ct.zarr', manifest=f'{root}/seeds.json', negative_bank=f'{root}/bank', val_z=[45000., 48500.],
+        validation=dict(strategy='fiber_hash', fraction=.1, seed=7349))])
+
+
+def run_document(model='regression', *, training=None, runtime=None, **model_fields):
+    document = dict(name='test', dataset=dataset_document(), model=dict(type=model, **model_fields))
+    if training:
+        document['training'] = training
+    if runtime:
+        document['runtime'] = runtime
+    return document
+
+
+def run_args(model='regression', *, training=None, runtime=None, **model_fields):
+    """Trainer settings (``args``) of a resolved run configuration."""
+    from vesuvius.neural_tracing.fiber_follow.train import run_config
+    return run_config.namespace(run_config.resolve(run_document(model, training=training, runtime=runtime,
+                                                                **model_fields)))
 
 
 def raw_batch(cfg, b=2):
@@ -51,42 +102,24 @@ def raw_batch(cfg, b=2):
     x = dict(fine=torch.rand(b, cfg.input_channels, cfg.fine.depth, cfg.fine.width, cfg.fine.width),
              seed=torch.zeros(b, 1, 3), seed_mask=torch.ones(b, 1), seed_tangent=torch.tensor([0., 0., 1.]).expand(b, -1),
              seed_age=torch.zeros(b))
-    x.update(slab_inputs(b))
     return dict(x=x, hist=hist, hmask=torch.ones(b, cfg.n_history), dense_ab=torch.zeros(b, q, 2),
                 dense_mask=torch.ones(b, q), **state_labels(b), endpoint_known=torch.zeros(b),
                 end_local=torch.zeros(b, 3), source=torch.zeros(b),
                 foreign=torch.zeros(b, cfg.fine.depth, cfg.fine.width, cfg.fine.width, dtype=torch.uint8))
 
 
-def slab_batch(c, b=2, step=0):
-    return raw_batch(c, b)
-
-
-def path_batch(c, count=2):
-    out = slab_batch(c, count)
-    points = torch.zeros(count, 8, 3, 3)
-    points[..., 2] = torch.tensor([-1., 0., 1.])
-    tangents = torch.zeros_like(points)
-    tangents[..., 2] = 1
-    out['x'].update(history_path_points=points, history_path_tangents=tangents,
-                    history_path_valid=out['x']['history_valid'][..., None].expand(-1, -1, 3).clone())
-    return out
-
-
 def geometry_batch(c, count=2, length=100.):
     from vesuvius.neural_tracing.fiber_follow.models.path_geometry import path_geometry_inputs
-    from test_history_slabs import observation
-    out = path_batch(c, count)
+    out = raw_batch(c, count)
     path = np.c_[np.zeros(int(length)+1), np.zeros(int(length)+1), np.arange(int(length)+1.)]
     out['x'].update(path_geometry_inputs([observation(path) for _ in range(count)]))
     return out
 
 
 def coordinate_batch(c, b=2):
-    """A batch with every input the coordinate regression model reads (CT-only image, slabs, path and geometry)."""
+    """A batch with every input the crop transformer reads (CT crop, seed, observed path and geometry tokens)."""
     out = geometry_batch(c, b)
     out['x']['fine'] = out['x']['fine'][:, :c.input_channels].contiguous()
-    out['x']['history_pose'] = torch.rand_like(out['x']['history_pose'])
     return out
 
 
@@ -122,3 +155,22 @@ def array_at(path, values):
 
 def batch(cfg, b=2):
     return coordinate_batch(cfg, b)
+
+
+def ct_volume(root):
+    """A 96^3 synthetic CT volume (x+2y+z) with its z-score normalization record under ``root``."""
+    from vesuvius.neural_tracing.fiber_follow.data import ct_normalization as norm
+    from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolume, FiberVolumeSpec
+    z, y, x = np.indices((96, 96, 96))
+    array_at(root/'ct'/'0', (x+2*y+z).clip(0, 255))
+    spec = FiberVolumeSpec('', ct_zarr=str(root/'ct'), ct_level=0, ct_grid_scale=4., inputs='ct', load_presence=False)
+    norm.prepare_normalization(root/'run', [spec], known=dict(method=norm.ZSCORE_METHOD, volumes={}))
+    return FiberVolume(spec, cache_bytes=1 << 20)
+
+
+def follower_config(**kwargs):
+    """A full-size crop/horizon/label contract (the earlier coordinate model's 120 x 104 crop, 48 behind, 16 planes)
+    for data, label and bank tests; no model is built."""
+    options = dict(fine=CropSpec(depth=120, width=104, behind=48, spacing=.5), n_future=16, gate_plane=None)
+    options.update(kwargs)
+    return RegressionConfig(**options)

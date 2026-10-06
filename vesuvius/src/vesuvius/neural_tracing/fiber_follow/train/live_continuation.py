@@ -8,7 +8,6 @@ Starts are restored recorded prefixes (observed path, seed reference, heading
 state, correspondence and historical events) or fresh seed-only states.
 """
 import multiprocessing as mp
-import os
 from queue import Empty, Full
 
 import numpy as np
@@ -32,67 +31,6 @@ def preserve_live_metadata(batch):
     pickle data, never tensor IPC storage or pinned image input.
     """
     return batch
-
-
-def chain_memory(item, depth):
-    """Chain identity and the decision records a chain's next state reads (decision memory).
-
-    This state's own decision is recorded under key ``depth``; the trainer stores its
-    encoder entry under (chain, depth) when the chain advances. A chain started from a
-    recorded prefix carries simulated, unrecorded decisions for that prefix.
-    """
-    from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength
-    from vesuvius.neural_tracing.fiber_follow.models.decision_memory import prune_decisions
-    from vesuvius.neural_tracing.fiber_follow.data.decision_memory import simulated_decisions
-    chain_id = item.get('live_chain_id')
-    if chain_id is None:
-        chain_id = int.from_bytes(os.urandom(7), 'little')
-    path = observed_path(item)
-    length = float(arclength(path)[-1])
-    decisions = item.get('memory_decisions')
-    if decisions is None:
-        decisions = item.get('_simulated_decisions') or simulated_decisions(path, arclength(path))
-    decisions = [d for d in decisions if d['travelled'] < length-1e-6]
-    decisions = decisions+[dict(travelled=length, pos=np.asarray(item['pos']).copy(),
-                                frame=np.asarray(item['frame']).copy(), key=int(depth))]
-    keep = prune_decisions([d['travelled'] for d in decisions], length)
-    return chain_id, [decisions[k] for k in keep]
-
-
-class DecisionStore:
-    """Encoder entries of live-chain decisions, on the training device, keyed by (chain, key).
-
-    Entries are detached BF16 features recorded by the training forward of the decision
-    itself. A chain's entries are pruned to its published decision records; chains not
-    advanced for ``max_age`` updates are dropped (their next state would be stale anyway).
-    """
-    def __init__(self, max_age):
-        self.max_age = max_age
-        self.chains = {}
-
-    def put(self, chain_id, key, features, keep, step):
-        entries, _ = self.chains.get(chain_id, ({}, step))
-        entries[key] = features.detach()
-        self.chains[chain_id] = ({k: v for k, v in entries.items() if k in keep}, step)
-
-    def gather(self, chains, keys, shape, device):
-        """(B, SLOTS, ...) features for recorded slots and a found mask."""
-        import torch
-        found = torch.zeros(keys.shape, dtype=torch.bool)
-        features = torch.zeros((*keys.shape, *shape), dtype=torch.bfloat16, device=device)
-        for row, chain in enumerate(chains.tolist()):
-            entries = self.chains.get(chain, ({}, 0))[0]
-            for slot, key in enumerate(keys[row].tolist()):
-                if key >= 0 and key in entries:
-                    features[row, slot] = entries[key]
-                    found[row, slot] = True
-        return features, found
-
-    def evict(self, step):
-        self.chains = {c: v for c, v in self.chains.items() if step-v[1] <= self.max_age}
-
-    def __len__(self):
-        return sum(len(entries) for entries, _ in self.chains.values())
 
 
 class LiveContinuationSource:
@@ -141,9 +79,7 @@ class LiveContinuationSource:
         labeler = item.get('labeler_state') or dict(
             t=float(item['trace_facts']['t']), last_travelled=float(item.get('travelled', 0.)), bad_run=0,
             bad_run_start=None, started=True, departure_distance=None, boundary_distance=None, switch=None)
-        chain_id, decisions = chain_memory(item, depth)
         return dict(pos=np.asarray(item['pos']), frame=np.asarray(item['frame']),
-                    chain_id=chain_id, memory_decisions=decisions,
                     observed_path=observed_path(item), fiber_idx=fi, reverse=reverse,
                     heading_start=int(item.get('heading_start', 0)),
                     loop_start=int(item['live_loop_start']),
@@ -225,7 +161,6 @@ class LiveContinuationSource:
         terminal = item['supervision'] == TERMINAL
         item.update({key: state[key] for key in SEED_FIELDS})
         item['seed_age'] = state['seed_age']+advanced['travelled']-state['travelled']
-        item.update(memory_decisions=state['memory_decisions'], live_chain_id=state['chain_id'])
         item.update(observed_path=path, heading_start=advanced['heading_start'],
             fiber_ref=(fi, fiber.length-facts['t'] if reverse else facts['t'], reverse),
             source=SOURCE['live'], source_step=state['source_step'], travelled=advanced['travelled'],
@@ -269,8 +204,6 @@ class LiveContinuation:
                 switch_tolerance=switch_tolerance, own_tolerance=own_tolerance, step=source.step)
             source.live_continuation = live
             self.sources.append(live)
-        # Decision memory: generous age bound, since a hop may wait in loader queues.
-        self.memory = DecisionStore(max_age=4*self.sources[0].max_age if self.sources else 256)
 
     def feedback(self, cpu, output, step):
         """Advance chains with the operating policy's commit on the trained prediction.
@@ -292,24 +225,9 @@ class LiveContinuation:
         counts, _ = commit_count(points, confidence, self.policy.confidence, self.policy.n_commit,
                                  self.policy.max_recovery_distance, self.policy.gate, getattr(self, "horizon", None))
         points, counts = points.cpu().numpy(), counts.cpu().numpy()
-        entries = output.get('memory_entry')
         for i, proposal, count in zip(indices, points, counts):
             if count:
-                state = states[i]
-                if entries is not None:
-                    keep = {d['key'] for d in state['memory_decisions'] if d.get('key') is not None}
-                    self.memory.put(state['chain_id'], state['memory_decisions'][-1]['key'], entries[i], keep, step)
-                source.publish(dict(state, points=proposal, commit=int(count), source_step=step))
-        if entries is not None:
-            self.memory.evict(step)
-
-    def attach_memory(self, x, shape):
-        """Recorded chain entries (B, SLOTS, *shape) and which slots were found; ``shape`` is the
-        model's ``cfg.memory_entry_shape``."""
-        device = x['history_keys'].device
-        features, found = self.memory.gather(x['history_chain'].cpu(), x['history_keys'].cpu(),
-                                             tuple(shape), device)
-        return features, found.to(device)
+                source.publish(dict(states[i], points=proposal, commit=int(count), source_step=step))
 
     def close(self):
         for source in self.sources:

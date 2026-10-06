@@ -216,17 +216,15 @@ def test_prefetch_failure_propagates_without_foreground_fallback(tmp_path,monkey
     with pytest.raises(RuntimeError,match='remote source unavailable'):client.ensure_metadata(spec)
 
 
-def test_main_and_history_prefetch_covers_ct_normals_and_all_crop_rolls():
-    from test_history_slabs import observation
-    from model_fixtures import config as cfg
+def test_prefetch_covers_ct_normals_and_all_crop_rolls():
+    from model_fixtures import config as cfg, observation
     from vesuvius.neural_tracing.fiber_follow.data.observations import ObservationBuilder
-    from vesuvius.neural_tracing.fiber_follow.data.history_slabs import slab_layout, SLAB
     from vesuvius.neural_tracing.fiber_follow.data.data import tight_block
     model=cfg();builder=ObservationBuilder(model)
     item=observation([[100,100,0],[100,100,256]])
     bounds=list(builder.prefetch_bounds(item,SimpleNamespace(input_scale=2.)))
-    observations=[(item,model.fine)]+[(s,SLAB) for s in slab_layout(item)]
-    assert len(bounds)==18
+    observations=[(item,model.fine)]
+    assert len(bounds)==2
     for j,(observation,crop) in enumerate(observations):
         lo,size=bounds[2*j]
         for angle in np.linspace(0,2*np.pi,33):

@@ -487,20 +487,6 @@ def test_a_jump_onto_the_same_fibers_next_winding_is_a_departure():
     assert jumped['followed'] <= hop-t0+2.
 
 
-def test_history_on_the_same_fibers_other_winding_is_not_the_original_fiber():
-    from vesuvius.neural_tracing.fiber_follow.data.observations import memory_distance
-    fiber, r, theta, arc = spiral_fiber()
-    t, age = 500., 40.
-    behind = fiber.points[int(t-age)]
-    assert memory_distance(fiber, t, False, behind, age) < .5
-    # The same angle one winding out lies 8 voxels away in space but about one turn further along the fiber.
-    angle = np.interp(t-age, arc, theta)
-    outer = fiber.points[int(np.interp(angle+2*np.pi, theta, arc))]
-    assert np.linalg.norm(outer-behind) < 9. and memory_distance(fiber, t, False, outer, age) > 7.
-    inner = fiber.points[int(np.interp(angle-2*np.pi, theta, arc))]  # the previous winding
-    assert memory_distance(fiber, t, False, inner, age) > 7.
-
-
 def protocol_sources():
     return [dict(name='src', fibers=[line_fiber()], volume=None, detector=None,
                  manifest=dict(calibration=[dict(fiber=0, t=50., sign=1., pos=np.array([0., 0., 50.]),

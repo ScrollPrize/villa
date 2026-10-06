@@ -9,7 +9,7 @@ import torch
 
 from model_fixtures import coordinate_batch as batch, coordinate_config
 from vesuvius.neural_tracing.fiber_follow.data.data import TracedFiber
-from vesuvius.neural_tracing.fiber_follow.models.model import CoordinateRegressionFollower
+from vesuvius.neural_tracing.fiber_follow.models.model import build_model
 from vesuvius.neural_tracing.fiber_follow.train.train import training_diagnostics
 from vesuvius.neural_tracing.fiber_follow.evaluation.seeds import evaluate, monitor_coverage
 from vesuvius.neural_tracing.fiber_follow.shared.experiment import rollout_summary
@@ -38,7 +38,7 @@ def test_direct_images_preserve_scores_rng_and_parameters(tmp_path, monkeypatch)
     from matplotlib.axes import Axes
     from matplotlib.figure import Figure
     cfg = coordinate_config(recurrent_refinement_steps=1)
-    model = CoordinateRegressionFollower(cfg)
+    model = build_model(cfg)
     data = batch(cfg)
     data.update(plane_ab=torch.ones(2, cfg.n_future, 2), plane_mask=torch.ones(2, cfg.n_future),
                 gt_history=data['hist'].clone(), gt_history_mask=data['hmask'].clone())

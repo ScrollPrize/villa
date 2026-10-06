@@ -28,8 +28,19 @@ from vesuvius.neural_tracing.fiber_follow.shared.geometry import interp_at
 from vesuvius.neural_tracing.fiber_follow.tracing.trace import TraceParams
 from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolume
 from vesuvius.neural_tracing.fiber_follow.data.observations import FiberTracer, traversal
-from vesuvius.neural_tracing.fiber_follow.models.model import CoordinateRegressionConfig
-from vesuvius.neural_tracing.fiber_follow.train.train import load_checkpoint, validate_volume_source
+from vesuvius.neural_tracing.fiber_follow.train.train import load_checkpoint
+
+
+def validate_volume_source(spec, manifest):
+    """Allow a different CT pyramid level, retaining frozen physical data/seeds."""
+    from vesuvius.neural_tracing.fiber_follow.shared.paths import recorded_path
+    for key in ('fiber_zarr_dir', 'ct_zarr', 'fiber_level', 'grid_scale'):
+        recorded = manifest['volume'][key]
+        if key in ('fiber_zarr_dir', 'ct_zarr') and recorded is not None:
+            recorded = recorded_path(recorded)
+        if spec.to_dict()[key] != recorded:
+            raise ValueError(f'Volume source {key} differs from frozen manifest')
+
 
 IDENTITY_VERSION = 1
 FIBERS = '/mnt/raid_nvme/spiral_dataset_working/fibers'

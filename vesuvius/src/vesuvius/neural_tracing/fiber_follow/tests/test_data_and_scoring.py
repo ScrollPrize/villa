@@ -180,7 +180,7 @@ def test_plane_teacher_intersects_original_segments_without_smoothing_vertices()
     np.testing.assert_allclose(ab[0], [1.,1.])
 
 
-def test_onpolicy_cache_requires_identity_and_the_whole_schema(tmp_path):
+def test_onpolicy_cache_requires_identity_and_the_whole_schema(tmp_path, capsys):
     path = tmp_path / 'old.npz'
     np.savez(path, pos=np.zeros((1, 3)))
     with pytest.raises(KeyError, match='__metadata__'):
@@ -197,9 +197,9 @@ def test_onpolicy_cache_requires_identity_and_the_whole_schema(tmp_path):
     with pytest.raises(ValueError, match='differ from the schema'):
         D.OnPolicyStates(manifest=op.manifest, provenance=op.provenance, offtrack=np.zeros(1, bool),
                          **{k: getattr(op, k) for k in (*D.OnPolicyStates.FIELDS, *D.OnPolicyStates.TRACK)})
-    # Cache history must match the training configuration.
-    with pytest.raises(ValueError, match='history length'):
-        D.FollowDataset([fiber()], FiberVolumeSpec('unused'), D.SampleConfig(n_history=128), None, onpolicy=[op])
+    # A cache whose history differs from the training configuration is skipped with a warning.
+    dataset = D.FollowDataset([fiber()], FiberVolumeSpec('unused'), D.SampleConfig(n_history=128), None, onpolicy=[op])
+    assert dataset.onpolicy == [] and 'history length' in capsys.readouterr().out
 
 
 def test_onpolicy_identity_and_mmap_roundtrip(tmp_path):

@@ -5,21 +5,11 @@ import numpy as np
 import pytest
 import torch
 
-from model_fixtures import coordinate_config, array_at
-from vesuvius.neural_tracing.fiber_follow.models.model import CoordinateRegressionFollower
+from model_fixtures import coordinate_config, ct_volume
+from vesuvius.neural_tracing.fiber_follow.models.model import build_model
 from vesuvius.neural_tracing.fiber_follow.data.observations import FiberTracer
-from vesuvius.neural_tracing.fiber_follow.data import ct_normalization as norm
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import frame_from_heading
 from vesuvius.neural_tracing.fiber_follow.tracing.trace import TraceParams
-from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolume, FiberVolumeSpec
-
-
-def ct_volume(root):
-    z, y, x = np.indices((96, 96, 96))
-    array_at(root/'ct'/'0', (x+2*y+z).clip(0, 255))
-    spec = FiberVolumeSpec('', ct_zarr=str(root/'ct'), ct_level=0, ct_grid_scale=4., inputs='ct', load_presence=False)
-    norm.prepare_normalization(root/'run', [spec], known=dict(method=norm.ZSCORE_METHOD, volumes={}))
-    return FiberVolume(spec, cache_bytes=1 << 20)
 
 
 @pytest.fixture
@@ -35,7 +25,7 @@ def test_pooled_rollout_matches_serial_including_inference_mode(tmp_path, one_in
     cfg = coordinate_config()
     vol = ct_volume(tmp_path)
     torch.manual_seed(0)
-    model = CoordinateRegressionFollower(cfg).eval()
+    model = build_model(cfg).eval()
     seeds = np.array([[24., 24., 24.], [24.3, 23.8, 24.1], [23.7, 24.2, 23.9]])
     headings = np.array([[.3, .4, .8660254]]*3)
     results = []

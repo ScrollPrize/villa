@@ -15,14 +15,6 @@ import torch
 import torch.nn.functional as F
 
 
-def crop_path_planes(crop, step=1.0):
-    """Forward coordinates (trace voxels, multiples of ``step``) of every path plane inside ``crop``, behind and ahead
-    of the head; the whole-crop path head predicts one lateral point per plane."""
-    lo = int(np.ceil(-crop.behind*crop.spacing/step-1e-9))
-    hi = int(np.floor((crop.depth-1-crop.behind)*crop.spacing/step+1e-9))
-    return np.arange(lo, hi+1, dtype=np.float64)*step
-
-
 @dataclass(frozen=True)
 class CropSpec:
     depth: int = 64  # samples along f
@@ -82,44 +74,6 @@ def block_start(pos_xyz: np.ndarray, frame: np.ndarray, spec: CropSpec) -> np.nd
     center = pos_xyz + spec.center_offset * frame[:, 2]
     half = spec.block_size // 2
     return np.floor(center[::-1]).astype(np.int64) - half + 1
-
-
-def render_history(hist_local: torch.Tensor, hist_mask: torch.Tensor, local_grid: torch.Tensor,
-                   sigma: float = 1.0, mode: str = 'points') -> torch.Tensor:
-    """Gaussian history, optionally joining consecutive valid points to the current origin.
-
-    Missing history stays empty. Masked gaps are never bridged. Width uses trace-grid units.
-    """
-    if mode not in ('points', 'segments') or not np.isfinite(sigma) or sigma <= 0:
-        raise ValueError('Invalid history rendering mode or sigma')
-    g = local_grid.reshape(-1, 3)
-    B, H, _ = hist_local.shape
-    if H == 0:
-        return hist_local.new_zeros((B, 1, *local_grid.shape[:3]))
-    if mode == 'points':
-        d2 = torch.cdist(hist_local, g[None].expand(B, -1, -1)).square()
-        d2 = d2.masked_fill(hist_mask[..., None] <= 0, float('inf')).amin(1)
-    elif (hist_local.device.type == local_grid.device.type == hist_mask.device.type == 'cpu'
-          and hist_local.dtype == local_grid.dtype == torch.float32
-          and not (hist_local.requires_grad or local_grid.requires_grad)):
-        from .fast_sample import segment_history_distances
-        d2 = torch.from_numpy(segment_history_distances(hist_local.numpy(), hist_mask.numpy(), g.numpy()))
-    else:
-        # Process one segment at a time to bound memory on full 64-cubed crops.
-        d2 = hist_local.new_full((B, len(g)), float('inf'))
-        for k in range(H):
-            end = hist_local[:, k]
-            start = hist_local[:, k-1] if k else torch.zeros_like(end)
-            connected = hist_mask[:, k-1] > 0 if k else torch.ones(B, device=end.device, dtype=torch.bool)
-            # Isolated valid points still contribute a spherical endpoint.
-            start = torch.where(connected[:, None], start, end)
-            v = end-start
-            q = g[None]-start[:, None]
-            t = ((q*v[:, None]).sum(-1) / v.square().sum(-1).clamp_min(1e-12)[:, None]).clamp(0, 1)
-            candidate = (q-t[..., None]*v[:, None]).square().sum(-1)
-            candidate = candidate.masked_fill(hist_mask[:, k, None] <= 0, float('inf'))
-            d2 = torch.minimum(d2, candidate)
-    return torch.exp(-d2 / (2*sigma*sigma)).view(B, 1, *local_grid.shape[:3])
 
 
 # ---------------------------------------------------------------- polylines

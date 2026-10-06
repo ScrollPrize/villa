@@ -6,7 +6,6 @@ import torch.nn.functional as F
 
 from vesuvius.neural_tracing.fiber_follow.data.labels import prefix_labels
 from vesuvius.neural_tracing.fiber_follow.data.state_labels import RECOVERABLE, TERMINAL
-from vesuvius.neural_tracing.fiber_follow.models.flow import FLOW_MODEL_TYPES
 from vesuvius.neural_tracing.fiber_follow.models.model import feature_grid
 from vesuvius.neural_tracing.fiber_follow.models.survival_confidence import survival_loss
 from vesuvius.neural_tracing.fiber_follow.tracing.policy import commit_prefix, gate_horizon
@@ -156,15 +155,8 @@ def loss_terms(output, batch, cfg, tolerance=1.5, *, n_commit=None, refinement_l
     # The last attempted pass gets 75%; earlier passes share 25%. Survival averages attempts
     # so adding feedback iterations does not multiply the confidence loss weight.
     geometry_losses, confidence_losses = [], []
-    crop_paths = output.get('refinement_crop_points')
-    for attempt, (curve, hazards) in enumerate(zip(output['refinement_points'].unbind(1),
-                                                   output['refinement_hazard_logits'].unbind(1))):
-        if crop_paths is not None:
-            # Whole-crop path: every crop plane, toward the original fiber wherever it is (whole_crop.py).
-            from vesuvius.neural_tracing.fiber_follow.models.whole_crop import crop_path_loss
-            geometry_losses.append(crop_path_loss(crop_paths[:, attempt], batch))
-        else:
-            geometry_losses.append(path_geometry_loss(curve, target, mask, near))
+    for curve, hazards in zip(output['refinement_points'].unbind(1), output['refinement_hazard_logits'].unbind(1)):
+        geometry_losses.append(path_geometry_loss(curve, target, mask, near))
         labels, known, _, _ = proposal_labels(curve, batch, cfg, tolerance)
         confidence_losses.append(survival_loss(hazards, labels, known)[0])
     attempts = output['refinement_mask'].bool()
@@ -190,7 +182,7 @@ def loss_terms(output, batch, cfg, tolerance=1.5, *, n_commit=None, refinement_l
         geometry = torch.where(count > 1, .75*final+.25*auxiliary, final)
         confidence = torch.where(attempts, confidence_losses, 0.).sum(1)/count
     flow_terms = {}
-    if cfg.model_type in FLOW_MODEL_TYPES:
+    if cfg.model_type == 'flow':
         geometry = output['flow_per_state']
         if 'flow_geometry_points' in output:
             # The integrated zero-start path, supervised as a regression path (flow_geometry_weight).
@@ -211,7 +203,7 @@ def loss_terms(output, batch, cfg, tolerance=1.5, *, n_commit=None, refinement_l
                  confidence_terminal_states=(labeled & (batch['supervision'] == TERMINAL)).sum(),
                  confidence_recoverable_states=(labeled & (batch['supervision'] == RECOVERABLE)).sum(),
                  positive_targets_per_state=positive, negative_targets_per_state=negative,
-                 geometry_states_per_state=mask.any(-1) if crop_paths is None else batch['crop_mask'].bool().any(-1),
+                 geometry_states_per_state=mask.any(-1),
                  geometry_count=mask.sum(), confidence_count=supervised_known.sum(),
                  error_sum=torch.where(mask, (predicted-target).norm(dim=-1), 0.).sum(),
                  correct_count=(labels*known).sum(), **flow_terms)

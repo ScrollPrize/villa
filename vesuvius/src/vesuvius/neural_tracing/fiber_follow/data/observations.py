@@ -16,7 +16,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.reference import SEED_FIELDS, o
 from vesuvius.neural_tracing.fiber_follow.data.state_labels import DEPARTURE_DISTANCE, supervise
 from vesuvius.neural_tracing.fiber_follow.tracing.heading import heading_free_bounds, reframe_item, FRAME_POLICY, FRAME_POLICIES
 from vesuvius.neural_tracing.fiber_follow.tracing.crop_frames import frame_predictor, orient_items, crop_frame_bounds
-from vesuvius.neural_tracing.fiber_follow.models.model import CoordinateRegressionConfig
+from vesuvius.neural_tracing.fiber_follow.models.model import FollowerConfig
 
 
 def image_crop(items, vol, crop, pool=None):
@@ -34,20 +34,11 @@ class ObservationBuilder:
 
     def prefetch_bounds(self,item,vol):
         """CT footprints covering unresolved roll and normal-estimation context."""
-        from vesuvius.neural_tracing.fiber_follow.data.history_slabs import slab_layout, SLAB
         if '_pending_seed_heading' in item:
             # A trace start takes its CT seed heading only once the image is built.
             yield heading_free_bounds(item['pos'],self.cfg.fine,vol.input_scale)
         predictor = frame_predictor(self.cfg)
         yield from crop_frame_bounds(item,self.cfg.fine,vol,predictor,include_crop=getattr(vol,'crop_view',None) is None)
-        if self.cfg.memory == 'decisions':
-            from vesuvius.neural_tracing.fiber_follow.data.decision_memory import memory_bounds
-            yield from memory_bounds(item,self.cfg,vol,predictor)
-            return
-        if self.cfg.memory == 'none':
-            return
-        for slab in slab_layout(item):
-            yield from crop_frame_bounds(slab,SLAB,vol,predictor)
 
     def finalize_frames(self,items,vol):
         for item in items:
@@ -63,12 +54,6 @@ class ObservationBuilder:
         x = dict(fine=crop_images(items,vol,self.cfg.fine,pool),seed=stack('visible_seed'),
                  seed_mask=stack('visible_seed_mask'),seed_age=stack('visible_seed_age'),
                  seed_tangent=stack('visible_seed_tangent'))
-        if self.cfg.memory == 'decisions':
-            from vesuvius.neural_tracing.fiber_follow.data.decision_memory import memory_inputs
-            x.update(memory_inputs(items, vol, self.cfg, pool))
-        elif self.cfg.memory == 'slabs':
-            from vesuvius.neural_tracing.fiber_follow.data.history_slabs import load_slabs
-            x.update(load_slabs(items, vol, self.cfg, pool))
         from vesuvius.neural_tracing.fiber_follow.models.path_geometry import path_geometry_inputs
         x.update(path_geometry_inputs(items))
         # Recorded replay frames have unknown quality unless it was supplied;
@@ -123,12 +108,6 @@ class IdentitySampling:
     # Certified synthetic failures: OU-noised original prefix, bridge, short neighbor tail.
     synthetic_tail: tuple = (4., 16.)
     synthetic_prefix: tuple = (128., 1024.)
-    # The 'synthetic_identity' task: the same certified switch with a long neighbor tail, so the
-    # departure is older than the current crop and recent memory can show.
-    identity_switch_tail: tuple = (48., 128.)
-    # Memory crops encoded during training: 'shared' takes the current crop's photometric draw,
-    # 'independent' draws per crop, as recorded live entries (and the tracer's own) already differ.
-    memory_augmentation: str = 'shared'
     # Crop roll about the heading: exact 180-degree flips make the tracer's roll-sign
     # convention irrelevant; jitter covers CT roll-estimate noise (p99 ~5 degrees).
     roll_flip_probability: float = .5
@@ -160,9 +139,6 @@ class IdentitySampling:
         from vesuvius.neural_tracing.fiber_follow.data.neighbor_continuations import validate_tail_range
         object.__setattr__(self, 'synthetic_tail', validate_tail_range(self.synthetic_tail))
         object.__setattr__(self, 'synthetic_prefix', validate_tail_range(self.synthetic_prefix))
-        object.__setattr__(self, 'identity_switch_tail', validate_tail_range(self.identity_switch_tail))
-        if self.memory_augmentation not in ('shared', 'independent'):
-            raise ValueError("Memory augmentation must be 'shared' or 'independent'")
 
 
 # Oversampled fresh locations, recorded per state.
@@ -171,21 +147,6 @@ LOCATION_SOURCES = ('uniform', 'lateral', 'bank_covered')
 
 def traversal(fiber, reverse):
     return (fiber.points[::-1], fiber.length-fiber.s[::-1]) if reverse else (fiber.points, fiber.s)
-
-
-MEMORY_ARC_MARGIN = 32.  # arclength slack behind an entry's age-implied position (plus age/8 for detours)
-
-
-def memory_distance(fiber, t, reverse, pos, age):
-    """Distance from an observed history position, ``age`` trace voxels behind the head at traversal arc ``t``, to
-    the original fiber's stretch it can lie on (traversal arc in [t-age-margin, t+MEMORY_ARC_MARGIN]), so another
-    winding of the same fiber never counts as the original fiber."""
-    p, arc = traversal(fiber, reverse)
-    margin = MEMORY_ARC_MARGIN+float(age)/8
-    window = (arc >= t-float(age)-margin) & (arc <= t+MEMORY_ARC_MARGIN)
-    if not window.any():
-        return np.inf
-    return float(np.linalg.norm(p[window]-np.asarray(pos, np.float64), axis=1).min())
 
 
 def visible_points(points,crop,margin=0.):
@@ -252,7 +213,7 @@ def roll_frame(frame, angle):
 class IdentityObservationBuilder(ObservationBuilder):
     """Foreign masks, identity evidence and augmentation on top of the shared observation."""
 
-    def __init__(self,cfg: CoordinateRegressionConfig,fibers=None,sampling=IdentitySampling(),*,
+    def __init__(self,cfg: FollowerConfig,fibers=None,sampling=IdentitySampling(),*,
                  augment=False,negative_bank=None,near_negative_bank=None,continuation_bank=None):
         super().__init__(cfg)
         self.fibers,self.sampling,self.augment = fibers,sampling,augment
@@ -284,7 +245,7 @@ class IdentityObservationBuilder(ObservationBuilder):
         on = (distance <= self.sampling.on_fiber_tolerance) & item['reference_mask'].astype(bool)
         item['reference_on_fiber'] = on.astype(np.float32)
         item['identity_reference_valid'] = bool(on[:-1].sum() >= 2 or on[-1])
-        item['identity_evidence'] = bool(item['identity_reference_valid'] or item.get('slab_identity_observable', False))
+        item['identity_evidence'] = bool(item['identity_reference_valid'])
         item['identity_observable'] = bool(item['match_distance'] <= DEPARTURE_DISTANCE or item['identity_evidence'])
         if 'trace_facts' in item:
             item['trace_facts']['identity_observable'] = item['identity_evidence']
@@ -331,15 +292,13 @@ class IdentityObservationBuilder(ObservationBuilder):
                 return item
         return None
 
-    def synthetic_terminal(self, sample_cfg, rng, long_tail=False):
-        """Certified wrong continuation after an OU-noised original prefix; labeled terminal.
-
-        ``long_tail`` takes the identity-switch tail range instead of the terminal one."""
+    def synthetic_terminal(self, sample_cfg, rng):
+        """Certified wrong continuation after an OU-noised original prefix; labeled terminal."""
         from vesuvius.neural_tracing.fiber_follow.data.neighbor_continuations import wrong_continuation
         bank = self.continuation_bank or self.negative_bank
         if bank is None:
             return None
-        tail = self.sampling.identity_switch_tail if long_tail else self.sampling.synthetic_tail
+        tail = self.sampling.synthetic_tail
         for _ in range(3):
             item = wrong_continuation(bank,sample_cfg,rng,tail_length_range=tail,
                                       prefix_length=float(rng.uniform(*self.sampling.synthetic_prefix)))
@@ -373,18 +332,6 @@ class IdentityObservationBuilder(ObservationBuilder):
         # recovery offsets. Only visible references are eligible for supervision.
         extent = max(cfg.n_history,cfg.fine.depth*cfg.fine.spacing)+16
         curve = local(np.arange(max(0.,t-extent),min(fiber.length,t+extent)+1e-9,.25))
-        if item['match_distance'] > DEPARTURE_DISTANCE or item.get('source') == SOURCE['synthetic']:
-            # Membership affects labels only; every observed slab/memory entry is still input.
-            if cfg.memory == 'decisions':
-                from vesuvius.neural_tracing.fiber_follow.data.decision_memory import memory_layout
-                entries = memory_layout(item)[0]
-            elif cfg.memory == 'none':
-                entries = []  # nothing beyond the current crop is observed
-            else:
-                from vesuvius.neural_tracing.fiber_follow.data.history_slabs import slab_layout
-                entries = slab_layout(item)
-            item['slab_identity_observable'] = any(
-                memory_distance(fiber, t, reverse, e['pos'], e['age']) <= s.on_fiber_tolerance for e in entries)
         item['identity_curve'] = curve
         self.identity_evidence(item, curve)
         visible = visible_points(curve,cfg.fine)
@@ -399,14 +346,6 @@ class IdentityObservationBuilder(ObservationBuilder):
         return item
 
     def footprint_allowed(self,item,band):
-        if self.cfg.memory == 'decisions':
-            from vesuvius.neural_tracing.fiber_follow.data.decision_memory import memory_allowed
-            if not memory_allowed(item, self.cfg, band):
-                return False
-        elif self.cfg.memory == 'slabs':
-            from vesuvius.neural_tracing.fiber_follow.data.history_slabs import slabs_allowed
-            if not slabs_allowed(item, band):
-                return False
         if band is None:
             return True
         z = np.asarray(item.get('identity_label_z',np.asarray(item['pos'])[2:3]))
@@ -430,17 +369,6 @@ class IdentityObservationBuilder(ObservationBuilder):
                    negative_bank_shards=np.zeros(len(items), np.int64))
         if selected.any() or not len(items):
             out['foreign'] = np.zeros((len(items), *shape), np.uint8)
-        identity = getattr(cfg, 'identity_mode', None) if self.fibers is not None else None
-        if identity:
-            from vesuvius.neural_tracing.fiber_follow.models.decision_memory import SLOTS, IDENTITY_NEGATIVES
-            out.update(identity_anchor_mask=np.zeros((len(items), SLOTS), bool),
-                       identity_departure_age=np.full(len(items), np.nan, np.float32))
-        if identity == 'infonce':
-            out.update(identity_points=np.zeros((len(items), 1+IDENTITY_NEGATIVES, 3), np.float32),
-                       identity_point_mask=np.zeros((len(items), 1+IDENTITY_NEGATIVES), bool))
-        elif identity == 'verify':
-            from vesuvius.neural_tracing.fiber_follow.models.identity_verifier import verification_buffers
-            out.update(verification_buffers(len(items)))
         for j, item in enumerate(items):
             out['location_source'][j] = item.get('location_source', 0)
             if 'identity_curve' not in item:
@@ -457,10 +385,6 @@ class IdentityObservationBuilder(ObservationBuilder):
             out['foreign_components'][j] = found['counts']['foreign_components']
             out['negative_bank_shards'][j] = bank.shard_count+(self.near_negative_bank.shard_count
                 if self.near_negative_bank is not None and self.near_negative_bank is not bank else 0)
-            if identity == 'infonce' and selected[j]:
-                self.identity_targets(item, found, out, j)
-            elif identity == 'verify' and selected[j]:
-                self.verification_targets(item, found, out, j)
             # Remember covered locations directly, independent of randomly selected
             # contrastive queries. Missing coverage remains unknown.
             ahead = found['local']
@@ -469,151 +393,6 @@ class IdentityObservationBuilder(ObservationBuilder):
                          & (ahead[:, 2] <= cfg.n_future*cfg.future_step)).any()):
                 self.lateral.append(item['fiber_ref'])
         return {k: torch.from_numpy(v) for k, v in out.items()}
-
-    def identity_departure(self, item, out, row):
-        """Arclength travelled since this trace left its original fiber (NaN if it has not)."""
-        facts = item.get('trace_facts', {})
-        departure = facts.get('departure_distance', np.nan)
-        if np.isfinite(departure) and 'travelled' in item:
-            out['identity_departure_age'][row] = float(item['travelled'])-float(departure)
-        elif '_leave_arc' in item and '_constructed_arc' in item:
-            out['identity_departure_age'][row] = float(item['_constructed_arc'][-1])-float(item['_leave_arc'])
-
-    def memory_on_fiber(self, item):
-        """Per selected memory entry: (age, whether its decision lay on the original fiber, not another winding)."""
-        index, t, reverse = item['fiber_ref']
-        fiber = self.fibers[int(index)]
-        return [(entry['age'], memory_distance(fiber, float(t), bool(reverse), entry['pos'], entry['age'])
-                 <= self.sampling.on_fiber_tolerance) for entry in item.get('_memory_entries') or []]
-
-    def plane_crossings(self, found, plane, own):
-        """Each neighbor path's crossing of ``plane`` (interpolated between consecutive samples) beyond
-        the own-fiber radius of ``own``, nearest first, so candidates differ only laterally."""
-        local = np.asarray(found['local'], np.float64).reshape(-1, 3)
-        paths = np.asarray(found['path_ids'])
-        nearest = {}
-        for path in np.unique(paths):
-            line = local[paths == path]
-            for a, b in zip(line[:-1], line[1:]):
-                if (a[2]-plane)*(b[2]-plane) > 0 or np.linalg.norm(b-a) > 2. or a[2] == b[2]:
-                    continue
-                point = a+(b-a)*(plane-a[2])/(b[2]-a[2])
-                distance = float(np.linalg.norm(point[:2]-own[:2]))
-                if distance > self.sampling.rule.own_radius and (path not in nearest or distance < nearest[path][0]):
-                    nearest[path] = (distance, point)
-        return [p for _, p in sorted(nearest.values(), key=lambda v: v[0])]
-
-    def identity_targets(self, item, found, out, row):
-        """Memory-identity points: the own fiber's crossing of the plane two voxels ahead (point 0),
-        each validated neighbor path's crossing of that plane, and anchors = memory entries at least
-        IDENTITY_MIN_AGE behind whose decision lay on the original fiber.
-        Annotation and bank geometry only label; nothing here becomes a model input feature."""
-        from vesuvius.neural_tracing.fiber_follow.models.decision_memory import IDENTITY_NEGATIVES, IDENTITY_MIN_AGE
-        self.identity_departure(item, out, row)
-        planes = np.asarray(item['planes'], np.float64)
-        k = int(np.argmin(np.abs(planes-2.)))
-        if not item['plane_mask'][k]:
-            return
-        positive = np.r_[np.asarray(item['plane_ab'][k], np.float64), planes[k]]
-        negatives = self.plane_crossings(found, planes[k], positive)[:IDENTITY_NEGATIVES]
-        if not negatives:
-            return
-        out['identity_points'][row, 0], out['identity_point_mask'][row, 0] = positive, True
-        out['identity_points'][row, 1:1+len(negatives)] = np.stack(negatives)
-        out['identity_point_mask'][row, 1:1+len(negatives)] = True
-        for slot, (age, on) in enumerate(self.memory_on_fiber(item)):
-            if age >= IDENTITY_MIN_AGE and on:
-                out['identity_anchor_mask'][row, slot] = True
-
-    def verification_targets(self, item, found, out, row):
-        """Verifier query positions for a state whose memory holds an entry on the original fiber.
-
-        Candidates at each IDENTITY_PLANES plane: the original fiber's crossing (0), the head-axis
-        point (1) and neighbor crossings. Dense samples (IDENTITY_SAMPLES): along the original fiber
-        (jittered within the own-fiber tube), beside it, on neighbor paths, on the trace path behind
-        the head and its axis ahead, and uniform in the crop. Every label is computed later from the
-        original fiber's curve (``identity_curve``, with which of its ends are annotation ends inside
-        the crop), so candidates, samples and the model's own predictions share one labeling rule.
-        Positions only enter the model; nothing says which fiber a position belongs to."""
-        from vesuvius.neural_tracing.fiber_follow.models.decision_memory import IDENTITY_NEGATIVES, IDENTITY_MIN_AGE
-        from vesuvius.neural_tracing.fiber_follow.models.identity_verifier import (
-            IDENTITY_PLANES, IDENTITY_SAMPLES, IDENTITY_CURVE, SAMPLE_MIX, POSITIVE_RADIUS)
-        self.identity_departure(item, out, row)
-        out['identity_synthetic'][row] = item.get('source') == SOURCE['synthetic']
-        memory = self.memory_on_fiber(item)
-        for slot, (age, on) in enumerate(memory):
-            out['identity_anchor_mask'][row, slot] = bool(age >= IDENTITY_MIN_AGE and on)
-        curve = np.asarray(item['identity_curve'], np.float64).reshape(-1, 3)
-        crop = self.cfg.fine
-        near = visible_points(curve, crop, margin=-4.)
-        if not any(on for _, on in memory) or not visible_points(curve, crop).any():
-            return
-        # A curve end inside the (slightly enlarged) crop is an annotation end: beyond it, unknown.
-        out['identity_curve_ends'][row] = near[0], near[-1]
-        kept = np.flatnonzero(near)
-        kept = kept[np.linspace(0, len(kept)-1, min(IDENTITY_CURVE, len(kept))).round().astype(int)]
-        out['identity_curve'][row, :len(kept)] = curve[kept]
-        out['identity_curve_mask'][row, :len(kept)] = True
-        planes = np.asarray(item['planes'], np.float64)
-        for p, depth in enumerate(IDENTITY_PLANES):
-            k = int(np.argmin(np.abs(planes-depth)))
-            own = np.r_[np.asarray(item['plane_ab'][k], np.float64), planes[k]]
-            if not item['plane_mask'][k] or not visible_points(own[None], crop)[0]:
-                continue
-            points = [own, np.r_[0., 0., planes[k]], *self.plane_crossings(found, planes[k], own)[:IDENTITY_NEGATIVES]]
-            out['identity_candidates'][row, p, :len(points)] = np.stack(points)
-            out['identity_mask'][row, p, :len(points)] = visible_points(np.stack(points), crop)
-        rng = np.random.default_rng((item['identity_seed'], 3))
-        samples = self.verification_samples(curve[visible_points(curve, crop)], found, item, rng, SAMPLE_MIX, POSITIVE_RADIUS)
-        samples = samples[visible_points(samples, crop)][:IDENTITY_SAMPLES]
-        out['identity_samples'][row, :len(samples)] = samples
-        out['identity_sample_mask'][row, :len(samples)] = True
-
-    def verification_samples(self, curve, found, item, rng, mix, radius):
-        """Dense query positions (unlabeled) by source; see ``verification_targets``."""
-        crop = self.cfg.fine
-        def jitter(points, low, high):
-            """Offsets perpendicular to the local direction of ``points`` (a polyline), radius in [low, high]."""
-            tangent = np.gradient(points, axis=0) if len(points) > 1 else np.tile([0., 0., 1.], (len(points), 1))
-            tangent /= np.maximum(np.linalg.norm(tangent, axis=-1, keepdims=True), 1e-8)
-            direction = rng.normal(size=points.shape)
-            direction -= (direction*tangent).sum(-1, keepdims=True)*tangent
-            direction /= np.maximum(np.linalg.norm(direction, axis=-1, keepdims=True), 1e-8)
-            return points+direction*np.sqrt(rng.uniform(low**2, high**2, (len(points), 1)))
-        def draw(points, count, low, high):
-            if not len(points) or not count:
-                return np.zeros((0, 3))
-            index = np.sort(rng.integers(len(points), size=count))
-            offsets = jitter(points, low, high)
-            return offsets[index]
-        half = (crop.width-1)*crop.spacing/2
-        lo, hi = np.array([-half, -half, -crop.behind*crop.spacing]), np.array([half, half, (crop.depth-1-crop.behind)*crop.spacing])
-        neighbors = np.asarray(found['local'], np.float64).reshape(-1, 3)
-        neighbors = neighbors[visible_points(neighbors, crop)]
-        behind = np.asarray(item['hist_local'], np.float64)[np.asarray(item['hmask']) > 0]
-        behind = behind[visible_points(behind, crop)]
-        axis = np.c_[np.zeros(64), np.zeros(64), np.linspace(1., hi[2], 64)]
-        parts = [draw(curve, mix['original'], 0., radius*2/3),
-                 draw(curve, mix['beside'], 3.5, 8.),
-                 draw(neighbors, mix['neighbors'], 0., 1.),
-                 draw(behind, mix['path']//2, 0., 1.), draw(axis, mix['path']-mix['path']//2, 0., 1.),
-                 rng.uniform(lo, hi, (mix['uniform'], 3))]
-        return np.concatenate(parts).astype(np.float32)
-
-    def augment_memory_crops(self, x, row, item, rng):
-        """Augment this row's memory crops encoded in training: with the current crop's draw ('shared',
-        continuing its RNG) or with a reproducible draw per memory slot ('independent'), as a recorded
-        entry's own decision had."""
-        slots = x['history_encode'].shape[1]
-        encoded = x['history_encode'].flatten().nonzero().flatten()
-        for crop in (encoded // slots == row).nonzero().flatten().tolist():
-            image = x['history_crops'][crop, 0].numpy()
-            if self.sampling.memory_augmentation == 'independent':
-                own = np.random.default_rng((item['identity_seed'], 2, int(encoded[crop]) % slots))
-                params, blur = photometric_draw(self.sampling, own)
-                augment_ct(image, params, own, blur)
-            else:
-                augment_ct(image, item['photometric'], rng, item.get('blur_sigma', 0.))
 
     def __call__(self,items,vol, *, decision_mask=None):
         """Images for every observation; expensive targets only for decisions.
@@ -650,14 +429,6 @@ class IdentityObservationBuilder(ObservationBuilder):
                 augmentation = dict(blur_sigma=item.get('blur_sigma', 0.))
                 batch['blurred'][j] = augmentation['blur_sigma'] > 0
                 augment_image_pair(batch['x']['fine'][j], item['photometric'], rng, **augmentation)
-                if 'history_crops' in batch['x']:
-                    self.augment_memory_crops(batch['x'], j, item, rng)
-                    continue
-                if 'history_slabs' not in batch['x']:  # no memory
-                    continue
-                for slot in batch['x']['history_valid'][j].nonzero().flatten().tolist():
-                    ct = batch['x']['history_slabs'][j, slot, 0].numpy()
-                    augment_ct(ct, item['photometric'], rng, augmentation['blur_sigma'])
         return batch
 
 
@@ -682,10 +453,6 @@ class FiberTracer(ModelTracer):
                 item['observed_path'] = path['observed_path']
                 if 'fiber_family' in path:
                     item['fiber_family'] = path['fiber_family']
-                if 'memory_decisions' in path:
-                    item['memory_decisions'] = path['memory_decisions']
         def move(value):
             return {k: move(v) for k, v in value.items()} if isinstance(value, dict) else value.to(self.device)
-        x = move(self.observations.images(items,self.vol,self.pool))
-        self._memory_entries = [item.get('_memory_entries') for item in items]
-        return x
+        return move(self.observations.images(items,self.vol,self.pool))

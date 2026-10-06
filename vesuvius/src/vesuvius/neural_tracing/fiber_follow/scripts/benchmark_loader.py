@@ -1,4 +1,4 @@
-"""CPU-only real-data loader benchmark from a saved regression config.
+"""CPU-only real-data loader benchmark (Paris 4 source) from a run's saved config.json.
 
 Run with --workers 0 --profile PATH to locate worker hotspots. --hash-batches
 records exact tensor digests (excluding timing fields) outside timed regions.
@@ -15,10 +15,10 @@ import numpy as np
 import torch
 
 from vesuvius.neural_tracing.fiber_follow.data.data import FollowDataset, SampleConfig, TaskBudget, ZBand, load_fibers, split_fibers, OnPolicyStates
-from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
 from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolumeSpec
 from vesuvius.neural_tracing.fiber_follow.train.runloop import raise_open_file_limit
-from vesuvius.neural_tracing.fiber_follow.models.model import CoordinateRegressionConfig
+from vesuvius.neural_tracing.fiber_follow.models.model import config_class
+from vesuvius.neural_tracing.fiber_follow.train import run_config
 from vesuvius.neural_tracing.fiber_follow.data.observations import IdentityObservationBuilder, IdentitySampling
 from vesuvius.neural_tracing.fiber_follow.data.neighbor_bank import NeighborBank
 
@@ -49,10 +49,11 @@ def main():
         ap.error('Positive batches, nonnegative warmup/workers; profiling requires workers=0')
     raise_open_file_limit()
     torch.set_num_threads(1)
-    c = json.loads(args.config.read_text())
-    cfg = CoordinateRegressionConfig(**dict(c['model_cfg'], fine=CropSpec(**c['model_cfg']['fine'])))
-    sample = SampleConfig(**dict(c['sample_cfg'], crop=cfg.fine))
-    spec = FiberVolumeSpec(**c['vol_spec'])
+    saved = json.loads(args.config.read_text())
+    cfg = config_class(saved['model_type'])(**saved['model_cfg'])
+    sample = SampleConfig(**dict(saved['sample_cfg'], crop=cfg.fine))
+    c = vars(run_config.namespace(saved['run_config']))
+    spec = FiberVolumeSpec(**saved['vol_spec'])
     band = ZBand(*(v/spec.grid_scale for v in c['val_z']))
     fibers, _ = split_fibers(load_fibers(c['fibers'], grid_scale=spec.grid_scale), band)
     banks = {role: NeighborBank(c[role], fibers, band, grid_scale=spec.grid_scale,
@@ -60,12 +61,12 @@ def main():
                 cache_bytes=int(c['negative_bank_cache_mb']*(1 << 20)))
              for role in ('negative_bank', 'near_negative_bank', 'continuation_bank')
              if c.get(role)}
-    builder = IdentityObservationBuilder(cfg, fibers, IdentitySampling(**c['identity_sampling']),
+    builder = IdentityObservationBuilder(cfg, fibers, IdentitySampling(**saved['identity_sampling']),
                                          augment=True, **banks)
     dataset = FollowDataset(fibers, spec, sample, band, chunk=c['batch'], seed=args.seed,
         cache_bytes=int(c['worker_cache_gb']*(1 << 30)), batch_builder=builder,
         onpolicy=[OnPolicyStates.load(p) for p in c['onpolicy']],
-        budget=TaskBudget(**dict(c['task_budget'], shares=tuple(c['task_budget']['shares'].values()))))
+        budget=TaskBudget(**dict(saved['task_budget'], shares=tuple(saved['task_budget']['shares'].values()))))
     loader = torch.utils.data.DataLoader(dataset, batch_size=None, num_workers=args.workers)
     iterator = iter(loader)
     for _ in range(args.warmup):

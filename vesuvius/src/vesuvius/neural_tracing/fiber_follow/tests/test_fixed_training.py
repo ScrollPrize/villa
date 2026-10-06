@@ -62,8 +62,8 @@ def test_masked_retries_preserve_adamw_skipped_parameter_updates():
     protected = {name: p.detach().clone() for name, p in model.named_parameters() if name.startswith('refinement_')}
     trained = model.coordinates.weight.detach().clone()
     with torch.no_grad():
-        model.confidence_scorer.failure.weight.zero_()
-        model.confidence_scorer.failure.bias.fill_(-20.)
+        model.hazard.weight.zero_()
+        model.hazard.bias.fill_(-20.)
     optimizer_update(model, ema, opt, [coordinate_batch(model.cfg)], 2, .001, compute_metrics=False)
     for name, p in model.named_parameters():
         if name in protected:

@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 import torch
 
-from model_fixtures import coordinate_batch, coordinate_config, proposal_output
+from model_fixtures import coordinate_batch, coordinate_config, fake_ct, proposal_output
 from vesuvius.neural_tracing.fiber_follow.models.model import build_model, select_refinement
 from vesuvius.neural_tracing.fiber_follow.train.supervision import loss_terms
 from vesuvius.neural_tracing.fiber_follow.evaluation.diagnostics import decision_rows
@@ -45,30 +45,41 @@ def test_selection_uses_actual_threshold_horizon_and_matching_scores():
     assert select_refinement(output, c)['selected_refinement'].item() == 0
 
 
-def test_retries_run_only_for_unaccepted_rows_and_mask_unused_attempts(monkeypatch):
+def hazards(model, monkeypatch, values):
+    """Replace the hazard head's output: ``values(decoded, call)`` -> (B, P) logits."""
+    calls = []
+    def forward(decoded):
+        calls.append(len(decoded))
+        return values(decoded, len(calls)-1)[..., None]
+    monkeypatch.setattr(model.hazard, 'forward', forward)
+    return calls
+
+
+def test_retries_run_for_every_slot_and_mask_attempts_after_acceptance(monkeypatch):
     model = build_model(coordinate_config(recurrent_refinement_steps=4))
     b = coordinate_batch(model.cfg, 3)
-    calls, decoder_batches = [], []
     accepted = []
-    def score(ctx, points):
-        calls.append(len(points))
-        values = points.new_full(points.shape[:2], 2.)
-        values[accepted] = -12.
-        return values
-    monkeypatch.setattr(model, 'hazard_logits', score)
-    hook = model.coordinates.register_forward_hook(lambda m, args, out: decoder_batches.append(len(out)))
-    # Full acceptance skips all additional decoder and scorer work.
+    def values(decoded, call):
+        out = decoded.new_full(decoded.shape[:2], 2.)
+        out[accepted] = -12.
+        return out
+    calls = hazards(model, monkeypatch, values)
+    # Every pass runs for every row (fixed slots); an accepted row keeps its first attempt.
     accepted[:] = [0, 1, 2]
     out = model(b['x'], b['hist'], b['hmask'], confidence_threshold=.9)
-    assert calls == decoder_batches == [3]
-    assert out['refinement_mask'].tolist() == [[True]]*3
+    assert calls == [3]*5
+    assert out['refinement_mask'].tolist() == [[True, False, False, False, False]]*3
     torch.testing.assert_close(out['points'], out['initial_points'])
-    calls.clear(), decoder_batches.clear()
-    accepted[:] = [0]
+    # Row i is accepted from pass i on.
+    calls.clear()
+    def values(decoded, call):
+        out = decoded.new_full(decoded.shape[:2], 2.)
+        out[:call+1] = -12.
+        return out
+    hazards(model, monkeypatch, values)
     out = model(b['x'], b['hist'], b['hmask'])
-    hook.remove()
-    assert calls == decoder_batches == [3, 2, 1]
-    assert out['refinement_mask'].tolist() == [[True, False, False], [True, True, False], [True, True, True]]
+    assert out['refinement_mask'].tolist() == [[True, False, False, False, False], [True, True, False, False, False],
+                                               [True, True, True, False, False]]
     assert out['selected_refinement'].tolist() == [0, 1, 2]
     terms = loss_terms(out, b, model.cfg)
     # Loss for each state agrees with evaluating only its actual attempts.
@@ -95,7 +106,7 @@ def test_partial_acceptance_uses_budget_and_absolute_head_can_replace_path(monke
     monkeypatch.setattr(model.coordinates, 'forward', coordinates)
     # First point accepted, later prefix rejected. A one-point commit does not
     # make the entire prediction acceptable and must not suppress retries.
-    monkeypatch.setattr(model, 'hazard_logits', lambda ctx, p: p.new_tensor([[-12., 2., 2., 2.]]))
+    hazards(model, monkeypatch, lambda decoded, call: decoded.new_tensor([[-12., 2., 2., 2.]]))
     out = model(b['x'], b['hist'], b['hmask'], n_commit=1)
     assert len(calls) == 3 and out['refinement_mask'].all()
     curves = out['refinement_points']
@@ -111,11 +122,11 @@ def test_feedback_changes_new_proposal_but_geometry_cannot_train_scores(monkeypa
     b = coordinate_batch(model.cfg, 1)
     outputs, scores = [], []
     for value in (-1., 3.):
-        def score(ctx, points, value=value):
-            result = points.new_full(points.shape[:2], value, requires_grad=True)
+        def score(decoded, call, value=value):
+            result = decoded.new_full(decoded.shape[:2], value).detach().requires_grad_()
             scores.append(result)
             return result
-        monkeypatch.setattr(model, 'hazard_logits', score)
+        hazards(model, monkeypatch, score)
         out = model(b['x'], b['hist'], b['hmask'], confidence_threshold=1.)
         outputs.append(out)
         loss_terms(out, b, model.cfg)['geometry_per_state'].sum().backward()
@@ -125,7 +136,6 @@ def test_feedback_changes_new_proposal_but_geometry_cannot_train_scores(monkeypa
 
 
 def test_tracer_passes_operating_threshold_into_adaptive_model(monkeypatch):
-    from test_history_slabs import fake_ct
     fake_ct(monkeypatch)
     model = build_model(coordinate_config(recurrent_refinement_steps=2)).eval()
     monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.data.observations.image_crop',
@@ -168,7 +178,6 @@ def test_recovery_evaluator_reruns_policy_per_threshold_on_float_inputs_and_obse
     calls = []
     def forward(x, hist, hmask, *, confidence_threshold, n_commit):
         assert all(v.dtype != torch.float16 for v in x.values())
-        assert x['history_valid'].dtype == torch.bool and x['history_slabs'].dtype == torch.float32
         calls.append((confidence_threshold, n_commit))
         return select_refinement(policy_output(), c, confidence_threshold, n_commit)
     monkeypatch.setattr(model, 'forward', forward)

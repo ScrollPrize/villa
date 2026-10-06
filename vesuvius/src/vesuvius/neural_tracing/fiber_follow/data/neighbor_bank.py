@@ -127,17 +127,10 @@ class NeighborBank:
         return len(self._known)
 
     def provenance(self):
-        """Record a snapshot boundary, while permitting append-only growth on resume."""
+        """Record a snapshot boundary of the published shards."""
         self.refresh(force=True)
         return dict(version=1, run_digest=self.run['digest'], manifest_sha256=self._manifest_sha,
                     shard_hashes={k:v['bank_sha256'] for k,v in sorted(self._known.items())})
-
-    def validate_resume(self, saved):
-        if not saved or saved.get('version') != 1 or saved.get('run_digest') != self.run['digest']:
-            raise ValueError('Checkpoint negative-bank run differs')
-        current = self.provenance()['shard_hashes']
-        if any(current.get(k) != v for k,v in saved['shard_hashes'].items()):
-            raise ValueError('Checkpoint negative-bank shards were removed or modified')
 
     def validate_volume(self, spec):
         from vesuvius.neural_tracing.fiber_follow.shared.paths import recorded_path

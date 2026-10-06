@@ -1,25 +1,25 @@
-"""Unified crop follower: a residual CNN tokenizes the crop and one transformer reads every token and predicts the path.
+"""Crop transformer: a residual CNN tokenizes the crop and one transformer reads every token and predicts the path.
 
-The crop (by default the forward35 crop: 144 deep x 104 x 104 at 0.5 trace voxels, 72 samples behind the head) goes
-through residual CNN stages, by default 32/64/128 channels at strides 2/4/8 with 1/2/2 blocks. Each stride-8 cell
-becomes one token (18 x 13 x 13 = 3042), with no other encoder. One transformer (by default 12 layers, width 256, 8
-heads, FFN 2048) reads, in every layer:
+The crop (by default 144 deep x 104 x 104 at 0.5 trace voxels, 72 samples behind the head) goes through residual CNN
+stages, by default 32/64/128 channels at strides 2/4/8 with 1/2/2 blocks. Each stride-8 cell becomes one token
+(18 x 13 x 13 = 3042), with no other encoder. One transformer (by default 12 layers, width 256, 8 heads, FFN 2048)
+reads, in every layer:
 
-  * context tokens: the crop cells, the recent observed path and seed (the coordinate model's reference points,
-    with CNN features sampled at each point) and the observed-path geometry tokens (models/path_geometry.py). They
-    attend to each other (key padding for absent references);
+  * context tokens: the crop cells, the recent observed path and seed (reference points, with CNN features sampled at
+    each point) and the observed-path geometry tokens (models/path_geometry.py). They attend to each other (key
+    padding for absent references);
   * path tokens, one per forward plane (planes 1..n_future): these attend to every context token and to the path
     tokens of their own set, through the same layer weights.
 
 Context tokens never attend to path tokens, so a decision's context keys/values are computed once and every further
 set of path tokens (refinement passes, flow draws and solver steps, scoring passes) costs only its own tokens. The
-model types share this backbone and differ only in what their path tokens carry and read out:
+two model types share this backbone and differ only in what their path tokens carry and read out:
 
-  * 'unified' (coordinate regression): the path tokens start at the centerline and read out each plane's lateral
-    position and hazard logit (survival confidence) together; optional refinement passes feed the proposal, its
-    evidence and its detached confidence back as new path tokens (as the coordinate model's recurrent refinement);
-  * 'unified_flow' (flow matching, models/flow.py): path tokens carry a noisy path and the flow time and read out
-    the velocity; a scoring set of path tokens carries a finished proposal and reads out its hazard logits. With
+  * 'regression': the path tokens start at the centerline and read out each plane's lateral position and hazard
+    logit (survival confidence) together; optional refinement passes feed the proposal, its evidence and its detached
+    confidence back as new path tokens;
+  * 'flow' (flow matching, models/flow.py): path tokens carry a noisy path and the flow time and read out the
+    velocity; a scoring set of path tokens carries a finished proposal and reads out its hazard logits. With
     flow_time_conditioning 'adaln' the time also modulates every layer's two branches and the final norm of the
     velocity path tokens (zero-initialized, so the model starts as the 'input' one); 'adaln_zero' gates each branch by
     a zero-initialized alpha instead (alpha*branch, DiT's adaLN-Zero), so every velocity-token block starts as the
@@ -27,37 +27,34 @@ model types share this backbone and differ only in what their path tokens carry 
 
 Both keep the shared output contract, losses, acceptance (gate plane), commits and trainer (train/train.py).
 """
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+import math
 
 import torch
 from torch import nn
 import torch.nn.functional as F
 
-from vesuvius.neural_tracing.fiber_follow.models.flow import FlowConfig, FlowMatching, time_embedding
+from vesuvius.neural_tracing.fiber_follow.models.flow import FlowMatching, FlowOptions, time_embedding
 from vesuvius.neural_tracing.fiber_follow.models.model import (
-    REFERENCE_METADATA, CoordinateRegressionConfig, future_points, proposal_output, reference_metadata,
-    reference_points, sample_features, select_refinement, token_coordinates)
+    REFERENCE_METADATA, FollowerConfig, future_points, proposal_output, reference_metadata, reference_points,
+    sample_features, select_refinement, token_coordinates)
 from vesuvius.neural_tracing.fiber_follow.models.path_geometry import PathGeometryTokens
 from vesuvius.neural_tracing.fiber_follow.models.sequence import CropCNN, SequenceLayer
 from vesuvius.neural_tracing.fiber_follow.models.survival_confidence import survival_predictions
-from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
 from vesuvius.neural_tracing.fiber_follow.tracing.policy import DEFAULT_CONFIDENCE, commit_prefix
 
-UNIFIED_MODEL_TYPES = ('unified', 'unified_flow')
 CELL, REFERENCE, GEOMETRY, PATH, SCORED = range(5)  # token kinds
 
 
 @dataclass
-class UnifiedArchitecture:
-    """Sizes of the unified backbone, mixed into the regression and flow configurations (``layers``/``heads``
-    size the transformer). There are no memory inputs, whole-crop planes, tube head or identity heads."""
-    fine: CropSpec = field(default_factory=lambda: CropSpec(depth=144, width=104, behind=72, spacing=.5))
+class CropTransformerArchitecture:
+    """Sizes of the crop transformer backbone, mixed into the regression and flow configurations (``layers``/``heads``
+    size the transformer)."""
     layers: int = 12
     heads: int = 8
     ffn: int = 2048
     cnn_channels: tuple = (32, 64, 128)  # one stage per entry, each at stride 2
     cnn_blocks: tuple = (1, 2, 2)
-    memory: str = 'none'
 
     def __post_init__(self):
         super().__post_init__()
@@ -65,13 +62,12 @@ class UnifiedArchitecture:
         self.cnn_blocks = tuple(int(b) for b in self.cnn_blocks)
         if (not self.cnn_channels or len(self.cnn_blocks) != len(self.cnn_channels)
                 or min(self.cnn_channels+self.cnn_blocks) < 1 or type(self.ffn) is not int or self.ffn < 1):
-            raise ValueError('The unified CNN needs positive channels and blocks per stage; the FFN a positive width')
-        if (self.memory != 'none' or self.path_planes != 'future' or self.tube_head or self.identity_dim
-                or self.identity_objective != 'infonce' or self.identity_map or self.identity_feedback):
-            raise ValueError('The unified model has no memory inputs, whole-crop planes, tube head or identity heads')
+            raise ValueError('The crop CNN needs positive channels and blocks per stage; the FFN a positive width')
+        if min(self.layers, self.heads) < 1 or self.hidden % self.heads:
+            raise ValueError('Positive layers and heads required; hidden must divide by heads')
         stride = self.token_stride[0]
         if self.fine.depth % stride or self.fine.width % stride:
-            raise ValueError(f'Unified crops must be multiples of the token stride ({stride})')
+            raise ValueError(f'Crop transformer crops must be multiples of the token stride ({stride})')
 
     @property
     def token_stride(self):
@@ -84,17 +80,27 @@ class UnifiedArchitecture:
 
 
 @dataclass
-class UnifiedConfig(UnifiedArchitecture, CoordinateRegressionConfig):
-    model_type: str = 'unified'
-    recurrent_refinement_steps: int = 0
+class RegressionConfig(CropTransformerArchitecture, FollowerConfig):
+    model_type: str = 'regression'
+    n_future: int = 35
+    gate_plane: int | None = 16
+    recurrent_refinement_steps: int = 3
+    query_scale: float | None = None  # forward-distance normalization of path queries; None: n_future*future_step
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.query_scale is not None and not (math.isfinite(self.query_scale) and self.query_scale > 0):
+            raise ValueError('Query scale must be finite and positive')
 
 
 @dataclass
-class UnifiedFlowConfig(UnifiedArchitecture, FlowConfig):
-    model_type: str = 'unified_flow'
+class FlowConfig(FlowOptions, CropTransformerArchitecture, FollowerConfig):
+    model_type: str = 'flow'
+    n_future: int = 16
+    gate_plane: int | None = None
 
 
-class UnifiedLayer(SequenceLayer):
+class CropTransformerLayer(SequenceLayer):
     """One pre-norm transformer layer: context tokens attend to each other; path tokens attend to the context and
     to the path tokens their mask allows."""
 
@@ -126,8 +132,8 @@ class UnifiedLayer(SequenceLayer):
         return residual(x, self.ffn(branch_input(x, self.norm2, 1)), 1)
 
 
-class UnifiedBackbone(nn.Module):
-    """CNN tokens, context tokens and the transformer shared by the unified model types."""
+class CropTransformer(nn.Module):
+    """CNN tokens, context tokens and the transformer shared by the regression and flow models."""
 
     def __init__(self, cfg):
         super().__init__()
@@ -140,11 +146,10 @@ class UnifiedBackbone(nn.Module):
         self.path_geometry = PathGeometryTokens(cfg)
         self.kind = nn.Parameter(torch.zeros(5, h))  # CELL, REFERENCE, GEOMETRY, PATH, SCORED
         nn.init.normal_(self.kind, std=.02)
-        self.layers = nn.ModuleList(UnifiedLayer(h, cfg.heads, cfg.ffn) for _ in range(cfg.layers))
+        self.layers = nn.ModuleList(CropTransformerLayer(h, cfg.heads, cfg.ffn) for _ in range(cfg.layers))
         self.norm = nn.LayerNorm(h)
         self.register_buffer('planes', torch.arange(1, cfg.n_future+1).float()*cfg.future_step, persistent=False)
         self.register_buffer('cell_xyz', token_coordinates(cfg).reshape(-1, 3), persistent=False)
-        self.query_scale = cfg.query_scale or cfg.n_future*cfg.future_step
 
     def sample_cells(self, ctx, points):
         """CNN cell features (B, M, C) and crop support (B, M) at crop-local points (B, M, 3)."""
@@ -206,27 +211,17 @@ class UnifiedBackbone(nn.Module):
         reference[..., 2] = self.planes
         return reference
 
-    def encode_history(self, x, return_anchors=False, return_identity=False):
-        """No memory tokens (the trainer's history interface)."""
-        out = (None, None, None) if return_anchors else (None, None)
-        return (*out, {}) if return_identity else out
-
     def proposal_output(self, initial, refinements, scores, valid):
         return proposal_output(initial, refinements, scores, valid)
 
-    def identity_terms(self, ctx, x):
-        return {}
 
-    def verification_terms(self, ctx, x, predicted=None):
-        return {}
-
-
-class UnifiedFollower(UnifiedBackbone):
+class RegressionFollower(CropTransformer):
     """Coordinate regression: plane positions and survival confidence from one set of path tokens."""
 
     def __init__(self, cfg):
         super().__init__(cfg)
         h, cells = cfg.hidden, cfg.cnn_channels[-1]
+        self.query_scale = cfg.query_scale or cfg.n_future*cfg.future_step
         # CNN evidence and support at the centerline, forward distance.
         self.query = nn.Sequential(nn.Linear(cells+2, h), nn.SiLU(), nn.Linear(h, h))
         self.coordinates = nn.Linear(h, 2)
@@ -283,8 +278,8 @@ class UnifiedFollower(UnifiedBackbone):
                                       confidence_threshold, n_commit)
 
 
-class UnifiedFlowFollower(FlowMatching, UnifiedBackbone):
-    """Flow matching (models/flow.py) on the unified backbone: velocity and proposal scoring are path-token sets."""
+class FlowFollower(FlowMatching, CropTransformer):
+    """Flow matching (models/flow.py) on the crop transformer: velocity and proposal scoring are path-token sets."""
 
     def __init__(self, cfg):
         super().__init__(cfg)

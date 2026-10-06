@@ -1,27 +1,31 @@
-"""Model crop size/spacing from the training command line."""
+"""Model crop size/spacing from the run configuration."""
 import pytest
 
-from model_fixtures import REQUIRED
-from vesuvius.neural_tracing.fiber_follow.models.model import CoordinateRegressionConfig
+from model_fixtures import run_document
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
-from vesuvius.neural_tracing.fiber_follow.train.train import build_parser, model_config_from_args
+from vesuvius.neural_tracing.fiber_follow.train import run_config
 
 
-def test_crop_flag_defaults_are_the_current_model_crop():
-    args = build_parser().parse_args(REQUIRED)
-    assert model_config_from_args(args).fine == CoordinateRegressionConfig().fine
+def model(kind='regression', **fields):
+    return run_config.model_config(run_config.resolve(run_document(kind, **fields)))
 
 
-@pytest.mark.parametrize('model', ['coordinate_regression', 'flow_matching'])
-def test_crop_flags_set_the_model_crop(model):
-    args = build_parser().parse_args(REQUIRED+['--model', model, '--crop-depth', '96', '--crop-width', '80',
-                                               '--crop-behind', '32', '--crop-spacing', '1.0'])
-    cfg = model_config_from_args(args)
+def test_crop_defaults_are_each_model_types_crop():
+    assert model().fine == CropSpec(depth=144, width=104, behind=72, spacing=.5)
+    assert model('flow').fine == CropSpec(depth=144, width=104, behind=72, spacing=.5)
+    assert model('sequence').fine == CropSpec(depth=80, width=64, behind=16, spacing=.5)
+
+
+@pytest.mark.parametrize('kind', ['regression', 'flow', 'sequence'])
+def test_configured_crop_sets_the_model_crop(kind):
+    cfg = model(kind, fine=dict(depth=96, width=80, behind=32, spacing=1.), n_future=16, gate_plane=None)
     assert cfg.fine == CropSpec(depth=96, width=80, behind=32, spacing=1.)
-    assert cfg.token_shape == (24, 20, 20)
+    assert cfg.token_shape == (12, 10, 10)
 
 
-def test_invalid_crop_flags_are_rejected():
-    for flags in (['--crop-depth', '98'], ['--crop-behind', '200'], ['--crop-spacing', '0']):
-        with pytest.raises(ValueError):
-            model_config_from_args(build_parser().parse_args(REQUIRED+flags))
+@pytest.mark.parametrize('fine', [dict(depth=98, width=104, behind=72, spacing=.5),
+                                  dict(depth=144, width=104, behind=200, spacing=.5),
+                                  dict(depth=144, width=104, behind=72, spacing=0.)])
+def test_invalid_crops_are_rejected(fine):
+    with pytest.raises(ValueError):
+        model(fine=fine)

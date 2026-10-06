@@ -10,9 +10,8 @@ import numpy as np
 import pytest
 import torch
 
-from model_fixtures import config, line_fiber, slab_inputs
+from model_fixtures import config, follower_config, line_fiber
 from vesuvius.neural_tracing.fiber_follow.data.observations import IdentityObservationBuilder, reference_layout
-from vesuvius.neural_tracing.fiber_follow.models.model import CoordinateRegressionConfig
 from vesuvius.neural_tracing.fiber_follow.data.neighbor_bank import NeighborBank
 from vesuvius.neural_tracing.fiber_follow.data.neighbor_bulk import digest, pack_paths, write_json
 from vesuvius.neural_tracing.fiber_follow.data.neighbor_mining import MiningConfig
@@ -128,12 +127,12 @@ def fake_images(builder,items):
     cfg=builder.cfg
     for item in items: reference_layout(item,cfg)
     stack=lambda key: torch.from_numpy(np.stack([i[key] for i in items]).astype(np.float32))
-    return slab_inputs(len(items)) | dict(fine=torch.from_numpy(np.random.default_rng(3).random((len(items),2,cfg.fine.depth,cfg.fine.width,cfg.fine.width),np.float32)),
+    return dict(fine=torch.from_numpy(np.random.default_rng(3).random((len(items),2,cfg.fine.depth,cfg.fine.width,cfg.fine.width),np.float32)),
         seed=stack('visible_seed'),seed_mask=stack('visible_seed_mask'),seed_tangent=stack('visible_seed_tangent'),seed_age=stack('visible_seed_age'))
 
 
-def test_identity_supervision_and_training_cli_require_a_bank(monkeypatch):
-    builder = IdentityObservationBuilder(CoordinateRegressionConfig())
+def test_identity_supervision_requires_a_bank(monkeypatch):
+    builder = IdentityObservationBuilder(follower_config())
     with pytest.raises(ValueError,match='requires a negative bank'):
         builder.bank_targets([])
     # Monitor observations (tracing, recovery) need no bank and carry no identity labels.
@@ -146,10 +145,6 @@ def test_identity_supervision_and_training_cli_require_a_bank(monkeypatch):
     result = builder(items,None)
     assert set(result['x']) == set(images) and 'dense_mask' in result
     assert 'identity_points' not in result and 'negative_mask' not in result
-    from vesuvius.neural_tracing.fiber_follow.train.train import main
-    with pytest.raises(ValueError,match='requires --negative-bank'):
-        main(['--name','unused','--fiber-zarrs','unused','--fibers','unused','--ct','unused',
-              '--manifest','unused','--device','cpu','--threads','1','--negative-bank',''])
 
 
 def test_bank_integrity_fails_closed_and_only_annotation_identity_must_match(tmp_path, monkeypatch):
@@ -170,14 +165,13 @@ def test_bank_integrity_fails_closed_and_only_annotation_identity_must_match(tmp
         stream.write(b'damaged')
     with pytest.raises(ValueError,match='checksum'):
         bank.paths(0,80.)
-    # Published shards are immutable; a resume allows growth only.
+    # Published shards are immutable; a refresh allows growth only.
     bank,_ = make_bank(tmp_path/'growth',with_path=True)
     root = bank.root
     first = list(bank._known.values())[0]
-    saved = bank.provenance()
     second = add_shard(root,1,x=8.)
     publish(root,[first,second])
-    bank.validate_resume(saved)
+    bank.refresh(force=True)
     publish(root,[second])
     with pytest.raises(ValueError,match='removed or modified'):
         bank.refresh(force=True)
@@ -216,7 +210,7 @@ def test_bank_integrity_fails_closed_and_only_annotation_identity_must_match(tmp
 def test_foreign_masks_refresh_without_contrastive_queries(tmp_path):
     reverse,angle = True,.37
     bank,fiber = make_bank(tmp_path)
-    cfg = CoordinateRegressionConfig()
+    cfg = follower_config()
     builder = IdentityObservationBuilder(cfg,[fiber],negative_bank=bank)
     state = item(cfg,reverse)
     rotation = np.array([[np.cos(angle),-np.sin(angle),0.],[np.sin(angle),np.cos(angle),0.],[0.,0.,1.]])
@@ -236,7 +230,7 @@ def test_foreign_masks_refresh_without_contrastive_queries(tmp_path):
 
 def test_bank_rasterization_marks_only_cells_containing_line_samples(tmp_path):
     bank,_ = make_bank(tmp_path,with_path=True)
-    cfg = CoordinateRegressionConfig()
+    cfg = follower_config()
     state = item(cfg)
     found = bank.candidates(state,cfg.fine,ComponentRule())
     indices = np.rint(crop_indices(cfg.fine,found['local'])).astype(int)
@@ -248,7 +242,7 @@ def test_bank_rasterization_marks_only_cells_containing_line_samples(tmp_path):
 def test_foreign_cell_extent_cannot_reach_target_exclusion_tube(tmp_path):
     bank,_ = make_bank(tmp_path)
     publish(tmp_path,[add_shard(tmp_path,0,x=3.)])
-    cfg = CoordinateRegressionConfig()
+    cfg = follower_config()
     state = item(cfg)
     found = bank.candidates(state,cfg.fine,ComponentRule())
     grid = crop_local_grid(cfg.fine)[found['foreign']]

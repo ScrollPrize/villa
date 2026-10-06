@@ -19,19 +19,20 @@ import numpy as np
 import torch
 from torch import nn
 
-from vesuvius.neural_tracing.fiber_follow.models.model import CoordinateRegressionConfig
 from vesuvius.neural_tracing.fiber_follow.data.crop_sampling import scalar_crops
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, arclength, frame_from_heading, interp_at
 
 ARCHITECTURE = 'crop_heading_ct_path_v2'
 NORMAL_ARCHITECTURE = 'crop_heading_normal_ct_path_v3'
 FRAME_ARCHITECTURE = 'crop_frame_ct_path_family_v4'
+# The follower crop the heading model was designed for (the earlier coordinate model's default).
+FOLLOWER_CROP = CropSpec(depth=120, width=104, behind=48, spacing=.5)
 DOWNSAMPLINGS = 4  # stride-2 encoder layers; patch sizes must be divisible by 2**DOWNSAMPLINGS
 
 
 def main_crop_forward(crop=None):
     """Forward extent of the follower's crop (trace voxels): the span whose fiber the heading should keep in crop."""
-    crop = crop or CoordinateRegressionConfig().fine
+    crop = crop or FOLLOWER_CROP
     return (crop.depth-1-crop.behind)*crop.spacing
 
 

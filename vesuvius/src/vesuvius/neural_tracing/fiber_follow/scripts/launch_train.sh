@@ -1,25 +1,23 @@
 #!/usr/bin/env bash
-# Background training with a persistent log. Additional CLI options override defaults.
+# Background training from a run configuration, with a persistent log:
+#   launch_train.sh RUN.json [--resume CHECKPOINT]
+# The log and PID file are named after the configuration's "name".
 set -euo pipefail
 FF="$(cd "$(dirname "$0")/.." && pwd)"
 VES="$(cd "$FF/../../../.." && pwd)"
 PYTHON=${PYTHON:-$VES/.venv/bin/python}
 export PYTHONPATH="$VES/src${PYTHONPATH:+:$PYTHONPATH}"
 if [[ ${1:-} == --help || ${1:-} == -h ]]; then
-    exec "$PYTHON" -m vesuvius.neural_tracing.fiber_follow.train.train --help
+    exec "$PYTHON" "$FF/train/train.py" --help
 fi
-name=${1:?Usage: launch_train.sh NAME [train options...]}
+config=${1:?Usage: launch_train.sh RUN.json [--resume CHECKPOINT]}
 shift
+config="$(cd "$(dirname "$config")" && pwd)/$(basename "$config")"
+name="$("$PYTHON" -c 'import json, sys; print(json.load(open(sys.argv[1]))["name"])' "$config")"
 case "$name" in
     ''|.|..|*/*) echo 'Run name must be a single directory name.' >&2; exit 1 ;;
 esac
-command=("$PYTHON" -u -m vesuvius.neural_tracing.fiber_follow.train.train \
-    --name "$name" \
-    --fiber-zarrs /mnt/raid_nvme/spiral_dataset_working/fiber_zarrs \
-    --fibers /mnt/raid_nvme/spiral_dataset_working/fibers \
-    --ct /mnt/raid_nvme/volpkgs/s1_2um_ds2.volpkg/volumes/s1_ds2.zarr \
-    --manifest "$FF/output/single_path_v11_preparation/seeds.json" \
-    "$@")
+command=("$PYTHON" -u "$FF/train/train.py" --config "$config" "$@")
 "$PYTHON" - "$FF/output/logs" "$name" "${command[@]}" <<'PY'
 from pathlib import Path
 import shlex

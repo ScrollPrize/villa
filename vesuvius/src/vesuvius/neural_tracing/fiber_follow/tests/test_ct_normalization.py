@@ -50,7 +50,7 @@ def test_zscore_uses_all_pixels_without_clipping_or_background_sentinel():
     np.testing.assert_array_equal(image, before)
 
 
-def test_zscore_init_resume_and_inference_reuse_the_checkpoint_policy(tmp_path, monkeypatch):
+def test_zscore_init_resume_and_inference_reuse_the_checkpoint_policy(tmp_path, monkeypatch, capsys):
     spec = volume(tmp_path)
     crop, items = CropSpec(8, 8, 4, 1.), [dict(pos=np.array([8., 8., 36.]), frame=np.eye(3))]
     with pytest.raises(ValueError, match='normalization record is required'):
@@ -75,8 +75,10 @@ def test_zscore_init_resume_and_inference_reuse_the_checkpoint_policy(tmp_path, 
     (out/'ct_normalization.json').write_text(json.dumps(bad))
     with pytest.raises(ValueError, match='differs'):
         norm.prepare_normalization(out, [spec], resume=document)
-    with pytest.raises(ValueError, match='differs from the checkpoint'):
+    # A record differing from the checkpoint's is reported, not rejected; an invalid record still fails.
+    with pytest.raises(ValueError, match='Invalid z-score'):
         norm.prepare_normalization(out, [spec], known=document)
+    assert 'differs from the checkpoint' in capsys.readouterr().out
     # A new inference volume gets its own record under the checkpoint's policy.
     second = volume(tmp_path/'second')
     inferred = norm.prepare_normalization(tmp_path/'infer', [second], known=document)
@@ -87,8 +89,10 @@ def test_zscore_init_resume_and_inference_reuse_the_checkpoint_policy(tmp_path, 
     meta_path = Path(second.ct_zarr)/'0'/'.zarray'
     meta = json.loads(meta_path.read_text()); meta['shape'][0] += 1
     meta_path.write_text(json.dumps(meta))
-    with pytest.raises(ValueError, match='metadata changed'):
-        norm.prepare_normalization(tmp_path/'infer', [second])
+    # Changed CT array metadata is reported and the current array recorded.
+    updated = norm.prepare_normalization(tmp_path/'infer', [second])
+    assert 'metadata changed' in capsys.readouterr().out
+    assert updated['volumes'][norm.volume_key(second)]['shape'][0] == meta['shape'][0]
 
 
 def test_fresh_run_defaults_to_zscore_and_rejects_background_policy(tmp_path):
