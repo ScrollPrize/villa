@@ -226,10 +226,10 @@ def test_qk_norm_and_modulation_bound_hold_path_attention_under_runaway_time_mod
 
 def test_learned_logit_scale_starts_at_the_standard_scale_sharpens_attention_and_trains_in_its_own_group(tmp_path):
     torch.manual_seed(47)
-    cfg = config(flow_time_conditioning='adaln_zero')
+    cfg = config()
     assert cfg.qk_logit_scale
     model, ema = initialize_model_weights(cfg, 'cpu')
-    plain = build_model(config(flow_time_conditioning='adaln_zero', qk_logit_scale=False))
+    plain = build_model(config(qk_logit_scale=False))
     plain.load_state_dict({k: v for k, v in model.state_dict().items() if not k.endswith('logit_scale')})
     b = coordinate_batch(cfg); y, t = torch.randn(2, 2, 4, 2), torch.rand(2, 2)
     with torch.no_grad():
@@ -254,7 +254,7 @@ def test_learned_logit_scale_starts_at_the_standard_scale_sharpens_attention_and
     assert opt.param_groups[1]['weight_decay'] == 0 and opt.param_groups[1]['lr'] == pytest.approx(.001*LOGIT_SCALE_LR_SCALE)
     assert opt.param_groups[0]['lr'] == pytest.approx(.001) and any(layer.logit_scale.abs().sum() > 0 for layer in model.layers)
     # A run trained without scales resumes with them added at zero: its moments are kept, the scales start fresh.
-    old_cfg = config(flow_time_conditioning='adaln_zero', qk_logit_scale=False)
+    old_cfg = config(qk_logit_scale=False)
     old, old_ema = initialize_model_weights(old_cfg, 'cpu')
     old_opt, _, _ = initialize_training_optimizer(old, old_ema, args)
     prepare_training(old, backend='eager')
