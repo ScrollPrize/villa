@@ -10,4 +10,4 @@ esac
 pid_file="$FF/output/logs/$name.pid"
 [[ -f "$pid_file" ]] || pid_file="$FF/output/$name/trainer.pid"
 export PYTHONPATH="$VES/src${PYTHONPATH:+:$PYTHONPATH}"
-exec "$VES/.venv/bin/python" -m vesuvius.neural_tracing.tracers.fibers.train.stop_run "$pid_file" "$name"
+exec "$VES/.venv/bin/python" -m vesuvius.neural_tracing.tracers.fibers.scripts.stop_run "$pid_file" "$name"
