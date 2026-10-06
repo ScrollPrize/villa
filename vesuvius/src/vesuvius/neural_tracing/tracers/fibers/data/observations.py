@@ -6,7 +6,6 @@ import numpy as np
 import torch
 from scipy.ndimage import gaussian_filter
 
-from vesuvius.neural_tracing.tracers.fibers.data.components import ComponentRule
 from vesuvius.neural_tracing.tracers.fibers.data.targets import collate_targets, resolve_trace_seed
 from vesuvius.neural_tracing.tracers.fibers.data.tasks import SOURCE
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.crops import scalar_crops, empty_image_batch
@@ -87,6 +86,14 @@ class ObservationBuilder:
 
     def __call__(self,items,vol):
         return dict(self.observations(items, vol), **collate_targets(items))
+
+
+@dataclass(frozen=True)
+class ComponentRule:
+    """Pair support/clearance settings; the old component sampler is retired."""
+    own_radius: float = 1.5  # minimum target clearance
+    lateral_max: float = 12.  # lateral support radius; crop support still applies
+    along_window: float = 2.  # negatives within this arc of their positive
 
 
 @dataclass(frozen=True)

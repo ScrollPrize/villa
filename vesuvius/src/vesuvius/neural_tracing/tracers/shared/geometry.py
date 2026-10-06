@@ -68,6 +68,13 @@ def crop_local_grid(spec: CropSpec) -> np.ndarray:
     return np.stack([a, b, c], axis=-1)
 
 
+def crop_indices(crop, local):
+    """Continuous volume indices (c, b, a) for crop-local (a, b, c) points: the inverse of ``crop_local_grid``."""
+    local = np.asarray(local, np.float64).reshape(-1, 3)
+    return np.c_[local[:, 2]/crop.spacing+crop.behind, local[:, 1]/crop.spacing+(crop.width-1)/2,
+                 local[:, 0]/crop.spacing+(crop.width-1)/2]
+
+
 def block_start(pos_xyz: np.ndarray, frame: np.ndarray, spec: CropSpec) -> np.ndarray:
     """zyx start of the axis-aligned block that contains the oriented crop."""
     center = pos_xyz + spec.center_offset * frame[:, 2]

@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import numpy as np
 
+from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import open_ct_array
 from vesuvius.neural_tracing.tracers.shared.io import atomic_write
 
 ZSCORE_METHOD = 'crop_zscore_v1'
@@ -14,13 +15,6 @@ def volume_key(spec):
     if '://' not in source:
         source = str(Path(source).resolve())
     return source+'::'+str(spec.ct_level)
-
-
-def open_ct(spec):
-    from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import ChunkedArray, RemoteChunkedArray
-    if str(spec.ct_zarr).startswith(('s3://', 'http://', 'https://')):
-        return RemoteChunkedArray(spec.ct_zarr, spec.ct_level, spec.cache_dir, 32 << 20)
-    return ChunkedArray(Path(spec.ct_zarr)/str(spec.ct_level), 32 << 20)
 
 
 def array_identity(ct):
@@ -41,7 +35,6 @@ def prepare_normalization(out, specs, *, known=None):
     Checkpoints embed the document too (``known``), allowing a missing JSON to be restored. A record that differs
     from the checkpoint's, or from the current CT array, is reported and replaced by the current one.
     """
-    from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import RemoteChunkedArray
     path = Path(out)/'ct_normalization.json'
     document = json.loads(path.read_text()) if path.exists() else dict(method=ZSCORE_METHOD, volumes={})
     if document.get('method') != ZSCORE_METHOD:
@@ -52,7 +45,7 @@ def prepare_normalization(out, specs, *, known=None):
     document = json.loads(json.dumps(document))
     for spec in specs:
         key = volume_key(spec)
-        ct = open_ct(spec)
+        ct = open_ct_array(spec, 32 << 20)
         if (known is not None and key in known['volumes'] and key in document['volumes']
                 and known['volumes'][key] != document['volumes'][key]):
             print(f'Warning: CT normalization record differs from the checkpoint: {key}', flush=True)

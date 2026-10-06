@@ -286,6 +286,14 @@ class RemoteChunkedArray(ChunkedArray):
             return super()._load(key)
 
 
+def open_ct_array(spec, cache_bytes, *, cache_only=False):
+    """The CT array a volume spec names: a remote store through the persistent chunk cache, or a local uncompressed
+    Zarr level."""
+    if str(spec.ct_zarr).startswith(('s3://','http://','https://')):
+        return RemoteChunkedArray(spec.ct_zarr, spec.ct_level, spec.cache_dir, cache_bytes, cache_only=cache_only)
+    return ChunkedArray(os.path.join(spec.ct_zarr, str(spec.ct_level)), cache_bytes)
+
+
 def remote_store(url, *, max_pool_connections=None):
     from vesuvius.neural_tracing.datasets.common import _make_remote_store
     from vesuvius.neural_tracing.s3_utils import s3_storage_options_for_path
@@ -348,9 +356,7 @@ class CTVolume:
             raise ValueError('CT sampling currently requires an integer number of CT voxels per trace voxel')
         if not spec.ct_zarr:
             raise ValueError("CT input mode needs ct_zarr")
-        ct = (RemoteChunkedArray(spec.ct_zarr, spec.ct_level, spec.cache_dir, int(cache_bytes*.75), cache_only=cache_only)
-              if spec.ct_zarr.startswith(('s3://','http://','https://')) else
-              ChunkedArray(os.path.join(spec.ct_zarr, str(spec.ct_level)), int(cache_bytes*.75)))
+        ct = open_ct_array(spec, int(cache_bytes*.75), cache_only=cache_only)
         if ct.dtype != np.dtype('uint8'):
             raise ValueError('CT intensity normalization currently requires uint8 data')
         self.ct = ct

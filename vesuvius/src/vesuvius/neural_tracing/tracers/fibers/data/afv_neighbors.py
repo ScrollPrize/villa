@@ -10,8 +10,7 @@ from pathlib import Path
 import numpy as np
 from scipy.spatial import cKDTree
 
-from vesuvius.neural_tracing.tracers.fibers.data.components import crop_indices
-from vesuvius.neural_tracing.tracers.shared.geometry import arclength, exact_nearest, interp_at
+from vesuvius.neural_tracing.tracers.shared.geometry import arclength, crop_indices, exact_nearest, interp_at
 
 
 class AFVBank:
