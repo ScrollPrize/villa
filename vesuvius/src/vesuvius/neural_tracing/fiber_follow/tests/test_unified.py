@@ -65,9 +65,9 @@ def test_path_token_sets_and_absent_references_are_independent():
             torch.testing.assert_close(v1[:, :, visible[0]], v0[:, :, visible[0]])
 
 
-@pytest.mark.parametrize('flow', [False, True])
-def test_compiled_training_matches_eager_with_finite_gradients(flow):
-    model = small(flow=flow)
+@pytest.mark.parametrize('flow, options', [(False, {}), (True, {}), (True, dict(flow_time_conditioning='adaln'))])
+def test_compiled_training_matches_eager_with_finite_gradients(flow, options):
+    model = small(flow=flow, **options)
     b = coordinate_batch(model.cfg, 2)
     if flow:
         b['flow_noise'] = torch.randn(2, model.cfg.flow_draws, 8, 2)
@@ -119,3 +119,28 @@ def test_tracing_runs_the_unified_model(tmp_path):
     finally:
         tracer.close()
     assert reasons == ['max_len'] and len(paths[0]) > 1
+
+
+def test_adaln_starts_as_the_input_conditioned_flow_model_and_modulates_only_velocity_tokens():
+    plain, adaln = small(flow=True), small(flow=True, flow_time_conditioning='adaln')
+    missing, unexpected = adaln.load_state_dict(plain.state_dict(), strict=False)
+    assert not unexpected and missing and all(k.startswith(('time_modulation', 'output_modulation')) for k in missing)
+    b = coordinate_batch(adaln.cfg, 2)
+    y, t = torch.randn(2, 3, 8, 2), torch.rand(2, 3)
+    with torch.no_grad():
+        ctx = adaln.context(b['x'], b['hist'], b['hmask'])
+        torch.testing.assert_close(adaln.velocity_field(ctx, y, t), plain.velocity_field(ctx, y, t))  # zero init
+        for linear in (*adaln.time_modulation, adaln.output_modulation):
+            linear.weight.normal_(std=.05)
+        modulated = adaln.velocity_field(ctx, y, t)
+        assert not torch.allclose(modulated, plain.velocity_field(ctx, y, t))
+        # Draws stay independent; proposal scores carry no time, so modulation never reaches them.
+        torch.testing.assert_close(adaln.velocity_field(ctx, y[:, :1], t[:, :1]), modulated[:, :1], atol=1e-5, rtol=1e-4)
+        points = adaln.to_points(y[:, 0])
+        torch.testing.assert_close(adaln.hazard_logits(ctx, points), plain.hazard_logits(ctx, points))
+    b['flow_noise'], b['flow_times'] = torch.randn(2, adaln.cfg.flow_draws, 8, 2), torch.rand(2, adaln.cfg.flow_draws)
+    out = adaln.training_forward(b['x'], b['hist'], b['hmask'], torch.tensor(.5), b)
+    out['flow_per_state'].sum().backward()
+    assert all(linear.weight.grad.abs().sum() > 0 for linear in (*adaln.time_modulation, adaln.output_modulation))
+    args = build_parser().parse_args(REQUIRED+['--model', 'unified_flow', '--flow-time-conditioning', 'adaln'])
+    assert model_config_from_args(args).flow_time_conditioning == 'adaln'
