@@ -1037,7 +1037,11 @@ def run_native_inference(
     variants = tta_variants(bool(args.tta))
     with torch.inference_mode(), autocast:
         for images, metadata in loader:
-            images = images.to(bundle.device, non_blocking=True)
+            # Only CUDA gets non_blocking: on torch 2.11/2.12 an MPS copy can
+            # read this host batch after it is freed (pytorch/pytorch#189690).
+            images = images.to(
+                bundle.device, non_blocking=bundle.device.type == "cuda"
+            )
             probabilities = predict_batch(
                 bundle.model,
                 images,
