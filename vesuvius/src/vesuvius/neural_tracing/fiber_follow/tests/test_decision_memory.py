@@ -274,7 +274,7 @@ def test_identity_targets_use_each_neighbor_path_crossing_of_the_positive_plane_
     from vesuvius.neural_tracing.fiber_follow.data.observations import IdentityObservationBuilder
     from vesuvius.neural_tracing.fiber_follow.models.decision_memory import IDENTITY_NEGATIVES
     builder = IdentityObservationBuilder.__new__(IdentityObservationBuilder)
-    builder.fibers = [NS(points=np.c_[np.zeros(300), np.zeros(300), np.arange(300.)])]
+    builder.fibers = [NS(points=np.c_[np.zeros(300), np.zeros(300), np.arange(300.)], s=np.arange(300.), length=299.)]
     builder.sampling = NS(rule=NS(own_radius=1.5), on_fiber_tolerance=1.5)
     planes = np.arange(1., 17.)
     item = dict(planes=planes, plane_mask=np.ones(16), plane_ab=np.zeros((16, 2)), fiber_ref=(0, 100., False),

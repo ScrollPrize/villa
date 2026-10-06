@@ -173,6 +173,21 @@ def traversal(fiber, reverse):
     return (fiber.points[::-1], fiber.length-fiber.s[::-1]) if reverse else (fiber.points, fiber.s)
 
 
+MEMORY_ARC_MARGIN = 32.  # arclength slack behind an entry's age-implied position (plus age/8 for detours)
+
+
+def memory_distance(fiber, t, reverse, pos, age):
+    """Distance from an observed history position, ``age`` trace voxels behind the head at traversal arc ``t``, to
+    the original fiber's stretch it can lie on (traversal arc in [t-age-margin, t+MEMORY_ARC_MARGIN]), so another
+    winding of the same fiber never counts as the original fiber."""
+    p, arc = traversal(fiber, reverse)
+    margin = MEMORY_ARC_MARGIN+float(age)/8
+    window = (arc >= t-float(age)-margin) & (arc <= t+MEMORY_ARC_MARGIN)
+    if not window.any():
+        return np.inf
+    return float(np.linalg.norm(p[window]-np.asarray(pos, np.float64), axis=1).min())
+
+
 def visible_points(points,crop,margin=0.):
     points = np.asarray(points)
     half = (crop.width-1)*crop.spacing/2-margin
@@ -359,18 +374,17 @@ class IdentityObservationBuilder(ObservationBuilder):
         extent = max(cfg.n_history,cfg.fine.depth*cfg.fine.spacing)+16
         curve = local(np.arange(max(0.,t-extent),min(fiber.length,t+extent)+1e-9,.25))
         if item['match_distance'] > DEPARTURE_DISTANCE or item.get('source') == SOURCE['synthetic']:
-            from scipy.spatial import cKDTree
             # Membership affects labels only; every observed slab/memory entry is still input.
             if cfg.memory == 'decisions':
                 from vesuvius.neural_tracing.fiber_follow.data.decision_memory import memory_layout
-                positions = [e['pos'] for e in memory_layout(item)[0]]
+                entries = memory_layout(item)[0]
             elif cfg.memory == 'none':
-                positions = []  # nothing beyond the current crop is observed
+                entries = []  # nothing beyond the current crop is observed
             else:
                 from vesuvius.neural_tracing.fiber_follow.data.history_slabs import slab_layout
-                positions = [o['pos'] for o in slab_layout(item)]
-            distance = cKDTree(fiber.points).query(np.stack(positions))[0] if positions else np.full(1,np.inf)
-            item['slab_identity_observable'] = bool((distance <= s.on_fiber_tolerance).any())
+                entries = slab_layout(item)
+            item['slab_identity_observable'] = any(
+                memory_distance(fiber, t, reverse, e['pos'], e['age']) <= s.on_fiber_tolerance for e in entries)
         item['identity_curve'] = curve
         self.identity_evidence(item, curve)
         visible = visible_points(curve,cfg.fine)
@@ -466,16 +480,11 @@ class IdentityObservationBuilder(ObservationBuilder):
             out['identity_departure_age'][row] = float(item['_constructed_arc'][-1])-float(item['_leave_arc'])
 
     def memory_on_fiber(self, item):
-        """Per selected memory entry: (age, whether its decision lay on the original fiber)."""
-        from scipy.spatial import cKDTree
-        trees = self.__dict__.setdefault('_identity_trees', {})
-        index = int(item['fiber_ref'][0])
-        if index not in trees:
-            if len(trees) > 4096:
-                trees.clear()
-            trees[index] = cKDTree(np.asarray(self.fibers[index].points))
-        return [(entry['age'], trees[index].query(entry['pos'])[0] <= self.sampling.on_fiber_tolerance)
-                for entry in item.get('_memory_entries') or []]
+        """Per selected memory entry: (age, whether its decision lay on the original fiber, not another winding)."""
+        index, t, reverse = item['fiber_ref']
+        fiber = self.fibers[int(index)]
+        return [(entry['age'], memory_distance(fiber, float(t), bool(reverse), entry['pos'], entry['age'])
+                 <= self.sampling.on_fiber_tolerance) for entry in item.get('_memory_entries') or []]
 
     def plane_crossings(self, found, plane, own):
         """Each neighbor path's crossing of ``plane`` (interpolated between consecutive samples) beyond

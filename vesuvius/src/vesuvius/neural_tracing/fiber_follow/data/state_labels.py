@@ -206,8 +206,8 @@ class TraceLabeler:
         """Process one committed polyline ending at the new head; return its facts.
 
         ``segment`` starts at the previous head (or is the seed alone) and ``travelled``
-        is the trace length at its end. Per-vertex distances are kept in
-        ``vertex_distances`` for evaluation profiles.
+        is the trace length at its end. Per-vertex distances and matched original-fiber
+        arclengths are kept in ``vertex_distances`` and ``vertex_arcs`` for evaluation.
         """
         f, sign = self.fiber, self.sign
         segment = np.asarray(segment, np.float64).reshape(-1, 3)
@@ -219,12 +219,14 @@ class TraceLabeler:
         self.started = True
         if not len(indices):
             self.vertex_distances = np.full(len(segment)-first, np.nan)
+            self.vertex_arcs = np.full(len(segment)-first, np.nan)
             self.last_travelled = float(travelled)
             return self.facts(np.inf, np.inf, valid=False, ambiguous=False)
         distances = np.linalg.norm(segment[:, None]-f.points[indices][None], axis=-1)
         nearest = indices[distances.argmin(-1)]
         vertex = distances.min(-1)
         self.vertex_distances = vertex[first:]
+        self.vertex_arcs = f.s[nearest][first:]
         head = distances[-1]
         best = int(head.argmin())
         distance = float(head[best])

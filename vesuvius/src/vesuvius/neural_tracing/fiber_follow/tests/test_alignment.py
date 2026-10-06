@@ -457,6 +457,50 @@ def test_departure_patience_is_path_length_not_point_count():
     assert score_trace(path(1., 5.), fiber, 100., 1., patience=10.)['diverged'] is False
 
 
+def spiral_fiber(windings=3., radius=60., pitch=8.):
+    """A fiber wound around the scroll axis: each winding passes ``pitch`` voxels outside the previous one."""
+    theta = np.linspace(0., 2*np.pi*windings, 200000)
+    r = radius+pitch*theta/(2*np.pi)
+    dense = np.c_[r*np.cos(theta)+200., r*np.sin(theta)+200., np.full_like(theta, 50.)]
+    arc = arclength(dense)
+    s = np.arange(0., arc[-1], 1.)
+    points = np.stack([np.interp(s, arc, dense[:, k]) for k in range(3)], -1)
+    return D.TracedFiber('spiral', points, s, ''), r, theta, arc
+
+
+def test_a_jump_onto_the_same_fibers_next_winding_is_a_departure():
+    from vesuvius.neural_tracing.fiber_follow.evaluation.seeds import score_trace
+    fiber, r, theta, arc = spiral_fiber()
+    t0, hop = 100., 150.
+    faithful = fiber.points[(fiber.s >= t0) & (fiber.s <= t0+400.)]
+    full = score_trace(faithful, fiber, t0, 1.)
+    assert not full['diverged'] and full['correct'] == pytest.approx(400., abs=1.)
+    # Follow the fiber to arc 150, step 8 voxels outward onto its next winding and follow that winding onward.
+    angle = np.interp(hop, arc, theta)
+    outer = np.interp(angle+2*np.pi, theta, arc)  # the next winding at the same angle, about one turn later
+    assert outer-hop > 300.
+    on_next = fiber.points[(fiber.s >= outer) & (fiber.s <= outer+200.)]
+    path = np.concatenate((fiber.points[(fiber.s >= t0) & (fiber.s <= hop)], on_next))
+    jumped = score_trace(path, fiber, t0, 1.)
+    assert jumped['diverged'] and jumped['correct'] == pytest.approx(hop-t0, abs=2.)
+    # Progress (coverage) never jumps by a winding.
+    assert jumped['followed'] <= hop-t0+2.
+
+
+def test_history_on_the_same_fibers_other_winding_is_not_the_original_fiber():
+    from vesuvius.neural_tracing.fiber_follow.data.observations import memory_distance
+    fiber, r, theta, arc = spiral_fiber()
+    t, age = 500., 40.
+    behind = fiber.points[int(t-age)]
+    assert memory_distance(fiber, t, False, behind, age) < .5
+    # The same angle one winding out lies 8 voxels away in space but about one turn further along the fiber.
+    angle = np.interp(t-age, arc, theta)
+    outer = fiber.points[int(np.interp(angle+2*np.pi, theta, arc))]
+    assert np.linalg.norm(outer-behind) < 9. and memory_distance(fiber, t, False, outer, age) > 7.
+    inner = fiber.points[int(np.interp(angle-2*np.pi, theta, arc))]  # the previous winding
+    assert memory_distance(fiber, t, False, inner, age) > 7.
+
+
 def protocol_sources():
     return [dict(name='src', fibers=[line_fiber()], volume=None, detector=None,
                  manifest=dict(calibration=[dict(fiber=0, t=50., sign=1., pos=np.array([0., 0., 50.]),

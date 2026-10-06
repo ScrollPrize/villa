@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import numpy as np
 import warnings
-from scipy.spatial import cKDTree
 
 from vesuvius.neural_tracing.fiber_follow.data.data import DATA_VERSION, TracedFiber
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import interp_at, tangent_at
@@ -85,20 +84,20 @@ def sustained_onsets(lengths, bad, patience=DEPARTURE_PATIENCE_LENGTH):
     return onsets
 
 
-def trace_events(path, fiber, t0, sign, tol=3.0, patience=DEPARTURE_PATIENCE_LENGTH, tree=None):
+def trace_events(path, fiber, t0, sign, tol=3.0, patience=DEPARTURE_PATIENCE_LENGTH):
     """First sustained departure and first supported endpoint-plane crossing.
 
     A departure is the first run of path points farther than ``tol`` from the GT fiber that spans
-    at least ``patience`` voxels of path length; it is dated at the run's first point.
+    at least ``patience`` voxels of path length; it is dated at the run's first point. Distances and
+    arcs come from arclength-continuous matching (``matched_profile``), so the fiber's other windings
+    near the path are off the fiber.
     Endpoint crossing is checked on segments, not just nearest-point indices,
     so the crossing segment can be partitioned exactly. Returns cumulative
     path lengths, GT distances/arcs, departure index, and endpoint path length.
     """
     path = np.asarray(path, dtype=np.float64).reshape(-1, 3)
-    tree = tree if tree is not None else cKDTree(fiber.points)
-    d, j = tree.query(path)
-    arc = fiber.s[j]
     lengths = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(path, axis=0), axis=1))] if len(path) else np.zeros(0)
+    d, arc = matched_profile(path, lengths, fiber, t0, sign, tol)
     onsets = sustained_onsets(lengths, d > tol, patience)
     end = onsets[0] if onsets else len(path)
     endpoint = fiber.points[-1 if sign > 0 else 0]
@@ -124,15 +123,45 @@ def trace_events(path, fiber, t0, sign, tol=3.0, patience=DEPARTURE_PATIENCE_LEN
     return lengths, d, arc, end, crossing
 
 
+MATCH_CHUNK = 8.0  # path length per correspondence update (about one commit)
+
+
+def matched_profile(path, lengths, fiber: TracedFiber, t0: float, sign: float, tol: float = 3.0):
+    """Per-vertex distance to, and arclength on, the original fiber, matched with arclength continuity.
+
+    The path is fed to the shared ``TraceLabeler`` in commit-sized pieces: each vertex is compared only with the
+    fiber stretch reachable from the previous match (a bounded window behind and ahead), never with the whole
+    fiber. A nearby other winding of the same fiber therefore counts as off the fiber, and progress cannot jump by
+    a winding.
+    """
+    from vesuvius.neural_tracing.fiber_follow.data.state_labels import TraceLabeler
+    if not len(path):
+        return np.zeros(0), np.zeros(0)
+    labeler = TraceLabeler(fiber, t0, sign, tolerance=tol, max_recovery_distance=max(tol, 6.0))
+    labeler.observe(path[:1], 0.0)
+    d, arc = [labeler.vertex_distances], [labeler.vertex_arcs]
+    heads = np.unique(np.r_[np.searchsorted(lengths, np.arange(MATCH_CHUNK, lengths[-1], MATCH_CHUNK)), len(path)-1])
+    previous = 0
+    for head in heads[heads > 0]:
+        labeler.observe(path[previous:head+1], float(lengths[head]))
+        d.append(labeler.vertex_distances)
+        arc.append(labeler.vertex_arcs)
+        previous = head
+    d, arc = np.concatenate(d), np.concatenate(arc)
+    # No reachable fiber stretch (never expected inside an annotation): off the fiber, no progress.
+    missing = ~np.isfinite(d)
+    return np.where(missing, np.inf, d), np.where(missing, t0, arc)
+
+
 def score_trace(path: np.ndarray, fiber: TracedFiber, t0: float, sign: float, tol: float = 3.0,
-                patience: float = DEPARTURE_PATIENCE_LENGTH, tree: cKDTree | None = None):
+                patience: float = DEPARTURE_PATIENCE_LENGTH):
     """Partition every segment into supported, wrong, or unknown length.
 
     An untagged annotation endpoint censors subsequent continuation. A tagged
     physical endpoint makes subsequent length an endpoint overrun. A departure
     before that boundary remains wrong even if the path later returns to GT.
     """
-    lengths, d, arc, end, crossing = trace_events(path, fiber, t0, sign, tol, patience, tree)
+    lengths, d, arc, end, crossing = trace_events(path, fiber, t0, sign, tol, patience)
     total = float(lengths[-1]) if len(lengths) else 0.0
     avail = float((fiber.length - t0) if sign > 0 else t0)
     prog = (arc[:end] - t0) * sign
@@ -187,7 +216,6 @@ def monitor_coverage(row, max_len):
 def evaluate(tracer, fibers, seeds, batch: int = 256, history_audit=None, on_trace=None,
              coverage_max_len=None):
     """Score rollouts; optionally apply monitor normalization or expose paths."""
-    trees = {}
     rows = []
     for b in range(0, len(seeds), batch):
         chunk = seeds[b:b + batch]
@@ -198,9 +226,7 @@ def evaluate(tracer, fibers, seeds, batch: int = 256, history_audit=None, on_tra
         paths, reasons = tracer.trace(np.stack([s["pos"] for s in chunk]), np.stack([s["heading"] for s in chunk]), **kwargs)
         for position, (s, p, r) in enumerate(zip(chunk, paths, reasons)):
             f = fibers[s["fiber"]]
-            if s["fiber"] not in trees:
-                trees[s["fiber"]] = cKDTree(f.points)
-            m = score_trace(p, f, s["t"], s["sign"], tree=trees[s["fiber"]])
+            m = score_trace(p, f, s["t"], s["sign"])
             if coverage_max_len is not None:
                 m = monitor_coverage(m, coverage_max_len)
             span = next((span for span in f.spans if span.start <= s["t"] <= span.end), None)

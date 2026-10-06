@@ -10,11 +10,11 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
-from scipy.spatial import cKDTree
 
 from .long_trace_audit import summary, write
 from .evaluation import paired_report
 from .evaluate import dataset_sources
+from .seeds import matched_profile
 from ..shared.geometry import tangent_at, arclength
 
 
@@ -146,9 +146,10 @@ def render_case(root, row, source, destination):
             ax.scatter([0],[0],s=20,color='red');ax.set_title(f"{'u' if dim==0 else 'v'} section; other axis {offset:+g}")
             ax.set_xlim(-16,16);ax.set_ylim(-32,64)
     arc=arclength(path) if len(path)>1 else np.zeros(1)
-    distance=cKDTree(annotation).query(path)[0]
+    # Arclength-matched distance (as strict scoring): the annotation's other windings near the path do not count.
+    distance=matched_profile(path,np.r_[0.,np.cumsum(np.linalg.norm(np.diff(path,axis=0),axis=1))],f,row['t0'],row['sign'])[0]
     ax=axes[0,3];ax.plot(arc,distance);ax.axhline(3,color='red',ls='--');ax.axvline(event,color='black',ls=':')
-    ax.set_ylim(0,min(30,max(8,float(distance.max()))));ax.set_title('Nearest annotation distance');ax.set_xlabel('Travel (trace voxels)')
+    ax.set_ylim(0,min(30,max(8,float(np.nanmax(np.where(np.isfinite(distance),distance,30.))))));ax.set_title('Matched annotation distance');ax.set_xlabel('Travel (trace voxels)')
     ax=axes[1,3];ax.plot(travelled,data['confidence'][:,0],label='first prefix');ax.plot(travelled,data['confidence'][:,-1],label='full prefix')
     unsafe=np.array([d['accepted_unsafe'] for d in details],bool)
     ax.scatter(travelled[unsafe],data['confidence'][unsafe,0],color='red',s=12,label='accepted unsafe')

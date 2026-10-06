@@ -16,7 +16,7 @@ def verify_builder(cfg):
     from vesuvius.neural_tracing.fiber_follow.data.observations import IdentityObservationBuilder
     builder = IdentityObservationBuilder.__new__(IdentityObservationBuilder)
     builder.cfg = cfg
-    builder.fibers = [NS(points=np.c_[np.zeros(300), np.zeros(300), np.arange(300.)])]
+    builder.fibers = [NS(points=np.c_[np.zeros(300), np.zeros(300), np.arange(300.)], s=np.arange(300.), length=299.)]
     builder.sampling = NS(rule=NS(own_radius=1.5), on_fiber_tolerance=1.5)
     return builder
 
