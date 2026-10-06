@@ -6,8 +6,10 @@ from dataclasses import asdict, dataclass, field
 import math
 
 import torch
+from torch import nn
 import torch.nn.functional as F
 
+from vesuvius.neural_tracing.fiber_follow.models.survival_confidence import survival_predictions
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
 from vesuvius.neural_tracing.fiber_follow.shared.retired import retire
 from vesuvius.neural_tracing.fiber_follow.tracing.policy import DEFAULT_CONFIDENCE, commit_prefix
@@ -215,6 +217,27 @@ def future_points(raw, planes, cfg):
     first = first*(first_limit/first.norm(dim=-1, keepdim=True).clamp_min(1e-8)).clamp(max=1.)
     lateral = torch.cat((first, lateral[:, 1:]), 1)
     return torch.cat((lateral, planes[None, :, None].expand(len(raw), -1, -1)), -1)
+
+
+def plane_coordinates(cfg):
+    """Forward coordinates (P,) of the path planes 1..n_future."""
+    return torch.arange(1, cfg.n_future+1).float()*cfg.future_step
+
+
+def path_readout(width):
+    """The per-plane lateral coordinates (starting near the centerline) and hazard logit read from path tokens."""
+    coordinates = nn.Linear(width, 2)
+    nn.init.normal_(coordinates.weight, std=.005)
+    nn.init.zeros_(coordinates.bias)
+    return coordinates, nn.Linear(width, 1)
+
+
+def read_path(states, coordinates, hazard, planes, cfg):
+    """Plane points (B, P, 3) and survival score (hazard logits, confidence logits, confidence) of path-token states
+    (B, P, W), through ``path_readout``'s layers."""
+    points = future_points(coordinates(states), planes, cfg)
+    hazards = hazard(states).squeeze(-1).float()
+    return points, (hazards, *survival_predictions(hazards))
 
 
 def proposal_output(initial, refinements, scores, valid):

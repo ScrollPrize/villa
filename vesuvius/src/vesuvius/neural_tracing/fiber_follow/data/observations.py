@@ -9,7 +9,7 @@ from scipy.ndimage import gaussian_filter
 from vesuvius.neural_tracing.fiber_follow.data.components import ComponentRule
 from vesuvius.neural_tracing.fiber_follow.data.data import SOURCE, collate_targets, resolve_trace_seed
 from vesuvius.neural_tracing.fiber_follow.data.crop_sampling import scalar_crops, empty_image_batch
-from vesuvius.neural_tracing.fiber_follow.shared.geometry import interp_at
+from vesuvius.neural_tracing.fiber_follow.shared.geometry import interp_at, traversal_curve
 from vesuvius.neural_tracing.fiber_follow.tracing.trace import ModelTracer
 from vesuvius.neural_tracing.fiber_follow.shared.reference import SEED_FIELDS, observed_seed
 from vesuvius.neural_tracing.fiber_follow.data.state_labels import DEPARTURE_DISTANCE, supervise
@@ -141,10 +141,6 @@ class IdentitySampling:
 
 # Oversampled fresh locations, recorded per state.
 LOCATION_SOURCES = ('uniform', 'lateral', 'bank_covered')
-
-
-def traversal(fiber, reverse):
-    return (fiber.points[::-1], fiber.length-fiber.s[::-1]) if reverse else (fiber.points, fiber.s)
 
 
 def visible_points(points,crop,margin=0.):
@@ -315,7 +311,7 @@ class IdentityObservationBuilder(ObservationBuilder):
         cfg,s = self.cfg,self.sampling
         item['fiber_family'] = fiber.tag
         _,t,reverse = item['fiber_ref']
-        p,arc = traversal(fiber,reverse)
+        p,arc = traversal_curve(fiber,reverse)
         pos,frame = np.asarray(item['pos']),np.asarray(item['frame'])
         local = lambda arcs: (interp_at(p,arc,np.clip(arcs,0,fiber.length))-pos) @ frame
         if 'seed_valid' not in item:

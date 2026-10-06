@@ -24,6 +24,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.geometry import (
     frame_from_heading,
     interp_at,
     tangent_at,
+    traversal_curve,
 )
 from vesuvius.neural_tracing.fiber_follow.data.annotation_repair import foldbacks, repair_kinks
 from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolume
@@ -286,13 +287,6 @@ def plane_targets(p, s, t, t_end, pos, frame, planes):
             ab[k] = (1 - w) * loc[i, :2] + w * loc[i + 1, :2]
             m[k] = 1.0
     return ab, m
-
-
-def traversal_curve(fiber, reverse):
-    """Annotation points and arclength in the traversal direction."""
-    if reverse:
-        return fiber.points[::-1], fiber.s[-1]-fiber.s[::-1]
-    return fiber.points, fiber.s
 
 
 def trace_prefix_length(t, category, rng):

@@ -19,21 +19,13 @@ from .evaluate import dataset_sources
 from .seeds import EvaluationAudit, evaluate, monitor_coverage, score_trace, summarize_outcomes
 from .recovery_scoring import recovery_score
 from ..data.observations import FiberTracer
-from ..shared.experiment import jsonable
+from ..shared.experiment import jsonable, write_json as write
 from ..shared.geometry import arclength, interp_at, tangent_at
 from ..tracing.heading import oriented_seed_heading, SeedHeadingError, SEED_HEADING_POLICY
 from ..tracing.policy import checkpoint_policy
 from ..tracing.trace import TraceParams
 from ..train.train import load_checkpoint
 from ..train.runloop import raise_open_file_limit
-
-
-def write(path, value):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix('.partial.json')
-    temporary.write_text(json.dumps(value, default=jsonable, indent=1)+'\n')
-    temporary.replace(path)
 
 
 def length_weighted_order(lengths, count, rng):

@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength, tangent_at
+from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength, tangent_at, traversal_curve
 
 DEPARTURE_DISTANCE = 3.0  # strict first-departure and displacement threshold, trace voxels
 DEPARTURE_PATIENCE = 3  # consecutive committed points beyond DEPARTURE_DISTANCE
@@ -274,7 +274,7 @@ def constructed_facts(fiber, t, reverse, pos, cfg, **flags):
     reachability exactly as the collector's search does.
     """
     from vesuvius.neural_tracing.fiber_follow.shared.geometry import interp_at
-    p, s = (fiber.points[::-1], fiber.length-fiber.s[::-1]) if reverse else (fiber.points, fiber.s)
+    p, s = traversal_curve(fiber, reverse)
     matched = interp_at(p, s, np.array([t]))[0]
     window = p[(s >= t-MATCH_BEHIND) & (s <= t+MATCH_AHEAD)]
     window = np.concatenate((window, matched[None]))

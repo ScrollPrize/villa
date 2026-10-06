@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from vesuvius.neural_tracing.fiber_follow.data.afv import AFVFibers
+from vesuvius.neural_tracing.fiber_follow.data.afv import AFVFibers, file_sha256
 from vesuvius.neural_tracing.fiber_follow.data.data import FollowDataset, fiber_manifest, load_fibers
 from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolumeSpec
 from vesuvius.neural_tracing.fiber_follow.data.observations import IdentityObservationBuilder
@@ -161,15 +161,12 @@ def open_afv_source(source, cache_dir, normalization=None):
     Returns (training fibers, validation fibers, CT spec, sha256).
     """
     path = Path(source['path'])
-    digest = hashlib.sha256()
-    with path.open('rb') as stream:
-        for block in iter(lambda: stream.read(8 << 20), b''):
-            digest.update(block)
-    if digest.hexdigest() != source['sha256']:
+    digest = file_sha256(path)
+    if digest != source['sha256']:
         raise ValueError(f'AFV checksum changed: {path}')
     scale = float(source['grid_scale'])
-    fibers = AFVFibers(path, scale, validation=source['validation'],sha256=digest.hexdigest())
-    validation_fibers = AFVFibers(path,scale,validation=source['validation'],split='validation',sha256=digest.hexdigest())
+    fibers = AFVFibers(path, scale, validation=source['validation'],sha256=digest)
+    validation_fibers = AFVFibers(path,scale,validation=source['validation'],split='validation',sha256=digest)
     if fibers.metadata['frame']['vc_open_data_coordinate_space'] != source['coordinate_space']:
         raise ValueError('AFV coordinate identity mismatch')
     root = fibers.metadata['root']
@@ -186,7 +183,7 @@ def open_afv_source(source, cache_dir, normalization=None):
     if normalization is not None:
         from vesuvius.neural_tracing.fiber_follow.data.ct_normalization import volume_key
         spec.ct_normalization = normalization['volumes'][volume_key(spec)]
-    return fibers, validation_fibers, spec, digest.hexdigest()
+    return fibers, validation_fibers, spec, digest
 
 
 def build_mixed_dataset(primary, document, cfg, sample, sampling, args, *, seed, budget, out=None, resume=False,

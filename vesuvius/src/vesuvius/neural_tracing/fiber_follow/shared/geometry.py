@@ -94,6 +94,13 @@ def interp_at(p: np.ndarray, s: np.ndarray, t: np.ndarray) -> np.ndarray:
     return np.stack([np.interp(t, s, p[:, i]) for i in range(3)], -1)
 
 
+def traversal_curve(fiber, reverse):
+    """Annotation points and arclength in the traversal direction."""
+    if reverse:
+        return fiber.points[::-1], fiber.s[-1]-fiber.s[::-1]
+    return fiber.points, fiber.s
+
+
 def tangent_at(p: np.ndarray, s: np.ndarray, t: float, half: float = 3.0) -> np.ndarray:
     a = interp_at(p, s, np.array([max(t - half, 0.0)]))[0]
     b = interp_at(p, s, np.array([min(t + half, s[-1])]))[0]

@@ -35,10 +35,9 @@ import torch.nn.functional as F
 from vesuvius.neural_tracing.fiber_follow.models.blocks import CropCNN, TransformerLayer
 from vesuvius.neural_tracing.fiber_follow.models.flow import FlowMatching, FlowOptions, time_embedding
 from vesuvius.neural_tracing.fiber_follow.models.model import (
-    REFERENCE_METADATA, FollowerConfig, future_points, proposal_output, reference_metadata, reference_points,
-    sample_features, select_refinement, token_coordinates)
+    REFERENCE_METADATA, FollowerConfig, path_readout, plane_coordinates, proposal_output, read_path,
+    reference_metadata, reference_points, sample_features, select_refinement, token_coordinates)
 from vesuvius.neural_tracing.fiber_follow.models.path_geometry import PathGeometryTokens
-from vesuvius.neural_tracing.fiber_follow.models.survival_confidence import survival_predictions
 from vesuvius.neural_tracing.fiber_follow.tracing.policy import DEFAULT_CONFIDENCE, commit_prefix
 
 CELL, REFERENCE, GEOMETRY, PATH, SCORED = range(5)  # token kinds
@@ -135,7 +134,8 @@ class CropTransformer(nn.Module):
         nn.init.normal_(self.kind, std=.02)
         self.layers = nn.ModuleList(CropTransformerLayer(h, cfg.heads, cfg.ffn) for _ in range(cfg.layers))
         self.norm = nn.LayerNorm(h)
-        self.register_buffer('planes', torch.arange(1, cfg.n_future+1).float()*cfg.future_step, persistent=False)
+        self.register_buffer('planes', plane_coordinates(cfg), persistent=False)
+        self.plane_scale = cfg.n_future*cfg.future_step  # forward-distance normalization of path tokens
         self.register_buffer('cell_xyz', token_coordinates(cfg).reshape(-1, 3), persistent=False)
 
     def sample_cells(self, ctx, points):
@@ -204,13 +204,9 @@ class RegressionFollower(CropTransformer):
     def __init__(self, cfg):
         super().__init__(cfg)
         h, cells = cfg.hidden, cfg.cnn_channels[-1]
-        self.query_scale = cfg.n_future*cfg.future_step
         # CNN evidence and support at the centerline, forward distance.
         self.query = nn.Sequential(nn.Linear(cells+2, h), nn.SiLU(), nn.Linear(h, h))
-        self.coordinates = nn.Linear(h, 2)
-        nn.init.normal_(self.coordinates.weight, std=.005)
-        nn.init.zeros_(self.coordinates.bias)
-        self.hazard = nn.Linear(h, 1)
+        self.coordinates, self.hazard = path_readout(h)
         if cfg.recurrent_refinement_steps:
             # CNN evidence and support at the proposal, its coordinates, detached failure/survival.
             self.refinement_fusion = nn.Sequential(nn.Linear(cells+1+3+2, h), nn.SiLU(), nn.Linear(h, h))
@@ -219,16 +215,14 @@ class RegressionFollower(CropTransformer):
 
     def decode(self, ctx, tokens):
         decoded = self.run_paths(ctx, tokens[:, None])[:, 0]
-        points = future_points(self.coordinates(decoded), self.planes, self.cfg)
-        hazards = self.hazard(decoded).squeeze(-1).float()
-        return decoded, points, (hazards, *survival_predictions(hazards))
+        return (decoded, *read_path(decoded, self.coordinates, self.hazard, self.planes, self.cfg))
 
     def predict(self, ctx, threshold):
         """Fixed proposal slots: refinement passes run for every row and an accepted row keeps its last attempt (path
         tokens are cheap, so tracing does not compact accepted rows either)."""
         cfg = self.cfg
         reference = self.centerline(ctx['cells'])
-        query = self.query(torch.cat((self.evidence(ctx, reference), reference[..., 2:]/self.query_scale), -1))
+        query = self.query(torch.cat((self.evidence(ctx, reference), reference[..., 2:]/self.plane_scale), -1))
         decoded, points, score = self.decode(ctx, query+self.kind[PATH].to(query.dtype))
         refinements, scores = [points], [score]
         active = torch.ones(len(points), device=points.device, dtype=torch.bool)

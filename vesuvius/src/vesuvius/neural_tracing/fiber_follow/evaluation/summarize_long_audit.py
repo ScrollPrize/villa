@@ -11,7 +11,8 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
 
-from .long_trace_audit import summary, write
+from ..shared.experiment import write_json as write
+from .long_trace_audit import summary
 from .evaluation import paired_report
 from .evaluate import dataset_sources
 from .seeds import matched_profile

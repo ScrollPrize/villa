@@ -23,7 +23,7 @@ import time
 import numpy as np
 
 from vesuvius.neural_tracing.fiber_follow.evaluation.seeds import EvaluationAudit, evaluate, monitor_coverage, summarize_outcomes
-from vesuvius.neural_tracing.fiber_follow.shared.experiment import jsonable
+from vesuvius.neural_tracing.fiber_follow.shared.experiment import jsonable, write_json as write
 from vesuvius.neural_tracing.fiber_follow.tracing.policy import checkpoint_policy
 from vesuvius.neural_tracing.fiber_follow.tracing.trace import TraceParams
 
@@ -75,11 +75,6 @@ def grouped_summary(rows):
 def manifest_digest(sources, splits):
     payload = {s['name']: {split: s['manifest'][split] for split in splits} for s in sources}
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=jsonable).encode()).hexdigest()
-
-
-def write(path, value):
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    Path(path).write_text(json.dumps(value, indent=1, default=jsonable))
 
 
 def calibrate(args, sources, *, checkpoint_loader, tracer_class):

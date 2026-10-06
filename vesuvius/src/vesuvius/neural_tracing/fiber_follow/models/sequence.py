@@ -25,8 +25,8 @@ import torch.nn.functional as F
 
 from vesuvius.neural_tracing.fiber_follow.models.blocks import CropCNN, TransformerLayer
 from vesuvius.neural_tracing.fiber_follow.models.model import (
-    FollowerConfig, future_points, proposal_output, sample_features, select_refinement)
-from vesuvius.neural_tracing.fiber_follow.models.survival_confidence import survival_predictions
+    FollowerConfig, path_readout, plane_coordinates, proposal_output, read_path, sample_features, select_refinement,
+    token_coordinates)
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
 from vesuvius.neural_tracing.fiber_follow.tracing.policy import DEFAULT_CONFIDENCE
 
@@ -122,20 +122,9 @@ class SequenceFollower(nn.Module):
         nn.init.normal_(self.kind, std=.02)
         self.layers = nn.ModuleList(SequenceLayer(h, cfg.heads, cfg.ffn) for _ in range(cfg.layers))
         self.norm = nn.LayerNorm(h)
-        self.coordinates = nn.Linear(h, 2)
-        nn.init.normal_(self.coordinates.weight, std=.005)
-        nn.init.zeros_(self.coordinates.bias)
-        self.hazard = nn.Linear(h, 1)
-        planes = torch.arange(1, cfg.n_future+1).float()*cfg.future_step
-        self.register_buffer('planes', planes, persistent=False)
-        self.register_buffer('cell_xyz', self.cell_coordinates(cfg), persistent=False)
-
-    @staticmethod
-    def cell_coordinates(cfg):
-        """Crop-local xyz of the stride-8 cells, flattened in (d, h, w) order."""
-        c, stride = cfg.fine, cfg.token_stride[0]
-        d, y, x = torch.meshgrid(*(torch.arange(n//stride).float()*stride for n in (c.depth, c.width, c.width)), indexing='ij')
-        return torch.stack((x-(c.width-1)/2, y-(c.width-1)/2, d-c.behind), -1).reshape(-1, 3)*c.spacing
+        self.coordinates, self.hazard = path_readout(h)
+        self.register_buffer('planes', plane_coordinates(cfg), persistent=False)
+        self.register_buffer('cell_xyz', token_coordinates(cfg).reshape(-1, 3), persistent=False)
 
     # ------------------------------------------------------------------ tokens
     def encode(self, image):
@@ -173,10 +162,8 @@ class SequenceFollower(nn.Module):
     def outputs(self, queries, confidence_threshold, n_commit):
         """Plane points and survival confidence from the final query states, in the shared output contract."""
         cfg = self.cfg
-        decoded = self.norm(queries)
-        points = future_points(self.coordinates(decoded), self.planes, cfg)
-        hazards = self.hazard(decoded).squeeze(-1).float()
-        out = proposal_output(points, [points], [(hazards, *survival_predictions(hazards))],
+        points, score = read_path(self.norm(queries), self.coordinates, self.hazard, self.planes, cfg)
+        out = proposal_output(points, [points], [score],
                               [torch.ones(len(points), dtype=torch.bool, device=points.device)])
         return select_refinement(out, cfg, confidence_threshold, n_commit)
 

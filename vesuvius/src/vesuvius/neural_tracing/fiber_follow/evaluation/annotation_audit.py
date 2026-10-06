@@ -5,7 +5,7 @@ import numpy as np
 from scipy.spatial import cKDTree
 from .seeds import matched_profile
 from .summarize_long_audit import load_rows
-from .long_trace_audit import write
+from ..shared.experiment import write_json as write
 from ..data.data import load_fibers
 from ..shared.geometry import arclength
 

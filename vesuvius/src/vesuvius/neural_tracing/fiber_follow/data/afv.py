@@ -14,6 +14,15 @@ from vesuvius.neural_tracing.fiber_follow.data.data import TracedFiber
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength, interp_at
 
 
+def file_sha256(path):
+    """SHA-256 of a whole file, read in 8 MiB blocks."""
+    digest = hashlib.sha256()
+    with open(path, 'rb') as stream:
+        for block in iter(lambda: stream.read(8 << 20), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 class AFVFibers(Sequence):
     """Keep only a catalog in memory; decode polylines into a bounded LRU.
 
@@ -73,11 +82,7 @@ class AFVFibers(Sequence):
 
     def manifest_entries(self):
         if self.sha256 is None:
-            h = hashlib.sha256()
-            with open(self.path, 'rb') as stream:
-                for block in iter(lambda: stream.read(8<<20), b''):
-                    h.update(block)
-            self.sha256 = h.hexdigest()
+            self.sha256 = file_sha256(self.path)
         ids = np.array([r[0] for r in self.catalog],dtype='<i8')
         # A compact immutable collection manifest avoids hashing/expanding all
         # polylines each time a replay cache is opened by a loader worker.

@@ -13,6 +13,15 @@ def jsonable(x):
     raise TypeError(type(x).__name__)
 
 
+def write_json(path, value):
+    """Write ``value`` (numpy values allowed) as indented JSON, atomically, creating parent folders."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix('.partial.json')
+    temporary.write_text(json.dumps(value, default=jsonable, indent=1)+'\n')
+    temporary.replace(path)
+
+
 def rollout_summary(rows):
     result=summarize(rows)
     wrong=[float(r['offtrack']) for r in rows if r['offtrack']>0]

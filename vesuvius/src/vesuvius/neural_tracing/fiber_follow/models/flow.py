@@ -86,25 +86,23 @@ def fit_flow_sigma(batches, cfg, states=2048):
 
 class FlowMatching:
     """The flow-matching generator over an observation model: the zero-start path, optionally followed by sampled
-    proposals; Gaussian/time draws train velocity. The model provides ``context``, ``velocity_field(ctx, y, t)`` ->
-    (B, D, P, 2), ``hazard_logits(ctx, points)`` and ``proposal_output``."""
+    proposals; Gaussian/time draws train velocity. The model provides ``planes`` (the forward coordinates of planes
+    1..n_future: the proposal's planes for scorer, gate, tracer and labels), ``context``, ``velocity_field(ctx, y, t)``
+    -> (B, D, P, 2), ``hazard_logits(ctx, points)`` and ``proposal_output``."""
 
     def init_flow(self, cfg):
         if not cfg.flow_sigma:
             raise ValueError('Fit flow scales before constructing the flow model')
         self.register_buffer('sigma', torch.tensor(cfg.flow_sigma, dtype=torch.float32), persistent=False)
-        # Flow planes: planes 1..n_future, the proposal's planes (scorer, gate, tracer, labels).
-        self.register_buffer('flow_planes', torch.tensor(cfg.path_plane_values, dtype=torch.float32), persistent=False)
-        self.plane_scale = cfg.n_future*cfg.future_step
 
     def to_points(self, y):
-        z = self.flow_planes.reshape(*([1]*(y.ndim-2)), -1, 1).expand(*y.shape[:-1], 1)
+        z = self.planes.reshape(*([1]*(y.ndim-2)), -1, 1).expand(*y.shape[:-1], 1)
         return torch.cat((y*self.sigma, z), -1)
 
     def generate(self, ctx, hist, start=None):
         """Midpoint integration from ``start`` (B, D, P, 2), by default the zero path (D=1), without gradients.
         Returns the (B, D, P, 3) points at every solver step."""
-        y = hist.new_zeros(len(hist), 1, len(self.flow_planes), 2) if start is None else start
+        y = hist.new_zeros(len(hist), 1, len(self.planes), 2) if start is None else start
         curves = [self.to_points(y)]
         with torch.no_grad():
             for step in range(self.cfg.flow_steps):
@@ -122,10 +120,10 @@ class FlowMatching:
         decision's noise depends on its key only (not on batch neighbours, batch size or precision).
         Without keys (training) the global RNG draws them.
         """
-        zero = hist.new_zeros(len(hist), 1, len(self.flow_planes), 2)
+        zero = hist.new_zeros(len(hist), 1, len(self.planes), 2)
         if not self.cfg.flow_samples:
             return zero
-        shape = (self.cfg.flow_samples, len(self.flow_planes), 2)
+        shape = (self.cfg.flow_samples, len(self.planes), 2)
         if keys is None:
             noise = torch.randn(len(hist), *shape, device=hist.device)
         else:
@@ -155,7 +153,7 @@ class FlowMatching:
             b, draws = len(hist), self.cfg.flow_draws
             noise = targets.get('flow_noise')
             if noise is None:
-                noise = torch.randn(b, draws, len(self.flow_planes), 2, device=hist.device)
+                noise = torch.randn(b, draws, len(self.planes), 2, device=hist.device)
             times = targets.get('flow_times')
             if times is None:
                 times = (torch.arange(draws, device=hist.device)[None]+torch.rand(b, draws, device=hist.device))/draws

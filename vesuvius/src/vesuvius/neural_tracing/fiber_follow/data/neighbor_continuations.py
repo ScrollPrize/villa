@@ -3,7 +3,7 @@ import numpy as np
 
 from vesuvius.neural_tracing.fiber_follow.data.data import SOURCE, label_state, trace_noise
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import (
-    arclength, exact_nearest, interp_at, frame_from_heading, normalize,
+    arclength, exact_nearest, interp_at, frame_from_heading, normalize, traversal_curve,
 )
 from vesuvius.neural_tracing.fiber_follow.tracing.heading import trace_heading
 from vesuvius.neural_tracing.fiber_follow.data.state_labels import constructed_facts
@@ -49,8 +49,7 @@ def wrong_continuation(bank, cfg, rng, *, tail_length_range=(4., 16.), prefix_le
     reverse = bool(rng.integers(2))
     if reverse:
         line,matched = line[::-1],matched[::-1]
-    own_points = fiber.points[::-1] if reverse else fiber.points
-    own_arc = fiber.length-fiber.s[::-1] if reverse else fiber.s
+    own_points, own_arc = traversal_curve(fiber, reverse)
     matched = fiber.length-matched if reverse else matched
     s = arclength(line)
     bridge_length = float(rng.uniform(16.,24.))

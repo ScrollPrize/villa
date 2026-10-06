@@ -14,9 +14,6 @@ def switch_detector(args, checkpoint, fibers, band, spec):
 
 
 def load_dataset(args, checkpoint):
-    import hashlib
-    from pathlib import Path
-    from vesuvius.neural_tracing.fiber_follow.data.afv import AFVFibers
     from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolumeSpec
     document = checkpoint.get('dataset_config')
     if not document:
@@ -29,18 +26,8 @@ def load_dataset(args, checkpoint):
         spec = FiberVolumeSpec.from_dict(checkpoint['vol_spec'])
         _,fibers,_,_ = load_primary_dataset(document,spec)
         return spec,fibers,None
-    digest = hashlib.sha256()
-    with Path(source['path']).open('rb') as stream:
-        for block in iter(lambda: stream.read(8<<20), b''):
-            digest.update(block)
-    if digest.hexdigest() != source['sha256']:
-        raise ValueError('AFV source changed since training')
-    scale = source['grid_scale']
-    fibers = AFVFibers(source['path'],scale,validation=source['validation'],sha256=digest.hexdigest())
-    from vesuvius.neural_tracing.fiber_follow.data.datasets import ct_source_spec
-    from vesuvius.neural_tracing.fiber_follow.data.ct_normalization import volume_key
-    spec = ct_source_spec(source, document['cache_dir'])
-    spec.ct_normalization = checkpoint['ct_normalization']['volumes'][volume_key(spec)]
+    from vesuvius.neural_tracing.fiber_follow.data.datasets import open_afv_source
+    fibers, _, spec, _ = open_afv_source(source, document['cache_dir'], checkpoint['ct_normalization'])
     return spec,fibers,None
 
 
