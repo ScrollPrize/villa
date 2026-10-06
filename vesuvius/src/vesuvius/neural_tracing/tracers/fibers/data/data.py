@@ -27,7 +27,7 @@ from vesuvius.neural_tracing.tracers.shared.geometry import (
     traversal_curve,
 )
 from vesuvius.neural_tracing.tracers.fibers.data.annotation_repair import foldbacks, repair_kinks
-from vesuvius.neural_tracing.tracers.fibers.data.volume import FiberVolume
+from vesuvius.neural_tracing.tracers.ct.volume import FiberVolume
 from vesuvius.neural_tracing.tracers.shared.reference import SEED_FIELDS
 
 
@@ -1175,60 +1175,6 @@ class FollowDataset(torch.utils.data.IterableDataset):
                     and hasattr(self.batch_builder,'prepare_sampling_feedback')):
                 self.batch_builder.prepare_sampling_feedback(items)
             yield items
-
-
-_GRID_CACHE: dict = {}
-
-
-def _grid_flat(crop: CropSpec) -> np.ndarray:
-    g = _GRID_CACHE.get(crop)
-    if g is None:
-        g = _GRID_CACHE[crop] = crop_local_grid(crop).reshape(-1, 3).astype(np.float64)
-    return g
-
-
-_CORNER_CACHE: dict = {}
-
-
-def crop_corners(crop: CropSpec) -> np.ndarray:
-    """Eight local (a, b, c) corners; the crop's sample points are their convex hull."""
-    corners = _CORNER_CACHE.get(crop)
-    if corners is None:
-        lc, fc = crop.lateral_coords, crop.forward_coords
-        corners = _CORNER_CACHE[crop] = np.array([(a, b, c) for a in (lc[0], lc[-1])
-                                                  for b in (lc[0], lc[-1]) for c in (fc[0], fc[-1])], np.float64)
-    return corners
-
-
-def tight_block(pos, frame, crop: CropSpec, scale: float = 1.):
-    """zyx start and size of the smallest axis-aligned block around one oriented crop.
-
-    Source-array coordinates (``scale`` source voxels per trace voxel). The block
-    holds every sample point plus the trilinear/nearest support voxel above it
-    and one guard voxel on each side, so a per-sample sampler that zero-pads
-    beyond the block reads exactly the values it reads from the larger
-    rotation-invariant ``block_start`` block (arrays fill outside with zero too).
-    Unlike ``block_start`` the footprint depends on the frame, so the holdout
-    guard keeps using the rotation-invariant block.
-    """
-    world = np.asarray(pos, np.float64)*scale + crop_corners(crop) @ (np.asarray(frame, np.float64)*scale).T
-    zyx = world[:, ::-1]
-    lo = np.floor(zyx.min(0)).astype(np.int64) - 1
-    hi = np.floor(zyx.max(0)).astype(np.int64) + 3
-    return lo, hi - lo
-
-
-def read_tight_blocks(items, vol: FiberVolume, crop: CropSpec, pool=None):
-    """Per-item minimal blocks for per-sample CPU sampling: (list of raw, list of zyx starts).
-
-    Same values as the rotation-invariant ``block_start`` block at every sample point, reading roughly a
-    third of the voxels and touching about half the chunks per item.
-    """
-    scale = getattr(vol, 'input_scale', 1.)
-    bounds = [tight_block(it["pos"], it["frame"], crop, scale) for it in items]
-    read = lambda b: vol.raw_block(b[0], b[1])
-    raw = list(map(read, bounds) if pool is None else pool.map(read, bounds))
-    return raw, [start for start, _ in bounds]
 
 
 def collate_targets(items):

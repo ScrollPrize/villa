@@ -20,10 +20,11 @@ from vesuvius.neural_tracing.tracers.fibers.heading_model.model import (
 from vesuvius.neural_tracing.tracers.fibers.heading_model.targets import in_crop_heading
 from vesuvius.neural_tracing.tracers.fibers.heading_model.frames import family_ids, smoothed_tangent, fiber_corrected_normal
 from vesuvius.neural_tracing.tracers.fibers.data.datasets import WeightedDatasets, load_primary_dataset, open_afv_source, primary_source_spec, read_dataset_config
-from vesuvius.neural_tracing.tracers.fibers.data.data import FollowDataset, SampleConfig, simulated_trace, tight_block, traversal_curve
+from vesuvius.neural_tracing.tracers.fibers.data.data import FollowDataset, SampleConfig, simulated_trace, traversal_curve
+from vesuvius.neural_tracing.tracers.ct.crops import tight_block
 from vesuvius.neural_tracing.tracers.shared.geometry import arclength, interp_at, normalize
 from vesuvius.neural_tracing.tracers.fibers.tracing.heading import linear12_heading
-from vesuvius.neural_tracing.tracers.fibers.data.volume import FiberVolume
+from vesuvius.neural_tracing.tracers.ct.volume import FiberVolume
 
 HISTORY_BINS = (('seed', 0., 1e-9), ('1-11', 1e-9, 12.), ('12-31', 12., 32.), ('32+', 32., float('inf')))
 
@@ -63,7 +64,7 @@ def load_sources(dataset_config, out, *, ct_normalization=None):
     Each source's ``spec`` is the follower's CT volume. ``ct_normalization`` (a follower run's ct_normalization.json)
     reuses that run's exact records.
     """
-    from vesuvius.neural_tracing.tracers.fibers.data.ct_normalization import prepare_normalization
+    from vesuvius.neural_tracing.tracers.ct.normalization import prepare_normalization
     document, digest = read_dataset_config(dataset_config)
     known = json.loads(Path(ct_normalization).read_text()) if ct_normalization else None
     sources = []

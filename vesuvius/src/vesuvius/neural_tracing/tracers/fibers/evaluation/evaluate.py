@@ -8,7 +8,7 @@ so its held-out identity coverage is reported as absent.
 from pathlib import Path
 
 from vesuvius.neural_tracing.tracers.fibers.evaluation.evaluation import main as protocol
-from vesuvius.neural_tracing.tracers.fibers.data.volume import FiberVolume
+from vesuvius.neural_tracing.tracers.ct.volume import FiberVolume
 from vesuvius.neural_tracing.tracers.fibers.data.observations import FiberTracer
 from vesuvius.neural_tracing.tracers.fibers.train.train import load_checkpoint
 
@@ -27,7 +27,7 @@ def dataset_sources(args, config=DATASET_CONFIG):
         if args.sources and source['name'] not in args.sources:
             continue
         if source['kind'] == 'paris4':
-            from vesuvius.neural_tracing.tracers.fibers.data.ct_normalization import prepare_normalization
+            from vesuvius.neural_tracing.tracers.ct.normalization import prepare_normalization
             spec = paris_spec  # the checkpoint's own volume, bound to its recorded CT normalization
             prepare_normalization(Path(args.out).parent if args.command == 'run' else args.out, [spec], known=normalization)
             _, _, validation, manifest = load_primary_dataset(document, spec)

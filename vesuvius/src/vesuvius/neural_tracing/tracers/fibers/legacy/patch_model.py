@@ -85,7 +85,7 @@ def check_recorded(recorded, required, kind):
 def load_legacy(path, device, build):
     """(EMA model in eval mode, crop, n_history, volume spec, checkpoint) from ``build(checkpoint)``: the tracing CLI's
     checkpoint loader contract."""
-    from vesuvius.neural_tracing.tracers.fibers.data.volume import FiberVolumeSpec
+    from vesuvius.neural_tracing.tracers.ct.volume import FiberVolumeSpec
     from vesuvius.neural_tracing.tracers.shared.paths import relocate_checkpoint
     ck = relocate_checkpoint(torch.load(path, map_location='cpu', weights_only=False))
     model = build(ck)

@@ -142,9 +142,10 @@ The fiber tracer lives in `tracers/fibers/`; the parts other tracers can reuse s
 | Package | Responsibility |
 | --- | --- |
 | `tracers/models` | The follower contract (`model.py`), the crop transformer (`regression`, `flow`), flow matching, the sequence model, the supervised-path contract (`targets.py`) |
-| `tracers/shared` | Geometry, reference handling, the commit policy, recorded-path relocation, retired settings, JSON output, sampling kernels |
+| `tracers/shared` | Geometry, reference handling, the commit policy, recorded-path relocation, retired settings, JSON output |
+| `tracers/ct` | CT volumes (local and remote chunked readers, chunk-store decoding), intensity normalization, oriented crop sampling, remote prefetch |
 | `train` | Entry point and run configuration, objectives, checkpoints, logging, online collection, live continuation |
-| `data` | Volumes, normalization, observation construction, labels, sampling, replay, AFV neighbors |
+| `data` | Fibers, observation construction, labels, sampling, replay, AFV neighbors |
 | `tracing` | Inference, collection, heading/frame resolution, rollout |
 | `evaluation` | Frozen-seed evaluation, recovery, diagnostics, long-trace audits |
 | `heading_model` | Heading/normal trainer and frozen frame predictor used by follower crop generation |

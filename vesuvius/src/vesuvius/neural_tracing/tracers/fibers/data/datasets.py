@@ -9,7 +9,7 @@ import torch
 from vesuvius.neural_tracing.tracers.fibers.data.afv import AFVFibers, file_sha256
 from vesuvius.neural_tracing.tracers.fibers.data.data import FollowDataset, fiber_manifest, load_fibers
 from vesuvius.neural_tracing.tracers.shared.paths import moved_path
-from vesuvius.neural_tracing.tracers.fibers.data.volume import FiberVolumeSpec
+from vesuvius.neural_tracing.tracers.ct.volume import FiberVolumeSpec
 from vesuvius.neural_tracing.tracers.fibers.data.observations import IdentityObservationBuilder
 from vesuvius.neural_tracing.tracers.fibers.data.afv_neighbors import AFVBank
 
@@ -80,7 +80,7 @@ def validation_manifest(fibers, spec, seed=0, monitor_count=32):
     from vesuvius.neural_tracing.tracers.fibers.evaluation.seeds import make_seeds
     from vesuvius.neural_tracing.tracers.shared.io import jsonable
     from vesuvius.neural_tracing.tracers.fibers.tracing.heading import SEED_HEADING_POLICY, TRACE_HEADING_POLICY, FRAME_POLICY
-    from vesuvius.neural_tracing.tracers.fibers.data.volume import FiberVolume
+    from vesuvius.neural_tracing.tracers.ct.volume import FiberVolume
     seed_volume = FiberVolume(spec, cache_bytes=256 << 20)
     rng = np.random.default_rng(seed)
     ids = rng.permutation(len(fibers)).tolist()
@@ -182,7 +182,7 @@ def open_afv_source(source, cache_dir, normalization=None):
         raise ValueError('AFV source CT differs from its embedded metadata')
     spec = ct_source_spec(source, cache_dir)
     if normalization is not None:
-        from vesuvius.neural_tracing.tracers.fibers.data.ct_normalization import volume_key
+        from vesuvius.neural_tracing.tracers.ct.normalization import volume_key
         spec.ct_normalization = normalization['volumes'][volume_key(spec)]
     return fibers, validation_fibers, spec, digest
 

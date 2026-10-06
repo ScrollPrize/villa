@@ -80,7 +80,7 @@ def main(argv=None):
     from vesuvius.neural_tracing.tracers.fibers.data.datasets import load_primary_dataset, open_afv_source, read_dataset_config
     from vesuvius.neural_tracing.tracers.models.model import config_from_checkpoint
     from vesuvius.neural_tracing.tracers.fibers.train.runloop import read_checkpoint
-    from vesuvius.neural_tracing.tracers.fibers.data.volume import FiberVolumeSpec
+    from vesuvius.neural_tracing.tracers.ct.volume import FiberVolumeSpec
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--checkpoint', required=True, help='Supplies the model crop/horizon and label tolerance')
     ap.add_argument('--dataset-config', default=str(Path(__file__).parents[1]/'configs'/'mixed_ct_datasets_paris50.json'))

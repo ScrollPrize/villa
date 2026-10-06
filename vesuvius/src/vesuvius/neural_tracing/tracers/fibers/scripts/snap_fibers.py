@@ -17,7 +17,7 @@ import time
 import numpy as np
 
 from vesuvius.neural_tracing.tracers.fibers.data.fiber_snapping import SnapConfig, snap_afv, snap_json
-from vesuvius.neural_tracing.tracers.fibers.data.volume import ChunkedArray
+from vesuvius.neural_tracing.tracers.ct.volume import ChunkedArray
 
 
 def main(argv=None):

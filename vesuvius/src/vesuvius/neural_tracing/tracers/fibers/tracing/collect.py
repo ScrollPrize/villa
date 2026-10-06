@@ -14,7 +14,7 @@ def switch_detector(args, checkpoint, fibers, band, spec):
 
 
 def load_dataset(args, checkpoint):
-    from vesuvius.neural_tracing.tracers.fibers.data.volume import FiberVolumeSpec
+    from vesuvius.neural_tracing.tracers.ct.volume import FiberVolumeSpec
     document = checkpoint.get('dataset_config')
     if not document:
         raise ValueError('Checkpoint has no mixed dataset configuration')

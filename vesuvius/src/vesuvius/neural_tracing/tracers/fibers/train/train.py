@@ -23,7 +23,7 @@ from vesuvius.neural_tracing.tracers.fibers.train.online import OnlineCollector
 from vesuvius.neural_tracing.tracers.shared.policy import (DEFAULT_CONFIDENCE, DEFAULT_GATE, gate_horizon,
     OperatingPolicy, selection_window)
 from vesuvius.neural_tracing.tracers.fibers.train.runloop import RunLog, lr_at, prepare_run_dir, read_checkpoint, save_checkpoint as write_checkpoint, update_ema, training_rng_state, resume_training, raise_open_file_limit
-from vesuvius.neural_tracing.tracers.fibers.data.volume import FiberVolume, FiberVolumeSpec
+from vesuvius.neural_tracing.tracers.ct.volume import FiberVolume, FiberVolumeSpec
 from vesuvius.neural_tracing.tracers.models.model import build_model, config_from_checkpoint
 from vesuvius.neural_tracing.tracers.fibers.data.observations import IdentityObservationBuilder, IdentitySampling, FiberTracer, LOCATION_SOURCES
 from vesuvius.neural_tracing.tracers.fibers.train import run_config
@@ -578,7 +578,7 @@ def main(argv=None):
     out = prepare_run_dir(args.out_root, args.name, resume is not None)
     (out/'trainer.pid').write_text(f'{os.getpid()}\n')
     (out/'validation_paris4.json').write_text(json.dumps(manifest,indent=2)+'\n')
-    from vesuvius.neural_tracing.tracers.fibers.data.ct_normalization import prepare_normalization
+    from vesuvius.neural_tracing.tracers.ct.normalization import prepare_normalization
     from vesuvius.neural_tracing.tracers.fibers.data.datasets import ct_source_spec
     calibration_specs = [spec, *(ct_source_spec(s, dataset_document['cache_dir'])
                                  for s in dataset_document['sources'] if s['kind'] != 'paris4')]
@@ -735,7 +735,7 @@ def main(argv=None):
     remote_prefetch = None
     try:
         if args.remote_prefetch_connections:
-            from vesuvius.neural_tracing.tracers.fibers.data.remote_prefetch import attach_remote_prefetch
+            from vesuvius.neural_tracing.tracers.ct.prefetch import attach_remote_prefetch
             remote_prefetch, remote_sources = attach_remote_prefetch(dataset.datasets,
                 args.remote_prefetch_connections, args.remote_prefetch_queue_size, args.remote_prefetch_timeout,
                 args.remote_prefetch_lookahead, args.workers)

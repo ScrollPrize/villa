@@ -6,7 +6,7 @@ from pathlib import Path
 
 from vesuvius.neural_tracing.tracers.fibers.data.data import OnPolicyStates
 from vesuvius.neural_tracing.tracers.fibers.tracing.heading import FRAME_POLICY
-from vesuvius.neural_tracing.tracers.fibers.data.volume import FiberVolume
+from vesuvius.neural_tracing.tracers.ct.volume import FiberVolume
 from vesuvius.neural_tracing.tracers.fibers.evaluation.recovery_fixtures import FIXTURE_STRATA, make_recovery_states, evaluate_recovery_states, recovery_counts
 from vesuvius.neural_tracing.tracers.fibers.data.observations import observation_builder, FiberTracer
 from vesuvius.neural_tracing.tracers.fibers.evaluation.diagnostics import decision_rows, summarize_decisions

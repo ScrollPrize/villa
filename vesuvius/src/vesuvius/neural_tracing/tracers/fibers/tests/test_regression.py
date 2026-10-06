@@ -13,7 +13,7 @@ from vesuvius.neural_tracing.tracers.fibers.train import train
 from vesuvius.neural_tracing.tracers.fibers.train.train import clip_training_gradients, initialize_training_optimizer, load_checkpoint, optimizer_update, prepare_training, save_checkpoint
 from vesuvius.neural_tracing.tracers.fibers.data.data import SampleConfig
 from vesuvius.neural_tracing.tracers.fibers.train.runloop import read_checkpoint, training_rng_state
-from vesuvius.neural_tracing.tracers.fibers.data.volume import FiberVolumeSpec
+from vesuvius.neural_tracing.tracers.ct.volume import FiberVolumeSpec
 from label_fixtures import set_terminal
 from model_fixtures import coordinate_batch, coordinate_config, batch as label_batch, forward, proposal_output
 

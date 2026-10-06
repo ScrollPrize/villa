@@ -15,7 +15,7 @@ def volume_key(spec):
 
 
 def open_ct(spec):
-    from vesuvius.neural_tracing.tracers.fibers.data.volume import ChunkedArray, RemoteChunkedArray
+    from vesuvius.neural_tracing.tracers.ct.volume import ChunkedArray, RemoteChunkedArray
     if str(spec.ct_zarr).startswith(('s3://', 'http://', 'https://')):
         return RemoteChunkedArray(spec.ct_zarr, spec.ct_level, spec.cache_dir, 32 << 20)
     return ChunkedArray(Path(spec.ct_zarr)/str(spec.ct_level), 32 << 20)
@@ -39,7 +39,7 @@ def prepare_normalization(out, specs, *, known=None):
     Checkpoints embed the document too (``known``), allowing a missing JSON to be restored. A record that differs
     from the checkpoint's, or from the current CT array, is reported and replaced by the current one.
     """
-    from vesuvius.neural_tracing.tracers.fibers.data.volume import RemoteChunkedArray
+    from vesuvius.neural_tracing.tracers.ct.volume import RemoteChunkedArray
     path = Path(out)/'ct_normalization.json'
     document = json.loads(path.read_text()) if path.exists() else dict(method=ZSCORE_METHOD, volumes={})
     if document.get('method') != ZSCORE_METHOD:

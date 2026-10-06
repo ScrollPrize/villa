@@ -56,7 +56,7 @@ inference uses the previous frame for sign continuity and a reproducible sign at
 
 - sources, fiber splits and CT volumes come from the follower dataset config, through
   `data.datasets.load_primary_dataset`, `open_afv_source` and `primary_source_spec`;
-- CT normalization comes from `data.ct_normalization.prepare_normalization`. Pass a follower run's
+- CT normalization comes from `tracers.ct.normalization.prepare_normalization`. Pass a follower run's
   `ct_normalization.json` to reuse its exact records;
 - the simulated tracer states come from `data.data.make_sample`: the startup mix, the calibrated tracing
   error and the head offset;
