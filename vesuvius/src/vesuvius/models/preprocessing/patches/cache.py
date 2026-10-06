@@ -13,7 +13,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
-SCHEMA_VERSION = 3
+# v4: invalidates v3 caches that may hold out-of-bounds positions found on
+# plain (non-multiscale) arrays with valid_patch_find_resolution >= 1 (#1970).
+SCHEMA_VERSION = 4
 
 
 @dataclass(frozen=True)
