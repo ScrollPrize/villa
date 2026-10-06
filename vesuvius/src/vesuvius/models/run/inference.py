@@ -20,6 +20,7 @@ multiprocessing.set_start_method('spawn', force=True)
 from tqdm.auto import tqdm
 from torch.utils.data import DataLoader
 from vesuvius.utils.models.load_nnunet_model import load_model_for_inference
+from vesuvius.models.utilities.get_accelerator import get_accelerator
 from vesuvius.data.vc_dataset import VCDataset
 from vesuvius.data.utils import open_zarr
 from pathlib import Path
@@ -331,7 +332,7 @@ class Inferer():
                  patch_size: [list, tuple] = None,
                  save_softmax: bool = False,
                  normalization_scheme: str = 'instance_zscore',
-                 device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
+                 device: str = None,
                  num_dataloader_workers: int = 4,
                  writer_workers: int = None,
                  verbose: bool = False,
@@ -370,7 +371,8 @@ class Inferer():
         self.verbose = verbose
         self.normalization_scheme = normalization_scheme
         self.input_format = input_format
-        self.device = torch.device(device)
+        # cuda, then mps, then cpu unless a device is given.
+        self.device = torch.device(device) if device else get_accelerator()
         self.num_dataloader_workers = num_dataloader_workers
         self.writer_workers = writer_workers
         self.skip_empty_patches = skip_empty_patches
@@ -840,13 +842,14 @@ class Inferer():
             anon=self.input_anon,
             bbox=self.bbox,
             read_retries=self.read_retries,
-            # The float16 default suits the CUDA autocast path. CPU convolutions
-            # have no float16 kernels, so half patches meet float32 weights and
-            # raise "Input type (c10::Half) and bias type (float) should be the
-            # same". Ask for the dtype the CPU model can actually consume.
+            # The float16 default suits the CUDA autocast path. Autocast only
+            # runs on CUDA here, so on CPU and MPS half patches would meet
+            # float32 weights and raise "Input type (c10::Half) and bias type
+            # (float) should be the same". Ask for the dtype the model can
+            # actually consume.
             return_as_type=(
-                "np.float32" if self.device.type == "cpu"
-                else "np.float16"
+                "np.float16" if self.device.type == "cuda"
+                else "np.float32"
             ),
         )
 
@@ -893,7 +896,7 @@ class Inferer():
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_dataloader_workers,
-            pin_memory=True if self.device != torch.device('cpu') else False,
+            pin_memory=self.device.type == 'cuda',
             collate_fn=VCDataset.collate_fn  # we use custom collate fn here to tag patches that contain only zeros
                                              # so we don't run them through the model
         )
@@ -1266,7 +1269,8 @@ def build_parser():
     parser.add_argument('--save_softmax', action='store_true', help='Save softmax outputs')
     parser.add_argument('--normalization', type=str, default='instance_zscore',
                       help='Normalization scheme (instance_zscore, global_zscore, instance_minmax, percentile_minmax, ct, none)')
-    parser.add_argument('--device', type=str, default='cuda', help='Device to use (cuda, cpu)')
+    parser.add_argument('--device', type=str, default=None,
+                        help='Device to use (cuda, mps, cpu). Default: cuda, then mps, then cpu')
     parser.add_argument('--num_workers', type=int, default=4,
                       help='Number of DataLoader workers. Use 0 in low /dev/shm environments (e.g. Docker).')
     parser.add_argument('--writer_workers', type=int, default=None,
