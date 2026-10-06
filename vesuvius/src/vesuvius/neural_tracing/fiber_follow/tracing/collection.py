@@ -300,7 +300,6 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer, bank_loader=
     ap.add_argument('--checkpoint', required=True)
     ap.add_argument('--fibers', required=True)
     ap.add_argument('--dataset-name', help='Source in the checkpoint dataset configuration')
-    ap.add_argument('--fiber-zarrs')
     ap.add_argument('--val-z', type=float, nargs=2, default=(45000., 48500.))
     ap.add_argument('--fibers-per-collection', type=int, default=64,
                     help='Distinct fibers; one seed position and one directed episode each')
@@ -344,8 +343,6 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer, bank_loader=
                        n_future=model.cfg.n_future, future_step=model.cfg.future_step,
                        label_tolerance=float(ck.get('tolerance', 1.5)),
                        max_recovery_distance=model.cfg.max_recovery_distance)
-    if args.fiber_zarrs:
-        spec.fiber_zarr_dir = args.fiber_zarrs
     if args.dataset_name:
         if dataset_loader is None:
             raise ValueError('This collector does not support named datasets')

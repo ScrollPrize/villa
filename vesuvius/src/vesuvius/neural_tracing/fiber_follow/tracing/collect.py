@@ -26,7 +26,7 @@ def load_dataset(args, checkpoint):
         raise ValueError('Unknown dataset source')
     if source['kind'] == 'paris4':
         from vesuvius.neural_tracing.fiber_follow.data.datasets import load_primary_dataset
-        spec = FiberVolumeSpec(**checkpoint['vol_spec'])
+        spec = FiberVolumeSpec.from_dict(checkpoint['vol_spec'])
         _,fibers,_,_ = load_primary_dataset(document,spec)
         return spec,fibers,None
     digest = hashlib.sha256()

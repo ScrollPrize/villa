@@ -178,7 +178,7 @@ def test_checkpoint_resume_and_init_weights(tmp_path):
     data = batch(cfg)
     prepare_training(m, backend='eager')
     optimizer_update(m, ema, opt, [data], 1, .001, compute_metrics=False)
-    spec = FiberVolumeSpec('unused', ct_zarr='unused', ct_level=0, ct_grid_scale=4., inputs='ct')
+    spec = FiberVolumeSpec('unused', ct_level=0, ct_grid_scale=4.)
     sample = SampleConfig(crop=cfg.fine, n_history=cfg.n_history)
     path = tmp_path/'last.pt'
     save_checkpoint(path, m, ema, spec, sample, dict(step=1, lr_restart_step=0, optimizer=opt.state_dict(),

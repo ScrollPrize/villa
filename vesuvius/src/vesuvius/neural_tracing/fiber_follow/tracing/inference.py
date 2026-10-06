@@ -168,7 +168,6 @@ def export_seeds(tracer, vol, seeds, families, out, *, grid_scale, batch, min_le
 def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer):
     ap = argparse.ArgumentParser()
     ap.add_argument("--checkpoint", required=True)
-    ap.add_argument("--fiber-zarrs", default=None, help="override the checkpoint's fiber zarr dir")
     ap.add_argument("--ct", default=None, help="override the checkpoint's CT zarr")
     ap.add_argument("--seed", action="append", default=[], help="base-voxel x,y,z (repeatable)")
     ap.add_argument("--family", action="append", choices=('H', 'V'), required=True,
@@ -214,12 +213,8 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer):
         n_commit = selected['n_commit'] if n_commit is None else n_commit
         gate = selected.get('gate') if gate is None else gate
     policy = checkpoint_policy(ck, model.cfg, confidence=confidence, n_commit=n_commit, gate=gate)
-    if args.fiber_zarrs:
-        spec.fiber_zarr_dir = args.fiber_zarrs
     if args.ct:
         spec.ct_zarr = args.ct
-    if spec.mode == 'ct':
-        spec.load_presence = False
     from vesuvius.neural_tracing.fiber_follow.data.ct_normalization import prepare_normalization
     prepare_normalization(args.out, [spec], known=ck['ct_normalization'])
     vol = FiberVolume(spec, cache_bytes=8 << 30)

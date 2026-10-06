@@ -9,7 +9,6 @@
         "kind": "paris4",
         "weight": 0.25,
         "fibers": "/mnt/raid_nvme/spiral_dataset_working/fibers",
-        "fiber_zarrs": "/mnt/raid_nvme/spiral_dataset_working/fiber_zarrs",
         "ct": "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr",
         "manifest": "../../output/single_path_v11_preparation/seeds.json",
         "val_z": [

@@ -7,7 +7,6 @@
       "kind": "paris4",
       "weight": 0.1,
       "fibers": "/mnt/raid_nvme/spiral_dataset_working/fibers",
-      "fiber_zarrs": "/mnt/raid_nvme/spiral_dataset_working/fiber_zarrs",
       "ct": "/mnt/raid_nvme/volpkgs/s1_2um_ds2.volpkg/volumes/s1_ds2.zarr",
       "manifest": "/home/sean/Documents/villa4/vesuvius/src/vesuvius/neural_tracing/fiber_follow/output/single_path_v11_preparation/seeds.json",
       "val_z": [

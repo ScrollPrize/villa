@@ -56,7 +56,7 @@ def test_flow_optimizer_ema_checkpoint_and_resume(tmp_path):
     assert metrics['prediction_loss_type'] == 'flow' and metrics['flow'] > 0
     path = tmp_path/'last.pt'
     sample = SampleConfig(crop=cfg.fine, n_history=cfg.n_history, n_future=cfg.n_future)
-    save_checkpoint(path, model, ema, FiberVolumeSpec('unused', inputs='ct'), sample,
+    save_checkpoint(path, model, ema, FiberVolumeSpec('unused'), sample,
                     dict(step=1, optimizer=opt.state_dict(), rng=training_rng_state()))
     loaded, _, _, _, ck = load_checkpoint(path, 'cpu')
     assert loaded.cfg == cfg

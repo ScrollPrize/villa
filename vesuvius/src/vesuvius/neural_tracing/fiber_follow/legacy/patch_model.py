@@ -87,7 +87,7 @@ def load_legacy(path, device, build):
     model = build(ck)
     model.load_state_dict(ck['ema'])
     model.to(device).eval()
-    return model, model.cfg.fine, model.cfg.n_history, FiberVolumeSpec(**ck['vol_spec']), ck
+    return model, model.cfg.fine, model.cfg.n_history, FiberVolumeSpec.from_dict(ck['vol_spec']), ck
 
 
 # ---------------------------------------------------------------------------------------------------- geometry

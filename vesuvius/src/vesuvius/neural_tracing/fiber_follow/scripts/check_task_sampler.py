@@ -107,7 +107,7 @@ def main(argv=None):
         if args.sources and source['name'] not in args.sources:
             continue
         if source['kind'] == 'paris4':
-            spec = FiberVolumeSpec(**ck['vol_spec'])
+            spec = FiberVolumeSpec.from_dict(ck['vol_spec'])
             _, fibers, _, _ = load_primary_dataset(document, spec)
             neighbors = None
         else:

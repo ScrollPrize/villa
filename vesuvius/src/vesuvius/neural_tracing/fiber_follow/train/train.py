@@ -213,7 +213,7 @@ def load_checkpoint(path,device='cuda'):
     model = build_model(cfg).to(device,memory_format=conv_memory_format(device))
     model.load_state_dict(ck['ema'])
     model.eval()
-    return model,cfg.fine,cfg.n_history,FiberVolumeSpec(**ck['vol_spec']),ck
+    return model,cfg.fine,cfg.n_history,FiberVolumeSpec.from_dict(ck['vol_spec']),ck
 
 
 def move_batch(batch, device):

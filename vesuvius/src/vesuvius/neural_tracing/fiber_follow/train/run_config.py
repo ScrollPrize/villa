@@ -23,7 +23,8 @@ import json
 import math
 from pathlib import Path
 
-from vesuvius.neural_tracing.fiber_follow.models.model import ANY, MODEL_TYPES, RETIRED_FIELDS, config_class, retire as retire_settings
+from vesuvius.neural_tracing.fiber_follow.models.model import MODEL_TYPES, RETIRED_FIELDS, config_class
+from vesuvius.neural_tracing.fiber_follow.shared.retired import ANY, retire as retire_settings
 
 OUT_ROOT = Path(__file__).resolve().parents[1]/'output'
 TOP_LEVEL = dict(name=None, out_root=None, init_weights=None, init_exclude=[], reset_optimizer=False)

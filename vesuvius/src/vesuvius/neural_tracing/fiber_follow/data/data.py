@@ -1009,12 +1009,6 @@ class FollowDataset(torch.utils.data.IterableDataset):
         from vesuvius.neural_tracing.fiber_follow.tracing.heading import frame_prefetch_bounds
         return [bound for item in items for bound in frame_prefetch_bounds(item,self.cfg.crop,vol.input_scale)]
 
-    def crop_prefetch_bounds(self, items, vol):
-        """Model-crop footprints in the crop-level array (any orientation), when crops read another CT level."""
-        from vesuvius.neural_tracing.fiber_follow.tracing.heading import heading_free_bounds
-        view = getattr(vol, 'crop_view', None)
-        return None if view is None else [heading_free_bounds(item['pos'], self.cfg.crop, view.input_scale) for item in items]
-
     def prefetch_items(self, items, vol, *, required=False):
         if self.remote_prefetch is None or not items:
             return
@@ -1023,14 +1017,10 @@ class FollowDataset(torch.utils.data.IterableDataset):
         if not required and self.remote_prefetch_lookahead:
             return
         bounds = self.prefetch_bounds(items,vol)
-        crop_bounds = self.crop_prefetch_bounds(items, vol)
-        for reader, reads in ((vol.ct, bounds), (getattr(getattr(vol, 'crop_view', None), 'ct', None), crop_bounds)):
-            if reads is None:
-                continue
-            if required:
-                self.remote_prefetch.ensure(reader,reads)
-            else:
-                self.remote_prefetch.submit(reader,reads)
+        if required:
+            self.remote_prefetch.ensure(vol.ct,bounds)
+        else:
+            self.remote_prefetch.submit(vol.ct,bounds)
 
     def resolve_seeds(self, items, vol, rng, windows):
         """CT seed headings; a seed without CT orientation is rejected and its task redrawn."""
@@ -1100,9 +1090,6 @@ class FollowDataset(torch.utils.data.IterableDataset):
             if lookahead:
                 self.remote_prefetch.lookahead(vol.ct,
                     [bounds for _,bounds in pending],scope=id(self))
-                if getattr(vol, 'crop_view', None) is not None:
-                    self.remote_prefetch.lookahead(vol.crop_view.ct,
-                        [self.crop_prefetch_bounds(plan, vol) for plan,_ in pending],scope=id(self))
             items, bounds = pending.popleft()
             live_outcomes = None
             if self.live_continuation is not None:
@@ -1113,8 +1100,6 @@ class FollowDataset(torch.utils.data.IterableDataset):
                 bounds = self.prefetch_bounds(items, vol) if lookahead else None
             if lookahead:
                 self.remote_prefetch.ensure(vol.ct,bounds)
-                if getattr(vol, 'crop_view', None) is not None:
-                    self.remote_prefetch.ensure(vol.crop_view.ct, self.crop_prefetch_bounds(items, vol))
             else:
                 self.prefetch_items(items,vol,required=True)
             seed_rejections += self.resolve_seeds(items, vol, live_rng, windows)
@@ -1221,15 +1206,15 @@ def tight_block(pos, frame, crop: CropSpec, scale: float = 1.):
     return lo, hi - lo
 
 
-def read_tight_blocks(items, vol: FiberVolume, crop: CropSpec, pool=None, *, presence=False):
+def read_tight_blocks(items, vol: FiberVolume, crop: CropSpec, pool=None):
     """Per-item minimal blocks for per-sample CPU sampling: (list of raw, list of zyx starts).
 
     Same values as the rotation-invariant ``block_start`` block at every sample point, reading roughly a
     third of the voxels and touching about half the chunks per item.
     """
-    scale = 1. if presence else getattr(vol, 'input_scale', 1.)
+    scale = getattr(vol, 'input_scale', 1.)
     bounds = [tight_block(it["pos"], it["frame"], crop, scale) for it in items]
-    read = lambda b: vol.presence.read(b[0], b[1])[None] if presence else vol.raw_block(b[0], b[1])
+    read = lambda b: vol.raw_block(b[0], b[1])
     raw = list(map(read, bounds) if pool is None else pool.map(read, bounds))
     return raw, [start for start, _ in bounds]
 

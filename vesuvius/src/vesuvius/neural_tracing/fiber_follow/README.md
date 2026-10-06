@@ -39,7 +39,7 @@ bash scripts/stop.sh NAME                                      # the trainer and
 }
 ```
 
-- `dataset` is the dataset configuration (data/datasets.py): exactly one `paris4` source (fibers, fiber zarrs, CT,
+- `dataset` is the dataset configuration (data/datasets.py): exactly one `paris4` source (fibers, CT,
   seed manifest, `val_z`) and any number of `afv` sources, each with a weight and validation split. Neighboring
   annotations of AFV sources supply foreign-path masks, synthetic wrong continuations and switch detection; Paris 4
   has no neighbor paths.

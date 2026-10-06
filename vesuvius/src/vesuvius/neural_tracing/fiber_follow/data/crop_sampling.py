@@ -42,12 +42,12 @@ def unique_crop_indices(items):
     return sources
 
 
-def scalar_crops(items, vol, crop, pool=None, *, presence=False, out=None, normalize=True):
+def scalar_crops(items, vol, crop, pool=None, *, out=None, normalize=True):
     grid = _grid_flat(crop)
     sources = unique_crop_indices(items)
     unique = [j for j, source in enumerate(sources) if j == source]
-    raw, starts = read_tight_blocks([items[j] for j in unique], vol, crop, pool, presence=presence)
-    scale = 1. if presence else vol.input_scale
+    raw, starts = read_tight_blocks([items[j] for j in unique], vol, crop, pool)
+    scale = vol.input_scale
     shape = (len(items), 1, crop.depth, crop.width, crop.width)
     result = np.empty(shape, np.float32) if out is None else out
     if result.shape != shape or result.dtype != np.float32:
@@ -59,7 +59,7 @@ def scalar_crops(items, vol, crop, pool=None, *, presence=False, out=None, norma
         item = items[j]
         sample_scalar_crop(raw[k], starts[k], item['pos']*scale, item['frame']*scale,
                            grid, result[j])
-        if not presence and normalize:
+        if normalize:
             normalize_ct(result[j, 0], vol.spec.ct_normalization)
     # Rows are independent and the Numba kernel releases the GIL, so a pool only
     # changes scheduling; each row's values are identical to the serial loop.

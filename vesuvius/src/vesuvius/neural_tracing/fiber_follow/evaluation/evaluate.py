@@ -33,10 +33,6 @@ def dataset_sources(args, config=DATASET_CONFIG):
             _, _, validation, manifest = load_primary_dataset(document, spec)
             detector = None
         else:
-            # The model's own crop CT level, as recorded when it was trained (absent: the configured level).
-            recorded = next((s for s in (checkpoint.get('dataset_config') or {}).get('sources', [])
-                             if s.get('name') == source['name']), {})
-            source = dict(source, **{k: recorded[k] for k in ('crop_ct_level', 'crop_ct_grid_scale') if k in recorded})
             _, validation, spec, _ = open_afv_source(source, document['cache_dir'], normalization)
             manifest = validation_manifest(validation, spec, source['validation']['seed'])
             detector = BankSwitchDetector([AFVBank(validation)])

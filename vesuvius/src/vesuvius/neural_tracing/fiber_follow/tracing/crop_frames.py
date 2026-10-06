@@ -87,24 +87,15 @@ def orient_items(items, vol, predictor=None, *, previous=None, pool=None):
         item.update(frame_policy=LEARNED_FRAME_POLICY, ct_frame_diagnostics=dict(source=3, energy=0., gap=0.))
 
 
-def crop_frame_bounds(item, crop, vol, predictor=None, *, include_crop=True):
-    """Reads of ``vol`` for one state's crop and frame. ``include_crop=False`` when the model crop itself is read
-    from another CT level (the crop view prefetches it); the frame/seed contexts stay."""
-    if predictor is None:
-        if include_crop:
-            yield from frame_prefetch_bounds(item, crop, vol.input_scale)
-        elif item.get('frame_policy') not in FRAME_POLICIES:
-            yield normal_context(item['pos'], vol.input_scale)  # the CT frame still reads this level
+def crop_frame_bounds(item, crop, vol, predictor=None):
+    """Reads of ``vol`` for one state's crop and frame."""
+    if predictor is None or item.get('frame_policy') in FRAME_POLICIES:
+        yield from frame_prefetch_bounds(item, crop, vol.input_scale)
     else:
-        if item.get('frame_policy') in FRAME_POLICIES:
-            if include_crop:
-                yield from frame_prefetch_bounds(item, crop, vol.input_scale)
-        else:
-            # Learned headings can change as well as roll; enclose every possible orientation.
-            if include_crop:
-                yield heading_free_bounds(item['pos'], crop, vol.input_scale)
-            yield heading_free_bounds(item['pos'], predictor.model.cfg.patch, vol.input_scale)
-            if not item.get('fiber_family'):
-                yield normal_context(item['pos'], vol.input_scale)
+        # Learned headings can change as well as roll; enclose every possible orientation.
+        yield heading_free_bounds(item['pos'], crop, vol.input_scale)
+        yield heading_free_bounds(item['pos'], predictor.model.cfg.patch, vol.input_scale)
+        if not item.get('fiber_family'):
+            yield normal_context(item['pos'], vol.input_scale)
     if item.get('seed_heading_family') is not None:
         yield normal_context(item['seed_pos'], vol.input_scale)

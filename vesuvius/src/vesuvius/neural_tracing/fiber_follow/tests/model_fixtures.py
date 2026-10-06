@@ -118,6 +118,6 @@ def ct_volume(root):
     from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolume, FiberVolumeSpec
     z, y, x = np.indices((96, 96, 96))
     array_at(root/'ct'/'0', (x+2*y+z).clip(0, 255))
-    spec = FiberVolumeSpec('', ct_zarr=str(root/'ct'), ct_level=0, ct_grid_scale=4., inputs='ct', load_presence=False)
+    spec = FiberVolumeSpec(str(root/'ct'), ct_level=0, ct_grid_scale=4.)
     norm.prepare_normalization(root/'run', [spec], known=dict(method=norm.ZSCORE_METHOD, volumes={}))
     return FiberVolume(spec, cache_bytes=1 << 20)

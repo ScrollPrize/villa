@@ -21,8 +21,7 @@ def volume(root):
                                                 order='C', filters=None, compressor=None, zarr_format=2)))
     z, y, x = np.indices((80, 80, 80))
     (path/'0.0.0').write_bytes(((x+2*y+z) % 256).astype(np.uint8).tobytes())
-    spec = FiberVolumeSpec(str(root/'fields'), ct_zarr=str(root/'ct'), ct_level=0, ct_grid_scale=4., inputs='ct',
-                           load_presence=False)
+    spec = FiberVolumeSpec(str(root/'ct'), ct_level=0, ct_grid_scale=4.)
     spec.ct_normalization = dict(method=ZSCORE_METHOD, volume=volume_key(spec), epsilon=ZSCORE_EPSILON)
     return FiberVolume(spec, cache_bytes=1 << 20)
 

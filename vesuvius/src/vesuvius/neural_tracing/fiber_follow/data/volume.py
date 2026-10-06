@@ -1,8 +1,8 @@
-"""Chunk-cached readers for the fiber prediction zarrs and the CT volume.
+"""Chunk-cached CT readers.
 
-Arrays are indexed ``z, y, x``. Fiber predictions use the eight-base-voxel
-trace grid. CT-only inputs can use a finer native grid; ``input_scale`` maps
-trace coordinates into the selected CT array. Fiber JSON uses base-voxel xyz.
+Arrays are indexed ``z, y, x``. Tracing uses the trace grid (``grid_scale`` base voxels per trace voxel); CT is read
+at a finer native grid, and ``input_scale`` maps trace coordinates into the selected CT array. Fiber JSON uses
+base-voxel xyz.
 """
 
 from __future__ import annotations
@@ -19,6 +19,8 @@ from urllib.parse import urlsplit
 
 import numcodecs
 import numpy as np
+
+from vesuvius.neural_tracing.fiber_follow.shared.retired import ANY, retire
 
 _VCZ1_REGISTERED = False
 _MISSING = object()
@@ -299,71 +301,36 @@ async def open_remote_array(url,level, *, max_pool_connections=None):
                             path=str(level),mode='r')
 
 
+# Removed volume fields and their only supported value (ANY: every value), as recorded in older checkpoints: the
+# fiber prediction zarrs (read only for the presence channel), presence inputs and a separate model-crop CT level.
+RETIRED_SPEC_FIELDS = dict(fiber_zarr_dir=ANY, fiber_level=ANY, inputs='ct', load_presence=False,
+                           crop_ct_level=None, crop_ct_grid_scale=None)
+
+
 @dataclass
 class FiberVolumeSpec:
-    fiber_zarr_dir: str
-    ct_zarr: str | None = None
-    fiber_level: int = 3
+    ct_zarr: str
     ct_level: int = 1
     ct_grid_scale: float = 8.0  # base voxels per selected CT voxel; s1_ds2 level 0 = 4
-    # base voxels per trace-grid voxel (fiber OME level 3 -> 8)
-    grid_scale: float = 8.0
-    # CT model input; presence may still support seed selection and data preparation.
-    inputs: str = "ct"
-    load_presence: bool = True  # False: CT metadata alone defines tracing bounds.
+    grid_scale: float = 8.0  # base voxels per trace-grid voxel
     cache_dir: str | None = None  # Persistent uncompressed remote CT chunks.
     ct_normalization: dict | None = None  # Bound at startup, persisted in run JSON/checkpoints.
-    # Model crops from another level of the same CT store (e.g. level 1); seed headings, CT frames and the learned
-    # frame predictor keep reading ``ct_level``. None: model crops read ``ct_level`` too.
-    crop_ct_level: int | None = None
-    crop_ct_grid_scale: float | None = None  # base voxels per crop-level CT voxel
 
-    @property
-    def mode(self) -> str:
-        return self.inputs
+    @classmethod
+    def from_dict(cls, values):
+        """A recorded spec (``to_dict``, checkpoints' ``vol_spec``), including one written before fields were removed."""
+        return cls(**retire(values, RETIRED_SPEC_FIELDS, 'volume'))
 
     def to_dict(self) -> dict:
         result = dict(self.__dict__)
         # Omit an unspecified cache location from portable volume metadata.
         if self.cache_dir is None:
             result.pop('cache_dir')
-        for key in ('crop_ct_level', 'crop_ct_grid_scale'):  # unchanged metadata for single-level volumes
-            if result[key] is None:
-                result.pop(key)
         return result
 
 
-def _find_channel_zarr(root: str, channel: str) -> str:
-    for name in sorted(os.listdir(root)):
-        if name.endswith(f"_{channel}.ome.zarr"):
-            return os.path.join(root, name)
-    raise FileNotFoundError(f"no *_{channel}.ome.zarr under {root}")
-
-
-class CropView:
-    """The reader of model crops when they come from another CT level (``FiberVolumeSpec.crop_ct_level``):
-    the same trace-grid geometry and normalization record, its own array and source voxels per trace voxel."""
-    def __init__(self, volume, ct, input_scale):
-        if not float(input_scale).is_integer():
-            raise ValueError('Crop CT sampling requires an integer number of CT voxels per trace voxel')
-        if ct.dtype != np.dtype('uint8'):
-            raise ValueError('CT intensity normalization currently requires uint8 data')
-        expected = np.asarray(volume.ct.shape)*input_scale/volume.input_scale
-        if np.any(np.abs(np.asarray(ct.shape)-expected) > 1):
-            raise ValueError(f'Crop CT shape {ct.shape} does not align with the main CT level')
-        self.ct, self.input_scale, self.spec, self.shape, self.presence = ct, float(input_scale), volume.spec, volume.shape, volume.presence
-
-    def raw_block(self, start, size):
-        return self.ct.read(start, size)[None]
-
-
-def model_crop_volume(vol):
-    """The reader of model (and memory) crops: the crop-level view when configured, else the volume itself."""
-    return getattr(vol, 'crop_view', None) or vol
-
-
 class FiberVolume:
-    """Model-image readers plus presence for seed initialization.
+    """The model-image (CT) reader.
 
     CT is read at its native resolution. External positions and ``shape``
     remain in trace units.
@@ -372,44 +339,23 @@ class FiberVolume:
     def __init__(self, spec: FiberVolumeSpec, cache_bytes: int = 3 << 30, *, cache_only=False) -> None:
         self.spec = spec
         self._cache_bytes = int(cache_bytes)
-        if spec.mode not in ('ct', 'ct+presence') or min(spec.grid_scale, spec.ct_grid_scale) <= 0:
-            raise ValueError('Invalid input mode or voxel scale; direction-field inputs are no longer supported')
-        lvl = str(spec.fiber_level)
-        if not spec.load_presence and spec.mode != 'ct':
-            raise ValueError('Presence-free volume reading requires CT-only inputs')
-        self.presence = (ChunkedArray(os.path.join(_find_channel_zarr(spec.fiber_zarr_dir, "presence"), lvl), cache_bytes // 4)
-                         if spec.load_presence else None)
+        if min(spec.grid_scale, spec.ct_grid_scale) <= 0:
+            raise ValueError('Invalid voxel scale')
         self.input_scale = spec.grid_scale/spec.ct_grid_scale
         if not self.input_scale.is_integer():
             raise ValueError('CT sampling currently requires an integer number of CT voxels per trace voxel')
         if not spec.ct_zarr:
             raise ValueError("CT input mode needs ct_zarr")
-        # Native CT is the larger field; presence keeps its own cache.
-        open_level = lambda level, size: (RemoteChunkedArray(spec.ct_zarr, level, spec.cache_dir, size, cache_only=cache_only)
-            if spec.ct_zarr.startswith(('s3://','http://','https://')) else
-            ChunkedArray(os.path.join(spec.ct_zarr, str(level)), size))
-        split = spec.crop_ct_level is not None
-        ct = open_level(spec.ct_level, int(cache_bytes*(.25 if split else .75)))
-        expected = np.asarray(self.presence.shape)*spec.grid_scale/spec.ct_grid_scale if self.presence is not None else np.asarray(ct.shape)
-        if np.any(np.abs(np.asarray(ct.shape)-expected) > 1):
-            raise ValueError(
-                f"CT shape {ct.shape} and voxel scale {spec.ct_grid_scale} do not align "
-                f"with presence shape {self.presence.shape} at scale {spec.grid_scale}"
-            )
+        ct = (RemoteChunkedArray(spec.ct_zarr, spec.ct_level, spec.cache_dir, int(cache_bytes*.75), cache_only=cache_only)
+              if spec.ct_zarr.startswith(('s3://','http://','https://')) else
+              ChunkedArray(os.path.join(spec.ct_zarr, str(spec.ct_level)), int(cache_bytes*.75)))
         if ct.dtype != np.dtype('uint8'):
             raise ValueError('CT intensity normalization currently requires uint8 data')
         self.ct = ct
         if spec.ct_normalization is not None:
             from vesuvius.neural_tracing.fiber_follow.data.ct_normalization import validate_record
             validate_record(spec.ct_normalization, spec)
-        self.shape = (self.presence.shape if self.presence is not None else
-                      tuple(np.ceil(np.asarray(self.ct.shape)/self.input_scale).astype(int)))
-        self.crop_view = None
-        if split:
-            if not spec.crop_ct_grid_scale or spec.crop_ct_grid_scale <= 0:
-                raise ValueError('A crop CT level needs its positive grid scale')
-            array = open_level(spec.crop_ct_level, int(cache_bytes*.5))
-            self.crop_view = CropView(self, array, spec.grid_scale/spec.crop_ct_grid_scale)
+        self.shape = tuple(np.ceil(np.asarray(self.ct.shape)/self.input_scale).astype(int))
 
     def raw_block(self, start, size) -> np.ndarray:
         """Model-input uint8 (1, ...) native CT block in source-array coordinates."""

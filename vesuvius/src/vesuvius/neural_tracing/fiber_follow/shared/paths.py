@@ -39,7 +39,7 @@ def relocated_volume_key(key):
 def relocate_checkpoint(ck):
     """Relocate the local paths a checkpoint records for its volume and CT normalization, in place."""
     spec = ck.get('vol_spec') or {}
-    for key in ('fiber_zarr_dir', 'ct_zarr', 'cache_dir'):
+    for key in ('ct_zarr', 'cache_dir'):
         if isinstance(spec.get(key), str) and '://' not in spec[key]:
             spec[key] = recorded_path(spec[key])
     if isinstance(spec.get('ct_normalization'), dict) and 'volume' in spec['ct_normalization']:

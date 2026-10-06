@@ -142,8 +142,6 @@ class PrefetchClient:
         if not spec.cache_dir:
             raise ValueError('Remote CT prefetch requires a persistent cache_dir')
         self._ensure((str(spec.ct_zarr).rstrip('/'),int(spec.ct_level),str(spec.cache_dir)),[None])
-        if getattr(spec, 'crop_ct_level', None) is not None:  # model crops read another level of the same store
-            self._ensure((str(spec.ct_zarr).rstrip('/'),int(spec.crop_ct_level),str(spec.cache_dir)),[None])
 
     def ensure(self, reader, bounds):
         if isinstance(reader,RemoteChunkedArray):

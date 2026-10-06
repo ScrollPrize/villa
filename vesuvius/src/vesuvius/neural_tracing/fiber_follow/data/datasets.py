@@ -1,5 +1,4 @@
 """Explicit dataset provenance and weighted, source-local training batches."""
-from dataclasses import replace
 import hashlib
 import json
 from pathlib import Path
@@ -14,31 +13,19 @@ from vesuvius.neural_tracing.fiber_follow.data.observations import IdentityObser
 from vesuvius.neural_tracing.fiber_follow.data.afv_neighbors import AFVBank
 
 
-PRIMARY_OPTIONS = ('fibers', 'fiber_zarrs', 'ct', 'manifest', 'val_z')
-
-
-def crop_level_options(source):
-    """Optional model-crop CT level of a dataset-config source (``crop_ct_level``, ``crop_ct_grid_scale``)."""
-    if source.get('crop_ct_level') is None:
-        return {}
-    return dict(crop_ct_level=int(source['crop_ct_level']), crop_ct_grid_scale=float(source['crop_ct_grid_scale']))
+PRIMARY_OPTIONS = ('fibers', 'ct', 'manifest', 'val_z')
 
 
 def ct_source_spec(source, cache_dir):
-    return FiberVolumeSpec(source.get('fiber_zarrs', ''), ct_zarr=source['ct'],
-        ct_level=int(source.get('ct_level', 0)), ct_grid_scale=float(source.get('ct_grid_scale', 1.)),
-        grid_scale=float(source['grid_scale']), inputs='ct', load_presence=False, cache_dir=cache_dir,
-        **crop_level_options(source))
+    return FiberVolumeSpec(source['ct'], ct_level=int(source.get('ct_level', 0)),
+        ct_grid_scale=float(source.get('ct_grid_scale', 1.)), grid_scale=float(source['grid_scale']), cache_dir=cache_dir)
 
 
-def primary_source_spec(document, *, fiber_zarrs=None, ct=None):
-    """The Paris 4 CT/fiber volume spec the trainer builds from a dataset config (CLI paths may override)."""
-    source = next((s for s in document['sources'] if s['kind'] == 'paris4'), {}) if document else {}
-    return FiberVolumeSpec(fiber_zarrs if fiber_zarrs is not None else source.get('fiber_zarrs'),
-        ct_zarr=ct if ct is not None else source.get('ct'),
-        ct_level=source.get('ct_level', 0), ct_grid_scale=source.get('ct_grid_scale', 4.),
-        grid_scale=source.get('grid_scale', 8.), inputs='ct',
-        load_presence=False, cache_dir=document['cache_dir'] if document else None, **crop_level_options(source))
+def primary_source_spec(document):
+    """The Paris 4 CT volume spec the trainer builds from a dataset config."""
+    source = next(s for s in document['sources'] if s['kind'] == 'paris4')
+    return FiberVolumeSpec(source['ct'], ct_level=source.get('ct_level', 0), ct_grid_scale=source.get('ct_grid_scale', 4.),
+        grid_scale=source.get('grid_scale', 8.), cache_dir=document['cache_dir'])
 
 
 def read_dataset_config(path):
@@ -80,7 +67,7 @@ def parse_dataset_config(document, base):
     if len(set(names)) != len(names) or sum(s['kind'] == 'paris4' for s in document['sources']) != 1:
         raise ValueError('Require unique source names and exactly one Paris 4 source')
     primary = next(s for s in document['sources'] if s['kind'] == 'paris4')
-    for key in ('fibers', 'fiber_zarrs', 'ct', 'manifest', 'val_z'):
+    for key in ('fibers', 'ct', 'manifest', 'val_z'):
         if key not in primary:
             raise ValueError(f'Paris 4 source is missing {key}')
     digest = hashlib.sha256(json.dumps(document, sort_keys=True).encode()).hexdigest()
@@ -93,9 +80,7 @@ def validation_manifest(fibers, spec, seed=0, monitor_count=32):
     from vesuvius.neural_tracing.fiber_follow.shared.experiment import jsonable
     from vesuvius.neural_tracing.fiber_follow.tracing.heading import SEED_HEADING_POLICY, TRACE_HEADING_POLICY, FRAME_POLICY
     from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolume
-    from dataclasses import replace
-    # Seed geometry reads CT only, even when the model itself has extra channels.
-    seed_volume = FiberVolume(replace(spec, inputs='ct', load_presence=False), cache_bytes=256 << 20)
+    seed_volume = FiberVolume(spec, cache_bytes=256 << 20)
     rng = np.random.default_rng(seed)
     ids = rng.permutation(len(fibers)).tolist()
     n = min(monitor_count, max(1,len(ids)//3))

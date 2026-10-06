@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
+from vesuvius.neural_tracing.fiber_follow.shared.retired import retire
 from vesuvius.neural_tracing.fiber_follow.tracing.policy import DEFAULT_CONFIDENCE, commit_prefix
 
 MODEL_TYPES = ('regression', 'flow', 'sequence')
@@ -98,20 +99,11 @@ def config_class(model_type):
 RETIRED_FIELDS = dict(activation_checkpointing=False, query_scale=None, flow_time_conditioning='adaln_zero',
                       flow_unknown_planes='own_path', flow_selection='retry', flow_zero_start=True,
                       flow_sample_threshold=0., flow_loss='pseudo_huber', flow_geometry_weight=0.)
-ANY = object()  # a retired setting every value of which is supported
-
-
-def retire(values, retired, what='model'):
-    """``values`` without the ``retired`` settings ({name: supported value or ANY}); refuses any other value."""
-    for key, kept in retired.items():
-        if key in values and kept is not ANY and values[key] != kept:
-            raise ValueError(f'The {what} setting {key}={values[key]!r} no longer exists (only {kept!r} is supported)')
-    return {k: v for k, v in values.items() if k not in retired}
 
 
 def config_from_checkpoint(ck):
     """The model configuration recorded in a checkpoint."""
-    return config_class(ck.get('model_type'))(**retire(ck['model_cfg'], RETIRED_FIELDS))
+    return config_class(ck.get('model_type'))(**retire(ck['model_cfg'], RETIRED_FIELDS, 'model'))
 
 
 def build_model(cfg):
