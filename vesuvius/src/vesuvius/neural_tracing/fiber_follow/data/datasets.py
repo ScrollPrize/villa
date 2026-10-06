@@ -356,7 +356,8 @@ def build_mixed_dataset(primary, document, cfg, sample, sampling, args, *, seed,
             from vesuvius.neural_tracing.fiber_follow.data.data import load_replay, usable_replay
             replay_paths = json.loads(replay_index.read_text()) if resume and replay_index and replay_index.exists() else []
             replay = usable_replay(load_replay(replay_paths), fibers, sample.n_history, spec.grid_scale)
-            dataset = FollowDataset(fibers, spec, sample, band, chunk=args.batch,
+            from vesuvius.neural_tracing.fiber_follow.data.data import loader_chunk
+            dataset = FollowDataset(fibers, spec, sample, band, chunk=loader_chunk(cfg, args.batch),
                 seed=seed+100003*(index+1), cache_bytes=int(args.worker_cache_gb*(1<<30)),
                 batch_builder=builder, budget=budget, length_power=args.afv_length_power,
                 onpolicy=replay, replay_index=str(replay_index) if replay_index else None)

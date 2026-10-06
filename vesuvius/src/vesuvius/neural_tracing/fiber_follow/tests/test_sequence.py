@@ -110,3 +110,21 @@ def test_tracing_builds_whole_trace_history_one_step_per_commit(tmp_path):
         assert counts == [decision]*len(idx)  # one history token per earlier commit of the same trace
     assert all(len(s['heads']) == len(tracer.read) and all(len(l) == len(tracer.read) for l in s['layers'])
                for s in tracer.sequence)
+
+
+def test_single_episode_loader_items_merge_into_one_microbatch():
+    from vesuvius.neural_tracing.fiber_follow.train.sequence import merge_episodes
+
+    def item(steps, segment, counter=None):
+        out = dict(hist=torch.zeros(steps, 4, 3), x=dict(fine=torch.full((steps, 1, 2, 2, 2), float(steps))),
+                   episode_index=torch.zeros(steps, dtype=torch.long), episode_step=torch.arange(steps),
+                   episode_segment=torch.ones(steps, segment, 3), episode_segment_mask=torch.ones(steps, segment, dtype=torch.bool),
+                   _live_states=[None]*steps)
+        if counter is not None:
+            out['ct_seed_rejections'] = torch.zeros(steps, dtype=torch.long)
+            out['ct_seed_rejections'][0] = counter
+        return out
+    batch = merge_episodes([item(3, 13), item(2, 17, counter=5)])
+    assert batch['episode_index'].tolist() == [0, 0, 0, 1, 1] and batch['x']['fine'][:, 0, 0, 0, 0].tolist() == [3, 3, 3, 2, 2]
+    assert batch['episode_segment'].shape == (5, 17, 3) and batch['episode_segment_mask'].sum(1).tolist() == [13]*3+[17]*2
+    assert batch['ct_seed_rejections'].sum() == 5 and len(batch['_live_states']) == 5

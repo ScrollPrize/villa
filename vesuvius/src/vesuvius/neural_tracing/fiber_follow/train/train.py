@@ -231,11 +231,13 @@ class DecisionBatchPrefetch:
     Only this thread consumes the loader iterator. Chunks remain ordered and
     exactly grad_steps whole batches form each update.
     The complete denominator is therefore known before any task backward.
+    With ``merge``, each batch is ``merge`` of ``per_chunk`` consecutive loader items (sequence episodes).
     """
-    def __init__(self, iterator, grad_steps):
-        if grad_steps < 1:
-            raise ValueError('Positive gradient accumulation steps required')
+    def __init__(self, iterator, grad_steps, per_chunk=1, merge=None):
+        if grad_steps < 1 or per_chunk < 1:
+            raise ValueError('Positive gradient accumulation steps and loader items per batch required')
         self.iterator, self.grad_steps = iterator, grad_steps
+        self.per_chunk, self.merge = per_chunk, merge
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='decision-batch')
         self.pending = self.executor.submit(self.collect)
         self.closed = False
@@ -243,7 +245,10 @@ class DecisionBatchPrefetch:
     def collect(self):
         chunks = []
         for _ in range(self.grad_steps):
-            chunks.append(next(self.iterator))
+            if self.merge is None:
+                chunks.append(next(self.iterator))
+            else:
+                chunks.append(self.merge([next(self.iterator) for _ in range(self.per_chunk)]))
         return chunks
 
     def __next__(self):
@@ -659,7 +664,8 @@ def main(argv=None):
     progress(f'{args.batch} independent decisions per batch')
     builder = IdentityObservationBuilder(cfg,train_f,identity_sampling,
         augment=True,negative_bank=negative_bank,**role_banks)
-    dataset = FollowDataset(train_f, spec, sample, band, chunk=args.batch, seed=args.seed+done,
+    from vesuvius.neural_tracing.fiber_follow.data.data import loader_chunk
+    dataset = FollowDataset(train_f, spec, sample, band, chunk=loader_chunk(cfg, args.batch), seed=args.seed+done,
         cache_bytes=int(args.worker_cache_gb*(1 << 30)), onpolicy=caches,
         replay_index=str(collector.index), batch_builder=builder, additional_crops=(), budget=budget)
     dataset_provenance = None
@@ -782,7 +788,11 @@ def main(argv=None):
         progress(f'Starting data loader; batch {args.batch} × grad steps {args.grad_steps} = '
                  f'{args.batch * args.grad_steps} decisions per update; starting update {done+1}')
         iterator = iter(loader)
-        updates = DecisionBatchPrefetch(iterator, args.grad_steps)
+        if cfg.model_type == 'sequence':  # single-episode loader items, merged per microbatch
+            from vesuvius.neural_tracing.fiber_follow.train.sequence import merge_episodes
+            updates = DecisionBatchPrefetch(iterator, args.grad_steps, per_chunk=args.batch, merge=merge_episodes)
+        else:
+            updates = DecisionBatchPrefetch(iterator, args.grad_steps)
         observed_states = interval_states = 0
         prior_samples = int(resume.get('samples_seen', 0)) if resume else 0
         ledger = SamplingLedger()

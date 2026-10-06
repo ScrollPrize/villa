@@ -56,6 +56,10 @@ class LegacyPatchConfig:
         return self.n_future if self.gate_plane is None else self.gate_plane
 
     @property
+    def recent_history_points(self):
+        return self.n_history
+
+    @property
     def token_stride(self):
         return (4, 4, 4)
 

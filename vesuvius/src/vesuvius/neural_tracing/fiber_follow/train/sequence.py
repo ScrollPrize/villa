@@ -25,6 +25,37 @@ def select_rows(batch, rows, count):
     return {key: pick(value) for key, value in batch.items()}
 
 
+def merge_episodes(items):
+    """One episode microbatch from loader items (data.loader_chunk): row-aligned tensors concatenated in item order,
+    each item's episodes renumbered after the previous items', wider trailing dimensions (committed segments) zero-padded,
+    and row counters an item omits (they are emitted only when nonzero) zero-filled. Lists concatenate."""
+    rows = [len(item['hist']) for item in items]
+    offset = 0
+    for item in items:
+        item['episode_index'] = item['episode_index']+offset
+        offset = int(item['episode_index'].max())+1
+
+    def merge(values, counts):
+        present = [v for v in values if v is not None]
+        first = present[0]
+        if isinstance(first, dict):
+            keys = list(dict.fromkeys(k for v in present for k in v))
+            return {k: merge([v.get(k) if v is not None else None for v in values], counts) for k in keys}
+        if torch.is_tensor(first) and first.ndim and all(v is None or len(v) == n for v, n in zip(values, counts)):
+            shape = [max(v.shape[d] for v in present) for d in range(1, first.ndim)]
+            parts = []
+            for value, n in zip(values, counts):
+                part = first.new_zeros((n, *shape))
+                if value is not None:
+                    part[(slice(None),)+tuple(slice(0, s) for s in value.shape[1:])] = value
+                parts.append(part)
+            return torch.cat(parts)
+        if isinstance(first, list):
+            return [x for v in present for x in v]
+        return first
+    return merge(items, rows)
+
+
 def episode_rows(batch):
     """(E, T) batch row of each episode step (-1 past an episode's end), and each row's (episode, step)."""
     index, step = batch['episode_index'].cpu(), batch['episode_step'].cpu()

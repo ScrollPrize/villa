@@ -511,6 +511,13 @@ def episode_decisions(fiber, t0, reverse, steps, commit, cfg: SampleConfig, rng:
     return out
 
 
+def loader_chunk(cfg, batch):
+    """Units per loader item: ``batch`` decisions, or for sequence models one episode (the trainer merges ``batch``
+    of them per microbatch, train/sequence.merge_episodes), so loader workers never hold whole episode microbatches
+    in shared memory."""
+    return 1 if cfg.model_type == 'sequence' else batch
+
+
 def mark_episode_identity(items):
     """Episode steps in step order: a step whose episode has an earlier step on the original fiber reads that fiber
     through its history tokens, so its identity is observable (observations.identity_evidence)."""
