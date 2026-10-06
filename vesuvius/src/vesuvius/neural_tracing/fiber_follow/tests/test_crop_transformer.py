@@ -106,3 +106,16 @@ def test_adaln_zero_velocity_blocks_start_as_the_identity_and_open_with_training
     b['flow_noise'], b['flow_times'] = torch.randn(2, fresh.cfg.flow_draws, 8, 2), torch.rand(2, fresh.cfg.flow_draws)
     fresh.training_forward(b['x'], b['hist'], b['hmask'], torch.tensor(.5), b)['flow_per_state'].sum().backward()
     assert all(m.weight.grad.abs().sum() > 0 for m in fresh.time_modulation)  # the gates learn from the first step
+
+
+def test_scoring_pass_scores_each_finished_proposal_without_steering_it():
+    model = small(scoring_pass=True).eval()
+    b = coordinate_batch(model.cfg, 2)
+    with torch.no_grad():
+        out = model(b['x'], b['hist'], b['hmask'], confidence_threshold=1.)
+        changed = copy.deepcopy(model)
+        changed.score[2].weight.mul_(-1.)  # only the scoring tokens' input changes
+        out2 = changed(b['x'], b['hist'], b['hmask'], confidence_threshold=1.)
+    # The initial proposal does not depend on its score (refinement passes read it back as feedback, by design).
+    torch.testing.assert_close(out2['initial_points'], out['initial_points'])
+    assert not torch.allclose(out2['confidence'], out['confidence'])  # the confidence comes from the scoring pass

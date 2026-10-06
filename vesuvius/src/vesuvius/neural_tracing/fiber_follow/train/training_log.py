@@ -192,23 +192,42 @@ def _interval_training_lines(row):
         if 'lookahead_chunks' in p:
             lines[-1] += f" | lookahead {p['lookahead_chunks']} chunk references / {p['lookahead_windows']} windows"
     if m.get('live_rows'):
-        lines.append(f"  live continuation: {int(m['live_rows'])} rows | terminal {int(m.get('live_terminal_rows', 0))}"
-                     f" | depth {m['live_depth_sum']/m['live_rows']:.2f}"
-                     f" | mean travel {m.get('live_travelled_sum', 0)/m['live_rows']:.1f} voxels"
-                     f" | chain starts by limit {m.get('live_start_limit_counts', {})}"
-                     f" | reached depths {m.get('live_depth_counts', {})}")
-    for source, entry in sorted(row.get('sampling', {}).items()):
-        lines.append(f"  source {source}: requested "+', '.join(f'{k} {v:.0%}' for k, v in sorted(entry['requested_share'].items()))
-                     +' | delivered '+', '.join(f'{k} {v:.0%}' for k, v in sorted(entry['delivered_share'].items())))
-        lines.append(f"    fallbacks {entry['fallbacks'] or 'none'} | supervision {entry['supervision']}"
-                     f" | geometry {entry['geometry_valid']}/{entry['rows']} | confidence {entry['confidence_valid']}/{entry['rows']}"
-                     f" | targets +{entry['positive_targets']:.0f}/-{entry['negative_targets']:.0f}")
-        lines.append(f"    fibers {entry['fibers']} | episodes {entry['episodes']} | events {entry['events']}"
-                     f" | source age mean {_number(entry['source_age_mean'], '.0f')} max {entry['source_age_max']}"
-                     f" | startup {entry['startup_requested']} -> seed ages {entry['seed_age']}"
-                     f" | replay travel {entry['replay_travel']} | {entry['counters']}")
+        lines.append(f"  live chains: {int(m['live_rows'])} rows | mean depth {m['live_depth_sum']/m['live_rows']:.0f} decisions"
+                     f" | mean travel {m.get('live_travelled_sum', 0)/m['live_rows']:.0f} vox"
+                     f" | {int(m.get('live_terminal_rows', 0))} terminal")
+    lines.extend(_sampling_table(row))
     if 'grad_norm_max' in m:
         lines.append(f"  gradients: max {m['grad_norm_max']:.2g}, clipped {m['clipped_updates']}/{updates} updates")
+    return lines
+
+
+def _sampling_table(row):
+    """One row per source: task mix (DAgger requested -> delivered), replay supply, label mix, confidence targets and
+    live-chain outcomes. Histograms (startup/seed ages, replay travel, chain limits) stay in the JSON log."""
+    sampling = row.get('sampling', {})
+    if not sampling:
+        return []
+    names = row.get('dataset_names', [])
+    pct = lambda n, d: f'{n/d:.0%}' if d else '--'
+    lines = ['  sampling (dagger = replayed rollout states; fallback = nothing to replay -> fresh; age = steps since the model that made the data)',
+             f"    {'source':<20}{'rows':>5}{'fresh':>7}{'live':>6}{'dagger req>got':>16}{'fallback':>10}"
+             f"{'replay ep':>11}{'age':>6}   {'labels follow/recov/term/unk':<30}{'hazard tgts':>12}"
+             "   live adv/cens/stale/empty"]
+    for source, entry in sorted(sampling.items(), key=lambda item: int(item[0])):
+        rows = entry['rows']
+        name = names[int(source)] if int(source) < len(names) else source
+        req, got = entry['requested_share'], entry['delivered_share']
+        dagger = lambda shares: sum(v for k, v in shares.items() if k.startswith('dagger'))
+        fallback = sum(entry['fallbacks'].values())
+        sup = entry['supervision']; labeled = sum(sup.values())
+        labels = '/'.join(pct(sup.get(k, 0), labeled) for k in ('following', 'recoverable', 'terminal', 'unknown'))
+        targets = entry['positive_targets']+entry['negative_targets']
+        c = entry.get('counters', {})
+        live = '/'.join(str(c.get('live_'+k, 0)) for k in ('advanced', 'censored', 'stale', 'empty'))
+        lines.append(f"    {name[:19]:<20}{rows:>5}{got.get('fresh', 0):>7.0%}{got.get('live', 0):>6.0%}"
+                     f"{f'{dagger(req):.0%}>{dagger(got):.0%}':>16}{pct(fallback, rows):>10}"
+                     f"{entry['episodes']:>11}{_number(entry['source_age_mean'], '.0f'):>6}   {labels:<30}"
+                     f"{pct(entry['negative_targets'], targets):>12}   {live}")
     return lines
 
 

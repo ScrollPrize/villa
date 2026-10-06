@@ -804,7 +804,7 @@ def main(argv=None):
                     samples_per_second=observed_states/(now-started),
                     interval_samples_per_second=interval_states/(now-interval_started),
                     interval_data_seconds=interval_data_seconds, interval_update_seconds=interval_update_seconds,
-                    interval=interval_metrics.summary(), sampling=ledger.summary(),
+                    interval=interval_metrics.summary(), sampling=ledger.summary(), dataset_names=list(dataset.names),
                     n_future=cfg.n_future, tolerance=args.tolerance,
                     interval_updates=step-interval_step,
                     cuda_peak_allocated_gib=torch.cuda.max_memory_allocated(args.device)/2**30
