@@ -2,6 +2,8 @@ add_executable(vc_cache_root src/vc_cache_root.cpp)
 target_link_libraries(vc_cache_root PRIVATE vc_core)
 
 if(VC_BUILD_APPS OR VC_BUILD_FIBERLETS)
+    add_executable(vc_fiber_bake_annotations src/vc_fiber_bake_annotations.cpp)
+    target_link_libraries(vc_fiber_bake_annotations vc_fiber_tracer vc_lasagna)
     add_executable(vc_fiber_trace_metric src/vc_fiber_trace_metric.cpp src/FiberTraceEvaluationCli.cpp src/FiberLiveBridge.cpp)
     target_link_libraries(vc_fiber_trace_metric vc_fiber_tracer vc_lasagna)
 endif()

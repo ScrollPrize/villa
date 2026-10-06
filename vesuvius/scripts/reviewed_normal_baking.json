@@ -1,0 +1,15 @@
+{
+  "binary": "../../volume-cartographer/build/fiber-evaluation/bin/vc_fiber_bake_annotations",
+  "cache_root": "/ephemeral/hendrik/las_manager_cache",
+  "manifests": {
+    "PHerc0139-20260102150214-lasagna-20260724.lasagna.json": "../src/vesuvius/neural_tracing/fiber_trace_3d/configs/embedding_normals/PHerc0139.lasagna.json",
+    "PHerc1299-20260309130042-lasagna-20260724.lasagna.json": "../src/vesuvius/neural_tracing/fiber_trace_3d/configs/embedding_normals/PHerc1299.lasagna.json",
+    "PHerc1451-20260319101107-lasagna-20260724.lasagna.json": "../src/vesuvius/neural_tracing/fiber_trace_3d/configs/embedding_normals/PHerc1451.lasagna.json",
+    "PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json": "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json"
+  },
+  "test_coordinates": {
+    "PHerc0139": "PHerc0139/20260102150214@L0",
+    "PHerc1299": "PHerc1299/20260309130042@L0",
+    "PHercParis4": "PHercParis4/20260411134726@L0"
+  }
+}
