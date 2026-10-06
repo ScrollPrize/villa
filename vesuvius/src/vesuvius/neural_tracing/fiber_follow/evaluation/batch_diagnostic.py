@@ -240,6 +240,30 @@ def decision_memory_rows(model, cpu_batch, device, memory=None):
     return batch
 
 
+SEQUENCE_EPISODES, SEQUENCE_DECISIONS = 4, 4  # sequence sheets: the last decisions of the first episodes
+
+
+@torch.no_grad()
+def sequence_rows(model, cpu_batch, device, n_commit):
+    """A sequence model's episode batch reduced to the rows the sheets show: the last ``SEQUENCE_DECISIONS``
+    supervised decisions of the first ``SEQUENCE_EPISODES`` episodes, each predicted exactly as in training (its own
+    crop with its episode's earlier steps as history, train/sequence.py). Returns those rows and their outputs."""
+    from vesuvius.neural_tracing.fiber_follow.train.sequence import episode_forward, select_rows
+    from vesuvius.neural_tracing.fiber_follow.train.train import move_batch
+    from vesuvius.neural_tracing.fiber_follow.tracing.policy import DEFAULT_CONFIDENCE
+    with torch.autocast('cuda', dtype=torch.bfloat16, enabled=torch.device(device).type == 'cuda'):
+        output, _ = episode_forward(model, move_batch(cpu_batch, device), DEFAULT_CONFIDENCE, n_commit)
+    supervised = cpu_batch['episode_supervised'].bool().nonzero().flatten()
+    episodes = cpu_batch['episode_index'][supervised]
+    picks = [k for episode in episodes.unique(sorted=True)[:SEQUENCE_EPISODES].tolist()
+             for k in (episodes == episode).nonzero().flatten()[-SEQUENCE_DECISIONS:].tolist()]
+    picks = torch.tensor(picks, dtype=torch.long)
+    count = len(supervised)
+    outputs = {key: value[picks.to(value.device)] for key, value in output.items()
+               if torch.is_tensor(value) and value.ndim and len(value) == count}
+    return select_rows(cpu_batch, supervised[picks], len(cpu_batch['hist'])), outputs
+
+
 @torch.no_grad()
 def render_microbatch(model, cpu_batch, out, step, *, device, n_commit, tolerance,
                       dataset_names=(), training_metrics=None, memory=None, tube_sigma=1.5):
@@ -257,6 +281,9 @@ def render_microbatch(model, cpu_batch, out, step, *, device, n_commit, toleranc
     try:
         if getattr(model.cfg, 'memory', 'slabs') == 'decisions':
             cpu_batch = decision_memory_rows(model, cpu_batch, device, memory)
+        episode_outputs = None
+        if model.model_type == 'sequence':
+            cpu_batch, episode_outputs = sequence_rows(model, cpu_batch, device, n_commit)
         for i in range(len(cpu_batch['hist'])):
             batch = move_batch(slice_batch(cpu_batch, slice(i, i+1)), device)
             # Singleton inference keeps each adaptive refinement's row identity
@@ -264,7 +291,10 @@ def render_microbatch(model, cpu_batch, out, step, *, device, n_commit, toleranc
             begin = time.perf_counter()
             with torch.autocast('cuda', dtype=torch.bfloat16, enabled=torch.device(device).type == 'cuda'):
                 with layer_capture(model) as layers:
-                    output = model(batch['x'], batch['hist'], batch['hmask'], n_commit=n_commit)
+                    if episode_outputs is None:
+                        output = model(batch['x'], batch['hist'], batch['hmask'], n_commit=n_commit)
+                    else:  # a sequence decision, predicted with its episode's history (sequence_rows)
+                        output = {key: value[i:i+1] for key, value in episode_outputs.items()}
             details = decision_details(output, batch, model.cfg, n_commit, tolerance)
             whole_metrics = {}
             if whole_crop:

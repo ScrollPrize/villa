@@ -568,12 +568,13 @@ def episode_decisions(fiber, t0, reverse, steps, commit, cfg: SampleConfig, rng:
 
 def episode_tensors(items, commit):
     """Row-aligned episode layout of a batch of episode decisions: episode and step indices, which rows are
-    supervised, and each step's committed segment (world xyz, padded) with its mask."""
-    length = int(round(commit))+1
+    supervised, and each step's committed segment (world xyz, padded to the longest, at least commit+1 points) with
+    its mask."""
+    length = max([int(round(commit))+1]+[len(item['episode_segment']) for item in items])
     segment = np.zeros((len(items), length, 3), np.float32)
     mask = np.zeros((len(items), length), bool)
     for row, item in enumerate(items):
-        points = np.asarray(item['episode_segment'])[:length]
+        points = np.asarray(item['episode_segment'])
         segment[row, :len(points)], mask[row, :len(points)] = points, True
     return dict(episode_index=torch.tensor([it['episode_index'] for it in items], dtype=torch.long),
                 episode_step=torch.tensor([it['episode_step'] for it in items], dtype=torch.long),
@@ -1014,6 +1015,66 @@ class FollowDataset(torch.utils.data.IterableDataset):
                 return items
         raise ValueError('Could not draw a training episode outside the held-out band')
 
+    def replay_episode_items(self, kind, rng, index):
+        """One on-policy episode (``self.episodes``) from the replay caches: consecutive recorded decisions of one
+        collected trace whose supervised (trailing) window contains a decision of replay class ``kind``. Each step is
+        relabeled and prepared as a replay item; its committed segment is the recorded trace from its head to the next
+        head (the last step's history token is never read, so its segment is its head alone). The collector keeps every
+        decision for sequence models (``--max-states``, stride 0), so a trace's rows are consecutive decisions.
+        Returns None when no eligible event is available."""
+        spec = self.episodes
+        eligible = self.eligible_caches()
+        for _ in range(8):
+            group = self.index.draw(kind, rng, eligible)
+            if group is None:
+                return None
+            if not self.claim(group[4]):
+                continue
+            ci, episode, event, members, key = group
+            op = self.onpolicy[ci]
+            trace = np.flatnonzero(np.asarray(op.episode) == episode)
+            trace = trace[np.argsort(np.asarray(op.source_row)[trace])]
+            if np.any(np.diff(np.asarray(op.source_row)[trace]) != 1):
+                raise ValueError('Replay episodes need every decision of a trace; collect with --max-states and stride 0')
+            anchor = int(np.searchsorted(np.asarray(op.source_row)[trace], int(op.source_row[int(rng.choice(members))])))
+            end = min(len(trace)-1, anchor+int(rng.integers(spec.supervised)))
+            start = max(0, end-spec.steps+1)
+            if end-start+1 < spec.min_steps:
+                continue
+            rows = trace[start:end+1]
+            items, shared = [], None
+            for step, j in enumerate(rows):
+                item = self.replay_item(op, int(j), rng)
+                if item is None:
+                    break
+                if shared is None:
+                    shared = {name: item[name] for name in ('photometric', 'blur_sigma') if name in item}
+                if step+1 < len(rows):
+                    segment = op.track_pos[int(op.seq_end[j])-1:int(op.seq_end[rows[step+1]])]
+                else:
+                    segment = np.asarray(op.pos[j])[None]
+                item.update(shared, replay_event=key, replay_episode=stable_key(key, episode), episode_index=index,
+                            episode_step=step, episode_supervised=step >= len(rows)-spec.supervised,
+                            episode_segment=np.asarray(segment, np.float64))
+                items.append(item)
+            else:
+                return items
+        return None
+
+    def episode_plan(self, rng, windows, index):
+        """One training episode by the task budget: a simulated trace ('fresh') or an on-policy replay episode
+        ('dagger_<class>', falling back to a fresh episode when none is eligible)."""
+        name = TASKS[int(rng.choice(len(TASKS), p=self.budget.shares))]
+        if name != 'fresh' and not name.startswith('dagger_'):
+            raise ValueError(f'Episode training draws fresh or DAgger episodes only, not {name!r}')
+        items = self.replay_episode_items(name[len('dagger_'):], rng, index) if name != 'fresh' else None
+        delivered, fallback = (name, 'none') if items is not None else ('fresh', 'none' if name == 'fresh' else 'fresh')
+        if items is None:
+            items = self.episode_items(rng, windows, index)
+        for item in items:
+            item.update(task_requested=TASK[name], task_delivered=TASK[delivered], task_fallback=FALLBACKS.index(fallback))
+        return items
+
     def live_start(self, rng, windows):
         """Chain starts: half recorded valid pre-excursion/recoverable prefixes, half seed-only."""
         from vesuvius.neural_tracing.fiber_follow.data.state_labels import FOLLOWING, RECOVERABLE
@@ -1219,7 +1280,7 @@ class FollowDataset(torch.utils.data.IterableDataset):
             items = []
             if self.episodes is not None:
                 for index in range(self.chunk):
-                    episode = self.episode_items(rng, windows, index)
+                    episode = self.episode_plan(rng, windows, index)
                     self.prefetch_items(episode, vol)
                     items.extend(episode)
                 yield items

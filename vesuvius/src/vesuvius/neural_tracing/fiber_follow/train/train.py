@@ -785,6 +785,9 @@ def build_parser():
                     help='Commit-gate confidence threshold for tracing, live chains, collection and training retries')
     ap.add_argument('--change-trace-confidence', action='store_true',
                     help='On resume, allow --trace-confidence to differ from the recorded run (e.g. after recalibration)')
+    ap.add_argument('--change-task-mix', action='store_true',
+                    help='On resume, allow the task shares, replay limits and DAgger collection settings to differ from '
+                         'the recorded run (e.g. adding on-policy episodes to a sequence run)')
     ap.add_argument('--retry-threshold', type=float, default=None,
                     help='Training only: refinement passes run while a proposal\'s confidence is below this threshold '
                          '(default: --trace-confidence); selection, live chains and collection keep --trace-confidence')
@@ -1016,9 +1019,14 @@ def validate_resume_options(args, recorded_options):
                'log_every','ckpt_every','diag_every','batch_diag_every','dagger_device','dagger_batch','dagger_forward_chunk',
                'negative_bank_refresh_seconds','negative_bank_cache_mb','activation_checkpointing',
                'history_grad_clip','rest_grad_clip','blur_probability','blur_sigma','retry_threshold','refinement_loss','refinement_weight',
-               'tolerance','change_trace_confidence'}  # confidence-label tolerance; the departure threshold is a separate constant
+               'tolerance','change_trace_confidence','change_task_mix'}  # confidence-label tolerance; the departure threshold is a separate constant
     if args.change_trace_confidence:
         ignored = ignored | {'trace_confidence'}  # explicit: live chains, collection and selection move to the new threshold
+    if args.change_task_mix:
+        # explicit: which tasks are drawn and how on-policy data is collected change; labels and samples keep their rules
+        ignored = ignored | {'task_share', 'terminal_fallback_cap', 'replay_max_age', 'replay_event_cap', 'replay_keep',
+                             'dagger_every', 'dagger_fibers', 'afv_dagger_fibers', 'dagger_trace_len', 'dagger_before',
+                             'dagger_after', 'dagger_stride', 'live_continuation_steps'}
     defaults = build_parser()
     # Options whose default changed when they were introduced: a run started earlier used the old behaviour.
     from vesuvius.neural_tracing.fiber_follow.tracing.policy import LEGACY_CONFIDENCE, LEGACY_GATE
@@ -1096,9 +1104,10 @@ def main(argv=None):
     initialization = resume.get('initialization') if resume else args.init_weights
     # A partial warm start builds the requested architecture; a full one copies the source's.
     cfg = model_config_from_args(args, resume or (None if args.init_partial else initial))
-    if cfg.model_type == 'sequence' and args.dagger_every:
-        # Replay rows are single decisions; sequence training reads whole episodes (on-policy episodes: not yet).
-        raise ValueError('--model sequence trains on simulated episodes; use --dagger-every 0')
+    if cfg.model_type == 'sequence' and any(budget.to_dict()['shares'].get(name, 0.) for name in
+                                            ('live', 'synthetic_terminal', 'synthetic_identity')):
+        # Episodes are simulated traces ('fresh') or windows of collected traces ('dagger_*'), nothing else.
+        raise ValueError('--model sequence trains on fresh and DAgger episodes; set the live and synthetic task shares to 0')
     inherited_frame = initial['model_cfg'].get('frame_checkpoint') if args.init_partial else None
     if args.frame_checkpoint or not resume:
         bind_frame_checkpoint(cfg, args.frame_checkpoint or cfg.frame_checkpoint or inherited_frame
@@ -1252,7 +1261,10 @@ def main(argv=None):
     collection = dict(every=args.dagger_every, fibers_per_collection=args.dagger_fibers, batch=args.dagger_batch,
                       forward_chunk=args.dagger_forward_chunk, seed=args.seed, replay_keep=args.replay_keep,
                       trace_len=args.dagger_trace_len, before=args.dagger_before, after=args.dagger_after,
-                      stride=args.dagger_stride, confidence=policy.confidence, n_commit=policy.n_commit, gate=policy.gate,
+                      # Sequence episodes need every decision of a collected trace (consecutive history steps).
+                      stride=0. if cfg.model_type == 'sequence' else args.dagger_stride,
+                      max_states=1 << 20 if cfg.model_type == 'sequence' else 192,
+                      confidence=policy.confidence, n_commit=policy.n_commit, gate=policy.gate,
                       collector_module='vesuvius.neural_tracing.fiber_follow.tracing.collect', threads=args.dagger_threads)
     bank_args = ('--bank-switch-tolerance', args.bank_switch_tolerance, '--bank-own-tolerance', args.bank_own_tolerance)
     collector = OnlineCollector(out/'dagger', args.fibers, args.val_z, args.dagger_device or args.device,
@@ -1485,7 +1497,7 @@ def main(argv=None):
                     log.record(dict(step=step, dagger_skipped_busy=True))
             periodic = {}
             # The batch renderer reads the patch-token models' internals; sequence models use the monitor rollouts.
-            if args.batch_diag_every and cfg.model_type != 'sequence' and (step % args.batch_diag_every == 0
+            if args.batch_diag_every and (step % args.batch_diag_every == 0
                                          or (resume is not None and step == done+1)):
                 from vesuvius.neural_tracing.fiber_follow.evaluation.batch_diagnostic import render_microbatch
                 began = time.monotonic()

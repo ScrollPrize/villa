@@ -72,7 +72,7 @@ class OnlineCollector:
     """
     def __init__(self, directory, fibers, val_z, device, every=1000, fibers_per_collection=64,
                  batch=8, forward_chunk=0, seed=0, replay_keep=4, initial=(), trace_len=768.,
-                 before=48., after=64., stride=16., confidence=None, n_commit=None, gate=None,
+                 before=48., after=64., stride=16., max_states=192, confidence=None, n_commit=None, gate=None,
                  collector_module='vesuvius.neural_tracing.fiber_follow.tracing.collect', extra_args=(), threads=4,
                  length_power=0.):
         self.directory = Path(directory).resolve()
@@ -83,6 +83,7 @@ class OnlineCollector:
         self.every, self.fibers_per_collection, self.batch = every, fibers_per_collection, batch
         self.forward_chunk, self.seed, self.replay_keep = forward_chunk, seed, replay_keep
         self.trace_len, self.before, self.after, self.stride = trace_len, before, after, stride
+        self.max_states = max_states
         self.confidence, self.n_commit, self.gate = confidence, n_commit, gate
         self.collector_module = collector_module
         if threads < 1:
@@ -100,7 +101,7 @@ class OnlineCollector:
     def settings(self):
         return dict(every=self.every, fibers_per_collection=self.fibers_per_collection, batch=self.batch,
                     threads=self.threads, forward_chunk=self.forward_chunk, trace_len=self.trace_len, before=self.before,
-                    after=self.after, stride=self.stride, replay_keep=self.replay_keep,
+                    after=self.after, stride=self.stride, max_states=self.max_states, replay_keep=self.replay_keep,
                     confidence=self.confidence, n_commit=self.n_commit, exploration='none',
                     length_power=self.length_power, **({} if self.gate is None else dict(gate=self.gate)))
 
@@ -149,6 +150,7 @@ class OnlineCollector:
                    '--fibers-per-collection', str(self.fibers_per_collection), '--batch', str(self.batch),
                    '--forward-chunk', str(self.forward_chunk), '--trace-len', str(self.trace_len),
                    '--before', str(self.before), '--after', str(self.after), '--stride', str(self.stride),
+                   '--max-states', str(self.max_states),
                    '--seed', str(self.seed+step), '--out', str(self.output), *self.extra_args]
         if self.coverage.exists():
             command += ['--coverage-state', str(self.coverage)]

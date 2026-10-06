@@ -315,6 +315,9 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer, bank_loader=
     ap.add_argument('--before', type=float, default=48., help='Dense decisions kept before an excursion')
     ap.add_argument('--after', type=float, default=64., help='Voxels kept after the first terminal failure')
     ap.add_argument('--stride', type=float, default=16., help='Travel between kept ordinary following decisions')
+    ap.add_argument('--max-states', type=int, default=192,
+                    help='Decisions kept per trace; with --stride 0 and a large cap every decision is kept (sequence '
+                         'models train on consecutive decisions of a trace)')
     ap.add_argument('--confidence', type=float, help='Default: the checkpoint operating policy')
     ap.add_argument('--n-commit', type=int, help='Default: the checkpoint operating policy')
     ap.add_argument('--gate', choices=('full', 'prefix'), help='Commit gate. Default: the checkpoint operating policy')
@@ -369,7 +372,7 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer, bank_loader=
             chunk = seeds[offset:offset+args.batch]
             collectors = [DecisionCollector(train_f[s['fiber']], s['fiber'], s['t'], s['sign'], cfg, band,
                                             before=args.before, after=args.after, stride=args.stride,
-                                            additional_crops=getattr(tracer, 'additional_crops', ()),
+                                            max_states=args.max_states, additional_crops=getattr(tracer, 'additional_crops', ()),
                                             bank_detector=bank_detector) for s in chunk]
             from vesuvius.neural_tracing.fiber_follow.tracing.crop_frames import trace_family_kwargs
             paths, chunk_reasons = tracer.trace(np.stack([s['pos'] for s in chunk]), np.stack([s['heading'] for s in chunk]),

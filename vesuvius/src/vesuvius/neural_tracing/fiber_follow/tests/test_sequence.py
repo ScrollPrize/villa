@@ -146,3 +146,59 @@ def test_tracing_builds_whole_trace_history_one_step_per_commit(tmp_path):
         assert counts == [decision]*len(idx)  # one history token per earlier commit of the same trace
     assert all(len(s['heads']) == len(tracer.read) and all(len(l) == len(tracer.read) for l in s['layers'])
                for s in tracer.sequence)
+
+
+def recorded_trace(decisions=30, commit=12, terminal=20):
+    """A replay cache holding every decision of one collected trace along z (heads ``commit`` voxels apart)."""
+    from replay_fixtures import replay_states
+    from vesuvius.neural_tracing.fiber_follow.data.state_labels import REPLAY_CLASS, TERMINAL
+    fiber = line_fiber(800.)
+    track = np.c_[np.full(decisions*commit+1, 100.), np.full(decisions*commit+1, 100.), 200.+np.arange(decisions*commit+1.)]
+    rows = [dict(pos=track[k*commit], t=200.+k*commit, travelled=float(k*commit), seq_start=0, seq_end=k*commit+1,
+                 episode=0, source_row=k, hist=np.zeros((4, 3)), hmask=np.zeros(4, np.float32),
+                 **(dict(replay_class=REPLAY_CLASS['terminal'], supervision=TERMINAL, event_id=0, hard=True)
+                    if k == terminal else {}))
+            for k in range(decisions)]
+    return replay_states([fiber], rows, track=track), track
+
+
+def episode_dataset(cache, steps=8, supervised=3):
+    from vesuvius.neural_tracing.fiber_follow.data.data import FollowDataset, ReplayIndex
+    ds = FollowDataset.__new__(FollowDataset)
+    ds.episodes = D.EpisodeSpec(steps=steps, supervised=supervised, commit=12)
+    ds.onpolicy, ds.index = [cache], ReplayIndex([cache])
+    ds.eligible_caches, ds.claim = lambda: {0}, lambda key: True
+    ds.replay_item = lambda op, j, rng: dict(row=j, pos=np.asarray(op.pos[j]))  # labels/crops are tested elsewhere
+    return ds
+
+
+def test_replay_episodes_are_consecutive_recorded_decisions_ending_near_the_event():
+    cache, track = recorded_trace()
+    ds = episode_dataset(cache)
+    for seed in range(12):
+        items = ds.replay_episode_items('terminal', np.random.default_rng(seed), index=3)
+        rows = [it['row'] for it in items]
+        assert len(items) == 8 and rows == list(range(rows[0], rows[0]+8))  # consecutive decisions of the trace
+        supervised = [it['row'] for it in items if it['episode_supervised']]
+        assert len(supervised) == 3 and 20 in supervised  # the terminal decision is supervised
+        assert [it['episode_step'] for it in items] == list(range(8)) and {it['episode_index'] for it in items} == {3}
+        for step, item in enumerate(items[:-1]):
+            # A step commits the recorded trace from its head to the next head.
+            np.testing.assert_allclose(item['episode_segment'], track[rows[step]*12:rows[step+1]*12+1])
+        np.testing.assert_allclose(items[-1]['episode_segment'], track[rows[-1]*12][None])
+    assert ds.replay_episode_items('recoverable', np.random.default_rng(0), index=0) is None  # no such event
+
+
+def test_replay_episodes_need_every_decision_of_a_trace():
+    import pytest
+    cache, _ = recorded_trace()
+    cache.source_row[10:] += 1  # one decision thinned away
+    with pytest.raises(ValueError, match='every decision'):
+        episode_dataset(cache).replay_episode_items('terminal', np.random.default_rng(0), index=0)
+
+
+def test_episode_segments_pad_to_the_longest_recorded_commit():
+    items = [dict(episode_index=0, episode_step=k, episode_supervised=k == 1, episode_segment=np.zeros((n, 3)))
+             for k, n in enumerate((13, 17))]
+    out = D.episode_tensors(items, 12)
+    assert out['episode_segment'].shape == (2, 17, 3) and out['episode_segment_mask'].sum(1).tolist() == [13, 17]
