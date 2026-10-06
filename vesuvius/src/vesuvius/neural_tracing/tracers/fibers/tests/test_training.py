@@ -36,7 +36,7 @@ def test_masked_retries_preserve_adamw_skipped_parameter_updates():
 
 def test_compiled_loss_preserves_terms_and_prediction_gradients():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    from vesuvius.neural_tracing.tracers.fibers.train.train import move_batch
+    from vesuvius.neural_tracing.tracers.shared.tensors import move_batch
     torch.manual_seed(341)
     model = build_model(coordinate_config(recurrent_refinement_steps=1)).to(device)
     batch = move_batch(coordinate_batch(model.cfg), device)

@@ -10,6 +10,7 @@ contract) and their rows of the batch for the shared losses and metrics.
 import torch
 
 from vesuvius.neural_tracing.tracers.models.sequence import relative_pose
+from vesuvius.neural_tracing.tracers.shared.tensors import fixed_rows
 
 ENCODE_CHUNK = 16  # crops per CNN call: one fixed shape for the compiled CNN (train.prepare_training)
 
@@ -69,7 +70,6 @@ def episode_rows(batch):
 def encode_rows(model, image, rows):
     """CNN cells of ``image[rows]`` in ``ENCODE_CHUNK``-row calls, the last padded with copies of its first row (instance
     normalization is per crop, so padding never changes a real row)."""
-    from vesuvius.neural_tracing.tracers.fibers.train.train import fixed_rows
     parts = []
     for start in range(0, len(rows), ENCODE_CHUNK):
         part = rows[start:start+ENCODE_CHUNK]

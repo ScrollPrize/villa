@@ -25,7 +25,7 @@ from vesuvius.neural_tracing.tracers.fibers.frames.ct import oriented_seed_headi
 from vesuvius.neural_tracing.tracers.shared.policy import checkpoint_policy
 from vesuvius.neural_tracing.tracers.fibers.tracing.trace import TraceParams
 from vesuvius.neural_tracing.tracers.models.checkpoint import load_checkpoint
-from vesuvius.neural_tracing.tracers.fibers.train.runloop import raise_open_file_limit
+from vesuvius.neural_tracing.tracers.shared.system import raise_open_file_limit
 
 
 def length_weighted_order(lengths, count, rng):

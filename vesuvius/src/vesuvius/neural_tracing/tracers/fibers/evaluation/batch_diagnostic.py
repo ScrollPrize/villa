@@ -116,7 +116,7 @@ def sequence_rows(model, cpu_batch, device, n_commit):
     supervised decisions of the first ``SEQUENCE_EPISODES`` episodes, each predicted exactly as in training (its own
     crop with its episode's earlier steps as history, train/sequence.py). Returns those rows and their outputs."""
     from vesuvius.neural_tracing.tracers.fibers.train.sequence import episode_forward, select_rows
-    from vesuvius.neural_tracing.tracers.fibers.train.train import move_batch
+    from vesuvius.neural_tracing.tracers.shared.tensors import move_batch
     from vesuvius.neural_tracing.tracers.shared.policy import DEFAULT_CONFIDENCE
     with torch.autocast('cuda', dtype=torch.bfloat16, enabled=torch.device(device).type == 'cuda'):
         output, _ = episode_forward(model, move_batch(cpu_batch, device), DEFAULT_CONFIDENCE, n_commit)
@@ -135,7 +135,7 @@ def sequence_rows(model, cpu_batch, device, n_commit):
 def render_microbatch(model, cpu_batch, out, step, *, device, n_commit, tolerance,
                       dataset_names=(), training_metrics=None):
     """One sheet per image type; every current-microbatch row, in loader order."""
-    from vesuvius.neural_tracing.tracers.fibers.train.train import move_batch
+    from vesuvius.neural_tracing.tracers.shared.tensors import move_batch
     from vesuvius.neural_tracing.tracers.fibers.evaluation.diagnostic_plots import plot_sheets
     folder = Path(out)/'diagnostic_images'/str(step)
     folder.mkdir(parents=True, exist_ok=True)

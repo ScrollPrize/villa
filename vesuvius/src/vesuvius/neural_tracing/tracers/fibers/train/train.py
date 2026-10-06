@@ -21,7 +21,9 @@ from vesuvius.neural_tracing.tracers.fibers.data.data import (
 from vesuvius.neural_tracing.tracers.fibers.train.online import OnlineCollector
 from vesuvius.neural_tracing.tracers.shared.policy import (DEFAULT_CONFIDENCE, DEFAULT_GATE, gate_horizon,
     OperatingPolicy, selection_window)
-from vesuvius.neural_tracing.tracers.fibers.train.runloop import RunLog, lr_at, prepare_run_dir, update_ema, training_rng_state, resume_training, raise_open_file_limit
+from vesuvius.neural_tracing.tracers.fibers.train.runloop import RunLog, lr_at, prepare_run_dir, update_ema, training_rng_state, resume_training
+from vesuvius.neural_tracing.tracers.shared.system import raise_open_file_limit
+from vesuvius.neural_tracing.tracers.shared.tensors import fixed_rows, move_batch
 from vesuvius.neural_tracing.tracers.models.checkpoint import initialize_model_weights, read_checkpoint, write_checkpoint
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume
 from vesuvius.neural_tracing.tracers.models.model import config_from_checkpoint
@@ -84,23 +86,6 @@ def prepare_training(model, batch_size=2, *, backend=None):
     model.training_forward = torch.compile(model.training_forward, **options)
     model.training_loss = torch.compile(loss_terms, **options)
     return model
-
-
-def fixed_rows(value, size):
-    """Pad with finite copies; the caller discards the extra output rows."""
-    if not 0 < len(value) <= size:
-        raise ValueError(f'Expected 1..{size} rows, got {len(value)}')
-    if len(value) < size:
-        value = torch.cat((value, value[:1].expand(size-len(value), *value.shape[1:])))
-    stride = 1
-    canonical = []
-    for extent in reversed(value.shape):
-        canonical.append(stride)
-        stride *= max(1, extent)
-    if value.stride() == tuple(reversed(canonical)):
-        return value
-    # Singleton dimensions can otherwise retain the stride of an indexed view.
-    return torch.empty_like(value, memory_format=torch.contiguous_format).copy_(value)
 
 
 def training_inputs(x, hist, hmask, size):
@@ -174,12 +159,6 @@ def initialize_training_optimizer(model, ema, args, resume=None):
 
 
 GRAD_CLIP = 60.
-
-
-def move_batch(batch, device):
-    # Pinned loader batches copy asynchronously; the compute stream orders later use.
-    return {k: move_batch(v, device) if isinstance(v, dict) else v.to(device, non_blocking=True)
-            for k, v in batch.items() if not k.startswith('_')}
 
 
 class DecisionBatchPrefetch:
