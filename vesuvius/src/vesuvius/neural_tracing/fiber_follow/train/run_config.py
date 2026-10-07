@@ -165,7 +165,7 @@ def resolve(document, base='.'):
 
     runtime = retire('runtime', dict(document.get('runtime') or {}))
     unknown('runtime', runtime, RUNTIME)
-    run['runtime'] = dict(RUNTIME, **RUNTIME_DEFAULTS[model_type], **runtime)
+    run['runtime'] = {**RUNTIME, **RUNTIME_DEFAULTS[model_type], **runtime}
     validate(run)
     return run
 
