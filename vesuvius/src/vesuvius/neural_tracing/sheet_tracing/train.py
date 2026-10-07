@@ -1,0 +1,452 @@
+"""Train the sheet tracer on rollouts over verified patches.
+
+Each iteration seeds a front from GT rows (with noise), rolls it out ``data.steps`` steps with the model's own
+predictions (noise between steps; in snapped episodes front_points beyond ``train.reset_distance`` are snapped back
+onto the sheet, free episodes drift; some episodes push a run of front_points towards a neighbouring sheet), and
+averages the per-step losses. The run directory ``output/NAME`` holds config.json, log.jsonl, last.pt,
+best.pt (highest validation score = coverage - kept_off), periodic diagnostics (val_XXXXXX/), and a final long-rollout eval.
+
+Usage:
+  python -m vesuvius.neural_tracing.sheet_tracing.train --config tiny.json --name tiny_v1
+  python -m vesuvius.neural_tracing.sheet_tracing.train --config tiny.json --name tiny_noattn --set model.attention=false
+  python -m vesuvius.neural_tracing.sheet_tracing.train --resume output/tiny_v1/last.pt
+"""
+from __future__ import annotations
+
+import argparse
+import copy
+import json
+import math
+import multiprocessing
+import queue
+import signal
+import sys
+import threading
+import time
+
+import numpy as np
+import torch
+from tqdm import tqdm
+
+from vesuvius.neural_tracing.fiber_follow.train.runloop import raise_open_file_limit
+from vesuvius.neural_tracing.sheet_tracing import config as C
+from vesuvius.neural_tracing.sheet_tracing import evaluate as E
+from vesuvius.neural_tracing.sheet_tracing.data.episodes import (
+    FIBER_KEYS, EpisodeSampler, EpisodeStream, MixedFrontStream, collate, episode_pad, fixed_episodes, keep_batch)
+from vesuvius.neural_tracing.sheet_tracing.data.patches import build_index
+from vesuvius.neural_tracing.sheet_tracing.live import LiveChains
+from vesuvius.neural_tracing.sheet_tracing.losses import step_losses
+from vesuvius.neural_tracing.sheet_tracing.model import build_model, compile_model, init_model_state, load_model_state
+from vesuvius.neural_tracing.sheet_tracing.rollout import Tracer
+from vesuvius.neural_tracing.sheet_tracing.seeding import perturb, seed_rows, sheet_jump
+from vesuvius.neural_tracing.sheet_tracing.visualize import episode_figure, metric_figure, training_figure
+
+
+def learning_rate(it: int, tc, minutes: float = 0.) -> float:
+    """Linear warmup, then cosine decay to zero at whichever comes first: ``iterations`` or ``max_minutes`` of
+    training (``minutes`` so far, including resumed time), so a time-budgeted run anneals fully."""
+    if it < tc.warmup:
+        return tc.lr*(it+1)/tc.warmup
+    progress = (it-tc.warmup)/max(1, tc.iterations-tc.warmup)
+    if tc.max_minutes:
+        progress = max(progress, minutes/tc.max_minutes)
+    return tc.lr*.5*(1+math.cos(math.pi*min(1., progress)))
+
+
+def train_rollout(tracer: Tracer, b: dict, cfg, spec, generator, front=None):
+    """Loss averaged over the rollout steps, per-step stats averaged likewise, the final front, and the point
+    confidences (B, N) of every step. ``front``: continue these fronts (live chains) instead of seeding from GT.
+    With ``train.backward_per_step`` each step's loss is backpropagated right away and the returned loss is
+    detached (gradients are already accumulated).
+
+    A ``free_fraction`` of episodes are never snapped back; in ``jump_probability`` of episodes a run of front_points
+    is pushed onto a neighbouring sheet before one random step (not the last). With ``train.history_rows`` (``cfg``
+    then has that many more ``data.history`` rows), the front first traces 0..history_rows GT rows up to the seed
+    without loss, put back on GT after each step, to fill the grid memory.
+    """
+    tc = cfg.train
+    B, steps, device = b['gt'].shape[0], cfg.data.steps, b['gt'].device
+    if front is None:
+        seeds = seed_rows(b['gt'], b['valid'], cfg, spec, generator, noise=True)
+        if 'seed_mask' in b:  # fiber-seeded episodes start from their own seed rows
+            seeds = torch.where(b['seed_mask'][:, None, None, None], b['seed'].to(seeds.dtype), seeds)
+        warm = int(torch.randint(0, tc.history_rows+1, (1,), device=device, generator=generator)) if tc.history_rows else 0
+        H = seeds.shape[1]
+        front = tracer.initial(seeds[:, :H-warm])
+        with torch.no_grad():
+            for j in range(warm):
+                out = tracer.step(front, b['block'], b['origin'], b['extras'])
+                front = tracer.teacher_forced(tracer.advance(front, out), seeds[:, H-warm+j])
+    snap = torch.rand(B, device=device, generator=generator) >= tc.free_fraction
+    jump = torch.rand(B, device=device, generator=generator) < tc.jump_probability
+    jump_at = torch.randint(0, max(1, steps-1), (B,), device=device, generator=generator)
+    total, stats, resets, jumped, confs = 0., {}, 0., 0., []
+    fibers = {k: b[k] for k in FIBER_KEYS if k in b} or None  # fiber-started episodes: the fibers around them
+    for t in range(steps):
+        if tc.jump_probability > 0:
+            pos, run = sheet_jump(front.pos, b['gt'], b['valid'], cfg, jump & (jump_at == t), generator,
+                                  b['block'], b['origin'])
+            tracer.move(front, pos)
+            jumped += run.float().mean()
+        out = tracer.step(front, b['block'], b['origin'], b['extras'], fibers)
+        loss, st = step_losses(out, front, b['gt'], b['valid'], cfg)
+        confs.append(torch.sigmoid(out.conf_logit.detach()))
+        if tc.backward_per_step:
+            (loss/steps).backward()
+            loss = loss.detach()
+        total = total+loss/steps
+        for k, v in st.items():
+            stats[k] = stats.get(k, 0.)+v/steps
+        front = tracer.advance(front, out, detach=tc.detach_steps)
+        pos, far = perturb(front.pos, b['gt'], b['valid'], cfg, snap, generator)
+        tracer.move(front, pos)
+        resets += far.float().mean()/steps
+    stats['reset'] = resets
+    stats['jumped'] = torch.as_tensor(jumped)
+    return total, stats, front, confs
+
+
+def _pinned(batch: dict) -> dict:
+    """The batch with its tensors pinned (packed blocks: their data; shapes stay on the host as they are)."""
+    pin = lambda x: x.pin_memory() if isinstance(x, torch.Tensor) else x
+    block = lambda p: dict(p, data=pin(p['data']))
+    return dict({k: pin(v) for k, v in batch.items() if k not in ('block', 'extras')}, block=block(batch['block']),
+                extras=[dict(e, block=block(e['block']), origin=pin(e['origin'])) for e in batch.get('extras', [])])
+
+
+def device_batches(batches, device, pinned_ahead: int = 2, timings: dict | None = None, pad_blocks: bool = True):
+    """``evaluate.to_device`` of each batch, the next batch's copy (and its block's conversion to float) already
+    running on a side stream while the current one is in use, so the host-to-device copy overlaps compute.
+
+    A background thread pins the batches (at most ``pinned_ahead`` waiting). Load the batches unpinned: a
+    DataLoader's own pin thread pins every prefetched batch (prefetch_factor * workers of them, gigabytes each at
+    level 0) and spends its time allocating page-locked memory instead of reusing it. ``timings`` (a dict) collects
+    the background thread's seconds waiting for the loader (``loader``) and pinning (``pin``)."""
+    if device.type != 'cuda':
+        yield from (E.to_device(b, device, pad_blocks) for b in batches)
+        return
+    side, main = torch.cuda.Stream(device), torch.cuda.current_stream(device)
+    ready_batches = queue.Queue(pinned_ahead)
+
+    def produce():
+        clock = time.perf_counter
+        try:
+            batches_iter, t0 = iter(batches), clock()
+            for b in batches_iter:
+                t1 = clock()
+                pinned = _pinned(b)
+                if timings is not None:
+                    timings['loader'] = timings.get('loader', 0.)+t1-t0
+                    timings['pin'] = timings.get('pin', 0.)+clock()-t1
+                ready_batches.put(pinned)
+                t0 = clock()
+            ready_batches.put(None)
+        except BaseException as e:  # hand loader errors to the consumer
+            ready_batches.put(e)
+
+    threading.Thread(target=produce, daemon=True).start()
+
+    def load():
+        b = ready_batches.get()
+        if isinstance(b, BaseException):
+            raise b
+        if b is None:
+            return None
+        with torch.cuda.stream(side):
+            return E.to_device(b, device, pad_blocks), side.record_event()
+
+    pending = load()
+    while pending is not None:
+        b, ready = pending
+        pending = load()
+        main.wait_event(ready)
+        blocks = [b['block']]+[e['block'] for e in b['extras']]
+        blocks = [x for block in blocks for x in (block if isinstance(block, list) else [block])]
+        seeds = [b[k] for k in ('seed', 'seed_mask')+FIBER_KEYS if k in b]
+        for x in [b['gt'], b['valid'], b['origin']]+blocks+[e['origin'] for e in b['extras']]+seeds:
+            x.record_stream(main)  # used on the main stream: not reusable before that work is done
+        yield b
+
+
+def front_variants(train_cfg, index, pad: float) -> dict:
+    """``data.front_points_range``: batch kind -> (training config, its episode sampler, batch size, share of
+    batches). Kinds are the point counts N (an N-point front), plus ``'follow'`` with ``data.follow_fraction``: a
+    3-point front following a fiber (``data.fiber_follow``, model mode 1). The batch holds about
+    ``train.points_per_batch`` points; the block bound ``data.roi`` grows with the front so long fronts still fit."""
+    d, tc = train_cfg.data, train_cfg.train
+    per_batch = tc.points_per_batch or tc.batch*d.front_points
+    counts = range(int(d.front_points_range[0]), int(d.front_points_range[1])+1)
+    kinds = [(n, n, False) for n in counts]+([('follow', 3, True)] if d.follow_fraction else [])
+    out = {}
+    for kind, n, follow in kinds:
+        cfg = copy.deepcopy(train_cfg)
+        cfg.data.front_points, cfg.data.fiber_follow = n, follow
+        if follow:
+            cfg.data.fiber_fraction = 0.
+        unit = 64 << d.volume_level
+        cfg.data.roi = max(d.roi, -(-int((n-1)*d.point_spacing+2*pad+2*d.gt_margin)//unit)*unit)
+        sampler = EpisodeSampler(cfg.data, index, 'train', d.steps, cfg.data.roi, pad)
+        share = d.follow_fraction if follow else (1-d.follow_fraction)/len(counts)
+        out[kind] = (cfg, sampler, max(1, round(per_batch/n)), share)
+        print(f'{kind}: {n} front points, batch {out[kind][2]}, {share:.0%} of batches, {len(sampler.index)} usable '
+              f'patches, {len(sampler.fiber_runs)} fiber runs, roi {cfg.data.roi}', flush=True)
+    return out
+
+
+def optimize_step(tracer: Tracer, opt, ema, b: dict, cfg, spec, generator, front=None):
+    """One training iteration on batch ``b``: rollout, backward, gradient clipping, optimizer and EMA update.
+    Returns ``train_rollout``'s loss, stats (plus the gradient norm ``grad``), final front and confidences."""
+    model, tc = tracer.model, cfg.train
+    opt.zero_grad(set_to_none=True)
+    loss, stats, front, confs = train_rollout(tracer, b, cfg, spec, generator, front)
+    if not tc.backward_per_step:
+        loss.backward()
+    stats['grad'] = torch.nn.utils.clip_grad_norm_(model.parameters(), tc.grad_clip)
+    opt.step()
+    if ema:
+        ema.update(model)
+    return loss, stats, front, confs
+
+
+class EMA:
+    """Exponential moving average of a model's weights (``train.ema``)."""
+
+    def __init__(self, model, decay: float, updates: int = 0):
+        self.model = copy.deepcopy(model).eval().requires_grad_(False)
+        self.decay, self.updates = decay, updates
+
+    @torch.no_grad()
+    def update(self, model) -> None:
+        self.updates += 1
+        decay = min(self.decay, (1+self.updates)/(10+self.updates))
+        torch._foreach_lerp_(list(self.model.parameters()), list(model.parameters()), 1-decay)
+
+
+def save(path, model, opt, cfg, it, best, minutes=0., ema: EMA | None = None):
+    tmp = path.with_suffix('.partial')
+    extra = dict(ema=ema.model.state_dict(), ema_updates=ema.updates) if ema else {}
+    torch.save(dict(model=model.state_dict(), opt=opt.state_dict(), config=cfg.to_dict(), iteration=it, best=best,
+                    minutes=minutes, **extra), tmp)
+    tmp.replace(path)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--config', help='JSON config (path, or a name under configs/)')
+    ap.add_argument('--name')
+    ap.add_argument('--set', action='append', default=[], metavar='SECTION.FIELD=VALUE')
+    ap.add_argument('--resume', help='checkpoint to resume (uses its config; --set still applies)')
+    ap.add_argument('--init', help='start from these model weights (architecture must match the config); fresh '
+                                   'optimizer, schedule and iteration count, unlike --resume')
+    args = ap.parse_args(argv)
+    sys.stdout.reconfigure(line_buffering=True)  # validation lines reach a redirected log as they happen
+
+    checkpoint = None
+    if args.resume:
+        checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
+        document = checkpoint['config']
+        for text in args.set:
+            section, name, value = C.parse_override(text)
+            document[section][name] = value
+        cfg = C.from_dict(document)
+    else:
+        overrides = list(args.set)+([f'train.name={args.name}'] if args.name else [])
+        cfg = C.load(args.config, overrides)
+    tc, d = cfg.train, cfg.data
+    run = cfg.run_dir
+    run.mkdir(parents=True, exist_ok=True)
+    (run/'config.json').write_text(json.dumps(cfg.to_dict(), indent=2))
+    raise_open_file_limit()
+    # Loader workers are forkserver children, not ours: exit through Python on SIGTERM so the DataLoader
+    # shuts them down instead of leaving them running.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+    torch.manual_seed(tc.seed)
+    if tc.compile_geometry:
+        from vesuvius.neural_tracing.sheet_tracing.geometry import use_compiled_projection
+        use_compiled_projection()
+    device = torch.device(tc.device)
+
+    index = build_index(d.patches_dir, C.OUTPUT/'cache')
+    pad = episode_pad(cfg.model, tc)
+    train_cfg = cfg  # training episodes start history_rows further back (memory warm-up); validation's do not
+    if tc.history_rows:
+        train_cfg = copy.deepcopy(cfg)
+        train_cfg.data.history += tc.history_rows
+    train_sampler = EpisodeSampler(train_cfg.data, index, 'train', d.steps, d.roi, pad)
+    val_sampler = EpisodeSampler(d, index, 'val', d.steps, d.roi, pad)
+    train_spec, spec = train_sampler.spec, val_sampler.spec
+    print(f'{len(train_sampler.index)} usable patches; GT grid {train_spec.Gu}x{train_spec.Gv}; '
+          f'block {train_sampler.block_size}^3 at level {d.volume_level}', flush=True)
+    t0 = time.time()
+    val_set = fixed_episodes(val_sampler, tc.val_episodes, tc.seed)
+    print(f'{len(val_set)} validation episodes in {time.time()-t0:.1f} s', flush=True)
+    jobs = None
+    if tc.live_chains:  # the workers serve live-chain continuations as whole batches
+        jobs = multiprocessing.Queue(64)
+        jobs.cancel_join_thread()  # never block exit on unread jobs
+    variants = front_variants(train_cfg, index, pad) if d.front_points_range else None
+    seed = tc.seed+(checkpoint['iteration'] if checkpoint else 0)
+    if variants:
+        stream = MixedFrontStream({k: v[1] for k, v in variants.items()}, {k: v[2] for k, v in variants.items()}, seed,
+                                  {k: v[3] for k, v in variants.items()})
+    else:
+        stream = EpisodeStream(train_sampler, seed, batch=tc.batch if jobs else 0, jobs=jobs)
+    batched = jobs is not None or variants is not None  # the stream yields whole batches
+    loader = torch.utils.data.DataLoader(
+        stream, batch_size=None if batched else tc.batch, num_workers=tc.workers,
+        collate_fn=keep_batch if batched else collate,
+        pin_memory=device.type == 'cuda' and jobs is not None,  # otherwise device_batches pins
+        persistent_workers=tc.workers > 0, prefetch_factor=tc.prefetch if tc.workers else None)
+
+    model = build_model(cfg).to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=tc.lr, weight_decay=tc.weight_decay)
+    start, best = 0, -1.
+    if args.init and not checkpoint:
+        saved = torch.load(args.init, map_location='cpu', weights_only=False)
+        init_model_state(model, saved.get('ema') or saved['model'])  # the averaged weights, when the run had them
+        print(f"initialised weights from {args.init}{' (EMA)' if saved.get('ema') else ''}", flush=True)
+    if checkpoint:
+        load_model_state(model, checkpoint['model'])
+        opt.load_state_dict(checkpoint['opt'])
+        start, best = checkpoint['iteration'], checkpoint['best']
+    print(f'model parameters: {sum(p.numel() for p in model.parameters())/1e6:.3f} M', flush=True)
+    ema = None
+    if tc.ema:
+        ema = EMA(model, tc.ema)
+        if checkpoint and checkpoint.get('ema'):
+            load_model_state(ema.model, checkpoint['ema'])
+            ema.updates = checkpoint.get('ema_updates', 0)
+    if tc.compile_model:
+        for net in (model, ema.model) if ema else (model,):
+            compile_model(net)
+    tracer = Tracer(model, cfg, device)
+    tracers = {n: Tracer(model, v[0], device) for n, v in variants.items()} if variants else {}
+    eval_tracer = Tracer(ema.model, cfg, device) if ema else tracer  # validation uses the averaged weights
+    generator = torch.Generator(device=device)
+    generator.manual_seed(tc.seed+start)
+    chains = LiveChains(train_cfg, train_spec, tracer, jobs, generator) if jobs else None
+
+    log_path = run/'log.jsonl'
+    log_rows = [json.loads(line) for line in log_path.read_text().splitlines()] if checkpoint and log_path.exists() else []
+    if not checkpoint:
+        log_path.write_text('')
+
+    def write(row):
+        # Reopen per row: tools that swap files under output/ (git stash/restore, sync) must not swallow the log.
+        log_rows.append(row)
+        with log_path.open('a') as fh:
+            fh.write(json.dumps(row)+'\n')
+
+    def validate(it):
+        viz = bool(tc.viz_every and it % tc.viz_every == 0)
+        per_step, records = E.rollout_metrics(eval_tracer, val_set, cfg, spec, d.steps, device, tc.batch,
+                                              records=4 if viz else 0,
+                                              surfaces=run/f'val_{it:06d}'/'tifxyz' if viz else None,
+                                              surface_count=8)
+        summary = E.summarize(per_step)
+        write(dict(kind='val', iteration=it, **summary))
+        if records:
+            out = run/f'val_{it:06d}'
+            out.mkdir(exist_ok=True)
+            for i, record in enumerate(records):
+                episode_figure(record, cfg, out/f'episode_{i:02d}.png')
+            metric_figure({'val': per_step}, cfg, out/'metrics.png')
+            training_figure(log_rows, run/'training.png')
+        return summary
+
+    started, data_time, it = time.time(), 0., start
+    resumed_minutes = float(checkpoint.get('minutes', 0.)) if checkpoint else 0.
+    minutes = lambda: resumed_minutes+(time.time()-started)/60
+    window = {}
+    bar = tqdm(range(start, tc.iterations), initial=start, total=tc.iterations, dynamic_ncols=True)
+    # Live chains decide what the loader serves from finished rollouts, so their batches are not fetched ahead.
+    batches = ((E.to_device(b, device) for b in loader) if chains else
+               device_batches(loader, device, pad_blocks=not d.unpadded_blocks))
+    for it in bar:
+        t_data = time.time()
+        while True:  # with live chains, skip continuations whose chains were dropped
+            b = next(batches)
+            b, chain = chains.begin(b, it) if chains else (b, None)
+            if chains is None or chain is not None:
+                break
+        data_time += time.time()-t_data
+        for group in opt.param_groups:
+            group['lr'] = learning_rate(it, tc, minutes())
+        if variants:  # this batch's kind: front size, or fiber following
+            kind = b['front_points']
+            vcfg = variants[kind][0]
+            loss, stats, front, confs = optimize_step(tracers[kind], opt, ema, b, vcfg, variants[kind][1].spec,
+                                                      generator)
+            stats['front_points'] = torch.tensor(float(vcfg.data.front_points))
+            stats['follow'] = torch.tensor(float(vcfg.data.fiber_follow))
+        else:
+            loss, stats, front, confs = optimize_step(tracer, opt, ema, b, train_cfg, train_spec, generator,
+                                                      chain['front'] if chain else None)
+        if chains:
+            chains.finish(b, chain, front, confs, it)
+            stats.update(chains.stats)
+        for k, v in stats.items():
+            window.setdefault(k, []).append(v)
+        done = it+1
+        if done % tc.log_every == 0:
+            row = {k: float(torch.stack([torch.as_tensor(x) for x in v]).float().mean()) for k, v in window.items()}
+            elapsed = time.time()-started
+            row.update(kind='train', iteration=done, lr=learning_rate(it, tc, minutes()), minutes=minutes(),
+                       episodes_per_s=(done-start)*tc.batch/elapsed, data_fraction=data_time/elapsed)
+            write(row)
+            window = {}
+            bar.set_postfix_str(f"loss {row['loss']:.3f} dist {row['dist']:.2f} same {row['same_sheet']:.2f} "
+                                f"conf {row['confident']:.2f} prec {row['conf_precision']:.2f} "
+                                f"caught {row['off_caught']:.2f} "
+                                f"{row['episodes_per_s']:.0f} ep/s data {row['data_fraction']:.0%}")
+        if done % tc.val_every == 0 or done == tc.iterations:
+            summary = validate(done)
+            tqdm.write(f"[{done}] val score {summary['score_mean']:.3f} coverage {summary['coverage_mean']:.3f} "
+                       f"kept_off {summary['kept_off_mean']:.3f} caught {summary['caught_mean']:.3f} "
+                       f"same_sheet {summary['same_sheet_mean']:.3f} "
+                       f"precision {summary['precision_mean']:.3f} rejoined {summary['rejoined_mean']:.3f} "
+                       f"dist p90 {summary['dist_p90_mean']:.2f}")
+            if summary['score_mean'] > best:
+                best = summary['score_mean']
+                save(run/'best.pt', model, opt, cfg, done, best, minutes(), ema)
+        if done % tc.ckpt_every == 0:
+            save(run/'last.pt', model, opt, cfg, done, best, minutes(), ema)
+        if tc.keep_every and done % tc.keep_every == 0:
+            save(run/f'ckpt_{done:06d}.pt', model, opt, cfg, done, best, minutes(), ema)
+        if tc.max_minutes and minutes() > tc.max_minutes:
+            tqdm.write(f'time budget reached at iteration {done}')
+            if done % tc.val_every:
+                summary = validate(done)
+                if summary['score_mean'] > best:
+                    best = summary['score_mean']
+                    save(run/'best.pt', model, opt, cfg, done, best, minutes(), ema)
+            break
+    save(run/'last.pt', model, opt, cfg, it+1, best, minutes(), ema)
+    training_figure(log_rows, run/'training.png')
+    del batches, loader  # stop the loader workers before evaluating
+    if cfg.eval.after_training:
+        final_eval(cfg, run, device)
+
+
+def final_eval(cfg, run, device):
+    """Short free rollouts on held-out episodes: best model and the straight-advance baseline, same episodes."""
+    from vesuvius.neural_tracing.sheet_tracing.model import StraightAdvance
+    e = cfg.eval
+    t0 = time.time()
+    episodes = E.eval_episodes(cfg, e.steps, e.roi, e.episodes)
+    best_model, _, _ = E.load_checkpoint(run/'best.pt', device)
+    reports = {}
+    for tag, net in (('eval', best_model), ('baseline_straight', StraightAdvance().to(device))):
+        reports[tag] = E.run(Tracer(net, cfg, device), cfg, run/'eval', e.steps, e.roi, e.episodes,
+                             records=4 if tag == 'eval' else 0, tag=tag, episodes=episodes)
+    metric_figure({k: {m: np.array(v) for m, v in r['per_step'].items()} for k, r in reports.items()}, cfg,
+                  run/'eval'/'compare.png')
+    for tag, r in reports.items():
+        s = r['summary']
+        print(f"{tag}: coverage {s['coverage_mean']:.3f} (last {s['coverage_last']:.3f}) same_sheet "
+              f"{s['same_sheet_mean']:.3f} precision {s['precision_mean']:.3f} caught {s['caught_mean']:.3f} "
+              f"rejoined {s['rejoined_mean']:.3f}", flush=True)
+    print(f'final eval: {e.episodes} episodes x {e.steps} steps in {time.time()-t0:.0f} s', flush=True)
+
+if __name__ == '__main__':
+    main()

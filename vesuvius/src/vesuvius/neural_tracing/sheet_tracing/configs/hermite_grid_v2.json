@@ -1,0 +1,7 @@
+{
+  "data": {"volume_level": 1, "front_points": 5, "point_spacing": 60.0, "step": 20.0, "steps": 12, "roi": 512, "patches_dir": ["/home/sean/Desktop/spiral_dataset/verified_patches", "/home/sean/Desktop/spiral_dataset_working/verified_patches"]},
+  "model": {"crop": [16, 32, 20], "crop_spacing": 2.0, "channels": [24, 48, 64], "strides": [1, 2, 2], "dim": 128, "layers": 3, "heads": 4, "memory_rows": 3, "surface_tokens": true, "token_crop": [8, 8, 8], "token_spacing": 2.0, "token_channels": [16, 32, 48], "token_strides": [1, 2, 2], "grid_layers": 3},
+  "trace": {"curve": "hermite", "spline_samples": 6},
+  "train": {"name": "hermite_grid_v2", "iterations": 200000, "batch": 32, "workers": 6, "lr": 0.0015, "val_every": 2000, "viz_every": 2000, "max_minutes": 300, "ckpt_every": 1000, "val_episodes": 64, "prefetch": 2, "warmup": 500, "keep_every": 5000},
+  "eval": {"episodes": 32, "steps": 10, "roi": 512}
+}

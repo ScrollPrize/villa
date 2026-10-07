@@ -1,0 +1,8 @@
+{
+  "data": {"volume_level": 1, "front_points": 12, "point_spacing": 20.0, "step": 20.0, "steps": 6, "roi": 384},
+  "model": {"crop": [16, 12, 20], "crop_spacing": 2.0, "channels": [16, 32, 48], "strides": [2, 2, 1], "dim": 96, "layers": 2,
+            "heads": 4, "memory_rows": 3},
+  "train": {"name": "tiny", "iterations": 3000, "batch": 32, "workers": 6, "lr": 0.002, "val_every": 500,
+            "viz_every": 500, "max_minutes": 15},
+  "eval": {"episodes": 32, "steps": 10, "roi": 512}
+}

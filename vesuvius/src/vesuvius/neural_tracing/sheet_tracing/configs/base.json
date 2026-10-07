@@ -1,0 +1,8 @@
+{
+  "data": {"volume_level": 0, "front_points": 24, "point_spacing": 15.0, "step": 15.0, "steps": 10, "roi": 512},
+  "model": {"crop": [32, 24, 32], "crop_spacing": 1.0, "crop_forward": 8.0, "channels": [24, 48, 96, 128], "strides": [1, 2, 2, 2],
+            "dim": 192, "layers": 4, "heads": 6, "memory_rows": 6},
+  "train": {"name": "base", "iterations": 60000, "batch": 24, "workers": 8, "lr": 0.001, "warmup": 1000,
+            "val_every": 2000, "viz_every": 2000, "ckpt_every": 2000, "val_episodes": 256},
+  "eval": {"episodes": 512, "steps": 30, "roi": 1024}
+}

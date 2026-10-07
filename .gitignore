@@ -71,3 +71,4 @@ volume-cartographer/AGENTS.md
 /spiral-fitting/.claude
 /vesuvius/src/vesuvius/neural_tracing/tracers/fibers/datasets/automated_fiber_volumes
 /vesuvius/src/vesuvius/neural_tracing/tracers/fibers/plans
+/vesuvius/src/vesuvius/neural_tracing/sheet_tracing/output
