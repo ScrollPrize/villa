@@ -36,7 +36,7 @@ from vesuvius.neural_tracing.tracers.sheets.losses import front_metrics, gap_mas
 from vesuvius.neural_tracing.tracers.sheets.checkpoint import load_checkpoint
 from vesuvius.neural_tracing.tracers.sheets.tracing.inference import connected_keep, write_surface
 from vesuvius.neural_tracing.tracers.sheets.tracing.rollout import Tracer
-from vesuvius.neural_tracing.tracers.sheets.sampling import sample_plane
+from vesuvius.neural_tracing.tracers.shared.crop_sampling.gpu import sample_plane
 from vesuvius.neural_tracing.tracers.sheets.tracing.seeding import seed_rows
 
 

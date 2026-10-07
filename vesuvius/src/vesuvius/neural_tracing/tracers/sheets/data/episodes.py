@@ -472,7 +472,7 @@ def pack_blocks(blocks: list[np.ndarray]) -> dict:
 def unpack_blocks(packed: dict, device, dtype=torch.float32, pad: bool = True):
     """(B, channels, D, H, W) ``dtype`` on ``device`` from ``pack_blocks``: blocks zero-padded at the far end (each keeps
     its own origin, so sampling coordinates are unchanged; padding reads as outside the volume). ``pad=False``: a list
-    of the B blocks at their own sizes instead (``data.unpadded_blocks``; ``sampling.sample_block`` reads either)."""
+    of the B blocks at their own sizes instead (``data.unpadded_blocks``; ``shared.crop_sampling.gpu.sample_block`` reads either)."""
     shapes = packed['shapes'].tolist()
     data = packed['data'].to(device, non_blocking=True)
     if not pad:

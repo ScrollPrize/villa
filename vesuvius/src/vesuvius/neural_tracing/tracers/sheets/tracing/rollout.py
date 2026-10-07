@@ -166,7 +166,7 @@ class Tracer:
         return dict(feat=torch.where(pad[..., None], torch.zeros_like(feat), feat), pad=pad)
 
     def step(self, front: Front, block, origin: torch.Tensor, fibers=None) -> StepOutput:
-        """``block``: the episodes' CT blocks (``sampling.sample_block``) with their level-voxel origins (B, 3).
+        """``block``: the episodes' CT blocks (``shared.crop_sampling.gpu.sample_block``) with their level-voxel origins (B, 3).
         ``fibers``: the batch's ``fiber_*`` tensors (fiber-started episodes), for ``model.fiber_tokens``."""
         frames = point_frames(front.pos, front.prev)
         crops = sample_crops(block, origin, self.level, front.pos, frames, self.offsets)

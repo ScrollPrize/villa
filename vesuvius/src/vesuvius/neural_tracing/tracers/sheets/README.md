@@ -196,7 +196,7 @@ is a tifxyz (rows are steps, columns are the Hermite curve samples, masked point
 | `data/episodes.py` | episode rejection sampling (patch, fiber-seeded, fiber-following), spatial split, loader streams |
 | `data/fibers.py` | memory-mapped fiber pool and the fibers around an episode |
 | `geometry.py` | GT grid evaluation and projection, Hermite curves, carrying low-confidence points, respacing, frames |
-| `sampling.py` | oriented GPU crops from a volume block |
+| `sampling.py` | sheet crops as `CropSpec`s, sampled by the shared GPU sampler (`shared/crop_sampling/gpu.py`) |
 | `model.py` | crop encoders, joint transformer (shared `models.blocks.SelfAttentionLayer`) over point, grid and fiber tokens, head |
 | `tracing/rollout.py` | one tracing step and front update (shared by train/eval/infer) |
 | `train/live.py` | live chains |
