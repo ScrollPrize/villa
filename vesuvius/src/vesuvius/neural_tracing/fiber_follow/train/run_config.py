@@ -42,7 +42,7 @@ TRAINING = dict(
     # Task budget (data/data.py TASKS); a given dict replaces the whole default, absent tasks get 0.
     task_shares=dict(fresh=.30, live=.45, dagger_pre_excursion=.06, dagger_recoverable=.08, dagger_terminal=.08,
                      dagger_premature_stop=.03, dagger_ordinary=0., synthetic_terminal=0.),
-    terminal_fallback_cap=.5, replay_max_age=12000, replay_event_cap=64,
+    terminal_fallback_cap=.5, replay_max_age=3000, replay_event_cap=64,
     # Simulated traces and labels.
     startup_shares=[.15, .17, .17, .51], excursion_probability=.2, excursion_amplitude=[3., 6.],
     excursion_rise=[16., 128.], synthetic_tail=[4., 16.], live_continuation_steps=[32, 256],

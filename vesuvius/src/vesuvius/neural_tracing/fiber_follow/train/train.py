@@ -628,7 +628,8 @@ def main(argv=None):
     if done >= args.steps:
         raise ValueError('Run has already reached its requested update count')
     replay_index = out/'dagger'/'replay.json'
-    replay_paths = json.loads(replay_index.read_text()) if resume and replay_index.exists() else []
+    from vesuvius.neural_tracing.fiber_follow.data.data import own_replay_paths
+    replay_paths = own_replay_paths(json.loads(replay_index.read_text()), out/'dagger') if resume and replay_index.exists() else []
     progress('Loading replay banks and preparing data loader')
     caches = usable_replay(load_replay(replay_paths), train_f, cfg.n_history, spec.grid_scale)
     collection = dict(every=args.dagger_every, fibers_per_collection=args.dagger_fibers, batch=args.dagger_batch,
@@ -674,8 +675,12 @@ def main(argv=None):
     progress('Task budget per source: '+', '.join(f'{k} {v:.0%}' for k, v in budget.to_dict()['shares'].items())
              +f'; replay age ceiling {budget.replay_max_age}, event cap {budget.replay_event_cap}, '
              f'synthetic terminal fallback cap {budget.terminal_fallback_cap:.0%}')
-    for source_dataset in dataset.datasets:
+    saved_draws = (resume or {}).get('replay_event_draws') or {}
+    for name, source_dataset in zip(dataset.names, dataset.datasets):
         source_dataset.set_step(done)
+        if name in saved_draws:  # replay event caps continue where the checkpoint left them
+            source_dataset.restore_event_draws(saved_draws[name])
+            progress(f'{name}: restored replay draw counts for {len(saved_draws[name]["slots"])} events')
         if cfg.model_type == 'sequence':
             from vesuvius.neural_tracing.fiber_follow.data.data import EpisodeSpec
             source_dataset.episodes = EpisodeSpec(steps=args.episode_steps, supervised=args.episode_supervised,
@@ -836,7 +841,8 @@ def main(argv=None):
                     dataset_config=dataset_document, dataset_provenance=dataset_provenance,
                     ct_normalization=ct_normalization, frame_policy=configured_frame_policy(cfg),
                     samples_seen=prior_samples+observed_states, identity_sampling=asdict(identity_sampling),
-                    run_config=run, training_options=vars(args), fiber_manifest=fiber_manifest(fibers))
+                    run_config=run, training_options=vars(args), fiber_manifest=fiber_manifest(fibers),
+                    replay_event_draws={name: d.event_draw_state() for name, d in zip(dataset.names, dataset.datasets)})
                 if resumable:
                     extra.update(optimizer=opt.state_dict(), rng=training_rng_state())
                 save_checkpoint(path, model, ema, spec, sample, extra)

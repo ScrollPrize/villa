@@ -6,6 +6,7 @@ import glob
 import hashlib
 import math
 import os
+from pathlib import Path
 from collections import deque
 from dataclasses import dataclass, field
 
@@ -647,7 +648,7 @@ class TaskBudget:
     """
     shares: tuple = tuple(DEFAULT_TASK_SHARES[name] for name in TASKS)
     terminal_fallback_cap: float = .5
-    replay_max_age: int = 12000
+    replay_max_age: int = 3000
     replay_event_cap: int = 64
 
     def __post_init__(self):
@@ -795,8 +796,8 @@ class FollowDataset(torch.utils.data.IterableDataset):
     def eligible_caches(self):
         step = int(self.step.value)
         if self._eligible[0] != step:
-            self._eligible = (step, frozenset(i for i, op in enumerate(self.onpolicy)
-                                              if step-int(op.provenance['step']) <= self.budget.replay_max_age))
+            self._eligible = (step, frozenset(i for i, op in enumerate(self.onpolicy)  # never from a later step
+                                              if 0 <= step-int(op.provenance['step']) <= self.budget.replay_max_age))
         return self._eligible[1]
 
     def claim(self, key):
@@ -810,6 +811,19 @@ class FollowDataset(torch.utils.data.IterableDataset):
 
     def max_event_reuse(self):
         return int(max(self.event_draws[:])) if len(self.event_draws) else 0
+
+    def event_draw_state(self):
+        """Replay draw counts per event slot (sparse), saved in checkpoints so a resumed run keeps its caps."""
+        with self.event_draws.get_lock():
+            counts = np.frombuffer(self.event_draws.get_obj(), dtype=np.int32).copy()
+        slots = np.flatnonzero(counts)
+        return dict(slots=slots.astype(np.int64), counts=counts[slots])
+
+    def restore_event_draws(self, state):
+        with self.event_draws.get_lock():
+            counts = np.frombuffer(self.event_draws.get_obj(), dtype=np.int32)
+            counts[:] = 0
+            counts[np.asarray(state['slots'], dtype=np.int64)] = np.asarray(state['counts'], dtype=np.int32)
 
     def refresh_replay(self):
         if self.replay_index is None or not os.path.exists(self.replay_index):
@@ -1469,6 +1483,17 @@ class OnPolicyStates:
             self._open(state["_dir"])
         else:
             self.__dict__.update(state)
+
+
+def own_replay_paths(paths, dagger_dir):
+    """The replay caches a run collected itself (inside its own ``dagger_dir``); caches of other runs or models are
+    dropped with a warning: DAgger states come only from the run's own recent checkpoints."""
+    root = Path(dagger_dir).resolve()
+    own = [p for p in paths if root in Path(p).resolve().parents]
+    for p in paths:
+        if p not in own:
+            print(f'Warning: dropping replay cache from another run: {p}', flush=True)
+    return own
 
 
 def load_replay(paths):

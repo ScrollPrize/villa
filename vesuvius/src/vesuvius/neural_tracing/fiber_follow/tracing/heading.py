@@ -10,7 +10,10 @@ SEED_HEADING_POLICY = 'ct_sheet_hv_sigma2_8_v2'
 TRACE_HEADING_POLICY = 'linear12_trusted_v1'
 FRAME_POLICY = 'ct_transverse_uv_sigma2_8_v3'
 LEARNED_FRAME_POLICY = 'learned_heading_normal_v1'
-FRAME_POLICIES = (FRAME_POLICY, LEARNED_FRAME_POLICY, 'ct_transverse_uv_v2')
+# Continuation crops: forward axis from the previous decision's prediction (tracing.crop_frames.predicted_axis), roll
+# from the frame model; seeds and restarts keep LEARNED_FRAME_POLICY.
+PREDICTION_FRAME_POLICY = 'prediction_axis_learned_roll_v1'
+FRAME_POLICIES = (FRAME_POLICY, LEARNED_FRAME_POLICY, PREDICTION_FRAME_POLICY, 'ct_transverse_uv_v2')
 CT_CONTEXT_RADIUS = 38  # four integration sigmas + three derivative sigmas
 # CT is scaled to [0, 1]. Require both directional evidence and enough
 # transverse energy to avoid orienting a crop from numerical residue.

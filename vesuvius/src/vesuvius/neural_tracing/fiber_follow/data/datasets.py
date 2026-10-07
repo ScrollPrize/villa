@@ -198,8 +198,9 @@ def build_mixed_dataset(primary, document, cfg, sample, sampling, args, *, seed,
             scale = float(source['grid_scale'])
             builder = IdentityObservationBuilder(cfg, fibers, sampling, augment=True, neighbors=AFVBank(fibers))
             replay_index = Path(out)/'dagger'/source['name']/'replay.json' if out else None
-            from vesuvius.neural_tracing.fiber_follow.data.data import load_replay, usable_replay
-            replay_paths = json.loads(replay_index.read_text()) if resume and replay_index and replay_index.exists() else []
+            from vesuvius.neural_tracing.fiber_follow.data.data import load_replay, own_replay_paths, usable_replay
+            replay_paths = (own_replay_paths(json.loads(replay_index.read_text()), Path(out)/'dagger')
+                            if resume and replay_index and replay_index.exists() else [])
             replay = usable_replay(load_replay(replay_paths), fibers, sample.n_history, spec.grid_scale)
             from vesuvius.neural_tracing.fiber_follow.data.data import loader_chunk
             dataset = FollowDataset(fibers, spec, sample, chunk=loader_chunk(cfg, args.batch),
