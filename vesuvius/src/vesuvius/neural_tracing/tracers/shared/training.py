@@ -42,10 +42,13 @@ class RunLog:
         self._file.close()
 
 
-def lr_at(step: int, base_lr: float, warmup: int, total_steps: int) -> float:
-    """Linear warmup multiplied by a cosine decay over ``total_steps``."""
-    return (base_lr * min(1., step / max(1, warmup))
-            * .5 * (1 + math.cos(math.pi * (step - 1) / total_steps)))
+def lr_at(step: int, base_lr: float, warmup: int, total_steps: int, progress: float | None = None) -> float:
+    """Linear warmup multiplied by a cosine decay over ``total_steps`` (``step`` counts from 1). ``progress``, a
+    fraction of the run done by another measure (e.g. of a time budget), advances the cosine when it is further
+    along; the decay then ends at zero."""
+    angle = (math.pi * (step - 1) / total_steps if progress is None
+             else math.pi * min(1., max((step - 1) / total_steps, progress)))
+    return base_lr * min(1., step / max(1, warmup)) * .5 * (1 + math.cos(angle))
 
 
 @torch.no_grad()

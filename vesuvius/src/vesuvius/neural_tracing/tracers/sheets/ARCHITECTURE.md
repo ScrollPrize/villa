@@ -404,7 +404,8 @@ spacing).
 
 ### Optimisation
 
-* AdamW with weight decay 1e-4, a linear warm-up, then cosine decay to zero at `train.max_minutes`.
+* AdamW with weight decay 1e-4 and the tracers' schedule (`shared.training.lr_at`): a linear warm-up multiplied by a
+  cosine decay that reaches zero at `train.max_minutes` (or `train.iterations`).
 * Gradient clipping at 1.0 and bf16 autocast.
 * Each step's loss is backpropagated right after the step (steps are detached from each other).
 * An EMA of the weights (0.999) is used for validation, `best.pt` and `--init`.

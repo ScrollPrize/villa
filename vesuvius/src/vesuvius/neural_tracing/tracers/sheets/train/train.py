@@ -17,7 +17,6 @@ from __future__ import annotations
 import argparse
 import copy
 import json
-import math
 import multiprocessing
 import queue
 import signal
@@ -41,18 +40,13 @@ from vesuvius.neural_tracing.tracers.sheets.model import build_model, compile_mo
 from vesuvius.neural_tracing.tracers.sheets.tracing.rollout import Tracer
 from vesuvius.neural_tracing.tracers.sheets.tracing.seeding import perturb, seed_rows, sheet_jump
 from vesuvius.neural_tracing.tracers.sheets.evaluation.figures import episode_figure, metric_figure, training_figure
-from vesuvius.neural_tracing.tracers.shared.training import prepare_run_dir, update_ema
+from vesuvius.neural_tracing.tracers.shared.training import lr_at, prepare_run_dir, update_ema
 
 
 def learning_rate(it: int, tc, minutes: float = 0.) -> float:
-    """Linear warmup, then cosine decay to zero at whichever comes first: ``iterations`` or ``max_minutes`` of
-    training (``minutes`` so far, including resumed time), so a time-budgeted run anneals fully."""
-    if it < tc.warmup:
-        return tc.lr*(it+1)/tc.warmup
-    progress = (it-tc.warmup)/max(1, tc.iterations-tc.warmup)
-    if tc.max_minutes:
-        progress = max(progress, minutes/tc.max_minutes)
-    return tc.lr*.5*(1+math.cos(math.pi*min(1., progress)))
+    """The tracers' warmup-cosine schedule (``shared.training.lr_at``) at iteration ``it`` (from 0), decaying to zero at
+    whichever comes first: ``iterations`` or ``max_minutes`` of training (``minutes`` so far, including resumed time)."""
+    return lr_at(it+1, tc.lr, tc.warmup, tc.iterations, minutes/tc.max_minutes if tc.max_minutes else None)
 
 
 def train_rollout(tracer: Tracer, b: dict, cfg, spec, generator, front=None):
