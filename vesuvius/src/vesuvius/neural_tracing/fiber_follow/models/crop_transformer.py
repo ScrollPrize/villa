@@ -90,7 +90,7 @@ class RegressionConfig(CropTransformerArchitecture, FollowerConfig):
     # True: each proposal's survival is scored by its own set of path tokens carrying the finished proposal (detached
     # points and the evidence sampled along them), as the flow model scores proposals (CropTransformer.hazard_logits);
     # False: read from the tokens that proposed it.
-    scoring_pass: bool = False
+    scoring_pass: bool = True
 
 
 @dataclass

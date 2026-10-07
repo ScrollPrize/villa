@@ -174,7 +174,7 @@ class SampleConfig:
     history_step: float = 1.0
     # Fresh trace starts, as direct draw allocations: seed-only, 1-8 and 9-32 requested
     # voxels of history, and a prefix drawn uniformly from the available history.
-    startup_shares: tuple = (.15, .17, .17, .51)
+    startup_shares: tuple = (.35, .15, .15, .35)
     # Simulated tracing error (``trace_noise``), fit to on-track 81k rollouts against the repaired
     # annotations (output/trace_noise_realism_20261002/refit_repaired): per-trace scale log-uniform
     # around a median of .412 (spread 3.43), commit-end correlation length, mid-commit bulge and
@@ -191,11 +191,12 @@ class SampleConfig:
     excursion_amplitude: tuple = (3., 6.)
     excursion_rise: tuple = (16., 128.)
     # A seed clicked a little off the centerline (``seed_offsets``): lateral offset magnitude range at the seed,
-    # voxels, fading out over ``seed_offset_ramp`` voxels of trace. (0, 0) keeps seeds on the annotation.
-    seed_offset: tuple = (0., 0.)
+    # voxels, fading out over ``seed_offset_ramp`` voxels of trace (default 0-1.5 vox; (0, 0) keeps seeds on the
+    # annotation).
+    seed_offset: tuple = (0., 1.5)
     seed_offset_ramp: float = 16.
     # Share of live-continuation chains that start at a fresh seed (the rest from replayed DAgger prefixes).
-    live_seed_start: float = .5
+    live_seed_start: float = .7
     # Horizon (vox) of the previous-prediction crop axis for continuation crops: on by default (the gate horizon, 16
     # planes); the trainer sets it from the model (tracing.crop_frames.prediction_window: 0 only for a model with
     # crop_axis 'heading_model'). Fresh continuation crops get simulated_prediction; seeds never do.

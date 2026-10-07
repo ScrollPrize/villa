@@ -38,8 +38,8 @@ class SequenceConfig(FollowerConfig):
     """The shared crop/horizon/label contract (FollowerConfig fields read by data, losses and tracing) plus this
     model's own sizes. ``layers``/``heads`` size the transformer; refinement is not used."""
     model_type: str = 'sequence'
-    fine: CropSpec = field(default_factory=lambda: CropSpec(depth=80, width=64, behind=16, spacing=.5))
-    n_future: int = 31
+    fine: CropSpec = field(default_factory=lambda: CropSpec(depth=104, width=64, behind=16, spacing=.5))
+    n_future: int = 43
     gate_plane: int | None = 16
     layers: int = 12
     heads: int = 8
@@ -47,7 +47,7 @@ class SequenceConfig(FollowerConfig):
     cnn_channels: tuple = (16, 32, 64, 128)
     # Per-stage strides: a full-resolution block, then stages at strides 2, 4, 8; (2, 2, 2, 1) drops the full-resolution
     # stage (same weight shapes and stride-8 cells, ~6x cheaper).
-    cnn_strides: tuple = (1, 2, 2, 2)
+    cnn_strides: tuple = (2, 2, 2, 1)
     cnn_blocks: int = 2
     history_limit: int = 512  # most recent history tokens a decision reads
 

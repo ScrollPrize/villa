@@ -26,7 +26,7 @@ def lateral_tangents(p, s, arcs):
 
 
 def test_simulated_trace_is_the_tracer_state_of_its_observed_path():
-    f, cfg = curved_fiber(), sample_config(startup_shares=(.2, .15, .15, .5), excursion_probability=0.)
+    f, cfg = curved_fiber(), sample_config(startup_shares=(.2, .15, .15, .5), excursion_probability=0., seed_offset=(0., 0.))
     for t, reverse, seed in ((t, r, k) for t, r in ((0., False), (2.5, True), (60., False)) for k in range(12)):
         p, s = D.traversal_curve(f, reverse)
         item = D.make_sample(f, t, reverse, cfg, np.random.default_rng(seed))
@@ -55,7 +55,8 @@ def test_simulated_trace_is_the_tracer_state_of_its_observed_path():
 
 def test_seed_offset_starts_off_the_centerline_and_fades_into_the_same_trace():
     f = curved_fiber()
-    on, off = sample_config(excursion_probability=0.), sample_config(excursion_probability=0., seed_offset=(.5, 1.5))
+    on, off = (sample_config(excursion_probability=0., seed_offset=(0., 0.)),
+               sample_config(excursion_probability=0., seed_offset=(.5, 1.5)))
     for t, startup, seed in ((t, c, k) for t in (0., 30.) for c in (0, 1, 2, 3) for k in range(6)):
         p, s = D.traversal_curve(f, False)
         base = D.make_sample(f, t, False, on, np.random.default_rng(seed), startup=startup)

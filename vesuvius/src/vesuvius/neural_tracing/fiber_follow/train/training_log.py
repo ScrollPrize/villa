@@ -106,7 +106,7 @@ class TrainingInterval:
     """Pool counts and weight decision-normalized means by supervised decisions."""
     means = ('loss', 'geometry', 'confidence_loss', 'refinement_attempts_mean')
     counts = tuple(p+'_'+s for p in ('ct_frame',)
-                   for s in ('count', 'transported', 'deterministic', 'learned', 'energy_sum', 'gap_sum')) + (
+                   for s in ('count', 'transported', 'deterministic', 'learned', 'prediction', 'energy_sum', 'gap_sum')) + (
               'live_depth_sum', 'live_travelled_sum', 'live_rows', 'live_terminal_rows',
               'ct_frame_rejected_batches', 'error_sum', 'geometry_count', 'point_correct_count', 'point_wrong_count',
               'point_unknown_count', 'supervised_states', 'observation_only_states',
@@ -171,7 +171,9 @@ def _interval_training_lines(row):
             frames.append(f"{label} {transported+deterministic}/{int(count)} fallbacks"
                           f" ({transported} transported, {deterministic} deterministic)"
                           f"; mean gap {m.get(prefix+'_gap_sum', 0)/count:.3f}"
-                          +(f"; {int(m[prefix+'_learned'])} learned" if m.get(prefix+'_learned', 0) else ''))
+                          +(f"; heading from the frame model {int(m.get(prefix+'_learned', 0))}, from the previous "
+                            f"prediction {int(m.get(prefix+'_prediction', 0))}"
+                            if m.get(prefix+'_learned', 0) or m.get(prefix+'_prediction', 0) else ''))
     if frames:
         lines.append('  CT frames: '+' | '.join(frames))
     if m.get('ct_frame_rejected_batches', 0):

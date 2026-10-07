@@ -424,5 +424,6 @@ class ModelTracer:
                         if self.prediction_window and prediction[i] is not None and len(prediction[i]) else None)
                 if axis is not None:
                     frames[i] = frame_from_heading(axis, np.asarray(frames[i])[:, 0])
+                    frame_diagnostics[i] = dict(frame_diagnostics[i], source=4)
                 predicted[i] = axis is not None
         return [np.asarray(p[h:]) for p, h in zip(paths, hist_start)], reasons

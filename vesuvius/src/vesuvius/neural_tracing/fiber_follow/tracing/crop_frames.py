@@ -101,6 +101,8 @@ def apply_prediction_axis(item, window):
     from vesuvius.neural_tracing.fiber_follow.data.data import refresh_frame_targets
     refresh_frame_targets(item)
     item['frame_policy'] = PREDICTION_FRAME_POLICY
+    # Diagnostics source 4: heading from the previous prediction (roll from the frame model); 3 = frame-model heading.
+    item['ct_frame_diagnostics'] = dict(item.get('ct_frame_diagnostics') or {}, source=4)
     return True
 
 

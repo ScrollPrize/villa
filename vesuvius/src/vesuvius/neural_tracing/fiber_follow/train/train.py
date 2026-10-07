@@ -394,7 +394,7 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
             source = cpu['x'][prefix+'_source']
             known = source >= 0
             for suffix, value in dict(count=known.sum(), transported=(source == 1).sum(),
-                    deterministic=(source == 2).sum(), learned=(source == 3).sum(),
+                    deterministic=(source == 2).sum(), learned=(source == 3).sum(), prediction=(source == 4).sum(),
                     energy_sum=cpu['x'][prefix+'_energy'][known].sum(),
                     gap_sum=cpu['x'][prefix+'_gap'][known].sum()).items():
                 name = prefix+'_'+suffix

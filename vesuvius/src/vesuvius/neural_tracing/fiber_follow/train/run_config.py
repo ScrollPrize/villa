@@ -44,9 +44,9 @@ TRAINING = dict(
                      dagger_premature_stop=.03, dagger_ordinary=0., synthetic_terminal=0.),
     terminal_fallback_cap=.5, replay_max_age=3000, replay_event_cap=64,
     # Simulated traces and labels.
-    startup_shares=[.15, .17, .17, .51], excursion_probability=.2, excursion_amplitude=[3., 6.],
+    startup_shares=[.35, .15, .15, .35], excursion_probability=.2, excursion_amplitude=[3., 6.],
     excursion_rise=[16., 128.], synthetic_tail=[4., 16.], live_continuation_steps=[32, 256],
-    seed_offset=[0., 0.], seed_offset_ramp=16., live_seed_start=.5,
+    seed_offset=[0., 1.5], seed_offset_ramp=16., live_seed_start=.7,
     # Neighbour banks, augmentation and AFV sampling.
     bank_coverage_probability=.2, bank_hard_fraction=.5, bank_switch_tolerance=.75, bank_own_tolerance=1.5,
     blur_probability=.25, blur_sigma=[.5, 1.25], lateral_fraction=.1, afv_length_power=3.,
@@ -61,22 +61,24 @@ TRAINING = dict(
     log_every=50, ckpt_every=1000, diag_every=5000, batch_diag_every=1000, diag_max_len=400., recovery_every=1000,
     recovery_seeds=8, recovery_length=32.)
 
-# Per model type: the settings of mixed_ct_afv_unified_v1 (regression), unified_flow_v6_adalnzero (flow) and
-# sequence_v1 (sequence) where they differ from TRAINING. The sequence run's live and synthetic shares (which sequence
-# training does not support) are folded into fresh.
+# Per model type: the settings of mixed_ct_afv_unified_scoring_v1 (regression), unified_flow_v6_adalnzero (flow) and
+# sequence_v3 (sequence; its run-specific lr/warmup/steps excepted) where they differ from TRAINING.
 DEFAULTS = dict(
-    regression=dict(batch=16, grad_steps=2, refinement_loss='all', terminal_fallback_cap=0., dagger_forward_chunk=8),
+    regression=dict(batch=16, grad_steps=2, refinement_loss='all', terminal_fallback_cap=0., dagger_forward_chunk=8,
+                    trace_confidence=.7),
     flow=dict(steps=40000, batch=48, warmup=1000, grad_clip=10., n_commit=16, gate='prefix', dagger_every=500,
               task_shares=dict(fresh=.27, live=.45, dagger_pre_excursion=.06, dagger_recoverable=.08,
                                dagger_terminal=.08, dagger_premature_stop=.03, dagger_ordinary=0.,
                                synthetic_terminal=.03),
               synthetic_tail=[4., 128.]),
-    sequence=dict(batch=20, n_commit=12, episode_commit=12, dagger_every=0, dagger_fibers=64, afv_dagger_fibers=None,
-                  dagger_batch=8, dagger_trace_len=768., batch_diag_every=0, live_continuation_steps=[12, 32],
-                  task_shares=dict(fresh=.70, live=0., dagger_pre_excursion=.08, dagger_recoverable=.06,
-                                   dagger_terminal=.08, dagger_premature_stop=.03, dagger_ordinary=.05,
+    sequence=dict(batch=20, n_commit=8, episode_commit=8, episode_steps=96, dagger_trace_len=2000.,
+                  terminal_fallback_cap=0., live_continuation_steps=[12, 32],
+                  task_shares=dict(fresh=.40, live=0., dagger_pre_excursion=.12, dagger_recoverable=.12,
+                                   dagger_terminal=.16, dagger_premature_stop=.10, dagger_ordinary=.10,
                                    synthetic_terminal=0.)))
 
+# Per model type: runtime defaults where they differ from RUNTIME.
+RUNTIME_DEFAULTS = dict(regression={}, flow={}, sequence=dict(worker_cache_gb=1.))
 RUNTIME = dict(device='cuda', workers=10, worker_cache_gb=.5, threads=4, dagger_threads=4,
                remote_prefetch_connections=48, remote_prefetch_queue_size=512, remote_prefetch_lookahead=16,
                remote_prefetch_timeout=120.)
@@ -163,7 +165,7 @@ def resolve(document, base='.'):
 
     runtime = retire('runtime', dict(document.get('runtime') or {}))
     unknown('runtime', runtime, RUNTIME)
-    run['runtime'] = dict(RUNTIME, **runtime)
+    run['runtime'] = dict(RUNTIME, **RUNTIME_DEFAULTS[model_type], **runtime)
     validate(run)
     return run
 
