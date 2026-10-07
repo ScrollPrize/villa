@@ -54,12 +54,12 @@ def test_frame_freezes_at_last_in_tube_decision():
 
 def test_losses_and_stop_classification():
     lost = score(path(lambda z: (max(0., .2*(z-60)), 0.), 100.))
-    assert lost['loss'] and lost['loss_kind'] == 'unlabelled' and lost['end'] == 'lost'
+    assert lost['loss'] and lost['loss_kind'] == 'unlabelled' and lost['end'] == 'lost' and lost['outcome'] == 'mistake'
     assert 40. < lost['loss_at'] < 50.
     labelled = score(path(lambda z: (max(0., .2*(z-60)), 0.), 100.), foreign=lambda p: np.full(len(p), .5))
     assert labelled['loss_kind'] == 'switch'
     on = path(lambda z: (0., 0.), 60.)
-    assert score(on)['end'] == 'premature'
+    assert score(on)['end'] == 'premature' and score(on)['outcome'] == 'stopped_early'
     assert score(on, reason='max_len')['end'] == 'censored'
     near_end = path(lambda z: (0., 0.), 172.)  # stopped 8 voxels short of the annotation end
     assert score(near_end)['end'] == 'end'

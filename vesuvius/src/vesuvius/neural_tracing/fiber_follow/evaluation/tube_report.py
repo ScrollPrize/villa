@@ -26,7 +26,10 @@ from ..data.datasets import read_dataset_config
 from ..shared.experiment import jsonable
 
 SOURCES = ('paris4', '0175A_5mm_v1', '1447_5mm_v1', 'paris4_afv_central')
-HEADLINE = (('losses_rate', 'identity losses', 3), ('switches_rate', '  of which switches', 3),
+HEADLINE = (('seeds_mistake', 'seeds: mistake, kept on', 3), ('seeds_stopped_early', 'seeds: stopped early', 3),
+            ('seeds_reached_end', 'seeds: reached end', 3), ('seeds_other', 'seeds: other', 3),
+            ('distance_per_mistake', 'mm traced per mistake', 0), ('continued_after_mistake', 'mm traced after mistake', 1), ('annotation_per_seed', 'annotation mm per seed', 1),
+            ('losses_rate', 'identity losses', 3), ('switches_rate', '  of which switches', 3),
             ('premature_stops_rate', 'premature stops', 3), ('excursions_rate', 'excursions', 3),
             ('precision', 'precision', 3), ('fiber_coverage', 'fiber coverage', 3),
             ('normal_p90', 'normal offset p90', 1), ('width_p90', 'width offset p90', 1),
@@ -55,22 +58,39 @@ def trace_inputs(row):
     return z, fiber
 
 
+def init_worker(neighbor_configs):
+    """Per process: the dataset-config entries sharing each source's volume; catalogs open on first use."""
+    _WORK.clear()
+    _WORK.update(configs=neighbor_configs or {}, neighbors={})
+
+
+def neighbors_for(source):
+    if source not in _WORK.get('configs', {}):
+        return None
+    if source not in _WORK['neighbors']:
+        _WORK['neighbors'][source] = NeighborFibers.from_configs(_WORK['configs'][source])
+    return _WORK['neighbors'][source]
+
+
 def score_row(job):
     row, stop, label = job
     z, fiber = trace_inputs(row)
     foreign = None
-    neighbors = _WORK.get('neighbors', {}).get(row['source']) if label else None
+    neighbors = neighbors_for(row['source']) if label else None
     if neighbors is not None:
         foreign = neighbors.foreign(neighbors.code(row['fiber_name']), fiber.points)
     return tube_scoring.score_tube(z['path'], fiber, row['t0'], row['sign'], z['travelled'], z['frame'], row['reason'],
                                    foreign=foreign, stop_at=stop)
 
 
-def score_rows(rows, stops, label, workers):
-    jobs = [(r, s, label) for r, s in zip(rows, stops)]
+def score_rows(rows, stops, neighbor_configs, workers):
+    """Tube scores of ``rows`` (``stops``: replayed stop lengths or None); switch labels with ``neighbor_configs``."""
+    jobs = [(r, s, bool(neighbor_configs)) for r, s in zip(rows, stops)]
     if workers > 1:
-        with Pool(workers) as pool:
+        # Workers do not inherit module state under spawn/forkserver: hand them the configs explicitly.
+        with Pool(workers, initializer=init_worker, initargs=(neighbor_configs,)) as pool:
             return pool.map(score_row, jobs, chunksize=16)
+    init_worker(neighbor_configs)
     return [score_row(j) for j in jobs]
 
 
@@ -106,6 +126,13 @@ def print_tables(report, labels):
                 star = '*' if d[1] > 0 or d[2] < 0 else ''
                 cells.append(f'{d[0]:+.{max(digits, 1)}f}{star}')
             print(f'{name:22}' + ''.join(f'{c:>{width}}' for c in cells))
+        runs = [entry['runs'][l] for l in labels if l in entry['runs']]
+        for distance in runs[0]['mistake_free']:
+            cells = ['-' if r['mistake_free'][distance] is None else
+                     f"{r['mistake_free'][distance][0]:.3f} (n={r['mistake_free'][distance][1]})" for r in runs]
+            print(f"{'no mistake by '+distance:22}" + ''.join(f'{c:>{width}}' for c in cells))
+        cells = ['-' if r['mistake_at_median'] is None else f"{r['mistake_at_median']:.1f}" for r in runs]
+        print(f"{'median mistake at':22}" + ''.join(f'{c:>{width}}' for c in cells))
     for source, entry in report['sources'].items():
         if 'curves' not in entry:
             continue
@@ -129,15 +156,14 @@ def main(argv=None):
     ap.add_argument('--workers', type=int, default=4)
     ap.add_argument('--out')
     args = ap.parse_args(argv)
-    configs = {}
+    configs, neighbor_configs = {}, None
     if args.config:
         document, _ = read_dataset_config(args.config)
         configs = {s['name']: s for s in document['sources']}
         if not args.no_switch_labels:
             same = lambda a, b: (str(a['ct']).rstrip('/') == str(b['ct']).rstrip('/')
                                  and float(a.get('grid_scale', 8.)) == float(b.get('grid_scale', 8.)))
-            _WORK['neighbors'] = {name: NeighborFibers.from_configs([s for s in document['sources'] if same(s, c)])
-                                  for name, c in configs.items()}
+            neighbor_configs = {name: [s for s in document['sources'] if same(s, c)] for name, c in configs.items()}
     labels, runs = [], {}
     for spec in args.runs:
         label, folders = spec.split('=', 1)
@@ -145,7 +171,7 @@ def main(argv=None):
         missing = [i for i, r in enumerate(rows) if args.rescore or 'tube' not in r]
         if missing:
             print(f'{label}: scoring {len(missing)} of {len(rows)} traces from saved traces', flush=True)
-            scores = score_rows([rows[i] for i in missing], [None]*len(missing), bool(_WORK.get('neighbors')), args.workers)
+            scores = score_rows([rows[i] for i in missing], [None]*len(missing), neighbor_configs, args.workers)
             for i, score in zip(missing, scores):
                 rows[i]['tube'] = score
         labels.append(label)
@@ -179,7 +205,7 @@ def main(argv=None):
         base = protocol['operating_policy']['confidence']
         for threshold in sorted(t for t in args.replay if t >= base):
             stops = replay_stops(rows, threshold, gate_plane)
-            scores = score_rows(rows, stops, False, args.workers)
+            scores = score_rows(rows, stops, None, args.workers)
             replayed = [dict(r, tube=s) for r, s in zip(rows, scores)]
             for source, entry in report['sources'].items():
                 members = [r for r in replayed if r['source'] == source]

@@ -146,6 +146,10 @@ def score_tube(path, fiber, t0, sign, decision_travelled, frames, reason, *, for
         version=VERSION, verified_length=float(segment[verified].sum()), wrong_length=float(segment[out].sum()),
         uninterrupted_length=float(segment[verified & (np.arange(len(lengths)) < first)].sum()),
         excursions=len(excursions), loss=loss is not None, loss_at=float(lengths[loss]) if loss is not None else None,
+        continued_after_loss=float(lengths[-1]-lengths[loss]) if loss is not None else 0.,
+        scored_travelled=float(lengths[scored][-1]) if scored.any() else 0.,
+        outcome=('mistake' if loss is not None else 'stopped_early' if end == 'premature'
+                 else 'reached_end' if end == 'end' else 'other'),
         loss_kind=kind, end=end, reason=reason, remaining=remaining, available=available,
         reached_end=reached is not None, endpoint_known=endpoint_known,
         unscored_length=0. if endpoint_known else float(segment[after].sum()),
@@ -177,7 +181,16 @@ def um_per_voxel(source_config):
 
 # Per-fiber sums; every summary metric is a ratio of these, so a fiber bootstrap resamples rows.
 FIBER_SUMS = ('traces', 'verified', 'wrong', 'excursions', 'losses', 'switches', 'premature', 'reached', 'unscored',
-              'overrun', 'total', 'coverage')
+              'overrun', 'total', 'coverage', 'reached_clean', 'other_outcome', 'continued', 'excursion_seeds',
+              'available')
+
+
+def outcome(tube):
+    """Per-seed outcome (``score_tube``'s field; derived for rows scored before it existed)."""
+    if 'outcome' in tube:
+        return tube['outcome']
+    return ('mistake' if tube['loss'] else 'stopped_early' if tube['end'] == 'premature'
+            else 'reached_end' if tube['end'] == 'end' else 'other')
 
 
 def fiber_table(rows):
@@ -195,7 +208,10 @@ def fiber_table(rows):
                      sum(t['loss_kind'] == 'switch' for t in tubes), sum(t['end'] == 'premature' for t in tubes),
                      sum(t['reached_end'] for t in tubes), sum(t['unscored_length'] for t in tubes),
                      sum(t['endpoint_overrun'] for t in tubes), sum(t['total_length'] for t in tubes),
-                     min(1., covered/max(length, 1e-9))])
+                     min(1., covered/max(length, 1e-9)),
+                     sum(outcome(t) == 'reached_end' for t in tubes), sum(outcome(t) == 'other' for t in tubes),
+                     sum(t.get('continued_after_loss', 0.) for t in tubes), sum(t['excursions'] > 0 for t in tubes),
+                     sum(t['available'] for t in tubes)])
         normal.append(np.sum([t['normal_hist'] for t in tubes], 0))
         width.append(np.sum([t['width_hist'] for t in tubes], 0))
     return np.asarray(sums, float), np.asarray(normal, float), np.asarray(width, float), sorted(groups)
@@ -218,12 +234,47 @@ def group_metrics(sums, normal, width, um):
         traces=v['traces'], verified_length=v['verified'],
         losses=v['losses'], switches=v['switches'], excursions=v['excursions'], premature_stops=v['premature'],
         losses_rate=v['losses']/exposure*unit, switches_rate=v['switches']/exposure*unit,
+        distance_per_mistake=exposure/max(v['losses'], 1)*(um/1e3 if um else 1.),
         excursions_rate=v['excursions']/exposure*unit, premature_stops_rate=v['premature']/exposure*unit,
         precision=v['verified']/max(v['verified']+v['wrong'], 1e-9),
         wrong_per_verified=v['wrong']/exposure,
         normal_p50=quantile(n, .5), normal_p90=quantile(n, .9), width_p50=quantile(w, .5), width_p90=quantile(w, .9),
         fiber_coverage=v['coverage']/fibers, reached_end=v['reached']/max(v['traces'], 1),
+        # Per seed (one directed trace), one outcome each: a mistake (identity loss, the trace kept going) takes
+        # precedence over stopping early on the fiber, reaching the annotation end, or anything else.
+        seeds_mistake=v['losses']/max(v['traces'], 1), seeds_stopped_early=v['premature']/max(v['traces'], 1),
+        seeds_reached_end=v['reached_clean']/max(v['traces'], 1), seeds_other=v['other_outcome']/max(v['traces'], 1),
+        seeds_any_excursion=v['excursion_seeds']/max(v['traces'], 1),
+        continued_after_mistake=v['continued']/max(v['losses'], 1)*(um/1e3 if um else 1.),
+        annotation_per_seed=v['available']/max(v['traces'], 1)*(um/1e3 if um else 1.),
         unscored_share=v['unscored']/max(v['total'], 1e-9), endpoint_overrun=v['overrun'])
+
+
+def mistake_free(rows, distances):
+    """Kaplan-Meier probability that a seed has traced each distance (trace voxels) without a mistake.
+
+    Event: the identity loss, dated where it began (travelled length). A trace that stops, reaches the annotation
+    end or is ended by the evaluation is censored at its last scored length. Returns (probability, traces still
+    at risk) per distance; None where fewer than 20 traces are still at risk.
+    """
+    tubes = [r['tube'] for r in rows]
+    times = np.asarray([t['loss_at'] if t['loss'] else t.get('scored_travelled', t['total_length']-t['unscored_length'])
+                        for t in tubes])
+    events = np.asarray([t['loss'] for t in tubes])
+    order = np.lexsort((~events, times))  # events before censoring at equal times
+    times, events = times[order], events[order]
+    survival, at_risk, curve = 1., len(times), []
+    for t, e in zip(times, events):
+        if e:
+            survival *= 1-1/at_risk
+        at_risk -= 1
+        curve.append((t, survival))
+    out = []
+    for d in distances:
+        risk = int((times >= d).sum())
+        before = [s for t, s in curve if t <= d]
+        out.append((before[-1] if before else 1., risk) if risk >= 20 else None)
+    return out
 
 
 def summarize_tube(rows, um=None, boot=1000, seed=0):
@@ -235,7 +286,12 @@ def summarize_tube(rows, um=None, boot=1000, seed=0):
     for _ in range(boot):
         pick = rng.integers(0, len(sums), len(sums))
         draws.append(group_metrics(sums[pick].sum(0), normal[pick], width[pick], um))
+    mm = [1., 2., 5., 10., 20.]
+    voxels = [d*1e3/um for d in mm] if um else [d*1e3 for d in mm]
+    lost_at = [r['tube']['loss_at'] for r in rows if r['tube']['loss']]
     return dict(unit='per 10 mm' if um else 'per 1000 trace voxels', um_per_voxel=um, fibers=len(sums),
+                mistake_free=dict(zip([f'{d:g}mm' if um else f'{d:g}k_voxels' for d in mm], mistake_free(rows, voxels))),
+                mistake_at_median=float(np.median(lost_at))*(um/1e3 if um else 1.) if lost_at else None,
                 metrics={k: [value, *np.nanpercentile([d[k] for d in draws], [2.5, 97.5]).tolist()] if boot else [value]
                          for k, value in point.items()})
 
