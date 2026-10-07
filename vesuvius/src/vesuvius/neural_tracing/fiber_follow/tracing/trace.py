@@ -243,8 +243,9 @@ class ModelTracer:
         """Greedy rollout, checking supervised confidence before committing.
 
         on_decision(i, state) observes the exact inference input and proposals,
-        before any commit; returning False censors the trace. Returned paths
-        always start at the seed.
+        before any commit; returning False censors the trace (reason 'oracle'),
+        returning a string censors it with that reason. Returned paths always
+        start at the seed.
         """
         was_training = self.model.training
         self.model.eval()
@@ -373,8 +374,9 @@ class ModelTracer:
                              fiber_family=families[i], ct_frame_diagnostics=frame_diagnostics[i].copy(),
                              refit_retry=refit is not None)
                 state.update({**references[i], 'seed_age': references[i]['seed_age']+float(length[i])})
-                if on_decision is not None and on_decision(int(i), state) is False:
-                    active[i], reasons[i] = False, 'oracle'
+                verdict = on_decision(int(i), state) if on_decision is not None else None
+                if verdict is False or isinstance(verdict, str):
+                    active[i], reasons[i] = False, verdict if isinstance(verdict, str) else 'oracle'
                     continue
                 if recovery_blocked:
                     active[i], reasons[i] = False, 'recovery_limit'

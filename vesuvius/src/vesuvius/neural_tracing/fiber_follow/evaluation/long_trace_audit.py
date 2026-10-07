@@ -18,11 +18,13 @@ import torch
 from .evaluate import dataset_sources
 from .seeds import EvaluationAudit, evaluate, monitor_coverage, score_trace, summarize_outcomes
 from .recovery_scoring import recovery_score
+from . import tube_scoring
+from .neighbor_fibers import NeighborFibers
 from ..data.observations import FiberTracer
 from ..shared.experiment import jsonable, write_json as write
 from ..shared.geometry import arclength, interp_at, tangent_at
 from ..tracing.heading import oriented_seed_heading, SeedHeadingError, SEED_HEADING_POLICY
-from ..tracing.policy import checkpoint_policy
+from ..tracing.policy import checkpoint_policy, gate_horizon
 from ..tracing.trace import TraceParams
 from ..train.train import load_checkpoint
 from ..train.runloop import raise_open_file_limit
@@ -75,11 +77,35 @@ def prepare_seeds(source, count, rng):
 
 
 class DetailedAudit(EvaluationAudit):
-    """Add evidence recording to the canonical evaluation audit without changing decisions."""
+    """Add evidence recording to the canonical evaluation audit without changing decisions.
+
+    With ``end_margin`` set, a trace is ended (reason 'annotation_end') once it has travelled that far past the
+    annotation end (the ``tube_scoring`` end rule; ``known_end_margin`` behind a tagged physical endpoint, so an
+    overrun stays measurable). Nothing past the end is scored, so tracing on is wasted.
+    """
+    end_margin = None
+    known_end_margin = 64.
+
     def start_batch(self, fibers, seeds):
         super().start_batch(fibers, seeds)
         self.details = [[] for _ in seeds]
         self.states = [[] for _ in seeds]
+        self.end_reached = [None]*len(seeds)
+
+    def annotation_end(self, index, state):
+        labeler, seed = self.labelers[index], self.seeds[index]
+        if self.end_reached[index] is None:
+            fiber, sign = labeler.fiber, labeler.sign
+            available = fiber.length-seed['t'] if sign > 0 else seed['t']
+            progress = (np.asarray(labeler.vertex_arcs)-seed['t'])*sign
+            near = np.flatnonzero((np.asarray(labeler.vertex_distances) <= tube_scoring.END_DISTANCE)
+                                  & (progress >= available-tube_scoring.END_PROGRESS))
+            if len(near) or labeler.boundary_distance is not None:
+                self.end_reached[index] = float(state['travelled'])
+        if self.end_reached[index] is None:
+            return False
+        known = labeler.fiber.endpoint_stop[1 if labeler.sign > 0 else 0]
+        return state['travelled'] >= self.end_reached[index]+(self.known_end_margin if known else self.end_margin)
 
     def __call__(self, index, state):
         before = self.records[index].copy()
@@ -98,6 +124,8 @@ class DetailedAudit(EvaluationAudit):
             rejected_unsafe=record['rejected_unsafe']-before['rejected_unsafe']))
         self.states[index].append({k: np.asarray(state[k]).copy() for k in
             ('pos','frame','hist','hmask','points','confidence','travelled','n_commit','heading_start')})
+        if self.end_margin is not None and self.annotation_end(index, state):
+            return 'annotation_end'
 
 
 def summary(rows):
@@ -120,6 +148,11 @@ def summary(rows):
     result['available_quantiles'] = np.quantile([r['available_full'] for r in rows], [0,.25,.5,.75,1])
     result['startup_departures'] = sum(r['diverged'] and r['correct'] < 32 for r in rows)
     return result
+
+
+def tube_summary(rows, um):
+    """Anisotropic-tube identity metrics (tube_scoring) with fiber-bootstrap intervals."""
+    return tube_scoring.summarize_tube([r for r in rows if 'tube' in r], um)
 
 
 def main():
@@ -145,6 +178,12 @@ def main():
                     help='before a confidence stop, retry once with the crop refit to the prediction (off by default)')
     ap.add_argument('--sampler-seed', type=int, default=0,
                     help="seed of the flow model's sampled proposals (TraceParams.seed; keyed per trace and decision)")
+    ap.add_argument('--trace-past-annotation-end', action='store_true',
+                    help='keep tracing past the annotation end (unscored); by default a trace ends --end-margin past it')
+    ap.add_argument('--end-margin', type=float, default=16.,
+                    help='trace voxels travelled past the annotation end before the evaluation ends the trace')
+    ap.add_argument('--no-switch-labels', action='store_true',
+                    help="skip the neighbour-fiber catalog; tube losses are then labelled 'unlabelled', not switch/lost")
     args = ap.parse_args()
     torch.set_num_threads(4)
     if args.precision == 'fp32':
@@ -173,6 +212,9 @@ def main():
     policy = checkpoint_policy(ck,model.cfg,confidence=args.confidence,n_commit=args.n_commit,gate=args.gate)
     provenance = dict(checkpoint=str(Path(args.checkpoint).resolve()), checkpoint_sha256=hashlib.sha256(Path(args.checkpoint).read_bytes()).hexdigest(),
         step=ck['step'], operating_policy=policy.to_dict(), max_len=args.max_len, batch=args.batch,
+        gate_plane=int(gate_horizon(model.cfg)), tube_scoring=tube_scoring.settings(),
+        annotation_end_stop=None if args.trace_past_annotation_end else dict(margin=args.end_margin,
+                                                                            known_margin=DetailedAudit.known_end_margin),
         seeds_sha256=hashlib.sha256((out/'seeds.json').read_bytes()).hexdigest(), final_fibers_used=False,
         note='Length-biased diagnostic population; not a uniform-population estimate. Local agreement does not establish fiber identity.',
         args=vars(args))
@@ -182,6 +224,7 @@ def main():
     for source in sources:
         name = source['name']
         fibers = source['fibers']
+        neighbors = None if args.no_switch_labels else NeighborFibers.from_configs(source['volume_configs'])
         tracer = FiberTracer(model,source['volume'],crop,nh,TraceParams.from_policy(policy,max_len=args.max_len,forward_chunk=args.batch,precision=args.precision,seed=args.sampler_seed,
                                                                                    refit_retry=args.refit_retry),device=args.device)
         try:
@@ -197,11 +240,17 @@ def main():
                         continue
                     chunk = seeds[start:start+args.batch]
                     audit = DetailedAudit(tracer,float(ck['tolerance']),source.get('detector'))
+                    audit.end_margin = None if args.trace_past_annotation_end else args.end_margin
                     paths=[]
                     rows,_ = evaluate(tracer,fibers,chunk,batch=args.batch,history_audit=audit,
                         coverage_max_len=args.max_len,on_trace=lambda seed,path,reason:paths.append(path))
                     for j,(row,seed,path) in enumerate(zip(rows,chunk,paths)):
                         f=fibers[seed['fiber']]
+                        states=audit.states[j]
+                        if states:
+                            foreign=None if neighbors is None else neighbors.foreign(neighbors.code(f.name),f.points)
+                            row['tube']=tube_scoring.score_tube(path,f,seed['t'],seed['sign'],[s['travelled'] for s in states],
+                                                                [s['frame'] for s in states],row['reason'],foreign=foreign)
                         row.update(source=name,cohort=cohort,seed_index=start+j,available_full=f.length-seed['t'] if seed['sign']>0 else seed['t'],
                                    fiber_length=f.length,family=f.tag,kink_repairs=f.kink_repairs,foldbacks=list(f.foldbacks),
                                    decisions_detail=audit.details[j],seed=seed,horizons={})
@@ -210,7 +259,6 @@ def main():
                             row['horizons'][str(horizon)]=monitor_coverage(score_trace(truncate_path(path,horizon),f,seed['t'],seed['sign']),horizon)
                         row['local']=recovery_score(path,f,seed['t'],seed['sign'],max_len=args.max_len,tol=3.,sample_step=.5,persistence=1.5)
                         arrays = dict(path=np.asarray(path),annotation=f.points,annotation_s=f.s)
-                        states=audit.states[j]
                         if states:
                             arrays.update({k:np.stack([s[k] for s in states]) for k in states[0]})
                         np.savez_compressed(destination/f'trace_{start+j:03d}.npz',**arrays)
@@ -223,7 +271,9 @@ def main():
     groups={}
     for row in all_rows:
         groups.setdefault(row['source']+'/'+row['cohort'],[]).append(row)
-    result=dict(provenance=provenance,seconds=time.monotonic()-started,groups={k:summary(v) for k,v in groups.items()})
+    um={source['name']:tube_scoring.um_per_voxel(source['config']) for source in sources}
+    result=dict(provenance=provenance,seconds=time.monotonic()-started,
+                groups={k:dict(summary(v),tube=tube_summary(v,um[k.split('/')[0]])) for k,v in groups.items()})
     write(out/'summary.json',result)
     print(json.dumps(result,default=jsonable),flush=True)
 

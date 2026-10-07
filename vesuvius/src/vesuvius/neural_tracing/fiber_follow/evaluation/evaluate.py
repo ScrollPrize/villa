@@ -36,8 +36,11 @@ def dataset_sources(args, config=DATASET_CONFIG):
             _, validation, spec, _ = open_afv_source(source, document['cache_dir'], normalization)
             manifest = validation_manifest(validation, spec, source['validation']['seed'])
             detector = BankSwitchDetector([AFVBank(validation)])
+        # Every annotation source on the same CT and trace grid (neighbour fibers for tube_scoring switch labels).
+        same_volume = [s for s in document['sources'] if str(s['ct']).rstrip('/') == str(source['ct']).rstrip('/')
+                       and float(s.get('grid_scale', 8.)) == float(source.get('grid_scale', 8.))]
         sources.append(dict(name=source['name'], fibers=validation, manifest=manifest, detector=detector,
-                            volume=FiberVolume(spec)))
+                            volume=FiberVolume(spec), config=source, volume_configs=same_volume))
     return sources
 
 
