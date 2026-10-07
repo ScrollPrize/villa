@@ -822,7 +822,21 @@ class FollowDataset(torch.utils.data.IterableDataset):
         if length_power != 1:
             lengths = lengths**length_power
         self.weights = lengths / lengths.sum()
+        self.location_weights = None  # data.location_weights.load: oversample bent and compressed locations
         self.terminal_requests = self.synthetic_fallbacks = 0
+
+    def set_location_weights(self, weights):
+        """Per fiber (arclength positions, weights) or None (uniform). Fresh windows start, and positions within them
+        are kept, in proportion to the weights; a fiber is chosen in proportion to its length weight times its mean."""
+        self.location_weights = weights
+        mean = np.asarray([1. if w is None else float(w[1].mean()) for w in weights])
+        fiber = self.weights*mean
+        self.fresh_weights = fiber/fiber.sum()
+        self.location_ceiling = max([1.]+[float(w[1].max()) for w in weights if w is not None])
+
+    def location_weight(self, fi, original_t):
+        w = self.location_weights[fi] if self.location_weights is not None else None
+        return 1. if w is None else float(w[1][min(int(np.searchsorted(w[0], original_t, 'right'))-1, len(w[1])-1)])
 
     def set_step(self, step):
         self.step.value = int(step)
@@ -888,9 +902,17 @@ class FollowDataset(torch.utils.data.IterableDataset):
                     if hasattr(self.batch_builder, 'fresh_location') else None)
         if location is not None:
             return location['fiber'], location['t'], location['reverse'], location['source']
+        weighted = self.location_weights is not None
         while len(windows) < self.pool_size:
-            fi = rng.choice(len(self.fibers), p=self.weights)
-            windows.append([fi, rng.uniform(0, self.fibers[fi].length), self.window_samples])
+            fi = rng.choice(len(self.fibers), p=self.fresh_weights if weighted else self.weights)
+            w = self.location_weights[fi] if weighted else None
+            if w is None:
+                center = rng.uniform(0, self.fibers[fi].length)
+            else:  # a window centre in proportion to the location weights
+                k = int(rng.choice(len(w[1]), p=w[1]/w[1].sum()))
+                center = float(np.clip(w[0][k]+rng.uniform(0., w[0][1]-w[0][0] if len(w[0]) > 1 else 0.),
+                                       0, self.fibers[fi].length))
+            windows.append([fi, center, self.window_samples])
         wi = rng.integers(len(windows))
         fi, center, _ = windows[wi]
         f = self.fibers[fi]
@@ -901,7 +923,10 @@ class FollowDataset(torch.utils.data.IterableDataset):
         if rng.random() < .1:
             t = max(0, f.length-rng.uniform(0, self.cfg.future_s[-1]*1.5))
         else:
-            original_t = np.clip(center+rng.uniform(-self.window/2, self.window/2), 0, f.length)
+            for _ in range(8):  # keep a position in proportion to its location weight
+                original_t = float(np.clip(center+rng.uniform(-self.window/2, self.window/2), 0, f.length))
+                if not weighted or rng.random()*self.location_ceiling < self.location_weight(fi, original_t):
+                    break
             t = f.length-original_t if rev else original_t
         return int(fi), float(t), rev, 0
 

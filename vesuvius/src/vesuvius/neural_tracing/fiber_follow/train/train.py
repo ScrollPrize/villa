@@ -678,8 +678,20 @@ def main(argv=None):
              +f'; replay age ceiling {budget.replay_max_age}, event cap {budget.replay_event_cap}, '
              f'synthetic terminal fallback cap {budget.terminal_fallback_cap:.0%}')
     saved_draws = (resume or {}).get('replay_event_draws') or {}
-    for name, source_dataset in zip(dataset.names, dataset.datasets):
+    from vesuvius.neural_tracing.fiber_follow.data import location_weights
+    for source, name, source_dataset in zip(dataset_document['sources'], dataset.names, dataset.datasets):
         source_dataset.set_step(done)
+        if args.oversample_bend or args.oversample_compression:
+            path = location_weights.cache_path(source, args.location_weights_dir or None)
+            if path.exists():
+                weights = location_weights.load(path, source_dataset.fibers, args.oversample_bend, args.oversample_compression)
+                source_dataset.set_location_weights(weights)
+                covered = sum(w is not None for w in weights)
+                progress(f'{name}: fresh locations weighted (bend x{1+args.oversample_bend:g}, compression '
+                         f'x{1+args.oversample_compression:g}) for {covered}/{len(weights)} fibers from {path.name}')
+            else:
+                progress(f'Warning: {name}: no location-weight cache {path} (scripts/build_location_weights.py); '
+                         'fresh locations stay uniform')
         if name in saved_draws:  # replay event caps continue where the checkpoint left them
             source_dataset.restore_event_draws(saved_draws[name])
             progress(f'{name}: restored replay draw counts for {len(saved_draws[name]["slots"])} events')

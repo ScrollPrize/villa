@@ -111,3 +111,19 @@ def test_crop_tilt_moves_the_forward_axis_and_the_labels_follow():
     p, s = D.traversal_curve(f, False)
     np.testing.assert_allclose(item['fut_local'] @ item['frame'].T+item['pos'],
                                interp_at(p, s, np.clip(60.+cfg.future_s, 0, s[-1])), atol=1e-6)
+
+
+def test_fresh_locations_follow_the_location_weights():
+    f = curved_fiber()  # 100 vox long; the second half weighs 3x
+    ds = object.__new__(D.FollowDataset)
+    ds.fibers, ds.weights = [f], np.array([1.])
+    ds.window, ds.pool_size, ds.window_samples, ds.cfg, ds.batch_builder = 256., 4, 32, sample_config(), None
+    ds.location_weights = None
+    ds.set_location_weights([(np.arange(0., 100., 8.), np.where(np.arange(0., 100., 8.) >= 48., 3., 1.))])
+    rng, windows = np.random.default_rng(0), []
+    ts = []
+    for _ in range(4000):
+        _, t, rev, _ = ds.fresh_location(rng, windows)
+        ts.append(f.length-t if rev else t)
+    late = np.mean(np.asarray(ts) >= 48.)
+    assert .6 < late < .85  # 3x weight on ~half the fiber (uniform would give ~0.5)
