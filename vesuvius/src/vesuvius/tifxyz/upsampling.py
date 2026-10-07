@@ -385,7 +385,8 @@ def interpolate_at_points(
     query_y, query_x : NDArray
         Query points in nominal (voxel) coordinates.
     scale : Tuple[float, float]
-        Grid scale (scale_y, scale_x).
+        Grid scale (scale_y, scale_x) in grid cells per voxel, typically
+        (0.05, 0.05). Grid index = nominal coordinate * scale.
     order : int
         Interpolation order for bspline method (2-5). Ignored for other methods.
     method : str
@@ -402,8 +403,8 @@ def interpolate_at_points(
         Interpolated (x, y, z, valid) at query points.
     """
     # Convert nominal coordinates to grid coordinates
-    grid_y = np.asarray(query_y, dtype=np.float32) / scale[0]
-    grid_x = np.asarray(query_x, dtype=np.float32) / scale[1]
+    grid_y = np.asarray(query_y, dtype=np.float32) * scale[0]
+    grid_x = np.asarray(query_x, dtype=np.float32) * scale[1]
 
     output_shape = grid_y.shape
 
