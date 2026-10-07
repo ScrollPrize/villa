@@ -29,27 +29,28 @@ def mm_every(rate):
     return '-' if not rate else f'every {10/rate:.0f} mm' if 10/rate >= 20 else f'every {10/rate:.1f} mm'
 
 
-def matched(entry, labels):
-    """Each run's per-seed mistake share and loss rate at the highest early-stop share among the runs' own thresholds.
+def matched(entry, labels, thresholds):
+    """Each run's per-seed mistake share, loss rate, coverage and threshold at the reference run's early-stop share.
 
-    Replay only raises a run's stop rate, so the common level is the largest base value; runs that cannot reach it
-    (no curve) are reported as '-'.
+    The reference is the first run. Replay only raises a run's stop rate, so a run that already stops early more often
+    than the reference, or cannot reach it within the replayed thresholds, is reported as None ('-').
     """
     curves = {}
     for label in labels:
         base = {k: v[0] for k, v in entry['runs'][label]['metrics'].items()}
-        points = [base]+[m for _, m in entry.get('curves', {}).get(label, [])]
+        base['threshold'] = thresholds[label]
+        points = [base]+[dict(m, threshold=t) for t, m in entry.get('curves', {}).get(label, [])]
         curves[label] = points
-    target = max(c[0]['seeds_stopped_early'] for c in curves.values())
+    target = curves[labels[0]][0]['seeds_stopped_early']
     out = {}
     for label, points in curves.items():
         x = np.array([p['seeds_stopped_early'] for p in points])
-        if x.max() < target-1e-9:
+        if x.max() < target-1e-9 or x.min() > target+1e-9:
             out[label] = None
             continue
         order = np.argsort(x)
         out[label] = {k: float(np.interp(target, x[order], np.array([p[k] for p in points])[order]))
-                      for k in ('seeds_mistake', 'losses_rate', 'fiber_coverage')}
+                      for k in ('seeds_mistake', 'losses_rate', 'fiber_coverage', 'threshold')}
     return target, out
 
 
@@ -65,6 +66,7 @@ border-bottom:1px solid var(--line);padding-bottom:4px}h3{font-size:16px;margin:
 th,td{border:1px solid var(--line);padding:5px 9px;text-align:right;white-space:nowrap}th:first-child,td:first-child{text-align:left}
 th{background:color-mix(in srgb,var(--accent) 10%,var(--card))}.star{color:var(--bad);font-weight:600}
 figure{margin:10px 0 22px;background:var(--card);border:1px solid var(--line);padding:8px}figure img{width:100%;height:auto;display:block}
+details{margin:10px 0}summary{cursor:pointer;font-size:16px;margin:8px 0}
 figcaption{font-size:13px;color:var(--muted);margin-top:6px}.tag{display:inline-block;padding:1px 7px;border-radius:9px;font-size:12px;
 margin-right:6px;background:color-mix(in srgb,var(--accent) 15%,var(--card))}.tag.bad{background:color-mix(in srgb,var(--bad) 20%,var(--card))}
 .tag.good{background:color-mix(in srgb,var(--good) 20%,var(--card))}nav a{color:var(--accent);margin-right:12px}
@@ -131,7 +133,7 @@ def html(report, title, traces=None):
            f'<title>Fiber Tracing Results</title><style>{CSS}</style></head><body><main><h1>{esc(title)}</h1>',
            '<nav><a href="#totals">Totals</a><a href="#runs">Runs</a><a href="#outcomes">Outcomes</a><a href="#distance">Distance to mistake</a>'
            '<a href="#stops">Stopping</a><a href="#quality">Quality</a><a href="#matched">Same stop rate</a>'
-           '<a href="#paired">Paired</a><a href="#images">Images</a></nav>']
+           '<a href="#curves">Curves</a><a href="#paired">Paired</a><a href="#images">Images</a></nav>']
     out.append('<h2 id="totals">Total length traced</h2><p class="muted">Correct = on the fiber (in the tube) before the annotation '
                'end. Incorrect = off the fiber before the annotation end. Length traced past annotation ends is not scored and '
                'not included.</p>')
@@ -205,14 +207,37 @@ fiber-bootstrap intervals.</p>""")
                                               for name, fn in block]))
     out.append('<h2 id="matched">Same stop rate</h2>')
     if any('curves' in e for e in report['sources'].values()):
-        out.append('<p>A run that stops more makes fewer mistakes per seed. Each run is replayed at higher confidence thresholds '
-                   'until it stops early as often as the most cautious run, then compared. This is approximate for flow models, '
-                   'where replay overstates stops.</p>')
+        out.append(f'<p>A run that stops more makes fewer mistakes per seed. Each run is replayed at higher confidence thresholds '
+                   f'until it stops early as often as {esc(labels[0])} (the reference) does, then compared. This is approximate for '
+                   'flow models, where replay overstates stops.</p>')
+        thresholds = {l: report['runs'][l].get('confidence') for l in labels}
         rows = []
         for source, entry in report['sources'].items():
-            target, values = matched(entry, [l for l in labels if l in entry['runs']])
-            rows.append([esc(source), pct(target)] + ['-' if values.get(l) is None else pct(values[l]['seeds_mistake']) for l in labels])
-        out.append(table(['source', 'early-stop share'] + [f'{l}: mistakes per seed' for l in labels], rows))
+            target, values = matched(entry, [l for l in labels if l in entry['runs']], thresholds)
+            rows.append([esc(source), pct(target)] + [
+                '-' if values.get(l) is None else f"{pct(values[l]['seeds_mistake'])} (at {values[l]['threshold']:.2f})"
+                for l in labels])
+        out.append(table(['source', 'early-stop share'] + [f'{l}: mistakes per seed (threshold)' for l in labels], rows))
+        out.append('<p class="muted">Threshold = the confidence threshold at which that run stops early as often as the matched '
+                   'level, interpolated between replayed thresholds. "-" means the run already stops early more often than the '
+                   'reference at its own threshold (replay can only add stops), or never stops that often up to 0.99.</p>')
+        out.append('<h2 id="curves">Operating curves</h2><p>Each run replayed from its own threshold upward: how mistakes, early '
+                   'stops and coverage trade off as the threshold rises. The first row of each table is the run as evaluated.</p>')
+        for label in labels:
+            is_open = ' open' if label.startswith('sequence') else ''
+            out.append(f'<details{is_open}><summary><b>{esc(label)}</b> (run at {thresholds[label]})</summary>')
+            for source, entry in report['sources'].items():
+                if label not in entry['runs']:
+                    continue
+                base = {k: v[0] for k, v in entry['runs'][label]['metrics'].items()}
+                points = [(thresholds[label], base)] + [(t, m) for t, m in entry.get('curves', {}).get(label, [])]
+                out.append(f'<h3>{esc(source)}</h3>')
+                out.append(table(['threshold', 'mistake, kept going', 'stopped early', 'reached end', 'fiber covered', 'precision',
+                                  'mistakes per 10 mm', 'stops early'],
+                                 [[f'{t:.2f}', pct(m['seeds_mistake']), pct(m['seeds_stopped_early']), pct(m['seeds_reached_end']),
+                                   pct(m['fiber_coverage']), f"{m['precision']:.3f}", f"{m['losses_rate']:.3f}",
+                                   mm_every(m['premature_stops_rate'])] for t, m in points]))
+            out.append('</details>')
     if len(labels) > 1:
         out.append(f'<h2 id="paired">Paired differences against {esc(labels[0])}</h2><p class="muted">Same traces in both runs; '
                    '<span class="star">*</span> = the 95% interval excludes 0.</p>')

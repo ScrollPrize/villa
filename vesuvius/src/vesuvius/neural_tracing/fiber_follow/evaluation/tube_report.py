@@ -252,7 +252,7 @@ def main(argv=None):
             continue
         gate_plane = args.gate_plane or protocol.get('gate_plane', 16)
         base = protocol['operating_policy']['confidence']
-        for threshold in sorted(t for t in args.replay if t >= base):
+        for threshold in sorted(t for t in args.replay if t > base+1e-9):
             stops = replay_stops(rows, threshold, gate_plane)
             scores = cached_scores(rows, stops, None, args.workers, f'replay{threshold:g}_gate{gate_plane}', refresh=args.rescore)
             replayed = [dict(r, tube=s) for r, s in zip(rows, scores)]
