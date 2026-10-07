@@ -1,4 +1,5 @@
 #include <iostream>
+#include "RenderCuda.hpp"
 #include "RenderPrefetch.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/render/ZarrChunkFetcher.hpp"
@@ -639,6 +640,7 @@ static void renderBands(
     int numParts, int partId,
     int cvType,
     uint32_t bandH,
+    vc::render::cuda::GpuSampler* gpu,  // --gpu: samples each band on the device (nullptr: CPU)
     WriteFn&& writeSlices)
 {
     const uint32_t numBands = (uint32_t(tgtSize.height) + bandH - 1) / bandH;
@@ -678,9 +680,10 @@ static void renderBands(
         // chunks this band samples instead (without waiting, as the box was queued) and
         // read through a view that drops the box request; reads still reach the source.
         // With --prefetch-remote the render was planned up front and cache is that view.
+        // The GPU sampler asks the cache for exactly the chunks its samples touch itself.
         std::optional<vc::render::prefetch::PrefetchedArrayView> bandView;
         vc::render::IChunkedArray* bandCache = cache;
-        if (ds && cache == ds) {
+        if (ds && cache == ds && !gpu) {
             // The planner walks every sample x offset, so split the band's rows across threads.
             const auto& offsets = isComposite ? compositeOffsets : allOffsets;
             const auto method = vc::render::prefetch::samplingForRender(isComposite);
@@ -708,10 +711,14 @@ static void renderBands(
             // skips non-finite pixels, so size + zero it here.
             cv::Mat_<uint8_t> compOut(base.rows, base.cols, uint8_t{0});
             if constexpr (std::is_same_v<T, uint8_t>) {
-                readCompositeFast(compOut, bandCache, level, base, dirs,
-                                  float(sliceStep),
-                                  compositeStart, compositeEnd,
-                                  compositeParams, vc::render::prefetch::samplingForRender(true));
+                if (gpu)
+                    gpu->composite(base, dirs, float(sliceStep), compositeStart, compositeEnd,
+                                   compositeParams, compOut);
+                else
+                    readCompositeFast(compOut, bandCache, level, base, dirs,
+                                      float(sliceStep),
+                                      compositeStart, compositeEnd,
+                                      compositeParams, vc::render::prefetch::samplingForRender(true));
             }
             cv::Mat s = compOut;
             rotateFlipIfNeeded(s, rotQuad, flipAxis);
@@ -719,7 +726,10 @@ static void renderBands(
         } else {
             // Normal: bulk read + accumulate
             std::vector<cv::Mat_<T>> raw;
-            readMultiSlice(raw, bandCache, level, base, dirs, allOffsets);
+            if (gpu)
+                gpu->sampleSlices(base, dirs, allOffsets, raw);
+            else
+                readMultiSlice(raw, bandCache, level, base, dirs, allOffsets);
             slices = processRawSlices<T>(raw, numSlices, accumOffsets, accumType, cvType, rotQuad, flipAxis);
         }
 
@@ -796,7 +806,9 @@ static void renderTiles(
     // TIF output (optional)
     std::vector<TiffWriter>* tifWriters, uint32_t tiffTileH,
     bool quickTif,
-    bool resume)
+    bool resume,
+    // --gpu: samples each tile row on the device (nullptr: CPU)
+    vc::render::cuda::GpuSampler* gpu)
 {
     const size_t CH = chunks0[1], CW = chunks0[2];
     const uint32_t numTileRows = static_cast<uint32_t>(tilesYSrc);
@@ -864,6 +876,63 @@ static void renderTiles(
         // first failure and rethrow it once every tile of this row has stopped.
         std::atomic<bool> rowFailed{false};
         std::exception_ptr rowError;
+
+        // The tile's L0 chunk is already on disk (--resume): the loop below only scatters it
+        // into the pyramid.
+        auto tileOnDisk = [&](uint32_t tx) {
+            if (!resume) return false;
+            const bool needsRotFlip = (rotQuad >= 0 || flipAxis >= 0);
+            int dTx = int(tx), dTy = int(ty), dTX, dTY;
+            if (needsRotFlip)
+                mapTileIndex(int(tx), int(ty), int(tilesXSrc), int(tilesYSrc),
+                             std::max(rotQuad, 0), flipAxis, dTx, dTy, dTX, dTY);
+            return dsOut->chunkExists(0, size_t(dTy), size_t(dTx));
+        };
+
+        // --gpu: generate the row's tiles here, gather them into one band and sample it on the
+        // device in a single pass; the tile loop below then takes its samples from that band
+        // instead of sampling itself. Tiles already on disk stay NaN, which samples to nothing.
+        std::vector<cv::Mat_<T>> gpuRaw;
+        cv::Mat_<uint8_t> gpuComp;
+        if (gpu) {
+            const cv::Vec3f qnan(NAN, NAN, NAN);
+            cv::Mat_<cv::Vec3f> bandBase(int(dy), tgtSize.width, qnan);
+            cv::Mat_<cv::Vec3f> bandDirs(int(dy), tgtSize.width, qnan);
+            #pragma omp parallel for schedule(dynamic)
+            for (uint32_t tx = 0; tx < numTileCols; tx++) {
+                if (rowFailed.load(std::memory_order_relaxed)) continue;
+                try {
+                    if (tileOnDisk(tx)) continue;
+                    const uint32_t x0 = tx * uint32_t(CW);
+                    const uint32_t dx = std::min(uint32_t(CW), uint32_t(tgtSize.width) - x0);
+                    float u0, v0; computeCanvasOrigin(fullSize, u0, v0);
+                    u0 += float(crop.x) + float(x0);
+                    v0 += float(crop.y) + float(y0);
+                    cv::Mat_<cv::Vec3f> tilePts, tileNrm, base, dirs;
+                    genTile(surf, cv::Size(int(dx), int(dy)), renderScale, u0, v0, tilePts, tileNrm);
+                    prepareBaseAndDirs(tilePts, tileNrm, scaleSeg, dsScale, hasAffine, aff, base, dirs);
+                    const cv::Rect at(int(x0), 0, int(dx), int(dy));
+                    base.copyTo(bandBase(at));
+                    dirs.copyTo(bandDirs(at));
+                } catch (...) {
+                    #pragma omp critical(render_tile_error)
+                    {
+                        if (!rowError) rowError = std::current_exception();
+                    }
+                    rowFailed.store(true, std::memory_order_relaxed);
+                }
+            }
+            if (rowError) std::rethrow_exception(rowError);
+            if (isComposite) {
+                gpuComp = cv::Mat_<uint8_t>(int(dy), tgtSize.width, uint8_t{0});
+                if constexpr (std::is_same_v<T, uint8_t>)
+                    gpu->composite(bandBase, bandDirs, float(sliceStep), compositeStart, compositeEnd,
+                                   compositeParams, gpuComp);
+            } else {
+                gpu->sampleSlices(bandBase, bandDirs, allOffsets, gpuRaw);
+            }
+        }
+
         #pragma omp parallel for schedule(dynamic)
         for (uint32_t tx = 0; tx < numTileCols; tx++) {
             if (rowFailed.load(std::memory_order_relaxed)) continue;
@@ -906,33 +975,47 @@ static void renderTiles(
                 uint32_t x0 = tx * uint32_t(CW);
                 uint32_t dx = std::min(uint32_t(CW), uint32_t(tgtSize.width) - x0);
 
-                // 1. Generate surface for this tile
-                float u0, v0; computeCanvasOrigin(fullSize, u0, v0);
-                u0 += float(crop.x) + float(x0);
-                v0 += float(crop.y) + float(y0);
-                cv::Mat_<cv::Vec3f> tilePts, tileNrm;
-                genTile(surf, cv::Size(int(dx), int(dy)), renderScale, u0, v0, tilePts, tileNrm);
-
-                // 2. Prepare base coords and step directions
-                cv::Mat_<cv::Vec3f> base, dirs;
-                prepareBaseAndDirs(tilePts, tileNrm, scaleSeg, dsScale, hasAffine, aff, base, dirs);
-
-                // 3. Sample all slices for this tile (single-threaded)
                 std::vector<cv::Mat_<T>> raw;
-                if (isComposite) {
-                    if constexpr (std::is_same_v<T, uint8_t>) {
-                        // readCompositeFast writes into a pre-allocated buffer (it never calls create),
-                        // and skips non-finite pixels, so size + zero it here.
-                        cv::Mat_<uint8_t> compOut(base.rows, base.cols, uint8_t{0});
-                        readCompositeFast(compOut, cache, level, base, dirs,
-                                          float(sliceStep),
-                                          compositeStart, compositeEnd,
-                                          compositeParams, vc::render::prefetch::samplingForRender(true));
-                        raw.resize(1);
-                        raw[0] = compOut;
+                if (gpu) {
+                    // Sampled on the device for the whole row above: this tile's columns of it.
+                    const cv::Rect at(int(x0), 0, int(dx), int(dy));
+                    if (isComposite) {
+                        if constexpr (std::is_same_v<T, uint8_t>) {
+                            raw.resize(1);
+                            raw[0] = gpuComp(at);
+                        }
+                    } else {
+                        raw.reserve(gpuRaw.size());
+                        for (const auto& slice : gpuRaw) raw.push_back(slice(at));
                     }
                 } else {
-                    sampleTileSlices(raw, cache, level, base, dirs, allOffsets);
+                    // 1. Generate surface for this tile
+                    float u0, v0; computeCanvasOrigin(fullSize, u0, v0);
+                    u0 += float(crop.x) + float(x0);
+                    v0 += float(crop.y) + float(y0);
+                    cv::Mat_<cv::Vec3f> tilePts, tileNrm;
+                    genTile(surf, cv::Size(int(dx), int(dy)), renderScale, u0, v0, tilePts, tileNrm);
+
+                    // 2. Prepare base coords and step directions
+                    cv::Mat_<cv::Vec3f> base, dirs;
+                    prepareBaseAndDirs(tilePts, tileNrm, scaleSeg, dsScale, hasAffine, aff, base, dirs);
+
+                    // 3. Sample all slices for this tile (single-threaded)
+                    if (isComposite) {
+                        if constexpr (std::is_same_v<T, uint8_t>) {
+                            // readCompositeFast writes into a pre-allocated buffer (it never calls create),
+                            // and skips non-finite pixels, so size + zero it here.
+                            cv::Mat_<uint8_t> compOut(base.rows, base.cols, uint8_t{0});
+                            readCompositeFast(compOut, cache, level, base, dirs,
+                                              float(sliceStep),
+                                              compositeStart, compositeEnd,
+                                              compositeParams, vc::render::prefetch::samplingForRender(true));
+                            raw.resize(1);
+                            raw[0] = compOut;
+                        }
+                    } else {
+                        sampleTileSlices(raw, cache, level, base, dirs, allOffsets);
+                    }
                 }
 
                 // Accumulate (no rotation — applied per-zarr-chunk and per-tif-band separately)
@@ -1339,6 +1422,14 @@ int main(int argc, char *argv[])
             "[--composite-start, --composite-end] layers along the normal at --slice-step spacing; "
             "use a symmetric range (e.g. --composite-start=-54 --composite-end=54) for a centered "
             "projection.")
+        ("gpu", po::bool_switch()->default_value(false),
+            "Sample the volume on a CUDA device. The NVIDIA driver and the NVRTC runtime compiler "
+            "are loaded at run time (nvrtc beside the executable, in VC_NVRTC_DIR, in the CUDA "
+            "toolkit, or on the library path), so the build needs no toolkit. Surface generation, "
+            "accumulation and the writers stay on the CPU, and the samples are the bytes the CPU "
+            "path produces. Without a usable device the render proceeds on the CPU with a warning.")
+        ("gpu-cache-gb", po::value<double>()->default_value(0.0),
+            "Device memory for the --gpu volume chunk pool, in GB (0 = half of the free device memory)")
         ("num-parts", po::value<int>()->default_value(1), "Parts for multi-VM")
         ("part-id", po::value<int>()->default_value(0), "Part ID (0-indexed)")
         ("merge-tiff-parts", po::bool_switch()->default_value(false), "Merge partial TIFFs from multi-VM render")
@@ -1644,6 +1735,29 @@ int main(int argc, char *argv[])
         std::ostringstream oss;
         for (auto v : chunk_cache->chunkShape(cacheLevel)) oss << v << " ";
         logPrintf(stdout, "chunk shape [%s]\n", oss.str().c_str());
+    }
+
+    // --- GPU sampling ---
+    // Opened once the source is known (its dtype and chunk shape size the device pool) and the
+    // composite reducer is settled (alpha and Beer-Lambert stay on the CPU).
+    std::unique_ptr<vc::render::cuda::GpuSampler> gpu;
+    if (parsed["gpu"].as<bool>()) {
+        const double gpuCacheGb = parsed["gpu-cache-gb"].as<double>();
+        if (!std::isfinite(gpuCacheGb) || gpuCacheGb < 0.0) {
+            logPrintf(stderr, "Error: --gpu-cache-gb must be a non-negative number\n");
+            return EXIT_FAILURE;
+        }
+        std::string why;
+        if (isCompositeMode &&
+            !vc::render::cuda::GpuSampler::compositeSupported(compositeParams, compositeEnd - compositeStart + 1, &why)) {
+            logPrintf(stderr, "Warning: %s; rendering on the CPU\n", why.c_str());
+        } else {
+            gpu = vc::render::cuda::GpuSampler::open(
+                *chunk_cache, cacheLevel, size_t(gpuCacheGb * double(1ull << 30)),
+                [](const std::string& line) { logPrintf(stdout, "%s\n", line.c_str()); }, why);
+            if (!gpu)
+                logPrintf(stderr, "Warning: GPU unavailable (%s); rendering on the CPU\n", why.c_str());
+        }
     }
 
     // --- Resolve voxel size for OME-Zarr metadata ---
@@ -2066,7 +2180,7 @@ int main(int argc, char *argv[])
                         dsOut.get(), chunks0, tilesXSrc, tilesYSrc,
                         pyramidDs,
                         tifWriters.empty() ? nullptr : &tifWriters, tiffTileH, quickTif,
-                        resumeFlag);
+                        resumeFlag, gpu.get());
                 else
                     renderTiles<uint8_t>(surf.get(), chunk_cache, renderingCache, cacheLevel,
                         full_size, crop, tgt_size, float(render_scale), scale_seg, ds_scale,
@@ -2076,7 +2190,7 @@ int main(int argc, char *argv[])
                         dsOut.get(), chunks0, tilesXSrc, tilesYSrc,
                         pyramidDs,
                         tifWriters.empty() ? nullptr : &tifWriters, tiffTileH, quickTif,
-                        resumeFlag);
+                        resumeFlag, gpu.get());
             } else {
                 // Band-based: TIF-only path
                 uint32_t bandH = 128;
@@ -2104,13 +2218,13 @@ int main(int argc, char *argv[])
                         full_size, crop, tgt_size, float(render_scale), scale_seg, ds_scale,
                         hasAffine, affineTransform, num_slices, slice_step,
                         accumOffsets, accumType, isCompositeMode, compositeStart, compositeEnd,
-                        compositeParams, rotQuad, flip_axis, numParts, partId, cvType, bandH, writerFn);
+                        compositeParams, rotQuad, flip_axis, numParts, partId, cvType, bandH, gpu.get(), writerFn);
                 else
                     renderBands<uint8_t>(surf.get(), chunk_cache, renderingCache, cacheLevel,
                         full_size, crop, tgt_size, float(render_scale), scale_seg, ds_scale,
                         hasAffine, affineTransform, num_slices, slice_step,
                         accumOffsets, accumType, isCompositeMode, compositeStart, compositeEnd,
-                        compositeParams, rotQuad, flip_axis, numParts, partId, cvType, bandH, writerFn);
+                        compositeParams, rotQuad, flip_axis, numParts, partId, cvType, bandH, gpu.get(), writerFn);
             }
 
             tifWriters.clear();
@@ -2160,6 +2274,7 @@ int main(int argc, char *argv[])
     }
     if (!ok)
         return EXIT_FAILURE;
+    if (gpu) logPrintf(stdout, "%s\n", gpu->summary().c_str());
 
     // Band prefetch can outlive the final sampled pixel. Let its downloads and
     // cache writes finish before the cache is destroyed and invalidates them.

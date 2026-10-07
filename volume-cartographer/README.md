@@ -279,6 +279,35 @@ This writes `render/00.tif` (360×360 pixels for the segment above, about
   `voxelsize: 182.128`, the seed is expected in level-2 coordinates, and the
   segment's `meta.json` keeps the selector in `target_volume`.
 
+#### Rendering on a GPU
+
+`--gpu` moves the volume sampling of a render to a CUDA device. Surface
+generation, accumulation, rotation and the writers stay on the CPU, and the
+samples are the bytes the CPU path produces (the kernels transcribe
+`Slicing.cpp`'s trilinear and nearest-neighbour samplers operation by
+operation, and `core/test/test_render_cuda.cpp` and
+`test_render_tifxyz_gpu.py` hold them to that), so a `--gpu` render is
+interchangeable with a CPU render of the same command line. On a 21-layer
+render of a large segment the sampling drops from minutes to seconds, leaving
+chunk decoding and output writing as the cost.
+
+- Nothing changes at build time: the NVIDIA driver (`nvcuda.dll`,
+  `libcuda.so.1`) and the NVRTC runtime compiler are loaded when the render
+  starts, and the kernels are compiled for the device in use. NVRTC is looked
+  for beside the executable, in `VC_NVRTC_DIR`, in the CUDA toolkit
+  (`CUDA_PATH/bin`, `/usr/local/cuda/lib64`) and on the library search path;
+  `nvrtc64_1x0_0.dll` / `libnvrtc.so.1x` come with the toolkit and with
+  `pip install nvidia-cuda-nvrtc-cu12`.
+- The device sees the first GPU the driver shows the process
+  (`CUDA_VISIBLE_DEVICES`), and keeps decoded chunks in a pool sized by
+  `--gpu-cache-gb` (default: half of the free device memory). Chunks come
+  from the same decoded-chunk cache as a CPU render, so remote volumes,
+  every compressor and `--prefetch-remote` work as before.
+- Without a usable device the render logs `Warning: GPU unavailable (...)` and
+  proceeds on the CPU. The `alpha` and `beerlambert` composites, and
+  `median` composites of more than 256 layers, also stay on the CPU, with a
+  warning; `max`, `min`, `mean` and `median` run on the device.
+
 ### Opening a volume package and navigating the UI
 First, click `File -> Open volpkg` and select the volpkg you wish to work with (select the folder ending in .volpkg)
 
