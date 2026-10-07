@@ -1,6 +1,6 @@
 # Status
 
-- [ ] Correct omitted EMA selections: current/best EMA99 and EMA999, GPU0–5.
+- [x] Correct omitted EMA selections: current/best EMA99 and EMA999, GPU0–5. All four completed; runner exited 0.
 
 - [x] Plan recorded.
 - [x] Independent review (extended_tuning_review approved).

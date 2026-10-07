@@ -1,5 +1,7 @@
 ## 2026-10-07 — 194246 training snapshot comparison
 
+- Corrected initial raw-only omission: current/best EMA99 and EMA999 completed on GPU0–5, frozen before continuation. Min512 errors/pieces/retained: EMA99 current 3/263/77.076%, best 3/258/80.681%; EMA999 current 5/270/77.765%, best 4/251/79.249%. Each took 286–296 s including startup and inference. No separate EMA best-restarts checkpoints exist. Same policy/cohort verified, 48 focused tests passed; full seven-selection comparison plus historical control recorded in report.
+
 - Froze current raw u23300, best-loss raw u20000 and best-restarts raw u17600 before evaluation; ran all 91 fibers / 182 directions with the unchanged winning policy on GPUs 0–5.
 - After 512-vx output filtering: respectively 4/3/4 errors, 291/270/264 pieces, 77.107/78.989/76.844% retained. Previous EMA999 u12100 remains the overall leader: 0 errors, 233 pieces, 82.086%. Before filtering all three new models have 4 errors.
 - Reused shared evaluation and metric helpers; exact cohort/policy audits and 30 focused tests. Full before/after-filter and per-scroll results in `docs/benchmarks/normalwidth_194246_tuned_20261007_v1.md` and JSON. No defaults changed.
