@@ -19,12 +19,12 @@ import time
 import numpy as np
 import torch
 
-from vesuvius.neural_tracing.sheet_tracing import config as C
-from vesuvius.neural_tracing.sheet_tracing.data.episodes import EpisodeSampler, EpisodeStream, collate, episode_pad
-from vesuvius.neural_tracing.sheet_tracing.data.patches import build_index
-from vesuvius.neural_tracing.sheet_tracing.model import build_model, compile_model, init_model_state
-from vesuvius.neural_tracing.sheet_tracing.rollout import Tracer
-from vesuvius.neural_tracing.sheet_tracing.train import EMA, _pinned, device_batches, optimize_step
+from vesuvius.neural_tracing.tracers.sheets import config as C
+from vesuvius.neural_tracing.tracers.sheets.data.episodes import EpisodeSampler, EpisodeStream, collate, episode_pad
+from vesuvius.neural_tracing.tracers.sheets.data.patches import build_index
+from vesuvius.neural_tracing.tracers.sheets.model import build_model, compile_model, init_model_state
+from vesuvius.neural_tracing.tracers.sheets.rollout import Tracer
+from vesuvius.neural_tracing.tracers.sheets.train import EMA, _pinned, device_batches, optimize_step
 
 
 def main(argv=None):
@@ -45,7 +45,7 @@ def main(argv=None):
     device = torch.device(args.device)
     torch.manual_seed(tc.seed)
     if tc.compile_geometry:
-        from vesuvius.neural_tracing.sheet_tracing.geometry import use_compiled_projection
+        from vesuvius.neural_tracing.tracers.sheets.geometry import use_compiled_projection
         use_compiled_projection()
 
     sampler = EpisodeSampler(d, build_index(d.patches_dir, C.OUTPUT/'cache'), 'train', d.steps, d.roi,

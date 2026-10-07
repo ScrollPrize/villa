@@ -6,7 +6,7 @@ random, and the fiber's line points from there on, cut to ``(--points - 1) * poi
 are the seed row (``--points`` front points). Fiber coordinates are multiplied by ``--coord-scale`` into the model's
 level-0 voxels (0.25: fibers traced on the 2.4 um Scroll 1 scan, model on s1_ds2). The advance direction at each
 point lies in the sheet, perpendicular to the fiber: sheet normal (2/8 CT structure tensor on level 0, as
-fiber_follow estimates normals) x fiber tangent, oriented ``--direction`` (up = +z, down, or both). Seeds whose
+the fiber tracer estimates normals) x fiber tangent, oriented ``--direction`` (up = +z, down, or both). Seeds whose
 points lie outside the volume or on empty CT are skipped. Each trace runs ``--steps`` steps without early stop (like
 the trace benchmark), and is written as ``OUT/fiber_FILESTEM_cpK_up|down`` tifxyz (kept points only; ``trace.json``
 provenance, ``confidence.npy``, area in meta.json). With ``--follow`` each trace also writes the fiber it extends
@@ -24,11 +24,11 @@ from pathlib import Path
 
 import numpy as np
 
-from vesuvius.neural_tracing.fiber_follow.data.volume import ChunkedArray
-from vesuvius.neural_tracing.sheet_tracing import config as C
-from vesuvius.neural_tracing.sheet_tracing.evaluate import load_checkpoint
-from vesuvius.neural_tracing.sheet_tracing.data.fibers import episode_fibers, fiber_pool
-from vesuvius.neural_tracing.sheet_tracing.infer import connected_keep, resample, trace, write_trace
+from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import ChunkedArray
+from vesuvius.neural_tracing.tracers.sheets import config as C
+from vesuvius.neural_tracing.tracers.sheets.evaluate import load_checkpoint
+from vesuvius.neural_tracing.tracers.sheets.data.fibers import episode_fibers, fiber_pool
+from vesuvius.neural_tracing.tracers.sheets.infer import connected_keep, resample, trace, write_trace
 
 
 def fiber_tag(fiber: dict) -> str:
@@ -58,15 +58,15 @@ def seed_from_fiber(fiber: dict, scale: float, length: float, rng) -> tuple[np.n
 
 
 CONTEXT_RADIUS = 38  # CT voxels around each point: four integration sigmas plus three derivative sigmas
-DERIVATIVE_SIGMA, INTEGRATION_SIGMA = 2., 8.  # the 2/8 tensor of fiber_follow's sheet normals
+DERIVATIVE_SIGMA, INTEGRATION_SIGMA = 2., 8.  # the 2/8 tensor of the fiber tracer's sheet normals
 MIN_EIGENGAP = .05  # relative gap of the two largest eigenvalues; below it the CT shows no clear sheet
 
 
 def sheet_normal(volume, point: np.ndarray) -> np.ndarray | None:
     """Sheet normal (xyz) at a level-0 point: the largest-eigenvalue axis of the CT structure tensor (derivative
-    sigma 2, integration sigma 8 voxels, Gaussian-weighted around the point), as fiber_follow estimates it; None
+    sigma 2, integration sigma 8 voxels, Gaussian-weighted around the point), as the fiber tracer estimates it; None
     without a clear sheet or near the volume edge."""
-    from vesuvius.neural_tracing.fiber_follow.tracing.heading import ct_structure_tensor
+    from vesuvius.neural_tracing.tracers.fibers.frames.ct import ct_structure_tensor
     start = np.floor(point[::-1]).astype(np.int64)-CONTEXT_RADIUS
     size = np.full(3, 2*CONTEXT_RADIUS+1)
     if np.any(start < 0) or np.any(start+size > np.asarray(volume.shape)):

@@ -1,7 +1,7 @@
 """Figures for ARCHITECTURE.md. Diagrams are schematic but to scale; the crop and trace figures use a
 real checkpoint and volume.
 
-  python -m vesuvius.neural_tracing.sheet_tracing.docs.make_architecture_figures --checkpoint CKPT [--path-map OLD=NEW]
+  python -m vesuvius.neural_tracing.tracers.sheets.docs.make_architecture_figures --checkpoint CKPT [--path-map OLD=NEW]
 """
 from __future__ import annotations
 
@@ -178,8 +178,8 @@ def layout_section():
 def load(checkpoint: str, path_map: list[str], device: str):
     """The checkpoint's model and config, sampling seeds only from the patch directories on ``data.volume`` (the
     volume the figures read)."""
-    from vesuvius.neural_tracing.sheet_tracing.evaluate import load_checkpoint
-    from vesuvius.neural_tracing.sheet_tracing.config import path_mapper
+    from vesuvius.neural_tracing.tracers.sheets.evaluate import load_checkpoint
+    from vesuvius.neural_tracing.tracers.sheets.config import path_mapper
     model, cfg = load_checkpoint(checkpoint, device)[:2]
     path_mapper(path_map)(cfg)
     d = cfg.data
@@ -193,12 +193,12 @@ def load(checkpoint: str, path_map: list[str], device: str):
 
 def real_data(checkpoint: str, path_map: list[str], device: str):
     """Crops the model sees at the seed of a benchmark trace, and that trace."""
-    from vesuvius.neural_tracing.fiber_follow.data.volume import ChunkedArray
-    from vesuvius.neural_tracing.sheet_tracing.geometry import point_frames
-    from vesuvius.neural_tracing.sheet_tracing.infer import read_block, resample, trace
-    from vesuvius.neural_tracing.sheet_tracing.rollout import Front, Tracer
-    from vesuvius.neural_tracing.sheet_tracing.sampling import sample_crops, view_radius
-    from vesuvius.neural_tracing.sheet_tracing.trace_benchmark import draw_seeds, seed_polyline
+    from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import ChunkedArray
+    from vesuvius.neural_tracing.tracers.sheets.geometry import point_frames
+    from vesuvius.neural_tracing.tracers.sheets.infer import read_block, resample, trace
+    from vesuvius.neural_tracing.tracers.sheets.rollout import Front, Tracer
+    from vesuvius.neural_tracing.tracers.sheets.sampling import sample_crops, view_radius
+    from vesuvius.neural_tracing.tracers.sheets.trace_benchmark import draw_seeds, seed_polyline
     model, cfg = load(checkpoint, path_map, device)
     seeds, spec, data = draw_seeds(cfg, 12, 30, 240., .95)
     w = seeds[3]
@@ -280,7 +280,7 @@ def real_data(checkpoint: str, path_map: list[str], device: str):
 def tilt():
     """Catmull-Rom vs tilted tangents through the same points, over a sheet with a bump between two of them."""
     import torch as _torch
-    from vesuvius.neural_tracing.sheet_tracing.geometry import chord_tangents, hermite_dense, normalize
+    from vesuvius.neural_tracing.tracers.sheets.geometry import chord_tangents, hermite_dense, normalize
     x = np.linspace(-10, 190, 400)
     sheet = 3.*np.exp(-((x-90)/18)**2)  # a 3 vx bump between the points at 60 and 120
     pts = _torch.tensor([[[0., 0, 0], [60., 0, 0], [120., 0, 0], [180., 0, 0]]])
@@ -317,11 +317,11 @@ def crops_xy(checkpoint: str, path_map: list[str], device: str, name: str = 'cro
     """An xy slice (z = const) of the CT through a real seed whose advance is close to z, with the actual sample
     positions of the point and grid-column crops that fall in the slice."""
     from scipy.spatial import ConvexHull
-    from vesuvius.neural_tracing.fiber_follow.data.volume import ChunkedArray
-    from vesuvius.neural_tracing.sheet_tracing.geometry import chord_tangents, normalize, point_frames
-    from vesuvius.neural_tracing.sheet_tracing.infer import resample
-    from vesuvius.neural_tracing.sheet_tracing.rollout import Front, Tracer
-    from vesuvius.neural_tracing.sheet_tracing.trace_benchmark import draw_seeds, seed_polyline
+    from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import ChunkedArray
+    from vesuvius.neural_tracing.tracers.sheets.geometry import chord_tangents, normalize, point_frames
+    from vesuvius.neural_tracing.tracers.sheets.infer import resample
+    from vesuvius.neural_tracing.tracers.sheets.rollout import Front, Tracer
+    from vesuvius.neural_tracing.tracers.sheets.trace_benchmark import draw_seeds, seed_polyline
     model, cfg = load(checkpoint, path_map, device)
     seeds, spec, data = draw_seeds(cfg, 100, 30, 240., .95)
     best = None

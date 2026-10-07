@@ -7,7 +7,7 @@
 #   fiber=remote_l0_fiber_ft/last.pt
 set -e
 PKG=$(cd "$(dirname "$0")/.." && pwd)
-REPO=$(cd "$PKG/../../../.." && pwd)  # vesuvius/
+REPO=$(cd "$PKG/../../../../.." && pwd)  # vesuvius/
 D=/ephemeral/sean/sheet_tracing/data
 out=$1; steps=$2; shift 2; ck=(); nm=(); extra=()
 while [ $# -gt 0 ]; do
@@ -15,7 +15,7 @@ while [ $# -gt 0 ]; do
   nm+=("${1%%=*}"); ck+=("$PKG/output/remote/${1#*=}"); shift
 done
 cd "$REPO"
-exec .venv/bin/python -m vesuvius.neural_tracing.sheet_tracing.trace_benchmark --checkpoints "${ck[@]}" --names "${nm[@]}" \
+exec .venv/bin/python -m vesuvius.neural_tracing.tracers.sheets.trace_benchmark --checkpoints "${ck[@]}" --names "${nm[@]}" \
   --threshold 0.4 --seeds 100 --steps "$steps" --out "$out" \
   --path-map $D/s1_ds2.zarr=/home/sean/Documents/volpkgs/s1_ds2.volpkg/volumes/s1_ds2.zarr \
   --path-map $D/verified_patches_old=/home/sean/Desktop/spiral_dataset/verified_patches \

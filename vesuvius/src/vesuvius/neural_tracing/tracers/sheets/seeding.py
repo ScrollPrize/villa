@@ -3,8 +3,8 @@ from __future__ import annotations
 
 import torch
 
-from vesuvius.neural_tracing.sheet_tracing.geometry import grid_eval, project, sheet_distance, surface_frame
-from vesuvius.neural_tracing.sheet_tracing.sampling import sample_block
+from vesuvius.neural_tracing.tracers.sheets.geometry import grid_eval, project, sheet_distance, surface_frame
+from vesuvius.neural_tracing.tracers.sheets.sampling import sample_block
 
 
 def _sheet_noise(frame, sigma_n: float, sigma_t: float, generator):

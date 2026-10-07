@@ -23,11 +23,11 @@ Outputs in ``output/trace_bench/TAG``: report.json, per_step.png, seed_NN.png, a
 GT window) and ``seedNN_MODEL`` (each trace; stopped points written as -1) for inspection in VC3D.
 
 Usage:
-  python -m vesuvius.neural_tracing.sheet_tracing.trace_benchmark --checkpoints output/A/best.pt output/B/best.pt \\
+  python -m vesuvius.neural_tracing.tracers.sheets.trace_benchmark --checkpoints output/A/best.pt output/B/best.pt \\
       --seeds 12 --steps 30 --tag ab
-  python -m vesuvius.neural_tracing.sheet_tracing.trace_benchmark --rescore output/trace_bench/ab
+  python -m vesuvius.neural_tracing.tracers.sheets.trace_benchmark --rescore output/trace_bench/ab
   # checkpoints trained elsewhere: map their recorded data paths (volumes, patch directories)
-  python -m vesuvius.neural_tracing.sheet_tracing.trace_benchmark --checkpoints remote/A/last.pt \\
+  python -m vesuvius.neural_tracing.tracers.sheets.trace_benchmark --checkpoints remote/A/last.pt \\
       --path-map /remote/data/s1_ds2.zarr=/local/s1_ds2.zarr --path-map /remote/patches=/local/patches --out DIR
 """
 from __future__ import annotations
@@ -41,15 +41,15 @@ import numpy as np
 import tifffile
 import torch
 
-from vesuvius.neural_tracing.fiber_follow.data.volume import ChunkedArray
-from vesuvius.neural_tracing.sheet_tracing import config as C
-from vesuvius.neural_tracing.sheet_tracing.data.episodes import EpisodeSampler, split_of
-from vesuvius.neural_tracing.sheet_tracing.data.patches import build_index
-from vesuvius.neural_tracing.sheet_tracing.evaluate import load_checkpoint
-from vesuvius.neural_tracing.sheet_tracing.geometry import grid_eval, surface_frame
-from vesuvius.neural_tracing.sheet_tracing.infer import connected_keep, read_block, resample, trace, write_surface
-from vesuvius.neural_tracing.sheet_tracing.losses import landing
-from vesuvius.neural_tracing.sheet_tracing.sampling import sample_plane
+from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import ChunkedArray
+from vesuvius.neural_tracing.tracers.sheets import config as C
+from vesuvius.neural_tracing.tracers.sheets.data.episodes import EpisodeSampler, split_of
+from vesuvius.neural_tracing.tracers.sheets.data.patches import build_index
+from vesuvius.neural_tracing.tracers.sheets.evaluate import load_checkpoint
+from vesuvius.neural_tracing.tracers.sheets.geometry import grid_eval, surface_frame
+from vesuvius.neural_tracing.tracers.sheets.infer import connected_keep, read_block, resample, trace, write_surface
+from vesuvius.neural_tracing.tracers.sheets.losses import landing
+from vesuvius.neural_tracing.tracers.sheets.sampling import sample_plane
 
 
 def _seed_sampler(cfg, steps: int, front: float, min_valid: float, split: str, all_val: bool, seed_split: bool):

@@ -7,10 +7,10 @@ averages the per-step losses. The run directory ``output/NAME`` holds config.jso
 best.pt (highest validation score = coverage - kept_off), periodic diagnostics (val_XXXXXX/), and a final long-rollout eval.
 
 Usage:
-  python -m vesuvius.neural_tracing.sheet_tracing.train --config remote_l0_points_ft.json --init output/l0_joint/last.pt
-  python -m vesuvius.neural_tracing.sheet_tracing.train --config remote_l0_fiber_ft.json \
+  python -m vesuvius.neural_tracing.tracers.sheets.train --config remote_l0_points_ft.json --init output/l0_joint/last.pt
+  python -m vesuvius.neural_tracing.tracers.sheets.train --config remote_l0_fiber_ft.json \
       --init output/remote_l0_points_ft/last.pt
-  python -m vesuvius.neural_tracing.sheet_tracing.train --resume output/remote_l0_fiber_ft/last.pt
+  python -m vesuvius.neural_tracing.tracers.sheets.train --resume output/remote_l0_fiber_ft/last.pt
 """
 from __future__ import annotations
 
@@ -28,18 +28,18 @@ import time
 import torch
 from tqdm import tqdm
 
-from vesuvius.neural_tracing.fiber_follow.train.runloop import raise_open_file_limit
-from vesuvius.neural_tracing.sheet_tracing import config as C
-from vesuvius.neural_tracing.sheet_tracing import evaluate as E
-from vesuvius.neural_tracing.sheet_tracing.data.episodes import (
+from vesuvius.neural_tracing.tracers.shared.system import raise_open_file_limit
+from vesuvius.neural_tracing.tracers.sheets import config as C
+from vesuvius.neural_tracing.tracers.sheets import evaluate as E
+from vesuvius.neural_tracing.tracers.sheets.data.episodes import (
     FIBER_KEYS, EpisodeSampler, EpisodeStream, MixedFrontStream, collate, episode_pad, fixed_episodes, keep_batch)
-from vesuvius.neural_tracing.sheet_tracing.data.patches import build_index
-from vesuvius.neural_tracing.sheet_tracing.live import LiveChains
-from vesuvius.neural_tracing.sheet_tracing.losses import step_losses
-from vesuvius.neural_tracing.sheet_tracing.model import build_model, compile_model, init_model_state, load_model_state
-from vesuvius.neural_tracing.sheet_tracing.rollout import Tracer
-from vesuvius.neural_tracing.sheet_tracing.seeding import perturb, seed_rows, sheet_jump
-from vesuvius.neural_tracing.sheet_tracing.visualize import episode_figure, metric_figure, training_figure
+from vesuvius.neural_tracing.tracers.sheets.data.patches import build_index
+from vesuvius.neural_tracing.tracers.sheets.live import LiveChains
+from vesuvius.neural_tracing.tracers.sheets.losses import step_losses
+from vesuvius.neural_tracing.tracers.sheets.model import build_model, compile_model, init_model_state, load_model_state
+from vesuvius.neural_tracing.tracers.sheets.rollout import Tracer
+from vesuvius.neural_tracing.tracers.sheets.seeding import perturb, seed_rows, sheet_jump
+from vesuvius.neural_tracing.tracers.sheets.visualize import episode_figure, metric_figure, training_figure
 
 
 def learning_rate(it: int, tc, minutes: float = 0.) -> float:
@@ -257,7 +257,7 @@ def main(argv=None):
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     torch.manual_seed(tc.seed)
     if tc.compile_geometry:
-        from vesuvius.neural_tracing.sheet_tracing.geometry import use_compiled_projection
+        from vesuvius.neural_tracing.tracers.sheets.geometry import use_compiled_projection
         use_compiled_projection()
     device = torch.device(tc.device)
 

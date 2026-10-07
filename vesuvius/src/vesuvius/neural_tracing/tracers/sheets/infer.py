@@ -10,7 +10,7 @@ point are written as invalid (-1); the points keep riding the curve, so they rea
 again. Tracing stops after ``--steps``, at the first row with no confident point connected to the surface traced
 so far, or when the front leaves the volume.
 
-  python -m vesuvius.neural_tracing.sheet_tracing.infer --checkpoint output/remote_l0_points_ft/last.pt \\
+  python -m vesuvius.neural_tracing.tracers.sheets.infer --checkpoint output/remote_l0_points_ft/last.pt \\
       --seed-patch /path/to/patch --line row:40 --range 100:160 --direction + --steps 40 --out output/remote_l0_points_ft/traces/t0
 """
 from __future__ import annotations
@@ -25,12 +25,12 @@ from scipy import ndimage
 import tifffile
 import torch
 
-from vesuvius.neural_tracing.fiber_follow.data.volume import ChunkedArray
-from vesuvius.neural_tracing.sheet_tracing import config as C
-from vesuvius.neural_tracing.sheet_tracing.data.episodes import collate_fibers
-from vesuvius.neural_tracing.sheet_tracing.evaluate import load_checkpoint
-from vesuvius.neural_tracing.sheet_tracing.rollout import Front, Tracer
-from vesuvius.neural_tracing.sheet_tracing.sampling import view_radius
+from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import ChunkedArray
+from vesuvius.neural_tracing.tracers.sheets import config as C
+from vesuvius.neural_tracing.tracers.sheets.data.episodes import collate_fibers
+from vesuvius.neural_tracing.tracers.sheets.evaluate import load_checkpoint
+from vesuvius.neural_tracing.tracers.sheets.rollout import Front, Tracer
+from vesuvius.neural_tracing.tracers.sheets.sampling import view_radius
 from vesuvius.tifxyz import Tifxyz, write_tifxyz
 
 

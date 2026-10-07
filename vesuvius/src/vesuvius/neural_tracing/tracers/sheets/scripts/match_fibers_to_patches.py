@@ -28,9 +28,9 @@ import numpy as np
 import tifffile
 from scipy.spatial import cKDTree
 
-from vesuvius.neural_tracing.fiber_follow.data.afv import AFVFibers
-from vesuvius.neural_tracing.sheet_tracing import config as C
-from vesuvius.neural_tracing.sheet_tracing.data.patches import build_index
+from vesuvius.neural_tracing.tracers.fibers.data.afv import AFVFibers
+from vesuvius.neural_tracing.tracers.sheets import config as C
+from vesuvius.neural_tracing.tracers.sheets.data.patches import build_index
 
 sys.path.insert(0, str(Path(__file__).parent))
 from trace_from_fibers import fiber_tag  # noqa: E402  (a sibling script)

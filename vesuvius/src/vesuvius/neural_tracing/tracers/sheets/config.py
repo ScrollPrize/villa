@@ -176,7 +176,7 @@ class TrainConfig:
     # min(ema, (1 + n) / (10 + n)) over the first updates. Validation, best.pt and evaluation use the averaged
     # weights; checkpoints keep both (``model`` raw, ``ema`` averaged).
     ema: float = 0.
-    # Live chains (like fiber_follow's live continuation): a front is not restarted from GT after its rollout but
+    # Live chains (like the fiber tracer's live continuation): a front is not restarted from GT after its rollout but
     # continues in a later iteration from exactly where the model left it (positions, curve, confidences, grid
     # memory) on the next GT window and block of its patch, which a loader worker reads on request (live.py).
     # A chain ends after a random number of steps in chain_steps, when under chain_on_sheet of its points end a

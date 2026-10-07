@@ -7,7 +7,7 @@ is elsewhere:
 * the options: [README.md](README.md);
 * every experiment with its numbers: [output/remote/RESULTS.md](output/remote/RESULTS.md).
 
-Paths below are relative to this package (`vesuvius/src/vesuvius/neural_tracing/sheet_tracing/`) unless absolute.
+Paths below are relative to this package (`vesuvius/src/vesuvius/neural_tracing/tracers/sheets/`) unless absolute.
 State as of 2026-10-07.
 
 ## 1. Models
@@ -69,8 +69,8 @@ Run from `vesuvius/` with `.venv/bin/python`. First set `M` to the H100 data fol
 **Trace a surface from a seed line** with `infer.py`. It writes a tifxyz with one row per step:
 
 ```bash
-.venv/bin/python -m vesuvius.neural_tracing.sheet_tracing.infer \
-  --checkpoint src/vesuvius/neural_tracing/sheet_tracing/output/remote/remote_l0_points_ft/last.pt \
+.venv/bin/python -m vesuvius.neural_tracing.tracers.sheets.infer \
+  --checkpoint src/vesuvius/neural_tracing/tracers/sheets/output/remote/remote_l0_points_ft/last.pt \
   --seed-patch /path/to/a/tifxyz --line row:40 --range 100:160 --direction + --steps 60 --threshold 0.5 \
   --out /path/to/output_tifxyz \
   --path-map $M/s1_ds2.zarr=/home/sean/Documents/volpkgs/s1_ds2.volpkg/volumes/s1_ds2.zarr
@@ -96,8 +96,8 @@ Run from `vesuvius/` with `.venv/bin/python`. First set `M` to the H100 data fol
 models in one run):
 
 ```bash
-src/vesuvius/neural_tracing/sheet_tracing/scripts/bench_local.sh \
-  src/vesuvius/neural_tracing/sheet_tracing/output/remote/trace_bench/my_test_s60_t0.4 60 \
+src/vesuvius/neural_tracing/tracers/sheets/scripts/bench_local.sh \
+  src/vesuvius/neural_tracing/tracers/sheets/output/remote/trace_bench/my_test_s60_t0.4 60 \
   pts=remote_l0_points_ft/last.pt fiber=remote_l0_fiber_ft/last.pt
 ```
 
@@ -115,8 +115,8 @@ progress every 100 traces, so it can be stopped early.
 ## 4. Training
 
 ```bash
-python -m vesuvius.neural_tracing.sheet_tracing.train --config CONFIG.json --name RUN [--init CKPT] [--set section.field=value ...]
-python -m vesuvius.neural_tracing.sheet_tracing.train --resume output/RUN/last.pt
+python -m vesuvius.neural_tracing.tracers.sheets.train --config CONFIG.json --name RUN [--init CKPT] [--set section.field=value ...]
+python -m vesuvius.neural_tracing.tracers.sheets.train --resume output/RUN/last.pt
 ```
 
 * **`--init`:** starts from a checkpoint's EMA weights with a fresh optimizer and schedule. The fiber and mode

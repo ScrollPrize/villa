@@ -2,7 +2,7 @@
 
 A block is a ``(B, 1, D, H, W)`` tensor of one pyramid level with its level-voxel ``z, y, x`` origin. Level
 voxel ``i`` is centred on level-0 coordinate ``(i + 0.5) * 2**level - 0.5`` (mean-pooled pyramid). Crops are
-laid out ``(normal, tangent, advance)`` and z-scored per crop, matching fiber_follow's crop normalization.
+laid out ``(normal, tangent, advance)`` and z-scored per crop, matching the fiber tracer's crop normalization.
 """
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import math
 import torch
 import torch.nn.functional as F
 
-from vesuvius.neural_tracing.fiber_follow.data.ct_normalization import ZSCORE_EPSILON
+from vesuvius.neural_tracing.tracers.shared.crop_sampling.normalization import ZSCORE_EPSILON
 
 
 def crop_offsets(crop, spacing: float, forward: float, device) -> torch.Tensor:

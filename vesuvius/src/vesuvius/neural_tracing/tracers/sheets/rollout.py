@@ -16,11 +16,11 @@ from dataclasses import dataclass, field
 
 import torch
 
-from vesuvius.neural_tracing.sheet_tracing.geometry import (
+from vesuvius.neural_tracing.tracers.sheets.geometry import (
     point_frames, carry_stopped, chord_tangents, front_frame, hermite_dense, normalize, onto_confident_curve, respace,
     to_local)
-from vesuvius.neural_tracing.sheet_tracing.data.episodes import FIBER_CODE_DIM
-from vesuvius.neural_tracing.sheet_tracing.sampling import crop_offsets, sample_crops
+from vesuvius.neural_tracing.tracers.sheets.data.episodes import FIBER_CODE_DIM
+from vesuvius.neural_tracing.tracers.sheets.sampling import crop_offsets, sample_crops
 
 
 @dataclass

@@ -20,7 +20,7 @@ import torch
 from torch import nn
 
 from vesuvius.models.build.resblocks import BasicBlockD
-from vesuvius.neural_tracing.sheet_tracing.data.episodes import FIBER_CODE_DIM
+from vesuvius.neural_tracing.tracers.sheets.data.episodes import FIBER_CODE_DIM
 
 POINT_FEATURES = 16
 TOKEN_FEATURES = 17

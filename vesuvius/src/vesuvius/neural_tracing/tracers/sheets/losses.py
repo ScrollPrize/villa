@@ -19,7 +19,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from vesuvius.neural_tracing.sheet_tracing.geometry import grid_eval, huber, project, sheet_distance, surface_frame
+from vesuvius.neural_tracing.tracers.sheets.geometry import grid_eval, huber, project, sheet_distance, surface_frame
 
 
 def masked_mean(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:

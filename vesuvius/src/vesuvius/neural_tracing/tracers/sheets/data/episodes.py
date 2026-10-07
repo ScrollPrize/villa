@@ -22,9 +22,9 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from vesuvius.neural_tracing.fiber_follow.data.volume import ChunkedArray
-from vesuvius.neural_tracing.sheet_tracing.data.fibers import episode_fibers, fiber_pool
-from vesuvius.neural_tracing.sheet_tracing.data.patches import GridSpec, PatchInfo, PatchStore
+from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import ChunkedArray
+from vesuvius.neural_tracing.tracers.sheets.data.fibers import episode_fibers, fiber_pool
+from vesuvius.neural_tracing.tracers.sheets.data.patches import GridSpec, PatchInfo, PatchStore
 
 
 def split_of(cell, val_fraction: float, seed: int) -> str:
@@ -557,5 +557,5 @@ def batches(episodes: list[dict], size: int):
 
 def episode_pad(model, train) -> float:
     """Block margin beyond the reachable GT region: view radius (crops) plus room for drift before a reset."""
-    from vesuvius.neural_tracing.sheet_tracing.sampling import view_radius
+    from vesuvius.neural_tracing.tracers.sheets.sampling import view_radius
     return math.ceil(view_radius(model)+train.reset_distance+4)

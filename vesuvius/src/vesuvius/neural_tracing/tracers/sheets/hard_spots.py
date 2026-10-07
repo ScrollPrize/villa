@@ -9,7 +9,7 @@ episode drawn there reaches the hard spot mid-rollout. Patch directories are ref
 ``data.patches_dir`` (``dir``), so records written on one machine can be used with another machine's paths. The
 output is rewritten every 100 traces, so a run can be stopped early and keep what it found.
 
-  python -m vesuvius.neural_tracing.sheet_tracing.hard_spots --checkpoint output/remote_l0_points_ft/last.pt \\
+  python -m vesuvius.neural_tracing.tracers.sheets.hard_spots --checkpoint output/remote_l0_points_ft/last.pt \\
       --seeds 2000 --out output/hard_windows_points_ft.json [--path-map OLD=NEW ...]
 """
 from __future__ import annotations
@@ -21,10 +21,10 @@ from pathlib import Path
 
 import numpy as np
 
-from vesuvius.neural_tracing.sheet_tracing.evaluate import load_checkpoint
-from vesuvius.neural_tracing.sheet_tracing.infer import _reach_row, resample, trace
-from vesuvius.neural_tracing.sheet_tracing.config import path_mapper
-from vesuvius.neural_tracing.sheet_tracing.trace_benchmark import draw_seeds, score, seed_polyline
+from vesuvius.neural_tracing.tracers.sheets.evaluate import load_checkpoint
+from vesuvius.neural_tracing.tracers.sheets.infer import _reach_row, resample, trace
+from vesuvius.neural_tracing.tracers.sheets.config import path_mapper
+from vesuvius.neural_tracing.tracers.sheets.trace_benchmark import draw_seeds, score, seed_polyline
 
 
 def first_stop(confs: np.ndarray, threshold: float) -> int | None:

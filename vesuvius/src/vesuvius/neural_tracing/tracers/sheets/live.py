@@ -1,6 +1,6 @@
 """Live chains: training fronts continue across iterations from where the model left them.
 
-Like fiber_follow's live continuation (``train/live_continuation.py``), but the chain state stays in the trainer.
+Like the fiber tracer's live continuation (``tracers/fibers/train/live_continuation.py``), but the chain state stays in the trainer.
 After a rollout, the fronts of the chains that go on (positions, curve, confidences and grid memory, detached, on
 the training device) wait in a pool; once a batch of them has gathered (``train.batch``; once a rollout has filled
 their memory, chains of any depth share a batch) they are kept under a job id, and a job for the loader workers
@@ -22,8 +22,8 @@ import queue
 
 import torch
 
-from vesuvius.neural_tracing.sheet_tracing.losses import landing
-from vesuvius.neural_tracing.sheet_tracing.rollout import Tracer, concat_fronts, select_front
+from vesuvius.neural_tracing.tracers.sheets.losses import landing
+from vesuvius.neural_tracing.tracers.sheets.rollout import Tracer, concat_fronts, select_front
 
 
 def select_batch(b: dict, index: list[int]) -> dict:
@@ -88,7 +88,7 @@ class LiveChains:
 
     def _reach(self, reach: torch.Tensor, kept: torch.Tensor) -> torch.Tensor:
         """Columns connected to the surface after rows ``kept`` (B, T, C), from ``reach`` (B, C) before them."""
-        from vesuvius.neural_tracing.sheet_tracing.infer import _reach_row
+        from vesuvius.neural_tracing.tracers.sheets.infer import _reach_row
         r, k = reach.cpu().numpy(), kept.cpu().numpy()
         for i in range(len(r)):
             for t in range(k.shape[1]):

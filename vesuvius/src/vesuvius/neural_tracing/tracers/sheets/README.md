@@ -86,9 +86,9 @@ and code names therefore means masked output, not halted motion.
 
 - **Training patches:** `data.patches_dir`. These are verified tifxyz patches with level-0 `x, y, z`; `-1` marks
   invalid nodes.
-- **Volume:** `data.volume` and `data.volume_level`. This is an OME-Zarr v2 pyramid read through fiber_follow's
+- **Volume:** `data.volume` and `data.volume_level`. This is an OME-Zarr v2 pyramid read through tracers/shared/crop_sampling's
   `ChunkedArray`; the models read level 0. Levels can be decoded in place with
-  `python -m vesuvius.neural_tracing.fiber_follow.data.decode_store --workers 8 --verify 256 .../s1_ds2.zarr/0`.
+  `python -m vesuvius.neural_tracing.tracers.shared.crop_sampling.decode_store --workers 8 --verify 256 .../s1_ds2.zarr/0`.
   Uncompressed chunks are memory-mapped and shared through the page cache.
 - **Episodes:** an episode resamples one patch window onto a canonical `(u, v)` grid at `data.gt_resolution`. `u`
   is the advance direction and `v` runs along the front, both in voxels. There are eight orientations: advance along
@@ -105,10 +105,10 @@ The run directory is `output/NAME`:
 
 ```bash
 cd vesuvius/src/vesuvius/neural_tracing/sheet_tracing
-../../../../.venv/bin/python -m vesuvius.neural_tracing.sheet_tracing.train --config remote_l0_fiber_ft.json \
+../../../../../.venv/bin/python -m vesuvius.neural_tracing.tracers.sheets.train --config remote_l0_fiber_ft.json \
     --name RUN --init output/remote_l0_points_ft/last.pt
 # resume
-../../../../.venv/bin/python -m vesuvius.neural_tracing.sheet_tracing.train --resume output/RUN/last.pt
+../../../../../.venv/bin/python -m vesuvius.neural_tracing.tracers.sheets.train --resume output/RUN/last.pt
 ```
 
 What one iteration does:
@@ -146,10 +146,10 @@ DataLoader shuts down its forkserver workers.
 ## Evaluation, trace benchmark and inference
 
 ```bash
-python -m vesuvius.neural_tracing.sheet_tracing.evaluate --checkpoint output/RUN/best.pt [--steps 30 --roi 1024 --episodes 256]
-python -m vesuvius.neural_tracing.sheet_tracing.trace_benchmark --checkpoints output/A/last.pt output/B/last.pt \
+python -m vesuvius.neural_tracing.tracers.sheets.evaluate --checkpoint output/RUN/best.pt [--steps 30 --roi 1024 --episodes 256]
+python -m vesuvius.neural_tracing.tracers.sheets.trace_benchmark --checkpoints output/A/last.pt output/B/last.pt \
     --seeds 40 --steps 30 --tag a_vs_b
-python -m vesuvius.neural_tracing.sheet_tracing.infer --checkpoint output/RUN/last.pt \
+python -m vesuvius.neural_tracing.tracers.sheets.infer --checkpoint output/RUN/last.pt \
     --seed-patch /path/to/patch --line row:40 --range 100:160 --direction + --steps 40 --out output/RUN/traces/t0
 ```
 
