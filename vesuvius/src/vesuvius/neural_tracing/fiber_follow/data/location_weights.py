@@ -88,14 +88,13 @@ def build(source, document_path, fibers, out, workers=16):
 def load(path, fibers, bend_boost=1., compression_boost=1.):
     """Per fiber (aligned with ``fibers`` by name): (arclength positions, location weights), or None for a fiber the
     cache does not hold (uniform)."""
-    data = np.load(path)
-    index = {str(n): i for i, n in enumerate(data['names'])}
-    starts = data['starts']
-    weight = 1.+bend_boost*data['bent']+compression_boost*data['compressed']
-    names = [row[1] for row in fibers.catalog] if hasattr(fibers, 'catalog') else [f.name for f in fibers]
+    with np.load(path) as data:  # read each array once: an npz decompresses on every access
+        names, starts, arcs = data['names'], data['starts'], data['arcs'].astype(np.float64)
+        weight = 1.+bend_boost*data['bent']+compression_boost*data['compressed']
+    index = {str(n): i for i, n in enumerate(names)}
+    wanted = [row[1] for row in fibers.catalog] if hasattr(fibers, 'catalog') else [f.name for f in fibers]
     out = []
-    for name in names:
+    for name in wanted:
         i = index.get(str(name))
-        out.append(None if i is None else (data['arcs'][starts[i]:starts[i+1]].astype(np.float64),
-                                           weight[starts[i]:starts[i+1]].astype(np.float64)))
+        out.append(None if i is None else (arcs[starts[i]:starts[i+1]], weight[starts[i]:starts[i+1]]))
     return out
