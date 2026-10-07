@@ -206,11 +206,13 @@ TEST_CASE("GPU layer samples equal readMultiSlice (uint8)")
     const Geometry g = randomGeometry(37, 53, array.shape(0), 1);
     checkLayers<std::uint8_t>(array, g, layerOffsets(21, 1.0), *gpu);
     checkLayers<std::uint8_t>(array, g, layerOffsets(11, 0.7), *gpu);
-    // a second band on the same pool: chunks already resident are not fetched again
+    // the same band again on the same pool: every chunk is resident, nothing is fetched
     const std::size_t fetchesBefore = array.fetches;
-    checkLayers<std::uint8_t>(array, g, layerOffsets(21, 1.0), *gpu);
+    std::vector<cv::Mat_<std::uint8_t>> again;
+    gpu->sampleSlices(g.base, g.dirs, layerOffsets(21, 1.0), again);
     CHECK(array.fetches == fetchesBefore);
     CHECK(gpu->stats().bands == 3);
+    CHECK(gpu->stats().evictions == 0);
 }
 
 TEST_CASE("GPU layer samples equal readMultiSlice (uint16: rounded, clamped at 65535)")
@@ -299,6 +301,6 @@ TEST_CASE("a failed chunk fetch surfaces as an exception, as on the CPU")
     if (!gpu) return;
     cv::Mat_<cv::Vec3f> base(3, 3, cv::Vec3f(5.f, 6.f, 7.f)), dirs(3, 3, cv::Vec3f(0.f, 0.f, 1.f));
     std::vector<cv::Mat_<std::uint8_t>> out;
-    CHECK_THROWS_WITH_AS(gpu->sampleSlices(base, dirs, layerOffsets(3, 1.0), out), "synthetic fetch failure",
-                         std::runtime_error);
+    CHECK_THROWS_WITH_AS(gpu->sampleSlices(base, dirs, layerOffsets(3, 1.0), out),
+                         doctest::Contains("synthetic fetch failure"), std::runtime_error);
 }

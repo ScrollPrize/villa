@@ -449,6 +449,7 @@ public:
         if (mod_) d_.ModuleUnload(mod_);
         if (ctx_) d_.PrimaryCtxRelease(dev_);
         libClose(nvrtcLib_);
+        libClose(builtinsLib_);
         libClose(driverLib_);
     }
 
@@ -541,10 +542,25 @@ private:
     {
         const auto candidates = nvrtcCandidates();
         for (const auto& path : candidates) {
+#ifdef _WIN32
+            // NVRTC loads its builtins library by bare name at compile time, which only finds it
+            // when it is already in the process or on the default search path. For a candidate in
+            // a directory, load the companion from that directory first (nvrtc64_130_0.dll ->
+            // nvrtc-builtins64_130.dll); a bare-name candidate has both on the search path.
+            if (const auto slash = path.find_last_of("/\\"); slash != std::string::npos) {
+                std::string builtins = path.substr(slash + 1);
+                if (builtins.rfind("nvrtc64_", 0) == 0 && builtins.size() > 13) {
+                    builtins = "nvrtc-builtins64_" + builtins.substr(8, 3) + ".dll";
+                    builtinsLib_ = libOpen(path.substr(0, slash + 1) + builtins);
+                }
+            }
+#endif
             if ((nvrtcLib_ = libOpen(path))) {
                 nvrtcPath_ = path;
                 break;
             }
+            libClose(builtinsLib_);
+            builtinsLib_ = nullptr;
         }
         if (!nvrtcLib_) {
             why = std::string("no NVRTC library: looked for ") + kNvrtcNames[0]
@@ -664,6 +680,7 @@ private:
 
     Lib driverLib_ = nullptr;
     Lib nvrtcLib_ = nullptr;
+    Lib builtinsLib_ = nullptr;
     DriverApi d_;
     NvrtcApi n_;
     CUdevice dev_ = 0;
@@ -708,7 +725,7 @@ struct GpuSampler::Impl {
 
     // Device memory: the pool, the chunk -> slot table, the per-chunk mark, and per-band scratch.
     CUdeviceptr dPool = 0, dTab = 0, dMask = 0, dBase = 0, dDirs = 0, dOffs = 0, dOut = 0;
-    std::size_t capGeom = 0, capOffs = 0, capOut = 0;
+    std::size_t capBase = 0, capDirs = 0, capOffs = 0, capOut = 0;
 
     // Residency: tab mirrors dTab; a chunk the cache reports as not stored is never asked for
     // again; slots are handed out in order, then the least recently used one not needed by the
@@ -780,7 +797,9 @@ struct GpuSampler::Impl {
             }
             poolBytes = std::min(poolBytes, freeBytes - headroom);
             nSlots = std::min(poolBytes / chunkBytes, ntab);
-            if (nSlots < 64) {
+            // A pool is useful from a few dozen chunks up; a volume with fewer chunks than that
+            // is held whole.
+            if (nSlots < std::min<std::size_t>(64, ntab)) {
                 why = "the chunk pool would hold fewer than 64 chunks (" + std::to_string(poolBytes >> 20) + " MB for "
                     + std::to_string(chunkBytes >> 10) + " KB chunks; raise --gpu-cache-gb)";
                 return false;
@@ -822,8 +841,8 @@ struct GpuSampler::Impl {
     {
         if (base.size() != dirs.size()) throw std::invalid_argument("GpuSampler: base and dirs differ in size");
         const std::size_t bytes = std::size_t(base.rows) * std::size_t(base.cols) * sizeof(cv::Vec3f);
-        ensure(dBase, capGeom, bytes);
-        ensure(dDirs, capGeom, bytes);
+        ensure(dBase, capBase, bytes);
+        ensure(dDirs, capDirs, bytes);
         const cv::Mat_<cv::Vec3f> b = base.isContinuous() ? base : base.clone();
         const cv::Mat_<cv::Vec3f> d = dirs.isContinuous() ? dirs : dirs.clone();
         dev->upload(dBase, b.ptr<float>(0), bytes);
