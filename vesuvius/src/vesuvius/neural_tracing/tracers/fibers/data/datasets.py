@@ -6,9 +6,10 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from vesuvius.neural_tracing.tracers.fibers.data.afv import AFVFibers, file_sha256
-from vesuvius.neural_tracing.tracers.fibers.data.fibers import (
-    fiber_manifest, load_fibers, heldout_ids, validate_split_policy)
+from vesuvius.neural_tracing.tracers.shared.annotations.afv import AFVFibers, file_sha256
+from vesuvius.neural_tracing.tracers.shared.annotations.splits import heldout_ids, validate_split_policy
+from vesuvius.neural_tracing.tracers.shared.annotations.traced import fiber_manifest
+from vesuvius.neural_tracing.tracers.shared.annotations.vc3d import load_fibers
 from vesuvius.neural_tracing.tracers.fibers.data.follow_dataset import FollowDataset
 from vesuvius.neural_tracing.tracers.shared.paths import moved_path
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolumeSpec, CTVolume

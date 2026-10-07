@@ -74,7 +74,7 @@ def make_afv(path, fibers):
 
 
 def test_afv_snapping_keeps_ids_names_and_families_and_reads_back(tmp_path):
-    from vesuvius.neural_tracing.tracers.fibers.data.afv import AFVFibers, read_afv_polylines
+    from vesuvius.neural_tracing.tracers.shared.annotations.afv import AFVFibers, read_afv_polylines
     from vesuvius.neural_tracing.tracers.fibers.data import fiber_snapping as snap_fibers
     scale = 8.
     centre = wavy()

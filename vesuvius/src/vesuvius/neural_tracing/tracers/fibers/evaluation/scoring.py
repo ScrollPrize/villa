@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from vesuvius.neural_tracing.tracers.fibers.data.fibers import DATA_VERSION, TracedFiber
+from vesuvius.neural_tracing.tracers.fibers.data.fibers import DATA_VERSION
+from vesuvius.neural_tracing.tracers.shared.annotations.traced import TracedFiber
 from vesuvius.neural_tracing.tracers.shared.geometry import tangent_at
 from vesuvius.neural_tracing.tracers.shared.policy import DEFAULT_MAX_RECOVERY_DISTANCE
 from vesuvius.neural_tracing.tracers.fibers.frames.learned import trace_family_kwargs

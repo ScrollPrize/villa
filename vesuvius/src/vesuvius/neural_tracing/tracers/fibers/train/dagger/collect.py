@@ -20,8 +20,9 @@ import warnings
 import numpy as np
 import torch
 
-from vesuvius.neural_tracing.tracers.fibers.data.fibers import (
-    ZBand, load_fibers, split_fibers, fiber_manifest, training_state_allowed)
+from vesuvius.neural_tracing.tracers.fibers.data.fibers import ZBand, split_fibers, training_state_allowed
+from vesuvius.neural_tracing.tracers.shared.annotations.traced import fiber_manifest
+from vesuvius.neural_tracing.tracers.shared.annotations.vc3d import load_fibers
 from vesuvius.neural_tracing.tracers.fibers.data.replay import OnPolicyStates
 from vesuvius.neural_tracing.tracers.fibers.data.samples import SampleConfig
 from vesuvius.neural_tracing.tracers.fibers.data.targets import label_state

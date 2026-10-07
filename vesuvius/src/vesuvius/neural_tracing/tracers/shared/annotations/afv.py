@@ -9,8 +9,9 @@ import sqlite3
 
 import numpy as np
 
-from vesuvius.neural_tracing.tracers.fibers.data.annotation_repair import ANNOTATION_REPAIR, repair_kinks
-from vesuvius.neural_tracing.tracers.fibers.data.fibers import TracedFiber, heldout_ids
+from vesuvius.neural_tracing.tracers.shared.annotations.repair import ANNOTATION_REPAIR, repair_kinks
+from vesuvius.neural_tracing.tracers.shared.annotations.traced import TracedFiber
+from vesuvius.neural_tracing.tracers.shared.annotations.splits import heldout_ids
 from vesuvius.neural_tracing.tracers.shared.geometry import arclength, interp_at, dense_line
 
 

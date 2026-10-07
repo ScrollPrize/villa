@@ -21,7 +21,7 @@ from pathlib import Path
 import numpy as np
 from scipy.spatial import cKDTree
 
-from vesuvius.neural_tracing.tracers.fibers.data.afv import AFVFibers
+from vesuvius.neural_tracing.tracers.shared.annotations.afv import AFVFibers
 from vesuvius.neural_tracing.tracers.sheets.data.fibers import CELL, cell_key
 
 FAMILY = {'H': 0, 'V': 1}

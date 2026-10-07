@@ -143,9 +143,10 @@ The fiber tracer lives in `tracers/fibers/`; the parts other tracers can reuse s
 | Package | Responsibility |
 | --- | --- |
 | `tracers/models` | The follower contract (`follower.py`), the model registry (`model.py`), checkpoints (`checkpoint.py`), the crop transformer (`regression`, `flow`), flow matching, the sequence model, the supervised-path contract (`targets.py`) |
-| `tracers/shared` | Geometry, observed-path references, the commit policy, recorded-path relocation, retired settings, JSON/atomic output, batch tensors |
+| `tracers/shared` | Geometry, observed-path references, the commit policy, recorded-path relocation, retired settings, JSON/atomic output, batch tensors, the CT structure tensor (`ct_structure.py`) |
+| `tracers/shared/annotations` | Fiber annotations: AFV collections, VC3D fiber JSON, the annotated-fiber type, kink repair, whole-fiber splits |
 | `tracers/shared/crop_sampling` | CT crop loading: volumes (local and remote chunked readers, chunk-store decoding), intensity normalization, oriented crop sampling, remote prefetch |
-| `data` | Annotated fibers and splits, seeds, simulated traces and episodes, targets and state labels, the task budget, replay, the training dataset, observations, AFV sources and neighbors |
+| `data` | The z-band split, seeds, simulated traces and episodes, targets and state labels, the task budget, replay, the training dataset, observations, AFV sources and neighbors |
 | `frames` | Crop frames: CT structure-tensor headings and frames (`ct.py`), the frozen learned frame model (`learned.py`) |
 | `tracing` | The tracer and rollout (`trace.py`), the tracing CLI (`inference.py`) |
 | `train` | Entry point and run configuration, the training update (`step.py`), objectives, logging, live continuation, DAgger collection (`dagger/`) |

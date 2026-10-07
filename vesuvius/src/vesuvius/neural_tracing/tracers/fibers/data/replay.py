@@ -7,9 +7,10 @@ import json
 
 import numpy as np
 
-from vesuvius.neural_tracing.tracers.fibers.data.fibers import fiber_manifest
+from vesuvius.neural_tracing.tracers.shared.annotations.traced import fiber_manifest
 from vesuvius.neural_tracing.tracers.fibers.data.tasks import TRAVEL_STRATA, stable_key
-from vesuvius.neural_tracing.tracers.fibers.data.state_labels import DEPARTURE_PATIENCE, facts, REPLAY_CLASS, REPLAY_CLASSES
+from vesuvius.neural_tracing.tracers.fibers.data.state_labels import (
+    DEPARTURE_PATIENCE, facts, REPLAY_CLASS, REPLAY_CLASSES)
 
 
 EVENT_TABLE_SIZE = 1 << 18

@@ -39,8 +39,8 @@ class NeighborFibers:
     @classmethod
     def from_configs(cls, configs):
         """Catalog of the dataset-config source entries that share one CT and trace grid."""
-        from vesuvius.neural_tracing.tracers.fibers.data.afv import AFVFibers
-        from vesuvius.neural_tracing.tracers.fibers.data.fibers import load_fibers
+        from vesuvius.neural_tracing.tracers.shared.annotations.afv import AFVFibers
+        from vesuvius.neural_tracing.tracers.shared.annotations.vc3d import load_fibers
         afvs, manual = [], []
         for config in configs:
             if config['kind'] == 'afv':
