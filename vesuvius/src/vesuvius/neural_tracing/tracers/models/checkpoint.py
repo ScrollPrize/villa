@@ -10,6 +10,7 @@ import torch
 from vesuvius.neural_tracing.tracers.models.model import MODEL_TYPES, RETIRED_FIELDS, build_model, config_class, config_from_checkpoint
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolumeSpec
 from vesuvius.neural_tracing.tracers.shared.paths import relocate_checkpoint
+from vesuvius.neural_tracing.tracers.models.weights import conv_memory_format, load_matching_weights
 
 
 def write_checkpoint(path, model, vol_spec, crop, n_history, model_type, extra=None):
@@ -29,24 +30,6 @@ def read_checkpoint(path, device='cuda'):
         raise ValueError(f'Unsupported checkpoint {path} ({detail}); checkpoints from before the model cleanup need '
                          'scripts/convert_checkpoint.py')
     return ck
-
-
-def conv_memory_format(device):
-    """Use the shared encoder convolution layout on CUDA."""
-    return torch.channels_last_3d if torch.device(device).type == 'cuda' else torch.contiguous_format
-
-
-def load_matching_weights(model, state, exclude=()):
-    """Load tensors whose names and shapes match, except names starting with an ``exclude`` prefix.
-
-    Returns a report: tensors left at initialization (``fresh``), checkpoint tensors with no counterpart
-    (``unexpected``) and same-name tensors of another shape (``mismatched``)."""
-    own = model.state_dict()
-    matched = {k: v for k, v in state.items() if k in own and own[k].shape == v.shape
-               and not any(k.startswith(prefix) for prefix in exclude)}
-    model.load_state_dict(matched, strict=False)
-    return dict(fresh=sorted(set(own)-set(matched)), unexpected=sorted(set(state)-set(own)),
-                mismatched=sorted(k for k, v in state.items() if k in own and own[k].shape != v.shape))
 
 
 def initialize_model_weights(cfg, device, initial=None, exclude=()):

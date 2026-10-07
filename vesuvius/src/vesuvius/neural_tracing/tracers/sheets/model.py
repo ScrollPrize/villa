@@ -21,6 +21,7 @@ from torch import nn
 
 from vesuvius.models.build.resblocks import BasicBlockD
 from vesuvius.neural_tracing.tracers.sheets.data.episodes import FIBER_CODE_DIM
+from vesuvius.neural_tracing.tracers.models.weights import load_matching_weights
 from vesuvius.neural_tracing.tracers.shared.compile import compile_options
 
 POINT_FEATURES = 16
@@ -150,14 +151,11 @@ OPTIONAL_MODULES = ('mode_', 'fiber_')  # modules a checkpoint without them star
 def init_model_state(model: SheetTracer, saved: dict) -> None:
     """``--init``: like ``load_model_state``, but the optional modules the checkpoint predates (``mode_embed``,
     ``fiber_*``) keep their fresh initialisation; any other missing or unexpected weight is still an error."""
-    missing = [k for k in model.state_dict() if k not in saved]
-    if not missing or any(not k.startswith(OPTIONAL_MODULES) for k in missing):
-        load_model_state(model, saved)  # complete, or the usual informative mismatch error
-        return
-    result = model.load_state_dict(saved, strict=False)
-    if result.unexpected_keys:
-        raise ValueError(f'Unexpected weights in the initial checkpoint: {result.unexpected_keys}')
-    print(f'new modules initialised fresh: {sorted({k.split(".")[0] for k in missing})}', flush=True)
+    report = load_matching_weights(model, saved)  # models.weights, as the fiber tracer's --init
+    if report['unexpected'] or report['mismatched'] or any(not k.startswith(OPTIONAL_MODULES) for k in report['fresh']):
+        load_model_state(model, saved)  # the usual informative mismatch error
+    if report['fresh']:
+        print(f'new modules initialised fresh: {sorted({k.split(".")[0] for k in report["fresh"]})}', flush=True)
 
 
 def load_model_state(model: SheetTracer, saved: dict) -> None:
