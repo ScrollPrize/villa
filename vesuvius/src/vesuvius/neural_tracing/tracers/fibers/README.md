@@ -11,7 +11,7 @@ Three model types share one trainer, data pipeline, labels, replay, live continu
   committed step, and predicts the path and its confidence; training runs whole episodes.
 
 Each type's defaults are the settings of the run it was established with (`mixed_ct_afv_unified_v1`,
-`unified_flow_v6_adalnzero`, `sequence_v1`). CT uses per-crop z-score normalization only (all values, float64
+`unified_flow_v6_adalnzero`, `sequence_v1`). CT uses per-crop z-score normalization only (all values, float32
 statistics, epsilon 1e-6; no clipping).
 
 ## Run configuration
