@@ -1,3 +1,137 @@
+## 2026-10-07 — 194246 training snapshot comparison
+
+- Froze current raw u23300, best-loss raw u20000 and best-restarts raw u17600 before evaluation; ran all 91 fibers / 182 directions with the unchanged winning policy on GPUs 0–5.
+- After 512-vx output filtering: respectively 4/3/4 errors, 291/270/264 pieces, 77.107/78.989/76.844% retained. Previous EMA999 u12100 remains the overall leader: 0 errors, 233 pieces, 82.086%. Before filtering all three new models have 4 errors.
+- Reused shared evaluation and metric helpers; exact cohort/policy audits and 30 focused tests. Full before/after-filter and per-scroll results in `docs/benchmarks/normalwidth_194246_tuned_20261007_v1.md` and JSON. No defaults changed.
+
+## 2026-10-06 — Extended cutoff and targeted tracing tuning
+
+- Completed16new post-modulation runs (.1/.2/.6/.7),28post rows total;
+  cached34configuration before/after512-vx analysis. Preserved prior12post/18short rows exactly.
+- Added reusable tuning runner/plan via approved wrapper, sharing native evaluation
+  and retained-output metrics.19new tracing parameter trials+2controls;21tests pass.
+- Best observed low-error setting:EMA999u12100,postcutoff.4,cos40width,noFW,
+  step12base voxels (CLIstep6),originalweights.0errors even before short filtering;
+  after512filter233pieces82.086%coverage,4.884mmactualpiece mean,3.814mmmedian.
+  Baseline3errors234pieces81.333%. Neighborsteps10/16 and combinednormal.05 do not improve it.
+- Keep higher-coverage alternative.1/cos40/noFW/step8base:8errors230pieces92.423%.
+  Defaults unchanged; benchmark-tuned,GT-assisted filtering caveat explicit. Best
+  min512 result retains noPHerc0332pieces, so0errors is not fullcoverage success.
+- Full global/per-scroll tables and effective settings:
+  docs/benchmarks/reviewed_ema999_trace_tuning_20261006_v1.md and
+  docs/benchmarks/reviewed_ema999_short512_20261006_v1.md.
+
+## 2026-10-06 — Minimum512 output-piece analysis
+
+- Added reusable saved-replay output filter on actual traced base arc; cached18configuration
+  before/after analysis, no retracing/GPU.17tests passed; all minimum0 controls match originals.
+- Positive-cutoff variants lose no additional errors:remaining errors are on longer pieces.
+  Post.4/cos40/FW retains2errors at75.974%coverage,4.334mm actual mean piece,3.513mmmedian.
+  Original online events preserved; discarded piece/coverage and GT-assisted-boundary caveat explicit.
+- Full global/per-scroll comparison and source provenance:
+  docs/benchmarks/reviewed_ema999_short512_20261006_v1.md. No default changes.
+
+## 2026-10-06 — Lower post-modulation cutoffs
+
+- Added eight EMA999u12100 post-modulation runs at.4/.3; reused four.5 rows
+  unchanged.13Python tests,12-row coverage/parity audits passed; no native changes.
+- Cos40/FW:.5→.4 keeps2errors,reduces593→482filtered,retained73.690→76.831%;
+  .3 gives3errors/395filtered/80.279%retained. Cos40/noFW:.4 keeps3errors while
+  reducing577→462filtered and improving87.510→89.847%retained versus.5.
+- Raw.5/cos40/FW remains competitive:2errors/393filtered/76.891%retained.
+  No defaults changed; full12-row sweep plus raw controls/per-scroll metrics in
+  docs/benchmarks/reviewed_postmod_presence_ema999_20261006_v1.md.
+
+## 2026-10-06 — Post-modulation presence cutoff
+
+- Added optional raw/modulated cutoff mode, using saved winning-candidate local
+  evidence including width and all six direction factors, excluding separate
+  smoothness/embedding penalties.505native+4queue+13Python tests passed.
+- Four EMA999u12100 cutoff.5 runs complete, with/without cosine40 andFW512.
+  Errors raw→post:6→4(off/noFW),3→2(off/FW),4→3(cos40/noFW),2→2(cos40/FW).
+  Filtered stops rise in all cases;cos40/FW393→593,retention76.891→73.690%.
+  Defaults unchanged. Full raw/post and per-scroll comparison:
+  docs/benchmarks/reviewed_postmod_presence_ema999_20261006_v1.md.
+
+## 2026-10-06 — Presence cutoff × width × reverse consistency
+
+- Added disabled-by-default raw-presence committed-point filter with separate
+  presence/reverse stop reasons and shared existing rollback/reseed handling.
+- Completed32-run frozen u11000/EMA999u12100 matrix:cutoffs0/.10/.25/.50,
+  width off/cosine40,FW off/full-prefix512. Native503+queue4 and Python12 tests
+  passed; seven historical controls reproduce global/per-scroll metrics.
+- Lowest error count2:EMA999/cosine40/FW/.50, but393filtered stops and76.891%
+  retained. Its cutoff0 control has8errors/142filtered/88.701%retained.
+  Rawu11000 widthoff/FW/cutoff0 remains3errors/230filtered/81.463%retained.
+  No default changes. Complete metrics/provenance in
+  docs/benchmarks/reviewed_presence_width_reverse_matrix_20261006_v1.md.
+
+## 2026-10-06 — Current122417 EMA999 width evaluation
+
+- Frozen EMA999 u12100 (SHA fd9dc4ba...), full91-fiber/182-direction benchmark.
+  Cosine40:44errors without FW/BW;8errors+142filtered with FW512 (88.70%retained).
+  Ungated/noFW control48errors. Matched historical comparisons and per-scroll metrics
+  in docs/benchmarks/normalwidth_122417_current_ema999_20261006_v1.md.
+- Generalized cached width diagnostics without historical hardcoded conclusions;
+  50failure plots, complete coverage, GT/trace prior deviation median3.15/3.42%.
+  Same frozen history favors GT in48% at departure and64% at failure endpoint.
+  No default/scheduling/precision changes.14targeted tests passed.
+
+## 2026-10-06 — Cached width-path diagnostics
+
+- Added native cached scalar-width query sharing embedding sampling, no new reader or inference.
+- Analyzed 91 reference fibers / 182 unweighted traces / 73 failures with complete coverage;
+  archived CSVs, provenance, 73 width/presence/error plots and benchmark report
+  `docs/benchmarks/reviewed_u11000_width_paths_20261006.md`.
+- Median relative width deviation: GT 3.47%, trace 4.04%, outside acceptance ellipse 15.42%.
+  At final departure width favors GT in 48/73 events; not sufficient for a reliable hard cutoff.
+  Recommendations: soft nonzero floor and confidence-qualified global-width updates; defaults unchanged.
+- Approved native build/tests and 12 targeted Python/native-query tests passed.
+
+## 2026-10-06 — Width modulation without reverse filtering
+
+- Follow-up cosine40%:72errors,mean18.9887mm,median4.3543mm versus off73,
+  18.7321/4.3107mm. Marginal difference, defaults unchanged; same report extended.
+
+- Same raw u11000,91fibers/182directions, width cache and beam settings;
+  disabled all FW/BW checks, compared off with cosine10% presence modulation.
+- Off73 error restarts versus cosine10 126; mean18.7321→10.7454mm,
+  median4.3107→3.5894mm. Prior low3 errors under FW/BW came with304filtered
+  stops for cosine10, not improved standalone tracing. Defaults unchanged.
+- Both complete, zero reverse/filtered checks;117.14/128.56s including194/521
+  missing inference tiles. Full metrics: `docs/benchmarks/reviewed_u11000_width_no_reverse_20261006.md`.
+
+## 2026-10-06 — Width tolerance/cosine sweep
+
+- Added optional clipped cos(pi*d/2) width gate; linear remains default. Swept
+  10/20/40/80% limits and same-cache off on raw u11000,91fibers/182directions.
+- Linear80:4errors/187filtered/85.0249% retained versus off3/230/81.4628%;
+  best coverage but not lowest errors. Cosine did not beat the wider linear gates.
+- Existing published predictions reused; changed paths required5567 additional
+  tiles through existing GPU0–5 demand pipeline. All9 full runs complete.
+- Full metrics/commands/provenance: `docs/benchmarks/reviewed_u11000_width_sweep_20261006.md`.
+
+## 2026-10-06 — Cumulative-width tracing experiment
+
+- Optional physical float32 width product through shared inference/cache/sampler;
+  linear presence gate reaches zero at20% deviation from cumulative committed
+  forward mean. Reverse checks freeze that mean; restarts reset it.
+- Full91-fiber u11000 evaluation: errors3→10, filtered233→229,
+  retained81.1133%→81.5878%. Remains opt-in, not a new baseline.
+- Native501-case suite and queue/adapter regressions pass; matched full run
+  completed on GPUs0–5 in324.51s. Full metrics and command:
+  `docs/benchmarks/reviewed_u11000_width20_fw512_20261006.md`.
+
+## 2026-10-06 — Reviewed normal/width/HV model evaluation
+
+- Committed neural follower integration on fiber-exp6 (`ba86eea12`), returned to
+  fiber-exp5 and cleanly fast-forwarded villa's fiber-normal-width-hv (`5d76a43ad`).
+- Evaluated frozen raw u9800 best-by-restarts, u10800 best-loss, u11000 current
+  with full-prefix512 FW/BW20/40 on91fibers/182directions, GPUs0–5.
+- Error/filtered counts7/159,8/213,3/233; retained87.4005%,82.4401%,81.1133%.
+  Historical u40500 remains the coverage/interruption baseline (5/66,94.7436%).
+- Full per-scroll data and provenance: `docs/benchmarks/reviewed_normal_width_fw512_20261006.md`.
+
 ## 2026-10-06 — Raw component loss reporting
 
 - Width, H/V, embedding and refinement leaf metrics now exclude configured

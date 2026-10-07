@@ -30,9 +30,13 @@ VALUE_FLAGS = frozenset({
     "smoothness-free-angle-degrees", "cumulative-smoothness-steps",
     "cumulative-smoothness-tangent-weight", "max-step-factor",
     "sample-pool-radius-voxels",
+    "width-relative-tolerance",
+    "replay-presence-cutoff",
 })
 # Flags whose value is one of a fixed set of words.
-CHOICE_FLAGS = {"sample-pool-mode": ("max", "mean"), "sample-pool-stencil": ("cross", "cube")}
+CHOICE_FLAGS = {"sample-pool-mode": ("max", "mean"), "sample-pool-stencil": ("cross", "cube"),
+                "width-weighting": ("linear", "cosine"),
+                "replay-presence-mode": ("raw", "modulated")}
 SWITCH_FLAGS = frozenset({"exhaustive-lookahead"})
 INCOMPLETE_MARKERS = ("incomplete.json", "inference_incomplete.json")
 

@@ -362,6 +362,34 @@ if __name__ == '__main__':
                     os.kill(int(proc.name), signal.SIGINT)
                     print(f'Interrupted crop trial native PID {proc.name}', flush=True)
             raise SystemExit(0)
+        if action == 'reviewed_width_paths':
+            subprocess.run([sys.executable, '-u', str(REPO / 'scripts/reviewed_width_paths.py')], check=True)
+            raise SystemExit(0)
+        if action == 'reviewed_ema999_width':
+            subprocess.run([sys.executable, '-u', str(REPO / 'scripts/reviewed_ema999_width_eval.py')], check=True)
+            raise SystemExit(0)
+        if action == 'reviewed_presence_postmod':
+            subprocess.run([sys.executable, '-u', str(REPO / 'scripts/reviewed_presence_sweep.py'), '--post-modulated'], check=True)
+            raise SystemExit(0)
+        if action == 'reviewed_presence_postmod_short':
+            subprocess.run([sys.executable, '-u', str(REPO / 'scripts/reviewed_presence_sweep.py'), '--post-modulated'], check=True)
+            subprocess.run([sys.executable, '-u', str(REPO / 'scripts/reviewed_short_segments.py')], check=True)
+            raise SystemExit(0)
+        if action == 'reviewed_short_segments':
+            subprocess.run([sys.executable, '-u', str(REPO / 'scripts/reviewed_short_segments.py')], check=True)
+            raise SystemExit(0)
+        if action == 'reviewed_trace_tuning':
+            subprocess.run([sys.executable, '-u', str(REPO / 'scripts/reviewed_trace_tuning.py')], check=True)
+            raise SystemExit(0)
+        if action == 'reviewed_194246':
+            subprocess.run([sys.executable, '-u', str(REPO / 'scripts/reviewed_194246_eval.py')], check=True)
+            raise SystemExit(0)
+        if action == 'reviewed_presence_sweep':
+            subprocess.run([sys.executable, '-u', str(REPO / 'scripts/reviewed_presence_sweep.py')], check=True)
+            raise SystemExit(0)
+        if action == 'reviewed_normal_width':
+            subprocess.run([sys.executable, '-u', str(REPO / 'scripts/reviewed_normal_width_eval.py')], check=True)
+            raise SystemExit(0)
         if action == 'reviewed_reverse_prefix':
             subprocess.run([sys.executable, '-u', str(REPO / 'scripts/reviewed_reverse_prefix.py')], check=True)
             raise SystemExit(0)

@@ -10,6 +10,77 @@ RESTART_EPISODE_DISTANCE = 80.0
 MEAN_DEFINITION = "combined-directed-distance-per-restarts-plus-one-v1"
 
 
+def filter_output_segments(document: dict, minimum_base_voxels: float) -> dict:
+    """Output-only pruning; never alter tracing/reseeding or saved input data.
+
+    Gate on traced polyline arc, account coverage on GT arc as the replay does.
+    GT error stops already define some boundaries: not a GT-free filter score.
+    """
+    import numpy as np
+    if not math.isfinite(minimum_base_voxels) or minimum_base_voxels < 0:
+        raise ValueError('minimum length must be finite and nonnegative')
+    replay = document['replay']
+    scale = float(document['provenance']['base_voxel_size_um']) / 1000
+    begin, end = replay['reference_begin_arc_base'], replay['reference_end_arc_base']
+    if not (scale > 0 and end > begin and replay['completed_reference_arc_base'] >= end - 1e-7):
+        raise ValueError('complete valid replay required')
+    segments = replay['segments']
+    failures = replay['failures']
+    failure_indices = [int(f['segment_index']) for f in failures]
+    if len(set(failure_indices)) != len(failure_indices) or any(i < 0 or i >= len(segments) for i in failure_indices):
+        raise ValueError('invalid failure-to-segment mapping')
+    records = []
+    for i, s in enumerate(segments):
+        points = np.asarray(s['trace_points_base_xyz'], dtype=np.float64)
+        if points.ndim != 2 or points.shape[1] != 3 or not np.isfinite(points).all():
+            raise ValueError('invalid traced polyline')
+        length = float(np.linalg.norm(np.diff(points, axis=0), axis=1).sum())
+        covered = max(0., s['end_reference_arc_base'] - s['matches'][0]['search_begin_arc_base']) if s['matches'] else 0.
+        reason = s['termination_reason']
+        records.append(dict(segment_index=i, trace_length_base=length,
+            reference_mm=covered*scale, keep=length >= minimum_base_voxels,
+            error=i in failure_indices, presence_stop=reason=='presence_filtered',
+            reverse_stop=reason=='reverse_consistency_filtered'))
+    if sum(r['presence_stop']+r['reverse_stop'] for r in records) != len(replay['filtered_stops']):
+        raise ValueError('filtered-stop mapping mismatch')
+    arcs = [float(f['reference_arc_base']) for f in failures if records[int(f['segment_index'])]['keep']]
+    if any(b<a for a,b in zip(arcs,arcs[1:])):
+        raise ValueError('failure arcs must be ordered')
+    return dict(source=document['provenance']['source_id'],
+        case_index=document['provenance']['case_index'], minimum_base_voxels=minimum_base_voxels,
+        reference_mm=(end-begin)*scale, records=records,
+        ordinary_restarts=len(_episode_indices(arcs, RESTART_EPISODE_DISTANCE)),
+        original_error_events=len(failures), original_filtered_stops=len(replay['filtered_stops']))
+
+
+def filtered_output_statistics(cases: list[dict]) -> dict:
+    """Aggregate surviving output pieces, exposing discarded coverage and events."""
+    import numpy as np
+    records = [r for c in cases for r in c['records']]
+    kept = [r for r in records if r['keep']]
+    discarded = [r for r in records if not r['keep']]
+    retained = math.fsum(r['reference_mm'] for r in kept)
+    reference = math.fsum(c['reference_mm'] for c in cases)
+    error_events = sum(r['error'] for r in kept)
+    presence = sum(r['presence_stop'] for r in kept)
+    reverse = sum(r['reverse_stop'] for r in kept)
+    stops = error_events + presence + reverse
+    quantiles = np.quantile([r['reference_mm'] for r in kept], [.05,.5,.95]).tolist() if kept else [None]*3
+    return dict(directions=len(cases), ordinary_restarts=sum(c['ordinary_restarts'] for c in cases),
+        error_events=error_events, presence_filtered=presence, reverse_filtered=reverse,
+        filtered_stops=presence+reverse, actual_stops=stops,
+        original_actual_stops=sum(c['original_error_events']+c['original_filtered_stops'] for c in cases),
+        kept_segments=len(kept), discarded_segments=len(discarded),
+        discarded_error_events=sum(r['error'] for r in discarded),
+        reference_mm=reference, retained_mm=retained,
+        discarded_mm=math.fsum(r['reference_mm'] for r in discarded),
+        retained_percent=100*retained/reference if reference else 0,
+        mean_mm=retained/(stops+1) if kept else None,
+        piece_mean_mm=retained/len(kept) if kept else None,
+        trace_piece_mean_base=math.fsum(r['trace_length_base'] for r in kept)/len(kept) if kept else None,
+        p05_mm=quantiles[0], median_mm=quantiles[1], p95_mm=quantiles[2])
+
+
 def _episode_indices(arcs, distance):
     return [i for i, x in enumerate(arcs) if i == 0 or x - arcs[i-1] >= distance]
 

@@ -42,6 +42,9 @@ def validate_cached_model(model, checkpoint_digest, settings):
     if "emit_embeddings" in settings and bool(settings["emit_embeddings"]) != bool(model["embedding_channels"]):
         raise ValueError("cannot extend cache with different embedding channels")
     settings.setdefault("emit_embeddings", bool(model["embedding_channels"]))
+    if 'emit_width' in settings and bool(settings['emit_width']) != bool(model.get('width_channel')):
+        raise ValueError('cannot extend cache with different width channels')
+    settings.setdefault('emit_width', bool(model.get('width_channel')))
     return settings
 
 

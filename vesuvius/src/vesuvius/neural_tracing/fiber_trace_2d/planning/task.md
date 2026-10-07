@@ -1,3 +1,3 @@
-# Consistent raw loss reporting
+# Evaluate194246 snapshots with winning tracer
 
-Log individual losses before their configured weights. Combined losses retain weighted inputs, but are logged before any outer weight. Preserve optimization, normalization and sampling. Do not stop or restart training. Commit outstanding source/docs/tests in logical commits; exclude generated datasets/profiler artifacts.
+Freeze current raw,best-loss raw,best-restarts raw from reviewed_normal_width_hv_fullres_128_sd1_bs128_ema_20261006_194246. Run reviewed91fibers/182directions with postcutoff.4,cos40,noFW,step6trace=12base,originalweights,beam8/lookahead2. Report min0/min512 metrics and previous EMA999u12100 winner. Preserve GPU0–5/resources/approved runner.

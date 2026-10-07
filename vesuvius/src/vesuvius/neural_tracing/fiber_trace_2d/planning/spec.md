@@ -1,5 +1,36 @@
 # Training trace execution contract
 
+## Optional replay presence filtering
+
+- Cached output-only length analysis may discard completed saved pieces below a minimum actual traced-polyline arc length in base coordinates (after rollback; equality retained). It must preserve native traces and online totals, expose discarded coverage/pieces, and distinguish surviving endpoint counts from original restarts. GT-error boundaries already split benchmark pieces, so this is GT-assisted retained-output analysis, not a demonstrated GT-free detector. Report actual arithmetic piece mean alongside historical virtual retained-distance/(surviving stops+1).
+
+- Optional `--replay-presence-mode modulated` uses the actual winning candidate's `1 - fiberLocalAlignmentLoss`, captured during scoring in both sample and fused-corner paths and carried to committed replay points. This includes width scaling and all six positive-clamped direction dot products, but excludes separate smoothness/embedding penalties. Raw remains default. Width-off still includes direction modulation. New-segment seeds/reseeding retain raw presence requirements because their width/history is reinitialized.
+- Cutoff0 disables the filter. In raw mode, positive cutoff in[0,1] accepts equality and tests raw unweighted presence at every newly committed forward point, maximum finite value among valid prediction options. Missing/invalid options count0; published-chunk readiness remains unchanged.
+- A rejected point is filtered, not an ordinary error. Retain previous accepted prefix without FW/BW, or last reverse-verified prefix with FW/BW. No terminal reverse check is added by presence rejection. Record presence_filtered separately from reverse_consistency_filtered.
+- Reuse existing GT-guided aligned local-maximum restart search within10/20 ellipse, additionally requiring presence>=cutoff. Always advance; exhaustion skips remaining reference. Initial supplied GT seed is not itself threshold-tested; failures before any committed point retain the original handling.
+- No change to beam scoring, widths, sampling precision, scheduler or disabled protocol. Retained distance and filtered counts must accompany error counts.
+
+## Optional cumulative-width tracing
+
+- Explicit width inference exports the annotation head's positive softplus
+  full width in network-input voxels as a float32 scalar product. It is part
+  of cache identity and coherent chunk readiness; legacy caches remain valid
+  only for their original products. Normal/HV heads are not implicit outputs.
+- The opt-in tracer multiplies presence by
+  max(0,1-abs(sample_width/mean_width-1)/relative_tolerance), initially0.20.
+  Optional cosine weighting instead uses cos(pi*d/2) for d<1, else0,
+  where d=abs(sample_width/mean_width-1)/relative_tolerance. Linear is default;
+  zero tolerance disables gating. Width shape does not change inference identity.
+  Seed and newly committed forward points contribute equally to a cumulative
+  arithmetic mean. Beam candidates never contribute. Update before observers;
+  shared-prefix commits can lag speculative frontier points.
+- Reverse consistency copies the current forward mean and never initializes
+  or updates it during the reverse trace. Forward restarts reset the mean.
+  Invalid candidate widths give zero presence evidence; invalid seed/committed
+  widths fail explicitly. Disabled width leaves original scoring unchanged.
+- Existing inference parallelism and precision are preserved. Width export
+  currently requires an unconditioned width head and does not support TTA.
+
 ## Loss reporting
 
 - Individual loss metrics exclude their configured outer weights. Intrinsic

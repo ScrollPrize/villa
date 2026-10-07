@@ -30,7 +30,8 @@ def test_code_hashes_do_not_invalidate_existing_cache(tmp_path):
 
 
 @pytest.mark.parametrize("change", [{"checkpoint_sha256": "other"}, {"precision": "float32"},
-                                  {"tile": 8}, {"embedding_channels": "signed-float32-v2"}])
+                                  {"tile": 8}, {"embedding_channels": "signed-float32-v2"},
+                                  {"width_channel": "float32-input-voxels-v1"}])
 def test_inference_parameters_remain_part_of_identity(tmp_path, change):
     root, geometry, model = fixture_cache(tmp_path)
     selected, stored = resolve_prediction_cache(tmp_path, {"id": "source"},

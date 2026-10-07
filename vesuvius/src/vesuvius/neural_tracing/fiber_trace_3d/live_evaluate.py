@@ -325,6 +325,7 @@ def create_demand_store(cache, source_identity, model_identity, geometry, effect
         level=level + power, scaledown=(1 << level) * geometry.scale, inference_scaledown=geometry.scale,
         chunk_size=geometry.chunk, product_prefix="fiber", zarr_path_prefix=cache / "fiber",
         emit_embeddings=bool(settings.get("emit_embeddings", False)),
+        emit_width=bool(settings.get("emit_width", False)),
         **adapter_options)
     # Construction restores checkpoint config; reapply the resolved precision.
     adapter.config["training"] = {**adapter.config.get("training", {}),
@@ -388,9 +389,13 @@ def resolve_inference_model(cache_root, checkpoint, model_config, settings, devi
                       "embedding_channels": "signed-float32-v2" if settings.get("emit_embeddings", False) else None}
     if settings.get("tta"):
         from .tta import SCHEMA, VARIANTS
+        if settings.get('emit_width'):
+            raise ValueError('TTA width export is not supported')
         if settings['tta'] not in VARIANTS or precision != 'off' or max_batch_size != 1:
             raise ValueError('TTA requires valid variant, precision off and max_batch_size1')
         model_identity['tta'] = SCHEMA  # Selection is a view, not a new prediction.
+    if settings.get('emit_width'):
+        model_identity['width_channel'] = 'float32-input-voxels-v1'
     return dict(snapshot=snapshot, effective=effective, settings=settings,
                 identity=model_identity, tile=tile, overlap=overlap, border=border,
                 scale=scale, chunk=chunk, power=power)
@@ -463,6 +468,12 @@ def run(config_path, checkpoint, devices, native_binary, model_config=None, *, r
     prediction_cache_root = inference_cache_root(cache_root, config.get("inference_cache_namespace"))
     settings = dict(config.get("inference", {}))
     trace_args = config.get("trace_args", [])
+    if '--width-relative-tolerance' in trace_args:
+        tolerance = float(trace_args[trace_args.index('--width-relative-tolerance') + 1])
+        if not math.isfinite(tolerance) or tolerance < 0:
+            raise ValueError('width relative tolerance must be finite and nonnegative')
+        if tolerance > 0:
+            settings['emit_width'] = True
     mixed = config.get("embedding_inference")
     if worker_factory is not None and mixed is not None:
         raise ValueError("resident training trace cannot use a different embedding checkpoint")
