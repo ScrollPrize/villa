@@ -64,3 +64,37 @@ def test_layers_source_channel_mismatch_is_an_error(tmp_path, monkeypatch):
     monkeypatch.setattr(inference.CFG, "in_chans", 6)
     with pytest.raises(ValueError):
         inference.preprocess_layers(out, None, False, start_z=1, end_z=7)
+
+
+def test_layer_files_must_be_one_per_index_without_gaps():
+    assert processing.contiguous_layer_window(["01.tif", "02.tif", "03.tif"]) == (1, 4)
+    with pytest.raises(RuntimeError, match="missing"):
+        processing.contiguous_layer_window(["01.tif", "02.tif", "04.tif"])
+    with pytest.raises(RuntimeError, match="more than once"):
+        processing.contiguous_layer_window(["a/layers/01.tif", "b/layers/01.tif", "a/layers/02.tif"])
+
+
+def test_window_recorded_from_the_files_present(tmp_path):
+    # A segment holding layers 1..5 only, asked for [1, 8): the zarr records [1, 6), so asking for layers it
+    # does not hold is an error instead of a silently shorter or shifted stack.
+    layers = _layer_stack(tmp_path)[1:6]
+    out = str(tmp_path / "sv.zarr")
+    processing.create_surface_volume_zarr(layers, out, chunk_size=16, use_compression=False)
+    processing.record_layer_window(out, *processing.contiguous_layer_window(layers))
+    assert processing.resolve_zarr_layer_window(out, 2, 6) == (1, 5)
+    with pytest.raises(RuntimeError, match="not all present"):
+        processing.resolve_zarr_layer_window(out, 1, 8)
+
+
+def test_unreadable_attrs_stop_instead_of_falling_back(tmp_path, monkeypatch):
+    layers = _layer_stack(tmp_path)
+    out = str(tmp_path / "sv.zarr")
+    processing.create_surface_volume_zarr(layers[1:7], out, chunk_size=16, use_compression=False)
+    processing.record_layer_window(out, 1, 7)
+
+    def failing_open(*args, **kwargs):
+        raise OSError("simulated S3/cache read error")
+
+    monkeypatch.setattr(processing.zarr, "open", failing_open)
+    with pytest.raises(RuntimeError, match="Could not read the layer-window attrs"):
+        processing.resolve_zarr_layer_window(out, 2, 6)

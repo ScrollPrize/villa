@@ -658,6 +658,9 @@ def run_prepare_step(inputs: Inputs, profiler: Optional[WorkflowProfiler] = None
         s3_client, bucket, prefix, inputs.start_layer, inputs.end_layer, profiler=profiler
     )
     logger.info(f"Found {len(layer_objects)} layer objects to download")
+    # The zarr's channel k must be source layer layer_start + k: refuse gaps and duplicate indices up front.
+    from processing import contiguous_layer_window
+    layer_start, layer_end = contiguous_layer_window([base for _, base in layer_objects])
 
     # Download layers to temporary directory
     work_dir = "/workspace"
@@ -685,7 +688,7 @@ def run_prepare_step(inputs: Inputs, profiler: Optional[WorkflowProfiler] = None
 
     # Record the layer window so the inference step does not re-apply it to the cropped stack
     from processing import record_layer_window
-    record_layer_window(created_zarr_path, inputs.start_layer, inputs.end_layer)
+    record_layer_window(created_zarr_path, layer_start, layer_end)
 
     # Write output path to file for next step
     output_file = "/tmp/surface_volume_zarr_path.txt"
