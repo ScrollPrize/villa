@@ -90,6 +90,20 @@ def flat_z_window_bbox(
     return (z0 + offset, y0, x0, z1 + offset, y1, x1), offset
 
 
+def label_z_window_bbox(bbox_zyx, image_volume, label_volume):
+    """Move an image Z window onto the label volume's own mid-plane.
+
+    A label store need not be as deep as the surface volume: ``create_label_zarrs``
+    writes 65 planes with the annotation on plane 32 whatever the image depth is.
+    Patch discovery reads each label at its own mid-plane, and a sample has to do the
+    same, or the window taken from a shallower image misses the annotated plane and
+    the patch trains with no supervision. Equal depths leave the window unchanged.
+    """
+    shift = int(label_volume.shape[0]) // 2 - int(image_volume.shape[0]) // 2
+    z0, y0, x0, z1, y1, x1 = bbox_zyx
+    return z0 + shift, y0, x0, z1 + shift, y1, x1
+
+
 def _require_real_z(volume, bbox_zyx, *, name: str) -> None:
     z0, _, _, z1, _, _ = bbox_zyx
     shape = tuple(int(value) for value in volume.shape)
@@ -325,25 +339,28 @@ class InkDataset(Dataset):
         else:
             supervision_volume = self._open(patch.supervision_mask, patch.segment.scale)
             labels_volume = self._open(patch.inklabels, patch.segment.scale)
+            supervision_bbox = label_z_window_bbox(bbox, image_volume, supervision_volume)
+            labels_bbox = label_z_window_bbox(bbox, image_volume, labels_volume)
             if self.config.jitter.enabled:
-                _require_real_z(supervision_volume, bbox, name="supervision")
-                _require_real_z(labels_volume, bbox, name="inklabels")
+                _require_real_z(supervision_volume, supervision_bbox, name="supervision")
+                _require_real_z(labels_volume, labels_bbox, name="inklabels")
             supervision, _ = read_bbox_with_padding(
-                supervision_volume, bbox, fill_value=0
+                supervision_volume, supervision_bbox, fill_value=0
             )
             if not patch.is_validation and patch.segment.validation_mask is not None:
                 validation_volume = self._open(
                     patch.segment.validation_mask, patch.segment.scale
                 )
+                validation_bbox = label_z_window_bbox(bbox, image_volume, validation_volume)
                 if self.config.jitter.enabled:
-                    _require_real_z(validation_volume, bbox, name="validation")
+                    _require_real_z(validation_volume, validation_bbox, name="validation")
                 validation, _ = read_bbox_with_padding(
-                    validation_volume, bbox, fill_value=0
+                    validation_volume, validation_bbox, fill_value=0
                 )
                 supervision = exclude_validation_voxels(
                     supervision, validation
                 )
-            labels, _ = read_bbox_with_padding(labels_volume, bbox, fill_value=0)
+            labels, _ = read_bbox_with_padding(labels_volume, labels_bbox, fill_value=0)
         return self._tensor_sample(
             patch, image, valid_slices, labels, supervision, surface_mask=None
         )

@@ -111,7 +111,10 @@ def find_segment_patches(
         if segment.validation_mask is None
         else open_volume(segment.validation_mask, segment.scale)
     )
+    # Each label store is read at its own mid-plane (they may hold a different number of planes).
     surface = int(supervision.shape[0] // 2)
+    ink_surface = int(inklabels.shape[0] // 2)
+    validation_surface = None if validation is None else int(validation.shape[0] // 2)
     patch_size = segment.patch_size
     finding = segment.data_config.patch_finding
     size = patch_size[1]
@@ -119,7 +122,7 @@ def find_segment_patches(
     default_stride = int(size * finding.overlap)
     stride = default_stride if finding.stride is None else finding.stride
     _, xyxys, _ = build_patch_index(
-        inklabels[surface],
+        inklabels[ink_surface],
         supervision[surface],
         size=size,
         tile_size=tile_size,
@@ -128,8 +131,10 @@ def find_segment_patches(
     )
     training: list[Patch] = []
     held_out: list[Patch] = []
+    # The patch window is in image coordinates; the labels sit at their own mid-plane.
+    image_surface = int(open_volume(segment.image_volume, segment.scale).shape[0] // 2)
     for x1, y1, _, _ in xyxys.tolist():
-        z0 = surface - patch_size[0] // 2
+        z0 = image_surface - patch_size[0] // 2
         bbox = (
             z0,
             int(y1),
@@ -147,7 +152,7 @@ def find_segment_patches(
         has_validation = False
         if validation is not None:
             validation_patch = validation[
-                surface,
+                validation_surface,
                 int(y1) : int(y1) + patch_size[1],
                 int(x1) : int(x1) + patch_size[2],
             ]
@@ -166,7 +171,7 @@ def find_segment_patches(
                 )
             )
         label_patch = inklabels[
-            surface,
+            ink_surface,
             int(y1) : int(y1) + patch_size[1],
             int(x1) : int(x1) + patch_size[2],
         ]

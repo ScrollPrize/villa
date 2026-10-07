@@ -13,6 +13,7 @@ import pytest
 import torch
 import zarr
 
+from vesuvius import label_zarr
 from vesuvius.ink_detection.config import InkDataConfig
 from vesuvius.ink_detection.data.dataset import InkDataset, flat_z_window_bbox
 from vesuvius.ink_detection.data.geometry import (
@@ -569,6 +570,35 @@ def test_flat_jitter_and_dataset_sample_are_self_contained(tmp_path, monkeypatch
     assert tuple(sample["image"].shape) == (1, 3, 2, 2)
     assert not bool(sample["is_unlabeled"])
     assert torch.count_nonzero(sample["supervision_mask"][:, :, 0, 0]) == 0
+
+
+def test_flat_sample_reads_converted_labels_at_their_own_mid_plane(tmp_path):
+    # create_label_zarrs writes 65 label planes; the 9 um surface volumes are 21 or 28 deep.
+    config = _config(tmp_path, patch_size=[3, 2, 2], patch_overlap=1.0)
+    image = np.arange(7 * 2 * 2, dtype=np.uint8).reshape(7, 2, 2)
+    labels = np.zeros((label_zarr.VOLUME_DEPTH, 2, 2), dtype=np.uint8)
+    labels[label_zarr.LABEL_SLICE, 0, :] = 255
+    supervision = np.zeros_like(labels)
+    supervision[label_zarr.LABEL_SLICE] = 255
+    paths = {}
+    for name, value in (("image", image), ("labels", labels), ("supervision", supervision)):
+        paths[name] = tmp_path / f"{name}.zarr"
+        _write_pyramid(paths[name], value)
+    segment = replace(
+        _segment(config, tmp_path, image_volume=paths["image"]),
+        inklabels=paths["labels"],
+        supervision_mask=paths["supervision"],
+    )
+
+    training, _ = find_segment_patches(segment, lambda path, scale: open_volume(path, resolution=scale))
+    assert [patch.bbox for patch in training] == [(2, 0, 0, 5, 2, 2)]  # the image's window
+
+    sample = InkDataset(config, do_augmentations=False, patches=training)[0]
+    np.testing.assert_array_equal(sample["image"][0].numpy(), image[2:5])
+    assert bool(sample["supervision_mask"].amax(dim=1).all())
+    np.testing.assert_array_equal(
+        sample["inklabels"].amax(dim=1)[0].numpy() > 0, [[True, True], [False, False]]
+    )
 
 
 class _FakeTifxyz:
