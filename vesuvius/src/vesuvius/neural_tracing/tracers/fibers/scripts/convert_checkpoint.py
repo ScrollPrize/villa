@@ -20,6 +20,8 @@ from pathlib import Path
 
 import torch
 
+from vesuvius.neural_tracing.tracers.shared.io import atomic_torch_save
+
 LEGACY_TYPES = dict(unified='regression', unified_flow='flow', sequence='sequence')
 # Removed model fields and the values under which they had no effect.
 INERT_MODEL_FIELDS = dict(memory='none', identity_dim=0, identity_objective='infonce', identity_map=False,
@@ -135,9 +137,7 @@ def main(argv=None):
     out, run, notes = convert(ck)
     parameters = verify(out)
     args.destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = args.destination.with_suffix('.partial.pt')
-    torch.save(out, temporary)
-    temporary.replace(args.destination)
+    atomic_torch_save(out, args.destination)
     args.run_config.write_text(json.dumps(run, indent=2)+'\n')
     print(f'{args.source}: {ck["model_type"]} -> {out["model_type"]} at step {out.get("step")}, '
           f'{parameters:,} parameters; model, EMA and optimizer load into the current model')

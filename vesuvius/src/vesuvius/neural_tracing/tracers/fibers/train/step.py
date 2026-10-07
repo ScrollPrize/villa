@@ -7,7 +7,7 @@ import torch
 from vesuvius.neural_tracing.tracers.shared.policy import gate_horizon, selection_window
 from vesuvius.neural_tracing.tracers.models.blocks import LOGIT_SCALE_LR_SCALE
 from vesuvius.neural_tracing.tracers.shared.compile import compile_options
-from vesuvius.neural_tracing.tracers.shared.training import restore_training_rng, update_ema
+from vesuvius.neural_tracing.tracers.shared.training import clip_training_gradients, restore_training_rng, update_ema
 from vesuvius.neural_tracing.tracers.shared.tensors import fixed_rows, move_batch
 from vesuvius.neural_tracing.tracers.fibers.data.observations import LOCATION_SOURCES
 from vesuvius.neural_tracing.tracers.fibers.train.supervision import commit_window, loss_terms
@@ -134,18 +134,6 @@ def resolve_device_sums(*tables):
 
 
 IDENTITY_SUMS = ('identity_correct_count', 'identity_flipped_count')
-
-
-def clip_training_gradients(model, max_norm=GRAD_CLIP):
-    """Clip the global gradient norm; checked before modifying gradients."""
-    if not math.isfinite(max_norm) or max_norm < 0:
-        raise ValueError('The gradient clipping limit must be finite and nonnegative (0 disables clipping)')
-    params = list(model.parameters())
-    norm = torch.nn.utils.get_total_norm([p.grad for p in params if p.grad is not None], error_if_nonfinite=True)
-    if max_norm > 0:
-        torch.nn.utils.clip_grads_with_norm_(params, max_norm, norm)
-    norm = float(norm)
-    return dict(grad_norm=norm, grad_clip_scale=min(1., max_norm/(norm+1e-6)) if max_norm else 1.)
 
 
 def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolerance=1.5,

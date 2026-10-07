@@ -9,14 +9,15 @@ import torch
 
 from vesuvius.neural_tracing.tracers.models.model import MODEL_TYPES, RETIRED_FIELDS, build_model, config_class, config_from_checkpoint
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolumeSpec
+from vesuvius.neural_tracing.tracers.shared.io import atomic_torch_save
 from vesuvius.neural_tracing.tracers.shared.paths import relocate_checkpoint
 from vesuvius.neural_tracing.tracers.models.weights import conv_memory_format, load_matching_weights
 
 
 def write_checkpoint(path, model, vol_spec, crop, n_history, model_type, extra=None):
-    torch.save(dict(model_type=model_type, model=model.state_dict(),
-                    model_cfg=model.cfg.to_dict(), crop=dataclasses.asdict(crop),
-                    n_history=n_history, vol_spec=vol_spec.to_dict(), **(extra or {})), path)
+    atomic_torch_save(dict(model_type=model_type, model=model.state_dict(),
+                           model_cfg=model.cfg.to_dict(), crop=dataclasses.asdict(crop),
+                           n_history=n_history, vol_spec=vol_spec.to_dict(), **(extra or {})), path)
 
 
 def read_checkpoint(path, device='cuda'):

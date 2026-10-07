@@ -45,13 +45,10 @@ from vesuvius.neural_tracing.tracers.fibers.train.training_log import (
 
 
 def save_checkpoint(path, model, ema, spec, sample, extra=None):
-    # Atomic publication: collectors must never open a partial checkpoint.
-    path = Path(path)
-    temporary = path.with_suffix('.partial.pt')
-    write_checkpoint(temporary, model, spec, sample.crop, sample.n_history, model.model_type,
+    # Atomic publication (write_checkpoint): collectors must never open a partial checkpoint.
+    write_checkpoint(path, model, spec, sample.crop, sample.n_history, model.model_type,
                      dict({'n_commit': commit_window(model.cfg, None), **(extra or {})},
                           ema=ema.state_dict(), sample_cfg=asdict(sample)))
-    temporary.replace(path)
 
 
 def collector_settings(collector):

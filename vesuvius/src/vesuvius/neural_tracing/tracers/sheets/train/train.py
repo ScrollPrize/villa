@@ -41,7 +41,8 @@ from vesuvius.neural_tracing.tracers.sheets.model import build_model, compile_mo
 from vesuvius.neural_tracing.tracers.sheets.tracing.rollout import Tracer
 from vesuvius.neural_tracing.tracers.sheets.tracing.seeding import perturb, seed_rows, sheet_jump
 from vesuvius.neural_tracing.tracers.sheets.evaluation.figures import episode_figure, metric_figure, training_figure
-from vesuvius.neural_tracing.tracers.shared.training import lr_at, prepare_run_dir, update_ema
+from vesuvius.neural_tracing.tracers.shared.io import atomic_torch_save
+from vesuvius.neural_tracing.tracers.shared.training import clip_training_gradients, lr_at, prepare_run_dir, update_ema
 
 
 def learning_rate(it: int, tc, minutes: float = 0.) -> float:
@@ -193,7 +194,7 @@ def optimize_step(tracer: Tracer, opt, ema, b: dict, cfg, spec, generator, front
     model, tc = tracer.model, cfg.train
     opt.zero_grad(set_to_none=True)
     loss, stats, front, confs = train_rollout(tracer, b, cfg, spec, generator, front)
-    stats['grad'] = torch.nn.utils.clip_grad_norm_(model.parameters(), tc.grad_clip)
+    stats['grad'] = torch.tensor(clip_training_gradients(model, tc.grad_clip)['grad_norm'])
     opt.step()
     if ema:
         ema.update(model)
@@ -214,11 +215,9 @@ class EMA:
 
 
 def save(path, model, opt, cfg, it, best, minutes=0., ema: EMA | None = None):
-    tmp = path.with_suffix('.partial')
     extra = dict(ema=ema.model.state_dict(), ema_updates=ema.updates) if ema else {}
-    torch.save(dict(model=model.state_dict(), opt=opt.state_dict(), config=cfg.to_dict(), iteration=it, best=best,
-                    minutes=minutes, **extra), tmp)
-    tmp.replace(path)
+    atomic_torch_save(dict(model=model.state_dict(), opt=opt.state_dict(), config=cfg.to_dict(), iteration=it,
+                           best=best, minutes=minutes, **extra), path)
 
 
 def main(argv=None):

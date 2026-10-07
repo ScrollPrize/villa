@@ -1,5 +1,5 @@
 """Training-run pieces shared by the tracers: run directory creation, the JSON-lines log, the warmup-cosine schedule,
-the weight EMA and RNG state."""
+gradient clipping, the weight EMA and RNG state."""
 from __future__ import annotations
 
 import json
@@ -80,3 +80,14 @@ def restore_training_rng(state):
         torch.cuda.set_rng_state_all([s.cpu() for s in state['cuda']])
 
 
+def clip_training_gradients(model, max_norm):
+    """Clip the global gradient norm (``max_norm`` 0 disables clipping); a nonfinite norm raises before any gradient
+    is modified. Returns the norm and the clip scale applied."""
+    if not math.isfinite(max_norm) or max_norm < 0:
+        raise ValueError('The gradient clipping limit must be finite and nonnegative (0 disables clipping)')
+    params = list(model.parameters())
+    norm = torch.nn.utils.get_total_norm([p.grad for p in params if p.grad is not None], error_if_nonfinite=True)
+    if max_norm > 0:
+        torch.nn.utils.clip_grads_with_norm_(params, max_norm, norm)
+    norm = float(norm)
+    return dict(grad_norm=norm, grad_clip_scale=min(1., max_norm/(norm+1e-6)) if max_norm else 1.)
