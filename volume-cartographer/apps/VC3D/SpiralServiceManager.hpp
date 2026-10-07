@@ -53,6 +53,10 @@ public:
     explicit SpiralServiceManager(QObject* parent = nullptr);
     ~SpiralServiceManager() override;
 
+    // spiral_service.py as a local launch would run it (SPIRAL_SERVICE_PATH,
+    // a source checkout, or the installed copy); empty when none is found.
+    static QString findService();
+
     void connectToService(const SpiralServiceProfile& profile);
     void disconnectFromService();
     void reconnect();
@@ -232,7 +236,6 @@ private:
                                                const QJsonObject& body)>;
 
     QString findPython() const;
-    QString findService() const;
     void setConnectionState(ConnectionState state, const QString& message = {});
     void startLocalProcess();
     void startTunnel();

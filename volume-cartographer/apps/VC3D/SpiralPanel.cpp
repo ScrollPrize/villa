@@ -1,6 +1,7 @@
 #include "SpiralPanel.hpp"
 #include "SpiralInputRows.hpp"
 #include "SpiralActivityWidget.hpp"
+#include "SpiralDescriptions.hpp"
 #include "SpiralInputFilter.hpp"
 
 #include "SpiralReloadComparison.hpp"
@@ -18,6 +19,7 @@
 #include <QDialog>
 #include <QDir>
 #include <QFileDialog>
+#include <QFileInfo>
 #include <QFormLayout>
 #include <QGridLayout>
 #include <QHBoxLayout>
@@ -57,6 +59,15 @@ constexpr int kLocalCheckpointRole = Qt::UserRole + 1;
 SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     : QWidget(parent), _service(service)
 {
+    const QString servicePath = SpiralServiceManager::findService();
+    _descriptions = new SpiralDescriptions(
+        servicePath.isEmpty()
+            ? QString()
+            : QFileInfo(servicePath).dir().filePath(QStringLiteral("descriptions.json")),
+        this);
+    connect(_descriptions, &SpiralDescriptions::changed,
+            this, &SpiralPanel::applyDescriptions);
+
     auto* rootLayout = new QVBoxLayout(this);
     rootLayout->setContentsMargins(4, 4, 4, 4);
     auto* scroll = new QScrollArea(this);
@@ -114,18 +125,19 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _profileCombo->setObjectName(QStringLiteral("spiralProfileCombo"));
     auto* addLan = new QToolButton(profileRow);
     addLan->setText(QStringLiteral("+LAN"));
-    addLan->setToolTip(tr("Add a Remote (LAN) profile: direct HTTP to a service on a trusted network"));
     auto* addSsh = new QToolButton(profileRow);
     addSsh->setText(QStringLiteral("+SSH"));
-    addSsh->setToolTip(tr("Add a Remote (SSH) profile: VC3D manages an SSH tunnel to a persistent service"));
     auto* removeProfile = new QToolButton(profileRow);
     removeProfile->setText(QStringLiteral("−"));
-    removeProfile->setToolTip(tr("Remove the selected profile"));
     profileLayout->addWidget(_profileCombo, 1);
     profileLayout->addWidget(addLan);
     profileLayout->addWidget(addSsh);
     profileLayout->addWidget(removeProfile);
     serviceForm->addRow(tr("Service"), profileRow);
+    describe(QStringLiteral("service_profile"), {profileRow});
+    describe(QStringLiteral("service_add_lan"), {addLan});
+    describe(QStringLiteral("service_add_ssh"), {addSsh});
+    describe(QStringLiteral("service_remove_profile"), {removeProfile});
 
     _endpointRow = new QWidget(serviceContents);
     auto* endpointLayout = new QHBoxLayout(_endpointRow);
@@ -134,6 +146,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _endpointUrl->setPlaceholderText(QStringLiteral("http://gpu-host:8765"));
     endpointLayout->addWidget(_endpointUrl);
     serviceForm->addRow(tr("Endpoint"), _endpointRow);
+    describe(QStringLiteral("service_endpoint"), {_endpointRow});
 
     _sshRow = new QWidget(serviceContents);
     auto* sshLayout = new QHBoxLayout(_sshRow);
@@ -143,11 +156,13 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _sshPort = new QSpinBox(_sshRow);
     _sshPort->setRange(1, 65535);
     _sshPort->setValue(8765);
-    _sshPort->setToolTip(tr("Loopback port of the persistent service on the host"));
+    auto* sshPortLabel = new QLabel(tr("port"), _sshRow);
     sshLayout->addWidget(_sshDestination, 1);
-    sshLayout->addWidget(new QLabel(tr("port"), _sshRow));
+    sshLayout->addWidget(sshPortLabel);
     sshLayout->addWidget(_sshPort);
     serviceForm->addRow(tr("SSH host"), _sshRow);
+    describe(QStringLiteral("service_ssh_host"), {_sshRow});
+    describe(QStringLiteral("service_ssh_port"), {sshPortLabel, _sshPort});
 
     _apiKeyRow = new QWidget(serviceContents);
     auto* apiKeyLayout = new QHBoxLayout(_apiKeyRow);
@@ -156,6 +171,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _apiKey->setEchoMode(QLineEdit::Password);
     apiKeyLayout->addWidget(_apiKey);
     serviceForm->addRow(tr("API key"), _apiKeyRow);
+    describe(QStringLiteral("service_api_key"), {_apiKeyRow});
 
     // Local launch binding: the owned service is started with these values as
     // --dataset/--output/--cache; selecting a different dataset restarts the
@@ -185,18 +201,13 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     };
     makeLaunchRow(_datasetRoot, _datasetRow, tr("Dataset"),
                   tr("Dataset root (required for the local service)"));
-    _datasetRoot->setToolTip(tr("Inputs-only dataset root the local service is "
-                                "bound to at launch (--dataset)"));
+    describe(QStringLiteral("service_dataset"), {_datasetRow});
     makeLaunchRow(_outputRoot, _outputRow, tr("Output"),
                   tr("Generated state root (default: per-dataset app data dir)"));
-    _outputRoot->setToolTip(tr("Root for all generated state (--output); must be "
-                               "outside the dataset root. Empty derives a "
-                               "per-dataset default under the VC3D data directory."));
+    describe(QStringLiteral("service_output"), {_outputRow});
     makeLaunchRow(_cacheRoot, _cacheRow, tr("Cache"),
                   tr("Derived cache root (default: ~/.cache/vc3d/spiral)"));
-    _cacheRoot->setToolTip(tr("Derived host cache directory (--cache); must be "
-                              "outside the dataset root. Empty uses the "
-                              "documented user cache default."));
+    describe(QStringLiteral("service_cache"), {_cacheRow});
 
     // One box, not a pair: the service advertises its own dataset root, so the
     // only thing this viewer cannot know is where the same dataset is mounted
@@ -211,10 +222,8 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     browseLocalRoot->setText(QStringLiteral("…"));
     mappingLayout->addWidget(_mapLocalRoot, 1);
     mappingLayout->addWidget(browseLocalRoot);
-    _mappingRow->setToolTip(tr("Optional: where this computer mounts the same dataset the "
-                               "service is bound to. Assumed to correspond to the service's "
-                               "advertised dataset root, so input overlays can be displayed."));
     serviceForm->addRow(tr("Local dataset path"), _mappingRow);
+    describe(QStringLiteral("service_local_dataset_path"), {_mappingRow});
     connect(browseLocalRoot, &QToolButton::clicked, this, [this]() {
         const QString chosen = QFileDialog::getExistingDirectory(
             this, tr("Select the local dataset root"), _mapLocalRoot->text());
@@ -234,6 +243,9 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _connectionStatus = new QLabel(tr("Disconnected"), serviceContents);
     _connectionStatus->setWordWrap(true);
     serviceForm->addRow(tr("Status"), _connectionStatus);
+    describe(QStringLiteral("service_connect"), {_connectButton});
+    describe(QStringLiteral("service_disconnect"), {_disconnectButton});
+    describe(QStringLiteral("service_status"), {_connectionStatus});
 
     // ------------------------------------------------------------------
     // Dataset and fit geometry
@@ -253,9 +265,8 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _scrollSummary->setObjectName(QStringLiteral("spiralScrollSummary"));
     _scrollSummary->setWordWrap(true);
     _scrollSummary->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    _scrollSummary->setToolTip(
-        tr("The scroll's physical facts, from spiral-scroll.json in the dataset root"));
     pathsForm->addRow(tr("Scroll"), _scrollSummary);
+    describe(QStringLiteral("scroll_summary"), {_scrollSummary});
     addPathRow(pathsForm, "umbilicus", tr("Umbilicus"), false);
 
     auto* pclContainer = new QWidget(pathsContents);
@@ -281,13 +292,10 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _pclPath->setPlaceholderText(tr("PCL path"));
     _browsePclButton = new QToolButton(pclContainer);
     _browsePclButton->setText(QStringLiteral("…"));
-    _browsePclButton->setToolTip(tr("Select PCL file"));
     _addPclButton = new QPushButton(QStringLiteral("+"), pclContainer);
     _addPclButton->setObjectName(QStringLiteral("spiralAddPcl"));
-    _addPclButton->setToolTip(tr("Add PCL"));
     _removePcl = new QPushButton(QStringLiteral("-"), pclContainer);
     _removePcl->setObjectName(QStringLiteral("spiralRemovePcl"));
-    _removePcl->setToolTip(tr("Remove selected PCL"));
     _removePcl->setEnabled(false);
     pclInputRow->addWidget(_pclRole);
     pclInputRow->addWidget(_pclPath, 1);
@@ -296,6 +304,12 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     pclInputRow->addWidget(_removePcl);
     pclLayout->addLayout(pclInputRow);
     pathsForm->addRow(tr("PCLs"), pclContainer);
+    describe(QStringLiteral("pcl_list"), {pclContainer});
+    describe(QStringLiteral("pcl_role"), {_pclRole});
+    describe(QStringLiteral("pcl_path"), {_pclPath});
+    describe(QStringLiteral("pcl_browse"), {_browsePclButton});
+    describe(QStringLiteral("pcl_add"), {_addPclButton});
+    describe(QStringLiteral("pcl_remove"), {_removePcl});
 
     addPathRow(pathsForm, "fibers", tr("Fibers"), true);
 
@@ -311,11 +325,6 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _verticalFiberOffsetEnabled->setObjectName(
         QStringLiteral("spiralVerticalFiberOffsetEnabled"));
     _verticalFiberOffsetEnabled->setChecked(false);
-    _verticalFiberOffsetEnabled->setToolTip(
-        tr("Vertical fibers sit on the back face of the sheet. When checked, the fit "
-           "expects vertical fiber strips this many voxels radially outside the fitted "
-           "winding instead of on it (pcl_vertical_fiber_radial_offset_*). Horizontal "
-           "fibers are unaffected. Applies at the next Run without a rebuild."));
     _verticalFiberOffsetVoxels = new QDoubleSpinBox(verticalOffset);
     _verticalFiberOffsetVoxels->setObjectName(
         QStringLiteral("spiralVerticalFiberOffsetVoxels"));
@@ -331,15 +340,14 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     verticalOffsetLayout->addWidget(_verticalFiberOffsetVoxels);
     verticalOffsetLayout->addStretch(1);
     pathsForm->addRow(verticalOffset);
+    describe(QStringLiteral("vertical_fiber_offset"), {_verticalFiberOffsetEnabled});
+    describe(QStringLiteral("vertical_fiber_offset_voxels"), {_verticalFiberOffsetVoxels});
 
     addPathRow(pathsForm, "tracks_dbm", tr("Tracks DBM"), false);
 
     _trackLengthBinSampling = new QCheckBox(tr("Sample tracks by length bins"), pathsContents);
     _trackLengthBinSampling->setObjectName(QStringLiteral("spiralTrackLengthBinSampling"));
     _trackLengthBinSampling->setChecked(false);
-    _trackLengthBinSampling->setToolTip(
-        tr("Draw short, medium, and long tracks using configurable weights. "
-           "The bin boundaries are computed from eligible-track arclength tertiles."));
     pathsForm->addRow(_trackLengthBinSampling);
 
     auto* trackWeights = new QWidget(pathsContents);
@@ -374,11 +382,10 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _maxTrackCrossings->setObjectName(QStringLiteral("spiralMaxTrackCrossings"));
     _maxTrackCrossings->setRange(0, 8);
     _maxTrackCrossings->setValue(0);
-    _maxTrackCrossings->setToolTip(
-        tr("Maximum differently oriented crossing partners appended for each sampled "
-           "primary track. Applies on the next Run; zero disables crossing-pair "
-           "sampling. The upper bound is prepared when the session loads."));
     pathsForm->addRow(tr("Max crossings / sampled track"), _maxTrackCrossings);
+    describe(QStringLiteral("track_length_bin_sampling"), {_trackLengthBinSampling});
+    describe(QStringLiteral("track_length_bin_weights"), {trackWeights});
+    describe(QStringLiteral("max_track_crossings"), {_maxTrackCrossings});
     for (QWidget* field : {static_cast<QWidget*>(_trackLengthBinSampling),
                            trackWeights,
                            static_cast<QWidget*>(_maxTrackCrossings)}) {
@@ -408,9 +415,8 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _lasagnaSummary->setObjectName(QStringLiteral("spiralLasagnaSummary"));
     _lasagnaSummary->setWordWrap(true);
     _lasagnaSummary->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    _lasagnaSummary->setToolTip(
-        tr("The store layout, from spiral-scroll.json in the dataset root"));
     lasagnaForm->addRow(tr("Store layout"), _lasagnaSummary);
+    describe(QStringLiteral("store_layout"), {_lasagnaSummary});
 
     auto* outputGroup = makeSection(tr("Fit and output"),
                                     QStringLiteral("spiralFitOutputGroup"),
@@ -438,6 +444,11 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     outputForm->addRow(tr("Render-volume scale"), _renderVolumeScale);
     outputForm->addRow(_savePngVisualizations);
     outputForm->addRow(tr("Advanced config JSON"), _advancedProfiles);
+    describe(QStringLiteral("z_begin"), {_zBegin});
+    describe(QStringLiteral("z_end"), {_zEnd});
+    describe(QStringLiteral("run_tag"), {_runTag});
+    describe(QStringLiteral("render_volume_scale"), {_renderVolumeScale});
+    describe(QStringLiteral("advanced_config"), {_advancedProfiles});
 
     auto* displayGroup = makeSection(tr("Display"),
                                      QStringLiteral("spiralDisplayGroup"),
@@ -454,17 +465,21 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _minimumDisplayedWinding->setObjectName(QStringLiteral("spiralMinimumDisplayedWinding"));
     _minimumDisplayedWinding->setRange(0, 1000000);
     _minimumDisplayedWinding->setValue(10);
-    _minimumDisplayedWinding->setToolTip(tr("First winding to display (inclusive)"));
     _maximumDisplayedWinding = new QSpinBox(windingRange);
     _maximumDisplayedWinding->setObjectName(QStringLiteral("spiralMaximumDisplayedWinding"));
     _maximumDisplayedWinding->setRange(-1, 1000000);
     _maximumDisplayedWinding->setValue(130);
-    _maximumDisplayedWinding->setToolTip(
-        tr("Last winding to display (inclusive); -1 displays through the final winding"));
-    windingRangeLayout->addWidget(new QLabel(tr("Min winding"), windingRange));
+    auto* minimumWindingLabel = new QLabel(tr("Min winding"), windingRange);
+    auto* maximumWindingLabel = new QLabel(tr("Max winding"), windingRange);
+    windingRangeLayout->addWidget(minimumWindingLabel);
     windingRangeLayout->addWidget(_minimumDisplayedWinding);
-    windingRangeLayout->addWidget(new QLabel(tr("Max winding"), windingRange));
+    windingRangeLayout->addWidget(maximumWindingLabel);
     windingRangeLayout->addWidget(_maximumDisplayedWinding);
+    describe(QStringLiteral("display_volume"), {_volumeSelector});
+    describe(QStringLiteral("display_min_winding"),
+             {minimumWindingLabel, _minimumDisplayedWinding});
+    describe(QStringLiteral("display_max_winding"),
+             {maximumWindingLabel, _maximumDisplayedWinding});
     displayLayout->addWidget(windingRange);
     auto emitWindingRange = [this](int) {
         emit windingRangeChanged(_minimumDisplayedWinding->value(),
@@ -477,7 +492,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
 
     auto* displayButton = new QPushButton(tr("Display ->"), displayContents);
     displayButton->setObjectName(QStringLiteral("spiralDisplayButton"));
-    displayButton->setToolTip(tr("Choose which Spiral overlays are shown"));
+    describe(QStringLiteral("display_button"), {displayButton});
     displayLayout->addWidget(displayButton);
 
     _displayDialog = new QDialog(this);
@@ -495,8 +510,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _showSurfaceIntersections = new QCheckBox(tr("Show surface intersections"), _displayDialog);
     _showSurfaceIntersections->setObjectName(QStringLiteral("spiralShowSurfaceIntersections"));
     _showSurfaceIntersections->setChecked(true);
-    _showSurfaceIntersections->setToolTip(
-        tr("Show rendered surface intersections on the plane views"));
+    describe(QStringLiteral("display_surface_intersections"), {_showSurfaceIntersections});
     connect(_showSurfaceIntersections, &QCheckBox::toggled,
             this, &SpiralPanel::surfaceIntersectionsChanged);
     displayDialogLayout->addWidget(_showSurfaceIntersections);
@@ -509,8 +523,12 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                                   ? QStringLiteral("spiralShowRelativeWindingPcls")
                                   : QStringLiteral("spiralShowSameWindingPcls"));
         toggle->setEnabled(false);
-        toggle->setToolTip(tr("No compatible %1 artifact is available")
-                               .arg(vc3d::spiral::pclRoleDisplayName(role)));
+        describe(role == vc3d::spiral::PclRole::Relative
+                     ? QStringLiteral("display_relative_pcls")
+                     : QStringLiteral("display_same_winding_pcls"),
+                 {toggle});
+        setToolTipNote(toggle, tr("No compatible %1 artifact is available")
+                                   .arg(vc3d::spiral::pclRoleDisplayName(role)));
         connect(toggle, &QCheckBox::toggled, this, [this, role](bool shown) {
             emit pclOverlayChanged(role, shown);
         });
@@ -528,9 +546,6 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _pointViewTolerance->setDecimals(1);
     _pointViewTolerance->setSingleStep(1.0);
     _pointViewTolerance->setSuffix(tr(" vx"));
-    _pointViewTolerance->setToolTip(
-        tr("Maximum distance from the preview surface at which same-winding "
-           "and relative-winding point markers are shown"));
     {
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
         _pointViewTolerance->setValue(
@@ -541,6 +556,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
         new QLabel(tr("Point surface tolerance"), pointToleranceRow));
     pointToleranceLayout->addWidget(_pointViewTolerance);
     pointToleranceLayout->addStretch(1);
+    describe(QStringLiteral("display_point_tolerance"), {pointToleranceRow});
     connect(_pointViewTolerance,
             QOverload<double>::of(&QDoubleSpinBox::valueChanged),
             this, [this](double tolerance) {
@@ -558,13 +574,11 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     intersectionStride->setObjectName(QStringLiteral("spiralSurfaceIntersectionStride"));
     intersectionStride->setRange(1, 16);
     intersectionStride->setValue(4);
-    intersectionStride->setToolTip(
-        tr("Sample every Nth input-surface grid cell when building Spiral intersections; "
-           "larger values are faster but less detailed"));
     intersectionStrideLayout->addWidget(
         new QLabel(tr("Surface intersection stride"), intersectionStrideRow));
     intersectionStrideLayout->addWidget(intersectionStride);
     intersectionStrideLayout->addStretch(1);
+    describe(QStringLiteral("display_intersection_stride"), {intersectionStrideRow});
     connect(intersectionStride, QOverload<int>::of(&QSpinBox::valueChanged),
             this, &SpiralPanel::surfaceIntersectionStrideChanged);
     displayDialogLayout->addWidget(intersectionStrideRow);
@@ -573,29 +587,21 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                                          _displayDialog);
     surfaceOverlap->setObjectName(QStringLiteral("spiralShowSurfaceOverlap"));
     surfaceOverlap->setChecked(true);
-    surfaceOverlap->setToolTip(
-        tr("Color areas of the flattened output that overlap the selected patch categories"));
+    describe(QStringLiteral("display_patch_overlap"), {surfaceOverlap});
     connect(surfaceOverlap, &QCheckBox::toggled,
             this, &SpiralPanel::surfaceOverlapChanged);
     displayDialogLayout->addWidget(surfaceOverlap);
 
     auto* runDiff = new QCheckBox(tr("Run diff"), _displayDialog);
     runDiff->setObjectName(QStringLiteral("spiralRunDiff"));
-    runDiff->setToolTip(
-        tr("Overlay the XYZ displacement magnitude between the previous and current "
-           "completed runs. Magnitude increases from blue through green, yellow, and "
-           "orange to red; the first run has no diff."));
+    describe(QStringLiteral("display_run_diff"), {runDiff});
     connect(runDiff, &QCheckBox::toggled, this, &SpiralPanel::runDiffChanged);
     displayDialogLayout->addWidget(runDiff);
 
     auto* windingTransitions = new QCheckBox(tr("Winding transitions"), _displayDialog);
     windingTransitions->setObjectName(QStringLiteral("spiralWindingTransitions"));
     windingTransitions->setChecked(true);
-    windingTransitions->setToolTip(
-        tr("Draw the boundaries between adjacent windings on the flattened "
-           "output, labeled with the winding numbers on either side. A red "
-           "boundary joins non-adjacent windings and usually indicates a "
-           "mapping problem."));
+    describe(QStringLiteral("display_winding_transitions"), {windingTransitions});
     connect(windingTransitions, &QCheckBox::toggled,
             this, &SpiralPanel::windingTransitionsChanged);
     displayDialogLayout->addWidget(windingTransitions);
@@ -606,26 +612,23 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _lossMap = new QComboBox(lossMapRow);
     _lossMap->setObjectName(QStringLiteral("spiralLossMap"));
     _lossMap->addItem(tr("No loss overlay"), QString());
-    _lossMap->setToolTip(
-        tr("Overlay a weighted per-sample loss residual on the flattened output"));
     _lossMapOpacity = new QSlider(Qt::Horizontal, lossMapRow);
     _lossMapOpacity->setObjectName(QStringLiteral("spiralLossMapOpacity"));
     _lossMapOpacity->setRange(0, 100);
     _lossMapOpacity->setValue(80);
-    _lossMapOpacity->setToolTip(tr("Loss overlay opacity"));
+    auto* lossMapOpacityLabel = new QLabel(tr("Opacity"), lossMapRow);
     lossMapLayout->addWidget(_lossMap, 1);
-    lossMapLayout->addWidget(new QLabel(tr("Opacity"), lossMapRow));
+    lossMapLayout->addWidget(lossMapOpacityLabel);
     lossMapLayout->addWidget(_lossMapOpacity);
+    describe(QStringLiteral("display_loss_map"), {_lossMap});
+    describe(QStringLiteral("display_loss_map_opacity"),
+             {lossMapOpacityLabel, _lossMapOpacity});
     displayDialogLayout->addWidget(lossMapRow);
     _lossMapDiagnostics = new QCheckBox(
         tr("Compute loss overlays with the next preview"), _displayDialog);
     _lossMapDiagnostics->setObjectName(
         QStringLiteral("spiralPreviewDiagnostics"));
-    _lossMapDiagnostics->setToolTip(
-        tr("Loss overlays roughly double the cost of a preview: every enabled "
-           "loss is evaluated again and each overlay is mapped onto the "
-           "flattened output. They are published after the surface, so the "
-           "preview itself still appears as soon as it is ready."));
+    describe(QStringLiteral("display_loss_map_diagnostics"), {_lossMapDiagnostics});
     connect(_lossMapDiagnostics, &QCheckBox::toggled,
             this, &SpiralPanel::previewDiagnosticsChanged);
     displayDialogLayout->addWidget(_lossMapDiagnostics);
@@ -649,11 +652,9 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
         auto* check = new QCheckBox(tr(item.second), _displayDialog);
         const QString key = QString::fromLatin1(item.first);
         _visibilityChecks[key] = check;
-        if (key == QStringLiteral("pending_only")) {
+        if (key == QStringLiteral("pending_only"))
             check->setObjectName(QStringLiteral("spiralPendingPatchesOnly"));
-            check->setToolTip(tr("Replace the verified patch selection with only "
-                                 "interactive-fit patches that are not yet committed to the dataset"));
-        }
+        describe(QStringLiteral("display_") + key, {check});
         check->setChecked(key == QStringLiteral("output"));
         connect(check, &QCheckBox::toggled, this, [this, key = QString::fromLatin1(item.first)](bool shown) {
             emit visibilityChanged(key, shown);
@@ -680,21 +681,15 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _sessionCheckpointLabel->setObjectName(QStringLiteral("spiralSessionCheckpoint"));
     _sessionCheckpointLabel->setWordWrap(true);
     _sessionCheckpointLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    _sessionCheckpointLabel->setToolTip(
-        tr("The checkpoint the resident fit was built from"));
     checkpointLayout->addWidget(_sessionCheckpointLabel);
 
     auto* checkpointChoiceRow = new QHBoxLayout;
     _checkpointChoice = new QComboBox(checkpointContents);
     _checkpointChoice->setObjectName(QStringLiteral("spiralCheckpointChoice"));
     _checkpointChoice->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
-    _checkpointChoice->setToolTip(
-        tr("Checkpoints the service can load, plus any local file browsed for here"));
     _checkpointChoice->addItem(tr("None"), QString());
     auto* browseCheckpoint = new QToolButton(checkpointContents);
     browseCheckpoint->setText(QStringLiteral("…"));
-    browseCheckpoint->setToolTip(tr("Choose a .ckpt file on this computer; it is "
-                                    "uploaded to the service before loading"));
     checkpointChoiceRow->addWidget(_checkpointChoice, 1);
     checkpointChoiceRow->addWidget(browseCheckpoint);
     checkpointLayout->addLayout(checkpointChoiceRow);
@@ -702,12 +697,6 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     auto* checkpointControls = new QHBoxLayout;
     _loadCheckpoint = new QPushButton(tr("Load"), checkpointContents);
     _loadCheckpoint->setEnabled(false);
-    _loadCheckpoint->setToolTip(
-        tr("Load this checkpoint. If no fit exists, initialize the fit directly "
-           "from the checkpoint. Otherwise replace the resident model's weights, "
-           "optimiser and RNG state; if it does not match, the service says what "
-           "a rebuild would have to replace and asks before doing it. If the fit "
-           "is in error, Load rebuilds it directly from the selected checkpoint."));
     _save = new QPushButton(tr("Save on Service"), checkpointContents);
     _save->setEnabled(false);
     _downloadCheckpoint = new QPushButton(tr("Download…"), checkpointContents);
@@ -723,6 +712,12 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _checkpointDownloadProgress->setVisible(false);
     checkpointLayout->addWidget(_checkpointDownloadStatus);
     checkpointLayout->addWidget(_checkpointDownloadProgress);
+    describe(QStringLiteral("checkpoint_session"), {_sessionCheckpointLabel});
+    describe(QStringLiteral("checkpoint_choice"), {_checkpointChoice});
+    describe(QStringLiteral("checkpoint_browse"), {browseCheckpoint});
+    describe(QStringLiteral("checkpoint_load"), {_loadCheckpoint});
+    describe(QStringLiteral("checkpoint_save"), {_save});
+    describe(QStringLiteral("checkpoint_download"), {_downloadCheckpoint});
     connect(browseCheckpoint, &QToolButton::clicked, this, [this]() {
         const QString chosen = QFileDialog::getOpenFileName(
             this, tr("Choose a Spiral checkpoint"), QDir::homePath(),
@@ -768,11 +763,6 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _dtLossLastPct->setSuffix(tr("%"));
     _dtLossLastPct->setValue(25);
     _dtLossLastPct->setEnabled(false);
-    _dtLossScheduleEnabled->setToolTip(
-        tr("Suppress directional DT losses until the final percentage of "
-           "this Run; stopping early does not resize the window"));
-    _dtLossLastPct->setToolTip(
-        tr("Percentage of requested iterations eligible for DT losses"));
     connect(_dtLossScheduleEnabled, &QCheckBox::toggled,
             _dtLossLastPct, &QWidget::setEnabled);
     _backgroundPreview = new QCheckBox(tr("Background preview every"), runContents);
@@ -785,9 +775,6 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _previewCadence->setValue(100);
     _previewCadence->setSuffix(tr(" iterations"));
     _previewCadence->setEnabled(false);
-    _backgroundPreview->setToolTip(
-        tr("Capture iteration-consistent previews during this Run; flattening "
-           "continues on the service while fitting resumes"));
     connect(_backgroundPreview, &QCheckBox::toggled,
             _previewCadence, &QWidget::setEnabled);
     _run = new QPushButton(tr("Run"), runContents);
@@ -796,7 +783,8 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     // Running is what this row is for. Rebuilding replaces the session the
     // others act on, and it is rarely the thing to reach for, so it sits at
     // the far end with the stretch between them.
-    controls->addWidget(new QLabel(tr("Iterations"), runContents));
+    auto* iterationsLabel = new QLabel(tr("Iterations"), runContents);
+    controls->addWidget(iterationsLabel);
     controls->addWidget(_iterations);
     controls->addWidget(_dtLossScheduleEnabled);
     controls->addWidget(_dtLossLastPct);
@@ -810,6 +798,14 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     previewScheduleRow->addWidget(_previewCadence);
     previewScheduleRow->addStretch(1);
     runLayout->addLayout(previewScheduleRow);
+    describe(QStringLiteral("run_initialize"), {_load});
+    describe(QStringLiteral("run_iterations"), {iterationsLabel, _iterations});
+    describe(QStringLiteral("run_dt_loss_schedule"), {_dtLossScheduleEnabled});
+    describe(QStringLiteral("run_dt_loss_last_pct"), {_dtLossLastPct});
+    describe(QStringLiteral("run_background_preview"), {_backgroundPreview});
+    describe(QStringLiteral("run_preview_cadence"), {_previewCadence});
+    describe(QStringLiteral("run_start"), {_run});
+    describe(QStringLiteral("run_stop"), {_stop});
     _checkpointDownloadTimer = new QTimer(this);
     _checkpointDownloadTimer->setInterval(1000);
     auto refreshCheckpointDownload = [this]() {
@@ -853,12 +849,9 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _inputList->setSelectionMode(QAbstractItemView::SingleSelection);
     _commitInputs = new QPushButton(tr("Commit"), runContents);
     _commitInputs->setEnabled(false);
-    _commitInputs->setToolTip(tr("Copy the session's added inputs into their dataset locations"));
     _addInputs = new QPushButton(tr("Add/Apply changes"), runContents);
-    _addInputs->setToolTip(tr("Snapshot and upload all ready local drawing drafts"));
     _removeInput = new QPushButton(tr("Remove"), runContents);
     _removeInput->setEnabled(false);
-    _removeInput->setToolTip(tr("Stage removal from subsequent fit steps; Restore is available until Commit."));
     _commitHint = new QLabel(runContents);
     _commitHint->setWordWrap(true);
     auto* commitRow = new QHBoxLayout;
@@ -872,12 +865,17 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     connect(_inputFilter, &QLineEdit::textChanged, this, &SpiralPanel::refreshInputVisibility);
     runLayout->addWidget(_inputFilter);
     _showOriginalInputs = new QCheckBox(tr("Show original dataset inputs"), runContents);
-    _showOriginalInputs->setToolTip(tr("Include unchanged inputs loaded from the dataset. Hidden inputs remain selected for the fit."));
     connect(_showOriginalInputs, &QCheckBox::toggled, this, &SpiralPanel::refreshInputVisibility);
     runLayout->addWidget(_showOriginalInputs);
     runLayout->addWidget(_inputList);
     runLayout->addLayout(commitRow);
     runLayout->addWidget(_commitHint);
+    describe(QStringLiteral("inputs_filter"), {_inputFilter});
+    describe(QStringLiteral("inputs_show_original"), {_showOriginalInputs});
+    describe(QStringLiteral("inputs_list"), {ephemeralLabel, _inputList});
+    describe(QStringLiteral("inputs_add"), {_addInputs});
+    describe(QStringLiteral("inputs_commit"), {_commitInputs});
+    describe(QStringLiteral("inputs_remove"), {_removeInput});
 
     _state = new QLabel(tr("Service disconnected"), statusDock);
     _state->setWordWrap(true);
@@ -891,7 +889,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     auto* showLogs = new QToolButton(statusDock);
     showLogs->setObjectName(QStringLiteral("spiralShowLogs"));
     showLogs->setText(tr("Logs"));
-    showLogs->setToolTip(tr("Show the spiral service's Python stdout / stderr"));
+    describe(QStringLiteral("logs"), {showLogs});
     showLogs->setAutoRaise(true);
     showLogs->setMaximumHeight(fontMetrics().height() + 4);
     connect(showLogs, &QToolButton::clicked, this,
@@ -920,6 +918,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     scroll->setWidget(contents);
     rootLayout->addWidget(scroll, 1);
     rootLayout->addWidget(statusDock);
+    applyDescriptions();
 
     // ------------------------------------------------------------------
     // Wiring
@@ -1690,7 +1689,7 @@ void SpiralPanel::setRemoteMode(bool remote)
     _removePcl->setEnabled(false);
     _save->setVisible(true);
     for (QLineEdit* edit : {_paths["dataset_root"], _paths["umbilicus"]})
-        edit->setToolTip(tr("Service-host path, owned by the service"));
+        setToolTipNote(edit->parentWidget(), tr("Service-host path, owned by the service"));
 }
 
 QLineEdit* SpiralPanel::addPathRow(QFormLayout* form, const QString& key, const QString& label, bool directory)
@@ -1701,6 +1700,7 @@ QLineEdit* SpiralPanel::addPathRow(QFormLayout* form, const QString& key, const 
     auto* browse = new QToolButton(container); browse->setText(QStringLiteral("…"));
     row->addWidget(edit, 1); row->addWidget(browse);
     form->addRow(label, container);
+    describe(QStringLiteral("path_") + key, {container});
     _paths[key] = edit; _pathDirectories[key] = directory;
     _pathBrowseButtons[key] = browse;
     connect(edit, &QLineEdit::textEdited, this, [this, key](const QString&) {
@@ -1783,29 +1783,44 @@ void SpiralPanel::setPclOverlayAvailable(vc3d::spiral::PclRole role,
     if (!toggle) return;
     toggle->setEnabled(available);
     if (!available) toggle->setChecked(false);
-    QString help;
-    if (!available) {
-        help = reason.isEmpty()
-            ? tr("No compatible %1 artifact is available")
-                  .arg(vc3d::spiral::pclRoleDisplayName(role))
-            : reason;
-    } else if (role == vc3d::spiral::PclRole::Relative) {
-        help = tr("Show relative-winding PCLs with their winding labels. "
-                  "Left-click a point to activate its editable collection; E "
-                  "adds a new collection (winding 0, 1, 2, ... per point) or "
-                  "appends to the active one, on the flattened view or any "
-                  "plane view; F flips the winding direction; Delete removes "
-                  "the collection after confirmation; Escape exits placement "
-                  "and clears the active PCL.");
-    } else {
-        help = tr("Show same-winding PCLs. Left-click a point to activate its "
-                  "editable collection; Q adds a new collection or appends to "
-                  "the active one, on the flattened view or any plane view; F "
-                  "reverses the active PCL; Delete removes it after "
-                  "confirmation; Escape exits placement and clears the active "
-                  "PCL.");
-    }
-    toggle->setToolTip(help);
+    setToolTipNote(toggle, available
+                               ? QString()
+                               : reason.isEmpty()
+                                     ? tr("No compatible %1 artifact is available")
+                                           .arg(vc3d::spiral::pclRoleDisplayName(role))
+                                     : reason);
+}
+
+void SpiralPanel::describe(const QString& id, std::initializer_list<QWidget*> widgets)
+{
+    for (QWidget* widget : widgets) _descriptionIds.insert(widget, id);
+}
+
+void SpiralPanel::setToolTipNote(QWidget* widget, const QString& note)
+{
+    if (note.isEmpty()) _toolTipNotes.remove(widget);
+    else _toolTipNotes.insert(widget, note);
+    applyToolTip(widget);
+}
+
+void SpiralPanel::applyToolTip(QWidget* widget)
+{
+    const QString toolTip = vc3d::spiral::descriptionToolTip(
+        _descriptions->describe(_descriptionIds.value(widget)),
+        _toolTipNotes.value(widget));
+    widget->setToolTip(toolTip);
+    // A form row's label carries its field's text, so hovering the label
+    // explains the row too.
+    if (QWidget* parent = widget->parentWidget())
+        if (auto* form = qobject_cast<QFormLayout*>(parent->layout()))
+            if (QWidget* label = form->labelForField(widget))
+                label->setToolTip(toolTip);
+}
+
+void SpiralPanel::applyDescriptions()
+{
+    for (auto it = _descriptionIds.cbegin(); it != _descriptionIds.cend(); ++it)
+        applyToolTip(it.key());
 }
 
 double SpiralPanel::pointViewTolerance() const
