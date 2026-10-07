@@ -37,6 +37,8 @@ sidebar_label: "Spiral Fitting"
 </head>
 
 import ChatCallout from '@site/src/components/ChatWidget/ChatCallout';
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
 
 
 *Last updated: September 16, 2026*
@@ -104,6 +106,15 @@ Everything the fit needs is declared in the project's own [`pyproject.toml`](htt
 
 On Windows, `uv sync` also installs `triton-windows`, a community build of Triton, because PyTorch publishes no `triton` wheel there and the fit's fused kernels need one. The first run compiles those kernels once.
 
+:::warning
+
+If you do not install through the pyproject.toml, ensure your torch version is `<2.13` versions `>= 2.13` will require _significantly_ more vram due to internal torch changes
+
+:::
+
+
+
+
 #### Get the dataset
 
 Ready-made inputs are published in the [`spiral-input` dataset](data_datasets#spiral-input-2026-07), which lives on the dl.ash2txt.org data server : [Spiral Datasets](https://dl.ash2txt.org/datasets/spiral_datasets/PHercParis4/) (~90 GB):
@@ -136,6 +147,85 @@ You also need to provide a **`spiral-scroll.json`** in the dataset root, recordi
 ```
 
 `name` is free-form and is what appears in the generated run-folder name. `spiral_outward_sense` (`"CW"` or `"ACW"`) says which way the spiral turns as it winds outward. No automated method determines it: it is read off the CT data by a person in VC3D, or taken from an already-fitted spiral. The file can also carry a `paths` object naming individual inputs whose filenames don't match the conventional ones (`"tracks_dbm"` is the usual one), and `normal_zarr_group` / `lasagna_scale`, which choose the OME-Zarr pyramid level the lasagna normal stores are read at — these are easy to get wrong silently, so read the scale off the store's own `.zattrs` rather than copying another scroll's values. The [spiral-fitting README](https://github.com/ScrollPrize/villa/blob/main/spiral-fitting/README.md) documents the full schema.
+
+
+#### Running the fit
+
+There are two ways to run the spiral fitting, either through the CLI or through an interactive fit session in the VC3D spiral workspace. Both run the same fit_spiral.py script. They differ in two ways: 
+- The VC3D workspace can be configured to render a flatten view at an interval or on the fits completion
+- The VC3D workspace supports adding inputs to "live" fits, interactively
+
+<div className="spiral-fit-tabs" style={{border: '1px solid var(--ifm-color-emphasis-300)', borderRadius: '8px', padding: '1.25rem', margin: '1.5rem 0', backgroundColor: 'var(--ifm-background-surface-color)'}}>
+
+<Tabs block>
+<TabItem value="vc3d-workspace" label="VC3D Workspace" className="spiral-workspace-tutorial" default>
+
+##### Starting a fit session
+
+Open VC3D, select the scroll's volume package in [VC3D](tutorial_VC3D), then select the **Spiral** workspace tab. It uses the same scan as the main workspace, with a flattened preview and CT slice views beside it. If you are planning on running the spiral service on the machine you're opening VC3D with , ensure you have the venv activated in the terminal before opening VC3D. 
+
+The spiral workspace runs through a service whether you're using it on the machine you're viewing VC3D through or over a network connection (internet or local LAN). 
+
+In **Spiral Service**, choose a connection:
+
+- **Local:** set **Dataset** and **Output**, then **Connect**. VC3D launches the service locally; its Python environment must have the spiral-fitting dependencies installed. Keep Output outside the dataset directory.
+- **Remote (SSH):** start the service on the GPU machine using the command below, then click **+SSH** in VC3D. Enter `[user@]host` (an SSH-config alias also works) and port `8765`, then **Connect**. Use SSH keys or an agent; if the host is new, connect once with `ssh user@host` in a terminal to accept its host key. VC3D creates the tunnel and retrieves the API key automatically.
+- **Remote (LAN):** start the same service with `--bind 0.0.0.0`, then click **+LAN**. Set **Endpoint** to `http://HOST:8765` and paste the API key printed by the service. Direct HTTP is unencrypted; use it on a trusted network, or use SSH.
+
+For either remote connection, run this on the GPU host from `villa/spiral-fitting` with dependencies installed (add `--bind 0.0.0.0` for LAN):
+
+```bash
+uv run python spiral_service.py --port 8765 \
+    --dataset /data/scrolls/s1 --output /data/spiral-output/s1 \
+    --gpus 0 --session-name my-fit
+```
+
+Keep this process running in a persistent terminal such as `tmux`. Remote fits continue when VC3D disconnects. Previews and checkpoints transfer automatically; a shared filesystem is unnecessary. If you mount the remote dataset locally, set **Local dataset path** to its matching root to enable verified-patch and shell overlays.
+
+##### Start a fit
+
+Set **z begin / z end** in **Fit and output**; start with a small range. Click **Initialize Fit**, choose **Iterations**, then **Run**. **Stop after iteration** pauses at the next completed step; another Run continues the fit. Initialization becomes **Rebuild Fit** once a fit exists. To resume a saved model, select it under **Checkpoint** and click **Load**.
+
+The default parameters used by fit_spiral.py apply to fits ran through the workspace as well. Click **Open Spiral Configuration...** to change any of these settings. 
+
+##### Navigate and inspect
+
+Outside drawing modes, right-drag to pan, use the wheel to zoom, and Shift+wheel to move through slices. Press **R** over a point to move the shared focus there; **X** recenters the views on that focus. Click the winding minimap below the flattened view to jump along the scroll. **Min winding / Max winding** limit the displayed windings (`-1` means through the last).
+
+Use **Display →** to toggle output, input patches, fibers and point collections, surface intersections, winding boundaries, patch overlap, and run differences. Loss overlays require **Compute loss overlays with the next preview**, which roughly doubles preview cost. The fixed status area shows fit progress and preview age; **Logs** opens service messages.
+
+##### Annotate and apply changes
+
+Draw patches and control-point lines on the flattened preview; same-winding and relative-winding points can also be placed in the CT views. Put the pointer over a viewer when using these shortcuts:
+
+| Key or gesture | Action |
+| --- | --- |
+| Tap Ctrl | Toggle patch painting; left-drag paints, right-drag erases |
+| Ctrl+wheel | Change brush size |
+| Shift+right-drag | Draw a freehand control-point line |
+| Hold V + left-clicks | Draw a control-point line through chosen points; release V to finish |
+| Q, then left-clicks | Place points belonging to the same winding |
+| E, then left-clicks | Place relative-winding points numbered 0, 1, 2, …; click successive windings in order |
+| F | Reverse the active point collection and its relative-winding ordering |
+| Escape | Exit the current drawing/point-placement mode |
+| Shift+E | Prepare drawing drafts for submission |
+
+Use **Add/Apply changes** to submit ready drafts to the fit, including while it is running. **Commit** persists the selected changes into the dataset; applying alone does not. For existing inputs, enable **Show original dataset inputs**, then right-click an entry and choose **Edit**. Patch and fiber editors save working copies; use Add/Apply afterward. **Remove** stages a removal, **Restore** reverses it before Commit, and committing the removal deletes the managed dataset entry.
+
+##### Preview intervals and rendering
+
+Enable **Background preview every** and choose an interval in **iterations** before clicking Run (default interval: 100). The service captures the fit at an iteration boundary, exports its surface, and flattens it through Lasagna; fitting resumes while flattening continues. VC3D downloads the finished geometry and displays the scan on that surface. This is a geometry preview; ink strips are produced separately by [Rendering ink](#rendering-ink).
+
+A preview is also requested when a connected run finishes or is stopped. Exporting and flattening can take minutes, so the displayed preview may trail the fit; check its iteration and lag in the status area. Until a new preview succeeds, the previous one stays visible.
+
+##### Where files live
+
+Generated files live on the **service machine**, under its Output root; the example above uses `/data/spiral-output/s1/my-fit/`. This holds fit run directories, previews, uploads, and checkpoints, including `checkpoint_autosave.ckpt`. For local services, an empty Output field uses a per-dataset directory in VC3D's application-data folder; set it explicitly for an easy-to-find location. The derived cache defaults to `~/.cache/vc3d/spiral`.
+
+**Checkpoint → Save on Service** saves remotely; **Download…** copies a checkpoint to your computer. VC3D also caches downloaded display artifacts locally. Only **Commit** writes your annotation changes back into the dataset. See the [service README](https://github.com/ScrollPrize/villa/blob/main/spiral-fitting/README.md#internet-flow-ssh-attach) for connection and storage details.
+
+</TabItem>
+<TabItem value="cli" label="CLI">
 
 ##### The fit configuration
 
@@ -179,6 +269,11 @@ python fit_spiral.py --dataset ./spiral_datasets/phercparis4
 That's it — the script loads the inputs (caching the expensive preprocessing), then runs 30,000 optimization steps, printing the loss breakdown every 200 steps. Multi-GPU is supported via `torchrun --nproc-per-node=N fit_spiral.py --dataset ...`, which splits each step's work across GPUs.
 
 To run the whole pipeline in one command — fit, then render ink, then score it — use [`runners/run_single.py`](https://github.com/ScrollPrize/villa/blob/main/spiral-fitting/runners/run_single.py) instead. It takes the same `--dataset`, plus an `--ink-volume`, and accepts the same configuration overrides as a `--config` JSON file; `runners/run_sweep.py` runs a whole folder of such configs concurrently across GPUs.
+
+</TabItem>
+</Tabs>
+
+</div>
 
 When it finishes, you get a self-contained run folder:
 
