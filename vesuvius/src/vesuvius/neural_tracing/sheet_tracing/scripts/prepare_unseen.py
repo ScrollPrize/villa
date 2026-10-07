@@ -2,15 +2,14 @@
 
 Downloads the largest segments of ``--scroll`` (tifxyz) and, from the volume ``--volume-id``, only the 128^3 chunks
 the benchmark's traces can reach, into a local OME-Zarr whose level 0 / 1 are the remote levels ``--levels`` (pick
-the ones at 9.6 um / 19.2 um, the training volume's level 0 / 1), and the same region of each ``--extra`` volume on
-the same grid (e.g. a surface prediction for models with an extra input channel; chunking and compression are kept
-as they are), into ``OUT/extra<i>.zarr``. Segment coordinates are multiplied by
-``--coord-scale`` to land in local level-0 voxels (e.g. 0.25 for segments in full-resolution 2.4 um coordinates).
+the ones at 9.6 um / 19.2 um, the training volume's level 0 / 1; chunking and compression are kept as they are).
+Segment coordinates are multiplied by ``--coord-scale`` to land in local level-0 voxels (e.g. 0.25 for segments in
+full-resolution 2.4 um coordinates).
 The seeds are drawn exactly as ``trace_benchmark.py --patches-dir OUT/patches --all-val --repeat-patches`` will draw
 them with the same ``--checkpoint`` first, ``--seeds``, ``--steps`` and ``--front``.
 
   python scripts/prepare_unseen.py --metadata metadata.json --scroll PHerc1667 --volume-id 20251217075048 \\
-      --segment-type tifxyz-transformed --levels 2 3 --coord-scale 0.25 --checkpoint output/big_curve_ctx2/last.pt \\
+      --segment-type tifxyz-transformed --levels 2 3 --coord-scale 0.25 --checkpoint output/remote_l0_points_ft/last.pt \\
       --out data/unseen/PHerc1667
 
 The plain ``tifxyz`` segments are in the coordinates of whatever volume they were traced on, which need not be
@@ -35,8 +34,6 @@ def main(argv=None):
     ap.add_argument('--segment-type', default='tifxyz', help="'tifxyz' (as traced) or 'tifxyz-transformed' (on --volume-id)")
     ap.add_argument('--coord-scale', type=float, default=1.)
     ap.add_argument('--levels', type=int, nargs=2, default=[2, 3], help='remote levels for local levels 0 and 1')
-    ap.add_argument('--extra', action='append', default=[], metavar='PATH',
-                    help='bucket path of a volume on the same grid (same levels), e.g. a surface prediction; repeatable')
     ap.add_argument('--segments', type=int, default=12, help='largest segments to use')
     ap.add_argument('--checkpoint', required=True, help='the benchmark\'s first checkpoint (its config draws the seeds)')
     ap.add_argument('--seeds', type=int, default=60)
@@ -78,9 +75,9 @@ def main(argv=None):
     print(f'{len(seeds)} seeds from {len({s["meta"]["patch"] for s in seeds})} segments', flush=True)
     boxes = [(w['reach_lo']-args.pad, w['reach_hi']+args.pad) for w in seeds]  # xyz, local level 0
 
-    # 3. download the chunks they cover into local zarrs (local level k = remote level args.levels[k])
+    # 3. download the chunks they cover into a local zarr (local level k = remote level args.levels[k])
     jobs = []
-    for name, path in [('volume', vpath)]+[(f'extra{i}', p.rstrip('/')) for i, p in enumerate(args.extra)]:
+    for name, path in [('volume', vpath)]:
         zarr = out/f'{name}.zarr'
         for level, remote in enumerate(args.levels):
             zarray = mirror_array(f'{ROOT}/{path}/{remote}', zarr/str(level),

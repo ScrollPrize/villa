@@ -16,7 +16,6 @@ Per step, over front_points whose committed point has GT supervision:
 
 Usage:
   python -m vesuvius.neural_tracing.sheet_tracing.evaluate --checkpoint output/RUN/best.pt
-  python -m vesuvius.neural_tracing.sheet_tracing.evaluate --checkpoint output/RUN/best.pt --baseline straight
 """
 from __future__ import annotations
 
@@ -31,10 +30,10 @@ import torch
 from vesuvius.neural_tracing.sheet_tracing import config as C
 from vesuvius.neural_tracing.sheet_tracing.data.episodes import (
     FIBER_KEYS, EpisodeSampler, batches, episode_pad, fixed_episodes, unpack_blocks)
-from vesuvius.neural_tracing.sheet_tracing.data.patches import GridSpec, build_index
+from vesuvius.neural_tracing.sheet_tracing.data.patches import build_index
 from vesuvius.neural_tracing.sheet_tracing.geometry import grid_eval, project, surface_frame
 from vesuvius.neural_tracing.sheet_tracing.losses import front_metrics, gap_mask, landing
-from vesuvius.neural_tracing.sheet_tracing.model import StraightAdvance, build_model, load_model_state
+from vesuvius.neural_tracing.sheet_tracing.model import build_model, load_model_state
 from vesuvius.neural_tracing.sheet_tracing.rollout import Tracer
 from vesuvius.neural_tracing.sheet_tracing.sampling import sample_plane
 from vesuvius.neural_tracing.sheet_tracing.seeding import seed_rows, seed_u_index
@@ -46,8 +45,6 @@ def to_device(batch, device, pad_blocks: bool = True):
     with ``pad_blocks=False``."""
     return dict(gt=batch['gt'].to(device, non_blocking=True), valid=batch['valid'].to(device, non_blocking=True),
                 block=unpack_blocks(batch['block'], device, pad=pad_blocks),
-                extras=[dict(block=unpack_blocks(e['block'], device, pad=pad_blocks),
-                             origin=e['origin'].to(device, non_blocking=True)) for e in batch.get('extras', [])],
                 origin=batch['origin'].to(device, non_blocking=True), meta=batch['meta'],
                 # live-chain continuation batches; the front size of data.front_points_range batches
                 **{k: batch[k] for k in ('chains', 'front_points') if k in batch},
@@ -136,7 +133,7 @@ def rollout_metrics(tracer: Tracer, episodes, cfg, spec, steps: int, device, bat
         rows, confs, mets, curves = [], [], [], []
         written = [tracer.output_columns(front.pos, front.conf)]
         for t in range(steps):
-            out = tracer.step(front, b['block'], b['origin'], b['extras'])
+            out = tracer.step(front, b['block'], b['origin'])
             _, _, curve_same, curve_ok = landing(out.dense, b['gt'], b['valid'], cfg.loss.sheet_tolerance)
             gap_conf = gap_mask(torch.sigmoid(out.conf_logit) > cfg.trace.confidence_threshold,
                                 out.dense.shape[1], cfg.trace.spline_samples)
@@ -223,7 +220,7 @@ def run(tracer, cfg, out_dir: Path, steps: int, roi: int, count: int, records: i
     """Evaluate on ``episodes`` (an ``(episodes, spec)`` pair from ``eval_episodes``, drawn if not given).
     Every episode (or the first ``surfaces``) is written as trace + GT tifxyz under ``out_dir/tifxyz_TAG``."""
     from vesuvius.neural_tracing.sheet_tracing.visualize import episode_figure, metric_figure
-    device = next(iter(tracer.model.parameters()), torch.zeros(1, device=cfg.train.device)).device
+    device = next(tracer.model.parameters()).device
     episodes, spec = episodes or eval_episodes(cfg, steps, roi, count)
     per_step, kept = rollout_metrics(tracer, episodes, cfg, spec, steps, device, records=records,
                                      surfaces=out_dir/f'tifxyz_{tag}',
@@ -241,7 +238,6 @@ def run(tracer, cfg, out_dir: Path, steps: int, roi: int, count: int, records: i
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--checkpoint', required=True)
-    ap.add_argument('--baseline', choices=('straight',), help='evaluate a baseline instead of the model')
     ap.add_argument('--steps', type=int)
     ap.add_argument('--roi', type=int)
     ap.add_argument('--episodes', type=int)
@@ -250,11 +246,9 @@ def main(argv=None):
     ap.add_argument('--device', default='cuda')
     args = ap.parse_args(argv)
     model, cfg, _ = load_checkpoint(args.checkpoint, args.device)
-    if args.baseline:
-        model = StraightAdvance().to(args.device)
     tracer = Tracer(model, cfg, args.device)
     e = cfg.eval
-    tag = args.tag or (f'baseline_{args.baseline}' if args.baseline else 'eval')
+    tag = args.tag or 'eval'
     steps, roi, count = args.steps or e.steps, args.roi or e.roi, args.episodes or e.episodes
     t0 = time.time()
     episodes = eval_episodes(cfg, steps, roi, count)

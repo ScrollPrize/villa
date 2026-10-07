@@ -26,7 +26,7 @@ Usage:
   python -m vesuvius.neural_tracing.sheet_tracing.trace_benchmark --checkpoints output/A/best.pt output/B/best.pt \\
       --seeds 12 --steps 30 --tag ab
   python -m vesuvius.neural_tracing.sheet_tracing.trace_benchmark --rescore output/trace_bench/ab
-  # checkpoints trained elsewhere: map their recorded data paths (volume, extra volumes, patch directories)
+  # checkpoints trained elsewhere: map their recorded data paths (volumes, patch directories)
   python -m vesuvius.neural_tracing.sheet_tracing.trace_benchmark --checkpoints remote/A/last.pt \\
       --path-map /remote/data/s1_ds2.zarr=/local/s1_ds2.zarr --path-map /remote/patches=/local/patches --out DIR
 """
@@ -318,7 +318,7 @@ def main(argv=None):
     ap.add_argument('--checkpoints', nargs='+')
     ap.add_argument('--rescore', nargs='+', metavar='DIR', help='recompute switch counts of existing benchmark folders')
     ap.add_argument('--path-map', action='append', default=[], metavar='OLD=NEW',
-                    help='replace the path prefix OLD by NEW in every checkpoint\'s data paths (volume, extra volumes, '
+                    help='replace the path prefix OLD by NEW in every checkpoint\'s data paths (volumes, '
                          'patch directories), e.g. for checkpoints trained on another machine; repeatable')
     ap.add_argument('--out', help='output directory (default: output/trace_bench/TAG)')
     ap.add_argument('--patches-dir', nargs='+', help='draw seeds from these patch directories (default: the first '
@@ -422,7 +422,7 @@ def main(argv=None):
             sc = score(rows, confs, w, spec, cfg, args.device, traced, held)
             sc.update(rows=rows, confs=confs)
             keep = connected_keep(confs, cfg.trace.confidence_threshold)
-            column = cfg.data.point_spacing/(cfg.trace.spline_samples if cfg.trace.curve == 'hermite' else 1)
+            column = cfg.data.point_spacing/cfg.trace.spline_samples
             write_surface(out/'tifxyz'/f'seed{i:02d}_{name}', rows, keep, cfg.data.step, column,
                           dict(meta=w['meta'], checkpoint=args.checkpoints[names.index(name)],
                                first_switch=sc['first_switch'], first_real_switch=sc['first_real_switch'],

@@ -1,8 +1,9 @@
-"""Training/evaluation episodes: a canonical GT window plus the cubic volume block the front moves in.
+"""Training/evaluation episodes: a canonical GT window plus the volume block the front moves in.
 
 An episode is drawn by rejection sampling: patch (weight ``valid ** patch_weight_power``), orientation and
-anchor; the seed rows must be valid, the supervised region mostly valid, the reachable region (plus the crop
-radius) must fit the block, and every block corner must fall in split cells of the requested split. Split
+anchor; the seed rows must be valid, the supervised region mostly valid, the reachable region plus the crop radius
+must fit within ``roi``, and every corner of the ``roi`` cube around it must fall in split cells of the requested
+split. The block read is the reachable region plus the view margin. Split
 cells are ``split_block``-voxel cubes assigned by a seeded hash, so overlapping patches share a split.
 
 Live chains (``train.live_chains``, see ``live.py``): ``EpisodeStream`` with ``batch`` yields whole batches and first
@@ -24,28 +25,6 @@ import torch
 from vesuvius.neural_tracing.fiber_follow.data.volume import ChunkedArray
 from vesuvius.neural_tracing.sheet_tracing.data.fibers import episode_fibers, fiber_pool
 from vesuvius.neural_tracing.sheet_tracing.data.patches import GridSpec, PatchInfo, PatchStore
-
-
-def extra_readers(data, cache_bytes: int) -> list[tuple[ChunkedArray, int]]:
-    """(array, pyramid level) per extra volume (``data.extra_volumes``, ``extra_levels``, ``extra_level_dirs``)."""
-    levels = [int(level) for level in (data.extra_levels or [data.volume_level]*len(data.extra_volumes))]
-    dirs = data.extra_level_dirs or [str(level) for level in levels]
-    return [(ChunkedArray(f'{path}/{folder}', cache_bytes), level)
-            for path, level, folder in zip(data.extra_volumes, levels, dirs)]
-
-
-def extra_block(array, level: int, origin, size, ct_level: int):
-    """An extra volume's block at its own ``level`` covering the CT block at ``origin`` (zyx, ``ct_level`` voxels)
-    with ``size``, plus one voxel of margin for interpolation: (block, origin at ``level``). Crops sample it with its
-    own level's coordinate transform, so a coarser channel is interpolated rather than shipped upsampled. At the
-    CT's level it is exactly the CT block's region."""
-    origin, size = np.asarray(origin, np.int64), np.asarray(size, np.int64)
-    if level == ct_level:
-        return array.read(origin, size), origin
-    ratio = (1 << ct_level)/(1 << level)  # extra voxels per CT voxel
-    lo = np.floor((origin+.5)*ratio-.5).astype(np.int64)-1
-    hi = np.ceil((origin+size-.5)*ratio-.5).astype(np.int64)+2
-    return array.read(lo, hi-lo), lo
 
 
 def split_of(cell, val_fraction: float, seed: int) -> str:
@@ -125,7 +104,6 @@ class EpisodeSampler:
     def __getstate__(self):
         state = self.__dict__.copy()
         state.pop('volumes', None)
-        state.pop('extras', None)
         return state
 
     @property
@@ -136,10 +114,6 @@ class EpisodeSampler:
     def _dir_of(self) -> dict:
         """Patch directory (a patch's ``root``) -> its position in data.patches_dir."""
         return {Path(p): i for i, p in enumerate(self._dirs)}
-
-    @cached_property
-    def extras(self):
-        return extra_readers(self.data, self.data.worker_cache_mb << 20)
 
     @cached_property
     def volumes(self) -> dict:
@@ -364,26 +338,16 @@ class EpisodeSampler:
         if w is None:
             return None
         seed = {k: w[k] for k in ('seed', 'fibers') if k in w}  # fiber-started episodes: seed rows, fibers around
-        if self.data.tight_blocks:  # only the reachable GT region plus the view margin, not the whole roi cube
-            return dict(gt=w['gt'], valid=w['valid'], meta=w['meta'], **seed,
-                        **self._read(w['meta']['root'], w['reach_lo']-self.pad, w['reach_hi']+self.pad))
-        scale = 1 << self.level
-        origin = np.floor((w['origin0'][::-1]+.5)/scale-.5).astype(np.int64)  # zyx, level voxels
         return dict(gt=w['gt'], valid=w['valid'], meta=w['meta'], **seed,
-                    **self._read_at(w['meta']['root'], origin, (self.block_size,)*3))
+                    **self._read(w['meta']['root'], w['reach_lo']-self.pad, w['reach_hi']+self.pad))
 
     def _read(self, root: str, lo, hi) -> dict:
-        """Block (and extra volumes' blocks) covering level-0 ``xyz`` [lo, hi] of the volume of patch directory
-        ``root``."""
+        """Block (1, D, H, W) and its level-voxel origin (zyx) covering level-0 ``xyz`` [lo, hi] of the volume of
+        patch directory ``root``."""
         scale = 1 << self.level
         origin = np.floor((lo[::-1]+.5)/scale-.5).astype(np.int64)  # zyx, level voxels
         size = tuple(int(v) for v in np.ceil((hi-lo)[::-1]/scale).astype(np.int64)+2)
-        return self._read_at(root, origin, size)
-
-    def _read_at(self, root: str, origin, size) -> dict:
-        block = self.volume(root).read(origin, size)[None]
-        extras = [extra_block(array, level, origin, size, self.level) for array, level in self.extras]
-        return dict(block=block, origin=origin, extras=[(b[None], o) for b, o in extras])
+        return dict(block=self.volume(root).read(origin, size)[None], origin=origin)
 
     @cached_property
     def _by_key(self) -> dict:
@@ -528,10 +492,6 @@ def collate(episodes: list[dict]) -> dict:
     return dict(gt=torch.from_numpy(np.stack([e['gt'] for e in episodes])),
                 valid=torch.from_numpy(np.stack([e['valid'] for e in episodes])),
                 block=pack_blocks([e['block'] for e in episodes]),  # CT, (B, 1, D, H, W) after unpack_blocks
-                # per extra volume: its own block at its own level, (B, 1, d, h, w), and origins (B, 3)
-                extras=[dict(block=pack_blocks([e['extras'][k][0] for e in episodes]),
-                             origin=torch.from_numpy(np.stack([e['extras'][k][1] for e in episodes])))
-                        for k in range(len(episodes[0].get('extras', [])))],
                 origin=torch.from_numpy(np.stack([e['origin'] for e in episodes])),
                 meta=[e['meta'] for e in episodes], **_collate_seeds(episodes), **collate_fibers(episodes))
 

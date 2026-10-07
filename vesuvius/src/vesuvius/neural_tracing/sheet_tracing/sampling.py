@@ -39,13 +39,9 @@ def crop_radius(crop, spacing, forward: float) -> float:
 
 
 def view_radius(model) -> float:
-    """Largest distance from a front point to any sample it reads (point, context or normal-profile crop)."""
-    radius = crop_radius(model.crop, model.crop_spacing, model.crop_forward)
-    if model.context_crop:
-        radius = max(radius, crop_radius(model.context_crop, model.context_spacing, 0.))
-    if model.profile_crop:
-        radius = max(radius, crop_radius(model.profile_crop, model.profile_spacing, 0.))
-    return radius
+    """Largest distance from a front point to any sample of its crop (the grid tokens' small crops along the curve
+    stay closer)."""
+    return crop_radius(model.crop, model.crop_spacing, model.crop_forward)
 
 
 def to_block_grid(points: torch.Tensor, origin: torch.Tensor, level: int, size) -> torch.Tensor:
@@ -81,34 +77,17 @@ def sample_block(volume, origin: torch.Tensor, level: int, points: torch.Tensor)
                       for i, v in enumerate(volume)])
 
 
-def sample_crops(block: torch.Tensor, origin: torch.Tensor, level: int, pos: torch.Tensor, frames: torch.Tensor,
-                 offsets: torch.Tensor, extras=()) -> torch.Tensor:
-    """Crops (B, N, C, Sn, St, Sa) for front_points at ``pos`` (B, N, 3) with frames (B, N, 3, 3); ``block`` as in
-    ``sample_block``.
-
-    Channel 0 is the CT ``block`` (z-scored per crop). ``extras`` are ``(block, origin, level)`` of extra volumes
-    (``data.extra_volumes``), each sampled at the same points through its own level's transform and scaled to
-    [0, 1]; a coarser extra is interpolated there rather than upsampled. Channels of ``block`` beyond the first
-    (an older layout) are treated as extras at the CT's level.
-    """
+def sample_crops(block, origin: torch.Tensor, level: int, pos: torch.Tensor, frames: torch.Tensor,
+                 offsets: torch.Tensor) -> torch.Tensor:
+    """CT crops (B, N, 1, Sn, St, Sa), z-scored per crop, for front_points at ``pos`` (B, N, 3) with frames
+    (B, N, 3, 3); ``block`` as in ``sample_block``."""
     B, N = pos.shape[:2]
     sn, st, sa = offsets.shape[:3]
     world = (pos[:, :, None, None, None]+torch.einsum('bnij,stuj->bnstui', frames, offsets)).reshape(B, N*sn, st, sa, 3)
-
-    def sample(volume, start, at_level):
-        out = sample_block(volume, start, at_level, world)
-        return out.reshape(B, out.shape[1], N, sn, st, sa).transpose(1, 2)
-
-    crops = sample(block, origin, level)
-    ct = crops[:, :, :1]
+    ct = sample_block(block, origin, level, world).reshape(B, 1, N, sn, st, sa).transpose(1, 2)
     mean = ct.mean((-3, -2, -1), keepdim=True)
     std = ct.std((-3, -2, -1), keepdim=True, unbiased=False)
-    channels = [(ct-mean)/std.clamp_min(ZSCORE_EPSILON)]
-    if crops.shape[2] > 1:
-        channels.append(crops[:, :, 1:]/255.)
-    for volume, start, at_level in extras:
-        channels.append(sample(volume, start, at_level)/255.)
-    return channels[0] if len(channels) == 1 else torch.cat(channels, 2)
+    return (ct-mean)/std.clamp_min(ZSCORE_EPSILON)
 
 
 def sample_plane(block: torch.Tensor, origin: torch.Tensor, level: int, center: torch.Tensor, axes: torch.Tensor,

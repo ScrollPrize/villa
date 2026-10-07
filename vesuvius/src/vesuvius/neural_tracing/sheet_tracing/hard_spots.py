@@ -9,8 +9,8 @@ episode drawn there reaches the hard spot mid-rollout. Patch directories are ref
 ``data.patches_dir`` (``dir``), so records written on one machine can be used with another machine's paths. The
 output is rewritten every 100 traces, so a run can be stopped early and keep what it found.
 
-  python -m vesuvius.neural_tracing.sheet_tracing.hard_spots --checkpoint output/m7/last.pt --seeds 2000 \\
-      --out output/hard_windows_m7.json [--path-map OLD=NEW ...]
+  python -m vesuvius.neural_tracing.sheet_tracing.hard_spots --checkpoint output/remote_l0_points_ft/last.pt \\
+      --seeds 2000 --out output/hard_windows_points_ft.json [--path-map OLD=NEW ...]
 """
 from __future__ import annotations
 

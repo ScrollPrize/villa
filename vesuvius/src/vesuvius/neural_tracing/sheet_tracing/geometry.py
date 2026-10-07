@@ -1,4 +1,4 @@
-"""Torch geometry for the front: GT surface grids, projection, cubic B-spline fronts and point frames.
+"""Torch geometry for the front: GT surface grids, projection, Hermite front curves and point frames.
 
 Points are level-0 ``x, y, z``. A GT grid is a ``(B, Gu, Gv, 3)`` patch resampled onto a regular ``(u, v)``
 lattice (``u`` = advance direction, ``v`` = along the front, both in grid-index units) with a ``(B, Gu, Gv)``
@@ -106,64 +106,6 @@ def _project(gt: torch.Tensor, valid: torch.Tensor, q: torch.Tensor, iters: int 
 def sheet_distance(q: torch.Tensor, S: torch.Tensor, frame: torch.Tensor) -> torch.Tensor:
     """Signed point-to-plane distance of ``q`` to the tangent plane at ``S`` (differentiable in ``q``)."""
     return ((q-S)*frame[..., 2]).sum(-1)
-
-
-def bspline_basis(s: torch.Tensor, ctrl: int, degree: int = 3) -> torch.Tensor:
-    """Clamped uniform B-spline basis, ``s`` (...,) in [0, 1] -> (..., ctrl)."""
-    knots = torch.cat([torch.zeros(degree), torch.linspace(0, 1, ctrl-degree+1), torch.ones(degree)]).to(s)
-    s = s.clamp(0, 1)[..., None]
-    basis = ((s >= knots[:-1]) & (s < knots[1:])).to(s.dtype)
-    at_end = (s[..., 0] >= 1)
-    basis[at_end] = 0
-    basis[..., ctrl-1][at_end] = 1  # the last non-empty span owns s = 1
-    for d in range(1, degree+1):
-        left_den = knots[d:-1]-knots[:-d-1]
-        right_den = knots[d+1:]-knots[1:-d]
-        left = torch.where(left_den > 0, (s-knots[:-d-1])/left_den.clamp_min(1e-12), torch.zeros_like(s))
-        right = torch.where(right_den > 0, (knots[d+1:]-s)/right_den.clamp_min(1e-12), torch.zeros_like(s))
-        basis = left*basis[..., :-1]+right*basis[..., 1:]
-    return basis
-
-
-class FrontSpline:
-    """Weighted smoothing cubic B-spline through ``front_points`` uniformly parameterised points.
-
-    The smoothness penalty acts on the *change* of control points relative to a least-squares fit of a
-    reference front (the current one): second differences of control points ignore uniform translation and
-    stretching, so advancing a curved front is unbiased, and a stopped point moves like its neighbours.
-    Penalising the control points themselves would flatten curved sheets a little every step.
-    ``fit`` is linear in the points, so gradients reach every point's prediction through the dense samples.
-    """
-
-    def __init__(self, front_points: int, ctrl: int, smooth: float, samples_per_gap: int, device):
-        self.front_points, self.ctrl, self.smooth = front_points, ctrl, smooth
-        self.A = bspline_basis(torch.linspace(0, 1, front_points, device=device), ctrl)
-        self.dense_s = torch.linspace(0, 1, (front_points-1)*samples_per_gap+1, device=device)
-        self.A_dense = bspline_basis(self.dense_s, ctrl)
-        D = torch.zeros(ctrl-2, ctrl, device=device)
-        for i in range(ctrl-2):
-            D[i, i:i+3] = torch.tensor([1., -2., 1.], device=device)
-        self.DtD = D.T@D
-        self.pinv = torch.linalg.pinv(self.A)
-
-    def least_squares(self, points: torch.Tensor) -> torch.Tensor:
-        return self.pinv.to(points.dtype)@points
-
-    def fit(self, points: torch.Tensor, weights: torch.Tensor, reference: torch.Tensor | None = None) -> torch.Tensor:
-        A = self.A.to(points.dtype)
-        DtD = self.DtD.to(points.dtype)
-        AtW = A.T[None]*weights[:, None, :]
-        lam = (self.smooth*weights.sum(1)/self.ctrl)[:, None, None]
-        rhs = AtW@points
-        if reference is not None:
-            rhs = rhs+lam*(DtD@self.least_squares(reference))
-        return torch.linalg.solve(AtW@A+lam*DtD, rhs)
-
-    def dense(self, ctrl_points: torch.Tensor) -> torch.Tensor:
-        return self.A_dense.to(ctrl_points.dtype)@ctrl_points
-
-    def at_front_points(self, ctrl_points: torch.Tensor) -> torch.Tensor:
-        return self.A.to(ctrl_points.dtype)@ctrl_points
 
 
 def chord_tangents(points: torch.Tensor) -> torch.Tensor:

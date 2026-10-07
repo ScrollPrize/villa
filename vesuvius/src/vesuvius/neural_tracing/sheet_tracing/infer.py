@@ -3,12 +3,12 @@
 The seed is either a grid line of an existing tifxyz (``--seed-patch DIR --line row:40 --range 100:160
 --direction +``: row 40, columns 100..160, advancing towards increasing rows) or a JSON file
 ``{"points": [[x, y, z], ...], "direction": [dx, dy, dz]}`` in level-0 voxels. The seed is re-sampled by arc
-length at ``data.point_spacing``; the number of front points follows from its length (any count >= 4 works, the
-model is independent of it). Each step reads the volume block around the current front. Rows are the steps.
-Columns are the front points (``trace.curve = 'smoothing'``) or the dense curve samples, ``trace.spline_samples`` per
-gap (``'hermite'``). Low-confidence front points (in Hermite mode, curve samples of their gaps) are written as
-invalid (-1); they keep riding the curve, so they reappear when they become confident again. Tracing stops after ``--steps``, or once fewer than ``--min-confident`` of
-the front points have been confident for ``--patience`` consecutive steps.
+length at ``data.point_spacing``; the number of front points follows from its length (any count >= 3 works, the
+model is independent of it). Each step reads the volume block around the current front. Rows are the steps,
+columns the dense curve samples, ``trace.spline_samples`` per gap. Curve samples of gaps with a low-confidence front
+point are written as invalid (-1); the points keep riding the curve, so they reappear when they become confident
+again. Tracing stops after ``--steps``, or once fewer than ``--min-confident`` of the front points have been
+confident for ``--patience`` consecutive steps.
 
   python -m vesuvius.neural_tracing.sheet_tracing.infer --checkpoint output/tiny_v1/best.pt \\
       --seed-patch /path/to/patch --line row:40 --range 100:160 --direction + --steps 40 --out output/tiny_v1/traces/t0
@@ -27,7 +27,7 @@ import torch
 
 from vesuvius.neural_tracing.fiber_follow.data.volume import ChunkedArray
 from vesuvius.neural_tracing.sheet_tracing import config as C
-from vesuvius.neural_tracing.sheet_tracing.data.episodes import collate_fibers, extra_block, extra_readers
+from vesuvius.neural_tracing.sheet_tracing.data.episodes import collate_fibers
 from vesuvius.neural_tracing.sheet_tracing.evaluate import load_checkpoint
 from vesuvius.neural_tracing.sheet_tracing.rollout import Front, Tracer
 from vesuvius.neural_tracing.sheet_tracing.sampling import view_radius
@@ -115,14 +115,12 @@ def trace(model, cfg, seed: np.ndarray, direction: np.ndarray, steps: int, devic
     cfg = copy.deepcopy(cfg)
     cfg.data.front_points = count
     cfg.data.fiber_follow = follow  # fiber-following mode (model.fiber_follow_mode): a front across a fiber
-    cfg.trace.spline_ctrl = min(count, cfg.trace.spline_ctrl or max(4, count//2))
     tracer = Tracer(model, cfg, device)
     unit = direction/np.maximum(np.linalg.norm(direction, axis=1, keepdims=True), 1e-9)
     pos = torch.tensor(seed, dtype=torch.float32, device=device)[None]
     prev = torch.tensor(seed-d.step*unit, dtype=torch.float32, device=device)[None]
     front = Front(pos, prev, torch.ones(1, count, device=device))
     volume = ChunkedArray(f'{d.volume}/{d.volume_level}', 1 << 30)
-    extras = extra_readers(d, 1 << 29)
     pad = view_radius(cfg.model)+d.step+4
     columns = lambda pos, conf, dense=None: tuple(x[0].cpu().numpy() for x in tracer.output_columns(pos, conf, dense))
     p, c = columns(front.pos, front.conf)
@@ -135,13 +133,8 @@ def trace(model, cfg, seed: np.ndarray, direction: np.ndarray, steps: int, devic
     model.eval()
     for _ in range(steps):
         block, origin = read_block(volume, front.pos[0].cpu().numpy(), pad, d.volume_level)
-        extra_inputs = []
-        for array, level in extras:
-            eb, eo = extra_block(array, level, origin, block.shape, d.volume_level)
-            extra_inputs.append(dict(block=torch.from_numpy(eb).to(device).float()[None, None],
-                                     origin=torch.from_numpy(eo).to(device)[None]))
         block = torch.from_numpy(block).to(device).float()[None, None]
-        out = tracer.step(front, block, torch.from_numpy(origin).to(device)[None], extra_inputs, fiber_inputs)
+        out = tracer.step(front, block, torch.from_numpy(origin).to(device)[None], fiber_inputs)
         front = tracer.advance(front, out)
         p, c = columns(front.pos, front.conf, out.dense)
         reach = _reach_row(c > cfg.trace.confidence_threshold, reach)
@@ -195,7 +188,7 @@ def write_surface(out: Path, rows: np.ndarray, keep: np.ndarray, row_step: float
 def write_trace(out: Path, rows: np.ndarray, confs: np.ndarray, cfg, threshold: float, provenance: dict,
                 overwrite: bool = False):
     keep = connected_keep(confs, threshold)
-    column = cfg.data.point_spacing/(cfg.trace.spline_samples if cfg.trace.curve == 'hermite' else 1)
+    column = cfg.data.point_spacing/cfg.trace.spline_samples
     write_surface(out, rows, keep, cfg.data.step, column, provenance, overwrite=overwrite,
                   voxel_size_um=cfg.data.voxel_size_um)
     np.save(out/'confidence.npy', confs.astype(np.float32))
@@ -210,14 +203,13 @@ def main(argv=None):
     ap.add_argument('--direction', choices=('+', '-'), default='+')
     ap.add_argument('--seed-json')
     ap.add_argument('--steps', type=int, default=40)
-    ap.add_argument('--threshold', type=float, help="confidence threshold (default: the checkpoint's; 0.4 is "
-                                                    "recommended for big_curve_ctx2)")
+    ap.add_argument('--threshold', type=float, help="confidence threshold (default: the checkpoint's)")
     ap.add_argument('--min-confident', type=float, default=.25)
     ap.add_argument('--patience', type=int, default=3)
     ap.add_argument('--out', required=True)
     ap.add_argument('--path-map', action='append', default=[], metavar='OLD=NEW',
-                    help='replace the path prefix OLD by NEW in the checkpoint\'s data paths (volume, extra volumes), '
-                         'e.g. for a checkpoint trained on another machine; repeatable')
+                    help='replace the path prefix OLD by NEW in the checkpoint\'s data paths (volumes, patch '
+                         'directories), e.g. for a checkpoint trained on another machine; repeatable')
     ap.add_argument('--device', default='cuda')
     args = ap.parse_args(argv)
     model, cfg, _ = load_checkpoint(args.checkpoint, args.device)

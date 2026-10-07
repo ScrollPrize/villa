@@ -31,7 +31,6 @@ def select_batch(b: dict, index: list[int]) -> dict:
     rows = torch.as_tensor(index, device=b['gt'].device)
     pick = lambda x: x[rows.to(x.device)]
     out = dict(b, gt=pick(b['gt']), valid=pick(b['valid']), block=pick(b['block']), origin=pick(b['origin']),
-               extras=[dict(block=pick(e['block']), origin=pick(e['origin'])) for e in b['extras']],
                meta=[b['meta'][i] for i in index])
     if 'chains' in b:
         out['chains'] = [b['chains'][i] for i in index]
@@ -42,7 +41,7 @@ class LiveChains:
     def __init__(self, cfg, spec, tracer: Tracer, jobs, generator):
         """``spec``: GT grid of the training episodes; ``jobs``: queue to the loader workers."""
         self.cfg, self.spec, self.tracer, self.jobs, self.generator = cfg, spec, tracer, jobs, generator
-        self.columns = tracer.columns if tracer.hermite else cfg.data.front_points
+        self.columns = tracer.columns
         self.pending = {}  # job id -> chain state, waiting for the job's batch
         self.pool = []  # chain states (one rollout's survivors each) waiting for a full job
         self.ids = itertools.count()
@@ -84,8 +83,6 @@ class LiveChains:
 
     def _column_conf(self, conf: torch.Tensor) -> torch.Tensor:
         """Point confidences (B, N) -> output columns', as written by inference (``Tracer.output_columns``)."""
-        if not self.tracer.hermite:
-            return conf
         gap = self.tracer.col_gap
         return torch.minimum(conf[:, gap], conf[:, gap+1])
 

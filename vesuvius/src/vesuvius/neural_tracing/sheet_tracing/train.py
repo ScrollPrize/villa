@@ -24,7 +24,6 @@ import sys
 import threading
 import time
 
-import numpy as np
 import torch
 from tqdm import tqdm
 
@@ -75,7 +74,7 @@ def train_rollout(tracer: Tracer, b: dict, cfg, spec, generator, front=None):
         front = tracer.initial(seeds[:, :H-warm])
         with torch.no_grad():
             for j in range(warm):
-                out = tracer.step(front, b['block'], b['origin'], b['extras'])
+                out = tracer.step(front, b['block'], b['origin'])
                 front = tracer.teacher_forced(tracer.advance(front, out), seeds[:, H-warm+j])
     snap = torch.rand(B, device=device, generator=generator) >= tc.free_fraction
     jump = torch.rand(B, device=device, generator=generator) < tc.jump_probability
@@ -88,7 +87,7 @@ def train_rollout(tracer: Tracer, b: dict, cfg, spec, generator, front=None):
                                   b['block'], b['origin'])
             tracer.move(front, pos)
             jumped += run.float().mean()
-        out = tracer.step(front, b['block'], b['origin'], b['extras'], fibers)
+        out = tracer.step(front, b['block'], b['origin'], fibers)
         loss, st = step_losses(out, front, b['gt'], b['valid'], cfg)
         confs.append(torch.sigmoid(out.conf_logit.detach()))
         if tc.backward_per_step:
@@ -110,8 +109,7 @@ def _pinned(batch: dict) -> dict:
     """The batch with its tensors pinned (packed blocks: their data; shapes stay on the host as they are)."""
     pin = lambda x: x.pin_memory() if isinstance(x, torch.Tensor) else x
     block = lambda p: dict(p, data=pin(p['data']))
-    return dict({k: pin(v) for k, v in batch.items() if k not in ('block', 'extras')}, block=block(batch['block']),
-                extras=[dict(e, block=block(e['block']), origin=pin(e['origin'])) for e in batch.get('extras', [])])
+    return dict({k: pin(v) for k, v in batch.items() if k != 'block'}, block=block(batch['block']))
 
 
 def device_batches(batches, device, pinned_ahead: int = 2, timings: dict | None = None, pad_blocks: bool = True):
@@ -160,10 +158,9 @@ def device_batches(batches, device, pinned_ahead: int = 2, timings: dict | None 
         b, ready = pending
         pending = load()
         main.wait_event(ready)
-        blocks = [b['block']]+[e['block'] for e in b['extras']]
-        blocks = [x for block in blocks for x in (block if isinstance(block, list) else [block])]
+        blocks = b['block'] if isinstance(b['block'], list) else [b['block']]
         seeds = [b[k] for k in ('seed', 'seed_mask')+FIBER_KEYS if k in b]
-        for x in [b['gt'], b['valid'], b['origin']]+blocks+[e['origin'] for e in b['extras']]+seeds:
+        for x in [b['gt'], b['valid'], b['origin']]+blocks+seeds:
             x.record_stream(main)  # used on the main stream: not reusable before that work is done
         yield b
 
@@ -276,7 +273,7 @@ def main(argv=None):
     val_sampler = EpisodeSampler(d, index, 'val', d.steps, d.roi, pad)
     train_spec, spec = train_sampler.spec, val_sampler.spec
     print(f'{len(train_sampler.index)} usable patches; GT grid {train_spec.Gu}x{train_spec.Gv}; '
-          f'block {train_sampler.block_size}^3 at level {d.volume_level}', flush=True)
+          f'blocks within {d.roi} vx at level {d.volume_level}', flush=True)
     t0 = time.time()
     val_set = fixed_episodes(val_sampler, tc.val_episodes, tc.seed)
     print(f'{len(val_set)} validation episodes in {time.time()-t0:.1f} s', flush=True)
@@ -429,23 +426,17 @@ def main(argv=None):
 
 
 def final_eval(cfg, run, device):
-    """Short free rollouts on held-out episodes: best model and the straight-advance baseline, same episodes."""
-    from vesuvius.neural_tracing.sheet_tracing.model import StraightAdvance
+    """Short free rollouts of the best model on held-out episodes."""
     e = cfg.eval
     t0 = time.time()
     episodes = E.eval_episodes(cfg, e.steps, e.roi, e.episodes)
     best_model, _, _ = E.load_checkpoint(run/'best.pt', device)
-    reports = {}
-    for tag, net in (('eval', best_model), ('baseline_straight', StraightAdvance().to(device))):
-        reports[tag] = E.run(Tracer(net, cfg, device), cfg, run/'eval', e.steps, e.roi, e.episodes,
-                             records=4 if tag == 'eval' else 0, tag=tag, episodes=episodes)
-    metric_figure({k: {m: np.array(v) for m, v in r['per_step'].items()} for k, r in reports.items()}, cfg,
-                  run/'eval'/'compare.png')
-    for tag, r in reports.items():
-        s = r['summary']
-        print(f"{tag}: coverage {s['coverage_mean']:.3f} (last {s['coverage_last']:.3f}) same_sheet "
-              f"{s['same_sheet_mean']:.3f} precision {s['precision_mean']:.3f} caught {s['caught_mean']:.3f} "
-              f"rejoined {s['rejoined_mean']:.3f}", flush=True)
+    report = E.run(Tracer(best_model, cfg, device), cfg, run/'eval', e.steps, e.roi, e.episodes, records=4,
+                   tag='eval', episodes=episodes)
+    s = report['summary']
+    print(f"eval: coverage {s['coverage_mean']:.3f} (last {s['coverage_last']:.3f}) same_sheet "
+          f"{s['same_sheet_mean']:.3f} precision {s['precision_mean']:.3f} caught {s['caught_mean']:.3f} "
+          f"rejoined {s['rejoined_mean']:.3f}", flush=True)
     print(f'final eval: {e.episodes} episodes x {e.steps} steps in {time.time()-t0:.0f} s', flush=True)
 
 if __name__ == '__main__':
