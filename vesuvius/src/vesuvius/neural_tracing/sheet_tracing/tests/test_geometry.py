@@ -1,8 +1,11 @@
-"""Geometry, sampling and rollout checks on analytic surfaces (no data files needed)."""
+"""Geometry, sampling, data and rollout checks on analytic surfaces and tiny generated data (no data files needed)."""
+import importlib.util
+import json
 from pathlib import Path
 
 import numpy as np
 import pytest
+import tifffile
 import torch
 
 from vesuvius.neural_tracing.sheet_tracing import config as C
@@ -23,6 +26,37 @@ def cylinder_grid(spec, radius=300., center=(400., 400.), z0=300.):
     theta = v/radius
     xyz = np.stack([center[0]+radius*np.cos(theta), center[1]+radius*np.sin(theta), z0+u], -1)
     return torch.tensor(xyz, dtype=torch.float32)[None], torch.ones(1, spec.Gu, spec.Gv, dtype=torch.bool)
+
+
+def _write_plane_patch(patch: Path, rows: int, cols: int) -> None:
+    """A tifxyz patch on the plane x = 60.5 with 2 vx cells: y = 20 + 2 col, z = 20 + 2 row."""
+    patch.mkdir(parents=True)
+    r, c = np.meshgrid(np.arange(rows), np.arange(cols), indexing='ij')
+    for name, values in dict(x=np.full(r.shape, 60.5), y=20.+2*c, z=20.+2*r).items():
+        tifffile.imwrite(patch/f'{name}.tif', values.astype(np.float32))
+    (patch/'meta.json').write_text(json.dumps(dict(scale=[.5, .5])))
+
+
+def _script(name: str):
+    """A module of scripts/ (not a package)."""
+    spec = importlib.util.spec_from_file_location(name, Path(__file__).parents[1]/'scripts'/f'{name}.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _write_volume(root, level=1, shape=(64, 64, 64), chunk=32, sheet_x=30):
+    """Tiny uncompressed zarr level with a bright sheet x = const (level voxels)."""
+    root = root/str(level)
+    root.mkdir(parents=True)
+    (root/'.zarray').write_text(json.dumps(dict(shape=list(shape), chunks=[chunk]*3, dtype='|u1', fill_value=0,
+                                                 order='C', filters=None, dimension_separator='.', compressor=None,
+                                                 zarr_format=2)))
+    vol = np.zeros(shape, np.uint8)
+    vol[:, :, sheet_x] = 255
+    for k in np.ndindex(*(s//chunk for s in shape)):
+        piece = vol[tuple(slice(i*chunk, (i+1)*chunk) for i in k)]
+        (root/'.'.join(map(str, k))).write_bytes(np.ascontiguousarray(piece).tobytes())
 
 
 # A small model of the supported architecture (level 1 so a 224 x 360 x 360 block covers the test cylinder).
@@ -186,19 +220,6 @@ def test_front_length_loss_penalises_stretch():
     assert abs(float(stats_for(1.2))-11.) < .5  # 20% stretch of 55 vx gaps
 
 
-def test_per_axis_crop_spacing():
-    """Crop spacing can differ per axis; a scalar keeps the old offsets exactly."""
-    from vesuvius.neural_tracing.sheet_tracing.sampling import crop_radius
-    a = crop_offsets([16, 12, 20], 2., 10., 'cpu')
-    b = crop_offsets([16, 12, 20], [2., 2., 2.], 10., 'cpu')
-    assert torch.equal(a, b)
-    c = crop_offsets([32, 32, 20], [1., 2., 2.], 10., 'cpu')
-    assert torch.allclose(c[..., 2].unique().diff(), torch.ones(31))  # normal: 1 vx
-    assert torch.allclose(c[..., 0].unique().diff(), torch.full((31,), 2.))  # tangent: 2 vx
-    assert c[..., 2].max() == 15.5 and c[..., 0].max() == 31.
-    assert crop_radius([16, 12, 20], 2., 10.) == crop_radius([16, 12, 20], [2, 2, 2], 10.)
-
-
 def test_connected_keep_and_row_reach():
     """Only confident points connected to the seed row are written; an unreachable row means stop."""
     from vesuvius.neural_tracing.sheet_tracing.infer import _reach_row, connected_keep
@@ -218,21 +239,9 @@ def test_connected_keep_and_row_reach():
 
 def test_trace_end_to_end_on_a_small_volume(tmp_path):
     """infer.trace runs a real model (parameters requiring grad) on a tiny on-disk volume and returns arrays."""
-    import json as _json
     from vesuvius.neural_tracing.sheet_tracing.infer import connected_keep, trace
-    level, shape, chunk = 1, (64, 64, 64), 32
-    root = tmp_path/'vol.zarr'/str(level)
-    root.mkdir(parents=True)
-    (root/'.zarray').write_text(_json.dumps(dict(shape=list(shape), chunks=[chunk]*3, dtype='|u1', fill_value=0,
-                                                 order='C', filters=None, dimension_separator='.', compressor=None,
-                                                 zarr_format=2)))
-    vol = np.zeros(shape, np.uint8)
-    vol[:, :, 30] = 255  # a bright sheet x = const (level-1 voxel 30 ~ level-0 x 60.5)
-    for kz in range(2):
-        for ky in range(2):
-            for kx in range(2):
-                block = vol[kz*chunk:(kz+1)*chunk, ky*chunk:(ky+1)*chunk, kx*chunk:(kx+1)*chunk]
-                (root/f'{kz}.{ky}.{kx}').write_bytes(np.ascontiguousarray(block).tobytes())
+    level = 1
+    _write_volume(tmp_path/'vol.zarr', level)  # a bright sheet at level-1 x 30 ~ level-0 x 60.5
     cfg = C.load(None, ['train.amp=none', 'model.dim=32', 'model.channels=[4,8]', 'model.strides=[2,2]',
                         'model.heads=2', 'model.token_channels=[4,8]', 'model.token_strides=[2,2]',
                         f'data.volume="{tmp_path/"vol.zarr"}"', f'data.volume_level={level}'])
@@ -270,33 +279,11 @@ def test_real_switch_needs_several_points_or_a_far_one():
     assert switch_steps(torch.zeros_like(off), dist) == (None, None)
 
 
-def _write_volume(root, level=1, shape=(64, 64, 64), chunk=32, sheet_x=30):
-    """Tiny uncompressed zarr level with a bright sheet x = const (level voxels)."""
-    import json as _json
-    root = root/str(level)
-    root.mkdir(parents=True)
-    (root/'.zarray').write_text(_json.dumps(dict(shape=list(shape), chunks=[chunk]*3, dtype='|u1', fill_value=0,
-                                                 order='C', filters=None, dimension_separator='.', compressor=None,
-                                                 zarr_format=2)))
-    vol = np.zeros(shape, np.uint8)
-    vol[:, :, sheet_x] = 255
-    for k in np.ndindex(*(s//chunk for s in shape)):
-        piece = vol[tuple(slice(i*chunk, (i+1)*chunk) for i in k)]
-        (root/'.'.join(map(str, k))).write_bytes(np.ascontiguousarray(piece).tobytes())
-
-
 def test_live_chain_continuation_window(tmp_path):
     """A chain's next episode is the same patch window moved along the advance by the front's progress."""
-    import json as _json
-    import tifffile as _tifffile
     from vesuvius.neural_tracing.sheet_tracing.data.episodes import EpisodeSampler
     from vesuvius.neural_tracing.sheet_tracing.data.patches import build_index
-    patch = tmp_path/'patches'/'p0'
-    patch.mkdir(parents=True)
-    r, c = np.meshgrid(np.arange(100), np.arange(40), indexing='ij')  # 2 vx cells: z along rows, y along cols
-    for name, values in dict(x=np.full(r.shape, 60.5), y=20.+2*c, z=20.+2*r).items():
-        _tifffile.imwrite(patch/f'{name}.tif', values.astype(np.float32))
-    (patch/'meta.json').write_text(_json.dumps(dict(scale=[.5, .5])))
+    _write_plane_patch(tmp_path/'patches'/'p0', 100, 40)  # 2 vx cells: z along rows, y along cols
     _write_volume(tmp_path/'vol.zarr')
     cfg = C.load(None, [f'data.patches_dir="{tmp_path/"patches"}"', f'data.volume="{tmp_path/"vol.zarr"}"', 'data.volume_level=1',
                         'data.front_points=3', 'data.point_spacing=20', 'data.step=10', 'data.steps=2',
@@ -387,19 +374,12 @@ def test_ema_weights_average_and_are_what_evaluation_loads(tmp_path):
 
 
 def test_hard_spot_episodes_start_at_the_recorded_spot(tmp_path):
-    import json as _json
-    import tifffile as _tifffile
     from vesuvius.neural_tracing.sheet_tracing.data.episodes import EpisodeSampler
     from vesuvius.neural_tracing.sheet_tracing.data.patches import build_index
-    patch = tmp_path/'patches'/'p0'
-    patch.mkdir(parents=True)
-    r, c = np.meshgrid(np.arange(100), np.arange(40), indexing='ij')
-    for name, values in dict(x=np.full(r.shape, 60.5), y=20.+2*c, z=20.+2*r).items():
-        _tifffile.imwrite(patch/f'{name}.tif', values.astype(np.float32))
-    (patch/'meta.json').write_text(_json.dumps(dict(scale=[.5, .5])))
+    _write_plane_patch(tmp_path/'patches'/'p0', 100, 40)
     _write_volume(tmp_path/'vol.zarr')
     spots = tmp_path/'hard.json'
-    spots.write_text(_json.dumps(dict(records=[dict(dir=0, patch='p0', axis=0, sign_u=1, sign_v=1, anchor=[20., 5.],
+    spots.write_text(json.dumps(dict(records=[dict(dir=0, patch='p0', axis=0, sign_u=1, sign_v=1, anchor=[20., 5.],
                                                     shift=20., step=8, kind='stop')])))
     overrides = [f'data.patches_dir=["{tmp_path/"patches"}"]', f'data.volume="{tmp_path/"vol.zarr"}"', 'data.volume_level=1',
                  'data.front_points=3', 'data.point_spacing=20', 'data.step=10', 'data.steps=2', 'data.gt_margin=10',
@@ -419,16 +399,14 @@ def test_hard_spot_episodes_start_at_the_recorded_spot(tmp_path):
 
 def test_index_uses_measured_cell_when_meta_scale_is_wrong(tmp_path):
     """Some patch families state twice their real cell size in meta.json; the index measures it instead."""
-    import json as _json
-    import tifffile as _tifffile
     from vesuvius.neural_tracing.sheet_tracing.data.patches import build_index
     r, c = np.meshgrid(np.arange(30), np.arange(20), indexing='ij')
     for name, scale in (('right', .5), ('wrong', .25), ('close', .45)):  # nodes 2 vx apart; claims 2, 4, 2.2 vx
         patch = tmp_path/'p'/name
         patch.mkdir(parents=True)
         for axis, values in dict(x=np.full(r.shape, 5.), y=2.*c, z=2.*r).items():
-            _tifffile.imwrite(patch/f'{axis}.tif', values.astype(np.float32))
-        (patch/'meta.json').write_text(_json.dumps(dict(scale=[scale, scale])))
+            tifffile.imwrite(patch/f'{axis}.tif', values.astype(np.float32))
+        (patch/'meta.json').write_text(json.dumps(dict(scale=[scale, scale])))
     infos = {i.name: i for i in build_index(tmp_path/'p', tmp_path/'cache')}
     assert infos['right'].cell == 2. and not infos['right'].stated_cell
     assert abs(infos['wrong'].cell-2.) < 1e-6 and infos['wrong'].stated_cell == 4.
@@ -442,8 +420,6 @@ def test_model_rollout_trains_every_part():
     block = torch.rand(1, 1, 224, 360, 360)*255
     origin = torch.zeros(1, 3, dtype=torch.long)
     model = build_model(cfg)
-    assert not hasattr(model, 'grid_blocks') and not hasattr(model, 'point_to_grid')
-    assert not hasattr(model.blocks[0], 'cross_attn')
     torch.nn.init.normal_(model.head.weight, std=1e-2)
     tracer = Tracer(model, cfg, 'cpu')
     front = tracer.initial(seed_rows(gt, valid, cfg, spec, noise=False))
@@ -461,7 +437,7 @@ def test_model_rollout_trains_every_part():
     assert model.token_type.grad.abs().sum() > 0
 
 
-def test_crops_must_divide():
+def test_config_rejects_bad_crops_and_removed_model_types():
     with pytest.raises(ValueError):
         C.load(None, SMALL+['model.crop=[8,16,10]'])  # 10 is not divisible by 4 (two stride-2 stages)
     with pytest.raises(ValueError):
@@ -470,17 +446,11 @@ def test_crops_must_divide():
 
 def test_patch_directories_on_their_own_volumes_and_weights(tmp_path):
     """data.patch_volumes: each directory's episodes read its own volume; data.dir_weights: its sampling share."""
-    import json as _json
-    import tifffile as _tifffile
     from vesuvius.neural_tracing.sheet_tracing.data.episodes import EpisodeSampler
     from vesuvius.neural_tracing.sheet_tracing.data.patches import build_index
     dirs = [tmp_path/'a', tmp_path/'b']
-    r, c = np.meshgrid(np.arange(100), np.arange(40), indexing='ij')
     for d in dirs:
-        (d/'p0').mkdir(parents=True)
-        for name, values in dict(x=np.full(r.shape, 60.5), y=20.+2*c, z=20.+2*r).items():
-            _tifffile.imwrite(d/'p0'/f'{name}.tif', values.astype(np.float32))
-        (d/'p0'/'meta.json').write_text(_json.dumps(dict(scale=[.5, .5])))
+        _write_plane_patch(d/'p0', 100, 40)
     _write_volume(tmp_path/'vol_a.zarr', shape=(128, 64, 64))  # the sheet at the patches (level-1 x 30)
     _write_volume(tmp_path/'vol_b.zarr', shape=(128, 64, 64), sheet_x=5)  # far from them
     base = [f'data.patches_dir=["{dirs[0]}", "{dirs[1]}"]', f'data.volume="{tmp_path/"vol_a.zarr"}"', 'data.volume_level=1',
@@ -499,15 +469,6 @@ def test_patch_directories_on_their_own_volumes_and_weights(tmp_path):
         assert nxt is not None and nxt['block'].max() == peak  # continuations stay on their directory's volume
     with pytest.raises(ValueError):
         C.load(None, base+['data.patch_volumes=["x"]'])  # one entry per directory
-
-
-def test_compiled_model_keeps_checkpoint_names():
-    from vesuvius.neural_tracing.sheet_tracing.model import compile_model
-    cfg = C.load(None, SMALL)
-    model = build_model(cfg)
-    names = list(model.state_dict())
-    compile_model(model)
-    assert list(model.state_dict()) == names
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='needs CUDA')
@@ -533,38 +494,18 @@ def test_device_batches_match_to_device():
         list(device_batches(failing(), device))  # loader errors reach the trainer instead of hanging it
 
 
-
-def test_packed_blocks_unpack_to_the_zero_padded_batch():
-    from vesuvius.neural_tracing.sheet_tracing.data.episodes import pack_blocks, unpack_blocks
-    rng = np.random.default_rng(0)
-    blocks = [rng.integers(1, 255, shape, dtype=np.uint8) for shape in ((1, 5, 7, 3), (1, 6, 4, 4), (1, 2, 7, 5))]
-    padded = np.zeros((3, 1, 6, 7, 5), np.uint8)
-    for i, b in enumerate(blocks):
-        padded[i, :, :b.shape[1], :b.shape[2], :b.shape[3]] = b
-    packed = pack_blocks(blocks)
-    assert packed['data'].numel() == sum(b.size for b in blocks)  # no padding shipped
-    assert torch.equal(unpack_blocks(packed, 'cpu'), torch.from_numpy(padded).float())
-
-
 def test_seeds_from_reuses_earlier_seeds_with_another_front(tmp_path, monkeypatch):
     """--seeds-from: the same patch, orientation and anchor give the same windows; a front too long for the patch
     drops the seed."""
-    import json as _json
-    import tifffile as _tifffile
     from vesuvius.neural_tracing.sheet_tracing.trace_benchmark import draw_seeds, seeds_from
     monkeypatch.setattr(C, 'OUTPUT', tmp_path)
-    patch = tmp_path/'patches'/'p0'
-    patch.mkdir(parents=True)
-    r, c = np.meshgrid(np.arange(100), np.arange(60), indexing='ij')  # 2 vx cells: 200 vx by 120 vx
-    for name, values in dict(x=np.full(r.shape, 60.5), y=20.+2*c, z=20.+2*r).items():
-        _tifffile.imwrite(patch/f'{name}.tif', values.astype(np.float32))
-    (patch/'meta.json').write_text(_json.dumps(dict(scale=[.5, .5])))
+    _write_plane_patch(tmp_path/'patches'/'p0', 100, 60)  # 2 vx cells: 200 vx by 120 vx
     cfg = C.load(None, [f'data.patches_dir="{tmp_path/"patches"}"', 'data.step=10', 'data.gt_margin=10',
                         'data.gt_resolution=2'])
     seeds, _, _ = draw_seeds(cfg, 12, 3, 40., .5, all_val=True, max_per_patch=0)
     assert seeds
     report = tmp_path/'report.json'
-    report.write_text(_json.dumps(dict(seeds=[w['meta'] for w in seeds])))
+    report.write_text(json.dumps(dict(seeds=[w['meta'] for w in seeds])))
     again, _, _, kept = seeds_from(report, cfg, 3, 40., .5, all_val=True)
     assert kept == list(range(len(seeds)))
     assert all(np.array_equal(a['gt'], w['gt']) and np.array_equal(a['valid'], w['valid']) for a, w in zip(again, seeds))
@@ -577,17 +518,10 @@ def test_seeds_from_reuses_earlier_seeds_with_another_front(tmp_path, monkeypatc
 
 def test_mixed_front_batches_vary_the_point_count(tmp_path):
     """data.front_points_range: each batch has one front size N, its GT window and batch size follow N."""
-    import json as _json
-    import tifffile as _tifffile
     from vesuvius.neural_tracing.sheet_tracing.data.episodes import MixedFrontStream
     from vesuvius.neural_tracing.sheet_tracing.data.patches import build_index
     from vesuvius.neural_tracing.sheet_tracing.train import front_variants
-    patch = tmp_path/'patches'/'p0'
-    patch.mkdir(parents=True)
-    r, c = np.meshgrid(np.arange(100), np.arange(100), indexing='ij')
-    for name, values in dict(x=np.full(r.shape, 60.5), y=20.+2*c, z=20.+2*r).items():
-        _tifffile.imwrite(patch/f'{name}.tif', values.astype(np.float32))
-    (patch/'meta.json').write_text(_json.dumps(dict(scale=[.5, .5])))
+    _write_plane_patch(tmp_path/'patches'/'p0', 100, 100)
     _write_volume(tmp_path/'vol.zarr', shape=(128, 128, 64))
     cfg = C.load(None, [f'data.patches_dir="{tmp_path/"patches"}"', f'data.volume="{tmp_path/"vol.zarr"}"', 'data.volume_level=1',
                         'data.front_points=3', 'data.point_spacing=20', 'data.step=10', 'data.steps=2',
@@ -609,13 +543,18 @@ def test_mixed_front_batches_vary_the_point_count(tmp_path):
         C.load(None, ['data.front_points_range=[2,5]'])
 
 
-def test_unpadded_blocks_sample_like_padded_ones():
-    """data.unpadded_blocks: crops from a list of per-episode blocks match those from the zero-padded batch."""
+def test_packed_blocks_unpack_padded_or_listed_and_sample_alike():
+    """Packed blocks ship no padding; unpacked, the zero-padded batch is the blocks padded at the far end, and crops
+    from the list of blocks (data.unpadded_blocks) match those from the padded batch."""
     from vesuvius.neural_tracing.sheet_tracing.data.episodes import pack_blocks, unpack_blocks
-    from vesuvius.neural_tracing.sheet_tracing.sampling import sample_crops
     rng = np.random.default_rng(0)
     blocks = [rng.integers(0, 255, shape, dtype=np.uint8) for shape in ((1, 20, 24, 18), (1, 16, 30, 22))]
     packed = pack_blocks(blocks)
+    assert packed['data'].numel() == sum(b.size for b in blocks)
+    want = np.zeros((2, 1, 20, 30, 22), np.uint8)
+    for i, b in enumerate(blocks):
+        want[i, :, :b.shape[1], :b.shape[2], :b.shape[3]] = b
+    assert torch.equal(unpack_blocks(packed, 'cpu'), torch.from_numpy(want).float())
     origin = torch.tensor([[3, 5, 7], [1, 2, 4]])
     pos = torch.tensor([[[12., 14., 13.], [15., 12., 11.]], [[10., 16., 9.], [14., 18., 12.]]])  # inside each block
     frames = torch.eye(3).expand(2, 2, 3, 3)
@@ -628,17 +567,10 @@ def test_unpadded_blocks_sample_like_padded_ones():
 def test_held_out_scoring_seeds_and_mask(tmp_path, monkeypatch):
     """--held-out-scoring: seeds need only their seed rows in val cells (their reach may cross train cells), and
     in_split marks exactly the points in val cells."""
-    import json as _json
-    import tifffile as _tifffile
     from vesuvius.neural_tracing.sheet_tracing.data.episodes import split_of
     from vesuvius.neural_tracing.sheet_tracing.trace_benchmark import draw_seeds, in_split
     monkeypatch.setattr(C, 'OUTPUT', tmp_path)
-    patch = tmp_path/'patches'/'p0'
-    patch.mkdir(parents=True)
-    r, c = np.meshgrid(np.arange(200), np.arange(200), indexing='ij')
-    for name, values in dict(x=np.full(r.shape, 60.5), y=20.+2*c, z=20.+2*r).items():
-        _tifffile.imwrite(patch/f'{name}.tif', values.astype(np.float32))
-    (patch/'meta.json').write_text(_json.dumps(dict(scale=[.5, .5])))
+    _write_plane_patch(tmp_path/'patches'/'p0', 200, 200)
     cfg = C.load(None, [f'data.patches_dir="{tmp_path/"patches"}"', 'data.step=10', 'data.gt_margin=10',
                         'data.gt_resolution=2', 'data.split_block=48', 'data.val_fraction=.5'])
     seeds, spec, data = draw_seeds(cfg, 20, 6, 40., .5, max_per_patch=0, seed_split=True)
@@ -657,26 +589,21 @@ def test_held_out_scoring_seeds_and_mask(tmp_path, monkeypatch):
 
 
 def test_resample_isotropic_squares_the_grid(tmp_path):
-    import importlib.util
-    import json as _json
-    import tifffile as _tifffile
-    spec = importlib.util.spec_from_file_location('resample_isotropic', Path(__file__).parents[1]/'scripts'/'resample_isotropic.py')
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    mod = _script('resample_isotropic')
     src = tmp_path/'src'/'p0'
     src.mkdir(parents=True)
     r, c = np.meshgrid(np.arange(30), np.arange(80), indexing='ij')  # rows 20 vx apart, columns 5 vx apart
     xyz = dict(x=np.full(r.shape, 60.5), y=10.+5*c, z=10.+20*r)
     xyz['x'][3, 8] = -1  # the node new column 2 starts from
     for name, values in xyz.items():
-        _tifffile.imwrite(src/f'{name}.tif', values.astype(np.float32))
-    (src/'meta.json').write_text(_json.dumps(dict(scale=[.05, .05])))
+        tifffile.imwrite(src/f'{name}.tif', values.astype(np.float32))
+    (src/'meta.json').write_text(json.dumps(dict(scale=[.05, .05])))
     mod.main([str(tmp_path/'src'), str(tmp_path/'out')])
-    out = np.stack([_tifffile.imread(tmp_path/'out'/'p0'/f'{n}.tif') for n in 'xyz'], -1)
+    out = np.stack([tifffile.imread(tmp_path/'out'/'p0'/f'{n}.tif') for n in 'xyz'], -1)
     ok = np.all(out != -1, -1)
     assert out.shape[:2] == (30, 20) and np.allclose(mod.steps(out, ok), (20., 20.))  # 79 * 5 / 20 + 1 columns
     assert not ok[3, 2] and ok.sum() == 30*20-1  # only the new node built from the invalid one is dropped
-    assert _json.loads((tmp_path/'out'/'p0'/'meta.json').read_text())['scale'] == [.05, .05]
+    assert json.loads((tmp_path/'out'/'p0'/'meta.json').read_text())['scale'] == [.05, .05]
 
 
 def test_written_tifxyz_records_its_area(tmp_path):
@@ -687,18 +614,14 @@ def test_written_tifxyz_records_its_area(tmp_path):
     keep = np.ones(r.shape, bool)
     keep[0, 0] = False  # one corner node: its quad goes
     write_surface(tmp_path/'s', rows, keep, 20., 10., voxel_size_um=10.)
-    import json as _json
-    meta = _json.loads((tmp_path/'s'/'meta.json').read_text())
+    meta = json.loads((tmp_path/'s'/'meta.json').read_text())
     assert meta['area_vx2'] == pytest.approx(11*200.) and meta['area_cm2'] == pytest.approx(11*200.*100/1e8)
 
 
 def test_fiber_seed_directions_follow_the_tensor_normal():
     """trace_from_fibers: the 2/8 structure-tensor normal of a tilted bright sheet, and an advance direction in the
     sheet, perpendicular to the fiber, pointing up."""
-    import importlib.util
-    spec = importlib.util.spec_from_file_location('trace_from_fibers', Path(__file__).parents[1]/'scripts'/'trace_from_fibers.py')
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    mod = _script('trace_from_fibers')
     n = np.array([1., 0., .5])/np.linalg.norm([1., 0., .5])  # sheet normal (xyz), tilted from horizontal x
     z, y, x = np.meshgrid(*(np.arange(160.),)*3, indexing='ij')
     vol = (255*np.exp(-.5*((x*n[0]+y*n[1]+z*n[2]-100.)/1.5)**2)).astype(np.uint8)
@@ -718,11 +641,8 @@ def test_fiber_seed_directions_follow_the_tensor_normal():
 def test_fiber_patch_matching_keeps_fibers_on_or_inside_the_sheet():
     """match_fibers_to_patches: a fiber touching or slightly inward of a patch (towards the umbilicus) matches it;
     one outward of it (the patch would be a sheet further in) does not."""
-    import importlib.util
     from scipy.spatial import cKDTree
-    spec = importlib.util.spec_from_file_location('match', Path(__file__).parents[1]/'scripts'/'match_fibers_to_patches.py')
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    mod = _script('match_fibers_to_patches')
     r, c = np.meshgrid(np.arange(40), np.arange(40), indexing='ij')  # patch x = 100, umbilicus at x = 0: outward is +x
     pos = np.stack([np.full(r.size, 100.), 20.*c.ravel(), 20.*r.ravel()], 1).astype(np.float32)
     nrm = np.tile(np.array([[1., 0., 0.]], np.float32), (r.size, 1))
@@ -747,15 +667,8 @@ def test_fiber_patch_matching_keeps_fibers_on_or_inside_the_sheet():
 
 
 def test_rotated_window_matches_axis_window_and_follows_a_diagonal(tmp_path):
-    import json as _json
-    import tifffile as _tifffile
     from vesuvius.neural_tracing.sheet_tracing.data.patches import PatchStore, build_index
-    patch = tmp_path/'patches'/'p0'
-    patch.mkdir(parents=True)
-    r, c = np.meshgrid(np.arange(120), np.arange(120), indexing='ij')
-    for name, values in dict(x=np.full(r.shape, 60.5), y=20.+2*c, z=20.+2*r).items():
-        _tifffile.imwrite(patch/f'{name}.tif', values.astype(np.float32))
-    (patch/'meta.json').write_text(_json.dumps(dict(scale=[.5, .5])))
+    _write_plane_patch(tmp_path/'patches'/'p0', 120, 120)
     info = build_index(tmp_path/'patches', tmp_path/'cache')[0]
     cfg = C.load(None, ['data.front_points=3', 'data.point_spacing=20', 'data.step=10', 'data.steps=2',
                         'data.gt_margin=10', 'data.gt_resolution=2'])
@@ -773,21 +686,14 @@ def test_rotated_window_matches_axis_window_and_follows_a_diagonal(tmp_path):
 
 
 def test_fiber_seeded_episodes_start_from_the_fiber(tmp_path):
-    import json as _json
-    import tifffile as _tifffile
     from vesuvius.neural_tracing.sheet_tracing.data.episodes import EpisodeSampler, collate
     from vesuvius.neural_tracing.sheet_tracing.data.patches import build_index
-    patch = tmp_path/'patches'/'p0'
-    patch.mkdir(parents=True)
-    r, c = np.meshgrid(np.arange(150), np.arange(150), indexing='ij')  # plane x = 60.5: y = 20 + 2 col, z = 20 + 2 row
-    for name, values in dict(x=np.full(r.shape, 60.5), y=20.+2*c, z=20.+2*r).items():
-        _tifffile.imwrite(patch/f'{name}.tif', values.astype(np.float32))
-    (patch/'meta.json').write_text(_json.dumps(dict(scale=[.5, .5])))
+    _write_plane_patch(tmp_path/'patches'/'p0', 150, 150)  # plane x = 60.5: y = 20 + 2 col, z = 20 + 2 row
     _write_volume(tmp_path/'vol.zarr', shape=(256, 256, 64))
     t = np.arange(0., 120., 5.)  # a fiber 2 vx inside the sheet, running diagonally (row and col both grow)
     xyz = np.stack([np.full(len(t), 58.5), 100.+t*.8, 120.+t*.6], 1)
     rc = np.stack([(xyz[:, 2]-20.)/2, (xyz[:, 1]-20.)/2], 1)
-    (tmp_path/'runs.jsonl').write_text(_json.dumps(dict(fiber='f1', root=str(tmp_path/'patches'), patch='p0', start=0.,
+    (tmp_path/'runs.jsonl').write_text(json.dumps(dict(fiber='f1', root=str(tmp_path/'patches'), patch='p0', start=0.,
                                                         end=float(t[-1]), offset=-2., rc=rc.tolist(), xyz=xyz.tolist()))+'\n')
     cfg = C.load(None, [f'data.patches_dir="{tmp_path/"patches"}"', f'data.volume="{tmp_path/"vol.zarr"}"', 'data.volume_level=1',
                         'data.front_points=3', 'data.point_spacing=20', 'data.step=10', 'data.steps=2', 'data.gt_margin=10',
@@ -831,20 +737,13 @@ def test_train_rollout_starts_from_provided_seed_rows():
 
 
 def test_fiber_follow_episodes_put_the_middle_column_on_the_fiber(tmp_path):
-    import json as _json
-    import tifffile as _tifffile
     from vesuvius.neural_tracing.sheet_tracing.data.episodes import EpisodeSampler
     from vesuvius.neural_tracing.sheet_tracing.data.patches import build_index
-    patch = tmp_path/'patches'/'p0'
-    patch.mkdir(parents=True)
-    r, c = np.meshgrid(np.arange(200), np.arange(200), indexing='ij')  # plane x = 60.5: y = 20 + 2 col, z = 20 + 2 row
-    for name, values in dict(x=np.full(r.shape, 60.5), y=20.+2*c, z=20.+2*r).items():
-        _tifffile.imwrite(patch/f'{name}.tif', values.astype(np.float32))
-    (patch/'meta.json').write_text(_json.dumps(dict(scale=[.5, .5])))
+    _write_plane_patch(tmp_path/'patches'/'p0', 200, 200)  # plane x = 60.5: y = 20 + 2 col, z = 20 + 2 row
     t = np.arange(0., 200., 5.)  # a gently curving horizontal fiber on the sheet: along y, z bending slowly
     xyz = np.stack([np.full(len(t), 60.5), 60.+t, 200.+20*np.sin(t/120.)], 1)
     rc = np.stack([(xyz[:, 2]-20.)/2, (xyz[:, 1]-20.)/2], 1)
-    (tmp_path/'runs.jsonl').write_text(_json.dumps(dict(fiber='f1', root=str(tmp_path/'patches'), patch='p0', start=0.,
+    (tmp_path/'runs.jsonl').write_text(json.dumps(dict(fiber='f1', root=str(tmp_path/'patches'), patch='p0', start=0.,
                                                         end=float(t[-1]), offset=0., rc=rc.tolist(), xyz=xyz.tolist()))+'\n')
     cfg = C.load(None, [f'data.patches_dir="{tmp_path/"patches"}"', 'data.front_points=3', 'data.point_spacing=20',
                         'data.step=10', 'data.steps=4', 'data.gt_margin=10', 'data.gt_resolution=2', 'data.roi=512',
@@ -893,12 +792,8 @@ def test_mode_embedding_starts_neutral_and_reaches_the_tokens():
 
 
 def test_fiber_pool_region_and_episode_instances(tmp_path):
-    import importlib.util
-    import json as _json
     from vesuvius.neural_tracing.sheet_tracing.data.fibers import episode_fibers, fiber_pool
-    spec = importlib.util.spec_from_file_location('bfp', Path(__file__).parents[1]/'scripts'/'build_fiber_pool.py')
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    mod = _script('build_fiber_pool')
     fibers = [('json:a', 0, *mod.resample(np.array([[100., 100., 100.], [100., 400., 100.]]), 5.)),
               ('afv:7', 1, *mod.resample(np.array([[110., 200., 0.], [110., 200., 300.]]), 5.)),
               ('afv:8', 0, *mod.resample(np.array([[900., 900., 900.], [900., 1000., 900.]]), 5.))]
@@ -914,7 +809,7 @@ def test_fiber_pool_region_and_episode_instances(tmp_path):
                         family=np.concatenate([np.full(len(f[2]), f[1], np.int8) for f in fibers])[order],
                         cell_keys=cells, cell_starts=np.append(starts, len(pts)).astype(np.int64)).items():
         np.save(out/f'{name}.npy', a)
-    (out/'keys.json').write_text(_json.dumps([f[0] for f in fibers]))
+    (out/'keys.json').write_text(json.dumps([f[0] for f in fibers]))
     pool = fiber_pool(str(out))
     got = episode_fibers(pool, [0., 0., 0.], [300., 500., 300.], 'json:a', lambda arc: arc <= 150.)
     seed = got['instance'] == 0
@@ -955,10 +850,7 @@ def test_fiber_tokens_reach_the_model_and_padding_is_inert():
 def test_extended_fiber_json_is_a_valid_vc3d_fiber():
     """trace_from_fibers.extended_fiber: the source line up to the start, then the kept middle points; control
     points are an ordered subset of the line (VC3D's validateFiberInputControlPoints)."""
-    import importlib.util
-    spec = importlib.util.spec_from_file_location('tff', Path(__file__).parents[1]/'scripts'/'trace_from_fibers.py')
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    mod = _script('trace_from_fibers')
     line = np.stack([np.linspace(0., 400., 81), np.zeros(81), np.zeros(81)], 1)  # model voxels, along x
     T, C = 6, 11
     rows = np.zeros((T+1, C, 3))

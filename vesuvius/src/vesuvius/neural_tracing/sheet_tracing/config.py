@@ -80,7 +80,7 @@ class DataConfig:
 @dataclass
 class ModelConfig:
     crop: list = field(default_factory=lambda: [24, 48, 32])  # point crop samples along (normal, front tangent, advance)
-    crop_spacing: float | list = 1.  # one number, or [normal, tangent, advance]
+    crop_spacing: float = 1.  # sample spacing along every axis
     crop_forward: float = 10.  # crop centre ahead of the point along the advance direction
     # Point CNN: ResNet-D basic blocks of these widths and strides (each crop size divisible by 2 per stride-2 stage),
     # then a 1x1 conv to point_bottleneck channels before the flattening Linear.
@@ -96,7 +96,7 @@ class ModelConfig:
     # Grid tokens: small CT crops along the curve (columns, trace.spline_samples per gap) for the current row and
     # the last memory_rows rows, through their own residual CNN.
     token_crop: list = field(default_factory=lambda: [16, 16, 16])  # samples along (normal, curve tangent, advance)
-    token_spacing: float | list = 1.
+    token_spacing: float = 1.
     token_channels: list = field(default_factory=lambda: [32, 64, 96])
     token_strides: list = field(default_factory=lambda: [1, 2, 2])
     # A learned mode embedding (zero at start) added to every token: 0 sheet tracing, 1 following a fiber with a
@@ -320,6 +320,8 @@ def validate(config: Config) -> None:
         raise ValueError('data.front_points must be at least 3 (the Hermite curve)')
     if len(m.crop) != 3 or any(int(c) < 2 for c in m.crop):
         raise ValueError('model.crop needs three sizes >= 2')
+    if not all(isinstance(s, (int, float)) for s in (m.crop_spacing, m.token_spacing)):
+        raise ValueError('model.crop_spacing and model.token_spacing are one number (per-axis spacing was removed)')
     if d.volume_level < 0 or d.roi % (1 << d.volume_level):
         raise ValueError('data.roi must be divisible by 2**data.volume_level')
     if config.train.amp not in ('bf16', 'none'):

@@ -14,27 +14,17 @@ import torch.nn.functional as F
 from vesuvius.neural_tracing.fiber_follow.data.ct_normalization import ZSCORE_EPSILON
 
 
-def axis_spacing(spacing) -> tuple[float, float, float]:
-    """Sample spacing along (normal, tangent, advance): one number for all three, or a list of three."""
-    if isinstance(spacing, (int, float)):
-        return (float(spacing),)*3
-    if len(spacing) != 3:
-        raise ValueError(f'crop spacing must be a number or [normal, tangent, advance], not {spacing!r}')
-    return tuple(float(s) for s in spacing)
-
-
-def crop_offsets(crop, spacing, forward: float, device) -> torch.Tensor:
-    """Local ``(t, a, n)`` offsets (Sn, St, Sa, 3) of the crop samples; ``spacing`` as in ``axis_spacing``."""
+def crop_offsets(crop, spacing: float, forward: float, device) -> torch.Tensor:
+    """Local ``(t, a, n)`` offsets (Sn, St, Sa, 3) of the crop samples, ``spacing`` apart along every axis."""
     sn, st, sa = (int(c) for c in crop)
-    dn, dt, da = axis_spacing(spacing)
-    axis = lambda count, d: (torch.arange(count, device=device, dtype=torch.float32)-(count-1)/2)*d
-    n, t, a = torch.meshgrid(axis(sn, dn), axis(st, dt), axis(sa, da)+forward, indexing='ij')
+    axis = lambda count: (torch.arange(count, device=device, dtype=torch.float32)-(count-1)/2)*float(spacing)
+    n, t, a = torch.meshgrid(axis(sn), axis(st), axis(sa)+forward, indexing='ij')
     return torch.stack([t, a, n], -1)
 
 
-def crop_radius(crop, spacing, forward: float) -> float:
+def crop_radius(crop, spacing: float, forward: float) -> float:
     """Largest distance of a crop sample from its point."""
-    half = [(int(c)-1)/2*d for c, d in zip(crop, axis_spacing(spacing))]
+    half = [(int(c)-1)/2*float(spacing) for c in crop]
     return math.sqrt(half[0]**2+half[1]**2+(half[2]+abs(forward))**2)
 
 
