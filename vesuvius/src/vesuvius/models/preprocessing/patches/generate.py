@@ -52,6 +52,7 @@ class PatchCacheResult:
 def generate_patch_caches(
     config_path: Path,
     *,
+    input_path: Optional[Path] = None,
     cache_dir: Optional[Path] = None,
     force: bool = False,
 ) -> PatchCacheResult:
@@ -62,6 +63,9 @@ def generate_patch_caches(
     ----------
     config_path : Path
         Path to training config YAML file.
+    input_path : Path, optional
+        Dataset root with images/ and labels/ subdirectories. Takes precedence
+        over the config's data_path, mirroring vesuvius.train -i/--input.
     cache_dir : Path, optional
         Override cache directory. Defaults to data_path/.patches_cache
     force : bool
@@ -75,6 +79,9 @@ def generate_patch_caches(
     # Load config
     mgr = ConfigManager(verbose=True)
     mgr.load_config(config_path)
+
+    if input_path is not None:
+        mgr.data_path = Path(input_path)
 
     data_path = Path(mgr.data_path)
     patch_size = tuple(int(v) for v in mgr.train_patch_size)
@@ -285,8 +292,7 @@ def _discover_volumes(
     labels_dir = data_path / "labels"
 
     if not images_dir.exists():
-        logger.warning("Images directory not found: %s", images_dir)
-        return []
+        raise FileNotFoundError(f"Images directory not found: {images_dir}")
 
     # Find all image zarrs
     image_zarrs = {
