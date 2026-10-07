@@ -74,7 +74,6 @@
   "heads": 8,
   "mlp_ratio": 8.0,
   "memory_rows": 3,
-  "dropout": 0.0,
   "token_crop": [
    16,
    16,

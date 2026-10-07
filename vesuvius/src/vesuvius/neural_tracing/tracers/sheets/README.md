@@ -197,12 +197,12 @@ is a tifxyz (rows are steps, columns are the Hermite curve samples, masked point
 | `data/fibers.py` | memory-mapped fiber pool and the fibers around an episode |
 | `geometry.py` | GT grid evaluation and projection, Hermite curves, carrying low-confidence points, respacing, frames |
 | `sampling.py` | oriented GPU crops from a volume block |
-| `model.py` | crop encoders, joint transformer over point, grid and fiber tokens, head |
+| `model.py` | crop encoders, joint transformer (shared `models.blocks.SelfAttentionLayer`) over point, grid and fiber tokens, head |
 | `tracing/rollout.py` | one tracing step and front update (shared by train/eval/infer) |
 | `train/live.py` | live chains |
 | `losses.py`, `tracing/seeding.py` | supervision, metrics, seeds, training perturbation and sheet jumps |
 | `train/train.py`, `evaluation/rollouts.py`, `evaluation/benchmark.py`, `evaluation/hard_spots.py`, `tracing/inference.py`, `evaluation/figures.py` | entry points and figures |
 | `scripts/` | data preparation (other scrolls, fiber matching and pool, resampling), fiber-seeded tracing, benchmarks |
 
-Run the tests with `python -m pytest vesuvius/src/vesuvius/neural_tracing/sheet_tracing/tests`. They use analytic
+Run the tests with `python -m pytest vesuvius/src/vesuvius/neural_tracing/tracers/sheets/tests`. They use analytic
 surfaces and don't need data files.

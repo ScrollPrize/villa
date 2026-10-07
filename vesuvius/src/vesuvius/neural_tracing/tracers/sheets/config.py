@@ -95,7 +95,10 @@ class ModelConfig:
     heads: int = 8
     mlp_ratio: float = 8.
     memory_rows: int = 3  # past grid rows kept besides the current one
-    dropout: float = 0.
+    # Shared transformer layer options (models/blocks.py): RMS-normalized queries/keys, and a learned per-head
+    # attention logit scale on top of them (its own optimizer group, as in the fiber tracer).
+    qk_norm: bool = False
+    qk_logit_scale: bool = False
     # Grid tokens: small CT crops along the curve (columns, trace.spline_samples per gap) for the current row and
     # the last memory_rows rows, through their own residual CNN.
     token_crop: list = field(default_factory=lambda: [16, 16, 16])  # samples along (normal, curve tangent, advance)
@@ -231,10 +234,10 @@ class Config:
 # loss is class-balanced and the along-front target is the seed column).
 REMOVED = dict(
     data=dict(extra_volumes=[], extra_levels=[], extra_level_dirs=[], tight_blocks=True),
-    model=dict(attention=True, surface_tokens=True, joint_transformer=True, residual=True, memory_lags=[],
-               memory_anchor=False, context_crop=[], profile_crop=[], grid_layers=ANY, context_spacing=ANY,
-               context_channels=ANY, context_strides=ANY, profile_spacing=ANY, profile_channels=ANY,
-               profile_strides=ANY),
+    model=dict(dropout=0., attention=True, surface_tokens=True, joint_transformer=True, residual=True,
+               memory_lags=[], memory_anchor=False, context_crop=[], profile_crop=[], grid_layers=ANY,
+               context_spacing=ANY, context_channels=ANY, context_strides=ANY, profile_spacing=ANY,
+               profile_channels=ANY, profile_strides=ANY),
     trace=dict(curve='hermite', stopped='curve', respace=True, spline_ctrl=ANY, spline_smooth=ANY,
                min_weight=ANY),
     loss=dict(column_target=ANY, confidence_balance=ANY),
@@ -346,6 +349,8 @@ def validate(config: Config) -> None:
                          'train.chain_steps [min, max] with data.steps <= min <= max')
     if m.dim % m.heads:
         raise ValueError('model.dim must be divisible by model.heads')
+    if m.qk_logit_scale and not m.qk_norm:
+        raise ValueError('model.qk_logit_scale needs model.qk_norm')
 
 
 def path_mapper(texts):

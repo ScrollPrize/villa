@@ -21,6 +21,7 @@ from torch import nn
 
 from vesuvius.models.build.resblocks import BasicBlockD
 from vesuvius.neural_tracing.tracers.sheets.data.episodes import FIBER_CODE_DIM
+from vesuvius.neural_tracing.tracers.models.blocks import SelfAttentionLayer
 from vesuvius.neural_tracing.tracers.models.weights import load_matching_weights
 from vesuvius.neural_tracing.tracers.shared.compile import compile_options
 
@@ -59,24 +60,6 @@ class CropEncoder(nn.Module):
         return self.proj(self.net(x).flatten(1))
 
 
-class Block(nn.Module):
-    """Pre-norm self-attention and MLP."""
-
-    def __init__(self, dim: int, heads: int, mlp_ratio: float, dropout: float):
-        super().__init__()
-        self.n_self = nn.LayerNorm(dim)
-        self.self_attn = nn.MultiheadAttention(dim, heads, dropout=dropout, batch_first=True)
-        hidden = int(dim*mlp_ratio)
-        self.n_mlp = nn.LayerNorm(dim)
-        self.mlp = nn.Sequential(nn.Linear(dim, hidden), nn.GELU(), nn.Dropout(dropout), nn.Linear(hidden, dim))
-
-    def forward(self, x, mask=None):
-        """``mask`` (B, L) bool: tokens of ``x`` no token attends to (padding)."""
-        h = self.n_self(x)
-        x = x+self.self_attn(h, h, h, key_padding_mask=mask, need_weights=False)[0]
-        return x+self.mlp(self.n_mlp(x))
-
-
 class SheetTracer(nn.Module):
     def __init__(self, cfg):
         super().__init__()
@@ -84,7 +67,8 @@ class SheetTracer(nn.Module):
         dim = cfg.dim
         self.encoder = CropEncoder(cfg.crop, cfg.channels, cfg.strides, dim, cfg.point_bottleneck)
         self.point_geometry = nn.Sequential(nn.Linear(POINT_FEATURES, dim), nn.GELU(), nn.Linear(dim, dim))
-        self.blocks = nn.ModuleList(Block(dim, cfg.heads, cfg.mlp_ratio, cfg.dropout) for _ in range(cfg.layers))
+        self.blocks = nn.ModuleList(SelfAttentionLayer(dim, cfg.heads, int(dim*cfg.mlp_ratio), cfg.qk_norm, cfg.qk_logit_scale)
+                                    for _ in range(cfg.layers))
         self.token_type = nn.Parameter(torch.randn(2, dim)*.02)  # point / grid tokens
         self.token_encoder = CropEncoder(cfg.token_crop, cfg.token_channels, cfg.token_strides, dim)
         self.token_geometry = nn.Sequential(nn.Linear(TOKEN_FEATURES, dim), nn.GELU(), nn.Linear(dim, dim))
@@ -127,7 +111,7 @@ class SheetTracer(nn.Module):
             mask = torch.cat([fibers['pad'].new_zeros(B, seq.shape[1]), fibers['pad']], 1)
             seq = torch.cat([seq, tokens.to(seq.dtype)], 1)
         for block in self.blocks:
-            seq = block(seq, mask=mask)
+            seq = block(seq, mask)
         x = seq[:, :N]
         out = self.head(self.norm(x))
         return out[..., :3], out[..., 3], x, out[..., 4:6], row
@@ -145,12 +129,35 @@ def build_model(cfg) -> SheetTracer:
     return SheetTracer(cfg.model)
 
 
+# Transformer block parameter names before the blocks became models.blocks.SelfAttentionLayer (nn.MultiheadAttention,
+# named LayerNorms, an MLP with a dropout layer); old checkpoints load renamed (``upgrade_state``).
+LEGACY_BLOCK_NAMES = (('.n_self.', '.norm1.'), ('.self_attn.in_proj_', '.qkv.'), ('.self_attn.out_proj.', '.out.'),
+                      ('.n_mlp.', '.norm2.'), ('.mlp.0.', '.ffn.0.'), ('.mlp.3.', '.ffn.2.'))
+
+
+def legacy_state(saved: dict) -> bool:
+    """Whether ``saved`` predates the shared transformer layer."""
+    return any(old in key for key in saved for old, _ in LEGACY_BLOCK_NAMES)
+
+
+def upgrade_state(saved: dict) -> dict:
+    """``saved`` with transformer block weights of the earlier layer renamed for SelfAttentionLayer (same tensors:
+    ``in_proj`` holds q, k, v in the order ``qkv`` splits them)."""
+    def rename(key):
+        for old, new in LEGACY_BLOCK_NAMES:
+            if key.startswith('blocks.') and old in key:
+                return key.replace(old, new)
+        return key
+    return {rename(k): v for k, v in saved.items()}
+
+
 OPTIONAL_MODULES = ('mode_', 'fiber_')  # modules a checkpoint without them starts fresh (``init_model_state``)
 
 
 def init_model_state(model: SheetTracer, saved: dict) -> None:
     """``--init``: like ``load_model_state``, but the optional modules the checkpoint predates (``mode_embed``,
     ``fiber_*``) keep their fresh initialisation; any other missing or unexpected weight is still an error."""
+    saved = upgrade_state(saved)
     report = load_matching_weights(model, saved)  # models.weights, as the fiber tracer's --init
     if report['unexpected'] or report['mismatched'] or any(not k.startswith(OPTIONAL_MODULES) for k in report['fresh']):
         load_model_state(model, saved)  # the usual informative mismatch error
@@ -159,4 +166,4 @@ def init_model_state(model: SheetTracer, saved: dict) -> None:
 
 
 def load_model_state(model: SheetTracer, saved: dict) -> None:
-    model.load_state_dict(saved)
+    model.load_state_dict(upgrade_state(saved))

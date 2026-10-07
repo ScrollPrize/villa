@@ -5,6 +5,7 @@ import math
 import torch
 
 from vesuvius.neural_tracing.tracers.shared.policy import gate_horizon, selection_window
+from vesuvius.neural_tracing.tracers.models.blocks import LOGIT_SCALE_LR_SCALE
 from vesuvius.neural_tracing.tracers.shared.compile import compile_options
 from vesuvius.neural_tracing.tracers.shared.training import restore_training_rng, update_ema
 from vesuvius.neural_tracing.tracers.shared.tensors import fixed_rows, move_batch
@@ -117,7 +118,6 @@ def initialize_training_optimizer(model, ema, args, resume=None):
 
 
 GRAD_CLIP = 60.
-LOGIT_SCALE_LR_SCALE = 10.  # LR multiple of the attention logit scales' group
 
 
 def accumulate(table, key, value):

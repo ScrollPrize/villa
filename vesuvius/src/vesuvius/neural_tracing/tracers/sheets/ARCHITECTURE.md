@@ -210,7 +210,9 @@ training it is the episode's reachable GT region, padded by `view_radius + reset
 ## 3. Network (`model.SheetTracer`)
 
 * Width `D = 256`, 8 attention heads, MLP ratio 8, no dropout, bf16 autocast.
-* Attention is `nn.MultiheadAttention(256, 8, batch_first=True)`.
+* Attention is `models.blocks.SelfAttentionLayer` (the tracers' shared transformer layer: `qkv` projection, scaled
+  dot-product attention, optional QK-norm and logit scale with `model.qk_norm`, `model.qk_logit_scale`). Checkpoints
+  from before it (`nn.MultiheadAttention` blocks) load with their weights renamed (`model.upgrade_state`).
 * There are no positional embeddings other than the geometry features above. The model is independent of `N`.
 
 **Crop encoders** (`CropEncoder`) are a stack of ResNet-D basic blocks
@@ -236,7 +238,7 @@ with 17 inputs. `fiber_geometry` (`fiber_ft`) is the same with 17 inputs.
 **Grid.** The stored rows' tokens are exactly the `row` tensors of earlier steps (CNN outputs, before geometry and
 attention), detached. Their geometry features are recomputed each step in the current front frame.
 
-**Transformer:** 8 blocks (`Block`), each pre-norm and residual:
+**Transformer:** 8 blocks (`SelfAttentionLayer`), each pre-norm and residual:
 
 * `s += SelfAttn(LN(s))` over the whole sequence (points, grid, fibers), with padded fiber tokens masked as keys;
 * `s += MLP(LN(s))`, where the MLP is `Linear(256, 2048) -> GELU -> Linear(2048, 256)`.

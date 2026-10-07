@@ -36,7 +36,8 @@ from vesuvius.neural_tracing.tracers.sheets.data.episodes import (
 from vesuvius.neural_tracing.tracers.sheets.data.patches import build_index
 from vesuvius.neural_tracing.tracers.sheets.train.live import LiveChains
 from vesuvius.neural_tracing.tracers.sheets.losses import step_losses
-from vesuvius.neural_tracing.tracers.sheets.model import build_model, compile_model, init_model_state, load_model_state
+from vesuvius.neural_tracing.tracers.models.blocks import LOGIT_SCALE_LR_SCALE
+from vesuvius.neural_tracing.tracers.sheets.model import build_model, compile_model, init_model_state, legacy_state, load_model_state
 from vesuvius.neural_tracing.tracers.sheets.tracing.rollout import Tracer
 from vesuvius.neural_tracing.tracers.sheets.tracing.seeding import perturb, seed_rows, sheet_jump
 from vesuvius.neural_tracing.tracers.sheets.evaluation.figures import episode_figure, metric_figure, training_figure
@@ -287,8 +288,15 @@ def main(argv=None):
         pin_memory=device.type == 'cuda' and jobs is not None,  # otherwise device_batches pins
         persistent_workers=tc.workers > 0, prefetch_factor=tc.prefetch if tc.workers else None)
 
+    if checkpoint and legacy_state(checkpoint['model']):
+        raise ValueError(f'{args.resume} predates the shared transformer layer (models/blocks.py), so its optimizer '
+                         'state does not match the model: start a new run from its weights with --init')
     model = build_model(cfg).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=tc.lr, weight_decay=tc.weight_decay)
+    scales = [p for n, p in model.named_parameters() if n.endswith('.logit_scale')]
+    groups = [dict(params=[p for n, p in model.named_parameters() if not n.endswith('.logit_scale')])]
+    if scales:  # attention logit scales (model.qk_logit_scale): no decay, a faster LR, as in the fiber tracer
+        groups.append(dict(params=scales, weight_decay=0., lr_scale=LOGIT_SCALE_LR_SCALE))
+    opt = torch.optim.AdamW(groups, lr=tc.lr, weight_decay=tc.weight_decay)
     start, best = 0, -1.
     if args.init and not checkpoint:
         saved = torch.load(args.init, map_location='cpu', weights_only=False)
@@ -360,7 +368,7 @@ def main(argv=None):
                 break
         data_time += time.time()-t_data
         for group in opt.param_groups:
-            group['lr'] = learning_rate(it, tc, minutes())
+            group['lr'] = learning_rate(it, tc, minutes())*group.get('lr_scale', 1.)
         if variants:  # this batch's kind: front size, or fiber following
             kind = b['front_points']
             vcfg = variants[kind][0]
