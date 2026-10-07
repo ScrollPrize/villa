@@ -21,6 +21,8 @@ from pathlib import Path
 import numpy as np
 from scipy.spatial import cKDTree
 
+from vesuvius.neural_tracing.tracers.shared.annotations.vc3d import fiber_tag
+from vesuvius.neural_tracing.tracers.shared.geometry import arclength, resample_polyline
 from vesuvius.neural_tracing.tracers.shared.annotations.afv import AFVFibers
 from vesuvius.neural_tracing.tracers.sheets.data.fibers import CELL, cell_key
 
@@ -28,11 +30,11 @@ FAMILY = {'H': 0, 'V': 1}
 
 
 def resample(points: np.ndarray, step: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Points every ``step`` voxels of arc length along a polyline, unit tangents and arc lengths there."""
-    arc = np.concatenate([[0.], np.cumsum(np.linalg.norm(np.diff(points, axis=0), axis=1))])
-    at = np.arange(0., arc[-1]+1e-9, step)
-    pts = np.stack([np.interp(at, arc, points[:, k]) for k in range(3)], 1)
-    tangent = np.gradient(pts, axis=0) if len(pts) > 1 else np.zeros_like(pts)
+    """Points every ``step`` voxels of arc length along a polyline (``shared.geometry.resample_polyline``), unit
+    tangents and arc lengths there."""
+    pts = resample_polyline(points, step)
+    at = np.arange(len(pts))*step if len(pts) > 2 or arclength(points)[-1] >= step else arclength(points)[[0, -1]]
+    tangent = np.gradient(pts, axis=0)
     return pts, tangent/np.maximum(np.linalg.norm(tangent, axis=1, keepdims=True), 1e-9), at
 
 
@@ -49,8 +51,7 @@ def main(argv=None):
     fibers = []  # (key, family, points, tangents)
     for path in sorted(Path(args.fiber_jsons).glob('*.json')) if args.fiber_jsons else []:
         fiber = json.loads(path.read_text())
-        hv = fiber.get('hv_classification') or {}
-        tag = hv.get('manual_tag') or hv.get('automatic_tag') or ''
+        tag = fiber_tag(fiber)
         if tag in FAMILY and len(fiber.get('line_points') or []) > 1:
             fibers.append((f'json:{path.stem}', FAMILY[tag],
                            *resample(np.asarray(fiber['line_points'], np.float64)/args.grid_scale, args.sample)))

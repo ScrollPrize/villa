@@ -8,6 +8,7 @@ import pytest
 import tifffile
 import torch
 
+from vesuvius.neural_tracing.tracers.shared.geometry import interp_at
 from vesuvius.neural_tracing.tracers.sheets import config as C
 from vesuvius.neural_tracing.tracers.sheets.geometry import (
     point_frames, carry_stopped, chord_tangents, grid_eval, hermite_dense, onto_confident_curve, project, respace,
@@ -760,7 +761,7 @@ def test_fiber_follow_episodes_put_the_middle_column_on_the_fiber(tmp_path):
         g, v = e['gt'], e['valid']
         col = g[:, mid][v[:, mid]]
         fine = np.arange(0., t[-1], .25)
-        line = np.stack([np.interp(fine, t, xyz[:, k]) for k in range(3)], 1)
+        line = interp_at(xyz, t, fine)
         dist = np.min(np.linalg.norm(col[:, None]-line[None], axis=-1), axis=1)
         assert dist.max() < 1.  # the middle column follows the fiber
         rows = np.flatnonzero(v[:, mid] & v[:, mid-10] & v[:, mid+10])

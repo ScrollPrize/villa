@@ -20,7 +20,6 @@ from __future__ import annotations
 import argparse
 import json
 import multiprocessing
-import sys
 import time
 from pathlib import Path
 
@@ -28,12 +27,12 @@ import numpy as np
 import tifffile
 from scipy.spatial import cKDTree
 
+from vesuvius.neural_tracing.tracers.shared.annotations.vc3d import fiber_tag
+from vesuvius.neural_tracing.tracers.shared.geometry import arclength, resample_polyline
 from vesuvius.neural_tracing.tracers.shared.annotations.afv import AFVFibers
 from vesuvius.neural_tracing.tracers.sheets import config as C
 from vesuvius.neural_tracing.tracers.sheets.data.patches import build_index
 
-sys.path.insert(0, str(Path(__file__).parent))
-from trace_from_fibers import fiber_tag  # noqa: E402  (a sibling script)
 
 _STATE = {}  # node arrays and tree, shared with forked workers
 
@@ -59,9 +58,9 @@ def match_fiber(job) -> list[dict]:
         fiber_id, points = job
     else:
         fiber_id, points = s['fibers'].catalog[job][0], s['fibers'].geometry(job).points
-    arc = np.concatenate([[0.], np.cumsum(np.linalg.norm(np.diff(points, axis=0), axis=1))])
-    at = np.arange(0., arc[-1], s['sample'])
-    samples = np.stack([np.interp(at, arc, points[:, k]) for k in range(3)], 1)
+    samples = resample_polyline(points, s['sample'])  # shared.geometry
+    at = np.arange(len(samples))*s['sample'] if len(samples) > 2 or arclength(points)[-1] >= s['sample'] \
+        else arclength(points)[[0, -1]]
     dist, idx = s['tree'].query(samples, k=s['candidates'], distance_upper_bound=s['reach'])
     found = np.isfinite(dist)
     idx = np.where(found, idx, 0)

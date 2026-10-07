@@ -24,6 +24,10 @@ from pathlib import Path
 
 import numpy as np
 
+from vesuvius.neural_tracing.tracers.shared.geometry import arclength
+from vc3d_fiber_format import parse_vc3d_fiber_format
+
+from vesuvius.neural_tracing.tracers.shared.annotations.vc3d import fiber_tag
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import ChunkedArray
 from vesuvius.neural_tracing.tracers.shared.ct_structure import CT_CONTEXT_RADIUS, MIN_EIGENGAP, SeedHeadingError, ct_sheet_normal
 from vesuvius.neural_tracing.tracers.sheets import config as C
@@ -32,17 +36,12 @@ from vesuvius.neural_tracing.tracers.sheets.data.fibers import episode_fibers, f
 from vesuvius.neural_tracing.tracers.sheets.tracing.inference import connected_keep, resample, trace, write_trace
 
 
-def fiber_tag(fiber: dict) -> str:
-    hv = fiber.get('hv_classification') or {}
-    return hv.get('manual_tag') or hv.get('automatic_tag') or ''
-
-
 def seed_from_fiber(fiber: dict, scale: float, length: float, rng) -> tuple[np.ndarray, int] | None:
     """Line points (N, 3) from a random control point on, cut to ``length`` voxels of arc length (scaled
     coordinates), and the index of that control point; None if no control point has that much fiber after it."""
     line = np.asarray(fiber['line_points'], np.float64)*scale
-    arc = np.concatenate([[0.], np.cumsum(np.linalg.norm(np.diff(line, axis=0), axis=1))])
-    cps = np.asarray([cp['position'] for cp in fiber['control_points']], np.float64)*scale
+    arc = arclength(line)
+    cps = np.asarray(parse_vc3d_fiber_format(fiber).control_points_xyz, np.float64)*scale  # version 1 or 3
     starts = [int(np.argmin(np.linalg.norm(line-cp, axis=1))) for cp in cps]
     usable = [k for k, i in enumerate(starts) if arc[-1]-arc[i] >= length]
     if not usable:
@@ -89,7 +88,7 @@ def follow_starts(fiber: dict, scale: float, from_end: float) -> list:
     """For each end of the fiber long enough: ((line points (N, 3) scaled, arc length of the start ``from_end``
     voxels in from that end), sign of the outward direction along the line)."""
     line = np.asarray(fiber['line_points'], np.float64)*scale
-    arc = np.concatenate([[0.], np.cumsum(np.linalg.norm(np.diff(line, axis=0), axis=1))])
+    arc = arclength(line)
     if arc[-1] < 2*from_end:
         return []
     return [((line, from_end), -1.), ((line, arc[-1]-from_end), 1.)]
@@ -99,7 +98,7 @@ def follow_front(line: np.ndarray, at: float, sign: float, spacing: float, volum
     """A 3-point front across the fiber at arc ``at`` (below, on, above it: one point spacing along the sheet,
     perpendicular to the fiber, from the 2/8 structure-tensor normal) and the advance direction at each point (the
     fiber's direction, ``sign`` along the line); (None, None) without a clear sheet."""
-    arc = np.concatenate([[0.], np.cumsum(np.linalg.norm(np.diff(line, axis=0), axis=1))])
+    arc = arclength(line)
     point = lambda a: np.array([np.interp(a, arc, line[:, k]) for k in range(3)])
     p = point(at)
     t = sign*(point(min(at+span, arc[-1]))-point(max(at-span, 0.)))
@@ -126,7 +125,7 @@ def extended_fiber(fiber: dict, line: np.ndarray, at: float, sign: float, rows: 
         count += 1
     if count == 1:
         return None
-    arc = np.concatenate([[0.], np.cumsum(np.linalg.norm(np.diff(line, axis=0), axis=1))])
+    arc = arclength(line)
     traced = rows[1:count, mid]
     if sign > 0:  # extending past the line's last point
         points = np.concatenate([line[arc < at], rows[:1, mid], traced])

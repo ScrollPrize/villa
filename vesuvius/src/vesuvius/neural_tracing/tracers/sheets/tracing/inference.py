@@ -25,6 +25,7 @@ from scipy import ndimage
 import tifffile
 import torch
 
+from vesuvius.neural_tracing.tracers.shared.geometry import resample_polyline
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import ChunkedArray
 from vesuvius.neural_tracing.tracers.sheets import config as C
 from vesuvius.neural_tracing.tracers.sheets.data.episodes import collate_fibers
@@ -35,11 +36,12 @@ from vesuvius.tifxyz import Tifxyz, write_tifxyz
 
 
 def resample(points: np.ndarray, spacing: float) -> np.ndarray:
-    seg = np.linalg.norm(np.diff(points, axis=0), axis=1)
-    cum = np.concatenate([[0.], np.cumsum(seg)])
-    count = max(4, int(round(cum[-1]/spacing))+1)
-    s = np.linspace(0, cum[-1], count)
-    return np.stack([np.interp(s, cum, points[:, i]) for i in range(3)], 1)
+    """A seed polyline's front points: ``shared.geometry.resample_polyline`` at the point spacing (exact spacing from
+    the first point); a front needs at least 3 points."""
+    seed = resample_polyline(np.asarray(points, np.float64), spacing)
+    if len(seed) < 3:
+        raise ValueError(f'A seed needs at least two point spacings ({2*spacing:g} voxels) of length')
+    return seed
 
 
 def seed_from_patch(path, line: str, span: str, direction: str):

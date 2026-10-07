@@ -22,6 +22,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from vesuvius.neural_tracing.tracers.shared.geometry import arclength, interp_at
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import ChunkedArray
 from vesuvius.neural_tracing.tracers.sheets.data.fibers import episode_fibers, fiber_pool
 from vesuvius.neural_tracing.tracers.sheets.data.patches import GridSpec, PatchInfo, PatchStore
@@ -219,11 +220,11 @@ class EpisodeSampler:
         info = self._by_key.get((run['root'], run['patch']))
         if info is None:
             return None
-        arc = np.concatenate([[0.], np.cumsum(np.linalg.norm(np.diff(run['xyz'], axis=0), axis=1))])
+        arc = arclength(run['xyz'])
         if arc[-1] < self.front_len:
             return None
         at = rng.uniform(0., arc[-1]-self.front_len)+np.arange(d.front_points)*d.point_spacing
-        pts = np.stack([np.interp(at, arc, run['xyz'][:, k]) for k in range(3)], 1)
+        pts = interp_at(run['xyz'], arc, at)
         rc = np.stack([np.interp(at, arc, run['rc'][:, k]) for k in range(2)], 1)
         v_rc = rc[-1]-rc[0]
         if np.linalg.norm(v_rc) < 1e-6:
@@ -265,7 +266,7 @@ class EpisodeSampler:
         info = self._by_key.get((run['root'], run['patch']))
         if info is None:
             return None
-        arc = np.concatenate([[0.], np.cumsum(np.linalg.norm(np.diff(run['xyz'], axis=0), axis=1))])
+        arc = arclength(run['xyz'])
         u_vals, v_vals = self.spec.u_vals, self.spec.v_vals
         span = u_vals[-1]-u_vals[0]
         if arc[-1] < span:

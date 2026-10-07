@@ -68,7 +68,7 @@ def load_fibers(fiber_dir: str, grid_scale: float = 8.0, spacing: float = 1.0) -
         s = arclength(pts)
         spans = [FiberSpan(float(s[a]), float(s[b]), fib.control_point_segments[i])
                  for i, (a, b) in enumerate(zip(bounds[:-1], bounds[1:]))]
-        tag = (fib.metadata.get("hv_classification") or {}).get("automatic_tag", "")
+        tag = fiber_tag(fib.metadata)
         endpoints = (False, False)
         if fib.version == 3:
             endpoints = tuple("kollesis_termination" in raw["control_points"][i].get("tags", [])
@@ -81,3 +81,8 @@ def load_fibers(fiber_dir: str, grid_scale: float = 8.0, spacing: float = 1.0) -
                               endpoint_stop=endpoints, source_hash=source_hash,
                               excluded_tail_length=tails, kink_repairs=len(repairs), foldbacks=folds))
     return out
+
+
+def fiber_tag(record) -> str:
+    """The H/V family of a VC3D fiber (its JSON, or its parsed metadata): the automatic classification's tag."""
+    return (record.get("hv_classification") or {}).get("automatic_tag", "")
