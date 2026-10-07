@@ -66,6 +66,8 @@ endfunction()
 
 vc_add_test(NAME test_smoke LIBS doctest::doctest)
 
+vc_add_test(NAME test_fiber_collection LIBS doctest::doctest vc_fiber_collection)
+
 vc_add_test(NAME test_omp_thread_point_collection)
 
 vc_add_test(NAME test_surface_area_units)
@@ -971,6 +973,10 @@ vc_add_test(NAME test_volume_extras)
 vc_add_test(NAME test_zarr_more)
 
 vc_add_test(NAME test_vcdataset_compressors)
+
+vc_add_test(NAME test_vcdataset_volcomp)
+
+vc_add_test(NAME test_zarr_shard_index_location)
 
 vc_add_test(NAME test_volume_static_read)
 

@@ -1585,6 +1585,7 @@ std::vector<LineControlPoint> mergeOptimizerControlPoints(std::vector<vc::lasagn
         merged.displayNormal = original[index].displayNormal;
         merged.direction = original[index].direction;
         merged.displayNormalSource = original[index].displayNormalSource;
+        merged.identity = original[index].identity;
         result.push_back(std::move(merged));
     }
     return result;
