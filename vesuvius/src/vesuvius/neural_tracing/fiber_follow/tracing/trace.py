@@ -39,9 +39,10 @@ class TraceParams:
     # Model arithmetic on CUDA: 'bf16' autocast, or 'fp32' (no autocast; TF32 follows torch.backends flags).
     # fp32 keeps batch-composition rounding differences from growing into flipped decisions.
     precision: str = 'bf16'
-    # A decision that would stop on confidence first retries once at the same head with its crop refit to its own
-    # prediction (tracing.crop_frames.predicted_axis over the gate horizon); only a second stop ends the trace.
-    refit_retry: bool = True
+    # Optional (off by default): a decision that would stop on confidence first retries once at the same head with its
+    # crop refit to its own prediction (tracing.crop_frames.predicted_axis over the gate horizon); only a second stop
+    # then ends the trace.
+    refit_retry: bool = False
 
     def __post_init__(self):
         if (self.n_commit < 1 or self.max_len <= 0 or not 0 <= self.confidence <= 1 or self.forward_chunk < 0

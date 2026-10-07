@@ -141,6 +141,8 @@ def main():
     ap.add_argument('--device', default='cuda')
     ap.add_argument('--precision', choices=('bf16', 'fp32'), default='bf16',
                     help='model arithmetic while tracing; fp32 (TF32 off) makes traces independent of batch composition')
+    ap.add_argument('--refit-retry', action='store_true',
+                    help='before a confidence stop, retry once with the crop refit to the prediction (off by default)')
     ap.add_argument('--sampler-seed', type=int, default=0,
                     help="seed of the flow model's sampled proposals (TraceParams.seed; keyed per trace and decision)")
     args = ap.parse_args()
@@ -180,7 +182,8 @@ def main():
     for source in sources:
         name = source['name']
         fibers = source['fibers']
-        tracer = FiberTracer(model,source['volume'],crop,nh,TraceParams.from_policy(policy,max_len=args.max_len,forward_chunk=args.batch,precision=args.precision,seed=args.sampler_seed),device=args.device)
+        tracer = FiberTracer(model,source['volume'],crop,nh,TraceParams.from_policy(policy,max_len=args.max_len,forward_chunk=args.batch,precision=args.precision,seed=args.sampler_seed,
+                                                                                   refit_retry=args.refit_retry),device=args.device)
         try:
             for cohort in args.cohorts:
                 seeds = frozen['sources'][name][cohort]
