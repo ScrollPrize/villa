@@ -529,6 +529,12 @@ class DatasetSource:
     surface_volume_paths: Mapping[str, str | Path] = field(
         default_factory=_FrozenMapping
     )
+    inklabels_paths: Mapping[str, str | Path] = field(
+        default_factory=_FrozenMapping
+    )
+    supervision_mask_paths: Mapping[str, str | Path] = field(
+        default_factory=_FrozenMapping
+    )
     sampling_scroll: str = ""
     sampling_physical_segment_keys: Mapping[str, str] = field(
         default_factory=_FrozenMapping
@@ -548,6 +554,12 @@ class DatasetSource:
         paths = value.get("surface_volume_paths") or {}
         if not isinstance(paths, Mapping):
             raise TypeError(f"datasets[{index}].surface_volume_paths must be an object")
+        inklabels_paths = value.get("inklabels_paths") or {}
+        if not isinstance(inklabels_paths, Mapping):
+            raise TypeError(f"datasets[{index}].inklabels_paths must be an object")
+        supervision_mask_paths = value.get("supervision_mask_paths") or {}
+        if not isinstance(supervision_mask_paths, Mapping):
+            raise TypeError(f"datasets[{index}].supervision_mask_paths must be an object")
         return cls(
             segments_path=Path(str(value["segments_path"])),
             volume_scale=int(value["volume_scale"]),
@@ -565,6 +577,12 @@ class DatasetSource:
             ),
             surface_volume_paths=_FrozenMapping(
                 {str(key): str(path) for key, path in paths.items()}
+            ),
+            inklabels_paths=_FrozenMapping(
+                {str(key): str(path) for key, path in inklabels_paths.items()}
+            ),
+            supervision_mask_paths=_FrozenMapping(
+                {str(key): str(path) for key, path in supervision_mask_paths.items()}
             ),
             sampling_scroll=str(value.get("sampling_scroll", "")).strip(),
             sampling_physical_segment_keys=_string_mapping(

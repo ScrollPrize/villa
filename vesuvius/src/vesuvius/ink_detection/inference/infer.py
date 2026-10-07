@@ -11,7 +11,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 from urllib.parse import urlparse
 
 import numpy as np
@@ -35,6 +35,7 @@ from vesuvius.ink_detection.inference.inference_runtime import (
     prepare_model_for_inference,
     resolve_amp_dtype,
 )
+from vesuvius.ink_detection.inference.resume import ResumeStore
 from vesuvius.ink_detection.models.model import make_model
 from vesuvius.ink_detection.volume_io import (
     ZARR_V3,
@@ -652,6 +653,7 @@ class ChunkAccumulator:
         prob_sum_store: Any,
         weight_sum_store: Any,
         contribution_counts: Mapping[ChunkKey, int],
+        record_flushes: bool = False,
     ) -> None:
         self.height, self.width = (int(value) for value in shape)
         self.chunk_h, self.chunk_w = (
@@ -662,6 +664,10 @@ class ChunkAccumulator:
         self.contribution_counts = dict(contribution_counts)
         self.seen_counts: dict[ChunkKey, int] = {}
         self.buffers: dict[ChunkKey, tuple[np.ndarray, np.ndarray]] = {}
+        # Only populated with record_flushes=True (resumable runs): chunks
+        # flushed since the last resume snapshot, drained by the snapshot.
+        self.record_flushes = bool(record_flushes)
+        self.flushed_since_save: dict[ChunkKey, tuple[np.ndarray, np.ndarray]] = {}
 
     def _bounds(self, key: ChunkKey) -> tuple[int, int, int, int]:
         y0, x0 = key.row * self.chunk_h, key.col * self.chunk_w
@@ -722,12 +728,37 @@ class ChunkAccumulator:
         y0, y1, x0, x1 = self._bounds(key)
         self.prob_sum_store[y0:y1, x0:x1] = probability
         self.weight_sum_store[y0:y1, x0:x1] = weight
+        if self.record_flushes:
+            self.flushed_since_save[key] = (probability, weight)
 
     def flush_remaining(self) -> None:
         """Flush chunks whose skipped raw-empty blocks prevented early completion."""
 
         for key in tuple(self.buffers):
             self._flush(key)
+
+
+def _save_resume_snapshot(
+    resume_store: ResumeStore, accumulator: ChunkAccumulator, next_block: int
+) -> None:
+    """Persist chunks flushed since the last snapshot plus the open buffers."""
+
+    flushed = {
+        (key.row, key.col): arrays
+        for key, arrays in accumulator.flushed_since_save.items()
+    }
+    resume_store.save(
+        next_block=next_block,
+        flushed=flushed,
+        open_buffers={
+            (key.row, key.col): arrays for key, arrays in accumulator.buffers.items()
+        },
+        seen_counts={
+            (key.row, key.col): count
+            for key, count in accumulator.seen_counts.items()
+        },
+    )
+    accumulator.flushed_since_save.clear()
 
 
 def run_block_inference(
@@ -741,8 +772,13 @@ def run_block_inference(
     amp_dtype: torch.dtype | None,
     tta_axes: Sequence[int],
     tta_batch_size: int | None,
+    on_batch_done: Callable[[int], None] | None = None,
 ) -> None:
-    """Forward nonempty flat patches and feed their weighted probabilities."""
+    """Forward nonempty flat patches and feed their weighted probabilities.
+
+    ``on_batch_done`` (if given) is called after every batch with the number
+    of scheduled blocks it consumed, including skipped raw-empty ones.
+    """
 
     mask_f32 = None if mask is None else mask.astype(np.float32, copy=False)
     autocast = (
@@ -752,10 +788,13 @@ def run_block_inference(
     )
     with torch.inference_mode(), autocast:
         for images_BCZYX, metadata in loader:
+            batch_blocks = int(metadata.shape[0])
             # The dataset records occupancy on raw patches; normalized all-zero
             # input is not a valid signal for this skip.
             keep = metadata[:, 4] > 0
             if not bool(keep.any()):
+                if on_batch_done is not None:
+                    on_batch_done(batch_blocks)
                 continue
             images_BCZYX = images_BCZYX[keep].to(device, non_blocking=True)
             metadata = metadata[keep]
@@ -786,6 +825,8 @@ def run_block_inference(
                     tile=tile,
                     tile_weights=weights,
                 )
+            if on_batch_done is not None:
+                on_batch_done(batch_blocks)
 
 
 def iter_probability_tiles(
@@ -1056,13 +1097,45 @@ def infer_single_zarr(
         occupancy_scale,
     )
     LOGGER.info("Selected %d patches for inference", len(blocks))
+    effective_batch_size = args.batch_size * max(1, len(args.gpu_ids))
+    resume_store = None
+    start_block = 0
+    restored_buffers: dict = {}
+    restored_seen: dict = {}
+    if getattr(args, "resume_dir", None) is not None:
+        checkpoint_path = getattr(args, "checkpoint", None)
+        resume_store = ResumeStore(
+            args.resume_dir,
+            fingerprint={
+                "input": str(input_zarr),
+                "checkpoint": str(checkpoint_path),
+                "checkpoint_bytes": (
+                    Path(checkpoint_path).stat().st_size
+                    if checkpoint_path is not None and Path(checkpoint_path).exists()
+                    else None
+                ),
+                "resolution": resolution,
+                "shape": [height, width],
+                "patch_size": patch_size,
+                "stride": stride,
+                "blend_mode": blend_mode,
+                "layer_indices": layer_indices.tolist(),
+                "tta_mirror": bool(args.tta_mirror),
+                "mask_path": None if args.mask_path is None else str(args.mask_path),
+                "num_blocks": len(blocks),
+                "tile_shape": list(tile_shape),
+                # Batch composition can change GPU kernel choice, so it is
+                # part of what makes a resumed run bit-identical.
+                "batch_size": effective_batch_size,
+            },
+        )
+        start_block, restored_buffers, restored_seen = resume_store.load()
     dataset = FlatBlockDataset(
         reader=reader,
-        blocks=blocks,
+        blocks=blocks[start_block:],
         patch_size=patch_size,
         preprocessing=configured_model.preprocessing,
     )
-    effective_batch_size = args.batch_size * max(1, len(args.gpu_ids))
     loader_kwargs: dict[str, Any] = {
         "dataset": dataset,
         "batch_size": effective_batch_size,
@@ -1113,8 +1186,25 @@ def infer_single_zarr(
             contribution_counts=compute_chunk_contribution_counts(
                 blocks, chunk_shape=accumulation_chunks
             ),
+            record_flushes=resume_store is not None,
         )
-        if blocks:
+        for (row, col), buffers in restored_buffers.items():
+            accumulator.buffers[ChunkKey(row, col)] = buffers
+            accumulator.seen_counts[ChunkKey(row, col)] = restored_seen[(row, col)]
+        on_batch_done = None
+        if resume_store is not None:
+            progress = {"next": start_block, "saved": start_block}
+
+            def on_batch_done(count: int) -> None:
+                progress["next"] += count
+                if progress["next"] - progress["saved"] >= args.resume_every:
+                    _save_resume_snapshot(resume_store, accumulator, progress["next"])
+                    LOGGER.info(
+                        "Progress: %d/%d blocks", progress["next"], len(blocks)
+                    )
+                    progress["saved"] = progress["next"]
+
+        if blocks[start_block:]:
             run_block_inference(
                 loader=loader,
                 model=configured_model.model,
@@ -1125,9 +1215,18 @@ def infer_single_zarr(
                 amp_dtype=configured_model.amp_dtype,
                 tta_axes=tta_axes,
                 tta_batch_size=args.tta_batch_size,
+                on_batch_done=on_batch_done,
             )
             accumulator.flush_remaining()
-        else:
+        if resume_store is not None:
+            # Final snapshot, then rebuild the complete accumulation from every
+            # saved part: earlier sessions' chunks only exist in the parts.
+            _save_resume_snapshot(resume_store, accumulator, len(blocks))
+            for (row, col), probability, weight in resume_store.iter_parts():
+                y0, y1, x0, x1 = accumulator._bounds(ChunkKey(row, col))
+                probability_sum[y0:y1, x0:x1] = probability
+                weight_sum[y0:y1, x0:x1] = weight
+        if not blocks:
             LOGGER.warning(
                 "No occupied blocks were found; writing an all-zero output"
             )
@@ -1330,6 +1429,17 @@ def parse_args(argv: Sequence[str] | None = None):
     parser.add_argument("--layer-end", type=int)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument(
+        "--resume-dir",
+        type=Path,
+        help=(
+            "Durable directory for resumable runs: progress is snapshotted "
+            "there every --resume-every blocks, and a rerun with the same "
+            "arguments continues from the last snapshot (bit-identical to an "
+            "uninterrupted run). Single-input mode only."
+        ),
+    )
+    parser.add_argument("--resume-every", type=int, default=2000)
+    parser.add_argument(
         "--direction", choices=("forward", "reverse", "both"), default="forward"
     )
     parser.add_argument(
@@ -1350,6 +1460,10 @@ def parse_args(argv: Sequence[str] | None = None):
         parser.error("--prefetch-factor must be positive")
     if args.batch_size <= 0:
         parser.error("--batch-size must be positive")
+    if args.resume_every <= 0:
+        parser.error("--resume-every must be positive")
+    if args.resume_dir is not None and args.folder is not None:
+        parser.error("--resume-dir is only supported for a single input")
     if args.tta_batch_size is not None and args.tta_batch_size <= 0:
         parser.error("--tta-batch-size must be positive")
     try:
