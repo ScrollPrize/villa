@@ -326,6 +326,7 @@ def create_demand_store(cache, source_identity, model_identity, geometry, effect
         chunk_size=geometry.chunk, product_prefix="fiber", zarr_path_prefix=cache / "fiber",
         emit_embeddings=bool(settings.get("emit_embeddings", False)),
         emit_width=bool(settings.get("emit_width", False)),
+        emit_normals=bool(settings.get("emit_normals", False)),
         **adapter_options)
     # Construction restores checkpoint config; reapply the resolved precision.
     adapter.config["training"] = {**adapter.config.get("training", {}),
@@ -389,13 +390,15 @@ def resolve_inference_model(cache_root, checkpoint, model_config, settings, devi
                       "embedding_channels": "signed-float32-v2" if settings.get("emit_embeddings", False) else None}
     if settings.get("tta"):
         from .tta import SCHEMA, VARIANTS
-        if settings.get('emit_width'):
-            raise ValueError('TTA width export is not supported')
+        if settings.get('emit_width') or settings.get('emit_normals'):
+            raise ValueError('TTA auxiliary width/normal export is not supported')
         if settings['tta'] not in VARIANTS or precision != 'off' or max_batch_size != 1:
             raise ValueError('TTA requires valid variant, precision off and max_batch_size1')
         model_identity['tta'] = SCHEMA  # Selection is a view, not a new prediction.
     if settings.get('emit_width'):
         model_identity['width_channel'] = 'float32-input-voxels-v1'
+    if settings.get('emit_normals'):
+        model_identity['sheet_normal_channels'] = 'six-sigmoid-compact-axis-u8-v1'
     return dict(snapshot=snapshot, effective=effective, settings=settings,
                 identity=model_identity, tile=tile, overlap=overlap, border=border,
                 scale=scale, chunk=chunk, power=power)
@@ -467,6 +470,10 @@ def run(config_path, checkpoint, devices, native_binary, model_config=None, *, r
     cache_root = Path(subprocess.check_output([str(resolver)], text=True).strip())
     prediction_cache_root = inference_cache_root(cache_root, config.get("inference_cache_namespace"))
     settings = dict(config.get("inference", {}))
+    if config.get('tracing_normals', 'lasagna') not in ('lasagna', 'fiber'):
+        raise ValueError('tracing_normals must be lasagna or fiber')
+    if config.get('tracing_normals') == 'fiber':
+        settings['emit_normals'] = True
     trace_args = config.get("trace_args", [])
     if '--width-relative-tolerance' in trace_args:
         tolerance = float(trace_args[trace_args.index('--width-relative-tolerance') + 1])
@@ -623,6 +630,8 @@ def run(config_path, checkpoint, devices, native_binary, model_config=None, *, r
                 entry["inference_roles"] = {"presence_nx_ny": str(manifests[0]),
                                             "embedding": str(manifests[1])}
             entry["normal_manifest"] = location(base, source["normal_manifest"])
+            if settings.get('emit_normals') and config.get('tracing_normals') == 'fiber':
+                entry['tracing_normals'] = 'fiber'
             entry["inference_scaledown_power"] = power
             entry["input_volume"] = input_path
             if "ct_volume" in source:

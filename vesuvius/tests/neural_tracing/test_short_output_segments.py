@@ -33,3 +33,16 @@ def test_empty_invalid_and_episode_regrouping():
     assert filter_output_segments(doc,512)['ordinary_restarts']==1
     doc['replay']['failures'][0]['segment_index']=50
     with pytest.raises(ValueError): filter_output_segments(doc,512)
+
+
+def test_neural_confidence_is_separate_and_optional():
+    doc=fixture()
+    doc['replay']['segments'][0]['termination_reason']='confidence'
+    original=filtered_output_statistics([filter_output_segments(doc,0)])
+    classified=filtered_output_statistics([filter_output_segments(doc,0,confidence_reasons=('confidence',))])
+    assert original['ordinary_restarts']==1
+    assert classified['ordinary_restarts']==0 and classified['confidence_filtered']==1
+    assert classified['actual_stops']==original['actual_stops']
+    assert classified['retained_mm']==original['retained_mm']
+    short=filtered_output_statistics([filter_output_segments(doc,512,confidence_reasons=('confidence',))])
+    assert short['confidence_filtered']==0

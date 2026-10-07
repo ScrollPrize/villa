@@ -1,3 +1,27 @@
+## 2026-10-07 — Predicted sheet normals in reviewed tracing
+
+- Added opt-in auxiliary normal export/cache identity/readiness and tracing-only
+  native sampler override; original Lasagna reference acceptance unchanged.
+  All existing scheduling, precision and default behavior retained.
+- Both reviewed182-case comparisons completed with additional matched-cache
+  controls. Min512 EMA999u12100: Lasagna1error/234pieces/82.031% retained versus
+  predicted3/232/81.070%; EMA99u19100: Lasagna3/257/80.773% versus predicted4/258/80.821%.
+  No clear quality improvement; Lasagna stays default. Historical controls and
+  all per-scroll/min0/min512 metrics retained in reviewed_predicted_normals_20261007_v1
+  benchmark MD/JSON.12Python/99native regression cases passed.
+
+## 2026-10-07 — New and historical neural follower comparison
+
+- Integrated upstream853dcf536 through existing native replay/forward-queue bridge;
+  completed Flow v5 u26000 and unified scoring u35000 on all182 directions using
+  GPU0–5. Exact requested confidence .5/.7, commit8 and full gate retained.
+- Min512: Flow14 errors/296 pieces/84.840% retained; unified13/285/86.662%.
+  Tuned EMA999u12100 remains0/233/82.086%. Historical memory and Flowv4
+  recomputed from saved traces using identical metrics; no historical reruns.
+- Full unfiltered/filtered and per-scroll comparisons, provenance and approved
+  runner instructions: docs/benchmarks/neural_follow_20261007.md and JSON.
+  Unified supplied checkpoint is35000 (not example33000). Defaults unchanged.
+
 ## 2026-10-07 — 194246 training snapshot comparison
 
 - Corrected initial raw-only omission: current/best EMA99 and EMA999 completed on GPU0–5, frozen before continuation. Min512 errors/pieces/retained: EMA99 current 3/263/77.076%, best 3/258/80.681%; EMA999 current 5/270/77.765%, best 4/251/79.249%. Each took 286–296 s including startup and inference. No separate EMA best-restarts checkpoints exist. Same policy/cohort verified, 48 focused tests passed; full seven-selection comparison plus historical control recorded in report.

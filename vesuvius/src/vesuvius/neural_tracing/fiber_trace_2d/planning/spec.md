@@ -1,5 +1,18 @@
 # Training trace execution contract
 
+## Optional predicted tracing normals
+
+- Explicit emit_normals exports the auxiliary normal head's six sigmoid
+  projections, accumulated before the shared compact-axis nx/ny encoding.
+  sheet_grad_mag is a constant nonzero validity channel, not winding density.
+  Reject missing/conditioned normal heads and auxiliary TTA; legacy outputs
+  remain unchanged when disabled. Cache identity includes this output schema.
+- tracing_normals=fiber binds these products to native forward/reverse tracing
+  using the existing Lasagna sampler on the prediction lattice. All sheet
+  products participate in the existing coherent chunk-readiness gate.
+- Reference acceptance, grace and GT-guided restart search still use the
+  original Lasagna normals. No automatic fallback or default source switch.
+
 ## Optional replay presence filtering
 
 - Cached output-only length analysis may discard completed saved pieces below a minimum actual traced-polyline arc length in base coordinates (after rollback; equality retained). It must preserve native traces and online totals, expose discarded coverage/pieces, and distinguish surviving endpoint counts from original restarts. GT-error boundaries already split benchmark pieces, so this is GT-assisted retained-output analysis, not a demonstrated GT-free detector. Report actual arithmetic piece mean alongside historical virtual retained-distance/(surviving stops+1).
@@ -79,6 +92,22 @@
   source/parent hashes, and record updated output hashes in the test manifest.
 
 ## Resident reviewed trace evaluation
+
+### Opt-in external neural follower comparison
+
+- Reuse the native reference replay acceptance, grace and restart grouping and
+  the existing shared ready-forward queue/native CT reader. External followers
+  do not replace default volume-based tracing.
+- Select legacy-flow or current unified checkpoint loaders explicitly; preserve
+  requested confidence, commit count, gate, scales, precision and sampling seed.
+  Verify heading checkpoint binding and record upstream/model hashes.
+- Report confidence stops separately from geometric errors, with retained
+  distance and pieces. Additional minimum-length filtering is GT-assisted
+  output analysis, not an error detector. Keep unfiltered results too.
+- Collection-wide dedup/export spacing does not apply to independent reference
+  cases. Validate identical reference geometry/identity before comparisons.
+
+### Resident execution
 
 - Trace tests become eligible only after the globally aggregated raw dense-test
   mean angle first falls strictly below10 degrees with valid angle support.

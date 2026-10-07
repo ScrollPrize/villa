@@ -166,6 +166,14 @@ if __name__ == '__main__':
     elif not sys.argv[1:]:
         control = REPO / 'scripts/training_failure_mining_control.json'
         action = json.loads(control.read_text()).get('action', 'start') if control.exists() else 'start'
+        if action == 'neural_follow':
+            subprocess.run([sys.executable, '-u', str(REPO/'scripts/neural_follow_benchmark.py')], check=True)
+            raise SystemExit(0)
+        if action == 'reviewed_predicted_normals':
+            with (REPO/'scripts/reviewed_predicted_normals.run.log').open('a') as log:
+                subprocess.run([sys.executable, '-u', str(REPO/'scripts/reviewed_predicted_normals.py')], check=True,
+                               stdout=log, stderr=subprocess.STDOUT)
+            raise SystemExit(0)
         if action == 'iso20_tiled':
             args=[sys.executable,'-u',str(REPO/'scripts/iso20_tiled.py')]
             if json.loads(control.read_text()).get('pilot'):args.append('--pilot')

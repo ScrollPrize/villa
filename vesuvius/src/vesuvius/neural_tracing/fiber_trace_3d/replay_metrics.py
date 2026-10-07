@@ -10,7 +10,7 @@ RESTART_EPISODE_DISTANCE = 80.0
 MEAN_DEFINITION = "combined-directed-distance-per-restarts-plus-one-v1"
 
 
-def filter_output_segments(document: dict, minimum_base_voxels: float) -> dict:
+def filter_output_segments(document: dict, minimum_base_voxels: float, *, confidence_reasons=()) -> dict:
     """Output-only pruning; never alter tracing/reseeding or saved input data.
 
     Gate on traced polyline arc, account coverage on GT arc as the replay does.
@@ -29,6 +29,9 @@ def filter_output_segments(document: dict, minimum_base_voxels: float) -> dict:
     failure_indices = [int(f['segment_index']) for f in failures]
     if len(set(failure_indices)) != len(failure_indices) or any(i < 0 or i >= len(segments) for i in failure_indices):
         raise ValueError('invalid failure-to-segment mapping')
+    confidence_failures = [f for f in failures if segments[int(f['segment_index'])]['termination_reason'] in confidence_reasons]
+    failures = [f for f in failures if segments[int(f['segment_index'])]['termination_reason'] not in confidence_reasons]
+    failure_indices = [int(f['segment_index']) for f in failures]
     records = []
     for i, s in enumerate(segments):
         points = np.asarray(s['trace_points_base_xyz'], dtype=np.float64)
@@ -40,7 +43,7 @@ def filter_output_segments(document: dict, minimum_base_voxels: float) -> dict:
         records.append(dict(segment_index=i, trace_length_base=length,
             reference_mm=covered*scale, keep=length >= minimum_base_voxels,
             error=i in failure_indices, presence_stop=reason=='presence_filtered',
-            reverse_stop=reason=='reverse_consistency_filtered'))
+            reverse_stop=reason=='reverse_consistency_filtered', confidence_stop=reason in confidence_reasons))
     if sum(r['presence_stop']+r['reverse_stop'] for r in records) != len(replay['filtered_stops']):
         raise ValueError('filtered-stop mapping mismatch')
     arcs = [float(f['reference_arc_base']) for f in failures if records[int(f['segment_index'])]['keep']]
@@ -50,7 +53,7 @@ def filter_output_segments(document: dict, minimum_base_voxels: float) -> dict:
         case_index=document['provenance']['case_index'], minimum_base_voxels=minimum_base_voxels,
         reference_mm=(end-begin)*scale, records=records,
         ordinary_restarts=len(_episode_indices(arcs, RESTART_EPISODE_DISTANCE)),
-        original_error_events=len(failures), original_filtered_stops=len(replay['filtered_stops']))
+        original_error_events=len(failures), original_filtered_stops=len(replay['filtered_stops'])+len(confidence_failures))
 
 
 def filtered_output_statistics(cases: list[dict]) -> dict:
@@ -64,11 +67,12 @@ def filtered_output_statistics(cases: list[dict]) -> dict:
     error_events = sum(r['error'] for r in kept)
     presence = sum(r['presence_stop'] for r in kept)
     reverse = sum(r['reverse_stop'] for r in kept)
-    stops = error_events + presence + reverse
+    confidence = sum(r.get('confidence_stop', False) for r in kept)
+    stops = error_events + presence + reverse + confidence
     quantiles = np.quantile([r['reference_mm'] for r in kept], [.05,.5,.95]).tolist() if kept else [None]*3
     return dict(directions=len(cases), ordinary_restarts=sum(c['ordinary_restarts'] for c in cases),
         error_events=error_events, presence_filtered=presence, reverse_filtered=reverse,
-        filtered_stops=presence+reverse, actual_stops=stops,
+        confidence_filtered=confidence, filtered_stops=presence+reverse+confidence, actual_stops=stops,
         original_actual_stops=sum(c['original_error_events']+c['original_filtered_stops'] for c in cases),
         kept_segments=len(kept), discarded_segments=len(discarded),
         discarded_error_events=sum(r['error'] for r in discarded),

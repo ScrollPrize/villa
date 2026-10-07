@@ -1,15 +1,15 @@
 # Plan
 
-1. Use current.pt,best.pt,best_reviewed_trace.pt; freeze all3 with existing freeze_selection before any long evaluations. Validate raw kind/selection metric,save hashes,steps and metadata.
-2. Reuse exact winning workload; replace only checkpoint,output,cache namespace and labels. Same inference precision/resources, GPU0–5,cohort and trace args. Distinct model identities; no native/default changes.
-3. Reuse evaluate_config, measured_result, filter_counts and short-output analyze. Extract shared result collection if necessary, never duplicate tracing/inference/metrics. Run3 through approved wrapper; compare original/min512 metrics globally/per-scroll with prior winner. Audit182cases91runs,effective args/cohort and retained accounting. Report each completion.
-4. Test config invariants and shared metrics; independent review; log/docs/changelog.
+1. Preserve prior neural work; branch already fiber-exp5. Controls: tuned EMA999u12100 and best-loss EMA99u19100.
+2. Add opt-in normal-head output: six sigmoid projection channels accumulated then shared hemisphere nx/ny encoding. Existing demand queue/cache/publication; include in cache identity/readiness. No scheduling changes.
+3. Native tracing uses predicted normals, including reverse traces; reference acceptance still uses Lasagna. Reuse sampler/decoder; disabled behavior unchanged.
+4. Tests for head layout/encoding, identity and separate trace/reference samplers. Approved build/test runner. Evaluate frozen checkpoints unchanged policy/precision on GPU0–5; report min0/min512/per-scroll and runtime caveats.
 
 ## Spec update
-Correction: raw-only selection was incomplete. Include current and best-loss EMA99 and EMA999, freezing all four before continuation; validate EMA kind, decay and metric. Retain completed raw results without rerunning inference/tracing. Only one best-reviewed-trace file exists, no separate EMA restart selections. Existing GT-assisted and output-only filter caveats preserved. No changes to scheduler, GPU0–5, inference precision or tracing policy.
+Optional normal product and tracing-only normal binding; unchanged GT ellipses, no default switch.
 
 ## Docs updates
-New194246 MD/JSON with snapshots,metrics,per-scroll rows,provenance,timing,reproduction command. Prior reports retained. Task/status/log/changelog updated.
+Comparison MD/JSON, provenance/configs/commands, validation, task log/status/changelog.
 
 ## Validation
-Config test ensures only allowed identity/output changes. Existing metrics tests; min0/source parity and retained+discarded checks. Effective trace equality with winner. No native build needed. No resource tuning or new approval commands.
+Independent plan review. Reject missing heads. Verify scales/encoding, readiness, cohort and policy. No concurrency retuning.

@@ -20,7 +20,8 @@ cmake -S "$repo_dir/volume-cartographer" -B "$build_dir" -G Ninja \
     -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_C_COMPILER=/usr/bin/gcc-13 \
     -DCMAKE_CXX_COMPILER=/usr/bin/g++-13 -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
     -DVC_BUILD_APPS=OFF -DVC_BUILD_FIBERLETS=ON -DVC_BUILD_FLATBOI=OFF \
-    -DVC_BUILD_PYTHON=OFF -DVC_BUILD_UI_TRACER=OFF -DVC_ENABLE_HIGHS=OFF \
+    -DVC_BUILD_PYTHON=ON -DPython_EXECUTABLE=/home/hendrik/.venv_las/bin/python -DVC_BUILD_UI_TRACER=OFF -DVC_ENABLE_HIGHS=OFF \
+    -Dnanobind_DIR=/home/hendrik/.cache/uv/archive-v0/rcrHRTTfYN8hOlRV/nanobind/cmake \
     -DVC_TESTING=ON -DVC_USE_PCH=OFF -DVC_USE_CCACHE=OFF -DVC_MARCH_NATIVE=OFF \
     -DVC_USE_SYSTEM_LIBBACKTRACE=ON -DFETCHCONTENT_FULLY_DISCONNECTED=ON \
     -DFETCHCONTENT_SOURCE_DIR_VC_DELTA3D=/home/hendrik/villa/volume-cartographer/build/dev-quickbuild-gcc/_deps/vc_delta3d-src

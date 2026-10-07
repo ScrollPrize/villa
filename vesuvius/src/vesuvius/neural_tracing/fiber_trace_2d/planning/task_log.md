@@ -1,25 +1,34 @@
-#194246 snapshot comparison
+# Predicted normal tracing comparison
 
-Continuation correction: user requested raw AND EMA selections, not raw alone. Add current/best-loss EMA99 (u23300/u19100) and EMA999 (u23300/u19300), freeze before inference, retain three completed raw evaluations. No separate EMA best-restarts checkpoints exist. Same approved runner, same GPU0–5 resources and policy. Commit current code after launch as requested.
+Already on fiber-exp5 at915e31e0f, latest evaluation branch. Prior neural implementation preserved uncommitted. Selected EMA999u12100 and best-loss EMA99u19100 (same3errors as raw best, fewerpieces/morecoverage). Native replay shares normal sampler with GT acceptance: separate tracing normals to preserve metric. Auxiliary normal head not exported yet; explicit new product needed. Existing queues/resources unchanged.
 
-Independent continuation review passed. All four EMA selections frozen and validated. Approved runner resumed, skips completed raw evaluations and is actively processing current EMA99 on GPU0–5. Native changes committed e085b0c2f; evaluation changes committed 6f5ff9840. 47 focused tests passed before the EMA extension and 3 selection/config tests passed after it. Reports evolve as evaluations finish. Responding with launch status ended monitoring prematurely; resumed monitoring through actual completion on user request.
+Independent plan and implementation reviews approved. Added opt-in six-sigmoid normal output after width, accumulated using existing products then compact nx/ny encoding; sheet_grad_mag is255 validity (not a measured winding density). Native sampler aliases these channels on the same lattice; readiness includes all three channels before grouped or ordinary sampling. Forward and reverse use predicted normals; GT acceptance and restart seed search use original Lasagna. No silent Lasagna fallback. Explicit cache identity, missing-head rejection and no auxiliary TTA.
 
-Final continuation completed, runner exit 0. All seven available selections now evaluated on the same 91 fibers / 182 directions. EMA results after min512: current EMA99 u23300 = 3 errors / 263 pieces / 77.0764% retained; best EMA99 u19100 = 3 / 258 / 80.6806%; current EMA999 u23300 = 5 / 270 / 77.7651%; best EMA999 u19300 = 4 / 251 / 79.2485%. EMA error counts unchanged by min512. Wall times including preparation and inference were 289.69, 294.61, 286.32 and 295.97 seconds respectively. Previous EMA999 u12100 remains the overall control winner, with the caveat of zero retained PHerc0332 distance after min512. Full report and JSON contain all eight rows including control, both min0/min512 and per-scroll data. All effective native policies/cohorts matched; shared metrics accounting passed. Final focused suite: 48 passed in 2.59s; git diff --check clean. No resource/tracing-policy changes or additional tuning.
+Native RelWithDebInfo build succeeded;9Python tests and99native cases passed. Full first launch failed because the new driver did not propagate single-thread BLAS environment to evaluate subprocesses; huge automatic OpenBLAS pools exhausted thread capacity. Set env before imports/children and resumed with original192CPU/6GPU,128input/accumulation/publication workers andbatch4 unchanged. No completed scientific result from failed launch. Existing cache reused where complete. Logs at scripts/reviewed_predicted_normals.run.log. Both full runs queued via approved command.
 
-Current task: current/best-loss/best-restarts with winning tracer. Raw filenames selected (EMA not requested); files exist. Freeze all before evaluation, then use exact winner config with model-specific namespace, GPU0–5 and unchanged resources. Previous work retained in durable reports/changelog. User asked commit status: current eval switches/runners/results are uncommitted,HEAD5d76a43ad; reported honestly, no commit requested yet.
+Resume guard required archiving the failed full directory; reused existing archive_incomplete_output helper, no deletion of caches or artifacts. Added independent known-axis tests: at nz=0 both antipodal signs are valid, corrected test to check axis not arbitrary sign. Final12Python/99native passed. No numerical code change from that test adjustment. EMA999 run now processing; hashes/source bindings and native effective policy are audited against historical control.
 
-Independent review approved. All3raw selections frozen before any evaluation: currentu23300 SHA f58ea7ce129b8f57a3882350f767e13987ed457ec4e07dfaa93582e35d28cbac; best-lossu20000 SHA b7da239165f7625181f8eefa11d3fe1f2af54e7f97b926a8445caee3a36c8315; best-restartsu17600 SHA f834bfc47f0e76e3166f4bc6ceacfb91f2936548e203cc11be007dc660fcfa00. Captured2026-10-07T11:47:44–49UTC; snapshots distinct. Selection best-restarts was26on32pieces64directions under training protocol, not a score for this full tuned evaluation.
+EMA999u12100 full completed182/182: min512 3errors/232pieces/81.070% retained vs historical0/233/82.086%. Total successful-attempt wall439.44s includes startup/inference/shutdown; initial failed attempt excluded. Additional matched-cache Lasagna controls queued to isolate normal-source effects from fresh accumulation roundoff. These preserve exact emitted primary/width bytes and all trace settings. Report generator wording corrected to avoid claiming enabled FW checks for these disabled-FW policies.
 
-Extracted shared collect_filtered_result from existing tuning runner and reused its report renderer (parameterized destination/title/notes), no duplicate inference/tracing/metrics. New reviewed_194246 approved-wrapper action.30config/selection/metric tests passed1.85s. Exactwinning args/cohort/nativepolicy checks retained; inference namespace modelhash-specific. Starting current thenbestloss thenbestrestarts.
+All four full182-case runs completed. Min512:
 
-Startup caught namespace length>64: NAME+fullSHA too long; no tracing ran. Fixed short label nw194246_+first32SHA (fullhash remains in actual modelidentity),added64limit regression. Preserve failedworkload as workload.invalid_namespace.json only when sole difference is invalidnamespace and no summary exists; frozen snapshots unchanged. Resume via sameapprovedcommand.
+| Model | Normal source | Errors | Presence stops | Pieces | Retained% | Mean mm | Median mm |
+|---|---|---:|---:|---:|---:|---:|---:|
+| EMA999u12100 | historical Lasagna |0|86|233|82.086|13.079|3.814|
+| EMA999u12100 | matched-cache Lasagna |1|87|234|82.031|12.776|3.830|
+| EMA999u12100 | predicted |3|86|232|81.070|12.486|3.706|
+| EMA99u19100 | historical Lasagna |3|111|258|80.681|9.725|3.376|
+| EMA99u19100 | matched-cache Lasagna |3|110|257|80.773|9.822|3.363|
+| EMA99u19100 | predicted |4|109|258|80.821|9.827|3.351|
 
-Preparedbindings also retain immutable namespace evidence; rather than weaken that check, removed the one-off workload repair and separate outputs into current_eval/best_loss_eval/best_restarts_eval under experimentroot. Originalfailedstartup evidence and frozen snapshots remain untouched. No inferred chunks existed from failedstartup.
-
-Currentrawu23300 completed182directions with exactmatchednativepolicy/cohort. min512:4errors291pieces77.106850%,virtualmean6.362121mm,piecemean3.672977mm,median2.646842mm. PriorEMA999u12100:0errors233pieces82.086156%,13.078831/4.883512/3.814470mm. Reported interimcomparison; bestlossu20000 automatically next.
-
-Bestlossrawu20000 completed182directions,matchedpolicy/cohort. min512:3errors270pieces78.988595%,virtualmean8.050887mm,piecemean4.055262mm,median2.710469mm.4errors beforelengthfilter;1discardederrorpiece. Interimtable reported; bestrestartsu17600 next.
-
-All three evaluations completed successfully. Best-restarts raw u17600: 4 errors, 264 kept pieces, 76.844195% retained, virtual mean 8.321840 mm, piece mean 4.034831 mm, median 3.082824 mm. Before filtering: 4 errors, 647 pieces, 85.654% retained. Previous EMA999 u12100 remains better overall under this fixed policy (0 errors, 233 pieces, 82.086% retained); note its PHerc0332 retained coverage is zero after filtering, whereas the new models retain some coverage there. No new-model EMA comparison was performed or implied.
-
-Final report: docs/benchmarks/normalwidth_194246_tuned_20261007_v1.md and JSON, including all min0/min512 and per-scroll metrics. All three cohorts/native policies and shared metric accounting passed validation. Changes remain uncommitted; user asked commit status, not to commit. No additional tuning performed.
+Unfiltered error counts identical to min512 for these four new runs. Additional
+control inference was needed for divergent routes; previously published shared
+chunks remain unchanged. Predicted full-run walls439.44s/371.03s; matched controls
+193.96s/166.81s with mostly warm caches and small additional fills. Not an isolated
+speed comparison; no speedup established. No clear quality improvement, no default
+change. Fresh-cache historical variation visible in EMA9990to1error. Both policy
+and cohort/normal-source-content bindings audited. Complete per-scroll/min0/min512,
+P05/P95 and provenance stored in docs/benchmarks/reviewed_predicted_normals_20261007_v1.md
+and JSON. Approved command is bash /home/hendrik/villa3/scripts/run_training_failure_mining;
+control action reviewed_predicted_normals, optional paired_controls:true. Build/tests
+use operation:build/tests. Completed runs are analyzed, not rerun.

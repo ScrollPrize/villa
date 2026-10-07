@@ -45,6 +45,9 @@ def validate_cached_model(model, checkpoint_digest, settings):
     if 'emit_width' in settings and bool(settings['emit_width']) != bool(model.get('width_channel')):
         raise ValueError('cannot extend cache with different width channels')
     settings.setdefault('emit_width', bool(model.get('width_channel')))
+    if 'emit_normals' in settings and bool(settings['emit_normals']) != bool(model.get('sheet_normal_channels')):
+        raise ValueError('cannot extend cache with different sheet normal channels')
+    settings.setdefault('emit_normals', bool(model.get('sheet_normal_channels')))
     return settings
 
 
