@@ -1,105 +1,118 @@
 # Sheet tracing: operations guide
 
-Where the models are, how to run them, how to train on the H100, and which models are best. The model itself is
-described in [ARCHITECTURE.md](ARCHITECTURE.md), the options in [README.md](README.md), and every experiment with its
-numbers in [output/remote/RESULTS.md](output/remote/RESULTS.md). Paths below are relative to this package
-(`vesuvius/src/vesuvius/neural_tracing/sheet_tracing/`) unless absolute. State as of 2026-10-05.
+This guide covers where the models are, how to run them and how to train on the H100. The rest of the documentation
+is elsewhere:
 
-## 1. Best models
+* the model itself: [ARCHITECTURE.md](ARCHITECTURE.md);
+* the options: [README.md](README.md);
+* every experiment with its numbers: [output/remote/RESULTS.md](output/remote/RESULTS.md).
 
-All current models share one architecture (the m7 model, 7.5 M parameters) and need two volumes: CT and the m7
-surface prediction, both read at pyramid level 1. Use threshold **0.4** for tracing (`--threshold 0.4`). The
-numbers are the 100-seed local benchmark on corrected seeds (folders `output/remote/trace_bench/m7_fix100_local_*`).
+Paths below are relative to this package (`vesuvius/src/vesuvius/neural_tracing/sheet_tracing/`) unless absolute.
+State as of 2026-10-07.
 
-| model | checkpoint | 60 steps: coverage / real switches / off-sheet points | 30 steps: coverage / real switches / off-sheet points | use it for |
-| --- | --- | --- | --- | --- |
-| **`m7_hard`** | `output/remote/m7_hard/last.pt` | **0.894** / 14 / 732 | **0.803** / 20 / 1,113 | furthest reach; more mistakes on shorter traces |
-| **`m7_fix`** | `output/remote/m7_fix/last.pt` | 0.850 / **10** / **164** | 0.770 / 13 / 830 | safest long traces (precision 0.999) |
-| `m7_len2` | `output/remote/ctx2_m7_len2/last.pt` | 0.862 / 12 / 588 | 0.784 / **9** / 373 | balanced; the base of the two above |
-| `m7` | `output/remote/ctx2_m7_len/last.pt` | 0.846 / 11 / 223 | 0.769 / **9** / **361** | the original m7 model |
-| `ctx2` | `output/remote/big_curve_ctx2/last.pt` | 0.807 / 13 / 563 | 0.748 / 12 / 707 | best CT-only model (no m7 volume needed) |
+## 1. Models
 
-In short: **`m7_hard` if reach matters most, `m7_fix` if mistakes matter most.**
+Two models are supported. Both share one architecture (18.5 M parameters) and read only the CT, at level 0.
 
-* `m7_hard` = `m7_len2` fine-tuned on corrected patch scales, with a third of training episodes at 466 mined failure
-  spots, plus EMA.
-* `m7_fix` = the same without the failure spots.
-* Both store EMA weights (the default when loading) and raw weights (`--raw NAME` in the benchmark); the two perform
-  about the same.
-* Tried and not better: level-0 CT, fiber presence (at level 0 and at level 1), the normal profile with long
-  memory, live-chain training, capacity beyond 7.5 M, and 20-step rollouts. See RESULTS.md.
+| model | checkpoint | what it is |
+| --- | --- | --- |
+| **`remote_l0_points_ft`** | `output/remote/remote_l0_points_ft/last.pt` | the sheet tracer, fine-tuned on 5 to 16-point fronts |
+| **`remote_l0_fiber_ft`** | `output/remote_l0_fiber_ft/` on the H100 | `points_ft` plus fiber-seeded episodes, fiber tokens and the fiber-following mode (3 to 9 points) |
+
+`points_ft` results (H100, 60 steps, threshold 0.4, held-out scoring; RESULTS.md, "Front points"), as coverage /
+precision / traces with a real switch:
+
+| set | 5 points | 9 points | 15 points |
+| --- | --- | --- | --- |
+| Scroll 1 | 0.848 / 0.968 / 10 | 0.824 / 0.984 / 15 | 0.783 / 0.940 / 33 |
+| PHerc0139 slab | 0.457 / 0.980 / 23 | 0.605 / 0.980 / 39 | 0.548 / 0.957 / 48 |
+| PHerc1667 slab | 0.561 / 0.980 / 35 | 0.580 / 0.972 / 47 | 0.579 / 0.957 / 55 |
+
+Checkpoints of the same architecture trained along the way (`l0_joint`, `remote_l0_joint_scrolls`,
+`remote_l0_mix_scratch`) still load. Checkpoints of the removed model types (m7, context, profile, smoothing and
+others) do not: their configs are rejected.
 
 ## 2. Where the checkpoints are
 
 | location | path | contents |
 | --- | --- | --- |
-| this machine | `output/remote/<run>/` | copies of every H100 run: `last.pt`, kept `ckpt_NNNNNN.pt` (every 5,000 iterations), `best.pt` for older runs, `log.jsonl`, `config.json`, `training.png`, validation figures |
-| H100 | `/ephemeral/sean/sheet_tracing/villa/vesuvius/src/vesuvius/neural_tracing/sheet_tracing/output/<run>/` | the originals, including `best.pt` for the recent runs (not copied) |
-| this machine | `output/<run>/` | early local runs (`tiny_*`, `hermite_grid_long_v1`) |
+| this machine | `output/remote/<run>/` | copies of H100 runs: `last.pt`, kept `ckpt_NNNNNN.pt`, `log.jsonl`, `config.json`, `training.png`, validation figures |
+| H100 | `/ephemeral/sean/sheet_tracing/villa/vesuvius/src/vesuvius/neural_tracing/sheet_tracing/output/<run>/` | the originals, including `best.pt` |
 
-A checkpoint is a dict with:
-* `model`: raw weights;
-* `ema`: EMA weights, only for runs with `train.ema`;
+A checkpoint is a dict with these keys:
+
+* `model`: the raw weights;
+* `ema`: the EMA weights;
 * `opt`, `config`, `iteration`, `minutes`, `best`.
 
-`evaluate.load_checkpoint` builds the model from the stored config and loads the EMA weights when present. All
-benchmarks used `last.pt`. `best.pt` is picked by validation score, which has been a poor guide to trace quality.
+`evaluate.load_checkpoint` builds the model from the stored config and loads the EMA weights. Benchmarks use
+`last.pt`.
 
 **Paths inside H100 checkpoints.** Their configs record the H100's data paths (`/ephemeral/sean/sheet_tracing/data/...`).
-On this machine, pass `--path-map OLD=NEW` (to `infer.py`, `trace_benchmark.py`, `trace_spread.py`, `hard_spots.py`)
-or use `scripts/bench_local.sh`, which has the mappings built in:
+On this machine, pass `--path-map OLD=NEW` (to `infer.py`, `trace_benchmark.py`, `trace_spread.py`, `hard_spots.py`
+and `scripts/trace_from_fibers.py`), or use `scripts/bench_local.sh`, which has the mappings built in:
 
 | H100 path | this machine |
 | --- | --- |
 | `/ephemeral/sean/sheet_tracing/data/s1_ds2.zarr` | `/home/sean/Documents/volpkgs/s1_ds2.volpkg/volumes/s1_ds2.zarr` |
-| `/ephemeral/sean/sheet_tracing/data/m7_ds2.zarr` | `/home/sean/Documents/volpkgs/s1_ds2.volpkg/volumes/m7_ds2.zarr` |
-| `/ephemeral/sean/sheet_tracing/data/fiber_presence.ome.zarr` | `/home/sean/Desktop/spiral_dataset/fiber_zarrs/PHercParis4-20260411134726-las-sd1-d74cca79_presence.ome.zarr` |
 | `/ephemeral/sean/sheet_tracing/data/verified_patches_old` | `/home/sean/Desktop/spiral_dataset/verified_patches` |
 | `/ephemeral/sean/sheet_tracing/data/verified_patches_working` | `/home/sean/Desktop/spiral_dataset_working/verified_patches` |
 
+The PHerc0139 and PHerc1667 patches and volumes (`data/unseen/`) and the fiber data (`data/afv/`) exist only on the
+H100.
+
 ## 3. Running a model (this machine)
 
-Run from `vesuvius/` with `.venv/bin/python`. Set `M` to the H100 data folder once:
+Run from `vesuvius/` with `.venv/bin/python`. First set `M` to the H100 data folder:
 `M=/ephemeral/sean/sheet_tracing/data`.
 
-**Trace a surface from a seed line** (`infer.py`; writes a tifxyz, one row per step, 25 columns):
+**Trace a surface from a seed line** with `infer.py`. It writes a tifxyz with one row per step:
 
 ```bash
 .venv/bin/python -m vesuvius.neural_tracing.sheet_tracing.infer \
-  --checkpoint src/vesuvius/neural_tracing/sheet_tracing/output/remote/m7_fix/last.pt \
-  --seed-patch /path/to/a/tifxyz --line row:40 --range 100:160 --direction + --steps 60 --threshold 0.4 \
+  --checkpoint src/vesuvius/neural_tracing/sheet_tracing/output/remote/remote_l0_points_ft/last.pt \
+  --seed-patch /path/to/a/tifxyz --line row:40 --range 100:160 --direction + --steps 60 --threshold 0.5 \
   --out /path/to/output_tifxyz \
-  --path-map $M/s1_ds2.zarr=/home/sean/Documents/volpkgs/s1_ds2.volpkg/volumes/s1_ds2.zarr \
-  --path-map $M/m7_ds2.zarr=/home/sean/Documents/volpkgs/s1_ds2.volpkg/volumes/m7_ds2.zarr
+  --path-map $M/s1_ds2.zarr=/home/sean/Documents/volpkgs/s1_ds2.volpkg/volumes/s1_ds2.zarr
 ```
 
-* **Seed:** a grid line of an existing tifxyz (`--line row:N` or `col:N`, columns `--range lo:hi`, advance
-  `--direction +` or `-` towards increasing or decreasing rows), or `--seed-json` with
-  `{"points": [[x, y, z], ...], "direction": [dx, dy, dz]}` in level-0 voxels.
+* **Seed:** either a grid line of an existing tifxyz or a JSON file.
+  * Grid line: `--line row:N` or `col:N`, with columns `--range lo:hi`, advancing `--direction +` or `-` (towards
+    increasing or decreasing rows).
+  * JSON: `--seed-json` with `{"points": [[x, y, z], ...], "direction": [dx, dy, dz]}` in level-0 voxels.
 * **Direction:** needed to orient the first crops; it should lie in the sheet.
 * **Stopping:** tracing stops at the first row with no confident point connected to the surface.
+* **Front size and threshold:** the front size follows from the seed length (60 vx per point).
+  `scripts/pick_inference.py` picked 15 points at threshold 0.5 for the PHercParis4 runs.
 
-**Benchmark models against each other** (`scripts/bench_local.sh`: 100 held-out seeds, threshold 0.4, all models
-in one run):
+**Trace from fibers** with `scripts/trace_from_fibers.py`, from VC3D fiber JSONs:
+
+* `--points 15 --direction both` traces sheets up and down from horizontal fibers.
+* With `remote_l0_fiber_ft`:
+  * `--fiber-pool POOL` shows the model the fibers around each trace;
+  * `--follow` runs the fiber-following mode and writes each extended fiber as a VC3D fiber JSON to `OUT/fibers/`.
+
+**Benchmark models against each other** with `scripts/bench_local.sh` (100 held-out seeds, threshold 0.4, all
+models in one run):
 
 ```bash
 src/vesuvius/neural_tracing/sheet_tracing/scripts/bench_local.sh \
   src/vesuvius/neural_tracing/sheet_tracing/output/remote/trace_bench/my_test_s60_t0.4 60 \
-  m7=ctx2_m7_len/last.pt fix=m7_fix/last.pt hard=m7_hard/last.pt -- --raw hard
+  pts=remote_l0_points_ft/last.pt fiber=remote_l0_fiber_ft/last.pt
 ```
 
-* **Output:** `report.json`, `per_step.png`, per-seed figures, and `tifxyz/` (`seedNN_gt` and `seedNN_<model>`) for VC3D.
-* **Time:** about 20 to 40 minutes for 4 to 6 models at 30 and 60 steps.
+* **Output:** `report.json`, `per_step.png`, per-seed figures, and `tifxyz/` (`seedNN_gt` and `seedNN_<model>`) for
+  VC3D.
 * **Comparing:** compare only models benchmarked on the same machine. The GB10 and the H100 differ slightly in bf16,
   which flips a few threshold decisions over a trace, so local and H100 numbers must not be mixed. Each machine is
   deterministic run to run.
-* **Re-scoring:** `trace_benchmark.py --rescore DIR` re-scores existing folders' switch counts from their tifxyz.
+* **Re-scoring:** `trace_benchmark.py --rescore DIR` re-scores the switch counts of existing folders from their
+  tifxyz.
 
-**Long traces for inspection:** `trace_spread.py --checkpoint ... --steps 120 --tag NAME --path-map ...` traces
-seeds spread over z and writes them to `output/spread/NAME/`.
+**Long traces for inspection:** `trace_spread.py --checkpoint ... --steps 120 --tag NAME --path-map ...` traces seeds
+spread over z and writes them to `output/spread/NAME/`.
 
-**Mine failure spots:**
-`hard_spots.py --checkpoint ... --seeds 1500 --out FILE.json --path-map ...` takes about 20 minutes. It writes
+**Mine failure spots:** `hard_spots.py --checkpoint ... --seeds 1500 --out FILE.json --path-map ...`. It writes
 progress every 100 traces, so it can be stopped early.
 
 ## 4. Training
@@ -109,43 +122,42 @@ python -m vesuvius.neural_tracing.sheet_tracing.train --config CONFIG.json --nam
 python -m vesuvius.neural_tracing.sheet_tracing.train --resume output/RUN/last.pt
 ```
 
-* **`--init`:** starts from a checkpoint's weights (its EMA weights if present) with a fresh optimizer and schedule.
-  Modules the checkpoint lacks start at zero, so the model begins unchanged.
+* **`--init`:** starts from a checkpoint's EMA weights with a fresh optimizer and schedule. The fiber and mode
+  modules start fresh when the checkpoint lacks them; the mode embedding starts at zero, so the model begins
+  unchanged.
 * **`--resume`:** continues a run, including the optimizer and the elapsed time.
-* **Configs:** in `configs/`. The H100 ones are `configs/remote_*.json`; the current recipes are
-  `remote_m7_fix.json` and `remote_m7_hard.json` (300 minutes, batch 64).
+* **Configs:** `configs/remote_l0_points_ft.json` and `configs/remote_l0_fiber_ft.json` (H100 paths).
 * **Option reference:** README.md.
 
 The patch index is cached in `output/cache/`. It is rebuilt automatically when the patch directories or
-`data/patches.py`'s `INDEX_VERSION` change; it measures each patch's real cell size where `meta.json` is wrong.
+`data/patches.py`'s `INDEX_VERSION` change, and it measures each patch's real cell size where `meta.json` is wrong.
 
 ## 5. The H100 machine
 
 * **Login:** `ssh ubuntu@147.224.219.64`. It's a shared machine, so other people's jobs run on it.
-* **GPU: use GPU 7 only.** GPU 6 is in use by others. A training run (batch 64) takes about 44 GB of GPU 7's 80 GB
-  and about 1 to 1.2 s per iteration. A run can share the GPU with a 20 to 25 GB job, but shared runs go slower, and
-  runs are capped by time, so they finish with fewer iterations.
-* **Everything stays under `/ephemeral/sean/sheet_tracing`**, including temporary files and caches. The root disk
-  is shared and nearly full: do not write anywhere else (plain logs and text are tolerated, nothing else). Always
-  `source /ephemeral/sean/sheet_tracing/env.sh` first. It points every temp and cache directory (tmp, uv, pip,
-  matplotlib, torch, triton, inductor, numba, CUDA) into `cache/`, sets `PYTHONPATH` to the repo copy and `$PY` to
-  the venv, and sets `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.
-* **Other people's resources:** keep DataLoader workers at about 8 to 10 per run, and use batch 64 at level 1 (lower
-  at level 0). Large batches with many workers have used about 190 GB of shared memory, which can break other
-  people's runs.
+* **GPU: use GPU 7 only.** `remote_l0_fiber_ft` (about 160 points per batch, 32 workers) takes about 31 GB and runs
+  at about 1.4 s per iteration.
+* **Everything stays under `/ephemeral/sean/sheet_tracing`**, including temporary files and caches. The root disk is
+  shared and nearly full: do not write anywhere else (plain logs and text are tolerated, nothing else).
+* **Always `source /ephemeral/sean/sheet_tracing/env.sh` first.** It does the following:
+  * points every temp and cache directory (tmp, uv, pip, matplotlib, torch, triton, inductor, numba, CUDA) into
+    `cache/`;
+  * sets `PYTHONPATH` to the repo copy and `$PY` to the venv;
+  * sets `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.
+* **Other people's resources:** watch the shared memory that DataLoader workers use (each holds `train.prefetch`
+  batches of blocks). Large batches with many workers can break other people's runs.
 
 **Layout** of `/ephemeral/sean/sheet_tracing`:
 
 | path | what |
 | --- | --- |
 | `villa/vesuvius/src/vesuvius/neural_tracing/sheet_tracing/` | the code (a copy of this package); `output/` holds the runs, `configs/` the configs |
-| `data/` | `s1_ds2.zarr` (levels 0 and 1 decompressed in place), `m7_ds2.zarr`, `fiber_presence.ome.zarr` (array `3` decompressed), both patch sets, `hard_windows_m7_len2.json` |
+| `data/` | `s1_ds2.zarr` (levels 0 and 1 decompressed in place), both Scroll 1 patch sets, `cut_windings_square/`, `unseen/PHerc0139` and `unseen/PHerc1667` (volumes and train patches), `afv/` (the PHercParis4 AFV, `paris4_H_fiber_runs.jsonl`, `paris4_fiber_pool/`), `fibers/`, `umbilicus_s1_ds2.json` |
 | `logs/` | `RUN.log` (training output, tqdm with `\r`) and `RUN.pid` |
-| `env.sh`, `launch.sh` | environment, and the detached launcher |
+| `env.sh`, `launch.sh` | the environment, and the detached launcher |
 | `cache/` | all temp and cache files |
-| `schedule_round*.sh` | old job chains (finished; examples of waiting on a run with `kill -0 $(cat logs/RUN.pid)`) |
 
-**Sync the code** after changing it here (configs are created on the H100, so they are excluded):
+**Sync the code** after changing it here. Configs are excluded because they are created on the H100:
 
 ```bash
 cd vesuvius/src/vesuvius/neural_tracing/sheet_tracing
@@ -159,7 +171,7 @@ rsync -a --exclude output/ --exclude __pycache__/ --exclude configs/ ./ \
 ssh ubuntu@147.224.219.64
 source /ephemeral/sean/sheet_tracing/env.sh
 O=$B/villa/vesuvius/src/vesuvius/neural_tracing/sheet_tracing/output
-$B/launch.sh 7 remote_m7_fix.json my_run --init $O/ctx2_m7_len2/last.pt   # GPU, config, run name, train args
+$B/launch.sh 7 configs/remote_l0_fiber_ft.json my_run --init $O/remote_l0_points_ft/last.pt   # GPU, config, name, train args
 ```
 
 **Monitor:**
@@ -173,8 +185,8 @@ nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv
 The H100's clock and logs are in UTC (Chicago is UTC-5 in summer).
 
 **Stop:**
+
 * Send `kill -TERM $(cat $B/logs/my_run.pid)`. The trainer exits cleanly and shuts down its loader workers.
-  `last.pt` is saved every 1,000 iterations.
 * Do not use `pkill -f PATTERN`: it also matches any shell whose command line contains the pattern, including the
   one running it.
 * Afterwards, check for leftover workers with `ps -eo pid,ppid,args | grep multiprocess | grep ephemeral/sean/villa`.
@@ -189,5 +201,4 @@ rsync -a --exclude '*.pt' $O/my_run $L/ && rsync -a --include 'ckpt_*.pt' --incl
 rsync -a $R/logs/ $L/logs/
 ```
 
-Then benchmark it locally with `scripts/bench_local.sh` against the models in section 1, and record the result in
-`output/remote/RESULTS.md`.
+Then benchmark it, and record the result in `output/remote/RESULTS.md`.

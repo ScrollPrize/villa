@@ -27,10 +27,6 @@
   "worker_cache_mb": 256,
   "max_tries": 200,
   "anchor_tries": 8,
-  "extra_volumes": [],
-  "tight_blocks": true,
-  "extra_levels": [],
-  "extra_level_dirs": [],
   "patch_volumes": [
    "",
    "",
@@ -78,9 +74,7 @@
   "heads": 8,
   "mlp_ratio": 8.0,
   "memory_rows": 3,
-  "attention": true,
   "dropout": 0.0,
-  "surface_tokens": true,
   "token_crop": [
    16,
    16,
@@ -97,34 +91,13 @@
    2,
    2
   ],
-  "grid_layers": 4,
-  "context_crop": [],
-  "context_spacing": 6.0,
-  "context_channels": [
-   8,
-   16,
-   32
-  ],
-  "context_strides": [
-   2,
-   2,
-   1
-  ],
-  "residual": true,
   "point_bottleneck": 32,
-  "joint_transformer": true,
   "fiber_follow_mode": true,
   "fiber_tokens": 48
  },
  "trace": {
-  "curve": "hermite",
-  "spline_ctrl": 0,
-  "spline_smooth": 0.01,
   "spline_samples": 6,
-  "respace": true,
-  "confidence_threshold": 0.5,
-  "stopped": "curve",
-  "min_weight": 0.001
+  "confidence_threshold": 0.5
  },
  "loss": {
   "normal": 1.0,

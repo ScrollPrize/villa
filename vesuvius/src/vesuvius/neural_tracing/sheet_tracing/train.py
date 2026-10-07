@@ -7,9 +7,10 @@ averages the per-step losses. The run directory ``output/NAME`` holds config.jso
 best.pt (highest validation score = coverage - kept_off), periodic diagnostics (val_XXXXXX/), and a final long-rollout eval.
 
 Usage:
-  python -m vesuvius.neural_tracing.sheet_tracing.train --config tiny.json --name tiny_v1
-  python -m vesuvius.neural_tracing.sheet_tracing.train --config tiny.json --name tiny_noattn --set model.attention=false
-  python -m vesuvius.neural_tracing.sheet_tracing.train --resume output/tiny_v1/last.pt
+  python -m vesuvius.neural_tracing.sheet_tracing.train --config remote_l0_points_ft.json --init output/l0_joint/last.pt
+  python -m vesuvius.neural_tracing.sheet_tracing.train --config remote_l0_fiber_ft.json \
+      --init output/remote_l0_points_ft/last.pt
+  python -m vesuvius.neural_tracing.sheet_tracing.train --resume output/remote_l0_fiber_ft/last.pt
 """
 from __future__ import annotations
 

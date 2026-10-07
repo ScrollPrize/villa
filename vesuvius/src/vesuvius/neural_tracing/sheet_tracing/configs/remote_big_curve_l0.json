@@ -1,7 +1,0 @@
-{
-  "data": {"volume_level": 0, "front_points": 5, "point_spacing": 60.0, "step": 20.0, "steps": 12, "roi": 512, "patches_dir": ["/ephemeral/sean/sheet_tracing/data/verified_patches_old", "/ephemeral/sean/sheet_tracing/data/verified_patches_working"], "volume": "/ephemeral/sean/sheet_tracing/data/s1_ds2.zarr", "tight_blocks": true},
-  "model": {"crop": [32, 32, 20], "crop_spacing": [1.0, 2.0, 2.0], "channels": [32, 64, 96], "strides": [1, 2, 2], "dim": 192, "layers": 4, "heads": 6, "memory_rows": 3, "surface_tokens": true, "token_crop": [16, 8, 8], "token_spacing": [1.0, 2.0, 2.0], "token_channels": [24, 48, 64], "token_strides": [1, 2, 2], "grid_layers": 4},
-  "trace": {"curve": "hermite", "spline_samples": 6, "stopped": "curve"},
-  "train": {"name": "remote_big_curve_l0", "iterations": 200000, "batch": 32, "workers": 8, "lr": 0.001, "val_every": 2000, "viz_every": 2000, "max_minutes": 300, "ckpt_every": 1000, "val_episodes": 64, "prefetch": 2, "warmup": 500, "keep_every": 5000, "compile_geometry": true},
-  "eval": {"episodes": 32, "steps": 10, "roi": 512}
-}

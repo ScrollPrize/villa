@@ -8,7 +8,7 @@ across code changes for numerical equality). ``--profile`` adds torch.profiler t
 host time) over three iterations. Run it with nothing else on the GPU; host load from other processes shows up in
 the timings, since the step is close to launch-bound.
 
-  python scripts/bench_train_step.py --config remote_l0_joint.json --init output/l0_joint/last.pt
+  python scripts/bench_train_step.py --config remote_l0_fiber_ft.json --init output/remote_l0_fiber_ft/last.pt
 """
 from __future__ import annotations
 

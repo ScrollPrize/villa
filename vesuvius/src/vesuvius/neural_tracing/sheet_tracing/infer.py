@@ -10,8 +10,8 @@ point are written as invalid (-1); the points keep riding the curve, so they rea
 again. Tracing stops after ``--steps``, or once fewer than ``--min-confident`` of the front points have been
 confident for ``--patience`` consecutive steps.
 
-  python -m vesuvius.neural_tracing.sheet_tracing.infer --checkpoint output/tiny_v1/best.pt \\
-      --seed-patch /path/to/patch --line row:40 --range 100:160 --direction + --steps 40 --out output/tiny_v1/traces/t0
+  python -m vesuvius.neural_tracing.sheet_tracing.infer --checkpoint output/remote_l0_points_ft/last.pt \\
+      --seed-patch /path/to/patch --line row:40 --range 100:160 --direction + --steps 40 --out output/remote_l0_points_ft/traces/t0
 """
 from __future__ import annotations
 

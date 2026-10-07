@@ -1,5 +1,4 @@
 """Geometry, sampling and rollout checks on analytic surfaces (no data files needed)."""
-import math
 from pathlib import Path
 
 import numpy as np
@@ -8,13 +7,13 @@ import torch
 
 from vesuvius.neural_tracing.sheet_tracing import config as C
 from vesuvius.neural_tracing.sheet_tracing.geometry import (
-    FrontSpline, point_frames, bspline_basis, carry_stopped, chord_tangents, grid_eval, hermite_dense,
-    onto_confident_curve, project, respace, sheet_distance)
+    point_frames, carry_stopped, chord_tangents, grid_eval, hermite_dense, onto_confident_curve, project, respace,
+    sheet_distance)
 from vesuvius.neural_tracing.sheet_tracing.losses import landing, step_losses, targets
-from vesuvius.neural_tracing.sheet_tracing.model import StraightAdvance, build_model, init_model_state
+from vesuvius.neural_tracing.sheet_tracing.model import build_model
 from vesuvius.neural_tracing.sheet_tracing.rollout import Tracer
 from vesuvius.neural_tracing.sheet_tracing.sampling import crop_offsets, sample_crops
-from vesuvius.neural_tracing.sheet_tracing.seeding import perturb, seed_rows, sheet_jump
+from vesuvius.neural_tracing.sheet_tracing.seeding import seed_rows, sheet_jump
 from vesuvius.neural_tracing.sheet_tracing.data.patches import GridSpec
 
 
@@ -26,47 +25,19 @@ def cylinder_grid(spec, radius=300., center=(400., 400.), z0=300.):
     return torch.tensor(xyz, dtype=torch.float32)[None], torch.ones(1, spec.Gu, spec.Gv, dtype=torch.bool)
 
 
-def test_bspline_partition_of_unity():
-    s = torch.linspace(0, 1, 101)
-    for ctrl in (4, 6, 9):
-        basis = bspline_basis(s, ctrl)
-        assert basis.shape == (101, ctrl)
-        assert torch.allclose(basis.sum(-1), torch.ones(101), atol=1e-5)
-        assert (basis >= -1e-6).all()
+# A small model of the supported architecture (level 1 so a 224 x 360 x 360 block covers the test cylinder).
+SMALL = ['train.amp=none', 'model.dim=32', 'model.heads=2', 'model.layers=2', 'model.mlp_ratio=4', 'data.volume_level=1',
+         'data.front_points=5', 'data.point_spacing=55', 'model.crop=[8,16,8]', 'model.channels=[4,8,8]',
+         'model.strides=[1,2,2]', 'model.point_bottleneck=4', 'model.token_crop=[4,4,4]', 'model.token_channels=[4,8,8]',
+         'model.token_strides=[1,2,2]']
 
 
-def test_spline_reproduces_line_and_respaces():
-    spline = FrontSpline(12, 6, 1e-2, 4, 'cpu')
-    t = torch.linspace(0, 1, 12)
-    line = torch.stack([100*t, 50*t, 0*t], -1)[None]
-    ctrl = spline.fit(line, torch.ones(1, 12), reference=line)
-    assert torch.allclose(spline.at_front_points(ctrl), line, atol=1e-3)
-    out = respace(spline.dense(ctrl), 12)
+def test_respace_spaces_the_curve_evenly():
+    t = torch.linspace(0, 1, 5)**2  # unevenly spaced points on a line
+    line = torch.stack([240*t, 0*t, 0*t], -1)[None]
+    out = respace(hermite_dense(line, chord_tangents(line), 6), 5)
     gaps = (out[:, 1:]-out[:, :-1]).norm(dim=-1)
-    assert torch.allclose(gaps, gaps.mean().expand_as(gaps), atol=1e-3)
-
-
-def test_spline_keeps_curvature():
-    """Translating a curved front with uniform displacement leaves its shape unchanged."""
-    spline = FrontSpline(12, 6, 1., 4, 'cpu')
-    theta = torch.linspace(0, 1.2, 12)
-    arc = torch.stack([300*torch.cos(theta), 300*torch.sin(theta), 0*theta], -1)[None]
-    moved = arc+torch.tensor([0., 0., 20.])
-    fitted = spline.at_front_points(spline.fit(moved, torch.ones(1, 12), reference=arc))
-    assert (fitted-moved).norm(dim=-1).max() < .05
-
-
-def test_spline_carries_stopped_point():
-    """A stopped point with a wild prediction barely moves the spline."""
-    spline = FrontSpline(12, 6, 1e-2, 4, 'cpu')
-    t = torch.linspace(0, 1, 12)
-    line = torch.stack([100*t, 0*t, 0*t], -1)[None]
-    wild = line.clone()
-    wild[0, 5, 1] = 40.
-    weights = torch.ones(1, 12)
-    weights[0, 5] = 1e-3
-    fitted = spline.at_front_points(spline.fit(wild, weights, reference=line))
-    assert fitted[0, 5, 1].abs() < .5
+    assert torch.allclose(gaps, torch.full_like(gaps, 60.), atol=.5)
 
 
 def test_projection_on_cylinder():
@@ -102,69 +73,6 @@ def test_crop_sampling_finds_bright_plane():
     crops = sample_crops(block, origin, 1, pos, frames, offsets)
     profile = crops[0, 0, 0, :, 2, 2]
     assert int(profile.argmax()) == 8-4
-
-
-@pytest.mark.parametrize('attention,curve,grid,stopped', [(True, 'smoothing', False, 'displacement'),
-                                                          (False, 'smoothing', False, 'displacement'),
-                                                          (True, 'hermite', False, 'displacement'),
-                                                          (True, 'hermite', True, 'displacement'),
-                                                          (True, 'hermite', True, 'curve'),
-                                                          (True, 'hermite', True, 'context'),
-                                                          (True, 'smoothing', True, 'displacement')])
-def test_rollout_step_backward(attention, curve, grid, stopped):
-    cfg = C.load(None, [f'model.attention={str(attention).lower()}', 'train.amp=none', 'model.dim=32',
-                        'model.channels=[4,8]', 'model.strides=[2,2]', 'model.heads=2', f'trace.curve={curve}',
-                        f'model.surface_tokens={str(grid).lower()}', 'model.token_channels=[4,8]',
-                        'model.token_strides=[2,2]', f'trace.stopped={"curve" if stopped == "context" else stopped}']
-                 +(['model.context_crop=[8,8,8]', 'model.context_channels=[4,8]', 'model.context_strides=[2,2]']
-                   if stopped == 'context' else [])
-                 +(['data.front_points=5', 'data.point_spacing=55'] if curve == 'hermite' else []))
-    spec = GridSpec.for_episode(cfg.data, cfg.data.steps)
-    gt, valid = cylinder_grid(spec)
-    block = torch.rand(1, 1, 224, 360, 360)*255  # level 1: covers the cylinder (z < 448, x, y < 720)
-    origin = torch.zeros(1, 3, dtype=torch.long)
-    model = build_model(cfg)
-    torch.nn.init.normal_(model.head.weight, std=1e-2)  # the zero-initialised head would block every gradient
-    tracer = Tracer(model, cfg, 'cpu')
-    front = tracer.initial(seed_rows(gt, valid, cfg, spec, noise=False))
-    total = 0.
-    for _ in range(3):
-        out = tracer.step(front, block, origin)
-        loss, stats = step_losses(out, front, gt, valid, cfg)
-        assert torch.isfinite(loss)
-        assert stats['supervised'] > .9
-        total = total+loss
-        front = tracer.advance(front, out)
-        tracer.move(front, perturb(front.pos, gt, valid, cfg, torch.tensor([True]))[0])
-    total.backward()
-    assert all(p.grad is not None and p.grad.abs().sum() > 0
-               for n, p in model.encoder.named_parameters() if n.endswith('weight'))
-    assert model.head.weight.grad.abs().sum() > 0
-    if grid:
-        assert len(front.grid) == 3 and front.grid[-1][0].shape == (1, tracer.columns, cfg.model.dim)
-        # (Conv biases feeding a per-channel GroupNorm get no gradient, so check weights.)
-        assert all(p.grad is not None and p.grad.abs().sum() > 0
-                   for n, p in model.token_encoder.named_parameters() if n.endswith('weight'))
-        # Front points sit on the curve's columns.
-        assert torch.allclose(front.curve[:, tracer.point_cols], front.pos, atol=1e-3)
-
-
-def test_straight_advance_on_cylinder_axis():
-    """Advancing straight along a cylinder's axis stays exactly on the sheet."""
-    cfg = C.load(None, ['train.amp=none'])
-    spec = GridSpec.for_episode(cfg.data, cfg.data.steps)
-    gt, valid = cylinder_grid(spec)
-    tracer = Tracer(StraightAdvance(), cfg, 'cpu')
-    front = tracer.initial(seed_rows(gt, valid, cfg, spec, noise=False))
-    block = torch.zeros(1, 1, 8, 8, 8)
-    for _ in range(4):
-        out = tracer.step(front, block, torch.zeros(1, 3, dtype=torch.long))
-        front = tracer.advance(front, out)
-    _, foot, frame, ok = project(gt, valid, front.pos)
-    assert ok.all()
-    # Smoothing the change (not the shape) keeps a curved front on the cylinder.
-    assert sheet_distance(front.pos, foot, frame).abs().max() < .1
-    assert math.isclose(float((front.pos[..., 2]-300.).mean()), 4*cfg.data.step, abs_tol=.5)
 
 
 def test_same_sheet_label_and_jump():
@@ -208,11 +116,12 @@ def test_carry_stopped_interpolates_neighbours():
     assert torch.equal(carry_stopped(disp, torch.zeros_like(confident)), disp)
 
 
-def test_hermite_straight_advance_on_cylinder_axis():
-    cfg = C.load(None, ['train.amp=none', 'trace.curve=hermite', 'data.front_points=5', 'data.point_spacing=55'])
+def test_straight_advance_on_cylinder_axis():
+    """The zero-initialised head predicts a straight advance: along a cylinder's axis it stays on the sheet."""
+    cfg = C.load(None, SMALL+['trace.confidence_threshold=.4'])
     spec = GridSpec.for_episode(cfg.data, cfg.data.steps)
     gt, valid = cylinder_grid(spec)
-    tracer = Tracer(StraightAdvance(), cfg, 'cpu')
+    tracer = Tracer(build_model(cfg), cfg, 'cpu')
     front = tracer.initial(seed_rows(gt, valid, cfg, spec, noise=False))
     block = torch.zeros(1, 1, 8, 8, 8)
     for _ in range(4):
@@ -225,7 +134,7 @@ def test_hermite_straight_advance_on_cylinder_axis():
 
 def test_sheet_jump_snaps_to_neighbouring_sheet():
     """With a volume, pushed front_points land on the bright neighbouring sheet, not at a fixed distance."""
-    cfg = C.load(None, ['train.amp=none'])
+    cfg = C.load(None, ['train.amp=none', 'data.volume_level=1'])
     spec = GridSpec.for_episode(cfg.data, cfg.data.steps)
     u, v = np.meshgrid(spec.u_vals, spec.v_vals, indexing='ij')
     plane = np.stack([100+v, np.full_like(u, 200.), 100+u], -1)  # the sheet y = 200, normal along y
@@ -258,63 +167,18 @@ def test_onto_confident_curve_returns_stopped_points_to_the_sheet():
     assert torch.equal(onto_confident_curve(off, none), off)
 
 
-def test_context_branch_starts_as_the_checkpoint():
-    """Initialising a context model from a checkpoint without context reproduces the checkpoint's outputs."""
-    small = ['train.amp=none', 'model.dim=32', 'model.channels=[4,8]', 'model.strides=[2,2]', 'model.heads=2',
-             'trace.curve=hermite', 'data.front_points=5']
-    base = build_model(C.load(None, small))
-    torch.nn.init.normal_(base.head.weight, std=.1)
-    ctx_cfg = C.load(None, small+['model.context_crop=[8,8,8]', 'model.context_channels=[4,8]',
-                                  'model.context_strides=[2,2]'])
-    ctx = build_model(ctx_cfg)
-    init_model_state(ctx, base.state_dict())
-    crops = torch.randn(2, 5, 1, *ctx_cfg.model.crop)
-    geom = torch.randn(2, 5, 16)
-    context = torch.randn(2, 5, 1, 8, 8, 8)
-    a = base(crops, geom)
-    b = ctx(crops, geom, context=context)
-    assert torch.equal(a[0], b[0]) and torch.equal(a[1], b[1])
-    with pytest.raises(Exception):  # a checkpoint missing non-optional weights still fails
-        init_model_state(ctx, {k: v for k, v in base.state_dict().items() if not k.startswith('head.')})
-
-
-def test_extra_channel_crops_and_init():
-    """Extra volumes become scaled crop channels; a 1-channel checkpoint initialises a 2-channel model unchanged."""
-    block = torch.zeros(1, 2, 32, 32, 32)
-    block[0, 0] = torch.rand(32, 32, 32)*200
-    block[0, 1, :, 16] = 255.
-    offsets = crop_offsets([8, 4, 4], 1., 0., 'cpu')
-    crops = sample_crops(block, torch.zeros(1, 3, dtype=torch.long), 0, torch.tensor([[[16., 16., 16.]]]),
-                         torch.eye(3)[None, None], offsets)
-    assert crops.shape == (1, 1, 2, 8, 4, 4)
-    assert abs(float(crops[0, 0, 0].mean())) < 1e-4 and abs(float(crops[0, 0, 0].std(unbiased=False))-1) < 1e-3
-    # samples straddle the bright plane at half-voxel offsets: interpolated 255 * 0.5, scaled to 0.5 (not z-scored)
-    assert float(crops[0, 0, 1].max()) == .5 and float(crops[0, 0, 1].min()) == 0.
-    small = ['train.amp=none', 'model.dim=32', 'model.channels=[4,8]', 'model.strides=[2,2]', 'model.heads=2',
-             'trace.curve=hermite', 'data.front_points=5']
-    one = build_model(C.load(None, small))
-    torch.nn.init.normal_(one.head.weight, std=.1)
-    two = build_model(C.load(None, small+['data.extra_volumes=["/surface.zarr"]']))
-    init_model_state(two, one.state_dict())
-    x = torch.randn(2, 5, 1, *C.load(None, small).model.crop)
-    geom = torch.randn(2, 5, 16)
-    with_extra = torch.cat([x, torch.rand_like(x)], 2)
-    assert torch.equal(one(x, geom)[0], two(with_extra, geom)[0])
-
-
 def test_front_length_loss_penalises_stretch():
     """The front-length term is zero for a front at its seed length and grows when it stretches."""
     from vesuvius.neural_tracing.sheet_tracing.rollout import StepOutput
-    cfg = C.load(None, ['train.amp=none', 'trace.curve=hermite', 'data.front_points=5', 'data.point_spacing=55',
-                        'loss.front_length=1.'])
+    cfg = C.load(None, SMALL+['loss.front_length=1.'])
     spec = GridSpec.for_episode(cfg.data, cfg.data.steps)
     gt, valid = cylinder_grid(spec, radius=10000.)  # nearly flat: arc length ~ chord length
     seeds = seed_rows(gt, valid, cfg, spec, noise=False)
-    front = Tracer(StraightAdvance(), cfg, 'cpu').initial(seeds)
+    front = Tracer(build_model(cfg), cfg, 'cpu').initial(seeds)
     def stats_for(scale):
         pos = front.pos[:, :1]+(front.pos-front.pos[:, :1])*scale
         dense = hermite_dense(pos, chord_tangents(pos), cfg.trace.spline_samples)
-        out = StepOutput(pos, torch.zeros(1, 5), pos, dense, torch.zeros(1, 5, 1), torch.eye(3).expand(1, 5, 3, 3))
+        out = StepOutput(pos, torch.zeros(1, 5), pos, dense, torch.zeros(1, 5, 1), torch.eye(3).expand(1, 5, 3, 3), None)
         return step_losses(out, front, gt, valid, cfg)[1]['gap_excess']
     assert stats_for(1.) < .1
     assert abs(float(stats_for(1.2))-11.) < .5  # 20% stretch of 55 vx gaps
@@ -368,8 +232,7 @@ def test_trace_end_to_end_on_a_small_volume(tmp_path):
                 block = vol[kz*chunk:(kz+1)*chunk, ky*chunk:(ky+1)*chunk, kx*chunk:(kx+1)*chunk]
                 (root/f'{kz}.{ky}.{kx}').write_bytes(np.ascontiguousarray(block).tobytes())
     cfg = C.load(None, ['train.amp=none', 'model.dim=32', 'model.channels=[4,8]', 'model.strides=[2,2]',
-                        'model.heads=2', 'trace.curve=hermite', 'model.surface_tokens=true',
-                        'model.token_channels=[4,8]', 'model.token_strides=[2,2]', 'trace.stopped=curve',
+                        'model.heads=2', 'model.token_channels=[4,8]', 'model.token_strides=[2,2]',
                         f'data.volume="{tmp_path/"vol.zarr"}"', f'data.volume_level={level}'])
     model = build_model(cfg)
     seed = np.stack([np.full(5, 60.5), np.linspace(20, 100, 5), np.full(5, 20.)], 1)  # on the sheet, along y
@@ -380,97 +243,19 @@ def test_trace_end_to_end_on_a_small_volume(tmp_path):
     assert confs.shape == rows.shape[:2] and connected_keep(confs, .5)[0].all()
 
 
-def test_coarse_extra_channel_sampled_at_its_own_level():
-    """A level-1 extra volume, read as its own block and sampled at level-0 points, gives the trilinear value at
-    the corresponding level-1 coordinates (exact for a linear field), including the block-origin bookkeeping."""
-    from vesuvius.neural_tracing.sheet_tracing.data.episodes import extra_block
-
-    class Array:  # ChunkedArray.read semantics
-        def __init__(self, data):
-            self.data = data
-
-        def read(self, start, size):
-            out = np.zeros(tuple(int(v) for v in size), self.data.dtype)
-            lo = np.maximum(start, 0)
-            hi = np.minimum(np.asarray(start)+size, self.data.shape)
-            if np.all(hi > lo):
-                out[tuple(slice(a-s, b-s) for a, b, s in zip(lo, hi, start))] = \
-                    self.data[tuple(slice(a, b) for a, b in zip(lo, hi))]
-            return out
-
-    z, y, x = np.meshgrid(*[np.arange(n, dtype=np.float32) for n in (40, 40, 40)], indexing='ij')
-    coarse = Array((10+2*z+1.5*y+x).astype(np.float32))  # level-1 voxel indices, linear
-    ct_origin, ct_size = np.array([20, 22, 24]), (24, 24, 24)  # a level-0 CT block (zyx)
-    eb, eo = extra_block(coarse, 1, ct_origin, ct_size, 0)
-    block = torch.rand(1, 1, *ct_size)
-    pos = torch.tensor([[[30.3, 31.7, 29.2], [35.1, 28.4, 33.9]]])  # level-0 xyz inside the CT block
-    offsets = crop_offsets([3, 3, 3], 1., 0., 'cpu')
-    crops = sample_crops(block, torch.from_numpy(ct_origin)[None], 0, pos, torch.eye(3).expand(1, 2, 3, 3), offsets,
-                         [(torch.from_numpy(eb)[None, None], torch.from_numpy(eo)[None], 1)])
-    assert crops.shape == (1, 2, 2, 3, 3, 3)
-    world = pos[0][:, None, None, None]+offsets[None]  # (N, Sn, St, Sa, 3) xyz
-    level1 = (world+.5)/2-.5
-    want = (10+2*level1[..., 2]+1.5*level1[..., 1]+level1[..., 0])/255.
-    assert torch.allclose(crops[0, :, 1], want, atol=1e-4)
-    same, so = extra_block(coarse, 0, ct_origin, ct_size, 0)  # at the CT's level: exactly its region
-    assert np.array_equal(so, ct_origin) and same.shape == ct_size
-
-
-
-
-GRID_SMALL = ['train.amp=none', 'model.dim=32', 'model.channels=[4,8]', 'model.strides=[2,2]', 'model.heads=2',
-              'trace.curve=hermite', 'trace.stopped=curve', 'data.front_points=5', 'data.point_spacing=55',
-              'model.surface_tokens=true', 'model.token_channels=[4,8]', 'model.token_strides=[2,2]']
-LONG_MEMORY = ['model.memory_lags=[1,2,3,6,12]', 'model.memory_anchor=true', 'model.profile_crop=[32,3,3]',
-               'model.profile_channels=[4,8]', 'model.profile_strides=[2,2]']
-
-
-def test_profile_and_long_memory_start_as_the_checkpoint():
-    """Initialised from a grid model without them, normal profiles and lagged/anchor memory change nothing while the
-    memory holds no more than the checkpoint's 3 rows; afterwards the grid holds the lag rows plus the anchor."""
-    base_cfg = C.load(None, GRID_SMALL)
-    new_cfg = C.load(None, GRID_SMALL+LONG_MEMORY)
-    spec = GridSpec.for_episode(base_cfg.data, base_cfg.data.steps)
-    gt, valid = cylinder_grid(spec)
-    block = torch.rand(1, 1, 224, 360, 360)*255
-    origin = torch.zeros(1, 3, dtype=torch.long)
-    base = build_model(base_cfg)
-    torch.nn.init.normal_(base.head.weight, std=1e-2)
-    new = build_model(new_cfg)
-    init_model_state(new, base.state_dict())
-    tracers = Tracer(base, base_cfg, 'cpu'), Tracer(new, new_cfg, 'cpu')
-    fronts = [t.initial(seed_rows(gt, valid, base_cfg, spec, noise=False)) for t in tracers]
-    with torch.no_grad():
-        for _ in range(4):  # grid rows 0..3 before each step: within the checkpoint's memory
-            outs = [t.step(f, block, origin) for t, f in zip(tracers, fronts)]
-            assert torch.allclose(outs[0].pred, outs[1].pred, atol=1e-5)
-            assert torch.allclose(outs[0].conf_logit, outs[1].conf_logit, atol=1e-5)
-            fronts = [t.advance(f, o) for t, f, o in zip(tracers, fronts, outs)]
-        for _ in range(10):
-            fronts[1] = tracers[1].advance(fronts[1], tracers[1].step(fronts[1], block, origin))
-    front = fronts[1]
-    assert front.rows == 14 and len(front.grid) == 12 and front.anchor is not None
-    grid, _ = tracers[1]._grid(front, point_frames(front.pos, front.prev), block, origin)
-    assert grid['past'].shape[1] == 6  # lags 1, 2, 3, 6, 12 and the anchor
-    assert grid['geom'].shape[-1] == 19 and grid['profile'].shape[:4] == (1, tracers[1].columns, 1, 32)
-    assert float(grid['geom'][0, 0, 0, -1]) == 1. and float(grid['geom'][0, 1:, 0, -1].abs().sum()) == 0.
-
-
-def test_history_warm_up_rollout_trains_the_new_inputs():
+def test_history_warm_up_rollout_trains():
     from vesuvius.neural_tracing.sheet_tracing.train import train_rollout
-    cfg = C.load(None, GRID_SMALL+LONG_MEMORY+['train.history_rows=3', 'data.history=4', 'data.steps=3'])
+    cfg = C.load(None, SMALL+['train.history_rows=3', 'data.history=4', 'data.steps=3'])
     spec = GridSpec.for_episode(cfg.data, cfg.data.steps)
     gt, valid = cylinder_grid(spec)
-    b = dict(gt=gt, valid=valid, block=torch.rand(1, 1, 224, 360, 360)*255, origin=torch.zeros(1, 3, dtype=torch.long),
-             extras=[])
+    b = dict(gt=gt, valid=valid, block=torch.rand(1, 1, 224, 360, 360)*255, origin=torch.zeros(1, 3, dtype=torch.long))
     model = build_model(cfg)
     torch.nn.init.normal_(model.head.weight, std=1e-2)
     generator = torch.Generator().manual_seed(1)
     loss, stats, _, _ = train_rollout(Tracer(model, cfg, 'cpu'), b, cfg, spec, generator)
     assert torch.isfinite(loss) and stats['supervised'] > .9
     loss.backward()
-    assert model.profile_proj.weight.grad.abs().sum() > 0
-    assert model.token_geometry[0].weight.grad[:, -2:].abs().sum() > 0  # lag features
+    assert model.token_geometry[0].weight.grad.abs().sum() > 0  # the grid memory the warm-up filled is read
 
 
 def test_real_switch_needs_several_points_or_a_far_one():
@@ -513,10 +298,10 @@ def test_live_chain_continuation_window(tmp_path):
         _tifffile.imwrite(patch/f'{name}.tif', values.astype(np.float32))
     (patch/'meta.json').write_text(_json.dumps(dict(scale=[.5, .5])))
     _write_volume(tmp_path/'vol.zarr')
-    cfg = C.load(None, [f'data.patches_dir="{tmp_path/"patches"}"', f'data.volume="{tmp_path/"vol.zarr"}"',
+    cfg = C.load(None, [f'data.patches_dir="{tmp_path/"patches"}"', f'data.volume="{tmp_path/"vol.zarr"}"', 'data.volume_level=1',
                         'data.front_points=3', 'data.point_spacing=20', 'data.step=10', 'data.steps=2',
-                        'data.gt_margin=10', 'data.gt_resolution=2', 'data.roi=512', 'data.tight_blocks=true',
-                        'data.val_fraction=0', 'data.min_valid_fraction=.5', 'trace.curve=hermite'])
+                        'data.gt_margin=10', 'data.gt_resolution=2', 'data.roi=512',
+                        'data.val_fraction=0', 'data.min_valid_fraction=.5'])
     sampler = EpisodeSampler(cfg.data, build_index(cfg.data.patches_dir, tmp_path/'cache'), 'train', 2, 512, 10.)
     rng = np.random.default_rng(0)
     assert any(sampler.sample(rng) is not None for _ in range(20))  # fresh episodes still draw
@@ -538,14 +323,13 @@ def test_live_chains_resume_where_the_model_left_off():
     import queue as _queue
     from vesuvius.neural_tracing.sheet_tracing.live import LiveChains
     from vesuvius.neural_tracing.sheet_tracing.train import train_rollout
-    cfg = C.load(None, GRID_SMALL+['model.memory_lags=[1,2,3]', 'train.live_chains=true',
-                                   'data.tight_blocks=true', 'data.steps=3', 'train.chain_steps=[3,30]', 'train.batch=1',
-                                   'train.chain_on_sheet=0', 'trace.confidence_threshold=.4', 'train.free_fraction=1',
-                                   'train.jump_probability=0'])
+    cfg = C.load(None, SMALL+['train.live_chains=true', 'data.steps=3', 'train.chain_steps=[3,30]', 'train.batch=1',
+                              'train.chain_on_sheet=0', 'trace.confidence_threshold=.4', 'train.free_fraction=1',
+                              'train.jump_probability=0'])
     spec = GridSpec.for_episode(cfg.data, cfg.data.steps)
     gt, valid = cylinder_grid(spec)
     b = dict(gt=gt, valid=valid, block=torch.rand(1, 1, 224, 360, 360)*255, origin=torch.zeros(1, 3, dtype=torch.long),
-             extras=[], meta=[dict(patch='p', root='r', axis=0, sign_u=1, sign_v=1, anchor=[5., 5.])])
+             meta=[dict(patch='p', root='r', axis=0, sign_u=1, sign_v=1, anchor=[5., 5.])])
     model = build_model(cfg)
     tracer = Tracer(model, cfg, 'cpu')
     jobs = _queue.Queue(4)
@@ -561,7 +345,7 @@ def test_live_chains_resume_where_the_model_left_off():
     assert torch.equal(resumed['front'].pos, front.pos) and int(resumed['steps'][0]) == 3
     with torch.no_grad():
         _, _, front2, _ = train_rollout(tracer, b, cfg, spec, torch.Generator().manual_seed(2), resumed['front'])
-    assert front2.rows == 6 and len(front2.grid) == 3  # memory is full after a rollout
+    assert len(front2.grid) == 3  # memory is full after a rollout
     assert chains.begin(dict(b, chains=[(job['id'], 0)]), 2)[1] is None  # consumed
     # Two jobs' chains share a batch; a chain whose state is gone is dropped with its episode.
     chains.finish(b, resumed, front2, confs, 3)
@@ -585,7 +369,7 @@ def test_live_chains_resume_where_the_model_left_off():
 def test_ema_weights_average_and_are_what_evaluation_loads(tmp_path):
     from vesuvius.neural_tracing.sheet_tracing.evaluate import load_checkpoint
     from vesuvius.neural_tracing.sheet_tracing.train import EMA, save
-    cfg = C.load(None, GRID_SMALL+['train.ema=0.9'])
+    cfg = C.load(None, SMALL+['train.ema=0.9'])
     model = build_model(cfg)
     ema = EMA(model, cfg.train.ema)
     before = {k: v.clone() for k, v in ema.model.state_dict().items()}
@@ -619,10 +403,10 @@ def test_hard_spot_episodes_start_at_the_recorded_spot(tmp_path):
     spots = tmp_path/'hard.json'
     spots.write_text(_json.dumps(dict(records=[dict(dir=0, patch='p0', axis=0, sign_u=1, sign_v=1, anchor=[20., 5.],
                                                     shift=20., step=8, kind='stop')])))
-    overrides = [f'data.patches_dir=["{tmp_path/"patches"}"]', f'data.volume="{tmp_path/"vol.zarr"}"',
+    overrides = [f'data.patches_dir=["{tmp_path/"patches"}"]', f'data.volume="{tmp_path/"vol.zarr"}"', 'data.volume_level=1',
                  'data.front_points=3', 'data.point_spacing=20', 'data.step=10', 'data.steps=2', 'data.gt_margin=10',
-                 'data.gt_resolution=2', 'data.roi=512', 'data.tight_blocks=true', 'data.min_valid_fraction=.5',
-                 'trace.curve=hermite', f'data.hard_windows="{spots}"', 'data.hard_fraction=1']
+                 'data.gt_resolution=2', 'data.roi=512', 'data.min_valid_fraction=.5',
+                 f'data.hard_windows="{spots}"', 'data.hard_fraction=1']
     index = build_index(C.load(None, overrides).data.patches_dir, tmp_path/'cache')
     cfg = C.load(None, overrides+['data.val_fraction=0'])
     rng = np.random.default_rng(0)
@@ -653,15 +437,8 @@ def test_index_uses_measured_cell_when_meta_scale_is_wrong(tmp_path):
     assert abs(infos['close'].cell-1/.45) < 1e-6 and not infos['close'].stated_cell  # within tolerance: as stated
 
 
-JOINT_SMALL = ['train.amp=none', 'model.dim=32', 'model.heads=2', 'model.layers=2', 'model.mlp_ratio=4',
-               'trace.curve=hermite', 'trace.stopped=curve', 'data.front_points=5', 'data.point_spacing=55',
-               'model.surface_tokens=true', 'model.residual=true', 'model.joint_transformer=true',
-               'model.crop=[8,16,8]', 'model.channels=[4,8,8]', 'model.strides=[1,2,2]', 'model.point_bottleneck=4',
-               'model.token_crop=[4,4,4]', 'model.token_channels=[4,8,8]', 'model.token_strides=[1,2,2]']
-
-
 def test_residual_joint_model_rollout_trains_every_part():
-    cfg = C.load(None, JOINT_SMALL)
+    cfg = C.load(None, SMALL)
     spec = GridSpec.for_episode(cfg.data, cfg.data.steps)
     gt, valid = cylinder_grid(spec)
     block = torch.rand(1, 1, 224, 360, 360)*255
@@ -690,11 +467,11 @@ def test_backward_per_step_gives_the_same_gradient():
     from vesuvius.neural_tracing.sheet_tracing.train import train_rollout
     grads = []
     for per_step in (False, True):
-        cfg = C.load(None, JOINT_SMALL+['data.steps=3', f'train.backward_per_step={str(per_step).lower()}'])
+        cfg = C.load(None, SMALL+['data.steps=3', f'train.backward_per_step={str(per_step).lower()}'])
         spec = GridSpec.for_episode(cfg.data, cfg.data.steps)
         gt, valid = cylinder_grid(spec)
         b = dict(gt=gt, valid=valid, block=torch.rand(1, 1, 224, 360, 360, generator=torch.Generator().manual_seed(3))*255,
-                 origin=torch.zeros(1, 3, dtype=torch.long), extras=[])
+                 origin=torch.zeros(1, 3, dtype=torch.long))
         torch.manual_seed(0)
         model = build_model(cfg)
         torch.nn.init.normal_(model.head.weight, std=1e-2)
@@ -707,9 +484,9 @@ def test_backward_per_step_gives_the_same_gradient():
 
 def test_residual_crops_must_divide():
     with pytest.raises(ValueError):
-        C.load(None, JOINT_SMALL+['model.crop=[8,16,10]'])  # 10 is not divisible by 4 (two stride-2 stages)
+        C.load(None, SMALL+['model.crop=[8,16,10]'])  # 10 is not divisible by 4 (two stride-2 stages)
     with pytest.raises(ValueError):
-        C.load(None, JOINT_SMALL+['model.residual=false'])  # the bottleneck needs the residual encoder
+        C.load(None, SMALL+['model.residual=false'])  # a removed model type: rejected, not silently dropped
 
 
 def test_patch_directories_on_their_own_volumes_and_weights(tmp_path):
@@ -727,10 +504,10 @@ def test_patch_directories_on_their_own_volumes_and_weights(tmp_path):
         (d/'p0'/'meta.json').write_text(_json.dumps(dict(scale=[.5, .5])))
     _write_volume(tmp_path/'vol_a.zarr', shape=(128, 64, 64))  # the sheet at the patches (level-1 x 30)
     _write_volume(tmp_path/'vol_b.zarr', shape=(128, 64, 64), sheet_x=5)  # far from them
-    base = [f'data.patches_dir=["{dirs[0]}", "{dirs[1]}"]', f'data.volume="{tmp_path/"vol_a.zarr"}"',
+    base = [f'data.patches_dir=["{dirs[0]}", "{dirs[1]}"]', f'data.volume="{tmp_path/"vol_a.zarr"}"', 'data.volume_level=1',
             f'data.patch_volumes=["", "{tmp_path/"vol_b.zarr"}"]', 'data.front_points=3', 'data.point_spacing=20',
             'data.step=10', 'data.steps=2', 'data.gt_margin=10', 'data.gt_resolution=2', 'data.roi=512',
-            'data.tight_blocks=true', 'data.val_fraction=0', 'data.min_valid_fraction=.5', 'trace.curve=hermite']
+            'data.val_fraction=0', 'data.min_valid_fraction=.5']
     index = build_index(C.load(None, base).data.patches_dir, tmp_path/'cache')
     rng = np.random.default_rng(0)
     for weights, root, peak in (('[1, 0]', dirs[0], 255), ('[0, 1]', dirs[1], 0)):
@@ -747,7 +524,7 @@ def test_patch_directories_on_their_own_volumes_and_weights(tmp_path):
 
 def test_compiled_model_keeps_checkpoint_names():
     from vesuvius.neural_tracing.sheet_tracing.model import compile_model
-    cfg = C.load(None, JOINT_SMALL)
+    cfg = C.load(None, SMALL)
     model = build_model(cfg)
     names = list(model.state_dict())
     compile_model(model)
@@ -762,7 +539,7 @@ def test_device_batches_match_to_device():
     g = torch.Generator().manual_seed(0)
     blocks = lambda: [np.random.default_rng(i).integers(0, 255, (1, 8-i, 6+i, 7), dtype=np.uint8) for i in range(2)]
     batches = [dict(gt=torch.rand(2, 5, 4, 3, generator=g), valid=torch.rand(2, 5, 4, generator=g) > .5,
-                    block=pack_blocks(blocks()), extras=[], origin=torch.randint(0, 9, (2, 3), generator=g),
+                    block=pack_blocks(blocks()), origin=torch.randint(0, 9, (2, 3), generator=g),
                     meta=[{}, {}]) for _ in range(3)]
     device = torch.device('cuda')
     got = list(device_batches(iter(batches), device))
@@ -804,7 +581,7 @@ def test_seeds_from_reuses_earlier_seeds_with_another_front(tmp_path, monkeypatc
         _tifffile.imwrite(patch/f'{name}.tif', values.astype(np.float32))
     (patch/'meta.json').write_text(_json.dumps(dict(scale=[.5, .5])))
     cfg = C.load(None, [f'data.patches_dir="{tmp_path/"patches"}"', 'data.step=10', 'data.gt_margin=10',
-                        'data.gt_resolution=2', 'trace.curve=hermite'])
+                        'data.gt_resolution=2'])
     seeds, _, _ = draw_seeds(cfg, 12, 3, 40., .5, all_val=True, distinct=False)
     assert seeds
     report = tmp_path/'report.json'
@@ -833,10 +610,10 @@ def test_mixed_front_batches_vary_the_point_count(tmp_path):
         _tifffile.imwrite(patch/f'{name}.tif', values.astype(np.float32))
     (patch/'meta.json').write_text(_json.dumps(dict(scale=[.5, .5])))
     _write_volume(tmp_path/'vol.zarr', shape=(128, 128, 64))
-    cfg = C.load(None, [f'data.patches_dir="{tmp_path/"patches"}"', f'data.volume="{tmp_path/"vol.zarr"}"',
+    cfg = C.load(None, [f'data.patches_dir="{tmp_path/"patches"}"', f'data.volume="{tmp_path/"vol.zarr"}"', 'data.volume_level=1',
                         'data.front_points=3', 'data.point_spacing=20', 'data.step=10', 'data.steps=2',
-                        'data.gt_margin=10', 'data.gt_resolution=2', 'data.roi=512', 'data.tight_blocks=true',
-                        'data.val_fraction=0', 'data.min_valid_fraction=.5', 'trace.curve=hermite',
+                        'data.gt_margin=10', 'data.gt_resolution=2', 'data.roi=512',
+                        'data.val_fraction=0', 'data.min_valid_fraction=.5',
                         'data.front_points_range=[3,5]', 'train.points_per_batch=12'])
     variants = front_variants(cfg, build_index(cfg.data.patches_dir, tmp_path/'cache'), 10.)
     assert sorted(variants) == [3, 4, 5] and [v[2] for v in variants.values()] == [4, 3, 2]
@@ -884,7 +661,7 @@ def test_held_out_scoring_seeds_and_mask(tmp_path, monkeypatch):
         _tifffile.imwrite(patch/f'{name}.tif', values.astype(np.float32))
     (patch/'meta.json').write_text(_json.dumps(dict(scale=[.5, .5])))
     cfg = C.load(None, [f'data.patches_dir="{tmp_path/"patches"}"', 'data.step=10', 'data.gt_margin=10',
-                        'data.gt_resolution=2', 'trace.curve=hermite', 'data.split_block=48', 'data.val_fraction=.5'])
+                        'data.gt_resolution=2', 'data.split_block=48', 'data.val_fraction=.5'])
     seeds, spec, data = draw_seeds(cfg, 20, 6, 40., .5, distinct=False, seed_split=True)
     assert seeds
     iu0 = int(round(-spec.u_lo/spec.res))
@@ -1002,7 +779,7 @@ def test_rotated_window_matches_axis_window_and_follows_a_diagonal(tmp_path):
     (patch/'meta.json').write_text(_json.dumps(dict(scale=[.5, .5])))
     info = build_index(tmp_path/'patches', tmp_path/'cache')[0]
     cfg = C.load(None, ['data.front_points=3', 'data.point_spacing=20', 'data.step=10', 'data.steps=2',
-                        'data.gt_margin=10', 'data.gt_resolution=2', 'trace.curve=hermite'])
+                        'data.gt_margin=10', 'data.gt_resolution=2'])
     spec = GridSpec.for_episode(cfg.data, 2)
     store = PatchStore()
     a, va = store.window(info, spec, 0, 1, 1, 40., 30.)
@@ -1033,10 +810,10 @@ def test_fiber_seeded_episodes_start_from_the_fiber(tmp_path):
     rc = np.stack([(xyz[:, 2]-20.)/2, (xyz[:, 1]-20.)/2], 1)
     (tmp_path/'runs.jsonl').write_text(_json.dumps(dict(fiber='f1', root=str(tmp_path/'patches'), patch='p0', start=0.,
                                                         end=float(t[-1]), offset=-2., rc=rc.tolist(), xyz=xyz.tolist()))+'\n')
-    cfg = C.load(None, [f'data.patches_dir="{tmp_path/"patches"}"', f'data.volume="{tmp_path/"vol.zarr"}"',
+    cfg = C.load(None, [f'data.patches_dir="{tmp_path/"patches"}"', f'data.volume="{tmp_path/"vol.zarr"}"', 'data.volume_level=1',
                         'data.front_points=3', 'data.point_spacing=20', 'data.step=10', 'data.steps=2', 'data.gt_margin=10',
-                        'data.gt_resolution=2', 'data.roi=512', 'data.tight_blocks=true', 'data.val_fraction=0',
-                        'data.min_valid_fraction=.5', 'trace.curve=hermite', f'data.fiber_runs="{tmp_path/"runs.jsonl"}"',
+                        'data.gt_resolution=2', 'data.roi=512', 'data.val_fraction=0',
+                        'data.min_valid_fraction=.5', f'data.fiber_runs="{tmp_path/"runs.jsonl"}"',
                         'data.fiber_fraction=1'])
     sampler = EpisodeSampler(cfg.data, build_index(cfg.data.patches_dir, tmp_path/'cache'), 'train', 2, 512, 10.)
     assert len(sampler.fiber_runs) == 1
@@ -1057,14 +834,14 @@ def test_fiber_seeded_episodes_start_from_the_fiber(tmp_path):
 def test_train_rollout_starts_from_provided_seed_rows():
     from vesuvius.neural_tracing.sheet_tracing.seeding import seed_rows
     from vesuvius.neural_tracing.sheet_tracing.train import train_rollout
-    cfg = C.load(None, JOINT_SMALL+['data.steps=1'])
+    cfg = C.load(None, SMALL+['data.steps=1'])
     spec = GridSpec.for_episode(cfg.data, cfg.data.steps)
     gt, valid = cylinder_grid(spec)
     gt, valid = gt.expand(2, -1, -1, -1).contiguous(), valid.expand(2, -1, -1).contiguous()
     rows = seed_rows(gt, valid, cfg, spec, noise=False)
     given = rows+torch.tensor([0., 0., 1.5])  # fiber seeds: 1.5 vx up from the GT rows
     b = dict(gt=gt, valid=valid, block=torch.rand(2, 1, 224, 360, 360)*255, origin=torch.zeros(2, 3, dtype=torch.long),
-             extras=[], seed=given, seed_mask=torch.tensor([True, False]))
+             seed=given, seed_mask=torch.tensor([True, False]))
     tracer = Tracer(build_model(cfg), cfg, 'cpu')
     started = []
     real = tracer.initial
@@ -1093,7 +870,7 @@ def test_fiber_follow_episodes_put_the_middle_column_on_the_fiber(tmp_path):
                                                         end=float(t[-1]), offset=0., rc=rc.tolist(), xyz=xyz.tolist()))+'\n')
     cfg = C.load(None, [f'data.patches_dir="{tmp_path/"patches"}"', 'data.front_points=3', 'data.point_spacing=20',
                         'data.step=10', 'data.steps=4', 'data.gt_margin=10', 'data.gt_resolution=2', 'data.roi=512',
-                        'data.val_fraction=0', 'trace.curve=hermite', f'data.fiber_runs="{tmp_path/"runs.jsonl"}"',
+                        'data.val_fraction=0', f'data.fiber_runs="{tmp_path/"runs.jsonl"}"',
                         'data.fiber_follow=true'])
     sampler = EpisodeSampler(cfg.data, build_index(cfg.data.patches_dir, tmp_path/'cache'), 'train', 4, 512, 10.,
                              region_split=True)
@@ -1114,10 +891,10 @@ def test_fiber_follow_episodes_put_the_middle_column_on_the_fiber(tmp_path):
 
 
 def test_mode_embedding_starts_neutral_and_reaches_the_tokens():
-    cfg = C.load(None, JOINT_SMALL+['model.fiber_follow_mode=true'])
+    cfg = C.load(None, SMALL+['model.fiber_follow_mode=true'])
     model = build_model(cfg)
     assert torch.equal(model.mode_embed, torch.zeros_like(model.mode_embed))
-    plain = build_model(C.load(None, JOINT_SMALL))
+    plain = build_model(C.load(None, SMALL))
     from vesuvius.neural_tracing.sheet_tracing.model import init_model_state
     init_model_state(model, plain.state_dict())  # an older checkpoint without the embedding loads
     with torch.no_grad():
@@ -1130,10 +907,10 @@ def test_mode_embedding_starts_neutral_and_reaches_the_tokens():
     block, origin = torch.rand(1, 1, 224, 360, 360)*255, torch.zeros(1, 3, dtype=torch.long)
     outs = []
     for follow in (False, True):
-        c = C.load(None, JOINT_SMALL+['model.fiber_follow_mode=true', f'data.fiber_follow={str(follow).lower()}'])
+        c = C.load(None, SMALL+['model.fiber_follow_mode=true', f'data.fiber_follow={str(follow).lower()}'])
         tracer = Tracer(model, c, 'cpu')
         with torch.no_grad():
-            outs.append(tracer.step(tracer.initial(seeds), block, origin, []).pred)
+            outs.append(tracer.step(tracer.initial(seeds), block, origin).pred)
     assert not torch.allclose(outs[0], outs[1])  # mode 1 changes the prediction, mode 0 is the plain model
 
 
@@ -1171,7 +948,7 @@ def test_fiber_pool_region_and_episode_instances(tmp_path):
 def test_fiber_tokens_reach_the_model_and_padding_is_inert():
     from vesuvius.neural_tracing.sheet_tracing.data.episodes import FIBER_CODE_DIM
     from vesuvius.neural_tracing.sheet_tracing.seeding import seed_rows
-    cfg = C.load(None, JOINT_SMALL+['model.fiber_tokens=4'])
+    cfg = C.load(None, SMALL+['model.fiber_tokens=4'])
     torch.manual_seed(0)
     model = build_model(cfg)
     torch.nn.init.normal_(model.head.weight, std=1e-2)
@@ -1188,10 +965,10 @@ def test_fiber_tokens_reach_the_model_and_padding_is_inert():
                   fiber_codes=codes)
     empty = dict(fibers, fiber_instance=torch.full((1, 5), -1))
     with torch.no_grad():
-        plain = tracer.step(front, block, origin, []).pred
-        none = tracer.step(front, block, origin, [], empty).pred
-        some = tracer.step(front, block, origin, [], fibers).pred
-        swapped = tracer.step(front, block, origin, [], dict(fibers, fiber_codes=codes.flip(1))).pred
+        plain = tracer.step(front, block, origin).pred
+        none = tracer.step(front, block, origin, empty).pred
+        some = tracer.step(front, block, origin, fibers).pred
+        swapped = tracer.step(front, block, origin, dict(fibers, fiber_codes=codes.flip(1))).pred
     assert torch.allclose(plain, none, atol=1e-5)  # only padding: as without fiber tokens
     assert not torch.allclose(plain, some, atol=1e-4)  # fibers change the prediction
     assert not torch.allclose(some, swapped, atol=1e-5)  # and which instance a point belongs to matters
