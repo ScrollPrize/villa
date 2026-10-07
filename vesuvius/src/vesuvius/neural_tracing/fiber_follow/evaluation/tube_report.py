@@ -163,7 +163,7 @@ def print_tables(report, labels):
             cells = [cell(entry['runs'][l]['metrics'][key], digits) for l in labels if l in entry['runs']]
             for label, diff in entry.get('paired', {}).items():
                 d = diff['metrics'][key]
-                star = '*' if d[1] > 0 or d[2] < 0 else ''
+                star = '*' if len(d) == 3 and (d[1] > 0 or d[2] < 0) else ''
                 cells.append(f'{d[0]:+.{max(digits, 1)}f}{star}')
             print(f'{name:22}' + ''.join(f'{c:>{width}}' for c in cells))
         runs = [entry['runs'][l] for l in labels if l in entry['runs']]
@@ -250,7 +250,10 @@ def main(argv=None):
         if protocol.get('args', {}).get('refit_retry'):
             print(f'{label}: refit retry was on; replay skipped')
             continue
-        gate_plane = args.gate_plane or protocol.get('gate_plane', 16)
+        # A full gate stops on the gate plane's running-minimum confidence; a prefix gate stops when its first plane
+        # fails (it commits fewer planes at a higher threshold too, so a prefix-gate replay is approximate).
+        gate = protocol.get('operating_policy', {}).get('gate', 'full')
+        gate_plane = args.gate_plane or (1 if gate == 'prefix' else protocol.get('gate_plane', 16))
         base = protocol['operating_policy']['confidence']
         for threshold in sorted(t for t in args.replay if t > base+1e-9):
             stops = replay_stops(rows, threshold, gate_plane)

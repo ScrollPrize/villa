@@ -64,6 +64,9 @@ main{max-width:1180px;margin:0 auto;padding:24px 16px 64px}h1{font-size:26px;mar
 border-bottom:1px solid var(--line);padding-bottom:4px}h3{font-size:16px;margin:20px 0 6px}p,li{color:var(--fg)}.muted{color:var(--muted)}
 .wrap{overflow-x:auto;margin:6px 0 14px}table{border-collapse:collapse;min-width:100%;background:var(--card);font-size:14px}
 th,td{border:1px solid var(--line);padding:5px 9px;text-align:right;white-space:nowrap}th:first-child,td:first-child{text-align:left}
+th:first-child,td:first-child{position:sticky;left:0;z-index:1;background:var(--card);box-shadow:1px 0 0 var(--line)}
+th{position:sticky;top:0;z-index:2}th:first-child{z-index:3;background:color-mix(in srgb,var(--accent) 10%,var(--card))}
+.wrap{max-height:80vh}.small{font-size:12px}.bad-text{color:var(--bad)}
 th{background:color-mix(in srgb,var(--accent) 10%,var(--card))}.star{color:var(--bad);font-weight:600}
 figure{margin:10px 0 22px;background:var(--card);border:1px solid var(--line);padding:8px}figure img{width:100%;height:auto;display:block}
 details{margin:10px 0}summary{cursor:pointer;font-size:16px;margin:8px 0}
@@ -76,6 +79,12 @@ margin-right:6px;background:color-mix(in srgb,var(--accent) 15%,var(--card))}.ta
 def esc(text):
     import html
     return html.escape(str(text))
+
+
+def length_cell(correct_mm, wrong_mm):
+    share = wrong_mm/max(correct_mm+wrong_mm, 1e-9)
+    return (f'{correct_mm/1e3:.2f} m / <span class="bad-text">{wrong_mm/1e3:.2f} m</span>'
+            f'<br><span class="muted small">{100*share:.1f}% incorrect</span>')
 
 
 def table(header, rows):
@@ -134,25 +143,24 @@ def html(report, title, traces=None):
            '<nav><a href="#totals">Totals</a><a href="#runs">Runs</a><a href="#outcomes">Outcomes</a><a href="#distance">Distance to mistake</a>'
            '<a href="#stops">Stopping</a><a href="#quality">Quality</a><a href="#matched">Same stop rate</a>'
            '<a href="#curves">Curves</a><a href="#paired">Paired</a><a href="#images">Images</a></nav>']
-    out.append('<h2 id="totals">Total length traced</h2><p class="muted">Correct = on the fiber (in the tube) before the annotation '
-               'end. Incorrect = off the fiber before the annotation end. Length traced past annotation ends is not scored and '
-               'not included.</p>')
-    rows, totals = [], {l: [0., 0.] for l in labels}
-    for source, entry in report['sources'].items():
-        cells = [esc(source)]
-        for label in labels:
-            m = entry['runs'].get(label, {}).get('metrics')
+    out.append('<h2 id="totals">Total length traced</h2><p class="muted">Each cell: length traced on the fiber (correct) / '
+               'off the fiber (incorrect), both before the annotation end; underneath, the incorrect share. Length traced past '
+               'annotation ends is not scored and not included.</p>')
+    sources = list(report['sources'])
+    rows = []
+    for label in labels:
+        cells, correct_all, wrong_all = [f'<b>{esc(label)}</b>'], 0., 0.
+        for source in sources:
+            m = report['sources'][source]['runs'].get(label, {}).get('metrics')
             if m is None:
-                cells += ['-', '-', '-']
+                cells.append('-')
                 continue
             c, w = m['correct_mm'][0], m['incorrect_mm'][0]
-            totals[label][0] += c
-            totals[label][1] += w
-            cells += [f'{c/1e3:.2f} m', f'{w/1e3:.2f} m', pct(w/max(c+w, 1e-9))]
+            correct_all, wrong_all = correct_all+c, wrong_all+w
+            cells.append(length_cell(c, w))
+        cells.append(f'<b>{length_cell(correct_all, wrong_all)}</b>')
         rows.append(cells)
-    rows.append(['<b>all volumes</b>'] + [x for l in labels for x in (f'<b>{totals[l][0]/1e3:.2f} m</b>', f'<b>{totals[l][1]/1e3:.2f} m</b>',
-                                                                       f'<b>{pct(totals[l][1]/max(sum(totals[l]), 1e-9))}</b>')])
-    out.append(table(['volume'] + [f'{l}: {k}' for l in labels for k in ('correct', 'incorrect', 'incorrect share')], rows))
+    out.append(table(['model'] + sources + ['all volumes'], rows))
     out.append('<h2 id="runs">Runs</h2>')
     rows = []
     for label, run in report['runs'].items():
@@ -250,7 +258,7 @@ fiber-bootstrap intervals.</p>""")
                 cells = []
                 for key, _, scale, unit in keys:
                     d = diff['metrics'][key]
-                    star = '<span class="star">*</span>' if d[1] > 0 or d[2] < 0 else ''
+                    star = '<span class="star">*</span>' if len(d) == 3 and (d[1] > 0 or d[2] < 0) else ''
                     cells.append(f"{scale*d[0]:+.{1 if scale == 100 else 3}f}{unit}{star}")
                 rows.append([esc(source), esc(label)] + cells)
         out.append(table(['source', 'run'] + [k[1] for k in keys], rows))

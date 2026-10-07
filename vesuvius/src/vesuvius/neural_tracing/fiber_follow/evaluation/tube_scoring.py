@@ -319,7 +319,8 @@ def compare_tube(rows_a, rows_b, um=None, boot=1000, seed=0):
         ma, mb = group_metrics(sa[pick].sum(0), na[pick], wa[pick], um), group_metrics(sb[pick].sum(0), nb[pick], wb[pick], um)
         draws.append({k: mb[k]-ma[k] for k in ma})
     return dict(shared_traces=len(shared), fibers=len(sa),
-                metrics={k: [value, *np.nanpercentile([d[k] for d in draws], [2.5, 97.5]).tolist()] for k, value in point.items()})
+                metrics={k: [value, *np.nanpercentile([d[k] for d in draws], [2.5, 97.5]).tolist()] if draws else [value]
+                         for k, value in point.items()})
 
 
 def replay_stop(decision_travelled, gate_confidence, threshold, final_was_stop):
