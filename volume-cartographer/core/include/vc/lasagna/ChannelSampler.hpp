@@ -224,9 +224,11 @@ encodeCompactNormalToRaw(const cv::Vec3d& normal);
     bool allowFloat32 = false);
 
 // Typed scalar reads through the same process cache. Interpolate each component
-// before L2 normalization; an empty row denotes an invalid/zero vector.
+// before optional L2 normalization; empty denotes invalid (or normalized zero).
+// With normalize=false retain physical scalar/vector units, including valid zero.
 void sampleLasagnaVectorBatch(const std::vector<LasagnaChannelBinding>& channels,
-    const std::vector<cv::Vec3f>& points, std::vector<std::vector<float>>& vectors);
+    const std::vector<cv::Vec3f>& points, std::vector<std::vector<float>>& vectors,
+    bool normalize = true);
 
 [[nodiscard]] LasagnaCubeRequest prepareLasagnaCubeRequest(
     const LasagnaChannelBinding& binding,

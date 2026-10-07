@@ -127,6 +127,40 @@ TEST_CASE("Full prefix consistency verifies to segment start including final par
     CHECK(spans[2]==std::make_pair(200.,250.));
 }
 
+TEST_CASE("Presence filtering retains accepted prefix and shares safe reseeding") {
+    using namespace vc::fiber_tracer;
+    class Normals final : public vc::lasagna::NormalSampler {
+        vc::lasagna::NormalSample sampleNormal(const cv::Vec3d&) const override { return {{0,1,0},true,{}}; }
+    } normals;
+    auto ref=makePolylineArcGeometry({{0,0,0},{100,0,0}});
+    ReplaySegmentRunner runner=[](const PolylineArcSample& seed,double,int,const ReplayPointObserver& observe,const FiberTraceProgressCallback&) {
+        for(double x=seed.arc+10;x<=100;x+=10) if(!observe({x,0,0},0,int(x))) break;
+        return std::string("stopped");
+    };
+    ReplayConsistencyPolicy policy;
+    auto run=[&]{return traceReferenceReplayCore(ref,0,100,10,3,40,160,2,1,normals,1,runner,{},{},policy);};
+    CHECK(run().filteredStops.empty());
+    policy.acceptPoint=[](const auto& p,const auto&){return p[0]!=50;};
+    policy.nextSeed=[&](double arc)->std::optional<PolylineArcSample>{return samplePolylineArc(ref,arc);};
+    auto r=run();
+    REQUIRE(r.filteredStops.size()==1);
+    CHECK(r.filteredStops[0]==std::array<double,3>{40,50,60});
+    CHECK(r.segments[0].terminationReason=="presence_filtered");
+    CHECK(r.failures.empty()); CHECK(r.reverseChecks==0); CHECK(r.completedReferenceArcBase==100);
+    policy.intervalBase=30; policy.allEndpoints=true;
+    policy.verify=[](const auto&){return true;};
+    r=run();
+    CHECK(r.filteredStops[0][0]==30); // No terminal reverse verification of rejected tail.
+    CHECK(r.reverseChecks==3);
+    policy.intervalBase=0;
+    policy.acceptPoint=[](const auto&,const auto&){return false;};
+    r=run();
+    CHECK(r.failures.empty()); CHECK(r.filteredStops.size()==5); CHECK(r.completedReferenceArcBase==100);
+    policy.nextSeed=[](double)->std::optional<PolylineArcSample>{return {};};
+    r=run();
+    CHECK(r.filteredStops.size()==1); CHECK(r.completedReferenceArcBase==100);
+}
+
 namespace
 {
 

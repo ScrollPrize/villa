@@ -59,6 +59,28 @@ inline bool parseTraceOption(
     };
     if (argument == "--step-voxels")
         config.stepVoxels = parseDouble(value("step-voxels"), "step-voxels");
+    else if (argument == "--width-relative-tolerance") {
+        config.widthRelativeTolerance = parseDouble(value("width-relative-tolerance"), "width-relative-tolerance");
+        if (!std::isfinite(config.widthRelativeTolerance) || config.widthRelativeTolerance < 0)
+            throw std::invalid_argument("width relative tolerance must be finite and nonnegative (zero disables it)");
+    }
+    else if (argument == "--width-weighting") {
+        const std::string shape = value("width-weighting");
+        if (shape != "linear" && shape != "cosine")
+            throw std::invalid_argument("width weighting must be linear or cosine");
+        config.widthCosineWeight = shape == "cosine";
+    }
+    else if (argument == "--replay-presence-mode") {
+        const std::string mode = value("replay-presence-mode");
+        if (mode != "raw" && mode != "modulated")
+            throw std::invalid_argument("replay presence mode must be raw or modulated");
+        config.replayPresenceModulated = mode == "modulated";
+    }
+    else if (argument == "--replay-presence-cutoff") {
+        config.replayPresenceCutoff = parseDouble(value("replay-presence-cutoff"), "replay-presence-cutoff");
+        if (!std::isfinite(config.replayPresenceCutoff) || config.replayPresenceCutoff < 0 || config.replayPresenceCutoff > 1)
+            throw std::invalid_argument("replay presence cutoff must be in [0,1]");
+    }
     else if (argument == "--replay-reverse-interval-base") {
         config.replayReverseIntervalBase = parseDouble(value("replay-reverse-interval-base"), "replay-reverse-interval-base");
         if (!std::isfinite(config.replayReverseIntervalBase) || config.replayReverseIntervalBase <= 0)
@@ -230,6 +252,10 @@ inline nlohmann::json traceConfigJson(const FiberTraceConfig& config)
         {"replay_reverse_all_endpoints", config.replayReverseAllEndpoints},
         {"replay_reverse_history_steps", config.replayReverseHistorySteps},
         {"embedding_weight", config.embeddingWeight},
+        {"replay_presence_cutoff", config.replayPresenceCutoff},
+        {"replay_presence_mode", config.replayPresenceModulated ? "modulated" : "raw"},
+        {"width_relative_tolerance", config.widthRelativeTolerance},
+        {"width_weighting", config.widthCosineWeight ? "cosine" : "linear"},
         {"embedding_integration", {{"kind",config.embeddingIntegration.kind},{"spacing",config.embeddingIntegration.spacing},
             {"gate_bias",config.embeddingIntegration.gateBias},{"gate_presence",config.embeddingIntegration.gatePresence},{"gate_distance",config.embeddingIntegration.gateDistance},
             {"cap_degrees",config.embeddingIntegration.capDegrees},{"long_half_life",config.embeddingIntegration.longHalfLife},

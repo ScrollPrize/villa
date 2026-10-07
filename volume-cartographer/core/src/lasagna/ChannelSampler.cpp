@@ -1534,7 +1534,7 @@ std::vector<LasagnaChannelBinding> bindLasagnaEmbeddingChannels(
 }
 
 void sampleLasagnaVectorBatch(const std::vector<LasagnaChannelBinding>& channels,
-    const std::vector<cv::Vec3f>& points, std::vector<std::vector<float>>& vectors)
+    const std::vector<cv::Vec3f>& points, std::vector<std::vector<float>>& vectors, bool normalize)
 {
     if (channels.empty()) throw std::invalid_argument("vector sampling requires channels");
     std::vector<LasagnaPrefetchRequest> requests;
@@ -1559,8 +1559,8 @@ void sampleLasagnaVectorBatch(const std::vector<LasagnaChannelBinding>& channels
             vector.push_back(static_cast<float>(*value));
             norm2 += *value * *value;
         }
-        if (vector.size() != channels.size() || norm2 <= 1e-16 || !std::isfinite(norm2)) vector.clear();
-        else for (auto& v : vector) v /= static_cast<float>(std::sqrt(norm2));
+        if (vector.size() != channels.size() || !std::isfinite(norm2) || (normalize && norm2 <= 1e-16)) vector.clear();
+        else if (normalize) for (auto& v : vector) v /= static_cast<float>(std::sqrt(norm2));
     }
 }
 

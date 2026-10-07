@@ -32,7 +32,8 @@ FiberReplayTraceResult traceReferenceReplayCore(
     const ReplayConsistencyPolicy& consistency)
 {
     if (!std::isfinite(consistency.intervalBase) || consistency.intervalBase < 0 ||
-        (consistency.intervalBase > 0 && (!consistency.verify || !consistency.nextSeed)))
+        (consistency.intervalBase > 0 && (!consistency.verify || !consistency.nextSeed)) ||
+        (consistency.acceptPoint && !consistency.nextSeed))
         throw std::invalid_argument("invalid replay consistency policy");
     if (!std::isfinite(excursionGraceBaseVoxels) || excursionGraceBaseVoxels < 0)
         throw std::invalid_argument("replay excursion grace must be finite and nonnegative");
@@ -61,6 +62,7 @@ FiberReplayTraceResult traceReferenceReplayCore(
         bool referenceExhausted = false;
         bool distanceFailed = false;
         bool filtered = false;
+        bool presenceFiltered = false;
         size_t checkedPoint = 0;
         size_t checkedMatches = 0;
         double checkedArc = segmentStartArc;
@@ -117,6 +119,17 @@ FiberReplayTraceResult traceReferenceReplayCore(
                     referenceExhausted = true;
                 if (referenceExhausted && excursion.outsideTravel) distanceFailed = true;
                 uncheckedTravel += stepTravel;
+                if (consistency.acceptPoint && !consistency.acceptPoint(pointBase,
+                        segment.tracePointsBase[segment.tracePointsBase.size()-2])) {
+                    filtered = true;
+                    presenceFiltered = true;
+                    return false;
+                }
+                if (consistency.acceptPoint && consistency.intervalBase <= 0) {
+                    checkedPoint = segment.tracePointsBase.size()-1;
+                    checkedMatches = segment.matches.size();
+                    checkedArc = previousArcBase;
+                }
                 // Default policy preserves earlier GT failures. The opt-in terminal
                 // check below audits any failure subsequently rejected by reverse tracing.
                 if (!distanceFailed && consistency.intervalBase > 0 &&
@@ -162,7 +175,7 @@ FiberReplayTraceResult traceReferenceReplayCore(
             segment.cumulativeLosses.resize(checkedPoint + 1);
             segment.matches.resize(checkedMatches);
             segment.endReferenceArcBase = checkedArc;
-            segment.terminationReason = "reverse_consistency_filtered";
+            segment.terminationReason = presenceFiltered ? "presence_filtered" : "reverse_consistency_filtered";
             result.segments.push_back(std::move(segment));
             const double searchArc = std::max(detectedArc, segmentStartArc) + nominalStepBase;
             if (searchArc < endArcBase) predictedSeed = consistency.nextSeed(searchArc);

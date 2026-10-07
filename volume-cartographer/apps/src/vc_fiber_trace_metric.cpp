@@ -264,7 +264,9 @@ int main(int argc, char** argv)
         if (argc > 1 && std::string_view(argv[1]) == "integrate-embeddings")
             return queryFiberIntegration(argc, argv);
         if (argc > 1 && std::string_view(argv[1]) == "sample-embeddings")
-            return queryCachedFiberEmbeddings(argc, argv);
+            return queryCachedFiberSamples(argc, argv);
+        if (argc > 1 && std::string_view(argv[1]) == "sample-width")
+            return queryCachedFiberSamples(argc, argv, true);
         if (argc > 1 && (std::string_view(argv[1]) == "replay-set" || std::string_view(argv[1]) == "render-replay" || std::string_view(argv[1]) == "replay-references"))
             return runFiberTraceEvaluationCli(argc, argv);
         const CliOptions options = parseArgs(argc, argv);
@@ -285,7 +287,7 @@ int main(int argc, char** argv)
         predictionManifest.workingToBaseScale = workingToBaseScale;
         const vc::lasagna::LasagnaDataset dataset(std::move(predictionManifest));
         const vc::fiber_tracer::FiberPredictionField predictions(
-            dataset, vc::fiber_tracer::FiberPredictionFieldBindingMode::TraceOptions, options.trace.embeddingWeight > 0);
+            dataset, vc::fiber_tracer::FiberPredictionFieldBindingMode::TraceOptions, options.trace.embeddingWeight > 0, options.trace.widthRelativeTolerance > 0);
 
         std::optional<vc::lasagna::LasagnaDataset> normalDataset;
         std::optional<vc::lasagna::LasagnaNormalSampler> normalSampler;

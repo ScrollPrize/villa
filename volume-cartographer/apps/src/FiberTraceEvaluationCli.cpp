@@ -808,7 +808,7 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
         manifest.workingToBaseScale = source.traceScale;
         source.predictionManifest = manifest;
         source.predictions = std::make_unique<FiberPredictionField>(vc::lasagna::LasagnaDataset(std::move(manifest)),
-            FiberPredictionFieldBindingMode::TraceOptions, trace.embeddingWeight > 0);
+            FiberPredictionFieldBindingMode::TraceOptions, trace.embeddingWeight > 0, trace.widthRelativeTolerance > 0);
         options.workingToBaseScale = source.traceScale;
         const auto normals = vc::lasagna::LasagnaDataset::openLocation(normalLocation, options);
         if (!normals.manifest().fiberPredictionPrefixes().empty() ||
@@ -1353,7 +1353,7 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                 if (bridge && (!resumeVisualization || renderThisCase)) {
                     livePredictions = std::make_unique<FiberPredictionField>(
                         vc::lasagna::LasagnaDataset(source.predictionManifest),
-                        FiberPredictionFieldBindingMode::TraceOptions, trace.embeddingWeight > 0);
+                        FiberPredictionFieldBindingMode::TraceOptions, trace.embeddingWeight > 0, trace.widthRelativeTolerance > 0);
                     livePredictions->setReadinessGate([&](const auto& dependencies) {
                         readiness.await(dependencies, [&](const auto& missing) {
                             permit.suspend([&] { bridge->await(source.id, index, remaining.load(), missing,

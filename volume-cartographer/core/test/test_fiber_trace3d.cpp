@@ -5,6 +5,7 @@
 #include "vc/fiber_tracer/FiberTrace.hpp"
 #include "vc/fiber_tracer/FiberReverseConsistency.hpp"
 #include "vc/fiber_tracer/FiberEmbedding.hpp"
+#include "vc/fiber_tracer/FiberWidth.hpp"
 #include "vc/fiber_tracer/FiberReplay.hpp"
 #include "vc/fiber_tracer/PolylineGeometry.hpp"
 #include "vc/lasagna/ChannelSampler.hpp"
@@ -434,10 +435,18 @@ TEST_CASE("signed float32 channels interpolate before normalization through shar
     CHECK(values[0][1] == doctest::Approx(std::sqrt(.5)));
     CHECK(values[1][0] == doctest::Approx(-2 / std::sqrt(5.0)));
     CHECK(values[2].empty());
+    vc::lasagna::sampleLasagnaVectorBatch(channels, {{.5f,.5f,.5f},{0,0,0}}, values, false);
+    CHECK(values[0][0] == doctest::Approx(1));
+    CHECK(values[1][0] == doctest::Approx(-2));
 }
 
 TEST_CASE("live field gates float visitor boundary chunks before any cache read")
 {
+    bool enableWidth=false;
+    SUBCASE("legacy channels") {}
+    SUBCASE("width participates in coherent readiness") { enableWidth=true; }
+    std::vector<const char*> names{"presence","nx","ny"};
+    if (enableWidth) names.push_back("width");
     namespace fs = std::filesystem;
     struct TemporaryDirectory {
         fs::path path;
@@ -445,26 +454,27 @@ TEST_CASE("live field gates float visitor boundary chunks before any cache read"
     } directory{fs::temp_directory_path() / ("vc_live_gate_" + std::to_string(std::mt19937_64(std::random_device{}())()))};
     REQUIRE(fs::create_directory(directory.path));
     nlohmann::json groups;
-    for (const auto* name : {"presence", "nx", "ny"}) {
+    for (const auto* name : names) {
         const auto path = directory.path / (std::string(name) + ".zarr");
         utils::ZarrMetadata metadata;
         metadata.version = utils::ZarrVersion::v2;
         metadata.shape = {128, 128, 128};
         metadata.chunks = {64, 64, 64};
-        metadata.dtype = utils::ZarrDtype::uint8;
+        metadata.dtype = std::string_view(name)=="width" ? utils::ZarrDtype::float32 : utils::ZarrDtype::uint8;
         metadata.compressor_id.clear();
         (void)utils::ZarrArray::create(path, metadata); // no prediction data exists
         groups[name] = {{"zarr", path.string()}, {"scaledown", 0}, {"channels", {name}}};
     }
     const nlohmann::json json{{"version", 2}, {"source_to_base", 0.01}, {"groups", groups}};
     auto manifest = vc::lasagna::LasagnaDatasetManifest::parseText(json.dump(), directory.path / "manifest.json");
-    vc::fiber_tracer::FiberPredictionField field{vc::lasagna::LasagnaDataset(std::move(manifest))};
+    vc::fiber_tracer::FiberPredictionField field{vc::lasagna::LasagnaDataset(std::move(manifest)),
+        vc::fiber_tracer::FiberPredictionFieldBindingMode::TraceOptions,false,enableWidth};
     int calls = 0;
     field.setReadinessGate([&](const auto& dependencies) {
         ++calls;
         // float(.63) / float(.01) == 63, whereas double(float(.63)) /
         // double(.01) < 63. The optimized visitor requires corner x=64 too.
-        for (const auto* name : {"presence", "nx", "ny"}) {
+        for (const auto* name : names) {
             CHECK(std::any_of(dependencies.begin(), dependencies.end(), [&](const auto& key) {
                 return key.arrayPath.string().find(name) != std::string::npos && key.indexZYX == std::array<uint32_t, 3>{0, 0, 1};
             }));
@@ -482,7 +492,7 @@ TEST_CASE("live field gates float visitor boundary chunks before any cache read"
     field.setReadinessGate([&](const auto& dependencies) {
         // A large duplicate batch strictly within chunk1 must not invent
         // chunk0 from the uninitialized tail of a single-chunk cube request.
-        REQUIRE(dependencies.size() == 3);
+        REQUIRE(dependencies.size() == names.size());
         for (const auto& key : dependencies)
             CHECK(key.indexZYX == std::array<uint32_t, 3>{1, 1, 1});
         throw std::runtime_error("synthetic not-ready");
@@ -491,7 +501,7 @@ TEST_CASE("live field gates float visitor boundary chunks before any cache read"
     CHECK_THROWS_WITH_AS(field.sampleBatch(std::vector<cv::Vec3f>(1000, {0.8f, 0.8f, 0.8f}),
         std::vector<cv::Vec3f>(1000, {1, 0, 0}), 1, samples, &profile), doctest::Contains("synthetic not-ready"), std::runtime_error);
     CHECK(profile.readinessPlanPoints == 1000);
-    CHECK(profile.readinessPlanDependencies == 3);
+    CHECK(profile.readinessPlanDependencies == names.size());
 }
 
 namespace
@@ -768,6 +778,65 @@ TEST_CASE("native fiber tracer defaults match regular Trace2CP command")
     CHECK(config.endpointAcceptThresholdBaseVoxels == doctest::Approx(20.0));
     CHECK(config.traceToBaseScale == doctest::Approx(1.0));
     CHECK_FALSE(config.baseVoxelSizeUm.has_value());
+}
+
+TEST_CASE("width presence gate and cumulative committed mean") {
+    using namespace vc::fiber_tracer;
+    FiberWidthMean mean;
+    mean.add(10); mean.add(12); mean.add(14);
+    CHECK(mean.mean() == doctest::Approx(12));
+    CHECK(mean.count == 3);
+    CHECK(fiberWidthPresenceScale(10,10,.2) == doctest::Approx(1));
+    CHECK(fiberWidthPresenceScale(11,10,.2) == doctest::Approx(.5));
+    CHECK(fiberWidthPresenceScale(9,10,.2) == doctest::Approx(.5));
+    CHECK(fiberWidthPresenceScale(12,10,.2) == doctest::Approx(0));
+    CHECK(fiberWidthPresenceScale(8,10,.2) == doctest::Approx(0));
+    CHECK(fiberWidthPresenceScale(0,10,.2) == 0);
+    CHECK(fiberWidthPresenceScale(100,0,0) == 1);
+    CHECK(fiberWidthPresenceScale(10,10,.2,true) == doctest::Approx(1));
+    CHECK(fiberWidthPresenceScale(11,10,.2,true) == doctest::Approx(std::sqrt(.5)));
+    CHECK(fiberWidthPresenceScale(9,10,.2,true) == doctest::Approx(std::sqrt(.5)));
+    CHECK(fiberWidthPresenceScale(12,10,.2,true) == doctest::Approx(0));
+    CHECK(fiberWidthPresenceScale(8,10,.2,true) == doctest::Approx(0));
+    CHECK(fiberWidthPresenceScale(13,10,.2,true) == 0);
+    CHECK(fiberWidthPresenceScale(0,10,.2,true) == 0);
+    CHECK(fiberWidthPresenceScale(100,0,0,true) == 1);
+    CHECK_THROWS(fiberWidthPresenceScale(10,0,.2,true));
+    CHECK_THROWS(mean.add(0));
+}
+
+TEST_CASE("width updates only committed steps without an observer and freezes for reverse") {
+    using namespace vc::fiber_tracer;
+    class WidthPrediction final : public FiberPredictionSource {
+    public:
+        mutable size_t sampled = 0;
+        FiberPredictionSample sample(const cv::Vec3d& p,const cv::Vec3d& d) const override {
+            return StraightPrediction{}.sample(p,d);
+        }
+        void sampleWidths(const std::vector<cv::Vec3f>& points,std::vector<float>& out) const override {
+            out.clear(); sampled+=points.size();
+            for (const auto& p:points) out.push_back(10+p[0]*.01f);
+        }
+    } source;
+    FiberTraceConfig config;
+    config.smoothnessNormalWeight=config.smoothnessTangentWeight=config.cumulativeSmoothnessTangentWeight=0;
+    config.parallelThreads=1;
+    const auto legacy=traceFiberExtrapolation(source,{0,0,0},{1,0,0},32,config);
+    CHECK(source.sampled==0);
+    config.widthRelativeTolerance=.2;
+    const auto forward=traceFiberExtrapolation(source,{0,0,0},{1,0,0},32,config);
+    REQUIRE(forward.points.size()>2);
+    CHECK(forward.widthSamples==forward.points.size());
+    CHECK(source.sampled>forward.widthSamples); // Speculative widths sampled, but not accumulated.
+    double total=0;
+    for (const auto& p:forward.points) total+=10+static_cast<float>(p[0])*.01f;
+    CHECK(forward.widthMean==doctest::Approx(total/forward.points.size()));
+    config.widthReferenceMean=forward.widthMean;
+    const auto reverse=traceFiberExtrapolation(source,forward.points.back(),{-1,0,0},32,config);
+    CHECK(reverse.widthSamples==0);
+    CHECK(reverse.widthMean==forward.widthMean);
+    config.widthRelativeTolerance=0; config.widthReferenceMean=0;
+    CHECK(traceFiberExtrapolation(source,{0,0,0},{1,0,0},32,config).points==legacy.points);
 }
 
 TEST_CASE("embedding tracing preserves zero-weight path and rejects missing embeddings")
@@ -1091,6 +1160,16 @@ TEST_CASE("native fiber tracer scores persisted corners without materialized sam
 
     REQUIRE(score.valid);
     REQUIRE(sampleScore.valid);
+    for (float factor : {0.f,.5f,1.f}) {
+        const auto fused = vc::fiber_tracer::testing::debugCandidateLossFromCorners(corners,optionCount,0,
+            {1,0,0},{1,0,0},{1,0,0},{1,0,0},config,factor);
+        const auto generic = vc::fiber_tracer::testing::debugCandidateLossFromSample(sample,
+            {1,0,0},{1,0,0},{1,0,0},{1,0,0},config,factor);
+        CHECK(fused.loss == doctest::Approx(generic.loss).epsilon(.0001));
+        CHECK(fused.modulatedPresence == doctest::Approx(generic.modulatedPresence).epsilon(.0001));
+        CHECK(fused.modulatedPresence == doctest::Approx(factor*128.f/255).epsilon(.0001));
+        CHECK(fused.loss == doctest::Approx(1-factor*128.f/255).epsilon(.0001));
+    }
     CHECK(score.loss == doctest::Approx(1.0 - 128.0 / 255.0));
     CHECK(score.loss == sampleScore.loss);
     CHECK(score.selectedPresence == sampleScore.selectedPresence);
@@ -2830,6 +2909,121 @@ TEST_CASE("Periodic native reverse verifier accepts straight paths without chang
     REQUIRE(recorded.first.has_value());
     CHECK((*recorded.first)[0] == doctest::Approx(80));
     CHECK(vertices.points.size() == 4);
+}
+
+TEST_CASE("replay reverse checks never seed or advance a second width average") {
+    using namespace vc::fiber_tracer;
+    class Source final : public FiberPredictionSource {
+    public:
+        mutable std::vector<cv::Vec3f> committed;
+        FiberPredictionSample sample(const cv::Vec3d& p,const cv::Vec3d& d) const override {
+            return StraightPrediction{}.sample(p,d);
+        }
+        void sampleWidths(const std::vector<cv::Vec3f>& points,std::vector<float>& out) const override {
+            if (points.size()==1) committed.push_back(points[0]);
+            out.clear();
+            for (const auto& p:points) out.push_back(10+p[0]*.001f);
+        }
+    } source;
+    FiberReplayTraceRequest request;
+    request.fiber.linePointsXyzBase={{0,0,0},{64,0,0}};
+    request.fiber.controlPointsXyzBase=request.fiber.linePointsXyzBase;
+    request.fiber.controlPointLineIndices={0,1};
+    request.traceToBaseScale=1;
+    request.errorThresholdBaseVoxels=100;
+    request.config.coneGridSize=3;
+    request.config.beamWidth=2;
+    request.config.parallelThreads=1;
+    request.config.widthRelativeTolerance=.2;
+    request.config.replayReverseIntervalBase=16;
+    request.config.replayReverseToStart=true;
+    request.config.replayReverseAllEndpoints=true;
+    ConstantNormalSampler normals;
+    const auto result=traceFiberReplay(source,request,normals,1);
+    CHECK(result.reverseChecks>=3);
+    CHECK(result.failures.empty());
+    CHECK(result.filteredStops.empty());
+    REQUIRE(result.segments.size()==1);
+    const auto& points=result.segments[0].tracePointsBase;
+    REQUIRE(source.committed.size()==points.size());
+    for (size_t i=0;i<points.size();++i) CHECK(cv::norm(cv::Vec3d(source.committed[i])-points[i])<1e-6);
+}
+
+TEST_CASE("Post modulation carries direction and width evidence without smoothness") {
+    using namespace vc::fiber_tracer;
+    FiberPredictionSample sample;
+    sample.options.push_back({{.6f,.8f,0},1.f,true});
+    FiberTraceConfig config;
+    const auto score=testing::debugCandidateLossFromSample(sample,{1,0,0},{1,0,0},{1,0,0},{1,0,0},config,.5f);
+    // Three of the six factors are .6, other three are1; width multiplier.5.
+    CHECK(score.modulatedPresence==doctest::Approx(.5*.6*.6*.6));
+    config.cumulativeSmoothnessTangentWeight=100;
+    const auto penalized=testing::debugCandidateLossFromSample(sample,{1,0,0},{1,0,0},{0,1,0},{1,0,0},config,.5f);
+    CHECK(penalized.modulatedPresence==score.modulatedPresence);
+}
+
+TEST_CASE("Raw presence replay cutoff accepts equality independently of width") {
+    using namespace vc::fiber_tracer;
+    class Source final : public FiberPredictionSource {
+    public:
+        FiberPredictionSample sample(const cv::Vec3d& p,const cv::Vec3d& d) const override {
+            FiberPredictionSample s;
+            for(auto option:StraightPrediction{}.sample(p,d).options) {
+                option.presence=.5f;
+                s.options.push_back(option);
+            }
+            return s;
+        }
+    } source;
+    FiberReplayTraceRequest request;
+    request.fiber.linePointsXyzBase={{0,0,0},{64,0,0}};
+    request.fiber.controlPointsXyzBase=request.fiber.linePointsXyzBase;
+    request.fiber.controlPointLineIndices={0,1};
+    request.traceToBaseScale=1; request.errorThresholdBaseVoxels=100;
+    request.config.coneGridSize=3; request.config.beamWidth=2; request.config.parallelThreads=1;
+    ConstantNormalSampler normals;
+    request.config.replayPresenceCutoff=.5;
+    auto r=traceFiberReplay(source,request,normals,1);
+    CHECK(r.failures.empty()); CHECK(r.filteredStops.empty());
+    request.config.replayPresenceModulated=true;
+    r=traceFiberReplay(source,request,normals,1);
+    CHECK(r.failures.empty()); CHECK(r.filteredStops.empty());
+    request.config.replayPresenceCutoff=.51;
+    r=traceFiberReplay(source,request,normals,1);
+    CHECK(r.failures.empty()); REQUIRE(r.filteredStops.size()==1);
+    CHECK(r.segments[0].terminationReason=="presence_filtered"); CHECK(r.reverseChecks==0);
+    request.config.replayPresenceCutoff=2;
+    CHECK_THROWS_AS(traceFiberReplay(source,request,normals,1),std::invalid_argument);
+}
+
+TEST_CASE("Post modulation filters a directional turn that raw presence accepts") {
+    using namespace vc::fiber_tracer;
+    class TurnSource final : public FiberPredictionSource {
+    public:
+        FiberPredictionSample sample(const cv::Vec3d& p,const cv::Vec3d&) const override {
+            FiberPredictionSample s;
+            s.options.push_back({p[0]>.01 ? cv::Vec3f{.6f,.8f,0} : cv::Vec3f{1,0,0},1.f,true});
+            return s;
+        }
+    } source;
+    FiberReplayTraceRequest request;
+    request.fiber.linePointsXyzBase={{0,0,0},{64,0,0}};
+    request.fiber.controlPointsXyzBase=request.fiber.linePointsXyzBase;
+    request.fiber.controlPointLineIndices={0,1};
+    request.traceToBaseScale=1; request.errorThresholdBaseVoxels=100;
+    request.config.coneGridSize=3; request.config.coneAngleDegrees=0;
+    request.config.beamWidth=2; request.config.parallelThreads=1;
+    request.config.replayPresenceCutoff=.5;
+    ConstantNormalSampler normals;
+    auto raw=traceFiberReplay(source,request,normals,1);
+    CHECK(raw.filteredStops.empty());
+    request.config.replayPresenceModulated=true;
+    auto mod=traceFiberReplay(source,request,normals,1);
+    REQUIRE(!mod.filteredStops.empty());
+    CHECK(mod.segments.front().terminationReason=="presence_filtered");
+    request.config.replayPresenceCutoff=0;
+    auto disabled=traceFiberReplay(source,request,normals,1);
+    CHECK(disabled.filteredStops.empty());
 }
 
 TEST_CASE("Reverse acceptance radii preserve defaults and isotropic distance")

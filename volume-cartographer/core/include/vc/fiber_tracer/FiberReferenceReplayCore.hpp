@@ -35,6 +35,8 @@ using ReplaySegmentRunner = std::function<std::string(
     const FiberTraceProgressCallback&)>;
 
 struct ReplayConsistencyPolicy {
+    // Current and previous committed base points; false filters this point.
+    std::function<bool(const cv::Vec3d&, const cv::Vec3d&)> acceptPoint;
     double intervalBase = 0;
     bool toStart = false;
     bool allEndpoints = false;

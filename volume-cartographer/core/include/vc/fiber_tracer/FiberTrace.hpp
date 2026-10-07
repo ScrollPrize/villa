@@ -91,6 +91,13 @@ struct FiberTraceProfile {
 };
 
 struct FiberTraceConfig {
+    // Optional replay filter on raw presence at committed forward points.
+    double replayPresenceCutoff = 0.0;
+    bool replayPresenceModulated = false;
+    // Opt-in cumulative committed-width gate. Frozen mean is internal reverse-check state.
+    double widthRelativeTolerance = 0.0;
+    bool widthCosineWeight = false;
+    double widthReferenceMean = 0.0;
     // Reference-replay experiment only; zero preserves the ordinary protocol.
     double replayReverseIntervalBase = 0.0;
     double replayReverseNormalRadiusBase = 20.0;
@@ -313,6 +320,10 @@ struct FiberInput {
 class FiberPredictionSource
 {
 public:
+    virtual void sampleWidths(const std::vector<cv::Vec3f>&, std::vector<float>&) const
+    {
+        throw std::runtime_error("width tracing requested but source has no width channel");
+    }
     virtual void sampleEmbeddings(const std::vector<cv::Vec3f>&,
                                  std::vector<std::vector<float>>&) const
     {
@@ -368,12 +379,13 @@ using FiberPredictionReadinessGate = std::function<void(const std::vector<FiberP
 class FiberPredictionField final : public FiberPredictionSource
 {
 public:
+    void sampleWidths(const std::vector<cv::Vec3f>& points, std::vector<float>& widths) const override;
     void sampleEmbeddings(const std::vector<cv::Vec3f>& points,
                           std::vector<std::vector<float>>& embeddings) const override;
     explicit FiberPredictionField(
         const vc::lasagna::LasagnaDataset& dataset,
         FiberPredictionFieldBindingMode bindingMode = FiberPredictionFieldBindingMode::TraceOptions,
-        bool enableEmbeddings = false);
+        bool enableEmbeddings = false, bool enableWidth = false);
     ~FiberPredictionField() override;
 
     // Configure once, before concurrent sampling. Empty retains offline behavior.
@@ -473,6 +485,8 @@ struct FiberTraceOneWayResult {
     std::string selectedTargetPlaneName;
     std::optional<cv::Vec3d> selectedTargetPlaneCrossing;
     double selectedTargetPlaneErrorVoxels = std::numeric_limits<double>::infinity();
+    double widthMean = 0;
+    uint64_t widthSamples = 0; // Zero for a frozen reverse reference.
 };
 
 struct FiberTraceSegmentResult {
@@ -644,6 +658,7 @@ struct CandidateScoreDebug {
     cv::Vec3d selectedDirection{0.0, 0.0, 0.0};
     double selectedPresence = 0.0;
     bool valid = false;
+    double modulatedPresence = 0.0;
 };
 
 [[nodiscard]] std::vector<size_t> debugPruneBeamStateIndices(const std::vector<BeamDebugState>& states, int beamWidth, double pruneDistanceVoxels);
@@ -660,7 +675,7 @@ struct CandidateScoreDebug {
     const cv::Vec3d& currentSampleDirection,
     const cv::Vec3d& historyDirection,
     const cv::Vec3d& candidateDirection,
-    const FiberTraceConfig& config);
+    const FiberTraceConfig& config, float presenceScale = 1);
 
 // Pools ``stencilSize`` consecutive samples per candidate as the tracer does
 // for ``--sample-pool-radius-voxels``; exposed for tests.
@@ -677,7 +692,7 @@ struct CandidateScoreDebug {
     const cv::Vec3d& currentSampleDirection,
     const cv::Vec3d& historyDirection,
     const cv::Vec3d& candidateDirection,
-    const FiberTraceConfig& config);
+    const FiberTraceConfig& config, float presenceScale = 1);
 [[nodiscard]] bool debugShouldRetryLookahead(
     bool lazyLookahead,
     size_t parentCap,
