@@ -1,8 +1,5 @@
-"""Method-agnostic pieces of a fiber-following training run.
-
-Shared by every model type: run directory creation, the JSON-lines log, the
-warmup-cosine schedule, EMA, RNG state and resuming (checkpoint I/O is models/checkpoint.py).
-"""
+"""Training-run pieces shared by the tracers: run directory creation, the JSON-lines log, the warmup-cosine schedule,
+the weight EMA and RNG state."""
 from __future__ import annotations
 
 import json
@@ -80,24 +77,3 @@ def restore_training_rng(state):
         torch.cuda.set_rng_state_all([s.cpu() for s in state['cuda']])
 
 
-def resume_training(ck, model, ema, opt, *, reset_optimizer=False):
-    """Restore weights, EMA, optimizer and RNG from a resumable checkpoint.
-
-    Only ``ckpt_*.pt``/``last.pt`` written by training carry optimizer state;
-    collector snapshots do not. Loader workers restart their own streams, so
-    the sampled data sequence after a resume differs from an uninterrupted run.
-    With reset_optimizer, retain the supplied fresh optimizer instead of the
-    saved moments/groups. Model weights, EMA, RNG and update count still resume.
-    Returns the completed update count.
-    """
-    if 'optimizer' not in ck:
-        raise ValueError('Checkpoint holds no optimizer state; resume from ckpt_*.pt or last.pt of a run')
-    if reset_optimizer and opt.state:
-        raise ValueError('Optimizer reset requires a fresh optimizer with empty state')
-    model.load_state_dict(ck['model'])
-    ema.load_state_dict(ck['ema'])
-    if not reset_optimizer:
-        opt.load_state_dict(ck['optimizer'])
-    if 'rng' in ck:
-        restore_training_rng(ck['rng'])
-    return int(ck['step'])

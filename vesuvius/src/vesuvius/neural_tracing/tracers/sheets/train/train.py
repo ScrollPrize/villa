@@ -41,6 +41,7 @@ from vesuvius.neural_tracing.tracers.sheets.model import build_model, compile_mo
 from vesuvius.neural_tracing.tracers.sheets.tracing.rollout import Tracer
 from vesuvius.neural_tracing.tracers.sheets.tracing.seeding import perturb, seed_rows, sheet_jump
 from vesuvius.neural_tracing.tracers.sheets.evaluation.figures import episode_figure, metric_figure, training_figure
+from vesuvius.neural_tracing.tracers.shared.training import prepare_run_dir, update_ema
 
 
 def learning_rate(it: int, tc, minutes: float = 0.) -> float:
@@ -211,11 +212,10 @@ class EMA:
         self.model = copy.deepcopy(model).eval().requires_grad_(False)
         self.decay, self.updates = decay, updates
 
-    @torch.no_grad()
     def update(self, model) -> None:
+        """One update of the average (``shared.training.update_ema``: the decay ramps up over the first updates)."""
         self.updates += 1
-        decay = min(self.decay, (1+self.updates)/(10+self.updates))
-        torch._foreach_lerp_(list(self.model.parameters()), list(model.parameters()), 1-decay)
+        update_ema(self.model, model, self.updates, self.decay)
 
 
 def save(path, model, opt, cfg, it, best, minutes=0., ema: EMA | None = None):
@@ -249,8 +249,7 @@ def main(argv=None):
         overrides = list(args.set)+([f'train.name={args.name}'] if args.name else [])
         cfg = C.load(args.config, overrides)
     tc, d = cfg.train, cfg.data
-    run = cfg.run_dir
-    run.mkdir(parents=True, exist_ok=True)
+    run = prepare_run_dir(cfg.run_dir.parent, cfg.run_dir.name, resume=checkpoint is not None)
     (run/'config.json').write_text(json.dumps(cfg.to_dict(), indent=2))
     raise_open_file_limit()
     # Loader workers are forkserver children, not ours: exit through Python on SIGTERM so the DataLoader

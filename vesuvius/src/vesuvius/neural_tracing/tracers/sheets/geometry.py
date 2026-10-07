@@ -11,6 +11,8 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+from vesuvius.neural_tracing.tracers.shared.compile import compile_options
+
 
 def normalize(v: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     return v/v.norm(dim=-1, keepdim=True).clamp_min(eps)
@@ -58,7 +60,7 @@ def use_compiled_projection(enabled: bool = True) -> None:
     kernels per call). Not bit-identical to eager: foot points differ by ~1e-3 vx typically, and a rare query can
     settle on a different Gauss-Newton solution."""
     global _COMPILED_PROJECT
-    _COMPILED_PROJECT = torch.compile(_project, dynamic=False) if enabled else None
+    _COMPILED_PROJECT = torch.compile(_project, **compile_options()) if enabled else None
 
 
 @torch.no_grad()

@@ -5,7 +5,8 @@ import math
 import torch
 
 from vesuvius.neural_tracing.tracers.shared.policy import gate_horizon, selection_window
-from vesuvius.neural_tracing.tracers.fibers.train.runloop import update_ema, resume_training
+from vesuvius.neural_tracing.tracers.shared.compile import compile_options
+from vesuvius.neural_tracing.tracers.shared.training import restore_training_rng, update_ema
 from vesuvius.neural_tracing.tracers.shared.tensors import fixed_rows, move_batch
 from vesuvius.neural_tracing.tracers.fibers.data.observations import LOCATION_SOURCES
 from vesuvius.neural_tracing.tracers.fibers.train.supervision import commit_window, loss_terms
@@ -24,12 +25,7 @@ def prepare_training(model, batch_size=2, *, backend=None):
         return model
     if batch_size < 1:
         raise ValueError('Positive training batch size required')
-    options = dict(dynamic=False, fullgraph=True)
-    # Keep eager BF16 rounding without changing global compiler configuration.
-    if backend is None or backend == 'inductor':
-        options['options'] = dict(emulate_precision_casts=True)
-    if backend is not None:
-        options['backend'] = backend
+    options = compile_options(backend, fullgraph=True)
     if model.model_type == 'sequence':
         # Episode batches (train/sequence.py) run eagerly; their CNN, which encodes every step's crop, is compiled
         # and fed fixed-size chunks. Compiling forward (not the module) keeps the parameter names.
@@ -289,3 +285,26 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
     if model.cfg.model_type == 'flow':
         sums.setdefault('flow', sums['geometry'])
     return sums
+
+
+def resume_training(ck, model, ema, opt, *, reset_optimizer=False):
+    """Restore weights, EMA, optimizer and RNG from a resumable checkpoint.
+
+    Only ``ckpt_*.pt``/``last.pt`` written by training carry optimizer state;
+    collector snapshots do not. Loader workers restart their own streams, so
+    the sampled data sequence after a resume differs from an uninterrupted run.
+    With reset_optimizer, retain the supplied fresh optimizer instead of the
+    saved moments/groups. Model weights, EMA, RNG and update count still resume.
+    Returns the completed update count.
+    """
+    if 'optimizer' not in ck:
+        raise ValueError('Checkpoint holds no optimizer state; resume from ckpt_*.pt or last.pt of a run')
+    if reset_optimizer and opt.state:
+        raise ValueError('Optimizer reset requires a fresh optimizer with empty state')
+    model.load_state_dict(ck['model'])
+    ema.load_state_dict(ck['ema'])
+    if not reset_optimizer:
+        opt.load_state_dict(ck['optimizer'])
+    if 'rng' in ck:
+        restore_training_rng(ck['rng'])
+    return int(ck['step'])

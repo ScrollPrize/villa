@@ -23,7 +23,7 @@ from vesuvius.neural_tracing.tracers.fibers.data.tasks import TASKS, TaskBudget
 from vesuvius.neural_tracing.tracers.fibers.train.dagger.online import OnlineCollector
 from vesuvius.neural_tracing.tracers.shared.policy import (
     DEFAULT_CONFIDENCE, DEFAULT_GATE, gate_horizon, OperatingPolicy)
-from vesuvius.neural_tracing.tracers.fibers.train.runloop import RunLog, lr_at, prepare_run_dir, training_rng_state
+from vesuvius.neural_tracing.tracers.shared.training import RunLog, lr_at, prepare_run_dir, training_rng_state
 from vesuvius.neural_tracing.tracers.shared.system import raise_open_file_limit
 from vesuvius.neural_tracing.tracers.models.checkpoint import (
     initialize_model_weights, read_checkpoint, write_checkpoint)

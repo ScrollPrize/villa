@@ -21,6 +21,7 @@ from torch import nn
 
 from vesuvius.models.build.resblocks import BasicBlockD
 from vesuvius.neural_tracing.tracers.sheets.data.episodes import FIBER_CODE_DIM
+from vesuvius.neural_tracing.tracers.shared.compile import compile_options
 
 POINT_FEATURES = 16
 TOKEN_FEATURES = 17
@@ -135,8 +136,8 @@ def compile_model(model: SheetTracer) -> None:
     """``train.compile_model``: torch.compile the model in place (parameter names, and so checkpoints, are
     unchanged). Inductor fuses the norm, activation and dtype-cast passes around the convolutions and the small
     transformer ops, which cuts both GPU time and kernel launches; same math, different rounding. One graph per
-    grid-memory depth (and per grad mode for validation)."""
-    model.compile(dynamic=False)
+    grid-memory depth (and per grad mode for validation). Compiler options: ``shared.compile.compile_options``."""
+    model.compile(**compile_options())
 
 
 def build_model(cfg) -> SheetTracer:
