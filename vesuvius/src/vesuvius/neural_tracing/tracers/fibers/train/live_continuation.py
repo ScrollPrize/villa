@@ -16,7 +16,8 @@ import torch
 from vesuvius.neural_tracing.tracers.fibers.data.targets import label_state
 from vesuvius.neural_tracing.tracers.fibers.data.tasks import SOURCE
 from vesuvius.neural_tracing.tracers.shared.geometry import frame_from_heading
-from vesuvius.neural_tracing.tracers.fibers.frames.ct import FRAME_POLICY, SeedHeadingError, ct_frame, reframe_item
+from vesuvius.neural_tracing.tracers.fibers.frames.ct import FRAME_POLICY, ct_frame, reframe_item
+from vesuvius.neural_tracing.tracers.shared.ct_structure import SeedHeadingError
 from vesuvius.neural_tracing.tracers.shared.policy import commit_count
 from vesuvius.neural_tracing.tracers.shared.reference import SEED_FIELDS, observed_path
 from vesuvius.neural_tracing.tracers.fibers.data.state_labels import FOLLOWING, RECOVERABLE, TERMINAL, TraceLabeler
@@ -168,7 +169,8 @@ class LiveContinuationSource:
         item = dataset.prepare(item, rng)
         # The unresolved-frame footprint covers all rolls and the CT tensor.
         dataset.prefetch_items([item], vol, required=True)
-        from vesuvius.neural_tracing.tracers.fibers.frames.learned import apply_prediction_axis, frame_predictor, orient_items, prediction_window
+        from vesuvius.neural_tracing.tracers.fibers.frames.learned import (
+            apply_prediction_axis, frame_predictor, orient_items, prediction_window)
         item['fiber_family'] = fiber.tag
         model_cfg = getattr(dataset.batch_builder, 'cfg', None)
         predictor = frame_predictor(model_cfg)

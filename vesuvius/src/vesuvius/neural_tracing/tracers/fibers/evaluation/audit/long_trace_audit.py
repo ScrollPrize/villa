@@ -16,14 +16,16 @@ import numpy as np
 import torch
 
 from vesuvius.neural_tracing.tracers.fibers.evaluation.protocol import dataset_sources
-from vesuvius.neural_tracing.tracers.fibers.evaluation.scoring import EvaluationAudit, evaluate, monitor_coverage, score_trace, summarize_outcomes
+from vesuvius.neural_tracing.tracers.fibers.evaluation.scoring import (
+    EvaluationAudit, evaluate, monitor_coverage, score_trace, summarize_outcomes)
 from vesuvius.neural_tracing.tracers.fibers.evaluation.audit.recovery_scoring import recovery_score
 from vesuvius.neural_tracing.tracers.fibers.evaluation.audit import tube_scoring
 from vesuvius.neural_tracing.tracers.fibers.evaluation.audit.neighbor_fibers import NeighborFibers
 from vesuvius.neural_tracing.tracers.fibers.tracing.trace import FiberTracer
 from vesuvius.neural_tracing.tracers.shared.io import jsonable, write_json as write
 from vesuvius.neural_tracing.tracers.shared.geometry import arclength, interp_at, tangent_at
-from vesuvius.neural_tracing.tracers.fibers.frames.ct import oriented_seed_heading, SeedHeadingError, SEED_HEADING_POLICY
+from vesuvius.neural_tracing.tracers.fibers.frames.ct import oriented_seed_heading, SEED_HEADING_POLICY
+from vesuvius.neural_tracing.tracers.shared.ct_structure import SeedHeadingError
 from vesuvius.neural_tracing.tracers.shared.policy import checkpoint_policy, gate_horizon
 from vesuvius.neural_tracing.tracers.fibers.tracing.trace import TraceParams
 from vesuvius.neural_tracing.tracers.models.checkpoint import load_checkpoint

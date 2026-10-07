@@ -16,8 +16,8 @@ from vesuvius.neural_tracing.tracers.shared.policy import (DEFAULT_CONFIDENCE, D
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume
 from vesuvius.neural_tracing.tracers.shared.reference import SEED_FIELDS, observed_path, trace_history
 from vesuvius.neural_tracing.tracers.fibers.data.observations import observation_builder
-from vesuvius.neural_tracing.tracers.fibers.frames.ct import (trace_heading, TRACE_HEADING_POLICY, FRAME_POLICY, FRAME_POLICIES,
-                                 PREDICTION_FRAME_POLICY, ct_frame, fiber_family)
+from vesuvius.neural_tracing.tracers.fibers.frames.ct import (
+    trace_heading, TRACE_HEADING_POLICY, FRAME_POLICY, FRAME_POLICIES, PREDICTION_FRAME_POLICY, ct_frame, fiber_family)
 from vesuvius.neural_tracing.tracers.fibers.frames.learned import (frame_predictor, configured_frame_policy, predict_frames,
                                       predicted_axis, prediction_window)
 

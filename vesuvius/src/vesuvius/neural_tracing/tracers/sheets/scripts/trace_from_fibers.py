@@ -25,6 +25,7 @@ from pathlib import Path
 import numpy as np
 
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import ChunkedArray
+from vesuvius.neural_tracing.tracers.shared.ct_structure import CT_CONTEXT_RADIUS, MIN_EIGENGAP, SeedHeadingError, ct_sheet_normal
 from vesuvius.neural_tracing.tracers.sheets import config as C
 from vesuvius.neural_tracing.tracers.sheets.checkpoint import load_checkpoint
 from vesuvius.neural_tracing.tracers.sheets.data.fibers import episode_fibers, fiber_pool
@@ -57,26 +58,18 @@ def seed_from_fiber(fiber: dict, scale: float, length: float, rng) -> tuple[np.n
     return pts, k
 
 
-CONTEXT_RADIUS = 38  # CT voxels around each point: four integration sigmas plus three derivative sigmas
-DERIVATIVE_SIGMA, INTEGRATION_SIGMA = 2., 8.  # the 2/8 tensor of the fiber tracer's sheet normals
-MIN_EIGENGAP = .05  # relative gap of the two largest eigenvalues; below it the CT shows no clear sheet
-
-
 def sheet_normal(volume, point: np.ndarray) -> np.ndarray | None:
-    """Sheet normal (xyz) at a level-0 point: the largest-eigenvalue axis of the CT structure tensor (derivative
-    sigma 2, integration sigma 8 voxels, Gaussian-weighted around the point), as the fiber tracer estimates it; None
-    without a clear sheet or near the volume edge."""
-    from vesuvius.neural_tracing.tracers.fibers.frames.ct import ct_structure_tensor
-    start = np.floor(point[::-1]).astype(np.int64)-CONTEXT_RADIUS
-    size = np.full(3, 2*CONTEXT_RADIUS+1)
+    """Sheet normal (xyz) at a level-0 point: the largest-eigenvalue axis of the 2/8 CT structure tensor
+    (``shared.ct_structure.ct_sheet_normal``, as the fiber tracer estimates it) over ``CT_CONTEXT_RADIUS`` voxels;
+    None without a clear sheet (relative eigengap below ``MIN_EIGENGAP``) or near the volume edge."""
+    start = np.floor(point[::-1]).astype(np.int64)-CT_CONTEXT_RADIUS
+    size = np.full(3, 2*CT_CONTEXT_RADIUS+1)
     if np.any(start < 0) or np.any(start+size > np.asarray(volume.shape)):
         return None
-    tensor = ct_structure_tensor(volume.read(start, size), point[::-1]-start, derivative_sigma=DERIVATIVE_SIGMA,
-                                 integration_sigma=INTEGRATION_SIGMA)
-    values, vectors = np.linalg.eigh(tensor)
-    if values[-1] <= 1e-12 or (values[-1]-values[-2])/values[-1] < MIN_EIGENGAP:
+    try:
+        return ct_sheet_normal(volume.read(start, size), point[::-1]-start, min_gap=MIN_EIGENGAP)
+    except SeedHeadingError:
         return None
-    return vectors[:, -1]
 
 
 def advance_directions(points: np.ndarray, sign: float, volume) -> np.ndarray | None:

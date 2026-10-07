@@ -17,9 +17,8 @@ import numpy as np
 
 from vesuvius.neural_tracing.tracers.shared.geometry import frame_from_heading
 from vesuvius.neural_tracing.tracers.fibers.frames.ct import (
-    FRAME_POLICY, LEARNED_FRAME_POLICY, FRAME_POLICIES, PREDICTION_FRAME_POLICY, fiber_family, orient_item, reframe_item,
-    frame_prefetch_bounds, heading_free_bounds, normal_context,
-)
+    FRAME_POLICY, LEARNED_FRAME_POLICY, FRAME_POLICIES, PREDICTION_FRAME_POLICY, fiber_family, orient_item,
+    reframe_item, frame_prefetch_bounds, heading_free_bounds, normal_context)
 from vesuvius.neural_tracing.tracers.shared.reference import observed_path
 
 DEFAULT_FRAME_CHECKPOINT = str(Path(__file__).resolve().parents[1]/'output'/'heading_model_l0_w16_centered_frame'/'ckpt_064000.pt')

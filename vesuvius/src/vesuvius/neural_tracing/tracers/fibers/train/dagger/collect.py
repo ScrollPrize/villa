@@ -20,16 +20,20 @@ import warnings
 import numpy as np
 import torch
 
-from vesuvius.neural_tracing.tracers.fibers.data.fibers import ZBand, load_fibers, split_fibers, fiber_manifest, training_state_allowed
+from vesuvius.neural_tracing.tracers.fibers.data.fibers import (
+    ZBand, load_fibers, split_fibers, fiber_manifest, training_state_allowed)
 from vesuvius.neural_tracing.tracers.fibers.data.replay import OnPolicyStates
 from vesuvius.neural_tracing.tracers.fibers.data.samples import SampleConfig
 from vesuvius.neural_tracing.tracers.fibers.data.targets import label_state
 from vesuvius.neural_tracing.tracers.fibers.data.seeds import directed_seed
 from vesuvius.neural_tracing.tracers.shared.geometry import arclength
-from vesuvius.neural_tracing.tracers.fibers.frames.ct import SeedHeadingError, SEED_HEADING_POLICY, TRACE_HEADING_POLICY, FRAME_POLICY
+from vesuvius.neural_tracing.tracers.fibers.frames.ct import SEED_HEADING_POLICY, TRACE_HEADING_POLICY, FRAME_POLICY
+from vesuvius.neural_tracing.tracers.shared.ct_structure import SeedHeadingError
 from vesuvius.neural_tracing.tracers.shared.policy import checkpoint_policy
 from vesuvius.neural_tracing.tracers.shared.reference import SEED_FIELDS
-from vesuvius.neural_tracing.tracers.fibers.data.state_labels import DEPARTURE_DISTANCE, DEPARTURE_PATIENCE, REASON, RECOVERABLE, REPLAY_CLASSES, SUPERVISION, TERMINAL, TraceLabeler, replay_class
+from vesuvius.neural_tracing.tracers.fibers.data.state_labels import (
+    DEPARTURE_DISTANCE, DEPARTURE_PATIENCE, REASON, RECOVERABLE, REPLAY_CLASSES, SUPERVISION, TERMINAL, TraceLabeler,
+    replay_class)
 from vesuvius.neural_tracing.tracers.fibers.tracing.trace import FiberTracer, TraceParams
 from vesuvius.neural_tracing.tracers.models.checkpoint import load_checkpoint
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume
