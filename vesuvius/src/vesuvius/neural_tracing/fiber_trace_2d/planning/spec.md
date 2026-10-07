@@ -95,6 +95,23 @@
 
 ### Opt-in external neural follower comparison
 
+- Checkpoints whose memory/identity architecture was removed upstream may use
+  an explicitly pinned historical follower runtime verified against saved source
+  hashes. Keep its original policy, frame and committed-path callback behavior;
+  never drop checkpoint features to fit a newer loader. Current shared native
+  replay/verification, CT reader and GPU queue remain in use. Include matched
+  unfiltered controls and record runtime commit and per-file provenance.
+- Optional neural FW/BW uses the shared native monotone reverse-path verifier
+  and reference replay rollback: full prefix every512 base voxels, terminal
+  endpoints included, ellipse20/40, no reverse history. Fresh reverse rollout
+  uses the actual forward endpoint/tangent (sign only), not reference geometry.
+  Forward/reverse state is separate; native CT loading and ready GPU queue are
+  shared. Reverse confidence/length exhaustion before prefix origin fails.
+- Neural filtered reseeding stays on the reference arc because followers have
+  no dense presence field for aligned-local-maximum selection. This difference
+  from regular tracing is explicit in comparisons. Report confidence and reverse
+  stops separately: a terminal confidence endpoint rejected by reverse checking
+  becomes a reverse stop. Disabled behavior/defaults remain unchanged.
 - Reuse the native reference replay acceptance, grace and restart grouping and
   the existing shared ready-forward queue/native CT reader. External followers
   do not replace default volume-based tracing.

@@ -8,6 +8,26 @@ from vesuvius.neural_tracing.fiber_trace_3d.neural_follow_batch import ForwardQu
 from vesuvius.neural_tracing.fiber_trace_3d.neural_follow_evaluate import family_of
 
 
+def test_historical_benchmark_preserves_saved_settings(tmp_path,monkeypatch):
+    import neural_follow_benchmark as driver
+    original=dict(checkpoint='old.pt',heading_checkpoint='heading.pt',output='old',
+        native_binary='old-bin',case_workers_per_gpu=16,max_batch_size=8,
+        input_workers_per_gpu=24,io_threads_per_gpu=24,precision='bf16',
+        policy_overrides={},replay=dict(nominal_step_base=8))
+    folder=tmp_path/'flow-full'
+    folder.mkdir()
+    (folder/'config.json').write_text(json.dumps(original))
+    monkeypatch.setattr(driver,'HISTORICAL_ROOT',tmp_path)
+    config=driver.historical_config('flow',tmp_path/'new')
+    for key in ('checkpoint','heading_checkpoint','case_workers_per_gpu','max_batch_size',
+                'input_workers_per_gpu','io_threads_per_gpu','precision','policy_overrides','replay'):
+        assert config[key]==original[key]
+    assert config['backend']=='historical'
+    assert config['forward_length_mode']=='reference_remaining_x3'
+    assert config['follower_runtime_commit']==driver.HISTORICAL_COMMIT
+    assert json.loads((folder/'config.json').read_text())==original
+
+
 def test_family_manual_precedes_automatic():
     assert family_of({'hv_classification':{'manual_tag':'V','automatic_tag':'H'}})=='V'
     with pytest.raises(ValueError): family_of({})
@@ -102,6 +122,10 @@ def test_native_callback_replay_success_and_expired_observer(tmp_path):
     result=json.loads(normals.replay(np.array([[8.,16.,16.],[24.,16.,16.]]),trace,1.,2.,0.,2.,1.,3.))
     assert result['case']['evaluation_complete']
     assert not result['case']['failures']
+    def forbidden(*args): raise AssertionError('disabled reverse must not run')
+    disabled=json.loads(normals.replay(np.array([[8.,16.,16.],[24.,16.,16.]]),trace,1.,2.,0.,2.,1.,3.,
+        reverse_runner=forbidden,reverse_interval_base=0.))
+    assert disabled==result
     with pytest.raises(RuntimeError,match='expired'):
         escaped[0](np.array([[1.,2.,3.]]),1)
 
@@ -155,3 +179,79 @@ def test_native_reader_preserves_bytes_and_fill(tmp_path):
     padded=native.read((-1,-1,-1),(6,6,6))
     assert np.all(padded[0]==17)
     assert np.array_equal(padded[1:5,1:5,1:5],values)
+
+
+@pytest.mark.parametrize('mode',['correct','lateral','wrong_way','confidence','duplicate'])
+def test_native_reverse_full_prefix(tmp_path,mode):
+    normals=normal_fixture(tmp_path)
+    line=np.array([[8.,16.,16.],[24.,16.,16.]])
+    starts=[]
+    reverse_starts=[]
+    def forward(start,tangent,remaining,max_steps,observe):
+        starts.append(start[0])
+        observe(np.array([np.asarray(start)+np.asarray(tangent)*s
+            for s in np.arange(1,remaining+1)],np.float64),1)
+        return 'done'
+    def reverse(start,tangent,remaining,max_steps,observe):
+        reverse_starts.append((start[0],remaining))
+        if mode=='confidence': return 'confidence'
+        if mode=='duplicate':
+            observe(np.array([start,start],np.float64),1)
+            return 'length'
+        direction=np.asarray(tangent) if mode!='wrong_way' else -np.asarray(tangent)
+        points=np.array([np.asarray(start)+direction*s for s in np.arange(1,remaining+1)],np.float64)
+        if mode=='lateral': points[:,2]+=5
+        observe(points,1)
+        return 'done'
+    result=json.loads(normals.replay(line,forward,1.,2.,0.,2.,1.,3.,
+        reverse_runner=reverse,reverse_interval_base=6.,reverse_normal_radius_base=2.,reverse_tangent_radius_base=4.))
+    assert result['case']['evaluation_complete']
+    assert reverse_starts
+    reasons=[s['termination_reason'] for s in result['replay']['segments']]
+    if mode=='correct':
+        assert reasons==['reference_end']
+        assert reverse_starts==[(14.,6.),(20.,12.),(24.,16.)]
+    else:
+        assert 'reverse_consistency_filtered' in reasons
+        assert all(b>a for a,b in zip(starts,starts[1:]))
+
+
+def test_native_reverse_rollback_and_terminal_error_check(tmp_path):
+    normals=normal_fixture(tmp_path)
+    line=np.array([[8.,16.,16.],[24.,16.,16.]])
+    starts=[]
+    saved=[]
+    def forward(start,tangent,remaining,max_steps,observe):
+        starts.append(start[0])
+        observe(np.array([np.asarray(start)+np.asarray(tangent)*s
+            for s in np.arange(1,remaining+1)],np.float64),1)
+        return 'confidence'
+    def reverse(start,tangent,remaining,max_steps,observe):
+        saved.append(observe)
+        if start[0]==20: return 'confidence'
+        observe(np.array([np.asarray(start)+np.asarray(tangent)*s
+            for s in np.arange(1,remaining+1)],np.float64),1)
+        return 'done'
+    result=json.loads(normals.replay(line,forward,1.,2.,0.,2.,1.,3.,
+        reverse_runner=reverse,reverse_interval_base=6.))
+    segments=result['replay']['segments']
+    assert starts==[8.,21.]
+    assert segments[0]['termination_reason']=='reverse_consistency_filtered'
+    assert segments[0]['end_reference_arc_base']==6.
+    assert segments[0]['trace_points_base_xyz'][-1]==[14.,16.,16.]
+    assert segments[1]['termination_reason']=='reference_end'
+    with pytest.raises(RuntimeError,match='expired'):
+        saved[0](np.array([[8.,16.,16.]]),1)
+
+    def bad_forward(start,tangent,remaining,max_steps,observe):
+        observe(np.array([np.asarray(start)+[1,0,5]],np.float64),1)
+        return 'observer_stop'
+    checks=[]
+    def short_reverse(*args):
+        checks.append(args[0])
+        return 'confidence'
+    result=json.loads(normals.replay(line,bad_forward,1.,2.,0.,2.,1.,3.,
+        reverse_runner=short_reverse,reverse_interval_base=100.))
+    assert checks  # GT-error endpoints checked despite not reaching interval.
+    assert all(s['termination_reason']=='reverse_consistency_filtered'
+        for s in result['replay']['segments'])

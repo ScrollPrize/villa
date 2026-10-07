@@ -23,7 +23,9 @@ class NormalSampler {
 public:
     std::string replay(nb::ndarray<const double, nb::numpy, nb::ndim<2>, nb::c_contig> points,
                        nb::callable runner, double nominalStep, double threshold,
-                       double grace, double tangentFactor, double refine, double maxStepFactor) {
+                       double grace, double tangentFactor, double refine, double maxStepFactor,
+                       nb::object reverseRunner, double reverseInterval,
+                       double reverseNormalRadius, double reverseTangentRadius) {
         if (points.shape(1) != 3 || points.shape(0) < 2)
             throw std::invalid_argument("expected reference [N,3] base XYZ points");
         if (!(nominalStep>0 && maxStepFactor>0 && threshold>0 && tangentFactor>0 && grace>=0 && refine>=0)
@@ -37,8 +39,12 @@ public:
                 reference[i][a]=v;
             }
         const auto geometry=vc::fiber_tracer::makePolylineArcGeometry(reference);
-        vc::fiber_tracer::ReplaySegmentRunner segment = [&](const auto& start, double remaining,
-                int maximumSteps, const auto& observer, const auto&) -> std::string {
+        if (!std::isfinite(reverseInterval) || reverseInterval < 0 ||
+            (reverseInterval > 0 && (reverseRunner.is_none() || !PyCallable_Check(reverseRunner.ptr()))))
+            throw std::invalid_argument("positive reverse interval requires reverse runner");
+        auto invoke = [&](nb::handle callback, const vc::fiber_tracer::PolylineArcSample& start,
+                double remaining, int maximumSteps,
+                const vc::fiber_tracer::ReplayPointObserver& observer) -> std::string {
             nb::gil_scoped_acquire acquire;
             auto active=std::make_shared<bool>(true);
             auto observe=nb::cpp_function([active, observer](
@@ -56,14 +62,41 @@ public:
             });
             try {
                 auto xyz=[](const cv::Vec3d& p){return nb::make_tuple(p[0],p[1],p[2]);};
-                const auto reason=nb::cast<std::string>(runner(xyz(start.point),xyz(start.tangent),remaining,maximumSteps,observe));
+                const auto reason=nb::cast<std::string>(callback(xyz(start.point),xyz(start.tangent),remaining,maximumSteps,observe));
                 *active=false;
                 return reason;
             } catch (...) { *active=false; throw; }
         };
+        vc::fiber_tracer::ReplaySegmentRunner segment = [&](const auto& start,
+                double remaining, int maximumSteps, const auto& observer, const auto&) {
+            return invoke(runner, start, remaining, maximumSteps, observer);
+        };
+        vc::fiber_tracer::ReplayConsistencyPolicy consistency;
+        if (reverseInterval > 0) {
+            consistency.intervalBase = reverseInterval;
+            consistency.toStart = true;
+            consistency.allEndpoints = true;
+            consistency.verify = [&](const std::vector<cv::Vec3d>& forward) {
+                const auto path = vc::fiber_tracer::makePolylineArcGeometry(forward);
+                auto start = vc::fiber_tracer::samplePolylineArc(path, path.length());
+                vc::fiber_tracer::ReverseSpanVerifier verifier(path, path.length(), start.point,
+                    sampler_, 1., reverseNormalRadius, reverseTangentRadius);
+                start.tangent = -start.tangent;
+                invoke(reverseRunner, start, path.length(),
+                    std::max(2, int(std::ceil(3. * path.length() / nominalStep)) + 1),
+                    [&](const cv::Vec3d& p, double, int) { return verifier.observe(p); });
+                return verifier.remainingArc() <= 1.e-12;
+            };
+            // Neural followers have no dense presence field for local-maximum
+            // reseeding. Preserve their reference-arc seed policy explicitly.
+            consistency.nextSeed = [&](double arc) -> std::optional<vc::fiber_tracer::PolylineArcSample> {
+                if (arc >= geometry.length()) return std::nullopt;
+                return vc::fiber_tracer::samplePolylineArc(geometry, arc);
+            };
+        }
         nb::gil_scoped_release release;
         const auto result=vc::fiber_tracer::traceReferenceReplayCore(geometry,0.,geometry.length(),
-            nominalStep,maxStepFactor,threshold,grace,tangentFactor,refine,sampler_,1.,segment,{},{});
+            nominalStep,maxStepFactor,threshold,grace,tangentFactor,refine,sampler_,1.,segment,{},{},consistency);
         vc::fiber_tracer::FiberReferenceReplayCase replayCase;
         replayCase.pointsBaseXYZ=reference;
         replayCase.referenceLengthBaseVoxels=geometry.length();
@@ -123,5 +156,7 @@ void bindNormalSampler(nb::module_& m) {
         .def("replay", &NormalSampler::replay, "points_xyz"_a, "run_segment"_a,
              "nominal_step_base"_a, "threshold_base"_a=40., "grace_base"_a=160.,
              "tangential_factor"_a=2., "match_refine_steps"_a=1., "max_step_factor"_a=3.,
+             "reverse_runner"_a=nb::none(), "reverse_interval_base"_a=0.,
+             "reverse_normal_radius_base"_a=20., "reverse_tangent_radius_base"_a=40.,
              "Run the shared native reference replay protocol with a callback tracer. Returns replay JSON.");
 }

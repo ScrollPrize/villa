@@ -14,6 +14,34 @@ namespace
 constexpr double kEpsilon = 1.0e-12;
 }  // namespace
 
+ReverseSpanVerifier::ReverseSpanVerifier(const PolylineArcGeometry& geometry,
+    double startArc, const cv::Vec3d& startPoint,
+    const vc::lasagna::NormalSampler& normals, double scale,
+    double normalRadius, double tangentRadius)
+    : geometry_(geometry), normals_(normals), scale_(scale),
+      normalRadius_(normalRadius), tangentRadius_(tangentRadius),
+      arc_(startArc), previous_(startPoint)
+{
+    if (!std::isfinite(normalRadius) || !(normalRadius > 0) ||
+        !std::isfinite(tangentRadius) || !(tangentRadius > 0))
+        throw std::invalid_argument("reverse radii must be finite and positive");
+}
+
+bool ReverseSpanVerifier::observe(const cv::Vec3d& point)
+{
+    const double advance = cv::norm(point - previous_);
+    if (!(advance > kEpsilon)) return true;
+    previous_ = point;
+    const auto projection = projectPointToPolylineArc(geometry_, point,
+        std::max(0.0, arc_ - 2.0 * advance), arc_);
+    const auto measurement = measureFiberReplayThreshold(point, projection.point,
+        normals_, scale_, normalRadius_, tangentRadius_ / normalRadius_);
+    if (fiberReplayThresholdExceeded(measurement, normalRadius_) ||
+        !(projection.arc < arc_ - kEpsilon)) return false;
+    arc_ = projection.arc;
+    return arc_ > kEpsilon;
+}
+
 FiberReplayTraceResult traceReferenceReplayCore(
     const PolylineArcGeometry& reference,
     double startArcBase,

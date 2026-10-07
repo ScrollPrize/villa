@@ -45,6 +45,22 @@ struct ReplayConsistencyPolicy {
     std::function<std::optional<PolylineArcSample>(double)> nextSeed;
 };
 
+// Backend-independent reverse verification against the actual forward path.
+// Coordinates are base XYZ; this object must not outlive geometry/normals.
+class ReverseSpanVerifier {
+public:
+    ReverseSpanVerifier(const PolylineArcGeometry& geometry, double startArc,
+        const cv::Vec3d& startPoint, const vc::lasagna::NormalSampler& normals,
+        double normalWorkingToBaseScale, double normalRadius, double tangentRadius);
+    bool observe(const cv::Vec3d& point);
+    double remainingArc() const { return arc_; }
+private:
+    const PolylineArcGeometry& geometry_;
+    const vc::lasagna::NormalSampler& normals_;
+    double scale_, normalRadius_, tangentRadius_, arc_;
+    cv::Vec3d previous_;
+};
+
 [[nodiscard]] FiberReplayTraceResult traceReferenceReplayCore(
     const PolylineArcGeometry& reference,
     double startArcBase,

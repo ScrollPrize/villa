@@ -1,8 +1,9 @@
 # Status
 
-- [x] Branch/baseline discovery.
+- [x] Commit prior work; read specifications.
 - [x] Independent plan and implementation review.
-- [x] Normal export and tracing-only binding.
-- [x] Tests/build:12Python,99native.
-- [x] Two full evaluations plus two matched-cache Lasagna controls.
-- [x] Docs/log/spec/changelog; no default promotion.
+- [x] Shared verification and neural integration.
+- [x] Build/regression/pilot.
+- [x] Both full evaluations, report and durable documentation.
+- [x] Memory/Flowv4 extension review, checkpoint inspection and configuration tests (149native/38Python).
+- [x] Old-model pilots and matched unfiltered/FW full runs; expanded comparison including EMA999 without FW.

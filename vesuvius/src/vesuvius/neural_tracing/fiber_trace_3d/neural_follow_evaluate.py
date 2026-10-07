@@ -24,10 +24,24 @@ def digest(path):
         return hashlib.file_digest(handle, 'sha256').hexdigest()
 
 
-def implementation_identity(binary):
+def activate_follower_runtime(config):
+    """Select a pinned historical package for checkpoints removed upstream."""
+    if config.get('follower_runtime'):
+        import vesuvius.neural_tracing as package
+        location=Path(config['follower_runtime'])/'vesuvius/src/vesuvius/neural_tracing'
+        if not (location/'fiber_follow/tracing/trace.py').is_file():
+            raise ValueError('missing frozen follower runtime')
+        if any(name.startswith('vesuvius.neural_tracing.fiber_follow') for name in sys.modules):
+            raise RuntimeError('select frozen follower runtime before importing follower modules')
+        package.__path__=[str(location),*package.__path__]
+
+
+def implementation_identity(binary, follower_runtime=None):
     """Prevent resumed cases from silently mixing evaluator/model revisions."""
     package = Path(__file__).resolve().parent
-    files = list((package.parent / 'fiber_follow').rglob('*.py'))
+    follower=(Path(follower_runtime)/'vesuvius/src/vesuvius/neural_tracing/fiber_follow'
+              if follower_runtime else package.parent/'fiber_follow')
+    files = list(follower.rglob('*.py'))
     files += list(package.glob('neural_follow_*.py'))
     files += [package / 'replay_metrics.py', Path(binary).resolve()]
     native = Path(os.environ['FIBER_FOLLOW_NATIVE_DIR'])
@@ -77,6 +91,7 @@ def worker(device, config, pending, completed):
     # Spawned only inside manager-owned process; no CUDA initialization before grant.
     import numpy as np
     import torch
+    activate_follower_runtime(config)
     from .neural_follow_native import load_native
     load_native()
     from vc.volume import Volume, NormalSampler, set_chunk_cache_io_threads, set_chunk_cache_decode_threads, set_chunk_cache_budget
@@ -145,18 +160,25 @@ def worker(device, config, pending, completed):
                         tracer.pool.shutdown()
                         tracer.pool = pool
                         tracer.forward = forward
+                        reverse_tracer = FiberTracer(model,volume,crop,history,copy.copy(params),device=cuda)
+                        reverse_tracer.pool.shutdown()
+                        reverse_tracer.pool = pool
+                        reverse_tracer.forward = forward
                         points = np.ascontiguousarray(case['points'],dtype=np.float64)
 
-                        def segment(start,tangent,remaining,max_steps,observe):
+                        def trace_segment(active_tracer,start,tangent,remaining,max_steps,observe,reverse=False):
                             seed = np.asarray(start,dtype=np.float64)/g
                             try:
                                 heading=ct_seed_heading(volume,seed,case['family'])
                             except SeedHeadingError:
                                 return 'seed_heading_unavailable'
-                            # GT provides only traversal sign, never frame/history.
+                            # Forward: GT traversal sign only. Reverse: actual
+                            # forward endpoint tangent sign, never GT geometry.
                             if np.dot(heading,tangent)<0:
                                 heading=-heading
-                            tracer.p.max_len = config.get('max_len', 100000.)
+                            active_tracer.p.max_len = (max(3*remaining/g,2.) if reverse else
+                                max(3*remaining/g,1.) if config.get('forward_length_mode')=='reference_remaining_x3'
+                                else config.get('max_len', 100000.))
                             sent=1
                             def abort(_index,path):
                                 nonlocal sent
@@ -166,15 +188,29 @@ def worker(device, config, pending, completed):
                                 if len(new) and not observe(new,first):
                                     return True
                                 return sent>=max_steps
-                            _, reasons=tracer._trace(np.asarray([seed]),np.asarray([heading]),
-                                None,families=[case['family']],on_commit=abort)
+                            if config.get('follower_runtime'):
+                                _, reasons=active_tracer._trace(np.asarray([seed]),np.asarray([heading]),
+                                    None,abort,None,families=[case['family']])
+                            else:
+                                _, reasons=active_tracer._trace(np.asarray([seed]),np.asarray([heading]),
+                                    None,families=[case['family']],on_commit=abort)
                             return reasons[0]
+
+                        def segment(*args):
+                            return trace_segment(tracer,*args)
+
+                        def reverse_segment(*args):
+                            return trace_segment(reverse_tracer,*args,reverse=True)
 
                         settings=config['replay']
                         measured=json.loads(normals.replay(points,segment,
                             nominal_step_base=settings['nominal_step_base'],
                             threshold_base=settings['threshold_base'], grace_base=settings['grace_base'],
-                            tangential_factor=settings['tangential_factor'],match_refine_steps=settings['match_refine_steps']))
+                            tangential_factor=settings['tangential_factor'],match_refine_steps=settings['match_refine_steps'],
+                            reverse_runner=reverse_segment,
+                            reverse_interval_base=settings.get('reverse_interval_base',0),
+                            reverse_normal_radius_base=settings.get('reverse_normal_radius_base',20),
+                            reverse_tangent_radius_base=settings.get('reverse_tangent_radius_base',40)))
                         outcome=measured['case']
                         outcome.update(source_index=case['source_index'],run_index=case['run_index'],
                             direction='reverse' if case['reverse'] else 'forward',reference_run=case['reference_run'])
@@ -227,12 +263,15 @@ def run(config, devices):
     ids={case['source_id'] for case in cases}
     config['sources']=[s for s in source_config['sources'] if s['id'] in ids]
     config['identity']=dict(checkpoint_sha256=digest(config['checkpoint']),
-        heading_sha256=digest(config['heading_checkpoint']),upstream='853dcf536',
+        heading_sha256=digest(config['heading_checkpoint']),upstream=config.get('upstream','853dcf536'),
         backend=config.get('backend', 'current'),sampling_seed=config.get('sampling_seed',0),
         policy_overrides=config.get('policy_overrides',{}),trace_grid_base=config['trace_grid_base'],
         ct_level=config['ct_level'],ct_grid_base=config['ct_grid_base'],precision=config.get('precision','bf16'),
         seed_heading='ct_hv_with_reference_traversal_sign',replay=config['replay'],
-        implementation=implementation_identity(config['native_binary']))
+        implementation=implementation_identity(config['native_binary'],config.get('follower_runtime')))
+    if config.get('follower_runtime'):
+        config['identity'].update(follower_runtime_commit=config['follower_runtime_commit'],
+            forward_length_mode=config['forward_length_mode'])
     binding=dict(config=config,references=[{k:v for k,v in c.items() if k!='source'} for c in cases])
     path=root/'binding.json'
     if path.exists() and json.loads(path.read_text())!=binding:

@@ -1,34 +1,21 @@
-# Predicted normal tracing comparison
+# Neural FW/BW task log
 
-Already on fiber-exp5 at915e31e0f, latest evaluation branch. Prior neural implementation preserved uncommitted. Selected EMA999u12100 and best-loss EMA99u19100 (same3errors as raw best, fewerpieces/morecoverage). Native replay shares normal sampler with GT acceptance: separate tracing normals to preserve metric. Auxiliary normal head not exported yet; explicit new product needed. Existing queues/resources unchanged.
+- Completed older-model matrix: all four runs182/182 directions. Flowv4 matched control102.92s; FW224.90s and1499reverse checks. Min0 errors43→3, retained99.622→69.397%; FW528confidence/518reverse stops. Min512 errors23→1, pieces352→309, retained85.831→61.773%, FW90confidence/148reverse stops, mean3.568mm/median2.461mm. No default promotion: fewer errors but substantial lost coverage. Memory results below also complete.
+- Expanded report explicitly includes saved own tuned EMA999u12100 WITHOUT FW/BW: min5120errors,86presence stops,233pieces,82.086%,mean13.079mm/median3.814mm. Width40% cosine and post-modulated cutoff0.4 remain enabled; not an unmodulated control. Report regeneration only, no GPU allocation. All historical and matched rows, min0/min512 and per-scroll data retained.149native/38Python tests passed for the extension. Limitations remain GT-arc neural reseeding, GT-assisted min512 filtering, and BF16/control variation; old models use verified frozen upstream runtime, not current incompatible loader.
 
-Independent plan and implementation reviews approved. Added opt-in six-sigmoid normal output after width, accumulated using existing products then compact nx/ny encoding; sheet_grad_mag is255 validity (not a measured winding density). Native sampler aliases these channels on the same lattice; readiness includes all three channels before grouped or ordinary sampling. Forward and reverse use predicted normals; GT acceptance and restart seed search use original Lasagna. No silent Lasagna fallback. Explicit cache identity, missing-head rejection and no auxiliary TTA.
+- Follow-up requested memory/Flowv4 and explicit own EMA999 without FW. Historical rows were unfiltered only. Plan extends same task to both with original batch8/16case workers, and matched current-code unfiltered controls because upstream changed since historical runs. Shared filter/scheduling untouched.
+- Compatibility inspection: current legacy loader rejects memory='decisions'. Reuse frozen historical model/rollout package from ba86eea12 as a versioned runtime artifact (not a reimplementation). All181 Python file hashes match each saved historical run. Namespace activation corrected for namespace packages. Original forward cap was3×remaining GT arc, now explicitly retained. Memory policy .4/full/8,3refinement steps; Flowv4 checkpoint policy .5/prefix/16,0refinement steps. Heading hash matches both. Matched controls still planned to measure integration/batching variation.
+- Independent extension/implementation review approved the frozen runtime path and restored callback/length semantics.149native/38Python tests passed, including old policy/batch preservation. Memory reverse pilot completed; Flow reverse pilot queued via manager.
+- Both older-model reverse pilots passed. Started full matrix via same approved command, control older_matrix true: memory control→memory FW/BW→Flowv4 control→Flowv4 FW/BW. Each182directions, GPU0–5. Report after each full run, historical rows retained separately.
+- Memory matched control completed101.30s: min0 14errors/99.042% retained; min5126errors/340pieces/77.053%,225confidence stops. Memory FW completed212.42s,1525reverse checks: min0 3errors/63.940% retained,1137confidence/546reverse stops; min5121error/287pieces/48.426%,84confidence/153reverse stops,mean2.809mm,median1.711mm. Strong error reduction but major coverage loss. Historical memory min5126errors/336pieces/76.542% remains a distinct saved row. Flowv4 next.
 
-Native RelWithDebInfo build succeeded;9Python tests and99native cases passed. Full first launch failed because the new driver did not propagate single-thread BLAS environment to evaluate subprocesses; huge automatic OpenBLAS pools exhausted thread capacity. Set env before imports/children and resumed with original192CPU/6GPU,128input/accumulation/publication workers andbatch4 unchanged. No completed scientific result from failed launch. Existing cache reused where complete. Logs at scripts/reviewed_predicted_normals.run.log. Both full runs queued via approved command.
-
-Resume guard required archiving the failed full directory; reused existing archive_incomplete_output helper, no deletion of caches or artifacts. Added independent known-axis tests: at nz=0 both antipodal signs are valid, corrected test to check axis not arbitrary sign. Final12Python/99native passed. No numerical code change from that test adjustment. EMA999 run now processing; hashes/source bindings and native effective policy are audited against historical control.
-
-EMA999u12100 full completed182/182: min512 3errors/232pieces/81.070% retained vs historical0/233/82.086%. Total successful-attempt wall439.44s includes startup/inference/shutdown; initial failed attempt excluded. Additional matched-cache Lasagna controls queued to isolate normal-source effects from fresh accumulation roundoff. These preserve exact emitted primary/width bytes and all trace settings. Report generator wording corrected to avoid claiming enabled FW checks for these disabled-FW policies.
-
-All four full182-case runs completed. Min512:
-
-| Model | Normal source | Errors | Presence stops | Pieces | Retained% | Mean mm | Median mm |
-|---|---|---:|---:|---:|---:|---:|---:|
-| EMA999u12100 | historical Lasagna |0|86|233|82.086|13.079|3.814|
-| EMA999u12100 | matched-cache Lasagna |1|87|234|82.031|12.776|3.830|
-| EMA999u12100 | predicted |3|86|232|81.070|12.486|3.706|
-| EMA99u19100 | historical Lasagna |3|111|258|80.681|9.725|3.376|
-| EMA99u19100 | matched-cache Lasagna |3|110|257|80.773|9.822|3.363|
-| EMA99u19100 | predicted |4|109|258|80.821|9.827|3.351|
-
-Unfiltered error counts identical to min512 for these four new runs. Additional
-control inference was needed for divergent routes; previously published shared
-chunks remain unchanged. Predicted full-run walls439.44s/371.03s; matched controls
-193.96s/166.81s with mostly warm caches and small additional fills. Not an isolated
-speed comparison; no speedup established. No clear quality improvement, no default
-change. Fresh-cache historical variation visible in EMA9990to1error. Both policy
-and cohort/normal-source-content bindings audited. Complete per-scroll/min0/min512,
-P05/P95 and provenance stored in docs/benchmarks/reviewed_predicted_normals_20261007_v1.md
-and JSON. Approved command is bash /home/hendrik/villa3/scripts/run_training_failure_mining;
-control action reviewed_predicted_normals, optional paired_controls:true. Build/tests
-use operation:build/tests. Completed runs are analyzed, not rerun.
+- Prior work committed:956a81c1e,510339f25. Branch fiber-exp5.
+- Plan: shared native consistency; Flowv5 and Unified unchanged model policies; GPU0–5. Neural reseeding cannot use dense presence peaks and retains reference-arc progression; this is an explicit comparison limitation.
+- Independent review approved with explicit GT-arc reseed, separate reverse state, shared exact verifier and completion-based acceptance. Implemented these requirements.
+- Approved runner build passed; native suites99+23+27 cases and Python36 tests passed, including full-prefix/terminal success, lateral/wrong-way/duplicate/confidence failure, existing history/width regressions. Pilot next.
+- Additional rollback/GT-error endpoint test passed (37Python total); independent implementation review found no blocking defect. Both GPU pilots completed with nested reverse inference through the existing queue. Full182-case runs started for both models, sequential model scheduling on GPU0–5.
+- Flowv5 full completed:1533 reverse checks,364.24s to last case. Min0:26→8 error episodes,97.172→71.448% retained;454 reverse stops/2776 confidence stops. Min512:14→5 errors,296→254 pieces,84.840→62.789% retained;74reverse/78confidence stops,mean5.509mm,median2.485mm. Thus error reduction costs substantial coverage; no promotion. Unified pending.
+- Unified full completed:1392reverse checks,432.38s to last case. Min0:24→5errors,96.320→70.919% retained;391reverse/3812confidence stops. Min512:13→3errors,285→239pieces,86.662→65.357% retained;60reverse/75confidence stops,mean6.518mm,median2.795mm.
+- Both full182-direction runs complete. Report includes historical memory/Flowv4, unchanged unfiltered new-model controls and tuned regular EMA999u12100 (min512:0errors/233pieces/82.086%). Exact reference geometry and checkpoint/policy/precision audits passed. Historical controls were not rerun; BF16 batching sensitivity remains.
+- Approved command for all builds/tests/pilots/full runs/report: `bash /home/hendrik/villa3/scripts/run_training_failure_mining`. Control action `neural_follow`, operation `build` / tests true / reverse true with pilot true or false / operation report. Tests:149native +37Python passed, including disabled parity. GPUs0–5,192CPU manager grant, unchanged batching/loading settings.
+- Durable results: docs/benchmarks/neural_follow_reverse_20261007.md and JSON; artifacts /ephemeral/hendrik/fiber3d_train2/evaluations/neural_follow_reverse_91_20261007_v1. Shared native verifier rather than duplicated Python geometry. No default promotion. Explicit limitation: GT-arc neural reseeding differs from dense-presence-aligned regular reseeding; min512 output analysis is GT-assisted. Older memory/Flowv4 not new FW/BW trials.

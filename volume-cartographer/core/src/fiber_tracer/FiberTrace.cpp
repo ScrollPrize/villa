@@ -4799,33 +4799,15 @@ double verifyFiberReverseSpan(const FiberPredictionSource& predictions,
         if (!prior.empty()) start.tangent = -prior.back();
     }
     double verifiedArc = config.replayReverseHistorySteps > 0 ? start.arc : startArc;
-    cv::Vec3d previous = start.point;
     const double scale = config.traceToBaseScale;
+    ReverseSpanVerifier verifier(geometry, verifiedArc, start.point, normals,
+        scale, normalRadiusBase, tangentialRadiusBase);
     try {
         (void)traceFiberExtrapolation(predictions, start.point / scale,
             -start.tangent, std::max(3.0 * verifiedArc / scale,
                 2.0 * config.stepVoxels), config, &normals, {},
             [&](const cv::Vec3d& tracePoint, double, int) {
-                const cv::Vec3d point = tracePoint * scale;
-                const double advance = cv::norm(point - previous);
-                if (!(advance > kEpsilon))
-                    return true;
-                previous = point;
-                // Restrict each match to a small monotone arc window, so
-                // a nearby fold cannot jump the validator along the line.
-                const auto projection = projectPointToPolylineArc(geometry,
-                    point, std::max(0.0, verifiedArc - 2.0 * advance), verifiedArc);
-                const auto measurement = measureFiberReplayThreshold(point,
-                    projection.point, normals, scale,
-                    normalRadiusBase,
-                    tangentialRadiusBase /
-                        normalRadiusBase);
-                if (fiberReplayThresholdExceeded(measurement,
-                        normalRadiusBase) ||
-                    !(projection.arc < verifiedArc - kEpsilon))
-                    return false;
-                verifiedArc = projection.arc;
-                return verifiedArc > kEpsilon;
+                return verifier.observe(tracePoint * scale);
             }, prior);
     } catch (const std::invalid_argument& error) {
         // Same missing-start policy as reference replay. A reverse
@@ -4835,7 +4817,7 @@ double verifyFiberReverseSpan(const FiberPredictionSource& predictions,
             "fiber trace start point has no valid prediction direction")
             throw;
     }
-    return verifiedArc;
+    return verifier.remainingArc();
 }
 
 std::optional<PolylineArcSample> findFiberReplayRestartSeed(

@@ -1,3 +1,18 @@
+## 2026-10-07 — Neural follower full-prefix FW/BW
+
+- Reused the exact native monotone reverse verifier and replay rollback for
+  neural callbacks; independent reverse state shares existing GPU batching.
+  Checks every512base vx plus terminal endpoints, ellipse20/40, no history.
+- Both182-direction runs completed, unchanged Flowv5 .5 / Unified .7 confidence,
+  commit8/full gate. Min512: Flow14→5errors but84.840→62.789% retained;
+  Unified13→3errors but86.662→65.357% retained.254/239pieces respectively.
+  Regular tuned EMA999u12100 remains stronger:0errors/233pieces/82.086%.
+- Report includes unfiltered, per-scroll, historical neural controls and all stop
+  categories: docs/benchmarks/neural_follow_reverse_20261007.md and JSON.
+ 149native/37Python tests passed. GPU0–5 runs364/432s excluding manager wait.
+  Neural filtered reseeding uses GT arc (no dense presence maxima); explicit
+  limitation. No default promotion.
+
 ## 2026-10-07 — Predicted sheet normals in reviewed tracing
 
 - Added opt-in auxiliary normal export/cache identity/readiness and tracing-only
@@ -3951,3 +3966,6 @@ identity remains unconfirmed. Global-assignment experiments not yet implemented.
 - Normal head now shares direction's Gaussian tube/segment assignment and
   falloff normalization, including axis projection weighting. Log unweighted
   normal MSE for comparison with direction; total still applies configured weight.
+# 2026-10-07: Older neural FW/BW comparisons
+
+Completed matched unfiltered and full-prefix FW/BW evaluations for Memory and Flowv4 on91 reviewed fibers/182directions, original checkpoint policies preserved through hash-verified historical runtime. Min512 errors6→1 and23→1, but coverage77.053→48.426% and85.831→61.773%. Own tuned EMA999u12100 without FW remains0errors/82.086%/233pieces. No promotion. Full metrics, historical comparisons, per-scroll results and reproduction instructions: `docs/benchmarks/neural_follow_reverse_20261007.md` and companion JSON. Validation149native/38Python tests.
