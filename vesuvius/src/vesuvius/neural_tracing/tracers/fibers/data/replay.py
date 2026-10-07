@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import json
 
 import numpy as np
@@ -234,6 +235,17 @@ class OnPolicyStates:
             self._open(state["_dir"])
         else:
             self.__dict__.update(state)
+
+
+def own_replay_paths(paths, dagger_dir):
+    """The replay caches a run collected itself (inside its own ``dagger_dir``); caches of other runs or models are
+    dropped with a warning: DAgger states come only from the run's own recent checkpoints."""
+    root = Path(dagger_dir).resolve()
+    own = [p for p in paths if root in Path(p).resolve().parents]
+    for p in paths:
+        if p not in own:
+            print(f'Warning: dropping replay cache from another run: {p}', flush=True)
+    return own
 
 
 def load_replay(paths):

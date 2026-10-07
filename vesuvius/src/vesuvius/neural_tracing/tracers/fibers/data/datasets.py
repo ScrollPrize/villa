@@ -18,7 +18,7 @@ from vesuvius.neural_tracing.tracers.fibers.data.seeds import make_seeds, read_m
 from vesuvius.neural_tracing.tracers.shared.io import jsonable
 from vesuvius.neural_tracing.tracers.fibers.frames.ct import SEED_HEADING_POLICY, TRACE_HEADING_POLICY, FRAME_POLICY
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.normalization import volume_key
-from vesuvius.neural_tracing.tracers.fibers.data.replay import load_replay, usable_replay
+from vesuvius.neural_tracing.tracers.fibers.data.replay import load_replay, own_replay_paths, usable_replay
 from vesuvius.neural_tracing.tracers.fibers.data.episodes import loader_chunk
 
 
@@ -199,7 +199,8 @@ def build_mixed_dataset(primary, document, cfg, sample, sampling, args, *, seed,
             scale = float(source['grid_scale'])
             builder = IdentityObservationBuilder(cfg, fibers, sampling, augment=True, neighbors=AFVBank(fibers))
             replay_index = Path(out)/'dagger'/source['name']/'replay.json' if out else None
-            replay_paths = json.loads(replay_index.read_text()) if resume and replay_index and replay_index.exists() else []
+            replay_paths = (own_replay_paths(json.loads(replay_index.read_text()), Path(out)/'dagger')
+                            if resume and replay_index and replay_index.exists() else [])
             replay = usable_replay(load_replay(replay_paths), fibers, sample.n_history, spec.grid_scale)
             dataset = FollowDataset(fibers, spec, sample, chunk=loader_chunk(cfg, args.batch),
                 seed=seed+100003*(index+1), cache_bytes=int(args.worker_cache_gb*(1<<30)),

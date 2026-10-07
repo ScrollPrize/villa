@@ -5,7 +5,8 @@ CT plus the supplied H/V family initializes each bidirectional trace. Every seed
 gets a status record in ``seeds.json``: exported, seed-only (no committed
 point), CT-unavailable, deduplicated or filtered by an explicit ``--min-length``.
 The checkpoint's operating policy is used unless ``--confidence``/``--n-commit``
-or a calibration ``--policy`` overrides it.
+or a calibration ``--policy`` overrides it. ``--refit-retry`` (off by default) lets a decision that would stop on
+confidence retry once with its crop refit to its own prediction.
 
   python -m vesuvius.neural_tracing.tracers.fibers.tracing.inference --checkpoint last.pt \
       --seed 18529.9,13044.9,51234.1 --family H --out traced/
@@ -197,6 +198,8 @@ def main(argv=None, *, checkpoint_loader=load_checkpoint, tracer_class=FiberTrac
     ap.add_argument("--sampling-seed", type=int, default=0, help="Reproducible per-trace sampling noise")
     ap.add_argument("--flow-samples", type=int, help="flow: Gaussian-start proposals per decision (default: checkpoint)")
     ap.add_argument("--flow-sample-scale", type=float, help="flow: their standard deviation in residual-scale units")
+    ap.add_argument("--refit-retry", action='store_true',
+                    help="before a confidence stop, retry once with the crop refit to the decision's own prediction")
     ap.add_argument("--precision", choices=('bf16', 'fp32'), default='bf16',
                     help="model arithmetic; fp32 (TF32 off) makes traces independent of batch composition")
     args = ap.parse_args(argv)
@@ -229,7 +232,7 @@ def main(argv=None, *, checkpoint_loader=load_checkpoint, tracer_class=FiberTrac
     prepare_normalization(args.out, [spec], known=ck['ct_normalization'])
     vol = CTVolume(spec, cache_bytes=8 << 30)
     tracer = tracer_class(model, vol, crop, n_hist, TraceParams.from_policy(policy, max_len=args.max_len,
-        seed=args.sampling_seed, precision=args.precision), device=args.device)
+        seed=args.sampling_seed, precision=args.precision, refit_retry=args.refit_retry), device=args.device)
     g = spec.grid_scale
 
     seeds = [np.array([float(v) for v in s.split(",")]) for s in args.seed]

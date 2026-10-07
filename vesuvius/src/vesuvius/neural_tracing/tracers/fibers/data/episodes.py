@@ -48,7 +48,8 @@ def episode_decisions(fiber, t0, reverse, steps, commit, cfg: SampleConfig, rng:
     for j in range(steps):
         i = int(round(prefix/step))+j*per_commit
         departed = details if np.abs(offsets[:i+1]).max() > 0 else {}
-        decision = decision_on_path(fiber, float(arcs[i]), reverse, cfg, path[:i+1], arcs[:i+1], category, sigma, departed)
+        decision = decision_on_path(fiber, float(arcs[i]), reverse, cfg, path[:i+1], arcs[:i+1], category, sigma, departed,
+                                    rng)
         out.append((decision, path[i:i+per_commit+1].copy()))
     return out
 

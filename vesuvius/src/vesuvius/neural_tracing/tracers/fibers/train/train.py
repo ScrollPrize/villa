@@ -17,7 +17,7 @@ import torch
 
 from vesuvius.neural_tracing.tracers.fibers.data.fibers import fiber_manifest
 from vesuvius.neural_tracing.tracers.fibers.data.follow_dataset import FollowDataset
-from vesuvius.neural_tracing.tracers.fibers.data.replay import load_replay, usable_replay
+from vesuvius.neural_tracing.tracers.fibers.data.replay import load_replay, own_replay_paths, usable_replay
 from vesuvius.neural_tracing.tracers.fibers.data.samples import SampleConfig
 from vesuvius.neural_tracing.tracers.fibers.data.tasks import TASKS, TaskBudget
 from vesuvius.neural_tracing.tracers.fibers.train.dagger.online import OnlineCollector
@@ -36,7 +36,7 @@ from vesuvius.neural_tracing.tracers.fibers.train.step import initialize_trainin
 from vesuvius.neural_tracing.tracers.fibers.evaluation.monitor.plots import plot_run_curves
 from vesuvius.neural_tracing.tracers.fibers.evaluation.monitor.recovery import monitor_fixture, evaluate_monitor
 from vesuvius.neural_tracing.tracers.fibers.evaluation.monitor.rollouts import monitor_afv_sources, training_diagnostics
-from vesuvius.neural_tracing.tracers.fibers.frames.learned import configured_frame_policy, frame_predictor, bind_frame_checkpoint
+from vesuvius.neural_tracing.tracers.fibers.frames.learned import bind_frame_checkpoint, configured_frame_policy, frame_predictor, prediction_window
 from vesuvius.neural_tracing.tracers.fibers.train.training_log import format_training_log, TrainingInterval, SamplingLedger
 
 
@@ -163,6 +163,8 @@ def main(argv=None):
     identity_sampling = IdentitySampling(
         blur_probability=args.blur_probability,blur_sigma=tuple(args.blur_sigma),
         lateral_fraction=args.lateral_fraction,bank_hard_fraction=args.bank_hard_fraction,
+        crop_tilt_probability=args.crop_tilt_probability,crop_tilt_deg=args.crop_tilt_deg,
+        crop_tilt_max_deg=args.crop_tilt_max_deg,
         bank_coverage_probability=args.bank_coverage_probability,synthetic_tail=tuple(args.synthetic_tail))
     if not 1 <= args.n_commit <= cfg.n_future:
         raise ValueError('Commit window must fit forecast')
@@ -173,6 +175,8 @@ def main(argv=None):
                           future_step=cfg.future_step, recent_history_points=cfg.n_history,
                           startup_shares=tuple(args.startup_shares), excursion_probability=args.excursion_probability,
                           excursion_amplitude=tuple(args.excursion_amplitude), excursion_rise=tuple(args.excursion_rise),
+                          seed_offset=tuple(args.seed_offset), seed_offset_ramp=args.seed_offset_ramp,
+                          live_seed_start=args.live_seed_start, prediction_window=prediction_window(cfg),
                           label_tolerance=args.tolerance, max_recovery_distance=cfg.max_recovery_distance)
     policy = training_policy(cfg, args.n_commit, args.trace_confidence, args.gate)
     progress('Loading manifest and fiber annotations')
@@ -221,7 +225,7 @@ def main(argv=None):
                 progress(f'  {name}: {", ".join(report[name][:20])}{" ..." if len(report[name]) > 20 else ""}')
     opt, done, lr_restart_step = initialize_training_optimizer(model, ema, args, resume)
     if args.reset_optimizer:
-        progress(f'Fresh AdamW: one parameter group, all parameters trainable; LR restarts at update {done+1} '
+        progress(f'Fresh AdamW: all parameters trainable; LR restarts at update {done+1} '
                  f'with {args.warmup} warmup updates to {args.lr:g}')
     # Episode batches present their supervised decisions to the compiled decision graph.
     prepare_training(model, args.batch*args.episode_supervised if cfg.model_type == 'sequence' else args.batch)
@@ -229,7 +233,7 @@ def main(argv=None):
     if done >= args.steps:
         raise ValueError('Run has already reached its requested update count')
     replay_index = out/'dagger'/'replay.json'
-    replay_paths = json.loads(replay_index.read_text()) if resume and replay_index.exists() else []
+    replay_paths = own_replay_paths(json.loads(replay_index.read_text()), out/'dagger') if resume and replay_index.exists() else []
     progress('Loading replay banks and preparing data loader')
     caches = usable_replay(load_replay(replay_paths), train_f, cfg.n_history, spec.grid_scale)
     collection = dict(every=args.dagger_every, fibers_per_collection=args.dagger_fibers, batch=args.dagger_batch,
@@ -275,8 +279,24 @@ def main(argv=None):
     progress('Task budget per source: '+', '.join(f'{k} {v:.0%}' for k, v in budget.to_dict()['shares'].items())
              +f'; replay age ceiling {budget.replay_max_age}, event cap {budget.replay_event_cap}, '
              f'synthetic terminal fallback cap {budget.terminal_fallback_cap:.0%}')
-    for source_dataset in dataset.datasets:
+    saved_draws = (resume or {}).get('replay_event_draws') or {}
+    from vesuvius.neural_tracing.tracers.fibers.data import location_weights
+    for source, name, source_dataset in zip(dataset_document['sources'], dataset.names, dataset.datasets):
         source_dataset.set_step(done)
+        if args.oversample_bend or args.oversample_compression:
+            path = location_weights.cache_path(source, args.location_weights_dir or None)
+            if path.exists():
+                weights = location_weights.load(path, source_dataset.fibers, args.oversample_bend, args.oversample_compression)
+                source_dataset.set_location_weights(weights)
+                covered = sum(w is not None for w in weights)
+                progress(f'{name}: fresh locations weighted (bend x{1+args.oversample_bend:g}, compression '
+                         f'x{1+args.oversample_compression:g}) for {covered}/{len(weights)} fibers from {path.name}')
+            else:
+                progress(f'Warning: {name}: no location-weight cache {path} (scripts/build_location_weights.py); '
+                         'fresh locations stay uniform')
+        if name in saved_draws:  # replay event caps continue where the checkpoint left them
+            source_dataset.restore_event_draws(saved_draws[name])
+            progress(f'{name}: restored replay draw counts for {len(saved_draws[name]["slots"])} events')
         if cfg.model_type == 'sequence':
             from vesuvius.neural_tracing.tracers.fibers.data.episodes import EpisodeSpec
             source_dataset.episodes = EpisodeSpec(steps=args.episode_steps, supervised=args.episode_supervised,
@@ -332,7 +352,9 @@ def main(argv=None):
                               trace_noise_bias=sample.trace_noise_bias, trace_noise_smoothing=sample.trace_noise_smoothing,
                               excursion_rise_distribution='log-uniform',
                               startup_shares=sample.startup_shares, excursion_probability=sample.excursion_probability,
-                              excursion_amplitude=sample.excursion_amplitude, excursion_rise=sample.excursion_rise),
+                              excursion_amplitude=sample.excursion_amplitude, excursion_rise=sample.excursion_rise,
+                              seed_offset=sample.seed_offset, seed_offset_ramp=sample.seed_offset_ramp,
+                              live_seed_start=sample.live_seed_start, prediction_window=sample.prediction_window),
         label_contract=dict(tolerance=sample.label_tolerance, max_recovery_distance=sample.max_recovery_distance),
         live_continuation_steps=args.live_continuation_steps,
         frame_policy=configured_frame_policy(cfg), sampling=asdict(identity_sampling)))
@@ -434,7 +456,8 @@ def main(argv=None):
                     dataset_config=dataset_document, dataset_provenance=dataset_provenance,
                     ct_normalization=ct_normalization, frame_policy=configured_frame_policy(cfg),
                     samples_seen=prior_samples+observed_states, identity_sampling=asdict(identity_sampling),
-                    run_config=run, training_options=vars(args), fiber_manifest=fiber_manifest(fibers))
+                    run_config=run, training_options=vars(args), fiber_manifest=fiber_manifest(fibers),
+                    replay_event_draws={name: d.event_draw_state() for name, d in zip(dataset.names, dataset.datasets)})
                 if resumable:
                     extra.update(optimizer=opt.state_dict(), rng=training_rng_state())
                 save_checkpoint(path, model, ema, spec, sample, extra)

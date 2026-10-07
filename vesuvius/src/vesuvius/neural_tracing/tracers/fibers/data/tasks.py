@@ -30,7 +30,7 @@ class TaskBudget:
     """
     shares: tuple = tuple(DEFAULT_TASK_SHARES[name] for name in TASKS)
     terminal_fallback_cap: float = .5
-    replay_max_age: int = 12000
+    replay_max_age: int = 3000
     replay_event_cap: int = 64
 
     def __post_init__(self):

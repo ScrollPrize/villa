@@ -65,7 +65,21 @@ class FollowDataset(torch.utils.data.IterableDataset):
         if length_power != 1:
             lengths = lengths**length_power
         self.weights = lengths / lengths.sum()
+        self.location_weights = None  # data.location_weights.load: oversample bent and compressed locations
         self.terminal_requests = self.synthetic_fallbacks = 0
+
+    def set_location_weights(self, weights):
+        """Per fiber (arclength positions, weights) or None (uniform). Fresh windows start, and positions within them
+        are kept, in proportion to the weights; a fiber is chosen in proportion to its length weight times its mean."""
+        self.location_weights = weights
+        mean = np.asarray([1. if w is None else float(w[1].mean()) for w in weights])
+        fiber = self.weights*mean
+        self.fresh_weights = fiber/fiber.sum()
+        self.location_ceiling = max([1.]+[float(w[1].max()) for w in weights if w is not None])
+
+    def location_weight(self, fi, original_t):
+        w = self.location_weights[fi] if self.location_weights is not None else None
+        return 1. if w is None else float(w[1][min(int(np.searchsorted(w[0], original_t, 'right'))-1, len(w[1])-1)])
 
     def set_step(self, step):
         self.step.value = int(step)
@@ -80,8 +94,8 @@ class FollowDataset(torch.utils.data.IterableDataset):
     def eligible_caches(self):
         step = int(self.step.value)
         if self._eligible[0] != step:
-            self._eligible = (step, frozenset(i for i, op in enumerate(self.onpolicy)
-                                              if step-int(op.provenance['step']) <= self.budget.replay_max_age))
+            self._eligible = (step, frozenset(i for i, op in enumerate(self.onpolicy)  # never from a later step
+                                              if 0 <= step-int(op.provenance['step']) <= self.budget.replay_max_age))
         return self._eligible[1]
 
     def claim(self, key):
@@ -95,6 +109,19 @@ class FollowDataset(torch.utils.data.IterableDataset):
 
     def max_event_reuse(self):
         return int(max(self.event_draws[:])) if len(self.event_draws) else 0
+
+    def event_draw_state(self):
+        """Replay draw counts per event slot (sparse), saved in checkpoints so a resumed run keeps its caps."""
+        with self.event_draws.get_lock():
+            counts = np.frombuffer(self.event_draws.get_obj(), dtype=np.int32).copy()
+        slots = np.flatnonzero(counts)
+        return dict(slots=slots.astype(np.int64), counts=counts[slots])
+
+    def restore_event_draws(self, state):
+        with self.event_draws.get_lock():
+            counts = np.frombuffer(self.event_draws.get_obj(), dtype=np.int32)
+            counts[:] = 0
+            counts[np.asarray(state['slots'], dtype=np.int64)] = np.asarray(state['counts'], dtype=np.int32)
 
     def refresh_replay(self):
         if self.replay_index is None or not os.path.exists(self.replay_index):
@@ -118,9 +145,17 @@ class FollowDataset(torch.utils.data.IterableDataset):
                     if hasattr(self.batch_builder, 'fresh_location') else None)
         if location is not None:
             return location['fiber'], location['t'], location['reverse'], location['source']
+        weighted = self.location_weights is not None
         while len(windows) < self.pool_size:
-            fi = rng.choice(len(self.fibers), p=self.weights)
-            windows.append([fi, rng.uniform(0, self.fibers[fi].length), self.window_samples])
+            fi = rng.choice(len(self.fibers), p=self.fresh_weights if weighted else self.weights)
+            w = self.location_weights[fi] if weighted else None
+            if w is None:
+                center = rng.uniform(0, self.fibers[fi].length)
+            else:  # a window centre in proportion to the location weights
+                k = int(rng.choice(len(w[1]), p=w[1]/w[1].sum()))
+                center = float(np.clip(w[0][k]+rng.uniform(0., w[0][1]-w[0][0] if len(w[0]) > 1 else 0.),
+                                       0, self.fibers[fi].length))
+            windows.append([fi, center, self.window_samples])
         wi = rng.integers(len(windows))
         fi, center, _ = windows[wi]
         f = self.fibers[fi]
@@ -131,7 +166,10 @@ class FollowDataset(torch.utils.data.IterableDataset):
         if rng.random() < .1:
             t = max(0, f.length-rng.uniform(0, self.cfg.future_s[-1]*1.5))
         else:
-            original_t = np.clip(center+rng.uniform(-self.window/2, self.window/2), 0, f.length)
+            for _ in range(8):  # keep a position in proportion to its location weight
+                original_t = float(np.clip(center+rng.uniform(-self.window/2, self.window/2), 0, f.length))
+                if not weighted or rng.random()*self.location_ceiling < self.location_weight(fi, original_t):
+                    break
             t = f.length-original_t if rev else original_t
         return int(fi), float(t), rev, 0
 
@@ -279,8 +317,9 @@ class FollowDataset(torch.utils.data.IterableDataset):
         return items
 
     def live_start(self, rng, windows):
-        """Chain starts: half recorded valid pre-excursion/recoverable prefixes, half seed-only."""
-        if rng.random() < .5:
+        """Chain starts: seed-only (share ``cfg.live_seed_start``), else a recorded valid pre-excursion/recoverable
+        prefix."""
+        if rng.random() >= self.cfg.live_seed_start:
             for name in ('pre_excursion', 'recoverable') if rng.random() < .5 else ('recoverable', 'pre_excursion'):
                 item = self.replay_draw(name, rng)
                 if item is not None and item['geometry_valid'] and item['supervision'] in (FOLLOWING, RECOVERABLE):
