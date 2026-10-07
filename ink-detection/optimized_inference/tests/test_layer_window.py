@@ -98,3 +98,18 @@ def test_unreadable_attrs_stop_instead_of_falling_back(tmp_path, monkeypatch):
     monkeypatch.setattr(processing.zarr, "open", failing_open)
     with pytest.raises(RuntimeError, match="Could not read the layer-window attrs"):
         processing.resolve_zarr_layer_window(out, 2, 6)
+
+
+@pytest.mark.parametrize("kept", ["layer_start", "layer_end"])
+def test_partial_window_attrs_are_an_error(tmp_path, kept):
+    layers = _layer_stack(tmp_path)
+    out = str(tmp_path / "sv.zarr")
+    processing.create_surface_volume_zarr(layers[1:7], out, chunk_size=16, use_compression=False)
+    processing.record_layer_window(out, 1, 7)
+    z = zarr.open(out, mode="r+")
+    for name in processing.LAYER_WINDOW_ATTRS:
+        if name != kept:
+            del z.attrs[name]
+
+    with pytest.raises(RuntimeError, match="records only"):
+        processing.resolve_zarr_layer_window(out, 2, 6)
