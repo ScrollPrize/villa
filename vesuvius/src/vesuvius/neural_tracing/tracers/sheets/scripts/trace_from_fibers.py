@@ -26,9 +26,9 @@ import numpy as np
 
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import ChunkedArray
 from vesuvius.neural_tracing.tracers.sheets import config as C
-from vesuvius.neural_tracing.tracers.sheets.evaluate import load_checkpoint
+from vesuvius.neural_tracing.tracers.sheets.checkpoint import load_checkpoint
 from vesuvius.neural_tracing.tracers.sheets.data.fibers import episode_fibers, fiber_pool
-from vesuvius.neural_tracing.tracers.sheets.infer import connected_keep, resample, trace, write_trace
+from vesuvius.neural_tracing.tracers.sheets.tracing.inference import connected_keep, resample, trace, write_trace
 
 
 def fiber_tag(fiber: dict) -> str:

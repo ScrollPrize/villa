@@ -7,10 +7,10 @@ averages the per-step losses. The run directory ``output/NAME`` holds config.jso
 best.pt (highest validation score = coverage - kept_off), periodic diagnostics (val_XXXXXX/), and a final long-rollout eval.
 
 Usage:
-  python -m vesuvius.neural_tracing.tracers.sheets.train --config remote_l0_points_ft.json --init output/l0_joint/last.pt
-  python -m vesuvius.neural_tracing.tracers.sheets.train --config remote_l0_fiber_ft.json \
+  python -m vesuvius.neural_tracing.tracers.sheets.train.train --config remote_l0_points_ft.json --init output/l0_joint/last.pt
+  python -m vesuvius.neural_tracing.tracers.sheets.train.train --config remote_l0_fiber_ft.json \
       --init output/remote_l0_points_ft/last.pt
-  python -m vesuvius.neural_tracing.tracers.sheets.train --resume output/remote_l0_fiber_ft/last.pt
+  python -m vesuvius.neural_tracing.tracers.sheets.train.train --resume output/remote_l0_fiber_ft/last.pt
 """
 from __future__ import annotations
 
@@ -30,16 +30,17 @@ from tqdm import tqdm
 
 from vesuvius.neural_tracing.tracers.shared.system import raise_open_file_limit
 from vesuvius.neural_tracing.tracers.sheets import config as C
-from vesuvius.neural_tracing.tracers.sheets import evaluate as E
+from vesuvius.neural_tracing.tracers.sheets.checkpoint import load_checkpoint
+from vesuvius.neural_tracing.tracers.sheets.evaluation import rollouts as E
 from vesuvius.neural_tracing.tracers.sheets.data.episodes import (
     FIBER_KEYS, EpisodeSampler, EpisodeStream, MixedFrontStream, collate, episode_pad, fixed_episodes, keep_batch)
 from vesuvius.neural_tracing.tracers.sheets.data.patches import build_index
-from vesuvius.neural_tracing.tracers.sheets.live import LiveChains
+from vesuvius.neural_tracing.tracers.sheets.train.live import LiveChains
 from vesuvius.neural_tracing.tracers.sheets.losses import step_losses
 from vesuvius.neural_tracing.tracers.sheets.model import build_model, compile_model, init_model_state, load_model_state
-from vesuvius.neural_tracing.tracers.sheets.rollout import Tracer
-from vesuvius.neural_tracing.tracers.sheets.seeding import perturb, seed_rows, sheet_jump
-from vesuvius.neural_tracing.tracers.sheets.visualize import episode_figure, metric_figure, training_figure
+from vesuvius.neural_tracing.tracers.sheets.tracing.rollout import Tracer
+from vesuvius.neural_tracing.tracers.sheets.tracing.seeding import perturb, seed_rows, sheet_jump
+from vesuvius.neural_tracing.tracers.sheets.evaluation.figures import episode_figure, metric_figure, training_figure
 
 
 def learning_rate(it: int, tc, minutes: float = 0.) -> float:
@@ -113,7 +114,7 @@ def _pinned(batch: dict) -> dict:
 
 
 def device_batches(batches, device, pinned_ahead: int = 2, timings: dict | None = None, pad_blocks: bool = True):
-    """``evaluate.to_device`` of each batch, the next batch's copy (and its block's conversion to float) already
+    """``evaluation.rollouts.to_device`` of each batch, the next batch's copy (and its block's conversion to float) already
     running on a side stream while the current one is in use, so the host-to-device copy overlaps compute.
 
     A background thread pins the batches (at most ``pinned_ahead`` waiting). Load the batches unpinned: a
@@ -428,7 +429,7 @@ def final_eval(cfg, run, device):
     e = cfg.eval
     t0 = time.time()
     episodes = E.eval_episodes(cfg, e.steps, e.roi, e.episodes)
-    best_model, _, _ = E.load_checkpoint(run/'best.pt', device)
+    best_model, _, _ = load_checkpoint(run/'best.pt', device)
     report = E.run(Tracer(best_model, cfg, device), cfg, run/'eval', episodes, e.steps, e.roi, records=4)
     s = report['summary']
     print(f"eval: coverage {s['coverage_mean']:.3f} (last {s['coverage_last']:.3f}) same_sheet "

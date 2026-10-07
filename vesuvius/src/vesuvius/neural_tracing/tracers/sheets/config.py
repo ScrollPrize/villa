@@ -37,8 +37,8 @@ class DataConfig:
     seed_noise_tangent: float = 3.  # ... and within the sheet
     worker_cache_mb: int = 256  # per-process chunk cache of the volume reader
     max_tries: int = 200  # patches drawn per episode before giving up
-    # Hard spots (``hard_spots.py``): this fraction of training episodes starts at a recorded failure spot of a
-    # model (JSON from hard_spots.py; patch directories by their position in patches_dir), jittered by up to two
+    # Hard spots (``evaluation/hard_spots.py``): this fraction of training episodes starts at a recorded failure spot of a
+    # model (JSON from evaluation/hard_spots.py; patch directories by their position in patches_dir), jittered by up to two
     # steps along the advance and half a point spacing along the front. Validation episodes are unaffected.
     hard_windows: str = ''
     hard_fraction: float = 0.
@@ -178,7 +178,7 @@ class TrainConfig:
     ema: float = 0.
     # Live chains (like the fiber tracer's live continuation): a front is not restarted from GT after its rollout but
     # continues in a later iteration from exactly where the model left it (positions, curve, confidences, grid
-    # memory) on the next GT window and block of its patch, which a loader worker reads on request (live.py).
+    # memory) on the next GT window and block of its patch, which a loader worker reads on request (train/live.py).
     # A chain ends after a random number of steps in chain_steps, when under chain_on_sheet of its points end a
     # rollout on the seed's sheet, when a row has no confident point connected to the surface traced so far (the
     # inference stop), or when its patch has no next window (chain_min_valid of it valid, in the split).

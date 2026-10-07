@@ -67,18 +67,18 @@ and code names therefore means masked output, not halted motion.
 | `data.fiber_runs`, `fiber_fraction`, `fiber_min_valid` | Fiber-seeded episodes: this fraction of episodes starts from a fiber matched to its patch (`scripts/match_fibers_to_patches.py`). The fiber is the seed row, and the GT window is rotated to follow it. |
 | `data.follow_fraction`, `model.fiber_follow_mode` | Fiber-following batches: a 3-point front across a matched fiber, with the middle point on it, advancing along it. The model gets a learned mode embedding (0 sheet tracing, 1 following), zero-initialised. |
 | `data.fiber_pool`, `model.fiber_tokens`, `data.fiber_cut_at_start`, `fiber_max_instances`, `fiber_max_points` | In fiber-started episodes, the fibers around the episode (`scripts/build_fiber_pool.py`) as extra transformer tokens: the `fiber_tokens` points nearest the front each step, each with a random per-episode instance code shared by all points of one fiber. In following episodes the seed fiber is cut ahead of the start, so the model learns to extend it. |
-| `train.py --init CKPT` | Start from a checkpoint's weights (EMA if present) with a fresh optimizer and schedule. The fiber and mode modules start fresh if the checkpoint lacks them. `--resume` continues a run. |
-| `train.ema` | Exponential moving average of the weights (e.g. 0.999). Validation, `best.pt`, evaluation and `--init` use the averaged weights. Checkpoints keep both (`model` raw, `ema` averaged); `trace_benchmark.py --raw NAME` benchmarks the raw ones. |
+| `train/train.py --init CKPT` | Start from a checkpoint's weights (EMA if present) with a fresh optimizer and schedule. The fiber and mode modules start fresh if the checkpoint lacks them. `--resume` continues a run. |
+| `train.ema` | Exponential moving average of the weights (e.g. 0.999). Validation, `best.pt`, evaluation and `--init` use the averaged weights. Checkpoints keep both (`model` raw, `ema` averaged); `evaluation/benchmark.py --raw NAME` benchmarks the raw ones. |
 | `train.max_minutes` | The cosine learning rate anneals to zero at the time budget. Resumed time counts. |
 | `train.keep_every` | Also keep `ckpt_ITER.pt` periodically, for benchmarking intermediate checkpoints. |
 | `train.compile_geometry` | `torch.compile` the GT projection: about 1.4x faster, but not bit-identical (foot points differ by about 1e-3 vx). |
 | `train.compile_model` | `torch.compile` the model: about 1.7x faster at level 0, not bit-identical. Checkpoints are unchanged. |
-| `train.live_chains` (+ `chain_steps`, `chain_on_sheet`, `chain_min_valid`, `chain_max_age`) | Live chains (`live.py`): a training front is not restarted from GT after its rollout, but continues in a later iteration from exactly where the model left it, on the next window of its patch. Needs `memory_rows <= data.steps`, and cannot be combined with `train.history_rows`. Use with `train.free_fraction=1`. |
+| `train.live_chains` (+ `chain_steps`, `chain_on_sheet`, `chain_min_valid`, `chain_max_age`) | Live chains (`train/live.py`): a training front is not restarted from GT after its rollout, but continues in a later iteration from exactly where the model left it, on the next window of its patch. Needs `memory_rows <= data.steps`, and cannot be combined with `train.history_rows`. Use with `train.free_fraction=1`. |
 | `train.history_rows` | Before each training rollout, trace 0..N GT rows up to the seed without loss (the front is put back on GT after each step), so the grid memory starts out filled. |
-| `hard_spots.py`, `data.hard_windows`, `data.hard_fraction` | `hard_spots.py` records where a model's traces stop or switch sheets. With `data.hard_windows` set to that JSON, `hard_fraction` of training episodes start at a recorded spot (jittered). Validation is unaffected. |
-| `trace_benchmark.py --path-map OLD=NEW --out DIR` | Benchmark checkpoints trained on another machine: rewrite the data paths stored in their configs. GPUs differ slightly in bf16, so compare only models benchmarked on the same machine. |
-| `trace_benchmark.py --seeds-from DIR`, `--held-out-scoring`, `--seeds-anywhere` | Reuse another run's seeds (e.g. across front sizes); score only points whose GT foot point lies in a val cell while the trace runs on; draw seeds from anywhere. |
-| `trace_benchmark.py --rescore DIR ...` | Recompute the switch counts of existing benchmark folders from their tifxyz. A *real switch* is a row with at least 3 kept off-sheet points, or a kept point more than 9 vx off. |
+| `evaluation/hard_spots.py`, `data.hard_windows`, `data.hard_fraction` | `evaluation/hard_spots.py` records where a model's traces stop or switch sheets. With `data.hard_windows` set to that JSON, `hard_fraction` of training episodes start at a recorded spot (jittered). Validation is unaffected. |
+| `evaluation/benchmark.py --path-map OLD=NEW --out DIR` | Benchmark checkpoints trained on another machine: rewrite the data paths stored in their configs. GPUs differ slightly in bf16, so compare only models benchmarked on the same machine. |
+| `evaluation/benchmark.py --seeds-from DIR`, `--held-out-scoring`, `--seeds-anywhere` | Reuse another run's seeds (e.g. across front sizes); score only points whose GT foot point lies in a val cell while the trace runs on; draw seeds from anywhere. |
+| `evaluation/benchmark.py --rescore DIR ...` | Recompute the switch counts of existing benchmark folders from their tifxyz. A *real switch* is a row with at least 3 kept off-sheet points, or a kept point more than 9 vx off. |
 | `scripts/trace_from_fibers.py` | Traces seeded from VC3D fiber JSONs, advancing along the 2/8 structure-tensor sheet direction, up and/or down. `--follow` uses the fiber-following mode and writes each extended fiber as a VC3D fiber JSON; `--fiber-pool` shows the model the fibers around each trace. |
 | `scripts/pick_inference.py` | Rank benchmark folders (front sizes x thresholds) by covered - 10 x off-sheet kept points. |
 
@@ -105,10 +105,10 @@ The run directory is `output/NAME`:
 
 ```bash
 cd vesuvius/src/vesuvius/neural_tracing/sheet_tracing
-../../../../../.venv/bin/python -m vesuvius.neural_tracing.tracers.sheets.train --config remote_l0_fiber_ft.json \
+../../../../../.venv/bin/python -m vesuvius.neural_tracing.tracers.sheets.train.train --config remote_l0_fiber_ft.json \
     --name RUN --init output/remote_l0_points_ft/last.pt
 # resume
-../../../../../.venv/bin/python -m vesuvius.neural_tracing.tracers.sheets.train --resume output/RUN/last.pt
+../../../../../.venv/bin/python -m vesuvius.neural_tracing.tracers.sheets.train.train --resume output/RUN/last.pt
 ```
 
 What one iteration does:
@@ -146,10 +146,10 @@ DataLoader shuts down its forkserver workers.
 ## Evaluation, trace benchmark and inference
 
 ```bash
-python -m vesuvius.neural_tracing.tracers.sheets.evaluate --checkpoint output/RUN/best.pt [--steps 30 --roi 1024 --episodes 256]
-python -m vesuvius.neural_tracing.tracers.sheets.trace_benchmark --checkpoints output/A/last.pt output/B/last.pt \
+python -m vesuvius.neural_tracing.tracers.sheets.evaluation.rollouts --checkpoint output/RUN/best.pt [--steps 30 --roi 1024 --episodes 256]
+python -m vesuvius.neural_tracing.tracers.sheets.evaluation.benchmark --checkpoints output/A/last.pt output/B/last.pt \
     --seeds 40 --steps 30 --tag a_vs_b
-python -m vesuvius.neural_tracing.tracers.sheets.infer --checkpoint output/RUN/last.pt \
+python -m vesuvius.neural_tracing.tracers.sheets.tracing.inference --checkpoint output/RUN/last.pt \
     --seed-patch /path/to/patch --line row:40 --range 100:160 --direction + --steps 40 --out output/RUN/traces/t0
 ```
 
@@ -198,10 +198,10 @@ is a tifxyz (rows are steps, columns are the Hermite curve samples, masked point
 | `geometry.py` | GT grid evaluation and projection, Hermite curves, carrying low-confidence points, respacing, frames |
 | `sampling.py` | oriented GPU crops from a volume block |
 | `model.py` | crop encoders, joint transformer over point, grid and fiber tokens, head |
-| `rollout.py` | one tracing step and front update (shared by train/eval/infer) |
-| `live.py` | live chains |
-| `losses.py`, `seeding.py` | supervision, metrics, seeds, training perturbation and sheet jumps |
-| `train.py`, `evaluate.py`, `trace_benchmark.py`, `hard_spots.py`, `infer.py`, `visualize.py` | entry points and figures |
+| `tracing/rollout.py` | one tracing step and front update (shared by train/eval/infer) |
+| `train/live.py` | live chains |
+| `losses.py`, `tracing/seeding.py` | supervision, metrics, seeds, training perturbation and sheet jumps |
+| `train/train.py`, `evaluation/rollouts.py`, `evaluation/benchmark.py`, `evaluation/hard_spots.py`, `tracing/inference.py`, `evaluation/figures.py` | entry points and figures |
 | `scripts/` | data preparation (other scrolls, fiber matching and pool, resampling), fiber-seeded tracing, benchmarks |
 
 Run the tests with `python -m pytest vesuvius/src/vesuvius/neural_tracing/sheet_tracing/tests`. They use analytic

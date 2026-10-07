@@ -15,7 +15,7 @@ while [ $# -gt 0 ]; do
   nm+=("${1%%=*}"); ck+=("$PKG/output/remote/${1#*=}"); shift
 done
 cd "$REPO"
-exec .venv/bin/python -m vesuvius.neural_tracing.tracers.sheets.trace_benchmark --checkpoints "${ck[@]}" --names "${nm[@]}" \
+exec .venv/bin/python -m vesuvius.neural_tracing.tracers.sheets.evaluation.benchmark --checkpoints "${ck[@]}" --names "${nm[@]}" \
   --threshold 0.4 --seeds 100 --steps "$steps" --out "$out" \
   --path-map $D/s1_ds2.zarr=/home/sean/Documents/volpkgs/s1_ds2.volpkg/volumes/s1_ds2.zarr \
   --path-map $D/verified_patches_old=/home/sean/Desktop/spiral_dataset/verified_patches \

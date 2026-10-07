@@ -15,7 +15,7 @@ Per step, over front_points whose committed point has GT supervision:
   dist_p50/p90, advance_p90  on-sheet distance and |advance error| of kept points
 
 Usage:
-  python -m vesuvius.neural_tracing.tracers.sheets.evaluate --checkpoint output/RUN/best.pt
+  python -m vesuvius.neural_tracing.tracers.sheets.evaluation.rollouts --checkpoint output/RUN/best.pt
 """
 from __future__ import annotations
 
@@ -33,11 +33,11 @@ from vesuvius.neural_tracing.tracers.sheets.data.episodes import (
 from vesuvius.neural_tracing.tracers.sheets.data.patches import build_index
 from vesuvius.neural_tracing.tracers.sheets.geometry import grid_eval, project, surface_frame
 from vesuvius.neural_tracing.tracers.sheets.losses import front_metrics, gap_mask, landing
-from vesuvius.neural_tracing.tracers.sheets.model import build_model, load_model_state
-from vesuvius.neural_tracing.tracers.sheets.rollout import Tracer
+from vesuvius.neural_tracing.tracers.sheets.checkpoint import load_checkpoint
+from vesuvius.neural_tracing.tracers.sheets.tracing.inference import connected_keep, write_surface
+from vesuvius.neural_tracing.tracers.sheets.tracing.rollout import Tracer
 from vesuvius.neural_tracing.tracers.sheets.sampling import sample_plane
-from vesuvius.neural_tracing.tracers.sheets.seeding import seed_rows
-
+from vesuvius.neural_tracing.tracers.sheets.tracing.seeding import seed_rows
 
 
 def to_device(batch, device, pad_blocks: bool = True):
@@ -93,16 +93,9 @@ def _record(b, i, seeds, rows, confs, mets, cfg, spec, last_curve):
         spec=dict(u_lo=spec.u_lo, v_lo=spec.v_lo, res=spec.res), extents=dict(adv=(80., span_a), front=(80., span_t)))
 
 
-@torch.no_grad()
-def connected_keep(confs, threshold):  # noqa: E302 (imported lazily: infer imports this module)
-    from vesuvius.neural_tracing.tracers.sheets.infer import connected_keep as keep
-    return keep(confs, threshold)
-
-
 def write_episode_surfaces(out_dir: Path, index: int, rows, keep, gt, valid, meta, tracer, cfg, spec, metrics):
     """``epNN_trace`` (rows = steps incl. the seed, columns as written by inference) and ``epNN_gt`` (the
     episode's canonical GT window, rows = u, columns = v, at ``gt_resolution``) tifxyz for VC3D."""
-    from vesuvius.neural_tracing.tracers.sheets.infer import write_surface
     provenance = dict(meta=meta, metrics=metrics, step=cfg.data.step, column_spacing=tracer.column_spacing(),
                       confidence_threshold=cfg.trace.confidence_threshold)
     write_surface(out_dir/f'ep{index:02d}_trace', rows, keep, cfg.data.step, tracer.column_spacing(), provenance,
@@ -200,15 +193,6 @@ def summarize(per_step: dict) -> dict:
     return out
 
 
-def load_checkpoint(path, device, raw: bool = False):
-    """Model (the EMA weights if the run kept them, unless ``raw``), config and the checkpoint dict."""
-    checkpoint = torch.load(path, map_location='cpu', weights_only=False)
-    cfg = C.from_dict(checkpoint['config'], strict=False)
-    model = build_model(cfg).to(device)
-    load_model_state(model, checkpoint['model'] if raw or not checkpoint.get('ema') else checkpoint['ema'])
-    return model, cfg, checkpoint
-
-
 def eval_episodes(cfg, steps: int, roi: int, count: int):
     """``count`` fixed held-out episodes and their grid spec."""
     index = build_index(cfg.data.patches_dir, C.OUTPUT/'cache')
@@ -219,7 +203,7 @@ def eval_episodes(cfg, steps: int, roi: int, count: int):
 def run(tracer, cfg, out_dir: Path, episodes, steps: int, roi: int, records: int = 6, tag: str = 'eval'):
     """Evaluate on ``episodes`` (an ``(episodes, spec)`` pair from ``eval_episodes``). Every episode is written as
     trace + GT tifxyz under ``out_dir/tifxyz_TAG``."""
-    from vesuvius.neural_tracing.tracers.sheets.visualize import episode_figure, metric_figure
+    from vesuvius.neural_tracing.tracers.sheets.evaluation.figures import episode_figure, metric_figure
     device = next(tracer.model.parameters()).device
     episodes, spec = episodes
     count = len(episodes)

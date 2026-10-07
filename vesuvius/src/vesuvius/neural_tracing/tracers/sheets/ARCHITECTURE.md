@@ -107,7 +107,7 @@ and `R` grid rows (the current row plus up to 3 stored ones, so 1 to 4). With th
   population std.
 * **Frames** are right-handed orthonormal triads `(t, a, n)`: `t` along the front, `a` the advance direction and
   `n` the sheet normal (`n = t x a`).
-* **Front state** (`rollout.Front`):
+* **Front state** (`tracing.rollout.Front`):
   * `pos` (B, N, 3): the control points;
   * `prev` (B, N, 3): the previous row, which gives the advance direction;
   * `conf` (B, N): the sigmoid confidence of the step that produced `pos`, 1 for the seed;
@@ -260,7 +260,7 @@ Because of the zero init, an untrained model advances straight, uses Catmull-Rom
 | head + its LayerNorm, token_type | 1,542 + 512, 512 |
 | `fiber_ft` only: fiber_geometry, fiber_type, mode_embed | 70,400 + 256 + 512 |
 
-## 4. From outputs to the next row (`rollout.Tracer.step`, `advance`)
+## 4. From outputs to the next row (`tracing.rollout.Tracer.step`, `advance`)
 
 No learned parameters are involved. `B` is the batch, `N` the number of points, `s = 20` vx the step and `tau` the
 threshold.
@@ -424,12 +424,12 @@ All four runs below use this architecture.
 
 ## 6. Inference
 
-* **`infer.py`.** The seed is a polyline (for example, a row of an existing tifxyz) plus an advance direction. It
+* **`tracing/inference.py`.** The seed is a polyline (for example, a row of an existing tifxyz) plus an advance direction. It
   is resampled by arc length to `max(4, round(length / 60) + 1)` evenly spaced points, with
   `prev = seed - 20 * direction`. Each step reads the level-0 CT block around the front, runs one `Tracer.step` and
   `advance`s. The written row is the step's Q dense columns, and a column is kept if its confidence exceeds the
   threshold.
-* **`trace_benchmark.py`** traces from GT seeds of held-out patches and scores the traces against the GT.
+* **`evaluation/benchmark.py`** traces from GT seeds of held-out patches and scores the traces against the GT.
 * **`scripts/trace_from_fibers.py`** seeds traces from fibers, advancing along the 2/8 structure-tensor sheet
   direction, up and/or down. With `fiber_ft`:
   * `--fiber-pool` gives the model the fibers around each trace;

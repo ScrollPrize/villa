@@ -178,7 +178,7 @@ def layout_section():
 def load(checkpoint: str, path_map: list[str], device: str):
     """The checkpoint's model and config, sampling seeds only from the patch directories on ``data.volume`` (the
     volume the figures read)."""
-    from vesuvius.neural_tracing.tracers.sheets.evaluate import load_checkpoint
+    from vesuvius.neural_tracing.tracers.sheets.checkpoint import load_checkpoint
     from vesuvius.neural_tracing.tracers.sheets.config import path_mapper
     model, cfg = load_checkpoint(checkpoint, device)[:2]
     path_mapper(path_map)(cfg)
@@ -195,10 +195,10 @@ def real_data(checkpoint: str, path_map: list[str], device: str):
     """Crops the model sees at the seed of a benchmark trace, and that trace."""
     from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import ChunkedArray
     from vesuvius.neural_tracing.tracers.sheets.geometry import point_frames
-    from vesuvius.neural_tracing.tracers.sheets.infer import read_block, resample, trace
-    from vesuvius.neural_tracing.tracers.sheets.rollout import Front, Tracer
+    from vesuvius.neural_tracing.tracers.sheets.tracing.inference import read_block, resample, trace
+    from vesuvius.neural_tracing.tracers.sheets.tracing.rollout import Front, Tracer
     from vesuvius.neural_tracing.tracers.sheets.sampling import sample_crops, view_radius
-    from vesuvius.neural_tracing.tracers.sheets.trace_benchmark import draw_seeds, seed_polyline
+    from vesuvius.neural_tracing.tracers.sheets.evaluation.benchmark import draw_seeds, seed_polyline
     model, cfg = load(checkpoint, path_map, device)
     seeds, spec, data = draw_seeds(cfg, 12, 30, 240., .95)
     w = seeds[3]
@@ -319,9 +319,9 @@ def crops_xy(checkpoint: str, path_map: list[str], device: str, name: str = 'cro
     from scipy.spatial import ConvexHull
     from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import ChunkedArray
     from vesuvius.neural_tracing.tracers.sheets.geometry import chord_tangents, normalize, point_frames
-    from vesuvius.neural_tracing.tracers.sheets.infer import resample
-    from vesuvius.neural_tracing.tracers.sheets.rollout import Front, Tracer
-    from vesuvius.neural_tracing.tracers.sheets.trace_benchmark import draw_seeds, seed_polyline
+    from vesuvius.neural_tracing.tracers.sheets.tracing.inference import resample
+    from vesuvius.neural_tracing.tracers.sheets.tracing.rollout import Front, Tracer
+    from vesuvius.neural_tracing.tracers.sheets.evaluation.benchmark import draw_seeds, seed_polyline
     model, cfg = load(checkpoint, path_map, device)
     seeds, spec, data = draw_seeds(cfg, 100, 30, 240., .95)
     best = None

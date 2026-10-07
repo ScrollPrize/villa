@@ -23,8 +23,8 @@ from vesuvius.neural_tracing.tracers.sheets import config as C
 from vesuvius.neural_tracing.tracers.sheets.data.episodes import EpisodeSampler, EpisodeStream, collate, episode_pad
 from vesuvius.neural_tracing.tracers.sheets.data.patches import build_index
 from vesuvius.neural_tracing.tracers.sheets.model import build_model, compile_model, init_model_state
-from vesuvius.neural_tracing.tracers.sheets.rollout import Tracer
-from vesuvius.neural_tracing.tracers.sheets.train import EMA, _pinned, device_batches, optimize_step
+from vesuvius.neural_tracing.tracers.sheets.tracing.rollout import Tracer
+from vesuvius.neural_tracing.tracers.sheets.train.train import EMA, _pinned, device_batches, optimize_step
 
 
 def main(argv=None):

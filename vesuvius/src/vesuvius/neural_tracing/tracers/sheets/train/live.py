@@ -12,7 +12,7 @@ trains on the states, and memory, it produces when tracing.
 
 A chain ends after a random number of steps in ``train.chain_steps``, when under ``chain_on_sheet`` of its
 supervised points end a rollout on the seed's sheet, when a rollout row has no confident point connected to the
-surface traced so far (the inference stop, ``infer._reach_row``), when its patch has no next window, or when it
+surface traced so far (the inference stop, ``tracing.inference._reach_row``), when its patch has no next window, or when it
 waits in the pool or for its window more than ``chain_max_age`` iterations after its rollout.
 """
 from __future__ import annotations
@@ -23,7 +23,7 @@ import queue
 import torch
 
 from vesuvius.neural_tracing.tracers.sheets.losses import landing
-from vesuvius.neural_tracing.tracers.sheets.rollout import Tracer, concat_fronts, select_front
+from vesuvius.neural_tracing.tracers.sheets.tracing.rollout import Tracer, concat_fronts, select_front
 
 
 def select_batch(b: dict, index: list[int]) -> dict:
@@ -88,7 +88,7 @@ class LiveChains:
 
     def _reach(self, reach: torch.Tensor, kept: torch.Tensor) -> torch.Tensor:
         """Columns connected to the surface after rows ``kept`` (B, T, C), from ``reach`` (B, C) before them."""
-        from vesuvius.neural_tracing.tracers.sheets.infer import _reach_row
+        from vesuvius.neural_tracing.tracers.sheets.tracing.inference import _reach_row
         r, k = reach.cpu().numpy(), kept.cpu().numpy()
         for i in range(len(r)):
             for t in range(k.shape[1]):

@@ -3,13 +3,13 @@
 Traces ``--seeds`` seeds from the training split (``--steps`` steps, ``--front`` voxels, as the trace benchmark draws
 them from the validation split, but several windows per patch are allowed) through the inference path without stopping, and records each trace's
 first failure: the row where the inference stop rule would fire at ``--threshold`` (no confident point connected to
-the surface), or the first real switch (``trace_benchmark.switch_steps``), whichever comes first. The record is the
+the surface), or the first real switch (``evaluation.benchmark.switch_steps``), whichever comes first. The record is the
 seed's window moved ``--before`` steps short of the failure along the advance (``shift``, voxels), so a training
 episode drawn there reaches the hard spot mid-rollout. Patch directories are referred to by their position in
 ``data.patches_dir`` (``dir``), so records written on one machine can be used with another machine's paths. The
 output is rewritten every 100 traces, so a run can be stopped early and keep what it found.
 
-  python -m vesuvius.neural_tracing.tracers.sheets.hard_spots --checkpoint output/remote_l0_points_ft/last.pt \\
+  python -m vesuvius.neural_tracing.tracers.sheets.evaluation.hard_spots --checkpoint output/remote_l0_points_ft/last.pt \\
       --seeds 2000 --out output/hard_windows_points_ft.json [--path-map OLD=NEW ...]
 """
 from __future__ import annotations
@@ -21,10 +21,10 @@ from pathlib import Path
 
 import numpy as np
 
-from vesuvius.neural_tracing.tracers.sheets.evaluate import load_checkpoint
-from vesuvius.neural_tracing.tracers.sheets.infer import _reach_row, resample, trace
+from vesuvius.neural_tracing.tracers.sheets.checkpoint import load_checkpoint
+from vesuvius.neural_tracing.tracers.sheets.tracing.inference import _reach_row, resample, trace
 from vesuvius.neural_tracing.tracers.sheets.config import path_mapper
-from vesuvius.neural_tracing.tracers.sheets.trace_benchmark import draw_seeds, score, seed_polyline
+from vesuvius.neural_tracing.tracers.sheets.evaluation.benchmark import draw_seeds, score, seed_polyline
 
 
 def first_stop(confs: np.ndarray, threshold: float) -> int | None:

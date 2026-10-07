@@ -6,7 +6,7 @@ must fit within ``roi``, and every corner of the ``roi`` cube around it must fal
 split. The block read is the reachable region plus the view margin. Split
 cells are ``split_block``-voxel cubes assigned by a seeded hash, so overlapping patches share a split.
 
-Live chains (``train.live_chains``, see ``live.py``): ``EpisodeStream`` with ``batch`` yields whole batches and first
+Live chains (``train.live_chains``, see ``train/live.py``): ``EpisodeStream`` with ``batch`` yields whole batches and first
 serves continuation jobs from the trainer, each the next window and block of the chains of one finished rollout
 (``EpisodeSampler.continuation``).
 """
@@ -249,7 +249,7 @@ class EpisodeSampler:
         tangent /= np.maximum(np.linalg.norm(tangent, axis=1, keepdims=True), 1e-9)
         advance -= (advance*tangent).sum(1, keepdims=True)*tangent
         advance /= np.maximum(np.linalg.norm(advance, axis=1, keepdims=True), 1e-9)
-        lags = np.arange(d.history, -1, -1)*d.step  # oldest first, like seeding.seed_rows
+        lags = np.arange(d.history, -1, -1)*d.step  # oldest first, like tracing.seeding.seed_rows
         episode['seed'] = (pts[None]-lags[:, None, None]*advance[None]).astype(np.float32)
         return self._with_fibers(episode, run, None)
 

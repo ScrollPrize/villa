@@ -14,9 +14,9 @@ from vesuvius.neural_tracing.tracers.sheets.geometry import (
     sheet_distance)
 from vesuvius.neural_tracing.tracers.sheets.losses import landing, step_losses, targets
 from vesuvius.neural_tracing.tracers.sheets.model import build_model
-from vesuvius.neural_tracing.tracers.sheets.rollout import Tracer
+from vesuvius.neural_tracing.tracers.sheets.tracing.rollout import Tracer
 from vesuvius.neural_tracing.tracers.sheets.sampling import crop_offsets, sample_crops
-from vesuvius.neural_tracing.tracers.sheets.seeding import seed_rows, sheet_jump
+from vesuvius.neural_tracing.tracers.sheets.tracing.seeding import seed_rows, sheet_jump
 from vesuvius.neural_tracing.tracers.sheets.data.patches import GridSpec
 
 
@@ -205,7 +205,7 @@ def test_onto_confident_curve_returns_stopped_points_to_the_sheet():
 
 def test_front_length_loss_penalises_stretch():
     """The front-length term is zero for a front at its seed length and grows when it stretches."""
-    from vesuvius.neural_tracing.tracers.sheets.rollout import StepOutput
+    from vesuvius.neural_tracing.tracers.sheets.tracing.rollout import StepOutput
     cfg = C.load(None, SMALL+['loss.front_length=1.'])
     spec = GridSpec.for_episode(cfg.data, cfg.data.steps)
     gt, valid = cylinder_grid(spec, radius=10000.)  # nearly flat: arc length ~ chord length
@@ -222,7 +222,7 @@ def test_front_length_loss_penalises_stretch():
 
 def test_connected_keep_and_row_reach():
     """Only confident points connected to the seed row are written; an unreachable row means stop."""
-    from vesuvius.neural_tracing.tracers.sheets.infer import _reach_row, connected_keep
+    from vesuvius.neural_tracing.tracers.sheets.tracing.inference import _reach_row, connected_keep
     conf = np.array([[1, 1, 1, 1, 1, 1],   # seed
                      [.9, .9, 0, 0, 0, 0],
                      [0, 0, 0, 0, .9, .9],  # confident but not touching row 1's kept columns
@@ -239,7 +239,7 @@ def test_connected_keep_and_row_reach():
 
 def test_trace_end_to_end_on_a_small_volume(tmp_path):
     """infer.trace runs a real model (parameters requiring grad) on a tiny on-disk volume and returns arrays."""
-    from vesuvius.neural_tracing.tracers.sheets.infer import connected_keep, trace
+    from vesuvius.neural_tracing.tracers.sheets.tracing.inference import connected_keep, trace
     level = 1
     _write_volume(tmp_path/'vol.zarr', level)  # a bright sheet at level-1 x 30 ~ level-0 x 60.5
     cfg = C.load(None, ['train.amp=none', 'model.dim=32', 'model.channels=[4,8]', 'model.strides=[2,2]',
@@ -254,7 +254,7 @@ def test_trace_end_to_end_on_a_small_volume(tmp_path):
 
 
 def test_history_warm_up_rollout_trains():
-    from vesuvius.neural_tracing.tracers.sheets.train import train_rollout
+    from vesuvius.neural_tracing.tracers.sheets.train.train import train_rollout
     cfg = C.load(None, SMALL+['train.history_rows=3', 'data.history=4', 'data.steps=3'])
     spec = GridSpec.for_episode(cfg.data, cfg.data.steps)
     gt, valid = cylinder_grid(spec)
@@ -268,7 +268,7 @@ def test_history_warm_up_rollout_trains():
 
 
 def test_real_switch_needs_several_points_or_a_far_one():
-    from vesuvius.neural_tracing.tracers.sheets.trace_benchmark import switch_steps
+    from vesuvius.neural_tracing.tracers.sheets.evaluation.benchmark import switch_steps
     off = torch.zeros(6, 10, dtype=torch.bool)
     dist = torch.full((6, 10), 6.5)
     off[1, 4] = True  # one borderline point: a switch, but not a real one
@@ -308,8 +308,8 @@ def test_live_chain_continuation_window(tmp_path):
 
 def test_live_chains_resume_where_the_model_left_off():
     import queue as _queue
-    from vesuvius.neural_tracing.tracers.sheets.live import LiveChains
-    from vesuvius.neural_tracing.tracers.sheets.train import train_rollout
+    from vesuvius.neural_tracing.tracers.sheets.train.live import LiveChains
+    from vesuvius.neural_tracing.tracers.sheets.train.train import train_rollout
     cfg = C.load(None, SMALL+['train.live_chains=true', 'data.steps=3', 'train.chain_steps=[3,30]', 'train.batch=1',
                               'train.chain_on_sheet=0', 'trace.confidence_threshold=.4', 'train.free_fraction=1',
                               'train.jump_probability=0'])
@@ -352,8 +352,8 @@ def test_live_chains_resume_where_the_model_left_off():
 
 
 def test_ema_weights_average_and_are_what_evaluation_loads(tmp_path):
-    from vesuvius.neural_tracing.tracers.sheets.evaluate import load_checkpoint
-    from vesuvius.neural_tracing.tracers.sheets.train import EMA, save
+    from vesuvius.neural_tracing.tracers.sheets.checkpoint import load_checkpoint
+    from vesuvius.neural_tracing.tracers.sheets.train.train import EMA, save
     cfg = C.load(None, SMALL+['train.ema=0.9'])
     model = build_model(cfg)
     ema = EMA(model, cfg.train.ema)
@@ -473,9 +473,9 @@ def test_patch_directories_on_their_own_volumes_and_weights(tmp_path):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='needs CUDA')
 def test_device_batches_match_to_device():
-    from vesuvius.neural_tracing.tracers.sheets.evaluate import to_device
+    from vesuvius.neural_tracing.tracers.sheets.evaluation.rollouts import to_device
     from vesuvius.neural_tracing.tracers.sheets.data.episodes import pack_blocks
-    from vesuvius.neural_tracing.tracers.sheets.train import device_batches
+    from vesuvius.neural_tracing.tracers.sheets.train.train import device_batches
     g = torch.Generator().manual_seed(0)
     blocks = lambda: [np.random.default_rng(i).integers(0, 255, (1, 8-i, 6+i, 7), dtype=np.uint8) for i in range(2)]
     batches = [dict(gt=torch.rand(2, 5, 4, 3, generator=g), valid=torch.rand(2, 5, 4, generator=g) > .5,
@@ -497,7 +497,7 @@ def test_device_batches_match_to_device():
 def test_seeds_from_reuses_earlier_seeds_with_another_front(tmp_path, monkeypatch):
     """--seeds-from: the same patch, orientation and anchor give the same windows; a front too long for the patch
     drops the seed."""
-    from vesuvius.neural_tracing.tracers.sheets.trace_benchmark import draw_seeds, seeds_from
+    from vesuvius.neural_tracing.tracers.sheets.evaluation.benchmark import draw_seeds, seeds_from
     monkeypatch.setattr(C, 'OUTPUT', tmp_path)
     _write_plane_patch(tmp_path/'patches'/'p0', 100, 60)  # 2 vx cells: 200 vx by 120 vx
     cfg = C.load(None, [f'data.patches_dir="{tmp_path/"patches"}"', 'data.step=10', 'data.gt_margin=10',
@@ -520,7 +520,7 @@ def test_mixed_front_batches_vary_the_point_count(tmp_path):
     """data.front_points_range: each batch has one front size N, its GT window and batch size follow N."""
     from vesuvius.neural_tracing.tracers.sheets.data.episodes import MixedFrontStream
     from vesuvius.neural_tracing.tracers.sheets.data.patches import build_index
-    from vesuvius.neural_tracing.tracers.sheets.train import front_variants
+    from vesuvius.neural_tracing.tracers.sheets.train.train import front_variants
     _write_plane_patch(tmp_path/'patches'/'p0', 100, 100)
     _write_volume(tmp_path/'vol.zarr', shape=(128, 128, 64))
     cfg = C.load(None, [f'data.patches_dir="{tmp_path/"patches"}"', f'data.volume="{tmp_path/"vol.zarr"}"', 'data.volume_level=1',
@@ -568,7 +568,7 @@ def test_held_out_scoring_seeds_and_mask(tmp_path, monkeypatch):
     """--held-out-scoring: seeds need only their seed rows in val cells (their reach may cross train cells), and
     in_split marks exactly the points in val cells."""
     from vesuvius.neural_tracing.tracers.sheets.data.episodes import split_of
-    from vesuvius.neural_tracing.tracers.sheets.trace_benchmark import draw_seeds, in_split
+    from vesuvius.neural_tracing.tracers.sheets.evaluation.benchmark import draw_seeds, in_split
     monkeypatch.setattr(C, 'OUTPUT', tmp_path)
     _write_plane_patch(tmp_path/'patches'/'p0', 200, 200)
     cfg = C.load(None, [f'data.patches_dir="{tmp_path/"patches"}"', 'data.step=10', 'data.gt_margin=10',
@@ -607,7 +607,7 @@ def test_resample_isotropic_squares_the_grid(tmp_path):
 
 
 def test_written_tifxyz_records_its_area(tmp_path):
-    from vesuvius.neural_tracing.tracers.sheets.infer import surface_area_vx2, write_surface
+    from vesuvius.neural_tracing.tracers.sheets.tracing.inference import surface_area_vx2, write_surface
     r, c = np.meshgrid(np.arange(5), np.arange(4), indexing='ij')
     rows = np.stack([np.full(r.shape, 7.), 10.*c, 20.*r], -1).astype(np.float32)  # 4 x 3 quads of 10 x 20 vx
     assert surface_area_vx2(rows) == pytest.approx(12*200.)
@@ -717,8 +717,8 @@ def test_fiber_seeded_episodes_start_from_the_fiber(tmp_path):
 
 
 def test_train_rollout_starts_from_provided_seed_rows():
-    from vesuvius.neural_tracing.tracers.sheets.seeding import seed_rows
-    from vesuvius.neural_tracing.tracers.sheets.train import train_rollout
+    from vesuvius.neural_tracing.tracers.sheets.tracing.seeding import seed_rows
+    from vesuvius.neural_tracing.tracers.sheets.train.train import train_rollout
     cfg = C.load(None, SMALL+['data.steps=1'])
     spec = GridSpec.for_episode(cfg.data, cfg.data.steps)
     gt, valid = cylinder_grid(spec)
@@ -779,7 +779,7 @@ def test_mode_embedding_starts_neutral_and_reaches_the_tokens():
         torch.nn.init.normal_(model.head.weight, std=1e-2)  # the head starts at zero: make the output depend on input
     spec = GridSpec.for_episode(cfg.data, cfg.data.steps)
     gt, valid = cylinder_grid(spec)
-    from vesuvius.neural_tracing.tracers.sheets.seeding import seed_rows
+    from vesuvius.neural_tracing.tracers.sheets.tracing.seeding import seed_rows
     seeds = seed_rows(gt, valid, cfg, spec, noise=False)
     block, origin = torch.rand(1, 1, 224, 360, 360)*255, torch.zeros(1, 3, dtype=torch.long)
     outs = []
@@ -820,7 +820,7 @@ def test_fiber_pool_region_and_episode_instances(tmp_path):
 
 def test_fiber_tokens_reach_the_model_and_padding_is_inert():
     from vesuvius.neural_tracing.tracers.sheets.data.episodes import FIBER_CODE_DIM
-    from vesuvius.neural_tracing.tracers.sheets.seeding import seed_rows
+    from vesuvius.neural_tracing.tracers.sheets.tracing.seeding import seed_rows
     cfg = C.load(None, SMALL+['model.fiber_tokens=4'])
     torch.manual_seed(0)
     model = build_model(cfg)

@@ -3,7 +3,7 @@
 Seeds are drawn from the validation split: a GT window whose seed row and the ``--steps`` rows ahead lie in
 val split cells, with at least ``--min-valid`` of that region valid. Every checkpoint traces
 the same seed polyline (``--front`` voxels of the GT seed row, re-sampled to that model's point spacing) with
-the same advance direction, reading the volume around the front each step (``infer.trace``; no early stop).
+the same advance direction, reading the volume around the front each step (``tracing.inference.trace``; no early stop).
 Each traced point (front point or Hermite curve sample) is scored against the GT window like ``evaluate``:
 
   same_sheet / kept / coverage / precision   as in evaluate, per step over all seeds
@@ -23,11 +23,11 @@ Outputs in ``output/trace_bench/TAG``: report.json, per_step.png, seed_NN.png, a
 GT window) and ``seedNN_MODEL`` (each trace; stopped points written as -1) for inspection in VC3D.
 
 Usage:
-  python -m vesuvius.neural_tracing.tracers.sheets.trace_benchmark --checkpoints output/A/best.pt output/B/best.pt \\
+  python -m vesuvius.neural_tracing.tracers.sheets.evaluation.benchmark --checkpoints output/A/best.pt output/B/best.pt \\
       --seeds 12 --steps 30 --tag ab
-  python -m vesuvius.neural_tracing.tracers.sheets.trace_benchmark --rescore output/trace_bench/ab
+  python -m vesuvius.neural_tracing.tracers.sheets.evaluation.benchmark --rescore output/trace_bench/ab
   # checkpoints trained elsewhere: map their recorded data paths (volumes, patch directories)
-  python -m vesuvius.neural_tracing.tracers.sheets.trace_benchmark --checkpoints remote/A/last.pt \\
+  python -m vesuvius.neural_tracing.tracers.sheets.evaluation.benchmark --checkpoints remote/A/last.pt \\
       --path-map /remote/data/s1_ds2.zarr=/local/s1_ds2.zarr --path-map /remote/patches=/local/patches --out DIR
 """
 from __future__ import annotations
@@ -45,9 +45,9 @@ from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import ChunkedA
 from vesuvius.neural_tracing.tracers.sheets import config as C
 from vesuvius.neural_tracing.tracers.sheets.data.episodes import EpisodeSampler, split_of
 from vesuvius.neural_tracing.tracers.sheets.data.patches import build_index
-from vesuvius.neural_tracing.tracers.sheets.evaluate import load_checkpoint
+from vesuvius.neural_tracing.tracers.sheets.checkpoint import load_checkpoint
 from vesuvius.neural_tracing.tracers.sheets.geometry import grid_eval, surface_frame
-from vesuvius.neural_tracing.tracers.sheets.infer import connected_keep, read_block, resample, trace, write_surface
+from vesuvius.neural_tracing.tracers.sheets.tracing.inference import connected_keep, read_block, resample, trace, write_surface
 from vesuvius.neural_tracing.tracers.sheets.losses import landing
 from vesuvius.neural_tracing.tracers.sheets.sampling import sample_plane
 

@@ -45,11 +45,11 @@ A checkpoint is a dict with these keys:
 * `ema`: the EMA weights;
 * `opt`, `config`, `iteration`, `minutes`, `best`.
 
-`evaluate.load_checkpoint` builds the model from the stored config and loads the EMA weights. Benchmarks use
+`checkpoint.load_checkpoint` builds the model from the stored config and loads the EMA weights. Benchmarks use
 `last.pt`.
 
 **Paths inside H100 checkpoints.** Their configs record the H100's data paths (`/ephemeral/sean/sheet_tracing/data/...`).
-On this machine, pass `--path-map OLD=NEW` (to `infer.py`, `trace_benchmark.py`, `hard_spots.py`
+On this machine, pass `--path-map OLD=NEW` (to `tracing/inference.py`, `evaluation/benchmark.py`, `evaluation/hard_spots.py`
 and `scripts/trace_from_fibers.py`), or use `scripts/bench_local.sh`, which has the mappings built in:
 
 | H100 path | this machine |
@@ -66,10 +66,10 @@ H100.
 Run from `vesuvius/` with `.venv/bin/python`. First set `M` to the H100 data folder:
 `M=/ephemeral/sean/sheet_tracing/data`.
 
-**Trace a surface from a seed line** with `infer.py`. It writes a tifxyz with one row per step:
+**Trace a surface from a seed line** with `tracing/inference.py`. It writes a tifxyz with one row per step:
 
 ```bash
-.venv/bin/python -m vesuvius.neural_tracing.tracers.sheets.infer \
+.venv/bin/python -m vesuvius.neural_tracing.tracers.sheets.tracing.inference \
   --checkpoint src/vesuvius/neural_tracing/tracers/sheets/output/remote/remote_l0_points_ft/last.pt \
   --seed-patch /path/to/a/tifxyz --line row:40 --range 100:160 --direction + --steps 60 --threshold 0.5 \
   --out /path/to/output_tifxyz \
@@ -106,17 +106,17 @@ src/vesuvius/neural_tracing/tracers/sheets/scripts/bench_local.sh \
 * **Comparing:** compare only models benchmarked on the same machine. The GB10 and the H100 differ slightly in bf16,
   which flips a few threshold decisions over a trace, so local and H100 numbers must not be mixed. Each machine is
   deterministic run to run.
-* **Re-scoring:** `trace_benchmark.py --rescore DIR` re-scores the switch counts of existing folders from their
+* **Re-scoring:** `evaluation/benchmark.py --rescore DIR` re-scores the switch counts of existing folders from their
   tifxyz.
 
-**Mine failure spots:** `hard_spots.py --checkpoint ... --seeds 1500 --out FILE.json --path-map ...`. It writes
+**Mine failure spots:** `evaluation/hard_spots.py --checkpoint ... --seeds 1500 --out FILE.json --path-map ...`. It writes
 progress every 100 traces, so it can be stopped early.
 
 ## 4. Training
 
 ```bash
-python -m vesuvius.neural_tracing.tracers.sheets.train --config CONFIG.json --name RUN [--init CKPT] [--set section.field=value ...]
-python -m vesuvius.neural_tracing.tracers.sheets.train --resume output/RUN/last.pt
+python -m vesuvius.neural_tracing.tracers.sheets.train.train --config CONFIG.json --name RUN [--init CKPT] [--set section.field=value ...]
+python -m vesuvius.neural_tracing.tracers.sheets.train.train --resume output/RUN/last.pt
 ```
 
 * **`--init`:** starts from a checkpoint's EMA weights with a fresh optimizer and schedule. The fiber and mode
