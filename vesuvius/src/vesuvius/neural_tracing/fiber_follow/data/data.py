@@ -196,6 +196,10 @@ class SampleConfig:
     seed_offset_ramp: float = 16.
     # Share of live-continuation chains that start at a fresh seed (the rest from replayed DAgger prefixes).
     live_seed_start: float = .5
+    # Horizon (vox) of the previous-prediction crop axis for continuation crops: on by default (the gate horizon, 16
+    # planes); the trainer sets it from the model (tracing.crop_frames.prediction_window: 0 only for a model with
+    # crop_axis 'heading_model'). Fresh continuation crops get simulated_prediction; seeds never do.
+    prediction_window: float = 16.
     label_tolerance: float = 1.5  # confidence-label tolerance; separate from the departure threshold
     max_recovery_distance: float = 6.0
     dense_substeps: int = 4
@@ -395,6 +399,38 @@ def excursion_offsets(arcs, p, s, cfg: SampleConfig, rng):
                                             excursion_phase=head/rise, excursion_head_offset=float(profile[-1]))
 
 
+# The model's previous prediction, fitted on its own traces (output/prediction_axis_20261006/fit_prediction_error.py:
+# mixed_ct_afv_unified_scoring_v1 ckpt_019000, 48940 decisions): per vox past the head, the share of the head's
+# lateral offset still present, and the RMS of a smooth lateral bend (calibrated so the simulated prediction axes match
+# the real ones' angle distribution).
+PREDICTION_OFFSET_DECAY = np.array([1.006, 0.999, 0.985, 0.968, 0.948, 0.927, 0.908, 0.890, 0.878, 0.867, 0.856, 0.847, 0.844, 0.840, 0.837, 0.834])
+PREDICTION_BEND_RMS = np.array([0.0305, 0.0555, 0.0765, 0.0962, 0.1135, 0.1318, 0.1496, 0.1673, 0.1821, 0.1989, 0.2163, 0.2346, 0.2502, 0.2682, 0.2876, 0.3081])
+
+
+def simulated_prediction(fiber, t, reverse, pos, window, rng):
+    """A previous decision's prediction past the head ``pos`` (matched at traversal arclength ``t``), as the model
+    makes it: the annotation 1..window vox ahead, carrying the head's lateral offset (PREDICTION_OFFSET_DECAY) plus one
+    smooth lateral bend of random direction (PREDICTION_BEND_RMS). Returns (window, 3) world points, nearest first."""
+    p, s = traversal_curve(fiber, reverse)
+    ahead = np.minimum(t+np.arange(1., window+1e-9, 1.), s[-1])
+    gt = interp_at(p, s, ahead)
+    k = np.minimum(np.arange(len(ahead)), len(PREDICTION_OFFSET_DECAY)-1)
+    tangent = lambda at: tangent_at(p, s, float(at))
+    t0 = tangent(t)
+    offset = np.asarray(pos)-interp_at(p, s, np.array([t]))[0]
+    offset = offset-(offset @ t0)*t0
+    end = tangent(ahead[-1])
+    bend = rng.normal(size=3)
+    bend = bend-(bend @ end)*end
+    bend = bend/max(np.linalg.norm(bend), 1e-9)
+    out = []
+    for j, at in enumerate(ahead):
+        tg = tangent(at)
+        shift = PREDICTION_OFFSET_DECAY[k[j]]*offset+PREDICTION_BEND_RMS[k[j]]*bend
+        out.append(gt[j]+shift-(shift @ tg)*tg)
+    return np.asarray(out)
+
+
 def seed_offsets(arcs, p, s, cfg: SampleConfig, rng):
     """Lateral offsets of a trace whose seed was placed slightly off the centerline: a random direction normal to the
     fiber at the seed, magnitude uniform in ``cfg.seed_offset``, fading linearly to zero over ``cfg.seed_offset_ramp``
@@ -438,15 +474,16 @@ def make_sample(fiber: TracedFiber, t: float, reverse: bool, cfg: SampleConfig, 
     heading, history and seed reference come from that observed path through the tracer's
     own functions. A path shorter than 12 voxels still holds the seed's CT heading; it and
     the seed tangent are resolved once CT is readable (``resolve_trace_seed``). Labels are
-    the GT continuation from the offset head under the shared state contract.
+    the GT continuation from the offset head under the shared state contract. A continuation (any traced history)
+    also gets a simulated previous prediction for its crop axis when ``cfg.prediction_window`` is set; seeds do not.
     ``startup`` fixes the draw category; ``excursion`` forces or forbids an excursion.
     """
     p, s = traversal_curve(fiber, reverse)
     path, arcs, category, sigma, details = simulated_trace(p, s, t, cfg, rng, startup=startup, excursion=excursion)
-    return decision_on_path(fiber, t, reverse, cfg, path, arcs, category, sigma, details)
+    return decision_on_path(fiber, t, reverse, cfg, path, arcs, category, sigma, details, rng)
 
 
-def decision_on_path(fiber, t, reverse, cfg, path, arcs, category, sigma, details):
+def decision_on_path(fiber, t, reverse, cfg, path, arcs, category, sigma, details, rng=None):
     """The tracer decision whose head ends an observed path (``path``, sampled at traversal arclengths ``arcs``
     ending at ``t``): crop heading, history, seed reference and labels exactly as ``make_sample`` builds them."""
     from vesuvius.neural_tracing.fiber_follow.tracing.heading import linear12_heading, trace_heading
@@ -470,6 +507,9 @@ def decision_on_path(fiber, t, reverse, cfg, path, arcs, category, sigma, detail
     supervise(item)
     if linear12_heading(path, 0) is None:
         item['_pending_seed_heading'] = (fiber, t, reverse, cfg)
+    if cfg.prediction_window and rng is not None and len(path) > 1:
+        # A continuation (not a seed): the crop axis comes from the previous decision's (simulated) prediction.
+        item['prev_prediction'] = simulated_prediction(fiber, t, reverse, pos, cfg.prediction_window, rng)
     return item
 
 
@@ -516,7 +556,8 @@ def episode_decisions(fiber, t0, reverse, steps, commit, cfg: SampleConfig, rng:
     for j in range(steps):
         i = int(round(prefix/step))+j*per_commit
         departed = details if np.abs(offsets[:i+1]).max() > 0 else {}
-        decision = decision_on_path(fiber, float(arcs[i]), reverse, cfg, path[:i+1], arcs[:i+1], category, sigma, departed)
+        decision = decision_on_path(fiber, float(arcs[i]), reverse, cfg, path[:i+1], arcs[:i+1], category, sigma, departed,
+                                    rng)
         out.append((decision, path[i:i+per_commit+1].copy()))
     return out
 

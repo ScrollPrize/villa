@@ -148,6 +148,7 @@ def orient_items(items, vol, predictor=None, *, previous=None, pool=None, window
     for item, fixed in zip(items, recorded):
         if not fixed:
             apply_prediction_axis(item, window)
+        item.pop('prev_prediction', None)  # used only to orient the crop
 
 
 def _orient_items(items, vol, predictor=None, *, previous=None, pool=None):

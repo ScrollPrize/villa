@@ -14,7 +14,7 @@ from vesuvius.neural_tracing.fiber_follow.tracing.trace import ModelTracer
 from vesuvius.neural_tracing.fiber_follow.shared.reference import SEED_FIELDS, observed_seed
 from vesuvius.neural_tracing.fiber_follow.data.state_labels import DEPARTURE_DISTANCE, supervise
 from vesuvius.neural_tracing.fiber_follow.tracing.heading import heading_free_bounds, reframe_item, FRAME_POLICY, FRAME_POLICIES
-from vesuvius.neural_tracing.fiber_follow.tracing.crop_frames import frame_predictor, orient_items, crop_frame_bounds
+from vesuvius.neural_tracing.fiber_follow.tracing.crop_frames import frame_predictor, orient_items, crop_frame_bounds, prediction_window
 from vesuvius.neural_tracing.fiber_follow.models.model import FollowerConfig
 
 
@@ -41,7 +41,7 @@ class ObservationBuilder:
     def finalize_frames(self,items,vol):
         for item in items:
             resolve_trace_seed(item,vol)
-        orient_items(items,vol,frame_predictor(self.cfg))
+        orient_items(items,vol,frame_predictor(self.cfg),window=prediction_window(self.cfg))
 
     def images(self,items,vol,pool=None):
         self.finalize_frames(items,vol)
@@ -111,6 +111,15 @@ class IdentitySampling:
     roll_flip_probability: float = .5
     roll_jitter_deg: float = 5.
     roll_jitter_max_deg: float = 15.
+    # Imperfect crop headings: on this share of training samples the crop's forward axis tilts by a 2-D Gaussian angle
+    # (Rayleigh scale crop_tilt_deg: median ~1.18x, p90 ~2.15x; capped at crop_tilt_max_deg) in a random direction, and the
+    # labels follow the tilted crop. Scale 6 deg on top of the prediction-axis crops (median error 3.2 deg) gives roughly
+    # the frame model's crop errors on successful decisions (median 5.4, p90 12 deg; output/failure_analysis_20261006/
+    # axis_estimators.py); the 20 deg cap keeps the fiber within ~5.5 vox of the axis over 16 planes, about the worst
+    # swing at real failures.
+    crop_tilt_probability: float = .25
+    crop_tilt_deg: float = 6.
+    crop_tilt_max_deg: float = 20.
 
     def __post_init__(self):
         if isinstance(self.rule, dict):
@@ -124,6 +133,9 @@ class IdentitySampling:
         if (not 0 <= self.roll_flip_probability <= 1 or not np.isfinite(self.roll_jitter_deg) or self.roll_jitter_deg < 0
                 or not np.isfinite(self.roll_jitter_max_deg) or self.roll_jitter_max_deg < 0):
             raise ValueError('Roll augmentation needs a flip probability in [0, 1] and finite nonnegative jitter')
+        if (not 0 <= self.crop_tilt_probability <= 1 or not np.isfinite(self.crop_tilt_deg) or self.crop_tilt_deg < 0
+                or not np.isfinite(self.crop_tilt_max_deg) or not 0 <= self.crop_tilt_max_deg < 90):
+            raise ValueError('Crop tilt needs a probability in [0, 1], a nonnegative scale and a cap below 90 degrees')
         if (len(self.blur_sigma) != 2 or not all(np.isfinite(v) for v in self.blur_sigma)
                 or not 0 <= self.blur_sigma[0] <= self.blur_sigma[1]):
             raise ValueError('Blur sigma must be a finite, nonnegative MIN MAX range')
@@ -204,6 +216,14 @@ def roll_frame(frame, angle):
     return np.asarray(frame) @ np.array([[c, -s, 0.], [s, c, 0.], [0., 0., 1.]])
 
 
+def tilt_frame(frame, angle, azimuth):
+    """The crop frame with its forward axis tilted by ``angle`` toward ``azimuth`` in its (u, v) plane; u follows."""
+    from vesuvius.neural_tracing.fiber_follow.shared.geometry import frame_from_heading
+    frame = np.asarray(frame, np.float64)
+    toward = np.cos(azimuth)*frame[:, 0]+np.sin(azimuth)*frame[:, 1]
+    return frame_from_heading(np.cos(angle)*frame[:, 2]+np.sin(angle)*toward, frame[:, 0])
+
+
 class IdentityObservationBuilder(ObservationBuilder):
     """Foreign masks, identity evidence and augmentation on top of the shared observation."""
 
@@ -214,18 +234,27 @@ class IdentityObservationBuilder(ObservationBuilder):
         self.neighbors = neighbors  # neighboring annotations (AFV sources); None: no known neighbors
         self.lateral = deque(maxlen=sampling.lateral_memory)
 
-    def apply_roll(self, item):
-        """Apply a drawn roll once the frame is final, before any read is planned.
+    def apply_roll(self, item, *, any_heading_planned=False):
+        """Apply a drawn roll (and crop tilt) once the frame is final, before any read is planned.
 
         Every local label, reference and crop footprint then shares the rolled frame;
         world geometry is unchanged. Unresolved CT frames keep the roll pending: their
-        planned footprint already covers every roll about the heading.
+        planned footprint already covers every roll about the heading. A tilt changes the
+        heading, so it applies only before reads are planned (recorded frames) or when the
+        planned footprint covers every heading (``any_heading_planned``: learned frames);
+        the labels are rebuilt for the tilted crop.
         """
         if item.get('frame_policy') not in FRAME_POLICIES or 'roll_augmentation' not in item:
             return item
         angle = item.pop('roll_augmentation')
         if angle:
             reframe_item(item, roll_frame(item['frame'], angle))
+        tilt = item.pop('tilt_augmentation', None)
+        if tilt is not None and (any_heading_planned or 'recorded_frame' in item):
+            from vesuvius.neural_tracing.fiber_follow.data.data import refresh_frame_targets
+            reframe_item(item, tilt_frame(item['frame'], *tilt))
+            refresh_frame_targets(item)
+            item['crop_tilt_deg'] = float(np.degrees(tilt[0]))
         return item
 
     def identity_evidence(self, item, curve):
@@ -249,9 +278,10 @@ class IdentityObservationBuilder(ObservationBuilder):
         super().finalize_frames(items,vol)
         for item in items:
             if self.augment:
-                self.apply_roll(item)
+                self.apply_roll(item, any_heading_planned=frame_predictor(self.cfg) is not None)
             else:
                 item.pop('roll_augmentation', None)
+                item.pop('tilt_augmentation', None)
             if 'identity_curve' in item:
                 self.identity_evidence(item, item['identity_curve'])
             else:
@@ -328,7 +358,13 @@ class IdentityObservationBuilder(ObservationBuilder):
             item['photometric'], item['blur_sigma'] = photometric_draw(s, rng)
             jitter = float(np.clip(rng.normal(0., s.roll_jitter_deg), -s.roll_jitter_max_deg, s.roll_jitter_max_deg))
             item['roll_augmentation'] = float(np.deg2rad(jitter)+(np.pi if rng.random() < s.roll_flip_probability else 0.))
+            if s.crop_tilt_probability and rng.random() < s.crop_tilt_probability:
+                angle = min(float(np.hypot(*rng.normal(0., s.crop_tilt_deg, 2))), s.crop_tilt_max_deg)
+                item['tilt_augmentation'] = (float(np.deg2rad(angle)), float(rng.uniform(0., 2*np.pi)))
+            if 'frame_policy' in item:
+                item['recorded_frame'] = True  # tilt now, before this item's reads are planned
             self.apply_roll(item)
+            item.pop('recorded_frame', None)
         item['identity_seed'] = int(rng.integers(2**63))
         item.setdefault('location_source',0)
         return item

@@ -50,6 +50,7 @@ TRAINING = dict(
     # Neighbour banks, augmentation and AFV sampling.
     bank_coverage_probability=.2, bank_hard_fraction=.5, bank_switch_tolerance=.75, bank_own_tolerance=1.5,
     blur_probability=.25, blur_sigma=[.5, 1.25], lateral_fraction=.1, afv_length_power=3.,
+    crop_tilt_probability=.25, crop_tilt_deg=6., crop_tilt_max_deg=20.,
     # On-policy collection (DAgger) and replay.
     dagger_every=1000, dagger_fibers=128, afv_dagger_fibers=384, dagger_batch=24, dagger_forward_chunk=0,
     dagger_trace_len=6000., dagger_before=48., dagger_after=64., dagger_stride=16., replay_keep=4,

@@ -364,6 +364,7 @@ class EvaluationAudit:
                                       bank_detector=self.detector) for s in seeds]
         self.records = [dict(decisions=0, rejected_unsafe=0, rejected_safe=0, accepted_unsafe=0, premature_stop=0,
                              stop_unknown=0, terminal_stop=0, recovery_foreign_contacts=0, recovery_commits=0,
+                             refit_retries=0,
                              displaced_previous=False) for _ in seeds]
 
     def __call__(self, index, state):
@@ -388,6 +389,9 @@ class EvaluationAudit:
         supported = item['geometry_valid'] and int(item['supervision']) in (FOLLOWING, RECOVERABLE)
         record['decisions'] += 1
         displaced = facts['match_distance'] > 3.
+        if state.get('refit_retry'):
+            record['refit_retries'] += 1  # not a stop: the head retries with its crop refit to its own prediction
+            return
         if state['would_stop']:
             if int(item['supervision']) == TERMINAL:
                 record['terminal_stop'] += 1
@@ -427,6 +431,7 @@ class EvaluationAudit:
 
 
 OUTCOME_COUNTS = ('decisions', 'rejected_unsafe', 'rejected_safe', 'accepted_unsafe', 'premature_stop', 'stop_unknown',
+                  'refit_retries',
                   'terminal_stop', 'recovery_foreign_contacts', 'recovery_commits', 'confirmed_switch',
                   'identity_coverage', 'excursions', 'excursion_returns', 'distance_events', 'distance_event_returns',
                   'distance_events_ended')

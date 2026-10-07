@@ -166,18 +166,25 @@ class LiveContinuationSource:
         item = dataset.prepare(item, rng)
         # The unresolved-frame footprint covers all rolls and the CT tensor.
         dataset.prefetch_items([item], vol, required=True)
-        from vesuvius.neural_tracing.fiber_follow.tracing.crop_frames import frame_predictor, orient_items
+        from vesuvius.neural_tracing.fiber_follow.tracing.crop_frames import (apply_prediction_axis, frame_predictor,
+                                                                              orient_items, prediction_window)
         item['fiber_family'] = fiber.tag
-        predictor = frame_predictor(getattr(dataset.batch_builder, 'cfg', None))
+        model_cfg = getattr(dataset.batch_builder, 'cfg', None)
+        predictor = frame_predictor(model_cfg)
+        window = prediction_window(model_cfg) if model_cfg is not None else 0
+        # The chain's previous prediction past what it committed (world, nearest first) sets the continuation crop axis.
+        head = np.asarray(state['observed_path'][-1], np.float64)
+        item['prev_prediction'] = (head+np.asarray(state['points']) @ np.asarray(state['frame']).T)[int(state['commit']):]
         if predictor is None:
             diagnostics = {}
             frame = ct_frame(vol, item['pos'], advanced['heading'], state['frame'], diagnostics=diagnostics)
             reframe_item(item, frame)
             item.update(frame_policy=FRAME_POLICY, ct_frame_diagnostics=diagnostics)
+            apply_prediction_axis(item, window)
         else:
-            orient_items([item], vol, predictor, previous=[state['frame']])
+            orient_items([item], vol, predictor, previous=[state['frame']], window=window)
         if hasattr(dataset.batch_builder, 'apply_roll'):
-            dataset.batch_builder.apply_roll(item)
+            dataset.batch_builder.apply_roll(item, any_heading_planned=predictor is not None)
         return item
 
     def close(self):

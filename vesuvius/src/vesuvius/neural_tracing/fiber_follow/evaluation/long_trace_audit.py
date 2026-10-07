@@ -88,7 +88,8 @@ class DetailedAudit(EvaluationAudit):
         distance = float(labeler.vertex_distances[-1]) if len(labeler.vertex_distances) else None
         self.details[index].append(dict(travelled=state['travelled'], confidence_first=float(state['confidence'][0]),
             confidence_last=float(state['confidence'][-1]), commit=int(state['n_commit']),
-            stopped=bool(state['would_stop']), blocked=bool(state['recovery_blocked']),
+            stopped=bool(state['would_stop']), refit_retry=bool(state.get('refit_retry', False)),
+            blocked=bool(state['recovery_blocked']),
             match_distance=distance, matched_t=labeler.t, departure=labeler.departure_distance,
             boundary=labeler.boundary_distance, switched=labeler.switch is not None,
             accepted_unsafe=record['accepted_unsafe']-before['accepted_unsafe'],

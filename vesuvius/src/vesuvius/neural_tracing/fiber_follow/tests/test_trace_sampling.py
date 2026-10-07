@@ -71,3 +71,43 @@ def test_seed_offset_starts_off_the_centerline_and_fades_into_the_same_trace():
         # Labels are still the GT continuation from the (possibly offset) head.
         future = interp_at(p, s, np.clip(t+on.future_s, 0, s[-1]))
         np.testing.assert_allclose(moved['fut_local'] @ moved['frame'].T+moved['pos'], future, atol=1e-9)
+
+
+def test_continuation_crops_follow_the_previous_prediction_and_seeds_do_not():
+    from vesuvius.neural_tracing.fiber_follow.tracing.crop_frames import apply_prediction_axis, predicted_axis
+    f, cfg = curved_fiber(), sample_config(excursion_probability=0., prediction_window=16.)
+    seed = D.make_sample(f, 20., False, cfg, np.random.default_rng(0), startup=0)
+    assert 'prev_prediction' not in seed  # a seed has no previous decision: the frame model orients it
+    item = D.make_sample(f, 60., False, cfg, np.random.default_rng(1), startup=3)
+    future = item['prev_prediction']
+    assert future.shape == (16, 3)
+    p, s = D.traversal_curve(f, False)
+    # The simulated prediction runs along the annotation ahead of the head, within a voxel or two of it.
+    gt = interp_at(p, s, item['trace_facts']['t']+np.arange(1., 17.)) if 'trace_facts' in item and 't' in item['trace_facts'] else None
+    assert np.linalg.norm(future[-1]-item['pos']) == pytest.approx(16., abs=2.5)
+    # The crop's forward axis becomes the prediction's axis; the labels follow the new frame.
+    assert apply_prediction_axis(item, 16.)
+    axis = predicted_axis(future, item['pos'], 16.)
+    np.testing.assert_allclose(item['frame'][:, 2], axis, atol=1e-9)
+    assert item['frame_policy'] == 'prediction_axis_learned_roll_v1'
+    future_world = item['fut_local'] @ item['frame'].T+item['pos']
+    np.testing.assert_allclose(future_world, interp_at(p, s, np.clip(60.+cfg.future_s, 0, s[-1])), atol=1e-6)
+    # A straight prediction gives its own direction.
+    line = item['pos']+np.arange(1., 17.)[:, None]*np.array([0., .6, .8])
+    np.testing.assert_allclose(predicted_axis(line, item['pos'], 16.), [0., .6, .8], atol=2e-3)
+
+
+def test_crop_tilt_moves_the_forward_axis_and_the_labels_follow():
+    from vesuvius.neural_tracing.fiber_follow.data.observations import tilt_frame
+    from vesuvius.neural_tracing.fiber_follow.tracing.heading import reframe_item
+    f, cfg = curved_fiber(), sample_config(excursion_probability=0., prediction_window=0.)
+    item = D.make_sample(f, 60., False, cfg, np.random.default_rng(3), startup=3)
+    before = item['frame'].copy()
+    reframe_item(item, tilt_frame(item['frame'], np.deg2rad(15.), 1.))
+    D.refresh_frame_targets(item)
+    assert np.degrees(np.arccos(np.clip(before[:, 2] @ item['frame'][:, 2], -1, 1))) == pytest.approx(15., abs=1e-6)
+    np.testing.assert_allclose(item['frame'].T @ item['frame'], np.eye(3), atol=1e-9)
+    # Labels are the same GT continuation, expressed in the tilted crop.
+    p, s = D.traversal_curve(f, False)
+    np.testing.assert_allclose(item['fut_local'] @ item['frame'].T+item['pos'],
+                               interp_at(p, s, np.clip(60.+cfg.future_s, 0, s[-1])), atol=1e-6)

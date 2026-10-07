@@ -30,7 +30,7 @@ from vesuvius.neural_tracing.fiber_follow.train import run_config
 from vesuvius.neural_tracing.fiber_follow.train.supervision import commit_window, loss_terms
 from vesuvius.neural_tracing.fiber_follow.evaluation.diagnostics import decision_rows, summarize_decisions
 from vesuvius.neural_tracing.fiber_follow.evaluation.recovery import monitor_fixture, evaluate_monitor
-from vesuvius.neural_tracing.fiber_follow.tracing.crop_frames import configured_frame_policy, frame_predictor, bind_frame_checkpoint
+from vesuvius.neural_tracing.fiber_follow.tracing.crop_frames import configured_frame_policy, frame_predictor, bind_frame_checkpoint, prediction_window
 from vesuvius.neural_tracing.fiber_follow.train.training_log import format_training_log, TrainingInterval, SamplingLedger
 
 
@@ -560,6 +560,8 @@ def main(argv=None):
     identity_sampling = IdentitySampling(
         blur_probability=args.blur_probability,blur_sigma=tuple(args.blur_sigma),
         lateral_fraction=args.lateral_fraction,bank_hard_fraction=args.bank_hard_fraction,
+        crop_tilt_probability=args.crop_tilt_probability,crop_tilt_deg=args.crop_tilt_deg,
+        crop_tilt_max_deg=args.crop_tilt_max_deg,
         bank_coverage_probability=args.bank_coverage_probability,synthetic_tail=tuple(args.synthetic_tail))
     if not 1 <= args.n_commit <= cfg.n_future:
         raise ValueError('Commit window must fit forecast')
@@ -571,7 +573,7 @@ def main(argv=None):
                           startup_shares=tuple(args.startup_shares), excursion_probability=args.excursion_probability,
                           excursion_amplitude=tuple(args.excursion_amplitude), excursion_rise=tuple(args.excursion_rise),
                           seed_offset=tuple(args.seed_offset), seed_offset_ramp=args.seed_offset_ramp,
-                          live_seed_start=args.live_seed_start,
+                          live_seed_start=args.live_seed_start, prediction_window=prediction_window(cfg),
                           label_tolerance=args.tolerance, max_recovery_distance=cfg.max_recovery_distance)
     policy = training_policy(cfg, args.n_commit, args.trace_confidence, args.gate)
     progress('Loading manifest and fiber annotations')
@@ -738,7 +740,7 @@ def main(argv=None):
                               startup_shares=sample.startup_shares, excursion_probability=sample.excursion_probability,
                               excursion_amplitude=sample.excursion_amplitude, excursion_rise=sample.excursion_rise,
                               seed_offset=sample.seed_offset, seed_offset_ramp=sample.seed_offset_ramp,
-                              live_seed_start=sample.live_seed_start),
+                              live_seed_start=sample.live_seed_start, prediction_window=sample.prediction_window),
         label_contract=dict(tolerance=sample.label_tolerance, max_recovery_distance=sample.max_recovery_distance),
         live_continuation_steps=args.live_continuation_steps,
         frame_policy=configured_frame_policy(cfg), sampling=asdict(identity_sampling)))

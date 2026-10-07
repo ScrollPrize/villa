@@ -10,13 +10,15 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
-from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, normalize
+from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, frame_from_heading, normalize
 from vesuvius.neural_tracing.fiber_follow.tracing.policy import (DEFAULT_CONFIDENCE, DEFAULT_GATE, DEFAULT_N_COMMIT, GATES, gate_horizon,
     commit_count, selection_window)
 from vesuvius.neural_tracing.fiber_follow.data.volume import FiberVolume
 from vesuvius.neural_tracing.fiber_follow.shared.reference import SEED_FIELDS, observed_path
-from vesuvius.neural_tracing.fiber_follow.tracing.heading import trace_heading, TRACE_HEADING_POLICY, FRAME_POLICY, FRAME_POLICIES, ct_frame, fiber_family
-from vesuvius.neural_tracing.fiber_follow.tracing.crop_frames import frame_predictor, configured_frame_policy, predict_frames
+from vesuvius.neural_tracing.fiber_follow.tracing.heading import (trace_heading, TRACE_HEADING_POLICY, FRAME_POLICY, FRAME_POLICIES,
+                                                                 PREDICTION_FRAME_POLICY, ct_frame, fiber_family)
+from vesuvius.neural_tracing.fiber_follow.tracing.crop_frames import (frame_predictor, configured_frame_policy, predict_frames,
+                                                                      predicted_axis, prediction_window)
 
 if TYPE_CHECKING:
     from torch.nn import Module as FollowNet
@@ -37,6 +39,9 @@ class TraceParams:
     # Model arithmetic on CUDA: 'bf16' autocast, or 'fp32' (no autocast; TF32 follows torch.backends flags).
     # fp32 keeps batch-composition rounding differences from growing into flipped decisions.
     precision: str = 'bf16'
+    # A decision that would stop on confidence first retries once at the same head with its crop refit to its own
+    # prediction (tracing.crop_frames.predicted_axis over the gate horizon); only a second stop ends the trace.
+    refit_retry: bool = True
 
     def __post_init__(self):
         if (self.n_commit < 1 or self.max_len <= 0 or not 0 <= self.confidence <= 1 or self.forward_chunk < 0
@@ -131,6 +136,9 @@ class ModelTracer:
         self.n_history, self.p, self.device = n_history, params or TraceParams(), str(device)
         self.frame_predictor = frame_predictor(model.cfg)
         self.frame_policy = configured_frame_policy(model.cfg)
+        self.prediction_window = prediction_window(model.cfg)  # continuation crop axis from the previous prediction
+        cfg = model.cfg
+        self.refit_window = float(getattr(cfg, 'gate_horizon', cfg.n_future))*float(getattr(cfg, 'future_step', 1.))
         self.heading_policy = 'learned_heading_v1' if self.frame_predictor is not None else TRACE_HEADING_POLICY
         if self.p.n_commit > model.cfg.n_future:
             raise ValueError(f'n_commit={self.p.n_commit} exceeds the model horizon n_future={model.cfg.n_future}')
@@ -295,6 +303,10 @@ class ModelTracer:
         length = np.zeros(n)
         last_segment = [np.asarray([p[-1]]) for p in paths]
         decisions = np.zeros(n, np.int64)  # per trace, for the flow sampler's decision keys
+        # Each trace's previous prediction past what it committed (world, nearest first); None at a seed or restart.
+        prediction = [None]*n
+        predicted = np.zeros(n, bool)  # this decision's crop came from the previous prediction
+        retried = np.zeros(n, bool)  # this head already had its confidence-stop retry
         pp = self.p
         while active.any():
             idx = np.flatnonzero(active)
@@ -345,6 +357,9 @@ class ModelTracer:
                 # Same-position refinement is already exhausted inside the model: a
                 # rejected decision stops the trace immediately; nothing is forced.
                 would_stop = commit == 0
+                refit = None
+                if would_stop and pp.refit_retry and not retried[i] and not recovery_blocked:
+                    refit = predicted_axis(pos[j]+points[j] @ fr[j].T, pos[j], self.refit_window)
                 state = dict(pos=pos[j].copy(), frame=fr[j].copy(), hist=hist_world[j].copy(), hmask=hm[j].copy(),
                              points=points[j].copy(), confidence=conf.copy(), n_commit=commit, would_stop=would_stop,
                              recovery_blocked=bool(recovery_blocked),
@@ -352,14 +367,21 @@ class ModelTracer:
                              observed_path=np.asarray(paths[i]).copy(),
                              heading_start=int(heading_start[i]),
                              frame_policy=(initial_states[i]['frame_policy'] if initial_states is not None and length[i] == 0
+                                           else PREDICTION_FRAME_POLICY if predicted[i]
                                            else getattr(self, 'frame_policy', FRAME_POLICY)),
-                             fiber_family=families[i], ct_frame_diagnostics=frame_diagnostics[i].copy())
+                             fiber_family=families[i], ct_frame_diagnostics=frame_diagnostics[i].copy(),
+                             refit_retry=refit is not None)
                 state.update({**references[i], 'seed_age': references[i]['seed_age']+float(length[i])})
                 if on_decision is not None and on_decision(int(i), state) is False:
                     active[i], reasons[i] = False, 'oracle'
                     continue
                 if recovery_blocked:
                     active[i], reasons[i] = False, 'recovery_limit'
+                    continue
+                if would_stop and refit is not None:
+                    # Retry once from the same head, the crop refit to this decision's own predicted fiber.
+                    frames[i] = frame_from_heading(refit, fr[j][:, 0])
+                    retried[i], predicted[i] = True, True
                     continue
                 if would_stop:
                     active[i], reasons[i] = False, 'confidence'
@@ -377,6 +399,8 @@ class ModelTracer:
                 length[i] = advanced['travelled']
                 heading_start[i] = advanced['heading_start']
                 reframe[i] = advanced['heading']
+                retried[i] = False
+                prediction[i] = (pos[j]+points[j] @ fr[j].T)[commit:]
                 if length[i] >= pp.max_len-1e-6:
                     active[i], reasons[i] = False, 'max_len'
             if sequence is not None:
@@ -394,4 +418,11 @@ class ModelTracer:
                                             diagnostics=frame_diagnostics[i])
                 for i, frame in zip(reframe, self.map(update, reframe)):
                     frames[i] = frame
+            for i in reframe:
+                # Continuations: forward along the previous prediction's axis, roll from the frame just built.
+                axis = (predicted_axis(prediction[i], paths[i][-1], self.prediction_window)
+                        if self.prediction_window and prediction[i] is not None and len(prediction[i]) else None)
+                if axis is not None:
+                    frames[i] = frame_from_heading(axis, np.asarray(frames[i])[:, 0])
+                predicted[i] = axis is not None
         return [np.asarray(p[h:]) for p, h in zip(paths, hist_start)], reasons

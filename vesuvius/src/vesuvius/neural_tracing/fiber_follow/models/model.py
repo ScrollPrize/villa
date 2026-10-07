@@ -32,6 +32,9 @@ class FollowerConfig:
     recurrent_refinement_steps: int = 0
     frame_checkpoint: str | None = None  # frozen heading/normal model used by crop builders
     frame_checkpoint_sha256: str | None = None
+    # Continuation crop axis: 'prediction' = the previous decision's prediction (tracing.crop_frames.predicted_axis;
+    # seeds and restarts keep the frame model's heading), 'heading_model' = the frame model's heading everywhere.
+    crop_axis: str = 'prediction'
 
     def __post_init__(self):
         if isinstance(self.fine, dict):
@@ -49,6 +52,8 @@ class FollowerConfig:
             raise ValueError('Future horizon exceeds fine image')
         if self.gate_plane is not None and (type(self.gate_plane) is not int or not 1 <= self.gate_plane <= self.n_future):
             raise ValueError('Gate plane must be an integer in [1, n_future]')
+        if self.crop_axis not in ('prediction', 'heading_model'):
+            raise ValueError("crop_axis must be 'prediction' or 'heading_model'")
         if not isinstance(self.recurrent_refinement_steps, int) or self.recurrent_refinement_steps < 0:
             raise ValueError('Recurrent refinement steps must be a nonnegative integer')
 
