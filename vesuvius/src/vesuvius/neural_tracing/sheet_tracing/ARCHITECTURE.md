@@ -406,7 +406,7 @@ spacing).
 
 * AdamW with weight decay 1e-4, a linear warm-up, then cosine decay to zero at `train.max_minutes`.
 * Gradient clipping at 1.0 and bf16 autocast.
-* Each step's loss is backpropagated right after the step (`train.backward_per_step`).
+* Each step's loss is backpropagated right after the step (steps are detached from each other).
 * An EMA of the weights (0.999) is used for validation, `best.pt` and `--init`.
 * Validation: 64 fixed held-out episodes every 1,000 iterations.
 

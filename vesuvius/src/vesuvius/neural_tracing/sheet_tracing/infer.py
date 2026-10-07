@@ -7,8 +7,8 @@ length at ``data.point_spacing``; the number of front points follows from its le
 model is independent of it). Each step reads the volume block around the current front. Rows are the steps,
 columns the dense curve samples, ``trace.spline_samples`` per gap. Curve samples of gaps with a low-confidence front
 point are written as invalid (-1); the points keep riding the curve, so they reappear when they become confident
-again. Tracing stops after ``--steps``, or once fewer than ``--min-confident`` of the front points have been
-confident for ``--patience`` consecutive steps.
+again. Tracing stops after ``--steps``, at the first row with no confident point connected to the surface traced
+so far, or when the front leaves the volume.
 
   python -m vesuvius.neural_tracing.sheet_tracing.infer --checkpoint output/remote_l0_points_ft/last.pt \\
       --seed-patch /path/to/patch --line row:40 --range 100:160 --direction + --steps 40 --out output/remote_l0_points_ft/traces/t0
@@ -98,12 +98,11 @@ def connected_keep(confs: np.ndarray, threshold: float) -> np.ndarray:
 
 
 @torch.no_grad()
-def trace(model, cfg, seed: np.ndarray, direction: np.ndarray, steps: int, device, min_confident=.25, patience=3,
-          stop_on_disconnect: bool = True, follow: bool = False, fibers: dict | None = None):
+def trace(model, cfg, seed: np.ndarray, direction: np.ndarray, steps: int, device, stop_on_disconnect: bool = True,
+          follow: bool = False, fibers: dict | None = None):
     """Rows (T+1, C, 3) including the seed and per-column confidences (T+1, C).
 
-    C is the number of front points, or of dense Hermite samples. Each Hermite sample gets the lower confidence
-    of its gap's two control points. With ``stop_on_disconnect`` (default), tracing stops at the first row with no
+    C is the number of dense Hermite samples; each gets the lower confidence of its gap's two control points. With ``stop_on_disconnect`` (default), tracing stops at the first row with no
     confident point connected to the surface traced so far (e.g. an entirely missed row): later rows could only
     form separate components. That row is not returned. Use ``connected_keep`` for the points to write.
     ``follow``: fiber-following mode (a front across a fiber, advancing along it). ``fibers``: the fibers around the
@@ -124,7 +123,7 @@ def trace(model, cfg, seed: np.ndarray, direction: np.ndarray, steps: int, devic
     pad = view_radius(cfg.model)+d.step+4
     columns = lambda pos, conf, dense=None: tuple(x[0].cpu().numpy() for x in tracer.output_columns(pos, conf, dense))
     p, c = columns(front.pos, front.conf)
-    rows, confs, low = [p], [c], 0
+    rows, confs = [p], [c]
     reach = np.ones(len(c), bool)  # the seed row
     shape = np.asarray(volume.shape)[::-1]*(1 << d.volume_level)
     fiber_inputs = None
@@ -142,9 +141,7 @@ def trace(model, cfg, seed: np.ndarray, direction: np.ndarray, steps: int, devic
             break
         rows.append(p)
         confs.append(c)
-        point_conf = front.conf[0].cpu().numpy()
-        low = low+1 if (point_conf > cfg.trace.confidence_threshold).mean() < min_confident else 0
-        if low >= patience or np.any(p < 0) or np.any(p >= shape):
+        if np.any(p < 0) or np.any(p >= shape):
             break
     return np.stack(rows), np.stack(confs)
 
@@ -204,8 +201,6 @@ def main(argv=None):
     ap.add_argument('--seed-json')
     ap.add_argument('--steps', type=int, default=40)
     ap.add_argument('--threshold', type=float, help="confidence threshold (default: the checkpoint's)")
-    ap.add_argument('--min-confident', type=float, default=.25)
-    ap.add_argument('--patience', type=int, default=3)
     ap.add_argument('--out', required=True)
     ap.add_argument('--path-map', action='append', default=[], metavar='OLD=NEW',
                     help='replace the path prefix OLD by NEW in the checkpoint\'s data paths (volumes, patch '
@@ -223,7 +218,7 @@ def main(argv=None):
     seed = resample(points, cfg.data.point_spacing)
     direction = np.stack([np.interp(np.linspace(0, len(points)-1, len(seed)), np.arange(len(points)), direction[:, i])
                           for i in range(3)], 1)
-    rows, confs = trace(model, cfg, seed, direction, args.steps, args.device, args.min_confident, args.patience)
+    rows, confs = trace(model, cfg, seed, direction, args.steps, args.device)
     out = Path(args.out)
     write_trace(out, rows, confs, cfg, cfg.trace.confidence_threshold, dict(vars(args), front_points=len(seed),
                                                                             steps_traced=len(rows)-1))

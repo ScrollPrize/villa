@@ -75,7 +75,7 @@ def episode_figure(record: dict, cfg, path: Path) -> None:
     plt.close(fig)
 
 
-def metric_figure(runs: dict, cfg, path: Path) -> None:
+def metric_figure(runs: dict, path: Path) -> None:
     """Per-step curves for one or more named rollouts (e.g. two checkpoints on the same episodes)."""
     names = ('coverage', 'same_sheet', 'curve_same_sheet', 'confident', 'precision', 'caught', 'rejoined', 'dist_p90')
     fig, axes = plt.subplots(1, len(names), figsize=(3.2*len(names), 3))

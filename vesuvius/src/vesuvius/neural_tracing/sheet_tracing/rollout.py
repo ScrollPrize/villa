@@ -192,17 +192,13 @@ class Tracer:
         dense = hermite_dense(points, tangents, t.spline_samples)
         return StepOutput(pred, conf_logit, points, dense, tokens.float(), frames, (row.float(), *row_geometry))
 
-    def advance(self, front: Front, out: StepOutput, detach: bool = True) -> Front:
-        conf = torch.sigmoid(out.conf_logit)
-        pos = respace(out.dense, front.pos.shape[1])
-        if detach:
-            pos, conf = pos.detach(), conf.detach()
+    def advance(self, front: Front, out: StepOutput) -> Front:
+        """The next front, detached from this step's graph (each training step's loss trains that step only)."""
+        conf = torch.sigmoid(out.conf_logit).detach()
+        pos = respace(out.dense, front.pos.shape[1]).detach()
         row = out.grid_row
-        row = (row[0].detach(), *row[1:]) if detach else row
-        grid = (front.grid+[row])[-max(1, self.cfg.model.memory_rows):]
-        curve = respace(out.dense, self.columns)
-        if detach:
-            curve = curve.detach()
+        grid = (front.grid+[(row[0].detach(), *row[1:])])[-max(1, self.cfg.model.memory_rows):]
+        curve = respace(out.dense, self.columns).detach()
         return Front(pos, front.pos, conf, curve, grid)
 
     def teacher_forced(self, front: Front, pos: torch.Tensor) -> Front:

@@ -49,7 +49,7 @@ A checkpoint is a dict with these keys:
 `last.pt`.
 
 **Paths inside H100 checkpoints.** Their configs record the H100's data paths (`/ephemeral/sean/sheet_tracing/data/...`).
-On this machine, pass `--path-map OLD=NEW` (to `infer.py`, `trace_benchmark.py`, `trace_spread.py`, `hard_spots.py`
+On this machine, pass `--path-map OLD=NEW` (to `infer.py`, `trace_benchmark.py`, `hard_spots.py`
 and `scripts/trace_from_fibers.py`), or use `scripts/bench_local.sh`, which has the mappings built in:
 
 | H100 path | this machine |
@@ -108,9 +108,6 @@ src/vesuvius/neural_tracing/sheet_tracing/scripts/bench_local.sh \
   deterministic run to run.
 * **Re-scoring:** `trace_benchmark.py --rescore DIR` re-scores the switch counts of existing folders from their
   tifxyz.
-
-**Long traces for inspection:** `trace_spread.py --checkpoint ... --steps 120 --tag NAME --path-map ...` traces seeds
-spread over z and writes them to `output/spread/NAME/`.
 
 **Mine failure spots:** `hard_spots.py --checkpoint ... --seeds 1500 --out FILE.json --path-map ...`. It writes
 progress every 100 traces, so it can be stopped early.

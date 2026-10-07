@@ -88,7 +88,9 @@ def test_same_sheet_label_and_jump():
     assert torch.equal(same, ~run)
     middle = (cfg.train.jump_min+cfg.train.jump_max)/2  # no volume given: push to the middle of the range
     assert torch.allclose(dist[run], torch.full_like(dist[run], middle), atol=.5)
-    _, _, applies = targets(pushed, gt, valid, cfg.data.step/cfg.data.gt_resolution, cfg.loss.sheet_tolerance)
+    d = cfg.data
+    columns = (torch.arange(d.front_points)*d.point_spacing+d.gt_margin)/d.gt_resolution
+    _, _, applies = targets(pushed, gt, valid, d.step/d.gt_resolution, cfg.loss.sheet_tolerance, columns)
     assert torch.equal(applies, ~run)
     unchanged, none = sheet_jump(pos, gt, valid, cfg, torch.tensor([False]))
     assert not none.any() and torch.equal(unchanged, pos)
@@ -237,8 +239,7 @@ def test_trace_end_to_end_on_a_small_volume(tmp_path):
     model = build_model(cfg)
     seed = np.stack([np.full(5, 60.5), np.linspace(20, 100, 5), np.full(5, 20.)], 1)  # on the sheet, along y
     direction = np.tile([0., 0., 1.], (5, 1))  # advance along z
-    rows, confs = trace(model, cfg, seed, direction, 3, 'cpu', min_confident=0., patience=10**9,
-                        stop_on_disconnect=False)
+    rows, confs = trace(model, cfg, seed, direction, 3, 'cpu', stop_on_disconnect=False)
     assert isinstance(rows, np.ndarray) and rows.shape == (4, (5-1)*cfg.trace.spline_samples+1, 3)
     assert confs.shape == rows.shape[:2] and connected_keep(confs, .5)[0].all()
 
@@ -252,9 +253,8 @@ def test_history_warm_up_rollout_trains():
     model = build_model(cfg)
     torch.nn.init.normal_(model.head.weight, std=1e-2)
     generator = torch.Generator().manual_seed(1)
-    loss, stats, _, _ = train_rollout(Tracer(model, cfg, 'cpu'), b, cfg, spec, generator)
+    loss, stats, _, _ = train_rollout(Tracer(model, cfg, 'cpu'), b, cfg, spec, generator)  # backpropagates per step
     assert torch.isfinite(loss) and stats['supervised'] > .9
-    loss.backward()
     assert model.token_geometry[0].weight.grad.abs().sum() > 0  # the grid memory the warm-up filled is read
 
 
@@ -336,15 +336,13 @@ def test_live_chains_resume_where_the_model_left_off():
     chains = LiveChains(cfg, spec, tracer, jobs, torch.Generator().manual_seed(0))
     _, chain = chains.begin(b, 0)
     chain['limit'][:] = 30
-    with torch.no_grad():
-        _, _, front, confs = train_rollout(tracer, b, cfg, spec, torch.Generator().manual_seed(1))
+    _, _, front, confs = train_rollout(tracer, b, cfg, spec, torch.Generator().manual_seed(1))
     chains.finish(b, chain, front, confs, 0)
     job = jobs.get_nowait()
     assert len(job['chains']) == 1 and job['chains'][0]['shift'] > 0
     _, resumed = chains.begin(dict(b, chains=[(job['id'], 0)]), 1)
     assert torch.equal(resumed['front'].pos, front.pos) and int(resumed['steps'][0]) == 3
-    with torch.no_grad():
-        _, _, front2, _ = train_rollout(tracer, b, cfg, spec, torch.Generator().manual_seed(2), resumed['front'])
+    _, _, front2, _ = train_rollout(tracer, b, cfg, spec, torch.Generator().manual_seed(2), resumed['front'])
     assert len(front2.grid) == 3  # memory is full after a rollout
     assert chains.begin(dict(b, chains=[(job['id'], 0)]), 2)[1] is None  # consumed
     # Two jobs' chains share a batch; a chain whose state is gone is dropped with its episode.
@@ -437,7 +435,7 @@ def test_index_uses_measured_cell_when_meta_scale_is_wrong(tmp_path):
     assert abs(infos['close'].cell-1/.45) < 1e-6 and not infos['close'].stated_cell  # within tolerance: as stated
 
 
-def test_residual_joint_model_rollout_trains_every_part():
+def test_model_rollout_trains_every_part():
     cfg = C.load(None, SMALL)
     spec = GridSpec.for_episode(cfg.data, cfg.data.steps)
     gt, valid = cylinder_grid(spec)
@@ -463,26 +461,7 @@ def test_residual_joint_model_rollout_trains_every_part():
     assert model.token_type.grad.abs().sum() > 0
 
 
-def test_backward_per_step_gives_the_same_gradient():
-    from vesuvius.neural_tracing.sheet_tracing.train import train_rollout
-    grads = []
-    for per_step in (False, True):
-        cfg = C.load(None, SMALL+['data.steps=3', f'train.backward_per_step={str(per_step).lower()}'])
-        spec = GridSpec.for_episode(cfg.data, cfg.data.steps)
-        gt, valid = cylinder_grid(spec)
-        b = dict(gt=gt, valid=valid, block=torch.rand(1, 1, 224, 360, 360, generator=torch.Generator().manual_seed(3))*255,
-                 origin=torch.zeros(1, 3, dtype=torch.long))
-        torch.manual_seed(0)
-        model = build_model(cfg)
-        torch.nn.init.normal_(model.head.weight, std=1e-2)
-        loss, *_ = train_rollout(Tracer(model, cfg, 'cpu'), b, cfg, spec, torch.Generator().manual_seed(1))
-        if not per_step:
-            loss.backward()
-        grads.append(torch.cat([p.grad.flatten() for p in model.parameters() if p.grad is not None]))
-    assert grads[0].shape == grads[1].shape and torch.allclose(grads[0], grads[1], rtol=1e-4, atol=1e-6)
-
-
-def test_residual_crops_must_divide():
+def test_crops_must_divide():
     with pytest.raises(ValueError):
         C.load(None, SMALL+['model.crop=[8,16,10]'])  # 10 is not divisible by 4 (two stride-2 stages)
     with pytest.raises(ValueError):
@@ -582,7 +561,7 @@ def test_seeds_from_reuses_earlier_seeds_with_another_front(tmp_path, monkeypatc
     (patch/'meta.json').write_text(_json.dumps(dict(scale=[.5, .5])))
     cfg = C.load(None, [f'data.patches_dir="{tmp_path/"patches"}"', 'data.step=10', 'data.gt_margin=10',
                         'data.gt_resolution=2'])
-    seeds, _, _ = draw_seeds(cfg, 12, 3, 40., .5, all_val=True, distinct=False)
+    seeds, _, _ = draw_seeds(cfg, 12, 3, 40., .5, all_val=True, max_per_patch=0)
     assert seeds
     report = tmp_path/'report.json'
     report.write_text(_json.dumps(dict(seeds=[w['meta'] for w in seeds])))
@@ -662,7 +641,7 @@ def test_held_out_scoring_seeds_and_mask(tmp_path, monkeypatch):
     (patch/'meta.json').write_text(_json.dumps(dict(scale=[.5, .5])))
     cfg = C.load(None, [f'data.patches_dir="{tmp_path/"patches"}"', 'data.step=10', 'data.gt_margin=10',
                         'data.gt_resolution=2', 'data.split_block=48', 'data.val_fraction=.5'])
-    seeds, spec, data = draw_seeds(cfg, 20, 6, 40., .5, distinct=False, seed_split=True)
+    seeds, spec, data = draw_seeds(cfg, 20, 6, 40., .5, max_per_patch=0, seed_split=True)
     assert seeds
     iu0 = int(round(-spec.u_lo/spec.res))
     v0, v1 = int(round(-spec.v_lo/spec.res)), int(round((40.-spec.v_lo)/spec.res))
@@ -700,7 +679,7 @@ def test_resample_isotropic_squares_the_grid(tmp_path):
     assert _json.loads((tmp_path/'out'/'p0'/'meta.json').read_text())['scale'] == [.05, .05]
 
 
-def test_tifxyz_area_counts_valid_quads(tmp_path):
+def test_written_tifxyz_records_its_area(tmp_path):
     from vesuvius.neural_tracing.sheet_tracing.infer import surface_area_vx2, write_surface
     r, c = np.meshgrid(np.arange(5), np.arange(4), indexing='ij')
     rows = np.stack([np.full(r.shape, 7.), 10.*c, 20.*r], -1).astype(np.float32)  # 4 x 3 quads of 10 x 20 vx
@@ -846,8 +825,7 @@ def test_train_rollout_starts_from_provided_seed_rows():
     started = []
     real = tracer.initial
     tracer.initial = lambda seeds: started.append(seeds) or real(seeds)
-    with torch.no_grad():
-        train_rollout(tracer, b, cfg, spec, torch.Generator().manual_seed(0))
+    train_rollout(tracer, b, cfg, spec, torch.Generator().manual_seed(0))
     assert torch.allclose(started[0][0], given[0])  # the fiber-seeded episode starts on its seed rows
     assert not torch.allclose(started[0][1], given[1], atol=1e-3)  # the other on (noisy) GT rows
 

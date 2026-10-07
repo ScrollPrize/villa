@@ -79,23 +79,16 @@ def sheet_normal(volume, point: np.ndarray) -> np.ndarray | None:
     return vectors[:, -1]
 
 
-def advance_directions(points: np.ndarray, sign: float, volume=None) -> np.ndarray | None:
-    """Per point, the in-sheet direction perpendicular to the fiber, pointing to ``sign`` z: normal x tangent with the
-    structure-tensor sheet normal (``volume``: the level-0 CT), else ``sign`` z made perpendicular to the tangent.
-    None if a point has no clear sheet or the direction runs nearly along the fiber's own axis."""
+def advance_directions(points: np.ndarray, sign: float, volume) -> np.ndarray | None:
+    """Per point, the in-sheet direction perpendicular to the fiber, pointing to ``sign`` z: the structure-tensor
+    sheet normal (``volume``: the level-0 CT) x the fiber tangent. None if a point has no clear sheet."""
     t = np.gradient(points, axis=0)
     t /= np.maximum(np.linalg.norm(t, axis=1, keepdims=True), 1e-9)
-    z = np.array([0., 0., sign])
-    if volume is None:
-        if np.abs(t@z).max() > .7:
-            return None
-        d = z-(t@z)[:, None]*t
-    else:
-        normals = [sheet_normal(volume, p) for p in points]
-        if any(n is None for n in normals):
-            return None
-        d = np.cross(np.stack(normals), t)
-        d *= np.where(d@z < 0, -1., 1.)[:, None]  # point up (or down)
+    normals = [sheet_normal(volume, p) for p in points]
+    if any(n is None for n in normals):
+        return None
+    d = np.cross(np.stack(normals), t)
+    d *= np.where(d[:, 2]*sign < 0, -1., 1.)[:, None]  # point up (or down)
     return d/np.maximum(np.linalg.norm(d, axis=1, keepdims=True), 1e-9)
 
 
@@ -164,8 +157,6 @@ def main(argv=None):
     ap.add_argument('--points', type=int, default=9)
     ap.add_argument('--steps', type=int, default=60)
     ap.add_argument('--direction', choices=('up', 'down', 'both'), default='up', help='advance along +z, -z or both')
-    ap.add_argument('--normals', choices=('tensor', 'z'), default='tensor', help='advance direction: in the sheet '
-                    'given by the 2/8 CT structure-tensor normal (default), or z made perpendicular to the fiber')
     ap.add_argument('--coord-scale', type=float, default=.25)
     ap.add_argument('--threshold', type=float, default=.4)
     ap.add_argument('--suffix', default='', help='appended to each trace name')
@@ -224,8 +215,8 @@ def main(argv=None):
                 idx = np.floor((seed[:, ::-1]+.5)/(1 << d.volume_level)-.5).astype(int)
                 if np.mean([volume.read(i, (1, 1, 1))[0, 0, 0] > 0 for i in idx]) < .9:
                     continue
-                rows, confs = trace(model, cfg, seed, direction, args.steps, args.device, min_confident=0.,
-                                    patience=10**9, follow=True, fibers=around(path, seed))
+                rows, confs = trace(model, cfg, seed, direction, args.steps, args.device, follow=True,
+                                    fibers=around(path, seed))
                 name = f'fiber_{path.stem}_end{end}_follow{args.suffix}'
                 extended = extended_fiber(fiber, line, arc, sign, rows, confs, args.threshold, args.coord_scale,
                                           f'fiber_{path.stem}_end{end}_extended')
@@ -258,19 +249,18 @@ def main(argv=None):
             continue
         traced = False
         for sign in signs:
-            direction = advance_directions(points, sign, level0 if args.normals == 'tensor' else None)
+            direction = advance_directions(points, sign, level0)
             if direction is None:
                 continue
             seed = resample(points, d.point_spacing)
             dirs = np.stack([np.interp(np.linspace(0, len(points)-1, len(seed)), np.arange(len(points)), direction[:, k])
                              for k in range(3)], 1)
-            rows, confs = trace(model, cfg, seed, dirs, args.steps, args.device, min_confident=0., patience=10**9,
-                                fibers=around(path, seed))
+            rows, confs = trace(model, cfg, seed, dirs, args.steps, args.device, fibers=around(path, seed))
             # the file name, not the fiber's ``sequence``: sequence numbers repeat across annotators' files
             name = f"fiber_{path.stem}_cp{cp:02d}_{'up' if sign > 0 else 'down'}{args.suffix}"
             write_trace(args.out/name, rows, confs, cfg, args.threshold,
                         dict(fiber=str(path), control_point=cp, direction='+z' if sign > 0 else '-z',
-                             normals=args.normals, points=len(seed), steps=args.steps, steps_traced=len(rows)-1,
+                             points=len(seed), steps=args.steps, steps_traced=len(rows)-1,
                              checkpoint=args.checkpoint,
                              coord_scale=args.coord_scale, threshold=args.threshold), overwrite=True)
             meta = json.loads((args.out/name/'meta.json').read_text())

@@ -36,7 +36,7 @@ from vesuvius.neural_tracing.sheet_tracing.losses import front_metrics, gap_mask
 from vesuvius.neural_tracing.sheet_tracing.model import build_model, load_model_state
 from vesuvius.neural_tracing.sheet_tracing.rollout import Tracer
 from vesuvius.neural_tracing.sheet_tracing.sampling import sample_plane
-from vesuvius.neural_tracing.sheet_tracing.seeding import seed_rows, seed_u_index
+from vesuvius.neural_tracing.sheet_tracing.seeding import seed_rows
 
 
 
@@ -117,7 +117,7 @@ def rollout_metrics(tracer: Tracer, episodes, cfg, spec, steps: int, device, bat
     """Per-step metric arrays (``steps``,) and up to ``records`` episode records for figures. With ``surfaces``,
     the first ``surface_count`` episodes are also written there as trace and GT tifxyz."""
     tracer.model.eval()
-    seed_u = seed_u_index(cfg, spec)
+    seed_u = -spec.u_lo/spec.res  # grid row of the seed (u = 0)
     keys = ('ok', 'same', 'conf', 'cover', 'off', 'caught', 'stopped_before', 'rejoined', 'accurate',
             'curve_ok', 'curve_kept', 'curve_same')
     sums = {k: np.zeros(steps) for k in keys}
@@ -209,27 +209,27 @@ def load_checkpoint(path, device, raw: bool = False):
     return model, cfg, checkpoint
 
 
-def eval_episodes(cfg, steps: int, roi: int, count: int, seed: int = 0):
+def eval_episodes(cfg, steps: int, roi: int, count: int):
+    """``count`` fixed held-out episodes and their grid spec."""
     index = build_index(cfg.data.patches_dir, C.OUTPUT/'cache')
     sampler = EpisodeSampler(cfg.data, index, 'val', steps, roi, episode_pad(cfg.model, cfg.train))
-    return fixed_episodes(sampler, count, seed), sampler.spec
+    return fixed_episodes(sampler, count, 0), sampler.spec
 
 
-def run(tracer, cfg, out_dir: Path, steps: int, roi: int, count: int, records: int = 6, tag: str = 'eval',
-        episodes=None, surfaces: int | None = None):
-    """Evaluate on ``episodes`` (an ``(episodes, spec)`` pair from ``eval_episodes``, drawn if not given).
-    Every episode (or the first ``surfaces``) is written as trace + GT tifxyz under ``out_dir/tifxyz_TAG``."""
+def run(tracer, cfg, out_dir: Path, episodes, steps: int, roi: int, records: int = 6, tag: str = 'eval'):
+    """Evaluate on ``episodes`` (an ``(episodes, spec)`` pair from ``eval_episodes``). Every episode is written as
+    trace + GT tifxyz under ``out_dir/tifxyz_TAG``."""
     from vesuvius.neural_tracing.sheet_tracing.visualize import episode_figure, metric_figure
     device = next(tracer.model.parameters()).device
-    episodes, spec = episodes or eval_episodes(cfg, steps, roi, count)
+    episodes, spec = episodes
+    count = len(episodes)
     per_step, kept = rollout_metrics(tracer, episodes, cfg, spec, steps, device, records=records,
-                                     surfaces=out_dir/f'tifxyz_{tag}',
-                                     surface_count=len(episodes) if surfaces is None else surfaces)
+                                     surfaces=out_dir/f'tifxyz_{tag}', surface_count=count)
     out_dir.mkdir(parents=True, exist_ok=True)
     report = dict(tag=tag, steps=steps, episodes=count, roi=roi, summary=summarize(per_step),
                   per_step={k: v.tolist() for k, v in per_step.items()})
     (out_dir/f'{tag}.json').write_text(json.dumps(report, indent=2))
-    metric_figure({tag: per_step}, cfg, out_dir/f'{tag}_metrics.png')
+    metric_figure({tag: per_step}, out_dir/f'{tag}_metrics.png')
     for i, record in enumerate(kept):
         episode_figure(record, cfg, out_dir/f'{tag}_episode_{i:02d}.png')
     return report
@@ -253,7 +253,7 @@ def main(argv=None):
     t0 = time.time()
     episodes = eval_episodes(cfg, steps, roi, count)
     print(f'{count} episodes drawn in {time.time()-t0:.1f} s', flush=True)
-    report = run(tracer, cfg, Path(args.checkpoint).parent/'eval', steps, roi, count, args.records, tag, episodes)
+    report = run(tracer, cfg, Path(args.checkpoint).parent/'eval', episodes, steps, roi, args.records, tag)
     print(json.dumps(report['summary'], indent=2))
 
 

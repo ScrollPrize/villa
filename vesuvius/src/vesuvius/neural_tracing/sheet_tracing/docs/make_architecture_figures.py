@@ -179,7 +179,7 @@ def load(checkpoint: str, path_map: list[str], device: str):
     """The checkpoint's model and config, sampling seeds only from the patch directories on ``data.volume`` (the
     volume the figures read)."""
     from vesuvius.neural_tracing.sheet_tracing.evaluate import load_checkpoint
-    from vesuvius.neural_tracing.sheet_tracing.trace_benchmark import path_mapper
+    from vesuvius.neural_tracing.sheet_tracing.config import path_mapper
     model, cfg = load_checkpoint(checkpoint, device)[:2]
     path_mapper(path_map)(cfg)
     d = cfg.data
@@ -242,7 +242,7 @@ def real_data(checkpoint: str, path_map: list[str], device: str):
     fig.savefig(OUT/'crops_real.png', dpi=130, bbox_inches='tight')
     plt.close(fig)
 
-    rows, confs = trace(model, cfg, seed, dirs, 30, device, min_confident=0., patience=10**9)
+    rows, confs = trace(model, cfg, seed, dirs, 30, device)
     center = rows[0].mean(0)
     t = rows[0][-1]-rows[0][0]
     t /= np.linalg.norm(t)

@@ -23,7 +23,8 @@ import numpy as np
 
 from vesuvius.neural_tracing.sheet_tracing.evaluate import load_checkpoint
 from vesuvius.neural_tracing.sheet_tracing.infer import _reach_row, resample, trace
-from vesuvius.neural_tracing.sheet_tracing.trace_benchmark import draw_seeds, path_mapper, score, seed_polyline
+from vesuvius.neural_tracing.sheet_tracing.config import path_mapper
+from vesuvius.neural_tracing.sheet_tracing.trace_benchmark import draw_seeds, score, seed_polyline
 
 
 def first_stop(confs: np.ndarray, threshold: float) -> int | None:
@@ -54,7 +55,7 @@ def main(argv=None):
     cfg.trace.confidence_threshold = args.threshold
     t0 = time.time()
     seeds, spec, data = draw_seeds(cfg, args.seeds, args.steps, args.front, args.min_valid, split='train',
-                                   distinct=False)
+                                   max_per_patch=0)
     roots = [Path(p) for p in (cfg.data.patches_dir if isinstance(cfg.data.patches_dir, list) else [cfg.data.patches_dir])]
     print(f'{len(seeds)} training-split seeds in {time.time()-t0:.0f} s', flush=True)
     records, counts = [], dict(traced=0, stop=0, switch=0, none=0)
@@ -74,8 +75,7 @@ def main(argv=None):
         seed = resample(points, cfg.data.point_spacing)
         idx = np.linspace(0, len(points)-1, len(seed))
         dirs = np.stack([np.interp(idx, np.arange(len(points)), direction[:, k]) for k in range(3)], 1)
-        rows, confs = trace(model, cfg, seed, dirs, args.steps, args.device, min_confident=0., patience=10**9,
-                            stop_on_disconnect=False)
+        rows, confs = trace(model, cfg, seed, dirs, args.steps, args.device, stop_on_disconnect=False)
         if len(rows) < args.steps+1:  # left the volume
             continue
         counts['traced'] += 1

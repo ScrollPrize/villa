@@ -69,7 +69,6 @@ and code names therefore means masked output, not halted motion.
 | `data.fiber_pool`, `model.fiber_tokens`, `data.fiber_cut_at_start`, `fiber_max_instances`, `fiber_max_points` | In fiber-started episodes, the fibers around the episode (`scripts/build_fiber_pool.py`) as extra transformer tokens: the `fiber_tokens` points nearest the front each step, each with a random per-episode instance code shared by all points of one fiber. In following episodes the seed fiber is cut ahead of the start, so the model learns to extend it. |
 | `train.py --init CKPT` | Start from a checkpoint's weights (EMA if present) with a fresh optimizer and schedule. The fiber and mode modules start fresh if the checkpoint lacks them. `--resume` continues a run. |
 | `train.ema` | Exponential moving average of the weights (e.g. 0.999). Validation, `best.pt`, evaluation and `--init` use the averaged weights. Checkpoints keep both (`model` raw, `ema` averaged); `trace_benchmark.py --raw NAME` benchmarks the raw ones. |
-| `train.backward_per_step` | Backpropagate each rollout step's loss right after the step: the same gradient (the steps are detached), with only one step's activations in memory. Needs `train.detach_steps`. |
 | `train.max_minutes` | The cosine learning rate anneals to zero at the time budget. Resumed time counts. |
 | `train.keep_every` | Also keep `ckpt_ITER.pt` periodically, for benchmarking intermediate checkpoints. |
 | `train.compile_geometry` | `torch.compile` the GT projection: about 1.4x faster, but not bit-identical (foot points differ by about 1e-3 vx). |
@@ -80,7 +79,6 @@ and code names therefore means masked output, not halted motion.
 | `trace_benchmark.py --path-map OLD=NEW --out DIR` | Benchmark checkpoints trained on another machine: rewrite the data paths stored in their configs. GPUs differ slightly in bf16, so compare only models benchmarked on the same machine. |
 | `trace_benchmark.py --seeds-from DIR`, `--held-out-scoring`, `--seeds-anywhere` | Reuse another run's seeds (e.g. across front sizes); score only points whose GT foot point lies in a val cell while the trace runs on; draw seeds from anywhere. |
 | `trace_benchmark.py --rescore DIR ...` | Recompute the switch counts of existing benchmark folders from their tifxyz. A *real switch* is a row with at least 3 kept off-sheet points, or a kept point more than 9 vx off. |
-| `trace_spread.py` | Long traces (e.g. 120 steps) from held-out seeds spread across z, for visual inspection. |
 | `scripts/trace_from_fibers.py` | Traces seeded from VC3D fiber JSONs, advancing along the 2/8 structure-tensor sheet direction, up and/or down. `--follow` uses the fiber-following mode and writes each extended fiber as a VC3D fiber JSON; `--fiber-pool` shows the model the fibers around each trace. |
 | `scripts/pick_inference.py` | Rank benchmark folders (front sizes x thresholds) by covered - 10 x off-sheet kept points. |
 
@@ -125,12 +123,12 @@ What one iteration does:
     gap.
 - Average the per-step losses:
   - Position loss: the prediction error versus the GT point one step ahead, split into normal, advance and tangent
-    components. With `loss.column_target` the target sits at the front point's seed column. Only points currently
-    on the seed's sheet get this loss.
+    components. The target sits at the front point's seed column, which penalizes the front shrinking or drifting
+    sideways. Only points currently on the seed's sheet get this loss.
   - Curve loss: the distance of the dense curve samples to the sheet, for gaps whose two control points are on the
     sheet.
-  - Confidence loss: BCE with the label "the prediction is on the seed's sheet", class-balanced
-    (`loss.confidence_balance`).
+  - Confidence loss: BCE with the label "the prediction is on the seed's sheet", class-balanced (off-sheet points
+    are rare).
   - Front-length loss: arc length versus the seed length (`loss.front_length`).
 - Patch nodes that are invalid or outside the patch carry no loss: a patch edge is not a sheet edge.
 
@@ -203,7 +201,7 @@ is a tifxyz (rows are steps, columns are the Hermite curve samples, masked point
 | `rollout.py` | one tracing step and front update (shared by train/eval/infer) |
 | `live.py` | live chains |
 | `losses.py`, `seeding.py` | supervision, metrics, seeds, training perturbation and sheet jumps |
-| `train.py`, `evaluate.py`, `trace_benchmark.py`, `trace_spread.py`, `hard_spots.py`, `infer.py`, `visualize.py` | entry points and figures |
+| `train.py`, `evaluate.py`, `trace_benchmark.py`, `hard_spots.py`, `infer.py`, `visualize.py` | entry points and figures |
 | `scripts/` | data preparation (other scrolls, fiber matching and pool, resampling), fiber-seeded tracing, benchmarks |
 
 Run the tests with `python -m pytest vesuvius/src/vesuvius/neural_tracing/sheet_tracing/tests`. They use analytic

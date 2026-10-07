@@ -43,7 +43,6 @@ import torch
 
 from vesuvius.neural_tracing.fiber_follow.data.volume import ChunkedArray
 from vesuvius.neural_tracing.sheet_tracing import config as C
-from vesuvius.neural_tracing.sheet_tracing.config import path_mapper  # noqa: F401  (re-exported)
 from vesuvius.neural_tracing.sheet_tracing.data.episodes import EpisodeSampler, split_of
 from vesuvius.neural_tracing.sheet_tracing.data.patches import build_index
 from vesuvius.neural_tracing.sheet_tracing.evaluate import load_checkpoint
@@ -69,14 +68,12 @@ def _seed_sampler(cfg, steps: int, front: float, min_valid: float, split: str, a
 
 
 def draw_seeds(cfg, count: int, steps: int, front: float, min_valid: float, seed: int = 0, split: str = 'val',
-               distinct: bool = True, all_val: bool = False, max_per_patch: int | None = None, patience: int = 500,
-               seed_split: bool = False):
+               all_val: bool = False, max_per_patch: int = 1, patience: int = 500, seed_split: bool = False):
     """GT windows of ``split`` for traces of ``steps`` steps and a ``front``-voxel seed row. At most
-    ``max_per_patch`` seeds per patch (default: 1 with ``distinct``, else unlimited); fewer than ``count`` if not
-    enough patches fit, giving up after ``patience`` draws in a row add nothing. ``all_val``: every split cell is a
-    validation cell (patches of a scroll never trained on)."""
-    if max_per_patch is None:
-        max_per_patch = 1 if distinct else count
+    ``max_per_patch`` seeds per patch (0: any number); fewer than ``count`` if not enough patches fit, giving up
+    after ``patience`` draws in a row add nothing. ``all_val``: every split cell is a validation cell (patches of a
+    scroll never trained on)."""
+    max_per_patch = max_per_patch or count
     sampler, data = _seed_sampler(cfg, steps, front, min_valid, split, all_val, seed_split)
     rng = np.random.default_rng([seed, 7])
     seeds, per_patch, misses = [], {}, 0
@@ -325,11 +322,7 @@ def main(argv=None):
                                                      'checkpoint\'s), e.g. segments of an unseen scroll')
     ap.add_argument('--all-val', action='store_true', help='no train/val split: every patch region is a seed candidate '
                                                           '(for scrolls never trained on)')
-    ap.add_argument('--repeat-patches', action='store_true', help='allow any number of seeds per patch')
-    ap.add_argument('--max-per-patch', type=int, help='at most this many seeds per patch (default 1)')
-    ap.add_argument('--seed-checkpoint', help='draw the seeds with this checkpoint\'s data config (default: the first '
-                                            'benchmarked checkpoint\'s), e.g. to benchmark a subset of models on the seeds '
-                                            'of an earlier run')
+    ap.add_argument('--max-per-patch', type=int, default=1, help='at most this many seeds per patch (0: any number)')
     ap.add_argument('--raw', nargs='*', default=[], metavar='NAME',
                     help='use the raw instead of the EMA weights for these models (checkpoints trained with train.ema)')
     ap.add_argument('--names', nargs='+')
@@ -363,7 +356,7 @@ def main(argv=None):
     names = args.names or [Path(c).parent.name for c in args.checkpoints]
     models = {name: load_checkpoint(path, args.device, raw=name in args.raw)[:2]
               for name, path in zip(names, args.checkpoints)}
-    apply = path_mapper(args.path_map)
+    apply = C.path_mapper(args.path_map)
     for _, cfg in models.values():
         apply(cfg)
     cfg0 = models[names[0]][1]
@@ -374,9 +367,6 @@ def main(argv=None):
             cfg.trace.confidence_threshold = args.threshold
     cfg0.data.volume = volume
     seed_cfg = cfg0
-    if args.seed_checkpoint:
-        seed_cfg = apply(C.from_dict(torch.load(args.seed_checkpoint, map_location='cpu', weights_only=False)['config'],
-                                     strict=False))
     if args.patches_dir:
         seed_cfg.data.patches_dir = args.patches_dir
     origin = None
@@ -387,7 +377,6 @@ def main(argv=None):
         print(f'{len(seeds)} of the seeds of {args.seeds_from} fit a {args.front:g} vx front', flush=True)
     else:
         seeds, spec, seed_data = draw_seeds(seed_cfg, args.seeds, args.steps, args.front, args.min_valid,
-                                            distinct=not args.repeat_patches,
                                             all_val=args.all_val or args.seeds_anywhere,
                                             max_per_patch=args.max_per_patch, seed_split=args.held_out_scoring)
     print(f'{len(seeds)} held-out seeds', flush=True)
@@ -413,7 +402,7 @@ def main(argv=None):
             seed = resample(points, cfg.data.point_spacing)
             idx = np.linspace(0, len(points)-1, len(seed))
             dirs = np.stack([np.interp(idx, np.arange(len(points)), direction[:, k]) for k in range(3)], 1)
-            rows, confs = trace(model, cfg, seed, dirs, args.steps, args.device, min_confident=0., patience=10**9)
+            rows, confs = trace(model, cfg, seed, dirs, args.steps, args.device)
             traced = len(rows)-1
             if len(rows) < args.steps+1:  # left the volume: pad with the last row, unsupervised beyond
                 pad = args.steps+1-len(rows)

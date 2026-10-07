@@ -56,8 +56,8 @@ def learning_rate(it: int, tc, minutes: float = 0.) -> float:
 def train_rollout(tracer: Tracer, b: dict, cfg, spec, generator, front=None):
     """Loss averaged over the rollout steps, per-step stats averaged likewise, the final front, and the point
     confidences (B, N) of every step. ``front``: continue these fronts (live chains) instead of seeding from GT.
-    With ``train.backward_per_step`` each step's loss is backpropagated right away and the returned loss is
-    detached (gradients are already accumulated).
+    Steps are detached from each other, and each step's loss is backpropagated right after the step (the same
+    gradient as the summed loss, with only one step's activations in memory); the returned loss is detached.
 
     A ``free_fraction`` of episodes are never snapped back; in ``jump_probability`` of episodes a run of front_points
     is pushed onto a neighbouring sheet before one random step (not the last). With ``train.history_rows`` (``cfg``
@@ -91,13 +91,12 @@ def train_rollout(tracer: Tracer, b: dict, cfg, spec, generator, front=None):
         out = tracer.step(front, b['block'], b['origin'], fibers)
         loss, st = step_losses(out, front, b['gt'], b['valid'], cfg)
         confs.append(torch.sigmoid(out.conf_logit.detach()))
-        if tc.backward_per_step:
-            (loss/steps).backward()
-            loss = loss.detach()
+        (loss/steps).backward()
+        loss = loss.detach()
         total = total+loss/steps
         for k, v in st.items():
             stats[k] = stats.get(k, 0.)+v/steps
-        front = tracer.advance(front, out, detach=tc.detach_steps)
+        front = tracer.advance(front, out)
         pos, far = perturb(front.pos, b['gt'], b['valid'], cfg, snap, generator)
         tracer.move(front, pos)
         resets += far.float().mean()/steps
@@ -197,8 +196,6 @@ def optimize_step(tracer: Tracer, opt, ema, b: dict, cfg, spec, generator, front
     model, tc = tracer.model, cfg.train
     opt.zero_grad(set_to_none=True)
     loss, stats, front, confs = train_rollout(tracer, b, cfg, spec, generator, front)
-    if not tc.backward_per_step:
-        loss.backward()
     stats['grad'] = torch.nn.utils.clip_grad_norm_(model.parameters(), tc.grad_clip)
     opt.step()
     if ema:
@@ -348,7 +345,7 @@ def main(argv=None):
             out.mkdir(exist_ok=True)
             for i, record in enumerate(records):
                 episode_figure(record, cfg, out/f'episode_{i:02d}.png')
-            metric_figure({'val': per_step}, cfg, out/'metrics.png')
+            metric_figure({'val': per_step}, out/'metrics.png')
             training_figure(log_rows, run/'training.png')
         return summary
 
@@ -432,13 +429,13 @@ def final_eval(cfg, run, device):
     t0 = time.time()
     episodes = E.eval_episodes(cfg, e.steps, e.roi, e.episodes)
     best_model, _, _ = E.load_checkpoint(run/'best.pt', device)
-    report = E.run(Tracer(best_model, cfg, device), cfg, run/'eval', e.steps, e.roi, e.episodes, records=4,
-                   tag='eval', episodes=episodes)
+    report = E.run(Tracer(best_model, cfg, device), cfg, run/'eval', episodes, e.steps, e.roi, records=4)
     s = report['summary']
     print(f"eval: coverage {s['coverage_mean']:.3f} (last {s['coverage_last']:.3f}) same_sheet "
           f"{s['same_sheet_mean']:.3f} precision {s['precision_mean']:.3f} caught {s['caught_mean']:.3f} "
           f"rejoined {s['rejoined_mean']:.3f}", flush=True)
     print(f'final eval: {e.episodes} episodes x {e.steps} steps in {time.time()-t0:.0f} s', flush=True)
+
 
 if __name__ == '__main__':
     main()

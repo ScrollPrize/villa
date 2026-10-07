@@ -121,14 +121,13 @@ class TraceConfig:
 class LossConfig:
     normal: float = 1.  # prediction error along the GT sheet normal
     advance: float = .3  # ... along the GT advance direction
-    tangent: float = .1  # ... along the front, against the point's seed column (see column_target)
+    # ... along the front, against the point's seed column (v = k * point_spacing) rather than its current position,
+    # so cumulative shrinking and sideways drift of the front are penalised, not just each step's sliding.
+    tangent: float = .1
     spline: float = .5  # dense spline samples' distance to the sheet
+    # Class-balanced: on- and off-sheet labels weigh equally (off-sheet points are rare, so an unbalanced BCE learns
+    # to keep all).
     confidence: float = .5
-    # Weight on- and off-sheet labels equally (off-sheet points are rare, so an unbalanced BCE learns to keep all).
-    confidence_balance: bool = True
-    # Along-front target is the point's seed column (v = k * point_spacing) rather than its current position, so
-    # cumulative shrinking and sideways drift of the front are penalised, not just each step's sliding.
-    column_target: bool = True
     # Front length: Huber on (arc length of the predicted curve - seed length) per gap, in voxels, so the
     # fixed set of front points neither stretches nor shrinks along the sheet. Needs no GT. 0 disables.
     front_length: float = 0.
@@ -158,7 +157,6 @@ class TrainConfig:
     jump_min: float = 7.  # push along the sheet normal, either sign, onto the brightest CT ridge in this range
     jump_max: float = 24.
     prefetch: int = 2  # loader batches in flight per worker (each holds batch x block bytes of shared memory)
-    detach_steps: bool = True  # False backpropagates through the whole rollout
     compile_geometry: bool = False  # torch.compile the GT projection: ~1.4x faster, not bit-identical (geometry.py)
     compile_model: bool = False  # torch.compile the model (model.compile_model): ~1.7x faster at level 0, not bit-identical
     points_per_batch: int = 0  # with data.front_points_range: front points per batch (0: train.batch * data.front_points)
@@ -178,9 +176,6 @@ class TrainConfig:
     # min(ema, (1 + n) / (10 + n)) over the first updates. Validation, best.pt and evaluation use the averaged
     # weights; checkpoints keep both (``model`` raw, ``ema`` averaged).
     ema: float = 0.
-    # Backpropagate each rollout step's loss right after the step instead of the summed loss at the end: the same
-    # gradient (steps are detached from each other), with only one step's activations in memory. Needs detach_steps.
-    backward_per_step: bool = False
     # Live chains (like fiber_follow's live continuation): a front is not restarted from GT after its rollout but
     # continues in a later iteration from exactly where the model left it (positions, curve, confidences, grid
     # memory) on the next GT window and block of its patch, which a loader worker reads on request (live.py).
@@ -227,8 +222,10 @@ class Config:
 
 
 
-# Options of model types this version no longer supports. A loaded config (e.g. from a checkpoint) may still list
-# them, at the value the supported models had (None: any value); another value means a model this code cannot run.
+# Options this version no longer has. A loaded config (e.g. from a checkpoint) may still list them, at the value the
+# supported models had; another value means a model this code cannot run. None: any value (options that only shaped
+# training: rollout steps are always detached and backpropagated one by one, the confidence loss is class-balanced
+# and the along-front target is the seed column).
 REMOVED = dict(
     data=dict(extra_volumes=[[]], extra_levels=[[]], extra_level_dirs=[[]], tight_blocks=[True]),
     model=dict(attention=[True], surface_tokens=[True], joint_transformer=[True], residual=[True], memory_lags=[[]],
@@ -237,6 +234,8 @@ REMOVED = dict(
                profile_strides=None),
     trace=dict(curve=['hermite'], stopped=['curve'], respace=[True], spline_ctrl=None, spline_smooth=None,
                min_weight=None),
+    loss=dict(column_target=None, confidence_balance=None),
+    train=dict(detach_steps=None, backward_per_step=None),
 )
 
 
@@ -335,8 +334,6 @@ def validate(config: Config) -> None:
         if any(int(c) % 4 for c in channels):
             raise ValueError(f'model.{name}channels must be divisible by 4 (GroupNorm(4))')
     tc = config.train
-    if tc.backward_per_step and not tc.detach_steps:
-        raise ValueError('train.backward_per_step needs train.detach_steps')
     if not 0 <= tc.ema < 1:
         raise ValueError('train.ema must be in [0, 1)')
     if tc.history_rows < 0:

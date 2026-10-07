@@ -43,13 +43,11 @@ def gap_mask(per_point: torch.Tensor, samples: int, per_gap: int) -> torch.Tenso
 
 @torch.no_grad()
 def targets(pos: torch.Tensor, gt: torch.Tensor, valid: torch.Tensor, step_cells: float, tolerance: float,
-            columns: torch.Tensor | None = None):
-    """GT point one step ahead of each on-sheet point's foot point (at grid column ``columns`` (N,) if given,
-    else at the foot point's own column), its frame, and where it applies."""
+            columns: torch.Tensor):
+    """GT point one step ahead of each on-sheet point's foot point, at the points' seed grid columns ``columns``
+    (N,), its frame, and where it applies."""
     uv, _, same, _ = landing(pos, gt, valid, tolerance)
-    target_uv = torch.stack([uv[..., 0]+step_cells, uv[..., 1]], -1)
-    if columns is not None:
-        target_uv[..., 1] = columns
+    target_uv = torch.stack([uv[..., 0]+step_cells, columns.expand_as(uv[..., 1])], -1)
     S, Su, Sv, ok_t = grid_eval(gt, valid, target_uv)
     return S, surface_frame(Su, Sv), same & ok_t
 
@@ -57,9 +55,7 @@ def targets(pos: torch.Tensor, gt: torch.Tensor, valid: torch.Tensor, step_cells
 def step_losses(out, front, gt, valid, cfg):
     d, lc = cfg.data, cfg.loss
     tol = lc.sheet_tolerance
-    columns = None
-    if lc.column_target:
-        columns = (torch.arange(front.pos.shape[1], device=gt.device)*d.point_spacing+d.gt_margin)/d.gt_resolution
+    columns = (torch.arange(front.pos.shape[1], device=gt.device)*d.point_spacing+d.gt_margin)/d.gt_resolution
     S, frame, pos_mask = targets(front.pos, gt, valid, d.step/d.gt_resolution, tol, columns)
     err = ((out.pred-S)[..., :, None]*frame).sum(-2)  # components along (t, a, n)
     point = lc.tangent*huber(err[..., 0], lc.huber)+lc.advance*huber(err[..., 1], lc.huber)
@@ -75,15 +71,12 @@ def step_losses(out, front, gt, valid, cfg):
 
     _, dist, same, ok_p = landing(out.pred.detach(), gt, valid, tol)
     bce = F.binary_cross_entropy_with_logits(out.conf_logit, same.float(), reduction='none')
-    if lc.confidence_balance:
-        # Mean of the on- and off-sheet means over the classes present, without a host sync: an absent class's
-        # masked mean is 0 and its flag 0, so this equals averaging only the present ones (0 if neither is).
-        on, off = ok_p & same, ok_p & ~same
-        present = torch.stack([on.any(), off.any()]).to(bce.dtype)
-        parts = torch.stack([masked_mean(bce, on), masked_mean(bce, off)])
-        loss_conf = (parts*present).sum()/present.sum().clamp_min(1)
-    else:
-        loss_conf = masked_mean(bce, ok_p)
+    # Class-balanced: the mean of the on- and off-sheet means over the classes present, without a host sync: an
+    # absent class's masked mean is 0 and its flag 0, so this equals averaging only the present ones (0 if neither is).
+    on, off = ok_p & same, ok_p & ~same
+    present = torch.stack([on.any(), off.any()]).to(bce.dtype)
+    parts = torch.stack([masked_mean(bce, on), masked_mean(bce, off)])
+    loss_conf = (parts*present).sum()/present.sum().clamp_min(1)
 
     loss = loss_point+lc.spline*loss_spline+lc.confidence*loss_conf
     # Front length: the (fixed) front points should neither stretch nor shrink along the sheet. Points are

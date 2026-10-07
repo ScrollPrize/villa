@@ -7,10 +7,6 @@ from vesuvius.neural_tracing.sheet_tracing.geometry import grid_eval, project, s
 from vesuvius.neural_tracing.sheet_tracing.sampling import sample_block
 
 
-def seed_u_index(cfg, spec) -> float:
-    return (0.-spec.u_lo)/spec.res
-
-
 def _sheet_noise(frame, sigma_n: float, sigma_t: float, generator):
     """Gaussian offsets along the normal and within the sheet, in the given ``(t, a, n)`` frames."""
     shape = frame.shape[:-2]
@@ -36,8 +32,6 @@ def seed_rows(gt, valid, cfg, spec, generator=None, noise: bool = True):
 def perturb(pos, gt, valid, cfg, snap: torch.Tensor, generator=None):
     """Training only: in episodes with ``snap`` (B,), snap points beyond ``reset_distance`` back onto their GT
     foot point; add noise everywhere. Free episodes let points drift onto other sheets (confidence negatives).
-
-    The offset is constant, so gradients through ``pos`` survive when rollouts are not detached.
     """
     tc = cfg.train
     with torch.no_grad():

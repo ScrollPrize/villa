@@ -67,7 +67,6 @@ class EpisodeSampler:
         self.weights = weights/weights.sum()
         self.store = PatchStore()
         self.level = data.volume_level
-        self.block_size = roi >> self.level
         iu0, _ = self.spec.index(0., 0.)
         self.seed_rows = [int(round(iu0-j*data.step/self.spec.res)) for j in range(data.history, -1, -1)]
         self.point_cols = [int(round(self.spec.index(0., k*data.point_spacing)[1])) for k in range(data.front_points)]
@@ -176,7 +175,6 @@ class EpisodeSampler:
         return None
 
     def _attempt(self, rng: np.random.Generator, info: PatchInfo) -> dict | None:
-        d = self.data
         axes = [a for a in (0, 1) if self._anchor(None, info, a, 1, 1, check=True)]
         if not axes:
             return None
