@@ -553,6 +553,9 @@ struct FiberReplayMatch {
 };
 
 struct FiberReplayTraceRequest {
+    // Optional scoring/reverse-check normals in trace coordinates. Reference
+    // acceptance and restart search continue to use the separate replay sampler.
+    const vc::lasagna::NormalSampler* tracingNormals = nullptr;
     FiberInput fiber;
     size_t startControlPointIndex = 0;
     std::optional<double> referenceBeginArcBase;

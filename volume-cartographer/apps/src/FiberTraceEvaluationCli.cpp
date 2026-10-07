@@ -172,6 +172,7 @@ struct Source {
     std::string id;
     std::unique_ptr<FiberPredictionField> predictions;
     std::unique_ptr<vc::lasagna::LasagnaNormalSampler> normals;
+    std::unique_ptr<vc::lasagna::LasagnaNormalSampler> tracingNormals;
     double traceScale = 1;
     double voxelSizeUm = 0;
     Json provenance;
@@ -823,6 +824,27 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                 throw std::invalid_argument("prediction and normal base shapes disagree");
         }
         source.normals = std::make_unique<vc::lasagna::LasagnaNormalSampler>(normals);
+        const auto tracingNormalMode = entry.value("tracing_normals", std::string("lasagna"));
+        if (tracingNormalMode != "lasagna" && tracingNormalMode != "fiber")
+            throw std::invalid_argument("invalid tracing_normals");
+        if (tracingNormalMode == "fiber") {
+            auto normalManifest = source.predictionManifest;
+            normalManifest.groups.clear();
+            for (const auto* channel : {"nx", "ny", "grad_mag"}) {
+                const auto name = std::string("sheet_") + channel;
+                const auto* group = source.predictionManifest.groupForChannel(name);
+                if (!group) throw std::invalid_argument("missing predicted normal channel " + name);
+                auto alias = *group;
+                alias.name = channel;
+                alias.channels = {channel};
+                normalManifest.groups.push_back(std::move(alias));
+            }
+            normalManifest.raw["grad_mag_encode_scale"] = 1.0;
+            normalManifest.raw["grad_mag_factor"] = 1.0;
+            vc::lasagna::LasagnaDataset normalDataset(std::move(normalManifest));
+            vc::lasagna::validateLasagnaNormalDatasetStructure(normalDataset);
+            source.tracingNormals = std::make_unique<vc::lasagna::LasagnaNormalSampler>(normalDataset);
+        }
         source.provenance = entry;
         source.provenance["fiber_manifest"] = fiberLocation;
         source.provenance["normal_manifest"] = normalLocation;
@@ -1362,6 +1384,7 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                     });
                 }
                 FiberReplayTraceRequest request;
+                request.tracingNormals = source.tracingNormals.get();
                 request.fiber.linePointsXyzBase = item.points;
                 request.fiber.controlPointsXyzBase = {item.points.front(), item.points.back()};
                 request.fiber.controlPointLineIndices = {0, item.points.size() - 1};

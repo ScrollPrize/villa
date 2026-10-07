@@ -2962,6 +2962,32 @@ TEST_CASE("Post modulation carries direction and width evidence without smoothne
     CHECK(penalized.modulatedPresence==score.modulatedPresence);
 }
 
+TEST_CASE("Replay can separate tracing normals from reference ellipse normals") {
+    using namespace vc::fiber_tracer;
+    StraightPrediction source;
+    FiberReplayTraceRequest request;
+    request.fiber.linePointsXyzBase={{0,0,0},{64,0,0}};
+    request.fiber.controlPointsXyzBase=request.fiber.linePointsXyzBase;
+    request.fiber.controlPointLineIndices={0,1};
+    request.config.coneGridSize=3; request.config.beamWidth=2; request.config.parallelThreads=1;
+    request.config.replayReverseIntervalBase=16;
+    request.config.replayReverseToStart=true;
+    request.config.replayReverseAllEndpoints=true;
+    ReplayNormalSampler reference({0,1,0}), tracing({0,0,1});
+    const auto original=traceFiberReplay(source,request,reference,1);
+    reference.sampledPoints.clear();
+    request.tracingNormals=&tracing;
+    const auto result=traceFiberReplay(source,request,reference,1);
+    CHECK_FALSE(tracing.sampledPoints.empty());
+    CHECK_FALSE(reference.sampledPoints.empty());
+    CHECK(result.reverseChecks > 0);
+    CHECK(result.failures.size()==original.failures.size());
+    CHECK(result.completedReferenceArcBase==doctest::Approx(original.completedReferenceArcBase));
+    // Explicit reference measurement is independent of the tracing override.
+    const auto measurement=measureFiberReplayThreshold({0,5,0},{0,0,0},reference,1,2,4);
+    CHECK(measurement.thresholdErrorRatio==doctest::Approx(2.5));
+}
+
 TEST_CASE("Raw presence replay cutoff accepts equality independently of width") {
     using namespace vc::fiber_tracer;
     class Source final : public FiberPredictionSource {

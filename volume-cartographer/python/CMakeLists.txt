@@ -70,7 +70,7 @@ set_target_properties(vc_volume PROPERTIES
     # site-packages root one level up, so search both.
     INSTALL_RPATH "$ORIGIN:$ORIGIN/.."
 )
-target_link_libraries(vc_volume PRIVATE vc_core vc_lasagna)
+target_link_libraries(vc_volume PRIVATE vc_core vc_lasagna vc_fiber_tracer)
 target_compile_features(vc_volume PRIVATE cxx_std_23)
 
 nanobind_add_module(vc_surface_index

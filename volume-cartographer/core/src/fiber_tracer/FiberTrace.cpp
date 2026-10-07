@@ -3098,6 +3098,16 @@ public:
                 throw std::runtime_error("width channel must be float32 on the prediction lattice");
             width_.push_back(std::move(width));
         }
+        if (manifest.groupForChannel("sheet_nx")) {
+            for (const auto* name : {"sheet_nx", "sheet_ny", "sheet_grad_mag"}) {
+                auto binding = vc::lasagna::bindLasagnaChannel(manifest, name, true);
+                const auto& lattice = options_.front().presence;
+                if (binding.spacing != lattice.spacing || binding.shapeZYX != lattice.shapeZYX ||
+                    binding.chunksZYX != lattice.chunksZYX)
+                    throw std::runtime_error("sheet normal channels must share prediction lattice/chunks");
+                sheetNormals_.push_back(std::move(binding));
+            }
+        }
         if (canonicalOptionIndex_.has_value()) {
             const auto& canonical = options_[*canonicalOptionIndex_];
             const auto sameShape = canonical.presence.shapeZYX == canonical.nx.shapeZYX && canonical.presence.shapeZYX == canonical.ny.shapeZYX;
@@ -3160,6 +3170,8 @@ public:
             for (const auto& binding : embeddings_)
                 bindings.push_back(&binding);
             for (const auto& binding : width_)
+                bindings.push_back(&binding);
+            for (const auto& binding : sheetNormals_)
                 bindings.push_back(&binding);
             for (const auto* binding : bindings) {
                 auto group = std::find_if(readinessGroups_.begin(), readinessGroups_.end(), [&](const auto& candidate) {
@@ -4144,6 +4156,7 @@ private:
     std::vector<Option> options_;
     std::vector<vc::lasagna::LasagnaChannelBinding> embeddings_;
     std::vector<vc::lasagna::LasagnaChannelBinding> width_;
+    std::vector<vc::lasagna::LasagnaChannelBinding> sheetNormals_;
     FiberPredictionReadinessGate readinessGate_;
     std::vector<OptionSamplingGrid> optionGrids_;
     bool cornerSamplingAvailable_ = true;
@@ -4893,6 +4906,7 @@ static FiberReplayTraceResult traceFiberReplayImpl(
     const FiberReplayFailureCallback& failureCallback,
     bool observeOnlyOnReturn)
 {
+    const auto& tracingNormals = request.tracingNormals ? *request.tracingNormals : normalSampler;
     if (!(request.traceToBaseScale > 0.0) || !std::isfinite(request.traceToBaseScale)) {
         throw std::invalid_argument("fiber replay trace-to-base scale must be finite and positive");
     }
@@ -4969,7 +4983,7 @@ static FiberReplayTraceResult traceFiberReplayImpl(
             oneWay.config = request.config;
             try {
                 const auto native = traceOneWayCore(
-                    predictions, oneWay, &normalSampler, segmentProgress,
+                    predictions, oneWay, &tracingNormals, segmentProgress,
                     "replay",
                     static_cast<double>(maximumSteps) *
                         request.config.stepVoxels,
@@ -5017,7 +5031,7 @@ static FiberReplayTraceResult traceFiberReplayImpl(
                 config.widthReferenceMean = forwardWidth.mean();
                 if (!(config.widthReferenceMean > 0)) throw std::logic_error("reverse width reference not initialized");
             }
-            return verifyFiberReverseSpan(predictions, normalSampler, config,
+            return verifyFiberReverseSpan(predictions, tracingNormals, config,
                 geometry, geometry.length(), config.replayReverseNormalRadiusBase,
                 config.replayReverseTangentialRadiusBase) <= kEpsilon;
         };
