@@ -2242,14 +2242,17 @@ def resample_grid(
     return out
 
 
-def finalize_coarse_grid(grid: np.ndarray) -> np.ndarray:
+def finalize_coarse_grid(
+    grid: np.ndarray, keep: np.ndarray | None = None
+) -> np.ndarray:
     """Post-resample tidy: erode one cell (boundary cells whose fine
-    support straddled the cleaned rim), then keep only the largest
-    connected component."""
+    support straddled the cleaned rim) unless a `keep` mask is given,
+    then keep only the largest connected component."""
     from scipy import ndimage
 
-    valid = grid[..., 0] >= 0
-    keep = ndimage.binary_erosion(valid, iterations=1)
+    if keep is None:
+        valid = grid[..., 0] >= 0
+        keep = ndimage.binary_erosion(valid, iterations=1)
     labels, count = ndimage.label(keep)
     if count > 1:
         sizes = np.bincount(labels.ravel())
@@ -2258,6 +2261,51 @@ def finalize_coarse_grid(grid: np.ndarray) -> np.ndarray:
     grid = grid.copy()
     grid[~keep] = -1.0
     return grid
+
+
+def support_coarse_mask(
+    grid: np.ndarray, fine_valid: np.ndarray, factor: float
+) -> np.ndarray:
+    """Alternative to the one-cell erosion of finalize_coarse_grid for a
+    `resample_grid(fine, factor)` output: a coarse quad survives only if
+    every fine vertex under its bilinear footprint is valid. Corners of
+    unsupported quads are dropped one at a time, cheapest first (least
+    adjacent supported area lost; ties by row, then column)."""
+    keep = grid[..., 0] >= 0
+    bounds = []
+    for n in fine_valid.shape:
+        # Same lattice and 1e-9 endpoint rule as resample_grid.
+        pos = np.arange(0, n - 1 + 1e-9, factor)
+        lo = np.floor(pos).astype(np.int64)
+        hi = np.where(pos - lo > 1e-9, np.minimum(lo + 1, n - 1), lo)
+        bounds.append((lo[:-1], hi[1:] + 1))
+    (r0, r1), (c0, c1) = bounds
+    holes = np.pad(~fine_valid, ((1, 0), (1, 0))).cumsum(0).cumsum(1)
+    supported = (
+        holes[r1[:, None], c1]
+        - holes[r0[:, None], c1]
+        - holes[r1[:, None], c0]
+        + holes[r0[:, None], c0]
+    ) == 0
+    xyz = np.asarray(grid, dtype=np.float64)
+    a, b = xyz[:-1, :-1], xyz[:-1, 1:]
+    c, d = xyz[1:, :-1], xyz[1:, 1:]
+    # Two-triangle quad area in mm² (only used to rank deletions).
+    area = 0.5 * (
+        np.linalg.norm(np.cross(c - a, b - a), axis=-1)
+        + np.linalg.norm(np.cross(b - d, c - d), axis=-1)
+    ) * (VOXEL_SIZE_UM**2 / 1e6)
+    while True:
+        quad = keep[:-1, :-1] & keep[1:, :-1] & keep[:-1, 1:] & keep[1:, 1:]
+        bad = quad & ~supported
+        if not bad.any():
+            return keep
+        lost = np.pad(np.where(quad & supported, area, 0.0), 1)
+        lost = lost[:-1, :-1] + lost[:-1, 1:] + lost[1:, :-1] + lost[1:, 1:]
+        bad = np.pad(bad, 1)
+        corner = bad[:-1, :-1] | bad[:-1, 1:] | bad[1:, :-1] | bad[1:, 1:]
+        lost[~corner] = np.inf
+        keep[np.unravel_index(np.argmin(lost), lost.shape)] = False
 
 
 def median_edge_vx(grid: np.ndarray) -> float:
@@ -2539,13 +2587,18 @@ def process_seed(seed, out, args, tracks, crossings) -> dict:
             )
             grid = grid.copy()
             grid[~cleaned] = -1.0
-            grid = finalize_coarse_grid(resample_grid(grid, factor))
+            coarse = resample_grid(grid, factor)
+            keep = None
+            if args.coarse_mask_mode == "support":
+                keep = support_coarse_mask(coarse, grid[..., 0] >= 0, factor)
+            grid = finalize_coarse_grid(coarse, keep)
             # tifxyz scale = grid units per voxel (20vx spacing -> 0.05)
             scale = (1.0 / args.output_spacing, 1.0 / args.output_spacing)
             stats["resample"] = {
                 "fine_edge_vx": fine_edge,
                 "factor": factor,
                 "border_erode_px": erode_px,
+                "coarse_mask_mode": args.coarse_mask_mode,
                 "coarse_valid_vertices": int((grid[..., 0] >= 0).sum()),
             }
         stage("cleanup_and_resample")
@@ -2781,6 +2834,16 @@ def main(argv=None) -> int:
         ),
     )
     parser.add_argument(
+        "--coarse-mask-mode",
+        choices=("erode", "support"),
+        default="erode",
+        help=(
+            "final mask of the resampled grid: erode one cell (default), or "
+            "keep each quad whose fine footprint is fully valid; support "
+            "needs --output-spacing a whole multiple of --resample-spacing"
+        ),
+    )
+    parser.add_argument(
         "--workers",
         type=int,
         default=1,
@@ -2811,6 +2874,17 @@ def main(argv=None) -> int:
         parser.error("--growth-min-span must be non-negative")
     if not math.isfinite(args.resample_spacing) or args.resample_spacing <= 0:
         parser.error("--resample-spacing must be finite and positive")
+    if args.coarse_mask_mode == "support":
+        ratio = args.output_spacing / args.resample_spacing
+        if not (
+            math.isfinite(ratio)
+            and ratio >= 1.0
+            and math.isclose(ratio, round(ratio))
+        ):
+            parser.error(
+                "--coarse-mask-mode support needs --output-spacing to be a "
+                "whole multiple of --resample-spacing"
+            )
     tracks = PackedTracks(args.tracks)
     crossings = CrossingCsr(args.crossings, tracks)
     args.output.mkdir(parents=True, exist_ok=True)
