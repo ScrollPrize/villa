@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
 from vesuvius.neural_tracing.tracers.shared.paths import parse_path_map, path_map, recorded_path
+from vesuvius.neural_tracing.tracers.shared.retired import ANY, retire
 
 PACKAGE = Path(__file__).resolve().parent
 OUTPUT = PACKAGE/'output'
@@ -224,20 +225,20 @@ class Config:
 
 
 
-# Options this version no longer has. A loaded config (e.g. from a checkpoint) may still list them, at the value the
-# supported models had; another value means a model this code cannot run. None: any value (options that only shaped
-# training: rollout steps are always detached and backpropagated one by one, the confidence loss is class-balanced
-# and the along-front target is the seed column).
+# Options this version no longer has (``shared/retired.py``). A loaded config (e.g. from a checkpoint) may still list
+# them, at the value the supported models had; another value means a model this code cannot run. ANY: any value
+# (options that only shaped training: rollout steps are always detached and backpropagated one by one, the confidence
+# loss is class-balanced and the along-front target is the seed column).
 REMOVED = dict(
-    data=dict(extra_volumes=[[]], extra_levels=[[]], extra_level_dirs=[[]], tight_blocks=[True]),
-    model=dict(attention=[True], surface_tokens=[True], joint_transformer=[True], residual=[True], memory_lags=[[]],
-               memory_anchor=[False], context_crop=[[]], profile_crop=[[]], grid_layers=None, context_spacing=None,
-               context_channels=None, context_strides=None, profile_spacing=None, profile_channels=None,
-               profile_strides=None),
-    trace=dict(curve=['hermite'], stopped=['curve'], respace=[True], spline_ctrl=None, spline_smooth=None,
-               min_weight=None),
-    loss=dict(column_target=None, confidence_balance=None),
-    train=dict(detach_steps=None, backward_per_step=None),
+    data=dict(extra_volumes=[], extra_levels=[], extra_level_dirs=[], tight_blocks=True),
+    model=dict(attention=True, surface_tokens=True, joint_transformer=True, residual=True, memory_lags=[],
+               memory_anchor=False, context_crop=[], profile_crop=[], grid_layers=ANY, context_spacing=ANY,
+               context_channels=ANY, context_strides=ANY, profile_spacing=ANY, profile_channels=ANY,
+               profile_strides=ANY),
+    trace=dict(curve='hermite', stopped='curve', respace=True, spline_ctrl=ANY, spline_smooth=ANY,
+               min_weight=ANY),
+    loss=dict(column_target=ANY, confidence_balance=ANY),
+    train=dict(detach_steps=ANY, backward_per_step=ANY),
 )
 
 
@@ -249,12 +250,7 @@ def from_dict(document: dict, strict: bool = True) -> Config:
         raise ValueError(f'Unknown config sections: {sorted(unknown)}')
     parts = {}
     for name, cls in SECTIONS.items():
-        values = dict(document.get(name, {}))
-        for key, allowed in REMOVED.get(name, {}).items():
-            if key in values:
-                value = values.pop(key)
-                if allowed is not None and value not in allowed:
-                    raise ValueError(f'{name}.{key}={value!r}: this model type is no longer supported')
+        values = retire(dict(document.get(name, {})), REMOVED.get(name, {}), name)
         names = {f.name for f in fields(cls)}
         bad = set(values)-names
         if bad and strict:

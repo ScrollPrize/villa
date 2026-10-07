@@ -18,8 +18,8 @@ Two models are supported, sharing one architecture:
 * `configs/remote_l0_fiber_ft.json`: initialised from `points_ft`, it adds fiber tokens and a fiber-following mode.
 
 The defaults in `config.py` are this architecture. A config or checkpoint that sets an option of a removed model
-type (`config.REMOVED`) to anything but the value these models use is rejected with "this model type is no longer
-supported".
+type (`config.REMOVED`, applied by `shared/retired.py`) to anything but the value these models use is rejected with
+"... no longer exists (only ... is supported)".
 
 One tracing step works as follows:
 
