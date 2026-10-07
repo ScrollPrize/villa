@@ -10,6 +10,8 @@ import json
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
+from vesuvius.neural_tracing.tracers.shared.paths import parse_path_map, path_map, recorded_path
+
 PACKAGE = Path(__file__).resolve().parent
 OUTPUT = PACKAGE/'output'
 
@@ -351,16 +353,16 @@ def validate(config: Config) -> None:
 
 
 def path_mapper(texts):
-    """``--path-map OLD=NEW`` texts -> a function applying them to every data path of a config (in place)."""
-    pairs = [text.split('=', 1) for text in texts]
-    if any(len(pair) != 2 for pair in pairs):
-        raise ValueError('--path-map needs OLD=NEW')
-    remap = lambda path: next((new+str(path)[len(old):] for old, new in pairs if str(path).startswith(old)), path)
+    """``--path-map OLD=NEW`` texts (none: the ``TRACERS_PATH_MAP`` environment, ``shared/paths.py``) -> a function
+    relocating every data path of a config in place."""
+    mapping = parse_path_map(texts) if texts else path_map()
+    remap = lambda path: recorded_path(path, mapping) if path and '://' not in str(path) else path
 
     def apply(cfg):
         d = cfg.data
         d.volume = remap(d.volume)
-        d.patch_volumes = [remap(p) if p else p for p in d.patch_volumes]
+        d.patch_volumes = [remap(p) for p in d.patch_volumes]
         d.patches_dir = [remap(p) for p in d.patches_dir] if isinstance(d.patches_dir, list) else remap(d.patches_dir)
+        d.hard_windows, d.fiber_runs, d.fiber_pool = remap(d.hard_windows), remap(d.fiber_runs), remap(d.fiber_pool)
         return cfg
     return apply

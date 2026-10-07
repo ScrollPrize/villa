@@ -101,7 +101,7 @@ live and synthetic task shares (which sequence training does not support) move t
 New runs use the frozen `heading_model_l0_w16_centered_frame/ckpt_064000.pt` for current-crop heading and roll. CT
 initializes seed headings with derivative sigma 2 and integration sigma 8, using a 77³ native CT context. H/V family
 comes from the seed or fiber metadata; only CT and observed paths enter the frame model. The model runs in batches on
-CPU, once per worker/process, with no training gradients. `FIBER_FOLLOW_PATH_MAP='OLD=NEW;...'` relocates absolute
+CPU, once per worker/process, with no training gradients. `TRACERS_PATH_MAP='OLD=NEW;...'` (formerly `FIBER_FOLLOW_PATH_MAP`) relocates absolute
 paths recorded on another machine when a checkpoint is loaded for inference. Paths recorded under the package's former
 location `neural_tracing/fiber_follow/` (checkpoints, run and dataset configurations) resolve to `neural_tracing/tracers/fibers/`.
 

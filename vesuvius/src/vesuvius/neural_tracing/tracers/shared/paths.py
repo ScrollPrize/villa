@@ -1,35 +1,44 @@
-"""Paths recorded in frozen artifacts (seed manifests, checkpoints) on another machine.
+"""Paths recorded in frozen artifacts (seed manifests, checkpoints, configs) on another machine.
 
-``FIBER_FOLLOW_PATH_MAP='OLD=NEW;OLD2=NEW2'`` relocates a recorded path whose prefix is OLD to NEW
-(longest prefix first) before it is compared with the paths of this run; the comparison itself stays
-exact. Without the variable, recorded paths are used unchanged. Paths recorded under the package's former
-location (``neural_tracing/fiber_follow``) are read as the same path under ``neural_tracing/tracers/fibers``.
+A path map ``OLD=NEW`` pairs (the ``TRACERS_PATH_MAP='OLD=NEW;OLD2=NEW2'`` variable, formerly
+``FIBER_FOLLOW_PATH_MAP``, or a tool's ``--path-map OLD=NEW`` options) relocates a recorded path whose leading
+components are OLD to NEW (longest prefix first) before it is compared with the paths of this run; the comparison
+itself stays exact. Without one, recorded paths are used unchanged. Paths recorded under a tracer's former package
+location (``MOVES``) are read as the same path under its current one.
 """
 import os
 from pathlib import PurePosixPath
 
-MOVED = ('neural_tracing', 'fiber_follow'), ('neural_tracing', 'tracers', 'fibers')
+MOVES = ((('neural_tracing', 'fiber_follow'), ('neural_tracing', 'tracers', 'fibers')),
+         (('neural_tracing', 'sheet_tracing'), ('neural_tracing', 'tracers', 'sheets')))
 
 
 def moved_path(path):
-    """``path`` with the package's former location replaced by its current one."""
+    """``path`` with a tracer package's former location replaced by its current one."""
     parts = PurePosixPath(str(path)).parts
-    old, new = MOVED
-    for i in range(len(parts)-len(old)+1):
-        if parts[i:i+len(old)] == old:
-            return str(PurePosixPath(*parts[:i], *new, *parts[i+len(old):]))
+    for old, new in MOVES:
+        for i in range(len(parts)-len(old)+1):
+            if parts[i:i+len(old)] == old:
+                return str(PurePosixPath(*parts[:i], *new, *parts[i+len(old):]))
     return str(path)
 
 
-def path_map(value=None):
-    value = os.environ.get('FIBER_FOLLOW_PATH_MAP', '') if value is None else value
+def parse_path_map(items):
+    """``OLD=NEW`` texts -> relocation pairs, longest OLD first."""
     pairs = []
-    for item in filter(None, (part.strip() for part in value.split(';'))):
+    for item in items:
         old, sep, new = item.partition('=')
         if not sep or not old or not new:
-            raise ValueError(f'FIBER_FOLLOW_PATH_MAP entries must be OLD=NEW: {item!r}')
+            raise ValueError(f'Path map entries must be OLD=NEW: {item!r}')
         pairs.append((PurePosixPath(moved_path(old)), PurePosixPath(moved_path(new))))
     return sorted(pairs, key=lambda pair: len(pair[0].parts), reverse=True)
+
+
+def path_map(value=None):
+    """The relocation pairs of ``value`` (``OLD=NEW;...``), by default of the environment."""
+    if value is None:
+        value = os.environ.get('TRACERS_PATH_MAP', os.environ.get('FIBER_FOLLOW_PATH_MAP', ''))
+    return parse_path_map(filter(None, (part.strip() for part in value.split(';'))))
 
 
 def recorded_path(path, mapping=None):
