@@ -36,6 +36,26 @@ def test_annotation_end_passed_off_centre_is_unscored_not_wrong():
     assert s['wrong_length'] == 0. and s['unscored_length'] > 90.
 
 
+def test_curled_annotation_tip_still_counts_as_the_end():
+    # The annotation's last 3 vertices hook sideways (about 5 voxels of arc, as on real AFV tips); a trace continuing
+    # straight never matches the tip itself.
+    curled = fiber()
+    curled.points = curled.points.copy()
+    curled.points[-3:, 0] = np.arange(1, 4)*1.5
+    curled.s = np.r_[0., np.cumsum(np.linalg.norm(np.diff(curled.points, axis=0), axis=1))]
+    curled.length = float(curled.s[-1])
+    trace = path(lambda z: (0., 0.), 260.)
+    travelled = np.arange(0., 260.+1e-9, 8.)
+    s = score_tube(trace, curled, 20., 1., travelled, [FRAME]*len(travelled), 'confidence')
+    assert s['reached_end'] and not s['loss'] and s['wrong_length'] == 0.
+
+
+def test_return_just_before_the_annotation_end_is_not_a_loss():
+    # Out of the tube for 20 voxels, back in 10 voxels before the end: an excursion, not a mistake.
+    s = score(path(lambda z: (2., 0.) if 170 < z < 190 else (0., 0.), 240.))
+    assert s['excursions'] == 1 and not s['loss'] and s['reached_end']
+
+
 def test_width_slide_stays_in_tube_but_normal_step_is_an_excursion():
     slide = score(path(lambda z: (0., 2.5) if 60 < z < 100 else (0., 0.), 120.))
     assert slide['excursions'] == 0 and slide['wrong_length'] == 0.

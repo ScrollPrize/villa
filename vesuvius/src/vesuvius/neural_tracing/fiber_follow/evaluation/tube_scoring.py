@@ -15,9 +15,9 @@ Per trace (all lengths in trace voxels, along the path):
   tube. Later length is unscored behind an untagged end; behind a tagged physical end it is an endpoint overrun.
 - excursion: a run out of the tube spanning >= EXCURSION_LENGTH. Counted, and wrong length while out.
 - loss (identity failure): a run out of the tube spanning >= LOSS_LENGTH after which the trace is never back in
-  the tube for RETURN_LENGTH before the scored end. At most one per trace. A 'switch' when, during the loss, the
-  trace runs nearer another annotated fiber than its own (within SWITCH_DISTANCE) for >= SWITCH_LENGTH;
-  otherwise 'lost'; 'unlabelled' without neighbour fibers.
+  the tube for RETURN_LENGTH before the scored end (being back in the tube when the annotation ends is a return).
+  At most one per trace. A 'switch' when, during the loss, the trace runs nearer another annotated fiber than its
+  own (within SWITCH_DISTANCE) for >= SWITCH_LENGTH; otherwise 'lost'; 'unlabelled' without neighbour fibers.
 - premature stop: the model stopped the trace in the tube with >= PREMATURE_REMAINING of annotation left.
 
 Rates are per verified length (in-tube length before the annotation end). The legacy first-departure scores
@@ -36,13 +36,13 @@ TUBE_WIDTH = 3.0  # about half the strip width
 EXCURSION_LENGTH = 3.0
 LOSS_LENGTH = 16.0
 RETURN_LENGTH = 32.0
-END_PROGRESS, END_DISTANCE = 3.0, 6.0
+END_PROGRESS, END_DISTANCE = 8.0, 6.0  # one commit: annotation tips often curl away for a few voxels
 PREMATURE_REMAINING = 16.0
 SWITCH_DISTANCE, SWITCH_LENGTH = 2.0, 4.0
 # Stops the evaluation imposes; every other reason is the tracer's own decision.
 EVALUATION_STOPS = ('annotation_end', 'oracle', 'max_len')
 LOCALIZATION_BINS = np.linspace(0., 4., 161)
-VERSION = 1
+VERSION = 3  # 2: end window 8 voxels (was 3); 3: back in the tube at the annotation end is a return
 
 
 def settings():
@@ -118,7 +118,13 @@ def score_tube(path, fiber, t0, sign, decision_travelled, frames, reason, *, for
     excursions = sustained_onsets(lengths, out, EXCURSION_LENGTH)
     # A loss: the first long out-of-tube run never followed by a return before the scored end.
     returns = sustained_onsets(lengths, verified, RETURN_LENGTH)
-    last_return = returns[-1] if returns else -1
+    if reached is not None and reached > 0 and verified[reached-1]:
+        # Back in the tube when the annotation ends: a return, however short the stretch before the end.
+        start = reached-1
+        while start > 0 and verified[start-1]:
+            start -= 1
+        returns.append(start)
+    last_return = max(returns) if returns else -1
     loss = next((o for o in sustained_onsets(lengths, out, LOSS_LENGTH) if o > last_return), None)
     kind = None
     if loss is not None:
@@ -231,7 +237,8 @@ def group_metrics(sums, normal, width, um):
 
     n, w = normal.sum(0), width.sum(0)
     return dict(
-        traces=v['traces'], verified_length=v['verified'],
+        traces=v['traces'], verified_length=v['verified'], wrong_length=v['wrong'],
+        correct_mm=v['verified']*um/1e3 if um else np.nan, incorrect_mm=v['wrong']*um/1e3 if um else np.nan,
         losses=v['losses'], switches=v['switches'], excursions=v['excursions'], premature_stops=v['premature'],
         losses_rate=v['losses']/exposure*unit, switches_rate=v['switches']/exposure*unit,
         distance_per_mistake=exposure/max(v['losses'], 1)*(um/1e3 if um else 1.),

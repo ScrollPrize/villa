@@ -13,6 +13,7 @@ paired differences. --replay rescores each run at higher confidence thresholds f
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 from multiprocessing import Pool
 from pathlib import Path
@@ -94,6 +95,27 @@ def score_rows(rows, stops, neighbor_configs, workers):
     return [score_row(j) for j in jobs]
 
 
+def cached_scores(rows, stops, neighbor_configs, workers, key, refresh=False):
+    """``score_rows`` with a per-run-folder cache (tube_cache/<key>_v<VERSION>.json), so unchanged runs load instantly."""
+    trace_key = lambda r: f"{r['source']}/{Path(r['npz']).parent.name}/{r['seed_index']}"
+    folders = {}
+    for i, r in enumerate(rows):
+        folders.setdefault(Path(r['npz']).parents[2], []).append(i)
+    scores = [None]*len(rows)
+    for folder, members in folders.items():
+        path = folder/'tube_cache'/f'{key}_v{tube_scoring.VERSION}.json'
+        cache = {} if refresh or not path.exists() else json.loads(path.read_text())
+        todo = [i for i in members if trace_key(rows[i]) not in cache]
+        if todo:
+            fresh = score_rows([rows[i] for i in todo], [stops[i] for i in todo], neighbor_configs, workers)
+            cache.update({trace_key(rows[i]): score for i, score in zip(todo, fresh)})
+            path.parent.mkdir(exist_ok=True)
+            path.write_text(json.dumps(cache, default=jsonable))
+        for i in members:
+            scores[i] = cache[trace_key(rows[i])]
+    return scores
+
+
 def replay_stops(rows, threshold, gate_plane):
     stops = []
     for row in rows:
@@ -101,6 +123,24 @@ def replay_stops(rows, threshold, gate_plane):
         stops.append(tube_scoring.replay_stop(z['travelled'], z['confidence'][:, gate_plane-1], threshold,
                                               final_was_stop=row['reason'] not in tube_scoring.EVALUATION_STOPS))
     return stops
+
+
+TRACE_FIELDS = ('outcome', 'end', 'reason', 'verified_length', 'wrong_length', 'total_length', 'available', 'remaining',
+                'loss_at', 'loss_kind', 'continued_after_loss', 'excursions', 'reached_end')
+
+
+def write_traces(path, runs):
+    """One row per trace and run; ``image`` is the run's strip render (render.py) when it exists."""
+    with open(path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(('run', 'source', 'cohort', 'seed_index', 'fiber_name', 'sign', 't0')+TRACE_FIELDS+('npz', 'image'))
+        for label, (rows, _) in runs.items():
+            for r in rows:
+                npz = Path(r['npz'])
+                image = npz.parents[2]/'images'/f"{r['source']}_{r.get('cohort', npz.parent.name)}_{r['seed_index']:03d}.png"
+                writer.writerow((label, r['source'], r.get('cohort', npz.parent.name), r['seed_index'], r['fiber_name'], r['sign'],
+                                 r['t0'])+tuple(r['tube'].get(k) for k in TRACE_FIELDS)
+                                + (str(npz), str(image) if image.exists() else ''))
 
 
 def cell(value, digits):
@@ -148,13 +188,14 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('runs', nargs='+', help='LABEL=FOLDER[,FOLDER2]')
     ap.add_argument('--config', help='dataset config of the evaluation (voxel sizes, neighbour fibers)')
-    ap.add_argument('--rescore', action='store_true', help='rescore every row from its saved trace')
+    ap.add_argument('--rescore', action='store_true', help='rescore every row from its saved trace, ignoring the cache')
     ap.add_argument('--no-switch-labels', action='store_true')
     ap.add_argument('--replay', nargs='*', type=float, default=[])
     ap.add_argument('--gate-plane', type=int, help="override the protocol's gate plane (runs before it was recorded: 16)")
     ap.add_argument('--boot', type=int, default=1000)
     ap.add_argument('--workers', type=int, default=4)
     ap.add_argument('--out')
+    ap.add_argument('--traces', help='CSV of every trace: run, source, seed, outcome and tube scores, npz and image paths')
     args = ap.parse_args(argv)
     configs, neighbor_configs = {}, None
     if args.config:
@@ -168,16 +209,24 @@ def main(argv=None):
     for spec in args.runs:
         label, folders = spec.split('=', 1)
         rows, protocol = load_run(folders)
-        missing = [i for i, r in enumerate(rows) if args.rescore or 'tube' not in r]
+        missing = [i for i, r in enumerate(rows) if args.rescore or r.get('tube', {}).get('version') != tube_scoring.VERSION]
         if missing:
-            print(f'{label}: scoring {len(missing)} of {len(rows)} traces from saved traces', flush=True)
-            scores = score_rows([rows[i] for i in missing], [None]*len(missing), neighbor_configs, args.workers)
+            print(f'{label}: scoring {len(missing)} of {len(rows)} traces (cached where unchanged)', flush=True)
+            scores = cached_scores([rows[i] for i in missing], [None]*len(missing), neighbor_configs, args.workers,
+                                   'base_labelled' if neighbor_configs else 'base', refresh=args.rescore)
             for i, score in zip(missing, scores):
                 rows[i]['tube'] = score
         labels.append(label)
         runs[label] = (rows, protocol)
-    report = dict(settings=tube_scoring.settings(), runs={l: dict(folders=s.split('=', 1)[1]) for l, s in zip(labels, args.runs)},
-                  sources={})
+    def run_info(spec, protocol):
+        policy = protocol.get('operating_policy', {})
+        return dict(folders=spec.split('=', 1)[1], checkpoint=protocol.get('checkpoint'), step=protocol.get('step'),
+                    confidence=policy.get('confidence'), n_commit=policy.get('n_commit'), gate=policy.get('gate'),
+                    refit_retry=bool(protocol.get('args', {}).get('refit_retry', False)),
+                    batch=protocol.get('batch'), annotation_end_stop=protocol.get('annotation_end_stop'),
+                    seeds_sha256=protocol.get('seeds_sha256'))
+    report = dict(settings=tube_scoring.settings(),
+                  runs={l: run_info(s, runs[l][1]) for l, s in zip(labels, args.runs)}, sources={})
     for source in SOURCES:
         um = tube_scoring.um_per_voxel(configs[source]) if source in configs else None
         entry = dict(runs={}, paired={})
@@ -205,7 +254,7 @@ def main(argv=None):
         base = protocol['operating_policy']['confidence']
         for threshold in sorted(t for t in args.replay if t >= base):
             stops = replay_stops(rows, threshold, gate_plane)
-            scores = score_rows(rows, stops, None, args.workers)
+            scores = cached_scores(rows, stops, None, args.workers, f'replay{threshold:g}_gate{gate_plane}', refresh=args.rescore)
             replayed = [dict(r, tube=s) for r, s in zip(rows, scores)]
             for source, entry in report['sources'].items():
                 members = [r for r in replayed if r['source'] == source]
@@ -215,6 +264,8 @@ def main(argv=None):
                     entry.setdefault('curves', {}).setdefault(label, []).append((threshold, {k: v[0] for k, v in metrics.items()}))
             print(f'{label}: replayed threshold {threshold}', flush=True)
     print_tables(report, labels)
+    if args.traces:
+        write_traces(args.traces, runs)
     if args.out:
         Path(args.out).write_text(json.dumps(report, default=jsonable, indent=1))
 
