@@ -34,8 +34,11 @@ import torch.nn.functional as F
 
 from vesuvius.neural_tracing.tracers.models.blocks import CropCNN, TransformerLayer
 from vesuvius.neural_tracing.tracers.models.flow import FlowMatching, FlowOptions, time_embedding
-from vesuvius.neural_tracing.tracers.models.follower import REFERENCE_METADATA, FollowerConfig, path_readout, plane_coordinates, proposal_output, read_path, reference_metadata, reference_points, sample_features, select_refinement, token_coordinates
+from vesuvius.neural_tracing.tracers.models.follower import (
+    REFERENCE_METADATA, FollowerConfig, path_readout, plane_coordinates, proposal_output, read_path,
+    reference_metadata, reference_points, sample_features, select_refinement, token_coordinates)
 from vesuvius.neural_tracing.tracers.models.path_geometry import PathGeometryTokens
+from vesuvius.neural_tracing.tracers.models.survival_confidence import survival_predictions
 from vesuvius.neural_tracing.tracers.shared.policy import DEFAULT_CONFIDENCE, commit_prefix
 
 CELL, REFERENCE, GEOMETRY, PATH, SCORED = range(5)  # token kinds
@@ -79,6 +82,10 @@ class RegressionConfig(CropTransformerArchitecture, FollowerConfig):
     n_future: int = 35
     gate_plane: int | None = 16
     recurrent_refinement_steps: int = 3
+    # True: each proposal's survival is scored by its own set of path tokens carrying the finished proposal (detached
+    # points and the evidence sampled along them), as the flow model scores proposals (CropTransformer.hazard_logits);
+    # False: read from the tokens that proposed it.
+    scoring_pass: bool = False
 
 
 @dataclass
@@ -199,6 +206,14 @@ class CropTransformer(nn.Module):
     def proposal_output(self, initial, refinements, scores, valid):
         return proposal_output(initial, refinements, scores, valid)
 
+    def hazard_logits(self, ctx, points):
+        """Per-plane hazard logits of a finished proposal (B, P, 3), from a scoring set of path tokens over the context
+        (``self.score`` input, ``self.hazard`` readout). No generator state enters a proposal's score."""
+        points = points.detach()
+        tokens = self.score(torch.cat((self.evidence(ctx, points), points/16.), -1))
+        decoded = self.run_paths(ctx, (tokens+self.kind[SCORED].to(tokens.dtype))[:, None])[:, 0]
+        return self.hazard(decoded).squeeze(-1).float()
+
 
 class RegressionFollower(CropTransformer):
     """Coordinate regression: plane positions and survival confidence from one set of path tokens."""
@@ -209,6 +224,9 @@ class RegressionFollower(CropTransformer):
         # CNN evidence and support at the centerline, forward distance.
         self.query = nn.Sequential(nn.Linear(cells+2, h), nn.SiLU(), nn.Linear(h, h))
         self.coordinates, self.hazard = path_readout(h)
+        if cfg.scoring_pass:
+            # CNN evidence and support at a finished proposal, its coordinates (hazard_logits; readout self.hazard).
+            self.score = nn.Sequential(nn.Linear(cells+1+3, h), nn.SiLU(), nn.Linear(h, h))
         if cfg.recurrent_refinement_steps:
             # CNN evidence and support at the proposal, its coordinates, detached failure/survival.
             self.refinement_fusion = nn.Sequential(nn.Linear(cells+1+3+2, h), nn.SiLU(), nn.Linear(h, h))
@@ -217,7 +235,11 @@ class RegressionFollower(CropTransformer):
 
     def decode(self, ctx, tokens):
         decoded = self.run_paths(ctx, tokens[:, None])[:, 0]
-        return (decoded, *read_path(decoded, self.coordinates, self.hazard, self.planes, self.cfg))
+        points, score = read_path(decoded, self.coordinates, self.hazard, self.planes, self.cfg)
+        if self.cfg.scoring_pass:  # the finished proposal is scored by its own path tokens
+            hazards = self.hazard_logits(ctx, points)
+            score = (hazards, *survival_predictions(hazards))
+        return decoded, points, score
 
     def predict(self, ctx, threshold):
         """Fixed proposal slots: refinement passes run for every row and an accepted row keeps its last attempt (path
@@ -297,9 +319,3 @@ class FlowFollower(FlowMatching, CropTransformer):
             output = soft(output)
         return self.velocity(self.run_paths(ctx, tokens, (layers, output))).float()
 
-    def hazard_logits(self, ctx, points):
-        # No generator state enters a proposal's score.
-        points = points.detach()
-        tokens = self.score(torch.cat((self.evidence(ctx, points), points/16.), -1))
-        decoded = self.run_paths(ctx, (tokens+self.kind[SCORED].to(tokens.dtype))[:, None])[:, 0]
-        return self.hazard(decoded).squeeze(-1).float()
