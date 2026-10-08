@@ -27,12 +27,13 @@ two model types share this backbone and differ only in what their path tokens ca
 Both keep the shared output contract, losses, acceptance (gate plane), commits and trainer (train/train.py).
 """
 from dataclasses import dataclass
+import math
 
 import torch
 from torch import nn
 import torch.nn.functional as F
 
-from vesuvius.neural_tracing.tracers.models.blocks import CropCNN, TransformerLayer
+from vesuvius.neural_tracing.tracers.models.blocks import CNN_ACTIVATIONS, CropCNN, TransformerLayer
 from vesuvius.neural_tracing.tracers.models.flow import FlowMatching, FlowOptions, time_embedding
 from vesuvius.neural_tracing.tracers.models.follower import (
     REFERENCE_METADATA, FollowerConfig, path_readout, plane_coordinates, proposal_output, read_path,
@@ -51,8 +52,14 @@ class CropTransformerArchitecture:
     layers: int = 12
     heads: int = 8
     ffn: int = 2048
-    cnn_channels: tuple = (32, 64, 128)  # one stage per entry, each at stride 2
-    cnn_blocks: tuple = (1, 2, 2)
+    # The crop CNN (models/blocks.CropCNN), as nnU-Net's residual encoder: a full-resolution stem and stage, then stages
+    # at strides 2, 4, 8 growing deeper. Checkpoints before 2026-10-08 had 32/64/128 channels, blocks 1/2/2, every stage
+    # at stride 2, no stem and ReLU (models/model.RECORDED_TYPE_DEFAULTS).
+    cnn_channels: tuple = (16, 32, 64, 128)  # one stage per entry
+    cnn_blocks: tuple = (1, 3, 4, 6)
+    cnn_strides: tuple | None = (1, 2, 2, 2)  # per stage, 1 or 2 (their product is the token stride); None: 2 each
+    cnn_stem: bool = True  # one full-resolution convolution before the first stage
+    cnn_activation: str = 'leaky_relu'  # 'relu' or 'leaky_relu' (slope 0.01)
     # Per-head RMS normalization of attention queries and keys (models/blocks.py). Unbounded, the flow model's adaLN
     # time modulation of the path tokens grew their q/k norms until path attention saturated and training diverged.
     qk_norm: bool = False
@@ -66,9 +73,15 @@ class CropTransformerArchitecture:
             raise ValueError('A learned attention logit scale needs qk_norm')
         self.cnn_channels = tuple(int(c) for c in self.cnn_channels)
         self.cnn_blocks = tuple(int(b) for b in self.cnn_blocks)
+        if self.cnn_strides is not None:
+            self.cnn_strides = tuple(int(s) for s in self.cnn_strides)
         if (not self.cnn_channels or len(self.cnn_blocks) != len(self.cnn_channels)
                 or min(self.cnn_channels+self.cnn_blocks) < 1 or type(self.ffn) is not int or self.ffn < 1):
             raise ValueError('The crop CNN needs positive channels and blocks per stage; the FFN a positive width')
+        if len(self.cnn_stage_strides) != len(self.cnn_channels) or any(s not in (1, 2) for s in self.cnn_stage_strides):
+            raise ValueError('The crop CNN needs one stride (1 or 2) per stage')
+        if self.cnn_activation not in CNN_ACTIVATIONS:
+            raise ValueError(f'Unknown crop CNN activation {self.cnn_activation!r} ({", ".join(CNN_ACTIVATIONS)})')
         if min(self.layers, self.heads) < 1 or self.hidden % self.heads:
             raise ValueError('Positive layers and heads required; hidden must divide by heads')
         stride = self.token_stride[0]
@@ -76,8 +89,12 @@ class CropTransformerArchitecture:
             raise ValueError(f'Crop transformer crops must be multiples of the token stride ({stride})')
 
     @property
+    def cnn_stage_strides(self):
+        return self.cnn_strides if self.cnn_strides is not None else (2,)*len(self.cnn_channels)
+
+    @property
     def token_stride(self):
-        stride = 2**len(self.cnn_channels)
+        stride = math.prod(self.cnn_stage_strides)
         return (stride,)*3
 
 
@@ -140,7 +157,8 @@ class CropTransformer(nn.Module):
         super().__init__()
         self.cfg, self.model_type = cfg, cfg.model_type
         h, cells = cfg.hidden, cfg.cnn_channels[-1]
-        self.cnn = CropCNN(cfg.cnn_channels, (2,)*len(cfg.cnn_channels), cfg.cnn_blocks)
+        self.cnn = CropCNN(cfg.cnn_channels, cfg.cnn_stage_strides, cfg.cnn_blocks, stem=cfg.cnn_stem,
+                           activation=cfg.cnn_activation)
         self.cell_token = nn.Linear(cells, h)
         self.cell_position = nn.Sequential(nn.Linear(3, h), nn.SiLU(), nn.Linear(h, h))
         self.reference_token = nn.Sequential(nn.Linear(cells+REFERENCE_METADATA, h), nn.SiLU(), nn.Linear(h, h))

@@ -11,22 +11,31 @@ LOGIT_SCALE_LR_SCALE = 10.  # LR multiple of the attention logit scales' optimiz
 from vesuvius.models.build.resblocks import BasicBlockD, StackedResidualBlocks
 
 
+# Encoder activations: name -> (module, keyword arguments); 'leaky_relu' has nnU-Net's slope.
+CNN_ACTIVATIONS = dict(relu=(nn.ReLU, dict(inplace=True)), leaky_relu=(nn.LeakyReLU, dict(negative_slope=1e-2, inplace=True)))
+
+
 class CropCNN(nn.Module):
     """Residual CNN stages (channels, initial stride, blocks per stage) over a one-channel crop; the first stage's
-    convolutions carry biases."""
-    def __init__(self, channels, strides, blocks):
+    convolutions carry biases. ``stem``: first one full-resolution convolution (norm, activation) to the first stage's
+    channels, as nnU-Net's residual encoder; ``activation``: a CNN_ACTIVATIONS name."""
+    def __init__(self, channels, strides, blocks, *, stem=False, activation='relu'):
         super().__init__()
+        nonlin, nonlin_kwargs = CNN_ACTIVATIONS[activation]
         options = dict(conv_op=nn.Conv3d, kernel_size=3, norm_op=nn.InstanceNorm3d,
-                       norm_op_kwargs=dict(eps=1e-5, affine=True), nonlin=nn.ReLU, nonlin_kwargs=dict(inplace=True),
+                       norm_op_kwargs=dict(eps=1e-5, affine=True), nonlin=nonlin, nonlin_kwargs=nonlin_kwargs,
                        block=BasicBlockD)
-        inputs = (1, *channels[:-1])
+        if stem:
+            self.stem = nn.Sequential(nn.Conv3d(1, channels[0], 3, padding=1),
+                                      nn.InstanceNorm3d(channels[0], eps=1e-5, affine=True), nonlin(**nonlin_kwargs))
+        inputs = (channels[0] if stem else 1, *channels[:-1])
         self.stages = nn.ModuleList(
             StackedResidualBlocks(n_blocks=n, input_channels=i, output_channels=c, initial_stride=s, conv_bias=not index,
                                   **options)
             for index, (i, c, s, n) in enumerate(zip(inputs, channels, strides, blocks)))
 
     def forward(self, image):
-        x = image
+        x = self.stem(image) if hasattr(self, 'stem') else image
         for stage in self.stages:
             x = stage(x)
         return x

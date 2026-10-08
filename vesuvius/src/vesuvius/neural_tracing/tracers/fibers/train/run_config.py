@@ -190,7 +190,7 @@ def model_config(run):
     from vesuvius.neural_tracing.tracers.shared.geometry import CropSpec
     values = {k: v for k, v in run['model'].items() if k != 'type'}
     values['fine'] = CropSpec(**values['fine'])
-    for key in ('cnn_channels', 'cnn_blocks', 'flow_sigma'):
+    for key in ('cnn_channels', 'cnn_blocks', 'cnn_strides', 'flow_sigma'):
         if isinstance(values.get(key), list):
             values[key] = tuple(tuple(v) if isinstance(v, list) else v for v in values[key])
     return config_class(run['model']['type'])(**values)

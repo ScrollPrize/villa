@@ -25,18 +25,23 @@ def config_class(model_type):
 RETIRED_FIELDS = dict(activation_checkpointing=False, query_scale=None, flow_time_conditioning='adaln_zero',
                       flow_unknown_planes='own_path', flow_selection='retry', flow_zero_start=True,
                       flow_sample_threshold=0., flow_loss='pseudo_huber', flow_geometry_weight=0.)
-# Model fields added after checkpoints were recorded without them, with the value those checkpoints were trained with.
+# Model fields added after checkpoints were recorded without them, with the value those checkpoints were trained with
+# (RECORDED_TYPE_DEFAULTS: per model type, where the types' earlier values differ).
 RECORDED_DEFAULTS = dict(qk_norm=False, flow_modulation_bound=0., qk_logit_scale=False, scoring_pass=False,
-                         cnn_strides=(1, 2, 2, 2))
+                         cnn_stem=False, cnn_activation='relu')
+CROP_TRANSFORMER_ENCODER = dict(cnn_channels=(32, 64, 128), cnn_blocks=(1, 2, 2), cnn_strides=None)  # before 2026-10-08
+RECORDED_TYPE_DEFAULTS = dict(regression=CROP_TRANSFORMER_ENCODER, flow=CROP_TRANSFORMER_ENCODER,
+                              sequence=dict(cnn_strides=(1, 2, 2, 2), cnn_blocks=2))
 
 
 def recorded_config(model_type, recorded):
-    """A configuration recorded without newer fields (RECORDED_DEFAULTS) or with retired ones (RETIRED_FIELDS), as it
-    was trained."""
+    """A configuration recorded without newer fields (RECORDED_DEFAULTS, RECORDED_TYPE_DEFAULTS) or with retired ones
+    (RETIRED_FIELDS), as it was trained."""
     cls = config_class(model_type)
     names = {f.name for f in fields(cls)}
     recorded = retire(recorded, RETIRED_FIELDS, 'model')
-    return cls(**{**{k: v for k, v in RECORDED_DEFAULTS.items() if k in names}, **recorded})
+    defaults = {**RECORDED_DEFAULTS, **RECORDED_TYPE_DEFAULTS.get(model_type, {})}
+    return cls(**{**{k: v for k, v in defaults.items() if k in names}, **recorded})
 
 
 def config_from_checkpoint(ck):

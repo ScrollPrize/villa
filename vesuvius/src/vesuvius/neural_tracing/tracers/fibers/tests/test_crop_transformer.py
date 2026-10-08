@@ -12,7 +12,7 @@ from vesuvius.neural_tracing.tracers.fibers.train.supervision import loss_terms
 from vesuvius.neural_tracing.tracers.fibers.train.step import prepare_training, training_prediction
 
 SMALL = dict(fine=CropSpec(depth=32, width=16, behind=8, spacing=.5), n_future=8, gate_plane=4, hidden=32, layers=2,
-             heads=2, ffn=64, cnn_channels=(4, 8, 16), cnn_blocks=(1, 1, 1), n_history=32)
+             heads=2, ffn=64, cnn_channels=(4, 8, 16), cnn_blocks=(1, 1, 1), cnn_strides=(2, 2, 2), n_history=32)
 # A small flow model with one path.
 PLAIN_FLOW = dict(flow_steps=2, flow_draws=3, flow_sigma=((1., 1.),)*8, flow_samples=0, flow_sigma_floor=1.)
 
@@ -119,3 +119,31 @@ def test_scoring_pass_scores_each_finished_proposal_without_steering_it():
     # The initial proposal does not depend on its score (refinement passes read it back as feedback, by design).
     torch.testing.assert_close(out2['initial_points'], out['initial_points'])
     assert not torch.allclose(out2['confidence'], out['confidence'])  # the confidence comes from the scoring pass
+
+
+def test_an_older_encoder_loads_as_trained_and_warm_starts_the_new_layout_at_matching_strides():
+    """A checkpoint recorded before the stem/stride/activation encoder fields rebuilds as it was trained (every stage at
+    stride 2, no stem, ReLU). Initializing a stem + full-resolution layout from it gives each old stage to the new
+    stage at its stride and width; the transformer loads; blocks added to a loaded stage start as pass-throughs."""
+    from vesuvius.neural_tracing.tracers.models.checkpoint import initialize_model_weights
+    from vesuvius.neural_tracing.tracers.models.model import config_from_checkpoint
+    old = small(cnn_channels=(8, 16), cnn_blocks=(1, 1), cnn_strides=None, cnn_stem=False, cnn_activation='relu')
+    recorded = {k: v for k, v in old.cfg.to_dict().items() if k not in ('cnn_strides', 'cnn_stem', 'cnn_activation')}
+    ck = dict(model_type='regression', model_cfg=recorded, model=old.state_dict(), ema=old.state_dict())
+    rebuilt = config_from_checkpoint(ck)
+    assert rebuilt.cnn_stage_strides == (2, 2) and not rebuilt.cnn_stem and rebuilt.cnn_activation == 'relu'
+    build_model(rebuilt).load_state_dict(old.state_dict())  # the same architecture
+    new = RegressionConfig(**dict(SMALL, recurrent_refinement_steps=2, cnn_channels=(4, 8, 16), cnn_blocks=(1, 1, 2),
+                                  cnn_strides=(1, 2, 2)))  # defaults: stem, LeakyReLU
+    model, ema = initialize_model_weights(new, 'cpu', ck)
+    loaded, before = model.state_dict(), old.state_dict()
+    for name in ('cnn.stages.2.blocks.0.conv1.conv.weight', 'cnn.stages.2.blocks.0.conv2.conv.weight'):
+        assert torch.equal(loaded[name], before[name.replace('stages.2', 'stages.1')])  # stride 4, 16 channels
+        assert torch.equal(ema.state_dict()[name], loaded[name])
+    assert torch.equal(loaded['cnn.stages.1.blocks.0.conv2.conv.weight'], before['cnn.stages.0.blocks.0.conv2.conv.weight'])
+    assert torch.equal(loaded['cell_token.weight'], before['cell_token.weight'])
+    assert torch.equal(loaded['layers.1.qkv.weight'], before['layers.1.qkv.weight'])
+    added = model.cnn.stages[2].blocks[1].conv2.norm
+    assert not added.weight.any() and not added.bias.any()  # added block: zero residual branch
+    assert model.cnn.stages[0].blocks[0].conv2.norm.weight.all()  # new full-resolution stage: usual initialization
+    assert {'cnn.stem.0.weight', 'cnn.stages.1.blocks.0.conv1.conv.weight'} <= set(model.initialization_report['fresh'])
