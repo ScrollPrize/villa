@@ -7,6 +7,7 @@
 
 #include <QtTest/QtTest>
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <vector>
@@ -193,6 +194,28 @@ private slots:
             QCOMPARE(static_cast<int>(std::lround(gaps[i] / stats.unitLengthVx)),
                      stats.sheetCounts[i]);
         }
+    }
+
+    void theFirstRefinementCannotCountAsSettled()
+    {
+        // Seed 5000 reads every gap as one sheet, which matches the initial
+        // all-ones counts; stopping there would leave the unit at 4680 while
+        // 7400 / 4680 rounds to two. The fixed point is [1,1,1,1,2] at 3900.
+        const std::vector<double> gaps{1000.0, 5000.0, 5000.0, 5000.0, 7400.0};
+        const SheetStatistics stats = estimateSheetStatistics(gaps);
+        QVERIFY(stats.valid());
+        QCOMPARE(stats.sheetCounts, (std::vector<int>{1, 1, 1, 1, 2}));
+        QVERIFY(near(stats.unitLengthVx, 3900.0));
+        for (std::size_t i = 0; i < gaps.size(); ++i) {
+            QCOMPARE(std::max(1, static_cast<int>(std::lround(gaps[i] / stats.unitLengthVx))),
+                     stats.sheetCounts[i]);
+        }
+        // Same shape with the last ratio landing exactly on 1.5 at the
+        // premature unit (12000 / 8000).
+        const SheetStatistics half = estimateSheetStatistics({1000.0, 9000.0, 9000.0, 9000.0, 12000.0});
+        QVERIFY(half.valid());
+        QCOMPARE(half.sheetCounts, (std::vector<int>{1, 1, 1, 1, 2}));
+        QVERIFY(near(half.unitLengthVx, 40000.0 / 6.0));
     }
 
     void aSpuriousTinyGapMakesTheEstimateUnusable()

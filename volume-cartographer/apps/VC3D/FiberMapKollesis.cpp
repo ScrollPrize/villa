@@ -95,7 +95,9 @@ SheetStatistics estimateSheetStatistics(const std::vector<double>& gapsVx)
         if (totalSheets <= 0) {
             break;
         }
-        settled = next == stats.sheetCounts;
+        // The initial all-ones counts were not read at any unit, so only
+        // counts that repeat a completed refinement are a fixed point.
+        settled = iteration > 0 && next == stats.sheetCounts;
         stats.sheetCounts = next;
         unit = totalLength / static_cast<double>(totalSheets);
         if (settled) {
