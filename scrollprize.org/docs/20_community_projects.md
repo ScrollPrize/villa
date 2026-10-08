@@ -77,6 +77,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 - [vesuvius-catalog](https://github.com/Schurkai/vesuvius-catalog): scriptable catalog CLI/library for the open-data bucket - answers which samples have segments, ink outputs or surface predictions at which resolutions, resolves S3/HTTPS data URLs (JSON/CSV output for scripting), and includes working openers for the bucket's OME-Zarr v2 stores under zarr-python 3.
 
+- [Volumen](https://github.com/pscamillo/volumen) by pscamillo. Desktop app (Linux and Windows) for the First Letters scrolls: opens published or local surfaces, makes its own flattened view from the CT, cuts the raw CT across each surface to check that it stays on one sheet, and keeps every verdict locally. Surfaces go both ways with VC3D: patches from a `.volpkg` open in Volumen, and any surface exports back as a ready-made project. On Linux with an NVIDIA GPU it also installs and runs the minimal route to make new surfaces.
+
 ## Segmentation
 
 ### 🌟 Highlighted
