@@ -321,6 +321,12 @@ auto main(int argc, char* argv[]) -> int
     if (qEnvironmentVariableIsEmpty("QT_IMAGEIO_MAXALLOC")) {
         QImageReader::setAllocationLimit(512);
     }
+    // Render a surface location only when a complete bilinear quad backs it.
+    // The legacy nearest-vertex coverage keeps ragged-edge pixels whose
+    // coordinates are blended toward the (-1, -1, -1) invalid sentinel; they
+    // draw as a noisy fringe and make a single surface tile depend on
+    // thousands of chunks. Set before any surface is loaded.
+    QuadSurface::setStrictQuadRenderValidityDefault(true);
     WheelFocusFilter wheelFocusFilter;
     app.installEventFilter(&wheelFocusFilter);
     QApplication::setOrganizationName("Vesuvius Challenge");
@@ -373,6 +379,9 @@ auto main(int argc, char* argv[]) -> int
         "Open a volume package at startup.",
         "path");
     parser.addOption(volumePackageOption);
+    QCommandLineOption fiberCollectionOption(
+        "fiber-collection", "Attach a read-only Automated Fiber Volume (.afv) to the opened CT volume.", "path");
+    parser.addOption(fiberCollectionOption);
 
     QCommandLineOption debugOption(
         "debug",
@@ -578,6 +587,10 @@ auto main(int argc, char* argv[]) -> int
                 std::cerr.flush();
                 std::_Exit(2);
             }
+        }
+
+        if (parser.isSet(fiberCollectionOption)) {
+            aWin.openFiberCollection(parser.value(fiberCollectionOption).trimmed());
         }
 
         // Agent bridge (opt-in, off by default). Constructed only when a bridge

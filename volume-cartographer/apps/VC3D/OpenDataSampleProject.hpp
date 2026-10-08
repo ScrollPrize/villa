@@ -31,14 +31,21 @@ struct OpenDataSampleProjectResult {
     std::vector<std::string> messages;
 };
 
-// selection optionally restricts attached volumes and derived
-// representations; nullptr attaches everything.
+struct OpenDataNewProject {
+    std::filesystem::path path;
+    std::string name;
+};
+
+// selection optionally restricts volumes, derived representations and segments;
+// nullptr attaches everything. newProject bypasses the cached full-sample project
+// and saves a fresh JSON before returning an ordinarily persistent loaded package.
 [[nodiscard]] std::shared_ptr<VolumePkg> createOpenDataSampleProject(
     const OpenDataSample& sample,
     const std::filesystem::path& remoteCacheRoot,
     OpenDataSampleProjectResult* resultOut = nullptr,
     const OpenDataSampleProgressCallback& progressCallback = {},
-    const OpenDataResourceSelection* selection = nullptr);
+    const OpenDataResourceSelection* selection = nullptr,
+    const OpenDataNewProject* newProject = nullptr);
 
 OpenDataSampleProjectResult attachOpenDataSampleVolumes(
     VolumePkg& pkg,
@@ -50,6 +57,7 @@ void attachOpenDataSampleSegments(
     const OpenDataSample& sample,
     const std::filesystem::path& remoteCacheRoot,
     OpenDataSampleProjectResult& result,
-    const OpenDataSampleProgressCallback& progressCallback = {});
+    const OpenDataSampleProgressCallback& progressCallback = {},
+    bool individualEntries = false);
 
 } // namespace vc3d::opendata

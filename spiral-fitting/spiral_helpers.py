@@ -10,6 +10,7 @@ import torch
 from tqdm import tqdm
 
 from sample_spiral import get_spiral_yxs, get_theta_and_radii
+from surface_orientation import GridLayout, export_metadata
 from tifxyz import (load_tifxyz, patch_to_payload, save_tifxyz,
                     save_combined_tifxyz)
 from vc3d_fiber_format_adapter import (
@@ -74,28 +75,14 @@ def scale_counts_for_z_range(
     z_end,
     reference_z_range_num_slices,
     z_range_scaled_count_keys,
-    floors=None,
 ):
-    """Scale per-step sample counts with the z-range, respecting floors.
-
-    Floors exist for losses whose per-sample information is sparse: the
-    phase bundle sees ~6 winding gradient sites per pair, so
-    volume-proportional scaling starves it on narrow windows (a 300-slice
-    session got ~380 pairs from the 12k default and corrected at half
-    grad_mag's rate - 2026-07-17 sampling-scale probes).
-    """
+    """Scale per-step sample counts with the z-range (never below 1)."""
     num_slices = z_end - z_begin
     scale = num_slices / reference_z_range_num_slices
     for key in z_range_scaled_count_keys:
-        floor = 1 if floors is None else int(floors.get(key, 1))
-        config[key] = max(floor, round(config[key] * scale))
+        config[key] = max(1, round(config[key] * scale))
     return scale, num_slices
 
-
-SAMPLING_COUNT_FLOORS = {
-    'sample_count_dense_spacing_pairs': 8_000,
-    'sample_count_dense_spacing_density_extra_pairs': 16_000,
-}
 
 # All per-step sample-count defaults are tuned for a 9500-slice z-range;
 # scale_counts_for_z_range() scales them relative to this reference.
@@ -119,7 +106,6 @@ def scale_and_split_counts(config, z_begin, z_end, count_keys, world_size=None):
     scale, num_slices = scale_counts_for_z_range(
         config, z_begin, z_end,
         REFERENCE_Z_RANGE_NUM_SLICES, count_keys,
-        floors=SAMPLING_COUNT_FLOORS,
     )
     split_divisor = split_counts_across_ranks(
         config, count_keys, world_size=world_size)
@@ -1128,7 +1114,7 @@ def _infer_shell_outer_winding_idx(
 def _resolve_shell_outer_winding_idx(cfg):
     # Winding bound shared by every sampler that integrates over the spiral
     # cylinder: the dense lasagna losses, the symmetric Dirichlet
-    # regulariser and the phase bundle (incl. min_spacing). Resolved once per
+    # regulariser and the native min_spacing barrier. Resolved once per
     # run from the config; the shell branch may still override it with the
     # inferred value. None disables those samplers (they early-return zero),
     # whatever their weights: _structurally_disabled_dense_weight_keys
@@ -1189,9 +1175,7 @@ def resolve_outer_winding_idx_and_notes(cfg, shell_active, infer_outer_winding_i
 _DENSE_WEIGHT_KEYS_NEEDING_OUTER_WINDING_IDX = (
     'loss_weight_dense_normals',
     'loss_weight_dense_spacing',
-    'loss_weight_dense_spacing_count',
     'loss_weight_dense_spacing_density',
-    'loss_weight_dense_attachment',
     'loss_weight_min_spacing',
     'loss_weight_sym_dirichlet',
 )
@@ -1484,11 +1468,14 @@ def save_mesh(
     winding_range,
     patch_satisfaction_evaluation,
     patch_atlas,
+    z_direction_is_top_to_bottom,
     tracks=(),
     run_tag=None,
     name='mesh',
     progress=None,
 ):
+    """Write one tifxyz per winding in the export layout (surface_orientation)
+    for ``z_direction_is_top_to_bottom``."""
     min_winding_idx, max_winding_idx = winding_range
     if cfg['shell_outer_winding_idx'] is not None:
         max_winding_idx = min(max_winding_idx, cfg['shell_outer_winding_idx'])
@@ -1533,6 +1520,8 @@ def save_mesh(
     os.makedirs(out_dir, exist_ok=True)
     output_total = 2 * len(num_thetas_by_winding)
     output_done = 0
+    layout = GridLayout.export(z_direction_is_top_to_bottom)
+    layout_metadata = export_metadata(z_direction_is_top_to_bottom)
     if progress is not None:
         progress.begin(
             'finalizing', 'Writing final mesh windings',
@@ -1549,12 +1538,13 @@ def save_mesh(
                 winding_zyxs = winding_slice.cpu().numpy().astype(np.float32)
                 winding_zyxs[invalid_mask] = -1.0
                 save_tifxyz(
-                    winding_zyxs,
+                    layout.apply(winding_zyxs),
                     out_dir,
                     uuid=f'w{winding_idx:03d}{uuid_suffix}{tag_suffix}',
                     step_size=step_size,
                     voxel_size_um=voxel_size_um,
                     source=f'fit_spiral {name}{uuid_suffix}',
+                    layout_metadata=layout_metadata,
                 )
             offset += num_thetas
             output_done += 1
@@ -1578,6 +1568,7 @@ def save_combined_preview(
     tracks=(),
     *,
     surface_id,
+    z_direction_is_top_to_bottom,
     base_shape_zyx=None,
     progress=None,
     input_extent_transform=None,
@@ -1609,6 +1600,10 @@ def save_combined_preview(
     caller passes ``None`` only when the resident patches are not in true
     scroll space (after a constraint bake), where splicing would write
     baked-space coordinates into a scroll-space surface.
+
+    The surface is written in the export layout (surface_orientation) for
+    ``z_direction_is_top_to_bottom``; the splice here and the loss maps work in
+    spiral order, the loss maps mapping through the manifest's layout.
     """
     if input_extent_transform is None:
         input_extent_transform = slice_to_spiral_transform
@@ -1713,6 +1708,7 @@ def save_combined_preview(
         grid_spacing,
         voxel_size_um,
         source='fit_spiral interactive preview',
+        z_direction_is_top_to_bottom=z_direction_is_top_to_bottom,
         first_winding=first_winding,
         cleanup_erosion_cells=3,
         base_shape_zyx=base_shape_zyx,
