@@ -52,12 +52,16 @@ from vesuvius.neural_tracing.tracers.sheets.losses import landing
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.gpu import sample_plane
 
 
-def _seed_sampler(cfg, steps: int, front: float, min_valid: float, split: str, all_val: bool, seed_split: bool):
+def _seed_sampler(cfg, steps: int, front: float, min_valid: float, split: str, all_val: bool, seed_split: bool,
+                  fiber_runs: str = '', fiber_pool: str = ''):
     """Sampler of benchmark seed windows (20 vx point spacing for checks) and its data config. ``seed_split``: only
-    the seed rows must lie in ``split`` cells (``--held-out-scoring``)."""
+    the seed rows must lie in ``split`` cells (``--held-out-scoring``). ``fiber_runs``: fiber-seeded windows from
+    these matched fiber runs (as in training), with the fibers of ``fiber_pool`` around them; else GT-row seeds."""
     data = copy.deepcopy(cfg.data)
     if all_val:
         data.val_fraction = 1.
+    data.fiber_runs, data.fiber_pool, data.fiber_fraction = fiber_runs, fiber_pool, 1. if fiber_runs else 0.
+    data.fiber_follow, data.hard_fraction = False, 0.
     data.point_spacing = 20.
     data.front_points = int(round(front/data.point_spacing))+1
     data.min_valid_fraction = min_valid
@@ -68,18 +72,24 @@ def _seed_sampler(cfg, steps: int, front: float, min_valid: float, split: str, a
 
 
 def draw_seeds(cfg, count: int, steps: int, front: float, min_valid: float, seed: int = 0, split: str = 'val',
-               all_val: bool = False, max_per_patch: int = 1, patience: int = 500, seed_split: bool = False):
+               all_val: bool = False, max_per_patch: int = 1, patience: int = 500, seed_split: bool = False,
+               fiber_runs: str = '', fiber_pool: str = ''):
     """GT windows of ``split`` for traces of ``steps`` steps and a ``front``-voxel seed row. At most
     ``max_per_patch`` seeds per patch (0: any number); fewer than ``count`` if not enough patches fit, giving up
     after ``patience`` draws in a row add nothing. ``all_val``: every split cell is a validation cell (patches of a
-    scroll never trained on)."""
+    scroll never trained on). ``fiber_runs``: fiber-seeded windows only (``_seed_sampler``), at most
+    ``max_per_patch`` per fiber."""
     max_per_patch = max_per_patch or count
-    sampler, data = _seed_sampler(cfg, steps, front, min_valid, split, all_val, seed_split)
+    sampler, data = _seed_sampler(cfg, steps, front, min_valid, split, all_val, seed_split, fiber_runs, fiber_pool)
+    if fiber_runs and not sampler.fiber_runs:
+        raise ValueError(f'No fiber run of {fiber_runs} is long enough for a {front:g} vx front')
     rng = np.random.default_rng([seed, 7])
     seeds, per_patch, misses = [], {}, 0
     for _ in range(count*20):
         w = sampler.window(rng)
-        key = None if w is None else (w['meta'].get('root'), w['meta']['patch'])
+        if fiber_runs and w is not None and 'seed' not in w:  # a fallback GT-row window: not a fiber seed
+            w = None
+        key = None if w is None else ((w['meta']['fiber'],) if fiber_runs else (w['meta'].get('root'), w['meta']['patch']))
         if w is not None and per_patch.get(key, 0) < max_per_patch:
             per_patch[key] = per_patch.get(key, 0)+1
             seeds.append(w)
@@ -113,7 +123,12 @@ def seeds_from(report: Path, cfg, steps: int, front: float, min_valid: float, sp
 
 
 def seed_polyline(w, spec, data):
-    """GT seed row (every grid node from v = 0 to the front length) and the per-point advance direction."""
+    """Seed row and the per-point advance direction: the fiber of a fiber-seeded window (its points along the
+    fiber, the direction from its row behind), else the GT seed row (every grid node from v = 0 to the front
+    length)."""
+    if 'seed' in w:
+        rows = np.asarray(w['seed'], np.float64)
+        return rows[-1], rows[-1]-rows[-2]
     iu0 = int(round((0-spec.u_lo)/spec.res))
     back = int(round(data.step/spec.res))
     v0 = int(round((0-spec.v_lo)/spec.res))
@@ -339,6 +354,11 @@ def main(argv=None):
                     'scored (no effect with --all-val)')
     ap.add_argument('--seeds-from', metavar='REPORT', help='reuse the seeds of an earlier report.json (same patch, '
                     'orientation and anchor) with this --front and --steps, dropping those that no longer fit')
+    ap.add_argument('--fiber-seeds', metavar='RUNS', help='seed from matched fiber runs (JSON lines of '
+                    'scripts/match_fibers_to_patches.py) instead of GT rows, as fiber-seeded training episodes; '
+                    '--max-per-patch then counts per fiber')
+    ap.add_argument('--fiber-pool', help='with --fiber-seeds: show models with fiber tokens the fibers around each '
+                    'seed (scripts/build_fiber_pool.py)')
     ap.add_argument('--min-valid', type=float, default=.95)
     ap.add_argument('--tag', default='bench')
     ap.add_argument('--device', default='cuda')
@@ -370,6 +390,8 @@ def main(argv=None):
     if args.patches_dir:
         seed_cfg.data.patches_dir = args.patches_dir
     origin = None
+    if args.fiber_seeds and args.seeds_from:
+        ap.error('--fiber-seeds draws its own seeds (no --seeds-from)')
     if args.seeds_from:
         seeds, spec, seed_data, origin = seeds_from(Path(args.seeds_from), seed_cfg, args.steps, args.front,
                                                     args.min_valid, all_val=args.all_val or args.seeds_anywhere,
@@ -378,7 +400,8 @@ def main(argv=None):
     else:
         seeds, spec, seed_data = draw_seeds(seed_cfg, args.seeds, args.steps, args.front, args.min_valid,
                                             all_val=args.all_val or args.seeds_anywhere,
-                                            max_per_patch=args.max_per_patch, seed_split=args.held_out_scoring)
+                                            max_per_patch=args.max_per_patch, seed_split=args.held_out_scoring,
+                                            fiber_runs=args.fiber_seeds or '', fiber_pool=args.fiber_pool or '')
     print(f'{len(seeds)} held-out seeds', flush=True)
     out = Path(args.out) if args.out else C.OUTPUT/'trace_bench'/args.tag
     (out/'tifxyz').mkdir(parents=True, exist_ok=True)
@@ -402,7 +425,7 @@ def main(argv=None):
             seed = resample(points, cfg.data.point_spacing)
             idx = np.linspace(0, len(points)-1, len(seed))
             dirs = np.stack([np.interp(idx, np.arange(len(points)), direction[:, k]) for k in range(3)], 1)
-            rows, confs = trace(model, cfg, seed, dirs, args.steps, args.device)
+            rows, confs = trace(model, cfg, seed, dirs, args.steps, args.device, fibers=w.get('fibers'))
             traced = len(rows)-1
             if len(rows) < args.steps+1:  # left the volume: pad with the last row, unsupervised beyond
                 pad = args.steps+1-len(rows)

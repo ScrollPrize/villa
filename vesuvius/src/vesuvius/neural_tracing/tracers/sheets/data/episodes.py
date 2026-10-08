@@ -79,10 +79,11 @@ class EpisodeSampler:
         if split == 'train' and data.hard_fraction:
             self.hard = json.loads(Path(data.hard_windows).read_text())['records']
         # Matched fiber stretches (data.fiber_runs) long enough for this sampler: as long as the front for
-        # fiber-seeded episodes, as long as the whole GT window's advance for fiber-following ones.
+        # fiber-seeded episodes, as long as the whole GT window's advance for fiber-following ones. Training episodes
+        # and benchmark seeds (region_split, trace_benchmark.py --fiber-seeds) use them; validation stays on GT rows.
         self.follow = bool(data.fiber_follow)
         self.fiber_runs = []
-        if split == 'train' and (data.fiber_fraction or self.follow):
+        if (split == 'train' or region_split) and (data.fiber_fraction or self.follow):
             need = self.spec.u_vals[-1]-self.spec.u_vals[0] if self.follow else self.front_len
             keys = {(info.root, info.name) for info in self.index}
             for line in Path(data.fiber_runs).read_text().splitlines():

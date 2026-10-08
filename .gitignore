@@ -72,3 +72,6 @@ volume-cartographer/AGENTS.md
 /vesuvius/src/vesuvius/neural_tracing/tracers/fibers/datasets/automated_fiber_volumes
 /vesuvius/src/vesuvius/neural_tracing/tracers/fibers/plans
 /vesuvius/src/vesuvius/neural_tracing/tracers/sheets/output
+/spiral-fitting/outputs/anchored_strip_extension
+/spiral-fitting/outputs
+/vesuvius/src/vesuvius/neural_tracing/fiber_follow/output

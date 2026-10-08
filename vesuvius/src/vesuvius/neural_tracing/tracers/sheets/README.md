@@ -65,6 +65,7 @@ and code names therefore means masked output, not halted motion.
 | `data.front_points_range`, `train.points_per_batch` | Training only: every batch draws its front size N uniformly from `[min, max]`, holding about `points_per_batch` points (`batch = points_per_batch / N`). `data.front_points` still sets validation. |
 | `data.unpadded_blocks` | Keep each training episode's block unpadded on the GPU (a list), instead of padding them to the batch's largest extent, which long fronts at mixed orientations blow up. |
 | `data.fiber_runs`, `fiber_fraction`, `fiber_min_valid` | Fiber-seeded episodes: this fraction of episodes starts from a fiber matched to its patch (`scripts/match_fibers_to_patches.py`). The fiber is the seed row, and the GT window is rotated to follow it. |
+| `data.fiber_fraction_by_runs` | With `data.front_points_range`: each front size's `fiber_fraction` scaled by its usable fiber runs per usable patch, relative to the size with the most, so the few fiber runs long enough for big fronts are not drawn over and over. |
 | `data.follow_fraction`, `model.fiber_follow_mode` | Fiber-following batches: a 3-point front across a matched fiber, with the middle point on it, advancing along it. The model gets a learned mode embedding (0 sheet tracing, 1 following), zero-initialised. |
 | `data.fiber_pool`, `model.fiber_tokens`, `data.fiber_cut_at_start`, `fiber_max_instances`, `fiber_max_points` | In fiber-started episodes, the fibers around the episode (`scripts/build_fiber_pool.py`) as extra transformer tokens: the `fiber_tokens` points nearest the front each step, each with a random per-episode instance code shared by all points of one fiber. In following episodes the seed fiber is cut ahead of the start, so the model learns to extend it. |
 | `train/train.py --init CKPT` | Start from a checkpoint's weights (EMA if present) with a fresh optimizer and schedule. The fiber and mode modules start fresh if the checkpoint lacks them. `--resume` continues a run. |
@@ -104,7 +105,7 @@ and code names therefore means masked output, not halted motion.
 The run directory is `output/NAME`:
 
 ```bash
-cd vesuvius/src/vesuvius/neural_tracing/sheet_tracing
+cd vesuvius/src/vesuvius/neural_tracing/tracers/sheets
 ../../../../../.venv/bin/python -m vesuvius.neural_tracing.tracers.sheets.train.train --config remote_l0_fiber_ft.json \
     --name RUN --init output/remote_l0_points_ft/last.pt
 # resume

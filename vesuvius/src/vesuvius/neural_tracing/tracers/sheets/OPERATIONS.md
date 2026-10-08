@@ -161,7 +161,7 @@ The patch index is cached in `output/cache/`. It is rebuilt automatically when t
 **Sync the code** after changing it here. Configs are excluded because they are created on the H100:
 
 ```bash
-cd vesuvius/src/vesuvius/neural_tracing/sheet_tracing
+cd vesuvius/src/vesuvius/neural_tracing/tracers/sheets
 rsync -a --exclude output/ --exclude __pycache__/ --exclude configs/ ./ \
   ubuntu@147.224.219.64:/ephemeral/sean/sheet_tracing/villa/vesuvius/src/vesuvius/neural_tracing/sheet_tracing/
 ```
@@ -197,7 +197,7 @@ The H100's clock and logs are in UTC (Chicago is UTC-5 in summer).
 ```bash
 R=ubuntu@147.224.219.64:/ephemeral/sean/sheet_tracing
 O=$R/villa/vesuvius/src/vesuvius/neural_tracing/sheet_tracing/output
-L=vesuvius/src/vesuvius/neural_tracing/sheet_tracing/output/remote
+L=vesuvius/src/vesuvius/neural_tracing/tracers/sheets/output/remote
 rsync -a --exclude '*.pt' $O/my_run $L/ && rsync -a --include 'ckpt_*.pt' --include 'last.pt' --exclude '*' $O/my_run/ $L/my_run/
 rsync -a $R/logs/ $L/logs/
 ```

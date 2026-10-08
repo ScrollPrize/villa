@@ -65,6 +65,10 @@ class DataConfig:
     fiber_runs: str = ''
     fiber_fraction: float = 0.
     fiber_min_valid: float = .5  # fiber episodes' min_valid_fraction: matched runs often lie near patch edges
+    # With front_points_range: each front size's fiber_fraction scaled by its usable fiber runs per usable patch,
+    # relative to the size with the most (fiber runs long enough for a big front are few; at the full fraction each
+    # of them would be drawn far more often than at small fronts).
+    fiber_fraction_by_runs: bool = False
     # Fiber-following batches (training): this fraction of batches has a 3-point front across a matched fiber,
     # middle point on it, advancing along it (``EpisodeSampler._follow_attempt``), with the model's mode input 1
     # (model.fiber_follow_mode). ``fiber_follow`` marks such a batch's sampler config; set by the trainer.

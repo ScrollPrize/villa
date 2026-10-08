@@ -544,6 +544,16 @@ def test_mixed_front_batches_vary_the_point_count(tmp_path):
         C.load(None, ['data.front_points_range=[2,5]'])
 
 
+def test_fiber_share_shrinks_with_the_fiber_runs_per_patch():
+    """data.fiber_fraction_by_runs: the front size with the most fiber runs per patch keeps the full fraction, the
+    others shrink in proportion, so a few long runs are not drawn over and over."""
+    from vesuvius.neural_tracing.tracers.sheets.train.train import fiber_shares
+    shares = fiber_shares(.25, {5: 3743, 9: 293, 16: 21, 17: 0}, {5: 17531, 9: 14022, 16: 9244, 17: 9000})
+    assert shares[5] == .25 and shares[17] == 0.
+    assert shares[9] == pytest.approx(.25*(293/14022)/(3743/17531)) and shares[16] < .003
+    assert fiber_shares(.25, {5: 0}, {5: 10}) == {5: 0.}
+
+
 def test_packed_blocks_unpack_padded_or_listed_and_sample_alike():
     """Packed blocks ship no padding; unpacked, the zero-padded batch is the blocks padded at the far end, and crops
     from the list of blocks (data.unpadded_blocks) match those from the padded batch."""
@@ -715,6 +725,30 @@ def test_fiber_seeded_episodes_start_from_the_fiber(tmp_path):
         assert np.allclose((step*np.array([0., .8, .6])).sum(1), 0, atol=1e-3)
     b = collate(eps+[{k: v for k, v in eps[0].items() if k != 'seed'}])  # plus one GT-seeded episode
     assert b['seed'].shape[0] == len(eps)+1 and b['seed_mask'].tolist() == [True]*len(eps)+[False]
+
+
+def test_benchmark_fiber_seeds_start_on_the_fiber(tmp_path, monkeypatch):
+    """trace_benchmark --fiber-seeds: only fiber-seeded windows, their seed polyline the fiber and the advance
+    perpendicular to it in the sheet."""
+    from vesuvius.neural_tracing.tracers.sheets.evaluation.benchmark import draw_seeds, seed_polyline
+    monkeypatch.setattr(C, 'OUTPUT', tmp_path)
+    _write_plane_patch(tmp_path/'patches'/'p0', 150, 150)
+    t = np.arange(0., 120., 5.)  # a fiber 2 vx inside the sheet, running diagonally on the patch grid
+    xyz = np.stack([np.full(len(t), 58.5), 100.+t*.8, 120.+t*.6], 1)
+    rc = np.stack([(xyz[:, 2]-20.)/2, (xyz[:, 1]-20.)/2], 1)
+    runs = tmp_path/'runs.jsonl'
+    runs.write_text(json.dumps(dict(fiber='f1', root=str(tmp_path/'patches'), patch='p0', start=0., end=float(t[-1]),
+                                    offset=-2., rc=rc.tolist(), xyz=xyz.tolist()))+'\n')
+    cfg = C.load(None, [f'data.patches_dir="{tmp_path/"patches"}"', 'data.step=10', 'data.gt_margin=10',
+                        'data.gt_resolution=2'])
+    seeds, spec, data = draw_seeds(cfg, 4, 2, 40., .5, all_val=True, max_per_patch=0, fiber_runs=str(runs))
+    assert seeds and all('seed' in w and w['meta']['fiber'] == 'f1' for w in seeds)
+    for w in seeds:
+        points, direction = seed_polyline(w, spec, data)
+        assert np.allclose(points[:, 0], 58.5) and np.allclose(np.linalg.norm(points[-1]-points[0]), 40., atol=.5)
+        assert np.allclose((direction*np.array([0., .8, .6])).sum(1), 0, atol=1e-3)  # across the fiber
+    plain, _, _ = draw_seeds(cfg, 4, 2, 40., .5, all_val=True, max_per_patch=0)
+    assert plain and not any('seed' in w for w in plain)  # without --fiber-seeds: GT rows
 
 
 def test_train_rollout_starts_from_provided_seed_rows():

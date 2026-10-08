@@ -165,6 +165,15 @@ def device_batches(batches, device, pinned_ahead: int = 2, timings: dict | None 
         yield b
 
 
+def fiber_shares(fraction: float, runs: dict, patches: dict) -> dict:
+    """``data.fiber_fraction_by_runs``: per batch kind, ``fraction`` scaled by the kind's usable fiber runs per usable
+    patch over the highest such density of any kind, so each fiber run is drawn no more often, relative to the
+    patches, than at the front size with the most runs."""
+    density = {k: runs[k]/max(1, patches[k]) for k in runs}
+    top = max(density.values(), default=0.)
+    return {k: fraction*rho/top if top else 0. for k, rho in density.items()}
+
+
 def front_variants(train_cfg, index, pad: float) -> dict:
     """``data.front_points_range``: batch kind -> (training config, its episode sampler, batch size, share of
     batches). Kinds are the point counts N (an N-point front), plus ``'follow'`` with ``data.follow_fraction``: a
@@ -185,8 +194,16 @@ def front_variants(train_cfg, index, pad: float) -> dict:
         sampler = EpisodeSampler(cfg.data, index, 'train', d.steps, cfg.data.roi, pad)
         share = d.follow_fraction if follow else (1-d.follow_fraction)/len(counts)
         out[kind] = (cfg, sampler, max(1, round(per_batch/n)), share)
-        print(f'{kind}: {n} front points, batch {out[kind][2]}, {share:.0%} of batches, {len(sampler.index)} usable '
-              f'patches, {len(sampler.fiber_runs)} fiber runs, roi {cfg.data.roi}', flush=True)
+    if d.fiber_fraction_by_runs:  # the samplers read their (shared) data config when drawing
+        sheet = [k for k in out if k != 'follow']
+        shares = fiber_shares(d.fiber_fraction, {k: len(out[k][1].fiber_runs) for k in sheet},
+                              {k: len(out[k][1].index) for k in sheet})
+        for k, f in shares.items():
+            out[k][0].data.fiber_fraction = f
+    for kind, (cfg, sampler, size, share) in out.items():
+        print(f'{kind}: {cfg.data.front_points} front points, batch {size}, {share:.0%} of batches, {len(sampler.index)} '
+              f'usable patches, {len(sampler.fiber_runs)} fiber runs ({cfg.data.fiber_fraction:.1%} of episodes), '
+              f'roi {cfg.data.roi}', flush=True)
     return out
 
 
