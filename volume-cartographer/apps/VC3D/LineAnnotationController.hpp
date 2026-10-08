@@ -126,7 +126,14 @@ public:
         std::string name;
         int controlPointCount = 0;
         int linePointCount = 0;
+        // The whole stored line, open tails included: what the atlas search
+        // and the agent bridge measure arclengths against.
         double lengthVx = 0.0;
+        // The line between the outermost control points (the sum of the
+        // spans; nothing when they all sit on one line point), what the
+        // panels show as the fiber's length; the whole line with fewer than
+        // two finite control points.
+        double annotatedLengthVx = 0.0;
         AlignmentMetrics alignment;
         std::vector<SpanSummary> spans;
         double hvZDistance = 0.0;
@@ -408,6 +415,10 @@ public:
     [[nodiscard]] uint64_t fiberIdForFilePath(const std::filesystem::path& path) const;
     // First loaded filename match; use the full path when sources may overlap.
     [[nodiscard]] uint64_t fiberIdForFileName(const std::string& fileName) const;
+    // The loaded fiber a line annotation dialog is editing, or 0 when the
+    // dialog is not one of this controller's panes or its fiber has no
+    // stored file yet (a new, unsaved fiber).
+    [[nodiscard]] uint64_t fiberIdForDialog(const LineAnnotationDialog* dialog) const;
     // Whether the fiber with this runtime id is loaded under this file name
     // (a caller that captured both before a yield checks they still agree).
     [[nodiscard]] bool hasLoadedFiber(uint64_t fiberId, const std::string& fileName) const;
@@ -1104,7 +1115,6 @@ private:
     [[nodiscard]] bool controlPointHasBranch(const LineAnnotationSession& session,
                                              int controlPointIndex) const;
     std::vector<uint64_t> syncBranchEndpointPositions(LineAnnotationSession& session);
-    [[nodiscard]] static double lineLengthVx(const std::vector<cv::Vec3d>& points);
     static void scaleStoredFiber(StoredFiber& fiber, double scale);
     [[nodiscard]] static vc::lasagna::LineModel lineModelFromPoints(
         const std::vector<cv::Vec3d>& points,
