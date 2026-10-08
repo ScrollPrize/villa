@@ -46,6 +46,7 @@ from vesuvius.ink_detection.models.checkpoint import (
 from vesuvius.ink_detection.models.model import make_model
 from vesuvius.ink_detection.volume_io import (
     open_volume,
+    DEFAULT_READ_RETRIES,
     read_bbox_with_padding,
 )
 from vesuvius.label_zarr import create_v2_array, open_v2_group
@@ -148,10 +149,21 @@ def parse_args(argv: Sequence[str] | None = None):
     parser.add_argument("--max-target-chunks", type=int, default=None)
     parser.add_argument("--cache-dir", type=Path, default=None)
     parser.add_argument("--cache-max-gb", type=float, default=None)
+    parser.add_argument(
+        "--read-retries",
+        type=int,
+        default=DEFAULT_READ_RETRIES,
+        help=(
+            "Attempts per patch read (default %(default)s). Transient remote "
+            "failures are retried with exponential backoff instead of aborting "
+            "the run. 1 disables."
+        ),
+    )
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args(argv)
     checks = (
         (args.batch_size > 0, "--batch-size must be positive"),
+        (args.read_retries >= 1, "--read-retries must be >= 1"),
         (args.num_workers >= 0, "--num-workers must be >= 0"),
         (args.prefetch_factor > 0, "--prefetch-factor must be positive"),
         (args.downsample_workers > 0, "--downsample-workers must be positive"),
@@ -848,8 +860,10 @@ class NativePatchDataset(Dataset):
         config,
         cache_dir=None,
         cache_max_gb=None,
+        read_retries: int = DEFAULT_READ_RETRIES,
     ) -> None:
         self.tifxyz_dir = Path(tifxyz_dir)
+        self.read_retries = max(1, int(read_retries))
         self.volume_path = str(volume_path)
         self.resolution = str(resolution)
         self.patches = tuple(patches)
@@ -944,7 +958,7 @@ class NativePatchDataset(Dataset):
         )
         bbox = (*starts, *stops)
         crop, valid_slices = read_bbox_with_padding(
-            self._ensure_volume(), bbox, fill_value=0
+            self._ensure_volume(), bbox, fill_value=0, read_retries=self.read_retries
         )
         crop = crop.astype(np.float32, copy=False)
         if valid_slices is not None:
@@ -1159,6 +1173,7 @@ def run_command(args) -> int:
         config=config,
         cache_dir=args.cache_dir,
         cache_max_gb=args.cache_max_gb,
+        read_retries=getattr(args, "read_retries", DEFAULT_READ_RETRIES),
     )
     run_native_inference(
         args=args,

@@ -38,8 +38,10 @@ from vesuvius.ink_detection.inference.inference_runtime import (
 from vesuvius.ink_detection.models.model import make_model
 from vesuvius.ink_detection.volume_io import (
     ZARR_V3,
+    DEFAULT_READ_RETRIES,
     open_volume,
     open_volume_root,
+    read_with_retry,
     select_volume_level,
 )
 from vesuvius.utils.cli import HyphenUnderscoreParser
@@ -341,11 +343,17 @@ def choose_pyramid_array(
     return selected, root[selected]
 
 
-def compute_nonempty_mask_from_lowres_array(array: Any) -> np.ndarray:
+def compute_nonempty_mask_from_lowres_array(
+    array: Any, *, read_retries: int = DEFAULT_READ_RETRIES
+) -> np.ndarray:
     """Collapse a 2D/3D low-resolution array to a 2D occupancy mask."""
 
     shape = tuple(int(value) for value in array.shape)
-    values = np.asarray(array[:])
+    values = read_with_retry(
+        lambda: np.asarray(array[:]),
+        retries=read_retries,
+        what="read of the occupancy scan level",
+    )
     if len(shape) == 2:
         return values != 0
     if len(shape) != 3:
@@ -360,6 +368,7 @@ def build_lowres_block_mask(
     height: int,
     width: int,
     user_mask: np.ndarray | None,
+    read_retries: int = DEFAULT_READ_RETRIES,
 ) -> tuple[np.ndarray | None, tuple[int, int], str | None]:
     """Combine group occupancy and user mask at occupancy resolution."""
 
@@ -373,7 +382,9 @@ def build_lowres_block_mask(
             preferred_key=DEFAULT_OCCUPANCY_SCAN_LEVEL,
             purpose="occupancy scan",
         )
-        occupancy = compute_nonempty_mask_from_lowres_array(occupancy_array)
+        occupancy = compute_nonempty_mask_from_lowres_array(
+            occupancy_array, read_retries=read_retries
+        )
         occupancy_h, occupancy_w = occupancy.shape
     scale_y = max(1, int(round(height / max(1, occupancy_h))))
     scale_x = max(1, int(round(width / max(1, occupancy_w))))
@@ -397,9 +408,11 @@ class FlatPatchReader:
         layer_indices: np.ndarray,
         output_depth: int,
         preprocessing: str,
+        read_retries: int = DEFAULT_READ_RETRIES,
     ) -> None:
         self.input_path = input_path
         self.resolution = str(resolution)
+        self.read_retries = max(1, int(read_retries))
         self.depth_axis_first = bool(depth_axis_first)
         self.height = int(height)
         self.width = int(width)
@@ -438,6 +451,13 @@ class FlatPatchReader:
         return self._array
 
     def _read_raw(self, y0: int, y1: int, x0: int, x1: int) -> np.ndarray:
+        return read_with_retry(
+            lambda: self._read_raw_once(y0, y1, x0, x1),
+            retries=self.read_retries,
+            what=f"read of rows {y0}:{y1} cols {x0}:{x1} from {self.input_path}",
+        )
+
+    def _read_raw_once(self, y0: int, y1: int, x0: int, x1: int) -> np.ndarray:
         array = self._ensure_array()
         if self.depth_axis_first:
             if self._read_mode == "ascending":
@@ -1012,6 +1032,7 @@ def infer_single_zarr(
         layer_indices=layer_indices,
         output_depth=configured_model.input_depth,
         preprocessing=configured_model.preprocessing,
+        read_retries=getattr(args, "read_retries", DEFAULT_READ_RETRIES),
     )
     mask = (
         None
@@ -1031,6 +1052,7 @@ def infer_single_zarr(
         height=height,
         width=width,
         user_mask=mask,
+        read_retries=getattr(args, "read_retries", DEFAULT_READ_RETRIES),
     )
     if occupancy is None:
         LOGGER.warning(
@@ -1311,6 +1333,17 @@ def parse_args(argv: Sequence[str] | None = None):
     )
     parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument(
+        "--read-retries",
+        type=int,
+        default=DEFAULT_READ_RETRIES,
+        help=(
+            "Attempts per patch read (default %(default)s). Transient remote "
+            "failures (truncated payloads, dropped connections, 429/5xx) are "
+            "retried with exponential backoff instead of aborting the run. "
+            "1 disables."
+        ),
+    )
+    parser.add_argument(
         "--overlap",
         type=float,
         default=DEFAULT_OVERLAP,
@@ -1348,6 +1381,8 @@ def parse_args(argv: Sequence[str] | None = None):
         parser.error("--num-workers must be nonnegative")
     if args.prefetch_factor <= 0:
         parser.error("--prefetch-factor must be positive")
+    if args.read_retries < 1:
+        parser.error("--read-retries must be >= 1")
     if args.batch_size <= 0:
         parser.error("--batch-size must be positive")
     if args.tta_batch_size is not None and args.tta_batch_size <= 0:

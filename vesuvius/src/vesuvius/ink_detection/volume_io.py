@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TypeVar
 
 import aiohttp
 import numpy as np
@@ -17,6 +19,55 @@ from vesuvius.data.utils import open_zarr as open_vesuvius_zarr
 
 _PUBLIC_S3_VOLUME_SUBSTRING = "vesuvius-challenge-open-data"
 ZARR_V3 = int(zarr.__version__.split(".", 1)[0]) >= 3
+LOGGER = logging.getLogger(__name__)
+
+# Attempts per chunk read. Streaming a published surface volume issues one
+# read per patch, and object stores drop connections routinely (truncated
+# payloads, SSL record failures, 5xx); without retries one hiccup discards a
+# multi-minute run. Same policy as vesuvius.data.volume (#1244).
+DEFAULT_READ_RETRIES = 4
+_READ_RETRY_INITIAL_DELAY_S = 0.5
+_READ_RETRY_MAX_DELAY_S = 8.0
+
+_T = TypeVar("_T")
+
+
+def read_with_retry(
+    read: Callable[[], _T],
+    *,
+    retries: int = DEFAULT_READ_RETRIES,
+    what: str = "chunk read",
+) -> _T:
+    """Call ``read()`` again after a transient remote failure.
+
+    Retries ``retries - 1`` times with exponential backoff (0.5 s doubling to
+    8 s). Transience is judged from the exception message across the cause
+    chain, because zarr/fsspec wrap aiohttp, botocore, urllib3 and ssl errors
+    differently; deterministic failures (bad index, missing array, auth) are
+    re-raised on the first attempt. ``retries=1`` disables retrying.
+    """
+    from vesuvius.data.volume import _is_transient_read_error
+
+    attempts = max(1, int(retries))
+    delay = _READ_RETRY_INITIAL_DELAY_S
+    for attempt in range(attempts):
+        try:
+            return read()
+        except Exception as exc:
+            if attempt == attempts - 1 or not _is_transient_read_error(exc):
+                raise
+            LOGGER.warning(
+                "transient error during %s (%s: %s); retry %d/%d in %.1fs",
+                what,
+                type(exc).__name__,
+                exc,
+                attempt + 1,
+                attempts - 1,
+                delay,
+            )
+            time.sleep(delay)
+            delay = min(delay * 2, _READ_RETRY_MAX_DELAY_S)
+    raise AssertionError("unreachable")
 
 
 def _cache_snapshot(cache_dir: Path) -> list[tuple[int, int, Path]]:
@@ -218,8 +269,12 @@ def read_bbox_with_padding(
     bbox_zyx: tuple[int, int, int, int, int, int],
     *,
     fill_value: int | float = 0,
+    read_retries: int = DEFAULT_READ_RETRIES,
 ) -> tuple[np.ndarray, tuple[slice, slice, slice] | None]:
-    """Read a positive ZYX bbox, padding only outside the array bounds."""
+    """Read a positive ZYX bbox, padding only outside the array bounds.
+
+    Transient remote read failures are retried (see :func:`read_with_retry`).
+    """
     z0, y0, x0, z1, y1, x1 = (int(value) for value in bbox_zyx)
     expected_shape = z1 - z0, y1 - y0, x1 - x0
     if any(size <= 0 for size in expected_shape):
@@ -230,12 +285,16 @@ def read_bbox_with_padding(
     output = np.full(expected_shape, fill_value, dtype=np.dtype(volume.dtype))
     if any(stop <= start for start, stop in zip(starts, stops)):
         return output, None
-    crop = np.asarray(
-        volume[
-            starts[0] : stops[0],
-            starts[1] : stops[1],
-            starts[2] : stops[2],
-        ]
+    crop = read_with_retry(
+        lambda: np.asarray(
+            volume[
+                starts[0] : stops[0],
+                starts[1] : stops[1],
+                starts[2] : stops[2],
+            ]
+        ),
+        retries=read_retries,
+        what=f"read of bbox {bbox_zyx}",
     )
     destination_starts = starts[0] - z0, starts[1] - y0, starts[2] - x0
     destination = tuple(
