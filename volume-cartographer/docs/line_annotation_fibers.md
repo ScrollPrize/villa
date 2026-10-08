@@ -262,8 +262,9 @@ the other rulers).
 The gaps between consecutive seams give a sheet-length estimate: the unit
 is seeded at the 25th percentile of the gaps, each gap is rounded to a
 whole number of sheets, and the unit becomes total gap length over total
-sheets (three refinements); the spread is the sample deviation of the
-per-sheet lengths. A gap read as k sheets gets k - 1 predicted seams spaced
+sheets, repeated until the counts stop changing (the estimate is withheld
+if they have not within 32 passes); the spread is the sample deviation of
+the per-sheet lengths. A gap read as k sheets gets k - 1 predicted seams spaced
 evenly across it, and the "ahead" spinbox (default 3) extrapolates that
 many seams past the last tagged one, one unit apart, with a spread that
 grows with the square root of the sheets stepped. Predictions draw in
