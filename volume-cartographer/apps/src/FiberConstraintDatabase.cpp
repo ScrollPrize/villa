@@ -1,6 +1,7 @@
 #include "FiberConstraintDatabase.hpp"
 #include "vc/fiber_tracer/FiberNormalOrientation.hpp"
 #include "vc/fiber_tracer/PolylineGeometry.hpp"
+#include "vc/core/util/AtomicFile.hpp"
 #include <sqlite3.h>
 #include <algorithm>
 #include <chrono>
@@ -148,7 +149,7 @@ nlohmann::json orientFiberConstraintDatabase(
     const std::vector<int64_t>& sourceIds,
     const std::vector<vc::fiber_tracer::FiberletCropTraceLine>& lines,
     const vc::lasagna::LasagnaNormalSampler& normals, int threads,
-    double sampleSpacing, const Json& provenance)
+    double sampleSpacing, const Json& provenance, const vc::core::util::Umbilicus* priorUmbilicus)
 {
     using namespace vc::fiber_tracer;
     using Clock=std::chrono::steady_clock;
@@ -182,8 +183,10 @@ nlohmann::json orientFiberConstraintDatabase(
         if(sqlite3_step(s.get())!=SQLITE_ROW)throw std::runtime_error("Missing source metadata");
         return Json::parse(reinterpret_cast<const char*>(sqlite3_column_text(s.get(),0)));
     };
-    if(metaValue("format")!="fiber-constraints" || metaValue("schema_version")!=1 || metaValue("complete")!=true)
-        throw std::runtime_error("Orientation requires a complete schema1 constraint database");
+    if(metaValue("format")!="fiber-constraints" || metaValue("schema_version")!=(priorUmbilicus?2:1) || metaValue("complete")!=true)
+        throw std::runtime_error("Orientation requires schema1; prior extraction requires oriented schema2");
+    if(priorUmbilicus && metaValue("normal_orientation").at("sample_spacing_base")!=sampleSpacing)
+        throw std::runtime_error("Prior sweep spacing must match baked orientation");
     const auto original=metaValue("provenance");
     for(const char* key:{"afv_uuid","normal_manifest","normal_provenance"})
         if(original.at(key)!=provenance.at(key))throw std::runtime_error(std::string("Source mismatch: ")+key);
@@ -223,12 +226,13 @@ nlohmann::json orientFiberConstraintDatabase(
     }
     check(src.get(),rc);query.reset();fiberQuery.reset();
     std::vector<cv::Vec3d> baked(2*events);
+    std::vector<double> priorSum(lines.size(),0.),priorWeight(lines.size(),0.);
     std::vector<unsigned char> valid(2*events,0);
     size_t samplesTotal=0,flips=0,endpointFlips=0,invalid=0,invalidEndpoints=0,invalidFibers=0;
     double sampleSeconds=0.;
     const auto sweepStarted=Clock::now();
     for(size_t begin=0;begin<lines.size();begin+=256) {
-        struct Sample { double arc; cv::Vec3d point; size_t slot; };
+        struct Sample { double arc; cv::Vec3d point; size_t slot; double weight=0.; };
         const size_t end=std::min(begin+256,lines.size()), regular=std::numeric_limits<size_t>::max();
         std::vector<Sample> ordered;std::vector<size_t> offsets{0};
         for(size_t i=begin;i<end;++i) {
@@ -237,6 +241,11 @@ nlohmann::json orientFiberConstraintDatabase(
             for(double arc=0;arc<geometry.length();arc+=sampleSpacing)
                 ordered.push_back({arc,samplePolylineArc(geometry,arc).point,regular});
             ordered.push_back({geometry.length(),samplePolylineArc(geometry,geometry.length()).point,regular});
+            for(size_t j=first;j<ordered.size();++j) {
+                const double left=j==first?ordered[j].arc:ordered[j-1].arc;
+                const double right=j+1==ordered.size()?ordered[j].arc:ordered[j+1].arc;
+                ordered[j].weight=(right-left)*.5;
+            }
             for(const auto& e:endpoints[i])ordered.push_back({e.arc,e.point,e.slot});
             std::stable_sort(ordered.begin()+first,ordered.end(),[](const auto& a,const auto& b){return a.arc<b.arc;});
             offsets.push_back(ordered.size());
@@ -256,6 +265,15 @@ nlohmann::json orientFiberConstraintDatabase(
                     throw std::runtime_error("Non-unit valid normal");
                 const bool flipped=sweep.orient(n,ok);
                 flips+=flipped;invalid+=!ok;good+=ok;
+                if(priorUmbilicus && ok && ordered[j].weight>0.) {
+                    const cv::Vec3f p(ordered[j].point);
+                    const cv::Vec3d radial(-priorUmbilicus->vector_to_umbilicus(p));
+                    const double r=cv::norm(radial);
+                    if(r>0.) {
+                        priorSum[begin+f]+=ordered[j].weight*n.dot(radial/r);
+                        priorWeight[begin+f]+=ordered[j].weight;
+                    }
+                }
                 if(ordered[j].slot!=regular) {
                     const auto slot=ordered[j].slot;baked[slot]=n;valid[slot]=ok;
                     endpointFlips+=flipped;invalidEndpoints+=!ok;
@@ -268,6 +286,37 @@ nlohmann::json orientFiberConstraintDatabase(
             <<" samples="<<samplesTotal<<" seconds="<<std::chrono::duration<double>(Clock::now()-sweepStarted).count()<<std::endl;
     }
     const double sweepSeconds=std::chrono::duration<double>(Clock::now()-sweepStarted).count();
+    if(priorUmbilicus) {
+        // Verify the gauge against ALL stored endpoint normals before exporting priors.
+        query=prepare(src.get(),"SELECT normal_a,normal_b FROM constraints ORDER BY id");
+        size_t count=0;
+        while((rc=sqlite3_step(query.get()))==SQLITE_ROW) {
+            for(int side=0;side<2;++side) {
+                const auto slot=2*count+side;
+                const auto n=Json::parse(reinterpret_cast<const char*>(sqlite3_column_text(query.get(),side)));
+                if(n.at("valid").get<bool>()!=bool(valid[slot]))throw std::runtime_error("Prior endpoint validity mismatch");
+                if(valid[slot]) {
+                    const auto& p=n.at("xyz");const cv::Vec3d old{p[0].get<double>(),p[1].get<double>(),p[2].get<double>()};
+                    if(cv::norm(old-baked[slot])>1e-12)throw std::runtime_error("Prior sweep differs from baked normal gauge");
+                }
+            }
+            ++count;
+        }
+        check(src.get(),rc);if(count!=events)throw std::runtime_error("Prior endpoint count mismatch");
+        std::vector<double> agreement(lines.size());
+        for(size_t i=0;i<lines.size();++i)agreement[i]=priorWeight[i]>0?priorSum[i]/priorWeight[i]:0.;
+        Json stats={{"fibers",fiberCount},{"checked_endpoints",2*events},{"sample_spacing_base",sampleSpacing},
+            {"invalid_samples",invalid},{"sweep_seconds",sweepSeconds},
+            {"total_seconds",std::chrono::duration<double>(Clock::now()-started).count()}};
+        Json document={{"format","fiber-outward-priors"},{"version",1},{"source_database",input.string()},
+            {"source_database_sha256",provenance.at("config").at("source_database_sha256")},
+            {"umbilicus_sha256",provenance.at("config").at("umbilicus_sha256")},
+            {"source_ids",sourceIds},{"agreement",agreement},{"valid_arc_weight",priorWeight},
+            {"provenance",provenance},{"statistics",stats}};
+        std::filesystem::create_directories(output.parent_path());
+        vc::core::util::ephemeralWriteString(output,document.dump()+"\n");
+        return stats;
+    }
     std::filesystem::create_directories(output.parent_path());
     auto dst=open(partial,SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE);
     std::cout<<"orientation: cloning original database"<<std::endl;

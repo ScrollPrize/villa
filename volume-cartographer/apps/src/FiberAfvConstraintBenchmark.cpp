@@ -2,6 +2,7 @@
 #include "FiberConstraintDatabase.hpp"
 #include "vc/core/types/FiberCollection.hpp"
 #include "vc/core/util/AtomicFile.hpp"
+#include "vc/core/util/ScrollUmbilicus.hpp"
 #include "vc/fiber_tracer/FiberTraceConstraints.hpp"
 #include "vc/fiber_tracer/PolylineGeometry.hpp"
 #include "vc/lasagna/ChannelSampler.hpp"
@@ -154,10 +155,22 @@ int runFiberAfvConstraintBenchmark(int argc, char** argv)
     if(cfg.contains("orient_database")) {
         if(repetitions!=1 || cfg.contains("compare_database"))
             throw std::invalid_argument("Orientation is one second pass, not extraction/comparison");
+        std::optional<vc::core::util::Umbilicus> umbilicus;
+        if(cfg.contains("normal_prior_output")) {
+            const auto& shape=root.at("coordinate_base_shape_zyx");
+            auto loaded=vc::core::util::loadUmbilicusWithFrameCheck(cfg.at("umbilicus").get<std::string>(),
+                {shape[2].get<double>(),shape[1].get<double>(),shape[0].get<double>()},
+                {shape[0].get<int>(),shape[1].get<int>(),shape[2].get<int>()},
+                vc::core::util::UmbilicusTargetGridAuthority::Authoritative,root.at("voxel_size_mm").get<double>()*1000.);
+            if(!loaded.umbilicus || !loaded.warning.empty() || loaded.scaleDescription.empty())
+                throw std::runtime_error("Umbilicus frame not verified: "+loaded.error+loaded.warning);
+            result["umbilicus_frame"]=loaded.scaleDescription;
+            umbilicus=std::move(loaded.umbilicus);
+        }
         result["orientation"]=orientFiberConstraintDatabase(
-            cfg.at("orient_database").get<std::string>(),cfg.at("database").get<std::string>(),
+            cfg.at("orient_database").get<std::string>(),cfg.at(umbilicus?"normal_prior_output":"database").get<std::string>(),
             std::vector<int64_t>(ids.begin(),ids.end()),lines,normals,threads,
-            cfg.value("normal_sample_spacing",spacing),result);
+            cfg.value("normal_sample_spacing",spacing),result,umbilicus?&*umbilicus:nullptr);
         result["wall_seconds"]=seconds(started);
         vc::core::util::ephemeralWriteString(output,result.dump(2)+"\n");
         std::cout<<"orientation complete "<<result["orientation"].dump()<<std::endl;
