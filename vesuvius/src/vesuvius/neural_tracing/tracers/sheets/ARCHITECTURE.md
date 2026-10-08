@@ -215,7 +215,8 @@ training it is the episode's reachable GT region, padded by `view_radius + reset
   from before it (`nn.MultiheadAttention` blocks) load with their weights renamed (`model.upgrade_state`).
 * There are no positional embeddings other than the geometry features above. The model is independent of `N`.
 
-**Crop encoders** (`CropEncoder`) are a stack of ResNet-D basic blocks
+**Crop encoders** (`model.crop_encoder`: the shared `models.blocks.CropCNN` with GroupNorm, GELU, conv biases in every
+stage and its one-token-per-crop head) are a stack of ResNet-D basic blocks
 (`vesuvius.models.build.resblocks.BasicBlockD`). Each block has two 3x3x3 convs, each followed by `GroupNorm(4)` and
 GELU, plus a skip path that is pooled and projected when the shape changes. The point encoder then has a 1x1 conv to
 32 channels, followed by GroupNorm and GELU. Both encoders end by flattening and a `Linear` to 256.

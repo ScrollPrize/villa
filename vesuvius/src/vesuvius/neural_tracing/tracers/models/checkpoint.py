@@ -11,7 +11,7 @@ from vesuvius.neural_tracing.tracers.models.model import MODEL_TYPES, RETIRED_FI
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolumeSpec
 from vesuvius.neural_tracing.tracers.shared.io import atomic_torch_save
 from vesuvius.neural_tracing.tracers.shared.paths import relocate_checkpoint
-from vesuvius.neural_tracing.tracers.models.weights import conv_memory_format, load_matching_weights
+from vesuvius.neural_tracing.tracers.models.weights import conv_memory_format, load_matching_weights, upgrade_state
 
 
 def write_checkpoint(path, model, vol_spec, crop, n_history, model_type, extra=None):
@@ -30,6 +30,9 @@ def read_checkpoint(path, device='cuda'):
         detail = f'model fields {", ".join(unknown)}' if unknown else f'model type {model_type!r}'
         raise ValueError(f'Unsupported checkpoint {path} ({detail}); checkpoints from before the model cleanup need '
                          'scripts/convert_checkpoint.py')
+    for key in ('model', 'ema'):  # weights of earlier layouts under their current names
+        if isinstance(ck.get(key), dict):
+            ck[key] = upgrade_state(ck[key])
     return ck
 
 

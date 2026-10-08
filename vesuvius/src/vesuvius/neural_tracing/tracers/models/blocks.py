@@ -1,7 +1,9 @@
-"""Building blocks shared by the tracers' models: the residual crop CNN, the pre-norm transformer layer's weights and
-head split/merge, and plain self-attention over a token set (the sheet tracer). The crop transformer
-(models/crop_transformer.py) and the sequence follower (models/sequence.py) subclass the layer to define which
-tokens attend to which."""
+"""Building blocks shared by the tracers' models: the residual crop CNN (feature map, per-cell tokens or one token per
+crop), the two-layer MLP of the token embeddings, the pre-norm transformer layer's weights and head split/merge, and
+plain self-attention over a token set (the sheet tracer). The crop transformer (models/crop_transformer.py) and the
+sequence follower (models/sequence.py) subclass the layer to define which tokens attend to which."""
+import math
+
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -11,25 +13,80 @@ LOGIT_SCALE_LR_SCALE = 10.  # LR multiple of the attention logit scales' optimiz
 from vesuvius.models.build.resblocks import BasicBlockD, StackedResidualBlocks
 
 
+def _group_norm(channels: int, **kwargs) -> nn.GroupNorm:
+    """GroupNorm with 4 groups (1 when the channels do not divide by 4)."""
+    return nn.GroupNorm(4 if channels % 4 == 0 else 1, channels, **kwargs)
+
+
+CNN_NORMS = dict(instance=(nn.InstanceNorm3d, dict(eps=1e-5, affine=True)), group=(_group_norm, {}))
+CNN_NONLINS = dict(relu=(nn.ReLU, dict(inplace=True)), gelu=(nn.GELU, {}))
+
+
 class CropCNN(nn.Module):
-    """Residual CNN stages (channels, initial stride, blocks per stage) over a one-channel crop; the first stage's
-    convolutions carry biases."""
-    def __init__(self, channels, strides, blocks):
+    """Residual CNN stages of ResNet-D basic blocks (channels, initial stride, blocks per stage) over a one-channel
+    crop, and optionally a head that turns its feature map into tokens of width ``dim``.
+
+    ``norm``: 'instance' (InstanceNorm3d, affine) or 'group' (GroupNorm, 4 groups); ``nonlin``: 'relu' or 'gelu';
+    ``conv_bias``: 'first' (only the first stage's convolutions carry biases) or 'all'. ``head``: None (``forward``
+    returns the feature map), 'cells' (one token per feature-map cell, (B, cells, dim), a Linear of the channels) or
+    'crop' (one token per crop, (B, dim): an optional 1x1 conv to ``bottleneck`` channels with the same norm and
+    nonlinearity, then flatten and a Linear; needs the ``crop`` size, which must divide by 2 per stride-2 stage).
+    ``features`` and ``tokens`` run the two halves separately, for models that read the feature map as well."""
+    def __init__(self, channels, strides, blocks, *, norm='instance', nonlin='relu', conv_bias='first', head=None,
+                 dim=None, crop=None, bottleneck=0):
         super().__init__()
-        options = dict(conv_op=nn.Conv3d, kernel_size=3, norm_op=nn.InstanceNorm3d,
-                       norm_op_kwargs=dict(eps=1e-5, affine=True), nonlin=nn.ReLU, nonlin_kwargs=dict(inplace=True),
-                       block=BasicBlockD)
+        if conv_bias not in ('first', 'all') or head not in (None, 'cells', 'crop') or (head and not dim):
+            raise ValueError(f'CropCNN: conv_bias {conv_bias!r}, head {head!r}, dim {dim!r}')
+        norm_op, norm_kwargs = CNN_NORMS[norm]
+        nonlin_op, nonlin_kwargs = CNN_NONLINS[nonlin]
+        options = dict(conv_op=nn.Conv3d, kernel_size=3, norm_op=norm_op, norm_op_kwargs=norm_kwargs, nonlin=nonlin_op,
+                       nonlin_kwargs=nonlin_kwargs, block=BasicBlockD)
         inputs = (1, *channels[:-1])
         self.stages = nn.ModuleList(
-            StackedResidualBlocks(n_blocks=n, input_channels=i, output_channels=c, initial_stride=s, conv_bias=not index,
-                                  **options)
+            StackedResidualBlocks(n_blocks=n, input_channels=i, output_channels=c, initial_stride=s,
+                                  conv_bias=conv_bias == 'all' or not index, **options)
             for index, (i, c, s, n) in enumerate(zip(inputs, channels, strides, blocks)))
+        self.head_kind = head
+        width = channels[-1]
+        if head == 'cells':
+            self.head = nn.Linear(width, dim)
+        elif head == 'crop':
+            if bottleneck:
+                self.bottleneck = nn.Sequential(nn.Conv3d(width, bottleneck, 1), norm_op(bottleneck, **norm_kwargs),
+                                                nonlin_op(**nonlin_kwargs))
+                width = bottleneck
+            shape = [int(c)//2**sum(int(s) == 2 for s in strides) for c in crop]
+            self.head = nn.Linear(width*math.prod(shape), dim)
 
-    def forward(self, image):
+    def features(self, image):
+        """The feature map (B, C, D', H', W') of crops (B, 1, D, H, W)."""
         x = image
         for stage in self.stages:
             x = stage(x)
         return x
+
+    def tokens(self, features):
+        """The head's tokens from a feature map of ``features``."""
+        if self.head_kind == 'cells':
+            return self.head(features.flatten(2).transpose(1, 2))
+        if hasattr(self, 'bottleneck'):
+            features = self.bottleneck(features)
+        return self.head(features.flatten(1))
+
+    def forward(self, image):
+        x = self.features(image)
+        return x if self.head_kind is None else self.tokens(x)
+
+
+class MLP(nn.Sequential):
+    """Linear, nonlinearity, Linear: ``inputs`` -> ``hidden`` (default ``outputs``) -> ``outputs``; ``zero_last``:
+    the last Linear starts at zero (the branch starts switched off). Layer names ``0`` and ``2`` as nn.Sequential."""
+    def __init__(self, inputs, outputs, nonlin=nn.SiLU, hidden=None, zero_last=False):
+        hidden = hidden or outputs
+        super().__init__(nn.Linear(inputs, hidden), nonlin(), nn.Linear(hidden, outputs))
+        if zero_last:
+            nn.init.zeros_(self[-1].weight)
+            nn.init.zeros_(self[-1].bias)
 
 
 class TransformerLayer(nn.Module):
@@ -49,7 +106,7 @@ class TransformerLayer(nn.Module):
             self.logit_scale = nn.Parameter(torch.zeros(heads))
         self.qkv = nn.Linear(width, 3*width)
         self.out = nn.Linear(width, width)
-        self.ffn = nn.Sequential(nn.Linear(width, ffn), nn.GELU(), nn.Linear(ffn, width))
+        self.ffn = MLP(width, width, nn.GELU, hidden=ffn)
 
     def split(self, x):
         b, n, width = x.shape

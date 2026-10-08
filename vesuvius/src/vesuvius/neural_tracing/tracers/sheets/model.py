@@ -1,7 +1,7 @@
 """The front model: a CT crop per front point and a grid of CT tokens along the front curve, read by one transformer.
 
-Each point token is its CT crop embedding (a residual CNN of ResNet-D basic blocks,
-``vesuvius.models.build.resblocks.BasicBlockD``, a 1x1 conv to ``point_bottleneck`` channels, then a Linear) plus
+Each point token is its CT crop embedding (``models.blocks.CropCNN``: residual ResNet-D stages with GroupNorm and
+GELU, a 1x1 conv to ``point_bottleneck`` channels, then a Linear) plus
 rotation-invariant geometry (position and frame in the front frame, place along the front, previous confidence).
 The grid holds small CT crops along the curve (columns) for the current row and the last ``memory_rows`` rows, each
 through its own residual CNN plus its geometry. One transformer runs full self-attention over the point and grid
@@ -13,15 +13,11 @@ advance and normal axes; it starts at zero (straight advance, Catmull-Rom tangen
 """
 from __future__ import annotations
 
-import math
-from functools import partial
-
 import torch
 from torch import nn
 
-from vesuvius.models.build.resblocks import BasicBlockD
 from vesuvius.neural_tracing.tracers.sheets.data.episodes import FIBER_CODE_DIM
-from vesuvius.neural_tracing.tracers.models.blocks import SelfAttentionLayer
+from vesuvius.neural_tracing.tracers.models.blocks import MLP, CropCNN, SelfAttentionLayer
 from vesuvius.neural_tracing.tracers.models.weights import load_matching_weights
 from vesuvius.neural_tracing.tracers.shared.compile import compile_options
 
@@ -32,32 +28,12 @@ TOKEN_FEATURES = 17
 FIBER_FEATURES = 3+3+2+1+FIBER_CODE_DIM
 
 
-def _groups(channels: int) -> int:
-    return 4 if channels % 4 == 0 else 1
-
-
-class CropEncoder(nn.Module):
-    """Crop CNN of ResNet-D basic blocks (one per stage: two 3x3x3 convs, GroupNorm(4), GELU, a pooled/projected
+def crop_encoder(crop, channels, strides, dim: int, bottleneck: int = 0) -> CropCNN:
+    """One token per crop: a ResNet-D basic block per stage (two 3x3x3 convs, GroupNorm(4), GELU, a pooled/projected
     skip), optionally a 1x1 conv to ``bottleneck`` channels, then flatten and Linear to ``dim``. Every crop size
-    must be divisible by 2 per stride-2 stage (the skip pools by flooring, the conv by ceiling)."""
-
-    def __init__(self, crop, channels, strides, dim: int, bottleneck: int = 0):
-        super().__init__()
-        norm = partial(nn.GroupNorm, 4)
-        layers, c_in, shape = [], 1, [int(c) for c in crop]
-        for c, stride in zip(channels, strides):
-            layers.append(BasicBlockD(nn.Conv3d, c_in, c, 3, int(stride), conv_bias=True, norm_op=norm, nonlin=nn.GELU))
-            if int(stride) == 2:
-                shape = [s//2 for s in shape]
-            c_in = c
-        if bottleneck:
-            layers += [nn.Conv3d(c_in, bottleneck, 1), nn.GroupNorm(_groups(bottleneck), bottleneck), nn.GELU()]
-            c_in = bottleneck
-        self.net = nn.Sequential(*layers)
-        self.proj = nn.Linear(c_in*math.prod(shape), dim)
-
-    def forward(self, x):
-        return self.proj(self.net(x).flatten(1))
+    must be divisible by 2 per stride-2 stage."""
+    return CropCNN(channels, strides, (1,)*len(channels), norm='group', nonlin='gelu', conv_bias='all', head='crop',
+                   dim=dim, crop=crop, bottleneck=bottleneck)
 
 
 class SheetTracer(nn.Module):
@@ -65,15 +41,15 @@ class SheetTracer(nn.Module):
         super().__init__()
         self.cfg = cfg
         dim = cfg.dim
-        self.encoder = CropEncoder(cfg.crop, cfg.channels, cfg.strides, dim, cfg.point_bottleneck)
-        self.point_geometry = nn.Sequential(nn.Linear(POINT_FEATURES, dim), nn.GELU(), nn.Linear(dim, dim))
+        self.encoder = crop_encoder(cfg.crop, cfg.channels, cfg.strides, dim, cfg.point_bottleneck)
+        self.point_geometry = MLP(POINT_FEATURES, dim, nn.GELU)
         self.blocks = nn.ModuleList(SelfAttentionLayer(dim, cfg.heads, int(dim*cfg.mlp_ratio), cfg.qk_norm, cfg.qk_logit_scale)
                                     for _ in range(cfg.layers))
         self.token_type = nn.Parameter(torch.randn(2, dim)*.02)  # point / grid tokens
-        self.token_encoder = CropEncoder(cfg.token_crop, cfg.token_channels, cfg.token_strides, dim)
-        self.token_geometry = nn.Sequential(nn.Linear(TOKEN_FEATURES, dim), nn.GELU(), nn.Linear(dim, dim))
+        self.token_encoder = crop_encoder(cfg.token_crop, cfg.token_channels, cfg.token_strides, dim)
+        self.token_geometry = MLP(TOKEN_FEATURES, dim, nn.GELU)
         if cfg.fiber_tokens:  # fiber points near the front as a third kind of token
-            self.fiber_geometry = nn.Sequential(nn.Linear(FIBER_FEATURES, dim), nn.GELU(), nn.Linear(dim, dim))
+            self.fiber_geometry = MLP(FIBER_FEATURES, dim, nn.GELU)
             self.fiber_type = nn.Parameter(torch.randn(dim)*.02)
         if cfg.fiber_follow_mode:  # 0: sheet tracing, 1: following a fiber; zero, so it starts as the checkpoint
             self.mode_embed = nn.Parameter(torch.zeros(2, dim))
@@ -133,20 +109,43 @@ def build_model(cfg) -> SheetTracer:
 # named LayerNorms, an MLP with a dropout layer); old checkpoints load renamed (``upgrade_state``).
 LEGACY_BLOCK_NAMES = (('.n_self.', '.norm1.'), ('.self_attn.in_proj_', '.qkv.'), ('.self_attn.out_proj.', '.out.'),
                       ('.n_mlp.', '.norm2.'), ('.mlp.0.', '.ffn.0.'), ('.mlp.3.', '.ffn.2.'))
+ENCODERS = ('encoder', 'token_encoder')
 
 
 def legacy_state(saved: dict) -> bool:
-    """Whether ``saved`` predates the shared transformer layer."""
+    """Whether ``saved`` predates the shared transformer layer (its optimizer state does not match the model). The
+    crop encoders' renaming (``_encoder_renames``) keeps parameter order and shapes, so it does not count."""
     return any(old in key for key in saved for old, _ in LEGACY_BLOCK_NAMES)
 
 
+def _encoder_renames(saved: dict) -> dict:
+    """Old -> new key prefixes of the crop encoders from before models.blocks.CropCNN (``net.K`` a residual stage
+    while it has ``conv1``, then the bottleneck's conv and norm; ``proj`` the head)."""
+    renames = {}
+    for e in ENCODERS:
+        stages = sorted({int(k.split('.')[2]) for k in saved if k.startswith(f'{e}.net.') and '.conv1.' in k})
+        for i in stages:
+            renames[f'{e}.net.{i}.'] = f'{e}.stages.{i}.blocks.0.'
+        nxt = len(stages)
+        renames[f'{e}.net.{nxt}.'] = f'{e}.bottleneck.0.'  # the 1x1 conv, its norm (the GELU has no weights)
+        renames[f'{e}.net.{nxt+1}.'] = f'{e}.bottleneck.1.'
+        renames[f'{e}.proj.'] = f'{e}.head.'
+    return renames
+
+
 def upgrade_state(saved: dict) -> dict:
-    """``saved`` with transformer block weights of the earlier layer renamed for SelfAttentionLayer (same tensors:
-    ``in_proj`` holds q, k, v in the order ``qkv`` splits them)."""
+    """``saved`` with weights of earlier layouts renamed (same tensors): transformer blocks of the earlier layer for
+    SelfAttentionLayer (``in_proj`` holds q, k, v in the order ``qkv`` splits them), and the earlier crop encoders
+    for models.blocks.CropCNN."""
+    encoders = _encoder_renames(saved)
+
     def rename(key):
         for old, new in LEGACY_BLOCK_NAMES:
             if key.startswith('blocks.') and old in key:
                 return key.replace(old, new)
+        for old, new in encoders.items():
+            if key.startswith(old):
+                return new+key[len(old):]
         return key
     return {rename(k): v for k, v in saved.items()}
 

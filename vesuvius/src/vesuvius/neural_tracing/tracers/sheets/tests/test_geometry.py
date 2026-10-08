@@ -438,6 +438,28 @@ def test_model_rollout_trains_every_part():
     assert model.token_type.grad.abs().sum() > 0
 
 
+def test_checkpoints_from_before_the_shared_crop_cnn_load_renamed():
+    """Encoder weights from before models.blocks.CropCNN (``net.K`` stages, then the bottleneck's conv and norm;
+    ``proj``) load under their new names (stages, bottleneck, head), unchanged."""
+    import re
+    from vesuvius.neural_tracing.tracers.sheets.model import load_model_state
+    cfg = C.load(None, SMALL)
+    torch.manual_seed(0)
+    model = build_model(cfg)
+    n = len(cfg.model.channels)
+
+    def old(key):
+        key = re.sub(r'^(encoder|token_encoder)\.stages\.(\d+)\.blocks\.0\.', r'\1.net.\2.', key)
+        key = re.sub(r'^encoder\.bottleneck\.(\d)\.', lambda m: f'encoder.net.{n+int(m[1])}.', key)
+        return re.sub(r'^(encoder|token_encoder)\.head\.', r'\1.proj.', key)
+    saved = {old(k): v for k, v in model.state_dict().items()}
+    assert 'encoder.net.3.weight' in saved and 'token_encoder.proj.weight' in saved
+    torch.manual_seed(1)
+    other = build_model(cfg)
+    load_model_state(other, saved)
+    assert all(torch.equal(a, b) for a, b in zip(model.state_dict().values(), other.state_dict().values()))
+
+
 def test_config_rejects_bad_crops_and_removed_model_types():
     with pytest.raises(ValueError):
         C.load(None, SMALL+['model.crop=[8,16,10]'])  # 10 is not divisible by 4 (two stride-2 stages)

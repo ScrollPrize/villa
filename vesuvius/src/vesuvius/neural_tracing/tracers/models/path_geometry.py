@@ -13,6 +13,7 @@ import numpy as np
 import torch
 from torch import nn
 
+from vesuvius.neural_tracing.tracers.models.blocks import MLP
 from vesuvius.neural_tracing.tracers.shared.geometry import arclength, interp_at
 from vesuvius.neural_tracing.tracers.shared.reference import observed_path
 
@@ -62,9 +63,7 @@ class PathGeometryTokens(nn.Module):
         super().__init__()
         self.register_buffer('frequencies', 2*math.pi/torch.tensor(SCALES), persistent=False)
         width = 3*2*len(SCALES)+FEATURES
-        self.embed = nn.Sequential(nn.Linear(width, cfg.hidden), nn.SiLU(), nn.Linear(cfg.hidden, cfg.hidden))
-        nn.init.zeros_(self.embed[-1].weight)
-        nn.init.zeros_(self.embed[-1].bias)
+        self.embed = MLP(width, cfg.hidden, zero_last=True)
 
     def forward(self, geometry, valid):
         geometry = torch.where(valid[..., None], geometry.float(), 0.)

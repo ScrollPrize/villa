@@ -32,7 +32,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from vesuvius.neural_tracing.tracers.models.blocks import CropCNN, TransformerLayer
+from vesuvius.neural_tracing.tracers.models.blocks import MLP, CropCNN, TransformerLayer
 from vesuvius.neural_tracing.tracers.models.flow import FlowMatching, FlowOptions, time_embedding
 from vesuvius.neural_tracing.tracers.models.follower import (
     REFERENCE_METADATA, FollowerConfig, path_readout, plane_coordinates, proposal_output, read_path,
@@ -140,10 +140,9 @@ class CropTransformer(nn.Module):
         super().__init__()
         self.cfg, self.model_type = cfg, cfg.model_type
         h, cells = cfg.hidden, cfg.cnn_channels[-1]
-        self.cnn = CropCNN(cfg.cnn_channels, (2,)*len(cfg.cnn_channels), cfg.cnn_blocks)
-        self.cell_token = nn.Linear(cells, h)
-        self.cell_position = nn.Sequential(nn.Linear(3, h), nn.SiLU(), nn.Linear(h, h))
-        self.reference_token = nn.Sequential(nn.Linear(cells+REFERENCE_METADATA, h), nn.SiLU(), nn.Linear(h, h))
+        self.cnn = CropCNN(cfg.cnn_channels, (2,)*len(cfg.cnn_channels), cfg.cnn_blocks, head='cells', dim=h)
+        self.cell_position = MLP(3, h)
+        self.reference_token = MLP(cells+REFERENCE_METADATA, h)
         self.path_geometry = PathGeometryTokens(cfg)
         self.kind = nn.Parameter(torch.zeros(5, h))  # CELL, REFERENCE, GEOMETRY, PATH, SCORED
         nn.init.normal_(self.kind, std=.02)
@@ -164,8 +163,8 @@ class CropTransformer(nn.Module):
     def context(self, x, hist, hmask):
         """Every layer's context keys/values for one decision per row, and its CNN cells."""
         cfg = self.cfg
-        cells = self.cnn(x['fine'])
-        tokens = self.cell_token(cells.flatten(2).transpose(1, 2))
+        cells = self.cnn.features(x['fine'])
+        tokens = self.cnn.tokens(cells)
         dtype = tokens.dtype
         tokens = tokens+self.cell_position(self.cell_xyz/16.).to(dtype)+self.kind[CELL].to(dtype)
         ctx = dict(cells=cells)
@@ -228,14 +227,14 @@ class RegressionFollower(CropTransformer):
         super().__init__(cfg)
         h, cells = cfg.hidden, cfg.cnn_channels[-1]
         # CNN evidence and support at the centerline, forward distance.
-        self.query = nn.Sequential(nn.Linear(cells+2, h), nn.SiLU(), nn.Linear(h, h))
+        self.query = MLP(cells+2, h)
         self.coordinates, self.hazard = path_readout(h)
         if cfg.scoring_pass:
             # CNN evidence and support at a finished proposal, its coordinates (hazard_logits; readout self.hazard).
-            self.score = nn.Sequential(nn.Linear(cells+1+3, h), nn.SiLU(), nn.Linear(h, h))
+            self.score = MLP(cells+1+3, h)
         if cfg.recurrent_refinement_steps:
             # CNN evidence and support at the proposal, its coordinates, detached failure/survival.
-            self.refinement_fusion = nn.Sequential(nn.Linear(cells+1+3+2, h), nn.SiLU(), nn.Linear(h, h))
+            self.refinement_fusion = MLP(cells+1+3+2, h)
             self.refinement_stage = nn.Embedding(cfg.recurrent_refinement_steps, h)
             nn.init.zeros_(self.refinement_stage.weight)
 
@@ -293,8 +292,8 @@ class FlowFollower(FlowMatching, CropTransformer):
         self.init_flow(cfg)
         h, cells = cfg.hidden, cfg.cnn_channels[-1]
         # CNN evidence and support at the noisy path, its residual-scale coordinates, forward distance.
-        self.query = nn.Sequential(nn.Linear(cells+1+2+1, h), nn.SiLU(), nn.Linear(h, h))
-        self.time = nn.Sequential(nn.Linear(64, h), nn.SiLU(), nn.Linear(h, h))
+        self.query = MLP(cells+1+2+1, h)
+        self.time = MLP(64, h)
         # Per layer: shift/scale/gate of the attention and FFN branches; then the final norm's shift/scale.
         self.time_modulation = nn.ModuleList(nn.Linear(h, 6*h) for _ in range(cfg.layers))
         self.output_modulation = nn.Linear(h, 2*h)
@@ -305,7 +304,7 @@ class FlowFollower(FlowMatching, CropTransformer):
         nn.init.normal_(self.velocity.weight, std=.01)
         nn.init.zeros_(self.velocity.bias)
         # CNN evidence and support at a finished proposal, its coordinates.
-        self.score = nn.Sequential(nn.Linear(cells+1+3, h), nn.SiLU(), nn.Linear(h, h))
+        self.score = MLP(cells+1+3, h)
         self.hazard = nn.Linear(h, 1)
 
     def velocity_field(self, ctx, y, t):

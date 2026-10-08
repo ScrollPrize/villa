@@ -58,7 +58,7 @@ def test_regression_forward_is_deterministic_causal_and_trainable():
         assert torch.isfinite(other[key]).all(), key
         torch.testing.assert_close(out[key], other[key], rtol=0, atol=0)
     loss_terms(out, b, m.cfg)['geometry_per_state'].mean().backward()
-    for module in (m.coordinates, m.cnn.stages[0].blocks[0].conv1.conv, m.cell_token, m.reference_token[0]):
+    for module in (m.coordinates, m.cnn.stages[0].blocks[0].conv1.conv, m.cnn.head, m.reference_token[0]):
         assert module.weight.grad is not None and module.weight.grad.abs().sum() > 0
     assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in m.path_geometry.parameters())
 
@@ -214,7 +214,22 @@ def test_checkpoint_resume_and_init_weights(tmp_path):
     report = wider.initialization_report
     assert report['mismatched'] and all('.ffn.' in name for name in report['mismatched'])
     assert {'hazard.weight', 'hazard.bias'} <= set(report['fresh']) and not report['unexpected']
-    torch.testing.assert_close(wider.cell_token.weight, initial['model']['cell_token.weight'], rtol=0, atol=0)
+    torch.testing.assert_close(wider.cnn.head.weight, initial['model']['cnn.head.weight'], rtol=0, atol=0)
+
+
+def test_checkpoints_from_before_the_shared_crop_cnn_head_load_renamed(tmp_path):
+    """A checkpoint whose cell-token Linear is still ``cell_token`` (before it became the 'cells' head of
+    models.blocks.CropCNN) reads with it renamed and loads unchanged."""
+    from vesuvius.neural_tracing.tracers.models.checkpoint import read_checkpoint
+    torch.manual_seed(3)
+    m = build_model(config())
+    old = {k.replace('cnn.head.', 'cell_token.') if k.startswith('cnn.head.') else k: v for k, v in m.state_dict().items()}
+    torch.save(dict(model_type=m.model_type, model=old, ema=old, model_cfg=m.cfg.to_dict()), tmp_path/'old.pt')
+    ck = read_checkpoint(tmp_path/'old.pt', 'cpu')
+    assert 'cnn.head.weight' in ck['model'] and 'cell_token.weight' not in ck['ema']
+    other = build_model(config())
+    other.load_state_dict(ck['model'])
+    assert all(torch.equal(a, b) for a, b in zip(m.state_dict().values(), other.state_dict().values()))
 
 
 def test_loss_supervises_every_proposal():

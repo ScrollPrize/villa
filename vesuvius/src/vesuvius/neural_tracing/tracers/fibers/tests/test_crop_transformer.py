@@ -66,7 +66,7 @@ def test_compiled_training_matches_eager_with_finite_gradients(flow):
     (terms['geometry_per_state']+.5*terms['confidence_per_state']).mean().backward()
     heads = (compiled.velocity, compiled.score[0], compiled.hazard) if flow else (
         compiled.coordinates, compiled.hazard, compiled.refinement_fusion[0])
-    for module in (compiled.cnn.stages[0].blocks[0].conv1.conv, compiled.cell_token, compiled.reference_token[0],
+    for module in (compiled.cnn.stages[0].blocks[0].conv1.conv, compiled.cnn.head, compiled.reference_token[0],
                    compiled.layers[0].qkv, compiled.layers[-1].ffn[0], *heads):
         assert module.weight.grad is not None and torch.isfinite(module.weight.grad).all()
         assert module.weight.grad.abs().sum() > 0

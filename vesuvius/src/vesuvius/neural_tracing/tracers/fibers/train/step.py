@@ -28,10 +28,10 @@ def prepare_training(model, batch_size=2, *, backend=None):
         raise ValueError('Positive training batch size required')
     options = compile_options(backend, fullgraph=True)
     if model.model_type == 'sequence':
-        # Episode batches (train/sequence.py) run eagerly; their CNN, which encodes every step's crop, is compiled
-        # and fed fixed-size chunks. Compiling forward (not the module) keeps the parameter names.
+        # Episode batches (train/sequence.py) run eagerly; their CNN trunk, which encodes every step's crop, is compiled
+        # and fed fixed-size chunks. Compiling the method (not the module) keeps the parameter names.
         model.training_batch_size, model._training_refined, model.training_loss = batch_size, None, loss_terms
-        model.cnn.forward = torch.compile(model.cnn.forward, **options)
+        model.cnn.features = torch.compile(model.cnn.features, **options)
         return model
     model.training_batch_size = batch_size
     model._training_refined = None

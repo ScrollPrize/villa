@@ -18,6 +18,7 @@ import numpy as np
 import torch
 from torch import nn
 
+from vesuvius.neural_tracing.tracers.models.blocks import MLP
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.crops import scalar_crops
 from vesuvius.neural_tracing.tracers.shared.geometry import CropSpec, arclength, frame_from_heading, interp_at
 from vesuvius.neural_tracing.tracers.shared.io import atomic_torch_save
@@ -81,11 +82,9 @@ class HeadingNet(nn.Module):
             nn.Conv3d(4*w, 4*w, 4, stride=2, padding=1), nn.SiLU(),
             nn.AdaptiveAvgPool3d(2), nn.Flatten())
         self.path = nn.Sequential(nn.Linear(4*cfg.window, 64), nn.SiLU())
-        self.head = nn.Sequential(nn.Linear(4*w*8+64, 64), nn.SiLU(), nn.Linear(64, 3))
-        nn.init.zeros_(self.head[-1].weight)
-        nn.init.zeros_(self.head[-1].bias)  # starts as the prior heading
+        self.head = MLP(4*w*8+64, 3, hidden=64, zero_last=True)  # starts as the prior heading
         if cfg.predict_normals:
-            self.normal_head = nn.Sequential(nn.Linear(4*w*8+64, 64), nn.SiLU(), nn.Linear(64, 3))
+            self.normal_head = MLP(4*w*8+64, 3, hidden=64)
         if cfg.predict_frames:
             self.family_embedding = nn.Embedding(2, 64)
             nn.init.zeros_(self.family_embedding.weight)

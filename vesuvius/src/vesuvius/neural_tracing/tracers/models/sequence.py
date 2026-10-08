@@ -23,7 +23,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from vesuvius.neural_tracing.tracers.models.blocks import CropCNN, TransformerLayer
+from vesuvius.neural_tracing.tracers.models.blocks import MLP, CropCNN, TransformerLayer
 from vesuvius.neural_tracing.tracers.models.follower import FollowerConfig, path_readout, plane_coordinates, proposal_output, read_path, sample_features, select_refinement, token_coordinates
 from vesuvius.neural_tracing.tracers.shared.geometry import CropSpec
 from vesuvius.neural_tracing.tracers.shared.policy import DEFAULT_CONFIDENCE
@@ -115,13 +115,12 @@ class SequenceFollower(nn.Module):
         self.cfg, self.model_type = cfg, cfg.model_type
         h, cells = cfg.hidden, cfg.cnn_channels[-1]
         # A full-resolution block, then stages at strides 2, 4, 8.
-        self.cnn = CropCNN(cfg.cnn_channels, cfg.cnn_strides, (1,)+(cfg.cnn_blocks,)*3)
-        self.cell_token = nn.Linear(cells, h)
-        self.cell_position = nn.Sequential(nn.Linear(3, h), nn.SiLU(), nn.Linear(h, h))
+        self.cnn = CropCNN(cfg.cnn_channels, cfg.cnn_strides, (1,)+(cfg.cnn_blocks,)*3, head='cells', dim=h)
+        self.cell_position = MLP(3, h)
         width = 2*cells+4+2*POSITION_FREQUENCIES
         self.history_token = nn.Sequential(nn.LayerNorm(width), nn.Linear(width, h), nn.SiLU(), nn.Linear(h, h))
-        self.history_pose = nn.Sequential(nn.Linear(4, h), nn.SiLU(), nn.Linear(h, h))
-        self.query_token = nn.Sequential(nn.Linear(1, h), nn.SiLU(), nn.Linear(h, h))
+        self.history_pose = MLP(4, h)
+        self.query_token = MLP(1, h)
         self.kind = nn.Parameter(torch.zeros(3, h))  # history, crop cell, plane query
         nn.init.normal_(self.kind, std=.02)
         self.layers = nn.ModuleList(SequenceLayer(h, cfg.heads, cfg.ffn) for _ in range(cfg.layers))
@@ -133,10 +132,10 @@ class SequenceFollower(nn.Module):
     # ------------------------------------------------------------------ tokens
     def encode(self, image):
         """Stride-8 CNN cells (B, C, D/8, W/8, W/8) of head crops (B, 1, D, W, W)."""
-        return self.cnn(image)
+        return self.cnn.features(image)
 
     def crop_tokens(self, cells):
-        tokens = self.cell_token(cells.flatten(2).transpose(1, 2))
+        tokens = self.cnn.tokens(cells)
         return tokens+self.cell_position(self.cell_xyz/16.).to(tokens.dtype)+self.kind[1].to(tokens.dtype)
 
     def query_tokens(self, count, like):
