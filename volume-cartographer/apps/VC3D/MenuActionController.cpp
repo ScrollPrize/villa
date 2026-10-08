@@ -4,7 +4,10 @@
 #include "VCSettings.hpp"
 #include "UnifiedBrowserDialog.hpp"
 #include "OpenDataCatalogWindow.hpp"
+#include "OpenDataLasagna.hpp"
 #include "OpenDataSampleProject.hpp"
+#include "ProjectFiberPaths.hpp"
+#include "ProjectCreationDefaults.hpp"
 #include "OpenDataVolumePrefill.hpp"
 #include "CWindow.hpp"
 #include "SurfacePanelController.hpp"
@@ -94,6 +97,7 @@ struct MenuActionController::OpenDataOpenTaskResult {
     QString error;
     QString sampleId;
     qint64 tifxyzSegmentCount{0};
+    bool freshProject{false};
 };
 
 struct MenuActionController::LasagnaAttachTaskResult {
@@ -225,6 +229,12 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _fileMenu->addSeparator();
     _fileMenu->addAction(_attachVolumeAct);
     _fileMenu->addAction(_attachSegmentsAct);
+    _fileMenu->addAction(QObject::tr("Open Automated Fiber Volume…"), this, [qWindow]() {
+        // macOS hides the native file-type selector when there is only one filter.
+        const auto path = QFileDialog::getOpenFileName(qWindow, QObject::tr("Open Automated Fiber Volume (.afv)"),
+                                                     {}, QObject::tr("Automated Fiber Volume (*.afv);;All files (*)"));
+        if (!path.isEmpty()) qWindow->openFiberCollection(path);
+    });
     _fileMenu->addAction(_attachNormalGridAct);
     _fileMenu->addAction(_attachUmbilicusAct);
     _fileMenu->addAction(_detachUmbilicusAct);
@@ -455,6 +465,12 @@ void MenuActionController::updateRecentRemoteList(const QString& url)
 
 void MenuActionController::attachRemoteZarr()
 {
+    const QStringList recentUrls = loadRecentRemoteUrls();
+    showAttachRemoteZarrDialog(recentUrls.isEmpty() ? QString() : recentUrls.first());
+}
+
+void MenuActionController::showAttachRemoteZarrDialog(const QString& initialUrl)
+{
     if (!_window) return;
 
     if (!_window->_state || !_window->_state->vpkg()) {
@@ -464,16 +480,13 @@ void MenuActionController::attachRemoteZarr()
         return;
     }
 
-    QStringList recentUrls = loadRecentRemoteUrls();
-    QString lastUrl = recentUrls.isEmpty() ? QString() : recentUrls.first();
-
     bool ok = false;
     QString url = QInputDialog::getText(
         _window,
         QObject::tr("Attach Remote Zarr"),
         QObject::tr("Enter remote OME-Zarr URL (http://, https://, s3://):"),
         QLineEdit::Normal,
-        lastUrl,
+        initialUrl,
         &ok);
 
     if (!ok || url.trimmed().isEmpty()) {
@@ -499,8 +512,16 @@ void MenuActionController::showOpenDataCatalog()
 
     auto* dialog = new vc3d::opendata::OpenDataCatalogWindow(_window);
     _openDataCatalogDialog = dialog;
+    connect(dialog, &vc3d::opendata::OpenDataCatalogWindow::attachVolumeRequested,
+            this, &MenuActionController::showAttachRemoteZarrDialog);
+    connect(dialog, &vc3d::opendata::OpenDataCatalogWindow::attachLasagnaRequested,
+            this, &MenuActionController::attachCatalogLasagna);
     dialog->setOpenSampleHandler([this](const vc3d::opendata::OpenDataSample& sample) {
         return openOpenDataSample(sample);
+    });
+    dialog->setCreateProjectHandler([this](const auto& sample, const auto& selection,
+                                           const auto& project) {
+        return openOpenDataSample(sample, true, &selection, nullptr, nullptr, &project);
     });
     dialog->setAttribute(Qt::WA_DeleteOnClose);
     connect(dialog, &QDialog::finished, this, [this]() {
@@ -575,26 +596,40 @@ bool MenuActionController::openOpenDataSample(const vc3d::opendata::OpenDataSamp
                                              bool interactive,
                                              const vc3d::opendata::OpenDataResourceSelection* selection,
                                              QString* errorMessage,
-                                             vc3d::opendata::OpenDataSampleProjectResult* resultOut)
+                                             vc3d::opendata::OpenDataSampleProjectResult* resultOut,
+                                             const vc3d::opendata::OpenDataNewProject* newProject)
 {
     if (!_window || !_window->_state) {
         if (errorMessage) *errorMessage = QObject::tr("No application window available.");
         return false;
     }
 
-    // Only interactive callers ask before replacing the current project.
-    if (interactive && _window->_state->vpkg()) {
+    if (newProject && _window->_state->vpkg()) {
+        const auto current = QString::fromStdString(_window->_state->vpkg()->path().string());
+        const auto destination = QString::fromStdString(newProject->path.string());
+        if (!current.isEmpty() && QFileInfo(current).canonicalFilePath() ==
+                                  QFileInfo(destination).canonicalFilePath() &&
+            QFileInfo::exists(destination)) {
+            QMessageBox::warning(_window, QObject::tr("Create Project"),
+                QObject::tr("Choose a different file from the currently open project."));
+            return false;
+        }
+    }
+
+    // Create and Open already explicitly confirms the project switch.
+    if (interactive && !newProject && _window->_state->vpkg()) {
         QMessageBox prompt(_window);
-        prompt.setWindowTitle(QObject::tr("Open Data Sample"));
-        prompt.setText(QObject::tr("Open sample %1").arg(QString::fromStdString(sample.id)));
+        prompt.setWindowTitle(QObject::tr("Open Project"));
+        prompt.setText(QObject::tr("Open sample %1?").arg(QString::fromStdString(sample.id)));
         prompt.setInformativeText(
-            QObject::tr("This will replace the current project."));
-        auto* replaceButton = prompt.addButton(QObject::tr("Replace Project"), QMessageBox::AcceptRole);
+            QObject::tr("This will close the current project and open the selected project. "
+                        "The current project file will not be overwritten."));
+        auto* openButton = prompt.addButton(QObject::tr("Open Project"), QMessageBox::AcceptRole);
         prompt.addButton(QMessageBox::Cancel);
-        prompt.setDefaultButton(replaceButton);
+        prompt.setDefaultButton(openButton);
         prompt.exec();
 
-        if (prompt.clickedButton() != replaceButton) {
+        if (prompt.clickedButton() != openButton) {
             return false;
         }
     }
@@ -615,7 +650,7 @@ bool MenuActionController::openOpenDataSample(const vc3d::opendata::OpenDataSamp
             outcome = o;
             loop.quit();
         },
-        {});
+        {}, newProject);
     loop.exec(QEventLoop::ExcludeUserInputEvents);
 
     if (errorMessage && !outcome.success) *errorMessage = outcome.error;
@@ -673,22 +708,31 @@ void MenuActionController::beginOpenDataSampleOpenTask(
     bool interactive,
     const vc3d::opendata::OpenDataResourceSelection* selection,
     std::function<void(const OpenDataSampleOpenOutcome&)> onFinished,
-    std::function<void(const vc3d::opendata::OpenDataSampleDownloadProgress&)> onProgress)
+    std::function<void(const vc3d::opendata::OpenDataSampleDownloadProgress&)> onProgress,
+    const vc3d::opendata::OpenDataNewProject* newProject)
 {
     const QString cacheDir = vc3d::remoteCachePath();
     const vc3d::opendata::OpenDataSample sampleCopy = sample;
+    const auto projectCopy = newProject
+        ? std::make_optional(*newProject) : std::nullopt;
     // Copy the selection by value so the worker thread never dereferences a
     // caller-owned pointer; a null selection means attach everything.
     const bool hasSelection = selection != nullptr;
     const vc3d::opendata::OpenDataResourceSelection selectionCopy =
         selection ? *selection : vc3d::opendata::OpenDataResourceSelection{};
+    const auto selectedSegmentCount = std::count_if(
+        sampleCopy.segments.begin(), sampleCopy.segments.end(), [&](const auto& segment) {
+            return segment.hasTifxyz() && (!selectionCopy.segmentIds ||
+                std::find(selectionCopy.segmentIds->begin(), selectionCopy.segmentIds->end(),
+                          segment.id) != selectionCopy.segmentIds->end());
+        });
     // CloseVolume() below is this flow's first destructive step: it emits
     // vpkgChanged, whose defensive handler tears line sessions down without
     // saving. Sessions must instead end -- finalized and saved -- while their
     // package is still the active one, so the gate sits here, before the
     // close; the completion-time gate stays only as a defense against
     // sessions opened during the asynchronous fetch.
-    if (_window && _window->_lineAnnotationController &&
+    if (!newProject && _window && _window->_lineAnnotationController &&
         !_window->_lineAnnotationController->prepareForPackageSwitch()) {
         if (onFinished) {
             // Queued: callers were written against "returns immediately,
@@ -708,16 +752,18 @@ void MenuActionController::beginOpenDataSampleOpenTask(
         }
         return;
     }
-    cancelOpenDataVolumePrefills();
-    _window->CloseVolume();
+    if (!newProject) {
+        cancelOpenDataVolumePrefills();
+        _window->CloseVolume();
+    }
 
     QPointer<QProgressDialog> progressDialog;
-    if (interactive && sampleCopy.tifxyzSegmentCount() > 0) {
+    if (interactive && (newProject || selectedSegmentCount > 0)) {
         auto* dialog = new QProgressDialog(
-            QObject::tr("Preparing segment downloads..."),
+            QObject::tr("Preparing catalog resources..."),
             QString(),
             0,
-            static_cast<int>(sampleCopy.tifxyzSegmentCount()) * 6,
+            static_cast<int>(selectedSegmentCount) * 6,
             _window);
         dialog->setWindowTitle(QObject::tr("Open Data Sample"));
         dialog->setCancelButton(nullptr);
@@ -845,18 +891,21 @@ void MenuActionController::beginOpenDataSampleOpenTask(
 
     _openDataSampleOpenInFlight = true;
     watcher->setFuture(QtConcurrent::run(
-        [sampleCopy, cacheDir, progressCallback, hasSelection, selectionCopy]() mutable {
+        [sampleCopy, cacheDir, progressCallback, hasSelection, selectionCopy, projectCopy,
+         selectedSegmentCount]() mutable {
             OpenDataOpenTaskResult taskResult;
+            taskResult.freshProject = projectCopy.has_value();
             taskResult.sampleId = QString::fromStdString(sampleCopy.id);
             taskResult.tifxyzSegmentCount =
-                static_cast<qint64>(sampleCopy.tifxyzSegmentCount());
+                static_cast<qint64>(selectedSegmentCount);
             try {
                 taskResult.pkg = vc3d::opendata::createOpenDataSampleProject(
                     sampleCopy,
                     cacheDir.toStdString(),
                     &taskResult.result,
                     progressCallback,
-                    hasSelection ? &selectionCopy : nullptr);
+                    hasSelection ? &selectionCopy : nullptr,
+                    projectCopy ? &*projectCopy : nullptr);
             } catch (const std::exception& e) {
                 taskResult.error = QString::fromUtf8(e.what());
             } catch (...) {
@@ -927,6 +976,7 @@ void MenuActionController::finishOpenDataSampleOpen(OpenDataOpenTaskResult task,
         // active surface alive beside this sample's package. With nothing
         // open — the common case, since this flow closed the volume when it
         // began — CloseVolume() is a no-op.
+        cancelOpenDataVolumePrefills();
         _window->CloseVolume();
         _window->_state->setVpkg(pkg);
         // CloseVolume() stopped all file watches; the ordinary open flow
@@ -964,7 +1014,7 @@ void MenuActionController::finishOpenDataSampleOpen(OpenDataOpenTaskResult task,
     }
 
     if (interactive &&
-        (result.supportedVolumes == 0 ||
+        ((!task.freshProject && result.supportedVolumes == 0) ||
          result.failedVolumes > 0 ||
          result.failedTifxyzSegments > 0)) {
         QString details;
@@ -1635,17 +1685,7 @@ void MenuActionController::newProject()
     if (!_window) return;
 
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    // Default new projects into the per-user .VC3D folder (same root the
-    // autosave uses, so home resolution matches across platforms).
-    QString defaultDir;
-    const auto autosaveFile = VolumePkg::autosaveFile();
-    if (!autosaveFile.empty()) {
-        defaultDir = QString::fromStdString(autosaveFile.parent_path().string());
-        QDir().mkpath(defaultDir);
-    }
-    if (defaultDir.isEmpty()) {
-        defaultDir = settings.value(vc3d::settings::project::DEFAULT_PATH).toString();
-    }
+    const QString defaultDir = vc3d::defaultNewProjectDirectory(settings);
     const QString defaultBase = QStringLiteral("untitled");
     const QString defaultName = defaultBase + QStringLiteral(".volpkg.json");
 
@@ -1674,6 +1714,7 @@ void MenuActionController::newProject()
     // autosave, and save() then writes the full JSON including the name.
     pkg->setName(base.toStdString());
     try {
+        std::filesystem::create_directories(vc3d::projectFiberDirectory(file.toStdString()));
         pkg->save(std::filesystem::path(file.toStdString()));
     } catch (const std::exception& e) {
         QMessageBox::warning(_window, QObject::tr("New Project failed"), QString::fromUtf8(e.what()));
@@ -1711,12 +1752,12 @@ QString MenuActionController::promptLocation(const QString& title,
                                              const QString& defaultDir,
                                              const QStringList& localFilters,
                                              bool acceptFiles,
-                                             bool acceptDirs)
+                                             bool acceptDirs,
+                                             bool startAtFile)
 {
     UnifiedBrowserDialog dlg(_window);
     dlg.setWindowTitle(title);
     dlg.setHint(hint);
-    dlg.setStartUri(defaultDir);
     dlg.setLocalNameFilters(localFilters);
     dlg.setAcceptsFiles(acceptFiles);
     dlg.setAcceptsDirs(acceptDirs);
@@ -1726,6 +1767,7 @@ QString MenuActionController::promptLocation(const QString& title,
             : nullptr;
         return attachment && attachment->resolveRemoteAuth(url, out, err);
     });
+    dlg.setStartUri(defaultDir, startAtFile);
     if (dlg.exec() != QDialog::Accepted) return {};
     QString uri = dlg.selectedUri();
     if (uri.startsWith(QLatin1String("file:"), Qt::CaseInsensitive)) {
@@ -1927,7 +1969,36 @@ void MenuActionController::attachRemoteLasagnaManifest()
     beginLasagnaManifestAttachment(true);
 }
 
-void MenuActionController::beginLasagnaManifestAttachment(bool remote)
+void MenuActionController::attachCatalogLasagna(const QString& artifactUrl, bool fiber)
+{
+    if (!_window || !_window->_state || !_window->_state->vpkg()) {
+        QMessageBox::information(_window, QObject::tr("No project"), QObject::tr("Open or create a project first."));
+        return;
+    }
+    const auto targetPackage = _window->_state->vpkg();
+    using Result = std::pair<QString, QString>;
+    auto* watcher = new QFutureWatcher<Result>(this);
+    connect(watcher, &QFutureWatcher<Result>::finished, this, [this, watcher, targetPackage, fiber]() {
+        const auto [url, error] = watcher->result();
+        watcher->deleteLater();
+        if (!_window || !_window->_state || _window->_state->vpkg() != targetPackage) return;
+        if (!error.isEmpty()) {
+            QMessageBox::warning(_window, QObject::tr("Attach failed"), error);
+            return;
+        }
+        beginLasagnaManifestAttachment(true, url, fiber);
+    });
+    watcher->setFuture(QtConcurrent::run([artifactUrl]() -> Result {
+        try {
+            return {QString::fromStdString(vc3d::opendata::discoverOpenDataLasagnaManifestUrl(
+                        artifactUrl.toStdString())), {}};
+        } catch (const std::exception& ex) {
+            return {{}, QString::fromUtf8(ex.what())};
+        }
+    }));
+}
+
+void MenuActionController::beginLasagnaManifestAttachment(bool remote, const QString& initialUrl, bool fiber)
 {
     if (!_window || !_window->_state || !_window->_state->vpkg()) {
         QMessageBox::information(_window, QObject::tr("No project"), QObject::tr("Open or create a project first."));
@@ -1942,7 +2013,7 @@ void MenuActionController::beginLasagnaManifestAttachment(bool remote)
     QString location;
     if (remote) {
         location =
-            promptLocation(QObject::tr("Attach Remote Lasagna Manifest"), QObject::tr("Pick a remote .lasagna.json manifest."), QStringLiteral("s3://"), {QStringLiteral("*.lasagna.json")}, true, false);
+            promptLocation(QObject::tr("Attach Remote Lasagna Manifest"), QObject::tr("Pick a remote .lasagna.json manifest."), initialUrl.isEmpty() ? QStringLiteral("s3://") : initialUrl, {QStringLiteral("*.lasagna.json")}, true, false, !initialUrl.isEmpty());
         if (location.isEmpty())
             return;
         if (!vc::lasagna::isRemoteLasagnaLocation(location.toStdString())) {
@@ -1960,7 +2031,7 @@ void MenuActionController::beginLasagnaManifestAttachment(bool remote)
 
     bool roleAccepted = false;
     const QString role =
-        QInputDialog::getItem(_window, QObject::tr("Lasagna Data Role"), QObject::tr("Attach this manifest as:"), {QObject::tr("Regular Lasagna"), QObject::tr("Fiber inference")}, 0, false, &roleAccepted);
+        QInputDialog::getItem(_window, QObject::tr("Lasagna Data Role"), QObject::tr("Attach this manifest as:"), {QObject::tr("Regular Lasagna"), QObject::tr("Fiber inference")}, fiber ? 1 : 0, false, &roleAccepted);
     if (!roleAccepted)
         return;
     const bool fiberInference = role == QObject::tr("Fiber inference");

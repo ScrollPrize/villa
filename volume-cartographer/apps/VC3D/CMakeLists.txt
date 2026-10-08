@@ -15,6 +15,8 @@ set(srcs
     Keybinds.cpp
     Keybinds.hpp
     CWindow.cpp
+    FiberCollectionController.cpp
+    FiberCollectionController.hpp
     CWindowContextMenu.cpp
     StatusDockPanelHost.cpp
     StatusDockPanelHost.hpp
@@ -50,6 +52,7 @@ set(srcs
     LineAnnotationController.cpp
     LineAnnotationController.hpp
     LineAnnotationFiberSegments.cpp
+    LineAnnotationStructuralEdits.cpp
     LineAnnotationFiberSegments.hpp
     LineAnnotationDialog.cpp
     LineAnnotationDialog.hpp
@@ -65,6 +68,8 @@ set(srcs
     OpenDataSampleProject.hpp
     OpenDataVolumePrefill.cpp
     OpenDataVolumePrefill.hpp
+    OpenDataVolumeOrientation.cpp
+    OpenDataVolumeOrientation.hpp
     OpenDataNormalGrids.cpp
     OpenDataNormalGrids.hpp
     OpenDataSegmentCache.cpp
@@ -370,6 +375,7 @@ target_link_libraries(VC3D
     # mimalloc first so its symbols win malloc/free resolution.
     $<$<BOOL:${mimalloc_FOUND}>:mimalloc>
     vc_core
+    vc_fiber_collection
     vc_atlas
     vc_lasagna
     vc_fiber_tracer

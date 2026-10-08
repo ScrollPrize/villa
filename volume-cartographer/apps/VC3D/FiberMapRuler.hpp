@@ -17,9 +17,12 @@ class QPainter;
 // false) paints nothing.
 struct FiberMapRulerModel {
     bool hasLayout = false;
-    // Winding gridlines: scene x per integer winding.
+    // Winding gridlines: scene x per integer winding, ascending in x.
     std::vector<vc3d::fiber_map::WindingMark> windings;
-    // Sheet distance as a function of scene x (see FiberNetworkLayout.hpp).
+    // The fitted sheet model the scene's x was scaled by (see
+    // sheetDistanceMonotoneVx in FiberNetworkLayout.hpp). Scene x is already
+    // the sheet distance from winding 0, so the rulers convert nothing; they
+    // read the model for the tooltip and for a fallback winding width.
     vc3d::fiber_map::SheetModel sheet;
     // Unset when the package could not say, in which case the distance rulers
     // count voxels rather than guess a physical length.
@@ -48,7 +51,8 @@ struct FiberMapRulerStyle {
 // is in view is always labelled. It reads the view transform on every paint.
 // Three modes:
 //   Windings      - the winding number at every gridline (above the ceiling)
-//   SheetDistance - distance along the sheet from winding 0 (below the floor)
+//   SheetDistance - distance along the sheet from winding 0 (below the
+//                   floor); this is the scene x itself
 //   Height        - scroll height above the volume floor (left of the map)
 // The distance modes label in physical units when the voxel size is known and
 // in voxels otherwise; the tick step comes from a 1-2-5 ladder so that ticks

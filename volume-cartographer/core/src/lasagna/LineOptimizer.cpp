@@ -1,4 +1,5 @@
 #include "vc/lasagna/LineOptimizer.hpp"
+#include "vc/core/util/ArcHermite.hpp"
 
 #include <ceres/ceres.h>
 #include <opencv2/core.hpp>
@@ -2147,11 +2148,7 @@ void growHardDirectionConstructedExtension(
     if (points.size() == 1) {
         return points.front();
     }
-    linePosition = std::clamp(linePosition, 0.0, static_cast<double>(points.size() - 1));
-    const int lower = static_cast<int>(std::floor(linePosition));
-    const int upper = std::min<int>(lower + 1, static_cast<int>(points.size() - 1));
-    const double t = linePosition - static_cast<double>(lower);
-    return lerp(points[static_cast<size_t>(lower)], points[static_cast<size_t>(upper)], t);
+    return vc::geometry::sampleLine(points, linePosition).value;
 }
 
 [[nodiscard]] bool canInitializeFromExistingLine(
@@ -2172,35 +2169,37 @@ void growHardDirectionConstructedExtension(
     return true;
 }
 
-[[nodiscard]] cv::Vec3d warpedDeltaAtPosition(
-    const std::vector<LineControlPoint>& controls,
-    const std::vector<cv::Vec3d>& basePoints,
-    double linePosition)
-{
-    if (controls.empty() || basePoints.empty()) {
-        return {0.0, 0.0, 0.0};
-    }
-    const auto controlDelta = [&](size_t index) {
-        return controls[index].volumePoint -
-               interpolateInitialLinePoint(basePoints, controls[index].linePosition);
-    };
-    if (linePosition <= controls.front().linePosition) {
-        return controlDelta(0);
-    }
-    for (size_t i = 0; i + 1 < controls.size(); ++i) {
-        const double a = controls[i].linePosition;
-        const double b = controls[i + 1].linePosition;
-        if (linePosition > b) {
-            continue;
+struct LineDisplacementField {
+    std::vector<double> lineArcs, controlArcs;
+    std::vector<cv::Vec3d> deltas;
+    std::vector<bool> flat;
+
+    LineDisplacementField(const std::vector<LineControlPoint>& controls,
+                          const std::vector<cv::Vec3d>& points)
+    {
+        lineArcs.resize(points.size(), 0);
+        for (size_t i=1; i<points.size(); ++i)
+            lineArcs[i] = lineArcs[i-1] + cv::norm(points[i]-points[i-1]);
+        for (const auto& control : controls) {
+            const double s = arc(control.linePosition);
+            const auto delta = control.volumePoint - interpolateInitialLinePoint(points, control.linePosition);
+            // Co-located controls have no interpolation interval.
+            if (!controlArcs.empty() && s <= controlArcs.back()+kEpsilon) continue;
+            controlArcs.push_back(s);
+            deltas.push_back(delta);
+            flat.push_back(cv::norm(delta) <= kMovedControlDistanceThreshold);
         }
-        const double denom = b - a;
-        const double t = std::abs(denom) <= kEpsilon
-            ? 1.0
-            : std::clamp((linePosition - a) / denom, 0.0, 1.0);
-        return lerp(controlDelta(i), controlDelta(i + 1), t);
+        if (!flat.empty()) flat.front() = flat.back() = true;
     }
-    return controlDelta(controls.size() - 1);
-}
+    double arc(double position) const {
+        position = std::clamp(position, 0.0, double(lineArcs.size()-1));
+        const size_t i = size_t(position), j = std::min(i+1,lineArcs.size()-1);
+        return lineArcs[i] + (position-i)*(lineArcs[j]-lineArcs[i]);
+    }
+    cv::Vec3d at(double position) const {
+        return vc::geometry::sampleField(controlArcs,deltas,arc(position),flat);
+    }
+};
 
 [[nodiscard]] int spanIdForSegment(
     const std::vector<LineControlPoint>& controls,
@@ -2393,6 +2392,7 @@ void optimizeControlSpanInitialization(
     }
     std::vector<std::array<double, 3>> warpedSpanPoints;
     warpedSpanPoints.reserve(linePositions.size());
+    const LineDisplacementField displacement(init.controlPoints, config.initialLinePoints);
     for (size_t positionIndex = 0; positionIndex < linePositions.size(); ++positionIndex) {
         const double linePosition = linePositions[positionIndex];
         if (positionIndex > 0) {
@@ -2404,9 +2404,7 @@ void optimizeControlSpanInitialization(
                 : SegmentSpacingConstraint{SegmentSpacingMode::FixedStep, -1});
         }
         const cv::Vec3d base = interpolateInitialLinePoint(config.initialLinePoints, linePosition);
-        const cv::Vec3d delta = warpedDeltaAtPosition(init.controlPoints,
-                                                      config.initialLinePoints,
-                                                      linePosition);
+        const cv::Vec3d delta = displacement.at(linePosition);
         warpedSpanPoints.push_back(toArray(base + delta));
     }
     optimizeControlSpanInitialization(warpedSpanPoints,
@@ -3407,9 +3405,13 @@ LineControlPointUpdateResult updateExistingLineControlPoint(
     }
     (void)changedBeforeSort;
 
-    const auto controlDelta = [&](const LineControlPoint& control) {
-        return control.volumePoint - interpolateInitialLinePoint(linePoints, control.linePosition);
-    };
+    // Only adjacent spans are replaced. Their stationary outer controls have
+    // zero displacement derivative, so the correction joins the untouched line.
+    const size_t firstControl = changedSortedIndex > 0 ? changedSortedIndex-1 : 0;
+    const size_t lastControl = std::min(size_t(changedSortedIndex+1), controlPoints.size()-1);
+    const LineDisplacementField displacement(
+        std::vector<LineControlPoint>(controlPoints.begin()+firstControl,
+                                      controlPoints.begin()+lastControl+1), linePoints);
     const auto resampleSpan = [&](const LineControlPoint& left,
                                   const LineControlPoint& right) {
         const double leftPosition = left.linePosition;
@@ -3427,17 +3429,11 @@ LineControlPointUpdateResult updateExistingLineControlPoint(
         positions.push_back(rightPosition);
         positions = uniqueSortedPositions(std::move(positions));
 
-        const cv::Vec3d leftDelta = controlDelta(left);
-        const cv::Vec3d rightDelta = controlDelta(right);
         std::vector<cv::Vec3d> provisional;
         provisional.reserve(positions.size());
         for (const double position : positions) {
-            const double denom = rightPosition - leftPosition;
-            const double t = std::abs(denom) <= kEpsilon
-                ? 0.0
-                : std::clamp((position - leftPosition) / denom, 0.0, 1.0);
             provisional.push_back(interpolateInitialLinePoint(linePoints, position) +
-                                  lerp(leftDelta, rightDelta, t));
+                                  displacement.at(position));
         }
 
         double spanLength = 0.0;
