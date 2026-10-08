@@ -6878,6 +6878,16 @@ std::vector<LineAnnotationController::FiberSummary> LineAnnotationController::fi
             }
             spanSummaries.push_back(std::move(summary));
         }
+        // The spans are cached per fiber generation; summing them is the
+        // annotated length without another control-to-line scan.
+        const double lineLength = vc3d::line_annotation::fiberLineLengthVx(fiber.linePoints);
+        double annotatedLength = lineLength;
+        if (!spans.empty()) {
+            annotatedLength = 0.0;
+            for (const auto& span : spans) {
+                annotatedLength += span.lengthVx;
+            }
+        }
         const int componentSize = componentSizes[findRoot(indexById.at(fiber.id))];
         const int pendingLinkCount = static_cast<int>(
             std::count_if(fiber.branches.begin(),
@@ -6888,9 +6898,8 @@ std::vector<LineAnnotationController::FiberSummary> LineAnnotationController::fi
             fiber.fileName,
             static_cast<int>(fiber.controlPoints.size()),
             static_cast<int>(fiber.linePoints.size()),
-            vc3d::fiber_slice::annotatedLineLengthVx(
-                fiber.linePoints,
-                vc3d::line_annotation::storedControlPointPositions(fiber.controlPoints)),
+            lineLength,
+            annotatedLength,
             cachedAlignmentForFiber(fiber.id),
             std::move(spanSummaries),
             fiber.hvClassification.zDistance,

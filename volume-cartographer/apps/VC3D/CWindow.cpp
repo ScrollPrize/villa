@@ -7964,7 +7964,7 @@ void CWindow::CreateWidgets(void)
                     fiber.name,
                     fiber.controlPointCount,
                     fiber.linePointCount,
-                    fiber.lengthVx,
+                    fiber.annotatedLengthVx,
                     alignment,
                     spans,
                     fiber.hvZDistance,
@@ -7983,7 +7983,7 @@ void CWindow::CreateWidgets(void)
             _fiberLengthVxById.clear();
             _fiberLengthVxById.reserve(fibers.size());
             for (const auto& fiber : fibers) {
-                _fiberLengthVxById[fiber.id] = fiber.lengthVx;
+                _fiberLengthVxById[fiber.id] = fiber.annotatedLengthVx;
             }
             // Unit first, so the rebuilt rows below are texted once in it.
             updateFiberLengthUnits();

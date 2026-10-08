@@ -126,7 +126,13 @@ public:
         std::string name;
         int controlPointCount = 0;
         int linePointCount = 0;
+        // The whole stored line, open tails included: what the atlas search
+        // and the agent bridge measure arclengths against.
         double lengthVx = 0.0;
+        // The line between the outermost control points (the sum of the
+        // spans), what the panels show as the fiber's length; the whole line
+        // when there are no spans.
+        double annotatedLengthVx = 0.0;
         AlignmentMetrics alignment;
         std::vector<SpanSummary> spans;
         double hvZDistance = 0.0;
