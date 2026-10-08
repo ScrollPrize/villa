@@ -39,8 +39,11 @@ set(srcs
     FiberMapRuler.cpp
     FiberMapRuler.hpp
     FiberMapRulerMath.hpp
+    FiberLengthDisplay.hpp
     FiberMapGapField.cpp
     FiberMapGapField.hpp
+    FiberMapKollesis.cpp
+    FiberMapKollesis.hpp
     FiberNetworkLayout.cpp
     FiberNetworkLayout.hpp
     FiberWindingSolver.cpp

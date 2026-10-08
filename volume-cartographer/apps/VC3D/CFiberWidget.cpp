@@ -1,5 +1,6 @@
 #include "CFiberWidget.hpp"
 
+#include "FiberLengthDisplay.hpp"
 #include "FiberNameDisplay.hpp"
 #include "LineAnnotationFiberSegments.hpp"
 
@@ -137,14 +138,6 @@ QStandardItem* readOnlyItem(const QString& text = QString())
     return item;
 }
 
-QString formatDouble(double value, int precision = 1)
-{
-    if (!std::isfinite(value)) {
-        return QStringLiteral("-");
-    }
-    return QString::number(value, 'f', precision);
-}
-
 QString formatTags(const std::vector<std::string>& tags)
 {
     QStringList parts;
@@ -242,6 +235,14 @@ void CFiberWidget::setupUi()
     auto* mainWidget = new QWidget(this);
     auto* layout = new QVBoxLayout(mainWidget);
 
+    _totalLengthLabel = new QLabel(mainWidget);
+    _totalLengthLabel->setObjectName(QStringLiteral("fiberTotalLengthLabel"));
+    _totalLengthLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    _totalLengthLabel->setToolTip(
+        tr("Sum of the listed fibers' line lengths. Centimetres when the "
+           "annotation frame's voxel size is known, otherwise voxels."));
+    layout->addWidget(_totalLengthLabel);
+
     _nameLabel = new QLabel(mainWidget);
     _nameLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
     _nameLabel->setMinimumHeight(_nameLabel->fontMetrics().lineSpacing() * 2);
@@ -310,17 +311,7 @@ void CFiberWidget::setupUi()
 
     _model = new QStandardItemModel(this);
     _model->setColumnCount(kColumnCount);
-    _model->setHorizontalHeaderLabels({
-        tr("name"),
-        tr("dir"),
-        tr("link"),
-        tr("pending"),
-        tr("len"),
-        tr("cps"),
-        tr("pts"),
-        tr("tags"),
-        tr("interp"),
-    });
+    _model->setHorizontalHeaderLabels(headerLabels());
     _treeView = new QTreeView(mainWidget);
     _treeView->setObjectName(QStringLiteral("fiberTreeView"));
     _treeView->setModel(_model);
@@ -599,6 +590,7 @@ void CFiberWidget::setFibers(const std::vector<FiberEntry>& fibers)
     }
 
     rebuildModel();
+    updateTotalLengthLabel();
 
     _selectedFiberId = 0;
     if (!previousSelection.empty()) {
@@ -609,6 +601,92 @@ void CFiberWidget::setFibers(const std::vector<FiberEntry>& fibers)
     if (_calcMetricsCheckBox && _calcMetricsCheckBox->isChecked()) {
         emit metricsCalculationRequested(orderedFiberIds());
     }
+}
+
+void CFiberWidget::setAnnotationVoxelSizeUm(std::optional<double> voxelSizeUm)
+{
+    if (!vc3d::fiber_length::hasPhysicalScale(voxelSizeUm)) {
+        voxelSizeUm.reset();
+    }
+    if (voxelSizeUm == _voxelSizeUm) {
+        return;
+    }
+    _voxelSizeUm = voxelSizeUm;
+    refreshLengthDisplays();
+}
+
+double CFiberWidget::totalLengthVx() const
+{
+    double total = 0.0;
+    for (const auto& fiber : _fibers) {
+        if (std::isfinite(fiber.lengthVx)) {
+            total += fiber.lengthVx;
+        }
+    }
+    return total;
+}
+
+QStringList CFiberWidget::headerLabels() const
+{
+    return {
+        tr("name"),
+        tr("dir"),
+        tr("link"),
+        tr("pending"),
+        vc3d::fiber_length::columnHeader(tr("len"), _voxelSizeUm),
+        tr("cps"),
+        tr("pts"),
+        tr("tags"),
+        tr("interp"),
+    };
+}
+
+void CFiberWidget::refreshLengthDisplays()
+{
+    if (_model) {
+        _model->setHorizontalHeaderLabels(headerLabels());
+        for (int row = 0; row < _model->rowCount(); ++row) {
+            QStandardItem* root = _model->item(row, kNameColumn);
+            if (!root) {
+                continue;
+            }
+            const uint64_t fiberId = root->data(kFiberIdRole).toULongLong();
+            const auto it = std::find_if(_fibers.begin(), _fibers.end(),
+                                         [fiberId](const FiberEntry& fiber) {
+                                             return fiber.id == fiberId;
+                                         });
+            if (it == _fibers.end()) {
+                continue;
+            }
+            if (QStandardItem* cell = _model->item(row, kLengthColumn)) {
+                cell->setText(vc3d::fiber_length::formatValue(it->lengthVx, _voxelSizeUm));
+            }
+            if (spanChildrenArePlaceholder(root)) {
+                continue;
+            }
+            for (int child = 0;
+                 child < root->rowCount() && child < static_cast<int>(it->spans.size());
+                 ++child) {
+                if (QStandardItem* cell = root->child(child, kLengthColumn)) {
+                    cell->setText(vc3d::fiber_length::formatValue(
+                        it->spans[static_cast<size_t>(child)].lengthVx, _voxelSizeUm));
+                }
+            }
+        }
+    }
+    updateTotalLengthLabel();
+    updateClassificationUi();
+}
+
+void CFiberWidget::updateTotalLengthLabel()
+{
+    if (!_totalLengthLabel) {
+        return;
+    }
+    _totalLengthLabel->setText(
+        tr("Total fiber length: %1  (%2 fibers)")
+            .arg(vc3d::fiber_length::formatLength(totalLengthVx(), _voxelSizeUm))
+            .arg(_fibers.size()));
 }
 
 void CFiberWidget::setAlignmentMetricsPending(bool pending)
@@ -670,17 +748,7 @@ void CFiberWidget::rebuildModel()
     const bool showMetrics = _calcMetricsCheckBox && _calcMetricsCheckBox->isChecked();
     _model->removeRows(0, _model->rowCount());
     _model->setColumnCount(kColumnCount);
-    _model->setHorizontalHeaderLabels({
-        tr("name"),
-        tr("dir"),
-        tr("link"),
-        tr("pending"),
-        tr("len"),
-        tr("cps"),
-        tr("pts"),
-        tr("tags"),
-        tr("interp"),
-    });
+    _model->setHorizontalHeaderLabels(headerLabels());
     if (_treeView && _treeView->header()) {
         _treeView->header()->setSortIndicator(_sortColumn, _sortOrder);
     }
@@ -695,7 +763,7 @@ void CFiberWidget::rebuildModel()
             readOnlyItem(fiber.pendingLinkCount > 0
                              ? QString::number(fiber.pendingLinkCount)
                              : QString()),
-            readOnlyItem(formatDouble(fiber.lengthVx, 1)),
+            readOnlyItem(vc3d::fiber_length::formatValue(fiber.lengthVx, _voxelSizeUm)),
             readOnlyItem(QString::number(fiber.controlPointCount)),
             readOnlyItem(QString::number(fiber.linePointCount)),
             readOnlyItem(formatTags(fiber.tags)),
@@ -750,7 +818,7 @@ void CFiberWidget::buildSpanChildRows(QStandardItem* root, const FiberEntry& fib
             readOnlyItem(directionForFiber(fiber)),
             readOnlyItem(QString()),
             readOnlyItem(QString()),
-            readOnlyItem(formatDouble(span.lengthVx, 1)),
+            readOnlyItem(vc3d::fiber_length::formatValue(span.lengthVx, _voxelSizeUm)),
             readOnlyItem(QString::number(span.controlPointCount)),
             readOnlyItem(QString::number(span.linePointCount)),
             readOnlyItem(QString()),
@@ -1215,11 +1283,12 @@ void CFiberWidget::updateClassificationUi()
         _autoLabel->setText(tr("Auto: -"));
     } else {
         const QString name = displayNameForFiber(*fiber);
-        _nameLabel->setText(tr("%1\ncp=%2    pts=%3    len=%4 vx")
+        _nameLabel->setText(tr("%1\ncp=%2    pts=%3    len=%4")
                                 .arg(name)
                                 .arg(fiber->controlPointCount)
                                 .arg(fiber->linePointCount)
-                                .arg(fiber->lengthVx, 0, 'f', 1));
+                                .arg(vc3d::fiber_length::formatLength(fiber->lengthVx,
+                                                                      _voxelSizeUm)));
         _scoreLabel->setText(tr("z dist: %1    control len: %2\nH score: %3    V score: %4")
                                  .arg(fiber->hvZDistance, 0, 'f', 2)
                                  .arg(fiber->hvFiberLength, 0, 'f', 2)

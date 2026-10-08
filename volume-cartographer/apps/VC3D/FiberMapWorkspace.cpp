@@ -1,8 +1,10 @@
 #include "FiberMapWorkspace.hpp"
 
+#include "FiberLengthDisplay.hpp"
 #include "FiberMapRuler.hpp"
 #include "FiberMapRulerMath.hpp"
 #include "LineAnnotationController.hpp"
+#include "LineAnnotationFiberClassification.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
 
 #include "vc/core/util/Logging.hpp"
@@ -21,6 +23,8 @@
 #include <QGraphicsLineItem>
 #include <QGraphicsPathItem>
 #include <QGraphicsPixmapItem>
+#include <QGraphicsPolygonItem>
+#include <QPolygonF>
 #include <QGraphicsRectItem>
 #include <QGraphicsScene>
 #include <QGraphicsSimpleTextItem>
@@ -184,6 +188,15 @@ QColor kollesisColor(int alpha)
 }
 constexpr qreal kKollesisRimWidthPx = 2.0;
 
+// A kollesis seam the statistics predict rather than a tag places: an amber
+// one warm step from the tagged seams' yellow, clear of the gap heat map's
+// blue-to-violet ramp, the fibers' cyan and green and the link violet. The
+// same value serves both themes.
+QColor kollesisPredictionColor(int alpha)
+{
+    return QColor(255, 170, 0, alpha);
+}
+
 // A control point tagged break is marked the same way in the break amber,
 // with a dotted rim; the span between two consecutive break points (a gap
 // span) draws as a dotted amber line in place of the fiber's stroke.
@@ -226,6 +239,10 @@ constexpr int kNetworkGlowAlpha = 70;
 constexpr qreal kPanelZ = -3.0;
 // The gap heat map: over the ground, under the winding grid and every fiber.
 constexpr qreal kGapZ = -2.5;
+// The kollesis overlap bands and their bound/mid lines: over the heat map,
+// under the winding grid (0) and everything drawn on it.
+constexpr qreal kKollesisBandZ = -2.0;
+constexpr qreal kKollesisLineZ = -1.5;
 // Columns per heat-map pixmap tile: well under any platform pixmap limit.
 constexpr int kGapTileCols = 4096;
 // Gap heat map defaults and ranges, in centimetres (the spinboxes' unit).
@@ -731,6 +748,10 @@ FiberMapView::FiberMapView(QWidget* parent)
         this, FiberMapRuler::Edge::Left, FiberMapRuler::Mode::Height));
     _rulers.push_back(std::make_unique<FiberMapRuler>(
         this, FiberMapRuler::Edge::Bottom, FiberMapRuler::Mode::SheetDistance));
+    // The kollesis band stacks outside the winding band on the ceiling; it
+    // takes no room while the model has no seams.
+    _rulers.push_back(std::make_unique<FiberMapRuler>(
+        this, FiberMapRuler::Edge::Top, FiberMapRuler::Mode::Kollesis, /*stackLevel=*/1));
     for (const auto& ruler : _rulers) {
         ruler->setFont(font());
     }
@@ -742,6 +763,22 @@ void FiberMapView::setRulerModel(const FiberMapRulerModel& model)
 {
     for (const auto& ruler : _rulers) {
         ruler->setModel(model);
+    }
+    // Once the ceiling scrolls off, the top stack clamps to the viewport
+    // edge: the winding band keeps room beyond it for the kollesis band
+    // exactly while that has seams to show.
+    int outerTopBands = 0;
+    for (const auto& ruler : _rulers) {
+        if (ruler->edge() == FiberMapRuler::Edge::Top &&
+            ruler->mode() == FiberMapRuler::Mode::Kollesis && ruler->hasContent()) {
+            ++outerTopBands;
+        }
+    }
+    for (const auto& ruler : _rulers) {
+        if (ruler->edge() == FiberMapRuler::Edge::Top &&
+            ruler->mode() == FiberMapRuler::Mode::Windings) {
+            ruler->setStackDepth(outerTopBands);
+        }
     }
     viewport()->update();
 }
@@ -931,22 +968,66 @@ FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller,
            "(0: only fibers on the same winding count)."));
     toolBar->addWidget(_gapFadeWindingsSpin);
     toolBar->addSeparator();
+
+    // The kollesis seams, read from the kollesis termination tags.
+    _kollesisCheck = new QCheckBox(tr("Kollesis"), toolBar);
+    _kollesisCheck->setObjectName(QStringLiteral("fiberMapKollesisCheck"));
+    _kollesisCheck->setChecked(true);
+    _kollesisCheck->setToolTip(
+        tr("Mark the kollesis seams: H fibers tagged kollesis termination at\n"
+           "their left end bound a sheet's start, at their right end its end.\n"
+           "Terminations within the gap below group into one seam; each side's\n"
+           "bound is the vertical through its mean position, the band between\n"
+           "them is the overlap and the seam sits centred in it. The band above\n"
+           "the winding ruler ticks every seam and lengths the sheet between\n"
+           "them. Gaps that measure several sheets get predicted seams in amber,\n"
+           "as do the sheets extrapolated past the last tagged seam."));
+    toolBar->addWidget(_kollesisCheck);
+    _kollesisGapSpin = new QDoubleSpinBox(toolBar);
+    _kollesisGapSpin->setObjectName(QStringLiteral("fiberMapKollesisGapSpin"));
+    _kollesisGapSpin->setRange(0.05, 5.0);
+    _kollesisGapSpin->setDecimals(2);
+    _kollesisGapSpin->setSingleStep(0.05);
+    _kollesisGapSpin->setValue(0.75);
+    _kollesisGapSpin->setSuffix(tr(" windings"));
+    _kollesisGapSpin->setToolTip(
+        tr("Terminations farther apart than this along the map start a new\n"
+           "kollesis seam."));
+    toolBar->addWidget(_kollesisGapSpin);
+    _kollesisAheadSpin = new QSpinBox(toolBar);
+    _kollesisAheadSpin->setObjectName(QStringLiteral("fiberMapKollesisAheadSpin"));
+    _kollesisAheadSpin->setRange(0, 50);
+    _kollesisAheadSpin->setValue(3);
+    _kollesisAheadSpin->setSuffix(tr(" ahead"));
+    _kollesisAheadSpin->setToolTip(
+        tr("How many kollesis seams to predict past the last tagged one, one\n"
+           "estimated sheet length apart (0: none). The estimate is the mean\n"
+           "sheet length over the tagged seams' gaps; the amber band around each\n"
+           "prediction is its spread, growing with the sheets stepped."));
+    toolBar->addWidget(_kollesisAheadSpin);
+    toolBar->addSeparator();
     _statusLabel =
         new QLabel(tr("press Update"), toolBar);
     toolBar->addWidget(_statusLabel);
 
     _tree = new QTreeWidget(this);
-    _tree->setColumnCount(5);
-    _tree->setHeaderLabels(
-        {tr("Fiber"), tr("H/V"), tr("Winding"), tr("Anchor"), tr("Annotation")});
+    _tree->setColumnCount(kTreeColumnCount);
+    _tree->setHeaderLabels(treeHeaderLabels());
     _tree->setUniformRowHeights(true);
     _tree->setSelectionMode(QAbstractItemView::SingleSelection);
     // Everything but the annotation name takes only what it needs; the
     // annotation name gets the rest of the dock.
-    for (int column = 0; column < 4; ++column) {
+    for (int column = 0; column < kTreeAnnotationColumn; ++column) {
         _tree->header()->setSectionResizeMode(column, QHeaderView::ResizeToContents);
     }
     _tree->header()->setStretchLastSection(true);
+    _totalLengthLabel = new QLabel(this);
+    _totalLengthLabel->setObjectName(QStringLiteral("fiberMapTotalLengthLabel"));
+    _totalLengthLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    _totalLengthLabel->setToolTip(
+        tr("Sum of the line lengths of every fiber the map was built from,\n"
+           "placed or not. Centimetres when the annotation frame's voxel size\n"
+           "is known, otherwise voxels."));
     _searchEdit = new QLineEdit(this);
     _searchEdit->setObjectName(QStringLiteral("fiberMapSearch"));
     _searchEdit->setPlaceholderText(tr("Search fibers by label or name"));
@@ -958,8 +1039,10 @@ FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller,
     auto* dockLayout = new QVBoxLayout(dockBody);
     dockLayout->setContentsMargins(0, 0, 0, 0);
     dockLayout->setSpacing(2);
+    dockLayout->addWidget(_totalLengthLabel);
     dockLayout->addWidget(_searchEdit);
     dockLayout->addWidget(_tree, 1);
+    updateTotalLengthLabel();
     _fiberDock = new QDockWidget(tr("Fibers"), this);
     _fiberDock->setObjectName(QStringLiteral("fiberMapFiberDock"));
     _fiberDock->setFeatures(QDockWidget::DockWidgetMovable | QDockWidget::DockWidgetFloatable);
@@ -990,6 +1073,12 @@ FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller,
             [this](bool) { handleGapParamsChanged(); });
     connect(_gapFadeWindingsSpin, &QSpinBox::valueChanged, this,
             [this](int) { handleGapParamsChanged(); });
+    connect(_kollesisCheck, &QCheckBox::toggled, this,
+            [this](bool) { rebuildKollesisOverlay(); });
+    connect(_kollesisGapSpin, &QDoubleSpinBox::valueChanged, this,
+            [this](double) { rebuildKollesisOverlay(); });
+    connect(_kollesisAheadSpin, &QSpinBox::valueChanged, this,
+            [this](int) { rebuildKollesisOverlay(); });
     updateGapLegend();
     // Shift held at the click asks for the from-scratch rebuild (the
     // memoization check's other half); the plain click is the memoized Update.
@@ -1154,12 +1243,204 @@ double FiberMapWorkspace::sceneVxPerCm() const
 
 QString FiberMapWorkspace::formatMapLength(double valueVx) const
 {
-    if (_voxelSizeUm) {
-        return tr("%1 cm").arg(valueVx * *_voxelSizeUm / kUmPerCm, 0, 'f', 2);
-    }
     // The layout works in voxels, so the voxel count is exactly what it computed;
-    // only the trip to centimetres needs a voxel size, and there is none.
-    return tr("%1 vx").arg(std::llround(valueVx));
+    // only the trip to centimetres needs a voxel size. Whole voxels here: these
+    // are map distances (gap saturation, ruler spans), not fiber lengths.
+    return vc3d::fiber_length::formatLength(valueVx, _voxelSizeUm, /*vxDecimals=*/0);
+}
+
+void FiberMapWorkspace::updateTotalLengthLabel()
+{
+    if (!_totalLengthLabel) {
+        return;
+    }
+    if (!_layoutBuilt) {
+        _totalLengthLabel->setText(tr("Total fiber length: -"));
+        return;
+    }
+    double totalVx = 0.0;
+    for (const auto& [id, lengthVx] : _fiberLengthVx) {
+        if (std::isfinite(lengthVx)) {
+            totalVx += lengthVx;
+        }
+    }
+    _totalLengthLabel->setText(
+        tr("Total fiber length: %1  (%2 fibers)")
+            .arg(vc3d::fiber_length::formatLength(totalVx, _voxelSizeUm))
+            .arg(_fiberLengthVx.size()));
+}
+
+vc3d::fiber_map::kollesis::Model FiberMapWorkspace::buildKollesisModel() const
+{
+    using vc3d::fiber_map::kollesis::Termination;
+    std::vector<Termination> terminations;
+    for (const vc3d::fiber_map::GlobalPlacedFiber& placed : _layout.fibers) {
+        const vc3d::fiber_map::PlacedFiber& fiber = placed.fiber;
+        // Only H fibers run along the sheet; a V fiber's two ends sit at
+        // nearly one x and say nothing about which side of a seam they are.
+        if (fiber.hvTag != 'H' || fiber.controlPoints.size() < 2) {
+            continue;
+        }
+        const std::size_t last = fiber.controlPoints.size() - 1;
+        const double xFirst = fiber.controlPoints.front().x();
+        const double xLast = fiber.controlPoints.back().x();
+        for (const std::size_t index : {std::size_t{0}, last}) {
+            if (index >= fiber.kollesisTerminations.size() ||
+                !fiber.kollesisTerminations[index]) {
+                continue;
+            }
+            // Placed control points are (map x, +z).
+            const QPointF& point = fiber.controlPoints[index];
+            Termination termination;
+            termination.fiberId = fiber.id;
+            termination.controlIndex = static_cast<int>(index);
+            termination.xMapVx = point.x();
+            termination.xSceneVx = sceneXOf(point.x());
+            termination.zVx = point.y();
+            // The end at the smaller x is where the sheet starts.
+            termination.left = index == 0 ? xFirst <= xLast : xLast < xFirst;
+            terminations.push_back(termination);
+        }
+    }
+    vc3d::fiber_map::kollesis::Params params;
+    params.gapWindings = _kollesisGapSpin ? _kollesisGapSpin->value() : 0.75;
+    params.windingWidthVx = 2.0 * M_PI * _layout.rRefVx;
+    params.predictInterior = true;
+    params.extrapolateCount = _kollesisAheadSpin ? _kollesisAheadSpin->value() : 0;
+    return vc3d::fiber_map::kollesis::buildModel(std::move(terminations), params);
+}
+
+void FiberMapWorkspace::rebuildKollesisOverlay()
+{
+    for (QGraphicsItem* item : _kollesisItems) {
+        _scene->removeItem(item);
+        delete item;
+    }
+    _kollesisItems.clear();
+    _rulerModel.kollesis.clear();
+    _kollesisModel = {};
+    const bool wanted = _kollesisCheck && _kollesisCheck->isChecked();
+    if (!wanted || !_layoutBuilt || _layout.fibers.empty()) {
+        _view->setRulerModel(_rulerModel);
+        return;
+    }
+    _kollesisModel = buildKollesisModel();
+    const vc3d::fiber_map::kollesis::Model& model = _kollesisModel;
+    // Scene y is -z; the ruler model holds the scroll extent the seams span.
+    const double topY = _rulerModel.extentTopSceneY;
+    const double bottomY = _rulerModel.extentBottomSceneY;
+    const auto formatVx = [this](double lengthVx) {
+        return vc3d::fiber_length::formatLength(lengthVx, _voxelSizeUm, 0);
+    };
+
+    QPen boundPen(kollesisColor(180));
+    boundPen.setWidthF(1.2);
+    boundPen.setCosmetic(true);
+    QPen seamPen(kollesisColor(235));
+    seamPen.setWidthF(1.0);
+    seamPen.setCosmetic(true);
+    seamPen.setStyle(Qt::DashLine);
+    const QBrush bandBrush(kollesisColor(48));
+    QPen predictedPen(kollesisPredictionColor(225));
+    predictedPen.setWidthF(1.2);
+    predictedPen.setCosmetic(true);
+    predictedPen.setStyle(Qt::DotLine);
+    const QBrush predictedBrush(kollesisPredictionColor(32));
+
+    const auto addVertical = [&](double x, const QPen& pen, const QString& tip) {
+        auto* line = _scene->addLine(x, topY, x, bottomY, pen);
+        line->setZValue(kKollesisLineZ);
+        line->setToolTip(tip);
+        _kollesisItems.push_back(line);
+    };
+    const auto addBand = [&](double x0, double x1, const QBrush& brush, const QString& tip) {
+        auto* band = _scene->addRect(QRectF(QPointF(x0, topY), QPointF(x1, bottomY)).normalized(),
+                                     QPen(Qt::NoPen), brush);
+        band->setZValue(kKollesisBandZ);
+        band->setToolTip(tip);
+        _kollesisItems.push_back(band);
+    };
+
+    const vc3d::fiber_map::kollesis::SheetStatistics& stats = model.statistics;
+    QString statsLine;
+    if (stats.valid()) {
+        statsLine = tr("Sheet length %1 ± %2 over %3 gaps")
+                        .arg(formatVx(stats.unitLengthVx), formatVx(stats.spreadVx))
+                        .arg(model.sheetLengthVx.size());
+    }
+
+    for (std::size_t i = 0; i < model.seams.size(); ++i) {
+        const vc3d::fiber_map::kollesis::Seam& seam = model.seams[i];
+        const bool hasNext = i + 1 < model.seams.size();
+        QString tip = tr("Kollesis %1: %2 left, %3 right terminations")
+                          .arg(i + 1)
+                          .arg(seam.left ? seam.left->count : 0)
+                          .arg(seam.right ? seam.right->count : 0);
+        if (!seam.hasBand()) {
+            tip += tr("\nOne side only: the seam is drawn as a line, not a band.");
+        }
+        if (hasNext) {
+            tip += tr("\nGap to the next seam: %1").arg(formatVx(model.sheetLengthVx[i]));
+            if (stats.valid() && stats.sheetCounts[i] >= 2) {
+                tip += tr(", read as %1 sheets").arg(stats.sheetCounts[i]);
+            }
+        }
+        if (!statsLine.isEmpty()) {
+            tip += QLatin1Char('\n') + statsLine;
+        }
+        if (seam.hasBand()) {
+            addBand(seam.left->xVx, seam.right->xVx, bandBrush, tip);
+            addVertical(seam.left->xVx, boundPen, tip);
+            addVertical(seam.right->xVx, boundPen, tip);
+            addVertical(seam.xVx(), seamPen, tip);
+        } else {
+            addVertical(seam.xVx(), boundPen, tip);
+        }
+        FiberMapRulerModel::KollesisMark mark;
+        mark.xVx = seam.xVx();
+        mark.predicted = false;
+        _rulerModel.kollesis.push_back(mark);
+    }
+
+    for (const vc3d::fiber_map::kollesis::PredictedSeam& prediction : model.predicted) {
+        QString tip = prediction.extrapolated
+            ? tr("Predicted kollesis: %1 sheets past the last tagged seam")
+                  .arg(prediction.step)
+            : tr("Predicted kollesis: sheet %1 of %2 between seams %3 and %4, "
+                 "where no termination is tagged")
+                  .arg(prediction.step)
+                  .arg(stats.sheetCounts[static_cast<std::size_t>(prediction.gapIndex)])
+                  .arg(prediction.gapIndex + 1)
+                  .arg(prediction.gapIndex + 2);
+        if (prediction.spreadVx > 0.0) {
+            tip += tr("\n± %1").arg(formatVx(prediction.spreadVx));
+        }
+        if (!statsLine.isEmpty()) {
+            tip += QLatin1Char('\n') + statsLine;
+        }
+        if (prediction.spreadVx > 0.0) {
+            addBand(prediction.xVx - prediction.spreadVx, prediction.xVx + prediction.spreadVx,
+                    predictedBrush, tip);
+        }
+        addVertical(prediction.xVx, predictedPen, tip);
+        FiberMapRulerModel::KollesisMark mark;
+        mark.xVx = prediction.xVx;
+        mark.predicted = true;
+        _rulerModel.kollesis.push_back(mark);
+    }
+
+    // The bar reads tagged and predicted seams as one ascending sequence,
+    // with the length between each neighbouring pair.
+    std::sort(_rulerModel.kollesis.begin(), _rulerModel.kollesis.end(),
+              [](const FiberMapRulerModel::KollesisMark& a,
+                 const FiberMapRulerModel::KollesisMark& b) { return a.xVx < b.xVx; });
+    for (std::size_t i = 0; i < _rulerModel.kollesis.size(); ++i) {
+        _rulerModel.kollesis[i].toNextVx =
+            i + 1 < _rulerModel.kollesis.size()
+                ? _rulerModel.kollesis[i + 1].xVx - _rulerModel.kollesis[i].xVx
+                : std::numeric_limits<double>::quiet_NaN();
+    }
+    _view->setRulerModel(_rulerModel);
 }
 
 QString FiberMapWorkspace::withCachedUmbilicusStatus(const QString& status)
@@ -1221,6 +1502,7 @@ void FiberMapWorkspace::clearLayout(const QString& reason)
     // epoch bump refuses its publication.
     _rebuildQueue.invalidate();
     _voxelSizeUm.reset();
+    _fiberLengthVx.clear();
     updateGapLegend();
     _scrollZMaxVx = 0.0;
     // A fresh fit belongs to the next layout, which is not this one's frame.
@@ -1236,6 +1518,7 @@ void FiberMapWorkspace::clearLayout(const QString& reason)
     if (_tree) {
         _tree->clear();
     }
+    updateTotalLengthLabel();
     rebuildScene(reason);
     _restingReason = reason;
     _freshStatus = withCachedUmbilicusStatus(reason);
@@ -1497,6 +1780,10 @@ struct FiberMapWorkspace::RebuildJobResult {
     qint64 gapMs = 0;
     // Products.
     vc3d::fiber_map::GlobalResult layout;
+    // Every snapshot fiber's line length (annotation-frame voxels), read
+    // before the conversion consumes the line points; display only, so not
+    // part of either digest.
+    std::unordered_map<uint64_t, double> fiberLengthVx;
     vc3d::fiber_map::ContentDigest inputsDigest;
     vc3d::fiber_map::ContentDigest outputDigest;
     vc3d::fiber_map::GlobalLayoutCache::Stats stats;
@@ -1518,7 +1805,10 @@ void runRebuildJob(const std::shared_ptr<FiberMapWorkspace::RebuildJobResult>& j
         const auto convertBegin = std::chrono::steady_clock::now();
         std::vector<vc3d::fiber_map::InputFiber> inputs;
         inputs.reserve(job->snapshot.fibers.size());
+        job->fiberLengthVx.reserve(job->snapshot.fibers.size());
         for (auto& fiber : job->snapshot.fibers) {
+            job->fiberLengthVx[fiber.id] =
+                vc3d::line_annotation::fiberLineLengthVx(fiber.linePoints);
             vc3d::fiber_map::InputFiber input;
             input.id = fiber.id;
             input.fileName = fiber.fileName;
@@ -1959,6 +2249,7 @@ void FiberMapWorkspace::publishRebuild(RebuildJobResult& job)
     _latchedReason.clear();
     _restingReason.clear();
     _voxelSizeUm = job.snapshot.voxelSizeUm;
+    _fiberLengthVx = std::move(job.fiberLengthVx);
     // The scale's tooltip notes an assumed voxel size, which this may have
     // just replaced with the package's own.
     updateGapLegend();
@@ -2229,6 +2520,7 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
     _chipHideScale = 0.0;
     // Scene-owned: clear() deletes them.
     _gapTiles.clear();
+    _kollesisItems.clear();
     _scene->clear();
 
     // Kept so a theme change can rebuild the scene as it stands, without asking
@@ -2241,10 +2533,13 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
     // The axes read the layout through the view; an empty layout blanks them.
     // Their colours are the map's, so a theme switch re-styles them with the
     // same rebuild. The model is completed below once the extent is known.
-    _view->setRulerStyle(FiberMapRulerStyle{theme.surface, theme.inkSoft, theme.winding});
+    _view->setRulerStyle(FiberMapRulerStyle{theme.surface, theme.inkSoft, theme.winding,
+                                            kollesisColor(255), kollesisPredictionColor(255)});
 
     if (_layout.fibers.empty()) {
-        _view->setRulerModel(FiberMapRulerModel{});
+        _rulerModel = FiberMapRulerModel{};
+        _kollesisModel = {};
+        _view->setRulerModel(_rulerModel);
         auto* message = _scene->addSimpleText(emptyMessage);
         message->setBrush(theme.ink);
         _contentRect = message->boundingRect().adjusted(-40.0, -40.0, 40.0, 40.0);
@@ -2323,7 +2618,8 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
         rulerModel.extentBottomSceneY = extentBottomY;
         rulerModel.extentLeftSceneX = leftX;
         rulerModel.extentRightSceneX = rightX;
-        _view->setRulerModel(rulerModel);
+        _rulerModel = std::move(rulerModel);
+        _view->setRulerModel(_rulerModel);
     }
 
     // One ground for the whole map, spanning the scroll's own z extent.
@@ -2334,6 +2630,10 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
 
     // The gap heat map, when there is one and it is switched on.
     addGapTiles();
+
+    // The kollesis seams, over the ground and the heat map, under the grid
+    // and the fibers.
+    rebuildKollesisOverlay();
 
     // The winding grid, one line per integer winding. The numbers are the
     // top ruler's, which labels whatever is in view; the scene carries only
@@ -2681,25 +2981,35 @@ void FiberMapWorkspace::rebuildTree()
         }
         return text;
     };
+    // The fiber's line length as the len column shows it (its header names
+    // the unit); a fiber the snapshot did not measure reads as a dash.
+    const auto lengthText = [this](uint64_t fiberId) {
+        const auto it = _fiberLengthVx.find(fiberId);
+        return vc3d::fiber_length::formatValue(
+            it != _fiberLengthVx.end() ? it->second
+                                       : std::numeric_limits<double>::quiet_NaN(),
+            _voxelSizeUm);
+    };
+    const auto lengthOf = [this](uint64_t fiberId) {
+        const auto it = _fiberLengthVx.find(fiberId);
+        return it != _fiberLengthVx.end() && std::isfinite(it->second) ? it->second : 0.0;
+    };
     const auto addFiberRow = [&](QTreeWidgetItem* parent,
                                  const vc3d::fiber_map::GlobalPlacedFiber* row) {
         const QString annotationName =
             _controller ? _controller->fiberDisplayName(row->fiber.id) : QString();
-        auto* item = parent != nullptr
-            ? new QTreeWidgetItem(
-                  parent, {row->fiber.label, QString(QLatin1Char(row->fiber.hvTag)),
-                           windingText(row->meta), anchorText(row->meta),
-                           annotationName})
-            : new QTreeWidgetItem(
-                  _tree, {row->fiber.label, QString(QLatin1Char(row->fiber.hvTag)),
-                          windingText(row->meta), anchorText(row->meta),
-                          annotationName});
+        const QStringList columns{row->fiber.label, QString(QLatin1Char(row->fiber.hvTag)),
+                                  windingText(row->meta), lengthText(row->fiber.id),
+                                  anchorText(row->meta), annotationName};
+        auto* item = parent != nullptr ? new QTreeWidgetItem(parent, columns)
+                                       : new QTreeWidgetItem(_tree, columns);
         item->setData(0, Qt::UserRole, QVariant::fromValue<qulonglong>(row->fiber.id));
+        item->setTextAlignment(kTreeLengthColumn, Qt::AlignRight | Qt::AlignVCenter);
         const QColor color = fiberColor(row->fiber.hvTag, theme);
         for (int column = 0; column < _tree->columnCount(); ++column) {
             item->setForeground(column, color);
         }
-        item->setForeground(3, theme.inkSoft);
+        item->setForeground(kTreeAnchorColumn, theme.inkSoft);
     };
 
     // Every red mark on the map, as the status line counts them: each suspect
@@ -2766,10 +3076,15 @@ void FiberMapWorkspace::rebuildTree()
     }
 
     for (const auto& [id, members] : networks) {
+        double networkLengthVx = 0.0;
+        for (const vc3d::fiber_map::GlobalPlacedFiber* row : members) {
+            networkLengthVx += lengthOf(row->fiber.id);
+        }
         auto* networkItem = new QTreeWidgetItem(
-            _tree, {tr("Network %1 — %2 fibers")
+            _tree, {tr("Network %1 — %2 fibers · %3")
                         .arg(id + 1)
-                        .arg(members.size())});
+                        .arg(members.size())
+                        .arg(vc3d::fiber_length::formatLength(networkLengthVx, _voxelSizeUm))});
         networkItem->setForeground(0, theme.inkSoft);
         // A header across the whole row, so the columns stay narrow.
         networkItem->setFirstColumnSpanned(true);
@@ -2796,14 +3111,49 @@ void FiberMapWorkspace::rebuildTree()
             _controller ? _controller->fiberDisplayName(unplaced->id) : QString();
         auto* item = new QTreeWidgetItem(
             _tree, {unplaced->label, QString(QLatin1Char(unplaced->hvTag)),
-                    QStringLiteral("—"), tr("unplaceable"), annotationName});
+                    QStringLiteral("—"), lengthText(unplaced->id), tr("unplaceable"),
+                    annotationName});
         item->setData(0, Qt::UserRole, QVariant::fromValue<qulonglong>(unplaced->id));
+        item->setTextAlignment(kTreeLengthColumn, Qt::AlignRight | Qt::AlignVCenter);
         for (int column = 0; column < _tree->columnCount(); ++column) {
             item->setForeground(column, theme.inkSoft);
         }
     }
+    _tree->setHeaderLabels(treeHeaderLabels());
+    updateTotalLengthLabel();
     applyTreeFilter();
     _syncingSelection = guard;
+}
+
+QStringList FiberMapWorkspace::treeHeaderLabels() const
+{
+    QStringList labels;
+    labels.reserve(kTreeColumnCount);
+    for (int column = 0; column < kTreeColumnCount; ++column) {
+        switch (column) {
+        case kTreeFiberColumn:
+            labels << tr("Fiber");
+            break;
+        case kTreeHvColumn:
+            labels << tr("H/V");
+            break;
+        case kTreeWindingColumn:
+            labels << tr("Winding");
+            break;
+        case kTreeLengthColumn:
+            labels << vc3d::fiber_length::columnHeader(tr("Len"), _voxelSizeUm);
+            break;
+        case kTreeAnchorColumn:
+            labels << tr("Anchor");
+            break;
+        case kTreeAnnotationColumn:
+            labels << tr("Annotation");
+            break;
+        default:
+            break;
+        }
+    }
+    return labels;
 }
 
 void FiberMapWorkspace::applyTreeFilter()

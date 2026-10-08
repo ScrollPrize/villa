@@ -209,6 +209,13 @@ private:
     ViewerManager* activeWorkspaceViewerManager() const;
     void updateActiveWorkspaceViewerControls();
     void updateProjectNameLabel();
+    // Pushes the annotation frame's voxel size to the fiber panels so their
+    // lengths read in centimetres where the package can say, then refreshes
+    // the status bar's fiber-length readout.
+    void updateFiberLengthUnits();
+    // The status bar's fiber-length readout: the line length of the fiber
+    // open in the active Line Annotation tab; hidden for any other tab.
+    void updateLineAnnotationLengthLabel();
     void populateDockToggleMenu(QMenu* menu) const;
     void createAtlasWorkspace();
     void displayAtlasFromDirectory(const std::filesystem::path& atlasDir);
@@ -408,6 +415,10 @@ private:
     QLabel* _segmentationGrowthWarning{nullptr};
     QLabel* _segmentTransformWarning{nullptr};
     QLabel* _statusMessageLabel{nullptr};
+    QLabel* _lineAnnotationLengthLabel{nullptr};
+    // Line length (annotation-frame voxels) by runtime fiber id, as of the
+    // last fiber summaries; what the status bar readout is looked up in.
+    std::unordered_map<uint64_t, double> _fiberLengthVxById;
     QLabel* _sharedCacheStatsLabel{nullptr};
     QLabel* _persistentCacheLowSpaceLabel{nullptr};
     QLabel* _persistentCacheWarningText{nullptr};

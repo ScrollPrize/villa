@@ -11,25 +11,26 @@
 #include <QPointF>
 #include <QRectF>
 #include <QString>
+#include <QStringList>
 
 #include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "vc/core/util/ScrollUmbilicus.hpp"
 
 #include "AnnotationFrame.hpp"
 #include "FiberMapGapField.hpp"
+#include "FiberMapKollesis.hpp"
 #include "FiberMapRebuildQueue.hpp"
+#include "FiberMapRuler.hpp"
 #include "FiberMapStaleness.hpp"
 #include "FiberNetworkLayout.hpp"
 #include "OpenDataVolumeOrientation.hpp"
 
-class FiberMapRuler;
-struct FiberMapRulerModel;
-struct FiberMapRulerStyle;
 class LineAnnotationController;
 class QCheckBox;
 class QDockWidget;
@@ -174,6 +175,18 @@ private:
     void requestRebuild(bool fullRebuild = false, bool automatic = false);
     void rebuildScene(const QString& emptyMessage);
     void rebuildTree();
+    // The dock tree's columns, in order; the len column's header names the
+    // unit its cells are in (cm with a voxel size, else vx).
+    enum TreeColumn {
+        kTreeFiberColumn = 0,
+        kTreeHvColumn,
+        kTreeWindingColumn,
+        kTreeLengthColumn,
+        kTreeAnchorColumn,
+        kTreeAnnotationColumn,
+        kTreeColumnCount,
+    };
+    [[nodiscard]] QStringList treeHeaderLabels() const;
     // Hides every fiber row the search box does not match, and every group
     // (error, network) left without a visible row; an empty box shows all.
     void applyTreeFilter();
@@ -265,6 +278,20 @@ private:
     // is known, otherwise the voxel count itself, which is the one figure still
     // true when the package cannot say how big a voxel is.
     [[nodiscard]] QString formatMapLength(double valueVx) const;
+    // The dock's total: every fiber of the published snapshot summed, in the
+    // same unit as the tree's len column; a dash without a layout.
+    void updateTotalLengthLabel();
+    // The kollesis seams (FiberMapKollesis.hpp) read off the published
+    // layout's H fibers with the toolbar's grouping gap: the terminations,
+    // in map x for grouping and scene x for fitting, over the scroll's z
+    // extent.
+    [[nodiscard]] vc3d::fiber_map::kollesis::Model buildKollesisModel() const;
+    // Redraws the seams - the translucent overlap bands, their bound lines
+    // and midlines in the scene, and the ruler's kollesis marks - from the
+    // layout as it stands. Cheap (no solve), so the toolbar's kollesis
+    // controls call it directly; rebuildScene() calls it as part of every
+    // scene build.
+    void rebuildKollesisOverlay();
     void setHighlightedFiber(uint64_t fiberId);
     // The gap heat map (FiberMapGapField.hpp). The field is a pure function of
     // the published layout and the toolbar's settings: it is built on the
@@ -354,6 +381,14 @@ private:
     // fiber row's label and annotation name, re-applied after every tree
     // rebuild.
     QLineEdit* _searchEdit = nullptr;
+    // Above the search box: the summed line length of every fiber the
+    // published layout was built from, placed or not.
+    QLabel* _totalLengthLabel = nullptr;
+    // Line length in annotation-frame voxels by runtime fiber id, for every
+    // fiber of the published layout's snapshot (the layout itself keeps only
+    // the smoothed, unrolled geometry, which is not what a length is read
+    // from). Cleared with the layout.
+    std::unordered_map<uint64_t, double> _fiberLengthVx;
     QLabel* _statusLabel = nullptr;
     QCheckBox* _gapsCheck = nullptr;
     // The colour scale reads "0 [ramp] [saturation]": the spinbox IS the
@@ -363,6 +398,18 @@ private:
     QDoubleSpinBox* _gapSaturationSpin = nullptr;
     QCheckBox* _gapFadeCheck = nullptr;
     QSpinBox* _gapFadeWindingsSpin = nullptr;
+    // The kollesis seams: on/off (the whole feature, scene and bar), the
+    // grouping gap in windings, and how many seams to predict ahead.
+    QCheckBox* _kollesisCheck = nullptr;
+    QDoubleSpinBox* _kollesisGapSpin = nullptr;
+    QSpinBox* _kollesisAheadSpin = nullptr;
+    // Scene-owned seam items (bands, bounds, midlines); cleared with the
+    // scene, or removed and deleted by rebuildKollesisOverlay().
+    std::vector<QGraphicsItem*> _kollesisItems;
+    vc3d::fiber_map::kollesis::Model _kollesisModel;
+    // What the view's axes read, as last handed over: the layout's extent
+    // and windings, plus the kollesis marks the overlay rebuild fills in.
+    FiberMapRulerModel _rulerModel;
     // The published layout's gap field (null before a build that carried
     // one) and the settings it was built with, so a toggle can tell a field
     // it may show from one that needs a rebuild.

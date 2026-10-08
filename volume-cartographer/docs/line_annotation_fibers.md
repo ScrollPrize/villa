@@ -218,6 +218,63 @@ unchanged), in place of the traced or interpolated style, and marks every
 break point with the dotted amber rim. The flag is display-only in the map:
 it does not change heat-map seeding, winding evidence or publishing.
 
+## Fiber lengths
+
+The length of a fiber is the length of its line, summed over its points in
+the annotation frame (voxels). It is shown in centimetres when the
+annotation frame's voxel size is known (the volume package's metadata,
+through `annotationFrame().voxelSizeUm`) and in voxels otherwise; the unit
+is never guessed. Centimetres show two decimals everywhere. The shared
+formatting lives in `FiberLengthDisplay.hpp`.
+
+- The Fibers dock's `len` column carries the unit in its header (`len (cm)`
+  or `len (vx)`), the cells are bare numbers, and a total over the loaded
+  fibers sits at the top of the dock.
+- The main window's status bar shows "Fiber length" for the fiber open in
+  the active Line Annotation tab, left of the cache figures; it hides when
+  another workspace is active.
+- The Fiber Map's dock has the same `len` column, a total over every fiber
+  the map knows (placed or not) above the search box, and a per-network
+  total in each network header. The lengths are recorded by the rebuild job
+  before the layout consumes the line points, so they cost nothing extra.
+
+The `control len` of the HV classification is a different quantity (the
+control-point spacing) and stays in voxels.
+
+## Kollesis seams on the Fiber Map
+
+Fibers whose first or last control point carries `kollesis_termination`
+feed the map's kollesis overlay ("Kollesis" checkbox on the map's toolbar,
+on by default; the checkbox hides the whole overlay). Only H fibers count. A
+termination is the *left* side of a seam when it is the fiber's lower-x end
+and the *right* side when it is the higher-x end: the left ends are where
+the newer sheet starts, the right ends where the older sheet ends. The
+terminations are sorted by map x and split into seams wherever two
+neighbours are farther apart than the gap threshold (toolbar spinbox, in
+windings, default 0.75). Within a seam each side's bound is the vertical
+through that side's mean scene x, the band between the two bounds is the
+sheet overlap, drawn full scroll height in the kollesis yellow, and the seam
+itself is the dashed vertical centred between the bounds; a seam with one
+side only is a single line. A band above the winding ruler ticks every seam
+and prints the sheet length between neighbours (centimetres or voxels like
+the other rulers).
+
+The gaps between consecutive seams give a sheet-length estimate: the unit
+is seeded at the 25th percentile of the gaps, each gap is rounded to a
+whole number of sheets, and the unit becomes total gap length over total
+sheets (three refinements); the spread is the sample deviation of the
+per-sheet lengths. A gap read as k sheets gets k - 1 predicted seams spaced
+evenly across it, and the "ahead" spinbox (default 3) extrapolates that
+many seams past the last tagged one, one unit apart, with a spread that
+grows with the square root of the sheets stepped. Predictions draw in
+amber (255, 170, 0) as dotted verticals with a translucent band of plus or
+minus the spread, and in the ruler band as amber dotted ticks; a length
+touching a predicted seam is printed in amber. Every band and line carries
+a tooltip with the termination counts, the gap and its sheet reading, and
+the unit length with its spread. The overlay is display-only: it changes no
+layout, heat-map or publishing result. The grouping and statistics live in
+`FiberMapKollesis.hpp`.
+
 ## Overview bar during re-optimization
 
 The overview bar above the cut views places each control point at a

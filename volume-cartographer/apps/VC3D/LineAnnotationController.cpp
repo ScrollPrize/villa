@@ -15096,6 +15096,19 @@ uint64_t LineAnnotationController::fiberIdForFileName(const std::string& fileNam
     return it != _fibers.end() ? it->id : 0;
 }
 
+uint64_t LineAnnotationController::fiberIdForDialog(const LineAnnotationDialog* dialog) const
+{
+    if (!dialog) {
+        return 0;
+    }
+    for (const auto& pane : _panes) {
+        if (pane.dialog.data() == dialog && pane.session) {
+            return fiberIdForFileName(pane.session->fiberFileName);
+        }
+    }
+    return 0;
+}
+
 void LineAnnotationController::addKnownFiberTags(const std::vector<std::string>& tags)
 {
     for (const auto& tag : tags) {
