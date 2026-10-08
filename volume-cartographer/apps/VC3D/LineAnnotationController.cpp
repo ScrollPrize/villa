@@ -6558,6 +6558,7 @@ LineAnnotationController::resolveAlignmentMetricsDataset()
     try {
         auto dataset = openDataset(selected, 1.0);
         vpkg->setSelectedLasagnaDataset(selected);
+        ++_sheetFieldGeneration;
         return dataset;
     } catch (const std::exception& ex) {
         showError(tr("Cannot resolve Lasagna for the active volume: %1")
@@ -7012,6 +7013,22 @@ LineAnnotationController::umbilicusStatus() const
     return {false, tr("no umbilicus")};
 }
 
+std::filesystem::path LineAnnotationController::fiberMapPackageDirectory() const
+{
+    if (!_state || !_state->vpkg() || _state->vpkg()->path().empty()) {
+        return {};
+    }
+    return _state->vpkg()->path().parent_path();
+}
+
+std::string LineAnnotationController::sheetFieldLocation() const
+{
+    if (!_state || !_state->vpkg()) {
+        return {};
+    }
+    return _state->vpkg()->selectedLasagnaDataset();
+}
+
 std::string LineAnnotationController::fiberMapCoordinateSpace() const
 {
     // Read off the tags directly, like annotationFrame(): the coordinate
@@ -7061,6 +7078,39 @@ LineAnnotationController::FiberMapSnapshot LineAnnotationController::fiberMapSna
 
     // Which catalog volume this is, for the map's winding sense.
     snapshot.coordinateSpace = fiberMapCoordinateSpace();
+    // Which sheet normal field the bent rays would read, and where a local
+    // location resolves; the worker opens it.
+    snapshot.sheetFieldLocation = sheetFieldLocation();
+    snapshot.sheetFieldGeneration = _sheetFieldGeneration;
+    snapshot.packageDirectory = fiberMapPackageDirectory();
+
+    // Stored geometry lives in each fiber's own coordinate base (its
+    // coordinate_base_shape_zyx); the frame above is the volume's. For a
+    // fiber annotated in this volume's base the two agree and nothing moves;
+    // a fiber rebased to another level is carried into the frame exactly as
+    // its session displays it (base to volume grid), then by the frame's
+    // factor, so the map, the umbilicus and the sheet field read one frame.
+    // Only the STAMPED base is read here (this runs on the GUI thread and
+    // opens nothing): a fiber without the stamp is taken as annotated in
+    // the frame. Keep stored geometry in the snapshot and carry only the
+    // scale: the worker applies it after the selected field opens. With no
+    // field (including a failed open), main's stored coordinates survive.
+    std::optional<std::array<int, 3>> volumeShapeZYX;
+    try {
+        if (const auto volume = _state ? _state->currentVolume() : nullptr) {
+            volumeShapeZYX = volume->shape();
+        }
+    } catch (...) {
+        volumeShapeZYX.reset();
+    }
+    const auto frameScaleOf = [&](const StoredFiber& fiber) {
+        auto scale = vc3d::line_annotation::fiberMapFrameScale(
+            fiber.coordinateBaseShapeZYX, volumeShapeZYX, frame.factor, !snapshot.sheetFieldLocation.empty());
+        if (!scale.error.empty()) {
+            scale.error = "fiber " + std::to_string(fiber.id) + ": " + scale.error;
+        }
+        return scale;
+    };
 
     std::unordered_set<uint64_t> loadedIds;
     loadedIds.reserve(_fibers.size());
@@ -7096,6 +7146,7 @@ LineAnnotationController::FiberMapSnapshot LineAnnotationController::fiberMapSna
         }
         entry.controlPoints.assign(fiber.controlPoints.begin(), fiber.controlPoints.end());
         entry.linePoints = fiber.linePoints;
+        entry.sheetFieldFrameScale = frameScaleOf(fiber);
         const size_t spanCount =
             fiber.controlPoints.empty() ? 0 : fiber.controlPoints.size() - 1;
         entry.tracedSegments.reserve(spanCount);
@@ -10516,6 +10567,7 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
             return false;
         }
         vpkg->setSelectedLasagnaDataset(selected);
+        ++_sheetFieldGeneration;
     } else {
         if (!session.normalSampler || session.selectedDatasetLocation != selected ||
             session.workingToBaseScale != workingToBaseScale) {
@@ -10597,6 +10649,7 @@ void LineAnnotationController::handleLasagnaDatasetSelectionChanged(
         return;
     }
     vpkg->setSelectedLasagnaDataset(location);
+    ++_sheetFieldGeneration;
     for (const auto& pane : _panes) {
         if (!pane.session) {
             continue;
@@ -19374,4 +19427,3 @@ QString LineAnnotationController::takeLastSuppressedError()
     _lastSuppressedError.clear();
     return message;
 }
-

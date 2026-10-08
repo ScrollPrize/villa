@@ -693,6 +693,129 @@ the final CP, malformed config, or inconsistent mode diagnostics. They never
 repair, normalize, tag, or rewrite invalid v3 input. Sync routes it to the
 manual conflict workflow and keeps local, remote, and base files unchanged.
 
+## Fiber Map: bent rays where the sheet runs along the umbilicus ray
+
+The Fiber Map's winding solver reads every H/V pair where the two polylines
+share an angle and a height about the umbilicus and compares their radii
+there. That reading is exact where the sheet is a graph over (angle, height)
+and meaningless where the sheet contains the ray direction: a spoke (the
+sheet running along the umbilicus ray) or a shelf (the sheet level, its
+windings stacked in height). In PHerc0139 the lt-293 shelf gave three
+contradictory readings per pair and a ring on every one of them.
+
+With a lasagna dataset selected for the package (the Line Annotation
+dataset menu), the map reads the dataset's sheet normal field and bends
+the rays instead:
+
+- The field is read at every line point of every fiber. A sample whose sheet
+  normal is more than 60 degrees from the umbilicus ray, so that the ray lies
+  within 30 degrees of the sheet itself (the conditioning gate: |n . e_r|
+  below 0.5), is ill conditioned for the radial rule; every straight reading
+  at such a sample, or whose own intersection position reads so, is set
+  aside.
+- From each ill-conditioned run a curtain of rays is traced along the sheet
+  normal, outward and inward from the fiber, in steps of 0.002 cm up to
+  0.1 cm, one pair of rays every 0.002 cm of arclength. Where the other
+  fiber's polyline crosses that curtain, the side it crosses on is the
+  winding order, read by sign exactly as the radial rule reads r_h - r_v:
+  the V on the outward side of the H curtain is Inside, on the inward side
+  Outside. The ray's accumulated angle about the umbilicus lifts the hit to
+  its whole-turn translate. The reading's confidence is its transversality.
+  No voxel distance decides an order: ray length, step and spacing only
+  bound the tracing.
+- Which way is outward is decided from the annotation, never from where a
+  ray ends. The field's axis is transported along the fiber by continuity,
+  the fiber is cut into sections over which its well-conditioned samples
+  agree on the transported axis' sign against the umbilicus (a change of
+  sign between two of them is a flip of the transport or a returned sheet,
+  and the samples between are contested), and each section gets its
+  unanimous sign provisionally; the link witnesses then justify it: a plain
+  link says the centre lies on the V-to-H side, an adjacent link on the
+  H-to-V side. Witnesses that agree anchor the stretch, witnesses that all
+  disagree anchor it the other way (the stretch is counted anchor-corrected
+  and its straight readings on samples whose final normal points at the
+  umbilicus are set aside), mixed witnesses leave it contested. A stretch
+  with no witness is recorded but withheld: no bent reading constrains the
+  map unless a link justifies its orientation. The status line counts the
+  readings, the set-asides and the withheld records, so a fiber on a shelf
+  that still shows rings needs a link to activate its readings.
+- Folds are read for what they are. The sign rule reads the next layer
+  along the normal, and a fold puts layers out of order there, so three
+  topological signatures withhold readings (recorded, never constraining):
+  a reading beyond the point where the fiber's own line crosses the same
+  strip side (the sheet folds back through its curtain), one curtain reading
+  both kinds of a pair on one translate (the other fiber passes on both
+  sides of it), and the pair's two curtains with accepted orientations
+  disagreeing on one translate.
+  A reading on a ray shared by two strips checks both strips' fold limits;
+  a self-crossing on that ray bounds both strips. The earliest contributing
+  limit applies, regardless of which strip represents the merged record,
+  so reversal or rotation around the umbilicus cannot hide a fold.
+  It also competes for first encounter in every contributing strip on its
+  side and translate: an earlier usable hit in either strip removes the
+  shared reading. All strips compare the original usable hits, so neither
+  the display representative nor strip traversal order selects constraints.
+  No voxel distance is involved; the status line's withheld count includes
+  them and the pair coverage names the reason.
+- The curtain readings are cached with the pair's straight detections,
+  keyed by the field's identity (the manifest, every channel's array
+  metadata and the scale), the tracing parameters and the umbilicus cutoff;
+  a link or tag edit reruns only the assembly. A dataset location is taken
+  as immutable while VC3D runs: a local dataset edited in place needs a
+  restart. Without a selected dataset the map is the straight-ray map it
+  always was, bit for bit. Stored fiber coordinates are carried from their
+  stamped base into the volume's annotation frame only after a sheet field
+  opens, so its normals sample the intended positions. No selection or a
+  failed open retains the legacy stored geometry.
+  If the field opens but a stamped fiber cannot be converted (incompatible
+  or unavailable volume dimensions, or an invalid frame factor), the build
+  reports the conversion error. It never samples the field at a guessed
+  unit scale.
+- A bent reading the final map violates rings like any other error, at its
+  position on the H fiber; the event record keeps the 3D point where the
+  curtain was crossed.
+
+- A reading withheld only for want of a witness, with both seeds on samples
+  whose vote found a sign, constrains nothing but can supply fold evidence:
+  opposite kinds on one translate within that same orientation section
+  remain opposite whichever way its provisional orientation points. Across owners, a
+  single disagreement cannot override a link anchor: it may be only an
+  opposite provisional orientation, as on a clean shelf and ramp. Instead,
+  compare reciprocal readings within the same two continuous orientation
+  sections, matching each passage by translate and requiring both positions
+  within those sections. A section may contain several ill-conditioned
+  runs separated by well-conditioned samples; those runs share its sign. If
+  they agree at one passage and disagree at another, no flip reconciles
+  them: the involved anchored readings are withheld as fold ambiguity
+  (`folded`), without orienting or activating the unwitnessed readings.
+  This test uses neither ray length nor the final map's violations. Both
+  readings need sound geometry: an unambiguous lift, adequate
+  transversality, no contact, no crossing beyond the owner's fold, and no
+  crease crossing.
+- A reading whose ray bent through a crease of the field (its direction
+  turned by more than 60 degrees since its seed step while the field's axis
+  went through tangential, |axis . e_r| below 0.05) is recorded and withheld
+  (`creaseCrossed`): its field line is not trusted to read the next layer.
+  Use the larger turn and the smaller conditioning of the strip's two
+  bounding rays, up to the hit's row. At a shared ray or row, include all
+  incident strips' measures before choosing the representative. This
+  conservative rule is invariant under swapping the rays or rotating them
+  around the umbilicus. Both thresholds are bent-ray parameters. Such a
+  reading cannot displace a clean reading or supply unwitnessed fold evidence.
+- An effective non-contact straight reading of the same pair (the radial
+  rule where it was well conditioned) that reads the opposite kind on the
+  same translate outranks a bent reading: the bent reading is recorded and
+  withheld (`straightDisagrees`), since the field line it followed misread
+  the sheet somewhere along its way. These are the standalone readings and
+  traversal group verdicts after merging and seam classification; detections
+  superseded by a verdict do not veto bent readings independently.
+
+Pair coverage reports `replaced` when usable bent readings exist. Otherwise,
+withheld records report the first applicable reason in this order:
+`noWitness`, `contested`, `seamWithheld`, `unorientedRun`, `unsupportedRun`,
+`folded`, `beyondFold`, `creaseCrossed`, `straightDisagrees`, `liftAmbiguous`.
+With no non-contact bent records it reports `noBentReach`.
+
 ## Sync Conflict Handling
 
 `scripts/vc_sync.py` compares local and S3 content with the last successfully

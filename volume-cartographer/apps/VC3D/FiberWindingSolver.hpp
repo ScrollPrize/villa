@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 // Global winding assignment for unrolled fibers, from H-vs-V crossing evidence.
@@ -91,6 +92,11 @@ struct FiberTrace {
     std::vector<double> theta;
     std::vector<double> radius;
     std::vector<double> z;
+    // Per sample: excluded from the local radial-ordering cost (the sheet
+    // normal field found the sample ill-conditioned for the radial rule, or
+    // the annotation contradicted the rule's outward assumption there: see
+    // BentAssembly). Empty = none. Solve-time input, never cached.
+    std::vector<unsigned char> ordinalExcluded;
 };
 
 // One deduped link; point indices index the FiberTrace arrays.
@@ -260,8 +266,49 @@ struct Crossing {
     // neither limb's count. Counted by no group; both limbs' groups on its
     // translate are `onCurtain` and take no verdict.
     bool apex = false;
-    // The z-monotone V branch the event was found on.
+    // The z-monotone V branch the event was found on, and (straight
+    // detections) the branch segment and its parameter at the hit: the
+    // provenance the layout's conditioning gate reads the field at.
     std::size_t vBranch = 0;
+    std::size_t vBranchSegment = kNoSample;
+    double vU = 0.0;
+    // --- Bent readings (see FiberMapBentRays.hpp). Classified records only:
+    // a shard (PairDetections) never holds a bent Crossing, it holds the raw
+    // BentHit records the classification turns into these, so these fields
+    // are outside identicalPairDetections by construction. A bent record is a
+    // crossing of the other fiber's polyline with the curtain of bent rays
+    // traced from this fiber's ill-conditioned run; `deltaR` is the signed
+    // ray arclength (negative = the V on the outward side of the H = Inside,
+    // exactly as r_h - r_v reads), confidence is the transversality alone,
+    // and the record never merges, never counts in a traversal group and is
+    // never read as a seam.
+    bool bent = false;
+    // The curtain was the V fiber's (rays from the V, the H polyline read).
+    bool curtainFromV = false;
+    // Recorded, constraining nothing: the run's orientation was not
+    // justified by the annotation (no link witness, or contested), or the
+    // pair is a kollesis seam pair.
+    bool withheld = false;
+    // What justified the orientation: 0 none, 1 the umbilicus vote, 2 link
+    // witnesses.
+    int anchor = 0;
+    // Why the record constrains nothing (BentDisposition as an integer; 0 =
+    // usable).
+    int bentReason = 0;
+    // The 3D hit on the other polyline, in the fibers' frame.
+    double hitX = 0.0;
+    double hitY = 0.0;
+    double hitZ = 0.0;
+    double rayLengthVx = 0.0;
+    double turnDeg = 0.0;
+    double minConditioning = 1.0;
+    // The curtain owner's seed samples bounding the strip and the position
+    // across it (0 at seedA, 1 at seedB); the ill-conditioned run (stretch)
+    // of the owner the strip belongs to.
+    std::size_t seedA = kNoSample;
+    std::size_t seedB = kNoSample;
+    double across = 0.0;
+    std::size_t stretch = kNoSample;
     // The raw detection this record came from (its position in the pair's
     // detection order); unique per detection.
     std::size_t detection = 0;
@@ -441,6 +488,13 @@ struct SolveResult {
     // Segment-level gate tallies, for the build summary.
     int gatedSegmentCount = 0;
     int tangentialCount = 0;
+    // Bent readings (see BentHit): representatives that constrained, records
+    // withheld, straight detections set aside by the shards' conditioning
+    // gate and by the classification's radial-inversion mask.
+    int bentCrossingCount = 0;
+    int withheldCount = 0;
+    int setAsideCount = 0;
+    int radialInvertedCount = 0;
     // Phase timings (milliseconds): crossing detection + merge, and
     // everything after (constraints, repair, packing, ascent, islands).
     double detectMs = 0.0;
@@ -519,9 +573,173 @@ struct CanonicalTrace {
 // annotation (link, tag) enters, so an annotation edit never invalidates a
 // shard. classifyPairCrossings turns it into the constraints, events and
 // groups the solve consumes.
+// One crossing of a bent curtain by the other fiber's polyline, as the
+// geometry unit found it (FiberMapBentRays.hpp CurtainHit), in plain
+// values: link-free, so it belongs in the cached shard; the lift, the sign,
+// the preference and the withholding are decided at classification.
+struct BentHit {
+    // The curtain's owner: true when the rays were traced from the V.
+    bool ownerIsV = false;
+    // The owner's ill-conditioned run and the provisional side the hit lies
+    // on (+1 along the run's provisional normal).
+    std::size_t stretch = 0;
+    int side = 1;
+    std::size_t seedA = 0;
+    std::size_t seedB = 0;
+    double across = 0.0;
+    // Every contributing strip as an unordered pair of owner sample IDs,
+    // sorted and unique. Empty for legacy/hand-made single-strip hits.
+    // Shared-ray reduction must not use only the display representative.
+    std::vector<std::pair<std::size_t, std::size_t>> contributingStrips;
+    // The two rays' start points (the owner's seed positions in the
+    // fibers' frame): the strip's geometric identity, which no storage
+    // order and no gauge enters.
+    double startAX = 0.0;
+    double startAY = 0.0;
+    double startAZ = 0.0;
+    double startBX = 0.0;
+    double startBY = 0.0;
+    double startBZ = 0.0;
+    // Arclength and accumulated angle about the umbilicus along the strip
+    // at the hit (angle before the winding sense is applied).
+    double s = 0.0;
+    double theta = 0.0;
+    double hitX = 0.0;
+    double hitY = 0.0;
+    double hitZ = 0.0;
+    // The other polyline's segment (trace sample index) and parameter.
+    std::size_t segment = 0;
+    double t = 0.0;
+    double transversality = 0.0;
+    bool touch = false;
+    bool tangential = false;
+    // The earliest arclength at which the owner's OWN polyline crosses
+    // any contributing strip side beyond the seed edge (infinity when
+    // none does): a reading beyond it looks through the owner's fold.
+    double selfCrossingS = 0.0;
+    // The largest contributing ray turn between its seed step and the hit
+    // row, in degrees (CurtainHit::turnDeg); used by the crease rule.
+    double turnDeg = 0.0;
+    double minConditioning = 1.0;
+};
+
+// Why a bent record constrains nothing (Crossing::bentReason).
+enum class BentDisposition : int {
+    Usable = 0,
+    // The run's orientation has no link witness (anchorPolicy LinksOnly).
+    NoWitness = 1,
+    // The witnesses disagree among themselves.
+    Contested = 2,
+    // No witness and the vote was split / had no voters (UmbilicusOrLinks).
+    Unoriented = 3,
+    Unsupported = 4,
+    // The pair is a kollesis seam pair.
+    SeamWithheld = 5,
+    // The lift to a whole turn was ambiguous (residual over a quarter turn).
+    LiftAmbiguous = 6,
+    // The hit lies beyond the owner's own polyline crossing the same strip
+    // side: the owner's sheet folds back through its curtain there, and
+    // the layers beyond are not in order along the ray.
+    BeyondFold = 7,
+    // One curtain of the pair read both kinds on one translate, or the two
+    // curtains disagreed on one translate: the pair is folded between the
+    // fibers and no reading is of the next layer. Every reading of that
+    // translate is withheld. Also used when two continuous orientation
+    // sections have inconsistent relative signs across reciprocal passages:
+    // those involved readings are withheld without orienting an unwitnessed
+    // section or trusting its provisional sign alone.
+    Folded = 8,
+    // An effective straight reading of the pair (an uncovered representative
+    // or a traversal group's verdict, after seam classification) reads the
+    // opposite kind on the same translate: the
+    // field line the bent reading followed misread the sheet somewhere
+    // along its way (a crease, a spoke the normals cross), and the direct
+    // reading stands.
+    StraightDisagrees = 9,
+    // The ray bent through a crease of the field on its way (its direction
+    // turned by more than the crease angle while the field's axis went
+    // through tangential): the sheet turned over along the ray and the far
+    // side's reading is not of the next layer.
+    CreaseCrossed = 10,
+};
+
+// The assembly's decision on one curtain stretch of a fiber (an
+// ill-conditioned run with a transported basis): annotation-dependent,
+// computed every build from the link witnesses, never cached.
+struct BentStretchDecision {
+    // The owner's run, in trace samples.
+    std::size_t firstSample = 0;
+    std::size_t lastSample = 0;
+    // The continuous orientation section containing the run. Several
+    // ill-conditioned runs can share one transported sign across the
+    // well-conditioned samples between them. Unknown: this run alone.
+    std::size_t orientationFirstSample = kNoSample;
+    std::size_t orientationLastSample = kNoSample;
+    // Applied to the provisional side of every record of the stretch (-1:
+    // the witnesses contradicted the provisional anchor).
+    int finalSign = 1;
+    // 0 none, 1 the umbilicus vote, 2 link witnesses.
+    int anchor = 0;
+    bool withheld = true;
+    BentDisposition disposition = BentDisposition::NoWitness;
+    bool corrected = false;
+};
+
+// Everything the classification needs of one fiber's assembly.
+struct BentAssembly {
+    // Indexed like BentHit::stretch.
+    std::vector<BentStretchDecision> stretches;
+    // Per trace sample: the FINAL anchored normal points at the umbilicus
+    // (its straight readings are set aside, the sample excluded from the
+    // ordinal placement). Empty = none.
+    std::vector<unsigned char> radialInverted;
+    // Per sample: the provisional orientation there stands on
+    // well-conditioned voters (the sample lies in a vote section that found
+    // a sign), whether or not a witness anchored the stretch. A reading of
+    // an unwitnessed but voted sample constrains nothing. Opposite kinds
+    // within one such orientation section are fold evidence regardless of its sign;
+    // independent signs are comparable only up to a flip. Reciprocal
+    // readings of the same two sections that agree at one passage and
+    // disagree at another cannot be reconciled by any flip: those involved
+    // readings are withheld as fold ambiguity. Empty: unknown.
+    std::vector<unsigned char> votedOrientation;
+    // The inwardness of the final normal interpolated between two trace
+    // samples at parameter t, against the radial direction AT that
+    // interpolated position (the layout owns the umbilicus and the
+    // normals): NaN where either sample has no final normal. A straight
+    // hit whose inwardness is below -conditioningGate is set aside.
+    std::function<double(std::size_t, std::size_t, double)> inwardnessBetween;
+    // The radial rule's own clearance.
+    double conditioningGate = 0.5;
+    // The crease rule's thresholds (BentRayParams::creaseTurnDeg and
+    // creaseConditioning): a reading whose ray turned more than the one
+    // while the field's axis went below the other is withheld as
+    // CreaseCrossed. creaseTurnDeg <= 0 disables it.
+    double creaseTurnDeg = 60.0;
+    double creaseConditioning = 0.05;
+};
+
+// The two owners' assemblies and the winding sense, for
+// classifyPairCrossings. Null = no bent readings at all (the shard's
+// bentHits are ignored).
+struct BentClassification {
+    const BentAssembly* h = nullptr;
+    const BentAssembly* v = nullptr;
+    int chirality = 1;
+    // The pair is a kollesis seam pair: its bent records are withheld.
+    bool seamPair = false;
+};
+
 struct PairDetections {
     std::vector<Crossing> raw;
     std::vector<Crossing> shallow;
+    // Bent curtain crossings of both owners (H curtain vs V polyline, V
+    // curtain vs H polyline), raw.
+    std::vector<BentHit> bentHits;
+    // Straight detections set aside by the conditioning gate (ill
+    // conditioned at their own positions); their segments and translates
+    // went to uncoveredSegments / gapTranslates.
+    int setAsideCount = 0;
     std::size_t detectionCount = 0;
     // Sorted, unique.
     std::vector<long long> gapTranslates;
@@ -561,6 +779,16 @@ struct PairCrossings {
     // V segment (a fold's flat top). Disables the verdict on the translates
     // it touched (recorded on the groups).
     int unresolvedCount = 0;
+    // Bent readings: raw hits in the shard, representatives that constrain,
+    // records withheld (with the union of their reasons as bits of
+    // BentDisposition), straight detections set aside by the shard's gate
+    // (copied) and by the radial-inversion mask here.
+    int bentRawCount = 0;
+    int bentUsableCount = 0;
+    int bentWithheldCount = 0;
+    unsigned bentWithheldReasons = 0;
+    int setAsideCount = 0;
+    int radialInvertedCount = 0;
 };
 // One tagged end of an H fiber, to be read against a V fiber on a kollesis,
 // through the link the annotator drew between the two: the tagged control's
@@ -599,12 +827,18 @@ struct SeamAnchor {
 // there - read Inside like a tagged encounter and flagged kollesisInferred.
 // The layout supplies them from a first solve and solves again; the plain
 // solveWindings overload never infers.
+// `bent`: the owners' assemblies (see BentClassification) when the shard
+// carries bent hits; null reads none. Every bent record is its own
+// representative and event (mergedCount 1, no group, no seam reading); the
+// usable ones constrain like straight crossings with confidence =
+// transversality; the rest are recorded with `withheld`.
 [[nodiscard]] PairCrossings classifyPairCrossings(const PairDetections& detections,
                                                   const CanonicalTrace& h,
                                                   const CanonicalTrace& v,
                                                   const std::vector<SeamAnchor>& seams,
                                                   const std::vector<std::size_t>& inferredSeams,
-                                                  const SolverParams& params);
+                                                  const SolverParams& params,
+                                                  const BentClassification* bent = nullptr);
 
 // A detection shard bound to the current build's fiber indices.
 struct PairDetection {

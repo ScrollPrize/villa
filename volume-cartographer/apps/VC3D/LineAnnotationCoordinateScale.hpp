@@ -3,6 +3,8 @@
 #include "vc/lasagna/Manifest.hpp"
 
 #include <array>
+
+#include <opencv2/core.hpp>
 #include <cmath>
 #include <cstddef>
 #include <optional>
@@ -36,6 +38,73 @@ inline double resolveFiberBaseToVolumeScale(
     }
     return vc::lasagna::dyadicCoordinateScaleBetweenShapes(
         *fiberBaseShapeZYX, working, 5);
+}
+
+// The factor carrying a stored fiber's geometry (its coordinate base) into
+// the Fiber Map's annotation frame: base to the volume grid (the scale its
+// session displays it by), then the frame's factor (the volume grid scaled
+// into the annotation frame). 1 without a base shape; 1 for a fiber
+// annotated in this volume's base under exact tags, so nothing moves then.
+// Without a selected sheet field retain the legacy stored coordinates,
+// including when the stamp is incompatible with the volume.
+struct FiberMapFrameScale {
+    double value = 1.0;
+    // Deferred until the worker has successfully opened a sheet field.
+    std::string error;
+};
+
+inline FiberMapFrameScale fiberMapFrameScale(
+    const std::optional<std::array<std::size_t, 3>>& fiberBaseShapeZYX,
+    const std::optional<std::array<int, 3>>& volumeShapeZYX,
+    double frameFactor,
+    bool sheetFieldSelected)
+{
+    if (!sheetFieldSelected || !fiberBaseShapeZYX) {
+        return {};
+    }
+    try {
+        if (!volumeShapeZYX) {
+            throw std::runtime_error("active volume shape is unavailable");
+        }
+        if (!(frameFactor > 0.0) || !std::isfinite(frameFactor)) {
+            throw std::runtime_error("annotation frame factor must be positive and finite");
+        }
+        const double scale = resolveFiberBaseToVolumeScale(fiberBaseShapeZYX, *volumeShapeZYX) * frameFactor;
+        if (!(scale > 0.0) || !std::isfinite(scale)) {
+            throw std::runtime_error("composed fiber-to-frame scale must be positive and finite");
+        }
+        return {scale, {}};
+    } catch (const std::exception& ex) {
+        return {1.0, ex.what()};
+    }
+}
+
+// The Fiber Map's conversion of one stored fiber's geometry into the frame:
+// every control and line point scaled by fiberMapFrameScale (nothing
+// touched without a field or at scale 1). The snapshot computes the scale
+// from the fiber's STAMPED coordinate base only (no dataset access on the
+// GUI thread). The worker applies it after opening the field, so a missing
+// or unavailable field preserves the legacy coordinates byte for byte.
+inline void scaleFiberMapGeometry(std::vector<cv::Vec3d>& controlPoints,
+                                  std::vector<cv::Vec3d>& linePoints,
+                                  const FiberMapFrameScale& frameScale,
+                                  bool hasSheetField)
+{
+    if (!hasSheetField) {
+        return;
+    }
+    if (!frameScale.error.empty()) {
+        throw std::runtime_error("Cannot map stored fiber into the sheet field: " + frameScale.error);
+    }
+    if (frameScale.value == 1.0) {
+        return;
+    }
+    for (cv::Vec3d& point : controlPoints) {
+        point *= frameScale.value;
+    }
+    for (cv::Vec3d& point : linePoints) {
+        point *= frameScale.value;
+    }
 }
 
 // The line geometry is stored in the fiber manifest's base coordinates, while
