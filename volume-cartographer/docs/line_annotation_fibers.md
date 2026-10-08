@@ -218,6 +218,112 @@ unchanged), in place of the traced or interpolated style, and marks every
 break point with the dotted amber rim. The flag is display-only in the map:
 it does not change heat-map seeding, winding evidence or publishing.
 
+## Fiber lengths
+
+The length of a fiber is the arc length of its line between its first and
+last control point, in the annotation frame (voxels). The open tails the
+optimizer extrapolates past the end control points (the extrapolation
+distance, on both sides) are not counted: they are not annotated fiber, and
+they would swamp a short fiber. It is shown in centimetres when the
+annotation frame's voxel size is known (the volume package's metadata,
+through `annotationFrame().voxelSizeUm`) and in voxels otherwise; the unit
+is never guessed. Centimetres show two decimals everywhere. The shared
+formatting lives in `FiberLengthDisplay.hpp`.
+
+- The Fibers dock's `len` column carries the unit in its header (`len (cm)`
+  or `len (vx)`), the cells are bare numbers, and a total over the loaded
+  fibers sits at the top of the dock.
+- The main window's status bar shows "Fiber length" for the fiber open in
+  the active Line Annotation tab, left of the cache figures; it hides when
+  another workspace is active.
+- The Fiber Map's dock has the same `len` column, a total over every fiber
+  the map knows (placed or not) above the search box, and a per-network
+  total in each network header. The rebuild worker measures each fiber's
+  annotated span before the layout consumes the line points.
+
+The `control len` of the HV classification is a different quantity (the
+control-point spacing) and stays in voxels.
+
+## Kollesis seams on the Fiber Map
+
+Fibers whose first or last control point carries `kollesis_termination`
+feed the map's kollesis overlay ("Kollesis" checkbox on the map's toolbar,
+on by default; the checkbox hides the whole overlay). Only H fibers count. A
+termination is the *left* side of a seam when it is the fiber's lower-x end
+and the *right* side when it is the higher-x end: the left ends are where
+the newer sheet starts, the right ends where the older sheet ends. The
+terminations are sorted by map x and split into seams wherever two
+neighbours are farther apart than the gap threshold (toolbar spinbox, in
+windings, default 0.75). Within a seam each side's bound is the vertical
+through that side's mean scene x, the band between the two bounds is the
+sheet overlap, drawn full scroll height in the kollesis yellow, and the seam
+itself is the dashed vertical centred between the bounds; a seam with one
+side only is a single line. A band above the winding ruler ticks every seam
+and prints the sheet length between neighbours (centimetres or voxels like
+the other rulers).
+
+The gaps between consecutive seams give a sheet-length estimate: the unit
+is seeded at the 25th percentile of the gaps, each gap is rounded to a
+whole number of sheets, and the unit becomes total gap length over total
+sheets, repeated until the counts stop changing (the estimate is withheld
+if they have not within 32 passes); the spread is the sample deviation of
+the per-sheet lengths. A gap read as k sheets gets k - 1 predicted seams spaced
+evenly across it, and the "ahead" spinbox (default 3) extrapolates that
+many seams past the last tagged one, one unit apart, with a spread that
+grows with the square root of the sheets stepped. Predictions draw in
+amber (255, 170, 0) as dotted verticals with a translucent band of plus or
+minus the spread, and in the ruler band as amber dotted ticks; a length
+touching a predicted seam is printed in amber. A tagged seam's band and
+lines carry a tooltip with its termination counts, the gap to the next
+seam with its sheet reading when there is one, and the sheet-length
+estimate once there are two seams; a prediction's tooltip says which sheet
+of which gap it fills, or how many sheets past the last tagged seam it
+lies, with its spread. The estimate is withheld when it is unusable (the
+counts do not settle, or a gap would read as more than a hundred sheets),
+and nothing is predicted then. The overlay is display-only: it changes no
+layout, heat-map or publishing result. The grouping and statistics live in
+`FiberMapKollesis.hpp`.
+
+## Overview bar during re-optimization
+
+The overview bar above the cut views places each control point at a
+fraction of its width. While a solve is running, or edits are queued for
+one in auto-reoptimize mode, the line on screen is provisional and its
+sampling changes with every landing, so the bar keeps the dot layout of the
+last settled geometry: existing control points stay where they were, a new
+control point appears at its distance along the line from its neighbour,
+measured against the settled layout (so it lands where the current-position
+marker stood when it was placed, whatever the provisional line's sampling),
+and only once nothing is running or queued do the dots move to their
+settled positions, in one step. The current-position marker, the gap
+and damaged spans and clicks on the bar all map through the same layout, so
+they stay consistent with the dots. In manual mode the spliced line is the
+geometry and the bar follows it at once.
+
+## Current position across a landing
+
+Every landing renumbers the line, so the current position (the green
+marker, the cut views, and the spot the strip cameras are anchored on) has
+to be carried from the line that was on screen to the one that replaces it.
+It is carried relative to the control points around it, matched across the
+two lines by identity: inside a span, the nearest point of that span on the
+new line to the old spot, preferring the candidate nearest the spot's
+expected place in the span where another pass of the fiber runs through
+it at a comparable distance; past the last control (or before the first),
+the old spot if the new tail still runs through it, else the same
+arc-length distance from that control, clamped to the new line's end. A
+control point placed since the line on screen was published counts as one
+of its controls, at the spot it was placed at, so a cursor working past a
+new point is carried relative to that point. A nearest-point search over
+the whole line is used only when no control can be matched.
+This matters most while extending a fiber: the extrapolated tail is
+re-traced from the new last control on every landing and can come back
+shorter or routed differently, and the nearest vertex of the whole line to
+a spot deep in the old tail is usually on the neighbouring wrap, which
+used to drop the current position into the middle of the annotation.
+The log reports a landing where the whole-line search would have moved
+the position more than fifty samples away from the carried one.
+
 ## Span and control-point menus (strips)
 
 In either strip view a Ctrl+right-click opens either the **span menu** or the
@@ -560,7 +666,9 @@ metric. Detailed trace and Lasagna failures remain in their mode-specific
 fields. `normal_manifest` stores the Lasagna manifest location used by the
 span, and `fiber_manifest` stores the fiber-inference manifest location. A
 direct Lasagna span stores only the former; trace stores both because it samples
-Lasagna normals; direct cubic spline stores neither. Fallbacks retain the
+Lasagna normals. Direct cubic spline records the selected normal and fiber
+manifest locations too: although its geometry is spline-interpolated, the
+annotated strip still uses the normal field for display. Fallbacks retain the
 locations consulted by failed higher-priority attempts.
 
 For ordinary project datasets these values are the configured local or remote

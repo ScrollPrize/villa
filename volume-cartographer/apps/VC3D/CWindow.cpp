@@ -1,4 +1,5 @@
 #include "CWindow.hpp"
+#include "FiberLengthDisplay.hpp"
 #include "VolumeDisplayNames.hpp"
 #include "OpenDataCoordinateIdentity.hpp"
 #include "OpenDataLasagna.hpp"
@@ -2538,6 +2539,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     connect(_workspaceTabs, &QTabWidget::currentChanged, this, [this]() {
         scheduleWindowStateSave();
         updateActiveWorkspaceViewerControls();
+        updateLineAnnotationLengthLabel();
         QTimer::singleShot(0, this, &CWindow::updateProjectNameLabel);
     });
     connect(_workspaceTabs, &QTabWidget::tabCloseRequested, this, [this](int index) {
@@ -2765,6 +2767,18 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             });
     connect(_viewerManager.get(), &ViewerManager::sharedCacheStatsChanged,
             this, &CWindow::onSharedCacheStatsChanged);
+
+    // Left of the cache figures: the length of the fiber being annotated,
+    // while a Line Annotation tab is the active workspace.
+    _lineAnnotationLengthLabel = new QLabel(this);
+    _lineAnnotationLengthLabel->setObjectName(QStringLiteral("lineAnnotationLengthLabel"));
+    _lineAnnotationLengthLabel->setContentsMargins(8, 0, 8, 0);
+    _lineAnnotationLengthLabel->setToolTip(
+        tr("Line length of the fiber open in this Line Annotation tab. "
+           "Centimetres when the annotation frame's voxel size is known, "
+           "otherwise voxels."));
+    _lineAnnotationLengthLabel->hide();
+    statusBar()->addPermanentWidget(_lineAnnotationLengthLabel);
 
     _sharedCacheStatsLabel = new QLabel(this);
     _sharedCacheStatsLabel->setContentsMargins(8, 0, 8, 0);
@@ -7950,7 +7964,7 @@ void CWindow::CreateWidgets(void)
                     fiber.name,
                     fiber.controlPointCount,
                     fiber.linePointCount,
-                    fiber.lengthVx,
+                    fiber.annotatedLengthVx,
                     alignment,
                     spans,
                     fiber.hvZDistance,
@@ -7966,6 +7980,13 @@ void CWindow::CreateWidgets(void)
                     traceState,
                 });
             }
+            _fiberLengthVxById.clear();
+            _fiberLengthVxById.reserve(fibers.size());
+            for (const auto& fiber : fibers) {
+                _fiberLengthVxById[fiber.id] = fiber.annotatedLengthVx;
+            }
+            // Unit first, so the rebuilt rows below are texted once in it.
+            updateFiberLengthUnits();
             if (_fiberWidget) {
                 _fiberWidget->setFibers(entries);
                 _fiberWidget->setKnownTags(_lineAnnotationController->knownFiberTags());
@@ -8159,6 +8180,12 @@ void CWindow::CreateWidgets(void)
         connectFiberWidget(_fiberWidget);
         connectFiberWidget(_fiberSliceWidget);
         updateFiberList(_lineAnnotationController->fiberSummaries());
+        // The annotation frame (and so the cm conversion) follows the
+        // current volume; the lengths themselves do not change.
+        connect(_state, &CState::volumeChanged, this,
+                [this](const std::shared_ptr<Volume>&, const std::string&) {
+                    updateFiberLengthUnits();
+                });
     }
     connect(_fiberController.get(), &FiberAnnotationController::crosshairModeChanged,
             this, &CWindow::onFiberCrosshairModeChanged);
@@ -8861,6 +8888,51 @@ void CWindow::onSharedCacheStatsChanged(const QStringList& items)
     if (!items.isEmpty())
         _sharedCacheStatsItems = items;
     updateSharedStatusLabel();
+}
+
+void CWindow::updateFiberLengthUnits()
+{
+    if (_destroyingWindow) {
+        return;
+    }
+    std::optional<double> voxelSizeUm;
+    if (_lineAnnotationController) {
+        voxelSizeUm = _lineAnnotationController->annotationFrame().voxelSizeUm;
+    }
+    if (_fiberWidget) {
+        _fiberWidget->setAnnotationVoxelSizeUm(voxelSizeUm);
+    }
+    if (_fiberSliceWidget) {
+        _fiberSliceWidget->setAnnotationVoxelSizeUm(voxelSizeUm);
+    }
+    updateLineAnnotationLengthLabel();
+}
+
+void CWindow::updateLineAnnotationLengthLabel()
+{
+    if (_destroyingWindow || !_lineAnnotationLengthLabel) {
+        return;
+    }
+    auto* dialog = _workspaceTabs
+        ? qobject_cast<LineAnnotationDialog*>(_workspaceTabs->currentWidget())
+        : nullptr;
+    const uint64_t fiberId = (dialog && _lineAnnotationController)
+        ? _lineAnnotationController->fiberIdForDialog(dialog)
+        : 0;
+    const auto it = fiberId != 0 ? _fiberLengthVxById.find(fiberId)
+                                 : _fiberLengthVxById.end();
+    if (it == _fiberLengthVxById.end()) {
+        _lineAnnotationLengthLabel->clear();
+        _lineAnnotationLengthLabel->hide();
+        return;
+    }
+    // The same frame the Fibers dock converts with, read from the controller
+    // rather than cached here so the two can never disagree.
+    const std::optional<double> voxelSizeUm =
+        _lineAnnotationController->annotationFrame().voxelSizeUm;
+    _lineAnnotationLengthLabel->setText(
+        tr("Fiber length %1").arg(vc3d::fiber_length::formatLength(it->second, voxelSizeUm)));
+    _lineAnnotationLengthLabel->show();
 }
 
 void CWindow::updateSharedStatusLabel()

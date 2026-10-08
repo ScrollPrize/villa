@@ -21,6 +21,8 @@ class QPainterPath;
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -118,6 +120,33 @@ struct GeneratedOverlay {
         std::vector<uint64_t> branchIds;
         std::vector<BranchLink> branchLinks;
         std::optional<cv::Vec3d> direction;
+        // Arc length from the line start to this control, and the whole
+        // line's arc length, both measured on the line the control's
+        // linePosition indexes (the session's live line, which may be a
+        // provisional splice the dialog does not hold yet). Non-finite when
+        // the producer did not know the line.
+        double arcLength = std::numeric_limits<double>::quiet_NaN();
+        double lineArcLength = std::numeric_limits<double>::quiet_NaN();
+        // The control's point lies on the line at its linePosition (every
+        // control except one edited off the line without re-optimization).
+        // On the strips such a control is drawn at its arc length along the
+        // strip's centre line, which stays right while the strip still shows
+        // the previous frame; an off-line control is drawn at its own point.
+        bool onLine = false;
+        // Revision of the line the marker's linePosition and arcLength index
+        // (the session's lineRevision); 0 when unknown. A control set whose
+        // revision differs from the displayed line's (GeneratedViews::
+        // lineRevision) indexes a line that is not on screen yet.
+        uint64_t lineRevision = 0;
+        // Session-lifetime identity of the control (LineControlPoint::
+        // identity); 0 when the producer has none. Views match controls
+        // across publishes by this, never by point or index.
+        uint64_t identity = 0;
+        // Set only while the marker's linePosition indexes a line other than
+        // the displayed one (a provisional publish, re-expressed on the
+        // displayed line): the control's position ON the displayed line, for
+        // everything that draws spans between controls on it.
+        double displayedLinePosition = std::numeric_limits<double>::quiet_NaN();
     };
 
     struct PredSnapMarker {
@@ -206,6 +235,12 @@ struct GeneratedOverlay {
     // Present for strip overlays. Line positions above remain in original
     // LineModel point-index coordinates and are mapped only while projecting.
     vc::lasagna::LineStripPositionMap stripPositionMap;
+    // Strip overlays: the surface to project through instead of the viewer's
+    // current one. Set while a strip still shows the frame of its previous
+    // surface (overlay swap pending): the viewer has already adopted the new
+    // surface, whose grid origin and scale differ, while what is on screen is
+    // the old one, so the held overlay must be placed through the held surface.
+    std::shared_ptr<QuadSurface> projectionSurface;
 };
 
 struct GeneratedSpanAlignmentMetric {
@@ -260,6 +295,8 @@ inline void scaleGeneratedMarkerForVolume(GeneratedOverlay::PredSnapMarker& mark
 }
 
 struct GeneratedViews {
+    // Revision of the line these views were built from; 0 when unknown.
+    uint64_t lineRevision = 0;
     double fiberWidth = 0.0; // Display-volume voxels, not persisted units.
     double fiberWidthGapFraction = vc::fiber_tracer::kDefaultFiberWidthGapFraction;
     double fiberBaseToVolumeScale = 1.0;
@@ -676,15 +713,280 @@ inline std::pair<size_t, size_t> generatedLineIndexRangeWithinWinding(
 // through the clicked point: a click is meant to be off the line, and where
 // another pass of the same fiber runs through the cut plane the clicked point
 // can be nearer to that pass than to the local one.
+// A remapped position with the squared distance of the chosen line point
+// from the anchor.
+struct RemappedGeneratedLinePosition {
+    double position = 0.0;
+    double distanceSq = 0.0;
+};
+
+namespace remap_detail {
+
+template <typename Point>
+inline bool finiteLinePoint(const Point& p)
+{
+    return std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]);
+}
+
+// The point at a fractional position; nullopt when a vertex it needs is not
+// finite.
+template <typename Point>
+inline std::optional<Point> linePointAt(const std::vector<Point>& linePoints, double position)
+{
+    using Scalar = typename Point::value_type;
+    if (linePoints.empty() || !std::isfinite(position)) {
+        return std::nullopt;
+    }
+    const double maxPosition = static_cast<double>(linePoints.size() - 1);
+    const double p = std::clamp(position, 0.0, maxPosition);
+    const size_t a = static_cast<size_t>(std::floor(p));
+    const size_t b = std::min(a + 1, linePoints.size() - 1);
+    const double t = p - static_cast<double>(a);
+    if (!finiteLinePoint(linePoints[a])) {
+        return std::nullopt;
+    }
+    if (t <= 0.0 || a == b) {
+        return linePoints[a];
+    }
+    if (!finiteLinePoint(linePoints[b])) {
+        return std::nullopt;
+    }
+    return linePoints[a] + (linePoints[b] - linePoints[a]) * static_cast<Scalar>(t);
+}
+
+// Calls fn(position) for every candidate position of the bounded search:
+// the bounds themselves and every vertex strictly inside them.
+template <typename Fn>
+inline void forEachBoundedCandidate(double lo, double hi, Fn&& fn)
+{
+    fn(lo);
+    for (double i = std::floor(lo) + 1.0; i < hi; i += 1.0) {
+        fn(i);
+    }
+    if (hi > lo) {
+        fn(hi);
+    }
+}
+
+// The anchor projected onto segment `s` (vertices s and s+1), with the
+// parameter clamped so the position stays inside [lo, hi]; nullopt when the
+// segment lies outside the bounds or is not usable.
+template <typename Point>
+inline std::optional<RemappedGeneratedLinePosition> projectedOntoSegment(
+    const std::vector<Point>& linePoints,
+    const Point& anchor,
+    size_t s,
+    double lo,
+    double hi)
+{
+    using Scalar = typename Point::value_type;
+    if (s + 1 >= linePoints.size()) {
+        return std::nullopt;
+    }
+    const double tLo = std::max(0.0, lo - static_cast<double>(s));
+    const double tHi = std::min(1.0, hi - static_cast<double>(s));
+    if (tLo > tHi) {
+        return std::nullopt;
+    }
+    const Point& a = linePoints[s];
+    const Point& b = linePoints[s + 1];
+    if (!finiteLinePoint(a) || !finiteLinePoint(b)) {
+        return std::nullopt;
+    }
+    const Point segment = b - a;
+    const double lengthSq = static_cast<double>(segment.dot(segment));
+    double t = tLo;
+    if (lengthSq > 0.0) {
+        t = std::clamp(static_cast<double>((anchor - a).dot(segment)) / lengthSq, tLo, tHi);
+    }
+    const Point projected = a + segment * static_cast<Scalar>(t);
+    const Point delta = projected - anchor;
+    return RemappedGeneratedLinePosition{static_cast<double>(s) + t,
+                                         static_cast<double>(delta.dot(delta))};
+}
+
+}  // namespace remap_detail
+
+// The bounded core: nearest point of newLinePoints[lo..hi] (fractional
+// bounds, clamped to the line) to the anchor, with the continuity tiebreak
+// measured against `continuityPosition` (a position in the NEW line's
+// numbering where the spot is expected). Candidates are the bounds and the
+// vertices inside them, refined along the adjacent segments within the
+// bounds, so the distance returned is that of the position returned.
+// Nullopt without a finite candidate in the bounds.
+// remappedGeneratedLinePositionFromAnchor is this over the whole line with
+// the old position as the expectation.
+template <typename Point>
+inline std::optional<RemappedGeneratedLinePosition> remappedGeneratedLinePositionWithin(
+    const std::vector<Point>& newLinePoints,
+    const Point& anchor,
+    double continuityPosition,
+    double lo,
+    double hi)
+{
+    using namespace remap_detail;
+    if (newLinePoints.empty() || !finiteLinePoint(anchor) || !std::isfinite(lo) || !std::isfinite(hi)) {
+        return std::nullopt;
+    }
+    const double maxNewPosition = static_cast<double>(newLinePoints.size() - 1);
+    lo = std::clamp(lo, 0.0, maxNewPosition);
+    hi = std::clamp(hi, 0.0, maxNewPosition);
+    if (lo > hi) {
+        std::swap(lo, hi);
+    }
+    const double expected = std::isfinite(continuityPosition) ? continuityPosition : lo;
+    const auto distanceSqAt = [&](double position) -> std::optional<double> {
+        const auto point = linePointAt(newLinePoints, position);
+        if (!point) {
+            return std::nullopt;
+        }
+        const Point delta = *point - anchor;
+        return static_cast<double>(delta.dot(delta));
+    };
+    std::optional<double> nearestPosition;
+    double nearestDistanceSq = std::numeric_limits<double>::max();
+    forEachBoundedCandidate(lo, hi, [&](double position) {
+        if (const auto distanceSq = distanceSqAt(position);
+            distanceSq && *distanceSq < nearestDistanceSq) {
+            nearestDistanceSq = *distanceSq;
+            nearestPosition = position;
+        }
+    });
+    if (!nearestPosition) {
+        return std::nullopt;
+    }
+    // Continuity tiebreak (see above): among candidates within twice the
+    // nearest distance, prefer the one whose position is closest to the
+    // expected one. Outside edited regions the true match is at distance
+    // ~0, so the band is empty of impostors and this is a no-op.
+    {
+        constexpr double kTieDistanceSqFactor = 4.0;  // (2x distance)^2
+        const double tieThresholdSq = nearestDistanceSq * kTieDistanceSqFactor + 1.0e-12;
+        double chosenDelta = std::abs(*nearestPosition - expected);
+        forEachBoundedCandidate(lo, hi, [&](double position) {
+            const auto distanceSq = distanceSqAt(position);
+            if (!distanceSq || *distanceSq > tieThresholdSq) {
+                return;
+            }
+            const double delta = std::abs(position - expected);
+            if (delta < chosenDelta) {
+                chosenDelta = delta;
+                nearestPosition = position;
+                nearestDistanceSq = *distanceSq;
+            }
+        });
+    }
+    RemappedGeneratedLinePosition best{*nearestPosition, nearestDistanceSq};
+    // Fractional refinement along the two segments adjacent to the chosen
+    // candidate, within the bounds.
+    const size_t chosenVertex = static_cast<size_t>(std::floor(*nearestPosition));
+    for (const size_t s : {chosenVertex > 0 ? chosenVertex - 1 : chosenVertex, chosenVertex}) {
+        if (const auto projected = projectedOntoSegment(newLinePoints, anchor, s, lo, hi);
+            projected && projected->distanceSq < best.distanceSq) {
+            best = *projected;
+        }
+    }
+    return best;
+}
+
+// The position within [lo, hi] of the new line that passes within
+// `toleranceSq` of the anchor and is nearest to `expected`, considering
+// every segment overlapping the bounds (the anchor projected onto it,
+// clamped to the bounds); nullopt when no point of the bounded line is
+// within tolerance. Unlike the remap above this never trades a candidate
+// within tolerance for a nearer one: it answers "is the old spot still on
+// this stretch of the line, and if so where", for a stretch whose geometry
+// may have been re-traced past the spot.
+template <typename Point>
+inline std::optional<double> generatedLinePositionNearSpot(
+    const std::vector<Point>& newLinePoints,
+    const Point& anchor,
+    double expected,
+    double lo,
+    double hi,
+    double toleranceSq)
+{
+    using namespace remap_detail;
+    if (newLinePoints.empty() || !finiteLinePoint(anchor) || !std::isfinite(lo) || !std::isfinite(hi) ||
+        !(toleranceSq >= 0.0)) {
+        return std::nullopt;
+    }
+    const double maxNewPosition = static_cast<double>(newLinePoints.size() - 1);
+    lo = std::clamp(lo, 0.0, maxNewPosition);
+    hi = std::clamp(hi, 0.0, maxNewPosition);
+    if (lo > hi) {
+        std::swap(lo, hi);
+    }
+    const double reference = std::isfinite(expected) ? expected : lo;
+    // A passage is a maximal run of consecutive segments whose projections
+    // are within tolerance; it is represented by its closest point (ties:
+    // nearest the expectation). At a sampling as fine as the tolerance the
+    // neighbours of the closest point are within tolerance too, and must
+    // not be preferred for being nearer the expectation.
+    std::optional<double> bestPosition;
+    double bestDelta = std::numeric_limits<double>::max();
+    std::optional<RemappedGeneratedLinePosition> passage;
+    const auto closePassage = [&]() {
+        if (!passage) {
+            return;
+        }
+        const double delta = std::abs(passage->position - reference);
+        if (delta < bestDelta) {
+            bestDelta = delta;
+            bestPosition = passage->position;
+        }
+        passage.reset();
+    };
+    const auto consider = [&](const RemappedGeneratedLinePosition& candidate) {
+        if (candidate.distanceSq > toleranceSq) {
+            closePassage();
+            return;
+        }
+        if (!passage || candidate.distanceSq < passage->distanceSq ||
+            (candidate.distanceSq == passage->distanceSq &&
+             std::abs(candidate.position - reference) < std::abs(passage->position - reference))) {
+            passage = candidate;
+        }
+    };
+    // Two consecutive segments both within tolerance are one passage only
+    // if the line stays within tolerance through their shared vertex (a
+    // sharp turn around the spot is two passages).
+    const auto vertexOutsideTolerance = [&](size_t v) {
+        if (v >= newLinePoints.size() || !finiteLinePoint(newLinePoints[v])) {
+            return true;
+        }
+        const Point delta = newLinePoints[v] - anchor;
+        return static_cast<double>(delta.dot(delta)) > toleranceSq;
+    };
+    bool anySegment = false;
+    for (size_t s = static_cast<size_t>(std::floor(lo)); s + 1 < newLinePoints.size() &&
+                                                         static_cast<double>(s) < hi; ++s) {
+        if (anySegment && static_cast<double>(s) >= lo && vertexOutsideTolerance(s)) {
+            closePassage();
+        }
+        anySegment = true;
+        if (const auto projected = projectedOntoSegment(newLinePoints, anchor, s, lo, hi)) {
+            consider(*projected);
+        } else {
+            closePassage();
+        }
+    }
+    if (!anySegment) {
+        // A single position (lo == hi on a vertex, or a one-point line).
+        if (const auto point = linePointAt(newLinePoints, lo)) {
+            const Point delta = *point - anchor;
+            consider({lo, static_cast<double>(delta.dot(delta))});
+        }
+    }
+    closePassage();
+    return bestPosition;
+}
+
 template <typename Point>
 inline double remappedGeneratedLinePositionFromAnchor(const std::vector<Point>& newLinePoints,
                                                       const Point& anchor,
                                                       double oldPosition)
 {
-    using Scalar = typename Point::value_type;
-    const auto finite = [](const Point& p) {
-        return std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]);
-    };
     if (newLinePoints.empty()) {
         return 0.0;
     }
@@ -693,86 +995,9 @@ inline double remappedGeneratedLinePositionFromAnchor(const std::vector<Point>& 
         return 0.0;
     }
     const double fallback = std::clamp(oldPosition, 0.0, maxNewPosition);
-    if (!finite(anchor)) {
-        return fallback;
-    }
-    std::optional<size_t> nearestIndex;
-    double nearestDistanceSq = std::numeric_limits<double>::max();
-    for (size_t i = 0; i < newLinePoints.size(); ++i) {
-        const Point& point = newLinePoints[i];
-        if (!finite(point)) {
-            continue;
-        }
-        const Point delta = point - anchor;
-        const double distanceSq = static_cast<double>(delta.dot(delta));
-        if (distanceSq < nearestDistanceSq) {
-            nearestDistanceSq = distanceSq;
-            nearestIndex = i;
-        }
-    }
-    if (!nearestIndex) {
-        return fallback;
-    }
-    // Continuity tiebreak (see above): among vertices within twice the
-    // nearest distance, prefer the one whose index is closest to the old
-    // position. Outside edited regions the true match is at distance ~0, so
-    // the band is empty of impostors and this is a no-op.
-    {
-        constexpr double kTieDistanceSqFactor = 4.0;  // (2x distance)^2
-        const double tieThresholdSq =
-            nearestDistanceSq * kTieDistanceSqFactor + 1.0e-12;
-        double chosenIndexDelta = std::abs(
-            static_cast<double>(*nearestIndex) - oldPosition);
-        for (size_t i = 0; i < newLinePoints.size(); ++i) {
-            const Point& point = newLinePoints[i];
-            if (!finite(point)) {
-                continue;
-            }
-            const Point delta = point - anchor;
-            const double distanceSq = static_cast<double>(delta.dot(delta));
-            if (distanceSq > tieThresholdSq) {
-                continue;
-            }
-            const double indexDelta =
-                std::abs(static_cast<double>(i) - oldPosition);
-            if (indexDelta < chosenIndexDelta) {
-                chosenIndexDelta = indexDelta;
-                nearestIndex = i;
-                nearestDistanceSq = distanceSq;
-            }
-        }
-    }
-    double bestPosition = static_cast<double>(*nearestIndex);
-    double bestDistanceSq = nearestDistanceSq;
-    // Fractional refinement: project the anchor onto the two segments adjacent
-    // to the nearest vertex; each candidate segment must have both endpoints
-    // finite (the nearest vertex already is).
-    for (const size_t segmentStart :
-         {*nearestIndex > 0 ? *nearestIndex - 1 : *nearestIndex, *nearestIndex}) {
-        if (segmentStart + 1 >= newLinePoints.size()) {
-            continue;
-        }
-        const Point& a = newLinePoints[segmentStart];
-        const Point& b = newLinePoints[segmentStart + 1];
-        if (!finite(a) || !finite(b)) {
-            continue;
-        }
-        const Point segment = b - a;
-        const double lengthSq = static_cast<double>(segment.dot(segment));
-        if (!(lengthSq > 0.0)) {
-            continue;
-        }
-        const double t = std::clamp(
-            static_cast<double>((anchor - a).dot(segment)) / lengthSq, 0.0, 1.0);
-        const Point projected = a + segment * static_cast<Scalar>(t);
-        const Point delta = projected - anchor;
-        const double distanceSq = static_cast<double>(delta.dot(delta));
-        if (distanceSq < bestDistanceSq) {
-            bestDistanceSq = distanceSq;
-            bestPosition = static_cast<double>(segmentStart) + t;
-        }
-    }
-    return std::clamp(bestPosition, 0.0, maxNewPosition);
+    const auto remapped = remappedGeneratedLinePositionWithin(
+        newLinePoints, anchor, oldPosition, 0.0, maxNewPosition);
+    return remapped ? remapped->position : fallback;
 }
 
 inline double remappedGeneratedLinePosition(const std::vector<cv::Vec3f>& oldLinePoints,
@@ -1423,11 +1648,17 @@ inline std::vector<std::pair<double, double>> generatedSpanLineRanges(
     std::sort(sorted.begin(), sorted.end(), [](const auto* a, const auto* b) {
         return a->linePosition < b->linePosition;
     });
+    // On the displayed line: a provisional publish's positions index the
+    // controller's line, which is not what the spans are drawn on.
+    const auto shownPosition = [](const GeneratedOverlay::ControlPointMarker& m) {
+        return std::isfinite(m.displayedLinePosition) ? m.displayedLinePosition : m.linePosition;
+    };
     std::vector<std::pair<double, double>> ranges;
     for (size_t i = 1; i < sorted.size(); ++i) {
-        if (ownerHasFlag(*sorted[i - 1]) &&
-            sorted[i - 1]->linePosition < sorted[i]->linePosition) {
-            ranges.emplace_back(sorted[i - 1]->linePosition, sorted[i]->linePosition);
+        const double first = shownPosition(*sorted[i - 1]);
+        const double second = shownPosition(*sorted[i]);
+        if (ownerHasFlag(*sorted[i - 1]) && first < second) {
+            ranges.emplace_back(first, second);
         }
     }
     return ranges;
@@ -1841,6 +2072,74 @@ struct GeneratedStripContextTarget {
 // control point belongs to that point, the middle half is the span.
 constexpr double kGeneratedStripContextControlFraction = 0.25;
 
+// A control's position on the DISPLAYED line: its displayedLinePosition
+// while it is a provisional control re-expressed on that line, else its own
+// linePosition (which then indexes the displayed line).
+// A table a binary search may run on: every entry finite and nondecreasing
+// (std::is_sorted alone lets interior NaNs through).
+inline bool generatedFiniteSortedTable(const std::vector<double>& table)
+{
+    for (size_t i = 0; i < table.size(); ++i) {
+        if (!std::isfinite(table[i]) || (i > 0 && table[i] < table[i - 1])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+inline double generatedShownLinePosition(const GeneratedOverlay::ControlPointMarker& control)
+{
+    return std::isfinite(control.displayedLinePosition) ? control.displayedLinePosition
+                                                        : control.linePosition;
+}
+
+// The strip grid column at an arc length along the centre line, from the
+// map's per-column arc lengths (nondecreasing); clamped to the strip.
+inline double generatedStripGridColumnForArcLength(
+    const vc::lasagna::LineStripPositionMap& positionMap,
+    double arcLength)
+{
+    const auto& arcs = positionMap.stripGridArclengths;
+    if (!positionMap.valid() || arcs.empty() || !std::isfinite(arcLength) ||
+        !generatedFiniteSortedTable(arcs)) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    if (arcLength <= arcs.front()) {
+        return 0.0;
+    }
+    if (arcLength >= arcs.back() || !std::isfinite(arcs.back())) {
+        return static_cast<double>(arcs.size() - 1);
+    }
+    const auto upper = std::upper_bound(arcs.begin(), arcs.end(), arcLength);
+    const size_t b = static_cast<size_t>(upper - arcs.begin());
+    if (b == 0 || b >= arcs.size()) {
+        // A map with non-finite or unsorted entries: no interpolation.
+        return b == 0 ? 0.0 : static_cast<double>(arcs.size() - 1);
+    }
+    const size_t a = b - 1;
+    const double span = arcs[b] - arcs[a];
+    const double t = span > 0.0 && std::isfinite(span) ? (arcLength - arcs[a]) / span : 0.0;
+    return static_cast<double>(a) + std::clamp(t, 0.0, 1.0);
+}
+
+// The strip grid column a control is drawn at on this map's strip: by arc
+// length when the control's arc length is measured on this map's line, else
+// by its position on the displayed line. The one mapping every strip-side
+// consumer (markers, hover zones, direction picking) must share.
+inline double generatedStripControlGridColumn(const GeneratedOverlay::ControlPointMarker& control,
+                                              const vc::lasagna::LineStripPositionMap& positionMap)
+{
+    if (std::isfinite(control.arcLength) && positionMap.valid() && control.lineRevision != 0 &&
+        control.lineRevision == positionMap.lineRevision) {
+        const double column = generatedStripGridColumnForArcLength(positionMap, control.arcLength);
+        if (std::isfinite(column)) {
+            return column;
+        }
+    }
+    const double shown = generatedShownLinePosition(control);
+    return positionMap.valid() ? positionMap.originalPositionToStripGridColumn(shown) : shown;
+}
+
 // The strip's controls in line order with the strip grid column of each
 // control's line position on the centre line: the space the click zones are
 // measured in. Grid columns are nondecreasing in line order by construction
@@ -1866,13 +2165,16 @@ inline GeneratedStripContextIndex buildGeneratedStripContextIndex(
     std::vector<std::pair<double, size_t>> ordered;
     for (size_t i = 0; i < controlPoints.size(); ++i) {
         const auto& control = controlPoints[i];
+        // Validity and the fallback column are judged on the displayed line
+        // (a provisional control's own index may lie beyond it).
+        const double shown = generatedShownLinePosition(control);
         if (control.controlIndex == std::numeric_limits<size_t>::max() ||
-            !validGeneratedLinePosition(control.linePosition, linePointCount)) {
+            !validGeneratedLinePosition(shown, linePointCount)) {
             continue;
         }
         const double column = positionMap.valid()
-            ? positionMap.originalPositionToStripGridColumn(control.linePosition)
-            : control.linePosition;
+            ? positionMap.originalPositionToStripGridColumn(shown)
+            : shown;
         if (!std::isfinite(column)) {
             continue;
         }
@@ -1884,9 +2186,8 @@ inline GeneratedStripContextIndex buildGeneratedStripContextIndex(
     index.controlIndices.reserve(ordered.size());
     index.gridColumns.reserve(ordered.size());
     for (const auto& [linePosition, i] : ordered) {
-        double column = positionMap.valid()
-            ? positionMap.originalPositionToStripGridColumn(linePosition)
-            : linePosition;
+        const auto& control = controlPoints[i];
+        double column = generatedStripControlGridColumn(control, positionMap);
         // Monotonic by construction; this only absorbs rounding in the map.
         if (!index.gridColumns.empty()) {
             column = std::max(column, index.gridColumns.back());
@@ -1939,6 +2240,931 @@ inline std::optional<GeneratedStripContextTarget> generatedStripContextTarget(
         return GeneratedStripContextTarget{Kind::ControlPoint, rank};
     }
     return GeneratedStripContextTarget{Kind::Span, rank - 1};
+}
+
+// ---- Overview bar layout --------------------------------------------------
+// The overview bar draws each control at a fraction of its width. While a
+// solve is running or queued the line the controller publishes runs ahead of
+// the one on screen (a placement publishes its spliced controls before any
+// landing, landings resample and regrow tails), so drawn from live positions
+// the dots wander until the end. The bar therefore keeps the FRACTIONS of
+// the last settled geometry, keyed by each control's volume point, and
+// everything is measured in ARC LENGTH on the displayed line: a control still
+// present keeps its fraction; a newly placed one is placed by its arc length
+// between its matched neighbours (which is where the current-position marker
+// stood when it was placed, see generatedDisplaySpaceControlArcLengths) and
+// keeps that fraction until the geometry settles; the marker, the gap and
+// damaged pieces and the bar's clicks map through the same anchors, by arc
+// length, so they agree with the dots whatever the line's sampling.
+struct GeneratedOverviewAnchor {
+    // The control's identity (ControlPointMarker::identity); 0 when the
+    // producer has none, then the point stands in for it.
+    uint64_t identity = 0;
+    cv::Vec3f point{std::numeric_limits<float>::quiet_NaN(),
+                    std::numeric_limits<float>::quiet_NaN(),
+                    std::numeric_limits<float>::quiet_NaN()};
+    // On the line the anchors were computed for.
+    double linePosition = 0.0;
+    // Arc length from that line's start to the control (display units).
+    double arcLength = 0.0;
+    // Across the bar, 0..1, nondecreasing in line order.
+    double fraction = 0.0;
+};
+
+struct GeneratedOverviewLayout {
+    std::vector<GeneratedOverviewAnchor> anchors;
+    // Arc length of the whole line the anchors belong to.
+    double totalArcLength = 0.0;
+
+    bool empty() const { return anchors.empty(); }
+};
+
+// Cumulative arc length per line point (non-finite points add nothing).
+inline std::vector<double> generatedCumulativeArcLength(const std::vector<cv::Vec3f>& linePoints)
+{
+    std::vector<double> cumulative(linePoints.size(), 0.0);
+    for (size_t i = 1; i < linePoints.size(); ++i) {
+        double step = 0.0;
+        if (finiteGeneratedPoint(linePoints[i]) && finiteGeneratedPoint(linePoints[i - 1])) {
+            // In double: float coordinates at the volume's scale overflow a
+            // float difference long before they are implausible.
+            const cv::Vec3d delta = cv::Vec3d(linePoints[i]) - cv::Vec3d(linePoints[i - 1]);
+            step = cv::norm(delta);
+            if (!std::isfinite(step)) {
+                step = 0.0;
+            }
+        }
+        cumulative[i] = cumulative[i - 1] + step;
+    }
+    return cumulative;
+}
+
+// Arc length at a (fractional) line position, clamped to the line.
+inline double generatedArcLengthAt(const std::vector<double>& cumulative, double linePosition)
+{
+    if (cumulative.empty() || !std::isfinite(linePosition)) {
+        return 0.0;
+    }
+    const double last = static_cast<double>(cumulative.size() - 1);
+    const double p = std::clamp(linePosition, 0.0, last);
+    const size_t a = static_cast<size_t>(std::floor(p));
+    const size_t b = std::min(a + 1, cumulative.size() - 1);
+    const double t = p - static_cast<double>(a);
+    return cumulative[a] * (1.0 - t) + cumulative[b] * t;
+}
+
+// The (fractional) line position at an arc length; flat stretches (repeated
+// points) resolve to their first position.
+inline double generatedLinePositionAtArcLength(const std::vector<double>& cumulative, double arcLength)
+{
+    if (cumulative.empty() || !std::isfinite(arcLength) || !generatedFiniteSortedTable(cumulative)) {
+        return 0.0;
+    }
+    if (arcLength <= cumulative.front()) {
+        return 0.0;
+    }
+    // First point whose arc length reaches `arcLength`: exactly on a point
+    // (or on a run of repeated points) that is the point itself, the first
+    // of the run; otherwise interpolate from the previous one.
+    const auto lower = std::lower_bound(cumulative.begin(), cumulative.end(), arcLength);
+    const size_t b = static_cast<size_t>(lower - cumulative.begin());
+    if (b >= cumulative.size()) {
+        return static_cast<double>(cumulative.size() - 1);
+    }
+    if (cumulative[b] == arcLength || b == 0) {
+        return static_cast<double>(b);
+    }
+    const size_t a = b - 1;
+    const double span = cumulative[b] - cumulative[a];
+    return static_cast<double>(a) + (span > 0.0 ? (arcLength - cumulative[a]) / span : 0.0);
+}
+
+// ---------------------------------------------------------------------------
+// Carrying a line position across a line publish.
+//
+// remappedGeneratedLinePosition finds the old position's 3D point on the
+// NEW line by nearest vertex, anywhere on it. That is right where the new
+// line still passes through the old spot, and wrong where it does not: a
+// landing re-traces the extrapolated tails from the outer controls, and the
+// new tail can be shorter (the trace stops where it finds no candidates) or
+// routed differently. A position hundreds of voxels into the old tail then
+// has no near match on the new tail, and the nearest vertex of the whole
+// line is on the neighbouring wrap of the same fiber: the current position
+// jumps from the end being extended into the middle of the annotation.
+//
+// carriedGeneratedLinePosition keeps the position RELATIVE to the controls
+// around it instead, matched across the two lines by control identity:
+//  - between two matched controls, the nearest point on the new line to the
+//    old spot is searched within that span only, with the remap's continuity
+//    tiebreak against the position's share of the span (an unchanged span
+//    still resolves exactly; an edited one stays inside its span and on its
+//    own pass of the fiber);
+//  - beyond the last matched control (or before the first), the old spot is
+//    used where the new line still passes through it (within
+//    exactSpotTolerance, in the lines' units) past that control, the
+//    passage nearest the arc-length expectation below if there are several,
+//    else the position keeps its arc-length distance from the control on
+//    the new line, clamped to the new line's end: "300 voxels past the
+//    last control" stays that, however the tail was re-traced;
+//  - with no matched control to anchor on, the plain remap decides.
+// The controls of each line must index THAT line (the dialog's line-space
+// controls for the displayed line, the publish's own controls for the new
+// one); identity 0 and non-finite positions never match.
+struct GeneratedLineCarryControl {
+    uint64_t identity = 0;
+    double linePosition = std::numeric_limits<double>::quiet_NaN();
+};
+
+inline std::vector<GeneratedLineCarryControl> generatedLineCarryControls(
+    const std::vector<GeneratedOverlay::ControlPointMarker>& controls)
+{
+    std::vector<GeneratedLineCarryControl> carry;
+    carry.reserve(controls.size());
+    for (const auto& control : controls) {
+        carry.push_back({control.identity, control.linePosition});
+    }
+    return carry;
+}
+
+// Adds, to the anchors of the line with revision `lineRevision`, the
+// controls published since that line was last published with its own
+// controls: the resolved placement entries record, by identity, where on
+// that displayed line a control published for a later line was placed (or
+// estimated to be). An identity already among the anchors keeps its anchor.
+template <typename ResolvedPlacement>
+inline void appendGeneratedLineCarryControls(
+    std::vector<GeneratedLineCarryControl>& carry,
+    const std::vector<ResolvedPlacement>& resolvedPlacements,
+    uint64_t lineRevision)
+{
+    for (const auto& entry : resolvedPlacements) {
+        if (entry.identity == 0 || !std::isfinite(entry.linePosition) ||
+            entry.lineRevision != lineRevision) {
+            continue;
+        }
+        const bool known = std::any_of(carry.begin(), carry.end(), [&entry](const auto& control) {
+            return control.identity == entry.identity;
+        });
+        if (!known) {
+            carry.push_back({entry.identity, entry.linePosition});
+        }
+    }
+}
+
+inline double carriedGeneratedLinePosition(
+    const std::vector<cv::Vec3f>& oldLinePoints,
+    const std::vector<GeneratedLineCarryControl>& oldControls,
+    const std::vector<cv::Vec3f>& newLinePoints,
+    const std::vector<GeneratedLineCarryControl>& newControls,
+    double oldPosition,
+    double exactSpotTolerance = 1.0)
+{
+    if (newLinePoints.empty() || !std::isfinite(oldPosition)) {
+        return 0.0;
+    }
+    const double fallback =
+        remappedGeneratedLinePosition(oldLinePoints, newLinePoints, oldPosition);
+    if (oldLinePoints.empty()) {
+        return fallback;
+    }
+    const double maxOldPosition = static_cast<double>(oldLinePoints.size() - 1);
+    const double maxNewPosition = static_cast<double>(newLinePoints.size() - 1);
+    const double position = std::clamp(oldPosition, 0.0, maxOldPosition);
+
+    // An identity listed twice on either side (whatever its positions) is
+    // ambiguous and matches nothing.
+    std::unordered_set<uint64_t> ambiguous;
+    for (const auto* controls : {&oldControls, &newControls}) {
+        std::unordered_set<uint64_t> seen;
+        for (const auto& control : *controls) {
+            if (control.identity != 0 && !seen.insert(control.identity).second) {
+                ambiguous.insert(control.identity);
+            }
+        }
+    }
+    // New controls by identity.
+    std::unordered_map<uint64_t, double> newPositions;
+    for (const auto& control : newControls) {
+        if (control.identity == 0 || !std::isfinite(control.linePosition) ||
+            ambiguous.count(control.identity) != 0) {
+            continue;
+        }
+        newPositions.emplace(control.identity, control.linePosition);
+    }
+    const auto matched = [&](const GeneratedLineCarryControl& control) {
+        return control.identity != 0 && std::isfinite(control.linePosition) &&
+               newPositions.find(control.identity) != newPositions.end();
+    };
+
+    // The nearest matched old control at or before the position, and at or
+    // after it (the same control when the position sits exactly on one).
+    std::optional<GeneratedLineCarryControl> before;
+    std::optional<GeneratedLineCarryControl> after;
+    for (const auto& control : oldControls) {
+        if (!matched(control)) {
+            continue;
+        }
+        if (control.linePosition <= position &&
+            (!before || control.linePosition > before->linePosition)) {
+            before = control;
+        }
+        if (control.linePosition >= position &&
+            (!after || control.linePosition < after->linePosition)) {
+            after = control;
+        }
+    }
+    if (!before && !after) {
+        return fallback;
+    }
+    // Orientation of the new line relative to the old one, from the matched
+    // controls: reversed when the first and last matched controls (in old
+    // order) swapped order. With one matched control the order is assumed
+    // kept: a line is only ever reversed by a merge, which keeps every
+    // control of both fibers, so a reversal always matches two or more. (A
+    // guess from the line's direction at the one control was tried and
+    // rejected: a sharp local bend from a re-solve, a repeated point or a
+    // non-finite neighbour there would turn a kept line into a "reversed"
+    // one, which is worse than missing the reversal that cannot happen.)
+    bool reversed = false;
+    {
+        std::optional<GeneratedLineCarryControl> firstOld;
+        std::optional<GeneratedLineCarryControl> lastOld;
+        for (const auto& control : oldControls) {
+            if (!matched(control)) {
+                continue;
+            }
+            if (!firstOld || control.linePosition < firstOld->linePosition) {
+                firstOld = control;
+            }
+            if (!lastOld || control.linePosition > lastOld->linePosition) {
+                lastOld = control;
+            }
+        }
+        if (firstOld && lastOld && firstOld->identity != lastOld->identity) {
+            reversed = newPositions.at(lastOld->identity) < newPositions.at(firstOld->identity);
+        }
+    }
+    const cv::Vec3f anchor = interpolatedGeneratedLinePoint(oldLinePoints, position);
+    const double exactToleranceSq = std::isfinite(exactSpotTolerance) && exactSpotTolerance >= 0.0
+        ? exactSpotTolerance * exactSpotTolerance
+        : 0.0;
+
+    if (before && after) {
+        const double newBefore = newPositions.at(before->identity);
+        const double newAfter = newPositions.at(after->identity);
+        const double lo = std::clamp(std::min(newBefore, newAfter), 0.0, maxNewPosition);
+        const double hi = std::clamp(std::max(newBefore, newAfter), 0.0, maxNewPosition);
+        // Where the spot is expected in the new span: its share of the old
+        // one. The tiebreak keeps the search on this pass of the fiber where
+        // another pass runs through the span at a comparable distance.
+        const double oldSpan = after->linePosition - before->linePosition;
+        const double share = oldSpan > 0.0
+            ? std::clamp((position - before->linePosition) / oldSpan, 0.0, 1.0)
+            : 0.0;
+        const double expected =
+            newBefore <= newAfter ? lo + share * (hi - lo) : hi - share * (hi - lo);
+        if (const auto within = remappedGeneratedLinePositionWithin(
+                newLinePoints, anchor, expected, lo, hi)) {
+            return within->position;
+        }
+        // No finite geometry in the span: keep the position's share of it.
+        return expected;
+    }
+
+    // A tail: the old spot where the new line still passes through it past
+    // the one matched control (a kept tail, or a re-trace along the same
+    // path), else the arc-length distance from that control.
+    const std::vector<double> oldArcs = generatedCumulativeArcLength(oldLinePoints);
+    const std::vector<double> newArcs = generatedCumulativeArcLength(newLinePoints);
+    // The one matched control, the old arc distance from it to the
+    // position, and the side of the control the position is on in the
+    // new numbering (past the control along the new line's direction, or
+    // before it).
+    const GeneratedLineCarryControl& control = before ? *before : *after;
+    const double newControl = std::clamp(newPositions.at(control.identity), 0.0, maxNewPosition);
+    const double distance = std::abs(generatedArcLengthAt(oldArcs, position) -
+                                     generatedArcLengthAt(oldArcs, control.linePosition));
+    const bool pastControl = before.has_value() != reversed;
+    const double lo = pastControl ? newControl : 0.0;
+    const double hi = pastControl ? maxNewPosition : newControl;
+    const double carried = std::clamp(
+        generatedLinePositionAtArcLength(
+            newArcs, generatedArcLengthAt(newArcs, newControl) + (pastControl ? distance : -distance)),
+        lo, hi);
+    if (const auto spot = generatedLinePositionNearSpot(
+            newLinePoints, anchor, carried, lo, hi, exactToleranceSq)) {
+        return *spot;
+    }
+    return carried;
+}
+
+namespace overview_detail {
+inline std::vector<const GeneratedOverlay::ControlPointMarker*> lineOrderedControls(
+    const std::vector<GeneratedOverlay::ControlPointMarker>& controls)
+{
+    std::vector<const GeneratedOverlay::ControlPointMarker*> ordered;
+    for (const auto& control : controls) {
+        if (std::isfinite(control.linePosition)) {
+            ordered.push_back(&control);
+        }
+    }
+    std::stable_sort(ordered.begin(), ordered.end(),
+                     [](const auto* a, const auto* b) { return a->linePosition < b->linePosition; });
+    return ordered;
+}
+inline bool samePoint(const cv::Vec3f& a, const cv::Vec3f& b)
+{
+    constexpr float kToleranceVx = 1.0e-3f;
+    return finiteGeneratedPoint(a) && finiteGeneratedPoint(b) &&
+           std::abs(a[0] - b[0]) <= kToleranceVx && std::abs(a[1] - b[1]) <= kToleranceVx &&
+           std::abs(a[2] - b[2]) <= kToleranceVx;
+}
+inline double lerp(double a, double b, double t)
+{
+    return a + (b - a) * std::clamp(t, 0.0, 1.0);
+}
+// A control's arc length: the one its producer measured, else measured on
+// `cumulative` (then assumed to be the control's line).
+inline double controlArcLength(const GeneratedOverlay::ControlPointMarker& control,
+                               const std::vector<double>& cumulative)
+{
+    return std::isfinite(control.arcLength) ? control.arcLength
+                                            : generatedArcLengthAt(cumulative, control.linePosition);
+}
+inline double lineArcLength(const std::vector<const GeneratedOverlay::ControlPointMarker*>& ordered,
+                            const std::vector<double>& cumulative)
+{
+    for (const auto* control : ordered) {
+        if (std::isfinite(control->lineArcLength)) {
+            return control->lineArcLength;
+        }
+    }
+    return cumulative.empty() ? 0.0 : cumulative.back();
+}
+inline double arcFraction(double arcLength, double totalArcLength)
+{
+    return totalArcLength > 0.0 ? std::clamp(arcLength / totalArcLength, 0.0, 1.0) : 0.0;
+}
+// The anchor for a control: by identity when both sides have one (exact,
+// one anchor per control); otherwise, for producers without identities, the
+// first unused anchor within tolerance of the point. Anchors already `used`
+// are skipped (one control per anchor).
+inline const GeneratedOverviewAnchor* findAnchor(const std::vector<GeneratedOverviewAnchor>& anchors,
+                                                 uint64_t identity,
+                                                 const cv::Vec3f& point,
+                                                 std::vector<bool>* used = nullptr)
+{
+    const GeneratedOverviewAnchor* best = nullptr;
+    size_t bestIndex = 0;
+    // Exact identity first, over all anchors; the point only stands in
+    // where one side has no identity (an anonymous anchor must not shadow
+    // an identified control's own anchor).
+    if (identity != 0) {
+        for (size_t i = 0; i < anchors.size(); ++i) {
+            if (used && i < used->size() && (*used)[i]) {
+                continue;
+            }
+            if (anchors[i].identity == identity) {
+                best = &anchors[i];
+                bestIndex = i;
+                break;
+            }
+        }
+    }
+    if (!best) {
+        for (size_t i = 0; i < anchors.size(); ++i) {
+            if (used && i < used->size() && (*used)[i]) {
+                continue;
+            }
+            if ((identity == 0 || anchors[i].identity == 0) && samePoint(anchors[i].point, point)) {
+                best = &anchors[i];
+                bestIndex = i;
+                break;
+            }
+        }
+    }
+    if (best && used) {
+        if (used->size() < anchors.size()) {
+            used->resize(anchors.size(), false);
+        }
+        (*used)[bestIndex] = true;
+    }
+    return best;
+}
+// Anchors fit for the piecewise mappings: finite, nondecreasing arc length
+// and fraction (an unfit anchor is dropped, order kept).
+inline std::vector<GeneratedOverviewAnchor> mappingAnchors(const std::vector<GeneratedOverviewAnchor>& anchors)
+{
+    std::vector<GeneratedOverviewAnchor> fit;
+    for (const auto& anchor : anchors) {
+        if (!std::isfinite(anchor.arcLength) || !std::isfinite(anchor.fraction)) {
+            continue;
+        }
+        GeneratedOverviewAnchor a = anchor;
+        if (!fit.empty()) {
+            a.arcLength = std::max(a.arcLength, fit.back().arcLength);
+            a.fraction = std::max(a.fraction, fit.back().fraction);
+        }
+        fit.push_back(a);
+    }
+    return fit;
+}
+} // namespace overview_detail
+
+// The layout of a settled geometry: every control at its arc-length fraction
+// of the line it indexes (`linePoints`, consistent with the controls in a
+// settled publish; the controls' own arc lengths take precedence).
+inline GeneratedOverviewLayout generatedOverviewSettledLayout(
+    const std::vector<GeneratedOverlay::ControlPointMarker>& controls,
+    const std::vector<cv::Vec3f>& linePoints)
+{
+    using namespace overview_detail;
+    GeneratedOverviewLayout layout;
+    const auto ordered = lineOrderedControls(controls);
+    const auto cumulative = generatedCumulativeArcLength(linePoints);
+    layout.totalArcLength = lineArcLength(ordered, cumulative);
+    if (!std::isfinite(layout.totalArcLength) || layout.totalArcLength < 0.0) {
+        layout.totalArcLength = 0.0;
+    }
+    for (const auto* control : ordered) {
+        double arc = controlArcLength(*control, cumulative);
+        if (!std::isfinite(arc)) {
+            continue;
+        }
+        // Invariants the mappings rely on: arcs within the line and
+        // nondecreasing in line order (inconsistent metadata is clamped).
+        arc = std::clamp(arc, 0.0, std::max(layout.totalArcLength, 0.0));
+        if (!layout.anchors.empty()) {
+            arc = std::max(arc, layout.anchors.back().arcLength);
+        }
+        layout.anchors.push_back({control->identity, control->point, control->linePosition, arc,
+                                  arcFraction(arc, layout.totalArcLength)});
+    }
+    return layout;
+}
+
+// An arc length's fraction across the bar: piecewise linear in arc length
+// through the anchors (sorted by arc length), the tails stretched to the
+// bar's ends; without anchors the plain arc-length fraction.
+inline double generatedOverviewFraction(const std::vector<GeneratedOverviewAnchor>& rawAnchors,
+                                        double arcLength,
+                                        double totalArcLength)
+{
+    using namespace overview_detail;
+    if (!std::isfinite(arcLength)) {
+        return 0.0;
+    }
+    if (!std::isfinite(totalArcLength)) {
+        totalArcLength = 0.0;
+    }
+    const auto anchors = mappingAnchors(rawAnchors);
+    if (anchors.empty()) {
+        return arcFraction(arcLength, totalArcLength);
+    }
+    const auto& first = anchors.front();
+    const auto& last = anchors.back();
+    if (arcLength <= first.arcLength) {
+        return first.arcLength > 0.0 ? lerp(0.0, first.fraction, arcLength / first.arcLength)
+                                     : first.fraction;
+    }
+    if (arcLength >= last.arcLength) {
+        const double span = totalArcLength - last.arcLength;
+        return span > 0.0 ? lerp(last.fraction, 1.0, (arcLength - last.arcLength) / span)
+                          : last.fraction;
+    }
+    const auto upper = std::upper_bound(
+        anchors.begin(), anchors.end(), arcLength,
+        [](double value, const GeneratedOverviewAnchor& anchor) { return value < anchor.arcLength; });
+    const auto& b = *upper;
+    const auto& a = *(upper - 1);
+    const double span = b.arcLength - a.arcLength;
+    return span > 0.0 ? lerp(a.fraction, b.fraction, (arcLength - a.arcLength) / span) : a.fraction;
+}
+
+// The inverse: the arc length drawn at `fraction` of the bar.
+inline double generatedOverviewArcLength(const std::vector<GeneratedOverviewAnchor>& rawAnchors,
+                                         double fraction,
+                                         double totalArcLength)
+{
+    using namespace overview_detail;
+    if (!std::isfinite(fraction)) {
+        return 0.0;
+    }
+    if (!std::isfinite(totalArcLength)) {
+        totalArcLength = 0.0;
+    }
+    fraction = std::clamp(fraction, 0.0, 1.0);
+    const auto anchors = mappingAnchors(rawAnchors);
+    if (anchors.empty()) {
+        return fraction * std::max(totalArcLength, 0.0);
+    }
+    const auto& first = anchors.front();
+    const auto& last = anchors.back();
+    if (fraction <= first.fraction) {
+        return first.fraction > 0.0 ? lerp(0.0, first.arcLength, fraction / first.fraction)
+                                    : first.arcLength;
+    }
+    if (fraction >= last.fraction) {
+        const double span = 1.0 - last.fraction;
+        return span > 0.0 ? lerp(last.arcLength, totalArcLength, (fraction - last.fraction) / span)
+                          : last.arcLength;
+    }
+    const auto upper = std::upper_bound(
+        anchors.begin(), anchors.end(), fraction,
+        [](double value, const GeneratedOverviewAnchor& anchor) { return value < anchor.fraction; });
+    const auto& b = *upper;
+    const auto& a = *(upper - 1);
+    const double span = b.fraction - a.fraction;
+    return span > 0.0 ? lerp(a.arcLength, b.arcLength, (fraction - a.fraction) / span) : a.arcLength;
+}
+
+// The anchors while the geometry is in flight. `known` holds fractions by
+// control point (the settled layout's, plus the fractions already given to
+// controls placed since). A control found there keeps its fraction. Any
+// other gets its first fraction from `positionMapping` when given: the
+// anchors the current-position marker maps through (the displayed line's
+// controls with their known fractions), so a new control lands exactly where
+// the marker stood at its arc length, even when it replaces a control whose
+// anchor it does not inherit. Without a mapping it is placed between its
+// nearest known line-order neighbours by the ratio of ARC LENGTHS (the
+// controls' arc lengths must all be on one line: the displayed line, see
+// generatedDisplaySpaceControlArcLengths), toward the line's start before
+// the first known control and toward its end past the last; with nothing
+// known at all, at its arc-length fraction. Fractions are made nondecreasing
+// in line order.
+inline std::vector<GeneratedOverviewAnchor> generatedOverviewFrozenAnchors(
+    const std::vector<GeneratedOverviewAnchor>& known,
+    const std::vector<GeneratedOverlay::ControlPointMarker>& controls,
+    const std::vector<cv::Vec3f>& linePoints,
+    const std::vector<GeneratedOverviewAnchor>* positionMapping = nullptr)
+{
+    using namespace overview_detail;
+    const auto ordered = lineOrderedControls(controls);
+    const auto cumulative = generatedCumulativeArcLength(linePoints);
+    double total = lineArcLength(ordered, cumulative);
+    if (!std::isfinite(total) || total < 0.0) {
+        total = 0.0;
+    }
+    std::vector<GeneratedOverviewAnchor> anchors(ordered.size());
+    std::vector<bool> matched(ordered.size(), false);
+    std::vector<bool> usedKnown(known.size(), false);
+    for (size_t i = 0; i < ordered.size(); ++i) {
+        anchors[i].identity = ordered[i]->identity;
+        anchors[i].point = ordered[i]->point;
+        anchors[i].linePosition = ordered[i]->linePosition;
+        double arc = controlArcLength(*ordered[i], cumulative);
+        if (!std::isfinite(arc)) {
+            arc = i > 0 ? anchors[i - 1].arcLength : 0.0;
+        }
+        arc = std::clamp(arc, 0.0, total);
+        anchors[i].arcLength = i > 0 ? std::max(arc, anchors[i - 1].arcLength) : arc;
+        if (const auto* anchor = findAnchor(known, ordered[i]->identity, ordered[i]->point, &usedKnown)) {
+            anchors[i].fraction = anchor->fraction;
+            matched[i] = true;
+        }
+    }
+    for (size_t i = 0; i < anchors.size(); ++i) {
+        if (matched[i]) {
+            continue;
+        }
+        const double arc = anchors[i].arcLength;
+        if (positionMapping && !positionMapping->empty()) {
+            anchors[i].fraction = generatedOverviewFraction(*positionMapping, arc, total);
+            continue;
+        }
+        std::optional<size_t> prev;
+        std::optional<size_t> next;
+        for (size_t j = i; j-- > 0;) {
+            if (matched[j]) { prev = j; break; }
+        }
+        for (size_t j = i + 1; j < anchors.size(); ++j) {
+            if (matched[j]) { next = j; break; }
+        }
+        if (prev && next) {
+            const double span = anchors[*next].arcLength - anchors[*prev].arcLength;
+            anchors[i].fraction = span > 0.0
+                ? lerp(anchors[*prev].fraction, anchors[*next].fraction,
+                       (arc - anchors[*prev].arcLength) / span)
+                : anchors[*prev].fraction;
+        } else if (prev) {
+            const double span = total - anchors[*prev].arcLength;
+            anchors[i].fraction = span > 0.0
+                ? lerp(anchors[*prev].fraction, 1.0, (arc - anchors[*prev].arcLength) / span)
+                : anchors[*prev].fraction;
+        } else if (next) {
+            const double span = anchors[*next].arcLength;
+            anchors[i].fraction = span > 0.0
+                ? lerp(0.0, anchors[*next].fraction, arc / span)
+                : anchors[*next].fraction;
+        } else {
+            anchors[i].fraction = arcFraction(arc, total);
+        }
+    }
+    for (size_t i = 0; i < anchors.size(); ++i) {
+        anchors[i].fraction = std::clamp(anchors[i].fraction, 0.0, 1.0);
+        if (i > 0) {
+            anchors[i].fraction = std::max(anchors[i].fraction, anchors[i - 1].fraction);
+        }
+    }
+    return anchors;
+}
+
+// When the overview bar may adopt the live geometry as its settled layout.
+// Every publish precedes the controller's report on it, so a publish alone
+// never counts as settled; a placement request of the dialog that is still
+// out keeps the layout it was made against; controls re-expressed on the
+// displayed line, or indexing another line, are never a layout.
+struct GeneratedOverviewGateState {
+    bool layoutEmpty = true;
+    bool controlsRebased = false;
+    bool controlsIndexDisplayedLine = true;
+    bool solveRunning = false;
+    bool solvePending = false;
+    bool autoReoptimize = true;
+    bool geometryUnconfirmed = false;
+    bool placementOutstanding = false;
+};
+
+inline bool generatedOverviewGeometryInFlight(const GeneratedOverviewGateState& gate)
+{
+    // Queued edits only ever dispatch in auto mode; in manual mode the
+    // spliced line is the geometry until the user asks for a solve.
+    return gate.solveRunning || (gate.solvePending && gate.autoReoptimize);
+}
+
+inline bool generatedOverviewAdopts(const GeneratedOverviewGateState& gate)
+{
+    if (gate.controlsRebased || !gate.controlsIndexDisplayedLine) {
+        return false;
+    }
+    if (gate.layoutEmpty) {
+        return true;
+    }
+    return !generatedOverviewGeometryInFlight(gate) && !gate.geometryUnconfirmed &&
+           !gate.placementOutstanding;
+}
+
+// A control point placement the dialog has requested but whose publish has
+// not arrived: the point it asked for, the arc length (on the line the
+// dialog showed, revision `lineRevision`) of the position it was placed at,
+// the current-position marker's spot.
+struct GeneratedPendingPlacement {
+    cv::Vec3f point{std::numeric_limits<float>::quiet_NaN(),
+                    std::numeric_limits<float>::quiet_NaN(),
+                    std::numeric_limits<float>::quiet_NaN()};
+    // The point ON the displayed line at the placed-at position: what the
+    // request is re-placed through on a later displayed line (the clicked
+    // point may sit across the strip, nearest to another pass of the line).
+    cv::Vec3f anchor{std::numeric_limits<float>::quiet_NaN(),
+                     std::numeric_limits<float>::quiet_NaN(),
+                     std::numeric_limits<float>::quiet_NaN()};
+    // The request this entry belongs to; retired when the request returns
+    // without having placed a control (rejected, failed), so no later
+    // control can take its arc length.
+    uint64_t token = 0;
+    double arcLength = std::numeric_limits<double>::quiet_NaN();
+    // The placed-at position on that same displayed line (to re-place the
+    // request on a later displayed line through its 3D point).
+    double linePosition = std::numeric_limits<double>::quiet_NaN();
+    // The overview bar fraction the marker stood at when the request was
+    // made: the control's fraction until the geometry settles, whatever
+    // landings do to the mapping meanwhile. NaN when unknown.
+    double fraction = std::numeric_limits<double>::quiet_NaN();
+    uint64_t lineRevision = 0;
+    // Resolved entries only: the control that took this arc length, and
+    // whether it came from a placement of this dialog (drawn on the centre
+    // line) rather than from an estimate.
+    uint64_t identity = 0;
+    bool fromPlacement = false;
+};
+
+// Re-expresses controls published for a line that is NOT on screen (their
+// lineRevision differs from `displayedRevision`) in the DISPLAYED line's
+// arc-length space, `displayed` being that line's layout: a control present
+// there takes its displayed arc length; a control resolved by an earlier
+// publish (`resolved`, by its own point, for this displayed revision) takes
+// the arc length it was given then; a control the dialog asked to place
+// takes the recorded arc length of the spot it was placed at (the nearest
+// pending placement within tolerance, recorded for this displayed revision;
+// consumed into `resolved` under the control's point, so no other control
+// can claim it and the control keeps it across later publishes); any other
+// control is interpolated between its nearest resolved line-order neighbours
+// by the ratio of its own live arc lengths (and recorded in `resolved` too).
+// Arc lengths are made nondecreasing in line order, lineArcLength becomes
+// the displayed total and lineRevision the displayed revision: the controls
+// then read as the displayed line's.
+inline std::vector<GeneratedOverlay::ControlPointMarker> generatedDisplaySpaceControlArcLengths(
+    const GeneratedOverviewLayout& displayed,
+    std::vector<GeneratedOverlay::ControlPointMarker> controls,
+    std::vector<GeneratedPendingPlacement>& pending,
+    std::vector<GeneratedPendingPlacement>& resolved,
+    uint64_t displayedRevision,
+    const std::vector<cv::Vec3f>& displayedLinePoints = {})
+{
+    using namespace overview_detail;
+    if (displayed.empty()) {
+        return controls;
+    }
+    const double displayedTotal =
+        std::isfinite(displayed.totalArcLength) ? std::max(displayed.totalArcLength, 0.0) : 0.0;
+    // `onLine` was judged on the controller's line. A control not already on
+    // the displayed line (a new one) is on the displayed centre line only if
+    // the displayed point at its displayed arc length is where it is; off it
+    // (a click across the strip) its own point must be drawn, not the line.
+    const auto displayedCumulative = generatedCumulativeArcLength(displayedLinePoints);
+    std::vector<size_t> order;
+    for (size_t i = 0; i < controls.size(); ++i) {
+        if (std::isfinite(controls[i].linePosition)) {
+            order.push_back(i);
+        }
+    }
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        return controls[a].linePosition < controls[b].linePosition;
+    });
+    std::vector<double> liveArc(order.size()), displayArc(order.size(), 0.0);
+    std::vector<bool> resolvedHere(order.size(), false);
+    std::vector<bool> usedDisplayed(displayed.anchors.size(), false);
+    std::vector<bool> usedResolved(resolved.size(), false);
+    std::vector<bool> fromPlacement(order.size(), false);
+    double liveTotal = std::numeric_limits<double>::quiet_NaN();
+    for (size_t k = 0; k < order.size(); ++k) {
+        const auto& control = controls[order[k]];
+        liveArc[k] = control.arcLength;
+        if (std::isfinite(control.lineArcLength) && !std::isfinite(liveTotal)) {
+            liveTotal = control.lineArcLength;
+        }
+        if (const auto* anchor = findAnchor(displayed.anchors, control.identity, control.point, &usedDisplayed)) {
+            displayArc[k] = anchor->arcLength;
+            resolvedHere[k] = true;
+            continue;
+        }
+        // Resolved earlier in this flight: exact identity first, over all
+        // entries; the point stands in only where one side is anonymous (an
+        // anonymous entry must not shadow an identified control's own).
+        const auto takeResolved = [&](size_t r) {
+            displayArc[k] = resolved[r].arcLength;
+            resolvedHere[k] = true;
+            fromPlacement[k] = resolved[r].fromPlacement;
+            usedResolved[r] = true;
+        };
+        const auto eligible = [&](size_t r) {
+            return !usedResolved[r] && resolved[r].lineRevision == displayedRevision &&
+                   std::isfinite(resolved[r].arcLength);
+        };
+        if (control.identity != 0) {
+            for (size_t r = 0; r < resolved.size() && !resolvedHere[k]; ++r) {
+                if (eligible(r) && resolved[r].identity == control.identity) {
+                    takeResolved(r);
+                }
+            }
+        }
+        for (size_t r = 0; r < resolved.size() && !resolvedHere[k]; ++r) {
+            if (eligible(r) && (control.identity == 0 || resolved[r].identity == 0) &&
+                samePoint(resolved[r].point, control.point)) {
+                takeResolved(r);
+            }
+        }
+    }
+    // Pending placements: controls still unresolved, in line order, take the
+    // nearest placement within tolerance of their point (ties: the one
+    // recorded first along the line, so two controls at one point of a
+    // returning line get their own), one placement each.
+    {
+        std::vector<size_t> candidates;
+        for (size_t p = 0; p < pending.size(); ++p) {
+            if (pending[p].lineRevision == displayedRevision && std::isfinite(pending[p].arcLength) &&
+                finiteGeneratedPoint(pending[p].point)) {
+                candidates.push_back(p);
+            }
+        }
+        std::stable_sort(candidates.begin(), candidates.end(), [&](size_t a, size_t b) {
+            return pending[a].arcLength < pending[b].arcLength;
+        });
+        std::vector<bool> taken(pending.size(), false);
+        for (size_t k = 0; k < order.size(); ++k) {
+            if (resolvedHere[k]) {
+                continue;
+            }
+            const auto& control = controls[order[k]];
+            if (!finiteGeneratedPoint(control.point)) {
+                continue;
+            }
+            constexpr float kPlacementToleranceVx = 0.5f;
+            std::optional<size_t> best;
+            float bestDistanceSq = kPlacementToleranceVx * kPlacementToleranceVx;
+            for (size_t p : candidates) {
+                if (taken[p]) {
+                    continue;
+                }
+                const cv::Vec3f delta = pending[p].point - control.point;
+                const float distanceSq = delta.dot(delta);
+                if (distanceSq < bestDistanceSq || (!best && distanceSq <= bestDistanceSq)) {
+                    bestDistanceSq = distanceSq;
+                    best = p;
+                }
+            }
+            if (best) {
+                const size_t p = *best;
+                displayArc[k] = pending[p].arcLength;
+                resolvedHere[k] = true;
+                fromPlacement[k] = true;
+                taken[p] = true;
+                GeneratedPendingPlacement done = pending[p];
+                done.point = control.point;
+                done.lineRevision = displayedRevision;
+                done.identity = control.identity;
+                done.fromPlacement = true;
+                resolved.push_back(done);
+            }
+        }
+        for (size_t p = pending.size(); p-- > 0;) {
+            if (taken[p]) {
+                pending.erase(pending.begin() + static_cast<std::ptrdiff_t>(p));
+            }
+        }
+    }
+    std::vector<bool> interpolated(order.size(), false);
+    for (size_t k = 0; k < order.size(); ++k) {
+        if (resolvedHere[k]) {
+            continue;
+        }
+        interpolated[k] = true;
+        std::optional<size_t> prev;
+        std::optional<size_t> next;
+        for (size_t j = k; j-- > 0;) {
+            if (resolvedHere[j]) { prev = j; break; }
+        }
+        for (size_t j = k + 1; j < order.size(); ++j) {
+            if (resolvedHere[j]) { next = j; break; }
+        }
+        const bool haveLive = std::isfinite(liveArc[k]);
+        if (prev && haveLive && std::isfinite(liveArc[*prev])) {
+            const double liveSpan = next && std::isfinite(liveArc[*next])
+                ? liveArc[*next] - liveArc[*prev]
+                : (std::isfinite(liveTotal) ? liveTotal - liveArc[*prev] : 0.0);
+            const double displayTo = next ? displayArc[*next] : displayedTotal;
+            displayArc[k] = liveSpan > 0.0
+                ? lerp(displayArc[*prev], displayTo, (liveArc[k] - liveArc[*prev]) / liveSpan)
+                : displayArc[*prev];
+        } else if (next && haveLive && std::isfinite(liveArc[*next])) {
+            const double liveSpan = liveArc[*next];
+            displayArc[k] = liveSpan > 0.0
+                ? lerp(displayArc[*next], 0.0, (liveArc[*next] - liveArc[k]) / liveSpan)
+                : displayArc[*next];
+        } else {
+            displayArc[k] = std::isfinite(liveArc[k]) ? liveArc[k] : 0.0;
+        }
+    }
+    for (size_t k = 0; k < order.size(); ++k) {
+        displayArc[k] = std::isfinite(displayArc[k]) ? std::clamp(displayArc[k], 0.0, displayedTotal) : 0.0;
+        if (k > 0) {
+            displayArc[k] = std::max(displayArc[k], displayArc[k - 1]);
+        }
+        auto& control = controls[order[k]];
+        control.arcLength = displayArc[k];
+        control.lineArcLength = displayedTotal;
+        control.lineRevision = displayedRevision;
+        if (fromPlacement[k]) {
+            // (see below: placed by this dialog, drawn on the centre line)
+            control.onLine = true;
+        }
+        if (!displayedCumulative.empty()) {
+            control.displayedLinePosition =
+                generatedLinePositionAtArcLength(displayedCumulative, displayArc[k]);
+            if (fromPlacement[k]) {
+                // A control this dialog placed is drawn ON the displayed
+                // centre line at the spot it was placed at: the solve now
+                // running pulls the line through the point, so that is where
+                // it ends up along the line; its across-strip offset is a
+                // transient the stale strip cannot show faithfully anyway
+                // (and the 3D projection onto that strip fails too often to
+                // be relied on for it).
+                control.onLine = true;
+            } else if (!findAnchor(displayed.anchors, control.identity, control.point) &&
+                       finiteGeneratedPoint(control.point)) {
+                // A provisional control from elsewhere: on the displayed
+                // centre line only if the displayed point at its displayed
+                // arc is (about) where it is.
+                const cv::Vec3f onDisplayed = interpolatedGeneratedLinePoint(
+                    displayedLinePoints, control.displayedLinePosition);
+                constexpr float kOnLineToleranceVx = 0.5f;
+                control.onLine = finiteGeneratedPoint(onDisplayed) &&
+                                 cv::norm(control.point - onDisplayed) <= kOnLineToleranceVx;
+            }
+        }
+        if (interpolated[k] && finiteGeneratedPoint(control.point)) {
+            // Keep the estimate: a later publish of the same control must
+            // not re-estimate it from arc lengths that moved meanwhile.
+            GeneratedPendingPlacement estimate;
+            estimate.point = control.point;
+            estimate.arcLength = displayArc[k];
+            estimate.linePosition = control.displayedLinePosition;
+            estimate.lineRevision = displayedRevision;
+            estimate.identity = control.identity;
+            resolved.push_back(estimate);
+        }
+    }
+    return controls;
 }
 
 struct GeneratedControlPointContextMenuOptions {

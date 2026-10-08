@@ -492,7 +492,11 @@ class LineAnnotationOverviewBar final : public QWidget
 {
 public:
     struct ControlDot {
+        // For the click callback: the control's line position (in the
+        // session's line space, which the controller resolves).
         double linePosition = 0.0;
+        // Where the dot is drawn, 0..1 across the bar.
+        double fraction = 0.0;
         QColor color;
         // Edge colour; unset draws the fill's darker shade (the default look).
         std::optional<QColor> edge;
@@ -507,15 +511,25 @@ public:
 
     std::function<void(double, QPoint)> controlContextRequested;
 
+    // Dots and the gap/damaged pieces come in bar fractions. `positionAnchors`
+    // map the dialog's line positions (the current-position marker, clicks
+    // on the bar) to fractions (see GeneratedOverviewAnchor); empty means the
+    // plain proportional layout.
     void setLineData(size_t linePointCount,
                      std::vector<ControlDot> dots,
-                     std::vector<std::pair<double, double>> gapLineRanges,
-                     std::vector<std::pair<double, double>> damagedLineRanges)
+                     std::vector<std::pair<double, double>> gapFractionRanges,
+                     std::vector<std::pair<double, double>> damagedFractionRanges,
+                     std::vector<vc3d::line_annotation::GeneratedOverviewAnchor> positionAnchors,
+                     std::vector<double> cumulativeArcLength,
+                     double totalArcLength)
     {
         _linePointCount = linePointCount;
         _dots = std::move(dots);
-        _gapLineRanges = std::move(gapLineRanges);
-        _damagedLineRanges = std::move(damagedLineRanges);
+        _gapFractionRanges = std::move(gapFractionRanges);
+        _damagedFractionRanges = std::move(damagedFractionRanges);
+        _anchors = std::move(positionAnchors);
+        _cumulativeArcLength = std::move(cumulativeArcLength);
+        _totalArcLength = totalArcLength;
         update();
     }
 
@@ -526,6 +540,14 @@ public:
         update();
     }
 
+    // The bar fraction a line position (dialog line space) is drawn at.
+    double fractionForLinePosition(double position) const
+    {
+        const double arcLength =
+            vc3d::line_annotation::generatedArcLengthAt(_cumulativeArcLength, position);
+        return vc3d::line_annotation::generatedOverviewFraction(_anchors, arcLength, _totalArcLength);
+    }
+
     std::optional<double> linePositionAtLocalX(qreal x) const
     {
         const qreal inner = innerWidth();
@@ -534,7 +556,9 @@ public:
         }
         const double t =
             std::clamp((x - kMarginPx) / static_cast<double>(inner), 0.0, 1.0);
-        return t * static_cast<double>(_linePointCount - 1);
+        const double arcLength =
+            vc3d::line_annotation::generatedOverviewArcLength(_anchors, t, _totalArcLength);
+        return vc3d::line_annotation::generatedLinePositionAtArcLength(_cumulativeArcLength, arcLength);
     }
 
 protected:
@@ -557,14 +581,14 @@ protected:
             bool operator<(const Piece& other) const { return x0 < other.x0; }
         };
         std::vector<Piece> pieces;
-        for (const auto& [first, second] : _gapLineRanges) {
+        for (const auto& [first, second] : _gapFractionRanges) {
             if (std::isfinite(first) && std::isfinite(second) && second > first) {
-                pieces.push_back({xForLinePosition(first), xForLinePosition(second), false});
+                pieces.push_back({xForFraction(first), xForFraction(second), false});
             }
         }
-        for (const auto& [first, second] : _damagedLineRanges) {
+        for (const auto& [first, second] : _damagedFractionRanges) {
             if (std::isfinite(first) && std::isfinite(second) && second > first) {
-                pieces.push_back({xForLinePosition(first), xForLinePosition(second), true});
+                pieces.push_back({xForFraction(first), xForFraction(second), true});
             }
         }
         std::sort(pieces.begin(), pieces.end());
@@ -602,10 +626,10 @@ protected:
         }
 
         for (const ControlDot& dot : _dots) {
-            if (!std::isfinite(dot.linePosition)) {
+            if (!std::isfinite(dot.fraction)) {
                 continue;
             }
-            const qreal x = xForLinePosition(dot.linePosition);
+            const qreal x = xForFraction(dot.fraction);
             QPen edgePen = dot.edge ? QPen(*dot.edge, 1.5) : QPen(dot.color.darker(150), 1.0);
             if (dot.dottedEdge) {
                 edgePen.setStyle(Qt::DotLine);
@@ -631,11 +655,10 @@ protected:
             const ControlDot* best = nullptr;
             qreal bestDistance = kHitRadiusPx;
             for (const ControlDot& dot : _dots) {
-                if (!std::isfinite(dot.linePosition)) {
+                if (!std::isfinite(dot.fraction)) {
                     continue;
                 }
-                const qreal distance =
-                    std::abs(xForLinePosition(dot.linePosition) - x);
+                const qreal distance = std::abs(xForFraction(dot.fraction) - x);
                 if (distance <= bestDistance) {
                     bestDistance = distance;
                     best = &dot;
@@ -654,17 +677,26 @@ private:
 
     qreal innerWidth() const { return width() - 2.0 * kMarginPx; }
 
+    qreal xForFraction(double fraction) const
+    {
+        return kMarginPx + static_cast<qreal>(std::clamp(fraction, 0.0, 1.0)) * innerWidth();
+    }
+
     qreal xForLinePosition(double position) const
     {
-        const double t = std::clamp(
-            position / static_cast<double>(_linePointCount - 1), 0.0, 1.0);
-        return kMarginPx + static_cast<qreal>(t) * innerWidth();
+        const double arcLength =
+            vc3d::line_annotation::generatedArcLengthAt(_cumulativeArcLength, position);
+        return xForFraction(vc3d::line_annotation::generatedOverviewFraction(
+            _anchors, arcLength, _totalArcLength));
     }
 
     size_t _linePointCount = 0;
     std::vector<ControlDot> _dots;
-    std::vector<std::pair<double, double>> _gapLineRanges;
-    std::vector<std::pair<double, double>> _damagedLineRanges;
+    std::vector<vc3d::line_annotation::GeneratedOverviewAnchor> _anchors;
+    std::vector<double> _cumulativeArcLength;
+    double _totalArcLength = 0.0;
+    std::vector<std::pair<double, double>> _gapFractionRanges;
+    std::vector<std::pair<double, double>> _damagedFractionRanges;
     double _currentPosition = std::numeric_limits<double>::quiet_NaN();
     QColor _currentColor{0, 245, 255};
 };
@@ -716,6 +748,8 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
         tr("Checked: re-optimize the line after every control-point edit.\n"
            "Unchecked: no optimization until \"Reinit reoptimization\" or close."));
     connect(_autoReoptimizeAction, &QAction::toggled, this, [this](bool checked) {
+        _overviewLayoutDirty = true;  // the gate reads the mode
+        updateOverviewBar();
         emit reoptimizationModeChanged(checked ? ReoptimizationMode::AutoReoptimize
                                                : ReoptimizationMode::NoOptimization);
     });
@@ -1356,6 +1390,7 @@ void LineAnnotationDialog::setGeneratedControlPoints(
     }
     _generatedViews.controlPoints = std::move(controlPoints);
     invalidateStripContextIndex();
+    rebaseProvisionalControlArcLengths();
     _generatedViews.spanAlignmentMetrics.clear();
     _generatedControlIndex =
         vc3d::line_annotation::buildGeneratedControlPointLinePositionIndex(
@@ -1406,6 +1441,7 @@ void LineAnnotationDialog::setGeneratedBranchOverlayData(
         std::move(branchLinks),
         std::move(spanAlignmentMetrics));
     invalidateStripContextIndex();
+    rebaseProvisionalControlArcLengths();
     _generatedControlIndex =
         vc3d::line_annotation::buildGeneratedControlPointLinePositionIndex(
             _generatedViews.controlPoints);
@@ -1568,6 +1604,181 @@ void LineAnnotationDialog::setOptimizationStatus(bool optimized)
 {
     _optimizationStatusOptimized = optimized;
     updateOptimizationStatusIndicator();
+}
+
+void LineAnnotationDialog::setLineSolveActivity(bool running, bool pending)
+{
+    const bool changed = _lineSolveRunning != running || _lineSolvePending != pending;
+    _lineSolveRunning = running;
+    _lineSolvePending = pending;
+    // Every geometry publish arrives BEFORE the controller's report on it
+    // (a placement publishes its spliced controls, then queues the solve;
+    // a landing publishes, then reports the solve finished), so a publish
+    // alone never counts as settled: only this report, arriving after it,
+    // confirms the geometry's state, and the bar adopts or keeps its layout
+    // accordingly.
+    const bool confirms = _overviewGeometryUnconfirmed;
+    _overviewGeometryUnconfirmed = false;
+    if (changed || confirms) {
+        _overviewLayoutDirty = true;
+        updateOverviewBar();
+    }
+}
+
+uint64_t LineAnnotationDialog::recordPendingPlacement(const cv::Vec3f& volumePoint, double linePosition)
+{
+    if (!_hasGeneratedViews || !std::isfinite(linePosition)) {
+        return 0;
+    }
+    // The arc length, on the line shown now, of the spot the point is placed
+    // at: where the controls-only publish that follows must draw it.
+    const auto cumulative =
+        vc3d::line_annotation::generatedCumulativeArcLength(_generatedViews.linePoints);
+    vc3d::line_annotation::GeneratedPendingPlacement entry;
+    entry.point = volumePoint;
+    entry.anchor = vc3d::line_annotation::interpolatedGeneratedLinePoint(_generatedViews.linePoints, linePosition);
+    entry.token = ++_lastPlacementToken;
+    entry.arcLength = vc3d::line_annotation::generatedArcLengthAt(cumulative, linePosition);
+    entry.linePosition = linePosition;
+    entry.lineRevision = _generatedViews.lineRevision;
+    // The bar fraction the marker stands at right now: the new control's
+    // fraction until the geometry settles (a landing during the request's
+    // confirmation dialog must not move it).
+    if (auto* bar = static_cast<LineAnnotationOverviewBar*>(_overviewBar.data())) {
+        entry.fraction = bar->fractionForLinePosition(linePosition);
+    }
+    _pendingPlacements.push_back(entry);
+    // A geometry change is on its way: until the controller reports on it
+    // the bar must not adopt anything (a confirmation dialog may spin the
+    // event loop between this request and its publish).
+    _overviewGeometryUnconfirmed = true;
+    _overviewLayoutDirty = true;
+    // A placement that never shows up (rejected, superseded) must not linger
+    // and claim a later point by coincidence.
+    constexpr size_t kMaxPendingPlacements = 16;
+    if (_pendingPlacements.size() > kMaxPendingPlacements) {
+        _pendingPlacements.erase(_pendingPlacements.begin());
+    }
+    return entry.token;
+}
+
+void LineAnnotationDialog::retirePendingPlacement(uint64_t token)
+{
+    // The request returned (the controller handles it synchronously, its
+    // confirmation dialog included); an entry still here was not consumed by
+    // a publish, so the request placed nothing: it must not linger for a
+    // later control to take.
+    if (token == 0) {
+        return;
+    }
+    const auto removed =
+        std::erase_if(_pendingPlacements, [token](const auto& entry) { return entry.token == token; });
+    std::erase_if(_heldPendingPlacements, [token](const auto& entry) { return entry.token == token; });
+    if (removed > 0) {
+        // The outstanding request was what held the bar's adoption back; a
+        // landing that reported idle meanwhile may now be adopted.
+        _overviewLayoutDirty = true;
+        updateOverviewBar();
+    }
+}
+
+void LineAnnotationDialog::noteDisplayedLineControls()
+{
+    // Called with every publish that brings its own line: these controls
+    // index the line on screen, and their arc lengths describe it.
+    _overviewLineSpaceControls = _generatedViews.controlPoints;
+    _overviewDisplayedLayout = vc3d::line_annotation::generatedOverviewSettledLayout(
+        _generatedViews.controlPoints, _generatedViews.linePoints);
+    _controlsRebased = false;
+    _overviewLayoutDirty = true;
+    // A placement recorded against an earlier displayed line (its request
+    // may be waiting on a confirmation dialog while another solve landed) is
+    // re-placed on this one through its 3D point, so its publish still finds
+    // the spot it was placed at, in this line's arc length and units.
+    const auto cumulative =
+        vc3d::line_annotation::generatedCumulativeArcLength(_generatedViews.linePoints);
+    for (auto& entry : _pendingPlacements) {
+        if (entry.lineRevision == _generatedViews.lineRevision) {
+            continue;
+        }
+        const double position = vc3d::line_annotation::remappedGeneratedLinePositionFromAnchor(
+            _generatedViews.linePoints, entry.anchor, entry.linePosition);
+        entry.linePosition = position;
+        entry.arcLength = vc3d::line_annotation::generatedArcLengthAt(cumulative, position);
+        entry.lineRevision = _generatedViews.lineRevision;
+    }
+}
+
+bool LineAnnotationDialog::publishedControlsIndexDisplayedLine() const
+{
+    // Known revisions on both sides and equal: the controls' positions and
+    // arc lengths belong to the line on screen. Unknown revisions are taken
+    // as consistent (nothing to rebase against).
+    if (_generatedViews.controlPoints.empty() || _generatedViews.lineRevision == 0) {
+        return true;
+    }
+    const uint64_t revision = _generatedViews.controlPoints.front().lineRevision;
+    return revision == 0 || revision == _generatedViews.lineRevision;
+}
+
+void LineAnnotationDialog::rebaseProvisionalControlArcLengths()
+{
+    // Controls published on their own may index the controller's line while
+    // the screen still shows the previous one (a placement publishes its
+    // spliced controls before any landing). Their arc lengths are then
+    // re-expressed on the displayed line so every view draws them where they
+    // belong on what is shown. Controls of the displayed line's revision
+    // (every publish after a landing, link-state refreshes) are consistent
+    // already and are left alone: rebasing them would carry the old line's
+    // measure into the new one.
+    if (_overviewDisplayedLayout.empty() || publishedControlsIndexDisplayedLine()) {
+        return;
+    }
+    _generatedViews.controlPoints = vc3d::line_annotation::generatedDisplaySpaceControlArcLengths(
+        _overviewDisplayedLayout,
+        std::move(_generatedViews.controlPoints),
+        _pendingPlacements,
+        _overviewResolvedArcs,
+        _generatedViews.lineRevision,
+        _generatedViews.linePoints);
+    _controlsRebased = true;
+    // Entries for other displayed revisions can never match again.
+    std::erase_if(_overviewResolvedArcs, [this](const auto& entry) {
+        return entry.lineRevision != _generatedViews.lineRevision;
+    });
+    // A control placed from this dialog takes the bar fraction recorded with
+    // its request, by identity, before the bar computes anything else.
+    for (const auto& entry : _overviewResolvedArcs) {
+        if (!entry.fromPlacement || entry.identity == 0 || !std::isfinite(entry.fraction)) {
+            continue;
+        }
+        const bool known = std::any_of(
+            _overviewProvisionalFractions.begin(), _overviewProvisionalFractions.end(),
+            [&entry](const auto& anchor) { return anchor.identity == entry.identity; });
+        if (!known) {
+            _overviewProvisionalFractions.push_back(
+                {entry.identity, entry.point, entry.linePosition, entry.arcLength, entry.fraction});
+        }
+    }
+}
+
+vc3d::line_annotation::GeneratedOverviewGateState LineAnnotationDialog::overviewGateState() const
+{
+    vc3d::line_annotation::GeneratedOverviewGateState gate;
+    gate.layoutEmpty = _overviewSettledLayout.empty();
+    gate.controlsRebased = _controlsRebased;
+    gate.controlsIndexDisplayedLine = publishedControlsIndexDisplayedLine();
+    gate.solveRunning = _lineSolveRunning;
+    gate.solvePending = _lineSolvePending;
+    gate.autoReoptimize = reoptimizationMode() == ReoptimizationMode::AutoReoptimize;
+    gate.geometryUnconfirmed = _overviewGeometryUnconfirmed;
+    gate.placementOutstanding = !_pendingPlacements.empty();
+    return gate;
+}
+
+bool LineAnnotationDialog::lineGeometryInFlight() const
+{
+    return vc3d::line_annotation::generatedOverviewGeometryInFlight(overviewGateState());
 }
 
 void LineAnnotationDialog::setFiberDisplayName(const QString& name)
@@ -1757,6 +1968,13 @@ bool LineAnnotationDialog::setGeneratedRows(
     _suppressPaneClosed = false;
     _hasGeneratedViews = false;
     _stripContextIndex.reset();
+    _overviewSettledLayout = {};
+    _overviewProvisionalFractions.clear();
+    _overviewLineSpaceControls.clear();
+    _overviewDisplayedLayout = {};
+    _controlsRebased = false;
+    _pendingPlacements.clear();
+    _overviewResolvedArcs.clear();
     _currentCutManualRotation = cv::Matx33f::eye();
     _currentCutManualRotationActive = false;
     _currentCutNormalOffsetVx = 0.0;
@@ -2016,11 +2234,54 @@ void LineAnnotationDialog::setGeneratedOverlay(const std::string& surfaceName,
     viewer->connectOverlaysUpdated(this, apply);
 }
 
+double LineAnnotationDialog::carriedLinePosition(
+    const std::vector<cv::Vec3f>& oldLinePoints,
+    const std::vector<GeneratedOverlay::ControlPointMarker>& oldControls,
+    const std::vector<vc3d::line_annotation::GeneratedPendingPlacement>& oldResolvedPlacements,
+    uint64_t oldLineRevision,
+    const std::vector<cv::Vec3f>& newLinePoints,
+    const std::vector<GeneratedOverlay::ControlPointMarker>& newControls,
+    uint64_t newLineRevision,
+    double oldPosition) const
+{
+    // A control set indexes its line when every marker's revision names it;
+    // revision 0 on either side is "unknown" and trusted. A set that indexes
+    // another line (a provisional publish) anchors nothing: without anchors
+    // the carry degrades to the plain remap.
+    const auto indexesLine = [](const std::vector<GeneratedOverlay::ControlPointMarker>& controls,
+                                uint64_t lineRevision) {
+        if (lineRevision == 0) {
+            return true;
+        }
+        return std::all_of(controls.begin(), controls.end(), [lineRevision](const auto& control) {
+            return control.lineRevision == 0 || control.lineRevision == lineRevision;
+        });
+    };
+    std::vector<vc3d::line_annotation::GeneratedLineCarryControl> oldCarry =
+        indexesLine(oldControls, oldLineRevision)
+            ? vc3d::line_annotation::generatedLineCarryControls(oldControls)
+            : std::vector<vc3d::line_annotation::GeneratedLineCarryControl>{};
+    // A control placed since the displayed line was published (its publish
+    // indexes the controller's line) is anchored where this dialog placed
+    // it on the displayed line: a cursor working past that control is
+    // carried relative to it, not to the control before it.
+    vc3d::line_annotation::appendGeneratedLineCarryControls(
+        oldCarry, oldResolvedPlacements, oldLineRevision);
+    const std::vector<vc3d::line_annotation::GeneratedLineCarryControl> newCarry =
+        indexesLine(newControls, newLineRevision)
+            ? vc3d::line_annotation::generatedLineCarryControls(newControls)
+            : std::vector<vc3d::line_annotation::GeneratedLineCarryControl>{};
+    return vc3d::line_annotation::carriedGeneratedLinePosition(
+        oldLinePoints, oldCarry, newLinePoints, newCarry, oldPosition);
+}
+
 void LineAnnotationDialog::anchorGeneratedStripSurfacesForUpdate(
     QuadSurface* newLineSurface,
     QuadSurface* newLineSideSlice,
     const vc::lasagna::LineStripPositionMap& newPositionMap,
-    const std::vector<cv::Vec3f>& newLinePoints) const
+    const std::vector<cv::Vec3f>& newLinePoints,
+    const std::vector<GeneratedOverlay::ControlPointMarker>& newControls,
+    uint64_t newLineRevision) const
 {
     if (!_hasGeneratedViews || _stripViewers.size() != 2 || newLinePoints.empty()) {
         return;
@@ -2050,11 +2311,18 @@ void LineAnnotationDialog::anchorGeneratedStripSurfacesForUpdate(
         if (!std::isfinite(oldPosition)) {
             continue;
         }
-        // The same fiber spot's position on the new line, and its surface X
-        // under the new strip's (un-shifted) parameterization.
-        const double newPosition =
-            vc3d::line_annotation::remappedGeneratedLinePosition(
-                _generatedViews.linePoints, newLinePoints, oldPosition);
+        // The same fiber spot's position on the new line (carried relative
+        // to the controls around it, like the current position), and its
+        // surface X under the new strip's (un-shifted) parameterization.
+        const double newPosition = carriedLinePosition(
+            _generatedViews.linePoints,
+            _overviewLineSpaceControls,
+            _overviewResolvedArcs,
+            _generatedViews.lineRevision,
+            newLinePoints,
+            newControls,
+            newLineRevision,
+            oldPosition);
         const auto* points = newQuad->rawPointsPtr();
         if (!points || points->empty()) {
             continue;
@@ -2126,11 +2394,16 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         _heldGeneratedViews = _generatedViews;
         _heldControlIndex = _generatedControlIndex;
         _heldLinePosition = _currentLinePosition;
+        _heldOverviewLineSpaceControls = _overviewLineSpaceControls;
+        _heldOverviewDisplayedLayout = _overviewDisplayedLayout;
+        _heldPendingPlacements = _pendingPlacements;
+        const bool heldControlsRebased = _controlsRebased;
 
         const double previousLinePosition = _currentLinePosition;
         const float previousDisplayTangentSign = _displayTangentSign;
         _generatedViews = std::move(views);
         invalidateStripContextIndex();
+        noteDisplayedLineControls();
         _displayTangentSign = vc3d::line_annotation::generatedDisplayTangentSign(
             _generatedViews.linePoints,
             _generatedViews.lineNormals);
@@ -2141,16 +2414,43 @@ bool LineAnnotationDialog::setGeneratedLineViews(
             static_cast<double>(_generatedViews.linePoints.size() - 1);
         // Land the current position on the same fiber spot: positions renumber
         // when the line is re-optimized, so the old numeric position is
-        // remapped through its 3D point instead of reused. Deliberately never
-        // recentered on a just-placed control point -- an update must not move
-        // the view (the cameras belong to the user, who may be mid-pan).
-        const double targetLinePosition =
-            vc3d::line_annotation::remappedGeneratedLinePosition(
+        // carried relative to the controls around it (the same spot within
+        // its span; the same distance past the last control in a re-traced
+        // tail) instead of reused. Deliberately never recentered on a
+        // just-placed control point -- an update must not move the view (the
+        // cameras belong to the user, who may be mid-pan).
+        const double targetLinePosition = carriedLinePosition(
+            _heldGeneratedViews.linePoints,
+            _heldOverviewLineSpaceControls,
+            _overviewResolvedArcs,
+            _heldGeneratedViews.lineRevision,
+            _generatedViews.linePoints,
+            _generatedViews.controlPoints,
+            _generatedViews.lineRevision,
+            previousLinePosition);
+        _currentLinePosition =
+            std::clamp(targetLinePosition, 0.0, maxLinePosition);
+        {
+            // Diagnostic for the position jump this carry replaces: the plain
+            // nearest-vertex remap would have landed far from the carried
+            // position (another wrap of the fiber, typically).
+            constexpr double kDivergenceSamples = 50.0;
+            const double plainRemap = vc3d::line_annotation::remappedGeneratedLinePosition(
                 _heldGeneratedViews.linePoints,
                 _generatedViews.linePoints,
                 previousLinePosition);
-        _currentLinePosition =
-            std::clamp(targetLinePosition, 0.0, maxLinePosition);
+            if (std::isfinite(plainRemap) &&
+                std::abs(plainRemap - _currentLinePosition) > kDivergenceSamples) {
+                Logger()->info(
+                    "line annotation: current position {:.1f} carried to {:.1f} "
+                    "(plain remap {:.1f}; old line {} points, new line {} points)",
+                    previousLinePosition,
+                    _currentLinePosition,
+                    plainRemap,
+                    _heldGeneratedViews.linePoints.size(),
+                    _generatedViews.linePoints.size());
+            }
+        }
         // The one step of the in-place update that can fail, validated before
         // the overlay-swap flags, offsets and viewer properties are touched:
         // set earlier, those would describe an update that never happened, for
@@ -2163,6 +2463,12 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                                     _currentLinePosition)) {
             _generatedViews = _heldGeneratedViews;
             invalidateStripContextIndex();
+            // The held controls may be a provisional publish; the line-space
+            // bookkeeping is restored from its own snapshot.
+            _overviewLineSpaceControls = _heldOverviewLineSpaceControls;
+            _overviewDisplayedLayout = _heldOverviewDisplayedLayout;
+            _pendingPlacements = _heldPendingPlacements;
+            _controlsRebased = heldControlsRebased;
             _generatedControlIndex = _heldControlIndex;
             _currentLinePosition = previousLinePosition;
             _displayTangentSign = previousDisplayTangentSign;
@@ -2366,6 +2672,13 @@ bool LineAnnotationDialog::setGeneratedLineViews(
 
     _generatedViews = views;
     invalidateStripContextIndex();
+    // Freshly built views (a new fiber, or panes rebuilt from scratch): the
+    // settled layout, if any, belonged to the previous geometry.
+    _overviewSettledLayout = {};
+    _overviewProvisionalFractions.clear();
+    _pendingPlacements.clear();
+    _overviewResolvedArcs.clear();
+    noteDisplayedLineControls();
     _displayTangentSign = vc3d::line_annotation::generatedDisplayTangentSign(
         _generatedViews.linePoints,
         _generatedViews.lineNormals);
@@ -2455,10 +2768,12 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                         return;
                     }
                     setCurrentCutFollowsStripMouse(true);
+                    const uint64_t token = recordPendingPlacement(volumePoint, _currentLinePosition);
                     emit generatedControlPointRequested(_generatedViews.currentCutName,
                                                         volumePoint,
                                                         _currentLinePosition,
                                                         interpolatedLinePoint(_currentLinePosition));
+                    retirePendingPlacement(token);
                 }
             });
     topSplitter->addWidget(currentViewer);
@@ -2515,10 +2830,12 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                         return;
                     }
                     setCurrentCutFollowsStripMouse(true);
+                    const uint64_t token = recordPendingPlacement(volumePoint, _currentLinePosition);
                     emit generatedControlPointRequested(_generatedViews.sideCutName,
                                                         volumePoint,
                                                         _currentLinePosition,
                                                         interpolatedLinePoint(_currentLinePosition));
+                    retirePendingPlacement(token);
                 }
             });
     topSplitter->addWidget(sideViewer);
@@ -2659,10 +2976,12 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                             if (!controlPointPlacementAllowedAt(position)) {
                                 return;
                             }
+                            const uint64_t token = recordPendingPlacement(volumePoint, position);
                             emit generatedControlPointRequested(surfaceName,
                                                                 volumePoint,
                                                                 position,
                                                                 interpolatedLinePoint(position));
+                            retirePendingPlacement(token);
                         }
                     }
                 });
@@ -3034,6 +3353,10 @@ const vc3d::line_annotation::GeneratedStripContextIndex& LineAnnotationDialog::s
 void LineAnnotationDialog::invalidateStripContextIndex()
 {
     _stripContextIndex.reset();
+    _overviewLayoutDirty = true;
+    // New geometry or controls whose solve state the controller has not
+    // reported yet (see setLineSolveActivity).
+    _overviewGeometryUnconfirmed = true;
     // A glow drawn from the old index may sit on a control that moved or is
     // gone; the next refresh (the static rebuild that follows every such
     // change) redraws it from the new one.
@@ -4402,6 +4725,12 @@ void LineAnnotationDialog::rebuildGeneratedStaticStripOverlays()
         if (sideStrip) {
             strip.fiberIntersections = stripViews.fiberIntersections;
         }
+        if (swapPending) {
+            // The viewer already holds the new surface; the frame on screen
+            // is the held one, so the held overlay projects through its own.
+            strip.projectionSurface =
+                sideStrip ? _heldGeneratedViews.lineSideSlice : _heldGeneratedViews.lineSurface;
+        }
         auto& placement = _staticStripOverlayPlacements[i];
         placement.groupKey = applyOverlayForViewer(staticStripOverlayKey(key), viewer, strip);
         // The camera these items were placed against; a pan tick shifts them
@@ -5605,10 +5934,12 @@ bool LineAnnotationDialog::placeControlPointAtCurrentLinePosition()
     // the placement renumbers the line positions the pan is steering by.
     cancelArrowPan();
     // The key places ON the line, so its point is also the position's anchor.
+    const uint64_t token = recordPendingPlacement(volumePoint, _currentLinePosition);
     emit generatedControlPointRequested(_generatedViews.currentCutName,
                                         volumePoint,
                                         _currentLinePosition,
                                         volumePoint);
+    retirePendingPlacement(token);
     return true;
 }
 
@@ -5771,8 +6102,10 @@ void LineAnnotationDialog::finishCrossSectionDrag()
     const auto edit = *_crossSectionDrag;
     cancelCrossSectionDrag();
     if (edit.changed) {
+        const uint64_t token = recordPendingPlacement(cv::Vec3f(edit.center), edit.linePosition);
         emit crossSectionDragFinished(_generatedViews.currentCutName, cv::Vec3f(edit.center),
             edit.linePosition, cv::Vec3f(edit.lineAnchor), cv::Vec3f(edit.normal), edit.normalChanged);
+        retirePendingPlacement(token);
     }
 }
 
@@ -5817,8 +6150,11 @@ bool LineAnnotationDialog::handleDirectionDragEvent(QObject* watched, QEvent* ev
         double best=vc::lasagna::kLineViewAlongSamplingDistanceBaseVoxels *
                     _generatedViews.fiberBaseToVolumeScale;
         for (const auto& cp : _generatedViews.controlPoints) {
+            // The column the marker is drawn at (shared with the markers and
+            // hover zones): a provisional control's own index may index the
+            // controller's line, not this strip.
             const auto cpUV=surface->gridToSurface({
-                _generatedViews.stripPositionMap.originalPositionToStripGridColumn(cp.linePosition),
+                vc3d::line_annotation::generatedStripControlGridColumn(cp, _generatedViews.stripPositionMap),
                 double(surface->rawPointsPtr()->rows/2)});
             const double distance=cv::norm(cpUV-cv::Vec2d(uv));
             if (distance<=best) { best=distance; chosen=&cp; chosenUV=cpUV; }
@@ -5842,7 +6178,9 @@ bool LineAnnotationDialog::handleDirectionDragEvent(QObject* watched, QEvent* ev
         drag.createControl=createControl;
         drag.linePosition=chosen->linePosition;
         drag.point=chosen->point;
-        drag.lineAnchor=interpolatedLinePoint(chosen->linePosition);
+        // On the displayed line (the control's own index may not index it).
+        const double shownPosition = vc3d::line_annotation::generatedShownLinePosition(*chosen);
+        drag.lineAnchor=interpolatedLinePoint(shownPosition);
         drag.pressPixel=mouse->pos();
         drag.surfaceOrigin=cv::Vec2f(chosenUV);
         drag.origin=viewer->surfaceCoordsToScene(float(chosenUV[0]),float(chosenUV[1]));
@@ -5850,7 +6188,7 @@ bool LineAnnotationDialog::handleDirectionDragEvent(QObject* watched, QEvent* ev
         if (!frame) return true;
         drag.normal=frame->normal; drag.across=frame->across; drag.along=frame->along;
         drag.axis=chosen->direction.value_or(vc::fiber_tracer::displayTangentAt(
-            _generatedViews.linePoints,chosen->linePosition));
+            _generatedViews.linePoints,shownPosition));
         _directionDrag=drag;
         viewer->clearOverlayGroup("fiber-direction-drag");
         auto* item=new CrossSectionDragPreview;
@@ -5875,10 +6213,14 @@ bool LineAnnotationDialog::handleDirectionDragEvent(QObject* watched, QEvent* ev
         const auto completed=drag;
         cancelDirectionDrag();
         if (result) {
-            if (completed.createControl)
+            if (completed.createControl) {
+                const uint64_t token = recordPendingPlacement(completed.point, completed.linePosition);
                 emit controlDirectionCreated(completed.point, completed.linePosition,
                                              completed.lineAnchor, cv::Vec3f(*result));
-            else emit controlDirectionChanged(index,cv::Vec3f(*result));
+                retirePendingPlacement(token);
+            } else {
+                emit controlDirectionChanged(index,cv::Vec3f(*result));
+            }
         }
     }
     return true;
@@ -6087,21 +6429,86 @@ bool LineAnnotationDialog::eventFilter(QObject* watched, QEvent* event)
     return QMainWindow::eventFilter(watched, event);
 }
 
-void LineAnnotationDialog::updateOverviewBar()
+void LineAnnotationDialog::rebuildOverviewBarLayout()
 {
     auto* bar = static_cast<LineAnnotationOverviewBar*>(_overviewBar.data());
     if (!bar || !_hasGeneratedViews) {
         return;
     }
-
-    std::vector<LineAnnotationOverviewBar::ControlDot> dots;
-    dots.reserve(_generatedViews.controlPoints.size());
-    for (const auto& control : _generatedViews.controlPoints) {
-        if (!std::isfinite(control.linePosition)) {
-            continue;
+    // Dot fractions. Settled geometry (confirmed by the controller: nothing
+    // running or pending, controls of the displayed line, none rebased) is
+    // adopted as the layout; otherwise the dots keep the known fractions
+    // (settled, plus those already given to controls placed since) and only
+    // a control seen for the first time is placed, by arc length.
+    // (The gate's rules are generatedOverviewAdopts'; see its comment.)
+    const bool adopt = vc3d::line_annotation::generatedOverviewAdopts(overviewGateState());
+    if (adopt) {
+        _overviewSettledLayout = vc3d::line_annotation::generatedOverviewSettledLayout(
+            _generatedViews.controlPoints, _generatedViews.linePoints);
+        _overviewProvisionalFractions.clear();
+        _overviewResolvedArcs.clear();
+        // Pending placements are NOT cleared here: a request may be waiting
+        // on a confirmation dialog whose nested event loop runs this refresh
+        // before the publish arrives. They are consumed by their publish or
+        // dropped when the displayed line moves to another revision.
+        noteDisplayedLineControls();
+    }
+    std::vector<vc3d::line_annotation::GeneratedOverviewAnchor> known = _overviewSettledLayout.anchors;
+    known.insert(known.end(), _overviewProvisionalFractions.begin(), _overviewProvisionalFractions.end());
+    // The current-position marker and clicks live in the dialog's own line
+    // space (the line the cut views show), which the published controls may
+    // not index during a solve; their mapping comes from the last control
+    // set known to index this line, by arc length on that line. A control
+    // seen for the first time takes its fraction from this same mapping, so
+    // it lands where the marker stood (also when it replaces a control).
+    const auto positionAnchors = adopt
+        ? _overviewSettledLayout.anchors
+        : vc3d::line_annotation::generatedOverviewFrozenAnchors(
+              known, _overviewLineSpaceControls, _generatedViews.linePoints);
+    const auto dotAnchors = adopt
+        ? _overviewSettledLayout.anchors
+        : vc3d::line_annotation::generatedOverviewFrozenAnchors(
+              known, _generatedViews.controlPoints, _generatedViews.linePoints, &positionAnchors);
+    if (!adopt) {
+        // A control placed since the geometry settled keeps the fraction it
+        // was first given (by identity), whatever later publishes do to its
+        // arc length, until the geometry settles.
+        for (const auto& anchor : dotAnchors) {
+            if (!vc3d::line_annotation::overview_detail::findAnchor(known, anchor.identity, anchor.point)) {
+                _overviewProvisionalFractions.push_back(anchor);
+                known.push_back(anchor);
+            }
         }
+    }
+    // Dots and span pieces come from the controls in line order and their
+    // anchors (same order), so a piece runs exactly from one dot to the next.
+    const auto orderedControls =
+        vc3d::line_annotation::overview_detail::lineOrderedControls(_generatedViews.controlPoints);
+    const auto fractionAt = [&dotAnchors](size_t rank) {
+        return rank < dotAnchors.size() ? dotAnchors[rank].fraction
+                                        : std::numeric_limits<double>::quiet_NaN();
+    };
+    std::vector<std::pair<double, double>> gapPieces;
+    std::vector<std::pair<double, double>> damagedPieces;
+    for (size_t rank = 0; rank + 1 < orderedControls.size(); ++rank) {
+        if (orderedControls[rank]->hasGapToNext) {
+            gapPieces.emplace_back(fractionAt(rank), fractionAt(rank + 1));
+        } else if (orderedControls[rank]->hasDamagedToNext) {
+            damagedPieces.emplace_back(fractionAt(rank), fractionAt(rank + 1));
+        }
+    }
+    const auto cumulativeArcLength =
+        vc3d::line_annotation::generatedCumulativeArcLength(_generatedViews.linePoints);
+    const double totalArcLength = _overviewDisplayedLayout.empty()
+        ? (cumulativeArcLength.empty() ? 0.0 : cumulativeArcLength.back())
+        : _overviewDisplayedLayout.totalArcLength;
+    std::vector<LineAnnotationOverviewBar::ControlDot> dots;
+    dots.reserve(orderedControls.size());
+    for (size_t rank = 0; rank < orderedControls.size(); ++rank) {
+        const auto& control = *orderedControls[rank];
         LineAnnotationOverviewBar::ControlDot dot;
         dot.linePosition = control.linePosition;
+        dot.fraction = fractionAt(rank);
         // Same state palette as the cut-view overlays.
         if (control.isLinkCandidate) {
             dot.color = QColor(60, 235, 120);
@@ -6138,8 +6545,27 @@ void LineAnnotationDialog::updateOverviewBar()
     }
     bar->setLineData(_generatedViews.linePoints.size(),
                      std::move(dots),
-                     vc3d::line_annotation::generatedGapLineRanges(_generatedViews.controlPoints),
-                     vc3d::line_annotation::generatedDamagedLineRanges(_generatedViews.controlPoints));
+                     std::move(gapPieces),
+                     std::move(damagedPieces),
+                     positionAnchors,
+                     cumulativeArcLength,
+                     totalArcLength);
+}
+
+void LineAnnotationDialog::updateOverviewBar()
+{
+    auto* bar = static_cast<LineAnnotationOverviewBar*>(_overviewBar.data());
+    if (!bar || !_hasGeneratedViews) {
+        return;
+    }
+
+    // The layout (dots, pieces, the marker's mapping) only changes with the
+    // geometry, the controls or the gate state; a moving cursor only moves
+    // the marker. Everything heavy sits behind the dirty flag.
+    if (_overviewLayoutDirty) {
+        rebuildOverviewBarLayout();
+        _overviewLayoutDirty = false;
+    }
 
     QColor markerColor(0, 245, 255);
     switch (currentLineMarkerState()) {
