@@ -165,7 +165,7 @@ QString FiberMapRuler::toolTipText() const
     case Mode::Kollesis: {
         QString text = tr("Kollesis seams: one tick per seam, read from the kollesis "
                           "termination tags on H fibers; between neighbouring ticks, "
-                          "the length of that sheet along the scroll. Pink ticks are "
+                          "the length of that sheet along the scroll. Amber ticks are "
                           "seams the sheet-length statistics predict, inside gaps "
                           "that measure several sheets and past the last tagged seam.");
         if (!_model.voxelSizeUm) {
