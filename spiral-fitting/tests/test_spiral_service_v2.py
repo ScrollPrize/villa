@@ -52,7 +52,7 @@ from fit_session import (API_VERSION, AUTOSAVE_CHECKPOINT_NAME, AUTOSAVE_METADAT
                          AutosaveError, PclRole, SessionState, SpiralInputPaths,
                          resolve_dataset_root, select_startup_autosave,
                          validate_autosave, write_autosave_metadata)
-from config import BACKFILLABLE_CONFIG_DEFAULTS, Config, durable_config
+from config import Config
 
 
 class FakeSession:
@@ -69,10 +69,6 @@ class FakeSession:
             "track_max_track_crossing_per_step": 0,
             "track_min_sample_spacing": 20.0,
             "track_max_sample_spacing": 60.0,
-            "track_min_walk_steps_per_track": 24,
-            "track_max_walk_steps_per_track": 256,
-            "track_min_walks_per_track": 2,
-            "track_max_walks_per_track": 4,
         }
         # The resolved configuration the fit is running, as a real session
         # publishes it once it has one; a checkpoint refusal is analysed
@@ -83,8 +79,6 @@ class FakeSession:
             "sample_count_patches_per_step": 360,
             "loss_weight_patch_radius": 8.0,
             "track_crossing_precompute_max": 8,
-            "track_crossing_mode": "track_walk",
-            "track_walk_minimum_cycle_travel": 20.0,
         }
         self.saved = []
         self.autosave_calls = []
@@ -117,9 +111,9 @@ class FakeSession:
             "progress": self.progress,
         }
 
-    def run(self, count, influence_config=None, run_config=None, path_changes=None,
+    def run(self, count, run_config=None, path_changes=None,
             autosave_on_pause=True, preview_schedule=None, dt_loss_schedule=None):
-        self.run_calls.append((count, dict(influence_config or {}), dict(run_config or {})))
+        self.run_calls.append((count, dict(run_config or {})))
         self.path_change_calls.append(dict(path_changes or {}))
         self.autosave_calls.append(autosave_on_pause)
         self.preview_schedules.append(copy.deepcopy(preview_schedule))
@@ -169,7 +163,6 @@ _NO_DENSE_LOSSES = {
     "loss_weight_dense_spacing": 0,
     "loss_weight_dense_normals": 0,
     "loss_weight_shell_outer": 0,
-    "loss_weight_shell_patch_radius": 0,
 }
 
 
@@ -269,7 +262,6 @@ def _planned_run(state, request):
     return state.run({
         "configuration": configuration,
         "iterations": request.pop("iterations"),
-        "influence": request.pop("influence_config", {}),
         "dt_loss_schedule": request.pop("dt_loss_schedule", {
             "enabled": False, "last_fraction": 0.25}),
         "expected_session_revision": state.session_revision,
@@ -1083,7 +1075,6 @@ class DatasetOwnershipTests(unittest.TestCase):
         self.assertEqual(
             request["paths"]["verified_patches"],
             str(self.root / "verified_patches"))
-        self.assertEqual(request["paths"]["unverified_patches"], "")
 
         disabled = self.state._dataset_session_request({
             "paths": {"tracks_dbm": "/not/an/advertised/store.dbm"},
@@ -1120,7 +1111,6 @@ class DatasetOwnershipTests(unittest.TestCase):
         paths, run, _, _ = self.state._prepare_session_request(request)
 
         self.assertEqual(paths.winding_inference, str(winding))
-        self.assertEqual(paths.surf_sdt, "")
         self.assertEqual(run.config, config)
 
         # Missing default-mode inputs must fail preflight, before GPU work.
@@ -1191,7 +1181,6 @@ class DatasetOwnershipTests(unittest.TestCase):
             "loss_weight_dense_spacing": 0,
             "loss_weight_dense_normals": 0,
             "loss_weight_shell_outer": 0,
-            "loss_weight_shell_patch_radius": 0,
             "loss_weight_patch_radius": 7.5,
         }
         request = {
@@ -1260,7 +1249,6 @@ class DatasetOwnershipTests(unittest.TestCase):
                     "loss_weight_dense_spacing": 0,
                     "loss_weight_dense_normals": 0,
                     "loss_weight_shell_outer": 0,
-                    "loss_weight_shell_patch_radius": 0,
                 },
             },
         }
@@ -1468,9 +1456,9 @@ class DatasetOwnershipTests(unittest.TestCase):
 
         path = self.output / name
         torch.save({
-            # Checkpoints store the durable subset of the schema, and the
-            # refusal analysis compares against exactly that subset.
-            "schema_version": 2, "cfg": durable_config(cfg),
+            # Checkpoints store the full configuration schema, and the
+            # refusal analysis compares key sets against exactly that schema.
+            "schema_version": 2, "cfg": dict(cfg),
             "input_manifest": {"dataset_root": str(
                 self.root if dataset_root is None else dataset_root)},
         }, path)
@@ -1484,10 +1472,7 @@ class DatasetOwnershipTests(unittest.TestCase):
 
     def test_a_refusal_reports_the_rebuild_that_would_accept_the_checkpoint(self):
         session = _attach_fake_session(self.state, self.output, self.root)
-        # Pin every input toggle to its historical value so the legacy
-        # backfill sub-case below stays a pure absence-vs-backfill check even
-        # though input_use_surf_sdt now defaults off.
-        live = Config(dict(BACKFILLABLE_CONFIG_DEFAULTS)).as_dict()
+        live = Config().as_dict()
         session.applied_config = dict(live)
 
         # A checkpoint differing only in allowlisted model configuration is a
@@ -1513,25 +1498,24 @@ class DatasetOwnershipTests(unittest.TestCase):
             "domain.ckpt", {**live, "z_end": live["z_end"] + 1000}))
         self.assertEqual(error.payload["stage"], "all")
 
-        # Input toggles have an unambiguous historical default. Their absence
-        # in a legacy checkpoint must not turn an otherwise rebuildable model
-        # mismatch into a permanent refusal.
-        pre_toggles = {
-            key: value for key, value in live.items()
-            if key not in BACKFILLABLE_CONFIG_DEFAULTS
-        }
-        pre_toggles["model_num_flow_stages"] = 3
+        # Stored configurations are loaded tolerantly: a key the checkpoint
+        # predates takes its default and a key the schema no longer has is
+        # dropped, so neither turns a rebuildable model mismatch into a
+        # permanent refusal.
+        partial = {key: value for key, value in live.items()
+                   if key != "input_use_tracks"}
+        partial["model_num_flow_stages"] = 3
+        partial["a_setting_that_no_longer_exists"] = 1
         error = self._refuse_load(session, self._write_checkpoint(
-            "pre-input-toggles.ckpt", pre_toggles))
+            "tolerated.ckpt", partial))
         self.assertEqual(error.payload["stage"], "model")
         self.assertNotIn("refused", error.payload)
-
-        # The stage calculation uses the same historical True defaults as the
-        # rebuild. A live disabled input therefore promotes the rebuild to the
-        # full host-input stage.
-        session.applied_config["input_use_tracks"] = False
+        # The default the rebuild would resume with is what the stage
+        # calculation diffs, so a live setting that differs from it promotes
+        # the rebuild to the full host-input stage.
+        session.applied_config["input_use_tracks"] = not live["input_use_tracks"]
         error = self._refuse_load(session, self._write_checkpoint(
-            "pre-input-toggles-disabled-live.ckpt", pre_toggles))
+            "tolerated-live-differs.ckpt", partial))
         self.assertEqual(error.payload["stage"], "all")
 
     def test_a_refusal_no_rebuild_can_fix_offers_nothing(self):
@@ -1545,10 +1529,11 @@ class DatasetOwnershipTests(unittest.TestCase):
         self.assertTrue(error.payload["refused"])
         self.assertNotIn("stage", error.payload)
 
-        # A cfg key set that is not this schema's.
+        # A stored value the schema cannot interpret.
         error = self._refuse_load(session, self._write_checkpoint(
-            "stale.ckpt", {**live, "a_setting_that_no_longer_exists": 1}))
+            "invalid.ckpt", {**live, "dense_spacing_mode": "bogus"}))
         self.assertTrue(error.payload["refused"])
+        self.assertNotIn("stage", error.payload)
 
         # A file that will not load at all.
         unreadable = self.output / "unreadable.ckpt"
@@ -1641,7 +1626,7 @@ class DatasetOwnershipTests(unittest.TestCase):
         import torch
         torch.save({
             "schema_version": 2,
-            "cfg": durable_config({**Config().as_dict(), **_NO_DENSE_LOSSES}),
+            "cfg": {**Config().as_dict(), **_NO_DENSE_LOSSES},
             "input_manifest": {"dataset_root": str(self.root)},
         }, checkpoint)
 
@@ -2294,59 +2279,6 @@ class UploadTests(unittest.TestCase):
         self.assertIsNone(status["same_winding_artifact"])
         self.assertEqual(status["relative_winding_artifact"]["id"], ref["id"])
 
-    def test_run_passes_and_validates_transient_influence_config(self):
-        session = self._session()
-        influence = {
-            "influence_enabled": True,
-            "influence_z": 1200,
-            "influence_windings": 2.5,
-            "influence_theta_frac": 0.2,
-            "influence_sigma": 0.25,
-            "sample_count_influence_footprint_points": 512,
-            "sample_count_influence_anchor_lattice_points": 2000,
-            "sample_count_influence_anchor_geometry_points": 1000,
-            "sample_count_influence_anchor_samples_per_step": 128,
-            "influence_anchor_ramp_power": 3.0,
-            "loss_weight_anchor": 15.0,
-        }
-        _planned_run(self.state, {"iterations": 10, "influence_config": influence})
-        self.assertEqual(session.run_calls[-1][1], influence)
-
-        with self.assertRaises(ApiError) as caught:
-            _planned_run(self.state, {"iterations": 10, "influence_config": {
-                "influence_theta_frac": 1.5,
-            }})
-        self.assertEqual(caught.exception.status, 400)
-
-    def test_run_ignores_and_reports_unknown_influence_keys(self):
-        session = self._session()
-        influence = {"influence_enabled": True, "influence_z": 1200,
-                     "influence_disable_dt_frac": 0.4,
-                     "future_unknown_setting": "obsolete"}
-        with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
-            result = _planned_run(self.state, {
-                "iterations": 10,
-                "influence_config": influence,
-            })
-        self.assertTrue(result["accepted"])
-        self.assertEqual(session.run_calls[-1][1], {
-            "influence_enabled": True, "influence_z": 1200})
-        self.assertEqual(self.state._active_run_influence, {
-            "influence_enabled": True, "influence_z": 1200})
-        warning = ("Ignoring unknown influence configuration keys: "
-                   "['future_unknown_setting', 'influence_disable_dt_frac']")
-        self.assertIn(warning, output.getvalue())
-        self.assertTrue(any(
-            event["text"] == warning and event["severity"] == "warning"
-            for event in self.state.events.read_after(0)["events"]))
-        self.assertIn("influence_disable_dt_frac", influence)
-
-        # Ignored keys cannot hide invalid values of known settings.
-        with self.assertRaisesRegex(ApiError, "influence_theta_frac must be between"):
-            _planned_run(self.state, {
-                "iterations": 10, "influence_config": {
-                    **influence, "influence_theta_frac": 1.5}})
-
     def test_run_requires_validates_and_propagates_dt_loss_schedule(self):
         session = self._session()
         for schedule in (
@@ -2364,7 +2296,6 @@ class UploadTests(unittest.TestCase):
         base = {
             "configuration": dict(Config.catalog()["defaults"]),
             "iterations": 10,
-            "influence": {},
             "expected_session_revision": self.state.session_revision,
         }
         invalid = (
@@ -2397,14 +2328,13 @@ class UploadTests(unittest.TestCase):
             result = self.state.run({
                 "configuration": configuration,
                 "iterations": 10,
-                "influence": {},
                 "dt_loss_schedule": {
                     "enabled": False, "last_fraction": 0.25},
                 "expected_session_revision": self.state.session_revision,
             })
         self.assertTrue(result["accepted"])
-        self.assertNotIn("influence_disable_dt_frac", session.run_calls[-1][2])
-        self.assertNotIn("future_unknown_setting", session.run_calls[-1][2])
+        self.assertNotIn("influence_disable_dt_frac", session.run_calls[-1][1])
+        self.assertNotIn("future_unknown_setting", session.run_calls[-1][1])
         warning = ("Ignoring unknown run configuration keys: "
                    "['future_unknown_setting', 'influence_disable_dt_frac']")
         self.assertIn(warning, output.getvalue())
@@ -2431,14 +2361,11 @@ class UploadTests(unittest.TestCase):
             "track_max_track_crossing_per_step": 3,
             "track_min_sample_spacing": 12.0,
             "track_max_sample_spacing": 32.0,
-            "track_min_walk_steps_per_track": 18,
-            "track_max_walk_steps_per_track": 96,
-            "track_max_walks_per_track": 5,
         }
 
         response = _planned_run(self.state, {"iterations": 10, "run_config": config})
 
-        self.assertEqual(session.run_calls[-1][2], config)
+        self.assertEqual(session.run_calls[-1][1], config)
         self.assertEqual(response["run_config"]["sample_count_patches_per_step"], 240)
 
         with self.assertRaisesRegex(ApiError, "requires rebuilding"):
@@ -2456,16 +2383,16 @@ class UploadTests(unittest.TestCase):
 
     def test_run_accepts_advertised_zero_count_for_disabled_input(self):
         session = self._session()
-        session.run_config["sample_count_dense_attachment_points"] = 0
+        session.run_config["sample_count_fiber_direction_points"] = 0
 
         response = _planned_run(self.state, {"iterations": 10, "run_config": {
-            "sample_count_dense_attachment_points": 0,
+            "sample_count_fiber_direction_points": 0,
         }})
 
-        self.assertEqual(session.run_calls[-1][2], {
-            "sample_count_dense_attachment_points": 0,
+        self.assertEqual(session.run_calls[-1][1], {
+            "sample_count_fiber_direction_points": 0,
         })
-        self.assertEqual(response["run_config"]["sample_count_dense_attachment_points"], 0)
+        self.assertEqual(response["run_config"]["sample_count_fiber_direction_points"], 0)
 
     def test_outer_shell_path_change_requires_session_reload(self):
         self._session()

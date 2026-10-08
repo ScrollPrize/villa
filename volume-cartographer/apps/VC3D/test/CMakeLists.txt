@@ -1,5 +1,24 @@
 find_package(Qt6 REQUIRED COMPONENTS Concurrent Core Network Test Widgets)
 
+add_executable(test_catalog_project_dialog
+    test_catalog_project_dialog.cpp
+    ../OpenDataCatalogWindow.cpp
+    ../OpenDataManifest.cpp
+    ../OpenDataSampleProject.cpp
+    ../OpenDataLasagna.cpp
+    ../OpenDataNormalGrids.cpp
+    ../OpenDataSegmentCache.cpp
+    ../OpenDataSegmentCacheIO.cpp)
+set_target_properties(test_catalog_project_dialog PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+target_include_directories(test_catalog_project_dialog PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_catalog_project_dialog PRIVATE
+    Qt6::Core Qt6::Widgets Qt6::Test Qt6::Concurrent vc_core vc_lasagna)
+add_test(NAME catalog_project_dialog COMMAND test_catalog_project_dialog)
+vc_register_test_target(test_catalog_project_dialog)
+vc_register_ctest(catalog_project_dialog test_catalog_project_dialog)
+set_tests_properties(catalog_project_dialog PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 30)
+
 add_executable(test_line_annotation_adjacent_links test_line_annotation_adjacent_links.cpp)
 set_target_properties(test_line_annotation_adjacent_links PROPERTIES
     AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
@@ -9,6 +28,22 @@ target_link_libraries(test_line_annotation_adjacent_links PRIVATE Qt6::Core Qt6:
 add_test(NAME line_annotation_adjacent_links COMMAND test_line_annotation_adjacent_links)
 vc_register_test_target(test_line_annotation_adjacent_links)
 vc_register_ctest(line_annotation_adjacent_links test_line_annotation_adjacent_links)
+
+add_executable(test_intersection_layer_item
+    test_intersection_layer_item.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/volume_viewers/IntersectionLayerItem.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/volume_viewers/IntersectionLayerItem.hpp)
+set_target_properties(test_intersection_layer_item PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+target_include_directories(test_intersection_layer_item PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_intersection_layer_item PRIVATE
+    Qt6::Core Qt6::Gui Qt6::Test Qt6::Widgets)
+add_test(NAME intersection_layer_item COMMAND test_intersection_layer_item)
+vc_register_test_target(test_intersection_layer_item)
+vc_register_ctest(intersection_layer_item test_intersection_layer_item)
+set_tests_properties(intersection_layer_item PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
 add_executable(test_spiral_input_draft test_spiral_input_draft.cpp)
 set_target_properties(test_spiral_input_draft PROPERTIES
@@ -381,6 +416,28 @@ target_link_libraries(test_annotation_frame PRIVATE
 add_test(NAME annotation_frame COMMAND test_annotation_frame)
 vc_register_test_target(test_annotation_frame)
 vc_register_ctest(annotation_frame test_annotation_frame)
+
+add_executable(test_open_data_volume_orientation
+    test_open_data_volume_orientation.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataVolumeOrientation.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataVolumeOrientation.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataManifest.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataManifest.hpp)
+
+set_target_properties(test_open_data_volume_orientation PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_open_data_volume_orientation PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_open_data_volume_orientation PRIVATE
+    vc_core
+    Qt6::Core
+    Qt6::Test)
+
+add_test(NAME open_data_volume_orientation COMMAND test_open_data_volume_orientation)
+vc_register_test_target(test_open_data_volume_orientation)
+vc_register_ctest(open_data_volume_orientation test_open_data_volume_orientation)
 
 add_executable(test_fiber_map_staleness
     test_fiber_map_staleness.cpp

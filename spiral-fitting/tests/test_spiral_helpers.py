@@ -21,7 +21,6 @@ from fit_spiral import (
     _UnattachedPclStripList,
     get_dt_loss_eligibility,
     get_unattached_pcl_dt_start,
-    get_progressive_dt_max_winding,
     get_run_dt_resume_iteration,
     materialize_fiber_fit_inputs,
 )
@@ -46,13 +45,11 @@ class RunDtLossScheduleTests(unittest.TestCase):
         cfg = Config({
             'loss_start_patch_dt': 10,
             'loss_start_track_dt': 20,
-            'loss_start_unverified_patch_dt': 30,
             'loss_start_unattached_pcl_dt': 25,
         }).as_dict()
         resume = 15
         self.assertEqual(get_dt_loss_eligibility(cfg, 14, resume), {
             'verified_patch': False,
-            'unverified_patch': False,
             'track': False,
             'unattached_pcl': False,
         })
@@ -61,7 +58,6 @@ class RunDtLossScheduleTests(unittest.TestCase):
         self.assertTrue(at_starts['verified_patch'])
         self.assertFalse(at_starts['unattached_pcl'])
         self.assertFalse(at_starts['track'])
-        self.assertFalse(at_starts['unverified_patch'])
         self.assertFalse(get_dt_loss_eligibility(cfg, 25, resume)['unattached_pcl'])
         self.assertTrue(get_dt_loss_eligibility(cfg, 26, resume)['unattached_pcl'])
         after_all = get_dt_loss_eligibility(cfg, 31, resume)
@@ -78,16 +74,6 @@ class RunDtLossScheduleTests(unittest.TestCase):
         self.assertEqual(get_unattached_pcl_dt_start(decoupled), 0)
         self.assertTrue(get_dt_loss_eligibility(decoupled, 1)['unattached_pcl'])
         self.assertFalse(get_dt_loss_eligibility(decoupled, 1)['verified_patch'])
-
-    def test_progressive_winding_cutoff_is_unchanged(self):
-        cfg = Config({
-            'dt_progressive_windings': True,
-            'dt_progressive_inner_winding': 20,
-            'dt_progressive_steps': 100,
-            'dt_progressive_exponent': 1.0,
-        }).as_dict()
-        self.assertEqual(
-            get_progressive_dt_max_winding(cfg, 60, 10, 120), 70.0)
 
 
 class FiberPointCollectionTests(unittest.TestCase):
@@ -347,7 +333,6 @@ class FiberPointCollectionTests(unittest.TestCase):
         context._trusted_geometry_from_active_inputs = mock.Mock(
             return_value=torch.empty((0, 3)))
         context.run_dt_resume_iteration = None
-        context.influence_state = None
         return context
 
 
@@ -445,9 +430,7 @@ class ShellOuterWindingIdxResolutionTests(unittest.TestCase):
             (
                 'loss_weight_dense_normals',
                 'loss_weight_dense_spacing',
-                'loss_weight_dense_spacing_count',
                 'loss_weight_dense_spacing_density',
-                'loss_weight_dense_attachment',
                 'loss_weight_min_spacing',
                 'loss_weight_sym_dirichlet',
             ))

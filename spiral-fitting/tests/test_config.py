@@ -1,6 +1,5 @@
 import inspect
 import json
-from pathlib import Path
 
 import pytest
 
@@ -54,19 +53,18 @@ def test_dt_target_cadence_alias_remains_positive_in_schema():
 def test_input_participation_toggles_are_rebuild_scoped_booleans():
     catalog = Config.catalog()
     expected = {
-        "input_use_verified_patches", "input_use_unverified_patches",
+        "input_use_verified_patches",
         "input_use_tracks", "input_use_fibers",
         "input_use_fiber_directions", "input_use_pcl_absolute",
         "input_use_pcl_relative", "input_use_pcl_same_winding",
         "input_use_pcl_drawn_control_points", "input_use_normals",
-        "input_use_surf_sdt", "input_use_gradient_magnitude",
+        "input_use_gradient_magnitude",
         "input_use_winding_inference", "input_use_outer_shell",
     }
     assert {key for key in catalog["defaults"]
             if key.startswith("input_use_")} == expected
     default_off = {
-        "input_use_surf_sdt", "input_use_fiber_directions",
-        "input_use_tracks",
+        "input_use_fiber_directions", "input_use_tracks",
     }
     # The editable point-collection roles (same-winding, relative) have a
     # live add/replace/delete path, so their toggles apply at a Run boundary;
@@ -126,9 +124,6 @@ def test_interactive_runtime_impacts_match_resident_capabilities():
         "track_min_sample_spacing", "track_max_sample_spacing",
         "track_length_bin_weights", "track_max_tortuosity",
         "track_max_track_crossing_per_step",
-        "track_min_walk_steps_per_track", "track_max_walk_steps_per_track",
-        "track_min_walks_per_track", "track_max_walks_per_track",
-        "track_walk_minimum_cycle_travel",
         "track_radius_target", "track_radius_loss_margin",
         "track_radius_within_norm_p", "track_dt_within_track_norm_p",
         "track_dt_norm_p", "track_dt_loss_margin",
@@ -137,7 +132,7 @@ def test_interactive_runtime_impacts_match_resident_capabilities():
                for key in mutable_tracks)
     assert all(fields[key]["runtime_impact"] == "run_boundary"
                for key in {
-                   "track_crossing_precompute_max", "track_crossing_mode",
+                   "track_crossing_precompute_max",
                    "track_exclusion_radius",
                })
     run_mutable_pcl = {
@@ -237,7 +232,7 @@ def test_mapping_and_json_overrides_and_validation(tmp_path):
     with pytest.raises(ValueError, match="Invalid value"):
         Config({"dense_spacing_mode": "unknown"})
     with pytest.raises(ValueError, match="Invalid vector length"):
-        Config({"dense_spacing_pair_m_short": [1]})
+        Config({"winding_model_relative_pair_delta": [1]})
     with pytest.raises(ValueError):
         Config({"track_max_tortuosity": "unlimited"})
 
@@ -275,10 +270,3 @@ def test_dt_loss_schedule_is_not_advanced_or_durable_configuration():
     assert "influence_disable_dt_frac" not in catalog["schema"]["fields"]
     with pytest.raises(ValueError, match="Unknown"):
         Config({"influence_disable_dt_frac": 0.75})
-
-
-def test_golden_metadata_uses_new_metric_and_excludes_removed_field():
-    golden = (Path(__file__).parent / "golden" / "golden_bands.json").read_text()
-    assert "run_dt_suppressed" in golden
-    assert "interactive_dt_suppressed" not in golden
-    assert "influence_disable_dt_frac" not in golden

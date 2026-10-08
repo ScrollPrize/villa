@@ -37,6 +37,11 @@ constexpr std::size_t kMaxDependencyBoxExpansion = 256;
 // blocking batch near 256 MiB lets all eight make progress without forcing the
 // first worker's freshly-prefetched chunks out before it samples them.
 constexpr std::size_t kDependencyDecodedBytesPerBatch = 256ULL << 20;
+// Decoded bytes one tile fill may prefetch in total. A well-formed 128x128
+// tile with its normal band touches a handful of chunks; a tile whose geometry
+// streaks across the volume would otherwise pull thousands through the shared
+// chunk cache, evicting every other viewer's working set, on every refill.
+constexpr std::size_t kMaxTileDependencyDecodedBytes = 512ULL << 20;
 
 
 // How many times a tile that came back incomplete is refilled before it is left
@@ -1025,6 +1030,24 @@ void SurfaceCache::State::runFill(const std::shared_ptr<State>& self,
         std::max<std::size_t>(
             1, kDependencyDecodedBytesPerBatch /
                    std::max<std::size_t>(1, decodedChunkBytes)));
+    const std::size_t tileDependencyLimit = std::max(
+        dependencyKeyLimit,
+        kMaxTileDependencyDecodedBytes / std::max<std::size_t>(1, decodedChunkBytes));
+    std::size_t prefetchedKeys = 0;
+
+    // Pixels the fill cannot serve within the dependency bounds are left
+    // uncovered rather than counted as incomplete: refilling cannot change the
+    // outcome, and an incomplete tile is refilled on every chunk arrival.
+    auto leaveUncovered = [&](int x0, int x1, int y0, int y1) {
+        for (int y = y0; y < y1; ++y) {
+            for (int x = x0; x < x1; ++x) {
+                const std::size_t index =
+                    std::size_t(y) * kTileSize + std::size_t(x);
+                tile->valid[index] = 0;
+                tile->validOffset[index] = 0;
+            }
+        }
+    };
 
     bool complete = true;
     auto stillCurrent = [&]() {
@@ -1047,7 +1070,7 @@ void SurfaceCache::State::runFill(const std::shared_ptr<State>& self,
             const int width = x1 - x0;
             const int height = y1 - y0;
             if (width <= 1 && height <= 1) {
-                complete = false;
+                leaveUncovered(x0, x1, y0, y1);
                 return true;
             }
             std::vector<ChunkKey>().swap(dependencies.keys);
@@ -1061,6 +1084,11 @@ void SurfaceCache::State::runFill(const std::shared_ptr<State>& self,
                    fillRegion(x0, x1, middle, y1);
         }
 
+        if (prefetchedKeys + dependencies.keys.size() > tileDependencyLimit) {
+            leaveUncovered(x0, x1, y0, y1);
+            return true;
+        }
+        prefetchedKeys += dependencies.keys.size();
         if (!dependencies.keys.empty()) {
             // A tile fill owns its exact normal-band dependencies independently
             // of any sparse viewer snapshot that caused the fill to be admitted.

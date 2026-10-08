@@ -2215,7 +2215,11 @@ template <typename LossAt>
         throw std::invalid_argument(
             "fiber trace start point has no valid prediction direction");
     }
-    const TraceVec startDirection = startPrediction.direction;
+    if (request.fixInitialDirection &&
+        !vc::fiber_tracer::displayUnit(request.initialDirection))
+        throw std::invalid_argument("fixed initial direction must be finite and nonzero");
+    const TraceVec startDirection = request.fixInitialDirection
+        ? referenceStartDirection : startPrediction.direction;
 
     const float distance = traceLengthLimitVoxels.has_value()
         ? static_cast<float>(*traceLengthLimitVoxels)
@@ -2300,6 +2304,9 @@ template <typename LossAt>
                         static_cast<double>(kTraceEpsilon),
                         *traceLengthLimitVoxels - nominalTracedLength)));
             }
+            const std::vector<ConeOffset> fixedOffsets;
+            const auto& generationOffsets = request.fixInitialDirection && stepIndex+advanced==0
+                ? fixedOffsets : coneOffsets;
             const bool finalLookaheadGeneration =
                 advanced + 1 >= lookaheadSteps ||
                 stepIndex + advanced + 1 >= maxSteps;
@@ -2318,7 +2325,7 @@ template <typename LossAt>
                         predictions,
                         normalSampler,
                         expanded,
-                        coneOffsets,
+                        generationOffsets,
                         generationStep,
                         targetPlanes,
                         acceptThresholdVoxels,
@@ -2337,7 +2344,7 @@ template <typename LossAt>
                     scoringScratch.tasks,
                     scoringScratch.candidatePoints,
                     expanded,
-                    coneOffsets,
+                    generationOffsets,
                     generationStep);
                 if (profile != nullptr)
                     profile->taskBuildSeconds += elapsedSeconds(taskBuildStart);
@@ -2881,21 +2888,23 @@ void appendMovingPlaneCandidates(
     return out;
 }
 
-[[nodiscard]] std::vector<cv::Vec3d> warpTracePrefixToMidpoint(
+[[nodiscard]] std::vector<cv::Vec3d> warpTracePrefixToMeeting(
     std::vector<cv::Vec3d> partial,
     const cv::Vec3d& anchor,
     const cv::Vec3d& sourceMeeting,
-    const cv::Vec3d& midpoint)
+    const cv::Vec3d& meeting)
 {
     if (partial.empty())
         return {};
+    // A zero-length side stays at its CP; the other side takes the entire
+    // correction. Do not fabricate a connector for an endpoint meeting.
     if (partial.size() == 1)
-        partial.push_back(sourceMeeting);
+        return {anchor};
     partial.front() = anchor;
     partial.back() = sourceMeeting;
     const auto lengths = arclengths(partial);
     const double total = lengths.back();
-    const cv::Vec3d delta = midpoint - sourceMeeting;
+    const cv::Vec3d delta = meeting - sourceMeeting;
     for (size_t index = 0; index < partial.size(); ++index) {
         const double blend = total > 1.0e-8
             ? std::clamp(lengths[index] / total, 0.0, 1.0)
@@ -2906,7 +2915,7 @@ void appendMovingPlaneCandidates(
         partial[index] += delta * blend;
     }
     partial.front() = anchor;
-    partial.back() = midpoint;
+    partial.back() = meeting;
     return partial;
 }
 
@@ -3003,18 +3012,22 @@ struct TraceMeetingFusion {
 
     auto forwardPartial = tracePrefixAtArc(forward, best->forwardArcLength);
     auto reversePartial = tracePrefixAtArc(reverse, best->reverseArcLength);
-    const cv::Vec3d midpoint =
-        (best->forwardPoint + best->reversePoint) * 0.5;
-    forwardPartial = warpTracePrefixToMidpoint(
+    // Distribute the meeting gap in proportion to traced arclength, so a
+    // short side does not absorb half the correction over almost no distance.
+    // Zero reverse length gives the target CP; zero forward length the start CP.
+    const double forwardWeight = best->forwardArcLength / result.traceLengthTraceVoxels;
+    const cv::Vec3d meeting = best->forwardPoint * (1.0 - forwardWeight) +
+                             best->reversePoint * forwardWeight;
+    forwardPartial = warpTracePrefixToMeeting(
         std::move(forwardPartial),
         forward.points.front(),
         best->forwardPoint,
-        midpoint);
-    reversePartial = warpTracePrefixToMidpoint(
+        meeting);
+    reversePartial = warpTracePrefixToMeeting(
         std::move(reversePartial),
         reverse.points.front(),
         best->reversePoint,
-        midpoint);
+        meeting);
     std::reverse(reversePartial.begin(), reversePartial.end());
     std::vector<cv::Vec3d> fusedDense = std::move(forwardPartial);
     if (!reversePartial.empty()) {
@@ -3242,7 +3255,9 @@ bool debugShouldRetryLookahead(
 FiberTraceSegmentResult debugFuseTraceSegment(
     const std::vector<cv::Vec3d>& forward,
     const std::vector<cv::Vec3d>& reverse,
-    const FiberTraceConfig& config)
+    const FiberTraceConfig& config,
+    const std::vector<FiberTraceTargetPlaneCrossing>& forwardCrossings,
+    const std::vector<FiberTraceTargetPlaneCrossing>& reverseCrossings)
 {
     validateTraceConfig(config);
     FiberTraceSegmentResult result;
@@ -3250,6 +3265,8 @@ FiberTraceSegmentResult debugFuseTraceSegment(
     result.forward.reason = "debug_forward";
     result.reverse.points = reverse;
     result.reverse.reason = "debug_reverse";
+    result.forward.targetPlaneCrossings = forwardCrossings;
+    result.reverse.targetPlaneCrossings = reverseCrossings;
     const TraceMeetingFusion fusion =
         fuseTraceMeetings(result.forward, result.reverse, config);
     result.fusedLine = fusion.fusedLine;
@@ -4670,7 +4687,8 @@ FiberTraceOneWayResult traceFiberExtrapolation(
     double distanceVoxels,
     const FiberTraceConfig& config,
     const vc::lasagna::NormalSampler* normalSampler,
-    const FiberTraceProgressCallback& progress)
+    const FiberTraceProgressCallback& progress,
+    bool fixInitialDirection)
 {
     if (!finitePoint(startPoint) || !finitePoint(outwardDirection)) {
         throw std::invalid_argument(
@@ -4690,6 +4708,7 @@ FiberTraceOneWayResult traceFiberExtrapolation(
     request.startPoint = startPoint;
     request.targetPoint = startPoint + direction * distanceVoxels;
     request.initialDirection = direction;
+    request.fixInitialDirection = fixInitialDirection;
     request.budgetSpanVoxels = distanceVoxels;
     // No target planes and no endpoint acceptance here: an open-tail
     // extrapolation has a synthetic target at the requested distance, nothing
@@ -4751,6 +4770,12 @@ FiberTraceSegmentResult traceFiberSegment(
     forwardOneWay.targetPoint = target;
     forwardOneWay.initialDirection =
         referenceTangentToward(request.referenceLine, request.startIndex, request.targetIndex);
+    if (request.startDirection) {
+        const auto axis = vc::fiber_tracer::displayUnit(*request.startDirection);
+        if (!axis) throw std::invalid_argument("invalid trace start direction");
+        forwardOneWay.initialDirection = request.targetIndex>request.startIndex ? *axis : -*axis;
+        forwardOneWay.fixInitialDirection = true;
+    }
     forwardOneWay.targetPlanes = targetLocalPlanes(
         predictions,
         request.referenceLine,
@@ -4767,6 +4792,12 @@ FiberTraceSegmentResult traceFiberSegment(
     reverseOneWay.targetPoint = start;
     reverseOneWay.initialDirection =
         referenceTangentToward(request.referenceLine, request.targetIndex, request.startIndex);
+    if (request.targetDirection) {
+        const auto axis = vc::fiber_tracer::displayUnit(*request.targetDirection);
+        if (!axis) throw std::invalid_argument("invalid trace target direction");
+        reverseOneWay.initialDirection = request.targetIndex>request.startIndex ? -*axis : *axis;
+        reverseOneWay.fixInitialDirection = true;
+    }
     reverseOneWay.targetPlanes = targetLocalPlanes(
         predictions,
         request.referenceLine,
@@ -4790,6 +4821,31 @@ FiberTraceSegmentResult traceFiberSegment(
     if (!result.fusedLine.empty()) {
         result.fusedLine.front() = request.referenceLine[request.startIndex];
         result.fusedLine.back() = request.referenceLine[request.targetIndex];
+    }
+    // Meeting warps/resampling can rotate the first edge even when the trace
+    // starts correctly. Restore explicit endpoint tangents only, smoothly
+    // fading the positional correction within each half of the fused line.
+    if ((request.startDirection || request.targetDirection) && result.fusedLine.size()>=2) {
+        auto& line=result.fusedLine;
+        if (line.size()<4) {
+            const auto a=line.front(), b=line.back();
+            line={a,a+(b-a)/3.0,a+(b-a)*2.0/3.0,b};
+        }
+        const auto constrain=[&](bool reverse, const cv::Vec3d& direction) {
+            const size_t n=line.size();
+            const auto at=[&](size_t i)->cv::Vec3d& { return line[reverse ? n-1-i : i]; };
+            std::vector<double> arcs(n,0);
+            for (size_t i=1;i<n;++i) arcs[i]=arcs[i-1]+cv::norm(at(i)-at(i-1));
+            const cv::Vec3d delta=at(0)+normalizedOrZero(direction)*cv::norm(at(1)-at(0))-at(1);
+            const size_t limit=(n+1)/2;
+            const double end=std::max(arcs[1]+1e-9,arcs[limit]);
+            for (size_t i=1;i<limit;++i) {
+                const double t=std::clamp((arcs[i]-arcs[1])/(end-arcs[1]),0.0,1.0);
+                at(i)+=delta*((1-t)*(1-t)*(1+2*t));
+            }
+        };
+        if (request.startDirection) constrain(false,forwardOneWay.initialDirection);
+        if (request.targetDirection) constrain(true,reverseOneWay.initialDirection);
     }
 
     result.forwardEndpointErrorTraceVoxels =

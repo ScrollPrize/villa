@@ -18,7 +18,7 @@ import { handleChat } from '../api/_lib/handler.mjs';
 import { rateLimitMode } from '../api/_lib/rateLimit.mjs';
 
 const PORT = Number.parseInt(process.env.PORT ?? '', 10) || 3901;
-const DEFAULT_MODEL = 'openai/gpt-5-mini';
+const DEFAULT_MODEL = 'openai/gpt-6-luna';
 
 // Build a Web Request from an incoming Node request.
 async function toWebRequest(req) {

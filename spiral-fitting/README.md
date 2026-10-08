@@ -93,9 +93,27 @@ This is not covered by scrollprize.org/tutorial_spiral. Required keys:
 
 - `schema_version` — must equal `1`.
 - `name`, `voxel_size_um` — required, no validation beyond presence.
-- `spiral_outward_sense` — must be `"CW"` or `"ACW"` (case-insensitive).
-  No automated method determines this; it is read off the CT data by a
-  person in VC3D, or computed from an already-fitted spiral.
+- `z_direction_is_top_to_bottom`, `left_handed_coordinates` — the fitted
+  volume's two properties from the open-data catalog (`metadata.json`), copied 
+- verbatim as `true`/`false`. Together they fix the spiral's sense under the catalog convention that every scroll
+  shows the same spiral seen from its top: `"CW"` when they are equal, `"ACW"`
+  when they differ. The z direction also orients exported surfaces (below).
+- `spiral_outward_sense` — `"CW"` or `"ACW"` (case-insensitive). Derived from
+  the two catalog properties when both are present, and then only needed as a
+  cross-check (a mismatch is an error). Without them it is required and is
+  read off the CT data by a person in VC3D, or from an already-fitted spiral.
+
+Exported surfaces (the per-winding `meshes/`, the combined preview and
+`flatten_spiral_checkpoint.py`'s source surface) read like the scroll: column 0
+is the outermost wrap, U running outside to inside as orient-segment
+normalises it, and row 0 is the top of the scroll when
+`z_direction_is_top_to_bottom` is known (rows stay in z order when it is
+not). Each `meta.json` and preview manifest records the z direction the
+layout was made with under `grid_orientation` (a grid without it is an older
+one in sampling order: innermost first, rows by z); `winding_column_ranges`
+are in the written grid, outermost winding first. `left_handed_coordinates` does not change the grid, only the
+direction of its cross-product normal, which renders correct with
+`flip-normals = not left_handed_coordinates`.
 
 Optional `paths` object for per-input overrides when a dataset's file names
 don't match the catalog's conventional defaults (e.g. `tracks_dbm`).
@@ -128,6 +146,33 @@ specifically):
   }
 }
 ```
+
+## Lasagna inputs must be packed first
+
+`fit_spiral.py` reads `normal_x`, `normal_y` and `gradient_magnitude` only
+through the resident-pool sidecars that `pack_resident_pools.py` writes
+(`lasagna_data.py`: there is no other loading path). Before the first fit on a
+dataset, pack the stores at the group named by `normal_zarr_group` in
+`spiral-scroll.json`:
+
+```sh
+python pack_resident_pools.py <dataset>/lasagna_inputs \
+    --what normals,grad_mag --normal-group 2
+```
+
+The packer looks for `*_nx.ome.zarr`, `*_ny.ome.zarr` and `*_grad_mag.ome.zarr`
+in that folder and writes `<store>.respool_g<group>_pair` (normals) and
+`<store>.respool_g<group>` (grad_mag) next to them. Without the sidecars the fit
+stops at input loading with
+
+```
+lasagna normals: resident-pool sidecar '.../PHercXXXX_nx.ome.zarr.respool_g2_pair' not found; build it with pack_resident_pools.py ...
+```
+
+The packer only iterates over chunk files that exist, so a store that holds only
+the z chunk rows of your fit window packs correctly; rows outside it read back
+as no-data. Pass `--ct <scroll zarr> --ct-group <group>` to drop bricks outside
+the CT mask.
 
 ## Sweep runner output
 
@@ -167,11 +212,6 @@ diffeomorphism composes. The stages are the slabs of the flow lattices'
 leading axis (`flow_field.flows.{0,1}` are `[stages, 3, ...]`), integrated in
 order by one fused kernel launch per direction; the inverse runs the slabs
 backwards in reverse order. One stage is the original single-field model.
-Checkpoints written with the earlier per-stage module layout
-(`extra_flow_fields.*`) are migrated on load, Adam moments included
-(`checkpoint_migrations.merge_flow_stage_lattices`). The retired
-`model_num_flow_timesteps` key is dropped from old configurations on load;
-checkpoints with a time axis longer than 1 are rejected.
 
 ## Flow-gradient conditioning
 
@@ -179,13 +219,12 @@ These optional settings change how the flow lattices are optimized, without
 adding loss terms or changing the model parameterization. The smoothing,
 lazy-moment and shared-second-moment switches default to off; gradient
 clipping defaults to disabled. The `optimizer_flow_*` settings apply at run
-boundaries and are read every step. Older checkpoints backfill these defaults.
+boundaries and are read every step.
 
 The step order is: DDP gradient averaging, NaN/Inf detection and replacement
-with zero, optional clipping, optional smoothing, influence masks, then the
-optimizer update. Sanitizing before smoothing prevents a single invalid entry
-from contaminating its neighborhood. Influence masks constrain the processed
-gradient after smoothing.
+with zero, optional clipping, optional smoothing, then the optimizer update.
+Sanitizing before smoothing prevents a single invalid entry from
+contaminating its neighborhood.
 
 - `optimizer_flow_grad_smoothing` Gaussian-smooths each flow lattice's
   gradient. `optimizer_flow_grad_smoothing_sigma_voxels` sets the standard
@@ -320,9 +359,16 @@ same modules build with serial kernels when it does not.
 or with conda/pip, install `torch` for your CUDA version and then
 `pip install -e .` from `spiral-fitting/`.
 
+On Linux x86-64, `uv sync` installs `brook-cu12`, CuPy and cuCIM for the GPU
+backend of `extract_surface_tracks.py` instead of Kimimaro, its CPU backend;
+on a machine without an NVIDIA GPU of compute capability 8.0 or newer, add
+Kimimaro with `uv sync --extra cpu` (with pip: `pip install -e '.[cpu]'`), and
+pass `--extra cpu` on later syncs too, since a plain `uv sync` removes it again.
+Other platforms get Kimimaro by default.
+
 ### Resident sparse field pools
 
-Normals, gradient magnitude, and surf-SDT samples are served by fully
+Normals and gradient magnitude samples are served by fully
 resident device brick pools. Each store's occupied bricks are packed once
 into a flat sidecar next to the source zarr by `pack_resident_pools.py`:
 
@@ -334,8 +380,8 @@ python pack_resident_pools.py /path/to/lasagna_inputs \
 `--ct` zeroes every voxel whose CT voxel reads 0 (the mask region around the
 scroll) so those bricks drop out of the pool and sample as no-data. The
 fitter loads the sidecars restricted to the configured z-ROI in one
-sequential read per channel (for the full s1 ROI: ~33 GiB SDT + ~10 GiB
-normals); after that every gather is pure device indexing with no I/O and no
+sequential read per channel (for the full s1 ROI: ~10 GiB normals); after
+that every gather is pure device indexing with no I/O and no
 eviction. When a required sidecar is missing, the fitter builds it before GPU
 loading and reports chunk progress. In DDP runs only rank 0 builds it. Manual
 prepacking with `--ct` remains useful because the CT mask can substantially
@@ -489,7 +535,7 @@ per profile. Generated previews, geometry, and
 checkpoints transfer through the artifact API into a local cache — no shared
 filesystem is needed. Optional: set the profile's **Local dataset path** if
 this machine mounts the same dataset, so input surface overlays
-(verified/unverified/shell) can be displayed locally. It is assumed to
+(verified patches/shell) can be displayed locally. It is assumed to
 correspond to the dataset root the service advertises, which is the prefix
 service paths are translated from; without it those overlays are simply marked
 unavailable.
@@ -503,10 +549,10 @@ read-only, and the service rejects a session request that carries
 Optional supervision sources have rebuild-scoped boolean switches in Advanced
 config. Set an `input_use_*` key to `false` to skip validation, loading,
 sampling, and losses for that source without changing its tuned weights or
-sample counts. Available switches cover verified/unverified patches, tracks,
+sample counts. Available switches cover verified patches, tracks,
 fibers, each PCL role (`absolute`, `relative`, `same_winding`, and
-`drawn_control_points`), normals, surface SDT, gradient magnitude, winding
-inference, and the outer shell. For example:
+`drawn_control_points`), normals, gradient magnitude, winding inference, and
+the outer shell. For example:
 
 ```json
 {
@@ -519,8 +565,8 @@ inference, and the outer shell. For example:
 Most role switches require a whole-fit rebuild; same-winding and relative PCL
 switches apply at the next Run. Disabled roles retain their accepted workspace
 content, and enabling a role restores that desired content. Disabling a
-prerequisite also disables its dependent supervision: phase spacing needs
-normals and surface SDT, while winding inference needs the outer shell.
+prerequisite also disables its dependent supervision: winding inference
+needs the outer shell.
 
 The API 33 client and service use one revisioned input workspace per dataset.
 One service holds the dataset editing lease and one client owns that workspace;
@@ -644,14 +690,6 @@ Input uploads only transfer immutable bytes. The editing workspace owns
 acceptance, application, and persistence; there is no separate ephemeral-input
 ledger or automatic commit on editor save. Checkpoint uploads remain service-scoped.
 
-Interactive influence settings are captured when each **Run** request starts.
-Applying input revisions uses those captured settings and extends the
-influence region's union.
-The region is cleared only when the Run pauses, before autosaving.
-Influence masks, limits, and controls are not checkpoint state. All
-`interactive_influence_*` advanced settings can therefore change between runs
-without reloading the resident session.
-
 Directional DT timing is an independent control on every interactive Run.
 When **Restrict DT losses to final** is unchecked, the Run adds no DT gate.
 When checked, the adjacent percentage is the eligible suffix of the originally
@@ -694,10 +732,20 @@ it and says what a rebuild would have to replace: rebuilding the **model only**
 keeps the loaded dataset inputs and everything already added to the fit, while
 a **whole-fit** rebuild re-reads the dataset and replays the workspace's desired
 revisions, including uncommitted additions. The panel reports the reasons and asks; a checkpoint no
-rebuild can accept — one written against another dataset, or against a
-configuration schema this service does not have — is reported and nothing is
-offered. A checkpoint-backed session takes its durable configuration from the
-checkpoint, so the local advanced-config profile does not override it.
+rebuild can accept — one written against another dataset, or whose stored
+configuration holds a value the schema cannot interpret — is reported and
+nothing is offered. A checkpoint-backed session takes its durable configuration
+from the checkpoint, so the local advanced-config profile does not override it.
+
+A checkpoint's stored configuration is loaded tolerantly
+(`checkpoint_migrations.tolerate_config`): keys the schema no longer has are
+dropped and keys the checkpoint predates take their current defaults. Each
+such edit is reported as a note or session warning. Only a stored value the
+schema cannot validate (a retired enum member, an out-of-range number) refuses
+the checkpoint. Tolerance covers configuration alone: a checkpoint whose
+parameters do not fit the live model — a multi-stage flow saved in the
+pre-slab `extra_flow_fields.*` layout, or an exponential-gap fit from before
+late August 2026 — is still refused on tensor geometry.
 
 The Iterations value on *Run* is a count added to the checkpoint's durable
 iteration. The progress bar is local to that run and therefore starts at zero;
@@ -746,6 +794,116 @@ journalctl --user -u spiral-service -f     # logs (includes the API key print)
 ```
 
 Direct command-line use remains fully supported; the unit is a convenience.
+
+## Extracting surface tracks
+
+`extract_surface_tracks.py` turns a surface-prediction volume into the tracks
+DBM that the next sections pack, index and rasterize. The predictions are
+binarized (`> 0`) and cut into thin slabs: horizontal ribbons 4 voxels deep
+every 16 voxels of z, then vertical zx and zy slabs 4 voxels thick every 64
+voxels across the occupied yx range. In every slab the connected components
+are labelled, max-pooled by 4, filtered by size and skeletonized, and each
+skeleton chain between branch or end points with at least 10 vertices becomes
+a track.
+
+```sh
+python extract_surface_tracks.py \
+    --predictions /path/to/<surface-predictions>.zarr/0 \
+    --out /path/to/<dataset>/tracks/<name>.dbm \
+    --z-min 10900 --z-max 11300
+```
+
+Every option defaults to the configuration at the top of the script, which
+also holds the slab geometry, the size thresholds and `path_mode`. Its two
+paths are placeholders: the script stops with an error until they are set or
+passed as `--predictions` and `--out`. `--predictions` takes a local path or a
+URL such as `s3://...`, opened with `open_zarr` from `../vesuvius/src`; the GPU
+backend reads a local zarr v2 array in the layout of the surface predictions
+(uint8, blosc, `/` chunk keys) straight from its chunk files instead. The z
+range is half-open (`[z-min, z-max)`).
+
+Two backends write the same keys in the same format:
+
+- `gpu`: Brook (`brook-cu12`) and cuCIM on NVIDIA GPUs, one worker process
+  per GPU. It needs Linux x86-64, GPUs of compute capability 8.0 or newer
+  (Ampere or later) and an NVIDIA driver R545 or newer (R570 or newer where the
+  driver JIT-compiles Brook's PTX). The CUDA 12 libraries come as pip wheels
+  (`brook-cu12` bundles its runtime; CuPy and cuCIM use NVIDIA's CUDA wheels
+  installed with them), so no system CUDA toolkit is needed. `--gpus 0,1`
+  selects GPUs by their `nvidia-smi` index; the default is every visible GPU.
+  Without `--gpus`, a set `CUDA_VISIBLE_DEVICES` is read the same way
+  (`nvidia-smi` indices, PCI bus order); UUID and MIG entries are not accepted,
+  so pass `--gpus` instead. With `--gpus`, `--backend auto` does not fall back
+  to Kimimaro when the GPU backend cannot run.
+- `cpu`: Kimimaro, one slab at a time. `uv sync` installs it on every platform
+  except Linux x86-64, where it is the optional `cpu` extra
+  (`uv sync --extra cpu`) for machines without a compatible GPU.
+
+`--backend auto` (the default) picks the GPU backend when its check passes
+(platform, packages, and the NVIDIA driver version and the compute capability
+of the selected GPUs, as reported by `nvidia-smi`) and `path_mode` is
+`'interjoint'`, and Kimimaro otherwise. The
+script prints the backend it uses and why. `--backend gpu` and `--backend cpu`
+stop with the reason when that backend cannot run. The GPU backend implements
+only the `'interjoint'` path mode.
+
+Brook implements Kimimaro's skeletonization on the GPU. Its skeletons are close
+to Kimimaro's but not always identical, so the two backends' DBMs agree closely
+rather than byte for byte (see the measurements below). Kimimaro collects the
+skeletons of its 8 worker processes as they finish, so the order of the tracks
+within a key can also differ between two CPU runs.
+
+Every key (`h:{z}`, `vy:{y}`, `vx:{x}`) holds a pickled list of `(N, 3)` int32
+ZYX arrays in full-resolution voxels, and an empty slab holds an empty list.
+Keys already in the DBM are skipped, so an interrupted run resumes where it
+stopped, with either backend; delete the DBM to recompute it. When
+`write_native_packed_store` is set (the default), the script then writes the
+packed store described in the next section. That step imports `tracks.py`,
+which needs PyTorch; `--no-packed-store` skips it, and `convert_track_store.py`
+can write the store later.
+
+The GPU backend decodes the z range once into a bit-packed block in POSIX
+shared memory (`/dev/shm`) of about (z-max − z-min) × Y × X / 8 bytes, where Y
+and X are the full extent of the volume, plus at most a quarter of that again
+(at the default slab spacing) for the byte columns of the vx slabs. For 400
+slices of a 7888 × 8096 volume the block takes 3.2 GB. The script stops with an
+error when `/dev/shm` has too little free space.
+
+Measured on Scroll 1 surface predictions with the default slab geometry and
+thresholds. Times run from the start of the extraction to the closed DBM,
+reading and decoding included, interpreter start-up and the packed store not:
+
+| Input (Y × X) | z range | Hardware | Backend | Runs | Time |
+| :--- | :--- | :--- | :--- | ---: | ---: |
+| public predictions, 7888 × 8096 | 10900–11300 | Intel Core i9-14900KF | Kimimaro, 8 workers | 1 | 336.9 s |
+| same | 10900–11300 | NVIDIA RTX 4090, driver 615 | GPU | 3 | 4.1, 4.2, 4.2 s |
+| predictions, 8174 × 8174 | 10900–11300 | 4 × NVIDIA H100 80GB, driver 570 | GPU | 3 | 4.4, 4.5, 4.6 s |
+| same | 10752–14848 | 4 × NVIDIA H100 80GB | GPU | 3 | 15.7, 15.9, 19.6 s |
+| same | 10752–14848 | 1 × NVIDIA H100 80GB | GPU | 1 | 40.0 s |
+
+The 19.6 s run was the first in a new environment (numba compiles and caches
+its kernels once). On z 10752–14848 (446 keys) the GPU backend wrote 1,006,831
+tracks with 41,530,237 points, and a Kimimaro run on the same range wrote
+1,006,740 tracks with 41,543,412 points (+0.01 % tracks, −0.03 % points). The
+GPU DBMs were byte-identical across runs and between 1 and 4 GPUs, and the tests
+compare them with the per-slab loop run with `brook.skeletonize`. These are
+single inputs; speed and agreement depend on the data and the GPUs.
+
+Run the tests from the repository root:
+
+```sh
+PYTHONPATH=spiral-fitting spiral-fitting/.venv/bin/python -m pytest -q \
+  spiral-fitting/tests/test_extract_surface_tracks.py
+```
+
+They compare `fast_tracks.py` with the networkx walk of the CPU backend on
+fixed and random graphs, check the backend selection and the command line
+without a GPU or Kimimaro, and run the CPU backend on a small synthetic volume
+when Kimimaro is installed. With Brook, CuPy, cuCIM and a GPU of compute
+capability 8.0 or newer, they also run the GPU backend on one GPU on two small
+synthetic zarr stores, one read by the direct chunk reader and one through the
+fallback reader, and compare the DBMs with the per-slab loop run with
+`brook.skeletonize`.
 
 ## Packing large track databases
 
@@ -856,9 +1014,8 @@ and optimisation then does no inference-store filesystem I/O. The default
 24,000 samples per step are split evenly between long relative-winding pairs
 (`sample_count_winding_model_relative_pairs`, index separation drawn from
 `winding_model_relative_pair_delta`) and adjacent-passage density pairs
-(`sample_count_winding_model_density_pairs`). In this mode surf-SDT is
-neither loaded nor required, while the independent Lasagna normal and native
-minimum-spacing losses remain available.
+(`sample_count_winding_model_density_pairs`). The independent Lasagna normal
+and native minimum-spacing losses remain available alongside it.
 
 The compact store is created by the Vesuvius winding-model
 `export_spiral_supervision.py` tool; see its `NATIVE_PHASE_CACHE.md` for the
