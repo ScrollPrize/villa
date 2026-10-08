@@ -34,7 +34,8 @@ vesuvius.predict \
 | `--tta_type` / `--disable_tta` | Choose `rotation` (default) or `mirroring`, or disable test-time augmentation.
 | `--num_parts` / `--part_id` | Partition inference so multiple machines can process different chunks.
 | `--bbox` | Restrict inference to a region of interest: `"z0:z1,y0:y1,x0:x1"` in global voxel coordinates, half-open. Omit a bound to reach the volume edge (`"1000:1400,:,2000:"`). See [Region-of-interest inference](#region-of-interest-inference).
-| `--chunk_cache_mb` | Keep up to this many MB of fetched input chunks in an in-memory LRU cache (zarr 3), so overlapping patches do not download the same chunks again. Each DataLoader worker keeps its own cache. Default `0` (off).
+| `--chunk_cache_mb` | Keep up to this many MB of fetched input chunks in an in-memory LRU cache (zarr 3), so overlapping patches do not download the same chunks again. Each DataLoader worker keeps its own cache. Default `0` (off). See [Streaming a remote volume](#streaming-a-remote-volume-chunk-cache-patch-order-and-workers).
+| `--patch_order` | `chunk` (default) reads patches along a Morton curve over the input's chunk grid, so patches that share chunks are read back to back; `zyx` is the row-major order. The patches, their coordinates and the per-patch logits are the same either way.
 | `--overlap` | Fractional patch overlap (0–1, default `0.5`).
 | `--batch_size` | Inference batch size (default `1`).
 | `--patch_size` | Override the model patch size using a comma-separated list (e.g. `192,192,192`).
@@ -93,6 +94,49 @@ Notes:
 - An ROI smaller than the model patch size along an axis is grown to the patch size and
   shifted back inside the volume, so the model always sees a full patch.
 - Bounds are clamped to the volume; a bbox entirely outside it is an error.
+
+### Streaming a remote volume: chunk cache, patch order and workers
+
+Patches overlap by 50% and are not aligned to the input's chunk grid, so every chunk is needed
+by many patches: a 192³ patch over 128³ chunks touches up to 27 of them, and with no cache each
+one is downloaded again for every patch that needs it (8× the volume's size for the region, more
+for smaller patches). `--chunk_cache_mb` keeps fetched chunks in memory, but a cache only helps
+when the patches that share a chunk are read close together *and by the same process*:
+
+- With `--patch_order chunk` (the default) the patch list follows a Morton curve over the chunk
+  grid, so neighbouring patches are consecutive. The row-major order (`zyx`) walks a whole row of
+  x before returning to the chunks it just used, which have been evicted by then unless the cache
+  holds an entire row band of the sweep.
+- With `--num_workers N` the DataLoader hands batch *i* to worker *i mod N*, which would scatter
+  neighbouring patches across processes. `vesuvius.predict` instead gives each worker one
+  contiguous run of the patch list, so each worker's cache sees its neighbours.
+
+Both change only the order in which patches are read; which patches are read, their coordinates
+and their logits are identical. `blend_logits` accumulates overlapping patches in index order, so
+the merged logits differ from a row-major run only by float16 rounding (in the run below 0.002% of
+voxels, each by one ulp, max 2⁻¹⁰). Measured on
+`PHercParis4.volpkg/volumes_zarr_standardized/54keV_7.91um_Scroll1A.zarr` (128³ zstd chunks),
+`--bbox 6400:6592,5120:5312,2048:3584`, 192³ patches, overlap 0.5, batch 1, `--num_workers 4
+--chunk_cache_mb 512`: 288 patches over 400 distinct chunks (308 MB), counting every chunk request
+made by every process:
+
+| version | order | chunk requests | per distinct chunk | MB downloaded | per-worker distinct chunks | logits sha256 |
+|---|---|---|---|---|---|---|
+| before | row-major, round-robin workers | 1360 | 3.40 | 1047 | 340, 340, 340, 340 | `dc39226603a3afe1` |
+| now | chunk, contiguous dispatch | 572 | 1.43 | 441 | 132, 145, 135, 160 | `dc39226603a3afe1` |
+
+With round-robin dispatch every worker ended up fetching 340 of the 400 chunks itself; with one
+contiguous run each, a worker fetches its own quarter plus the chunks on the boundary with its
+neighbours. The remaining 1.43× is that boundary, not repeated fetches within a worker.
+
+When the cache cannot hold a whole row band of the sweep the order itself decides the count. On a
+96×80×112 volume with 16³ chunks and 24³ patches (378 patches, 210 distinct chunks; see
+`tests/data/test_patch_order.py`), an LRU of 16 / 32 / 64 chunks fetches 1842 / 393 / 322 chunks
+in chunk order against 2288 / 1298 / 524 row-major. Only once the cache holds a full band (128
+chunks here) does row-major catch up (210 against 252). A chunk cache of a few hundred MB per
+worker is therefore enough once the order is chunk-local, whereas in row-major order it must hold
+a whole band (chunks along x × patch depth in y and z), which for a full-width scroll is several
+GB per worker. With `--chunk_cache_mb 0` the order makes no difference to what is fetched.
 
 ## Stage 2 — `vesuvius.blend_logits`
 

@@ -16,6 +16,7 @@ from vesuvius.utils import list_files, is_aws_ec2_instance
 # Import get_max_value from data.utils to avoid import errors
 from vesuvius.data.utils import get_max_value, open_zarr
 from vesuvius.data.zarr_chunk_index import build_chunk_occupancy, compute_patch_non_empty_mask
+from vesuvius.data.patch_order import PATCH_ORDERS, chunk_local_order
 
 class VCDataset(Dataset):
     def __init__(
@@ -48,6 +49,7 @@ class VCDataset(Dataset):
             read_retries: int = 4,  # Attempts per read, forwarded to Volume
             cache: bool = False,
             cache_size_mb: int = 256,
+            patch_order: str = 'chunk',
             ):
         """
         Dataset for nnUNet inference using the Volume class for data access and preprocessing.
@@ -93,6 +95,13 @@ class VCDataset(Dataset):
                 Overlapping patches then reuse chunks instead of fetching them again.
                 Requires zarr 3.
             cache_size_mb: Size bound of that cache in megabytes (default 256).
+            patch_order: Order in which ``all_positions`` lists the patches. ``'chunk'``
+                (default) sorts them along a Morton curve over the input array's chunk
+                grid so patches that share chunks are read back to back, which is what
+                lets the chunk cache serve them; ``'zyx'`` keeps the row-major
+                enumeration. The set of patches and each patch's data are the same
+                either way; the per-patch logits are identical, and the blended
+                output differs only by float16 rounding of the accumulation order.
         """
         self.input_path = input_path
         self.input_format = input_format # Keep for informational purposes
@@ -107,6 +116,10 @@ class VCDataset(Dataset):
         self.anon = anon
         self.empty_patches_skipped = 0  # Counter for skipped patches
         self.non_empty_mask = None  # Per-patch bool mask; populated below for infer mode with zarr input
+        if patch_order not in PATCH_ORDERS:
+            raise ValueError(f"patch_order must be one of {PATCH_ORDERS}, got {patch_order!r}")
+        self.patch_order = patch_order
+        self.chunk_shape = None  # spatial chunk shape of the level-0 array, once the Volume is open
 
         # Data partitioning parameters
         if num_parts < 1:
@@ -397,6 +410,24 @@ class VCDataset(Dataset):
                     else:
                          print(f"  Warning: No patch starting positions found in the Z-range [{z_start}, {z_end}) for part {self.part_id}.")
 
+            # Visit patches in chunk-local (Morton) order so a chunk cache sees the
+            # patches that share a chunk back to back. Only the sequence changes:
+            # the set of patches, their coordinates and the data read for each are
+            # exactly what the row-major enumeration above produces, so the blended
+            # result is identical. Sorting after the Z partition keeps each part
+            # (and each DDP rank, which slices a contiguous range) on its own
+            # contiguous run of the curve.
+            self.chunk_shape = self._spatial_chunk_shape()
+            if self.patch_order == 'chunk' and self.all_positions:
+                if self.chunk_shape is None:
+                    if self.verbose:
+                        print("  Input chunk shape unknown; keeping z-y-x patch order")
+                else:
+                    order = chunk_local_order(self.all_positions, self.chunk_shape)
+                    self.all_positions = [self.all_positions[i] for i in order]
+                    if self.verbose:
+                        print(f"  Patch order: chunk-local (Morton curve over {self.chunk_shape} chunks)")
+
             # Build per-patch non-empty mask from the input zarr's chunk occupancy.
             # This lets us drop patches that fall entirely in empty regions of a sparse
             # input without ever touching the underlying data; fallback to None leaves
@@ -431,6 +462,33 @@ class VCDataset(Dataset):
                 lo_c = max(0, hi_c - patch)
             roi.append((lo_c, hi_c))
         return tuple(roi)
+
+    def _level0_array(self):
+        """The zarr array patches are read from (level "0" of a multiscale group), or None."""
+        try:
+            import zarr as _zarr
+        except ImportError:
+            return None
+        array_obj = getattr(self.volume, 'data', None)
+        if isinstance(array_obj, _zarr.Array):
+            return array_obj
+        if isinstance(array_obj, _zarr.Group):
+            # Level "0" is what Volume.__getitem__ reads by default.
+            if "0" in array_obj and isinstance(array_obj["0"], _zarr.Array):
+                return array_obj["0"]
+        return None
+
+    def _spatial_chunk_shape(self):
+        """(cz, cy, cx) chunk shape of the level-0 array, without a leading channel axis."""
+        array_obj = self._level0_array()
+        if array_obj is None:
+            return None
+        chunks = tuple(int(c) for c in array_obj.chunks)
+        if len(chunks) == 4:
+            chunks = chunks[1:]
+        if len(chunks) != 3 or any(c <= 0 for c in chunks):
+            return None
+        return chunks
 
     def _build_non_empty_mask_from_chunks(self, use_path):
         if not self.skip_empty_patches or not self.all_positions:

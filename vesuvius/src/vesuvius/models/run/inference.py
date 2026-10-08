@@ -22,6 +22,7 @@ from torch.utils.data import DataLoader
 from vesuvius.utils.models.load_nnunet_model import load_model_for_inference
 from vesuvius.data.vc_dataset import VCDataset
 from vesuvius.data.utils import open_zarr
+from vesuvius.data.patch_order import PATCH_ORDERS, WorkerContiguousBatchSampler
 from pathlib import Path
 from vesuvius.models.build.build_network_from_config import NetworkFromConfig
 from vesuvius.models.run.external_models.load_resnet import try_load_external_resnet34_model
@@ -351,6 +352,7 @@ class Inferer():
                  max_patches: int = None,
                  bbox: [list, tuple] = None,
                  chunk_cache_mb: int = 0,
+                 patch_order: str = 'chunk',
                  ):
         print(f"Initializing Inferer with output_dir: '{output_dir}'")
         if output_dir and not output_dir.strip():
@@ -389,6 +391,7 @@ class Inferer():
         self.max_patches = max_patches
         self.bbox = tuple(bbox) if bbox is not None else None
         self.chunk_cache_mb = chunk_cache_mb
+        self.patch_order = patch_order
         self.model_patch_size = None
         self.num_classes = None
 
@@ -420,6 +423,8 @@ class Inferer():
             raise ValueError(f"max_patches must be >= 1 when provided, got {self.max_patches}.")
         if self.chunk_cache_mb < 0:
             raise ValueError(f"chunk_cache_mb must be >= 0, got {self.chunk_cache_mb}.")
+        if self.patch_order not in PATCH_ORDERS:
+            raise ValueError(f"Invalid patch_order '{self.patch_order}'. Must be one of {PATCH_ORDERS}.")
         # Defer patch size validation until after model loading if not explicitly provided
 
         # --- Output Setup ---
@@ -846,6 +851,7 @@ class Inferer():
             read_retries=self.read_retries,
             cache=self.chunk_cache_mb > 0,
             cache_size_mb=self.chunk_cache_mb,
+            patch_order=self.patch_order,
             # The float16 default suits the CUDA autocast path. CPU convolutions
             # have no float16 kernels, so half patches meet float32 weights and
             # raise "Input type (c10::Half) and bias type (float) should be the
@@ -894,15 +900,24 @@ class Inferer():
                 )
             print(f"Total patches to process for part {self.part_id}: {self.num_active_patches}")
 
-        self.dataloader = DataLoader(
-            loader_dataset,
-            batch_size=self.batch_size,
-            shuffle=False,
+        loader_kwargs = dict(
             num_workers=self.num_dataloader_workers,
             pin_memory=True if self.device != torch.device('cpu') else False,
             collate_fn=VCDataset.collate_fn  # we use custom collate fn here to tag patches that contain only zeros
                                              # so we don't run them through the model
         )
+        if self.num_dataloader_workers > 1:
+            # DataLoader hands batch i to worker i % num_workers, so with plain
+            # batching neighbouring patches land in different processes and each
+            # worker's chunk cache has to fetch what its neighbours already hold.
+            # Give every worker one contiguous run of the (chunk-ordered) patch
+            # list instead: the batches are the same slices, each patch is still
+            # read and written exactly once, only the dispatch order differs.
+            batch_sampler = WorkerContiguousBatchSampler(
+                self.num_active_patches, self.batch_size, self.num_dataloader_workers)
+            self.dataloader = DataLoader(loader_dataset, batch_sampler=batch_sampler, **loader_kwargs)
+        else:
+            self.dataloader = DataLoader(loader_dataset, batch_size=self.batch_size, shuffle=False, **loader_kwargs)
         return self.dataset, self.dataloader
     
     def _concat_multi_task_outputs(self, outputs_dict):
@@ -1317,6 +1332,11 @@ def build_parser():
                            'cache, so overlapping patches reuse chunks instead of downloading '
                            'them again. Each DataLoader worker keeps its own cache. Requires '
                            'zarr 3. Default 0 (off).')
+    parser.add_argument('--patch_order', type=str, default='chunk', choices=list(PATCH_ORDERS),
+                      help='Order in which patches are read. "chunk" (default) follows a Morton '
+                           'curve over the input chunk grid, so patches that share chunks are '
+                           'read back to back and --chunk_cache_mb can serve them; "zyx" is the '
+                           'row-major order. The patches and their outputs are the same either way.')
     parser.add_argument('--max_patches', type=int, default=None,
                       help='Optional cap on patch positions processed by this part. '
                            'Intended for smoke tests; production inference leaves this unset.')
@@ -1401,6 +1421,7 @@ def main():
         max_patches=args.max_patches,
         bbox=bbox,
         chunk_cache_mb=args.chunk_cache_mb,
+        patch_order=args.patch_order,
     )
 
     try:
