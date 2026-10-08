@@ -287,6 +287,16 @@ TEST_CASE("fiber slice annotated length stops at the outermost control points")
     CHECK(vc3d::fiber_slice::annotatedLineLengthVx(line, shuffled) == doctest::Approx(2400.0));
 }
 
+TEST_CASE("fiber slice annotated length is nothing when the controls share one line point")
+{
+    // Two finite controls that both snap to line point 1: there is a control
+    // pair, but no line between them - not the whole line.
+    const std::vector<cv::Vec3d> line{
+        {0.0, 0.0, 0.0}, {10.0, 0.0, 0.0}, {10.0, 0.0, 0.0}, {20.0, 0.0, 0.0}};
+    const std::vector<cv::Vec3d> controls{{10.0, 0.0, 0.0}, {10.0, 0.0, 0.0}};
+    CHECK(vc3d::fiber_slice::annotatedLineLengthVx(line, controls) == doctest::Approx(0.0));
+}
+
 TEST_CASE("fiber slice annotated length is the whole line without two control points")
 {
     const auto line = lineAlongX(11, 8.0);
