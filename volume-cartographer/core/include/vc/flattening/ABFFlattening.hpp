@@ -47,6 +47,34 @@ struct ABFVertexIssue {
     float score = 0.f;
 };
 
+struct ABFScaleConsistency {
+    bool checked = false;
+    bool consistent = true;
+    bool checkedColumns = false;
+    bool checkedRows = false;
+    float columnMedianSpacingVoxels = 0.f;
+    float rowMedianSpacingVoxels = 0.f;
+    float columnScaleRatio = 1.f;
+    float rowScaleRatio = 1.f;
+    std::string failureReason;
+};
+
+/**
+ * @brief Check that tifxyz scale agrees with measured grid spacing.
+ *
+ * TIFXYZ scale is stored as grid cells per voxel, so a representative
+ * one-cell spacing in voxels multiplied by the corresponding scale should be
+ * approximately 1.  The check is deliberately generous and sampling-bounded:
+ * it is a last-line guard against malformed metadata causing pathological
+ * output allocations, not a replacement for detailed surface preflight.
+ *
+ * Axes with too few valid adjacent samples are skipped.  If neither axis has
+ * enough samples, checked is false and consistent remains true.
+ */
+ABFScaleConsistency checkAbfInputScale(const cv::Mat_<cv::Vec3f>& points,
+                                       const cv::Vec2f& scale,
+                                       float toleranceFactor = 4.f);
+
 struct ABFDiagnostics {
     bool success = false;
     bool exploded = false;
