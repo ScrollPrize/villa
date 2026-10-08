@@ -5298,7 +5298,7 @@ TEST_CASE("fiber mode falls back only the failed native span")
           doctest::Approx(1.0).epsilon(1.0e-10));
 }
 
-TEST_CASE("fiber mode records only manifest identities used by direct interpolation")
+TEST_CASE("fiber mode retains active manifest identities for spline strips")
 {
     FiberModeNormalSampler normals;
     const auto optimize = [&](vc3d::line_annotation::SegmentInterpolationGoal goal) {
@@ -5335,8 +5335,15 @@ TEST_CASE("fiber mode records only manifest identities used by direct interpolat
     const auto spline = optimize(
         vc3d::line_annotation::SegmentInterpolationGoal::Cspline);
     REQUIRE(spline.controlPoints.front().segmentToNext.has_value());
-    CHECK(spline.controlPoints.front().segmentToNext->normalManifestLocation.empty());
-    CHECK(spline.controlPoints.front().segmentToNext->fiberManifestLocation.empty());
+    CHECK(spline.controlPoints.front().segmentToNext->normalManifestLocation ==
+          "normal.lasagna.json");
+    CHECK(spline.controlPoints.front().segmentToNext->fiberManifestLocation ==
+          "fiber.lasagna.json");
+    const auto restored = vc3d::line_annotation::fiberTraceSegmentMetadataFromJson(
+        vc3d::line_annotation::fiberTraceSegmentMetadataToJson(
+            *spline.controlPoints.front().segmentToNext));
+    CHECK(restored.normalManifestLocation == "normal.lasagna.json");
+    CHECK(restored.fiberManifestLocation == "fiber.lasagna.json");
 }
 
 TEST_CASE("fiber mode can return only the inclusive control span")
