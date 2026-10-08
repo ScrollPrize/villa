@@ -13,7 +13,12 @@ namespace
 // than the minimum, so one spurious short gap (two seams a grouping gap
 // apart that are really one) does not make every real sheet read as many.
 constexpr double kSeedPercentile = 0.25;
-constexpr int kRefineIterations = 3;
+// The refinement stops once the sheet counts stop changing; this many rounds
+// without settling, or any gap reading more than kMaxSheetsPerGap sheets (a
+// unit that is a fraction of a real sheet, from a spurious short gap), means
+// the estimate is unusable and no statistics are reported.
+constexpr int kMaxRefineIterations = 32;
+constexpr double kMaxSheetsPerGap = 100.0;
 
 }  // namespace
 
@@ -64,25 +69,41 @@ SheetStatistics estimateSheetStatistics(const std::vector<double>& gapsVx)
         std::floor(kSeedPercentile * static_cast<double>(positive.size() - 1)));
     double unit = positive[seedIndex];
     // Assign each gap its sheet count at the current unit, then re-estimate
-    // the unit as the per-sheet mean; a couple of rounds settle it.
-    for (int iteration = 0; iteration < kRefineIterations && unit > 0.0; ++iteration) {
+    // the unit as the per-sheet mean, until the counts stop changing: the
+    // unit is then the mean at those counts and the counts are the rounding
+    // at that unit, so the predictions a gap gets agree with the unit shown.
+    bool settled = false;
+    std::vector<int> next(gapsVx.size(), 1);
+    for (int iteration = 0; iteration < kMaxRefineIterations && unit > 0.0; ++iteration) {
         double totalLength = 0.0;
         long long totalSheets = 0;
         for (std::size_t i = 0; i < gapsVx.size(); ++i) {
             const double gap = gapsVx[i];
+            next[i] = 1;
             if (!std::isfinite(gap) || gap <= 0.0) {
-                stats.sheetCounts[i] = 1;
                 continue;
             }
-            const int count = std::max(1, static_cast<int>(std::llround(gap / unit)));
-            stats.sheetCounts[i] = count;
+            const double ratio = gap / unit;
+            if (!(ratio <= kMaxSheetsPerGap)) {
+                // Unusable: a fraction of a sheet is passing for the unit.
+                return SheetStatistics{std::vector<int>(gapsVx.size(), 1), 0.0, 0.0};
+            }
+            next[i] = std::max(1, static_cast<int>(std::lround(ratio)));
             totalLength += gap;
-            totalSheets += count;
+            totalSheets += next[i];
         }
         if (totalSheets <= 0) {
             break;
         }
+        settled = next == stats.sheetCounts;
+        stats.sheetCounts = next;
         unit = totalLength / static_cast<double>(totalSheets);
+        if (settled) {
+            break;
+        }
+    }
+    if (!settled) {
+        return SheetStatistics{std::vector<int>(gapsVx.size(), 1), 0.0, 0.0};
     }
     stats.unitLengthVx = unit;
     // Spread: the sample deviation of each gap's per-sheet length.

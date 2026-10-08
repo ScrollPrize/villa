@@ -415,7 +415,10 @@ private:
     QLabel* _segmentationGrowthWarning{nullptr};
     QLabel* _segmentTransformWarning{nullptr};
     QLabel* _statusMessageLabel{nullptr};
-    QLabel* _lineAnnotationLengthLabel{nullptr};
+    // Owned by the status bar, which the destructor detaches (and Qt then
+    // deletes) before the volume closes: a QPointer, so the late refreshes
+    // that close triggers see it gone.
+    QPointer<QLabel> _lineAnnotationLengthLabel;
     // Line length (annotation-frame voxels) by runtime fiber id, as of the
     // last fiber summaries; what the status bar readout is looked up in.
     std::unordered_map<uint64_t, double> _fiberLengthVxById;

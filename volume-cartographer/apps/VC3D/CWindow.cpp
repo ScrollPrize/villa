@@ -8892,6 +8892,9 @@ void CWindow::onSharedCacheStatsChanged(const QStringList& items)
 
 void CWindow::updateFiberLengthUnits()
 {
+    if (_destroyingWindow) {
+        return;
+    }
     std::optional<double> voxelSizeUm;
     if (_lineAnnotationController) {
         voxelSizeUm = _lineAnnotationController->annotationFrame().voxelSizeUm;
@@ -8907,7 +8910,7 @@ void CWindow::updateFiberLengthUnits()
 
 void CWindow::updateLineAnnotationLengthLabel()
 {
-    if (!_lineAnnotationLengthLabel) {
+    if (_destroyingWindow || !_lineAnnotationLengthLabel) {
         return;
     }
     auto* dialog = _workspaceTabs

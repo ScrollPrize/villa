@@ -32,6 +32,7 @@
 #include <algorithm>
 #include <cmath>
 #include <set>
+#include <unordered_map>
 #include <utility>
 
 namespace {
@@ -645,19 +646,22 @@ void CFiberWidget::refreshLengthDisplays()
 {
     if (_model) {
         _model->setHorizontalHeaderLabels(headerLabels());
+        // One lookup table for the pass, not a search of _fibers per row.
+        std::unordered_map<uint64_t, const FiberEntry*> byId;
+        byId.reserve(_fibers.size());
+        for (const FiberEntry& fiber : _fibers) {
+            byId.emplace(fiber.id, &fiber);
+        }
         for (int row = 0; row < _model->rowCount(); ++row) {
             QStandardItem* root = _model->item(row, kNameColumn);
             if (!root) {
                 continue;
             }
-            const uint64_t fiberId = root->data(kFiberIdRole).toULongLong();
-            const auto it = std::find_if(_fibers.begin(), _fibers.end(),
-                                         [fiberId](const FiberEntry& fiber) {
-                                             return fiber.id == fiberId;
-                                         });
-            if (it == _fibers.end()) {
+            const auto found = byId.find(root->data(kFiberIdRole).toULongLong());
+            if (found == byId.end()) {
                 continue;
             }
+            const FiberEntry* it = found->second;
             if (QStandardItem* cell = _model->item(row, kLengthColumn)) {
                 cell->setText(vc3d::fiber_length::formatValue(it->lengthVx, _voxelSizeUm));
             }

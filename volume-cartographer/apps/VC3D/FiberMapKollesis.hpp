@@ -79,6 +79,9 @@ struct SheetStatistics {
     // Sample standard deviation of the per-gap sheet lengths (gap / count);
     // 0 with fewer than two gaps.
     double spreadVx = 0.0;
+    // False without a positive gap, and when the estimate is unusable: the
+    // counts did not settle, or a gap would read as more than a hundred
+    // sheets (then sheetCounts are all 1 and nothing is predicted).
     [[nodiscard]] bool valid() const { return unitLengthVx > 0.0; }
 };
 

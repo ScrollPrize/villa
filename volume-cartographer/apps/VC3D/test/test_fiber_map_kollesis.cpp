@@ -180,6 +180,37 @@ private slots:
         QCOMPARE(stats.sheetCounts, (std::vector<int>{1, 1, 1, 1, 1}));
     }
 
+    void statisticsSettleSoCountsAgreeWithTheUnit()
+    {
+        // Three fixed rounds left counts [1,2,2,23] with a unit that rounds
+        // the last gap to 24: the refinement runs to a fixed point instead.
+        const SheetStatistics stats = estimateSheetStatistics({2000.0, 3000.0, 3000.0, 42000.0});
+        QVERIFY(stats.valid());
+        QCOMPARE(stats.sheetCounts, (std::vector<int>{1, 2, 2, 24}));
+        QVERIFY(near(stats.unitLengthVx, 50000.0 / 29.0));
+        const std::vector<double> gaps{2000.0, 3000.0, 3000.0, 42000.0};
+        for (std::size_t i = 0; i < gaps.size(); ++i) {
+            QCOMPARE(static_cast<int>(std::lround(gaps[i] / stats.unitLengthVx)),
+                     stats.sheetCounts[i]);
+        }
+    }
+
+    void aSpuriousTinyGapMakesTheEstimateUnusable()
+    {
+        // A near-zero gap as the seed would read the real gap as billions
+        // of sheets: no statistics, no predictions, no huge allocation.
+        const SheetStatistics stats = estimateSheetStatistics({1e-6, 5000.0});
+        QVERIFY(!stats.valid());
+        QCOMPARE(stats.sheetCounts, (std::vector<int>{1, 1}));
+        Params p = params(0.75, 3);
+        p.windingWidthVx = 0.0;
+        const Model model = buildModel(
+            {at(1, 0.0, 0.0, true), at(2, 0.000001, 0.0, true), at(3, 5000.000001, 0.0, true)}, p);
+        QCOMPARE(model.seams.size(), std::size_t{3});
+        QVERIFY(!model.statistics.valid());
+        QVERIFY(model.predicted.empty());
+    }
+
     void singleGapHasNoSpread()
     {
         const SheetStatistics stats = estimateSheetStatistics({5000.0});

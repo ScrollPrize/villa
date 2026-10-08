@@ -235,8 +235,8 @@ formatting lives in `FiberLengthDisplay.hpp`.
   another workspace is active.
 - The Fiber Map's dock has the same `len` column, a total over every fiber
   the map knows (placed or not) above the search box, and a per-network
-  total in each network header. The lengths are recorded by the rebuild job
-  before the layout consumes the line points, so they cost nothing extra.
+  total in each network header. The rebuild worker measures each fiber's
+  line before the layout consumes the line points.
 
 The `control len` of the HV classification is a different quantity (the
 control-point spacing) and stays in voxels.
@@ -269,9 +269,14 @@ many seams past the last tagged one, one unit apart, with a spread that
 grows with the square root of the sheets stepped. Predictions draw in
 amber (255, 170, 0) as dotted verticals with a translucent band of plus or
 minus the spread, and in the ruler band as amber dotted ticks; a length
-touching a predicted seam is printed in amber. Every band and line carries
-a tooltip with the termination counts, the gap and its sheet reading, and
-the unit length with its spread. The overlay is display-only: it changes no
+touching a predicted seam is printed in amber. A tagged seam's band and
+lines carry a tooltip with its termination counts, the gap to the next
+seam with its sheet reading when there is one, and the sheet-length
+estimate once there are two seams; a prediction's tooltip says which sheet
+of which gap it fills, or how many sheets past the last tagged seam it
+lies, with its spread. The estimate is withheld when it is unusable (the
+counts do not settle, or a gap would read as more than a hundred sheets),
+and nothing is predicted then. The overlay is display-only: it changes no
 layout, heat-map or publishing result. The grouping and statistics live in
 `FiberMapKollesis.hpp`.
 

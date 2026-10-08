@@ -2171,6 +2171,7 @@ void FiberMapWorkspace::applyRebuild(const std::shared_ptr<RebuildJobResult>& jo
             job->cache = {};
             job->gapField.reset();
             job->gapTiles.clear();
+            job->fiberLengthVx.clear();
         }
     });
 
