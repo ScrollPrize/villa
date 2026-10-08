@@ -782,6 +782,20 @@ vc_add_test(NAME test_surface_patch_index)
 vc_add_test(NAME test_tiff_merge)
 
 vc_add_test(NAME test_http_fetch_errors)
+vc_add_test(NAME test_sftp_fetch LIBS doctest::doctest vc_core Qt6::Core)
+if(VC_BUILD_PYTHON)
+    find_package(Python REQUIRED COMPONENTS Interpreter)
+    add_dependencies(test_sftp_fetch vc_volume)
+    add_test(NAME python_sftp_volume
+        COMMAND "${CMAKE_COMMAND}" -E env
+            "PYTHONPATH=${CMAKE_BINARY_DIR}/python"
+            "PYTHONNOUSERSITE=1"
+            "${Python_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/python/tests/test_sftp_volume.py"
+            --ssh-fixture "$<TARGET_FILE:test_sftp_fetch>"
+            --work-dir "${CMAKE_CURRENT_BINARY_DIR}")
+    set_tests_properties(python_sftp_volume PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 200)
+    vc_register_ctest(python_sftp_volume test_sftp_fetch)
+endif()
 
 # Live S3: stages PHerc 0172 level 5 to a local zarr dir, then exercises
 # the NormalGridGenerate library API against it. Soft-skips on network.

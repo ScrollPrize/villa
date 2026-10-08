@@ -480,16 +480,18 @@ void MenuActionController::showAttachRemoteZarrDialog(const QString& initialUrl)
         return;
     }
 
-    bool ok = false;
-    QString url = QInputDialog::getText(
-        _window,
+    const auto url = promptLocation(
         QObject::tr("Attach Remote Zarr"),
-        QObject::tr("Enter remote OME-Zarr URL (http://, https://, s3://):"),
-        QLineEdit::Normal,
-        initialUrl,
-        &ok);
+        QObject::tr("Select a remote OME-Zarr root (http://, https://, s3://, sftp://)."),
+        initialUrl.isEmpty() ? QStringLiteral("s3://") : initialUrl,
+        {}, false, true);
 
-    if (!ok || url.trimmed().isEmpty()) {
+    if (url.trimmed().isEmpty()) {
+        return;
+    }
+    if (!vc::project::isLocationRemote(url.toStdString())) {
+        QMessageBox::warning(_window, QObject::tr("Attach failed"),
+            QObject::tr("Select a remote volume, or use Attach Volume for a local one."));
         return;
     }
 
@@ -1795,7 +1797,7 @@ void MenuActionController::attachVolume()
     }
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     auto loc = promptLocation(QObject::tr("Attach Volume"),
-                              QObject::tr("Pick a zarr volume or a folder of zarrs (local or s3://, https://)."),
+                              QObject::tr("Pick a zarr volume or a folder of zarrs (local or s3://, https://, sftp://)."),
                               settings.value(vc3d::settings::project::DEFAULT_PATH).toString(),
                               {}, false, true);
     if (loc.isEmpty()) return;
@@ -2017,7 +2019,7 @@ void MenuActionController::beginLasagnaManifestAttachment(bool remote, const QSt
         if (location.isEmpty())
             return;
         if (!vc::lasagna::isRemoteLasagnaLocation(location.toStdString())) {
-            QMessageBox::warning(_window, QObject::tr("Attach failed"), QObject::tr("The remote action requires an s3://, http://, or https:// manifest."));
+            QMessageBox::warning(_window, QObject::tr("Attach failed"), QObject::tr("The remote action requires an s3://, http://, https://, or sftp:// manifest."));
             return;
         }
     } else {

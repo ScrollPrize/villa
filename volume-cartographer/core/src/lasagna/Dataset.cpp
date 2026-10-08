@@ -48,6 +48,8 @@ namespace {
 [[nodiscard]] bool isRemoteLocation(std::string_view value)
 {
     return startsWithNoCase(value, "http://") ||
+           startsWithNoCase(value, "sftp://") ||
+           startsWithNoCase(value, "ssh://") ||
            startsWithNoCase(value, "https://") ||
            startsWithNoCase(value, "s3://") ||
            (startsWithNoCase(value, "s3+") &&

@@ -1,4 +1,5 @@
 #include "utils/zarr.hpp"
+#include "utils/sftp_fetch.hpp"
 
 #include <charconv>
 #include <cmath>
@@ -1277,7 +1278,10 @@ HttpStore::HttpStore(std::string base_url, AwsAuth auth)
 }
 
 bool HttpStore::exists(const std::string& key) const {
-    return client_->head(make_url(key)).ok();
+    const auto resp = client_->head(make_url(key));
+    if (is_sftp_url(base_url_) && !resp.ok() && !resp.not_found())
+        throw std::runtime_error("SFTP stat failed: " + resp.error_message);
+    return resp.ok();
 }
 
 std::vector<std::byte> HttpStore::get(const std::string& key) const {
@@ -1290,6 +1294,8 @@ std::vector<std::byte> HttpStore::get(const std::string& key) const {
 std::optional<std::vector<std::byte>>
 HttpStore::get_if_exists(const std::string& key) const {
     auto resp = client_->get(make_url(key));
+    if (is_sftp_url(base_url_) && !resp.ok() && !resp.not_found())
+        throw std::runtime_error("SFTP read failed: " + resp.error_message);
     if (!resp.ok()) return std::nullopt;
     return std::move(resp.body);
 }
@@ -1305,6 +1311,8 @@ void HttpStore::erase(const std::string& /*key*/) {
 std::optional<std::vector<std::byte>>
 HttpStore::get_partial(const std::string& key, std::size_t offset, std::size_t length) const {
     auto resp = client_->get_range(make_url(key), offset, length);
+    if (is_sftp_url(base_url_) && !resp.ok() && !resp.not_found())
+        throw std::runtime_error("SFTP range read failed: " + resp.error_message);
     if (!resp.ok()) return std::nullopt;
     return std::move(resp.body);
 }

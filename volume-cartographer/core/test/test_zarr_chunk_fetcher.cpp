@@ -687,6 +687,8 @@ TEST_CASE("native mirror coalesces inner requests into one full shard transfer")
     CHECK(cache->activeRemoteFetches().empty());
     CHECK(cache->stats().remoteFetchesInFlight == 0);
 
+    // Blocking reads resolve RAM data before asynchronous disk writes finish.
+    cache->waitForPersistentWrites();
     cache.reset();
     vc::render::processChunkCacheService()->invalidateSource(identity);
     fs::remove_all(source);
