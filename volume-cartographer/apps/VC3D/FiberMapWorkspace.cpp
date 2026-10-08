@@ -813,7 +813,10 @@ bool FiberMapView::viewportEvent(QEvent* event)
     if (event && event->type() == QEvent::ToolTip) {
         auto* help = static_cast<QHelpEvent*>(event);
         const QRect area = viewport()->rect();
-        for (const auto& ruler : _rulers) {
+        // Where bands overlap at a viewport corner the last painted one is
+        // on top, so the hit test runs in reverse paint order.
+        for (auto it = _rulers.rbegin(); it != _rulers.rend(); ++it) {
+            const auto& ruler = *it;
             const QRect band = ruler->bandRect(area);
             if (band.contains(help->pos())) {
                 QToolTip::showText(help->globalPos(), ruler->toolTipText(), viewport(), band);

@@ -1289,7 +1289,9 @@ void CFiberWidget::updateClassificationUi()
                                 .arg(fiber->linePointCount)
                                 .arg(vc3d::fiber_length::formatLength(fiber->lengthVx,
                                                                       _voxelSizeUm)));
-        _scoreLabel->setText(tr("z dist: %1    control len: %2\nH score: %3    V score: %4")
+        // The classification's distances stay in voxels whatever the len
+        // line above shows, so they say so.
+        _scoreLabel->setText(tr("z dist: %1 vx    control len: %2 vx\nH score: %3    V score: %4")
                                  .arg(fiber->hvZDistance, 0, 'f', 2)
                                  .arg(fiber->hvFiberLength, 0, 'f', 2)
                                  .arg(fiber->horizontalScore, 0, 'f', 2)
