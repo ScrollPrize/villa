@@ -350,6 +350,7 @@ class Inferer():
                  model_cache_dir: str = DEFAULT_MODEL_CACHE_DIR,
                  max_patches: int = None,
                  bbox: [list, tuple] = None,
+                 chunk_cache_mb: int = 0,
                  ):
         print(f"Initializing Inferer with output_dir: '{output_dir}'")
         if output_dir and not output_dir.strip():
@@ -387,6 +388,7 @@ class Inferer():
         self.model_cache_dir = model_cache_dir
         self.max_patches = max_patches
         self.bbox = tuple(bbox) if bbox is not None else None
+        self.chunk_cache_mb = chunk_cache_mb
         self.model_patch_size = None
         self.num_classes = None
 
@@ -416,6 +418,8 @@ class Inferer():
              raise ValueError(f"Invalid tta_type '{self.tta_type}'. Must be 'mirroring' or 'rotation'.")
         if self.max_patches is not None and self.max_patches < 1:
             raise ValueError(f"max_patches must be >= 1 when provided, got {self.max_patches}.")
+        if self.chunk_cache_mb < 0:
+            raise ValueError(f"chunk_cache_mb must be >= 0, got {self.chunk_cache_mb}.")
         # Defer patch size validation until after model loading if not explicitly provided
 
         # --- Output Setup ---
@@ -840,6 +844,8 @@ class Inferer():
             anon=self.input_anon,
             bbox=self.bbox,
             read_retries=self.read_retries,
+            cache=self.chunk_cache_mb > 0,
+            cache_size_mb=self.chunk_cache_mb,
             # The float16 default suits the CUDA autocast path. CPU convolutions
             # have no float16 kernels, so half patches meet float32 weights and
             # raise "Input type (c10::Half) and bias type (float) should be the
@@ -1306,6 +1312,11 @@ def build_parser():
                            '(dropped connections, truncated payloads, 429/5xx) are retried '
                            'with exponential backoff so one hiccup does not abort a long '
                            'streaming run. Set to 1 to disable.')
+    parser.add_argument('--chunk_cache_mb', type=int, default=0,
+                      help='Keep up to this many MB of fetched input chunks in an in-memory LRU '
+                           'cache, so overlapping patches reuse chunks instead of downloading '
+                           'them again. Each DataLoader worker keeps its own cache. Requires '
+                           'zarr 3. Default 0 (off).')
     parser.add_argument('--max_patches', type=int, default=None,
                       help='Optional cap on patch positions processed by this part. '
                            'Intended for smoke tests; production inference leaves this unset.')
@@ -1389,6 +1400,7 @@ def main():
         model_cache_dir=args.model_cache_dir,
         max_patches=args.max_patches,
         bbox=bbox,
+        chunk_cache_mb=args.chunk_cache_mb,
     )
 
     try:
