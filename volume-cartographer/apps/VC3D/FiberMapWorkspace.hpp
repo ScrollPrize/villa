@@ -292,6 +292,10 @@ private:
     // controls call it directly; rebuildScene() calls it as part of every
     // scene build.
     void rebuildKollesisOverlay();
+    // The content rect plus whatever the kollesis overlay reaches beyond it:
+    // what the first-build fit frames and the scene rect wraps.
+    [[nodiscard]] QRectF framedRect() const;
+    void applySceneRect();
     void setHighlightedFiber(uint64_t fiberId);
     // The gap heat map (FiberMapGapField.hpp). The field is a pure function of
     // the published layout and the toolbar's settings: it is built on the
@@ -459,6 +463,9 @@ private:
     // past the outer panels; this is the tight rect around the content, which
     // is what the first-build fit frames.
     QRectF _contentRect;
+    // The x range the kollesis seams and predictions cover beyond the content
+    // rect (same y as the content rect); null while they stay inside it.
+    QRectF _kollesisReach;
     // What the empty scene last said, so a theme change can rebuild the scene as
     // it stands rather than take a fresh snapshot to work out the message again.
     QString _emptyMessage;

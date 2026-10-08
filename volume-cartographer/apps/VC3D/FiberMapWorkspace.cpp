@@ -1319,9 +1319,21 @@ void FiberMapWorkspace::rebuildKollesisOverlay()
     _kollesisItems.clear();
     _rulerModel.kollesis.clear();
     _kollesisModel = {};
+    const bool haveLayout = _layoutBuilt && !_layout.fibers.empty();
+    if (haveLayout) {
+        // The seams may reach past the layout (extrapolated predictions
+        // above all); the rulers' run, the scene rect and the fit follow
+        // them. Start from the layout's own extent each time.
+        _kollesisReach = QRectF();
+        _rulerModel.extentLeftSceneX = _contentRect.left();
+        _rulerModel.extentRightSceneX = _contentRect.right();
+    }
     const bool wanted = _kollesisCheck && _kollesisCheck->isChecked();
-    if (!wanted || !_layoutBuilt || _layout.fibers.empty()) {
+    if (!wanted || !haveLayout) {
         _view->setRulerModel(_rulerModel);
+        if (haveLayout) {
+            applySceneRect();
+        }
         return;
     }
     _kollesisModel = buildKollesisModel();
@@ -1440,7 +1452,41 @@ void FiberMapWorkspace::rebuildKollesisOverlay()
                 ? _rulerModel.kollesis[i + 1].xVx - _rulerModel.kollesis[i].xVx
                 : std::numeric_limits<double>::quiet_NaN();
     }
+
+    // Everything drawn above, bands and lines alike, lies within the x range
+    // of the items; where that leaves the layout, the rulers run on, the
+    // scene rect grows so the view can pan there and the fit frames it.
+    double reachLeft = _contentRect.left();
+    double reachRight = _contentRect.right();
+    for (const QGraphicsItem* item : _kollesisItems) {
+        const QRectF bounds = item->sceneBoundingRect();
+        reachLeft = std::min(reachLeft, bounds.left());
+        reachRight = std::max(reachRight, bounds.right());
+    }
+    if (reachLeft < _contentRect.left() || reachRight > _contentRect.right()) {
+        _kollesisReach = QRectF(QPointF(reachLeft, _contentRect.top()),
+                                QPointF(reachRight, _contentRect.bottom()));
+        _rulerModel.extentLeftSceneX = reachLeft;
+        _rulerModel.extentRightSceneX = reachRight;
+    }
     _view->setRulerModel(_rulerModel);
+    applySceneRect();
+}
+
+QRectF FiberMapWorkspace::framedRect() const
+{
+    return _kollesisReach.isNull() ? _contentRect : _contentRect.united(_kollesisReach);
+}
+
+void FiberMapWorkspace::applySceneRect()
+{
+    // Panning stops at the scene rect, so the rect runs wider than the content:
+    // zoomed in, the map's edges can be dragged away from the viewport edge
+    // instead of being pinned to it.
+    const QRectF framed = framedRect();
+    const double xMargin =
+        std::max(0.25 * framed.width(), kMinSceneMarginCm * sceneVxPerCm());
+    _scene->setSceneRect(framed.adjusted(-xMargin, 0.0, xMargin, 0.0));
 }
 
 QString FiberMapWorkspace::withCachedUmbilicusStatus(const QString& status)
@@ -2443,7 +2489,7 @@ void FiberMapWorkspace::publishRebuild(RebuildJobResult& job)
     _statusLabel->setText(status);
 
     if (!_viewFitted && !_layout.fibers.empty()) {
-        _view->fitInView(_contentRect, Qt::KeepAspectRatio);
+        _view->fitInView(framedRect(), Qt::KeepAspectRatio);
         _viewFitted = true;
     }
     // fitInView changes the scale without a wheel event.
@@ -2543,6 +2589,7 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
         auto* message = _scene->addSimpleText(emptyMessage);
         message->setBrush(theme.ink);
         _contentRect = message->boundingRect().adjusted(-40.0, -40.0, 40.0, 40.0);
+        _kollesisReach = QRectF();
         _scene->setSceneRect(_contentRect);
         return;
     }
@@ -2630,6 +2677,15 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
 
     // The gap heat map, when there is one and it is switched on.
     addGapTiles();
+
+    // The scroll extent, when known, is part of what the first-build fit
+    // shows. The axes float just outside the extent, so the fit keeps a
+    // slice of room above the ceiling and below the floor for their bands.
+    // Set before the kollesis overlay, which may reach past the layout.
+    {
+        const double height = std::max(sceneBottomY - sceneTopY, 1e-6);
+        _contentRect = QRectF(leftX, sceneTopY - 0.06 * height, sceneWidth, 1.12 * height);
+    }
 
     // The kollesis seams, over the ground and the heat map, under the grid
     // and the fibers.
@@ -2866,17 +2922,7 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
         ring->setZValue(kSuspectRingZ);
     }
 
-    // The scroll extent, when known, is part of what the first-build fit
-    // shows. The axes float just outside the extent, so the fit keeps a
-    // slice of room above the ceiling and below the floor for their bands.
-    const double height = std::max(sceneBottomY - sceneTopY, 1e-6);
-    _contentRect = QRectF(leftX, sceneTopY - 0.06 * height, sceneWidth, 1.12 * height);
-
-    // Panning stops at the scene rect, so the rect runs wider than the content:
-    // zoomed in, the map's edges can be dragged away from the viewport edge
-    // instead of being pinned to it.
-    const double xMargin = std::max(0.25 * sceneWidth, kMinSceneMarginCm * vxPerCm);
-    _scene->setSceneRect(_contentRect.adjusted(-xMargin, 0.0, xMargin, 0.0));
+    applySceneRect();
 
     // Chips hide once a winding is narrower than kMinChipPixelsPerWinding on
     // screen. Windings are not equally wide in the scene, so the threshold is

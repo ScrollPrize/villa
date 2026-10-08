@@ -15103,7 +15103,9 @@ uint64_t LineAnnotationController::fiberIdForDialog(const LineAnnotationDialog* 
     }
     for (const auto& pane : _panes) {
         if (pane.dialog.data() == dialog && pane.session) {
-            return fiberIdForFileName(pane.session->fiberFileName);
+            // The session's own runtime id: a basename lookup could land on
+            // another working copy's fiber of the same name.
+            return pane.session->fiberId;
         }
     }
     return 0;

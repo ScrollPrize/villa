@@ -246,15 +246,18 @@ QRect FiberMapRuler::bandRect(const QRect& viewport) const
         if (runRight <= runLeft) {
             return QRect();
         }
+        // Both clamps keep the band's place in the stack: the inner bands'
+        // room (reserve) when the ceiling is above the viewport, this band's
+        // own offset (inset) when it is below.
         const int bottom = clipped(ceilingF - inset,
-                                   viewport.top() + thickness + reserve, farBottom);
+                                   viewport.top() + thickness + reserve, farBottom - inset);
         return QRect(runLeft, bottom - thickness, runRight - runLeft, thickness);
     }
     case Edge::Bottom: {
         if (runRight <= runLeft) {
             return QRect();
         }
-        const int top = clipped(floorF + inset, viewport.top(),
+        const int top = clipped(floorF + inset, viewport.top() + inset,
                                 farBottom - thickness - reserve);
         return QRect(runLeft, top, runRight - runLeft, thickness);
     }
@@ -263,7 +266,7 @@ QRect FiberMapRuler::bandRect(const QRect& viewport) const
             return QRect();
         }
         const int right = clipped(leftF - inset,
-                                  viewport.left() + thickness + reserve, farRight);
+                                  viewport.left() + thickness + reserve, farRight - inset);
         return QRect(right - thickness, runTop, thickness, runBottom - runTop);
     }
     }
