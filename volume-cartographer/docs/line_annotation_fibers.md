@@ -600,7 +600,9 @@ metric. Detailed trace and Lasagna failures remain in their mode-specific
 fields. `normal_manifest` stores the Lasagna manifest location used by the
 span, and `fiber_manifest` stores the fiber-inference manifest location. A
 direct Lasagna span stores only the former; trace stores both because it samples
-Lasagna normals; direct cubic spline stores neither. Fallbacks retain the
+Lasagna normals. Direct cubic spline records the selected normal and fiber
+manifest locations too: although its geometry is spline-interpolated, the
+annotated strip still uses the normal field for display. Fallbacks retain the
 locations consulted by failed higher-priority attempts.
 
 For ordinary project datasets these values are the configured local or remote

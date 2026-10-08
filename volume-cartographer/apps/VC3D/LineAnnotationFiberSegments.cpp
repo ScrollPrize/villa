@@ -742,8 +742,11 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
             metadata.failureDetail.clear();
             metadata.lasagnaFailureCode.clear();
             metadata.lasagnaFailureDetail.clear();
-            metadata.normalManifestLocation.clear();
-            metadata.fiberManifestLocation.clear();
+            // Spline geometry still displays a strip using the selected normals.
+            // Record the active sources, rather than losing their provenance or
+            // retaining identities from a previous interpolation request.
+            metadata.normalManifestLocation = request.normalManifestLocation;
+            metadata.fiberManifestLocation = request.fiberManifestLocation;
             continue;
         }
         const bool wantsTrace = requestedMode == SegmentInterpolationMode::Trace;
