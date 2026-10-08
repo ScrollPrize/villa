@@ -40,6 +40,22 @@ import AwardedTotal from '@site/src/components/AwardedTotal';
 
 Vesuvius Challenge has awarded **<AwardedTotal />** in prizes since the competition started in 2023! This page lists all the prizes awarded so far.
 
+### \$50,000 First Letters: PHerc. 343 (October, 2026)
+
+**Goal:** Find 10 letters within a 4 cm² area of a scroll where nothing has been read yet.
+
+<div className="flex flex-row flex-wrap">
+  <PrizeCard
+    href="https://github.com/Nieuwlaar/pherc343-first-letters"
+    prizeAmount="$50,000"
+    title="Winner"
+    description="Erwin Nieuwlaar found the text πᾶν τὸ γινόμε[νον, “everything that happens / is generated” deep inside PHerc. 343"
+    mediaSrc="/img/firstletters/pherc0343-nieuwlaar.webp"
+    mediaAlt="Ink detected in PHerc. 343 by Erwin Nieuwlaar, shown in yellow over the dimmed CT"
+    wide
+  />
+</div>
+
 ### \$31,000 Progress Prizes (August 2026)
 
 **Goal:** Improve the tools and training methods needed to read the scrolls.
