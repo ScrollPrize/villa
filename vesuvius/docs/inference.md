@@ -116,27 +116,26 @@ and their logits are identical. `blend_logits` accumulates overlapping patches i
 the merged logits differ from a row-major run only by float16 rounding (in the run below 0.002% of
 voxels, each by one ulp, max 2⁻¹⁰). Measured on
 `PHercParis4.volpkg/volumes_zarr_standardized/54keV_7.91um_Scroll1A.zarr` (128³ zstd chunks),
-`--bbox 6400:6592,5120:5312,2048:3584`, 192³ patches, overlap 0.5, batch 1, `--num_workers 4
---chunk_cache_mb 512`: 288 patches over 400 distinct chunks (308 MB), counting every chunk request
-made by every process:
+`--bbox 6400:6592,5120:5312,2048:3584`, 192³ patches, overlap 0.5, batch 1: 288 patches over 400
+distinct chunks (308 MB), counting every chunk request made by every process (the logits digest
+was the same `dc39226603a3afe1` in every run):
 
-| version | order | chunk requests | per distinct chunk | MB downloaded | per-worker distinct chunks | logits sha256 |
-|---|---|---|---|---|---|---|
-| before | row-major, round-robin workers | 1360 | 3.40 | 1047 | 340, 340, 340, 340 | `dc39226603a3afe1` |
-| now | chunk, contiguous dispatch | 572 | 1.43 | 441 | 132, 145, 135, 160 | `dc39226603a3afe1` |
+| `--num_workers` | `--chunk_cache_mb` | row-major, round-robin workers (before) | row-major, contiguous dispatch | chunk order, contiguous dispatch (now) |
+|---|---|---|---|---|
+| 4 | 0 | 4600 requests, 3539 MB | – | 4600 requests, 3539 MB |
+| 4 | 64 | 2919 requests, 2241 MB | 1292 requests, 996 MB | **590 requests, 455 MB** |
+| 4 | 512 | 1360 requests, 1047 MB | 800 requests, 614 MB | **572 requests, 441 MB** |
+| 0 | 64 | 1289 requests, 994 MB | – | **506 requests, 392 MB** |
+| 0 | 512 | 400 requests, 308 MB | – | 400 requests, 308 MB |
 
-With round-robin dispatch every worker ended up fetching 340 of the 400 chunks itself; with one
-contiguous run each, a worker fetches its own quarter plus the chunks on the boundary with its
-neighbours. The remaining 1.43× is that boundary, not repeated fetches within a worker.
-
-When the cache cannot hold a whole row band of the sweep the order itself decides the count. On a
-96×80×112 volume with 16³ chunks and 24³ patches (378 patches, 210 distinct chunks; see
-`tests/data/test_patch_order.py`), an LRU of 16 / 32 / 64 chunks fetches 1842 / 393 / 322 chunks
-in chunk order against 2288 / 1298 / 524 row-major. Only once the cache holds a full band (128
-chunks here) does row-major catch up (210 against 252). A chunk cache of a few hundred MB per
-worker is therefore enough once the order is chunk-local, whereas in row-major order it must hold
-a whole band (chunks along x × patch depth in y and z), which for a full-width scroll is several
-GB per worker. With `--chunk_cache_mb 0` the order makes no difference to what is fetched.
+With round-robin dispatch every worker fetched 340 of the 400 chunks itself; with one contiguous run
+each, a worker fetches its own quarter plus the chunks on the boundary with its neighbours, which is
+the remaining 1.4×. When the cache cannot hold a whole row band of the sweep (64 MB here, ~75 chunks
+against a 135-chunk band) the order decides the count: row-major re-fetches the band for every row
+(3.2× in one process, 7.3× with four), the chunk order stays near the floor. A chunk cache of a few
+hundred MB per worker is therefore enough once the order is chunk-local, whereas in row-major order it
+must hold a whole band (chunks along x × patch depth in y and z), which for a full-width scroll is
+several GB per worker. With `--chunk_cache_mb 0` the order makes no difference to what is fetched.
 
 ## Stage 2 — `vesuvius.blend_logits`
 
