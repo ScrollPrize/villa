@@ -719,8 +719,17 @@ struct ProcessChunkCacheServiceRegistry {
 
 ProcessChunkCacheServiceRegistry& processChunkCacheServiceRegistry()
 {
+#if defined(_WIN32)
+    // ChunkCacheService owns scheduler threads. Avoid destroying the process
+    // registry from vc_core.dll teardown while Windows holds the loader lock;
+    // sibling thread-owning process registries use the same process-lifetime
+    // allocation pattern on Windows.
+    static auto* registry = new ProcessChunkCacheServiceRegistry;
+    return *registry;
+#else
     static ProcessChunkCacheServiceRegistry registry;
     return registry;
+#endif
 }
 
 ChunkCacheService::Options defaultProcessChunkCacheServiceOptions()
