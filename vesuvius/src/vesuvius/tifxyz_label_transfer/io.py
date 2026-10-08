@@ -20,10 +20,27 @@ from .core import Surface
 
 
 def _read_tiff(path: Path) -> NDArray:
+    """Read a TIFF into memory, releasing the backing file handle.
+
+    ``tifffile.memmap`` keeps the source file mapped for the lifetime of the
+    returned array. Every caller here immediately materialises the result with
+    ``np.asarray`` (often with a dtype change that already copies), so the map
+    only defers a read that always happens while leaving the ``.tif`` open. On
+    Windows an open mapping blocks deletion of the file and of any enclosing
+    temporary directory. Copy once and close the mapping so the handle is
+    released deterministically rather than at an unspecified garbage
+    collection.
+    """
     try:
-        return tifffile.memmap(path, mode="r")
+        mapped = tifffile.memmap(path, mode="r")
     except ValueError:
         return tifffile.imread(path)
+    try:
+        return np.array(mapped)
+    finally:
+        underlying = getattr(mapped, "_mmap", None)
+        if underlying is not None:
+            underlying.close()
 
 
 def load_tifxyz_mask(
@@ -235,7 +252,15 @@ class TemporaryRaster:
 
     def close(self) -> None:
         self.array.flush()
+        # Dropping the last reference is not enough on Windows: the mapping must
+        # be closed explicitly before the backing file can be unlinked, and
+        # relying on garbage collection to do it leaves the file locked when a
+        # caller's view of the raster is still alive. Every view is finished
+        # with by the time close() runs, so releasing the map here is safe.
+        underlying = getattr(self.array, "_mmap", None)
         del self.array
+        if underlying is not None:
+            underlying.close()
         self.path.unlink(missing_ok=True)
 
     def __enter__(self) -> "TemporaryRaster":
