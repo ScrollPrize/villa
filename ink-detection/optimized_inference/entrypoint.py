@@ -658,6 +658,9 @@ def run_prepare_step(inputs: Inputs, profiler: Optional[WorkflowProfiler] = None
         s3_client, bucket, prefix, inputs.start_layer, inputs.end_layer, profiler=profiler
     )
     logger.info(f"Found {len(layer_objects)} layer objects to download")
+    # The zarr's channel k must be source layer layer_start + k: refuse gaps and duplicate indices up front.
+    from processing import contiguous_layer_window
+    layer_start, layer_end = contiguous_layer_window([base for _, base in layer_objects])
 
     # Download layers to temporary directory
     work_dir = "/workspace"
@@ -682,6 +685,10 @@ def run_prepare_step(inputs: Inputs, profiler: Optional[WorkflowProfiler] = None
         use_compression=inputs.use_zarr_compression,
         profiler=profiler,
     )
+
+    # Record the layer window so the inference step does not re-apply it to the cropped stack
+    from processing import record_layer_window
+    record_layer_window(created_zarr_path, layer_start, layer_end)
 
     # Write output path to file for next step
     output_file = "/tmp/surface_volume_zarr_path.txt"
@@ -832,19 +839,23 @@ from device_utils import select_device, amp_device_type
     else:
         is_reverse_segment = False
 
-    # Run inference from zarr
-    # Note: When using a predefined surface volume zarr (not created by the prepare step),
-    # it may contain more layers than requested. We use start_layer and end_layer to crop
-    # to the desired range within the zarr.
-    logger.info(f"Running inference from surface volume zarr with layer range [{inputs.start_layer}, {inputs.end_layer})...")
+    # Run inference from zarr. A zarr written by the prepare step holds only the requested
+    # layers and records that window in its attrs, so the window is rebased onto its channels;
+    # a predefined full-depth zarr (no attrs) is cropped with the absolute layer indices.
+    from processing import resolve_zarr_layer_window
+    start_z, end_z = resolve_zarr_layer_window(inputs.surface_volume_zarr, inputs.start_layer, inputs.end_layer)
+    logger.info(
+        f"Running inference from surface volume zarr with layer range [{inputs.start_layer}, {inputs.end_layer})"
+        f" -> zarr channels [{start_z}, {end_z})..."
+    )
     start_infer_time = time.time()
     result = run_inference(
         inputs.surface_volume_zarr,
         model,
         device,
         is_reverse_segment=is_reverse_segment,
-        start_z=inputs.start_layer,
-        end_z=inputs.end_layer,
+        start_z=start_z,
+        end_z=end_z,
         profiler=profiler,
     )
     infer_elapsed = time.time() - start_infer_time
