@@ -14,8 +14,10 @@ add_subdirectory(VC3D)
 add_executable(vc_render_video src/vc_render_video.cpp)
 target_link_libraries(vc_render_video opencv_core vc_core opencv_videoio)
 
-add_executable(vc_render_tifxyz src/vc_render_tifxyz.cpp)
-target_link_libraries(vc_render_tifxyz vc_core vc_flattening Boost::program_options TIFF::TIFF)
+# RenderCuda.cpp is the --gpu sampler: it loads the CUDA driver and NVRTC at run time (hence
+# CMAKE_DL_LIBS), so no CUDA toolkit is involved in the build.
+add_executable(vc_render_tifxyz src/vc_render_tifxyz.cpp src/RenderCuda.cpp)
+target_link_libraries(vc_render_tifxyz vc_core vc_flattening Boost::program_options TIFF::TIFF ${CMAKE_DL_LIBS})
 
 add_executable(vc_objrefine src/ObjAlphaCompRefinement.cpp)
 target_link_libraries(vc_objrefine vc_core)

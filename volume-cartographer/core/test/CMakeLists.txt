@@ -881,7 +881,21 @@ if(TARGET vc_render_tifxyz)
             $<TARGET_FILE:vc_render_tifxyz>)
     set_tests_properties(test_render_band_prefetch PROPERTIES TIMEOUT 120)
     vc_register_ctest(test_render_band_prefetch vc_render_tifxyz)
+    # --gpu writes the bytes the CPU path writes; skips where no CUDA device or NVRTC is usable.
+    add_test(NAME test_render_tifxyz_gpu
+        COMMAND ${Python3_EXECUTABLE}
+            "${CMAKE_CURRENT_SOURCE_DIR}/test_render_tifxyz_gpu.py"
+            $<TARGET_FILE:vc_render_tifxyz>)
+    set_tests_properties(test_render_tifxyz_gpu PROPERTIES TIMEOUT 600)
+    vc_register_ctest(test_render_tifxyz_gpu vc_render_tifxyz)
 endif()
+
+# The CUDA sampler of vc_render_tifxyz (--gpu) against the CPU samplers it transcribes, on a
+# synthetic chunked array; a soft skip on a machine without a CUDA device or NVRTC.
+vc_add_test(NAME test_render_cuda
+    SOURCES test_render_cuda.cpp ${PROJECT_SOURCE_DIR}/apps/src/RenderCuda.cpp
+    LIBS doctest::doctest vc_core ${CMAKE_DL_LIBS}
+    INCLUDES ${PROJECT_SOURCE_DIR}/apps/src)
 
 vc_add_test(NAME test_fiber_intersections LIBS doctest::doctest vc_atlas)
 
