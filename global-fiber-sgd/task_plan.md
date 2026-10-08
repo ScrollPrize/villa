@@ -1,5 +1,11 @@
 # Global fiber SGD: data reconnaissance
 
+## Current task
+
+Independent fiber normal orientation, with full plan and validation protocol in
+[normal_orientation_plan.md](normal_orientation_plan.md). This is a second pass
+over saved constraints, not new constraint extraction or cross-fiber alignment.
+
 ## Follow-up: shared BP integration (2026-10-08)
 
 User requests merging existing BP code and explaining its Lasagna constraint

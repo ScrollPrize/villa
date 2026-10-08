@@ -1,0 +1,15 @@
+{
+  "afv": "/home/hendrik/villa2/global-fiber-sgd/data/Paris4_v1.afv",
+  "coordinate_space": "PHercParis4/20260411134726",
+  "normal_manifest": "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json",
+  "normal_provenance": "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/inference.json",
+  "remote_cache": "/home/hendrik/villa2/global-fiber-sgd/data/normal_cache",
+  "minimum_xyz": [0,0,37872],
+  "maximum_xyz": [32693,32693,38128],
+  "threads": 128,
+  "repetitions": 1,
+  "normal_sample_spacing": 16,
+  "orient_database": "/home/hendrik/villa2/global-fiber-sgd/data/constraints_v1/pilot.afc.sqlite",
+  "database": "/home/hendrik/villa2/global-fiber-sgd/data/oriented_normals_v1/pilot.afc.sqlite",
+  "output": "/home/hendrik/villa2/global-fiber-sgd/data/oriented_normals_v1/pilot.json"
+}

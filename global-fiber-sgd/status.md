@@ -1,5 +1,11 @@
 # Status
 
+## Independent fiber normal orientation
+
+- [x] Plan and implementation independently reviewed.
+- [x] Native second-pass implementation;142regression tests pass.
+- [x] Pilot and full database validation; documentation/results complete.
+
 - [x] Preserve prior experiments and create clean branch from updated origin/main.
 - [x] Plan and independent review.
 - [x] Download AFV and preserve source metadata.

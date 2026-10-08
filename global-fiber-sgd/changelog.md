@@ -2,6 +2,14 @@
 
 ## 2026-10-08
 
+- Added native second-pass fiber-local normal orientation over existing constraint
+  DB, regular16base-voxel sampling plus exact endpoints, independent+1fiber gauge.
+  Schema2 stores only signed endpoint normals; source extraction/measurements
+  preserved. Full512,698fibers/7,368,335events processed in222.89s wall;25.7667%
+  endpoint flips, no invalid endpoints (5invalid intermediate samples skipped).
+  142native tests and full-field/endpoint-axis validation pass. See
+  normal_orientation_results.md and schema documentation.
+
 - Added non-mutating initial-relation outcome diagnostics. Fullraw audit:
   parallel29.5660%rejected/perp10.3820%;seed failures unclassified. All7.368M
   measurements exactly match prior DB,141tests pass. Tables and denominators:

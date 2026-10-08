@@ -13,3 +13,10 @@ nlohmann::json writeFiberConstraintDatabase(
 
 void verifyFiberConstraintDatabaseMeasurements(const std::filesystem::path& path,
     const vc::fiber_tracer::FiberTraceConstraintReport& report);
+
+nlohmann::json orientFiberConstraintDatabase(
+    const std::filesystem::path& input, const std::filesystem::path& output,
+    const std::vector<int64_t>& sourceIds,
+    const std::vector<vc::fiber_tracer::FiberletCropTraceLine>& lines,
+    const vc::lasagna::LasagnaNormalSampler& normals, int threads,
+    double sampleSpacing, const nlohmann::json& provenance);

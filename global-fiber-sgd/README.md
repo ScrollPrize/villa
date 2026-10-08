@@ -10,6 +10,10 @@ Full-volume reusable constraint export: see [database schema and commands](const
 This stores unsigned local events and both endpoint sheet-normal axes; source
 geometry remains in the original AFV.
 
+Second pass: [fiber-local signed normal sweep](constraint_database.md#second-pass-fiber-local-signed-normals-schema2)
+stores signed endpoint normals plus a separate+1fiber sign. No cross-fiber
+alignment or winding assignment is performed yet.
+
 Reciprocal-filter follow-up: [parallel removal and perpendicular iteration
 comparison](parallel_reciprocal_results.md). The existing exported database is
 the historical reciprocal-on baseline; these comparison runs do not overwrite it.

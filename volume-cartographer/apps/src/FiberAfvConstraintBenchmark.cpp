@@ -151,6 +151,18 @@ int runFiberAfvConstraintBenchmark(int argc, char** argv)
         {"normal_spacing_base",spacing},{"runs",Json::array()}};
     const auto output=std::filesystem::path(cfg.at("output").get<std::string>());
     std::filesystem::create_directories(output.parent_path());
+    if(cfg.contains("orient_database")) {
+        if(repetitions!=1 || cfg.contains("compare_database"))
+            throw std::invalid_argument("Orientation is one second pass, not extraction/comparison");
+        result["orientation"]=orientFiberConstraintDatabase(
+            cfg.at("orient_database").get<std::string>(),cfg.at("database").get<std::string>(),
+            std::vector<int64_t>(ids.begin(),ids.end()),lines,normals,threads,
+            cfg.value("normal_sample_spacing",spacing),result);
+        result["wall_seconds"]=seconds(started);
+        vc::core::util::ephemeralWriteString(output,result.dump(2)+"\n");
+        std::cout<<"orientation complete "<<result["orientation"].dump()<<std::endl;
+        return 0;
+    }
     for(int i=0;i<repetitions;++i) {
         const auto begin=Clock::now();
         std::cout<<"extraction repetition="<<i<<std::endl;

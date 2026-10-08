@@ -7,6 +7,7 @@
 #include "vc/fiber_tracer/FiberTraceWindingLeastSquares.hpp"
 #include "vc/fiber_tracer/FiberTraceWindingOrderedCuts.hpp"
 #include "vc/fiber_tracer/LasagnaNormalAlignment.hpp"
+#include "vc/fiber_tracer/FiberNormalOrientation.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -15,6 +16,28 @@
 #include <numeric>
 #include <string>
 #include <vector>
+
+TEST_CASE("Independent fiber normal sweep preserves initial gauge and invalid gaps")
+{
+    using vc::fiber_tracer::FiberNormalOrientationSweep;
+    FiberNormalOrientationSweep sweep;
+    cv::Vec3d n{0,0,-1}; CHECK_FALSE(sweep.orient(n,true)); CHECK(n[2]==-1);
+    n={0,0,1}; CHECK(sweep.orient(n,true)); CHECK(n[2]==-1);
+    n={0,0,0}; CHECK_FALSE(sweep.orient(n,false));
+    n={0,0,1}; CHECK(sweep.orient(n,true)); CHECK(n[2]==-1);
+    n={1,0,0}; CHECK_FALSE(sweep.orient(n,true)); CHECK(n[0]==1);
+    n={-1,0,0}; CHECK(sweep.orient(n,true)); CHECK(n[0]==1);
+    FiberNormalOrientationSweep other;
+    n={0,0,1}; CHECK_FALSE(other.orient(n,true)); CHECK(n[2]==1);
+    // A smooth 180-degree turn must not be flattened to a fixed hemisphere.
+    FiberNormalOrientationSweep turn;
+    for(int i=0;i<=180;++i) {
+        const double a=i*std::acos(-1.)/180.;
+        n={std::sin(a),0,std::cos(a)};
+        CHECK_FALSE(turn.orient(n,true));
+    }
+    CHECK(n[2]==doctest::Approx(-1.));
+}
 
 TEST_CASE("Source memory messages exactly enumerate unique visible assignments")
 {

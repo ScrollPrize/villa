@@ -1,10 +1,15 @@
 #include "FiberConstraintDatabase.hpp"
+#include "vc/fiber_tracer/FiberNormalOrientation.hpp"
+#include "vc/fiber_tracer/PolylineGeometry.hpp"
 #include <sqlite3.h>
 #include <algorithm>
 #include <chrono>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
+#include <cmath>
+#include <unordered_map>
+#include <limits>
 
 namespace {
 using Json = nlohmann::json;
@@ -134,6 +139,188 @@ nlohmann::json writeFiberConstraintDatabase(
     fk.reset();integrity.reset();insert.reset();fiber.reset();meta.reset();db.reset();
     std::filesystem::rename(temporary,output);
     stats["export_seconds"]=std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
+    stats["database_bytes"]=std::filesystem::file_size(output);
+    return stats;
+}
+
+nlohmann::json orientFiberConstraintDatabase(
+    const std::filesystem::path& input, const std::filesystem::path& output,
+    const std::vector<int64_t>& sourceIds,
+    const std::vector<vc::fiber_tracer::FiberletCropTraceLine>& lines,
+    const vc::lasagna::LasagnaNormalSampler& normals, int threads,
+    double sampleSpacing, const Json& provenance)
+{
+    using namespace vc::fiber_tracer;
+    using Clock=std::chrono::steady_clock;
+    const auto started=Clock::now();
+    if(!std::isfinite(sampleSpacing) || sampleSpacing<=0. || threads<1 || lines.size()!=sourceIds.size())
+        throw std::invalid_argument("Invalid normal orientation sampling configuration");
+    const auto partial=std::filesystem::path(output.string()+".partial");
+    if(std::filesystem::exists(output) || std::filesystem::exists(partial))
+        throw std::runtime_error("Refusing to overwrite oriented database or partial output");
+    using Database=std::unique_ptr<sqlite3,decltype(&sqlite3_close)>;
+    using Statement=std::unique_ptr<sqlite3_stmt,decltype(&sqlite3_finalize)>;
+    const auto open=[](const auto& path,int flags) {
+        sqlite3* raw=nullptr; const int rc=sqlite3_open_v2(path.c_str(),&raw,flags,nullptr);
+        Database db(raw,sqlite3_close);
+        if(rc!=SQLITE_OK)throw std::runtime_error("Cannot open constraint database: "+path.string());
+        return db;
+    };
+    auto src=open(input,SQLITE_OPEN_READONLY);
+    if(sqlite3_exec(src.get(),"BEGIN",nullptr,nullptr,nullptr)!=SQLITE_OK)
+        throw std::runtime_error("Cannot acquire source database snapshot");
+    const auto check=[](sqlite3* db,int rc) {
+        if(rc!=SQLITE_OK && rc!=SQLITE_DONE)throw std::runtime_error(sqlite3_errmsg(db));
+    };
+    const auto prepare=[&](sqlite3* db,const char* sql) {
+        sqlite3_stmt* raw=nullptr;check(db,sqlite3_prepare_v2(db,sql,-1,&raw,nullptr));
+        return Statement(raw,sqlite3_finalize);
+    };
+    const auto metaValue=[&](const char* key) {
+        auto s=prepare(src.get(),"SELECT value FROM metadata WHERE key=?");
+        check(src.get(),sqlite3_bind_text(s.get(),1,key,-1,SQLITE_STATIC));
+        if(sqlite3_step(s.get())!=SQLITE_ROW)throw std::runtime_error("Missing source metadata");
+        return Json::parse(reinterpret_cast<const char*>(sqlite3_column_text(s.get(),0)));
+    };
+    if(metaValue("format")!="fiber-constraints" || metaValue("schema_version")!=1 || metaValue("complete")!=true)
+        throw std::runtime_error("Orientation requires a complete schema1 constraint database");
+    const auto original=metaValue("provenance");
+    for(const char* key:{"afv_uuid","normal_manifest","normal_provenance"})
+        if(original.at(key)!=provenance.at(key))throw std::runtime_error(std::string("Source mismatch: ")+key);
+
+    struct Endpoint { size_t slot; double arc; cv::Vec3d point; };
+    std::vector<std::vector<Endpoint>> endpoints(sourceIds.size());
+    std::unordered_map<int64_t,size_t> index;
+    std::vector<double> lengths(sourceIds.size());
+    for(size_t i=0;i<sourceIds.size();++i) {
+        if(!index.emplace(sourceIds[i],i).second)throw std::runtime_error("Duplicate source fiber");
+        lengths[i]=makePolylineArcGeometry(lines[i].pointsBaseXYZ).length();
+    }
+    auto fiberQuery=prepare(src.get(),"SELECT id,source_index,length_base FROM fibers ORDER BY source_index");
+    size_t fiberCount=0; int rc;
+    while((rc=sqlite3_step(fiberQuery.get()))==SQLITE_ROW) {
+        if(fiberCount>=sourceIds.size() || sqlite3_column_int64(fiberQuery.get(),0)!=sourceIds[fiberCount] ||
+           sqlite3_column_int64(fiberQuery.get(),1)!=static_cast<int64_t>(fiberCount) ||
+           std::abs(sqlite3_column_double(fiberQuery.get(),2)-lengths[fiberCount])>1e-6)
+            throw std::runtime_error("Source fiber identity/order/length differs");
+        ++fiberCount;
+    }
+    check(src.get(),rc);
+    if(fiberCount!=sourceIds.size())throw std::runtime_error("Source fiber count differs");
+    auto query=prepare(src.get(),"SELECT id,fiber_a,fiber_b,arc_a,arc_b,ax,ay,az,bx,by,bz FROM constraints ORDER BY id");
+    size_t events=0;
+    while((rc=sqlite3_step(query.get()))==SQLITE_ROW) {
+        if(sqlite3_column_int64(query.get(),0)!=static_cast<int64_t>(events))throw std::runtime_error("Non-contiguous constraint IDs");
+        for(int side=0;side<2;++side) {
+            const auto i=index.at(sqlite3_column_int64(query.get(),1+side));
+            const double arc=sqlite3_column_double(query.get(),3+side);
+            if(!std::isfinite(arc) || arc<0 || arc>lengths[i]+1e-6)throw std::runtime_error("Invalid constraint arc");
+            const int c=5+side*3;
+            endpoints[i].push_back({2*events+side,arc,{sqlite3_column_double(query.get(),c),
+                sqlite3_column_double(query.get(),c+1),sqlite3_column_double(query.get(),c+2)}});
+        }
+        ++events;
+    }
+    check(src.get(),rc);query.reset();fiberQuery.reset();
+    std::vector<cv::Vec3d> baked(2*events);
+    std::vector<unsigned char> valid(2*events,0);
+    size_t samplesTotal=0,flips=0,endpointFlips=0,invalid=0,invalidEndpoints=0,invalidFibers=0;
+    double sampleSeconds=0.;
+    const auto sweepStarted=Clock::now();
+    for(size_t begin=0;begin<lines.size();begin+=256) {
+        struct Sample { double arc; cv::Vec3d point; size_t slot; };
+        const size_t end=std::min(begin+256,lines.size()), regular=std::numeric_limits<size_t>::max();
+        std::vector<Sample> ordered;std::vector<size_t> offsets{0};
+        for(size_t i=begin;i<end;++i) {
+            const auto geometry=makePolylineArcGeometry(lines[i].pointsBaseXYZ);
+            const size_t first=ordered.size();
+            for(double arc=0;arc<geometry.length();arc+=sampleSpacing)
+                ordered.push_back({arc,samplePolylineArc(geometry,arc).point,regular});
+            ordered.push_back({geometry.length(),samplePolylineArc(geometry,geometry.length()).point,regular});
+            for(const auto& e:endpoints[i])ordered.push_back({e.arc,e.point,e.slot});
+            std::stable_sort(ordered.begin()+first,ordered.end(),[](const auto& a,const auto& b){return a.arc<b.arc;});
+            offsets.push_back(ordered.size());
+        }
+        std::vector<cv::Vec3d> points;points.reserve(ordered.size());
+        for(const auto& s:ordered)points.push_back(s.point);
+        std::vector<vc::lasagna::NormalSampleWithDerivative> sampled;
+        const auto sampleStarted=Clock::now();
+        (void)normals.sampleNormalBatch(points,false,threads,sampled);
+        sampleSeconds+=std::chrono::duration<double>(Clock::now()-sampleStarted).count();
+        if(sampled.size()!=ordered.size())throw std::runtime_error("Normal batch size differs");
+        for(size_t f=0;f+1<offsets.size();++f) {
+            FiberNormalOrientationSweep sweep;size_t good=0;
+            for(size_t j=offsets[f];j<offsets[f+1];++j) {
+                auto n=sampled[j].sample.normal;const bool ok=sampled[j].sample.valid;
+                if(ok && (!std::isfinite(n.dot(n)) || std::abs(n.dot(n)-1.)>1e-6))
+                    throw std::runtime_error("Non-unit valid normal");
+                const bool flipped=sweep.orient(n,ok);
+                flips+=flipped;invalid+=!ok;good+=ok;
+                if(ordered[j].slot!=regular) {
+                    const auto slot=ordered[j].slot;baked[slot]=n;valid[slot]=ok;
+                    endpointFlips+=flipped;invalidEndpoints+=!ok;
+                }
+            }
+            invalidFibers+=good==0;
+        }
+        samplesTotal+=ordered.size();
+        if(begin%8192==0 || end==lines.size())std::cout<<"orient normals fibers="<<end<<"/"<<lines.size()
+            <<" samples="<<samplesTotal<<" seconds="<<std::chrono::duration<double>(Clock::now()-sweepStarted).count()<<std::endl;
+    }
+    const double sweepSeconds=std::chrono::duration<double>(Clock::now()-sweepStarted).count();
+    std::filesystem::create_directories(output.parent_path());
+    auto dst=open(partial,SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE);
+    std::cout<<"orientation: cloning original database"<<std::endl;
+    sqlite3_backup* backup=sqlite3_backup_init(dst.get(),"main",src.get(),"main");
+    if(!backup)throw std::runtime_error(sqlite3_errmsg(dst.get()));
+    const int copyRc=sqlite3_backup_step(backup,-1);const int finishRc=sqlite3_backup_finish(backup);
+    check(dst.get(),copyRc);check(dst.get(),finishRc);
+    const auto exec=[&](const char* sql){check(dst.get(),sqlite3_exec(dst.get(),sql,nullptr,nullptr,nullptr));};
+    exec("PRAGMA foreign_keys=ON; BEGIN IMMEDIATE; ALTER TABLE fibers ADD COLUMN normal_sign INTEGER NOT NULL DEFAULT 1 CHECK(normal_sign IN(-1,1)); PRAGMA user_version=2;");
+    auto update=prepare(dst.get(),"UPDATE constraints SET normal_a=?,normal_b=? WHERE id=?");
+    query=prepare(src.get(),"SELECT id,normal_a,normal_b FROM constraints ORDER BY id");
+    size_t count=0;
+    while((rc=sqlite3_step(query.get()))==SQLITE_ROW) {
+        for(int side=0;side<2;++side) {
+            const auto slot=2*count+side;
+            auto n=Json::parse(reinterpret_cast<const char*>(sqlite3_column_text(query.get(),1+side)));
+            if(n.at("valid").get<bool>()!=bool(valid[slot]))throw std::runtime_error("Endpoint validity changed");
+            if(valid[slot]) {
+                const auto& p=n.at("xyz");const cv::Vec3d old{p[0].get<double>(),p[1].get<double>(),p[2].get<double>()};
+                if(std::min(cv::norm(old-baked[slot]),cv::norm(old+baked[slot]))>1e-12)
+                    throw std::runtime_error("Endpoint normal axis changed, not merely sign");
+                n["xyz"]=point(baked[slot]);
+            }
+            const auto str=n.dump();check(dst.get(),sqlite3_bind_text(update.get(),side+1,str.c_str(),int(str.size()),SQLITE_TRANSIENT));
+        }
+        check(dst.get(),sqlite3_bind_int64(update.get(),3,count));check(dst.get(),sqlite3_step(update.get()));
+        check(dst.get(),sqlite3_reset(update.get()));++count;
+        if(count%262144==0)std::cout<<"oriented endpoint publication "<<count<<"/"<<events<<std::endl;
+    }
+    check(src.get(),rc);
+    if(count!=events)throw std::runtime_error("Endpoint count changed");
+    Json stats={{"fibers",fiberCount},{"constraints",events},{"samples",samplesTotal},{"flipped_samples",flips},
+        {"flipped_endpoints",endpointFlips},{"invalid_samples",invalid},{"invalid_endpoints",invalidEndpoints},
+        {"fibers_without_valid_normals",invalidFibers},{"sample_spacing_base",sampleSpacing},
+        {"sampling_seconds",sampleSeconds},{"sweep_seconds",sweepSeconds},
+        {"source_database",input.string()},{"cross_fiber_alignment",false}};
+    auto meta=prepare(dst.get(),"INSERT OR REPLACE INTO metadata VALUES(?,?)");
+    const auto put=[&](const char* key,const Json& value) {
+        const auto str=value.dump();check(dst.get(),sqlite3_bind_text(meta.get(),1,key,-1,SQLITE_STATIC));
+        check(dst.get(),sqlite3_bind_text(meta.get(),2,str.c_str(),int(str.size()),SQLITE_TRANSIENT));
+        check(dst.get(),sqlite3_step(meta.get()));check(dst.get(),sqlite3_reset(meta.get()));
+    };
+    put("schema_version",2);put("normal_orientation",stats);put("normal_orientation_provenance",provenance);
+    put("normal_semantics","fiber-local signed unit sheet normals; effective normal=normal_sign*baked normal; first valid sample anchors gauge; invalid gaps retain last valid orientation; no cross-fiber alignment");
+    exec("COMMIT;");
+    auto integrity=prepare(dst.get(),"PRAGMA quick_check");
+    if(sqlite3_step(integrity.get())!=SQLITE_ROW || std::string(reinterpret_cast<const char*>(sqlite3_column_text(integrity.get(),0)))!="ok")
+        throw std::runtime_error("Oriented database integrity failure");
+    auto fk=prepare(dst.get(),"PRAGMA foreign_key_check");
+    if(sqlite3_step(fk.get())!=SQLITE_DONE)throw std::runtime_error("Oriented database foreign-key failure");
+    fk.reset();integrity.reset();meta.reset();update.reset();query.reset();dst.reset();src.reset();
+    std::filesystem::rename(partial,output);
+    stats["total_seconds"]=std::chrono::duration<double>(Clock::now()-started).count();
     stats["database_bytes"]=std::filesystem::file_size(output);
     return stats;
 }

@@ -1,0 +1,8 @@
+{
+  "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/oriented_normals_v1/full_runner",
+  "reference_dir": "/home/hendrik/villa2/global-fiber-sgd/data",
+  "input_files": ["/home/hendrik/villa2/global-fiber-sgd/orient_normals_full.json"],
+  "commands": [
+    {"name":"orient","binary":"vc_fiber_trace_chunk","args":["afv-constraints","/home/hendrik/villa2/global-fiber-sgd/orient_normals_full.json"]}
+  ]
+}
