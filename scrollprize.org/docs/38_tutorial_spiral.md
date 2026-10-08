@@ -166,6 +166,17 @@ Open VC3D, select the scroll's volume package in [VC3D](tutorial_VC3D), then sel
 
 The spiral workspace runs through a service whether you're using it on the machine you're viewing VC3D through or over a network connection (internet or local LAN). 
 
+
+##### Navigating the UI 
+
+The spiral workspace is composed of two "windows": the configuration dock, on the left-side of the UI, and the flattened spiral view, which occupies the majority of the view. When no fit has returned a "preview", the flattened view is just a black rectangle. 
+
+The configuration dock for the most part should be used top-to-bottom, and all fits begin with a session "connection"
+
+## INSERT A PIC OF THE UI
+
+###### Connecting to a session
+
 In **Spiral Service**, choose a connection:
 
 - **Local:** set **Dataset** and **Output**, then **Connect**. VC3D launches the service locally; its Python environment must have the spiral-fitting dependencies installed. Keep Output outside the dataset directory.
@@ -180,29 +191,41 @@ uv run python spiral_service.py --port 8765 \
     --gpus 0 --session-name my-fit
 ```
 
-Keep this process running in a persistent terminal such as `tmux`. Remote fits continue when VC3D disconnects. Previews and checkpoints transfer automatically; a shared filesystem is unnecessary. If you mount the remote dataset locally, set **Local dataset path** to its matching root to enable verified-patch and shell overlays.
+Keep this process running in a persistent terminal such as `tmux`. Remote fits continue when VC3D disconnects. Previews and checkpoints transfer automatically; a shared filesystem is unnecessary. If you mount the remote dataset locally, set **Local dataset path** to its matching root to enable verified patch overlays.
 
-##### Start a fit
+###### Configuring and running the initial fit 
+
+The default parameters used by fit_spiral.py also apply to fit sessions run through the workspace. The only fields necessary for you to fill in are **Output Directory**, **z begin** and **z end**. If you'd like to override the defaults, click **Open Spiral Configuration...** and edit the fields. Hovering the mouse over the text for each field will show a brief description of what it does. 
+
+## INSERT A PIC OF THE SPIRAL CONFIGURATION DIALOG BOX
 
 Set **z begin / z end** in **Fit and output**; start with a small range. Click **Initialize Fit**, choose **Iterations**, then **Run**. **Stop after iteration** pauses at the next completed step; another Run continues the fit. Initialization becomes **Rebuild Fit** once a fit exists. To resume a saved model, select it under **Checkpoint** and click **Load**.
 
-The default parameters used by fit_spiral.py apply to fits ran through the workspace as well. Click **Open Spiral Configuration...** to change any of these settings. 
+Once the configured number of steps completes, or on the interval set by **Background preview every..** spinbox when enabled, a flattened spiral surface will display in the viewer. 
 
-##### Navigate and inspect
+### INSERT PICTURE OF FLATTENED SURFACE
 
-Outside drawing modes, right-drag to pan, use the wheel to zoom, and Shift+wheel to move through slices. Press **R** over a point to move the shared focus there; **X** recenters the views on that focus. Click the winding minimap below the flattened view to jump along the scroll. **Min winding / Max winding** limit the displayed windings (`-1` means through the last).
+Navigation in the spiral preview surface and the volume views is similar to the rest of VC3D
+- `right-click + drag` to pan, 
+- mouse-wheel to zoom, 
+- shift+wheel to move through slices on the flattened view,
+- `R` and `ctrl+c` over a point to show that area in all views, 
+- `X` recenters the views on that focus if you have panned away 
 
-Use **Display →** to toggle output, input patches, fibers and point collections, surface intersections, winding boundaries, patch overlap, and run differences. Loss overlays require **Compute loss overlays with the next preview**, which roughly doubles preview cost. The fixed status area shows fit progress and preview age; **Logs** opens service messages.
+The spiral surface also contains a "minimap". Click the winding minimap below the flattened view to jump along the scroll. Use **Min winding / Max winding** limit the displayed windings (`-1` means through the last).
+
+Within the display section of the configuration dock is the **Volume** combobox, which allows you to select the primary displayed volume (Overlays are managed like regular VC3D, via the **Overlay** toolbar item). The spiral preview surface also has many additional overlays available. Use **Display →** to toggle output, input patches, fibers and point collections, surface intersections, winding boundaries, patch overlap, and run differences. Loss overlays require **Compute loss overlays with the next preview**, which roughly doubles preview cost. The fixed status area shows fit progress and preview age; **Logs** opens service messages.
 
 ##### Annotate and apply changes
 
-Draw patches and control-point lines on the flattened preview; same-winding and relative-winding points can also be placed in the CT views. Put the pointer over a viewer when using these shortcuts:
+When fitting a spiral using the spiral workspace, you can add constraints to a running fit. 
 
 | Key or gesture | Action |
 | --- | --- |
 | Tap Ctrl | Toggle patch painting; left-drag paints, right-drag erases |
 | Ctrl+wheel | Change brush size |
 | Shift+right-drag | Draw a freehand control-point line |
+| Ctrl + right-click -> 2d line annotation | place control points to use in the fiber annotation, press `E` to optimize and display the line annotation window | 
 | Hold V + left-clicks | Draw a control-point line through chosen points; release V to finish |
 | Q, then left-clicks | Place points belonging to the same winding |
 | E, then left-clicks | Place relative-winding points numbered 0, 1, 2, …; click successive windings in order |
@@ -270,11 +293,6 @@ That's it — the script loads the inputs (caching the expensive preprocessing),
 
 To run the whole pipeline in one command — fit, then render ink, then score it — use [`runners/run_single.py`](https://github.com/ScrollPrize/villa/blob/main/spiral-fitting/runners/run_single.py) instead. It takes the same `--dataset`, plus an `--ink-volume`, and accepts the same configuration overrides as a `--config` JSON file; `runners/run_sweep.py` runs a whole folder of such configs concurrently across GPUs.
 
-</TabItem>
-</Tabs>
-
-</div>
-
 When it finishes, you get a self-contained run folder:
 
 ```
@@ -291,6 +309,28 @@ out/2026-07-08_s1_slice-10500-11500_27399-patch_<run-name>/
 ```
 
 The overlay PNGs are only written when `output_save_png_visualizations` is on; it defaults to off, since rendering them means reading scan slices back at the end of the fit.
+
+</TabItem>
+</Tabs>
+
+</div>
+
+### Tips for getting better spiral fits
+The goal of any spiral fit is to do _as little annotation as possible_ . This is, of course, a hard question to answer until you have a perfect fit and work backwards. However, we can get a rough guess if we consider how the spiral interpolates. The easiest way to think of this is to imagine the scroll as a set of local shapes glued together, perhaps one section of the scroll looks like a `C` or one a `J` or god forbid a `Z`. In each of these shaped sections, we need _something_ to inform the spiral how the local area should be deformed. 
+
+These "descriptions" typically come in the form of constraints like patches, fibers, or relative winding annotations. The "density" of these shape descriptors required in a given area depends greatly on how uniform the deformation is. If a large number of windings all make mostly the same shape, it could be very few. However if an area makes something more `3C` than `C` (bear with me), you'll need a fair bit more annotation. The "complexity" of the local shape is the primary multiplier of annotation density, rather than the number of windings or the curvature alone. Once you've got a constraint that describes the neighborhood, there is little benefit in adding "more". You would not, for example, want to annotate multiple windings in a row radially if they are mostly the same shape and have somewhat regular spacing.
+
+The other instance which typically requires more-than-usual amounts of annotation is the case of shears. In this context, a shear of the scroll is a location where the papyrus has not only _broken apart_ but also _shifted_ along an axis. These situations are particularly hard for a smooth field to interpolate (they are by nature unsmooth). In these types of areas it is best to try and find some portion of the scroll which you can follow through, and apply a fair bit of annotation on either side of the shear, as near as you can get to the actual missing papyrus. 
+
+### INSERT PIC OF SOME SHAPES ON THE SCROLLS W/ STUFF DRAWN IDK HOW TO BEST SHOW THIS BUT WILL FIGURE OUT ALSO PIC OF SHEAR
+
+Now that we've described the _bad_ areas, there are some shapes within a scroll which are "easier" (or at least as easy as unrolling an ancient carbonized scroll can reasonably be): 
+
+- Because the gap expander prefers to push outwards from its initial gap, and due to it being a cumulative sum of the gaps _along_ the radial , the spiral will (for the most part) perform quite well in areas with regular spacing and curvature which happens smoothly over a large area. This _reduces_ the amount of annotation we need in these areas
+- Areas which have large gaps between windings that are sustained for long runs reduce the amount of "uncertainty" in the fit, and are typically fit well very early
+- Areas with minimal curvature (even highly compressed ones)
+
+
 
 #### Rendering ink
 
@@ -311,6 +351,7 @@ The script `get_ink_metrics.py` computes some metrics based on the amount of let
 The ink-coverage model was only trained on PHerc. Paris 4, so it may not give accurate results for other scrolls with significantly different writing styles.
 
 :::
+
 
 ### How it works
 
