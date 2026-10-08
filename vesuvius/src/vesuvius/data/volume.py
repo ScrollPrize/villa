@@ -380,7 +380,7 @@ class Volume:
             # Provide example usage hints
             print("\nExample Usage:")
             print('  volume = Volume(type="scroll", scroll_id=1)')
-            print('  segment = Volume(type="segment", segment_id=20230827161847)')
+            print('  segment = Volume(type="segment", scroll_id=1, segment_id=20230827161847)')
             print('  zarr_vol = Volume(type="zarr", path="/path/to/my/data.zarr")')
             raise
 
