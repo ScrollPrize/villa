@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
+from devices import float_hi, scatter_reduce_
 from sample_spiral import (
     get_radial_normal_stretch,
     get_theta_and_radii,
@@ -265,12 +266,13 @@ def evaluate_patch_satisfaction_packed(
             satisfied_boundary_counts.scatter_add_(
                 0, patch_indices, (satisfied & boundary).to(torch.int64))
         roi_counts_dev = roi_counts.to(device=device)
-        satisfied_patches = (satisfied_counts.to(torch.float64)
+        hi = float_hi(device)
+        satisfied_patches = (satisfied_counts.to(hi)
             >= thresholds['satisfied_patch_quad_fraction']
-               * roi_counts_dev.to(torch.float64))
-        boundary_satisfied = (satisfied_boundary_counts.to(torch.float64)
+               * roi_counts_dev.to(hi))
+        boundary_satisfied = (satisfied_boundary_counts.to(hi)
             >= thresholds['boundary_satisfied_patch_quad_fraction']
-               * boundary_counts.to(torch.float64))
+               * boundary_counts.to(hi))
         satisfied_areas = (patch_areas
             * satisfied_counts.cpu().to(torch.float64)
             / full_valid_counts.clamp_min(1))
@@ -292,8 +294,8 @@ def evaluate_patch_satisfaction_packed(
             (patch_count,), torch.iinfo(torch.int64).max,
             dtype=torch.int64, device=device)
         max_radius.scatter_reduce_(0, patch_indices, radius.float(), reduce='amax')
-        max_winding.scatter_reduce_(0, patch_indices, raw_windings, reduce='amax')
-        min_winding.scatter_reduce_(0, patch_indices, raw_windings, reduce='amin')
+        scatter_reduce_(max_winding, patch_indices, raw_windings, 'amax')
+        scatter_reduce_(min_winding, patch_indices, raw_windings, 'amin')
         has_roi = roi_counts > 0
         max_radius_cpu = max_radius.cpu().tolist()
         max_winding_cpu = max_winding.cpu().tolist()

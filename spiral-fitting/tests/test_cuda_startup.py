@@ -49,6 +49,16 @@ def test_diagnostic_does_not_assume_shared_memory(monkeypatch, device):
     assert 'drop_caches' not in str(caught.value)
 
 
+@pytest.mark.parametrize('device', ['mps', 'cpu'])
+def test_startup_probe_is_skipped_off_cuda(monkeypatch, device):
+    calls = []
+    monkeypatch.setattr(torch, 'empty', lambda *a, **kw: calls.append('allocate'))
+    monkeypatch.setattr(torch.cuda, 'synchronize', lambda: calls.append('synchronize'))
+    fit_spiral.FitContext.check_cuda_ready(
+        SimpleNamespace(progress=None, device=torch.device(device)))
+    assert calls == []
+
+
 def test_headless_stops_before_loading_inputs_on_cuda_failure():
     context = SimpleNamespace(
         progress=None,
