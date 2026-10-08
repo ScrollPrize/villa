@@ -194,7 +194,11 @@ class TrainConfig:
     chain_min_valid: float = .5
     chain_max_age: int = 200  # iterations a chain may wait for its next window before it is dropped
     seed: int = 0
-    device: str = 'cuda'
+    device: str = 'cuda'  # with gpus > 1 each process uses its own GPU (cuda:LOCAL_RANK) instead
+    # Data-parallel processes, one GPU each, started by torchrun --nproc_per_node=GPUS (shared/distributed.py). Each
+    # process draws its own batches (batch / points_per_batch are per process) and the gradients of all processes'
+    # batches are averaged into one update: an iteration then sees GPUS batches.
+    gpus: int = 1
 
 
 @dataclass
@@ -341,6 +345,8 @@ def validate(config: Config) -> None:
         raise ValueError('train.ema must be in [0, 1)')
     if tc.history_rows < 0:
         raise ValueError('train.history_rows must be >= 0')
+    if type(tc.gpus) is not int or tc.gpus < 1:
+        raise ValueError('train.gpus must be a positive integer')
     if tc.live_chains and (tc.history_rows or len(tc.chain_steps) != 2 or m.memory_rows > d.steps
                            or not d.steps <= int(tc.chain_steps[0]) <= int(tc.chain_steps[1])):
         # Continued chains of different depths share batches, so every continued front must hold the same memory:

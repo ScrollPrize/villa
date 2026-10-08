@@ -126,8 +126,8 @@ def main(argv=None):
     cli = build_parser().parse_args(argv)
     run = run_config.load(cli.config)
     args = run_config.namespace(run, cli.resume)
-    from vesuvius.neural_tracing.tracers.fibers.train.distributed import from_environment, NullLog
-    parallel = from_environment(args.gpus)  # torchrun processes when gpus > 1 (train/distributed.py)
+    from vesuvius.neural_tracing.tracers.shared.distributed import from_environment, NullLog
+    parallel = from_environment(args.gpus)  # torchrun processes when gpus > 1 (shared/distributed.py)
     main_rank = parallel is None or parallel.is_main
     if parallel is not None:
         args.device = parallel.device

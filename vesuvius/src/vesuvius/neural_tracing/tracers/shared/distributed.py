@@ -1,18 +1,21 @@
-"""Data-parallel training across processes started by torchrun (runtime option ``gpus``; scripts/launch_train.sh).
+"""Data-parallel training across processes started by torchrun, shared by the tracers (fibers: runtime option ``gpus``
+and scripts/launch_train.sh; sheets: ``train.gpus`` and ``torchrun --nproc_per_node=GPUS -m ...sheets.train.train``).
 
-Training calls the compiled ``model.training_forward`` rather than ``model.forward``, so the model is not wrapped in
-``DistributedDataParallel`` (whose gradient hooks run only through its own forward). Instead every process computes the
-gradients of its own decisions, ``average_gradients`` combines them into exactly the gradient of the pooled update, and
-every process then applies the same clipping, AdamW step and EMA update, so model, EMA and optimizer stay identical.
+The tracers train through compiled functions or step-wise backward passes rather than one ``model.forward``, so the
+model is not wrapped in ``DistributedDataParallel`` (whose gradient hooks run only through its own forward). Instead
+every process computes the gradients of its own data, ``average_gradients`` combines them into exactly the gradient of
+the pooled update, and every process then applies the same clipping, AdamW step and EMA update, so model, EMA and
+optimizer stay identical. Anything else an update depends on (e.g. a learning rate following a time budget) must be
+the same on every process: ``broadcast_value`` hands out rank 0's.
 
-The pooled loss weights every supervised decision equally, as one process does over its microbatches: each process's
-gradient (its loss is a mean over its own ``total`` decisions) is weighted by ``total`` and the sum divided by the total
-over all processes. A parameter without a gradient on every process keeps ``grad=None`` (AdamW skips it, as it does for
-unexecuted refinement retries); one with a gradient on any process gets zeros where it had none. A nonfinite loss on
-any process is reported on all of them before any update, so no process waits on the others.
+``average_gradients`` weights each process's gradient (of a loss averaged over its own ``total`` units: supervised
+decisions for fibers, one batch for sheets) by ``total`` and divides the sum by the total over all processes. A
+parameter without a gradient on every process keeps ``grad=None`` (AdamW skips it, as it does for unexecuted
+refinement retries); one with a gradient on any process gets zeros where it had none. A nonfinite loss on any process
+is reported on all of them before any update, so no process waits on the others.
 
-Only rank 0 writes run files, logs, checkpoints, diagnostics and collects DAgger states; every rank reads the published
-replay indices. Each rank draws its own training data (seed offset per rank).
+Only rank 0 writes run files, logs, checkpoints and diagnostics (and, for fibers, collects DAgger states); each rank
+draws its own training data (seed offset per rank, ``seed_offset``).
 """
 from __future__ import annotations
 
@@ -57,6 +60,19 @@ class DataParallel:
         dist.broadcast_object_list(holder, src=0)
         return holder[0]
 
+    def broadcast_module(self, module):
+        """Copy rank 0's parameters and buffers into ``module`` on every rank, so all processes start identical
+        whatever their initialization."""
+        with torch.no_grad():
+            for tensor in module.state_dict().values():
+                dist.broadcast(tensor, src=0)
+
+    def broadcast_value(self, value):
+        """Rank 0's float ``value`` on every rank (one small collective; cheap enough for every update)."""
+        holder = torch.tensor([float(value)], device=self.device, dtype=torch.float64)
+        dist.broadcast(holder, src=0)
+        return float(holder)
+
     def average_gradients(self, model, total, finite, observed=0):
         """Pool the gradients of all processes (module docstring); returns (pooled total, all finite, pooled observed)."""
         params = [p for p in model.parameters() if p.requires_grad]
@@ -91,10 +107,12 @@ def from_environment(expected=1):
     """The process group when started by torchrun with WORLD_SIZE > 1, else None; checks it against ``expected`` GPUs."""
     world = int(os.environ.get('WORLD_SIZE', '1'))
     if world != expected:
-        raise RuntimeError(f'The run configuration asks for {expected} GPU process(es) but {world} were started; launch '
-                           'with scripts/launch_train.sh (torchrun --nproc_per_node=gpus when gpus > 1)')
-    # FIBER_FOLLOW_DDP_BACKEND=gloo (testing only) lets several processes share one GPU, which NCCL refuses.
-    return DataParallel(os.environ.get('FIBER_FOLLOW_DDP_BACKEND', 'nccl')) if world > 1 else None
+        raise RuntimeError(f'The configuration asks for {expected} GPU process(es) but {world} were started; launch '
+                           'with torchrun --nproc_per_node=GPUS (fibers: scripts/launch_train.sh does so when gpus > 1)')
+    # TRACERS_DDP_BACKEND=gloo (testing only; formerly FIBER_FOLLOW_DDP_BACKEND) lets several processes share one GPU,
+    # which NCCL refuses.
+    backend = os.environ.get('TRACERS_DDP_BACKEND', os.environ.get('FIBER_FOLLOW_DDP_BACKEND', 'nccl'))
+    return DataParallel(backend) if world > 1 else None
 
 
 class NullLog:

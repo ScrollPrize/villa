@@ -1,11 +1,11 @@
-"""Data-parallel gradient pooling (train/distributed.py) across two CPU processes (gloo)."""
+"""Data-parallel gradient pooling (shared/distributed.py) across two CPU processes (gloo)."""
 import os
 import socket
 
 import torch
 import torch.multiprocessing as mp
 
-from vesuvius.neural_tracing.tracers.fibers.train.distributed import DataParallel
+from vesuvius.neural_tracing.tracers.shared.distributed import DataParallel
 
 # Per rank: decisions in its update, gradient of the shared parameter, gradient of a parameter only rank 1 used
 # (rank 0 leaves it None, like an unexecuted refinement retry), and whether its loss was finite.
@@ -27,7 +27,9 @@ def worker(rank, port, finite, folder):
     if rank == 1:
         model['partial'].grad = ONLY_RANK1.clone()
     total, all_finite, observed = parallel.average_gradients(model, TOTALS[rank], finite[rank], observed=10+rank)
-    torch.save((total, all_finite, observed, model['shared'].grad, model['partial'].grad, model['unused'].grad),
+    shared_value = parallel.broadcast_value(rank+.25)  # e.g. rank 0's elapsed minutes for the learning rate
+    torch.save((total, all_finite, observed, model['shared'].grad, model['partial'].grad, model['unused'].grad,
+                shared_value),
                f'{folder}/{rank}.pt')
     parallel.close()
 
@@ -42,10 +44,11 @@ def test_gradients_pool_as_one_update_over_every_decision(tmp_path):
     expected_shared = (TOTALS[0]*SHARED[0]+TOTALS[1]*SHARED[1])/sum(TOTALS)
     expected_partial = TOTALS[1]*ONLY_RANK1/sum(TOTALS)  # zeros on rank 0
     for rank in (0, 1):
-        total, all_finite, observed, shared, partial, unused = out[rank]
+        total, all_finite, observed, shared, partial, unused, value = out[rank]
         assert total == sum(TOTALS) and all_finite and observed == 21
         assert torch.allclose(shared, expected_shared) and torch.allclose(partial, expected_partial)
         assert unused is None  # no process had a gradient: AdamW keeps skipping it
+        assert value == .25  # rank 0's value everywhere
 
 
 def test_a_nonfinite_loss_on_one_process_is_seen_by_all(tmp_path):

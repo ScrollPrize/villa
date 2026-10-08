@@ -143,7 +143,7 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
                      refinement_weight=1., parallel=None):
     """One equally weighted task loss per independent supervised decision.
 
-    With ``parallel`` (train/distributed.DataParallel) the gradients of every process's decisions are pooled before
+    With ``parallel`` (shared/distributed.DataParallel) the gradients of every process's decisions are pooled before
     clipping, so all processes apply the same update; the returned metrics describe this process's decisions, plus
     the pooled ``pooled_supervised_states``/``pooled_observed_states``.
     """

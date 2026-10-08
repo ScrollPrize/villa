@@ -84,7 +84,7 @@ RUNTIME = dict(device='cuda', workers=10, worker_cache_gb=.5, threads=4, dagger_
                remote_prefetch_connections=48, remote_prefetch_queue_size=512, remote_prefetch_lookahead=16,
                remote_prefetch_timeout=120.,
                # Data-parallel processes, one GPU each (scripts/launch_train.sh starts torchrun when > 1;
-               # train/distributed.py). Batch and grad_steps are per process.
+               # shared/distributed.py). Batch and grad_steps are per process.
                gpus=1,
                # Physical GPU index for the DAgger collector subprocess (its CUDA_VISIBLE_DEVICES); None: the
                # training process's (rank 0's) GPU.

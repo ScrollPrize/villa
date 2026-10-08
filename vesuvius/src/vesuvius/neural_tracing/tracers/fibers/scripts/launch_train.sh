@@ -18,7 +18,7 @@ name="$("$PYTHON" -c 'import json, sys; print(json.load(open(sys.argv[1]))["name
 case "$name" in
     ''|.|..|*/*) echo 'Run name must be a single directory name.' >&2; exit 1 ;;
 esac
-# runtime.gpus > 1: one data-parallel process per GPU (torchrun; train/distributed.py). The visible GPUs come from
+# runtime.gpus > 1: one data-parallel process per GPU (torchrun; shared/distributed.py). The visible GPUs come from
 # CUDA_VISIBLE_DEVICES; the PID file then names the torchrun agent, which stops every process with it.
 gpus="$("$PYTHON" -c 'import json, sys; print(int((json.load(open(sys.argv[1])).get("runtime") or {}).get("gpus", 1)))' "$config")"
 if (( gpus > 1 )); then

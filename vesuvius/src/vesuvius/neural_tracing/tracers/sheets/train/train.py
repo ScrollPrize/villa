@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import math
 import multiprocessing
 import queue
 import signal
@@ -41,6 +42,7 @@ from vesuvius.neural_tracing.tracers.sheets.model import build_model, compile_mo
 from vesuvius.neural_tracing.tracers.sheets.tracing.rollout import Tracer
 from vesuvius.neural_tracing.tracers.sheets.tracing.seeding import perturb, seed_rows, sheet_jump
 from vesuvius.neural_tracing.tracers.sheets.evaluation.figures import episode_figure, metric_figure, training_figure
+from vesuvius.neural_tracing.tracers.shared.distributed import from_environment
 from vesuvius.neural_tracing.tracers.shared.io import atomic_torch_save
 from vesuvius.neural_tracing.tracers.shared.training import clip_training_gradients, lr_at, prepare_run_dir, update_ema
 
@@ -188,12 +190,18 @@ def front_variants(train_cfg, index, pad: float) -> dict:
     return out
 
 
-def optimize_step(tracer: Tracer, opt, ema, b: dict, cfg, spec, generator, front=None):
+def optimize_step(tracer: Tracer, opt, ema, b: dict, cfg, spec, generator, front=None, parallel=None):
     """One training iteration on batch ``b``: rollout, backward, gradient clipping, optimizer and EMA update.
-    Returns ``train_rollout``'s loss, stats (plus the gradient norm ``grad``), final front and confidences."""
+    Returns ``train_rollout``'s loss, stats (plus the gradient norm ``grad``), final front and confidences.
+    With ``parallel`` (shared/distributed.DataParallel) the gradients of every process's batch are averaged (each
+    batch weighted equally) before clipping, so all processes apply the same update."""
     model, tc = tracer.model, cfg.train
     opt.zero_grad(set_to_none=True)
     loss, stats, front, confs = train_rollout(tracer, b, cfg, spec, generator, front)
+    if parallel is not None:
+        _, finite, _ = parallel.average_gradients(model, 1, math.isfinite(float(loss)))
+        if not finite:
+            raise FloatingPointError('Nonfinite training loss on a data-parallel process')
     stats['grad'] = torch.tensor(clip_training_gradients(model, tc.grad_clip)['grad_norm'])
     opt.step()
     if ema:
@@ -243,8 +251,14 @@ def main(argv=None):
         overrides = list(args.set)+([f'train.name={args.name}'] if args.name else [])
         cfg = C.load(args.config, overrides)
     tc, d = cfg.train, cfg.data
-    run = prepare_run_dir(cfg.run_dir.parent, cfg.run_dir.name, resume=checkpoint is not None)
-    (run/'config.json').write_text(json.dumps(cfg.to_dict(), indent=2))
+    parallel = from_environment(tc.gpus)  # torchrun processes when train.gpus > 1 (shared/distributed.py)
+    main_rank = parallel is None or parallel.is_main
+    rank_seed = parallel.seed_offset() if parallel is not None else 0  # each process draws its own data
+    run = prepare_run_dir(cfg.run_dir.parent, cfg.run_dir.name, resume=checkpoint is not None) if main_rank else cfg.run_dir
+    if parallel is not None:
+        parallel.barrier()
+    if main_rank:
+        (run/'config.json').write_text(json.dumps(cfg.to_dict(), indent=2))
     raise_open_file_limit()
     # Loader workers are forkserver children, not ours: exit through Python on SIGTERM so the DataLoader
     # shuts them down instead of leaving them running.
@@ -253,9 +267,13 @@ def main(argv=None):
     if tc.compile_geometry:
         from vesuvius.neural_tracing.tracers.sheets.geometry import use_compiled_projection
         use_compiled_projection()
-    device = torch.device(tc.device)
+    device = torch.device(parallel.device if parallel is not None else tc.device)
 
-    index = build_index(d.patches_dir, C.OUTPUT/'cache')
+    for turn in range(parallel.world_size if parallel is not None else 1):  # one process at a time builds the cache
+        if parallel is None or parallel.rank == turn:
+            index = build_index(d.patches_dir, C.OUTPUT/'cache')
+        if parallel is not None:
+            parallel.barrier()
     pad = episode_pad(cfg.model, tc)
     train_cfg = cfg  # training episodes start history_rows further back (memory warm-up); validation's do not
     if tc.history_rows:
@@ -266,15 +284,17 @@ def main(argv=None):
     train_spec, spec = train_sampler.spec, val_sampler.spec
     print(f'{len(train_sampler.index)} usable patches; GT grid {train_spec.Gu}x{train_spec.Gv}; '
           f'blocks within {d.roi} vx at level {d.volume_level}', flush=True)
-    t0 = time.time()
-    val_set = fixed_episodes(val_sampler, tc.val_episodes, tc.seed)
-    print(f'{len(val_set)} validation episodes in {time.time()-t0:.1f} s', flush=True)
+    val_set = None  # only rank 0 validates
+    if main_rank:
+        t0 = time.time()
+        val_set = fixed_episodes(val_sampler, tc.val_episodes, tc.seed)
+        print(f'{len(val_set)} validation episodes in {time.time()-t0:.1f} s', flush=True)
     jobs = None
     if tc.live_chains:  # the workers serve live-chain continuations as whole batches
         jobs = multiprocessing.Queue(64)
         jobs.cancel_join_thread()  # never block exit on unread jobs
     variants = front_variants(train_cfg, index, pad) if d.front_points_range else None
-    seed = tc.seed+(checkpoint['iteration'] if checkpoint else 0)
+    seed = tc.seed+(checkpoint['iteration'] if checkpoint else 0)+rank_seed
     if variants:
         stream = MixedFrontStream({k: v[1] for k, v in variants.items()}, {k: v[2] for k, v in variants.items()}, seed,
                                   {k: v[3] for k, v in variants.items()})
@@ -312,6 +332,10 @@ def main(argv=None):
         if checkpoint and checkpoint.get('ema'):
             load_model_state(ema.model, checkpoint['ema'])
             ema.updates = checkpoint.get('ema_updates', 0)
+    if parallel is not None:  # identical starting weights on every process, then each draws its own randomness
+        for net in (model, ema.model) if ema else (model,):
+            parallel.broadcast_module(net)
+        torch.manual_seed(tc.seed+(checkpoint['iteration'] if checkpoint else 0)+rank_seed)
     if tc.compile_model:
         for net in (model, ema.model) if ema else (model,):
             compile_model(net)
@@ -319,7 +343,7 @@ def main(argv=None):
     tracers = {n: Tracer(model, v[0], device) for n, v in variants.items()} if variants else {}
     eval_tracer = Tracer(ema.model, cfg, device) if ema else tracer  # validation uses the averaged weights
     generator = torch.Generator(device=device)
-    generator.manual_seed(tc.seed+start)
+    generator.manual_seed(tc.seed+start+rank_seed)
     chains = LiveChains(train_cfg, train_spec, tracer, jobs, generator) if jobs else None
 
     log_path = run/'log.jsonl'
@@ -328,6 +352,8 @@ def main(argv=None):
         log_path.write_text('')
 
     def write(row):
+        if not main_rank:
+            return
         # Reopen per row: tools that swap files under output/ (git stash/restore, sync) must not swallow the log.
         log_rows.append(row)
         with log_path.open('a') as fh:
@@ -352,9 +378,13 @@ def main(argv=None):
 
     started, data_time, it = time.time(), 0., start
     resumed_minutes = float(checkpoint.get('minutes', 0.)) if checkpoint else 0.
-    minutes = lambda: resumed_minutes+(time.time()-started)/60
+    # Every process follows rank 0's clock (the learning rate and the time budget must agree across processes).
+    elapsed_minutes = lambda: resumed_minutes+(time.time()-started)/60
+    minutes = elapsed_minutes if parallel is None else lambda: parallel.broadcast_value(elapsed_minutes())
+    world = parallel.world_size if parallel is not None else 1
     window = {}
-    bar = tqdm(range(start, tc.iterations), initial=start, total=tc.iterations, dynamic_ncols=True)
+    bar = tqdm(range(start, tc.iterations), initial=start, total=tc.iterations, dynamic_ncols=True,
+               disable=not main_rank)
     # Live chains decide what the loader serves from finished rollouts, so their batches are not fetched ahead.
     batches = ((E.to_device(b, device) for b in loader) if chains else
                device_batches(loader, device, pad_blocks=not d.unpadded_blocks))
@@ -366,36 +396,37 @@ def main(argv=None):
             if chains is None or chain is not None:
                 break
         data_time += time.time()-t_data
+        now = minutes()
         for group in opt.param_groups:
-            group['lr'] = learning_rate(it, tc, minutes())*group.get('lr_scale', 1.)
+            group['lr'] = learning_rate(it, tc, now)*group.get('lr_scale', 1.)
         if variants:  # this batch's kind: front size, or fiber following
             kind = b['front_points']
             vcfg = variants[kind][0]
             loss, stats, front, confs = optimize_step(tracers[kind], opt, ema, b, vcfg, variants[kind][1].spec,
-                                                      generator)
+                                                      generator, parallel=parallel)
             stats['front_points'] = torch.tensor(float(vcfg.data.front_points))
             stats['follow'] = torch.tensor(float(vcfg.data.fiber_follow))
         else:
             loss, stats, front, confs = optimize_step(tracer, opt, ema, b, train_cfg, train_spec, generator,
-                                                      chain['front'] if chain else None)
+                                                      chain['front'] if chain else None, parallel=parallel)
         if chains:
             chains.finish(b, chain, front, confs, it)
             stats.update(chains.stats)
         for k, v in stats.items():
             window.setdefault(k, []).append(v)
         done = it+1
-        if done % tc.log_every == 0:
+        if done % tc.log_every == 0 and main_rank:  # rank 0's batches stand for the iteration's
             row = {k: float(torch.stack([torch.as_tensor(x) for x in v]).float().mean()) for k, v in window.items()}
             elapsed = time.time()-started
-            row.update(kind='train', iteration=done, lr=learning_rate(it, tc, minutes()), minutes=minutes(),
-                       episodes_per_s=(done-start)*tc.batch/elapsed, data_fraction=data_time/elapsed)
+            row.update(kind='train', iteration=done, lr=learning_rate(it, tc, elapsed_minutes()),
+                       minutes=elapsed_minutes(), episodes_per_s=(done-start)*tc.batch*world/elapsed, data_fraction=data_time/elapsed)
             write(row)
             window = {}
             bar.set_postfix_str(f"loss {row['loss']:.3f} dist {row['dist']:.2f} same {row['same_sheet']:.2f} "
                                 f"conf {row['confident']:.2f} prec {row['conf_precision']:.2f} "
                                 f"caught {row['off_caught']:.2f} "
                                 f"{row['episodes_per_s']:.0f} ep/s data {row['data_fraction']:.0%}")
-        if done % tc.val_every == 0 or done == tc.iterations:
+        if main_rank and (done % tc.val_every == 0 or done == tc.iterations):
             summary = validate(done)
             tqdm.write(f"[{done}] val score {summary['score_mean']:.3f} coverage {summary['coverage_mean']:.3f} "
                        f"kept_off {summary['kept_off_mean']:.3f} caught {summary['caught_mean']:.3f} "
@@ -404,22 +435,27 @@ def main(argv=None):
                        f"dist p90 {summary['dist_p90_mean']:.2f}")
             if summary['score_mean'] > best:
                 best = summary['score_mean']
-                save(run/'best.pt', model, opt, cfg, done, best, minutes(), ema)
-        if done % tc.ckpt_every == 0:
-            save(run/'last.pt', model, opt, cfg, done, best, minutes(), ema)
-        if tc.keep_every and done % tc.keep_every == 0:
-            save(run/f'ckpt_{done:06d}.pt', model, opt, cfg, done, best, minutes(), ema)
-        if tc.max_minutes and minutes() > tc.max_minutes:
-            tqdm.write(f'time budget reached at iteration {done}')
-            if done % tc.val_every:
+                save(run/'best.pt', model, opt, cfg, done, best, elapsed_minutes(), ema)
+        if main_rank and done % tc.ckpt_every == 0:
+            save(run/'last.pt', model, opt, cfg, done, best, elapsed_minutes(), ema)
+        if main_rank and tc.keep_every and done % tc.keep_every == 0:
+            save(run/f'ckpt_{done:06d}.pt', model, opt, cfg, done, best, elapsed_minutes(), ema)
+        if tc.max_minutes and minutes() > tc.max_minutes:  # the same decision on every process (rank 0's clock)
+            if main_rank:
+                tqdm.write(f'time budget reached at iteration {done}')
+            if main_rank and done % tc.val_every:
                 summary = validate(done)
                 if summary['score_mean'] > best:
                     best = summary['score_mean']
-                    save(run/'best.pt', model, opt, cfg, done, best, minutes(), ema)
+                    save(run/'best.pt', model, opt, cfg, done, best, elapsed_minutes(), ema)
             break
-    save(run/'last.pt', model, opt, cfg, it+1, best, minutes(), ema)
-    training_figure(log_rows, run/'training.png')
     del batches, loader  # stop the loader workers before evaluating
+    if parallel is not None:
+        parallel.close()
+    if not main_rank:
+        return
+    save(run/'last.pt', model, opt, cfg, it+1, best, elapsed_minutes(), ema)
+    training_figure(log_rows, run/'training.png')
     if cfg.eval.after_training:
         final_eval(cfg, run, device)
 

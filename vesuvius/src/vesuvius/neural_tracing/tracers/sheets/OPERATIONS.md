@@ -123,6 +123,10 @@ python -m vesuvius.neural_tracing.tracers.sheets.train.train --resume output/RUN
   modules start fresh when the checkpoint lacks them; the mode embedding starts at zero, so the model begins
   unchanged.
 * **`--resume`:** continues a run, including the optimizer and the elapsed time.
+* **Several GPUs:** set `train.gpus` and start one process per GPU with torchrun, e.g.
+  `CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 -m vesuvius.neural_tracing.tracers.sheets.train.train --config CONFIG.json --name RUN --set train.gpus=2`.
+  Each process draws its own batches, and their gradients are averaged into one update (`shared/distributed.py`).
+  An iteration therefore sees `gpus` batches. Rank 0 logs, validates and writes checkpoints.
 * **Configs:** `configs/remote_l0_points_ft.json` and `configs/remote_l0_fiber_ft.json` (H100 paths).
 * **Option reference:** README.md.
 
