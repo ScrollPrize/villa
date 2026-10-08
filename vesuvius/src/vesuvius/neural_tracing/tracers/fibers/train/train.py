@@ -246,6 +246,9 @@ def main(argv=None):
     if args.reset_optimizer:
         progress(f'Fresh AdamW: all parameters trainable; LR restarts at update {done+1} '
                  f'with {args.warmup} warmup updates to {args.lr:g}')
+    elif args.lr_restart_step is not None:
+        progress(f'AdamW moments kept; LR schedule restarts at update {lr_restart_step+1} with {args.warmup} warmup '
+                 f'updates to {args.lr:g}, cosine to zero at update {args.steps}')
     # Episode batches present their supervised decisions to the compiled decision graph.
     prepare_training(model, args.batch*args.episode_supervised if cfg.model_type == 'sequence' else args.batch)
     progress('Compiling training operations; first forward/backward passes may take several minutes')

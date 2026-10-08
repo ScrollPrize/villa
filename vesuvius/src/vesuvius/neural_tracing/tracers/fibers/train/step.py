@@ -113,6 +113,11 @@ def initialize_training_optimizer(model, ema, args, resume=None):
     if scales and len(opt.param_groups) == 1:  # resumed from a checkpoint trained without them: they start fresh
         opt.add_param_group(scale_group)
     origin = done if reset else int((resume or {}).get('lr_restart_step', 0))
+    if getattr(args, 'lr_restart_step', None) is not None:  # a chosen schedule restart; the moments stay
+        if resume is None or args.lr_restart_step > done:
+            raise ValueError(f'lr_restart_step {args.lr_restart_step} needs --resume from that update or later '
+                             f'(resumed at {done})')
+        origin = args.lr_restart_step
     match_optimizer_layout(opt)
     return opt, done, origin
 

@@ -6,6 +6,8 @@
       "init_weights": null,              # optional checkpoint whose model/EMA tensors start the run (name+shape match)
       "init_exclude": [],                # tensor-name prefixes kept at initialization
       "reset_optimizer": false,          # with --resume: fresh AdamW and LR schedule from the resumed step
+      "lr_restart_step": null,           # with --resume: warmup + cosine to training.steps restart from this update
+                                         # (<= the resumed one); AdamW moments are kept. null: the checkpoint's
       "dataset": {...},                  # the dataset configuration (data/datasets.py: version, cache_dir, sources)
       "model": {"type": "regression"},   # 'regression', 'flow' or 'sequence', plus any model field
       "training": {...},                 # optimizer, schedule, losses, sampling, task shares, DAgger, diagnostics
@@ -28,7 +30,8 @@ from vesuvius.neural_tracing.tracers.shared.retired import ANY, retire as retire
 from vesuvius.neural_tracing.tracers.shared.paths import moved_path
 
 OUT_ROOT = Path(__file__).resolve().parents[1]/'output'
-TOP_LEVEL = dict(name=None, out_root=None, init_weights=None, init_exclude=[], reset_optimizer=False)
+TOP_LEVEL = dict(name=None, out_root=None, init_weights=None, init_exclude=[], reset_optimizer=False,
+                 lr_restart_step=None)
 SECTIONS = ('dataset', 'model', 'training', 'runtime')
 
 # Training settings shared by every model type.
@@ -206,6 +209,10 @@ def validate(run):
         raise ValueError('grad_clip must be finite and nonnegative (0 disables clipping)')
     if type(r['gpus']) is not int or r['gpus'] < 1:
         raise ValueError('gpus must be a positive integer')
+    restart = run['lr_restart_step']
+    if restart is not None and (type(restart) is not int or not 0 <= restart < t['steps'] or run['reset_optimizer']):
+        raise ValueError('lr_restart_step must be an update count below training.steps, and not with reset_optimizer '
+                         '(which restarts the schedule at the resumed update)')
     if r['dagger_gpu'] is not None and (type(r['dagger_gpu']) is not int or r['dagger_gpu'] < 0):
         raise ValueError('dagger_gpu must be a nonnegative GPU index or null')
     if (r['remote_prefetch_connections'] < 0 or r['remote_prefetch_queue_size'] < 1 or r['remote_prefetch_lookahead'] < 0
