@@ -271,6 +271,21 @@ Generated files live on the **service machine**, under its Output root; the exam
 
 **Checkpoint → Save on Service** saves remotely; **Download…** copies a checkpoint to your computer. VC3D also caches downloaded display artifacts locally. Only **Commit** writes your annotation changes back into the dataset. See the [service README](https://github.com/ScrollPrize/villa/blob/main/spiral-fitting/README.md#internet-flow-ssh-attach) for connection and storage details.
 
+##### Improving the fit "interactively" 
+
+Once the spiral surface is shown in VC3D you can inspect it for mistakes. Mistakes can be grouped into a few types, and the "fixes" for these mistakes can come from many different kinds of constraints.
+
+**Sheet Switches** are areas where the spiral fit has started on one winding, lets call it winding `A`, and departs from it and continues along an adjacent winding `B`. You can fix these by either telling the spiral fit "this point continues this way" (patches, fibers), or "these two points are not the same winding" (relative winding annotations). For the most part unless relative winding annotations fall on patches (and produce links), you get more "bang for your buck" with patches or fibers in resolving these types of errors
+
+**Wandering** is when the spiral fit shifts back and forth along the normal of the surface, never adhering quite to the proper sheet and occasionally (but only briefly) falling onto an adjacent winding. These are best resolved with patches, but fibers could suffice if there is simply just a complete lack of annotation in this area. 
+
+When you identify one of these areas, and you've added your fix (in the form of some new constraint, see the keybinds above) to the live fit, it's typically good pratice to disable the "DT" losses temporarily. These losses have a tendency to make the spiral "stick" to an annotation, making it hard for it to adjust to your new annotations. The VC3D spiral workspace makes this easy, by checking the box **Restrict DT losses to final...** and entering a percentage. In this example, the fit will run for 2000 additional iterations (extending its polynomial LR decay to account for the longer horizon), with the first 75% of those iterations having its "DT" losses disabled.
+
+<div className="mb-4 max-w-[810px] mx-auto">
+  <img src="/img/tutorials/spiral-workspace/restrict-dt-losses.webp" alt="Run controls with Iterations set to 2000 and the Restrict DT losses to final checkbox enabled at 25%." className="w-[100%]" />
+  <figcaption className="mt-[-6px]">2000 more iterations, with the DT losses only active for the final 25%.</figcaption>
+</div>
+
 </TabItem>
 <TabItem value="cli" label="CLI">
 
