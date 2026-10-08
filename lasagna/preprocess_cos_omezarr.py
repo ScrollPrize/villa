@@ -225,6 +225,9 @@ class LasagnaCosPredict3DAdapter:
 	COS_PRODUCT = "cos"
 	NORMAL_PRODUCT = "lasagna_normal"
 	PRED_DT_PRODUCT = "pred_dt"
+	# UNet channels 1:8 — grad_mag plus six 3×2 direction channels — before
+	# finalize_product_slab encodes them to persisted grad_mag/nx/ny.
+	NORMAL_RAW_CHANNEL_COUNT = 7
 
 	def __init__(
 		self,
@@ -242,6 +245,12 @@ class LasagnaCosPredict3DAdapter:
 		self.cos_product = cos_product
 		self.normal_product = normal_product
 		self.pred_dt_product = pred_dt_product
+		if int(self.normal_product.raw_channel_count) != self.NORMAL_RAW_CHANNEL_COUNT:
+			raise ValueError(
+				f"normal product must accumulate {self.NORMAL_RAW_CHANNEL_COUNT} raw "
+				f"channels (grad_mag + 6 direction); got "
+				f"{self.normal_product.raw_channel_count}"
+			)
 		self.norm_type = None
 		self.upsample_mode = None
 		self.output_sigmoid = True
@@ -300,14 +309,15 @@ class LasagnaCosPredict3DAdapter:
 		output = torch.sigmoid(output) if self.output_sigmoid else output.clamp(0.0, 1.0)
 		if output.ndim != 5:
 			raise ValueError("Lasagna predict3d model output must have shape B,C,D,H,W")
-		if int(output.shape[1]) < 8:
+		raw_n = 1 + self.NORMAL_RAW_CHANNEL_COUNT
+		if int(output.shape[1]) < raw_n:
 			raise ValueError(
 				"Lasagna predict3d model output must contain at least 8 channels: "
 				"cos, grad_mag, and six direction channels"
 			)
 		return {
 			self.cos_product.name: output[:, 0:1],
-			self.normal_product.name: output[:, 1:8],
+			self.normal_product.name: output[:, 1:raw_n],
 		}
 
 	def finalize_product_slab(
@@ -323,9 +333,10 @@ class LasagnaCosPredict3DAdapter:
 				"cos": np.clip(slab[0] * 255.0, 0.0, 255.0).astype(np.uint8),
 			}
 		if product.name == self.normal_product.name:
-			if slab.ndim != 4 or int(slab.shape[0]) != 7:
+			if slab.ndim != 4 or int(slab.shape[0]) != self.NORMAL_RAW_CHANNEL_COUNT:
 				raise ValueError(
-					f"normal slab must have shape 7,D,H,W; got {slab.shape}"
+					f"normal slab must have shape {self.NORMAL_RAW_CHANNEL_COUNT},D,H,W; "
+					f"got {slab.shape}"
 				)
 			gm_u8 = np.clip(slab[0] * 1000.0, 0.0, 255.0).astype(np.uint8)
 			nx_u8, ny_u8 = encode_normal_nxny_u8(
@@ -1752,6 +1763,7 @@ def run_preprocess_3d(
 			),
 			chunk_size=oc,
 			pyramid_policy=PYRAMID_POLICY_CUSTOM,
+			accumulator_channel_count=LasagnaCosPredict3DAdapter.NORMAL_RAW_CHANNEL_COUNT,
 			inference_scaledown=other_sd,
 		),
 		pred_dt_product=(

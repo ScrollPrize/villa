@@ -6,6 +6,7 @@
 #include <limits>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -112,6 +113,12 @@ struct FiberTraceSegmentMetadata {
     std::string failureDetail;
     std::string lasagnaFailureCode;
     std::string lasagnaFailureDetail;
+    // Span tags (format version 4): sorted, unique strings that describe the
+    // span itself rather than the trace that produced it, e.g. kGapSpanTag.
+    // Serialized as "tags", omitted when empty. Survive a re-solve like
+    // interpGoal does (the tracer rebuilds the descriptor and copies them
+    // back); a span tag never encodes a value, only its presence.
+    std::vector<std::string> tags;
 };
 
 [[nodiscard]] bool isAcceptedNativeTrace(const FiberTraceSegmentMetadata& metadata) noexcept;
@@ -133,7 +140,20 @@ struct FiberTraceSegmentMetadata {
     std::string detail);
 
 struct LineControlPoint : vc::lasagna::LineControlPoint {
+    std::optional<cv::Vec3d> direction;
+    std::optional<cv::Vec3d> displayNormal;
+    std::string displayNormalSource = "unknown";
     std::optional<FiberTraceSegmentMetadata> segmentToNext;
+    // Per-control-point tags (see kKollesisTerminationTag). Sorted, unique,
+    // non-empty; they belong to the point itself and travel with it through
+    // every edit, unlike segmentToNext which belongs to the span.
+    std::vector<std::string> tags;
+    // Session-lifetime identity of this control, assigned by the controller
+    // the first time the control is published (0 until then) and carried
+    // through every edit with the struct, so views can tell "the same
+    // control" across publishes without comparing points or indices.
+    // Mutable: assigned lazily from the const publish path. Not persisted.
+    mutable uint64_t identity = 0;
 
     LineControlPoint() = default;
     LineControlPoint(double linePositionValue, cv::Vec3d volumePointValue, bool isSeedValue, int optimizedIndexValue)
@@ -145,6 +165,13 @@ struct LineControlPoint : vc::lasagna::LineControlPoint {
     }
     explicit LineControlPoint(const vc::lasagna::LineControlPoint& value) : vc::lasagna::LineControlPoint(value) {}
 };
+
+inline void clearControlPointCorrections(LineControlPoint& control)
+{
+    control.direction.reset();
+    control.displayNormal.reset();
+    control.displayNormalSource = "unknown";
+}
 
 struct ControlPointCollapseResult {
     std::vector<LineControlPoint> controlPoints;
@@ -209,7 +236,13 @@ struct PreparedControlPointEdit {
     double linePosition);
 
 struct StoredControlPoint : cv::Vec3d {
+    std::optional<cv::Vec3d> direction;
+    std::optional<cv::Vec3d> displayNormal;
+    std::string displayNormalSource = "unknown";
     std::optional<FiberTraceSegmentMetadata> segmentToNext;
+    // Serialized as the control point's optional "tags" array; omitted when
+    // empty so untagged fibers are written exactly as before.
+    std::vector<std::string> tags;
 
     StoredControlPoint() = default;
     explicit StoredControlPoint(const cv::Vec3d& position) : cv::Vec3d(position) {}
@@ -220,6 +253,95 @@ struct StoredControlPoint : cv::Vec3d {
 // sync. A toolbar interpolation-mode switch strips it on the save after a
 // successful re-optimization; nothing else touches it programmatically.
 inline constexpr const char* kReviewedTag = "reviewed";
+
+// Per-control-point tag: the point marks where the fiber terminates at a
+// kollesis (sheet join). Set from the control point context menu; rendered
+// pale yellow in the line annotation views and the Fiber Map.
+inline constexpr const char* kKollesisTerminationTag = "kollesis_termination";
+
+// Per-control-point tag: the point sits at the edge of a break in the papyrus.
+// Any control point may carry it. A span whose two endpoints (neighbours in
+// line order) both carry it is a gap span; VC3D records that on the span
+// itself as kGapSpanTag (see syncGapSpanTags) and everything that shows or
+// enforces a gap reads the span tag, never the pair of points. A point
+// carries either this tag or kKollesisTerminationTag, never both.
+inline constexpr const char* kBreakTag = "break";
+
+// Span tag (FiberTraceSegmentMetadata::tags): the span bridges a gap in the
+// papyrus. Written by VC3D exactly when both endpoint controls carry
+// kBreakTag, kept in step by syncGapSpanTags after every edit and healed on
+// load, so a reader of the file learns the gap from the span alone. A gap
+// span draws as a dotted amber line, is closed to control point placement
+// until a break is removed, and takes the cubic-spline goal when it forms.
+inline constexpr const char* kGapSpanTag = "gap";
+
+// Span tag: the span follows the fiber correctly, but the papyrus there is
+// damaged, so the section is worth knowing about later. Set from the span
+// menu; changes nothing about the points, the goal or the geometry. Drawn as
+// alternating amber and red dashes. Never on a gap span (a gap wins: making
+// a span a gap clears this tag).
+inline constexpr const char* kDamagedSpanTag = "damaged";
+
+// The vc3d_fiber format version VC3D writes. Version 4 is version 3 plus the
+// optional span `tags` array; a version-3 span carrying tags is rejected so
+// the version is a true signal of what a file may contain.
+inline constexpr int kFiberFormatVersion = 4;
+
+// Sorted-unique tag list helpers shared by the stored and session control
+// point types. controlPointTagsFromJson rejects anything but an array of
+// strings; blank entries are dropped.
+[[nodiscard]] bool hasControlPointTag(const std::vector<std::string>& tags,
+                                      std::string_view tag) noexcept;
+// Returns true when the list changed.
+bool setControlPointTag(std::vector<std::string>& tags, std::string_view tag, bool enabled);
+[[nodiscard]] std::vector<std::string> mergedControlPointTags(
+    const std::vector<std::string>& lhs, const std::vector<std::string>& rhs);
+[[nodiscard]] std::vector<std::string> controlPointTagsFromJson(const nlohmann::json& json);
+// True when tags carry both kKollesisTerminationTag and kBreakTag. The two are
+// mutually exclusive on a point: a toggle that would add the second, and a
+// click collapse whose tag union would combine them, are refused.
+[[nodiscard]] bool controlPointTagsConflict(const std::vector<std::string>& tags) noexcept;
+
+// The gap spans of a session's controls: consecutive controls IN LINE-POSITION
+// ORDER (the order the overlays, the placement gate and the goal owner rule
+// all use; a session's vector can be out of line order after a reopen) that
+// both carry kBreakTag. Each pair is (index of the lower-position control,
+// index of the other); the first is the span's owner for interpolation-goal
+// purposes, as handleGeneratedSegmentInterpolationGoal picks it. Controls
+// without a finite line position take no part.
+[[nodiscard]] std::vector<std::pair<size_t, size_t>> gapSpansForControls(
+    const std::vector<LineControlPoint>& controls);
+
+// Puts kGapSpanTag on exactly the spans whose two endpoints carry kBreakTag
+// and removes it everywhere else, so the span tags always agree with the
+// point tags in anything VC3D holds or writes. The session overload pairs
+// neighbours in line order (gapSpansForControls) and reports the owners whose
+// gap formed or dissolved so the caller can apply the goal policy; a span
+// owner without a descriptor gets the default Lasagna one. The stored overload
+// pairs by index (stored controls are in line order by contract) and returns
+// whether anything changed.
+struct GapSpanSync {
+    std::vector<size_t> formed;
+    std::vector<size_t> dissolved;
+    [[nodiscard]] bool changed() const noexcept { return !formed.empty() || !dissolved.empty(); }
+};
+GapSpanSync syncGapSpanTags(std::vector<LineControlPoint>& controls);
+bool syncGapSpanTags(std::vector<StoredControlPoint>& controls);
+// syncGapSpanTags plus the gap goal policy for a structural edit that is
+// about to re-solve anyway: a span whose gap formed takes the cubic-spline
+// goal, one whose gap dissolved while still cspline returns to global (any
+// other goal is left alone). The break toggle applies the same policy through
+// the controller's goal path so it can start the re-solve itself.
+GapSpanSync applyGapSpanPolicy(std::vector<LineControlPoint>& controls);
+// The same for stored controls (a merge's or split's result, held in memory
+// before it is saved): pairs by index, returns whether anything changed.
+bool applyGapSpanPolicy(std::vector<StoredControlPoint>& controls);
+// Whether the span owned by `control` is a gap span (carries kGapSpanTag).
+[[nodiscard]] bool spanIsGap(const std::optional<FiberTraceSegmentMetadata>& metadata) noexcept;
+[[nodiscard]] bool spanIsDamaged(const std::optional<FiberTraceSegmentMetadata>& metadata) noexcept;
+// Sets or clears a span tag on the span descriptor. Never creates a
+// descriptor (a control without one owns no span). Returns whether it changed.
+bool setSpanTag(std::optional<FiberTraceSegmentMetadata>& metadata, std::string_view tag, bool enabled);
 
 enum class FiberTraceState {
     Legacy,       // no prediction-traced spans in the stored geometry
@@ -292,7 +414,10 @@ struct FiberModeOptimizationResult {
     FiberModeOptimizationRequest request);
 
 [[nodiscard]] nlohmann::json fiberTraceSegmentMetadataToJson(const FiberTraceSegmentMetadata& metadata);
-[[nodiscard]] FiberTraceSegmentMetadata fiberTraceSegmentMetadataFromJson(const nlohmann::json& json);
+// fiberVersion: the file's vc3d_fiber version; span tags are accepted from
+// version 4 on and rejected as an unknown field before that.
+[[nodiscard]] FiberTraceSegmentMetadata fiberTraceSegmentMetadataFromJson(const nlohmann::json& json,
+                                                                          int fiberVersion = kFiberFormatVersion);
 [[nodiscard]] nlohmann::json storedControlPointToJson(const StoredControlPoint& control);
 [[nodiscard]] StoredControlPoint storedControlPointFromJson(const nlohmann::json& json, int fiberVersion);
 

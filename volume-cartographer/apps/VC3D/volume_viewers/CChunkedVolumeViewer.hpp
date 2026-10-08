@@ -235,7 +235,7 @@ public:
     }
 
     std::optional<SurfaceProjection> projectVolumePoint(
-        const cv::Vec3f& volPoint) const override;
+        const cv::Vec3f& volPoint, float depthTolerance) const override;
     QPointF surfaceProjectionToScene(const SurfaceProjection& projection) const override;
     SurfaceProjectionContext surfaceProjectionContext() const override;
     QPointF volumeToScene(const cv::Vec3f& volPoint) override;
@@ -258,6 +258,7 @@ public:
     // DISPLAYED frame was rendered from the current surface geometry (stale
     // in-flight frames adopt with an older epoch).
     std::uint64_t surfaceGeometryEpoch() const { return _surfaceGeometryEpoch; }
+    bool hasDisplayedRenderFrame() const { return _displayedRenderJob.has_value(); }
     std::uint64_t displayedSurfaceGeometryEpoch() const
     {
         return _displayedRenderJob ? _displayedRenderJob->surfaceGeometryEpoch : 0;
@@ -281,6 +282,9 @@ public:
         QObject* receiver, const std::function<void()>& callback) override {
         return connect(this, &CChunkedVolumeViewer::overlaysUpdated, receiver, callback);
     }
+    // Re-runs every connectOverlaysUpdated callback: for a data change the
+    // viewer itself cannot see (an overlay's source edited elsewhere).
+    void refreshOverlays() { if (_closing) return; emit overlaysUpdated(); }
     void reloadPerfSettings() override;
     void setSurfaceCacheBudgets(std::size_t baseBytes, std::size_t overlayBytes) override;
     void setPreferSurfaceTileFills(bool enabled) override;

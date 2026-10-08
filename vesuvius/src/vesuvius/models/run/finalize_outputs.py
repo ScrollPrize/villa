@@ -581,7 +581,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main():
     """Entry point for the vesuvius.finalize command."""
-    args = build_parser().parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
 
     # Validate partitioning arguments
     if args.part_id < 0 or args.part_id >= args.num_parts:

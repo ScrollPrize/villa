@@ -76,6 +76,30 @@ vc::lasagna::LineViewConfig tenVoxelRibbonConfig()
 
 } // namespace
 
+TEST_CASE("Stored curves can be inspected without a sheet-normal field")
+{
+    for (int axis = 0; axis < 3; ++axis) {
+        std::vector<cv::Vec3d> points(6, {3.0, 5.0, 7.0});
+        for (size_t i = 0; i < points.size(); ++i)
+            points[i][axis] += 10.0 * i;
+        points[3] = points[2]; // Repeated points are legal collection geometry.
+        const auto line = vc::lasagna::lineModelForInspection(points);
+        REQUIRE(line.points.size() == points.size());
+        for (size_t i = 0; i < points.size(); ++i)
+            CHECK(line.points[i].position == points[i]);
+        const auto views = vc::lasagna::buildLineViewSurfaces(line);
+        REQUIRE(views.lineSurface);
+        REQUIRE(views.lineSideSlice);
+        REQUIRE(views.lineUpVectors.size() == points.size());
+        for (const auto& up : views.lineUpVectors) {
+            CHECK(finitePoint(up));
+            CHECK(cv::norm(up) == doctest::Approx(1.0));
+        }
+    }
+    CHECK_THROWS_AS(vc::lasagna::lineModelForInspection({}), std::invalid_argument);
+    CHECK_THROWS_AS(vc::lasagna::lineModelForInspection({{NAN, 0, 0}}), std::invalid_argument);
+}
+
 TEST_CASE("LineViewBuilder creates ribbons from annotation control-point spans")
 {
     const auto views = vc::lasagna::buildLineViewSurfaces(simpleLine(), tenVoxelRibbonConfig());

@@ -21,7 +21,6 @@ from fit_spiral import (
     _UnattachedPclStripList,
     get_dt_loss_eligibility,
     get_unattached_pcl_dt_start,
-    get_progressive_dt_max_winding,
     get_run_dt_resume_iteration,
     materialize_fiber_fit_inputs,
 )
@@ -46,13 +45,11 @@ class RunDtLossScheduleTests(unittest.TestCase):
         cfg = Config({
             'loss_start_patch_dt': 10,
             'loss_start_track_dt': 20,
-            'loss_start_unverified_patch_dt': 30,
             'loss_start_unattached_pcl_dt': 25,
         }).as_dict()
         resume = 15
         self.assertEqual(get_dt_loss_eligibility(cfg, 14, resume), {
             'verified_patch': False,
-            'unverified_patch': False,
             'track': False,
             'unattached_pcl': False,
         })
@@ -61,7 +58,6 @@ class RunDtLossScheduleTests(unittest.TestCase):
         self.assertTrue(at_starts['verified_patch'])
         self.assertFalse(at_starts['unattached_pcl'])
         self.assertFalse(at_starts['track'])
-        self.assertFalse(at_starts['unverified_patch'])
         self.assertFalse(get_dt_loss_eligibility(cfg, 25, resume)['unattached_pcl'])
         self.assertTrue(get_dt_loss_eligibility(cfg, 26, resume)['unattached_pcl'])
         after_all = get_dt_loss_eligibility(cfg, 31, resume)
@@ -78,16 +74,6 @@ class RunDtLossScheduleTests(unittest.TestCase):
         self.assertEqual(get_unattached_pcl_dt_start(decoupled), 0)
         self.assertTrue(get_dt_loss_eligibility(decoupled, 1)['unattached_pcl'])
         self.assertFalse(get_dt_loss_eligibility(decoupled, 1)['verified_patch'])
-
-    def test_progressive_winding_cutoff_is_unchanged(self):
-        cfg = Config({
-            'dt_progressive_windings': True,
-            'dt_progressive_inner_winding': 20,
-            'dt_progressive_steps': 100,
-            'dt_progressive_exponent': 1.0,
-        }).as_dict()
-        self.assertEqual(
-            get_progressive_dt_max_winding(cfg, 60, 10, 120), 70.0)
 
 
 class FiberPointCollectionTests(unittest.TestCase):
@@ -132,6 +118,23 @@ class FiberPointCollectionTests(unittest.TestCase):
 
             points = [point["p"] for point in collection["points"].values()]
             np.testing.assert_array_equal(points, [[1, 2, 3], [5, 6, 7]])
+
+    def test_ignores_adjacent_links_unsupported_by_spiral_fitting(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = self._write_fiber(temporary, {
+                "control_points": [[4, 8, 12], [20, 24, 28]],
+                "line_points": [[4, 8, 12], [20, 24, 28]],
+                "adjacent_branches": [{
+                    "branch_file": "peer.json",
+                    "control_point_index": 0,
+                    "branch_control_point_index": 1,
+                }],
+            })
+
+            collection = load_fiber_point_collection(
+                path, collection_id=7, min_point_spacing=0)
+
+            self.assertEqual(collection["branches"], [])
 
     def test_declared_coordinate_domain_overrides_legacy_scale(self):
         for shape, expected_scale in (([101, 201, 301], 1),
@@ -330,7 +333,6 @@ class FiberPointCollectionTests(unittest.TestCase):
         context._trusted_geometry_from_active_inputs = mock.Mock(
             return_value=torch.empty((0, 3)))
         context.run_dt_resume_iteration = None
-        context.influence_state = None
         return context
 
 
@@ -428,9 +430,7 @@ class ShellOuterWindingIdxResolutionTests(unittest.TestCase):
             (
                 'loss_weight_dense_normals',
                 'loss_weight_dense_spacing',
-                'loss_weight_dense_spacing_count',
                 'loss_weight_dense_spacing_density',
-                'loss_weight_dense_attachment',
                 'loss_weight_min_spacing',
                 'loss_weight_sym_dirichlet',
             ))

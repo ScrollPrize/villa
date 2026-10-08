@@ -1,44 +1,36 @@
 # Plan
 
-1. Use the existing cache mutex for every derived-cache reset. Snapshot normal
-   and validity matrices under that mutex, including the validity fast-path
-   flag, before reading outside the lock. Do not serialize whole renders.
-   Use a private validity snapshot helper shared with validMask(); never nest
-   acquisitions of the non-recursive cache mutex. ensureLoaded() precedes cache
-   locking; any nested locks retain load-mutex then cache-mutex ordering.
-2. Keep point storage, geometry mutation, channel I/O, scheduling and numerical
-   algorithms unchanged. Concurrent point edits/unloading are not made safe by
-   this cache-only fix.
-3. Add a focused concurrent invalidation/render test with exact output checks,
-   including repository TIFFXYZ fixtures. Exercise cache rebuilds and retained
-   snapshots; test the unpatched implementation as a negative control.
-4. Build with 32 jobs and existing dependencies only. Run focused QuadSurface
-   tests and repeated offscreen RPC smoke runs, including four-CPU runs.
-5. Obtain independent plan and code review. Present the PR draft for approval;
-   do not create the PR before approval.
+1. Add independent raw-volume and segment filters, preserving existing selection semantics.
+2. Add fresh project name/destination options to shared creation: bypass cached full-sample projects.
+3. Create Project beside Open Sample: initially unchecked resources grouped by
+   representation type; checkable individual entries and select all/none, name and destination browser;
+   confirm overwrite, then use existing asynchronous opening and session-save gates.
+4. Test empty selection, independent predictions, segment filtering, saved name/path
+   and isolation from cached projects. Verify immediate opening, cancellation and
+   save failure without closing the active project. Build VC3D and run catalog tests.
+5. Preserve representation coordinate metadata and channel attachments, but do
+   not attach unselected scans or rebased source views in selective creation.
+   Selected segments attach individual directories, not aggregate cache
+   roots, and must not mark unselected cached segments orphaned.
 
-## Specification Updates
+## Spec update
 
-Document derived-cache snapshot lifetime and invalidation requirements in
-specs/rendering.md. No render cancellation or geometry-edit contract change.
+Follow-up: extract annotation fiber-path naming into one shared helper, use it
+in catalog and ordinary new-project creation, and test empty-directory creation
+and preservation of existing contents.
 
-## Documentation Updates
+Document selective creation, empty defaults, required coordinate dependencies and global cache reuse.
 
-Correct cache ownership and synchronization comments in QuadSurface.hpp.
-Record reproduction, validation and remaining limitations in task_log.md.
+## Docs updates
 
-## Testing And Validation
+Add catalog usage documentation and validation log.
 
-Compare coordinates, normals and masks against a serial baseline; include
-concurrent renders and cache clears. Reuse the actual smoke test and record
-failures rather than increasing its timeout. A stress test is not a proof of
-all schedules; source-level locking review is also required.
-Preload fixtures, clone serial render baselines (gen returns TLS views), and
-compare exact finite values and NaN positions. Include all-valid components,
-invalid points, strict validity, normals omitted/requested and depth offsets.
-Only cache-only operations run concurrently. Geometry invalidation, lazy loading,
-channel access and point eviction remain excluded from the concurrent contract.
+## Changelog
 
-## Changelog Update
+Record new selective project creation action.
 
-Add one dated summary line after validation.
+## Review
+
+Independent review against task, spec and overarching plan before implementation.
+Reviewer identified dependency semantics and cancellation/save-failure coverage;
+these are explicit above. The render efficiency plan remains unchanged.

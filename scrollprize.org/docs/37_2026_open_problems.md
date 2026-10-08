@@ -250,7 +250,7 @@ The areas we most often see this type of problem are:
 * **compressed regions**, where the image itself gives weak or ambiguous evidence;    
 * **damaged regions**, where the physical papyrus is torn, folded, or missing.
 
-These errors determine whether a flattened rendering shows a coherent writing surface or a corrupted one. The community has since built automatic tools that specifically target this failure list:
+These errors determine whether a flattened rendering shows a coherent writing surface or a corrupted one. We greatly value community contributions that help us trace sheets more accurately, avoiding these failure cases.
 
 <Admonition type="tip" icon="🙋" title="How you can help">
 
@@ -647,7 +647,7 @@ The result is released as [fiber\_ink\_4class\_selfdistill](https://huggingface.
 Sections [2](#2-unwrapping-turning-disconnected-voxels-into-a-surface) and [3](#3-ink-recovery-reading-the-scrolls) above introduced mesh tracing, approximate labels, fiber connectivity, and 3D ink segmentation — and along the way, six 🙋 callouts pointed out where the community can make the most difference:
 
 * **Create datasets** with labels better localized on the papyrus’ recto **or train ML models** that can better preserve the sheets’ topology (See the 🙋 callout in ["Surface prediction"](#surface-prediction), Section 2.)  
-* **If you know classical geometry, optimization, or C++:** help with automatic topology repair — building tools that catch mesh-tracing errors like holes, mergers, and sheet switches without a human checking every traced piece of surface by hand. (See the 🙋 callout in ["Meshes: adding connectivity"](#meshes-adding-connectivity), Section 2.)  
+* **If you know classical geometry, optimization, or C++:** help with building tools that avoid mesh-tracing errors like holes, mergers, and sheet switches without a human checking and fixing every traced piece of surface by hand. (See the 🙋 callout in ["Meshes: adding connectivity"](#meshes-adding-connectivity), Section 2.)  
 * **If you have experience with 3D annotation, active learning, or data-quality work:** help improve surface supervision. The labels 3D models learn from are still approximate, and a smaller set of precise labels in the hardest regions may matter more than a larger set of easy ones. (See the 🙋 callout in ["Label quality: one of the main unwrapping bottlenecks"](#label-quality-one-of-the-main-unwrapping-bottlenecks), Section 2.)
 * **If you know classical computer vision or fiber/curve-following techniques:** help with conservative fiber tracing — following individual papyrus fibers reliably across long distances to give the pipeline connectivity clues it otherwise lacks. (See the 🙋 callout in ["Fibers as connectivity clues"](#fibers-as-connectivity-clues), Section 2.)  
 * Devise better **evaluation suites and loss functions to improve the global spiral fit**, or find efficient and automated ways to introduce exploitable prior information.  
@@ -662,7 +662,7 @@ The pipeline works, but not without a person checking its output at almost every
 | Compressed or highly curved regions | Some regions lose effective separability between layers. | Better scan regimes, smaller voxel size, shorter propagation distance, phase retrieval. | Scan-quality metrics, and scroll-specific acquisition recipes. |
 | No built-in connectivity | CT gives voxels, not sheets or graphs. | Surface prediction plus mesh tracing. | Better geometry priors, fiber tracing, and topology-aware tools. |
 | Approximate surface labels | Human-created meshes are useful but not voxel-exact. | Train 3D surface models from approximate annotations. | Label snapping, active learning, self-supervised approaches. |
-| Sheet switches | Meshes can jump from one wrap to another. | VC3D inspection and manual correction. | Stronger local continuity constraints and conservative failure detection. |
+| Sheet switches | Meshes can jump from one wrap to another. | VC3D inspection and manual correction. | Smarter surface tracing algorithms that avoid introducing sheet switches. |
 | Ink depth ambiguity | Fragment photos give 2D labels, not exact 3D ink positions. | Surface-conditioned 3D input with 2D output. | Direct 3D ink segmentation where possible. |
 | Cross-scroll generalization | Ink models may work on one scroll but not another. | Fragment training plus scroll-specific pseudo-labeling. | Multi-scroll training, better labels, stronger diagnostics. |
 | Data scale | Scroll volumes are too large for ordinary local workflows. | OME-Zarr, chunked processing, cloud storage. | Reproducible streaming pipelines and cheaper compute/storage paths. |

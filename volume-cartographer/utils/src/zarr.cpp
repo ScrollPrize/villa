@@ -8,9 +8,82 @@
 #  include <sys/mman.h>
 #  include <sys/stat.h>
 #  include <unistd.h>
+#  include <cerrno>
 #endif
 
 namespace utils {
+
+namespace {
+
+// One open descriptor on a file, with the size taken from that descriptor
+// (fstat), not from a separate stat by path. Opened under a shard lock, the
+// size and every read_at() see the same file: a trailing index cannot move
+// between locating it and reading it.
+class OpenFile {
+public:
+    explicit OpenFile(const std::filesystem::path& p) {
+#if !defined(_WIN32)
+        fd_ = ::open(p.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd_ < 0) return;
+        struct stat st;
+        if (::fstat(fd_, &st) < 0 || st.st_size < 0) return;
+        size_ = static_cast<std::uint64_t>(st.st_size);
+#else
+        f_.open(p, std::ios::binary | std::ios::ate);
+        if (!f_) return;
+        const auto end = f_.tellg();
+        if (end < 0) return;
+        size_ = static_cast<std::uint64_t>(end);
+#endif
+        ok_ = true;
+    }
+    ~OpenFile() {
+#if !defined(_WIN32)
+        if (fd_ >= 0) ::close(fd_);
+#endif
+    }
+    OpenFile(const OpenFile&) = delete;
+    OpenFile& operator=(const OpenFile&) = delete;
+
+    [[nodiscard]] bool ok() const noexcept { return ok_; }
+    [[nodiscard]] std::uint64_t size() const noexcept { return size_; }
+#if !defined(_WIN32)
+    [[nodiscard]] int fd() const noexcept { return fd_; }
+#endif
+
+    // Exactly n bytes at off, or false (short file, I/O error).
+    [[nodiscard]] bool read_at(std::uint64_t off, void* buf, std::size_t n) {
+        if (off > size_ || n > size_ - off) return false;
+#if !defined(_WIN32)
+        auto* out = static_cast<char*>(buf);
+        while (n > 0) {
+            const auto got = ::pread(fd_, out, n, static_cast<off_t>(off));
+            if (got < 0 && errno == EINTR) continue;
+            if (got <= 0) return false;
+            out += got;
+            off += static_cast<std::uint64_t>(got);
+            n -= static_cast<std::size_t>(got);
+        }
+        return true;
+#else
+        f_.clear();
+        f_.seekg(static_cast<std::streamoff>(off));
+        f_.read(static_cast<char*>(buf), static_cast<std::streamsize>(n));
+        return static_cast<bool>(f_);
+#endif
+    }
+
+private:
+    bool ok_ = false;
+    std::uint64_t size_ = 0;
+#if !defined(_WIN32)
+    int fd_ = -1;
+#else
+    std::ifstream f_;
+#endif
+};
+
+} // namespace
 
 // ---------------------------------------------------------------------------
 // JSON wrapper functions
@@ -85,6 +158,8 @@ ZarrMetadata parse_zarray(std::string_view json_str) {
                 meta.compression_level = cl->get_int();
             else if (auto* lv = json_find(*p, "level"); lv && lv->is_number())
                 meta.compression_level = lv->get_int();
+            if (auto* q = json_find(*p, "q"); q && q->is_number())
+                meta.codec_q = static_cast<float>(q->get_double());
         }
     }
 
@@ -181,7 +256,10 @@ ZarrMetadata parse_zarr_json(std::string_view json_str) {
                 if (auto* cs = json_find(cfg, "chunk_shape"); cs && cs->is_array())
                     for (const auto& v : (*cs))
                         sc.sub_chunks.push_back(v.get_size_t());
-                // index_location is always "start" — ignore any "end" values
+                if (auto* il = json_find(cfg, "index_location"); il && il->is_string())
+                    sc.index_location = il->get_string();
+                if (sc.index_location != "start" && sc.index_location != "end")
+                    throw std::runtime_error("zarr: unsupported sharding index_location: " + sc.index_location);
                 if (auto* ic = json_find(cfg, "index_codecs"); ic && ic->is_array())
                     for (const auto& icv : (*ic))
                         if (icv.is_object()) sc.index_codecs.push_back(parse_codec_config(icv));
@@ -265,7 +343,7 @@ std::string serialize_zarr_json(const ZarrMetadata& meta) {
                     sub_cs.push_back(JsonValue(c));
                 sc_cfg["chunk_shape"] = JsonValue(std::move(sub_cs));
             }
-            sc_cfg["index_location"] = JsonValue("start");
+            sc_cfg["index_location"] = JsonValue(meta.shard_config->index_location);
 
             {
                 JsonArray idx_codecs;
@@ -689,17 +767,45 @@ bool ZarrArray::needs_byteswap() const noexcept {
 }
 
 std::optional<std::vector<std::byte>>
+ZarrArray::extract_inner_chunk_raw(std::span<const std::byte> shard_data,
+                                   std::span<const std::size_t> inner_indices) const {
+    const auto& sc = *meta_.shard_config;
+    const auto n_inner = meta_.total_sub_chunks_per_shard();
+    const std::size_t index_total = sc.index_bytes(n_inner);
+    if (shard_data.size() < index_total) return std::nullopt;
+    std::span<const std::byte> index_data = sc.index_at_end()
+        ? shard_data.subspan(shard_data.size() - index_total, n_inner * 16)
+        : shard_data.subspan(0, n_inner * 16);
+    std::size_t linear = 0, stride = 1;
+    for (std::size_t d = inner_indices.size(); d-- > 0;) {
+        linear += inner_indices[d] * stride;
+        stride *= meta_.sub_chunks_per_shard(d);
+    }
+    if (linear >= n_inner) return std::nullopt;
+    const std::uint64_t offset = detail::read_le64(index_data.data() + linear * 16);
+    const std::uint64_t nbytes = detail::read_le64(index_data.data() + linear * 16 + 8);
+    if (offset == ~std::uint64_t(0) || nbytes == 0) return std::nullopt;
+    if (offset > shard_data.size() || nbytes > shard_data.size() - offset) return std::nullopt;
+    return std::vector<std::byte>(shard_data.begin() + static_cast<std::ptrdiff_t>(offset),
+                                  shard_data.begin() + static_cast<std::ptrdiff_t>(offset + nbytes));
+}
+
+std::optional<std::vector<std::byte>>
 ZarrArray::extract_inner_chunk(std::span<const std::byte> shard_data,
                                std::span<const std::size_t> inner_indices) const {
     const auto& sc = *meta_.shard_config;
     const auto n_inner = meta_.total_sub_chunks_per_shard();
     const std::size_t index_size = n_inner * 16;
+    const std::size_t index_total = sc.index_bytes(n_inner);
 
-    if (shard_data.size() < index_size)
+    if (shard_data.size() < index_total)
         throw std::runtime_error("zarr: shard too small to contain index");
 
-    // Index is always at the start of the shard.
-    std::span<const std::byte> index_data = shard_data.subspan(0, index_size);
+    // The index (16 bytes per inner chunk, optionally followed by a crc32c
+    // checksum) sits at the start or the end of the shard per index_location.
+    std::span<const std::byte> index_data = sc.index_at_end()
+        ? shard_data.subspan(shard_data.size() - index_total, index_size)
+        : shard_data.subspan(0, index_size);
 
     std::vector<std::byte> decoded_index;
     if (!sc.index_codecs.empty()) {
@@ -742,7 +848,8 @@ ZarrArray::extract_inner_chunk(std::span<const std::byte> shard_data,
         throw std::runtime_error("zarr: inner chunk index out of range");
 
     const auto& entry = index.entries[linear];
-    if (entry.is_missing()) return std::nullopt;
+    // Missing, or the (0xFF..FE, 0) known-empty sentinel: no stored bytes.
+    if (entry.is_missing() || entry.nbytes == 0) return std::nullopt;
 
     if (entry.offset + entry.nbytes > shard_data.size())
         throw std::runtime_error("zarr: inner chunk offset/size exceeds shard data");
@@ -1017,6 +1124,25 @@ bool is_canonical_c3d(const ZarrMetadata& m) noexcept {
     return true;
 }
 
+bool is_canonical_volcomp(const ZarrMetadata& m) noexcept {
+    if (m.dtype != ZarrDtype::uint8 || m.ndim() != 3) return false;
+    auto has_volcomp = [](const std::vector<ZarrCodecConfig>& cs) {
+        for (const auto& c : cs) if (c.name == "volcomp") return true;
+        return false;
+    };
+    if (m.shard_config) {
+        const auto& sc = *m.shard_config;
+        if (sc.sub_chunks.size() != 3) return false;
+        for (std::size_t d = 0; d < 3; ++d)
+            if (sc.sub_chunks[d] != 128 || m.chunks[d] % 128 != 0) return false;
+        return has_volcomp(sc.sub_codecs);
+    }
+    if (m.chunks.size() != 3) return false;
+    for (std::size_t d = 0; d < 3; ++d)
+        if (m.chunks[d] != 128) return false;
+    return m.compressor_id == "volcomp" || has_volcomp(m.codecs);
+}
+
 // ---------------------------------------------------------------------------
 // Store
 // ---------------------------------------------------------------------------
@@ -1029,6 +1155,15 @@ Store::get_partial(const std::string& key, std::size_t offset, std::size_t lengt
     auto end = std::min(offset + length, data->size());
     return std::vector<std::byte>(data->begin() + static_cast<std::ptrdiff_t>(offset),
                                    data->begin() + static_cast<std::ptrdiff_t>(end));
+}
+
+std::optional<Store::TrailingRange>
+Store::get_trailing_range(const std::string& key, std::size_t from_end, std::size_t length) const {
+    auto size = size_of(key);
+    if (!size || *size < from_end) return std::nullopt;
+    auto bytes = get_partial(key, *size - from_end, length);
+    if (!bytes) return std::nullopt;
+    return TrailingRange{*size, std::move(*bytes)};
 }
 
 // ---------------------------------------------------------------------------
@@ -1075,6 +1210,25 @@ FileSystemStore::get_partial(const std::string& key, std::size_t offset, std::si
     std::vector<std::byte> buf(actual_len);
     f.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(actual_len));
     return buf;
+}
+
+std::optional<std::size_t> FileSystemStore::size_of(const std::string& key) const {
+    std::error_code ec;
+    auto sz = std::filesystem::file_size(safe_path(key), ec);
+    if (ec) return std::nullopt;
+    return static_cast<std::size_t>(sz);
+}
+
+std::optional<Store::TrailingRange>
+FileSystemStore::get_trailing_range(const std::string& key, std::size_t from_end,
+                                    std::size_t length) const {
+    OpenFile f(safe_path(key));   // size and bytes through one descriptor
+    if (!f.ok() || f.size() < from_end) return std::nullopt;
+    const std::uint64_t at = f.size() - from_end;
+    const auto n = static_cast<std::size_t>(std::min<std::uint64_t>(length, f.size() - at));
+    std::vector<std::byte> buf(n);
+    if (n && !f.read_at(at, buf.data(), n)) return std::nullopt;
+    return TrailingRange{static_cast<std::size_t>(f.size()), std::move(buf)};
 }
 
 void FileSystemStore::set(const std::string& key, std::span<const std::byte> value) {
@@ -1153,6 +1307,12 @@ HttpStore::get_partial(const std::string& key, std::size_t offset, std::size_t l
     auto resp = client_->get_range(make_url(key), offset, length);
     if (!resp.ok()) return std::nullopt;
     return std::move(resp.body);
+}
+
+std::optional<std::size_t> HttpStore::size_of(const std::string& key) const {
+    auto resp = client_->head(make_url(key));
+    if (!resp.ok() || resp.content_length == 0) return std::nullopt;
+    return resp.content_length;
 }
 
 std::string HttpStore::make_url(const std::string& key) const {
@@ -1241,6 +1401,21 @@ std::uint64_t read_le64(const std::byte* src) {
     return val;
 }
 
+std::uint32_t crc32c(std::span<const std::byte> data) noexcept {
+    static const auto table = [] {
+        std::array<std::uint32_t, 256> t{};
+        for (std::uint32_t i = 0; i < 256; ++i) {
+            std::uint32_t c = i;
+            for (int k = 0; k < 8; ++k) c = (c & 1u) ? (c >> 1) ^ 0x82F63B78u : c >> 1;
+            t[i] = c;
+        }
+        return t;
+    }();
+    std::uint32_t c = ~0u;
+    for (auto b : data) c = table[(c ^ static_cast<std::uint8_t>(b)) & 0xFFu] ^ (c >> 8);
+    return ~c;
+}
+
 std::vector<std::byte> ShardIndex::serialize() const {
     std::vector<std::byte> buf(entries.size() * 16);
     for (std::size_t i = 0; i < entries.size(); ++i) {
@@ -1302,6 +1477,9 @@ std::string serialize_zarray(const ZarrMetadata& meta) {
     } else if (meta.compressor_id == "lz4") {
         s += "  \"compressor\": {\"id\": \"lz4\", \"acceleration\": "
              + std::to_string(meta.compression_level) + "},\n";
+    } else if (meta.compressor_id == "volcomp") {
+        s += "  \"compressor\": {\"id\": \"volcomp\", \"q\": "
+             + std::to_string(meta.codec_q.value_or(8.0f)) + "},\n";
     } else {
         // zstd, gzip, zlib, bz2, ...
         s += "  \"compressor\": {\"id\": \"" + meta.compressor_id + "\", \"level\": "
@@ -1705,6 +1883,14 @@ void ZarrArray::write_chunk(std::span<const std::size_t> chunk_indices,
         write_data = buf;
     }
 
+    // A sharded array's chunks are inner chunks: refuse an unwritable index
+    // before encoding anything, and never write a bare chunk at a shard key.
+    if (is_sharded()) {
+        check_shard_index_writable();
+        if (store_)
+            throw std::runtime_error("zarr: writing inner chunks of a sharded array needs a local array");
+    }
+
     // Compress.
     std::vector<std::byte> compressed;
     if (codec_.compress && needs_compression()) {
@@ -1712,7 +1898,10 @@ void ZarrArray::write_chunk(std::span<const std::size_t> chunk_indices,
         write_data = compressed;
     }
 
-    write_chunk_raw(chunk_indices, write_data);
+    if (is_sharded())
+        write_inner_chunk_to_shard(chunk_indices, write_data);
+    else
+        write_chunk_raw(chunk_indices, write_data);
 }
 
 bool ZarrArray::chunk_exists(std::span<const std::size_t> chunk_indices) const {
@@ -1777,10 +1966,7 @@ ZarrArray::decode_chunk_from_storage_object(
         return decode_chunk_payload(object_bytes);
 
     const auto location = storage_object_location(chunk_indices);
-    auto encoded = extract_inner_chunk(object_bytes, location.inner_indices);
-    if (!encoded)
-        return std::nullopt;
-    return decode_chunk_payload(*encoded);
+    return extract_inner_chunk(object_bytes, location.inner_indices);
 }
 
 std::optional<std::vector<std::size_t>>
@@ -1860,10 +2046,63 @@ ZarrArray::read_inner_chunk(std::span<const std::size_t> shard_indices,
     return extract_inner_chunk(*shard_data, inner_indices);
 }
 
-void ZarrArray::write_shard(std::span<const std::size_t> shard_indices,
-                            std::span<const std::optional<std::vector<std::byte>>> inner_chunks) {
+void ZarrArray::check_shard_index_writable() const {
     if (!is_sharded())
         throw std::runtime_error("zarr: not a sharded array");
+    const auto& sc = *meta_.shard_config;
+    if (sc.index_location != "start" && sc.index_location != "end")
+        throw std::runtime_error("zarr: cannot write shards with index_location \"" +
+                                 sc.index_location + "\"");
+    // The writers emit a little-endian uint64 index, optionally followed by
+    // its crc32c. Any other index codec is refused before a file is touched.
+    for (std::size_t i = 0; i < sc.index_codecs.size(); ++i) {
+        const auto& ic = sc.index_codecs[i];
+        if (ic.name == "bytes") {
+            if (ic.configuration && ic.configuration->is_object()) {
+                auto* e = json_find(*ic.configuration, "endian");
+                if (e && e->is_string() && e->get_string() != "little")
+                    throw std::runtime_error("zarr: cannot write a big-endian shard index");
+            }
+        } else if (ic.name == "crc32c") {
+            if (i + 1 != sc.index_codecs.size())
+                throw std::runtime_error("zarr: cannot write a shard index with codecs after crc32c");
+        } else {
+            throw std::runtime_error("zarr: cannot write a shard index with codec \"" + ic.name + "\"");
+        }
+    }
+}
+
+std::vector<std::byte> ZarrArray::encode_shard_index(const detail::ShardIndex& index) const {
+    auto bytes = index.serialize();
+    const auto& sc = *meta_.shard_config;
+    if (!sc.index_codecs.empty() && sc.index_codecs.back().name == "crc32c") {
+        const std::uint32_t crc = detail::crc32c(bytes);
+        for (int i = 0; i < 4; ++i)
+            bytes.push_back(static_cast<std::byte>((crc >> (8 * i)) & 0xFF));
+    }
+    return bytes;
+}
+
+std::size_t ZarrArray::linear_inner_index(std::span<const std::size_t> chunk_indices,
+                                          std::vector<std::size_t>& shard_idx) const {
+    const auto ndim = meta_.ndim();
+    if (chunk_indices.size() != ndim)
+        throw std::runtime_error("zarr: chunk index rank mismatch");
+    shard_idx.assign(ndim, 0);
+    std::size_t linear = 0;
+    std::size_t stride = 1;
+    for (std::size_t d = ndim; d-- > 0;) {
+        const auto ips = meta_.sub_chunks_per_shard(d);
+        shard_idx[d] = chunk_indices[d] / ips;
+        linear += (chunk_indices[d] % ips) * stride;
+        stride *= ips;
+    }
+    return linear;
+}
+
+void ZarrArray::write_shard(std::span<const std::size_t> shard_indices,
+                            std::span<const std::optional<std::vector<std::byte>>> inner_chunks) {
+    check_shard_index_writable();
 
     const auto& sc = *meta_.shard_config;
     const auto n_inner = meta_.total_sub_chunks_per_shard();
@@ -1871,14 +2110,15 @@ void ZarrArray::write_shard(std::span<const std::size_t> shard_indices,
     if (inner_chunks.size() != n_inner)
         throw std::runtime_error("zarr: wrong number of inner chunks for shard");
 
-    // Build shard data: [index][chunk0 padded to 4k][chunk1 padded to 4k]...
+    // index "start": [index][chunk0 padded to 4k][chunk1 padded to 4k]...
+    // index "end":   [chunk0 padded to 4k][chunk1 padded to 4k]...[index]
     std::vector<std::byte> shard_data;
     detail::ShardIndex index;
     index.entries.resize(n_inner);
 
-    // Index always at start — reserve space for it.
-    const std::size_t index_size = n_inner * 16;
-    shard_data.resize(index_size);
+    const bool at_end = sc.index_at_end();
+    const std::size_t index_total = sc.index_bytes(n_inner);
+    if (!at_end) shard_data.resize(index_total);   // reserve room for the index
 
     auto pad_to_align = [&]() {
         auto n = shard_data.size();
@@ -1909,40 +2149,129 @@ void ZarrArray::write_shard(std::span<const std::size_t> shard_indices,
         pad_to_align();
     }
 
-    // Write index at start.
-    auto index_bytes = index.serialize();
-    std::memcpy(shard_data.data(), index_bytes.data(), index_size);
+    auto index_bytes = encode_shard_index(index);
+    if (at_end)
+        shard_data.insert(shard_data.end(), index_bytes.begin(), index_bytes.end());
+    else
+        std::memcpy(shard_data.data(), index_bytes.data(), index_bytes.size());
 
     // Write shard file.
     write_chunk_raw(shard_indices, shard_data);
 }
 
-void ZarrArray::write_inner_chunk_to_shard(std::span<const std::size_t> chunk_indices,
-                                           std::span<const std::byte> data) {
-    if (!is_sharded())
-        throw std::runtime_error("zarr: not a sharded array");
-
-    const auto ndim = meta_.ndim();
+void ZarrArray::set_shard_entry_locked(const std::filesystem::path& p, std::size_t linear,
+                                       const std::span<const std::byte>* payload,
+                                       detail::ShardIndexEntry entry) {
+    const auto& sc = *meta_.shard_config;
     const auto n_inner = meta_.total_sub_chunks_per_shard();
     const std::size_t index_size = n_inner * 16;
+    const std::size_t index_total = sc.index_bytes(n_inner);
+    const bool at_end = sc.index_at_end();
+    const bool checksummed = index_total != index_size;
 
-    std::vector<std::size_t> shard_idx(ndim);
-    std::vector<std::size_t> inner_idx(ndim);
-    for (std::size_t d = 0; d < ndim; ++d) {
-        auto ips = meta_.sub_chunks_per_shard(d);
-        shard_idx[d] = chunk_indices[d] / ips;
-        inner_idx[d] = chunk_indices[d] % ips;
+    if (!std::filesystem::exists(p)) {
+        // A fresh shard is its index alone, identical for either location.
+        detail::ShardIndex empty;
+        empty.entries.resize(n_inner);   // all (0xFF..FF, 0xFF..FF): missing
+        auto bytes = encode_shard_index(empty);
+        std::ofstream create(p, std::ios::binary | std::ios::trunc);
+        create.write(reinterpret_cast<const char*>(bytes.data()),
+                     static_cast<std::streamsize>(bytes.size()));
+        if (!create) throw std::runtime_error("zarr: cannot create shard " + p.string());
     }
 
-    std::size_t linear = 0;
-    std::size_t stride = 1;
-    for (std::size_t d = ndim; d-- > 0;) {
-        linear += inner_idx[d] * stride;
-        stride *= meta_.sub_chunks_per_shard(d);
+    std::fstream f(p, std::ios::binary | std::ios::in | std::ios::out);
+    if (!f) throw std::runtime_error("zarr: cannot open shard " + p.string());
+    f.seekg(0, std::ios::end);
+    const auto file_size = static_cast<std::uint64_t>(f.tellg());
+    if (file_size < index_total)
+        throw std::runtime_error("zarr: shard smaller than its index: " + p.string());
+    std::uint64_t index_pos = at_end ? file_size - index_total : 0;
+
+    // Fast path, unchanged from the original writer: a start index without
+    // a checksum is patched 16 bytes at a time.
+    if (!at_end && !checksummed) {
+        if (payload) {
+            // Padding bytes (if any) are left uninitialised — ext4 zero-fills
+            // them on sparse extension, and readers never look at them.
+            entry.offset = (file_size + kShardChunkAlign - 1) & ~(kShardChunkAlign - 1);
+            entry.nbytes = payload->size();
+            f.seekp(static_cast<std::streamoff>(entry.offset));
+            f.write(reinterpret_cast<const char*>(payload->data()),
+                    static_cast<std::streamsize>(payload->size()));
+        }
+        std::byte e[16];
+        detail::write_le64(e, entry.offset);
+        detail::write_le64(e + 8, entry.nbytes);
+        f.seekp(static_cast<std::streamoff>(linear * 16));
+        f.write(reinterpret_cast<const char*>(e), 16);
+        f.flush();
+        if (!f) throw std::runtime_error("zarr: shard write failed: " + p.string());
+        return;
     }
 
-    auto key = chunk_key(shard_idx);
-    auto p = root_ / key;
+    // Otherwise the whole index is re-encoded (the checksum covers all of it).
+    std::vector<std::byte> raw(index_size);
+    f.seekg(static_cast<std::streamoff>(index_pos));
+    f.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(index_size));
+    if (!f) throw std::runtime_error("zarr: cannot read shard index: " + p.string());
+    auto index = detail::ShardIndex::deserialize(raw, n_inner);
+
+    if (payload) {
+        // Start: append at the 4k-aligned EOF. End: the old trailing index is
+        // dead once rewritten, so the payload goes over it (4k-aligned) and
+        // the new index follows the payload as the file's last bytes. The
+        // file never shrinks, so no truncation is needed. (Unlike the start
+        // layout, an interrupted end-layout update leaves no valid index.)
+        const std::uint64_t from = at_end ? index_pos : file_size;
+        entry.offset = (from + kShardChunkAlign - 1) & ~(kShardChunkAlign - 1);
+        entry.nbytes = payload->size();
+        if (entry.offset > from) {
+            std::vector<std::byte> pad(entry.offset - from, std::byte{0});
+            f.seekp(static_cast<std::streamoff>(from));
+            f.write(reinterpret_cast<const char*>(pad.data()),
+                    static_cast<std::streamsize>(pad.size()));
+        }
+        f.seekp(static_cast<std::streamoff>(entry.offset));
+        f.write(reinterpret_cast<const char*>(payload->data()),
+                static_cast<std::streamsize>(payload->size()));
+        if (at_end) index_pos = entry.offset + entry.nbytes;
+    }
+    index.entries[linear] = entry;
+    auto bytes = encode_shard_index(index);
+    f.seekp(static_cast<std::streamoff>(index_pos));
+    f.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    f.flush();
+    if (!f) throw std::runtime_error("zarr: shard write failed: " + p.string());
+}
+
+std::optional<detail::ShardIndexEntry>
+ZarrArray::read_shard_entry(const std::filesystem::path& p, std::size_t linear) const {
+    // The trailing index moves on every update, so its position (the file
+    // size) is taken under the lock that guards the entry read, from the
+    // same descriptor.
+    std::lock_guard lock(shard_mutex_for(p));
+    OpenFile f(p);
+    if (!f.ok()) return std::nullopt;
+    std::uint64_t pos = static_cast<std::uint64_t>(linear) * 16;
+    const auto& sc = *meta_.shard_config;
+    if (sc.index_at_end()) {
+        const std::size_t index_total = sc.index_bytes(meta_.total_sub_chunks_per_shard());
+        if (f.size() < index_total) return std::nullopt;
+        pos += f.size() - index_total;
+    }
+    std::byte e[16];
+    if (!f.read_at(pos, e, 16)) return std::nullopt;
+    return detail::ShardIndexEntry{detail::read_le64(e), detail::read_le64(e + 8)};
+}
+
+void ZarrArray::write_inner_chunk_to_shard(std::span<const std::size_t> chunk_indices,
+                                           std::span<const std::byte> data) {
+    check_shard_index_writable();
+    std::vector<std::size_t> shard_idx;
+    const std::size_t linear = linear_inner_index(chunk_indices, shard_idx);
+
+    auto p = root_ / chunk_key(shard_idx);
     std::filesystem::create_directories(p.parent_path());
 
     // Lock to prevent concurrent writes tearing this shard file.
@@ -1953,176 +2282,60 @@ void ZarrArray::write_inner_chunk_to_shard(std::span<const std::size_t> chunk_in
     // both truncate with an empty index, and the second writer would
     // overwrite the first's already-committed index entry.
     std::lock_guard lock(shard_mutex_for(p));
-
-    if (!std::filesystem::exists(p)) {
-        std::ofstream create(p, std::ios::binary);
-        // Write empty index: all entries = (0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF)
-        std::vector<std::byte> empty_index(index_size);
-        std::memset(empty_index.data(), 0xFF, index_size);
-        create.write(reinterpret_cast<const char*>(empty_index.data()),
-                     static_cast<std::streamsize>(index_size));
-    }
-
-    // Open for random read/write
-    std::fstream f(p, std::ios::binary | std::ios::in | std::ios::out);
-    if (!f) return;
-
-    // 1. Seek to EOF, round up to next 4k boundary, append chunk data.
-    //    Padding bytes (if any) are left uninitialised — ext4 zero-fills
-    //    them on sparse extension, and readers never look at them.
-    f.seekp(0, std::ios::end);
-    auto eof_offset = static_cast<std::uint64_t>(f.tellp());
-    auto chunk_offset = (eof_offset + kShardChunkAlign - 1)
-                      & ~(kShardChunkAlign - 1);
-    if (chunk_offset != eof_offset) {
-        f.seekp(static_cast<std::streamoff>(chunk_offset));
-    }
-    f.write(reinterpret_cast<const char*>(data.data()),
-            static_cast<std::streamsize>(data.size()));
-
-    // 2. Seek to index entry, write 16 bytes (offset + nbytes)
-    auto nbytes = static_cast<std::uint64_t>(data.size());
-    f.seekp(static_cast<std::streamoff>(linear * 16));
-    f.write(reinterpret_cast<const char*>(&chunk_offset), 8);
-    f.write(reinterpret_cast<const char*>(&nbytes), 8);
-    f.flush();
+    set_shard_entry_locked(p, linear, &data, {});
 }
 
 bool ZarrArray::inner_chunk_exists(std::span<const std::size_t> chunk_indices) const {
     if (!is_sharded()) return false;
-    const auto ndim = meta_.ndim();
-
-    std::vector<std::size_t> shard_idx(ndim);
-    std::vector<std::size_t> inner_idx(ndim);
-    for (std::size_t d = 0; d < ndim; ++d) {
-        auto ips = meta_.sub_chunks_per_shard(d);
-        shard_idx[d] = chunk_indices[d] / ips;
-        inner_idx[d] = chunk_indices[d] % ips;
-    }
-
-    std::size_t linear = 0;
-    std::size_t stride = 1;
-    for (std::size_t d = ndim; d-- > 0;) {
-        linear += inner_idx[d] * stride;
-        stride *= meta_.sub_chunks_per_shard(d);
-    }
-
-    auto p = root_ / chunk_key(shard_idx);
-    std::ifstream f(p, std::ios::binary);
-    if (!f) return false;
-
-    f.seekg(static_cast<std::streamoff>(linear * 16));
-    std::uint64_t offset = 0, nbytes = 0;
-    f.read(reinterpret_cast<char*>(&offset), 8);
-    f.read(reinterpret_cast<char*>(&nbytes), 8);
-    if (!f) return false;
+    std::vector<std::size_t> shard_idx;
+    const std::size_t linear = linear_inner_index(chunk_indices, shard_idx);
+    auto e = read_shard_entry(root_ / chunk_key(shard_idx), linear);
+    if (!e) return false;
     // Not present: (0xFF..FF, 0xFF..FF). Empty/zero: (0xFF..FE, 0).
-    if (offset == ~std::uint64_t(0) && nbytes == ~std::uint64_t(0)) return false;
-    if (offset == (~std::uint64_t(0) - 1) && nbytes == 0) return false;
+    if (e->is_missing()) return false;
+    if (e->offset == (~std::uint64_t(0) - 1) && e->nbytes == 0) return false;
     return true;
 }
 
 bool ZarrArray::inner_chunk_is_empty(std::span<const std::size_t> chunk_indices) const {
     if (!is_sharded()) return false;
-    const auto ndim = meta_.ndim();
-
-    std::vector<std::size_t> shard_idx(ndim);
-    std::vector<std::size_t> inner_idx(ndim);
-    for (std::size_t d = 0; d < ndim; ++d) {
-        auto ips = meta_.sub_chunks_per_shard(d);
-        shard_idx[d] = chunk_indices[d] / ips;
-        inner_idx[d] = chunk_indices[d] % ips;
-    }
-
-    std::size_t linear = 0;
-    std::size_t stride = 1;
-    for (std::size_t d = ndim; d-- > 0;) {
-        linear += inner_idx[d] * stride;
-        stride *= meta_.sub_chunks_per_shard(d);
-    }
-
-    auto p = root_ / chunk_key(shard_idx);
-    std::ifstream f(p, std::ios::binary);
-    if (!f) return false;
-
-    f.seekg(static_cast<std::streamoff>(linear * 16));
-    std::uint64_t offset = 0, nbytes = 0;
-    f.read(reinterpret_cast<char*>(&offset), 8);
-    f.read(reinterpret_cast<char*>(&nbytes), 8);
-    if (!f) return false;
-    return (offset == (~std::uint64_t(0) - 1) && nbytes == 0);
+    std::vector<std::size_t> shard_idx;
+    const std::size_t linear = linear_inner_index(chunk_indices, shard_idx);
+    auto e = read_shard_entry(root_ / chunk_key(shard_idx), linear);
+    return e && e->offset == (~std::uint64_t(0) - 1) && e->nbytes == 0;
 }
 
 void ZarrArray::mark_inner_chunk_empty(std::span<const std::size_t> chunk_indices) {
-    if (!is_sharded())
-        throw std::runtime_error("zarr: not a sharded array");
+    check_shard_index_writable();
+    std::vector<std::size_t> shard_idx;
+    const std::size_t linear = linear_inner_index(chunk_indices, shard_idx);
 
-    const auto ndim = meta_.ndim();
-    const auto n_inner = meta_.total_sub_chunks_per_shard();
-    const std::size_t index_size = n_inner * 16;
-
-    std::vector<std::size_t> shard_idx(ndim);
-    std::vector<std::size_t> inner_idx(ndim);
-    for (std::size_t d = 0; d < ndim; ++d) {
-        auto ips = meta_.sub_chunks_per_shard(d);
-        shard_idx[d] = chunk_indices[d] / ips;
-        inner_idx[d] = chunk_indices[d] % ips;
-    }
-
-    std::size_t linear = 0;
-    std::size_t stride = 1;
-    for (std::size_t d = ndim; d-- > 0;) {
-        linear += inner_idx[d] * stride;
-        stride *= meta_.sub_chunks_per_shard(d);
-    }
-
-    auto key = chunk_key(shard_idx);
-    auto p = root_ / key;
+    auto p = root_ / chunk_key(shard_idx);
     std::filesystem::create_directories(p.parent_path());
 
-    if (!std::filesystem::exists(p)) {
-        std::ofstream create(p, std::ios::binary);
-        std::vector<std::byte> empty_index(index_size);
-        std::memset(empty_index.data(), 0xFF, index_size);
-        create.write(reinterpret_cast<const char*>(empty_index.data()),
-                     static_cast<std::streamsize>(index_size));
-    }
-
+    // Empty sentinel: (0xFF..FE, 0)
     std::lock_guard lock(shard_mutex_for(p));
-    std::fstream f(p, std::ios::binary | std::ios::in | std::ios::out);
-    if (!f) return;
-
-    // Write empty sentinel: (0xFF..FE, 0)
-    std::uint64_t sentinel_offset = ~std::uint64_t(0) - 1;
-    std::uint64_t sentinel_nbytes = 0;
-    f.seekp(static_cast<std::streamoff>(linear * 16));
-    f.write(reinterpret_cast<const char*>(&sentinel_offset), 8);
-    f.write(reinterpret_cast<const char*>(&sentinel_nbytes), 8);
-    f.flush();
+    set_shard_entry_locked(p, linear, nullptr, {~std::uint64_t(0) - 1, 0});
 }
 
 void ZarrArray::write_empty_shard(std::span<const std::size_t> shard_indices) {
-    if (!is_sharded())
-        throw std::runtime_error("zarr: not a sharded array");
+    check_shard_index_writable();
     const auto n_inner = meta_.total_sub_chunks_per_shard();
 
     auto key = chunk_key(std::vector<std::size_t>(shard_indices.begin(), shard_indices.end()));
     auto p = root_ / key;
     std::filesystem::create_directories(p.parent_path());
 
-    std::vector<std::uint64_t> index(n_inner * 2);
-    const std::uint64_t sentinel_offset = ~std::uint64_t(0) - 1;
-    const std::uint64_t sentinel_nbytes = 0;
-    for (std::size_t i = 0; i < n_inner; ++i) {
-        index[i * 2]     = sentinel_offset;
-        index[i * 2 + 1] = sentinel_nbytes;
-    }
+    // The shard is its index alone, so start and end layouts coincide.
+    detail::ShardIndex index;
+    index.entries.assign(n_inner, detail::ShardIndexEntry{~std::uint64_t(0) - 1, 0});
+    auto bytes = encode_shard_index(index);
 
+    // Replaced through a rename rather than truncated in place: a reader
+    // may still hold a mapping of the old file (read_whole_shard), and
+    // truncating that inode would leave its pages past the new EOF.
     std::lock_guard lock(shard_mutex_for(p));
-    std::ofstream f(p, std::ios::binary | std::ios::trunc);
-    if (!f) return;
-    f.write(reinterpret_cast<const char*>(index.data()),
-            static_cast<std::streamsize>(index.size() * 8));
+    detail::write_file_bytes(p, bytes);
 }
 
 // ---------------------------------------------------------------------------
@@ -2212,7 +2425,10 @@ ZarrArray::read_inner_chunk_from_shard(std::span<const std::size_t> chunk_indice
     }
     if (linear > std::numeric_limits<std::size_t>::max() / 16)
         return std::nullopt;
-    const std::size_t index_offset = linear * 16;
+    const std::size_t entry_offset = linear * 16;
+    const auto& sc = *meta_.shard_config;
+    const bool at_end = sc.index_at_end();
+    const std::size_t index_total = sc.index_bytes(meta_.total_sub_chunks_per_shard());
     auto is_missing_or_empty = [](std::uint64_t offset, std::uint64_t nbytes) {
         return (offset == ~std::uint64_t(0) && nbytes == ~std::uint64_t(0)) ||
                (offset == ~std::uint64_t(0) - 1 && nbytes == 0) ||
@@ -2222,12 +2438,26 @@ ZarrArray::read_inner_chunk_from_shard(std::span<const std::size_t> chunk_indice
     auto key = chunk_key(shard_idx);
     if (store_) {
         auto full_key = array_key_.empty() ? key : array_key_ + "/" + key;
-        auto entry = store_->get_partial(full_key, index_offset, 16);
+        std::optional<std::vector<std::byte>> entry;
+        if (at_end) {
+            // Locate and read the trailing entry in one store call, so the
+            // size it is found from and the bytes come from the same object.
+            // Stores that cannot size an object fall back to a whole read.
+            if (index_total < entry_offset + 16) return std::nullopt;
+            auto tail = store_->get_trailing_range(full_key, index_total - entry_offset, 16);
+            if (!tail) {
+                auto whole = store_->get_if_exists(full_key);
+                if (!whole) return std::nullopt;
+                return extract_inner_chunk_raw(*whole, inner_idx);
+            }
+            entry = std::move(tail->bytes);
+        } else {
+            entry = store_->get_partial(full_key, entry_offset, 16);
+        }
         if (!entry || entry->size() < 16) return std::nullopt;
 
-        std::uint64_t offset = 0, nbytes = 0;
-        std::memcpy(&offset, entry->data(), 8);
-        std::memcpy(&nbytes, entry->data() + 8, 8);
+        const std::uint64_t offset = detail::read_le64(entry->data());
+        const std::uint64_t nbytes = detail::read_le64(entry->data() + 8);
         if (is_missing_or_empty(offset, nbytes)) return std::nullopt;
         if (offset > std::numeric_limits<std::size_t>::max() ||
             nbytes > std::numeric_limits<std::size_t>::max())
@@ -2244,28 +2474,29 @@ ZarrArray::read_inner_chunk_from_shard(std::span<const std::size_t> chunk_indice
     auto p = root_ / key;
     // Lock to prevent reading while another thread is writing the
     // same shard (striped — reads against other shards don't block).
+    // The trailing index position is derived from the size of the
+    // descriptor opened under this lock: a writer moves the trailing index
+    // on every update, so a size taken before the lock could point the
+    // read at old index storage that is now payload or padding.
     std::lock_guard lock(shard_mutex_for(p));
-    std::ifstream f(p, std::ios::binary);
-    if (!f) return std::nullopt;
+    OpenFile f(p);
+    if (!f.ok()) return std::nullopt;
+    std::uint64_t index_offset = entry_offset;
+    if (at_end) {
+        if (f.size() < index_total) return std::nullopt;
+        index_offset += f.size() - index_total;
+    }
 
-    // Read 16-byte index entry at position linear*16
-    if (index_offset > static_cast<std::size_t>(std::numeric_limits<std::streamoff>::max()))
-        return std::nullopt;
-    f.seekg(static_cast<std::streamoff>(index_offset));
-    std::uint64_t offset = 0, nbytes = 0;
-    f.read(reinterpret_cast<char*>(&offset), 8);
-    f.read(reinterpret_cast<char*>(&nbytes), 8);
-    if (!f) return std::nullopt;
+    std::byte e[16];
+    if (!f.read_at(index_offset, e, 16)) return std::nullopt;
+    const std::uint64_t offset = detail::read_le64(e);
+    const std::uint64_t nbytes = detail::read_le64(e + 8);
     if (is_missing_or_empty(offset, nbytes)) return std::nullopt;
-    if (offset > static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max()) ||
-        nbytes > static_cast<std::uint64_t>(std::numeric_limits<std::streamsize>::max()))
+    if (nbytes > std::numeric_limits<std::size_t>::max() || nbytes > f.size())
         return std::nullopt;
 
-    // Read chunk data
-    f.seekg(static_cast<std::streamoff>(offset));
-    std::vector<std::byte> data(nbytes);
-    f.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(nbytes));
-    if (!f) return std::nullopt;
+    std::vector<std::byte> data(static_cast<std::size_t>(nbytes));
+    if (!f.read_at(offset, data.data(), data.size())) return std::nullopt;
     return data;
 }
 
@@ -2282,19 +2513,37 @@ ZarrArray::read_whole_shard(std::span<const std::size_t> chunk_indices) const {
     auto p = root_ / key;
     std::lock_guard lock(shard_mutex_for(p));
 #if !defined(_WIN32)
-    int fd = ::open(p.c_str(), O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return std::nullopt;
-    struct stat st;
-    if (::fstat(fd, &st) < 0 || st.st_size <= 0) {
-        ::close(fd);
-        return std::nullopt;
-    }
-    const std::size_t sz = static_cast<std::size_t>(st.st_size);
-    void* ptr = ::mmap(nullptr, sz, PROT_READ, MAP_PRIVATE, fd, 0);
+    OpenFile f(p);   // size via fstat on this descriptor, under the lock
+    if (!f.ok() || f.size() == 0) return std::nullopt;
+    const std::size_t sz = static_cast<std::size_t>(f.size());
+    const auto& sc = *meta_.shard_config;
+    const std::size_t index_total = sc.index_bytes(meta_.total_sub_chunks_per_shard());
+    const bool snapshot = sz >= index_total;
+    // A MAP_PRIVATE mapping is not a snapshot: pages not yet faulted in (or
+    // not yet copied) show later writes to the file. Writers only append
+    // payload and rewrite the index in place (a trailing index over its old
+    // region, a start index at offset 0); whole-shard rewrites go through a
+    // rename to a new inode. So the payload bytes an index points at never
+    // change, but the index itself would. Its pages are copied privately
+    // (write-faulted) here while the lock is still held, then the mapping
+    // goes read-only.
+    void* ptr = ::mmap(nullptr, sz, snapshot ? (PROT_READ | PROT_WRITE) : PROT_READ,
+                       MAP_PRIVATE, f.fd(), 0);
     // The mapping survives the fd close — no fd leak from a long-lived
     // shard-cache entry.
-    ::close(fd);
     if (ptr == MAP_FAILED) return std::nullopt;
+    if (snapshot) {
+        const auto page = static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
+        const std::size_t from = sc.index_at_end() ? sz - index_total : 0;
+        const std::size_t to = from + index_total;
+        auto* base = static_cast<volatile unsigned char*>(ptr);
+        for (std::size_t at = from / page * page; at < to; at += page)
+            base[at] = base[at];   // write fault: private copy of this page now
+        if (::mprotect(ptr, sz, PROT_READ) < 0) {
+            ::munmap(ptr, sz);
+            return std::nullopt;
+        }
+    }
     // MADV_RANDOM: we parse the trailing index then hop to a specific
     // inner-chunk offset. Sequential readahead would prefetch pages we
     // never touch.

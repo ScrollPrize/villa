@@ -6,7 +6,9 @@
 #include <opencv2/core/matx.hpp>
 
 #include <cstdint>
+#include <algorithm>
 #include <map>
+#include <tuple>
 #include <string>
 #include <utility>
 #include <vector>
@@ -42,6 +44,17 @@ struct InputLink {
     // The annotation keeps this in sync on both reciprocal refs; the layout
     // ORs the two sides on dedup anyway.
     bool pending = false;
+    // The endpoints are one winding apart, the V fiber's inside the H
+    // fiber's (FiberBranchRef::adjacent). The solver gets the one-turn
+    // offset instead of an equality. A pair that is not one H and one V has
+    // no inside: such a link is an annotation error (PlacedLink::
+    // adjacentUnpaired), reported suspect and given no constraint. ORed on
+    // dedup like pending.
+    bool adjacent = false;
+    // The ref stated its kind explicitly (the containing JSON array).
+    // Two explicit refs of one pair disagreeing (true here, false there) is
+    // reported as PlacedLink::adjacentDisagrees.
+    bool adjacentExplicit = true;
 };
 
 struct InputFiber {
@@ -56,6 +69,22 @@ struct InputFiber {
     // Per control-point-span "was fiber-model traced"; anything else is only
     // an interpolation. Empty or mismatched renders as a single traced run.
     std::vector<bool> tracedSegments;
+    // Per control point: tagged kollesis_termination. Read at solve time
+    // (a V fiber linked to two tagged H fibers is on a kollesis), never by
+    // the cached detection, so it is not part of the cache keys; empty or
+    // mismatched means no tags.
+    std::vector<bool> kollesisTerminations;
+    // Per control point: tagged break (the points get a dotted rim). Display
+    // only; read when the placed fiber is built from the fresh input, so not
+    // part of the cache keys. Empty or mismatched means no tags.
+    std::vector<bool> breaks;
+    // Per control-point span: the span descriptor carries the gap span tag
+    // (drawn as a dotted amber run). Display only, same rules; empty or
+    // mismatched means no gaps.
+    std::vector<bool> gapSegments;
+    // Per control-point span: the damaged span tag (alternating amber and
+    // red dashes). Display only, same rules.
+    std::vector<bool> damagedSegments;
     // Raw directed refs; the layout dedupes reciprocal pairs.
     std::vector<InputLink> links;
 };
@@ -87,9 +116,22 @@ struct LayoutParams {
     double minGapVx = 4167.0;
 };
 
-// One styling run of a fiber, in voxels with +y = +z.
+// One styling run of a fiber, in voxels with +y = +z. Exactly one of the
+// three styles applies: gap (both endpoint controls tagged break) outranks
+// traced / interpolated. The points carry the layout's own geometry, with the
+// one-sample overlap past each bounding control that lets neighbouring runs
+// join visually; the gap heat map seeds from these, so they are the same
+// whether or not any break is tagged. Drawing a gap exactly is the drawer's
+// job: see displayRunPoints.
 struct Run {
     bool traced = true;
+    bool gap = false;
+    // The damaged span tag; never together with gap (the gap wins).
+    bool damaged = false;
+    // The controls (indices into PlacedFiber::controlPoints) bounding the
+    // run's spans; -1 when the run is the whole fiber without span flags.
+    int firstControl = -1;
+    int lastControl = -1;
     std::vector<QPointF> points;
 };
 
@@ -102,7 +144,20 @@ struct PlacedFiber {
     // Control-point positions read off the smoothed geometry, so they land
     // exactly on the drawn curve.
     std::vector<QPointF> controlPoints;
+    // Parallel to controlPoints: the point carries the kollesis_termination
+    // tag (copied from the input; always sized to controlPoints).
+    std::vector<bool> kollesisTerminations;
+    // Parallel to controlPoints: the point carries the break tag (same rule).
+    std::vector<bool> breaks;
 };
+
+// The points to DRAW for fiber.runs[runIndex]: the run's own points, except
+// that a gap or damaged run, and any run next to one, ends exactly at the
+// shared control's position on the curve instead of one sample past it, so
+// the dashes cover their span and nothing else and no solid stroke runs on
+// underneath them. Runs away from every gap or damaged span are unchanged.
+[[nodiscard]] std::vector<QPointF> displayRunPoints(const PlacedFiber& fiber,
+                                                    std::size_t runIndex);
 
 struct PlacedLink {
     uint64_t fiberA = 0;
@@ -116,6 +171,17 @@ struct PlacedLink {
     bool suspect = false;
     // True when either input ref of the deduped pair still awaits review.
     bool pending = false;
+    // An adjacent-winding link (InputLink::adjacent): turnErr is measured
+    // against the one-turn offset, and the map draws the endpoints as
+    // triangles.
+    bool adjacent = false;
+    // An adjacent link between fibers that are not one H and one V: the
+    // error the map flags for it (always suspect; it constrained nothing).
+    bool adjacentUnpaired = false;
+    // The pair's two refs state different kinds (one adjacent, one explicitly
+    // ordinary): the annotation is inconsistent between the two files. Always
+    // suspect, constrains nothing; the sync merge arbitrates.
+    bool adjacentDisagrees = false;
 };
 
 struct WindingMark {
@@ -149,6 +215,12 @@ struct Result {
 // umbilicusCenters are dense volume-frame centers (x, y, z), one per z slice;
 // an empty list means the network cannot be unrolled and yields an empty
 // result.
+//
+// This per-network unroll has no winding dimension - x is angle at one
+// reference radius - so every link, adjacent or not, is an angular tie here
+// and InputLink::adjacent only rides through to PlacedLink (and marks an
+// unpaired one suspect). The winding semantics of adjacent links live in
+// buildGlobalLayout, which is what the Fiber Map draws.
 [[nodiscard]] Result buildLayout(const std::vector<InputFiber>& fibers,
                                  const std::vector<cv::Vec3f>& umbilicusCenters,
                                  const LayoutParams& params);
@@ -181,6 +253,9 @@ struct GlobalFiberMeta {
     GlobalAnchor anchor = GlobalAnchor::Unresolved;
     bool linked = false;
     bool sheetDriftSuspect = false;
+    // A V fiber the annotator has linked to kollesis-tagged H ends on both
+    // sides: its seam encounters read as same winding or inward.
+    bool onKollesis = false;
     // W range over the fiber; a multi-turn H fiber has no single winding.
     double windingLo = 0.0;
     double windingHi = 0.0;
@@ -197,10 +272,81 @@ struct GlobalPlacedFiber {
     GlobalFiberMeta meta;
 };
 
-// A crossing constraint the repair had to drop, marked on the map (y = +z,
-// like every placed coordinate here).
+// Every H-vs-V crossing event the solver resolved (one per crossing of the
+// two polylines, apex touches included and flagged), positioned on the drawn
+// H polyline (y = +z, like every placed coordinate here), with what it read
+// and what became of the representative that stood for it: the inspection
+// record behind the map's markers. Ids are the runtime fiber ids of the build.
+struct CrossingEvent {
+    QPointF posVx;
+    uint64_t hFiberId = 0;
+    uint64_t vFiberId = 0;
+    long long n = 0;
+    winding::CrossingKind kind = winding::CrossingKind::Inside;
+    winding::CrossingStatus status = winding::CrossingStatus::Used;
+    double deltaR = 0.0;
+    double transversality = 0.0;
+    bool tangential = false;
+    bool touch = false;
+    // Read as a kollesis seam encounter (same winding or inward).
+    bool kollesis = false;
+    // ... from the solve contradiction on a certified kollesis V rather than
+    // from a tag on this H fiber (see winding::Crossing::kollesisInferred).
+    bool kollesisInferred = false;
+    int orientation = 0;
+    int mergedCount = 1;
+    double confidence = 0.0;
+    double violationTurns = 0.0;
+    // Index into GlobalResult::crossingGroups, or -1.
+    long long groupId = -1;
+};
+
+// A pair's crossings on one translate and run of V branches read together
+// (see winding::CrossingGroup; vBranch is the run's first limb); members
+// index GlobalResult::crossingEvents.
+struct CrossingGroupRecord {
+    uint64_t hFiberId = 0;
+    uint64_t vFiberId = 0;
+    long long n = 0;
+    std::size_t vBranch = 0;
+    std::vector<std::size_t> members;
+    int multiplicity = 0;
+    int insideCount = 0;
+    int orientationSum = 0;
+    int insideOrientationSum = 0;
+    bool mixedSigns = false;
+    bool coverageGap = false;
+    bool unresolved = false;
+    bool onCurtain = false;
+    bool traversalCovered = false;
+    // A seam encounter lies on the translate: no verdict (incomplete count).
+    bool seamed = false;
+    double minAbsDeltaR = 0.0;
+    double meanTransversality = 0.0;
+    bool hasVerdict = false;
+    winding::CrossingKind verdict = winding::CrossingKind::Inside;
+    double confidence = 0.0;
+    winding::CrossingStatus status = winding::CrossingStatus::Used;
+    double violationTurns = 0.0;
+};
+
+// A declared winding error, marked on the map: a dropped crossing the final
+// map still violates, or every member of such a traversal group. Group
+// members share a groupId; they are one conflict drawn at each place the
+// pair met, not independent errors.
 struct CrossingMark {
     QPointF posVx;
+    uint64_t hFiberId = 0;
+    uint64_t vFiberId = 0;
+    long long n = 0;
+    winding::CrossingKind kind = winding::CrossingKind::Inside;
+    double deltaR = 0.0;
+    double violationTurns = 0.0;
+    // Index into GlobalResult::crossingEvents.
+    std::size_t eventIndex = 0;
+    // Index into GlobalResult::crossingGroups when the error is a group's, else -1.
+    long long groupId = -1;
+    bool kollesis = false;
 };
 
 // A fiber that could not be placed: no geometry, no umbilicus to unroll
@@ -213,6 +359,46 @@ struct UnplacedFiber {
     char hvTag = '?';
 };
 
+// How a layout's winding sense was settled. The sense is a property of the
+// scroll, not of the annotation, and a handful of fibers' geometry is a poor
+// witness to it (a fiber drifting in z over a turn compares radii at
+// different heights, and one one-turn fiber can tip a close vote), so unless
+// the caller states it both senses are solved and the map that contradicts
+// itself less is kept.
+enum class ChiralityBasis {
+    // The caller set SolverParams::chiralityOverride.
+    Override,
+    // Both senses were solved on the geometry alone (links left out); this
+    // one had fewer crossing contradictions by the margin of
+    // chiralityComparisonDecisive.
+    Comparison,
+    // Both senses were solved on the geometry alone and their crossing
+    // contradictions were within that margin (or nothing was solvable);
+    // the data's vote decided.
+    Vote,
+};
+
+// Whether `fewer` crossing contradictions against `more` in the other sense
+// is a mirrored map rather than noise. The counts are independent ones -
+// dropped crossings and group conflicts, from a solve with the links left
+// out - not the rings drawn for them (one group conflict rings at every
+// member) and not links.
+//
+// A wrong sense contradicts every ordering between different turns (a V
+// fiber that crosses an H fiber's first turn on one side and its second on
+// the other), so it shows as a multiple of the true sense's count, not as
+// a handful more; the true sense contradicts only where the sheet is not a
+// spiral (folds, seams). Links stay out of the decision: a link to the wrong
+// turn of an H fiber is a contradiction in the true sense and none in the
+// mirror, so a few of them, or several on one fiber, would decide for the
+// mirror. So the other sense must show more than twice the crossing
+// contradictions, and at least three more. A map with no ordering between
+// turns at all cannot be decided this way, and is not.
+[[nodiscard]] inline bool chiralityComparisonDecisive(int fewer, int more)
+{
+    return more > 2 * fewer && more - fewer >= 3;
+}
+
 struct GlobalResult {
     // Ordered by (label, fileName, id), every placeable fiber of the input;
     // fileName before the runtime id so the order survives id reassignment
@@ -222,21 +408,46 @@ struct GlobalResult {
     // One mark per integer winding across the padded extent.
     std::vector<WindingMark> windings;
     std::vector<CrossingMark> suspectCrossings;
+    // Every crossing and every traversal group of the solve, for inspection.
+    std::vector<CrossingEvent> crossingEvents;
+    std::vector<CrossingGroupRecord> crossingGroups;
     std::vector<UnplacedFiber> unplaced;
     double rRefVx = 0.0;
     double x0Vx = 0.0;
     double x1Vx = 0.0;
     double yMinVx = 0.0;
     double yMaxVx = 0.0;
+    // The winding sense the map is laid out in (+1: the winding grows with
+    // theta = atan2(dy, dx) about the umbilicus, -1: against it) and how it
+    // was settled. chiralityVote and chiralityNetVotes are what the data's
+    // own vote (winding::tallyChirality) said whichever way the map went;
+    // comparedChiralityErrors and rejectedChiralityErrors are the crossing
+    // contradictions (dropped crossings + group conflicts, links left out:
+    // the figures chiralityComparisonDecisive compared) of this sense and
+    // of the other, -1 when the senses were never compared.
     int chirality = 1;
+    ChiralityBasis chiralityBasis = ChiralityBasis::Vote;
+    int chiralityVote = 1;
+    int chiralityNetVotes = 0;
+    int comparedChiralityErrors = -1;
+    int rejectedChiralityErrors = -1;
     int islandCount = 0;
     int unresolvedCount = 0;
     int tieCount = 0;
     int suspectLinkCount = 0;
-    // Declared winding errors only: drops involving a fiber with no
-    // model-traced span are expected interpolation noise and are neither
-    // counted here nor marked on the map.
+    // Declared winding errors: dropped constraints the final map still
+    // violates. droppedCrossingCount counts individual crossings,
+    // declaredGroupCount traversal groups (each one conflict);
+    // traversalGroupCount is the groups that took a verdict.
     int droppedCrossingCount = 0;
+    int declaredGroupCount = 0;
+    int traversalGroupCount = 0;
+    // Owner-segment pairs the detector could not intersect (exactly
+    // parallel); their translates take no group verdict.
+    int unresolvedIntersectionCount = 0;
+    // Events read as kollesis seam encounters.
+    int kollesisCrossingCount = 0;
+    int kollesisInferredCount = 0;
     // Geometry the solver refused to learn from: angularly ill-conditioned
     // or wild segments, and tangential contacts. Nonzero values say the map
     // may be underconstrained for a reason the fibers themselves can't show.
@@ -279,6 +490,23 @@ struct SheetModel {
 // to be negative there) or the model is degenerate (rRef or radius0 not
 // positive).
 [[nodiscard]] double sheetXForDistanceVx(const SheetModel& model, double distanceVx);
+// The map x below which the modelled radius is negative and sheet distance
+// has no meaning: -infinity without a pitch or for a degenerate model.
+[[nodiscard]] double sheetDomainFloorXVx(const SheetModel& model);
+// The Fiber Map draws its scene with x scaled by sheet distance, so that a
+// centimetre of sheet is the same width on every winding: this is that
+// scaling. It is sheetDistanceVx wherever the modelled radius is positive;
+// below the domain floor the map's own arclength takes over at the floor's
+// distance, so the mapping is monotone for every map x of the data's
+// magnitude (the quadratic overflows only for |x| far beyond any volume) and
+// every fiber has exactly one scene position. Identity for a degenerate
+// model (rRef or radius0 not positive).
+[[nodiscard]] double sheetDistanceMonotoneVx(const SheetModel& model, double xVx);
+// Inverse of sheetDistanceMonotoneVx, to rounding: on the domain and on the
+// continuation the round trip is exact to a few ulps; at the floor itself
+// the quadratic is flat, so a distance within rounding of the floor's maps
+// back to within about 1e-8 relative of the floor's x.
+[[nodiscard]] double sheetXForDistanceMonotoneVx(const SheetModel& model, double distanceVx);
 // The sheet model a result carries.
 [[nodiscard]] SheetModel sheetModelOf(const GlobalResult& result);
 
@@ -299,7 +527,8 @@ struct ContentDigest {
 // each cached artifact consumes - never on anyone's generation counters:
 //
 //   prep slot  (per fileName):  H(fiber geometry fields, umbilicus)
-//   pair slot  (per H,V pair):  H(prepKey_H, prepKey_V, chirality,
+//   pair slot  (per H,V pair and winding sense):
+//                               H(prepKey_H, prepKey_V, chirality,
 //                                 detection params)
 //
 // Fiber identity across builds is the stored fileName; runtime ids are
@@ -318,6 +547,16 @@ struct ContentDigest {
 // necessarily differ; digestGlobalResult() defines the semantic field set.
 class GlobalLayoutCache;
 
+// With params.solver.chiralityOverride == 0 the winding sense is decided on
+// the geometry alone: both senses are solved with the links left out, the
+// one with decisively fewer crossing contradictions is taken
+// (chiralityComparisonDecisive), the data's vote deciding otherwise, and
+// the map is then built in that sense with the links
+// (GlobalResult::chiralityBasis). That is three solves, and two detections
+// with a cache (the third build finds its sense's shards there; without
+// one, three); a caller that knows the scroll's sense (the open-data
+// catalog states it, see OpenDataVolumeOrientation.hpp) sets the override
+// and pays for one of each.
 [[nodiscard]] GlobalResult buildGlobalLayout(
     const std::vector<InputFiber>& fibers,
     const std::vector<cv::Vec3f>& umbilicusCenters,
@@ -328,6 +567,12 @@ class GlobalLayoutCache {
 public:
     void clear();
 
+    // When a build decides the winding sense itself, the fiber counts are
+    // the first sense's run's (the later runs find every preparation
+    // already there) and the pair counts the kept sense's deciding run's:
+    // pair shards are keyed by sense and are link-free, so each sense's
+    // counts stand alone, and the run that detected for the kept map is
+    // reported (the final, linked solve of that sense reuses them all).
     struct Stats {
         bool used = false;
         int fibersReused = 0;
@@ -336,6 +581,10 @@ public:
         int pairsRecomputed = 0;
     };
     [[nodiscard]] const Stats& lastStats() const { return _stats; }
+    // The cached detection shards in (H file, V file, winding sense) order,
+    // for tests of the contract that a cached shard is the fresh one bit for
+    // bit.
+    [[nodiscard]] std::vector<const winding::PairDetections*> cachedDetections() const;
 
 private:
     friend GlobalResult buildGlobalLayout(const std::vector<InputFiber>&,
@@ -350,10 +599,13 @@ private:
     };
     struct PairSlot {
         ContentDigest key;
-        winding::PairCrossings detection;
+        winding::PairDetections detection;
     };
     std::map<std::string, PrepSlot> _prep;
-    std::map<std::pair<std::string, std::string>, PairSlot> _pairs;
+    // One slot per (H file, V file, winding sense): the two senses of one
+    // pair are different detections, and a build that solves both must
+    // leave both behind or every later build recomputes one of them.
+    std::map<std::tuple<std::string, std::string, int>, PairSlot> _pairs;
     Stats _stats;
 };
 

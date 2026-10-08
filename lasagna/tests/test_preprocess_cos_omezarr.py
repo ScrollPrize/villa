@@ -730,6 +730,7 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 				),
 				chunk_size=32,
 				pyramid_policy=PYRAMID_POLICY_CUSTOM,
+				accumulator_channel_count=LasagnaCosPredict3DAdapter.NORMAL_RAW_CHANNEL_COUNT,
 			),
 			pred_dt_product=OutputProductSpec(
 				name=LasagnaCosPredict3DAdapter.PRED_DT_PRODUCT,
@@ -753,10 +754,82 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			adapter.normal_product.channel_names,
 			("grad_mag", "nx", "ny"),
 		)
+		self.assertEqual(adapter.normal_product.channel_count, 3)
+		self.assertEqual(
+			adapter.normal_product.raw_channel_count,
+			LasagnaCosPredict3DAdapter.NORMAL_RAW_CHANNEL_COUNT,
+		)
 		self.assertEqual(
 			[product.name for product in adapter.derived_output_products],
 			[LasagnaCosPredict3DAdapter.PRED_DT_PRODUCT],
 		)
+
+	def test_lasagna_adapter_rejects_three_channel_normal_accumulator(self):
+		cos = OutputProductSpec(
+			name=LasagnaCosPredict3DAdapter.COS_PRODUCT,
+			level=1,
+			scaledown=2,
+			channels=(OutputChannelSpec("cos", relative_path="cos.ome.zarr"),),
+			chunk_size=32,
+		)
+		normal = OutputProductSpec(
+			name=LasagnaCosPredict3DAdapter.NORMAL_PRODUCT,
+			level=2,
+			scaledown=4,
+			channels=(
+				OutputChannelSpec("grad_mag", relative_path="grad_mag.ome.zarr"),
+				OutputChannelSpec("nx", relative_path="nx.ome.zarr"),
+				OutputChannelSpec("ny", relative_path="ny.ome.zarr"),
+			),
+			chunk_size=32,
+		)
+		with self.assertRaisesRegex(ValueError, "accumulate 7 raw channels"):
+			LasagnaCosPredict3DAdapter(
+				checkpoint="model.pt",
+				tile_size=64,
+				device_name="cpu",
+				cos_product=cos,
+				normal_product=normal,
+			)
+
+	def test_lasagna_normal_finalize_uses_seven_raw_channels(self):
+		product = OutputProductSpec(
+			name=LasagnaCosPredict3DAdapter.NORMAL_PRODUCT,
+			level=2,
+			scaledown=4,
+			channels=(
+				OutputChannelSpec("grad_mag", relative_path="grad_mag.ome.zarr"),
+				OutputChannelSpec("nx", relative_path="nx.ome.zarr"),
+				OutputChannelSpec("ny", relative_path="ny.ome.zarr"),
+			),
+			chunk_size=32,
+			accumulator_channel_count=LasagnaCosPredict3DAdapter.NORMAL_RAW_CHANNEL_COUNT,
+		)
+		adapter = LasagnaCosPredict3DAdapter(
+			checkpoint="model.pt",
+			tile_size=64,
+			device_name="cpu",
+			cos_product=OutputProductSpec(
+				name=LasagnaCosPredict3DAdapter.COS_PRODUCT,
+				level=1,
+				scaledown=2,
+				channels=(OutputChannelSpec("cos", relative_path="cos.ome.zarr"),),
+				chunk_size=32,
+			),
+			normal_product=product,
+		)
+		with self.assertRaisesRegex(ValueError, "shape 7,D,H,W"):
+			adapter.finalize_product_slab(product, np.zeros((3, 4, 4, 4), dtype=np.float32))
+		raw = torch.rand(1, 8, 2, 2, 2)
+		tensors = adapter.product_tensors_from_output(raw)
+		self.assertEqual(tuple(tensors[product.name].shape), (1, 7, 2, 2, 2))
+		persisted = adapter.finalize_product_slab(
+			product, tensors[product.name][0].detach().numpy(),
+		)
+		self.assertEqual(set(persisted), {"grad_mag", "nx", "ny"})
+		for name, arr in persisted.items():
+			self.assertEqual(arr.dtype, np.uint8, name)
+			self.assertEqual(arr.shape, (2, 2, 2), name)
 
 	def test_lasagna_output_adapter_requires_complete_normal_bundle(self):
 		with tempfile.TemporaryDirectory() as td:

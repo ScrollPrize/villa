@@ -17,7 +17,7 @@ apt-get install -y --no-install-recommends \
     libopencv-dev libopencv-contrib-dev \
     libcgal-dev libmpfr-dev libgmp-dev \
     libblosc-dev libzstd-dev libcurl4-openssl-dev \
-    nlohmann-json3-dev libavahi-client-dev \
+    nlohmann-json3-dev libavahi-client-dev libsqlite3-dev \
     liblz4-dev libtiff-dev \
     zlib1g-dev gfortran libopenblas-dev liblapack-dev liblapacke-dev libomp-dev \
     libscotch-dev libscotchmetis-dev libhwloc-dev \

@@ -1,5 +1,75 @@
 # Changelog
 
+## 2026-09-29
+
+- Add selective catalog project creation with initially unchecked resources,
+  project name/destination, individual segment attachment and immediate opening.
+
+## 2026-09-27
+
+- The workspace tab bar now shows the project name rather than the current
+  volume filename, with the project path as its tooltip.
+
+- Split correction reset into a selected-CP action at the bottom of the context
+  menu and a whole-fiber action in the annotation window menu.
+
+## 2026-09-24
+
+- Added persisted CP direction axes, Shift-drag editing from either strip,
+  cross-section orientation, trace/Lasagna constraints and interior spline
+  tangents, with three-way sync conflict handling.
+  Added persistent strip direction markers and a whole-fiber direction/normal
+  correction reset in the Ctrl-right-click menu.
+  Directions are signed by fiber order; only explicit annotations fix native
+  first steps and fused endpoint headings. Existing direction hints retain
+  prediction selection. Reversal negates annotations; markers are 80 pixels.
+
+- Unified corrections with ordinary normal-input alignment and strip construction;
+  shared the regular line tangent and interpolated targets in a transported frame
+  to avoid inheriting baseline half turns between close CPs.
+
+- Display normal corrections consider both equivalent signs, interpolate the
+  shortest axis rotation and preserve sign continuity in constructed strips.
+
+- Removed the regressed analytic ribbon renderer/projection. Strips again use
+  ordinary QuadSurface grids, smoothed construction frames and indexed picking;
+  cross views retain windowed tangents. Manual offsets rotate baseline frames.
+- CP movement corrections taper smoothly at local edit boundaries.
+  CP display normals now record manual/interpolated/unknown provenance.
+
+- New CPs inherit the existing interpolated display correction rather than
+  introducing zero-offset knots; uncorrected regions remain unset.
+
+- Added cross-view Shift-drag for the fiber center and nominal width edges.
+  Edge drags retain width, using the original opposite edge for orientation,
+  and submit position/display-normal changes through the CP-edit pipeline.
+  Inner/outer tolerance ticks follow the preview. Multiple strokes while Shift
+  is held are preview-only; Shift release commits one edit and reoptimization.
+
+- Persisted per-fiber `width_gap_fraction`, defaulting missing values to 0.2;
+  retained through editing, split/merge and sync, and used by all width guides.
+
+- Added 80%/120% fiber-width tolerance guides and mirrored cursor-centered edge
+  previews in the top strip and cross view, reusing graphics items. Ctrl+Space
+  in the annotation window invokes the shared volume-overlay toggle.
+
+- Fixed native bidirectional fusion near CPs by apportioning meeting-gap
+  correction by prefix arclength; endpoint meetings no longer add a connector.
+
+- Replaced cross-section polygon/line editing with whole-fiber width and
+  per-CP baked display normals, smooth display-only angular corrections,
+  persistent width/normal guides, and three-way metadata sync.
+
+## 2026-09-18
+
+- Fixed double decompression and byte swapping when decoding Zarr inner chunks from cached shards.
+
+## 2026-09-17
+
+- Added persistent line and polygon cross-section annotations to VC3D fibers,
+  including exact cut-plane restoration, transactional editing and saving,
+  split/merge preservation, and UUID-based three-way sync conflict handling.
+
 ## 2026-09-14
 
 - Fixed QuadSurface derived-cache eviction racing in-flight renders during surface and project switches.

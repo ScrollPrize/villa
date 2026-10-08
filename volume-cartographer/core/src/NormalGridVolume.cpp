@@ -81,6 +81,12 @@
                 const int min_level = metadata.value("min-level", 0);
                 const int max_level = metadata.value("max-level", 0);
                 selected_level = std::clamp(requested_level, min_level, max_level);
+                if (selected_level != requested_level) {
+                    std::cerr << "warning: normal_grid_level=" << requested_level
+                              << " is outside the levels " << min_level << ".." << max_level
+                              << " available in " << base_path
+                              << "; using level " << selected_level << std::endl;
+                }
 
                 utils::Json level_metadata;
                 const std::string level_metadata_name =
@@ -106,6 +112,13 @@
                 output_spiral_step = level_step / coordinate_scale;
             } else {
                 selected_level = 0;
+                if (requested_level != 0) {
+                    std::cerr << "warning: normal_grid_level=" << requested_level
+                              << " ignored; store at " << base_path
+                              << " is single-scale (no \"format\":\"normal-grid-multiscale\" in metadata.json)"
+                              << "; using level 0. A multiscale store can be derived from a local copy with"
+                              << " vc_gen_normalgrids pyramid -i <store> -o <multiscale store>" << std::endl;
+                }
                 sparse_volume = metadata.value("sparse-volume", 1);
                 output_spiral_step = metadata.value("spiral-step", 20.0);
             }
