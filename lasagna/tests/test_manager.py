@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 import lasagna.manager.cli as manager_cli
+import lasagna.manager.prefetch as manager_prefetch
 from lasagna.manager import catalog
 from lasagna.manager.catalog import CatalogCache, get_catalog, index_volumes, resolve_volume
 from lasagna.manager.cli import (
@@ -74,6 +75,17 @@ def sample_catalog() -> dict:
         },
         "models": {},
     }
+
+
+def sample_https_catalog() -> dict:
+    document = sample_catalog()
+    sample = next(iter(document["samples"].values()))
+    for volume in sample["volumes"].values():
+        origin = volume["data"][0]["origins"][0]
+        origin["access_roots"] = [
+            {"type": "https", "url": "https://public.example", "usage": "public-read"}
+        ]
+    return document
 
 
 def test_config_init_round_trip_and_no_overwrite(tmp_path, monkeypatch):
@@ -237,6 +249,7 @@ def test_catalog_index_preserves_identity_and_selectors():
     first = records[0]
     assert first.selector == "PHerc0001/20260101000001-2.4um.zarr"
     assert first.s3_url == "s3://public/PHerc0001/volumes/20260101000001-2.4um.zarr/"
+    assert first.prefetch_url == first.s3_url
     assert first.license["name"] == "CC BY-NC 4.0"
     assert first.catalog_metadata["sha256"] == first.catalog_sha256
     assert first.raw["data"][0]["origins"] == list(first.origins)
@@ -244,6 +257,30 @@ def test_catalog_index_preserves_identity_and_selectors():
     assert resolve_volume(records, "20260101000001") == first
     with pytest.raises(ValueError, match="ambiguous"):
         resolve_volume(records, "2026")
+
+
+def test_catalog_prefetch_url_falls_back_to_public_http_and_preserves_s3_precedence():
+    https_record = index_volumes(
+        CatalogCache(sample_https_catalog(), {"sha256": "digest"})
+    )[0]
+    assert https_record.s3_url is None
+    assert https_record.prefetch_url == (
+        "https://public.example/PHerc0001/volumes/"
+        "20260101000001-2.4um.zarr/"
+    )
+    assert https_record.selected_origin == https_record.origins[0]
+
+    document = sample_https_catalog()
+    first = next(iter(next(iter(document["samples"].values()))["volumes"].values()))
+    first["data"][0]["origins"].append({
+        "path": first["long_id"] + "/",
+        "access_roots": [
+            {"type": "s3", "url": "s3://preferred", "usage": "public-read"}
+        ],
+    })
+    s3_record = index_volumes(CatalogCache(document, {"sha256": "digest"}))[0]
+    assert s3_record.s3_url == f"s3://preferred/{s3_record.long_id}/"
+    assert s3_record.prefetch_url == s3_record.s3_url
 
 
 def test_catalog_index_tolerates_explicit_null_shape():
@@ -554,6 +591,55 @@ def test_prefetch_reuses_downloader_and_root_convention(tmp_path, monkeypatch):
     }]
 
 
+def test_prefetch_http_fallback_mirrors_raw_zarr_bytes(tmp_path, monkeypatch):
+    config = configured(tmp_path)
+    record = index_volumes(
+        CatalogCache(sample_https_catalog(), {"sha256": "digest"})
+    )[0]
+    source = record.prefetch_url.rstrip("/")
+    zarray = json.dumps({
+        "zarr_format": 2,
+        "shape": [2, 2, 2],
+        "chunks": [1, 1, 1],
+        "dtype": "|u1",
+        "compressor": None,
+        "fill_value": 0,
+        "order": "C",
+        "filters": None,
+        "dimension_separator": ".",
+    }, separators=(",", ":")).encode()
+    remote = {
+        f"{source}/.zattrs": b'{"multiscales":[]}',
+        f"{source}/0/.zarray": zarray,
+    }
+    for z in range(2):
+        for y in range(2):
+            for x in range(2):
+                remote[f"{source}/0/{z}.{y}.{x}"] = bytes([z * 4 + y * 2 + x])
+
+    def fake_read(url, *, allow_missing=False):
+        if url in remote:
+            return remote[url]
+        if allow_missing:
+            return None
+        raise AssertionError(f"unexpected required URL: {url}")
+
+    monkeypatch.setattr(manager_prefetch, "_http_read_bytes", fake_read)
+    result = prefetch_volume(config, record, 0, workers=3, remote_inventory=False)
+    root = volume_cache_root(config, record)
+    assert result == root / "0"
+    assert (root / ".zattrs").read_bytes() == remote[f"{source}/.zattrs"]
+    assert (root / "0" / ".zarray").read_bytes() == zarray
+    assert (root / "0" / "0.0.0").read_bytes() == b"\x00"
+    assert (root / "0" / "1.1.1").read_bytes() == b"\x07"
+
+    # Resume must use the existing chunk instead of fetching it again.
+    del remote[f"{source}/0/1.1.1"]
+    result = prefetch_volume(config, record, 0, workers=2, remote_inventory=False)
+    assert result == root / "0"
+    assert (root / "0" / "1.1.1").read_bytes() == b"\x07"
+
+
 class FakeTmux:
     def __init__(self, sessions=()):
         self.sessions = set(sessions)
@@ -585,6 +671,35 @@ def _snapshot_and_config(tmp_path: Path):
     python.write_text("", encoding="utf-8")
     config = configured(tmp_path, snapshot_dirs=(tmp_path / "runs",))
     return config, index_snapshots(config)[0]
+
+
+def test_https_volume_default_prefetch_is_supported_but_on_demand_modes_remain_s3_only(tmp_path):
+    config, snapshot = _snapshot_and_config(tmp_path)
+    volume = index_volumes(
+        CatalogCache(sample_https_catalog(), {"sha256": "digest", "fetched_at": "now"})
+    )[0]
+    run_dir = launch_inference(
+        config, snapshot, volume, 1,
+        original_argv=["inference", "run"],
+        prefetch=True, tmux=FakeTmux(),
+    )
+    command = json.loads((run_dir / "command.json").read_text())
+    assert command["prefetch"]["source"] == volume.prefetch_url
+    assert command["prefetch"]["source"].startswith("https://")
+    assert "--no-download" in command["resolved_argv"]
+
+    with pytest.raises(ValueError, match="no supported S3 origin"):
+        launch_inference(
+            config, snapshot, volume, 1,
+            original_argv=["inference", "run"],
+            prefetch=False, tmux=FakeTmux(),
+        )
+    with pytest.raises(ValueError, match="no supported S3 origin"):
+        launch_inference(
+            config, snapshot, volume, 1,
+            original_argv=["inference", "run"],
+            prefetch=False, live_fetch=True, tmux=FakeTmux(),
+        )
 
 
 def test_launch_writes_backend_neutral_record_and_argv(tmp_path):
