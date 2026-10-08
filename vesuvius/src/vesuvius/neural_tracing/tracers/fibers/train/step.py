@@ -156,8 +156,13 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
                      confidence_weight=.5, ema_decay=.999, ema_ramp=True, n_commit=None, compute_metrics=True,
                      grad_clip=GRAD_CLIP, diagnostic=None, live_continuation=None, ledger=None,
                      confidence_threshold=.5, gate='prefix', refinement_loss='policy',
-                     refinement_weight=1.):
-    """One equally weighted task loss per independent supervised decision."""
+                     refinement_weight=1., parallel=None):
+    """One equally weighted task loss per independent supervised decision.
+
+    With ``parallel`` (train/distributed.DataParallel) the gradients of every process's decisions are pooled before
+    clipping, so all processes apply the same update; the returned metrics describe this process's decisions, plus
+    the pooled ``pooled_supervised_states``/``pooled_observed_states``.
+    """
     prepare_training(model, getattr(model, 'training_batch_size', 2))
     # Episode batches (model 'sequence') supervise their trailing decisions; earlier steps only build history.
     total = sum(int(batch['episode_supervised'].sum()) if 'episode_supervised' in batch else len(batch['hist'])
@@ -262,10 +267,14 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
             rows = per_state[offset:offset+len(cpu['hist'])]
             offset += len(cpu['hist'])
             ledger.add(cpu, step, rows.T.tolist())
-    # The summed loss is finite only if every batch loss was; checked before any update.
-    if not math.isfinite(sums['loss']):
-        raise FloatingPointError(f'Nonfinite loss at step {step}')
+    # The summed loss is finite only if every batch loss was; checked (on every process) before any update.
+    finite = math.isfinite(sums['loss'])
     finish_training_update(model)
+    if parallel is not None:
+        pooled_total, finite, pooled_observed = parallel.average_gradients(model, total, finite, observed)
+        sums.update(pooled_supervised_states=pooled_total, pooled_observed_states=pooled_observed)
+    if not finite:
+        raise FloatingPointError(f'Nonfinite loss at step {step}')
     sums.update(clip_training_gradients(model, grad_clip))
     opt.step()
     update_ema(ema, model, step, ema_decay, ramp=ema_ramp)

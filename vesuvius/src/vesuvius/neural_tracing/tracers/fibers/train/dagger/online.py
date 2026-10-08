@@ -74,7 +74,7 @@ class OnlineCollector:
                  batch=8, forward_chunk=0, seed=0, replay_keep=4, initial=(), trace_len=768.,
                  before=48., after=64., stride=16., max_states=192, confidence=None, n_commit=None, gate=None,
                  collector_module='vesuvius.neural_tracing.tracers.fibers.train.dagger.collect', extra_args=(), threads=4,
-                 length_power=0.):
+                 length_power=0., publish=True, cuda_visible_devices=None):
         self.directory = Path(directory).resolve()
         self.directory.mkdir(parents=True, exist_ok=True)
         self.index = self.directory/'replay.json'
@@ -96,14 +96,18 @@ class OnlineCollector:
         self.output = None
         self.launched_step = self.previous_launch = None
         self.busy_skips = 0
-        publish_replay(self.index, self.paths)
+        # Collection runs on cuda_visible_devices (a physical GPU index) when given, else on ``device``.
+        self.cuda_visible_devices = None if cuda_visible_devices is None else str(cuda_visible_devices)
+        if publish:  # data-parallel ranks other than 0 only read the index rank 0 publishes
+            publish_replay(self.index, self.paths)
 
     def settings(self):
         return dict(every=self.every, fibers_per_collection=self.fibers_per_collection, batch=self.batch,
                     threads=self.threads, forward_chunk=self.forward_chunk, trace_len=self.trace_len, before=self.before,
                     after=self.after, stride=self.stride, max_states=self.max_states, replay_keep=self.replay_keep,
                     confidence=self.confidence, n_commit=self.n_commit, exploration='none',
-                    length_power=self.length_power, **({} if self.gate is None else dict(gate=self.gate)))
+                    length_power=self.length_power, **({} if self.gate is None else dict(gate=self.gate)),
+                    **({} if self.cuda_visible_devices is None else dict(cuda_visible_devices=self.cuda_visible_devices)))
 
     def due(self, step):
         return bool(self.every) and step % self.every == 0
@@ -146,7 +150,8 @@ class OnlineCollector:
         save(checkpoint)
         command = [sys.executable, '-m', self.collector_module,
                    '--threads', str(self.threads), '--checkpoint', str(checkpoint), '--fibers', self.fibers,
-                   '--val-z', *map(str, self.val_z), '--device', self.device,
+                   '--val-z', *map(str, self.val_z),
+                   '--device', 'cuda' if self.cuda_visible_devices is not None else self.device,
                    '--fibers-per-collection', str(self.fibers_per_collection), '--batch', str(self.batch),
                    '--forward-chunk', str(self.forward_chunk), '--trace-len', str(self.trace_len),
                    '--before', str(self.before), '--after', str(self.after), '--stride', str(self.stride),
@@ -160,7 +165,8 @@ class OnlineCollector:
             if value is not None:
                 command += [flag, str(value)]
         self.log = self.output.with_suffix('.log').open('w')
-        self.process = subprocess.Popen(command, stdout=self.log, stderr=subprocess.STDOUT)
+        env = None if self.cuda_visible_devices is None else dict(os.environ, CUDA_VISIBLE_DEVICES=self.cuda_visible_devices)
+        self.process = subprocess.Popen(command, stdout=self.log, stderr=subprocess.STDOUT, env=env)
         self.previous_launch, self.launched_step = self.launched_step, step
         return True
 

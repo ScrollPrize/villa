@@ -82,7 +82,13 @@ DEFAULTS = dict(
 RUNTIME_DEFAULTS = dict(regression={}, flow={}, sequence=dict(worker_cache_gb=1.))
 RUNTIME = dict(device='cuda', workers=10, worker_cache_gb=.5, threads=4, dagger_threads=4,
                remote_prefetch_connections=48, remote_prefetch_queue_size=512, remote_prefetch_lookahead=16,
-               remote_prefetch_timeout=120.)
+               remote_prefetch_timeout=120.,
+               # Data-parallel processes, one GPU each (scripts/launch_train.sh starts torchrun when > 1;
+               # train/distributed.py). Batch and grad_steps are per process.
+               gpus=1,
+               # Physical GPU index for the DAgger collector subprocess (its CUDA_VISIBLE_DEVICES); None: the
+               # training process's (rank 0's) GPU.
+               dagger_gpu=None)
 
 # Model fields set by the trainer, not by a configuration.
 DERIVED_MODEL_FIELDS = ('model_type', 'frame_checkpoint_sha256')
@@ -198,6 +204,10 @@ def validate(run):
         raise ValueError('refinement_weight must be finite and nonnegative')
     if not math.isfinite(t['grad_clip']) or t['grad_clip'] < 0:
         raise ValueError('grad_clip must be finite and nonnegative (0 disables clipping)')
+    if type(r['gpus']) is not int or r['gpus'] < 1:
+        raise ValueError('gpus must be a positive integer')
+    if r['dagger_gpu'] is not None and (type(r['dagger_gpu']) is not int or r['dagger_gpu'] < 0):
+        raise ValueError('dagger_gpu must be a nonnegative GPU index or null')
     if (r['remote_prefetch_connections'] < 0 or r['remote_prefetch_queue_size'] < 1 or r['remote_prefetch_lookahead'] < 0
             or not math.isfinite(r['remote_prefetch_timeout']) or r['remote_prefetch_timeout'] <= 0):
         raise ValueError('Prefetch connections and lookahead must be nonnegative; queue size and timeout must be positive')

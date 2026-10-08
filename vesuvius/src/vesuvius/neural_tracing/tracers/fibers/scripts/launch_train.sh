@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Background training from a run configuration, with a persistent log:
 #   launch_train.sh RUN.json [--resume CHECKPOINT]
+# With runtime.gpus > 1, e.g. CUDA_VISIBLE_DEVICES=4,7 launch_train.sh RUN.json (2 processes, one per visible GPU).
 # The log and PID file are named after the configuration's "name".
 set -euo pipefail
 FF="$(cd "$(dirname "$0")/.." && pwd)"
@@ -17,7 +18,14 @@ name="$("$PYTHON" -c 'import json, sys; print(json.load(open(sys.argv[1]))["name
 case "$name" in
     ''|.|..|*/*) echo 'Run name must be a single directory name.' >&2; exit 1 ;;
 esac
-command=("$PYTHON" -u "$FF/train/train.py" --config "$config" "$@")
+# runtime.gpus > 1: one data-parallel process per GPU (torchrun; train/distributed.py). The visible GPUs come from
+# CUDA_VISIBLE_DEVICES; the PID file then names the torchrun agent, which stops every process with it.
+gpus="$("$PYTHON" -c 'import json, sys; print(int((json.load(open(sys.argv[1])).get("runtime") or {}).get("gpus", 1)))' "$config")"
+if (( gpus > 1 )); then
+    command=("$PYTHON" -u -m torch.distributed.run --standalone --nproc_per_node="$gpus" "$FF/train/train.py" --config "$config" "$@")
+else
+    command=("$PYTHON" -u "$FF/train/train.py" --config "$config" "$@")
+fi
 "$PYTHON" - "$FF/output/logs" "$name" "${command[@]}" <<'PY'
 from pathlib import Path
 import shlex

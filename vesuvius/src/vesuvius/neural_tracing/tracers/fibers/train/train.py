@@ -125,14 +125,22 @@ def main(argv=None):
     cli = build_parser().parse_args(argv)
     run = run_config.load(cli.config)
     args = run_config.namespace(run, cli.resume)
+    from vesuvius.neural_tracing.tracers.fibers.train.distributed import from_environment, NullLog
+    parallel = from_environment(args.gpus)  # torchrun processes when gpus > 1 (train/distributed.py)
+    main_rank = parallel is None or parallel.is_main
+    if parallel is not None:
+        args.device = parallel.device
+    rank_seed = parallel.seed_offset() if parallel is not None else 0
     dataset_document = run['dataset']
     dataset_digest = hashlib.sha256(json.dumps(dataset_document, sort_keys=True).encode()).hexdigest()
     launch_started = time.monotonic()
 
     def progress(message):
-        print(f'[{args.name} +{time.monotonic()-launch_started:.1f}s] {message}', flush=True)
+        if main_rank:
+            print(f'[{args.name} +{time.monotonic()-launch_started:.1f}s] {message}', flush=True)
 
-    progress(f'Starting training ({args.model}): device={args.device}, workers={args.workers}')
+    progress(f'Starting training ({args.model}): device={args.device}, workers={args.workers}'
+             +(f', {parallel.world_size} data-parallel processes' if parallel is not None else ''))
     if args.reset_optimizer and not args.resume:
         raise ValueError('reset_optimizer applies to --resume')
     budget = TaskBudget(tuple(args.task_shares[name] for name in TASKS), terminal_fallback_cap=args.terminal_fallback_cap,
@@ -190,18 +198,25 @@ def main(argv=None):
         added = [s['name'] for s in dataset_document['sources'] if s['name'] not in known]
         if added:
             progress(f'Warm start adds dataset sources the initialization never saw: {", ".join(added)}')
-    out = prepare_run_dir(args.out_root, args.name, resume is not None)
-    (out/'trainer.pid').write_text(f'{os.getpid()}\n')
-    (out/'validation_paris4.json').write_text(json.dumps(manifest,indent=2)+'\n')
+    out = prepare_run_dir(args.out_root, args.name, resume is not None) if main_rank else Path(args.out_root)/args.name
+    if parallel is not None:
+        parallel.barrier()
+    if main_rank:
+        (out/'trainer.pid').write_text(f'{os.getpid()}\n')
+        (out/'validation_paris4.json').write_text(json.dumps(manifest,indent=2)+'\n')
     from vesuvius.neural_tracing.tracers.shared.crop_sampling.normalization import prepare_normalization
     from vesuvius.neural_tracing.tracers.fibers.data.datasets import ct_source_spec
     calibration_specs = [spec, *(ct_source_spec(s, dataset_document['cache_dir'])
                                  for s in dataset_document['sources'] if s['kind'] != 'paris4')]
     progress('Preparing per-crop CT z-score normalization')
-    ct_normalization = prepare_normalization(out, calibration_specs,
-        known=resume['ct_normalization'] if resume is not None else None)  # a relocated CT adds its own record
+    for turn in range(parallel.world_size if parallel is not None else 1):
+        if parallel is None or parallel.rank == turn:
+            ct_normalization = prepare_normalization(out, calibration_specs,
+                known=resume['ct_normalization'] if resume is not None else None)  # a relocated CT adds its own record
+        if parallel is not None:
+            parallel.barrier()
     recovery_states = recovery_hash = None
-    if args.recovery_every:
+    if args.recovery_every and main_rank:
         progress('Preparing monitor recovery fixture')
         recovery_states, recovery_hash = monitor_fixture(out/'monitor_recovery.npz', val_f, manifest,
                                                          sample, spec, args.recovery_seeds)
@@ -224,6 +239,9 @@ def main(argv=None):
             if report[name]:
                 progress(f'  {name}: {", ".join(report[name][:20])}{" ..." if len(report[name]) > 20 else ""}')
     opt, done, lr_restart_step = initialize_training_optimizer(model, ema, args, resume)
+    if rank_seed:  # rank 0 keeps the single-process (or resumed) RNG; other ranks draw their own noise
+        torch.manual_seed(args.seed+done+rank_seed)
+        np.random.seed((args.seed+done+rank_seed) % 2**32)
     if args.reset_optimizer:
         progress(f'Fresh AdamW: all parameters trainable; LR restarts at update {done+1} '
                  f'with {args.warmup} warmup updates to {args.lr:g}')
@@ -245,19 +263,21 @@ def main(argv=None):
                       confidence=policy.confidence, n_commit=policy.n_commit, gate=policy.gate,
                       collector_module='vesuvius.neural_tracing.tracers.fibers.train.dagger.collect', threads=args.dagger_threads)
     bank_args = ('--bank-switch-tolerance', args.bank_switch_tolerance, '--bank-own-tolerance', args.bank_own_tolerance)
+    collection.update(publish=main_rank, cuda_visible_devices=args.dagger_gpu)
     collector = OnlineCollector(out/'dagger', args.fibers, args.val_z, args.device,
         initial=[c._dir for c in caches], **collection, extra_args=bank_args)
-    progress(f'{args.batch} independent decisions per batch')
+    progress(f'{args.batch} independent decisions per batch'
+             +(f' per process; DAgger collection on GPU {args.dagger_gpu}' if args.dagger_gpu is not None else ''))
     # Paris 4 has no neighbor paths: no foreign masks, bank-covered locations or synthetic wrong continuations.
     builder = IdentityObservationBuilder(cfg,train_f,identity_sampling,augment=True)
     from vesuvius.neural_tracing.tracers.fibers.data.episodes import loader_chunk
-    dataset = FollowDataset(train_f, spec, sample, chunk=loader_chunk(cfg, args.batch), seed=args.seed+done,
+    dataset = FollowDataset(train_f, spec, sample, chunk=loader_chunk(cfg, args.batch), seed=args.seed+done+rank_seed,
         cache_bytes=int(args.worker_cache_gb*(1 << 30)), onpolicy=caches,
         replay_index=str(collector.index), batch_builder=builder, budget=budget)
     from vesuvius.neural_tracing.tracers.fibers.data.datasets import build_mixed_dataset
     progress('Checking mixed-source datasets and AFV checksums')
     dataset, dataset_provenance = build_mixed_dataset(dataset, dataset_document, cfg, sample,
-        identity_sampling, args, seed=args.seed+done, out=out, resume=resume is not None,
+        identity_sampling, args, seed=args.seed+done+rank_seed, out=out, resume=resume is not None,
         normalization=ct_normalization, budget=budget)
     from vesuvius.neural_tracing.tracers.fibers.train.dagger.online import MultiSourceCollector
     collectors = []
@@ -266,7 +286,8 @@ def main(argv=None):
             collector.extra_args += ['--dataset-name',source['name']]
             collectors.append((source['name'],collector))
             continue
-        (out/f'validation_{source["name"]}.json').write_text(json.dumps(source_dataset.validation_manifest,indent=2)+'\n')
+        if main_rank:
+            (out/f'validation_{source["name"]}.json').write_text(json.dumps(source_dataset.validation_manifest,indent=2)+'\n')
         afv_collection = dict(collection, length_power=args.afv_length_power,
                               fibers_per_collection=args.afv_dagger_fibers or args.dagger_fibers)
         collectors.append((source['name'],OnlineCollector(out/'dagger'/source['name'],
@@ -312,12 +333,16 @@ def main(argv=None):
     if fit_flow_scales:
         from vesuvius.neural_tracing.tracers.models.flow import fit_flow_sigma
         progress('Fitting flow residual scales from training states')
-        cfg.flow_sigma = fit_flow_sigma(iter(loader), cfg, args.flow_calibration_states)
+        if main_rank:
+            cfg.flow_sigma = fit_flow_sigma(iter(loader), cfg, args.flow_calibration_states)
+        if parallel is not None:
+            cfg.flow_sigma = parallel.broadcast_object(cfg.flow_sigma if main_rank else None)
         for follower in (model, ema):
             follower.sigma.copy_(torch.tensor(cfg.flow_sigma, device=args.device))
             follower.cfg.flow_sigma = cfg.flow_sigma
-    (out/'run.json').write_text(json.dumps(run, indent=2)+'\n')
-    if not resume:
+    if main_rank:
+        (out/'run.json').write_text(json.dumps(run, indent=2)+'\n')
+    if not resume and main_rank:
         (out/'config.json').write_text(json.dumps(dict(run_config=run, model_type=model.model_type,
             dataset_config_sha256=dataset_digest, dataset_provenance=dataset_provenance,
             ct_normalization=ct_normalization, identity_sampling=asdict(identity_sampling),
@@ -330,7 +355,7 @@ def main(argv=None):
             frame_policy=configured_frame_policy(cfg), monitor_recovery_sha256=recovery_hash,
             seed_manifest_sha256=manifest['sha256'], fiber_manifest=fiber_manifest(fibers),
             parameter_count=sum(p.numel() for p in model.parameters())), indent=2))
-    log = RunLog(out/'log.jsonl', formatter=format_training_log)
+    log = RunLog(out/'log.jsonl', formatter=format_training_log) if main_rank else NullLog()
     log.record(dict(step=done, event='ct_normalization', calibration=ct_normalization))
     log.record(dict(step=done, event='dataset_configuration', datasets=dataset_provenance,
                     names=dataset.names, probabilities=dataset.weights.tolist(),
@@ -340,6 +365,7 @@ def main(argv=None):
         log.record(dict(step=done, event='resume_configuration', checkpoint=str(args.resume),
                         run_config=run, model_cfg=cfg.to_dict()))
     log.record(dict(step=done, event='optimizer_configuration', reset=args.reset_optimizer,
+                    data_parallel_processes=parallel.world_size if parallel is not None else 1,
                     lr_restart_step=lr_restart_step, optimizer_state_entries=len(opt.state),
                     groups=[dict(parameters=len(g['params'])) for g in opt.param_groups],
                     trainable_parameters=sum(p.numel() for p in model.parameters() if p.requires_grad)))
@@ -380,12 +406,14 @@ def main(argv=None):
                 enabled=remote_prefetch is not None,connections=args.remote_prefetch_connections,
                 queue_size=args.remote_prefetch_queue_size,lookahead=args.remote_prefetch_lookahead,
                 timeout=args.remote_prefetch_timeout,sources=len(remote_sources)))
-        if args.diag_every:
+        if args.diag_every and main_rank:
             from vesuvius.neural_tracing.tracers.fibers.tracing.trace import TraceParams
             tracer = FiberTracer(ema, CTVolume(spec), cfg.fine, cfg.n_history,
                 TraceParams.from_policy(policy, max_len=args.diag_max_len), device=args.device)
-        progress(f'Starting data loader; batch {args.batch} × grad steps {args.grad_steps} = '
-                 f'{args.batch * args.grad_steps} decisions per update; starting update {done+1}')
+        world = parallel.world_size if parallel is not None else 1
+        progress(f'Starting data loader; batch {args.batch} × grad steps {args.grad_steps}'
+                 +(f' × {world} processes' if world > 1 else '')
+                 +f' = {args.batch * args.grad_steps * world} decisions per update; starting update {done+1}')
         iterator = iter(loader)
         if cfg.model_type == 'sequence':  # single-episode loader items, merged per microbatch
             from vesuvius.neural_tracing.tracers.fibers.train.sequence import merge_episodes
@@ -398,7 +426,7 @@ def main(argv=None):
         for step in range(done+1, args.steps+1):
             for source_dataset in dataset.datasets:
                 source_dataset.set_step(step)
-            event = collector.poll(step)
+            event = collector.poll(step) if main_rank else None
             if event:
                 log.record(dict(step=step, **event))
             early = step <= done+5
@@ -418,9 +446,10 @@ def main(argv=None):
                 n_commit=args.n_commit, compute_metrics=step % args.log_every == 0 or step == args.steps,
                 grad_clip=args.grad_clip, confidence_threshold=policy.confidence, gate=policy.gate,
                 refinement_loss=args.refinement_loss, refinement_weight=args.refinement_weight,
-                diagnostic=diagnostic, live_continuation=live_continuation, ledger=ledger)
-            observed_states += metrics['observed_states']
-            interval_states += metrics['observed_states']
+                diagnostic=diagnostic, live_continuation=live_continuation, ledger=ledger, parallel=parallel)
+            pooled = metrics.get('pooled_observed_states', metrics['observed_states'])  # every process's states
+            observed_states += pooled
+            interval_states += pooled
             update_seconds = time.monotonic()-update_started
             interval_data_seconds += data_seconds
             interval_update_seconds += update_seconds
@@ -429,7 +458,7 @@ def main(argv=None):
                 progress(f'Update {step} complete in {time.monotonic()-update_started:.1f}s; loss={metrics["loss"]:.5f}')
                 if step == done+5:
                     progress(f'Startup progress complete; regular metrics every {args.log_every} updates')
-            if step % args.log_every == 0 or step == args.steps:
+            if main_rank and (step % args.log_every == 0 or step == args.steps):
                 now = time.monotonic()
                 log.record(dict(step=step, lr=lr, **metrics, samples_seen=prior_samples+observed_states,
                     **({'remote_prefetch':remote_prefetch.snapshot()} if remote_prefetch else {}),
@@ -464,18 +493,18 @@ def main(argv=None):
 
             # Preserve the completed optimizer update before optional collectors
             # or diagnostics can fail. These checkpoints include optimizer/RNG.
-            if step % args.ckpt_every == 0 or step == args.steps:
+            if main_rank and (step % args.ckpt_every == 0 or step == args.steps):
                 save(out/f'ckpt_{step:06d}.pt', resumable=True)
                 save(out/'last.pt', resumable=True)
-            if step < args.steps:
+            if step < args.steps and main_rank:
                 if collector.launch(step, save):
                     log.record(dict(step=step, dagger_launched=True))
                 elif step % args.dagger_every == 0 if args.dagger_every else False:
                     log.record(dict(step=step, dagger_skipped_busy=True))
             periodic = {}
             # The batch renderer reads the patch-token models' internals; sequence models use the monitor rollouts.
-            if args.batch_diag_every and (step % args.batch_diag_every == 0
-                                         or (resume is not None and step == done+1)):
+            if main_rank and args.batch_diag_every and (step % args.batch_diag_every == 0
+                                                       or (resume is not None and step == done+1)):
                 from vesuvius.neural_tracing.tracers.fibers.evaluation.monitor.microbatch import render_microbatch
                 began = time.monotonic()
                 report = render_microbatch(ema, batches[-1], out, step, device=args.device,
@@ -521,6 +550,8 @@ def main(argv=None):
         if tracer is not None:
             tracer.close()
         log.close()
+        if parallel is not None:
+            parallel.close()
     return str(out/'last.pt')
 
 
