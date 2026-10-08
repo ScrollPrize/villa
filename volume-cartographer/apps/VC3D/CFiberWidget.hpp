@@ -4,9 +4,11 @@
 #include <QStandardItemModel>
 #include <QPushButton>
 #include <QString>
+#include <QStringList>
 
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -90,6 +92,14 @@ public:
     QAction* createShowFiberSliceAction(QObject* parent);
     QAction* createRenameFiberFileAction(QObject* parent);
     void setFibers(const std::vector<FiberEntry>& fibers);
+    // Physical size of one annotation-frame voxel in µm, the frame the
+    // entries' lengthVx are measured in. With it, lengths (the len column,
+    // the selected fiber's header line, the total at the top) read in
+    // centimetres; unset, they stay in voxels and the column header says so.
+    void setAnnotationVoxelSizeUm(std::optional<double> voxelSizeUm);
+    [[nodiscard]] std::optional<double> annotationVoxelSizeUm() const { return _voxelSizeUm; }
+    // Sum of every listed fiber's lengthVx (finite values only).
+    [[nodiscard]] double totalLengthVx() const;
     void setAlignmentMetricsPending(bool pending);
     void updateAlignmentMetrics(uint64_t fiberId,
                                 const FiberEntry::AlignmentMetrics& alignment,
@@ -151,6 +161,12 @@ private:
     bool _spiralFitAvailable = false;
     void setupUi();
     void rebuildModel();
+    // The column headers, with the len column naming its current unit.
+    [[nodiscard]] QStringList headerLabels() const;
+    // Re-texts every length cell and the header after the unit changed; the
+    // model's rows, selection and expansion stay as they are.
+    void refreshLengthDisplays();
+    void updateTotalLengthLabel();
     void sortFibers();
     QStandardItem* findFiberItem(uint64_t fiberId);
     QList<QStandardItem*> rowItemsForNameItem(QStandardItem* nameItem) const;
@@ -176,7 +192,9 @@ private:
     std::function<bool(const std::vector<uint64_t>&)> _deleteConfirmationForTesting;
     int _sortColumn = 0;
     Qt::SortOrder _sortOrder = Qt::AscendingOrder;
+    std::optional<double> _voxelSizeUm;
 
+    QLabel* _totalLengthLabel = nullptr;
     QCheckBox* _calcMetricsCheckBox;
     QCheckBox* _showFibersCheckBox;
     QCheckBox* _showLinkedCheckBox;

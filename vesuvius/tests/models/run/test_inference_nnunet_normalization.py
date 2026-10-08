@@ -155,6 +155,7 @@ def test_dataset_receives_ct_intensity_properties(monkeypatch):
     inferer.input_anon = False
     inferer.bbox = None
     inferer.read_retries = 1
+    inferer.chunk_cache_mb = 0
     inferer.device = torch.device('cpu')
     inferer.max_patches = None
 
