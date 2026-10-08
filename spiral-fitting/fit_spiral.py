@@ -2999,6 +2999,7 @@ class FitContext:
                 verify=os.environ.get(
                     'FIT_SPIRAL_VERIFY_WINDING_INFERENCE', '1') != '0',
                 z_range=(self.z_begin, self.z_end),
+                z_to_umbilicus_yx=self.umbilicus_z_to_yx(),
             )
             print(
                 'loaded winding inference: '
@@ -3006,7 +3007,9 @@ class FitContext:
                 f"({self.winding_inference.num_z_eligible_rays:,} intersect "
                 f"z-range [{self.z_begin}, {self.z_end})), "
                 f"{self.winding_inference.fingerprint['num_crossings']:,} "
-                'crossings')
+                'crossings, '
+                f"{self.winding_inference.num_inward_rays:,} inward rays "
+                'flipped')
 
         self._density_inactive_warned = set()
 
