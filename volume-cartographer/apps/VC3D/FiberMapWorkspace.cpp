@@ -3,6 +3,7 @@
 #include "FiberLengthDisplay.hpp"
 #include "FiberMapRuler.hpp"
 #include "FiberMapRulerMath.hpp"
+#include "FiberSliceGeometry.hpp"
 #include "LineAnnotationController.hpp"
 #include "LineAnnotationFiberClassification.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
@@ -1856,8 +1857,8 @@ void runRebuildJob(const std::shared_ptr<FiberMapWorkspace::RebuildJobResult>& j
         inputs.reserve(job->snapshot.fibers.size());
         job->fiberLengthVx.reserve(job->snapshot.fibers.size());
         for (auto& fiber : job->snapshot.fibers) {
-            job->fiberLengthVx[fiber.id] =
-                vc3d::line_annotation::fiberLineLengthVx(fiber.linePoints);
+            job->fiberLengthVx[fiber.id] = vc3d::fiber_slice::annotatedLineLengthVx(
+                fiber.linePoints, fiber.controlPoints);
             vc3d::fiber_map::InputFiber input;
             input.id = fiber.id;
             input.fileName = fiber.fileName;

@@ -6,8 +6,9 @@
 #include <optional>
 
 // Fiber lengths as the panels display them. Lengths are measured in
-// annotation-frame voxels (vc::atlas::fiberLineLengthVx over the stored line
-// points); they read in centimetres only when the annotation frame's voxel
+// annotation-frame voxels (vc3d::fiber_slice::annotatedLineLengthVx: the
+// line between the outermost control points, without the extrapolated open
+// tails); they read in centimetres only when the annotation frame's voxel
 // size is known, and in voxels otherwise. There is deliberately no assumed
 // voxel size here: a guessed conversion would present every figure as
 // physical when it is not (see AnnotationFrame::voxelSizeUm).

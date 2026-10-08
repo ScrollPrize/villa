@@ -808,29 +808,6 @@ bool finitePoint(const cv::Vec3f& v)
     return std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2]);
 }
 
-double polylineLengthRange(const std::vector<cv::Vec3d>& points,
-                           size_t firstIndex,
-                           size_t lastIndex)
-{
-    if (points.size() < 2 || firstIndex >= points.size() || lastIndex >= points.size() ||
-        lastIndex <= firstIndex) {
-        return 0.0;
-    }
-
-    double length = 0.0;
-    for (size_t i = firstIndex + 1; i <= lastIndex; ++i) {
-        if (!finitePoint(points[i - 1]) || !finitePoint(points[i])) {
-            continue;
-        }
-        const cv::Vec3d delta = points[i] - points[i - 1];
-        const double step = std::sqrt(delta.dot(delta));
-        if (std::isfinite(step)) {
-            length += step;
-        }
-    }
-    return length;
-}
-
 cv::Vec3f toVec3f(const cv::Vec3d& v)
 {
     return {static_cast<float>(v[0]),
@@ -6458,9 +6435,9 @@ LineAnnotationController::controlSpansForFiber(const StoredFiber& fiber)
         span.firstLineIndex = left.lineIndex;
         span.lastLineIndex = right.lineIndex;
         span.linePointCount = static_cast<int>(right.lineIndex - left.lineIndex + 1);
-        span.lengthVx = polylineLengthRange(fiber.linePoints,
-                                            span.firstLineIndex,
-                                            span.lastLineIndex);
+        span.lengthVx = vc3d::fiber_slice::polylineLengthRange(fiber.linePoints,
+                                                               span.firstLineIndex,
+                                                               span.lastLineIndex);
         spans.push_back(span);
     }
     return spans;
@@ -6911,7 +6888,9 @@ std::vector<LineAnnotationController::FiberSummary> LineAnnotationController::fi
             fiber.fileName,
             static_cast<int>(fiber.controlPoints.size()),
             static_cast<int>(fiber.linePoints.size()),
-            lineLengthVx(fiber.linePoints),
+            vc3d::fiber_slice::annotatedLineLengthVx(
+                fiber.linePoints,
+                vc3d::line_annotation::storedControlPointPositions(fiber.controlPoints)),
             cachedAlignmentForFiber(fiber.id),
             std::move(spanSummaries),
             fiber.hvClassification.zDistance,
@@ -17343,11 +17322,6 @@ std::vector<uint64_t> LineAnnotationController::syncBranchEndpointPositions(
         }
     }
     return affectedFiberIds;
-}
-
-double LineAnnotationController::lineLengthVx(const std::vector<cv::Vec3d>& points)
-{
-    return vc3d::line_annotation::fiberLineLengthVx(points);
 }
 
 void LineAnnotationController::scaleStoredFiber(StoredFiber& fiber, double scale)

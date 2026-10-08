@@ -220,8 +220,11 @@ it does not change heat-map seeding, winding evidence or publishing.
 
 ## Fiber lengths
 
-The length of a fiber is the length of its line, summed over its points in
-the annotation frame (voxels). It is shown in centimetres when the
+The length of a fiber is the arc length of its line between its first and
+last control point, in the annotation frame (voxels). The open tails the
+optimizer extrapolates past the end control points (the extrapolation
+distance, on both sides) are not counted: they are not annotated fiber, and
+they would swamp a short fiber. It is shown in centimetres when the
 annotation frame's voxel size is known (the volume package's metadata,
 through `annotationFrame().voxelSizeUm`) and in voxels otherwise; the unit
 is never guessed. Centimetres show two decimals everywhere. The shared
@@ -236,7 +239,7 @@ formatting lives in `FiberLengthDisplay.hpp`.
 - The Fiber Map's dock has the same `len` column, a total over every fiber
   the map knows (placed or not) above the search box, and a per-network
   total in each network header. The rebuild worker measures each fiber's
-  line before the layout consumes the line points.
+  annotated span before the layout consumes the line points.
 
 The `control len` of the HV classification is a different quantity (the
 control-point spacing) and stays in voxels.
