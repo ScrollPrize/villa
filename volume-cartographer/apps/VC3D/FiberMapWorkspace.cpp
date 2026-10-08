@@ -1,12 +1,20 @@
 #include "FiberMapWorkspace.hpp"
 
 #include "FiberLengthDisplay.hpp"
+#include "FiberMapLasagnaField.hpp"
 #include "FiberMapRuler.hpp"
 #include "FiberMapRulerMath.hpp"
 #include "FiberSliceGeometry.hpp"
 #include "LineAnnotationController.hpp"
+#include "LineAnnotationCoordinateScale.hpp"
 #include "LineAnnotationFiberClassification.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
+#include "VCSettings.hpp"
+
+#include "vc/core/types/VolumePkg.hpp"
+#include "vc/lasagna/Dataset.hpp"
+#include "vc/lasagna/LasagnaNormalSampler.hpp"
+#include "vc/lasagna/Manifest.hpp"
 
 #include "vc/core/util/Logging.hpp"
 
@@ -51,6 +59,7 @@
 
 #include <opencv2/core.hpp>
 #include <QStyleOptionGraphicsItem>
+#include <QThread>
 #include <QTimer>
 #include <QToolBar>
 #include <QToolTip>
@@ -1543,6 +1552,9 @@ void FiberMapWorkspace::clearLayout(const QString& reason)
     _layoutGeneration = 0;
     _layoutFrame = {};
     _layoutUmbilicusFingerprint.clear();
+    _layoutSheetFieldToken.clear();
+    _sheetField.reset();
+    _sheetFieldKey.clear();
     _layoutPackageGeneration = 0;
     _layoutUmbilicusGeneration = 0;
     _layoutBuilt = false;
@@ -1595,7 +1607,31 @@ FiberMapWorkspace::currentDependencies() const
     deps.catalogVolume = QString::fromStdString(
         vc3d::opendata::catalogVolumeOfCoordinateSpace(coordinateSpace));
     deps.catalogManifestToken = catalogManifestTokenFor(coordinateSpace);
+    deps.sheetFieldToken = sheetFieldTokenFor(_controller->sheetFieldLocation(),
+                                              _controller->fiberMapPackageDirectory(),
+                                              _controller->sheetFieldGeneration());
     return deps;
+}
+
+// A local location is named by where it resolves: a package saved into
+// another directory resolves a relative location to another dataset, and a
+// job started before the move must not publish as fresh.
+QString FiberMapWorkspace::sheetFieldTokenFor(const std::string& location,
+                                              const std::filesystem::path& packageDirectory,
+                                              uint64_t generation)
+{
+    if (location.empty()) {
+        return {};
+    }
+    std::string resolved = location;
+    if (!vc::project::isLocationRemote(location)) {
+        try {
+            resolved = vc::project::resolveLocalPath(location, packageDirectory).string();
+        } catch (...) {
+            resolved = packageDirectory.string() + "/" + location;
+        }
+    }
+    return vc3d::fiber_map::sheetFieldToken(location, resolved, generation);
 }
 
 QString FiberMapWorkspace::catalogManifestTokenFor(const std::string& coordinateSpace) const
@@ -1617,6 +1653,7 @@ FiberMapWorkspace::layoutDependencies() const
     deps.frame = _layoutFrame;
     deps.catalogVolume = _layoutCatalogVolume;
     deps.catalogManifestToken = _layoutCatalogManifestToken;
+    deps.sheetFieldToken = _layoutSheetFieldToken;
     return deps;
 }
 
@@ -1816,6 +1853,17 @@ struct FiberMapWorkspace::RebuildJobResult {
     QString catalogManifestToken;
     // The workspace's memoization cache, exclusive to the job in flight.
     vc3d::fiber_map::GlobalLayoutCache cache;
+    // The sheet normal field (FiberMapBentRays.hpp): the selection token
+    // the job started with (compared at publication), the field itself
+    // (memoized by the workspace under sheetFieldKey, else opened by the
+    // worker), and what the layout records as the effective field: its
+    // identity, the unavailable statement with the open error, or empty
+    // when no dataset is selected.
+    QString sheetFieldToken;
+    std::string sheetFieldKey;
+    std::shared_ptr<const vc3d::fiber_map::bent::SheetNormalField> sheetField;
+    std::string effectiveField;
+    qint64 fieldOpenMs = 0;
     // The gap heat map: wanted at job start (checkbox on), built with these
     // settings after the layout. Failure is reported, never fatal to the
     // layout.
@@ -1846,6 +1894,46 @@ struct FiberMapWorkspace::RebuildJobResult {
 namespace
 {
 
+// The sheet field's memoization key: which dataset, resolved against which
+// package, read in which annotation frame (the frame fixes the scale).
+std::string sheetFieldKeyFor(const LineAnnotationController::FiberMapSnapshot& snapshot)
+{
+    return snapshot.sheetFieldLocation + "|" + snapshot.packageDirectory.string() + "|" +
+           std::to_string(snapshot.frame.extentXyz[0]) + "," +
+           std::to_string(snapshot.frame.extentXyz[1]) + "," +
+           std::to_string(snapshot.frame.extentXyz[2]);
+}
+
+// Open the selected lasagna dataset as the Fiber Map's sheet normal field,
+// exactly as the tracer resolves its frames: the manifest's base shape
+// against the annotation frame's extent gives the dyadic working-to-base
+// scale the sampler is built with. Throws on any failure; the caller
+// records the reason as the effective field.
+std::shared_ptr<const vc3d::fiber_map::bent::SheetNormalField> openSheetField(
+    const LineAnnotationController::FiberMapSnapshot& snapshot)
+{
+    const std::string& location = snapshot.sheetFieldLocation;
+    const std::string resolved =
+        vc::project::isLocationRemote(location)
+            ? location
+            : vc::project::resolveLocalPath(location, snapshot.packageDirectory).string();
+    vc::lasagna::LasagnaDatasetOpenOptions options;
+    options.remoteCacheRoot = vc3d::remoteCachePathFs();
+    // A first open at scale 1 reads the manifest's base shape.
+    const vc::lasagna::LasagnaDataset probe =
+        vc::lasagna::LasagnaDataset::openLocation(resolved, options);
+    const double workingToBaseScale = vc3d::fiber_map::bent::sheetFieldWorkingToBaseScale(
+        snapshot.frame.extentXyz, probe.manifest().baseShapeZYX);
+    options.workingToBaseScale = workingToBaseScale;
+    auto dataset = std::make_shared<vc::lasagna::LasagnaDataset>(
+        vc::lasagna::LasagnaDataset::openLocation(resolved, options));
+    auto sampler = std::make_shared<vc::lasagna::LasagnaNormalSampler>(*dataset);
+    const int threads = std::max(1, QThread::idealThreadCount());
+    return std::make_shared<const vc3d::fiber_map::bent::LasagnaSheetNormalField>(
+        std::move(sampler), vc3d::fiber_map::bent::lasagnaFieldIdentity(*dataset, workingToBaseScale),
+        threads);
+}
+
 // The worker: conversion, input digest, layout, output digest - everything
 // that does not need the GUI thread. Exceptions become the job's error;
 // nothing escapes into Qt.
@@ -1853,10 +1941,37 @@ void runRebuildJob(const std::shared_ptr<FiberMapWorkspace::RebuildJobResult>& j
 {
     try {
         const auto convertBegin = std::chrono::steady_clock::now();
+        // The sheet normal field: the selected lasagna dataset, opened here
+        // (never on the GUI thread) unless the workspace memoized it, at the
+        // scale that maps the fibers' frame to the lasagna base. An open
+        // failure leaves the build without a field and records why, so the
+        // input digest and the published layout carry the effective state.
+        const auto fieldBegin = std::chrono::steady_clock::now();
+        if (!job->snapshot.sheetFieldLocation.empty()) {
+            if (!job->sheetField) {
+                try {
+                    job->sheetField = openSheetField(job->snapshot);
+                } catch (const std::exception& ex) {
+                    job->effectiveField = "unavailable|" + job->snapshot.sheetFieldLocation +
+                                          "|" + ex.what();
+                    Logger()->warn("Fiber map: sheet normal field unavailable ({}): {}",
+                                   job->snapshot.sheetFieldLocation, ex.what());
+                }
+            }
+            if (job->sheetField) {
+                job->effectiveField = job->sheetField->identity();
+            }
+        }
+        job->fieldOpenMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now() - fieldBegin)
+                               .count();
         std::vector<vc3d::fiber_map::InputFiber> inputs;
         inputs.reserve(job->snapshot.fibers.size());
         job->fiberLengthVx.reserve(job->snapshot.fibers.size());
         for (auto& fiber : job->snapshot.fibers) {
+            vc3d::line_annotation::scaleFiberMapGeometry(
+                fiber.controlPoints, fiber.linePoints, fiber.sheetFieldFrameScale,
+                job->sheetField != nullptr);
             job->fiberLengthVx[fiber.id] = vc3d::fiber_slice::annotatedLineLengthVx(
                 fiber.linePoints, fiber.controlPoints);
             vc3d::fiber_map::InputFiber input;
@@ -1918,13 +2033,14 @@ void runRebuildJob(const std::shared_ptr<FiberMapWorkspace::RebuildJobResult>& j
             }
         }
         job->inputsDigest = vc3d::fiber_map::digestGlobalInputs(
-            inputs, job->snapshot.umbilicusCenters, job->params);
+            inputs, job->snapshot.umbilicusCenters, job->params, job->effectiveField);
         const auto layoutBegin = std::chrono::steady_clock::now();
         job->convertMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                              layoutBegin - convertBegin)
                              .count();
         job->layout = vc3d::fiber_map::buildGlobalLayout(
-            inputs, job->snapshot.umbilicusCenters, job->params, &job->cache);
+            inputs, job->snapshot.umbilicusCenters, job->params, &job->cache,
+            job->sheetField.get(), job->effectiveField);
         job->layoutMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                             std::chrono::steady_clock::now() - layoutBegin)
                             .count();
@@ -2078,6 +2194,20 @@ void FiberMapWorkspace::startRebuild(bool fullRebuild, bool automatic)
         job->builtPackageGeneration = _controller->packageGeneration();
         job->builtUmbilicusGeneration = _controller->umbilicusGeneration();
         job->catalogOrientation = _catalogOrientation;
+        job->sheetFieldToken = sheetFieldTokenFor(job->snapshot.sheetFieldLocation,
+                                                  job->snapshot.packageDirectory,
+                                                  job->snapshot.sheetFieldGeneration);
+        job->sheetFieldKey = sheetFieldKeyFor(job->snapshot);
+        // The memoized field travels with the job when it is the same
+        // dataset in the same frame; a Full rebuild reopens it.
+        if (fullRebuild) {
+            _sheetField.reset();
+            _sheetFieldKey.clear();
+        }
+        if (_sheetField && _sheetFieldKey == job->sheetFieldKey &&
+            !job->snapshot.sheetFieldLocation.empty()) {
+            job->sheetField = _sheetField;
+        }
         job->hadFibers = !job->snapshot.fibers.empty();
         job->hadUmbilicus = !job->snapshot.umbilicusCenters.empty();
         job->wantGapField = _gapsCheck && _gapsCheck->isChecked();
@@ -2107,6 +2237,9 @@ void FiberMapWorkspace::startRebuild(bool fullRebuild, bool automatic)
             job->params.solver.neighborhoodZVx = 0.5 * vxPerCm;      // ordinal window
             job->params.solver.neighborhoodArcVx = 0.5 * vxPerCm;
             job->params.solver.apexProminenceVx = 0.001 * vxPerCm; // fold apex vs jitter
+            job->params.bentRays.stepVx = 0.002 * vxPerCm;         // bent ray step
+            job->params.bentRays.maxLengthVx = 0.1 * vxPerCm;      // bent ray reach
+            job->params.bentRays.spacingVx = 0.002 * vxPerCm;      // ray start spacing
         }
 
         // The cache travels WITH the job: the worker is its only toucher
@@ -2240,10 +2373,13 @@ void FiberMapWorkspace::applyRebuild(const std::shared_ptr<RebuildJobResult>& jo
     // followed literally - discard and re-run. The job's cache IS kept: its
     // slots are content-keyed digests, exact across edits, so the immediate
     // re-run stays warm and cheap.
-    if (_controller->fiberDataGeneration() != job->snapshot.generation ||
-        _controller->umbilicusGeneration() != job->builtUmbilicusGeneration ||
-        _controller->umbilicusFingerprint() != job->preReadUmbilicusFingerprint ||
-        catalogManifestTokenFor(coordinateSpace) != job->catalogManifestToken) {
+    vc3d::fiber_map::FiberMapDependencies jobDependencies;
+    jobDependencies.fiberGeneration = job->snapshot.generation;
+    jobDependencies.umbilicusGeneration = job->builtUmbilicusGeneration;
+    jobDependencies.umbilicusFingerprint = job->preReadUmbilicusFingerprint;
+    jobDependencies.catalogManifestToken = job->catalogManifestToken;
+    jobDependencies.sheetFieldToken = job->sheetFieldToken;
+    if (vc3d::fiber_map::publicationRefused(jobDependencies, currentDependencies())) {
         _layoutCache = std::move(job->cache);
         if (isVisible()) {
             (void)_rebuildQueue.request(job->fullRebuild, job->automatic);
@@ -2291,6 +2427,14 @@ void FiberMapWorkspace::publishRebuild(RebuildJobResult& job)
     _layoutCatalogVolume = QString::fromStdString(
         vc3d::opendata::catalogVolumeOfCoordinateSpace(job.snapshot.coordinateSpace));
     _layoutCatalogManifestToken = job.catalogManifestToken;
+    _layoutSheetFieldToken = job.sheetFieldToken;
+    if (job.sheetField) {
+        _sheetField = job.sheetField;
+        _sheetFieldKey = job.sheetFieldKey;
+    } else {
+        _sheetField.reset();
+        _sheetFieldKey.clear();
+    }
     _layoutGeneration = job.snapshot.generation;
     _layoutFrame = job.snapshot.frame;
     _layoutPackageGeneration = job.builtPackageGeneration;
@@ -2420,6 +2564,40 @@ void FiberMapWorkspace::publishRebuild(RebuildJobResult& job)
         if (_layout.kollesisInferredCount > 0) {
             status += tr(" (%1 inferred)").arg(_layout.kollesisInferredCount);
         }
+    }
+    // The sheet normal field and the bent readings it gave (see
+    // FiberMapBentRays.hpp): what was read, what stood aside, what was
+    // withheld for want of a link witness, and how long the field took.
+    if (_layout.effectiveField.empty()) {
+        status += tr(" · no sheet field (straight rays only)");
+    } else if (_layout.effectiveField.rfind("unavailable|", 0) == 0) {
+        const QString statement = QString::fromStdString(_layout.effectiveField);
+        const int lastBar = statement.lastIndexOf(QLatin1Char('|'));
+        status += tr(" · sheet field unavailable: %1")
+                      .arg(lastBar >= 0 ? statement.mid(lastBar + 1) : statement);
+    } else {
+        status += tr(" · bent: %1 readings").arg(_layout.bentCrossingCount);
+        if (_layout.linkAnchoredCount > 0 || _layout.umbilicusAnchoredCount > 0) {
+            status += tr(" (%1 on link anchors, %2 on the umbilicus)")
+                          .arg(_layout.linkAnchoredCount)
+                          .arg(_layout.umbilicusAnchoredCount);
+        }
+        if (_layout.setAsideCount > 0 || _layout.radialInvertedCount > 0) {
+            status += tr(", %1 straight set aside")
+                          .arg(_layout.setAsideCount + _layout.radialInvertedCount);
+        }
+        if (_layout.withheldCount > 0) {
+            status += tr(", %1 withheld").arg(_layout.withheldCount);
+        }
+        if (_layout.anchorCorrectedStretchCount > 0) {
+            status += tr(", %1 anchor-corrected").arg(_layout.anchorCorrectedStretchCount);
+        }
+        if (_layout.unorientedRunCount > 0 || _layout.unsupportedRunCount > 0) {
+            status += tr(", %1 unoriented / %2 unsupported runs")
+                          .arg(_layout.unorientedRunCount)
+                          .arg(_layout.unsupportedRunCount);
+        }
+        status += tr(" · field %1 ms").arg(static_cast<qint64>(_layout.fieldMs) + job.fieldOpenMs);
     }
     // How the winding sense was settled, since a wrong sense is the one
     // thing that turns a clean map into hundreds of errors at once.

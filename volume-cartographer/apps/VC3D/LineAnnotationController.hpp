@@ -33,6 +33,7 @@
 #include "AnnotationFrame.hpp"
 #include "UmbilicusOrientationFreshness.hpp"
 #include "LineAnnotationFiberClassification.hpp"
+#include "LineAnnotationCoordinateScale.hpp"
 #include "LineAnnotationFiberDeletion.hpp"
 #include "LineAnnotationFiberSegments.hpp"
 #include "LineAnnotationFiberLinkValidation.hpp"
@@ -183,6 +184,11 @@ public:
         char hvTag = '?';
         std::vector<cv::Vec3d> controlPoints;
         std::vector<cv::Vec3d> linePoints;
+        // Stored geometry stays byte-identical to the legacy snapshot. The
+        // worker applies this scale only after opening a sheet-normal field.
+        // Conversion failures travel with it; only a field-enabled worker
+        // rejects them, preserving the fieldless geometry path.
+        vc3d::line_annotation::FiberMapFrameScale sheetFieldFrameScale;
         // Per control-point span; size max(0, controlPoints.size() - 1).
         std::vector<bool> tracedSegments;
         // Per control point: carries the kollesis_termination tag. Same size
@@ -230,6 +236,15 @@ public:
         // names the catalog entry that orients it; empty for a volume without
         // the tags.
         std::string coordinateSpace;
+        // The sheet normal field the Fiber Map reads bent rays from (see
+        // FiberMapBentRays.hpp): the package's selected lasagna dataset
+        // location (empty when none is selected), the package directory a
+        // local location resolves against, and the selection generation
+        // (sheetFieldGeneration()). Nothing is opened on the GUI thread: the
+        // rebuild worker opens it.
+        std::string sheetFieldLocation;
+        std::filesystem::path packageDirectory;
+        uint64_t sheetFieldGeneration = 0;
         QString umbilicusMessage;           // resolver error / ambiguity text; empty on success
         // Ready-to-display description of the frame the scale maps from, for
         // workspace status bars: the stamped volume and its level offset when
@@ -395,6 +410,14 @@ public:
     // catalog entry that orients it; empty for a volume without the tags.
     // A tag read, no parse, so it is cheap enough for dependency checks.
     [[nodiscard]] std::string fiberMapCoordinateSpace() const;
+    // The package's selected lasagna dataset location (the Fiber Map's sheet
+    // normal field), empty when none; and a counter bumped whenever that
+    // selection changes, for holders of derived data (the Fiber Map).
+    [[nodiscard]] std::string sheetFieldLocation() const;
+    [[nodiscard]] uint64_t sheetFieldGeneration() const { return _sheetFieldGeneration; }
+    // The directory a local sheet-field location resolves against (the
+    // package's), empty without a package.
+    [[nodiscard]] std::filesystem::path fiberMapPackageDirectory() const;
     [[nodiscard]] std::vector<FiberLinkOverlayInfo> fiberLinkOverlayInfos() const;
     // Bumped whenever the loaded fiber set changes (load, save, delete, and the
     // edits that refresh the fiber summaries). Holders of derived data compare
@@ -1361,6 +1384,9 @@ private:
     uint64_t _fiberDataGeneration = 1;
     // See packageGeneration(); starts at 1 for the same reason.
     uint64_t _packageGeneration = 1;
+    // See sheetFieldGeneration(); bumped wherever the selected lasagna
+    // dataset is set.
+    uint64_t _sheetFieldGeneration = 1;
     // Counts loads of the fiber list. A load that yields to the event loop
     // before publishing (the broken-link prompt, the repair-error dialog)
     // compares its own number against this afterwards and stands down if a

@@ -13,7 +13,11 @@
 #include <utility>
 #include <vector>
 
+#include "FiberMapBentRays.hpp"
+#include "FiberMapContentDigest.hpp"
 #include "FiberWindingSolver.hpp"
+
+#include <memory>
 
 // Extrinsic unroll of manually linked H/V fiber networks about the scroll
 // umbilicus, ported from the fiber_network_unroll.py review script.
@@ -242,6 +246,9 @@ struct GlobalLayoutParams {
     double minPadXVx = 9167.0;
     double minPadYVx = 6667.0;
     winding::SolverParams solver;
+    // Bent rays where the sheet runs along the umbilicus ray (see
+    // FiberMapBentRays.hpp); used only when a sheet normal field is given.
+    bent::BentRayParams bentRays;
 };
 
 // How a fiber's component got its absolute winding; mirrors the solver's
@@ -299,6 +306,66 @@ struct CrossingEvent {
     double violationTurns = 0.0;
     // Index into GlobalResult::crossingGroups, or -1.
     long long groupId = -1;
+    // --- Bent readings (winding::Crossing::bent and following): a crossing
+    // of the other fiber's polyline with a curtain of bent rays; deltaR is
+    // the signed ray arclength, confidence the transversality; `withheld`
+    // records constrained nothing (bentReason says why: winding::
+    // BentDisposition), `anchor` 0 none / 1 umbilicus / 2 links.
+    bool bent = false;
+    bool curtainFromV = false;
+    bool withheld = false;
+    int anchor = 0;
+    int bentReason = 0;
+    // The 3D hit on the other polyline, in the fibers' frame.
+    cv::Vec3d hitVx{0.0, 0.0, 0.0};
+    double rayLengthVx = 0.0;
+    double turnDeg = 0.0;
+    double minConditioning = 1.0;
+};
+
+// A pair whose straight readings the sheet normal field set aside (ill
+// conditioned at their own positions, or on a stretch the annotation
+// showed inverted), and what stood in: `reason` is `replaced` (usable bent
+// readings exist for the pair), `noWitness`, `contested`, `seamWithheld`,
+// `unorientedRun`, `unsupportedRun`, `folded`, `beyondFold`, `creaseCrossed`,
+// `straightDisagrees`, `liftAmbiguous`
+// (bent records exist but every one is withheld, the first reason by that
+// order) or `noBentReach`
+// (no non-contact bent records).
+struct PairCoverageRecord {
+    uint64_t hFiberId = 0;
+    uint64_t vFiberId = 0;
+    int setAsideCount = 0;
+    int radialInvertedCount = 0;
+    int bentCount = 0;
+    int withheldCount = 0;
+    std::string reason;
+};
+
+// One stretch of a fiber under the sheet normal field (a contiguous run of
+// samples where the field has a value), with its orientation vote and the
+// assembly's decision on it (see FiberMapBentRays.hpp and
+// winding::BentStretchDecision): the inspection record behind every bent
+// reading's anchor, and what tells the user which fiber needs a link.
+struct StretchDecisionRecord {
+    uint64_t fiberId = 0;
+    std::size_t firstSample = 0;
+    std::size_t lastSample = 0;
+    // The vote: 0 Oriented, 1 Unoriented (split), 2 Unsupported (no voter).
+    int voteStatus = 2;
+    int provisionalSign = 1;
+    double agreeWeight = 0.0;
+    double disagreeWeight = 0.0;
+    // Link witnesses agreeing / disagreeing with the provisional sign.
+    int witnessesAgree = 0;
+    int witnessesDisagree = 0;
+    int finalSign = 1;
+    int anchor = 0;
+    bool withheld = true;
+    int reason = 0;
+    bool corrected = false;
+    // Ill-conditioned runs (curtains) within the stretch.
+    int runCount = 0;
 };
 
 // A pair's crossings on one translate and run of V branches read together
@@ -347,6 +414,9 @@ struct CrossingMark {
     // Index into GlobalResult::crossingGroups when the error is a group's, else -1.
     long long groupId = -1;
     bool kollesis = false;
+    // A bent reading's mark: the 3D hit it read, so the user can look there.
+    bool bent = false;
+    cv::Vec3d hitVx{0.0, 0.0, 0.0};
 };
 
 // A fiber that could not be placed: no geometry, no umbilicus to unroll
@@ -464,11 +534,39 @@ struct GlobalResult {
     // distance degrades to the map's own arclength at rRef. See SheetModel.
     double sheetRadius0Vx = 0.0;
     double sheetPitchVx = 0.0;
+    // --- The sheet normal field the map was built with (see
+    // FiberMapBentRays.hpp): its identity, or the caller's statement of why
+    // none was available; empty when the build was asked for none (the
+    // legacy, field-less map, whose digests are unchanged). Everything
+    // below it is zero / empty without a field.
+    std::string effectiveField;
+    // Bent readings that constrained; records withheld; straight readings
+    // set aside by the field's conditioning gate and by the annotation's
+    // radial inversion; runs whose vote was split / voteless; stretches the
+    // witnesses anchored the other way; constraining bent readings by their
+    // anchor.
+    int bentCrossingCount = 0;
+    int withheldCount = 0;
+    int setAsideCount = 0;
+    int radialInvertedCount = 0;
+    int unorientedRunCount = 0;
+    int unsupportedRunCount = 0;
+    int anchorCorrectedStretchCount = 0;
+    int umbilicusAnchoredCount = 0;
+    int linkAnchoredCount = 0;
+    std::vector<PairCoverageRecord> pairCoverage;
+    // Every fiber's stretches under the field, in (fiber order, stretch)
+    // order.
+    std::vector<StretchDecisionRecord> stretchDecisions;
     // Phase timings (milliseconds), for the rebuild's one-line profile.
     double prepMs = 0.0;
     double detectMs = 0.0;
     double solveMs = 0.0;
     double geometryMs = 0.0;
+    // Field telemetry (not digested): time spent reading the field and
+    // tracing curtains, and samples read.
+    double fieldMs = 0.0;
+    uint64_t fieldSampleCount = 0;
 };
 
 // Distance along the sheet as a function of map position. The map's x is
@@ -510,18 +608,9 @@ struct SheetModel {
 // The sheet model a result carries.
 [[nodiscard]] SheetModel sheetModelOf(const GlobalResult& result);
 
-// 128-bit content digest (two independent FNV-1a lanes over raw bytes).
-// Collisions are the design's one stated deviation from literal exactness:
-// ~2^-64 per comparison, with Full rebuild as the recovery path.
-struct ContentDigest {
-    uint64_t a = 0;
-    uint64_t b = 0;
-    bool operator==(const ContentDigest& other) const
-    {
-        return a == other.a && b == other.b;
-    }
-    bool operator!=(const ContentDigest& other) const { return !(*this == other); }
-};
+// 128-bit content digest: see FiberMapContentDigest.hpp. Collisions are the
+// design's one stated deviation from literal exactness: ~2^-64 per
+// comparison, with Full rebuild as the recovery path.
 
 // Memoization for buildGlobalLayout, keyed on content digests of exactly what
 // each cached artifact consumes - never on anyone's generation counters:
@@ -563,6 +652,40 @@ class GlobalLayoutCache;
     const GlobalLayoutParams& params,
     GlobalLayoutCache* cache = nullptr);
 
+// The same with a sheet normal field (see FiberMapBentRays.hpp): every
+// fiber's samples are read for their conditioning, straight readings at
+// ill-conditioned positions are set aside and bent-ray readings stand in
+// where a curtain meets the other fiber. `effectiveField` is what the
+// result and the input digest record: the field's identity when one is
+// given (it must then equal field->identity()), or the caller's statement
+// of why none was available ("unavailable|..."), or empty for the
+// field-less map. The three builds of an automatic winding sense pass the
+// field through. The cache's prep and pair slots are keyed by the field's
+// identity, the bent parameters and the umbilicus cutoff as well.
+[[nodiscard]] GlobalResult buildGlobalLayout(
+    const std::vector<InputFiber>& fibers,
+    const std::vector<cv::Vec3f>& umbilicusCenters,
+    const GlobalLayoutParams& params,
+    GlobalLayoutCache* cache,
+    const bent::SheetNormalField* field,
+    const std::string& effectiveField);
+
+// What the layout derives from the field for one fiber over its visible
+// domain: the conditioning profile, the ill-conditioned mask, the
+// transported (provisional) orientation and the curtain. A pure function
+// of the fiber's geometry, the umbilicus, the field and the parameters.
+struct FieldPrep {
+    bent::ConditioningProfile profile;
+    std::vector<unsigned char> illConditioned;
+    bent::FiberOrientation orientation;
+    bent::BentCurtain curtain;
+    // Per strip side (stretch, lower ray, upper ray, side): the arclength
+    // at which the fiber's own polyline first crosses it beyond the seed
+    // edge (the fiber's sheet folding back through its curtain; absent
+    // when it never does).
+    bent::CurtainSelfCrossings selfCrossing;
+};
+
 class GlobalLayoutCache {
 public:
     void clear();
@@ -590,12 +713,20 @@ private:
     friend GlobalResult buildGlobalLayout(const std::vector<InputFiber>&,
                                           const std::vector<cv::Vec3f>&,
                                           const GlobalLayoutParams&,
-                                          GlobalLayoutCache*);
+                                          GlobalLayoutCache*,
+                                          const bent::SheetNormalField*,
+                                          const std::string&);
     struct PrepSlot {
         ContentDigest key;
         std::vector<double> thetaLine;
         std::vector<double> radius;
         std::vector<std::size_t> controlLineIndex;
+        // The field preparation, guarded by its own key H(prep key, field
+        // identity, bent parameters, umbilicus cutoff): a field or parameter
+        // change recomputes it and leaves the unwrap alone. Null without a
+        // field.
+        ContentDigest fieldKey;
+        std::shared_ptr<const FieldPrep> field;
     };
     struct PairSlot {
         ContentDigest key;
@@ -622,6 +753,14 @@ private:
     const std::vector<InputFiber>& fibers,
     const std::vector<cv::Vec3f>& umbilicusCenters,
     const GlobalLayoutParams& params);
+// With the effective field state (see buildGlobalLayout): the legacy digest
+// when it is empty, otherwise the legacy stream followed by the field's
+// identity, the bent parameters and the anchor policy.
+[[nodiscard]] ContentDigest digestGlobalInputs(
+    const std::vector<InputFiber>& fibers,
+    const std::vector<cv::Vec3f>& umbilicusCenters,
+    const GlobalLayoutParams& params,
+    const std::string& effectiveField);
 [[nodiscard]] ContentDigest digestGlobalResult(const GlobalResult& result);
 
 } // namespace vc3d::fiber_map

@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <string>
 
 #include "vc/core/util/ScrollUmbilicus.hpp"
 
@@ -37,7 +38,28 @@ struct FiberMapDependencies {
     // is empty, so an untagged volume never depends on the manifest).
     QString catalogVolume;
     QString catalogManifestToken;
+    // The sheet normal field the bent rays read (FiberMapBentRays.hpp): the
+    // package's selected lasagna dataset location and the controller's
+    // selection generation ("<location>|<generation>"); empty when none is
+    // selected. The field's content identity is the layout's business
+    // (GlobalResult::effectiveField); this names what a rebuild would open.
+    QString sheetFieldToken;
 };
+
+// The sheet-field token of FiberMapDependencies: what a rebuild would open
+// (the location as selected and, for a local location, where it resolves
+// against the package directory - a package saved elsewhere resolves a
+// relative location to another dataset) and the selection generation.
+// Empty when no field is selected.
+inline QString sheetFieldToken(const std::string& location, const std::string& resolvedLocation,
+                               uint64_t generation)
+{
+    if (location.empty()) {
+        return {};
+    }
+    return QString::fromStdString(location) + QLatin1Char('|') + QString::fromStdString(resolvedLocation) +
+           QLatin1Char('|') + QString::number(generation);
+}
 
 // What a comparison concluded, separately from acting on it.
 struct StaleVerdict {
@@ -65,6 +87,8 @@ struct StaleVerdict {
         Umbilicus,
         // The cached catalog manifest the winding sense is read from moved.
         Catalog,
+        // Another lasagna dataset was selected (or the selection cleared).
+        SheetField,
     };
     Action action = Action::Fresh;
     Cause cause = Cause::None;
@@ -193,7 +217,33 @@ inline StaleVerdict staleVerdictFor(const FiberMapDependencies& built,
         return verdict;
     }
 
+    // Another sheet normal field would be read: the bent readings, and
+    // which straight readings stand, follow the field.
+    if (current.sheetFieldToken != built.sheetFieldToken) {
+        verdict.action = StaleVerdict::Action::MarkStale;
+        verdict.cause = StaleVerdict::Cause::SheetField;
+        verdict.reason = QObject::tr("sheet normal field changed — press Update");
+        return verdict;
+    }
+
     return verdict;
+}
+
+// Whether a build that started from `job` (the dependencies as of its start)
+// may be published into `current` (the dependencies now): refused when any
+// dependency a rebuild reads changed meanwhile - the fibers, the umbilicus
+// (counter or file token), the catalog manifest, the sheet normal field
+// selection. The package and the frame are judged separately by the holder
+// (a package switch clears, a frame switch marks stale and keeps the cache),
+// so they are not compared here.
+inline bool publicationRefused(const FiberMapDependencies& job,
+                               const FiberMapDependencies& current)
+{
+    return current.fiberGeneration != job.fiberGeneration ||
+           current.umbilicusGeneration != job.umbilicusGeneration ||
+           current.umbilicusFingerprint != job.umbilicusFingerprint ||
+           current.catalogManifestToken != job.catalogManifestToken ||
+           current.sheetFieldToken != job.sheetFieldToken;
 }
 
 } // namespace vc3d::fiber_map

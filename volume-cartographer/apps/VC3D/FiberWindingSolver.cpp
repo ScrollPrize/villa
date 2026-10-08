@@ -1,6 +1,7 @@
 #include "FiberWindingSolver.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
 #include <chrono>
@@ -777,6 +778,8 @@ PairDetections detectPairCrossings(const CanonicalTrace& hTrace,
                     crossing.hSegment = i;
                     crossing.hT = t;
                     crossing.vBranch = branchIndex;
+                    crossing.vBranchSegment = j;
+                    crossing.vU = u;
                     crossing.detection = detectionCount++;
                     if (u == 0.0) {
                         crossing.vSample = branch.vertexId[j];
@@ -979,8 +982,31 @@ bool identicalPairDetections(const PairDetections& a, const PairDetections& b)
                sameDouble(x.transversality, y.transversality) && x.tangential == y.tangential &&
                x.orientation == y.orientation && x.hSegment == y.hSegment &&
                sameDouble(x.hT, y.hT) && x.vSample == y.vSample && x.touch == y.touch &&
-               x.vBranch == y.vBranch && x.detection == y.detection;
+               x.vBranch == y.vBranch && x.detection == y.detection &&
+               x.vBranchSegment == y.vBranchSegment && sameDouble(x.vU, y.vU);
     };
+    const auto sameHit = [&](const BentHit& x, const BentHit& y) {
+        return x.ownerIsV == y.ownerIsV && x.stretch == y.stretch && x.side == y.side &&
+               x.contributingStrips == y.contributingStrips &&
+               x.seedA == y.seedA && x.seedB == y.seedB && sameDouble(x.across, y.across) &&
+               sameDouble(x.startAX, y.startAX) && sameDouble(x.startAY, y.startAY) &&
+               sameDouble(x.startAZ, y.startAZ) && sameDouble(x.startBX, y.startBX) &&
+               sameDouble(x.startBY, y.startBY) && sameDouble(x.startBZ, y.startBZ) &&
+               sameDouble(x.s, y.s) && sameDouble(x.theta, y.theta) && sameDouble(x.hitX, y.hitX) &&
+               sameDouble(x.hitY, y.hitY) && sameDouble(x.hitZ, y.hitZ) && x.segment == y.segment &&
+               sameDouble(x.t, y.t) && sameDouble(x.transversality, y.transversality) &&
+               x.touch == y.touch && x.tangential == y.tangential &&
+               sameDouble(x.selfCrossingS, y.selfCrossingS) && sameDouble(x.turnDeg, y.turnDeg) &&
+               sameDouble(x.minConditioning, y.minConditioning);
+    };
+    if (a.bentHits.size() != b.bentHits.size() || a.setAsideCount != b.setAsideCount) {
+        return false;
+    }
+    for (std::size_t i = 0; i < a.bentHits.size(); ++i) {
+        if (!sameHit(a.bentHits[i], b.bentHits[i])) {
+            return false;
+        }
+    }
     if (a.raw.size() != b.raw.size() || a.shallow.size() != b.shallow.size() ||
         a.detectionCount != b.detectionCount || a.gapTranslates != b.gapTranslates ||
         a.unresolvedTranslates != b.unresolvedTranslates ||
@@ -1066,12 +1092,15 @@ PairCrossings classifyPairCrossings(const PairDetections& detections,
                                     const CanonicalTrace& vTrace,
                                     const std::vector<SeamAnchor>& seams,
                                     const std::vector<std::size_t>& inferredSeams,
-                                    const SolverParams& params)
+                                    const SolverParams& params,
+                                    const BentClassification* bent)
 {
     PairCrossings result;
     result.gatedSegmentCount = detections.gatedSegmentCount;
     result.tangentialCount = detections.tangentialCount;
     result.unresolvedCount = detections.unresolvedCount;
+    result.setAsideCount = detections.setAsideCount;
+    result.bentRawCount = static_cast<int>(detections.bentHits.size());
     if (hTrace.psi.empty() || vTrace.psi.empty()) {
         return result;
     }
@@ -1244,11 +1273,585 @@ PairCrossings classifyPairCrossings(const PairDetections& detections,
     }
     std::vector<Crossing> raw = detections.raw;
     std::vector<Crossing> shallow = detections.shallow;
-    const std::size_t detectionCount = detections.detectionCount;
-    const std::set<long long> gapTranslates(detections.gapTranslates.begin(),
-                                            detections.gapTranslates.end());
+    // Straight detections are judged against the assembly's radial-inversion
+    // mask (see BentAssembly): a hit on a sample whose final anchored normal
+    // points at the umbilicus, or whose interpolated inwardness at the hit
+    // does, reads the radial rule where the annotation says it does not
+    // hold. Such a detection is set aside before anything is merged: its
+    // segment and translate join the uncovered sets, exactly as the shard's
+    // own conditioning gate records its set-asides.
+    std::set<long long> gapTranslates(detections.gapTranslates.begin(),
+                                      detections.gapTranslates.end());
+    std::set<std::size_t> uncoveredSet(detections.uncoveredSegments.begin(),
+                                       detections.uncoveredSegments.end());
+    if (bent != nullptr) {
+        const auto inverted = [](const BentAssembly* assembly, std::size_t sample) {
+            return assembly != nullptr && sample < assembly->radialInverted.size() &&
+                   assembly->radialInverted[sample] != 0;
+        };
+        const auto inwardAt = [](const BentAssembly* assembly, std::size_t i0, std::size_t i1,
+                                 double t) {
+            if (assembly == nullptr || !assembly->inwardnessBetween) {
+                return false;
+            }
+            const double inwardness = assembly->inwardnessBetween(i0, i1, t);
+            return !std::isnan(inwardness) && inwardness < -assembly->conditioningGate;
+        };
+        const auto setAside = [&](const Crossing& c) {
+            bool out = inverted(bent->h, c.hSegment) || inverted(bent->h, c.hSegment + 1) ||
+                       inwardAt(bent->h, c.hSegment, c.hSegment + 1, c.hT);
+            if (!out && c.vBranchSegment != kNoSample && c.vBranch < vTrace.branches.size()) {
+                const Branch& branch = vTrace.branches[c.vBranch];
+                if (c.vBranchSegment + 1 < branch.sample.size()) {
+                    const std::size_t s0 = branch.sample[c.vBranchSegment];
+                    const std::size_t s1 = branch.sample[c.vBranchSegment + 1];
+                    out = inverted(bent->v, s0) || inverted(bent->v, s1) ||
+                          inwardAt(bent->v, s0, s1, c.vU);
+                }
+            }
+            return out;
+        };
+        for (std::vector<Crossing>* list : {&raw, &shallow}) {
+            std::vector<Crossing> kept;
+            kept.reserve(list->size());
+            for (const Crossing& c : *list) {
+                if (setAside(c)) {
+                    uncoveredSet.insert(c.hSegment);
+                    gapTranslates.insert(c.n);
+                    ++result.radialInvertedCount;
+                } else {
+                    kept.push_back(c);
+                }
+            }
+            *list = std::move(kept);
+        }
+    }
+    const std::vector<std::size_t> uncoveredSegments(uncoveredSet.begin(), uncoveredSet.end());
+    // Detection ids: the shard's straight detections, then the bent records
+    // (one id each, in their canonical order below).
+    const std::size_t detectionCount = detections.detectionCount +
+                                       (bent != nullptr ? detections.bentHits.size() : 0);
     const std::set<long long> unresolvedTranslates(detections.unresolvedTranslates.begin(),
                                                    detections.unresolvedTranslates.end());
+
+    // --- Bent readings: the shard's raw curtain hits of both owners, lifted,
+    // signed by the assembly's decision on the owner's run, reduced to the
+    // first encounter per strip and translate, with the H curtain preferred
+    // over an equivalent V curtain reading. Every record is a Crossing of
+    // its own; nothing here merges, groups or reads seams.
+    struct BentRecord {
+        Crossing record;
+        bool ownerIsV = false;
+        std::size_t stretch = 0;
+        int side = 1;
+        std::size_t seedA = 0;
+        std::size_t seedB = 0;
+        std::size_t segment = 0;
+        double t = 0.0;
+        double s = 0.0;
+        // Positions along the H and the V, in samples (the owner's by seed
+        // lerp, the other's by segment + t), and the lifted angles.
+        double hPos = 0.0;
+        double vPos = 0.0;
+        double psiH = 0.0;
+        double psiV = 0.0;
+        bool contact = false;
+        bool usable = false;
+        // The reading's own geometry is sound (lift residual within the
+        // band, not beyond the owner's fold or through a crease, not a
+        // contact, not too shallow), whatever its stretch's decision: what
+        // an unwitnessed reading needs to count as fold evidence.
+        bool geometricallySound = false;
+        // The strip identity: the unordered pair of the two rays' start
+        // points (the smaller first), which neither storage order nor any
+        // gauge enters.
+        std::array<double, 6> stripKey{};
+        std::vector<std::pair<std::size_t, std::size_t>> contributingStrips;
+    };
+    std::vector<BentRecord> bentRecords;
+    // The H position of every bent encounter (every record, before the
+    // reduction and the preference drop any): the terminal-event test
+    // asks whether the H met the V again further along, which a dropped
+    // twin answers as well as a kept record.
+    std::vector<double> bentAlong;
+    if (bent != nullptr && !detections.bentHits.empty()) {
+        const auto lerp = [](double a, double b, double t) { return a + t * (b - a); };
+        for (const BentHit& hit : detections.bentHits) {
+            const CanonicalTrace& owner = hit.ownerIsV ? vTrace : hTrace;
+            const CanonicalTrace& other = hit.ownerIsV ? hTrace : vTrace;
+            if (hit.seedA >= owner.psi.size() || hit.seedB >= owner.psi.size() ||
+                other.psi.size() < 2 || hit.segment + 1 >= other.psi.size()) {
+                continue;
+            }
+            const BentAssembly* assembly = hit.ownerIsV ? bent->v : bent->h;
+            const BentStretchDecision* decision =
+                assembly != nullptr && hit.stretch < assembly->stretches.size()
+                    ? &assembly->stretches[hit.stretch]
+                    : nullptr;
+            BentRecord entry;
+            entry.ownerIsV = hit.ownerIsV;
+            entry.stretch = hit.stretch;
+            entry.side = hit.side;
+            entry.seedA = hit.seedA;
+            entry.seedB = hit.seedB;
+            entry.contributingStrips = hit.contributingStrips;
+            if (entry.contributingStrips.empty()) {
+                entry.contributingStrips.emplace_back(std::min(hit.seedA, hit.seedB),
+                                                     std::max(hit.seedA, hit.seedB));
+            }
+            entry.segment = hit.segment;
+            entry.t = hit.t;
+            entry.s = hit.s;
+            const double ownerPsi = lerp(owner.psi[hit.seedA], owner.psi[hit.seedB], hit.across);
+            const double ownerZ = lerp(owner.z[hit.seedA], owner.z[hit.seedB], hit.across);
+            const double ownerPos =
+                static_cast<double>(hit.seedA) +
+                hit.across * (static_cast<double>(hit.seedB) - static_cast<double>(hit.seedA));
+            const double otherPsi = lerp(other.psi[hit.segment], other.psi[hit.segment + 1], hit.t);
+            const double otherZ = lerp(other.z[hit.segment], other.z[hit.segment + 1], hit.t);
+            const double otherPos = static_cast<double>(hit.segment) + hit.t;
+            if (hit.ownerIsV) {
+                entry.psiH = otherPsi;
+                entry.psiV = ownerPsi;
+                entry.hPos = otherPos;
+                entry.vPos = ownerPos;
+                entry.record.zVx = otherZ;
+            } else {
+                entry.psiH = ownerPsi;
+                entry.psiV = otherPsi;
+                entry.hPos = ownerPos;
+                entry.vPos = otherPos;
+                entry.record.zVx = ownerZ;
+            }
+            // The lift: the ray runs from the owner to the hit, accumulating
+            // theta about the umbilicus; in the canonical frame psi =
+            // chirality * theta, so the hit sits at psi_owner + chirality *
+            // theta in the OWNER's gauge. The translate n is the whole-turn
+            // gap between the gauges at the hit, exactly as a straight
+            // crossing's: psiV - psiH = 2 pi n + residual.
+            const double lift = static_cast<double>(bent->chirality) * hit.theta;
+            const double ownerSign = hit.ownerIsV ? -1.0 : 1.0;
+            const double delta = entry.psiV - entry.psiH - ownerSign * lift;
+            const long long n = static_cast<long long>(std::llround(delta / kTwoPi));
+            const double residual = delta - kTwoPi * static_cast<double>(n);
+            const bool liftOk = std::abs(residual) <= 0.25 * kTwoPi;
+            Crossing& c = entry.record;
+            c.bent = true;
+            c.curtainFromV = hit.ownerIsV;
+            c.n = n;
+            c.psiH = entry.psiH;
+            c.hitX = hit.hitX;
+            c.hitY = hit.hitY;
+            c.hitZ = hit.hitZ;
+            c.rayLengthVx = hit.s;
+            c.turnDeg = hit.turnDeg;
+            c.minConditioning = hit.minConditioning;
+            c.seedA = hit.seedA;
+            c.seedB = hit.seedB;
+            c.across = hit.across;
+            c.stretch = hit.stretch;
+            c.transversality = hit.transversality;
+            c.orientation = 0;
+            c.mergedCount = 1;
+            c.vSample = kNoSample;
+            // The V provenance: the V trace segment of the hit (the other
+            // polyline's segment for an H curtain, the seed span for a V
+            // curtain) resolved to the branch holding it, with the branch
+            // segment and parameter where the branch runs through it.
+            c.vBranch = 0;
+            c.vBranchSegment = kNoSample;
+            c.vU = 0.0;
+            {
+                // The V trace segment holding the hit's V position: the other
+                // polyline's segment for an H curtain; for a V curtain the
+                // seeds' interpolated position resolved to the segment it
+                // falls in (seeds are spaced by the ray spacing, not
+                // adjacent samples).
+                std::size_t vLo = hit.segment;
+                double vParameter = hit.t;
+                if (hit.ownerIsV) {
+                    const double position = std::clamp(
+                        entry.vPos, 0.0, static_cast<double>(vTrace.psi.size() - 1));
+                    vLo = static_cast<std::size_t>(std::floor(position));
+                    if (vTrace.psi.size() >= 2 && vLo + 1 >= vTrace.psi.size()) {
+                        vLo = vTrace.psi.size() - 2;
+                    }
+                    vParameter = position - static_cast<double>(vLo);
+                }
+                const std::size_t vHi = vLo + 1;
+                for (std::size_t b = 0; b < vTrace.branches.size(); ++b) {
+                    const Branch& branch = vTrace.branches[b];
+                    for (std::size_t j = 0; j + 1 < branch.sample.size(); ++j) {
+                        if (branch.sample[j] == vLo && branch.sample[j + 1] == vHi) {
+                            c.vBranch = b;
+                            c.vBranchSegment = j;
+                            c.vU = vParameter;
+                        } else if (branch.sample[j] == vHi && branch.sample[j + 1] == vLo) {
+                            c.vBranch = b;
+                            c.vBranchSegment = j;
+                            c.vU = 1.0 - vParameter;
+                        } else {
+                            continue;
+                        }
+                        break;
+                    }
+                    if (c.vBranchSegment != kNoSample) {
+                        break;
+                    }
+                }
+            }
+            {
+                const double clampedH = std::clamp(entry.hPos, 0.0,
+                                                   static_cast<double>(hTrace.psi.size() - 1));
+                std::size_t segment = static_cast<std::size_t>(std::floor(clampedH));
+                if (hTrace.psi.size() >= 2 && segment + 1 >= hTrace.psi.size()) {
+                    segment = hTrace.psi.size() - 2;
+                }
+                c.hSegment = segment;
+                c.hT = clampedH - static_cast<double>(segment);
+            }
+            const int finalSign = decision != nullptr ? decision->finalSign : 1;
+            const int side = hit.side * finalSign;
+            c.deltaR = hit.ownerIsV ? hit.s * static_cast<double>(side)
+                                    : -hit.s * static_cast<double>(side);
+            c.kind = c.deltaR <= 0.0 ? CrossingKind::Inside : CrossingKind::Outside;
+            c.anchor = decision != nullptr ? decision->anchor : 0;
+            entry.contact = hit.touch || hit.tangential;
+            if (entry.contact) {
+                c.touch = hit.touch;
+                c.tangential = true;
+                c.confidence = 0.0;
+            } else {
+                c.confidence = hit.transversality;
+                if (!trusted) {
+                    c.confidence *= params.untrustedConfidenceFactor;
+                }
+            }
+            if (decision == nullptr) {
+                c.withheld = true;
+                c.bentReason = static_cast<int>(BentDisposition::NoWitness);
+            } else if (bent->seamPair) {
+                c.withheld = true;
+                c.bentReason = static_cast<int>(BentDisposition::SeamWithheld);
+            } else if (decision->withheld) {
+                c.withheld = true;
+                c.bentReason = static_cast<int>(decision->disposition);
+            } else if (!liftOk) {
+                c.withheld = true;
+                c.bentReason = static_cast<int>(BentDisposition::LiftAmbiguous);
+            } else if (!entry.contact && hit.s > hit.selfCrossingS) {
+                c.withheld = true;
+                c.bentReason = static_cast<int>(BentDisposition::BeyondFold);
+            }
+            const bool creaseCrossed = assembly != nullptr && assembly->creaseTurnDeg > 0.0 &&
+                                       hit.turnDeg > assembly->creaseTurnDeg &&
+                                       hit.minConditioning < assembly->creaseConditioning;
+            entry.geometricallySound = !entry.contact && liftOk && !(hit.s > hit.selfCrossingS) &&
+                                       !creaseCrossed && hit.transversality >= params.minTransversality;
+            // The crease rule (see BentDisposition::CreaseCrossed), decided
+            // before any reading competes or suppresses: a reading through a
+            // crease neither reduces a clean one nor stands in for it.
+            if (!c.withheld && !entry.contact && creaseCrossed) {
+                c.withheld = true;
+                c.bentReason = static_cast<int>(BentDisposition::CreaseCrossed);
+            }
+            entry.usable = !entry.contact && !c.withheld &&
+                           hit.transversality >= params.minTransversality;
+            if (!entry.usable && !entry.contact && !c.withheld) {
+                // Too shallow to constrain, like a straight tangential pass.
+                c.tangential = true;
+                c.confidence = 0.0;
+                entry.contact = true;
+            }
+            const std::array<double, 3> a{hit.startAX, hit.startAY, hit.startAZ};
+            const std::array<double, 3> b{hit.startBX, hit.startBY, hit.startBZ};
+            const bool aFirst = a <= b;
+            const std::array<double, 3>& first = aFirst ? a : b;
+            const std::array<double, 3>& second = aFirst ? b : a;
+            entry.stripKey = {first[0], first[1], first[2], second[0], second[1], second[2]};
+            bentAlong.push_back(entry.hPos);
+            bentRecords.push_back(std::move(entry));
+        }
+        // First encounter per strip (owner, run, seeds, side) and translate,
+        // among the usable records only: the smallest s; records within
+        // 1e-6 vx of that minimum tie, and the tie goes to the greater
+        // transversality, then the lexicographically smaller hit point.
+        // Nothing unusable competes or suppresses.
+        {
+            constexpr double kTieVx = 1e-6;
+            std::map<std::tuple<bool, std::size_t, std::size_t, std::size_t, int, long long>,
+                     std::vector<std::size_t>>
+                byStrip;
+            for (std::size_t i = 0; i < bentRecords.size(); ++i) {
+                const BentRecord& e = bentRecords[i];
+                if (!e.usable) {
+                    continue;
+                }
+                for (const auto& [a, b] : e.contributingStrips) {
+                    byStrip[{e.ownerIsV, e.stretch, a, b, e.side, e.record.n}].push_back(i);
+                }
+            }
+            std::vector<char> dropped(bentRecords.size(), 0);
+            // A record dropped as the exact twin of the kept one (the same
+            // reading of the same strip from another passage of the other
+            // polyline: equal length, transversality and hit point) keeps
+            // standing in for its passage in the H preference below, so
+            // which twin the storage order put first cannot be seen.
+            std::vector<char> twin(bentRecords.size(), 0);
+            std::vector<std::vector<std::size_t>> twinOf(bentRecords.size());
+            for (const auto& [key, members] : byStrip) {
+                double minS = std::numeric_limits<double>::infinity();
+                for (const std::size_t i : members) {
+                    minS = std::min(minS, bentRecords[i].s);
+                }
+                std::size_t keep = members.front();
+                bool haveKeep = false;
+                for (const std::size_t i : members) {
+                    const BentRecord& e = bentRecords[i];
+                    if (e.s > minS + kTieVx) {
+                        continue;
+                    }
+                    if (!haveKeep) {
+                        keep = i;
+                        haveKeep = true;
+                        continue;
+                    }
+                    const BentRecord& k = bentRecords[keep];
+                    const std::array<double, 3> pe{e.record.hitX, e.record.hitY, e.record.hitZ};
+                    const std::array<double, 3> pk{k.record.hitX, k.record.hitY, k.record.hitZ};
+                    // Exact geometric twins (the same reading from two
+                    // passages) are told apart by what they export - the
+                    // lifted positions and the height - never by storage.
+                    const std::array<double, 3> se{e.psiH, e.psiV, e.record.zVx};
+                    const std::array<double, 3> sk{k.psiH, k.psiV, k.record.zVx};
+                    if (e.record.transversality > k.record.transversality ||
+                        (e.record.transversality == k.record.transversality &&
+                         (pe < pk || (pe == pk && se < sk)))) {
+                        keep = i;
+                    }
+                }
+                const BentRecord& kept = bentRecords[keep];
+                for (const std::size_t i : members) {
+                    if (i == keep) {
+                        continue;
+                    }
+                    dropped[i] = 1;
+                    const BentRecord& e = bentRecords[i];
+                    if (std::abs(e.s - kept.s) <= kTieVx &&
+                               e.record.transversality == kept.record.transversality &&
+                               e.record.hitX == kept.record.hitX && e.record.hitY == kept.record.hitY &&
+                               e.record.hitZ == kept.record.hitZ) {
+                        twinOf[i].push_back(keep);
+                    }
+                }
+            }
+            // A shared hit competes in EVERY contributing strip and is
+            // dropped if it loses in any of them. Evaluate all groups on
+            // the original usable set, so group traversal cannot matter.
+            // Only surviving representatives may stand for exact twins in
+            // H preference; a winner in one strip can lose in another.
+            for (std::size_t i = 0; i < twinOf.size(); ++i) {
+                auto& representatives = twinOf[i];
+                std::erase_if(representatives, [&](std::size_t k) { return dropped[k]; });
+                twin[i] = !representatives.empty();
+            }
+            // H preference: a V-owned usable crossing is dropped only when an
+            // H-owned usable crossing would emit the SAME inequality (same
+            // kind and translate) with both positions in the same
+            // ill-conditioned runs: the H-owned record's H position in the
+            // H run holding the V-owned record's H position, and its V
+            // position in the V run holding the V-owned record's seed.
+            const auto runOf = [](const BentAssembly* assembly, double position)
+                -> const BentStretchDecision* {
+                if (assembly == nullptr) {
+                    return nullptr;
+                }
+                for (const BentStretchDecision& stretch : assembly->stretches) {
+                    if (position >= static_cast<double>(stretch.firstSample) &&
+                        position <= static_cast<double>(stretch.lastSample)) {
+                        return &stretch;
+                    }
+                }
+                return nullptr;
+            };
+            const auto within = [](const BentStretchDecision* run, double position) {
+                return run != nullptr && position >= static_cast<double>(run->firstSample) &&
+                       position <= static_cast<double>(run->lastSample);
+            };
+            // Both sides by passage: the kept V-owned record stands for its
+            // exact twins (the same reading from other passages of the H),
+            // and is suppressed when ANY of those passages is covered by an
+            // equivalent H-owned record (kept or twin), so neither side's
+            // storage order shows.
+            for (std::size_t i = 0; i < bentRecords.size(); ++i) {
+                const BentRecord& v = bentRecords[i];
+                if (!v.usable || dropped[i] || !v.ownerIsV) {
+                    continue;
+                }
+                const BentStretchDecision* vRun =
+                    bent->v != nullptr && v.stretch < bent->v->stretches.size()
+                        ? &bent->v->stretches[v.stretch]
+                        : nullptr;
+                if (vRun == nullptr) {
+                    continue;
+                }
+                bool suppressed = false;
+                for (std::size_t p = 0; p < bentRecords.size() && !suppressed; ++p) {
+                    if (p != i && !(twin[p] && std::find(twinOf[p].begin(), twinOf[p].end(), i) != twinOf[p].end())) {
+                        continue;
+                    }
+                    const BentStretchDecision* hRun = runOf(bent->h, bentRecords[p].hPos);
+                    if (hRun == nullptr) {
+                        continue;
+                    }
+                    for (std::size_t j = 0; j < bentRecords.size(); ++j) {
+                        const BentRecord& h = bentRecords[j];
+                        if (!h.usable || (dropped[j] && !twin[j]) || h.ownerIsV ||
+                            h.record.n != v.record.n || h.record.kind != v.record.kind) {
+                            continue;
+                        }
+                        if (within(hRun, h.hPos) && within(vRun, h.vPos)) {
+                            suppressed = true;
+                            break;
+                        }
+                    }
+                }
+                if (suppressed) {
+                    dropped[i] = 1;
+                }
+            }
+            std::vector<BentRecord> kept;
+            kept.reserve(bentRecords.size());
+            for (std::size_t i = 0; i < bentRecords.size(); ++i) {
+                if (!dropped[i]) {
+                    kept.push_back(std::move(bentRecords[i]));
+                }
+            }
+            bentRecords = std::move(kept);
+            // Folds. The sign rule reads the next layer along the normal; a
+            // fold puts layers out of order there. Its signatures are
+            // topological: one curtain of the pair reading both kinds on
+            // one translate (the other fiber passes on both sides of it),
+            // or the pair's two curtains disagreeing on one translate.
+            // Every usable reading of such a translate is withheld, and the
+            // records say so.
+            // A reading withheld only for want of a witness, on a stretch
+            // whose vote nevertheless found a sign, is evidence within its
+            // own orientation section: opposite kinds there survive a sign flip.
+            // Its provisional sign has no established relation to another
+            // owner's (or another stretch's) anchor. Comparing those signs
+            // can manufacture a fold on a level shelf whose remote voters
+            // orient it opposite to the other owner's link witness.
+            const auto foldEvidence = [&](const BentRecord& e) {
+                if (e.usable) {
+                    return true;
+                }
+                if (!e.record.withheld ||
+                    e.record.bentReason != static_cast<int>(BentDisposition::NoWitness) || !e.geometricallySound) {
+                    return false;
+                }
+                const BentAssembly* assembly = e.ownerIsV ? bent->v : bent->h;
+                if (assembly == nullptr || e.stretch >= assembly->stretches.size()) {
+                    return false;
+                }
+                const auto voted = [&](std::size_t sample) {
+                    return sample < assembly->votedOrientation.size() && assembly->votedOrientation[sample] != 0;
+                };
+                return voted(e.seedA) && voted(e.seedB);
+            };
+            using OrientationKey = std::tuple<bool, std::size_t, std::size_t>;
+            const auto orientationKey = [&](const BentRecord& e) -> OrientationKey {
+                const auto* assembly = e.ownerIsV ? bent->v : bent->h;
+                const auto& run = assembly->stretches[e.stretch];
+                if (run.orientationFirstSample != kNoSample && run.orientationLastSample != kNoSample) {
+                    return {true, run.orientationFirstSample, run.orientationLastSample};
+                }
+                return {false, e.stretch, 0};
+            };
+            const auto withinOrientation = [&](const BentStretchDecision* run, double position) {
+                if (run->orientationFirstSample != kNoSample && run->orientationLastSample != kNoSample) {
+                    return position >= static_cast<double>(run->orientationFirstSample) &&
+                           position <= static_cast<double>(run->orientationLastSample);
+                }
+                return within(run, position);
+            };
+            std::map<long long, std::array<std::set<int>, 2>> kindsByTranslate;
+            std::map<std::tuple<long long, bool, OrientationKey>, std::set<int>> provisionalKinds;
+            std::set<long long> provisionalFolds;
+            for (const BentRecord& e : bentRecords) {
+                if (!foldEvidence(e)) {
+                    continue;
+                }
+                const int kind = e.record.kind == CrossingKind::Inside ? 0 : 1;
+                if (e.usable) {
+                    kindsByTranslate[e.record.n][e.ownerIsV ? 1 : 0].insert(kind);
+                } else {
+                    auto& kinds = provisionalKinds[{e.record.n, e.ownerIsV, orientationKey(e)}];
+                    kinds.insert(kind);
+                    if (kinds.size() == 2) {
+                        provisionalFolds.insert(e.record.n);
+                    }
+                }
+            }
+            // Independent provisional signs are comparable only up to a
+            // flip. For the SAME two continuous orientation sections, reciprocal
+            // readings must therefore have one consistent relative sign.
+            // Agreement at one passage and disagreement at another cannot
+            // be repaired by flipping either section. Withhold the involved
+            // readings as fold ambiguity, without choosing an orientation
+            // for the unwitnessed section. A clean shelf with uniformly
+            // opposite provisional signs has no such contradiction.
+            struct RelativeReadings {
+                unsigned relations = 0;
+                std::set<std::size_t> usable;
+            };
+            std::map<std::pair<OrientationKey, OrientationKey>, RelativeReadings> relativeReadings;
+            for (std::size_t i = 0; i < bentRecords.size(); ++i) {
+                const BentRecord& h = bentRecords[i];
+                if (h.ownerIsV || !foldEvidence(h) || bent->h == nullptr ||
+                    h.stretch >= bent->h->stretches.size()) {
+                    continue;
+                }
+                const auto* hRun = &bent->h->stretches[h.stretch];
+                for (std::size_t j = 0; j < bentRecords.size(); ++j) {
+                    const BentRecord& v = bentRecords[j];
+                    if (!v.ownerIsV || !foldEvidence(v) || h.record.n != v.record.n ||
+                        h.usable == v.usable || bent->v == nullptr ||
+                        v.stretch >= bent->v->stretches.size()) {
+                        continue;
+                    }
+                    const auto* vRun = &bent->v->stretches[v.stretch];
+                    if (!withinOrientation(hRun, v.hPos) || !withinOrientation(vRun, h.vPos)) {
+                        continue;
+                    }
+                    auto& relative = relativeReadings[{orientationKey(h), orientationKey(v)}];
+                    relative.relations |= h.record.kind == v.record.kind ? 1U : 2U;
+                    relative.usable.insert(h.usable ? i : j);
+                }
+            }
+            std::set<std::size_t> inconsistentRelativeOrientation;
+            for (const auto& [stretches, relative] : relativeReadings) {
+                if (relative.relations == 3U) {
+                    inconsistentRelativeOrientation.insert(relative.usable.begin(), relative.usable.end());
+                }
+            }
+            for (std::size_t i = 0; i < bentRecords.size(); ++i) {
+                BentRecord& e = bentRecords[i];
+                if (!e.usable) {
+                    continue;
+                }
+                const auto& kinds = kindsByTranslate[e.record.n];
+                const bool mixedOwner = kinds[0].size() == 2 || kinds[1].size() == 2;
+                const bool disagree = !kinds[0].empty() && !kinds[1].empty() && kinds[0] != kinds[1];
+                if (mixedOwner || disagree || provisionalFolds.count(e.record.n) != 0 ||
+                    inconsistentRelativeOrientation.count(i) != 0) {
+                    e.usable = false;
+                    e.record.withheld = true;
+                    e.record.bentReason = static_cast<int>(BentDisposition::Folded);
+                }
+            }
+        }
+    }
 
     // Pair-local sort and merge of the transversal detections into the
     // representatives the legacy constraint path is built from, unchanged:
@@ -1697,7 +2300,7 @@ PairCrossings classifyPairCrossings(const PairDetections& detections,
     // event's V branch's height range, and no segment on the way on which a
     // detection may have gone unseen (gated, or an unresolved overlap).
     {
-        const std::vector<std::size_t>& uncovered = detections.uncoveredSegments;
+        const std::vector<std::size_t>& uncovered = uncoveredSegments;
         // Any uncovered segment with index in [from, to]?
         const auto uncoveredWithin = [&](std::size_t from, std::size_t to) {
             if (from > to) {
@@ -1707,12 +2310,16 @@ PairCrossings classifyPairCrossings(const PairDetections& detections,
             return it != uncovered.end() && *it <= to;
         };
         std::vector<double> alongAll;
-        alongAll.reserve(raw.size() + shallow.size());
+        alongAll.reserve(raw.size() + shallow.size() + bentRecords.size());
         for (const std::vector<Crossing>* list : {&raw, &shallow}) {
             for (const Crossing& detection : *list) {
                 alongAll.push_back(static_cast<double>(detection.hSegment) + detection.hT);
             }
         }
+        // A bent reading is an encounter of the pair too: an H fiber that
+        // meets the V through a curtain between a straight crossing and its
+        // end did not end unmet.
+        alongAll.insert(alongAll.end(), bentAlong.begin(), bentAlong.end());
         std::sort(alongAll.begin(), alongAll.end());
         const std::size_t last = hPsi.size() - 1;
         for (Crossing& event : events) {
@@ -2058,6 +2665,87 @@ PairCrossings classifyPairCrossings(const PairDetections& detections,
             representative.groupIndex = displayGroup;
         }
     }
+    if (!bentRecords.empty()) {
+        // Compare the effective straight constraints, after seam reading,
+        // merging and traversal verdicts. Covered detections no longer
+        // constrain independently: Inside/Inside/Outside can mean one
+        // Outside traversal. A partially covered representative has
+        // already been rebuilt from its uncovered detections here.
+        std::map<long long, std::set<int>> straightKinds;
+        for (const Crossing& c : result.crossings) {
+            if (!c.coveredByGroups && !c.withheld && !c.tangential && !c.touch) {
+                straightKinds[c.n].insert(c.kind == CrossingKind::Inside ? 0 : 1);
+            }
+        }
+        for (const CrossingGroup& group : result.groups) {
+            if (group.hasVerdict) {
+                straightKinds[group.n].insert(group.verdict == CrossingKind::Inside ? 0 : 1);
+            }
+        }
+        for (BentRecord& e : bentRecords) {
+            if (!e.usable) {
+                continue;
+            }
+            const auto found = straightKinds.find(e.record.n);
+            if (found != straightKinds.end() &&
+                found->second.count(e.record.kind == CrossingKind::Inside ? 1 : 0) != 0) {
+                e.usable = false;
+                e.record.withheld = true;
+                e.record.bentReason = static_cast<int>(BentDisposition::StraightDisagrees);
+            }
+        }
+    }
+    // One canonical order over both owners, by terms that do not depend
+    // on either fiber's storage order and that cover everything a
+    // record exports: owner (H first), the strip (the rays' start
+    // points), the outward side first, s, the greater transversality
+    // first, the hit point, then every classified term (n, kind,
+    // withheld and why, anchor, contact flags, the lifted positions,
+    // the height), then storage tiebreakers that only separate records
+    // whose constraints and exports are identical.
+    std::stable_sort(bentRecords.begin(), bentRecords.end(),
+                     [](const BentRecord& a, const BentRecord& b) {
+                         const auto key = [](const BentRecord& e) {
+                             return std::make_tuple(
+                                 e.ownerIsV, e.stripKey, -e.side, e.s,
+                                 -e.record.transversality, e.record.hitX, e.record.hitY,
+                                 e.record.hitZ, e.record.n,
+                                 e.record.kind == CrossingKind::Inside ? 0 : 1,
+                                 e.record.withheld ? 1 : 0, e.record.bentReason,
+                                 e.record.anchor,
+                                 (e.record.touch ? 1 : 0) | (e.record.tangential ? 2 : 0),
+                                 e.psiH, e.psiV, e.record.zVx, e.stretch, e.segment, e.t,
+                                 e.seedA, e.seedB);
+                         };
+                         return key(a) < key(b);
+                     });
+    for (std::size_t i = 0; i < bentRecords.size(); ++i) {
+        bentRecords[i].record.detection = detections.detectionCount + i;
+    }
+
+    // Bent records: each its own representative (usable ones constrain,
+    // withheld ones are recorded, contacts follow the shallow path) and its
+    // own event, after every straight record, in their canonical order.
+    for (const BentRecord& entry : bentRecords) {
+        const Crossing& record = entry.record;
+        representativeOf[record.detection] = result.crossings.size();
+        clusterDetections.push_back({record.detection});
+        result.crossings.push_back(record);
+        Crossing event = record;
+        event.representative = representativeOf[record.detection];
+        eventOfDetection[record.detection] = events.size();
+        events.push_back(std::move(event));
+        if (entry.contact) {
+            continue;
+        }
+        if (record.withheld) {
+            ++result.bentWithheldCount;
+            result.bentWithheldReasons |= 1u << static_cast<unsigned>(record.bentReason);
+        } else {
+            ++result.bentUsableCount;
+        }
+    }
+
     result.events = std::move(events);
     return result;
 }
@@ -2177,6 +2865,10 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
         result.gatedSegmentCount += detection->detection->gatedSegmentCount;
         result.tangentialCount += detection->detection->tangentialCount;
         result.unresolvedIntersectionCount += detection->detection->unresolvedCount;
+        result.bentCrossingCount += detection->detection->bentUsableCount;
+        result.withheldCount += detection->detection->bentWithheldCount;
+        result.setAsideCount += detection->detection->setAsideCount;
+        result.radialInvertedCount += detection->detection->radialInvertedCount;
         const std::size_t crossingBase = merged.size();
         const std::size_t eventBase = events.size();
         const std::size_t groupBase = groups.size();
@@ -2241,8 +2933,9 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
             continue;
         }
         // A shallow pass is an event for the count and the record, never a
-        // constraint on its own.
-        if (crossing.tangential) {
+        // constraint on its own; a withheld bent reading is a record whose
+        // orientation the annotation did not justify.
+        if (crossing.tangential || crossing.withheld) {
             continue;
         }
         switch (crossing.kind) {
@@ -2505,13 +3198,26 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
     }
 
     // --- Local radial-ordering cost. One z-sorted point set over every fiber;
-    // membership in the comparison set is a flag consulted per query.
+    // membership in the comparison set is a flag consulted per query. A
+    // fiber's ordinal samples leave out those its FiberTrace excludes (the
+    // sheet normal field found the radial rule ill-conditioned there, or
+    // the annotation contradicted it), as point and as query alike.
+    std::vector<std::vector<std::size_t>> ordinalSamples(count);
+    for (std::size_t f = 0; f < count; ++f) {
+        const std::vector<unsigned char>& excluded = fibers[f].ordinalExcluded;
+        for (const std::size_t i : sampleIndices(psi[f].size())) {
+            if (i < excluded.size() && excluded[i] != 0) {
+                continue;
+            }
+            ordinalSamples[f].push_back(i);
+        }
+    }
     std::vector<OrdinalPoint> points;
     for (std::size_t f = 0; f < count; ++f) {
         if (!usable(f)) {
             continue;
         }
-        for (const std::size_t i : sampleIndices(psi[f].size())) {
+        for (const std::size_t i : ordinalSamples[f]) {
             points.push_back(OrdinalPoint{fibers[f].z[i], psi[f][i],
                                           fibers[f].radius[i], f});
         }
@@ -2537,7 +3243,7 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
                                  std::size_t excludeBlock, std::size_t* pairs) {
         double cost = 0.0;
         std::size_t pairCount = 0;
-        for (const std::size_t i : sampleIndices(psi[f].size())) {
+        for (const std::size_t i : ordinalSamples[f]) {
             const double z = fibers[f].z[i];
             const double p = psi[f][i];
             const double r = fibers[f].radius[i];
@@ -2632,7 +3338,7 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
         for (const auto& [block, blockMembers] : blocks) {
             for (const std::size_t f : blockMembers) {
                 std::vector<OrdinalPair>& list = pairsOf[f];
-                for (const std::size_t i : sampleIndices(psi[f].size())) {
+                for (const std::size_t i : ordinalSamples[f]) {
                     const double z = fibers[f].z[i];
                     const double p = psi[f][i];
                     const double r = fibers[f].radius[i];
@@ -2794,7 +3500,7 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
             if (!usable(f)) {
                 continue;
             }
-            for (const std::size_t i : sampleIndices(psi[f].size())) {
+            for (const std::size_t i : ordinalSamples[f]) {
                 const double z = fibers[f].z[i];
                 const double p = psi[f][i];
                 const double r = fibers[f].radius[i];
