@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <exception>
 #include <cmath>
 #include <chrono>
 #include <condition_variable>
@@ -808,29 +809,53 @@ NormalPrefetchReport LasagnaChannelChunkCache::prefetchResolved(
     report.chunksRead = missing.size();
     if (!missing.empty()) {
         maxWorkers = std::clamp<size_t>(maxWorkers, 1, missing.size());
+        // Every loaded chunk is retained for the batch from the pointer the
+        // load returns: the cache may evict it again before the batch reads
+        // it (another channel's loads, a small capacity), and a chunk that
+        // loaded must not come back as a missing sample.
+        std::vector<std::shared_ptr<const LasagnaCachedChunk>> loaded(missing.size());
         std::vector<std::future<void>> futures;
         futures.reserve(maxWorkers);
         std::atomic<size_t> next{0};
-        for (size_t worker = 0; worker < maxWorkers; ++worker) {
-            futures.push_back(lasagnaReadPool().submit(
-                [this, &binding, &array, &missing, &next]() {
-                    while (true) {
-                        const size_t index = next.fetch_add(1);
-                        if (index >= missing.size()) {
-                            return;
+        // Every worker is joined before anything here can be left: a
+        // failing read (or a failing submission) is rethrown only once the
+        // others have finished with `missing`, `loaded` and `next`.
+        std::exception_ptr failure;
+        try {
+            for (size_t worker = 0; worker < maxWorkers; ++worker) {
+                futures.push_back(lasagnaReadPool().submit(
+                    [this, &binding, &array, &missing, &loaded, &next]() {
+                        while (true) {
+                            const size_t index = next.fetch_add(1);
+                            if (index >= missing.size()) {
+                                return;
+                            }
+                            const LasagnaChannelChunkKey key = missing[index];
+                            loaded[index] = load(binding, array, key);
                         }
-                        const LasagnaChannelChunkKey key = missing[index];
-                        (void)load(binding, array, key);
-                    }
-                }));
+                    }));
+            }
+        } catch (...) {
+            failure = std::current_exception();
+            // Stop the workers already running at their next chunk.
+            next.store(missing.size());
         }
         for (auto& future : futures) {
-            future.get();
+            try {
+                future.get();
+            } catch (...) {
+                if (!failure) {
+                    failure = std::current_exception();
+                }
+                next.store(missing.size());
+            }
         }
-        std::shared_lock<std::shared_mutex> lock(mutex_);
-        for (const auto& key : missing) {
-            if (auto it = entries_.find(key); it != entries_.end()) {
-                resolved.emplace(key, it->second.bytes);
+        if (failure) {
+            std::rethrow_exception(failure);
+        }
+        for (size_t index = 0; index < missing.size(); ++index) {
+            if (loaded[index]) {
+                resolved.emplace(missing[index], loaded[index]);
             }
         }
     }
@@ -863,20 +888,37 @@ NormalPrefetchReport LasagnaChannelChunkCache::prefetchInterleaved(
     std::vector<std::future<void>> futures;
     futures.reserve(maxWorkers);
     std::atomic<size_t> next{0};
-    for (size_t worker = 0; worker < maxWorkers; ++worker) {
-        futures.push_back(lasagnaReadPool().submit([this, &missing, &next]() {
-            while (true) {
-                const size_t index = next.fetch_add(1);
-                if (index >= missing.size()) {
-                    return;
+    // Joined before leaving, whatever fails (see prefetchResolved).
+    std::exception_ptr failure;
+    try {
+        for (size_t worker = 0; worker < maxWorkers; ++worker) {
+            futures.push_back(lasagnaReadPool().submit([this, &missing, &next]() {
+                while (true) {
+                    const size_t index = next.fetch_add(1);
+                    if (index >= missing.size()) {
+                        return;
+                    }
+                    const auto& request = missing[index];
+                    (void)load(*request.first, *request.first->array, request.second);
                 }
-                const auto& request = missing[index];
-                (void)load(*request.first, *request.first->array, request.second);
-            }
-        }));
+            }));
+        }
+    } catch (...) {
+        failure = std::current_exception();
+        next.store(missing.size());
     }
     for (auto& future : futures) {
-        future.get();
+        try {
+            future.get();
+        } catch (...) {
+            if (!failure) {
+                failure = std::current_exception();
+            }
+            next.store(missing.size());
+        }
+    }
+    if (failure) {
+        std::rethrow_exception(failure);
     }
     return report;
 }
@@ -1593,10 +1635,7 @@ void appendLasagnaInterpolationChunkKeys(
     std::vector<LasagnaChannelChunkKey>& keys)
 {
     const LasagnaCubeRequest request = prepareLasagnaCubeRequest(binding, volumePoint);
-    if (!request.valid) {
-        return;
-    }
-    keys.insert(keys.end(), request.keys.begin(), request.keys.end());
+    appendUniqueLasagnaCubeRequestChunkKeys(request, keys);
 }
 
 std::optional<double> sampleLasagnaChannel(
@@ -1658,10 +1697,12 @@ std::optional<cv::Vec3d> sampleLasagnaCompactAxisTensor(
     }
     LasagnaCubeRequest resolvedNx = nxRequest;
     LasagnaCubeRequest resolvedNy = nyRequest;
-    for (size_t i = 0; i < resolvedNx.keys.size(); ++i) {
-        resolvedNx.chunks[i] = cache.get(nxBinding, *nxBinding.array, resolvedNx.keys[i]);
-        resolvedNy.chunks[i] = cache.get(nyBinding, *nyBinding.array, resolvedNy.keys[i]);
-    }
+    // Honor each request's single-chunk flag: the other seven keys are
+    // uninitialized placeholders, not requests for chunk (0, 0, 0).
+    LasagnaLocalChunkResolver nxResolver(nxBinding, cache);
+    LasagnaLocalChunkResolver nyResolver(nyBinding, cache);
+    nxResolver.resolve(resolvedNx);
+    nyResolver.resolve(resolvedNy);
     return sampleLasagnaCompactAxisTensor(nxBinding, nyBinding, resolvedNx, resolvedNy);
 }
 
