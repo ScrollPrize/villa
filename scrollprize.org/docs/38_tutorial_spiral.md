@@ -49,7 +49,7 @@ Most of our segmentation tools work bottom-up. [GrowPatch](2026_open_problems#no
 
 That is what the spiral fit does. It takes the whole pile of partial evidence — surface patches, traced lines, winding annotations, volumetric predictions — and fits a single, globally coherent surface for the entire scroll that agrees with as much of that evidence as possible. Where the evidence is dense, the fitted surface follows it closely; where there are gaps, the spiral bridges them smoothly instead of stopping or leaving a gap.
 
-<div className="mb-4">
+<div className="mb-4 max-w-[720px] mx-auto">
   <img src="/img/tutorials/spiral-fit-paris4.webp" className="w-[100%]"/>
   <figcaption className="mt-[-6px]">The result of fitting a spiral to PHerc. Paris 4 (Scroll 1): the 130 fitted windings, overlaid on a horizontal slice through the scan.</figcaption>
 </div>
@@ -173,11 +173,19 @@ The spiral workspace is composed of two "windows": the configuration dock, on th
 
 The configuration dock for the most part should be used top-to-bottom, and all fits begin with a session "connection"
 
-## INSERT A PIC OF THE UI
+<div className="mb-4 max-w-[900px] mx-auto">
+  <img src="/img/tutorials/spiral-workspace/workspace-overview.webp" alt="VC3D Spiral workspace with the configuration dock on the left, flattened preview in the center, and CT views on the right." className="w-[100%]" />
+  <figcaption className="mt-[-6px]">The Spiral workspace: configuration dock, flattened preview, and CT views.</figcaption>
+</div>
 
 ###### Connecting to a session
 
 In **Spiral Service**, choose a connection:
+
+<div className="mb-4 max-w-[720px] mx-auto">
+  <img src="/img/tutorials/spiral-workspace/spiral-service-section.webp" alt="Spiral Service panel showing connection profiles, endpoint, SSH host, dataset, output, and cache fields." className="w-[100%]" />
+  <figcaption className="mt-[-6px]">Connection profiles and service paths in the Spiral Service panel.</figcaption>
+</div>
 
 - **Local:** set **Dataset** and **Output**, then **Connect**. VC3D launches the service locally; its Python environment must have the spiral-fitting dependencies installed. Keep Output outside the dataset directory.
 - **Remote (SSH):** start the service on the GPU machine using the command below, then click **+SSH** in VC3D. Enter `[user@]host` (an SSH-config alias also works) and port `8765`, then **Connect**. Use SSH keys or an agent; if the host is new, connect once with `ssh user@host` in a terminal to accept its host key. VC3D creates the tunnel and retrieves the API key automatically.
@@ -197,13 +205,14 @@ Keep this process running in a persistent terminal such as `tmux`. Remote fits c
 
 The default parameters used by fit_spiral.py also apply to fit sessions run through the workspace. The only fields necessary for you to fill in are **Output Directory**, **z begin** and **z end**. If you'd like to override the defaults, click **Open Spiral Configuration...** and edit the fields. Hovering the mouse over the text for each field will show a brief description of what it does. 
 
-## INSERT A PIC OF THE SPIRAL CONFIGURATION DIALOG BOX
+<div className="mb-4 max-w-[900px] mx-auto">
+  <img src="/img/tutorials/spiral-workspace/spiral-configuration-panel.webp" alt="Spiral configuration dialog with sampling, loss, patch, and model settings." className="w-[100%]" />
+  <figcaption className="mt-[-6px]">The Spiral configuration dialog exposes the fit settings and their descriptions.</figcaption>
+</div>
 
 Set **z begin / z end** in **Fit and output**; start with a small range. Click **Initialize Fit**, choose **Iterations**, then **Run**. **Stop after iteration** pauses at the next completed step; another Run continues the fit. Initialization becomes **Rebuild Fit** once a fit exists. To resume a saved model, select it under **Checkpoint** and click **Load**.
 
 Once the configured number of steps completes, or on the interval set by **Background preview every..** spinbox when enabled, a flattened spiral surface will display in the viewer. 
-
-### INSERT PICTURE OF FLATTENED SURFACE
 
 Navigation in the spiral preview surface and the volume views is similar to the rest of VC3D
 - `right-click + drag` to pan, 
@@ -215,6 +224,11 @@ Navigation in the spiral preview surface and the volume views is similar to the 
 The spiral surface also contains a "minimap". Click the winding minimap below the flattened view to jump along the scroll. Use **Min winding / Max winding** limit the displayed windings (`-1` means through the last).
 
 Within the display section of the configuration dock is the **Volume** combobox, which allows you to select the primary displayed volume (Overlays are managed like regular VC3D, via the **Overlay** toolbar item). The spiral preview surface also has many additional overlays available. Use **Display →** to toggle output, input patches, fibers and point collections, surface intersections, winding boundaries, patch overlap, and run differences. Loss overlays require **Compute loss overlays with the next preview**, which roughly doubles preview cost. The fixed status area shows fit progress and preview age; **Logs** opens service messages.
+
+<div className="mb-4 max-w-[378px] mx-auto">
+  <img src="/img/tutorials/spiral-workspace/spiral-display-panel.webp" alt="Display dialog with controls for point collections, patch overlap, winding transitions, loss overlays, and input visibility." className="w-[100%]" />
+  <figcaption className="mt-[-6px]">Display controls for the preview and its overlays.</figcaption>
+</div>
 
 ##### Annotate and apply changes
 
@@ -233,7 +247,17 @@ When fitting a spiral using the spiral workspace, you can add constraints to a r
 | Escape | Exit the current drawing/point-placement mode |
 | Shift+E | Prepare drawing drafts for submission |
 
+<div className="mb-4 max-w-[720px] mx-auto">
+  <img src="/img/tutorials/spiral-workspace/surface-annotation-types.webp" alt="Flattened spiral surface with a purple painted patch and cyan point annotations." className="w-[100%]" />
+  <figcaption className="mt-[-6px]">A flattened spiral preview with a painted patch and point annotations.</figcaption>
+</div>
+
 Use **Add/Apply changes** to submit ready drafts to the fit, including while it is running. **Commit** persists the selected changes into the dataset; applying alone does not. For existing inputs, enable **Show original dataset inputs**, then right-click an entry and choose **Edit**. Patch and fiber editors save working copies; use Add/Apply afterward. **Remove** stages a removal, **Restore** reverses it before Commit, and committing the removal deletes the managed dataset entry.
+
+<div className="mb-4 max-w-[720px] mx-auto">
+  <img src="/img/tutorials/spiral-workspace/pending-and-committed-inputs.webp" alt="Input list showing drawing changes and the Add/Apply changes, Commit, and Remove buttons." className="w-[100%]" />
+  <figcaption className="mt-[-6px]">Drawing changes in the input list: Apply updates the fit; Commit writes them into the dataset.</figcaption>
+</div>
 
 ##### Preview intervals and rendering
 
@@ -318,17 +342,44 @@ The overlay PNGs are only written when `output_save_png_visualizations` is on; i
 ### Tips for getting better spiral fits
 The goal of any spiral fit is to do _as little annotation as possible_ . This is, of course, a hard question to answer until you have a perfect fit and work backwards. However, we can get a rough guess if we consider how the spiral interpolates. The easiest way to think of this is to imagine the scroll as a set of local shapes glued together, perhaps one section of the scroll looks like a `C` or one a `J` or god forbid a `Z`. In each of these shaped sections, we need _something_ to inform the spiral how the local area should be deformed. 
 
+<div className="mb-4 flex flex-wrap items-center justify-between sm:w-[108%] sm:ml-[-4%]">
+  <figure className="w-[100%] sm:w-[71%] m-0">
+    <img src="/img/tutorials/spiral-workspace/annotation-density-combined.webp" alt="A slab of scroll split into colored local shape sections, shown assembled on the left and exploded apart on the right, each marked with a green, yellow, or red annotation-density badge." className="w-[100%]" />
+    <figcaption className="mt-0">The scroll as a set of local shapes glued together. Badges indicate roughly how much annotation each section needs, from low (green) to high (red).</figcaption>
+  </figure>
+  <figure className="w-[60%] my-0 mx-auto sm:mx-0 sm:w-[26%]">
+    <img src="/img/tutorials/spiral-workspace/annotation-density-stack.webp" alt="Three stacked slabs of the scroll at different z heights, each divided into colored shape sections with annotation-density badges." className="w-[100%]" />
+    <figcaption className="mt-0">The same scroll at three heights: density follows local shape complexity, so it changes along z.</figcaption>
+  </figure>
+</div>
+
 These "descriptions" typically come in the form of constraints like patches, fibers, or relative winding annotations. The "density" of these shape descriptors required in a given area depends greatly on how uniform the deformation is. If a large number of windings all make mostly the same shape, it could be very few. However if an area makes something more `3C` than `C` (bear with me), you'll need a fair bit more annotation. The "complexity" of the local shape is the primary multiplier of annotation density, rather than the number of windings or the curvature alone. Once you've got a constraint that describes the neighborhood, there is little benefit in adding "more". You would not, for example, want to annotate multiple windings in a row radially if they are mostly the same shape and have somewhat regular spacing.
 
 The other instance which typically requires more-than-usual amounts of annotation is the case of shears. In this context, a shear of the scroll is a location where the papyrus has not only _broken apart_ but also _shifted_ along an axis. These situations are particularly hard for a smooth field to interpolate (they are by nature unsmooth). In these types of areas it is best to try and find some portion of the scroll which you can follow through, and apply a fair bit of annotation on either side of the shear, as near as you can get to the actual missing papyrus. 
 
-### INSERT PIC OF SOME SHAPES ON THE SCROLLS W/ STUFF DRAWN IDK HOW TO BEST SHOW THIS BUT WILL FIGURE OUT ALSO PIC OF SHEAR
+<div className="mb-4 flex flex-wrap items-start justify-between sm:w-[80%] sm:mx-auto">
+  <figure className="w-[100%] sm:w-[53%] m-0">
+    <video autoPlay playsInline loop muted className="w-[100%]" poster="/img/tutorials/spiral-workspace/shear-xy-poster.webp">
+      <source src="/img/tutorials/spiral-workspace/shear-xy.webm" type="video/webm"/>
+    </video>
+    <figcaption className="mt-0">Scrolling through z 9680–9990 across a shear, where the papyrus breaks and shifts along an axis.</figcaption>
+  </figure>
+  <figure className="w-[100%] sm:w-[45%] m-0">
+    <img src="/img/tutorials/spiral-workspace/shear-section-normal.webp" alt="Vertical CT section cut across the papyrus layers through the shear, showing a dark void at about z 9813 where the layers above and below are offset from each other." className="w-[100%]" />
+    <figcaption className="mt-0">The same shear in a vertical section cut across the layers. The crosshair marks z 9813, where the layers break apart and shift.</figcaption>
+  </figure>
+</div>
 
 Now that we've described the _bad_ areas, there are some shapes within a scroll which are "easier" (or at least as easy as unrolling an ancient carbonized scroll can reasonably be): 
 
 - Because the gap expander prefers to push outwards from its initial gap, and due to it being a cumulative sum of the gaps _along_ the radial , the spiral will (for the most part) perform quite well in areas with regular spacing and curvature which happens smoothly over a large area. This _reduces_ the amount of annotation we need in these areas
 - Areas which have large gaps between windings that are sustained for long runs reduce the amount of "uncertainty" in the fit, and are typically fit well very early
 - Areas with minimal curvature (even highly compressed ones)
+
+<div className="mb-4 max-w-[560px] mx-auto">
+  <img src="/img/tutorials/spiral-workspace/annotation-density-easy-piece.webp" alt="A single green 3D piece of the scroll, its top face showing evenly spaced windings that curve smoothly, with one white annotation line." className="w-[100%]" />
+  <figcaption className="mt-[-6px]">One of the easiest pieces from the slab above: regular spacing and smooth, gradual curvature mean a single annotation describes the whole neighborhood.</figcaption>
+</div>
 
 
 
