@@ -162,15 +162,28 @@ class _Fiber:
         return getattr(self.collection.geometry(self.index), key)
 
 
-def read_afv_polylines(path):
-    """Every fiber of an AFV as (fibers row dict, native xyz (N, 3) polyline), in id order."""
+def read_afv_polylines(path, fiber_ids=None):
+    """Raw AFV polylines in ID order, optionally only selected original IDs.
+
+    Unlike the training collection's geometry(), this does not repair/densify.
+    """
     with sqlite3.connect(f'file:{Path(path).resolve()}?mode=ro', uri=True) as c:
         columns = [r[1] for r in c.execute('PRAGMA table_info(fibers)')]
-        rows = {r[0]: dict(zip(columns, r)) for r in c.execute(f'SELECT {",".join(columns)} FROM fibers ORDER BY id')}
+        selected=None if fiber_ids is None else sorted(set(map(int,fiber_ids)))
+        if selected is not None:
+            c.execute('CREATE TEMP TABLE selected_fibers(id INTEGER PRIMARY KEY)')
+            c.executemany('INSERT INTO selected_fibers VALUES(?)',((i,) for i in selected))
+        where='' if selected is None else ' WHERE id IN (SELECT id FROM selected_fibers)'
+        rows = {r[0]: dict(zip(columns, r)) for r in c.execute(f'SELECT {",".join(columns)} FROM fibers{where} ORDER BY id')}
+        if selected is not None and len(rows)!=len(selected):
+            raise ValueError('Unknown requested AFV fiber ID')
         pieces = {}
-        for fid, first, blob in c.execute('SELECT fiber_id,first_segment,points FROM blocks ORDER BY fiber_id,first_segment'):
+        where='' if selected is None else ' WHERE fiber_id IN (SELECT id FROM selected_fibers)'
+        for fid, first, blob in c.execute('SELECT fiber_id,first_segment,points FROM blocks'+where+' ORDER BY fiber_id,first_segment'):
             xyz = np.frombuffer(blob, dtype='<f8').reshape(-1, 3)
-            pieces.setdefault(fid, []).append(xyz if fid not in pieces else xyz[1:])
+            # Evaluate membership BEFORE setdefault inserts the first block.
+            block = xyz if fid not in pieces else xyz[1:]
+            pieces.setdefault(fid, []).append(block)
     return [(rows[fid], np.concatenate(pieces[fid])) for fid in rows]
 
 

@@ -1,0 +1,6 @@
+{
+  "fiber_normal_priors": {
+    "native_config": "/home/hendrik/villa2/global-fiber-sgd/extract_outward_priors.json",
+    "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/sign_resolution_v2/prior_runner"
+  }
+}

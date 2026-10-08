@@ -2,9 +2,9 @@
 
 ## Current task
 
-Independent fiber normal orientation, with full plan and validation protocol in
-[normal_orientation_plan.md](normal_orientation_plan.md). This is a second pass
-over saved constraints, not new constraint extraction or cross-fiber alignment.
+Signed-normal solution visualization with full plan in
+[sign_visualization_plan.md](sign_visualization_plan.md). CPU-only OBJ/PLY export,
+original whole AFV curves and exact oriented endpoint normals; no new inference.
 
 ## Follow-up: shared BP integration (2026-10-08)
 

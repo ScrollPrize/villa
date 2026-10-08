@@ -1,5 +1,28 @@
 # Status
 
+- [x] Inward normal output / outward display convention; long-preview arrows5x,
+  in-place update, all2463tips validated and original OBJ unchanged.
+
+- [x] Longer retained-fiber preview exported and validated;median8285basevoxels,
+  100fibers/0broken/2463arrows. Independent plan review and4tests passed.
+
+- [x] Whole-scroll retained preview:100fibers/295arrows,0broken;4tests passed.
+
+## Signed-normal visualization
+
+- [x] Plan independently reviewed; CPU exporter and regression tests implemented.
+- [x] Preview45fibers/349arrows generated;7tests pass; paths/commands documented.
+- [x] MeshLab compatibility:explicit675edges, raw first-vertex fix, regenerated
+  both OBJ files/index ranges; normal PLY hash unchanged; regression tested.
+
+## Whole-fiber sign resolution
+
+- [x] Plan independently reviewed; catalogue umbilicus found/frame verified.
+- [x] Shared native scalar-prior export and PyTorch objective implemented.
+- [x] Native142/Python5tests; full signed-endpoint/prior gauge and hash validation.
+- [x] Managed GPU2000/10000step penalty comparison; independent solution validation.
+- [x] Durable results/model documentation and reproducible commands.
+
 ## Independent fiber normal orientation
 
 - [x] Plan and implementation independently reviewed.

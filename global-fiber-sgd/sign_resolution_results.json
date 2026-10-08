@@ -1,0 +1,201 @@
+{
+  "summary": {
+    "baselines": {
+      "baked_plus": {
+        "broken_fibers_percent": 0.0,
+        "expected_broken_percent": 9.35762318327038e-12,
+        "outward_agreement": -0.022045228630304337,
+        "retained_disagreement_original_weight_percent": 33.987552642822266,
+        "retained_events_percent": 100.0,
+        "uncertain_signs_percent": 100.0,
+        "weighted_disagreement_all_percent": 33.987552642822266,
+        "weighted_disagreement_retained_percent": 33.987552642822266
+      },
+      "radial": {
+        "broken_fibers_percent": 0.0,
+        "expected_broken_percent": 9.35762318327038e-12,
+        "outward_agreement": 0.7007447481155396,
+        "retained_disagreement_original_weight_percent": 1.4637064933776855,
+        "retained_events_percent": 100.0,
+        "uncertain_signs_percent": 100.0,
+        "weighted_disagreement_all_percent": 1.4637064933776855,
+        "weighted_disagreement_retained_percent": 1.4637064933776855
+      }
+    },
+    "config": {
+      "broken_penalties": [
+        0.01,
+        0.1,
+        1.0
+      ],
+      "code_provenance": {
+        "optimizer_sha256": "0a9afb0fc69f6ff41b4c6b947894c31bf3cc455105a8ba50ec124b03193cd071",
+        "revision": "1a41f43219e42892942155a8de3cef103103025b"
+      },
+      "database": "/home/hendrik/villa2/global-fiber-sgd/data/oriented_normals_v1/full.afc.sqlite",
+      "devices": "0",
+      "gpu_manager": {
+        "cpu_cores": 4,
+        "exclusive": false,
+        "label": "global-fiber-normal-sign",
+        "priority": 100,
+        "vram_bytes_per_gpu": 4294967296
+      },
+      "log_every": 1000,
+      "lr": 0.05,
+      "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/sign_resolution_v2/adam_sweep",
+      "prior_weight": 0.001,
+      "priors": "/home/hendrik/villa2/global-fiber-sgd/data/sign_resolution_v2/outward_priors.json",
+      "seed": 0,
+      "steps": 10000,
+      "tensor_cache": "/home/hendrik/villa2/global-fiber-sgd/data/sign_resolution_v2/tensors.npz"
+    },
+    "deterministic_algorithms": true,
+    "gpu": "NVIDIA H100 80GB HBM3",
+    "hard_readout": "sign +1 for logit>=0; broken for logit>=0; probabilities retained",
+    "input": {
+      "fibers": 512698,
+      "invalid_events_skipped": 0,
+      "isolated_fibers": 43776,
+      "perpendicular_events": 1320610,
+      "seconds": 23.490192390978336,
+      "signature": {
+        "database_sha256": "8983b333a2d44ef6f0461f031f35c4b92e5353d2ecf6247d30945017c3229bd7",
+        "priors_sha256": "da3f089a5264b5b2e23dbedb3aad30c6710908c2794612f82757a68374e69caf",
+        "version": 2
+      },
+      "tensor_bytes": 43130914,
+      "used_events": 1320610
+    },
+    "interpretation": "event-weighted agreement, not anatomical accuracy; no winding solve",
+    "peak_allocated_bytes": 148575744,
+    "runs": [
+      {
+        "all_broken_objective": 0.01014962762594223,
+        "broken_penalty": 0.01,
+        "final": {
+          "broken_fibers_percent": 9.225314140319824,
+          "expected_broken_percent": 9.31370735168457,
+          "loss": 0.00110261095687747,
+          "outward_agreement": 0.6974418759346008,
+          "pair_loss": 1.8750444723991677e-05,
+          "prior_loss": 0.1524897664785385,
+          "retained_disagreement_original_weight_percent": 6.459488758991938e-06,
+          "retained_events_percent": 49.76866912841797,
+          "seconds": 22.212593825999647,
+          "step": 10000,
+          "uncertain_signs_percent": 0.40706223249435425,
+          "weighted_disagreement_all_percent": 0.34241995215415955,
+          "weighted_disagreement_retained_percent": 1.2977688129467424e-05
+        },
+        "initial": {
+          "broken_fibers_percent": 0.0,
+          "expected_broken_percent": 0.9999998807907104,
+          "loss": 0.3042161762714386,
+          "outward_agreement": 0.7007447481155396,
+          "pair_loss": 0.303840309381485,
+          "prior_loss": 0.27589040994644165,
+          "retained_disagreement_original_weight_percent": 1.4637064933776855,
+          "retained_events_percent": 100.0,
+          "seconds": 0.011554656899534166,
+          "step": 0,
+          "uncertain_signs_percent": 100.0,
+          "weighted_disagreement_all_percent": 1.4637064933776855,
+          "weighted_disagreement_retained_percent": 1.4637064933776855
+        }
+      },
+      {
+        "all_broken_objective": 0.10014962762594223,
+        "broken_penalty": 0.1,
+        "final": {
+          "broken_fibers_percent": 0.4685019254684448,
+          "expected_broken_percent": 0.47929707169532776,
+          "loss": 0.0006569703109562397,
+          "outward_agreement": 0.6974768042564392,
+          "pair_loss": 2.5490589905530214e-05,
+          "prior_loss": 0.1521826684474945,
+          "retained_disagreement_original_weight_percent": 0.0010529833380132914,
+          "retained_events_percent": 98.43224334716797,
+          "seconds": 22.271325637004338,
+          "step": 10000,
+          "uncertain_signs_percent": 0.4197402894496918,
+          "weighted_disagreement_all_percent": 0.34136760234832764,
+          "weighted_disagreement_retained_percent": 0.001069389982149005
+        },
+        "initial": {
+          "broken_fibers_percent": 0.0,
+          "expected_broken_percent": 0.9999998807907104,
+          "loss": 0.3051161766052246,
+          "outward_agreement": 0.7007447481155396,
+          "pair_loss": 0.303840309381485,
+          "prior_loss": 0.27589040994644165,
+          "retained_disagreement_original_weight_percent": 1.4637064933776855,
+          "retained_events_percent": 100.0,
+          "seconds": 0.00045883492566645145,
+          "step": 0,
+          "uncertain_signs_percent": 100.0,
+          "weighted_disagreement_all_percent": 1.4637064933776855,
+          "weighted_disagreement_retained_percent": 1.4637064933776855
+        }
+      },
+      {
+        "all_broken_objective": 1.0001496276259423,
+        "broken_penalty": 1.0,
+        "final": {
+          "broken_fibers_percent": 0.08952638506889343,
+          "expected_broken_percent": 0.09061534702777863,
+          "loss": 0.002680918201804161,
+          "outward_agreement": 0.6970009803771973,
+          "pair_loss": 0.0016223547281697392,
+          "prior_loss": 0.1524098962545395,
+          "retained_disagreement_original_weight_percent": 0.1607407182455063,
+          "retained_events_percent": 99.55323791503906,
+          "seconds": 23.404728431953117,
+          "step": 10000,
+          "uncertain_signs_percent": 0.39672479033470154,
+          "weighted_disagreement_all_percent": 0.3201580345630646,
+          "weighted_disagreement_retained_percent": 0.16145429015159607
+        },
+        "initial": {
+          "broken_fibers_percent": 0.0,
+          "expected_broken_percent": 0.9999998807907104,
+          "loss": 0.3141161799430847,
+          "outward_agreement": 0.7007447481155396,
+          "pair_loss": 0.303840309381485,
+          "prior_loss": 0.27589040994644165,
+          "retained_disagreement_original_weight_percent": 1.4637064933776855,
+          "retained_events_percent": 100.0,
+          "seconds": 0.0007346710190176964,
+          "step": 0,
+          "uncertain_signs_percent": 100.0,
+          "weighted_disagreement_all_percent": 1.4637064933776855,
+          "weighted_disagreement_retained_percent": 1.4637064933776855
+        }
+      }
+    ],
+    "torch_version": "2.11.0+cu128"
+  },
+  "validation": [
+    {
+      "penalty": 0.01,
+      "broken_fibers": 47298,
+      "retained_events": 657250,
+      "opposed_retained_events": 9,
+      "weighted_retained_disagreement_percent": 1.2977689141039694e-05
+    },
+    {
+      "penalty": 0.1,
+      "broken_fibers": 2402,
+      "retained_events": 1299906,
+      "opposed_retained_events": 137,
+      "weighted_retained_disagreement_percent": 0.0010693899082287815
+    },
+    {
+      "penalty": 1.0,
+      "broken_fibers": 459,
+      "retained_events": 1314710,
+      "opposed_retained_events": 2499,
+      "weighted_retained_disagreement_percent": 0.16145429887203797
+    }
+  ]
+}

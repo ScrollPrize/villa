@@ -14,6 +14,10 @@ Second pass: [fiber-local signed normal sweep](constraint_database.md#second-pas
 stores signed endpoint normals plus a separate+1fiber sign. No cross-fiber
 alignment or winding assignment is performed yet.
 
+Third stage: [whole-fiber normal sign optimization](sign_resolution.md) adds
+PyTorch sign/broken probabilities, perpendicular normal agreement and a weak
+catalogue-umbilicus prior. Whole fibers remain intact; winding solving is separate.
+
 Reciprocal-filter follow-up: [parallel removal and perpendicular iteration
 comparison](parallel_reciprocal_results.md). The existing exported database is
 the historical reciprocal-on baseline; these comparison runs do not overwrite it.

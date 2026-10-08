@@ -2,6 +2,37 @@
 
 ## 2026-10-08
 
+- Canonical saved signs now inward; display arrows outward, with explicit
+  conventions and legacy conversion. Long-preview2463arrows overwritten at5x
+  length/radius (640/20); original OBJ unchanged, historical solution preserved.
+
+- Longer whole-scroll preview:100 spatially selected from1000longest retained
+  fibers,0broken,2463normal arrows; length min/median/max7546/8285/11358basevoxels.
+  Output whole_scroll_100_long_retained/ (2.49MiB); previous preview preserved.
+
+- Whole-scroll preview:100 spatially distributed retained fibers,0broken,
+  295arrows,887vertices,787OBJedges. Four exporter tests passed. Output:
+  data/sign_resolution_v2/whole_scroll_100_retained/ (372KiB).
+
+- Fixed MeshLab fiber OBJ compatibility:explicit two-vertex line elements for
+  every segment, replacing long multi-index polyline records. Existing preview
+  repaired programmatically with geometry-range checks; signed-normal PLY unchanged.
+  Also fixed pre-existing raw AFV reader evaluation order dropping first vertices;
+  regenerated45full curves/720vertices/675edges and updated index ranges.
+
+- Added CPU signed-normal visualization:raw AFV OBJ polylines, colored PLY arrow
+  meshes, broken-only OBJ overlay and per-fiber/event/arc metadata. Reuses raw AFV
+  reader with optional ID selection; no geometry repair/inference. Preview45fibers,
+  349arrows around brokenfiber454634;7tests. See sign_resolution.md.
+
+- Implemented whole-fiber GPU sign/broken resolution from perpendicular normal
+  dots and weak catalogue-umbilicus radial prior. Reuses native normal sweep and
+  frame-checked Umbilicus; source DB fingerprints prevent stale-prior pairing.
+  Full512,698fibers/1,320,610events,10000Adamsteps~22s/penalty on managed H100;
+  penalty0.1retains98.4322%events with0.001069%weighted sign opposition and0.4685%
+  broken fibers.142native/5Python tests and independent saved-solution validation.
+  No anatomy/optimality claim; source DB untouched. See sign_resolution_results.md.
+
 - Added native second-pass fiber-local normal orientation over existing constraint
   DB, regular16base-voxel sampling plus exact endpoints, independent+1fiber gauge.
   Schema2 stores only signed endpoint normals; source extraction/measurements

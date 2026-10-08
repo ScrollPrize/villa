@@ -1,0 +1,16 @@
+{
+  "fiber_normal_visualization": {
+    "afv": "/home/hendrik/villa2/global-fiber-sgd/data/Paris4_v1.afv",
+    "database": "/home/hendrik/villa2/global-fiber-sgd/data/oriented_normals_v1/full.afc.sqlite",
+    "solution": "/home/hendrik/villa2/global-fiber-sgd/data/sign_resolution_v2/adam_sweep/solution_0.1.npz",
+    "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/sign_resolution_v2/whole_scroll_100_retained",
+    "sample_count":100,
+    "exclude_broken":true,
+    "arrow_spacing":256,
+    "arrow_length":128,
+    "arrow_radius":4,
+    "max_fibers":100,
+    "max_points":1000000,
+    "max_arrows":50000
+  }
+}

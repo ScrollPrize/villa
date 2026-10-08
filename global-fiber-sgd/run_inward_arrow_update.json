@@ -1,0 +1,7 @@
+{
+  "fiber_normal_arrow_update": {
+    "output_root": "/home/hendrik/villa2/global-fiber-sgd/data/sign_resolution_v2/whole_scroll_100_long_retained",
+    "arrow_length": 640,
+    "arrow_radius": 20
+  }
+}

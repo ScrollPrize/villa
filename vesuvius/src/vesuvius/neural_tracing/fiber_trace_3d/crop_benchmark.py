@@ -51,6 +51,21 @@ def bp_metrics(log):
 
 
 def run(config):
+    if 'fiber_normal_arrow_update' in config:
+        from .fiber_normal_sign_visualization import update_arrows
+        return update_arrows(config['fiber_normal_arrow_update'])
+    if 'fiber_normal_obj_repair' in config:
+        from .fiber_normal_sign_visualization import repair_obj_lines
+        return repair_obj_lines(config['fiber_normal_obj_repair'])
+    if 'fiber_normal_visualization' in config:
+        from .fiber_normal_sign_visualization import export
+        return export(config['fiber_normal_visualization'])
+    if 'fiber_normal_priors' in config:
+        from .fiber_normal_sign import run_priors
+        return run_priors(config['fiber_normal_priors'])
+    if 'fiber_normal_sign' in config:
+        from .fiber_normal_sign import run as run_sign
+        return run_sign(config['fiber_normal_sign'])
     if 'neighborhood_readout_report' in config:
         from .neighborhood_readout_report import report
         return report(config)
