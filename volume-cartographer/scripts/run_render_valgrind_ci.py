@@ -8,6 +8,8 @@ import hashlib
 import json
 import math
 import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -35,6 +37,59 @@ REPLAY_CONFIGURATION = {
     "replay_idle_scale": 1.0,
     "dependency_excess_scale": 1.0,
 }
+
+
+def collect_evaluate(args: argparse.Namespace) -> None:
+    """Retry invalid captures, never a valid score's comparison to the reference."""
+    case = args.case_dir.resolve()
+    capture = case / "callgrind"
+    output = case / "evaluation.json"
+    case.mkdir(parents=True, exist_ok=True)
+    output.unlink(missing_ok=True)
+    for attempt in range(1, 4):
+        shutil.rmtree(capture, ignore_errors=True)
+        capture.mkdir()
+        print(f"{args.fixture}/{args.scenario}: capture attempt {attempt}/3", flush=True)
+        scheduler = capture / "scheduler.log"
+        collect = [
+            str(args.valgrind), "--tool=callgrind", "--instr-atstart=no",
+            "--fair-sched=yes", "--scheduling-quantum=10000",
+            "--separate-threads=yes", "--dump-every-bb=10000",
+            "--combine-dumps=no", "--collect-systime=no", "--cache-sim=yes",
+            "--branch-sim=yes", "--I1=32768,8,64", "--D1=32768,8,64",
+            "--LL=8388608,16,64",
+        ]
+        if args.fixture == "parallel":
+            collect += ["--trace-sched=yes", "--trace-syscalls=yes", "--time-stamp=yes",
+                        f"--log-file={scheduler}"]
+        collect += [
+            f"--callgrind-out-file={capture / 'callgrind.out'}", str(args.benchmark),
+            "--fixture", args.fixture, "--scenario", args.scenario,
+            "--native-trials", "1", "--metadata", str(capture / "metadata.json"),
+            "--repetitions", "1", "--callgrind",
+        ]
+        evaluate = [
+            str(args.replay), "evaluate-render", "--fixture", args.fixture,
+            "--scenario", args.scenario, "--callgrind-prefix", str(capture / "callgrind.out"),
+            "--callgrind-metadata", str(capture / "metadata.json"),
+            "--model", str(args.model), "--output", str(output),
+        ]
+        if args.fixture == "parallel":
+            evaluate += ["--callgrind-scheduler", str(scheduler)]
+        env = dict(os.environ, VC_RENDER_SAMPLER_THREADS="4" if args.fixture == "parallel" else "1")
+        result = subprocess.run(collect, env=env, check=False)
+        if result.returncode == 0:
+            result = subprocess.run(evaluate, check=False)
+        if result.returncode == 0 and output.is_file():
+            (capture / "collected.stamp").touch()
+            return
+        output.unlink(missing_ok=True)
+        failed = case / f"failed-attempt-{attempt}"
+        shutil.rmtree(failed, ignore_errors=True)
+        capture.rename(failed)
+        print(f"Capture/replay attempt {attempt} failed; retained files in {failed}",
+              file=sys.stderr, flush=True)
+    raise RuntimeError(f"{args.fixture}/{args.scenario}: capture/replay failed after 3 attempts")
 
 
 def sha256_file(path: Path) -> str:
@@ -184,6 +239,13 @@ def set_tolerance(args: argparse.Namespace) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    collect = subparsers.add_parser("collect-evaluate")
+    for option in ("valgrind", "benchmark", "replay", "model", "case-dir"):
+        collect.add_argument(f"--{option}", required=True, type=Path)
+    collect.add_argument("--fixture", choices=("serial", "parallel"), required=True)
+    collect.add_argument("--scenario", choices=SCENARIOS, required=True)
+    collect.set_defaults(function=collect_evaluate)
 
     freeze = subparsers.add_parser("freeze-reference")
     freeze.add_argument("--model", required=True, type=Path)

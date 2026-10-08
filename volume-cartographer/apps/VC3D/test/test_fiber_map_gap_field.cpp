@@ -24,7 +24,9 @@ using vc3d::fiber_map::gaps::GapFieldParams;
 using vc3d::fiber_map::gaps::GapFieldTile;
 using vc3d::fiber_map::gaps::buildGapField;
 using vc3d::fiber_map::gaps::gapFieldTiles;
+using vc3d::fiber_map::gaps::resampledToSheetDistance;
 using vc3d::fiber_map::gaps::sameGapSettings;
+using vc3d::fiber_map::sheetModelOf;
 
 namespace
 {
@@ -86,6 +88,51 @@ double sheetU(const GlobalResult& layout, double x)
     return vc3d::fiber_map::sheetDistanceVx(vc3d::fiber_map::sheetModelOf(layout), x);
 }
 
+// The re-gridding rule, spelled out independently: the smallest value of
+// the source columns whose centres fall inside output cell (i, j), or the
+// source column the cell's centre falls in when none does. NaN only when
+// every candidate is NaN.
+float expectedRegridded(const GapField& src, const vc3d::fiber_map::SheetModel& model,
+                        const GapField& dst, int i, int j, bool* several)
+{
+    const double c = dst.cellVx;
+    const double xa = vc3d::fiber_map::sheetXForDistanceMonotoneVx(model, dst.x0Vx + j * c);
+    const double xb = vc3d::fiber_map::sheetXForDistanceMonotoneVx(model, dst.x0Vx + (j + 1) * c);
+    const double xc = vc3d::fiber_map::sheetXForDistanceMonotoneVx(model, dst.x0Vx + (j + 0.5) * c);
+    std::vector<int> candidates;
+    for (int s = 0; s < src.cols; ++s) {
+        const double centre = src.x0Vx + (s + 0.5) * src.cellVx;
+        if (centre >= xa && centre < xb) {
+            candidates.push_back(s);
+        }
+    }
+    if (candidates.empty()) {
+        candidates.push_back(std::clamp(static_cast<int>(std::floor((xc - src.x0Vx) / src.cellVx)),
+                                        0, src.cols - 1));
+    } else if (candidates.size() > 1 && several) {
+        *several = true;
+    }
+    float value = std::numeric_limits<float>::quiet_NaN();
+    for (const int s : candidates) {
+        const float v = src.at(i, s);
+        if (!std::isnan(v) && (std::isnan(value) || v < value)) {
+            value = v;
+        }
+    }
+    return value;
+}
+
+float finiteMinimum(const GapField& field)
+{
+    float best = std::numeric_limits<float>::infinity();
+    for (const float v : field.distanceVx) {
+        if (!std::isnan(v)) {
+            best = std::min(best, v);
+        }
+    }
+    return best;
+}
+
 }  // namespace
 
 class TestFiberMapGapField : public QObject
@@ -117,6 +164,8 @@ private slots:
     void fadeTapersNeighbouringWindingsToNothing();
     void matchesBruteForceOracleWithFade();
     void tilesCoverTheFieldEdgeToEdge();
+    void resamplesOntoSheetDistance();
+    void resampledGridStaysUnderBudget();
 };
 
 void TestFiberMapGapField::emptyLayoutYieldsEmptyField()
@@ -788,6 +837,215 @@ void TestFiberMapGapField::degenerateGridsStillMeasure()
         QCOMPARE(field.rows, 200);
         QVERIFY(std::abs(sampleAt(field, 20.0, 7050.0) - 2000.0) <= 0.01);
         QVERIFY(std::abs(sampleAt(field, 20.0, 2050.0) - 3000.0) <= 0.01);
+    }
+}
+
+void TestFiberMapGapField::resamplesOntoSheetDistance()
+{
+    // Without a pitch the sheet distance is the map's x: the field comes back
+    // as it was (at a negative origin too, where ceil of the rounded width
+    // could otherwise add a column), and an empty field stays empty.
+    {
+        GlobalResult layout = makeLayout(1000.0, 1000.0, 0.0, -9167.0, 10833.0, 0.0, 1000.0);
+        addVertical(layout, 5000.0, 0.0, 1000.0);
+        GapFieldParams params;
+        params.cellVx = 100.0;
+        params.saturationVx = 3000.0;
+        const GapField source = buildGapField(layout, params);
+        const GapField same = resampledToSheetDistance(source, sheetModelOf(layout));
+        QCOMPARE(same.cols, source.cols);
+        QCOMPARE(same.rows, source.rows);
+        QCOMPARE(same.x0Vx, source.x0Vx);
+        QCOMPARE(same.cellVx, source.cellVx);
+        QVERIFY(same.distanceVx == source.distanceVx);
+        QVERIFY(resampledToSheetDistance(GapField{}, sheetModelOf(layout)).empty());
+    }
+    // rRef 1000, radius0 1000, pitch 200: winding W sits at x = W * 2pi*1000
+    // on the map and at sheet distance 2pi * (1000 W + 100 W^2). The
+    // re-gridded field spans the extent's sheet distance in the same cell,
+    // and reads the source's in-sheet distance at each cell's own sheet
+    // position, to within the source's resolution there.
+    GlobalResult layout =
+        makeLayout(1000.0, 1000.0, 200.0, 0.0, 3.0 * kTwoPi * 1000.0, 0.0, 400.0);
+    const double xSeed = 2.0 * kTwoPi * 1000.0;
+    addVertical(layout, xSeed, 0.0, 400.0);
+    GapFieldParams params;
+    params.cellVx = 100.0;
+    params.saturationVx = 3000.0;
+    params.acrossWeight = 0.0;
+    const GapField source = buildGapField(layout, params);
+    QVERIFY(!source.empty());
+    const vc3d::fiber_map::SheetModel model = sheetModelOf(layout);
+    const GapField field = resampledToSheetDistance(source, model);
+    QCOMPARE(field.cellVx, source.cellVx);
+    QCOMPARE(field.rows, source.rows);
+    QCOMPARE(field.y0Vx, source.y0Vx);
+    QCOMPARE(field.saturationVx, source.saturationVx);
+    QCOMPARE(field.folded, source.folded);
+    QCOMPARE(field.seedFiberCount, source.seedFiberCount);
+    const double u0 = sheetU(layout, layout.x0Vx);
+    const double u1 = sheetU(layout, layout.x1Vx);
+    QCOMPARE(field.x0Vx, u0);
+    QCOMPARE(field.cols, static_cast<int>(std::ceil((u1 - u0) / field.cellVx)));
+    QVERIFY(field.cols > source.cols);
+    // A source cell at winding 2 is 1.4 output cells of sheet distance wide,
+    // and the source itself is exact to a cell: allow three cells.
+    const double uSeed = sheetU(layout, xSeed);
+    const double slack = 3.0 * params.cellVx;
+    QVERIFY2(std::abs(sampleAt(field, uSeed, 200.0)) <= slack,
+             qPrintable(QString::number(sampleAt(field, uSeed, 200.0))));
+    for (const double offset : {-1500.0, -600.0, 600.0, 1500.0}) {
+        const float value = sampleAt(field, uSeed + offset, 200.0);
+        QVERIFY2(std::abs(value - std::abs(offset)) <= slack,
+                 qPrintable(QStringLiteral("%1 at %2").arg(value).arg(offset)));
+    }
+    // Every output cell reads some source cell: nothing is left outside.
+    QVERIFY(std::none_of(field.distanceVx.begin(), field.distanceVx.end(),
+                         [](float v) { return std::isnan(v); }));
+    // The rule cell by cell on this expanding fixture too: footprints here
+    // are mostly empty (the output cell lies inside one source column and
+    // reads the column its centre falls in), and the last output column
+    // reaches past the source's edge and reads the edge column.
+    {
+        bool several = false;
+        for (int j = 0; j < field.cols; ++j) {
+            for (int i = 0; i < field.rows; ++i) {
+                QCOMPARE(field.at(i, j), expectedRegridded(source, model, field, i, j, &several));
+            }
+        }
+        QVERIFY(!several);
+        const double lastCentre = field.x0Vx + (static_cast<double>(field.cols) - 0.5) * field.cellVx;
+        const double lastX = vc3d::fiber_map::sheetXForDistanceMonotoneVx(model, lastCentre);
+        QVERIFY(lastX > source.x0Vx + static_cast<double>(source.cols - 1) * source.cellVx);
+        for (int i = 0; i < field.rows; ++i) {
+            QCOMPARE(field.at(i, field.cols - 1), source.at(i, source.cols - 1));
+        }
+    }
+
+    // A steep compression must not lose a fiber: rRef 4000 against a radius
+    // of 300 at winding 0 squeezes about thirteen source columns into one
+    // output column, and the seed's zero line is one source column wide.
+    // The output's minimum is the source's (zero), at the seed's own sheet
+    // position.
+    {
+        GlobalResult steep = makeLayout(4000.0, 300.0, 10.0, 0.0, 20800.0, 0.0, 600.0);
+        addVertical(steep, 2600.0, 0.0, 600.0);
+        GapFieldParams one;
+        one.cellVx = 208.0;
+        one.saturationVx = 4056.0;
+        one.acrossWeight = 0.0;
+        const GapField src = buildGapField(steep, one);
+        QCOMPARE(finiteMinimum(src), 0.0f);
+        const vc3d::fiber_map::SheetModel steepModel = sheetModelOf(steep);
+        const GapField dst = resampledToSheetDistance(src, steepModel);
+        QVERIFY(dst.cols * 10 < src.cols);
+        QCOMPARE(finiteMinimum(dst), 0.0f);
+        QCOMPARE(sampleAt(dst, sheetU(steep, 2600.0), 300.0), 0.0f);
+        for (int j = 0; j < dst.cols; ++j) {
+            for (int i = 0; i < dst.rows; ++i) {
+                QCOMPARE(dst.at(i, j), expectedRegridded(src, steepModel, dst, i, j, nullptr));
+            }
+        }
+    }
+    // The selection rule, pinned cell by cell on a field whose rows differ,
+    // including columns the source's out-of-domain NaN covers. rRef 1000,
+    // radius0 500, pitch 200: the floor is winding -2.5, inside the extent,
+    // so the leftmost source columns are NaN and stay NaN where they land.
+    {
+        GlobalResult sloped =
+            makeLayout(1000.0, 500.0, 200.0, -20000.0, kTwoPi * 1000.0, 0.0, 600.0);
+        addDot(sloped, 100.0, 100.0);
+        addDot(sloped, 3000.0, 500.0);
+        GapFieldParams two;
+        two.cellVx = 100.0;
+        two.saturationVx = 3000.0;
+        two.acrossWeight = 0.0;
+        const GapField src = buildGapField(sloped, two);
+        const vc3d::fiber_map::SheetModel slopedModel = sheetModelOf(sloped);
+        const double xFloor = vc3d::fiber_map::sheetDomainFloorXVx(slopedModel);
+        QVERIFY(xFloor > sloped.x0Vx && xFloor < sloped.x1Vx);
+        QVERIFY(std::isnan(sampleAt(src, sloped.x0Vx + 50.0, 300.0)));
+        const GapField dst = resampledToSheetDistance(src, slopedModel);
+        QCOMPARE(dst.rows, src.rows);
+        QVERIFY(dst.rows > 1);
+        QVERIFY(dst.cols < src.cols);  // mean radius below rRef: compressed
+        bool sawNaN = false;
+        bool sawDifferentRows = false;
+        bool sawFootprintOfSeveral = false;
+        for (int j = 0; j < dst.cols; ++j) {
+            const auto expectedAt = [&](int i) {
+                return expectedRegridded(src, slopedModel, dst, i, j, &sawFootprintOfSeveral);
+            };
+            for (int i = 0; i < dst.rows; ++i) {
+                const float expected = expectedAt(i);
+                const float actual = dst.at(i, j);
+                if (std::isnan(expected)) {
+                    QVERIFY2(std::isnan(actual), qPrintable(QStringLiteral("%1,%2").arg(i).arg(j)));
+                    sawNaN = true;
+                } else {
+                    QCOMPARE(actual, expected);
+                }
+            }
+            if (dst.rows > 1 && !std::isnan(dst.at(0, j)) && dst.at(0, j) != dst.at(dst.rows - 1, j)) {
+                sawDifferentRows = true;
+            }
+        }
+        QVERIFY(sawNaN);
+        QVERIFY(sawDifferentRows);
+        QVERIFY(sawFootprintOfSeveral);
+        QCOMPARE(finiteMinimum(dst), finiteMinimum(src));
+        // The tiles cover the re-gridded field edge to edge, image row 0 at
+        // the field's top row, as for any field.
+        const std::vector<GapFieldTile> tiles = gapFieldTiles(dst, 7);
+        QVERIFY(tiles.size() > 1);
+        QCOMPARE(tiles.front().sceneRect.left(), dst.x0Vx);
+        QCOMPARE(tiles.back().sceneRect.right(),
+                 dst.x0Vx + static_cast<double>(dst.cols) * dst.cellVx);
+        QCOMPARE(tiles.back().colEnd, dst.cols);
+    }
+}
+
+void TestFiberMapGapField::resampledGridStaysUnderBudget()
+{
+    // The reviewer's case: a model whose mean radius is well above rRef, so
+    // re-gridding multiplies the columns. buildGapField counts those columns
+    // against maxCells, so the cell coarsens until the re-gridded field
+    // fits too, and re-gridding then allocates within the budget.
+    GlobalResult layout = makeLayout(4000.0, 4000.0, 4000.0, 0.0, 20000.0, 0.0, 10000.0);
+    addVertical(layout, 5000.0, 0.0, 10000.0);
+    GapFieldParams params;
+    params.cellVx = 100.0;
+    params.saturationVx = 8000.0;
+    params.maxCells = 6000;
+    const GapField source = buildGapField(layout, params);
+    QVERIFY(source.cellCoarsened);
+    QVERIFY(source.distanceVx.size() <= params.maxCells);
+    const GapField field = resampledToSheetDistance(source, sheetModelOf(layout));
+    QVERIFY2(field.distanceVx.size() <= params.maxCells,
+             qPrintable(QString::number(field.distanceVx.size())));
+    QVERIFY(field.cols > source.cols);
+    QCOMPARE(field.rows, source.rows);
+    QCOMPARE(field.cellVx, source.cellVx);
+    // The same layout with no pitch coarsens only for its own grid: the
+    // re-gridding term never binds when it is the identity.
+    layout.sheetPitchVx = 0.0;
+    const GapField flat = buildGapField(layout, params);
+    QCOMPARE(flat.cellVx, 200.0);
+    QCOMPARE(flat.cols, 100);
+    // The identity term is the grid's own column count, not a ceil of the
+    // rounded sheet-width quotient: at this negative origin the quotient
+    // rounds to 100.00000000000001, and exactly 1000 cells must fit 1000.
+    {
+        GlobalResult tight = makeLayout(1000.0, 1000.0, 0.0, -9167.0, 833.0, 0.0, 1000.0);
+        addVertical(tight, 0.0, 0.0, 1000.0);
+        GapFieldParams exact;
+        exact.cellVx = 100.0;
+        exact.saturationVx = 1000.0;
+        exact.maxCells = 1000;
+        const GapField fits = buildGapField(tight, exact);
+        QVERIFY(!fits.cellCoarsened);
+        QCOMPARE(fits.cols, 100);
+        QCOMPARE(fits.rows, 10);
     }
 }
 

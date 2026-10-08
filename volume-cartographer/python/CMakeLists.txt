@@ -50,7 +50,7 @@ set_target_properties(vc_lasagna_amgx PROPERTIES
 
 target_link_libraries(vc_lasagna_amgx PRIVATE vc_lasagna)
 
-set_target_properties(vc_core vc_lasagna utils utils_c3d_codec c3d PROPERTIES
+set_target_properties(vc_core vc_lasagna utils utils_c3d_codec c3d utils_volcomp_codec volcomp PROPERTIES
     INSTALL_RPATH "$ORIGIN"
 )
 
@@ -100,7 +100,7 @@ install(TARGETS vc_lasagna_amgx
     RUNTIME DESTINATION .
 )
 
-install(TARGETS vc_core vc_lasagna utils utils_c3d_codec c3d
+install(TARGETS vc_core vc_lasagna utils utils_c3d_codec c3d utils_volcomp_codec volcomp
     LIBRARY DESTINATION .
     RUNTIME DESTINATION .
     ARCHIVE DESTINATION .

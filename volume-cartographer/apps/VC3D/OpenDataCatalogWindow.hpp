@@ -1,6 +1,7 @@
 #pragma once
 
 #include "OpenDataManifest.hpp"
+#include "OpenDataSampleProject.hpp"
 
 #include <QDialog>
 #include <QFutureWatcher>
@@ -27,9 +28,17 @@ class OpenDataCatalogWindow : public QDialog
 
 public:
     explicit OpenDataCatalogWindow(QWidget* parent = nullptr);
+    explicit OpenDataCatalogWindow(const OpenDataManifest& manifest, QWidget* parent = nullptr);
     ~OpenDataCatalogWindow() override;
 
     void setOpenSampleHandler(std::function<bool(const OpenDataSample&)> handler);
+    using CreateProjectHandler = std::function<bool(const OpenDataSample&,
+        const OpenDataResourceSelection&, const OpenDataNewProject&)>;
+    void setCreateProjectHandler(CreateProjectHandler handler);
+
+signals:
+    void attachVolumeRequested(const QString& url);
+    void attachLasagnaRequested(const QString& url, bool fiber);
 
 private slots:
     void reloadManifest();
@@ -47,6 +56,7 @@ private slots:
     void openSelectedSegmentCacheFolder();
     void syncSelectedSampleCache();
     void openSelectedSample();
+    void createSelectedProject();
 
 private:
     struct ManifestLoadResult {
@@ -105,10 +115,13 @@ private:
     QLabel* _statusLabel{nullptr};
     QPushButton* _refreshButton{nullptr};
     QPushButton* _openSampleButton{nullptr};
+    QPushButton* _createProjectButton{nullptr};
     QPushButton* _copyVolumeUrlButton{nullptr};
+    QPushButton* _attachVolumeButton{nullptr};
     QPushButton* _openVolumeUrlButton{nullptr};
     QPushButton* _downloadNormalGridsButton{nullptr};
     QPushButton* _copyRepresentationUrlButton{nullptr};
+    QPushButton* _attachRepresentationButton{nullptr};
     QPushButton* _openRepresentationUrlButton{nullptr};
     QPushButton* _copySegmentUrlButton{nullptr};
     QPushButton* _openSegmentUrlButton{nullptr};
@@ -125,6 +138,7 @@ private:
     std::vector<QFutureWatcher<PhotoLoadResult>*> _photoWatchers;
     QString _pendingPhotoSampleId;
     std::function<bool(const OpenDataSample&)> _openSampleHandler;
+    CreateProjectHandler _createProjectHandler;
 };
 
 } // namespace vc3d::opendata

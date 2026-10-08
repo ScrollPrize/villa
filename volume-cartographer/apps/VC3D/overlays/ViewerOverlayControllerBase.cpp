@@ -620,17 +620,15 @@ ViewerOverlayControllerBase::filterPointsNearViewerSurface(VolumeViewerBase* vie
                                                            bool requireSceneVisibility) const
 {
     Surface* surface = viewerSurface(viewer);
-    auto* planeSurface = dynamic_cast<PlaneSurface*>(surface);
-    auto* quadSurface = dynamic_cast<QuadSurface*>(surface);
-    auto* viewerManager = managerForViewer(viewer);
-    auto* patchIndex = viewerManager ? viewerManager->surfacePatchIndex() : nullptr;
+    const bool projectsOntoSurface =
+        dynamic_cast<PlaneSurface*>(surface) || dynamic_cast<QuadSurface*>(surface);
 
     std::vector<float> pointOpacities(points.size(), 1.0f);
     PointFilterOptions filter;
     filter.clipToSurface = false;
     filter.requireSceneVisibility = requireSceneVisibility;
     filter.computeScenePoints = true;
-    filter.volumePredicate = [planeSurface, quadSurface, patchIndex, tolerance, &bounds,
+    filter.volumePredicate = [viewer, projectsOntoSurface, tolerance, &bounds,
                               &pointOpacities](const cv::Vec3f& point, size_t index) {
         if (bounds && !bounds->contains(point)) {
             pointOpacities[index] = 0.0f;
@@ -646,12 +644,12 @@ ViewerOverlayControllerBase::filterPointsNearViewerSurface(VolumeViewerBase* vie
             return dist >= tolerance ? 0.0f : 1.0f - (dist / tolerance);
         };
         float opacity = 1.0f;
-        if (planeSurface) {
-            opacity = opacityForDistance(std::fabs(planeSurface->pointDist(point)));
-        } else if (quadSurface) {
-            cv::Vec3f ptr(0, 0, 0);
-            const float dist = quadSurface->pointTo(ptr, point, std::max(tolerance, 0.0f), 100, patchIndex);
-            opacity = opacityForDistance(dist);
+        if (projectsOntoSurface) {
+            // Distance from the displayed depth band (normal offset and
+            // composite slab), not from the nominal surface.
+            const auto projection =
+                viewer->projectVolumePoint(point, std::max(tolerance, 0.0f));
+            opacity = projection ? opacityForDistance(projection->distance) : 0.0f;
         }
         pointOpacities[index] = opacity;
         return opacity > 0.0f;
@@ -696,12 +694,6 @@ ViewerOverlayControllerBase::filterPointsNearViewerSurfaceCached(
                               cached.contentRevision == contentRevision;
 
     if (!cacheMatches) {
-        Surface* surface = viewerSurface(viewer);
-        auto* planeSurface = dynamic_cast<PlaneSurface*>(surface);
-        auto* quadSurface = dynamic_cast<QuadSurface*>(surface);
-        auto* viewerManager = managerForViewer(viewer);
-        auto* patchIndex = viewerManager ? viewerManager->surfacePatchIndex() : nullptr;
-
         // Identical to the fade in filterPointsNearViewerSurface().
         auto opacityForDistance = [tolerance](float dist) {
             if (dist < 0.0f) {
@@ -725,23 +717,18 @@ ViewerOverlayControllerBase::filterPointsNearViewerSurfaceCached(
 
         for (std::size_t index = 0; index < points.size(); ++index) {
             const cv::Vec3f& point = points[index];
-            float opacity = 1.0f;
-            if (planeSurface) {
-                opacity = opacityForDistance(std::fabs(planeSurface->pointDist(point)));
-            } else if (quadSurface) {
-                cv::Vec3f ptr(0, 0, 0);
-                const float dist = quadSurface->pointTo(
-                    ptr, point, std::max(tolerance, 0.0f), 100, patchIndex);
-                opacity = opacityForDistance(dist);
-            }
-            if (opacity <= 0.0f) {
-                continue;
-            }
             // A point that does not project maps to a NaN scene position,
             // which never satisfies the viewport test the warm path applies
             // below -- so dropping it here is equivalent, not a new filter.
-            const auto projection = viewer->projectVolumePoint(point);
+            const auto projection =
+                viewer->projectVolumePoint(point, std::max(tolerance, 0.0f));
             if (!projection) {
+                continue;
+            }
+            // Distance from the displayed depth band (normal offset and
+            // composite slab), not from the nominal surface.
+            const float opacity = opacityForDistance(projection->distance);
+            if (opacity <= 0.0f) {
                 continue;
             }
             entry.projections.push_back(*projection);
@@ -836,6 +823,12 @@ ViewerOverlayControllerBase::projectedPointChain(VolumeViewerBase* viewer,
     const cv::Vec3f planeOrigin = plane ? plane->origin() : cv::Vec3f{};
     const cv::Vec3f planeBasisX = plane ? plane->basisX() : cv::Vec3f{};
     const cv::Vec3f planeBasisY = plane ? plane->basisY() : cv::Vec3f{};
+    // Measure distances from the depth band the viewer displays (its normal
+    // offset, widened to the slab while compositing).
+    const SurfaceProjectionContext projectionContext = viewer->surfaceProjectionContext();
+    const float depthLo = projectionContext.depthLo;
+    const float depthHi = projectionContext.depthHi;
+    const bool nominalDepth = depthLo == 0.0f && depthHi == 0.0f;
 
     auto sameVector = [](const cv::Vec3f& a, const cv::Vec3f& b) {
         return a == b;
@@ -847,6 +840,8 @@ ViewerOverlayControllerBase::projectedPointChain(VolumeViewerBase* viewer,
                               cached.surface == surface &&
                               cached.surfaceGeneration == surfaceGeneration &&
                               cached.tolerance == tolerance &&
+                              cached.depthLo == depthLo &&
+                              cached.depthHi == depthHi &&
                               sameVector(cached.planeOrigin, planeOrigin) &&
                               sameVector(cached.planeBasisX, planeBasisX) &&
                               sameVector(cached.planeBasisY, planeBasisY);
@@ -858,6 +853,8 @@ ViewerOverlayControllerBase::projectedPointChain(VolumeViewerBase* viewer,
         entry.surface = surface;
         entry.surfaceGeneration = surfaceGeneration;
         entry.tolerance = tolerance;
+        entry.depthLo = depthLo;
+        entry.depthHi = depthHi;
         entry.planeOrigin = planeOrigin;
         entry.planeBasisX = planeBasisX;
         entry.planeBasisY = planeBasisY;
@@ -887,7 +884,7 @@ ViewerOverlayControllerBase::projectedPointChain(VolumeViewerBase* viewer,
             bool valid = true;
             bool lineEndpointOnly = false;
             if (plane) {
-                distance = std::fabs(plane->pointDist(point));
+                distance = depthBandDistance(plane->scalarp(point), depthLo, depthHi);
                 const cv::Vec3f projected = plane->project(point, 1.0f, 1.0f);
                 surfacePoint = {projected[0], projected[1]};
             } else {
@@ -902,11 +899,25 @@ ViewerOverlayControllerBase::projectedPointChain(VolumeViewerBase* viewer,
                 } else {
                     SurfacePatchIndex::PointQuery query;
                     query.worldPoint = point;
-                    query.tolerance = std::max(tolerance, 1.0e-3f);
+                    query.tolerance = std::max(
+                        tolerance + std::max(std::fabs(depthLo), std::fabs(depthHi)),
+                        1.0e-3f);
                     query.surfaces.only = indexedQuad;
                     if (const auto hit = patchIndex->locate(query)) {
                         pointer = hit->ptr;
                         distance = hit->distance;
+                        if (!nominalDepth) {
+                            const cv::Vec3f coord = quad->coord(pointer);
+                            const cv::Vec3f normal = quad->normal(pointer);
+                            if (std::isfinite(coord[0]) && std::isfinite(coord[1]) &&
+                                std::isfinite(coord[2]) && std::isfinite(normal[0]) &&
+                                std::isfinite(normal[1]) && std::isfinite(normal[2])) {
+                                distance =
+                                    depthBandDistance(point, coord, normal, depthLo, depthHi);
+                            } else {
+                                valid = false;
+                            }
+                        }
                     } else {
                         valid = false;
                     }
@@ -1594,6 +1605,7 @@ void ViewerOverlayControllerBase::rebuildOverlay(VolumeViewerBase* viewer)
         return;
     }
 
+    if (!needsOverlayRebuild(viewer)) return;
     OverlayBuilder builder(viewer);
     collectPrimitives(viewer, builder);
     auto primitives = builder.takePrimitives();
