@@ -130,8 +130,9 @@ public:
         // and the agent bridge measure arclengths against.
         double lengthVx = 0.0;
         // The line between the outermost control points (the sum of the
-        // spans), what the panels show as the fiber's length; the whole line
-        // when there are no spans.
+        // spans; nothing when they all sit on one line point), what the
+        // panels show as the fiber's length; the whole line with fewer than
+        // two finite control points.
         double annotatedLengthVx = 0.0;
         AlignmentMetrics alignment;
         std::vector<SpanSummary> spans;
