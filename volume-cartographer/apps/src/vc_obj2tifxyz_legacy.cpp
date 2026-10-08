@@ -111,6 +111,8 @@ public:
         // For each triangle, compute the Jacobian of the mapping to get stretch in U and V
         double sum_scale_u = 0.0, sum_scale_v = 0.0;
         double sum_weight = 0.0;
+        // per triangle norms and UV areas, for an area weighted median (robust to a few stretched triangles)
+        std::vector<std::pair<double, double>> norms_u, norms_v;
 
         for (const auto& face : faces) {
             // Check valid indices
@@ -170,11 +172,25 @@ public:
             sum_scale_u += scale_u * uv_area;
             sum_scale_v += scale_v * uv_area;
             sum_weight += uv_area;
+            norms_u.emplace_back(scale_u, uv_area);
+            norms_v.emplace_back(scale_v, uv_area);
         }
 
         // Average scale factors
-        double avg_scale_u = (sum_weight > 0) ? sum_scale_u / sum_weight : 1.0;
-        double avg_scale_v = (sum_weight > 0) ? sum_scale_v / sum_weight : 1.0;
+        auto weighted_median = [](std::vector<std::pair<double, double>>& v, double fallback) {
+            if (v.empty()) return fallback;
+            std::sort(v.begin(), v.end());
+            double total = 0.0;
+            for (const auto& e : v) total += e.second;
+            double acc = 0.0;
+            for (const auto& e : v) {
+                acc += e.second;
+                if (acc >= 0.5 * total) return e.first;
+            }
+            return v.back().first;
+        };
+        double avg_scale_u = weighted_median(norms_u, (sum_weight > 0) ? sum_scale_u / sum_weight : 1.0);
+        double avg_scale_v = weighted_median(norms_v, (sum_weight > 0) ? sum_scale_v / sum_weight : 1.0);
 
         cv::Vec2f uv_range = uv_max - uv_min;
 
