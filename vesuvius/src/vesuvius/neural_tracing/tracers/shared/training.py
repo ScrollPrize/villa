@@ -1,8 +1,5 @@
-"""Method-agnostic pieces of a fiber-following training run.
-
-Shared by every model type: run directory creation, the JSON-lines log, the
-warmup-cosine schedule, EMA, RNG state and resuming (checkpoint I/O is models/checkpoint.py).
-"""
+"""Training-run pieces shared by the tracers: run directory creation, the JSON-lines log, the warmup-cosine schedule,
+gradient clipping, the weight EMA and RNG state."""
 from __future__ import annotations
 
 import json
@@ -45,10 +42,13 @@ class RunLog:
         self._file.close()
 
 
-def lr_at(step: int, base_lr: float, warmup: int, total_steps: int) -> float:
-    """Linear warmup multiplied by a cosine decay over ``total_steps``."""
-    return (base_lr * min(1., step / max(1, warmup))
-            * .5 * (1 + math.cos(math.pi * (step - 1) / total_steps)))
+def lr_at(step: int, base_lr: float, warmup: int, total_steps: int, progress: float | None = None) -> float:
+    """Linear warmup multiplied by a cosine decay over ``total_steps`` (``step`` counts from 1). ``progress``, a
+    fraction of the run done by another measure (e.g. of a time budget), advances the cosine when it is further
+    along; the decay then ends at zero."""
+    angle = (math.pi * (step - 1) / total_steps if progress is None
+             else math.pi * min(1., max((step - 1) / total_steps, progress)))
+    return base_lr * min(1., step / max(1, warmup)) * .5 * (1 + math.cos(angle))
 
 
 @torch.no_grad()
@@ -80,24 +80,14 @@ def restore_training_rng(state):
         torch.cuda.set_rng_state_all([s.cpu() for s in state['cuda']])
 
 
-def resume_training(ck, model, ema, opt, *, reset_optimizer=False):
-    """Restore weights, EMA, optimizer and RNG from a resumable checkpoint.
-
-    Only ``ckpt_*.pt``/``last.pt`` written by training carry optimizer state;
-    collector snapshots do not. Loader workers restart their own streams, so
-    the sampled data sequence after a resume differs from an uninterrupted run.
-    With reset_optimizer, retain the supplied fresh optimizer instead of the
-    saved moments/groups. Model weights, EMA, RNG and update count still resume.
-    Returns the completed update count.
-    """
-    if 'optimizer' not in ck:
-        raise ValueError('Checkpoint holds no optimizer state; resume from ckpt_*.pt or last.pt of a run')
-    if reset_optimizer and opt.state:
-        raise ValueError('Optimizer reset requires a fresh optimizer with empty state')
-    model.load_state_dict(ck['model'])
-    ema.load_state_dict(ck['ema'])
-    if not reset_optimizer:
-        opt.load_state_dict(ck['optimizer'])
-    if 'rng' in ck:
-        restore_training_rng(ck['rng'])
-    return int(ck['step'])
+def clip_training_gradients(model, max_norm):
+    """Clip the global gradient norm (``max_norm`` 0 disables clipping); a nonfinite norm raises before any gradient
+    is modified. Returns the norm and the clip scale applied."""
+    if not math.isfinite(max_norm) or max_norm < 0:
+        raise ValueError('The gradient clipping limit must be finite and nonnegative (0 disables clipping)')
+    params = list(model.parameters())
+    norm = torch.nn.utils.get_total_norm([p.grad for p in params if p.grad is not None], error_if_nonfinite=True)
+    if max_norm > 0:
+        torch.nn.utils.clip_grads_with_norm_(params, max_norm, norm)
+    norm = float(norm)
+    return dict(grad_norm=norm, grad_clip_scale=min(1., max_norm/(norm+1e-6)) if max_norm else 1.)

@@ -28,7 +28,9 @@ from vesuvius.neural_tracing.tracers.shared.policy import checkpoint_policy
 from vesuvius.neural_tracing.tracers.fibers.tracing.trace import FiberTracer, ModelTracer, TraceParams
 from vesuvius.neural_tracing.tracers.models.checkpoint import load_checkpoint
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume
-from vesuvius.neural_tracing.tracers.fibers.frames.ct import SeedHeadingError, ct_seed_heading, SEED_HEADING_POLICY, TRACE_HEADING_POLICY, FRAME_POLICY
+from vesuvius.neural_tracing.tracers.fibers.frames.ct import (
+    ct_seed_heading, SEED_HEADING_POLICY, TRACE_HEADING_POLICY, FRAME_POLICY)
+from vesuvius.neural_tracing.tracers.shared.ct_structure import SeedHeadingError
 from vesuvius.neural_tracing.tracers.fibers.frames.learned import trace_family_kwargs
 
 

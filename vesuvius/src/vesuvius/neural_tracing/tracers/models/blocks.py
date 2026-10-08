@@ -1,8 +1,12 @@
-"""Building blocks shared by the crop transformer (models/crop_transformer.py) and the sequence follower
-(models/sequence.py): the residual crop CNN and the pre-norm transformer layer's weights and head split/merge. Each
-model's layer subclass defines which tokens attend to which."""
+"""Building blocks shared by the tracers' models: the residual crop CNN, the pre-norm transformer layer's weights and
+head split/merge, and plain self-attention over a token set (the sheet tracer). The crop transformer
+(models/crop_transformer.py) and the sequence follower (models/sequence.py) subclass the layer to define which
+tokens attend to which."""
 import torch
 from torch import nn
+import torch.nn.functional as F
+
+LOGIT_SCALE_LR_SCALE = 10.  # LR multiple of the attention logit scales' optimizer group (no weight decay)
 
 from vesuvius.models.build.resblocks import BasicBlockD, StackedResidualBlocks
 
@@ -60,3 +64,13 @@ class TransformerLayer(nn.Module):
     def merge(self, value):
         b, heads, n, d = value.shape
         return self.out(value.transpose(1, 2).reshape(b, n, heads*d))
+
+
+class SelfAttentionLayer(TransformerLayer):
+    """A pre-norm transformer layer in which every token attends to every token; ``padding`` (B, L) bool marks the
+    tokens no token attends to."""
+    def forward(self, x, padding=None):
+        q, k, v = self.split(self.norm1(x))
+        mask = None if padding is None else ~padding[:, None, None, :]
+        x = x+self.merge(F.scaled_dot_product_attention(q, k, v, attn_mask=mask))
+        return x+self.ffn(self.norm2(x))

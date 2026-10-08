@@ -11,13 +11,16 @@ import torch
 from vesuvius.neural_tracing.tracers.shared.geometry import crop_local_grid
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume
 from vesuvius.neural_tracing.tracers.shared.reference import SEED_FIELDS
-from vesuvius.neural_tracing.tracers.fibers.data.episodes import episode_decisions, episode_tensors, mark_episode_identity
-from vesuvius.neural_tracing.tracers.fibers.data.replay import EVENT_TABLE_SIZE, ReplayIndex, load_replay, replay_facts, replay_labeler_state, usable_replay
+from vesuvius.neural_tracing.tracers.fibers.data.episodes import (
+    episode_decisions, episode_tensors, mark_episode_identity)
+from vesuvius.neural_tracing.tracers.fibers.data.replay import (
+    EVENT_TABLE_SIZE, ReplayIndex, load_replay, replay_facts, replay_labeler_state, usable_replay)
 from vesuvius.neural_tracing.tracers.fibers.data.samples import STARTUP_CATEGORIES, make_sample
 from vesuvius.neural_tracing.tracers.fibers.data.targets import label_state, resolve_trace_seed
 from vesuvius.neural_tracing.tracers.fibers.data.tasks import FALLBACKS, SOURCE, TASK, TASKS, TaskBudget, stable_key
 from vesuvius.neural_tracing.tracers.fibers.data.state_labels import RECOVERABLE, FOLLOWING
-from vesuvius.neural_tracing.tracers.fibers.frames.ct import FRAME_POLICY, frame_prefetch_bounds, SeedHeadingError
+from vesuvius.neural_tracing.tracers.fibers.frames.ct import FRAME_POLICY, frame_prefetch_bounds
+from vesuvius.neural_tracing.tracers.shared.ct_structure import SeedHeadingError
 
 
 MAX_CT_FRAME_REJECTIONS = 64

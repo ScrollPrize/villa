@@ -2,7 +2,7 @@
 import numpy as np
 import torch
 
-from vesuvius.neural_tracing.tracers.fibers.data.fibers import fiber_manifest
+from vesuvius.neural_tracing.tracers.shared.annotations.traced import fiber_manifest
 from vesuvius.neural_tracing.tracers.fibers.data.replay import OnPolicyStates, replay_facts
 from vesuvius.neural_tracing.tracers.fibers.data.samples import STARTUP_CATEGORIES, make_sample
 from vesuvius.neural_tracing.tracers.fibers.data.targets import label_state, resolve_trace_seed

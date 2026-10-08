@@ -34,3 +34,11 @@ def write_json(path, value):
     atomic_write(path, (json.dumps(value, default=jsonable, indent=1)+'\n').encode())
 
 
+def atomic_torch_save(value, path):
+    """``torch.save`` through a temporary sibling (``.partial.pt``) and an atomic rename, so a reader (a collector,
+    an evaluation) never opens a partial checkpoint."""
+    import torch
+    path = Path(path)
+    temporary = path.with_suffix('.partial.pt')
+    torch.save(value, temporary)
+    temporary.replace(path)

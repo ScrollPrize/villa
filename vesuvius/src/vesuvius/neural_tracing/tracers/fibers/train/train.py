@@ -15,7 +15,7 @@ import time
 import numpy as np
 import torch
 
-from vesuvius.neural_tracing.tracers.fibers.data.fibers import fiber_manifest
+from vesuvius.neural_tracing.tracers.shared.annotations.traced import fiber_manifest
 from vesuvius.neural_tracing.tracers.fibers.data.follow_dataset import FollowDataset
 from vesuvius.neural_tracing.tracers.fibers.data.replay import load_replay, own_replay_paths, usable_replay
 from vesuvius.neural_tracing.tracers.fibers.data.samples import SampleConfig
@@ -23,31 +23,32 @@ from vesuvius.neural_tracing.tracers.fibers.data.tasks import TASKS, TaskBudget
 from vesuvius.neural_tracing.tracers.fibers.train.dagger.online import OnlineCollector
 from vesuvius.neural_tracing.tracers.shared.policy import (
     DEFAULT_CONFIDENCE, DEFAULT_GATE, gate_horizon, OperatingPolicy)
-from vesuvius.neural_tracing.tracers.fibers.train.runloop import RunLog, lr_at, prepare_run_dir, training_rng_state
+from vesuvius.neural_tracing.tracers.shared.training import RunLog, lr_at, prepare_run_dir, training_rng_state
 from vesuvius.neural_tracing.tracers.shared.system import raise_open_file_limit
-from vesuvius.neural_tracing.tracers.models.checkpoint import initialize_model_weights, read_checkpoint, write_checkpoint
+from vesuvius.neural_tracing.tracers.models.checkpoint import (
+    initialize_model_weights, read_checkpoint, write_checkpoint)
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume
 from vesuvius.neural_tracing.tracers.models.model import config_from_checkpoint
 from vesuvius.neural_tracing.tracers.fibers.data.observations import IdentityObservationBuilder, IdentitySampling
 from vesuvius.neural_tracing.tracers.fibers.tracing.trace import FiberTracer
 from vesuvius.neural_tracing.tracers.fibers.train import run_config
 from vesuvius.neural_tracing.tracers.fibers.train.supervision import commit_window
-from vesuvius.neural_tracing.tracers.fibers.train.step import initialize_training_optimizer, optimizer_update, prepare_training
+from vesuvius.neural_tracing.tracers.fibers.train.step import (
+    initialize_training_optimizer, optimizer_update, prepare_training)
 from vesuvius.neural_tracing.tracers.fibers.evaluation.monitor.plots import plot_run_curves
 from vesuvius.neural_tracing.tracers.fibers.evaluation.monitor.recovery import monitor_fixture, evaluate_monitor
 from vesuvius.neural_tracing.tracers.fibers.evaluation.monitor.rollouts import monitor_afv_sources, training_diagnostics
-from vesuvius.neural_tracing.tracers.fibers.frames.learned import bind_frame_checkpoint, configured_frame_policy, frame_predictor, prediction_window
-from vesuvius.neural_tracing.tracers.fibers.train.training_log import format_training_log, TrainingInterval, SamplingLedger
+from vesuvius.neural_tracing.tracers.fibers.frames.learned import (
+    bind_frame_checkpoint, configured_frame_policy, frame_predictor, prediction_window)
+from vesuvius.neural_tracing.tracers.fibers.train.training_log import (
+    format_training_log, TrainingInterval, SamplingLedger)
 
 
 def save_checkpoint(path, model, ema, spec, sample, extra=None):
-    # Atomic publication: collectors must never open a partial checkpoint.
-    path = Path(path)
-    temporary = path.with_suffix('.partial.pt')
-    write_checkpoint(temporary, model, spec, sample.crop, sample.n_history, model.model_type,
+    # Atomic publication (write_checkpoint): collectors must never open a partial checkpoint.
+    write_checkpoint(path, model, spec, sample.crop, sample.n_history, model.model_type,
                      dict({'n_commit': commit_window(model.cfg, None), **(extra or {})},
                           ema=ema.state_dict(), sample_cfg=asdict(sample)))
-    temporary.replace(path)
 
 
 def collector_settings(collector):

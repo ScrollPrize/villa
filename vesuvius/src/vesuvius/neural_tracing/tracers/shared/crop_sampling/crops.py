@@ -49,7 +49,7 @@ def scalar_crops(items, vol, crop, pool=None, *, out=None, normalize=True):
     unique = [j for j, source in enumerate(sources) if j == source]
     raw, starts = read_tight_blocks([items[j] for j in unique], vol, crop, pool)
     scale = vol.input_scale
-    shape = (len(items), 1, crop.depth, crop.width, crop.width)
+    shape = (len(items), 1, crop.depth, crop.height or crop.width, crop.width)
     result = np.empty(shape, np.float32) if out is None else out
     if result.shape != shape or result.dtype != np.float32:
         raise ValueError('Scalar crop destination must have the expected shape and float32 dtype')
@@ -92,9 +92,9 @@ def crop_corners(crop: CropSpec) -> np.ndarray:
     """Eight local (a, b, c) corners; the crop's sample points are their convex hull."""
     corners = _CORNER_CACHE.get(crop)
     if corners is None:
-        lc, fc = crop.lateral_coords, crop.forward_coords
+        lc, vc, fc = crop.lateral_coords, crop.vertical_coords, crop.forward_coords
         corners = _CORNER_CACHE[crop] = np.array([(a, b, c) for a in (lc[0], lc[-1])
-                                                  for b in (lc[0], lc[-1]) for c in (fc[0], fc[-1])], np.float64)
+                                                  for b in (vc[0], vc[-1]) for c in (fc[0], fc[-1])], np.float64)
     return corners
 
 

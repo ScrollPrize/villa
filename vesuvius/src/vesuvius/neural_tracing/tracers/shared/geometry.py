@@ -17,16 +17,25 @@ from scipy.spatial import cKDTree
 @dataclass(frozen=True)
 class CropSpec:
     depth: int = 64  # samples along f
-    width: int = 64  # samples along u and v
-    behind: int = 16  # samples behind the current point
+    width: int = 64  # samples along u (and v, unless ``height`` is set)
+    behind: float = 16  # samples behind the current point (fractional: the crop centre lies between samples)
     spacing: float = 1.0
+    height: int | None = None  # samples along v; None: ``width`` (a square cross-section)
     @property
     def forward_coords(self) -> np.ndarray:
         return (np.arange(self.depth) - self.behind) * self.spacing
 
     @property
     def lateral_coords(self) -> np.ndarray:
+        """Sample offsets along u."""
         return (np.arange(self.width) - (self.width - 1) / 2.0) * self.spacing
+
+    @property
+    def vertical_coords(self) -> np.ndarray:
+        """Sample offsets along v."""
+        if self.height is None:
+            return self.lateral_coords
+        return (np.arange(self.height) - (self.height - 1) / 2.0) * self.spacing
 
     @property
     def center_offset(self) -> float:
@@ -36,8 +45,9 @@ class CropSpec:
     @property
     def block_size(self) -> int:
         fc = self.forward_coords
-        h = 0.5 * float(self.lateral_coords[-1] - self.lateral_coords[0])
-        r = np.sqrt((fc - self.center_offset) ** 2 + 2 * h**2).max()
+        hu = 0.5 * float(self.lateral_coords[-1] - self.lateral_coords[0])
+        hv = 0.5 * float(self.vertical_coords[-1] - self.vertical_coords[0])
+        r = np.sqrt((fc - self.center_offset) ** 2 + (hu**2 + hv**2)).max()
         return int(2 * np.ceil(r + 2.0))
 
 
@@ -64,14 +74,14 @@ def crop_local_grid(spec: CropSpec) -> np.ndarray:
     """Local (a=u, b=v, c=f) coordinates, shape (D, H, W, 3)."""
     lc = spec.lateral_coords
     fc = spec.forward_coords
-    c, b, a = np.meshgrid(fc, lc, lc, indexing="ij")
+    c, b, a = np.meshgrid(fc, spec.vertical_coords, lc, indexing="ij")
     return np.stack([a, b, c], axis=-1)
 
 
 def crop_indices(crop, local):
     """Continuous volume indices (c, b, a) for crop-local (a, b, c) points: the inverse of ``crop_local_grid``."""
     local = np.asarray(local, np.float64).reshape(-1, 3)
-    return np.c_[local[:, 2]/crop.spacing+crop.behind, local[:, 1]/crop.spacing+(crop.width-1)/2,
+    return np.c_[local[:, 2]/crop.spacing+crop.behind, local[:, 1]/crop.spacing+((crop.height or crop.width)-1)/2,
                  local[:, 0]/crop.spacing+(crop.width-1)/2]
 
 

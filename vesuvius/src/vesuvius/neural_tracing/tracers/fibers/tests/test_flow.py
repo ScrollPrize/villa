@@ -14,7 +14,7 @@ from vesuvius.neural_tracing.tracers.fibers.train.step import (
     LOGIT_SCALE_LR_SCALE, prepare_training, optimizer_update, initialize_training_optimizer)
 from vesuvius.neural_tracing.tracers.fibers.train.train import save_checkpoint
 from vesuvius.neural_tracing.tracers.models.checkpoint import initialize_model_weights, load_checkpoint
-from vesuvius.neural_tracing.tracers.fibers.train.runloop import training_rng_state
+from vesuvius.neural_tracing.tracers.shared.training import training_rng_state
 from vesuvius.neural_tracing.tracers.fibers.data.samples import SampleConfig
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolumeSpec
 

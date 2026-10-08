@@ -20,6 +20,7 @@ from torch import nn
 
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.crops import scalar_crops
 from vesuvius.neural_tracing.tracers.shared.geometry import CropSpec, arclength, frame_from_heading, interp_at
+from vesuvius.neural_tracing.tracers.shared.io import atomic_torch_save
 from vesuvius.neural_tracing.tracers.shared.retired import retire
 
 ARCHITECTURE = 'crop_heading_ct_path_v2'
@@ -148,7 +149,8 @@ def model_inputs(vol, cfg, positions, frames, paths, pool=None, *, normal_target
 
 
 def save_heading_model(path, model, **extra):
-    torch.save(dict(architecture=model.architecture, config=model.cfg.to_dict(), state=model.state_dict(), **extra), path)
+    atomic_torch_save(dict(architecture=model.architecture, config=model.cfg.to_dict(), state=model.state_dict(), **extra),
+                      path)
 
 
 def load_heading_model(path, device='cpu'):

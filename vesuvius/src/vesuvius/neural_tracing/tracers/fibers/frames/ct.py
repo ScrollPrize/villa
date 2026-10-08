@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import numpy as np
-from scipy.ndimage import gaussian_filter
 
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.crops import tight_block
-from vesuvius.neural_tracing.tracers.shared.geometry import arclength, interp_at, frame_from_heading, normalize, block_start
+from vesuvius.neural_tracing.tracers.shared.ct_structure import (
+    CT_CONTEXT_RADIUS, CT_DERIVATIVE_SIGMA, CT_INTEGRATION_SIGMA, MIN_EIGENGAP, SeedHeadingError, ct_sheet_normal,
+    ct_structure_tensor)
+from vesuvius.neural_tracing.tracers.shared.geometry import (
+    arclength, interp_at, frame_from_heading, normalize, block_start)
 
 SEED_HEADING_POLICY = 'ct_sheet_hv_sigma2_8_v2'
 TRACE_HEADING_POLICY = 'linear12_trusted_v1'
@@ -15,18 +18,11 @@ LEARNED_FRAME_POLICY = 'learned_heading_normal_v1'
 # from the frame model; seeds and restarts keep LEARNED_FRAME_POLICY.
 PREDICTION_FRAME_POLICY = 'prediction_axis_learned_roll_v1'
 FRAME_POLICIES = (FRAME_POLICY, LEARNED_FRAME_POLICY, PREDICTION_FRAME_POLICY, 'ct_transverse_uv_v2')
-CT_DERIVATIVE_SIGMA, CT_INTEGRATION_SIGMA = 2., 8.  # CT voxels; the structure tensor of the seed and frame policies
-CT_CONTEXT_RADIUS = 38  # four integration sigmas + three derivative sigmas
 # CT is scaled to [0, 1]. Require both directional evidence and enough
 # transverse energy to avoid orienting a crop from numerical residue.
 MIN_FRAME_ENERGY = 1e-12
 MIN_FRAME_ENERGY_FRACTION = 1e-4
-MIN_FRAME_GAP = .05
 HEADING_SPAN = 12.0  # trace voxels, not vertices or model calls
-
-
-class SeedHeadingError(ValueError):
-    """The supplied seed/family does not determine a usable CT heading."""
 
 
 def fiber_family(value):
@@ -35,45 +31,6 @@ def fiber_family(value):
     if family not in ('H', 'V'):
         raise SeedHeadingError('CT seed headings require an H or V fiber family')
     return family
-
-
-def ct_structure_tensor(cube, center_zyx, *, sample_spacing=1., derivative_sigma=1., integration_sigma=4.):
-    """XYZ gradient tensor; CT-unit derivative/integration sigmas default to 1/4.
-
-    ``sample_spacing`` is the isotropic spacing in selected-CT voxels. The
-    default preserves native CT behavior; resampled crops can specify theirs.
-    Sigmas are in selected-CT voxel units, independent of sample spacing.
-    Returned axes follow the input array's reversed axis order, not its world
-    rotation: callers must rotate crop-local tensors/normals into world XYZ.
-    """
-    image = np.asarray(cube, dtype=np.float64) / 255.
-    center = np.asarray(center_zyx, dtype=np.float64)
-    if image.ndim != 3 or center.shape != (3,) or not np.isfinite(image).all() or not np.isfinite(center).all():
-        raise SeedHeadingError('CT seed context must be a finite 3D image and center')
-    if not np.isfinite(sample_spacing) or sample_spacing <= 0:
-        raise SeedHeadingError('CT sample spacing must be finite and positive')
-    if not all(np.isfinite(s) and s > 0 for s in (derivative_sigma, integration_sigma)):
-        raise SeedHeadingError('CT tensor sigmas must be finite and positive')
-    gradients = []
-    for axis in range(3):
-        order = [0, 0, 0]
-        order[axis] = 1
-        gradients.append(gaussian_filter(image, derivative_sigma/sample_spacing, order=order, mode='nearest', truncate=3.)/sample_spacing)
-    weights = [np.exp(-.5*((np.arange(n)-c)/(integration_sigma/sample_spacing))**2) for n, c in zip(image.shape, center)]
-    weight = weights[0][:, None, None]*weights[1][None, :, None]*weights[2][None, None, :]
-    weight /= weight.sum()
-    tensor = np.array([[np.sum(weight*a*b) for b in gradients] for a in gradients])
-    return tensor[::-1, ::-1]  # zyx array axes -> world xyz
-
-
-def ct_sheet_normal(cube, center_zyx):
-    """Unrestricted sheet normal for selecting an initial H/V heading."""
-    # Solve in array-axis order for the seed-heading sign convention.
-    values, vectors = np.linalg.eigh(ct_structure_tensor(cube, center_zyx,
-        derivative_sigma=CT_DERIVATIVE_SIGMA, integration_sigma=CT_INTEGRATION_SIGMA)[::-1, ::-1])
-    if values[-1] <= 1e-12 or values[-1]-values[-2] <= 1e-6*values[-1]:
-        raise SeedHeadingError('CT seed context has no identifiable sheet normal')
-    return vectors[::-1, -1]  # zyx array axes -> world xyz
 
 
 def sheet_heading(normal, family):
@@ -153,7 +110,7 @@ def transverse_frame(tensor, heading, previous=None, *, fallback=None, diagnosti
     fraction = energy/max(float(np.trace(tensor)), MIN_FRAME_ENERGY)
     gap = max(0., float(values[-1]-values[0]))/max(energy, MIN_FRAME_ENERGY)
     reliable = (energy > MIN_FRAME_ENERGY and fraction >= MIN_FRAME_ENERGY_FRACTION
-                and gap >= MIN_FRAME_GAP)
+                and gap >= MIN_EIGENGAP)
     source = 0
     if reliable:
         u = basis @ vectors[:, -1]

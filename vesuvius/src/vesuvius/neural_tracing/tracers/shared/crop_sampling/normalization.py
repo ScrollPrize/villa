@@ -77,7 +77,15 @@ def normalize_ct(image, record):
         raise ValueError('CT normalization requires a contiguous float32 3D crop')
     if not np.isfinite(image).all():
         raise ValueError('Z-score CT crop contains nonfinite values')
-    mean = image.mean(dtype=np.float64)
-    std = image.std(dtype=np.float64)
-    image -= np.float32(mean)
+    mean = image.mean(dtype=np.float32)  # float32 statistics, as the GPU sampler's zscore_crops
+    std = image.std(dtype=np.float32)
+    image -= mean
     image /= np.float32(max(float(std), ZSCORE_EPSILON))
+
+
+def zscore_crops(crops):
+    """Per-crop z-score of torch crops (..., D, H, W) (population statistics in the crops' dtype, ``ZSCORE_EPSILON``):
+    the GPU sampler's counterpart of ``normalize_ct``."""
+    mean = crops.mean((-3, -2, -1), keepdim=True)
+    std = crops.std((-3, -2, -1), keepdim=True, unbiased=False)
+    return (crops-mean)/std.clamp_min(ZSCORE_EPSILON)

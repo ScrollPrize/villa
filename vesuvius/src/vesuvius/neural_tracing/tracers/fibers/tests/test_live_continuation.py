@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from vesuvius.neural_tracing.tracers.fibers.train.live_continuation import LiveContinuation, LiveContinuationSource
-from vesuvius.neural_tracing.tracers.fibers.data.fibers import TracedFiber
+from vesuvius.neural_tracing.tracers.shared.annotations.traced import TracedFiber
 from vesuvius.neural_tracing.tracers.fibers.data.follow_dataset import FollowDataset
 from vesuvius.neural_tracing.tracers.fibers.data.samples import SampleConfig, make_sample
 from vesuvius.neural_tracing.tracers.fibers.data.tasks import SOURCE

@@ -11,7 +11,7 @@ Three model types share one trainer, data pipeline, labels, replay, live continu
   committed step, and predicts the path and its confidence; training runs whole episodes.
 
 Each type's defaults are the settings of the run it was established with (`mixed_ct_afv_unified_v1`,
-`unified_flow_v6_adalnzero`, `sequence_v1`). CT uses per-crop z-score normalization only (all values, float64
+`unified_flow_v6_adalnzero`, `sequence_v1`). CT uses per-crop z-score normalization only (all values, float32
 statistics, epsilon 1e-6; no clipping).
 
 ## Run configuration
@@ -101,7 +101,7 @@ live and synthetic task shares (which sequence training does not support) move t
 New runs use the frozen `heading_model_l0_w16_centered_frame/ckpt_064000.pt` for current-crop heading and roll. CT
 initializes seed headings with derivative sigma 2 and integration sigma 8, using a 77³ native CT context. H/V family
 comes from the seed or fiber metadata; only CT and observed paths enter the frame model. The model runs in batches on
-CPU, once per worker/process, with no training gradients. `FIBER_FOLLOW_PATH_MAP='OLD=NEW;...'` relocates absolute
+CPU, once per worker/process, with no training gradients. `TRACERS_PATH_MAP='OLD=NEW;...'` (formerly `FIBER_FOLLOW_PATH_MAP`) relocates absolute
 paths recorded on another machine when a checkpoint is loaded for inference. Paths recorded under the package's former
 location `neural_tracing/fiber_follow/` (checkpoints, run and dataset configurations) resolve to `neural_tracing/tracers/fibers/`.
 
@@ -143,9 +143,10 @@ The fiber tracer lives in `tracers/fibers/`; the parts other tracers can reuse s
 | Package | Responsibility |
 | --- | --- |
 | `tracers/models` | The follower contract (`follower.py`), the model registry (`model.py`), checkpoints (`checkpoint.py`), the crop transformer (`regression`, `flow`), flow matching, the sequence model, the supervised-path contract (`targets.py`) |
-| `tracers/shared` | Geometry, observed-path references, the commit policy, recorded-path relocation, retired settings, JSON/atomic output, batch tensors |
-| `tracers/shared/crop_sampling` | CT crop loading: volumes (local and remote chunked readers, chunk-store decoding), intensity normalization, oriented crop sampling, remote prefetch |
-| `data` | Annotated fibers and splits, seeds, simulated traces and episodes, targets and state labels, the task budget, replay, the training dataset, observations, AFV sources and neighbors |
+| `tracers/shared` | Geometry, observed-path references, the commit policy, recorded-path relocation, retired settings, JSON/atomic output, batch tensors, the CT structure tensor (`ct_structure.py`), training-run pieces (`training.py`: run dirs, log, LR schedule, EMA) and compile options |
+| `tracers/shared/annotations` | Fiber annotations: AFV collections, VC3D fiber JSON, the annotated-fiber type, kink repair, whole-fiber splits |
+| `tracers/shared/crop_sampling` | CT crop loading: volumes (local and remote chunked readers, chunk-store decoding), intensity normalization, oriented crop sampling (CPU kernel for data workers, GPU sampler for in-step crops), remote prefetch |
+| `data` | The z-band split, seeds, simulated traces and episodes, targets and state labels, the task budget, replay, the training dataset, observations, AFV sources and neighbors |
 | `frames` | Crop frames: CT structure-tensor headings and frames (`ct.py`), the frozen learned frame model (`learned.py`) |
 | `tracing` | The tracer and rollout (`trace.py`), the tracing CLI (`inference.py`) |
 | `train` | Entry point and run configuration, the training update (`step.py`), objectives, logging, live continuation, DAgger collection (`dagger/`) |

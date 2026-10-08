@@ -65,8 +65,8 @@ def build(source, document_path, fibers, out, workers=16):
 
 def main(argv=None):
     from vesuvius.neural_tracing.tracers.fibers.data import location_weights
-    from vesuvius.neural_tracing.tracers.fibers.data.afv import AFVFibers
-    from vesuvius.neural_tracing.tracers.fibers.data.fibers import load_fibers
+    from vesuvius.neural_tracing.tracers.shared.annotations.afv import AFVFibers
+    from vesuvius.neural_tracing.tracers.shared.annotations.vc3d import load_fibers
     from vesuvius.neural_tracing.tracers.fibers.data.datasets import read_dataset_config
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('dataset_config')

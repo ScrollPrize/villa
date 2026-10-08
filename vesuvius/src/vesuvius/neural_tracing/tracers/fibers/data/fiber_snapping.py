@@ -171,7 +171,7 @@ def snap_native(polylines, presence, scale, offset, cfg, device, output_step):
 
 
 def snap_afv(source, destination, presence, scale, offset, cfg, device, output_step, limit, provenance):
-    from vesuvius.neural_tracing.tracers.fibers.data.afv import read_afv_polylines, write_afv
+    from vesuvius.neural_tracing.tracers.shared.annotations.afv import read_afv_polylines, write_afv
     fibers = read_afv_polylines(source)
     if limit:
         fibers = fibers[:limit]

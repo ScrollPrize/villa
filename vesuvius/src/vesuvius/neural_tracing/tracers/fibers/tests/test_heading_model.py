@@ -4,7 +4,7 @@ import json
 import numpy as np
 import torch
 
-from vesuvius.neural_tracing.tracers.fibers.data.fibers import TracedFiber
+from vesuvius.neural_tracing.tracers.shared.annotations.traced import TracedFiber
 from vesuvius.neural_tracing.tracers.fibers.heading_model.model import HeadingConfig, HeadingNet, load_heading_model
 from vesuvius.neural_tracing.tracers.fibers.heading_model.normals import normal_loss, normal_target
 from vesuvius.neural_tracing.tracers.fibers.heading_model.targets import in_crop_heading, lateral_extent
@@ -13,7 +13,8 @@ from vesuvius.neural_tracing.tracers.shared.geometry import arclength, normalize
 
 def volume(root):
     """Tiny CT-only volume (80^3 native CT, trace grid at half resolution) with per-crop z-score records."""
-    from vesuvius.neural_tracing.tracers.shared.crop_sampling.normalization import ZSCORE_EPSILON, ZSCORE_METHOD, volume_key
+    from vesuvius.neural_tracing.tracers.shared.crop_sampling.normalization import (
+        ZSCORE_EPSILON, ZSCORE_METHOD, volume_key)
     from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume, CTVolumeSpec
     path = root/'ct/0'
     path.mkdir(parents=True)
